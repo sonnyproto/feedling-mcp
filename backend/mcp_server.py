@@ -1411,8 +1411,7 @@ def bootstrap(ctx: Context = None) -> dict:
     description=(
         "Check memory garden state after writing cards. Call after Pass 3 (落卡) "
         "to decide whether to sweep memory for more moments. Returns count, "
-        "floor (server gate threshold), target (real-depth target), and "
-        "suggestions. If passing=false, address the suggestions before moving "
+        "relationship-age floor, and suggestions. If passing=false, address the suggestions before moving "
         "on to identity_init. Don't proceed to Step 5 (identity derivation) "
         "until passing=true OR you've explicitly explained to the user why "
         "your memory of them is exhausted at the current count."

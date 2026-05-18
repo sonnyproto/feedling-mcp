@@ -49,6 +49,23 @@
 
 ---
 
+## 2026-05-18
+
+### [DONE] Onboarding protocol docs synced to floor-based memory standard
+
+- Synced backend bootstrap instructions and README bootstrap flow with the
+  public `io-onboarding` skill: Step 0, four memory passes, 7-dimension
+  identity, verify tools, chat-loop verification, and broadcast as the final
+  onboarding step.
+- Changed memory verification from target-based gating back to floor-based
+  gating: relationship floors are still exposed, but hitting the floor now
+  passes unless metadata issues are present.
+- Clarified `docs/DESIGN_E2E.md` as historical derivation rather than current
+  wire-format source of truth, and refreshed deployment records from live
+  `/attestation` (`b1e72a6`, compose hash `0xf09f1ddc...`).
+
+---
+
 ## 2026-05-14
 
 ### [DONE] Production docs and privacy sweep after prod9 redeploy

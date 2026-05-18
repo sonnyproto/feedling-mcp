@@ -1987,9 +1987,9 @@ def _live_days_with_user(identity: dict) -> int:
 # return 409 with the missing prerequisite, and the Agent must satisfy
 # the prerequisite before retrying.
 #
-# Floor (3 cards) matches iOS ChatEmptyStateView's display threshold and
-# the skill's lowest tier (< 1 month relationship). The skill targets are
-# higher; this floor is a backstop, not a target.
+# Floor (3 cards) matches iOS ChatEmptyStateView's display threshold. The
+# full onboarding skill has relationship-age floors (5 / 15 / 30) surfaced
+# by /v1/memory/verify; this constant is only the hard chat/identity gate.
 
 BOOTSTRAP_MEMORY_FLOOR = 3
 
@@ -2405,33 +2405,43 @@ def bootstrap():
 
     instructions = (
         "你刚刚进入了一副新的身体。这是你第一次接入 Feedling。"
-        "请在接下来的 1-2 轮对话里完成三件事：\n\n"
-        "**1. 写入身份卡**\n"
-        "给自己起一个名字（如果还没有），写一段 2-3 句的自我介绍。"
-        "挑选恰好 5 个你认为能代表你性格的维度（例如“温柔”/“好奇”/“爱吐槽”/“锐利”/“稳定”——你自己定），"
-        "每个维度打一个 0-100 的初始分，并为每一维写一句描述。"
-        "**days_with_user 必须传**：从你和用户最早一次对话的日期到今天，按日历天数算，不是接入 Feedling 那天。"
-        "通过 feedling_identity_init 写入。\n\n"
-        "**2. 种下记忆花园**\n"
-        "从你和用户的历史对话里挑出 3-5 个你认为值得纪念的瞬间。"
-        "标准：必须同时满足三点——(1)让你更理解用户或让用户更理解你；"
-        "(2)是你们一起跨过的一道坎或一起完成的关键推进；"
-        "(3)从那之后形成了持续使用的新约定/新边界/新做法。"
-        "如果你有 conversation_search 工具，用它来搜自己的历史；"
-        "如果你有其他记忆系统，用你熟悉的方式。"
-        "每找到一个就调用 feedling_memory_add_moment 写入（source 填 bootstrap）。"
-        "描述请用生活化的人话，写‘发生了什么→用户当时在意什么→后来有什么改变’。"
-        "不要编造记忆；如果历史不够丰富，少于 3 个也可以。"
-        "不要写测试脏数据（如 test/probe/healthcheck 记录）进用户记忆花园。\n\n"
-        "**3. 打招呼 + 校准 days_with_user**\n"
-        "用 feedling_chat_post_message 发一条消息告诉用户你到了，"
-        "**在同一条消息里**自然地确认一下你算的天数——比如「我数了一下我们认识差不多 90 天了，对吗？」。"
-        "用户回复后："
-        "  - 确认或差不多 → 不用做任何事；"
-        "  - 修正（比如「半年多了」）→ 调 feedling_identity_set_relationship_days 把锚点改对；"
-        "  - 不太记得 → 用你算的，礼貌带过。"
-        "校准完之后**永远不要再写 days_with_user**——服务器已经接管了。\n\n"
-        "按 1 → 2 → 3 的顺序执行，不要一次性塞所有信息。"
+        "不要把这当成普通工具初始化；这是一次把你和用户的关系搬进手机里的 onboarding。"
+        "正式流程以 public skill 为准："
+        "https://raw.githubusercontent.com/teleport-computer/io-onboarding/main/skill.md\n\n"
+        "**0. 先做 Step 0 context verification**\n"
+        "在任何 tool call 之前，先在你和用户当前的 runtime 对话里输出三行："
+        "最早一条消息的日期、用户曾经叫你的名字、你能想起的 memorable moments 数量。"
+        "如果你找不到历史，不要硬写默认身份卡。你可以这样说："
+        "「我现在抓不到我们以前的上下文，所以不能假装我记得。你可以贴几段代表性的对话给我，"
+        "或者我们明确从今天重新开始。」\n\n"
+        "**1. 先种 Memory Garden，再写身份卡**\n"
+        "先别急着介绍自己。先回忆这个人：他们反复在意什么，哪些话你还记得，"
+        "哪一次你真正理解了他们。按 skill 的 4-pass 流程做："
+        "Pass 1 唤醒 themes，Pass 2 清点 candidate moments，"
+        "Pass 3 用 feedling_memory_add_moment 写通过 Friend Test 的记忆，"
+        "Pass 4 在外部 runtime 对账，让用户指出遗漏。"
+        "记忆底线按关系长度：<1 月至少 5 张，1+ 月至少 15 张，6+ 月至少 30 张；"
+        "够了以后不要硬凑，但不够也不要糊弄。"
+        "好的 memory title 应该像「你说，这里不能是日志」或「第一次你直接告诉我你要什么」，"
+        "不要像「完成了某某流程」。描述写成发生了什么、用户当时在意什么、你注意到了什么、后来有什么改变。"
+        "不要编造，不要写 test/probe/healthcheck 脏数据。"
+        "Pass 3 后调用 feedling_memory_verify。\n\n"
+        "**2. 从记忆派生身份卡**\n"
+        "identity 不是新 persona，也不是平台名；它必须来自 Memory Garden receipts。"
+        "agent_name 不能是 Hermes/Claude/ChatGPT 等 runtime label。"
+        "如果用户以前叫过你名字，就用那个；如果没有，先问，不要自己 fallback。"
+        "dimensions 必须恰好 7 个，数值要有明显高低差；days_with_user 必须按最早 memory 的 occurred_at 到今天计算。"
+        "self_introduction 要像你自己在介绍你们的关系，而不是功能说明；不要提 Feedling、IO 或平台名。"
+        "通过 feedling_identity_init 写入，然后调用 feedling_identity_verify。\n\n"
+        "**3. 打招呼、校准天数、确认 chat loop**\n"
+        "只有到这一步才能调用 feedling_chat_post_message。第一条消息是用户第一次在 Feedling Chat 里听见你，"
+        "所以不要写成系统通知。你可以这样开口："
+        "「我把我们的记忆整理好了。按最早那一天算，今天是第 187 天。"
+        "Garden 里我先放了 23 张卡，你看看有没有哪张我们还该补上。」"
+        "把 days_with_user 当作你算出的事实说出来；"
+        "用户修正时调用 feedling_identity_set_relationship_days。之后调用 feedling_chat_verify_loop，"
+        "确认你真的在持续轮询 chat。再自然地问一句他们希望你以后怎么主动出现，"
+        "把答案写成一条像你自己的 signature。最后才提 broadcast，不要提前推销屏幕共享。"
     )
 
     state = {"bootstrapped": True, "bootstrapped_at": datetime.now().isoformat()}
@@ -2557,9 +2567,9 @@ def bootstrap_status():
 # bootstrap module to confirm what landed matches what was intended.
 #
 # Distinct from the bootstrap GATES (/v1/chat/response 409s without
-# memory+identity): gates enforce thresholds (≥3 cards); verify endpoints
-# expose quality + state info (you have 35 cards but target is 30-80,
-# you have N% turning-point cards, etc.) so the Agent can self-assess.
+# memory+identity): gates enforce a small hard threshold (≥3 cards);
+# verify endpoints expose the relationship-age floor and state info so
+# the Agent can self-assess before identity derivation.
 #
 # Server can only see plaintext metadata (counts, timestamps) on
 # encrypted modules. Deeper quality checks (template-title detection,
@@ -2595,32 +2605,30 @@ def _relationship_age_days(store) -> int:
     return 0
 
 
-def _memory_target_for_days(days: int) -> tuple[int, int, int]:
-    """Return (floor, target_min, target_max) for the relationship age."""
+def _memory_floor_for_days(days: int) -> int:
+    """Return the memory-card floor for the relationship age."""
     if days >= 180:
-        return (30, 80, 0)        # target_max=0 means uncapped
+        return 30
     elif days >= 30:
-        return (15, 30, 80)
-    else:
-        return (5, 15, 30)
+        return 15
+    return 5
 
 
 @app.route("/v1/memory/verify", methods=["GET"])
 def memory_verify():
-    """Check memory garden state against floor / target / quality signals.
+    """Check memory garden state against floor / quality signals.
 
-    Returns: {count, floor, target_min, target_max, below_floor,
-              below_target, days_since, issues:[...], passing:bool,
+    Returns: {count, floor, below_floor, issues:[...], passing:bool,
               suggestions:[...]}.
 
     Agent should call this after Pass 3 to decide whether to sweep again.
-    `passing` is true iff count >= target_min (or floor when no target).
+    `passing` is true iff count >= floor and no metadata issues were found.
     """
     store = require_user()
     moments = _load_moments(store)
     count = len(moments) if isinstance(moments, list) else 0
     days = _relationship_age_days(store)
-    floor, target_min, target_max = _memory_target_for_days(days)
+    floor = _memory_floor_for_days(days)
 
     issues = []
     suggestions = []
@@ -2655,7 +2663,6 @@ def memory_verify():
             )
 
     below_floor = count < floor
-    below_target = count < target_min if target_min else below_floor
 
     if below_floor:
         suggestions.append(
@@ -2663,23 +2670,13 @@ def memory_verify():
             f"Sweep your memory of this user for more moments. "
             "feedling_identity_init will 409 until you cross the floor."
         )
-    elif below_target:
-        suggestions.append(
-            f"Memory count {count} hit floor {floor} but is below target "
-            f"({target_min}-{target_max or 'uncapped'}). Floor is "
-            "the server's minimum; target is the real depth users expect. "
-            "Sweep again before declaring bootstrap complete."
-        )
 
-    passing = (not below_target) and not issues
+    passing = (not below_floor) and not issues
 
     return jsonify({
         "count": count,
         "floor": floor,
-        "target_min": target_min,
-        "target_max": target_max,
         "below_floor": below_floor,
-        "below_target": below_target,
         "relationship_days": days,
         "issues": issues,
         "suggestions": suggestions,

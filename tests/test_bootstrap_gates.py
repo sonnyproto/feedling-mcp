@@ -342,9 +342,9 @@ def test_memory_verify_empty_user(backend):
     assert len(body["suggestions"]) >= 1
 
 
-def test_memory_verify_above_floor_below_target(backend):
+def test_memory_verify_passing_at_relationship_floor(backend):
     """User with 5 memories where the earliest is recent → relationship age
-    < 30 days → floor 5 / target_min 15. 5 hits floor but is below target."""
+    < 30 days → floor 5. Hitting the floor is passing."""
     user_id, api_key = _register(backend["base_url"])
     # Use recent occurred_at so _relationship_age_days < 30 → floor=5
     today = datetime.now().date().isoformat() + "T00:00:00"
@@ -367,8 +367,7 @@ def test_memory_verify_above_floor_below_target(backend):
     assert body["count"] == 5
     assert body["floor"] == 5, f"unexpected floor for recent user: {body}"
     assert body["below_floor"] is False
-    assert body["below_target"] is True  # below target_min=15
-    assert body["passing"] is False
+    assert body["passing"] is True
 
 
 def test_identity_verify_not_written(backend):

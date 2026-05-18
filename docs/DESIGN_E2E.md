@@ -7,6 +7,13 @@ Historical framing: this doc was written against the multi-tenant backend
 introduced before E2E encryption. See `docs/CHANGELOG.md` for the current
 shipped state and landmark diffs.
 
+Current-source note: this file is retained because it explains why the
+architecture exists. It is no longer the source of truth for exact wire
+formats or production topology. For current crypto implementation, read
+`backend/content_encryption.py`, `backend/enclave_app.py`, and
+`testapp/FeedlingTest/ContentEncryption.swift`. For the current trust/audit
+model, read `docs/AUDIT.md` and `README.md`.
+
 Current live topology is summarized in `README.md` and
 `deploy/DEPLOYMENTS.md`: `api.feedling.app` and `mcp.feedling.app`
 terminate at `dstack-ingress` inside the prod9 CVM, while `/attestation`
@@ -101,10 +108,15 @@ screen frames to, we needed a privacy model that matches the claim
 
 ## 3. Cryptographic construction
 
-All symmetric operations use **ChaCha20-Poly1305 (IETF)** via libsodium's
-`crypto_aead_chacha20poly1305_ietf_*`. All public-key operations use
-**X25519 + XSalsa20-Poly1305** via libsodium's `crypto_box_seal` (anonymous
-sealed box — sender is ephemeral, recipient is the known pubkey).
+Current shipped v1 uses **ChaCha20-Poly1305 (IETF)** for body encryption
+with a 12-byte nonce. Per-item content keys are wrapped to the user and
+enclave with Feedling's iOS-compatible BoxSeal variant:
+X25519 ECDH → HKDF-SHA256 with `info="feedling-box-seal-v1"` →
+ChaCha20-Poly1305 using nonce `sha256(ephemeral_pub || recipient_pub)[:12]`.
+This intentionally differs from libsodium `crypto_box_seal`, because
+CryptoKit does not expose XSalsa20/Blake2b. The historical paragraphs below
+that mention `crypto_box_seal` or 24-byte nonces predate the shipped
+CryptoKit-compatible implementation.
 
 ### 3.1 Key inventory
 
@@ -151,9 +163,9 @@ clarify what the server does and does not see.
   "owner_user_id": "usr_abc…",         // plaintext — bound into AEAD additional-data (see §3.4)
 
   "body_ct": "base64(ChaCha20Poly1305-IETF(K, nonce, plaintext_body, aad=owner_user_id||v||id))",
-  "nonce":   "base64(24 bytes)",
-  "K_user":     "base64(crypto_box_seal(K, user_content_pk))",
-  "K_enclave":  "base64(crypto_box_seal(K, enclave_content_pk))", // null when visibility=local_only
+  "nonce":   "base64(12 bytes)",
+  "K_user":     "base64(Feedling BoxSeal(K, user_content_pk))",
+  "K_enclave":  "base64(Feedling BoxSeal(K, enclave_content_pk))", // omitted when visibility=local_only
   "enclave_pk_fpr": "first 16 bytes hex of sha256(enclave_content_pk)"  // so we know which enclave keypair this was wrapped to; enables rotation
 }
 ```
@@ -170,11 +182,11 @@ For frames (screen captures via WebSocket ingest):
 
   "owner_user_id": "usr_abc…",
   "image_ct": "base64(ChaCha20Poly1305-IETF(K, image_nonce, jpeg_bytes, aad=owner_user_id||v||filename))",
-  "image_nonce": "base64(24 bytes)",
+  "image_nonce": "base64(12 bytes)",
   "ocr_ct":    "base64(ChaCha20Poly1305-IETF(K, ocr_nonce, ocr_text, aad=owner_user_id||v||filename))",
-  "ocr_nonce": "base64(24 bytes)",
-  "K_user":    "base64(crypto_box_seal(K, user_content_pk))",
-  "K_enclave": "base64(crypto_box_seal(K, enclave_content_pk))",
+  "ocr_nonce": "base64(12 bytes)",
+  "K_user":    "base64(Feedling BoxSeal(K, user_content_pk))",
+  "K_enclave": "base64(Feedling BoxSeal(K, enclave_content_pk))",
   "enclave_pk_fpr": "…"
 }
 ```
@@ -606,11 +618,11 @@ iOS                                     Flask
  │                                        │
  │  plaintext = "hello agent"             │
  │  K = random(32)                        │
- │  nonce = random(24)                    │
+ │  nonce = random(12)                    │
  │  body_ct = ChaCha20Poly1305-IETF(K, nonce, │
  │             plaintext)                 │
- │  K_user = box_seal(K, user_content_pk) │
- │  K_enclave = box_seal(K,               │
+ │  K_user = Feedling BoxSeal(K, user_content_pk) │
+ │  K_enclave = Feedling BoxSeal(K,       │
  │              enclave_content_pk)       │
  │                                        │
  │  POST /v1/chat/message ───────────────►│

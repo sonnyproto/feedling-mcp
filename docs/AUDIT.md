@@ -147,9 +147,9 @@ source-review work.
 
 ### Docs that name the honest asterisks
 
-- `docs/DESIGN_E2E.md` — the full architecture, including §10
-  "Threat model" which lists what this system can and cannot
-  protect against.
+- `docs/DESIGN_E2E.md` — historical encryption-design derivation,
+  including §10 "Threat model". Use `README.md` and this audit guide
+  for current production topology.
 - `docs/CHANGELOG.md` — landmark diffs by session, including what
   was encrypted at each phase and which paths are now fully v1.
 

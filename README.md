@@ -43,9 +43,9 @@ so updates are visible to all installed apps without an iOS rebuild.
 
 ## What guarantees does Feedling give you?
 
-The trust story, in one page. `docs/DESIGN_E2E.md` has the historical
-derivation, `docs/AUDIT.md` has the broader source-review guide, and
-the current live-verify command is below.
+The trust story, in one page. `docs/AUDIT.md` has the broader
+source-review guide, `docs/DESIGN_E2E.md` is the historical derivation,
+and the current live-verify command is below.
 
 1. **Content-at-rest is ciphertext.** Chat, memory moments, identity
    card, agent nudges, agent replies, screen frames — every write path
@@ -375,7 +375,7 @@ subsequent tool call is routed as that user.
 | Tab | Content |
 |-----|---------|
 | Chat | Real-time conversation with Agent |
-| Identity | Agent's 5-dimension personality card (pentagon radar) |
+| Identity | Agent's 7-dimension personality card (radar) |
 | Garden | Memory garden — long-press a card to toggle visibility |
 | Settings | Storage mode, API info, Privacy hero (audit card, export, delete, reset) |
 
@@ -405,12 +405,12 @@ struct ContentState: Codable, Hashable {
 
 1. Agent calls `POST /v1/bootstrap`
 2. Backend returns `first_time` + instructions
-3. Agent computes `days_with_user` from its own conversation history (calendar days since the very first conversation with this user) and calls `feedling_identity_init` — writes 5-dimension personality card as v1 envelope; the server records `relationship_started_at` from `days_with_user` as a fixed anchor
-4. Agent searches its own memory → calls `feedling_memory_add_moment` 3-5 times
-5. Agent calls `feedling_chat_post_message` to greet the user — and in the same message, asks them to confirm the days estimate. If the user corrects ("we've known each other 6 months, not 3"), Agent calls `feedling_identity_set_relationship_days` to recalibrate the anchor; otherwise nothing more to do
-6. Agent asks the user how they want to be reached proactively → writes a `signature` (one sentence in the agent's own voice) into the identity card
-7. iOS app detects identity envelope appeared → auto-switches to Identity tab
-8. User sees: filled radar + memory garden + chat message + agent's signature; `days_with_user` auto-increments daily because the server computes `(now - relationship_started_at) / 86400` on every read
+3. Before any tool call, Agent performs Step 0 context verification from its own runtime memory: earliest message date, name it has been called, and memorable-moment count. If history is missing, it asks the user for context or an explicit fresh start instead of writing defaults.
+4. Agent runs the four memory passes from the public skill: theme inventory, candidate enumeration, write-through with `feedling_memory_add_moment`, then user verification in the external runtime. Memory floors are relationship-age based: <1 month ≥5, 1+ month ≥15, 6+ months ≥30. Agent calls `feedling_memory_verify` before identity.
+5. Agent derives identity from the written memories, then calls `feedling_identity_init` with exactly 7 dimensions and `days_with_user = today - earliest_memory.occurred_at`. The server records `relationship_started_at` from `days_with_user` as a fixed anchor, and Agent calls `feedling_identity_verify`.
+6. Agent calls `feedling_chat_post_message` to greet the user — this is the first Feedling chat message. It states the computed day count as a fact. If the user corrects it, Agent calls `feedling_identity_set_relationship_days` to recalibrate the anchor.
+7. Agent calls `feedling_chat_verify_loop` to prove chat polling is really alive, then asks the user how they want to be reached proactively and writes a `signature` into the identity card.
+8. Only after chat is alive does Agent mention broadcast/screen sharing. iOS detects identity envelope appeared → auto-switches to Identity tab. `days_with_user` auto-increments daily because the server computes `(now - relationship_started_at) / 86400` on every read.
 
 ### Memory Garden quality standard
 
@@ -520,7 +520,8 @@ outside a user directory.
 
 | If you want to … | Read |
 |---|---|
-| Understand the full encryption / enclave design | `docs/DESIGN_E2E.md` |
+| Understand the current trust/audit model | `docs/AUDIT.md` |
+| Read the historical encryption design derivation | `docs/DESIGN_E2E.md` |
 | Verify the running enclave yourself | `docs/AUDIT.md` |
 | Redeploy the CVM or rotate `compose_hash` | `deploy/DEPLOYMENTS.md` |
 | See landmark diffs by session (current state lives here too) | `docs/CHANGELOG.md` |
