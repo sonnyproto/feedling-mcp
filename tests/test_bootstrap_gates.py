@@ -31,7 +31,7 @@ import sys
 import tempfile
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -127,9 +127,19 @@ def _register(base_url: str) -> tuple[str, str]:
     return body["user_id"], body["api_key"]
 
 
-def _add_memory(base_url: str, user_id: str, api_key: str, marker: str) -> None:
+def _add_memory(
+    base_url: str,
+    user_id: str,
+    api_key: str,
+    marker: str,
+    occurred_at: str | None = None,
+) -> None:
+    """Write one memory. Default occurred_at = now → relationship_age=0
+    → tier <2 days → floor=1. Tests that exercise specific age tiers
+    should pass occurred_at explicitly.
+    """
     env = _stub_envelope(user_id, marker)
-    env["occurred_at"] = "2026-04-01T00:00:00"
+    env["occurred_at"] = occurred_at or datetime.now().isoformat()
     r = requests.post(
         f"{base_url}/v1/memory/add",
         json={"envelope": env},
@@ -139,7 +149,7 @@ def _add_memory(base_url: str, user_id: str, api_key: str, marker: str) -> None:
     assert r.status_code in (200, 201), f"memory_add failed: {r.text}"
 
 
-def _init_identity(base_url: str, user_id: str, api_key: str, days: int = 30) -> requests.Response:
+def _init_identity(base_url: str, user_id: str, api_key: str, days: int = 0) -> requests.Response:
     env = _stub_envelope(user_id, "identity")
     return requests.post(
         f"{base_url}/v1/identity/init",
@@ -224,15 +234,30 @@ def test_identity_init_allowed_after_3_memories(backend):
     assert r.status_code == 201, f"identity_init should succeed: {r.text}"
 
 
-def test_identity_init_blocked_when_only_2_memories(backend):
-    """Floor is 3. 2 memories is not enough."""
+def test_identity_init_blocked_when_below_age_tier_floor(backend):
+    """Floor is per-age. For a ≥1-month relationship the floor is 15;
+    writing 2 cards trips the gate. Older `occurred_at` puts the user
+    into the higher-floor tier."""
     user_id, api_key = _register(backend["base_url"])
+    two_months_ago = (datetime.now() - timedelta(days=60)).isoformat()
     for i in range(2):
-        _add_memory(backend["base_url"], user_id, api_key, f"m{i}")
+        _add_memory(backend["base_url"], user_id, api_key, f"m{i}",
+                    occurred_at=two_months_ago)
     r = _init_identity(backend["base_url"], user_id, api_key)
     assert r.status_code == 409, f"expected 409, got {r.status_code}: {r.text}"
     body = r.json()
     assert body["memory_count"] == 2
+    assert body["memory_floor"] >= 15, f"expected ≥1-month floor, got {body}"
+
+
+def test_identity_init_allowed_with_one_card_for_we_just_met(backend):
+    """The <2-days tier needs only 1 card. 'We just met today' is a valid
+    bootstrap path — agent and user only have one shared moment so far."""
+    user_id, api_key = _register(backend["base_url"])
+    # occurred_at = today → relationship_age = 0 → floor = 1
+    _add_memory(backend["base_url"], user_id, api_key, "m0")
+    r = _init_identity(backend["base_url"], user_id, api_key, days=0)
+    assert r.status_code == 201, f"identity_init should succeed: {r.text}"
 
 
 # ---------------------------------------------------------------------------
@@ -343,21 +368,14 @@ def test_memory_verify_empty_user(backend):
 
 
 def test_memory_verify_passing_at_relationship_floor(backend):
-    """User with 5 memories where the earliest is recent → relationship age
-    < 30 days → floor 5. Hitting the floor is passing."""
+    """User with 5 memories in the 2-30 day tier → floor 5. Hitting the
+    floor is passing."""
     user_id, api_key = _register(backend["base_url"])
-    # Use recent occurred_at so _relationship_age_days < 30 → floor=5
-    today = datetime.now().date().isoformat() + "T00:00:00"
+    # 10 days ago → 2-30 day tier → floor = 5
+    ten_days_ago = (datetime.now() - timedelta(days=10)).isoformat()
     for i in range(5):
-        env = _stub_envelope(user_id, f"m{i}")
-        env["occurred_at"] = today
-        r = requests.post(
-            f"{backend['base_url']}/v1/memory/add",
-            json={"envelope": env},
-            headers={"X-API-Key": api_key},
-            timeout=TIMEOUT,
-        )
-        assert r.status_code in (200, 201)
+        _add_memory(backend["base_url"], user_id, api_key, f"m{i}",
+                    occurred_at=ten_days_ago)
     r = requests.get(
         f"{backend['base_url']}/v1/memory/verify",
         headers={"X-API-Key": api_key},
@@ -365,8 +383,24 @@ def test_memory_verify_passing_at_relationship_floor(backend):
     )
     body = r.json()
     assert body["count"] == 5
-    assert body["floor"] == 5, f"unexpected floor for recent user: {body}"
+    assert body["floor"] == 5, f"unexpected floor for 2-30d tier: {body}"
     assert body["below_floor"] is False
+    assert body["passing"] is True
+
+
+def test_memory_verify_floor_for_we_just_met(backend):
+    """The <2-days tier has floor=1. A single card written today should
+    pass verify."""
+    user_id, api_key = _register(backend["base_url"])
+    _add_memory(backend["base_url"], user_id, api_key, "m0")
+    r = requests.get(
+        f"{backend['base_url']}/v1/memory/verify",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    body = r.json()
+    assert body["count"] == 1
+    assert body["floor"] == 1, f"expected <2d floor=1, got {body}"
     assert body["passing"] is True
 
 

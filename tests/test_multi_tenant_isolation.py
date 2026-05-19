@@ -441,10 +441,15 @@ def test_envelope_owner_user_id_mismatch_rejected(backend):
     a_uid, a_key = _register(base_url)
     b_uid, _ = _register(base_url)
 
-    # Seed A's memories so identity_init reaches the owner check, not the gate.
+    # Seed A's memories so identity_init reaches the owner check, not the
+    # bootstrap gate. occurred_at = today puts the user in the <2-days
+    # tier (floor=1) so 3 cards is plenty to pass the gate; the test then
+    # exercises the owner_user_id mismatch path.
+    from datetime import datetime as _dt
+    today_iso = _dt.now().isoformat()
     for i in range(3):
         m_env = _stub_envelope(a_uid, f"a-mem-{i}")
-        m_env["occurred_at"] = "2026-04-01T00:00:00"
+        m_env["occurred_at"] = today_iso
         r = requests.post(
             f"{base_url}/v1/memory/add",
             json={"envelope": m_env},

@@ -1851,10 +1851,11 @@ def chat_response():
     update; `push_body` is plaintext metadata (user-visible on lockscreen)
     and is never stored in chat.
 
-    Bootstrap gate: this endpoint 409s if memory_count < BOOTSTRAP_MEMORY_FLOOR
-    or identity is not yet written. See _gate_bootstrap_for_chat for the
-    rationale — runtime-level skill text isn't enough to stop hallucinated
-    bootstrap completion; the server has to enforce it.
+    Bootstrap gate: this endpoint 409s if memory_count < the per-age floor
+    (see _memory_floor_for_days) or identity is not yet written. See
+    _gate_bootstrap_for_chat for the rationale — runtime-level skill text
+    isn't enough to stop hallucinated bootstrap completion; the server has
+    to enforce it.
     """
     store = require_user()
     gated = _gate_bootstrap_for_chat(store)
@@ -1987,11 +1988,12 @@ def _live_days_with_user(identity: dict) -> int:
 # return 409 with the missing prerequisite, and the Agent must satisfy
 # the prerequisite before retrying.
 #
-# Floor (3 cards) matches iOS ChatEmptyStateView's display threshold. The
-# full onboarding skill has relationship-age floors (5 / 15 / 30) surfaced
-# by /v1/memory/verify; this constant is only the hard chat/identity gate.
-
-BOOTSTRAP_MEMORY_FLOOR = 3
+# Floor is dynamic by relationship age — see _memory_floor_for_days
+# (defined further down with the verify endpoints). A 6-month relationship
+# legitimately demands more cards than a "we just met today" one. The
+# previous hardcoded floor=3 was a compromise that was too strict for
+# brand-new relationships AND too lax for established ones; replaced
+# 2026-05-19 with the per-age table that's already documented in skill.
 
 # Public skill URL — included in 409 responses so Agents that don't carry
 # the skill in context can refetch it. Single source of truth.
@@ -2003,13 +2005,18 @@ def _bootstrap_state(store) -> dict:
     on every write path. Source of truth: on-disk identity + memory files.
 
     Returns:
-        {"memory_count": int, "identity_written": bool, "stage": str}
+        {"memory_count": int, "memory_floor": int, "identity_written": bool, "stage": str}
         stage ∈ {"needs_memory", "needs_identity", "main_loop"}
+
+    `memory_floor` is computed from `_relationship_age_days(store)` — see
+    `_memory_floor_for_days` for the tiers. <2 days needs only 1 card
+    (we-just-met case); ≥6 months needs 30.
     """
     moments = _load_moments(store)
     memory_count = len(moments) if isinstance(moments, list) else 0
     identity_written = _load_identity(store) is not None
-    if memory_count < BOOTSTRAP_MEMORY_FLOOR:
+    memory_floor = _memory_floor_for_days(_relationship_age_days(store))
+    if memory_count < memory_floor:
         stage = "needs_memory"
     elif not identity_written:
         stage = "needs_identity"
@@ -2017,6 +2024,7 @@ def _bootstrap_state(store) -> dict:
         stage = "main_loop"
     return {
         "memory_count": memory_count,
+        "memory_floor": memory_floor,
         "identity_written": identity_written,
         "stage": stage,
     }
@@ -2035,9 +2043,10 @@ def _gate_bootstrap_for_chat(store):
         return None
     if state["stage"] == "needs_memory":
         required = (
-            f"Write at least {BOOTSTRAP_MEMORY_FLOOR} memory cards via "
-            f"feedling_memory_add_moment (currently {state['memory_count']}), "
-            "then call feedling_identity_init, BEFORE you can post chat. "
+            f"Write at least {state['memory_floor']} memory cards via "
+            f"feedling_memory_add_moment (currently {state['memory_count']}; "
+            f"floor for this relationship age), then call "
+            "feedling_identity_init, BEFORE you can post chat. "
             "Do not fabricate Pass 4 summaries — the cards must actually exist."
         )
     else:  # needs_identity
@@ -2046,12 +2055,12 @@ def _gate_bootstrap_for_chat(store):
             "(7 dimensions + days_with_user) BEFORE you can post chat."
         )
     print(f"[gate:{store.user_id}] chat_response blocked stage={state['stage']} "
-          f"mem={state['memory_count']} id={state['identity_written']}")
+          f"mem={state['memory_count']}/{state['memory_floor']} id={state['identity_written']}")
     return jsonify({
         "error": "bootstrap_incomplete",
         "stage": state["stage"],
         "memory_count": state["memory_count"],
-        "memory_floor": BOOTSTRAP_MEMORY_FLOOR,
+        "memory_floor": state["memory_floor"],
         "identity_written": state["identity_written"],
         "required": required,
         "skill_url": _SKILL_URL,
@@ -2059,26 +2068,26 @@ def _gate_bootstrap_for_chat(store):
 
 
 def _gate_bootstrap_for_identity_init(store):
-    """Refuse /v1/identity/init when fewer than the floor of memories exist.
-
-    Identity must be DERIVED from memories per skill protocol — writing
-    identity before any memories means the Agent skipped the four passes
-    and is making up dimensions from thin air.
+    """Refuse /v1/identity/init when fewer than the per-age floor of
+    memories exist. Identity must be DERIVED from memories — writing
+    identity at the floor=15 tier with 3 cards means the Agent skipped
+    the depth pass.
     """
     state = _bootstrap_state(store)
-    if state["memory_count"] >= BOOTSTRAP_MEMORY_FLOOR:
+    if state["memory_count"] >= state["memory_floor"]:
         return None
-    print(f"[gate:{store.user_id}] identity_init blocked mem={state['memory_count']}")
+    print(f"[gate:{store.user_id}] identity_init blocked "
+          f"mem={state['memory_count']}/{state['memory_floor']}")
     return jsonify({
         "error": "bootstrap_incomplete",
         "stage": "needs_memory",
         "memory_count": state["memory_count"],
-        "memory_floor": BOOTSTRAP_MEMORY_FLOOR,
+        "memory_floor": state["memory_floor"],
         "required": (
-            f"Write at least {BOOTSTRAP_MEMORY_FLOOR} memory cards via "
-            f"feedling_memory_add_moment (currently {state['memory_count']}) "
-            "BEFORE calling feedling_identity_init. Identity dimensions must "
-            "be derived from real cards, not invented."
+            f"Write at least {state['memory_floor']} memory cards via "
+            f"feedling_memory_add_moment (currently {state['memory_count']}; "
+            f"floor for this relationship age) BEFORE calling feedling_identity_init. "
+            "Identity dimensions must be derived from real cards, not invented."
         ),
         "skill_url": _SKILL_URL,
     }), 409
@@ -2104,10 +2113,11 @@ def identity_init():
     {agent_name, self_introduction, dimensions} serialized as JSON.
     Plaintext metadata: id, created_at, updated_at. See DESIGN_E2E.md §3.2.
 
-    Bootstrap gate: requires memory_count >= BOOTSTRAP_MEMORY_FLOOR. Identity
-    must be DERIVED from memories per skill protocol; writing identity with
-    zero memories means the Agent invented dimensions instead of reading
-    cards. See _gate_bootstrap_for_identity_init.
+    Bootstrap gate: requires memory_count >= the per-age floor (see
+    _memory_floor_for_days). Identity must be DERIVED from memories per
+    skill protocol; writing identity without depth proportional to the
+    relationship age means the Agent skipped the depth pass.
+    See _gate_bootstrap_for_identity_init.
     """
     store = require_user()
     existing = _load_identity(store)
@@ -2606,12 +2616,26 @@ def _relationship_age_days(store) -> int:
 
 
 def _memory_floor_for_days(days: int) -> int:
-    """Return the memory-card floor for the relationship age."""
+    """Return the memory-card floor for the relationship age.
+
+    Tiers:
+      ≥ 6 months: 30 (established relationship)
+      ≥ 1 month:  15 (real history)
+      ≥ 2 days:    5 (recent but real)
+      < 2 days:    1 (we-just-met path; need ≥1 card to derive identity at all)
+
+    The <2-days tier exists for honest "first day" scenarios — agent and
+    user genuinely met today, only have one moment so far. Skill Hard Rule
+    forbids agents from claiming this tier unless the user explicitly
+    stated it ("we just met today"); the server trusts the agent here.
+    """
     if days >= 180:
         return 30
-    elif days >= 30:
+    if days >= 30:
         return 15
-    return 5
+    if days >= 2:
+        return 5
+    return 1
 
 
 @app.route("/v1/memory/verify", methods=["GET"])
