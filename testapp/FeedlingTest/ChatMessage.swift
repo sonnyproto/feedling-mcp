@@ -145,7 +145,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
             }
             return copy
         } catch {
-            print("[chat] unseal failed for id=\(id) type=\(contentType): \(error)")
+            log("[chat] unseal failed for id=\(id) type=\(contentType): \(error)")
             var copy = self
             copy.content = "[encrypted — decrypt failed]"
             return copy

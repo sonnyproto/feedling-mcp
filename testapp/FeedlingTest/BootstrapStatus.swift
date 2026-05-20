@@ -93,7 +93,7 @@ final class BootstrapStatusViewModel: ObservableObject {
             self.lastFetchAt = Date()
         } catch {
             // Silent — empty-state UI just keeps showing "waiting"
-            print("[bootstrap-status] fetch failed: \(error)")
+            log("[bootstrap-status] fetch failed: \(error)")
         }
     }
 }

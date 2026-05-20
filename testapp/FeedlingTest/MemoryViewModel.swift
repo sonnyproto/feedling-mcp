@@ -136,7 +136,7 @@ struct MemoryMoment: Codable, Identifiable, Hashable {
             copy.quotedInChat    = inner.quoted_in_chat
             return copy
         } catch {
-            print("[memory] unseal failed id=\(id): \(error)")
+            log("[memory] unseal failed id=\(id): \(error)")
             var copy = self
             copy.title = "[encrypted — decrypt failed]"
             return copy
@@ -231,7 +231,7 @@ class MemoryViewModel: ObservableObject {
             unreadIds = allIds.subtracting(seenIds)
             moments = incoming
         } catch {
-            print("[MemoryVM] load error: \(error)")
+            log("[MemoryVM] load error: \(error)")
         }
     }
 }

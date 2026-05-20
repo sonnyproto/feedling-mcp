@@ -66,6 +66,6 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         _ application: UIApplication,
         didFailToRegisterForRemoteNotificationsWithError error: Error
     ) {
-        print("[APNs] ❌ Failed to register: \(error.localizedDescription)")
+        log("[APNs] ❌ Failed to register: \(error.localizedDescription)")
     }
 }

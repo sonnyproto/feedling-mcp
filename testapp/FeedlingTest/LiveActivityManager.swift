@@ -37,7 +37,7 @@ class LiveActivityManager: ObservableObject {
 
     func startActivity() async {
         guard ActivityAuthorizationInfo().areActivitiesEnabled else {
-            print("[LiveActivity] ❌ Activities not enabled on this device")
+            log("[LiveActivity] ❌ Activities not enabled on this device")
             return
         }
 
@@ -67,20 +67,20 @@ class LiveActivityManager: ObservableObject {
             isActive = true
             lastState = initialState
             observeTokens(for: activity)
-            print("[LiveActivity] ✅ Started: \(activity.id)")
+            log("[LiveActivity] ✅ Started: \(activity.id)")
         } catch {
-            print("[LiveActivity] ❌ Failed to start: \(error.localizedDescription)")
+            log("[LiveActivity] ❌ Failed to start: \(error.localizedDescription)")
         }
     }
 
     func updateActivity(state: ScreenActivityAttributes.ContentState) async {
         guard let activity = currentActivity else {
-            print("[LiveActivity] ⚠️ No active activity to update")
+            log("[LiveActivity] ⚠️ No active activity to update")
             return
         }
         await activity.update(.init(state: state, staleDate: nil))
         lastState = state
-        print("[LiveActivity] 🔄 Updated: \(state.title) — \(state.body.prefix(40))")
+        log("[LiveActivity] 🔄 Updated: \(state.title) — \(state.body.prefix(40))")
     }
 
     /// Call when identity card loads or days change. Updates the idle lock screen display.
@@ -111,7 +111,7 @@ class LiveActivityManager: ObservableObject {
         isActive = false
         activityPushToken = nil
         lastState = nil
-        print("[LiveActivity] 🛑 Stopped")
+        log("[LiveActivity] 🛑 Stopped")
     }
 
     // MARK: - Token registration
@@ -175,6 +175,6 @@ class LiveActivityManager: ObservableObject {
         let bodyData = try? JSONSerialization.data(withJSONObject: body)
         guard let req = FeedlingAPI.shared.authorizedRequest(path: path, method: "POST", body: bodyData) else { return }
         _ = try? await URLSession.shared.data(for: req)
-        print("[Token] 📤 Uploaded \(body["type"] ?? "?") token")
+        log("[Token] 📤 Uploaded \(body["type"] ?? "?") token")
     }
 }

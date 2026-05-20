@@ -116,9 +116,9 @@ class ChatViewModel: ObservableObject {
             messages = stampProactive(decryptBatch(resp.messages))
             latestTs = messages.last?.ts ?? 0
             let roleCounts = Dictionary(grouping: messages, by: { $0.role }).mapValues { $0.count }
-            print("[chat] loadHistory count=\(messages.count) roles=\(roleCounts)")
+            log("[chat] loadHistory count=\(messages.count) roles=\(roleCounts)")
         } catch {
-            print("[chat] loadHistory error: \(error)")
+            log("[chat] loadHistory error: \(error)")
         }
     }
 
@@ -146,7 +146,7 @@ class ChatViewModel: ObservableObject {
                 waitingTimeoutTask?.cancel()
             }
         } catch {
-            print("[chat] fetchNew error: \(error)")
+            log("[chat] fetchNew error: \(error)")
         }
     }
 
@@ -204,7 +204,7 @@ class ChatViewModel: ObservableObject {
               let enclavePK = api.enclaveContentPublicKey,
               !api.userId.isEmpty
         else {
-            print("[chat] skipping send — content keypair not ready")
+            log("[chat] skipping send — content keypair not ready")
             isSending = false
             return
         }
@@ -218,9 +218,9 @@ class ChatViewModel: ObservableObject {
                 visibility: .shared
             )
             body = try JSONSerialization.data(withJSONObject: env.jsonBody())
-            print("[chat] sending v1 envelope id=\(env.id)")
+            log("[chat] sending v1 envelope id=\(env.id)")
         } catch {
-            print("[chat] envelope build failed: \(error)")
+            log("[chat] envelope build failed: \(error)")
             isSending = false
             return
         }
@@ -245,7 +245,7 @@ class ChatViewModel: ObservableObject {
     func sendImage(_ jpegData: Data) async {
         guard !isSending else { return }
         guard !jpegData.isEmpty else {
-            print("[chat] sendImage called with empty data")
+            log("[chat] sendImage called with empty data")
             return
         }
         isSending = true
@@ -275,7 +275,7 @@ class ChatViewModel: ObservableObject {
               let enclavePK = api.enclaveContentPublicKey,
               !api.userId.isEmpty
         else {
-            print("[chat] sendImage skipped — content keypair not ready")
+            log("[chat] sendImage skipped — content keypair not ready")
             return
         }
 
@@ -294,9 +294,9 @@ class ChatViewModel: ObservableObject {
             var outer = env.jsonBody()
             outer["content_type"] = "image"
             body = try JSONSerialization.data(withJSONObject: outer)
-            print("[chat] sending v1 image envelope id=\(env.id) bytes=\(jpegData.count)")
+            log("[chat] sending v1 image envelope id=\(env.id) bytes=\(jpegData.count)")
         } catch {
-            print("[chat] image envelope build failed: \(error)")
+            log("[chat] image envelope build failed: \(error)")
             return
         }
 

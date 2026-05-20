@@ -137,7 +137,7 @@ struct IdentityCard: Codable {
             // server's value already on `self` does the right thing.
             return copy
         } catch {
-            print("[identity] unseal failed: \(error)")
+            log("[identity] unseal failed: \(error)")
             var copy = self
             copy.agentName = "[encrypted — decrypt failed]"
             return copy
@@ -218,7 +218,7 @@ class IdentityViewModel: ObservableObject {
                 LiveActivityManager.shared.setDays(days)
             }
         } catch {
-            print("[IdentityVM] load error: \(error)")
+            log("[IdentityVM] load error: \(error)")
         }
     }
 }

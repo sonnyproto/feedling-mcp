@@ -21,22 +21,22 @@ class SampleHandler: RPBroadcastSampleHandler {
         let endpoint = SharedConfig.ingestEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
         WebSocketManager.shared.connect(endpoint: endpoint.isEmpty ? SharedConfig.defaultIngestEndpoint : endpoint,
                                         token: token.isEmpty ? "feedling" : token)
-        print("[broadcast] started, interval=\(Int(frameInterval * 1000))ms, endpoint=\(endpoint)")
+        log("[broadcast] started, interval=\(Int(frameInterval * 1000))ms, endpoint=\(endpoint)")
     }
 
     override func broadcastPaused() {
-        print("[broadcast] paused")
+        log("[broadcast] paused")
     }
 
     override func broadcastResumed() {
-        print("[broadcast] resumed")
+        log("[broadcast] resumed")
     }
 
     override func broadcastFinished() {
         SharedConfig.sharedDefaults?.set(false, forKey: "isBroadcasting")
         WebSocketManager.shared.disconnect()
         webSocketFrameQueue.clear()
-        print("[broadcast] finished")
+        log("[broadcast] finished")
     }
 
     override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {

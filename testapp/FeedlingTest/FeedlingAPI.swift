@@ -247,7 +247,7 @@ final class FeedlingAPI: ObservableObject {
         // can no longer see. Refuse; the next launch with healthy Keychain
         // will pick up the entry and proceed normally.
         if UserDefaults.standard.bool(forKey: Keys.hasRegistered) {
-            print("[register] BLOCKED: hasRegistered=true but apiKey empty — refusing to re-register and orphan existing account")
+            log("[register] BLOCKED: hasRegistered=true but apiKey empty — refusing to re-register and orphan existing account")
             UserDefaults.standard.set(true, forKey: Keys.registrationFailed)
             return
         }
@@ -307,7 +307,7 @@ final class FeedlingAPI: ObservableObject {
             guard let http = resp as? HTTPURLResponse else { return }
 
             guard (200..<300).contains(http.statusCode) else {
-                print("[register] HTTP \(http.statusCode): \(String(data: respData, encoding: .utf8) ?? "")")
+                log("[register] HTTP \(http.statusCode): \(String(data: respData, encoding: .utf8) ?? "")")
                 UserDefaults.standard.set(true, forKey: Keys.registrationFailed)
                 return
             }
@@ -315,9 +315,9 @@ final class FeedlingAPI: ObservableObject {
             struct RegResp: Decodable { let user_id: String; let api_key: String }
             let decoded = try JSONDecoder().decode(RegResp.self, from: respData)
             setCredentials(userId: decoded.user_id, apiKey: decoded.api_key)
-            print("[register] got user_id=\(decoded.user_id)")
+            log("[register] got user_id=\(decoded.user_id)")
         } catch {
-            print("[register] error: \(error)")
+            log("[register] error: \(error)")
             UserDefaults.standard.set(true, forKey: Keys.registrationFailed)
         }
     }
@@ -341,7 +341,7 @@ final class FeedlingAPI: ObservableObject {
                 self.userId = w.user_id
                 UserDefaults.standard.set(w.user_id, forKey: Keys.userId)
                 syncToAppGroup()
-                print("[whoami] resolved user_id=\(w.user_id)")
+                log("[whoami] resolved user_id=\(w.user_id)")
             }
 
             // Self-heal key drift: if the server's registered public_key differs
@@ -349,16 +349,16 @@ final class FeedlingAPI: ObservableObject {
             // incoming assistant messages are decryptable.
             let localContentPK = try ContentKeyStore.shared.ensureContentKeypair().publicKey.rawRepresentation.base64EncodedString()
             if let remotePK = w.public_key, !remotePK.isEmpty, remotePK != localContentPK {
-                print("[whoami] public_key mismatch detected; syncing content key")
+                log("[whoami] public_key mismatch detected; syncing content key")
                 let body = try JSONSerialization.data(withJSONObject: ["public_key": localContentPK])
                 if let syncReq = authorizedRequest(path: "/v1/users/public-key", method: "POST", body: body) {
                     let (_, syncResp) = try await URLSession.shared.data(for: syncReq)
                     let code = (syncResp as? HTTPURLResponse)?.statusCode ?? -1
-                    print("[whoami] public_key sync status=\(code)")
+                    log("[whoami] public_key sync status=\(code)")
                 }
             }
         } catch {
-            print("[whoami] failed: \(error)")
+            log("[whoami] failed: \(error)")
         }
     }
 
@@ -727,7 +727,7 @@ final class FeedlingAPI: ObservableObject {
             userContentPublicKey = sk.publicKey
             publishContentKeysToAppGroup()
         } catch {
-            print("[content-keypair] failed to load/generate: \(error)")
+            log("[content-keypair] failed to load/generate: \(error)")
         }
     }
 
@@ -786,9 +786,9 @@ final class FeedlingAPI: ObservableObject {
             // platform-layer measurements (MRTD, RTMR0-2) change for
             // reasons unrelated to our app, per dstack-tutorial §1.
             evaluateComposeHashChange()
-            print("[attestation] refreshed: compose_hash=\(b.compose_hash?.prefix(16) ?? "nil")…")
+            log("[attestation] refreshed: compose_hash=\(b.compose_hash?.prefix(16) ?? "nil")…")
         } catch {
-            print("[attestation] refresh failed: \(error)")
+            log("[attestation] refresh failed: \(error)")
         }
     }
 }
@@ -974,7 +974,7 @@ final class ApiKeyStore {
         ]
         let status = SecItemAdd(localQuery as CFDictionary, nil)
         if status != errSecSuccess {
-            print("[ApiKeyStore] save failed: status=\(status)")
+            log("[ApiKeyStore] save failed: status=\(status)")
         }
     }
 }

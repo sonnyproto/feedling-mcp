@@ -98,14 +98,14 @@ final class WebSocketFrameQueue {
         guard let ctx = FrameEnvelope.loadContext(),
               let inner = try? JSONEncoder().encode(payload),
               let env = FrameEnvelope.wrap(plaintext: inner, ctx: ctx) else {
-            print("[ws] skipping frame — v1 envelope context unavailable")
+            log("[ws] skipping frame — v1 envelope context unavailable")
             return
         }
         var wire = env
         wire["type"] = "frame"            // backend WS handler routes on this
         wire["ts"] = frame.enqueueTs      // index field — server stores in frames_meta
         WebSocketManager.shared.sendJSON(wire)
-        print("[ws] sent v1 frame envelope body_ct_len=\(((env["envelope"] as? [String:Any])?["body_ct"] as? String ?? "").count)")
+        log("[ws] sent v1 frame envelope body_ct_len=\(((env["envelope"] as? [String:Any])?["body_ct"] as? String ?? "").count)")
     }
 
     private func resizeIfNeeded(_ image: UIImage, maxEdge: CGFloat) -> UIImage {

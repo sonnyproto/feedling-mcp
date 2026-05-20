@@ -98,7 +98,7 @@ final class WebSocketManager: NSObject {
         session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
         webSocketTask = session?.webSocketTask(with: request)
         webSocketTask?.resume()
-        print("[ws] connecting to \(url)")
+        log("[ws] connecting to \(url)")
     }
 
     private func scheduleReconnect() {
@@ -111,7 +111,7 @@ final class WebSocketManager: NSObject {
         }
         reconnectWorkItem = item
         queue.asyncAfter(deadline: .now() + delay, execute: item)
-        print("[ws] reconnecting in \(Int(delay))s")
+        log("[ws] reconnecting in \(Int(delay))s")
     }
 }
 
@@ -121,7 +121,7 @@ extension WebSocketManager: URLSessionWebSocketDelegate {
         queue.async {
             self.isConnected = true
             self.retryAttempt = 0
-            print("[ws] connected")
+            log("[ws] connected")
         }
     }
 
@@ -129,7 +129,7 @@ extension WebSocketManager: URLSessionWebSocketDelegate {
                     didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         queue.async {
             self.isConnected = false
-            print("[ws] closed")
+            log("[ws] closed")
             self.scheduleReconnect()
         }
     }
@@ -138,7 +138,7 @@ extension WebSocketManager: URLSessionWebSocketDelegate {
         if let error {
             queue.async {
                 self.isConnected = false
-                print("[ws] error: \(error.localizedDescription)")
+                log("[ws] error: \(error.localizedDescription)")
                 self.scheduleReconnect()
             }
         }

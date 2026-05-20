@@ -103,7 +103,7 @@ struct MemoryGardenView: View {
                                 moment: moment, toLocalOnly: toLocalOnly)
                             await vm.loadMoments()
                         } catch {
-                            print("[visibility-flip] \(moment.id): \(error)")
+                            log("[visibility-flip] \(moment.id): \(error)")
                         }
                     }
                 }
@@ -468,7 +468,7 @@ struct MemoryCardDetailView: View {
                 await memoryVM.loadMoments()
                 dismiss()
             } catch {
-                print("[delete-memory] \(moment.id): \(error)")
+                log("[delete-memory] \(moment.id): \(error)")
                 dismiss()
             }
         }
