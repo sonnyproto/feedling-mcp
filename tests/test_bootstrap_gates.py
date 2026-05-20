@@ -29,6 +29,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -479,3 +480,40 @@ def test_chat_verify_loop_synthetic_ping_does_not_pollute_history(backend):
     for m in msgs:
         assert m.get("source") != "verify_ping", \
             f"synthetic ping leaked into user history: {m}"
+
+
+def test_chat_verify_loop_marks_live_connection_without_first_message(backend):
+    """A successful synthetic verify marks Live connection in bootstrap
+    status, but the private verify reply must not count as the visible
+    first message that opens Chat."""
+    user_id, api_key = _register(backend["base_url"])
+    for i in range(3):
+        _add_memory(backend["base_url"], user_id, api_key, f"m{i}")
+    assert _init_identity(backend["base_url"], user_id, api_key).status_code == 201
+
+    def delayed_agent_reply():
+        time.sleep(0.5)
+        _chat_response(backend["base_url"], user_id, api_key)
+
+    t = threading.Thread(target=delayed_agent_reply)
+    t.start()
+    r = requests.post(
+        f"{backend['base_url']}/v1/chat/verify_loop",
+        json={"timeout_sec": 6},
+        headers={"X-API-Key": api_key},
+        timeout=10,
+    )
+    t.join(timeout=5)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["passing"] is True
+
+    r = requests.get(
+        f"{backend['base_url']}/v1/bootstrap/status",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    status = r.json()
+    assert status["chat_loop_verified"] is True
+    assert status["agent_messages_count"] == 0
+    assert status["is_complete"] is False

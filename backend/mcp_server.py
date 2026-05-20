@@ -998,6 +998,7 @@ def _build_and_post_identity(
     category: str,
     signature: list[str] | None,
     ctx: Context | None,
+    audit_reason: str = "",
 ) -> dict:
     """Shared encrypt-and-POST path used by both identity_init and identity_replace.
 
@@ -1045,6 +1046,14 @@ def _build_and_post_identity(
     post_payload: dict = {"envelope": envelope}
     if days_with_user is not None:
         post_payload["days_with_user"] = int(max(0, days_with_user))
+    # Audit payload tells the backend's identity-change feed what to log.
+    # Init defaults to a generic "first write" marker if no reason supplied;
+    # replace defaults to "Agent rewrote the identity card" — these only
+    # show up in user-facing UI when the Agent didn't bother to explain.
+    post_payload["audit"] = {
+        "action": "init" if op_label == "init" else "replace",
+        "reason": audit_reason,
+    }
     print(f"[mcp] identity.{op_label} v1 envelope id={envelope['id']} days_with_user={days_with_user}")
     return _post(endpoint, post_payload, ctx=ctx)
 
@@ -1074,15 +1083,21 @@ def identity_init(
     days_with_user: int,
     category: str = "",
     signature: list[str] = None,
+    reason: str = "",
     ctx: Context = None,
 ) -> dict:
     """First-time identity write. days_with_user is mandatory — it sets the
     server-side relationship anchor. Returns 409 from the backend if the card
-    already exists — use feedling_identity_replace to overwrite."""
+    already exists — use feedling_identity_replace to overwrite.
+
+    `reason` (optional): one sentence in your own voice describing what this
+    init represents to you. Shown in the user's "最近的变化" feed verbatim.
+    See the skill section on writing reason fields."""
     return _build_and_post_identity(
         "/v1/identity/init", "init",
         agent_name, self_introduction, dimensions,
         days_with_user, category, signature, ctx,
+        audit_reason=reason,
     )
 
 
@@ -1107,14 +1122,20 @@ def identity_replace(
     days_with_user: int | None = None,
     category: str = "",
     signature: list[str] = None,
+    reason: str = "",
     ctx: Context = None,
 ) -> dict:
     """In-place identity overwrite. days_with_user is optional — omit to keep
-    the current relationship anchor unchanged."""
+    the current relationship anchor unchanged.
+
+    `reason` (optional): one sentence in your own voice describing why
+    you're rewriting the card. Shown in the user's "最近的变化" feed
+    verbatim. See the skill section on writing reason fields."""
     return _build_and_post_identity(
         "/v1/identity/replace", "replace",
         agent_name, self_introduction, dimensions,
         days_with_user, category, signature, ctx,
+        audit_reason=reason,
     )
 
 
@@ -1182,7 +1203,8 @@ def identity_nudge(dimension_name: str, delta: int, reason: str = "", ctx: Conte
     matched = next((d for d in dims if d.get("name") == dimension_name), None)
     if matched is None:
         return {"error": f"dimension '{dimension_name}' not found"}
-    new_val = max(0, min(100, int(matched.get("value", 0)) + int(delta)))
+    old_val = int(matched.get("value", 0))
+    new_val = max(0, min(100, old_val + int(delta)))
     matched["value"] = new_val
     if reason:
         matched["last_nudge_reason"] = reason
@@ -1206,7 +1228,22 @@ def identity_nudge(dimension_name: str, delta: int, reason: str = "", ctx: Conte
         visibility="shared",
     )
     print(f"[mcp] identity.nudge v1 rewrap dim={dimension_name} {delta:+d} → {new_val}")
-    return _post("/v1/identity/replace", {"envelope": envelope}, ctx=ctx)
+    # Pass plaintext audit info so the backend can append a change-feed
+    # entry. Backend never sees the dimension values otherwise (envelope
+    # is ciphertext); this is the only path that surfaces the diff to
+    # iOS's "最近的变化" UI. Reason is shown verbatim to the user — see
+    # the "Writing the reason field" section of the skill for voice rules.
+    return _post("/v1/identity/replace", {
+        "envelope": envelope,
+        "audit": {
+            "action": "nudge",
+            "dimension": dimension_name,
+            "old_value": old_val,
+            "new_value": new_val,
+            "delta": int(delta),
+            "reason": reason,
+        },
+    }, ctx=ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -1440,13 +1477,14 @@ def identity_verify(ctx: Context = None) -> dict:
     name="feedling_chat_verify_loop",
     description=(
         "Send a synthetic ping in chat and wait up to 30s for your reply. "
-        "Confirms your reply pipeline is REAL — i.e. you're actually polling "
-        "Feedling and posting actual replies, not a stopgap bridge script "
-        "emitting templates. Call after Step 6 (first greeting). If "
-        "passing=false, your runtime category is wrong (you're probably a "
-        "one-shot CLI without chat-resident-consumer set up). DO NOT write "
-        "a workaround daemon — tell the operator to install "
-        "chat-resident-consumer instead. See the Hard Rule about bridge scripts."
+        "Confirms that some reply pipeline posted an agent-role response after "
+        "the ping. Call after identity verification and before the first "
+        "visible Feedling greeting if you're a persistent Category A runtime, "
+        "or if a real chat-resident-consumer is intentionally owning the loop. "
+        "If you're a one-shot CLI, passing=true does NOT prove you stay alive "
+        "between turns; it may only prove a resident/bridge/fallback answered. "
+        "DO NOT write a workaround daemon — tell the operator to "
+        "install/configure chat-resident-consumer instead."
     ),
 )
 def chat_verify_loop(timeout_sec: int = 30, ctx: Context = None) -> dict:

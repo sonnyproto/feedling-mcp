@@ -44,12 +44,11 @@ struct ChatView: View {
     /// Onboarding state = "agent hasn't moved in yet." The four bootstrap
     /// passes happen in the user's external agent runtime (Claude Desktop /
     /// Code), not here — Feedling chat doesn't host that work. The Chat tab
-    /// stays a pure instructions surface until the agent's first
-    /// `feedling_chat_post_message` lands (skill Step 6 — greeting + days
-    /// verification). That message both opens the conversation and triggers
-    /// this flag to flip. No header, no input bar before then: the user has
-    /// no business sending to a channel the agent hasn't introduced itself
-    /// in, and an input bar on a wall-of-instructions page reads as broken.
+    /// stays a pure instructions surface until the agent has verified the
+    /// live reply pipeline and then posted its first visible greeting. No
+    /// header, no input bar before then: the user shouldn't enter Chat until
+    /// the agent has both moved in and proved that future replies will be
+    /// handled by a real live connection.
     private var showOnboarding: Bool {
         vm.messages.isEmpty && !vm.isWaitingForReply
     }

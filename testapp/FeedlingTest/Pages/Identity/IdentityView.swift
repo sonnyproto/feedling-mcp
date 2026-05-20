@@ -4,6 +4,12 @@ import SwiftUI
 
 struct IdentityView: View {
     @EnvironmentObject var vm: IdentityViewModel
+    // For tap-to-chat: tapping a "最近的变化" card preloads a draft in
+    // ChatView and switches to the Chat tab. Both env objects already
+    // exist in the app — same pattern as HealthCheckView's diagnostic
+    // shortcuts.
+    @EnvironmentObject var chatVM: ChatViewModel
+    @EnvironmentObject var router: AppRouter
 
     private let isChinese: Bool =
         Locale.preferredLanguages.first?.hasPrefix("zh") ?? false
@@ -19,6 +25,10 @@ struct IdentityView: View {
                         radarSection(identity)
                         Rectangle().fill(Color.cinFg).frame(height: 1).padding(.horizontal, 24)
                         dimensionsList(identity)
+                        if !vm.recentChanges.isEmpty {
+                            Rectangle().fill(Color.cinFg).frame(height: 1).padding(.horizontal, 24)
+                            recentChangesSection
+                        }
                     }
                 }
             } else {
@@ -147,6 +157,89 @@ struct IdentityView: View {
         .padding(.bottom, 32)
     }
 
+    // MARK: - Recent changes ("最近的变化")
+    //
+    // Renders the top 3 most recent identity_change events as cards.
+    // Each card is a tap target: tapping preloads ChatView with a draft
+    // message that references THIS specific change, and switches to the
+    // Chat tab. The user can edit the draft (or send as-is) — the agent
+    // sees a normal user message and decides how to respond. We do not
+    // tell the agent what to say; the iOS layer just opens the channel.
+
+    private var recentChangesSection: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .lastTextBaseline, spacing: 10) {
+                Text(isChinese ? "最近的变化" : "RECENT CHANGES")
+                    .font(.dmMono(size: 9.5))
+                    .foregroundStyle(Color.cinAccent1)
+                    .kerning(3)
+                    .fontWeight(.semibold)
+                Spacer()
+                if vm.recentChanges.count > 3 {
+                    // TODO: future "ALL ↗" tap action — opens a dedicated
+                    // history page. For now it's a passive label so the
+                    // user knows the feed is truncated.
+                    Text("ALL ↗")
+                        .font(.dmMono(size: 9, weight: .medium))
+                        .foregroundStyle(Color.cinSub)
+                        .kerning(2)
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 18)
+            .padding(.bottom, 12)
+
+            ForEach(vm.recentChanges.prefix(3)) { change in
+                IdentityChangeCard(
+                    change: change,
+                    isChinese: isChinese,
+                    onTap: { tapChange(change) }
+                )
+                .padding(.horizontal, 24)
+                .padding(.bottom, 12)
+            }
+        }
+        .padding(.bottom, 32)
+    }
+
+    /// Build a draft message referencing this specific change, drop it
+    /// into ChatViewModel.inputText, and switch to the Chat tab. The
+    /// draft is intentionally short and incomplete — it gives the user
+    /// a context-anchor opener; they finish the sentence themselves.
+    private func tapChange(_ change: IdentityChange) {
+        let opener = draftOpener(for: change, isChinese: isChinese)
+        chatVM.inputText = opener
+        router.selectedTab = .chat
+    }
+
+    /// Compose the chat draft. Format is "关于...，我想说" / "About ... I want to
+    /// say" — gives context without putting words in the user's mouth.
+    private func draftOpener(for change: IdentityChange, isChinese: Bool) -> String {
+        switch change.action {
+        case "nudge":
+            let dim = change.dimension ?? "—"
+            let delta = change.delta ?? 0
+            let sign = delta > 0 ? "+" : ""
+            if isChinese {
+                return "关于你刚把「\(dim) \(sign)\(delta)」那次调整，我想说："
+            } else {
+                return "About that \"\(dim) \(sign)\(delta)\" adjustment you just made — "
+            }
+        case "replace":
+            return isChinese
+                ? "关于你刚才把整张身份卡重写，我想说："
+                : "About rewriting the whole identity card just now — "
+        case "init":
+            return isChinese
+                ? "关于你刚才第一次写身份卡，我想说："
+                : "About writing the identity card for the first time — "
+        default:
+            return isChinese
+                ? "关于你刚才那次身份调整，我想说："
+                : "About that identity change just now — "
+        }
+    }
+
     // MARK: - Empty state
 
     private var emptyState: some View {
@@ -223,6 +316,138 @@ private struct CinDimensionRow: View {
         .overlay(alignment: .top) {
             Rectangle().fill(Color.cinLine).frame(height: 0.5).padding(.horizontal, 24)
         }
+    }
+}
+
+// MARK: - Identity-change card
+//
+// One entry in the "最近的变化" feed. Style matches the Identity page's
+// existing typography (dmMono for timestamps/numbers, notoSerifSC for
+// reason text, cinAccent1 for delta emphasis). The whole card is a tap
+// target — the CTA "和我聊聊 ↗" is a visual hint, not a separate button.
+
+private struct IdentityChangeCard: View {
+    let change: IdentityChange
+    let isChinese: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            VStack(alignment: .leading, spacing: 10) {
+                // Timestamp row — month/day · time, with action marker if
+                // this is an init/replace (no diff to show in the body).
+                HStack(alignment: .center, spacing: 8) {
+                    Text(formattedTimestamp)
+                        .font(.dmMono(size: 9.5))
+                        .foregroundStyle(Color.cinSub)
+                        .kerning(1.5)
+                    Spacer()
+                    if change.action != "nudge", let label = actionLabel {
+                        Text(label)
+                            .font(.dmMono(size: 9))
+                            .foregroundStyle(Color.cinAccent1)
+                            .kerning(2)
+                    }
+                }
+
+                // Diff row — only for nudges. "温柔   7.0 → 7.5    +0.5"
+                if change.action == "nudge",
+                   let dim = change.dimension,
+                   let oldV = change.oldValue,
+                   let newV = change.newValue {
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        Text(dim)
+                            .font(.notoSerifSC(size: 15, weight: .medium))
+                            .foregroundStyle(Color.cinFg)
+                        Text("\(numberFormatted(oldV))  →  \(numberFormatted(newV))")
+                            .font(.dmMono(size: 13))
+                            .foregroundStyle(Color.cinFg)
+                        Spacer()
+                        if let d = change.delta {
+                            Text(deltaFormatted(d))
+                                .font(.dmMono(size: 13, weight: .medium))
+                                .foregroundStyle(Color.cinAccent1)
+                        }
+                    }
+                }
+
+                // Reason text — agent's own voice. Italic newsreader to
+                // match the signature line on the Identity header.
+                if let reason = change.reason, !reason.isEmpty {
+                    Text(reason)
+                        .font(.newsreader(size: 13, italic: true))
+                        .foregroundStyle(Color.cinFg.opacity(0.75))
+                        .lineSpacing(3)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                // CTA hint — entire card is tappable, this is just visual
+                // confirmation that the card leads somewhere.
+                HStack {
+                    Spacer()
+                    Text(isChinese ? "和我聊聊  ↗" : "Talk to me  ↗")
+                        .font(.dmMono(size: 10, weight: .medium))
+                        .foregroundStyle(Color.cinAccent1)
+                        .kerning(1.5)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay(
+                Rectangle()
+                    .stroke(Color.cinLine, lineWidth: 1)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    // Timestamps from the server are ISO 8601. Display as "5/19 · 14:32".
+    private var formattedTimestamp: String {
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var date = iso.date(from: change.ts)
+        if date == nil {
+            iso.formatOptions = [.withInternetDateTime]
+            date = iso.date(from: change.ts)
+        }
+        if date == nil {
+            // Fallback: try plain "yyyy-MM-dd'T'HH:mm:ss" (server's local-time
+            // format without explicit offset). datetime.now().isoformat()
+            // doesn't include 'Z'.
+            let f = DateFormatter()
+            f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSSSSS"
+            date = f.date(from: change.ts)
+            if date == nil {
+                f.dateFormat = "yyyy-MM-dd'T'HH:mm:ss"
+                date = f.date(from: change.ts)
+            }
+        }
+        guard let d = date else { return change.ts }
+        let out = DateFormatter()
+        out.dateFormat = "M/d  ·  HH:mm"
+        return out.string(from: d)
+    }
+
+    private var actionLabel: String? {
+        switch change.action {
+        case "init":    return "◆  IDENTITY · FIRST WRITE"
+        case "replace": return "◆  IDENTITY · REWRITTEN"
+        default:        return nil
+        }
+    }
+
+    /// Server stores dimension values as 0-100 ints; the existing radar
+    /// table displays them as one decimal (7.8 etc.) so the change card
+    /// follows the same convention. value 78 → "7.8".
+    private func numberFormatted(_ v: Int) -> String {
+        String(format: "%.1f", Double(v) / 10.0)
+    }
+
+    private func deltaFormatted(_ d: Int) -> String {
+        let sign = d > 0 ? "+" : ""
+        return "\(sign)\(String(format: "%.1f", Double(d) / 10.0))"
     }
 }
 

@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+@preconcurrency import UserNotifications
 
 struct IdentityCard: Codable {
     var agentName: String
@@ -145,15 +146,52 @@ struct IdentityCard: Codable {
     }
 }
 
+/// One entry in the identity-change feed (/v1/identity/changes). Mirrors
+/// the dict returned by backend's `_load_identity_changes`. Each card in
+/// the iOS "最近的变化" section is one of these.
+struct IdentityChange: Codable, Identifiable, Equatable {
+    let id: String
+    let ts: String                  // ISO 8601 from server
+    let action: String              // "init" | "replace" | "nudge"
+    let dimension: String?
+    let oldValue: Int?
+    let newValue: Int?
+    let delta: Int?
+    let reason: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, ts, action, dimension, reason
+        case oldValue = "old_value"
+        case newValue = "new_value"
+        case delta
+    }
+
+    /// `true` for changes worth surfacing as a local push (big nudges or
+    /// any replace). Small ±1/2 nudges accumulate in the feed but don't
+    /// pop a notification — would be too noisy.
+    var deservesNotification: Bool {
+        switch action {
+        case "init", "replace": return true
+        case "nudge":           return abs(delta ?? 0) >= 5
+        default:                return false
+        }
+    }
+}
+
 @MainActor
 class IdentityViewModel: ObservableObject {
     @Published var identity: IdentityCard? = nil
     @Published var isLoading = false
     @Published var didJustBootstrap = false
+    /// Newest-first list of identity changes; powers the "最近的变化" feed.
+    @Published var recentChanges: [IdentityChange] = []
 
     private var timer: Timer?
     private var wasNil = true
     private var resetObserver: NSObjectProtocol?
+    // Tracks which change IDs we've already shown a local push for, so the
+    // poll loop doesn't re-fire the same notification every 10s.
+    private var notifiedChangeIDs: Set<String> = []
 
     init() {
         resetObserver = NotificationCenter.default.addObserver(
@@ -178,12 +216,20 @@ class IdentityViewModel: ObservableObject {
         isLoading = false
         didJustBootstrap = false
         wasNil = true
+        recentChanges = []
+        notifiedChangeIDs.removeAll()
     }
 
     func startPolling() {
-        Task { await loadIdentity() }
+        Task {
+            await loadIdentity()
+            await loadRecentChanges()
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
-            Task { await self?.loadIdentity() }
+            Task {
+                await self?.loadIdentity()
+                await self?.loadRecentChanges()
+            }
         }
     }
 
@@ -194,6 +240,44 @@ class IdentityViewModel: ObservableObject {
 
     private func contentSK() -> Curve25519.KeyAgreement.PrivateKey? {
         do { return try ContentKeyStore.shared.loadPrivateKey() } catch { return nil }
+    }
+
+    /// Poll /v1/identity/changes. New entries (not in notifiedChangeIDs)
+    /// fire a local push if they pass the deservesNotification filter.
+    /// This is the "agent silently nudged my dimensions — let me know"
+    /// surface; the existing chat / memory poll loops aren't touched.
+    func loadRecentChanges() async {
+        guard let req = FeedlingAPI.shared.authorizedRequest(
+            path: "/v1/identity/changes",
+            queryItems: [URLQueryItem(name: "limit", value: "50")]
+        ) else { return }
+        do {
+            let (data, _) = try await URLSession.shared.data(for: req)
+            struct Response: Codable {
+                let changes: [IdentityChange]
+            }
+            let decoded = try JSONDecoder().decode(Response.self, from: data)
+            let previouslySeen = notifiedChangeIDs
+            // Find changes we haven't notified for AND that deserve a push.
+            // First poll: notifiedChangeIDs is empty — seed it without
+            // firing pushes (so old history doesn't spam on first launch).
+            let isFirstPoll = previouslySeen.isEmpty && recentChanges.isEmpty
+            let newOnes = decoded.changes.filter {
+                !previouslySeen.contains($0.id) && $0.deservesNotification
+            }
+            recentChanges = decoded.changes
+            for c in decoded.changes {
+                notifiedChangeIDs.insert(c.id)
+            }
+            if !isFirstPoll {
+                for c in newOnes {
+                    IdentityChangeNotifier.shared.fire(change: c,
+                                                      agentName: identity?.agentName ?? "")
+                }
+            }
+        } catch {
+            print("[IdentityVM] changes load error: \(error)")
+        }
     }
 
     func loadIdentity() async {
@@ -219,6 +303,99 @@ class IdentityViewModel: ObservableObject {
             }
         } catch {
             log("[IdentityVM] load error: \(error)")
+        }
+    }
+}
+
+
+// MARK: - Identity-change local notifier
+//
+// Fires a UNUserNotification when a new identity change lands. Title is
+// the agent's name (so the lock-screen shows "小哆啦" + body), body is
+// the reason text verbatim (truncated by iOS to ~80 chars on lock screen).
+//
+// This is intentionally NOT an APNs push — it's a LOCAL notification
+// scheduled by iOS itself when polling detects a new entry. No server-
+// side push tokens or external delivery; works offline if the change
+// already landed and is polled later.
+//
+// We don't include the dimension/delta in the body; the reason field
+// already speaks in the agent's voice and is what the user came for.
+
+@MainActor
+final class IdentityChangeNotifier {
+    static let shared = IdentityChangeNotifier()
+    private init() {}
+
+    private var permissionRequested = false
+
+    func fire(change: IdentityChange, agentName: String) {
+        let body = (change.reason ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        // Skip silent pushes — if the agent didn't bother writing a reason
+        // there's nothing meaningful to notify about.
+        guard !body.isEmpty else { return }
+
+        let center = UNUserNotificationCenter.current()
+        ensurePermission(center: center) { [weak self] granted in
+            guard granted else { return }
+            self?.schedule(change: change, agentName: agentName, body: body, center: center)
+        }
+    }
+
+    private func ensurePermission(center: UNUserNotificationCenter, completion: @escaping @MainActor (Bool) -> Void) {
+        center.getNotificationSettings { settings in
+            let status = settings.authorizationStatus
+            Task { @MainActor in
+                switch status {
+                case .authorized, .provisional, .ephemeral:
+                    completion(true)
+                case .denied:
+                    completion(false)
+                case .notDetermined:
+                    // Only request once per session — don't pester the user.
+                    guard !self.permissionRequested else { completion(false); return }
+                    self.permissionRequested = true
+                    do {
+                        let granted = try await center.requestAuthorization(options: [.alert, .sound])
+                        completion(granted)
+                    } catch {
+                        completion(false)
+                    }
+                @unknown default:
+                    completion(false)
+                }
+            }
+        }
+    }
+
+    private func schedule(change: IdentityChange,
+                          agentName: String,
+                          body: String,
+                          center: UNUserNotificationCenter) {
+        let content = UNMutableNotificationContent()
+        content.title = agentName.isEmpty ? "Identity update" : agentName
+        // Subtitle gives the dimension/delta context above the body so the
+        // user can scan it without expanding. Only for nudges; init/replace
+        // skip subtitle (no diff to show).
+        if change.action == "nudge",
+           let dim = change.dimension, let delta = change.delta {
+            let sign = delta > 0 ? "+" : ""
+            content.subtitle = "\(dim) \(sign)\(delta)"
+        }
+        content.body = body
+        // userInfo carries the change id so a future tap-handler can
+        // navigate to the Identity tab and highlight this card.
+        content.userInfo = ["identity_change_id": change.id, "action": change.action]
+        // Use a trigger of nil (deliver immediately).
+        let request = UNNotificationRequest(
+            identifier: "identity_change_\(change.id)",
+            content: content,
+            trigger: nil
+        )
+        center.add(request) { error in
+            if let error {
+                print("[IdentityChangeNotifier] schedule failed: \(error)")
+            }
         }
     }
 }

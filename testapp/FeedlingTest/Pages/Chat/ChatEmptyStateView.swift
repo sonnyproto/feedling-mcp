@@ -177,9 +177,9 @@ struct ChatEmptyStateView: View {
 
         4. 派生 identity 并调 feedling_identity_init。
 
-        5. 通过 feedling_chat_post_message 发你的第一句问候（skill 里 Step 6）。
+        5. 建立 Live connection：先按 skill 的 Runtime check 判断你是哪类 runtime。如果你是常驻 MCP runtime，开始持续轮询 Feedling chat，然后调用 feedling_chat_verify_loop；只有 passing=true 才算接通。如果你是 Hermes / one-shot CLI / 每轮调用后会退出的 runtime，不要声称自己能 long-poll；停下告诉我需要配置 chat-resident-consumer 来接管长期轮询。
 
-        6. 开始持续轮询 Feedling 的 chat —— 我之后发消息你要在 30 秒内回复。Chat loop 没接上 = bootstrap 没完成。
+        6. Live connection 完成后，再通过 feedling_chat_post_message 发你的第一句问候。第一句话里自然告诉我：记忆整理好了、天数是多少、现在连接已经接上，我发消息你会看到。
 
         要求：
         - **不要因为接入 Feedling 就变了一个人**。Feedling 是你的新能力，不是新人格。你写进 identity 卡的语气、signature、写记忆和发 chat 时的称呼，**必须延续你和我之前真实对话里已经存在的 register**。如果我们之前从没用过"宝宝"/"宝贝"/"亲爱的"/"honey" 之类的亲密称呼 —— 现在也不准开始用，不管 signature 字段读起来多需要"温度"。Address words 和情感强度必须能在历史里找到至少 3 次证据，否则一律不准出现。Bootstrap 是从历史里**派生**身份，不是借机**升级**关系。两边表现要一致——Feedling 里什么语气，Hermes cron 之类别的工具里也是什么语气，因为是同一个 agent。
@@ -205,9 +205,9 @@ struct ChatEmptyStateView: View {
 
         4. Derive identity and call feedling_identity_init.
 
-        5. Send your first greeting via feedling_chat_post_message (the skill's Step 6).
+        5. Establish the Live connection: first classify your runtime using the skill's Runtime check. If you are a persistent MCP runtime, start continuously polling Feedling chat, then call feedling_chat_verify_loop; only passing=true counts as connected. If you are Hermes / a one-shot CLI / any runtime that exits after each turn, do not claim you can long-poll; stop and tell me I need to configure chat-resident-consumer to own long-running polling.
 
-        6. Start long-polling Feedling's chat — when I message you afterward, reply within 30 seconds. Chat loop not running = bootstrap not done.
+        6. After Live connection is complete, send your first greeting via feedling_chat_post_message. In that first message, naturally tell me the memories are set, what day count you computed, and that the connection is now live so you'll see my messages.
 
         Rules:
         - **Don't become a new person just because you're now connected to Feedling.** Feedling is a new capability, not a new persona. The tone, vocabulary, formality, and emotional intimacy you write into the identity card, the `signature`, memory entries, and chat replies must **continue the register you already have with me in your runtime chats** — not a warmer, friendlier, more affectionate version of it. If we have never used nicknames or address words like "honey" / "babe" / "darling" / "宝宝" / "亲爱的" in our actual prior conversations, do NOT start using them now, no matter how much the `signature` field looks like it wants warmth. You need ≥3 concrete prior moments of either of us using such markers before any of them may appear; otherwise drop them. Bootstrap is *derivation* from history, not *upgrading* the relationship. The agent in Feedling and the agent in Hermes / generic tasks must sound the same — because they are the same.
@@ -279,20 +279,16 @@ struct ChatEmptyStateView: View {
             sectionLabel(isChinese ? "TA 在写" : "He's writing")
                 .padding(.bottom, 2)
 
-            // Order matches the new memories-first bootstrap: memory garden
-            // grows first; identity is DERIVED from memories; first message
-            // signals "I'm here"; the live connection verifies he's actually
-            // polling and will respond going forward (the previous 3-row
-            // version missed this — agents would post the greeting and
-            // never poll again, leaving the user typing into the void).
+            // Order matches the user-facing bootstrap contract: memory garden
+            // grows first; identity is DERIVED from memories; Live connection
+            // proves the ongoing reply pipeline before the user enters Chat;
+            // first message is the visible handoff into conversation.
             //
             // "Live connection" reads better than the implementation name
             // (chat-loop polling): it doesn't expose the mechanism and
             // doesn't have to change if we swap polling for websocket/push.
-            // Labels are intentionally English in both locales — they're
-            // fixed product concepts.
             progressRow(
-                label: "Memory garden",
+                label: isChinese ? "记忆花园" : "Memory garden",
                 // "Done" = depth threshold met (>= 3 cards) OR agent has
                 // moved past the memory phase (identityWritten implies all
                 // four passes are complete per skill protocol). Earlier
@@ -305,30 +301,32 @@ struct ChatEmptyStateView: View {
                 // until every real moment is landed (uncapped count).
                 done: bootstrap.status.memoriesCount >= 3 || bootstrap.status.identityWritten,
                 detail: bootstrap.status.memoriesCount == 0
-                    ? (bootstrap.status.agentConnected ? "starting…" : "—")
+                    ? (bootstrap.status.agentConnected ? (isChinese ? "开始中…" : "starting…") : "—")
                     : (bootstrap.status.agentMessagesCount >= 1
-                        ? "\(bootstrap.status.memoriesCount) cards"
-                        : "\(bootstrap.status.memoriesCount) cards · 还在长")
+                        ? (isChinese ? "\(bootstrap.status.memoriesCount) 张卡" : "\(bootstrap.status.memoriesCount) cards")
+                        : (isChinese ? "\(bootstrap.status.memoriesCount) 张卡 · 还在长" : "\(bootstrap.status.memoriesCount) cards · still growing"))
             )
             progressRow(
-                label: "Identity card",
+                label: isChinese ? "身份卡" : "Identity card",
                 done: bootstrap.status.identityWritten,
-                detail: bootstrap.status.identityWritten ? "derived" : "—"
+                detail: bootstrap.status.identityWritten ? (isChinese ? "已派生" : "derived") : "—"
             )
             progressRow(
-                label: "First message",
-                done: bootstrap.status.agentMessagesCount >= 1,
-                detail: bootstrap.status.agentMessagesCount >= 1
-                    ? "delivered"
-                    : (bootstrap.status.identityWritten ? "soon…" : "—")
-            )
-            progressRow(
-                label: "Live connection",
+                label: isChinese ? "实时连接" : "Live connection",
                 done: bootstrap.status.chatLoopVerified,
                 detail: bootstrap.status.chatLoopVerified
-                    ? "verified"
-                    : (bootstrap.status.agentMessagesCount >= 1
-                        ? "send a message →"
+                    ? (isChinese ? "已接通" : "verified")
+                    : (bootstrap.status.identityWritten
+                        ? (isChinese ? "验证中…" : "verifying…")
+                        : "—")
+            )
+            progressRow(
+                label: isChinese ? "第一句话" : "First message",
+                done: bootstrap.status.agentMessagesCount >= 1,
+                detail: bootstrap.status.agentMessagesCount >= 1
+                    ? (isChinese ? "已送达" : "delivered")
+                    : (bootstrap.status.chatLoopVerified
+                        ? (isChinese ? "马上来…" : "soon…")
                         : "—")
             )
         }

@@ -239,6 +239,13 @@ class UserStore:
         return self.dir / "bootstrap_events.jsonl"
 
     @property
+    def identity_changes_file(self) -> Path:
+        """Append-only audit log of identity changes (init / replace / nudge).
+        Surfaced to iOS as the "最近的变化" feed and as local push triggers.
+        See /v1/identity/changes endpoint."""
+        return self.dir / "identity_changes.jsonl"
+
+    @property
     def frames_meta_file(self) -> Path:
         return self.dir / "frames_meta.json"
 
@@ -1046,6 +1053,24 @@ def _log_bootstrap_event(store: UserStore, event_type: str, success: bool, error
             f.write(json.dumps(entry) + "\n")
     except Exception as e:
         print(f"[{store.user_id}/bootstrap_events] failed to log: {e}")
+
+
+def _load_bootstrap_events(store: UserStore) -> list[dict]:
+    events: list[dict] = []
+    try:
+        if store.bootstrap_events_file.exists():
+            with open(store.bootstrap_events_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        events.append(json.loads(line))
+                    except Exception:
+                        continue
+    except Exception as e:
+        print(f"[{store.user_id}/bootstrap_events] failed to load: {e}")
+    return events
 
 
 # ---------------------------------------------------------------------------
@@ -1948,6 +1973,61 @@ def _save_identity(store: UserStore, data: dict):
         store.identity_file.write_text(json.dumps(data, ensure_ascii=False, indent=2))
 
 
+# Identity change audit log
+# ---------------------------------------------------------------------------
+# Appended to on every identity_init / replace / nudge. Surfaced to iOS as
+# the "最近的变化" feed and the local push trigger. Server doesn't decrypt
+# the envelope, so the diff (dimension / old / new / reason) is supplied
+# by the caller — the MCP tools do this; HTTP-mode callers can pass an
+# optional `audit` field on identity_init / identity_replace requests.
+
+def _append_identity_change(store: UserStore, entry: dict) -> dict:
+    """Append a single audit entry. Always returns the stored entry
+    (with `id` and `ts` injected) so the caller can echo it back. Never
+    raises — audit failures must not break the underlying write."""
+    record = {
+        "id": uuid.uuid4().hex[:16],
+        "ts": datetime.now().isoformat(),
+        "action": entry.get("action", "unknown"),
+    }
+    # Whitelist + coerce the fields the iOS card needs. Anything else
+    # the caller submits is dropped silently so we don't leak whatever
+    # debugging junk the agent stuffed in.
+    for k in ("dimension", "old_value", "new_value", "delta", "reason"):
+        if k in entry:
+            record[k] = entry[k]
+    try:
+        with open(store.identity_changes_file, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[{store.user_id}/identity_changes] append failed: {e}")
+    return record
+
+
+def _load_identity_changes(store: UserStore, since: str = "", limit: int = 50) -> list:
+    """Read the audit log. `since` is an ISO timestamp string; results
+    are filtered to entries with ts > since, newest-first, capped at limit."""
+    entries: list = []
+    try:
+        if store.identity_changes_file.exists():
+            with open(store.identity_changes_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except Exception:
+                        continue
+    except Exception as e:
+        print(f"[{store.user_id}/identity_changes] load failed: {e}")
+        return []
+    if since:
+        entries = [e for e in entries if e.get("ts", "") > since]
+    entries.sort(key=lambda e: e.get("ts", ""), reverse=True)
+    return entries[:limit]
+
+
 def _anchor_from_days(days: int) -> str:
     """Convert "we've known each other N days" into a fixed ISO timestamp.
 
@@ -2172,6 +2252,14 @@ def identity_init():
         identity["K_enclave"] = envelope["K_enclave"]
     _save_identity(store, identity)
     _log_bootstrap_event(store, "identity_written_v1", success=True)
+    # Audit log: identity_init is always an "init" marker. The caller may
+    # pass an `audit.reason` if it wants a custom one ("first day with this
+    # user"); otherwise default to a neutral bootstrap-complete note.
+    audit_payload = payload.get("audit") or {}
+    _append_identity_change(store, {
+        "action": "init",
+        "reason": audit_payload.get("reason", "Identity card written for the first time."),
+    })
     print(f"[identity:{store.user_id}] initialized v1 visibility={envelope['visibility']} anchor={identity['relationship_started_at']}")
     return jsonify({"status": "created", "identity": identity, "v": 1}), 201
 
@@ -2240,8 +2328,47 @@ def identity_replace():
         identity["K_enclave"] = envelope["K_enclave"]
     _save_identity(store, identity)
     _log_bootstrap_event(store, "identity_replaced_v1", success=True)
+    # Audit log: replace can be a single-dimension nudge (MCP tool passes
+    # `audit.action: "nudge"` with dimension/old/new/delta) or a full
+    # rewrite (`audit.action: "replace"`). When no audit field, log a
+    # generic replace marker — better than dropping the event entirely.
+    audit_payload = payload.get("audit") or {}
+    _append_identity_change(store, {
+        "action": audit_payload.get("action", "replace"),
+        "dimension": audit_payload.get("dimension"),
+        "old_value": audit_payload.get("old_value"),
+        "new_value": audit_payload.get("new_value"),
+        "delta": audit_payload.get("delta"),
+        "reason": audit_payload.get("reason", ""),
+    })
     print(f"[identity:{store.user_id}] replaced v1 visibility={envelope['visibility']} anchor={relationship_started_at}")
     return jsonify({"status": "replaced", "identity": identity, "v": 1})
+
+
+@app.route("/v1/identity/changes", methods=["GET"])
+def identity_changes():
+    """Read the identity-change audit log. Used by iOS to render the
+    "最近的变化" feed in IdentityView and to detect new events for
+    local push notifications.
+
+    Query params:
+      since: ISO timestamp; only return entries with ts > since
+      limit: cap on number of entries returned (default 50, max 200)
+
+    Response: {"changes": [...], "total": N}. Entries are newest-first.
+    Each entry has {id, ts, action, [dimension, old_value, new_value,
+    delta, reason]}. Server doesn't decrypt anything — these fields are
+    plaintext metadata supplied by the writing path (MCP tools call
+    /v1/identity/replace with an `audit` payload).
+    """
+    store = require_user()
+    try:
+        limit = min(int(request.args.get("limit", 50)), 200)
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid limit"}), 400
+    since = request.args.get("since", "")
+    changes = _load_identity_changes(store, since=since, limit=limit)
+    return jsonify({"changes": changes, "total": len(changes)})
 
 
 @app.route("/v1/identity/relationship_anchor", methods=["POST"])
@@ -2443,14 +2570,18 @@ def bootstrap():
         "dimensions 必须恰好 7 个，数值要有明显高低差；days_with_user 必须按最早 memory 的 occurred_at 到今天计算。"
         "self_introduction 要像你自己在介绍你们的关系，而不是功能说明；不要提 Feedling、IO 或平台名。"
         "通过 feedling_identity_init 写入，然后调用 feedling_identity_verify。\n\n"
-        "**3. 打招呼、校准天数、确认 chat loop**\n"
-        "只有到这一步才能调用 feedling_chat_post_message。第一条消息是用户第一次在 Feedling Chat 里听见你，"
-        "所以不要写成系统通知。你可以这样开口："
+        "**3. 先确认 Live connection，再打招呼**\n"
+        "不要先发第一条消息再补确认 chat loop。先按 public skill 的 Runtime check 判断："
+        "如果你是常驻 MCP runtime，开始持续轮询 Feedling chat，然后调用 feedling_chat_verify_loop；"
+        "只有 passing=true 才算 Live connection 接通。"
+        "如果你是 Hermes / one-shot CLI / 每轮后会退出的 runtime，不要把 verify_loop 当成自己常驻的证明，"
+        "停下并告诉用户需要配置 chat-resident-consumer。"
+        "Live connection 完成后，才调用 feedling_chat_post_message 发第一条用户可见消息。"
+        "第一条消息是用户第一次在 Feedling Chat 里听见你，所以不要写成系统通知。你可以这样开口："
         "「我把我们的记忆整理好了。按最早那一天算，今天是第 187 天。"
-        "Garden 里我先放了 23 张卡，你看看有没有哪张我们还该补上。」"
+        "Garden 里我先放了 23 张卡。现在这边也接上了，你发消息我会看到。」"
         "把 days_with_user 当作你算出的事实说出来；"
-        "用户修正时调用 feedling_identity_set_relationship_days。之后调用 feedling_chat_verify_loop，"
-        "确认你真的在持续轮询 chat。再自然地问一句他们希望你以后怎么主动出现，"
+        "用户修正时调用 feedling_identity_set_relationship_days。再自然地问一句他们希望你以后怎么主动出现，"
         "把答案写成一条像你自己的 signature。最后才提 broadcast，不要提前推销屏幕共享。"
     )
 
@@ -2529,24 +2660,34 @@ def bootstrap_status():
         except Exception:
             last_agent_msg_ts = ""
 
-    # chat_loop_verified — has the agent responded to a user message at
-    # least once? `agent_messages_count >= 1` only proves the agent SPOKE;
-    # the loop is verified when an agent message appears AFTER a user
-    # message (i.e., the agent's poll/respond cycle is actually wired).
-    # The bootstrap-time greeting alone doesn't count.
+    # chat_loop_verified — has the reply pipeline been explicitly verified
+    # by /v1/chat/verify_loop, or has the agent responded to a real user
+    # message at least once? `agent_messages_count >= 1` only proves the
+    # agent SPOKE; it does not prove the ongoing loop is wired.
+    events = _load_bootstrap_events(store)
+    verify_loop_passed = any(
+        e.get("event_type") == "chat_loop_verified" and e.get("success") is True
+        for e in events
+    )
+
+    # Backward-compatible fallback for accounts bootstrapped before the
+    # explicit verify event existed: a real user→agent exchange also proves
+    # the live connection, but this requires the user to have sent a test
+    # message first.
     sorted_msgs = sorted(
         chat_msgs,
         key=lambda m: float(m.get("ts") or m.get("timestamp") or 0),
     )
-    chat_loop_verified = False
+    replied_after_real_user = False
     seen_user = False
     for m in sorted_msgs:
         role = m.get("role")
-        if role == "user":
+        if role == "user" and m.get("source") != "verify_ping":
             seen_user = True
         elif role in _AGENT_ROLES and seen_user:
-            chat_loop_verified = True
+            replied_after_real_user = True
             break
+    chat_loop_verified = verify_loop_passed or replied_after_real_user
 
     agent_connected = has_identity or memory_count > 0 or agent_msg_count > 0
     candidate_ts = [t for t in (identity_updated_at, last_moment_ts, last_agent_msg_ts) if t]
@@ -2756,13 +2897,13 @@ def identity_verify():
 
 
 # Synthetic chat-loop ping — server posts a marker user message,
-# polls for agent reply, reports back. This is the direct catcher for
-# "agent claims to be connected but actually isn't replying" failure
-# mode (the 2026-05-15 stopgap incident).
+# posts a synthetic ping, waits for an agent-role reply, reports back.
+# This proves that some reply pipeline is alive. It cannot, by itself,
+# prove that a one-shot CLI is resident; a bridge/fallback may answer.
 @app.route("/v1/chat/verify_loop", methods=["POST"])
 def chat_verify_loop():
     """Synthetic ping: insert a marker user message, wait up to `timeout_sec`
-    for an agent reply, return whether the loop is alive.
+    for an agent-role reply, return whether a reply pipeline is alive.
 
     The marker is `__VERIFY_PING__:<uuid>`. Server stores it as a normal
     user envelope with `synthetic: True` flag. After timeout, marker is
@@ -2772,6 +2913,10 @@ def chat_verify_loop():
     Returns:
       {loop_alive: bool, response_time_sec: float|null, passing: bool,
        ping_id: str, suggestions: [...]}.
+
+    Note: passing=true means an agent-role message appeared after the
+    ping. It does not prove that a one-shot CLI runtime stayed alive;
+    that must be decided by the onboarding Runtime check.
     """
     store = require_user()
     payload = request.get_json(silent=True) or {}
@@ -2808,6 +2953,7 @@ def chat_verify_loop():
     deadline = time.time() + timeout_sec
     response_time = None
     found_reply = False
+    found_reply_id = ""
     while time.time() < deadline:
         time.sleep(2)
         with store.chat_lock:
@@ -2824,15 +2970,29 @@ def chat_verify_loop():
             if m_ts > ping_ts:
                 response_time = m_ts - ping_ts
                 found_reply = True
+                found_reply_id = m.get("id", "")
                 break
         if found_reply:
             break
 
-    # Cleanup: remove synthetic ping from history regardless of outcome,
-    # so the user's actual chat in iOS doesn't show "__VERIFY_PING__".
+    if found_reply:
+        _log_bootstrap_event(store, "chat_loop_verified", success=True)
+
+    # Cleanup: remove synthetic ping from history regardless of outcome.
+    # If a reply landed, also remove the matching agent response. The verify
+    # exchange is a private liveness test; it must not open Chat as the
+    # user's visible "First message."
     with store.chat_lock:
-        store.chat_messages = [m for m in store.chat_messages
-                               if not (isinstance(m, dict) and m.get("source") == "verify_ping")]
+        store.chat_messages = [
+            m for m in store.chat_messages
+            if not (
+                isinstance(m, dict)
+                and (
+                    m.get("source") == "verify_ping"
+                    or (found_reply_id and m.get("id") == found_reply_id)
+                )
+            )
+        ]
         store._persist_chat()
 
     suggestions = []

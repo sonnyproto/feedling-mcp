@@ -5,22 +5,24 @@ of these are imported by the backend at runtime.
 
 ## `chat_resident_consumer.py` — HTTP-mode chat bridge
 
-A long-running daemon that lets a **non-MCP agent backend** participate
+A long-running daemon that lets a **non-resident agent backend** participate
 in Feedling chat. Without it, a Feedling iOS user can send chat messages
 to a Feedling server but no one ever replies — unless they're connected
-via an MCP runtime, which handles polling and replying natively.
+via a runtime that stays alive and handles polling/replying natively.
 
 ### When you need this
 
 | Your agent runtime | Use chat-resident? |
 |--|--|
-| Claude Desktop, Claude Code, OpenClaw, Cursor, Hermes-MCP — any client that does `claude mcp add feedling …` | **No.** MCP runtimes long-poll and reply natively via `feedling_chat_post_message`. |
+| Claude Desktop, Claude Code, OpenClaw, Cursor, Hermes-MCP **when the process stays alive between user turns** | **No.** A resident MCP runtime long-polls and replies natively via `feedling_chat_post_message`. |
+| Hermes CLI / mcporter / any MCP-capable CLI that exits after one invocation | **Yes.** MCP tools are not enough; if the process is not resident, it cannot own the chat loop. |
 | Custom Python script that just makes HTTP requests | **Yes.** |
 | Plain Anthropic / OpenAI API loop without MCP support | **Yes.** |
 | Local Llama / Ollama / vLLM serving a `/chat` endpoint | **Yes.** |
 | A CLI tool you want to use as the agent (Hermes-CLI, etc.) | **Yes.** |
 
 If you're in the "Yes" rows, `chat_resident_consumer.py` is the bridge.
+The test is process lifetime, not brand name and not whether MCP tools exist.
 
 ### What it does
 
@@ -121,6 +123,13 @@ AGENT_CLI_CMD=hermes chat -Q --continue --max-turns 1 -q "{message}"
 ```
 
 `--continue` keeps Hermes' conversation memory across turns.
+
+Before installing the daemon, run the exact Hermes command in a terminal with
+a normal user message and confirm stdout is a real model reply in the agent's
+voice. If it returns a shell like "我看到了：<message>。你要我继续展开哪一块?"
+or another template, the resident is correctly forwarding messages but the
+configured CLI command is not reaching the real agent session. Fix
+`AGENT_CLI_CMD` / session selection before running it as a service.
 
 ### Image messages
 
