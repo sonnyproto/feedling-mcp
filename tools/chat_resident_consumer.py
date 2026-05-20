@@ -504,7 +504,7 @@ _IDENTITY_LEAK_RE = re.compile(r"\b(hermes|reasoning|chain\s*of\s*thought)\b", r
 # Typical leaked planning / chain-of-thought lead-ins from agent UIs.
 _REASONING_LINE_RE = re.compile(
     r"^\s*(i\s+need\s+to|i\'?m\s+thinking|the\s+user\s+wrote|the\s+user\s+wants|"
-    r"this\s+(means|doesn\'?t)|i\s+should|i\'?ll|let\s+me\s+|my\s+plan\s+is)",
+    r"this\s+(means|doesn\'?t)|i\s+think|i\s+should|i\'ll|let\s+me\s+|my\s+plan\s+is)",
     re.IGNORECASE,
 )
 
@@ -694,10 +694,6 @@ def _sanitize_reply_text(text: str) -> str:
         kept = [ln for ln in kept if any("一" <= c <= "鿿" for c in ln)]
         if not kept:
             return ""
-    else:
-        # No Chinese line at all: likely an English planning block from upstream.
-        # Return empty so caller falls back to safe Chinese fallback message.
-        return ""
 
     # Dedup consecutive identical lines.
     deduped: list[str] = []

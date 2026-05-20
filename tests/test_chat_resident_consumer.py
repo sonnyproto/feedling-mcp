@@ -390,6 +390,13 @@ I think it's best to respond warmly and playfully."""
     assert cleaned == ""
 
 
+def test_sanitize_reply_text_allows_direct_english_reply():
+    raw = """Hello Seven — I see your message now.
+Tell me what you want to work on next."""
+    cleaned = crc._sanitize_reply_text(raw)
+    assert cleaned == "Hello Seven — I see your message now.\nTell me what you want to work on next."
+
+
 def test_normalize_agent_replies_supports_messages_array_json():
     raw = '{"messages":["在。","我在听。","继续说。"]}'
     out = crc._normalize_agent_replies(raw)
