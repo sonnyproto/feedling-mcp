@@ -2578,11 +2578,14 @@ def bootstrap():
         "self_introduction 要像你自己在介绍你们的关系，而不是功能说明；不要提 Feedling、IO 或平台名。"
         "通过 feedling_identity_init 写入，然后调用 feedling_identity_verify。\n\n"
         "**3. 先确认 Live connection，再打招呼**\n"
-        "不要先发第一条消息再补确认 chat loop。先按 public skill 的 Runtime check 判断："
-        "如果你是常驻 MCP runtime，开始持续轮询 Feedling chat，然后调用 feedling_chat_verify_loop；"
+        "不要先发第一条消息再补确认 chat loop。先按 public skill 的 Connection owner selection 判断："
+        "如果你是 Hermes/OpenClaw gateway、Telegram/WeChat/Feishu 式 bot host、"
+        "或任何会在用户消息之间保持常驻的 agent process，优先在同一个 resident gateway 里"
+        "启用 Feedling/IO channel，并由它持续轮询 Feedling chat；然后调用 feedling_chat_verify_loop，"
         "只有 passing=true 才算 Live connection 接通。"
-        "如果你是 Hermes / one-shot CLI / 每轮后会退出的 runtime，不要把 verify_loop 当成自己常驻的证明，"
-        "停下并告诉用户需要配置 chat-resident-consumer。"
+        "不要把 Hermes/OpenClaw 默认降级成 `hermes chat ...` one-shot CLI；"
+        "只有当你确认自己真的只是一个每轮后退出的命令、且没有 resident gateway/channel 可用时，"
+        "才停下并告诉用户需要配置 chat-resident-consumer。"
         "Live connection 完成后，才调用 feedling_chat_post_message 发第一条用户可见消息。"
         "第一条消息是用户第一次在 Feedling Chat 里听见你，所以不要写成系统通知。你可以这样开口："
         "「我把我们的记忆整理好了。按最早那一天算，今天是第 187 天。"
@@ -2922,8 +2925,8 @@ def chat_verify_loop():
        ping_id: str, suggestions: [...]}.
 
     Note: passing=true means an agent-role message appeared after the
-    ping. It does not prove that a one-shot CLI runtime stayed alive;
-    that must be decided by the onboarding Runtime check.
+    ping. It does not prove that a one-shot command stayed alive;
+    that must be decided by the onboarding Connection owner selection.
     """
     store = require_user()
     payload = request.get_json(silent=True) or {}
