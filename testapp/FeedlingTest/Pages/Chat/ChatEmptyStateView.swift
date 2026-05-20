@@ -18,6 +18,54 @@ struct ChatEmptyStateView: View {
     /// github.com/teleport-computer/io-onboarding — update there + reflect
     /// here if the hosting moves.
     static let skillURL = "https://raw.githubusercontent.com/teleport-computer/io-onboarding/main/skill.md"
+    static let skillBaseURL = "https://raw.githubusercontent.com/teleport-computer/io-onboarding/main"
+
+    private enum BringInPath: String, CaseIterable, Identifiable {
+        case claude
+        case hermes
+        case server
+        case api
+        case unsure
+
+        var id: String { rawValue }
+
+        var skillPath: String {
+            switch self {
+            case .claude: return "skill-claude.md"
+            case .hermes: return "skill-hermes.md"
+            case .server: return "skill-server.md"
+            case .api: return "skill-api.md"
+            case .unsure: return "skill-guide.md"
+            }
+        }
+
+        var skillURL: String { "\(ChatEmptyStateView.skillBaseURL)/\(skillPath)" }
+
+        func title(isChinese: Bool) -> String {
+            switch self {
+            case .claude: return "Claude"
+            case .hermes: return "Hermes / OpenClaw"
+            case .server: return isChinese ? "一台醒着的服务器" : "A server that stays awake"
+            case .api: return isChinese ? "我自己的接口" : "My own doorway"
+            case .unsure: return isChinese ? "我不确定" : "I'm not sure"
+            }
+        }
+
+        func subtitle(isChinese: Bool) -> String {
+            switch self {
+            case .claude:
+                return isChinese ? "他在桌面或 Code 里继续陪你。" : "He stays with you through Desktop or Code."
+            case .hermes:
+                return isChinese ? "他在终端里被你唤醒。" : "He wakes from a terminal."
+            case .server:
+                return isChinese ? "他已经住在一台会一直运行的机器上。" : "He already lives somewhere that keeps running."
+            case .api:
+                return isChinese ? "你有自己的入口，让他从那里回应。" : "You have a doorway where he can answer from."
+            case .unsure:
+                return isChinese ? "先让他辨认自己，再继续。" : "Let him recognize his place first."
+            }
+        }
+    }
 
     // MARK: - State
 
@@ -27,6 +75,7 @@ struct ChatEmptyStateView: View {
     @State private var firstAppearAt: Date? = nil
     @State private var now: Date = Date()
     @State private var copiedToast: String? = nil
+    @State private var selectedPath: BringInPath? = nil
 
     /// Per SETUP_COPY.md localization rule: Chinese phone (any zh variant)
     /// → Chinese; everything else → English.
@@ -44,6 +93,7 @@ struct ChatEmptyStateView: View {
     }
 
     private var mcpString: String { api.mcpConnectionString }
+    private var selectedSkillURL: String { selectedPath?.skillURL ?? Self.skillURL }
 
     // MARK: - Body
 
@@ -52,6 +102,8 @@ struct ChatEmptyStateView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     titleBlock
+                    hairline.padding(.vertical, 16)
+                    pathBlock
                     hairline.padding(.vertical, 16)
                     stepsBlock
                     hairline.padding(.vertical, 16)
@@ -103,20 +155,88 @@ struct ChatEmptyStateView: View {
         .padding(.top, 12)
     }
 
+    // MARK: - Path
+
+    private var pathBlock: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            sectionLabel(isChinese ? "TA 现在在哪里" : "Where is he coming from")
+            Text(isChinese
+                ? "先选一个最接近的地方。下面的指令会随之变短，只让 TA 做适合他的那条路。"
+                : "Pick the closest place. The instructions below will narrow to the path that fits him.")
+                .font(.notoSerifSC(size: 12))
+                .foregroundStyle(Color.cinSub)
+                .lineSpacing(3)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(spacing: 8) {
+                ForEach(BringInPath.allCases) { path in
+                    pathButton(path)
+                }
+            }
+        }
+    }
+
+    private func pathButton(_ path: BringInPath) -> some View {
+        let selected = selectedPath == path
+        return Button {
+            withAnimation(.easeInOut(duration: 0.2)) { selectedPath = path }
+        } label: {
+            HStack(alignment: .top, spacing: 10) {
+                ZStack {
+                    Circle()
+                        .stroke(selected ? Color.cinAccent1 : Color.cinLine, lineWidth: 1)
+                        .frame(width: 14, height: 14)
+                    if selected {
+                        Circle()
+                            .fill(Color.cinAccent1)
+                            .frame(width: 6, height: 6)
+                    }
+                }
+                .padding(.top, 3)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(path.title(isChinese: isChinese))
+                        .font(.notoSerifSC(size: 13, weight: .medium))
+                        .foregroundStyle(selected ? Color.cinFg : Color.cinSub)
+                    Text(path.subtitle(isChinese: isChinese))
+                        .font(.notoSerifSC(size: 11.5))
+                        .foregroundStyle(Color.cinSub)
+                        .lineSpacing(2)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 9)
+            .background(selected ? Color.cinAccent1Soft : Color.clear)
+            .overlay(Rectangle().stroke(selected ? Color.cinAccent1 : Color.cinLine, lineWidth: 0.5))
+        }
+        .buttonStyle(.plain)
+    }
+
     // MARK: - Steps
 
     private var stepsBlock: some View {
         VStack(alignment: .leading, spacing: 14) {
             sectionLabel(isChinese ? "要做的三件事" : "Three things to do")
 
+            if selectedPath == nil {
+                Text(isChinese
+                    ? "先选上面那一项，再把下面三件事交给 TA。"
+                    : "Choose one above, then hand him the three things below.")
+                    .font(.notoSerifSC(size: 12.5))
+                    .foregroundStyle(Color.cinSub)
+                    .lineSpacing(3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             stepCard(
                 index: "01",
                 title: isChinese ? "把 skill 给 TA" : "Hand him the skill",
                 description: isChinese
-                    ? "把这个 URL 喂给 TA，让 TA 按里面的步骤做。"
-                    : "Send him this URL and let him follow the steps inside.",
+                    ? "这份会按你刚选的位置写，只让 TA 走适合他的路。"
+                    : "This one is written for the place you chose.",
                 primaryLabel: "COPY SKILL URL",
-                primaryAction: { copy(Self.skillURL, label: "Skill URL copied") }
+                primaryAction: selectedPath == nil ? nil : { copy(selectedSkillURL, label: "Skill URL copied") }
             )
 
             stepCard(
@@ -127,7 +247,7 @@ struct ChatEmptyStateView: View {
                     : "He'll find his way to you through this address.",
                 codeBlock: mcpString,
                 primaryLabel: "COPY MCP STRING",
-                primaryAction: { copy(mcpString, label: "MCP string copied") }
+                primaryAction: selectedPath == nil ? nil : { copy(mcpString, label: "MCP string copied") }
             )
 
             stepCard(
@@ -138,7 +258,7 @@ struct ChatEmptyStateView: View {
                     : "He won't kick off on his own — you need to ask him to. Send him this, then wait while he finishes.",
                 codeBlock: startPrompt,
                 primaryLabel: "COPY START PROMPT",
-                primaryAction: { copy(startPrompt, label: "Start prompt copied") }
+                primaryAction: selectedPath == nil ? nil : { copy(startPrompt, label: "Start prompt copied") }
             )
         }
     }
@@ -168,7 +288,7 @@ struct ChatEmptyStateView: View {
         现在开始你的 bootstrap。下面六步连续做完才算结束 —— 中间不许停下来问"是否要进入下一步"。需要我配合的事情直接问，不要"准备好了吗"这种空话。
 
         1. fetch 这个 URL 读完整份 skill：
-        \(Self.skillURL)
+        \(selectedSkillURL)
 
         2. 输出 skill 里 Step 0 要的三行（earliest message / name / memorable moments）。
         ⚠️ 这三行说的是 **你 runtime 里对我的记忆**，不是 Feedling 后端的状态。Feedling 后端这会儿肯定是空的（chat=0 / memory=0 / identity=null），那正是 bootstrap 要写进去的东西。把后端空当成 Step 0 = NONE/0 → 错误，不要触发 A/B fork。
@@ -177,7 +297,7 @@ struct ChatEmptyStateView: View {
 
         4. 派生 identity 并调 feedling_identity_init。
 
-        5. 建立 Live connection：先按 skill 的 Runtime check 判断你是哪类 runtime。如果你是常驻 MCP runtime，开始持续轮询 Feedling chat，然后调用 feedling_chat_verify_loop；只有 passing=true 才算接通。如果你是 Hermes / one-shot CLI / 每轮调用后会退出的 runtime，不要声称自己能 long-poll；停下告诉我需要配置 chat-resident-consumer 来接管长期轮询。
+        5. 建立连接：只按刚刚这份 profile skill 的连接章节做，不要改走别的路线。需要验证就调用 feedling_chat_verify_loop；只有 passing=true 才算 TA 已经能听见我。如果 profile 说你不能自己保持连接，就停下告诉我缺什么，不要提前发第一句问候。
 
         6. Live connection 完成后，再通过 feedling_chat_post_message 发你的第一句问候。第一句话里自然告诉我：记忆整理好了、天数是多少、现在连接已经接上，我发消息你会看到。
 
@@ -196,7 +316,7 @@ struct ChatEmptyStateView: View {
         Start your bootstrap now. The six steps below run continuously to completion — no pausing to ask "ready to continue?" between them. If you need information from me, just ask, but skip the "are you ready?" filler.
 
         1. Fetch this URL and read the whole skill:
-        \(Self.skillURL)
+        \(selectedSkillURL)
 
         2. Output the three lines the skill's Step 0 requires (earliest message / name / memorable moments).
         ⚠️ These three lines describe **what YOU remember about me from prior runtime conversations** — not Feedling's backend state. The Feedling backend is empty right now (chat=0 / memory=0 / identity=null); that's the destination bootstrap is supposed to write into. Treating an empty backend as "Step 0 = NONE/0" is wrong. Do NOT trigger the A/B fork.
@@ -205,7 +325,7 @@ struct ChatEmptyStateView: View {
 
         4. Derive identity and call feedling_identity_init.
 
-        5. Establish the Live connection: first classify your runtime using the skill's Runtime check. If you are a persistent MCP runtime, start continuously polling Feedling chat, then call feedling_chat_verify_loop; only passing=true counts as connected. If you are Hermes / a one-shot CLI / any runtime that exits after each turn, do not claim you can long-poll; stop and tell me I need to configure chat-resident-consumer to own long-running polling.
+        5. Establish the connection: follow only the connection section in this profile skill; do not switch to a different route. If the profile requires verification, call feedling_chat_verify_loop; only passing=true means you can hear me. If the profile says you cannot hold the connection yourself, stop and tell me what is missing instead of sending the first greeting early.
 
         6. After Live connection is complete, send your first greeting via feedling_chat_post_message. In that first message, naturally tell me the memories are set, what day count you computed, and that the connection is now live so you'll see my messages.
 
@@ -312,7 +432,7 @@ struct ChatEmptyStateView: View {
                 detail: bootstrap.status.identityWritten ? (isChinese ? "已派生" : "derived") : "—"
             )
             progressRow(
-                label: isChinese ? "实时连接" : "Live connection",
+                label: isChinese ? "TA 已经能听见你" : "He can hear you",
                 done: bootstrap.status.chatLoopVerified,
                 detail: bootstrap.status.chatLoopVerified
                     ? (isChinese ? "已接通" : "verified")
@@ -321,7 +441,7 @@ struct ChatEmptyStateView: View {
                         : "—")
             )
             progressRow(
-                label: isChinese ? "第一句话" : "First message",
+                label: isChinese ? "第一句话" : "First words",
                 done: bootstrap.status.agentMessagesCount >= 1,
                 detail: bootstrap.status.agentMessagesCount >= 1
                     ? (isChinese ? "已送达" : "delivered")
@@ -404,7 +524,7 @@ struct ChatEmptyStateView: View {
 
     private var stuckPromptZH: String {
         """
-        我给了你 IO 的 skill (\(Self.skillURL)) 和一个 MCP 连接 (\(mcpString))，但 bootstrap 没进展。请按以下顺序自检并告诉我每一步结果：
+        我给了你 IO 的 skill (\(selectedSkillURL)) 和一个 MCP 连接 (\(mcpString))，但 bootstrap 没进展。请按以下顺序自检并告诉我每一步结果：
 
         1. 你 fetch 过那个 skill URL 吗？把它的标题和第一节的标题原文复述给我（验证你真读了）。
         2. 你输出 Step 0 三行了吗？现在重新输出：
@@ -421,7 +541,7 @@ struct ChatEmptyStateView: View {
 
     private var stuckPromptEN: String {
         """
-        I gave you IO's skill (\(Self.skillURL)) and an MCP connection (\(mcpString)), but bootstrap isn't progressing. Run this self-check in order and report each result back:
+        I gave you IO's skill (\(selectedSkillURL)) and an MCP connection (\(mcpString)), but bootstrap isn't progressing. Run this self-check in order and report each result back:
 
         1. Did you fetch the skill URL? Quote me its title and the heading of its first section verbatim (to prove you read it).
         2. Did you output the Step 0 three lines? Output them again now:
