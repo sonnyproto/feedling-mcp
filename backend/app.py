@@ -462,6 +462,13 @@ class UserStore:
             "owner_user_id": envelope.get("owner_user_id", self.user_id),
             "content_type": ct,
         }
+        # Synthetic verify pings are not real user content and are removed
+        # after /v1/chat/verify_loop completes. They still need plaintext
+        # while resident consumers are polling, because local_only synthetic
+        # envelopes intentionally do not carry K_enclave and therefore cannot
+        # be decrypted through the normal enclave/MCP history path.
+        if source == "verify_ping" and envelope.get("synthetic_marker"):
+            msg["content"] = envelope["synthetic_marker"]
         if envelope.get("K_enclave") is not None:
             msg["K_enclave"] = envelope["K_enclave"]
 
