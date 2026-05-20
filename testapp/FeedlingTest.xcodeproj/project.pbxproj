@@ -19,7 +19,6 @@
 		4439EBE8F3C72B5BD382E09B /* IdentityViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 73B9EF7A6239E3D9EEB165D8 /* IdentityViewModel.swift */; };
 		54F410F09BA339F380E1A986 /* NotoSerifSC-Regular.ttf in Resources */ = {isa = PBXBuildFile; fileRef = F73D3F5C02B003A4063CF014 /* NotoSerifSC-Regular.ttf */; };
 		56BEDBB90CCEE5017A47D79C /* WebSocketManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9DB161EB74DB2AA3F40F30E0 /* WebSocketManager.swift */; };
-		59D5D2A66B66C1BE35C4AF74 /* FeedlingBroadcastSetupUI.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 163932C9DCA1AD2D29756AA4 /* FeedlingBroadcastSetupUI.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		5DF918A2E9B422DA9B793E13 /* CinnabarTabBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD86CBC7017A59A22F0C8A04 /* CinnabarTabBar.swift */; };
 		61F24F4911D4423B125600EF /* SharedConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2CDD8AF63E3E29635CACE24C /* SharedConfig.swift */; };
 		6310510CF3FCB370E85CA39B /* InterTight-Regular.ttf in Resources */ = {isa = PBXBuildFile; fileRef = 1EF848471B03E094CE9A32BF /* InterTight-Regular.ttf */; };
@@ -33,7 +32,6 @@
 		95B75F3E42596B0BE048ED62 /* CVMEndpoints.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2F5A34295AFAB91B4C93B95 /* CVMEndpoints.swift */; };
 		97421A140CE8899782DE1375 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5D4282756E211274D73C148 /* ContentView.swift */; };
 		9CCE8CB8D1077F0CC0C236D4 /* ContentEncryption.swift in Sources */ = {isa = PBXBuildFile; fileRef = 50CA03E6CA8335EC78038FDA /* ContentEncryption.swift */; };
-		9D3B3F0CBA67EEEE5B6F0867 /* BroadcastSetupViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 81D822BE1140DD59ADE787AD /* BroadcastSetupViewController.swift */; };
 		A0883EB3FA50ED73B16218B5 /* HealthCheckView.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF69F5C08D901DB7194DE286 /* HealthCheckView.swift */; };
 		A1342E092AF06A379D8C9825 /* DCAPQVL.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A19FD1364EF06641F6EE2D8 /* DCAPQVL.swift */; };
 		A3AA0B796AD846E609C8715A /* ScreenActivityWidget.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8485AF4D5CF32FCD3BD19600 /* ScreenActivityWidget.swift */; };
@@ -74,13 +72,6 @@
 			remoteGlobalIDString = 40F0E8EF6FA85277D76C29E3;
 			remoteInfo = FeedlingTestWidget;
 		};
-		E1A037C481922382AE45E3D6 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = 7666E9E4F7C671C82EBD8484 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = B0C63F767F63B43C47A6CE60;
-			remoteInfo = FeedlingBroadcastSetupUI;
-		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -92,7 +83,6 @@
 			files = (
 				8444956D16998579C3D74FAB /* FeedlingTestWidget.appex in Embed Foundation Extensions */,
 				E5572F9376D197D99DF91E67 /* FeedlingBroadcast.appex in Embed Foundation Extensions */,
-				59D5D2A66B66C1BE35C4AF74 /* FeedlingBroadcastSetupUI.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -103,7 +93,6 @@
 		059AB22EE40CB3F08CADCAE2 /* ScreenActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenActivityAttributes.swift; sourceTree = "<group>"; };
 		0AB72BEC4DBB1798ABB40444 /* IntelPCSClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IntelPCSClient.swift; sourceTree = "<group>"; };
 		14B773D2531DF1548E7C3C63 /* FeedlingTestApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FeedlingTestApp.swift; sourceTree = "<group>"; };
-		163932C9DCA1AD2D29756AA4 /* FeedlingBroadcastSetupUI.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = FeedlingBroadcastSetupUI.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		17C8E8DFD069B7910BF6136C /* Verifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Verifier.swift; sourceTree = "<group>"; };
 		1B8A7BF4CCA8BF6B818B587E /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		1EF848471B03E094CE9A32BF /* InterTight-Regular.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "InterTight-Regular.ttf"; sourceTree = "<group>"; };
@@ -111,7 +100,6 @@
 		2449E25E7E495E2125E1DE74 /* FrameEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameEnvelope.swift; sourceTree = "<group>"; };
 		256AD1FDDDD86B01E7B16036 /* EventLogReplay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventLogReplay.swift; sourceTree = "<group>"; };
 		2889F890552F556700BB6ACD /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
-		28A4834DDC516FBDFC2E61DA /* FeedlingBroadcastSetupUI.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FeedlingBroadcastSetupUI.entitlements; sourceTree = "<group>"; };
 		2CDD8AF63E3E29635CACE24C /* SharedConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedConfig.swift; sourceTree = "<group>"; };
 		3909F8C0719509F4F8260943 /* FeedlingBroadcast.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FeedlingBroadcast.entitlements; sourceTree = "<group>"; };
 		3A1334F790E91A80F93AF4AD /* DMMono-Medium.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "DMMono-Medium.ttf"; sourceTree = "<group>"; };
@@ -122,25 +110,23 @@
 		50CA03E6CA8335EC78038FDA /* ContentEncryption.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentEncryption.swift; sourceTree = "<group>"; };
 		55823AFBDF473E1DBABB4A3E /* FeedlingTestWidget.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FeedlingTestWidget.entitlements; sourceTree = "<group>"; };
 		5F3C6BFE5F5FF06EF002CFD3 /* ChatViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatViewModel.swift; sourceTree = "<group>"; };
-		660D2AEB7DB9C066DED5AD94 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		6B29A5A5FA7651518EF641E5 /* NotoSerifSC-Medium.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "NotoSerifSC-Medium.ttf"; sourceTree = "<group>"; };
 		73B9EF7A6239E3D9EEB165D8 /* IdentityViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IdentityViewModel.swift; sourceTree = "<group>"; };
 		73F3D2316F4D793B8771AD70 /* InterTight-Medium.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "InterTight-Medium.ttf"; sourceTree = "<group>"; };
-		81D822BE1140DD59ADE787AD /* BroadcastSetupViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BroadcastSetupViewController.swift; sourceTree = "<group>"; };
 		8485AF4D5CF32FCD3BD19600 /* ScreenActivityWidget.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenActivityWidget.swift; sourceTree = "<group>"; };
 		8585B7EF732F6D6EF2D5BEE6 /* SampleHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SampleHandler.swift; sourceTree = "<group>"; };
 		8C308EE0153161454F66B92E /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		9B389587507B7D8A5C1A4CC1 /* Parser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Parser.swift; sourceTree = "<group>"; };
-		9BEDE1B24252F0AF7E4B9A09 /* FeedlingTest.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FeedlingTest.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		9BEDE1B24252F0AF7E4B9A09 /* FeedlingTest.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = FeedlingTest.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		9DB161EB74DB2AA3F40F30E0 /* WebSocketManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebSocketManager.swift; sourceTree = "<group>"; };
 		A12C1C629AC66C1D02A0BCE5 /* DMMono-Regular.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "DMMono-Regular.ttf"; sourceTree = "<group>"; };
 		B3DB0E6C7C11B4B979F67492 /* FeedlingAPI.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FeedlingAPI.swift; sourceTree = "<group>"; };
-		B47B840768263FD66F28FB11 /* FeedlingTestWidget.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = FeedlingTestWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		B47B840768263FD66F28FB11 /* FeedlingTestWidget.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = FeedlingTestWidget.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		BABFD58BB392DCD1187673EA /* Newsreader-Italic-VariableFont_opsz,wght.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "Newsreader-Italic-VariableFont_opsz,wght.ttf"; sourceTree = "<group>"; };
 		BB44BB0331F13D05A5956D7B /* BootstrapStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootstrapStatus.swift; sourceTree = "<group>"; };
 		BC81F4E14F5E038B4836EAA4 /* AuditCardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuditCardView.swift; sourceTree = "<group>"; };
 		C2F5A34295AFAB91B4C93B95 /* CVMEndpoints.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CVMEndpoints.swift; sourceTree = "<group>"; };
-		C33E21075035F8499B243C1B /* FeedlingBroadcast.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = FeedlingBroadcast.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		C33E21075035F8499B243C1B /* FeedlingBroadcast.appex */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = "wrapper.app-extension"; path = FeedlingBroadcast.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		C6A2500CE5E31F2AB9F0AF9A /* IdentityView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IdentityView.swift; sourceTree = "<group>"; };
 		CC77DE4E647A13DFA7969DDD /* Newsreader-VariableFont_opsz,wght.ttf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "Newsreader-VariableFont_opsz,wght.ttf"; sourceTree = "<group>"; };
 		CD86CBC7017A59A22F0C8A04 /* CinnabarTabBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinnabarTabBar.swift; sourceTree = "<group>"; };
@@ -208,7 +194,6 @@
 			isa = PBXGroup;
 			children = (
 				C33E21075035F8499B243C1B /* FeedlingBroadcast.appex */,
-				163932C9DCA1AD2D29756AA4 /* FeedlingBroadcastSetupUI.appex */,
 				9BEDE1B24252F0AF7E4B9A09 /* FeedlingTest.app */,
 				B47B840768263FD66F28FB11 /* FeedlingTestWidget.appex */,
 			);
@@ -228,22 +213,11 @@
 			children = (
 				EE37094391F6BB9C2D424ED9 /* Fonts */,
 				F1DBCEF6E245A9D5B9B4D198 /* FeedlingBroadcast */,
-				E2A4CBFE3B81EA82329D4D55 /* FeedlingBroadcastSetupUI */,
 				0E9CF1DFFEF7EBFABD8DA3E0 /* FeedlingTest */,
 				0E6B0860E646F7727F69845C /* FeedlingTestWidget */,
 				4A631C3321DAE9C14E2D63C2 /* Shared */,
 				21135111837BEE77BC26B938 /* Products */,
 			);
-			sourceTree = "<group>";
-		};
-		E2A4CBFE3B81EA82329D4D55 /* FeedlingBroadcastSetupUI */ = {
-			isa = PBXGroup;
-			children = (
-				81D822BE1140DD59ADE787AD /* BroadcastSetupViewController.swift */,
-				28A4834DDC516FBDFC2E61DA /* FeedlingBroadcastSetupUI.entitlements */,
-				660D2AEB7DB9C066DED5AD94 /* Info.plist */,
-			);
-			path = FeedlingBroadcastSetupUI;
 			sourceTree = "<group>";
 		};
 		F1DBCEF6E245A9D5B9B4D198 /* FeedlingBroadcast */ = {
@@ -322,7 +296,6 @@
 			dependencies = (
 				84358B4470F16D89F9CC5DB4 /* PBXTargetDependency */,
 				49B62DB44CC90114BF941EA4 /* PBXTargetDependency */,
-				AB425D8EF6D7B7F0046B13CC /* PBXTargetDependency */,
 			);
 			name = FeedlingTest;
 			packageProductDependencies = (
@@ -349,23 +322,6 @@
 			productReference = B47B840768263FD66F28FB11 /* FeedlingTestWidget.appex */;
 			productType = "com.apple.product-type.app-extension";
 		};
-		B0C63F767F63B43C47A6CE60 /* FeedlingBroadcastSetupUI */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 2E4094369FC262BD249A0C9A /* Build configuration list for PBXNativeTarget "FeedlingBroadcastSetupUI" */;
-			buildPhases = (
-				AA065692AA47F1A8168C8E5C /* Sources */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-			);
-			name = FeedlingBroadcastSetupUI;
-			packageProductDependencies = (
-			);
-			productName = FeedlingBroadcastSetupUI;
-			productReference = 163932C9DCA1AD2D29756AA4 /* FeedlingBroadcastSetupUI.appex */;
-			productType = "com.apple.product-type.app-extension";
-		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -382,9 +338,6 @@
 						DevelopmentTeam = DC9JH5DRMY;
 					};
 					40F0E8EF6FA85277D76C29E3 = {
-						DevelopmentTeam = DC9JH5DRMY;
-					};
-					B0C63F767F63B43C47A6CE60 = {
 						DevelopmentTeam = DC9JH5DRMY;
 					};
 				};
@@ -404,7 +357,6 @@
 			projectRoot = "";
 			targets = (
 				143528F74119840BD515D293 /* FeedlingBroadcast */,
-				B0C63F767F63B43C47A6CE60 /* FeedlingBroadcastSetupUI */,
 				282D06B399CCE088372449A9 /* FeedlingTest */,
 				40F0E8EF6FA85277D76C29E3 /* FeedlingTestWidget */,
 			);
@@ -449,14 +401,6 @@
 				2D6C4681A184D00774C9AAD3 /* SampleHandler.swift in Sources */,
 				61F24F4911D4423B125600EF /* SharedConfig.swift in Sources */,
 				56BEDBB90CCEE5017A47D79C /* WebSocketManager.swift in Sources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		AA065692AA47F1A8168C8E5C /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				9D3B3F0CBA67EEEE5B6F0867 /* BroadcastSetupViewController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -517,33 +461,9 @@
 			target = 40F0E8EF6FA85277D76C29E3 /* FeedlingTestWidget */;
 			targetProxy = 9FC01A447C5F280A995C6CBA /* PBXContainerItemProxy */;
 		};
-		AB425D8EF6D7B7F0046B13CC /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			target = B0C63F767F63B43C47A6CE60 /* FeedlingBroadcastSetupUI */;
-			targetProxy = E1A037C481922382AE45E3D6 /* PBXContainerItemProxy */;
-		};
 /* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
-		14B3B835EFF9750F11FAE73F /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = FeedlingBroadcastSetupUI/FeedlingBroadcastSetupUI.entitlements;
-				DEVELOPMENT_TEAM = DC9JH5DRMY;
-				INFOPLIST_FILE = FeedlingBroadcastSetupUI/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = IO;
-				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-					"@executable_path/../../Frameworks",
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.feedling.mcp.broadcastSetupUI;
-				SDKROOT = iphoneos;
-				TARGETED_DEVICE_FAMILY = "1,2";
-			};
-			name = Release;
-		};
 		2C428C1431E2DAE1BF932153 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -677,7 +597,6 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				DEVELOPMENT_TEAM = DC9JH5DRMY;
 				INFOPLIST_FILE = FeedlingTest/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = IO;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -695,7 +614,6 @@
 				CODE_SIGN_ENTITLEMENTS = FeedlingTestWidget/FeedlingTestWidget.entitlements;
 				DEVELOPMENT_TEAM = DC9JH5DRMY;
 				INFOPLIST_FILE = FeedlingTestWidget/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = IO;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -716,7 +634,6 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				DEVELOPMENT_TEAM = DC9JH5DRMY;
 				INFOPLIST_FILE = FeedlingTest/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = IO;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -734,7 +651,6 @@
 				CODE_SIGN_ENTITLEMENTS = FeedlingTestWidget/FeedlingTestWidget.entitlements;
 				DEVELOPMENT_TEAM = DC9JH5DRMY;
 				INFOPLIST_FILE = FeedlingTestWidget/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = IO;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -747,32 +663,12 @@
 			};
 			name = Release;
 		};
-		B750BD50EFB028DD77498C06 /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = FeedlingBroadcastSetupUI/FeedlingBroadcastSetupUI.entitlements;
-				DEVELOPMENT_TEAM = DC9JH5DRMY;
-				INFOPLIST_FILE = FeedlingBroadcastSetupUI/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = IO;
-				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
-				LD_RUNPATH_SEARCH_PATHS = (
-					"$(inherited)",
-					"@executable_path/Frameworks",
-					"@executable_path/../../Frameworks",
-				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.feedling.mcp.broadcastSetupUI;
-				SDKROOT = iphoneos;
-				TARGETED_DEVICE_FAMILY = "1,2";
-			};
-			name = Debug;
-		};
 		D6C8509A80E309C02C7984CA /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = FeedlingBroadcast/FeedlingBroadcast.entitlements;
 				DEVELOPMENT_TEAM = DC9JH5DRMY;
 				INFOPLIST_FILE = FeedlingBroadcast/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = IO;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -791,7 +687,6 @@
 				CODE_SIGN_ENTITLEMENTS = FeedlingBroadcast/FeedlingBroadcast.entitlements;
 				DEVELOPMENT_TEAM = DC9JH5DRMY;
 				INFOPLIST_FILE = FeedlingBroadcast/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = IO;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -807,15 +702,6 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		2E4094369FC262BD249A0C9A /* Build configuration list for PBXNativeTarget "FeedlingBroadcastSetupUI" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				B750BD50EFB028DD77498C06 /* Debug */,
-				14B3B835EFF9750F11FAE73F /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Debug;
-		};
 		5C7A44734ECB7FD48F277D7B /* Build configuration list for PBXProject "FeedlingTest" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (

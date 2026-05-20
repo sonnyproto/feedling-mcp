@@ -86,7 +86,6 @@ targets:
     dependencies:
       - target: FeedlingTestWidget
       - target: FeedlingBroadcast
-      - target: FeedlingBroadcastSetupUI
 
   FeedlingBroadcast:
     type: app-extension
@@ -113,31 +112,6 @@ targets:
     settings:
       DEVELOPMENT_TEAM: DC9JH5DRMY
       PRODUCT_BUNDLE_IDENTIFIER: com.feedling.mcp.broadcast
-
-  FeedlingBroadcastSetupUI:
-    type: app-extension
-    platform: iOS
-    bundleId: com.feedling.mcp.broadcastSetupUI
-    deploymentTarget: "16.2"
-    sources:
-      - path: FeedlingBroadcastSetupUI
-    entitlements:
-      path: FeedlingBroadcastSetupUI/FeedlingBroadcastSetupUI.entitlements
-      properties:
-        com.apple.security.application-groups:
-          - group.com.feedling.mcp
-    info:
-      path: FeedlingBroadcastSetupUI/Info.plist
-      properties:
-        CFBundleDisplayName: IO Broadcast Setup
-        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
-        CFBundleShortVersionString: $(MARKETING_VERSION)
-        NSExtension:
-          NSExtensionPointIdentifier: com.apple.broadcast-services-setupui
-          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).BroadcastSetupViewController
-    settings:
-      DEVELOPMENT_TEAM: DC9JH5DRMY
-      PRODUCT_BUNDLE_IDENTIFIER: com.feedling.mcp.broadcastSetupUI
 
   FeedlingTestWidget:
     type: app-extension
