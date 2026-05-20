@@ -21,20 +21,16 @@ struct ChatEmptyStateView: View {
     static let skillBaseURL = "https://raw.githubusercontent.com/teleport-computer/io-onboarding/main"
 
     private enum BringInPath: String, CaseIterable, Identifiable {
-        case claude
-        case hermes
-        case server
-        case api
+        case resident
+        case chatClient
         case unsure
 
         var id: String { rawValue }
 
         var skillPath: String {
             switch self {
-            case .claude: return "skill-claude.md"
-            case .hermes: return "skill-hermes.md"
-            case .server: return "skill-server.md"
-            case .api: return "skill-api.md"
+            case .resident: return "skill-resident-agent.md"
+            case .chatClient: return "skill-chat-client.md"
             case .unsure: return "skill-guide.md"
             }
         }
@@ -43,24 +39,22 @@ struct ChatEmptyStateView: View {
 
         func title(isChinese: Bool) -> String {
             switch self {
-            case .claude: return "Claude"
-            case .hermes: return "Hermes / OpenClaw"
-            case .server: return isChinese ? "一台醒着的服务器" : "A server that stays awake"
-            case .api: return isChinese ? "我自己的接口" : "My own doorway"
+            case .resident: return isChinese ? "TA 在我的机器上" : "On my machine"
+            case .chatClient: return isChinese ? "TA 在聊天工具里" : "In a chat app"
             case .unsure: return isChinese ? "我不确定" : "I'm not sure"
             }
         }
 
         func subtitle(isChinese: Bool) -> String {
             switch self {
-            case .claude:
-                return isChinese ? "他在桌面或 Code 里继续陪你。" : "He stays with you through Desktop or Code."
-            case .hermes:
-                return isChinese ? "他在终端里被你唤醒。" : "He wakes from a terminal."
-            case .server:
-                return isChinese ? "他已经住在一台会一直运行的机器上。" : "He already lives somewhere that keeps running."
-            case .api:
-                return isChinese ? "你有自己的入口，让他从那里回应。" : "You have a doorway where he can answer from."
+            case .resident:
+                return isChinese
+                    ? "Hermes、OpenClaw，或一台一直开着的 Mac / server。"
+                    : "Hermes, OpenClaw, or a Mac / server you keep running."
+            case .chatClient:
+                return isChinese
+                    ? "Claude、ChatGPT、Gemini，或另一个 AI 聊天产品。"
+                    : "Claude, ChatGPT, Gemini, or another AI chat product."
             case .unsure:
                 return isChinese ? "先让他辨认自己，再继续。" : "Let him recognize his place first."
             }
