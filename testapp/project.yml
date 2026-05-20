@@ -42,7 +42,14 @@ targets:
     bundleId: com.feedling.mcp
     deploymentTarget: "16.2"
     sources:
-      - path: FeedlingTest
+      - path: FeedlingTest/App
+      - path: FeedlingTest/API
+      - path: FeedlingTest/Chat
+      - path: FeedlingTest/Identity
+      - path: FeedlingTest/Memory
+      - path: FeedlingTest/Audit
+      - path: FeedlingTest/LiveActivity
+      - path: FeedlingTest/Assets.xcassets
       - path: Shared
     entitlements:
       path: FeedlingTest/FeedlingTest.entitlements
