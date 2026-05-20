@@ -65,14 +65,14 @@ struct HealthCheckView: View {
         .onAppear {
             router.enterDetail()
             bootstrap.startPolling(interval: 4)
-            isBroadcasting = UserDefaults(suiteName: "group.com.feedling.mcp")?.bool(forKey: "isBroadcasting") ?? false
+            isBroadcasting = UserDefaults(suiteName: FeedlingAPI.appGroup)?.bool(forKey: FeedlingAPI.isBroadcastingKey) ?? false
         }
         .onDisappear {
             router.exitDetail()
             bootstrap.stopPolling()
         }
         .onReceive(broadcastPollTimer) { _ in
-            isBroadcasting = UserDefaults(suiteName: "group.com.feedling.mcp")?.bool(forKey: "isBroadcasting") ?? false
+            isBroadcasting = UserDefaults(suiteName: FeedlingAPI.appGroup)?.bool(forKey: FeedlingAPI.isBroadcastingKey) ?? false
         }
         .onReceive(secondTicker) { now = $0 }
     }

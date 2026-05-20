@@ -37,7 +37,8 @@ final class FeedlingAPI: ObservableObject {
         case selfHosted = "self_hosted"
     }
 
-    private static let appGroup = "group.com.feedling.mcp"
+    static let appGroup = "group.com.feedling.mcp"
+    static let isBroadcastingKey = "isBroadcasting"
     private static let defaultCloudURL = "https://api.feedling.app"
 
     // MARK: - Published credentials (drives UI)
@@ -737,7 +738,7 @@ final class FeedlingAPI: ObservableObject {
     /// content private key stays in the main app's Keychain.
     /// See FeedlingBroadcast/FrameEnvelope.swift for the reader side.
     func publishContentKeysToAppGroup() {
-        guard let shared = UserDefaults(suiteName: "group.com.feedling.mcp") else { return }
+        guard let shared = UserDefaults(suiteName: FeedlingAPI.appGroup) else { return }
         shared.set(userId, forKey: "feedling.userID")
         if let pk = userContentPublicKey {
             shared.set(pk.rawRepresentation.base64EncodedString(),

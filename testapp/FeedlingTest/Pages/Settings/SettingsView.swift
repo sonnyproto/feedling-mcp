@@ -247,10 +247,10 @@ struct SettingsView: View {
             }
             .navigationBarHidden(true)
             .onAppear {
-                isBroadcasting = UserDefaults(suiteName: "group.com.feedling.mcp")?.bool(forKey: "isBroadcasting") ?? false
+                isBroadcasting = UserDefaults(suiteName: FeedlingAPI.appGroup)?.bool(forKey: FeedlingAPI.isBroadcastingKey) ?? false
             }
             .onReceive(broadcastPollTimer) { _ in
-                isBroadcasting = UserDefaults(suiteName: "group.com.feedling.mcp")?.bool(forKey: "isBroadcasting") ?? false
+                isBroadcasting = UserDefaults(suiteName: FeedlingAPI.appGroup)?.bool(forKey: FeedlingAPI.isBroadcastingKey) ?? false
             }
             .overlay(alignment: .bottom) {
                 if let msg = showCopiedToast {
