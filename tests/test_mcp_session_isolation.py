@@ -89,6 +89,57 @@ def test_remember_then_resolve_returns_same_key():
     assert mcp_server._resolve_for_session(sid) == key
 
 
+def test_chat_history_merges_verify_ping_plaintext(monkeypatch):
+    """MCP history usually comes from the enclave decrypt path, but synthetic
+    verify pings are local_only and intentionally cannot be enclave-decrypted.
+    Preserve only that server-authored sentinel plaintext so resident
+    consumers can answer live-connection checks."""
+
+    decrypted = {
+        "messages": [
+            {
+                "id": "ping-1",
+                "role": "user",
+                "source": "verify_ping",
+                "content": "",
+                "content_type": "text",
+                "ts": 1.0,
+            },
+            {
+                "id": "normal-1",
+                "role": "user",
+                "source": "chat",
+                "content": "",
+                "content_type": "text",
+                "ts": 2.0,
+            },
+        ]
+    }
+    plain = {
+        "messages": [
+            {
+                "id": "ping-1",
+                "source": "verify_ping",
+                "content": "__VERIFY_PING__:abc123",
+            },
+            {
+                "id": "normal-1",
+                "source": "chat",
+                "content": "must-not-copy",
+            },
+        ]
+    }
+
+    monkeypatch.setattr(mcp_server, "_get_decrypted", lambda *args, **kwargs: decrypted)
+    monkeypatch.setattr(mcp_server, "_get", lambda *args, **kwargs: plain)
+
+    out = mcp_server.chat_get_history(limit=20)
+
+    msgs = out["messages"]
+    assert msgs[0]["content"] == "__VERIFY_PING__:abc123"
+    assert msgs[1]["content"] == ""
+
+
 def test_missing_session_id_resolves_to_none():
     """The defining post-P0 invariant: no session_id, no fallback, no key."""
     mcp_server._remember("session-X", "key-X")

@@ -814,9 +814,35 @@ def chat_get_history(limit: int = 50, ctx: Context = None):
     than receiving the base64 as opaque text (which is what happened
     before this change — image messages silently broke agent replies).
     """
-    raw = _get_decrypted("/v1/chat/history", {"limit": min(limit, 200)}, ctx=ctx)
+    params = {"limit": min(limit, 200)}
+    raw = _get_decrypted("/v1/chat/history", params, ctx=ctx)
     if not isinstance(raw, dict) or "messages" not in raw:
         return raw
+
+    # Synthetic verify pings are intentionally local_only and carry no
+    # K_enclave, so the enclave decrypt path cannot recover their sentinel
+    # text. The Flask history stores that sentinel as plaintext `content`
+    # only for source=verify_ping; merge it back by id so resident consumers
+    # using MCP as their decrypt source can answer liveness pings. Do not
+    # copy plaintext for normal chat messages.
+    try:
+        plain = _get("/v1/chat/history", params, ctx=ctx)
+        plain_by_id = {
+            m.get("id"): m
+            for m in plain.get("messages", [])
+            if isinstance(m, dict) and m.get("source") == "verify_ping" and m.get("content")
+        }
+    except Exception:
+        plain_by_id = {}
+
+    if plain_by_id:
+        for m in raw.get("messages", []):
+            if not isinstance(m, dict) or m.get("content"):
+                continue
+            plain_msg = plain_by_id.get(m.get("id"))
+            if plain_msg:
+                m["content"] = plain_msg["content"]
+                m["source"] = plain_msg.get("source", m.get("source"))
 
     image_blocks: list = []
     for m in raw.get("messages", []):
