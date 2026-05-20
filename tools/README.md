@@ -12,8 +12,16 @@ via a runtime that stays alive and handles polling/replying natively.
 
 ### When you need this
 
+Pick the highest-priority path that can honestly own Live connection:
+
+1. **Server-resident agent** — no bridge needed if the agent itself is a stable daemon that can poll Feedling and post replies.
+2. **Resident bridge for one-shot / local CLI agents** — use `chat_resident_consumer.py`; this is the normal path for Hermes CLI / mcporter / shell-invoked agents.
+3. **HTTP/API agent backend** — use `chat_resident_consumer.py` to poll Feedling and POST user messages into your API.
+4. **Desktop MCP runtime** — only skip the bridge if the desktop/runtime process truly stays alive and keeps polling without another operator prompt.
+
 | Your agent runtime | Use chat-resident? |
 |--|--|
+| Server-resident agent daemon that owns polling itself | **No.** It is already the resident. |
 | Claude Desktop, Claude Code, OpenClaw, Cursor, Hermes-MCP **when the process stays alive between user turns** | **No.** A resident MCP runtime long-polls and replies natively via `feedling_chat_post_message`. |
 | Hermes CLI / mcporter / any MCP-capable CLI that exits after one invocation | **Yes.** MCP tools are not enough; if the process is not resident, it cannot own the chat loop. |
 | Custom Python script that just makes HTTP requests | **Yes.** |
