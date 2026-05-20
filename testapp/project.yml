@@ -49,6 +49,7 @@ targets:
       - path: FeedlingTest/Memory
       - path: FeedlingTest/Audit
       - path: FeedlingTest/LiveActivity
+      - path: FeedlingTest/Settings
       - path: FeedlingTest/Assets.xcassets
       - path: Shared
     entitlements:
