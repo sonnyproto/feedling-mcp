@@ -147,9 +147,10 @@ requests.delete = _auth_delete
 # Satisfy bootstrap-stage gate (added 2026-05-15)
 #
 # /v1/chat/response and /v1/identity/init 409 with `bootstrap_incomplete`
-# until the user has written ≥3 memories AND initialized identity. The
-# legacy linear test order (chat → identity) predates that gate, so we
-# seed memories + identity here before any chat-response assertion runs.
+# until the user has written enough memories for the relationship-age floor
+# AND initialized identity. The legacy linear test order (chat → identity)
+# predates that gate, so we seed fresh memories + identity here before any
+# chat-response assertion runs.
 #
 # Idempotent under --key mode: identity_init returns 409 already_initialized
 # if it's been set before, which is fine — bootstrap is still satisfied.
@@ -158,6 +159,7 @@ requests.delete = _auth_delete
 def _seed_bootstrap_state():
     if not USER_ID:
         return
+    occurred_at = time.strftime("%Y-%m-%dT%H:%M:%S")
     for i in range(3):
         env = {
             "v": 1,
@@ -167,7 +169,7 @@ def _seed_bootstrap_state():
             "K_enclave": base64.b64encode(uuid.uuid4().bytes * 3).decode(),
             "visibility": "shared",
             "owner_user_id": USER_ID,
-            "occurred_at": "2026-04-01T00:00:00",
+            "occurred_at": occurred_at,
         }
         _orig_post(f"{BASE_URL}/v1/memory/add",
                    json={"envelope": env}, headers=AUTH_HEADERS, timeout=5)
