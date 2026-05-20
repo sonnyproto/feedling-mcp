@@ -114,6 +114,11 @@ AGENT_CLI_CMD=mycli ask {message}
 `{message}` is substituted with the user's plaintext message. The
 command's stdout becomes the reply.
 
+When running under `systemd`, do not assume your interactive shell `PATH`
+is available. Prefer an absolute executable path in `AGENT_CLI_CMD`; if that
+is not stable, set `AGENT_CLI_PATH` to the directory that contains the agent
+binary.
+
 **CLI agents must produce clean stdout.** Session IDs, prompts, debug
 footers, and other decorative output WILL leak into the user's chat
 if your CLI doesn't have a quiet mode. The daemon strips a few known
@@ -124,6 +129,7 @@ the safest path is configuring your CLI to be silent.
 
 ```
 # JSON output (preferred — unambiguous field extraction)
+AGENT_CLI_PATH=/home/openclaw/.local/bin:/home/openclaw/.hermes/hermes-agent/venv/bin
 AGENT_CLI_CMD=hermes chat -Q --continue --max-turns 1 -q "{message}"
 
 # Plain text output (sanitizer strips known footers)

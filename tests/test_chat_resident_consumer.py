@@ -408,6 +408,28 @@ def test_extract_session_id_from_cli_output():
     assert crc._extract_session_id(raw) == "20260503_024038_b526cf"
 
 
+def test_resolve_cli_executable_uses_agent_cli_path(tmp_path, monkeypatch):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    exe = bin_dir / "hermes"
+    exe.write_text("#!/bin/sh\n", encoding="utf-8")
+    exe.chmod(0o755)
+
+    monkeypatch.setattr(crc, "AGENT_CLI_PATH", str(bin_dir))
+    monkeypatch.setenv("PATH", "")
+
+    resolved = crc._resolve_cli_executable(["hermes", "chat"])
+    assert resolved == [str(exe), "chat"]
+
+
+def test_resolve_cli_executable_error_mentions_systemd(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_PATH", "")
+    monkeypatch.setenv("PATH", "")
+
+    with pytest.raises(FileNotFoundError, match="systemd service"):
+        crc._resolve_cli_executable(["missing-agent", "chat"])
+
+
 def test_agent_session_file_scoped_by_user_id(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", "/tmp/feedling_{user_id}.txt")
     monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_abc", "user_pk": None, "enclave_pk": None})

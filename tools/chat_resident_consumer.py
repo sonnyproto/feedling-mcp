@@ -31,6 +31,8 @@ CLI mode:
                         user's message text.
                         Example (Hermes): hermes chat -Q --output-mode json -q {message}
                         Example (plain):  mycli ask {message}
+  AGENT_CLI_PATH        Optional colon-separated executable search path added
+                        before PATH. Useful for systemd services.
 
 Optional:
   CHECKPOINT_FILE       Path to persist last-processed timestamp (default: /tmp/feedling_chat_checkpoint.json)
@@ -47,6 +49,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -101,6 +104,7 @@ AGENT_HTTP_TOKEN = os.environ.get("AGENT_HTTP_TOKEN", "")
 AGENT_HTTP_FIELD = os.environ.get("AGENT_HTTP_FIELD", "response")
 
 AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
+AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
 
 CHECKPOINT_FILE = Path(
     os.environ.get("CHECKPOINT_FILE", "/tmp/feedling_chat_checkpoint.json")
@@ -627,6 +631,44 @@ def _extract_session_id(raw: str) -> str:
     return ""
 
 
+def _resolve_cli_executable(cmd: list[str]) -> list[str]:
+    if not cmd:
+        return cmd
+
+    executable = cmd[0]
+    if os.path.sep in executable:
+        return cmd
+
+    search_parts: list[str] = []
+    if AGENT_CLI_PATH:
+        search_parts.extend(p for p in AGENT_CLI_PATH.split(os.pathsep) if p)
+    if os.environ.get("PATH"):
+        search_parts.extend(p for p in os.environ["PATH"].split(os.pathsep) if p)
+
+    home = Path.home()
+    search_parts.extend(
+        [
+            str(home / ".local" / "bin"),
+            str(home / ".hermes" / "hermes-agent" / "venv" / "bin"),
+            str(home / ".hermes" / "bin"),
+            str(home / ".cargo" / "bin"),
+            "/usr/local/bin",
+            "/opt/homebrew/bin",
+        ]
+    )
+    search_path = os.pathsep.join(dict.fromkeys(search_parts))
+    resolved = shutil.which(executable, path=search_path)
+    if not resolved:
+        raise FileNotFoundError(
+            f"CLI executable {executable!r} was not found. Use an absolute path "
+            "in AGENT_CLI_CMD or set AGENT_CLI_PATH for the systemd service."
+        )
+
+    if resolved != executable:
+        log.debug("resolved cli executable %s -> %s", executable, resolved)
+    return [resolved, *cmd[1:]]
+
+
 def call_agent_cli(message: str) -> str:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
@@ -638,7 +680,7 @@ def call_agent_cli(message: str) -> str:
     elif sid and "hermes chat" in cmd_str and "--resume" not in cmd_str and "--continue" not in cmd_str:
         cmd_str = cmd_str.replace("hermes chat", f"hermes chat --resume {shlex.quote(sid)}", 1)
 
-    cmd = shlex.split(cmd_str)
+    cmd = _resolve_cli_executable(shlex.split(cmd_str))
     log.debug("running cli agent: %s", cmd)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
