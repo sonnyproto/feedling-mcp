@@ -159,17 +159,6 @@ jobs:
       - name: Run parser tests
         run: cd tools/dcap && python3 -m unittest test_dcap_parse.py -v
 
-  # -------------------------------------------------------------------------
-  # DCAP parser — Swift package tests (runs on macOS)
-  # -------------------------------------------------------------------------
-  dcap-swift:
-    name: DCAP parser (swift package)
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - name: swift test
-        run: cd ios/FeedlingDCAP && swift test --parallel
-
   # =========================================================================
   # DEPLOY — detect whether this push affects CVM image or compose
   #

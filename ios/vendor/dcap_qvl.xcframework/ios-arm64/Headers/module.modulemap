@@ -1,5 +1,0 @@
-module dcap_qvl {
-    umbrella header "dcap_qvl.h"
-    export *
-    module * { export * }
-}
