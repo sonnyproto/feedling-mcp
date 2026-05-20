@@ -5,6 +5,12 @@ options:
   deploymentTarget:
     iOS: "16.2"
   xcodeVersion: "15"
+  groupOrdering:
+    - order:
+        - FeedlingTest
+        - FeedlingBroadcast
+        - FeedlingTestWidget
+        - Shared
 
 settings:
   DEVELOPMENT_TEAM: DC9JH5DRMY
@@ -121,9 +127,6 @@ targets:
     sources:
       - path: FeedlingTestWidget
       - path: Shared
-      - path: FeedlingTest/Fonts
-        type: folder
-        buildPhase: resources
     entitlements:
       path: FeedlingTestWidget/FeedlingTestWidget.entitlements
       properties:
