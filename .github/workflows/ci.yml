@@ -181,6 +181,7 @@ jobs:
           filters: |
             cvm:
               - 'backend/**'
+              - 'tools/chat_resident_consumer.py'
               - 'deploy/Dockerfile'
               - 'deploy/docker-compose.phala.yaml'
               - 'deploy/publish-compose-hash.sh'
