@@ -4,8 +4,8 @@ import UIKit
 /// Shown in the Chat tab when no messages exist yet — i.e., the user has
 /// finished registration but no agent has connected/written anything yet.
 /// Replaces the previous blank canvas: tells the user what to do (paste
-/// skill + MCP string into their agent), shows real-time progress as the
-/// agent boots, and offers a stuck-fallback after 60 s.
+/// skill + path-specific connection details into their agent), shows real-time
+/// progress as the agent boots, and offers a stuck-fallback after 60 s.
 ///
 /// Visuals follow the existing Cinnabar token set (CinnabarTokens.swift):
 /// dmMono for kerned labels, notoSerifSC for Chinese body, newsreader for
@@ -87,7 +87,86 @@ struct ChatEmptyStateView: View {
     }
 
     private var mcpString: String { api.mcpConnectionString }
+    private var residentConnectorConfig: String {
+        let key = api.apiKey.isEmpty ? "<registering...>" : api.apiKey
+        let mcpURL: String
+        if api.storageMode == .selfHosted {
+            let derivedMCP = api.baseURL
+                .replacingOccurrences(of: ":5001", with: ":5002")
+                .replacingOccurrences(of: "api.", with: "mcp.")
+            mcpURL = "\(derivedMCP)/sse?key=\(key)"
+        } else {
+            mcpURL = "https://mcp.feedling.app/sse?key=\(key)"
+        }
+        return """
+        FEEDLING_API_URL=\(api.baseURL)
+        FEEDLING_API_KEY=\(key)
+        FEEDLING_MCP_URL=\(mcpURL)
+        """
+    }
+    private var connectionBlock: String {
+        switch selectedPath {
+        case .resident:
+            return residentConnectorConfig
+        case .chatClient:
+            return mcpString
+        case .unsure:
+            return """
+            Resident connector config:
+            \(residentConnectorConfig)
+
+            Chat-client MCP command:
+            \(mcpString)
+            """
+        case .none:
+            return mcpString
+        }
+    }
     private var selectedSkillURL: String { selectedPath?.skillURL ?? Self.skillURL }
+    private var connectionTitle: String {
+        switch selectedPath {
+        case .resident:
+            return isChinese ? "把常驻连接配置给 TA" : "Give him resident config"
+        case .chatClient:
+            return isChinese ? "把 MCP 连接告诉 TA" : "Tell him the MCP connection"
+        case .unsure:
+            return isChinese ? "把两种连接信息给 TA" : "Give him both connection options"
+        case .none:
+            return isChinese ? "把连接告诉 TA" : "Tell him the connection"
+        }
+    }
+    private var connectionDescription: String {
+        switch selectedPath {
+        case .resident:
+            return isChinese
+                ? "这不是 Claude MCP 命令；让 TA 把它写进 Hermes / OpenClaw 的常驻 Feedling channel。"
+                : "This is not a Claude MCP command; he should put it in the resident Hermes / OpenClaw Feedling channel."
+        case .chatClient:
+            return isChinese
+                ? "TA 用这条 MCP 命令在当前聊天工具里连接。"
+                : "He uses this MCP command to connect from the current chat client."
+        case .unsure:
+            return isChinese
+                ? "让 TA 先识别自己是哪条路径，再只使用对应的那一段。"
+                : "He should identify his path first, then use only the matching block."
+        case .none:
+            return isChinese
+                ? "TA 用这串信息找到你这边。"
+                : "He'll find his way to you through this address."
+        }
+    }
+    private var connectionCopyLabel: String {
+        switch selectedPath {
+        case .resident:
+            return isChinese ? "复制常驻配置" : "COPY RESIDENT CONFIG"
+        case .chatClient:
+            return isChinese ? "复制 MCP 连接" : "COPY MCP STRING"
+        case .unsure:
+            return isChinese ? "复制连接信息" : "COPY CONNECTION INFO"
+        case .none:
+            return isChinese ? "复制连接" : "COPY CONNECTION"
+        }
+    }
 
     // MARK: - Body
 
@@ -237,14 +316,13 @@ struct ChatEmptyStateView: View {
 
             stepCard(
                 index: "02",
-                title: isChinese ? "把 MCP 连接告诉 TA" : "Tell him the MCP connection",
-                description: isChinese
-                    ? "TA 用这串地址找到你这边。"
-                    : "He'll find his way to you through this address.",
-                codeBlock: mcpString,
-                primaryLabel: isChinese ? "复制 MCP 连接" : "COPY MCP STRING",
+                title: connectionTitle,
+                description: connectionDescription,
+                codeBlock: connectionBlock,
+                codeLineLimit: selectedPath == .resident ? 4 : (selectedPath == .unsure ? 6 : 2),
+                primaryLabel: connectionCopyLabel,
                 primaryAction: selectedPath == nil ? nil : {
-                    copy(mcpString, label: isChinese ? "已复制 MCP 连接" : "MCP string copied")
+                    copy(connectionBlock, label: isChinese ? "已复制连接信息" : "Connection copied")
                 }
             )
 
@@ -351,6 +429,7 @@ struct ChatEmptyStateView: View {
         title: String,
         description: String,
         codeBlock: String? = nil,
+        codeLineLimit: Int = 2,
         primaryLabel: String?,
         primaryAction: (() -> Void)?
     ) -> some View {
@@ -374,7 +453,7 @@ struct ChatEmptyStateView: View {
                     Text(codeBlock)
                         .font(.dmMono(size: 9.5))
                         .foregroundStyle(Color.cinFg)
-                        .lineLimit(2)
+                        .lineLimit(codeLineLimit)
                         .truncationMode(.middle)
                         .multilineTextAlignment(.leading)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -524,14 +603,17 @@ struct ChatEmptyStateView: View {
 
     private var stuckPromptZH: String {
         """
-        我给了你 IO 的 skill (\(selectedSkillURL)) 和一个 MCP 连接 (\(mcpString))，但 bootstrap 没进展。请按以下顺序自检并告诉我每一步结果：
+        我给了你 IO 的 skill (\(selectedSkillURL)) 和连接信息：
+        \(connectionBlock)
+
+        但 bootstrap 没进展。请按以下顺序自检并告诉我每一步结果：
 
         1. 你 fetch 过那个 skill URL 吗？把它的标题和第一节的标题原文复述给我（验证你真读了）。
         2. 你输出 Step 0 三行了吗？现在重新输出：
            - EARLIEST MESSAGE I CAN FIND FROM THIS USER: <ISO date | NONE>
            - NAME I'VE BEEN CALLED IN PRIOR CHATS: <name | NONE>（不能是 runtime label）
            - APPROXIMATE MEMORABLE MOMENTS I CAN RECALL: <integer | 0>
-        3. 你的 MCP 连接里有 feedling_* 工具吗？调一次 feedling_chat_get_history 看响应（401 / 500 / 别的？）。
+        3. 如果你是聊天工具/MCP 路径：你的 MCP 连接里有 feedling_* 工具吗？调一次 feedling_chat_get_history 看响应（401 / 500 / 别的？）。如果你是 resident 路径：常驻 Feedling/IO channel 是否用这份配置启动并持续 poll？
         4. 你目前卡在哪一步：fetch skill / Step 0 verify / Pass 1 唤醒 / Pass 2 清点 / Pass 3 落卡 / Pass 4 对账 / identity 派生？
         5. 如果有任何错误，把错误原文贴回来。
 
@@ -541,14 +623,17 @@ struct ChatEmptyStateView: View {
 
     private var stuckPromptEN: String {
         """
-        I gave you IO's skill (\(selectedSkillURL)) and an MCP connection (\(mcpString)), but bootstrap isn't progressing. Run this self-check in order and report each result back:
+        I gave you IO's skill (\(selectedSkillURL)) and these connection details:
+        \(connectionBlock)
+
+        Bootstrap isn't progressing. Run this self-check in order and report each result back:
 
         1. Did you fetch the skill URL? Quote me its title and the heading of its first section verbatim (to prove you read it).
         2. Did you output the Step 0 three lines? Output them again now:
            - EARLIEST MESSAGE I CAN FIND FROM THIS USER: <ISO date | NONE>
            - NAME I'VE BEEN CALLED IN PRIOR CHATS: <name | NONE> (must NOT be a runtime label)
            - APPROXIMATE MEMORABLE MOMENTS I CAN RECALL: <integer | 0>
-        3. Does your MCP connection expose the feedling_* tools? Call feedling_chat_get_history once and tell me the response (401 / 500 / something else?).
+        3. If you are on the chat-client/MCP path: does your MCP connection expose the feedling_* tools? Call feedling_chat_get_history once and tell me the response (401 / 500 / something else?). If you are on the resident path: is the resident Feedling/IO channel running with this config and continuously polling?
         4. Where exactly are you stuck: fetch skill / Step 0 verify / Pass 1 theme inventory / Pass 2 candidates / Pass 3 write-through / Pass 4 verification / identity derivation?
         5. If anything errored, paste the error text back to me.
 

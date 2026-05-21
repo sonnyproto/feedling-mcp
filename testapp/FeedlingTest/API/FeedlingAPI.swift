@@ -238,6 +238,29 @@ final class FeedlingAPI: ObservableObject {
         return "ws://\(host):9998/ingest"
     }
 
+    private func wipeLocalAccountState() {
+        // Wipe local state — credentials, Keychain entries, UserDefaults flags.
+        self.userId = ""
+        self.apiKey = ""
+        persist()
+        UserDefaults.standard.removeObject(forKey: Keys.userId)
+        UserDefaults.standard.removeObject(forKey: Keys.apiKey)
+        UserDefaults.standard.removeObject(forKey: PhaseBKeys.lastAcceptedComposeHash)
+        UserDefaults.standard.removeObject(forKey: PhaseBKeys.onboardingCompletedV1)
+        UserDefaults.standard.removeObject(forKey: PhaseBKeys.signedOutForComposeChange)
+        UserDefaults.standard.removeObject(forKey: Keys.hasRegistered)
+
+        // Wipe Keychain content + identity key + apiKey so a fresh register starts clean.
+        _ = ContentKeyStore.shared.wipeKeypair()
+        _ = KeyStore.shared.wipeKeypair()
+        _ = ApiKeyStore.shared.wipe()
+
+        // Tell the view models to drop their in-memory caches. Without this,
+        // chat/identity/garden views keep stale data on screen until their
+        // next poll cycle overwrites it — visually broken after a wipe.
+        NotificationCenter.default.post(name: .feedlingCredentialsReset, object: nil)
+    }
+
     // MARK: - Registration
 
     // Serializes concurrent callers. The `apiKey.isEmpty` guard passes
@@ -670,31 +693,20 @@ final class FeedlingAPI: ObservableObject {
                           userInfo: [NSLocalizedDescriptionKey: "could not build request"])
         }
         let (_, resp) = try await URLSession.shared.data(for: req)
-        guard let http = resp as? HTTPURLResponse, http.statusCode == 200 else {
-            throw NSError(domain: "Reset", code: (resp as? HTTPURLResponse)?.statusCode ?? 0,
+        guard let http = resp as? HTTPURLResponse else {
+            throw NSError(domain: "Reset", code: 0,
+                          userInfo: [NSLocalizedDescriptionKey: "reset failed"])
+        }
+        guard http.statusCode == 200 || http.statusCode == 401 else {
+            throw NSError(domain: "Reset", code: http.statusCode,
                           userInfo: [NSLocalizedDescriptionKey: "reset failed"])
         }
 
-        // Wipe local state — credentials, Keychain entries, UserDefaults flags.
-        self.userId = ""
-        self.apiKey = ""
-        persist()
-        UserDefaults.standard.removeObject(forKey: Keys.userId)
-        UserDefaults.standard.removeObject(forKey: Keys.apiKey)
-        UserDefaults.standard.removeObject(forKey: PhaseBKeys.lastAcceptedComposeHash)
-        UserDefaults.standard.removeObject(forKey: PhaseBKeys.onboardingCompletedV1)
-        UserDefaults.standard.removeObject(forKey: PhaseBKeys.signedOutForComposeChange)
-        UserDefaults.standard.removeObject(forKey: Keys.hasRegistered)
-
-        // Wipe Keychain content + identity key + apiKey so a fresh register starts clean.
-        _ = ContentKeyStore.shared.wipeKeypair()
-        _ = KeyStore.shared.wipeKeypair()
-        _ = ApiKeyStore.shared.wipe()
-
-        // Tell the view models to drop their in-memory caches. Without this,
-        // chat/identity/garden views keep stale data on screen until their
-        // next poll cycle overwrites it — visually broken after a wipe.
-        NotificationCenter.default.post(name: .feedlingCredentialsReset, object: nil)
+        // 200: server deleted the account. 401: the local key is already stale
+        // or revoked, so server-side deletion is impossible from this device.
+        // In both cases the user explicitly chose destructive reset; keeping
+        // the dead local key would trap them in a permanent 401 state.
+        wipeLocalAccountState()
     }
 
     /// Discard current credentials and regenerate. Asks server to register fresh.
@@ -703,16 +715,12 @@ final class FeedlingAPI: ObservableObject {
     func regenerateCredentials() async {
         UserDefaults.standard.removeObject(forKey: Keys.cloudApiKey)
         UserDefaults.standard.removeObject(forKey: Keys.cloudUserId)
-        self.apiKey = ""
-        self.userId = ""
         UserDefaults.standard.set(false, forKey: Keys.hasRegistered)
         UserDefaults.standard.set(false, forKey: Keys.registrationFailed)
-        _ = ApiKeyStore.shared.wipe()
-        persist()
         // Post BEFORE re-registration so the view models go empty immediately;
         // the new account's data (none, until agent connects) flows in via
         // their normal polling once registration completes.
-        NotificationCenter.default.post(name: .feedlingCredentialsReset, object: nil)
+        wipeLocalAccountState()
         await ensureRegisteredIfCloud()
     }
 

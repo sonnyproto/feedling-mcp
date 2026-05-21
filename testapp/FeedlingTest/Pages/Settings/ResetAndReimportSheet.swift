@@ -117,10 +117,10 @@ struct ResetAndReimportSheet: View {
 //
 // Shown after Delete Account & Reset. In cloud mode `ensureRegisteredIfCloud`
 // has already minted a fresh API key by the time this sheet appears — happy
-// path renders the new MCP String + COPY. In self-hosted mode (or when
-// cloud registration silently failed), apiKey is still empty — the sheet
-// renders a guidance state pointing the user at Settings → Storage to
-// register / paste a new key manually.
+// path renders fresh reconnection details + COPY. In self-hosted mode (or
+// when cloud registration silently failed), apiKey is still empty — the
+// sheet renders a guidance state pointing the user at Settings → Storage
+// to register / paste a new key manually.
 
 struct PostWipeReimportSheet: View {
     @Environment(\.dismiss) private var dismiss
@@ -131,6 +131,32 @@ struct PostWipeReimportSheet: View {
         Locale.preferredLanguages.first?.hasPrefix("zh") ?? false
 
     private var hasFreshKey: Bool { !api.apiKey.isEmpty }
+    private var residentConnectorConfig: String {
+        let key = api.apiKey.isEmpty ? "<registering...>" : api.apiKey
+        let mcpURL: String
+        if api.storageMode == .selfHosted {
+            let derivedMCP = api.baseURL
+                .replacingOccurrences(of: ":5001", with: ":5002")
+                .replacingOccurrences(of: "api.", with: "mcp.")
+            mcpURL = "\(derivedMCP)/sse?key=\(key)"
+        } else {
+            mcpURL = "https://mcp.feedling.app/sse?key=\(key)"
+        }
+        return """
+        FEEDLING_API_URL=\(api.baseURL)
+        FEEDLING_API_KEY=\(key)
+        FEEDLING_MCP_URL=\(mcpURL)
+        """
+    }
+    private var reimportBlock: String {
+        """
+        Resident connector config:
+        \(residentConnectorConfig)
+
+        Chat-client MCP command:
+        \(api.mcpConnectionString)
+        """
+    }
 
     var body: some View {
         ZStack {
@@ -161,8 +187,8 @@ struct PostWipeReimportSheet: View {
 
                         if hasFreshKey {
                             Text(isChinese
-                                 ? "已经注册了新账号。在你把 agent runtime 切到新 key 之前，Claude.ai / Hermes 等的每个 tool call 都会返回 401 user_not_found。现在就把下面这条 MCP String paste 到 agent 里。"
-                                 : "A fresh account is registered. Until you re-point your agent at the new key, every tool call from Claude.ai / Hermes / etc. will return 401 user_not_found. Paste this MCP String into your agent runtime now.")
+                                 ? "已经注册了新账号。在你把 agent runtime 切到新 key 之前，Claude.ai / Hermes 等的每个 tool call 都会返回 401 user_not_found。Hermes / OpenClaw resident 用常驻配置；Claude / ChatGPT / Gemini 这类聊天工具才用 MCP 命令。"
+                                 : "A fresh account is registered. Until you re-point your agent at the new key, every tool call from Claude.ai / Hermes / etc. will return 401 user_not_found. Hermes / OpenClaw residents use the resident config; Claude / ChatGPT / Gemini-style chat tools use the MCP command.")
                                 .font(.notoSerifSC(size: 13))
                                 .foregroundStyle(Color.cinSub)
                                 .lineSpacing(4)
@@ -171,12 +197,12 @@ struct PostWipeReimportSheet: View {
 
                             VStack(alignment: .leading, spacing: 8) {
                                 HStack {
-                                    Text(isChinese ? "MCP 连接字符串" : "MCP String")
+                                    Text(isChinese ? "重新连接信息" : "Reconnection details")
                                         .font(.notoSerifSC(size: 13.5))
                                         .foregroundStyle(Color.cinFg)
                                     Spacer()
                                     Button {
-                                        UIPasteboard.general.string = api.mcpConnectionString
+                                        UIPasteboard.general.string = reimportBlock
                                         withAnimation(.easeOut(duration: 0.15)) { copied = true }
                                     } label: {
                                         Text(copied
@@ -188,7 +214,7 @@ struct PostWipeReimportSheet: View {
                                     }
                                     .buttonStyle(.plain)
                                 }
-                                Text(api.mcpConnectionString)
+                                Text(reimportBlock)
                                     .font(.dmMono(size: 9))
                                     .foregroundStyle(Color.cinSub)
                                     .lineSpacing(2)
@@ -214,8 +240,8 @@ struct PostWipeReimportSheet: View {
                             // register on user's own VPS and paste back) or cloud
                             // registration silently failed.
                             Text(isChinese
-                                 ? "新的 API key 还没就绪。请到 Settings → Storage，按你的存储模式重新拿一个 key——自托管模式从你自己的 VPS 注册并 paste 回来，cloud 模式点 \"REGENERATE API KEY\"。拿到之后，把新的 MCP String 重新导入你的 agent runtime。"
-                                 : "The new API key isn't ready yet. Head to Settings → Storage and grab one — self-hosted mode: register on your VPS and paste back; cloud mode: tap \"REGENERATE API KEY\". Once you have it, re-import the new MCP String into your agent runtime.")
+                                 ? "新的 API key 还没就绪。请到 Settings → Storage，按你的存储模式重新拿一个 key——自托管模式从你自己的 VPS 注册并 paste 回来，cloud 模式点 \"REGENERATE API KEY\"。拿到之后，把新的连接信息重新导入你的 agent runtime。"
+                                 : "The new API key isn't ready yet. Head to Settings → Storage and grab one — self-hosted mode: register on your VPS and paste back; cloud mode: tap \"REGENERATE API KEY\". Once you have it, re-import the new connection details into your agent runtime.")
                                 .font(.notoSerifSC(size: 13))
                                 .foregroundStyle(Color.cinSub)
                                 .lineSpacing(4)
