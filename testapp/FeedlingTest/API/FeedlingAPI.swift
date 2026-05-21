@@ -437,6 +437,7 @@ final class FeedlingAPI: ObservableObject {
             struct Who: Decodable {
                 let user_id: String
                 let public_key: String?
+                let enclave_content_public_key_hex: String?
             }
             let w = try JSONDecoder().decode(Who.self, from: data)
             if !w.user_id.isEmpty, w.user_id != self.userId {
@@ -457,6 +458,17 @@ final class FeedlingAPI: ObservableObject {
                     let (_, syncResp) = try await URLSession.shared.data(for: syncReq)
                     let code = (syncResp as? HTTPURLResponse)?.statusCode ?? -1
                     log("[whoami] public_key sync status=\(code)")
+                }
+            }
+
+            if let enclaveHex = w.enclave_content_public_key_hex,
+               let pkBytes = Data(hexString: enclaveHex) {
+                do {
+                    let pk = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: pkBytes)
+                    self.enclaveContentPublicKey = pk
+                    publishContentKeysToAppGroup()
+                } catch {
+                    log("[whoami] enclave content key invalid: \(error)")
                 }
             }
         } catch {

@@ -169,6 +169,25 @@ class ChatViewModel: ObservableObject {
         inputText = ""
         isSending = true
 
+        let api = FeedlingAPI.shared
+        await api.ensureUserIdIfNeeded()
+        api.ensureContentKeypair()
+        if api.enclaveContentPublicKey == nil {
+            await api.refreshEnclaveAttestation()
+        }
+
+        guard let userPK = api.userContentPublicKey,
+              let enclavePK = api.enclaveContentPublicKey,
+              !api.userId.isEmpty
+        else {
+            log("[chat] send skipped — content keys not ready")
+            inputText = text
+            isSending = false
+            isWaitingForReply = false
+            waitingTimeoutTask?.cancel()
+            return
+        }
+
         // Optimistic insert
         let optimistic = ChatMessage(
             id: UUID().uuidString,
@@ -199,15 +218,6 @@ class ChatViewModel: ObservableObject {
         // plaintext bodies with 400 post-v0 strip, so bail out loudly if
         // crypto material isn't ready yet (fresh install before the first
         // attestation sync).
-        let api = FeedlingAPI.shared
-        guard let userPK = api.userContentPublicKey,
-              let enclavePK = api.enclaveContentPublicKey,
-              !api.userId.isEmpty
-        else {
-            log("[chat] skipping send — content keypair not ready")
-            isSending = false
-            return
-        }
         let body: Data?
         do {
             let ownerUserID = api.userId
@@ -226,6 +236,11 @@ class ChatViewModel: ObservableObject {
             log("[chat] sending v1 envelope id=\(result.1)")
         } catch {
             log("[chat] envelope build failed: \(error)")
+            messages.removeAll { $0.id == optimistic.id }
+            latestTs = messages.last?.ts ?? 0
+            inputText = text
+            isWaitingForReply = false
+            waitingTimeoutTask?.cancel()
             isSending = false
             return
         }
@@ -235,9 +250,39 @@ class ChatViewModel: ObservableObject {
             method: "POST",
             body: body
         ) else {
-            isSending = false; return
+            messages.removeAll { $0.id == optimistic.id }
+            latestTs = messages.last?.ts ?? 0
+            inputText = text
+            isWaitingForReply = false
+            waitingTimeoutTask?.cancel()
+            isSending = false
+            return
         }
-        _ = try? await URLSession.shared.data(for: req)
+        do {
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            guard let http = resp as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode)
+            else {
+                let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+                log("[chat] send failed HTTP \(code): \(String(data: data, encoding: .utf8) ?? "")")
+                messages.removeAll { $0.id == optimistic.id }
+                latestTs = messages.last?.ts ?? 0
+                inputText = text
+                isWaitingForReply = false
+                waitingTimeoutTask?.cancel()
+                isSending = false
+                return
+            }
+        } catch {
+            log("[chat] send request failed: \(error)")
+            messages.removeAll { $0.id == optimistic.id }
+            latestTs = messages.last?.ts ?? 0
+            inputText = text
+            isWaitingForReply = false
+            waitingTimeoutTask?.cancel()
+            isSending = false
+            return
+        }
         isSending = false
     }
 
