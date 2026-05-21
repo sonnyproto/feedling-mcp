@@ -443,11 +443,7 @@ Self-hosted users derive the same shape using their own domain:
 claude mcp add feedling --transport sse "https://mcp.<your-domain>/sse?key=<api_key>"
 ```
 
-### OpenClaw / HTTP-mode agents
-
-OpenClaw (and other MCP-capable agent runtimes) use the same MCP path
-as Claude Desktop — point them at the `mcp.feedling.app/sse` endpoint
-above and they'll fetch the live skill from io-onboarding automatically.
+### Hermes / OpenClaw / machine-resident agents
 
 For Hermes / OpenClaw / Mac / server agents and **non-MCP** agent backends
 (a custom Python script, a plain Anthropic/OpenAI loop, a local Llama endpoint),
@@ -457,14 +453,16 @@ run the independent resident consumer service:
 cp deploy/chat_resident.env.example ~/feedling-chat-resident.env
 chmod 600 ~/feedling-chat-resident.env
 # Edit ~/feedling-chat-resident.env — set FEEDLING_API_URL, FEEDLING_API_KEY,
-# AGENT_MODE, and one of FEEDLING_ENCLAVE_URL / FEEDLING_MCP_URL.
+# a decrypt source, and the runtime's real HTTP or CLI agent entry.
 sudo cp deploy/feedling-chat-resident.service /etc/systemd/system/
 sudo systemctl enable --now feedling-chat-resident
 ```
 
-See `tools/README.md` for the full setup — the agent exposes either an HTTP
-`/chat` endpoint or a CLI command; the consumer handles polling, decrypt source,
-v1 envelope wrapping, and checkpoints.
+See `tools/README.md` for the full setup. For Hermes CLI, the consumer stores
+the first `session_id` and resumes it with `--resume`; it does not use
+`--continue`. For Hermes' API server, use the OpenAI-compatible
+`/v1/chat/completions` mode with Hermes session headers. Agent failures are
+logged by default rather than posted as fake fallback chat bubbles.
 
 Self-hosted users: see [`deploy/SELF_HOSTING.md`](deploy/SELF_HOSTING.md)
 for an end-to-end SSH runbook (clone, deps, env, systemd, HTTPS via

@@ -100,8 +100,7 @@ echo "╠═══════════════════════�
 echo "║  To enable agent auto-reply:                                    ║"
 echo "║    1. cp $REPO_DIR/deploy/chat_resident.env.example            ║"
 echo "║          ~/feedling-chat-resident.env && chmod 600 it           ║"
-echo "║    2. Fill in FEEDLING_API_KEY and AGENT_CLI_CMD (or           ║"
-echo "║       AGENT_MODE=http + AGENT_HTTP_URL)                        ║"
+echo "║    2. Fill in FEEDLING_API_KEY and a real HTTP/CLI agent entry ║"
 echo "║    3. sudo systemctl enable --now feedling-chat-resident        ║"
 echo "║    4. sudo systemctl status feedling-chat-resident              ║"
 fi

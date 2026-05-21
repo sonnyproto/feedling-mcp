@@ -3,34 +3,33 @@
 Operator-facing utilities for Feedling. Each entry is independent — none
 of these are imported by the backend at runtime.
 
-## `chat_resident_consumer.py` — HTTP-mode chat bridge
+## `chat_resident_consumer.py` — independent resident chat bridge
 
-A long-running daemon that lets a **non-resident agent backend** participate
-in Feedling chat. Without it, a Feedling iOS user can send chat messages
-to a Feedling server but no one ever replies — unless they're connected
-via a runtime that stays alive and handles polling/replying natively.
+A long-running daemon that lets an agent backend participate in Feedling chat.
+It owns the Feedling poll loop, calls the real agent entry, and posts the reply
+back.
 
 ### When you need this
 
 Pick the highest-priority path that can honestly own Live connection:
 
-1. **Server-resident agent** — no bridge needed if the agent itself is a stable daemon that can poll Feedling and post replies.
-2. **Resident bridge for one-shot / local CLI agents** — use `chat_resident_consumer.py`; this is the normal path for Hermes CLI / mcporter / shell-invoked agents.
-3. **HTTP/API agent backend** — use `chat_resident_consumer.py` to poll Feedling and POST user messages into your API.
-4. **Desktop MCP runtime** — only skip the bridge if the desktop/runtime process truly stays alive and keeps polling without another operator prompt.
+1. **Independent resident consumer** — use `chat_resident_consumer.py`. This is the normal path for Hermes / OpenClaw / Mac mini / VPS agents.
+2. **HTTP/API agent backend** — still use `chat_resident_consumer.py`; it polls Feedling and POSTs user messages into your API.
+3. **Desktop MCP runtime** — only skip the bridge if that desktop/runtime process truly stays alive and keeps polling without another operator prompt.
 
 | Your agent runtime | Use chat-resident? |
 |--|--|
-| Server-resident agent daemon that owns polling itself | **No.** It is already the resident. |
-| Claude Desktop, Claude Code, OpenClaw, Cursor, Hermes-MCP **when the process stays alive between user turns** | **No.** A resident MCP runtime long-polls and replies natively via `feedling_chat_post_message`. |
-| Hermes CLI / mcporter / any MCP-capable CLI that exits after one invocation | **Yes.** MCP tools are not enough; if the process is not resident, it cannot own the chat loop. |
+| Server-resident agent daemon that already owns Feedling polling itself | **No.** It is already the resident. |
+| Hermes / OpenClaw / Claude Code on a Mac mini or VPS | **Yes.** Run this independent consumer and point it at the runtime's HTTP or CLI entry. |
+| Hermes CLI / mcporter / any CLI that exits after one invocation | **Yes.** The consumer keeps the long-running loop and invokes the CLI per message. |
 | Custom Python script that just makes HTTP requests | **Yes.** |
 | Plain Anthropic / OpenAI API loop without MCP support | **Yes.** |
 | Local Llama / Ollama / vLLM serving a `/chat` endpoint | **Yes.** |
 | A CLI tool you want to use as the agent (Hermes-CLI, etc.) | **Yes.** |
 
-If you're in the "Yes" rows, `chat_resident_consumer.py` is the bridge.
-The test is process lifetime, not brand name and not whether MCP tools exist.
+If you're in the "Yes" rows, `chat_resident_consumer.py` is the bridge. The
+test is whether Feedling has a long-running poll owner, not brand name and not
+whether MCP tools exist in some other surface.
 
 ### What it does
 
@@ -88,7 +87,7 @@ your messages going out, but the agent never produces a response.
 
 ### Agent backend modes
 
-#### `AGENT_MODE=http` (recommended)
+#### `AGENT_MODE=http`
 
 Use this when your agent exposes a JSON HTTP endpoint:
 
@@ -101,6 +100,20 @@ AGENT_HTTP_FIELD=response                    # JSON field that contains the repl
 
 The daemon POSTs `{"message": "<user text>"}` and reads the named field
 from the JSON response.
+
+For Hermes' API server, use the OpenAI-compatible protocol instead of the
+simple JSON shape:
+
+```
+AGENT_MODE=http
+AGENT_HTTP_PROTOCOL=openai
+AGENT_HTTP_URL=http://127.0.0.1:8642/v1/chat/completions
+AGENT_HTTP_MODEL=hermes-agent
+# AGENT_HTTP_SESSION_KEY is optional; defaults to feedling:{user_id}.
+```
+
+The daemon sends `X-Hermes-Session-Key`, stores the returned
+`X-Hermes-Session-Id`, and sends it back on later turns.
 
 #### `AGENT_MODE=cli`
 
@@ -128,15 +141,14 @@ the safest path is configuring your CLI to be silent.
 ##### Hermes example
 
 ```
-# JSON output (preferred — unambiguous field extraction)
 AGENT_CLI_PATH=/home/openclaw/.local/bin:/home/openclaw/.hermes/hermes-agent/venv/bin
-AGENT_CLI_CMD=hermes chat -Q --continue --max-turns 1 -q "{message}"
-
-# Plain text output (sanitizer strips known footers)
-AGENT_CLI_CMD=hermes chat -Q --continue --max-turns 1 -q "{message}"
+AGENT_CLI_CMD=hermes chat -Q --max-turns 1 -q "{message}"
 ```
 
-`--continue` keeps Hermes' conversation memory across turns.
+Do not put `--continue` in `AGENT_CLI_CMD`. On the first turn, Hermes creates
+a session and prints `session_id`; the consumer stores it. On later turns the
+consumer injects `--resume <session_id>` so Feedling is bound to the same
+conversation instead of whichever local Hermes session happens to be latest.
 
 Before installing the daemon, run the exact Hermes command in a terminal with
 a normal user message and confirm stdout is a real model reply in the agent's
@@ -144,6 +156,21 @@ voice. If it returns a shell like "我看到了：<message>。你要我继续展
 or another template, the resident is correctly forwarding messages but the
 configured CLI command is not reaching the real agent session. Fix
 `AGENT_CLI_CMD` / session selection before running it as a service.
+
+### Failure behavior
+
+By default, agent-entry failures are log-only and **no fallback template is
+posted into iOS Chat**:
+
+```
+SEND_FALLBACK_ON_AGENT_ERROR=false
+```
+
+This keeps user-visible chat clean. If the agent command, HTTP endpoint, or
+reply sanitizer fails, inspect the resident logs and fix the entry; do not
+mask it with "send that once more" / "temporarily unavailable" chat bubbles.
+There is an opt-in fallback knob for local experiments, but production
+onboarding should leave it disabled.
 
 ### Image messages
 

@@ -8,7 +8,8 @@ and writes the reply back via /v1/chat/response.
 Supports two agent backend modes (set AGENT_MODE env var):
 
   http  — POST the user message to an HTTP endpoint and read the response body.
-          Works with any REST-compatible agent (Hermes HTTP API, OpenClaw, etc.)
+          Supports simple JSON endpoints and Hermes' OpenAI-compatible
+          /v1/chat/completions API.
 
   cli   — Run a shell command with the user message passed via --query/-q flag.
           Works with any CLI agent that writes its reply to stdout.
@@ -24,19 +25,25 @@ Required env vars (all keys go in CHAT_RESIDENT_ENV_FILE, never hardcoded):
 HTTP mode:
   AGENT_HTTP_URL        Endpoint to POST user messages to
   AGENT_HTTP_TOKEN      Bearer token (optional)
+  AGENT_HTTP_PROTOCOL   "simple" (POST {"message"}) or "openai" for Hermes
   AGENT_HTTP_FIELD      JSON response field containing the reply (default: "response")
 
 CLI mode:
   AGENT_CLI_CMD         Full command template; {message} is replaced with the
                         user's message text.
-                        Example (Hermes): hermes chat -Q --output-mode json -q {message}
+                        Example (Hermes): hermes chat -Q --max-turns 1 -q "{message}"
                         Example (plain):  mycli ask {message}
+                        For Hermes, the consumer stores session_id and
+                        auto-injects --resume on later turns.
   AGENT_CLI_PATH        Optional colon-separated executable search path added
                         before PATH. Useful for systemd services.
 
 Optional:
   CHECKPOINT_FILE       Path to persist last-processed timestamp (default: /tmp/feedling_chat_checkpoint.json)
-  FALLBACK_REPLY        Reply sent when agent call fails (default: built-in string)
+  SEND_FALLBACK_ON_AGENT_ERROR
+                        Default false. When false, agent failures are logged
+                        and no fake template is posted to the user.
+  FALLBACK_REPLY        Optional opt-in fallback text
   POLL_TIMEOUT          Long-poll timeout in seconds (default: 30)
   LOG_LEVEL             DEBUG / INFO / WARNING (default: INFO)
 """
@@ -91,6 +98,13 @@ def _mask(val: str) -> str:
     return val[:4] + "***" + val[-4:]
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -102,6 +116,15 @@ AGENT_MODE = os.environ.get("AGENT_MODE", "http").lower()
 AGENT_HTTP_URL = os.environ.get("AGENT_HTTP_URL", "")
 AGENT_HTTP_TOKEN = os.environ.get("AGENT_HTTP_TOKEN", "")
 AGENT_HTTP_FIELD = os.environ.get("AGENT_HTTP_FIELD", "response")
+AGENT_HTTP_PROTOCOL = os.environ.get("AGENT_HTTP_PROTOCOL", "simple").lower()
+AGENT_HTTP_MODEL = os.environ.get("AGENT_HTTP_MODEL", "hermes-agent")
+AGENT_HTTP_SESSION_KEY = os.environ.get("AGENT_HTTP_SESSION_KEY", "")
+AGENT_HTTP_SESSION_HEADER = os.environ.get(
+    "AGENT_HTTP_SESSION_HEADER", "X-Hermes-Session-Id"
+)
+AGENT_HTTP_SESSION_KEY_HEADER = os.environ.get(
+    "AGENT_HTTP_SESSION_KEY_HEADER", "X-Hermes-Session-Key"
+)
 
 AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
@@ -116,6 +139,7 @@ AGENT_SESSION_FILE_TEMPLATE = os.environ.get(
 FALLBACK_REPLY = os.environ.get(
     "FALLBACK_REPLY", "（Agent 暂时无法响应，请稍后再试）"
 )
+SEND_FALLBACK_ON_AGENT_ERROR = _env_bool("SEND_FALLBACK_ON_AGENT_ERROR", False)
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
 
 # Placeholder routed to text-only agent backends when the user sends an
@@ -560,15 +584,51 @@ def _extract_text_from_cli_output(raw: str) -> str:
     return paragraphs[-1]
 
 
-def call_agent_http(message: str) -> str:
-    if not AGENT_HTTP_URL:
-        raise ValueError("AGENT_HTTP_URL is not set for http mode")
+def _agent_http_headers() -> dict[str, str]:
     headers = {"Content-Type": "application/json"}
     if AGENT_HTTP_TOKEN:
         headers["Authorization"] = f"Bearer {AGENT_HTTP_TOKEN}"
+    return headers
+
+
+def _agent_session_key() -> str:
+    if AGENT_HTTP_SESSION_KEY.strip():
+        return AGENT_HTTP_SESSION_KEY.strip()
+    user_id = (_whoami_cache.get("user_id") or "").strip()
+    if user_id:
+        return f"feedling:{user_id}"
+    digest = hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:12]
+    return f"feedling:{digest}"
+
+
+def _extract_openai_reply(body: dict) -> str:
+    choices = body.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            message = first.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, str) and content.strip():
+                    return content.strip()
+            text = first.get("text")
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+    raise ValueError("OpenAI-compatible response has no usable reply text")
+
+
+def _remember_http_session(resp: httpx.Response) -> None:
+    sid = (resp.headers.get(AGENT_HTTP_SESSION_HEADER) or "").strip()
+    if sid:
+        _save_agent_session_id(sid)
+
+
+def _call_agent_http_simple(message: str) -> str:
+    headers = _agent_http_headers()
     payload = {"message": message}
     resp = httpx.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=60)
     resp.raise_for_status()
+    _remember_http_session(resp)
     body = resp.json()
     if isinstance(body, dict):
         for field in (AGENT_HTTP_FIELD, "response", "content", "text", "reply"):
@@ -578,6 +638,39 @@ def call_agent_http(message: str) -> str:
     if isinstance(body, str):
         return body.strip()
     raise ValueError(f"unexpected response type: {type(body)}")
+
+
+def _call_agent_http_openai(message: str) -> str:
+    headers = _agent_http_headers()
+    sid = _load_agent_session_id()
+    if sid:
+        headers[AGENT_HTTP_SESSION_HEADER] = sid
+    session_key = _agent_session_key()
+    if session_key:
+        headers[AGENT_HTTP_SESSION_KEY_HEADER] = session_key
+
+    payload = {
+        "model": AGENT_HTTP_MODEL,
+        "messages": [{"role": "user", "content": message}],
+        "stream": False,
+    }
+    resp = httpx.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=120)
+    resp.raise_for_status()
+    _remember_http_session(resp)
+    body = resp.json()
+    if not isinstance(body, dict):
+        raise ValueError(f"unexpected OpenAI response type: {type(body)}")
+    return _extract_openai_reply(body)
+
+
+def call_agent_http(message: str) -> str:
+    if not AGENT_HTTP_URL:
+        raise ValueError("AGENT_HTTP_URL is not set for http mode")
+    if AGENT_HTTP_PROTOCOL in {"openai", "hermes", "chat_completions", "chat-completions"}:
+        return _call_agent_http_openai(message)
+    if AGENT_HTTP_PROTOCOL in {"simple", "generic", "json"}:
+        return _call_agent_http_simple(message)
+    raise ValueError(f"unknown AGENT_HTTP_PROTOCOL: {AGENT_HTTP_PROTOCOL!r}")
 
 
 def _agent_session_file_for_user() -> Path:
@@ -669,18 +762,76 @@ def _resolve_cli_executable(cmd: list[str]) -> list[str]:
     return [resolved, *cmd[1:]]
 
 
+def _is_hermes_chat_cmd(cmd: list[str]) -> bool:
+    return len(cmd) >= 2 and Path(cmd[0]).name == "hermes" and cmd[1] == "chat"
+
+
+def _strip_hermes_continue(cmd: list[str]) -> tuple[list[str], bool]:
+    """Remove Hermes --continue/-c from resident-owned commands.
+
+    The resident owns continuity by persisting the first Hermes session_id and
+    injecting --resume <session_id> on later turns. --continue means "latest
+    local session" and can attach Feedling to the wrong conversation.
+    """
+    out: list[str] = []
+    i = 0
+    removed = False
+    while i < len(cmd):
+        token = cmd[i]
+        if token in {"--continue", "-c"}:
+            removed = True
+            i += 1
+            # Hermes accepts an optional session name after --continue. Drop it
+            # only when it is clearly not another flag.
+            if i < len(cmd) and not cmd[i].startswith("-"):
+                i += 1
+            continue
+        out.append(token)
+        i += 1
+    return out, removed
+
+
+def _has_hermes_resume(cmd: list[str]) -> bool:
+    return "--resume" in cmd or "-r" in cmd
+
+
+def _render_cli_template(message: str, sid: str) -> list[str]:
+    msg_token = "__FEEDLING_MESSAGE__"
+    sid_token = "__FEEDLING_SESSION_ID__"
+    template = (
+        AGENT_CLI_CMD
+        .replace("{message}", msg_token)
+        .replace("{session_id}", sid_token)
+    )
+    cmd = shlex.split(template)
+    return [
+        part.replace(msg_token, message).replace(sid_token, sid)
+        for part in cmd
+    ]
+
+
+def _prepare_cli_command(message: str) -> list[str]:
+    sid = _load_agent_session_id()
+    cmd = _render_cli_template(message, sid)
+
+    if _is_hermes_chat_cmd(cmd):
+        cmd, removed_continue = _strip_hermes_continue(cmd)
+        if removed_continue:
+            log.warning(
+                "removed Hermes --continue from AGENT_CLI_CMD; resident "
+                "continuity uses stored session_id plus --resume"
+            )
+        if sid and not _has_hermes_resume(cmd):
+            cmd = [cmd[0], cmd[1], "--resume", sid, *cmd[2:]]
+
+    return _resolve_cli_executable(cmd)
+
+
 def call_agent_cli(message: str) -> str:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
 
-    cmd_str = AGENT_CLI_CMD.replace("{message}", message)
-    sid = _load_agent_session_id()
-    if "{session_id}" in cmd_str:
-        cmd_str = cmd_str.replace("{session_id}", sid)
-    elif sid and "hermes chat" in cmd_str and "--resume" not in cmd_str and "--continue" not in cmd_str:
-        cmd_str = cmd_str.replace("hermes chat", f"hermes chat --resume {shlex.quote(sid)}", 1)
-
-    cmd = _resolve_cli_executable(shlex.split(cmd_str))
+    cmd = _prepare_cli_command(message)
     log.debug("running cli agent: %s", cmd)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
@@ -689,7 +840,9 @@ def call_agent_cli(message: str) -> str:
         _save_agent_session_id(observed_sid)
 
     if result.returncode != 0:
-        log.warning("cli agent exited %d: %s", result.returncode, result.stderr[:200])
+        raise RuntimeError(
+            f"cli agent exited {result.returncode}: {(result.stderr or '')[:300]}"
+        )
     raw = result.stdout
     text = _extract_text_from_cli_output(raw)
     if not text:
@@ -790,7 +943,11 @@ def call_agent(message: str) -> list[str]:
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
     replies = _normalize_agent_replies(raw)
-    return replies or [FALLBACK_REPLY]
+    if replies:
+        return replies
+    if SEND_FALLBACK_ON_AGENT_ERROR:
+        return [FALLBACK_REPLY]
+    raise ValueError("agent produced no usable reply after sanitization")
 
 
 # ---------------------------------------------------------------------------
@@ -1017,17 +1174,23 @@ def _process_messages(messages: list) -> float:
         try:
             replies = call_agent(content)
         except Exception as e:
-            log.error("agent call failed: %s", e)
-            now = time.time()
-            if now - _last_fallback_ts >= FALLBACK_COOLDOWN:
-                replies = [FALLBACK_REPLY]
-                _last_fallback_ts = now
-                log.warning("sending fallback reply (cooldown starts)")
+            log.error("agent call failed; not posting user-visible fallback: %s", e)
+            if SEND_FALLBACK_ON_AGENT_ERROR:
+                now = time.time()
+                if now - _last_fallback_ts >= FALLBACK_COOLDOWN:
+                    replies = [FALLBACK_REPLY]
+                    _last_fallback_ts = now
+                    log.warning("sending opt-in fallback reply (cooldown starts)")
+                else:
+                    log.warning(
+                        "fallback suppressed — cooldown active (last sent %.0fs ago)",
+                        now - _last_fallback_ts,
+                    )
+                    latest = max(latest, ts)
+                    continue
             else:
-                log.warning(
-                    "fallback suppressed — cooldown active (last sent %.0fs ago)",
-                    now - _last_fallback_ts,
-                )
+                # Mark this message seen for this process so a broken agent entry
+                # does not create a visible template loop. The error stays in logs.
                 latest = max(latest, ts)
                 continue
 

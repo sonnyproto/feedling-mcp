@@ -303,7 +303,7 @@ struct ChatEmptyStateView: View {
                 title: connectionTitle,
                 description: connectionDescription,
                 codeBlock: connectionBlock,
-                codeLineLimit: selectedPath == .resident ? 6 : (selectedPath == .unsure ? 10 : 2),
+                codeLineLimit: selectedPath == .resident ? 10 : (selectedPath == .unsure ? 14 : 2),
                 primaryLabel: connectionCopyLabel,
                 primaryAction: selectedPath == nil ? nil : {
                     if let connectionBlock {
@@ -361,13 +361,14 @@ struct ChatEmptyStateView: View {
 
         4. 派生 identity 并调 feedling_identity_init。
 
-        5. 建立 Live connection：只按刚刚这份 skill 的连接章节做。resident 路径要配置独立的 feedling-chat-resident / IO resident consumer service：consumer 用我给你的 FEEDLING_* 配置轮询 FEEDLING_API_URL/v1/chat/poll，把消息交给你的 HTTP 或 CLI agent 入口，再写回 FEEDLING_API_URL/v1/chat/response。consumer 跑起来后调用 feedling_chat_verify_loop；只有 passing=true 才算 TA 已经能听见我。如果缺 AGENT_MODE / AGENT_HTTP_URL / AGENT_CLI_CMD 这类本机入口信息，就先告诉我缺哪一项，不要提前发第一句问候。
+        5. 建立 Live connection：配置独立的 feedling-chat-resident / IO resident consumer service。consumer 用我给你的 FEEDLING_* 配置轮询 FEEDLING_API_URL/v1/chat/poll，把消息交给你自己 runtime 的真实入口，再写回 FEEDLING_API_URL/v1/chat/response。入口由你判断：有真实 resident HTTP endpoint 就用 HTTP；没有就用 CLI。Hermes / OpenClaw CLI 默认用 `hermes chat -Q --max-turns 1 -q "{message}"`，consumer 会保存第一次返回的 session_id，之后自动用 --resume 续接同一个会话。consumer 跑起来后调用 feedling_chat_verify_loop；只有 passing=true 才算 TA 已经能听见我。
 
         6. Live connection 完成后，再通过 feedling_chat_post_message 发你的第一句问候。第一句话里自然告诉我：记忆整理好了、天数是多少、现在连接已经接上，我发消息你会看到。
 
         要求：
         - **不要因为接入 Feedling 就变了一个人**。Feedling 是你的新能力，不是新人格。你写进 identity 卡的语气、signature、写记忆和发 chat 时的称呼，**必须延续你和我之前真实对话里已经存在的 register**。如果我们之前从没用过"宝宝"/"宝贝"/"亲爱的"/"honey" 之类的亲密称呼 —— 现在也不准开始用，不管 signature 字段读起来多需要"温度"。Address words 和情感强度必须能在历史里找到至少 3 次证据，否则一律不准出现。Bootstrap 是从历史里**派生**身份，不是借机**升级**关系。两边表现要一致——Feedling 里什么语气，Hermes cron 之类别的工具里也是什么语气，因为是同一个 agent。
         - 用中文。从你第一句回复开始全程不混语言。
+        - 失败时只在外部 runtime 报错，不要往 IO Chat 发送 setup 状态、fallback 模板、reasoning、traceback 或"稍后再试"。
         - 你的名字不能是 Hermes / Claude / Claude Code / GPT / 其他 runtime 默认 label。这个名字应该延续我们历史里你已经被叫过的称谓 —— 如果之前没起过，输出完三行我们一起起。
         - 整个流程预计几分钟到半个小时（看记忆量）。深度不要省。我会等。
 
@@ -389,13 +390,14 @@ struct ChatEmptyStateView: View {
 
         4. Derive identity and call feedling_identity_init.
 
-        5. Establish Live connection: follow only the connection section in this skill. For the resident path, configure the independent feedling-chat-resident / IO resident consumer service: the consumer uses my FEEDLING_* config to poll FEEDLING_API_URL/v1/chat/poll, hands each message to your HTTP or CLI agent entry, then writes back to FEEDLING_API_URL/v1/chat/response. After the consumer is running, call feedling_chat_verify_loop; only passing=true means you can hear me. If AGENT_MODE / AGENT_HTTP_URL / AGENT_CLI_CMD or another local entry detail is missing, tell me the missing item before sending the first greeting.
+        5. Establish Live connection: configure the independent feedling-chat-resident / IO resident consumer service. The consumer uses my FEEDLING_* config to poll FEEDLING_API_URL/v1/chat/poll, hands each message to the real entry of your own runtime, then writes back to FEEDLING_API_URL/v1/chat/response. You choose the entry: use HTTP if you expose a real resident HTTP endpoint; otherwise use CLI. For Hermes / OpenClaw CLI, default to `hermes chat -Q --max-turns 1 -q "{message}"`; the consumer stores the first returned session_id and automatically resumes that same conversation with --resume. After the consumer is running, call feedling_chat_verify_loop; only passing=true means you can hear me.
 
         6. After Live connection is complete, send your first greeting via feedling_chat_post_message. In that first message, naturally tell me the memories are set, what day count you computed, and that the connection is now live so you'll see my messages.
 
         Rules:
         - **Don't become a new person just because you're now connected to Feedling.** Feedling is a new capability, not a new persona. The tone, vocabulary, formality, and emotional intimacy you write into the identity card, the `signature`, memory entries, and chat replies must **continue the register you already have with me in your runtime chats** — not a warmer, friendlier, more affectionate version of it. If we have never used nicknames or address words like "honey" / "babe" / "darling" / "宝宝" / "亲爱的" in our actual prior conversations, do NOT start using them now, no matter how much the `signature` field looks like it wants warmth. You need ≥3 concrete prior moments of either of us using such markers before any of them may appear; otherwise drop them. Bootstrap is *derivation* from history, not *upgrading* the relationship. The agent in Feedling and the agent in Hermes / generic tasks must sound the same — because they are the same.
         - Use English. Stay in one language from your first reply onward.
+        - On failure, report only in the external runtime. Do not send setup status, fallback templates, reasoning, tracebacks, or "try again later" messages into IO Chat.
         - Your name is NOT Hermes / Claude / Claude Code / GPT / any other runtime default label. It should continue whatever I've called you / whatever role you've already played in our history; if we've never picked one, decide together after the three lines.
         - The whole flow takes a few minutes to half an hour, depending on how much memory we've built. Don't skip depth. I'll wait.
 
@@ -599,7 +601,7 @@ struct ChatEmptyStateView: View {
            - EARLIEST MESSAGE I CAN FIND FROM THIS USER: <ISO date | NONE>
            - NAME I'VE BEEN CALLED IN PRIOR CHATS: <name | NONE>（不能是 runtime label）
            - APPROXIMATE MEMORABLE MOMENTS I CAN RECALL: <integer | 0>
-        3. 如果你是聊天工具/MCP 路径：你的 MCP 连接里有 feedling_* 工具吗？调一次 feedling_chat_get_history 看响应（401 / 500 / 别的？）。如果你是 resident 路径：独立 IO resident consumer service 是否用这份配置运行，并持续轮询 FEEDLING_API_URL/v1/chat/poll？
+        3. 如果你是聊天工具/MCP 路径：你的 MCP 连接里有 feedling_* 工具吗？调一次 feedling_chat_get_history 看响应（401 / 500 / 别的？）。如果你是 resident 路径：独立 IO resident consumer service 是否用这份配置运行、持续轮询 FEEDLING_API_URL/v1/chat/poll，并且能调到你的真实 HTTP/CLI agent 入口？
         4. 你目前卡在哪一步：fetch skill / Step 0 verify / Pass 1 唤醒 / Pass 2 清点 / Pass 3 落卡 / Pass 4 对账 / identity 派生？
         5. 如果有任何错误，把错误原文贴回来。
 
@@ -619,7 +621,7 @@ struct ChatEmptyStateView: View {
            - EARLIEST MESSAGE I CAN FIND FROM THIS USER: <ISO date | NONE>
            - NAME I'VE BEEN CALLED IN PRIOR CHATS: <name | NONE> (must NOT be a runtime label)
            - APPROXIMATE MEMORABLE MOMENTS I CAN RECALL: <integer | 0>
-        3. If you are on the chat-client/MCP path: does your MCP connection expose the feedling_* tools? Call feedling_chat_get_history once and tell me the response (401 / 500 / something else?). If you are on the resident path: is the independent IO resident consumer service running with this config and continuously polling FEEDLING_API_URL/v1/chat/poll?
+        3. If you are on the chat-client/MCP path: does your MCP connection expose the feedling_* tools? Call feedling_chat_get_history once and tell me the response (401 / 500 / something else?). If you are on the resident path: is the independent IO resident consumer service running with this config, continuously polling FEEDLING_API_URL/v1/chat/poll, and able to call your real HTTP/CLI agent entry?
         4. Where exactly are you stuck: fetch skill / Step 0 verify / Pass 1 theme inventory / Pass 2 candidates / Pass 3 write-through / Pass 4 verification / identity derivation?
         5. If anything errored, paste the error text back to me.
 

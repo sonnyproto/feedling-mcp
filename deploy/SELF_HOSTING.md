@@ -245,9 +245,9 @@ curl -s -H "X-API-Key: <new_key>" "$FEEDLING_API_URL/v1/chat/poll?timeout=1"
 #    arrives in the app within one poll cycle (~30s)
 ```
 
-If step 3 returns the fallback template instead of a real reply, the
-agent backend is unreachable from chat-resident — check its env and
-logs.
+If step 3 returns no reply, inspect chat-resident logs. Production onboarding
+keeps `SEND_FALLBACK_ON_AGENT_ERROR=false`, so agent-entry failures should stay
+in logs instead of appearing as template chat bubbles.
 
 ---
 

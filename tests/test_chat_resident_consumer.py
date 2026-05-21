@@ -116,7 +116,7 @@ def test_invalid_key_exits_on_startup():
 
 
 # ---------------------------------------------------------------------------
-# Bonus: fallback cooldown — agent failure should not spam the user
+# Bonus: agent failures are fail-hard by default
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -201,31 +201,32 @@ def test_empty_content_no_decrypt_source_no_reply_no_fallback(monkeypatch):
     assert result_ts == pytest.approx(5000.0)
 
 
-def test_fallback_cooldown_suppresses_repeat():
-    """If the agent fails twice in rapid succession, only the first failure
-    should trigger a fallback reply; the second should be suppressed."""
-    msgs = [
-        _make_msg(role="user", content="msg1", ts=100.0),
-        _make_msg(role="user", content="msg2", ts=101.0),
-    ]
+def test_agent_failure_no_fallback_by_default(monkeypatch):
+    """Agent backend failure should not post a fake user-visible template."""
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", False)
+    crc._last_fallback_ts = 0.0
 
-    # Reset cooldown state.
+    with patch.object(crc, "call_agent", side_effect=RuntimeError("agent down")), \
+         patch.object(crc, "post_reply") as mock_post:
+        result_ts = crc._process_messages([
+            _make_msg(role="user", content="msg1", ts=100.0)
+        ])
+
+    mock_post.assert_not_called()
+    assert result_ts == pytest.approx(100.0)
+
+
+def test_fallback_is_explicit_opt_in(monkeypatch):
+    """The legacy fallback path still exists only when explicitly enabled."""
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
     crc._last_fallback_ts = 0.0
 
     with patch.object(crc, "call_agent", side_effect=RuntimeError("agent down")), \
          patch.object(crc, "post_reply") as mock_post, \
          patch("time.time", return_value=200.0):
-        # First call: cooldown not active → fallback sent, _last_fallback_ts = 200.0
-        crc._process_messages([msgs[0]])
+        crc._process_messages([_make_msg(role="user", content="msg1", ts=101.0)])
 
-    assert mock_post.call_count == 1
-
-    with patch.object(crc, "call_agent", side_effect=RuntimeError("agent down")), \
-         patch.object(crc, "post_reply") as mock_post2, \
-         patch("time.time", return_value=210.0):  # only 10s later, within cooldown
-        crc._process_messages([msgs[1]])
-
-    mock_post2.assert_not_called()
+    mock_post.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -435,3 +436,95 @@ def test_agent_session_file_scoped_by_user_id(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_abc", "user_pk": None, "enclave_pk": None})
     p = crc._agent_session_file_for_user()
     assert str(p) == "/tmp/feedling_usr_abc.txt"
+
+
+def test_prepare_hermes_cli_strips_continue_and_injects_resume(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        'hermes chat -Q --continue --max-turns 1 -q "{message}"',
+    )
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("hello")
+
+    assert "--continue" not in cmd
+    assert cmd[:4] == ["hermes", "chat", "--resume", "sess_123"]
+    assert "hello" in cmd
+
+
+def test_prepare_hermes_cli_first_turn_removes_continue(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        'hermes chat -Q --continue --max-turns 1 -q "{message}"',
+    )
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("hello")
+
+    assert "--continue" not in cmd
+    assert "--resume" not in cmd
+
+
+def test_prepare_cli_preserves_message_with_quotes(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command('say "hello" now')
+
+    assert cmd == ["mycli", "ask", 'say "hello" now']
+
+
+def test_cli_nonzero_exit_fails_even_with_stdout(monkeypatch):
+    class _Result:
+        returncode = 2
+        stdout = "stale text that must not be posted"
+        stderr = "bad command"
+
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message: ["mycli", "ask", message])
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
+
+    with pytest.raises(RuntimeError, match="cli agent exited 2"):
+        crc.call_agent_cli("hi")
+
+
+def test_openai_http_protocol_uses_session_headers(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        headers = {"X-Hermes-Session-Id": "sess_new"}
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {
+                "choices": [
+                    {"message": {"content": "real reply"}}
+                ]
+            }
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        return _Resp()
+
+    saved = []
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://127.0.0.1:8642/v1/chat/completions")
+    monkeypatch.setattr(crc, "AGENT_HTTP_PROTOCOL", "openai")
+    monkeypatch.setattr(crc, "AGENT_HTTP_MODEL", "hermes-agent")
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_abc", "user_pk": None, "enclave_pk": None})
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_old")
+    monkeypatch.setattr(crc, "_save_agent_session_id", lambda sid: saved.append(sid))
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    assert crc.call_agent_http("hi") == "real reply"
+    assert captured["json"]["messages"] == [{"role": "user", "content": "hi"}]
+    assert captured["headers"]["X-Hermes-Session-Id"] == "sess_old"
+    assert captured["headers"]["X-Hermes-Session-Key"] == "feedling:usr_abc"
+    assert saved == ["sess_new"]
