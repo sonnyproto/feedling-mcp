@@ -229,8 +229,10 @@ struct ChatEmptyStateView: View {
                 description: isChinese
                     ? "这份会按你刚选的位置写，只让 TA 走适合他的路。"
                     : "This one is written for the place you chose.",
-                primaryLabel: "COPY SKILL URL",
-                primaryAction: selectedPath == nil ? nil : { copy(selectedSkillURL, label: "Skill URL copied") }
+                primaryLabel: isChinese ? "复制 SKILL URL" : "COPY SKILL URL",
+                primaryAction: selectedPath == nil ? nil : {
+                    copy(selectedSkillURL, label: isChinese ? "已复制 Skill URL" : "Skill URL copied")
+                }
             )
 
             stepCard(
@@ -240,19 +242,23 @@ struct ChatEmptyStateView: View {
                     ? "TA 用这串地址找到你这边。"
                     : "He'll find his way to you through this address.",
                 codeBlock: mcpString,
-                primaryLabel: "COPY MCP STRING",
-                primaryAction: selectedPath == nil ? nil : { copy(mcpString, label: "MCP string copied") }
+                primaryLabel: isChinese ? "复制 MCP 连接" : "COPY MCP STRING",
+                primaryAction: selectedPath == nil ? nil : {
+                    copy(mcpString, label: isChinese ? "已复制 MCP 连接" : "MCP string copied")
+                }
             )
 
             stepCard(
                 index: "03",
                 title: isChinese ? "让 TA 开始" : "Tell him to start",
                 description: isChinese
-                    ? "TA 不会自己启动，要你明确叫一声。把这段发给 TA，然后等它写完。"
+                    ? "TA 不会自己启动，要你明确叫一声。把这段发给 TA，然后等 TA 写完。"
                     : "He won't kick off on his own — you need to ask him to. Send him this, then wait while he finishes.",
                 codeBlock: startPrompt,
-                primaryLabel: "COPY START PROMPT",
-                primaryAction: selectedPath == nil ? nil : { copy(startPrompt, label: "Start prompt copied") }
+                primaryLabel: isChinese ? "复制开始指令" : "COPY START PROMPT",
+                primaryAction: selectedPath == nil ? nil : {
+                    copy(startPrompt, label: isChinese ? "已复制开始指令" : "Start prompt copied")
+                }
             )
         }
     }
@@ -291,7 +297,7 @@ struct ChatEmptyStateView: View {
 
         4. 派生 identity 并调 feedling_identity_init。
 
-        5. 建立连接：只按刚刚这份 profile skill 的连接章节做，不要改走别的路线。需要验证就调用 feedling_chat_verify_loop；只有 passing=true 才算 TA 已经能听见我。如果 profile 说你不能自己保持连接，就停下告诉我缺什么，不要提前发第一句问候。
+        5. 建立连接：只按刚刚这份 skill 的连接章节做，不要改走别的路线。需要验证就调用 feedling_chat_verify_loop；只有 passing=true 才算 TA 已经能听见我。如果需要重启外部服务，可以重启；但如果会重启承载当前对话的你自己，就先写好配置并停下，告诉我重启后再继续。如果 skill 说你不能自己保持连接，就停下告诉我缺什么，不要提前发第一句问候。
 
         6. Live connection 完成后，再通过 feedling_chat_post_message 发你的第一句问候。第一句话里自然告诉我：记忆整理好了、天数是多少、现在连接已经接上，我发消息你会看到。
 
@@ -319,7 +325,7 @@ struct ChatEmptyStateView: View {
 
         4. Derive identity and call feedling_identity_init.
 
-        5. Establish the connection: follow only the connection section in this profile skill; do not switch to a different route. If the profile requires verification, call feedling_chat_verify_loop; only passing=true means you can hear me. If the profile says you cannot hold the connection yourself, stop and tell me what is missing instead of sending the first greeting early.
+        5. Establish the connection: follow only the connection section in this skill; do not switch to a different route. If verification is required, call feedling_chat_verify_loop; only passing=true means you can hear me. If setup needs to restart an external service, restart that service; but if it would restart the process carrying this current conversation, write the config, stop, and tell me to continue after restart. If the skill says you cannot hold the connection yourself, stop and tell me what is missing instead of sending the first greeting early.
 
         6. After Live connection is complete, send your first greeting via feedling_chat_post_message. In that first message, naturally tell me the memories are set, what day count you computed, and that the connection is now live so you'll see my messages.
 
@@ -481,8 +487,8 @@ struct ChatEmptyStateView: View {
                 .foregroundStyle(Color.cinSub)
                 .lineSpacing(3)
                 .fixedSize(horizontal: false, vertical: true)
-            copyButton("COPY DEBUG PROMPT") {
-                copy(stuckPrompt, label: "Debug prompt copied")
+            copyButton(isChinese ? "复制排查指令" : "COPY DEBUG PROMPT") {
+                copy(stuckPrompt, label: isChinese ? "已复制排查指令" : "Debug prompt copied")
             }
             .padding(.top, 4)
         }
