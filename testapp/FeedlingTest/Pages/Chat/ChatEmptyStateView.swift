@@ -361,7 +361,7 @@ struct ChatEmptyStateView: View {
 
         4. 派生 identity 并调 feedling_identity_init。
 
-        5. 建立 Live connection：配置独立的 feedling-chat-resident / IO resident consumer service。consumer 用我给你的 FEEDLING_* 配置轮询 FEEDLING_API_URL/v1/chat/poll，把消息交给你自己 runtime 的真实入口，再写回 FEEDLING_API_URL/v1/chat/response。入口由你判断：有真实 resident HTTP endpoint 就用 HTTP；没有就用 CLI。Hermes / OpenClaw CLI 默认用 `hermes chat -Q --max-turns 1 -q "{message}"`，consumer 会保存第一次返回的 session_id，之后自动用 --resume 续接同一个会话。consumer 跑起来后调用 feedling_chat_verify_loop；只有 passing=true 才算 TA 已经能听见我。
+        5. 建立 Live connection：配置独立的 feedling-chat-resident / IO resident consumer service。consumer 用我给你的 FEEDLING_* 配置轮询 FEEDLING_API_URL/v1/chat/poll，把消息交给你自己 runtime 的真实入口，再写回 FEEDLING_API_URL/v1/chat/response。入口由你判断：有真实 resident HTTP endpoint 就用 HTTP；没有就用 CLI。Hermes / OpenClaw CLI 默认用 `hermes chat -Q --max-turns 1 -q "{message}"`，consumer 会保存第一次返回的 session_id，之后自动用 --resume 续接同一个会话。consumer 要作为独立 service 运行：可调用 Hermes/OpenClaw，但不挂在 Hermes gateway 或当前对话 turn 下面。consumer 跑起来后调用 feedling_chat_verify_loop；只有 passing=true 才算 TA 已经能听见我。
 
         6. Live connection 完成后，再通过 feedling_chat_post_message 发你的第一句问候。第一句话里自然告诉我：记忆整理好了、天数是多少、现在连接已经接上，我发消息你会看到。
 
@@ -390,7 +390,7 @@ struct ChatEmptyStateView: View {
 
         4. Derive identity and call feedling_identity_init.
 
-        5. Establish Live connection: configure the independent feedling-chat-resident / IO resident consumer service. The consumer uses my FEEDLING_* config to poll FEEDLING_API_URL/v1/chat/poll, hands each message to the real entry of your own runtime, then writes back to FEEDLING_API_URL/v1/chat/response. You choose the entry: use HTTP if you expose a real resident HTTP endpoint; otherwise use CLI. For Hermes / OpenClaw CLI, default to `hermes chat -Q --max-turns 1 -q "{message}"`; the consumer stores the first returned session_id and automatically resumes that same conversation with --resume. After the consumer is running, call feedling_chat_verify_loop; only passing=true means you can hear me.
+        5. Establish Live connection: configure the independent feedling-chat-resident / IO resident consumer service. The consumer uses my FEEDLING_* config to poll FEEDLING_API_URL/v1/chat/poll, hands each message to the real entry of your own runtime, then writes back to FEEDLING_API_URL/v1/chat/response. You choose the entry: use HTTP if you expose a real resident HTTP endpoint; otherwise use CLI. For Hermes / OpenClaw CLI, default to `hermes chat -Q --max-turns 1 -q "{message}"`; the consumer stores the first returned session_id and automatically resumes that same conversation with --resume. Run the consumer as its own service: it may call Hermes/OpenClaw, but it is not hosted inside Hermes gateway or the current chat turn. After the consumer is running, call feedling_chat_verify_loop; only passing=true means you can hear me.
 
         6. After Live connection is complete, send your first greeting via feedling_chat_post_message. In that first message, naturally tell me the memories are set, what day count you computed, and that the connection is now live so you'll see my messages.
 

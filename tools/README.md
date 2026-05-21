@@ -61,12 +61,49 @@ chmod 600 ~/feedling-chat-resident.env
 # Run in the foreground for testing
 python tools/chat_resident_consumer.py
 
-# Install as a systemd service for production
+# Install as a systemd service for production on a root/server deployment
 sudo cp deploy/feedling-chat-resident.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now feedling-chat-resident
 sudo systemctl status feedling-chat-resident
 ```
+
+For a user-space agent host such as Hermes/OpenClaw on a VPS, install it as
+a user service instead of nesting it under the top-level gateway:
+
+```ini
+# ~/.config/systemd/user/feedling-chat-resident.service
+[Unit]
+Description=Feedling Chat Resident Consumer
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/openclaw/work/feedling-mcp
+EnvironmentFile=/home/openclaw/feedling-chat-resident.env
+ExecStart=/home/openclaw/.hermes/hermes-agent/venv/bin/python /home/openclaw/work/feedling-mcp/tools/chat_resident_consumer.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+```
+
+Then:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now feedling-chat-resident.service
+journalctl --user -u feedling-chat-resident.service -f
+```
+
+The resident consumer may call Hermes/OpenClaw through `AGENT_CLI_CMD` or
+`AGENT_HTTP_URL`, but it should be supervised as its own process. Do not
+make it a child job inside the current Hermes chat turn or the top-level
+Hermes gateway; otherwise the IO chat loop dies or restarts with that host
+process.
 
 ### ⚠️ Decrypt source is mandatory
 

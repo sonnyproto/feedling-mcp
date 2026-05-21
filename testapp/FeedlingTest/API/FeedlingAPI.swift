@@ -783,6 +783,8 @@ final class FeedlingAPI: ObservableObject {
         AGENT_MODE=cli
         AGENT_CLI_CMD=hermes chat -Q --max-turns 1 -q "{message}"
         # The consumer stores the first session_id and resumes with --resume.
+        # Run this as an independent service (systemd --user / launchd / supervisor / pm2),
+        # not as a child job inside Hermes gateway or the current chat turn.
         # If you expose a real resident HTTP endpoint:
         #   AGENT_MODE=http
         #   AGENT_HTTP_PROTOCOL=simple

@@ -464,6 +464,12 @@ the first `session_id` and resumes it with `--resume`; it does not use
 `/v1/chat/completions` mode with Hermes session headers. Agent failures are
 logged by default rather than posted as fake fallback chat bubbles.
 
+On Hermes/OpenClaw hosts, "independent" means process ownership: run
+`feedling-chat-resident` as its own user service (`systemd --user`, launchd,
+supervisor, pm2, etc.). It can still call Hermes/OpenClaw through CLI or HTTP,
+but it should not be a child job of the top-level Hermes gateway or the
+current chat turn.
+
 Self-hosted users: see [`deploy/SELF_HOSTING.md`](deploy/SELF_HOSTING.md)
 for an end-to-end SSH runbook (clone, deps, env, systemd, HTTPS via
 Caddy, DNS, iOS pointing at your URL+key).
