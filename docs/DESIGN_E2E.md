@@ -1518,7 +1518,7 @@ not promise.
 
 - `docs/CHANGELOG.md` — current shipped state + landmark diffs by session.
 - `deploy/SELF_HOSTING.md` — end-to-end self-hosting runbook for users who prefer their own VPS over the TEE.
-- `tools/README.md` — HTTP-mode chat-resident bridge for non-MCP agent backends.
+- `tools/README.md` — independent resident consumer service for machine/server agent backends.
 - io-onboarding `skill.md` (separate public repo) — the agent skill the user pastes into their runtime: <https://github.com/teleport-computer/io-onboarding>.
 - `deploy/BUILD.md` — reproducible build recipe for the enclave container image.
 - **Audit tool: <https://github.com/sxysun/is-this-real-tea>** — the

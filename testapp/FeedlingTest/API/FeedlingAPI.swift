@@ -662,8 +662,8 @@ final class FeedlingAPI: ObservableObject {
 
     /// Server-side synthetic ping for the chat reply pipeline. Server
     /// posts a marker user message, waits up to ~30s for an agent reply,
-    /// returns whether the loop is alive. Direct catcher for the
-    /// "stopgap bridge pretending to be the agent" failure mode.
+    /// returns whether the loop is alive. This catches cases where a
+    /// resident consumer is not actually delivering to the real agent.
     func verifyChatLoop(timeoutSec: Int = 30) async throws -> VerifyLoopResult {
         let body = try JSONSerialization.data(withJSONObject: ["timeout_sec": timeoutSec])
         guard let req = authorizedRequest(path: "/v1/chat/verify_loop", method: "POST", body: body) else {
@@ -744,17 +744,41 @@ final class FeedlingAPI: ObservableObject {
 
     // MARK: - Display strings for Settings
 
-    var mcpConnectionString: String {
+    var mcpServerURL: String {
         // In self-hosted mode the user's server likely isn't on mcp.feedling.app yet;
-        // we still render a copy-paste-able string using their own baseURL's host.
+        // we still render copy-paste-able URLs using their own baseURL's host.
         if storageMode == .selfHosted {
-            let derivedMCP = baseURL
+            return baseURL
                 .replacingOccurrences(of: ":5001", with: ":5002")
                 .replacingOccurrences(of: "api.", with: "mcp.")
-            return "claude mcp add feedling --transport sse \"\(derivedMCP)/sse?key=\(apiKey.isEmpty ? "<YOUR_KEY>" : apiKey)\""
         }
-        let mcp = "https://mcp.feedling.app"
-        return "claude mcp add feedling --transport sse \"\(mcp)/sse?key=\(apiKey.isEmpty ? "<registering…>" : apiKey)\""
+        return "https://mcp.feedling.app"
+    }
+
+    var mcpConnectionString: String {
+        return "claude mcp add feedling --transport sse \"\(mcpServerURL)/sse?key=\(apiKey.isEmpty ? "<registering…>" : apiKey)\""
+    }
+
+    var residentConsumerConfig: String {
+        let key = apiKey.isEmpty ? "<registering…>" : apiKey
+        return """
+        FEEDLING_API_URL=\(baseURL)
+        FEEDLING_API_KEY=\(key)
+        FEEDLING_MCP_URL=\(mcpServerURL)/sse?key=\(key)
+        AGENT_MODE=<http|cli>
+        AGENT_HTTP_URL=<your-agent-http-endpoint>
+        AGENT_CLI_CMD=<your-agent-command-with-{message}>
+        """
+    }
+
+    var connectionDetailsBlock: String {
+        return """
+        Resident consumer config:
+        \(residentConsumerConfig)
+
+        Chat-client MCP command:
+        \(mcpConnectionString)
+        """
     }
 
     var envExportBlock: String {

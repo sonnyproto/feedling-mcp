@@ -87,46 +87,30 @@ struct ChatEmptyStateView: View {
     }
 
     private var mcpString: String { api.mcpConnectionString }
-    private var residentConnectorConfig: String {
-        let key = api.apiKey.isEmpty ? "<registering...>" : api.apiKey
-        let mcpURL: String
-        if api.storageMode == .selfHosted {
-            let derivedMCP = api.baseURL
-                .replacingOccurrences(of: ":5001", with: ":5002")
-                .replacingOccurrences(of: "api.", with: "mcp.")
-            mcpURL = "\(derivedMCP)/sse?key=\(key)"
-        } else {
-            mcpURL = "https://mcp.feedling.app/sse?key=\(key)"
-        }
-        return """
-        FEEDLING_API_URL=\(api.baseURL)
-        FEEDLING_API_KEY=\(key)
-        FEEDLING_MCP_URL=\(mcpURL)
-        """
-    }
-    private var connectionBlock: String {
+    private var residentConsumerConfig: String { api.residentConsumerConfig }
+    private var connectionBlock: String? {
         switch selectedPath {
         case .resident:
-            return residentConnectorConfig
+            return residentConsumerConfig
         case .chatClient:
             return mcpString
         case .unsure:
             return """
-            Resident connector config:
-            \(residentConnectorConfig)
+            Resident consumer config:
+            \(residentConsumerConfig)
 
             Chat-client MCP command:
             \(mcpString)
             """
         case .none:
-            return mcpString
+            return nil
         }
     }
     private var selectedSkillURL: String { selectedPath?.skillURL ?? Self.skillURL }
     private var connectionTitle: String {
         switch selectedPath {
         case .resident:
-            return isChinese ? "把常驻连接配置给 TA" : "Give him resident config"
+            return isChinese ? "把 resident consumer 配置给 TA" : "Give him resident consumer config"
         case .chatClient:
             return isChinese ? "把 MCP 连接告诉 TA" : "Tell him the MCP connection"
         case .unsure:
@@ -139,8 +123,8 @@ struct ChatEmptyStateView: View {
         switch selectedPath {
         case .resident:
             return isChinese
-                ? "这不是 Claude MCP 命令；让 TA 把它写进 Hermes / OpenClaw 的常驻 Feedling channel。"
-                : "This is not a Claude MCP command; he should put it in the resident Hermes / OpenClaw Feedling channel."
+                ? "这不是 Claude MCP 命令；让 TA 用它启动独立的 IO resident consumer service。"
+                : "This is not a Claude MCP command; he should use it to run the independent IO resident consumer service."
         case .chatClient:
             return isChinese
                 ? "TA 用这条 MCP 命令在当前聊天工具里连接。"
@@ -158,7 +142,7 @@ struct ChatEmptyStateView: View {
     private var connectionCopyLabel: String {
         switch selectedPath {
         case .resident:
-            return isChinese ? "复制常驻配置" : "COPY RESIDENT CONFIG"
+            return isChinese ? "复制 CONSUMER 配置" : "COPY CONSUMER CONFIG"
         case .chatClient:
             return isChinese ? "复制 MCP 连接" : "COPY MCP STRING"
         case .unsure:
@@ -319,10 +303,12 @@ struct ChatEmptyStateView: View {
                 title: connectionTitle,
                 description: connectionDescription,
                 codeBlock: connectionBlock,
-                codeLineLimit: selectedPath == .resident ? 4 : (selectedPath == .unsure ? 6 : 2),
+                codeLineLimit: selectedPath == .resident ? 6 : (selectedPath == .unsure ? 10 : 2),
                 primaryLabel: connectionCopyLabel,
                 primaryAction: selectedPath == nil ? nil : {
-                    copy(connectionBlock, label: isChinese ? "已复制连接信息" : "Connection copied")
+                    if let connectionBlock {
+                        copy(connectionBlock, label: isChinese ? "已复制连接信息" : "Connection copied")
+                    }
                 }
             )
 
@@ -332,7 +318,7 @@ struct ChatEmptyStateView: View {
                 description: isChinese
                     ? "TA 不会自己启动，要你明确叫一声。把这段发给 TA，然后等 TA 写完。"
                     : "He won't kick off on his own — you need to ask him to. Send him this, then wait while he finishes.",
-                codeBlock: startPrompt,
+                codeBlock: selectedPath == nil ? nil : startPrompt,
                 primaryLabel: isChinese ? "复制开始指令" : "COPY START PROMPT",
                 primaryAction: selectedPath == nil ? nil : {
                     copy(startPrompt, label: isChinese ? "已复制开始指令" : "Start prompt copied")
@@ -375,7 +361,7 @@ struct ChatEmptyStateView: View {
 
         4. 派生 identity 并调 feedling_identity_init。
 
-        5. 建立连接：只按刚刚这份 skill 的连接章节做，不要改走别的路线。需要验证就调用 feedling_chat_verify_loop；只有 passing=true 才算 TA 已经能听见我。如果需要重启外部服务，可以重启；但如果会重启承载当前对话的你自己，就先写好配置并停下，告诉我重启后再继续。如果 skill 说你不能自己保持连接，就停下告诉我缺什么，不要提前发第一句问候。
+        5. 建立 Live connection：只按刚刚这份 skill 的连接章节做。resident 路径要配置独立的 feedling-chat-resident / IO resident consumer service：consumer 用我给你的 FEEDLING_* 配置轮询 FEEDLING_API_URL/v1/chat/poll，把消息交给你的 HTTP 或 CLI agent 入口，再写回 FEEDLING_API_URL/v1/chat/response。consumer 跑起来后调用 feedling_chat_verify_loop；只有 passing=true 才算 TA 已经能听见我。如果缺 AGENT_MODE / AGENT_HTTP_URL / AGENT_CLI_CMD 这类本机入口信息，就先告诉我缺哪一项，不要提前发第一句问候。
 
         6. Live connection 完成后，再通过 feedling_chat_post_message 发你的第一句问候。第一句话里自然告诉我：记忆整理好了、天数是多少、现在连接已经接上，我发消息你会看到。
 
@@ -403,7 +389,7 @@ struct ChatEmptyStateView: View {
 
         4. Derive identity and call feedling_identity_init.
 
-        5. Establish the connection: follow only the connection section in this skill; do not switch to a different route. If verification is required, call feedling_chat_verify_loop; only passing=true means you can hear me. If setup needs to restart an external service, restart that service; but if it would restart the process carrying this current conversation, write the config, stop, and tell me to continue after restart. If the skill says you cannot hold the connection yourself, stop and tell me what is missing instead of sending the first greeting early.
+        5. Establish Live connection: follow only the connection section in this skill. For the resident path, configure the independent feedling-chat-resident / IO resident consumer service: the consumer uses my FEEDLING_* config to poll FEEDLING_API_URL/v1/chat/poll, hands each message to your HTTP or CLI agent entry, then writes back to FEEDLING_API_URL/v1/chat/response. After the consumer is running, call feedling_chat_verify_loop; only passing=true means you can hear me. If AGENT_MODE / AGENT_HTTP_URL / AGENT_CLI_CMD or another local entry detail is missing, tell me the missing item before sending the first greeting.
 
         6. After Live connection is complete, send your first greeting via feedling_chat_post_message. In that first message, naturally tell me the memories are set, what day count you computed, and that the connection is now live so you'll see my messages.
 
@@ -604,7 +590,7 @@ struct ChatEmptyStateView: View {
     private var stuckPromptZH: String {
         """
         我给了你 IO 的 skill (\(selectedSkillURL)) 和连接信息：
-        \(connectionBlock)
+        \(connectionBlock ?? "")
 
         但 bootstrap 没进展。请按以下顺序自检并告诉我每一步结果：
 
@@ -613,7 +599,7 @@ struct ChatEmptyStateView: View {
            - EARLIEST MESSAGE I CAN FIND FROM THIS USER: <ISO date | NONE>
            - NAME I'VE BEEN CALLED IN PRIOR CHATS: <name | NONE>（不能是 runtime label）
            - APPROXIMATE MEMORABLE MOMENTS I CAN RECALL: <integer | 0>
-        3. 如果你是聊天工具/MCP 路径：你的 MCP 连接里有 feedling_* 工具吗？调一次 feedling_chat_get_history 看响应（401 / 500 / 别的？）。如果你是 resident 路径：常驻 Feedling/IO channel 是否用这份配置启动并持续 poll？
+        3. 如果你是聊天工具/MCP 路径：你的 MCP 连接里有 feedling_* 工具吗？调一次 feedling_chat_get_history 看响应（401 / 500 / 别的？）。如果你是 resident 路径：独立 IO resident consumer service 是否用这份配置运行，并持续轮询 FEEDLING_API_URL/v1/chat/poll？
         4. 你目前卡在哪一步：fetch skill / Step 0 verify / Pass 1 唤醒 / Pass 2 清点 / Pass 3 落卡 / Pass 4 对账 / identity 派生？
         5. 如果有任何错误，把错误原文贴回来。
 
@@ -624,7 +610,7 @@ struct ChatEmptyStateView: View {
     private var stuckPromptEN: String {
         """
         I gave you IO's skill (\(selectedSkillURL)) and these connection details:
-        \(connectionBlock)
+        \(connectionBlock ?? "")
 
         Bootstrap isn't progressing. Run this self-check in order and report each result back:
 
@@ -633,7 +619,7 @@ struct ChatEmptyStateView: View {
            - EARLIEST MESSAGE I CAN FIND FROM THIS USER: <ISO date | NONE>
            - NAME I'VE BEEN CALLED IN PRIOR CHATS: <name | NONE> (must NOT be a runtime label)
            - APPROXIMATE MEMORABLE MOMENTS I CAN RECALL: <integer | 0>
-        3. If you are on the chat-client/MCP path: does your MCP connection expose the feedling_* tools? Call feedling_chat_get_history once and tell me the response (401 / 500 / something else?). If you are on the resident path: is the resident Feedling/IO channel running with this config and continuously polling?
+        3. If you are on the chat-client/MCP path: does your MCP connection expose the feedling_* tools? Call feedling_chat_get_history once and tell me the response (401 / 500 / something else?). If you are on the resident path: is the independent IO resident consumer service running with this config and continuously polling FEEDLING_API_URL/v1/chat/poll?
         4. Where exactly are you stuck: fetch skill / Step 0 verify / Pass 1 theme inventory / Pass 2 candidates / Pass 3 write-through / Pass 4 verification / identity derivation?
         5. If anything errored, paste the error text back to me.
 

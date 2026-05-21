@@ -89,13 +89,13 @@ struct SettingsView: View {
                                 Rectangle().fill(Color.cinAccent1.opacity(0.2)).frame(height: 1)
 
                                 if api.storageMode == .cloud {
-                                    cinCopyRow("MCP String", value: api.mcpConnectionString, label: "COPY ↗") {
-                                        UIPasteboard.general.string = api.mcpConnectionString
-                                        showToast("Copied MCP string")
+                                    cinCopyRow("Connection Details", value: api.connectionDetailsBlock, label: "COPY ↗") {
+                                        UIPasteboard.general.string = api.connectionDetailsBlock
+                                        showToast("Copied connection details")
                                     }
-                                    cinCopyRow("Env Vars", value: api.envExportBlock, label: "COPY ↗") {
+                                    cinCopyRow("API Env Vars", value: api.envExportBlock, label: "COPY ↗") {
                                         UIPasteboard.general.string = api.envExportBlock
-                                        showToast("Copied env vars")
+                                        showToast("Copied API env vars")
                                     }
                                     cinActionRow(
                                         isRegenerating
@@ -109,7 +109,7 @@ struct SettingsView: View {
                                         // your existing chat / identity /
                                         // memory garden unreachable from this
                                         // device and (b) forces you to re-
-                                        // import a new MCP String into every
+                                        // import fresh connection details into every
                                         // agent runtime you've connected.
                                         // Far too consequential for a one-tap
                                         // surface — open a confirmation alert.
@@ -290,8 +290,8 @@ struct SettingsView: View {
                 }
             } message: {
                 Text(isChinese
-                     ? "⚠️ 你会立刻失去对所有现有数据的访问。\n\n之前所有 chat 历史、memory garden 里的记忆、agent 的 identity 卡——技术上还在服务端，但旧 key 一作废，这台手机就再也读不到了，永久无法恢复。\n\n同时，你的 agent runtime（Claude Desktop / Hermes 等）还 pin 着旧 key，所有 tool call 都会 401，必须重新导入新的 MCP String 才能让 agent 继续工作。\n\n如果你只是想清空当前账号重新开始，用「删除账号与重置」更直接（它会真的清掉服务端数据）。\n\n这个操作不可撤销。"
-                     : "⚠️ You will lose access to ALL of your existing data, immediately.\n\nYour chat history, every memory in the garden, and the agent's identity card — technically they stay on the server, but once the old key is invalidated this device can never read them again. There is no recovery path.\n\nYour agent runtime (Claude Desktop / Hermes / etc.) is still pinned to the OLD key. Every tool call will return 401 until you re-import the new MCP String into each runtime.\n\nIf you just want to wipe the current account and start fresh, Delete Account & Reset is more direct (it actually clears the server-side data).\n\nThis cannot be undone.")
+                     ? "⚠️ 你会立刻失去对所有现有数据的访问。\n\n之前所有 chat 历史、memory garden 里的记忆、agent 的 identity 卡——技术上还在服务端，但旧 key 一作废，这台手机就再也读不到了，永久无法恢复。\n\n同时，你的 agent runtime（Claude Desktop / Hermes 等）还 pin 着旧 key，所有 tool call 都会 401，必须重新导入新的连接信息才能让 agent 继续工作。\n\n如果你只是想清空当前账号重新开始，用「删除账号与重置」更直接（它会真的清掉服务端数据）。\n\n这个操作不可撤销。"
+                     : "⚠️ You will lose access to ALL of your existing data, immediately.\n\nYour chat history, every memory in the garden, and the agent's identity card — technically they stay on the server, but once the old key is invalidated this device can never read them again. There is no recovery path.\n\nYour agent runtime (Claude Desktop / Hermes / etc.) is still pinned to the OLD key. Every tool call will return 401 until you re-import the fresh connection details into each runtime.\n\nIf you just want to wipe the current account and start fresh, Delete Account & Reset is more direct (it actually clears the server-side data).\n\nThis cannot be undone.")
             }
             .sheet(isPresented: $showPostWipeReimport) {
                 PostWipeReimportSheet()
@@ -306,7 +306,7 @@ struct SettingsView: View {
         do {
             try await FeedlingAPI.shared.deleteMyDataAndResetLocalState()
             // Server-side delete + local wipe done. Cloud mode auto-registers
-            // a fresh account so `mcpConnectionString` populates before the
+            // a fresh account so connection details populate before the
             // sheet shows. Self-hosted mode is a no-op here — the user has
             // to register a new key on their VPS and paste it back into
             // Settings → Storage. The sheet itself handles both states.
@@ -323,7 +323,7 @@ struct SettingsView: View {
         await FeedlingAPI.shared.regenerateCredentials()
         // Reuse the same post-wipe re-import sheet as Delete Account: both
         // paths leave the user with a fresh API key + a stale agent runtime
-        // pinned to the old one. The sheet surfaces the new MCP String and
+        // pinned to the old one. The sheet surfaces the new connection details and
         // walks them through re-importing it.
         showPostWipeReimport = true
     }

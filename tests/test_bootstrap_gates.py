@@ -435,7 +435,7 @@ def test_identity_verify_after_init(backend):
 
 def test_chat_verify_loop_no_agent_returns_dead(backend):
     """No agent connected → synthetic ping times out → passing=false +
-    suggestions guide operator to install chat-resident-consumer."""
+    suggestions guide operator to run feedling-chat-resident."""
     user_id, api_key = _register(backend["base_url"])
     r = requests.post(
         f"{backend['base_url']}/v1/chat/verify_loop",
@@ -449,7 +449,7 @@ def test_chat_verify_loop_no_agent_returns_dead(backend):
     assert body["passing"] is False
     assert body["response_time_sec"] is None
     assert len(body["suggestions"]) >= 1
-    assert "chat-resident-consumer" in body["suggestions"][0]
+    assert "feedling-chat-resident" in body["suggestions"][0]
 
 
 def test_chat_verify_loop_synthetic_ping_does_not_pollute_history(backend):

@@ -36,7 +36,7 @@ struct ResetAndReimportSheet: View {
                             .padding(.horizontal, 24)
                             .padding(.top, 24)
                             .padding(.bottom, 14)
-                        Text("Download your data, delete your old account, register a new one. Fresh keys — use the MCP string to walk your agent through re-importing.")
+                        Text("Download your data, delete your old account, register a new one. Fresh keys — use the connection details to walk your agent through re-importing.")
                             .font(.notoSerifSC(size: 13))
                             .foregroundStyle(Color.cinSub)
                             .lineSpacing(4)
@@ -131,31 +131,8 @@ struct PostWipeReimportSheet: View {
         Locale.preferredLanguages.first?.hasPrefix("zh") ?? false
 
     private var hasFreshKey: Bool { !api.apiKey.isEmpty }
-    private var residentConnectorConfig: String {
-        let key = api.apiKey.isEmpty ? "<registering...>" : api.apiKey
-        let mcpURL: String
-        if api.storageMode == .selfHosted {
-            let derivedMCP = api.baseURL
-                .replacingOccurrences(of: ":5001", with: ":5002")
-                .replacingOccurrences(of: "api.", with: "mcp.")
-            mcpURL = "\(derivedMCP)/sse?key=\(key)"
-        } else {
-            mcpURL = "https://mcp.feedling.app/sse?key=\(key)"
-        }
-        return """
-        FEEDLING_API_URL=\(api.baseURL)
-        FEEDLING_API_KEY=\(key)
-        FEEDLING_MCP_URL=\(mcpURL)
-        """
-    }
     private var reimportBlock: String {
-        """
-        Resident connector config:
-        \(residentConnectorConfig)
-
-        Chat-client MCP command:
-        \(api.mcpConnectionString)
-        """
+        api.connectionDetailsBlock
     }
 
     var body: some View {
@@ -187,8 +164,8 @@ struct PostWipeReimportSheet: View {
 
                         if hasFreshKey {
                             Text(isChinese
-                                 ? "已经注册了新账号。在你把 agent runtime 切到新 key 之前，Claude.ai / Hermes 等的每个 tool call 都会返回 401 user_not_found。Hermes / OpenClaw resident 用常驻配置；Claude / ChatGPT / Gemini 这类聊天工具才用 MCP 命令。"
-                                 : "A fresh account is registered. Until you re-point your agent at the new key, every tool call from Claude.ai / Hermes / etc. will return 401 user_not_found. Hermes / OpenClaw residents use the resident config; Claude / ChatGPT / Gemini-style chat tools use the MCP command.")
+                                 ? "已经注册了新账号。在你把 agent runtime 切到新 key 之前，Claude.ai / Hermes 等的每个 tool call 都会返回 401 user_not_found。Hermes / OpenClaw / Mac / server 路径用 resident consumer config；Claude / ChatGPT / Gemini 这类聊天工具才用 MCP 命令。"
+                                 : "A fresh account is registered. Until you re-point your agent at the new key, every tool call from Claude.ai / Hermes / etc. will return 401 user_not_found. Hermes / OpenClaw / Mac / server paths use resident consumer config; Claude / ChatGPT / Gemini-style chat tools use the MCP command.")
                                 .font(.notoSerifSC(size: 13))
                                 .foregroundStyle(Color.cinSub)
                                 .lineSpacing(4)

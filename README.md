@@ -14,7 +14,7 @@ Agent 是大脑，Feedling 是身体。
 3. **Production CVM stack** (`deploy/docker-compose.phala.yaml`) — dstack-ingress + Flask + FastMCP + enclave services running inside one Phala TDX CVM
 4. **Enclave app** (`backend/enclave_app.py`) — owns the content private key, serves `/attestation` on its own pinnable TLS port, and runs the decrypt proxy
 5. **iOS app** (`testapp/`) — Chat · Identity · Garden · Settings, plus Live Activity / Dynamic Island, Broadcast Extension for screen capture, and a live **audit card** that re-verifies the enclave on every open
-6. **Skill** — the agent's bootstrap + behavior spec. Lives in a separate public repo so it can be hot-updated without an iOS rebuild: <https://github.com/teleport-computer/io-onboarding>. Covers resident MCP runtimes (Claude Desktop / Code / OpenClaw / Cursor / Hermes-MCP when it stays alive), one-shot MCP CLIs (Hermes CLI / mcporter, paired with `feedling-chat-resident` after bootstrap), and HTTP-mode custom agent backends — Appendix A in the skill maps each MCP tool to its HTTP equivalent.
+6. **Skill** — the agent's bootstrap + behavior spec. Lives in a separate public repo so it can be hot-updated without an iOS rebuild: <https://github.com/teleport-computer/io-onboarding>. Covers resident consumer setup for Hermes / OpenClaw / Mac / server agents, direct MCP chat clients, and HTTP-mode custom agent backends — Appendix A in the skill maps each MCP tool to its HTTP equivalent.
 7. **Contracts** (`contracts/`) — `FeedlingAppAuth` on Ethereum Sepolia, the on-chain allow-list of authorized `compose_hash`es
 8. **Tools** (`tools/`) — `audit_live_cvm.py` CLI that mirrors the iOS audit checks; DCAP verifier; envelope round-trip tests
 
@@ -408,7 +408,7 @@ struct ContentState: Codable, Hashable {
 3. Before any tool call, Agent performs Step 0 context verification from its own runtime memory: earliest message date, name it has been called, and memorable-moment count. If history is missing, it asks the user for context or an explicit fresh start instead of writing defaults.
 4. Agent runs the four memory passes from the public skill: theme inventory, candidate enumeration, write-through with `feedling_memory_add_moment`, then user verification in the external runtime. Memory floors are relationship-age based: <1 month ≥5, 1+ month ≥15, 6+ months ≥30. Agent calls `feedling_memory_verify` before identity.
 5. Agent derives identity from the written memories, then calls `feedling_identity_init` with exactly 7 dimensions and `days_with_user = today - earliest_memory.occurred_at`. The server records `relationship_started_at` from `days_with_user` as a fixed anchor, and Agent calls `feedling_identity_verify`.
-6. Agent runs the public skill's Connection owner selection and establishes Live connection before the user enters Chat. Resident agent/gateway runtimes call `feedling_chat_verify_loop` from the same process that will keep polling; literal one-shot command runtimes stop and tell the operator to configure `feedling-chat-resident` instead of claiming they can poll.
+6. Agent establishes Live connection before the user enters Chat by running the independent `feedling-chat-resident` / IO resident consumer service when a machine/server path is used. The resident consumer polls `/v1/chat/poll`, calls the agent's HTTP or CLI entry, posts `/v1/chat/response`, then `feedling_chat_verify_loop` proves the loop before the first greeting.
 7. After Live connection is verified, Agent calls `feedling_chat_post_message` to greet the user — this is the first visible Feedling chat message. It states the computed day count as a fact and tells the user the connection is live. If the user corrects the day count, Agent calls `feedling_identity_set_relationship_days` to recalibrate the anchor.
 8. Only after chat is alive does Agent mention broadcast/screen sharing. iOS detects identity envelope appeared → auto-switches to Identity tab. `days_with_user` auto-increments daily because the server computes `(now - relationship_started_at) / 86400` on every read.
 
@@ -430,8 +430,8 @@ Writing guidance: narrate from inside the moment, not from outside it. The topic
 
 ### Claude.ai / Claude Desktop (SSE MCP)
 
-Cloud users get a one-liner from the iOS app's **Settings → Agent
-Setup → Copy MCP string**:
+Cloud users get the MCP one-liner from the iOS app's **Settings → Storage →
+Connection Details**:
 
 ```
 claude mcp add feedling --transport sse "https://mcp.feedling.app/sse?key=<api_key>"
@@ -449,9 +449,9 @@ OpenClaw (and other MCP-capable agent runtimes) use the same MCP path
 as Claude Desktop — point them at the `mcp.feedling.app/sse` endpoint
 above and they'll fetch the live skill from io-onboarding automatically.
 
-For **non-MCP** agent backends (a custom Python script, a plain
-Anthropic/OpenAI loop, a local Llama endpoint), install the
-HTTP-mode bridge:
+For Hermes / OpenClaw / Mac / server agents and **non-MCP** agent backends
+(a custom Python script, a plain Anthropic/OpenAI loop, a local Llama endpoint),
+run the independent resident consumer service:
 
 ```bash
 cp deploy/chat_resident.env.example ~/feedling-chat-resident.env
@@ -462,9 +462,9 @@ sudo cp deploy/feedling-chat-resident.service /etc/systemd/system/
 sudo systemctl enable --now feedling-chat-resident
 ```
 
-See `tools/README.md` for the full setup — the agent backend exposes
-either an HTTP `/chat` endpoint or a CLI command; the consumer handles
-v1 envelope wrap + decrypt source + checkpoints.
+See `tools/README.md` for the full setup — the agent exposes either an HTTP
+`/chat` endpoint or a CLI command; the consumer handles polling, decrypt source,
+v1 envelope wrapping, and checkpoints.
 
 Self-hosted users: see [`deploy/SELF_HOSTING.md`](deploy/SELF_HOSTING.md)
 for an end-to-end SSH runbook (clone, deps, env, systemd, HTTPS via

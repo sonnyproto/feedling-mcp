@@ -1505,12 +1505,11 @@ def identity_verify(ctx: Context = None) -> dict:
         "Send a synthetic ping in chat and wait up to 30s for your reply. "
         "Confirms that some reply pipeline posted an agent-role response after "
         "the ping. Call after identity verification and before the first "
-        "visible Feedling greeting if you're a persistent Category A runtime, "
-        "or if a real chat-resident-consumer is intentionally owning the loop. "
-        "If you're a one-shot CLI, passing=true does NOT prove you stay alive "
-        "between turns; it may only prove a resident/bridge/fallback answered. "
-        "DO NOT write a workaround daemon — tell the operator to "
-        "install/configure chat-resident-consumer instead."
+        "visible Feedling greeting after the independent feedling-chat-resident "
+        "/ IO resident consumer service is running. The consumer should poll "
+        "/v1/chat/poll, call AGENT_HTTP_URL or AGENT_CLI_CMD, and post "
+        "/v1/chat/response. passing=true is followed by one ordinary IO Chat "
+        "message acceptance check."
     ),
 )
 def chat_verify_loop(timeout_sec: int = 30, ctx: Context = None) -> dict:
