@@ -184,7 +184,7 @@ struct ChatView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(Array(vm.messages.enumerated()), id: \.element.id) { idx, msg in
+                    ForEach(vm.messages) { msg in
                         Group {
                             if msg.isFromAgent && msg.isProactive {
                                 ProactiveDivider(date: msg.date)
@@ -396,7 +396,6 @@ struct CinMessageBubble: View {
                     .padding(.vertical, 12)
                     .background(Color.cinAccent1Soft)
                     .frame(maxWidth: UIScreen.main.bounds.width * 0.82, alignment: .leading)
-                    .textSelection(.enabled)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -440,7 +439,6 @@ struct CinMessageBubble: View {
                         .padding(.vertical, 12)
                         .background(Color.cinAccent2)
                         .frame(maxWidth: UIScreen.main.bounds.width * 0.78, alignment: .trailing)
-                        .textSelection(.enabled)
                 }
                 Text(message.date, style: .time)
                     .font(.dmMono(size: 8))

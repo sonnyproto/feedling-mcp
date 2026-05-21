@@ -210,15 +210,20 @@ class ChatViewModel: ObservableObject {
         }
         let body: Data?
         do {
-            let env = try ContentEncryption.envelope(
-                plaintext: Data(text.utf8),
-                ownerUserID: api.userId,
-                userContentPK: userPK,
-                enclaveContentPK: enclavePK,
-                visibility: .shared
-            )
-            body = try JSONSerialization.data(withJSONObject: env.jsonBody())
-            log("[chat] sending v1 envelope id=\(env.id)")
+            let ownerUserID = api.userId
+            let result = try await Task.detached(priority: .userInitiated) {
+                let env = try ContentEncryption.envelope(
+                    plaintext: Data(text.utf8),
+                    ownerUserID: ownerUserID,
+                    userContentPK: userPK,
+                    enclaveContentPK: enclavePK,
+                    visibility: .shared
+                )
+                let data = try JSONSerialization.data(withJSONObject: env.jsonBody())
+                return (data, env.id)
+            }.value
+            body = result.0
+            log("[chat] sending v1 envelope id=\(result.1)")
         } catch {
             log("[chat] envelope build failed: \(error)")
             isSending = false
@@ -281,20 +286,25 @@ class ChatViewModel: ObservableObject {
 
         let body: Data?
         do {
-            let env = try ContentEncryption.envelope(
-                plaintext: jpegData,
-                ownerUserID: api.userId,
-                userContentPK: userPK,
-                enclaveContentPK: enclavePK,
-                visibility: .shared
-            )
-            // jsonBody() already returns {"envelope": {...}}; we add the
-            // content_type tag at the same outer level (plaintext metadata,
-            // server uses it to mark the row as image vs text).
-            var outer = env.jsonBody()
-            outer["content_type"] = "image"
-            body = try JSONSerialization.data(withJSONObject: outer)
-            log("[chat] sending v1 image envelope id=\(env.id) bytes=\(jpegData.count)")
+            let ownerUserID = api.userId
+            let result = try await Task.detached(priority: .userInitiated) {
+                let env = try ContentEncryption.envelope(
+                    plaintext: jpegData,
+                    ownerUserID: ownerUserID,
+                    userContentPK: userPK,
+                    enclaveContentPK: enclavePK,
+                    visibility: .shared
+                )
+                // jsonBody() already returns {"envelope": {...}}; we add the
+                // content_type tag at the same outer level (plaintext metadata,
+                // server uses it to mark the row as image vs text).
+                var outer = env.jsonBody()
+                outer["content_type"] = "image"
+                let data = try JSONSerialization.data(withJSONObject: outer)
+                return (data, env.id)
+            }.value
+            body = result.0
+            log("[chat] sending v1 image envelope id=\(result.1) bytes=\(jpegData.count)")
         } catch {
             log("[chat] image envelope build failed: \(error)")
             return

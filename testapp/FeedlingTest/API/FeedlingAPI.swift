@@ -66,6 +66,12 @@ final class FeedlingAPI: ObservableObject {
         if let stored = ApiKeyStore.shared.load(), !stored.isEmpty {
             return stored
         }
+        if let legacy = UserDefaults.standard.string(forKey: Keys.apiKey), !legacy.isEmpty {
+            return legacy
+        }
+        if let shared = UserDefaults(suiteName: Self.appGroup)?.string(forKey: Keys.apiKey), !shared.isEmpty {
+            return shared
+        }
         return UserDefaults.standard.string(forKey: Keys.apiKey) ?? ""
     }
 
@@ -77,6 +83,7 @@ final class FeedlingAPI: ObservableObject {
 
     private init() {
         let defaults = UserDefaults.standard
+        let resolvedStorageMode = StorageMode(rawValue: defaults.string(forKey: Keys.storageMode) ?? "") ?? .cloud
         self.baseURL = ProcessInfo.processInfo.environment["FEEDLING_API_URL"]
             ?? defaults.string(forKey: Keys.baseURL)
             ?? Self.defaultCloudURL
@@ -103,12 +110,19 @@ final class FeedlingAPI: ObservableObject {
             // One-time migration: pull existing UserDefaults key into Keychain.
             self.apiKey = legacy
             ApiKeyStore.shared.save(legacy)
+        } else if let shared = UserDefaults(suiteName: Self.appGroup)?.string(forKey: Keys.apiKey), !shared.isEmpty {
+            // Last-resort recovery: the app-group mirror is written for the
+            // broadcast extension. If standard defaults were unavailable or
+            // wiped but the app-group copy survived, treat it as the same
+            // account and restore it instead of silently minting a new one.
+            self.apiKey = shared
+            ApiKeyStore.shared.save(shared)
         } else {
             self.apiKey = ""
         }
 
         self.userId = defaults.string(forKey: Keys.userId) ?? ""
-        self.storageMode = StorageMode(rawValue: defaults.string(forKey: Keys.storageMode) ?? "") ?? .cloud
+        self.storageMode = resolvedStorageMode
         // Only mirror to UserDefaults / app group if we actually resolved an
         // apiKey. If apiKey is empty here it means Keychain returned nil
         // (transient miss after restart) AND the UserDefaults legacy fall-
@@ -119,6 +133,10 @@ final class FeedlingAPI: ObservableObject {
         // recovered) will pick up the entry and persist normally.
         if !apiKey.isEmpty {
             defaults.set(apiKey, forKey: Keys.apiKey)
+            if storageMode == .cloud {
+                defaults.set(true, forKey: Keys.hasRegistered)
+                defaults.set(false, forKey: Keys.registrationFailed)
+            }
             syncToAppGroup()
         }
     }
@@ -238,6 +256,15 @@ final class FeedlingAPI: ObservableObject {
         guard storageMode == .cloud else { return }
         guard apiKey.isEmpty else { return }
 
+        // Second-chance recovery. The singleton may have initialized while
+        // Keychain was temporarily unavailable during device reboot. Before
+        // registering a new account, re-check every persisted mirror that can
+        // point at the existing account. This prevents phone restart from
+        // rotating the API key and breaking the user's already-linked agent.
+        if recoverExistingCredentialsIfPossible() {
+            return
+        }
+
         // Belt-and-suspenders against the 2026-05-10 orphan-account bug. If
         // hasRegistered is already true but apiKey resolved to empty, this
         // is NOT a fresh-install state — Keychain transiently failed to
@@ -249,6 +276,11 @@ final class FeedlingAPI: ObservableObject {
         // will pick up the entry and proceed normally.
         if UserDefaults.standard.bool(forKey: Keys.hasRegistered) {
             log("[register] BLOCKED: hasRegistered=true but apiKey empty — refusing to re-register and orphan existing account")
+            UserDefaults.standard.set(true, forKey: Keys.registrationFailed)
+            return
+        }
+        if hasExistingAccountMarkers() {
+            log("[register] BLOCKED: existing account markers present but apiKey empty — refusing silent re-register")
             UserDefaults.standard.set(true, forKey: Keys.registrationFailed)
             return
         }
@@ -269,6 +301,52 @@ final class FeedlingAPI: ObservableObject {
         registrationTask = task
         await task.value
         registrationTask = nil
+    }
+
+    private func recoverExistingCredentialsIfPossible() -> Bool {
+        let defaults = UserDefaults.standard
+        let shared = UserDefaults(suiteName: Self.appGroup)
+
+        let candidates = [
+            ApiKeyStore.shared.load(),
+            defaults.string(forKey: Keys.apiKey),
+            shared?.string(forKey: Keys.apiKey),
+            defaults.string(forKey: Keys.cloudApiKey),
+        ]
+
+        guard let recovered = candidates.compactMap({ $0?.trimmingCharacters(in: .whitespacesAndNewlines) })
+            .first(where: { !$0.isEmpty }) else {
+            return false
+        }
+
+        self.apiKey = recovered
+        if self.userId.isEmpty {
+            self.userId = defaults.string(forKey: Keys.userId)
+                ?? shared?.string(forKey: Keys.userId)
+                ?? defaults.string(forKey: Keys.cloudUserId)
+                ?? ""
+        }
+        defaults.set(true, forKey: Keys.hasRegistered)
+        defaults.set(false, forKey: Keys.registrationFailed)
+        persist()
+        log("[register] recovered existing apiKey from persisted storage; skipped re-register")
+        return true
+    }
+
+    private func hasExistingAccountMarkers() -> Bool {
+        let defaults = UserDefaults.standard
+        let shared = UserDefaults(suiteName: Self.appGroup)
+        let markers = [
+            defaults.string(forKey: Keys.userId),
+            shared?.string(forKey: Keys.userId),
+            defaults.string(forKey: Keys.cloudUserId),
+            shared?.string(forKey: Keys.apiKey),
+            defaults.string(forKey: Keys.cloudApiKey),
+        ]
+        return markers.contains { value in
+            guard let value else { return false }
+            return !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
     }
 
     // Suspends until NWPathMonitor reports a satisfied (reachable) path.
