@@ -536,7 +536,7 @@ def test_prepare_hermes_cli_strips_continue_and_injects_resume(monkeypatch):
     monkeypatch.setattr(
         crc,
         "AGENT_CLI_CMD",
-        'hermes chat -Q --continue --source tool --max-turns 4 -q "{message}"',
+        'hermes chat -Q --continue --source tool --max-turns 60 -q "{message}"',
     )
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
@@ -552,7 +552,7 @@ def test_prepare_hermes_cli_first_turn_removes_continue(monkeypatch):
     monkeypatch.setattr(
         crc,
         "AGENT_CLI_CMD",
-        'hermes chat -Q --continue --source tool --max-turns 4 -q "{message}"',
+        'hermes chat -Q --continue --source tool --max-turns 60 -q "{message}"',
     )
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
@@ -561,6 +561,39 @@ def test_prepare_hermes_cli_first_turn_removes_continue(monkeypatch):
 
     assert "--continue" not in cmd
     assert "--resume" not in cmd
+
+
+def test_warn_if_hermes_cli_may_drift_logs_profile_and_turns(monkeypatch, caplog):
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        'hermes chat -Q --max-turns 1 -q "You are Dora. User message: {message}"',
+    )
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    crc._warn_if_agent_entry_may_drift()
+
+    text = caplog.text
+    assert "wrap {message}" in text
+    assert "without HERMES_HOME" in text
+    assert "--max-turns 1" in text
+
+
+def test_warn_if_hermes_cli_good_profile_is_quiet(monkeypatch, caplog):
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        'hermes chat -Q --source tool --max-turns 60 -q "{message}"',
+    )
+    monkeypatch.setenv("HERMES_HOME", "/home/openclaw/.hermes/profiles/daily")
+
+    crc._warn_if_agent_entry_may_drift()
+
+    assert "wrap {message}" not in caplog.text
+    assert "without HERMES_HOME" not in caplog.text
+    assert "Very small turn" not in caplog.text
 
 
 def test_prepare_cli_preserves_message_with_quotes(monkeypatch):

@@ -475,10 +475,12 @@ sudo cp deploy/feedling-chat-resident.service /etc/systemd/system/
 sudo systemctl enable --now feedling-chat-resident
 ```
 
-See `tools/README.md` for the full setup. For Hermes CLI, use
-`hermes chat -Q --source tool --max-turns 4 -q "{message}"`; the consumer
+See `tools/README.md` for the full setup. For Hermes/OpenClaw CLI, set
+`HERMES_HOME` to the same profile the real resident agent uses, then call the
+agent directly with
+`hermes chat -Q --source tool --max-turns 60 -q "{message}"`; the consumer
 stores the first `session_id` and resumes it with `--resume`; it does not use
-`--continue`. For Hermes' API server, use the OpenAI-compatible
+`--continue` or a wrapper persona prompt. For Hermes' API server, use the OpenAI-compatible
 `/v1/chat/completions` mode with Hermes session headers. Agent failures are
 logged by default rather than posted as fake fallback chat bubbles.
 Image messages are decrypted by the consumer too: OpenAI-compatible HTTP gets

@@ -34,7 +34,7 @@ CLI mode:
                         Image messages can also use {image_path} or
                         {image_paths}; otherwise the path is appended to
                         the message text.
-                        Example (Hermes): hermes chat -Q --source tool --max-turns 4 -q "{message}"
+                        Example (Hermes): hermes chat -Q --source tool --max-turns 60 -q "{message}"
                         Example (plain):  mycli ask {message}
                         For Hermes, the consumer stores session_id and
                         auto-injects --resume on later turns.
@@ -927,6 +927,75 @@ def _is_hermes_chat_cmd(cmd: list[str]) -> bool:
     return len(cmd) >= 2 and Path(cmd[0]).name == "hermes" and cmd[1] == "chat"
 
 
+def _cli_flag_value(cmd: list[str], flag: str) -> str:
+    try:
+        idx = cmd.index(flag)
+    except ValueError:
+        return ""
+    if idx + 1 >= len(cmd):
+        return ""
+    return cmd[idx + 1]
+
+
+def _warn_if_agent_entry_may_drift() -> None:
+    """Log non-fatal warnings for common context/persona drift configs.
+
+    The resident consumer should call the user's real runtime entry. It should
+    not invent a mini persona prompt or a shallow throwaway session just for IO.
+    We keep this as diagnostics instead of hard failure because non-Hermes
+    runtimes legitimately vary, but the warnings make bad configs visible in
+    systemd logs before users experience a strange persona shift.
+    """
+    if AGENT_MODE != "cli" or not AGENT_CLI_CMD:
+        return
+
+    lower_template = AGENT_CLI_CMD.lower()
+    if re.search(r"\b(you are|user message|reply naturally|same style|persona)\b", lower_template):
+        log.warning(
+            "AGENT_CLI_CMD appears to wrap {message} in an identity/persona "
+            "prompt. For continuity, call the real agent entry directly and "
+            "let the runtime's own profile/memory shape the reply."
+        )
+
+    try:
+        cmd = shlex.split(AGENT_CLI_CMD.replace("{message}", "__MSG__"))
+    except ValueError as e:
+        log.warning("AGENT_CLI_CMD could not be parsed for drift checks: %s", e)
+        return
+
+    if not _is_hermes_chat_cmd(cmd):
+        return
+
+    if not os.environ.get("HERMES_HOME"):
+        log.warning(
+            "Hermes/OpenClaw CLI is configured without HERMES_HOME. systemd may "
+            "use a different profile than the user's resident agent. Set "
+            "HERMES_HOME to the real profile, for example "
+            "/home/openclaw/.hermes/profiles/daily."
+        )
+
+    if "--source" not in cmd:
+        log.warning(
+            "Hermes/OpenClaw CLI has no --source flag. Use --source tool so IO "
+            "messages enter the normal tool-origin conversation path."
+        )
+
+    turns_raw = _cli_flag_value(cmd, "--max-turns")
+    if turns_raw:
+        try:
+            turns = int(turns_raw)
+            if turns < 20:
+                log.warning(
+                    "Hermes/OpenClaw CLI uses --max-turns %d. Very small turn "
+                    "limits often produce short/template replies. Prefer "
+                    "--max-turns 60 for IO chat unless your runtime has a "
+                    "stronger native session endpoint.",
+                    turns,
+                )
+        except ValueError:
+            pass
+
+
 def _strip_hermes_continue(cmd: list[str]) -> tuple[list[str], bool]:
     """Remove Hermes --continue/-c from resident-owned commands.
 
@@ -1414,6 +1483,8 @@ def run() -> None:
             "Check FEEDLING_API_URL and FEEDLING_API_KEY, then restart."
         )
         sys.exit(1)
+
+    _warn_if_agent_entry_may_drift()
 
     if FEEDLING_ENCLAVE_URL or FEEDLING_MCP_URL:
         if not _verify_decrypt_sources():

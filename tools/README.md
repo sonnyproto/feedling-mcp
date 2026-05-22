@@ -185,13 +185,18 @@ the safest path is configuring your CLI to be silent.
 
 ```
 AGENT_CLI_PATH=/home/openclaw/.local/bin:/home/openclaw/.hermes/hermes-agent/venv/bin
-AGENT_CLI_CMD=hermes chat -Q --source tool --max-turns 4 -q "{message}"
+HERMES_HOME=/home/openclaw/.hermes/profiles/daily
+AGENT_CLI_CMD=hermes chat -Q --source tool --max-turns 60 -q "{message}"
 ```
 
 Do not put `--continue` in `AGENT_CLI_CMD`. On the first turn, Hermes creates
 a session and prints `session_id`; the consumer stores it. On later turns the
 consumer injects `--resume <session_id>` so Feedling is bound to the same
 conversation instead of whichever local Hermes session happens to be latest.
+Set `HERMES_HOME` to the same profile used by the user's real resident agent
+entry. Do not wrap `{message}` in a special persona prompt such as "You are
+Dora..." or "reply naturally"; the resident should call the same agent profile
+the user already trusts, with IO as only a new transport.
 
 Before installing the daemon, run the exact Hermes command in a terminal with
 a normal user message, a direct identity question, and one tool-using question.
@@ -200,8 +205,8 @@ returns a shell like "我看到了：<message>。你要我继续展开哪一块?
 unavailable for a normal tool-using request, prints internal reasoning, or
 returns another template, the resident is correctly forwarding messages but the
 configured CLI command is not reaching a production-quality agent session. Fix
-`AGENT_CLI_CMD`, toolset access, max-turns, or session selection before running
-it as a service.
+`HERMES_HOME`, `AGENT_CLI_CMD`, toolset access, max-turns, or session selection
+before running it as a service.
 
 ### Failure behavior
 
