@@ -664,14 +664,54 @@ _REASONING_LINE_RE = re.compile(
 )
 
 
+def _strip_reasoning_sections(raw: str) -> str:
+    """Remove explicit reasoning/code sections while preserving final answer.
+
+    Hermes/OpenClaw UIs often print a visible block like:
+
+      💭 Reasoning:
+      ```copy
+      **Doing work**
+      I need to ...
+      ```
+
+    The older consumer avoided this by keeping only the last CJK paragraph,
+    which also destroyed normal multi-paragraph answers. This keeps the full
+    answer and removes only the declared reasoning block.
+    """
+    lines = raw.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.search(r"(^|\b|💭)\s*Reasoning\s*:", line, re.IGNORECASE):
+            i += 1
+            # Skip optional language/copy marker before a fenced block.
+            while i < len(lines) and lines[i].strip().lower() in {"copy", ""}:
+                i += 1
+            if i < len(lines) and lines[i].strip().startswith("```"):
+                i += 1
+                while i < len(lines) and not lines[i].strip().startswith("```"):
+                    i += 1
+                if i < len(lines):
+                    i += 1
+                continue
+            # Unfenced reasoning: skip until a blank line, then resume.
+            while i < len(lines) and lines[i].strip():
+                i += 1
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out)
+
+
 def _extract_text_from_cli_output(raw: str) -> str:
     """Best-effort extraction from raw CLI stdout.
 
     1. Try JSON parse first (hermes --output-mode json gives a clean field).
-    2. Split into blank-line-separated paragraphs after stripping noise lines.
-    3. Return the last paragraph that contains CJK characters — reasoning
-       blocks are typically English and precede the Chinese reply.
-    4. Fall back to the last non-empty paragraph if no CJK found.
+    2. Remove explicit reasoning/code sections.
+    3. Strip known headers/footers.
+    4. Return the full remaining answer, preserving multi-paragraph replies.
     """
     raw = raw.strip()
     if not raw:
@@ -686,29 +726,12 @@ def _extract_text_from_cli_output(raw: str) -> str:
     except (json.JSONDecodeError, TypeError):
         pass
 
-    # Strip noise lines, then split into paragraphs
-    clean = [ln for ln in raw.splitlines() if not _NOISE_LINE_RE.match(ln)]
-    paragraphs: list[str] = []
-    current: list[str] = []
-    for ln in clean:
-        if ln.strip():
-            current.append(ln)
-        else:
-            if current:
-                paragraphs.append("\n".join(current).strip())
-                current = []
-    if current:
-        paragraphs.append("\n".join(current).strip())
+    raw = _strip_reasoning_sections(raw)
+    clean = [ln.rstrip() for ln in raw.splitlines() if not _NOISE_LINE_RE.match(ln)]
+    text = "\n".join(clean).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
 
-    if not paragraphs:
-        return ""
-
-    # Prefer the last paragraph that contains CJK characters
-    for para in reversed(paragraphs):
-        if any("一" <= c <= "鿿" for c in para):
-            return para
-
-    return paragraphs[-1]
+    return text
 
 
 def _agent_http_headers() -> dict[str, str]:
@@ -1033,14 +1056,6 @@ def _sanitize_reply_text(text: str) -> str:
 
     if not kept:
         return ""
-
-    # If there are Chinese lines, prefer Chinese-only output to avoid leaking
-    # English internal reasoning blocks from upstream agent UIs.
-    has_cjk = any(any("一" <= c <= "鿿" for c in ln) for ln in kept)
-    if has_cjk:
-        kept = [ln for ln in kept if any("一" <= c <= "鿿" for c in ln)]
-        if not kept:
-            return ""
 
     # Dedup consecutive identical lines.
     deduped: list[str] = []

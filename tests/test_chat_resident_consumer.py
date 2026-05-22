@@ -464,6 +464,34 @@ Tell me what you want to work on next."""
     assert cleaned == "Hello Seven — I see your message now.\nTell me what you want to work on next."
 
 
+def test_extract_cli_output_preserves_full_answer_after_reasoning_block():
+    raw = """💭 Reasoning:
+```copy
+**Executing updates**
+I need to locate the repo root and think through the answer.
+It's important to keep this concise.
+```
+
+我看到了。
+
+这张图里有一张搜索结果卡片，下面还有一条学术资料链接。
+Project founder
+Research profile
+
+如果你愿意，我可以继续帮你拆图里的关键信息。
+
+session_id: sess_123
+"""
+    extracted = crc._extract_text_from_cli_output(raw)
+    cleaned = crc._sanitize_reply_text(extracted)
+
+    assert "Reasoning" not in cleaned
+    assert "I need to" not in cleaned
+    assert "Project founder" in cleaned
+    assert "Research profile" in cleaned
+    assert "如果你愿意" in cleaned
+
+
 def test_normalize_agent_replies_supports_messages_array_json():
     raw = '{"messages":["在。","我在听。","继续说。"]}'
     out = crc._normalize_agent_replies(raw)
