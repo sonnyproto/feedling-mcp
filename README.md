@@ -467,6 +467,8 @@ For Hermes / OpenClaw / Mac / server agents and **non-MCP** agent backends
 run the independent resident consumer service:
 
 ```bash
+# Use the latest official consumer code. If this checkout already exists,
+# update it with: git fetch origin main && git pull --ff-only origin main
 cp deploy/chat_resident.env.example ~/feedling-chat-resident.env
 chmod 600 ~/feedling-chat-resident.env
 # Edit ~/feedling-chat-resident.env — set FEEDLING_API_URL, FEEDLING_API_KEY,
@@ -492,7 +494,9 @@ On Hermes/OpenClaw hosts, "independent" means process ownership: run
 `feedling-chat-resident` as its own user service (`systemd --user`, launchd,
 supervisor, pm2, etc.). It can still call Hermes/OpenClaw through CLI or HTTP,
 but it should not be a child job of the top-level Hermes gateway or the
-current chat turn.
+current chat turn. The service's `WorkingDirectory` / `ExecStart` must point at
+the updated `feedling-mcp` checkout; a stale checkout can keep replying with old
+consumer behavior even after the iOS app and public onboarding skill are current.
 
 Self-hosted users: see [`deploy/SELF_HOSTING.md`](deploy/SELF_HOSTING.md)
 for an end-to-end SSH runbook (clone, deps, env, systemd, HTTPS via

@@ -55,6 +55,9 @@ or in `{image_path}` / `{image_paths}` template slots.
 ### Quick start
 
 ```bash
+# Use the latest official checkout before installing the service:
+# git fetch origin main && git pull --ff-only origin main
+
 cp deploy/chat_resident.env.example ~/feedling-chat-resident.env
 chmod 600 ~/feedling-chat-resident.env
 # Edit ~/feedling-chat-resident.env — fill FEEDLING_API_URL, FEEDLING_API_KEY,
@@ -100,6 +103,21 @@ systemctl --user daemon-reload
 systemctl --user enable --now feedling-chat-resident.service
 journalctl --user -u feedling-chat-resident.service -f
 ```
+
+Before Step 6 / the first IO greeting, verify that the service is running the
+same checkout you just updated:
+
+```bash
+cd /home/openclaw/work/feedling-mcp
+git fetch origin main
+git rev-parse --short HEAD
+git rev-parse --short origin/main
+systemctl --user cat feedling-chat-resident.service
+```
+
+`HEAD` and `origin/main` should match, and the service `WorkingDirectory` /
+`ExecStart` should point at that checkout. If not, update the checkout or point
+the service at a fresh clone, then restart only `feedling-chat-resident`.
 
 The resident consumer may call Hermes/OpenClaw through `AGENT_CLI_CMD` or
 `AGENT_HTTP_URL`, but it should be supervised as its own process. Do not
