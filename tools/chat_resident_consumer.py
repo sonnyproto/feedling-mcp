@@ -663,6 +663,45 @@ _REASONING_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_CJK_RE = re.compile(r"[\u3400-\u9fff]")
+
+_LEADING_META_PREAMBLE_RE = re.compile(
+    r"\b("
+    r"(no\s+)?specific\s+tool\s+is\s+required"
+    r"|factual\s+question"
+    r"|rely\s+on\s+my\s+(memory|general\s+knowledge)"
+    r"|general\s+knowledge\s+up\s+to"
+    r"|i\s+remember\b"
+    r"|i'?m\s+uncertain\b"
+    r"|i'?ll\s+craft\b"
+    r"|i\s+will\s+craft\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _strip_leading_meta_preamble(lines: list[str]) -> list[str]:
+    """Drop leaked English planning before a CJK final answer.
+
+    Hermes can sometimes emit an unlabelled preamble such as
+    "specific tool is required..." before the actual Chinese reply. Treat that
+    as internal setup only when it appears at the very start and a CJK answer
+    follows; plain English replies remain untouched.
+    """
+    if not lines or not any(_CJK_RE.search(ln) for ln in lines):
+        return lines
+
+    first = next((i for i, ln in enumerate(lines) if ln.strip()), None)
+    if first is None:
+        return lines
+    if not _LEADING_META_PREAMBLE_RE.search(lines[first]):
+        return lines
+
+    first_cjk = next((i for i, ln in enumerate(lines[first:], start=first) if _CJK_RE.search(ln)), None)
+    if first_cjk is None:
+        return lines
+    return lines[first_cjk:]
+
 
 def _strip_reasoning_sections(raw: str) -> str:
     """Remove explicit reasoning/code sections while preserving final answer.
@@ -1123,6 +1162,10 @@ def _sanitize_reply_text(text: str) -> str:
             continue
         kept.append(ln)
 
+    if not kept:
+        return ""
+
+    kept = _strip_leading_meta_preamble(kept)
     if not kept:
         return ""
 

@@ -464,6 +464,22 @@ Tell me what you want to work on next."""
     assert cleaned == "Hello Seven — I see your message now.\nTell me what you want to work on next."
 
 
+def test_sanitize_reply_text_drops_unlabeled_english_meta_before_cjk_answer():
+    raw = """specific tool is required for this factual question, so I can rely on my memory
+or general knowledge up to 2024. I remember Philip Daian as an Ethereum researcher
+who analyzed the DAO exploit. I'll craft a concise answer.
+Philip Daian 主要是把「区块链里看不见的交易操控」这件事讲明白、定义清楚，并推动行业修它。
+最核心的几件事：
+1) 把 MEV 这件事系统化
+2) 揭示 DEX 和链上交易排序的结构性风险
+"""
+    cleaned = crc._sanitize_reply_text(raw)
+    assert "specific tool is required" not in cleaned
+    assert "general knowledge up to 2024" not in cleaned
+    assert cleaned.startswith("Philip Daian 主要是")
+    assert "把 MEV 这件事系统化" in cleaned
+
+
 def test_extract_cli_output_preserves_full_answer_after_reasoning_block():
     raw = """💭 Reasoning:
 ```copy
