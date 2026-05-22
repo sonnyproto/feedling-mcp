@@ -254,6 +254,8 @@ final class FeedlingAPI: ObservableObject {
         _ = ContentKeyStore.shared.wipeKeypair()
         _ = KeyStore.shared.wipeKeypair()
         _ = ApiKeyStore.shared.wipe()
+        userContentPublicKey = nil
+        publishContentKeysToAppGroup()
 
         // Tell the view models to drop their in-memory caches. Without this,
         // chat/identity/garden views keep stale data on screen until their
@@ -394,7 +396,7 @@ final class FeedlingAPI: ObservableObject {
             // Chat/Memory/Identity envelopes are wrapped to ContentKeyStore's keypair;
             // if registration uploads a different key, incoming assistant messages
             // become undecryptable (`[encrypted — decrypt failed]`).
-            let contentSK = try ContentKeyStore.shared.ensureContentKeypair()
+            let contentSK = try syncContentKeypairFromStore()
             let pubB64 = contentSK.publicKey.rawRepresentation.base64EncodedString()
             let body: [String: Any] = ["public_key": pubB64]
             let data = try JSONSerialization.data(withJSONObject: body)
@@ -450,8 +452,9 @@ final class FeedlingAPI: ObservableObject {
             // Self-heal key drift: if the server's registered public_key differs
             // from this device's content-encryption public key, patch it so
             // incoming assistant messages are decryptable.
-            let localContentPK = try ContentKeyStore.shared.ensureContentKeypair().publicKey.rawRepresentation.base64EncodedString()
-            if let remotePK = w.public_key, !remotePK.isEmpty, remotePK != localContentPK {
+            let localContentPK = try syncContentKeypairFromStore().publicKey.rawRepresentation.base64EncodedString()
+            let remotePK = (w.public_key ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if remotePK != localContentPK {
                 log("[whoami] public_key mismatch detected; syncing content key")
                 let body = try JSONSerialization.data(withJSONObject: ["public_key": localContentPK])
                 if let syncReq = authorizedRequest(path: "/v1/users/public-key", method: "POST", body: body) {
@@ -839,17 +842,26 @@ final class FeedlingAPI: ObservableObject {
     /// Load (or lazily generate) the user's long-lived content keypair.
     /// Backed by Keychain entries distinct from the identity keypair.
     func ensureContentKeypair() {
-        if userContentPublicKey != nil {
-            publishContentKeysToAppGroup()
-            return
-        }
         do {
-            let sk = try ContentKeyStore.shared.ensureContentKeypair()
-            userContentPublicKey = sk.publicKey
-            publishContentKeysToAppGroup()
+            _ = try syncContentKeypairFromStore()
         } catch {
             log("[content-keypair] failed to load/generate: \(error)")
         }
+    }
+
+    /// Keep the in-memory public key aligned with the Keychain private key.
+    /// Reset/regenerate can replace the Keychain entry while the FeedlingAPI
+    /// singleton stays alive; using a stale in-memory public key makes newly
+    /// sent chat envelopes undecryptable after history reload.
+    @discardableResult
+    private func syncContentKeypairFromStore() throws -> Curve25519.KeyAgreement.PrivateKey {
+        let sk = try ContentKeyStore.shared.ensureContentKeypair()
+        let pk = sk.publicKey
+        if userContentPublicKey?.rawRepresentation != pk.rawRepresentation {
+            userContentPublicKey = pk
+        }
+        publishContentKeysToAppGroup()
+        return sk
     }
 
     /// Publish the content pubkeys + user_id to the shared App Group
@@ -863,10 +875,14 @@ final class FeedlingAPI: ObservableObject {
         if let pk = userContentPublicKey {
             shared.set(pk.rawRepresentation.base64EncodedString(),
                        forKey: "feedling.userContentPublicKey")
+        } else {
+            shared.removeObject(forKey: "feedling.userContentPublicKey")
         }
         if let pk = enclaveContentPublicKey {
             shared.set(pk.rawRepresentation.base64EncodedString(),
                        forKey: "feedling.enclaveContentPublicKey")
+        } else {
+            shared.removeObject(forKey: "feedling.enclaveContentPublicKey")
         }
     }
 

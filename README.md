@@ -155,7 +155,7 @@ commit is baked into the image and surfaced in
 
 ---
 
-## Status (as of 2026-05-14)
+## Status (as of 2026-05-21)
 
 See `docs/CHANGELOG.md` for the full landmark history. TL;DR of what's
 shipped:
@@ -177,9 +177,13 @@ shipped:
 - [x] Push preference system — agent asks during bootstrap, stores in `signature` on Identity page
 - [x] Memory Garden: unread dots (persistent), month badge right-aligned, bilingual copy
 - [x] Identity page: `signature` field displayed; bilingual empty state
-- [x] SKILL.md: main loop spec for both MCP and HTTP agents; memory quality rewrite (friend test)
+- [x] Public IO onboarding skill split by runtime path: resident-agent, chat-client, API, and "not sure" guide
+- [x] iOS onboarding copy simplified: Skill URL → IO connection details → short start prompt; implementation details live in the skill
+- [x] Independent `feedling-chat-resident` / IO resident consumer is the standard live-chat path for Hermes / OpenClaw / Mac / server agents
+- [x] Resident consumer defaults to no user-visible fallback templates on agent-entry failures; errors stay in logs/external runtime
+- [x] SKILL.md: main loop spec for MCP, resident consumer, and HTTP agents; memory quality rewrite (friend test)
 
-**Deferred (post-launch)**
+**Deferred**
 - [ ] Migrate on-chain `FeedlingAppAuth` to Ethereum mainnet
 - [ ] Claude.ai connector submission
 
@@ -188,11 +192,11 @@ shipped:
 ## Architecture
 
 ```
-Claude.ai / Claude Desktop /       Non-MCP agent backends
-OpenClaw / Cursor / Hermes         (via feedling-chat-resident)
-        │                                │
-        │ MCP SSE                        │ HTTPS + envelopes
-        ▼                                ▼
+Claude / ChatGPT / Gemini style       Hermes / OpenClaw / Mac / server
+MCP chat clients                      agents via feedling-chat-resident
+        │                                      │
+        │ MCP SSE                              │ poll + HTTP/CLI agent entry
+        ▼                                      ▼
 ┌────────────────────────────────────────────────────────────────┐
 │                    Phala prod9 TDX CVM                         │
 │  dstack-ingress (443, LE TLS)                                  │
@@ -302,8 +306,9 @@ Creates a venv under `~/feedling-venv`, installs deps, writes
 | POST | `/v1/bootstrap` | First-connection trigger; returns instructions for Agent |
 | GET | `/v1/bootstrap/status` | Bootstrap progress/events for the iOS status surface |
 | GET | `/v1/identity/get` | Read identity envelope (response includes live `days_with_user` from server anchor) |
-| POST | `/v1/identity/init` | Write identity envelope (once, 5 dimensions). Requires `days_with_user` to set the relationship anchor |
+| POST | `/v1/identity/init` | Write identity envelope (once, exactly 7 dimensions). Requires `days_with_user` to set the relationship anchor |
 | POST | `/v1/identity/replace` | In-place rewrite of envelope. `days_with_user` optional — preserves anchor if omitted |
+| GET | `/v1/identity/changes` | List recent identity nudge/change events |
 | POST | `/v1/identity/relationship_anchor` | Update relationship anchor only (no envelope rewrite). Used by bootstrap calibration |
 | GET | `/v1/memory/list` | List memory envelopes |
 | GET | `/v1/memory/get` | Get one envelope by id |
@@ -311,7 +316,7 @@ Creates a venv under `~/feedling-venv`, installs deps, writes
 | DELETE | `/v1/memory/delete` | Delete a moment by id |
 | POST | `/v1/content/swap` | In-place envelope swap (visibility toggles) |
 | GET | `/v1/content/export` | Export all user content as envelopes |
-| POST | `/v1/account/reset` | Wipe this user's data + rotate api_key |
+| POST | `/v1/account/reset` | Wipe this user's server data and revoke the current key; iOS re-registers a fresh account locally |
 | GET | `/v1/screen/ios` | iOS screen/frame aggregation |
 | GET | `/v1/screen/mac` | Mock Mac activity payload used by early demos |
 | GET | `/v1/screen/analyze` | Semantic-first screen analysis + `rate_limit_ok` |
@@ -333,11 +338,15 @@ Creates a venv under `~/feedling-venv`, installs deps, writes
 | POST | `/v1/chat/message` | User sends a message envelope (iOS app) |
 | POST | `/v1/chat/response` | Agent posts a text or image reply envelope |
 | GET | `/v1/chat/poll` | Long-poll: blocks until user message |
+| GET | `/v1/memory/verify` | Bootstrap memory quality/count verification |
+| GET | `/v1/identity/verify` | Bootstrap identity verification |
+| POST | `/v1/chat/verify_loop` | Synthetic ping that proves the resident reply loop is alive |
+| GET | `/healthz` | Process health check |
 
 All write endpoints that take content enforce v1 envelope shape and
 reject plaintext with `400 plaintext_write_rejected`.
 
-### MCP tools (20 total)
+### MCP tools (23 total)
 
 | Tool | Maps to |
 |------|---------|
@@ -351,6 +360,9 @@ reject plaintext with `400 plaintext_write_rejected`.
 | `feedling_memory_list` | GET /v1/memory/list |
 | `feedling_memory_get` | GET /v1/memory/get |
 | `feedling_memory_delete` | DELETE /v1/memory/delete |
+| `feedling_memory_verify` | GET /v1/memory/verify |
+| `feedling_identity_verify` | GET /v1/identity/verify |
+| `feedling_chat_verify_loop` | POST /v1/chat/verify_loop |
 | `feedling_push_dynamic_island` | POST /v1/push/dynamic-island |
 | `feedling_push_live_activity` | POST /v1/push/live-activity |
 | `feedling_screen_latest_frame` | GET /v1/screen/frames/latest (metadata only) |
@@ -428,10 +440,10 @@ Writing guidance: narrate from inside the moment, not from outside it. The topic
 
 ## Agent setup
 
-### Claude.ai / Claude Desktop (SSE MCP)
+### Chat-client MCP runtimes
 
-Cloud users get the MCP one-liner from the iOS app's **Settings → Storage →
-Connection Details**:
+Claude / ChatGPT / Gemini-style clients use the MCP one-liner from the iOS
+app's **Settings → Storage → Connection Details** or the Chat onboarding path:
 
 ```
 claude mcp add feedling --transport sse "https://mcp.feedling.app/sse?key=<api_key>"
@@ -442,6 +454,11 @@ Self-hosted users derive the same shape using their own domain:
 ```
 claude mcp add feedling --transport sse "https://mcp.<your-domain>/sse?key=<api_key>"
 ```
+
+Direct MCP is enough for memory, identity, and tool calls. Ongoing IO Chat
+still needs something that can keep receiving new messages. If the chat client
+cannot stay alive after the user closes the window/session, pair it with the
+resident consumer path below before sending the first IO greeting.
 
 ### Hermes / OpenClaw / machine-resident agents
 

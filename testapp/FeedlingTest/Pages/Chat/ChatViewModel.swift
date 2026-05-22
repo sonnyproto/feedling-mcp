@@ -321,6 +321,12 @@ class ChatViewModel: ObservableObject {
         }
 
         let api = FeedlingAPI.shared
+        await api.ensureUserIdIfNeeded()
+        api.ensureContentKeypair()
+        if api.enclaveContentPublicKey == nil {
+            await api.refreshEnclaveAttestation()
+        }
+
         guard let userPK = api.userContentPublicKey,
               let enclavePK = api.enclaveContentPublicKey,
               !api.userId.isEmpty

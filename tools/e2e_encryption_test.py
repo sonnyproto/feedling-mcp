@@ -405,7 +405,7 @@ def main():
         id_plain = {"agent_name": "Luna",
                     "self_introduction": "我是 Luna",
                     "dimensions": [{"name": n, "value": 50, "description": "…"}
-                                   for n in ["好奇", "温柔", "锐利", "稳定", "幽默"]]}
+                                   for n in ["好奇", "温柔", "锐利", "稳定", "幽默", "克制", "直接"]]}
         id_body = json.dumps(id_plain, ensure_ascii=False).encode("utf-8")
         K_i = secrets.token_bytes(32); nonce_i = secrets.token_bytes(12)  # ChaCha20-Poly1305 IETF nonce
         id_id = f"id_{secrets.token_hex(8)}"
@@ -437,8 +437,8 @@ def main():
             if ident:
                 check("identity agent_name round-trips",
                       ident.get("agent_name") == "Luna")
-                check("identity has 5 dimensions",
-                      len(ident.get("dimensions", [])) == 5)
+                check("identity has 7 dimensions",
+                      len(ident.get("dimensions", [])) == 7)
 
         section("Negative: unauth hits 401")
         r = requests.get("http://127.0.0.1:5003/v1/chat/history", timeout=5)

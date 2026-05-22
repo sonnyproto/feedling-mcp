@@ -49,6 +49,27 @@
 
 ---
 
+## 2026-05-21
+
+### [DONE] Resident onboarding path made reusable after live iPhone test
+
+- Re-centered onboarding on an independent `feedling-chat-resident` /
+  IO resident consumer service for Hermes / OpenClaw / Mac / server agents.
+  The live path is poll `/v1/chat/poll` → call the agent HTTP/CLI entry →
+  POST `/v1/chat/response`, verified by `feedling_chat_verify_loop`.
+- Simplified iOS onboarding copy to three handoff items: skill URL,
+  path-specific IO connection details, and a short start prompt. Detailed
+  CLI/HTTP/systemd choices now live in the public `io-onboarding` skill.
+- Updated resident consumer docs and examples to use Hermes CLI
+  `hermes chat -Q --source tool --max-turns 4 -q "{message}"`, persist
+  session id for `--resume`, and keep user-visible fallback templates off
+  by default.
+- Updated README inventories for current verification endpoints/tools and
+  clarified that direct MCP is enough for bootstrap/tool calls, while reliable
+  ongoing IO Chat needs an always-on owner.
+
+---
+
 ## 2026-05-18
 
 ### [DONE] Onboarding protocol docs synced to floor-based memory standard

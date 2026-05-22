@@ -169,30 +169,51 @@ iOS app → **Settings → Storage → Self-hosted** → paste URL + Key → Sav
 
 Your server is up. Now decide how the user's agent talks to it.
 
-### Option A — MCP (recommended for any modern agent runtime)
+### Option A — Independent resident consumer (recommended for machine/server agents)
 
-The user's agent runtime (Claude Desktop, Claude Code, OpenClaw, Cursor,
-Hermes, etc.) speaks MCP directly to your `feedling-mcp` service. Add
-the connection in the agent runtime's config:
+Use this for Hermes / OpenClaw / Claude Code on a Mac mini or VPS, or any
+agent that can be reached through a stable HTTP endpoint or CLI command.
+The resident consumer owns the ongoing IO Chat loop:
+
+```text
+poll /v1/chat/poll → call the agent HTTP/CLI entry → POST /v1/chat/response
+```
+
+Install it from this repo:
+
+```bash
+cp deploy/chat_resident.env.example ~/feedling-chat-resident.env
+chmod 600 ~/feedling-chat-resident.env
+# Fill FEEDLING_API_URL, FEEDLING_API_KEY, a decrypt source,
+# and the agent's real HTTP or CLI entry.
+sudo cp deploy/feedling-chat-resident.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now feedling-chat-resident
+```
+
+For user-owned agent hosts, prefer a user service (`systemd --user`,
+launchd, supervisor, pm2) so the consumer is not a child job of the
+current agent chat turn or top-level gateway. See
+**[`tools/README.md`](../tools/README.md)** for the full setup.
+
+### Option B — Chat-client MCP
+
+Use this for Claude Desktop / Claude.ai / ChatGPT / Gemini-style products
+that connect to tools through MCP. Add the connection in the agent runtime's
+config:
 
 ```
 claude mcp add feedling --transport sse "https://mcp.<your-domain>/sse?key=<api_key>"
 ```
 
 The agent fetches the public skill from
-`https://raw.githubusercontent.com/teleport-computer/io-onboarding/main/skill.md`
-and follows it. No extra daemon needed on your VPS.
+`https://raw.githubusercontent.com/teleport-computer/io-onboarding/main/skill-chat-client.md`
+and follows it.
 
-### Option B — HTTP-mode via `feedling-chat-resident`
-
-For agent backends that DON'T speak MCP (a custom Python script, a
-local LLM via Ollama, a plain Anthropic API loop, etc.), install the
-`feedling-chat-resident` consumer to bridge HTTP ↔ your agent backend.
-See **[`tools/README.md`](../tools/README.md)** for setup details.
-
-The same public skill applies — agents in HTTP-mode follow the same
-bootstrap, identity, and main-loop rules, just translating each MCP
-tool reference to the HTTP endpoint per the skill's Appendix A.
+Direct MCP is enough for bootstrap, memory, and identity. For reliable
+ongoing IO Chat, the runtime must keep listening after the user closes the
+window/session. If it cannot, pair the MCP client with Option A before the
+first IO greeting.
 
 ---
 
@@ -205,8 +226,8 @@ Ask the user to:
    should show a `live_activity` token appear.
 2. Send a chat message in the app. Watch
    `~/feedling-data/<user_id>/chat.json` grow.
-3. Wait for the agent to reply (MCP runtime polling, or chat-resident
-   polling). The reply should appear in iOS within ~30 seconds.
+3. Wait for the agent to reply through the resident consumer or a verified
+   always-on MCP runtime. The reply should appear in iOS within ~30 seconds.
 
 If the reply never arrives, see **Troubleshooting** below.
 
