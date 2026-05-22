@@ -211,8 +211,19 @@ Do not put `--continue` in `AGENT_CLI_CMD`. On the first turn, Hermes creates
 a session and prints `session_id`; the consumer stores it. On later turns the
 consumer injects `--resume <session_id>` so Feedling is bound to the same
 conversation instead of whichever local Hermes session happens to be latest.
-Set `HERMES_HOME` to the same profile used by the user's real resident agent
-entry. Do not wrap `{message}` in a special persona prompt such as "You are
+Set `HERMES_HOME` to the same home/profile used by the user's real running
+resident agent entry. Do not guess it from folder names; read it from the
+actual service environment when available:
+
+```bash
+pid=$(systemctl --user show -p MainPID --value hermes-gateway)
+tr '\0' '\n' < /proc/$pid/environ | grep '^HERMES_HOME='
+```
+
+Some Hermes/OpenClaw installs use `/home/openclaw/.hermes`; others use
+`/home/openclaw/.hermes/profiles/daily`. The resident consumer must match the
+running agent, otherwise CLI calls can fail auth or drift into the wrong
+persona/session. Do not wrap `{message}` in a special persona prompt such as "You are
 Dora..." or "reply naturally"; the resident should call the same agent profile
 the user already trusts, with IO as only a new transport.
 
