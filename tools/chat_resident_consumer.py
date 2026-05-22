@@ -31,6 +31,9 @@ HTTP mode:
 CLI mode:
   AGENT_CLI_CMD         Full command template; {message} is replaced with the
                         user's message text.
+                        Image messages can also use {image_path} or
+                        {image_paths}; otherwise the path is appended to
+                        the message text.
                         Example (Hermes): hermes chat -Q --source tool --max-turns 4 -q "{message}"
                         Example (plain):  mycli ask {message}
                         For Hermes, the consumer stores session_id and
@@ -44,6 +47,7 @@ Optional:
                         Default false. When false, agent failures are logged
                         and no fake template is posted to the user.
   FALLBACK_REPLY        Optional opt-in fallback text
+  IMAGE_TEMP_DIR        Where decrypted chat images are written for CLI agents
   POLL_TIMEOUT          Long-poll timeout in seconds (default: 30)
   LOG_LEVEL             DEBUG / INFO / WARNING (default: INFO)
 """
@@ -62,6 +66,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -136,23 +141,24 @@ AGENT_SESSION_FILE_TEMPLATE = os.environ.get(
     "AGENT_SESSION_FILE",
     f"/tmp/feedling_agent_session_{hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]}_{{user_id}}.txt",
 )
+IMAGE_TEMP_DIR = Path(os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_images"))
 FALLBACK_REPLY = os.environ.get(
     "FALLBACK_REPLY", "（Agent 暂时无法响应，请稍后再试）"
 )
 SEND_FALLBACK_ON_AGENT_ERROR = _env_bool("SEND_FALLBACK_ON_AGENT_ERROR", False)
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
 
-# Placeholder routed to text-only agent backends when the user sends an
-# image-only message. Without this the consumer would silently drop image
-# messages because their `content` is "" by design (enclave decrypts the
-# JPEG into `image_b64`, leaves `content` empty). Vision-capable agents
-# can ignore this hint and call `feedling_chat_get_history` themselves
-# to read `image_b64`.
+# Prompt routed only when an agent entry cannot receive a native image object.
+# The consumer still extracts decrypted image bytes and passes them through
+# the richest available channel:
+#   - OpenAI-compatible HTTP gets a multimodal `image_url` content block.
+#   - simple HTTP gets an `images` array.
+#   - CLI gets local image file paths in the message or command template.
 IMAGE_PLACEHOLDER = os.environ.get(
     "IMAGE_PLACEHOLDER",
-    "[The user just sent you an image. Acknowledge it warmly in your normal "
-    "voice and ask what they want to share about it. If you can read images, "
-    "call feedling_chat_get_history to see it.]",
+    "[The user sent an image in IO Chat. Inspect the attached/local image "
+    "before replying. If your current runtime cannot open the image, say "
+    "plainly that this connector has not enabled image vision yet.]",
 )
 
 # ---------------------------------------------------------------------------
@@ -360,6 +366,7 @@ def _fetch_from_mcp(since: float, limit: int) -> list[dict] | None:
 
     def _extract_messages_from_mcp_result(result_obj) -> list[dict]:
         """Parse FastMCP call_tool return shapes across client versions."""
+        image_blocks: list[str] = []
 
         def _maybe_parse_json_text(text: str):
             if not text:
@@ -374,45 +381,96 @@ def _fetch_from_mcp(since: float, limit: int) -> list[dict] | None:
                     return msgs
             return None
 
+        def _maybe_image_b64(item: Any) -> str | None:
+            data = getattr(item, "data", None)
+            mime = getattr(item, "mimeType", None) or getattr(item, "mime_type", None)
+            typ = getattr(item, "type", None)
+            if isinstance(item, dict):
+                data = data if data is not None else item.get("data")
+                mime = mime or item.get("mimeType") or item.get("mime_type")
+                typ = typ or item.get("type")
+            if data is None:
+                return None
+            if typ not in (None, "image") and not str(mime or "").startswith("image/"):
+                return None
+            if isinstance(data, bytes):
+                return base64.b64encode(data).decode("ascii")
+            if isinstance(data, str) and data.strip():
+                value = data.strip()
+                return value.split(",", 1)[1] if value.startswith("data:") else value
+            return None
+
+        def _attach_image_blocks(msgs: list[dict]) -> list[dict]:
+            if not image_blocks:
+                return msgs
+            for msg in msgs:
+                if not isinstance(msg, dict):
+                    continue
+                marker = msg.get("image_b64")
+                if not isinstance(marker, str):
+                    continue
+                m = re.fullmatch(r"<vision_block:(\d+)>", marker.strip())
+                if not m:
+                    continue
+                idx = int(m.group(1))
+                if 0 <= idx < len(image_blocks):
+                    msg["image_b64"] = image_blocks[idx]
+            return msgs
+
         if result_obj is None:
             return []
 
         # Newer shape: CallToolResult(content=[...], structured_content=...)
         content_list = getattr(result_obj, "content", None)
         if isinstance(content_list, list):
+            parsed_msgs: list[dict] | None = None
             for item in content_list:
+                image_b64 = _maybe_image_b64(item)
+                if image_b64:
+                    image_blocks.append(image_b64)
+                    continue
                 text = getattr(item, "text", None)
                 if isinstance(text, str):
                     parsed = _maybe_parse_json_text(text)
                     if parsed is not None:
-                        return parsed
+                        parsed_msgs = parsed
+            if parsed_msgs is not None:
+                return _attach_image_blocks(parsed_msgs)
 
         structured = getattr(result_obj, "structured_content", None)
         if isinstance(structured, dict):
             msgs = structured.get("messages") or structured.get("history")
             if isinstance(msgs, list):
-                return msgs
+                return _attach_image_blocks(msgs)
 
         text_attr = getattr(result_obj, "text", None)
         if isinstance(text_attr, str):
             parsed = _maybe_parse_json_text(text_attr)
             if parsed is not None:
-                return parsed
+                return _attach_image_blocks(parsed)
 
         # Older shape: list[ContentLike]
         if isinstance(result_obj, list):
+            parsed_msgs: list[dict] | None = None
             for item in result_obj:
+                image_b64 = _maybe_image_b64(item)
+                if image_b64:
+                    image_blocks.append(image_b64)
+                    continue
                 text = getattr(item, "text", None)
                 if isinstance(text, str):
                     parsed = _maybe_parse_json_text(text)
                     if parsed is not None:
-                        return parsed
+                        parsed_msgs = parsed
+                        continue
                 parsed = _maybe_parse_json_text(str(item))
                 if parsed is not None:
-                    return parsed
+                    parsed_msgs = parsed
+            if parsed_msgs is not None:
+                return _attach_image_blocks(parsed_msgs)
 
         parsed = _maybe_parse_json_text(str(result_obj))
-        return parsed if parsed is not None else []
+        return _attach_image_blocks(parsed) if parsed is not None else []
 
     async def _call():
         if supports_headers:
@@ -505,6 +563,75 @@ def get_decrypted_history(since: float, limit: int = 20) -> list[dict] | None:
         log.warning("MCP source failed")
 
     return None  # no configured source succeeded
+
+
+# ---------------------------------------------------------------------------
+# Image message handling
+# ---------------------------------------------------------------------------
+
+def _decode_image_b64(value: Any) -> bytes | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    if raw.startswith("data:"):
+        raw = raw.split(",", 1)[1]
+    if raw.startswith("<vision_block:"):
+        return None
+    try:
+        return base64.b64decode(raw, validate=True)
+    except Exception:
+        try:
+            return base64.b64decode(raw)
+        except Exception as e:
+            log.warning("image_b64 decode failed: %s", e)
+            return None
+
+
+def _image_payloads_from_msg(msg: dict) -> list[dict[str, str]]:
+    image_bytes = _decode_image_b64(msg.get("image_b64"))
+    if not image_bytes:
+        return []
+    mime = msg.get("image_mime") or "image/jpeg"
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    return [
+        {
+            "mime_type": str(mime),
+            "data": b64,
+            "data_url": f"data:{mime};base64,{b64}",
+        }
+    ]
+
+
+def _image_file_paths_for_msg(msg: dict) -> list[str]:
+    payloads = _image_payloads_from_msg(msg)
+    if not payloads:
+        return []
+    key = re.sub(r"[^A-Za-z0-9_.-]+", "_", _msg_key(msg))[:96] or "image"
+    IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    paths: list[str] = []
+    for idx, payload in enumerate(payloads):
+        ext = ".png" if payload.get("mime_type") == "image/png" else ".jpg"
+        path = IMAGE_TEMP_DIR / f"{key}_{idx}{ext}"
+        try:
+            path.write_bytes(base64.b64decode(payload["data"]))
+            paths.append(str(path))
+        except Exception as e:
+            log.warning("failed to write image temp file %s: %s", path, e)
+    return paths
+
+
+def _message_for_agent(content: str, image_paths: list[str] | None = None) -> str:
+    image_paths = image_paths or []
+    if not image_paths:
+        return content
+    joined = ", ".join(image_paths)
+    return (
+        f"{content}\n\n"
+        f"Decrypted image file(s) for this IO message: {joined}\n"
+        "Open/inspect the image before replying if your runtime has local "
+        "vision or file-image support. Do not ask the user to describe the "
+        "image unless this runtime truly cannot inspect local image files."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -623,9 +750,11 @@ def _remember_http_session(resp: httpx.Response) -> None:
         _save_agent_session_id(sid)
 
 
-def _call_agent_http_simple(message: str) -> str:
+def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = None) -> str:
     headers = _agent_http_headers()
     payload = {"message": message}
+    if images:
+        payload["images"] = images
     resp = httpx.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=60)
     resp.raise_for_status()
     _remember_http_session(resp)
@@ -640,7 +769,7 @@ def _call_agent_http_simple(message: str) -> str:
     raise ValueError(f"unexpected response type: {type(body)}")
 
 
-def _call_agent_http_openai(message: str) -> str:
+def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = None) -> str:
     headers = _agent_http_headers()
     sid = _load_agent_session_id()
     if sid:
@@ -649,9 +778,18 @@ def _call_agent_http_openai(message: str) -> str:
     if session_key:
         headers[AGENT_HTTP_SESSION_KEY_HEADER] = session_key
 
+    content: Any = message
+    if images:
+        blocks: list[dict[str, Any]] = [{"type": "text", "text": message}]
+        for image in images:
+            data_url = image.get("data_url")
+            if data_url:
+                blocks.append({"type": "image_url", "image_url": {"url": data_url}})
+        content = blocks
+
     payload = {
         "model": AGENT_HTTP_MODEL,
-        "messages": [{"role": "user", "content": message}],
+        "messages": [{"role": "user", "content": content}],
         "stream": False,
     }
     resp = httpx.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=120)
@@ -663,13 +801,13 @@ def _call_agent_http_openai(message: str) -> str:
     return _extract_openai_reply(body)
 
 
-def call_agent_http(message: str) -> str:
+def call_agent_http(message: str, images: list[dict[str, str]] | None = None) -> str:
     if not AGENT_HTTP_URL:
         raise ValueError("AGENT_HTTP_URL is not set for http mode")
     if AGENT_HTTP_PROTOCOL in {"openai", "hermes", "chat_completions", "chat-completions"}:
-        return _call_agent_http_openai(message)
+        return _call_agent_http_openai(message, images=images)
     if AGENT_HTTP_PROTOCOL in {"simple", "generic", "json"}:
-        return _call_agent_http_simple(message)
+        return _call_agent_http_simple(message, images=images)
     raise ValueError(f"unknown AGENT_HTTP_PROTOCOL: {AGENT_HTTP_PROTOCOL!r}")
 
 
@@ -795,24 +933,38 @@ def _has_hermes_resume(cmd: list[str]) -> bool:
     return "--resume" in cmd or "-r" in cmd
 
 
-def _render_cli_template(message: str, sid: str) -> list[str]:
+def _render_cli_template(message: str, sid: str, image_paths: list[str] | None = None) -> list[str]:
+    image_paths = image_paths or []
     msg_token = "__FEEDLING_MESSAGE__"
     sid_token = "__FEEDLING_SESSION_ID__"
+    image_path_token = "__FEEDLING_IMAGE_PATH__"
+    image_paths_token = "__FEEDLING_IMAGE_PATHS__"
     template = (
         AGENT_CLI_CMD
         .replace("{message}", msg_token)
         .replace("{session_id}", sid_token)
+        .replace("{image_path}", image_path_token)
+        .replace("{image_paths}", image_paths_token)
     )
     cmd = shlex.split(template)
+    first_image = image_paths[0] if image_paths else ""
+    all_images = " ".join(image_paths)
     return [
-        part.replace(msg_token, message).replace(sid_token, sid)
+        part
+        .replace(msg_token, message)
+        .replace(sid_token, sid)
+        .replace(image_path_token, first_image)
+        .replace(image_paths_token, all_images)
         for part in cmd
     ]
 
 
-def _prepare_cli_command(message: str) -> list[str]:
+def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> list[str]:
     sid = _load_agent_session_id()
-    cmd = _render_cli_template(message, sid)
+    rendered_message = message
+    if image_paths and "{image_path" not in AGENT_CLI_CMD:
+        rendered_message = _message_for_agent(message, image_paths)
+    cmd = _render_cli_template(rendered_message, sid, image_paths=image_paths)
 
     if _is_hermes_chat_cmd(cmd):
         cmd, removed_continue = _strip_hermes_continue(cmd)
@@ -827,11 +979,11 @@ def _prepare_cli_command(message: str) -> list[str]:
     return _resolve_cli_executable(cmd)
 
 
-def call_agent_cli(message: str) -> str:
+def call_agent_cli(message: str, image_paths: list[str] | None = None) -> str:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
 
-    cmd = _prepare_cli_command(message)
+    cmd = _prepare_cli_command(message, image_paths=image_paths)
     log.debug("running cli agent: %s", cmd)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
@@ -934,11 +1086,15 @@ def _normalize_agent_replies(raw_reply: str) -> list[str]:
     return [clean] if clean else []
 
 
-def call_agent(message: str) -> list[str]:
+def call_agent(
+    message: str,
+    images: list[dict[str, str]] | None = None,
+    image_paths: list[str] | None = None,
+) -> list[str]:
     if AGENT_MODE == "http":
-        raw = call_agent_http(message)
+        raw = call_agent_http(message, images=images)
     elif AGENT_MODE == "cli":
-        raw = call_agent_cli(message)
+        raw = call_agent_cli(message, image_paths=image_paths)
     else:
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
@@ -1145,17 +1301,25 @@ def _process_messages(messages: list) -> float:
 
         content = msg.get("content", "").strip()
         content_type = msg.get("content_type", "text")
+        image_payloads: list[dict[str, str]] = []
+        image_paths: list[str] = []
 
         if content_type == "image":
             # Image messages legitimately have content == "" — the JPEG
-            # lives in image_b64. Route a placeholder to text-only agents
-            # so they produce a reply instead of silently dropping the
-            # message. Vision-capable agents can ignore the placeholder
-            # and read image_b64 via feedling_chat_get_history.
+            # lives in image_b64. Extract it here so the agent entry receives
+            # real image context instead of only a vague "image arrived" hint.
             log.info(
-                "image message [ts=%.3f] — routing IMAGE_PLACEHOLDER to agent",
+                "image message [ts=%.3f] — preparing image context for agent",
                 ts,
             )
+            image_payloads = _image_payloads_from_msg(msg)
+            image_paths = _image_file_paths_for_msg(msg) if image_payloads else []
+            if not image_payloads:
+                log.warning(
+                    "image message [ts=%.3f] has no decrypted image_b64; "
+                    "routing honest image-unavailable prompt",
+                    ts,
+                )
             content = IMAGE_PLACEHOLDER
         elif not content:
             # Genuinely empty text — decrypt source missing or failed.
@@ -1172,7 +1336,14 @@ def _process_messages(messages: list) -> float:
             log.info("user message [ts=%.3f]: %s", ts, content[:80])
 
         try:
-            replies = call_agent(content)
+            if image_payloads or image_paths:
+                replies = call_agent(
+                    content,
+                    images=image_payloads,
+                    image_paths=image_paths,
+                )
+            else:
+                replies = call_agent(content)
         except Exception as e:
             log.error("agent call failed; not posting user-visible fallback: %s", e)
             if SEND_FALLBACK_ON_AGENT_ERROR:

@@ -422,7 +422,7 @@ struct ContentState: Codable, Hashable {
 5. Agent derives identity from the written memories, then calls `feedling_identity_init` with exactly 7 dimensions and `days_with_user = today - earliest_memory.occurred_at`. The server records `relationship_started_at` from `days_with_user` as a fixed anchor, and Agent calls `feedling_identity_verify`.
 6. Agent establishes Live connection before the user enters Chat by running the independent `feedling-chat-resident` / IO resident consumer service when a machine/server path is used. The resident consumer polls `/v1/chat/poll`, calls the agent's HTTP or CLI entry, posts `/v1/chat/response`, then `feedling_chat_verify_loop` proves the loop before the first greeting.
 7. After Live connection is verified, Agent calls `feedling_chat_post_message` to greet the user — this is the first visible Feedling chat message. It states the computed day count as a fact and tells the user the connection is live. If the user corrects the day count, Agent calls `feedling_identity_set_relationship_days` to recalibrate the anchor.
-8. Only after chat is alive does Agent mention broadcast/screen sharing. iOS detects identity envelope appeared → auto-switches to Identity tab. `days_with_user` auto-increments daily because the server computes `(now - relationship_started_at) / 86400` on every read.
+8. Only after chat is alive does Agent mention broadcast/screen sharing. iOS detects identity envelope appeared → auto-switches to Identity tab. `days_with_user` auto-increments by calendar day from `relationship_started_at` on every read.
 
 ### Memory Garden quality standard
 
@@ -481,6 +481,10 @@ stores the first `session_id` and resumes it with `--resume`; it does not use
 `--continue`. For Hermes' API server, use the OpenAI-compatible
 `/v1/chat/completions` mode with Hermes session headers. Agent failures are
 logged by default rather than posted as fake fallback chat bubbles.
+Image messages are decrypted by the consumer too: OpenAI-compatible HTTP gets
+a multimodal image block, simple HTTP gets an `images` array, and CLI agents
+get a local image file path so they can inspect the image instead of replying
+from a placeholder.
 
 On Hermes/OpenClaw hosts, "independent" means process ownership: run
 `feedling-chat-resident` as its own user service (`systemd --user`, launchd,

@@ -16,6 +16,7 @@ class LiveActivityManager: ObservableObject {
 
     /// Days with user — set by IdentityViewModel when identity loads
     var daysWithUser: Int = 0
+    var relationshipStartedAt: String?
 
     private var backendURL: String { FeedlingAPI.baseURL }
 
@@ -53,7 +54,7 @@ class LiveActivityManager: ObservableObject {
         let initialState = ScreenActivityAttributes.ContentState(
             title: "",
             body: "",
-            data: ["days": "\(daysWithUser)"],
+            data: liveActivityDaysData(),
             updatedAt: Date()
         )
 
@@ -84,19 +85,28 @@ class LiveActivityManager: ObservableObject {
     }
 
     /// Call when identity card loads or days change. Updates the idle lock screen display.
-    func setDays(_ days: Int) {
+    func setDays(_ days: Int, relationshipStartedAt: String? = nil) {
         daysWithUser = days
+        self.relationshipStartedAt = relationshipStartedAt
         guard let activity = currentActivity,
               lastState?.body.isEmpty != false else { return }
         Task {
             let updated = ScreenActivityAttributes.ContentState(
                 title: lastState?.title ?? "",
                 body: lastState?.body ?? "",
-                data: ["days": "\(days)"],
+                data: liveActivityDaysData(),
                 updatedAt: Date()
             )
             await activity.update(.init(state: updated, staleDate: nil))
         }
+    }
+
+    private func liveActivityDaysData() -> [String: String] {
+        var data = ["days": "\(daysWithUser)"]
+        if let relationshipStartedAt, !relationshipStartedAt.isEmpty {
+            data["relationship_started_at"] = relationshipStartedAt
+        }
+        return data
     }
 
     func stopActivity() async {

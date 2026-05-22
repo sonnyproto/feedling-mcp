@@ -118,14 +118,27 @@ struct ScreenActivityWidget: Widget {
 private struct LockScreenView: View {
     let state: ScreenActivityAttributes.ContentState
 
-    private var days: Int {
-        Int(state.data["days"] ?? "0") ?? 0
+    private func days(at date: Date) -> Int {
+        if let raw = state.data["relationship_started_at"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           raw.count >= 10 {
+            let parts = raw.prefix(10).split(separator: "-").compactMap { Int($0) }
+            if parts.count == 3,
+               let start = Calendar.current.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2])) {
+                let cal = Calendar.current
+                let from = cal.startOfDay(for: start)
+                let to = cal.startOfDay(for: date)
+                return max(0, cal.dateComponents([.day], from: from, to: to).day ?? 0)
+            }
+        }
+        return Int(state.data["days"] ?? "0") ?? 0
     }
 
     var body: some View {
         Group {
             if state.body.isEmpty {
-                idleView
+                TimelineView(.periodic(from: Date(), by: 3600)) { context in
+                    idleView(days: days(at: context.date))
+                }
             } else {
                 activeView
             }
@@ -137,7 +150,7 @@ private struct LockScreenView: View {
     }
 
     // Idle: days-together display
-    private var idleView: some View {
+    private func idleView(days: Int) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Text("\(days)")
                 .font(.cinNewsreader(32))

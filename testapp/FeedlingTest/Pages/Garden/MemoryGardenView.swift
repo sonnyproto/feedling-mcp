@@ -212,6 +212,9 @@ struct MemoryCardDetailView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var showDeleteConfirm = false
 
+    private let isChinese: Bool =
+        Locale.preferredLanguages.first?.hasPrefix("zh") ?? false
+
     private var occurredDateStr: String {
         guard let date = moment.occurredDate else { return moment.occurredAt }
         let fmt = DateFormatter()
@@ -243,11 +246,14 @@ struct MemoryCardDetailView: View {
 
     private var sourceLabel: String {
         switch moment.source.lowercased() {
-        case "bootstrap":          return "初识时记录"
-        case "live_conversation":  return "聊天中记录"
-        case "user_initiated":     return "你提起的"
-        case "chat":               return "聊天中记录"
-        default:                   return moment.source.isEmpty ? "—" : moment.source
+        case "bootstrap":
+            return isChinese ? "初识时记录" : "From our first meeting"
+        case "live_conversation", "chat":
+            return isChinese ? "聊天中记录" : "From our chats"
+        case "user_initiated":
+            return isChinese ? "你提起的" : "You brought it up"
+        default:
+            return moment.source.isEmpty ? "—" : moment.source
         }
     }
 
@@ -277,7 +283,7 @@ struct MemoryCardDetailView: View {
                     Spacer()
                     VStack(spacing: 0) {
                         Rectangle().fill(Color.cinLine).frame(height: 1)
-                        Text("删除这条记忆？")
+                        Text(isChinese ? "删除这条记忆？" : "Delete this memory?")
                             .font(.notoSerifSC(size: 13.5))
                             .foregroundStyle(Color.cinFg)
                             .frame(maxWidth: .infinity, alignment: .leading)
@@ -287,7 +293,7 @@ struct MemoryCardDetailView: View {
                         Button {
                             deleteAndDismiss()
                         } label: {
-                            Text("删除")
+                            Text(isChinese ? "删除" : "DELETE")
                                 .font(.dmMono(size: 10, weight: .medium))
                                 .kerning(3)
                                 .foregroundStyle(Color.cinAccent1)
@@ -299,7 +305,7 @@ struct MemoryCardDetailView: View {
                         Button {
                             showDeleteConfirm = false
                         } label: {
-                            Text("取消")
+                            Text(isChinese ? "取消" : "CANCEL")
                                 .font(.dmMono(size: 10))
                                 .kerning(3)
                                 .foregroundStyle(Color.cinSub)
@@ -403,9 +409,9 @@ struct MemoryCardDetailView: View {
     private var timeBlock: some View {
         VStack(alignment: .leading, spacing: 0) {
             Rectangle().fill(Color.cinLine).frame(height: 1)
-            metaRow(label: "发生于", value: occurredDateStr)
+            metaRow(label: isChinese ? "发生于" : "OCCURRED", value: occurredDateStr)
             if !moment.source.isEmpty {
-                metaRow(label: "来源", value: sourceLabel)
+                metaRow(label: isChinese ? "来源" : "SOURCE", value: sourceLabel)
             }
             if let ctx = moment.context, !ctx.isEmpty {
                 metaRow(label: "CONTEXT", value: ctx)
@@ -444,7 +450,7 @@ struct MemoryCardDetailView: View {
                 chatVM.quoteInChat(moment: moment)
                 router.selectedTab = .chat
             } label: {
-                Text("在 CHAT 里聊聊 ↗")
+                Text(isChinese ? "在 CHAT 里聊聊 ↗" : "TALK IN CHAT ↗")
             }
             .buttonStyle(CinPrimaryButtonStyle())
             .frame(maxWidth: .infinity)
@@ -452,7 +458,7 @@ struct MemoryCardDetailView: View {
             Button {
                 showDeleteConfirm = true
             } label: {
-                Text("DELETE")
+                Text(isChinese ? "删除" : "DELETE")
             }
             .buttonStyle(CinSecondaryButtonStyle())
             .frame(width: 88)

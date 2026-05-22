@@ -1093,7 +1093,7 @@ def _build_and_post_identity(
         "value (0-100), description (string). For each dimension you must be able to "
         "name ≥3 specific memory cards as receipts — if you can't, drop that dimension "
         "and pick one you can defend. "
-        "days_with_user (REQUIRED): computed as floor((today − earliest_memory.occurred_at) / 1 day). "
+        "days_with_user (REQUIRED): computed as calendar-day difference between today and earliest_memory.occurred_at. "
         "Do not guess this value — derive it from the memories you wrote. "
         "agent_name: NEVER use a runtime label (Hermes / Claude / GPT / etc.). "
         "Use the name the user has called you in prior chats; if none, propose one and "

@@ -567,6 +567,19 @@ def _decrypt_envelope(env: dict, authorized_user_id: str, content_sk: nacl.publi
     return plaintext
 
 
+def _parse_iso_calendar_date(value: str) -> _dt.date | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        norm = raw.replace("Z", "+00:00")
+        if "T" not in norm:
+            norm = norm + "T00:00:00"
+        return _dt.datetime.fromisoformat(norm).date()
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Agent-facing decrypt-and-serve handlers.
 #
@@ -894,11 +907,11 @@ def v1_identity_get():
         # so users that bootstrapped before this migration still see something.
         anchor = identity.get("relationship_started_at")
         if anchor:
-            try:
-                started = _dt.datetime.fromisoformat(anchor)
-                live_days = max(0, (_dt.datetime.now() - started).days)
-            except Exception:
-                live_days = inner.get("days_with_user", 0)
+            started = _parse_iso_calendar_date(anchor)
+            live_days = (
+                max(0, (_dt.datetime.now().date() - started).days)
+                if started else inner.get("days_with_user", 0)
+            )
         else:
             live_days = inner.get("days_with_user", 0)
 

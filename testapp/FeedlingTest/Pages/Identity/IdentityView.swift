@@ -139,12 +139,16 @@ struct IdentityView: View {
 
     private func dimensionsList(_ id: IdentityCard) -> some View {
         VStack(spacing: 0) {
+            // Spacer pins the label to the leading edge so it matches the
+            // "RECENT CHANGES" section below; without it the HStack sizes to
+            // content and the outer VStack centers it.
             HStack(alignment: .lastTextBaseline, spacing: 10) {
                 Text("DIMENSIONS")
                     .font(.dmMono(size: 9.5))
                     .foregroundStyle(Color.cinAccent1)
                     .kerning(3)
                     .fontWeight(.semibold)
+                Spacer()
             }
             .padding(.horizontal, 24)
             .padding(.top, 18)
@@ -279,11 +283,19 @@ private struct CinDimensionRow: View {
                 .kerning(1)
                 .frame(width: 24)
 
-            // Name
+            // Name — column widened to fit two-word English dimension names
+            // ("Execution Drive", "Precision & Boundaries", …) without
+            // SwiftUI breaking single words across lines character-by-character.
+            // Two-line wrap is allowed; minimumScaleFactor catches the longest
+            // edge cases ("Operational Caution"). Chinese names (2–4 chars)
+            // still left-align with whitespace to the right — fine.
             Text(dimension.name)
                 .font(.notoSerifSC(size: 14, weight: .medium))
                 .foregroundStyle(Color.cinFg)
-                .frame(width: 52, alignment: .leading)
+                .lineLimit(2)
+                .minimumScaleFactor(0.85)
+                .multilineTextAlignment(.leading)
+                .frame(width: 110, alignment: .leading)
 
             // Bar
             GeometryReader { geo in
@@ -491,23 +503,31 @@ struct HatchedRadarView: View {
             }
             fillPath.closeSubpath()
 
-            // Draw 45° hatch lines clipped to the fill polygon
-            ctx.clip(to: fillPath)
-            let bounds = CGRect(origin: .zero, size: size)
-            let step: CGFloat = 8
-            var x = bounds.minX - bounds.height
-            while x < bounds.maxX + bounds.height {
-                var hatch = Path()
-                hatch.move(to: CGPoint(x: x, y: bounds.minY))
-                hatch.addLine(to: CGPoint(x: x + bounds.height, y: bounds.maxY))
-                ctx.stroke(hatch, with: .color(Color.cinAccent1.opacity(0.25)), lineWidth: 1)
-                x += step
+            // Draw 45° hatch lines clipped to the fill polygon.
+            // Scope the clip inside drawLayer so it only applies to the hatch
+            // pass — otherwise the clip persists for the rest of the closure
+            // and chops off the outer half of the polygon outline + the 7
+            // vertex dots that sit right on the polygon edge.
+            ctx.drawLayer { layerCtx in
+                layerCtx.clip(to: fillPath)
+                let bounds = CGRect(origin: .zero, size: size)
+                let step: CGFloat = 8
+                var x = bounds.minX - bounds.height
+                while x < bounds.maxX + bounds.height {
+                    var hatch = Path()
+                    hatch.move(to: CGPoint(x: x, y: bounds.minY))
+                    hatch.addLine(to: CGPoint(x: x + bounds.height, y: bounds.maxY))
+                    layerCtx.stroke(hatch, with: .color(Color.cinAccent1.opacity(0.25)), lineWidth: 1)
+                    x += step
+                }
             }
 
-            // Stroke outline
+            // Stroke outline (full line width visible — no longer clipped)
             ctx.stroke(fillPath, with: .color(Color.cinAccent1.opacity(0.8)), lineWidth: 1.5)
 
-            // Dots at vertices
+            // Dots at vertices — drawn last so they sit on top of the polygon
+            // outline as full circles. Previously the lingering clip from the
+            // hatch pass cut each dot in half.
             for i in 0..<n {
                 let r = maxR * dimensions[i].normalizedValue
                 let pt = vertex(i: i, n: n, r: r, c: center)
@@ -521,11 +541,19 @@ struct HatchedRadarView: View {
                 let maxR = min(geo.size.width, geo.size.height) / 2 - 36
                 ForEach(Array(dimensions.enumerated()), id: \.offset) { i, dim in
                     let pt = vertex(i: i, n: dimensions.count, r: maxR + 22, c: center)
+                    // Constrain label width so multi-word English dimension
+                    // names ("Tolerance for Fluff", "Precision & Boundaries")
+                    // wrap to two lines instead of sprawling horizontally and
+                    // colliding with the neighbouring vertex labels. Single-
+                    // word and short Chinese names stay on one line within
+                    // the same frame.
                     Text(dim.name)
-                        .font(.dmMono(size: 11))
+                        .font(.dmMono(size: 10.5))
                         .foregroundStyle(Color.cinSub)
                         .kerning(0.5)
+                        .lineSpacing(1)
                         .multilineTextAlignment(.center)
+                        .frame(width: 96)
                         .position(pt)
                 }
             }

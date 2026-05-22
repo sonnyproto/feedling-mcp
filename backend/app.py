@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -2035,28 +2035,61 @@ def _load_identity_changes(store: UserStore, since: str = "", limit: int = 50) -
     return entries[:limit]
 
 
-def _anchor_from_days(days: int) -> str:
+def _parse_iso_calendar_date(value: str) -> date | None:
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    try:
+        norm = raw.replace("Z", "+00:00")
+        if "T" not in norm:
+            norm = norm + "T00:00:00"
+        return datetime.fromisoformat(norm).date()
+    except Exception:
+        return None
+
+
+def _earliest_memory_date(store: UserStore) -> date | None:
+    dates: list[date] = []
+    for moment in _load_moments(store):
+        if not isinstance(moment, dict):
+            continue
+        d = _parse_iso_calendar_date(moment.get("occurred_at", ""))
+        if d:
+            dates.append(d)
+    return min(dates) if dates else None
+
+
+def _anchor_from_days(days: int, store: UserStore | None = None, prefer_memory: bool = False) -> str:
     """Convert "we've known each other N days" into a fixed ISO timestamp.
 
     The anchor is the source of truth for days_with_user — every read computes
-    `(now - anchor) / 86400`, so the displayed count auto-increments daily and
-    is unaffected by envelope rewrites (init / replace / nudge).
+    a calendar-day delta from this date, so the displayed count increments at
+    midnight instead of at the exact bootstrap hour.
     """
+    if prefer_memory and store is not None:
+        earliest = _earliest_memory_date(store)
+        if earliest:
+            return earliest.isoformat()
     safe_days = max(0, int(days))
-    started_at = datetime.now() - timedelta(days=safe_days)
+    started_at = datetime.now().date() - timedelta(days=safe_days)
     return started_at.isoformat()
 
 
-def _live_days_with_user(identity: dict) -> int:
+def _live_days_with_user(identity: dict, store: UserStore | None = None) -> int:
     """Compute the live days_with_user from the relationship anchor."""
-    anchor = identity.get("relationship_started_at")
-    if not anchor:
+    anchor_date = _parse_iso_calendar_date(identity.get("relationship_started_at", ""))
+
+    # Migration repair for anchors created from server UTC time after the
+    # user's local midnight boundary: if old identities have no explicit
+    # anchor source and the memory garden proves an earlier first date, use it.
+    if store is not None and not identity.get("relationship_anchor_source"):
+        earliest = _earliest_memory_date(store)
+        if earliest and (anchor_date is None or earliest < anchor_date):
+            anchor_date = earliest
+
+    if not anchor_date:
         return 0
-    try:
-        started = datetime.fromisoformat(anchor)
-    except Exception:
-        return 0
-    return max(0, (datetime.now() - started).days)
+    return max(0, (datetime.now().date() - anchor_date).days)
 
 
 # ---------------------------------------------------------------------------
@@ -2190,7 +2223,7 @@ def identity_get():
     # envelope locally, but it never sees the anchor itself — it just reads
     # this top-level field. Same convention as the enclave proxy.
     enriched = dict(data)
-    enriched["days_with_user"] = _live_days_with_user(data)
+    enriched["days_with_user"] = _live_days_with_user(data, store=store)
     return jsonify({"identity": enriched})
 
 
@@ -2253,7 +2286,8 @@ def identity_init():
         "owner_user_id": envelope["owner_user_id"],
         "created_at": now,
         "updated_at": now,
-        "relationship_started_at": _anchor_from_days(days_with_user),
+        "relationship_started_at": _anchor_from_days(days_with_user, store=store, prefer_memory=True),
+        "relationship_anchor_source": "earliest_memory" if _earliest_memory_date(store) else "days_with_user",
     }
     if envelope.get("K_enclave"):
         identity["K_enclave"] = envelope["K_enclave"]
@@ -2311,8 +2345,10 @@ def identity_replace():
         if not isinstance(days_with_user, int) or days_with_user < 0:
             return jsonify({"error": "days_with_user must be a non-negative int"}), 400
         relationship_started_at = _anchor_from_days(days_with_user)
+        relationship_anchor_source = "user_calibrated"
     elif existing and existing.get("relationship_started_at"):
         relationship_started_at = existing["relationship_started_at"]
+        relationship_anchor_source = existing.get("relationship_anchor_source", "")
     else:
         # First-ever write through replace (no prior init). Reject so callers
         # are forced through init's mandatory days_with_user path.
@@ -2330,6 +2366,7 @@ def identity_replace():
         "created_at": created_at,
         "updated_at": now,
         "relationship_started_at": relationship_started_at,
+        "relationship_anchor_source": relationship_anchor_source,
     }
     if envelope.get("K_enclave"):
         identity["K_enclave"] = envelope["K_enclave"]
@@ -2399,6 +2436,7 @@ def identity_relationship_anchor():
         return jsonify({"error": "days_with_user (non-negative int) required"}), 400
 
     existing["relationship_started_at"] = _anchor_from_days(days_with_user)
+    existing["relationship_anchor_source"] = "user_calibrated"
     existing["updated_at"] = datetime.now().isoformat()
     _save_identity(store, existing)
     print(f"[identity:{store.user_id}] anchor updated → {existing['relationship_started_at']} (days={days_with_user})")
@@ -2743,22 +2781,13 @@ def _relationship_age_days(store) -> int:
     finally to 0 (treat as fresh)."""
     identity = _load_identity(store)
     if identity and identity.get("relationship_started_at"):
-        try:
-            started = datetime.fromisoformat(identity["relationship_started_at"])
-            return max(0, (datetime.now() - started).days)
-        except Exception:
-            pass
+        return _live_days_with_user(identity, store=store)
     moments = _load_moments(store)
     if moments:
         try:
-            earliest = min(
-                (m.get("occurred_at", "") for m in moments if isinstance(m, dict) and m.get("occurred_at")),
-            )
+            earliest = _earliest_memory_date(store)
             if earliest:
-                started = datetime.fromisoformat(earliest.replace("Z", "+00:00"))
-                if started.tzinfo:
-                    started = started.replace(tzinfo=None)
-                return max(0, (datetime.now() - started).days)
+                return max(0, (datetime.now().date() - earliest).days)
         except Exception:
             pass
     return 0
@@ -2878,7 +2907,7 @@ def identity_verify():
     issues = []
     suggestions = []
 
-    days_with_user = _live_days_with_user(identity)
+    days_with_user = _live_days_with_user(identity, store=store)
     if days_with_user < 0:
         issues.append({"type": "days_with_user_negative", "got": days_with_user})
     if days_with_user > 365 * 30:

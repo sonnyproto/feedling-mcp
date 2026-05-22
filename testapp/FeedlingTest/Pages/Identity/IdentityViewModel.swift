@@ -8,6 +8,7 @@ struct IdentityCard: Codable {
     var dimensions: [Dimension]
     let createdAt: String
     let updatedAt: String
+    let relationshipStartedAt: String?
 
     // Optional display fields — written by the agent into the encrypted body
     var signature: [String]?        // two-line poetic signature shown on Identity page
@@ -46,7 +47,22 @@ struct IdentityCard: Codable {
     /// hack was unstable — every envelope rewrite (init/replace/nudge/swap)
     /// would reset updatedAt and zero the elapsed counter.
     var daysWithUser: Int {
-        daysWithUserWritten ?? 0
+        if let start = relationshipStartDate {
+            let cal = Calendar.current
+            let from = cal.startOfDay(for: start)
+            let to = cal.startOfDay(for: Date())
+            return max(0, cal.dateComponents([.day], from: from, to: to).day ?? 0)
+        }
+        return daysWithUserWritten ?? 0
+    }
+
+    private var relationshipStartDate: Date? {
+        guard let raw = relationshipStartedAt?.trimmingCharacters(in: .whitespacesAndNewlines),
+              raw.count >= 10
+        else { return nil }
+        let parts = raw.prefix(10).split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        return Calendar.current.date(from: DateComponents(year: parts[0], month: parts[1], day: parts[2]))
     }
 
     enum CodingKeys: String, CodingKey {
@@ -54,6 +70,7 @@ struct IdentityCard: Codable {
         case selfIntroduction = "self_introduction"
         case dimensions, signature, category
         case daysWithUserWritten = "days_with_user"
+        case relationshipStartedAt = "relationship_started_at"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
         case v, body_ct, nonce, K_user, K_enclave, visibility, owner_user_id, id
@@ -69,6 +86,7 @@ struct IdentityCard: Codable {
         signature            = try? c.decode([String].self, forKey: .signature)
         category             = try? c.decode(String.self, forKey: .category)
         daysWithUserWritten  = try? c.decode(Int.self, forKey: .daysWithUserWritten)
+        relationshipStartedAt = try? c.decode(String.self, forKey: .relationshipStartedAt)
         v               = try? c.decode(Int.self, forKey: .v)
         body_ct         = try? c.decode(String.self, forKey: .body_ct)
         nonce           = try? c.decode(String.self, forKey: .nonce)
@@ -289,7 +307,7 @@ class IdentityViewModel: ObservableObject {
             }
             let decoded = try JSONDecoder().decode(Response.self, from: data)
             var newIdentity = decoded.identity
-            if let sk = contentSK(), var id = newIdentity {
+            if let sk = contentSK(), let id = newIdentity {
                 newIdentity = id.decryptedIfNeeded(withUserSK: sk)
                 _ = id
             }
@@ -299,7 +317,7 @@ class IdentityViewModel: ObservableObject {
             wasNil = newIdentity == nil
             identity = newIdentity
             if let days = newIdentity?.daysWithUser {
-                LiveActivityManager.shared.setDays(days)
+                LiveActivityManager.shared.setDays(days, relationshipStartedAt: newIdentity?.relationshipStartedAt)
             }
         } catch {
             log("[IdentityVM] load error: \(error)")

@@ -6,6 +6,7 @@ Run with: pytest tests/test_chat_resident_consumer.py -v
 """
 
 import importlib
+import base64
 import os
 import sys
 import time
@@ -51,6 +52,13 @@ def _make_msg(role="user", content="hello", ts=None, timestamp=None):
         msg["ts"] = ts
     if timestamp is not None:
         msg["timestamp"] = timestamp
+    return msg
+
+
+def _make_image_msg(ts=1.0, image_bytes=b"fake-jpeg"):
+    msg = _make_msg(role="user", content="", ts=ts)
+    msg["content_type"] = "image"
+    msg["image_b64"] = base64.b64encode(image_bytes).decode("ascii")
     return msg
 
 
@@ -136,6 +144,23 @@ def test_enclave_history_used_when_configured(monkeypatch):
 
     mock_agent.assert_called_once_with("decrypted hello")
     assert result_ts == pytest.approx(2000.0)
+
+
+def test_image_message_passes_image_context_to_agent(monkeypatch, tmp_path):
+    monkeypatch.setattr(crc, "IMAGE_TEMP_DIR", tmp_path)
+    msg = _make_image_msg(ts=2100.0)
+
+    with patch.object(crc, "call_agent", return_value="I can see it.") as mock_agent, \
+         patch.object(crc, "post_reply") as mock_post:
+        result_ts = crc._process_messages([msg])
+
+    mock_post.assert_called_once()
+    assert result_ts == pytest.approx(2100.0)
+    _, kwargs = mock_agent.call_args
+    assert kwargs["images"][0]["data"] == msg["image_b64"]
+    assert kwargs["images"][0]["data_url"].startswith("data:image/jpeg;base64,")
+    assert kwargs["image_paths"]
+    assert Path(kwargs["image_paths"][0]).exists()
 
 
 def test_dedup_prevents_reprocessing_same_message():
@@ -360,6 +385,47 @@ def test_mcp_calltoolresult_content_shape(monkeypatch):
     assert out and out[0]["content"] == "hi"
 
 
+def test_mcp_calltoolresult_attaches_image_blocks(monkeypatch):
+    """MCP history returns image messages as text JSON plus ImageContent blocks.
+    The resident consumer must reattach image bytes so CLI/HTTP backends can
+    receive real image context instead of a marker string."""
+
+    class _TC:
+        def __init__(self, text):
+            self.text = text
+
+    class _IC:
+        type = "image"
+        mimeType = "image/jpeg"
+        data = base64.b64encode(b"jpeg-bytes").decode("ascii")
+
+    class _Result:
+        content = [
+            _TC('{"messages":[{"role":"user","content":"","content_type":"image","image_b64":"<vision_block:0>","ts":2.0}]}'),
+            _IC(),
+        ]
+
+    class _FakeClient:
+        def __init__(self, url, headers=None):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_):
+            pass
+        async def call_tool(self, name, args):
+            return _Result()
+
+    monkeypatch.setattr(crc, "_fastmcp_cls", _FakeClient)
+    monkeypatch.setattr(crc, "FEEDLING_MCP_URL", "https://mcp.feedling.app")
+    monkeypatch.setattr(crc, "FEEDLING_MCP_KEY", "k")
+    monkeypatch.setattr(crc, "_mcp_transport_cache", {"https://mcp.feedling.app": "https://mcp.feedling.app/sse"})
+
+    out = crc._fetch_from_mcp(0.0, 20)
+
+    assert out and out[0]["content_type"] == "image"
+    assert out[0]["image_b64"] == base64.b64encode(b"jpeg-bytes").decode("ascii")
+
+
 def test_sanitize_reply_text_strips_leaks_and_duplicates():
     raw = """— ✵ Hermes
 
@@ -479,6 +545,30 @@ def test_prepare_cli_preserves_message_with_quotes(monkeypatch):
     assert cmd == ["mycli", "ask", 'say "hello" now']
 
 
+def test_prepare_cli_appends_image_path_when_template_has_no_image_slot(monkeypatch, tmp_path):
+    image_path = str(tmp_path / "photo.jpg")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("look at this", image_paths=[image_path])
+
+    assert cmd[:2] == ["mycli", "ask"]
+    assert "look at this" in cmd[2]
+    assert image_path in cmd[2]
+
+
+def test_prepare_cli_uses_image_path_template(monkeypatch, tmp_path):
+    image_path = str(tmp_path / "photo.jpg")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask --image "{image_path}" "{message}"')
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("look at this", image_paths=[image_path])
+
+    assert cmd == ["mycli", "ask", "--image", image_path, "look at this"]
+
+
 def test_cli_nonzero_exit_fails_even_with_stdout(monkeypatch):
     class _Result:
         returncode = 2
@@ -486,7 +576,7 @@ def test_cli_nonzero_exit_fails_even_with_stdout(monkeypatch):
         stderr = "bad command"
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message: ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["mycli", "ask", message])
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError, match="cli agent exited 2"):
@@ -528,3 +618,30 @@ def test_openai_http_protocol_uses_session_headers(monkeypatch):
     assert captured["headers"]["X-Hermes-Session-Id"] == "sess_old"
     assert captured["headers"]["X-Hermes-Session-Key"] == "feedling:usr_abc"
     assert saved == ["sess_new"]
+
+
+def test_openai_http_protocol_sends_multimodal_image_block(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        headers = {}
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"choices": [{"message": {"content": "vision reply"}}]}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://127.0.0.1:8642/v1/chat/completions")
+    monkeypatch.setattr(crc, "AGENT_HTTP_PROTOCOL", "openai")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    image = {"data_url": "data:image/jpeg;base64,abcd", "data": "abcd", "mime_type": "image/jpeg"}
+
+    assert crc.call_agent_http("see image", images=[image]) == "vision reply"
+    content = captured["json"]["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "see image"}
+    assert content[1] == {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abcd"}}

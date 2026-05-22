@@ -37,18 +37,20 @@ whether MCP tools exist in some other surface.
 2. Fetches each message's plaintext from a configured **decrypt source**
    (the enclave's `/v1/chat/history` mirror, or — fallback — the MCP
    server's `feedling_chat_get_history` tool).
-3. Calls your agent backend with the plaintext message (HTTP POST or
-   CLI invocation, configurable).
+3. Calls your agent backend with the plaintext message and, for image
+   messages, the decrypted image context (HTTP POST or CLI invocation,
+   configurable).
 4. Wraps the reply text into a v1 envelope using
    `backend/content_encryption.py` (imported at runtime) and POSTs it
    back to `/v1/chat/response`.
 5. Maintains a checkpoint file so it never re-processes old messages
    after restart.
 
-For image messages (`content_type=image`), the daemon routes a
-configurable `IMAGE_PLACEHOLDER` to text-only backends. Vision-capable
-backends can opt to call `feedling_chat_get_history` themselves and
-read `image_b64` directly.
+For image messages (`content_type=image`), the daemon extracts `image_b64`
+from the decrypt source. OpenAI-compatible HTTP backends receive a
+multimodal `image_url` block, simple HTTP backends receive an `images`
+array, and CLI backends receive local image file paths in the message
+or in `{image_path}` / `{image_paths}` template slots.
 
 ### Quick start
 
@@ -136,7 +138,8 @@ AGENT_HTTP_FIELD=response                    # JSON field that contains the repl
 ```
 
 The daemon POSTs `{"message": "<user text>"}` and reads the named field
-from the JSON response.
+from the JSON response. For image messages it also includes
+`images: [{"mime_type", "data", "data_url"}]`.
 
 For Hermes' API server, use the OpenAI-compatible protocol instead of the
 simple JSON shape:
@@ -162,7 +165,10 @@ AGENT_CLI_CMD=mycli ask {message}
 ```
 
 `{message}` is substituted with the user's plaintext message. The
-command's stdout becomes the reply.
+command's stdout becomes the reply. For image messages, the consumer writes
+the decrypted image to `IMAGE_TEMP_DIR` and either appends the file path to
+`{message}` or fills explicit `{image_path}` / `{image_paths}` placeholders
+if your CLI supports image arguments.
 
 When running under `systemd`, do not assume your interactive shell `PATH`
 is available. Prefer an absolute executable path in `AGENT_CLI_CMD`; if that
@@ -215,16 +221,19 @@ onboarding should leave it disabled.
 ### Image messages
 
 Image messages are routed to the agent backend as the placeholder
-configured in `IMAGE_PLACEHOLDER`. Default:
+configured in `IMAGE_PLACEHOLDER` plus the decrypted image context. Default:
 
-> `[The user just sent you an image. Acknowledge it warmly in your normal voice and ask what they want to share about it. If you can read images, call feedling_chat_get_history to see it.]`
+> `[The user sent an image in IO Chat. Inspect the attached/local image before replying. If your current runtime cannot open the image, say plainly that this connector has not enabled image vision yet.]`
 
-Vision-capable agent backends can ignore the placeholder, call
-`GET {FEEDLING_API_URL}/v1/chat/history` themselves, and decode
-`image_b64` from the most recent message.
+OpenAI-compatible HTTP backends receive the image as a standard
+`image_url` block. Simple HTTP backends receive an `images` array. CLI
+backends receive a local image file path; use a template such as
+`AGENT_CLI_CMD='mycli ask --image "{image_path}" "{message}"'` if your
+agent CLI has a first-class image flag.
 
-Without this hint, images would be silently dropped (their `content`
-field is empty by design; the JPEG lives in `image_b64`).
+If the decrypt source cannot provide image bytes, the consumer logs the
+failure and routes only the honest placeholder; it should not pretend to
+have seen the image.
 
 ### Re-auth checklist
 
