@@ -31,7 +31,7 @@ HTTP mode:
 CLI mode:
   AGENT_CLI_CMD         Full command template; {message} is replaced with the
                         user's message text.
-                        Example (Hermes): hermes chat -Q --max-turns 1 -q "{message}"
+                        Example (Hermes): hermes chat -Q --source tool --max-turns 4 -q "{message}"
                         Example (plain):  mycli ask {message}
                         For Hermes, the consumer stores session_id and
                         auto-injects --resume on later turns.

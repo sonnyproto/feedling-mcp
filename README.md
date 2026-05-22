@@ -458,8 +458,9 @@ sudo cp deploy/feedling-chat-resident.service /etc/systemd/system/
 sudo systemctl enable --now feedling-chat-resident
 ```
 
-See `tools/README.md` for the full setup. For Hermes CLI, the consumer stores
-the first `session_id` and resumes it with `--resume`; it does not use
+See `tools/README.md` for the full setup. For Hermes CLI, use
+`hermes chat -Q --source tool --max-turns 4 -q "{message}"`; the consumer
+stores the first `session_id` and resumes it with `--resume`; it does not use
 `--continue`. For Hermes' API server, use the OpenAI-compatible
 `/v1/chat/completions` mode with Hermes session headers. Agent failures are
 logged by default rather than posted as fake fallback chat bubbles.

@@ -442,7 +442,7 @@ def test_prepare_hermes_cli_strips_continue_and_injects_resume(monkeypatch):
     monkeypatch.setattr(
         crc,
         "AGENT_CLI_CMD",
-        'hermes chat -Q --continue --max-turns 1 -q "{message}"',
+        'hermes chat -Q --continue --source tool --max-turns 4 -q "{message}"',
     )
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
@@ -458,7 +458,7 @@ def test_prepare_hermes_cli_first_turn_removes_continue(monkeypatch):
     monkeypatch.setattr(
         crc,
         "AGENT_CLI_CMD",
-        'hermes chat -Q --continue --max-turns 1 -q "{message}"',
+        'hermes chat -Q --continue --source tool --max-turns 4 -q "{message}"',
     )
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)

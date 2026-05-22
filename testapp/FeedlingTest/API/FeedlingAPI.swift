@@ -778,22 +778,6 @@ final class FeedlingAPI: ObservableObject {
         FEEDLING_API_KEY=\(key)
         FEEDLING_MCP_URL=\(mcpServerURL)
         FEEDLING_MCP_KEY=\(key)
-        # Agent entry is chosen by your runtime, not by the user.
-        # Hermes/OpenClaw CLI default:
-        AGENT_MODE=cli
-        AGENT_CLI_CMD=hermes chat -Q --max-turns 1 -q "{message}"
-        # The consumer stores the first session_id and resumes with --resume.
-        # Run this as an independent service (systemd --user / launchd / supervisor / pm2),
-        # not as a child job inside Hermes gateway or the current chat turn.
-        # If you expose a real resident HTTP endpoint:
-        #   AGENT_MODE=http
-        #   AGENT_HTTP_PROTOCOL=simple
-        #   AGENT_HTTP_URL=http://127.0.0.1:<port>/chat
-        # If you expose Hermes API server:
-        #   AGENT_MODE=http
-        #   AGENT_HTTP_PROTOCOL=openai
-        #   AGENT_HTTP_URL=http://127.0.0.1:8642/v1/chat/completions
-        SEND_FALLBACK_ON_AGENT_ERROR=false
         """
     }
 

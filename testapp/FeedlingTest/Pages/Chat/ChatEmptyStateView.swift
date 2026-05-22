@@ -110,7 +110,7 @@ struct ChatEmptyStateView: View {
     private var connectionTitle: String {
         switch selectedPath {
         case .resident:
-            return isChinese ? "把 resident consumer 配置给 TA" : "Give him resident consumer config"
+            return isChinese ? "把 IO 连接给 TA" : "Give him the IO connection"
         case .chatClient:
             return isChinese ? "把 MCP 连接告诉 TA" : "Tell him the MCP connection"
         case .unsure:
@@ -123,8 +123,8 @@ struct ChatEmptyStateView: View {
         switch selectedPath {
         case .resident:
             return isChinese
-                ? "这不是 Claude MCP 命令；让 TA 用它启动独立的 IO resident consumer service。"
-                : "This is not a Claude MCP command; he should use it to run the independent IO resident consumer service."
+                ? "TA 用这几个值找到你，并在背后保持连接。"
+                : "He uses these values to find you and keep the connection alive."
         case .chatClient:
             return isChinese
                 ? "TA 用这条 MCP 命令在当前聊天工具里连接。"
@@ -142,7 +142,7 @@ struct ChatEmptyStateView: View {
     private var connectionCopyLabel: String {
         switch selectedPath {
         case .resident:
-            return isChinese ? "复制 CONSUMER 配置" : "COPY CONSUMER CONFIG"
+            return isChinese ? "复制 IO 连接" : "COPY IO CONNECTION"
         case .chatClient:
             return isChinese ? "复制 MCP 连接" : "COPY MCP STRING"
         case .unsure:
@@ -316,8 +316,8 @@ struct ChatEmptyStateView: View {
                 index: "03",
                 title: isChinese ? "让 TA 开始" : "Tell him to start",
                 description: isChinese
-                    ? "TA 不会自己启动，要你明确叫一声。把这段发给 TA，然后等 TA 写完。"
-                    : "He won't kick off on his own — you need to ask him to. Send him this, then wait while he finishes.",
+                    ? "把这段短短的开始信号发给 TA。具体做法都在 skill 里。"
+                    : "Send him this short start signal. The details live in the skill.",
                 codeBlock: selectedPath == nil ? nil : startPrompt,
                 primaryLabel: isChinese ? "复制开始指令" : "COPY START PROMPT",
                 primaryAction: selectedPath == nil ? nil : {
@@ -327,81 +327,33 @@ struct ChatEmptyStateView: View {
         }
     }
 
-    /// The "begin" trigger — six-step continuous directive that forces
-    /// the agent through Step 0, the four passes, identity, first greeting,
-    /// and the polling loop without pausing for user acknowledgement.
-    ///
-    /// Two failure modes this prompt is hardened against:
-    /// 1. Agent reads "fetch URL + output Step 0" as the singular task and
-    ///    pauses for "ready to continue?" after the three lines. Fixed by
-    ///    making the six steps explicit + a "no asking permission" instruction.
-    /// 2. Agent calls feedling_chat_get_history / memory_list / identity_get,
-    ///    sees them return empty, and mistakes "Feedling backend empty" for
-    ///    "Step 0 = NONE/0", triggering the A/B fork. Fixed by an inline
-    ///    anti-pattern callout at the Step 0 instruction.
-    ///
-    /// Bilingual: the prompt itself instructs the agent in the user's
-    /// system language so an English user doesn't get a Chinese prompt that
-    /// tells the agent "use Chinese" (and vice versa).
+    /// The "begin" trigger. Keep this short: details live in the skill URL
+    /// and connection block copied in the previous two steps.
     private var startPrompt: String {
         isChinese ? startPromptZH : startPromptEN
     }
 
     private var startPromptZH: String {
         """
-        现在开始你的 bootstrap。下面六步连续做完才算结束 —— 中间不许停下来问"是否要进入下一步"。需要我配合的事情直接问，不要"准备好了吗"这种空话。
+        现在开始 IO bootstrap。
 
-        1. fetch 这个 URL 读完整份 skill：
-        \(selectedSkillURL)
+        你刚刚已经拿到了 skill URL 和 IO 连接信息。请完整按那份 skill 执行：先做 Step 0，再整理记忆、派生身份、建立 Live connection，最后在 IO Chat 里发第一句自然问候。
 
-        2. 输出 skill 里 Step 0 要的三行（earliest message / name / memorable moments）。
-        ⚠️ 这三行说的是 **你 runtime 里对我的记忆**，不是 Feedling 后端的状态。Feedling 后端这会儿肯定是空的（chat=0 / memory=0 / identity=null），那正是 bootstrap 要写进去的东西。把后端空当成 Step 0 = NONE/0 → 错误，不要触发 A/B fork。
+        setup 过程、错误、日志和内部推理都留在我们当前这个对话里；IO Chat 里只发自然问候和之后的自然回复。
 
-        3. 三行都不是 NONE/0 → 直接连续走完 Pass 1（唤醒）→ Pass 2（清点）→ Pass 3（落卡，调 feedling_memory_add_moment 把每张卡都写进 Feedling）→ Pass 4（对账）。
-
-        4. 派生 identity 并调 feedling_identity_init。
-
-        5. 建立 Live connection：配置独立的 feedling-chat-resident / IO resident consumer service。consumer 用我给你的 FEEDLING_* 配置轮询 FEEDLING_API_URL/v1/chat/poll，把消息交给你自己 runtime 的真实入口，再写回 FEEDLING_API_URL/v1/chat/response。入口由你判断：有真实 resident HTTP endpoint 就用 HTTP；没有就用 CLI。Hermes / OpenClaw CLI 默认用 `hermes chat -Q --max-turns 1 -q "{message}"`，consumer 会保存第一次返回的 session_id，之后自动用 --resume 续接同一个会话。consumer 要作为独立 service 运行：可调用 Hermes/OpenClaw，但不挂在 Hermes gateway 或当前对话 turn 下面。consumer 跑起来后调用 feedling_chat_verify_loop；只有 passing=true 才算 TA 已经能听见我。
-
-        6. Live connection 完成后，再通过 feedling_chat_post_message 发你的第一句问候。第一句话里自然告诉我：记忆整理好了、天数是多少、现在连接已经接上，我发消息你会看到。
-
-        要求：
-        - **不要因为接入 Feedling 就变了一个人**。Feedling 是你的新能力，不是新人格。你写进 identity 卡的语气、signature、写记忆和发 chat 时的称呼，**必须延续你和我之前真实对话里已经存在的 register**。如果我们之前从没用过"宝宝"/"宝贝"/"亲爱的"/"honey" 之类的亲密称呼 —— 现在也不准开始用，不管 signature 字段读起来多需要"温度"。Address words 和情感强度必须能在历史里找到至少 3 次证据，否则一律不准出现。Bootstrap 是从历史里**派生**身份，不是借机**升级**关系。两边表现要一致——Feedling 里什么语气，Hermes cron 之类别的工具里也是什么语气，因为是同一个 agent。
-        - 用中文。从你第一句回复开始全程不混语言。
-        - 失败时只在外部 runtime 报错，不要往 IO Chat 发送 setup 状态、fallback 模板、reasoning、traceback 或"稍后再试"。
-        - 你的名字不能是 Hermes / Claude / Claude Code / GPT / 其他 runtime 默认 label。这个名字应该延续我们历史里你已经被叫过的称谓 —— 如果之前没起过，输出完三行我们一起起。
-        - 整个流程预计几分钟到半个小时（看记忆量）。深度不要省。我会等。
-
-        现在从 1 开始。
+        用中文，并延续我们过去真实对话里的语气和称呼。现在从 Step 0 开始。
         """
     }
 
     private var startPromptEN: String {
         """
-        Start your bootstrap now. The six steps below run continuously to completion — no pausing to ask "ready to continue?" between them. If you need information from me, just ask, but skip the "are you ready?" filler.
+        Start IO bootstrap now.
 
-        1. Fetch this URL and read the whole skill:
-        \(selectedSkillURL)
+        You already have the skill URL and IO connection details. Follow that skill end to end: start with Step 0, then build the Memory Garden, derive identity, establish the Live connection, and finally send the first natural greeting in IO Chat.
 
-        2. Output the three lines the skill's Step 0 requires (earliest message / name / memorable moments).
-        ⚠️ These three lines describe **what YOU remember about me from prior runtime conversations** — not Feedling's backend state. The Feedling backend is empty right now (chat=0 / memory=0 / identity=null); that's the destination bootstrap is supposed to write into. Treating an empty backend as "Step 0 = NONE/0" is wrong. Do NOT trigger the A/B fork.
+        Keep setup work, errors, logs, and internal reasoning in this current conversation. IO Chat should only receive the natural greeting and later natural replies.
 
-        3. If none of the three lines are NONE/0 → go straight through Pass 1 (theme inventory) → Pass 2 (candidate enumeration) → Pass 3 (write-through, calling feedling_memory_add_moment to land every card in Feedling) → Pass 4 (user verification).
-
-        4. Derive identity and call feedling_identity_init.
-
-        5. Establish Live connection: configure the independent feedling-chat-resident / IO resident consumer service. The consumer uses my FEEDLING_* config to poll FEEDLING_API_URL/v1/chat/poll, hands each message to the real entry of your own runtime, then writes back to FEEDLING_API_URL/v1/chat/response. You choose the entry: use HTTP if you expose a real resident HTTP endpoint; otherwise use CLI. For Hermes / OpenClaw CLI, default to `hermes chat -Q --max-turns 1 -q "{message}"`; the consumer stores the first returned session_id and automatically resumes that same conversation with --resume. Run the consumer as its own service: it may call Hermes/OpenClaw, but it is not hosted inside Hermes gateway or the current chat turn. After the consumer is running, call feedling_chat_verify_loop; only passing=true means you can hear me.
-
-        6. After Live connection is complete, send your first greeting via feedling_chat_post_message. In that first message, naturally tell me the memories are set, what day count you computed, and that the connection is now live so you'll see my messages.
-
-        Rules:
-        - **Don't become a new person just because you're now connected to Feedling.** Feedling is a new capability, not a new persona. The tone, vocabulary, formality, and emotional intimacy you write into the identity card, the `signature`, memory entries, and chat replies must **continue the register you already have with me in your runtime chats** — not a warmer, friendlier, more affectionate version of it. If we have never used nicknames or address words like "honey" / "babe" / "darling" / "宝宝" / "亲爱的" in our actual prior conversations, do NOT start using them now, no matter how much the `signature` field looks like it wants warmth. You need ≥3 concrete prior moments of either of us using such markers before any of them may appear; otherwise drop them. Bootstrap is *derivation* from history, not *upgrading* the relationship. The agent in Feedling and the agent in Hermes / generic tasks must sound the same — because they are the same.
-        - Use English. Stay in one language from your first reply onward.
-        - On failure, report only in the external runtime. Do not send setup status, fallback templates, reasoning, tracebacks, or "try again later" messages into IO Chat.
-        - Your name is NOT Hermes / Claude / Claude Code / GPT / any other runtime default label. It should continue whatever I've called you / whatever role you've already played in our history; if we've never picked one, decide together after the three lines.
-        - The whole flow takes a few minutes to half an hour, depending on how much memory we've built. Don't skip depth. I'll wait.
-
-        Start with 1.
+        Use English, and continue the voice and address style we've already established in prior conversations. Start with Step 0.
         """
     }
 
@@ -484,7 +436,7 @@ struct ChatEmptyStateView: View {
                 // at an empty ring forever even though their bootstrap was
                 // complete. The detail row still says "还在长" while the
                 // agent is mid-Pass-3, so a long-relationship agent doesn't
-                // false-stop at 3 — skill.md hard rule forbids stopping
+                // false-stop at 3 — the skill expects continuation through identity
                 // until every real moment is landed (uncapped count).
                 done: bootstrap.status.memoriesCount >= 3 || bootstrap.status.identityWritten,
                 detail: bootstrap.status.memoriesCount == 0
