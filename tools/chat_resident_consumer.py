@@ -678,16 +678,22 @@ def _should_attach_screen_context(content: str) -> bool:
 
 
 def _fetch_screen_json(path: str) -> dict | None:
-    try:
-        resp = httpx.get(f"{FEEDLING_API_URL}{path}", headers=_HEADERS, timeout=20)
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        body = resp.json()
-        return body if isinstance(body, dict) else None
-    except Exception as e:
-        log.warning("screen context fetch failed path=%s error=%s", path, e)
-        return None
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = httpx.get(f"{FEEDLING_API_URL}{path}", headers=_HEADERS, timeout=20)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            body = resp.json()
+            return body if isinstance(body, dict) else None
+        except Exception as e:
+            last_error = e
+            if attempt < 2:
+                time.sleep(0.25 * (attempt + 1))
+                continue
+    log.warning("screen context fetch failed path=%s error=%s", path, last_error)
+    return None
 
 
 def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]], list[str]]:
