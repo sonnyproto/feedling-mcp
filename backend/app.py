@@ -105,7 +105,8 @@ def _resolve_user(api_key: str) -> str | None:
 _USER_ID_RE = re.compile(r"^usr_[a-f0-9]{16}$")
 
 
-def _register_user(public_key: str | None = None) -> dict:
+def _register_user(public_key: str | None = None,
+                   archive_language: str | None = None) -> dict:
     user_id = f"usr_{secrets.token_hex(8)}"
     api_key = secrets.token_hex(32)
     entry = {
@@ -114,12 +115,33 @@ def _register_user(public_key: str | None = None) -> dict:
         "public_key": (public_key or "").strip(),
         "created_at": datetime.now().isoformat(),
     }
+    # archive_language: the BCP-47-ish locale code the iOS app picked up
+    # from Locale.preferredLanguages on the registering device (e.g. "en",
+    # "zh-Hans", "ja"). Drives the second defense layer against agent
+    # archive-language drift — see /v1/users/preferences for migration
+    # path and the skill's "Lock the Memory Garden language" rule for
+    # how the agent consumes it.
+    if archive_language:
+        entry["archive_language"] = archive_language.strip()
     with _users_lock:
         _users.append(entry)
         _save_users()
         _key_to_user[entry["api_key_hash"]] = user_id
-    print(f"[users] registered {user_id}")
+    print(f"[users] registered {user_id} archive_language={entry.get('archive_language', 'unset')}")
     return {"user_id": user_id, "api_key": api_key}
+
+
+def _get_user_archive_language(user_id: str) -> str | None:
+    """Return the user's stored archive_language, or None if unset.
+    Caller is the source of truth for fallback behavior; this is a thin
+    read helper used by /v1/bootstrap, /v1/memory/verify, /v1/users/whoami.
+    """
+    with _users_lock:
+        for u in _users:
+            if u.get("user_id") == user_id:
+                val = u.get("archive_language")
+                return val if val else None
+    return None
 
 
 _load_users()
@@ -1089,7 +1111,11 @@ def _load_bootstrap_events(store: UserStore) -> list[dict]:
 def users_register():
     payload = request.get_json(silent=True) or {}
     public_key = (payload.get("public_key") or "").strip()
-    result = _register_user(public_key=public_key or None)
+    archive_language = (payload.get("archive_language") or "").strip()
+    result = _register_user(
+        public_key=public_key or None,
+        archive_language=archive_language or None,
+    )
     return jsonify(result), 201
 
 
@@ -1098,13 +1124,15 @@ def users_whoami():
     """Identify the caller and return the public material needed to wrap
     content for them.
 
-    Returns two fields so v1-envelope writers (MCP tools, iOS, etc.) can
-    seal new items without a second round trip:
+    Returns:
       - `public_key` — the caller's own X25519 content pubkey (base64),
         from the user record.
       - `enclave_content_public_key_hex` — the live enclave's content
         pubkey, fetched from /attestation and cached for 60s. Missing
         when no enclave is reachable.
+      - `archive_language` — the locale code the iOS app supplied at
+        registration (e.g. "en", "zh-Hans"). Null for legacy accounts;
+        callers fall back to inferring from existing card content.
     """
     store = require_user()
     resp: dict = {"user_id": store.user_id}
@@ -1115,7 +1143,57 @@ def users_whoami():
     if info:
         resp["enclave_content_public_key_hex"] = info["content_pk_hex"]
         resp["enclave_compose_hash"] = info["compose_hash"]
+    archive_language = _get_user_archive_language(store.user_id)
+    if archive_language:
+        resp["archive_language"] = archive_language
     return jsonify(resp)
+
+
+@app.route("/v1/users/preferences", methods=["POST"])
+def users_set_preferences():
+    """Update mutable preferences on the authenticated user's record.
+
+    Currently the only supported preference is `archive_language` — the
+    locale code that the agent should use as the source of truth for
+    Memory Garden / Identity Card language. iOS posts this on first
+    launch for legacy accounts that registered before the field existed,
+    and again whenever the user explicitly changes their iOS system
+    language and re-launches the app.
+
+    Body: {"archive_language": "<bcp-47 string>" | null}
+    Pass null to clear (agent falls back to inferred behavior).
+    """
+    store = require_user()
+    payload = request.get_json(silent=True) or {}
+    if "archive_language" not in payload:
+        return jsonify({
+            "error": "archive_language required (string or null)",
+        }), 400
+    raw = payload.get("archive_language")
+    if raw is not None and not isinstance(raw, str):
+        return jsonify({"error": "archive_language must be a string or null"}), 400
+    new_value = (raw or "").strip() if isinstance(raw, str) else ""
+
+    updated = False
+    with _users_lock:
+        for u in _users:
+            if u.get("user_id") == store.user_id:
+                if new_value:
+                    u["archive_language"] = new_value
+                else:
+                    u.pop("archive_language", None)
+                updated = True
+                break
+        if updated:
+            _save_users()
+
+    if not updated:
+        return jsonify({"error": "user not found"}), 404
+    print(f"[users] {store.user_id} archive_language → {new_value or 'cleared'}")
+    return jsonify({
+        "status": "updated",
+        "archive_language": new_value or None,
+    })
 
 
 @app.route("/v1/users/public-key", methods=["POST"])
@@ -2964,7 +3042,15 @@ def bootstrap():
 
     _log_bootstrap_event(store, "bootstrap_started", success=True)
     print(f"[bootstrap:{store.user_id}] first_time — instructions returned")
-    return jsonify({"status": "first_time", "instructions": instructions})
+    resp = {"status": "first_time", "instructions": instructions}
+    archive_language = _get_user_archive_language(store.user_id)
+    if archive_language:
+        # Defense layer 2: surface the user's iOS-system locale as the
+        # source of truth for archive language so the agent doesn't have
+        # to infer from chat drift. Skill consumes this from here AND
+        # /v1/memory/verify.
+        resp["archive_language"] = archive_language
+    return jsonify(resp)
 
 
 @app.route("/v1/bootstrap/status", methods=["GET"])
@@ -3249,7 +3335,7 @@ def memory_verify():
     passing = (not below_floor["story"]) and (not below_floor["about_me"]) and not issues
     passing_full = passing and (not below_floor["ta_thinking"])
 
-    return jsonify({
+    resp = {
         "counts": counts,
         "floors": floors,
         "below_floor": below_floor,
@@ -3262,7 +3348,15 @@ def memory_verify():
         # read these. The per-tab fields above are the new source of truth.
         "count": counts["total"],
         "floor": floors["total"],
-    })
+    }
+    archive_language = _get_user_archive_language(store.user_id)
+    if archive_language:
+        # Defense layer 2: agent reads this every time it verifies and
+        # treats it as authoritative — overrides anything it might
+        # otherwise infer from recent chat language drift. Skill rule
+        # "Lock the Memory Garden language" consumes this field.
+        resp["archive_language"] = archive_language
+    return jsonify(resp)
 
 
 @app.route("/v1/identity/verify", methods=["GET"])

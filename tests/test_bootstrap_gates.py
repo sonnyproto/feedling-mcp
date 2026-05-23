@@ -826,3 +826,116 @@ def test_running_capture_supported_after_main_loop(backend):
         # use "chat" / "live_conversation" to mark provenance.
     )
     assert captured["moment"]["type"] == "fact"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: archive_language defense (Memory Garden language lock layer 2)
+#
+# Beyond the skill-level "don't switch language" rule, the server now
+# stores the user's iOS-system locale at registration and surfaces it
+# on /v1/users/whoami, /v1/bootstrap, /v1/memory/verify so the agent
+# has an authoritative signal instead of inferring from chat drift.
+# ---------------------------------------------------------------------------
+
+def _register_with_lang(base_url: str, archive_language: str | None) -> tuple[str, str]:
+    payload: dict = {}
+    if archive_language is not None:
+        payload["archive_language"] = archive_language
+    r = requests.post(f"{base_url}/v1/users/register", json=payload, timeout=TIMEOUT)
+    assert r.status_code == 201, r.text
+    body = r.json()
+    return body["user_id"], body["api_key"]
+
+
+def test_register_with_archive_language_persists_on_whoami(backend):
+    user_id, api_key = _register_with_lang(backend["base_url"], "en")
+    r = requests.get(
+        f"{backend['base_url']}/v1/users/whoami",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert r.json().get("archive_language") == "en"
+
+
+def test_register_without_archive_language_returns_no_field(backend):
+    user_id, api_key = _register_with_lang(backend["base_url"], None)
+    r = requests.get(
+        f"{backend['base_url']}/v1/users/whoami",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    body = r.json()
+    # Field is omitted entirely (not null) when unset — easier for clients
+    # using strict decoders.
+    assert "archive_language" not in body or body["archive_language"] is None
+
+
+def test_preferences_update_archive_language(backend):
+    """Legacy backfill path: account registered without the field, iOS
+    posts the locale on next launch."""
+    user_id, api_key = _register_with_lang(backend["base_url"], None)
+    r = requests.post(
+        f"{backend['base_url']}/v1/users/preferences",
+        json={"archive_language": "zh-Hans"},
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["archive_language"] == "zh-Hans"
+    # Confirm persistence via whoami round-trip.
+    r = requests.get(
+        f"{backend['base_url']}/v1/users/whoami",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert r.json()["archive_language"] == "zh-Hans"
+
+
+def test_preferences_clear_archive_language(backend):
+    user_id, api_key = _register_with_lang(backend["base_url"], "ja")
+    r = requests.post(
+        f"{backend['base_url']}/v1/users/preferences",
+        json={"archive_language": None},
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200
+    assert r.json()["archive_language"] is None
+    r = requests.get(
+        f"{backend['base_url']}/v1/users/whoami",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert "archive_language" not in r.json() or r.json()["archive_language"] is None
+
+
+def test_preferences_rejects_missing_field(backend):
+    user_id, api_key = _register_with_lang(backend["base_url"], "en")
+    r = requests.post(
+        f"{backend['base_url']}/v1/users/preferences",
+        json={},  # missing archive_language key entirely
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 400
+
+
+def test_bootstrap_response_surfaces_archive_language(backend):
+    user_id, api_key = _register_with_lang(backend["base_url"], "zh-Hant-TW")
+    r = requests.post(
+        f"{backend['base_url']}/v1/bootstrap",
+        json={}, headers={"X-API-Key": api_key}, timeout=TIMEOUT,
+    )
+    assert r.status_code == 200
+    assert r.json().get("archive_language") == "zh-Hant-TW"
+
+
+def test_memory_verify_surfaces_archive_language(backend):
+    user_id, api_key = _register_with_lang(backend["base_url"], "en")
+    r = requests.get(
+        f"{backend['base_url']}/v1/memory/verify",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200
+    assert r.json().get("archive_language") == "en"
