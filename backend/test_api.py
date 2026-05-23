@@ -160,7 +160,11 @@ def _seed_bootstrap_state():
     if not USER_ID:
         return
     occurred_at = time.strftime("%Y-%m-%dT%H:%M:%S")
-    for i in range(3):
+    # Post-2026-05-22 typed-memory model: bootstrap gate is per-tab.
+    # Seed 1 moment (Story) + 2 facts (About me) at today to pass the
+    # <2-days floor (story=1, about_me=1).
+    seed_types = ["moment", "fact", "fact"]
+    for i, mem_type in enumerate(seed_types):
         env = {
             "v": 1,
             "body_ct": base64.b64encode(uuid.uuid4().bytes * 4).decode(),
@@ -170,6 +174,7 @@ def _seed_bootstrap_state():
             "visibility": "shared",
             "owner_user_id": USER_ID,
             "occurred_at": occurred_at,
+            "type": mem_type,
         }
         _orig_post(f"{BASE_URL}/v1/memory/add",
                    json={"envelope": env}, headers=AUTH_HEADERS, timeout=5)
@@ -503,6 +508,7 @@ env_mem = make_envelope(
     id=mem_id,
     occurred_at="2025-01-01T12:00:00",
     source="bootstrap",
+    type="moment",  # mandatory plaintext metadata post-2026-05-22
 )
 r = requests.post(f"{BASE_URL}/v1/memory/add", json={"envelope": env_mem}, timeout=5)
 check("POST v1 envelope /v1/memory/add → 201", r.status_code == 201,

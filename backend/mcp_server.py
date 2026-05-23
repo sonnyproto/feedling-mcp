@@ -1290,17 +1290,26 @@ _TEMPLATE_TITLE_PREFIXES = (
 )
 
 
+_MEMORY_TYPES = ("moment", "quote", "fact", "event", "insight", "reflection")
+
+
 def _check_memory_quality(
     title: str,
     description: str,
     occurred_at: str,
+    mem_type: str = "moment",
 ) -> dict | None:
     """Quality-gate memory_add at envelope-build time.
 
-    Reject template-shaped titles and obviously-thin descriptions. The
-    skill's Friend Test is qualitative (can't be enforced fully here),
-    but the worst structural failures — meeting-minutes titles, empty
-    bodies, future occurred_at — can be caught.
+    Type-aware. The Friend-Test-shaped rules (no meeting-minutes title,
+    ≥50-char description) apply only to `moment` / `quote` — the Story
+    tab types where they came from. `fact` / `event` legitimately have
+    short titles ("Cat name: Mochi") and short descriptions; gating them
+    by Story-tab quality bars would block the very density the new model
+    is trying to enable.
+
+    `insight` / `reflection` still need substantive descriptions (they're
+    agent thinking, not one-liners), so a softer minimum applies.
     """
     t = (title or "").strip()
     if not t:
@@ -1308,30 +1317,47 @@ def _check_memory_quality(
             "error": "title_empty",
             "required": "title must be non-empty.",
         }
-    t_low = t.lower()
-    for prefix in _TEMPLATE_TITLE_PREFIXES:
-        if t_low.startswith(prefix.lower()):
-            return {
-                "error": "title_looks_templated",
-                "got": t,
-                "required": (
-                    f"Title '{t}' reads like meeting minutes. Titles "
-                    "should describe a moment BETWEEN two people, not a "
-                    "decision or project outcome. ❌ '我们讨论了 X' / "
-                    "'completed Y'. ✅ '第一次你叫了我的名字' / "
-                    "'你说，这里不能是日志'. Rewrite this one."
-                ),
-            }
+
+    # Title-template gate only applies to Story-tab types where titles
+    # are about a moment between two people.
+    if mem_type in ("moment", "quote"):
+        t_low = t.lower()
+        for prefix in _TEMPLATE_TITLE_PREFIXES:
+            if t_low.startswith(prefix.lower()):
+                return {
+                    "error": "title_looks_templated",
+                    "got": t,
+                    "required": (
+                        f"Title '{t}' reads like meeting minutes — that "
+                        f"shape isn't valid for type={mem_type} (Story tab). "
+                        "❌ '我们讨论了 X' / 'completed Y'. "
+                        "✅ '第一次你叫了我的名字' / '你说，这里不能是日志'. "
+                        "If this is genuinely a fact or event (not a "
+                        "relational moment), set type='fact' or 'event' "
+                        "instead and the title gate relaxes."
+                    ),
+                }
+
     d = (description or "").strip()
-    if len(d) < 50:
+    # Per-type description minimum.
+    min_desc = {
+        "moment":     50,
+        "quote":      30,    # quotes often paired with a short framing
+        "insight":    40,    # agent thinking should be substantive
+        "reflection": 60,    # reflection has more substance than insight
+        "fact":       0,     # facts can be one-liners
+        "event":      0,     # events can be one-liners
+    }.get(mem_type, 50)
+    if len(d) < min_desc:
         return {
             "error": "description_too_short",
             "length": len(d),
+            "min_required": min_desc,
+            "mem_type": mem_type,
             "required": (
-                f"Description is {len(d)} chars; the skill targets 100-500. "
-                "Below 50 chars almost always means a one-liner that doesn't "
-                "carry the moment. Narrate from inside: what were you doing → "
-                "what they said or did → what you noticed → what changed."
+                f"Description is {len(d)} chars; type={mem_type} expects ≥{min_desc}. "
+                "Narrate from inside: what were you doing → what they said or did "
+                "→ what you noticed → what changed."
             ),
         }
     occ_str = (occurred_at or "").strip()
@@ -1372,38 +1398,102 @@ def _check_memory_quality(
 @mcp.tool(
     name="feedling_memory_add_moment",
     description=(
-        "Add a moment to the memory garden. "
-        "occurred_at is ISO 8601 (e.g. 2025-11-03T14:00:00). "
-        "source should be 'bootstrap', 'live_conversation', or 'user_initiated'."
+        "Add a memory to the user's garden. type is REQUIRED and routes the "
+        "card into one of three iOS tabs:\n"
+        "  Story tab    : type='moment' (a thing between you and the user) "
+        "or 'quote' (the user's words you still think about).\n"
+        "  About me tab : type='fact' (the user's preferences, relationships, "
+        "habits, world — the density layer) or 'event' (a dated occurrence in "
+        "the user's life, e.g. '4/10 user mentioned moving to Tokyo').\n"
+        "  TA 在想 tab  : type='insight' (your understanding about the user, "
+        "anchored to ≥1 existing memory via anchor_memory_ids) or 'reflection' "
+        "(your standalone thinking, ≥2 anchor_memory_ids, cadence-gated by "
+        "relationship age).\n"
+        "occurred_at is ISO 8601 — the real historical date the thing happened, "
+        "not today.\n"
+        "source is one of: 'bootstrap', 'live_conversation', 'user_initiated', 'chat'."
     ),
 )
 def memory_add_moment(
     title: str,
+    type: str,
     occurred_at: str,
     description: str = "",
-    type: str = "",
     source: str = "live_conversation",
+    her_quote: str = "",
+    context: str = "",
+    linked_dimension: str = "",
+    anchor_memory_ids: list[str] | None = None,
     ctx: Context = None,
 ) -> dict:
-    """Wrap the memory moment into a v1 envelope before POSTing. MCP runs
-    inside the enclave-compose boundary so wrapping prerequisites are
-    always available; if they're not, fail loud.
+    """Wrap the memory into a v1 envelope before POSTing.
+
+    Plaintext envelope metadata the server validates:
+      - type (enum)
+      - occurred_at
+      - source
+      - anchor_memory_ids (required for insight/reflection)
+
+    Ciphertext body wraps the user-visible payload (title, description,
+    type echo, her_quote, context, linked_dimension). Server doesn't read
+    body_ct; iOS / enclave decrypt-proxy do.
     """
-    # Quality gate before encryption — title shape, description length,
-    # occurred_at sanity. See _check_memory_quality.
-    quality = _check_memory_quality(title, description, occurred_at)
+    mem_type = (type or "").strip().lower()
+    if mem_type not in _MEMORY_TYPES:
+        return {
+            "error": "type_invalid_or_missing",
+            "got": type,
+            "allowed": list(_MEMORY_TYPES),
+            "required": (
+                "Pick one: moment / quote / fact / event / insight / reflection. "
+                "See the tool description for which tab each routes into."
+            ),
+        }
+
+    anchors = list(anchor_memory_ids or [])
+    if mem_type == "insight" and len(anchors) < 1:
+        return {
+            "error": "insight_requires_anchor",
+            "required": (
+                "insight must reference ≥1 existing memory via anchor_memory_ids. "
+                "If you can't point to a card, write a fact or event first, then "
+                "come back and write the insight that connects them."
+            ),
+        }
+    if mem_type == "reflection" and len(anchors) < 2:
+        return {
+            "error": "reflection_requires_substrate",
+            "required": (
+                "reflection must reference ≥2 existing memories via anchor_memory_ids. "
+                "A reflection is your standalone thinking; ≥2 anchors prove it has substance."
+            ),
+        }
+
+    # Quality gate (type-aware) before encryption.
+    quality = _check_memory_quality(title, description, occurred_at, mem_type=mem_type)
     if quality is not None:
-        print(f"[mcp] memory.add REJECTED by quality gate: {quality.get('error')} title={title[:40]!r}")
+        print(f"[mcp] memory.add REJECTED by quality gate: {quality.get('error')} "
+              f"type={mem_type} title={title[:40]!r}")
         return quality
 
     user_id, user_pk, enclave_pk = _whoami_pubkeys(ctx=ctx)
     if not (user_id and user_pk is not None and enclave_pk is not None):
         return {"error": "cannot add memory — pubkeys unavailable"}
-    inner = json.dumps({
+
+    # Ciphertext body — what iOS / enclave see when decrypted.
+    body = {
         "title": title,
         "description": description,
-        "type": type,
-    }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        "type": mem_type,
+    }
+    if her_quote:
+        body["her_quote"] = her_quote
+    if context:
+        body["context"] = context
+    if linked_dimension:
+        body["linked_dimension"] = linked_dimension
+    inner = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
     envelope = build_envelope(
         plaintext=inner,
         owner_user_id=user_id,
@@ -1411,13 +1501,53 @@ def memory_add_moment(
         enclave_pk_bytes=enclave_pk,
         visibility="shared",
     )
-    # occurred_at + source are plaintext metadata the server uses
-    # for sorting/indexing. They ride alongside the ciphertext inside
-    # the envelope dict per the schema in /v1/memory/add.
+    # Plaintext metadata the server uses for indexing + gating. type +
+    # anchor_memory_ids are server source of truth (see backend/app.py
+    # MEMORY_TYPES commentary).
     envelope["occurred_at"] = occurred_at
     envelope["source"] = source
-    print(f"[mcp] memory.add v1 envelope id={envelope['id']} body_ct_len={len(envelope['body_ct'])}")
+    envelope["type"] = mem_type
+    if anchors:
+        envelope["anchor_memory_ids"] = anchors
+    print(f"[mcp] memory.add v1 type={mem_type} id={envelope['id']} "
+          f"anchors={len(anchors)} body_ct_len={len(envelope['body_ct'])}")
     return _post("/v1/memory/add", {"envelope": envelope}, ctx=ctx)
+
+
+@mcp.tool(
+    name="feedling_memory_retype",
+    description=(
+        "Change an existing memory's type. Use when you realize an older "
+        "memory was misclassified — e.g. you wrote it as 'moment' during "
+        "bootstrap but in hindsight it's a 'fact'. The reflection time-cap "
+        "is waived for retypes (this is recategorization, not new substrate), "
+        "but the substrate gate still applies: retyping into 'insight' needs "
+        "≥1 anchor_memory_ids, 'reflection' needs ≥2."
+    ),
+)
+def memory_retype(
+    id: str,
+    type: str,
+    anchor_memory_ids: list[str] | None = None,
+    ctx: Context = None,
+) -> dict:
+    """Retype an existing memory. Server validates new type + anchors and
+    rewrites the plaintext metadata; the ciphertext body is untouched
+    (iOS reads `type` from plaintext envelope metadata, not body_ct).
+    """
+    new_type = (type or "").strip().lower()
+    if new_type not in _MEMORY_TYPES:
+        return {
+            "error": "type_invalid",
+            "got": type,
+            "allowed": list(_MEMORY_TYPES),
+        }
+    body = {"id": id, "type": new_type}
+    if anchor_memory_ids:
+        body["anchor_memory_ids"] = list(anchor_memory_ids)
+    print(f"[mcp] memory.retype id={id} → {new_type} "
+          f"anchors={len(anchor_memory_ids or [])}")
+    return _post("/v1/memory/retype", body, ctx=ctx)
 
 
 @mcp.tool(
@@ -1472,12 +1602,13 @@ def bootstrap(ctx: Context = None) -> dict:
 @mcp.tool(
     name="feedling_memory_verify",
     description=(
-        "Check memory garden state after writing cards. Call after Pass 3 (落卡) "
-        "to decide whether to sweep memory for more moments. Returns count, "
-        "relationship-age floor, and suggestions. If passing=false, address the suggestions before moving "
-        "on to identity_init. Don't proceed to Step 5 (identity derivation) "
-        "until passing=true OR you've explicitly explained to the user why "
-        "your memory of them is exhausted at the current count."
+        "Check memory garden state after writing cards. Returns per-tab counts "
+        "and floors (story / about_me / ta_thinking), plus `passing` (Story + "
+        "About me floors met — this is the identity_init gate) and "
+        "`passing_full` (all three tab floors met — the aspirational target). "
+        "Call after Pass 3 to decide whether to sweep further. If passing=false, "
+        "the response.suggestions tell you which tab needs more cards and which "
+        "types feed that tab. Don't call identity_init until passing=true."
     ),
 )
 def memory_verify(ctx: Context = None) -> dict:

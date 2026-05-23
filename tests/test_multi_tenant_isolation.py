@@ -61,6 +61,7 @@ import sys
 import tempfile
 import time
 import uuid
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -198,12 +199,20 @@ def _user_flow(base_url: str, slot_idx: int) -> dict:
     user_id, api_key = _register(base_url)
     H = {"X-API-Key": api_key}
 
-    # --- 5 memories FIRST (bootstrap gate requires ≥3 before identity_init) ---
+    # --- memories FIRST (bootstrap gate requires per-tab floors satisfied) ---
+    # occurred_at=today → relationship_age=0 → tier <2 days → story=1, about_me=1
+    # floor. Write 1 moment (Story) + 4 facts (About me) so we have 5 cards
+    # total (preserves the multi-tenant isolation surface) while passing the
+    # per-tab gate. type is now mandatory plaintext metadata on every write
+    # (post-2026-05-22 typed-memory rewrite).
     memory_markers = []
-    for i in range(5):
+    today_iso = datetime.now().isoformat()
+    seed_types = ["moment", "fact", "fact", "fact", "fact"]
+    for i, mem_type in enumerate(seed_types):
         m_marker = f"memory-{slot_idx}-{i}"
         m_env = _stub_envelope(user_id, m_marker)
-        m_env["occurred_at"] = "2026-05-01T00:00:00"
+        m_env["occurred_at"] = today_iso
+        m_env["type"] = mem_type
         r = requests.post(
             f"{base_url}/v1/memory/add",
             json={"envelope": m_env},
@@ -443,13 +452,14 @@ def test_envelope_owner_user_id_mismatch_rejected(backend):
 
     # Seed A's memories so identity_init reaches the owner check, not the
     # bootstrap gate. occurred_at = today puts the user in the <2-days
-    # tier (floor=1) so 3 cards is plenty to pass the gate; the test then
-    # exercises the owner_user_id mismatch path.
-    from datetime import datetime as _dt
-    today_iso = _dt.now().isoformat()
-    for i in range(3):
+    # tier (Story=1 / About me=1 floor); seed 1 moment + 2 facts. type is
+    # now mandatory plaintext metadata.
+    today_iso = datetime.now().isoformat()
+    seed_types = ["moment", "fact", "fact"]
+    for i, mem_type in enumerate(seed_types):
         m_env = _stub_envelope(a_uid, f"a-mem-{i}")
         m_env["occurred_at"] = today_iso
+        m_env["type"] = mem_type
         r = requests.post(
             f"{base_url}/v1/memory/add",
             json={"envelope": m_env},
@@ -488,9 +498,12 @@ def test_envelope_owner_user_id_mismatch_rejected(backend):
         f"identity_replace accepted mismatched owner_user_id (regression): {r.status_code} {r.text}"
     )
 
-    # memory_add with B's owner_user_id → 403 (this one already existed)
+    # memory_add with B's owner_user_id → 403 (this one already existed).
+    # Set type so the request gets past the type-required check and reaches
+    # the owner-mismatch check (which is the one this test is exercising).
     bad_env = _stub_envelope(b_uid, "bad-memory")
     bad_env["occurred_at"] = "2026-05-01T00:00:00"
+    bad_env["type"] = "fact"
     r = requests.post(
         f"{base_url}/v1/memory/add",
         json={"envelope": bad_env},

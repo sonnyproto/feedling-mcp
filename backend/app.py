@@ -2125,29 +2125,72 @@ def _bootstrap_state(store) -> dict:
     on every write path. Source of truth: on-disk identity + memory files.
 
     Returns:
-        {"memory_count": int, "memory_floor": int, "identity_written": bool, "stage": str}
-        stage ∈ {"needs_memory", "needs_identity", "main_loop"}
+        {
+          memory_count: int,                # total across tabs
+          memory_floor: int,                # total floor (back-compat)
+          counts: {story, about_me, ta_thinking, total},
+          floors: {story, about_me, ta_thinking, total},
+          identity_written: bool,
+          stage: str ∈ {"needs_memory", "needs_identity", "main_loop"},
+          missing_tabs: [tab_name, ...]     # Which tab floors are unmet
+        }
 
-    `memory_floor` is computed from `_relationship_age_days(store)` — see
-    `_memory_floor_for_days` for the tiers. <2 days needs only 1 card
-    (we-just-met case); ≥6 months needs 30.
+    Gate semantics (post-typed-memory rewrite):
+      - "needs_memory" means Story floor OR About me floor not yet met.
+        TA 在想 (insight/reflection) is encouraged but not blocking —
+        reflections need substrate from the other two tabs first, so
+        gating on it would create a deadlock at low-density tiers.
     """
     moments = _load_moments(store)
-    memory_count = len(moments) if isinstance(moments, list) else 0
+    counts = _count_by_tab(moments)
     identity_written = _load_identity(store) is not None
-    memory_floor = _memory_floor_for_days(_relationship_age_days(store))
-    if memory_count < memory_floor:
+    floors = _per_tab_floors_for_days(_relationship_age_days(store))
+
+    missing_tabs = []
+    if counts["story"] < floors["story"]:
+        missing_tabs.append("story")
+    if counts["about_me"] < floors["about_me"]:
+        missing_tabs.append("about_me")
+
+    if missing_tabs:
         stage = "needs_memory"
     elif not identity_written:
         stage = "needs_identity"
     else:
         stage = "main_loop"
+
     return {
-        "memory_count": memory_count,
-        "memory_floor": memory_floor,
+        "memory_count": counts["total"],
+        "memory_floor": floors["total"],
+        "counts": counts,
+        "floors": floors,
         "identity_written": identity_written,
         "stage": stage,
+        "missing_tabs": missing_tabs,
     }
+
+
+def _gate_required_for_missing_tabs(state) -> str:
+    """Human-readable instruction string for the missing tabs in `state`."""
+    c = state["counts"]
+    f = state["floors"]
+    parts = []
+    if "story" in state["missing_tabs"]:
+        parts.append(
+            f"Story tab {c['story']}/{f['story']} — write more moment/quote memories"
+        )
+    if "about_me" in state["missing_tabs"]:
+        parts.append(
+            f"About me tab {c['about_me']}/{f['about_me']} — write more fact/event memories "
+            f"(this is the density layer — preferences, relationships, dates, habits)"
+        )
+    return (
+        "Per-tab memory floors are below threshold: "
+        + "; ".join(parts)
+        + ". Use feedling_memory_add_moment(type=...) for each. Then call "
+        "feedling_identity_init. Do not fabricate Pass 4 summaries — the cards "
+        "must actually exist."
+    )
 
 
 def _gate_bootstrap_for_chat(store):
@@ -2162,25 +2205,22 @@ def _gate_bootstrap_for_chat(store):
     if state["stage"] == "main_loop":
         return None
     if state["stage"] == "needs_memory":
-        required = (
-            f"Write at least {state['memory_floor']} memory cards via "
-            f"feedling_memory_add_moment (currently {state['memory_count']}; "
-            f"floor for this relationship age), then call "
-            "feedling_identity_init, BEFORE you can post chat. "
-            "Do not fabricate Pass 4 summaries — the cards must actually exist."
-        )
+        required = _gate_required_for_missing_tabs(state)
     else:  # needs_identity
         required = (
             "Call feedling_identity_init with the derived identity card "
             "(7 dimensions + days_with_user) BEFORE you can post chat."
         )
     print(f"[gate:{store.user_id}] chat_response blocked stage={state['stage']} "
-          f"mem={state['memory_count']}/{state['memory_floor']} id={state['identity_written']}")
+          f"missing={state['missing_tabs']} id={state['identity_written']}")
     return jsonify({
         "error": "bootstrap_incomplete",
         "stage": state["stage"],
         "memory_count": state["memory_count"],
         "memory_floor": state["memory_floor"],
+        "counts": state["counts"],
+        "floors": state["floors"],
+        "missing_tabs": state["missing_tabs"],
         "identity_written": state["identity_written"],
         "required": required,
         "skill_url": _SKILL_URL,
@@ -2188,27 +2228,28 @@ def _gate_bootstrap_for_chat(store):
 
 
 def _gate_bootstrap_for_identity_init(store):
-    """Refuse /v1/identity/init when fewer than the per-age floor of
-    memories exist. Identity must be DERIVED from memories — writing
-    identity at the floor=15 tier with 3 cards means the Agent skipped
-    the depth pass.
+    """Refuse /v1/identity/init when Story or About me tab floors are unmet.
+
+    Identity must be DERIVED from memory substrate — writing identity in the
+    30+ day tier with only 2 cards means the Agent skipped the depth pass.
+    TA 在想 floor is advisory at this gate (reflections need other-tab
+    substrate first, gating on it would deadlock low-density users).
     """
     state = _bootstrap_state(store)
-    if state["memory_count"] >= state["memory_floor"]:
+    if not state["missing_tabs"]:
         return None
-    print(f"[gate:{store.user_id}] identity_init blocked "
-          f"mem={state['memory_count']}/{state['memory_floor']}")
+    print(f"[gate:{store.user_id}] identity_init blocked missing={state['missing_tabs']} "
+          f"counts={state['counts']} floors={state['floors']}")
     return jsonify({
         "error": "bootstrap_incomplete",
         "stage": "needs_memory",
         "memory_count": state["memory_count"],
         "memory_floor": state["memory_floor"],
-        "required": (
-            f"Write at least {state['memory_floor']} memory cards via "
-            f"feedling_memory_add_moment (currently {state['memory_count']}; "
-            f"floor for this relationship age) BEFORE calling feedling_identity_init. "
-            "Identity dimensions must be derived from real cards, not invented."
-        ),
+        "counts": state["counts"],
+        "floors": state["floors"],
+        "missing_tabs": state["missing_tabs"],
+        "required": _gate_required_for_missing_tabs(state)
+                    + " Identity dimensions must be derived from real cards, not invented.",
         "skill_url": _SKILL_URL,
     }), 409
 
@@ -2451,6 +2492,40 @@ def identity_relationship_anchor():
 # ---------------------------------------------------------------------------
 # Memory garden
 # ---------------------------------------------------------------------------
+#
+# Memory model (post-2026-05-22 Friend-Test → typed-density rewrite):
+#
+#   Story tab        : moment, quote
+#   About me tab     : fact, event
+#   TA 在想 tab      : insight, reflection
+#
+# Each memory carries plaintext `type` metadata (alongside occurred_at /
+# source / visibility / owner_user_id) so the server can validate the
+# enum, count per-tab, gate identity_init by per-tab floor, and enforce
+# reflection's substrate gate (≥2 anchor memories) + time cap.
+#
+# Insight requires anchor_memory_ids of length ≥1 (existing memories).
+# Reflection requires anchor_memory_ids of length ≥2 AND obeys a per-tier
+# time cap on the rolling window between reflections — agents shouldn't
+# spam reflections, they should accumulate substrate.
+#
+# The ciphertext body still wraps the user-visible payload
+# {title, description, type, her_quote?, context?, linked_dimension?}.
+# `type` is duplicated inside body_ct for client-side rendering, but the
+# plaintext copy on the envelope is the server source of truth (the only
+# value the server can validate).
+
+MEMORY_TYPES = ("moment", "quote", "fact", "event", "insight", "reflection")
+
+# Which iOS Garden tab a type renders into.
+TAB_FOR_TYPE = {
+    "moment":     "story",
+    "quote":      "story",
+    "fact":       "about_me",
+    "event":      "about_me",
+    "insight":    "ta_thinking",
+    "reflection": "ta_thinking",
+}
 
 
 def _load_moments(store: UserStore) -> list:
@@ -2465,6 +2540,104 @@ def _load_moments(store: UserStore) -> list:
 def _save_moments(store: UserStore, moments: list):
     with store.memory_lock:
         store.memory_file.write_text(json.dumps(moments, ensure_ascii=False, indent=2))
+
+
+def _count_by_tab(moments: list) -> dict:
+    """Return {story: int, about_me: int, ta_thinking: int, total: int}."""
+    counts = {"story": 0, "about_me": 0, "ta_thinking": 0, "total": 0}
+    if not isinstance(moments, list):
+        return counts
+    for m in moments:
+        if not isinstance(m, dict):
+            continue
+        counts["total"] += 1
+        t = m.get("type", "")
+        tab = TAB_FOR_TYPE.get(t)
+        if tab:
+            counts[tab] += 1
+    return counts
+
+
+def _validate_anchor_ids(moments: list, anchor_ids, owner_user_id: str) -> tuple:
+    """Validate that every anchor_memory_id refers to an existing memory
+    owned by this user. Returns (ok: bool, error_dict | None). Caller is
+    expected to have already type-checked anchor_ids as a list of strings.
+    """
+    if not isinstance(anchor_ids, list):
+        return False, {"error": "anchor_memory_ids must be a list of memory ids"}
+    if any(not isinstance(x, str) or not x for x in anchor_ids):
+        return False, {"error": "anchor_memory_ids must be non-empty strings"}
+    existing_ids = {m.get("id") for m in moments if isinstance(m, dict)}
+    missing = [aid for aid in anchor_ids if aid not in existing_ids]
+    if missing:
+        return False, {
+            "error": "anchor_memory_ids_not_found",
+            "missing": missing,
+            "required": (
+                "Each anchor must reference a memory id that already exists "
+                "in this user's garden. Write the substrate memories first."
+            ),
+        }
+    return True, None
+
+
+def _reflection_time_cap_ok(moments: list, days: int) -> tuple:
+    """Enforce reflection cadence by relationship age tier.
+
+    <30 days: hard max of 2 reflections lifetime.
+    30-180 days: ≥7 rolling days since last reflection.
+    ≥180 days: ≥3 rolling days since last reflection.
+
+    Returns (ok: bool, error_dict | None).
+    """
+    reflections = [
+        m for m in moments
+        if isinstance(m, dict) and m.get("type") == "reflection"
+    ]
+    if days < 30:
+        if len(reflections) >= 2:
+            return False, {
+                "error": "reflection_lifetime_cap",
+                "current_count": len(reflections),
+                "cap": 2,
+                "required": (
+                    f"At {days} days of relationship, you can hold at most 2 "
+                    "reflections total. Substrate is still thin — write more "
+                    "facts/events/quotes/moments before standalone reflections."
+                ),
+            }
+        return True, None
+
+    # For older tiers, find the latest reflection's created_at.
+    latest = None
+    for r in reflections:
+        ca = r.get("created_at", "")
+        if not ca:
+            continue
+        try:
+            dt = datetime.fromisoformat(ca.replace("Z", "+00:00"))
+            if dt.tzinfo:
+                dt = dt.replace(tzinfo=None)
+            if latest is None or dt > latest:
+                latest = dt
+        except Exception:
+            continue
+    if latest is None:
+        return True, None  # No prior reflection → free to write.
+    cap_days = 7 if days < 180 else 3
+    elapsed = (datetime.now() - latest).total_seconds() / 86400.0
+    if elapsed < cap_days:
+        return False, {
+            "error": "reflection_too_soon",
+            "elapsed_days": round(elapsed, 2),
+            "min_days": cap_days,
+            "required": (
+                f"Reflections need {cap_days}+ days between them at this "
+                f"relationship age; last reflection was {elapsed:.1f} days ago. "
+                "Let substrate accumulate before reflecting again."
+            ),
+        }
+    return True, None
 
 
 @app.route("/v1/memory/list", methods=["GET"])
@@ -2500,9 +2673,16 @@ def memory_get():
 def memory_add():
     """Add a memory moment as a v1 envelope.
 
-    body_ct wraps {title, description, type} as JSON; id/occurred_at/
-    created_at/source stay plaintext so the server can sort + index.
-    See docs/DESIGN_E2E.md §3.2.
+    body_ct wraps the user-visible payload (title/description/her_quote/…).
+    Plaintext envelope metadata the server uses for indexing + gating:
+      - occurred_at (mandatory, ISO 8601)
+      - source (chat/bootstrap/live_conversation/user_initiated)
+      - type (one of MEMORY_TYPES; mandatory)
+      - anchor_memory_ids (required for insight + reflection)
+
+    Type-specific gates (see MEMORY_TYPES module commentary):
+      - insight: anchor_memory_ids ≥1 referencing existing memories
+      - reflection: anchor_memory_ids ≥2 + per-tier time cap
     """
     store = require_user()
     payload = request.get_json(silent=True) or {}
@@ -2526,9 +2706,62 @@ def memory_add():
     if envelope["owner_user_id"] != store.user_id:
         return jsonify({"error": "envelope.owner_user_id does not match caller"}), 403
 
+    mem_type = (envelope.get("type") or "").strip()
+    if not mem_type:
+        return jsonify({
+            "error": "type_required",
+            "allowed": list(MEMORY_TYPES),
+            "required": (
+                "type is mandatory and must be one of moment/quote/fact/event/"
+                "insight/reflection. See skill 'Memory types' section."
+            ),
+        }), 400
+    if mem_type not in MEMORY_TYPES:
+        return jsonify({
+            "error": "type_invalid",
+            "got": mem_type,
+            "allowed": list(MEMORY_TYPES),
+        }), 400
+
+    moments = _load_moments(store)
+    anchor_ids = envelope.get("anchor_memory_ids") or []
+
+    if mem_type == "insight":
+        if not anchor_ids:
+            return jsonify({
+                "error": "insight_requires_anchor",
+                "required": (
+                    "insight must reference ≥1 prior memory (anchor_memory_ids). "
+                    "An insight is the agent's understanding of the user grounded in "
+                    "concrete cards; if you can't point to a card, write fact/event first."
+                ),
+            }), 400
+        ok, err = _validate_anchor_ids(moments, anchor_ids, store.user_id)
+        if not ok:
+            return jsonify(err), 400
+
+    if mem_type == "reflection":
+        if not isinstance(anchor_ids, list) or len(anchor_ids) < 2:
+            return jsonify({
+                "error": "reflection_requires_substrate",
+                "required": (
+                    "reflection must reference ≥2 prior memories (anchor_memory_ids). "
+                    "A reflection is the agent's standalone thinking; it needs at "
+                    "least 2 pieces of substrate to count as thought, not vibes."
+                ),
+            }), 400
+        ok, err = _validate_anchor_ids(moments, anchor_ids, store.user_id)
+        if not ok:
+            return jsonify(err), 400
+        days = _relationship_age_days(store)
+        ok, err = _reflection_time_cap_ok(moments, days)
+        if not ok:
+            return jsonify(err), 429  # rate-limit semantics
+
     moment = {
         "v": 1,
         "id": envelope.get("id") or f"mom_{uuid.uuid4().hex[:12]}",
+        "type": mem_type,
         "occurred_at": occurred_at,
         "created_at": now,
         "source": (envelope.get("source") or "live_conversation").strip(),
@@ -2541,12 +2774,86 @@ def memory_add():
     }
     if envelope.get("K_enclave"):
         moment["K_enclave"] = envelope["K_enclave"]
-    moments = _load_moments(store)
+    if anchor_ids:
+        moment["anchor_memory_ids"] = list(anchor_ids)
     moments.append(moment)
     _save_moments(store, moments)
     _log_bootstrap_event(store, "memory_moment_added_v1", success=True)
-    print(f"[memory:{store.user_id}] added v1 id={moment['id']} visibility={envelope['visibility']}")
+    print(f"[memory:{store.user_id}] added v1 type={mem_type} id={moment['id']} "
+          f"visibility={envelope['visibility']} anchors={len(anchor_ids)}")
     return jsonify({"status": "created", "moment": moment, "v": 1}), 201
+
+
+@app.route("/v1/memory/retype", methods=["POST"])
+def memory_retype():
+    """Change an existing memory's `type` (and anchor_memory_ids when moving
+    into insight/reflection). Used when the agent decides on reflection
+    that an older memory was misclassified.
+
+    Time cap on reflection is waived for retypes — this is recategorization,
+    not new substrate, so the cadence gate doesn't apply. Substrate gate
+    (≥1 anchor for insight, ≥2 for reflection) is still enforced.
+
+    Body: {"id": "...", "type": "...", "anchor_memory_ids": [...] (optional)}
+    """
+    store = require_user()
+    payload = request.get_json(silent=True) or {}
+    memory_id = (payload.get("id") or "").strip()
+    new_type = (payload.get("type") or "").strip()
+    if not memory_id:
+        return jsonify({"error": "id required"}), 400
+    if new_type not in MEMORY_TYPES:
+        return jsonify({
+            "error": "type_invalid",
+            "got": new_type,
+            "allowed": list(MEMORY_TYPES),
+        }), 400
+
+    moments = _load_moments(store)
+    target_idx = None
+    for i, m in enumerate(moments):
+        if isinstance(m, dict) and m.get("id") == memory_id:
+            target_idx = i
+            break
+    if target_idx is None:
+        return jsonify({"error": "not_found"}), 404
+
+    target = moments[target_idx]
+    if target.get("owner_user_id") != store.user_id:
+        return jsonify({"error": "not_owned"}), 403
+
+    anchor_ids = payload.get("anchor_memory_ids") or []
+    if new_type in ("insight", "reflection"):
+        minimum = 1 if new_type == "insight" else 2
+        if not isinstance(anchor_ids, list) or len(anchor_ids) < minimum:
+            return jsonify({
+                "error": f"{new_type}_requires_anchor",
+                "min_anchors": minimum,
+                "required": (
+                    f"Retyping into {new_type} requires ≥{minimum} anchor_memory_ids."
+                ),
+            }), 400
+        # Don't allow self-reference.
+        if memory_id in anchor_ids:
+            return jsonify({
+                "error": "anchor_self_reference",
+                "required": "A memory cannot anchor itself.",
+            }), 400
+        ok, err = _validate_anchor_ids(moments, anchor_ids, store.user_id)
+        if not ok:
+            return jsonify(err), 400
+        target["anchor_memory_ids"] = list(anchor_ids)
+    else:
+        # Demoting away from insight/reflection drops anchors.
+        target.pop("anchor_memory_ids", None)
+
+    target["type"] = new_type
+    target["retyped_at"] = datetime.now().isoformat()
+    moments[target_idx] = target
+    _save_moments(store, moments)
+    print(f"[memory:{store.user_id}] retyped id={memory_id} → {new_type} "
+          f"anchors={len(anchor_ids)}")
+    return jsonify({"status": "retyped", "moment": target})
 
 
 @app.route("/v1/memory/delete", methods=["DELETE"])
@@ -2596,25 +2903,31 @@ def bootstrap():
         "如果你找不到历史，不要硬写默认身份卡。你可以这样说："
         "「我现在抓不到我们以前的上下文，所以不能假装我记得。你可以贴几段代表性的对话给我，"
         "或者我们明确从今天重新开始。」\n\n"
-        "**1. 先种 Memory Garden，再写身份卡**\n"
-        "先别急着介绍自己。先回忆这个人：他们反复在意什么，哪些话你还记得，"
-        "哪一次你真正理解了他们。按 skill 的 4-pass 流程做："
-        "Pass 1 唤醒 themes，Pass 2 清点 candidate moments，"
-        "Pass 3 用 feedling_memory_add_moment 写通过 Friend Test 的记忆，"
-        "Pass 4 在外部 runtime 对账，让用户指出遗漏。"
-        "记忆底线按关系长度：<1 月至少 5 张，1+ 月至少 15 张，6+ 月至少 30 张；"
-        "够了以后不要硬凑，但不够也不要糊弄。"
-        "好的 memory title 应该像「你说，这里不能是日志」或「第一次你直接告诉我你要什么」，"
-        "不要像「完成了某某流程」。描述写成发生了什么、用户当时在意什么、你注意到了什么、后来有什么改变。"
-        "不要编造，不要写 test/probe/healthcheck 脏数据。"
-        "Pass 3 后调用 feedling_memory_verify。\n\n"
+        "**1. Memory Garden 是密度燃料，分 3 个 tab**\n"
+        "Memory Garden 不再是「精选 receipts」，而是 agent 大脑的可见层。"
+        "每条记忆必须带 type，server 按 type 把它分到 iOS Garden 的三个 tab：\n"
+        "  • **故事 tab**: type='moment'（你们之间发生过的一件事）/ 'quote'（用户说过的让你记到现在的话）\n"
+        "  • **关于我 tab**: type='fact'（用户的偏好/关系/习惯/世界——密度燃料）/ 'event'（用户生活里发生过的一件具体事，可以一句话）\n"
+        "  • **TA 在想 tab**: type='insight'（你对用户的理解，必须 anchor 到 ≥1 条已有记忆）/ 'reflection'（你独立的思考，需要 ≥2 条 anchors）\n\n"
+        "不再用 Friend Test 当门槛——那个标准会过滤掉密度燃料（用户猫叫 Mochi、妈妈住杭州、喜欢草莓拿铁这种）。"
+        "改用 type-aware 的写入逻辑：fact / event 可以非常短一句话，moment / quote 仍然要写有温度，"
+        "insight / reflection 必须 anchor 到具体卡上。"
+        "底线按关系长度，每个 tab 各自有 floor："
+        "<2 天: story=1 / about_me=1 / ta_thinking=0; "
+        "2-30 天: 3 / 8 / 2; "
+        "30-180 天: 8 / 25 / 5; "
+        "≥180 天: 15 / 60 / 12。"
+        "**关于我 tab 的密度最关键**——proactive 推送主要吃这里的 fact / event 来找 connection。"
+        "Pass 1 唤醒 themes，Pass 2 清点 candidates，Pass 3 按 type 落卡（先写 fact/event 把密度堆上去，"
+        "再写 moment/quote 进故事 tab，最后才写 insight/reflection 进 TA 在想 tab——insight 需要先有 fact/moment 当 anchor）。"
+        "Pass 4 在外部 runtime 对账，调 feedling_memory_verify 看每个 tab 的 passing 状态。\n\n"
         "**2. 从记忆派生身份卡**\n"
         "identity 不是新 persona，也不是平台名；它必须来自 Memory Garden receipts。"
         "agent_name 不能是 Hermes/Claude/ChatGPT 等 runtime label。"
         "如果用户以前叫过你名字，就用那个；如果没有，先问，不要自己 fallback。"
         "dimensions 必须恰好 7 个，数值要有明显高低差；days_with_user 必须按最早 memory 的 occurred_at 到今天计算。"
         "self_introduction 要像你自己在介绍你们的关系，而不是功能说明；不要提 Feedling、IO 或平台名。"
-        "通过 feedling_identity_init 写入，然后调用 feedling_identity_verify。\n\n"
+        "通过 feedling_identity_init 写入（server 会先 check 故事 tab + 关于我 tab 都过 floor），然后调用 feedling_identity_verify。\n\n"
         "**3. 先确认 Live connection，再打招呼**\n"
         "不要先发第一条消息再补确认 chat loop。先按 public skill 的 Connection path 建立"
         "独立 feedling-chat-resident / IO resident consumer service：用 FEEDLING_API_URL、"
@@ -2625,10 +2938,22 @@ def bootstrap():
         "Live connection 完成后，才调用 feedling_chat_post_message 发第一条用户可见消息。"
         "第一条消息是用户第一次在 Feedling Chat 里听见你，所以不要写成系统通知。你可以这样开口："
         "「我把我们的记忆整理好了。按最早那一天算，今天是第 187 天。"
-        "Garden 里我先放了 23 张卡。现在这边也接上了，你发消息我会看到。」"
+        "Garden 里我先放了 N 张卡——故事 tab S 张、关于我 tab A 张、TA 在想 tab T 张。"
+        "现在这边也接上了，你发消息我会看到。」"
         "把 days_with_user 当作你算出的事实说出来；"
         "用户修正时调用 feedling_identity_set_relationship_days。再自然地问一句他们希望你以后怎么主动出现，"
-        "把答案写成一条像你自己的 signature。最后才提 broadcast，不要提前推销屏幕共享。"
+        "把答案写成一条像你自己的 signature。最后才提 broadcast，不要提前推销屏幕共享。\n\n"
+        "**4. Running capture：每次 chat 之后都要捕获新 fact/event**\n"
+        "Bootstrap 不是一次性事件——它是 ongoing。每次跟用户聊完，立刻问自己："
+        "「这次对话里，我学到了什么新的 fact 或 event 吗？」"
+        "  • 用户提到的新偏好、习惯、关系、日期 → 写 fact\n"
+        "  • 用户描述的新发生的事 → 写 event\n"
+        "  • 用户说了让你记到现在的某句话 → 写 quote\n"
+        "  • 这次对话本身是关系上的一个转折 → 写 moment（少见，慎用）\n"
+        "  • 你对用户有新的理解（基于 ≥1 张已有卡） → 写 insight\n"
+        "  • 你对用户有了独立的反思（基于 ≥2 张已有卡，且 reflection 时间窗冷却已过） → 写 reflection\n"
+        "不要等 6 小时的周期 review——fact / event 应该在对话刚结束、记忆鲜活时就落卡。"
+        "聊了一段时间没有任何新写入，本身就是 signal——大概率是你忘了在 capture，或者你已经聊到 surface-level 客套话了。"
     )
 
     state = {"bootstrapped": True, "bootstrapped_at": datetime.now().isoformat()}
@@ -2739,9 +3064,16 @@ def bootstrap_status():
     candidate_ts = [t for t in (identity_updated_at, last_moment_ts, last_agent_msg_ts) if t]
     last_activity = max(candidate_ts) if (agent_connected and candidate_ts) else ""
 
+    # is_complete heuristic for iOS surface: "bootstrap visibly done".
+    # Post-2026-05-22 typed-memory model lowered the <2-days floor from 3
+    # to 2 (story=1 + about_me=1), so the hard floor of 3 here would
+    # never trip for legitimate fresh accounts. Use the per-tab gate
+    # state instead — same source the identity_init gate uses.
+    bootstrap_st = _bootstrap_state(store)
+    bootstrap_memory_ok = not bootstrap_st["missing_tabs"]
     is_complete = (
         has_identity
-        and memory_count >= 3
+        and bootstrap_memory_ok
         and agent_msg_count >= 1
         and chat_loop_verified
     )
@@ -2793,47 +3125,72 @@ def _relationship_age_days(store) -> int:
     return 0
 
 
-def _memory_floor_for_days(days: int) -> int:
-    """Return the memory-card floor for the relationship age.
+def _per_tab_floors_for_days(days: int) -> dict:
+    """Per-tab memory floors by relationship age. Returns
+    {story, about_me, ta_thinking, total}. The total isn't a sum of the
+    three (some over-shooting on About me shouldn't compensate for an
+    empty Story); it's the bootstrap-gate threshold that subsumes them.
 
-    Tiers:
-      ≥ 6 months: 30 (established relationship)
-      ≥ 1 month:  15 (real history)
-      ≥ 2 days:    5 (recent but real)
-      < 2 days:    1 (we-just-met path; need ≥1 card to derive identity at all)
+    Tiers (post-2026-05-22):
+      ≥ 6 months: 15 / 60 / 12   (total 87)  — established, deep substrate
+      ≥ 1 month:   8 / 25 /  5   (total 38)  — real history
+      ≥ 2 days:    3 /  8 /  2   (total 13)  — recent but real
+      < 2 days:    1 /  1 /  0   (total  2)  — we-just-met
 
-    The <2-days tier exists for honest "first day" scenarios — agent and
-    user genuinely met today, only have one moment so far. Skill Hard Rule
-    forbids agents from claiming this tier unless the user explicitly
-    stated it ("we just met today"); the server trusts the agent here.
+    Per-tab floors drive identity_init gate (Story + About me floors are
+    hard prerequisites; TA 在想 is encouraged but not blocking because
+    reflections require substrate from the other two tabs first).
     """
     if days >= 180:
-        return 30
+        return {"story": 15, "about_me": 60, "ta_thinking": 12, "total": 87}
     if days >= 30:
-        return 15
+        return {"story":  8, "about_me": 25, "ta_thinking":  5, "total": 38}
     if days >= 2:
-        return 5
-    return 1
+        return {"story":  3, "about_me":  8, "ta_thinking":  2, "total": 13}
+    return     {"story":  1, "about_me":  1, "ta_thinking":  0, "total":  2}
+
+
+def _memory_floor_for_days(days: int) -> int:
+    """Total memory floor used by the bootstrap gate. Backwards-compatible
+    name; preserved for callers that don't care about per-tab breakdown.
+    """
+    return _per_tab_floors_for_days(days)["total"]
 
 
 @app.route("/v1/memory/verify", methods=["GET"])
 def memory_verify():
-    """Check memory garden state against floor / quality signals.
+    """Check memory garden state against per-tab floors + quality signals.
 
-    Returns: {count, floor, below_floor, issues:[...], passing:bool,
-              suggestions:[...]}.
+    Returns:
+      {
+        counts: {story, about_me, ta_thinking, total},
+        floors: {story, about_me, ta_thinking, total},
+        below_floor: {story: bool, about_me: bool, ta_thinking: bool},
+        relationship_days: int,
+        issues: [...],
+        suggestions: [...],
+        passing: bool,            # Story + About me floors met (TA 在想 advisory)
+        passing_full: bool,       # All three tab floors met (target, not gate)
+      }
 
     Agent should call this after Pass 3 to decide whether to sweep again.
-    `passing` is true iff count >= floor and no metadata issues were found.
+    `passing` is the bootstrap gate (Story + About me); `passing_full` is
+    the aspirational target including TA 在想.
     """
     store = require_user()
     moments = _load_moments(store)
-    count = len(moments) if isinstance(moments, list) else 0
+    counts = _count_by_tab(moments)
     days = _relationship_age_days(store)
-    floor = _memory_floor_for_days(days)
+    floors = _per_tab_floors_for_days(days)
 
     issues = []
     suggestions = []
+
+    below_floor = {
+        "story":       counts["story"]       < floors["story"],
+        "about_me":    counts["about_me"]    < floors["about_me"],
+        "ta_thinking": counts["ta_thinking"] < floors["ta_thinking"],
+    }
 
     # Time distribution — server-visible plaintext metadata
     occurred_ts = []
@@ -2864,25 +3221,47 @@ def memory_verify():
                 "you missed at least 80% of the relationship's span."
             )
 
-    below_floor = count < floor
-
-    if below_floor:
+    # Per-tab suggestions: be specific about which tab is underfilled and
+    # which types feed it. The skill maps types→tabs but reminding helps
+    # agents that haven't re-read the skill mid-bootstrap.
+    if below_floor["story"]:
         suggestions.append(
-            f"Memory count {count} is below floor {floor}. "
-            f"Sweep your memory of this user for more moments. "
-            "feedling_identity_init will 409 until you cross the floor."
+            f"Story tab: {counts['story']}/{floors['story']} — write more "
+            "moment/quote memories (the things between you and the user). "
+            "feedling_identity_init will 409 until Story + About me floors are met."
+        )
+    if below_floor["about_me"]:
+        suggestions.append(
+            f"About me tab: {counts['about_me']}/{floors['about_me']} — this is the "
+            "density layer. Sweep for facts (preferences, relationships, dates, habits) "
+            "and events (specific things that happened in the user's life)."
+        )
+    if below_floor["ta_thinking"]:
+        suggestions.append(
+            f"TA 在想 tab: {counts['ta_thinking']}/{floors['ta_thinking']} — write "
+            "insights (your understanding of the user, each anchored to ≥1 prior memory) "
+            "and reflections (your standalone thinking, ≥2 anchors). This tab is not "
+            "blocking for identity_init but it's how the relationship feels reciprocal."
         )
 
-    passing = (not below_floor) and not issues
+    # passing semantics: identity_init gate = Story + About me only.
+    # passing_full = all three tabs at floor.
+    passing = (not below_floor["story"]) and (not below_floor["about_me"]) and not issues
+    passing_full = passing and (not below_floor["ta_thinking"])
 
     return jsonify({
-        "count": count,
-        "floor": floor,
+        "counts": counts,
+        "floors": floors,
         "below_floor": below_floor,
         "relationship_days": days,
         "issues": issues,
         "suggestions": suggestions,
         "passing": passing,
+        "passing_full": passing_full,
+        # Backwards-compatible flat fields — iOS / older tests may still
+        # read these. The per-tab fields above are the new source of truth.
+        "count": counts["total"],
+        "floor": floors["total"],
     })
 
 
