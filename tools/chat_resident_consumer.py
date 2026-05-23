@@ -48,6 +48,10 @@ Optional:
                         and no fake template is posted to the user.
   FALLBACK_REPLY        Optional opt-in fallback text
   IMAGE_TEMP_DIR        Where decrypted chat images are written for CLI agents
+  SCREEN_CONTEXT_MODE   "on_mention" (default), "always", or "off". When active,
+                        recent screen-sharing context is attached to screen
+                        questions so the agent does not need to run curl/MCP
+                        commands from its own sandbox.
   POLL_TIMEOUT          Long-poll timeout in seconds (default: 30)
   LOG_LEVEL             DEBUG / INFO / WARNING (default: INFO)
 """
@@ -142,6 +146,9 @@ AGENT_SESSION_FILE_TEMPLATE = os.environ.get(
     f"/tmp/feedling_agent_session_{hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]}_{{user_id}}.txt",
 )
 IMAGE_TEMP_DIR = Path(os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_images"))
+SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "on_mention").strip().lower()
+SCREEN_CONTEXT_MAX_AGE_SEC = int(os.environ.get("SCREEN_CONTEXT_MAX_AGE_SEC", "300"))
+SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
 FALLBACK_REPLY = os.environ.get(
     "FALLBACK_REPLY", "（Agent 暂时无法响应，请稍后再试）"
 )
@@ -159,6 +166,12 @@ IMAGE_PLACEHOLDER = os.environ.get(
     "[The user sent an image in IO Chat. Inspect the attached/local image "
     "before replying. If your current runtime cannot open the image, say "
     "plainly that this connector has not enabled image vision yet.]",
+)
+
+_SCREEN_CONTEXT_TRIGGER_RE = re.compile(
+    r"(screen|broadcast|share|sharing|see\s+(my|the)|look\s+at|current\s+screen|"
+    r"屏幕|共享|画面|看得到|看见|看到|能看|看一下|这张|这个|这里|当前)",
+    re.IGNORECASE,
 )
 
 # ---------------------------------------------------------------------------
@@ -620,6 +633,23 @@ def _image_file_paths_for_msg(msg: dict) -> list[str]:
     return paths
 
 
+def _image_file_paths_from_payloads(prefix: str, payloads: list[dict[str, str]]) -> list[str]:
+    if not payloads:
+        return []
+    key = re.sub(r"[^A-Za-z0-9_.-]+", "_", prefix)[:96] or "image"
+    IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    paths: list[str] = []
+    for idx, payload in enumerate(payloads):
+        ext = ".png" if payload.get("mime_type") == "image/png" else ".jpg"
+        path = IMAGE_TEMP_DIR / f"{key}_{idx}{ext}"
+        try:
+            path.write_bytes(base64.b64decode(payload["data"]))
+            paths.append(str(path))
+        except Exception as e:
+            log.warning("failed to write image temp file %s: %s", path, e)
+    return paths
+
+
 def _message_for_agent(content: str, image_paths: list[str] | None = None) -> str:
     image_paths = image_paths or []
     if not image_paths:
@@ -635,6 +665,100 @@ def _message_for_agent(content: str, image_paths: list[str] | None = None) -> st
 
 
 # ---------------------------------------------------------------------------
+# Screen-sharing context
+# ---------------------------------------------------------------------------
+
+def _should_attach_screen_context(content: str) -> bool:
+    mode = SCREEN_CONTEXT_MODE
+    if mode in {"0", "false", "off", "none", "disabled"}:
+        return False
+    if mode in {"1", "true", "always", "on"}:
+        return True
+    return bool(_SCREEN_CONTEXT_TRIGGER_RE.search(content or ""))
+
+
+def _fetch_screen_json(path: str) -> dict | None:
+    try:
+        resp = httpx.get(f"{FEEDLING_API_URL}{path}", headers=_HEADERS, timeout=20)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        body = resp.json()
+        return body if isinstance(body, dict) else None
+    except Exception as e:
+        log.warning("screen context fetch failed path=%s error=%s", path, e)
+        return None
+
+
+def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]], list[str]]:
+    """Attach recent screen-sharing context for screen/deictic questions.
+
+    The resident already has the Feedling API key, so it should decrypt the
+    latest frame itself instead of making the agent run curl/MCP commands from a
+    sandbox that may require user approval.
+    """
+    if not _should_attach_screen_context(content):
+        return "", [], []
+
+    latest = _fetch_screen_json("/v1/screen/frames/latest")
+    if not latest:
+        return "", [], []
+
+    frame_id = str(latest.get("id") or "").strip()
+    ts = float(latest.get("ts") or 0.0)
+    if not frame_id:
+        return "", [], []
+    if ts and time.time() - ts > SCREEN_CONTEXT_MAX_AGE_SEC:
+        log.info(
+            "screen context skipped — latest frame is stale age=%.1fs id=%s",
+            time.time() - ts,
+            frame_id,
+        )
+        return "", [], []
+
+    include_image = "true" if SCREEN_CONTEXT_INCLUDE_IMAGE else "false"
+    decrypted = _fetch_screen_json(
+        f"/v1/screen/frames/{frame_id}/decrypt?include_image={include_image}"
+    )
+    if not decrypted:
+        return "", [], []
+
+    app = decrypted.get("app") or latest.get("app") or "unknown"
+    ocr_text = (decrypted.get("ocr_text") or "").strip()
+    captured_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)) if ts else "unknown"
+
+    payloads: list[dict[str, str]] = []
+    image_b64 = decrypted.get("image_b64")
+    if isinstance(image_b64, str) and image_b64.strip():
+        raw_b64 = image_b64.split(",", 1)[1] if image_b64.startswith("data:") else image_b64
+        mime = decrypted.get("image_mime") or "image/jpeg"
+        payloads.append(
+            {
+                "mime_type": str(mime),
+                "data": raw_b64,
+                "data_url": f"data:{mime};base64,{raw_b64}",
+            }
+        )
+
+    paths = _image_file_paths_from_payloads(f"screen_{frame_id}", payloads)
+    parts = [
+        "[Live Feedling screen-sharing context]",
+        f"captured_at_utc: {captured_at}",
+        f"app: {app}",
+    ]
+    if ocr_text:
+        parts.append(f"ocr_text:\n{ocr_text[:2000]}")
+    elif payloads:
+        parts.append("ocr_text: empty; inspect the attached screenshot image if your runtime supports vision.")
+    else:
+        parts.append("ocr_text: empty and no screenshot image was available.")
+    if paths:
+        parts.append("screenshot_file: " + ", ".join(paths))
+
+    return "\n".join(parts), payloads, paths
+
+
+# ---------------------------------------------------------------------------
 # Agent backends
 # ---------------------------------------------------------------------------
 
@@ -642,6 +766,8 @@ def _message_for_agent(content: str, image_paths: list[str] | None = None) -> st
 _NOISE_LINE_RE = re.compile(
     r"^\s*("
     r"session_id\s*:.*"      # hermes session footer
+    r"|[↻⟳]?\s*(resumed|created|started)\s+session\b.*"  # hermes session banner
+    r"|[A-Za-z0-9_\-]{8,}\s*\(\d+\s+user\s+messages?,\s*\d+\s+total\s+messages?\)"
     r"|---+|={3,}|[-–—_]{3,}" # separator lines
     r"|\[.*\]\s*$"           # [bracket] meta lines
     r"|💭.*"                 # hermes thinking-emoji prefix
@@ -1461,6 +1587,17 @@ def _process_messages(messages: list) -> float:
             continue
         else:
             log.info("user message [ts=%.3f]: %s", ts, content[:80])
+
+        screen_text, screen_payloads, screen_paths = _screen_context_for_message(content)
+        if screen_text:
+            content = f"{content}\n\n{screen_text}"
+            image_payloads.extend(screen_payloads)
+            image_paths.extend(screen_paths)
+            log.info(
+                "attached screen context to agent message ts=%.3f images=%d",
+                ts,
+                len(screen_payloads),
+            )
 
         try:
             if image_payloads or image_paths:

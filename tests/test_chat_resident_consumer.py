@@ -163,6 +163,36 @@ def test_image_message_passes_image_context_to_agent(monkeypatch, tmp_path):
     assert Path(kwargs["image_paths"][0]).exists()
 
 
+def test_screen_question_attaches_decrypted_screen_context(monkeypatch):
+    msg = _make_msg(role="user", content="你能看到我的屏幕吗", ts=2200.0)
+    screen_image = {
+        "mime_type": "image/jpeg",
+        "data": base64.b64encode(b"screen-jpeg").decode("ascii"),
+        "data_url": "data:image/jpeg;base64,c2NyZWVuLWpwZWc=",
+    }
+    monkeypatch.setattr(
+        crc,
+        "_screen_context_for_message",
+        lambda content: (
+            "[Live Feedling screen-sharing context]\napp: com.feedling.mcp\nocr_text:\nhello screen",
+            [screen_image],
+            ["/tmp/feedling_chat_images/screen.jpg"],
+        ),
+    )
+
+    with patch.object(crc, "call_agent", return_value="I can see it.") as mock_agent, \
+         patch.object(crc, "post_reply") as mock_post:
+        result_ts = crc._process_messages([msg])
+
+    mock_post.assert_called_once()
+    assert result_ts == pytest.approx(2200.0)
+    args, kwargs = mock_agent.call_args
+    assert args[0].startswith("你能看到我的屏幕吗")
+    assert "hello screen" in args[0]
+    assert kwargs["images"] == [screen_image]
+    assert kwargs["image_paths"] == ["/tmp/feedling_chat_images/screen.jpg"]
+
+
 def test_dedup_prevents_reprocessing_same_message():
     """The same message processed twice (e.g. on restart with stale checkpoint)
     must not trigger a second agent call."""
@@ -506,6 +536,21 @@ session_id: sess_123
     assert "Project founder" in cleaned
     assert "Research profile" in cleaned
     assert "如果你愿意" in cleaned
+
+
+def test_extract_cli_output_strips_resumed_session_banner():
+    raw = """↻ Resumed session
+20260522_222908_60d12e (1 user message, 2 total messages)
+在，Seven。
+要我现在用「小哆啦」模式，陪你过一遍今天最关键的三件事吗？
+"""
+    extracted = crc._extract_text_from_cli_output(raw)
+    cleaned = crc._sanitize_reply_text(extracted)
+
+    assert "Resumed session" not in cleaned
+    assert "20260522_222908_60d12e" not in cleaned
+    assert "total messages" not in cleaned
+    assert cleaned == "在，Seven。\n要我现在用「小哆啦」模式，陪你过一遍今天最关键的三件事吗？"
 
 
 def test_normalize_agent_replies_supports_messages_array_json():
