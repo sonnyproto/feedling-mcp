@@ -7,6 +7,7 @@ Run with: pytest tests/test_chat_resident_consumer.py -v
 
 import importlib
 import base64
+import json
 import os
 import sys
 import time
@@ -538,6 +539,50 @@ session_id: sess_123
     assert "如果你愿意" in cleaned
 
 
+def test_extract_cli_output_prefers_structured_json_reply():
+    raw = json.dumps(
+        {
+            "session_id": "sess_json",
+            "reasoning": "internal text that must never be shown",
+            "reply": "在，Seven。\n我看到了你发来的屏幕。",
+        },
+        ensure_ascii=False,
+    )
+
+    assert crc._extract_text_from_cli_output(raw) == "在，Seven。\n我看到了你发来的屏幕。"
+    assert crc._extract_session_id(raw) == "sess_json"
+
+
+def test_extract_cli_output_reads_jsonl_final_answer():
+    raw = """
+debug line for human terminal
+{"event":"thinking","content":"do not use this"}
+{"session_id":"sess_jsonl","final_answer":"这是最终回复。"}
+"""
+
+    assert crc._extract_text_from_cli_output(raw) == "这是最终回复。"
+    assert crc._extract_session_id(raw) == "sess_jsonl"
+
+
+def test_extract_cli_output_ignores_non_final_json_events():
+    raw = """
+{"session_id":"sess_jsonl","final_answer":"这是最终回复。"}
+{"event":"thinking","content":"do not use this even if it appears last"}
+"""
+
+    assert crc._extract_text_from_cli_output(raw) == "这是最终回复。"
+    assert crc._extract_session_id(raw) == "sess_jsonl"
+
+
+def test_extract_cli_output_reads_openai_style_json():
+    raw = json.dumps(
+        {"choices": [{"message": {"content": "structured reply"}}]},
+        ensure_ascii=False,
+    )
+
+    assert crc._extract_text_from_cli_output(raw) == "structured reply"
+
+
 def test_extract_cli_output_strips_resumed_session_banner():
     raw = """↻ Resumed session
 20260522_222908_60d12e (1 user message, 2 total messages)
@@ -551,6 +596,28 @@ def test_extract_cli_output_strips_resumed_session_banner():
     assert "20260522_222908_60d12e" not in cleaned
     assert "total messages" not in cleaned
     assert cleaned == "在，Seven。\n要我现在用「小哆啦」模式，陪你过一遍今天最关键的三件事吗？"
+
+
+def test_sanitize_mixed_cli_output_drops_leading_non_cjk_block_and_duplicate_answer():
+    raw = """Some unlabelled English transcript text from a CLI wrapper.
+It may span multiple lines before the actual answer starts.
+└──────────────────────────────────────────────────────────────────────────────┘
+看到了，这次可以明确说：我已经看到了你共享出来的屏幕内容（至少这一帧）。
+我看到的是一张社交平台帖子详情页（界面像小红书），主题在讲 Mentra Live 智能眼镜。
+所以结论是：能看到你共享的画面内容了。
+看到了，这次可以明确说：我已经看到了你共享出来的屏幕内容（至少这一帧）。
+我看到的是一张社交平台帖子详情页（界面像小红书），主题在讲 Mentra Live 智能眼镜。
+所以结论是：能看到你共享的画面内容了。
+但严格说这是“已收到并读到共享帧”，不是持续实时遥控视角。
+"""
+    cleaned = crc._sanitize_reply_text(raw)
+
+    assert "Some unlabelled English transcript" not in cleaned
+    assert "actual answer starts" not in cleaned
+    assert "└" not in cleaned
+    assert cleaned.count("看到了，这次可以明确说") == 1
+    assert "Mentra Live 智能眼镜" in cleaned
+    assert cleaned.endswith("不是持续实时遥控视角。")
 
 
 def test_normalize_agent_replies_supports_messages_array_json():

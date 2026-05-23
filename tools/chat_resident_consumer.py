@@ -13,9 +13,10 @@ Supports two agent backend modes (set AGENT_MODE env var):
 
   cli   — Run a shell command with the user message passed via --query/-q flag.
           Works with any CLI agent that writes its reply to stdout.
-          IMPORTANT: the CLI command MUST produce clean stdout (plain text or
-          JSON only). See SKILL.md § "Chat Resident Consumer" for per-agent
-          configuration requirements.
+          Prefer machine-readable JSON stdout with a final-answer field such as
+          {"reply": "..."}; plain-text stdout is supported only as a fallback.
+          See SKILL.md § "Chat Resident Consumer" for per-agent configuration
+          requirements.
 
 Required env vars (all keys go in CHAT_RESIDENT_ENV_FILE, never hardcoded):
   FEEDLING_API_URL      Base URL of the Feedling backend (e.g. http://localhost:5001)
@@ -34,7 +35,7 @@ CLI mode:
                         Image messages can also use {image_path} or
                         {image_paths}; otherwise the path is appended to
                         the message text.
-                        Example (Hermes): hermes chat -Q --source tool --max-turns 60 -q "{message}"
+                        Example (Hermes): hermes chat --output-mode json -Q --source tool --max-turns 60 -q "{message}"
                         Example (plain):  mycli ask {message}
                         For Hermes, the consumer stores session_id and
                         auto-injects --resume on later turns.
@@ -777,6 +778,7 @@ _NOISE_LINE_RE = re.compile(
     r"|---+|={3,}|[-–—_]{3,}" # separator lines
     r"|\[.*\]\s*$"           # [bracket] meta lines
     r"|💭.*"                 # hermes thinking-emoji prefix
+    r"|[└┌│╰╭─].*"           # box-drawing UI chrome
     r"|\*\*[^*]+\*\*\s*$"   # **standalone bold header**
     r"|</?think>"            # <think> XML tags
     r"|Reasoning:\s*$"       # bare "Reasoning:" label
@@ -790,49 +792,52 @@ _IDENTITY_LEAK_RE = re.compile(r"\b(hermes|reasoning|chain\s*of\s*thought)\b", r
 
 # Typical leaked planning / chain-of-thought lead-ins from agent UIs.
 _REASONING_LINE_RE = re.compile(
-    r"^\s*(i\s+need\s+to|i\'?m\s+thinking|the\s+user\s+wrote|the\s+user\s+wants|"
-    r"this\s+(means|doesn\'?t)|i\s+think|i\s+should|i\'ll|let\s+me\s+|my\s+plan\s+is)",
+    r"^\s*\.?\s*(i\s+need\s+to|i\'?m\s+thinking|the\s+user\s+wrote|the\s+user\s+wants|"
+    r"this\s+(means|doesn\'?t)|i\s+think|i\s+should|i\'ll|let\s+me\s+|my\s+plan\s+is|"
+    r"i\s+could\s+use|it\s+seems|i\s+really\s+should|let\'?s\s+(see|make)|"
+    r"perhaps\b|maybe\s+through\b)",
     re.IGNORECASE,
 )
 
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 
-_LEADING_META_PREAMBLE_RE = re.compile(
-    r"\b("
-    r"(no\s+)?specific\s+tool\s+is\s+required"
-    r"|factual\s+question"
-    r"|rely\s+on\s+my\s+(memory|general\s+knowledge)"
-    r"|general\s+knowledge\s+up\s+to"
-    r"|i\s+remember\b"
-    r"|i'?m\s+uncertain\b"
-    r"|i'?ll\s+craft\b"
-    r"|i\s+will\s+craft\b"
-    r")",
-    re.IGNORECASE,
-)
+def _strip_leading_non_cjk_preamble(lines: list[str]) -> list[str]:
+    """Drop a leading non-CJK transcript block before a CJK final answer.
 
-
-def _strip_leading_meta_preamble(lines: list[str]) -> list[str]:
-    """Drop leaked English planning before a CJK final answer.
-
-    Hermes can sometimes emit an unlabelled preamble such as
-    "specific tool is required..." before the actual Chinese reply. Treat that
-    as internal setup only when it appears at the very start and a CJK answer
-    follows; plain English replies remain untouched.
+    This avoids phrase-specific patches for leaked CLI planning. If the final
+    answer is clearly Chinese, any initial English/UI-only block before the
+    first Chinese line is treated as transport transcript, not user-facing text.
+    Pure English replies and bilingual content after the first Chinese line are
+    preserved.
     """
     if not lines or not any(_CJK_RE.search(ln) for ln in lines):
         return lines
 
-    first = next((i for i, ln in enumerate(lines) if ln.strip()), None)
-    if first is None:
-        return lines
-    if not _LEADING_META_PREAMBLE_RE.search(lines[first]):
-        return lines
-
-    first_cjk = next((i for i, ln in enumerate(lines[first:], start=first) if _CJK_RE.search(ln)), None)
-    if first_cjk is None:
+    first_cjk = next((i for i, ln in enumerate(lines) if _CJK_RE.search(ln)), None)
+    if first_cjk is None or first_cjk == 0:
         return lines
     return lines[first_cjk:]
+
+
+def _collapse_repeated_line_blocks(lines: list[str]) -> list[str]:
+    """Collapse adjacent repeated answer blocks while preserving one copy."""
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        max_block = (len(lines) - i) // 2
+        collapsed = False
+        for size in range(max_block, 0, -1):
+            block = lines[i : i + size]
+            nxt = lines[i + size : i + 2 * size]
+            if block == nxt:
+                out.extend(block)
+                i += size * 2
+                collapsed = True
+                break
+        if not collapsed:
+            out.append(lines[i])
+            i += 1
+    return out
 
 
 def _strip_reasoning_sections(raw: str) -> str:
@@ -876,6 +881,119 @@ def _strip_reasoning_sections(raw: str) -> str:
     return "\n".join(out)
 
 
+_JSON_REPLY_FIELDS = (
+    "reply",
+    "response",
+    "content",
+    "text",
+    "message",
+    "final",
+    "final_answer",
+    "answer",
+    "output",
+)
+
+_JSON_NON_FINAL_EVENTS = {
+    "debug",
+    "delta",
+    "log",
+    "progress",
+    "reasoning",
+    "status",
+    "stderr",
+    "stdout",
+    "system",
+    "thinking",
+    "thought",
+    "tool",
+    "tool_call",
+    "tool_result",
+    "trace",
+}
+
+
+def _reply_from_json_obj(obj: Any) -> str:
+    """Extract the final answer from a structured agent response object."""
+    if isinstance(obj, str):
+        return obj.strip()
+
+    if isinstance(obj, list):
+        for item in reversed(obj):
+            text = _reply_from_json_obj(item)
+            if text:
+                return text
+        return ""
+
+    if not isinstance(obj, dict):
+        return ""
+
+    marker = str(
+        obj.get("event")
+        or obj.get("type")
+        or obj.get("kind")
+        or obj.get("phase")
+        or ""
+    ).strip().lower()
+    if marker in _JSON_NON_FINAL_EVENTS:
+        return ""
+
+    for field in _JSON_REPLY_FIELDS:
+        value = obj.get(field)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, (dict, list)):
+            text = _reply_from_json_obj(value)
+            if text:
+                return text
+
+    choices = obj.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            text = _reply_from_json_obj(choice)
+            if text:
+                return text
+
+    messages = obj.get("messages")
+    if isinstance(messages, list):
+        for item in reversed(messages):
+            if not isinstance(item, dict):
+                text = _reply_from_json_obj(item)
+                if text:
+                    return text
+                continue
+            role = str(item.get("role") or "").lower()
+            if role and role not in {"assistant", "agent", "openclaw", "model"}:
+                continue
+            text = _reply_from_json_obj(item)
+            if text:
+                return text
+
+    return ""
+
+
+def _json_objects_from_cli_output(raw: str) -> list[Any]:
+    """Parse structured CLI output without interpreting human terminal UI."""
+    raw = raw.strip()
+    if not raw:
+        return []
+
+    try:
+        return [json.loads(raw)]
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    objects: list[Any] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped[0] not in "[{":
+            continue
+        try:
+            objects.append(json.loads(stripped))
+        except (json.JSONDecodeError, TypeError):
+            continue
+    return objects
+
+
 def _extract_text_from_cli_output(raw: str) -> str:
     """Best-effort extraction from raw CLI stdout.
 
@@ -888,14 +1006,10 @@ def _extract_text_from_cli_output(raw: str) -> str:
     if not raw:
         return ""
 
-    # JSON path
-    try:
-        obj = json.loads(raw)
-        for field in ("response", "content", "text", "message", "reply"):
-            if isinstance(obj.get(field), str) and obj[field].strip():
-                return obj[field].strip()
-    except (json.JSONDecodeError, TypeError):
-        pass
+    for obj in reversed(_json_objects_from_cli_output(raw)):
+        text = _reply_from_json_obj(obj)
+        if text:
+            return text
 
     raw = _strip_reasoning_sections(raw)
     clean = [ln.rstrip() for ln in raw.splitlines() if not _NOISE_LINE_RE.match(ln)]
@@ -1047,7 +1161,13 @@ def _save_agent_session_id(sid: str) -> None:
 def _extract_session_id(raw: str) -> str:
     if not raw:
         return ""
-    m = re.search(r"session_id\s*:\s*([A-Za-z0-9_\-]+)", raw)
+    for obj in reversed(_json_objects_from_cli_output(raw)):
+        if isinstance(obj, dict):
+            for field in ("session_id", "sessionId", "session"):
+                value = obj.get(field)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    m = re.search(r'"?session_id"?\s*:\s*"?([A-Za-z0-9_\-]+)"?', raw)
     if m:
         return m.group(1)
     m = re.search(r"Resumed session\s+([A-Za-z0-9_\-]+)", raw)
@@ -1149,6 +1269,20 @@ def _warn_if_agent_entry_may_drift() -> None:
         log.warning(
             "Hermes/OpenClaw CLI has no --source flag. Use --source tool so IO "
             "messages enter the normal tool-origin conversation path."
+        )
+
+    output_mode = _cli_flag_value(cmd, "--output-mode")
+    if not output_mode:
+        log.warning(
+            "Hermes/OpenClaw CLI is not using --output-mode json. Prefer "
+            "structured JSON stdout so the resident reads only the final reply "
+            "field instead of cleaning human terminal UI."
+        )
+    elif output_mode.lower() != "json":
+        log.warning(
+            "Hermes/OpenClaw CLI output mode is %s; prefer --output-mode json "
+            "for IO resident chat.",
+            output_mode,
         )
 
     turns_raw = _cli_flag_value(cmd, "--max-turns")
@@ -1297,7 +1431,7 @@ def _sanitize_reply_text(text: str) -> str:
     if not kept:
         return ""
 
-    kept = _strip_leading_meta_preamble(kept)
+    kept = _strip_leading_non_cjk_preamble(kept)
     if not kept:
         return ""
 
@@ -1306,6 +1440,8 @@ def _sanitize_reply_text(text: str) -> str:
     for ln in kept:
         if not deduped or deduped[-1] != ln:
             deduped.append(ln)
+
+    deduped = _collapse_repeated_line_blocks(deduped)
 
     return "\n".join(deduped).strip()
 

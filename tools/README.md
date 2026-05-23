@@ -193,18 +193,19 @@ is available. Prefer an absolute executable path in `AGENT_CLI_CMD`; if that
 is not stable, set `AGENT_CLI_PATH` to the directory that contains the agent
 binary.
 
-**CLI agents must produce clean stdout.** Session IDs, prompts, debug
-footers, and other decorative output WILL leak into the user's chat
-if your CLI doesn't have a quiet mode. The daemon strips a few known
-patterns defensively (Hermes' `session_id:` footer for example) but
-the safest path is configuring your CLI to be silent.
+**CLI agents should produce structured stdout.** Prefer valid JSON with a
+single final-answer field such as `{"reply":"..."}` plus optional
+`session_id`. The daemon reads the reply field directly and treats human
+terminal UI as a fallback path only. Session IDs, prompts, debug footers,
+and decorative output can still leak if the CLI does not offer JSON/quiet
+mode, so do not depend on text cleanup for normal operation.
 
 ##### Hermes example
 
 ```
 AGENT_CLI_PATH=/home/openclaw/.local/bin:/home/openclaw/.hermes/hermes-agent/venv/bin
 HERMES_HOME=/home/openclaw/.hermes/profiles/daily
-AGENT_CLI_CMD=hermes chat -Q --source tool --max-turns 60 -q "{message}"
+AGENT_CLI_CMD=hermes chat --output-mode json -Q --source tool --max-turns 60 -q "{message}"
 ```
 
 Do not put `--continue` in `AGENT_CLI_CMD`. On the first turn, Hermes creates
