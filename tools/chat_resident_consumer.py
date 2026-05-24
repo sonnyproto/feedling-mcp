@@ -1302,7 +1302,7 @@ def _resolve_cli_executable(cmd: list[str]) -> list[str]:
 
 
 def _is_hermes_chat_cmd(cmd: list[str]) -> bool:
-    return len(cmd) >= 2 and Path(cmd[0]).name == "hermes" and cmd[1] == "chat"
+    return bool(cmd) and Path(cmd[0]).name == "hermes" and "chat" in cmd[1:]
 
 
 def _cli_flag_value(cmd: list[str], flag: str) -> str:
@@ -1458,7 +1458,7 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
                 "continuity uses stored session_id plus --resume"
             )
         if sid and not _has_hermes_resume(cmd):
-            cmd = [cmd[0], cmd[1], "--resume", sid, *cmd[2:]]
+            cmd = [cmd[0], "--resume", sid, *cmd[1:]]
 
     return _resolve_cli_executable(cmd)
 

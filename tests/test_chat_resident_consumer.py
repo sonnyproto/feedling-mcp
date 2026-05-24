@@ -672,7 +672,22 @@ def test_prepare_hermes_cli_strips_continue_and_injects_resume(monkeypatch):
     cmd = crc._prepare_cli_command("hello")
 
     assert "--continue" not in cmd
-    assert cmd[:4] == ["hermes", "chat", "--resume", "sess_123"]
+    assert cmd[:4] == ["hermes", "--resume", "sess_123", "chat"]
+    assert "hello" in cmd
+
+
+def test_prepare_hermes_cli_injects_resume_before_chat_with_top_level_flags(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        'hermes --yolo chat -Q --source tool --max-turns 60 -q "{message}"',
+    )
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("hello")
+
+    assert cmd[:5] == ["hermes", "--resume", "sess_123", "--yolo", "chat"]
     assert "hello" in cmd
 
 
