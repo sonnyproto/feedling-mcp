@@ -915,3 +915,56 @@ def test_process_proactive_jobs_routes_through_agent_and_posts_metadata(monkeypa
         "gate_decision_id": "gd_1",
         "proactive_job_id": "pj_1",
     }
+
+
+def test_post_proactive_reply_triggers_alert_and_live_activity(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"id": "msg_1"}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        return _Resp()
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_abc", "user_pk": b"u" * 32, "enclave_pk": b"e" * 32},
+    )
+    monkeypatch.setattr(
+        crc,
+        "_build_envelope",
+        lambda **kwargs: {"v": 1, "id": "env_1", "visibility": kwargs["visibility"]},
+    )
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    crc.post_reply(
+        "我看到了这个时机。",
+        source=crc.PROACTIVE_JOB_SOURCE,
+        gate_decision_id="gd_1",
+        proactive_job_id="pj_1",
+    )
+
+    body = captured["json"]
+    assert body["source"] == crc.PROACTIVE_JOB_SOURCE
+    assert body["gate_decision_id"] == "gd_1"
+    assert body["proactive_job_id"] == "pj_1"
+    assert body["alert_body"] == "我看到了这个时机。"
+    assert body["push_live_activity"] is True
+    assert body["push_body"] == "我看到了这个时机。"
+    assert body["data"] == {
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "gate_decision_id": "gd_1",
+        "proactive_job_id": "pj_1",
+    }

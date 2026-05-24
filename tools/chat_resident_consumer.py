@@ -1728,7 +1728,15 @@ def post_reply(
         if proactive_job_id:
             body["proactive_job_id"] = proactive_job_id
         if source == PROACTIVE_JOB_SOURCE:
-            body["alert_body"] = content[:240]
+            visible_body = content[:240]
+            body["alert_body"] = visible_body
+            body["push_live_activity"] = True
+            body["push_body"] = visible_body
+            body["data"] = {
+                "source": PROACTIVE_JOB_SOURCE,
+                "gate_decision_id": gate_decision_id,
+                "proactive_job_id": proactive_job_id,
+            }
         resp = httpx.post(url, json=body, headers=_HEADERS, timeout=15)
         _handle_post_reply_response(resp)
         return
@@ -1742,7 +1750,9 @@ def post_reply(
         url,
         json={
             "content": content,
-            "push_live_activity": False,
+            "push_live_activity": source == PROACTIVE_JOB_SOURCE,
+            "push_body": content[:240] if source == PROACTIVE_JOB_SOURCE else "",
+            "alert_body": content[:240] if source == PROACTIVE_JOB_SOURCE else "",
             "source": source,
             "gate_decision_id": gate_decision_id,
             "proactive_job_id": proactive_job_id,
