@@ -205,7 +205,7 @@ mode, so do not depend on text cleanup for normal operation.
 ```
 AGENT_CLI_PATH=/home/openclaw/.local/bin:/home/openclaw/.hermes/hermes-agent/venv/bin
 HERMES_HOME=/home/openclaw/.hermes/profiles/daily
-AGENT_CLI_CMD=hermes chat --output-mode json -Q --source tool --max-turns 60 -q "{message}"
+AGENT_CLI_CMD=hermes chat -Q --source tool --max-turns 60 -q "{message}"
 ```
 
 Do not put `--continue` in `AGENT_CLI_CMD`. On the first turn, Hermes creates

@@ -35,7 +35,7 @@ CLI mode:
                         Image messages can also use {image_path} or
                         {image_paths}; otherwise the path is appended to
                         the message text.
-                        Example (Hermes): hermes chat --output-mode json -Q --source tool --max-turns 60 -q "{message}"
+                        Example (Hermes): hermes chat -Q --source tool --max-turns 60 -q "{message}"
                         Example (plain):  mycli ask {message}
                         For Hermes, the consumer stores session_id and
                         auto-injects --resume on later turns.
@@ -1084,7 +1084,7 @@ def _json_objects_from_cli_output(raw: str) -> list[Any]:
 def _extract_text_from_cli_output(raw: str) -> str:
     """Best-effort extraction from raw CLI stdout.
 
-    1. Try JSON parse first (hermes --output-mode json gives a clean field).
+    1. Try JSON parse first when a runtime provides structured output.
     2. Remove explicit reasoning/code sections.
     3. Strip known headers/footers.
     4. Return the full remaining answer, preserving multi-paragraph replies.
@@ -1359,16 +1359,11 @@ def _warn_if_agent_entry_may_drift() -> None:
         )
 
     output_mode = _cli_flag_value(cmd, "--output-mode")
-    if not output_mode:
+    if output_mode:
         log.warning(
-            "Hermes/OpenClaw CLI is not using --output-mode json. Prefer "
-            "structured JSON stdout so the resident reads only the final reply "
-            "field instead of cleaning human terminal UI."
-        )
-    elif output_mode.lower() != "json":
-        log.warning(
-            "Hermes/OpenClaw CLI output mode is %s; prefer --output-mode json "
-            "for IO resident chat.",
+            "Hermes/OpenClaw CLI includes --output-mode %s. Current Hermes chat "
+            "deployments do not support this flag; the resident will remove it "
+            "before execution.",
             output_mode,
         )
 
@@ -1405,6 +1400,23 @@ def _strip_hermes_continue(cmd: list[str]) -> tuple[list[str], bool]:
             i += 1
             # Hermes accepts an optional session name after --continue. Drop it
             # only when it is clearly not another flag.
+            if i < len(cmd) and not cmd[i].startswith("-"):
+                i += 1
+            continue
+        out.append(token)
+        i += 1
+    return out, removed
+
+
+def _strip_cli_option_value(cmd: list[str], flags: set[str]) -> tuple[list[str], bool]:
+    out: list[str] = []
+    i = 0
+    removed = False
+    while i < len(cmd):
+        token = cmd[i]
+        if token in flags:
+            removed = True
+            i += 1
             if i < len(cmd) and not cmd[i].startswith("-"):
                 i += 1
             continue
@@ -1456,6 +1468,12 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
             log.warning(
                 "removed Hermes --continue from AGENT_CLI_CMD; resident "
                 "continuity uses stored session_id plus --resume"
+            )
+        cmd, removed_output_mode = _strip_cli_option_value(cmd, {"--output-mode"})
+        if removed_output_mode:
+            log.warning(
+                "removed Hermes --output-mode from AGENT_CLI_CMD; this Hermes "
+                "chat CLI does not support that flag in current deployments"
             )
         if sid and not _has_hermes_resume(cmd):
             cmd = [cmd[0], "--resume", sid, *cmd[1:]]

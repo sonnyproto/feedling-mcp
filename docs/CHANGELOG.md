@@ -61,7 +61,7 @@
   path-specific IO connection details, and a short start prompt. Detailed
   CLI/HTTP/systemd choices now live in the public `io-onboarding` skill.
 - Updated resident consumer docs and examples to use Hermes/OpenClaw CLI
-  `HERMES_HOME=<real profile> hermes chat --output-mode json -Q --source tool --max-turns 60 -q "{message}"`,
+  `HERMES_HOME=<real profile> hermes chat -Q --source tool --max-turns 60 -q "{message}"`,
   persist session id for `--resume`, avoid wrapper persona prompts, and keep
   user-visible fallback templates off by default.
 - Updated README inventories for current verification endpoints/tools and

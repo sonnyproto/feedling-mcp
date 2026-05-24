@@ -691,6 +691,23 @@ def test_prepare_hermes_cli_injects_resume_before_chat_with_top_level_flags(monk
     assert "hello" in cmd
 
 
+def test_prepare_hermes_cli_strips_unsupported_output_mode(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        'hermes chat --output-mode json -Q --source tool --max-turns 60 -q "{message}"',
+    )
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("hello")
+
+    assert "--output-mode" not in cmd
+    assert "json" not in cmd
+    assert cmd[:4] == ["hermes", "--resume", "sess_123", "chat"]
+    assert "hello" in cmd
+
+
 def test_prepare_hermes_cli_first_turn_removes_continue(monkeypatch):
     monkeypatch.setattr(
         crc,
