@@ -50,6 +50,13 @@ Optional:
                         entry used for chat replies.
   PROACTIVE_POLL_TIMEOUT
                         Short long-poll timeout for proactive jobs (default: 1)
+  PROACTIVE_TICK_ENABLED
+                        Default true. Periodically ask Feedling Gate to inspect
+                        recent screen context and enqueue hidden jobs when true.
+  PROACTIVE_TICK_INTERVAL_SEC
+                        Gate tick interval in seconds (default: 300)
+  PROACTIVE_TICK_START_DELAY_SEC
+                        Delay before the first automatic Gate tick (default: 15)
   SEND_FALLBACK_ON_AGENT_ERROR
                         Default false. When false, agent failures are logged
                         and no fake template is posted to the user.
@@ -73,6 +80,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -151,6 +159,13 @@ CHECKPOINT_FILE = Path(
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 PROACTIVE_POLL_ENABLED = _env_bool("PROACTIVE_POLL_ENABLED", True)
 PROACTIVE_POLL_TIMEOUT = int(os.environ.get("PROACTIVE_POLL_TIMEOUT", "1"))
+PROACTIVE_TICK_ENABLED = _env_bool("PROACTIVE_TICK_ENABLED", True)
+PROACTIVE_TICK_INTERVAL_SEC = int(os.environ.get("PROACTIVE_TICK_INTERVAL_SEC", "300"))
+PROACTIVE_TICK_START_DELAY_SEC = int(os.environ.get("PROACTIVE_TICK_START_DELAY_SEC", "15"))
+CONSUMER_ID = os.environ.get(
+    "CONSUMER_ID",
+    f"{socket.gethostname()}:{os.getpid()}",
+)
 AGENT_SESSION_FILE_TEMPLATE = os.environ.get(
     "AGENT_SESSION_FILE",
     f"/tmp/feedling_agent_session_{hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]}_{{user_id}}.txt",
@@ -1689,13 +1704,55 @@ def poll_proactive_jobs(since: float) -> dict:
     return resp.json()
 
 
+def post_proactive_tick() -> dict:
+    url = f"{FEEDLING_API_URL}/v1/proactive/tick"
+    resp = httpx.post(url, json={}, headers=_HEADERS, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def claim_proactive_job(job_id: str) -> bool:
+    if not job_id:
+        return False
+    url = f"{FEEDLING_API_URL}/v1/proactive/jobs/{job_id}/claim"
+    resp = httpx.post(
+        url,
+        json={"consumer_id": CONSUMER_ID},
+        headers=_HEADERS,
+        timeout=10,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    return bool(body.get("claimed"))
+
+
+def update_proactive_job_status(job_id: str, status: str, reason: str = "") -> None:
+    if not job_id:
+        return
+    url = f"{FEEDLING_API_URL}/v1/proactive/jobs/{job_id}/status"
+    try:
+        resp = httpx.post(
+            url,
+            json={
+                "status": status,
+                "reason": reason,
+                "consumer_id": CONSUMER_ID,
+            },
+            headers=_HEADERS,
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        log.warning("failed to update proactive job status id=%s status=%s error=%s", job_id, status, e)
+
+
 def post_reply(
     content: str,
     *,
     source: str = "chat",
     gate_decision_id: str = "",
     proactive_job_id: str = "",
-) -> None:
+) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
 
     Falls back to plaintext only when encryption is unavailable — this will
@@ -1738,8 +1795,7 @@ def post_reply(
                 "proactive_job_id": proactive_job_id,
             }
         resp = httpx.post(url, json=body, headers=_HEADERS, timeout=15)
-        _handle_post_reply_response(resp)
-        return
+        return _handle_post_reply_response(resp)
 
     # Encryption unavailable — plaintext path (will 400 on v1 backends).
     log.error(
@@ -1759,10 +1815,10 @@ def post_reply(
         },
         headers=_HEADERS, timeout=15,
     )
-    _handle_post_reply_response(resp)
+    return _handle_post_reply_response(resp)
 
 
-def _handle_post_reply_response(resp) -> None:
+def _handle_post_reply_response(resp) -> dict:
     """Inspect a /v1/chat/response response. Re-raises 4xx/5xx EXCEPT for
     the structured `bootstrap_incomplete` 409, which we want to surface in
     operator logs without crashing the daemon (a crash would put the
@@ -1784,8 +1840,12 @@ def _handle_post_reply_response(resp) -> None:
                 body.get("memory_count"),
                 body.get("identity_written"),
             )
-            return
+            return body
     resp.raise_for_status()
+    try:
+        return resp.json()
+    except Exception:
+        return {}
 
 
 def get_latest_ts() -> float:
@@ -1862,6 +1922,15 @@ def _process_proactive_jobs(jobs: list) -> float:
             log.debug("skipping already-processed proactive job key=%s", key)
             continue
 
+        job_id = str(job.get("job_id") or "")
+        try:
+            if not claim_proactive_job(job_id):
+                log.info("proactive job not claimed id=%s", job_id)
+                continue
+        except Exception as e:
+            log.error("proactive job claim failed id=%s: %s", job_id, e)
+            continue
+
         frame_ids = job.get("frame_ids")
         if not isinstance(frame_ids, list):
             frame_ids = []
@@ -1875,6 +1944,7 @@ def _process_proactive_jobs(jobs: list) -> float:
             len(frame_ids),
         )
 
+        update_proactive_job_status(job_id, "realizing")
         try:
             replies = call_agent(
                 message,
@@ -1883,6 +1953,7 @@ def _process_proactive_jobs(jobs: list) -> float:
             )
         except Exception as e:
             log.error("proactive agent call failed; not posting fallback: %s", e)
+            update_proactive_job_status(job_id, "failed", f"agent_call_failed: {e}")
             continue
 
         if isinstance(replies, str):
@@ -1890,17 +1961,31 @@ def _process_proactive_jobs(jobs: list) -> float:
         elif not isinstance(replies, list):
             replies = [str(replies)]
 
+        posted_any = False
+        last_error = ""
         for reply in replies:
             try:
-                post_reply(
+                result = post_reply(
                     reply,
                     source=PROACTIVE_JOB_SOURCE,
                     gate_decision_id=str(job.get("gate_decision_id") or ""),
-                    proactive_job_id=str(job.get("job_id") or ""),
+                    proactive_job_id=job_id,
                 )
+                if isinstance(result, dict) and result.get("error"):
+                    raise RuntimeError(str(result)[:500])
+                posted_any = True
+                if isinstance(result, dict):
+                    update_proactive_job_status(
+                        job_id,
+                        "posted",
+                        f"chat_message_id={result.get('id', '')}",
+                    )
                 log.info("proactive reply sent: %s", reply[:80])
             except Exception as e:
+                last_error = str(e)
                 log.error("failed to post proactive reply: %s", e)
+        if not posted_any:
+            update_proactive_job_status(job_id, "failed", last_error or "empty_agent_reply")
 
     return latest
 
@@ -2074,13 +2159,16 @@ def run() -> None:
         # replayed after an operator installs the consumer.
         last_job_ts = time.time()
         _save_proactive_checkpoint(last_job_ts)
+    next_proactive_tick_mono = time.monotonic() + max(0, PROACTIVE_TICK_START_DELAY_SEC)
 
     log.info(
-        "starting poll loop — last_ts=%.3f last_job_ts=%.3f poll_timeout=%ds proactive=%s",
+        "starting poll loop — last_ts=%.3f last_job_ts=%.3f poll_timeout=%ds proactive=%s proactive_tick=%s tick_interval=%ds",
         last_ts,
         last_job_ts,
         POLL_TIMEOUT,
         proactive_enabled,
+        PROACTIVE_TICK_ENABLED,
+        PROACTIVE_TICK_INTERVAL_SEC,
     )
 
     consecutive_errors = 0
@@ -2089,6 +2177,17 @@ def run() -> None:
         try:
             if proactive_enabled:
                 try:
+                    if PROACTIVE_TICK_ENABLED and time.monotonic() >= next_proactive_tick_mono:
+                        tick = post_proactive_tick()
+                        decision = tick.get("decision") or {}
+                        log.info(
+                            "proactive gate tick gate=%s reason=%s enqueued=%s frames=%d",
+                            bool(decision.get("should_reach_out")),
+                            decision.get("reason"),
+                            bool(tick.get("enqueued")),
+                            len(decision.get("frame_ids") or []),
+                        )
+                        next_proactive_tick_mono = time.monotonic() + max(30, PROACTIVE_TICK_INTERVAL_SEC)
                     job_result = poll_proactive_jobs(last_job_ts)
                     jobs = job_result.get("jobs") or []
                     if jobs:

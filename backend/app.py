@@ -14,7 +14,7 @@ import uuid
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 import httpx
 import jwt
@@ -520,10 +520,23 @@ class UserStore:
         if envelope.get("K_enclave") is not None:
             msg["K_enclave"] = envelope["K_enclave"]
         if extra:
-            for key in ("gate_decision_id", "proactive_job_id"):
+            for key in (
+                "gate_decision_id",
+                "proactive_job_id",
+                "alert_preview",
+                "push_body_preview",
+                "push_live_activity_requested",
+                "live_activity_status",
+                "live_activity_reason",
+                "live_activity_activity_id",
+                "alert_status",
+                "alert_reason",
+            ):
                 value = extra.get(key)
                 if isinstance(value, str) and value.strip():
                     msg[key] = value.strip()
+                elif isinstance(value, bool):
+                    msg[key] = value
 
         with self.chat_lock:
             self.chat_messages.append(msg)
@@ -531,6 +544,31 @@ class UserStore:
                 self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
             self._persist_chat()
         return msg
+
+    def update_chat_message_metadata(self, msg_id: str, fields: dict) -> dict | None:
+        allowed = {
+            "live_activity_status",
+            "live_activity_reason",
+            "live_activity_activity_id",
+            "alert_status",
+            "alert_reason",
+        }
+        clean: dict = {}
+        for key, value in (fields or {}).items():
+            if key not in allowed:
+                continue
+            if value is None:
+                continue
+            clean[key] = str(value)[:500]
+        if not clean:
+            return None
+        with self.chat_lock:
+            for msg in self.chat_messages:
+                if msg.get("id") == msg_id:
+                    msg.update(clean)
+                    self._persist_chat()
+                    return msg
+        return None
 
     def notify_chat_waiters(self):
         with self.chat_waiters_lock:
@@ -643,6 +681,59 @@ class UserStore:
 
     def list_proactive_jobs(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
         return self._read_jsonl(self.proactive_jobs_file, limit=limit, since_epoch=since_epoch)
+
+    def update_proactive_job(
+        self,
+        job_id: str,
+        fields: dict,
+        *,
+        only_if_status: str | None = None,
+    ) -> dict | None:
+        """Patch one hidden proactive job in-place.
+
+        Jobs are kept as JSONL for append/read simplicity, but status needs a
+        real lifecycle so the debug dashboard can distinguish "not consumed"
+        from "agent failed" from "chat write delivered".
+        """
+        job_id = str(job_id or "").strip()
+        if not job_id:
+            return None
+        allowed = {
+            "status",
+            "status_reason",
+            "consumer_id",
+            "claimed_at",
+            "realizing_at",
+            "posted_at",
+            "failed_at",
+            "updated_at",
+            "chat_message_id",
+        }
+        patch = {k: v for k, v in (fields or {}).items() if k in allowed}
+        if not patch:
+            return None
+        patch["updated_at"] = datetime.now().isoformat()
+        with self.proactive_lock:
+            rows = self._read_jsonl(self.proactive_jobs_file, limit=0, since_epoch=0.0)
+            changed: dict | None = None
+            for row in rows:
+                if str(row.get("job_id") or "") != job_id:
+                    continue
+                cur_status = str(row.get("status") or "pending")
+                if only_if_status is not None and cur_status != only_if_status:
+                    return None
+                row.update(patch)
+                changed = row
+                break
+            if changed is None:
+                return None
+            tmp = self.proactive_jobs_file.with_suffix(".jsonl.tmp")
+            with open(tmp, "w") as f:
+                for row in rows[-PROACTIVE_JOB_MAX:]:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            tmp.replace(self.proactive_jobs_file)
+        self.notify_proactive_job_waiters()
+        return changed
 
     def _trim_proactive_jobs(self) -> None:
         rows = self._read_jsonl(self.proactive_jobs_file, limit=PROACTIVE_JOB_MAX, since_epoch=0.0)
@@ -958,13 +1049,135 @@ def _recent_frame_meta(store: UserStore, now: float, window_sec: float) -> list[
     return frames[-12:]
 
 
+def _sample_frames_for_gate(frames: list[dict], max_frames: int = 5) -> list[dict]:
+    """Pick representative recent frames for Gate V0.
+
+    True visual clustering belongs in the vision Gate. This metadata sampler
+    keeps the same contract now: include boundaries and current state, cap at 5.
+    """
+    clean = [f for f in frames if isinstance(f, dict) and str(f.get("id") or "").strip()]
+    clean.sort(key=lambda f: float(f.get("ts", 0) or 0))
+    if len(clean) <= max_frames:
+        return clean
+    if max_frames <= 2:
+        return [clean[-1]]
+    picks = [clean[0], clean[-1]]
+    middle = clean[1:-1]
+    slots = max_frames - len(picks)
+    if middle and slots > 0:
+        if slots == 1:
+            picks.append(middle[len(middle) // 2])
+        else:
+            for i in range(slots):
+                idx = round(i * (len(middle) - 1) / max(1, slots - 1))
+                picks.append(middle[idx])
+    by_id: dict[str, dict] = {}
+    for frame in picks:
+        by_id[str(frame.get("id"))] = frame
+    return sorted(by_id.values(), key=lambda f: float(f.get("ts", 0) or 0))
+
+
 def _frame_ids(frames: list[dict]) -> list[str]:
     out: list[str] = []
     for frame in frames:
         frame_id = str(frame.get("id") or "").strip()
         if frame_id:
             out.append(frame_id)
-    return out[-4:]
+    return out[-5:]
+
+
+def _decrypt_frame_metadata_for_gate(store: UserStore, frame_id: str, api_key: str | None) -> dict:
+    """Best-effort decrypt of a frame for the automatic Gate.
+
+    The Flask backend does not store raw API keys, so only request-scoped
+    callers (iOS / resident consumer / manual curl) can run this path.
+    """
+    fid = str(frame_id or "").strip()
+    if not fid:
+        return {"frame_id": "", "error": "missing_frame_id"}
+    if _find_envelope_path(store, fid) is None:
+        return {"frame_id": fid, "error": "frame_not_found"}
+    enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
+    if not enclave_url:
+        return {"frame_id": fid, "error": "enclave_unavailable"}
+    if not api_key:
+        return {"frame_id": fid, "error": "api_key_unavailable"}
+    try:
+        with httpx.Client(timeout=20, verify=False) as client:
+            resp = client.get(
+                f"{enclave_url}/v1/screen/frames/{fid}/decrypt",
+                headers={"X-API-Key": api_key},
+                params={"include_image": "false"},
+            )
+        if resp.status_code >= 400:
+            return {
+                "frame_id": fid,
+                "error": f"decrypt_http_{resp.status_code}",
+                "body": resp.text[:240],
+            }
+        data = resp.json()
+        if not isinstance(data, dict):
+            return {"frame_id": fid, "error": "decrypt_non_object"}
+        return {
+            "frame_id": fid,
+            "ts": data.get("ts"),
+            "app": data.get("app") or "unknown",
+            "ocr_text": str(data.get("ocr_text") or "")[:1200],
+            "w": data.get("w"),
+            "h": data.get("h"),
+        }
+    except Exception as e:
+        return {"frame_id": fid, "error": f"decrypt_error:{type(e).__name__}:{str(e)[:160]}"}
+
+
+def _gate_ocr_summary(frame_contexts: list[dict], fallback_frames: list[dict]) -> str:
+    seen: set[str] = set()
+    parts: list[str] = []
+    for frame in reversed(frame_contexts):
+        text = str(frame.get("ocr_text") or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            parts.append(text[:320])
+            if len(parts) >= 4:
+                break
+    if parts:
+        return " | ".join(reversed(parts))[:1000]
+    return _ocr_summary(fallback_frames)
+
+
+def _gate_current_app(frame_contexts: list[dict], fallback_frames: list[dict]) -> str:
+    for frame in reversed(frame_contexts):
+        app_name = str(frame.get("app") or "").strip()
+        if app_name and app_name != "unknown":
+            return app_name[:120]
+    for frame in reversed(fallback_frames):
+        app_name = str(frame.get("app") or "").strip()
+        if app_name:
+            return app_name[:120]
+    return "unknown"
+
+
+def _explicit_help_signal(ocr: str) -> bool:
+    text = (ocr or "").lower()
+    if len(text.strip()) < 40:
+        return False
+    cues = (
+        "帮我", "要不要", "怎么", "如何", "哪一个", "选哪个", "压成", "总结",
+        "review", "compare", "which", "should i", "help me", "summarize",
+    )
+    return any(cue in text for cue in cues) or "?" in text or "？" in text
+
+
+def _recent_proactive_fire_active(store: UserStore, now: float, window_sec: float = 900.0) -> bool:
+    with store.chat_lock:
+        for msg in reversed(store.chat_messages):
+            if msg.get("source") != PROACTIVE_JOB_SOURCE:
+                continue
+            ts = float(msg.get("ts", 0) or 0)
+            if now - ts <= window_sec:
+                return True
+            return False
+    return False
 
 
 def _ocr_summary(frames: list[dict]) -> str:
@@ -994,25 +1207,44 @@ def _payload_float(payload: dict, key: str, default: float, lo: float, hi: float
     return max(lo, min(hi, value))
 
 
-def _build_proactive_gate_decision(store: UserStore, payload: dict) -> dict:
+def _build_proactive_gate_decision(store: UserStore, payload: dict, api_key: str | None = None) -> dict:
     now = time.time()
     payload = payload if isinstance(payload, dict) else {}
     force = bool(payload.get("force", False))
     settings = store.load_proactive_settings()
 
-    frames = _recent_frame_meta(
-        store,
-        now,
-        _payload_float(payload, "frame_window_sec", 300.0, 30.0, 3600.0),
-    )
+    payload_frames = payload.get("frames")
+    if isinstance(payload_frames, list) and payload_frames:
+        frames = [
+            f for f in payload_frames
+            if isinstance(f, dict) and str(f.get("id") or f.get("frame_id") or "").strip()
+        ]
+        for f in frames:
+            if not f.get("id") and f.get("frame_id"):
+                f["id"] = f.get("frame_id")
+    else:
+        frames = _recent_frame_meta(
+            store,
+            now,
+            _payload_float(payload, "frame_window_sec", 300.0, 30.0, 3600.0),
+        )
+    selected_frames = _sample_frames_for_gate(frames)
+    frame_ids = _frame_ids(selected_frames)
+    frame_contexts = [
+        _decrypt_frame_metadata_for_gate(store, fid, api_key)
+        for fid in frame_ids
+    ] if frame_ids and not payload.get("context_hint") else []
     device_events = _recent_device_events_for_gate(
         store,
         now,
         _payload_float(payload, "device_event_window_sec", 900.0, 30.0, 86400.0),
     )
-    latest = frames[-1] if frames else {}
-    current_app = latest.get("app") or "unknown"
-    ocr = _ocr_summary(frames)
+    current_app = str(payload.get("current_app") or "").strip()
+    if not current_app:
+        current_app = _gate_current_app(frame_contexts, selected_frames)
+    ocr = str(payload.get("ocr_summary") or "").strip()
+    if not ocr:
+        ocr = _gate_ocr_summary(frame_contexts, selected_frames)
 
     context_hint = str(payload.get("context_hint") or "").strip()
     connections = payload.get("connections")
@@ -1028,6 +1260,10 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict) -> dict:
         or "proactive_screen_context"
     ).strip()
 
+    explicit_help = _explicit_help_signal(ocr)
+    decrypt_errors = [f.get("error") for f in frame_contexts if f.get("error")]
+    decrypt_ok = any(str(f.get("ocr_text") or "").strip() or str(f.get("app") or "").strip() not in {"", "unknown"} for f in frame_contexts)
+
     if not context_hint:
         suggested = semantic.get("suggested_openers") or []
         if semantic.get("semantic_strength") in {"strong", "medium"} and (ocr or current_app != "unknown"):
@@ -1035,10 +1271,19 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict) -> dict:
                 f"Recent screen context appears to be {semantic.get('semantic_scene') or 'active work'} "
                 f"in {current_app}. OCR summary: {ocr or 'not available'}."
             )
+        elif explicit_help:
+            context_hint = (
+                "Recent screen context contains an explicit help / choice / summary cue. "
+                f"Current app: {current_app}. OCR summary: {ocr[:700]}."
+            )
         elif suggested and (ocr or current_app != "unknown"):
             context_hint = f"Possible useful opening: {suggested[0]} Context: {ocr or current_app}."
 
-    should_reach_out = bool(context_hint)
+    should_reach_out = bool(payload.get("context_hint")) or (
+        bool(context_hint) and (
+            semantic.get("semantic_strength") in {"strong", "medium"} or explicit_help
+        )
+    )
     reason = "manual_hint" if payload.get("context_hint") else "semantic_gate"
 
     if not settings.get("enabled", True) and not force:
@@ -1047,9 +1292,25 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict) -> dict:
     elif settings.get("dnd", False) and not force:
         should_reach_out = False
         reason = "dnd_enabled"
+    elif not frames and not force:
+        should_reach_out = False
+        reason = "no_recent_frames"
     elif _recent_user_chat_active(store, now) and not force:
         should_reach_out = False
         reason = "recent_user_chat_active"
+    elif store.cooldown_remaining_seconds() > 0 and not force:
+        should_reach_out = False
+        reason = "push_cooldown"
+    elif _recent_proactive_fire_active(store, now) and not force:
+        should_reach_out = False
+        reason = "recent_proactive_fire"
+    elif frame_ids and not decrypt_ok and not payload.get("context_hint") and not force:
+        should_reach_out = False
+        reason = "frame_decrypt_unavailable"
+    elif should_reach_out and semantic.get("semantic_strength") in {"strong", "medium"}:
+        reason = f"semantic_{semantic.get('semantic_strength')}"
+    elif should_reach_out and explicit_help:
+        reason = "explicit_help_signal"
     elif not should_reach_out:
         reason = "insufficient_context"
 
@@ -1058,7 +1319,7 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict) -> dict:
         "decision_id": decision_id,
         "ts": now,
         "created_at": datetime.fromtimestamp(now).isoformat(),
-        "gate_model": "manual_v0a",
+        "gate_model": "manual_v0a" if payload.get("context_hint") else "ocr_semantic_v0",
         "should_reach_out": should_reach_out,
         "should_garden_passive": False,
         "abstention_reason": "" if should_reach_out else reason,
@@ -1066,10 +1327,17 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict) -> dict:
         "intent_label": intent_label[:120],
         "context_hint": context_hint[:2000],
         "connections": connections,
-        "frame_ids": _frame_ids(frames),
+        "frame_ids": frame_ids,
         "device_event_ids": [str(e.get("event_id")) for e in device_events if e.get("event_id")][:10],
         "current_app": current_app,
         "semantic": semantic,
+        "gate_input": {
+            "ocr_chars": len(ocr),
+            "sampled_frame_count": len(selected_frames),
+            "decrypt_ok": decrypt_ok,
+            "decrypt_errors": [str(e)[:120] for e in decrypt_errors[:5]],
+            "explicit_help_signal": explicit_help,
+        },
         "forced": force,
     }
 
@@ -1105,10 +1373,45 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
                 "gate_decision_id": m.get("gate_decision_id", ""),
                 "proactive_job_id": m.get("proactive_job_id", ""),
                 "content_type": m.get("content_type", "text"),
+                "alert_preview": m.get("alert_preview", ""),
+                "push_body_preview": m.get("push_body_preview", ""),
+                "push_live_activity_requested": bool(m.get("push_live_activity_requested")),
+                "live_activity_status": m.get("live_activity_status", ""),
+                "live_activity_reason": m.get("live_activity_reason", ""),
+                "live_activity_activity_id": m.get("live_activity_activity_id", ""),
+                "alert_status": m.get("alert_status", ""),
+                "alert_reason": m.get("alert_reason", ""),
             }
             for m in store.chat_messages
             if m.get("source") == PROACTIVE_JOB_SOURCE
         ][-25:]
+    messages_by_job = {
+        str(m.get("proactive_job_id") or ""): m
+        for m in proactive_messages
+        if m.get("proactive_job_id")
+    }
+    enriched_jobs: list[dict] = []
+    for job in jobs:
+        row = dict(job)
+        msg = messages_by_job.get(str(job.get("job_id") or ""))
+        if msg:
+            live_status = str(msg.get("live_activity_status") or "")
+            alert_status = str(msg.get("alert_status") or "")
+            if live_status == "delivered" and alert_status in {"", "delivered", "logged_only"}:
+                row["derived_status"] = "delivered"
+            elif live_status:
+                row["derived_status"] = f"chat_written_live_activity_{live_status}"
+            else:
+                row["derived_status"] = "chat_written"
+            row["chat_message_id"] = msg.get("id", "")
+            row["chat_ts"] = msg.get("ts")
+            row["alert_status"] = alert_status
+            row["live_activity_status"] = live_status
+            row["preview"] = msg.get("alert_preview") or msg.get("push_body_preview") or ""
+        else:
+            row["derived_status"] = row.get("status", "pending")
+            row.setdefault("preview", "")
+        enriched_jobs.append(row)
     with store.frames_lock:
         frames = [
             {
@@ -1125,7 +1428,7 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
         "generated_at": datetime.now().isoformat(),
         "settings": store.load_proactive_settings(),
         "decisions": decisions,
-        "jobs": jobs,
+        "jobs": enriched_jobs,
         "device_events": events,
         "proactive_messages": proactive_messages,
         "recent_frames": frames,
@@ -1143,6 +1446,48 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     def esc(value) -> str:
         return html.escape(str(value if value is not None else ""))
 
+    api_key = (request.args.get("key") or "").strip()
+    key_qs = f"?key={quote(api_key)}" if api_key else ""
+
+    def fmt_time(ts_value) -> str:
+        try:
+            ts = float(ts_value or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if ts <= 0:
+            return ""
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+    def fmt_epoch(ts_value) -> str:
+        try:
+            return str(round(float(ts_value or 0), 3))
+        except (TypeError, ValueError):
+            return ""
+
+    def frame_links(frame_ids) -> str:
+        ids = [str(fid).strip() for fid in (frame_ids or []) if str(fid).strip()]
+        if not ids:
+            return ""
+        links = []
+        for fid in ids:
+            safe = quote(fid)
+            label = esc(fid[:10])
+            links.append(
+                f"<a class='mono' href='/v1/screen/frames/{safe}/image{key_qs}' target='_blank'>{label}</a>"
+                f"<a class='mini' href='/v1/screen/frames/{safe}/decrypt{key_qs}{'&' if key_qs else '?'}include_image=false' target='_blank'>json</a>"
+            )
+        return " ".join(links)
+
+    def status_class(value) -> str:
+        text = str(value or "").lower()
+        if text in {"true", "delivered", "chat_written", "logged_only"} or text.startswith("chat_written"):
+            return "ok"
+        if text in {"pending", "false", "skipped"}:
+            return "muted"
+        if "error" in text or "failed" in text:
+            return "bad"
+        return ""
+
     decisions = list(reversed(snapshot.get("decisions") or []))
     jobs = list(reversed(snapshot.get("jobs") or []))
     messages = list(reversed(snapshot.get("proactive_messages") or []))
@@ -1151,18 +1496,22 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
     def decision_rows() -> str:
         if not decisions:
-            return "<tr><td colspan='7'>No Gate decisions yet.</td></tr>"
+            return "<tr><td colspan='10'>No Gate decisions yet.</td></tr>"
         rows = []
         for d in decisions[:30]:
             verdict = "TRUE" if d.get("should_reach_out") else "FALSE"
+            gate_input = d.get("gate_input") or {}
             rows.append(
                 "<tr>"
-                f"<td class='mono'>{esc(round(float(d.get('ts') or 0), 3))}</td>"
+                f"<td>{esc(fmt_time(d.get('ts')))}</td>"
+                f"<td class='mono'>{esc(fmt_epoch(d.get('ts')))}</td>"
                 f"<td class='{ 'ok' if d.get('should_reach_out') else 'muted' }'>{verdict}</td>"
+                f"<td class='mono'>{esc(d.get('gate_model'))}</td>"
                 f"<td>{esc(d.get('reason') or d.get('abstention_reason'))}</td>"
                 f"<td>{esc(d.get('intent_label'))}</td>"
                 f"<td class='wrap'>{esc(d.get('context_hint'))}</td>"
-                f"<td>{esc(', '.join(d.get('frame_ids') or []))}</td>"
+                f"<td>{frame_links(d.get('frame_ids'))}</td>"
+                f"<td class='wrap mono'>{esc(json.dumps(gate_input, ensure_ascii=False))}</td>"
                 f"<td class='mono'>{esc(d.get('decision_id'))}</td>"
                 "</tr>"
             )
@@ -1170,15 +1519,23 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
     def job_rows() -> str:
         if not jobs:
-            return "<tr><td colspan='6'>No hidden proactive jobs yet.</td></tr>"
+            return "<tr><td colspan='13'>No hidden proactive jobs yet.</td></tr>"
         rows = []
         for j in jobs[:30]:
+            status = j.get("derived_status") or j.get("status", "pending")
             rows.append(
                 "<tr>"
-                f"<td class='mono'>{esc(round(float(j.get('ts') or 0), 3))}</td>"
-                f"<td>{esc(j.get('status', 'pending'))}</td>"
+                f"<td>{esc(fmt_time(j.get('ts')))}</td>"
+                f"<td class='mono'>{esc(fmt_epoch(j.get('ts')))}</td>"
+                f"<td class='{status_class(status)}'>{esc(status)}</td>"
                 f"<td>{esc(j.get('intent_label'))}</td>"
                 f"<td class='wrap'>{esc(j.get('context_hint'))}</td>"
+                f"<td>{frame_links(j.get('frame_ids'))}</td>"
+                f"<td class='wrap'>{esc(j.get('status_reason'))}</td>"
+                f"<td class='wrap'>{esc(j.get('preview'))}</td>"
+                f"<td class='{status_class(j.get('alert_status'))}'>{esc(j.get('alert_status'))}</td>"
+                f"<td class='{status_class(j.get('live_activity_status'))}'>{esc(j.get('live_activity_status'))}</td>"
+                f"<td class='mono'>{esc(j.get('consumer_id'))}</td>"
                 f"<td class='mono'>{esc(j.get('gate_decision_id'))}</td>"
                 f"<td class='mono'>{esc(j.get('job_id'))}</td>"
                 "</tr>"
@@ -1187,13 +1544,18 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
     def message_rows() -> str:
         if not messages:
-            return "<tr><td colspan='5'>No proactive chat writes yet.</td></tr>"
+            return "<tr><td colspan='9'>No proactive chat writes yet.</td></tr>"
         rows = []
         for m in messages[:25]:
+            preview = m.get("alert_preview") or m.get("push_body_preview") or "(encrypted envelope; no plaintext preview recorded)"
             rows.append(
                 "<tr>"
-                f"<td class='mono'>{esc(round(float(m.get('ts') or 0), 3))}</td>"
+                f"<td>{esc(fmt_time(m.get('ts')))}</td>"
+                f"<td class='mono'>{esc(fmt_epoch(m.get('ts')))}</td>"
                 f"<td>{esc(m.get('content_type'))}</td>"
+                f"<td class='wrap'>{esc(preview)}</td>"
+                f"<td class='{status_class(m.get('alert_status'))}'>{esc(m.get('alert_status'))}</td>"
+                f"<td class='{status_class(m.get('live_activity_status'))}'>{esc(m.get('live_activity_status'))}</td>"
                 f"<td class='mono'>{esc(m.get('gate_decision_id'))}</td>"
                 f"<td class='mono'>{esc(m.get('proactive_job_id'))}</td>"
                 f"<td class='mono'>{esc(m.get('id'))}</td>"
@@ -1203,28 +1565,30 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
     def frame_rows() -> str:
         if not frames:
-            return "<tr><td colspan='5'>No frames indexed.</td></tr>"
+            return "<tr><td colspan='6'>No frames indexed.</td></tr>"
         rows = []
         for f in frames[:25]:
             rows.append(
                 "<tr>"
-                f"<td class='mono'>{esc(round(float(f.get('ts') or 0), 3))}</td>"
+                f"<td>{esc(fmt_time(f.get('ts')))}</td>"
+                f"<td class='mono'>{esc(fmt_epoch(f.get('ts')))}</td>"
                 f"<td>{esc(f.get('app'))}</td>"
                 f"<td>{esc(f.get('ocr_len'))}</td>"
                 f"<td>{esc(f.get('encrypted'))}</td>"
-                f"<td class='mono'>{esc(f.get('id'))}</td>"
+                f"<td>{frame_links([f.get('id')])}</td>"
                 "</tr>"
             )
         return "".join(rows)
 
     def event_rows() -> str:
         if not events:
-            return "<tr><td colspan='4'>No device events yet.</td></tr>"
+            return "<tr><td colspan='5'>No device events yet.</td></tr>"
         rows = []
         for e in events[:25]:
             rows.append(
                 "<tr>"
-                f"<td class='mono'>{esc(round(float(e.get('ts') or 0), 3))}</td>"
+                f"<td>{esc(fmt_time(e.get('ts')))}</td>"
+                f"<td class='mono'>{esc(fmt_epoch(e.get('ts')))}</td>"
                 f"<td>{esc(e.get('source'))}</td>"
                 f"<td>{esc(e.get('type'))}</td>"
                 f"<td class='wrap'>{esc(json.dumps(e.get('payload') or {}, ensure_ascii=False))}</td>"
@@ -1250,9 +1614,12 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     th, td {{ border: 1px solid #ddd2c5; padding: 8px; vertical-align: top; text-align: left; }}
     th {{ background: #efe5d7; }}
     .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }}
+    a {{ color: #8e301f; text-decoration: none; border-bottom: 1px solid #d0a094; }}
+    a.mini {{ margin-left: 6px; font-size: 11px; color: #6f6961; }}
     .wrap {{ max-width: 520px; white-space: pre-wrap; }}
     .ok {{ color: #0b7d42; font-weight: 700; }}
     .muted {{ color: #8b8176; }}
+    .bad {{ color: #b42318; font-weight: 700; }}
   </style>
 </head>
 <body>
@@ -1267,19 +1634,19 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
   </div>
 
   <h2>Gate Decisions</h2>
-  <table><thead><tr><th>ts</th><th>Gate</th><th>reason</th><th>intent</th><th>context_hint</th><th>frames</th><th>decision</th></tr></thead><tbody>{decision_rows()}</tbody></table>
+  <table><thead><tr><th>time</th><th>ts</th><th>Gate</th><th>model</th><th>reason</th><th>intent</th><th>context_hint</th><th>frames</th><th>gate input</th><th>decision</th></tr></thead><tbody>{decision_rows()}</tbody></table>
 
   <h2>Hidden Jobs</h2>
-  <table><thead><tr><th>ts</th><th>status</th><th>intent</th><th>context_hint</th><th>decision</th><th>job</th></tr></thead><tbody>{job_rows()}</tbody></table>
+  <table><thead><tr><th>time</th><th>ts</th><th>status</th><th>intent</th><th>context_hint</th><th>frames sent</th><th>reason</th><th>preview</th><th>alert</th><th>live activity</th><th>consumer</th><th>decision</th><th>job</th></tr></thead><tbody>{job_rows()}</tbody></table>
 
   <h2>Proactive Chat Writes</h2>
-  <table><thead><tr><th>ts</th><th>type</th><th>decision</th><th>job</th><th>message</th></tr></thead><tbody>{message_rows()}</tbody></table>
+  <table><thead><tr><th>time</th><th>ts</th><th>type</th><th>preview</th><th>alert</th><th>live activity</th><th>decision</th><th>job</th><th>message</th></tr></thead><tbody>{message_rows()}</tbody></table>
 
   <h2>Recent Screen Frames</h2>
-  <table><thead><tr><th>ts</th><th>app</th><th>ocr len</th><th>encrypted</th><th>frame</th></tr></thead><tbody>{frame_rows()}</tbody></table>
+  <table><thead><tr><th>time</th><th>ts</th><th>app</th><th>ocr len</th><th>encrypted</th><th>frame</th></tr></thead><tbody>{frame_rows()}</tbody></table>
 
   <h2>Device Events</h2>
-  <table><thead><tr><th>ts</th><th>source</th><th>type</th><th>redacted payload</th></tr></thead><tbody>{event_rows()}</tbody></table>
+  <table><thead><tr><th>time</th><th>ts</th><th>source</th><th>type</th><th>redacted payload</th></tr></thead><tbody>{event_rows()}</tbody></table>
 </body>
 </html>"""
 
@@ -2064,7 +2431,7 @@ def _send_chat_alert(store: UserStore, alert_body: str, alert_title: str = ""):
     Tap on the notification opens the app (iOS handles routing).
     """
     if not alert_body:
-        return
+        return {"status": "skipped", "reason": "empty_body"}
     # Match iOS-registered token type: LiveActivityManager registers
     # the standard APNs push token as type="device".
     device_token = next(
@@ -2073,7 +2440,7 @@ def _send_chat_alert(store: UserStore, alert_body: str, alert_title: str = ""):
     )
     if not device_token:
         print(f"[chat-alert:{store.user_id}] no device token — skip push")
-        return
+        return {"status": "skipped", "reason": "no_device_token"}
 
     # Truncate at 80 chars; iOS shows the rest after tapping into chat.
     body = alert_body.strip()
@@ -2090,8 +2457,10 @@ def _send_chat_alert(store: UserStore, alert_body: str, alert_title: str = ""):
     try:
         result = _send_apns(device_token, apns_payload, push_type="alert", topic=BUNDLE_ID)
         print(f"[chat-alert:{store.user_id}] {result.get('status')}")
+        return result
     except Exception as e:
         print(f"[chat-alert:{store.user_id}] failed: {e}")
+        return {"status": "error", "reason": str(e)}
 
 
 @app.route("/v1/push/notification", methods=["POST"])
@@ -2499,7 +2868,7 @@ def proactive_tick():
     """
     store = require_user()
     payload = request.get_json(silent=True) or {}
-    decision = _build_proactive_gate_decision(store, payload)
+    decision = _build_proactive_gate_decision(store, payload, api_key=_extract_api_key())
     store.append_gate_decision(decision)
 
     job = None
@@ -2511,6 +2880,60 @@ def proactive_tick():
         "job": job,
         "enqueued": job is not None,
     })
+
+
+def _job_status_patch(payload: dict, *, default_status: str = "") -> dict:
+    status = str(payload.get("status") or default_status).strip().lower()
+    reason = str(payload.get("reason") or payload.get("status_reason") or "").strip()
+    consumer_id = str(payload.get("consumer_id") or "").strip()
+    now_iso = datetime.now().isoformat()
+    patch: dict = {}
+    if status:
+        patch["status"] = status[:80]
+        if status == "claimed":
+            patch["claimed_at"] = now_iso
+        elif status == "realizing":
+            patch["realizing_at"] = now_iso
+        elif status in {"posted", "delivered"}:
+            patch["posted_at"] = now_iso
+        elif status in {"failed", "skipped"}:
+            patch["failed_at"] = now_iso
+    if reason:
+        patch["status_reason"] = reason[:500]
+    if consumer_id:
+        patch["consumer_id"] = consumer_id[:160]
+    if payload.get("chat_message_id"):
+        patch["chat_message_id"] = str(payload.get("chat_message_id"))[:160]
+    return patch
+
+
+@app.route("/v1/proactive/jobs/<job_id>/claim", methods=["POST"])
+def proactive_job_claim(job_id):
+    store = require_user()
+    payload = request.get_json(silent=True) or {}
+    patch = _job_status_patch(payload, default_status="claimed")
+    job = store.update_proactive_job(job_id, patch, only_if_status="pending")
+    if job is None:
+        current = None
+        for row in store.list_proactive_jobs(since_epoch=0, limit=0):
+            if str(row.get("job_id") or "") == str(job_id):
+                current = row
+                break
+        return jsonify({"claimed": False, "job": current, "reason": "not_pending_or_missing"})
+    return jsonify({"claimed": True, "job": job})
+
+
+@app.route("/v1/proactive/jobs/<job_id>/status", methods=["POST"])
+def proactive_job_status(job_id):
+    store = require_user()
+    payload = request.get_json(silent=True) or {}
+    patch = _job_status_patch(payload)
+    if not patch:
+        return jsonify({"error": "empty_status_patch"}), 400
+    job = store.update_proactive_job(job_id, patch)
+    if job is None:
+        return jsonify({"error": "job_not_found"}), 404
+    return jsonify({"job": job})
 
 
 @app.route("/v1/proactive/decisions", methods=["GET"])
@@ -2558,7 +2981,10 @@ def proactive_jobs_poll():
         return jsonify({"error": "invalid limit"}), 400
     limit = max(1, min(limit, 100))
 
-    pending = store.list_proactive_jobs(since_epoch=since, limit=limit)
+    pending = [
+        j for j in store.list_proactive_jobs(since_epoch=since, limit=limit)
+        if str(j.get("status") or "pending") == "pending"
+    ]
     if pending:
         return jsonify({"jobs": pending, "timed_out": False})
 
@@ -2575,7 +3001,10 @@ def proactive_jobs_poll():
             pass
 
     if notified:
-        pending = store.list_proactive_jobs(since_epoch=since, limit=limit)
+        pending = [
+            j for j in store.list_proactive_jobs(since_epoch=since, limit=limit)
+            if str(j.get("status") or "pending") == "pending"
+        ]
         return jsonify({"jobs": pending, "timed_out": False})
     return jsonify({"jobs": [], "timed_out": True})
 
@@ -2694,10 +3123,19 @@ def chat_response():
     source = str(payload.get("source") or "chat").strip() or "chat"
     if source not in {"chat", "live_activity", "heartbeat", PROACTIVE_JOB_SOURCE}:
         return jsonify({"error": "invalid source"}), 400
+    alert_body = str(payload.get("alert_body") or "")
+    push_body = str(payload.get("push_body") or "")
     extra = {
         "gate_decision_id": str(payload.get("gate_decision_id") or ""),
         "proactive_job_id": str(payload.get("proactive_job_id") or ""),
     }
+    if source == PROACTIVE_JOB_SOURCE:
+        preview = (alert_body or push_body).strip()
+        if preview:
+            extra["alert_preview"] = preview[:240]
+        if push_body.strip():
+            extra["push_body_preview"] = push_body.strip()[:240]
+        extra["push_live_activity_requested"] = bool(payload.get("push_live_activity"))
     msg = store.append_chat(
         "openclaw",
         source,
@@ -2705,6 +3143,7 @@ def chat_response():
         content_type=content_type,
         extra=extra,
     )
+    delivery_fields: dict = {}
     if payload.get("push_live_activity"):
         push_payload = {
             "title": payload.get("title", ""),
@@ -2712,14 +3151,26 @@ def chat_response():
             "subtitle": payload.get("subtitle"),
             "data": payload.get("data", {}),
         }
-        push_live_activity_inner(store, push_payload)
+        live_resp = push_live_activity_inner(store, push_payload)
+        try:
+            live_body = live_resp.get_json(silent=True) or {}
+        except Exception:
+            live_body = {}
+        delivery_fields["live_activity_status"] = live_body.get("status", "unknown")
+        delivery_fields["live_activity_reason"] = live_body.get("reason", "")
+        delivery_fields["live_activity_activity_id"] = live_body.get("activity_id", "")
     # Fire APNs alert push so users not currently in the app still see
     # the agent's message. MCP supplies `alert_body` (plaintext) — the
     # server itself doesn't decrypt the envelope. Best-effort: failures
     # here don't block the chat write.
-    alert_body = payload.get("alert_body", "")
     if alert_body:
-        _send_chat_alert(store, alert_body, alert_title=payload.get("title", ""))
+        alert_result = _send_chat_alert(store, alert_body, alert_title=payload.get("title", ""))
+        delivery_fields["alert_status"] = (alert_result or {}).get("status", "unknown")
+        delivery_fields["alert_reason"] = (alert_result or {}).get("reason", "")
+    if delivery_fields:
+        updated = store.update_chat_message_metadata(msg["id"], delivery_fields)
+        if updated:
+            msg = updated
     print(f"[chat:{store.user_id}] openclaw(v1, source={source}, type={content_type}) id={msg['id']}")
     return jsonify({"id": msg["id"], "ts": msg["ts"], "v": msg["v"]})
 

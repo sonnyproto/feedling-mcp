@@ -883,9 +883,16 @@ def test_process_proactive_jobs_routes_through_agent_and_posts_metadata(monkeypa
     def _post(reply, **kwargs):
         captured["reply"] = reply
         captured["post_kwargs"] = kwargs
+        return {"id": "msg_1"}
 
     monkeypatch.setattr(crc, "call_agent", _agent)
     monkeypatch.setattr(crc, "post_reply", _post)
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="": captured.setdefault("statuses", []).append((job_id, status, reason)),
+    )
     monkeypatch.setattr(
         crc,
         "_screen_context_for_frame_ids",
@@ -915,6 +922,8 @@ def test_process_proactive_jobs_routes_through_agent_and_posts_metadata(monkeypa
         "gate_decision_id": "gd_1",
         "proactive_job_id": "pj_1",
     }
+    assert ("pj_1", "realizing", "") in captured["statuses"]
+    assert any(s[0] == "pj_1" and s[1] == "posted" for s in captured["statuses"])
 
 
 def test_post_proactive_reply_triggers_alert_and_live_activity(monkeypatch):
