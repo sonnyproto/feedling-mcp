@@ -44,6 +44,12 @@ CLI mode:
 
 Optional:
   CHECKPOINT_FILE       Path to persist last-processed timestamp (default: /tmp/feedling_chat_checkpoint.json)
+  PROACTIVE_POLL_ENABLED
+                        Default true. Poll hidden proactive jobs created by
+                        Feedling Gate and realize them through the same agent
+                        entry used for chat replies.
+  PROACTIVE_POLL_TIMEOUT
+                        Short long-poll timeout for proactive jobs (default: 1)
   SEND_FALLBACK_ON_AGENT_ERROR
                         Default false. When false, agent failures are logged
                         and no fake template is posted to the user.
@@ -142,6 +148,9 @@ AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
 CHECKPOINT_FILE = Path(
     os.environ.get("CHECKPOINT_FILE", "/tmp/feedling_chat_checkpoint.json")
 )
+PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
+PROACTIVE_POLL_ENABLED = _env_bool("PROACTIVE_POLL_ENABLED", True)
+PROACTIVE_POLL_TIMEOUT = int(os.environ.get("PROACTIVE_POLL_TIMEOUT", "1"))
 AGENT_SESSION_FILE_TEMPLATE = os.environ.get(
     "AGENT_SESSION_FILE",
     f"/tmp/feedling_agent_session_{hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]}_{{user_id}}.txt",
@@ -290,19 +299,46 @@ log.info(
 # Checkpoint (persist last processed message timestamp)
 # ---------------------------------------------------------------------------
 
-def _load_checkpoint() -> float:
+def _load_checkpoint_data() -> dict[str, float]:
     try:
         data = json.loads(CHECKPOINT_FILE.read_text())
-        return float(data.get("last_ts", 0))
+        if not isinstance(data, dict):
+            return {}
+        return {
+            "last_ts": float(data.get("last_ts", 0) or 0),
+            "last_job_ts": float(data.get("last_job_ts", 0) or 0),
+        }
     except Exception:
-        return 0.0
+        return {}
+
+
+def _write_checkpoint_data(data: dict[str, float]) -> None:
+    try:
+        CHECKPOINT_FILE.write_text(json.dumps(data))
+    except Exception as e:
+        log.warning("checkpoint write failed: %s", e)
+
+
+def _load_checkpoint() -> float:
+    return float(_load_checkpoint_data().get("last_ts", 0.0) or 0.0)
 
 
 def _save_checkpoint(ts: float) -> None:
-    try:
-        CHECKPOINT_FILE.write_text(json.dumps({"last_ts": ts}))
-    except Exception as e:
-        log.warning("checkpoint write failed: %s", e)
+    data = _load_checkpoint_data()
+    data["last_ts"] = ts
+    data.setdefault("last_job_ts", 0.0)
+    _write_checkpoint_data(data)
+
+
+def _load_proactive_checkpoint() -> float:
+    return float(_load_checkpoint_data().get("last_job_ts", 0.0) or 0.0)
+
+
+def _save_proactive_checkpoint(ts: float) -> None:
+    data = _load_checkpoint_data()
+    data.setdefault("last_ts", 0.0)
+    data["last_job_ts"] = ts
+    _write_checkpoint_data(data)
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +799,57 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
         parts.append("screenshot_file: " + ", ".join(paths))
 
     return "\n".join(parts), payloads, paths
+
+
+def _screen_context_for_frame_ids(frame_ids: list[str]) -> tuple[str, list[dict[str, str]], list[str]]:
+    """Attach the concrete frames named by a proactive Gate job."""
+    frame_ids = [str(fid).strip() for fid in (frame_ids or []) if str(fid).strip()]
+    if not frame_ids:
+        return "", [], []
+
+    include_image = "true" if SCREEN_CONTEXT_INCLUDE_IMAGE else "false"
+    context_parts = ["[Feedling proactive screen context]"]
+    payloads: list[dict[str, str]] = []
+    paths: list[str] = []
+
+    for frame_id in frame_ids[-4:]:
+        decrypted = _fetch_screen_json(
+            f"/v1/screen/frames/{frame_id}/decrypt?include_image={include_image}"
+        )
+        if not decrypted:
+            continue
+
+        app = decrypted.get("app") or "unknown"
+        ts = float(decrypted.get("ts") or 0.0)
+        captured_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts)) if ts else "unknown"
+        ocr_text = (decrypted.get("ocr_text") or "").strip()
+        context_parts.append(f"frame_id: {frame_id}")
+        context_parts.append(f"captured_at_utc: {captured_at}")
+        context_parts.append(f"app: {app}")
+        if ocr_text:
+            context_parts.append(f"ocr_text:\n{ocr_text[:2000]}")
+
+        image_b64 = decrypted.get("image_b64")
+        if isinstance(image_b64, str) and image_b64.strip():
+            raw_b64 = image_b64.split(",", 1)[1] if image_b64.startswith("data:") else image_b64
+            mime = decrypted.get("image_mime") or "image/jpeg"
+            payloads.append(
+                {
+                    "mime_type": str(mime),
+                    "data": raw_b64,
+                    "data_url": f"data:{mime};base64,{raw_b64}",
+                }
+            )
+
+    paths = _image_file_paths_from_payloads(
+        "proactive_screen_" + hashlib.sha1(",".join(frame_ids).encode()).hexdigest()[:12],
+        payloads,
+    )
+    if paths:
+        context_parts.append("screenshot_file: " + ", ".join(paths))
+    if len(context_parts) == 1:
+        return "", [], []
+    return "\n".join(context_parts), payloads, paths
 
 
 # ---------------------------------------------------------------------------
@@ -1575,7 +1662,22 @@ def poll_chat(since: float) -> dict:
     return resp.json()
 
 
-def post_reply(content: str) -> None:
+def poll_proactive_jobs(since: float) -> dict:
+    url = f"{FEEDLING_API_URL}/v1/proactive/jobs/poll"
+    timeout = max(0, PROACTIVE_POLL_TIMEOUT)
+    params = {"since": since, "timeout": timeout}
+    resp = httpx.get(url, params=params, headers=_HEADERS, timeout=timeout + 10)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def post_reply(
+    content: str,
+    *,
+    source: str = "chat",
+    gate_decision_id: str = "",
+    proactive_job_id: str = "",
+) -> None:
     """Post agent reply as a v1 ciphertext envelope.
 
     Falls back to plaintext only when encryption is unavailable — this will
@@ -1602,9 +1704,14 @@ def post_reply(content: str) -> None:
             enclave_pk_bytes=enc_pk,
             visibility=visibility,
         )
-        resp = httpx.post(
-            url, json={"envelope": envelope}, headers=_HEADERS, timeout=15
-        )
+        body: dict[str, Any] = {"envelope": envelope, "source": source}
+        if gate_decision_id:
+            body["gate_decision_id"] = gate_decision_id
+        if proactive_job_id:
+            body["proactive_job_id"] = proactive_job_id
+        if source == PROACTIVE_JOB_SOURCE:
+            body["alert_body"] = content[:240]
+        resp = httpx.post(url, json=body, headers=_HEADERS, timeout=15)
         _handle_post_reply_response(resp)
         return
 
@@ -1614,7 +1721,14 @@ def post_reply(content: str) -> None:
         "Ensure content_encryption.py is importable and whoami succeeded."
     )
     resp = httpx.post(
-        url, json={"content": content, "push_live_activity": False},
+        url,
+        json={
+            "content": content,
+            "push_live_activity": False,
+            "source": source,
+            "gate_decision_id": gate_decision_id,
+            "proactive_job_id": proactive_job_id,
+        },
         headers=_HEADERS, timeout=15,
     )
     _handle_post_reply_response(resp)
@@ -1673,6 +1787,94 @@ def _handle_signal(signum, _frame):
 
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
+
+
+def _proactive_job_key(job: dict) -> str:
+    jid = str(job.get("job_id") or "").strip()
+    if jid:
+        return f"proactive:{jid}"
+    return f"proactive:{job.get('ts', job.get('created_at', 'unknown'))}"
+
+
+def _message_for_proactive_job(job: dict, screen_text: str = "") -> str:
+    context_hint = str(job.get("context_hint") or "").strip()
+    intent_label = str(job.get("intent_label") or "proactive_context").strip()
+    connections = job.get("connections")
+    if not isinstance(connections, list):
+        connections = []
+    connection_text = "\n".join(f"- {str(item).strip()}" for item in connections if str(item).strip())
+
+    parts = [
+        "[Feedling proactive hidden job]",
+        "A Feedling Gate decided this may be a good moment to reach out.",
+        "Write only the message the user should see, in your normal voice.",
+        f"intent: {intent_label}",
+    ]
+    if context_hint:
+        parts.append(f"context_hint:\n{context_hint}")
+    if connection_text:
+        parts.append(f"possible_connections:\n{connection_text}")
+    if screen_text:
+        parts.append(screen_text)
+    return "\n\n".join(parts)
+
+
+def _process_proactive_jobs(jobs: list) -> float:
+    """Realize hidden proactive jobs through the same configured agent entry."""
+    latest = 0.0
+    for job in jobs:
+        ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
+        latest = max(latest, ts)
+
+        if job.get("source") and job.get("source") != PROACTIVE_JOB_SOURCE:
+            continue
+
+        key = _proactive_job_key(job)
+        if not _mark_seen(key):
+            log.debug("skipping already-processed proactive job key=%s", key)
+            continue
+
+        frame_ids = job.get("frame_ids")
+        if not isinstance(frame_ids, list):
+            frame_ids = []
+        screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
+        message = _message_for_proactive_job(job, screen_text=screen_text)
+        log.info(
+            "proactive job [ts=%.3f] id=%s intent=%s frames=%d",
+            ts,
+            job.get("job_id"),
+            job.get("intent_label"),
+            len(frame_ids),
+        )
+
+        try:
+            replies = call_agent(
+                message,
+                images=screen_payloads,
+                image_paths=screen_paths,
+            )
+        except Exception as e:
+            log.error("proactive agent call failed; not posting fallback: %s", e)
+            continue
+
+        if isinstance(replies, str):
+            replies = [replies]
+        elif not isinstance(replies, list):
+            replies = [str(replies)]
+
+        for reply in replies:
+            try:
+                post_reply(
+                    reply,
+                    source=PROACTIVE_JOB_SOURCE,
+                    gate_decision_id=str(job.get("gate_decision_id") or ""),
+                    proactive_job_id=str(job.get("job_id") or ""),
+                )
+                log.info("proactive reply sent: %s", reply[:80])
+            except Exception as e:
+                log.error("failed to post proactive reply: %s", e)
+
+    return latest
 
 
 def _process_messages(messages: list) -> float:
@@ -1837,12 +2039,45 @@ def run() -> None:
             log.warning("could not seed from history: %s", e)
 
     _save_checkpoint(last_ts)
-    log.info("starting poll loop — last_ts=%.3f poll_timeout=%ds", last_ts, POLL_TIMEOUT)
+    last_job_ts = _load_proactive_checkpoint()
+    proactive_enabled = PROACTIVE_POLL_ENABLED
+    if proactive_enabled and last_job_ts == 0.0:
+        # Start from "now" on first boot so historical hidden jobs are not
+        # replayed after an operator installs the consumer.
+        last_job_ts = time.time()
+        _save_proactive_checkpoint(last_job_ts)
+
+    log.info(
+        "starting poll loop — last_ts=%.3f last_job_ts=%.3f poll_timeout=%ds proactive=%s",
+        last_ts,
+        last_job_ts,
+        POLL_TIMEOUT,
+        proactive_enabled,
+    )
 
     consecutive_errors = 0
 
     while _running:
         try:
+            if proactive_enabled:
+                try:
+                    job_result = poll_proactive_jobs(last_job_ts)
+                    jobs = job_result.get("jobs") or []
+                    if jobs:
+                        new_job_ts = _process_proactive_jobs(jobs)
+                        if new_job_ts > last_job_ts:
+                            last_job_ts = new_job_ts
+                            _save_proactive_checkpoint(last_job_ts)
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        proactive_enabled = False
+                        log.warning(
+                            "proactive jobs endpoint not available on this backend; "
+                            "disabling proactive polling for this process"
+                        )
+                    else:
+                        raise
+
             result = poll_chat(last_ts)
             consecutive_errors = 0
 

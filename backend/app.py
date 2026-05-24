@@ -3,6 +3,7 @@ import base64
 import errno
 import hashlib
 import hmac
+import html
 import json
 import os
 import re
@@ -164,6 +165,9 @@ MAX_FRAMES = 200
 MAX_CHAT_MESSAGES = 5000
 PUSH_COOLDOWN_SECONDS = int(os.environ.get("FEEDLING_PUSH_COOLDOWN_SEC", 300))
 LIVE_ACTIVITY_DEDUPE_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC", 900))
+DEVICE_EVENT_RETENTION_DAYS = int(os.environ.get("FEEDLING_DEVICE_EVENT_RETENTION_DAYS", 30))
+PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
+PROACTIVE_JOB_MAX = int(os.environ.get("FEEDLING_PROACTIVE_JOB_MAX", 500))
 
 
 # Used from inside UserStore._load_tokens on boot; must be defined before
@@ -220,6 +224,11 @@ class UserStore:
         self.identity_lock = threading.Lock()
         self.memory_lock = threading.Lock()
 
+        # proactive presence state
+        self.proactive_lock = threading.Lock()
+        self.proactive_job_waiters: list[threading.Event] = []
+        self.proactive_job_waiters_lock = threading.Lock()
+
         # load persistent state
         self._load_tokens()
         self._load_push_state()
@@ -270,6 +279,22 @@ class UserStore:
     @property
     def frames_meta_file(self) -> Path:
         return self.dir / "frames_meta.json"
+
+    @property
+    def proactive_settings_file(self) -> Path:
+        return self.dir / "proactive_settings.json"
+
+    @property
+    def device_events_file(self) -> Path:
+        return self.dir / "device_events.jsonl"
+
+    @property
+    def gate_decisions_file(self) -> Path:
+        return self.dir / "gate_decisions.jsonl"
+
+    @property
+    def proactive_jobs_file(self) -> Path:
+        return self.dir / "proactive_jobs.jsonl"
 
     # ------- frames index -------
     def _load_frames_meta(self):
@@ -453,6 +478,7 @@ class UserStore:
         source: str,
         envelope: dict,
         content_type: str = "text",
+        extra: dict | None = None,
     ) -> dict:
         """Append a v1 ciphertext chat message. `envelope` holds the AEAD
         payload. See docs/DESIGN_E2E.md §3.2 for field definitions. Server
@@ -493,6 +519,11 @@ class UserStore:
             msg["content"] = envelope["synthetic_marker"]
         if envelope.get("K_enclave") is not None:
             msg["K_enclave"] = envelope["K_enclave"]
+        if extra:
+            for key in ("gate_decision_id", "proactive_job_id"):
+                value = extra.get(key)
+                if isinstance(value, str) and value.strip():
+                    msg[key] = value.strip()
 
         with self.chat_lock:
             self.chat_messages.append(msg)
@@ -506,6 +537,129 @@ class UserStore:
             for ev in self.chat_waiters:
                 ev.set()
             self.chat_waiters.clear()
+
+    # ------- proactive presence -------
+    def load_proactive_settings(self) -> dict:
+        default = {
+            "enabled": True,
+            "dnd": False,
+            "permission_states": {},
+            "updated_at": datetime.now().isoformat(),
+        }
+        try:
+            if self.proactive_settings_file.exists():
+                data = json.loads(self.proactive_settings_file.read_text())
+                if isinstance(data, dict):
+                    merged = dict(default)
+                    merged.update(data)
+                    if not isinstance(merged.get("permission_states"), dict):
+                        merged["permission_states"] = {}
+                    return merged
+        except Exception as e:
+            print(f"[{self.user_id}/proactive] settings load failed: {e}")
+        return default
+
+    def save_proactive_settings(self, patch: dict) -> dict:
+        allowed = {"enabled", "dnd", "permission_states"}
+        cur = self.load_proactive_settings()
+        for key, value in (patch or {}).items():
+            if key not in allowed:
+                continue
+            if key in {"enabled", "dnd"}:
+                cur[key] = bool(value)
+            elif key == "permission_states" and isinstance(value, dict):
+                states = dict(cur.get("permission_states") or {})
+                for pname, pstate in value.items():
+                    states[str(pname)] = str(pstate)
+                cur["permission_states"] = states
+        cur["updated_at"] = datetime.now().isoformat()
+        with self.proactive_lock:
+            self.proactive_settings_file.write_text(json.dumps(cur, ensure_ascii=False, indent=2))
+        return cur
+
+    def _append_jsonl(self, path: Path, entry: dict) -> None:
+        with self.proactive_lock:
+            with open(path, "a") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def _read_jsonl(self, path: Path, limit: int = 100, since_epoch: float = 0.0) -> list[dict]:
+        rows: list[dict] = []
+        if not path.exists():
+            return rows
+        try:
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except Exception:
+                        continue
+                    if since_epoch:
+                        ts = float(item.get("ts", item.get("ts_epoch", 0)) or 0)
+                        if ts <= since_epoch:
+                            continue
+                    rows.append(item)
+        except Exception as e:
+            print(f"[{self.user_id}/proactive] jsonl read failed path={path.name}: {e}")
+            return []
+        if limit > 0:
+            return rows[-limit:]
+        return rows
+
+    def append_device_event(self, event: dict) -> dict:
+        self._append_jsonl(self.device_events_file, event)
+        self._prune_device_events()
+        return event
+
+    def list_device_events(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
+        return self._read_jsonl(self.device_events_file, limit=limit, since_epoch=since_epoch)
+
+    def _prune_device_events(self) -> None:
+        cutoff = time.time() - DEVICE_EVENT_RETENTION_DAYS * 86400
+        rows = self._read_jsonl(self.device_events_file, limit=0, since_epoch=cutoff)
+        try:
+            tmp = self.device_events_file.with_suffix(".jsonl.tmp")
+            with open(tmp, "w") as f:
+                for row in rows:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            tmp.replace(self.device_events_file)
+        except Exception as e:
+            print(f"[{self.user_id}/device-events] prune failed: {e}")
+
+    def append_gate_decision(self, decision: dict) -> dict:
+        self._append_jsonl(self.gate_decisions_file, decision)
+        return decision
+
+    def list_gate_decisions(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
+        return self._read_jsonl(self.gate_decisions_file, limit=limit, since_epoch=since_epoch)
+
+    def append_proactive_job(self, job: dict) -> dict:
+        self._append_jsonl(self.proactive_jobs_file, job)
+        self._trim_proactive_jobs()
+        self.notify_proactive_job_waiters()
+        return job
+
+    def list_proactive_jobs(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
+        return self._read_jsonl(self.proactive_jobs_file, limit=limit, since_epoch=since_epoch)
+
+    def _trim_proactive_jobs(self) -> None:
+        rows = self._read_jsonl(self.proactive_jobs_file, limit=PROACTIVE_JOB_MAX, since_epoch=0.0)
+        try:
+            tmp = self.proactive_jobs_file.with_suffix(".jsonl.tmp")
+            with open(tmp, "w") as f:
+                for row in rows:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            tmp.replace(self.proactive_jobs_file)
+        except Exception as e:
+            print(f"[{self.user_id}/proactive-jobs] trim failed: {e}")
+
+    def notify_proactive_job_waiters(self):
+        with self.proactive_job_waiters_lock:
+            for ev in self.proactive_job_waiters:
+                ev.set()
+            self.proactive_job_waiters.clear()
 
 
 # Registry of per-user stores
@@ -709,6 +863,425 @@ def _mark_active_token_success(store: UserStore, entry: dict):
 # ---------------------------------------------------------------------------
 
 from semantic_analysis import analyze as _semantic_analysis  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Proactive Gate helpers
+# ---------------------------------------------------------------------------
+
+_DEVICE_EVENT_ALLOWED_KEYS = {
+    "permission",
+    "status",
+    "source",
+    "type",
+    "category",
+    "place_type",
+    "workout_type",
+    "duration_min",
+    "distance_bucket",
+    "starts_in_min",
+    "ended_min_ago",
+    "is_busy",
+    "has_location",
+    "motion",
+    "time_of_day",
+    "scene_tags",
+}
+
+_DEVICE_EVENT_DROP_RE = re.compile(
+    r"(raw|text|content|title|name|address|photo|image|lat|lng|lon|coordinate|phone|email)",
+    re.IGNORECASE,
+)
+
+
+def _new_public_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:16]}"
+
+
+def _redact_device_payload(payload: dict) -> dict:
+    """Persist only coarse device-event facts.
+
+    Raw location/photo/calendar text belongs in the user device or encrypted
+    frame store, not in server-side proactive logs. The Gate needs enough
+    signal to decide whether to create a job; the real agent can ask for richer
+    context later through the normal encrypted path.
+    """
+    if not isinstance(payload, dict):
+        return {}
+
+    redacted: dict = {}
+    for key, value in payload.items():
+        skey = str(key)
+        if _DEVICE_EVENT_DROP_RE.search(skey):
+            continue
+        if skey not in _DEVICE_EVENT_ALLOWED_KEYS and not skey.startswith("safe_"):
+            continue
+        if isinstance(value, (bool, int, float)) or value is None:
+            redacted[skey] = value
+        elif isinstance(value, str):
+            redacted[skey] = value[:120]
+        elif isinstance(value, list):
+            safe_items = []
+            for item in value[:12]:
+                if isinstance(item, (str, int, float, bool)):
+                    safe_items.append(item if not isinstance(item, str) else item[:80])
+            redacted[skey] = safe_items
+    return redacted
+
+
+def _make_device_event(source: str, event_type: str, payload: dict) -> dict:
+    now = time.time()
+    return {
+        "event_id": _new_public_id("evt"),
+        "ts": now,
+        "created_at": datetime.fromtimestamp(now).isoformat(),
+        "source": (source or "ios").strip()[:80],
+        "type": (event_type or "unknown").strip()[:80],
+        "payload": _redact_device_payload(payload),
+    }
+
+
+def _recent_user_chat_active(store: UserStore, now: float, window_sec: float = 600.0) -> bool:
+    with store.chat_lock:
+        for msg in reversed(store.chat_messages):
+            ts = float(msg.get("ts", 0) or 0)
+            if now - ts > window_sec:
+                return False
+            if msg.get("role") == "user":
+                return True
+    return False
+
+
+def _recent_frame_meta(store: UserStore, now: float, window_sec: float) -> list[dict]:
+    with store.frames_lock:
+        frames = [f for f in store.frames_meta if now - float(f.get("ts", 0) or 0) <= window_sec]
+    return frames[-12:]
+
+
+def _frame_ids(frames: list[dict]) -> list[str]:
+    out: list[str] = []
+    for frame in frames:
+        frame_id = str(frame.get("id") or "").strip()
+        if frame_id:
+            out.append(frame_id)
+    return out[-4:]
+
+
+def _ocr_summary(frames: list[dict]) -> str:
+    seen: set[str] = set()
+    parts: list[str] = []
+    for frame in reversed(frames):
+        text = (frame.get("ocr_text") or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        parts.append(text[:240])
+        if len(parts) >= 3:
+            break
+    return " | ".join(reversed(parts))[:700]
+
+
+def _recent_device_events_for_gate(store: UserStore, now: float, window_sec: float) -> list[dict]:
+    since = max(0.0, now - window_sec)
+    return store.list_device_events(since_epoch=since, limit=25)
+
+
+def _payload_float(payload: dict, key: str, default: float, lo: float, hi: float) -> float:
+    try:
+        value = float(payload.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(lo, min(hi, value))
+
+
+def _build_proactive_gate_decision(store: UserStore, payload: dict) -> dict:
+    now = time.time()
+    payload = payload if isinstance(payload, dict) else {}
+    force = bool(payload.get("force", False))
+    settings = store.load_proactive_settings()
+
+    frames = _recent_frame_meta(
+        store,
+        now,
+        _payload_float(payload, "frame_window_sec", 300.0, 30.0, 3600.0),
+    )
+    device_events = _recent_device_events_for_gate(
+        store,
+        now,
+        _payload_float(payload, "device_event_window_sec", 900.0, 30.0, 86400.0),
+    )
+    latest = frames[-1] if frames else {}
+    current_app = latest.get("app") or "unknown"
+    ocr = _ocr_summary(frames)
+
+    context_hint = str(payload.get("context_hint") or "").strip()
+    connections = payload.get("connections")
+    if not isinstance(connections, list):
+        connections = []
+    connections = [str(c).strip()[:240] for c in connections if str(c).strip()][:5]
+
+    semantic = _semantic_analysis(current_app=current_app, ocr_summary=ocr)
+    intent_label = str(
+        payload.get("intent_label")
+        or semantic.get("task_intent")
+        or semantic.get("semantic_scene")
+        or "proactive_screen_context"
+    ).strip()
+
+    if not context_hint:
+        suggested = semantic.get("suggested_openers") or []
+        if semantic.get("semantic_strength") in {"strong", "medium"} and (ocr or current_app != "unknown"):
+            context_hint = (
+                f"Recent screen context appears to be {semantic.get('semantic_scene') or 'active work'} "
+                f"in {current_app}. OCR summary: {ocr or 'not available'}."
+            )
+        elif suggested and (ocr or current_app != "unknown"):
+            context_hint = f"Possible useful opening: {suggested[0]} Context: {ocr or current_app}."
+
+    should_reach_out = bool(context_hint)
+    reason = "manual_hint" if payload.get("context_hint") else "semantic_gate"
+
+    if not settings.get("enabled", True) and not force:
+        should_reach_out = False
+        reason = "proactive_disabled"
+    elif settings.get("dnd", False) and not force:
+        should_reach_out = False
+        reason = "dnd_enabled"
+    elif _recent_user_chat_active(store, now) and not force:
+        should_reach_out = False
+        reason = "recent_user_chat_active"
+    elif not should_reach_out:
+        reason = "insufficient_context"
+
+    decision_id = _new_public_id("gd")
+    return {
+        "decision_id": decision_id,
+        "ts": now,
+        "created_at": datetime.fromtimestamp(now).isoformat(),
+        "gate_model": "manual_v0a",
+        "should_reach_out": should_reach_out,
+        "should_garden_passive": False,
+        "abstention_reason": "" if should_reach_out else reason,
+        "reason": reason,
+        "intent_label": intent_label[:120],
+        "context_hint": context_hint[:2000],
+        "connections": connections,
+        "frame_ids": _frame_ids(frames),
+        "device_event_ids": [str(e.get("event_id")) for e in device_events if e.get("event_id")][:10],
+        "current_app": current_app,
+        "semantic": semantic,
+        "forced": force,
+    }
+
+
+def _proactive_job_from_decision(decision: dict) -> dict:
+    now = time.time()
+    return {
+        "job_id": _new_public_id("pj"),
+        "ts": now,
+        "created_at": datetime.fromtimestamp(now).isoformat(),
+        "source": PROACTIVE_JOB_SOURCE,
+        "gate_decision_id": decision.get("decision_id", ""),
+        "status": "pending",
+        "intent_label": decision.get("intent_label", ""),
+        "context_hint": decision.get("context_hint", ""),
+        "connections": decision.get("connections", []),
+        "frame_ids": decision.get("frame_ids", []),
+        "device_event_ids": decision.get("device_event_ids", []),
+        "current_app": decision.get("current_app", ""),
+    }
+
+
+def _proactive_debug_snapshot(store: UserStore) -> dict:
+    decisions = store.list_gate_decisions(limit=50)
+    jobs = store.list_proactive_jobs(limit=50)
+    events = store.list_device_events(limit=50)
+    with store.chat_lock:
+        proactive_messages = [
+            {
+                "id": m.get("id"),
+                "ts": m.get("ts"),
+                "source": m.get("source"),
+                "gate_decision_id": m.get("gate_decision_id", ""),
+                "proactive_job_id": m.get("proactive_job_id", ""),
+                "content_type": m.get("content_type", "text"),
+            }
+            for m in store.chat_messages
+            if m.get("source") == PROACTIVE_JOB_SOURCE
+        ][-25:]
+    with store.frames_lock:
+        frames = [
+            {
+                "id": f.get("id"),
+                "ts": f.get("ts"),
+                "app": f.get("app") or "unknown",
+                "ocr_len": len((f.get("ocr_text") or "").strip()),
+                "encrypted": bool(f.get("encrypted")),
+            }
+            for f in store.frames_meta[-25:]
+        ]
+    return {
+        "user_id": store.user_id,
+        "generated_at": datetime.now().isoformat(),
+        "settings": store.load_proactive_settings(),
+        "decisions": decisions,
+        "jobs": jobs,
+        "device_events": events,
+        "proactive_messages": proactive_messages,
+        "recent_frames": frames,
+        "counts": {
+            "decisions": len(decisions),
+            "jobs": len(jobs),
+            "device_events": len(events),
+            "proactive_messages": len(proactive_messages),
+            "recent_frames": len(frames),
+        },
+    }
+
+
+def _render_proactive_dashboard(snapshot: dict) -> str:
+    def esc(value) -> str:
+        return html.escape(str(value if value is not None else ""))
+
+    decisions = list(reversed(snapshot.get("decisions") or []))
+    jobs = list(reversed(snapshot.get("jobs") or []))
+    messages = list(reversed(snapshot.get("proactive_messages") or []))
+    frames = list(reversed(snapshot.get("recent_frames") or []))
+    events = list(reversed(snapshot.get("device_events") or []))
+
+    def decision_rows() -> str:
+        if not decisions:
+            return "<tr><td colspan='7'>No Gate decisions yet.</td></tr>"
+        rows = []
+        for d in decisions[:30]:
+            verdict = "TRUE" if d.get("should_reach_out") else "FALSE"
+            rows.append(
+                "<tr>"
+                f"<td class='mono'>{esc(round(float(d.get('ts') or 0), 3))}</td>"
+                f"<td class='{ 'ok' if d.get('should_reach_out') else 'muted' }'>{verdict}</td>"
+                f"<td>{esc(d.get('reason') or d.get('abstention_reason'))}</td>"
+                f"<td>{esc(d.get('intent_label'))}</td>"
+                f"<td class='wrap'>{esc(d.get('context_hint'))}</td>"
+                f"<td>{esc(', '.join(d.get('frame_ids') or []))}</td>"
+                f"<td class='mono'>{esc(d.get('decision_id'))}</td>"
+                "</tr>"
+            )
+        return "".join(rows)
+
+    def job_rows() -> str:
+        if not jobs:
+            return "<tr><td colspan='6'>No hidden proactive jobs yet.</td></tr>"
+        rows = []
+        for j in jobs[:30]:
+            rows.append(
+                "<tr>"
+                f"<td class='mono'>{esc(round(float(j.get('ts') or 0), 3))}</td>"
+                f"<td>{esc(j.get('status', 'pending'))}</td>"
+                f"<td>{esc(j.get('intent_label'))}</td>"
+                f"<td class='wrap'>{esc(j.get('context_hint'))}</td>"
+                f"<td class='mono'>{esc(j.get('gate_decision_id'))}</td>"
+                f"<td class='mono'>{esc(j.get('job_id'))}</td>"
+                "</tr>"
+            )
+        return "".join(rows)
+
+    def message_rows() -> str:
+        if not messages:
+            return "<tr><td colspan='5'>No proactive chat writes yet.</td></tr>"
+        rows = []
+        for m in messages[:25]:
+            rows.append(
+                "<tr>"
+                f"<td class='mono'>{esc(round(float(m.get('ts') or 0), 3))}</td>"
+                f"<td>{esc(m.get('content_type'))}</td>"
+                f"<td class='mono'>{esc(m.get('gate_decision_id'))}</td>"
+                f"<td class='mono'>{esc(m.get('proactive_job_id'))}</td>"
+                f"<td class='mono'>{esc(m.get('id'))}</td>"
+                "</tr>"
+            )
+        return "".join(rows)
+
+    def frame_rows() -> str:
+        if not frames:
+            return "<tr><td colspan='5'>No frames indexed.</td></tr>"
+        rows = []
+        for f in frames[:25]:
+            rows.append(
+                "<tr>"
+                f"<td class='mono'>{esc(round(float(f.get('ts') or 0), 3))}</td>"
+                f"<td>{esc(f.get('app'))}</td>"
+                f"<td>{esc(f.get('ocr_len'))}</td>"
+                f"<td>{esc(f.get('encrypted'))}</td>"
+                f"<td class='mono'>{esc(f.get('id'))}</td>"
+                "</tr>"
+            )
+        return "".join(rows)
+
+    def event_rows() -> str:
+        if not events:
+            return "<tr><td colspan='4'>No device events yet.</td></tr>"
+        rows = []
+        for e in events[:25]:
+            rows.append(
+                "<tr>"
+                f"<td class='mono'>{esc(round(float(e.get('ts') or 0), 3))}</td>"
+                f"<td>{esc(e.get('source'))}</td>"
+                f"<td>{esc(e.get('type'))}</td>"
+                f"<td class='wrap'>{esc(json.dumps(e.get('payload') or {}, ensure_ascii=False))}</td>"
+                "</tr>"
+            )
+        return "".join(rows)
+
+    counts = snapshot.get("counts") or {}
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="5">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Feedling Proactive Debug</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 24px; color: #1f1d1a; background: #f6f0e6; }}
+    h1 {{ margin-bottom: 4px; }}
+    h2 {{ margin-top: 32px; border-top: 1px solid #d8d0c4; padding-top: 18px; }}
+    .meta {{ color: #6f6961; margin-bottom: 16px; }}
+    .pill {{ display: inline-block; border: 1px solid #c9bfb2; padding: 4px 8px; margin: 2px; background: #fffaf1; }}
+    table {{ width: 100%; border-collapse: collapse; background: #fffaf1; }}
+    th, td {{ border: 1px solid #ddd2c5; padding: 8px; vertical-align: top; text-align: left; }}
+    th {{ background: #efe5d7; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }}
+    .wrap {{ max-width: 520px; white-space: pre-wrap; }}
+    .ok {{ color: #0b7d42; font-weight: 700; }}
+    .muted {{ color: #8b8176; }}
+  </style>
+</head>
+<body>
+  <h1>Feedling Proactive Debug</h1>
+  <div class="meta">user <span class="mono">{esc(snapshot.get('user_id'))}</span> · generated {esc(snapshot.get('generated_at'))} · auto-refresh 5s</div>
+  <div>
+    <span class="pill">decisions {esc(counts.get('decisions', 0))}</span>
+    <span class="pill">jobs {esc(counts.get('jobs', 0))}</span>
+    <span class="pill">proactive writes {esc(counts.get('proactive_messages', 0))}</span>
+    <span class="pill">frames {esc(counts.get('recent_frames', 0))}</span>
+    <span class="pill">device events {esc(counts.get('device_events', 0))}</span>
+  </div>
+
+  <h2>Gate Decisions</h2>
+  <table><thead><tr><th>ts</th><th>Gate</th><th>reason</th><th>intent</th><th>context_hint</th><th>frames</th><th>decision</th></tr></thead><tbody>{decision_rows()}</tbody></table>
+
+  <h2>Hidden Jobs</h2>
+  <table><thead><tr><th>ts</th><th>status</th><th>intent</th><th>context_hint</th><th>decision</th><th>job</th></tr></thead><tbody>{job_rows()}</tbody></table>
+
+  <h2>Proactive Chat Writes</h2>
+  <table><thead><tr><th>ts</th><th>type</th><th>decision</th><th>job</th><th>message</th></tr></thead><tbody>{message_rows()}</tbody></table>
+
+  <h2>Recent Screen Frames</h2>
+  <table><thead><tr><th>ts</th><th>app</th><th>ocr len</th><th>encrypted</th><th>frame</th></tr></thead><tbody>{frame_rows()}</tbody></table>
+
+  <h2>Device Events</h2>
+  <table><thead><tr><th>ts</th><th>source</th><th>type</th><th>redacted payload</th></tr></thead><tbody>{event_rows()}</tbody></table>
+</body>
+</html>"""
 
 
 # ---------------------------------------------------------------------------
@@ -1876,6 +2449,138 @@ def analyze_screen():
 
 
 # ---------------------------------------------------------------------------
+# Proactive hidden jobs
+# ---------------------------------------------------------------------------
+
+
+@app.route("/v1/proactive/settings", methods=["GET", "POST"])
+def proactive_settings():
+    store = require_user()
+    if request.method == "GET":
+        return jsonify(store.load_proactive_settings())
+    payload = request.get_json(silent=True) or {}
+    settings = store.save_proactive_settings(payload)
+    return jsonify(settings)
+
+
+@app.route("/v1/device/events", methods=["GET", "POST"])
+def device_events():
+    store = require_user()
+    if request.method == "GET":
+        try:
+            since = float(request.args.get("since", 0))
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid since"}), 400
+        try:
+            limit = int(request.args.get("limit", 100))
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid limit"}), 400
+        limit = max(1, min(limit, 200))
+        return jsonify({"events": store.list_device_events(since_epoch=since, limit=limit)})
+
+    payload = request.get_json(silent=True) or {}
+    event = _make_device_event(
+        source=str(payload.get("source") or "ios"),
+        event_type=str(payload.get("type") or payload.get("event_type") or "unknown"),
+        payload=payload.get("payload") if isinstance(payload.get("payload"), dict) else {},
+    )
+    store.append_device_event(event)
+    return jsonify(event)
+
+
+@app.route("/v1/proactive/tick", methods=["POST"])
+def proactive_tick():
+    """Manual V0a Gate tick.
+
+    This endpoint is intentionally explicit: scheduler policy can be added
+    later, but the first shippable loop should be easy to inspect and replay.
+    If Gate passes, it creates a hidden job. The resident consumer, not the
+    server, realizes that job through the user's real agent entry.
+    """
+    store = require_user()
+    payload = request.get_json(silent=True) or {}
+    decision = _build_proactive_gate_decision(store, payload)
+    store.append_gate_decision(decision)
+
+    job = None
+    if decision.get("should_reach_out"):
+        job = store.append_proactive_job(_proactive_job_from_decision(decision))
+
+    return jsonify({
+        "decision": decision,
+        "job": job,
+        "enqueued": job is not None,
+    })
+
+
+@app.route("/v1/proactive/decisions", methods=["GET"])
+def proactive_decisions():
+    store = require_user()
+    try:
+        since = float(request.args.get("since", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid since"}), 400
+    try:
+        limit = int(request.args.get("limit", 100))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid limit"}), 400
+    limit = max(1, min(limit, 200))
+    return jsonify({"decisions": store.list_gate_decisions(since_epoch=since, limit=limit)})
+
+
+@app.route("/v1/proactive/debug", methods=["GET"])
+def proactive_debug_json():
+    store = require_user()
+    return jsonify(_proactive_debug_snapshot(store))
+
+
+@app.route("/debug/proactive", methods=["GET"])
+def proactive_debug_page():
+    store = require_user()
+    html_body = _render_proactive_dashboard(_proactive_debug_snapshot(store))
+    return Response(html_body, mimetype="text/html")
+
+
+@app.route("/v1/proactive/jobs/poll", methods=["GET"])
+def proactive_jobs_poll():
+    store = require_user()
+    try:
+        since = float(request.args.get("since", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid since"}), 400
+    try:
+        timeout = max(0.0, min(float(request.args.get("timeout", 30)), 60))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid timeout"}), 400
+    try:
+        limit = int(request.args.get("limit", 20))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid limit"}), 400
+    limit = max(1, min(limit, 100))
+
+    pending = store.list_proactive_jobs(since_epoch=since, limit=limit)
+    if pending:
+        return jsonify({"jobs": pending, "timed_out": False})
+
+    ev = threading.Event()
+    with store.proactive_job_waiters_lock:
+        store.proactive_job_waiters.append(ev)
+
+    notified = ev.wait(timeout=timeout)
+
+    with store.proactive_job_waiters_lock:
+        try:
+            store.proactive_job_waiters.remove(ev)
+        except ValueError:
+            pass
+
+    if notified:
+        pending = store.list_proactive_jobs(since_epoch=since, limit=limit)
+        return jsonify({"jobs": pending, "timed_out": False})
+    return jsonify({"jobs": [], "timed_out": True})
+
+
+# ---------------------------------------------------------------------------
 # Chat
 # ---------------------------------------------------------------------------
 
@@ -1986,7 +2691,20 @@ def chat_response():
     content_type = payload.get("content_type", "text")
     if content_type not in ("text", "image"):
         return jsonify({"error": "content_type must be 'text' or 'image'"}), 400
-    msg = store.append_chat("openclaw", "chat", envelope, content_type=content_type)
+    source = str(payload.get("source") or "chat").strip() or "chat"
+    if source not in {"chat", "live_activity", "heartbeat", PROACTIVE_JOB_SOURCE}:
+        return jsonify({"error": "invalid source"}), 400
+    extra = {
+        "gate_decision_id": str(payload.get("gate_decision_id") or ""),
+        "proactive_job_id": str(payload.get("proactive_job_id") or ""),
+    }
+    msg = store.append_chat(
+        "openclaw",
+        source,
+        envelope,
+        content_type=content_type,
+        extra=extra,
+    )
     if payload.get("push_live_activity"):
         push_payload = {
             "title": payload.get("title", ""),
@@ -2002,7 +2720,7 @@ def chat_response():
     alert_body = payload.get("alert_body", "")
     if alert_body:
         _send_chat_alert(store, alert_body, alert_title=payload.get("title", ""))
-    print(f"[chat:{store.user_id}] openclaw(v1, type={content_type}) id={msg['id']}")
+    print(f"[chat:{store.user_id}] openclaw(v1, source={source}, type={content_type}) id={msg['id']}")
     return jsonify({"id": msg["id"], "ts": msg["ts"], "v": msg["v"]})
 
 

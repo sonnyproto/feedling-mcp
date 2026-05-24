@@ -834,3 +834,52 @@ def test_openai_http_protocol_sends_multimodal_image_block(monkeypatch):
     content = captured["json"]["messages"][0]["content"]
     assert content[0] == {"type": "text", "text": "see image"}
     assert content[1] == {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abcd"}}
+
+
+def test_process_proactive_jobs_routes_through_agent_and_posts_metadata(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {}
+
+    def _agent(message, images=None, image_paths=None):
+        captured["message"] = message
+        captured["images"] = images
+        captured["image_paths"] = image_paths
+        return ["我看到了这个时机。"]
+
+    def _post(reply, **kwargs):
+        captured["reply"] = reply
+        captured["post_kwargs"] = kwargs
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "post_reply", _post)
+    monkeypatch.setattr(
+        crc,
+        "_screen_context_for_frame_ids",
+        lambda frame_ids: ("screen: user is reading docs", [{"data": "x"}], ["/tmp/frame.jpg"]),
+    )
+
+    job = {
+        "job_id": "pj_1",
+        "gate_decision_id": "gd_1",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 123.0,
+        "intent_label": "screen_context",
+        "context_hint": "The user has stayed on the same technical article.",
+        "connections": ["This relates to the user's current Feedling work."],
+        "frame_ids": ["frame_1"],
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(123.0)
+    assert "Feedling proactive hidden job" in captured["message"]
+    assert "The user has stayed" in captured["message"]
+    assert "screen: user is reading docs" in captured["message"]
+    assert captured["images"] == [{"data": "x"}]
+    assert captured["image_paths"] == ["/tmp/frame.jpg"]
+    assert captured["reply"] == "我看到了这个时机。"
+    assert captured["post_kwargs"] == {
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "gate_decision_id": "gd_1",
+        "proactive_job_id": "pj_1",
+    }
