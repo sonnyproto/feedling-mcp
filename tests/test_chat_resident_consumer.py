@@ -117,11 +117,28 @@ def test_invalid_key_exits_on_startup():
     """If whoami returns 401 / can't get user_id at startup, run() must
     call sys.exit(1) rather than entering the poll loop silently."""
     with patch.object(crc, "_load_whoami", return_value=False), \
+         patch.object(crc, "WHOAMI_STARTUP_RETRIES", 1), \
          patch.object(crc, "_ENCRYPTION_AVAILABLE", True), \
          pytest.raises(SystemExit) as exc_info:
         crc.run()
 
     assert exc_info.value.code != 0
+
+
+def test_whoami_startup_retries_transient_failure(monkeypatch):
+    """Startup whoami should tolerate transient network failures."""
+    calls = []
+
+    def _load():
+        calls.append(1)
+        return len(calls) >= 3
+
+    monkeypatch.setattr(crc, "_load_whoami", _load)
+    monkeypatch.setattr(crc, "WHOAMI_STARTUP_RETRIES", 4)
+    monkeypatch.setattr(crc, "WHOAMI_STARTUP_RETRY_DELAY_SEC", 0)
+
+    assert crc._load_whoami_with_retries() is True
+    assert len(calls) == 3
 
 
 # ---------------------------------------------------------------------------

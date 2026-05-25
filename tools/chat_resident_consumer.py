@@ -179,6 +179,10 @@ FALLBACK_REPLY = os.environ.get(
 )
 SEND_FALLBACK_ON_AGENT_ERROR = _env_bool("SEND_FALLBACK_ON_AGENT_ERROR", False)
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
+WHOAMI_STARTUP_RETRIES = int(os.environ.get("WHOAMI_STARTUP_RETRIES", "8"))
+WHOAMI_STARTUP_RETRY_DELAY_SEC = float(
+    os.environ.get("WHOAMI_STARTUP_RETRY_DELAY_SEC", "5")
+)
 
 # Prompt routed only when an agent entry cannot receive a native image object.
 # The consumer still extracts decrypted image bytes and passes them through
@@ -1687,6 +1691,26 @@ def _load_whoami() -> bool:
     return bool(user_id and user_pk)
 
 
+def _load_whoami_with_retries() -> bool:
+    """Fetch whoami at startup, tolerating transient network/TLS failures."""
+    attempts = max(1, WHOAMI_STARTUP_RETRIES)
+    delay = max(0.0, WHOAMI_STARTUP_RETRY_DELAY_SEC)
+
+    for idx in range(attempts):
+        if _load_whoami():
+            return True
+        if idx + 1 < attempts:
+            log.warning(
+                "whoami startup check failed; retrying %s/%s in %.1fs",
+                idx + 2,
+                attempts,
+                delay,
+            )
+            if delay:
+                time.sleep(delay)
+    return False
+
+
 def poll_chat(since: float) -> dict:
     url = f"{FEEDLING_API_URL}/v1/chat/poll"
     params = {"since": since, "timeout": POLL_TIMEOUT}
@@ -2114,7 +2138,7 @@ def run() -> None:
         )
         sys.exit(1)
 
-    if not _load_whoami():
+    if not _load_whoami_with_retries():
         log.critical(
             "whoami failed at startup — cannot obtain user_id or public_key. "
             "Check FEEDLING_API_URL and FEEDLING_API_KEY, then restart."
