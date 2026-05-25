@@ -162,6 +162,7 @@ PROACTIVE_POLL_TIMEOUT = int(os.environ.get("PROACTIVE_POLL_TIMEOUT", "1"))
 PROACTIVE_TICK_ENABLED = _env_bool("PROACTIVE_TICK_ENABLED", True)
 PROACTIVE_TICK_INTERVAL_SEC = int(os.environ.get("PROACTIVE_TICK_INTERVAL_SEC", "300"))
 PROACTIVE_TICK_START_DELAY_SEC = int(os.environ.get("PROACTIVE_TICK_START_DELAY_SEC", "15"))
+PROACTIVE_MAX_REPLY_MESSAGES = int(os.environ.get("PROACTIVE_MAX_REPLY_MESSAGES", "5"))
 CONSUMER_ID = os.environ.get(
     "CONSUMER_ID",
     f"{socket.gethostname()}:{os.getpid()}",
@@ -1077,6 +1078,21 @@ def _reply_from_json_obj(obj: Any) -> str:
     return ""
 
 
+def _multi_reply_json_from_obj(obj: Any) -> str:
+    """Preserve explicit multi-bubble JSON instead of collapsing it."""
+    messages: Any = None
+    if isinstance(obj, dict) and isinstance(obj.get("messages"), list):
+        messages = obj.get("messages")
+    elif isinstance(obj, list):
+        messages = obj
+    if not isinstance(messages, list):
+        return ""
+    out = [item.strip() for item in messages if isinstance(item, str) and item.strip()]
+    if not out:
+        return ""
+    return json.dumps({"messages": out}, ensure_ascii=False)
+
+
 def _json_objects_from_cli_output(raw: str) -> list[Any]:
     """Parse structured CLI output without interpreting human terminal UI."""
     raw = raw.strip()
@@ -1113,6 +1129,9 @@ def _extract_text_from_cli_output(raw: str) -> str:
         return ""
 
     for obj in reversed(_json_objects_from_cli_output(raw)):
+        multi = _multi_reply_json_from_obj(obj)
+        if multi:
+            return multi
         text = _reply_from_json_obj(obj)
         if text:
             return text
@@ -1174,6 +1193,10 @@ def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = 
     _remember_http_session(resp)
     body = resp.json()
     if isinstance(body, dict):
+        if isinstance(body.get("messages"), list):
+            multi = _multi_reply_json_from_obj(body)
+            if multi:
+                return multi
         for field in (AGENT_HTTP_FIELD, "response", "content", "text", "reply"):
             if isinstance(body.get(field), str) and body[field].strip():
                 return body[field].strip()
@@ -1570,15 +1593,29 @@ def _sanitize_reply_text(text: str) -> str:
     return "\n".join(deduped).strip()
 
 
-def _normalize_agent_replies(raw_reply: str) -> list[str]:
+def _structured_reply_payload(raw_reply: str) -> Any:
+    try:
+        return json.loads(raw_reply)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _cap_agent_replies(replies: list[str], max_items: int | None = None) -> list[str]:
+    limit = max(1, max_items if max_items is not None else PROACTIVE_MAX_REPLY_MESSAGES)
+    return replies[:limit]
+
+
+def _normalize_agent_replies(raw_reply: str, max_items: int | None = None) -> list[str]:
     """Convert agent output into one or more chat bubbles.
 
     Supported shapes:
     - Plain text -> one bubble after sanitization.
     - JSON string with {"messages": ["...", "..."]} -> multiple bubbles.
+    - JSON string with ["...", "..."] -> multiple bubbles.
 
     We keep policy minimal here: resident should not force one-to-one turn mapping;
-    agent-side logic decides whether to return one or many messages.
+    agent-side logic decides whether to return one or many messages. The resident
+    only enforces the product cap so one proactive moment cannot flood the user.
     """
     if not isinstance(raw_reply, str):
         return []
@@ -1588,18 +1625,20 @@ def _normalize_agent_replies(raw_reply: str) -> list[str]:
         return []
 
     # Optional structured multi-message output from agent.
-    try:
-        obj = json.loads(raw_reply)
-        if isinstance(obj, dict) and isinstance(obj.get("messages"), list):
-            out: list[str] = []
-            for item in obj["messages"]:
-                if isinstance(item, str):
-                    clean = _sanitize_reply_text(item)
-                    if clean:
-                        out.append(clean)
-            return out
-    except (json.JSONDecodeError, TypeError):
-        pass
+    obj = _structured_reply_payload(raw_reply)
+    items: list[Any] | None = None
+    if isinstance(obj, dict) and isinstance(obj.get("messages"), list):
+        items = obj["messages"]
+    elif isinstance(obj, list):
+        items = obj
+    if items is not None:
+        out: list[str] = []
+        for item in items:
+            if isinstance(item, str):
+                clean = _sanitize_reply_text(item)
+                if clean:
+                    out.append(clean)
+        return _cap_agent_replies(out, max_items=max_items)
 
     clean = _sanitize_reply_text(raw_reply)
     return [clean] if clean else []
@@ -1884,6 +1923,55 @@ def get_latest_ts() -> float:
     return 0.0
 
 
+def _message_text_for_context(msg: dict) -> str:
+    text = (
+        msg.get("content")
+        or msg.get("text")
+        or msg.get("plaintext")
+        or msg.get("body")
+        or ""
+    )
+    if isinstance(text, dict):
+        text = json.dumps(text, ensure_ascii=False)
+    if not isinstance(text, str):
+        text = str(text or "")
+    text = " ".join(text.strip().split())
+    if not text:
+        ctype = str(msg.get("content_type") or "").lower()
+        if ctype == "image" or msg.get("image_b64"):
+            text = "[image]"
+    return text[:500]
+
+
+def recent_chat_context_for_proactive(limit: int = 8) -> str:
+    """Return a short plaintext chat transcript for proactive continuity.
+
+    This uses the same decrypt sources as normal chat processing. If no decrypt
+    source is available, proactive realization still proceeds; it simply lacks
+    recent-chat continuity context.
+    """
+    try:
+        history = get_decrypted_history(since=0, limit=max(1, min(limit, 20)))
+    except Exception as e:
+        log.warning("recent chat context fetch failed: %s", e)
+        return ""
+    if not history:
+        return ""
+
+    rows: list[str] = []
+    for msg in history[-limit:]:
+        if not isinstance(msg, dict):
+            continue
+        text = _message_text_for_context(msg)
+        if not text or "__VERIFY_PING__" in text:
+            continue
+        role = "user" if msg.get("role") == "user" else "agent"
+        if msg.get("source") == PROACTIVE_JOB_SOURCE:
+            role = "agent(proactive)"
+        rows.append(f"- {role}: {text}")
+    return "\n".join(rows)
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
@@ -1908,7 +1996,11 @@ def _proactive_job_key(job: dict) -> str:
     return f"proactive:{job.get('ts', job.get('created_at', 'unknown'))}"
 
 
-def _message_for_proactive_job(job: dict, screen_text: str = "") -> str:
+def _message_for_proactive_job(
+    job: dict,
+    screen_text: str = "",
+    recent_chat_context: str = "",
+) -> str:
     context_hint = str(job.get("context_hint") or "").strip()
     intent_label = str(job.get("intent_label") or "proactive_context").strip()
     connections = job.get("connections")
@@ -1920,12 +2012,20 @@ def _message_for_proactive_job(job: dict, screen_text: str = "") -> str:
         "[Feedling proactive hidden job]",
         "A Feedling Gate decided this may be a good moment to reach out.",
         "Write only the message the user should see, in your normal voice.",
+        "You may send 1-5 short chat bubbles if that feels more natural than one message.",
+        'For multiple bubbles, return JSON exactly like {"messages":["...","..."]}. Otherwise return plain text.',
         f"intent: {intent_label}",
     ]
     if context_hint:
         parts.append(f"context_hint:\n{context_hint}")
     if connection_text:
         parts.append(f"possible_connections:\n{connection_text}")
+    if recent_chat_context:
+        parts.append(
+            "recent_chat_context:\n"
+            f"{recent_chat_context}\n"
+            "Use this only for continuity; do not summarize it back unless it is directly relevant."
+        )
     if screen_text:
         parts.append(screen_text)
     return "\n\n".join(parts)
@@ -1959,7 +2059,12 @@ def _process_proactive_jobs(jobs: list) -> float:
         if not isinstance(frame_ids, list):
             frame_ids = []
         screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
-        message = _message_for_proactive_job(job, screen_text=screen_text)
+        recent_context = recent_chat_context_for_proactive(limit=8)
+        message = _message_for_proactive_job(
+            job,
+            screen_text=screen_text,
+            recent_chat_context=recent_context,
+        )
         log.info(
             "proactive job [ts=%.3f] id=%s intent=%s frames=%d",
             ts,
@@ -1981,9 +2086,11 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
 
         if isinstance(replies, str):
-            replies = [replies]
+            replies = _normalize_agent_replies(replies)
         elif not isinstance(replies, list):
-            replies = [str(replies)]
+            replies = _normalize_agent_replies(str(replies))
+        else:
+            replies = _cap_agent_replies([str(r) for r in replies if str(r).strip()])
 
         posted_any = False
         last_error = ""

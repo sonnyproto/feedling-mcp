@@ -169,6 +169,7 @@ def test_auto_proactive_gate_uses_decrypted_frame_ocr(tmp_path, monkeypatch):
     def _fake_llm_gate(**kwargs):
         assert kwargs["frame_contexts"][0]["image_b64"] == "ZmFrZS1qcGVn"
         assert "要不要帮我" in kwargs["ocr_summary"]
+        assert kwargs["gate_context"]["memory_set"][0]["id"] == "mom_rewrite"
         return {
             "ok": True,
             "raw": {
@@ -178,13 +179,36 @@ def test_auto_proactive_gate_uses_decrypted_frame_ocr(tmp_path, monkeypatch):
                 "context_hint": "The user is looking at a dense post and may want help turning it into one usable sentence.",
                 "reason": "model_detected_helpful_moment",
                 "frame_ids": ["abcd1234abcd1234"],
-                "connections": ["The screen contains a rewrite/compression cue."],
+                "connection": {
+                    "source_type": "memory_set",
+                    "source_id": "mom_rewrite",
+                    "quote": "The user often asks Dora to compress dense ideas into a sendable point.",
+                    "why_concrete": "The screen asks whether to compress three paragraphs into one point.",
+                },
             },
             "usage": {"total_tokens": 123},
         }
 
     monkeypatch.setattr(appmod, "_decrypt_frame_metadata_for_gate", _fake_decrypt)
     monkeypatch.setattr(appmod, "_call_openrouter_proactive_gate", _fake_llm_gate)
+    monkeypatch.setattr(appmod, "_build_gate_memory_context", lambda *_args, **_kwargs: {
+        "identity_card": {"agent_name": "Dora"},
+        "memory_set": [{
+            "id": "mom_rewrite",
+            "type": "fact",
+            "title": "The user likes turning dense arguments into compact sendable points.",
+            "description": "Dora has helped compress notes into concise arguments before.",
+        }],
+        "passive_observations": [],
+        "recent_fires": [],
+        "now_local": {"iso": "2026-05-24T10:00:00-04:00"},
+        "connection_candidates": [{
+            "source_type": "memory_set",
+            "source_id": "mom_rewrite",
+            "quote": "The user likes turning dense arguments into compact sendable points.",
+        }],
+        "context_errors": {"identity": "", "memory": ""},
+    })
 
     api_key = "test_proactive_auto_key"
     user_id = "usr_endpoint_proactive_auto"
@@ -210,7 +234,104 @@ def test_auto_proactive_gate_uses_decrypted_frame_ocr(tmp_path, monkeypatch):
     assert body["decision"]["gate_input"]["decrypt_ok"] is True
     assert body["decision"]["gate_input"]["image_count"] == 1
     assert body["decision"]["gate_input"]["llm_called"] is True
+    assert body["decision"]["connection"]["source_id"] == "mom_rewrite"
     assert body["job"]["frame_ids"] == ["abcd1234abcd1234"]
+    assert body["job"]["connection"]["source_id"] == "mom_rewrite"
+
+
+def test_auto_proactive_gate_does_not_block_after_recent_user_chat(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(appmod, "OPENROUTER_API_KEY", "sk-test")
+    appmod._stores.clear()
+
+    monkeypatch.setattr(appmod, "_decrypt_frame_metadata_for_gate", lambda _store, frame_id, _api_key, include_image=False: {
+        "frame_id": frame_id,
+        "app": "xhs",
+        "ocr_text": "这段内容和我们之前聊过的压缩观点有关。",
+        "image_b64": "ZmFrZS1qcGVn" if include_image else "",
+        "image_mime": "image/jpeg",
+    })
+    monkeypatch.setattr(appmod, "_call_openrouter_proactive_gate", lambda **kwargs: {
+        "ok": True,
+        "raw": {
+            "should_reach_out": True,
+            "confidence": 0.86,
+            "intent_label": "memory_connection",
+            "context_hint": "The user is looking at a screen tied to a known memory.",
+            "reason": "model_detected_memory_connection",
+            "frame_ids": ["recentchat123456"],
+            "connection": {
+                "source_type": "memory_set",
+                "source_id": "mom_known",
+                "quote": "The user likes compact observations.",
+                "why_concrete": "The screen is about compressing a point.",
+            },
+        },
+        "usage": {"total_tokens": 88},
+    })
+    monkeypatch.setattr(appmod, "_build_gate_memory_context", lambda *_args, **_kwargs: {
+        "identity_card": {"agent_name": "Dora"},
+        "memory_set": [{"id": "mom_known", "title": "The user likes compact observations."}],
+        "passive_observations": [],
+        "recent_fires": [],
+        "now_local": {"iso": "2026-05-24T10:00:00-04:00"},
+        "connection_candidates": [{
+            "source_type": "memory_set",
+            "source_id": "mom_known",
+            "quote": "The user likes compact observations.",
+        }],
+        "context_errors": {"identity": "", "memory": ""},
+    })
+
+    api_key = "test_proactive_recent_chat_key"
+    user_id = "usr_endpoint_proactive_recent_chat"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.append_chat("user", "ios", {
+        "id": "msg_recent_user",
+        "v": 1,
+        "body_ct": "ct",
+        "nonce": "nonce",
+        "K_user": "k-user",
+        "visibility": "shared",
+        "owner_user_id": user_id,
+    })
+    store.frames_meta.append({
+        "id": "recentchat123456",
+        "filename": "recentchat123456.env.json",
+        "ts": appmod.time.time(),
+        "encrypted": True,
+    })
+
+    client = appmod.app.test_client()
+    resp = client.post("/v1/proactive/tick", headers={"X-API-Key": api_key}, json={})
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["enqueued"] is True
+    assert body["decision"]["reason"] == "model_detected_memory_connection"
+
+
+def test_recent_proactive_fire_cooldown_is_ten_minutes(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    store = appmod.UserStore("usr_test_proactive_cooldown")
+    now = appmod.time.time()
+    envelope = {
+        "id": "msg_fire",
+        "v": 1,
+        "body_ct": "ct",
+        "nonce": "nonce",
+        "K_user": "k-user",
+        "visibility": "shared",
+        "owner_user_id": store.user_id,
+    }
+    msg = store.append_chat("openclaw", appmod.PROACTIVE_JOB_SOURCE, envelope)
+
+    msg["ts"] = now - 599
+    assert appmod._recent_proactive_fire_active(store, now) is True
+
+    msg["ts"] = now - 601
+    assert appmod._recent_proactive_fire_active(store, now) is False
 
 
 def test_auto_proactive_gate_requires_model_even_with_strong_ocr(tmp_path, monkeypatch):
@@ -228,6 +349,19 @@ def test_auto_proactive_gate_requires_model_even_with_strong_ocr(tmp_path, monke
         }
 
     monkeypatch.setattr(appmod, "_decrypt_frame_metadata_for_gate", _fake_decrypt)
+    monkeypatch.setattr(appmod, "_build_gate_memory_context", lambda *_args, **_kwargs: {
+        "identity_card": {"agent_name": "Dora"},
+        "memory_set": [{"id": "mom_summary", "title": "User often asks for concise summaries."}],
+        "passive_observations": [],
+        "recent_fires": [],
+        "now_local": {"iso": "2026-05-24T10:00:00-04:00"},
+        "connection_candidates": [{
+            "source_type": "memory_set",
+            "source_id": "mom_summary",
+            "quote": "User often asks for concise summaries.",
+        }],
+        "context_errors": {"identity": "", "memory": ""},
+    })
 
     api_key = "test_proactive_auto_no_model_key"
     user_id = "usr_endpoint_proactive_auto_no_model"
@@ -267,6 +401,69 @@ def test_auto_proactive_gate_records_false_without_frames(tmp_path, monkeypatch)
     assert body["enqueued"] is False
     assert body["decision"]["should_reach_out"] is False
     assert body["decision"]["reason"] == "no_recent_frames"
+
+
+def test_llm_gate_true_requires_known_concrete_connection():
+    raw = {
+        "should_reach_out": True,
+        "confidence": 0.9,
+        "intent_label": "screen_context",
+        "context_hint": "The user is on a screen tied to a memory.",
+        "reason": "has_connection",
+        "connection": {
+            "source_type": "memory_set",
+            "source_id": "mom_unknown",
+            "quote": "unknown",
+            "why_concrete": "claims a match",
+        },
+        "frame_ids": ["frame_a"],
+    }
+
+    decision = appmod._coerce_llm_gate_payload(raw, ["frame_a"], {"mom_known"})
+
+    assert decision["should_reach_out"] is False
+    assert decision["abstention_reason"] == "llm_unrecognized_connection"
+    assert decision["context_hint"] == ""
+
+
+def test_gate_review_endpoint_records_human_label(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_gate_review_key"
+    user_id = "usr_gate_review"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+
+    decision = appmod._build_proactive_gate_decision(
+        store,
+        {
+            "force": True,
+            "context_hint": "The user is testing the review harness.",
+            "intent_label": "manual_proactive_test",
+        },
+    )
+    store.append_gate_decision(decision)
+
+    client = appmod.app.test_client()
+    resp = client.post(
+        f"/v1/proactive/decisions/{decision['decision_id']}/review",
+        headers={"X-API-Key": api_key},
+        json={"label": "great_companion_moment", "notes": "felt natural"},
+    )
+
+    assert resp.status_code == 200
+    review = resp.get_json()["review"]
+    assert review["label"] == "great_companion_moment"
+    assert review["decision_id"] == decision["decision_id"]
+
+    snapshot = appmod._proactive_debug_snapshot(store)
+    latest = snapshot["latest_review_by_decision"][decision["decision_id"]]
+    assert latest["notes"] == "felt natural"
+
+    listing = client.get("/v1/proactive/reviews?since=0", headers={"X-API-Key": api_key})
+    assert listing.status_code == 200
+    assert listing.get_json()["reviews"][0]["label"] == "great_companion_moment"
 
 
 def test_proactive_job_claim_and_status_lifecycle(tmp_path, monkeypatch):

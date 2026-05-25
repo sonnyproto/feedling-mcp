@@ -4,6 +4,7 @@ import errno
 import hashlib
 import hmac
 import html
+import io
 import json
 import os
 import re
@@ -15,6 +16,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 import jwt
@@ -171,10 +173,13 @@ PROACTIVE_JOB_MAX = int(os.environ.get("FEEDLING_PROACTIVE_JOB_MAX", 500))
 PROACTIVE_GATE_PROVIDER = os.environ.get("FEEDLING_PROACTIVE_GATE_PROVIDER", "openrouter").strip().lower()
 PROACTIVE_GATE_MODEL = os.environ.get("FEEDLING_PROACTIVE_GATE_MODEL", "google/gemini-3.1-flash-lite").strip()
 PROACTIVE_GATE_TIMEOUT_SEC = float(os.environ.get("FEEDLING_PROACTIVE_GATE_TIMEOUT_SEC", "30"))
-PROACTIVE_GATE_MAX_FRAMES = int(os.environ.get("FEEDLING_PROACTIVE_GATE_MAX_FRAMES", "4"))
+PROACTIVE_GATE_MAX_FRAMES = int(os.environ.get("FEEDLING_PROACTIVE_GATE_MAX_FRAMES", "5"))
+PROACTIVE_GATE_FRAME_CANDIDATE_MAX = int(os.environ.get("FEEDLING_PROACTIVE_GATE_FRAME_CANDIDATE_MAX", "60"))
+PROACTIVE_GATE_SCENE_HASH_THRESHOLD = int(os.environ.get("FEEDLING_PROACTIVE_GATE_SCENE_HASH_THRESHOLD", "5"))
 PROACTIVE_GATE_INCLUDE_IMAGES = os.environ.get("FEEDLING_PROACTIVE_GATE_INCLUDE_IMAGES", "true").lower() not in {
     "0", "false", "no", "off",
 }
+PROACTIVE_DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "America/New_York").strip() or "UTC"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 
 
@@ -303,6 +308,10 @@ class UserStore:
     @property
     def proactive_jobs_file(self) -> Path:
         return self.dir / "proactive_jobs.jsonl"
+
+    @property
+    def gate_reviews_file(self) -> Path:
+        return self.dir / "gate_reviews.jsonl"
 
     # ------- frames index -------
     def _load_frames_meta(self):
@@ -681,6 +690,13 @@ class UserStore:
     def list_gate_decisions(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
         return self._read_jsonl(self.gate_decisions_file, limit=limit, since_epoch=since_epoch)
 
+    def append_gate_review(self, review: dict) -> dict:
+        self._append_jsonl(self.gate_reviews_file, review)
+        return review
+
+    def list_gate_reviews(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
+        return self._read_jsonl(self.gate_reviews_file, limit=limit, since_epoch=since_epoch)
+
     def append_proactive_job(self, job: dict) -> dict:
         self._append_jsonl(self.proactive_jobs_file, job)
         self._trim_proactive_jobs()
@@ -1054,14 +1070,15 @@ def _recent_user_chat_active(store: UserStore, now: float, window_sec: float = 6
 def _recent_frame_meta(store: UserStore, now: float, window_sec: float) -> list[dict]:
     with store.frames_lock:
         frames = [f for f in store.frames_meta if now - float(f.get("ts", 0) or 0) <= window_sec]
-    return frames[-12:]
+    return frames[-PROACTIVE_GATE_FRAME_CANDIDATE_MAX:]
 
 
 def _sample_frames_for_gate(frames: list[dict], max_frames: int = 5) -> list[dict]:
-    """Pick representative recent frames for Gate V0.
+    """Metadata fallback sampler for Gate frames.
 
-    True visual clustering belongs in the vision Gate. This metadata sampler
-    keeps the same contract now: include boundaries and current state, cap at 5.
+    The preferred path samples after decryption with visual hashes. This
+    fallback is used when the Gate is blocked before decrypting or in tests
+    that only provide frame metadata.
     """
     clean = [f for f in frames if isinstance(f, dict) and str(f.get("id") or "").strip()]
     clean.sort(key=lambda f: float(f.get("ts", 0) or 0))
@@ -1088,10 +1105,106 @@ def _sample_frames_for_gate(frames: list[dict], max_frames: int = 5) -> list[dic
 def _frame_ids(frames: list[dict]) -> list[str]:
     out: list[str] = []
     for frame in frames:
-        frame_id = str(frame.get("id") or "").strip()
+        frame_id = str(frame.get("id") or frame.get("frame_id") or "").strip()
         if frame_id:
             out.append(frame_id)
-    return out[-5:]
+    return out
+
+
+def _base64_payload(data_url_or_b64: str) -> str:
+    raw = str(data_url_or_b64 or "").strip()
+    if "," in raw and raw.lower().startswith("data:"):
+        return raw.split(",", 1)[1]
+    return raw
+
+
+def _visual_hash_for_gate(image_b64: str) -> str | None:
+    """Return a lightweight perceptual hash for decrypted screen frames.
+
+    This uses an 8x8 grayscale average hash. It is intentionally small and
+    deterministic: enough to collapse near-duplicate screen frames before the
+    LLM call without adding a second model to the pipeline.
+    """
+    payload = _base64_payload(image_b64)
+    if not payload:
+        return None
+    try:
+        from PIL import Image  # type: ignore
+
+        image = Image.open(io.BytesIO(base64.b64decode(payload))).convert("L").resize((8, 8))
+        pixels = list(image.getdata())
+        avg = sum(pixels) / max(1, len(pixels))
+        bits = "".join("1" if px >= avg else "0" for px in pixels)
+        return f"{int(bits, 2):016x}"
+    except Exception:
+        return None
+
+
+def _hash_distance(a: str | None, b: str | None) -> int | None:
+    if not a or not b:
+        return None
+    try:
+        return (int(a, 16) ^ int(b, 16)).bit_count()
+    except Exception:
+        return None
+
+
+def _same_scene_fallback(a: dict, b: dict) -> bool:
+    app_a = str(a.get("app") or "").strip().lower()
+    app_b = str(b.get("app") or "").strip().lower()
+    if app_a and app_b and app_a != "unknown" and app_a == app_b:
+        text_a = " ".join(str(a.get("ocr_text") or "").split())[:240]
+        text_b = " ".join(str(b.get("ocr_text") or "").split())[:240]
+        return bool(text_a and text_a == text_b)
+    return False
+
+
+def _sample_frame_contexts_for_gate(frame_contexts: list[dict], max_frames: int = 5) -> list[dict]:
+    """Cluster decrypted frames by scene and keep 3-5 representatives.
+
+    Mirrors the product spec's "cluster by scene, cap at 5" behavior:
+    consecutive near-duplicates collapse, the last frame is always retained,
+    and active app switches get represented.
+    """
+    clean = [
+        f for f in frame_contexts
+        if isinstance(f, dict) and str(f.get("frame_id") or f.get("id") or "").strip()
+    ]
+    clean.sort(key=lambda f: float(f.get("ts", 0) or 0))
+    if len(clean) <= max_frames:
+        return clean
+
+    hashes = [_visual_hash_for_gate(str(f.get("image_b64") or "")) for f in clean]
+    clusters: list[list[int]] = [[0]]
+    for i in range(1, len(clean)):
+        dist = _hash_distance(hashes[i], hashes[i - 1])
+        same_scene = (
+            dist is not None and dist < PROACTIVE_GATE_SCENE_HASH_THRESHOLD
+        ) or _same_scene_fallback(clean[i], clean[i - 1])
+        if same_scene:
+            clusters[-1].append(i)
+        else:
+            clusters.append([i])
+
+    representatives = [clean[c[-1]] for c in clusters]
+    if len(representatives) <= max_frames:
+        return representatives
+
+    rep_hashes = [_visual_hash_for_gate(str(f.get("image_b64") or "")) for f in representatives]
+
+    def change_score(idx: int) -> int:
+        left = _hash_distance(rep_hashes[idx], rep_hashes[idx - 1]) if idx > 0 else 0
+        right = _hash_distance(rep_hashes[idx], rep_hashes[idx + 1]) if idx < len(rep_hashes) - 1 else 0
+        if left is None and right is None:
+            return 0
+        return (left or 0) + (right or 0)
+
+    keep_indexes = {0, len(representatives) - 1}
+    middle = list(range(1, len(representatives) - 1))
+    middle.sort(key=change_score, reverse=True)
+    for idx in middle[:max(0, max_frames - len(keep_indexes))]:
+        keep_indexes.add(idx)
+    return [representatives[i] for i in sorted(keep_indexes)]
 
 
 def _decrypt_frame_metadata_for_gate(
@@ -1133,6 +1246,7 @@ def _decrypt_frame_metadata_for_gate(
             return {"frame_id": fid, "error": "decrypt_non_object"}
         result = {
             "frame_id": fid,
+            "id": fid,
             "ts": data.get("ts"),
             "app": data.get("app") or "unknown",
             "ocr_text": str(data.get("ocr_text") or "")[:1200],
@@ -1185,7 +1299,7 @@ def _explicit_help_signal(ocr: str) -> bool:
     return any(cue in text for cue in cues) or "?" in text or "？" in text
 
 
-def _recent_proactive_fire_active(store: UserStore, now: float, window_sec: float = 900.0) -> bool:
+def _recent_proactive_fire_active(store: UserStore, now: float, window_sec: float = 600.0) -> bool:
     with store.chat_lock:
         for msg in reversed(store.chat_messages):
             if msg.get("source") != PROACTIVE_JOB_SOURCE:
@@ -1197,6 +1311,207 @@ def _recent_proactive_fire_active(store: UserStore, now: float, window_sec: floa
     return False
 
 
+def _safe_zoneinfo(name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        return ZoneInfo("UTC")
+
+
+def _now_local_context(payload: dict, settings: dict, now: float) -> dict:
+    tz_name = str(
+        payload.get("timezone")
+        or payload.get("tz")
+        or settings.get("timezone")
+        or PROACTIVE_DEFAULT_TIMEZONE
+    ).strip() or "UTC"
+    tz = _safe_zoneinfo(tz_name)
+    local_dt = datetime.fromtimestamp(now, tz)
+    return {
+        "iso": local_dt.isoformat(),
+        "date": local_dt.date().isoformat(),
+        "time": local_dt.strftime("%H:%M"),
+        "weekday": local_dt.strftime("%A"),
+        "timezone": tz_name,
+    }
+
+
+def _enclave_get_json_for_gate(path: str, api_key: str | None, params: dict | None = None) -> tuple[dict | None, str]:
+    enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
+    if not enclave_url:
+        return None, "enclave_unavailable"
+    if not api_key:
+        return None, "api_key_unavailable"
+    try:
+        with httpx.Client(timeout=20, verify=False) as client:
+            resp = client.get(
+                f"{enclave_url}{path}",
+                headers={"X-API-Key": api_key},
+                params=params or {},
+            )
+        if resp.status_code >= 400:
+            return None, f"enclave_http_{resp.status_code}:{resp.text[:160]}"
+        data = resp.json()
+        if not isinstance(data, dict):
+            return None, "enclave_non_object"
+        return data, ""
+    except Exception as e:
+        return None, f"enclave_error:{type(e).__name__}:{str(e)[:120]}"
+
+
+def _summarize_identity_for_gate(identity: dict | None) -> tuple[dict, list[dict]]:
+    if not isinstance(identity, dict):
+        return {}, []
+    agent_name = str(identity.get("agent_name") or "").strip()
+    summary = {
+        "agent_name": agent_name,
+        "self_introduction": str(identity.get("self_introduction") or "")[:800],
+        "days_with_user": identity.get("days_with_user"),
+        "category": str(identity.get("category") or "")[:160],
+        "signature": identity.get("signature") if isinstance(identity.get("signature"), list) else [],
+        "interruption_preferences": identity.get("interruption_preferences")
+        or identity.get("push_preferences")
+        or identity.get("proactive_preferences")
+        or {},
+    }
+    dimensions = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
+    clean_dims: list[dict] = []
+    connection_rows: list[dict] = []
+    for idx, dim in enumerate(dimensions[:12]):
+        if not isinstance(dim, dict):
+            continue
+        name = str(dim.get("name") or dim.get("label") or f"dimension_{idx + 1}").strip()
+        desc = str(dim.get("description") or dim.get("evidence") or "").strip()
+        row = {
+            "id": f"identity.dimension.{idx + 1}",
+            "name": name[:120],
+            "score": dim.get("score"),
+            "description": desc[:400],
+        }
+        clean_dims.append(row)
+        if name or desc:
+            connection_rows.append({
+                "source_type": "identity_card",
+                "source_id": row["id"],
+                "quote": f"{name}: {desc}".strip(": ")[:500],
+            })
+    summary["dimensions"] = clean_dims
+    if agent_name:
+        connection_rows.append({
+            "source_type": "identity_card",
+            "source_id": "identity.agent_name",
+            "quote": f"agent_name={agent_name}",
+        })
+    return summary, connection_rows
+
+
+def _moment_is_passive_observation(moment: dict) -> bool:
+    fields = [
+        moment.get("type"),
+        moment.get("source"),
+        moment.get("category"),
+        *(moment.get("tags") if isinstance(moment.get("tags"), list) else []),
+    ]
+    text = " ".join(str(x or "") for x in fields).lower()
+    return "agent_passive_observation" in text or "passive_observation" in text
+
+
+def _summarize_moments_for_gate(moments: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
+    memory_set: list[dict] = []
+    passive_observations: list[dict] = []
+    connection_rows: list[dict] = []
+    for moment in moments:
+        if not isinstance(moment, dict):
+            continue
+        if moment.get("decrypt_status") and moment.get("decrypt_status") != "ok":
+            continue
+        mid = str(moment.get("id") or "").strip()
+        if not mid:
+            continue
+        title = str(moment.get("title") or "").strip()
+        desc = str(moment.get("description") or "").strip()
+        row = {
+            "id": mid,
+            "type": str(moment.get("type") or "")[:80],
+            "source": str(moment.get("source") or "")[:80],
+            "occurred_at": moment.get("occurred_at"),
+            "title": title[:220],
+            "description": desc[:700],
+        }
+        if _moment_is_passive_observation(moment):
+            passive_observations.append(row)
+            source_type = "passive_observation"
+        else:
+            memory_set.append(row)
+            source_type = "memory_set"
+        quote = " — ".join(part for part in [title, desc] if part)[:700]
+        if quote:
+            connection_rows.append({
+                "source_type": source_type,
+                "source_id": mid,
+                "quote": quote,
+            })
+    return memory_set[:80], passive_observations[:10], connection_rows[:120]
+
+
+def _recent_fires_for_gate(store: UserStore, now: float) -> list[dict]:
+    fires: list[dict] = []
+    since = now - 86400
+    decisions = store.list_gate_decisions(since_epoch=since, limit=80)
+    for row in decisions:
+        if not row.get("should_reach_out"):
+            continue
+        fires.append({
+            "decision_id": row.get("decision_id"),
+            "ts": row.get("ts"),
+            "intent_label": row.get("intent_label", ""),
+            "context_hint": row.get("context_hint", "")[:500],
+            "reason": row.get("reason", ""),
+            "connection": row.get("connection") or {},
+            "frame_ids": row.get("frame_ids", [])[:5],
+        })
+    return fires[-20:]
+
+
+def _build_gate_memory_context(
+    store: UserStore,
+    api_key: str | None,
+    payload: dict,
+    settings: dict,
+    now: float,
+) -> dict:
+    identity_data, identity_error = _enclave_get_json_for_gate("/v1/identity/get", api_key)
+    memory_data, memory_error = _enclave_get_json_for_gate("/v1/memory/list", api_key, {"limit": "200"})
+
+    identity, identity_connections = _summarize_identity_for_gate(
+        (identity_data or {}).get("identity") if isinstance(identity_data, dict) else None
+    )
+    memory_set, passive_observations, memory_connections = _summarize_moments_for_gate(
+        (memory_data or {}).get("moments") if isinstance((memory_data or {}).get("moments"), list) else []
+    )
+    connection_candidates = identity_connections + memory_connections
+    return {
+        "identity_card": identity,
+        "memory_set": memory_set,
+        "passive_observations": passive_observations,
+        "recent_fires": _recent_fires_for_gate(store, now),
+        "now_local": _now_local_context(payload, settings, now),
+        "connection_candidates": connection_candidates,
+        "context_errors": {
+            "identity": identity_error,
+            "memory": memory_error,
+        },
+    }
+
+
+def _gate_context_connection_ids(gate_context: dict) -> set[str]:
+    return {
+        str(row.get("source_id") or "").strip()
+        for row in gate_context.get("connection_candidates", [])
+        if isinstance(row, dict) and str(row.get("source_id") or "").strip()
+    }
+
+
 def _strip_json_code_fence(text: str) -> str:
     cleaned = (text or "").strip()
     if cleaned.startswith("```"):
@@ -1205,7 +1520,31 @@ def _strip_json_code_fence(text: str) -> str:
     return cleaned.strip()
 
 
-def _coerce_llm_gate_payload(raw: dict, selected_frame_ids: list[str]) -> dict:
+PROACTIVE_GATE_SYSTEM_PROMPT = (
+    "You are the proactive gate for the user's personal AI companion. "
+    "Your job is to decide whether the companion would naturally think of the user in this moment. "
+    "Naturally think of has exactly one criterion: a concrete connection between the current screen/context "
+    "and something specific in identity_card, memory_set, or passive_observations. "
+    "Return JSON only. Do not reveal chain-of-thought. Do not write the final user-facing message."
+)
+
+
+def _normalize_connection(raw_connection) -> dict:
+    if not isinstance(raw_connection, dict):
+        return {}
+    return {
+        "source_type": str(raw_connection.get("source_type") or "")[:80],
+        "source_id": str(raw_connection.get("source_id") or "")[:160],
+        "quote": str(raw_connection.get("quote") or "")[:700],
+        "why_concrete": str(raw_connection.get("why_concrete") or "")[:700],
+    }
+
+
+def _coerce_llm_gate_payload(
+    raw: dict,
+    selected_frame_ids: list[str],
+    allowed_connection_ids: set[str] | None = None,
+) -> dict:
     if not isinstance(raw, dict):
         return {
             "should_reach_out": False,
@@ -1213,7 +1552,8 @@ def _coerce_llm_gate_payload(raw: dict, selected_frame_ids: list[str]) -> dict:
             "intent_label": "invalid_gate_response",
             "context_hint": "",
             "reason": "llm_non_object",
-            "connections": [],
+            "abstention_reason": "llm_non_object",
+            "connection": {},
             "frame_ids": [],
         }
 
@@ -1235,13 +1575,42 @@ def _coerce_llm_gate_payload(raw: dict, selected_frame_ids: list[str]) -> dict:
     except (TypeError, ValueError):
         confidence = 0.0
 
+    connection = _normalize_connection(raw.get("connection"))
+    connections = raw.get("connections")
+    if isinstance(connections, list) and not connection:
+        for item in connections:
+            connection = _normalize_connection(item)
+            if connection:
+                break
+
+    should = bool(raw.get("should_reach_out"))
+    context_hint = str(raw.get("context_hint") or "").strip()[:2000]
+    abstention_reason = str(raw.get("abstention_reason") or raw.get("reason") or "").strip()[:500]
+    reason = str(raw.get("reason") or ("llm_true" if should else abstention_reason or "llm_false"))[:240]
+
+    allowed_connection_ids = allowed_connection_ids or set()
+    if should:
+        if not context_hint:
+            should = False
+            reason = "llm_missing_context_hint"
+            abstention_reason = "llm_missing_context_hint"
+        elif not connection.get("source_id"):
+            should = False
+            reason = "llm_missing_concrete_connection"
+            abstention_reason = "llm_missing_concrete_connection"
+        elif allowed_connection_ids and connection.get("source_id") not in allowed_connection_ids:
+            should = False
+            reason = "llm_unrecognized_connection"
+            abstention_reason = "llm_unrecognized_connection"
+
     return {
-        "should_reach_out": bool(raw.get("should_reach_out")),
+        "should_reach_out": should,
         "confidence": max(0.0, min(1.0, confidence)),
         "intent_label": str(raw.get("intent_label") or raw.get("intent") or "proactive_screen_context")[:120],
-        "context_hint": str(raw.get("context_hint") or "")[:2000],
-        "reason": str(raw.get("reason") or "llm_decision")[:240],
-        "connections": [str(c).strip()[:240] for c in connections if str(c).strip()][:5],
+        "context_hint": context_hint if should else "",
+        "reason": reason,
+        "abstention_reason": "" if should else (abstention_reason or reason),
+        "connection": connection if should else {},
         "frame_ids": frame_ids,
     }
 
@@ -1250,8 +1619,8 @@ def _call_openrouter_proactive_gate(
     *,
     frame_contexts: list[dict],
     device_events: list[dict],
-    current_app: str,
     ocr_summary: str,
+    gate_context: dict,
 ) -> dict:
     """Call the model that decides whether Feedling should proactively speak.
 
@@ -1267,6 +1636,7 @@ def _call_openrouter_proactive_gate(
         return {"ok": False, "error": "model_not_configured"}
 
     selected_frame_ids = [str(f.get("frame_id") or "") for f in frame_contexts if f.get("frame_id")]
+    allowed_connection_ids = _gate_context_connection_ids(gate_context)
     metadata_frames = []
     content: list[dict] = []
     for idx, frame in enumerate(frame_contexts, start=1):
@@ -1284,23 +1654,58 @@ def _call_openrouter_proactive_gate(
             "decrypt_error": frame.get("error", ""),
         })
     gate_payload = {
-        "task": "Decide whether the user's own AI should proactively send one message now.",
+        "task": "Decide whether the user's own AI companion should proactively send one message now.",
+        "gate_role": (
+            "You are deciding whether the companion would naturally think of the user now. "
+            "This product is for high-recall AI companionship, not a low-interruption work assistant."
+        ),
+        "core_criterion": (
+            "should_reach_out=true requires a concrete connection between visible/current context "
+            "and a specific source_id in connection_candidates."
+        ),
+        "valid_connections": [
+            "A named topic/person/place/object on screen directly matches a memory, identity dimension, or passive observation.",
+            "The user is doing something that matches an established preference, emotional pattern, project, relationship, or repeated concern in memory.",
+            "The local time/context makes a memory-linked ritual or recurring situation relevant now.",
+            "The screen suggests a moment the companion has specifically helped with before, grounded in a named memory or observation.",
+        ],
+        "invalid_connections": [
+            "Generic claims like the user might be overwhelmed, might want help, or perhaps needs a summary.",
+            "A useful work-assistant opportunity with no memory/identity match.",
+            "Idle browsing, repeated content already fired in recent_fires, or vague similarity to the user's interests.",
+            "Any decision based only on OCR keywords without a concrete source_id.",
+        ],
         "decision_policy": [
-            "Return should_reach_out=true only when the visible screen shows a timely moment where a short proactive message would likely help.",
-            "Prefer false for idle browsing, unclear content, private/low-confidence screens, repeated reminders, or when the user is already actively chatting.",
-            "Do not write the final user-facing message. Write only a concise context_hint for the user's resident agent.",
-            "Use the images as primary evidence. OCR is unreliable auxiliary metadata.",
+            "Prefer high recall when the connection is concrete and emotionally/contextually natural for a companion.",
+            "Use interruption_preferences from identity_card when present; otherwise keep messages short and easy to ignore.",
+            "Use recent_fires to avoid repeating the same idea within 24 hours.",
+            "Use images as primary evidence. OCR is unreliable auxiliary metadata.",
+            "Do not reveal chain-of-thought. Put only short audit text in reason or abstention_reason.",
+            "Do not write the final user-facing message. Write only hidden context_hint for the user's resident agent.",
         ],
         "output_schema": {
             "should_reach_out": "boolean",
             "confidence": "number 0..1",
             "intent_label": "short snake_case label",
             "context_hint": "hidden context for the user's resident agent, 1-3 sentences",
-            "reason": "short reason for dashboard/debug",
+            "reason": "short positive audit reason when true",
+            "abstention_reason": "required short reason when false",
+            "connection": {
+                "source_type": "identity_card | memory_set | passive_observation",
+                "source_id": "must match one source_id from connection_candidates",
+                "quote": "short supporting text from that source",
+                "why_concrete": "why the current screen connects to that source",
+            },
             "frame_ids": "array of frame ids used",
-            "connections": "optional array of short supporting facts",
         },
-        "current_app": current_app,
+        "gate_context": {
+            "identity_card": gate_context.get("identity_card") or {},
+            "memory_set": gate_context.get("memory_set") or [],
+            "passive_observations": gate_context.get("passive_observations") or [],
+            "recent_fires": gate_context.get("recent_fires") or [],
+            "now_local": gate_context.get("now_local") or {},
+            "connection_candidates": gate_context.get("connection_candidates") or [],
+        },
         "ocr_summary": ocr_summary[:1200],
         "frames": metadata_frames,
         "device_events": device_events[-10:],
@@ -1326,14 +1731,7 @@ def _call_openrouter_proactive_gate(
     body = {
         "model": PROACTIVE_GATE_MODEL,
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a conservative proactive-notification gate. "
-                    "You only decide whether to create a hidden job for the user's own resident agent. "
-                    "You never write the final message to the user."
-                ),
-            },
+            {"role": "system", "content": PROACTIVE_GATE_SYSTEM_PROMPT},
             {"role": "user", "content": content},
         ],
         "temperature": 0,
@@ -1359,7 +1757,7 @@ def _call_openrouter_proactive_gate(
         parsed = json.loads(_strip_json_code_fence(text))
         return {
             "ok": True,
-            "raw": _coerce_llm_gate_payload(parsed, selected_frame_ids),
+            "raw": _coerce_llm_gate_payload(parsed, selected_frame_ids, allowed_connection_ids),
             "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
         }
     except json.JSONDecodeError as e:
@@ -1417,8 +1815,11 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict, api_key: str
             now,
             _payload_float(payload, "frame_window_sec", 300.0, 30.0, 3600.0),
         )
-    selected_frames = _sample_frames_for_gate(frames, max_frames=PROACTIVE_GATE_MAX_FRAMES)
-    frame_ids = _frame_ids(selected_frames)
+    candidate_frames = _sample_frames_for_gate(
+        frames,
+        max_frames=PROACTIVE_GATE_FRAME_CANDIDATE_MAX,
+    )
+    frame_ids = _frame_ids(candidate_frames)
     device_events = _recent_device_events_for_gate(
         store,
         now,
@@ -1432,10 +1833,6 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict, api_key: str
         block_reason = "dnd_enabled"
     elif not frames and not force:
         block_reason = "no_recent_frames"
-    elif _recent_user_chat_active(store, now) and not force:
-        block_reason = "recent_user_chat_active"
-    elif store.cooldown_remaining_seconds() > 0 and not force:
-        block_reason = "push_cooldown"
     elif _recent_proactive_fire_active(store, now) and not force:
         block_reason = "recent_proactive_fire"
 
@@ -1445,7 +1842,13 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict, api_key: str
         connections = []
     connections = [str(c).strip()[:240] for c in connections if str(c).strip()][:5]
 
-    frame_contexts = [
+    gate_context = (
+        _build_gate_memory_context(store, api_key, payload, settings, now)
+        if not is_manual_hint and not block_reason else {}
+    )
+    allowed_connection_ids = _gate_context_connection_ids(gate_context)
+
+    candidate_frame_contexts = [
         _decrypt_frame_metadata_for_gate(
             store,
             fid,
@@ -1454,12 +1857,18 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict, api_key: str
         )
         for fid in frame_ids
     ] if frame_ids and not is_manual_hint else []
+    frame_contexts = _sample_frame_contexts_for_gate(
+        candidate_frame_contexts,
+        max_frames=PROACTIVE_GATE_MAX_FRAMES,
+    ) if candidate_frame_contexts else []
+    selected_frames = frame_contexts or _sample_frames_for_gate(candidate_frames, max_frames=PROACTIVE_GATE_MAX_FRAMES)
+    frame_ids = _frame_ids(selected_frames)
     current_app = str(payload.get("current_app") or "").strip()
     if not current_app:
-        current_app = _gate_current_app(frame_contexts, selected_frames)
+        current_app = _gate_current_app(frame_contexts, candidate_frames)
     ocr = str(payload.get("ocr_summary") or "").strip()
     if not ocr:
-        ocr = _gate_ocr_summary(frame_contexts, selected_frames)
+        ocr = _gate_ocr_summary(frame_contexts, candidate_frames)
 
     decrypt_errors = [f.get("error") for f in frame_contexts if f.get("error")]
     decrypt_ok = any(
@@ -1488,29 +1897,43 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict, api_key: str
         should_reach_out = False
         reason = "frame_decrypt_unavailable"
         intent_label = "frame_decrypt_unavailable"
+    elif not allowed_connection_ids and not force:
+        should_reach_out = False
+        reason = "memory_context_unavailable"
+        intent_label = "memory_context_unavailable"
     else:
         llm_called = True
         llm_result = _call_openrouter_proactive_gate(
             frame_contexts=frame_contexts,
             device_events=device_events,
-            current_app=current_app,
             ocr_summary=ocr,
+            gate_context=gate_context,
         )
         if llm_result.get("ok"):
             llm_payload = llm_result.get("raw") or {}
             llm_usage = llm_result.get("usage") if isinstance(llm_result.get("usage"), dict) else {}
             should_reach_out = bool(llm_payload.get("should_reach_out"))
-            reason = str(llm_payload.get("reason") or ("llm_true" if should_reach_out else "llm_false"))[:240]
+            reason = str(
+                llm_payload.get("reason")
+                or llm_payload.get("abstention_reason")
+                or ("llm_true" if should_reach_out else "llm_false")
+            )[:240]
             intent_label = str(llm_payload.get("intent_label") or "llm_proactive_gate").strip()
             if should_reach_out:
                 context_hint = str(llm_payload.get("context_hint") or "").strip()
-                connections = llm_payload.get("connections") if isinstance(llm_payload.get("connections"), list) else []
-                connections = [str(c).strip()[:240] for c in connections if str(c).strip()][:5]
+                connection = llm_payload.get("connection") if isinstance(llm_payload.get("connection"), dict) else {}
+                connections = [
+                    str(connection.get("quote") or "").strip()[:240],
+                    str(connection.get("why_concrete") or "").strip()[:240],
+                ]
+                connections = [c for c in connections if c][:5]
                 frame_ids = llm_payload.get("frame_ids") if isinstance(llm_payload.get("frame_ids"), list) else frame_ids
                 frame_ids = [str(fid) for fid in frame_ids if str(fid) in set(_frame_ids(selected_frames))][:PROACTIVE_GATE_MAX_FRAMES]
                 if not context_hint:
                     should_reach_out = False
                     reason = "llm_missing_context_hint"
+            else:
+                context_hint = ""
         else:
             should_reach_out = False
             llm_error = str(llm_result.get("error") or "llm_error")[:240]
@@ -1530,6 +1953,11 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict, api_key: str
         "intent_label": intent_label[:120],
         "context_hint": context_hint[:2000],
         "connections": connections,
+        "connection": (
+            llm_payload.get("connection")
+            if should_reach_out and isinstance(llm_payload.get("connection"), dict)
+            else {}
+        ),
         "frame_ids": frame_ids,
         "device_event_ids": [str(e.get("event_id")) for e in device_events if e.get("event_id")][:10],
         "current_app": current_app,
@@ -1546,6 +1974,14 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict, api_key: str
             "decrypt_errors": [str(e)[:120] for e in decrypt_errors[:5]],
             "llm_called": llm_called,
             "llm_error": llm_error,
+            "memory_context": {
+                "identity_loaded": bool((gate_context.get("identity_card") or {}).get("agent_name")),
+                "memory_count": len(gate_context.get("memory_set") or []),
+                "passive_observation_count": len(gate_context.get("passive_observations") or []),
+                "recent_fire_count": len(gate_context.get("recent_fires") or []),
+                "connection_candidate_count": len(gate_context.get("connection_candidates") or []),
+                "context_errors": gate_context.get("context_errors") or {},
+            },
         },
         "forced": force,
     }
@@ -1563,6 +1999,7 @@ def _proactive_job_from_decision(decision: dict) -> dict:
         "intent_label": decision.get("intent_label", ""),
         "context_hint": decision.get("context_hint", ""),
         "connections": decision.get("connections", []),
+        "connection": decision.get("connection", {}),
         "frame_ids": decision.get("frame_ids", []),
         "device_event_ids": decision.get("device_event_ids", []),
         "current_app": decision.get("current_app", ""),
@@ -1573,6 +2010,12 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
     decisions = store.list_gate_decisions(limit=50)
     jobs = store.list_proactive_jobs(limit=50)
     events = store.list_device_events(limit=50)
+    reviews = store.list_gate_reviews(limit=200)
+    latest_review_by_decision: dict[str, dict] = {}
+    for review in reviews:
+        did = str(review.get("decision_id") or "")
+        if did:
+            latest_review_by_decision[did] = review
     with store.chat_lock:
         proactive_messages = [
             {
@@ -1637,12 +2080,15 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
         "generated_at": datetime.now().isoformat(),
         "settings": store.load_proactive_settings(),
         "decisions": decisions,
+        "reviews": reviews,
+        "latest_review_by_decision": latest_review_by_decision,
         "jobs": enriched_jobs,
         "device_events": events,
         "proactive_messages": proactive_messages,
         "recent_frames": frames,
         "counts": {
             "decisions": len(decisions),
+            "reviews": len(reviews),
             "jobs": len(jobs),
             "device_events": len(events),
             "proactive_messages": len(proactive_messages),
@@ -1698,6 +2144,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         return ""
 
     decisions = list(reversed(snapshot.get("decisions") or []))
+    latest_reviews = snapshot.get("latest_review_by_decision") or {}
     jobs = list(reversed(snapshot.get("jobs") or []))
     messages = list(reversed(snapshot.get("proactive_messages") or []))
     frames = list(reversed(snapshot.get("recent_frames") or []))
@@ -1705,23 +2152,46 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
     def decision_rows() -> str:
         if not decisions:
-            return "<tr><td colspan='10'>No Gate decisions yet.</td></tr>"
+            return "<tr><td colspan='13'>No Gate decisions yet.</td></tr>"
         rows = []
         for d in decisions[:30]:
             verdict = "TRUE" if d.get("should_reach_out") else "FALSE"
             gate_input = d.get("gate_input") or {}
+            connection = d.get("connection") or {}
+            review = latest_reviews.get(str(d.get("decision_id") or "")) or {}
+            review_action = f"/v1/proactive/decisions/{quote(str(d.get('decision_id') or ''))}/review{key_qs}"
+            review_html = (
+                f"<div class='mini'>last: {esc(review.get('label') or 'unreviewed')}</div>"
+                f"<form method='post' action='{review_action}'>"
+                "<select name='label'>"
+                "<option value='correct_true'>correct true</option>"
+                "<option value='correct_false'>correct false</option>"
+                "<option value='missed_opportunity'>missed opportunity</option>"
+                "<option value='spam'>spam</option>"
+                "<option value='weak_connection'>weak connection</option>"
+                "<option value='repeated'>repeated</option>"
+                "<option value='privacy_bad'>privacy bad</option>"
+                "<option value='great_companion_moment'>great companion moment</option>"
+                "</select>"
+                "<input name='notes' placeholder='notes' maxlength='300'>"
+                "<button type='submit'>save</button>"
+                "</form>"
+            )
             rows.append(
                 "<tr>"
                 f"<td>{esc(fmt_time(d.get('ts')))}</td>"
                 f"<td class='mono'>{esc(fmt_epoch(d.get('ts')))}</td>"
                 f"<td class='{ 'ok' if d.get('should_reach_out') else 'muted' }'>{verdict}</td>"
                 f"<td class='mono'>{esc(d.get('gate_model'))}</td>"
-                f"<td>{esc(d.get('reason') or d.get('abstention_reason'))}</td>"
+                f"<td>{esc(d.get('reason'))}</td>"
+                f"<td>{esc(d.get('abstention_reason'))}</td>"
                 f"<td>{esc(d.get('intent_label'))}</td>"
+                f"<td class='wrap mono'>{esc(json.dumps(connection, ensure_ascii=False))}</td>"
                 f"<td class='wrap'>{esc(d.get('context_hint'))}</td>"
                 f"<td>{frame_links(d.get('frame_ids'))}</td>"
                 f"<td class='wrap mono'>{esc(json.dumps(gate_input, ensure_ascii=False))}</td>"
                 f"<td class='mono'>{esc(d.get('decision_id'))}</td>"
+                f"<td>{review_html}</td>"
                 "</tr>"
             )
         return "".join(rows)
@@ -1826,6 +2296,8 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     a {{ color: #8e301f; text-decoration: none; border-bottom: 1px solid #d0a094; }}
     a.mini {{ margin-left: 6px; font-size: 11px; color: #6f6961; }}
     .wrap {{ max-width: 520px; white-space: pre-wrap; }}
+    select, input, button {{ font: inherit; font-size: 12px; margin: 2px 0; }}
+    input {{ max-width: 180px; }}
     .ok {{ color: #0b7d42; font-weight: 700; }}
     .muted {{ color: #8b8176; }}
     .bad {{ color: #b42318; font-weight: 700; }}
@@ -1836,6 +2308,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
   <div class="meta">user <span class="mono">{esc(snapshot.get('user_id'))}</span> · generated {esc(snapshot.get('generated_at'))} · auto-refresh 5s</div>
   <div>
     <span class="pill">decisions {esc(counts.get('decisions', 0))}</span>
+    <span class="pill">reviews {esc(counts.get('reviews', 0))}</span>
     <span class="pill">jobs {esc(counts.get('jobs', 0))}</span>
     <span class="pill">proactive writes {esc(counts.get('proactive_messages', 0))}</span>
     <span class="pill">frames {esc(counts.get('recent_frames', 0))}</span>
@@ -1843,7 +2316,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
   </div>
 
   <h2>Gate Decisions</h2>
-  <table><thead><tr><th>time</th><th>ts</th><th>Gate</th><th>model</th><th>reason</th><th>intent</th><th>context_hint</th><th>frames</th><th>gate input</th><th>decision</th></tr></thead><tbody>{decision_rows()}</tbody></table>
+  <table><thead><tr><th>time</th><th>ts</th><th>Gate</th><th>model</th><th>reason</th><th>abstention</th><th>intent</th><th>connection</th><th>context_hint</th><th>frames</th><th>gate input</th><th>decision</th><th>human review</th></tr></thead><tbody>{decision_rows()}</tbody></table>
 
   <h2>Hidden Jobs</h2>
   <table><thead><tr><th>time</th><th>ts</th><th>status</th><th>intent</th><th>context_hint</th><th>frames sent</th><th>reason</th><th>preview</th><th>alert</th><th>live activity</th><th>consumer</th><th>decision</th><th>job</th></tr></thead><tbody>{job_rows()}</tbody></table>
@@ -3158,6 +3631,81 @@ def proactive_decisions():
         return jsonify({"error": "invalid limit"}), 400
     limit = max(1, min(limit, 200))
     return jsonify({"decisions": store.list_gate_decisions(since_epoch=since, limit=limit)})
+
+
+@app.route("/v1/proactive/decisions/<decision_id>/review", methods=["POST"])
+def proactive_decision_review(decision_id):
+    store = require_user()
+    if request.is_json:
+        payload = request.get_json(silent=True) or {}
+    else:
+        payload = request.form.to_dict(flat=True)
+
+    decision_id = str(decision_id or "").strip()
+    if not decision_id:
+        return jsonify({"error": "decision_id_required"}), 400
+
+    decision = None
+    for row in store.list_gate_decisions(since_epoch=0, limit=0):
+        if str(row.get("decision_id") or "") == decision_id:
+            decision = row
+            break
+    if decision is None:
+        return jsonify({"error": "decision_not_found"}), 404
+
+    label = str(payload.get("label") or "").strip()
+    allowed_labels = {
+        "correct_true",
+        "correct_false",
+        "missed_opportunity",
+        "spam",
+        "weak_connection",
+        "repeated",
+        "privacy_bad",
+        "great_companion_moment",
+    }
+    if label not in allowed_labels:
+        return jsonify({"error": "invalid_label", "allowed": sorted(allowed_labels)}), 400
+
+    review = {
+        "review_id": _new_public_id("gr"),
+        "decision_id": decision_id,
+        "ts": time.time(),
+        "created_at": datetime.now().isoformat(),
+        "label": label,
+        "notes": str(payload.get("notes") or "")[:500],
+        "reviewer": str(payload.get("reviewer") or "human")[:80],
+        "expected_should_reach_out": payload.get("expected_should_reach_out"),
+        "correct_connection_source_id": str(payload.get("correct_connection_source_id") or "")[:160],
+        "decision_should_reach_out": bool(decision.get("should_reach_out")),
+        "decision_reason": str(decision.get("reason") or decision.get("abstention_reason") or "")[:240],
+        "decision_intent_label": str(decision.get("intent_label") or "")[:120],
+        "decision_connection": decision.get("connection") or {},
+        "frame_ids": decision.get("frame_ids") or [],
+    }
+    store.append_gate_review(review)
+    accept = request.headers.get("Accept", "")
+    if not request.is_json and "text/html" in accept:
+        return Response(
+            "<html><body><p>Review saved.</p><script>history.back()</script></body></html>",
+            mimetype="text/html",
+        )
+    return jsonify({"review": review})
+
+
+@app.route("/v1/proactive/reviews", methods=["GET"])
+def proactive_reviews():
+    store = require_user()
+    try:
+        since = float(request.args.get("since", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid since"}), 400
+    try:
+        limit = int(request.args.get("limit", 200))
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid limit"}), 400
+    limit = max(1, min(limit, 500))
+    return jsonify({"reviews": store.list_gate_reviews(since_epoch=since, limit=limit)})
 
 
 @app.route("/v1/proactive/debug", methods=["GET"])

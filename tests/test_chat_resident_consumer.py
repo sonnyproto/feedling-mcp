@@ -915,6 +915,11 @@ def test_process_proactive_jobs_routes_through_agent_and_posts_metadata(monkeypa
         "_screen_context_for_frame_ids",
         lambda frame_ids: ("screen: user is reading docs", [{"data": "x"}], ["/tmp/frame.jpg"]),
     )
+    monkeypatch.setattr(
+        crc,
+        "recent_chat_context_for_proactive",
+        lambda limit=8: "- user: 你刚刚问我这段要不要压成一句话。\n- agent: 我可以帮你压。",
+    )
 
     job = {
         "job_id": "pj_1",
@@ -930,6 +935,8 @@ def test_process_proactive_jobs_routes_through_agent_and_posts_metadata(monkeypa
     assert crc._process_proactive_jobs([job]) == pytest.approx(123.0)
     assert "Feedling proactive hidden job" in captured["message"]
     assert "The user has stayed" in captured["message"]
+    assert "recent_chat_context" in captured["message"]
+    assert "你刚刚问我这段要不要压成一句话" in captured["message"]
     assert "screen: user is reading docs" in captured["message"]
     assert captured["images"] == [{"data": "x"}]
     assert captured["image_paths"] == ["/tmp/frame.jpg"]
@@ -941,6 +948,42 @@ def test_process_proactive_jobs_routes_through_agent_and_posts_metadata(monkeypa
     }
     assert ("pj_1", "realizing", "") in captured["statuses"]
     assert any(s[0] == "pj_1" and s[1] == "posted" for s in captured["statuses"])
+
+
+def test_normalize_agent_replies_supports_multiple_messages_with_cap(monkeypatch):
+    monkeypatch.setattr(crc, "PROACTIVE_MAX_REPLY_MESSAGES", 5)
+
+    raw = '{"messages":["第一条","第二条","第三条","第四条","第五条","第六条"]}'
+
+    assert crc._normalize_agent_replies(raw) == ["第一条", "第二条", "第三条", "第四条", "第五条"]
+
+
+def test_extract_cli_output_preserves_structured_multi_messages():
+    raw = '{"messages":["第一条","第二条"]}'
+
+    extracted = crc._extract_text_from_cli_output(raw)
+
+    assert crc._normalize_agent_replies(extracted) == ["第一条", "第二条"]
+
+
+def test_message_for_proactive_job_instructs_multi_bubble_without_hiding_context():
+    job = {
+        "intent_label": "screen_context",
+        "context_hint": "The user is reading a note tied to an old memory.",
+        "connections": ["memory card mom_1: user likes compact observations"],
+    }
+
+    message = crc._message_for_proactive_job(
+        job,
+        screen_text="screen: dense paragraph",
+        recent_chat_context="- user: 这段帮我看一下",
+    )
+
+    assert "1-5 short chat bubbles" in message
+    assert '{"messages":["...","..."]}' in message
+    assert "recent_chat_context" in message
+    assert "possible_connections" in message
+    assert "screen: dense paragraph" in message
 
 
 def test_post_proactive_reply_triggers_alert_and_live_activity(monkeypatch):
