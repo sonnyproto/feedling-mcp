@@ -309,6 +309,7 @@ jobs:
           # the key body needs to travel. If the secret isn't set, the
           # backend logs-only and the iOS push is silently dropped.
           APNS_KEY_P8_B64:     ${{ secrets.APNS_KEY_P8_B64 }}
+          OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
         run: |
           echo ">>> deploy-cvm target: $CVM_ID"
@@ -319,6 +320,7 @@ jobs:
             -e "CF_ZONE_ID=$CF_ZONE_ID" \
             -e "CF_API_TOKEN=$CF_API_TOKEN" \
             -e "APNS_KEY_P8_B64=$APNS_KEY_P8_B64" \
+            -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
             --wait
 
       - name: Publish live compose_hash on Sepolia

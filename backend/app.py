@@ -168,6 +168,14 @@ LIVE_ACTIVITY_DEDUPE_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC
 DEVICE_EVENT_RETENTION_DAYS = int(os.environ.get("FEEDLING_DEVICE_EVENT_RETENTION_DAYS", 30))
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 PROACTIVE_JOB_MAX = int(os.environ.get("FEEDLING_PROACTIVE_JOB_MAX", 500))
+PROACTIVE_GATE_PROVIDER = os.environ.get("FEEDLING_PROACTIVE_GATE_PROVIDER", "openrouter").strip().lower()
+PROACTIVE_GATE_MODEL = os.environ.get("FEEDLING_PROACTIVE_GATE_MODEL", "google/gemini-3.1-flash-lite").strip()
+PROACTIVE_GATE_TIMEOUT_SEC = float(os.environ.get("FEEDLING_PROACTIVE_GATE_TIMEOUT_SEC", "30"))
+PROACTIVE_GATE_MAX_FRAMES = int(os.environ.get("FEEDLING_PROACTIVE_GATE_MAX_FRAMES", "4"))
+PROACTIVE_GATE_INCLUDE_IMAGES = os.environ.get("FEEDLING_PROACTIVE_GATE_INCLUDE_IMAGES", "true").lower() not in {
+    "0", "false", "no", "off",
+}
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 
 
 # Used from inside UserStore._load_tokens on boot; must be defined before
@@ -1086,7 +1094,12 @@ def _frame_ids(frames: list[dict]) -> list[str]:
     return out[-5:]
 
 
-def _decrypt_frame_metadata_for_gate(store: UserStore, frame_id: str, api_key: str | None) -> dict:
+def _decrypt_frame_metadata_for_gate(
+    store: UserStore,
+    frame_id: str,
+    api_key: str | None,
+    include_image: bool = False,
+) -> dict:
     """Best-effort decrypt of a frame for the automatic Gate.
 
     The Flask backend does not store raw API keys, so only request-scoped
@@ -1107,7 +1120,7 @@ def _decrypt_frame_metadata_for_gate(store: UserStore, frame_id: str, api_key: s
             resp = client.get(
                 f"{enclave_url}/v1/screen/frames/{fid}/decrypt",
                 headers={"X-API-Key": api_key},
-                params={"include_image": "false"},
+                params={"include_image": "true" if include_image else "false"},
             )
         if resp.status_code >= 400:
             return {
@@ -1118,14 +1131,18 @@ def _decrypt_frame_metadata_for_gate(store: UserStore, frame_id: str, api_key: s
         data = resp.json()
         if not isinstance(data, dict):
             return {"frame_id": fid, "error": "decrypt_non_object"}
-        return {
+        result = {
             "frame_id": fid,
             "ts": data.get("ts"),
             "app": data.get("app") or "unknown",
             "ocr_text": str(data.get("ocr_text") or "")[:1200],
             "w": data.get("w"),
             "h": data.get("h"),
+            "image_mime": data.get("image_mime") or "image/jpeg",
         }
+        if include_image and data.get("image_b64"):
+            result["image_b64"] = str(data.get("image_b64") or "")
+        return result
     except Exception as e:
         return {"frame_id": fid, "error": f"decrypt_error:{type(e).__name__}:{str(e)[:160]}"}
 
@@ -1180,6 +1197,177 @@ def _recent_proactive_fire_active(store: UserStore, now: float, window_sec: floa
     return False
 
 
+def _strip_json_code_fence(text: str) -> str:
+    cleaned = (text or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    return cleaned.strip()
+
+
+def _coerce_llm_gate_payload(raw: dict, selected_frame_ids: list[str]) -> dict:
+    if not isinstance(raw, dict):
+        return {
+            "should_reach_out": False,
+            "confidence": 0.0,
+            "intent_label": "invalid_gate_response",
+            "context_hint": "",
+            "reason": "llm_non_object",
+            "connections": [],
+            "frame_ids": [],
+        }
+
+    allowed_ids = set(selected_frame_ids)
+    requested_ids = raw.get("frame_ids")
+    if not isinstance(requested_ids, list):
+        requested_ids = selected_frame_ids if raw.get("should_reach_out") else []
+    frame_ids = [
+        str(fid) for fid in requested_ids
+        if str(fid) in allowed_ids
+    ][:PROACTIVE_GATE_MAX_FRAMES]
+
+    connections = raw.get("connections")
+    if not isinstance(connections, list):
+        connections = []
+
+    try:
+        confidence = float(raw.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    return {
+        "should_reach_out": bool(raw.get("should_reach_out")),
+        "confidence": max(0.0, min(1.0, confidence)),
+        "intent_label": str(raw.get("intent_label") or raw.get("intent") or "proactive_screen_context")[:120],
+        "context_hint": str(raw.get("context_hint") or "")[:2000],
+        "reason": str(raw.get("reason") or "llm_decision")[:240],
+        "connections": [str(c).strip()[:240] for c in connections if str(c).strip()][:5],
+        "frame_ids": frame_ids,
+    }
+
+
+def _call_openrouter_proactive_gate(
+    *,
+    frame_contexts: list[dict],
+    device_events: list[dict],
+    current_app: str,
+    ocr_summary: str,
+) -> dict:
+    """Call the model that decides whether Feedling should proactively speak.
+
+    The model is a Gate only. It writes a hidden job context, not the final
+    user-facing message; the resident consumer still hands that job to the
+    user's real agent entry so persona stays owned by the user's agent.
+    """
+    if PROACTIVE_GATE_PROVIDER != "openrouter":
+        return {"ok": False, "error": f"unsupported_provider:{PROACTIVE_GATE_PROVIDER}"}
+    if not OPENROUTER_API_KEY:
+        return {"ok": False, "error": "model_not_configured"}
+    if not PROACTIVE_GATE_MODEL:
+        return {"ok": False, "error": "model_not_configured"}
+
+    selected_frame_ids = [str(f.get("frame_id") or "") for f in frame_contexts if f.get("frame_id")]
+    metadata_frames = []
+    content: list[dict] = []
+    for idx, frame in enumerate(frame_contexts, start=1):
+        frame_id = str(frame.get("frame_id") or "")
+        image_b64 = str(frame.get("image_b64") or "")
+        metadata_frames.append({
+            "index": idx,
+            "frame_id": frame_id,
+            "ts": frame.get("ts"),
+            "app": frame.get("app") or "unknown",
+            "w": frame.get("w"),
+            "h": frame.get("h"),
+            "ocr_text": str(frame.get("ocr_text") or "")[:1200],
+            "has_image": bool(image_b64),
+            "decrypt_error": frame.get("error", ""),
+        })
+    gate_payload = {
+        "task": "Decide whether the user's own AI should proactively send one message now.",
+        "decision_policy": [
+            "Return should_reach_out=true only when the visible screen shows a timely moment where a short proactive message would likely help.",
+            "Prefer false for idle browsing, unclear content, private/low-confidence screens, repeated reminders, or when the user is already actively chatting.",
+            "Do not write the final user-facing message. Write only a concise context_hint for the user's resident agent.",
+            "Use the images as primary evidence. OCR is unreliable auxiliary metadata.",
+        ],
+        "output_schema": {
+            "should_reach_out": "boolean",
+            "confidence": "number 0..1",
+            "intent_label": "short snake_case label",
+            "context_hint": "hidden context for the user's resident agent, 1-3 sentences",
+            "reason": "short reason for dashboard/debug",
+            "frame_ids": "array of frame ids used",
+            "connections": "optional array of short supporting facts",
+        },
+        "current_app": current_app,
+        "ocr_summary": ocr_summary[:1200],
+        "frames": metadata_frames,
+        "device_events": device_events[-10:],
+    }
+
+    content.append({
+        "type": "text",
+        "text": (
+            "You are Feedling Proactive Gate. Return JSON only, no markdown.\n"
+            + json.dumps(gate_payload, ensure_ascii=False)
+        ),
+    })
+    for frame in frame_contexts:
+        image_b64 = str(frame.get("image_b64") or "")
+        if not image_b64:
+            continue
+        mime = str(frame.get("image_mime") or "image/jpeg")
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{mime};base64,{image_b64}"},
+        })
+
+    body = {
+        "model": PROACTIVE_GATE_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a conservative proactive-notification gate. "
+                    "You only decide whether to create a hidden job for the user's own resident agent. "
+                    "You never write the final message to the user."
+                ),
+            },
+            {"role": "user", "content": content},
+        ],
+        "temperature": 0,
+        "max_tokens": 600,
+    }
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": os.environ.get("FEEDLING_PUBLIC_URL", "https://feedling.app"),
+        "X-Title": "Feedling Proactive Gate",
+    }
+    try:
+        with httpx.Client(timeout=PROACTIVE_GATE_TIMEOUT_SEC) as client:
+            resp = client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body)
+        if resp.status_code >= 400:
+            return {"ok": False, "error": f"llm_http_{resp.status_code}:{resp.text[:240]}"}
+        data = resp.json()
+        content_obj = (((data.get("choices") or [{}])[0].get("message") or {}).get("content"))
+        if isinstance(content_obj, list):
+            text = "\n".join(str(part.get("text") or "") for part in content_obj if isinstance(part, dict))
+        else:
+            text = str(content_obj or "")
+        parsed = json.loads(_strip_json_code_fence(text))
+        return {
+            "ok": True,
+            "raw": _coerce_llm_gate_payload(parsed, selected_frame_ids),
+            "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
+        }
+    except json.JSONDecodeError as e:
+        return {"ok": False, "error": f"llm_json_parse:{str(e)[:160]}"}
+    except Exception as e:
+        return {"ok": False, "error": f"llm_error:{type(e).__name__}:{str(e)[:160]}"}
+
+
 def _ocr_summary(frames: list[dict]) -> str:
     seen: set[str] = set()
     parts: list[str] = []
@@ -1212,6 +1400,7 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict, api_key: str
     payload = payload if isinstance(payload, dict) else {}
     force = bool(payload.get("force", False))
     settings = store.load_proactive_settings()
+    is_manual_hint = bool(str(payload.get("context_hint") or "").strip())
 
     payload_frames = payload.get("frames")
     if isinstance(payload_frames, list) and payload_frames:
@@ -1228,23 +1417,27 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict, api_key: str
             now,
             _payload_float(payload, "frame_window_sec", 300.0, 30.0, 3600.0),
         )
-    selected_frames = _sample_frames_for_gate(frames)
+    selected_frames = _sample_frames_for_gate(frames, max_frames=PROACTIVE_GATE_MAX_FRAMES)
     frame_ids = _frame_ids(selected_frames)
-    frame_contexts = [
-        _decrypt_frame_metadata_for_gate(store, fid, api_key)
-        for fid in frame_ids
-    ] if frame_ids and not payload.get("context_hint") else []
     device_events = _recent_device_events_for_gate(
         store,
         now,
         _payload_float(payload, "device_event_window_sec", 900.0, 30.0, 86400.0),
     )
-    current_app = str(payload.get("current_app") or "").strip()
-    if not current_app:
-        current_app = _gate_current_app(frame_contexts, selected_frames)
-    ocr = str(payload.get("ocr_summary") or "").strip()
-    if not ocr:
-        ocr = _gate_ocr_summary(frame_contexts, selected_frames)
+
+    block_reason = ""
+    if not settings.get("enabled", True) and not force:
+        block_reason = "proactive_disabled"
+    elif settings.get("dnd", False) and not force:
+        block_reason = "dnd_enabled"
+    elif not frames and not force:
+        block_reason = "no_recent_frames"
+    elif _recent_user_chat_active(store, now) and not force:
+        block_reason = "recent_user_chat_active"
+    elif store.cooldown_remaining_seconds() > 0 and not force:
+        block_reason = "push_cooldown"
+    elif _recent_proactive_fire_active(store, now) and not force:
+        block_reason = "recent_proactive_fire"
 
     context_hint = str(payload.get("context_hint") or "").strip()
     connections = payload.get("connections")
@@ -1252,74 +1445,84 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict, api_key: str
         connections = []
     connections = [str(c).strip()[:240] for c in connections if str(c).strip()][:5]
 
-    semantic = _semantic_analysis(current_app=current_app, ocr_summary=ocr)
-    intent_label = str(
-        payload.get("intent_label")
-        or semantic.get("task_intent")
-        or semantic.get("semantic_scene")
-        or "proactive_screen_context"
-    ).strip()
-
-    explicit_help = _explicit_help_signal(ocr)
-    decrypt_errors = [f.get("error") for f in frame_contexts if f.get("error")]
-    decrypt_ok = any(str(f.get("ocr_text") or "").strip() or str(f.get("app") or "").strip() not in {"", "unknown"} for f in frame_contexts)
-
-    if not context_hint:
-        suggested = semantic.get("suggested_openers") or []
-        if semantic.get("semantic_strength") in {"strong", "medium"} and (ocr or current_app != "unknown"):
-            context_hint = (
-                f"Recent screen context appears to be {semantic.get('semantic_scene') or 'active work'} "
-                f"in {current_app}. OCR summary: {ocr or 'not available'}."
-            )
-        elif explicit_help:
-            context_hint = (
-                "Recent screen context contains an explicit help / choice / summary cue. "
-                f"Current app: {current_app}. OCR summary: {ocr[:700]}."
-            )
-        elif suggested and (ocr or current_app != "unknown"):
-            context_hint = f"Possible useful opening: {suggested[0]} Context: {ocr or current_app}."
-
-    should_reach_out = bool(payload.get("context_hint")) or (
-        bool(context_hint) and (
-            semantic.get("semantic_strength") in {"strong", "medium"} or explicit_help
+    frame_contexts = [
+        _decrypt_frame_metadata_for_gate(
+            store,
+            fid,
+            api_key,
+            include_image=bool(PROACTIVE_GATE_INCLUDE_IMAGES and not is_manual_hint and not block_reason),
         )
-    )
-    reason = "manual_hint" if payload.get("context_hint") else "semantic_gate"
+        for fid in frame_ids
+    ] if frame_ids and not is_manual_hint else []
+    current_app = str(payload.get("current_app") or "").strip()
+    if not current_app:
+        current_app = _gate_current_app(frame_contexts, selected_frames)
+    ocr = str(payload.get("ocr_summary") or "").strip()
+    if not ocr:
+        ocr = _gate_ocr_summary(frame_contexts, selected_frames)
 
-    if not settings.get("enabled", True) and not force:
+    decrypt_errors = [f.get("error") for f in frame_contexts if f.get("error")]
+    decrypt_ok = any(
+        str(f.get("image_b64") or "").strip()
+        or str(f.get("ocr_text") or "").strip()
+        or str(f.get("app") or "").strip() not in {"", "unknown"}
+        for f in frame_contexts
+    )
+    image_count = sum(1 for f in frame_contexts if str(f.get("image_b64") or "").strip())
+
+    semantic_reference = _semantic_analysis(current_app=current_app, ocr_summary=ocr)
+    llm_payload: dict = {}
+    llm_usage: dict = {}
+    llm_error = ""
+    llm_called = False
+
+    if is_manual_hint:
+        should_reach_out = True
+        reason = "manual_hint"
+        intent_label = str(payload.get("intent_label") or "manual_proactive_test").strip()
+    elif block_reason:
         should_reach_out = False
-        reason = "proactive_disabled"
-    elif settings.get("dnd", False) and not force:
-        should_reach_out = False
-        reason = "dnd_enabled"
-    elif not frames and not force:
-        should_reach_out = False
-        reason = "no_recent_frames"
-    elif _recent_user_chat_active(store, now) and not force:
-        should_reach_out = False
-        reason = "recent_user_chat_active"
-    elif store.cooldown_remaining_seconds() > 0 and not force:
-        should_reach_out = False
-        reason = "push_cooldown"
-    elif _recent_proactive_fire_active(store, now) and not force:
-        should_reach_out = False
-        reason = "recent_proactive_fire"
-    elif frame_ids and not decrypt_ok and not payload.get("context_hint") and not force:
+        reason = block_reason
+        intent_label = "blocked_before_model"
+    elif frame_ids and not decrypt_ok and not force:
         should_reach_out = False
         reason = "frame_decrypt_unavailable"
-    elif should_reach_out and semantic.get("semantic_strength") in {"strong", "medium"}:
-        reason = f"semantic_{semantic.get('semantic_strength')}"
-    elif should_reach_out and explicit_help:
-        reason = "explicit_help_signal"
-    elif not should_reach_out:
-        reason = "insufficient_context"
+        intent_label = "frame_decrypt_unavailable"
+    else:
+        llm_called = True
+        llm_result = _call_openrouter_proactive_gate(
+            frame_contexts=frame_contexts,
+            device_events=device_events,
+            current_app=current_app,
+            ocr_summary=ocr,
+        )
+        if llm_result.get("ok"):
+            llm_payload = llm_result.get("raw") or {}
+            llm_usage = llm_result.get("usage") if isinstance(llm_result.get("usage"), dict) else {}
+            should_reach_out = bool(llm_payload.get("should_reach_out"))
+            reason = str(llm_payload.get("reason") or ("llm_true" if should_reach_out else "llm_false"))[:240]
+            intent_label = str(llm_payload.get("intent_label") or "llm_proactive_gate").strip()
+            if should_reach_out:
+                context_hint = str(llm_payload.get("context_hint") or "").strip()
+                connections = llm_payload.get("connections") if isinstance(llm_payload.get("connections"), list) else []
+                connections = [str(c).strip()[:240] for c in connections if str(c).strip()][:5]
+                frame_ids = llm_payload.get("frame_ids") if isinstance(llm_payload.get("frame_ids"), list) else frame_ids
+                frame_ids = [str(fid) for fid in frame_ids if str(fid) in set(_frame_ids(selected_frames))][:PROACTIVE_GATE_MAX_FRAMES]
+                if not context_hint:
+                    should_reach_out = False
+                    reason = "llm_missing_context_hint"
+        else:
+            should_reach_out = False
+            llm_error = str(llm_result.get("error") or "llm_error")[:240]
+            reason = llm_error
+            intent_label = "llm_gate_error"
 
     decision_id = _new_public_id("gd")
     return {
         "decision_id": decision_id,
         "ts": now,
         "created_at": datetime.fromtimestamp(now).isoformat(),
-        "gate_model": "manual_v0a" if payload.get("context_hint") else "ocr_semantic_v0",
+        "gate_model": "manual_v0a" if is_manual_hint else f"{PROACTIVE_GATE_PROVIDER}:{PROACTIVE_GATE_MODEL}",
         "should_reach_out": should_reach_out,
         "should_garden_passive": False,
         "abstention_reason": "" if should_reach_out else reason,
@@ -1330,13 +1533,19 @@ def _build_proactive_gate_decision(store: UserStore, payload: dict, api_key: str
         "frame_ids": frame_ids,
         "device_event_ids": [str(e.get("event_id")) for e in device_events if e.get("event_id")][:10],
         "current_app": current_app,
-        "semantic": semantic,
+        "semantic": {
+            "reference": semantic_reference,
+            "llm_confidence": llm_payload.get("confidence"),
+            "llm_usage": llm_usage,
+        },
         "gate_input": {
             "ocr_chars": len(ocr),
             "sampled_frame_count": len(selected_frames),
             "decrypt_ok": decrypt_ok,
+            "image_count": image_count,
             "decrypt_errors": [str(e)[:120] for e in decrypt_errors[:5]],
-            "explicit_help_signal": explicit_help,
+            "llm_called": llm_called,
+            "llm_error": llm_error,
         },
         "forced": force,
     }

@@ -156,6 +156,11 @@ services:
       APNS_KEY_P8_B64: "${APNS_KEY_P8_B64:-}"
       APNS_KEY_ID: "${APNS_KEY_ID:-}"
       APNS_TEAM_ID: "${APNS_TEAM_ID:-}"
+      # Optional LLM Gate for proactive screen outreach. If unset, automatic
+      # Gate records model_not_configured and does not enqueue hidden jobs.
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      FEEDLING_PROACTIVE_GATE_PROVIDER: "${FEEDLING_PROACTIVE_GATE_PROVIDER:-openrouter}"
+      FEEDLING_PROACTIVE_GATE_MODEL: "${FEEDLING_PROACTIVE_GATE_MODEL:-google/gemini-3.1-flash-lite}"
     ports:
       - "5001:5001"
       - "9998:9998"

@@ -154,16 +154,37 @@ def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
 
 def test_auto_proactive_gate_uses_decrypted_frame_ocr(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(appmod, "OPENROUTER_API_KEY", "sk-test")
     appmod._stores.clear()
 
-    def _fake_decrypt(_store, frame_id, _api_key):
+    def _fake_decrypt(_store, frame_id, _api_key, include_image=False):
         return {
             "frame_id": frame_id,
             "app": "xhs",
             "ocr_text": "我在对比两个方案，要不要帮我把这三段压成一句可以发的观点？",
+            "image_b64": "ZmFrZS1qcGVn" if include_image else "",
+            "image_mime": "image/jpeg",
+        }
+
+    def _fake_llm_gate(**kwargs):
+        assert kwargs["frame_contexts"][0]["image_b64"] == "ZmFrZS1qcGVn"
+        assert "要不要帮我" in kwargs["ocr_summary"]
+        return {
+            "ok": True,
+            "raw": {
+                "should_reach_out": True,
+                "confidence": 0.88,
+                "intent_label": "help_compress_point",
+                "context_hint": "The user is looking at a dense post and may want help turning it into one usable sentence.",
+                "reason": "model_detected_helpful_moment",
+                "frame_ids": ["abcd1234abcd1234"],
+                "connections": ["The screen contains a rewrite/compression cue."],
+            },
+            "usage": {"total_tokens": 123},
         }
 
     monkeypatch.setattr(appmod, "_decrypt_frame_metadata_for_gate", _fake_decrypt)
+    monkeypatch.setattr(appmod, "_call_openrouter_proactive_gate", _fake_llm_gate)
 
     api_key = "test_proactive_auto_key"
     user_id = "usr_endpoint_proactive_auto"
@@ -184,10 +205,50 @@ def test_auto_proactive_gate_uses_decrypted_frame_ocr(tmp_path, monkeypatch):
     assert resp.status_code == 200
     body = resp.get_json()
     assert body["enqueued"] is True
-    assert body["decision"]["gate_model"] == "ocr_semantic_v0"
-    assert body["decision"]["reason"] in {"semantic_strong", "explicit_help_signal"}
+    assert body["decision"]["gate_model"] == "openrouter:google/gemini-3.1-flash-lite"
+    assert body["decision"]["reason"] == "model_detected_helpful_moment"
     assert body["decision"]["gate_input"]["decrypt_ok"] is True
+    assert body["decision"]["gate_input"]["image_count"] == 1
+    assert body["decision"]["gate_input"]["llm_called"] is True
     assert body["job"]["frame_ids"] == ["abcd1234abcd1234"]
+
+
+def test_auto_proactive_gate_requires_model_even_with_strong_ocr(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(appmod, "OPENROUTER_API_KEY", "")
+    appmod._stores.clear()
+
+    def _fake_decrypt(_store, frame_id, _api_key, include_image=False):
+        return {
+            "frame_id": frame_id,
+            "app": "xhs",
+            "ocr_text": "帮我总结这段，然后压成一句可以发的观点。",
+            "image_b64": "ZmFrZS1qcGVn" if include_image else "",
+            "image_mime": "image/jpeg",
+        }
+
+    monkeypatch.setattr(appmod, "_decrypt_frame_metadata_for_gate", _fake_decrypt)
+
+    api_key = "test_proactive_auto_no_model_key"
+    user_id = "usr_endpoint_proactive_auto_no_model"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.frames_meta.append({
+        "id": "efef1234efef1234",
+        "filename": "efef1234efef1234.env.json",
+        "ts": appmod.time.time(),
+        "encrypted": True,
+    })
+
+    client = appmod.app.test_client()
+    resp = client.post("/v1/proactive/tick", headers={"X-API-Key": api_key}, json={})
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["enqueued"] is False
+    assert body["decision"]["should_reach_out"] is False
+    assert body["decision"]["reason"] == "model_not_configured"
+    assert body["decision"]["gate_input"]["llm_called"] is True
 
 
 def test_auto_proactive_gate_records_false_without_frames(tmp_path, monkeypatch):
