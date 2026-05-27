@@ -203,7 +203,10 @@ def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
     assert page.status_code == 200
     assert b"Feedling Proactive Debug" in page.data
     assert body["job"]["job_id"].encode() in page.data
-    assert b"frames sent" in page.data
+    # Section header is always present once the jobs list renders; the
+    # previous "frames sent" probe relied on a table column header that
+    # the new card layout only emits when a job actually has frames.
+    assert b"Hidden Jobs" in page.data
 
 
 def test_auto_proactive_gate_uses_decrypted_frame_ocr(tmp_path, monkeypatch):

@@ -2190,117 +2190,195 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     frames = list(reversed(snapshot.get("recent_frames") or []))
     events = list(reversed(snapshot.get("device_events") or []))
 
-    def decision_rows(rows_source, empty_text: str) -> str:
-        if not rows_source:
-            return f"<tr><td colspan='13'>{esc(empty_text)}</td></tr>"
-        rows = []
-        for d in rows_source[:30]:
-            verdict = "TRUE" if d.get("should_reach_out") else "FALSE"
-            gate_input = _gate_input_dict(d.get("gate_input"))
-            connection = d.get("connection") or {}
-            review = latest_reviews.get(str(d.get("decision_id") or "")) or {}
-            review_action = f"/v1/proactive/decisions/{quote(str(d.get('decision_id') or ''))}/review{key_qs}"
-            review_html = (
-                f"<div class='mini'>last: {esc(review.get('label') or 'unreviewed')}</div>"
-                f"<form method='post' action='{review_action}'>"
-                "<select name='label'>"
-                "<option value='correct_true'>correct true</option>"
-                "<option value='correct_false'>correct false</option>"
-                "<option value='missed_opportunity'>missed opportunity</option>"
-                "<option value='spam'>spam</option>"
-                "<option value='weak_connection'>weak connection</option>"
-                "<option value='repeated'>repeated</option>"
-                "<option value='privacy_bad'>privacy bad</option>"
-                "<option value='great_companion_moment'>great companion moment</option>"
-                "</select>"
-                "<input name='notes' placeholder='notes' maxlength='300'>"
-                "<button type='submit'>save</button>"
-                "</form>"
-            )
-            rows.append(
-                "<tr>"
-                f"<td>{esc(fmt_time(d.get('ts')))}</td>"
-                f"<td class='mono'>{esc(fmt_epoch(d.get('ts')))}</td>"
-                f"<td class='{ 'ok' if d.get('should_reach_out') else 'muted' }'>{verdict}</td>"
-                f"<td class='mono'>{esc(d.get('gate_model'))}</td>"
-                f"<td>{esc(d.get('reason'))}</td>"
-                f"<td>{esc(d.get('abstention_reason'))}</td>"
-                f"<td>{esc(d.get('intent_label'))}</td>"
-                f"<td class='wrap mono'>{esc(json.dumps(connection, ensure_ascii=False))}</td>"
-                f"<td class='wrap'>{esc(d.get('context_hint'))}</td>"
-                f"<td>{frame_links(d.get('frame_ids'))}</td>"
-                f"<td class='wrap mono'>{esc(json.dumps(gate_input, ensure_ascii=False))}</td>"
-                f"<td class='mono'>{esc(d.get('decision_id'))}</td>"
-                f"<td>{review_html}</td>"
-                "</tr>"
-            )
-        return "".join(rows)
+    def short_id(value, head: int = 8) -> str:
+        """Truncate long IDs for display; full value shown on hover via title attr."""
+        s = str(value or "").strip()
+        if len(s) <= head + 2:
+            return esc(s)
+        return f"<span class='mono trunc' title='{esc(s)}'>{esc(s[:head])}…</span>"
 
-    gate_header = "<thead><tr><th>time</th><th>ts</th><th>Gate</th><th>model</th><th>reason</th><th>abstention</th><th>intent</th><th>connection</th><th>context_hint</th><th>frames</th><th>gate input</th><th>decision</th><th>human review</th></tr></thead>"
+    def fold_json(label: str, payload) -> str:
+        """Collapse JSON payloads behind a <details> summary so they don't
+        eat horizontal space by default."""
+        try:
+            pretty = json.dumps(payload, ensure_ascii=False, indent=2)
+        except Exception:
+            pretty = str(payload or "")
+        if not pretty.strip() or pretty.strip() in ("{}", "null", "[]"):
+            return f"<span class='muted mini'>{esc(label)}: ∅</span>"
+        return (
+            f"<details class='inline-json'><summary>{esc(label)}</summary>"
+            f"<pre class='mono'>{esc(pretty)}</pre></details>"
+        )
+
+    # Gate Decisions are the heaviest rendering on this page (13 columns of
+    # mixed text + JSON + form). Converted from a wide table to a stack of
+    # cards: each decision is one block, fields laid out in a 2-column grid
+    # that wraps to single-column on narrow viewports. JSON payloads
+    # (connection, gate_input) collapse behind <details>. Same data, same
+    # density, no horizontal scroll.
+    def decision_card(d) -> str:
+        verdict = "TRUE" if d.get("should_reach_out") else "FALSE"
+        verdict_cls = "ok" if d.get("should_reach_out") else "muted"
+        gate_input = _gate_input_dict(d.get("gate_input"))
+        connection = d.get("connection") or {}
+        review = latest_reviews.get(str(d.get("decision_id") or "")) or {}
+        decision_id = str(d.get("decision_id") or "")
+        review_action = f"/v1/proactive/decisions/{quote(decision_id)}/review{key_qs}"
+        frame_links_html = frame_links(d.get("frame_ids"))
+        intent = d.get("intent_label") or ""
+        abstention = d.get("abstention_reason") or ""
+        context_hint = d.get("context_hint") or ""
+        reason = d.get("reason") or ""
+
+        meta_bits = [
+            f"<span class='meta-bit'><span class='label'>time</span> {esc(fmt_time(d.get('ts')))}</span>",
+            f"<span class='meta-bit mono'><span class='label'>ts</span> {esc(fmt_epoch(d.get('ts')))}</span>",
+            f"<span class='meta-bit mono'><span class='label'>model</span> {esc(d.get('gate_model'))}</span>",
+            f"<span class='meta-bit'><span class='label'>id</span> {short_id(decision_id)}</span>",
+        ]
+        if intent:
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>intent</span> {esc(intent)}</span>")
+        if abstention:
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>abstention</span> {esc(abstention)}</span>")
+
+        body_blocks = []
+        if reason:
+            body_blocks.append(f"<div class='block'><span class='block-label'>reason</span><div class='block-text'>{esc(reason)}</div></div>")
+        if context_hint:
+            body_blocks.append(f"<div class='block'><span class='block-label'>context_hint</span><div class='block-text'>{esc(context_hint)}</div></div>")
+        if frame_links_html:
+            body_blocks.append(f"<div class='block'><span class='block-label'>frames</span><div class='block-text'>{frame_links_html}</div></div>")
+        body_blocks.append(f"<div class='block'>{fold_json('connection', connection)}</div>")
+        body_blocks.append(f"<div class='block'>{fold_json('gate_input', gate_input)}</div>")
+
+        review_html = (
+            f"<div class='review'>"
+            f"<div class='mini'>last review: <span class='{ 'ok' if review.get('label') == 'correct_true' else '' }'>{esc(review.get('label') or 'unreviewed')}</span></div>"
+            f"<form method='post' action='{review_action}'>"
+            "<select name='label'>"
+            "<option value='correct_true'>correct true</option>"
+            "<option value='correct_false'>correct false</option>"
+            "<option value='missed_opportunity'>missed opportunity</option>"
+            "<option value='spam'>spam</option>"
+            "<option value='weak_connection'>weak connection</option>"
+            "<option value='repeated'>repeated</option>"
+            "<option value='privacy_bad'>privacy bad</option>"
+            "<option value='great_companion_moment'>great companion moment</option>"
+            "</select>"
+            "<input name='notes' placeholder='notes' maxlength='300'>"
+            "<button type='submit'>save</button>"
+            "</form>"
+            "</div>"
+        )
+
+        return (
+            f"<article class='card decision-card'>"
+            f"  <header class='card-head'>"
+            f"    <span class='verdict {verdict_cls}'>{verdict}</span>"
+            f"    <div class='meta-bits'>{''.join(meta_bits)}</div>"
+            f"  </header>"
+            f"  <div class='card-body'>{''.join(body_blocks)}</div>"
+            f"  {review_html}"
+            f"</article>"
+        )
+
+    def decision_section(rows_source, empty_text: str) -> str:
+        if not rows_source:
+            return f"<div class='empty'>{esc(empty_text)}</div>"
+        return "<div class='card-list'>" + "".join(decision_card(d) for d in rows_source[:30]) + "</div>"
+
     hidden_gate_details = ""
     if no_frame_decisions:
         hidden_gate_details = (
             "<details class='debug-details'>"
             f"<summary>Show hidden no-frame Gate ticks ({len(no_frame_decisions)})</summary>"
-            f"<table>{gate_header}<tbody>{decision_rows(no_frame_decisions, 'No hidden no-frame Gate ticks.')}</tbody></table>"
-            "</details>"
+            + decision_section(no_frame_decisions, "No hidden no-frame Gate ticks.")
+            + "</details>"
         )
 
-    def job_rows() -> str:
-        if not jobs:
-            return "<tr><td colspan='13'>No hidden proactive jobs yet.</td></tr>"
-        rows = []
-        for j in jobs[:30]:
-            status = j.get("derived_status") or j.get("status", "pending")
-            rows.append(
-                "<tr>"
-                f"<td>{esc(fmt_time(j.get('ts')))}</td>"
-                f"<td class='mono'>{esc(fmt_epoch(j.get('ts')))}</td>"
-                f"<td class='{status_class(status)}'>{esc(status)}</td>"
-                f"<td>{esc(j.get('intent_label'))}</td>"
-                f"<td class='wrap'>{esc(j.get('context_hint'))}</td>"
-                f"<td>{frame_links(j.get('frame_ids'))}</td>"
-                f"<td class='wrap'>{esc(j.get('status_reason'))}</td>"
-                f"<td class='wrap'>{esc(j.get('preview'))}</td>"
-                f"<td class='{status_class(j.get('alert_status'))}'>{esc(j.get('alert_status'))}</td>"
-                f"<td class='{status_class(j.get('live_activity_status'))}'>{esc(j.get('live_activity_status'))}</td>"
-                f"<td class='mono'>{esc(j.get('consumer_id'))}</td>"
-                f"<td class='mono'>{esc(j.get('gate_decision_id'))}</td>"
-                f"<td class='mono'>{esc(j.get('job_id'))}</td>"
-                "</tr>"
-            )
-        return "".join(rows)
+    # Hidden Jobs — same card pattern as Gate Decisions. Fewer JSON blobs
+    # so cards render lighter, but the wide horizontal table is the
+    # bigger problem; cards solve it the same way.
+    def job_card(j) -> str:
+        status = j.get("derived_status") or j.get("status", "pending")
+        intent = j.get("intent_label") or ""
+        meta_bits = [
+            f"<span class='meta-bit'><span class='label'>time</span> {esc(fmt_time(j.get('ts')))}</span>",
+            f"<span class='meta-bit mono'><span class='label'>ts</span> {esc(fmt_epoch(j.get('ts')))}</span>",
+            f"<span class='meta-bit'><span class='label'>job</span> {short_id(j.get('job_id'))}</span>",
+            f"<span class='meta-bit'><span class='label'>decision</span> {short_id(j.get('gate_decision_id'))}</span>",
+        ]
+        if j.get("consumer_id"):
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>consumer</span> {short_id(j.get('consumer_id'))}</span>")
+        if intent:
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>intent</span> {esc(intent)}</span>")
 
+        body_blocks = []
+        if j.get("context_hint"):
+            body_blocks.append(f"<div class='block'><span class='block-label'>context_hint</span><div class='block-text'>{esc(j.get('context_hint'))}</div></div>")
+        if j.get("status_reason"):
+            body_blocks.append(f"<div class='block'><span class='block-label'>reason</span><div class='block-text'>{esc(j.get('status_reason'))}</div></div>")
+        if j.get("preview"):
+            body_blocks.append(f"<div class='block'><span class='block-label'>preview</span><div class='block-text'>{esc(j.get('preview'))}</div></div>")
+        frames_sent = frame_links(j.get("frame_ids"))
+        if frames_sent:
+            body_blocks.append(f"<div class='block'><span class='block-label'>frames sent</span><div class='block-text'>{frames_sent}</div></div>")
+
+        status_pill = f"<span class='verdict {status_class(status)}'>{esc(status)}</span>"
+        chips = []
+        if j.get("alert_status"):
+            chips.append(f"<span class='chip {status_class(j.get('alert_status'))}'>alert: {esc(j.get('alert_status'))}</span>")
+        if j.get("live_activity_status"):
+            chips.append(f"<span class='chip {status_class(j.get('live_activity_status'))}'>live activity: {esc(j.get('live_activity_status'))}</span>")
+
+        chips_html = f"<div class='chip-row'>{''.join(chips)}</div>" if chips else ""
+
+        return (
+            f"<article class='card'>"
+            f"  <header class='card-head'>{status_pill}<div class='meta-bits'>{''.join(meta_bits)}</div></header>"
+            f"  {chips_html}"
+            f"  <div class='card-body'>{''.join(body_blocks)}</div>"
+            f"</article>"
+        )
+
+    def job_section() -> str:
+        if not jobs:
+            return "<div class='empty'>No hidden proactive jobs yet.</div>"
+        return "<div class='card-list'>" + "".join(job_card(j) for j in jobs[:30]) + "</div>"
+
+    # The remaining three sections (chat writes / frames / events) have
+    # fewer columns; tables still fit a reasonable max-width with
+    # `table-layout: fixed` + the new `.table-scroll` wrapper for the
+    # rare overflow case. No card conversion needed.
     def message_rows() -> str:
         if not messages:
-            return "<tr><td colspan='9'>No proactive chat writes yet.</td></tr>"
+            return "<tr><td colspan='8'>No proactive chat writes yet.</td></tr>"
         rows = []
         for m in messages[:25]:
             preview = m.get("alert_preview") or m.get("push_body_preview") or "(encrypted envelope; no plaintext preview recorded)"
             rows.append(
                 "<tr>"
-                f"<td>{esc(fmt_time(m.get('ts')))}</td>"
-                f"<td class='mono'>{esc(fmt_epoch(m.get('ts')))}</td>"
+                f"<td>{esc(fmt_time(m.get('ts')))}<div class='mono mini'>{esc(fmt_epoch(m.get('ts')))}</div></td>"
                 f"<td>{esc(m.get('content_type'))}</td>"
                 f"<td class='wrap'>{esc(preview)}</td>"
                 f"<td class='{status_class(m.get('alert_status'))}'>{esc(m.get('alert_status'))}</td>"
                 f"<td class='{status_class(m.get('live_activity_status'))}'>{esc(m.get('live_activity_status'))}</td>"
-                f"<td class='mono'>{esc(m.get('gate_decision_id'))}</td>"
-                f"<td class='mono'>{esc(m.get('proactive_job_id'))}</td>"
-                f"<td class='mono'>{esc(m.get('id'))}</td>"
+                f"<td>{short_id(m.get('gate_decision_id'))}</td>"
+                f"<td>{short_id(m.get('proactive_job_id'))}</td>"
+                f"<td>{short_id(m.get('id'))}</td>"
                 "</tr>"
             )
         return "".join(rows)
 
     def frame_rows() -> str:
         if not frames:
-            return "<tr><td colspan='6'>No frames indexed.</td></tr>"
+            return "<tr><td colspan='5'>No frames indexed.</td></tr>"
         rows = []
         for f in frames[:25]:
             rows.append(
                 "<tr>"
-                f"<td>{esc(fmt_time(f.get('ts')))}</td>"
-                f"<td class='mono'>{esc(fmt_epoch(f.get('ts')))}</td>"
+                f"<td>{esc(fmt_time(f.get('ts')))}<div class='mono mini'>{esc(fmt_epoch(f.get('ts')))}</div></td>"
                 f"<td>{esc(f.get('app'))}</td>"
                 f"<td>{esc(f.get('ocr_len'))}</td>"
                 f"<td>{esc(f.get('encrypted'))}</td>"
@@ -2311,16 +2389,15 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
     def event_rows() -> str:
         if not events:
-            return "<tr><td colspan='5'>No device events yet.</td></tr>"
+            return "<tr><td colspan='4'>No device events yet.</td></tr>"
         rows = []
         for e in events[:25]:
             rows.append(
                 "<tr>"
-                f"<td>{esc(fmt_time(e.get('ts')))}</td>"
-                f"<td class='mono'>{esc(fmt_epoch(e.get('ts')))}</td>"
+                f"<td>{esc(fmt_time(e.get('ts')))}<div class='mono mini'>{esc(fmt_epoch(e.get('ts')))}</div></td>"
                 f"<td>{esc(e.get('source'))}</td>"
                 f"<td>{esc(e.get('type'))}</td>"
-                f"<td class='wrap'>{esc(json.dumps(e.get('payload') or {}, ensure_ascii=False))}</td>"
+                f"<td>{fold_json('payload', e.get('payload') or {})}</td>"
                 "</tr>"
             )
         return "".join(rows)
@@ -2336,26 +2413,217 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Feedling Proactive Debug</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 24px; color: #1f1d1a; background: #f6f0e6; }}
-    h1 {{ margin-bottom: 4px; }}
-    h2 {{ margin-top: 32px; border-top: 1px solid #d8d0c4; padding-top: 18px; }}
-    .meta {{ color: #6f6961; margin-bottom: 16px; }}
-    .pill {{ display: inline-block; border: 1px solid #c9bfb2; padding: 4px 8px; margin: 2px; background: #fffaf1; }}
-    table {{ width: 100%; border-collapse: collapse; background: #fffaf1; }}
-    th, td {{ border: 1px solid #ddd2c5; padding: 8px; vertical-align: top; text-align: left; }}
-    th {{ background: #efe5d7; }}
-    .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0 auto;
+      padding: 24px;
+      max-width: 1240px;
+      color: #1f1d1a;
+      background: #f6f0e6;
+      line-height: 1.4;
+    }}
+    h1 {{ margin: 0 0 4px; }}
+    h2 {{
+      margin-top: 32px;
+      border-top: 1px solid #d8d0c4;
+      padding-top: 18px;
+      font-size: 18px;
+    }}
+    .meta {{ color: #6f6961; margin-bottom: 16px; font-size: 13px; }}
+    .pill {{
+      display: inline-block;
+      border: 1px solid #c9bfb2;
+      padding: 4px 8px;
+      margin: 2px;
+      background: #fffaf1;
+      font-size: 12px;
+      border-radius: 2px;
+    }}
+    .hint {{ margin: 8px 0 16px; color: #6f6961; font-size: 13px; }}
+    .empty {{
+      padding: 16px;
+      background: #fffaf1;
+      border: 1px solid #ddd2c5;
+      color: #6f6961;
+      font-style: italic;
+    }}
+
+    /* ---- Card layout (Gate Decisions + Hidden Jobs) ---- */
+    .card-list {{ display: flex; flex-direction: column; gap: 12px; }}
+    .card {{
+      background: #fffaf1;
+      border: 1px solid #ddd2c5;
+      padding: 14px 16px;
+      border-radius: 2px;
+    }}
+    .card-head {{
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+      padding-bottom: 10px;
+      border-bottom: 1px solid #eee5d5;
+    }}
+    .verdict {{
+      display: inline-block;
+      padding: 4px 10px;
+      font-weight: 700;
+      font-size: 12px;
+      letter-spacing: 0.5px;
+      background: #efe5d7;
+      border-radius: 2px;
+      white-space: nowrap;
+    }}
+    .verdict.ok    {{ background: #d4ead8; color: #0b7d42; }}
+    .verdict.muted {{ background: #ebe4d4; color: #8b8176; }}
+    .verdict.bad   {{ background: #f5d8d4; color: #b42318; }}
+    .meta-bits {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 18px;
+      flex: 1;
+      align-items: baseline;
+      font-size: 12px;
+    }}
+    .meta-bit {{ color: #1f1d1a; }}
+    .meta-bit .label {{
+      color: #8b8176;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      font-size: 10px;
+      margin-right: 4px;
+    }}
+    .chip-row {{ display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }}
+    .chip {{
+      display: inline-block;
+      padding: 2px 8px;
+      background: #efe5d7;
+      font-size: 11px;
+      border-radius: 2px;
+    }}
+    .chip.ok    {{ background: #d4ead8; color: #0b7d42; }}
+    .chip.muted {{ background: #ebe4d4; color: #8b8176; }}
+    .chip.bad   {{ background: #f5d8d4; color: #b42318; }}
+    .card-body {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px 24px;
+    }}
+    @media (max-width: 720px) {{
+      .card-body {{ grid-template-columns: 1fr; }}
+    }}
+    .block {{ min-width: 0; }}
+    .block-label {{
+      display: block;
+      color: #8b8176;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      font-size: 10px;
+      margin-bottom: 3px;
+    }}
+    .block-text {{
+      font-size: 13px;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
+    }}
+    .review {{
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid #eee5d5;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+    }}
+    .review .mini {{ margin-right: 6px; color: #6f6961; }}
+    .review form {{ display: inline-flex; gap: 6px; flex-wrap: wrap; }}
+    .review select, .review input, .review button {{ font: inherit; font-size: 12px; }}
+    .review input {{ width: 160px; }}
+
+    /* ---- Inline JSON disclosure (used inside cards + small tables) ---- */
+    details.inline-json {{ display: block; }}
+    details.inline-json > summary {{
+      cursor: pointer;
+      color: #8e301f;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      font-size: 10px;
+      list-style: revert;
+    }}
+    details.inline-json[open] > summary {{ margin-bottom: 4px; }}
+    details.inline-json pre {{
+      margin: 0;
+      padding: 8px;
+      background: #f0e8d8;
+      overflow-x: auto;
+      max-height: 280px;
+      font-size: 11px;
+      border-radius: 2px;
+    }}
+
+    /* ---- Tables (Chat Writes / Frames / Events) ---- */
+    .table-scroll {{
+      max-width: 100%;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      border: 1px solid #ddd2c5;
+      background: #fffaf1;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+      font-size: 13px;
+    }}
+    th, td {{
+      border-bottom: 1px solid #eee5d5;
+      padding: 8px 10px;
+      vertical-align: top;
+      text-align: left;
+      overflow-wrap: anywhere;
+    }}
+    th {{
+      background: #efe5d7;
+      font-weight: 600;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #5a544b;
+    }}
+    tr:last-child td {{ border-bottom: none; }}
+    .wrap {{ white-space: pre-wrap; }}
+    .mono {{
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11.5px;
+    }}
+    .mini {{ font-size: 10.5px; color: #8b8176; }}
+    .trunc {{ cursor: help; border-bottom: 1px dotted #b8a895; }}
+
+    /* Per-table column widths */
+    .t-messages col.c-time   {{ width: 13%; }}
+    .t-messages col.c-type   {{ width: 8%; }}
+    .t-messages col.c-prev   {{ width: 33%; }}
+    .t-messages col.c-status {{ width: 9%; }}
+    .t-messages col.c-id     {{ width: 9%; }}
+    .t-frames   col.c-time   {{ width: 18%; }}
+    .t-frames   col.c-app    {{ width: 22%; }}
+    .t-frames   col.c-num    {{ width: 12%; }}
+    .t-frames   col.c-link   {{ width: 32%; }}
+    .t-events   col.c-time   {{ width: 16%; }}
+    .t-events   col.c-source {{ width: 14%; }}
+    .t-events   col.c-type   {{ width: 18%; }}
+    .t-events   col.c-payload{{ width: 52%; }}
+
     a {{ color: #8e301f; text-decoration: none; border-bottom: 1px solid #d0a094; }}
     a.mini {{ margin-left: 6px; font-size: 11px; color: #6f6961; }}
-    .wrap {{ max-width: 520px; white-space: pre-wrap; }}
-    select, input, button {{ font: inherit; font-size: 12px; margin: 2px 0; }}
-    input {{ max-width: 180px; }}
-    .ok {{ color: #0b7d42; font-weight: 700; }}
+    .ok    {{ color: #0b7d42; font-weight: 600; }}
     .muted {{ color: #8b8176; }}
-    .bad {{ color: #b42318; font-weight: 700; }}
-    .hint {{ margin: 8px 0 12px; color: #6f6961; }}
-    details.debug-details {{ margin-top: 12px; }}
-    details.debug-details summary {{ cursor: pointer; color: #8e301f; margin-bottom: 8px; }}
+    .bad   {{ color: #b42318; font-weight: 600; }}
+    details.debug-details {{ margin-top: 14px; }}
+    details.debug-details > summary {{ cursor: pointer; color: #8e301f; margin-bottom: 8px; font-size: 13px; }}
   </style>
 </head>
 <body>
@@ -2373,21 +2641,47 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
   </div>
 
   <h2>Gate Decisions</h2>
-  <div class="hint">Main table only shows Gate decisions with frame/OCR/image context. Empty scheduled ticks are folded below.</div>
-  <table>{gate_header}<tbody>{decision_rows(frame_decisions, f'No frame-backed Gate decisions yet. Hidden empty ticks: {hidden_no_frame_count}.')}</tbody></table>
+  <div class="hint">Main view shows Gate decisions with frame/OCR/image context. Empty scheduled ticks are folded below.</div>
+  {decision_section(frame_decisions, f'No frame-backed Gate decisions yet. Hidden empty ticks: {hidden_no_frame_count}.')}
   {hidden_gate_details}
 
   <h2>Hidden Jobs</h2>
-  <table><thead><tr><th>time</th><th>ts</th><th>status</th><th>intent</th><th>context_hint</th><th>frames sent</th><th>reason</th><th>preview</th><th>alert</th><th>live activity</th><th>consumer</th><th>decision</th><th>job</th></tr></thead><tbody>{job_rows()}</tbody></table>
+  {job_section()}
 
   <h2>Proactive Chat Writes</h2>
-  <table><thead><tr><th>time</th><th>ts</th><th>type</th><th>preview</th><th>alert</th><th>live activity</th><th>decision</th><th>job</th><th>message</th></tr></thead><tbody>{message_rows()}</tbody></table>
+  <div class="table-scroll">
+    <table class="t-messages">
+      <colgroup>
+        <col class="c-time"><col class="c-type"><col class="c-prev">
+        <col class="c-status"><col class="c-status">
+        <col class="c-id"><col class="c-id"><col class="c-id">
+      </colgroup>
+      <thead><tr><th>time</th><th>type</th><th>preview</th><th>alert</th><th>live activity</th><th>decision</th><th>job</th><th>message</th></tr></thead>
+      <tbody>{message_rows()}</tbody>
+    </table>
+  </div>
 
   <h2>Recent Screen Frames</h2>
-  <table><thead><tr><th>time</th><th>ts</th><th>app</th><th>ocr len</th><th>encrypted</th><th>frame</th></tr></thead><tbody>{frame_rows()}</tbody></table>
+  <div class="table-scroll">
+    <table class="t-frames">
+      <colgroup>
+        <col class="c-time"><col class="c-app"><col class="c-num"><col class="c-num"><col class="c-link">
+      </colgroup>
+      <thead><tr><th>time</th><th>app</th><th>ocr len</th><th>encrypted</th><th>frame</th></tr></thead>
+      <tbody>{frame_rows()}</tbody>
+    </table>
+  </div>
 
   <h2>Device Events</h2>
-  <table><thead><tr><th>time</th><th>ts</th><th>source</th><th>type</th><th>redacted payload</th></tr></thead><tbody>{event_rows()}</tbody></table>
+  <div class="table-scroll">
+    <table class="t-events">
+      <colgroup>
+        <col class="c-time"><col class="c-source"><col class="c-type"><col class="c-payload">
+      </colgroup>
+      <thead><tr><th>time</th><th>source</th><th>type</th><th>payload</th></tr></thead>
+      <tbody>{event_rows()}</tbody>
+    </table>
+  </div>
 </body>
 </html>"""
 
