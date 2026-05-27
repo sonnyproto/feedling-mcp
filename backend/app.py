@@ -2012,7 +2012,15 @@ def _proactive_job_from_decision(decision: dict) -> dict:
 
 
 def _proactive_debug_snapshot(store: UserStore) -> dict:
-    decisions = store.list_gate_decisions(limit=50)
+    # Read deeper than the render cap so frame-backed decisions don't
+    # vanish when broadcast has been off and the tail of the file is
+    # dominated by `no_recent_frames` empty ticks. The renderer splits
+    # this list into frame-backed and no-frame buckets and caps each at
+    # 30 — so loading 500 here keeps both buckets honest at low marginal
+    # cost (JSONL parse over a small file). Earlier behavior was
+    # `limit=50` which silently hid all old frame-backed history once
+    # 50+ empty ticks accumulated.
+    decisions = store.list_gate_decisions(limit=500)
     jobs = store.list_proactive_jobs(limit=50)
     events = store.list_device_events(limit=50)
     reviews = store.list_gate_reviews(limit=200)
