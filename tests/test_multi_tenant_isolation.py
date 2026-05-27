@@ -226,7 +226,11 @@ def _user_flow(base_url: str, slot_idx: int) -> dict:
     iv_env = _stub_envelope(user_id, iv_marker)
     r = requests.post(
         f"{base_url}/v1/identity/init",
-        json={"envelope": iv_env, "days_with_user": 30 + slot_idx},
+        json={
+            "envelope": iv_env,
+            "days_with_user": 0,
+            "relationship_anchor_evidence": f"tenant-test-anchor-{slot_idx}",
+        },
         headers=H, timeout=TIMEOUT,
     )
     assert r.status_code == 201, f"identity_init failed for {user_id}: {r.text}"
@@ -482,7 +486,11 @@ def test_envelope_owner_user_id_mismatch_rejected(backend):
     good_env = _stub_envelope(a_uid, "good-init")
     r = requests.post(
         f"{base_url}/v1/identity/init",
-        json={"envelope": good_env, "days_with_user": 1},
+        json={
+            "envelope": good_env,
+            "days_with_user": 0,
+            "relationship_anchor_evidence": "owner-mismatch-test-anchor",
+        },
         headers={"X-API-Key": a_key}, timeout=TIMEOUT,
     )
     assert r.status_code == 201

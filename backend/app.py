@@ -236,6 +236,7 @@ class UserStore:
         # identity / memory locks
         self.identity_lock = threading.Lock()
         self.memory_lock = threading.Lock()
+        self.consumer_state_lock = threading.Lock()
 
         # proactive presence state
         self.proactive_lock = threading.Lock()
@@ -281,6 +282,10 @@ class UserStore:
     @property
     def bootstrap_events_file(self) -> Path:
         return self.dir / "bootstrap_events.jsonl"
+
+    @property
+    def consumer_state_file(self) -> Path:
+        return self.dir / "consumer_state.json"
 
     @property
     def identity_changes_file(self) -> Path:
@@ -2097,12 +2102,45 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
     }
 
 
+def _gate_input_dict(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _gate_decision_has_frame_context(decision: dict) -> bool:
+    frame_ids = decision.get("frame_ids")
+    if isinstance(frame_ids, list) and any(str(fid).strip() for fid in frame_ids):
+        return True
+    gate_input = _gate_input_dict(decision.get("gate_input"))
+    for key in ("sampled_frame_count", "image_count", "ocr_chars"):
+        try:
+            if int(gate_input.get(key) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return bool(gate_input.get("decrypt_ok"))
+
+
 def _render_proactive_dashboard(snapshot: dict) -> str:
     def esc(value) -> str:
         return html.escape(str(value if value is not None else ""))
 
     api_key = (request.args.get("key") or "").strip()
     key_qs = f"?key={quote(api_key)}" if api_key else ""
+    settings = snapshot.get("settings") or {}
+    dashboard_tz_name = str(
+        request.args.get("tz")
+        or settings.get("timezone")
+        or PROACTIVE_DEFAULT_TIMEZONE
+    ).strip() or "UTC"
+    dashboard_tz = _safe_zoneinfo(dashboard_tz_name)
 
     def fmt_time(ts_value) -> str:
         try:
@@ -2111,7 +2149,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             ts = 0.0
         if ts <= 0:
             return ""
-        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(ts, dashboard_tz).strftime("%Y-%m-%d %H:%M:%S")
 
     def fmt_epoch(ts_value) -> str:
         try:
@@ -2144,19 +2182,21 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         return ""
 
     decisions = list(reversed(snapshot.get("decisions") or []))
+    frame_decisions = [d for d in decisions if _gate_decision_has_frame_context(d)]
+    no_frame_decisions = [d for d in decisions if not _gate_decision_has_frame_context(d)]
     latest_reviews = snapshot.get("latest_review_by_decision") or {}
     jobs = list(reversed(snapshot.get("jobs") or []))
     messages = list(reversed(snapshot.get("proactive_messages") or []))
     frames = list(reversed(snapshot.get("recent_frames") or []))
     events = list(reversed(snapshot.get("device_events") or []))
 
-    def decision_rows() -> str:
-        if not decisions:
-            return "<tr><td colspan='13'>No Gate decisions yet.</td></tr>"
+    def decision_rows(rows_source, empty_text: str) -> str:
+        if not rows_source:
+            return f"<tr><td colspan='13'>{esc(empty_text)}</td></tr>"
         rows = []
-        for d in decisions[:30]:
+        for d in rows_source[:30]:
             verdict = "TRUE" if d.get("should_reach_out") else "FALSE"
-            gate_input = d.get("gate_input") or {}
+            gate_input = _gate_input_dict(d.get("gate_input"))
             connection = d.get("connection") or {}
             review = latest_reviews.get(str(d.get("decision_id") or "")) or {}
             review_action = f"/v1/proactive/decisions/{quote(str(d.get('decision_id') or ''))}/review{key_qs}"
@@ -2195,6 +2235,16 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
                 "</tr>"
             )
         return "".join(rows)
+
+    gate_header = "<thead><tr><th>time</th><th>ts</th><th>Gate</th><th>model</th><th>reason</th><th>abstention</th><th>intent</th><th>connection</th><th>context_hint</th><th>frames</th><th>gate input</th><th>decision</th><th>human review</th></tr></thead>"
+    hidden_gate_details = ""
+    if no_frame_decisions:
+        hidden_gate_details = (
+            "<details class='debug-details'>"
+            f"<summary>Show hidden no-frame Gate ticks ({len(no_frame_decisions)})</summary>"
+            f"<table>{gate_header}<tbody>{decision_rows(no_frame_decisions, 'No hidden no-frame Gate ticks.')}</tbody></table>"
+            "</details>"
+        )
 
     def job_rows() -> str:
         if not jobs:
@@ -2276,6 +2326,8 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         return "".join(rows)
 
     counts = snapshot.get("counts") or {}
+    visible_gate_count = len(frame_decisions)
+    hidden_no_frame_count = len(no_frame_decisions)
     return f"""<!doctype html>
 <html>
 <head>
@@ -2301,13 +2353,18 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     .ok {{ color: #0b7d42; font-weight: 700; }}
     .muted {{ color: #8b8176; }}
     .bad {{ color: #b42318; font-weight: 700; }}
+    .hint {{ margin: 8px 0 12px; color: #6f6961; }}
+    details.debug-details {{ margin-top: 12px; }}
+    details.debug-details summary {{ cursor: pointer; color: #8e301f; margin-bottom: 8px; }}
   </style>
 </head>
 <body>
   <h1>Feedling Proactive Debug</h1>
-  <div class="meta">user <span class="mono">{esc(snapshot.get('user_id'))}</span> · generated {esc(snapshot.get('generated_at'))} · auto-refresh 5s</div>
+  <div class="meta">user <span class="mono">{esc(snapshot.get('user_id'))}</span> · generated {esc(snapshot.get('generated_at'))} · times in {esc(dashboard_tz_name)} · auto-refresh 5s</div>
   <div>
     <span class="pill">decisions {esc(counts.get('decisions', 0))}</span>
+    <span class="pill">visible gate decisions {esc(visible_gate_count)}</span>
+    <span class="pill">hidden no-frame ticks {esc(hidden_no_frame_count)}</span>
     <span class="pill">reviews {esc(counts.get('reviews', 0))}</span>
     <span class="pill">jobs {esc(counts.get('jobs', 0))}</span>
     <span class="pill">proactive writes {esc(counts.get('proactive_messages', 0))}</span>
@@ -2316,7 +2373,9 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
   </div>
 
   <h2>Gate Decisions</h2>
-  <table><thead><tr><th>time</th><th>ts</th><th>Gate</th><th>model</th><th>reason</th><th>abstention</th><th>intent</th><th>connection</th><th>context_hint</th><th>frames</th><th>gate input</th><th>decision</th><th>human review</th></tr></thead><tbody>{decision_rows()}</tbody></table>
+  <div class="hint">Main table only shows Gate decisions with frame/OCR/image context. Empty scheduled ticks are folded below.</div>
+  <table>{gate_header}<tbody>{decision_rows(frame_decisions, f'No frame-backed Gate decisions yet. Hidden empty ticks: {hidden_no_frame_count}.')}</tbody></table>
+  {hidden_gate_details}
 
   <h2>Hidden Jobs</h2>
   <table><thead><tr><th>time</th><th>ts</th><th>status</th><th>intent</th><th>context_hint</th><th>frames sent</th><th>reason</th><th>preview</th><th>alert</th><th>live activity</th><th>consumer</th><th>decision</th><th>job</th></tr></thead><tbody>{job_rows()}</tbody></table>
@@ -2722,6 +2781,98 @@ def _load_bootstrap_events(store: UserStore) -> list[dict]:
     except Exception as e:
         print(f"[{store.user_id}/bootstrap_events] failed to load: {e}")
     return events
+
+
+_OFFICIAL_CONSUMER_NAME = "feedling-chat-resident"
+_CONSUMER_RECENT_SEC = int(os.environ.get("FEEDLING_CONSUMER_RECENT_SEC", "180"))
+
+
+def _load_consumer_state(store: UserStore) -> dict:
+    try:
+        if store.consumer_state_file.exists():
+            data = json.loads(store.consumer_state_file.read_text())
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        print(f"[{store.user_id}/consumer_state] failed to load: {e}")
+    return {}
+
+
+def _save_consumer_state(store: UserStore, state: dict) -> None:
+    try:
+        tmp = store.consumer_state_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+        tmp.replace(store.consumer_state_file)
+    except Exception as e:
+        print(f"[{store.user_id}/consumer_state] failed to save: {e}")
+
+
+def _consumer_headers_from_request() -> dict:
+    name = (request.headers.get("X-Feedling-Consumer") or "").strip()
+    if not name:
+        return {}
+    return {
+        "consumer_name": name,
+        "consumer_id": (request.headers.get("X-Feedling-Consumer-Id") or "").strip(),
+        "consumer_version": (request.headers.get("X-Feedling-Consumer-Version") or "").strip(),
+        "consumer_commit": (request.headers.get("X-Feedling-Consumer-Commit") or "").strip(),
+        "official": name == _OFFICIAL_CONSUMER_NAME,
+        "remote_addr": request.remote_addr or "",
+        "user_agent": request.headers.get("User-Agent", ""),
+    }
+
+
+def _record_consumer_event(store: UserStore, event_type: str) -> None:
+    info = _consumer_headers_from_request()
+    if not info:
+        return
+    now_epoch = time.time()
+    now_iso = datetime.now().isoformat()
+    with store.consumer_state_lock:
+        state = _load_consumer_state(store)
+        state.update(info)
+        state["last_event"] = event_type
+        state["last_seen_at"] = now_iso
+        state["last_seen_epoch"] = now_epoch
+        if event_type == "poll":
+            state["last_poll_at"] = now_iso
+            state["last_poll_epoch"] = now_epoch
+        elif event_type == "response":
+            state["last_response_at"] = now_iso
+            state["last_response_epoch"] = now_epoch
+        _save_consumer_state(store, state)
+
+
+def _consumer_validation_state(store: UserStore) -> dict:
+    with store.consumer_state_lock:
+        state = _load_consumer_state(store)
+    last_poll_epoch = 0.0
+    try:
+        last_poll_epoch = float(state.get("last_poll_epoch") or 0)
+    except Exception:
+        last_poll_epoch = 0.0
+    age_sec = time.time() - last_poll_epoch if last_poll_epoch > 0 else None
+    official = bool(state.get("official"))
+    recent = age_sec is not None and age_sec <= _CONSUMER_RECENT_SEC
+    passing = official and recent
+    return {
+        "passing": passing,
+        "official": official,
+        "consumer_name": state.get("consumer_name", ""),
+        "consumer_id": state.get("consumer_id", ""),
+        "consumer_version": state.get("consumer_version", ""),
+        "consumer_commit": state.get("consumer_commit", ""),
+        "last_poll_at": state.get("last_poll_at", ""),
+        "last_response_at": state.get("last_response_at", ""),
+        "age_sec": age_sec,
+        "recent_window_sec": _CONSUMER_RECENT_SEC,
+        "required": (
+            "Run the standard independent feedling-chat-resident / IO resident "
+            "consumer with the current FEEDLING_API_KEY. It must poll "
+            "FEEDLING_API_URL/v1/chat/poll and identify itself with the "
+            "X-Feedling-Consumer headers."
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3859,10 +4010,12 @@ def chat_response():
     to enforce it.
     """
     store = require_user()
-    gated = _gate_bootstrap_for_chat(store)
+    payload = request.get_json(silent=True) or {}
+    allow_verify_reply = _reply_is_for_pending_verify_ping(store)
+    gated = _gate_bootstrap_for_chat(store, allow_verify_reply=allow_verify_reply)
     if gated is not None:
         return gated
-    payload = request.get_json(silent=True) or {}
+    _record_consumer_event(store, "response")
     envelope = payload.get("envelope")
     if envelope is None:
         return jsonify({"error": "envelope required"}), 400
@@ -3935,6 +4088,7 @@ def chat_response():
 @app.route("/v1/chat/poll", methods=["GET"])
 def chat_poll():
     store = require_user()
+    _record_consumer_event(store, "poll")
     try:
         since = float(request.args.get("since", 0))
     except (TypeError, ValueError):
@@ -4197,7 +4351,51 @@ def _gate_required_for_missing_tabs(state) -> str:
     )
 
 
-def _gate_bootstrap_for_chat(store):
+def _chat_loop_verified_by_server(store) -> bool:
+    events = _load_bootstrap_events(store)
+    if any(
+        e.get("event_type") == "chat_loop_verified" and e.get("success") is True
+        for e in events
+    ):
+        return True
+
+    with store.chat_lock:
+        chat_msgs = list(store.chat_messages)
+    sorted_msgs = sorted(
+        chat_msgs,
+        key=lambda m: float(m.get("ts") or m.get("timestamp") or 0),
+    )
+    seen_user = False
+    for m in sorted_msgs:
+        role = m.get("role")
+        if role == "user" and m.get("source") != "verify_ping":
+            seen_user = True
+        elif role in ("agent", "openclaw") and seen_user:
+            return True
+    return False
+
+
+def _reply_is_for_pending_verify_ping(store) -> bool:
+    """True when the next agent response is the private verify-loop reply.
+
+    /v1/chat/verify_loop must be able to receive one agent response before
+    the visible chat gate is open. The synthetic ping is removed after the
+    verify completes, so this does not leak into user chat.
+    """
+    with store.chat_lock:
+        chat_msgs = list(store.chat_messages)
+    for m in reversed(chat_msgs):
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role in ("agent", "openclaw"):
+            return False
+        if role == "user":
+            return m.get("source") == "verify_ping"
+    return False
+
+
+def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
     """Refuse /v1/chat/response when bootstrap is incomplete.
 
     Returns a (response, status) tuple to be returned by the caller, or None
@@ -4207,6 +4405,47 @@ def _gate_bootstrap_for_chat(store):
     """
     state = _bootstrap_state(store)
     if state["stage"] == "main_loop":
+        if allow_verify_reply:
+            return None
+        consumer_state = _consumer_validation_state(store)
+        if not consumer_state["passing"]:
+            print(
+                f"[gate:{store.user_id}] chat_response blocked stage=needs_resident_consumer "
+                f"consumer={consumer_state.get('consumer_name')} recent={consumer_state.get('age_sec')}"
+            )
+            return jsonify({
+                "error": "bootstrap_incomplete",
+                "stage": "needs_resident_consumer",
+                "memory_count": state["memory_count"],
+                "memory_floor": state["memory_floor"],
+                "counts": state["counts"],
+                "floors": state["floors"],
+                "missing_tabs": state["missing_tabs"],
+                "identity_written": state["identity_written"],
+                "resident_consumer": consumer_state,
+                "required": consumer_state["required"],
+                "skill_url": _SKILL_URL,
+            }), 409
+        if not _chat_loop_verified_by_server(store):
+            required = (
+                "After the standard resident consumer is running, call "
+                "feedling_chat_verify_loop and wait for passing=true before "
+                "sending any visible IO Chat greeting."
+            )
+            print(f"[gate:{store.user_id}] chat_response blocked stage=needs_live_connection")
+            return jsonify({
+                "error": "bootstrap_incomplete",
+                "stage": "needs_live_connection",
+                "memory_count": state["memory_count"],
+                "memory_floor": state["memory_floor"],
+                "counts": state["counts"],
+                "floors": state["floors"],
+                "missing_tabs": state["missing_tabs"],
+                "identity_written": state["identity_written"],
+                "resident_consumer": consumer_state,
+                "required": required,
+                "skill_url": _SKILL_URL,
+            }), 409
         return None
     if state["stage"] == "needs_memory":
         required = _gate_required_for_missing_tabs(state)
@@ -4318,6 +4557,30 @@ def identity_init():
     days_with_user = payload.get("days_with_user")
     if days_with_user is None or not isinstance(days_with_user, int) or days_with_user < 0:
         return jsonify({"error": "days_with_user (non-negative int) required at init"}), 400
+    relationship_anchor_evidence = str(payload.get("relationship_anchor_evidence") or "").strip()
+    if len(relationship_anchor_evidence) < 8:
+        return jsonify({
+            "error": "relationship_anchor_evidence required at init",
+            "required": (
+                "Pass a concrete source for the earliest relationship date "
+                "(transcript/session/file/message pointer or user-confirmed fresh start). "
+                "Do not guess days_with_user."
+            ),
+        }), 400
+    earliest_memory_date = _earliest_memory_date(store)
+    if earliest_memory_date:
+        computed_days = max(0, (datetime.now().date() - earliest_memory_date).days)
+        if abs(computed_days - days_with_user) > 1:
+            return jsonify({
+                "error": "days_with_user_mismatch",
+                "days_with_user": days_with_user,
+                "computed_from_earliest_memory": computed_days,
+                "earliest_memory_date": earliest_memory_date.isoformat(),
+                "required": (
+                    "Recompute days_with_user from the earliest memory's occurred_at "
+                    "before calling feedling_identity_init."
+                ),
+            }), 400
 
     now = datetime.now().isoformat()
     identity = {
@@ -4332,7 +4595,8 @@ def identity_init():
         "created_at": now,
         "updated_at": now,
         "relationship_started_at": _anchor_from_days(days_with_user, store=store, prefer_memory=True),
-        "relationship_anchor_source": "earliest_memory" if _earliest_memory_date(store) else "days_with_user",
+        "relationship_anchor_source": "earliest_memory" if earliest_memory_date else "days_with_user",
+        "relationship_anchor_evidence": relationship_anchor_evidence,
     }
     if envelope.get("K_enclave"):
         identity["K_enclave"] = envelope["K_enclave"]
@@ -4391,9 +4655,13 @@ def identity_replace():
             return jsonify({"error": "days_with_user must be a non-negative int"}), 400
         relationship_started_at = _anchor_from_days(days_with_user)
         relationship_anchor_source = "user_calibrated"
+        relationship_anchor_evidence = (payload.get("relationship_anchor_evidence") or "").strip()
+        if not relationship_anchor_evidence and existing:
+            relationship_anchor_evidence = existing.get("relationship_anchor_evidence", "")
     elif existing and existing.get("relationship_started_at"):
         relationship_started_at = existing["relationship_started_at"]
         relationship_anchor_source = existing.get("relationship_anchor_source", "")
+        relationship_anchor_evidence = existing.get("relationship_anchor_evidence", "")
     else:
         # First-ever write through replace (no prior init). Reject so callers
         # are forced through init's mandatory days_with_user path.
@@ -4412,6 +4680,7 @@ def identity_replace():
         "updated_at": now,
         "relationship_started_at": relationship_started_at,
         "relationship_anchor_source": relationship_anchor_source,
+        "relationship_anchor_evidence": relationship_anchor_evidence,
     }
     if envelope.get("K_enclave"):
         identity["K_enclave"] = envelope["K_enclave"]
@@ -5047,30 +5316,8 @@ def bootstrap_status():
     # by /v1/chat/verify_loop, or has the agent responded to a real user
     # message at least once? `agent_messages_count >= 1` only proves the
     # agent SPOKE; it does not prove the ongoing loop is wired.
-    events = _load_bootstrap_events(store)
-    verify_loop_passed = any(
-        e.get("event_type") == "chat_loop_verified" and e.get("success") is True
-        for e in events
-    )
-
-    # Backward-compatible fallback for accounts bootstrapped before the
-    # explicit verify event existed: a real user→agent exchange also proves
-    # the live connection, but this requires the user to have sent a test
-    # message first.
-    sorted_msgs = sorted(
-        chat_msgs,
-        key=lambda m: float(m.get("ts") or m.get("timestamp") or 0),
-    )
-    replied_after_real_user = False
-    seen_user = False
-    for m in sorted_msgs:
-        role = m.get("role")
-        if role == "user" and m.get("source") != "verify_ping":
-            seen_user = True
-        elif role in _AGENT_ROLES and seen_user:
-            replied_after_real_user = True
-            break
-    chat_loop_verified = verify_loop_passed or replied_after_real_user
+    chat_loop_verified = _chat_loop_verified_by_server(store)
+    resident_consumer = _consumer_validation_state(store)
 
     agent_connected = has_identity or memory_count > 0 or agent_msg_count > 0
     candidate_ts = [t for t in (identity_updated_at, last_moment_ts, last_agent_msg_ts) if t]
@@ -5087,6 +5334,7 @@ def bootstrap_status():
         has_identity
         and bootstrap_memory_ok
         and agent_msg_count >= 1
+        and resident_consumer["passing"]
         and chat_loop_verified
     )
 
@@ -5098,6 +5346,8 @@ def bootstrap_status():
         "memories_count": memory_count,
         "agent_messages_count": agent_msg_count,
         "chat_loop_verified": chat_loop_verified,
+        "resident_consumer_connected": resident_consumer["passing"],
+        "resident_consumer": resident_consumer,
         "is_complete": is_complete,
     })
 
@@ -5319,17 +5569,169 @@ def identity_verify():
             "relationship_started_at is missing. Use "
             "feedling_identity_set_relationship_days to set it."
         )
+    relationship_anchor_evidence = str(identity.get("relationship_anchor_evidence") or "").strip()
+    if not relationship_anchor_evidence:
+        issues.append({"type": "no_relationship_anchor_evidence"})
+        suggestions.append(
+            "relationship_anchor_evidence is missing. Re-run identity bootstrap "
+            "with a concrete transcript/session/file pointer for the earliest date."
+        )
 
     return jsonify({
         "written": True,
         "days_with_user": days_with_user,
         "relationship_anchored": relationship_anchored,
+        "relationship_anchor_source": identity.get("relationship_anchor_source", ""),
+        "relationship_anchor_evidence": relationship_anchor_evidence,
         "created_at": identity.get("created_at", ""),
         "updated_at": identity.get("updated_at", ""),
         "issues": issues,
         "suggestions": suggestions,
         "passing": len(issues) == 0,
     })
+
+
+def _visible_agent_message_count(store) -> int:
+    with store.chat_lock:
+        chat_msgs = list(store.chat_messages)
+    return sum(
+        1 for m in chat_msgs
+        if isinstance(m, dict)
+        and m.get("role") in ("agent", "openclaw")
+        and m.get("source") != "verify_ping"
+    )
+
+
+def _real_user_agent_exchange_verified(store) -> bool:
+    with store.chat_lock:
+        chat_msgs = list(store.chat_messages)
+    sorted_msgs = sorted(
+        chat_msgs,
+        key=lambda m: float(m.get("ts") or m.get("timestamp") or 0),
+    )
+    seen_user = False
+    for m in sorted_msgs:
+        role = m.get("role")
+        if role == "user" and m.get("source") != "verify_ping":
+            seen_user = True
+        elif role in ("agent", "openclaw") and seen_user:
+            return True
+    return False
+
+
+def _onboarding_validation_payload(store: UserStore) -> dict:
+    bootstrap_st = _bootstrap_state(store)
+    memory_ok = not bootstrap_st["missing_tabs"]
+    identity = _load_identity(store)
+    identity_written = identity is not None
+    relationship_anchored = bool(identity and identity.get("relationship_started_at"))
+    relationship_evidence = str((identity or {}).get("relationship_anchor_evidence") or "").strip()
+    relationship_ok = relationship_anchored and bool(relationship_evidence)
+    resident = _consumer_validation_state(store)
+    chat_loop_ok = _chat_loop_verified_by_server(store)
+    first_greeting_count = _visible_agent_message_count(store)
+    first_greeting_ok = first_greeting_count > 0
+    real_exchange_ok = _real_user_agent_exchange_verified(store)
+
+    steps = [
+        {
+            "id": "memory_garden",
+            "label": "Memory Garden",
+            "passing": memory_ok,
+            "counts": bootstrap_st["counts"],
+            "floors": bootstrap_st["floors"],
+            "missing_tabs": bootstrap_st["missing_tabs"],
+            "required": _gate_required_for_missing_tabs(bootstrap_st) if not memory_ok else "",
+        },
+        {
+            "id": "identity_card",
+            "label": "Identity Card",
+            "passing": identity_written,
+            "written": identity_written,
+            "required": (
+                "Call feedling_identity_init after memory verification passes."
+                if not identity_written else ""
+            ),
+        },
+        {
+            "id": "relationship_anchor",
+            "label": "Relationship Anchor",
+            "passing": relationship_ok,
+            "relationship_anchored": relationship_anchored,
+            "relationship_anchor_source": (identity or {}).get("relationship_anchor_source", ""),
+            "relationship_anchor_evidence": relationship_evidence,
+            "days_with_user": _live_days_with_user(identity, store=store) if identity else None,
+            "required": (
+                "Re-run identity init with relationship_anchor_evidence and a "
+                "days_with_user value that matches the earliest memory date."
+                if identity_written and not relationship_ok else ""
+            ),
+        },
+        {
+            "id": "resident_consumer",
+            "label": "Resident Consumer",
+            "passing": resident["passing"],
+            "official": resident["official"],
+            "consumer_name": resident["consumer_name"],
+            "consumer_id": resident["consumer_id"],
+            "last_poll_at": resident["last_poll_at"],
+            "age_sec": resident["age_sec"],
+            "required": resident["required"] if not resident["passing"] else "",
+        },
+        {
+            "id": "live_loop",
+            "label": "Live Connection",
+            "passing": chat_loop_ok,
+            "required": (
+                "Call feedling_chat_verify_loop after the standard resident "
+                "consumer is polling. Only passing=true opens visible chat."
+                if not chat_loop_ok else ""
+            ),
+        },
+        {
+            "id": "first_greeting",
+            "label": "First Greeting",
+            "passing": first_greeting_ok,
+            "visible_agent_messages": first_greeting_count,
+            "required": (
+                "After Live Connection passes, send the first greeting via "
+                "feedling_chat_post_message."
+                if not first_greeting_ok else ""
+            ),
+        },
+        {
+            "id": "real_chat_acceptance",
+            "label": "Real Chat Acceptance",
+            "passing": real_exchange_ok,
+            "required": (
+                "Ask the user to send one ordinary IO Chat message and confirm "
+                "the resident consumer replies naturally."
+                if not real_exchange_ok else ""
+            ),
+        },
+    ]
+
+    next_step = next((step for step in steps if not step["passing"]), None)
+    return {
+        "passing": next_step is None,
+        "stage": "complete" if next_step is None else next_step["id"],
+        "next_action": "" if next_step is None else next_step["required"],
+        "steps": steps,
+        "skill_url": _SKILL_URL,
+    }
+
+
+@app.route("/v1/onboarding/validate", methods=["GET"])
+def onboarding_validate():
+    """Authoritative onboarding acceptance check.
+
+    This is deliberately server-side and artifact-based: agents can report
+    anything, but the validator only passes a step when Feedling can see the
+    corresponding write, resident-consumer heartbeat, verify-loop event, or
+    real user→agent exchange.
+    """
+    store = require_user()
+    return jsonify(_onboarding_validation_payload(store))
 
 
 # Synthetic chat-loop ping — server posts a marker user message,

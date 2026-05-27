@@ -163,6 +163,7 @@ PROACTIVE_TICK_ENABLED = _env_bool("PROACTIVE_TICK_ENABLED", True)
 PROACTIVE_TICK_INTERVAL_SEC = int(os.environ.get("PROACTIVE_TICK_INTERVAL_SEC", "300"))
 PROACTIVE_TICK_START_DELAY_SEC = int(os.environ.get("PROACTIVE_TICK_START_DELAY_SEC", "15"))
 PROACTIVE_MAX_REPLY_MESSAGES = int(os.environ.get("PROACTIVE_MAX_REPLY_MESSAGES", "5"))
+PROACTIVE_RECENT_CHAT_LIMIT = int(os.environ.get("PROACTIVE_RECENT_CHAT_LIMIT", "20"))
 CONSUMER_ID = os.environ.get(
     "CONSUMER_ID",
     f"{socket.gethostname()}:{os.getpid()}",
@@ -222,7 +223,30 @@ FEEDLING_ENCLAVE_URL = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
 FEEDLING_MCP_URL = os.environ.get("FEEDLING_MCP_URL", "").rstrip("/")
 FEEDLING_MCP_KEY = os.environ.get("FEEDLING_MCP_KEY", FEEDLING_API_KEY)
 
-_HEADERS = {"X-API-Key": FEEDLING_API_KEY}
+
+def _consumer_commit() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(Path(__file__).parent.parent),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+_HEADERS = {
+    "X-API-Key": FEEDLING_API_KEY,
+    "X-Feedling-Consumer": "feedling-chat-resident",
+    "X-Feedling-Consumer-Id": CONSUMER_ID,
+    "X-Feedling-Consumer-Version": "resident-v1",
+    "X-Feedling-Consumer-Commit": os.environ.get("FEEDLING_CONSUMER_COMMIT", _consumer_commit()),
+}
 
 # Separate HTTP client for the enclave (self-signed TLS, verify=False).
 _ENCLAVE_CLIENT: httpx.Client | None = (
@@ -1943,15 +1967,16 @@ def _message_text_for_context(msg: dict) -> str:
     return text[:500]
 
 
-def recent_chat_context_for_proactive(limit: int = 8) -> str:
+def recent_chat_context_for_proactive(limit: int | None = None) -> str:
     """Return a short plaintext chat transcript for proactive continuity.
 
     This uses the same decrypt sources as normal chat processing. If no decrypt
     source is available, proactive realization still proceeds; it simply lacks
     recent-chat continuity context.
     """
+    limit = max(1, min(limit if limit is not None else PROACTIVE_RECENT_CHAT_LIMIT, 50))
     try:
-        history = get_decrypted_history(since=0, limit=max(1, min(limit, 20)))
+        history = get_decrypted_history(since=0, limit=limit)
     except Exception as e:
         log.warning("recent chat context fetch failed: %s", e)
         return ""
@@ -2024,7 +2049,8 @@ def _message_for_proactive_job(
         parts.append(
             "recent_chat_context:\n"
             f"{recent_chat_context}\n"
-            "Use this only for continuity; do not summarize it back unless it is directly relevant."
+            "Use this only for local continuity. Do not overfit or imitate these lines. "
+            "Your own runtime identity, memory, and normal voice remain the source of the reply."
         )
     if screen_text:
         parts.append(screen_text)
@@ -2059,7 +2085,7 @@ def _process_proactive_jobs(jobs: list) -> float:
         if not isinstance(frame_ids, list):
             frame_ids = []
         screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
-        recent_context = recent_chat_context_for_proactive(limit=8)
+        recent_context = recent_chat_context_for_proactive()
         message = _message_for_proactive_job(
             job,
             screen_text=screen_text,

@@ -184,20 +184,73 @@ def _init_identity(base_url: str, user_id: str, api_key: str, days: int = 0) -> 
     env = _stub_envelope(user_id, "identity")
     return requests.post(
         f"{base_url}/v1/identity/init",
-        json={"envelope": env, "days_with_user": days},
+        json={
+            "envelope": env,
+            "days_with_user": days,
+            "relationship_anchor_evidence": "test transcript anchor",
+        },
         headers={"X-API-Key": api_key},
         timeout=TIMEOUT,
     )
 
 
-def _chat_response(base_url: str, user_id: str, api_key: str) -> requests.Response:
+_CONSUMER_HEADERS = {
+    "X-Feedling-Consumer": "feedling-chat-resident",
+    "X-Feedling-Consumer-Id": "pytest-consumer",
+    "X-Feedling-Consumer-Version": "resident-v1",
+    "X-Feedling-Consumer-Commit": "pytest",
+}
+
+
+def _record_consumer_poll(base_url: str, api_key: str) -> None:
+    headers = {"X-API-Key": api_key, **_CONSUMER_HEADERS}
+    r = requests.get(
+        f"{base_url}/v1/chat/poll?since=9999999999&timeout=0.01",
+        headers=headers,
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+
+
+def _chat_response(
+    base_url: str,
+    user_id: str,
+    api_key: str,
+    *,
+    consumer_headers: bool = False,
+) -> requests.Response:
     env = _stub_envelope(user_id, "chat-reply")
+    headers = {"X-API-Key": api_key}
+    if consumer_headers:
+        headers.update(_CONSUMER_HEADERS)
     return requests.post(
         f"{base_url}/v1/chat/response",
         json={"envelope": env, "alert_body": "hi"},
-        headers={"X-API-Key": api_key},
+        headers=headers,
         timeout=TIMEOUT,
     )
+
+
+def _establish_live_connection(base_url: str, user_id: str, api_key: str) -> dict:
+    _record_consumer_poll(base_url, api_key)
+
+    def delayed_agent_reply():
+        time.sleep(0.5)
+        _chat_response(base_url, user_id, api_key, consumer_headers=True)
+
+    t = threading.Thread(target=delayed_agent_reply)
+    t.start()
+    r = requests.post(
+        f"{base_url}/v1/chat/verify_loop",
+        json={"timeout_sec": 6},
+        headers={"X-API-Key": api_key},
+        timeout=10,
+    )
+    t.join(timeout=5)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["passing"] is True, body
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -235,12 +288,13 @@ def test_chat_response_blocked_when_memory_ok_but_no_identity(backend):
     assert body["identity_written"] is False
 
 
-def test_chat_response_allowed_after_full_bootstrap(backend):
-    """Story floor + About me floor + identity_init → chat_response 200."""
+def test_chat_response_allowed_after_full_bootstrap_and_live_connection(backend):
+    """Story floor + About me floor + identity_init + live connection → chat_response 200."""
     user_id, api_key = _register(backend["base_url"])
     _seed_passing_bootstrap(backend["base_url"], user_id, api_key)
     r = _init_identity(backend["base_url"], user_id, api_key)
     assert r.status_code == 201, f"identity_init failed: {r.text}"
+    _establish_live_connection(backend["base_url"], user_id, api_key)
     r = _chat_response(backend["base_url"], user_id, api_key)
     assert r.status_code == 200, f"chat_response should succeed: {r.text}"
 
@@ -334,6 +388,7 @@ def test_bootstrap_status_counts_openclaw_role(backend):
     user_id, api_key = _register(backend["base_url"])
     _seed_passing_bootstrap(backend["base_url"], user_id, api_key)
     assert _init_identity(backend["base_url"], user_id, api_key).status_code == 201
+    _establish_live_connection(backend["base_url"], user_id, api_key)
     assert _chat_response(backend["base_url"], user_id, api_key).status_code == 200
 
     r = requests.get(
@@ -358,6 +413,7 @@ def test_bootstrap_status_chat_loop_verified_with_openclaw(backend):
     user_id, api_key = _register(backend["base_url"])
     _seed_passing_bootstrap(backend["base_url"], user_id, api_key)
     assert _init_identity(backend["base_url"], user_id, api_key).status_code == 201
+    _establish_live_connection(backend["base_url"], user_id, api_key)
 
     # User → agent → user → agent sequence
     user_env = _stub_envelope(user_id, "user-msg")
@@ -392,8 +448,11 @@ def test_bootstrap_status_complete_field_includes_loop_verified(backend):
     user_id, api_key = _register(backend["base_url"])
     _seed_passing_bootstrap(backend["base_url"], user_id, api_key)
     assert _init_identity(backend["base_url"], user_id, api_key).status_code == 201
-    # Agent posts a greeting but no user message → loop not verified yet
-    assert _chat_response(backend["base_url"], user_id, api_key).status_code == 200
+    _record_consumer_poll(backend["base_url"], api_key)
+    # Agent tries to post a visible greeting before verify_loop passes.
+    r = _chat_response(backend["base_url"], user_id, api_key)
+    assert r.status_code == 409
+    assert r.json()["stage"] == "needs_live_connection"
 
     r = requests.get(
         f"{backend['base_url']}/v1/bootstrap/status",
@@ -401,7 +460,7 @@ def test_bootstrap_status_complete_field_includes_loop_verified(backend):
         timeout=TIMEOUT,
     )
     body = r.json()
-    assert body["agent_messages_count"] >= 1
+    assert body["agent_messages_count"] == 0
     assert body["chat_loop_verified"] is False
     assert body["is_complete"] is False
 
@@ -498,6 +557,72 @@ def test_identity_verify_after_init(backend):
     assert body["passing"] is True
 
 
+def test_identity_init_requires_relationship_anchor_evidence(backend):
+    user_id, api_key = _register(backend["base_url"])
+    _seed_passing_bootstrap(backend["base_url"], user_id, api_key)
+    env = _stub_envelope(user_id, "identity")
+    r = requests.post(
+        f"{backend['base_url']}/v1/identity/init",
+        json={"envelope": env, "days_with_user": 0},
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 400
+    assert r.json()["error"] == "relationship_anchor_evidence required at init"
+
+
+def test_identity_init_rejects_days_that_do_not_match_earliest_memory(backend):
+    user_id, api_key = _register(backend["base_url"])
+    _seed_passing_bootstrap(backend["base_url"], user_id, api_key)
+    env = _stub_envelope(user_id, "identity")
+    r = requests.post(
+        f"{backend['base_url']}/v1/identity/init",
+        json={
+            "envelope": env,
+            "days_with_user": 40,
+            "relationship_anchor_evidence": "test transcript anchor",
+        },
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 400
+    assert r.json()["error"] == "days_with_user_mismatch"
+
+
+def test_onboarding_validate_steps_progression(backend):
+    user_id, api_key = _register(backend["base_url"])
+    r = requests.get(
+        f"{backend['base_url']}/v1/onboarding/validate",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    body = r.json()
+    assert body["passing"] is False
+    assert body["stage"] == "memory_garden"
+
+    _seed_passing_bootstrap(backend["base_url"], user_id, api_key)
+    assert _init_identity(backend["base_url"], user_id, api_key).status_code == 201
+    r = requests.get(
+        f"{backend['base_url']}/v1/onboarding/validate",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    body = r.json()
+    assert body["stage"] == "resident_consumer"
+    assert next(s for s in body["steps"] if s["id"] == "relationship_anchor")["passing"] is True
+
+    _establish_live_connection(backend["base_url"], user_id, api_key)
+    r = requests.get(
+        f"{backend['base_url']}/v1/onboarding/validate",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    body = r.json()
+    assert body["stage"] == "first_greeting"
+    assert next(s for s in body["steps"] if s["id"] == "resident_consumer")["passing"] is True
+    assert next(s for s in body["steps"] if s["id"] == "live_loop")["passing"] is True
+
+
 def test_chat_verify_loop_no_agent_returns_dead(backend):
     """No agent connected → synthetic ping times out → passing=false +
     suggestions guide operator to run feedling-chat-resident."""
@@ -554,10 +679,11 @@ def test_chat_verify_loop_marks_live_connection_without_first_message(backend):
     user_id, api_key = _register(backend["base_url"])
     _seed_passing_bootstrap(backend["base_url"], user_id, api_key)
     assert _init_identity(backend["base_url"], user_id, api_key).status_code == 201
+    _record_consumer_poll(backend["base_url"], api_key)
 
     def delayed_agent_reply():
         time.sleep(0.5)
-        _chat_response(backend["base_url"], user_id, api_key)
+        _chat_response(backend["base_url"], user_id, api_key, consumer_headers=True)
 
     t = threading.Thread(target=delayed_agent_reply)
     t.start()

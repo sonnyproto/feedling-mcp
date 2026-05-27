@@ -108,6 +108,60 @@ def test_proactive_debug_derives_job_delivery_state(tmp_path, monkeypatch):
     assert snapshot["jobs"][0]["live_activity_status"] == "delivered"
 
 
+def test_proactive_debug_folds_no_frame_gate_ticks(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    store = appmod.UserStore("usr_test_proactive_folded_gate")
+
+    no_frame = {
+        "decision_id": "gd_no_frame",
+        "ts": 1000,
+        "gate_model": "openrouter:google/gemini-3.1-flash-lite",
+        "should_reach_out": False,
+        "reason": "no_recent_frames_unit_test",
+        "abstention_reason": "no_recent_frames",
+        "intent_label": "blocked_before_model",
+        "connection": {},
+        "frame_ids": [],
+        "gate_input": {
+            "ocr_chars": 0,
+            "sampled_frame_count": 0,
+            "decrypt_ok": False,
+            "image_count": 0,
+        },
+    }
+    with_frame = {
+        "decision_id": "gd_with_frame",
+        "ts": 1001,
+        "gate_model": "openrouter:google/gemini-3.1-flash-lite",
+        "should_reach_out": False,
+        "reason": "frame_backed_false_unit_test",
+        "abstention_reason": "model_false",
+        "intent_label": "reviewable_false",
+        "connection": {},
+        "frame_ids": [],
+        "gate_input": {
+            "ocr_chars": 42,
+            "sampled_frame_count": 2,
+            "decrypt_ok": True,
+            "image_count": 1,
+        },
+    }
+    store.append_gate_decision(no_frame)
+    store.append_gate_decision(with_frame)
+
+    assert appmod._gate_decision_has_frame_context(no_frame) is False
+    assert appmod._gate_decision_has_frame_context(with_frame) is True
+
+    snapshot = appmod._proactive_debug_snapshot(store)
+    with appmod.app.test_request_context("/debug/proactive?key=test"):
+        page = appmod._render_proactive_dashboard(snapshot)
+
+    assert "visible gate decisions 1" in page
+    assert "hidden no-frame ticks 1" in page
+    assert "Show hidden no-frame Gate ticks (1)" in page
+    assert page.find("frame_backed_false_unit_test") < page.find("no_recent_frames_unit_test")
+
+
 def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
@@ -512,7 +566,7 @@ def test_proactive_job_claim_and_status_lifecycle(tmp_path, monkeypatch):
 
 def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store: None)
+    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
     appmod._stores.clear()
 
     sent_push_types = []

@@ -918,7 +918,7 @@ def test_process_proactive_jobs_routes_through_agent_and_posts_metadata(monkeypa
     monkeypatch.setattr(
         crc,
         "recent_chat_context_for_proactive",
-        lambda limit=8: "- user: 你刚刚问我这段要不要压成一句话。\n- agent: 我可以帮你压。",
+        lambda limit=None: "- user: 你刚刚问我这段要不要压成一句话。\n- agent: 我可以帮你压。",
     )
 
     job = {
@@ -937,6 +937,7 @@ def test_process_proactive_jobs_routes_through_agent_and_posts_metadata(monkeypa
     assert "The user has stayed" in captured["message"]
     assert "recent_chat_context" in captured["message"]
     assert "你刚刚问我这段要不要压成一句话" in captured["message"]
+    assert "own runtime identity" in captured["message"]
     assert "screen: user is reading docs" in captured["message"]
     assert captured["images"] == [{"data": "x"}]
     assert captured["image_paths"] == ["/tmp/frame.jpg"]
@@ -984,6 +985,27 @@ def test_message_for_proactive_job_instructs_multi_bubble_without_hiding_context
     assert "recent_chat_context" in message
     assert "possible_connections" in message
     assert "screen: dense paragraph" in message
+
+
+def test_recent_chat_context_defaults_to_twenty_messages(monkeypatch):
+    captured = {}
+
+    def _history(since, limit):
+        captured["limit"] = limit
+        return [
+            {"role": "user", "content": f"用户消息 {idx}"}
+            for idx in range(25)
+        ]
+
+    monkeypatch.setattr(crc, "PROACTIVE_RECENT_CHAT_LIMIT", 20)
+    monkeypatch.setattr(crc, "get_decrypted_history", _history)
+
+    context = crc.recent_chat_context_for_proactive()
+
+    assert captured["limit"] == 20
+    assert context.count("- user:") == 20
+    assert "用户消息 5" in context
+    assert "用户消息 24" in context
 
 
 def test_post_proactive_reply_triggers_alert_and_live_activity(monkeypatch):

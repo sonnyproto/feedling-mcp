@@ -1025,6 +1025,7 @@ def _build_and_post_identity(
     signature: list[str] | None,
     ctx: Context | None,
     audit_reason: str = "",
+    relationship_anchor_evidence: str = "",
 ) -> dict:
     """Shared encrypt-and-POST path used by both identity_init and identity_replace.
 
@@ -1072,6 +1073,8 @@ def _build_and_post_identity(
     post_payload: dict = {"envelope": envelope}
     if days_with_user is not None:
         post_payload["days_with_user"] = int(max(0, days_with_user))
+    if relationship_anchor_evidence:
+        post_payload["relationship_anchor_evidence"] = relationship_anchor_evidence
     # Audit payload tells the backend's identity-change feed what to log.
     # Init defaults to a generic "first write" marker if no reason supplied;
     # replace defaults to "Agent rewrote the identity card" — these only
@@ -1095,6 +1098,8 @@ def _build_and_post_identity(
         "and pick one you can defend. "
         "days_with_user (REQUIRED): computed as calendar-day difference between today and earliest_memory.occurred_at. "
         "Do not guess this value — derive it from the memories you wrote. "
+        "relationship_anchor_evidence (REQUIRED): a concrete pointer to the "
+        "transcript/session/file/user-confirmed fresh-start source for the earliest date. "
         "agent_name: NEVER use a runtime label (Hermes / Claude / GPT / etc.). "
         "Use the name the user has called you in prior chats; if none, propose one and "
         "let the user accept. "
@@ -1107,14 +1112,17 @@ def identity_init(
     self_introduction: str,
     dimensions: list[dict],
     days_with_user: int,
+    relationship_anchor_evidence: str,
     category: str = "",
     signature: list[str] = None,
     reason: str = "",
     ctx: Context = None,
 ) -> dict:
-    """First-time identity write. days_with_user is mandatory — it sets the
-    server-side relationship anchor. Returns 409 from the backend if the card
-    already exists — use feedling_identity_replace to overwrite.
+    """First-time identity write. days_with_user and
+    relationship_anchor_evidence are mandatory — together they set the
+    server-side relationship anchor and its audit trail. Returns 409 from
+    the backend if the card already exists — use feedling_identity_replace
+    to overwrite.
 
     `reason` (optional): one sentence in your own voice describing what this
     init represents to you. Shown in the user's "最近的变化" feed verbatim.
@@ -1124,6 +1132,7 @@ def identity_init(
         agent_name, self_introduction, dimensions,
         days_with_user, category, signature, ctx,
         audit_reason=reason,
+        relationship_anchor_evidence=relationship_anchor_evidence,
     )
 
 
@@ -1628,6 +1637,20 @@ def memory_verify(ctx: Context = None) -> dict:
 )
 def identity_verify(ctx: Context = None) -> dict:
     return _get("/v1/identity/verify", ctx=ctx)
+
+
+@mcp.tool(
+    name="feedling_onboarding_validate",
+    description=(
+        "Server-side onboarding acceptance check. Call after each bootstrap "
+        "module. It verifies actual Feedling artifacts: Memory Garden floors, "
+        "identity write, relationship anchor evidence, standard resident "
+        "consumer polling, live verify_loop, first greeting, and one real "
+        "user→agent exchange. If passing=false, follow next_action and rerun."
+    ),
+)
+def onboarding_validate(ctx: Context = None) -> dict:
+    return _get("/v1/onboarding/validate", ctx=ctx)
 
 
 @mcp.tool(

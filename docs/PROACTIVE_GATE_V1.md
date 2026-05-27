@@ -92,8 +92,8 @@ entry with:
 - `intent_label`
 - `context_hint`
 - `possible_connections`
-- recent chat context: up to the last 8 decrypted chat messages, if the resident
-  has a decrypt source available
+- recent chat context: up to the last 20 decrypted chat messages by default
+  (`PROACTIVE_RECENT_CHAT_LIMIT`), if the resident has a decrypt source available
 - selected screen-frame text and the corresponding images / image paths
 
 The agent writes the actual user-facing message. For a more human rhythm, the
@@ -104,6 +104,12 @@ agent may return one message or multiple short bubbles:
 ```
 
 The resident enforces a hard cap of 5 bubbles per proactive job.
+
+Recent chat context is only a local continuity aid. It helps the agent avoid a
+proactive message that ignores the immediately preceding conversation, especially
+for stateless HTTP entries or compressed CLI sessions. It is not the source of
+persona or voice: the user's own runtime identity, memory, and normal agent
+profile remain authoritative.
 
 ## Frame Sampling
 
