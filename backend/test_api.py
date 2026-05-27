@@ -143,6 +143,41 @@ requests.post = _auth_post
 requests.delete = _auth_delete
 
 
+CONSUMER_HEADERS = {
+    "X-Feedling-Consumer": "feedling-chat-resident",
+    "X-Feedling-Consumer-Id": "test-api-consumer",
+    "X-Feedling-Consumer-Version": "test-api",
+    "X-Feedling-Consumer-Commit": "test-api",
+}
+
+
+def _raw_headers(*extras):
+    headers = dict(AUTH_HEADERS)
+    for extra in extras:
+        headers.update(extra or {})
+    return headers
+
+
+def _seed_envelope(owner: str, *, visibility: str = "shared",
+                   with_k_enclave: bool = True, **overrides) -> dict:
+    body = base64.b64encode(uuid.uuid4().bytes * 4).decode()
+    nonce = base64.b64encode(uuid.uuid4().bytes[:12] * 2).decode()
+    k = base64.b64encode(uuid.uuid4().bytes * 3).decode()
+    env = {
+        "v": 1,
+        "body_ct": body,
+        "nonce": nonce,
+        "K_user": k,
+        "enclave_pk_fpr": "00" * 16,
+        "visibility": visibility,
+        "owner_user_id": owner,
+    }
+    if with_k_enclave:
+        env["K_enclave"] = k
+    env.update(overrides)
+    return env
+
+
 # ---------------------------------------------------------------------------
 # Satisfy bootstrap-stage gate (added 2026-05-15)
 #
@@ -165,31 +200,67 @@ def _seed_bootstrap_state():
     # <2-days floor (story=1, about_me=1).
     seed_types = ["moment", "fact", "fact"]
     for i, mem_type in enumerate(seed_types):
-        env = {
-            "v": 1,
-            "body_ct": base64.b64encode(uuid.uuid4().bytes * 4).decode(),
-            "nonce": base64.b64encode(uuid.uuid4().bytes[:12] * 2).decode(),
-            "K_user": base64.b64encode(uuid.uuid4().bytes * 3).decode(),
-            "K_enclave": base64.b64encode(uuid.uuid4().bytes * 3).decode(),
-            "visibility": "shared",
-            "owner_user_id": USER_ID,
-            "occurred_at": occurred_at,
-            "type": mem_type,
-        }
+        env = _seed_envelope(
+            USER_ID,
+            occurred_at=occurred_at,
+            type=mem_type,
+        )
         _orig_post(f"{BASE_URL}/v1/memory/add",
                    json={"envelope": env}, headers=AUTH_HEADERS, timeout=5)
-    seed_id_env = {
-        "v": 1,
-        "body_ct": base64.b64encode(uuid.uuid4().bytes * 4).decode(),
-        "nonce": base64.b64encode(uuid.uuid4().bytes[:12] * 2).decode(),
-        "K_user": base64.b64encode(uuid.uuid4().bytes * 3).decode(),
-        "K_enclave": base64.b64encode(uuid.uuid4().bytes * 3).decode(),
-        "visibility": "shared",
-        "owner_user_id": USER_ID,
-    }
+    seed_id_env = _seed_envelope(USER_ID)
     _orig_post(f"{BASE_URL}/v1/identity/init",
-               json={"envelope": seed_id_env, "days_with_user": 1},
+               json={
+                   "envelope": seed_id_env,
+                   "days_with_user": 0,
+                   "relationship_anchor_evidence": "test_api seeded earliest memory at current timestamp",
+               },
                headers=AUTH_HEADERS, timeout=5)
+    _seed_live_connection_state()
+
+
+def _seed_live_connection_state():
+    """Simulate the standard resident consumer acceptance path for legacy API tests."""
+    if not USER_ID:
+        return
+
+    since = time.time()
+    poll_rt = {}
+
+    def poll_and_reply_verify():
+        try:
+            r = _orig_get(
+                f"{BASE_URL}/v1/chat/poll?since={since}&timeout=10",
+                headers=_raw_headers(CONSUMER_HEADERS),
+                timeout=15,
+            )
+            poll_rt["poll_status"] = r.status_code
+            if r.status_code != 200:
+                poll_rt["err"] = r.text[:120]
+                return
+            if not r.json().get("messages", []):
+                poll_rt["err"] = "no verify ping message"
+                return
+            verify_env = _seed_envelope(USER_ID, visibility="local_only", with_k_enclave=False)
+            rr = _orig_post(
+                f"{BASE_URL}/v1/chat/response",
+                json={"envelope": verify_env},
+                headers=_raw_headers(CONSUMER_HEADERS),
+                timeout=5,
+            )
+            poll_rt["reply_status"] = rr.status_code
+        except Exception as e:
+            poll_rt["err"] = str(e)
+
+    t = threading.Thread(target=poll_and_reply_verify, daemon=True)
+    t.start()
+    time.sleep(0.2)
+    _orig_post(
+        f"{BASE_URL}/v1/chat/verify_loop",
+        json={"timeout_sec": 10},
+        headers=AUTH_HEADERS,
+        timeout=15,
+    )
+    t.join(timeout=12)
 
 
 _seed_bootstrap_state()
@@ -456,7 +527,11 @@ check("plaintext /v1/identity/init → 400 or 409",
 # at init — it sets the server-side relationship anchor.
 env_id = make_envelope(USER_ID)
 r = requests.post(f"{BASE_URL}/v1/identity/init",
-                  json={"envelope": env_id, "days_with_user": 1}, timeout=5)
+                  json={
+                      "envelope": env_id,
+                      "days_with_user": 0,
+                      "relationship_anchor_evidence": "test_api identity init evidence",
+                  }, timeout=5)
 check("v1 envelope /v1/identity/init → 201 or 409",
       r.status_code in (201, 409), f"got {r.status_code}: {r.text[:120]}")
 
