@@ -2140,6 +2140,91 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     def esc(value) -> str:
         return html.escape(str(value if value is not None else ""))
 
+    debug_labels = {
+        "time": "时间",
+        "ts": "时间戳",
+        "model": "模型",
+        "id": "判定 ID",
+        "intent": "意图",
+        "abstention": "不触发原因",
+        "reason": "判定理由",
+        "context_hint": "上下文提示",
+        "frames": "屏幕帧",
+        "frames sent": "已发送帧",
+        "connection": "关联依据",
+        "gate_input": "Gate 输入",
+        "payload": "事件数据",
+        "consumer": "消费服务",
+        "decision": "Gate 判定",
+        "job": "任务",
+        "preview": "消息预览",
+    }
+
+    debug_value_labels = {
+        "TRUE": "触发",
+        "FALSE": "不触发",
+        "true": "触发",
+        "false": "不触发",
+        "pending": "等待处理",
+        "claimed": "处理中",
+        "completed": "已完成",
+        "delivered": "已送达",
+        "chat_written": "已写入聊天",
+        "logged_only": "仅记录",
+        "skipped": "已跳过",
+        "failed": "失败",
+        "error": "错误",
+        "unreviewed": "未标注",
+        "correct_true": "正确触发",
+        "correct_false": "正确不触发",
+        "missed_opportunity": "漏掉机会",
+        "spam": "打扰/垃圾",
+        "weak_connection": "关联太弱",
+        "repeated": "重复触发",
+        "privacy_bad": "隐私不合适",
+        "great_companion_moment": "很好的陪伴时机",
+        "blocked_before_model": "模型前拦截",
+        "reviewable_false": "可复查的不触发",
+        "manual_proactive_test": "手动主动触发测试",
+        "research_pause": "研究停顿",
+        "proactive_screen_context": "屏幕上下文",
+        "manual_hint": "手动提示",
+        "no_recent_frames": "最近没有屏幕帧",
+        "no_recent_frames_unit_test": "最近没有屏幕帧（测试）",
+        "recent_proactive_fire": "10 分钟内已经主动触发过",
+        "proactive_disabled": "主动触发已关闭",
+        "dnd_enabled": "勿扰模式开启",
+        "frame_decrypt_unavailable": "屏幕帧无法解密",
+        "memory_context_unavailable": "记忆/身份上下文不可用",
+        "model_not_configured": "Gate 模型未配置",
+        "model_false": "模型判断不触发",
+        "llm_false": "模型判断不触发",
+        "llm_true": "模型判断触发",
+        "llm_non_object": "模型返回不是 JSON 对象",
+        "llm_missing_context_hint": "模型缺少上下文提示",
+        "llm_missing_concrete_connection": "模型缺少具体关联",
+        "llm_unrecognized_connection": "模型给出的关联无法验证",
+        "invalid_gate_response": "Gate 返回无效",
+        "has_connection": "存在具体关联",
+        "model_detected_helpful_moment": "模型发现可帮助时机",
+        "model_detected_memory_connection": "模型发现记忆关联",
+        "agent_call_failed": "调用用户 Agent 失败",
+    }
+
+    def tr_label(value) -> str:
+        return debug_labels.get(str(value or ""), str(value or ""))
+
+    def tr_value(value) -> str:
+        raw = str(value if value is not None else "")
+        return debug_value_labels.get(raw, raw)
+
+    def value_html(value) -> str:
+        raw = str(value if value is not None else "")
+        translated = tr_value(raw)
+        if translated != raw:
+            return f"<span title='{esc(raw)}'>{esc(translated)}</span>"
+        return esc(raw)
+
     api_key = (request.args.get("key") or "").strip()
     key_qs = f"?key={quote(api_key)}" if api_key else ""
     settings = snapshot.get("settings") or {}
@@ -2175,7 +2260,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             label = esc(fid[:10])
             links.append(
                 f"<a class='mono' href='/v1/screen/frames/{safe}/image{key_qs}' target='_blank'>{label}</a>"
-                f"<a class='mini' href='/v1/screen/frames/{safe}/decrypt{key_qs}{'&' if key_qs else '?'}include_image=false' target='_blank'>json</a>"
+                f"<a class='mini' href='/v1/screen/frames/{safe}/decrypt{key_qs}{'&' if key_qs else '?'}include_image=false' target='_blank'>解密 JSON</a>"
             )
         return " ".join(links)
 
@@ -2213,9 +2298,9 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         except Exception:
             pretty = str(payload or "")
         if not pretty.strip() or pretty.strip() in ("{}", "null", "[]"):
-            return f"<span class='muted mini'>{esc(label)}: ∅</span>"
+            return f"<span class='muted mini'>{esc(tr_label(label))}: ∅</span>"
         return (
-            f"<details class='inline-json'><summary>{esc(label)}</summary>"
+            f"<details class='inline-json'><summary>{esc(tr_label(label))}</summary>"
             f"<pre class='mono'>{esc(pretty)}</pre></details>"
         )
 
@@ -2226,7 +2311,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     # (connection, gate_input) collapse behind <details>. Same data, same
     # density, no horizontal scroll.
     def decision_card(d) -> str:
-        verdict = "TRUE" if d.get("should_reach_out") else "FALSE"
+        verdict = "触发" if d.get("should_reach_out") else "不触发"
         verdict_cls = "ok" if d.get("should_reach_out") else "muted"
         gate_input = _gate_input_dict(d.get("gate_input"))
         connection = d.get("connection") or {}
@@ -2240,42 +2325,42 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         reason = d.get("reason") or ""
 
         meta_bits = [
-            f"<span class='meta-bit'><span class='label'>time</span> {esc(fmt_time(d.get('ts')))}</span>",
-            f"<span class='meta-bit mono'><span class='label'>ts</span> {esc(fmt_epoch(d.get('ts')))}</span>",
-            f"<span class='meta-bit mono'><span class='label'>model</span> {esc(d.get('gate_model'))}</span>",
-            f"<span class='meta-bit'><span class='label'>id</span> {short_id(decision_id)}</span>",
+            f"<span class='meta-bit'><span class='label'>{esc(tr_label('time'))}</span> {esc(fmt_time(d.get('ts')))}</span>",
+            f"<span class='meta-bit mono'><span class='label'>{esc(tr_label('ts'))}</span> {esc(fmt_epoch(d.get('ts')))}</span>",
+            f"<span class='meta-bit mono'><span class='label'>{esc(tr_label('model'))}</span> {esc(d.get('gate_model'))}</span>",
+            f"<span class='meta-bit'><span class='label'>{esc(tr_label('id'))}</span> {short_id(decision_id)}</span>",
         ]
         if intent:
-            meta_bits.append(f"<span class='meta-bit'><span class='label'>intent</span> {esc(intent)}</span>")
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('intent'))}</span> {value_html(intent)}</span>")
         if abstention:
-            meta_bits.append(f"<span class='meta-bit'><span class='label'>abstention</span> {esc(abstention)}</span>")
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('abstention'))}</span> {value_html(abstention)}</span>")
 
         body_blocks = []
         if reason:
-            body_blocks.append(f"<div class='block'><span class='block-label'>reason</span><div class='block-text'>{esc(reason)}</div></div>")
+            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('reason'))}</span><div class='block-text'>{value_html(reason)}</div></div>")
         if context_hint:
-            body_blocks.append(f"<div class='block'><span class='block-label'>context_hint</span><div class='block-text'>{esc(context_hint)}</div></div>")
+            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('context_hint'))}</span><div class='block-text'>{esc(context_hint)}</div></div>")
         if frame_links_html:
-            body_blocks.append(f"<div class='block'><span class='block-label'>frames</span><div class='block-text'>{frame_links_html}</div></div>")
+            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('frames'))}</span><div class='block-text'>{frame_links_html}</div></div>")
         body_blocks.append(f"<div class='block'>{fold_json('connection', connection)}</div>")
         body_blocks.append(f"<div class='block'>{fold_json('gate_input', gate_input)}</div>")
 
         review_html = (
             f"<div class='review'>"
-            f"<div class='mini'>last review: <span class='{ 'ok' if review.get('label') == 'correct_true' else '' }'>{esc(review.get('label') or 'unreviewed')}</span></div>"
+            f"<div class='mini'>最近标注: <span class='{ 'ok' if review.get('label') == 'correct_true' else '' }'>{value_html(review.get('label') or 'unreviewed')}</span></div>"
             f"<form method='post' action='{review_action}'>"
             "<select name='label'>"
-            "<option value='correct_true'>correct true</option>"
-            "<option value='correct_false'>correct false</option>"
-            "<option value='missed_opportunity'>missed opportunity</option>"
-            "<option value='spam'>spam</option>"
-            "<option value='weak_connection'>weak connection</option>"
-            "<option value='repeated'>repeated</option>"
-            "<option value='privacy_bad'>privacy bad</option>"
-            "<option value='great_companion_moment'>great companion moment</option>"
+            "<option value='correct_true'>正确触发</option>"
+            "<option value='correct_false'>正确不触发</option>"
+            "<option value='missed_opportunity'>漏掉机会</option>"
+            "<option value='spam'>打扰/垃圾</option>"
+            "<option value='weak_connection'>关联太弱</option>"
+            "<option value='repeated'>重复触发</option>"
+            "<option value='privacy_bad'>隐私不合适</option>"
+            "<option value='great_companion_moment'>很好的陪伴时机</option>"
             "</select>"
-            "<input name='notes' placeholder='notes' maxlength='300'>"
-            "<button type='submit'>save</button>"
+            "<input name='notes' placeholder='标注备注' maxlength='300'>"
+            "<button type='submit'>保存</button>"
             "</form>"
             "</div>"
         )
@@ -2300,8 +2385,8 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     if no_frame_decisions:
         hidden_gate_details = (
             "<details class='debug-details'>"
-            f"<summary>Show hidden no-frame Gate ticks ({len(no_frame_decisions)})</summary>"
-            + decision_section(no_frame_decisions, "No hidden no-frame Gate ticks.")
+            f"<summary>显示隐藏的无屏幕帧 Gate 空 tick（{len(no_frame_decisions)}）</summary>"
+            + decision_section(no_frame_decisions, "没有隐藏的无屏幕帧 Gate 空 tick。")
             + "</details>"
         )
 
@@ -2312,33 +2397,33 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         status = j.get("derived_status") or j.get("status", "pending")
         intent = j.get("intent_label") or ""
         meta_bits = [
-            f"<span class='meta-bit'><span class='label'>time</span> {esc(fmt_time(j.get('ts')))}</span>",
-            f"<span class='meta-bit mono'><span class='label'>ts</span> {esc(fmt_epoch(j.get('ts')))}</span>",
-            f"<span class='meta-bit'><span class='label'>job</span> {short_id(j.get('job_id'))}</span>",
-            f"<span class='meta-bit'><span class='label'>decision</span> {short_id(j.get('gate_decision_id'))}</span>",
+            f"<span class='meta-bit'><span class='label'>{esc(tr_label('time'))}</span> {esc(fmt_time(j.get('ts')))}</span>",
+            f"<span class='meta-bit mono'><span class='label'>{esc(tr_label('ts'))}</span> {esc(fmt_epoch(j.get('ts')))}</span>",
+            f"<span class='meta-bit'><span class='label'>{esc(tr_label('job'))}</span> {short_id(j.get('job_id'))}</span>",
+            f"<span class='meta-bit'><span class='label'>{esc(tr_label('decision'))}</span> {short_id(j.get('gate_decision_id'))}</span>",
         ]
         if j.get("consumer_id"):
-            meta_bits.append(f"<span class='meta-bit'><span class='label'>consumer</span> {short_id(j.get('consumer_id'))}</span>")
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('consumer'))}</span> {short_id(j.get('consumer_id'))}</span>")
         if intent:
-            meta_bits.append(f"<span class='meta-bit'><span class='label'>intent</span> {esc(intent)}</span>")
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('intent'))}</span> {value_html(intent)}</span>")
 
         body_blocks = []
         if j.get("context_hint"):
-            body_blocks.append(f"<div class='block'><span class='block-label'>context_hint</span><div class='block-text'>{esc(j.get('context_hint'))}</div></div>")
+            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('context_hint'))}</span><div class='block-text'>{esc(j.get('context_hint'))}</div></div>")
         if j.get("status_reason"):
-            body_blocks.append(f"<div class='block'><span class='block-label'>reason</span><div class='block-text'>{esc(j.get('status_reason'))}</div></div>")
+            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('reason'))}</span><div class='block-text'>{value_html(j.get('status_reason'))}</div></div>")
         if j.get("preview"):
-            body_blocks.append(f"<div class='block'><span class='block-label'>preview</span><div class='block-text'>{esc(j.get('preview'))}</div></div>")
+            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('preview'))}</span><div class='block-text'>{esc(j.get('preview'))}</div></div>")
         frames_sent = frame_links(j.get("frame_ids"))
         if frames_sent:
-            body_blocks.append(f"<div class='block'><span class='block-label'>frames sent</span><div class='block-text'>{frames_sent}</div></div>")
+            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('frames sent'))}</span><div class='block-text'>{frames_sent}</div></div>")
 
-        status_pill = f"<span class='verdict {status_class(status)}'>{esc(status)}</span>"
+        status_pill = f"<span class='verdict {status_class(status)}'>{value_html(status)}</span>"
         chips = []
         if j.get("alert_status"):
-            chips.append(f"<span class='chip {status_class(j.get('alert_status'))}'>alert: {esc(j.get('alert_status'))}</span>")
+            chips.append(f"<span class='chip {status_class(j.get('alert_status'))}'>通知: {value_html(j.get('alert_status'))}</span>")
         if j.get("live_activity_status"):
-            chips.append(f"<span class='chip {status_class(j.get('live_activity_status'))}'>live activity: {esc(j.get('live_activity_status'))}</span>")
+            chips.append(f"<span class='chip {status_class(j.get('live_activity_status'))}'>Live Activity: {value_html(j.get('live_activity_status'))}</span>")
 
         chips_html = f"<div class='chip-row'>{''.join(chips)}</div>" if chips else ""
 
@@ -2352,7 +2437,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
     def job_section() -> str:
         if not jobs:
-            return "<div class='empty'>No hidden proactive jobs yet.</div>"
+            return "<div class='empty'>还没有隐藏主动任务。</div>"
         return "<div class='card-list'>" + "".join(job_card(j) for j in jobs[:30]) + "</div>"
 
     # The remaining three sections (chat writes / frames / events) have
@@ -2361,17 +2446,17 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     # rare overflow case. No card conversion needed.
     def message_rows() -> str:
         if not messages:
-            return "<tr><td colspan='8'>No proactive chat writes yet.</td></tr>"
+            return "<tr><td colspan='8'>还没有主动消息写入。</td></tr>"
         rows = []
         for m in messages[:25]:
-            preview = m.get("alert_preview") or m.get("push_body_preview") or "(encrypted envelope; no plaintext preview recorded)"
+            preview = m.get("alert_preview") or m.get("push_body_preview") or "（加密 envelope；没有记录明文预览）"
             rows.append(
                 "<tr>"
                 f"<td>{esc(fmt_time(m.get('ts')))}<div class='mono mini'>{esc(fmt_epoch(m.get('ts')))}</div></td>"
                 f"<td>{esc(m.get('content_type'))}</td>"
                 f"<td class='wrap'>{esc(preview)}</td>"
-                f"<td class='{status_class(m.get('alert_status'))}'>{esc(m.get('alert_status'))}</td>"
-                f"<td class='{status_class(m.get('live_activity_status'))}'>{esc(m.get('live_activity_status'))}</td>"
+                f"<td class='{status_class(m.get('alert_status'))}'>{value_html(m.get('alert_status'))}</td>"
+                f"<td class='{status_class(m.get('live_activity_status'))}'>{value_html(m.get('live_activity_status'))}</td>"
                 f"<td>{short_id(m.get('gate_decision_id'))}</td>"
                 f"<td>{short_id(m.get('proactive_job_id'))}</td>"
                 f"<td>{short_id(m.get('id'))}</td>"
@@ -2381,7 +2466,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
     def frame_rows() -> str:
         if not frames:
-            return "<tr><td colspan='5'>No frames indexed.</td></tr>"
+            return "<tr><td colspan='5'>还没有索引到屏幕帧。</td></tr>"
         rows = []
         for f in frames[:25]:
             rows.append(
@@ -2397,7 +2482,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
     def event_rows() -> str:
         if not events:
-            return "<tr><td colspan='4'>No device events yet.</td></tr>"
+            return "<tr><td colspan='4'>还没有设备事件。</td></tr>"
         rows = []
         for e in events[:25]:
             rows.append(
@@ -2419,7 +2504,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
   <meta charset="utf-8">
   <meta http-equiv="refresh" content="5">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Feedling Proactive Debug</title>
+  <title>Feedling 主动触发调试台</title>
   <style>
     * {{ box-sizing: border-box; }}
     body {{
@@ -2635,28 +2720,28 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
   </style>
 </head>
 <body>
-  <h1>Feedling Proactive Debug</h1>
-  <div class="meta">user <span class="mono">{esc(snapshot.get('user_id'))}</span> · generated {esc(snapshot.get('generated_at'))} · times in {esc(dashboard_tz_name)} · auto-refresh 5s</div>
+  <h1>Feedling 主动触发调试台</h1>
+  <div class="meta">用户 <span class="mono">{esc(snapshot.get('user_id'))}</span> · 生成时间 {esc(snapshot.get('generated_at'))} · 页面时间按 {esc(dashboard_tz_name)} 显示 · 每 5 秒自动刷新</div>
   <div>
-    <span class="pill">decisions {esc(counts.get('decisions', 0))}</span>
-    <span class="pill">visible gate decisions {esc(visible_gate_count)}</span>
-    <span class="pill">hidden no-frame ticks {esc(hidden_no_frame_count)}</span>
-    <span class="pill">reviews {esc(counts.get('reviews', 0))}</span>
-    <span class="pill">jobs {esc(counts.get('jobs', 0))}</span>
-    <span class="pill">proactive writes {esc(counts.get('proactive_messages', 0))}</span>
-    <span class="pill">frames {esc(counts.get('recent_frames', 0))}</span>
-    <span class="pill">device events {esc(counts.get('device_events', 0))}</span>
+    <span class="pill">全部判定 {esc(counts.get('decisions', 0))}</span>
+    <span class="pill">主表判定 {esc(visible_gate_count)}</span>
+    <span class="pill">隐藏空 tick {esc(hidden_no_frame_count)}</span>
+    <span class="pill">人工标注 {esc(counts.get('reviews', 0))}</span>
+    <span class="pill">隐藏任务 {esc(counts.get('jobs', 0))}</span>
+    <span class="pill">主动写入 {esc(counts.get('proactive_messages', 0))}</span>
+    <span class="pill">屏幕帧 {esc(counts.get('recent_frames', 0))}</span>
+    <span class="pill">设备事件 {esc(counts.get('device_events', 0))}</span>
   </div>
 
-  <h2>Gate Decisions</h2>
-  <div class="hint">Main view shows Gate decisions with frame/OCR/image context. Empty scheduled ticks are folded below.</div>
-  {decision_section(frame_decisions, f'No frame-backed Gate decisions yet. Hidden empty ticks: {hidden_no_frame_count}.')}
+  <h2>Gate 判定</h2>
+  <div class="hint">主表只显示带屏幕帧、OCR 或图片上下文的 Gate 判定。没有屏幕帧的定时空 tick 会折叠在下方。</div>
+  {decision_section(frame_decisions, f'还没有带屏幕上下文的 Gate 判定。隐藏空 tick：{hidden_no_frame_count}。')}
   {hidden_gate_details}
 
-  <h2>Hidden Jobs</h2>
+  <h2>隐藏任务</h2>
   {job_section()}
 
-  <h2>Proactive Chat Writes</h2>
+  <h2>主动消息写入</h2>
   <div class="table-scroll">
     <table class="t-messages">
       <colgroup>
@@ -2664,29 +2749,29 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         <col class="c-status"><col class="c-status">
         <col class="c-id"><col class="c-id"><col class="c-id">
       </colgroup>
-      <thead><tr><th>time</th><th>type</th><th>preview</th><th>alert</th><th>live activity</th><th>decision</th><th>job</th><th>message</th></tr></thead>
+      <thead><tr><th>时间</th><th>类型</th><th>预览</th><th>系统通知</th><th>Live Activity</th><th>判定</th><th>任务</th><th>消息</th></tr></thead>
       <tbody>{message_rows()}</tbody>
     </table>
   </div>
 
-  <h2>Recent Screen Frames</h2>
+  <h2>最近屏幕帧</h2>
   <div class="table-scroll">
     <table class="t-frames">
       <colgroup>
         <col class="c-time"><col class="c-app"><col class="c-num"><col class="c-num"><col class="c-link">
       </colgroup>
-      <thead><tr><th>time</th><th>app</th><th>ocr len</th><th>encrypted</th><th>frame</th></tr></thead>
+      <thead><tr><th>时间</th><th>App</th><th>OCR 长度</th><th>已加密</th><th>屏幕帧</th></tr></thead>
       <tbody>{frame_rows()}</tbody>
     </table>
   </div>
 
-  <h2>Device Events</h2>
+  <h2>设备事件</h2>
   <div class="table-scroll">
     <table class="t-events">
       <colgroup>
         <col class="c-time"><col class="c-source"><col class="c-type"><col class="c-payload">
       </colgroup>
-      <thead><tr><th>time</th><th>source</th><th>type</th><th>payload</th></tr></thead>
+      <thead><tr><th>时间</th><th>来源</th><th>类型</th><th>事件数据</th></tr></thead>
       <tbody>{event_rows()}</tbody>
     </table>
   </div>

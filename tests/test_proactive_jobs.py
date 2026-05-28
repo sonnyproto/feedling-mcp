@@ -156,9 +156,9 @@ def test_proactive_debug_folds_no_frame_gate_ticks(tmp_path, monkeypatch):
     with appmod.app.test_request_context("/debug/proactive?key=test"):
         page = appmod._render_proactive_dashboard(snapshot)
 
-    assert "visible gate decisions 1" in page
-    assert "hidden no-frame ticks 1" in page
-    assert "Show hidden no-frame Gate ticks (1)" in page
+    assert "主表判定 1" in page
+    assert "隐藏空 tick 1" in page
+    assert "显示隐藏的无屏幕帧 Gate 空 tick（1）" in page
     assert page.find("frame_backed_false_unit_test") < page.find("no_recent_frames_unit_test")
 
 
@@ -201,12 +201,12 @@ def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
 
     page = client.get("/debug/proactive", headers=headers)
     assert page.status_code == 200
-    assert b"Feedling Proactive Debug" in page.data
+    assert "Feedling 主动触发调试台".encode() in page.data
     assert body["job"]["job_id"].encode() in page.data
     # Section header is always present once the jobs list renders; the
     # previous "frames sent" probe relied on a table column header that
     # the new card layout only emits when a job actually has frames.
-    assert b"Hidden Jobs" in page.data
+    assert "隐藏任务".encode() in page.data
 
 
 def test_auto_proactive_gate_uses_decrypted_frame_ocr(tmp_path, monkeypatch):
