@@ -179,7 +179,7 @@ PROACTIVE_GATE_SCENE_HASH_THRESHOLD = int(os.environ.get("FEEDLING_PROACTIVE_GAT
 PROACTIVE_GATE_INCLUDE_IMAGES = os.environ.get("FEEDLING_PROACTIVE_GATE_INCLUDE_IMAGES", "true").lower() not in {
     "0", "false", "no", "off",
 }
-PROACTIVE_DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "America/New_York").strip() or "UTC"
+PROACTIVE_DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/Shanghai").strip() or "UTC"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 PROACTIVE_DEBUG_TRANSLATION_MODEL = os.environ.get(
     "FEEDLING_PROACTIVE_DEBUG_TRANSLATION_MODEL",
@@ -201,6 +201,7 @@ def _normalize_token_entry(entry: dict) -> dict:
     normalized.setdefault("status", "active")
     normalized.setdefault("last_error", "")
     normalized.setdefault("last_success_at", "")
+    normalized.setdefault("apns_env", normalized.get("environment", ""))
     normalized.setdefault("updated_at", normalized.get("registered_at", datetime.now().isoformat()))
     return normalized
 
@@ -612,6 +613,7 @@ class UserStore:
         default = {
             "enabled": True,
             "dnd": False,
+            "timezone": PROACTIVE_DEFAULT_TIMEZONE,
             "permission_states": {},
             "updated_at": datetime.now().isoformat(),
         }
@@ -629,13 +631,20 @@ class UserStore:
         return default
 
     def save_proactive_settings(self, patch: dict) -> dict:
-        allowed = {"enabled", "dnd", "permission_states"}
+        allowed = {"enabled", "dnd", "timezone", "permission_states"}
         cur = self.load_proactive_settings()
         for key, value in (patch or {}).items():
             if key not in allowed:
                 continue
             if key in {"enabled", "dnd"}:
                 cur[key] = bool(value)
+            elif key == "timezone":
+                tz_name = str(value or "").strip()
+                try:
+                    ZoneInfo(tz_name)
+                except ZoneInfoNotFoundError:
+                    continue
+                cur[key] = tz_name
             elif key == "permission_states" and isinstance(value, dict):
                 states = dict(cur.get("permission_states") or {})
                 for pname, pstate in value.items():
@@ -925,6 +934,10 @@ def _is_push_to_start_token(entry: dict) -> bool:
     return entry.get("type") == "push_to_start"
 
 
+def _is_device_token(entry: dict) -> bool:
+    return entry.get("type") in ("device", "apns")
+
+
 def _entry_is_active(entry: dict) -> bool:
     return (entry.get("status") or "active") == "active"
 
@@ -949,7 +962,15 @@ def _select_token(store: UserStore, predicate, activity_id: str | None = None, a
     return candidates[0]
 
 
-def _update_token_lifecycle(store: UserStore, entry: dict, *, status: str | None = None, last_error: str | None = None, success: bool = False):
+def _update_token_lifecycle(
+    store: UserStore,
+    entry: dict,
+    *,
+    status: str | None = None,
+    last_error: str | None = None,
+    success: bool = False,
+    apns_env: str | None = None,
+):
     token = entry.get("token")
     token_type = entry.get("type")
     activity_id = entry.get("activity_id")
@@ -968,6 +989,8 @@ def _update_token_lifecycle(store: UserStore, entry: dict, *, status: str | None
             cur["last_success_at"] = now_iso
             cur["status"] = "active"
             cur["last_error"] = ""
+        if apns_env:
+            cur["apns_env"] = apns_env
         cur["updated_at"] = now_iso
         store.tokens[idx] = cur
         changed = True
@@ -981,8 +1004,8 @@ def _mark_expired_token(store: UserStore, entry: dict, reason: str):
     _update_token_lifecycle(store, entry, status="expired", last_error=reason)
 
 
-def _mark_active_token_success(store: UserStore, entry: dict):
-    _update_token_lifecycle(store, entry, success=True)
+def _mark_active_token_success(store: UserStore, entry: dict, apns_env: str | None = None):
+    _update_token_lifecycle(store, entry, success=True, apns_env=apns_env)
 
 
 # ---------------------------------------------------------------------------
@@ -2187,9 +2210,11 @@ def _translate_debug_texts_to_zh(texts: list[str]) -> dict[str, str]:
                     {
                         "role": "system",
                         "content": (
-                            "Translate debug-dashboard text from English to concise Simplified Chinese. "
+                            "Translate debug-dashboard prose from English to natural, concise Simplified Chinese "
+                            "for a product debugging UI. "
                             "Preserve IDs, model names, JSON keys, product names, and technical terms like Gate, "
-                            "context_hint, Live Activity, APNs, OCR. Return JSON only."
+                            "context_hint, Live Activity, APNs, OCR. Do not preserve generic words like companion, "
+                            "user, screen, response, or reason; translate them naturally. Return JSON only."
                         ),
                     },
                     {
@@ -2296,6 +2321,8 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         "research_pause": "研究停顿",
         "proactive_screen_context": "屏幕上下文",
         "manual_hint": "手动提示",
+        "already_responded": "已经回应过",
+        "shared_build_reflection": "共享构建反思",
         "no_recent_frames": "最近没有屏幕帧",
         "no_recent_frames_unit_test": "最近没有屏幕帧（测试）",
         "recent_proactive_fire": "10 分钟内已经主动触发过",
@@ -2417,6 +2444,10 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             return f"<span title='{esc(raw)}'>{esc(translation_map[raw])}</span>"
         return esc(raw)
 
+    def prose_or_value_html(value) -> str:
+        raw = str(value if value is not None else "")
+        return prose_html(raw) if tr_value(raw) == raw else value_html(raw)
+
     def short_id(value, head: int = 8) -> str:
         """Truncate long IDs for display; full value shown on hover via title attr."""
         s = str(value or "").strip()
@@ -2467,11 +2498,11 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         if intent:
             meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('intent'))}</span> {value_html(intent)}</span>")
         if abstention:
-            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('abstention'))}</span> {value_html(abstention)}</span>")
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('abstention'))}</span> {prose_or_value_html(abstention)}</span>")
 
         body_blocks = []
         if reason:
-            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('reason'))}</span><div class='block-text'>{prose_html(reason) if tr_value(reason) == reason else value_html(reason)}</div></div>")
+            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('reason'))}</span><div class='block-text'>{prose_or_value_html(reason)}</div></div>")
         if context_hint:
             body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('context_hint'))}</span><div class='block-text'>{prose_html(context_hint)}</div></div>")
         if frame_links_html:
@@ -2546,7 +2577,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('context_hint'))}</span><div class='block-text'>{prose_html(j.get('context_hint'))}</div></div>")
         if j.get("status_reason"):
             status_reason = j.get("status_reason")
-            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('reason'))}</span><div class='block-text'>{prose_html(status_reason) if tr_value(status_reason) == str(status_reason) else value_html(status_reason)}</div></div>")
+            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('reason'))}</span><div class='block-text'>{prose_or_value_html(status_reason)}</div></div>")
         if j.get("preview"):
             body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('preview'))}</span><div class='block-text'>{prose_html(j.get('preview'))}</div></div>")
         frames_sent = frame_links(j.get("frame_ids"))
@@ -3104,12 +3135,40 @@ def _make_apns_jwt() -> str:
     )
 
 
-def _send_apns(device_token: str, payload: dict, push_type: str, topic: str) -> dict:
-    if not APNS_KEY:
-        print(f"[apns] no key — logged only → {device_token[:16]}… {payload}")
-        return {"status": "logged_only"}
-    host = "api.sandbox.push.apple.com" if APNS_SANDBOX else "api.push.apple.com"
+def _apns_env_name(sandbox: bool) -> str:
+    return "sandbox" if sandbox else "production"
+
+
+def _apns_host(sandbox: bool) -> str:
+    return "api.sandbox.push.apple.com" if sandbox else "api.push.apple.com"
+
+
+def _apns_reason_text(result: dict) -> str:
+    reason = str((result or {}).get("reason") or "")
+    try:
+        parsed = json.loads(reason)
+        if isinstance(parsed, dict) and parsed.get("reason"):
+            return str(parsed.get("reason"))
+    except Exception:
+        pass
+    return reason
+
+
+def _apns_is_bad_device_token(result: dict) -> bool:
+    return (result or {}).get("status") == "error" and "BadDeviceToken" in _apns_reason_text(result)
+
+
+def _apns_token_should_expire(result: dict) -> bool:
+    if (result or {}).get("status") != "error":
+        return False
+    reason = _apns_reason_text(result)
+    return any(marker in reason for marker in ("BadDeviceToken", "ExpiredToken", "Unregistered"))
+
+
+def _send_apns_once(device_token: str, payload: dict, push_type: str, topic: str, *, sandbox: bool) -> dict:
+    host = _apns_host(sandbox)
     url = f"https://{host}/3/device/{device_token}"
+    env_name = _apns_env_name(sandbox)
     headers = {
         "authorization": f"bearer {_make_apns_jwt()}",
         "apns-push-type": push_type,
@@ -3121,10 +3180,30 @@ def _send_apns(device_token: str, payload: dict, push_type: str, topic: str) -> 
         with httpx.Client(http2=True, timeout=10) as client:
             resp = client.post(url, json=payload, headers=headers)
         if resp.status_code == 200:
-            return {"status": "delivered"}
-        return {"status": "error", "code": resp.status_code, "reason": resp.text}
+            return {"status": "delivered", "apns_env": env_name}
+        return {"status": "error", "code": resp.status_code, "reason": resp.text, "apns_env": env_name}
     except Exception as e:
-        return {"status": "error", "reason": str(e)}
+        return {"status": "error", "reason": str(e), "apns_env": env_name}
+
+
+def _send_apns(device_token: str, payload: dict, push_type: str, topic: str) -> dict:
+    if not APNS_KEY:
+        print(f"[apns] no key — logged only → {device_token[:16]}… {payload}")
+        return {"status": "logged_only"}
+    primary_sandbox = APNS_SANDBOX
+    first = _send_apns_once(device_token, payload, push_type, topic, sandbox=primary_sandbox)
+    if first.get("status") == "delivered" or not _apns_is_bad_device_token(first):
+        return first
+
+    # TestFlight/App Store tokens are production tokens, while Xcode-run
+    # development builds use sandbox tokens. A mixed beta can legitimately
+    # present both, so retry the other APNs host before declaring the token bad.
+    second = _send_apns_once(device_token, payload, push_type, topic, sandbox=not primary_sandbox)
+    second["fallback_attempted"] = True
+    second["fallback_from"] = first.get("apns_env", _apns_env_name(primary_sandbox))
+    if second.get("status") != "delivered":
+        second["first_error"] = first
+    return second
 
 
 # ---------------------------------------------------------------------------
@@ -3746,13 +3825,12 @@ def push_live_activity_inner(store: UserStore, payload: dict):
 
     delivered = result.get("status") == "delivered"
     if delivered:
-        _mark_active_token_success(store, entry)
+        _mark_active_token_success(store, entry, apns_env=result.get("apns_env"))
         store.record_successful_push()
         store.record_live_activity_sent(message=body, top_app=top_app)
     else:
         reason_text = str(result.get("reason", ""))
-        error_code = result.get("code")
-        if error_code == 410 and ("ExpiredToken" in reason_text or "Unregistered" in reason_text):
+        if _apns_token_should_expire(result):
             _mark_expired_token(store, entry, reason_text)
             print(f"[live-activity:{store.user_id}] token expired, marked inactive: activity_id={entry.get('activity_id')}")
 
@@ -3802,11 +3880,10 @@ def push_live_start():
     topic = f"{BUNDLE_ID}.push-type.liveactivity"
     result = _send_apns(entry["token"], apns_payload, push_type="liveactivity", topic=topic)
     if result.get("status") == "delivered":
-        _mark_active_token_success(store, entry)
+        _mark_active_token_success(store, entry, apns_env=result.get("apns_env"))
     else:
         reason_text = str(result.get("reason", ""))
-        error_code = result.get("code")
-        if error_code == 410 and ("ExpiredToken" in reason_text or "Unregistered" in reason_text):
+        if _apns_token_should_expire(result):
             _mark_expired_token(store, entry, reason_text)
 
     print(f"[live-start:{store.user_id}] {result}")
@@ -3831,12 +3908,10 @@ def _send_chat_alert(store: UserStore, alert_body: str, alert_title: str = ""):
     if not alert_body:
         return {"status": "skipped", "reason": "empty_body"}
     # Match iOS-registered token type: LiveActivityManager registers
-    # the standard APNs push token as type="device".
-    device_token = next(
-        (t["token"] for t in store.tokens if t.get("type") == "device" and t.get("token")),
-        None,
-    )
-    if not device_token:
+    # the standard APNs push token as type="device". Older dev builds used
+    # type="apns", so accept both but choose the newest active token.
+    entry = _select_token(store, _is_device_token, active_only=True)
+    if not entry:
         print(f"[chat-alert:{store.user_id}] no device token — skip push")
         return {"status": "skipped", "reason": "no_device_token"}
 
@@ -3853,7 +3928,11 @@ def _send_chat_alert(store: UserStore, alert_body: str, alert_title: str = ""):
         "feedling": {"type": "chat_reply"},
     }
     try:
-        result = _send_apns(device_token, apns_payload, push_type="alert", topic=BUNDLE_ID)
+        result = _send_apns(entry["token"], apns_payload, push_type="alert", topic=BUNDLE_ID)
+        if result.get("status") == "delivered":
+            _mark_active_token_success(store, entry, apns_env=result.get("apns_env"))
+        elif _apns_token_should_expire(result):
+            _mark_expired_token(store, entry, str(result.get("reason", "")))
         print(f"[chat-alert:{store.user_id}] {result.get('status')}")
         return result
     except Exception as e:
@@ -3865,8 +3944,8 @@ def _send_chat_alert(store: UserStore, alert_body: str, alert_title: str = ""):
 def push_notification():
     store = require_user()
     payload = request.get_json(silent=True) or {}
-    device_token = next((t["token"] for t in store.tokens if t.get("type") == "apns"), None)
-    if not device_token:
+    entry = _select_token(store, _is_device_token, active_only=True)
+    if not entry:
         print(f"[notification:{store.user_id}] no device token — logged: {payload}")
         return jsonify({"status": "logged", "message_id": f"msg_{uuid.uuid4().hex[:8]}"})
 
@@ -3876,7 +3955,11 @@ def push_notification():
             "sound": "default",
         }
     }
-    result = _send_apns(device_token, apns_payload, push_type="alert", topic=BUNDLE_ID)
+    result = _send_apns(entry["token"], apns_payload, push_type="alert", topic=BUNDLE_ID)
+    if result.get("status") == "delivered":
+        _mark_active_token_success(store, entry, apns_env=result.get("apns_env"))
+    elif _apns_token_should_expire(result):
+        _mark_expired_token(store, entry, str(result.get("reason", "")))
     print(f"[notification:{store.user_id}] {result}")
     return jsonify({"status": result["status"], "message_id": f"msg_{uuid.uuid4().hex[:8]}"})
 
@@ -3901,6 +3984,9 @@ def register_token():
     }
     if activity_id:
         entry["activity_id"] = activity_id
+    apns_env = str(payload.get("apns_env") or payload.get("environment") or "").strip().lower()
+    if apns_env in {"sandbox", "production"}:
+        entry["apns_env"] = apns_env
 
     store.tokens[:] = [
         _normalize_token_entry(t)

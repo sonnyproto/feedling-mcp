@@ -174,6 +174,7 @@ def test_proactive_debug_translates_prose_only_in_zh_view(tmp_path, monkeypatch)
     store = appmod.UserStore("usr_test_proactive_debug_translate")
     reason = "The screen has a concrete connection to the user's memory garden."
     context_hint = "The user is comparing a dense note and may want one gentle nudge."
+    abstention = "The companion has already successfully engaged with the user's current context and provided a relevant response."
     decision = {
         "decision_id": "gd_translate",
         "ts": 1002,
@@ -192,7 +193,26 @@ def test_proactive_debug_translates_prose_only_in_zh_view(tmp_path, monkeypatch)
         },
         "context_hint": context_hint,
     }
+    false_decision = {
+        "decision_id": "gd_translate_false",
+        "ts": 1003,
+        "gate_model": "openrouter:google/gemini-3.1-flash-lite",
+        "should_reach_out": False,
+        "reason": "already_responded",
+        "abstention_reason": abstention,
+        "intent_label": "already_responded",
+        "connection": {},
+        "frame_ids": ["frame_translate_2"],
+        "gate_input": {
+            "ocr_chars": 120,
+            "sampled_frame_count": 1,
+            "decrypt_ok": True,
+            "image_count": 1,
+        },
+        "context_hint": "",
+    }
     store.append_gate_decision(decision)
+    store.append_gate_decision(false_decision)
     snapshot = appmod._proactive_debug_snapshot(store)
 
     monkeypatch.setattr(
@@ -201,6 +221,7 @@ def test_proactive_debug_translates_prose_only_in_zh_view(tmp_path, monkeypatch)
         lambda texts: {
             reason: "屏幕内容和用户的记忆花园有明确关联。",
             context_hint: "用户正在比较一段密集笔记，可能适合轻轻提醒一句。",
+            abstention: "陪伴者已经结合用户当前上下文给过合适回复。",
         },
     )
 
@@ -210,10 +231,43 @@ def test_proactive_debug_translates_prose_only_in_zh_view(tmp_path, monkeypatch)
         page_en = appmod._render_proactive_dashboard(snapshot)
 
     assert "屏幕内容和用户的记忆花园有明确关联。" in page_zh
+    assert "陪伴者已经结合用户当前上下文给过合适回复。" in page_zh
+    assert "已经回应过" in page_zh
     assert "title='The screen has a concrete connection to the user&#x27;s memory garden.'" in page_zh
+    assert "title='The companion has already successfully engaged with the user&#x27;s current context" in page_zh
     assert "The screen has a concrete connection" in page_en
     assert "屏幕内容和用户的记忆花园有明确关联。" not in page_en
+    assert "陪伴者已经结合用户当前上下文给过合适回复。" not in page_en
     assert snapshot["decisions"][0]["reason"] == reason
+
+
+def test_proactive_settings_persists_timezone(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_proactive_timezone_key"
+    user_id = "usr_endpoint_proactive_timezone"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    resp = client.post(
+        "/v1/proactive/settings",
+        headers=headers,
+        json={"timezone": "Asia/Tokyo"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["timezone"] == "Asia/Tokyo"
+
+    bad = client.post(
+        "/v1/proactive/settings",
+        headers=headers,
+        json={"timezone": "Not/AZone"},
+    )
+    assert bad.status_code == 200
+    assert bad.get_json()["timezone"] == "Asia/Tokyo"
 
 
 def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
@@ -693,3 +747,87 @@ def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeyp
     assert msg["alert_preview"] == "我看到你停在这里了。"
     assert msg["alert_status"] == "delivered"
     assert msg["live_activity_status"] == "delivered"
+
+
+def test_apns_retries_production_when_sandbox_rejects_testflight_token(monkeypatch):
+    monkeypatch.setattr(appmod, "APNS_KEY", "test-key")
+    monkeypatch.setattr(appmod, "APNS_SANDBOX", True)
+    monkeypatch.setattr(appmod, "_make_apns_jwt", lambda: "jwt")
+
+    calls = []
+
+    class _Resp:
+        def __init__(self, status_code, text=""):
+            self.status_code = status_code
+            self.text = text
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, url, json, headers):
+            calls.append(url)
+            if "sandbox" in url:
+                return _Resp(400, '{"reason":"BadDeviceToken"}')
+            return _Resp(200)
+
+    monkeypatch.setattr(appmod.httpx, "Client", _Client)
+
+    result = appmod._send_apns(
+        "testflight-token",
+        {"aps": {"alert": {"body": "hi"}}},
+        push_type="alert",
+        topic="com.feedling.mcp",
+    )
+
+    assert [("sandbox" in url) for url in calls] == [True, False]
+    assert result["status"] == "delivered"
+    assert result["apns_env"] == "production"
+    assert result["fallback_attempted"] is True
+    assert result["fallback_from"] == "sandbox"
+
+
+def test_chat_alert_uses_latest_active_device_token_and_marks_bad_token_expired(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_bad_device_token_key"
+    user_id = "usr_bad_device_token"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.tokens = [
+        {
+            "type": "device",
+            "token": "old-device-token",
+            "status": "active",
+            "registered_at": "2026-05-24T00:00:00",
+        },
+        {
+            "type": "device",
+            "token": "new-device-token",
+            "status": "active",
+            "registered_at": "2026-05-29T00:00:00",
+        },
+    ]
+
+    seen = []
+
+    def _fake_send_apns(device_token, payload, push_type, topic):
+        seen.append(device_token)
+        return {"status": "error", "code": 400, "reason": '{"reason":"BadDeviceToken"}', "apns_env": "production"}
+
+    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+
+    result = appmod._send_chat_alert(store, "hello", alert_title="Dora")
+
+    assert result["status"] == "error"
+    assert seen == ["new-device-token"]
+    latest = [t for t in store.tokens if t["token"] == "new-device-token"][0]
+    assert latest["status"] == "expired"
+    assert "BadDeviceToken" in latest["last_error"]
