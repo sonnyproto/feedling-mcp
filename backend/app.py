@@ -15,7 +15,7 @@ import uuid
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -181,6 +181,15 @@ PROACTIVE_GATE_INCLUDE_IMAGES = os.environ.get("FEEDLING_PROACTIVE_GATE_INCLUDE_
 }
 PROACTIVE_DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "America/New_York").strip() or "UTC"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+PROACTIVE_DEBUG_TRANSLATION_MODEL = os.environ.get(
+    "FEEDLING_PROACTIVE_DEBUG_TRANSLATION_MODEL",
+    PROACTIVE_GATE_MODEL,
+).strip()
+PROACTIVE_DEBUG_TRANSLATION_TIMEOUT_SEC = float(
+    os.environ.get("FEEDLING_PROACTIVE_DEBUG_TRANSLATION_TIMEOUT_SEC", "10")
+)
+_debug_translation_cache: dict[str, str] = {}
+_debug_translation_lock = threading.Lock()
 
 
 # Used from inside UserStore._load_tokens on boot; must be defined before
@@ -2136,11 +2145,109 @@ def _gate_decision_has_frame_context(decision: dict) -> bool:
     return bool(gate_input.get("decrypt_ok"))
 
 
+def _debug_translation_candidate(text: str) -> bool:
+    raw = (text or "").strip()
+    if len(raw) < 8:
+        return False
+    # Machine enum values are handled by the fixed label dictionary. The
+    # model translator is only for prose fields such as reason/context_hint.
+    if re.fullmatch(r"[a-zA-Z0-9_:\-./ ]+", raw) and len(raw.split()) <= 4:
+        return False
+    return bool(re.search(r"[A-Za-z]", raw))
+
+
+def _translate_debug_texts_to_zh(texts: list[str]) -> dict[str, str]:
+    """Best-effort display-only translation for the debug dashboard.
+
+    This never mutates Gate/job records. Raw English remains in JSON logs and
+    folded payloads; translated strings are only used for HTML rendering when
+    `lang=zh`.
+    """
+    unique: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        raw = str(text or "").strip()
+        if not raw or raw in seen or not _debug_translation_candidate(raw):
+            continue
+        seen.add(raw)
+        unique.append(raw[:1800])
+
+    if not unique:
+        return {}
+
+    with _debug_translation_lock:
+        cached = {text: _debug_translation_cache[text] for text in unique if text in _debug_translation_cache}
+    missing = [text for text in unique if text not in cached][:24]
+
+    if missing and OPENROUTER_API_KEY and PROACTIVE_DEBUG_TRANSLATION_MODEL:
+        try:
+            payload = {
+                "model": PROACTIVE_DEBUG_TRANSLATION_MODEL,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Translate debug-dashboard text from English to concise Simplified Chinese. "
+                            "Preserve IDs, model names, JSON keys, product names, and technical terms like Gate, "
+                            "context_hint, Live Activity, APNs, OCR. Return JSON only."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "texts": missing,
+                                "schema": {"translations": ["same length as texts"]},
+                            },
+                            ensure_ascii=False,
+                        ),
+                    },
+                ],
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+            }
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            with httpx.Client(timeout=PROACTIVE_DEBUG_TRANSLATION_TIMEOUT_SEC) as client:
+                resp = client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers)
+                resp.raise_for_status()
+            content = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+            parsed = json.loads(_strip_json_code_fence(content))
+            translations = parsed.get("translations")
+            if isinstance(translations, list):
+                with _debug_translation_lock:
+                    for raw, translated in zip(missing, translations):
+                        out = str(translated or "").strip()
+                        if out:
+                            _debug_translation_cache[raw] = out[:1800]
+                            cached[raw] = _debug_translation_cache[raw]
+        except Exception as e:
+            print(f"[proactive-debug] translation failed: {e}")
+
+    return cached
+
+
 def _render_proactive_dashboard(snapshot: dict) -> str:
     def esc(value) -> str:
         return html.escape(str(value if value is not None else ""))
 
-    debug_labels = {
+    lang_param = str(request.args.get("lang") or "").strip().lower()
+    if lang_param not in {"zh", "en"}:
+        accept_lang = request.headers.get("Accept-Language", "").lower()
+        lang_param = "zh" if "zh" in accept_lang else "en"
+    is_zh = lang_param == "zh"
+
+    def ui(en: str, zh: str) -> str:
+        return zh if is_zh else en
+
+    def lang_url(target: str) -> str:
+        args = request.args.to_dict(flat=True)
+        args["lang"] = target
+        return f"/debug/proactive?{urlencode(args)}"
+
+    debug_labels_zh = {
         "time": "时间",
         "ts": "时间戳",
         "model": "模型",
@@ -2160,7 +2267,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         "preview": "消息预览",
     }
 
-    debug_value_labels = {
+    debug_value_labels_zh = {
         "TRUE": "触发",
         "FALSE": "不触发",
         "true": "触发",
@@ -2212,11 +2319,12 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     }
 
     def tr_label(value) -> str:
-        return debug_labels.get(str(value or ""), str(value or ""))
+        raw = str(value or "")
+        return debug_labels_zh.get(raw, raw) if is_zh else raw
 
     def tr_value(value) -> str:
         raw = str(value if value is not None else "")
-        return debug_value_labels.get(raw, raw)
+        return debug_value_labels_zh.get(raw, raw) if is_zh else raw
 
     def value_html(value) -> str:
         raw = str(value if value is not None else "")
@@ -2260,7 +2368,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             label = esc(fid[:10])
             links.append(
                 f"<a class='mono' href='/v1/screen/frames/{safe}/image{key_qs}' target='_blank'>{label}</a>"
-                f"<a class='mini' href='/v1/screen/frames/{safe}/decrypt{key_qs}{'&' if key_qs else '?'}include_image=false' target='_blank'>解密 JSON</a>"
+                f"<a class='mini' href='/v1/screen/frames/{safe}/decrypt{key_qs}{'&' if key_qs else '?'}include_image=false' target='_blank'>{esc(ui('json', '解密 JSON'))}</a>"
             )
         return " ".join(links)
 
@@ -2282,6 +2390,32 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     messages = list(reversed(snapshot.get("proactive_messages") or []))
     frames = list(reversed(snapshot.get("recent_frames") or []))
     events = list(reversed(snapshot.get("device_events") or []))
+    translation_map: dict[str, str] = {}
+    if is_zh:
+        translation_candidates: list[str] = []
+        for d in (frame_decisions[:30] + no_frame_decisions[:30]):
+            translation_candidates.extend([
+                str(d.get("reason") or ""),
+                str(d.get("abstention_reason") or ""),
+                str(d.get("context_hint") or ""),
+            ])
+        for j in jobs[:30]:
+            translation_candidates.extend([
+                str(j.get("context_hint") or ""),
+                str(j.get("status_reason") or ""),
+                str(j.get("preview") or ""),
+            ])
+        for m in messages[:25]:
+            translation_candidates.append(
+                str(m.get("alert_preview") or m.get("push_body_preview") or "")
+            )
+        translation_map = _translate_debug_texts_to_zh(translation_candidates)
+
+    def prose_html(value) -> str:
+        raw = str(value if value is not None else "").strip()
+        if is_zh and raw in translation_map:
+            return f"<span title='{esc(raw)}'>{esc(translation_map[raw])}</span>"
+        return esc(raw)
 
     def short_id(value, head: int = 8) -> str:
         """Truncate long IDs for display; full value shown on hover via title attr."""
@@ -2311,7 +2445,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     # (connection, gate_input) collapse behind <details>. Same data, same
     # density, no horizontal scroll.
     def decision_card(d) -> str:
-        verdict = "触发" if d.get("should_reach_out") else "不触发"
+        verdict = ui("TRUE", "触发") if d.get("should_reach_out") else ui("FALSE", "不触发")
         verdict_cls = "ok" if d.get("should_reach_out") else "muted"
         gate_input = _gate_input_dict(d.get("gate_input"))
         connection = d.get("connection") or {}
@@ -2337,9 +2471,9 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
         body_blocks = []
         if reason:
-            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('reason'))}</span><div class='block-text'>{value_html(reason)}</div></div>")
+            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('reason'))}</span><div class='block-text'>{prose_html(reason) if tr_value(reason) == reason else value_html(reason)}</div></div>")
         if context_hint:
-            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('context_hint'))}</span><div class='block-text'>{esc(context_hint)}</div></div>")
+            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('context_hint'))}</span><div class='block-text'>{prose_html(context_hint)}</div></div>")
         if frame_links_html:
             body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('frames'))}</span><div class='block-text'>{frame_links_html}</div></div>")
         body_blocks.append(f"<div class='block'>{fold_json('connection', connection)}</div>")
@@ -2347,20 +2481,20 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
         review_html = (
             f"<div class='review'>"
-            f"<div class='mini'>最近标注: <span class='{ 'ok' if review.get('label') == 'correct_true' else '' }'>{value_html(review.get('label') or 'unreviewed')}</span></div>"
+            f"<div class='mini'>{esc(ui('last review', '最近标注'))}: <span class='{ 'ok' if review.get('label') == 'correct_true' else '' }'>{value_html(review.get('label') or 'unreviewed')}</span></div>"
             f"<form method='post' action='{review_action}'>"
             "<select name='label'>"
-            "<option value='correct_true'>正确触发</option>"
-            "<option value='correct_false'>正确不触发</option>"
-            "<option value='missed_opportunity'>漏掉机会</option>"
-            "<option value='spam'>打扰/垃圾</option>"
-            "<option value='weak_connection'>关联太弱</option>"
-            "<option value='repeated'>重复触发</option>"
-            "<option value='privacy_bad'>隐私不合适</option>"
-            "<option value='great_companion_moment'>很好的陪伴时机</option>"
+            f"<option value='correct_true'>{esc(ui('correct true', '正确触发'))}</option>"
+            f"<option value='correct_false'>{esc(ui('correct false', '正确不触发'))}</option>"
+            f"<option value='missed_opportunity'>{esc(ui('missed opportunity', '漏掉机会'))}</option>"
+            f"<option value='spam'>{esc(ui('spam', '打扰/垃圾'))}</option>"
+            f"<option value='weak_connection'>{esc(ui('weak connection', '关联太弱'))}</option>"
+            f"<option value='repeated'>{esc(ui('repeated', '重复触发'))}</option>"
+            f"<option value='privacy_bad'>{esc(ui('privacy bad', '隐私不合适'))}</option>"
+            f"<option value='great_companion_moment'>{esc(ui('great companion moment', '很好的陪伴时机'))}</option>"
             "</select>"
-            "<input name='notes' placeholder='标注备注' maxlength='300'>"
-            "<button type='submit'>保存</button>"
+            f"<input name='notes' placeholder='{esc(ui('notes', '标注备注'))}' maxlength='300'>"
+            f"<button type='submit'>{esc(ui('save', '保存'))}</button>"
             "</form>"
             "</div>"
         )
@@ -2385,8 +2519,8 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     if no_frame_decisions:
         hidden_gate_details = (
             "<details class='debug-details'>"
-            f"<summary>显示隐藏的无屏幕帧 Gate 空 tick（{len(no_frame_decisions)}）</summary>"
-            + decision_section(no_frame_decisions, "没有隐藏的无屏幕帧 Gate 空 tick。")
+            f"<summary>{esc(ui(f'Show hidden no-frame Gate ticks ({len(no_frame_decisions)})', f'显示隐藏的无屏幕帧 Gate 空 tick（{len(no_frame_decisions)}）'))}</summary>"
+            + decision_section(no_frame_decisions, ui("No hidden no-frame Gate ticks.", "没有隐藏的无屏幕帧 Gate 空 tick。"))
             + "</details>"
         )
 
@@ -2409,11 +2543,12 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
         body_blocks = []
         if j.get("context_hint"):
-            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('context_hint'))}</span><div class='block-text'>{esc(j.get('context_hint'))}</div></div>")
+            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('context_hint'))}</span><div class='block-text'>{prose_html(j.get('context_hint'))}</div></div>")
         if j.get("status_reason"):
-            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('reason'))}</span><div class='block-text'>{value_html(j.get('status_reason'))}</div></div>")
+            status_reason = j.get("status_reason")
+            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('reason'))}</span><div class='block-text'>{prose_html(status_reason) if tr_value(status_reason) == str(status_reason) else value_html(status_reason)}</div></div>")
         if j.get("preview"):
-            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('preview'))}</span><div class='block-text'>{esc(j.get('preview'))}</div></div>")
+            body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('preview'))}</span><div class='block-text'>{prose_html(j.get('preview'))}</div></div>")
         frames_sent = frame_links(j.get("frame_ids"))
         if frames_sent:
             body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('frames sent'))}</span><div class='block-text'>{frames_sent}</div></div>")
@@ -2421,7 +2556,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         status_pill = f"<span class='verdict {status_class(status)}'>{value_html(status)}</span>"
         chips = []
         if j.get("alert_status"):
-            chips.append(f"<span class='chip {status_class(j.get('alert_status'))}'>通知: {value_html(j.get('alert_status'))}</span>")
+            chips.append(f"<span class='chip {status_class(j.get('alert_status'))}'>{esc(ui('alert', '通知'))}: {value_html(j.get('alert_status'))}</span>")
         if j.get("live_activity_status"):
             chips.append(f"<span class='chip {status_class(j.get('live_activity_status'))}'>Live Activity: {value_html(j.get('live_activity_status'))}</span>")
 
@@ -2437,7 +2572,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
     def job_section() -> str:
         if not jobs:
-            return "<div class='empty'>还没有隐藏主动任务。</div>"
+            return f"<div class='empty'>{esc(ui('No hidden proactive jobs yet.', '还没有隐藏主动任务。'))}</div>"
         return "<div class='card-list'>" + "".join(job_card(j) for j in jobs[:30]) + "</div>"
 
     # The remaining three sections (chat writes / frames / events) have
@@ -2446,15 +2581,15 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     # rare overflow case. No card conversion needed.
     def message_rows() -> str:
         if not messages:
-            return "<tr><td colspan='8'>还没有主动消息写入。</td></tr>"
+            return f"<tr><td colspan='8'>{esc(ui('No proactive chat writes yet.', '还没有主动消息写入。'))}</td></tr>"
         rows = []
         for m in messages[:25]:
-            preview = m.get("alert_preview") or m.get("push_body_preview") or "（加密 envelope；没有记录明文预览）"
+            preview = m.get("alert_preview") or m.get("push_body_preview") or ui("(encrypted envelope; no plaintext preview recorded)", "（加密 envelope；没有记录明文预览）")
             rows.append(
                 "<tr>"
                 f"<td>{esc(fmt_time(m.get('ts')))}<div class='mono mini'>{esc(fmt_epoch(m.get('ts')))}</div></td>"
                 f"<td>{esc(m.get('content_type'))}</td>"
-                f"<td class='wrap'>{esc(preview)}</td>"
+                f"<td class='wrap'>{prose_html(preview)}</td>"
                 f"<td class='{status_class(m.get('alert_status'))}'>{value_html(m.get('alert_status'))}</td>"
                 f"<td class='{status_class(m.get('live_activity_status'))}'>{value_html(m.get('live_activity_status'))}</td>"
                 f"<td>{short_id(m.get('gate_decision_id'))}</td>"
@@ -2466,7 +2601,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
     def frame_rows() -> str:
         if not frames:
-            return "<tr><td colspan='5'>还没有索引到屏幕帧。</td></tr>"
+            return f"<tr><td colspan='5'>{esc(ui('No frames indexed.', '还没有索引到屏幕帧。'))}</td></tr>"
         rows = []
         for f in frames[:25]:
             rows.append(
@@ -2482,7 +2617,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
     def event_rows() -> str:
         if not events:
-            return "<tr><td colspan='4'>还没有设备事件。</td></tr>"
+            return f"<tr><td colspan='4'>{esc(ui('No device events yet.', '还没有设备事件。'))}</td></tr>"
         rows = []
         for e in events[:25]:
             rows.append(
@@ -2498,13 +2633,18 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     counts = snapshot.get("counts") or {}
     visible_gate_count = len(frame_decisions)
     hidden_no_frame_count = len(no_frame_decisions)
+    page_title = ui("Feedling Proactive Debug", "Feedling 主动触发调试台")
+    visible_empty_text = ui(
+        f"No Gate decisions with screen context yet. Hidden no-frame ticks: {hidden_no_frame_count}.",
+        f"还没有带屏幕上下文的 Gate 判定。隐藏空 tick：{hidden_no_frame_count}。",
+    )
     return f"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta http-equiv="refresh" content="5">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Feedling 主动触发调试台</title>
+  <title>{esc(page_title)}</title>
   <style>
     * {{ box-sizing: border-box; }}
     body {{
@@ -2517,6 +2657,36 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
       line-height: 1.4;
     }}
     h1 {{ margin: 0 0 4px; }}
+    .topbar {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 16px;
+    }}
+    .lang-switch {{
+      display: inline-flex;
+      gap: 4px;
+      border: 1px solid #c9bfb2;
+      background: #fffaf1;
+      padding: 3px;
+      border-radius: 2px;
+      flex: 0 0 auto;
+    }}
+    .lang-switch a {{
+      display: inline-block;
+      padding: 4px 8px;
+      border: 0;
+      color: #6f6961;
+      font-size: 12px;
+    }}
+    .lang-switch a.active {{
+      background: #8e301f;
+      color: #fffaf1;
+    }}
+    @media (max-width: 640px) {{
+      .topbar {{ flex-direction: column; }}
+    }}
     h2 {{
       margin-top: 32px;
       border-top: 1px solid #d8d0c4;
@@ -2720,28 +2890,36 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
   </style>
 </head>
 <body>
-  <h1>Feedling 主动触发调试台</h1>
-  <div class="meta">用户 <span class="mono">{esc(snapshot.get('user_id'))}</span> · 生成时间 {esc(snapshot.get('generated_at'))} · 页面时间按 {esc(dashboard_tz_name)} 显示 · 每 5 秒自动刷新</div>
+  <div class="topbar">
+    <div>
+      <h1>{esc(page_title)}</h1>
+      <div class="meta">{esc(ui('user', '用户'))} <span class="mono">{esc(snapshot.get('user_id'))}</span> · {esc(ui('generated', '生成时间'))} {esc(snapshot.get('generated_at'))} · {esc(ui('times shown in', '页面时间按'))} {esc(dashboard_tz_name)} {esc(ui('', '显示'))} · {esc(ui('auto-refresh 5s', '每 5 秒自动刷新'))}</div>
+    </div>
+    <nav class="lang-switch" aria-label="language">
+      <a class="{'active' if not is_zh else ''}" href="{esc(lang_url('en'))}">English</a>
+      <a class="{'active' if is_zh else ''}" href="{esc(lang_url('zh'))}">中文</a>
+    </nav>
+  </div>
   <div>
-    <span class="pill">全部判定 {esc(counts.get('decisions', 0))}</span>
-    <span class="pill">主表判定 {esc(visible_gate_count)}</span>
-    <span class="pill">隐藏空 tick {esc(hidden_no_frame_count)}</span>
-    <span class="pill">人工标注 {esc(counts.get('reviews', 0))}</span>
-    <span class="pill">隐藏任务 {esc(counts.get('jobs', 0))}</span>
-    <span class="pill">主动写入 {esc(counts.get('proactive_messages', 0))}</span>
-    <span class="pill">屏幕帧 {esc(counts.get('recent_frames', 0))}</span>
-    <span class="pill">设备事件 {esc(counts.get('device_events', 0))}</span>
+    <span class="pill">{esc(ui('all decisions', '全部判定'))} {esc(counts.get('decisions', 0))}</span>
+    <span class="pill">{esc(ui('visible decisions', '主表判定'))} {esc(visible_gate_count)}</span>
+    <span class="pill">{esc(ui('hidden no-frame ticks', '隐藏空 tick'))} {esc(hidden_no_frame_count)}</span>
+    <span class="pill">{esc(ui('human reviews', '人工标注'))} {esc(counts.get('reviews', 0))}</span>
+    <span class="pill">{esc(ui('hidden jobs', '隐藏任务'))} {esc(counts.get('jobs', 0))}</span>
+    <span class="pill">{esc(ui('proactive writes', '主动写入'))} {esc(counts.get('proactive_messages', 0))}</span>
+    <span class="pill">{esc(ui('screen frames', '屏幕帧'))} {esc(counts.get('recent_frames', 0))}</span>
+    <span class="pill">{esc(ui('device events', '设备事件'))} {esc(counts.get('device_events', 0))}</span>
   </div>
 
-  <h2>Gate 判定</h2>
-  <div class="hint">主表只显示带屏幕帧、OCR 或图片上下文的 Gate 判定。没有屏幕帧的定时空 tick 会折叠在下方。</div>
-  {decision_section(frame_decisions, f'还没有带屏幕上下文的 Gate 判定。隐藏空 tick：{hidden_no_frame_count}。')}
+  <h2>{esc(ui('Gate Decisions', 'Gate 判定'))}</h2>
+  <div class="hint">{esc(ui('The main list only shows Gate decisions backed by screen frames, OCR, or image context. Scheduled no-frame ticks are folded below.', '主表只显示带屏幕帧、OCR 或图片上下文的 Gate 判定。没有屏幕帧的定时空 tick 会折叠在下方。'))}</div>
+  {decision_section(frame_decisions, visible_empty_text)}
   {hidden_gate_details}
 
-  <h2>隐藏任务</h2>
+  <h2>{esc(ui('Hidden Jobs', '隐藏任务'))}</h2>
   {job_section()}
 
-  <h2>主动消息写入</h2>
+  <h2>{esc(ui('Proactive Chat Writes', '主动消息写入'))}</h2>
   <div class="table-scroll">
     <table class="t-messages">
       <colgroup>
@@ -2749,29 +2927,29 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         <col class="c-status"><col class="c-status">
         <col class="c-id"><col class="c-id"><col class="c-id">
       </colgroup>
-      <thead><tr><th>时间</th><th>类型</th><th>预览</th><th>系统通知</th><th>Live Activity</th><th>判定</th><th>任务</th><th>消息</th></tr></thead>
+      <thead><tr><th>{esc(ui('time', '时间'))}</th><th>{esc(ui('type', '类型'))}</th><th>{esc(ui('preview', '预览'))}</th><th>{esc(ui('alert', '系统通知'))}</th><th>Live Activity</th><th>{esc(ui('decision', '判定'))}</th><th>{esc(ui('job', '任务'))}</th><th>{esc(ui('message', '消息'))}</th></tr></thead>
       <tbody>{message_rows()}</tbody>
     </table>
   </div>
 
-  <h2>最近屏幕帧</h2>
+  <h2>{esc(ui('Recent Screen Frames', '最近屏幕帧'))}</h2>
   <div class="table-scroll">
     <table class="t-frames">
       <colgroup>
         <col class="c-time"><col class="c-app"><col class="c-num"><col class="c-num"><col class="c-link">
       </colgroup>
-      <thead><tr><th>时间</th><th>App</th><th>OCR 长度</th><th>已加密</th><th>屏幕帧</th></tr></thead>
+      <thead><tr><th>{esc(ui('time', '时间'))}</th><th>App</th><th>{esc(ui('OCR length', 'OCR 长度'))}</th><th>{esc(ui('encrypted', '已加密'))}</th><th>{esc(ui('frame', '屏幕帧'))}</th></tr></thead>
       <tbody>{frame_rows()}</tbody>
     </table>
   </div>
 
-  <h2>设备事件</h2>
+  <h2>{esc(ui('Device Events', '设备事件'))}</h2>
   <div class="table-scroll">
     <table class="t-events">
       <colgroup>
         <col class="c-time"><col class="c-source"><col class="c-type"><col class="c-payload">
       </colgroup>
-      <thead><tr><th>时间</th><th>来源</th><th>类型</th><th>事件数据</th></tr></thead>
+      <thead><tr><th>{esc(ui('time', '时间'))}</th><th>{esc(ui('source', '来源'))}</th><th>{esc(ui('type', '类型'))}</th><th>{esc(ui('payload', '事件数据'))}</th></tr></thead>
       <tbody>{event_rows()}</tbody>
     </table>
   </div>

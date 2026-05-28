@@ -153,13 +153,67 @@ def test_proactive_debug_folds_no_frame_gate_ticks(tmp_path, monkeypatch):
     assert appmod._gate_decision_has_frame_context(with_frame) is True
 
     snapshot = appmod._proactive_debug_snapshot(store)
-    with appmod.app.test_request_context("/debug/proactive?key=test"):
+    with appmod.app.test_request_context("/debug/proactive?key=test&lang=zh"):
         page = appmod._render_proactive_dashboard(snapshot)
 
     assert "主表判定 1" in page
     assert "隐藏空 tick 1" in page
     assert "显示隐藏的无屏幕帧 Gate 空 tick（1）" in page
     assert page.find("frame_backed_false_unit_test") < page.find("no_recent_frames_unit_test")
+
+    with appmod.app.test_request_context("/debug/proactive?key=test&lang=en"):
+        page_en = appmod._render_proactive_dashboard(snapshot)
+
+    assert "visible decisions 1" in page_en
+    assert "hidden no-frame ticks 1" in page_en
+    assert "Show hidden no-frame Gate ticks (1)" in page_en
+
+
+def test_proactive_debug_translates_prose_only_in_zh_view(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    store = appmod.UserStore("usr_test_proactive_debug_translate")
+    reason = "The screen has a concrete connection to the user's memory garden."
+    context_hint = "The user is comparing a dense note and may want one gentle nudge."
+    decision = {
+        "decision_id": "gd_translate",
+        "ts": 1002,
+        "gate_model": "openrouter:google/gemini-3.1-flash-lite",
+        "should_reach_out": True,
+        "reason": reason,
+        "abstention_reason": "",
+        "intent_label": "manual_proactive_test",
+        "connection": {},
+        "frame_ids": ["frame_translate"],
+        "gate_input": {
+            "ocr_chars": 120,
+            "sampled_frame_count": 1,
+            "decrypt_ok": True,
+            "image_count": 1,
+        },
+        "context_hint": context_hint,
+    }
+    store.append_gate_decision(decision)
+    snapshot = appmod._proactive_debug_snapshot(store)
+
+    monkeypatch.setattr(
+        appmod,
+        "_translate_debug_texts_to_zh",
+        lambda texts: {
+            reason: "屏幕内容和用户的记忆花园有明确关联。",
+            context_hint: "用户正在比较一段密集笔记，可能适合轻轻提醒一句。",
+        },
+    )
+
+    with appmod.app.test_request_context("/debug/proactive?key=test&lang=zh"):
+        page_zh = appmod._render_proactive_dashboard(snapshot)
+    with appmod.app.test_request_context("/debug/proactive?key=test&lang=en"):
+        page_en = appmod._render_proactive_dashboard(snapshot)
+
+    assert "屏幕内容和用户的记忆花园有明确关联。" in page_zh
+    assert "title='The screen has a concrete connection to the user&#x27;s memory garden.'" in page_zh
+    assert "The screen has a concrete connection" in page_en
+    assert "屏幕内容和用户的记忆花园有明确关联。" not in page_en
+    assert snapshot["decisions"][0]["reason"] == reason
 
 
 def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
@@ -199,7 +253,7 @@ def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
     assert snapshot["counts"]["decisions"] == 1
     assert snapshot["counts"]["jobs"] == 1
 
-    page = client.get("/debug/proactive", headers=headers)
+    page = client.get("/debug/proactive?lang=zh", headers=headers)
     assert page.status_code == 200
     assert "Feedling 主动触发调试台".encode() in page.data
     assert body["job"]["job_id"].encode() in page.data
@@ -207,6 +261,11 @@ def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
     # previous "frames sent" probe relied on a table column header that
     # the new card layout only emits when a job actually has frames.
     assert "隐藏任务".encode() in page.data
+
+    page_en = client.get("/debug/proactive?lang=en", headers=headers)
+    assert page_en.status_code == 200
+    assert b"Feedling Proactive Debug" in page_en.data
+    assert b"Hidden Jobs" in page_en.data
 
 
 def test_auto_proactive_gate_uses_decrypted_frame_ocr(tmp_path, monkeypatch):
