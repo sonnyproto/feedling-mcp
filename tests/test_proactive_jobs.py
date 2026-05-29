@@ -687,7 +687,7 @@ def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeyp
 
     sent_push_types = []
 
-    def _fake_send_apns(device_token, payload, push_type, topic):
+    def _fake_send_apns(device_token, payload, push_type, topic, **_kwargs):
         sent_push_types.append(push_type)
         return {"status": "delivered"}
 
@@ -862,7 +862,7 @@ def test_chat_alert_falls_back_from_bad_latest_device_token(tmp_path, monkeypatc
 
     seen = []
 
-    def _fake_send_apns(device_token, payload, push_type, topic):
+    def _fake_send_apns(device_token, payload, push_type, topic, **_kwargs):
         seen.append(device_token)
         if device_token == "old-device-token":
             return {"status": "delivered", "apns_env": "production"}
@@ -909,7 +909,7 @@ def test_live_activity_falls_back_from_topic_mismatch_token(tmp_path, monkeypatc
 
     seen = []
 
-    def _fake_send_apns(device_token, payload, push_type, topic):
+    def _fake_send_apns(device_token, payload, push_type, topic, **_kwargs):
         seen.append(device_token)
         if device_token == "old-live-token":
             return {"status": "delivered", "apns_env": "production"}
@@ -935,3 +935,44 @@ def test_live_activity_falls_back_from_topic_mismatch_token(tmp_path, monkeypatc
     latest = [t for t in store.tokens if t["token"] == "new-live-token"][0]
     assert latest["status"] == "expired"
     assert "DeviceTokenNotForTopic" in latest["last_error"]
+
+
+def test_apns_prefers_token_recorded_environment(monkeypatch):
+    monkeypatch.setattr(appmod, "APNS_KEY", "test-key")
+    monkeypatch.setattr(appmod, "APNS_SANDBOX", True)
+    monkeypatch.setattr(appmod, "_make_apns_jwt", lambda: "jwt")
+
+    calls = []
+
+    class _Resp:
+        def __init__(self, status_code, text=""):
+            self.status_code = status_code
+            self.text = text
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, url, json, headers):
+            calls.append(url)
+            return _Resp(200)
+
+    monkeypatch.setattr(appmod.httpx, "Client", _Client)
+
+    result = appmod._send_apns(
+        "testflight-token",
+        {"aps": {"alert": {"body": "hi"}}},
+        push_type="alert",
+        topic="com.feedling.mcp",
+        preferred_env="production",
+    )
+
+    assert result["status"] == "delivered"
+    assert result["apns_env"] == "production"
+    assert [("sandbox" in url) for url in calls] == [False]

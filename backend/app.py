@@ -3185,6 +3185,9 @@ def _apns_should_retry_other_env(result: dict) -> bool:
             "BadEnvironmentKeyInToken",
             "BadEnvironmentKeyIdInToken",
             "BadCertificateEnvironment",
+            # Live Activity tokens can surface this for an environment
+            # mismatch. Try the other APNs host before expiring the token.
+            "ExpiredToken",
         )
     )
 
@@ -3226,24 +3229,48 @@ def _send_apns_once(device_token: str, payload: dict, push_type: str, topic: str
         return {"status": "error", "reason": str(e), "apns_env": env_name}
 
 
-def _send_apns(device_token: str, payload: dict, push_type: str, topic: str) -> dict:
+def _apns_sandbox_for_env(env: str | None) -> bool | None:
+    clean = str(env or "").strip().lower()
+    if clean == "sandbox":
+        return True
+    if clean == "production":
+        return False
+    return None
+
+
+def _send_apns(
+    device_token: str,
+    payload: dict,
+    push_type: str,
+    topic: str,
+    *,
+    preferred_env: str | None = None,
+) -> dict:
     if not APNS_KEY:
         print(f"[apns] no key — logged only → {device_token[:16]}… {payload}")
         return {"status": "logged_only"}
-    primary_sandbox = APNS_SANDBOX
-    first = _send_apns_once(device_token, payload, push_type, topic, sandbox=primary_sandbox)
-    if first.get("status") == "delivered" or not _apns_should_retry_other_env(first):
-        return first
 
-    # TestFlight/App Store tokens are production tokens, while Xcode-run
-    # development builds use sandbox tokens. A mixed beta can legitimately
-    # present both, so retry the other APNs host before declaring the token bad.
-    second = _send_apns_once(device_token, payload, push_type, topic, sandbox=not primary_sandbox)
-    second["fallback_attempted"] = True
-    second["fallback_from"] = first.get("apns_env", _apns_env_name(primary_sandbox))
-    if second.get("status") != "delivered":
-        second["first_error"] = first
-    return second
+    preferred_sandbox = _apns_sandbox_for_env(preferred_env)
+    primary_sandbox = APNS_SANDBOX if preferred_sandbox is None else preferred_sandbox
+    attempts: list[dict] = []
+    for idx, sandbox in enumerate((primary_sandbox, not primary_sandbox)):
+        if idx == 1 and attempts and not _apns_should_retry_other_env(attempts[0]):
+            break
+        result = _send_apns_once(device_token, payload, push_type, topic, sandbox=sandbox)
+        attempts.append(result)
+        if result.get("status") == "delivered":
+            if idx > 0:
+                result["fallback_attempted"] = True
+                result["fallback_from"] = attempts[0].get("apns_env", _apns_env_name(primary_sandbox))
+            return result
+
+    last = dict(attempts[-1]) if attempts else {"status": "error", "reason": "not_attempted"}
+    if len(attempts) > 1:
+        last["fallback_attempted"] = True
+        last["fallback_from"] = attempts[0].get("apns_env", _apns_env_name(primary_sandbox))
+        last["first_error"] = attempts[0]
+    last["attempted_envs"] = [str(a.get("apns_env") or "") for a in attempts]
+    return last
 
 
 def _send_apns_to_active_tokens(
@@ -3263,22 +3290,31 @@ def _send_apns_to_active_tokens(
 
     errors = []
     for entry in candidates:
-        result = _send_apns(entry["token"], payload, push_type=push_type, topic=topic)
+        result = _send_apns(
+            entry["token"],
+            payload,
+            push_type=push_type,
+            topic=topic,
+            preferred_env=entry.get("apns_env"),
+        )
         if result.get("status") == "delivered":
             _mark_active_token_success(store, entry, apns_env=result.get("apns_env"))
             result["attempts"] = len(errors) + 1
             return result
 
         reason_text = _apns_reason_text(result)
+        if reason_text:
+            _update_token_lifecycle(store, entry, last_error=reason_text)
         errors.append({
             "type": entry.get("type", ""),
             "activity_id": entry.get("activity_id", ""),
             "registered_at": entry.get("registered_at", ""),
             "apns_env": result.get("apns_env", ""),
+            "attempted_envs": result.get("attempted_envs", []),
             "reason": reason_text or str(result.get("reason", "")),
         })
         if _apns_token_should_expire(result):
-            _mark_expired_token(store, entry, str(result.get("reason", reason_text)))
+            _mark_expired_token(store, entry, reason_text or str(result.get("reason", "")))
             continue
 
     last = errors[-1] if errors else {}
@@ -3964,7 +4000,13 @@ def push_live_start():
     }
 
     topic = f"{BUNDLE_ID}.push-type.liveactivity"
-    result = _send_apns(entry["token"], apns_payload, push_type="liveactivity", topic=topic)
+    result = _send_apns(
+        entry["token"],
+        apns_payload,
+        push_type="liveactivity",
+        topic=topic,
+        preferred_env=entry.get("apns_env"),
+    )
     if result.get("status") == "delivered":
         _mark_active_token_success(store, entry, apns_env=result.get("apns_env"))
     else:
