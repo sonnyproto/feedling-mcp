@@ -793,7 +793,51 @@ def test_apns_retries_production_when_sandbox_rejects_testflight_token(monkeypat
     assert result["fallback_from"] == "sandbox"
 
 
-def test_chat_alert_uses_latest_active_device_token_and_marks_bad_token_expired(tmp_path, monkeypatch):
+def test_apns_retries_production_when_sandbox_returns_bad_environment_key(monkeypatch):
+    monkeypatch.setattr(appmod, "APNS_KEY", "test-key")
+    monkeypatch.setattr(appmod, "APNS_SANDBOX", True)
+    monkeypatch.setattr(appmod, "_make_apns_jwt", lambda: "jwt")
+
+    calls = []
+
+    class _Resp:
+        def __init__(self, status_code, text=""):
+            self.status_code = status_code
+            self.text = text
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def post(self, url, json, headers):
+            calls.append(url)
+            if "sandbox" in url:
+                return _Resp(400, '{"reason":"BadEnvironmentKeyInToken"}')
+            return _Resp(200)
+
+    monkeypatch.setattr(appmod.httpx, "Client", _Client)
+
+    result = appmod._send_apns(
+        "testflight-token",
+        {"aps": {"alert": {"body": "hi"}}},
+        push_type="alert",
+        topic="com.feedling.mcp",
+    )
+
+    assert [("sandbox" in url) for url in calls] == [True, False]
+    assert result["status"] == "delivered"
+    assert result["apns_env"] == "production"
+    assert result["fallback_attempted"] is True
+    assert result["fallback_from"] == "sandbox"
+
+
+def test_chat_alert_falls_back_from_bad_latest_device_token(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
@@ -820,14 +864,74 @@ def test_chat_alert_uses_latest_active_device_token_and_marks_bad_token_expired(
 
     def _fake_send_apns(device_token, payload, push_type, topic):
         seen.append(device_token)
+        if device_token == "old-device-token":
+            return {"status": "delivered", "apns_env": "production"}
         return {"status": "error", "code": 400, "reason": '{"reason":"BadDeviceToken"}', "apns_env": "production"}
 
     monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
 
     result = appmod._send_chat_alert(store, "hello", alert_title="Dora")
 
-    assert result["status"] == "error"
-    assert seen == ["new-device-token"]
+    assert result["status"] == "delivered"
+    assert seen == ["new-device-token", "old-device-token"]
     latest = [t for t in store.tokens if t["token"] == "new-device-token"][0]
     assert latest["status"] == "expired"
     assert "BadDeviceToken" in latest["last_error"]
+    older = [t for t in store.tokens if t["token"] == "old-device-token"][0]
+    assert older["status"] == "active"
+    assert older["last_success_at"]
+
+
+def test_live_activity_falls_back_from_topic_mismatch_token(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_bad_live_activity_token_key"
+    user_id = "usr_bad_live_activity_token"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.tokens = [
+        {
+            "type": "live_activity",
+            "token": "old-live-token",
+            "status": "active",
+            "activity_id": "old_activity",
+            "registered_at": "2026-05-24T00:00:00",
+        },
+        {
+            "type": "live_activity",
+            "token": "new-live-token",
+            "status": "active",
+            "activity_id": "new_activity",
+            "registered_at": "2026-05-29T00:00:00",
+        },
+    ]
+
+    seen = []
+
+    def _fake_send_apns(device_token, payload, push_type, topic):
+        seen.append(device_token)
+        if device_token == "old-live-token":
+            return {"status": "delivered", "apns_env": "production"}
+        return {
+            "status": "error",
+            "code": 400,
+            "reason": '{"reason":"DeviceTokenNotForTopic"}',
+            "apns_env": "production",
+        }
+
+    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+
+    with appmod.app.test_client() as client:
+        resp = client.post(
+            "/v1/push/live-activity",
+            headers={"X-API-Key": api_key},
+            json={"body": "hello"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["status"] == "delivered"
+    assert seen == ["new-live-token", "old-live-token"]
+    latest = [t for t in store.tokens if t["token"] == "new-live-token"][0]
+    assert latest["status"] == "expired"
+    assert "DeviceTokenNotForTopic" in latest["last_error"]

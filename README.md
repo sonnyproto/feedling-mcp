@@ -9,19 +9,18 @@ Agent 是大脑，Feedling 是身体。
 
 ## What this repo is
 
-1. **Flask HTTP backend** (`backend/app.py`) — iOS + HTTP-skill agent API
+1. **Flask HTTP backend** (`backend/app.py`) — iOS, MCP, resident-consumer, and proactive APIs
 2. **FastMCP server** (`backend/mcp_server.py`) — MCP protocol for Claude.ai / Claude Desktop
 3. **Production CVM stack** (`deploy/docker-compose.phala.yaml`) — dstack-ingress + Flask + FastMCP + enclave services running inside one Phala TDX CVM
 4. **Enclave app** (`backend/enclave_app.py`) — owns the content private key, serves `/attestation` on its own pinnable TLS port, and runs the decrypt proxy
-5. **iOS app** (`testapp/`) — Chat · Identity · Garden · Settings, plus Live Activity / Dynamic Island, Broadcast Extension for screen capture, and a live **audit card** that re-verifies the enclave on every open
-6. **Skill** — the agent's bootstrap + behavior spec. Lives in a separate public repo so it can be hot-updated without an iOS rebuild: <https://github.com/teleport-computer/io-onboarding>. Covers resident consumer setup for Hermes / OpenClaw / Mac / server agents, direct MCP chat clients, and HTTP-mode custom agent backends — Appendix A in the skill maps each MCP tool to its HTTP equivalent.
+5. **iOS app** — now lives in the companion repo <https://github.com/teleport-computer/feedling-mcp-ios>. It owns Chat · Identity · Garden · Settings, Live Activity / Dynamic Island, Broadcast Extension for screen capture, and the live audit card.
+6. **Skill** — the agent's bootstrap + behavior spec. Lives in a separate public repo so it can be hot-updated without an iOS rebuild: <https://github.com/teleport-computer/io-onboarding>. Current onboarding splits users into three routes: own server / resident consumer, model API key, and official app import.
 7. **Contracts** (`contracts/`) — `FeedlingAppAuth` on Ethereum Sepolia, the on-chain allow-list of authorized `compose_hash`es
 8. **Tools** (`tools/`) — `audit_live_cvm.py` CLI that mirrors the iOS audit checks; DCAP verifier; envelope round-trip tests
 
 ```
 feedling-mcp-v1/
 ├── backend/        ← Flask (5001) + FastMCP (5002) + enclave_app (5003)
-├── testapp/        ← iOS SwiftUI app + Widget + Broadcast Extension
 ├── deploy/         ← docker-compose.yaml (local/self-host)
 │                     + docker-compose.phala.yaml (production CVM)
 │                     + Caddyfile/systemd/setup.sh for self-hosting
@@ -33,10 +32,11 @@ feedling-mcp-v1/
 ├── DESIGN.md       ← visual / UI design tokens
 └── CLAUDE.md       ← repo-level conventions for Claude Code
 
+The iOS app lives in github.com/teleport-computer/feedling-mcp-ios.
 The agent skill — what the AI reads when a user pastes the onboarding
-URL into their runtime — lives in the public companion repo
-github.com/teleport-computer/io-onboarding, NOT inside this repo,
-so updates are visible to all installed apps without an iOS rebuild.
+URL into their runtime — lives in github.com/teleport-computer/io-onboarding.
+Neither lives in this backend repo, so onboarding copy can update without
+touching the CVM image, and iOS UI work can ship independently.
 ```
 
 ---
@@ -177,7 +177,7 @@ shipped:
 - [x] Push preference system — agent asks during bootstrap, stores in `signature` on Identity page
 - [x] Memory Garden: unread dots (persistent), month badge right-aligned, bilingual copy
 - [x] Identity page: `signature` field displayed; bilingual empty state
-- [x] Public IO onboarding skill split by runtime path: resident-agent, chat-client, API, and "not sure" guide
+- [x] Public IO onboarding skill split by user-facing route: own server / resident consumer, model API key, and official app import
 - [x] iOS onboarding copy simplified: Skill URL → IO connection details → short start prompt; implementation details live in the skill
 - [x] Independent `feedling-chat-resident` / IO resident consumer is the standard live-chat path for Hermes / OpenClaw / Mac / server agents
 - [x] Resident consumer defaults to no user-visible fallback templates on agent-entry failures; errors stay in logs/external runtime
@@ -192,10 +192,10 @@ shipped:
 ## Architecture
 
 ```
-Claude / ChatGPT / Gemini style       Hermes / OpenClaw / Mac / server
-MCP chat clients                      agents via feedling-chat-resident
+Official app / MCP import             Hermes / OpenClaw / Mac / server
+clients                               agents via feedling-chat-resident
         │                                      │
-        │ MCP SSE                              │ poll + HTTP/CLI agent entry
+        │ MCP SSE (import/tools)               │ poll + HTTP/CLI agent entry
         ▼                                      ▼
 ┌────────────────────────────────────────────────────────────────┐
 │                    Phala prod9 TDX CVM                         │
@@ -382,6 +382,9 @@ subsequent tool call is routed as that user.
 
 ## iOS app
 
+The iOS project now lives in the companion repo:
+<https://github.com/teleport-computer/feedling-mcp-ios>.
+
 ### Tab structure
 
 | Tab | Content |
@@ -393,9 +396,10 @@ subsequent tool call is routed as that user.
 
 ### Setup (first time)
 
-1. Open `testapp/FeedlingTest.xcodeproj` in Xcode
-2. For each target: sign with your team, verify App Groups = `group.com.feedling.mcp`
-3. Plug in iPhone (iOS 16.2+) → Build & Run
+1. Clone/open `feedling-mcp-ios`
+2. Open `App/FeedlingTest.xcodeproj` in Xcode
+3. For each target: sign with your team, verify App Groups = `group.com.feedling.mcp`
+4. Plug in iPhone (iOS 16.2+) → Build & Run
 
 ### `ContentState` (Live Activity / Dynamic Island)
 
@@ -440,7 +444,17 @@ Writing guidance: narrate from inside the moment, not from outside it. The topic
 
 ## Agent setup
 
-### Chat-client MCP runtimes
+The public iOS onboarding now starts by asking the user which route they need:
+
+1. **I have my own server** — VPS / Mac mini / always-on Hermes or OpenClaw.
+   Use the independent resident consumer route.
+2. **I have a model API key** — OpenAI / Gemini / OpenRouter / Anthropic.
+   IO hosts this route; the user should not install MCP or a resident consumer.
+3. **I only use an official app** — Claude / ChatGPT / Gemini apps or web.
+   Import is supported; reliable real-time IO Chat is not supported unless the
+   user later chooses a live route.
+
+### Official-app / MCP import runtimes
 
 Claude / ChatGPT / Gemini-style clients use the MCP one-liner from the iOS
 app's **Settings → Storage → Connection Details** or the Chat onboarding path:
@@ -455,10 +469,10 @@ Self-hosted users derive the same shape using their own domain:
 claude mcp add feedling --transport sse "https://mcp.<your-domain>/sse?key=<api_key>"
 ```
 
-Direct MCP is enough for memory, identity, and tool calls. Ongoing IO Chat
-still needs something that can keep receiving new messages. If the chat client
-cannot stay alive after the user closes the window/session, pair it with the
-resident consumer path below before sending the first IO greeting.
+Direct MCP is enough for memory, identity, and tool calls when the product
+supports MCP/tools. It is not, by itself, an ongoing incoming-message loop.
+If the chat client cannot stay alive after the user closes the window/session,
+this route remains import-only until the user chooses a live route.
 
 ### Hermes / OpenClaw / machine-resident agents
 
@@ -498,6 +512,18 @@ but it should not be a child job of the top-level Hermes gateway or the
 current chat turn. The service's `WorkingDirectory` / `ExecStart` must point at
 the updated `feedling-mcp` checkout; a stale checkout can keep replying with old
 consumer behavior even after the iOS app and public onboarding skill are current.
+
+### Model API key route
+
+Users who only have a model provider key should not follow either MCP import or
+resident-consumer setup. The intended product path is IO-hosted: the user enters
+provider, model, and API key in IO, and IO owns the runtime. That hosted runtime
+must still use the same Memory Garden, identity, and proactive rules as other
+routes, but it is not a custom HTTP endpoint operated by the user.
+
+Implementation note: provider-key storage and hosted runtime execution are part
+of the backend/iOS product surface. Do not ask API-key users to create launchd,
+systemd, bridge scripts, or a `feedling-chat-resident` service.
 
 Self-hosted users: see [`deploy/SELF_HOSTING.md`](deploy/SELF_HOSTING.md)
 for an end-to-end SSH runbook (clone, deps, env, systemd, HTTPS via

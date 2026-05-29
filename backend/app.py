@@ -943,6 +943,11 @@ def _entry_is_active(entry: dict) -> bool:
 
 
 def _select_token(store: UserStore, predicate, activity_id: str | None = None, active_only: bool = True):
+    candidates = _select_tokens(store, predicate, activity_id=activity_id, active_only=active_only)
+    return candidates[0] if candidates else None
+
+
+def _select_tokens(store: UserStore, predicate, activity_id: str | None = None, active_only: bool = True) -> list[dict]:
     candidates = []
     for raw in store.tokens:
         entry = _normalize_token_entry(raw)
@@ -956,10 +961,8 @@ def _select_token(store: UserStore, predicate, activity_id: str | None = None, a
             continue
         candidates.append(entry)
 
-    if not candidates:
-        return None
     candidates.sort(key=lambda x: x.get("registered_at", ""), reverse=True)
-    return candidates[0]
+    return candidates
 
 
 def _update_token_lifecycle(
@@ -985,10 +988,12 @@ def _update_token_lifecycle(
             cur["status"] = status
         if last_error is not None:
             cur["last_error"] = last_error
+            cur["last_error_at"] = now_iso
         if success:
             cur["last_success_at"] = now_iso
             cur["status"] = "active"
             cur["last_error"] = ""
+            cur["last_error_at"] = ""
         if apns_env:
             cur["apns_env"] = apns_env
         cur["updated_at"] = now_iso
@@ -2103,7 +2108,9 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
             row["chat_message_id"] = msg.get("id", "")
             row["chat_ts"] = msg.get("ts")
             row["alert_status"] = alert_status
+            row["alert_reason"] = msg.get("alert_reason", "")
             row["live_activity_status"] = live_status
+            row["live_activity_reason"] = msg.get("live_activity_reason", "")
             row["preview"] = msg.get("alert_preview") or msg.get("push_body_preview") or ""
         else:
             row["derived_status"] = row.get("status", "pending")
@@ -2360,6 +2367,13 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             return f"<span title='{esc(raw)}'>{esc(translated)}</span>"
         return esc(raw)
 
+    def status_detail_html(status, reason) -> str:
+        html = value_html(status)
+        reason_text = str(reason or "").strip()
+        if reason_text:
+            html += f"<div class='mono mini'>{esc(reason_text[:180])}</div>"
+        return html
+
     api_key = (request.args.get("key") or "").strip()
     key_qs = f"?key={quote(api_key)}" if api_key else ""
     settings = snapshot.get("settings") or {}
@@ -2587,9 +2601,15 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         status_pill = f"<span class='verdict {status_class(status)}'>{value_html(status)}</span>"
         chips = []
         if j.get("alert_status"):
-            chips.append(f"<span class='chip {status_class(j.get('alert_status'))}'>{esc(ui('alert', '通知'))}: {value_html(j.get('alert_status'))}</span>")
+            chips.append(
+                f"<span class='chip {status_class(j.get('alert_status'))}'>{esc(ui('alert', '通知'))}: "
+                f"{status_detail_html(j.get('alert_status'), j.get('alert_reason'))}</span>"
+            )
         if j.get("live_activity_status"):
-            chips.append(f"<span class='chip {status_class(j.get('live_activity_status'))}'>Live Activity: {value_html(j.get('live_activity_status'))}</span>")
+            chips.append(
+                f"<span class='chip {status_class(j.get('live_activity_status'))}'>Live Activity: "
+                f"{status_detail_html(j.get('live_activity_status'), j.get('live_activity_reason'))}</span>"
+            )
 
         chips_html = f"<div class='chip-row'>{''.join(chips)}</div>" if chips else ""
 
@@ -2621,8 +2641,8 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
                 f"<td>{esc(fmt_time(m.get('ts')))}<div class='mono mini'>{esc(fmt_epoch(m.get('ts')))}</div></td>"
                 f"<td>{esc(m.get('content_type'))}</td>"
                 f"<td class='wrap'>{prose_html(preview)}</td>"
-                f"<td class='{status_class(m.get('alert_status'))}'>{value_html(m.get('alert_status'))}</td>"
-                f"<td class='{status_class(m.get('live_activity_status'))}'>{value_html(m.get('live_activity_status'))}</td>"
+                f"<td class='{status_class(m.get('alert_status'))}'>{status_detail_html(m.get('alert_status'), m.get('alert_reason'))}</td>"
+                f"<td class='{status_class(m.get('live_activity_status'))}'>{status_detail_html(m.get('live_activity_status'), m.get('live_activity_reason'))}</td>"
                 f"<td>{short_id(m.get('gate_decision_id'))}</td>"
                 f"<td>{short_id(m.get('proactive_job_id'))}</td>"
                 f"<td>{short_id(m.get('id'))}</td>"
@@ -3154,15 +3174,35 @@ def _apns_reason_text(result: dict) -> str:
     return reason
 
 
-def _apns_is_bad_device_token(result: dict) -> bool:
-    return (result or {}).get("status") == "error" and "BadDeviceToken" in _apns_reason_text(result)
+def _apns_should_retry_other_env(result: dict) -> bool:
+    if (result or {}).get("status") != "error":
+        return False
+    reason = _apns_reason_text(result)
+    return any(
+        marker in reason
+        for marker in (
+            "BadDeviceToken",
+            "BadEnvironmentKeyInToken",
+            "BadEnvironmentKeyIdInToken",
+            "BadCertificateEnvironment",
+        )
+    )
 
 
 def _apns_token_should_expire(result: dict) -> bool:
     if (result or {}).get("status") != "error":
         return False
     reason = _apns_reason_text(result)
-    return any(marker in reason for marker in ("BadDeviceToken", "ExpiredToken", "Unregistered"))
+    return any(
+        marker in reason
+        for marker in (
+            "BadDeviceToken",
+            "DeviceTokenNotForTopic",
+            "ExpiredToken",
+            "TopicDisallowed",
+            "Unregistered",
+        )
+    )
 
 
 def _send_apns_once(device_token: str, payload: dict, push_type: str, topic: str, *, sandbox: bool) -> dict:
@@ -3192,7 +3232,7 @@ def _send_apns(device_token: str, payload: dict, push_type: str, topic: str) -> 
         return {"status": "logged_only"}
     primary_sandbox = APNS_SANDBOX
     first = _send_apns_once(device_token, payload, push_type, topic, sandbox=primary_sandbox)
-    if first.get("status") == "delivered" or not _apns_is_bad_device_token(first):
+    if first.get("status") == "delivered" or not _apns_should_retry_other_env(first):
         return first
 
     # TestFlight/App Store tokens are production tokens, while Xcode-run
@@ -3204,6 +3244,50 @@ def _send_apns(device_token: str, payload: dict, push_type: str, topic: str) -> 
     if second.get("status") != "delivered":
         second["first_error"] = first
     return second
+
+
+def _send_apns_to_active_tokens(
+    store: UserStore,
+    predicate,
+    payload: dict,
+    *,
+    push_type: str,
+    topic: str,
+    activity_id: str | None = None,
+) -> dict:
+    candidates = _select_tokens(store, predicate, activity_id=activity_id, active_only=True)
+    if not candidates and activity_id:
+        candidates = _select_tokens(store, predicate, active_only=True)
+    if not candidates:
+        return {"status": "skipped", "reason": "no_active_token", "attempts": 0}
+
+    errors = []
+    for entry in candidates:
+        result = _send_apns(entry["token"], payload, push_type=push_type, topic=topic)
+        if result.get("status") == "delivered":
+            _mark_active_token_success(store, entry, apns_env=result.get("apns_env"))
+            result["attempts"] = len(errors) + 1
+            return result
+
+        reason_text = _apns_reason_text(result)
+        errors.append({
+            "type": entry.get("type", ""),
+            "activity_id": entry.get("activity_id", ""),
+            "registered_at": entry.get("registered_at", ""),
+            "apns_env": result.get("apns_env", ""),
+            "reason": reason_text or str(result.get("reason", "")),
+        })
+        if _apns_token_should_expire(result):
+            _mark_expired_token(store, entry, str(result.get("reason", reason_text)))
+            continue
+
+    last = errors[-1] if errors else {}
+    return {
+        "status": "error",
+        "reason": last.get("reason", "all_tokens_failed"),
+        "attempts": len(errors),
+        "errors": errors[-5:],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -3783,8 +3867,7 @@ def push_live_activity_inner(store: UserStore, payload: dict):
     activity_id = payload.get("activity_id")
     entry = _select_token(store, _is_live_activity_token, activity_id=activity_id, active_only=True)
     if not entry and activity_id:
-        entry = _select_token(store, _is_live_activity_token, activity_id=None, active_only=True)
-
+        entry = _select_token(store, _is_live_activity_token, active_only=True)
     if not entry:
         print(f"[live-activity:{store.user_id}] no active token registered — logged: {payload}")
         return jsonify({
@@ -3821,18 +3904,19 @@ def push_live_activity_inner(store: UserStore, payload: dict):
         }
     }
     topic = f"{BUNDLE_ID}.push-type.liveactivity"
-    result = _send_apns(entry["token"], apns_payload, push_type="liveactivity", topic=topic)
+    result = _send_apns_to_active_tokens(
+        store,
+        _is_live_activity_token,
+        apns_payload,
+        push_type="liveactivity",
+        topic=topic,
+        activity_id=activity_id,
+    )
 
     delivered = result.get("status") == "delivered"
     if delivered:
-        _mark_active_token_success(store, entry, apns_env=result.get("apns_env"))
         store.record_successful_push()
         store.record_live_activity_sent(message=body, top_app=top_app)
-    else:
-        reason_text = str(result.get("reason", ""))
-        if _apns_token_should_expire(result):
-            _mark_expired_token(store, entry, reason_text)
-            print(f"[live-activity:{store.user_id}] token expired, marked inactive: activity_id={entry.get('activity_id')}")
 
     print(f"[live-activity:{store.user_id}] {result}")
     response = {
@@ -3843,6 +3927,8 @@ def push_live_activity_inner(store: UserStore, payload: dict):
         response["error_code"] = result.get("code")
     if result.get("reason"):
         response["reason"] = result.get("reason")
+    if result.get("errors"):
+        response["errors"] = result.get("errors")
     if result.get("code") == 410:
         response["needs_refresh"] = True
     return jsonify(response)
@@ -3910,8 +3996,7 @@ def _send_chat_alert(store: UserStore, alert_body: str, alert_title: str = ""):
     # Match iOS-registered token type: LiveActivityManager registers
     # the standard APNs push token as type="device". Older dev builds used
     # type="apns", so accept both but choose the newest active token.
-    entry = _select_token(store, _is_device_token, active_only=True)
-    if not entry:
+    if not _select_token(store, _is_device_token, active_only=True):
         print(f"[chat-alert:{store.user_id}] no device token — skip push")
         return {"status": "skipped", "reason": "no_device_token"}
 
@@ -3928,11 +4013,13 @@ def _send_chat_alert(store: UserStore, alert_body: str, alert_title: str = ""):
         "feedling": {"type": "chat_reply"},
     }
     try:
-        result = _send_apns(entry["token"], apns_payload, push_type="alert", topic=BUNDLE_ID)
-        if result.get("status") == "delivered":
-            _mark_active_token_success(store, entry, apns_env=result.get("apns_env"))
-        elif _apns_token_should_expire(result):
-            _mark_expired_token(store, entry, str(result.get("reason", "")))
+        result = _send_apns_to_active_tokens(
+            store,
+            _is_device_token,
+            apns_payload,
+            push_type="alert",
+            topic=BUNDLE_ID,
+        )
         print(f"[chat-alert:{store.user_id}] {result.get('status')}")
         return result
     except Exception as e:
@@ -3944,8 +4031,7 @@ def _send_chat_alert(store: UserStore, alert_body: str, alert_title: str = ""):
 def push_notification():
     store = require_user()
     payload = request.get_json(silent=True) or {}
-    entry = _select_token(store, _is_device_token, active_only=True)
-    if not entry:
+    if not _select_token(store, _is_device_token, active_only=True):
         print(f"[notification:{store.user_id}] no device token — logged: {payload}")
         return jsonify({"status": "logged", "message_id": f"msg_{uuid.uuid4().hex[:8]}"})
 
@@ -3955,11 +4041,13 @@ def push_notification():
             "sound": "default",
         }
     }
-    result = _send_apns(entry["token"], apns_payload, push_type="alert", topic=BUNDLE_ID)
-    if result.get("status") == "delivered":
-        _mark_active_token_success(store, entry, apns_env=result.get("apns_env"))
-    elif _apns_token_should_expire(result):
-        _mark_expired_token(store, entry, str(result.get("reason", "")))
+    result = _send_apns_to_active_tokens(
+        store,
+        _is_device_token,
+        apns_payload,
+        push_type="alert",
+        topic=BUNDLE_ID,
+    )
     print(f"[notification:{store.user_id}] {result}")
     return jsonify({"status": result["status"], "message_id": f"msg_{uuid.uuid4().hex[:8]}"})
 
