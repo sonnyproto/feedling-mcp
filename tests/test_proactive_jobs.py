@@ -309,7 +309,7 @@ def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
 
     page = client.get("/debug/proactive?lang=zh", headers=headers)
     assert page.status_code == 200
-    assert "Feedling 主动触发调试台".encode() in page.data
+    assert b"IO Proactive Harness" in page.data
     assert body["job"]["job_id"].encode() in page.data
     # Section header is always present once the jobs list renders; the
     # previous "frames sent" probe relied on a table column header that
@@ -318,7 +318,7 @@ def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
 
     page_en = client.get("/debug/proactive?lang=en", headers=headers)
     assert page_en.status_code == 200
-    assert b"Feedling Proactive Debug" in page_en.data
+    assert b"IO Proactive Harness" in page_en.data
     assert b"Hidden Jobs" in page_en.data
 
 

@@ -2684,7 +2684,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     counts = snapshot.get("counts") or {}
     visible_gate_count = len(frame_decisions)
     hidden_no_frame_count = len(no_frame_decisions)
-    page_title = ui("Feedling Proactive Debug", "Feedling 主动触发调试台")
+    page_title = "IO Proactive Harness"
     visible_empty_text = ui(
         f"No Gate decisions with screen context yet. Hidden no-frame ticks: {hidden_no_frame_count}.",
         f"还没有带屏幕上下文的 Gate 判定。隐藏空 tick：{hidden_no_frame_count}。",
