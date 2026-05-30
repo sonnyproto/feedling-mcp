@@ -997,7 +997,87 @@ def test_live_activity_expires_environment_mismatch_token(tmp_path, monkeypatch)
     assert seen == ["new-live-token", "old-live-token"]
     latest = [t for t in store.tokens if t["token"] == "new-live-token"][0]
     assert latest["status"] == "expired"
+    assert latest["expired_at"]
     assert "BadEnvironmentKeyInToken" in latest["last_error"]
+
+
+def test_live_activity_expiring_error_requests_token_refresh(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_refresh_bad_live_activity_key"
+    user_id = "usr_refresh_bad_live"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.tokens = [
+        {
+            "type": "live_activity",
+            "token": "bad-live-token",
+            "status": "active",
+            "activity_id": "activity_1",
+            "registered_at": "2026-05-29T00:00:00",
+        }
+    ]
+
+    def _fake_send_apns(device_token, payload, push_type, topic, **_kwargs):
+        return {
+            "status": "error",
+            "code": 400,
+            "reason": '{"reason":"BadDeviceToken"}',
+            "apns_env": "production",
+        }
+
+    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+
+    with appmod.app.test_client() as client:
+        resp = client.post(
+            "/v1/push/live-activity",
+            headers={"X-API-Key": api_key},
+            json={"body": "hello"},
+        )
+
+    body = resp.get_json()
+    assert resp.status_code == 200
+    assert body["status"] == "error"
+    assert body["needs_refresh"] is True
+    assert body["reason"] == "BadDeviceToken"
+    latest = store.tokens[0]
+    assert latest["status"] == "expired"
+    assert latest["expired_at"]
+
+
+def test_register_token_persists_client_push_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_token_metadata_key"
+    user_id = "usr_token_metadata"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    with appmod.app.test_client() as client:
+        resp = client.post(
+            "/v1/push/register-token",
+            headers={"X-API-Key": api_key},
+            json={
+                "type": "device",
+                "token": "device-token",
+                "apns_env": "production",
+                "bundle_id": "com.feedling.mcp",
+                "app_version": "1.0.0",
+                "app_build": "42",
+                "build_configuration": "release",
+                "device_model": "iPhone",
+                "system_version": "26.4.1",
+            },
+        )
+
+    assert resp.status_code == 200
+    store = appmod.get_store(user_id)
+    token = store.tokens[0]
+    assert token["status"] == "active"
+    assert token["apns_env"] == "production"
+    assert token["bundle_id"] == "com.feedling.mcp"
+    assert token["app_build"] == "42"
 
 
 def test_apns_prefers_token_recorded_environment(monkeypatch):

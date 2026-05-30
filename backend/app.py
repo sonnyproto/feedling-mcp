@@ -201,6 +201,7 @@ def _normalize_token_entry(entry: dict) -> dict:
     normalized.setdefault("status", "active")
     normalized.setdefault("last_error", "")
     normalized.setdefault("last_success_at", "")
+    normalized.setdefault("expired_at", "")
     normalized.setdefault("apns_env", normalized.get("environment", ""))
     normalized.setdefault("updated_at", normalized.get("registered_at", datetime.now().isoformat()))
     return normalized
@@ -986,12 +987,15 @@ def _update_token_lifecycle(
             continue
         if status is not None:
             cur["status"] = status
+            if status == "expired":
+                cur["expired_at"] = now_iso
         if last_error is not None:
             cur["last_error"] = last_error
             cur["last_error_at"] = now_iso
         if success:
             cur["last_success_at"] = now_iso
             cur["status"] = "active"
+            cur["expired_at"] = ""
             cur["last_error"] = ""
             cur["last_error_at"] = ""
         if apns_env:
@@ -4067,7 +4071,7 @@ def push_live_activity_inner(store: UserStore, payload: dict):
         response["reason"] = result.get("reason")
     if result.get("errors"):
         response["errors"] = result.get("errors")
-    if result.get("code") == 410:
+    if result.get("code") == 410 or _apns_token_should_expire(result):
         response["needs_refresh"] = True
     return jsonify(response)
 
@@ -4084,6 +4088,15 @@ def push_live_start():
     title = (payload.get("title") or "").strip()
     body_text = (payload.get("body") or payload.get("message") or "").strip()
     subtitle = (payload.get("subtitle") or "").strip() or None
+    activity_id = str(payload.get("activity_id") or f"la_{uuid.uuid4().hex[:8]}")
+    attributes = payload.get("attributes")
+    if not isinstance(attributes, dict):
+        attributes = {"activityId": activity_id}
+    attributes_type = str(
+        payload.get("attributes-type")
+        or payload.get("attributes_type")
+        or "ScreenActivityAttributes"
+    )
     apns_payload = {
         "aps": {
             "timestamp": int(time.time()),
@@ -4097,7 +4110,12 @@ def push_live_start():
                 "data": payload.get("data", {}),
                 "updatedAt": time.time(),
             },
-            "alert": {"title": "", "body": ""},
+            "attributes-type": attributes_type,
+            "attributes": attributes,
+            "alert": {
+                "title": title or "OpenClaw",
+                "body": body_text or "Live Activity started",
+            },
         }
     }
 
@@ -4122,6 +4140,8 @@ def push_live_start():
         response["error_code"] = result.get("code")
     if result.get("reason"):
         response["reason"] = result.get("reason")
+    if result.get("code") == 410 or _apns_token_should_expire(result):
+        response["needs_refresh"] = True
     return jsonify(response)
 
 
@@ -4212,6 +4232,7 @@ def register_token():
         "status": "active",
         "last_error": "",
         "last_success_at": "",
+        "expired_at": "",
         "updated_at": now_iso,
     }
     if activity_id:
@@ -4219,6 +4240,17 @@ def register_token():
     apns_env = str(payload.get("apns_env") or payload.get("environment") or "").strip().lower()
     if apns_env in {"sandbox", "production"}:
         entry["apns_env"] = apns_env
+    for meta_key in (
+        "bundle_id",
+        "app_version",
+        "app_build",
+        "build_configuration",
+        "device_model",
+        "system_version",
+    ):
+        meta_value = payload.get(meta_key)
+        if meta_value is not None:
+            entry[meta_key] = str(meta_value)[:160]
 
     store.tokens[:] = [
         _normalize_token_entry(t)
