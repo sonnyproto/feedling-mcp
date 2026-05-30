@@ -2295,11 +2295,12 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             value = default
         return max(lower, min(upper, value))
 
-    decision_cap = int_arg("decision_limit", 8, 3, 20)
-    no_frame_cap = int_arg("no_frame_limit", 3, 1, 10)
-    job_cap = int_arg("job_limit", 8, 3, 20)
-    table_cap = int_arg("table_limit", 10, 5, 20)
+    decision_cap = int_arg("decision_limit", 4, 2, 20)
+    no_frame_cap = int_arg("no_frame_limit", 1, 1, 10)
+    job_cap = int_arg("job_limit", 4, 2, 20)
+    table_cap = int_arg("table_limit", 6, 3, 20)
     show_no_frame = str(request.args.get("show_no_frame") or "").strip().lower() in {"1", "true", "yes"}
+    show_payloads = str(request.args.get("detail") or "").strip().lower() in {"1", "true", "yes"}
 
     debug_labels_zh = {
         "time": "时间",
@@ -2507,7 +2508,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             pretty = str(payload or "")
         if not pretty.strip() or pretty.strip() in ("{}", "null", "[]"):
             return f"<span class='muted mini'>{esc(tr_label(label))}: ∅</span>"
-        max_chars = 900
+        max_chars = 500 if show_payloads else 180
         if len(pretty) > max_chars:
             pretty = pretty[:max_chars].rstrip() + "\n… truncated"
         return (
@@ -2553,8 +2554,9 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('context_hint'))}</span><div class='block-text'>{prose_html(context_hint)}</div></div>")
         if frame_links_html:
             body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('frames'))}</span><div class='block-text'>{frame_links_html}</div></div>")
-        body_blocks.append(f"<div class='block'>{fold_json('connection', connection)}</div>")
-        body_blocks.append(f"<div class='block'>{fold_json('gate_input', gate_input)}</div>")
+        if show_payloads:
+            body_blocks.append(f"<div class='block'>{fold_json('connection', connection)}</div>")
+            body_blocks.append(f"<div class='block'>{fold_json('gate_input', gate_input)}</div>")
 
         review_html = (
             f"<div class='review'>"
@@ -2725,7 +2727,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
                 f"<td>{esc(fmt_time(e.get('ts')))}<div class='mono mini'>{esc(fmt_epoch(e.get('ts')))}</div></td>"
                 f"<td>{esc(e.get('source'))}</td>"
                 f"<td>{esc(e.get('type'))}</td>"
-                f"<td>{fold_json('payload', e.get('payload') or {})}</td>"
+                f"<td>{fold_json('payload', e.get('payload') or {}) if show_payloads else short_id((e.get('payload') or {}).get('id') or e.get('id') or e.get('type'))}</td>"
                 "</tr>"
             )
         return "".join(rows)
@@ -3009,6 +3011,10 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     <span class="pill">{esc(ui('proactive writes', '主动写入'))} {esc(counts.get('proactive_messages', 0))}</span>
     <span class="pill">{esc(ui('screen frames', '屏幕帧'))} {esc(counts.get('recent_frames', 0))}</span>
     <span class="pill">{esc(ui('device events', '设备事件'))} {esc(counts.get('device_events', 0))}</span>
+  </div>
+  <div class="hint">
+    {esc(ui('Compact mode is on to keep the debug page reliable.', '当前为轻量模式，避免调试页过大导致白屏或截断。'))}
+    <a href="{esc(dashboard_url(detail=1))}">{esc(ui('show JSON detail', '显示 JSON 详情'))}</a>
   </div>
 
   <h2>{esc(ui('Gate Decisions', 'Gate 判定'))}</h2>
