@@ -2295,10 +2295,10 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             value = default
         return max(lower, min(upper, value))
 
-    decision_cap = int_arg("decision_limit", 12, 3, 30)
-    no_frame_cap = int_arg("no_frame_limit", 8, 1, 20)
-    job_cap = int_arg("job_limit", 12, 3, 30)
-    table_cap = int_arg("table_limit", 15, 5, 25)
+    decision_cap = int_arg("decision_limit", 8, 3, 20)
+    no_frame_cap = int_arg("no_frame_limit", 3, 1, 10)
+    job_cap = int_arg("job_limit", 8, 3, 20)
+    table_cap = int_arg("table_limit", 10, 5, 20)
     show_no_frame = str(request.args.get("show_no_frame") or "").strip().lower() in {"1", "true", "yes"}
 
     debug_labels_zh = {
@@ -2507,7 +2507,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             pretty = str(payload or "")
         if not pretty.strip() or pretty.strip() in ("{}", "null", "[]"):
             return f"<span class='muted mini'>{esc(tr_label(label))}: ∅</span>"
-        max_chars = 1600
+        max_chars = 900
         if len(pretty) > max_chars:
             pretty = pretty[:max_chars].rstrip() + "\n… truncated"
         return (
