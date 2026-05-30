@@ -2279,6 +2279,28 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         args["lang"] = target
         return f"/debug/proactive?{urlencode(args)}"
 
+    def dashboard_url(**updates) -> str:
+        args = request.args.to_dict(flat=True)
+        for key, value in updates.items():
+            if value is None:
+                args.pop(key, None)
+            else:
+                args[key] = str(value)
+        return f"/debug/proactive?{urlencode(args)}"
+
+    def int_arg(name: str, default: int, lower: int, upper: int) -> int:
+        try:
+            value = int(str(request.args.get(name) or default).strip())
+        except (TypeError, ValueError):
+            value = default
+        return max(lower, min(upper, value))
+
+    decision_cap = int_arg("decision_limit", 12, 3, 30)
+    no_frame_cap = int_arg("no_frame_limit", 8, 1, 20)
+    job_cap = int_arg("job_limit", 12, 3, 30)
+    table_cap = int_arg("table_limit", 15, 5, 25)
+    show_no_frame = str(request.args.get("show_no_frame") or "").strip().lower() in {"1", "true", "yes"}
+
     debug_labels_zh = {
         "time": "时间",
         "ts": "时间戳",
@@ -2434,19 +2456,22 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     translation_map: dict[str, str] = {}
     if is_zh:
         translation_candidates: list[str] = []
-        for d in (frame_decisions[:30] + no_frame_decisions[:30]):
+        translated_decisions = frame_decisions[:decision_cap]
+        if show_no_frame:
+            translated_decisions += no_frame_decisions[:no_frame_cap]
+        for d in translated_decisions:
             translation_candidates.extend([
                 str(d.get("reason") or ""),
                 str(d.get("abstention_reason") or ""),
                 str(d.get("context_hint") or ""),
             ])
-        for j in jobs[:30]:
+        for j in jobs[:job_cap]:
             translation_candidates.extend([
                 str(j.get("context_hint") or ""),
                 str(j.get("status_reason") or ""),
                 str(j.get("preview") or ""),
             ])
-        for m in messages[:25]:
+        for m in messages[:table_cap]:
             translation_candidates.append(
                 str(m.get("alert_preview") or m.get("push_body_preview") or "")
             )
@@ -2470,14 +2495,21 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         return f"<span class='mono trunc' title='{esc(s)}'>{esc(s[:head])}…</span>"
 
     def fold_json(label: str, payload) -> str:
-        """Collapse JSON payloads behind a <details> summary so they don't
-        eat horizontal space by default."""
+        """Collapse JSON payloads behind a <details> summary.
+
+        Production debug pages can accumulate large Gate inputs quickly. Keep
+        the dashboard response bounded so browsers do not receive a truncated
+        HTML document from the edge path.
+        """
         try:
             pretty = json.dumps(payload, ensure_ascii=False, indent=2)
         except Exception:
             pretty = str(payload or "")
         if not pretty.strip() or pretty.strip() in ("{}", "null", "[]"):
             return f"<span class='muted mini'>{esc(tr_label(label))}: ∅</span>"
+        max_chars = 1600
+        if len(pretty) > max_chars:
+            pretty = pretty[:max_chars].rstrip() + "\n… truncated"
         return (
             f"<details class='inline-json'><summary>{esc(tr_label(label))}</summary>"
             f"<pre class='mono'>{esc(pretty)}</pre></details>"
@@ -2555,17 +2587,34 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             f"</article>"
         )
 
-    def decision_section(rows_source, empty_text: str) -> str:
+    def decision_section(rows_source, empty_text: str, limit: int = decision_cap) -> str:
         if not rows_source:
             return f"<div class='empty'>{esc(empty_text)}</div>"
-        return "<div class='card-list'>" + "".join(decision_card(d) for d in rows_source[:30]) + "</div>"
+        return "<div class='card-list'>" + "".join(decision_card(d) for d in rows_source[:limit]) + "</div>"
 
     hidden_gate_details = ""
     if no_frame_decisions:
+        if show_no_frame:
+            hidden_body = decision_section(
+                no_frame_decisions,
+                ui("No hidden no-frame Gate ticks.", "没有隐藏的无屏幕帧 Gate 空 tick。"),
+                limit=no_frame_cap,
+            )
+            hidden_hint = (
+                f"<div class='hint'>{esc(ui('Showing a bounded sample to keep the dashboard fast.', '仅显示有限样本，避免调试页过大。'))} "
+                f"<a href='{esc(dashboard_url(show_no_frame=None))}'>{esc(ui('hide no-frame ticks', '隐藏空 tick 明细'))}</a></div>"
+            )
+        else:
+            hidden_body = (
+                f"<div class='empty'>{esc(ui('No-frame Gate ticks are folded to keep this page lightweight.', '无屏幕帧 Gate 空 tick 已折叠，以保持页面轻量。'))} "
+                f"<a href='{esc(dashboard_url(show_no_frame=1))}'>{esc(ui('show sample', '显示样本'))}</a></div>"
+            )
+            hidden_hint = ""
         hidden_gate_details = (
             "<details class='debug-details'>"
             f"<summary>{esc(ui(f'Show hidden no-frame Gate ticks ({len(no_frame_decisions)})', f'显示隐藏的无屏幕帧 Gate 空 tick（{len(no_frame_decisions)}）'))}</summary>"
-            + decision_section(no_frame_decisions, ui("No hidden no-frame Gate ticks.", "没有隐藏的无屏幕帧 Gate 空 tick。"))
+            + hidden_hint
+            + hidden_body
             + "</details>"
         )
 
@@ -2624,7 +2673,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     def job_section() -> str:
         if not jobs:
             return f"<div class='empty'>{esc(ui('No hidden proactive jobs yet.', '还没有隐藏主动任务。'))}</div>"
-        return "<div class='card-list'>" + "".join(job_card(j) for j in jobs[:30]) + "</div>"
+        return "<div class='card-list'>" + "".join(job_card(j) for j in jobs[:job_cap]) + "</div>"
 
     # The remaining three sections (chat writes / frames / events) have
     # fewer columns; tables still fit a reasonable max-width with
@@ -2634,7 +2683,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         if not messages:
             return f"<tr><td colspan='8'>{esc(ui('No proactive chat writes yet.', '还没有主动消息写入。'))}</td></tr>"
         rows = []
-        for m in messages[:25]:
+        for m in messages[:table_cap]:
             preview = m.get("alert_preview") or m.get("push_body_preview") or ui("(encrypted envelope; no plaintext preview recorded)", "（加密 envelope；没有记录明文预览）")
             rows.append(
                 "<tr>"
@@ -2654,7 +2703,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         if not frames:
             return f"<tr><td colspan='5'>{esc(ui('No frames indexed.', '还没有索引到屏幕帧。'))}</td></tr>"
         rows = []
-        for f in frames[:25]:
+        for f in frames[:table_cap]:
             rows.append(
                 "<tr>"
                 f"<td>{esc(fmt_time(f.get('ts')))}<div class='mono mini'>{esc(fmt_epoch(f.get('ts')))}</div></td>"
@@ -2670,7 +2719,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         if not events:
             return f"<tr><td colspan='4'>{esc(ui('No device events yet.', '还没有设备事件。'))}</td></tr>"
         rows = []
-        for e in events[:25]:
+        for e in events[:table_cap]:
             rows.append(
                 "<tr>"
                 f"<td>{esc(fmt_time(e.get('ts')))}<div class='mono mini'>{esc(fmt_epoch(e.get('ts')))}</div></td>"
@@ -2964,7 +3013,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
   <h2>{esc(ui('Gate Decisions', 'Gate 判定'))}</h2>
   <div class="hint">{esc(ui('The main list only shows Gate decisions backed by screen frames, OCR, or image context. Scheduled no-frame ticks are folded below.', '主表只显示带屏幕帧、OCR 或图片上下文的 Gate 判定。没有屏幕帧的定时空 tick 会折叠在下方。'))}</div>
-  {decision_section(frame_decisions, visible_empty_text)}
+  {decision_section(frame_decisions, visible_empty_text, limit=decision_cap)}
   {hidden_gate_details}
 
   <h2>{esc(ui('Hidden Jobs', '隐藏任务'))}</h2>

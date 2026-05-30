@@ -159,7 +159,14 @@ def test_proactive_debug_folds_no_frame_gate_ticks(tmp_path, monkeypatch):
     assert "主表判定 1" in page
     assert "隐藏空 tick 1" in page
     assert "显示隐藏的无屏幕帧 Gate 空 tick（1）" in page
-    assert page.find("frame_backed_false_unit_test") < page.find("no_recent_frames_unit_test")
+    assert "frame_backed_false_unit_test" in page
+    assert "no_recent_frames_unit_test" not in page
+    assert "显示样本" in page
+
+    with appmod.app.test_request_context("/debug/proactive?key=test&lang=zh&show_no_frame=1"):
+        expanded_page = appmod._render_proactive_dashboard(snapshot)
+
+    assert expanded_page.find("frame_backed_false_unit_test") < expanded_page.find("no_recent_frames_unit_test")
 
     with appmod.app.test_request_context("/debug/proactive?key=test&lang=en"):
         page_en = appmod._render_proactive_dashboard(snapshot)
@@ -167,6 +174,7 @@ def test_proactive_debug_folds_no_frame_gate_ticks(tmp_path, monkeypatch):
     assert "visible decisions 1" in page_en
     assert "hidden no-frame ticks 1" in page_en
     assert "Show hidden no-frame Gate ticks (1)" in page_en
+    assert "no_recent_frames_unit_test" not in page_en
 
 
 def test_proactive_debug_translates_prose_only_in_zh_view(tmp_path, monkeypatch):
