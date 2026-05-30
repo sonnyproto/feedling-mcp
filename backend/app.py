@@ -167,6 +167,7 @@ MAX_FRAMES = 200
 MAX_CHAT_MESSAGES = 5000
 PUSH_COOLDOWN_SECONDS = int(os.environ.get("FEEDLING_PUSH_COOLDOWN_SEC", 300))
 LIVE_ACTIVITY_DEDUPE_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC", 900))
+LIVE_ACTIVITY_START_COOLDOWN_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_START_COOLDOWN_SEC", 1800))
 DEVICE_EVENT_RETENTION_DAYS = int(os.environ.get("FEEDLING_DEVICE_EVENT_RETENTION_DAYS", 30))
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 PROACTIVE_JOB_MAX = int(os.environ.get("FEEDLING_PROACTIVE_JOB_MAX", 500))
@@ -241,6 +242,7 @@ class UserStore:
             "last_message": "",
             "last_top_app": "",
             "last_sent_epoch": 0.0,
+            "last_start_epoch": 0.0,
         }
         self.live_activity_state_lock = threading.Lock()
 
@@ -447,6 +449,7 @@ class UserStore:
                         "last_message": str(data.get("last_message", "")),
                         "last_top_app": str(data.get("last_top_app", "")),
                         "last_sent_epoch": float(data.get("last_sent_epoch", 0.0)),
+                        "last_start_epoch": float(data.get("last_start_epoch", 0.0)),
                     }
         except Exception as e:
             print(f"[{self.user_id}/live-activity] load failed: {e}")
@@ -488,6 +491,25 @@ class UserStore:
             self.live_activity_state["last_top_app"] = (top_app or "").strip().lower()
             self.live_activity_state["last_sent_epoch"] = time.time()
         self._save_live_activity_state()
+
+    def live_activity_start_cooldown_remaining_seconds(self) -> float:
+        with self.live_activity_state_lock:
+            last_start = float(self.live_activity_state.get("last_start_epoch", 0.0))
+        if last_start <= 0:
+            return 0.0
+        elapsed = max(0.0, time.time() - last_start)
+        return max(0.0, LIVE_ACTIVITY_START_COOLDOWN_SEC - elapsed)
+
+    def should_start_live_activity(self) -> tuple[bool, str]:
+        remaining = self.live_activity_start_cooldown_remaining_seconds()
+        if remaining <= 0:
+            return True, "start_window_open"
+        return False, f"start_cooldown:{int(remaining)}s"
+
+    def record_live_activity_started(self, message: str, top_app: str):
+        with self.live_activity_state_lock:
+            self.live_activity_state["last_start_epoch"] = time.time()
+        self.record_live_activity_sent(message=message, top_app=top_app)
 
     # ------- chat -------
     def _load_chat(self):
@@ -562,6 +584,7 @@ class UserStore:
                 "live_activity_status",
                 "live_activity_reason",
                 "live_activity_activity_id",
+                "live_activity_mode",
                 "alert_status",
                 "alert_reason",
             ):
@@ -583,6 +606,7 @@ class UserStore:
             "live_activity_status",
             "live_activity_reason",
             "live_activity_activity_id",
+            "live_activity_mode",
             "alert_status",
             "alert_reason",
         }
@@ -2085,6 +2109,7 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
                 "live_activity_status": m.get("live_activity_status", ""),
                 "live_activity_reason": m.get("live_activity_reason", ""),
                 "live_activity_activity_id": m.get("live_activity_activity_id", ""),
+                "live_activity_mode": m.get("live_activity_mode", ""),
                 "alert_status": m.get("alert_status", ""),
                 "alert_reason": m.get("alert_reason", ""),
             }
@@ -2115,6 +2140,7 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
             row["alert_reason"] = msg.get("alert_reason", "")
             row["live_activity_status"] = live_status
             row["live_activity_reason"] = msg.get("live_activity_reason", "")
+            row["live_activity_mode"] = msg.get("live_activity_mode", "")
             row["preview"] = msg.get("alert_preview") or msg.get("push_body_preview") or ""
         else:
             row["derived_status"] = row.get("status", "pending")
@@ -2661,9 +2687,12 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
                 f"{status_detail_html(j.get('alert_status'), j.get('alert_reason'))}</span>"
             )
         if j.get("live_activity_status"):
+            live_detail = status_detail_html(j.get("live_activity_status"), j.get("live_activity_reason"))
+            if j.get("live_activity_mode"):
+                live_detail += f" <span class='mono mini'>{esc(j.get('live_activity_mode'))}</span>"
             chips.append(
                 f"<span class='chip {status_class(j.get('live_activity_status'))}'>Live Activity: "
-                f"{status_detail_html(j.get('live_activity_status'), j.get('live_activity_reason'))}</span>"
+                f"{live_detail}</span>"
             )
 
         chips_html = f"<div class='chip-row'>{''.join(chips)}</div>" if chips else ""
@@ -2691,13 +2720,16 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         rows = []
         for m in messages[:table_cap]:
             preview = m.get("alert_preview") or m.get("push_body_preview") or ui("(encrypted envelope; no plaintext preview recorded)", "（加密 envelope；没有记录明文预览）")
+            live_detail = status_detail_html(m.get("live_activity_status"), m.get("live_activity_reason"))
+            if m.get("live_activity_mode"):
+                live_detail += f"<div class='mono mini'>{esc(m.get('live_activity_mode'))}</div>"
             rows.append(
                 "<tr>"
                 f"<td>{esc(fmt_time(m.get('ts')))}<div class='mono mini'>{esc(fmt_epoch(m.get('ts')))}</div></td>"
                 f"<td>{esc(m.get('content_type'))}</td>"
                 f"<td class='wrap'>{prose_html(preview)}</td>"
                 f"<td class='{status_class(m.get('alert_status'))}'>{status_detail_html(m.get('alert_status'), m.get('alert_reason'))}</td>"
-                f"<td class='{status_class(m.get('live_activity_status'))}'>{status_detail_html(m.get('live_activity_status'), m.get('live_activity_reason'))}</td>"
+                f"<td class='{status_class(m.get('live_activity_status'))}'>{live_detail}</td>"
                 f"<td>{short_id(m.get('gate_decision_id'))}</td>"
                 f"<td>{short_id(m.get('proactive_job_id'))}</td>"
                 f"<td>{short_id(m.get('id'))}</td>"
@@ -3991,6 +4023,56 @@ def get_sources():
 # ---------------------------------------------------------------------------
 
 
+def _live_activity_identity_context(store: UserStore) -> dict:
+    identity = _load_identity(store) or {}
+    return {
+        "aiStart": str(identity.get("relationship_started_at") or "").strip() or None,
+    }
+
+
+def _live_activity_content_state(store: UserStore, payload: dict, *, default_visual_state: str = "reply") -> dict:
+    title = (payload.get("title") or "").strip()
+    body = (payload.get("body") or payload.get("message") or payload.get("desc") or "").strip()
+    subtitle = (payload.get("subtitle") or "").strip() or None
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    identity_context = _live_activity_identity_context(store)
+    visual_state = str(
+        payload.get("visualState")
+        or payload.get("visual_state")
+        or ("reply" if body else default_visual_state)
+    ).strip() or default_visual_state
+    if visual_state not in {"default", "sharing", "reply"}:
+        visual_state = default_visual_state
+    name = (payload.get("name") or title or "IO")
+    name = str(name).strip() or "IO"
+
+    # Include both the post-animation schema (visualState/name/desc/aiStart)
+    # and the earlier schema (title/subtitle/body/data/updatedAt). Swift
+    # Codable ignores unknown keys, so this keeps production TestFlight builds
+    # and the new animated widget build compatible during rollout.
+    return {
+        "visualState": visual_state,
+        "name": name,
+        "desc": body,
+        "aiStart": payload.get("aiStart") or payload.get("ai_start") or identity_context.get("aiStart"),
+        "title": title,
+        "subtitle": subtitle,
+        "body": body,
+        "personaId": payload.get("personaId", "default"),
+        "templateId": payload.get("templateId", "default"),
+        "data": data,
+        "updatedAt": time.time(),
+    }
+
+
+def _live_activity_body(payload: dict) -> str:
+    return (payload.get("body") or payload.get("message") or payload.get("desc") or "").strip()
+
+
+def _live_activity_top_app(payload: dict) -> str:
+    return str(payload.get("topApp") or payload.get("top_app") or "")
+
+
 @app.route("/v1/push/dynamic-island", methods=["POST"])
 def push_dynamic_island():
     store = require_user()
@@ -4017,31 +4099,27 @@ def push_live_activity_inner(store: UserStore, payload: dict):
             "activity_id": activity_id or f"la_{uuid.uuid4().hex[:8]}",
             "needs_refresh": True,
             "reason": "no_active_live_activity_token",
+            "mode": "update",
         })
 
-    title = (payload.get("title") or "").strip()
-    body = (payload.get("body") or payload.get("message") or "").strip()
-    subtitle = (payload.get("subtitle") or "").strip() or None
-    top_app = payload.get("topApp", "")
+    body = _live_activity_body(payload)
+    top_app = _live_activity_top_app(payload)
 
     suppress, reason = store.should_suppress_live_activity(message=body, top_app=top_app)
     if suppress:
         print(f"[live-activity:{store.user_id}] suppressed: {reason} body={body[:60]}")
-        return jsonify({"status": "suppressed", "reason": reason, "activity_id": entry.get("activity_id")})
+        return jsonify({
+            "status": "suppressed",
+            "reason": reason,
+            "activity_id": entry.get("activity_id"),
+            "mode": "update",
+        })
 
     apns_payload = {
         "aps": {
             "timestamp": int(time.time()),
             "event": payload.get("event", "update"),
-            "content-state": {
-                "title": title,
-                "subtitle": subtitle,
-                "body": body,
-                "personaId": payload.get("personaId", "default"),
-                "templateId": payload.get("templateId", "default"),
-                "data": payload.get("data", {}),
-                "updatedAt": time.time(),
-            },
+            "content-state": _live_activity_content_state(store, payload, default_visual_state="reply"),
             "alert": {"title": "", "body": ""},
         }
     }
@@ -4064,6 +4142,7 @@ def push_live_activity_inner(store: UserStore, payload: dict):
     response = {
         "status": result.get("status", "error"),
         "activity_id": entry.get("activity_id") or activity_id,
+        "mode": "update",
     }
     if result.get("code") is not None:
         response["error_code"] = result.get("code")
@@ -4080,14 +4159,46 @@ def push_live_activity_inner(store: UserStore, payload: dict):
 def push_live_start():
     store = require_user()
     payload = request.get_json(silent=True) or {}
+    return push_live_start_inner(store, payload)
+
+
+def push_live_activity_end_inner(store: UserStore, payload: dict | None = None) -> dict:
+    payload = payload or {}
+    body = _live_activity_body(payload)
+    top_app = _live_activity_top_app(payload)
+    activity_id = payload.get("activity_id")
+    apns_payload = {
+        "aps": {
+            "timestamp": int(time.time()),
+            "event": "end",
+            "content-state": _live_activity_content_state(store, payload, default_visual_state="default"),
+            "dismissal-date": int(time.time()),
+        }
+    }
+    topic = f"{BUNDLE_ID}.push-type.liveactivity"
+    result = _send_apns_to_active_tokens(
+        store,
+        _is_live_activity_token,
+        apns_payload,
+        push_type="liveactivity",
+        topic=topic,
+        activity_id=activity_id,
+    )
+    if result.get("status") == "delivered":
+        store.record_live_activity_sent(message=body, top_app=top_app)
+    print(f"[live-end:{store.user_id}] {result}")
+    return result
+
+
+def push_live_start_inner(store: UserStore, payload: dict, *, end_existing: bool = False):
     entry = _select_token(store, _is_push_to_start_token, active_only=True)
     if not entry:
         print(f"[live-start:{store.user_id}] no push_to_start token — logged: {payload}")
-        return jsonify({"status": "logged", "reason": "no_active_push_to_start_token"})
+        return jsonify({"status": "logged", "reason": "no_active_push_to_start_token", "mode": "start"})
 
     title = (payload.get("title") or "").strip()
-    body_text = (payload.get("body") or payload.get("message") or "").strip()
-    subtitle = (payload.get("subtitle") or "").strip() or None
+    body_text = _live_activity_body(payload)
+    top_app = _live_activity_top_app(payload)
     activity_id = str(payload.get("activity_id") or f"la_{uuid.uuid4().hex[:8]}")
     attributes = payload.get("attributes")
     if not isinstance(attributes, dict):
@@ -4097,19 +4208,15 @@ def push_live_start():
         or payload.get("attributes_type")
         or "ScreenActivityAttributes"
     )
+    end_result = None
+    if end_existing and _select_token(store, _is_live_activity_token, active_only=True):
+        end_result = push_live_activity_end_inner(store, payload)
+
     apns_payload = {
         "aps": {
             "timestamp": int(time.time()),
             "event": "start",
-            "content-state": {
-                "title": title,
-                "subtitle": subtitle,
-                "body": body_text,
-                "personaId": payload.get("personaId", "default"),
-                "templateId": payload.get("templateId", "default"),
-                "data": payload.get("data", {}),
-                "updatedAt": time.time(),
-            },
+            "content-state": _live_activity_content_state(store, payload, default_visual_state="reply"),
             "attributes-type": attributes_type,
             "attributes": attributes,
             "alert": {
@@ -4129,20 +4236,60 @@ def push_live_start():
     )
     if result.get("status") == "delivered":
         _mark_active_token_success(store, entry, apns_env=result.get("apns_env"))
+        store.record_live_activity_started(message=body_text, top_app=top_app)
     else:
         reason_text = str(result.get("reason", ""))
         if _apns_token_should_expire(result):
             _mark_expired_token(store, entry, reason_text)
 
     print(f"[live-start:{store.user_id}] {result}")
-    response = {"status": result.get("status", "error")}
+    response = {"status": result.get("status", "error"), "mode": "start"}
     if result.get("code") is not None:
         response["error_code"] = result.get("code")
     if result.get("reason"):
         response["reason"] = result.get("reason")
     if result.get("code") == 410 or _apns_token_should_expire(result):
         response["needs_refresh"] = True
+    if end_result:
+        response["end_status"] = end_result.get("status", "unknown")
+        if end_result.get("reason"):
+            response["end_reason"] = end_result.get("reason")
     return jsonify(response)
+
+
+def push_live_activity_hybrid_inner(store: UserStore, payload: dict):
+    should_start, start_reason = store.should_start_live_activity()
+    if should_start and _select_token(store, _is_push_to_start_token, active_only=True):
+        start_resp = push_live_start_inner(store, payload, end_existing=True)
+        try:
+            start_body = start_resp.get_json(silent=True) or {}
+        except Exception:
+            start_body = {}
+        if start_body.get("status") == "delivered":
+            start_body["mode"] = "start"
+            start_body["start_reason"] = start_reason
+            return jsonify(start_body)
+
+        # If push-to-start is unavailable or rejected, fall back to the cheaper
+        # update path so an already-visible activity can still refresh.
+        update_resp = push_live_activity_inner(store, payload)
+        try:
+            update_body = update_resp.get_json(silent=True) or {}
+        except Exception:
+            update_body = {}
+        update_body["mode"] = "start_fallback_update"
+        update_body["start_status"] = start_body.get("status", "unknown")
+        update_body["start_reason"] = start_body.get("reason") or start_reason
+        return jsonify(update_body)
+
+    update_resp = push_live_activity_inner(store, payload)
+    try:
+        update_body = update_resp.get_json(silent=True) or {}
+    except Exception:
+        update_body = {}
+    update_body["mode"] = "update"
+    update_body["start_reason"] = start_reason
+    return jsonify(update_body)
 
 
 def _send_chat_alert(store: UserStore, alert_body: str, alert_title: str = ""):
@@ -4915,7 +5062,9 @@ def chat_response():
     """Agent posts a reply as a v1 ciphertext envelope. Shape matches
     /v1/chat/message. The optional `push_live_activity` / `push_body` /
     `title` / `subtitle` / `data` fields trigger an APNs Live Activity
-    update; `push_body` is plaintext metadata (user-visible on lockscreen)
+    delivery. Proactive replies use a hybrid policy: push-to-start at most
+    once per start window, then cheaper updates while the activity is presumed
+    alive. `push_body` is plaintext metadata (user-visible in APNs surfaces)
     and is never stored in chat.
 
     Bootstrap gate: this endpoint 409s if memory_count < the per-age floor
@@ -4971,12 +5120,16 @@ def chat_response():
     delivery_fields: dict = {}
     if payload.get("push_live_activity"):
         push_payload = {
-            "title": payload.get("title", ""),
+            "title": payload.get("title", "") or "IO",
             "body": payload.get("push_body", ""),
             "subtitle": payload.get("subtitle"),
             "data": payload.get("data", {}),
+            "visualState": payload.get("visualState") or payload.get("visual_state") or "reply",
         }
-        live_resp = push_live_activity_inner(store, push_payload)
+        if source == PROACTIVE_JOB_SOURCE:
+            live_resp = push_live_activity_hybrid_inner(store, push_payload)
+        else:
+            live_resp = push_live_activity_inner(store, push_payload)
         try:
             live_body = live_resp.get_json(silent=True) or {}
         except Exception:
@@ -4984,6 +5137,7 @@ def chat_response():
         delivery_fields["live_activity_status"] = live_body.get("status", "unknown")
         delivery_fields["live_activity_reason"] = live_body.get("reason", "")
         delivery_fields["live_activity_activity_id"] = live_body.get("activity_id", "")
+        delivery_fields["live_activity_mode"] = live_body.get("mode", "")
     # Fire APNs alert push so users not currently in the app still see
     # the agent's message. MCP supplies `alert_body` (plaintext) — the
     # server itself doesn't decrypt the envelope. Best-effort: failures

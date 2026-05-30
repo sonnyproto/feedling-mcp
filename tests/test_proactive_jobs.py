@@ -757,6 +757,183 @@ def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeyp
     assert msg["live_activity_status"] == "delivered"
 
 
+def test_proactive_chat_response_uses_push_to_start_when_start_window_open(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    appmod._stores.clear()
+
+    sent = []
+
+    def _fake_send_apns(device_token, payload, push_type, topic, **_kwargs):
+        sent.append({
+            "token": device_token,
+            "push_type": push_type,
+            "event": (payload.get("aps") or {}).get("event"),
+            "content_state": (payload.get("aps") or {}).get("content-state", {}),
+        })
+        return {"status": "delivered"}
+
+    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+
+    api_key = "test_proactive_start_key"
+    user_id = "usr_endpoint_proactive_start"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.tokens = [
+        {
+            "type": "live_activity",
+            "token": "live-token",
+            "activity_id": "activity_1",
+            "status": "active",
+            "registered_at": "2026-05-24T00:00:00",
+        },
+        {
+            "type": "push_to_start",
+            "token": "start-token",
+            "status": "active",
+            "registered_at": "2026-05-24T00:00:01",
+        },
+        {
+            "type": "device",
+            "token": "device-token",
+            "status": "active",
+            "registered_at": "2026-05-24T00:00:02",
+        },
+    ]
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    envelope = {
+        "id": "msg_start_1",
+        "v": 1,
+        "body_ct": "ct",
+        "nonce": "nonce",
+        "K_user": "k-user",
+        "K_enclave": "k-enclave",
+        "visibility": "shared",
+        "owner_user_id": user_id,
+    }
+
+    resp = client.post(
+        "/v1/chat/response",
+        headers=headers,
+        json={
+            "envelope": envelope,
+            "source": appmod.PROACTIVE_JOB_SOURCE,
+            "gate_decision_id": "gd_start",
+            "proactive_job_id": "pj_start",
+            "alert_body": "我看到你停在这里了。",
+            "push_live_activity": True,
+            "push_body": "我看到你停在这里了。",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert [(row["push_type"], row["event"]) for row in sent] == [
+        ("liveactivity", "end"),
+        ("liveactivity", "start"),
+        ("alert", None),
+    ]
+    start_state = sent[1]["content_state"]
+    assert start_state["visualState"] == "reply"
+    assert start_state["name"] == "IO"
+    assert start_state["desc"] == "我看到你停在这里了。"
+    assert start_state["body"] == "我看到你停在这里了。"
+
+    snapshot = appmod._proactive_debug_snapshot(store)
+    msg = snapshot["proactive_messages"][0]
+    assert msg["live_activity_status"] == "delivered"
+    assert msg["live_activity_mode"] == "start"
+    assert store.live_activity_start_cooldown_remaining_seconds() > 0
+
+
+def test_proactive_chat_response_uses_update_during_start_cooldown(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    appmod._stores.clear()
+
+    sent = []
+
+    def _fake_send_apns(device_token, payload, push_type, topic, **_kwargs):
+        sent.append({
+            "token": device_token,
+            "push_type": push_type,
+            "event": (payload.get("aps") or {}).get("event"),
+            "content_state": (payload.get("aps") or {}).get("content-state", {}),
+        })
+        return {"status": "delivered"}
+
+    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+
+    api_key = "test_proactive_update_key"
+    user_id = "usr_endpoint_proactive_update"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.tokens = [
+        {
+            "type": "live_activity",
+            "token": "live-token",
+            "activity_id": "activity_1",
+            "status": "active",
+            "registered_at": "2026-05-24T00:00:00",
+        },
+        {
+            "type": "push_to_start",
+            "token": "start-token",
+            "status": "active",
+            "registered_at": "2026-05-24T00:00:01",
+        },
+        {
+            "type": "device",
+            "token": "device-token",
+            "status": "active",
+            "registered_at": "2026-05-24T00:00:02",
+        },
+    ]
+    store.live_activity_state["last_start_epoch"] = appmod.time.time()
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    envelope = {
+        "id": "msg_update_1",
+        "v": 1,
+        "body_ct": "ct",
+        "nonce": "nonce",
+        "K_user": "k-user",
+        "K_enclave": "k-enclave",
+        "visibility": "shared",
+        "owner_user_id": user_id,
+    }
+
+    resp = client.post(
+        "/v1/chat/response",
+        headers=headers,
+        json={
+            "envelope": envelope,
+            "source": appmod.PROACTIVE_JOB_SOURCE,
+            "gate_decision_id": "gd_update",
+            "proactive_job_id": "pj_update",
+            "alert_body": "继续看一下这里。",
+            "push_live_activity": True,
+            "push_body": "继续看一下这里。",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert [(row["push_type"], row["event"]) for row in sent] == [
+        ("liveactivity", "update"),
+        ("alert", None),
+    ]
+    update_state = sent[0]["content_state"]
+    assert update_state["visualState"] == "reply"
+    assert update_state["desc"] == "继续看一下这里。"
+
+    snapshot = appmod._proactive_debug_snapshot(store)
+    msg = snapshot["proactive_messages"][0]
+    assert msg["live_activity_status"] == "delivered"
+    assert msg["live_activity_mode"] == "update"
+
+
 def test_apns_retries_production_when_sandbox_rejects_testflight_token(monkeypatch):
     monkeypatch.setattr(appmod, "APNS_KEY", "test-key")
     monkeypatch.setattr(appmod, "APNS_SANDBOX", True)
