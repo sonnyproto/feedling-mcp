@@ -2740,6 +2740,50 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         f"No Gate decisions with screen context yet. Hidden no-frame ticks: {hidden_no_frame_count}.",
         f"还没有带屏幕上下文的 Gate 判定。隐藏空 tick：{hidden_no_frame_count}。",
     )
+    if not show_payloads:
+        return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="5">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{esc(page_title)}</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0 auto; padding: 20px; max-width: 1120px; background: #f6f0e6; color: #1f1d1a; line-height: 1.35; }}
+    h1 {{ margin: 0 0 4px; }} h2 {{ margin: 24px 0 10px; padding-top: 14px; border-top: 1px solid #d8d0c4; font-size: 18px; }}
+    .meta,.hint,.mini {{ color: #786f65; font-size: 12px; }} .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }}
+    .pill,.verdict,.chip {{ display: inline-block; padding: 3px 8px; margin: 2px; background: #efe5d7; border-radius: 2px; font-size: 12px; }}
+    .ok {{ color: #0b7d42; font-weight: 700; }} .bad {{ color: #b42318; font-weight: 700; }} .muted {{ color: #8b8176; }}
+    .card {{ background: #fffaf1; border: 1px solid #ddd2c5; padding: 12px; margin: 10px 0; }}
+    .card-head {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; border-bottom: 1px solid #eee5d5; padding-bottom: 8px; margin-bottom: 8px; }}
+    .meta-bits {{ display: flex; flex-wrap: wrap; gap: 8px 14px; font-size: 12px; }} .label,.block-label {{ color: #8b8176; text-transform: uppercase; letter-spacing: .4px; font-size: 10px; }}
+    .block {{ margin: 7px 0; }} .block-text,.wrap {{ white-space: pre-wrap; overflow-wrap: anywhere; }} .review {{ margin-top: 8px; padding-top: 8px; border-top: 1px solid #eee5d5; }}
+    table {{ width: 100%; border-collapse: collapse; table-layout: fixed; background: #fffaf1; }} th,td {{ border: 1px solid #ddd2c5; padding: 7px; vertical-align: top; text-align: left; overflow-wrap: anywhere; }} th {{ background: #efe5d7; }}
+    a {{ color: #8e301f; text-decoration: none; border-bottom: 1px solid #d0a094; }} .empty {{ padding: 12px; background: #fffaf1; border: 1px solid #ddd2c5; color: #786f65; }}
+  </style>
+</head>
+<body>
+  <h1>{esc(page_title)}</h1>
+  <div class="meta">{esc(ui('user', '用户'))} <span class="mono">{esc(snapshot.get('user_id'))}</span> · {esc(ui('generated', '生成时间'))} {esc(snapshot.get('generated_at'))} · {esc(dashboard_tz_name)}</div>
+  <div>
+    <span class="pill">{esc(ui('visible decisions', '主表判定'))} {esc(visible_gate_count)}</span>
+    <span class="pill">{esc(ui('hidden no-frame ticks', '隐藏空 tick'))} {esc(hidden_no_frame_count)}</span>
+    <span class="pill">{esc(ui('hidden jobs', '隐藏任务'))} {esc(counts.get('jobs', 0))}</span>
+    <span class="pill">{esc(ui('proactive writes', '主动写入'))} {esc(counts.get('proactive_messages', 0))}</span>
+    <span class="pill">{esc(ui('screen frames', '屏幕帧'))} {esc(counts.get('recent_frames', 0))}</span>
+  </div>
+  <div class="hint">{esc(ui('Compact mode is on to keep the debug page reliable.', '当前为轻量模式，避免调试页过大导致白屏或截断。'))} <a href="{esc(dashboard_url(detail=1))}">{esc(ui('show JSON detail', '显示 JSON 详情'))}</a></div>
+  <h2>{esc(ui('Gate Decisions', 'Gate 判定'))}</h2>
+  {decision_section(frame_decisions, visible_empty_text, limit=decision_cap)}
+  {hidden_gate_details}
+  <h2>{esc(ui('Hidden Jobs', '隐藏任务'))}</h2>
+  {job_section()}
+  <h2>{esc(ui('Proactive Chat Writes', '主动消息写入'))}</h2>
+  <table><thead><tr><th>{esc(ui('time', '时间'))}</th><th>{esc(ui('type', '类型'))}</th><th>{esc(ui('preview', '预览'))}</th><th>{esc(ui('alert', '系统通知'))}</th><th>Live Activity</th><th>{esc(ui('decision', '判定'))}</th><th>{esc(ui('job', '任务'))}</th><th>{esc(ui('message', '消息'))}</th></tr></thead><tbody>{message_rows()}</tbody></table>
+  <h2>{esc(ui('Recent Screen Frames', '最近屏幕帧'))}</h2>
+  <table><thead><tr><th>{esc(ui('time', '时间'))}</th><th>App</th><th>{esc(ui('OCR length', 'OCR 长度'))}</th><th>{esc(ui('encrypted', '已加密'))}</th><th>{esc(ui('frame', '屏幕帧'))}</th></tr></thead><tbody>{frame_rows()}</tbody></table>
+</body>
+</html>"""
     return f"""<!doctype html>
 <html>
 <head>
