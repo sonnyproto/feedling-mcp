@@ -945,6 +945,61 @@ def test_live_activity_falls_back_from_topic_mismatch_token(tmp_path, monkeypatc
     assert "DeviceTokenNotForTopic" in latest["last_error"]
 
 
+def test_live_activity_expires_environment_mismatch_token(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_bad_live_activity_env_key"
+    user_id = "usr_bad_live_activity_env"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.tokens = [
+        {
+            "type": "live_activity",
+            "token": "old-live-token",
+            "status": "active",
+            "activity_id": "old_activity",
+            "registered_at": "2026-05-24T00:00:00",
+        },
+        {
+            "type": "live_activity",
+            "token": "new-live-token",
+            "status": "active",
+            "activity_id": "new_activity",
+            "registered_at": "2026-05-29T00:00:00",
+        },
+    ]
+
+    seen = []
+
+    def _fake_send_apns(device_token, payload, push_type, topic, **_kwargs):
+        seen.append(device_token)
+        if device_token == "old-live-token":
+            return {"status": "delivered", "apns_env": "production"}
+        return {
+            "status": "error",
+            "code": 400,
+            "reason": '{"reason":"BadEnvironmentKeyInToken"}',
+            "apns_env": "production",
+        }
+
+    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+
+    with appmod.app.test_client() as client:
+        resp = client.post(
+            "/v1/push/live-activity",
+            headers={"X-API-Key": api_key},
+            json={"body": "hello"},
+        )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["status"] == "delivered"
+    assert seen == ["new-live-token", "old-live-token"]
+    latest = [t for t in store.tokens if t["token"] == "new-live-token"][0]
+    assert latest["status"] == "expired"
+    assert "BadEnvironmentKeyInToken" in latest["last_error"]
+
+
 def test_apns_prefers_token_recorded_environment(monkeypatch):
     monkeypatch.setattr(appmod, "APNS_KEY", "test-key")
     monkeypatch.setattr(appmod, "APNS_SANDBOX", True)

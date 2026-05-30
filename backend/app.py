@@ -3249,6 +3249,9 @@ def _apns_token_should_expire(result: dict) -> bool:
         marker in reason
         for marker in (
             "BadDeviceToken",
+            "BadEnvironmentKeyInToken",
+            "BadEnvironmentKeyIdInToken",
+            "BadCertificateEnvironment",
             "DeviceTokenNotForTopic",
             "ExpiredToken",
             "TopicDisallowed",
