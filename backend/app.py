@@ -4998,33 +4998,98 @@ def chat_history():
     except (TypeError, ValueError):
         return jsonify({"error": "invalid since"}), 400
 
+    before_raw = request.args.get("before", "")
+    before = 0.0
+    if before_raw not in ("", None):
+        try:
+            before = float(before_raw)
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid before"}), 400
+
+    include_image_body = str(
+        request.args.get("include_image_body", request.args.get("include_image_bodies", "true"))
+    ).lower() not in {"0", "false", "no", "off"}
+
     with store.chat_lock:
-        msgs = [m for m in store.chat_messages if m["ts"] > since]
+        all_msgs = list(store.chat_messages)
         total = len(store.chat_messages)
-    msgs = msgs[-limit:]
 
-    out = []
-    for m in msgs:
-        item = dict(m)
-        # iOS ChatMessage.content is non-optional. v1 envelope messages are
-        # ciphertext-only at rest and may omit plaintext `content`; always
-        # include an empty string so Decodable succeeds and client-side decrypt
-        # can populate content later.
-        item.setdefault("content", "")
+    if before > 0:
+        filtered = [m for m in all_msgs if float(m.get("ts", 0)) < before]
+        msgs = filtered[-limit:]
+        has_more_older = len(filtered) > len(msgs)
+        has_more_newer = False
+        page_mode = "before"
+    elif since > 0:
+        filtered = [m for m in all_msgs if float(m.get("ts", 0)) > since]
+        msgs = filtered[:limit]
+        has_more_older = bool(all_msgs and msgs and float(all_msgs[0].get("ts", 0)) < float(msgs[0].get("ts", 0)))
+        has_more_newer = len(filtered) > len(msgs)
+        page_mode = "since"
+    else:
+        msgs = all_msgs[-limit:]
+        has_more_older = len(all_msgs) > len(msgs)
+        has_more_newer = False
+        page_mode = "latest"
 
-        role = item.get("role")
-        if role == "openclaw":
-            item["sender"] = "assistant"
-            item["is_from_openclaw"] = True
-        elif role == "user":
-            item["sender"] = "user"
-            item["is_from_openclaw"] = False
-        out.append(item)
+    out = [_chat_history_item(m, include_image_body=include_image_body) for m in msgs]
+    omitted_image_bodies = sum(1 for m in out if m.get("body_omitted"))
+    oldest_ts = float(out[0].get("ts", 0)) if out else 0
+    latest_ts = float(out[-1].get("ts", 0)) if out else 0
 
     ua = request.headers.get("User-Agent", "")
-    print(f"[chat/history:{store.user_id}] ip={request.remote_addr} since={since} limit={limit} returned={len(out)} total={total} ua={ua[:80]}")
+    print(
+        f"[chat/history:{store.user_id}] ip={request.remote_addr} mode={page_mode} "
+        f"since={since} before={before} limit={limit} returned={len(out)} total={total} "
+        f"include_image_body={include_image_body} omitted_images={omitted_image_bodies} ua={ua[:80]}"
+    )
 
-    return jsonify({"messages": out, "total": total})
+    return jsonify({
+        "messages": out,
+        "total": total,
+        "oldest_ts": oldest_ts,
+        "latest_ts": latest_ts,
+        "has_more_older": has_more_older,
+        "has_more_newer": has_more_newer,
+        "image_bodies_omitted": omitted_image_bodies,
+    })
+
+
+def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
+    item = dict(m)
+    # iOS ChatMessage.content is non-optional. v1 envelope messages are
+    # ciphertext-only at rest and may omit plaintext `content`; always
+    # include an empty string so Decodable succeeds and client-side decrypt
+    # can populate content later.
+    item.setdefault("content", "")
+
+    if item.get("content_type", "text") == "image":
+        item["body_ct_len"] = len(item.get("body_ct") or "")
+        if not include_image_body:
+            item["body_omitted"] = True
+            for key in ("body_ct", "nonce", "K_user", "K_enclave"):
+                item.pop(key, None)
+        else:
+            item["body_omitted"] = False
+
+    role = item.get("role")
+    if role == "openclaw":
+        item["sender"] = "assistant"
+        item["is_from_openclaw"] = True
+    elif role == "user":
+        item["sender"] = "user"
+        item["is_from_openclaw"] = False
+    return item
+
+
+@app.route("/v1/chat/messages/<message_id>/body", methods=["GET"])
+def chat_message_body(message_id):
+    store = require_user()
+    with store.chat_lock:
+        msg = next((m for m in store.chat_messages if str(m.get("id") or "") == str(message_id)), None)
+    if not msg:
+        return jsonify({"error": "message_not_found"}), 404
+    return jsonify({"message": _chat_history_item(msg, include_image_body=True)})
 
 
 @app.route("/v1/chat/message", methods=["POST"])

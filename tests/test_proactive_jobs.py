@@ -757,6 +757,85 @@ def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeyp
     assert msg["live_activity_status"] == "delivered"
 
 
+def test_chat_history_supports_lightweight_images_and_before_cursor(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_chat_history_lightweight_key"
+    user_id = "usr_chat_history_lightweight"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+
+    def _append(idx: int, *, content_type: str = "text", body_ct: str = "ct"):
+        msg = store.append_chat(
+            "user",
+            "chat",
+            {
+                "id": f"msg_{idx}",
+                "v": 1,
+                "body_ct": body_ct,
+                "nonce": "nonce",
+                "K_user": "k-user",
+                "K_enclave": "k-enclave",
+                "visibility": "shared",
+                "owner_user_id": user_id,
+            },
+            content_type=content_type,
+        )
+        msg["ts"] = float(idx)
+        store._persist_chat()
+        return msg
+
+    for i in range(1, 6):
+        _append(i)
+    _append(6, content_type="image", body_ct="x" * 4096)
+    for i in range(7, 11):
+        _append(i)
+
+    with appmod.app.test_client() as client:
+        latest = client.get(
+            "/v1/chat/history?limit=6&include_image_body=false",
+            headers={"X-API-Key": api_key},
+        )
+        older = client.get(
+            "/v1/chat/history?before=5&limit=3&include_image_body=false",
+            headers={"X-API-Key": api_key},
+        )
+        image_body = client.get(
+            "/v1/chat/messages/msg_6/body",
+            headers={"X-API-Key": api_key},
+        )
+
+    assert latest.status_code == 200
+    latest_body = latest.get_json()
+    assert [m["id"] for m in latest_body["messages"]] == [
+        "msg_5",
+        "msg_6",
+        "msg_7",
+        "msg_8",
+        "msg_9",
+        "msg_10",
+    ]
+    assert latest_body["has_more_older"] is True
+    assert latest_body["image_bodies_omitted"] == 1
+    image_row = [m for m in latest_body["messages"] if m["id"] == "msg_6"][0]
+    assert image_row["body_omitted"] is True
+    assert image_row["body_ct_len"] == 4096
+    assert "body_ct" not in image_row
+    assert "K_user" not in image_row
+
+    assert older.status_code == 200
+    older_body = older.get_json()
+    assert [m["id"] for m in older_body["messages"]] == ["msg_2", "msg_3", "msg_4"]
+    assert older_body["has_more_older"] is True
+
+    assert image_body.status_code == 200
+    full_image = image_body.get_json()["message"]
+    assert full_image["id"] == "msg_6"
+    assert full_image["body_ct"] == "x" * 4096
+    assert full_image["body_omitted"] is False
+
+
 def test_proactive_chat_response_uses_push_to_start_when_start_window_open(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
