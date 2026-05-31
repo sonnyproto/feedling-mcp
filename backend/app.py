@@ -24,6 +24,17 @@ import websockets
 from flask import Flask, abort, g, jsonify, request, Response, send_file
 from flask_compress import Compress
 
+from content_encryption import build_envelope
+from provider_client import (
+    ProviderConfig,
+    ProviderError,
+    chat_completion,
+    mask_api_key,
+    public_config as public_provider_config,
+    test_provider_key,
+    validate_config as validate_provider_config,
+)
+
 # ---------------------------------------------------------------------------
 # Root directory + deployment mode
 # ---------------------------------------------------------------------------
@@ -312,6 +323,20 @@ class UserStore:
         Surfaced to iOS as the "最近的变化" feed and as local push triggers.
         See /v1/identity/changes endpoint."""
         return self.dir / "identity_changes.jsonl"
+
+    @property
+    def onboarding_route_file(self) -> Path:
+        return self.dir / "onboarding_route.json"
+
+    @property
+    def model_api_file(self) -> Path:
+        return self.dir / "model_api.json"
+
+    @property
+    def history_import_jobs_dir(self) -> Path:
+        path = self.dir / "history_import_jobs"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     @property
     def frames_meta_file(self) -> Path:
@@ -4039,6 +4064,1163 @@ def _get_enclave_info() -> dict | None:
 
 
 # ---------------------------------------------------------------------------
+# IO-hosted Model API key route
+# ---------------------------------------------------------------------------
+
+MODEL_API_ROUTES = {"resident", "official_import", "model_api"}
+
+
+def _now_iso() -> str:
+    return datetime.now().isoformat()
+
+
+def _read_json_object(path: Path) -> dict | None:
+    try:
+        if path.exists():
+            data = json.loads(path.read_text())
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        print(f"[json] read failed path={path.name}: {e}")
+    return None
+
+
+def _write_json_object(path: Path, data: dict, *, private: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+    tmp.replace(path)
+    if private:
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+
+
+def _normalize_onboarding_route(route: str) -> str:
+    raw = (route or "").strip().lower().replace("-", "_")
+    aliases = {
+        "server": "resident",
+        "resident_agent": "resident",
+        "modelapi": "model_api",
+        "model_api_key": "model_api",
+        "api": "model_api",
+        "official": "official_import",
+        "official_app": "official_import",
+        "import_only": "official_import",
+    }
+    return aliases.get(raw, raw)
+
+
+def _load_onboarding_route(store: UserStore) -> str:
+    data = _read_json_object(store.onboarding_route_file) or {}
+    route = _normalize_onboarding_route(str(data.get("route") or "resident"))
+    return route if route in MODEL_API_ROUTES else "resident"
+
+
+def _save_onboarding_route(store: UserStore, route: str) -> dict:
+    normalized = _normalize_onboarding_route(route)
+    if normalized not in MODEL_API_ROUTES:
+        raise ValueError("route must be resident, official_import, or model_api")
+    data = {"route": normalized, "selected_at": _now_iso()}
+    _write_json_object(store.onboarding_route_file, data)
+    return data
+
+
+@app.route("/v1/onboarding/route", methods=["GET", "POST"])
+def onboarding_route():
+    store = require_user()
+    if request.method == "GET":
+        return jsonify({
+            "route": _load_onboarding_route(store),
+            "allowed": sorted(MODEL_API_ROUTES),
+        })
+    payload = request.get_json(silent=True) or {}
+    try:
+        data = _save_onboarding_route(store, str(payload.get("route") or ""))
+    except ValueError as e:
+        return jsonify({"error": str(e), "allowed": sorted(MODEL_API_ROUTES)}), 400
+    print(f"[onboarding:{store.user_id}] route={data['route']}")
+    return jsonify(data)
+
+
+def _load_model_api_config(store: UserStore) -> dict | None:
+    data = _read_json_object(store.model_api_file)
+    if not data:
+        return None
+    if data.get("route") != "model_api":
+        data["route"] = "model_api"
+    return data
+
+
+def _save_model_api_config(store: UserStore, config: dict) -> dict:
+    data = dict(config)
+    data["route"] = "model_api"
+    data["updated_at"] = _now_iso()
+    if not data.get("created_at"):
+        data["created_at"] = data["updated_at"]
+    _write_json_object(store.model_api_file, data, private=True)
+    return data
+
+
+def _public_model_api_config(config: dict | None) -> dict:
+    if not config:
+        return {"configured": False}
+    safe = public_provider_config(config)
+    safe["configured"] = True
+    safe["privacy_mode"] = "tdx_cvm_backend_runtime_option_a"
+    return safe
+
+
+def _model_api_key_encryption_material(store: UserStore) -> tuple[bytes, bytes] | tuple[None, str]:
+    user_pk_b64 = _get_user_public_key(store.user_id)
+    if not user_pk_b64:
+        return None, "user_content_public_key_missing"
+    try:
+        user_pk = base64.b64decode(user_pk_b64)
+    except Exception:
+        return None, "user_content_public_key_invalid_base64"
+    if len(user_pk) != 32:
+        return None, "user_content_public_key_invalid_length"
+
+    enclave_info = _get_enclave_info()
+    if not enclave_info:
+        return None, "enclave_info_unavailable"
+    try:
+        enclave_pk = bytes.fromhex(str(enclave_info.get("content_pk_hex") or ""))
+    except Exception:
+        return None, "enclave_content_public_key_invalid_hex"
+    if len(enclave_pk) != 32:
+        return None, "enclave_content_public_key_invalid_length"
+    return user_pk, enclave_pk
+
+
+def _build_shared_envelope_for_store(
+    store: UserStore,
+    plaintext: bytes,
+    *,
+    item_id: str | None = None,
+) -> tuple[dict | None, str]:
+    material = _model_api_key_encryption_material(store)
+    if material[0] is None:
+        return None, str(material[1])
+    user_pk, enclave_pk = material  # type: ignore[misc]
+    try:
+        return build_envelope(
+            plaintext=plaintext,
+            owner_user_id=store.user_id,
+            user_pk_bytes=user_pk,  # type: ignore[arg-type]
+            enclave_pk_bytes=enclave_pk,  # type: ignore[arg-type]
+            visibility="shared",
+            item_id=item_id,
+        ), ""
+    except Exception as e:
+        return None, f"envelope_build_failed:{type(e).__name__}:{str(e)[:160]}"
+
+
+def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpose: str) -> bytes:
+    enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
+    if not enclave_url:
+        raise RuntimeError("enclave_unavailable")
+    if not api_key:
+        raise RuntimeError("api_key_unavailable")
+    try:
+        with httpx.Client(timeout=20, verify=False) as client:
+            resp = client.post(
+                f"{enclave_url}/v1/envelope/decrypt",
+                headers={"X-API-Key": api_key},
+                json={"envelope": envelope, "purpose": purpose},
+            )
+    except httpx.HTTPError as e:
+        raise RuntimeError(f"enclave_error:{type(e).__name__}") from e
+    if resp.status_code >= 400:
+        raise RuntimeError(f"enclave_http_{resp.status_code}:{resp.text[:180]}")
+    body = resp.json()
+    if not isinstance(body, dict) or not isinstance(body.get("plaintext_b64"), str):
+        raise RuntimeError("enclave_invalid_decrypt_response")
+    try:
+        return base64.b64decode(body["plaintext_b64"])
+    except Exception as e:
+        raise RuntimeError(f"enclave_plaintext_decode:{type(e).__name__}") from e
+
+
+def _provider_config_from_plain(config: dict, api_key: str) -> ProviderConfig:
+    provider, model, base_url = validate_provider_config(
+        str(config.get("provider") or ""),
+        str(config.get("model") or ""),
+        str(config.get("base_url") or ""),
+    )
+    return ProviderConfig(provider=provider, model=model, api_key=api_key, base_url=base_url)
+
+
+def _load_runtime_provider_config(store: UserStore, api_key: str | None) -> ProviderConfig | tuple[None, dict]:
+    config = _load_model_api_config(store)
+    if not config:
+        return None, {"error": "model_api_not_configured"}
+    if config.get("test_status") != "ok":
+        return None, {"error": "model_api_not_tested", "test_status": config.get("test_status", "")}
+    envelope = config.get("api_key_envelope")
+    if not isinstance(envelope, dict):
+        return None, {"error": "model_api_key_envelope_missing"}
+    try:
+        provider_key = _decrypt_envelope_via_enclave(
+            envelope,
+            api_key,
+            purpose="model_api_provider_key",
+        ).decode("utf-8")
+    except Exception as e:
+        return None, {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}
+    try:
+        return _provider_config_from_plain(config, provider_key)
+    except ProviderError as e:
+        return None, {"error": "model_api_config_invalid", "detail": str(e)}
+
+
+@app.route("/v1/model_api/setup", methods=["POST"])
+def model_api_setup():
+    store = require_user()
+    payload = request.get_json(silent=True) or {}
+    provider = str(payload.get("provider") or "")
+    model = str(payload.get("model") or "")
+    base_url = str(payload.get("base_url") or "")
+    raw_key = str(payload.get("api_key") or "").strip()
+    if not raw_key:
+        return jsonify({"error": "api_key required"}), 400
+    try:
+        provider, model, base_url = validate_provider_config(provider, model, base_url)
+    except ProviderError as e:
+        return jsonify({"error": str(e)}), 400
+
+    envelope, err = _build_shared_envelope_for_store(
+        store,
+        raw_key.encode("utf-8"),
+        item_id=f"model_api_key_{uuid.uuid4().hex}",
+    )
+    if envelope is None:
+        return jsonify({
+            "error": "cannot_encrypt_provider_key",
+            "detail": err,
+            "required": (
+                "The user must have a content public key and the enclave "
+                "attestation endpoint must be reachable before saving a provider key."
+            ),
+        }), 409
+
+    try:
+        test = test_provider_key(ProviderConfig(provider, model, raw_key, base_url))
+    except ProviderError as e:
+        return jsonify({
+            "error": "provider_test_failed",
+            "detail": str(e),
+            "status_code": e.status_code,
+        }), 400
+
+    config = _save_model_api_config(store, {
+        "provider": provider,
+        "model": model,
+        "base_url": base_url,
+        "api_key_hint": mask_api_key(raw_key),
+        "api_key_envelope": envelope,
+        "test_status": "ok",
+        "last_test_at": _now_iso(),
+        "last_test_usage": test.get("usage") or {},
+        "privacy_mode": "tdx_cvm_backend_runtime_option_a",
+    })
+    _save_onboarding_route(store, "model_api")
+    print(f"[model_api:{store.user_id}] setup provider={provider} model={model}")
+    return jsonify({"status": "configured", "config": _public_model_api_config(config)})
+
+
+@app.route("/v1/model_api/get", methods=["GET"])
+def model_api_get():
+    store = require_user()
+    return jsonify({"config": _public_model_api_config(_load_model_api_config(store))})
+
+
+@app.route("/v1/model_api/test", methods=["POST"])
+def model_api_test():
+    store = require_user()
+    api_key = _extract_api_key()
+    config = _load_model_api_config(store)
+    if not config:
+        return jsonify({"error": "model_api_not_configured"}), 404
+    runtime = _load_runtime_provider_config(store, api_key)
+    if isinstance(runtime, tuple):
+        _, err = runtime
+        config["test_status"] = "failed"
+        config["last_test_error"] = err.get("error", "unknown")
+        _save_model_api_config(store, config)
+        return jsonify(err), 400
+    try:
+        test = test_provider_key(runtime)
+    except ProviderError as e:
+        config["test_status"] = "failed"
+        config["last_test_error"] = str(e)[:240]
+        _save_model_api_config(store, config)
+        return jsonify({
+            "error": "provider_test_failed",
+            "detail": str(e),
+            "status_code": e.status_code,
+        }), 400
+    config["test_status"] = "ok"
+    config["last_test_at"] = _now_iso()
+    config["last_test_error"] = ""
+    config["last_test_usage"] = test.get("usage") or {}
+    _save_model_api_config(store, config)
+    print(f"[model_api:{store.user_id}] test ok provider={config.get('provider')} model={config.get('model')}")
+    return jsonify({"status": "ok", "config": _public_model_api_config(config)})
+
+
+@app.route("/v1/model_api/delete", methods=["DELETE"])
+def model_api_delete():
+    store = require_user()
+    deleted = False
+    try:
+        if store.model_api_file.exists():
+            store.model_api_file.unlink()
+            deleted = True
+    except Exception as e:
+        return jsonify({"error": f"delete_failed:{type(e).__name__}"}), 500
+    print(f"[model_api:{store.user_id}] deleted={deleted}")
+    return jsonify({"deleted": deleted})
+
+
+def _history_job_path(store: UserStore, job_id: str) -> Path:
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "", job_id or "")
+    return store.history_import_jobs_dir / f"{safe}.json"
+
+
+def _save_history_job(store: UserStore, job: dict) -> dict:
+    job["updated_at"] = _now_iso()
+    _write_json_object(_history_job_path(store, job["job_id"]), job, private=True)
+    return job
+
+
+_HISTORY_LINE_RE = re.compile(
+    r"^\s*(?:\[(?P<bracket_ts>[^\]]{6,80})\]\s*)?"
+    r"(?:(?P<iso_ts>\d{4}-\d{2}-\d{2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?)\s+)?"
+    r"(?:(?P<role>[A-Za-z\u4e00-\u9fff _-]{1,32})\s*[:：]\s*)?"
+    r"(?P<text>.+?)\s*$"
+)
+
+
+def _parse_history_ts(raw: str) -> float | None:
+    val = (raw or "").strip()
+    if not val:
+        return None
+    norm = val.replace("Z", "+00:00")
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", norm):
+        norm += "T00:00:00"
+    if " " in norm and "T" not in norm:
+        norm = norm.replace(" ", "T", 1)
+    try:
+        dt = datetime.fromisoformat(norm)
+        if dt.tzinfo:
+            dt = dt.replace(tzinfo=None)
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+def _normalize_history_role(raw: str) -> str:
+    role = (raw or "").strip().lower()
+    if role in {"user", "human", "me", "you", "我", "用户"}:
+        return "user"
+    if role in {"assistant", "ai", "agent", "claude", "chatgpt", "gemini", "gpt", "io", "ta", "他", "助手"}:
+        return "assistant"
+    return "user"
+
+
+def _parse_plaintext_history(content: str) -> list[dict]:
+    lines = (content or "").splitlines()
+    messages: list[dict] = []
+    cur: dict | None = None
+
+    def flush() -> None:
+        nonlocal cur
+        if cur and str(cur.get("content") or "").strip():
+            cur["content"] = str(cur["content"]).strip()
+            messages.append(cur)
+        cur = None
+
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            flush()
+            continue
+        m = _HISTORY_LINE_RE.match(line)
+        if not m:
+            if cur:
+                cur["content"] += "\n" + line
+            continue
+        role_raw = m.group("role") or ""
+        ts_raw = m.group("iso_ts") or m.group("bracket_ts") or ""
+        text = (m.group("text") or "").strip()
+        has_role = bool(role_raw.strip())
+        has_ts = bool(ts_raw.strip() and _parse_history_ts(ts_raw) is not None)
+        if has_role or has_ts or cur is None:
+            flush()
+            cur = {
+                "role": _normalize_history_role(role_raw),
+                "content": text,
+                "ts": _parse_history_ts(ts_raw),
+                "source": "history_import",
+            }
+        else:
+            cur["content"] += "\n" + line
+    flush()
+
+    if not messages and content.strip():
+        messages.append({
+            "role": "user",
+            "content": content.strip(),
+            "ts": None,
+            "source": "history_import",
+        })
+    return messages
+
+
+def _message_iso_date(msg: dict, fallback: date) -> str:
+    try:
+        ts = msg.get("ts")
+        if ts:
+            return datetime.fromtimestamp(float(ts)).date().isoformat()
+    except Exception:
+        pass
+    return fallback.isoformat()
+
+
+def _relationship_start_from_import(payload: dict, messages: list[dict]) -> tuple[date | None, str]:
+    raw = str(payload.get("relationship_started_at") or "").strip()
+    if raw:
+        parsed = _parse_iso_calendar_date(raw)
+        if parsed:
+            return parsed, ""
+        return None, "relationship_started_at must be YYYY-MM-DD or ISO datetime"
+
+    dated: list[date] = []
+    for msg in messages:
+        try:
+            ts = msg.get("ts")
+            if ts:
+                dated.append(datetime.fromtimestamp(float(ts)).date())
+        except Exception:
+            pass
+    if dated:
+        return min(dated), ""
+    if bool(payload.get("fresh_start")):
+        return date.today(), ""
+    return None, "relationship_started_at required when transcript has no timestamps; or pass fresh_start=true"
+
+
+def _transcript_sample(messages: list[dict], max_chars: int = 18000) -> str:
+    parts: list[str] = []
+    total = 0
+    for msg in messages:
+        role = "User" if msg.get("role") == "user" else "Assistant"
+        at = ""
+        try:
+            if msg.get("ts"):
+                at = datetime.fromtimestamp(float(msg["ts"])).isoformat(timespec="seconds") + " "
+        except Exception:
+            at = ""
+        text = str(msg.get("content") or "").strip()
+        if not text:
+            continue
+        line = f"{at}{role}: {text}"
+        if total + len(line) > max_chars:
+            break
+        parts.append(line)
+        total += len(line) + 1
+    return "\n".join(parts)
+
+
+def _json_from_model_text(text: str):
+    raw = (text or "").strip()
+    if not raw:
+        raise ValueError("empty model response")
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(raw):
+        if ch not in "{[":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(raw[idx:])
+            return obj
+        except Exception:
+            continue
+    raise ValueError("no json object found")
+
+
+def _coerce_memory_cards(raw, relationship_start: date) -> list[dict]:
+    if isinstance(raw, dict):
+        raw_items = raw.get("memories") or raw.get("cards") or raw.get("items") or []
+    else:
+        raw_items = raw
+    if not isinstance(raw_items, list):
+        return []
+
+    cards: list[dict] = []
+    allowed = {"moment", "quote", "fact", "event"}
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        mem_type = str(item.get("type") or "fact").strip().lower()
+        if mem_type not in allowed:
+            mem_type = "fact"
+        title = str(item.get("title") or "").strip()[:120]
+        desc = str(item.get("description") or item.get("content") or "").strip()[:1200]
+        if not desc:
+            continue
+        if not title:
+            title = desc[:72]
+        occurred = str(item.get("occurred_at") or item.get("date") or "").strip()
+        if not _parse_iso_calendar_date(occurred):
+            occurred = relationship_start.isoformat()
+        card = {
+            "type": mem_type,
+            "title": title,
+            "description": desc,
+            "occurred_at": occurred,
+        }
+        quote = str(item.get("her_quote") or item.get("quote") or "").strip()
+        if quote:
+            card["her_quote"] = quote[:500]
+        context = str(item.get("context") or "").strip()
+        if context:
+            card["context"] = context[:600]
+        cards.append(card)
+    return cards
+
+
+def _dedupe_memory_cards(cards: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for card in cards:
+        key = re.sub(
+            r"\s+",
+            " ",
+            (str(card.get("type") or "") + "|" + str(card.get("title") or "") + "|" + str(card.get("description") or "")[:160]).lower(),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(card)
+    return out
+
+
+def _fallback_memory_cards(
+    messages: list[dict],
+    relationship_start: date,
+    *,
+    story_needed: int,
+    about_needed: int,
+) -> list[dict]:
+    cards: list[dict] = []
+    usable = [m for m in messages if str(m.get("content") or "").strip()]
+    if not usable:
+        usable = [{"role": "user", "content": "Fresh start with IO.", "ts": None}]
+
+    idx = 0
+    story_types = ["moment", "quote"]
+    while story_needed > 0:
+        msg = usable[idx % len(usable)]
+        content = str(msg.get("content") or "").strip()
+        mem_type = story_types[idx % len(story_types)]
+        cards.append({
+            "type": mem_type,
+            "title": ("Imported exchange" if mem_type == "moment" else "Imported quote") + f" {idx + 1}",
+            "description": content[:900],
+            "her_quote": content[:360] if mem_type == "quote" and msg.get("role") == "user" else "",
+            "occurred_at": _message_iso_date(msg, relationship_start),
+        })
+        idx += 1
+        story_needed -= 1
+
+    about_types = ["fact", "event"]
+    while about_needed > 0:
+        msg = usable[idx % len(usable)]
+        content = str(msg.get("content") or "").strip()
+        mem_type = about_types[idx % len(about_types)]
+        cards.append({
+            "type": mem_type,
+            "title": ("Imported user detail" if mem_type == "fact" else "Imported event") + f" {idx + 1}",
+            "description": content[:900],
+            "occurred_at": _message_iso_date(msg, relationship_start),
+        })
+        idx += 1
+        about_needed -= 1
+    return cards
+
+
+def _extract_memory_cards_with_provider(
+    provider: ProviderConfig,
+    messages: list[dict],
+    relationship_start: date,
+    floors: dict,
+) -> tuple[list[dict], list[str]]:
+    warnings: list[str] = []
+    target_total = int(floors.get("story", 1)) + int(floors.get("about_me", 1))
+    sample = _transcript_sample(messages, max_chars=22000)
+    if not sample:
+        return [], ["empty_transcript_sample"]
+    prompt = (
+        "Extract Memory Garden cards from this transcript. Return JSON only in this shape: "
+        "{\"memories\":[{\"type\":\"moment|quote|fact|event\",\"title\":\"...\","
+        "\"description\":\"...\",\"her_quote\":\"optional user quote\","
+        "\"occurred_at\":\"YYYY-MM-DD\"}]}. "
+        f"Need at least {floors.get('story', 1)} story cards (moment/quote) and "
+        f"{floors.get('about_me', 1)} about_me cards (fact/event), up to {max(target_total + 6, 8)} total. "
+        "Use concrete details only; do not invent beyond the transcript. "
+        f"If dates are unclear, use {relationship_start.isoformat()}."
+        "\n\nTranscript:\n" + sample
+    )
+    try:
+        result = chat_completion(
+            provider,
+            [
+                {"role": "system", "content": "You are a strict JSON extraction engine for Feedling Memory Garden."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=2600,
+            temperature=0.1,
+            timeout=45.0,
+        )
+        parsed = _json_from_model_text(result["reply"])
+        return _dedupe_memory_cards(_coerce_memory_cards(parsed, relationship_start)), warnings
+    except Exception as e:
+        warnings.append(f"provider_memory_extraction_failed:{type(e).__name__}:{str(e)[:160]}")
+        return [], warnings
+
+
+def _memory_counts_for_cards(cards: list[dict]) -> dict:
+    counts = {"story": 0, "about_me": 0, "ta_thinking": 0, "total": 0}
+    for card in cards:
+        t = str(card.get("type") or "")
+        tab = TAB_FOR_TYPE.get(t)
+        counts["total"] += 1
+        if tab:
+            counts[tab] += 1
+    return counts
+
+
+def _ensure_import_memory_floors(
+    cards: list[dict],
+    messages: list[dict],
+    relationship_start: date,
+    floors: dict,
+) -> list[dict]:
+    counts = _memory_counts_for_cards(cards)
+    story_needed = max(0, int(floors.get("story", 1)) - counts["story"])
+    about_needed = max(0, int(floors.get("about_me", 1)) - counts["about_me"])
+    if story_needed or about_needed:
+        cards = cards + _fallback_memory_cards(
+            messages,
+            relationship_start,
+            story_needed=story_needed,
+            about_needed=about_needed,
+        )
+    # Force the first persisted memory to anchor the relationship start date.
+    if cards:
+        cards[0]["occurred_at"] = relationship_start.isoformat()
+    return _dedupe_memory_cards(cards)
+
+
+def _moment_from_memory_card(store: UserStore, card: dict, envelope: dict) -> dict:
+    now = _now_iso()
+    moment = {
+        "v": 1,
+        "id": envelope.get("id") or f"mom_{uuid.uuid4().hex[:12]}",
+        "type": str(card.get("type") or "fact"),
+        "occurred_at": str(card.get("occurred_at") or now),
+        "created_at": now,
+        "source": "history_import",
+        "body_ct": envelope["body_ct"],
+        "nonce": envelope["nonce"],
+        "K_user": envelope["K_user"],
+        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+        "visibility": envelope["visibility"],
+        "owner_user_id": envelope["owner_user_id"],
+    }
+    if envelope.get("K_enclave"):
+        moment["K_enclave"] = envelope["K_enclave"]
+    return moment
+
+
+def _append_import_memory_cards(store: UserStore, cards: list[dict]) -> list[dict]:
+    moments = _load_moments(store)
+    created: list[dict] = []
+    for card in cards:
+        mem_type = str(card.get("type") or "")
+        if mem_type not in {"moment", "quote", "fact", "event"}:
+            continue
+        body = {
+            "title": str(card.get("title") or "")[:120],
+            "description": str(card.get("description") or "")[:1200],
+            "type": mem_type,
+        }
+        for key in ("her_quote", "context", "linked_dimension"):
+            value = str(card.get(key) or "").strip()
+            if value:
+                body[key] = value[:800]
+        envelope, err = _build_shared_envelope_for_store(
+            store,
+            json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        )
+        if envelope is None:
+            raise RuntimeError(f"memory_envelope_failed:{err}")
+        envelope["type"] = mem_type
+        envelope["occurred_at"] = str(card.get("occurred_at") or date.today().isoformat())
+        envelope["source"] = "history_import"
+        moments.append(_moment_from_memory_card(store, card, envelope))
+        created.append(moments[-1])
+    _save_moments(store, moments)
+    if created:
+        _log_bootstrap_event(store, "history_import_memory_written", success=True)
+    return created
+
+
+def _fallback_identity_payload(memories: list[dict], days: int) -> dict:
+    sample_desc = ""
+    if memories:
+        sample_desc = str(memories[0].get("description") or memories[0].get("title") or "")
+    desc = sample_desc[:220] or "I am still learning from the imported history."
+    names = [
+        "Attentive", "Steady", "Playful", "Protective",
+        "Curious", "Direct", "Tender",
+    ]
+    values = [74, 68, 56, 63, 71, 59, 66]
+    dimensions = [
+        {
+            "name": name,
+            "value": values[idx],
+            "description": (
+                f"Estimated from imported history. Anchor: {desc}"
+                if idx == 0 else
+                "Estimated from imported chat patterns; refine after live conversation."
+            ),
+        }
+        for idx, name in enumerate(names)
+    ]
+    return {
+        "agent_name": "IO",
+        "self_introduction": (
+            "I imported our previous history and built a first version of my memory "
+            "from it. I may still need correction, but I can now answer with that "
+            "context instead of starting blank."
+        ),
+        "dimensions": dimensions,
+        "days_with_user": days,
+        "category": "Attentive · Grounded",
+        "signature": ["Built from receipts", "Ready to keep noticing"],
+    }
+
+
+def _normalize_identity_payload(raw, memories: list[dict], days: int) -> dict:
+    if not isinstance(raw, dict):
+        return _fallback_identity_payload(memories, days)
+    payload = dict(raw.get("identity") if isinstance(raw.get("identity"), dict) else raw)
+    dims = payload.get("dimensions")
+    if not isinstance(dims, list):
+        return _fallback_identity_payload(memories, days)
+    clean_dims: list[dict] = []
+    for idx, dim in enumerate(dims[:7]):
+        if not isinstance(dim, dict):
+            continue
+        name = str(dim.get("name") or f"Dimension {idx + 1}")[:60]
+        try:
+            value = int(dim.get("value", 50))
+        except Exception:
+            value = 50
+        desc = str(dim.get("description") or dim.get("evidence") or "")[:500]
+        clean_dims.append({
+            "name": name,
+            "value": max(0, min(value, 100)),
+            "description": desc or "Derived from imported history.",
+        })
+    if len(clean_dims) != 7:
+        return _fallback_identity_payload(memories, days)
+    payload["agent_name"] = str(payload.get("agent_name") or "IO")[:80]
+    payload["self_introduction"] = str(payload.get("self_introduction") or "")[:1200]
+    if not payload["self_introduction"]:
+        payload["self_introduction"] = _fallback_identity_payload(memories, days)["self_introduction"]
+    payload["dimensions"] = clean_dims
+    payload["days_with_user"] = days
+    if "signature" in payload and not isinstance(payload["signature"], list):
+        payload.pop("signature", None)
+    if "category" in payload:
+        payload["category"] = str(payload["category"])[:120]
+    return payload
+
+
+def _derive_identity_with_provider(
+    provider: ProviderConfig,
+    messages: list[dict],
+    memory_cards: list[dict],
+    days: int,
+) -> tuple[dict, list[str]]:
+    warnings: list[str] = []
+    memory_sample = json.dumps(memory_cards[:40], ensure_ascii=False)
+    transcript = _transcript_sample(messages, max_chars=12000)
+    prompt = (
+        "Derive a Feedling Identity Card from imported chat history and memory cards. "
+        "Return JSON only with fields: agent_name, self_introduction, category, "
+        "signature (array of two short strings), dimensions (exactly 7 objects with "
+        "name, value 0-100, description). Do not invent facts not grounded in input. "
+        f"days_with_user is {days}.\n\nMemory cards:\n{memory_sample}\n\nTranscript sample:\n{transcript}"
+    )
+    try:
+        result = chat_completion(
+            provider,
+            [
+                {"role": "system", "content": "You write concise, grounded Feedling identity JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=1800,
+            temperature=0.3,
+            timeout=45.0,
+        )
+        return _normalize_identity_payload(_json_from_model_text(result["reply"]), memory_cards, days), warnings
+    except Exception as e:
+        warnings.append(f"provider_identity_failed:{type(e).__name__}:{str(e)[:160]}")
+        return _fallback_identity_payload(memory_cards, days), warnings
+
+
+def _store_identity_payload(
+    store: UserStore,
+    identity_payload: dict,
+    *,
+    days_with_user: int,
+    evidence: str,
+) -> dict:
+    envelope, err = _build_shared_envelope_for_store(
+        store,
+        json.dumps(identity_payload, ensure_ascii=False).encode("utf-8"),
+    )
+    if envelope is None:
+        raise RuntimeError(f"identity_envelope_failed:{err}")
+
+    existing = _load_identity(store)
+    now = _now_iso()
+    identity = {
+        "v": 1,
+        "id": envelope.get("id") or (existing.get("id") if existing else uuid.uuid4().hex),
+        "body_ct": envelope["body_ct"],
+        "nonce": envelope["nonce"],
+        "K_user": envelope["K_user"],
+        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+        "visibility": envelope["visibility"],
+        "owner_user_id": envelope["owner_user_id"],
+        "created_at": existing.get("created_at") if existing else now,
+        "updated_at": now,
+        "relationship_started_at": _anchor_from_days(days_with_user, store=store, prefer_memory=True),
+        "relationship_anchor_source": "history_import",
+        "relationship_anchor_evidence": evidence,
+    }
+    if envelope.get("K_enclave"):
+        identity["K_enclave"] = envelope["K_enclave"]
+    _save_identity(store, identity)
+    _log_bootstrap_event(store, "history_import_identity_written", success=True)
+    _append_identity_change(store, {
+        "action": "replace" if existing else "init",
+        "reason": "Identity card written from Model API history import.",
+    })
+    return identity
+
+
+def _append_import_chat_messages(store: UserStore, messages: list[dict]) -> list[dict]:
+    created: list[dict] = []
+    for msg in messages[-MAX_CHAT_MESSAGES:]:
+        text = str(msg.get("content") or "").strip()
+        if not text:
+            continue
+        envelope, err = _build_shared_envelope_for_store(
+            store,
+            text.encode("utf-8"),
+        )
+        if envelope is None:
+            raise RuntimeError(f"chat_envelope_failed:{err}")
+        role = "user" if msg.get("role") == "user" else "openclaw"
+        created.append(store.append_chat(role, "history_import", envelope))
+    if created:
+        _log_bootstrap_event(store, "history_import_chat_written", success=True)
+    return created
+
+
+def _process_history_import_sync(
+    store: UserStore,
+    api_key: str | None,
+    job: dict,
+    payload: dict,
+) -> dict:
+    content = str(payload.get("content") or "")
+    fmt = str(payload.get("format") or "plaintext").strip().lower()
+    if fmt not in {"plaintext", "text"}:
+        raise ValueError("P0 supports format=plaintext only")
+    if not content.strip():
+        raise ValueError("content required")
+
+    runtime = _load_runtime_provider_config(store, api_key)
+    if isinstance(runtime, tuple):
+        _, err = runtime
+        raise RuntimeError(json.dumps(err, ensure_ascii=False))
+
+    messages = _parse_plaintext_history(content)
+    relationship_start, rel_err = _relationship_start_from_import(payload, messages)
+    if relationship_start is None:
+        raise ValueError(rel_err)
+    days = max(0, (date.today() - relationship_start).days)
+    floors = _per_tab_floors_for_days(days)
+
+    job.update({
+        "status": "processing",
+        "format": "plaintext",
+        "messages_parsed": len(messages),
+        "relationship_started_at": relationship_start.isoformat(),
+        "relationship_days": days,
+        "floors": floors,
+    })
+    _save_history_job(store, job)
+
+    chat_rows = _append_import_chat_messages(store, messages)
+    provider_cards, warnings = _extract_memory_cards_with_provider(
+        runtime,
+        messages,
+        relationship_start,
+        floors,
+    )
+    cards = _ensure_import_memory_floors(provider_cards, messages, relationship_start, floors)
+    memory_rows = _append_import_memory_cards(store, cards)
+
+    identity_payload, id_warnings = _derive_identity_with_provider(runtime, messages, cards, days)
+    warnings.extend(id_warnings)
+    identity = _store_identity_payload(
+        store,
+        identity_payload,
+        days_with_user=days,
+        evidence=f"history_import:{job['job_id']} relationship_started_at={relationship_start.isoformat()}",
+    )
+
+    job.update({
+        "status": "completed",
+        "completed_at": _now_iso(),
+        "chat_messages_imported": len(chat_rows),
+        "memories_created": len(memory_rows),
+        "identity_written": bool(identity),
+        "warnings": warnings,
+    })
+    return _save_history_job(store, job)
+
+
+@app.route("/v1/history_import/upload", methods=["POST"])
+def history_import_upload():
+    store = require_user()
+    api_key = _extract_api_key()
+    payload = request.get_json(silent=True) or {}
+    job_id = f"hi_{uuid.uuid4().hex[:16]}"
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "created_at": _now_iso(),
+    }
+    _save_history_job(store, job)
+    try:
+        job = _process_history_import_sync(store, api_key, job, payload)
+    except Exception as e:
+        job.update({
+            "status": "failed",
+            "failed_at": _now_iso(),
+            "error": f"{type(e).__name__}:{str(e)[:500]}",
+        })
+        _save_history_job(store, job)
+        return jsonify({"job": job}), 400
+    print(
+        f"[history_import:{store.user_id}] job={job_id} messages={job.get('messages_parsed')} "
+        f"memories={job.get('memories_created')} chat={job.get('chat_messages_imported')}"
+    )
+    return jsonify({"job": job}), 201
+
+
+@app.route("/v1/history_import/status/<job_id>", methods=["GET"])
+def history_import_status(job_id):
+    store = require_user()
+    path = _history_job_path(store, job_id)
+    data = _read_json_object(path)
+    if not data:
+        return jsonify({"error": "job_not_found"}), 404
+    return jsonify({"job": data})
+
+
+def _model_api_should_attach_screen(message: str, include_flag: bool) -> bool:
+    if include_flag:
+        return True
+    text = (message or "").lower()
+    cues = (
+        "screen", "screenshot", "what am i looking at", "look at this",
+        "current app", "current page", "屏幕", "截图", "现在这个", "帮我看",
+    )
+    return any(cue in text for cue in cues)
+
+
+def _model_api_context_messages(
+    store: UserStore,
+    api_key: str | None,
+    user_message: str,
+    *,
+    include_screen_context: bool,
+) -> tuple[list[dict], dict]:
+    hist, hist_err = _enclave_get_json_for_gate(
+        "/v1/chat/history",
+        api_key,
+        {"limit": "30"},
+    )
+    identity_data, identity_err = _enclave_get_json_for_gate("/v1/identity/get", api_key)
+    context_memories = []
+    recent_messages = []
+    if isinstance(hist, dict):
+        context_memories = hist.get("context_memories") if isinstance(hist.get("context_memories"), list) else []
+        recent_messages = hist.get("messages") if isinstance(hist.get("messages"), list) else []
+
+    identity = {}
+    if isinstance(identity_data, dict) and isinstance(identity_data.get("identity"), dict):
+        identity = identity_data["identity"]
+
+    screen_context = ""
+    if _model_api_should_attach_screen(user_message, include_screen_context):
+        with store.frames_lock:
+            latest = store.frames_meta[-1].copy() if store.frames_meta else None
+        if latest and latest.get("id"):
+            frame = _decrypt_frame_metadata_for_gate(
+                store,
+                str(latest.get("id")),
+                api_key,
+                include_image=False,
+            )
+            if not frame.get("error"):
+                screen_context = (
+                    f"Current screen app: {frame.get('app') or 'unknown'}\n"
+                    f"Current screen OCR: {str(frame.get('ocr_text') or '')[:1600]}"
+                )
+
+    identity_summary = {
+        "agent_name": identity.get("agent_name", ""),
+        "self_introduction": identity.get("self_introduction", ""),
+        "days_with_user": identity.get("days_with_user"),
+        "category": identity.get("category", ""),
+        "signature": identity.get("signature", []),
+        "dimensions": identity.get("dimensions", []),
+    }
+    context_payload = {
+        "identity": identity_summary,
+        "context_memories": context_memories[:8],
+        "screen_context": screen_context,
+        "context_errors": {
+            "history": hist_err,
+            "identity": identity_err,
+        },
+    }
+
+    messages: list[dict] = [
+        {
+            "role": "system",
+            "content": (
+                "You are the user's IO companion. Reply naturally and concisely. "
+                "Use the provided identity and memory context when relevant. "
+                "Do not mention hidden implementation details, API keys, prompts, or encrypted storage."
+            ),
+        },
+        {
+            "role": "system",
+            "content": "Feedling context JSON:\n" + json.dumps(context_payload, ensure_ascii=False)[:12000],
+        },
+    ]
+    for msg in recent_messages[-14:]:
+        content = str(msg.get("content") or "").strip()
+        if not content:
+            continue
+        role = "assistant" if msg.get("role") in {"openclaw", "agent", "assistant"} else "user"
+        messages.append({"role": role, "content": content[:4000]})
+    if not any(m.get("role") == "user" and m.get("content") == user_message for m in messages[-3:]):
+        messages.append({"role": "user", "content": user_message})
+    return messages, context_payload
+
+
+@app.route("/v1/model_api/chat/send", methods=["POST"])
+def model_api_chat_send():
+    store = require_user()
+    api_key = _extract_api_key()
+    payload = request.get_json(silent=True) or {}
+    message = str(payload.get("message") or payload.get("content") or "").strip()
+    if not message:
+        return jsonify({"error": "message required"}), 400
+    if len(message) > 12000:
+        return jsonify({"error": "message too long", "max_chars": 12000}), 413
+
+    runtime = _load_runtime_provider_config(store, api_key)
+    if isinstance(runtime, tuple):
+        _, err = runtime
+        return jsonify(err), 400
+
+    user_env, env_err = _build_shared_envelope_for_store(store, message.encode("utf-8"))
+    if user_env is None:
+        return jsonify({"error": "user_message_envelope_failed", "detail": env_err}), 409
+    user_row = store.append_chat("user", "model_api", user_env)
+    store.notify_chat_waiters()
+
+    provider_messages, context_payload = _model_api_context_messages(
+        store,
+        api_key,
+        message,
+        include_screen_context=bool(payload.get("include_screen_context")),
+    )
+    try:
+        result = chat_completion(
+            runtime,
+            provider_messages,
+            max_tokens=int(payload.get("max_tokens") or 900),
+            temperature=float(payload.get("temperature") or 0.7),
+            timeout=90.0,
+        )
+    except ProviderError as e:
+        return jsonify({
+            "error": "provider_chat_failed",
+            "detail": str(e),
+            "status_code": e.status_code,
+            "user_message_id": user_row["id"],
+        }), 502
+
+    reply = str(result.get("reply") or "").strip()
+    if not reply:
+        return jsonify({"error": "provider_empty_reply", "user_message_id": user_row["id"]}), 502
+    assistant_env, env_err = _build_shared_envelope_for_store(store, reply.encode("utf-8"))
+    if assistant_env is None:
+        return jsonify({"error": "assistant_envelope_failed", "detail": env_err}), 409
+    assistant_row = store.append_chat("openclaw", "model_api", assistant_env)
+    store.notify_chat_waiters()
+    print(
+        f"[model_api_chat:{store.user_id}] user_msg={user_row['id']} "
+        f"reply={assistant_row['id']} provider={runtime.provider} model={runtime.model}"
+    )
+    return jsonify({
+        "status": "ok",
+        "reply": reply,
+        "user_message": {"id": user_row["id"], "ts": user_row["ts"]},
+        "assistant_message": {"id": assistant_row["id"], "ts": assistant_row["ts"]},
+        "provider": runtime.provider,
+        "model": runtime.model,
+        "usage": result.get("usage") or {},
+        "context": {
+            "memories": len(context_payload.get("context_memories") or []),
+            "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
+            "screen_context": bool(context_payload.get("screen_context")),
+        },
+    })
+
+
+# ---------------------------------------------------------------------------
 # Screen / aggregation
 # ---------------------------------------------------------------------------
 
@@ -6833,7 +8015,175 @@ def _real_user_agent_exchange_verified(store) -> bool:
     return False
 
 
+def _model_api_hosted_chat_verified(store) -> bool:
+    with store.chat_lock:
+        chat_msgs = list(store.chat_messages)
+    sorted_msgs = sorted(
+        chat_msgs,
+        key=lambda m: float(m.get("ts") or m.get("timestamp") or 0),
+    )
+    seen_model_user = False
+    for m in sorted_msgs:
+        if m.get("source") != "model_api":
+            continue
+        role = m.get("role")
+        if role == "user":
+            seen_model_user = True
+        elif role in ("agent", "openclaw") and seen_model_user:
+            return True
+    return False
+
+
+def _latest_history_import_job(store: UserStore) -> dict | None:
+    jobs: list[dict] = []
+    try:
+        for path in store.history_import_jobs_dir.glob("*.json"):
+            data = _read_json_object(path)
+            if data:
+                jobs.append(data)
+    except Exception:
+        return None
+    if not jobs:
+        return None
+    jobs.sort(key=lambda j: str(j.get("updated_at") or j.get("created_at") or ""))
+    return jobs[-1]
+
+
+def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
+    bootstrap_st = _bootstrap_state(store)
+    memory_ok = not bootstrap_st["missing_tabs"]
+    identity = _load_identity(store)
+    identity_written = identity is not None
+    relationship_anchored = bool(identity and identity.get("relationship_started_at"))
+    relationship_evidence = str((identity or {}).get("relationship_anchor_evidence") or "").strip()
+    relationship_ok = relationship_anchored and bool(relationship_evidence)
+    config = _load_model_api_config(store)
+    latest_job = _latest_history_import_job(store)
+    history_ok = bool(latest_job and latest_job.get("status") == "completed")
+    hosted_chat_ok = _model_api_hosted_chat_verified(store)
+
+    steps = [
+        {
+            "id": "model_api_config",
+            "label": "Model API Config",
+            "passing": bool(config),
+            "provider": (config or {}).get("provider", ""),
+            "model": (config or {}).get("model", ""),
+            "required": "Call /v1/model_api/setup with provider, model, and api_key." if not config else "",
+        },
+        {
+            "id": "model_api_test",
+            "label": "Model API Test",
+            "passing": bool(config and config.get("test_status") == "ok"),
+            "test_status": (config or {}).get("test_status", ""),
+            "required": "Call /v1/model_api/test until test_status is ok." if not (config and config.get("test_status") == "ok") else "",
+        },
+        {
+            "id": "history_import",
+            "label": "History Import",
+            "passing": history_ok,
+            "job_id": (latest_job or {}).get("job_id", ""),
+            "job_status": (latest_job or {}).get("status", ""),
+            "messages_parsed": (latest_job or {}).get("messages_parsed", 0),
+            "memories_created": (latest_job or {}).get("memories_created", 0),
+            "required": "Call /v1/history_import/upload with a real transcript." if not history_ok else "",
+        },
+        {
+            "id": "memory_garden",
+            "label": "Memory Garden",
+            "passing": memory_ok,
+            "counts": bootstrap_st["counts"],
+            "floors": bootstrap_st["floors"],
+            "missing_tabs": bootstrap_st["missing_tabs"],
+            "required": _gate_required_for_missing_tabs(bootstrap_st) if not memory_ok else "",
+        },
+        {
+            "id": "identity_card",
+            "label": "Identity Card",
+            "passing": identity_written,
+            "written": identity_written,
+            "required": "History import must derive and write Identity Card." if not identity_written else "",
+        },
+        {
+            "id": "relationship_anchor",
+            "label": "Relationship Anchor",
+            "passing": relationship_ok,
+            "relationship_anchored": relationship_anchored,
+            "relationship_anchor_source": (identity or {}).get("relationship_anchor_source", ""),
+            "relationship_anchor_evidence": relationship_evidence,
+            "days_with_user": _live_days_with_user(identity, store=store) if identity else None,
+            "required": "History import must include relationship_started_at or fresh_start=true." if not relationship_ok else "",
+        },
+        {
+            "id": "hosted_chat",
+            "label": "Hosted Chat",
+            "passing": hosted_chat_ok,
+            "required": "Send one test message through /v1/model_api/chat/send." if not hosted_chat_ok else "",
+        },
+    ]
+    next_step = next((step for step in steps if not step["passing"]), None)
+    return {
+        "passing": next_step is None,
+        "stage": "complete" if next_step is None else next_step["id"],
+        "route": "model_api",
+        "next_action": "" if next_step is None else next_step["required"],
+        "steps": steps,
+        "skill_url": "https://raw.githubusercontent.com/teleport-computer/io-onboarding/main/skill-api.md",
+    }
+
+
+def _official_import_onboarding_validation_payload(store: UserStore) -> dict:
+    bootstrap_st = _bootstrap_state(store)
+    memory_ok = not bootstrap_st["missing_tabs"]
+    identity = _load_identity(store)
+    identity_written = identity is not None
+    relationship_evidence = str((identity or {}).get("relationship_anchor_evidence") or "").strip()
+    relationship_ok = bool(identity and identity.get("relationship_started_at") and relationship_evidence)
+    steps = [
+        {
+            "id": "memory_garden",
+            "label": "Memory Garden",
+            "passing": memory_ok,
+            "counts": bootstrap_st["counts"],
+            "floors": bootstrap_st["floors"],
+            "missing_tabs": bootstrap_st["missing_tabs"],
+            "required": _gate_required_for_missing_tabs(bootstrap_st) if not memory_ok else "",
+        },
+        {
+            "id": "identity_card",
+            "label": "Identity Card",
+            "passing": identity_written,
+            "written": identity_written,
+            "required": "Use the official app/tool client to import memory and identity." if not identity_written else "",
+        },
+        {
+            "id": "relationship_anchor",
+            "label": "Relationship Anchor",
+            "passing": relationship_ok,
+            "relationship_anchor_evidence": relationship_evidence,
+            "days_with_user": _live_days_with_user(identity, store=store) if identity else None,
+            "required": "Set relationship anchor during import." if not relationship_ok else "",
+        },
+    ]
+    next_step = next((step for step in steps if not step["passing"]), None)
+    return {
+        "passing": next_step is None,
+        "stage": "import_ready" if next_step is None else next_step["id"],
+        "route": "official_import",
+        "realtime_chat_supported": False,
+        "next_action": "" if next_step is None else next_step["required"],
+        "steps": steps,
+        "skill_url": "https://raw.githubusercontent.com/teleport-computer/io-onboarding/main/skill-chat-client.md",
+    }
+
+
 def _onboarding_validation_payload(store: UserStore) -> dict:
+    route = _load_onboarding_route(store)
+    if route == "model_api":
+        return _model_api_onboarding_validation_payload(store)
+    if route == "official_import":
+        return _official_import_onboarding_validation_payload(store)
+
     bootstrap_st = _bootstrap_state(store)
     memory_ok = not bootstrap_st["missing_tabs"]
     identity = _load_identity(store)
@@ -6929,6 +8279,7 @@ def _onboarding_validation_payload(store: UserStore) -> dict:
     return {
         "passing": next_step is None,
         "stage": "complete" if next_step is None else next_step["id"],
+        "route": "resident",
         "next_action": "" if next_step is None else next_step["required"],
         "steps": steps,
         "skill_url": _SKILL_URL,

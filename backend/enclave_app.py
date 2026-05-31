@@ -580,6 +580,56 @@ def _parse_iso_calendar_date(value: str) -> _dt.date | None:
         return None
 
 
+@app.route("/v1/envelope/decrypt", methods=["POST"])
+def v1_envelope_decrypt():
+    """Decrypt one caller-owned v1 envelope.
+
+    This is intentionally narrow: callers authenticate with the normal
+    Feedling API key, the enclave resolves the authorized user through Flask,
+    and `_decrypt_envelope` enforces owner_user_id == authorized_user_id before
+    opening the body. Flask uses this for Model API provider-key unwrapping in
+    the IO-hosted runtime; raw plaintext is returned only to the authenticated
+    internal caller and should never be logged.
+    """
+    if not _state["ready"]:
+        return jsonify({"error": "not_ready", "detail": _state["error"]}), 503
+
+    api_key = _extract_api_key()
+    if not api_key:
+        return jsonify({"error": "missing_api_key"}), 401
+
+    try:
+        whoami = _flask_get("/v1/users/whoami", api_key)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            return jsonify({"error": "unauthorized"}), 401
+        return jsonify({"error": f"backend_error: {e}"}), 502
+    except httpx.HTTPError as e:
+        return jsonify({"error": f"backend_error: {e}"}), 502
+
+    authorized_user_id = whoami.get("user_id", "")
+    if not authorized_user_id:
+        return jsonify({"error": "cannot_resolve_user_id"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    env = payload.get("envelope")
+    if not isinstance(env, dict):
+        return jsonify({"error": "envelope required"}), 400
+
+    content_sk = _get_or_derive_content_sk()
+    try:
+        plaintext = _decrypt_envelope(env, authorized_user_id, content_sk)
+    except DecryptFailure as e:
+        return jsonify({"error": f"decrypt_failed: {e.reason}"}), 403
+
+    return jsonify({
+        "owner_user_id": authorized_user_id,
+        "id": env.get("id", ""),
+        "v": int(env.get("v", 1)),
+        "plaintext_b64": base64.b64encode(plaintext).decode("ascii"),
+    })
+
+
 # ---------------------------------------------------------------------------
 # Agent-facing decrypt-and-serve handlers.
 #
