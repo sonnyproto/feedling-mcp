@@ -3234,6 +3234,53 @@ def _run_ws_server():
 threading.Thread(target=_run_ws_server, daemon=True).start()
 
 app = Flask(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Per-request access log
+# ---------------------------------------------------------------------------
+# gunicorn (production) does not emit Flask's old dev-server access line, so
+# without this the only per-request visibility in `phala cvms logs` is whatever
+# individual handlers happen to print. This logs ONE structured line per
+# request with the server-side handler time (dur_ms) and the on-the-wire
+# response size + encoding — enough to tell "backend slow" from "network slow"
+# and to spot oversized responses straight from the CVM logs. Registered
+# before Compress(app) so it runs AFTER compression and records the final
+# Content-Length / Content-Encoding.
+@app.before_request
+def _access_log_start():
+    g._req_start = time.monotonic()
+
+
+@app.after_request
+def _access_log_end(response):
+    # /healthz is hit constantly by the HAProxy/uptime probe — skip the noise.
+    if request.path == "/healthz":
+        return response
+    start = getattr(g, "_req_start", None)
+    dur_ms = int((time.monotonic() - start) * 1000) if start is not None else -1
+    uid = getattr(g, "user_id", "-")
+    clen = response.headers.get("Content-Length", "?")
+    enc = response.headers.get("Content-Encoding", "-")
+    # Keep the query string (limit/since/include_image_body — the useful bits)
+    # but REDACT the `key` param: _extract_api_key() accepts `?key=` as an auth
+    # method, so the URL can carry a live API key that must never reach the logs.
+    if request.args.get("key"):
+        pairs = [
+            (k, "REDACTED" if k.lower() == "key" else v)
+            for k, v in request.args.items(multi=True)
+        ]
+        path = f"{request.path}?{urlencode(pairs)}"
+    else:
+        path = request.full_path.rstrip("?")
+    print(
+        f"[req] uid={uid} {request.method} {path} status={response.status_code} "
+        f"bytes={clen} enc={enc} dur_ms={dur_ms}",
+        flush=True,
+    )
+    return response
+
+
 # gzip responses when the client sends Accept-Encoding: gzip. CVM egress
 # throughput is ~30-50 KB/s for large payloads; the decrypt-with-image
 # path was shipping 470 KB of JSON per call, and dropping that in half
@@ -7307,5 +7354,9 @@ if __name__ == "__main__":
     # deploys can leave it unset — the 5001 default matches the published
     # compose/Dockerfile contract.
     port = int(os.environ.get("FEEDLING_PORT", os.environ.get("PORT", "5001")))
-    print(f"Feedling server running at http://0.0.0.0:{port} (mode=multi-tenant, auth=api-key)")
+    # Production and all containers run gunicorn (see deploy/Dockerfile CMD
+    # and the compose files): the Werkzeug dev server below is single-process
+    # and stalls on large responses under the TDX CVM. Keep this path for
+    # local dev and the hermetic test harness ONLY — never for real traffic.
+    print(f"Feedling DEV server running at http://0.0.0.0:{port} (mode=multi-tenant, auth=api-key; prod uses gunicorn)")
     app.run(host="0.0.0.0", port=port, debug=False)

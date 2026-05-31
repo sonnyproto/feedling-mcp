@@ -63,6 +63,9 @@ USER feedling
 
 EXPOSE 5001 5002 9998
 
-# Default command runs the Flask backend. docker-compose overrides for the
-# MCP service.
-CMD ["python", "-u", "backend/app.py"]
+# Default command runs the Flask backend under gunicorn (production WSGI;
+# the Werkzeug dev server in app.run() stalls on large responses under the
+# TDX CVM). Single worker is mandatory — app.py binds the WebSocket ingest
+# on :9998 at import time, so multiple workers would collide on that port;
+# concurrency comes from threads. docker-compose overrides this for MCP.
+CMD ["gunicorn", "--chdir", "backend", "-w", "1", "--threads", "16", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]

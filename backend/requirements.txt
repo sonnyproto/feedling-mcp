@@ -7,6 +7,13 @@ cryptography>=42.0.0
 fastmcp>=2.0.0
 Pillow>=10.0.0
 
+# Production WSGI server for the Flask backend. The dev server in
+# app.run() (Werkzeug) is single-process and stalls on large responses
+# under the TDX CVM; gunicorn gives worker timeouts + better write-out.
+# MUST stay single-worker: app.py starts the WebSocket ingest thread at
+# import time (binds :9998), so multiple workers would collide on it.
+gunicorn>=23.0.0
+
 # Phase 1 (enclave) deps — see backend/enclave_app.py
 PyNaCl>=1.5.0
 dstack-sdk>=0.5.0

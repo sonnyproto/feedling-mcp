@@ -296,6 +296,57 @@ Creates a venv under `~/feedling-venv`, installs deps, writes
 `~/feedling.env` (multi-tenant — no shared API key), and starts
 `feedling-backend` + `feedling-mcp` systemd units.
 
+### Logs
+
+All services log to stdout. In production read them with `phala cvms logs`;
+locally with `docker compose logs`.
+
+**Production (Phala CVM).** `phala cvms logs <cvm>` defaults to the *first*
+container — `ingress` (HAProxy) — whose lines are TCP/TLS access records, not
+HTTP, so they look empty of useful detail. To read a specific service, pass
+`-c <container>`:
+
+```bash
+# backend (Flask API + the [req] access log below). -f follows, -t adds timestamps.
+phala cvms logs feedling-enclave-v2 -c <backend-container> --tail 200 -t
+```
+
+dstack container names are **not** the compose service names, and the CLI can't
+list them (`phala cvms` has no `ps`/`exec`; `get` doesn't expose them). Read the
+real names off the CVM detail page in the Phala dashboard
+(`cloud.phala.network`), then use them with `-c` — same for the `mcp` and
+`enclave` containers.
+
+**Per-request access log.** The backend runs under gunicorn in production, which
+does not reproduce Flask's old dev-server access line, so the backend emits its
+own structured line per request:
+
+```
+[req] uid=usr_xxx GET /v1/chat/history?limit=40 status=200 bytes=960515 enc=br dur_ms=37
+```
+
+| field | meaning |
+|-------|---------|
+| `uid` | authenticated user id, or `-` |
+| (path) | method + path **including query string** (the api_key is a header, never logged) |
+| `status` | HTTP status code |
+| `bytes` | on-the-wire response size, after gzip/brotli |
+| `enc` | content-encoding applied (`gzip` / `br` / `-`) |
+| `dur_ms` | **server-side handler time** — compare with the client's total latency to tell "backend slow" from "network slow" |
+
+`/healthz` is skipped so the HAProxy uptime probe doesn't flood the log.
+
+Handy filters (append to a `phala cvms logs ... -c <backend-container>` pipe):
+
+```bash
+| grep 'GET /v1/chat/history'                      # history calls + their sizes/durations
+| grep '\[req\]' | awk -F'dur_ms=' '$2+0 > 1000'   # requests slower than 1s server-side
+| grep -E '\[req\].* status=(4|5)[0-9][0-9]'       # 4xx / 5xx only
+```
+
+**Local / self-host.** `docker compose -f deploy/docker-compose.yaml logs -f backend`
+(systemd: `journalctl -u feedling-backend -f`).
+
 ### HTTP endpoints
 
 | Method | Path | Description |

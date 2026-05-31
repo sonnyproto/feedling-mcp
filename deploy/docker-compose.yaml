@@ -70,7 +70,9 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     image: feedling-backend:dev
-    command: ["python", "-u", "backend/app.py"]
+    # gunicorn = production WSGI. -w 1 is mandatory: app.py binds the :9998
+    # WebSocket ingest at import time, so multiple workers collide on it.
+    command: ["gunicorn", "--chdir", "backend", "-w", "1", "--threads", "16", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
     restart: unless-stopped
     environment:
       # --- BAKED: security-relevant, audited by iOS ---

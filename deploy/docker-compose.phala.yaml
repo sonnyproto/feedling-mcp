@@ -140,7 +140,10 @@ services:
   # is sufficient for transport hygiene.
   backend:
     image: ghcr.io/teleport-computer/feedling:24cb086
-    command: ["python", "-u", "backend/app.py"]
+    # gunicorn = production WSGI (the Werkzeug dev server stalls on large
+    # responses under TDX). -w 1 is mandatory: app.py binds the :9998 WS
+    # ingest at import time, so multiple workers would collide on it.
+    command: ["gunicorn", "--chdir", "backend", "-w", "1", "--threads", "16", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
     restart: unless-stopped
     environment:
       FEEDLING_API_KEY: ""
