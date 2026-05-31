@@ -73,7 +73,7 @@ Body:
 
 ```json
 {
-  "provider": "openai" | "openrouter" | "openai_compatible",
+  "provider": "openai" | "anthropic" | "gemini" | "deepseek" | "openrouter" | "openai_compatible",
   "model": "gpt-4.1-mini",
   "api_key": "sk-...",
   "base_url": "https://api.openai.com/v1"
@@ -220,7 +220,7 @@ Manual smoke:
 
 1. Register or use an existing user.
 2. `POST /v1/onboarding/route {"route":"model_api"}`.
-3. `POST /v1/model_api/setup` with a real OpenAI/OpenRouter-compatible key.
+3. `POST /v1/model_api/setup` with a real provider key.
 4. `POST /v1/history_import/upload` with a real transcript.
 5. Poll `GET /v1/history_import/status/<job_id>`.
 6. Verify `/v1/memory/list`, `/v1/identity/get`, `/v1/onboarding/validate`.
@@ -236,7 +236,7 @@ dev server alone cannot complete this route because provider-key decrypt needs
 ```bash
 export FEEDLING_API_URL="https://api.feedling.app"
 export FEEDLING_API_KEY="<io user api key>"
-export MODEL_PROVIDER="openrouter"
+export MODEL_PROVIDER="openrouter" # openai | anthropic | gemini | deepseek | openrouter | openai_compatible
 export MODEL_NAME="openai/gpt-4.1-mini"
 export MODEL_API_KEY="<provider api key>"
 ```
@@ -253,13 +253,18 @@ curl -sS "$FEEDLING_API_URL/v1/onboarding/route" \
 Save and test provider config:
 
 ```bash
+BASE_URL_JSON=""
+if [ "$MODEL_PROVIDER" = "openai_compatible" ]; then
+  BASE_URL_JSON=', "base_url":"https://your-provider.example/v1"'
+fi
+
 curl -sS "$FEEDLING_API_URL/v1/model_api/setup" \
   -H "X-API-Key: $FEEDLING_API_KEY" \
   -H "Content-Type: application/json" \
   -d "{
     \"provider\":\"$MODEL_PROVIDER\",
     \"model\":\"$MODEL_NAME\",
-    \"api_key\":\"$MODEL_API_KEY\"
+    \"api_key\":\"$MODEL_API_KEY\"$BASE_URL_JSON
   }" | jq
 ```
 
