@@ -308,14 +308,19 @@ HTTP, so they look empty of useful detail. To read a specific service, pass
 
 ```bash
 # backend (Flask API + the [req] access log below). -f follows, -t adds timestamps.
-phala cvms logs feedling-enclave-v2 -c <backend-container> --tail 200 -t
+phala cvms logs feedling-enclave-v2 -c feedling-enclave-backend-1 --tail 200 -t
 ```
 
-dstack container names are **not** the compose service names, and the CLI can't
-list them (`phala cvms` has no `ps`/`exec`; `get` doesn't expose them). Read the
-real names off the CVM detail page in the Phala dashboard
-(`cloud.phala.network`), then use them with `-c` — same for the `mcp` and
-`enclave` containers.
+dstack names containers `<compose-project>-<service>-1`, where the project is the
+compose file's `name:` (currently `feedling-enclave`) — not the CVM name, and not
+something the CLI lists (`phala cvms` has no `ps`/`exec`). The live containers:
+
+| service | `-c` name |
+|---------|-----------|
+| backend (Flask API) | `feedling-enclave-backend-1` |
+| mcp (FastMCP SSE) | `feedling-enclave-mcp-1` |
+| enclave (attestation + decrypt) | `feedling-enclave-enclave-1` |
+| ingress (HAProxy — the default when `-c` is omitted) | `feedling-enclave-ingress-1` |
 
 **Per-request access log.** The backend runs under gunicorn in production, which
 does not reproduce Flask's old dev-server access line, so the backend emits its
@@ -336,7 +341,7 @@ own structured line per request:
 
 `/healthz` is skipped so the HAProxy uptime probe doesn't flood the log.
 
-Handy filters (append to a `phala cvms logs ... -c <backend-container>` pipe):
+Handy filters (append to a `phala cvms logs ... -c feedling-enclave-backend-1` pipe):
 
 ```bash
 | grep 'GET /v1/chat/history'                      # history calls + their sizes/durations
