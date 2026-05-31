@@ -171,6 +171,12 @@ LIVE_ACTIVITY_START_COOLDOWN_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_ST
 DEVICE_EVENT_RETENTION_DAYS = int(os.environ.get("FEEDLING_DEVICE_EVENT_RETENTION_DAYS", 30))
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 PROACTIVE_JOB_MAX = int(os.environ.get("FEEDLING_PROACTIVE_JOB_MAX", 500))
+PROACTIVE_DEBUG_DECISION_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_DECISION_READ_MAX", 1000))
+PROACTIVE_DEBUG_JOB_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_JOB_READ_MAX", PROACTIVE_JOB_MAX))
+PROACTIVE_DEBUG_EVENT_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_EVENT_READ_MAX", 500))
+PROACTIVE_DEBUG_REVIEW_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_REVIEW_READ_MAX", 500))
+PROACTIVE_DEBUG_MESSAGE_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_MESSAGE_READ_MAX", 500))
+PROACTIVE_DEBUG_FRAME_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_FRAME_READ_MAX", MAX_FRAMES))
 PROACTIVE_GATE_PROVIDER = os.environ.get("FEEDLING_PROACTIVE_GATE_PROVIDER", "openrouter").strip().lower()
 PROACTIVE_GATE_MODEL = os.environ.get("FEEDLING_PROACTIVE_GATE_MODEL", "google/gemini-3.1-flash-lite").strip()
 PROACTIVE_GATE_TIMEOUT_SEC = float(os.environ.get("FEEDLING_PROACTIVE_GATE_TIMEOUT_SEC", "30"))
@@ -2077,18 +2083,14 @@ def _proactive_job_from_decision(decision: dict) -> dict:
 
 
 def _proactive_debug_snapshot(store: UserStore) -> dict:
-    # Read deeper than the render cap so frame-backed decisions don't
-    # vanish when broadcast has been off and the tail of the file is
-    # dominated by `no_recent_frames` empty ticks. The renderer splits
-    # this list into frame-backed and no-frame buckets and caps each at
-    # 30 — so loading 500 here keeps both buckets honest at low marginal
-    # cost (JSONL parse over a small file). Earlier behavior was
-    # `limit=50` which silently hid all old frame-backed history once
-    # 50+ empty ticks accumulated.
-    decisions = store.list_gate_decisions(limit=500)
-    jobs = store.list_proactive_jobs(limit=50)
-    events = store.list_device_events(limit=50)
-    reviews = store.list_gate_reviews(limit=200)
+    # The debug dashboard is used as an investigation surface, not a tiny
+    # status widget. Read enough rows to cover a normal day of proactive
+    # activity; the renderer still lets callers cap visible sections via
+    # query params, but the backing snapshot should not hide history first.
+    decisions = store.list_gate_decisions(limit=PROACTIVE_DEBUG_DECISION_READ_MAX)
+    jobs = store.list_proactive_jobs(limit=PROACTIVE_DEBUG_JOB_READ_MAX)
+    events = store.list_device_events(limit=PROACTIVE_DEBUG_EVENT_READ_MAX)
+    reviews = store.list_gate_reviews(limit=PROACTIVE_DEBUG_REVIEW_READ_MAX)
     latest_review_by_decision: dict[str, dict] = {}
     for review in reviews:
         did = str(review.get("decision_id") or "")
@@ -2115,7 +2117,7 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
             }
             for m in store.chat_messages
             if m.get("source") == PROACTIVE_JOB_SOURCE
-        ][-25:]
+        ][-PROACTIVE_DEBUG_MESSAGE_READ_MAX:]
     messages_by_job = {
         str(m.get("proactive_job_id") or ""): m
         for m in proactive_messages
@@ -2155,7 +2157,7 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
                 "ocr_len": len((f.get("ocr_text") or "").strip()),
                 "encrypted": bool(f.get("encrypted")),
             }
-            for f in store.frames_meta[-25:]
+            for f in store.frames_meta[-PROACTIVE_DEBUG_FRAME_READ_MAX:]
         ]
     return {
         "user_id": store.user_id,
@@ -2325,12 +2327,21 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             value = default
         return max(lower, min(upper, value))
 
-    decision_cap = int_arg("decision_limit", 4, 2, 20)
-    no_frame_cap = int_arg("no_frame_limit", 1, 1, 10)
-    job_cap = int_arg("job_limit", 4, 2, 20)
-    table_cap = int_arg("table_limit", 6, 3, 20)
+    decision_cap = int_arg("decision_limit", 80, 1, PROACTIVE_DEBUG_DECISION_READ_MAX)
+    no_frame_cap = int_arg("no_frame_limit", 50, 1, PROACTIVE_DEBUG_DECISION_READ_MAX)
+    job_cap = int_arg("job_limit", 100, 1, PROACTIVE_DEBUG_JOB_READ_MAX)
+    table_cap = int_arg(
+        "table_limit",
+        100,
+        1,
+        max(
+            PROACTIVE_DEBUG_EVENT_READ_MAX,
+            PROACTIVE_DEBUG_MESSAGE_READ_MAX,
+            PROACTIVE_DEBUG_FRAME_READ_MAX,
+        ),
+    )
     show_no_frame = str(request.args.get("show_no_frame") or "").strip().lower() in {"1", "true", "yes"}
-    show_payloads = str(request.args.get("detail") or "").strip().lower() in {"1", "true", "yes"}
+    show_payloads = str(request.args.get("detail") or "1").strip().lower() not in {"0", "false", "no", "off"}
 
     debug_labels_zh = {
         "time": "时间",
@@ -2546,6 +2557,21 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             f"<pre class='mono'>{esc(pretty)}</pre></details>"
         )
 
+    def section_limit_link(
+        param: str,
+        current: int,
+        total: int,
+        step: int,
+        label_en: str,
+        label_zh: str,
+        extra_updates: dict | None = None,
+    ) -> str:
+        if total <= current:
+            return ""
+        updates = dict(extra_updates or {})
+        updates[param] = min(total, current + step)
+        return f"<a class='control-link' href='{esc(dashboard_url(**updates))}'>{esc(ui(label_en, label_zh))}</a>"
+
     # Gate Decisions are the heaviest rendering on this page (13 columns of
     # mixed text + JSON + form). Converted from a wide table to a stack of
     # cards: each decision is one block, fields laid out in a 2-column grid
@@ -2632,8 +2658,18 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
                 ui("No hidden no-frame Gate ticks.", "没有隐藏的无屏幕帧 Gate 空 tick。"),
                 limit=no_frame_cap,
             )
+            more_no_frame = section_limit_link(
+                "no_frame_limit",
+                no_frame_cap,
+                len(no_frame_decisions),
+                50,
+                "show more no-frame ticks",
+                "显示更多空 tick",
+                {"show_no_frame": 1},
+            )
             hidden_hint = (
-                f"<div class='hint'>{esc(ui('Showing a bounded sample to keep the dashboard fast.', '仅显示有限样本，避免调试页过大。'))} "
+                f"<div class='hint'>{esc(ui('Showing no-frame ticks with a high cap; increase it if you need older scheduler history.', '正在显示无屏幕帧空 tick；需要更早的定时历史可以继续增加上限。'))} "
+                f"{more_no_frame} "
                 f"<a href='{esc(dashboard_url(show_no_frame=None))}'>{esc(ui('hide no-frame ticks', '隐藏空 tick 明细'))}</a></div>"
             )
         else:
@@ -2776,50 +2812,46 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         f"No Gate decisions with screen context yet. Hidden no-frame ticks: {hidden_no_frame_count}.",
         f"还没有带屏幕上下文的 Gate 判定。隐藏空 tick：{hidden_no_frame_count}。",
     )
-    if not show_payloads:
-        return f"""<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta http-equiv="refresh" content="5">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{esc(page_title)}</title>
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0 auto; padding: 20px; max-width: 1120px; background: #f6f0e6; color: #1f1d1a; line-height: 1.35; }}
-    h1 {{ margin: 0 0 4px; }} h2 {{ margin: 24px 0 10px; padding-top: 14px; border-top: 1px solid #d8d0c4; font-size: 18px; }}
-    .meta,.hint,.mini {{ color: #786f65; font-size: 12px; }} .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }}
-    .pill,.verdict,.chip {{ display: inline-block; padding: 3px 8px; margin: 2px; background: #efe5d7; border-radius: 2px; font-size: 12px; }}
-    .ok {{ color: #0b7d42; font-weight: 700; }} .bad {{ color: #b42318; font-weight: 700; }} .muted {{ color: #8b8176; }}
-    .card {{ background: #fffaf1; border: 1px solid #ddd2c5; padding: 12px; margin: 10px 0; }}
-    .card-head {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; border-bottom: 1px solid #eee5d5; padding-bottom: 8px; margin-bottom: 8px; }}
-    .meta-bits {{ display: flex; flex-wrap: wrap; gap: 8px 14px; font-size: 12px; }} .label,.block-label {{ color: #8b8176; text-transform: uppercase; letter-spacing: .4px; font-size: 10px; }}
-    .block {{ margin: 7px 0; }} .block-text,.wrap {{ white-space: pre-wrap; overflow-wrap: anywhere; }} .review {{ margin-top: 8px; padding-top: 8px; border-top: 1px solid #eee5d5; }}
-    table {{ width: 100%; border-collapse: collapse; table-layout: fixed; background: #fffaf1; }} th,td {{ border: 1px solid #ddd2c5; padding: 7px; vertical-align: top; text-align: left; overflow-wrap: anywhere; }} th {{ background: #efe5d7; }}
-    a {{ color: #8e301f; text-decoration: none; border-bottom: 1px solid #d0a094; }} .empty {{ padding: 12px; background: #fffaf1; border: 1px solid #ddd2c5; color: #786f65; }}
-  </style>
-</head>
-<body>
-  <h1>{esc(page_title)}</h1>
-  <div class="meta">{esc(ui('user', '用户'))} <span class="mono">{esc(snapshot.get('user_id'))}</span> · {esc(ui('generated', '生成时间'))} {esc(snapshot.get('generated_at'))} · {esc(dashboard_tz_name)}</div>
-  <div>
-    <span class="pill">{esc(ui('visible decisions', '主表判定'))} {esc(visible_gate_count)}</span>
-    <span class="pill">{esc(ui('hidden no-frame ticks', '隐藏空 tick'))} {esc(hidden_no_frame_count)}</span>
-    <span class="pill">{esc(ui('hidden jobs', '隐藏任务'))} {esc(counts.get('jobs', 0))}</span>
-    <span class="pill">{esc(ui('proactive writes', '主动写入'))} {esc(counts.get('proactive_messages', 0))}</span>
-    <span class="pill">{esc(ui('screen frames', '屏幕帧'))} {esc(counts.get('recent_frames', 0))}</span>
-  </div>
-  <div class="hint">{esc(ui('Compact mode is on to keep the debug page reliable.', '当前为轻量模式，避免调试页过大导致白屏或截断。'))} <a href="{esc(dashboard_url(detail=1))}">{esc(ui('show JSON detail', '显示 JSON 详情'))}</a></div>
-  <h2>{esc(ui('Gate Decisions', 'Gate 判定'))}</h2>
-  {decision_section(frame_decisions, visible_empty_text, limit=decision_cap)}
-  {hidden_gate_details}
-  <h2>{esc(ui('Hidden Jobs', '隐藏任务'))}</h2>
-  {job_section()}
-  <h2>{esc(ui('Proactive Chat Writes', '主动消息写入'))}</h2>
-  <table><thead><tr><th>{esc(ui('time', '时间'))}</th><th>{esc(ui('type', '类型'))}</th><th>{esc(ui('preview', '预览'))}</th><th>{esc(ui('alert', '系统通知'))}</th><th>Live Activity</th><th>{esc(ui('decision', '判定'))}</th><th>{esc(ui('job', '任务'))}</th><th>{esc(ui('message', '消息'))}</th></tr></thead><tbody>{message_rows()}</tbody></table>
-  <h2>{esc(ui('Recent Screen Frames', '最近屏幕帧'))}</h2>
-  <table><thead><tr><th>{esc(ui('time', '时间'))}</th><th>App</th><th>{esc(ui('OCR length', 'OCR 长度'))}</th><th>{esc(ui('encrypted', '已加密'))}</th><th>{esc(ui('frame', '屏幕帧'))}</th></tr></thead><tbody>{frame_rows()}</tbody></table>
-</body>
-</html>"""
+    detail_toggle = (
+        f"<a class='control-link' href='{esc(dashboard_url(detail=0))}'>{esc(ui('hide JSON detail', '隐藏 JSON 详情'))}</a>"
+        if show_payloads
+        else f"<a class='control-link' href='{esc(dashboard_url(detail=1))}'>{esc(ui('show JSON detail', '显示 JSON 详情'))}</a>"
+    )
+    control_links = " ".join(
+        link for link in [
+            detail_toggle,
+            section_limit_link(
+                "decision_limit",
+                decision_cap,
+                len(frame_decisions),
+                80,
+                "show more Gate decisions",
+                "显示更多 Gate 判定",
+            ),
+            section_limit_link(
+                "job_limit",
+                job_cap,
+                len(jobs),
+                100,
+                "show more completed jobs",
+                "显示更多已完成任务",
+            ),
+            section_limit_link(
+                "table_limit",
+                table_cap,
+                max(len(messages), len(frames), len(events)),
+                100,
+                "show more tables",
+                "显示更多表格记录",
+            ),
+            (
+                f"<a class='control-link' href='{esc(dashboard_url(show_no_frame=1))}'>{esc(ui('show no-frame ticks', '显示空 tick'))}</a>"
+                if no_frame_decisions and not show_no_frame
+                else ""
+            ),
+        ]
+        if link
+    )
     return f"""<!doctype html>
 <html>
 <head>
@@ -2886,6 +2918,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
       border-radius: 2px;
     }}
     .hint {{ margin: 8px 0 16px; color: #6f6961; font-size: 13px; }}
+    .control-link {{ display: inline-block; margin-left: 8px; white-space: nowrap; }}
     .empty {{
       padding: 16px;
       background: #fffaf1;
@@ -3093,8 +3126,8 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     <span class="pill">{esc(ui('device events', '设备事件'))} {esc(counts.get('device_events', 0))}</span>
   </div>
   <div class="hint">
-    {esc(ui('Compact mode is on to keep the debug page reliable.', '当前为轻量模式，避免调试页过大导致白屏或截断。'))}
-    <a href="{esc(dashboard_url(detail=1))}">{esc(ui('show JSON detail', '显示 JSON 详情'))}</a>
+    {esc(ui('Full debug mode is on by default. The page reads deeper history and caps only the rendered sections; use the links to expand further or hide JSON payloads.', '默认已恢复完整调试模式。页面会读取更深的历史，只限制渲染条数；可以用下面链接继续展开或隐藏 JSON。'))}
+    {control_links}
   </div>
 
   <h2>{esc(ui('Gate Decisions', 'Gate 判定'))}</h2>

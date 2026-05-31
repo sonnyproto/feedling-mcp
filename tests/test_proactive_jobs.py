@@ -177,6 +177,89 @@ def test_proactive_debug_folds_no_frame_gate_ticks(tmp_path, monkeypatch):
     assert "no_recent_frames_unit_test" not in page_en
 
 
+def test_proactive_debug_dashboard_defaults_to_deep_full_view(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    store = appmod.UserStore("usr_test_proactive_deep_dashboard")
+
+    for i in range(12):
+        decision_id = f"gd_frame_{i}"
+        job_id = f"pj_{i}"
+        store.append_gate_decision(
+            {
+                "decision_id": decision_id,
+                "ts": 1000 + i,
+                "gate_model": "openrouter:google/gemini-3.1-flash-lite",
+                "should_reach_out": bool(i % 2),
+                "reason": f"frame_reason_{i}",
+                "abstention_reason": "model_false",
+                "intent_label": "reviewable_false",
+                "connection": {"why": f"connection_{i}"},
+                "frame_ids": [f"frame_{i}"],
+                "gate_input": {
+                    "ocr_chars": 42,
+                    "sampled_frame_count": 2,
+                    "decrypt_ok": True,
+                    "image_count": 1,
+                },
+            }
+        )
+        store.append_proactive_job(
+            {
+                "job_id": job_id,
+                "ts": 1000 + i,
+                "gate_decision_id": decision_id,
+                "status": "completed",
+                "intent_label": "reviewable_false",
+                "context_hint": f"context_hint_{i}",
+                "frame_ids": [f"frame_{i}"],
+            }
+        )
+        envelope = {
+            "id": f"msg_proactive_{i}",
+            "v": 1,
+            "body_ct": "ct",
+            "nonce": "nonce",
+            "K_user": "k-user",
+            "K_enclave": "k-enclave",
+            "visibility": "shared",
+            "owner_user_id": store.user_id,
+        }
+        store.append_chat(
+            "openclaw",
+            appmod.PROACTIVE_JOB_SOURCE,
+            envelope,
+            extra={
+                "gate_decision_id": decision_id,
+                "proactive_job_id": job_id,
+                "alert_preview": f"preview_{i}",
+                "alert_status": "delivered",
+                "live_activity_status": "delivered",
+            },
+        )
+        store.append_device_event(
+            {
+                "id": f"ev_{i}",
+                "ts": appmod.time.time() + i,
+                "source": "unit",
+                "type": f"event_{i}",
+                "payload": {"id": f"payload_{i}"},
+            }
+        )
+
+    snapshot = appmod._proactive_debug_snapshot(store)
+    with appmod.app.test_request_context("/debug/proactive?key=test&lang=en"):
+        page = appmod._render_proactive_dashboard(snapshot)
+
+    assert "lang-switch" in page
+    assert "Full debug mode is on by default" in page
+    assert "Compact mode is on" not in page
+    assert "hide JSON detail" in page
+    assert "frame_reason_0" in page
+    assert "pj_0" in page
+    assert "preview_0" in page
+    assert "event_0" in page
+
+
 def test_proactive_debug_translates_prose_only_in_zh_view(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive_debug_translate")
