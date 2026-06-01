@@ -328,6 +328,14 @@ class UserStore:
         return self.dir / "identity_changes.jsonl"
 
     @property
+    def memory_changes_file(self) -> Path:
+        return self.dir / "memory_changes.jsonl"
+
+    @property
+    def memory_capture_jobs_file(self) -> Path:
+        return self.dir / "memory_capture_jobs.jsonl"
+
+    @property
     def onboarding_route_file(self) -> Path:
         return self.dir / "onboarding_route.json"
 
@@ -5503,12 +5511,303 @@ def _model_api_context_messages(
     return messages, context_payload
 
 
+def _model_api_name_action_from_message(message: str) -> dict | None:
+    text = (message or "").strip()
+    if not text:
+        return None
+    patterns = [
+        r"\bcall\s+yourself\s+[`'\"“”‘’]*([^,\n.!?。！？]+)",
+        r"\byour\s+name\s+(?:is|should be|should become|becomes)\s+[`'\"“”‘’]*([^,\n.!?。！？]+)",
+        r"(?:叫你|喊你|称呼你)\s*[`'\"“”‘’：:]*([^，,。.!?！？\n]+)",
+        r"你(?:就|以后|今后|从现在起)叫\s*[`'\"“”‘’：:]*([^，,。.!?！？\n]+)",
+        r"你的名字(?:改成|改为|叫)\s*[`'\"“”‘’：:]*([^，,。.!?！？\n]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        name = match.group(1).strip()
+        name = re.split(r"\s+(?:btw|please|pls)\b", name, maxsplit=1, flags=re.IGNORECASE)[0]
+        name = name.strip(" `\"'“”‘’。，,.;；:：!！?？")
+        if not name or len(name) > 80:
+            continue
+        if any(ch in name for ch in "\n\r{}[]"):
+            continue
+        if name.lower() in _IDENTITY_RUNTIME_LABELS:
+            continue
+        return {
+            "type": "identity.profile_patch",
+            "patch": {"agent_name": name},
+            "reason": "User asked the agent to update its displayed name in chat.",
+            "source": "model_api_detector",
+        }
+    return None
+
+
+def _model_api_identity_dimension_action_from_message(
+    store: UserStore,
+    api_key: str | None,
+    message: str,
+) -> dict | None:
+    text = (message or "").strip()
+    if not text:
+        return None
+    direction = None
+    if re.search(r"(调高|提高|升高|增加|加|up|increase|raise)", text, flags=re.IGNORECASE):
+        direction = 1
+    elif re.search(r"(调低|降低|减少|减|down|decrease|lower)", text, flags=re.IGNORECASE):
+        direction = -1
+    if direction is None:
+        return None
+    plain, _ = _identity_plain_for_action(store, api_key)
+    dims = plain.get("dimensions") if isinstance(plain, dict) else []
+    if not isinstance(dims, list):
+        return None
+    lowered = text.lower()
+    matched_name = ""
+    for dim in dims:
+        if not isinstance(dim, dict):
+            continue
+        name = str(dim.get("name") or "").strip()
+        if name and name.lower() in lowered:
+            matched_name = name
+            break
+    if not matched_name:
+        return None
+    number_match = re.search(r"([+-]?\d{1,2})", text)
+    try:
+        raw_delta = abs(int(number_match.group(1))) if number_match else 3
+    except Exception:
+        raw_delta = 3
+    delta = max(1, min(raw_delta, 10)) * direction
+    return {
+        "type": "identity.dimension_nudge",
+        "dimension": matched_name,
+        "delta": delta,
+        "reason": "User asked to adjust this Identity dimension in chat.",
+        "source": "model_api_detector",
+    }
+
+
+def _model_api_identity_actions_from_message(
+    store: UserStore,
+    api_key: str | None,
+    message: str,
+) -> list[dict]:
+    actions: list[dict] = []
+    action = _model_api_name_action_from_message(message)
+    if action:
+        actions.append(action)
+    dim_action = _model_api_identity_dimension_action_from_message(store, api_key, message)
+    if dim_action:
+        actions.append(dim_action)
+    return actions
+
+
+def _context_refs_from_payload(payload: dict) -> list[dict]:
+    refs = payload.get("context_refs") or payload.get("contextRefs") or []
+    if not isinstance(refs, list):
+        return []
+    out: list[dict] = []
+    for ref in refs[:8]:
+        if not isinstance(ref, dict):
+            continue
+        ref_type = str(ref.get("type") or "").strip()
+        ref_id = str(ref.get("id") or "").strip()
+        if not ref_type or not ref_id:
+            continue
+        clean = {"type": ref_type[:40], "id": ref_id[:160]}
+        if ref.get("title"):
+            clean["title"] = str(ref.get("title") or "")[:240]
+        out.append(clean)
+    return out
+
+
+def _extract_patch_text_from_message(message: str) -> str:
+    text = (message or "").strip()
+    patterns = [
+        r"(?:改成|改为|改一下为|更新成|更新为)\s*[「“\"']?(.+?)[」”\"']?$",
+        r"(?:should be|change it to|update it to)\s*[\"']?(.+?)[\"']?$",
+        r"不是.+?(?:是|而是)\s*[「“\"']?(.+?)[」”\"']?$",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            return str(m.group(1) or "").strip()[:1200]
+    return ""
+
+
+def _model_api_memory_actions_from_message(message: str, context_refs: list[dict]) -> list[dict]:
+    memory_refs = [ref for ref in context_refs if ref.get("type") == "memory" and ref.get("id")]
+    if not memory_refs:
+        return []
+    memory_id = str(memory_refs[0]["id"])
+    text = (message or "").strip()
+    lowered = text.lower()
+    if re.search(r"(删除|删掉|移除|forget this|delete this|remove this)", lowered):
+        return [{
+            "type": "memory.delete",
+            "memory_id": memory_id,
+            "reason": "User asked to delete this Memory Garden card in chat.",
+        }]
+    if re.search(r"(不对|错了|写错|修改|改成|改为|更新|change|update|wrong|incorrect)", lowered):
+        replacement = _extract_patch_text_from_message(text)
+        patch: dict = {}
+        if replacement:
+            patch["description"] = replacement
+        else:
+            patch["description"] = text[:1200]
+        return [{
+            "type": "memory.content_patch",
+            "memory_id": memory_id,
+            "patch": patch,
+            "reason": "User corrected this Memory Garden card in chat.",
+        }]
+    return []
+
+
+def _identity_actions_default_reply(user_message: str, effects: list[dict]) -> str:
+    fields = set()
+    has_memory = False
+    for effect in effects:
+        if str(effect.get("type") or "").startswith("memory_") or str(effect.get("action") or "").startswith("memory."):
+            has_memory = True
+        for field in effect.get("fields") or []:
+            fields.add(str(field))
+    zh = bool(re.search(r"[\u4e00-\u9fff]", user_message or ""))
+    if has_memory:
+        return "改好了，Memory Garden 已更新。" if zh else "Done. I updated the Memory Garden."
+    if "agent_name" in fields:
+        return "改好了。" if zh else "Done. I updated my displayed name."
+    if fields:
+        return "改好了，Identity 已更新。" if zh else "Done. I updated my identity."
+    return "我看到了，但这次没有可写入的 Identity 更新。" if zh else "I saw that, but there was no identity update to write."
+
+
+def _model_api_capture_prompt(user_message: str, assistant_reply: str, context_payload: dict) -> list[dict]:
+    memories = context_payload.get("context_memories") or []
+    identity = context_payload.get("identity") or {}
+    payload = {
+        "user_message": user_message[:4000],
+        "assistant_reply": assistant_reply[:4000],
+        "existing_context_memories": memories[:8],
+        "identity": identity,
+        "today": date.today().isoformat(),
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are Feedling's Memory Capture worker. Return JSON only. "
+                "Extract durable Memory Garden cards from the latest exchange. "
+                "Only write facts, events, quotes, or rare relational moments. "
+                "Do not write vague preferences, duplicate existing memories, or private implementation details. "
+                "Shape: {\"memories\":[{\"type\":\"fact|event|quote|moment\","
+                "\"title\":\"...\",\"description\":\"...\",\"occurred_at\":\"YYYY-MM-DD\","
+                "\"her_quote\":\"optional\",\"context\":\"optional\"}]}. "
+                "Return {\"memories\":[]} if nothing durable should be written."
+            ),
+        },
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:12000]},
+    ]
+
+
+def _model_api_run_memory_capture(
+    store: UserStore,
+    api_key: str | None,
+    runtime: ProviderConfig,
+    *,
+    user_message: str,
+    assistant_reply: str,
+    user_message_id: str,
+    assistant_message_id: str,
+    context_payload: dict,
+) -> dict:
+    job_base = {
+        "mode": "running",
+        "source_chat_message_ids": [user_message_id, assistant_message_id],
+        "message_chars": len(user_message),
+        "reply_chars": len(assistant_reply),
+    }
+    if os.environ.get("FEEDLING_MODEL_API_MEMORY_CAPTURE", "1").strip().lower() in {"0", "false", "off", "no"}:
+        return _append_memory_capture_job(store, {**job_base, "status": "skipped", "error": "disabled"})
+    try:
+        result = chat_completion(
+            runtime,
+            _model_api_capture_prompt(user_message, assistant_reply, context_payload),
+            max_tokens=900,
+            temperature=0.1,
+            timeout=30.0,
+        )
+        raw = _json_from_model_text(str(result.get("reply") or ""))
+        memories = raw.get("memories") if isinstance(raw, dict) else []
+        if not isinstance(memories, list):
+            memories = []
+        actions: list[dict] = []
+        seen_titles = set()
+        for item in memories[:4]:
+            if not isinstance(item, dict):
+                continue
+            mem_type = str(item.get("type") or "fact").strip().lower()
+            if mem_type not in {"fact", "event", "quote", "moment"}:
+                continue
+            title = _memory_action_text(item.get("title"), 180)
+            description = str(item.get("description") or "").strip()[:1200]
+            if len(title) < 4 or (not description and mem_type != "quote"):
+                continue
+            key = title.lower()
+            if key in seen_titles:
+                continue
+            seen_titles.add(key)
+            actions.append({
+                "type": "memory.add",
+                "memory": {
+                    "type": mem_type,
+                    "title": title,
+                    "description": description,
+                    "occurred_at": _memory_action_text(item.get("occurred_at") or date.today().isoformat(), 80),
+                    "source": "model_api_capture",
+                    "her_quote": str(item.get("her_quote") or "").strip()[:1000],
+                    "context": str(item.get("context") or "").strip()[:1000],
+                },
+                "reason": "Captured from recent chat.",
+                "capture_mode": "running",
+                "source_chat_message_ids": [user_message_id, assistant_message_id],
+            })
+        if not actions:
+            return _append_memory_capture_job(store, {**job_base, "status": "completed", "actions_planned": 0, "actions_written": 0})
+        body, status = _execute_memory_actions(store, api_key, actions)
+        if status >= 400:
+            return _append_memory_capture_job(store, {
+                **job_base,
+                "status": "failed",
+                "actions_planned": len(actions),
+                "actions_written": len(body.get("effects") or []),
+                "effects": body.get("effects") or [],
+                "error": body.get("error", "memory_action_failed"),
+            })
+        return _append_memory_capture_job(store, {
+            **job_base,
+            "status": "completed",
+            "actions_planned": len(actions),
+            "actions_written": len(body.get("effects") or []),
+            "effects": body.get("effects") or [],
+        })
+    except Exception as e:
+        return _append_memory_capture_job(store, {
+            **job_base,
+            "status": "failed",
+            "error": f"{type(e).__name__}:{str(e)[:300]}",
+        })
+
+
 @app.route("/v1/model_api/chat/send", methods=["POST"])
 def model_api_chat_send():
     store = require_user()
     api_key = _extract_api_key()
     payload = request.get_json(silent=True) or {}
     message = str(payload.get("message") or payload.get("content") or "").strip()
+    context_refs = _context_refs_from_payload(payload)
     if not message:
         return jsonify({"error": "message required"}), 400
     if len(message) > 12000:
@@ -5525,12 +5824,62 @@ def model_api_chat_send():
     user_row = store.append_chat("user", "model_api", user_env)
     store.notify_chat_waiters()
 
+    effects: list[dict] = []
+    identity_action_results: list[dict] = []
+    memory_action_results: list[dict] = []
+    identity_actions = _model_api_identity_actions_from_message(store, api_key, message)
+    if identity_actions:
+        action_body, action_status = _execute_identity_actions(store, api_key, identity_actions)
+        identity_action_results = action_body.get("results") or []
+        effects.extend(action_body.get("effects") or [])
+        if action_status >= 400:
+            return jsonify({
+                "error": "identity_action_failed",
+                "detail": action_body.get("error", "unknown_error"),
+                "results": identity_action_results,
+                "user_message_id": user_row["id"],
+            }), action_status
+    memory_actions = _model_api_memory_actions_from_message(message, context_refs)
+    if memory_actions:
+        for action in memory_actions:
+            action["source_chat_message_ids"] = [user_row["id"]]
+        memory_body, memory_status = _execute_memory_actions(store, api_key, memory_actions)
+        memory_action_results = memory_body.get("results") or []
+        effects.extend(memory_body.get("effects") or [])
+        if memory_status >= 400:
+            return jsonify({
+                "error": "memory_action_failed",
+                "detail": memory_body.get("error", "unknown_error"),
+                "results": memory_action_results,
+                "user_message_id": user_row["id"],
+            }), memory_status
+
     provider_messages, context_payload = _model_api_context_messages(
         store,
         api_key,
         message,
         include_screen_context=bool(payload.get("include_screen_context")),
     )
+    if context_refs:
+        context_payload["context_refs"] = context_refs
+        provider_messages.insert(2, {
+            "role": "system",
+            "content": "User-selected context refs JSON:\n" + json.dumps(context_refs, ensure_ascii=False)[:3000],
+        })
+    if identity_action_results or memory_action_results:
+        provider_messages.insert(2, {
+            "role": "system",
+            "content": (
+                "Feedling action result JSON:\n"
+                + json.dumps({
+                    "identity_results": identity_action_results,
+                    "memory_results": memory_action_results,
+                    "effects": effects,
+                }, ensure_ascii=False)[:5000]
+                + "\nIf the user asked for the change, acknowledge that it was written. "
+                "Do not claim an identity or memory update unless the result status is ok."
+            ),
+        })
     try:
         result = chat_completion(
             runtime,
@@ -5540,16 +5889,22 @@ def model_api_chat_send():
             timeout=90.0,
         )
     except ProviderError as e:
-        return jsonify({
-            "error": "provider_chat_failed",
-            "detail": str(e),
-            "status_code": e.status_code,
-            "user_message_id": user_row["id"],
-        }), 502
+        if effects:
+            result = {"reply": _identity_actions_default_reply(message, effects), "usage": {}}
+        else:
+            return jsonify({
+                "error": "provider_chat_failed",
+                "detail": str(e),
+                "status_code": e.status_code,
+                "user_message_id": user_row["id"],
+            }), 502
 
     reply = str(result.get("reply") or "").strip()
     if not reply:
-        return jsonify({"error": "provider_empty_reply", "user_message_id": user_row["id"]}), 502
+        if effects:
+            reply = _identity_actions_default_reply(message, effects)
+        else:
+            return jsonify({"error": "provider_empty_reply", "user_message_id": user_row["id"]}), 502
     assistant_env, env_err = _build_shared_envelope_for_store(store, reply.encode("utf-8"))
     if assistant_env is None:
         return jsonify({"error": "assistant_envelope_failed", "detail": env_err}), 409
@@ -5565,6 +5920,16 @@ def model_api_chat_send():
     updated = store.update_chat_message_metadata(assistant_row["id"], delivery_fields)
     if updated:
         assistant_row = updated
+    capture_job = _model_api_run_memory_capture(
+        store,
+        api_key,
+        runtime,
+        user_message=message,
+        assistant_reply=reply,
+        user_message_id=user_row["id"],
+        assistant_message_id=assistant_row["id"],
+        context_payload=context_payload,
+    )
     print(
         f"[model_api_chat:{store.user_id}] user_msg={user_row['id']} "
         f"reply={assistant_row['id']} provider={runtime.provider} model={runtime.model}"
@@ -5577,10 +5942,19 @@ def model_api_chat_send():
         "provider": runtime.provider,
         "model": runtime.model,
         "usage": result.get("usage") or {},
+        "effects": effects,
+        "identity_actions": identity_action_results,
+        "memory_actions": memory_action_results,
+        "capture": {
+            "job_id": capture_job.get("job_id", ""),
+            "status": capture_job.get("status", ""),
+            "actions_written": capture_job.get("actions_written", 0),
+        },
         "context": {
             "memories": len(context_payload.get("context_memories") or []),
             "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
             "screen_context": bool(context_payload.get("screen_context")),
+            "context_refs": len(context_refs),
         },
     })
 
@@ -7157,6 +7531,390 @@ def _live_days_with_user(identity: dict, store: UserStore | None = None) -> int:
     return max(0, (datetime.now().date() - anchor_date).days)
 
 
+_IDENTITY_RUNTIME_LABELS = {
+    "hermes", "claude", "claude code", "claude desktop", "claude-code", "claude-desktop",
+    "claude.ai", "anthropic", "openclaw", "open-claw", "open claw", "cursor",
+    "chatgpt", "chat-gpt", "gpt", "gpt-4", "gpt-4o", "gpt-5", "openai",
+    "gemini", "google ai", "google", "bard", "copilot", "github copilot",
+    "agent", "assistant", "ai", "bot",
+}
+
+
+def _identity_action_text(value, max_chars: int) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text[:max_chars].strip()
+
+
+def _identity_plain_for_action(store: UserStore, api_key: str | None) -> tuple[dict | None, str]:
+    data, err = _enclave_get_json_for_gate("/v1/identity/get", api_key)
+    if err:
+        return None, err
+    if not isinstance(data, dict) or not isinstance(data.get("identity"), dict):
+        return None, "identity_not_initialized"
+    identity = data["identity"]
+    status = identity.get("decrypt_status")
+    if status and status != "ok":
+        return None, str(status)
+    return identity, ""
+
+
+def _identity_payload_from_plain(identity: dict) -> dict:
+    payload = {
+        "agent_name": str(identity.get("agent_name") or "IO")[:80],
+        "self_introduction": str(identity.get("self_introduction") or "")[:1200],
+        "dimensions": identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else [],
+    }
+    if identity.get("category"):
+        payload["category"] = str(identity.get("category") or "")[:120]
+    if isinstance(identity.get("signature"), list):
+        payload["signature"] = [str(item)[:120] for item in identity["signature"][:6]]
+    return payload
+
+
+def _save_identity_action_payload(
+    store: UserStore,
+    payload: dict,
+    *,
+    audit: dict,
+    event_type: str,
+) -> tuple[dict | None, dict | None, str]:
+    existing = _load_identity(store)
+    if not existing:
+        return None, None, "identity_not_initialized"
+    if not existing.get("relationship_started_at"):
+        return None, None, "identity_relationship_anchor_missing"
+    envelope, err = _build_shared_envelope_for_store(
+        store,
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        item_id=existing.get("id") or None,
+    )
+    if envelope is None:
+        return None, None, err
+
+    now = _now_iso()
+    identity = {
+        "v": 1,
+        "id": envelope.get("id") or existing.get("id") or uuid.uuid4().hex,
+        "body_ct": envelope["body_ct"],
+        "nonce": envelope["nonce"],
+        "K_user": envelope["K_user"],
+        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+        "visibility": envelope["visibility"],
+        "owner_user_id": envelope["owner_user_id"],
+        "created_at": existing.get("created_at") or now,
+        "updated_at": now,
+        "relationship_started_at": existing.get("relationship_started_at", ""),
+        "relationship_anchor_source": existing.get("relationship_anchor_source", ""),
+        "relationship_anchor_evidence": existing.get("relationship_anchor_evidence", ""),
+    }
+    if envelope.get("K_enclave"):
+        identity["K_enclave"] = envelope["K_enclave"]
+    _save_identity(store, identity)
+    _log_bootstrap_event(store, event_type, success=True)
+    change = _append_identity_change(store, audit)
+    return identity, change, ""
+
+
+def _identity_profile_patch(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
+    patch = action.get("patch") if isinstance(action.get("patch"), dict) else {}
+    for key in ("agent_name", "self_introduction", "category", "signature"):
+        if key in action and key not in patch:
+            patch[key] = action[key]
+    if not patch:
+        return {"status": "error", "error": "patch_required", "action": "identity.profile_patch"}, [], 400
+
+    plain, err = _identity_plain_for_action(store, api_key)
+    if plain is None:
+        return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409
+
+    payload = _identity_payload_from_plain(plain)
+    changed: list[str] = []
+    audit_old = ""
+    audit_new = ""
+
+    if "agent_name" in patch:
+        new_name = _identity_action_text(patch.get("agent_name"), 80).strip(" `\"'“”‘’。，,.;；:：!！?？")
+        if not new_name:
+            return {"status": "error", "error": "agent_name_empty", "action": "identity.profile_patch"}, [], 400
+        if new_name.lower() in _IDENTITY_RUNTIME_LABELS:
+            return {"status": "error", "error": "agent_name_too_generic", "action": "identity.profile_patch"}, [], 400
+        old_name = str(payload.get("agent_name") or "")
+        if new_name != old_name:
+            payload["agent_name"] = new_name
+            changed.append("agent_name")
+            audit_old = old_name
+            audit_new = new_name
+
+    if "self_introduction" in patch:
+        intro = str(patch.get("self_introduction") or "").strip()[:1200]
+        if not intro:
+            return {"status": "error", "error": "self_introduction_empty", "action": "identity.profile_patch"}, [], 400
+        old_intro = str(payload.get("self_introduction") or "")
+        if intro != old_intro:
+            payload["self_introduction"] = intro
+            changed.append("self_introduction")
+            if not audit_old and not audit_new:
+                audit_old = old_intro[:120]
+                audit_new = intro[:120]
+
+    if "category" in patch:
+        category = _identity_action_text(patch.get("category"), 120)
+        old_category = str(payload.get("category") or "")
+        if category != old_category:
+            if category:
+                payload["category"] = category
+            else:
+                payload.pop("category", None)
+            changed.append("category")
+            if not audit_old and not audit_new:
+                audit_old = old_category
+                audit_new = category
+
+    if "signature" in patch:
+        sig_raw = patch.get("signature")
+        if not isinstance(sig_raw, list):
+            return {"status": "error", "error": "signature_must_be_list", "action": "identity.profile_patch"}, [], 400
+        signature = [_identity_action_text(item, 120) for item in sig_raw[:6]]
+        signature = [item for item in signature if item]
+        old_signature = payload.get("signature") if isinstance(payload.get("signature"), list) else []
+        if signature != old_signature:
+            if signature:
+                payload["signature"] = signature
+            else:
+                payload.pop("signature", None)
+            changed.append("signature")
+            if not audit_old and not audit_new:
+                audit_old = ", ".join(old_signature)[:120]
+                audit_new = ", ".join(signature)[:120]
+
+    if not changed:
+        return {
+            "status": "ok",
+            "action": "identity.profile_patch",
+            "changed_fields": [],
+            "noop": True,
+        }, [], 200
+
+    reason = _identity_action_text(
+        action.get("reason") or f"Identity profile updated: {', '.join(changed)}.",
+        500,
+    )
+    identity, change, err = _save_identity_action_payload(
+        store,
+        payload,
+        audit={
+            "action": "profile_patch",
+            "dimension": "profile",
+            "old_value": audit_old,
+            "new_value": audit_new,
+            "reason": reason,
+        },
+        event_type="identity_action_profile_patch",
+    )
+    if identity is None:
+        return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409
+
+    effect = {
+        "type": "identity_updated",
+        "action": "identity.profile_patch",
+        "fields": changed,
+        "identity_id": identity.get("id", ""),
+        "change_id": change.get("id", "") if change else "",
+    }
+    return {
+        "status": "ok",
+        "action": "identity.profile_patch",
+        "changed_fields": changed,
+        "identity": {
+            "id": identity.get("id", ""),
+            "updated_at": identity.get("updated_at", ""),
+            "days_with_user": _live_days_with_user(identity, store=store),
+        },
+        "change": change or {},
+    }, [effect], 200
+
+
+def _identity_dimension_nudge(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
+    dimension_name = _identity_action_text(action.get("dimension") or action.get("dimension_name"), 80)
+    if not dimension_name:
+        return {"status": "error", "error": "dimension_required", "action": "identity.dimension_nudge"}, [], 400
+    try:
+        delta = int(action.get("delta"))
+    except Exception:
+        return {"status": "error", "error": "delta_required", "action": "identity.dimension_nudge"}, [], 400
+
+    plain, err = _identity_plain_for_action(store, api_key)
+    if plain is None:
+        return {"status": "error", "error": err, "action": "identity.dimension_nudge"}, [], 409
+
+    payload = _identity_payload_from_plain(plain)
+    dims = list(payload.get("dimensions") or [])
+    matched = None
+    for dim in dims:
+        if isinstance(dim, dict) and str(dim.get("name") or "").strip().lower() == dimension_name.lower():
+            matched = dim
+            break
+    if matched is None:
+        return {"status": "error", "error": "dimension_not_found", "action": "identity.dimension_nudge"}, [], 404
+    try:
+        old_value = int(matched.get("value", 0))
+    except Exception:
+        old_value = 0
+    new_value = max(0, min(100, old_value + delta))
+    if new_value == old_value:
+        return {
+            "status": "ok",
+            "action": "identity.dimension_nudge",
+            "changed_fields": [],
+            "noop": True,
+        }, [], 200
+    matched["value"] = new_value
+    reason = _identity_action_text(action.get("reason") or f"{dimension_name} adjusted by {delta:+d}.", 500)
+    if reason:
+        matched["last_nudge_reason"] = reason
+    payload["dimensions"] = dims
+
+    identity, change, err = _save_identity_action_payload(
+        store,
+        payload,
+        audit={
+            "action": "nudge",
+            "dimension": dimension_name,
+            "old_value": old_value,
+            "new_value": new_value,
+            "delta": delta,
+            "reason": reason,
+        },
+        event_type="identity_action_dimension_nudge",
+    )
+    if identity is None:
+        return {"status": "error", "error": err, "action": "identity.dimension_nudge"}, [], 409
+    effect = {
+        "type": "identity_updated",
+        "action": "identity.dimension_nudge",
+        "fields": ["dimensions"],
+        "identity_id": identity.get("id", ""),
+        "change_id": change.get("id", "") if change else "",
+    }
+    return {
+        "status": "ok",
+        "action": "identity.dimension_nudge",
+        "changed_fields": ["dimensions"],
+        "identity": {
+            "id": identity.get("id", ""),
+            "updated_at": identity.get("updated_at", ""),
+            "days_with_user": _live_days_with_user(identity, store=store),
+        },
+        "change": change or {},
+    }, [effect], 200
+
+
+def _identity_relationship_days_set(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
+    try:
+        days = int(action.get("days_with_user"))
+    except Exception:
+        return {"status": "error", "error": "days_with_user_required", "action": "identity.relationship_days_set"}, [], 400
+    if days < 0:
+        return {"status": "error", "error": "days_with_user_must_be_non_negative", "action": "identity.relationship_days_set"}, [], 400
+    existing = _load_identity(store)
+    if not existing:
+        return {"status": "error", "error": "identity_not_initialized", "action": "identity.relationship_days_set"}, [], 409
+    old_days = _live_days_with_user(existing, store=store)
+    identity = dict(existing)
+    identity["updated_at"] = _now_iso()
+    identity["relationship_started_at"] = _anchor_from_days(days)
+    identity["relationship_anchor_source"] = "user_calibrated"
+    evidence = _identity_action_text(action.get("relationship_anchor_evidence") or action.get("reason") or "", 500)
+    if evidence:
+        identity["relationship_anchor_evidence"] = evidence
+    _save_identity(store, identity)
+    _log_bootstrap_event(store, "identity_action_relationship_days_set", success=True)
+    change = _append_identity_change(store, {
+        "action": "relationship_days",
+        "dimension": "relationship_days",
+        "old_value": old_days,
+        "new_value": days,
+        "delta": days - old_days,
+        "reason": evidence or "Relationship day count recalibrated.",
+    })
+    effect = {
+        "type": "identity_updated",
+        "action": "identity.relationship_days_set",
+        "fields": ["days_with_user"],
+        "identity_id": identity.get("id", ""),
+        "change_id": change.get("id", "") if change else "",
+    }
+    return {
+        "status": "ok",
+        "action": "identity.relationship_days_set",
+        "changed_fields": ["days_with_user"],
+        "identity": {
+            "id": identity.get("id", ""),
+            "updated_at": identity.get("updated_at", ""),
+            "days_with_user": days,
+        },
+        "change": change or {},
+    }, [effect], 200
+
+
+def _execute_identity_action(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
+    if not isinstance(action, dict):
+        return {"status": "error", "error": "action_must_be_object"}, [], 400
+    action_type = str(action.get("type") or action.get("action") or "").strip()
+    if action_type == "identity.profile_patch":
+        return _identity_profile_patch(store, api_key, action)
+    if action_type == "identity.dimension_nudge":
+        return _identity_dimension_nudge(store, api_key, action)
+    if action_type == "identity.relationship_days_set":
+        return _identity_relationship_days_set(store, action)
+    return {
+        "status": "error",
+        "error": "unsupported_identity_action",
+        "action": action_type,
+        "supported": [
+            "identity.profile_patch",
+            "identity.dimension_nudge",
+            "identity.relationship_days_set",
+        ],
+    }, [], 400
+
+
+def _execute_identity_actions(store: UserStore, api_key: str | None, actions: list[dict]) -> tuple[dict, int]:
+    if not isinstance(actions, list) or not actions:
+        return {"status": "error", "error": "actions_required", "results": [], "effects": []}, 400
+    results: list[dict] = []
+    effects: list[dict] = []
+    for action in actions[:10]:
+        result, action_effects, status = _execute_identity_action(store, api_key, action)
+        results.append(result)
+        effects.extend(action_effects)
+        if status >= 400:
+            return {
+                "status": "error",
+                "error": result.get("error", "identity_action_failed"),
+                "results": results,
+                "effects": effects,
+            }, status
+    return {"status": "ok", "results": results, "effects": effects}, 200
+
+
+@app.route("/v1/identity/actions", methods=["POST"])
+def identity_actions():
+    store = require_user()
+    api_key = _extract_api_key()
+    payload = request.get_json(silent=True) or {}
+    actions = payload.get("actions")
+    if actions is None and isinstance(payload.get("action"), dict):
+        actions = [payload["action"]]
+    elif actions is None and (payload.get("type") or payload.get("action")):
+        actions = [payload]
+    if not isinstance(actions, list):
+        return jsonify({"error": "actions required"}), 400
+    body, status = _execute_identity_actions(store, api_key, actions)
+    return jsonify(body), status
+
+
 # ---------------------------------------------------------------------------
 # Bootstrap stage gating
 # ---------------------------------------------------------------------------
@@ -7722,6 +8480,48 @@ def _save_moments(store: UserStore, moments: list):
         store.memory_file.write_text(json.dumps(moments, ensure_ascii=False, indent=2))
 
 
+def _append_jsonl(path: Path, record: dict) -> dict:
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[jsonl] append failed path={path.name}: {e}")
+    return record
+
+
+def _append_memory_change(store: UserStore, entry: dict) -> dict:
+    record = {
+        "id": uuid.uuid4().hex[:16],
+        "ts": _now_iso(),
+        "action": str(entry.get("action") or "unknown")[:80],
+        "memory_id": str(entry.get("memory_id") or "")[:160],
+    }
+    for key in (
+        "type", "old_type", "new_type", "fields", "reason",
+        "capture_mode", "source_chat_message_ids", "anchor_memory_ids",
+    ):
+        if key in entry:
+            record[key] = entry[key]
+    return _append_jsonl(store.memory_changes_file, record)
+
+
+def _append_memory_capture_job(store: UserStore, entry: dict) -> dict:
+    job = {
+        "job_id": entry.get("job_id") or f"mc_{uuid.uuid4().hex[:16]}",
+        "ts": time.time(),
+        "created_at": _now_iso(),
+        "status": str(entry.get("status") or "queued")[:80],
+        "mode": str(entry.get("mode") or "running")[:80],
+    }
+    for key in (
+        "source_chat_message_ids", "message_chars", "reply_chars",
+        "actions_planned", "actions_written", "effects", "error", "warnings",
+    ):
+        if key in entry:
+            job[key] = entry[key]
+    return _append_jsonl(store.memory_capture_jobs_file, job)
+
+
 def _count_by_tab(moments: list) -> dict:
     """Return {story: int, about_me: int, ta_thinking: int, total: int}."""
     counts = {"story": 0, "about_me": 0, "ta_thinking": 0, "total": 0}
@@ -7818,6 +8618,391 @@ def _reflection_time_cap_ok(moments: list, days: int) -> tuple:
             ),
         }
     return True, None
+
+
+def _memory_action_text(value, max_chars: int) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    return text[:max_chars].strip()
+
+
+def _memory_plain_from_envelope(moment: dict, api_key: str | None) -> tuple[dict | None, str]:
+    if moment.get("visibility") == "local_only":
+        return None, "memory_local_only_agent_cannot_read"
+    try:
+        raw = _decrypt_envelope_via_enclave(moment, api_key, purpose="memory_action")
+        inner = json.loads(raw.decode("utf-8"))
+        if not isinstance(inner, dict):
+            return None, "memory_plaintext_not_object"
+        return inner, ""
+    except Exception as e:
+        return None, f"memory_decrypt_failed:{type(e).__name__}:{str(e)[:180]}"
+
+
+def _memory_inner_from_action(data: dict) -> dict:
+    inner = {
+        "title": _memory_action_text(data.get("title"), 180),
+        "description": str(data.get("description") or "").strip()[:2000],
+        "type": str(data.get("type") or "fact").strip().lower(),
+    }
+    if data.get("her_quote"):
+        inner["her_quote"] = str(data.get("her_quote") or "").strip()[:1000]
+    if data.get("context"):
+        inner["context"] = str(data.get("context") or "").strip()[:1000]
+    if data.get("linked_dimension"):
+        inner["linked_dimension"] = str(data.get("linked_dimension") or "").strip()[:160]
+    if data.get("quoted_in_chat") is not None:
+        try:
+            inner["quoted_in_chat"] = max(0, int(data.get("quoted_in_chat")))
+        except Exception:
+            pass
+    return inner
+
+
+def _memory_validate_write(
+    store: UserStore,
+    moments: list,
+    *,
+    mem_type: str,
+    anchor_ids: list,
+    memory_id: str = "",
+    enforce_reflection_cap: bool = True,
+) -> tuple[bool, dict | None]:
+    if mem_type not in MEMORY_TYPES:
+        return False, {"error": "type_invalid", "got": mem_type, "allowed": list(MEMORY_TYPES)}
+    if mem_type in ("insight", "reflection"):
+        minimum = 1 if mem_type == "insight" else 2
+        if not isinstance(anchor_ids, list) or len(anchor_ids) < minimum:
+            return False, {
+                "error": f"{mem_type}_requires_anchor",
+                "min_anchors": minimum,
+                "required": f"{mem_type} requires ≥{minimum} anchor_memory_ids.",
+            }
+        if memory_id and memory_id in anchor_ids:
+            return False, {
+                "error": "anchor_self_reference",
+                "required": "A memory cannot anchor itself.",
+            }
+        ok, err = _validate_anchor_ids(moments, anchor_ids, store.user_id)
+        if not ok:
+            return False, err
+        if mem_type == "reflection" and enforce_reflection_cap:
+            ok, err = _reflection_time_cap_ok(moments, _relationship_age_days(store))
+            if not ok:
+                return False, err
+    return True, None
+
+
+def _build_memory_envelope_for_store(
+    store: UserStore,
+    inner: dict,
+    *,
+    item_id: str | None = None,
+) -> tuple[dict | None, str]:
+    return _build_shared_envelope_for_store(
+        store,
+        json.dumps(inner, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        item_id=item_id,
+    )
+
+
+def _memory_record_from_envelope(store: UserStore, envelope: dict, *, existing: dict | None = None) -> dict:
+    now = _now_iso()
+    moment = {
+        "v": 1,
+        "id": envelope.get("id") or (existing.get("id") if existing else f"mom_{uuid.uuid4().hex[:12]}"),
+        "type": str(envelope.get("type") or (existing or {}).get("type") or "fact"),
+        "occurred_at": str(envelope.get("occurred_at") or (existing or {}).get("occurred_at") or now),
+        "created_at": (existing or {}).get("created_at") or now,
+        "updated_at": now,
+        "source": str(envelope.get("source") or (existing or {}).get("source") or "live_conversation"),
+        "body_ct": envelope["body_ct"],
+        "nonce": envelope["nonce"],
+        "K_user": envelope["K_user"],
+        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
+        "visibility": envelope["visibility"],
+        "owner_user_id": envelope["owner_user_id"],
+    }
+    if envelope.get("K_enclave"):
+        moment["K_enclave"] = envelope["K_enclave"]
+    anchor_ids = envelope.get("anchor_memory_ids") or []
+    if anchor_ids:
+        moment["anchor_memory_ids"] = list(anchor_ids)
+    return moment
+
+
+def _memory_action_effect(action: str, memory_id: str, fields: list[str] | None = None) -> dict:
+    return {
+        "type": "memory_updated" if action not in {"memory.add", "memory.add_correction"} else "memory_added",
+        "action": action,
+        "memory_id": memory_id,
+        "fields": fields or [],
+    }
+
+
+def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
+    raw = action.get("memory") if isinstance(action.get("memory"), dict) else action
+    mem_type = str(raw.get("type") or "fact").strip().lower()
+    title = _memory_action_text(raw.get("title"), 180)
+    description = str(raw.get("description") or "").strip()[:2000]
+    if not title:
+        return {"status": "error", "error": "title_required", "action": "memory.add"}, [], 400
+    if not description and mem_type not in {"quote", "event"}:
+        return {"status": "error", "error": "description_required", "action": "memory.add"}, [], 400
+    anchor_ids = raw.get("anchor_memory_ids") or action.get("anchor_memory_ids") or []
+    if not isinstance(anchor_ids, list):
+        return {"status": "error", "error": "anchor_memory_ids_must_be_list", "action": "memory.add"}, [], 400
+    moments = _load_moments(store)
+    ok, err = _memory_validate_write(store, moments, mem_type=mem_type, anchor_ids=anchor_ids)
+    if not ok:
+        return {"status": "error", **(err or {}), "action": "memory.add"}, [], 400
+
+    inner = _memory_inner_from_action({**raw, "type": mem_type, "title": title, "description": description})
+    envelope, env_err = _build_memory_envelope_for_store(store, inner)
+    if envelope is None:
+        return {"status": "error", "error": env_err, "action": "memory.add"}, [], 409
+    envelope["type"] = mem_type
+    envelope["occurred_at"] = _memory_action_text(raw.get("occurred_at") or _now_iso(), 80)
+    envelope["source"] = _memory_action_text(raw.get("source") or action.get("source") or "model_api_capture", 80)
+    if anchor_ids:
+        envelope["anchor_memory_ids"] = list(anchor_ids)
+    moment = _memory_record_from_envelope(store, envelope)
+    moments.append(moment)
+    _save_moments(store, moments)
+    _log_bootstrap_event(store, "memory_action_added_v1", success=True)
+    change = _append_memory_change(store, {
+        "action": "add",
+        "memory_id": moment["id"],
+        "type": mem_type,
+        "reason": _memory_action_text(action.get("reason") or "Memory added from chat/capture.", 500),
+        "capture_mode": action.get("capture_mode") or "",
+        "source_chat_message_ids": action.get("source_chat_message_ids") or [],
+        "anchor_memory_ids": anchor_ids,
+    })
+    effect = _memory_action_effect(str(action.get("type") or "memory.add"), moment["id"], ["created"])
+    return {
+        "status": "ok",
+        "action": str(action.get("type") or "memory.add"),
+        "memory": {"id": moment["id"], "type": mem_type, "occurred_at": moment["occurred_at"]},
+        "change": change,
+    }, [effect], 201
+
+
+def _memory_content_patch_action(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
+    memory_id = _memory_action_text(action.get("id") or action.get("memory_id"), 160)
+    patch = action.get("patch") if isinstance(action.get("patch"), dict) else {}
+    if not memory_id:
+        return {"status": "error", "error": "memory_id_required", "action": "memory.content_patch"}, [], 400
+    if not patch:
+        return {"status": "error", "error": "patch_required", "action": "memory.content_patch"}, [], 400
+
+    moments = _load_moments(store)
+    idx = next((i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == memory_id), None)
+    if idx is None:
+        return {"status": "error", "error": "not_found", "action": "memory.content_patch"}, [], 404
+    existing = moments[idx]
+    if existing.get("owner_user_id") != store.user_id:
+        return {"status": "error", "error": "not_owned", "action": "memory.content_patch"}, [], 403
+    inner, err = _memory_plain_from_envelope(existing, api_key)
+    if inner is None:
+        return {"status": "error", "error": err, "action": "memory.content_patch"}, [], 409
+
+    merged = dict(inner)
+    changed: list[str] = []
+    for key, max_len in (
+        ("title", 180),
+        ("description", 2000),
+        ("her_quote", 1000),
+        ("context", 1000),
+        ("linked_dimension", 160),
+    ):
+        if key in patch:
+            new_val = str(patch.get(key) or "").strip()[:max_len]
+            if new_val:
+                merged[key] = new_val
+            else:
+                merged.pop(key, None)
+            if merged.get(key, "") != inner.get(key, ""):
+                changed.append(key)
+
+    mem_type = str(patch.get("type") or existing.get("type") or merged.get("type") or "fact").strip().lower()
+    if mem_type != existing.get("type"):
+        changed.append("type")
+    merged["type"] = mem_type
+    occurred_at = _memory_action_text(patch.get("occurred_at") or existing.get("occurred_at") or _now_iso(), 80)
+    if occurred_at != existing.get("occurred_at"):
+        changed.append("occurred_at")
+    source = _memory_action_text(patch.get("source") or existing.get("source") or "live_conversation", 80)
+    anchor_ids = patch.get("anchor_memory_ids", existing.get("anchor_memory_ids") or [])
+    if not isinstance(anchor_ids, list):
+        return {"status": "error", "error": "anchor_memory_ids_must_be_list", "action": "memory.content_patch"}, [], 400
+    if anchor_ids != (existing.get("anchor_memory_ids") or []):
+        changed.append("anchor_memory_ids")
+
+    ok, validation_err = _memory_validate_write(
+        store,
+        moments,
+        mem_type=mem_type,
+        anchor_ids=anchor_ids,
+        memory_id=memory_id,
+        enforce_reflection_cap=False,
+    )
+    if not ok:
+        return {"status": "error", **(validation_err or {}), "action": "memory.content_patch"}, [], 400
+    if not changed:
+        return {"status": "ok", "action": "memory.content_patch", "changed_fields": [], "noop": True}, [], 200
+
+    envelope, env_err = _build_memory_envelope_for_store(store, _memory_inner_from_action(merged), item_id=memory_id)
+    if envelope is None:
+        return {"status": "error", "error": env_err, "action": "memory.content_patch"}, [], 409
+    envelope["type"] = mem_type
+    envelope["occurred_at"] = occurred_at
+    envelope["source"] = source
+    if anchor_ids:
+        envelope["anchor_memory_ids"] = list(anchor_ids)
+    updated = _memory_record_from_envelope(store, envelope, existing=existing)
+    moments[idx] = updated
+    _save_moments(store, moments)
+    _log_bootstrap_event(store, "memory_action_patched_v1", success=True)
+    change = _append_memory_change(store, {
+        "action": "content_patch",
+        "memory_id": memory_id,
+        "old_type": existing.get("type", ""),
+        "new_type": mem_type,
+        "fields": changed,
+        "reason": _memory_action_text(action.get("reason") or "Memory updated from chat.", 500),
+        "source_chat_message_ids": action.get("source_chat_message_ids") or [],
+        "anchor_memory_ids": anchor_ids,
+    })
+    return {
+        "status": "ok",
+        "action": "memory.content_patch",
+        "changed_fields": changed,
+        "memory": {"id": memory_id, "type": mem_type, "occurred_at": occurred_at},
+        "change": change,
+    }, [_memory_action_effect("memory.content_patch", memory_id, changed)], 200
+
+
+def _memory_retype_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
+    memory_id = _memory_action_text(action.get("id") or action.get("memory_id"), 160)
+    new_type = str(action.get("new_type") or action.get("memory_type") or action.get("to_type") or "").strip().lower()
+    if not memory_id:
+        return {"status": "error", "error": "memory_id_required", "action": "memory.retype"}, [], 400
+    if new_type not in MEMORY_TYPES:
+        return {"status": "error", "error": "type_invalid", "got": new_type, "allowed": list(MEMORY_TYPES), "action": "memory.retype"}, [], 400
+    moments = _load_moments(store)
+    idx = next((i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == memory_id), None)
+    if idx is None:
+        return {"status": "error", "error": "not_found", "action": "memory.retype"}, [], 404
+    target = dict(moments[idx])
+    anchor_ids = action.get("anchor_memory_ids") or []
+    ok, err = _memory_validate_write(store, moments, mem_type=new_type, anchor_ids=anchor_ids, memory_id=memory_id, enforce_reflection_cap=False)
+    if not ok:
+        return {"status": "error", **(err or {}), "action": "memory.retype"}, [], 400
+    old_type = target.get("type", "")
+    if old_type == new_type and anchor_ids == (target.get("anchor_memory_ids") or []):
+        return {"status": "ok", "action": "memory.retype", "changed_fields": [], "noop": True}, [], 200
+    target["type"] = new_type
+    target["updated_at"] = _now_iso()
+    target["retyped_at"] = target["updated_at"]
+    if anchor_ids:
+        target["anchor_memory_ids"] = list(anchor_ids)
+    else:
+        target.pop("anchor_memory_ids", None)
+    moments[idx] = target
+    _save_moments(store, moments)
+    change = _append_memory_change(store, {
+        "action": "retype",
+        "memory_id": memory_id,
+        "old_type": old_type,
+        "new_type": new_type,
+        "fields": ["type", "anchor_memory_ids"],
+        "reason": _memory_action_text(action.get("reason") or "Memory type updated.", 500),
+        "anchor_memory_ids": anchor_ids,
+    })
+    return {
+        "status": "ok",
+        "action": "memory.retype",
+        "changed_fields": ["type", "anchor_memory_ids"],
+        "memory": {"id": memory_id, "type": new_type},
+        "change": change,
+    }, [_memory_action_effect("memory.retype", memory_id, ["type", "anchor_memory_ids"])], 200
+
+
+def _memory_delete_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
+    memory_id = _memory_action_text(action.get("id") or action.get("memory_id"), 160)
+    if not memory_id:
+        return {"status": "error", "error": "memory_id_required", "action": "memory.delete"}, [], 400
+    moments = _load_moments(store)
+    target = next((m for m in moments if isinstance(m, dict) and m.get("id") == memory_id), None)
+    if target is None:
+        return {"status": "error", "error": "not_found", "action": "memory.delete"}, [], 404
+    new_moments = [m for m in moments if not (isinstance(m, dict) and m.get("id") == memory_id)]
+    _save_moments(store, new_moments)
+    change = _append_memory_change(store, {
+        "action": "delete",
+        "memory_id": memory_id,
+        "type": target.get("type", ""),
+        "reason": _memory_action_text(action.get("reason") or "Memory deleted from chat.", 500),
+        "source_chat_message_ids": action.get("source_chat_message_ids") or [],
+    })
+    effect = {"type": "memory_deleted", "action": "memory.delete", "memory_id": memory_id, "fields": ["deleted"]}
+    return {"status": "ok", "action": "memory.delete", "memory": {"id": memory_id}, "change": change}, [effect], 200
+
+
+def _execute_memory_action(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
+    if not isinstance(action, dict):
+        return {"status": "error", "error": "action_must_be_object"}, [], 400
+    action_type = str(action.get("type") or action.get("action") or "").strip()
+    if action_type in {"memory.add", "memory.add_correction"}:
+        return _memory_add_action(store, action)
+    if action_type == "memory.content_patch":
+        return _memory_content_patch_action(store, api_key, action)
+    if action_type == "memory.retype":
+        return _memory_retype_action(store, action)
+    if action_type == "memory.delete":
+        return _memory_delete_action(store, action)
+    return {
+        "status": "error",
+        "error": "unsupported_memory_action",
+        "action": action_type,
+        "supported": ["memory.add", "memory.add_correction", "memory.content_patch", "memory.retype", "memory.delete"],
+    }, [], 400
+
+
+def _execute_memory_actions(store: UserStore, api_key: str | None, actions: list[dict]) -> tuple[dict, int]:
+    if not isinstance(actions, list) or not actions:
+        return {"status": "error", "error": "actions_required", "results": [], "effects": []}, 400
+    results: list[dict] = []
+    effects: list[dict] = []
+    for action in actions[:20]:
+        result, action_effects, status = _execute_memory_action(store, api_key, action)
+        results.append(result)
+        effects.extend(action_effects)
+        if status >= 400:
+            return {
+                "status": "error",
+                "error": result.get("error", "memory_action_failed"),
+                "results": results,
+                "effects": effects,
+            }, status
+    return {"status": "ok", "results": results, "effects": effects}, 200
+
+
+@app.route("/v1/memory/actions", methods=["POST"])
+def memory_actions():
+    store = require_user()
+    api_key = _extract_api_key()
+    payload = request.get_json(silent=True) or {}
+    actions = payload.get("actions")
+    if actions is None and isinstance(payload.get("action"), dict):
+        actions = [payload["action"]]
+    elif actions is None and (payload.get("type") or payload.get("action")):
+        actions = [payload]
+    if not isinstance(actions, list):
+        return jsonify({"error": "actions required"}), 400
+    body, status = _execute_memory_actions(store, api_key, actions)
+    return jsonify(body), status
 
 
 @app.route("/v1/memory/list", methods=["GET"])
@@ -8945,6 +10130,8 @@ def _chat_stats(store: UserStore) -> dict:
 
 def _memory_stats(store: UserStore) -> dict:
     moments = _load_moments(store)
+    changes = store._read_jsonl(store.memory_changes_file, limit=0)
+    capture_jobs = store._read_jsonl(store.memory_capture_jobs_file, limit=0)
     by_type = {typ: 0 for typ in MEMORY_TYPES}
     by_tab = {"story": 0, "about_me": 0, "ta_thinking": 0}
     by_source: dict[str, int] = {}
@@ -8962,11 +10149,32 @@ def _memory_stats(store: UserStore) -> dict:
         created_epochs.append(_to_epoch(m.get("created_at")))
         occurred_epochs.append(_to_epoch(m.get("occurred_at")))
     counts = _count_by_tab(moments)
+    capture_epochs = [
+        _to_epoch(j.get("ts") or j.get("created_at"))
+        for j in capture_jobs
+        if isinstance(j, dict)
+    ]
+    actions_written = 0
+    for job in capture_jobs:
+        if not isinstance(job, dict):
+            continue
+        try:
+            actions_written += int(job.get("actions_written") or 0)
+        except (TypeError, ValueError):
+            continue
     return {
         "total": counts["total"],
         "by_tab": by_tab,
         "by_type": by_type,
         "by_source": by_source,
+        "changes": len(changes),
+        "changes_by_action": _count_rows(changes, "action"),
+        "changes_by_capture_mode": _count_rows(changes, "capture_mode"),
+        "capture_jobs": len(capture_jobs),
+        "capture_jobs_by_status": _count_rows(capture_jobs, "status"),
+        "capture_jobs_by_mode": _count_rows(capture_jobs, "mode"),
+        "capture_actions_written": actions_written,
+        "last_capture_at": _epoch_to_iso(max(capture_epochs, default=0)),
         "first_created_at": _epoch_to_iso(min([e for e in created_epochs if e], default=0)),
         "last_created_at": _epoch_to_iso(max(created_epochs, default=0)),
         "earliest_occurred_at": _epoch_to_iso(min([e for e in occurred_epochs if e], default=0)),
@@ -9264,7 +10472,8 @@ def _render_data_track_page(payload: dict) -> str:
             f"<td>{onboarding['steps_done']}/{onboarding['steps_total']}</td>"
             f"<td>{html.escape(_format_duration(onboarding['stuck_for_sec']))}</td>"
             f"<td>{row['chat']['total']} <span class='muted'>u{row['chat']['user_messages']} / a{row['chat']['agent_messages']}</span></td>"
-            f"<td>{row['memory']['total']} <span class='muted'>S{row['memory']['by_tab'].get('story', 0)} / A{row['memory']['by_tab'].get('about_me', 0)} / T{row['memory']['by_tab'].get('ta_thinking', 0)}</span></td>"
+            f"<td>{row['memory']['total']} <span class='muted'>S{row['memory']['by_tab'].get('story', 0)} / A{row['memory']['by_tab'].get('about_me', 0)} / T{row['memory']['by_tab'].get('ta_thinking', 0)}</span>"
+            f"<br><span class='muted'>cap {row['memory'].get('capture_actions_written', 0)} / edit {row['memory'].get('changes', 0)}</span></td>"
             f"<td>{row['proactive']['proactive_messages']} <span class='muted'>jobs {row['proactive']['jobs']} / fail {row['proactive']['failed_jobs']}</span></td>"
             f"<td>{html.escape(row.get('last_activity_at') or '')}</td>"
             "</tr>"

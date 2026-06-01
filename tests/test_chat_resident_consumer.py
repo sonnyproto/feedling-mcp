@@ -32,7 +32,8 @@ _ENV_DEFAULTS = {
 for k, v in _ENV_DEFAULTS.items():
     os.environ.setdefault(k, v)
 
-# Add backend dir to path (needed for real import in non-test environments).
+# Add repo root + backend dir to path (needed for real import in non-test environments).
+sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 # Stub out content_encryption only when the backend tree is unavailable. In the
@@ -230,6 +231,84 @@ def test_dedup_prevents_reprocessing_same_message():
         crc._process_messages([msg])   # second time → deduped
 
     assert mock_agent.call_count == 1
+
+
+def test_process_messages_executes_identity_actions_before_reply():
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    events = []
+    action = {
+        "type": "identity.profile_patch",
+        "patch": {"agent_name": "小秘"},
+        "reason": "User asked for a displayed name change.",
+    }
+    msg = _make_msg(role="user", content="call yourself 小秘", ts=3100.0)
+
+    def _execute(actions):
+        events.append(("actions", actions))
+        return {"status": "ok", "effects": [{"type": "identity_updated"}], "results": []}
+
+    def _post(reply, **kwargs):
+        events.append(("reply", reply))
+        return {"id": "msg_1"}
+
+    with patch.object(crc, "call_agent", return_value={"actions": [action], "messages": ["改好了。"]}), \
+         patch.object(crc, "execute_agent_actions", side_effect=_execute), \
+         patch.object(crc, "post_reply", side_effect=_post):
+        result_ts = crc._process_messages([msg])
+
+    assert result_ts == pytest.approx(3100.0)
+    assert events[0] == ("actions", [action])
+    assert events[1] == ("reply", "改好了。")
+
+
+def test_process_messages_does_not_post_optimistic_reply_when_identity_action_fails():
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    action = {
+        "type": "identity.profile_patch",
+        "patch": {"agent_name": "小秘"},
+    }
+    msg = _make_msg(role="user", content="把你的名字改成小秘", ts=3200.0)
+
+    with patch.object(crc, "call_agent", return_value={"actions": [action], "messages": ["改好了。"]}), \
+         patch.object(crc, "execute_agent_actions", side_effect=RuntimeError("write failed")), \
+         patch.object(crc, "post_reply") as mock_post:
+        result_ts = crc._process_messages([msg])
+
+    assert result_ts == pytest.approx(3200.0)
+    mock_post.assert_called_once()
+    assert "没能" in mock_post.call_args.args[0]
+    assert mock_post.call_args.args[0] != "改好了。"
+
+
+def test_process_messages_executes_memory_actions_before_reply():
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    events = []
+    action = {
+        "type": "memory.content_patch",
+        "memory_id": "mom_1",
+        "patch": {"description": "corrected"},
+    }
+    msg = _make_msg(role="user", content="这张记忆改一下", ts=3300.0)
+
+    def _execute(actions):
+        events.append(("actions", actions))
+        return {"status": "ok", "effects": [{"type": "memory_updated"}], "results": []}
+
+    def _post(reply, **kwargs):
+        events.append(("reply", reply))
+        return {"id": "msg_1"}
+
+    with patch.object(crc, "call_agent", return_value={"actions": [action], "messages": ["改好了。"]}), \
+         patch.object(crc, "execute_agent_actions", side_effect=_execute), \
+         patch.object(crc, "post_reply", side_effect=_post):
+        result_ts = crc._process_messages([msg])
+
+    assert result_ts == pytest.approx(3300.0)
+    assert events[0] == ("actions", [action])
+    assert events[1] == ("reply", "改好了。")
 
 
 # ---------------------------------------------------------------------------

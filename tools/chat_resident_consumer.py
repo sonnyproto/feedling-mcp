@@ -1635,30 +1635,45 @@ def _cap_agent_replies(replies: list[str], max_items: int | None = None) -> list
     return replies[:limit]
 
 
-def _normalize_agent_replies(raw_reply: str, max_items: int | None = None) -> list[str]:
+def _normalize_agent_output(raw_reply: Any, max_items: int | None = None) -> tuple[list[dict], list[str]]:
     """Convert agent output into one or more chat bubbles.
 
     Supported shapes:
     - Plain text -> one bubble after sanitization.
     - JSON string with {"messages": ["...", "..."]} -> multiple bubbles.
+    - JSON string with {"actions": [...], "messages": [...]} -> identity actions + bubbles.
     - JSON string with ["...", "..."] -> multiple bubbles.
 
     We keep policy minimal here: resident should not force one-to-one turn mapping;
     agent-side logic decides whether to return one or many messages. The resident
     only enforces the product cap so one proactive moment cannot flood the user.
     """
-    if not isinstance(raw_reply, str):
-        return []
+    actions: list[dict] = []
+    if isinstance(raw_reply, dict):
+        obj = raw_reply
+        raw_text = ""
+    elif isinstance(raw_reply, list):
+        obj = raw_reply
+        raw_text = ""
+    elif isinstance(raw_reply, str):
+        raw_text = raw_reply.strip()
+        if not raw_text:
+            return [], []
+        obj = _structured_reply_payload(raw_text)
+    else:
+        return [], []
 
-    raw_reply = raw_reply.strip()
-    if not raw_reply:
-        return []
-
-    # Optional structured multi-message output from agent.
-    obj = _structured_reply_payload(raw_reply)
     items: list[Any] | None = None
     if isinstance(obj, dict) and isinstance(obj.get("messages"), list):
         items = obj["messages"]
+        raw_actions = obj.get("actions")
+        if isinstance(raw_actions, list):
+            actions = [a for a in raw_actions if isinstance(a, dict)]
+    elif isinstance(obj, dict) and isinstance(obj.get("reply"), str):
+        items = [obj["reply"]]
+        raw_actions = obj.get("actions")
+        if isinstance(raw_actions, list):
+            actions = [a for a in raw_actions if isinstance(a, dict)]
     elif isinstance(obj, list):
         items = obj
     if items is not None:
@@ -1668,17 +1683,25 @@ def _normalize_agent_replies(raw_reply: str, max_items: int | None = None) -> li
                 clean = _sanitize_reply_text(item)
                 if clean:
                     out.append(clean)
-        return _cap_agent_replies(out, max_items=max_items)
+        return actions, _cap_agent_replies(out, max_items=max_items)
 
-    clean = _sanitize_reply_text(raw_reply)
-    return [clean] if clean else []
+    clean = _sanitize_reply_text(raw_text)
+    return [], ([clean] if clean else [])
+
+
+def _normalize_agent_replies(raw_reply: str, max_items: int | None = None) -> list[str]:
+    return _normalize_agent_output(raw_reply, max_items=max_items)[1]
+
+
+def _split_agent_result(result: Any, max_items: int | None = None) -> tuple[list[dict], list[str]]:
+    return _normalize_agent_output(result, max_items=max_items)
 
 
 def call_agent(
     message: str,
     images: list[dict[str, str]] | None = None,
     image_paths: list[str] | None = None,
-) -> list[str]:
+) -> Any:
     if AGENT_MODE == "http":
         raw = call_agent_http(message, images=images)
     elif AGENT_MODE == "cli":
@@ -1686,7 +1709,9 @@ def call_agent(
     else:
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
-    replies = _normalize_agent_replies(raw)
+    actions, replies = _normalize_agent_output(raw)
+    if actions:
+        return {"actions": actions, "messages": replies}
     if replies:
         return replies
     if SEND_FALLBACK_ON_AGENT_ERROR:
@@ -1706,6 +1731,76 @@ _whoami_cache: dict = {"user_id": "", "user_pk": None, "enclave_pk": None}
 # Fallback deduplication — don't flood the user if the agent repeatedly fails.
 FALLBACK_COOLDOWN = int(os.environ.get("FALLBACK_COOLDOWN", "60"))
 _last_fallback_ts: float = 0.0
+
+
+def execute_identity_actions(actions: list[dict]) -> dict:
+    if not actions:
+        return {"status": "ok", "results": [], "effects": []}
+    resp = httpx.post(
+        f"{FEEDLING_API_URL}/v1/identity/actions",
+        json={"actions": actions},
+        headers=_HEADERS,
+        timeout=20,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"identity_actions_http_{resp.status_code}:{resp.text[:500]}")
+    body = resp.json()
+    if not isinstance(body, dict) or body.get("status") not in {"ok", "created", "replaced"}:
+        raise RuntimeError(f"identity_actions_unexpected_response:{str(body)[:500]}")
+    return body
+
+
+def execute_memory_actions(actions: list[dict]) -> dict:
+    if not actions:
+        return {"status": "ok", "results": [], "effects": []}
+    resp = httpx.post(
+        f"{FEEDLING_API_URL}/v1/memory/actions",
+        json={"actions": actions},
+        headers=_HEADERS,
+        timeout=20,
+    )
+    if resp.status_code >= 400:
+        raise RuntimeError(f"memory_actions_http_{resp.status_code}:{resp.text[:500]}")
+    body = resp.json()
+    if not isinstance(body, dict) or body.get("status") not in {"ok", "created", "replaced"}:
+        raise RuntimeError(f"memory_actions_unexpected_response:{str(body)[:500]}")
+    return body
+
+
+def execute_agent_actions(actions: list[dict]) -> dict:
+    identity_actions: list[dict] = []
+    memory_actions: list[dict] = []
+    unsupported: list[str] = []
+    for action in actions:
+        action_type = str(action.get("type") or action.get("action") or "")
+        if action_type.startswith("identity."):
+            identity_actions.append(action)
+        elif action_type.startswith("memory."):
+            memory_actions.append(action)
+        else:
+            unsupported.append(action_type)
+    if unsupported:
+        raise RuntimeError(f"unsupported_agent_actions:{unsupported}")
+    identity_result = execute_identity_actions(identity_actions)
+    memory_result = execute_memory_actions(memory_actions)
+    return {
+        "status": "ok",
+        "identity": identity_result,
+        "memory": memory_result,
+        "effects": (identity_result.get("effects") or []) + (memory_result.get("effects") or []),
+    }
+
+
+def _identity_action_failure_reply(source_message: str) -> str:
+    if re.search(r"[\u4e00-\u9fff]", source_message or ""):
+        return "我刚刚没能把这次更新写进去，所以先不假装已经改好了。"
+    return "I could not write that update, so I will not pretend it changed."
+
+
+def _identity_action_success_reply(source_message: str) -> str:
+    if re.search(r"[\u4e00-\u9fff]", source_message or ""):
+        return "改好了。"
+    return "Done. I updated my identity."
 
 # Message dedup — rolling window prevents reprocessing the same message on
 # restart with a stale checkpoint or if poll races with checkpoint save.
@@ -2116,7 +2211,7 @@ def _process_proactive_jobs(jobs: list) -> float:
 
         update_proactive_job_status(job_id, "realizing")
         try:
-            replies = call_agent(
+            agent_result = call_agent(
                 message,
                 images=screen_payloads,
                 image_paths=screen_paths,
@@ -2126,12 +2221,9 @@ def _process_proactive_jobs(jobs: list) -> float:
             update_proactive_job_status(job_id, "failed", f"agent_call_failed: {e}")
             continue
 
-        if isinstance(replies, str):
-            replies = _normalize_agent_replies(replies)
-        elif not isinstance(replies, list):
-            replies = _normalize_agent_replies(str(replies))
-        else:
-            replies = _cap_agent_replies([str(r) for r in replies if str(r).strip()])
+        actions, replies = _split_agent_result(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
+        if actions:
+            log.warning("ignoring %d identity action(s) from proactive job id=%s", len(actions), job_id)
 
         posted_any = False
         last_error = ""
@@ -2230,19 +2322,19 @@ def _process_messages(messages: list) -> float:
 
         try:
             if image_payloads or image_paths:
-                replies = call_agent(
+                agent_result = call_agent(
                     content,
                     images=image_payloads,
                     image_paths=image_paths,
                 )
             else:
-                replies = call_agent(content)
+                agent_result = call_agent(content)
         except Exception as e:
             log.error("agent call failed; not posting user-visible fallback: %s", e)
             if SEND_FALLBACK_ON_AGENT_ERROR:
                 now = time.time()
                 if now - _last_fallback_ts >= FALLBACK_COOLDOWN:
-                    replies = [FALLBACK_REPLY]
+                    agent_result = [FALLBACK_REPLY]
                     _last_fallback_ts = now
                     log.warning("sending opt-in fallback reply (cooldown starts)")
                 else:
@@ -2258,10 +2350,20 @@ def _process_messages(messages: list) -> float:
                 latest = max(latest, ts)
                 continue
 
-        if isinstance(replies, str):
-            replies = [replies]
-        elif not isinstance(replies, list):
-            replies = [str(replies)]
+        actions, replies = _split_agent_result(agent_result)
+        if actions:
+            try:
+                action_result = execute_agent_actions(actions)
+                log.info(
+                    "agent action(s) executed count=%d effects=%d",
+                    len(actions),
+                    len(action_result.get("effects") or []),
+                )
+                if not replies:
+                    replies = [_identity_action_success_reply(content)]
+            except Exception as e:
+                log.error("agent action execution failed; suppressing optimistic agent reply: %s", e)
+                replies = [_identity_action_failure_reply(content)]
 
         for reply in replies:
             try:

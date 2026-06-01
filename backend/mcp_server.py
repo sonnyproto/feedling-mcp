@@ -1166,6 +1166,45 @@ def identity_replace(
 
 
 @mcp.tool(
+    name="feedling_identity_profile_patch",
+    description=(
+        "Patch lightweight identity profile fields without rewriting dimensions. "
+        "Use this when the user asks you to rename yourself, update your "
+        "self-introduction, category, or signature. This is the preferred tool "
+        "for simple identity edits; it preserves dimensions and relationship days."
+    ),
+)
+def identity_profile_patch(
+    agent_name: str = "",
+    self_introduction: str = "",
+    category: str = "",
+    signature: list[str] = None,
+    reason: str = "",
+    ctx: Context = None,
+) -> dict:
+    patch: dict = {}
+    if agent_name:
+        patch["agent_name"] = agent_name
+    if self_introduction:
+        patch["self_introduction"] = self_introduction
+    if category:
+        patch["category"] = category
+    if signature is not None:
+        patch["signature"] = signature
+    if not patch:
+        return {"error": "at least one profile field is required"}
+    print(f"[mcp] identity.profile_patch fields={','.join(sorted(patch.keys()))}")
+    return _post("/v1/identity/actions", {
+        "actions": [{
+            "type": "identity.profile_patch",
+            "patch": patch,
+            "reason": reason,
+            "source": "mcp_tool",
+        }],
+    }, ctx=ctx)
+
+
+@mcp.tool(
     name="feedling_identity_set_relationship_days",
     description=(
         "Recalibrate the relationship-age anchor without rewriting the identity card. "
@@ -1548,6 +1587,58 @@ def memory_retype(
     print(f"[mcp] memory.retype id={id} → {new_type} "
           f"anchors={len(anchor_memory_ids or [])}")
     return _post("/v1/memory/retype", body, ctx=ctx)
+
+
+@mcp.tool(
+    name="feedling_memory_update",
+    description=(
+        "Patch an existing Memory Garden card in place. Use only when the user "
+        "explicitly says a card is wrong or asks you to edit it. For passive "
+        "new observations, add a new memory instead of rewriting history."
+    ),
+)
+def memory_update(
+    id: str,
+    title: str = "",
+    description: str = "",
+    her_quote: str = "",
+    context: str = "",
+    linked_dimension: str = "",
+    occurred_at: str = "",
+    type: str = "",
+    anchor_memory_ids: list[str] | None = None,
+    reason: str = "",
+    ctx: Context = None,
+) -> dict:
+    patch: dict = {}
+    if title:
+        patch["title"] = title
+    if description:
+        patch["description"] = description
+    if her_quote:
+        patch["her_quote"] = her_quote
+    if context:
+        patch["context"] = context
+    if linked_dimension:
+        patch["linked_dimension"] = linked_dimension
+    if occurred_at:
+        patch["occurred_at"] = occurred_at
+    if type:
+        patch["type"] = type.strip().lower()
+    if anchor_memory_ids is not None:
+        patch["anchor_memory_ids"] = list(anchor_memory_ids)
+    if not patch:
+        return {"error": "at least one field is required"}
+    print(f"[mcp] memory.update id={id} fields={','.join(sorted(patch.keys()))}")
+    return _post("/v1/memory/actions", {
+        "actions": [{
+            "type": "memory.content_patch",
+            "memory_id": id,
+            "patch": patch,
+            "reason": reason,
+            "source": "mcp_tool",
+        }],
+    }, ctx=ctx)
 
 
 @mcp.tool(
