@@ -137,3 +137,82 @@ def test_deepseek_chat_completion_uses_openai_compatible_endpoint(monkeypatch):
     assert calls[0]["url"] == "https://api.deepseek.com/chat/completions"
     assert calls[0]["headers"]["Authorization"] == "Bearer sk-ds-test"
     assert calls[0]["json"]["model"] == "deepseek-chat"
+
+
+def test_openai_compatible_chat_completion_preserves_image_parts(monkeypatch):
+    calls = _fake_client(
+        monkeypatch,
+        {
+            "id": "chatcmpl-test",
+            "choices": [{"message": {"content": "vision ok"}}],
+            "usage": {"total_tokens": 9},
+        },
+    )
+
+    image_part = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/jpeg;base64,abcd"},
+    }
+    result = pc.chat_completion(
+        pc.ProviderConfig("openrouter", "openai/gpt-4.1-mini", "sk-or-test"),
+        [{"role": "user", "content": [{"type": "text", "text": "look"}, image_part]}],
+    )
+
+    assert result["reply"] == "vision ok"
+    content = calls[0]["json"]["messages"][0]["content"]
+    assert content == [{"type": "text", "text": "look"}, image_part]
+
+
+def test_anthropic_chat_completion_maps_image_parts(monkeypatch):
+    calls = _fake_client(
+        monkeypatch,
+        {
+            "id": "msg_test",
+            "content": [{"type": "text", "text": "vision ok"}],
+            "usage": {"input_tokens": 7, "output_tokens": 2},
+        },
+    )
+
+    result = pc.chat_completion(
+        pc.ProviderConfig("anthropic", "claude-sonnet-4-20250514", "sk-ant-test"),
+        [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abcd"}},
+        ]}],
+    )
+
+    assert result["reply"] == "vision ok"
+    content = calls[0]["json"]["messages"][0]["content"]
+    assert content[0] == {"type": "text", "text": "look"}
+    assert content[1] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "abcd"},
+    }
+
+
+def test_gemini_chat_completion_maps_image_parts(monkeypatch):
+    calls = _fake_client(
+        monkeypatch,
+        {
+            "responseId": "gemini_test",
+            "candidates": [{"content": {"parts": [{"text": "vision ok"}]}}],
+            "usageMetadata": {"totalTokenCount": 8},
+        },
+    )
+
+    result = pc.chat_completion(
+        pc.ProviderConfig("gemini", "gemini-2.5-flash", "AIza-test"),
+        [{"role": "user", "content": [
+            {"type": "text", "text": "look"},
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abcd"}},
+        ]}],
+    )
+
+    assert result["reply"] == "vision ok"
+    assert calls[0]["json"]["contents"] == [{
+        "role": "user",
+        "parts": [
+            {"text": "look"},
+            {"inline_data": {"mime_type": "image/jpeg", "data": "abcd"}},
+        ],
+    }]

@@ -15,6 +15,7 @@ import uuid
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -6597,7 +6598,7 @@ def _model_api_context_messages(
     user_message: str,
     *,
     include_screen_context: bool,
-) -> tuple[list[dict], dict]:
+) -> tuple[list[dict], dict, list[dict[str, str]]]:
     hist, hist_err = _enclave_get_json_for_gate(
         "/v1/chat/history",
         api_key,
@@ -6615,6 +6616,7 @@ def _model_api_context_messages(
         identity = identity_data["identity"]
 
     screen_context = ""
+    screen_images: list[dict[str, str]] = []
     if _model_api_should_attach_screen(user_message, include_screen_context):
         with store.frames_lock:
             latest = store.frames_meta[-1].copy() if store.frames_meta else None
@@ -6623,13 +6625,20 @@ def _model_api_context_messages(
                 store,
                 str(latest.get("id")),
                 api_key,
-                include_image=False,
+                include_image=True,
             )
             if not frame.get("error"):
                 screen_context = (
                     f"Current screen app: {frame.get('app') or 'unknown'}\n"
                     f"Current screen OCR: {str(frame.get('ocr_text') or '')[:1600]}"
                 )
+                image_b64 = str(frame.get("image_b64") or "").strip()
+                if image_b64:
+                    screen_images.append({
+                        "mime": str(frame.get("image_mime") or "image/jpeg"),
+                        "b64": image_b64,
+                        "label": "current_screen",
+                    })
 
     identity_summary = {
         "agent_name": identity.get("agent_name", ""),
@@ -6643,6 +6652,7 @@ def _model_api_context_messages(
         "identity": identity_summary,
         "context_memories": context_memories[:8],
         "screen_context": screen_context,
+        "screen_image_attached": bool(screen_images),
         "context_errors": {
             "history": hist_err,
             "identity": identity_err,
@@ -6671,7 +6681,7 @@ def _model_api_context_messages(
         messages.append({"role": role, "content": content[:4000]})
     if not any(m.get("role") == "user" and m.get("content") == user_message for m in messages[-3:]):
         messages.append({"role": "user", "content": user_message})
-    return messages, context_payload
+    return messages, context_payload, screen_images
 
 
 def _model_api_name_action_from_message(message: str) -> dict | None:
@@ -6964,14 +6974,63 @@ def _model_api_run_memory_capture(
         })
 
 
+MODEL_API_MAX_IMAGE_BYTES = 2_000_000
+
+
+def _model_api_image_payload(payload: dict) -> tuple[bytes | None, str, str | None]:
+    raw = str(payload.get("image_b64") or payload.get("image_base64") or "").strip()
+    if not raw:
+        return None, "", None
+    mime = str(payload.get("image_mime") or "image/jpeg").strip() or "image/jpeg"
+    if not re.match(r"^image/(jpeg|jpg|png|webp)$", mime, re.I):
+        return None, "", "image_mime must be image/jpeg, image/png, or image/webp"
+    if raw.startswith("data:"):
+        head, _, rest = raw.partition(",")
+        raw = rest.strip()
+        if head.startswith("data:image/") and ";" in head:
+            mime = head.removeprefix("data:").split(";", 1)[0] or mime
+    try:
+        image_bytes = base64.b64decode(raw, validate=True)
+    except Exception:
+        return None, "", "image_b64 must be valid base64"
+    if not image_bytes:
+        return None, "", "image_b64 must not be empty"
+    if len(image_bytes) > MODEL_API_MAX_IMAGE_BYTES:
+        return None, "", f"image too large; max {MODEL_API_MAX_IMAGE_BYTES} bytes"
+    return image_bytes, mime, None
+
+
+def _model_api_user_content(message: str, images: list[dict[str, str]]) -> Any:
+    text = message.strip() or "User sent an image."
+    if not images:
+        return text
+    parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    for image in images:
+        image_b64 = str(image.get("b64") or "").strip()
+        if not image_b64:
+            continue
+        image_mime = str(image.get("mime") or "image/jpeg")
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{image_mime};base64,{image_b64}"},
+        })
+    return parts
+
+
 @app.route("/v1/model_api/chat/send", methods=["POST"])
 def model_api_chat_send():
     store = require_user()
     api_key = _extract_api_key()
     payload = request.get_json(silent=True) or {}
+    image_bytes, image_mime, image_err = _model_api_image_payload(payload)
+    if image_err:
+        return jsonify({"error": "invalid_image", "detail": image_err}), 400
+    image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes else ""
+    has_image = image_bytes is not None
     message = str(payload.get("message") or payload.get("content") or "").strip()
+    message_for_context = message or ("User sent an image." if has_image else "")
     context_refs = _context_refs_from_payload(payload)
-    if not message:
+    if not message_for_context:
         return jsonify({"error": "message required"}), 400
     if len(message) > 12000:
         return jsonify({"error": "message too long", "max_chars": 12000}), 413
@@ -6981,10 +7040,16 @@ def model_api_chat_send():
         _, err = runtime
         return jsonify(err), 400
 
-    user_env, env_err = _build_shared_envelope_for_store(store, message.encode("utf-8"))
+    user_plaintext = image_bytes if image_bytes is not None else message.encode("utf-8")
+    user_env, env_err = _build_shared_envelope_for_store(store, user_plaintext)
     if user_env is None:
         return jsonify({"error": "user_message_envelope_failed", "detail": env_err}), 409
-    user_row = store.append_chat("user", "model_api", user_env)
+    user_row = store.append_chat(
+        "user",
+        "model_api",
+        user_env,
+        content_type="image" if has_image else "text",
+    )
     store.notify_chat_waiters()
 
     effects: list[dict] = []
@@ -7017,12 +7082,23 @@ def model_api_chat_send():
                 "user_message_id": user_row["id"],
             }), memory_status
 
-    provider_messages, context_payload = _model_api_context_messages(
+    provider_messages, context_payload, screen_images = _model_api_context_messages(
         store,
         api_key,
-        message,
+        message_for_context,
         include_screen_context=bool(payload.get("include_screen_context")),
     )
+    provider_images = list(screen_images)
+    if has_image:
+        provider_images.append({"mime": image_mime, "b64": image_b64, "label": "user_upload"})
+    if provider_images:
+        user_content = _model_api_user_content(message_for_context, provider_images)
+        for idx in range(len(provider_messages) - 1, -1, -1):
+            if provider_messages[idx].get("role") == "user":
+                provider_messages[idx]["content"] = user_content
+                break
+        else:
+            provider_messages.append({"role": "user", "content": user_content})
     if context_refs:
         context_payload["context_refs"] = context_refs
         provider_messages.insert(2, {
@@ -7087,7 +7163,7 @@ def model_api_chat_send():
         store,
         api_key,
         runtime,
-        user_message=message,
+        user_message=message_for_context,
         assistant_reply=reply,
         user_message_id=user_row["id"],
         assistant_message_id=assistant_row["id"],
@@ -7102,6 +7178,7 @@ def model_api_chat_send():
         "reply": reply,
         "user_message": {"id": user_row["id"], "ts": user_row["ts"]},
         "assistant_message": {"id": assistant_row["id"], "ts": assistant_row["ts"]},
+        "user_content_type": "image" if has_image else "text",
         "provider": runtime.provider,
         "model": runtime.model,
         "usage": result.get("usage") or {},

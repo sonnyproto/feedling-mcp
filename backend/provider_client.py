@@ -163,6 +163,62 @@ def _content_text(content: Any) -> str:
     return str(content or "").strip()
 
 
+def _image_parts(content: Any) -> list[dict[str, str]]:
+    if not isinstance(content, list):
+        return []
+    out: list[dict[str, str]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        data_url = ""
+        if isinstance(part.get("image_url"), dict):
+            data_url = str(part["image_url"].get("url") or "")
+        elif part.get("type") == "image_url":
+            data_url = str(part.get("url") or "")
+        if not data_url.startswith("data:image/") or ";base64," not in data_url:
+            continue
+        meta, data = data_url.split(",", 1)
+        mime = meta.removeprefix("data:").split(";", 1)[0] or "image/jpeg"
+        if data.strip():
+            out.append({"mime_type": mime, "data": data.strip()})
+    return out
+
+
+def _content_to_anthropic(content: Any) -> str | list[dict[str, Any]]:
+    text = _content_text(content)
+    images = _image_parts(content)
+    if not images:
+        return text
+    parts: list[dict[str, Any]] = []
+    if text:
+        parts.append({"type": "text", "text": text})
+    for image in images:
+        parts.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image["mime_type"],
+                "data": image["data"],
+            },
+        })
+    return parts
+
+
+def _content_to_gemini_parts(content: Any) -> list[dict[str, Any]]:
+    parts: list[dict[str, Any]] = []
+    text = _content_text(content)
+    if text:
+        parts.append({"text": text})
+    for image in _image_parts(content):
+        parts.append({
+            "inline_data": {
+                "mime_type": image["mime_type"],
+                "data": image["data"],
+            },
+        })
+    return parts
+
+
 def _json_only_instruction(response_format: dict[str, Any] | None) -> str:
     if not response_format:
         return ""
@@ -209,6 +265,56 @@ def _split_system_messages(
         _append_text_message(provider_messages, role=mapped_role, content=content)
     if not provider_messages:
         provider_messages.append({"role": "user", "content": "Say ok."})
+    return "\n\n".join(system_parts).strip(), provider_messages
+
+
+def _split_system_messages_anthropic(
+    messages: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    system_parts: list[str] = []
+    provider_messages: list[dict[str, Any]] = []
+    for message in messages:
+        role = str(message.get("role") or "").strip().lower()
+        content = message.get("content")
+        text = _content_text(content)
+        if role == "system":
+            if text:
+                system_parts.append(text)
+            continue
+        converted = _content_to_anthropic(content)
+        if not converted:
+            continue
+        mapped_role = (
+            "assistant"
+            if role in {"assistant", "openclaw", "agent", "model"}
+            else "user"
+        )
+        provider_messages.append({"role": mapped_role, "content": converted})
+    if not provider_messages:
+        provider_messages.append({"role": "user", "content": "Say ok."})
+    return "\n\n".join(system_parts).strip(), provider_messages
+
+
+def _split_system_messages_gemini(
+    messages: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    system_parts: list[str] = []
+    provider_messages: list[dict[str, Any]] = []
+    for message in messages:
+        role = str(message.get("role") or "").strip().lower()
+        content = message.get("content")
+        text = _content_text(content)
+        if role == "system":
+            if text:
+                system_parts.append(text)
+            continue
+        parts = _content_to_gemini_parts(content)
+        if not parts:
+            continue
+        mapped_role = "model" if role in {"assistant", "openclaw", "agent", "model"} else "user"
+        provider_messages.append({"role": mapped_role, "parts": parts})
+    if not provider_messages:
+        provider_messages.append({"role": "user", "parts": [{"text": "Say ok."}]})
     return "\n\n".join(system_parts).strip(), provider_messages
 
 
@@ -326,10 +432,7 @@ def _chat_completion_anthropic(
     timeout: float,
     response_format: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    system, provider_messages = _split_system_messages(
-        messages,
-        assistant_role="assistant",
-    )
+    system, provider_messages = _split_system_messages_anthropic(messages)
     json_instruction = _json_only_instruction(response_format)
     if json_instruction:
         system = f"{system}\n\n{json_instruction}".strip()
@@ -385,11 +488,7 @@ def _chat_completion_gemini(
     timeout: float,
     response_format: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    system, split_messages = _split_system_messages(messages, assistant_role="model")
-    contents = [
-        {"role": message["role"], "parts": [{"text": message["content"]}]}
-        for message in split_messages
-    ]
+    system, contents = _split_system_messages_gemini(messages)
     generation_config: dict[str, Any] = {
         "temperature": temperature,
         "maxOutputTokens": max(1, min(int(max_tokens), 4096)),

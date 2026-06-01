@@ -370,6 +370,58 @@ def test_history_import_reuses_inflight_client_job(client, monkeypatch):
     assert job["memories_created"] >= 2
 
 
+def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
+    _, api_key = _register(client)
+    captured = {}
+
+    monkeypatch.setattr(
+        appmod,
+        "test_provider_key",
+        lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
+    )
+    monkeypatch.setattr(
+        appmod,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose: b"sk-test-secret",
+    )
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        if any(isinstance(m.get("content"), list) for m in messages):
+            captured["messages"] = messages
+        return {"reply": "I can see the image.", "usage": {"total_tokens": 11}}
+
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test-secret"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    chat = client.post(
+        "/v1/model_api/chat/send",
+        json={
+            "message": "What is in this image?",
+            "image_mime": "image/jpeg",
+            "image_b64": _b64(b"fake-jpeg-bytes"),
+        },
+        headers=_headers(api_key),
+    )
+    assert chat.status_code == 200, chat.get_data(as_text=True)
+    assert chat.get_json()["user_content_type"] == "image"
+
+    user_messages = [m for m in captured["messages"] if m.get("role") == "user"]
+    content = user_messages[-1]["content"]
+    assert content[0] == {"type": "text", "text": "What is in this image?"}
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+    history = client.get("/v1/chat/history?limit=10", headers=_headers(api_key))
+    rows = history.get_json()["messages"]
+    assert any(row["role"] == "user" and row["content_type"] == "image" for row in rows)
+
+
 def test_history_import_accepts_json_file_and_persona_profile(client, monkeypatch):
     user_id, api_key = _register(client)
 
