@@ -1062,6 +1062,7 @@ def test_proactive_chat_response_uses_push_to_start_when_start_window_open(tmp_p
             "push_type": push_type,
             "event": (payload.get("aps") or {}).get("event"),
             "content_state": (payload.get("aps") or {}).get("content-state", {}),
+            "alert": (payload.get("aps") or {}).get("alert", {}),
         })
         return {"status": "delivered"}
 
@@ -1152,6 +1153,7 @@ def test_proactive_chat_response_uses_update_during_start_cooldown(tmp_path, mon
             "push_type": push_type,
             "event": (payload.get("aps") or {}).get("event"),
             "content_state": (payload.get("aps") or {}).get("content-state", {}),
+            "alert": (payload.get("aps") or {}).get("alert", {}),
         })
         return {"status": "delivered"}
 
@@ -1219,6 +1221,7 @@ def test_proactive_chat_response_uses_update_during_start_cooldown(tmp_path, mon
     update_state = sent[0]["content_state"]
     assert update_state["visualState"] == "reply"
     assert update_state["desc"] == "继续看一下这里。"
+    assert sent[0]["alert"] == {"title": "IO", "body": "继续看一下这里。"}
 
     snapshot = appmod._proactive_debug_snapshot(store)
     msg = snapshot["proactive_messages"][0]

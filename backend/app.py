@@ -5749,7 +5749,10 @@ def push_live_activity_inner(store: UserStore, payload: dict):
             "timestamp": int(time.time()),
             "event": payload.get("event", "update"),
             "content-state": _live_activity_content_state(store, payload, default_visual_state="reply"),
-            "alert": {"title": alert_title, "body": alert_body[:240]},
+            # Non-empty alert text is what makes a remote Live Activity update
+            # user-visible instead of only refreshing the lock-screen/Island
+            # content state silently.
+            "alert": {"title": alert_title or "IO", "body": alert_body[:240]},
         }
     }
     topic = f"{BUNDLE_ID}.push-type.liveactivity"
