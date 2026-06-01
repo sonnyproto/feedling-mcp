@@ -4480,6 +4480,139 @@ def _parse_plaintext_history(content: str) -> list[dict]:
     return messages
 
 
+def _extract_json_text(value) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = [_extract_json_text(item) for item in value]
+        return "\n".join(part for part in parts if part).strip()
+    if isinstance(value, dict):
+        for key in ("text", "content", "message", "body", "value"):
+            if key in value:
+                text = _extract_json_text(value.get(key))
+                if text:
+                    return text
+        parts = value.get("parts")
+        if isinstance(parts, list):
+            return _extract_json_text(parts)
+    return ""
+
+
+def _extract_json_ts(item: dict) -> float | None:
+    for key in ("create_time", "created_at", "timestamp", "time", "date"):
+        raw = item.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, (int, float)):
+            return float(raw)
+        parsed = _parse_history_ts(str(raw))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _role_from_json_item(item: dict) -> str:
+    author = item.get("author")
+    if isinstance(author, dict):
+        role = author.get("role") or author.get("name")
+        if role:
+            return _normalize_history_role(str(role))
+    role = item.get("role") or item.get("sender") or item.get("from") or item.get("speaker")
+    if role:
+        return _normalize_history_role(str(role))
+    return "user"
+
+
+def _parse_json_history(content: str) -> list[dict]:
+    raw = json.loads(content)
+    messages: list[dict] = []
+    seen: set[tuple[str, str, float | None]] = set()
+
+    def maybe_add(item: dict) -> bool:
+        candidate = item.get("message") if isinstance(item.get("message"), dict) else item
+        if not isinstance(candidate, dict):
+            return False
+        text = _extract_json_text(candidate.get("content"))
+        if not text:
+            text = _extract_json_text(candidate.get("text"))
+        if not text:
+            return False
+        role = _role_from_json_item(candidate)
+        ts = _extract_json_ts(candidate) or _extract_json_ts(item)
+        key = (role, text[:500], ts)
+        if key in seen:
+            return True
+        seen.add(key)
+        messages.append({
+            "role": role,
+            "content": text,
+            "ts": ts,
+            "source": "history_import",
+        })
+        return True
+
+    def walk(value) -> None:
+        if isinstance(value, list):
+            for item in value:
+                walk(item)
+            return
+        if not isinstance(value, dict):
+            return
+        if maybe_add(value):
+            return
+        mapping = value.get("mapping")
+        if isinstance(mapping, dict):
+            for node in mapping.values():
+                walk(node)
+        for key in ("messages", "chat_messages", "conversation", "conversations", "items"):
+            if key in value:
+                walk(value.get(key))
+
+    walk(raw)
+    messages.sort(key=lambda m: (m.get("ts") is None, float(m.get("ts") or 0)))
+    return messages
+
+
+def _parse_import_history_content(content: str, fmt: str, warnings: list[str]) -> list[dict]:
+    if not content.strip():
+        return []
+    normalized = (fmt or "plaintext").strip().lower()
+    if normalized in {"json", "chatgpt_json", "claude_json"}:
+        return _parse_json_history(content)
+    if normalized in {"auto", "file"}:
+        stripped = content.lstrip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                return _parse_json_history(content)
+            except Exception as e:
+                warnings.append(f"json_parse_failed_falling_back_to_plaintext:{type(e).__name__}")
+        return _parse_plaintext_history(content)
+    if normalized in {"plaintext", "text"}:
+        return _parse_plaintext_history(content)
+    raise ValueError("format must be plaintext, text, json, or auto")
+
+
+def _persona_support_messages(payload: dict) -> list[dict]:
+    persona = str(
+        payload.get("persona_content")
+        or payload.get("persona")
+        or payload.get("profile_content")
+        or ""
+    ).strip()
+    if not persona:
+        return []
+    filename = str(payload.get("persona_filename") or "").strip()
+    title = "Long-term user profile"
+    if filename:
+        title += f" ({filename[:120]})"
+    return [{
+        "role": "user",
+        "content": f"{title}:\n{persona[:30000]}",
+        "ts": None,
+        "source": "persona_import",
+    }]
+
+
 def _message_iso_date(msg: dict, fallback: date) -> str:
     try:
         ts = msg.get("ts")
@@ -4958,17 +5091,26 @@ def _process_history_import_sync(
 ) -> dict:
     content = str(payload.get("content") or "")
     fmt = str(payload.get("format") or "plaintext").strip().lower()
-    if fmt not in {"plaintext", "text"}:
-        raise ValueError("P0 supports format=plaintext only")
-    if not content.strip():
-        raise ValueError("content required")
+    warnings: list[str] = []
+    history_messages = _parse_import_history_content(content, fmt, warnings)
+    support_messages = _persona_support_messages(payload)
+    if not history_messages and not support_messages:
+        if not bool(payload.get("fresh_start")):
+            raise ValueError("content, persona_content, or fresh_start=true required")
+        support_messages = [{
+            "role": "user",
+            "content": "Fresh start. No persona profile or previous chat history was provided.",
+            "ts": None,
+            "source": "fresh_start",
+        }]
+        warnings.append("fresh_start_without_support_material")
 
     runtime = _load_runtime_provider_config(store, api_key)
     if isinstance(runtime, tuple):
         _, err = runtime
         raise RuntimeError(json.dumps(err, ensure_ascii=False))
 
-    messages = _parse_plaintext_history(content)
+    messages = history_messages + support_messages
     relationship_start, rel_err = _relationship_start_from_import(payload, messages)
     if relationship_start is None:
         raise ValueError(rel_err)
@@ -4977,21 +5119,26 @@ def _process_history_import_sync(
 
     job.update({
         "status": "processing",
-        "format": "plaintext",
-        "messages_parsed": len(messages),
+        "format": fmt or "plaintext",
+        "history_filename": str(payload.get("history_filename") or "")[:240],
+        "persona_filename": str(payload.get("persona_filename") or "")[:240],
+        "messages_parsed": len(history_messages),
+        "support_materials": len(support_messages),
+        "persona_chars": sum(len(str(m.get("content") or "")) for m in support_messages if m.get("source") == "persona_import"),
         "relationship_started_at": relationship_start.isoformat(),
         "relationship_days": days,
         "floors": floors,
     })
     _save_history_job(store, job)
 
-    chat_rows = _append_import_chat_messages(store, messages)
-    provider_cards, warnings = _extract_memory_cards_with_provider(
+    chat_rows = _append_import_chat_messages(store, history_messages)
+    provider_cards, provider_warnings = _extract_memory_cards_with_provider(
         runtime,
         messages,
         relationship_start,
         floors,
     )
+    warnings.extend(provider_warnings)
     cards = _ensure_import_memory_floors(provider_cards, messages, relationship_start, floors)
     memory_rows = _append_import_memory_cards(store, cards)
 
@@ -8080,13 +8227,17 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
         },
         {
             "id": "history_import",
-            "label": "History Import",
+            "label": "Onboarding Materials",
             "passing": history_ok,
             "job_id": (latest_job or {}).get("job_id", ""),
             "job_status": (latest_job or {}).get("status", ""),
             "messages_parsed": (latest_job or {}).get("messages_parsed", 0),
+            "support_materials": (latest_job or {}).get("support_materials", 0),
             "memories_created": (latest_job or {}).get("memories_created", 0),
-            "required": "Call /v1/history_import/upload with a real transcript." if not history_ok else "",
+            "required": (
+                "Start onboarding with a chat history file, persona profile, or confirmed fresh start."
+                if not history_ok else ""
+            ),
         },
         {
             "id": "memory_garden",

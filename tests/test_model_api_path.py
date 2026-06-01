@@ -213,3 +213,132 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     assert all("body_ct" in row for row in rows if row["source"] == "model_api")
     assert "sk-test-secret" not in (appmod.FEEDLING_DIR / user_id / "model_api.json").read_text()
 
+
+def test_history_import_accepts_json_file_and_persona_profile(client, monkeypatch):
+    user_id, api_key = _register(client)
+
+    monkeypatch.setattr(
+        appmod,
+        "test_provider_key",
+        lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
+    )
+    monkeypatch.setattr(
+        appmod,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose: b"sk-test-secret",
+    )
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        if "Extract Memory Garden" in joined:
+            assert "Long-term user profile" in joined
+            return {
+                "reply": (
+                    '{"memories":['
+                    '{"type":"moment","title":"Imported JSON moment","description":"User tested JSON export import.","occurred_at":"2026-05-30"},'
+                    '{"type":"fact","title":"Persona preference","description":"User likes durable setup context.","occurred_at":"2026-05-30"}'
+                    "]}"
+                ),
+                "usage": {},
+            }
+        if "Derive a Feedling Identity Card" in joined:
+            return {"reply": appmod.json.dumps(_identity_payload()), "usage": {}}
+        return {"reply": "ok", "usage": {}}
+
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test-secret"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    chat_export = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "I am testing JSON history import.",
+                "created_at": "2026-05-30T08:00:00",
+            },
+            {
+                "role": "assistant",
+                "content": [{"text": "I will preserve context."}],
+                "created_at": "2026-05-30T08:01:00",
+            },
+        ]
+    }
+    upload = client.post(
+        "/v1/history_import/upload",
+        json={
+            "format": "auto",
+            "content": appmod.json.dumps(chat_export),
+            "history_filename": "chat-export.json",
+            "persona_content": "Long-term user profile: prefers durable setup context.",
+            "persona_filename": "persona.md",
+        },
+        headers=_headers(api_key),
+    )
+    assert upload.status_code == 201, upload.get_data(as_text=True)
+    job = upload.get_json()["job"]
+    assert job["status"] == "completed"
+    assert job["messages_parsed"] == 2
+    assert job["support_materials"] == 1
+    assert job["history_filename"] == "chat-export.json"
+    assert job["persona_filename"] == "persona.md"
+    assert job["memories_created"] >= 2
+    assert job["identity_written"] is True
+
+
+def test_history_import_allows_confirmed_fresh_start_without_materials(client, monkeypatch):
+    user_id, api_key = _register(client)
+
+    monkeypatch.setattr(
+        appmod,
+        "test_provider_key",
+        lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
+    )
+    monkeypatch.setattr(
+        appmod,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose: b"sk-test-secret",
+    )
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        assert "Fresh start" in joined
+        if "Extract Memory Garden" in joined:
+            return {
+                "reply": (
+                    '{"memories":['
+                    '{"type":"moment","title":"Fresh start","description":"User started without imported material.","occurred_at":"2026-06-01"},'
+                    '{"type":"fact","title":"Blank setup","description":"No prior material was provided.","occurred_at":"2026-06-01"}'
+                    "]}"
+                ),
+                "usage": {},
+            }
+        if "Derive a Feedling Identity Card" in joined:
+            return {"reply": appmod.json.dumps(_identity_payload()), "usage": {}}
+        return {"reply": "ok", "usage": {}}
+
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test-secret"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    upload = client.post(
+        "/v1/history_import/upload",
+        json={"format": "auto", "content": "", "fresh_start": True},
+        headers=_headers(api_key),
+    )
+    assert upload.status_code == 201, upload.get_data(as_text=True)
+    job = upload.get_json()["job"]
+    assert job["status"] == "completed"
+    assert job["messages_parsed"] == 0
+    assert job["support_materials"] == 1
+    assert "fresh_start_without_support_material" in job["warnings"]
+    assert job["identity_written"] is True

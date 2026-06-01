@@ -108,8 +108,11 @@ Body:
 
 ```json
 {
-  "format": "plaintext",
-  "content": "...",
+  "format": "auto",
+  "content": "... chat history file text ...",
+  "history_filename": "chat-export.json",
+  "persona_content": "... optional long-term user profile ...",
+  "persona_filename": "persona.md",
   "relationship_started_at": "2026-05-01",
   "fresh_start": false
 }
@@ -121,7 +124,13 @@ P0 processes synchronously but writes a durable job file under:
 {FEEDLING_DIR}/{user_id}/history_import_jobs/{job_id}.json
 ```
 
-P0 supports plaintext transcripts first. ChatGPT/Claude/Gemini exports are P1.
+`content` is the optional chat history file body; the iOS app should populate
+it from a file upload, not a paste box. `persona_content` is optional and may
+come from pasted text or a persona file. If both are empty, the caller must set
+`fresh_start=true`; the server will still create a blank onboarding job but
+returns a warning because identity and memory have no real support material.
+
+P0 supports plaintext and common JSON export shapes via `format=auto`.
 
 ### `GET /v1/history_import/status/<job_id>`
 
@@ -284,8 +293,10 @@ cat > /tmp/feedling-history.txt <<'EOF'
 EOF
 
 jq -Rs '{
-  format: "plaintext",
+  format: "auto",
   content: .,
+  history_filename: "feedling-history.txt",
+  persona_content: "Optional long-term user profile text.",
   relationship_started_at: "2026-05-31"
 }' /tmp/feedling-history.txt > /tmp/feedling-history.json
 
