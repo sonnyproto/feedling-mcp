@@ -3978,32 +3978,51 @@ def users_set_preferences():
 
 @app.route("/v1/users/public-key", methods=["POST"])
 def users_set_public_key():
-    """Update the authenticated user's content public key.
+    """Backfill the authenticated user's content public key.
 
-    Used to repair key drift when a client rotates/regenerates its local
-    content keypair but keeps the same api_key.
+    This route is intentionally conservative. Once encrypted content exists,
+    public_key rotation must go through /v1/content/rewrap-to-current-key so
+    stored envelopes are rewrapped before future writes target the new key.
     """
     store = require_user()
     payload = request.get_json(silent=True) or {}
     public_key = (payload.get("public_key") or "").strip()
     if not public_key:
         return jsonify({"error": "public_key required"}), 400
+    _, err = _decode_content_public_key(public_key)
+    if err:
+        return jsonify({"error": err}), 400
 
-    updated = False
-    with _users_lock:
-        for u in _users:
-            if u.get("user_id") == store.user_id:
-                u["public_key"] = public_key
-                updated = True
-                break
-        if updated:
-            _save_users()
+    existing = _get_user_public_key(store.user_id)
+    if existing == public_key:
+        return jsonify({
+            "ok": True,
+            "status": "unchanged",
+            "user_id": store.user_id,
+            "public_key_fpr": _content_public_key_fingerprint(public_key),
+        })
+    counts = _encrypted_content_counts(store)
+    if existing and counts["total"] > 0:
+        return jsonify({
+            "error": "public_key_rotation_requires_rewrap",
+            "message": "Existing encrypted content must be rewrapped before changing public_key.",
+            "current_public_key_fpr": _content_public_key_fingerprint(existing),
+            "requested_public_key_fpr": _content_public_key_fingerprint(public_key),
+            "encrypted_content": counts,
+            "recovery_endpoint": "/v1/content/rewrap-to-current-key",
+        }), 409
 
-    if not updated:
+    if not _set_user_public_key(store.user_id, public_key):
         return jsonify({"error": "user not found"}), 404
 
-    print(f"[users] updated public_key for {store.user_id}")
-    return jsonify({"ok": True, "user_id": store.user_id})
+    print(f"[users] updated public_key for {store.user_id} fpr={_content_public_key_fingerprint(public_key)}")
+    return jsonify({
+        "ok": True,
+        "status": "updated",
+        "user_id": store.user_id,
+        "public_key_fpr": _content_public_key_fingerprint(public_key),
+        "encrypted_content": counts,
+    })
 
 
 def _get_user_public_key(user_id: str) -> str:
@@ -4014,6 +4033,67 @@ def _get_user_public_key(user_id: str) -> str:
             if u.get("user_id") == user_id:
                 return (u.get("public_key") or "").strip()
     return ""
+
+
+def _set_user_public_key(user_id: str, public_key: str) -> bool:
+    updated = False
+    with _users_lock:
+        for u in _users:
+            if u.get("user_id") == user_id:
+                u["public_key"] = public_key.strip()
+                updated = True
+                break
+        if updated:
+            _save_users()
+    return updated
+
+
+def _decode_content_public_key(public_key: str) -> tuple[bytes | None, str]:
+    raw = (public_key or "").strip()
+    if not raw:
+        return None, "public_key required"
+    try:
+        decoded = base64.b64decode(raw, validate=True)
+    except Exception:
+        return None, "public_key invalid base64"
+    if len(decoded) != 32:
+        return None, "public_key must decode to 32 bytes"
+    return decoded, ""
+
+
+def _content_public_key_fingerprint(public_key: str | bytes | None) -> str:
+    if public_key is None:
+        return ""
+    if isinstance(public_key, str):
+        key_bytes, err = _decode_content_public_key(public_key)
+        if err or key_bytes is None:
+            return "invalid"
+    else:
+        key_bytes = public_key
+    return hashlib.sha256(key_bytes).hexdigest()[:16]
+
+
+def _has_encrypted_content_record(item: dict | None) -> bool:
+    return bool(
+        isinstance(item, dict)
+        and item.get("body_ct")
+        and item.get("nonce")
+        and item.get("K_user")
+    )
+
+
+def _encrypted_content_counts(store: UserStore) -> dict:
+    identity = _load_identity(store)
+    moments = _load_moments(store)
+    with store.chat_lock:
+        chat_msgs = list(store.chat_messages)
+    counts = {
+        "identity": 1 if _has_encrypted_content_record(identity) else 0,
+        "memory": sum(1 for m in moments if _has_encrypted_content_record(m)),
+        "chat": sum(1 for m in chat_msgs if _has_encrypted_content_record(m)),
+    }
+    counts["total"] = counts["identity"] + counts["memory"] + counts["chat"]
+    return counts
 
 
 # Cached enclave attestation (for wrapping envelopes we can't decrypt
@@ -8646,6 +8726,116 @@ def _swap_memory_inplace(moments: list, mom_id: str, env: dict) -> str:
     return "not_found"
 
 
+def _rewrap_bucket() -> dict:
+    return {"checked": 0, "rewrapped": 0, "skipped": 0, "errors": 0}
+
+
+def _rewrap_summary() -> dict:
+    return {
+        "identity": _rewrap_bucket(),
+        "memory": _rewrap_bucket(),
+        "chat": _rewrap_bucket(),
+        "total_checked": 0,
+        "total_rewrapped": 0,
+        "total_skipped": 0,
+        "total_errors": 0,
+    }
+
+
+def _rewrap_record_result(
+    summary: dict,
+    kind: str,
+    item_id: str,
+    status: str,
+    *,
+    reason: str = "",
+) -> dict:
+    bucket = summary[kind]
+    bucket["checked"] += 1
+    summary["total_checked"] += 1
+    if status == "rewrapped":
+        bucket["rewrapped"] += 1
+        summary["total_rewrapped"] += 1
+    elif status == "error":
+        bucket["errors"] += 1
+        summary["total_errors"] += 1
+    else:
+        bucket["skipped"] += 1
+        summary["total_skipped"] += 1
+    result = {"type": kind, "id": item_id, "status": status}
+    if reason:
+        result["reason"] = reason[:240]
+    return result
+
+
+def _enclave_content_public_key_material() -> tuple[bytes | None, str, str]:
+    enclave_info = _get_enclave_info()
+    if not enclave_info:
+        return None, "", "enclave_info_unavailable"
+    raw_hex = str(enclave_info.get("content_pk_hex") or "")
+    try:
+        enclave_pk = bytes.fromhex(raw_hex)
+    except Exception:
+        return None, "", "enclave_content_public_key_invalid_hex"
+    if len(enclave_pk) != 32:
+        return None, "", "enclave_content_public_key_invalid_length"
+    return enclave_pk, _content_public_key_fingerprint(enclave_pk), ""
+
+
+def _apply_envelope_fields(record: dict, env: dict) -> None:
+    if not record.get("id") and env.get("id"):
+        record["id"] = env["id"]
+    record["v"] = int(env.get("v", 1))
+    record["body_ct"] = env["body_ct"]
+    record["nonce"] = env["nonce"]
+    record["K_user"] = env["K_user"]
+    if env.get("K_enclave"):
+        record["K_enclave"] = env["K_enclave"]
+    else:
+        record.pop("K_enclave", None)
+    record["enclave_pk_fpr"] = env.get("enclave_pk_fpr", "")
+    record["visibility"] = env["visibility"]
+    record["owner_user_id"] = env["owner_user_id"]
+
+
+def _build_rewrapped_envelope(
+    store: UserStore,
+    record: dict,
+    *,
+    api_key: str | None,
+    user_pk: bytes,
+    enclave_pk: bytes,
+    kind: str,
+) -> tuple[dict | None, str, str]:
+    item_id = str(record.get("id") or "")
+    if not _has_encrypted_content_record(record):
+        return None, "skipped_unencrypted", ""
+    if str(record.get("visibility") or "shared") != "shared":
+        return None, "skipped_local_only", ""
+    if not record.get("K_enclave"):
+        return None, "skipped_missing_enclave_key", ""
+    try:
+        plaintext = _decrypt_envelope_via_enclave(
+            record,
+            api_key,
+            purpose=f"content_rewrap:{kind}:{item_id or 'unknown'}",
+        )
+    except Exception as e:
+        return None, "error", f"decrypt_failed:{type(e).__name__}:{str(e)}"
+    try:
+        env = build_envelope(
+            plaintext=plaintext,
+            owner_user_id=store.user_id,
+            user_pk_bytes=user_pk,
+            enclave_pk_bytes=enclave_pk,
+            visibility="shared",
+            item_id=item_id or None,
+        )
+        return env, "rewrapped", ""
+    except Exception as e:
+        return None, "error", f"envelope_build_failed:{type(e).__name__}:{str(e)}"
+
+
 @app.route("/v1/content/swap", methods=["POST"])
 def content_swap():
     store = require_user()
@@ -8708,6 +8898,142 @@ def content_swap():
         _save_moments(store, moments)
 
     return jsonify({"results": results, "summary": _swap_summary(results)})
+
+
+@app.route("/v1/content/rewrap-to-current-key", methods=["POST"])
+def content_rewrap_to_current_key():
+    """Rewrap chat/memory/identity envelopes to the caller's current key.
+
+    Recovery path for key drift: the enclave decrypts existing shared envelopes
+    via K_enclave, then the backend re-encrypts the same plaintext to the
+    public_key supplied by the authenticated iOS client. The user record's
+    public_key is updated only after every eligible item has been verified.
+    """
+    store = require_user()
+    api_key = _extract_api_key()
+    payload = request.get_json(silent=True) or {}
+    dry_raw = payload.get("dry_run", False)
+    dry_run = dry_raw is True or (isinstance(dry_raw, str) and dry_raw.lower() in {"1", "true", "yes", "on"})
+    requested_public_key = (payload.get("public_key") or _get_user_public_key(store.user_id) or "").strip()
+    user_pk, err = _decode_content_public_key(requested_public_key)
+    if err or user_pk is None:
+        return jsonify({"error": err or "public_key invalid"}), 400
+
+    enclave_pk, enclave_fpr, enclave_err = _enclave_content_public_key_material()
+    if enclave_err or enclave_pk is None:
+        return jsonify({"error": enclave_err or "enclave_info_unavailable"}), 503
+
+    summary = _rewrap_summary()
+    results: list[dict] = []
+    identity_plan: dict | None = None
+    memory_plans: list[tuple[int, dict]] = []
+    chat_plans: list[tuple[str, dict]] = []
+
+    identity = _load_identity(store)
+    if identity is not None:
+        env, status, reason = _build_rewrapped_envelope(
+            store,
+            identity,
+            api_key=api_key,
+            user_pk=user_pk,
+            enclave_pk=enclave_pk,
+            kind="identity",
+        )
+        item_id = str(identity.get("id") or "identity")
+        results.append(_rewrap_record_result(summary, "identity", item_id, status, reason=reason))
+        if env is not None:
+            identity_plan = env
+
+    moments = _load_moments(store)
+    for idx, moment in enumerate(moments):
+        if not isinstance(moment, dict):
+            continue
+        env, status, reason = _build_rewrapped_envelope(
+            store,
+            moment,
+            api_key=api_key,
+            user_pk=user_pk,
+            enclave_pk=enclave_pk,
+            kind="memory",
+        )
+        item_id = str(moment.get("id") or "")
+        results.append(_rewrap_record_result(summary, "memory", item_id, status, reason=reason))
+        if env is not None:
+            memory_plans.append((idx, env))
+
+    with store.chat_lock:
+        chat_msgs = list(store.chat_messages)
+    for msg in chat_msgs:
+        if not isinstance(msg, dict):
+            continue
+        env, status, reason = _build_rewrapped_envelope(
+            store,
+            msg,
+            api_key=api_key,
+            user_pk=user_pk,
+            enclave_pk=enclave_pk,
+            kind="chat",
+        )
+        item_id = str(msg.get("id") or "")
+        results.append(_rewrap_record_result(summary, "chat", item_id, status, reason=reason))
+        if env is not None:
+            chat_plans.append((item_id, env))
+
+    response = {
+        "status": "dry_run" if dry_run else "ok",
+        "dry_run": dry_run,
+        "user_id": store.user_id,
+        "public_key_fpr": _content_public_key_fingerprint(user_pk),
+        "enclave_pk_fpr": enclave_fpr,
+        "summary": summary,
+        "results": results,
+    }
+
+    if summary["total_errors"] > 0:
+        response["status"] = "failed"
+        response["error"] = "rewrap_failed"
+        code = 200 if dry_run else 409
+        print(f"[content-rewrap:{store.user_id}] failed errors={summary['total_errors']} dry_run={dry_run}")
+        return jsonify(response), code
+
+    if dry_run:
+        print(f"[content-rewrap:{store.user_id}] dry_run rewrappable={summary['total_rewrapped']} skipped={summary['total_skipped']}")
+        return jsonify(response)
+
+    now = datetime.now().isoformat()
+    if identity is not None and identity_plan is not None:
+        new_identity = dict(identity)
+        _apply_envelope_fields(new_identity, identity_plan)
+        new_identity["rewrapped_at"] = now
+        _save_identity(store, new_identity)
+        _append_identity_change(store, {
+            "action": "rewrap",
+            "reason": "Identity envelope rewrapped to the current iOS content key.",
+        })
+
+    if memory_plans:
+        for idx, env in memory_plans:
+            if 0 <= idx < len(moments) and isinstance(moments[idx], dict):
+                _apply_envelope_fields(moments[idx], env)
+                moments[idx]["rewrapped_at"] = now
+        _save_moments(store, moments)
+
+    chat_dirty = False
+    for item_id, env in chat_plans:
+        if _swap_chat(store, item_id, env) == "ok":
+            chat_dirty = True
+    if chat_dirty:
+        with store.chat_lock:
+            for msg in store.chat_messages:
+                if isinstance(msg, dict) and msg.get("id") in {item_id for item_id, _ in chat_plans}:
+                    msg["rewrapped_at"] = now
+            store._persist_chat()
+
+    if not _set_user_public_key(store.user_id, requested_public_key):
+        return jsonify({"error": "user not found"}), 404
+
+    print(f"[content-rewrap:{store.user_id}] ok rewrapped={summary['total_rewrapped']} skipped={summary['total_skipped']} fpr={response['public_key_fpr']}")
+    return jsonify(response)
 
 
 # ---------------------------------------------------------------------------
