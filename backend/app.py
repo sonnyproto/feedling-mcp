@@ -5203,10 +5203,129 @@ def _history_job_path(store: UserStore, job_id: str) -> Path:
     return store.history_import_jobs_dir / f"{safe}.json"
 
 
+HISTORY_IMPORT_STALE_SEC = int(os.environ.get("FEEDLING_HISTORY_IMPORT_STALE_SEC", str(30 * 60)))
+_HISTORY_IMPORT_PHASES = {
+    "upload_received": (5, "Upload received"),
+    "parsing_materials": (15, "Reading materials"),
+    "chat_history_importing": (25, "Reading chat history"),
+    "memory_extracting": (45, "Extracting Memory Garden"),
+    "memory_writing": (60, "Writing Memory Garden"),
+    "identity_deriving": (75, "Deriving Identity Card"),
+    "relationship_anchor_writing": (85, "Writing relationship anchor"),
+    "hosted_chat_preparing": (93, "Preparing hosted chat"),
+    "completed": (100, "Completed"),
+    "failed": (100, "Failed"),
+}
+_history_import_active_jobs: set[str] = set()
+_history_import_active_lock = threading.Lock()
+
+
 def _save_history_job(store: UserStore, job: dict) -> dict:
     job["updated_at"] = _now_iso()
     _write_json_object(_history_job_path(store, job["job_id"]), job, private=True)
     return job
+
+
+def _history_import_phase_fields(phase: str) -> dict:
+    progress, label = _HISTORY_IMPORT_PHASES.get(phase, (0, phase or ""))
+    return {
+        "phase": phase,
+        "phase_label": label,
+        "progress": progress,
+    }
+
+
+def _update_history_job_phase(
+    store: UserStore,
+    job: dict,
+    phase: str,
+    *,
+    status: str = "processing",
+    **fields,
+) -> dict:
+    job.update(_history_import_phase_fields(phase))
+    job["status"] = status
+    job.update(fields)
+    return _save_history_job(store, job)
+
+
+def _history_import_payload_hash(payload: dict) -> str:
+    relevant = {
+        key: payload.get(key)
+        for key in (
+            "format",
+            "content",
+            "fresh_start",
+            "relationship_started_at",
+            "character_content",
+            "character_card",
+            "character_filename",
+            "character_card_filename",
+            "persona_content",
+            "persona",
+            "personal_profile_content",
+            "personal_profile_filename",
+            "profile_content",
+            "persona_filename",
+            "history_filename",
+        )
+    }
+    blob = json.dumps(relevant, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _history_import_client_job_id(payload: dict) -> str:
+    raw = str(payload.get("client_job_id") or "").strip()
+    return re.sub(r"[^a-zA-Z0-9_-]", "", raw)[:96]
+
+
+def _load_history_import_jobs(store: UserStore) -> list[dict]:
+    jobs: list[dict] = []
+    try:
+        for path in store.history_import_jobs_dir.glob("*.json"):
+            data = _read_json_object(path)
+            if data:
+                jobs.append(data)
+    except Exception:
+        return []
+    jobs.sort(key=lambda j: str(j.get("updated_at") or j.get("created_at") or ""))
+    return jobs
+
+
+def _history_import_age_sec(job: dict) -> float:
+    raw = str(job.get("updated_at") or job.get("created_at") or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, time.time() - datetime.fromisoformat(raw).timestamp())
+    except Exception:
+        return 0.0
+
+
+def _history_import_find_reusable_job(
+    store: UserStore,
+    *,
+    client_job_id: str,
+    input_hash: str,
+) -> dict | None:
+    for job in reversed(_load_history_import_jobs(store)):
+        status = str(job.get("status") or "")
+        if status == "failed":
+            continue
+        matches_client = client_job_id and str(job.get("client_job_id") or "") == client_job_id
+        matches_hash = input_hash and str(job.get("input_hash") or "") == input_hash
+        if not (matches_client or matches_hash):
+            continue
+        if status in {"queued", "processing"} and _history_import_age_sec(job) > HISTORY_IMPORT_STALE_SEC:
+            job.update({
+                "status": "failed",
+                "failed_at": _now_iso(),
+                "error": "RuntimeError:stale_history_import_job",
+            })
+            _update_history_job_phase(store, job, "failed", status="failed")
+            continue
+        return job
+    return None
 
 
 _HISTORY_LINE_RE = re.compile(
@@ -5242,6 +5361,19 @@ def _normalize_history_role(raw: str) -> str:
     if role in {"assistant", "ai", "agent", "claude", "chatgpt", "gemini", "gpt", "io", "ta", "他", "助手"}:
         return "assistant"
     return "user"
+
+
+def _normalize_json_history_role(raw: str) -> str:
+    role = (raw or "").strip().lower()
+    if not role:
+        return "user"
+    if role in {"user", "human", "me", "you", "我", "用户"}:
+        return "user"
+    if role in {"assistant", "ai", "agent", "model", "claude", "chatgpt", "gemini", "gpt", "io", "ta", "他", "助手"}:
+        return "assistant"
+    if role in {"system", "developer", "tool", "function", "browser", "插件"}:
+        return ""
+    return ""
 
 
 def _parse_plaintext_history(content: str) -> list[dict]:
@@ -5329,11 +5461,35 @@ def _role_from_json_item(item: dict) -> str:
     if isinstance(author, dict):
         role = author.get("role") or author.get("name")
         if role:
-            return _normalize_history_role(str(role))
+            return _normalize_json_history_role(str(role))
     role = item.get("role") or item.get("sender") or item.get("from") or item.get("speaker")
     if role:
-        return _normalize_history_role(str(role))
+        return _normalize_json_history_role(str(role))
     return "user"
+
+
+def _dedupe_history_messages(messages: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    seen: set[tuple[str, str, float | None]] = set()
+    for msg in messages:
+        text = str(msg.get("content") or "").strip()
+        role = str(msg.get("role") or "").strip()
+        if role not in {"user", "assistant"} or not text:
+            continue
+        ts = msg.get("ts")
+        try:
+            ts_key = float(ts) if ts is not None else None
+        except Exception:
+            ts_key = None
+        key = (role, re.sub(r"\s+", " ", text)[:800], ts_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        clean = dict(msg)
+        clean["content"] = text
+        clean["role"] = role
+        out.append(clean)
+    return out
 
 
 def _parse_json_history(content: str) -> list[dict]:
@@ -5351,6 +5507,8 @@ def _parse_json_history(content: str) -> list[dict]:
         if not text:
             return False
         role = _role_from_json_item(candidate)
+        if role not in {"user", "assistant"}:
+            return False
         ts = _extract_json_ts(candidate) or _extract_json_ts(item)
         key = (role, text[:500], ts)
         if key in seen:
@@ -5383,13 +5541,51 @@ def _parse_json_history(content: str) -> list[dict]:
 
     walk(raw)
     messages.sort(key=lambda m: (m.get("ts") is None, float(m.get("ts") or 0)))
-    return messages
+    return _dedupe_history_messages(messages)
+
+
+_WRAPPED_CHAT_HISTORY_RE = re.compile(
+    r"(?ms)^\s*={3,}\s*BEGIN\s+CHAT\s+HISTORY\s+FILE:\s*(?P<filename>.*?)\s*={3,}\s*"
+    r"(?P<body>.*?)(?:^\s*={3,}\s*END\s+CHAT\s+HISTORY\s+FILE:.*?={3,}\s*|\Z)"
+)
+
+
+def _parse_wrapped_history_content(content: str, warnings: list[str]) -> tuple[bool, list[dict]]:
+    blocks = list(_WRAPPED_CHAT_HISTORY_RE.finditer(content or ""))
+    if not blocks:
+        return False, []
+
+    messages: list[dict] = []
+    for block in blocks:
+        filename = str(block.group("filename") or "").strip()
+        body = str(block.group("body") or "").strip()
+        if not body:
+            warnings.append(f"empty_chat_history_file:{filename[:120]}")
+            continue
+        lower_name = filename.lower()
+        looks_json = lower_name.endswith(".json") or body.lstrip().startswith(("{", "["))
+        if looks_json:
+            try:
+                parsed = _parse_json_history(body)
+            except Exception as e:
+                warnings.append(f"wrapped_json_parse_failed:{filename[:120]}:{type(e).__name__}")
+                continue
+        else:
+            parsed = _parse_plaintext_history(body)
+        for msg in parsed:
+            if filename:
+                msg["source_filename"] = filename[:240]
+        messages.extend(parsed)
+    return True, _dedupe_history_messages(messages)
 
 
 def _parse_import_history_content(content: str, fmt: str, warnings: list[str]) -> list[dict]:
     if not content.strip():
         return []
     normalized = (fmt or "plaintext").strip().lower()
+    has_wrapped, wrapped_messages = _parse_wrapped_history_content(content, warnings)
+    if has_wrapped:
+        return wrapped_messages
     if normalized in {"json", "chatgpt_json", "claude_json"}:
         return _parse_json_history(content)
     if normalized in {"auto", "file"}:
@@ -5405,25 +5601,107 @@ def _parse_import_history_content(content: str, fmt: str, warnings: list[str]) -
     raise ValueError("format must be plaintext, text, json, or auto")
 
 
+_SUPPORT_BLOCK_RE = re.compile(
+    r"(?ms)^\s*={3,}\s*BEGIN\s+"
+    r"(?P<label>CHARACTER\s+CARD|PERSONAL\s+PROFILE(?:\s+CARD)?|PERSONA\s+PROFILE|USER\s+PROFILE|PERSONA)"
+    r"(?:\s*:[^=]*)?\s*={3,}\s*"
+    r"(?P<body>.*?)(?=^\s*={3,}\s*BEGIN\s+"
+    r"(?:CHARACTER\s+CARD|PERSONAL\s+PROFILE(?:\s+CARD)?|PERSONA\s+PROFILE|USER\s+PROFILE|PERSONA)"
+    r"(?:\s*:[^=]*)?\s*={3,}\s*|\Z)"
+)
+_SUPPORT_MARKER_RE = re.compile(r"^\s*={3,}\s*(?:BEGIN|END)\s+[^=]+={3,}\s*$", re.IGNORECASE)
+
+
+def _clean_support_material_text(text: str) -> str:
+    lines: list[str] = []
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        if _SUPPORT_MARKER_RE.match(line):
+            continue
+        if re.match(r"^\s*={3,}\s*(?:BEGIN|END)\s+CHAT\s+HISTORY\s+FILE:", line, re.IGNORECASE):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _support_message(label: str, source: str, content: str, filename: str = "") -> dict | None:
+    clean = _clean_support_material_text(content)
+    if not clean:
+        return None
+    title = label
+    if filename.strip():
+        title += f" ({filename.strip()[:120]})"
+    return {
+        "role": "user",
+        "content": f"{title}:\n{clean[:30000]}",
+        "ts": None,
+        "source": source,
+    }
+
+
+def _split_support_sections(content: str) -> list[tuple[str, str, str]]:
+    sections: list[tuple[str, str, str]] = []
+    for m in _SUPPORT_BLOCK_RE.finditer(content or ""):
+        raw_label = re.sub(r"\s+", " ", str(m.group("label") or "").strip().lower())
+        body = str(m.group("body") or "").strip()
+        if "character" in raw_label:
+            sections.append(("Character card", "character_import", body))
+        else:
+            sections.append(("Personal profile", "persona_import", body))
+    return sections
+
+
 def _persona_support_messages(payload: dict) -> list[dict]:
-    persona = str(
-        payload.get("persona_content")
-        or payload.get("persona")
+    messages: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(label: str, source: str, content: str, filename: str = "") -> None:
+        msg = _support_message(label, source, content, filename)
+        if not msg:
+            return
+        key = (source, re.sub(r"\s+", " ", str(msg.get("content") or ""))[:1000])
+        if key in seen:
+            return
+        seen.add(key)
+        messages.append(msg)
+
+    character = str(payload.get("character_content") or payload.get("character_card") or "").strip()
+    if character:
+        add(
+            "Character card",
+            "character_import",
+            character,
+            str(payload.get("character_filename") or payload.get("character_card_filename") or "").strip(),
+        )
+
+    profile = str(
+        payload.get("personal_profile_content")
         or payload.get("profile_content")
         or ""
     ).strip()
-    if not persona:
-        return []
-    filename = str(payload.get("persona_filename") or "").strip()
-    title = "Long-term user profile"
-    if filename:
-        title += f" ({filename[:120]})"
-    return [{
-        "role": "user",
-        "content": f"{title}:\n{persona[:30000]}",
-        "ts": None,
-        "source": "persona_import",
-    }]
+    if profile:
+        add(
+            "Personal profile",
+            "persona_import",
+            profile,
+            str(payload.get("personal_profile_filename") or payload.get("persona_filename") or "").strip(),
+        )
+
+    persona = str(payload.get("persona_content") or payload.get("persona") or "").strip()
+    if persona:
+        split_sections = _split_support_sections(persona)
+        if split_sections:
+            filename = str(payload.get("persona_filename") or "").strip()
+            for label, source, body in split_sections:
+                add(label, source, body, filename)
+        else:
+            add(
+                "Personal profile",
+                "persona_import",
+                persona,
+                str(payload.get("persona_filename") or "").strip(),
+            )
+    return messages
 
 
 def _message_iso_date(msg: dict, fallback: date) -> str:
@@ -5434,6 +5712,65 @@ def _message_iso_date(msg: dict, fallback: date) -> str:
     except Exception:
         pass
     return fallback.isoformat()
+
+
+_IMPORT_ARTIFACT_KEYS = (
+    "async_status",
+    "atlas_mode_enabled",
+    "blocked_urls",
+    "context_scopes",
+    "conversation_id",
+    "conversation_origin",
+    "conversation_template_id",
+    "current_node",
+    "default_model_slug",
+    "disabled_tool_ids",
+    "gizmo_id",
+    "is_archived",
+    "is_do_not_remember",
+    "is_read_only",
+    "mapping",
+)
+
+
+def _looks_like_import_artifact(text: str) -> bool:
+    raw = str(text or "")
+    if not raw.strip():
+        return False
+    upper = raw.upper()
+    if "BEGIN CHAT HISTORY FILE" in upper or "END CHAT HISTORY FILE" in upper:
+        return True
+    key_hits = sum(1 for key in _IMPORT_ARTIFACT_KEYS if f'"{key}"' in raw or f"{key}:" in raw)
+    if key_hits >= 2:
+        return True
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    jsonish = sum(1 for line in lines if re.match(r'^"[^"]+"\s*:', line) or line in {"{", "}", "[", "]", "},"})
+    return len(lines) >= 4 and jsonish / max(len(lines), 1) > 0.5
+
+
+def _clean_import_memory_text(text: str, max_chars: int = 900) -> str:
+    kept: list[str] = []
+    for raw in str(text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            if kept and kept[-1] != "":
+                kept.append("")
+            continue
+        if _SUPPORT_MARKER_RE.match(line):
+            continue
+        if re.match(r"^\s*={3,}\s*(?:BEGIN|END)\s+CHAT\s+HISTORY\s+FILE:", line, re.IGNORECASE):
+            continue
+        if re.match(r'^"[^"]+"\s*:', line):
+            continue
+        if line in {"{", "}", "[", "]", "},", "],"}:
+            continue
+        if any(key in line for key in _IMPORT_ARTIFACT_KEYS):
+            continue
+        kept.append(line)
+    cleaned = "\n".join(kept).strip()
+    if _looks_like_import_artifact(cleaned):
+        return ""
+    return cleaned[:max_chars].strip()
 
 
 def _relationship_start_from_import(payload: dict, messages: list[dict]) -> tuple[date | None, str]:
@@ -5459,11 +5796,42 @@ def _relationship_start_from_import(payload: dict, messages: list[dict]) -> tupl
     return None, "relationship_started_at required when transcript has no timestamps; or pass fresh_start=true"
 
 
+def _detect_import_language(messages: list[dict]) -> str:
+    sample = "\n".join(str(m.get("content") or "") for m in messages)[:24000]
+    zh_count = len(re.findall(r"[\u4e00-\u9fff]", sample))
+    latin_count = len(re.findall(r"[A-Za-z]", sample))
+    if zh_count >= 8 and zh_count >= max(3, int(latin_count * 0.08)):
+        return "zh-Hans"
+    return "en"
+
+
+def _language_instruction(language: str) -> str:
+    if str(language).startswith("zh"):
+        return (
+            "Write every user-visible field in Simplified Chinese. Keep proper names, model IDs, "
+            "and exact quoted phrases in their original language when needed."
+        )
+    return "Write every user-visible field in natural English."
+
+
+def _english_only_for_zh(text: str) -> bool:
+    raw = str(text or "")
+    return bool(re.search(r"[A-Za-z]{4,}", raw)) and not re.search(r"[\u4e00-\u9fff]", raw)
+
+
 def _transcript_sample(messages: list[dict], max_chars: int = 18000) -> str:
     parts: list[str] = []
     total = 0
     for msg in messages:
-        role = "User" if msg.get("role") == "user" else "Assistant"
+        source = str(msg.get("source") or "")
+        if source == "character_import":
+            role = "Character card"
+        elif source == "persona_import":
+            role = "Personal profile"
+        elif source == "fresh_start":
+            role = "Fresh start"
+        else:
+            role = "User" if msg.get("role") == "user" else "Assistant"
         at = ""
         try:
             if msg.get("ts"):
@@ -5523,6 +5891,10 @@ def _coerce_memory_cards(raw, relationship_start: date) -> list[dict]:
             continue
         if not title:
             title = desc[:72]
+        quote = str(item.get("her_quote") or item.get("quote") or "").strip()
+        context = str(item.get("context") or "").strip()
+        if any(_looks_like_import_artifact(value) for value in (title, desc, quote, context) if value):
+            continue
         occurred = str(item.get("occurred_at") or item.get("date") or "").strip()
         if not _parse_iso_calendar_date(occurred):
             occurred = relationship_start.isoformat()
@@ -5532,10 +5904,8 @@ def _coerce_memory_cards(raw, relationship_start: date) -> list[dict]:
             "description": desc,
             "occurred_at": occurred,
         }
-        quote = str(item.get("her_quote") or item.get("quote") or "").strip()
         if quote:
             card["her_quote"] = quote[:500]
-        context = str(item.get("context") or "").strip()
         if context:
             card["context"] = context[:600]
         cards.append(card)
@@ -5564,11 +5934,20 @@ def _fallback_memory_cards(
     *,
     story_needed: int,
     about_needed: int,
+    language: str = "en",
 ) -> list[dict]:
     cards: list[dict] = []
-    usable = [m for m in messages if str(m.get("content") or "").strip()]
+    usable: list[dict] = []
+    for msg in messages:
+        content = _clean_import_memory_text(str(msg.get("content") or ""))
+        if not content:
+            continue
+        clean_msg = dict(msg)
+        clean_msg["content"] = content
+        usable.append(clean_msg)
     if not usable:
-        usable = [{"role": "user", "content": "Fresh start with IO.", "ts": None}]
+        fallback_text = "从空白状态开始。" if str(language).startswith("zh") else "Fresh start with IO."
+        usable = [{"role": "user", "content": fallback_text, "ts": None}]
 
     idx = 0
     story_types = ["moment", "quote"]
@@ -5576,9 +5955,13 @@ def _fallback_memory_cards(
         msg = usable[idx % len(usable)]
         content = str(msg.get("content") or "").strip()
         mem_type = story_types[idx % len(story_types)]
+        if str(language).startswith("zh"):
+            title = ("导入片段" if mem_type == "moment" else "导入原话") + f" {idx + 1}"
+        else:
+            title = ("Imported exchange" if mem_type == "moment" else "Imported quote") + f" {idx + 1}"
         cards.append({
             "type": mem_type,
-            "title": ("Imported exchange" if mem_type == "moment" else "Imported quote") + f" {idx + 1}",
+            "title": title,
             "description": content[:900],
             "her_quote": content[:360] if mem_type == "quote" and msg.get("role") == "user" else "",
             "occurred_at": _message_iso_date(msg, relationship_start),
@@ -5591,9 +5974,13 @@ def _fallback_memory_cards(
         msg = usable[idx % len(usable)]
         content = str(msg.get("content") or "").strip()
         mem_type = about_types[idx % len(about_types)]
+        if str(language).startswith("zh"):
+            title = ("导入的个人细节" if mem_type == "fact" else "导入的事件") + f" {idx + 1}"
+        else:
+            title = ("Imported user detail" if mem_type == "fact" else "Imported event") + f" {idx + 1}"
         cards.append({
             "type": mem_type,
-            "title": ("Imported user detail" if mem_type == "fact" else "Imported event") + f" {idx + 1}",
+            "title": title,
             "description": content[:900],
             "occurred_at": _message_iso_date(msg, relationship_start),
         })
@@ -5607,6 +5994,7 @@ def _extract_memory_cards_with_provider(
     messages: list[dict],
     relationship_start: date,
     floors: dict,
+    language: str = "en",
 ) -> tuple[list[dict], list[str]]:
     warnings: list[str] = []
     target_total = int(floors.get("story", 1)) + int(floors.get("about_me", 1))
@@ -5621,6 +6009,8 @@ def _extract_memory_cards_with_provider(
         f"Need at least {floors.get('story', 1)} story cards (moment/quote) and "
         f"{floors.get('about_me', 1)} about_me cards (fact/event), up to {max(target_total + 6, 8)} total. "
         "Use concrete details only; do not invent beyond the transcript. "
+        "Do not copy raw JSON, file delimiters, upload wrappers, or internal field names. "
+        f"{_language_instruction(language)} "
         f"If dates are unclear, use {relationship_start.isoformat()}."
         "\n\nTranscript:\n" + sample
     )
@@ -5658,6 +6048,7 @@ def _ensure_import_memory_floors(
     messages: list[dict],
     relationship_start: date,
     floors: dict,
+    language: str = "en",
 ) -> list[dict]:
     counts = _memory_counts_for_cards(cards)
     story_needed = max(0, int(floors.get("story", 1)) - counts["story"])
@@ -5668,6 +6059,7 @@ def _ensure_import_memory_floors(
             relationship_start,
             story_needed=story_needed,
             about_needed=about_needed,
+            language=language,
         )
     # Force the first persisted memory to anchor the relationship start date.
     if cards:
@@ -5729,24 +6121,26 @@ def _append_import_memory_cards(store: UserStore, cards: list[dict]) -> list[dic
     return created
 
 
-def _fallback_identity_payload(memories: list[dict], days: int) -> dict:
+def _fallback_identity_payload(memories: list[dict], days: int, language: str = "en") -> dict:
     sample_desc = ""
     if memories:
         sample_desc = str(memories[0].get("description") or memories[0].get("title") or "")
-    desc = sample_desc[:220] or "I am still learning from the imported history."
-    names = [
-        "Attentive", "Steady", "Playful", "Protective",
-        "Curious", "Direct", "Tender",
-    ]
+    is_zh = str(language).startswith("zh")
+    desc = sample_desc[:220] or ("我还在从导入材料里学习。" if is_zh else "I am still learning from the imported history.")
+    names = (
+        ["细心", "稳定", "有趣", "守护感", "好奇", "直接", "温柔"]
+        if is_zh else
+        ["Attentive", "Steady", "Playful", "Protective", "Curious", "Direct", "Tender"]
+    )
     values = [74, 68, 56, 63, 71, 59, 66]
     dimensions = [
         {
             "name": name,
             "value": values[idx],
             "description": (
-                f"Estimated from imported history. Anchor: {desc}"
+                (f"根据导入材料初步估计。依据：{desc}" if is_zh else f"Estimated from imported history. Anchor: {desc}")
                 if idx == 0 else
-                "Estimated from imported chat patterns; refine after live conversation."
+                ("根据导入的对话模式初步估计；后续会在真实对话中继续校准。" if is_zh else "Estimated from imported chat patterns; refine after live conversation.")
             ),
         }
         for idx, name in enumerate(names)
@@ -5754,45 +6148,54 @@ def _fallback_identity_payload(memories: list[dict], days: int) -> dict:
     return {
         "agent_name": "IO",
         "self_introduction": (
+            "我已经读过你导入的材料，并先搭好了一版记忆和身份。可能还需要你慢慢校正，但我不会再从空白开始。"
+            if is_zh else
             "I imported our previous history and built a first version of my memory "
             "from it. I may still need correction, but I can now answer with that "
             "context instead of starting blank."
         ),
         "dimensions": dimensions,
         "days_with_user": days,
-        "category": "Attentive · Grounded",
-        "signature": ["Built from receipts", "Ready to keep noticing"],
+        "category": "细心 · 稳定" if is_zh else "Attentive · Grounded",
+        "signature": ["从材料里醒来", "继续记住你"] if is_zh else ["Built from receipts", "Ready to keep noticing"],
     }
 
 
-def _normalize_identity_payload(raw, memories: list[dict], days: int) -> dict:
+def _normalize_identity_payload(raw, memories: list[dict], days: int, language: str = "en") -> dict:
+    fallback = _fallback_identity_payload(memories, days, language)
     if not isinstance(raw, dict):
-        return _fallback_identity_payload(memories, days)
+        return fallback
     payload = dict(raw.get("identity") if isinstance(raw.get("identity"), dict) else raw)
     dims = payload.get("dimensions")
     if not isinstance(dims, list):
-        return _fallback_identity_payload(memories, days)
+        return fallback
     clean_dims: list[dict] = []
     for idx, dim in enumerate(dims[:7]):
         if not isinstance(dim, dict):
             continue
         name = str(dim.get("name") or f"Dimension {idx + 1}")[:60]
+        if str(language).startswith("zh") and _english_only_for_zh(name):
+            name = str(fallback["dimensions"][idx].get("name") or f"维度 {idx + 1}")[:60]
         try:
             value = int(dim.get("value", 50))
         except Exception:
             value = 50
         desc = str(dim.get("description") or dim.get("evidence") or "")[:500]
+        if str(language).startswith("zh") and _english_only_for_zh(desc):
+            desc = ""
         clean_dims.append({
             "name": name,
             "value": max(0, min(value, 100)),
-            "description": desc or "Derived from imported history.",
+            "description": desc or ("根据导入材料得出。" if str(language).startswith("zh") else "Derived from imported history."),
         })
     if len(clean_dims) != 7:
-        return _fallback_identity_payload(memories, days)
+        return fallback
     payload["agent_name"] = str(payload.get("agent_name") or "IO")[:80]
     payload["self_introduction"] = str(payload.get("self_introduction") or "")[:1200]
+    if str(language).startswith("zh") and _english_only_for_zh(payload["self_introduction"]):
+        payload["self_introduction"] = ""
     if not payload["self_introduction"]:
-        payload["self_introduction"] = _fallback_identity_payload(memories, days)["self_introduction"]
+        payload["self_introduction"] = fallback["self_introduction"]
     payload["dimensions"] = clean_dims
     payload["days_with_user"] = days
     if "signature" in payload and not isinstance(payload["signature"], list):
@@ -5807,6 +6210,7 @@ def _derive_identity_with_provider(
     messages: list[dict],
     memory_cards: list[dict],
     days: int,
+    language: str = "en",
 ) -> tuple[dict, list[str]]:
     warnings: list[str] = []
     memory_sample = json.dumps(memory_cards[:40], ensure_ascii=False)
@@ -5816,6 +6220,7 @@ def _derive_identity_with_provider(
         "Return JSON only with fields: agent_name, self_introduction, category, "
         "signature (array of two short strings), dimensions (exactly 7 objects with "
         "name, value 0-100, description). Do not invent facts not grounded in input. "
+        f"{_language_instruction(language)} "
         f"days_with_user is {days}.\n\nMemory cards:\n{memory_sample}\n\nTranscript sample:\n{transcript}"
     )
     try:
@@ -5829,10 +6234,10 @@ def _derive_identity_with_provider(
             temperature=0.3,
             timeout=45.0,
         )
-        return _normalize_identity_payload(_json_from_model_text(result["reply"]), memory_cards, days), warnings
+        return _normalize_identity_payload(_json_from_model_text(result["reply"]), memory_cards, days, language), warnings
     except Exception as e:
         warnings.append(f"provider_identity_failed:{type(e).__name__}:{str(e)[:160]}")
-        return _fallback_identity_payload(memory_cards, days), warnings
+        return _fallback_identity_payload(memory_cards, days, language), warnings
 
 
 def _store_identity_payload(
@@ -5841,6 +6246,7 @@ def _store_identity_payload(
     *,
     days_with_user: int,
     evidence: str,
+    language: str = "en",
 ) -> dict:
     envelope, err = _build_shared_envelope_for_store(
         store,
@@ -5872,7 +6278,7 @@ def _store_identity_payload(
     _log_bootstrap_event(store, "history_import_identity_written", success=True)
     _append_identity_change(store, {
         "action": "replace" if existing else "init",
-        "reason": "Identity card written from Model API history import.",
+        "reason": "根据导入材料写入身份卡。" if str(language).startswith("zh") else "Identity card written from Model API history import.",
     })
     return identity
 
@@ -5883,6 +6289,7 @@ def _generate_model_api_onboarding_greeting(
     memory_cards: list[dict],
     identity_payload: dict,
     days: int,
+    language: str = "en",
 ) -> tuple[str, list[str]]:
     warnings: list[str] = []
     identity_summary = {
@@ -5896,7 +6303,8 @@ def _generate_model_api_onboarding_greeting(
         "Write the first visible chat message from the user's IO companion after onboarding. "
         "The imported files have already been analyzed into memory and identity; do not paste, "
         "summarize, or mention the source files, onboarding, import, API keys, encryption, or internal tools. "
-        "Speak in the companion's own voice, grounded in the context below. Match the user's language if clear. "
+        "Speak in the companion's own voice, grounded in the context below. "
+        f"{_language_instruction(language)} "
         "Return only the message text, no JSON, no bullets, 1-3 short sentences.\n\n"
         "Identity JSON:\n"
         + json.dumps(identity_summary, ensure_ascii=False)[:4000]
@@ -5949,6 +6357,7 @@ def _process_history_import_sync(
     job: dict,
     payload: dict,
 ) -> dict:
+    _update_history_job_phase(store, job, "parsing_materials")
     content = str(payload.get("content") or "")
     fmt = str(payload.get("format") or "plaintext").strip().lower()
     warnings: list[str] = []
@@ -5970,52 +6379,83 @@ def _process_history_import_sync(
         _, err = runtime
         raise RuntimeError(json.dumps(err, ensure_ascii=False))
 
-    messages = history_messages + support_messages
-    relationship_start, rel_err = _relationship_start_from_import(payload, messages)
+    analysis_messages = support_messages + history_messages
+    fallback_messages = history_messages if history_messages else support_messages
+    relationship_start, rel_err = _relationship_start_from_import(payload, fallback_messages)
     if relationship_start is None:
         raise ValueError(rel_err)
     days = max(0, (date.today() - relationship_start).days)
     floors = _per_tab_floors_for_days(days)
+    language = _detect_import_language(analysis_messages)
 
-    job.update({
-        "status": "processing",
+    _update_history_job_phase(store, job, "chat_history_importing", **{
         "format": fmt or "plaintext",
         "history_filename": str(payload.get("history_filename") or "")[:240],
         "persona_filename": str(payload.get("persona_filename") or "")[:240],
         "messages_parsed": len(history_messages),
         "support_materials": len(support_messages),
         "persona_chars": sum(len(str(m.get("content") or "")) for m in support_messages if m.get("source") == "persona_import"),
+        "import_language": language,
         "relationship_started_at": relationship_start.isoformat(),
         "relationship_days": days,
         "floors": floors,
     })
-    _save_history_job(store, job)
 
+    _update_history_job_phase(store, job, "memory_extracting")
     provider_cards, provider_warnings = _extract_memory_cards_with_provider(
         runtime,
-        messages,
+        analysis_messages,
         relationship_start,
         floors,
+        language,
     )
     warnings.extend(provider_warnings)
-    cards = _ensure_import_memory_floors(provider_cards, messages, relationship_start, floors)
-    memory_rows = _append_import_memory_cards(store, cards)
+    cards = _ensure_import_memory_floors(provider_cards, fallback_messages, relationship_start, floors, language)
 
-    identity_payload, id_warnings = _derive_identity_with_provider(runtime, messages, cards, days)
+    _update_history_job_phase(
+        store,
+        job,
+        "memory_writing",
+        memories_planned=len(cards),
+    )
+    memory_rows = _append_import_memory_cards(store, cards)
+    _update_history_job_phase(
+        store,
+        job,
+        "identity_deriving",
+        memories_created=len(memory_rows),
+    )
+
+    identity_payload, id_warnings = _derive_identity_with_provider(runtime, analysis_messages, cards, days, language)
     warnings.extend(id_warnings)
+    _update_history_job_phase(
+        store,
+        job,
+        "relationship_anchor_writing",
+        memories_created=len(memory_rows),
+    )
     identity = _store_identity_payload(
         store,
         identity_payload,
         days_with_user=days,
         evidence=f"history_import:{job['job_id']} relationship_started_at={relationship_start.isoformat()}",
+        language=language,
+    )
+    _update_history_job_phase(
+        store,
+        job,
+        "hosted_chat_preparing",
+        memories_created=len(memory_rows),
+        identity_written=bool(identity),
     )
 
     greeting_text, greeting_warnings = _generate_model_api_onboarding_greeting(
         runtime,
-        messages,
+        analysis_messages,
         cards,
         identity_payload,
         days,
+        language,
     )
     warnings.extend(greeting_warnings)
     greeting_row = _append_model_api_onboarding_greeting(store, greeting_text) if greeting_text else None
@@ -6030,7 +6470,64 @@ def _process_history_import_sync(
         "onboarding_greeting_message_id": (greeting_row or {}).get("id", ""),
         "warnings": warnings,
     })
-    return _save_history_job(store, job)
+    return _update_history_job_phase(store, job, "completed", status="completed")
+
+
+def _run_history_import_job(
+    store: UserStore,
+    api_key: str | None,
+    job_id: str,
+    payload: dict,
+) -> None:
+    try:
+        job = _read_json_object(_history_job_path(store, job_id)) or {
+            "job_id": job_id,
+            "status": "queued",
+            "created_at": _now_iso(),
+        }
+        job["started_at"] = job.get("started_at") or _now_iso()
+        _process_history_import_sync(store, api_key, job, payload)
+        print(
+            f"[history_import:{store.user_id}] job={job_id} messages={job.get('messages_parsed')} "
+            f"memories={job.get('memories_created')} chat={job.get('chat_messages_imported')} async=1"
+        )
+    except Exception as e:
+        job = _read_json_object(_history_job_path(store, job_id)) or {
+            "job_id": job_id,
+            "created_at": _now_iso(),
+        }
+        job.update({
+            "failed_at": _now_iso(),
+            "error": f"{type(e).__name__}:{str(e)[:500]}",
+        })
+        _update_history_job_phase(store, job, "failed", status="failed")
+        print(f"[history_import:{store.user_id}] job={job_id} failed={type(e).__name__}:{str(e)[:220]}")
+    finally:
+        with _history_import_active_lock:
+            _history_import_active_jobs.discard(job_id)
+
+
+def _start_history_import_job(
+    store: UserStore,
+    api_key: str | None,
+    job: dict,
+    payload: dict,
+) -> bool:
+    job_id = str(job.get("job_id") or "")
+    if not job_id:
+        return False
+    with _history_import_active_lock:
+        if job_id in _history_import_active_jobs:
+            return False
+        _history_import_active_jobs.add(job_id)
+    thread = threading.Thread(
+        target=_run_history_import_job,
+        args=(store, api_key, job_id, dict(payload)),
+        daemon=True,
+        name=f"history-import-{job_id[:18]}",
+    )
+    thread.start()
+    return True
 
 
 @app.route("/v1/history_import/upload", methods=["POST"])
@@ -6038,28 +6535,39 @@ def history_import_upload():
     store = require_user()
     api_key = _extract_api_key()
     payload = request.get_json(silent=True) or {}
+    input_hash = _history_import_payload_hash(payload)
+    client_job_id = _history_import_client_job_id(payload)
+    existing = _history_import_find_reusable_job(
+        store,
+        client_job_id=client_job_id,
+        input_hash=input_hash,
+    )
+    if existing:
+        if str(existing.get("status") or "") in {"queued", "processing"}:
+            _start_history_import_job(store, api_key, existing, payload)
+            return jsonify({"job": existing}), 202
+        return jsonify({"job": existing}), 200
+
     job_id = f"hi_{uuid.uuid4().hex[:16]}"
     job = {
         "job_id": job_id,
         "status": "queued",
+        "client_job_id": client_job_id,
+        "input_hash": input_hash,
         "created_at": _now_iso(),
+        "content_chars": len(str(payload.get("content") or "")),
+        "persona_chars": len(str(
+            payload.get("persona_content")
+            or payload.get("persona")
+            or payload.get("profile_content")
+            or ""
+        )),
+        **_history_import_phase_fields("upload_received"),
     }
     _save_history_job(store, job)
-    try:
-        job = _process_history_import_sync(store, api_key, job, payload)
-    except Exception as e:
-        job.update({
-            "status": "failed",
-            "failed_at": _now_iso(),
-            "error": f"{type(e).__name__}:{str(e)[:500]}",
-        })
-        _save_history_job(store, job)
-        return jsonify({"job": job}), 400
-    print(
-        f"[history_import:{store.user_id}] job={job_id} messages={job.get('messages_parsed')} "
-        f"memories={job.get('memories_created')} chat={job.get('chat_messages_imported')}"
-    )
-    return jsonify({"job": job}), 201
+    _start_history_import_job(store, api_key, job, payload)
+    print(f"[history_import:{store.user_id}] job={job_id} queued async=1 client_job_id={client_job_id[:24]}")
+    return jsonify({"job": job}), 202
 
 
 @app.route("/v1/history_import/status/<job_id>", methods=["GET"])
@@ -10459,6 +10967,9 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
             "passing": history_ok,
             "job_id": (latest_job or {}).get("job_id", ""),
             "job_status": (latest_job or {}).get("status", ""),
+            "phase": (latest_job or {}).get("phase", ""),
+            "phase_label": (latest_job or {}).get("phase_label", ""),
+            "progress": (latest_job or {}).get("progress", 0),
             "messages_parsed": (latest_job or {}).get("messages_parsed", 0),
             "support_materials": (latest_job or {}).get("support_materials", 0),
             "memories_created": (latest_job or {}).get("memories_created", 0),
@@ -10950,9 +11461,15 @@ def _history_import_stats(store: UserStore) -> dict:
         "has_job": True,
         "job_id": latest.get("job_id", ""),
         "status": latest.get("status", ""),
+        "phase": latest.get("phase", ""),
+        "phase_label": latest.get("phase_label", ""),
+        "progress": latest.get("progress", 0),
         "created_at": latest.get("created_at", ""),
+        "started_at": latest.get("started_at", ""),
         "updated_at": latest.get("updated_at", ""),
         "completed_at": latest.get("completed_at", ""),
+        "failed_at": latest.get("failed_at", ""),
+        "error": latest.get("error", ""),
         "messages_parsed": latest.get("messages_parsed", 0),
         "support_materials": latest.get("support_materials", 0),
         "chat_messages_imported": latest.get("chat_messages_imported", 0),

@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -46,6 +48,19 @@ def _register(client) -> tuple[str, str]:
 
 def _headers(api_key: str) -> dict[str, str]:
     return {"X-API-Key": api_key}
+
+
+def _wait_history_import_job(client, api_key: str, job_id: str, timeout: float = 3.0) -> dict:
+    deadline = time.time() + timeout
+    last_job = {}
+    while time.time() < deadline:
+        res = client.get(f"/v1/history_import/status/{job_id}", headers=_headers(api_key))
+        assert res.status_code == 200, res.get_data(as_text=True)
+        last_job = res.get_json()["job"]
+        if last_job["status"] in {"completed", "failed"}:
+            return last_job
+        time.sleep(0.02)
+    raise AssertionError(f"history import job did not finish: {last_job}")
 
 
 def _identity_payload() -> dict:
@@ -196,12 +211,30 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
             "format": "plaintext",
             "content": transcript,
             "relationship_started_at": "2026-05-31",
+            "client_job_id": "test-history-import-complete",
         },
         headers=_headers(api_key),
     )
-    assert upload.status_code == 201, upload.get_data(as_text=True)
-    job = upload.get_json()["job"]
+    assert upload.status_code == 202, upload.get_data(as_text=True)
+    queued_job = upload.get_json()["job"]
+    assert queued_job["status"] == "queued"
+    assert queued_job["phase"] == "upload_received"
+    duplicate = client.post(
+        "/v1/history_import/upload",
+        json={
+            "format": "plaintext",
+            "content": transcript,
+            "relationship_started_at": "2026-05-31",
+            "client_job_id": "test-history-import-complete",
+        },
+        headers=_headers(api_key),
+    )
+    assert duplicate.status_code in (200, 202), duplicate.get_data(as_text=True)
+    assert duplicate.get_json()["job"]["job_id"] == queued_job["job_id"]
+    job = _wait_history_import_job(client, api_key, queued_job["job_id"])
     assert job["status"] == "completed"
+    assert job["phase"] == "completed"
+    assert job["progress"] == 100
     assert job["messages_parsed"] == 2
     assert job["memories_created"] >= 2
     assert job["identity_written"] is True
@@ -273,6 +306,70 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     assert "sk-test-secret" not in (appmod.FEEDLING_DIR / user_id / "model_api.json").read_text()
 
 
+def test_history_import_reuses_inflight_client_job(client, monkeypatch):
+    user_id, api_key = _register(client)
+    release_provider = threading.Event()
+    provider_entered = threading.Event()
+
+    monkeypatch.setattr(
+        appmod,
+        "test_provider_key",
+        lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
+    )
+    monkeypatch.setattr(
+        appmod,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose: b"sk-test-secret",
+    )
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        if "Extract Memory Garden" in joined:
+            provider_entered.set()
+            assert release_provider.wait(timeout=2)
+            return {
+                "reply": (
+                    '{"memories":['
+                    '{"type":"moment","title":"Inflight moment","description":"The job was reused.","occurred_at":"2026-05-31"},'
+                    '{"type":"fact","title":"Inflight fact","description":"Duplicate start did not duplicate work.","occurred_at":"2026-05-31"}'
+                    "]}"
+                ),
+                "usage": {},
+            }
+        if "Derive a Feedling Identity Card" in joined:
+            return {"reply": appmod.json.dumps(_identity_payload()), "usage": {}}
+        return {"reply": "Ready.", "usage": {}}
+
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test-secret"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    payload = {
+        "format": "plaintext",
+        "content": "2026-05-31 User: Please reuse this import job.",
+        "relationship_started_at": "2026-05-31",
+        "client_job_id": "test-inflight-reuse",
+    }
+    first = client.post("/v1/history_import/upload", json=payload, headers=_headers(api_key))
+    assert first.status_code == 202, first.get_data(as_text=True)
+    first_job = first.get_json()["job"]
+    assert provider_entered.wait(timeout=2)
+
+    duplicate = client.post("/v1/history_import/upload", json=payload, headers=_headers(api_key))
+    assert duplicate.status_code == 202, duplicate.get_data(as_text=True)
+    assert duplicate.get_json()["job"]["job_id"] == first_job["job_id"]
+
+    release_provider.set()
+    job = _wait_history_import_job(client, api_key, first_job["job_id"])
+    assert job["status"] == "completed"
+    assert job["memories_created"] >= 2
+
+
 def test_history_import_accepts_json_file_and_persona_profile(client, monkeypatch):
     user_id, api_key = _register(client)
 
@@ -335,11 +432,12 @@ def test_history_import_accepts_json_file_and_persona_profile(client, monkeypatc
             "history_filename": "chat-export.json",
             "persona_content": "Long-term user profile: prefers durable setup context.",
             "persona_filename": "persona.md",
+            "client_job_id": "test-json-history-import",
         },
         headers=_headers(api_key),
     )
-    assert upload.status_code == 201, upload.get_data(as_text=True)
-    job = upload.get_json()["job"]
+    assert upload.status_code == 202, upload.get_data(as_text=True)
+    job = _wait_history_import_job(client, api_key, upload.get_json()["job"]["job_id"])
     assert job["status"] == "completed"
     assert job["messages_parsed"] == 2
     assert job["support_materials"] == 1
@@ -347,6 +445,83 @@ def test_history_import_accepts_json_file_and_persona_profile(client, monkeypatc
     assert job["persona_filename"] == "persona.md"
     assert job["memories_created"] >= 2
     assert job["identity_written"] is True
+
+
+def test_wrapped_chat_history_json_parses_without_upload_artifacts():
+    chat_export = [
+        {
+            "mapping": {
+                "u1": {
+                    "message": {
+                        "author": {"role": "user"},
+                        "content": {"content_type": "text", "parts": ["我最近在测试 API onboarding。"]},
+                        "create_time": 1780200000.0,
+                    }
+                },
+                "a1": {
+                    "message": {
+                        "author": {"role": "assistant"},
+                        "content": {"content_type": "text", "parts": ["我会把导入内容变成可读记忆。"]},
+                        "create_time": 1780200060.0,
+                    }
+                },
+                "sys": {
+                    "message": {
+                        "author": {"role": "system"},
+                        "content": {"content_type": "text", "parts": ["internal setup"]},
+                        "create_time": 1780200120.0,
+                    }
+                },
+            }
+        }
+    ]
+    wrapped = (
+        "===== BEGIN CHAT HISTORY FILE: conversations-011.json =====\n"
+        + appmod.json.dumps(chat_export, ensure_ascii=False)
+        + "\n===== END CHAT HISTORY FILE: conversations-011.json ====="
+    )
+    warnings = []
+
+    messages = appmod._parse_import_history_content(wrapped, "auto", warnings)
+
+    assert warnings == []
+    assert [m["role"] for m in messages] == ["user", "assistant"]
+    assert "API onboarding" in messages[0]["content"]
+    assert all("BEGIN CHAT HISTORY FILE" not in m["content"] for m in messages)
+    assert all("conversation_id" not in m["content"] for m in messages)
+
+    cards = appmod._fallback_memory_cards(
+        messages,
+        appmod.date(2026, 5, 31),
+        story_needed=1,
+        about_needed=1,
+        language=appmod._detect_import_language(messages),
+    )
+    assert len(cards) == 2
+    assert cards[0]["title"].startswith("导入")
+    assert all("BEGIN CHAT HISTORY FILE" not in card["description"] for card in cards)
+
+
+def test_support_material_sections_split_character_and_personal_profile():
+    payload = {
+        "persona_filename": "combined.md",
+        "persona_content": """
+===== BEGIN CHARACTER CARD =====
+小哆啦是一个稳定、细心、会记得小事的陪伴型 AI。
+===== END CHARACTER CARD =====
+
+===== BEGIN PERSONAL PROFILE CARD: profile.md =====
+用户喜欢直接的反馈，也希望记忆写得像人能读懂的话。
+===== END PERSONAL PROFILE CARD: profile.md =====
+""",
+    }
+
+    support = appmod._persona_support_messages(payload)
+
+    assert [m["source"] for m in support] == ["character_import", "persona_import"]
+    assert "小哆啦" in support[0]["content"]
+    assert "用户喜欢直接的反馈" in support[1]["content"]
+    assert all("BEGIN " not in m["content"] and "END " not in m["content"] for m in support)
 
 
 def test_history_import_allows_confirmed_fresh_start_without_materials(client, monkeypatch):
@@ -391,11 +566,16 @@ def test_history_import_allows_confirmed_fresh_start_without_materials(client, m
 
     upload = client.post(
         "/v1/history_import/upload",
-        json={"format": "auto", "content": "", "fresh_start": True},
+        json={
+            "format": "auto",
+            "content": "",
+            "fresh_start": True,
+            "client_job_id": "test-fresh-start-import",
+        },
         headers=_headers(api_key),
     )
-    assert upload.status_code == 201, upload.get_data(as_text=True)
-    job = upload.get_json()["job"]
+    assert upload.status_code == 202, upload.get_data(as_text=True)
+    job = _wait_history_import_job(client, api_key, upload.get_json()["job"]["job_id"])
     assert job["status"] == "completed"
     assert job["messages_parsed"] == 0
     assert job["support_materials"] == 1
