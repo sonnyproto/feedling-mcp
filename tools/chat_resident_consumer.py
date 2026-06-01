@@ -122,6 +122,12 @@ def _mask(val: str) -> str:
     return val[:4] + "***" + val[-4:]
 
 
+def _fingerprint_bytes(val: bytes | None) -> str:
+    if not val:
+        return "missing"
+    return hashlib.sha256(val).hexdigest()[:12]
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -1692,7 +1698,9 @@ def call_agent(
 # Feedling API helpers
 # ---------------------------------------------------------------------------
 
-# Cached from /v1/users/whoami at startup. Refreshed on 401/encryption error.
+# Cached from /v1/users/whoami for diagnostics and fallback state. Refreshed
+# before every encrypted write so resident agents do not keep wrapping replies
+# to a stale iOS content public key.
 _whoami_cache: dict = {"user_id": "", "user_pk": None, "enclave_pk": None}
 
 # Fallback deduplication — don't flood the user if the agent repeatedly fails.
@@ -1748,8 +1756,8 @@ def _load_whoami() -> bool:
     log.info(
         "whoami loaded — user_id=%s user_pk=%s enclave_pk=%s",
         user_id,
-        "ok" if user_pk else "MISSING",
-        "ok" if enc_pk else "missing (local_only fallback)",
+        _fingerprint_bytes(user_pk),
+        _fingerprint_bytes(enc_pk),
     )
     return bool(user_id and user_pk)
 
@@ -1852,6 +1860,10 @@ def post_reply(
     wrong in the log instead.
     """
     url = f"{FEEDLING_API_URL}/v1/chat/response"
+
+    if _ENCRYPTION_AVAILABLE and not _load_whoami():
+        log.error("whoami refresh failed before encrypted reply; skipping write")
+        return {"error": "whoami_refresh_failed"}
 
     user_id = _whoami_cache["user_id"]
     user_pk: bytes | None = _whoami_cache["user_pk"]
