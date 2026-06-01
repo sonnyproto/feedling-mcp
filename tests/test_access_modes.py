@@ -1,0 +1,151 @@
+from __future__ import annotations
+
+import base64
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+import app as appmod  # noqa: E402
+
+
+def _b64(raw: bytes) -> str:
+    return base64.b64encode(raw).decode("ascii")
+
+
+@pytest.fixture()
+def client(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(appmod, "USERS_FILE", tmp_path / "users.json")
+    appmod._users[:] = []
+    appmod._key_to_user.clear()
+    appmod._stores.clear()
+    appmod._save_users()
+    monkeypatch.setattr(
+        appmod,
+        "_get_enclave_info",
+        lambda: {"content_pk_hex": ("22" * 32), "compose_hash": "test"},
+    )
+    appmod.app.config.update(TESTING=True)
+    with appmod.app.test_client() as c:
+        yield c
+
+
+def _register(client) -> tuple[str, str, str]:
+    res = client.post(
+        "/v1/users/register",
+        json={"public_key": _b64(b"\x11" * 32), "archive_language": "en"},
+    )
+    assert res.status_code == 201, res.get_data(as_text=True)
+    body = res.get_json()
+    return body["user_id"], body["principal_id"], body["api_key"]
+
+
+def _headers(api_key: str) -> dict[str, str]:
+    return {"X-API-Key": api_key}
+
+
+def test_register_creates_principal_and_access_state(client):
+    user_id, principal_id, api_key = _register(client)
+
+    who = client.get("/v1/users/whoami", headers=_headers(api_key))
+    assert who.status_code == 200
+    who_body = who.get_json()
+    assert who_body["user_id"] == user_id
+    assert who_body["principal_id"] == principal_id
+    assert who_body["active_route"] == "resident"
+
+    modes = client.get("/v1/access/modes", headers=_headers(api_key))
+    assert modes.status_code == 200
+    body = modes.get_json()
+    assert body["user_id"] == user_id
+    assert body["principal_id"] == principal_id
+    assert body["active_route"] == "resident"
+    assert body["api_keys_count"] == 1
+    by_mode = {m["access_mode"]: m for m in body["access_modes"]}
+    assert by_mode["official_import"]["connected"] is True
+    assert by_mode["resident"]["connected"] is True
+    assert by_mode["resident"]["active"] is True
+
+
+def test_switch_access_mode_preserves_user_and_marks_binding(client):
+    user_id, principal_id, api_key = _register(client)
+
+    res = client.post(
+        "/v1/access/modes/switch",
+        headers=_headers(api_key),
+        json={"access_mode": "api"},
+    )
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["user_id"] == user_id
+    assert body["principal_id"] == principal_id
+    assert body["active_route"] == "model_api"
+    by_mode = {m["access_mode"]: m for m in body["access_modes"]}
+    assert by_mode["model_api"]["active"] is True
+    assert by_mode["model_api"]["connected"] is True
+
+    route = client.get("/v1/onboarding/route", headers=_headers(api_key)).get_json()
+    assert route["route"] == "model_api"
+
+
+def test_link_token_claim_issues_new_key_for_same_user(client):
+    user_id, principal_id, api_key = _register(client)
+
+    token_res = client.post(
+        "/v1/access/link-token",
+        headers=_headers(api_key),
+        json={"access_mode": "server", "label": "local server"},
+    )
+    assert token_res.status_code == 201, token_res.get_data(as_text=True)
+    token = token_res.get_json()["token"]
+
+    claim = client.post(
+        "/v1/access/claim-token",
+        json={"token": token, "client_label": "agent runtime"},
+    )
+    assert claim.status_code == 201, claim.get_data(as_text=True)
+    claim_body = claim.get_json()
+    assert claim_body["user_id"] == user_id
+    assert claim_body["principal_id"] == principal_id
+    assert claim_body["api_key"] != api_key
+    assert claim_body["active_route"] == "resident"
+
+    new_who = client.get("/v1/users/whoami", headers=_headers(claim_body["api_key"]))
+    assert new_who.status_code == 200
+    assert new_who.get_json()["user_id"] == user_id
+
+    old_who = client.get("/v1/users/whoami", headers=_headers(api_key))
+    assert old_who.status_code == 200
+    assert old_who.get_json()["principal_id"] == principal_id
+
+    second_claim = client.post("/v1/access/claim-token", json={"token": token})
+    assert second_claim.status_code == 409
+
+    users_json = json.loads((appmod.FEEDLING_DIR / "users.json").read_text())
+    assert len(users_json) == 1
+    assert len(users_json[0]["api_keys"]) == 2
+
+
+def test_legacy_user_record_backfills_principal_and_api_keys(client):
+    raw_key = "legacy-test-key"
+    user_id = "usr_abcdef1234567890"
+    appmod._users[:] = [{
+        "user_id": user_id,
+        "api_key_hash": appmod._hash_api_key(raw_key),
+        "created_at": "2026-06-01T00:00:00",
+    }]
+    appmod._save_users()
+    appmod._users[:] = []
+    appmod._key_to_user.clear()
+    appmod._load_users()
+
+    res = client.get("/v1/access/modes", headers=_headers(raw_key))
+    assert res.status_code == 200
+    body = res.get_json()
+    assert body["user_id"] == user_id
+    assert body["principal_id"].startswith("prn_")
+    assert body["api_keys_count"] == 1

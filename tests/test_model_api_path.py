@@ -111,6 +111,42 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     assert all(step["id"] != "resident_consumer" for step in body["steps"])
 
 
+def test_model_api_setup_can_reuse_saved_key_when_model_changes(client, monkeypatch):
+    _, api_key = _register(client)
+    calls = []
+
+    def fake_test_provider_key(cfg):
+        calls.append((cfg.provider, cfg.model, cfg.api_key, cfg.base_url))
+        return {"reply": "ok", "usage": {"total_tokens": 1}}
+
+    monkeypatch.setattr(appmod, "test_provider_key", fake_test_provider_key)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-existing"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+    first = setup.get_json()["config"]
+
+    monkeypatch.setattr(
+        appmod,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose: b"sk-existing",
+    )
+    update = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1"},
+        headers=_headers(api_key),
+    )
+    assert update.status_code == 200, update.get_data(as_text=True)
+    second = update.get_json()["config"]
+    assert second["provider"] == "openai"
+    assert second["model"] == "gpt-4.1"
+    assert second["api_key_hint"] == first["api_key_hint"]
+    assert calls[-1] == ("openai", "gpt-4.1", "sk-existing", "https://api.openai.com/v1")
+
+
 def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypatch):
     user_id, api_key = _register(client)
 

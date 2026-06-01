@@ -48,8 +48,29 @@ FEEDLING_DIR.mkdir(parents=True, exist_ok=True)
 
 USERS_FILE = FEEDLING_DIR / "users.json"
 _users_lock = threading.Lock()
-_users: list[dict] = []                    # [{user_id, api_key_hash, public_key, created_at}]
-_key_to_user: dict[str, str] = {}          # api_key_hash → user_id (in-memory cache)
+_users: list[dict] = []                    # [{user_id, principal_id, api_keys, public_key, created_at}]
+_key_to_user: dict[str, str] = {}          # api_key_hash -> user_id (in-memory cache)
+_access_link_tokens_lock = threading.Lock()
+
+ACCESS_MODES = ("resident", "model_api", "official_import")
+ACCESS_MODE_LABELS = {
+    "resident": "Server",
+    "model_api": "API",
+    "official_import": "Official App Chat",
+}
+ACCESS_LINK_TOKEN_TTL_SEC = int(os.environ.get("FEEDLING_ACCESS_LINK_TOKEN_TTL_SEC", "900"))
+_ACCESS_MODE_ALIASES = {
+    "server": "resident",
+    "resident_agent": "resident",
+    "modelapi": "model_api",
+    "model_api_key": "model_api",
+    "api": "model_api",
+    "official": "official_import",
+    "official_app": "official_import",
+    "official_chat": "official_import",
+    "app_chat": "official_import",
+    "import_only": "official_import",
+}
 
 # API keys are 32 random bytes (high-entropy), so a fast collision-resistant
 # hash is sufficient — bcrypt is designed for low-entropy passwords. Using
@@ -80,6 +101,165 @@ def _hash_api_key(api_key: str) -> str:
     return hmac.new(_PEPPER, api_key.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
+def _access_link_tokens_file() -> Path:
+    return FEEDLING_DIR / "access_link_tokens.json"
+
+
+def _normalize_access_mode(mode: str) -> str:
+    raw = (mode or "").strip().lower().replace("-", "_")
+    return _ACCESS_MODE_ALIASES.get(raw, raw)
+
+
+def _new_principal_id() -> str:
+    return f"prn_{secrets.token_hex(8)}"
+
+
+def _new_key_id() -> str:
+    return f"key_{secrets.token_hex(6)}"
+
+
+def _new_binding_id() -> str:
+    return f"bind_{secrets.token_hex(6)}"
+
+
+def _normalize_api_key_entries(user_entry: dict) -> tuple[list[dict], bool]:
+    changed = False
+    created_at = str(user_entry.get("created_at") or datetime.now().isoformat())
+    existing = user_entry.get("api_keys")
+    keys: list[dict] = []
+    seen_hashes: set[str] = set()
+    if isinstance(existing, list):
+        for item in existing:
+            if not isinstance(item, dict):
+                changed = True
+                continue
+            key_hash = str(item.get("api_key_hash") or "").strip()
+            if not key_hash or key_hash in seen_hashes:
+                changed = True
+                continue
+            mode = _normalize_access_mode(str(item.get("access_mode") or "official_import"))
+            if mode not in ACCESS_MODES:
+                mode = "official_import"
+                changed = True
+            normalized = {
+                "key_id": str(item.get("key_id") or _new_key_id()),
+                "api_key_hash": key_hash,
+                "access_mode": mode,
+                "label": str(item.get("label") or ACCESS_MODE_LABELS.get(mode, mode)),
+                "created_at": str(item.get("created_at") or created_at),
+                "revoked_at": str(item.get("revoked_at") or ""),
+            }
+            if normalized != item:
+                changed = True
+            keys.append(normalized)
+            seen_hashes.add(key_hash)
+    legacy_hash = str(user_entry.get("api_key_hash") or "").strip()
+    if legacy_hash and legacy_hash not in seen_hashes:
+        keys.insert(0, {
+            "key_id": "key_primary",
+            "api_key_hash": legacy_hash,
+            "access_mode": "official_import",
+            "label": "Primary",
+            "created_at": created_at,
+            "revoked_at": "",
+        })
+        changed = True
+    return keys, changed
+
+
+def _normalize_access_bindings(user_entry: dict, api_keys: list[dict]) -> tuple[list[dict], bool]:
+    changed = False
+    created_at = str(user_entry.get("created_at") or datetime.now().isoformat())
+    existing = user_entry.get("access_bindings")
+    bindings_by_mode: dict[str, dict] = {}
+    if isinstance(existing, list):
+        for item in existing:
+            if not isinstance(item, dict):
+                changed = True
+                continue
+            mode = _normalize_access_mode(str(item.get("access_mode") or item.get("route") or ""))
+            if mode not in ACCESS_MODES:
+                changed = True
+                continue
+            normalized = {
+                "binding_id": str(item.get("binding_id") or _new_binding_id()),
+                "access_mode": mode,
+                "label": str(item.get("label") or ACCESS_MODE_LABELS.get(mode, mode)),
+                "status": str(item.get("status") or "connected"),
+                "created_at": str(item.get("created_at") or created_at),
+                "updated_at": str(item.get("updated_at") or item.get("created_at") or created_at),
+                "last_seen_at": str(item.get("last_seen_at") or ""),
+                "last_key_id": str(item.get("last_key_id") or ""),
+            }
+            if normalized != item:
+                changed = True
+            current = bindings_by_mode.get(mode)
+            if current is None or normalized["updated_at"] >= current.get("updated_at", ""):
+                bindings_by_mode[mode] = normalized
+    for key in api_keys:
+        if key.get("revoked_at"):
+            continue
+        mode = _normalize_access_mode(str(key.get("access_mode") or "official_import"))
+        if mode not in ACCESS_MODES:
+            continue
+        if mode not in bindings_by_mode:
+            bindings_by_mode[mode] = {
+                "binding_id": _new_binding_id(),
+                "access_mode": mode,
+                "label": ACCESS_MODE_LABELS.get(mode, mode),
+                "status": "connected",
+                "created_at": str(key.get("created_at") or created_at),
+                "updated_at": str(key.get("created_at") or created_at),
+                "last_seen_at": "",
+                "last_key_id": str(key.get("key_id") or ""),
+            }
+            changed = True
+    return list(bindings_by_mode.values()), changed
+
+
+def _normalize_user_entry(user_entry: dict) -> bool:
+    changed = False
+    if not str(user_entry.get("principal_id") or "").strip():
+        user_entry["principal_id"] = _new_principal_id()
+        changed = True
+    keys, key_changed = _normalize_api_key_entries(user_entry)
+    if key_changed or user_entry.get("api_keys") != keys:
+        user_entry["api_keys"] = keys
+        changed = True
+    bindings, binding_changed = _normalize_access_bindings(user_entry, keys)
+    if binding_changed or user_entry.get("access_bindings") != bindings:
+        user_entry["access_bindings"] = bindings
+        changed = True
+    return changed
+
+
+def _normalize_all_users() -> bool:
+    changed = False
+    for user_entry in _users:
+        if isinstance(user_entry, dict):
+            changed = _normalize_user_entry(user_entry) or changed
+    return changed
+
+
+def _rebuild_key_cache() -> None:
+    _key_to_user.clear()
+    for user_entry in _users:
+        if not isinstance(user_entry, dict):
+            continue
+        user_id = str(user_entry.get("user_id") or "")
+        if not user_id:
+            continue
+        legacy_hash = str(user_entry.get("api_key_hash") or "").strip()
+        if legacy_hash:
+            _key_to_user[legacy_hash] = user_id
+        for key_entry in user_entry.get("api_keys") or []:
+            if not isinstance(key_entry, dict) or key_entry.get("revoked_at"):
+                continue
+            key_hash = str(key_entry.get("api_key_hash") or "").strip()
+            if key_hash:
+                _key_to_user[key_hash] = user_id
+
+
 def _load_users():
     global _users, _key_to_user
     try:
@@ -89,7 +269,10 @@ def _load_users():
     except Exception as e:
         print(f"[users] failed to load: {e}")
         _users = []
-    _key_to_user = {u["api_key_hash"]: u["user_id"] for u in _users if "api_key_hash" in u}
+    changed = _normalize_all_users()
+    _rebuild_key_cache()
+    if changed:
+        _save_users()
     print(f"[users] loaded {len(_users)} user(s)")
 
 
@@ -109,10 +292,23 @@ def _resolve_user(api_key: str) -> str | None:
     if uid:
         return uid
     with _users_lock:
+        changed = _normalize_all_users()
         for u in _users:
             if u.get("api_key_hash") == h:
                 _key_to_user[h] = u["user_id"]
+                if changed:
+                    _save_users()
                 return u["user_id"]
+            for key_entry in u.get("api_keys") or []:
+                if not isinstance(key_entry, dict) or key_entry.get("revoked_at"):
+                    continue
+                if key_entry.get("api_key_hash") == h:
+                    _key_to_user[h] = u["user_id"]
+                    if changed:
+                        _save_users()
+                    return u["user_id"]
+        if changed:
+            _save_users()
     return None
 
 
@@ -120,14 +316,42 @@ _USER_ID_RE = re.compile(r"^usr_[a-f0-9]{16}$")
 
 
 def _register_user(public_key: str | None = None,
-                   archive_language: str | None = None) -> dict:
+                   archive_language: str | None = None,
+                   access_mode: str = "official_import",
+                   label: str | None = None) -> dict:
     user_id = f"usr_{secrets.token_hex(8)}"
+    principal_id = _new_principal_id()
     api_key = secrets.token_hex(32)
+    api_key_hash = _hash_api_key(api_key)
+    mode = _normalize_access_mode(access_mode)
+    if mode not in ACCESS_MODES:
+        mode = "official_import"
+    key_id = "key_primary"
+    now_iso = datetime.now().isoformat()
     entry = {
         "user_id": user_id,
-        "api_key_hash": _hash_api_key(api_key),
+        "principal_id": principal_id,
+        "api_key_hash": api_key_hash,
+        "api_keys": [{
+            "key_id": key_id,
+            "api_key_hash": api_key_hash,
+            "access_mode": mode,
+            "label": (label or "Primary").strip() or "Primary",
+            "created_at": now_iso,
+            "revoked_at": "",
+        }],
+        "access_bindings": [{
+            "binding_id": _new_binding_id(),
+            "access_mode": mode,
+            "label": ACCESS_MODE_LABELS.get(mode, mode),
+            "status": "connected",
+            "created_at": now_iso,
+            "updated_at": now_iso,
+            "last_seen_at": "",
+            "last_key_id": key_id,
+        }],
         "public_key": (public_key or "").strip(),
-        "created_at": datetime.now().isoformat(),
+        "created_at": now_iso,
     }
     # archive_language: the BCP-47-ish locale code the iOS app picked up
     # from Locale.preferredLanguages on the registering device (e.g. "en",
@@ -140,9 +364,9 @@ def _register_user(public_key: str | None = None,
     with _users_lock:
         _users.append(entry)
         _save_users()
-        _key_to_user[entry["api_key_hash"]] = user_id
+        _key_to_user[api_key_hash] = user_id
     print(f"[users] registered {user_id} archive_language={entry.get('archive_language', 'unset')}")
-    return {"user_id": user_id, "api_key": api_key}
+    return {"user_id": user_id, "principal_id": principal_id, "api_key": api_key}
 
 
 def _get_user_archive_language(user_id: str) -> str | None:
@@ -4019,6 +4243,353 @@ def _consumer_validation_state(store: UserStore) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Access modes: one user/principal, multiple API keys and entry points
+# ---------------------------------------------------------------------------
+
+
+def _find_user_entry_locked(user_id: str) -> dict | None:
+    for user_entry in _users:
+        if user_entry.get("user_id") == user_id:
+            _normalize_user_entry(user_entry)
+            return user_entry
+    return None
+
+
+def _user_entry_snapshot(user_id: str) -> dict | None:
+    with _users_lock:
+        user_entry = _find_user_entry_locked(user_id)
+        return dict(user_entry) if user_entry else None
+
+
+def _principal_id_for_user(user_id: str) -> str:
+    snapshot = _user_entry_snapshot(user_id) or {}
+    return str(snapshot.get("principal_id") or "")
+
+
+def _upsert_access_binding_locked(
+    user_entry: dict,
+    access_mode: str,
+    *,
+    status: str = "connected",
+    key_id: str = "",
+    label: str = "",
+    touch_seen: bool = False,
+) -> dict:
+    mode = _normalize_access_mode(access_mode)
+    if mode not in ACCESS_MODES:
+        raise ValueError("access_mode must be resident, model_api, or official_import")
+    now_iso = datetime.now().isoformat()
+    bindings = user_entry.setdefault("access_bindings", [])
+    if not isinstance(bindings, list):
+        bindings = []
+        user_entry["access_bindings"] = bindings
+    for binding in bindings:
+        if not isinstance(binding, dict):
+            continue
+        if _normalize_access_mode(str(binding.get("access_mode") or "")) != mode:
+            continue
+        binding["access_mode"] = mode
+        binding["label"] = label or binding.get("label") or ACCESS_MODE_LABELS.get(mode, mode)
+        binding["status"] = status
+        binding["updated_at"] = now_iso
+        if touch_seen:
+            binding["last_seen_at"] = now_iso
+        if key_id:
+            binding["last_key_id"] = key_id
+        if not binding.get("binding_id"):
+            binding["binding_id"] = _new_binding_id()
+        if not binding.get("created_at"):
+            binding["created_at"] = now_iso
+        return binding
+    binding = {
+        "binding_id": _new_binding_id(),
+        "access_mode": mode,
+        "label": label or ACCESS_MODE_LABELS.get(mode, mode),
+        "status": status,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+        "last_seen_at": now_iso if touch_seen else "",
+        "last_key_id": key_id,
+    }
+    bindings.append(binding)
+    return binding
+
+
+def _issue_api_key_for_user_locked(
+    user_entry: dict,
+    *,
+    access_mode: str,
+    label: str = "",
+) -> dict:
+    mode = _normalize_access_mode(access_mode)
+    if mode not in ACCESS_MODES:
+        raise ValueError("access_mode must be resident, model_api, or official_import")
+    raw_key = secrets.token_hex(32)
+    key_hash = _hash_api_key(raw_key)
+    key_id = _new_key_id()
+    now_iso = datetime.now().isoformat()
+    key_entry = {
+        "key_id": key_id,
+        "api_key_hash": key_hash,
+        "access_mode": mode,
+        "label": (label or ACCESS_MODE_LABELS.get(mode, mode)).strip(),
+        "created_at": now_iso,
+        "revoked_at": "",
+    }
+    keys = user_entry.setdefault("api_keys", [])
+    if not isinstance(keys, list):
+        keys = []
+        user_entry["api_keys"] = keys
+    keys.append(key_entry)
+    _upsert_access_binding_locked(
+        user_entry,
+        mode,
+        key_id=key_id,
+        label=ACCESS_MODE_LABELS.get(mode, mode),
+        touch_seen=True,
+    )
+    _key_to_user[key_hash] = user_entry["user_id"]
+    return {"api_key": raw_key, "key_entry": key_entry}
+
+
+def _public_access_mode_state(user_entry: dict, active_route: str) -> list[dict]:
+    _normalize_user_entry(user_entry)
+    bindings_by_mode = {
+        _normalize_access_mode(str(binding.get("access_mode") or "")): binding
+        for binding in user_entry.get("access_bindings") or []
+        if isinstance(binding, dict)
+    }
+    key_counts: dict[str, int] = {mode: 0 for mode in ACCESS_MODES}
+    for key_entry in user_entry.get("api_keys") or []:
+        if not isinstance(key_entry, dict) or key_entry.get("revoked_at"):
+            continue
+        mode = _normalize_access_mode(str(key_entry.get("access_mode") or "official_import"))
+        if mode in key_counts:
+            key_counts[mode] += 1
+    out = []
+    for mode in ACCESS_MODES:
+        binding = bindings_by_mode.get(mode) or {}
+        out.append({
+            "access_mode": mode,
+            "route": mode,
+            "label": ACCESS_MODE_LABELS.get(mode, mode),
+            "connected": bool(binding),
+            "active": active_route == mode,
+            "status": binding.get("status", "not_connected") if binding else "not_connected",
+            "binding_id": binding.get("binding_id", ""),
+            "created_at": binding.get("created_at", ""),
+            "updated_at": binding.get("updated_at", ""),
+            "last_seen_at": binding.get("last_seen_at", ""),
+            "api_keys": key_counts.get(mode, 0),
+        })
+    return out
+
+
+def _access_modes_payload(store: UserStore) -> dict:
+    active_route = _load_onboarding_route(store)
+    with _users_lock:
+        user_entry = _find_user_entry_locked(store.user_id)
+        if not user_entry:
+            return {"error": "user not found"}
+        # Treat the selected onboarding route as a connected access mode, but
+        # do not move any content: all Memory/Chat/Identity files remain under
+        # the same user_id.
+        _upsert_access_binding_locked(user_entry, active_route)
+        _save_users()
+        key_count = sum(
+            1
+            for key_entry in user_entry.get("api_keys") or []
+            if isinstance(key_entry, dict) and not key_entry.get("revoked_at")
+        )
+        return {
+            "user_id": store.user_id,
+            "principal_id": user_entry.get("principal_id", ""),
+            "active_route": active_route,
+            "access_modes": _public_access_mode_state(user_entry, active_route),
+            "api_keys_count": key_count,
+            "link_token_ttl_seconds": ACCESS_LINK_TOKEN_TTL_SEC,
+        }
+
+
+def _load_access_link_tokens() -> list[dict]:
+    path = _access_link_tokens_file()
+    try:
+        if path.exists():
+            data = json.loads(path.read_text())
+            return data if isinstance(data, list) else []
+    except Exception as e:
+        print(f"[access] failed to load link tokens: {e}")
+    return []
+
+
+def _save_access_link_tokens(rows: list[dict]) -> None:
+    path = _access_link_tokens_file()
+    try:
+        path.write_text(json.dumps(rows, ensure_ascii=False, indent=2))
+        os.chmod(path, 0o600)
+    except Exception as e:
+        print(f"[access] failed to save link tokens: {e}")
+
+
+def _trim_access_link_tokens(rows: list[dict]) -> list[dict]:
+    cutoff = time.time() - 86400
+    trimmed = []
+    for row in rows:
+        try:
+            expires_at = float(row.get("expires_at_epoch") or 0)
+        except Exception:
+            expires_at = 0
+        used_at = str(row.get("used_at") or "")
+        if expires_at >= cutoff or not used_at:
+            trimmed.append(row)
+    return trimmed[-500:]
+
+
+@app.route("/v1/access/modes", methods=["GET"])
+def access_modes_get():
+    store = require_user()
+    return jsonify(_access_modes_payload(store))
+
+
+@app.route("/v1/access/modes/switch", methods=["POST"])
+def access_modes_switch():
+    store = require_user()
+    payload = request.get_json(silent=True) or {}
+    mode = _normalize_access_mode(str(payload.get("access_mode") or payload.get("route") or ""))
+    if mode not in ACCESS_MODES:
+        return jsonify({"error": "access_mode must be resident, model_api, or official_import"}), 400
+    data = _save_onboarding_route(store, mode)
+    with _users_lock:
+        user_entry = _find_user_entry_locked(store.user_id)
+        if user_entry:
+            _upsert_access_binding_locked(user_entry, mode, touch_seen=True)
+            _save_users()
+    print(f"[access:{store.user_id}] active_route={data['route']}")
+    return jsonify(_access_modes_payload(store))
+
+
+@app.route("/v1/access/link-token", methods=["POST"])
+def access_link_token_create():
+    store = require_user()
+    payload = request.get_json(silent=True) or {}
+    mode = _normalize_access_mode(str(payload.get("access_mode") or payload.get("route") or _load_onboarding_route(store)))
+    if mode not in ACCESS_MODES:
+        return jsonify({"error": "access_mode must be resident, model_api, or official_import"}), 400
+    label = str(payload.get("label") or ACCESS_MODE_LABELS.get(mode, mode)).strip()[:80]
+    raw_token = "flt_" + secrets.token_urlsafe(32)
+    token_hash = _hash_api_key(raw_token)
+    now_epoch = time.time()
+    expires_at_epoch = now_epoch + ACCESS_LINK_TOKEN_TTL_SEC
+    with _users_lock:
+        user_entry = _find_user_entry_locked(store.user_id)
+        if not user_entry:
+            return jsonify({"error": "user not found"}), 404
+        principal_id = user_entry.get("principal_id", "")
+        existing_status = ""
+        for binding in user_entry.get("access_bindings") or []:
+            if isinstance(binding, dict) and _normalize_access_mode(str(binding.get("access_mode") or "")) == mode:
+                existing_status = str(binding.get("status") or "")
+                break
+        _upsert_access_binding_locked(user_entry, mode, status=existing_status or "pending")
+        _save_users()
+    entry = {
+        "token_id": f"flt_{secrets.token_hex(6)}",
+        "token_hash": token_hash,
+        "user_id": store.user_id,
+        "principal_id": principal_id,
+        "access_mode": mode,
+        "label": label,
+        "created_at": datetime.now().isoformat(),
+        "expires_at": datetime.fromtimestamp(expires_at_epoch).isoformat(),
+        "expires_at_epoch": expires_at_epoch,
+        "used_at": "",
+    }
+    with _access_link_tokens_lock:
+        rows = _trim_access_link_tokens(_load_access_link_tokens())
+        rows.append(entry)
+        _save_access_link_tokens(rows)
+    return jsonify({
+        "token": raw_token,
+        "token_id": entry["token_id"],
+        "access_mode": mode,
+        "route": mode,
+        "label": label,
+        "expires_at": entry["expires_at"],
+        "expires_in_seconds": ACCESS_LINK_TOKEN_TTL_SEC,
+        "claim_endpoint": "/v1/access/claim-token",
+    }), 201
+
+
+@app.route("/v1/access/claim-token", methods=["POST"])
+def access_link_token_claim():
+    payload = request.get_json(silent=True) or {}
+    raw_token = str(payload.get("token") or "").strip()
+    if not raw_token:
+        return jsonify({"error": "token required"}), 400
+    token_hash = _hash_api_key(raw_token)
+    now_epoch = time.time()
+    client_label = str(payload.get("label") or payload.get("client_label") or "").strip()[:80]
+    public_key = str(payload.get("public_key") or "").strip()
+    archive_language = str(payload.get("archive_language") or "").strip()
+    make_active = bool(payload.get("make_active", True))
+    with _access_link_tokens_lock:
+        rows = _load_access_link_tokens()
+        match = None
+        for row in rows:
+            if row.get("token_hash") == token_hash:
+                match = row
+                break
+        if not match:
+            return jsonify({"error": "invalid_token"}), 404
+        if match.get("used_at"):
+            return jsonify({"error": "token_already_used"}), 409
+        try:
+            expires_at_epoch = float(match.get("expires_at_epoch") or 0)
+        except Exception:
+            expires_at_epoch = 0
+        if expires_at_epoch and expires_at_epoch < now_epoch:
+            return jsonify({"error": "token_expired"}), 410
+        user_id = str(match.get("user_id") or "")
+        mode = _normalize_access_mode(str(match.get("access_mode") or ""))
+        if mode not in ACCESS_MODES:
+            return jsonify({"error": "token_access_mode_invalid"}), 400
+        with _users_lock:
+            user_entry = _find_user_entry_locked(user_id)
+            if not user_entry:
+                return jsonify({"error": "user not found"}), 404
+            if public_key and not str(user_entry.get("public_key") or "").strip():
+                _, err = _decode_content_public_key(public_key)
+                if err:
+                    return jsonify({"error": err}), 400
+                user_entry["public_key"] = public_key
+            if archive_language and not user_entry.get("archive_language"):
+                user_entry["archive_language"] = archive_language
+            issued = _issue_api_key_for_user_locked(
+                user_entry,
+                access_mode=mode,
+                label=client_label or str(match.get("label") or ACCESS_MODE_LABELS.get(mode, mode)),
+            )
+            _save_users()
+            principal_id = user_entry.get("principal_id", "")
+        if make_active:
+            _save_onboarding_route(get_store(user_id), mode)
+        match["used_at"] = datetime.now().isoformat()
+        match["claimed_label"] = client_label
+        _save_access_link_tokens(_trim_access_link_tokens(rows))
+    print(f"[access:{user_id}] claimed mode={mode} key={issued['key_entry']['key_id']}")
+    return jsonify({
+        "status": "connected",
+        "user_id": user_id,
+        "principal_id": principal_id,
+        "api_key": issued["api_key"],
+        "access_mode": mode,
+        "route": mode,
+        "active_route": _load_onboarding_route(get_store(user_id)),
+        "key_id": issued["key_entry"]["key_id"],
+    }), 201
+
+
+# ---------------------------------------------------------------------------
 # Users: register endpoint (public — no auth required)
 # ---------------------------------------------------------------------------
 
@@ -4028,9 +4599,13 @@ def users_register():
     payload = request.get_json(silent=True) or {}
     public_key = (payload.get("public_key") or "").strip()
     archive_language = (payload.get("archive_language") or "").strip()
+    access_mode = str(payload.get("access_mode") or payload.get("route") or "official_import")
+    label = str(payload.get("label") or "").strip()
     result = _register_user(
         public_key=public_key or None,
         archive_language=archive_language or None,
+        access_mode=access_mode,
+        label=label or None,
     )
     return jsonify(result), 201
 
@@ -4051,7 +4626,13 @@ def users_whoami():
         callers fall back to inferring from existing card content.
     """
     store = require_user()
-    resp: dict = {"user_id": store.user_id}
+    access = _access_modes_payload(store)
+    resp: dict = {
+        "user_id": store.user_id,
+        "principal_id": access.get("principal_id", ""),
+        "active_route": access.get("active_route", ""),
+        "access_modes": access.get("access_modes", []),
+    }
     pk = _get_user_public_key(store.user_id)
     if pk:
         resp["public_key"] = pk
@@ -4283,7 +4864,7 @@ def _get_enclave_info() -> dict | None:
 # IO-hosted Model API key route
 # ---------------------------------------------------------------------------
 
-MODEL_API_ROUTES = {"resident", "official_import", "model_api"}
+MODEL_API_ROUTES = set(ACCESS_MODES)
 
 
 def _now_iso() -> str:
@@ -4314,18 +4895,7 @@ def _write_json_object(path: Path, data: dict, *, private: bool = False) -> None
 
 
 def _normalize_onboarding_route(route: str) -> str:
-    raw = (route or "").strip().lower().replace("-", "_")
-    aliases = {
-        "server": "resident",
-        "resident_agent": "resident",
-        "modelapi": "model_api",
-        "model_api_key": "model_api",
-        "api": "model_api",
-        "official": "official_import",
-        "official_app": "official_import",
-        "import_only": "official_import",
-    }
-    return aliases.get(raw, raw)
+    return _normalize_access_mode(route)
 
 
 def _load_onboarding_route(store: UserStore) -> str:
@@ -4356,6 +4926,11 @@ def onboarding_route():
         data = _save_onboarding_route(store, str(payload.get("route") or ""))
     except ValueError as e:
         return jsonify({"error": str(e), "allowed": sorted(MODEL_API_ROUTES)}), 400
+    with _users_lock:
+        user_entry = _find_user_entry_locked(store.user_id)
+        if user_entry:
+            _upsert_access_binding_locked(user_entry, data["route"], touch_seen=True)
+            _save_users()
     print(f"[onboarding:{store.user_id}] route={data['route']}")
     return jsonify(data)
 
@@ -4495,35 +5070,55 @@ def _load_runtime_provider_config(store: UserStore, api_key: str | None) -> Prov
 @app.route("/v1/model_api/setup", methods=["POST"])
 def model_api_setup():
     store = require_user()
+    caller_api_key = _extract_api_key()
     payload = request.get_json(silent=True) or {}
     provider = str(payload.get("provider") or "")
     model = str(payload.get("model") or "")
     base_url = str(payload.get("base_url") or "")
     raw_key = str(payload.get("api_key") or "").strip()
-    if not raw_key:
-        return jsonify({"error": "api_key required"}), 400
     try:
         provider, model, base_url = validate_provider_config(provider, model, base_url)
     except ProviderError as e:
         return jsonify({"error": str(e)}), 400
 
-    envelope, err = _build_shared_envelope_for_store(
-        store,
-        raw_key.encode("utf-8"),
-        item_id=f"model_api_key_{uuid.uuid4().hex}",
-    )
-    if envelope is None:
-        return jsonify({
-            "error": "cannot_encrypt_provider_key",
-            "detail": err,
-            "required": (
-                "The user must have a content public key and the enclave "
-                "attestation endpoint must be reachable before saving a provider key."
-            ),
-        }), 409
+    existing = _load_model_api_config(store) or {}
+    existing_envelope = existing.get("api_key_envelope")
+    if raw_key:
+        provider_key = raw_key
+        envelope, err = _build_shared_envelope_for_store(
+            store,
+            raw_key.encode("utf-8"),
+            item_id=f"model_api_key_{uuid.uuid4().hex}",
+        )
+        if envelope is None:
+            return jsonify({
+                "error": "cannot_encrypt_provider_key",
+                "detail": err,
+                "required": (
+                    "The user must have a content public key and the enclave "
+                    "attestation endpoint must be reachable before saving a provider key."
+                ),
+            }), 409
+        api_key_hint = mask_api_key(raw_key)
+    else:
+        if not isinstance(existing_envelope, dict):
+            return jsonify({"error": "api_key required"}), 400
+        try:
+            provider_key = _decrypt_envelope_via_enclave(
+                existing_envelope,
+                caller_api_key,
+                purpose="model_api_provider_key",
+            ).decode("utf-8")
+        except Exception as e:
+            return jsonify({
+                "error": "model_api_key_decrypt_failed",
+                "detail": str(e)[:220],
+            }), 400
+        envelope = existing_envelope
+        api_key_hint = str(existing.get("api_key_hint") or "saved key")
 
     try:
-        test = test_provider_key(ProviderConfig(provider, model, raw_key, base_url))
+        test = test_provider_key(ProviderConfig(provider, model, provider_key, base_url))
     except ProviderError as e:
         return jsonify({
             "error": "provider_test_failed",
@@ -4535,7 +5130,7 @@ def model_api_setup():
         "provider": provider,
         "model": model,
         "base_url": base_url,
-        "api_key_hint": mask_api_key(raw_key),
+        "api_key_hint": api_key_hint,
         "api_key_envelope": envelope,
         "test_status": "ok",
         "last_test_at": _now_iso(),
@@ -10309,6 +10904,17 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
     store = get_store(user_id)
     route_data = _read_json_object(store.onboarding_route_file) or {}
     route = _load_onboarding_route(store)
+    access_modes = _public_access_mode_state(dict(user_entry), route)
+    access_connected = [
+        mode["access_mode"]
+        for mode in access_modes
+        if mode.get("connected")
+    ]
+    api_keys_count = sum(
+        1
+        for key_entry in user_entry.get("api_keys") or []
+        if isinstance(key_entry, dict) and not key_entry.get("revoked_at")
+    )
     validation = _safe_onboarding_validation(_onboarding_validation_payload(store))
     steps = validation.get("steps", [])
     steps_total = len(steps)
@@ -10341,11 +10947,19 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
     stuck_for_sec = 0 if passing else int(max(0, now - latest_epoch)) if latest_epoch else None
     row = {
         "user_id": user_id,
+        "principal_id": user_entry.get("principal_id") or "",
         "registered_at": registered_at,
         "archive_language": user_entry.get("archive_language") or "",
         "public_key_present": bool(str(user_entry.get("public_key") or "").strip()),
         "route": route,
         "route_selected_at": route_data.get("selected_at", ""),
+        "access": {
+            "principal_id": user_entry.get("principal_id") or "",
+            "active_route": route,
+            "connected_modes": access_connected,
+            "modes": access_modes,
+            "api_keys_count": api_keys_count,
+        },
         "onboarding": {
             "passing": passing,
             "stage": "complete" if passing else stage,
@@ -10379,6 +10993,8 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
 
 def _data_track_payload(*, include_users: bool = True, include_detail_user: str = "") -> dict:
     with _users_lock:
+        if _normalize_all_users():
+            _save_users()
         users = [dict(u) for u in _users if u.get("user_id")]
     rows = [
         _build_data_track_user(u, include_detail=(include_detail_user == u.get("user_id")))
@@ -10389,6 +11005,7 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     incomplete = max(0, len(rows) - completed)
     stage_counts: dict[str, int] = {}
     route_counts: dict[str, int] = {}
+    access_mode_counts: dict[str, int] = {}
     chat_total = 0
     memory_total = 0
     proactive_jobs = 0
@@ -10399,6 +11016,8 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         route = row["route"]
         stage_counts[stage] = stage_counts.get(stage, 0) + 1
         route_counts[route] = route_counts.get(route, 0) + 1
+        for mode in row.get("access", {}).get("connected_modes", []):
+            access_mode_counts[mode] = access_mode_counts.get(mode, 0) + 1
         chat_total += row["chat"]["total"]
         memory_total += row["memory"]["total"]
         proactive_jobs += row["proactive"]["jobs"]
@@ -10412,6 +11031,8 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         "completion_rate": (completed / len(rows)) if rows else 0,
         "stage_counts": stage_counts,
         "route_counts": route_counts,
+        "access_mode_counts": access_mode_counts,
+        "principals_total": len(set(r.get("principal_id") or r.get("user_id") for r in rows)),
         "chat_messages_total": chat_total,
         "memory_total": memory_total,
         "memory_avg_per_user": (memory_total / len(rows)) if rows else 0,
@@ -10464,10 +11085,16 @@ def _render_data_track_page(payload: dict) -> str:
         complete = onboarding["passing"]
         status_class = "ok" if complete else "warn"
         user_url = f"/admin/data-track/users/{quote(row['user_id'])}{qs_suffix}"
+        access = row.get("access", {})
+        principal = str(access.get("principal_id") or row.get("principal_id") or "")
+        principal_short = f"{principal[:12]}…" if len(principal) > 12 else principal
+        connected_modes = ", ".join(access.get("connected_modes") or []) or "none"
         rows_html.append(
             "<tr>"
-            f"<td><a href='{html.escape(user_url)}'>{html.escape(row['user_id'])}</a></td>"
+            f"<td><a href='{html.escape(user_url)}'>{html.escape(row['user_id'])}</a>"
+            f"<br><span class='muted'>{html.escape(principal_short)} · keys {access.get('api_keys_count', 0)}</span></td>"
             f"<td>{html.escape(row['route'])}</td>"
+            f"<td>{html.escape(connected_modes)}</td>"
             f"<td><span class='pill {status_class}'>{html.escape(stage)}</span></td>"
             f"<td>{onboarding['steps_done']}/{onboarding['steps_total']}</td>"
             f"<td>{html.escape(_format_duration(onboarding['stuck_for_sec']))}</td>"
@@ -10484,7 +11111,8 @@ def _render_data_track_page(payload: dict) -> str:
         _render_metric("completion", f"{summary['completion_rate'] * 100:.0f}%"),
         _render_metric("chat messages", summary["chat_messages_total"]),
         _render_metric("memories", summary["memory_total"]),
-        _render_metric("proactive jobs", summary["proactive_jobs_total"]),
+    _render_metric("proactive jobs", summary["proactive_jobs_total"]),
+    _render_metric("principals", summary.get("principals_total", summary["users_total"])),
     ])
     return f"""<!doctype html>
 <html>
@@ -10524,8 +11152,8 @@ def _render_data_track_page(payload: dict) -> str:
   <h2>Beta users</h2>
   <div class="toolbar"><input id="q" placeholder="Filter user, route, stage"></div>
   <table id="users">
-    <thead><tr><th>User</th><th>Route</th><th>Onboarding</th><th>Steps</th><th>Stuck</th><th>Chat</th><th>Memory</th><th>Proactive</th><th>Last activity</th></tr></thead>
-    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='9' class='muted'>No users yet.</td></tr>"}</tbody>
+    <thead><tr><th>User</th><th>Route</th><th>Access</th><th>Onboarding</th><th>Steps</th><th>Stuck</th><th>Chat</th><th>Memory</th><th>Proactive</th><th>Last activity</th></tr></thead>
+    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='10' class='muted'>No users yet.</td></tr>"}</tbody>
   </table>
 </main>
 <script>
@@ -10569,7 +11197,7 @@ def _render_user_detail_page(user: dict) -> str:
 <main>
   <a href="{html.escape(back)}">Back to data track</a>
   <h1>{html.escape(user['user_id'])}</h1>
-  <div class="muted">Route {html.escape(user['route'])}; stage {html.escape(user['onboarding']['stage'])}; metadata only.</div>
+  <div class="muted">Principal {html.escape(user.get('principal_id') or '')}; route {html.escape(user['route'])}; stage {html.escape(user['onboarding']['stage'])}; metadata only.</div>
   <section class="grid">
     <div class="card"><div class="value">{user['onboarding']['steps_done']}/{user['onboarding']['steps_total']}</div><div class="label">onboarding steps</div></div>
     <div class="card"><div class="value">{html.escape(_format_duration(user['onboarding']['stuck_for_sec']))}</div><div class="label">stuck for</div></div>
