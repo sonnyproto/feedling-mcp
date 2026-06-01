@@ -147,6 +147,7 @@ services:
     restart: unless-stopped
     environment:
       FEEDLING_API_KEY: ""
+      FEEDLING_ADMIN_TOKEN: "${FEEDLING_ADMIN_TOKEN:-}"
       FEEDLING_DATA_DIR: "/data"
       FEEDLING_WS_PORT: "9998"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"

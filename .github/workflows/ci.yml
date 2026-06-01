@@ -312,6 +312,7 @@ jobs:
           APNS_KEY_ID:         ${{ secrets.APNS_KEY_ID }}
           APNS_TEAM_ID:        ${{ secrets.APNS_TEAM_ID }}
           OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
+          FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
         run: |
           echo ">>> deploy-cvm target: $CVM_ID"
@@ -325,6 +326,7 @@ jobs:
             -e "APNS_KEY_ID=$APNS_KEY_ID" \
             -e "APNS_TEAM_ID=$APNS_TEAM_ID" \
             -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
+            -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
             --wait
 
       - name: Publish live compose_hash on Sepolia

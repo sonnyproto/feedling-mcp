@@ -180,6 +180,8 @@ PUSH_COOLDOWN_SECONDS = int(os.environ.get("FEEDLING_PUSH_COOLDOWN_SEC", 300))
 LIVE_ACTIVITY_DEDUPE_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC", 900))
 LIVE_ACTIVITY_START_COOLDOWN_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_START_COOLDOWN_SEC", 1800))
 DEVICE_EVENT_RETENTION_DAYS = int(os.environ.get("FEEDLING_DEVICE_EVENT_RETENTION_DAYS", 30))
+TRACK_EVENT_RETENTION_DAYS = int(os.environ.get("FEEDLING_TRACK_EVENT_RETENTION_DAYS", 90))
+TRACK_EVENT_MAX = int(os.environ.get("FEEDLING_TRACK_EVENT_MAX", 2000))
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 PROACTIVE_JOB_MAX = int(os.environ.get("FEEDLING_PROACTIVE_JOB_MAX", 500))
 PROACTIVE_DEBUG_DECISION_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_DECISION_READ_MAX", 1000))
@@ -361,6 +363,10 @@ class UserStore:
     @property
     def gate_reviews_file(self) -> Path:
         return self.dir / "gate_reviews.jsonl"
+
+    @property
+    def tracking_events_file(self) -> Path:
+        return self.dir / "tracking_events.jsonl"
 
     # ------- frames index -------
     def _load_frames_meta(self):
@@ -775,6 +781,26 @@ class UserStore:
 
     def list_gate_reviews(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
         return self._read_jsonl(self.gate_reviews_file, limit=limit, since_epoch=since_epoch)
+
+    def append_tracking_event(self, event: dict) -> dict:
+        self._append_jsonl(self.tracking_events_file, event)
+        self._prune_tracking_events()
+        return event
+
+    def list_tracking_events(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
+        return self._read_jsonl(self.tracking_events_file, limit=limit, since_epoch=since_epoch)
+
+    def _prune_tracking_events(self) -> None:
+        cutoff = time.time() - TRACK_EVENT_RETENTION_DAYS * 86400
+        rows = self._read_jsonl(self.tracking_events_file, limit=TRACK_EVENT_MAX, since_epoch=cutoff)
+        try:
+            tmp = self.tracking_events_file.with_suffix(".jsonl.tmp")
+            with open(tmp, "w") as f:
+                for row in rows[-TRACK_EVENT_MAX:]:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            tmp.replace(self.tracking_events_file)
+        except Exception as e:
+            print(f"[{self.user_id}/tracking-events] prune failed: {e}")
 
     def append_proactive_job(self, job: dict) -> dict:
         self._append_jsonl(self.proactive_jobs_file, job)
@@ -6205,6 +6231,93 @@ def analyze_screen():
 # Proactive hidden jobs
 # ---------------------------------------------------------------------------
 
+_TRACK_EVENT_TYPE_RE = re.compile(r"[^a-zA-Z0-9_.:-]+")
+_TRACK_SENSITIVE_KEY_RE = re.compile(
+    r"(api[_-]?key|secret|token|password|private|body_ct|k_user|k_enclave|"
+    r"nonce|cipher|content|clipboard|prompt|transcript|persona|history|"
+    r"filename|file_name|file|raw|text|title|url|email|phone|lat|lng|"
+    r"latitude|longitude)",
+    re.IGNORECASE,
+)
+
+
+def _safe_track_scalar(value):
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        return value
+    if isinstance(value, str):
+        return value.strip()[:200]
+    return None
+
+
+def _sanitize_track_payload(payload, depth: int = 0) -> dict:
+    """Keep beta tracking metadata useful while refusing content-like fields."""
+    if not isinstance(payload, dict) or depth > 2:
+        return {}
+    clean: dict = {}
+    for raw_key, value in payload.items():
+        key = str(raw_key or "").strip()[:80]
+        if not key or _TRACK_SENSITIVE_KEY_RE.search(key):
+            continue
+        if isinstance(value, dict):
+            nested = _sanitize_track_payload(value, depth + 1)
+            if nested:
+                clean[key] = nested
+            continue
+        if isinstance(value, list):
+            vals = []
+            for item in value[:20]:
+                if isinstance(item, dict):
+                    nested = _sanitize_track_payload(item, depth + 1)
+                    if nested:
+                        vals.append(nested)
+                else:
+                    scalar = _safe_track_scalar(item)
+                    if scalar is not None:
+                        vals.append(scalar)
+            if vals:
+                clean[key] = vals
+            continue
+        scalar = _safe_track_scalar(value)
+        if scalar is not None:
+            clean[key] = scalar
+    return clean
+
+
+def _make_tracking_event(store: UserStore, event_type: str, payload: dict | None = None) -> dict:
+    raw_type = str(event_type or "unknown").strip()[:120]
+    normalized = _TRACK_EVENT_TYPE_RE.sub("_", raw_type).strip("_.:-").lower()
+    if not normalized:
+        normalized = "unknown"
+    return {
+        "event_id": _new_public_id("trk"),
+        "user_id": store.user_id,
+        "type": normalized[:120],
+        "ts": time.time(),
+        "created_at": datetime.now().isoformat(),
+        "source": str((payload or {}).get("source") or "ios")[:40],
+        "payload": _sanitize_track_payload((payload or {}).get("payload") if isinstance(payload, dict) else {}),
+        "app_version": str((payload or {}).get("app_version") or "")[:40],
+        "build": str((payload or {}).get("build") or "")[:40],
+        "platform": str((payload or {}).get("platform") or "ios")[:40],
+        "route": str((payload or {}).get("route") or "")[:80],
+    }
+
+
+@app.route("/v1/track/event", methods=["POST"])
+def track_event():
+    store = require_user()
+    payload = request.get_json(silent=True) or {}
+    event_type = str(payload.get("event_type") or payload.get("type") or "unknown")
+    event = _make_tracking_event(store, event_type, payload)
+    store.append_tracking_event(event)
+    return jsonify({"status": "ok", "event_id": event["event_id"]})
+
 
 @app.route("/v1/proactive/settings", methods=["GET", "POST"])
 def proactive_settings():
@@ -8530,6 +8643,604 @@ def onboarding_validate():
     return jsonify(_onboarding_validation_payload(store))
 
 
+# ---------------------------------------------------------------------------
+# Beta data track admin surface
+# ---------------------------------------------------------------------------
+
+def _extract_admin_token() -> str:
+    key = request.headers.get("X-Admin-Token", "").strip()
+    if key:
+        return key
+    auth = request.headers.get("Authorization", "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return request.args.get("admin_key", "").strip()
+
+
+def require_admin() -> None:
+    configured = os.environ.get("FEEDLING_ADMIN_TOKEN", "").strip()
+    if not configured:
+        abort(503)
+    supplied = _extract_admin_token()
+    if not supplied or not hmac.compare_digest(supplied, configured):
+        abort(401)
+
+
+def _admin_qs() -> str:
+    token = request.args.get("admin_key", "").strip()
+    return urlencode({"admin_key": token}) if token else ""
+
+
+def _to_epoch(value) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except Exception:
+            return 0.0
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except Exception:
+        pass
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _epoch_to_iso(epoch: float) -> str:
+    try:
+        if epoch and epoch > 0:
+            return datetime.fromtimestamp(float(epoch)).isoformat()
+    except Exception:
+        pass
+    return ""
+
+
+def _latest_epoch(*values) -> float:
+    epochs = [_to_epoch(v) for v in values]
+    return max(epochs) if epochs else 0.0
+
+
+def _count_rows(rows: list[dict], key: str) -> dict:
+    counts: dict[str, int] = {}
+    for row in rows:
+        val = str(row.get(key) or "unknown").strip() or "unknown"
+        counts[val] = counts.get(val, 0) + 1
+    return counts
+
+
+def _safe_onboarding_validation(raw: dict) -> dict:
+    def scrub_step(step: dict) -> dict:
+        blocked = {"relationship_anchor_evidence"}
+        safe: dict = {}
+        for key, value in (step or {}).items():
+            if key in blocked:
+                safe["has_relationship_anchor_evidence"] = bool(str(value or "").strip())
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                safe[key] = value
+            elif isinstance(value, (list, dict)):
+                safe[key] = value
+        return safe
+
+    return {
+        "passing": bool((raw or {}).get("passing")),
+        "stage": str((raw or {}).get("stage") or ""),
+        "route": str((raw or {}).get("route") or ""),
+        "next_action": str((raw or {}).get("next_action") or ""),
+        "steps": [scrub_step(s) for s in (raw or {}).get("steps", []) if isinstance(s, dict)],
+        "skill_url": str((raw or {}).get("skill_url") or ""),
+    }
+
+
+def _chat_stats(store: UserStore) -> dict:
+    with store.chat_lock:
+        messages = list(store.chat_messages)
+    by_role = _count_rows(messages, "role")
+    by_source = _count_rows(messages, "source")
+    by_content_type = _count_rows(messages, "content_type")
+    epochs = [_to_epoch(m.get("ts") or m.get("timestamp")) for m in messages if isinstance(m, dict)]
+    user_epochs = [
+        _to_epoch(m.get("ts") or m.get("timestamp"))
+        for m in messages
+        if isinstance(m, dict) and m.get("role") == "user"
+    ]
+    agent_epochs = [
+        _to_epoch(m.get("ts") or m.get("timestamp"))
+        for m in messages
+        if isinstance(m, dict) and m.get("role") in ("agent", "openclaw")
+    ]
+    return {
+        "total": len(messages),
+        "by_role": by_role,
+        "by_source": by_source,
+        "by_content_type": by_content_type,
+        "user_messages": by_role.get("user", 0),
+        "agent_messages": by_role.get("agent", 0) + by_role.get("openclaw", 0),
+        "image_messages": by_content_type.get("image", 0),
+        "proactive_messages": by_source.get(PROACTIVE_JOB_SOURCE, 0),
+        "first_at": _epoch_to_iso(min(epochs)) if epochs else "",
+        "last_at": _epoch_to_iso(max(epochs)) if epochs else "",
+        "last_user_at": _epoch_to_iso(max(user_epochs)) if user_epochs else "",
+        "last_agent_at": _epoch_to_iso(max(agent_epochs)) if agent_epochs else "",
+    }
+
+
+def _memory_stats(store: UserStore) -> dict:
+    moments = _load_moments(store)
+    by_type = {typ: 0 for typ in MEMORY_TYPES}
+    by_tab = {"story": 0, "about_me": 0, "ta_thinking": 0}
+    by_source: dict[str, int] = {}
+    created_epochs = []
+    occurred_epochs = []
+    for m in moments if isinstance(moments, list) else []:
+        if not isinstance(m, dict):
+            continue
+        mem_type = str(m.get("type") or "unknown")
+        by_type[mem_type] = by_type.get(mem_type, 0) + 1
+        tab = TAB_FOR_TYPE.get(mem_type, "unknown")
+        by_tab[tab] = by_tab.get(tab, 0) + 1
+        source = str(m.get("source") or "unknown")
+        by_source[source] = by_source.get(source, 0) + 1
+        created_epochs.append(_to_epoch(m.get("created_at")))
+        occurred_epochs.append(_to_epoch(m.get("occurred_at")))
+    counts = _count_by_tab(moments)
+    return {
+        "total": counts["total"],
+        "by_tab": by_tab,
+        "by_type": by_type,
+        "by_source": by_source,
+        "first_created_at": _epoch_to_iso(min([e for e in created_epochs if e], default=0)),
+        "last_created_at": _epoch_to_iso(max(created_epochs, default=0)),
+        "earliest_occurred_at": _epoch_to_iso(min([e for e in occurred_epochs if e], default=0)),
+        "latest_occurred_at": _epoch_to_iso(max(occurred_epochs, default=0)),
+    }
+
+
+def _proactive_stats(store: UserStore) -> dict:
+    decisions = store.list_gate_decisions(limit=0)
+    jobs = store.list_proactive_jobs(limit=0)
+    device_events = store.list_device_events(limit=0)
+    with store.chat_lock:
+        proactive_messages = [
+            m for m in store.chat_messages
+            if isinstance(m, dict) and m.get("source") == PROACTIVE_JOB_SOURCE
+        ]
+    decision_true = sum(1 for d in decisions if bool(d.get("should_reach_out")))
+    status_counts = _count_rows(jobs, "status")
+    live_status_counts = _count_rows(proactive_messages, "live_activity_status")
+    alert_status_counts = _count_rows(proactive_messages, "alert_status")
+    job_epochs = [_to_epoch(j.get("ts") or j.get("created_at") or j.get("updated_at")) for j in jobs]
+    msg_epochs = [_to_epoch(m.get("ts")) for m in proactive_messages]
+    decision_epochs = [_to_epoch(d.get("ts") or d.get("created_at")) for d in decisions]
+    delivered = (
+        live_status_counts.get("delivered", 0)
+        + alert_status_counts.get("delivered", 0)
+        + alert_status_counts.get("logged_only", 0)
+    )
+    failed = sum(status_counts.get(s, 0) for s in ("failed", "skipped"))
+    failed += sum(live_status_counts.get(s, 0) for s in ("failed", "error"))
+    failed += sum(alert_status_counts.get(s, 0) for s in ("failed", "error"))
+    return {
+        "decisions": len(decisions),
+        "decision_true": decision_true,
+        "decision_false": max(0, len(decisions) - decision_true),
+        "jobs": len(jobs),
+        "jobs_by_status": status_counts,
+        "pending_jobs": status_counts.get("pending", 0),
+        "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
+        "failed_jobs": failed,
+        "proactive_messages": len(proactive_messages),
+        "delivery_signals": delivered,
+        "live_activity_status": live_status_counts,
+        "alert_status": alert_status_counts,
+        "device_events": len(device_events),
+        "last_at": _epoch_to_iso(max(job_epochs + msg_epochs + decision_epochs, default=0)),
+    }
+
+
+def _push_stats(store: UserStore) -> dict:
+    tokens = [t for t in (store.tokens or []) if isinstance(t, dict)]
+    statuses = _count_rows(tokens, "status")
+    updated_epochs = [_to_epoch(t.get("updated_at") or t.get("registered_at")) for t in tokens]
+    return {
+        "tokens": len(tokens),
+        "active_tokens": statuses.get("active", 0),
+        "by_status": statuses,
+        "last_token_at": _epoch_to_iso(max(updated_epochs, default=0)),
+    }
+
+
+def _tracking_stats(store: UserStore, *, include_events: bool = False) -> dict:
+    events = store.list_tracking_events(limit=0)
+    by_type = _count_rows(events, "type")
+    epochs = [_to_epoch(e.get("ts") or e.get("created_at")) for e in events]
+    latest = sorted(events, key=lambda e: _to_epoch(e.get("ts") or e.get("created_at")), reverse=True)[:50]
+    out = {
+        "events": len(events),
+        "by_type": by_type,
+        "last_at": _epoch_to_iso(max(epochs, default=0)),
+    }
+    if include_events:
+        out["latest"] = [
+            {
+                "event_id": e.get("event_id", ""),
+                "type": e.get("type", ""),
+                "created_at": e.get("created_at", ""),
+                "source": e.get("source", ""),
+                "route": e.get("route", ""),
+                "app_version": e.get("app_version", ""),
+                "build": e.get("build", ""),
+                "payload": e.get("payload", {}),
+            }
+            for e in latest
+        ]
+    return out
+
+
+def _history_import_stats(store: UserStore) -> dict:
+    latest = _latest_history_import_job(store)
+    if not latest:
+        return {"has_job": False}
+    return {
+        "has_job": True,
+        "job_id": latest.get("job_id", ""),
+        "status": latest.get("status", ""),
+        "created_at": latest.get("created_at", ""),
+        "updated_at": latest.get("updated_at", ""),
+        "completed_at": latest.get("completed_at", ""),
+        "messages_parsed": latest.get("messages_parsed", 0),
+        "support_materials": latest.get("support_materials", 0),
+        "chat_messages_imported": latest.get("chat_messages_imported", 0),
+        "memories_created": latest.get("memories_created", 0),
+        "identity_written": bool(latest.get("identity_written")),
+    }
+
+
+def _bootstrap_event_stats(store: UserStore, *, include_events: bool = False) -> dict:
+    events = _load_bootstrap_events(store)
+    by_type = _count_rows(events, "event_type")
+    epochs = [_to_epoch(e.get("timestamp") or e.get("ts")) for e in events]
+    out = {
+        "events": len(events),
+        "by_type": by_type,
+        "last_at": _epoch_to_iso(max(epochs, default=0)),
+    }
+    if include_events:
+        out["latest"] = [
+            {
+                "event_type": e.get("event_type", ""),
+                "success": bool(e.get("success")),
+                "timestamp": e.get("timestamp", ""),
+                "has_error": bool(str(e.get("error_message") or "").strip()),
+            }
+            for e in events[-50:]
+        ]
+    return out
+
+
+def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) -> dict:
+    user_id = str(user_entry.get("user_id") or "")
+    store = get_store(user_id)
+    route_data = _read_json_object(store.onboarding_route_file) or {}
+    route = _load_onboarding_route(store)
+    validation = _safe_onboarding_validation(_onboarding_validation_payload(store))
+    steps = validation.get("steps", [])
+    steps_total = len(steps)
+    steps_done = sum(1 for s in steps if bool(s.get("passing")))
+    chat = _chat_stats(store)
+    memory = _memory_stats(store)
+    proactive = _proactive_stats(store)
+    push = _push_stats(store)
+    tracking = _tracking_stats(store, include_events=include_detail)
+    bootstrap_events = _bootstrap_event_stats(store, include_events=include_detail)
+    history_import = _history_import_stats(store)
+    identity = _load_identity(store)
+    identity_updated_at = (identity or {}).get("updated_at", "")
+    registered_at = str(user_entry.get("created_at") or "")
+    latest_epoch = _latest_epoch(
+        registered_at,
+        route_data.get("selected_at"),
+        chat.get("last_at"),
+        memory.get("last_created_at"),
+        proactive.get("last_at"),
+        tracking.get("last_at"),
+        bootstrap_events.get("last_at"),
+        identity_updated_at,
+        history_import.get("updated_at"),
+        history_import.get("completed_at"),
+    )
+    now = time.time()
+    stage = validation.get("stage") or "unknown"
+    passing = bool(validation.get("passing"))
+    stuck_for_sec = 0 if passing else int(max(0, now - latest_epoch)) if latest_epoch else None
+    row = {
+        "user_id": user_id,
+        "registered_at": registered_at,
+        "archive_language": user_entry.get("archive_language") or "",
+        "public_key_present": bool(str(user_entry.get("public_key") or "").strip()),
+        "route": route,
+        "route_selected_at": route_data.get("selected_at", ""),
+        "onboarding": {
+            "passing": passing,
+            "stage": "complete" if passing else stage,
+            "steps_done": steps_done,
+            "steps_total": steps_total,
+            "next_action": validation.get("next_action", ""),
+            "steps": steps if include_detail else [],
+            "stuck_for_sec": stuck_for_sec,
+        },
+        "last_activity_at": _epoch_to_iso(latest_epoch),
+        "chat": chat,
+        "memory": memory,
+        "proactive": proactive,
+        "push": push,
+        "tracking": tracking,
+        "bootstrap_events": bootstrap_events,
+        "history_import": history_import,
+    }
+    if include_detail:
+        row["identity"] = {
+            "written": identity is not None,
+            "updated_at": identity_updated_at,
+            "relationship_started_at": (identity or {}).get("relationship_started_at", ""),
+            "relationship_anchor_source": (identity or {}).get("relationship_anchor_source", ""),
+            "has_relationship_anchor_evidence": bool(
+                str((identity or {}).get("relationship_anchor_evidence") or "").strip()
+            ),
+        }
+    return row
+
+
+def _data_track_payload(*, include_users: bool = True, include_detail_user: str = "") -> dict:
+    with _users_lock:
+        users = [dict(u) for u in _users if u.get("user_id")]
+    rows = [
+        _build_data_track_user(u, include_detail=(include_detail_user == u.get("user_id")))
+        for u in users
+    ]
+    rows.sort(key=lambda r: r.get("registered_at") or "", reverse=True)
+    completed = sum(1 for r in rows if r["onboarding"]["passing"])
+    incomplete = max(0, len(rows) - completed)
+    stage_counts: dict[str, int] = {}
+    route_counts: dict[str, int] = {}
+    chat_total = 0
+    memory_total = 0
+    proactive_jobs = 0
+    proactive_messages = 0
+    proactive_failed = 0
+    for row in rows:
+        stage = row["onboarding"]["stage"]
+        route = row["route"]
+        stage_counts[stage] = stage_counts.get(stage, 0) + 1
+        route_counts[route] = route_counts.get(route, 0) + 1
+        chat_total += row["chat"]["total"]
+        memory_total += row["memory"]["total"]
+        proactive_jobs += row["proactive"]["jobs"]
+        proactive_messages += row["proactive"]["proactive_messages"]
+        proactive_failed += row["proactive"]["failed_jobs"]
+    summary = {
+        "generated_at": datetime.now().isoformat(),
+        "users_total": len(rows),
+        "onboarding_completed": completed,
+        "onboarding_incomplete": incomplete,
+        "completion_rate": (completed / len(rows)) if rows else 0,
+        "stage_counts": stage_counts,
+        "route_counts": route_counts,
+        "chat_messages_total": chat_total,
+        "memory_total": memory_total,
+        "memory_avg_per_user": (memory_total / len(rows)) if rows else 0,
+        "proactive_jobs_total": proactive_jobs,
+        "proactive_messages_total": proactive_messages,
+        "proactive_failed_total": proactive_failed,
+    }
+    payload = {"summary": summary}
+    if include_users:
+        payload["users"] = rows
+    return payload
+
+
+def _format_duration(seconds) -> str:
+    if seconds is None:
+        return "n/a"
+    try:
+        sec = int(seconds)
+    except Exception:
+        return "n/a"
+    if sec < 60:
+        return f"{sec}s"
+    minutes = sec // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h"
+    return f"{hours // 24}d"
+
+
+def _render_metric(label: str, value) -> str:
+    return (
+        "<div class='metric'>"
+        f"<div class='metric-value'>{html.escape(str(value))}</div>"
+        f"<div class='metric-label'>{html.escape(label)}</div>"
+        "</div>"
+    )
+
+
+def _render_data_track_page(payload: dict) -> str:
+    summary = payload["summary"]
+    users = payload.get("users", [])
+    qs = _admin_qs()
+    qs_suffix = f"?{qs}" if qs else ""
+    rows_html = []
+    for row in users:
+        onboarding = row["onboarding"]
+        stage = onboarding["stage"]
+        complete = onboarding["passing"]
+        status_class = "ok" if complete else "warn"
+        user_url = f"/admin/data-track/users/{quote(row['user_id'])}{qs_suffix}"
+        rows_html.append(
+            "<tr>"
+            f"<td><a href='{html.escape(user_url)}'>{html.escape(row['user_id'])}</a></td>"
+            f"<td>{html.escape(row['route'])}</td>"
+            f"<td><span class='pill {status_class}'>{html.escape(stage)}</span></td>"
+            f"<td>{onboarding['steps_done']}/{onboarding['steps_total']}</td>"
+            f"<td>{html.escape(_format_duration(onboarding['stuck_for_sec']))}</td>"
+            f"<td>{row['chat']['total']} <span class='muted'>u{row['chat']['user_messages']} / a{row['chat']['agent_messages']}</span></td>"
+            f"<td>{row['memory']['total']} <span class='muted'>S{row['memory']['by_tab'].get('story', 0)} / A{row['memory']['by_tab'].get('about_me', 0)} / T{row['memory']['by_tab'].get('ta_thinking', 0)}</span></td>"
+            f"<td>{row['proactive']['proactive_messages']} <span class='muted'>jobs {row['proactive']['jobs']} / fail {row['proactive']['failed_jobs']}</span></td>"
+            f"<td>{html.escape(row.get('last_activity_at') or '')}</td>"
+            "</tr>"
+        )
+    metrics = "".join([
+        _render_metric("users", summary["users_total"]),
+        _render_metric("onboarding done", summary["onboarding_completed"]),
+        _render_metric("completion", f"{summary['completion_rate'] * 100:.0f}%"),
+        _render_metric("chat messages", summary["chat_messages_total"]),
+        _render_metric("memories", summary["memory_total"]),
+        _render_metric("proactive jobs", summary["proactive_jobs_total"]),
+    ])
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Feedling Beta Data Track</title>
+  <style>
+    :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; }}
+    body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+    main {{ max-width:1280px; margin:0 auto; padding:28px 24px 48px; }}
+    h1 {{ font-size:26px; margin:0 0 4px; }}
+    h2 {{ font-size:16px; margin:28px 0 12px; }}
+    .muted {{ color:var(--muted); }}
+    .metrics {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:22px 0; }}
+    .metric {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
+    .metric-value {{ font-size:24px; font-weight:700; }}
+    .metric-label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }}
+    .toolbar {{ display:flex; gap:10px; align-items:center; margin:18px 0; }}
+    input {{ width:320px; max-width:100%; border:1px solid var(--line); border-radius:6px; padding:9px 10px; background:white; color:var(--fg); }}
+    table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
+    th,td {{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }}
+    th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }}
+    tr:last-child td {{ border-bottom:0; }}
+    a {{ color:var(--accent); text-decoration:none; }}
+    .pill {{ display:inline-flex; border-radius:999px; padding:2px 8px; font-size:12px; background:#efe7df; color:var(--muted); }}
+    .pill.ok {{ color:var(--ok); background:#e7f3ed; }}
+    .pill.warn {{ color:var(--warn); background:#fff1db; }}
+    pre {{ white-space:pre-wrap; word-break:break-word; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Feedling Beta Data Track</h1>
+  <div class="muted">Generated {html.escape(summary["generated_at"])}. Metadata only; encrypted content is not read or rendered.</div>
+  <section class="metrics">{metrics}</section>
+  <h2>Beta users</h2>
+  <div class="toolbar"><input id="q" placeholder="Filter user, route, stage"></div>
+  <table id="users">
+    <thead><tr><th>User</th><th>Route</th><th>Onboarding</th><th>Steps</th><th>Stuck</th><th>Chat</th><th>Memory</th><th>Proactive</th><th>Last activity</th></tr></thead>
+    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='9' class='muted'>No users yet.</td></tr>"}</tbody>
+  </table>
+</main>
+<script>
+const q = document.getElementById('q');
+q.addEventListener('input', () => {{
+  const needle = q.value.toLowerCase();
+  for (const tr of document.querySelectorAll('#users tbody tr')) {{
+    tr.style.display = tr.textContent.toLowerCase().includes(needle) ? '' : 'none';
+  }}
+}});
+</script>
+</body>
+</html>"""
+
+
+def _render_user_detail_page(user: dict) -> str:
+    qs = _admin_qs()
+    back = f"/admin/data-track?{qs}" if qs else "/admin/data-track"
+    safe_json = json.dumps(user, ensure_ascii=False, indent=2)
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(user['user_id'])} · Feedling Data Track</title>
+  <style>
+    :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; }}
+    body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+    main {{ max-width:1040px; margin:0 auto; padding:28px 24px 48px; }}
+    a {{ color:var(--accent); text-decoration:none; }}
+    h1 {{ font-size:24px; margin:14px 0 4px; }}
+    .muted {{ color:var(--muted); }}
+    .grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; margin:20px 0; }}
+    .card {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
+    .value {{ font-size:22px; font-weight:700; }}
+    .label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }}
+    pre {{ white-space:pre-wrap; word-break:break-word; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
+  </style>
+</head>
+<body>
+<main>
+  <a href="{html.escape(back)}">Back to data track</a>
+  <h1>{html.escape(user['user_id'])}</h1>
+  <div class="muted">Route {html.escape(user['route'])}; stage {html.escape(user['onboarding']['stage'])}; metadata only.</div>
+  <section class="grid">
+    <div class="card"><div class="value">{user['onboarding']['steps_done']}/{user['onboarding']['steps_total']}</div><div class="label">onboarding steps</div></div>
+    <div class="card"><div class="value">{html.escape(_format_duration(user['onboarding']['stuck_for_sec']))}</div><div class="label">stuck for</div></div>
+    <div class="card"><div class="value">{user['chat']['total']}</div><div class="label">chat messages</div></div>
+    <div class="card"><div class="value">{user['memory']['total']}</div><div class="label">memories</div></div>
+    <div class="card"><div class="value">{user['proactive']['proactive_messages']}</div><div class="label">proactive writes</div></div>
+  </section>
+  <pre>{html.escape(safe_json)}</pre>
+</main>
+</body>
+</html>"""
+
+
+@app.route("/v1/admin/data-track/summary", methods=["GET"])
+def admin_data_track_summary():
+    require_admin()
+    return jsonify(_data_track_payload(include_users=False))
+
+
+@app.route("/v1/admin/data-track/users", methods=["GET"])
+def admin_data_track_users():
+    require_admin()
+    return jsonify(_data_track_payload(include_users=True))
+
+
+@app.route("/v1/admin/data-track/users/<user_id>", methods=["GET"])
+def admin_data_track_user(user_id: str):
+    require_admin()
+    with _users_lock:
+        entry = next((dict(u) for u in _users if u.get("user_id") == user_id), None)
+    if not entry:
+        return jsonify({"error": "user_not_found"}), 404
+    return jsonify({"user": _build_data_track_user(entry, include_detail=True)})
+
+
+@app.route("/admin/data-track", methods=["GET"])
+def admin_data_track_page():
+    require_admin()
+    return Response(_render_data_track_page(_data_track_payload(include_users=True)), mimetype="text/html")
+
+
+@app.route("/admin/data-track/users/<user_id>", methods=["GET"])
+def admin_data_track_user_page(user_id: str):
+    require_admin()
+    with _users_lock:
+        entry = next((dict(u) for u in _users if u.get("user_id") == user_id), None)
+    if not entry:
+        return Response("user not found", status=404, mimetype="text/plain")
+    return Response(_render_user_detail_page(_build_data_track_user(entry, include_detail=True)), mimetype="text/html")
+
+
 # Synthetic chat-loop ping — server posts a marker user message,
 # posts a synthetic ping, waits for an agent-role reply, reports back.
 # This proves that some reply pipeline is alive. It cannot, by itself,
@@ -9206,6 +9917,11 @@ def _unauthorized(e):
 @app.errorhandler(403)
 def _forbidden(e):
     return jsonify({"error": "forbidden"}), 403
+
+
+@app.errorhandler(503)
+def _unavailable(e):
+    return jsonify({"error": "service_unavailable", "detail": "admin token is not configured"}), 503
 
 
 if __name__ == "__main__":
