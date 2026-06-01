@@ -477,10 +477,6 @@ def push_live_activity(
     payload_data = dict(data or {})
 
     api_key = _current_api_key(ctx)
-    blocked = _check_vision_gate(api_key)
-    if blocked:
-        return blocked
-
     rec = _recent_decrypt_by_api_key.get(api_key) if api_key else None
     if rec:
         payload_data.setdefault("analysis_source", "vision")
@@ -686,11 +682,6 @@ def chat_post_message(
       through ONE `/v1/chat/response` request (same backend code path), which avoids
       split-brain failures where push succeeds but chat writeback is missed.
     """
-    if push_live_activity:
-        blocked = _check_vision_gate(_current_api_key(ctx))
-        if blocked:
-            return blocked
-
     user_id, user_pk, enclave_pk = _whoami_pubkeys(ctx=ctx)
     if not (user_id and user_pk is not None and enclave_pk is not None):
         return {"error": "cannot post chat — pubkeys unavailable"}

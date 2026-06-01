@@ -1878,14 +1878,17 @@ def post_reply(
             enclave_pk_bytes=enc_pk,
             visibility=visibility,
         )
-        body: dict[str, Any] = {"envelope": envelope, "source": source}
+        visible_body = content[:240]
+        body: dict[str, Any] = {
+            "envelope": envelope,
+            "source": source,
+            "alert_body": visible_body,
+        }
         if gate_decision_id:
             body["gate_decision_id"] = gate_decision_id
         if proactive_job_id:
             body["proactive_job_id"] = proactive_job_id
         if source == PROACTIVE_JOB_SOURCE:
-            visible_body = content[:240]
-            body["alert_body"] = visible_body
             body["push_live_activity"] = True
             body["push_body"] = visible_body
             body["data"] = {
@@ -1907,7 +1910,7 @@ def post_reply(
             "content": content,
             "push_live_activity": source == PROACTIVE_JOB_SOURCE,
             "push_body": content[:240] if source == PROACTIVE_JOB_SOURCE else "",
-            "alert_body": content[:240] if source == PROACTIVE_JOB_SOURCE else "",
+            "alert_body": content[:240],
             "source": source,
             "gate_decision_id": gate_decision_id,
             "proactive_job_id": proactive_job_id,

@@ -32,13 +32,18 @@ _ENV_DEFAULTS = {
 for k, v in _ENV_DEFAULTS.items():
     os.environ.setdefault(k, v)
 
-# Stub out content_encryption so import doesn't fail without the backend tree.
-_fake_enc = types.ModuleType("content_encryption")
-_fake_enc.build_envelope = lambda **kw: {"v": 1, "stub": True}
-sys.modules.setdefault("content_encryption", _fake_enc)
-
 # Add backend dir to path (needed for real import in non-test environments).
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+
+# Stub out content_encryption only when the backend tree is unavailable. In the
+# full backend suite, app.py needs the real module; poisoning sys.modules here
+# makes later envelope tests import a fake build_envelope.
+try:
+    import content_encryption  # noqa: F401
+except ModuleNotFoundError:
+    _fake_enc = types.ModuleType("content_encryption")
+    _fake_enc.build_envelope = lambda **kw: {"v": 1, "stub": True}
+    sys.modules.setdefault("content_encryption", _fake_enc)
 
 import tools.chat_resident_consumer as crc  # noqa: E402  (after env setup)
 
@@ -1038,6 +1043,7 @@ def test_post_proactive_reply_triggers_alert_and_live_activity(monkeypatch):
         "_build_envelope",
         lambda **kwargs: {"v": 1, "id": "env_1", "visibility": kwargs["visibility"]},
     )
+    monkeypatch.setattr(crc, "_load_whoami", lambda: True)
     monkeypatch.setattr(crc.httpx, "post", _post)
 
     crc.post_reply(

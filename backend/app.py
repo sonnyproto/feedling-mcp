@@ -179,6 +179,7 @@ MAX_CHAT_MESSAGES = 5000
 PUSH_COOLDOWN_SECONDS = int(os.environ.get("FEEDLING_PUSH_COOLDOWN_SEC", 300))
 LIVE_ACTIVITY_DEDUPE_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC", 900))
 LIVE_ACTIVITY_START_COOLDOWN_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_START_COOLDOWN_SEC", 1800))
+APP_FOREGROUND_FRESH_SEC = int(os.environ.get("FEEDLING_APP_FOREGROUND_FRESH_SEC", 90))
 DEVICE_EVENT_RETENTION_DAYS = int(os.environ.get("FEEDLING_DEVICE_EVENT_RETENTION_DAYS", 30))
 TRACK_EVENT_RETENTION_DAYS = int(os.environ.get("FEEDLING_TRACK_EVENT_RETENTION_DAYS", 90))
 TRACK_EVENT_MAX = int(os.environ.get("FEEDLING_TRACK_EVENT_MAX", 2000))
@@ -624,6 +625,10 @@ class UserStore:
                 "live_activity_mode",
                 "alert_status",
                 "alert_reason",
+                "push_decision",
+                "push_reason",
+                "app_presence_phase",
+                "app_presence_age_sec",
             ):
                 value = extra.get(key)
                 if isinstance(value, str) and value.strip():
@@ -646,6 +651,10 @@ class UserStore:
             "live_activity_mode",
             "alert_status",
             "alert_reason",
+            "push_decision",
+            "push_reason",
+            "app_presence_phase",
+            "app_presence_age_sec",
         }
         clean: dict = {}
         for key, value in (fields or {}).items():
@@ -1128,6 +1137,17 @@ _DEVICE_EVENT_ALLOWED_KEYS = {
     "motion",
     "time_of_day",
     "scene_tags",
+    "scene_phase",
+    "phase",
+    "app_state",
+    "is_foreground",
+    "selected_tab",
+    "tab",
+    "is_chat_visible",
+    "is_in_detail",
+    "reason",
+    "app_version",
+    "build",
 }
 
 _DEVICE_EVENT_DROP_RE = re.compile(
@@ -1180,6 +1200,82 @@ def _make_device_event(source: str, event_type: str, payload: dict) -> dict:
         "source": (source or "ios").strip()[:80],
         "type": (event_type or "unknown").strip()[:80],
         "payload": _redact_device_payload(payload),
+    }
+
+
+def _latest_app_presence(store: UserStore, now: float | None = None) -> dict | None:
+    now = now or time.time()
+    for event in reversed(store.list_device_events(since_epoch=max(0.0, now - 86400), limit=300)):
+        event_type = str(event.get("type") or "").strip().lower()
+        if event_type not in {"app_presence", "app_state", "app_lifecycle"}:
+            continue
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        phase = str(
+            payload.get("scene_phase")
+            or payload.get("phase")
+            or payload.get("app_state")
+            or ""
+        ).strip().lower()
+        try:
+            ts = float(event.get("ts", 0) or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        age = max(0.0, now - ts) if ts > 0 else float("inf")
+        is_foreground = payload.get("is_foreground")
+        if isinstance(is_foreground, str):
+            is_foreground = is_foreground.lower() in {"1", "true", "yes", "active", "foreground"}
+        elif not isinstance(is_foreground, bool):
+            is_foreground = phase in {"active", "foreground"}
+        is_chat_visible = payload.get("is_chat_visible")
+        if isinstance(is_chat_visible, str):
+            is_chat_visible = is_chat_visible.lower() in {"1", "true", "yes"}
+        elif not isinstance(is_chat_visible, bool):
+            is_chat_visible = False
+        return {
+            "event_id": event.get("event_id", ""),
+            "phase": phase or "unknown",
+            "age_sec": age,
+            "is_foreground": bool(is_foreground),
+            "is_chat_visible": bool(is_chat_visible),
+            "selected_tab": str(payload.get("selected_tab") or payload.get("tab") or "")[:80],
+        }
+    return None
+
+
+def _ai_push_decision(store: UserStore) -> dict:
+    now = time.time()
+    presence = _latest_app_presence(store, now)
+    if presence is None:
+        return {
+            "should_push": True,
+            "reason": "no_app_presence",
+            "phase": "unknown",
+            "age_sec": "",
+        }
+
+    age = float(presence.get("age_sec") or 0.0)
+    phase = str(presence.get("phase") or "unknown")
+    is_fresh = age <= APP_FOREGROUND_FRESH_SEC
+    if presence.get("is_foreground") and is_fresh:
+        reason = "app_foreground_chat_visible" if presence.get("is_chat_visible") else "app_foreground"
+        return {
+            "should_push": False,
+            "reason": reason,
+            "phase": phase,
+            "age_sec": str(int(age)),
+        }
+
+    if presence.get("is_foreground") and not is_fresh:
+        reason = "foreground_presence_stale"
+    elif phase in {"background", "inactive"}:
+        reason = f"app_{phase}"
+    else:
+        reason = "app_not_foreground"
+    return {
+        "should_push": True,
+        "reason": reason,
+        "phase": phase,
+        "age_sec": str(int(age)) if age != float("inf") else "",
     }
 
 
@@ -2165,6 +2261,10 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
                 "live_activity_mode": m.get("live_activity_mode", ""),
                 "alert_status": m.get("alert_status", ""),
                 "alert_reason": m.get("alert_reason", ""),
+                "push_decision": m.get("push_decision", ""),
+                "push_reason": m.get("push_reason", ""),
+                "app_presence_phase": m.get("app_presence_phase", ""),
+                "app_presence_age_sec": m.get("app_presence_age_sec", ""),
             }
             for m in store.chat_messages
             if m.get("source") == PROACTIVE_JOB_SOURCE
@@ -2194,6 +2294,8 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
             row["live_activity_status"] = live_status
             row["live_activity_reason"] = msg.get("live_activity_reason", "")
             row["live_activity_mode"] = msg.get("live_activity_mode", "")
+            row["push_decision"] = msg.get("push_decision", "")
+            row["push_reason"] = msg.get("push_reason", "")
             row["preview"] = msg.get("alert_preview") or msg.get("push_body_preview") or ""
         else:
             row["derived_status"] = row.get("status", "pending")
@@ -5453,6 +5555,16 @@ def model_api_chat_send():
         return jsonify({"error": "assistant_envelope_failed", "detail": env_err}), 409
     assistant_row = store.append_chat("openclaw", "model_api", assistant_env)
     store.notify_chat_waiters()
+    delivery_fields = _deliver_ai_message_push_if_background(
+        store,
+        body=reply,
+        title="IO",
+        data={"source": "model_api"},
+        visual_state="reply",
+    )
+    updated = store.update_chat_message_metadata(assistant_row["id"], delivery_fields)
+    if updated:
+        assistant_row = updated
     print(
         f"[model_api_chat:{store.user_id}] user_msg={user_row['id']} "
         f"reply={assistant_row['id']} provider={runtime.provider} model={runtime.model}"
@@ -5619,6 +5731,8 @@ def push_live_activity_inner(store: UserStore, payload: dict):
 
     body = _live_activity_body(payload)
     top_app = _live_activity_top_app(payload)
+    alert_title = str(payload.get("alert_title") or payload.get("title") or "").strip()
+    alert_body = str(payload.get("alert_body") or body or "").strip()
 
     suppress, reason = store.should_suppress_live_activity(message=body, top_app=top_app)
     if suppress:
@@ -5635,7 +5749,7 @@ def push_live_activity_inner(store: UserStore, payload: dict):
             "timestamp": int(time.time()),
             "event": payload.get("event", "update"),
             "content-state": _live_activity_content_state(store, payload, default_visual_state="reply"),
-            "alert": {"title": "", "body": ""},
+            "alert": {"title": alert_title, "body": alert_body[:240]},
         }
     }
     topic = f"{BUNDLE_ID}.push-type.liveactivity"
@@ -5851,6 +5965,77 @@ def _send_chat_alert(store: UserStore, alert_body: str, alert_title: str = ""):
     except Exception as e:
         print(f"[chat-alert:{store.user_id}] failed: {e}")
         return {"status": "error", "reason": str(e)}
+
+
+def _json_body_from_response(resp) -> dict:
+    try:
+        body = resp.get_json(silent=True) or {}
+        return body if isinstance(body, dict) else {}
+    except Exception:
+        return {}
+
+
+def _deliver_ai_message_push_if_background(
+    store: UserStore,
+    *,
+    body: str,
+    title: str = "",
+    data: dict | None = None,
+    visual_state: str = "reply",
+) -> dict:
+    visible_body = (body or "").strip()
+    decision = _ai_push_decision(store)
+    fields: dict = {
+        "push_decision": "send" if decision.get("should_push") else "suppress",
+        "push_reason": str(decision.get("reason") or "")[:120],
+        "app_presence_phase": str(decision.get("phase") or "")[:40],
+    }
+    if decision.get("age_sec") not in ("", None):
+        fields["app_presence_age_sec"] = str(decision.get("age_sec"))[:20]
+
+    if not visible_body:
+        fields.update({
+            "push_decision": "skip",
+            "push_reason": "empty_body",
+            "live_activity_status": "skipped",
+            "live_activity_reason": "empty_body",
+            "alert_status": "skipped",
+            "alert_reason": "empty_body",
+        })
+        return fields
+
+    if not decision.get("should_push"):
+        reason = str(decision.get("reason") or "app_foreground")[:120]
+        fields.update({
+            "live_activity_status": "suppressed",
+            "live_activity_reason": reason,
+            "alert_status": "suppressed",
+            "alert_reason": reason,
+        })
+        print(f"[ai-push:{store.user_id}] suppressed reason={reason}")
+        return fields
+
+    push_payload = {
+        "title": title or "IO",
+        "body": visible_body[:240],
+        "alert_body": visible_body[:240],
+        "data": data or {},
+        "visualState": visual_state or "reply",
+    }
+    live_body = _json_body_from_response(push_live_activity_hybrid_inner(store, push_payload))
+    fields["live_activity_status"] = live_body.get("status", "unknown")
+    fields["live_activity_reason"] = live_body.get("reason", "")
+    fields["live_activity_activity_id"] = live_body.get("activity_id", "")
+    fields["live_activity_mode"] = live_body.get("mode", "")
+
+    alert_result = _send_chat_alert(store, visible_body, alert_title=title or "")
+    fields["alert_status"] = (alert_result or {}).get("status", "unknown")
+    fields["alert_reason"] = (alert_result or {}).get("reason", "")
+    print(
+        f"[ai-push:{store.user_id}] live={fields['live_activity_status']} "
+        f"alert={fields['alert_status']} reason={fields.get('push_reason', '')}"
+    )
+    return fields
 
 
 @app.route("/v1/push/notification", methods=["POST"])
@@ -6727,12 +6912,11 @@ def chat_message():
 @app.route("/v1/chat/response", methods=["POST"])
 def chat_response():
     """Agent posts a reply as a v1 ciphertext envelope. Shape matches
-    /v1/chat/message. The optional `push_live_activity` / `push_body` /
-    `title` / `subtitle` / `data` fields trigger an APNs Live Activity
-    delivery. Proactive replies use a hybrid policy: push-to-start at most
-    once per start window, then cheaper updates while the activity is presumed
-    alive. `push_body` is plaintext metadata (user-visible in APNs surfaces)
-    and is never stored in chat.
+    /v1/chat/message. When the caller supplies plaintext `alert_body` or
+    `push_body`, the server applies app-state push policy: background/unknown
+    app state gets APNs alert + Live Activity hybrid delivery; active foreground
+    app state records a suppression. `push_body` / `alert_body` are plaintext
+    metadata (user-visible in APNs surfaces) and are never stored in chat.
 
     Bootstrap gate: this endpoint 409s if memory_count < the per-age floor
     (see _memory_floor_for_days) or identity is not yet written. See
@@ -6785,34 +6969,18 @@ def chat_response():
         extra=extra,
     )
     delivery_fields: dict = {}
-    if payload.get("push_live_activity"):
-        push_payload = {
-            "title": payload.get("title", "") or "IO",
-            "body": payload.get("push_body", ""),
-            "subtitle": payload.get("subtitle"),
-            "data": payload.get("data", {}),
-            "visualState": payload.get("visualState") or payload.get("visual_state") or "reply",
-        }
-        if source == PROACTIVE_JOB_SOURCE:
-            live_resp = push_live_activity_hybrid_inner(store, push_payload)
-        else:
-            live_resp = push_live_activity_inner(store, push_payload)
-        try:
-            live_body = live_resp.get_json(silent=True) or {}
-        except Exception:
-            live_body = {}
-        delivery_fields["live_activity_status"] = live_body.get("status", "unknown")
-        delivery_fields["live_activity_reason"] = live_body.get("reason", "")
-        delivery_fields["live_activity_activity_id"] = live_body.get("activity_id", "")
-        delivery_fields["live_activity_mode"] = live_body.get("mode", "")
-    # Fire APNs alert push so users not currently in the app still see
-    # the agent's message. MCP supplies `alert_body` (plaintext) — the
-    # server itself doesn't decrypt the envelope. Best-effort: failures
-    # here don't block the chat write.
-    if alert_body:
-        alert_result = _send_chat_alert(store, alert_body, alert_title=payload.get("title", ""))
-        delivery_fields["alert_status"] = (alert_result or {}).get("status", "unknown")
-        delivery_fields["alert_reason"] = (alert_result or {}).get("reason", "")
+    visible_push_body = (push_body or alert_body).strip()
+    # Any plaintext AI reply supplied by the caller enters the same app-state
+    # policy: background/unknown app state gets Live Activity + APNs alert;
+    # foreground app state records a suppression instead of interrupting.
+    if visible_push_body or payload.get("push_live_activity"):
+        delivery_fields.update(_deliver_ai_message_push_if_background(
+            store,
+            body=visible_push_body,
+            title=payload.get("title", "") or "IO",
+            data=payload.get("data") if isinstance(payload.get("data"), dict) else {},
+            visual_state=payload.get("visualState") or payload.get("visual_state") or "reply",
+        ))
     if delivery_fields:
         updated = store.update_chat_message_metadata(msg["id"], delivery_fields)
         if updated:

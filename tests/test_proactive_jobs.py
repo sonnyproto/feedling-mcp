@@ -840,6 +840,136 @@ def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeyp
     assert msg["live_activity_status"] == "delivered"
 
 
+def test_ai_chat_response_pushes_when_app_background(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    appmod._stores.clear()
+
+    sent = []
+
+    def _fake_send_apns(device_token, payload, push_type, topic, **_kwargs):
+        sent.append({
+            "token": device_token,
+            "push_type": push_type,
+            "event": (payload.get("aps") or {}).get("event"),
+        })
+        return {"status": "delivered"}
+
+    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+
+    api_key = "test_ai_push_background_key"
+    user_id = "usr_ai_push_background"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.tokens = [
+        {
+            "type": "live_activity",
+            "token": "live-token",
+            "activity_id": "activity_1",
+            "status": "active",
+            "registered_at": "2026-06-01T00:00:00",
+        },
+        {
+            "type": "device",
+            "token": "device-token",
+            "status": "active",
+            "registered_at": "2026-06-01T00:00:01",
+        },
+    ]
+    store.append_device_event(appmod._make_device_event("ios", "app_presence", {
+        "scene_phase": "background",
+        "is_foreground": False,
+        "selected_tab": "chat",
+        "is_chat_visible": False,
+    }))
+
+    resp = appmod.app.test_client().post(
+        "/v1/chat/response",
+        headers={"X-API-Key": api_key},
+        json={
+            "envelope": {
+                "id": "msg_ai_background",
+                "v": 1,
+                "body_ct": "ct",
+                "nonce": "nonce",
+                "K_user": "k-user",
+                "K_enclave": "k-enclave",
+                "visibility": "shared",
+                "owner_user_id": user_id,
+            },
+            "source": "chat",
+            "alert_body": "后台时每条 AI 消息都要推送。",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert [(row["push_type"], row["event"]) for row in sent] == [
+        ("liveactivity", "update"),
+        ("alert", None),
+    ]
+    msg = store.chat_messages[-1]
+    assert msg["push_decision"] == "send"
+    assert msg["push_reason"] == "app_background"
+    assert msg["live_activity_status"] == "delivered"
+    assert msg["alert_status"] == "delivered"
+
+
+def test_ai_chat_response_suppresses_push_when_app_foreground(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    appmod._stores.clear()
+
+    sent = []
+
+    def _fake_send_apns(device_token, payload, push_type, topic, **_kwargs):
+        sent.append(push_type)
+        return {"status": "delivered"}
+
+    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+
+    api_key = "test_ai_push_foreground_key"
+    user_id = "usr_ai_push_foreground"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.tokens = [
+        {"type": "live_activity", "token": "live-token", "activity_id": "activity_1", "status": "active"},
+        {"type": "device", "token": "device-token", "status": "active"},
+    ]
+    store.append_device_event(appmod._make_device_event("ios", "app_presence", {
+        "scene_phase": "active",
+        "is_foreground": True,
+        "selected_tab": "chat",
+        "is_chat_visible": True,
+    }))
+
+    resp = appmod.app.test_client().post(
+        "/v1/chat/response",
+        headers={"X-API-Key": api_key},
+        json={
+            "envelope": {
+                "id": "msg_ai_foreground",
+                "v": 1,
+                "body_ct": "ct",
+                "nonce": "nonce",
+                "K_user": "k-user",
+                "K_enclave": "k-enclave",
+                "visibility": "shared",
+                "owner_user_id": user_id,
+            },
+            "source": "chat",
+            "alert_body": "前台时不要打断用户。",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert sent == []
+    msg = store.chat_messages[-1]
+    assert msg["push_decision"] == "suppress"
+    assert msg["push_reason"] == "app_foreground_chat_visible"
+    assert msg["live_activity_status"] == "suppressed"
+    assert msg["alert_status"] == "suppressed"
+
+
 def test_chat_history_supports_lightweight_images_and_before_cursor(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
