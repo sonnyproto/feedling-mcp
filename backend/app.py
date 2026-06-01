@@ -862,6 +862,7 @@ class UserStore:
                 "push_reason",
                 "app_presence_phase",
                 "app_presence_age_sec",
+                "model_api_kind",
             ):
                 value = extra.get(key)
                 if isinstance(value, str) and value.strip():
@@ -5876,23 +5877,70 @@ def _store_identity_payload(
     return identity
 
 
-def _append_import_chat_messages(store: UserStore, messages: list[dict]) -> list[dict]:
-    created: list[dict] = []
-    for msg in messages[-MAX_CHAT_MESSAGES:]:
-        text = str(msg.get("content") or "").strip()
-        if not text:
-            continue
-        envelope, err = _build_shared_envelope_for_store(
-            store,
-            text.encode("utf-8"),
+def _generate_model_api_onboarding_greeting(
+    provider: ProviderConfig,
+    messages: list[dict],
+    memory_cards: list[dict],
+    identity_payload: dict,
+    days: int,
+) -> tuple[str, list[str]]:
+    warnings: list[str] = []
+    identity_summary = {
+        "agent_name": identity_payload.get("agent_name", "IO"),
+        "self_introduction": identity_payload.get("self_introduction", ""),
+        "category": identity_payload.get("category", ""),
+        "signature": identity_payload.get("signature", []),
+        "days_with_user": days,
+    }
+    prompt = (
+        "Write the first visible chat message from the user's IO companion after onboarding. "
+        "The imported files have already been analyzed into memory and identity; do not paste, "
+        "summarize, or mention the source files, onboarding, import, API keys, encryption, or internal tools. "
+        "Speak in the companion's own voice, grounded in the context below. Match the user's language if clear. "
+        "Return only the message text, no JSON, no bullets, 1-3 short sentences.\n\n"
+        "Identity JSON:\n"
+        + json.dumps(identity_summary, ensure_ascii=False)[:4000]
+        + "\n\nMemory cards:\n"
+        + json.dumps(memory_cards[:12], ensure_ascii=False)[:8000]
+        + "\n\nTranscript sample:\n"
+        + _transcript_sample(messages, max_chars=8000)
+    )
+    try:
+        result = chat_completion(
+            provider,
+            [
+                {"role": "system", "content": "You are the user's IO companion writing one natural first message."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=320,
+            temperature=0.7,
+            timeout=45.0,
         )
-        if envelope is None:
-            raise RuntimeError(f"chat_envelope_failed:{err}")
-        role = "user" if msg.get("role") == "user" else "openclaw"
-        created.append(store.append_chat(role, "history_import", envelope))
-    if created:
-        _log_bootstrap_event(store, "history_import_chat_written", success=True)
-    return created
+    except Exception as e:
+        warnings.append(f"provider_onboarding_greeting_failed:{type(e).__name__}:{str(e)[:160]}")
+        return "", warnings
+
+    text = str(result.get("reply") or "").strip()
+    text = re.sub(r"^```(?:text)?\s*|\s*```$", "", text).strip()
+    if not text:
+        warnings.append("provider_onboarding_greeting_empty")
+        return "", warnings
+    return text[:1200], warnings
+
+
+def _append_model_api_onboarding_greeting(store: UserStore, text: str) -> dict:
+    envelope, err = _build_shared_envelope_for_store(store, text.encode("utf-8"))
+    if envelope is None:
+        raise RuntimeError(f"onboarding_greeting_envelope_failed:{err}")
+    row = store.append_chat(
+        "openclaw",
+        "model_api",
+        envelope,
+        extra={"model_api_kind": "onboarding_greeting"},
+    )
+    store.notify_chat_waiters()
+    _log_bootstrap_event(store, "model_api_onboarding_greeting_written", success=True)
+    return row
 
 
 def _process_history_import_sync(
@@ -5943,7 +5991,6 @@ def _process_history_import_sync(
     })
     _save_history_job(store, job)
 
-    chat_rows = _append_import_chat_messages(store, history_messages)
     provider_cards, provider_warnings = _extract_memory_cards_with_provider(
         runtime,
         messages,
@@ -5963,12 +6010,24 @@ def _process_history_import_sync(
         evidence=f"history_import:{job['job_id']} relationship_started_at={relationship_start.isoformat()}",
     )
 
+    greeting_text, greeting_warnings = _generate_model_api_onboarding_greeting(
+        runtime,
+        messages,
+        cards,
+        identity_payload,
+        days,
+    )
+    warnings.extend(greeting_warnings)
+    greeting_row = _append_model_api_onboarding_greeting(store, greeting_text) if greeting_text else None
+
     job.update({
         "status": "completed",
         "completed_at": _now_iso(),
-        "chat_messages_imported": len(chat_rows),
+        "chat_messages_imported": 0,
         "memories_created": len(memory_rows),
         "identity_written": bool(identity),
+        "onboarding_greeting_written": bool(greeting_row),
+        "onboarding_greeting_message_id": (greeting_row or {}).get("id", ""),
         "warnings": warnings,
     })
     return _save_history_job(store, job)
@@ -10342,8 +10401,11 @@ def _model_api_hosted_chat_verified(store) -> bool:
         role = m.get("role")
         if role == "user":
             seen_model_user = True
-        elif role in ("agent", "openclaw") and seen_model_user:
-            return True
+        elif role in ("agent", "openclaw"):
+            if m.get("model_api_kind") == "onboarding_greeting":
+                return True
+            if seen_model_user:
+                return True
     return False
 
 

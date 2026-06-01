@@ -205,16 +205,32 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     assert job["messages_parsed"] == 2
     assert job["memories_created"] >= 2
     assert job["identity_written"] is True
+    assert job["chat_messages_imported"] == 0
+    assert job["onboarding_greeting_written"] is True
 
     mid_validate = client.get("/v1/onboarding/validate", headers=_headers(api_key)).get_json()
     assert mid_validate["route"] == "model_api"
-    assert mid_validate["stage"] == "hosted_chat"
+    assert mid_validate["stage"] == "complete"
+    assert mid_validate["passing"] is True
+
+    pre_chat = client.get("/v1/chat/history?limit=20", headers=_headers(api_key))
+    assert pre_chat.status_code == 200
+    pre_rows = pre_chat.get_json()["messages"]
+    assert len(pre_rows) == 1
+    assert not any(row["source"] == "history_import" for row in pre_rows)
+    assert pre_rows[0]["source"] == "model_api"
+    assert pre_rows[0]["role"] == "openclaw"
+    assert pre_rows[0]["model_api_kind"] == "onboarding_greeting"
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/chat/history":
             return {
                 "messages": [
-                    {"role": "user", "content": "I prefer direct answers.", "source": "history_import"},
+                    {
+                        "role": "openclaw",
+                        "content": "I can answer from the imported history now.",
+                        "source": "model_api",
+                    },
                 ],
                 "context_memories": [
                     {"title": "User preference", "description": "User prefers direct answers."},
@@ -244,6 +260,13 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     history = client.get("/v1/chat/history?limit=20", headers=_headers(api_key))
     assert history.status_code == 200
     rows = history.get_json()["messages"]
+    assert not any(row["source"] == "history_import" for row in rows)
+    assert any(
+        row["source"] == "model_api"
+        and row["role"] == "openclaw"
+        and row.get("model_api_kind") == "onboarding_greeting"
+        for row in rows
+    )
     assert any(row["source"] == "model_api" and row["role"] == "user" for row in rows)
     assert any(row["source"] == "model_api" and row["role"] == "openclaw" for row in rows)
     assert all("body_ct" in row for row in rows if row["source"] == "model_api")
