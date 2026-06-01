@@ -972,6 +972,7 @@ def test_ai_chat_response_suppresses_push_when_app_foreground(tmp_path, monkeypa
 
 def test_chat_history_supports_lightweight_images_and_before_cursor(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(appmod, "CHAT_HISTORY_INLINE_BODY_CT_MAX", 64)
     appmod._stores.clear()
 
     api_key = "test_chat_history_lightweight_key"
@@ -1002,7 +1003,8 @@ def test_chat_history_supports_lightweight_images_and_before_cursor(tmp_path, mo
     for i in range(1, 6):
         _append(i)
     _append(6, content_type="image", body_ct="x" * 4096)
-    for i in range(7, 11):
+    _append(7, body_ct="y" * 128)
+    for i in range(8, 11):
         _append(i)
 
     with appmod.app.test_client() as client:
@@ -1018,6 +1020,10 @@ def test_chat_history_supports_lightweight_images_and_before_cursor(tmp_path, mo
             "/v1/chat/messages/msg_6/body",
             headers={"X-API-Key": api_key},
         )
+        large_text_body = client.get(
+            "/v1/chat/messages/msg_7/body",
+            headers={"X-API-Key": api_key},
+        )
 
     assert latest.status_code == 200
     latest_body = latest.get_json()
@@ -1031,11 +1037,21 @@ def test_chat_history_supports_lightweight_images_and_before_cursor(tmp_path, mo
     ]
     assert latest_body["has_more_older"] is True
     assert latest_body["image_bodies_omitted"] == 1
+    assert latest_body["bodies_omitted"] == 2
+    assert latest_body["body_omit_inline_max"] == 64
     image_row = [m for m in latest_body["messages"] if m["id"] == "msg_6"][0]
     assert image_row["body_omitted"] is True
+    assert image_row["body_omitted_reason"] == "image_body"
     assert image_row["body_ct_len"] == 4096
     assert "body_ct" not in image_row
     assert "K_user" not in image_row
+    large_text_row = [m for m in latest_body["messages"] if m["id"] == "msg_7"][0]
+    assert large_text_row["content_type"] == "text"
+    assert large_text_row["body_omitted"] is True
+    assert large_text_row["body_omitted_reason"] == "large_body_ct"
+    assert large_text_row["body_ct_len"] == 128
+    assert "body_ct" not in large_text_row
+    assert "K_user" not in large_text_row
 
     assert older.status_code == 200
     older_body = older.get_json()
@@ -1047,6 +1063,12 @@ def test_chat_history_supports_lightweight_images_and_before_cursor(tmp_path, mo
     assert full_image["id"] == "msg_6"
     assert full_image["body_ct"] == "x" * 4096
     assert full_image["body_omitted"] is False
+
+    assert large_text_body.status_code == 200
+    full_large_text = large_text_body.get_json()["message"]
+    assert full_large_text["id"] == "msg_7"
+    assert full_large_text["body_ct"] == "y" * 128
+    assert full_large_text["body_omitted"] is False
 
 
 def test_proactive_chat_response_uses_push_to_start_when_start_window_open(tmp_path, monkeypatch):

@@ -59,6 +59,7 @@ ACCESS_MODE_LABELS = {
     "official_import": "Official App Chat",
 }
 ACCESS_LINK_TOKEN_TTL_SEC = int(os.environ.get("FEEDLING_ACCESS_LINK_TOKEN_TTL_SEC", "900"))
+CHAT_HISTORY_INLINE_BODY_CT_MAX = int(os.environ.get("FEEDLING_CHAT_HISTORY_INLINE_BODY_CT_MAX", "262144"))
 _ACCESS_MODE_ALIASES = {
     "server": "resident",
     "resident_agent": "resident",
@@ -7792,7 +7793,12 @@ def chat_history():
         page_mode = "latest"
 
     out = [_chat_history_item(m, include_image_body=include_image_body) for m in msgs]
-    omitted_image_bodies = sum(1 for m in out if m.get("body_omitted"))
+    omitted_bodies = sum(1 for m in out if m.get("body_omitted"))
+    omitted_image_bodies = sum(
+        1
+        for m in out
+        if m.get("body_omitted") and m.get("content_type", "text") == "image"
+    )
     oldest_ts = float(out[0].get("ts", 0)) if out else 0
     latest_ts = float(out[-1].get("ts", 0)) if out else 0
 
@@ -7800,7 +7806,8 @@ def chat_history():
     print(
         f"[chat/history:{store.user_id}] ip={request.remote_addr} mode={page_mode} "
         f"since={since} before={before} limit={limit} returned={len(out)} total={total} "
-        f"include_image_body={include_image_body} omitted_images={omitted_image_bodies} ua={ua[:80]}"
+        f"include_image_body={include_image_body} omitted_bodies={omitted_bodies} "
+        f"omitted_images={omitted_image_bodies} ua={ua[:80]}"
     )
 
     return jsonify({
@@ -7810,7 +7817,9 @@ def chat_history():
         "latest_ts": latest_ts,
         "has_more_older": has_more_older,
         "has_more_newer": has_more_newer,
+        "bodies_omitted": omitted_bodies,
         "image_bodies_omitted": omitted_image_bodies,
+        "body_omit_inline_max": CHAT_HISTORY_INLINE_BODY_CT_MAX,
     })
 
 
@@ -7822,14 +7831,27 @@ def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
     # can populate content later.
     item.setdefault("content", "")
 
-    if item.get("content_type", "text") == "image":
-        item["body_ct_len"] = len(item.get("body_ct") or "")
-        if not include_image_body:
-            item["body_omitted"] = True
-            for key in ("body_ct", "nonce", "K_user", "K_enclave"):
-                item.pop(key, None)
-        else:
-            item["body_omitted"] = False
+    content_type = item.get("content_type", "text")
+    body_ct = item.get("body_ct") or ""
+    body_ct_len = len(body_ct)
+    should_omit_body = False
+    body_omitted_reason = ""
+    if content_type == "image" and not include_image_body:
+        should_omit_body = True
+        body_omitted_reason = "image_body"
+    elif body_ct_len > CHAT_HISTORY_INLINE_BODY_CT_MAX and not include_image_body:
+        should_omit_body = True
+        body_omitted_reason = "large_body_ct"
+
+    if should_omit_body:
+        item["body_ct_len"] = body_ct_len
+        item["body_omitted"] = True
+        item["body_omitted_reason"] = body_omitted_reason
+        for key in ("body_ct", "nonce", "K_user", "K_enclave"):
+            item.pop(key, None)
+    elif content_type == "image" or body_ct_len > CHAT_HISTORY_INLINE_BODY_CT_MAX:
+        item["body_ct_len"] = body_ct_len
+        item["body_omitted"] = False
 
     role = item.get("role")
     if role == "openclaw":
