@@ -225,7 +225,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
-          SHA_SHORT=$(git rev-parse --short HEAD)
+          SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
           IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
           echo "waiting for ${IMAGE}:$SHA_SHORT"
@@ -245,6 +245,8 @@ jobs:
         env:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
+          TRIGGER_SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+
           # Sync to latest main FIRST. Rerun case (e.g. a previous deploy-
           # cvm partially failed after the prior run already pushed the
           # "deploy: bump CVM image to :<sha>" commit): without this, the
@@ -257,18 +259,17 @@ jobs:
           git fetch origin main
           git reset --hard origin/main
 
-          SHA_SHORT=$(git rev-parse --short HEAD)
           IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
-          sed -i -E "s|ghcr\.io/[^/]+/feedling:[a-f0-9]+|${IMAGE}:${SHA_SHORT}|g" \
+          sed -i -E "s|ghcr\.io/[^/]+/feedling:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
             deploy/docker-compose.phala.yaml
           if git diff --quiet -- deploy/docker-compose.phala.yaml; then
-            echo "tag already pinned to :$SHA_SHORT — no-op bump"
+            echo "tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
           else
             git config user.name  'feedling-ci'
             git config user.email 'ci@feedling.app'
             git add deploy/docker-compose.phala.yaml
-            git commit -m "deploy: bump CVM image to :$SHA_SHORT [skip ci]"
+            git commit -m "deploy: bump CVM image to :$TRIGGER_SHA_SHORT [skip ci]"
             git push origin HEAD:main
           fi
 
@@ -343,4 +344,16 @@ jobs:
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install pyyaml
-          ./deploy/publish-compose-hash.sh eth_sepolia
+          publish_status=1
+          for attempt in 1 2 3; do
+            if ./deploy/publish-compose-hash.sh eth_sepolia; then
+              publish_status=0
+              break
+            fi
+            publish_status=$?
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::compose_hash publish failed with exit $publish_status; retrying in 20s"
+              sleep 20
+            fi
+          done
+          exit "$publish_status"
