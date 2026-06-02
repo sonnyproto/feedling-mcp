@@ -138,24 +138,13 @@ services:
   # TLS-terminated route `wss://<app-id>-9998.dstack-pha-prod9...` —
   # frames are app-layer encrypted (FrameEnvelope v1) so gateway TLS
   # is sufficient for transport hygiene.
-  # --- One-shot data migration: legacy /data files → PostgreSQL. ---
-  # Runs once before backend starts, importing the old file-based user data
-  # (still on the feedling_backend_data volume) into the external Postgres.
-  # Idempotent + marker-guarded: after the first successful run it records
-  # server_config.migration_done, and every later boot (e.g. CVM reboot)
-  # no-ops instead of re-importing stale files over data users have since
-  # written to Postgres. Safe to leave here permanently; safe to remove in a
-  # later deploy once the migration is confirmed (removal re-changes
-  # compose_hash → one more attest/consent). Image tag is kept in lockstep
-  # with backend/mcp by the CI sed bump.
-  migrate:
-    image: ghcr.io/teleport-computer/feedling:bc2d630
-    command: ["python", "backend/migrate_to_pg.py", "--data-dir", "/data"]
-    restart: "no"
-    environment:
-      DATABASE_URL: "${DATABASE_URL:-}"
-    volumes:
-      - feedling_backend_data:/data
+  # NOTE: the one-shot `migrate` service was removed after the file→Postgres
+  # migration completed (server_config.migration_done is set on the RDS, all
+  # users/data are present). It is intentionally NOT here because a `restart:no`
+  # container that exits can leave dstack's stack status stuck in updating/
+  # starting. To re-run a migration in future, run migrate_to_pg.py manually
+  # (e.g. via a temporary one-shot deploy) — the marker makes it a safe no-op
+  # unless invoked with --force.
 
   backend:
     image: ghcr.io/teleport-computer/feedling:bc2d630
@@ -203,10 +192,6 @@ services:
     depends_on:
       enclave:
         condition: service_healthy
-      # Block backend startup until the one-shot migration has imported the
-      # legacy /data files into Postgres (no-ops on subsequent boots).
-      migrate:
-        condition: service_completed_successfully
 
   # --- MCP SSE server (plain HTTP behind ingress). ---
   # TLS termination moved to the ingress service; MCP speaks HTTP only.

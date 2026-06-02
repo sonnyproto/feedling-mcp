@@ -92,6 +92,21 @@
 - 线上 RDS 8 张表已建好（init_schema 幂等，启动自动建）；唯一需要的 GitHub
   secret `DATABASE_URL` 已配置。
 
+### [DONE] 迁移已完成 + 移除 migrate service（修 starting）
+
+- **迁移事实上已完成**：线上含 migrate service 的版本部署后，`migrate` 在
+  2026-06-02 03:42 UTC 跑完，把老数据导入 RDS 并置 `migration_done` 标记。RDS
+  现有 107+ 用户、chat 时间跨 2026-04-21~至今、且在实时增长（backend 正常服务）。
+- **CVM starting 的成因 + 处理**：部署期间 CVM 一度长时间停在 `updating/starting`
+  （一次性 `restart:no` 容器退出 + `depends_on: service_completed_successfully`
+  在 dstack-dev-0.5.8 下的表现），最终自行恢复 `running`。为避免复发，已从
+  `docker-compose.phala.yaml` **移除 `migrate` service 及 backend 的
+  `depends_on: migrate`**——迁移已完成、`migration_done` 标记已在，不再需要它。
+- 安全性：`migration_done` 已设 → 即便将来再跑 migrate 也永久 no-op（除非
+  `--force`），不会覆盖 RDS 现有数据。
+- 后续如需再迁移：手动运行 `migrate_to_pg.py`（marker 会让它 no-op，需要时加
+  `--force`），不再走常驻 compose service。
+
 ---
 
 ## 2026-06-01
