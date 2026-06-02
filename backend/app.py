@@ -5481,7 +5481,6 @@ def _relationship_start_from_import(payload: dict, messages: list[dict]) -> tupl
         parsed = _parse_iso_calendar_date(raw)
         if parsed:
             return parsed, ""
-        return None, "relationship_started_at must be YYYY-MM-DD or ISO datetime"
 
     dated: list[date] = []
     for msg in messages:
@@ -5493,7 +5492,7 @@ def _relationship_start_from_import(payload: dict, messages: list[dict]) -> tupl
             pass
     if dated:
         return min(dated), ""
-    if bool(payload.get("fresh_start")):
+    if bool(payload.get("fresh_start")) or raw:
         return date.today(), ""
     return None, "relationship_started_at required when transcript has no timestamps; or pass fresh_start=true"
 
@@ -5521,34 +5520,146 @@ def _english_only_for_zh(text: str) -> bool:
     return bool(re.search(r"[A-Za-z]{4,}", raw)) and not re.search(r"[\u4e00-\u9fff]", raw)
 
 
-def _transcript_sample(messages: list[dict], max_chars: int = 18000) -> str:
-    parts: list[str] = []
-    total = 0
-    for msg in messages:
-        source = str(msg.get("source") or "")
-        if source == "character_import":
-            role = "Character card"
-        elif source == "persona_import":
-            role = "Personal profile"
-        elif source == "fresh_start":
-            role = "Fresh start"
-        else:
-            role = "User" if msg.get("role") == "user" else "Assistant"
+_IMPORT_SUPPORT_SOURCES = {"character_import", "persona_import", "fresh_start"}
+
+
+def _format_import_message_line(msg: dict) -> str:
+    source = str(msg.get("source") or "")
+    if source == "character_import":
+        role = "Character card"
+    elif source == "persona_import":
+        role = "Personal profile"
+    elif source == "fresh_start":
+        role = "Fresh start"
+    else:
+        role = "User" if msg.get("role") == "user" else "Assistant"
+    at = ""
+    try:
+        if msg.get("ts"):
+            at = datetime.fromtimestamp(float(msg["ts"])).isoformat(timespec="seconds") + " "
+    except Exception:
         at = ""
-        try:
-            if msg.get("ts"):
-                at = datetime.fromtimestamp(float(msg["ts"])).isoformat(timespec="seconds") + " "
-        except Exception:
-            at = ""
-        text = str(msg.get("content") or "").strip()
-        if not text:
+    text = str(msg.get("content") or "").strip()
+    if not text:
+        return ""
+    return f"{at}{role}: {text}"
+
+
+def _append_import_lines(lines: list[str], out: list[str], budget: int, *, reverse: bool = False) -> int:
+    total = sum(len(line) + 1 for line in out)
+    iterable = reversed(lines) if reverse else lines
+    staged: list[str] = []
+    for line in iterable:
+        if not line:
             continue
-        line = f"{at}{role}: {text}"
-        if total + len(line) > max_chars:
+        if total + len(line) + 1 > budget:
             break
-        parts.append(line)
+        staged.append(line)
         total += len(line) + 1
-    return "\n".join(parts)
+    if reverse:
+        staged.reverse()
+    out.extend(staged)
+    return total
+
+
+def _sequential_transcript_sample(messages: list[dict], max_chars: int) -> str:
+    lines = [_format_import_message_line(msg) for msg in messages]
+    out: list[str] = []
+    _append_import_lines(lines, out, max_chars)
+    return "\n".join(out)
+
+
+def _stratified_history_sample(messages: list[dict], max_chars: int) -> str:
+    lines = [_format_import_message_line(msg) for msg in messages]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    full = "\n".join(lines)
+    if len(full) <= max_chars:
+        return full
+
+    sections: list[tuple[str, list[str], bool]] = [
+        ("[Earliest history]", lines, False),
+        ("[Middle history]", lines[len(lines) // 2:], False),
+        ("[Latest history]", lines, True),
+    ]
+    per_section = max(1200, max_chars // 3)
+    out_sections: list[str] = []
+    seen: set[str] = set()
+    for title, section_lines, reverse in sections:
+        picked: list[str] = []
+        _append_import_lines(section_lines, picked, per_section, reverse=reverse)
+        picked = [line for line in picked if line not in seen]
+        seen.update(picked)
+        if picked:
+            out_sections.append(title + "\n" + "\n".join(picked))
+    text = "\n\n".join(out_sections)
+    return text[:max_chars].strip()
+
+
+def _transcript_sample(messages: list[dict], max_chars: int = 18000) -> str:
+    support = [m for m in messages if str(m.get("source") or "") in _IMPORT_SUPPORT_SOURCES]
+    history = [m for m in messages if str(m.get("source") or "") not in _IMPORT_SUPPORT_SOURCES]
+    full = "\n".join(_format_import_message_line(m) for m in messages if _format_import_message_line(m))
+    if len(full) <= max_chars:
+        return full
+
+    parts: list[str] = []
+    support_budget = min(5000, max(1200, max_chars // 4))
+    support_text = _sequential_transcript_sample(support, support_budget)
+    if support_text:
+        parts.append("[Onboarding support material]\n" + support_text)
+    history_budget = max(2000, max_chars - sum(len(p) + 2 for p in parts))
+    history_text = _stratified_history_sample(history, history_budget)
+    if history_text:
+        parts.append(history_text)
+    return "\n\n".join(parts)[:max_chars].strip()
+
+
+def _transcript_extraction_windows(
+    messages: list[dict],
+    *,
+    max_chars: int = 18000,
+    max_windows: int = 8,
+) -> list[str]:
+    support = [m for m in messages if str(m.get("source") or "") in _IMPORT_SUPPORT_SOURCES]
+    history = [m for m in messages if str(m.get("source") or "") not in _IMPORT_SUPPORT_SOURCES]
+    support_text = _sequential_transcript_sample(support, min(4500, max_chars // 4))
+    history_lines = [_format_import_message_line(m) for m in history]
+    history_lines = [line for line in history_lines if line]
+
+    if not history_lines:
+        only = _transcript_sample(support, max_chars=max_chars)
+        return [only] if only else []
+
+    prefix = ("[Onboarding support material]\n" + support_text + "\n\n") if support_text else ""
+    line_budget = max(4000, max_chars - len(prefix) - 80)
+    chunks: list[str] = []
+    current: list[str] = []
+    total = 0
+    for line in history_lines:
+        if current and total + len(line) + 1 > line_budget:
+            chunks.append("\n".join(current))
+            current = []
+            total = 0
+        current.append(line)
+        total += len(line) + 1
+    if current:
+        chunks.append("\n".join(current))
+
+    if len(chunks) > max_windows:
+        keep: list[int] = []
+        for i in range(max_windows):
+            keep.append(round(i * (len(chunks) - 1) / max(max_windows - 1, 1)))
+        chunks = [chunks[i] for i in sorted(set(keep))]
+
+    windows: list[str] = []
+    total_windows = len(chunks)
+    for idx, chunk in enumerate(chunks, start=1):
+        windows.append(
+            f"{prefix}[Chat history window {idx}/{total_windows}]\n{chunk}".strip()
+        )
+    return windows
 
 
 def _json_from_model_text(text: str):
@@ -5569,6 +5680,41 @@ def _json_from_model_text(text: str):
         except Exception:
             continue
     raise ValueError("no json object found")
+
+
+_GENERIC_IMPORT_TITLE_RE = re.compile(
+    r"^(?:导入(?:片段|原话|的个人细节|的事件)|imported\s+(?:exchange|quote|user detail|event|fragment|segment))\s*\d*$",
+    re.IGNORECASE,
+)
+_LOW_VALUE_IMPORT_PATTERNS = [
+    re.compile(r"请(?:你)?(?:为我)?介绍一下(?:什么是|.+?是什么)"),
+    re.compile(r"(?:什么是|有哪些|可以从哪些方面|如何更好地).*?(?:矿泉水|水源|黄山|北纬30)"),
+    re.compile(r"^(?:继续|还有吗|再举例一些|[0-9]+)$"),
+    re.compile(r"i'?m sorry,?\s+i don'?t understand", re.IGNORECASE),
+]
+
+
+def _normalize_card_similarity_text(text: str) -> str:
+    raw = re.sub(r"\s+", "", str(text or "").lower())
+    raw = re.sub(r"[，。！？、,.!?;:：；\"'“”‘’（）()\[\]{}<>《》]", "", raw)
+    return raw[:260]
+
+
+def _looks_like_low_value_import_card(title: str, desc: str, mem_type: str) -> bool:
+    clean_title = str(title or "").strip()
+    clean_desc = str(desc or "").strip()
+    joined = clean_title + "\n" + clean_desc
+    if _GENERIC_IMPORT_TITLE_RE.match(clean_title):
+        return True
+    if len(clean_desc) < 8:
+        return True
+    if any(p.search(joined) for p in _LOW_VALUE_IMPORT_PATTERNS):
+        return True
+    if mem_type in {"fact", "event"}:
+        normalized = _normalize_card_similarity_text(clean_desc)
+        if len(normalized) < 12:
+            return True
+    return False
 
 
 def _coerce_memory_cards(raw, relationship_start: date) -> list[dict]:
@@ -5593,6 +5739,8 @@ def _coerce_memory_cards(raw, relationship_start: date) -> list[dict]:
             continue
         if not title:
             title = desc[:72]
+        if _looks_like_low_value_import_card(title, desc, mem_type):
+            continue
         quote = str(item.get("her_quote") or item.get("quote") or "").strip()
         context = str(item.get("context") or "").strip()
         if any(_looks_like_import_artifact(value) for value in (title, desc, quote, context) if value):
@@ -5617,17 +5765,40 @@ def _coerce_memory_cards(raw, relationship_start: date) -> list[dict]:
 def _dedupe_memory_cards(cards: list[dict]) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
+    seen_text: set[str] = set()
     for card in cards:
+        title = str(card.get("title") or "")
+        desc = str(card.get("description") or "")
+        mem_type = str(card.get("type") or "")
+        if _looks_like_low_value_import_card(title, desc, mem_type):
+            continue
         key = re.sub(
             r"\s+",
             " ",
-            (str(card.get("type") or "") + "|" + str(card.get("title") or "") + "|" + str(card.get("description") or "")[:160]).lower(),
+            (mem_type + "|" + title + "|" + desc[:160]).lower(),
         )
         if key in seen:
             continue
+        norm = _normalize_card_similarity_text(desc)
+        if norm:
+            if any(norm == prev or norm[:80] == prev[:80] or norm in prev or prev in norm for prev in seen_text):
+                continue
+            seen_text.add(norm)
         seen.add(key)
         out.append(card)
     return out
+
+
+def _natural_import_title(content: str, mem_type: str, language: str) -> str:
+    clean = re.sub(r"\s+", " ", str(content or "")).strip()
+    clean = re.sub(r"^(User|Assistant|用户|助手|AI|TA)[:：]\s*", "", clean)
+    if not clean:
+        return "新的记忆" if str(language).startswith("zh") else "New memory"
+    if str(language).startswith("zh"):
+        compact = re.sub(r"[。！？].*$", "", clean)
+        return compact[:24] or "导入的真实片段"
+    words = clean.split()
+    return " ".join(words[:8])[:72] or "Imported memory"
 
 
 def _fallback_memory_cards(
@@ -5657,10 +5828,7 @@ def _fallback_memory_cards(
         msg = usable[idx % len(usable)]
         content = str(msg.get("content") or "").strip()
         mem_type = story_types[idx % len(story_types)]
-        if str(language).startswith("zh"):
-            title = ("导入片段" if mem_type == "moment" else "导入原话") + f" {idx + 1}"
-        else:
-            title = ("Imported exchange" if mem_type == "moment" else "Imported quote") + f" {idx + 1}"
+        title = _natural_import_title(content, mem_type, language)
         cards.append({
             "type": mem_type,
             "title": title,
@@ -5676,10 +5844,7 @@ def _fallback_memory_cards(
         msg = usable[idx % len(usable)]
         content = str(msg.get("content") or "").strip()
         mem_type = about_types[idx % len(about_types)]
-        if str(language).startswith("zh"):
-            title = ("导入的个人细节" if mem_type == "fact" else "导入的事件") + f" {idx + 1}"
-        else:
-            title = ("Imported user detail" if mem_type == "fact" else "Imported event") + f" {idx + 1}"
+        title = _natural_import_title(content, mem_type, language)
         cards.append({
             "type": mem_type,
             "title": title,
@@ -5691,47 +5856,85 @@ def _fallback_memory_cards(
     return cards
 
 
+def _import_memory_targets(floors: dict, history_messages: list[dict], support_messages: list[dict]) -> dict:
+    history_count = len(history_messages)
+    support_count = len(support_messages)
+    if history_count <= 0:
+        story = 1 if support_count else max(1, int(floors.get("story", 1)))
+        about = 2 if support_count else max(1, int(floors.get("about_me", 1)))
+    elif history_count < 20:
+        story, about = 2, 4
+    elif history_count < 80:
+        story, about = 4, 8
+    elif history_count < 250:
+        story, about = 6, 14
+    elif history_count < 800:
+        story, about = 10, 24
+    else:
+        story, about = 12, 30
+
+    if support_count:
+        about += min(4, support_count * 2)
+    return {
+        "story": max(1, story),
+        "about_me": max(1, about),
+        "ta_thinking": 0,
+        "total": max(2, story + about),
+    }
+
+
 def _extract_memory_cards_with_provider(
     provider: ProviderConfig,
     messages: list[dict],
     relationship_start: date,
-    floors: dict,
+    targets: dict,
     language: str = "en",
 ) -> tuple[list[dict], list[str]]:
     warnings: list[str] = []
-    target_total = int(floors.get("story", 1)) + int(floors.get("about_me", 1))
-    sample = _transcript_sample(messages, max_chars=22000)
-    if not sample:
+    target_total = int(targets.get("story", 1)) + int(targets.get("about_me", 1))
+    windows = _transcript_extraction_windows(messages, max_chars=18000, max_windows=8)
+    if not windows:
         return [], ["empty_transcript_sample"]
-    prompt = (
-        "Extract Memory Garden cards from this transcript. Return JSON only in this shape: "
-        "{\"memories\":[{\"type\":\"moment|quote|fact|event\",\"title\":\"...\","
-        "\"description\":\"...\",\"her_quote\":\"optional user quote\","
-        "\"occurred_at\":\"YYYY-MM-DD\"}]}. "
-        f"Need at least {floors.get('story', 1)} story cards (moment/quote) and "
-        f"{floors.get('about_me', 1)} about_me cards (fact/event), up to {max(target_total + 6, 8)} total. "
-        "Use concrete details only; do not invent beyond the transcript. "
-        "Do not copy raw JSON, file delimiters, upload wrappers, or internal field names. "
-        f"{_language_instruction(language)} "
-        f"If dates are unclear, use {relationship_start.isoformat()}."
-        "\n\nTranscript:\n" + sample
-    )
-    try:
-        result = chat_completion(
-            provider,
-            [
-                {"role": "system", "content": "You are a strict JSON extraction engine for Feedling Memory Garden."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=2600,
-            temperature=0.1,
-            timeout=45.0,
+    if len(windows) > 1:
+        warnings.append(f"history_import_windows:{len(windows)}")
+
+    all_cards: list[dict] = []
+    per_window_target = max(3, min(8, (target_total + len(windows) - 1) // len(windows) + 2))
+    for idx, sample in enumerate(windows, start=1):
+        prompt = (
+            "Extract high-signal Feedling Memory Garden cards from this onboarding material window. "
+            "Large imports are processed across multiple timeline windows, so use this window's durable details "
+            "without assuming it is the whole relationship. Return JSON only in this shape: "
+            "{\"memories\":[{\"type\":\"moment|quote|fact|event\",\"title\":\"...\","
+            "\"description\":\"...\",\"her_quote\":\"optional exact user quote\","
+            "\"occurred_at\":\"YYYY-MM-DD\"}]}. "
+            f"Window {idx}/{len(windows)}. Return up to {per_window_target} cards from this window, fewer or zero if the material is repetitive, generic, or not personal. "
+            "moment/quote cards belong to Story and must be specific lived exchanges or exact user wording. "
+            "fact/event cards belong to About me and must be durable user preferences, relationships, habits, projects, dates, or boundaries. "
+            "Do not save generic encyclopedia Q&A, product-copy drafts, assistant filler, empty commands, raw JSON, file delimiters, upload wrappers, or internal field names. "
+            "Do not write one card per message; merge repeated content into one stronger card. "
+            "Use natural, specific titles. Never use titles like Imported exchange, Imported quote, 导入片段, 导入原话, 导入的个人细节, or 导入的事件. "
+            "Character card material describes the AI companion; personal profile material describes the user. Do not confuse the two. "
+            f"{_language_instruction(language)} "
+            f"If dates are unclear, use {relationship_start.isoformat()}."
+            "\n\nMaterial window:\n" + sample
         )
-        parsed = _json_from_model_text(result["reply"])
-        return _dedupe_memory_cards(_coerce_memory_cards(parsed, relationship_start)), warnings
-    except Exception as e:
-        warnings.append(f"provider_memory_extraction_failed:{type(e).__name__}:{str(e)[:160]}")
-        return [], warnings
+        try:
+            result = chat_completion(
+                provider,
+                [
+                    {"role": "system", "content": "You are a strict JSON extraction engine for Feedling Memory Garden."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=1800,
+                temperature=0.1,
+                timeout=45.0,
+            )
+            parsed = _json_from_model_text(result["reply"])
+            all_cards.extend(_coerce_memory_cards(parsed, relationship_start))
+        except Exception as e:
+            warnings.append(f"provider_memory_extraction_failed_window_{idx}:{type(e).__name__}:{str(e)[:160]}")
+    return _dedupe_memory_cards(all_cards), warnings
 
 
 def _memory_counts_for_cards(cards: list[dict]) -> dict:
@@ -6088,6 +6291,7 @@ def _process_history_import_sync(
         raise ValueError(rel_err)
     days = max(0, (date.today() - relationship_start).days)
     floors = _per_tab_floors_for_days(days)
+    import_targets = _import_memory_targets(floors, history_messages, support_messages)
     language = _detect_import_language(analysis_messages)
 
     _update_history_job_phase(store, job, "chat_history_importing", **{
@@ -6101,6 +6305,7 @@ def _process_history_import_sync(
         "relationship_started_at": relationship_start.isoformat(),
         "relationship_days": days,
         "floors": floors,
+        "import_targets": import_targets,
     })
 
     _update_history_job_phase(store, job, "memory_extracting")
@@ -6108,11 +6313,11 @@ def _process_history_import_sync(
         runtime,
         analysis_messages,
         relationship_start,
-        floors,
+        import_targets,
         language,
     )
     warnings.extend(provider_warnings)
-    cards = _ensure_import_memory_floors(provider_cards, fallback_messages, relationship_start, floors, language)
+    cards = _ensure_import_memory_floors(provider_cards, fallback_messages, relationship_start, import_targets, language)
 
     _update_history_job_phase(
         store,
@@ -8417,8 +8622,21 @@ def _parse_iso_calendar_date(value: str) -> date | None:
     raw = (value or "").strip()
     if not raw:
         return None
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 8:
+        try:
+            return date(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+        except Exception:
+            pass
+    m = re.match(r"^\s*(\d{4})\D+(\d{1,2})\D+(\d{1,2})(?:\D|$)", raw)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except Exception:
+            pass
     try:
-        norm = raw.replace("Z", "+00:00")
+        norm = raw.replace("年", "-").replace("月", "-").replace("日", "")
+        norm = norm.replace("/", "-").replace(".", "-").replace("Z", "+00:00")
         if "T" not in norm:
             norm = norm + "T00:00:00"
         return datetime.fromisoformat(norm).date()
@@ -10674,7 +10892,6 @@ def _latest_history_import_job(store: UserStore) -> dict | None:
 
 def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
     bootstrap_st = _bootstrap_state(store)
-    memory_ok = not bootstrap_st["missing_tabs"]
     identity = _load_identity(store)
     identity_written = identity is not None
     relationship_anchored = bool(identity and identity.get("relationship_started_at"))
@@ -10683,6 +10900,8 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
     config = _load_model_api_config(store)
     latest_job = _latest_history_import_job(store)
     history_ok = bool(latest_job and latest_job.get("status") == "completed")
+    counts = bootstrap_st["counts"]
+    memory_ok = history_ok and counts.get("story", 0) >= 1 and counts.get("about_me", 0) >= 1
     hosted_chat_ok = _model_api_hosted_chat_verified(store)
 
     steps = [
@@ -10725,7 +10944,7 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
             "counts": bootstrap_st["counts"],
             "floors": bootstrap_st["floors"],
             "missing_tabs": bootstrap_st["missing_tabs"],
-            "required": _gate_required_for_missing_tabs(bootstrap_st) if not memory_ok else "",
+            "required": "History import must write at least one Story card and one About-me card." if not memory_ok else "",
         },
         {
             "id": "identity_card",

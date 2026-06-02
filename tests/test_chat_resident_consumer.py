@@ -684,6 +684,21 @@ def test_extract_cli_output_reads_openai_style_json():
     assert crc._extract_text_from_cli_output(raw) == "structured reply"
 
 
+def test_extract_cli_output_reads_claude_code_json_result():
+    raw = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "session_id": "123e4567-e89b-12d3-a456-426614174000",
+            "result": "在，我接上了。",
+        },
+        ensure_ascii=False,
+    )
+
+    assert crc._extract_text_from_cli_output(raw) == "在，我接上了。"
+    assert crc._extract_session_id(raw) == "123e4567-e89b-12d3-a456-426614174000"
+
+
 def test_extract_cli_output_strips_resumed_session_banner():
     raw = """↻ Resumed session
 20260522_222908_60d12e (1 user message, 2 total messages)
@@ -822,6 +837,43 @@ def test_prepare_hermes_cli_first_turn_removes_continue(monkeypatch):
 
     assert "--continue" not in cmd
     assert "--resume" not in cmd
+
+
+def test_prepare_claude_cli_first_turn_forces_print_json_and_strips_continue(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        'claude --continue "{message}"',
+    )
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("hello")
+
+    assert "--continue" not in cmd
+    assert "--resume" not in cmd
+    assert "--print" in cmd
+    assert "--output-format" in cmd
+    assert "json" in cmd
+    assert "hello" in cmd
+
+
+def test_prepare_claude_cli_injects_stored_resume(monkeypatch):
+    sid = "123e4567-e89b-12d3-a456-426614174000"
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        'claude -p "{message}"',
+    )
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: sid)
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("hello")
+
+    assert cmd[:3] == ["claude", "--resume", sid]
+    assert "--output-format" in cmd
+    assert "json" in cmd
+    assert "hello" in cmd
 
 
 def test_warn_if_hermes_cli_may_drift_logs_profile_and_turns(monkeypatch, caplog):
@@ -1041,6 +1093,31 @@ def test_normalize_agent_replies_supports_multiple_messages_with_cap(monkeypatch
     raw = '{"messages":["第一条","第二条","第三条","第四条","第五条","第六条"]}'
 
     assert crc._normalize_agent_replies(raw) == ["第一条", "第二条", "第三条", "第四条", "第五条"]
+
+
+def test_normalize_agent_replies_extracts_content_field():
+    raw = '{"content":"正常应该只显示 content 里的文字。","content_type":"text"}'
+
+    assert crc._normalize_agent_replies(raw) == ["正常应该只显示 content 里的文字。"]
+
+
+def test_normalize_agent_replies_unwraps_claude_result_content_json():
+    raw = json.dumps(
+        {
+            "type": "result",
+            "session_id": "123e4567-e89b-12d3-a456-426614174000",
+            "result": json.dumps(
+                {
+                    "content": "Claude Code 内层 JSON 也应该只显示这句。",
+                    "content_type": "text",
+                },
+                ensure_ascii=False,
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+    assert crc._normalize_agent_replies(raw) == ["Claude Code 内层 JSON 也应该只显示这句。"]
 
 
 def test_extract_cli_output_preserves_structured_multi_messages():

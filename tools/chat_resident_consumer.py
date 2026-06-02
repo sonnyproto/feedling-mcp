@@ -1021,6 +1021,7 @@ def _strip_reasoning_sections(raw: str) -> str:
 _JSON_REPLY_FIELDS = (
     "reply",
     "response",
+    "result",
     "content",
     "text",
     "message",
@@ -1377,6 +1378,10 @@ def _is_hermes_chat_cmd(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "hermes" and "chat" in cmd[1:]
 
 
+def _is_claude_code_cmd(cmd: list[str]) -> bool:
+    return bool(cmd) and Path(cmd[0]).name == "claude"
+
+
 def _cli_flag_value(cmd: list[str], flag: str) -> str:
     try:
         idx = cmd.index(flag)
@@ -1497,8 +1502,31 @@ def _strip_cli_option_value(cmd: list[str], flags: set[str]) -> tuple[list[str],
     return out, removed
 
 
-def _has_hermes_resume(cmd: list[str]) -> bool:
+def _strip_cli_flags(cmd: list[str], flags: set[str]) -> tuple[list[str], bool]:
+    out: list[str] = []
+    removed = False
+    for token in cmd:
+        if token in flags:
+            removed = True
+            continue
+        out.append(token)
+    return out, removed
+
+
+def _has_cli_resume(cmd: list[str]) -> bool:
     return "--resume" in cmd or "-r" in cmd
+
+
+def _has_claude_session_id(cmd: list[str]) -> bool:
+    return "--session-id" in cmd
+
+
+def _has_claude_print(cmd: list[str]) -> bool:
+    return "--print" in cmd or "-p" in cmd
+
+
+def _has_claude_output_format(cmd: list[str]) -> bool:
+    return "--output-format" in cmd
 
 
 def _render_cli_template(message: str, sid: str, image_paths: list[str] | None = None) -> list[str]:
@@ -1547,7 +1575,20 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
                 "removed Hermes --output-mode from AGENT_CLI_CMD; this Hermes "
                 "chat CLI does not support that flag in current deployments"
             )
-        if sid and not _has_hermes_resume(cmd):
+        if sid and not _has_cli_resume(cmd):
+            cmd = [cmd[0], "--resume", sid, *cmd[1:]]
+    elif _is_claude_code_cmd(cmd):
+        cmd, removed_continue = _strip_cli_flags(cmd, {"--continue", "-c"})
+        if removed_continue:
+            log.warning(
+                "removed Claude Code --continue from AGENT_CLI_CMD; resident "
+                "continuity uses stored session_id plus --resume"
+            )
+        if not _has_claude_print(cmd):
+            cmd = [cmd[0], "--print", *cmd[1:]]
+        if not _has_claude_output_format(cmd):
+            cmd = [cmd[0], "--output-format", "json", *cmd[1:]]
+        if sid and not _has_cli_resume(cmd) and not _has_claude_session_id(cmd):
             cmd = [cmd[0], "--resume", sid, *cmd[1:]]
 
     return _resolve_cli_executable(cmd)
@@ -1664,16 +1705,23 @@ def _normalize_agent_output(raw_reply: Any, max_items: int | None = None) -> tup
         return [], []
 
     items: list[Any] | None = None
-    if isinstance(obj, dict) and isinstance(obj.get("messages"), list):
-        items = obj["messages"]
+    if isinstance(obj, dict):
         raw_actions = obj.get("actions")
         if isinstance(raw_actions, list):
             actions = [a for a in raw_actions if isinstance(a, dict)]
-    elif isinstance(obj, dict) and isinstance(obj.get("reply"), str):
-        items = [obj["reply"]]
-        raw_actions = obj.get("actions")
-        if isinstance(raw_actions, list):
-            actions = [a for a in raw_actions if isinstance(a, dict)]
+        if isinstance(obj.get("messages"), list):
+            items = obj["messages"]
+        else:
+            text = _reply_from_json_obj(obj)
+            nested = _structured_reply_payload(text) if isinstance(text, str) else None
+            if isinstance(nested, (dict, list)):
+                nested_actions, nested_replies = _normalize_agent_output(
+                    nested,
+                    max_items=max_items,
+                )
+                return actions + nested_actions, nested_replies
+            if text:
+                items = [text]
     elif isinstance(obj, list):
         items = obj
     if items is not None:

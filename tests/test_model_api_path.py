@@ -193,6 +193,27 @@ def test_model_api_setup_can_reuse_saved_key_when_model_changes(client, monkeypa
     assert calls[-1] == ("openai", "gpt-4.1", "sk-existing", "https://api.openai.com/v1")
 
 
+def test_history_import_relationship_date_accepts_flexible_user_input():
+    assert appmod._parse_iso_calendar_date("20260602") == appmod.date(2026, 6, 2)
+    assert appmod._parse_iso_calendar_date("2026/06/02") == appmod.date(2026, 6, 2)
+    assert appmod._parse_iso_calendar_date("2026年6月2日") == appmod.date(2026, 6, 2)
+    assert appmod._parse_iso_calendar_date("2026-02-31") is None
+
+    parsed, err = appmod._relationship_start_from_import(
+        {"relationship_started_at": "20260602"},
+        [],
+    )
+    assert parsed == appmod.date(2026, 6, 2)
+    assert err == ""
+
+    fallback, err = appmod._relationship_start_from_import(
+        {"relationship_started_at": "not a date"},
+        [],
+    )
+    assert fallback == appmod.date.today()
+    assert err == ""
+
+
 def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypatch):
     user_id, api_key = _register(client)
 
@@ -209,7 +230,7 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "Extract Memory Garden" in joined:
+        if "Memory Garden" in joined:
             return {
                 "reply": (
                     '{"memories":['
@@ -355,7 +376,7 @@ def test_history_import_reuses_inflight_client_job(client, monkeypatch):
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "Extract Memory Garden" in joined:
+        if "Memory Garden" in joined:
             provider_entered.set()
             assert release_provider.wait(timeout=2)
             return {
@@ -469,12 +490,12 @@ def test_history_import_accepts_json_file_and_persona_profile(client, monkeypatc
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "Extract Memory Garden" in joined:
+        if "Memory Garden" in joined:
             assert "Long-term user profile" in joined
             return {
                 "reply": (
                     '{"memories":['
-                    '{"type":"moment","title":"Imported JSON moment","description":"User tested JSON export import.","occurred_at":"2026-05-30"},'
+                    '{"type":"moment","title":"JSON import test","description":"User tested JSON export import.","occurred_at":"2026-05-30"},'
                     '{"type":"fact","title":"Persona preference","description":"User likes durable setup context.","occurred_at":"2026-05-30"}'
                     "]}"
                 ),
@@ -581,8 +602,85 @@ def test_wrapped_chat_history_json_parses_without_upload_artifacts():
         language=appmod._detect_import_language(messages),
     )
     assert len(cards) == 2
-    assert cards[0]["title"].startswith("导入")
+    assert not cards[0]["title"].startswith("导入")
     assert all("BEGIN CHAT HISTORY FILE" not in card["description"] for card in cards)
+
+
+def test_large_history_sampling_keeps_middle_and_latest_messages():
+    messages = []
+    for idx in range(180):
+        messages.append({
+            "role": "user" if idx % 2 == 0 else "assistant",
+            "content": f"message-{idx} " + ("x" * 180),
+            "ts": 1_700_000_000 + idx,
+            "source": "history_import",
+        })
+    messages[0]["content"] = "EARLIEST_MARKER " + messages[0]["content"]
+    messages[90]["content"] = "MIDDLE_MARKER " + messages[90]["content"]
+    messages[-1]["content"] = "LATEST_MARKER " + messages[-1]["content"]
+
+    sample = appmod._transcript_sample(messages, max_chars=5000)
+
+    assert "EARLIEST_MARKER" in sample
+    assert "MIDDLE_MARKER" in sample
+    assert "LATEST_MARKER" in sample
+
+
+def test_large_history_extraction_windows_cover_full_timeline():
+    messages = []
+    for idx in range(120):
+        messages.append({
+            "role": "user",
+            "content": f"history-window-message-{idx} " + ("x" * 350),
+            "ts": 1_700_000_000 + idx,
+            "source": "history_import",
+        })
+    messages[0]["content"] = "FIRST_WINDOW_MARKER " + messages[0]["content"]
+    messages[-1]["content"] = "LAST_WINDOW_MARKER " + messages[-1]["content"]
+
+    windows = appmod._transcript_extraction_windows(messages, max_chars=5000, max_windows=5)
+    joined = "\n".join(windows)
+
+    assert len(windows) > 1
+    assert "FIRST_WINDOW_MARKER" in joined
+    assert "LAST_WINDOW_MARKER" in joined
+
+
+def test_import_memory_targets_do_not_force_historical_floor_padding():
+    targets = appmod._import_memory_targets(
+        {"story": 15, "about_me": 60, "ta_thinking": 12, "total": 87},
+        [{"role": "user", "content": f"m{i}", "source": "history_import"} for i in range(120)],
+        [],
+    )
+
+    assert targets["story"] == 6
+    assert targets["about_me"] == 14
+
+
+def test_import_memory_filters_generic_import_cards_and_repetitive_low_value_content():
+    cards = appmod._dedupe_memory_cards([
+        {
+            "type": "moment",
+            "title": "导入片段 7",
+            "description": "请你为我介绍一下什么是天然矿泉水",
+            "occurred_at": "2026-06-01",
+        },
+        {
+            "type": "fact",
+            "title": "黄山矿泉水项目",
+            "description": "用户正在研究黄山天然矿泉水项目，希望文案更清楚。",
+            "occurred_at": "2026-06-01",
+        },
+        {
+            "type": "event",
+            "title": "黄山矿泉水文案",
+            "description": "用户正在研究黄山天然矿泉水项目，希望文案更清楚。",
+            "occurred_at": "2026-06-01",
+        },
+    ])
+
+    assert len(cards) == 1
+    assert cards[0]["title"] == "黄山矿泉水项目"
 
 
 def test_support_material_sections_split_character_and_personal_profile():
@@ -624,7 +722,7 @@ def test_history_import_allows_confirmed_fresh_start_without_materials(client, m
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
         assert "Fresh start" in joined
-        if "Extract Memory Garden" in joined:
+        if "Memory Garden" in joined:
             return {
                 "reply": (
                     '{"memories":['

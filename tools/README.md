@@ -238,6 +238,19 @@ configured CLI command is not reaching a production-quality agent session. Fix
 `HERMES_HOME`, `AGENT_CLI_CMD`, toolset access, max-turns, or session selection
 before running it as a service.
 
+##### Claude Code CLI example
+
+```
+AGENT_CLI_PATH=/home/openclaw/.npm-global/bin:/home/openclaw/.local/bin
+AGENT_CLI_CMD=claude --print --output-format json "{message}"
+```
+
+The consumer reads Claude Code's `session_id` from JSON output and injects
+`--resume <session_id>` on later turns. Do not use `--continue`: it means
+"latest local conversation" and can attach IO to the wrong session. If the
+service environment cannot find `claude`, use an absolute executable path or set
+`AGENT_CLI_PATH`.
+
 ### Failure behavior
 
 By default, agent-entry failures are log-only and **no fallback template is
