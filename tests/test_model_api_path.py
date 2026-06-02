@@ -922,6 +922,56 @@ def test_support_materials_accept_explicit_character_and_personal_profile_fields
     assert "用户喜欢直接的反馈" in support[1]["content"]
 
 
+def test_support_materials_extract_chatgpt_memories_json_without_raw_artifacts():
+    payload = {
+        "personal_profile_filename": "memories.json",
+        "personal_profile_content": appmod.json.dumps([
+            {
+                "conversations_memory": "**工作上下文**\nSeven 正在做 Feedling MCP 和 API onboarding。",
+                "account_uuid": "user-secret-id",
+            }
+        ]),
+    }
+
+    support = appmod._persona_support_messages(payload)
+
+    assert len(support) == 1
+    content = support[0]["content"]
+    assert "工作上下文" in content
+    assert "Feedling MCP" in content
+    assert "conversations_memory" not in content
+    assert "account_uuid" not in content
+    assert "[{" not in content
+
+
+def test_support_materials_ignore_account_metadata_json():
+    payload = {
+        "personal_profile_filename": "users.json",
+        "personal_profile_content": appmod.json.dumps([
+            {
+                "uuid": "user-secret-id",
+                "email_address": "seven@example.com",
+                "verified_phone_number": "+10000000000",
+                "full_name": "Seven",
+            }
+        ]),
+    }
+
+    assert appmod._persona_support_messages(payload) == []
+
+
+def test_import_language_prefers_user_archive_language(monkeypatch):
+    monkeypatch.setattr(appmod, "_get_user_archive_language", lambda user_id: "zh-Hans-US")
+    store = type("Store", (), {"user_id": "usr_test"})()
+
+    language = appmod._import_language_for_store(
+        store,
+        [{"role": "user", "content": "Work context and product strategy are written in English."}],
+    )
+
+    assert language == "zh-Hans-US"
+
+
 def test_history_import_allows_confirmed_fresh_start_without_materials(client, monkeypatch):
     user_id, api_key = _register(client)
 

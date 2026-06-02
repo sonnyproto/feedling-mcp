@@ -5329,7 +5329,7 @@ def _clean_support_material_text(text: str) -> str:
 
 
 def _support_message(label: str, source: str, content: str, filename: str = "") -> dict | None:
-    clean = _clean_support_material_text(content)
+    clean = _normalize_support_material_text(content, filename)
     if not clean:
         return None
     title = label
@@ -5341,6 +5341,124 @@ def _support_message(label: str, source: str, content: str, filename: str = "") 
         "ts": None,
         "source": source,
     }
+
+
+_SUPPORT_JSON_TEXT_KEYS = (
+    "conversations_memory",
+    "conversation_memory",
+    "personal_profile",
+    "persona_profile",
+    "user_profile",
+    "character_card",
+    "persona",
+    "profile",
+    "memory",
+    "memories",
+    "summary",
+    "description",
+    "notes",
+    "content",
+    "text",
+    "body",
+    "value",
+)
+_SUPPORT_JSON_PRIVATE_KEYS = {
+    "uuid",
+    "account_uuid",
+    "user_id",
+    "email",
+    "email_address",
+    "phone",
+    "phone_number",
+    "verified_phone_number",
+    "id",
+}
+
+
+def _support_json_is_account_metadata(value: dict) -> bool:
+    keys = {str(k).lower() for k in value.keys()}
+    has_private = bool(keys & _SUPPORT_JSON_PRIVATE_KEYS) or any(
+        "email" in key or "phone" in key or "uuid" in key for key in keys
+    )
+    has_content = any(key in keys for key in _SUPPORT_JSON_TEXT_KEYS)
+    return has_private and not has_content
+
+
+def _support_json_scalar_text(value) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = _clean_support_material_text(value)
+    if len(text) < 2:
+        return ""
+    if re.fullmatch(r"[0-9a-fA-F-]{16,}", text):
+        return ""
+    if "@" in text and re.fullmatch(r"\S+@\S+\.\S+", text):
+        return ""
+    return text
+
+
+def _extract_support_json_text(value, *, depth: int = 0) -> list[str]:
+    if depth > 5:
+        return []
+    if isinstance(value, str):
+        text = _support_json_scalar_text(value)
+        return [text] if text else []
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value[:200]:
+            parts.extend(_extract_support_json_text(item, depth=depth + 1))
+        return parts
+    if not isinstance(value, dict):
+        return []
+    if _support_json_is_account_metadata(value):
+        return []
+
+    parts: list[str] = []
+    lower_map = {str(k).lower(): k for k in value.keys()}
+    for key in _SUPPORT_JSON_TEXT_KEYS:
+        original_key = lower_map.get(key)
+        if original_key is not None:
+            parts.extend(_extract_support_json_text(value.get(original_key), depth=depth + 1))
+
+    if parts:
+        return parts
+
+    for key, nested in value.items():
+        lower_key = str(key).lower()
+        if lower_key in _SUPPORT_JSON_PRIVATE_KEYS:
+            continue
+        if any(token in lower_key for token in ("email", "phone", "uuid", "avatar", "url")):
+            continue
+        parts.extend(_extract_support_json_text(nested, depth=depth + 1))
+    return parts
+
+
+def _normalize_support_material_text(content: str, filename: str = "") -> str:
+    clean = _clean_support_material_text(content)
+    if not clean:
+        return ""
+
+    stripped = clean.strip()
+    if not stripped.startswith(("{", "[")):
+        return clean
+
+    try:
+        parsed = json.loads(stripped)
+    except Exception:
+        return clean
+
+    parts = _extract_support_json_text(parsed)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        normalized = re.sub(r"\s+", " ", part).strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(part.strip())
+    if not deduped:
+        return ""
+    return "\n\n".join(deduped)[:30000].strip()
 
 
 def _split_support_sections(content: str) -> list[tuple[str, str, str]]:
@@ -5506,6 +5624,18 @@ def _detect_import_language(messages: list[dict]) -> str:
     if zh_count >= 8 and zh_count >= max(3, int(latin_count * 0.08)):
         return "zh-Hans"
     return "en"
+
+
+def _import_language_for_store(store: UserStore, messages: list[dict]) -> str:
+    detected = _detect_import_language(messages)
+    archive_language = str(_get_user_archive_language(store.user_id) or "").strip()
+    if archive_language.lower().startswith("zh"):
+        return archive_language
+    if detected.startswith("zh"):
+        return detected
+    if archive_language.lower().startswith("en"):
+        return archive_language
+    return detected
 
 
 def _language_instruction(language: str) -> str:
@@ -7119,7 +7249,7 @@ def _process_history_import_sync(
         content_chars=len(content),
     )
     import_targets = _import_memory_targets(floors, history_messages, support_messages, profile)
-    language = _detect_import_language(analysis_messages)
+    language = _import_language_for_store(store, analysis_messages)
     windows = _build_transcript_windows(
         analysis_messages,
         max_chars=18000,
