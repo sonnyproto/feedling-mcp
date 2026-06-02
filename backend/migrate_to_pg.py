@@ -141,12 +141,19 @@ def migrate_global_blobs(data_dir: Path) -> None:
             print(f"[global] imported access_link_tokens ({len(data)} row(s))")
 
 
-def migrate_user_dir(user_dir: Path) -> dict:
+def migrate_user_dir(user_dir: Path, merge: bool = False) -> dict:
     user_id = user_dir.name
     counts = {"blobs": 0, "chat": 0, "memory": 0, "frames": 0, "logs": 0}
 
-    # Idempotency: clear any prior import for this user first.
-    db.delete_user_data(user_id)
+    # Default: clear any prior import for this user first (delete + reimport),
+    # so RDS ends up exactly mirroring the files. In --merge mode we SKIP the
+    # delete and only upsert/append — used to backfill missing data WITHOUT
+    # wiping rows the live backend has written to RDS since the first migration.
+    # Note: in merge mode the row-per-item tables (chat/memory/frames/blobs/
+    # users) upsert by id (idempotent, no dupes), but the append-only user_logs
+    # streams may gain duplicate rows for already-migrated users.
+    if not merge:
+        db.delete_user_data(user_id)
 
     # Singleton blobs.
     for stem, kind in BLOB_FILES.items():
@@ -281,6 +288,13 @@ def main() -> int:
         action="store_true",
         help="Re-run even if a previous migration already completed (ignores the migration_done marker).",
     )
+    parser.add_argument(
+        "--merge",
+        action="store_true",
+        help="Backfill mode: do NOT delete existing rows first; only upsert/append. "
+             "Use to add missing data without reverting rows the live backend has "
+             "written since the first migration. Implies running despite the marker.",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir).expanduser()
@@ -296,7 +310,7 @@ def main() -> int:
     # Idempotency guard: once a migration has completed, never re-import on a
     # later run (e.g. CVM reboot re-running the one-shot migrate container) —
     # that would overwrite data users have since written to Postgres.
-    if not args.force:
+    if not args.force and not args.merge:
         done = db.get_config(_MIGRATION_DONE_KEY)
         if done:
             print(
@@ -321,9 +335,11 @@ def main() -> int:
     migrate_users(data_dir)
     migrate_global_blobs(data_dir)
 
+    if args.merge:
+        print("[migrate] MERGE mode: existing rows kept, only upserting/appending.")
     totals = {"users": 0, "blobs": 0, "chat": 0, "memory": 0, "frames": 0, "logs": 0}
     for user_dir in _user_dirs(data_dir):
-        c = migrate_user_dir(user_dir)
+        c = migrate_user_dir(user_dir, merge=args.merge)
         totals["users"] += 1
         for k in ("blobs", "chat", "memory", "frames", "logs"):
             totals[k] += c[k]

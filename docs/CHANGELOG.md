@@ -107,6 +107,20 @@
 - 后续如需再迁移：手动运行 `migrate_to_pg.py`（marker 会让它 no-op，需要时加
   `--force`），不再走常驻 compose service。
 
+### [DONE] 数据缺失补救工具：migrate_to_pg 加 --merge + SSH 执行路径
+
+- 用户反馈 03:42 那次迁移**不完整**（RDS 缺数据）。`migrate_to_pg.py` 新增
+  **`--merge`** 模式：跳过 `delete_user_data`，只 upsert/append → 补回缺失数据
+  而**不回退** live backend 在迁移后写入 RDS 的新行（row-per-item 表按 id 幂等
+  upsert；append-only user_logs 可能产生重复，非关键）。`--merge` 隐含绕过
+  `migration_done` 标记。本地临时 PG 验证：现有新数据保留 + 缺失用户/记录补回。
+- **执行路径**（TDX CVM 内,SSH 直连默认被 publickey 挡）：下次
+  `phala deploy ... --ssh-pubkey ~/.ssh/id_rsa.pub` 注入 SSH 公钥后,可
+  `phala ssh <cvm> -- docker exec <backend容器> python backend/migrate_to_pg.py
+  --data-dir /data --verify|--merge` 精确对账与补缺。容器名用 `phala ps` 确认。
+- 三种模式:`--verify`(只读对账文件 vs RDS)、`--merge`(安全补缺)、`--force`
+  (全量 delete+reimport,会回退增量,仅维护窗口用)。
+
 ---
 
 ## 2026-06-01
