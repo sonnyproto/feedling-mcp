@@ -23,14 +23,14 @@ def test_relationship_days_use_calendar_dates_and_memory_anchor(tmp_path, monkey
             return cls(2026, 5, 22, 1, 30, tzinfo=tz)
 
     monkeypatch.setattr(app, "datetime", FakeDatetime)
-    memory_file = tmp_path / "memory.json"
-    memory_file.write_text(json.dumps([
-        {"occurred_at": "2026-04-10T09:00:00"},
-        {"occurred_at": "2026-04-12T09:00:00"},
-    ]))
+    # Moments now live in PostgreSQL (see backend/db.py), so seed them through
+    # the persistence layer instead of writing a memory.json file.
+    app.db.memory_replace_all("usr_test", [
+        {"id": "m1", "occurred_at": "2026-04-10T09:00:00"},
+        {"id": "m2", "occurred_at": "2026-04-12T09:00:00"},
+    ])
     store = SimpleNamespace(
         user_id="usr_test",
-        memory_file=memory_file,
         memory_lock=threading.Lock(),
     )
 

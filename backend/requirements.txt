@@ -17,3 +17,17 @@ gunicorn>=23.0.0
 # Phase 1 (enclave) deps — see backend/enclave_app.py
 PyNaCl>=1.5.0
 dstack-sdk>=0.5.0
+
+# PostgreSQL persistence layer (see backend/db.py). All per-user data lives in
+# Postgres now, not local files. [binary] ships a self-contained libpq so the
+# image needs no system libpq; [pool] provides the threaded ConnectionPool the
+# 16-thread gunicorn worker shares. External Postgres connections MUST use
+# sslmode=require (set in DATABASE_URL).
+psycopg[binary,pool]>=3.2
+
+# Database schema migrations. Alembic is the single source of truth for the
+# schema (see backend/alembic/versions/). db.init_schema() runs `upgrade head`
+# at startup. Alembic pulls in SQLAlchemy, used ONLY to drive migrations — the
+# request path still talks to Postgres directly via the psycopg pool. The
+# migration engine connects with the psycopg3 driver (postgresql+psycopg://).
+alembic>=1.13

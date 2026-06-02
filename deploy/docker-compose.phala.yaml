@@ -138,6 +138,25 @@ services:
   # TLS-terminated route `wss://<app-id>-9998.dstack-pha-prod9...` —
   # frames are app-layer encrypted (FrameEnvelope v1) so gateway TLS
   # is sufficient for transport hygiene.
+  # --- One-shot data migration: legacy /data files → PostgreSQL. ---
+  # Runs once before backend starts, importing the old file-based user data
+  # (still on the feedling_backend_data volume) into the external Postgres.
+  # Idempotent + marker-guarded: after the first successful run it records
+  # server_config.migration_done, and every later boot (e.g. CVM reboot)
+  # no-ops instead of re-importing stale files over data users have since
+  # written to Postgres. Safe to leave here permanently; safe to remove in a
+  # later deploy once the migration is confirmed (removal re-changes
+  # compose_hash → one more attest/consent). Image tag is kept in lockstep
+  # with backend/mcp by the CI sed bump.
+  migrate:
+    image: ghcr.io/teleport-computer/feedling:bc2d630
+    command: ["python", "backend/migrate_to_pg.py", "--data-dir", "/data"]
+    restart: "no"
+    environment:
+      DATABASE_URL: "${DATABASE_URL:-}"
+    volumes:
+      - feedling_backend_data:/data
+
   backend:
     image: ghcr.io/teleport-computer/feedling:bc2d630
     # gunicorn = production WSGI (the Werkzeug dev server stalls on large
@@ -151,6 +170,17 @@ services:
       FEEDLING_DATA_DIR: "/data"
       FEEDLING_WS_PORT: "9998"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
+      # External Postgres holding all (E2E-encrypted) user data + plaintext
+      # metadata. Injected via the encrypted env channel (`phala deploy -e
+      # DATABASE_URL=...`) because it carries DB credentials. MUST include
+      # sslmode=require. SECURITY CAVEAT: because it is interpolated (not baked)
+      # it does not change compose_hash — an operator can in principle point the
+      # backend at a different Postgres without re-attesting. The data at rest
+      # is ciphertext, but the DB endpoint sees plaintext metadata; disclose
+      # this in the deployment trust docs. Defaulted to empty (not `:?`) so
+      # compose synthesis / build never aborts on an unset var; the backend
+      # still fails fast at startup (db.py) if it ends up empty at runtime.
+      DATABASE_URL: "${DATABASE_URL:-}"
       # APNs developer key for push (Dynamic Island / Live Activity).
       # Injected via `phala deploy -e APNS_KEY_P8_B64=...` (encrypted env
       # channel, NOT baked into compose_hash). Empty default keeps dev
@@ -173,6 +203,10 @@ services:
     depends_on:
       enclave:
         condition: service_healthy
+      # Block backend startup until the one-shot migration has imported the
+      # legacy /data files into Postgres (no-ops on subsequent boots).
+      migrate:
+        condition: service_completed_successfully
 
   # --- MCP SSE server (plain HTTP behind ingress). ---
   # TLS termination moved to the ingress service; MCP speaks HTTP only.

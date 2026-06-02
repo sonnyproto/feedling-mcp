@@ -49,6 +49,127 @@
 
 ---
 
+## 2026-06-02
+
+### [DONE] 引入 Alembic 管理数据库 schema
+
+- schema 改为由 **Alembic 单一真相源**管理（`backend/alembic/versions/`），取代
+  原先 `db.init_schema()` 里内联的一段 `CREATE TABLE IF NOT EXISTS` DDL。
+- `db.init_schema()` 现在跑 `alembic upgrade head`（programmatic），从
+  `DATABASE_URL` 读连接（`backend/alembic/env.py` 把 `postgresql://` 映射到
+  psycopg3 方言 `postgresql+psycopg://`）。app 启动、migrate 容器、测试 conftest
+  都走同一条路，不会双真相源漂移。
+- baseline 迁移 `0001_baseline` 用幂等 DDL（`IF NOT EXISTS`），所以对**已经建好
+  8 张表的线上 RDS** 安全——下次部署 `upgrade head` 时只是 no-op + 记录
+  `alembic_version=0001_baseline`，不动数据。
+- 依赖：`requirements.txt` + `requirements.lock`（uv 重新生成）加 `alembic>=1.13`
+  （带 SQLAlchemy 2.x，仅用于驱动迁移；请求路径仍走 psycopg pool）。
+- 脚手架：`backend/alembic.ini`、`alembic/env.py`、`alembic/script.py.mako`、
+  `alembic/versions/0001_baseline.py`。已确认 `.dockerignore` 不排除、Dockerfile
+  `COPY backend/` 会带进镜像。
+- **后续改 schema 的流程**：`cd backend && alembic revision -m "..."` 写迁移 →
+  提交 → 部署时 `init_schema()`（=`upgrade head`）自动应用；也可手动
+  `DATABASE_URL=... alembic upgrade head`。
+- 验证：本地临时 PG 实测「全新库建表+打戳 / 幂等重跑 / 已有表的库安全 no-op+打戳」
+  三场景全过；`alembic current|history|revision` CLI 正常；全套测试 **213 passed**。
+
+### [DONE] 老数据迁移方案：Phala CVM 内一次性 migrate 容器
+
+- 老用户数据在 Phala CVM 的 `feedling_backend_data` volume（`/data` 下的旧
+  JSON/JSONL 文件）。TDX enclave 不便把数据导出，故采用「CVM 内自迁移」：
+  `docker-compose.phala.yaml` 新增一次性 `migrate` service（同镜像，挂同一
+  `feedling_backend_data` volume，注入 `DATABASE_URL`，跑
+  `migrate_to_pg.py --data-dir /data`），`backend` 通过
+  `depends_on: migrate: condition: service_completed_successfully` 等它跑完再起。
+- **防重复覆盖**：`migrate_to_pg.py` 加 `migration_done` 标记（写在
+  `server_config`）。首次成功后置标记，之后每次启动（CVM 重启会重跑该一次性
+  容器）检测到标记即 no-op，绝不用旧文件覆盖用户已写入 RDS 的新数据。`--force`
+  可强制重跑。→ 该 migrate service 可永久留在 compose；确认无误后也可在后续
+  常规部署中移除（移除会再变 compose_hash → 多一次 attest）。
+- 加 service 会改变 compose_hash → 上链 + iOS consent（部署本就会弹）。
+- 验证：本地临时 PG 实测「首次迁移 → 重启 no-op 保留新数据 → --force 重导入」
+  三场景全过；`docker compose config` 解析新 compose 正常。
+- 线上 RDS 8 张表已建好（init_schema 幂等，启动自动建）；唯一需要的 GitHub
+  secret `DATABASE_URL` 已配置。
+
+---
+
+## 2026-06-01
+
+### [DONE] PostgreSQL 迁移扩展覆盖新功能 + 解决 stash 冲突
+
+- 迁移期间 main 合入了新功能（`Add identity and memory agent actions`、
+  `Add beta data track dashboard` 等），`git stash pop` 在 `backend/app.py`
+  留下 3 处未解决的冲突标记（"Updated upstream" vs "Stashed changes"）。已逐一
+  解决：保留上游新功能 + 保留迁移的 `import db` / db 持久化。
+- 修复合并引入的断裂引用（上游新代码调用了迁移已删除的方法）：
+  `_set_user_public_key` / content-rewrap 里的 `_persist_chat()`、
+  tracking/memory dashboard 里的 `self._append_jsonl` / `store._read_jsonl`
+  —— 全部改为 `db.*`。
+- 把新功能引入的文件持久化也迁到 PostgreSQL：`tracking_events` /
+  `memory_changes` / `memory_capture_jobs` 三个 JSONL 流 → `user_logs`；
+  `onboarding_route` / `model_api` → `user_blobs`；`history_import_jobs`
+  （原每任务一个 .json 的目录）→ `user_blobs`（kind 前缀 `history_import_job:`）。
+  无需改 schema（复用 user_logs / user_blobs 表）。
+- `db.py` 新增 `delete_blob` / `list_blobs(prefix)`，删除 `app.py` 中已无用的
+  `_read/_write_json_object`、模块级 `_append_jsonl`、全部 `_*_file` 路径属性。
+
+### [DONE] 第二轮：合并再次拉取的后端 + 覆盖用户模型重构
+
+- 又拉取了后端代码（`Keep history import out of visible chat`、
+  `Omit oversized chat bodies from lightweight history` 等），`backend/app.py`
+  再次出现冲突标记，已解决。
+- **用户模型重构**：上游把 users 从单 `api_key_hash` 改成富模型
+  （`principal_id` + `api_keys[]` 多密钥/吊销 + access bindings），且 `_save_users()`
+  被重新引入并在 11 处调用。把 `db.py` 的 `users` 表改为**整文档 JSONB**
+  （`user_id` PK + `doc`），新增 `save_all_users`；`_save_users()` 改为 db 持久化，
+  所有 key 管理调用点无需改动即可工作。
+- 新增的文件持久化继续迁到 DB：`access_link_tokens`（全局）→ 新增 `global_blobs`
+  表 + `get/set_global_blob`。修复上游 `_set_user_public_key` 调用已删除
+  `_save_users` 的断裂引用。
+- 迁移脚本同步扩展：覆盖整文档 users（保留 api_keys/principal_id，api_key 仍有效）、
+  onboarding_route / model_api blob、tracking/memory_changes/memory_capture 日志、
+  history_import_jobs（每任务一 blob）、全局 access_link_tokens。
+- 适配新增功能测试文件中残留的文件存储断言（`USERS_FILE` monkeypatch、
+  `identity_file`/`memory_file`/`model_api.json` 直读、`_persist_chat`）→ 全部改走 `db.*`。
+- 验证：全套测试对真实 Postgres 全绿（**206 passed**），迁移 e2e（含新用户模型 +
+  全部新文件 + 全局 blob + api_key 存活）通过。后端仍无任何用户数据落地文件。
+
+---
+
+## 2026-05-31
+
+### [DONE] 持久层从本地文件迁移到外部 PostgreSQL
+
+- 新增 `backend/db.py`：psycopg3 + 连接池存储层，承载所有原本写在
+  `FEEDLING_DATA_DIR` 下的 JSON/JSONL 文件。Schema 为混合模型：小的单例
+  blob（push_state / live_activity_state / tokens / proactive_settings /
+  identity / bootstrap / consumer_state / frames_meta）进 `user_blobs` KV 表；
+  高频集合用 row-per-item 表（`chat_messages` / `memory_moments` /
+  `frame_envelopes` / `user_logs`）。全局 `users` 表 + `server_config`（pepper）。
+- `backend/app.py`：`UserStore` 与全局 users 注册表保留各自的内存缓存与
+  `threading.Lock`，只把 `_load_X`/`_save_X` 的函数体换成调用 `db.py`。仍是单
+  gunicorn worker；长轮询 waiter 仍基于内存 `threading.Event`，未占用 DB 连接。
+  chat 不再每次重写整个文件——append 现在是单行 INSERT + 有界 trim（O(1)）。
+- 加解密**未改动**：服务器从不解密，envelope 的 `body_ct`/`nonce`/`K_user`/
+  `K_enclave` 等字段逐字节存为 JSONB 并原样返回，enclave 解密路径不受影响。
+  `/v1/content/swap` 的可见性切换（含 K_enclave 增删）走整行替换以保证语义。
+- 新增 `backend/migrate_to_pg.py`：一次性、幂等地把现有文件树导入 PG。**会导入
+  `.pepper`**，使既有 api_key_hash 继续有效（否则所有 api_key 失效）。`--verify`
+  复核计数。文件系统保留作回滚。
+- 依赖：`requirements.txt` + `requirements.lock`（uv 重新生成，含 hash）加
+  `psycopg[binary,pool]>=3.2`。
+- 部署：`docker-compose.yaml` / `docker-compose.phala.yaml` /
+  `feedling.env.example` 加 `DATABASE_URL`（`:?` 形式，未设置即 fail-fast；
+  必须 `sslmode=require`）。
+- **为什么 / 安全影响**：选了外部托管 PG（数据离开 enclave）。数据在库内是
+  E2E 密文，但库能看到明文元数据（user_id / 时间戳 / app 名 / visibility）。
+  `DATABASE_URL` 因是 `${VAR}` 插值不进 compose_hash，运营方理论上可重定向到
+  另一个 PG 而不重新 attest——已在 compose 注释里标注为 attested config 并提示
+  需在部署信任文档中披露。
+
+---
+
 ## 2026-05-21
 
 ### [DONE] Resident onboarding path made reusable after live iPhone test

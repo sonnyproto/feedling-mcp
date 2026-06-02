@@ -36,18 +36,27 @@ from provider_client import (
     validate_config as validate_provider_config,
 )
 
+import db
+
 # ---------------------------------------------------------------------------
 # Root directory + deployment mode
 # ---------------------------------------------------------------------------
 
+# FEEDLING_DIR is no longer the source of truth for user data (that lives in
+# PostgreSQL now — see db.py). It is still used for non-user-data files that
+# ride in the data volume, e.g. the APNs .p8 push key. Kept for compatibility.
 FEEDLING_DIR = Path(os.environ.get("FEEDLING_DATA_DIR", str(Path.home() / "feedling-data"))).expanduser()
 FEEDLING_DIR.mkdir(parents=True, exist_ok=True)
+
+# Create the PostgreSQL schema (idempotent) before any load/save runs at import
+# time. Fails fast if DATABASE_URL is unset / the DB is unreachable — the
+# backend now requires Postgres and must not silently fall back to files.
+db.init_schema()
 
 # ---------------------------------------------------------------------------
 # Users registry (multi-tenant). Every request is auth'd by api_key.
 # ---------------------------------------------------------------------------
 
-USERS_FILE = FEEDLING_DIR / "users.json"
 _users_lock = threading.Lock()
 _users: list[dict] = []                    # [{user_id, principal_id, api_keys, public_key, created_at}]
 _key_to_user: dict[str, str] = {}          # api_key_hash -> user_id (in-memory cache)
@@ -80,20 +89,16 @@ _ACCESS_MODE_ALIASES = {
 # leaks, while avoiding per-request bcrypt cost (which would be dramatic given
 # long-poll + screen-analyze are hit every few seconds).
 def _server_pepper() -> bytes:
-    """Stable secret for key hashing. Persisted under FEEDLING_DIR."""
-    pepper_file = FEEDLING_DIR / ".pepper"
-    if pepper_file.exists():
-        try:
-            return pepper_file.read_bytes()
-        except Exception:
-            pass
-    pepper = secrets.token_bytes(32)
-    try:
-        pepper_file.write_bytes(pepper)
-        os.chmod(pepper_file, 0o600)
-    except Exception as e:
-        print(f"[users] could not persist pepper: {e}")
-    return pepper
+    """Stable secret for key hashing. Persisted in PostgreSQL (server_config).
+
+    Bootstrap is race-safe: the first writer's pepper wins and every worker
+    reads back the same value, so api_key_hashes stay stable. The migration
+    script imports the pre-existing .pepper bytes so old api_keys keep working.
+    """
+    existing = db.get_config("pepper")
+    if existing:
+        return existing
+    return db.set_config_if_absent("pepper", secrets.token_bytes(32))
 
 
 _PEPPER = _server_pepper()
@@ -101,10 +106,6 @@ _PEPPER = _server_pepper()
 
 def _hash_api_key(api_key: str) -> str:
     return hmac.new(_PEPPER, api_key.encode("utf-8"), hashlib.sha256).hexdigest()
-
-
-def _access_link_tokens_file() -> Path:
-    return FEEDLING_DIR / "access_link_tokens.json"
 
 
 def _normalize_access_mode(mode: str) -> str:
@@ -264,13 +265,7 @@ def _rebuild_key_cache() -> None:
 
 def _load_users():
     global _users, _key_to_user
-    try:
-        if USERS_FILE.exists():
-            data = json.loads(USERS_FILE.read_text())
-            _users = data if isinstance(data, list) else []
-    except Exception as e:
-        print(f"[users] failed to load: {e}")
-        _users = []
+    _users = db.load_all_users()
     changed = _normalize_all_users()
     _rebuild_key_cache()
     if changed:
@@ -279,11 +274,10 @@ def _load_users():
 
 
 def _save_users():
-    try:
-        USERS_FILE.write_text(json.dumps(_users, indent=2))
-        os.chmod(USERS_FILE, 0o600)
-    except Exception as e:
-        print(f"[users] failed to save: {e}")
+    """Persist the whole in-memory user registry to PostgreSQL. Called wherever
+    the registry changes (registration, api-key add/revoke, normalization,
+    preference / public-key edits). The file era wrote users.json here."""
+    db.save_all_users(_users)
 
 
 def _resolve_user(api_key: str) -> str | None:
@@ -393,14 +387,10 @@ _load_users()
 MAX_FRAMES = 200
 # Chat history ring buffer per user. Bumped from 500 → 5000 on 2026-05-11
 # to give users meaningful scroll-back across months of normal use without
-# silently losing their oldest conversations. At ~800 bytes per text-only
-# envelope this caps chat.json around 4 MB; image-heavy users will see it
-# grow into the tens of MB because envelopes carry the encrypted JPEG
-# inline. Each chat append rewrites the whole file (see _persist_chat),
-# so the bigger the file, the slower the write — at 5000 the per-message
-# write cost is roughly 100-500 ms depending on image density. If that
-# starts mattering, the next step is switching chat persistence to an
-# append-only JSONL log so writes become O(1) regardless of history depth.
+# silently losing their oldest conversations. Chat now persists row-per-message
+# in PostgreSQL (see db.chat_append), so an append is a single-row INSERT plus
+# a bounded trim — O(1) regardless of history depth — rather than rewriting the
+# whole history. The cap still bounds storage and the in-memory list size.
 MAX_CHAT_MESSAGES = 5000
 PUSH_COOLDOWN_SECONDS = int(os.environ.get("FEEDLING_PUSH_COOLDOWN_SEC", 300))
 LIVE_ACTIVITY_DEDUPE_SEC = int(os.environ.get("FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC", 900))
@@ -455,15 +445,14 @@ def _normalize_token_entry(entry: dict) -> dict:
 
 
 class UserStore:
-    """All per-user state + file paths + locks. One instance per user_id."""
+    """All per-user state + locks. One instance per user_id. Persistence is in
+    PostgreSQL (see db.py); state below is the in-memory working copy."""
 
     def __init__(self, user_id: str):
         self.user_id = user_id
+        # Legacy on-disk dir for this user. No longer written to — kept only so
+        # account_reset can sweep any pre-migration residual files if present.
         self.dir = FEEDLING_DIR / user_id
-        self.dir.mkdir(parents=True, exist_ok=True)
-
-        self.frames_dir = self.dir / "frames"
-        self.frames_dir.mkdir(parents=True, exist_ok=True)
 
         # frames
         self.frames_meta: list[dict] = []
@@ -509,186 +498,50 @@ class UserStore:
         self._load_chat()
         self._load_frames_meta()
 
-    # ------- file paths -------
-    @property
-    def push_state_file(self) -> Path:
-        return self.dir / "push_state.json"
-
-    @property
-    def live_activity_state_file(self) -> Path:
-        return self.dir / "live_activity_state.json"
-
-    @property
-    def tokens_file(self) -> Path:
-        return self.dir / "tokens.json"
-
-    @property
-    def chat_file(self) -> Path:
-        return self.dir / "chat.json"
-
-    @property
-    def identity_file(self) -> Path:
-        return self.dir / "identity.json"
-
-    @property
-    def memory_file(self) -> Path:
-        return self.dir / "memory.json"
-
-    @property
-    def bootstrap_file(self) -> Path:
-        return self.dir / "bootstrap.json"
-
-    @property
-    def bootstrap_events_file(self) -> Path:
-        return self.dir / "bootstrap_events.jsonl"
-
-    @property
-    def consumer_state_file(self) -> Path:
-        return self.dir / "consumer_state.json"
-
-    @property
-    def identity_changes_file(self) -> Path:
-        """Append-only audit log of identity changes (init / replace / nudge).
-        Surfaced to iOS as the "最近的变化" feed and as local push triggers.
-        See /v1/identity/changes endpoint."""
-        return self.dir / "identity_changes.jsonl"
-
-    @property
-    def memory_changes_file(self) -> Path:
-        return self.dir / "memory_changes.jsonl"
-
-    @property
-    def memory_capture_jobs_file(self) -> Path:
-        return self.dir / "memory_capture_jobs.jsonl"
-
-    @property
-    def onboarding_route_file(self) -> Path:
-        return self.dir / "onboarding_route.json"
-
-    @property
-    def model_api_file(self) -> Path:
-        return self.dir / "model_api.json"
-
-    @property
-    def history_import_jobs_dir(self) -> Path:
-        path = self.dir / "history_import_jobs"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    @property
-    def frames_meta_file(self) -> Path:
-        return self.dir / "frames_meta.json"
-
-    @property
-    def proactive_settings_file(self) -> Path:
-        return self.dir / "proactive_settings.json"
-
-    @property
-    def device_events_file(self) -> Path:
-        return self.dir / "device_events.jsonl"
-
-    @property
-    def gate_decisions_file(self) -> Path:
-        return self.dir / "gate_decisions.jsonl"
-
-    @property
-    def proactive_jobs_file(self) -> Path:
-        return self.dir / "proactive_jobs.jsonl"
-
-    @property
-    def gate_reviews_file(self) -> Path:
-        return self.dir / "gate_reviews.jsonl"
-
-    @property
-    def tracking_events_file(self) -> Path:
-        return self.dir / "tracking_events.jsonl"
-
     # ------- frames index -------
     def _load_frames_meta(self):
-        # Fast path: index file already persisted.
-        if self.frames_meta_file.exists():
-            try:
-                data = json.loads(self.frames_meta_file.read_text())
-                if isinstance(data, list):
-                    self.frames_meta = data
-                    print(f"[{self.user_id}/frames] loaded index n={len(self.frames_meta)}")
-                    return
-            except Exception as e:
-                print(f"[{self.user_id}/frames] index load failed: {e} — rebuilding from disk")
+        # Fast path: index blob already persisted.
+        data = db.get_blob(self.user_id, "frames_meta")
+        if isinstance(data, list):
+            self.frames_meta = data
+            print(f"[{self.user_id}/frames] loaded index n={len(self.frames_meta)}")
+            return
 
-        # Rebuild path: no index yet (first boot with this fix, or pre-fix restart
-        # left orphan env.json files). Scan frames_dir and reconstruct meta from
-        # envelope bodies + file mtime. ts fallback loses sub-second precision but
-        # is good enough to un-orphan pre-fix frames.
-        recovered: list[dict] = []
+        # Rebuild path: no index blob yet (first boot post-migration, or the
+        # blob was lost). Reconstruct the lightweight index from the stored
+        # frame envelope rows, prune to MAX_FRAMES, and re-persist the index.
         try:
-            for p in sorted(self.frames_dir.glob("*.env.json")):
-                try:
-                    env = json.loads(p.read_text())
-                    if not isinstance(env, dict) or not env.get("body_ct"):
-                        continue
-                    recovered.append({
-                        "filename": p.name,
-                        "ts": p.stat().st_mtime,
-                        "app": None,
-                        "ocr_text": "",
-                        "w": 0,
-                        "h": 0,
-                        "encrypted": True,
-                        "id": env.get("id") or p.stem.split(".")[0],
-                        "v": env.get("v", 1),
-                        "owner_user_id": env.get("owner_user_id"),
-                    })
-                except Exception as e:
-                    print(f"[{self.user_id}/frames] skip {p.name}: {e}")
-            recovered.sort(key=lambda m: m["ts"])
+            recovered = db.frame_list_meta(self.user_id)  # already sorted by ts
             if len(recovered) > MAX_FRAMES:
-                # Keep the newest MAX_FRAMES; prune orphan files for the rest.
                 drop = recovered[:-MAX_FRAMES]
                 recovered = recovered[-MAX_FRAMES:]
                 for m in drop:
-                    try:
-                        (self.frames_dir / m["filename"]).unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    db.frame_delete(self.user_id, m["id"])
             self.frames_meta = recovered
             self._persist_frames_meta()
-            print(f"[{self.user_id}/frames] rebuilt index from disk n={len(recovered)}")
+            print(f"[{self.user_id}/frames] rebuilt index from db n={len(recovered)}")
         except Exception as e:
             print(f"[{self.user_id}/frames] rebuild failed: {e}")
             self.frames_meta = []
 
     def _persist_frames_meta(self):
-        try:
-            tmp = self.frames_meta_file.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self.frames_meta))
-            tmp.replace(self.frames_meta_file)
-        except Exception as e:
-            print(f"[{self.user_id}/frames] index save failed: {e}")
+        db.set_blob(self.user_id, "frames_meta", self.frames_meta)
 
     # ------- tokens -------
     def _load_tokens(self):
-        try:
-            if self.tokens_file.exists():
-                data = json.loads(self.tokens_file.read_text())
-                self.tokens = data if isinstance(data, list) else []
-        except Exception as e:
-            print(f"[{self.user_id}/tokens] load failed: {e}")
-            self.tokens = []
+        data = db.get_blob(self.user_id, "tokens")
+        self.tokens = data if isinstance(data, list) else []
         self.tokens[:] = [_normalize_token_entry(t) for t in self.tokens]
         self._save_tokens()
 
     def _save_tokens(self):
-        try:
-            self.tokens_file.write_text(json.dumps(self.tokens))
-        except Exception as e:
-            print(f"[{self.user_id}/tokens] save failed: {e}")
+        db.set_blob(self.user_id, "tokens", self.tokens)
 
     # ------- push cooldown -------
     def _load_push_state(self):
         try:
-            if self.push_state_file.exists():
-                data = json.loads(self.push_state_file.read_text())
+            data = db.get_blob(self.user_id, "push_state")
+            if isinstance(data, dict):
                 epoch = float(data.get("last_push_epoch", 0.0))
                 elapsed = time.time() - epoch
                 if 0 <= elapsed < PUSH_COOLDOWN_SECONDS:
@@ -701,10 +554,7 @@ class UserStore:
         with self.push_lock:
             self.last_push_epoch = time.time()
             self.last_push_mono = time.monotonic()
-        try:
-            self.push_state_file.write_text(json.dumps({"last_push_epoch": self.last_push_epoch}))
-        except Exception as e:
-            print(f"[{self.user_id}/push_state] save failed: {e}")
+        db.set_blob(self.user_id, "push_state", {"last_push_epoch": self.last_push_epoch})
 
     def cooldown_remaining_seconds(self) -> float:
         with self.push_lock:
@@ -714,23 +564,19 @@ class UserStore:
     # ------- live activity dedupe -------
     def _load_live_activity_state(self):
         try:
-            if self.live_activity_state_file.exists():
-                data = json.loads(self.live_activity_state_file.read_text())
-                if isinstance(data, dict):
-                    self.live_activity_state = {
-                        "last_message": str(data.get("last_message", "")),
-                        "last_top_app": str(data.get("last_top_app", "")),
-                        "last_sent_epoch": float(data.get("last_sent_epoch", 0.0)),
-                        "last_start_epoch": float(data.get("last_start_epoch", 0.0)),
-                    }
+            data = db.get_blob(self.user_id, "live_activity_state")
+            if isinstance(data, dict):
+                self.live_activity_state = {
+                    "last_message": str(data.get("last_message", "")),
+                    "last_top_app": str(data.get("last_top_app", "")),
+                    "last_sent_epoch": float(data.get("last_sent_epoch", 0.0)),
+                    "last_start_epoch": float(data.get("last_start_epoch", 0.0)),
+                }
         except Exception as e:
             print(f"[{self.user_id}/live-activity] load failed: {e}")
 
     def _save_live_activity_state(self):
-        try:
-            self.live_activity_state_file.write_text(json.dumps(self.live_activity_state))
-        except Exception as e:
-            print(f"[{self.user_id}/live-activity] save failed: {e}")
+        db.set_blob(self.user_id, "live_activity_state", self.live_activity_state)
 
     def should_suppress_live_activity(self, message: str, top_app: str) -> tuple[bool, str]:
         normalized_message = " ".join((message or "").strip().split())
@@ -785,19 +631,7 @@ class UserStore:
 
     # ------- chat -------
     def _load_chat(self):
-        try:
-            if self.chat_file.exists():
-                data = json.loads(self.chat_file.read_text())
-                self.chat_messages = data if isinstance(data, list) else []
-        except Exception as e:
-            print(f"[{self.user_id}/chat] load failed: {e}")
-            self.chat_messages = []
-
-    def _persist_chat(self):
-        try:
-            self.chat_file.write_text(json.dumps(self.chat_messages))
-        except Exception as e:
-            print(f"[{self.user_id}/chat] save failed: {e}")
+        self.chat_messages = db.chat_load(self.user_id)
 
     def append_chat(
         self,
@@ -875,7 +709,7 @@ class UserStore:
             self.chat_messages.append(msg)
             if len(self.chat_messages) > MAX_CHAT_MESSAGES:
                 self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
-            self._persist_chat()
+            db.chat_append(self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
         return msg
 
     def update_chat_message_metadata(self, msg_id: str, fields: dict) -> dict | None:
@@ -904,7 +738,7 @@ class UserStore:
             for msg in self.chat_messages:
                 if msg.get("id") == msg_id:
                     msg.update(clean)
-                    self._persist_chat()
+                    db.chat_update_metadata(self.user_id, msg_id, clean)
                     return msg
         return None
 
@@ -924,14 +758,13 @@ class UserStore:
             "updated_at": datetime.now().isoformat(),
         }
         try:
-            if self.proactive_settings_file.exists():
-                data = json.loads(self.proactive_settings_file.read_text())
-                if isinstance(data, dict):
-                    merged = dict(default)
-                    merged.update(data)
-                    if not isinstance(merged.get("permission_states"), dict):
-                        merged["permission_states"] = {}
-                    return merged
+            data = db.get_blob(self.user_id, "proactive_settings")
+            if isinstance(data, dict):
+                merged = dict(default)
+                merged.update(data)
+                if not isinstance(merged.get("permission_states"), dict):
+                    merged["permission_states"] = {}
+                return merged
         except Exception as e:
             print(f"[{self.user_id}/proactive] settings load failed: {e}")
         return default
@@ -958,102 +791,67 @@ class UserStore:
                 cur["permission_states"] = states
         cur["updated_at"] = datetime.now().isoformat()
         with self.proactive_lock:
-            self.proactive_settings_file.write_text(json.dumps(cur, ensure_ascii=False, indent=2))
+            db.set_blob(self.user_id, "proactive_settings", cur)
         return cur
 
-    def _append_jsonl(self, path: Path, entry: dict) -> None:
-        with self.proactive_lock:
-            with open(path, "a") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-    def _read_jsonl(self, path: Path, limit: int = 100, since_epoch: float = 0.0) -> list[dict]:
-        rows: list[dict] = []
-        if not path.exists():
-            return rows
+    # ------- append-only logs (PostgreSQL-backed; see db.user_logs) -------
+    @staticmethod
+    def _entry_epoch(entry: dict) -> float | None:
+        """Extract the epoch ts an entry carries (``ts`` or ``ts_epoch``) for
+        the indexed ts column. Returns None when the entry has no epoch ts
+        (e.g. ISO-timestamped streams) — such rows are then ts-filter-exempt."""
+        raw = entry.get("ts", entry.get("ts_epoch"))
         try:
-            with open(path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        item = json.loads(line)
-                    except Exception:
-                        continue
-                    if since_epoch:
-                        ts = float(item.get("ts", item.get("ts_epoch", 0)) or 0)
-                        if ts <= since_epoch:
-                            continue
-                    rows.append(item)
-        except Exception as e:
-            print(f"[{self.user_id}/proactive] jsonl read failed path={path.name}: {e}")
-            return []
-        if limit > 0:
-            return rows[-limit:]
-        return rows
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
 
     def append_device_event(self, event: dict) -> dict:
-        self._append_jsonl(self.device_events_file, event)
-        self._prune_device_events()
+        db.log_append(self.user_id, "device_events", event, ts=self._entry_epoch(event))
+        cutoff = time.time() - DEVICE_EVENT_RETENTION_DAYS * 86400
+        db.log_prune_older_than(self.user_id, "device_events", cutoff)
         return event
 
     def list_device_events(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
-        return self._read_jsonl(self.device_events_file, limit=limit, since_epoch=since_epoch)
-
-    def _prune_device_events(self) -> None:
-        cutoff = time.time() - DEVICE_EVENT_RETENTION_DAYS * 86400
-        rows = self._read_jsonl(self.device_events_file, limit=0, since_epoch=cutoff)
-        try:
-            tmp = self.device_events_file.with_suffix(".jsonl.tmp")
-            with open(tmp, "w") as f:
-                for row in rows:
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            tmp.replace(self.device_events_file)
-        except Exception as e:
-            print(f"[{self.user_id}/device-events] prune failed: {e}")
+        return db.log_read(self.user_id, "device_events", limit=limit, since_epoch=since_epoch)
 
     def append_gate_decision(self, decision: dict) -> dict:
-        self._append_jsonl(self.gate_decisions_file, decision)
+        db.log_append(self.user_id, "gate_decisions", decision, ts=self._entry_epoch(decision))
         return decision
 
     def list_gate_decisions(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
-        return self._read_jsonl(self.gate_decisions_file, limit=limit, since_epoch=since_epoch)
+        return db.log_read(self.user_id, "gate_decisions", limit=limit, since_epoch=since_epoch)
 
     def append_gate_review(self, review: dict) -> dict:
-        self._append_jsonl(self.gate_reviews_file, review)
+        db.log_append(self.user_id, "gate_reviews", review, ts=self._entry_epoch(review))
         return review
 
     def list_gate_reviews(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
-        return self._read_jsonl(self.gate_reviews_file, limit=limit, since_epoch=since_epoch)
+        return db.log_read(self.user_id, "gate_reviews", limit=limit, since_epoch=since_epoch)
 
     def append_tracking_event(self, event: dict) -> dict:
-        self._append_jsonl(self.tracking_events_file, event)
-        self._prune_tracking_events()
+        db.log_append(self.user_id, "tracking_events", event, ts=self._entry_epoch(event))
+        db.log_prune_older_than(
+            self.user_id, "tracking_events", time.time() - TRACK_EVENT_RETENTION_DAYS * 86400
+        )
+        db.log_trim(self.user_id, "tracking_events", TRACK_EVENT_MAX)
         return event
 
     def list_tracking_events(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
-        return self._read_jsonl(self.tracking_events_file, limit=limit, since_epoch=since_epoch)
-
-    def _prune_tracking_events(self) -> None:
-        cutoff = time.time() - TRACK_EVENT_RETENTION_DAYS * 86400
-        rows = self._read_jsonl(self.tracking_events_file, limit=TRACK_EVENT_MAX, since_epoch=cutoff)
-        try:
-            tmp = self.tracking_events_file.with_suffix(".jsonl.tmp")
-            with open(tmp, "w") as f:
-                for row in rows[-TRACK_EVENT_MAX:]:
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            tmp.replace(self.tracking_events_file)
-        except Exception as e:
-            print(f"[{self.user_id}/tracking-events] prune failed: {e}")
+        return db.log_read(self.user_id, "tracking_events", limit=limit, since_epoch=since_epoch)
 
     def append_proactive_job(self, job: dict) -> dict:
-        self._append_jsonl(self.proactive_jobs_file, job)
-        self._trim_proactive_jobs()
+        db.log_append(
+            self.user_id, "proactive_jobs", job,
+            ts=self._entry_epoch(job),
+            item_key=(str(job.get("job_id") or "") or None),
+        )
+        db.log_trim(self.user_id, "proactive_jobs", PROACTIVE_JOB_MAX)
         self.notify_proactive_job_waiters()
         return job
 
     def list_proactive_jobs(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
-        return self._read_jsonl(self.proactive_jobs_file, limit=limit, since_epoch=since_epoch)
+        return db.log_read(self.user_id, "proactive_jobs", limit=limit, since_epoch=since_epoch)
 
     def update_proactive_job(
         self,
@@ -1062,12 +860,11 @@ class UserStore:
         *,
         only_if_status: str | None = None,
     ) -> dict | None:
-        """Patch one hidden proactive job in-place.
-
-        Jobs are kept as JSONL for append/read simplicity, but status needs a
-        real lifecycle so the debug dashboard can distinguish "not consumed"
-        from "agent failed" from "chat write delivered".
-        """
+        """Patch one hidden proactive job in-place. Status has a real lifecycle
+        so the debug dashboard can distinguish "not consumed" from "agent
+        failed" from "chat write delivered". The patch is an atomic single-row
+        JSONB merge; ``only_if_status`` is enforced in SQL (no-op if it doesn't
+        match the row's current status)."""
         job_id = str(job_id or "").strip()
         if not job_id:
             return None
@@ -1086,38 +883,12 @@ class UserStore:
         if not patch:
             return None
         patch["updated_at"] = datetime.now().isoformat()
-        with self.proactive_lock:
-            rows = self._read_jsonl(self.proactive_jobs_file, limit=0, since_epoch=0.0)
-            changed: dict | None = None
-            for row in rows:
-                if str(row.get("job_id") or "") != job_id:
-                    continue
-                cur_status = str(row.get("status") or "pending")
-                if only_if_status is not None and cur_status != only_if_status:
-                    return None
-                row.update(patch)
-                changed = row
-                break
-            if changed is None:
-                return None
-            tmp = self.proactive_jobs_file.with_suffix(".jsonl.tmp")
-            with open(tmp, "w") as f:
-                for row in rows[-PROACTIVE_JOB_MAX:]:
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            tmp.replace(self.proactive_jobs_file)
-        self.notify_proactive_job_waiters()
+        changed = db.log_patch_item(
+            self.user_id, "proactive_jobs", job_id, patch, only_if_status=only_if_status
+        )
+        if changed is not None:
+            self.notify_proactive_job_waiters()
         return changed
-
-    def _trim_proactive_jobs(self) -> None:
-        rows = self._read_jsonl(self.proactive_jobs_file, limit=PROACTIVE_JOB_MAX, since_epoch=0.0)
-        try:
-            tmp = self.proactive_jobs_file.with_suffix(".jsonl.tmp")
-            with open(tmp, "w") as f:
-                for row in rows:
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
-            tmp.replace(self.proactive_jobs_file)
-        except Exception as e:
-            print(f"[{self.user_id}/proactive-jobs] trim failed: {e}")
 
     def notify_proactive_job_waiters(self):
         with self.proactive_job_waiters_lock:
@@ -1195,8 +966,8 @@ def _save_frame(store: UserStore, payload: dict):
           "visibility":"shared","owner_user_id":...}}
 
     The JPEG + OCR are inside `body_ct` (ChaCha20-Poly1305 AEAD bound to
-    owner|v|id). Server never decrypts — it writes the envelope to
-    <frames_dir>/<id>.env.json and appends the item to frames_meta with
+    owner|v|id). Server never decrypts — it stores the envelope in a
+    frame_envelopes row and appends the item to frames_meta with
     `encrypted=True` so the UI + enclave path can find it.
     """
     env = payload.get("envelope")
@@ -1208,18 +979,13 @@ def _save_frame(store: UserStore, payload: dict):
 
 def _save_frame_envelope(store: UserStore, payload: dict, env: dict):
     """Persist a v1 frame envelope. The ciphertext blob is big (>150KB for
-    typical screen frames) so we keep it on disk as a separate .env.json
-    instead of inlining into frames_meta. frames_meta gets a lightweight
-    index entry with `encrypted=True`.
+    typical screen frames) so it lives in its own frame_envelopes row instead
+    of being inlined into the frames_meta index blob. frames_meta gets a
+    lightweight index entry with `encrypted=True`.
     """
     item_id = env.get("id") or uuid.uuid4().hex
     ts = payload.get("ts") or time.time()
-    env_path = store.frames_dir / f"{item_id}.env.json"
-    try:
-        env_path.write_text(json.dumps(env))
-    except Exception as e:
-        print(f"[ingest:{store.user_id}] envelope write failed id={item_id}: {e}")
-        return
+    db.frame_upsert(store.user_id, item_id, ts, env)
 
     meta = {
         "filename": f"{item_id}.env.json",
@@ -1238,9 +1004,7 @@ def _save_frame_envelope(store: UserStore, payload: dict, env: dict):
         store.frames_meta.append(meta)
         if len(store.frames_meta) > MAX_FRAMES:
             removed = store.frames_meta.pop(0)
-            old = store.frames_dir / removed["filename"]
-            if old.exists():
-                old.unlink()
+            db.frame_delete(store.user_id, removed.get("id") or removed["filename"].split(".")[0])
         store._persist_frames_meta()
 
     body_len = len(env.get("body_ct") or "")
@@ -1679,7 +1443,7 @@ def _decrypt_frame_metadata_for_gate(
     fid = str(frame_id or "").strip()
     if not fid:
         return {"frame_id": "", "error": "missing_frame_id"}
-    if _find_envelope_path(store, fid) is None:
+    if not _frame_exists(store, fid):
         return {"frame_id": fid, "error": "frame_not_found"}
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
@@ -4128,29 +3892,11 @@ def _log_bootstrap_event(store: UserStore, event_type: str, success: bool, error
         "error_message": error_message,
         "timestamp": datetime.now().isoformat(),
     }
-    try:
-        with open(store.bootstrap_events_file, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception as e:
-        print(f"[{store.user_id}/bootstrap_events] failed to log: {e}")
+    db.log_append(store.user_id, "bootstrap_events", entry)
 
 
 def _load_bootstrap_events(store: UserStore) -> list[dict]:
-    events: list[dict] = []
-    try:
-        if store.bootstrap_events_file.exists():
-            with open(store.bootstrap_events_file) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        events.append(json.loads(line))
-                    except Exception:
-                        continue
-    except Exception as e:
-        print(f"[{store.user_id}/bootstrap_events] failed to load: {e}")
-    return events
+    return db.log_read_all(store.user_id, "bootstrap_events")
 
 
 _OFFICIAL_CONSUMER_NAME = "feedling-chat-resident"
@@ -4159,22 +3905,16 @@ _CONSUMER_RECENT_SEC = int(os.environ.get("FEEDLING_CONSUMER_RECENT_SEC", "180")
 
 def _load_consumer_state(store: UserStore) -> dict:
     try:
-        if store.consumer_state_file.exists():
-            data = json.loads(store.consumer_state_file.read_text())
-            if isinstance(data, dict):
-                return data
+        data = db.get_blob(store.user_id, "consumer_state")
+        if isinstance(data, dict):
+            return data
     except Exception as e:
         print(f"[{store.user_id}/consumer_state] failed to load: {e}")
     return {}
 
 
 def _save_consumer_state(store: UserStore, state: dict) -> None:
-    try:
-        tmp = store.consumer_state_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2))
-        tmp.replace(store.consumer_state_file)
-    except Exception as e:
-        print(f"[{store.user_id}/consumer_state] failed to save: {e}")
+    db.set_blob(store.user_id, "consumer_state", state)
 
 
 def _consumer_headers_from_request() -> dict:
@@ -4415,23 +4155,12 @@ def _access_modes_payload(store: UserStore) -> dict:
 
 
 def _load_access_link_tokens() -> list[dict]:
-    path = _access_link_tokens_file()
-    try:
-        if path.exists():
-            data = json.loads(path.read_text())
-            return data if isinstance(data, list) else []
-    except Exception as e:
-        print(f"[access] failed to load link tokens: {e}")
-    return []
+    data = db.get_global_blob("access_link_tokens")
+    return data if isinstance(data, list) else []
 
 
 def _save_access_link_tokens(rows: list[dict]) -> None:
-    path = _access_link_tokens_file()
-    try:
-        path.write_text(json.dumps(rows, ensure_ascii=False, indent=2))
-        os.chmod(path, 0o600)
-    except Exception as e:
-        print(f"[access] failed to save link tokens: {e}")
+    db.set_global_blob("access_link_tokens", rows)
 
 
 def _trim_access_link_tokens(rows: list[dict]) -> list[dict]:
@@ -4685,7 +4414,7 @@ def users_set_preferences():
                 updated = True
                 break
         if updated:
-            _save_users()
+            db.upsert_user(u)
 
     if not updated:
         return jsonify({"error": "user not found"}), 404
@@ -4764,7 +4493,7 @@ def _set_user_public_key(user_id: str, public_key: str) -> bool:
                 updated = True
                 break
         if updated:
-            _save_users()
+            db.upsert_user(u)
     return updated
 
 
@@ -4874,35 +4603,12 @@ def _now_iso() -> str:
     return datetime.now().isoformat()
 
 
-def _read_json_object(path: Path) -> dict | None:
-    try:
-        if path.exists():
-            data = json.loads(path.read_text())
-            if isinstance(data, dict):
-                return data
-    except Exception as e:
-        print(f"[json] read failed path={path.name}: {e}")
-    return None
-
-
-def _write_json_object(path: Path, data: dict, *, private: bool = False) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2))
-    tmp.replace(path)
-    if private:
-        try:
-            os.chmod(path, 0o600)
-        except Exception:
-            pass
-
-
 def _normalize_onboarding_route(route: str) -> str:
     return _normalize_access_mode(route)
 
 
 def _load_onboarding_route(store: UserStore) -> str:
-    data = _read_json_object(store.onboarding_route_file) or {}
+    data = db.get_blob(store.user_id, "onboarding_route") or {}
     route = _normalize_onboarding_route(str(data.get("route") or "resident"))
     return route if route in MODEL_API_ROUTES else "resident"
 
@@ -4912,7 +4618,7 @@ def _save_onboarding_route(store: UserStore, route: str) -> dict:
     if normalized not in MODEL_API_ROUTES:
         raise ValueError("route must be resident, official_import, or model_api")
     data = {"route": normalized, "selected_at": _now_iso()}
-    _write_json_object(store.onboarding_route_file, data)
+    db.set_blob(store.user_id, "onboarding_route", data)
     return data
 
 
@@ -4939,7 +4645,7 @@ def onboarding_route():
 
 
 def _load_model_api_config(store: UserStore) -> dict | None:
-    data = _read_json_object(store.model_api_file)
+    data = db.get_blob(store.user_id, "model_api")
     if not data:
         return None
     if data.get("route") != "model_api":
@@ -4953,7 +4659,7 @@ def _save_model_api_config(store: UserStore, config: dict) -> dict:
     data["updated_at"] = _now_iso()
     if not data.get("created_at"):
         data["created_at"] = data["updated_at"]
-    _write_json_object(store.model_api_file, data, private=True)
+    db.set_blob(store.user_id, "model_api", data)
     return data
 
 
@@ -5188,20 +4894,15 @@ def model_api_test():
 @app.route("/v1/model_api/delete", methods=["DELETE"])
 def model_api_delete():
     store = require_user()
-    deleted = False
-    try:
-        if store.model_api_file.exists():
-            store.model_api_file.unlink()
-            deleted = True
-    except Exception as e:
-        return jsonify({"error": f"delete_failed:{type(e).__name__}"}), 500
+    deleted = db.delete_blob(store.user_id, "model_api")
     print(f"[model_api:{store.user_id}] deleted={deleted}")
     return jsonify({"deleted": deleted})
 
 
-def _history_job_path(store: UserStore, job_id: str) -> Path:
+def _history_job_kind(job_id: str) -> str:
+    """user_blobs kind for a single history-import job. One blob per job_id."""
     safe = re.sub(r"[^a-zA-Z0-9_-]", "", job_id or "")
-    return store.history_import_jobs_dir / f"{safe}.json"
+    return f"history_import_job:{safe}"
 
 
 HISTORY_IMPORT_STALE_SEC = int(os.environ.get("FEEDLING_HISTORY_IMPORT_STALE_SEC", str(30 * 60)))
@@ -5223,7 +4924,7 @@ _history_import_active_lock = threading.Lock()
 
 def _save_history_job(store: UserStore, job: dict) -> dict:
     job["updated_at"] = _now_iso()
-    _write_json_object(_history_job_path(store, job["job_id"]), job, private=True)
+    db.set_blob(store.user_id, _history_job_kind(job["job_id"]), job)
     return job
 
 
@@ -5281,14 +4982,7 @@ def _history_import_client_job_id(payload: dict) -> str:
 
 
 def _load_history_import_jobs(store: UserStore) -> list[dict]:
-    jobs: list[dict] = []
-    try:
-        for path in store.history_import_jobs_dir.glob("*.json"):
-            data = _read_json_object(path)
-            if data:
-                jobs.append(data)
-    except Exception:
-        return []
+    jobs = db.list_blobs(store.user_id, "history_import_job:")
     jobs.sort(key=lambda j: str(j.get("updated_at") or j.get("created_at") or ""))
     return jobs
 
@@ -6481,7 +6175,7 @@ def _run_history_import_job(
     payload: dict,
 ) -> None:
     try:
-        job = _read_json_object(_history_job_path(store, job_id)) or {
+        job = db.get_blob(store.user_id, _history_job_kind(job_id)) or {
             "job_id": job_id,
             "status": "queued",
             "created_at": _now_iso(),
@@ -6493,7 +6187,7 @@ def _run_history_import_job(
             f"memories={job.get('memories_created')} chat={job.get('chat_messages_imported')} async=1"
         )
     except Exception as e:
-        job = _read_json_object(_history_job_path(store, job_id)) or {
+        job = db.get_blob(store.user_id, _history_job_kind(job_id)) or {
             "job_id": job_id,
             "created_at": _now_iso(),
         }
@@ -6574,8 +6268,7 @@ def history_import_upload():
 @app.route("/v1/history_import/status/<job_id>", methods=["GET"])
 def history_import_status(job_id):
     store = require_user()
-    path = _history_job_path(store, job_id)
-    data = _read_json_object(path)
+    data = db.get_blob(store.user_id, _history_job_kind(job_id))
     if not data:
         return jsonify({"error": "job_not_found"}), 404
     return jsonify({"job": data})
@@ -7781,10 +7474,13 @@ def serve_frame(filename):
     # Reject path traversal
     if "/" in filename or ".." in filename:
         return jsonify({"error": "bad filename"}), 400
-    fpath = store.frames_dir / filename
-    if not fpath.exists():
+    # Filenames are `<frame_id>.env.json`; map back to the frame_id and serve
+    # the stored envelope JSON bytes (frames are always v1 ciphertext now).
+    frame_id = filename.split(".")[0]
+    env = db.frame_get(store.user_id, frame_id)
+    if env is None:
         return jsonify({"error": "not found"}), 404
-    return send_file(fpath, mimetype="image/jpeg")
+    return Response(json.dumps(env), mimetype="application/json")
 
 
 # --- Frame decrypt plumbing -------------------------------------------------
@@ -7808,24 +7504,19 @@ def serve_frame(filename):
 #                                         everything curl-reachable too.
 
 
-def _find_envelope_path(store, frame_id: str) -> Path | None:
-    """Locate the on-disk .env.json for a given frame id.
-
-    Fast path: filename is `<id>.env.json` — check that first. Fall back
-    to scanning frames_meta by id in case the filename convention shifts.
-    """
+def _load_envelope(store, frame_id: str) -> dict | None:
+    """Load a frame's stored v1 envelope doc by id, or None if absent/invalid."""
     if not re.match(r"^[a-f0-9]{16,64}$", frame_id):
         return None
-    direct = store.frames_dir / f"{frame_id}.env.json"
-    if direct.exists():
-        return direct
-    with store.frames_lock:
-        for meta in store.frames_meta:
-            if meta.get("id") == frame_id:
-                p = store.frames_dir / meta["filename"]
-                if p.exists():
-                    return p
-    return None
+    env = db.frame_get(store.user_id, frame_id)
+    return env if isinstance(env, dict) else None
+
+
+def _frame_exists(store, frame_id: str) -> bool:
+    """Existence guard for the proxy endpoints (no heavy body_ct fetch)."""
+    if not re.match(r"^[a-f0-9]{16,64}$", frame_id):
+        return False
+    return db.frame_exists(store.user_id, frame_id)
 
 
 @app.route("/v1/screen/frames/<frame_id>/envelope", methods=["GET"])
@@ -7837,15 +7528,9 @@ def frame_envelope(frame_id):
     ciphertext back for in-enclave decryption.
     """
     store = require_user()
-    fpath = _find_envelope_path(store, frame_id)
-    if fpath is None:
+    env = _load_envelope(store, frame_id)
+    if env is None:
         return jsonify({"error": "not found"}), 404
-    try:
-        env = json.loads(fpath.read_text())
-    except Exception as e:
-        return jsonify({"error": f"envelope parse: {e}"}), 500
-    if not isinstance(env, dict):
-        return jsonify({"error": "envelope not an object"}), 500
     return jsonify(env)
 
 
@@ -7858,8 +7543,7 @@ def frame_decrypt(frame_id):
     `include_image=true|false` to gate the base64 JPEG payload (large).
     """
     store = require_user()
-    fpath = _find_envelope_path(store, frame_id)
-    if fpath is None:
+    if not _frame_exists(store, frame_id):
         return jsonify({"error": "not found"}), 404
 
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
@@ -7891,8 +7575,7 @@ def frame_image(frame_id):
     throttle on dstack-gateway (~1 Mbps/stream, ~3-4 Mbps aggregate).
     """
     store = require_user()
-    fpath = _find_envelope_path(store, frame_id)
-    if fpath is None:
+    if not _frame_exists(store, frame_id):
         return jsonify({"error": "not found"}), 404
 
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
@@ -8668,8 +8351,9 @@ def chat_poll():
 
 def _load_identity(store: UserStore) -> dict | None:
     try:
-        if store.identity_file.exists():
-            return json.loads(store.identity_file.read_text())
+        data = db.get_blob(store.user_id, "identity")
+        if isinstance(data, dict):
+            return data
     except Exception as e:
         print(f"[{store.user_id}/identity] load failed: {e}")
     return None
@@ -8677,7 +8361,7 @@ def _load_identity(store: UserStore) -> dict | None:
 
 def _save_identity(store: UserStore, data: dict):
     with store.identity_lock:
-        store.identity_file.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        db.set_blob(store.user_id, "identity", data)
 
 
 # Identity change audit log
@@ -8703,32 +8387,16 @@ def _append_identity_change(store: UserStore, entry: dict) -> dict:
     for k in ("dimension", "old_value", "new_value", "delta", "reason"):
         if k in entry:
             record[k] = entry[k]
-    try:
-        with open(store.identity_changes_file, "a") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"[{store.user_id}/identity_changes] append failed: {e}")
+    # ts here is an ISO string, not an epoch — leave the indexed ts column NULL
+    # and keep the since/sort filtering in Python (string comparison) below.
+    db.log_append(store.user_id, "identity_changes", record)
     return record
 
 
 def _load_identity_changes(store: UserStore, since: str = "", limit: int = 50) -> list:
     """Read the audit log. `since` is an ISO timestamp string; results
     are filtered to entries with ts > since, newest-first, capped at limit."""
-    entries: list = []
-    try:
-        if store.identity_changes_file.exists():
-            with open(store.identity_changes_file) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entries.append(json.loads(line))
-                    except Exception:
-                        continue
-    except Exception as e:
-        print(f"[{store.user_id}/identity_changes] load failed: {e}")
-        return []
+    entries = db.log_read_all(store.user_id, "identity_changes")
     if since:
         entries = [e for e in entries if e.get("ts", "") > since]
     entries.sort(key=lambda e: e.get("ts", ""), reverse=True)
@@ -9729,8 +9397,7 @@ TAB_FOR_TYPE = {
 
 def _load_moments(store: UserStore) -> list:
     try:
-        if store.memory_file.exists():
-            return json.loads(store.memory_file.read_text())
+        return db.memory_load(store.user_id)
     except Exception as e:
         print(f"[{store.user_id}/memory] load failed: {e}")
     return []
@@ -9738,16 +9405,7 @@ def _load_moments(store: UserStore) -> list:
 
 def _save_moments(store: UserStore, moments: list):
     with store.memory_lock:
-        store.memory_file.write_text(json.dumps(moments, ensure_ascii=False, indent=2))
-
-
-def _append_jsonl(path: Path, record: dict) -> dict:
-    try:
-        with open(path, "a") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"[jsonl] append failed path={path.name}: {e}")
-    return record
+        db.memory_replace_all(store.user_id, moments)
 
 
 def _append_memory_change(store: UserStore, entry: dict) -> dict:
@@ -9763,7 +9421,9 @@ def _append_memory_change(store: UserStore, entry: dict) -> dict:
     ):
         if key in entry:
             record[key] = entry[key]
-    return _append_jsonl(store.memory_changes_file, record)
+    # ts is an ISO string here, so leave the indexed ts column NULL.
+    db.log_append(store.user_id, "memory_changes", record)
+    return record
 
 
 def _append_memory_capture_job(store: UserStore, entry: dict) -> dict:
@@ -9780,7 +9440,9 @@ def _append_memory_capture_job(store: UserStore, entry: dict) -> dict:
     ):
         if key in entry:
             job[key] = entry[key]
-    return _append_jsonl(store.memory_capture_jobs_file, job)
+    db.log_append(store.user_id, "memory_capture_jobs", job,
+                  ts=job["ts"], item_key=job["job_id"])
+    return job
 
 
 def _count_by_tab(moments: list) -> dict:
@@ -10504,8 +10166,9 @@ def memory_delete():
 
 def _load_bootstrap(store: UserStore) -> dict:
     try:
-        if store.bootstrap_file.exists():
-            return json.loads(store.bootstrap_file.read_text())
+        data = db.get_blob(store.user_id, "bootstrap")
+        if isinstance(data, dict):
+            return data
     except Exception as e:
         print(f"[{store.user_id}/bootstrap] load failed: {e}")
     return {"bootstrapped": False}
@@ -10583,10 +10246,7 @@ def bootstrap():
     )
 
     state = {"bootstrapped": True, "bootstrapped_at": datetime.now().isoformat()}
-    try:
-        store.bootstrap_file.write_text(json.dumps(state))
-    except Exception as e:
-        print(f"[bootstrap:{store.user_id}] failed to save state: {e}")
+    db.set_blob(store.user_id, "bootstrap", state)
 
     _log_bootstrap_event(store, "bootstrap_started", success=True)
     print(f"[bootstrap:{store.user_id}] first_time — instructions returned")
@@ -10995,14 +10655,7 @@ def _model_api_hosted_chat_verified(store) -> bool:
 
 
 def _latest_history_import_job(store: UserStore) -> dict | None:
-    jobs: list[dict] = []
-    try:
-        for path in store.history_import_jobs_dir.glob("*.json"):
-            data = _read_json_object(path)
-            if data:
-                jobs.append(data)
-    except Exception:
-        return None
+    jobs = db.list_blobs(store.user_id, "history_import_job:")
     if not jobs:
         return None
     jobs.sort(key=lambda j: str(j.get("updated_at") or j.get("created_at") or ""))
@@ -11397,8 +11050,8 @@ def _chat_stats(store: UserStore) -> dict:
 
 def _memory_stats(store: UserStore) -> dict:
     moments = _load_moments(store)
-    changes = store._read_jsonl(store.memory_changes_file, limit=0)
-    capture_jobs = store._read_jsonl(store.memory_capture_jobs_file, limit=0)
+    changes = db.log_read_all(store.user_id, "memory_changes")
+    capture_jobs = db.log_read_all(store.user_id, "memory_capture_jobs")
     by_type = {typ: 0 for typ in MEMORY_TYPES}
     by_tab = {"story": 0, "about_me": 0, "ta_thinking": 0}
     by_source: dict[str, int] = {}
@@ -11580,7 +11233,7 @@ def _bootstrap_event_stats(store: UserStore, *, include_events: bool = False) ->
 def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) -> dict:
     user_id = str(user_entry.get("user_id") or "")
     store = get_store(user_id)
-    route_data = _read_json_object(store.onboarding_route_file) or {}
+    route_data = db.get_blob(store.user_id, "onboarding_route") or {}
     route = _load_onboarding_route(store)
     access_modes = _public_access_mode_state(dict(user_entry), route)
     access_connected = [
@@ -12014,17 +11667,19 @@ def chat_verify_loop():
     # exchange is a private liveness test; it must not open Chat as the
     # user's visible "First message."
     with store.chat_lock:
-        store.chat_messages = [
-            m for m in store.chat_messages
-            if not (
+        def _is_synthetic(m):
+            return (
                 isinstance(m, dict)
                 and (
                     m.get("source") == "verify_ping"
                     or (found_reply_id and m.get("id") == found_reply_id)
                 )
             )
-        ]
-        store._persist_chat()
+        removed_ids = [m.get("id") for m in store.chat_messages if _is_synthetic(m)]
+        store.chat_messages = [m for m in store.chat_messages if not _is_synthetic(m)]
+        for rid in removed_ids:
+            if rid:
+                db.chat_delete(store.user_id, rid)
 
     suggestions = []
     if not found_reply:
@@ -12100,6 +11755,9 @@ def _swap_chat(store: "UserStore", msg_id: str, env: dict) -> str:
             msg["enclave_pk_fpr"] = env.get("enclave_pk_fpr", "")
             msg["visibility"] = env["visibility"]
             msg["owner_user_id"] = env["owner_user_id"]
+            # Full-row replace: the K_enclave key may have been removed, which a
+            # JSONB shallow-merge can't express, so we overwrite the whole doc.
+            db.chat_append(store.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
             return "ok"
     return "not_found"
 
@@ -12244,7 +11902,6 @@ def content_swap():
         return jsonify({"results": [], "summary": _swap_summary([])})
 
     results: list[dict] = []
-    chat_dirty = False
     memory_dirty = False
     moments = None
 
@@ -12276,9 +11933,8 @@ def content_swap():
             continue
 
         if itype == "chat":
+            # _swap_chat persists the matched message to the DB itself.
             status = _swap_chat(store, iid, env)
-            if status == "ok":
-                chat_dirty = True
             results.append({"type": "chat", "id": iid, "status": status})
         else:
             if moments is None:
@@ -12288,9 +11944,6 @@ def content_swap():
                 memory_dirty = True
             results.append({"type": "memory", "id": iid, "status": status})
 
-    if chat_dirty:
-        with store.chat_lock:
-            store._persist_chat()
     if memory_dirty and moments is not None:
         _save_moments(store, moments)
 
@@ -12415,16 +12068,19 @@ def content_rewrap_to_current_key():
                 moments[idx]["rewrapped_at"] = now
         _save_moments(store, moments)
 
-    chat_dirty = False
+    swapped_ids: set[str] = set()
     for item_id, env in chat_plans:
+        # _swap_chat persists the swapped envelope fields to the DB itself.
         if _swap_chat(store, item_id, env) == "ok":
-            chat_dirty = True
-    if chat_dirty:
+            swapped_ids.add(item_id)
+    if swapped_ids:
+        # Stamp rewrapped_at on the affected in-memory messages and persist the
+        # full updated rows (chat is row-per-message in PostgreSQL now).
         with store.chat_lock:
             for msg in store.chat_messages:
-                if isinstance(msg, dict) and msg.get("id") in {item_id for item_id, _ in chat_plans}:
+                if isinstance(msg, dict) and msg.get("id") in swapped_ids:
                     msg["rewrapped_at"] = now
-            store._persist_chat()
+                    db.chat_append(store.user_id, msg["id"], msg["ts"], msg, MAX_CHAT_MESSAGES)
 
     if not _set_user_public_key(store.user_id, requested_public_key):
         return jsonify({"error": "user not found"}), 404
@@ -12469,23 +12125,19 @@ def content_export():
     moments = _load_moments(store)
     identity = _load_identity(store)
 
-    # Inline each frame's on-disk envelope. frames_meta is the index; the
-    # ciphertext lives in <frames_dir>/<id>.env.json. A missing env file
-    # just means the frame was evicted mid-read — skip it rather than 500.
+    # Inline each frame's stored envelope. frames_meta is the index; the
+    # ciphertext lives in its frame_envelopes row. A missing row just means the
+    # frame was evicted mid-read — skip it rather than 500.
     frames_out: list[dict] = []
     with store.frames_lock:
         frame_index = [f.copy() for f in store.frames_meta]
     for meta in frame_index:
-        env_path = store.frames_dir / meta["filename"]
-        if not env_path.exists():
-            continue
-        try:
-            envelope = json.loads(env_path.read_text())
-        except Exception as e:
-            print(f"[export:{store.user_id}] skipping frame {meta.get('id')}: {e}")
+        fid = meta.get("id")
+        envelope = db.frame_get(store.user_id, fid) if fid else None
+        if not isinstance(envelope, dict):
             continue
         frames_out.append({
-            "id": meta.get("id"),
+            "id": fid,
             "ts": meta.get("ts"),
             "w": meta.get("w", 0),
             "h": meta.get("h", 0),
@@ -12557,8 +12209,8 @@ def account_reset():
 
     user_id = store.user_id
 
-    # Remove the user from users.json FIRST so any in-flight requests
-    # carrying the old api_key fail auth immediately.
+    # Remove the user record FIRST so any in-flight requests carrying the old
+    # api_key fail auth immediately.
     with _users_lock:
         before = len(_users)
         _users[:] = [u for u in _users if u.get("user_id") != user_id]
@@ -12567,25 +12219,27 @@ def account_reset():
         to_evict = [h for h, uid in _key_to_user.items() if uid == user_id]
         for h in to_evict:
             _key_to_user.pop(h, None)
-        _save_users()
+        db.delete_user(user_id)
 
-    # Then remove the user's data directory.
-    deleted_dir = False
+    # Then hard-delete all of the user's data rows (chat / memory / frames /
+    # logs / blobs) and evict the cached in-memory store.
+    db.delete_user_data(user_id)
+    with _stores_lock:
+        _stores.pop(user_id, None)
+
+    # Best-effort cleanup of any residual on-disk dir (pre-migration leftovers).
     try:
         import shutil
-        # Defense in depth: make sure we're about to delete a per-user dir
-        # under FEEDLING_DIR, not FEEDLING_DIR itself or something above it.
         if (
             store.dir.exists()
             and store.dir != FEEDLING_DIR
             and store.dir.parent == FEEDLING_DIR
         ):
             shutil.rmtree(store.dir)
-            deleted_dir = True
     except Exception as e:
-        print(f"[reset:{user_id}] rmtree failed: {e}")
+        print(f"[reset:{user_id}] residual dir cleanup failed: {e}")
 
-    print(f"[reset:{user_id}] deleted (user_record={removed} dir={deleted_dir})")
+    print(f"[reset:{user_id}] deleted (user_record={removed})")
     return jsonify({"deleted": True, "user_id": user_id})
 
 

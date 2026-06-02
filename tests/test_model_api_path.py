@@ -21,7 +21,6 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "USERS_FILE", tmp_path / "users.json")
     appmod._users[:] = []
     appmod._key_to_user.clear()
     appmod._stores.clear()
@@ -114,7 +113,7 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     assert get_res.status_code == 200
     assert "api_key_envelope" not in get_res.get_json()["config"]
 
-    config_text = (appmod.FEEDLING_DIR / user_id / "model_api.json").read_text()
+    config_text = appmod.json.dumps(appmod.db.get_blob(user_id, "model_api") or {})
     assert raw_provider_key not in config_text
     assert "api_key_envelope" in config_text
 
@@ -303,7 +302,7 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     assert any(row["source"] == "model_api" and row["role"] == "user" for row in rows)
     assert any(row["source"] == "model_api" and row["role"] == "openclaw" for row in rows)
     assert all("body_ct" in row for row in rows if row["source"] == "model_api")
-    assert "sk-test-secret" not in (appmod.FEEDLING_DIR / user_id / "model_api.json").read_text()
+    assert "sk-test-secret" not in appmod.json.dumps(appmod.db.get_blob(user_id, "model_api") or {})
 
 
 def test_history_import_reuses_inflight_client_job(client, monkeypatch):

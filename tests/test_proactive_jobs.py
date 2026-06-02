@@ -997,7 +997,9 @@ def test_chat_history_supports_lightweight_images_and_before_cursor(tmp_path, mo
             content_type=content_type,
         )
         msg["ts"] = float(idx)
-        store._persist_chat()
+        # Persist the deterministic ts override through the DB layer (the old
+        # file-based store._persist_chat() is gone — chat is row-per-message now).
+        appmod.db.chat_append(user_id, msg["id"], msg["ts"], msg, appmod.MAX_CHAT_MESSAGES)
         return msg
 
     for i in range(1, 6):

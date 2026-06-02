@@ -38,6 +38,10 @@ mkdir -p "$DATA_DIR"
 echo "=== 3. Ensure env file exists ==="
 if [ ! -f "$ENV_FILE" ]; then
     cat > "$ENV_FILE" <<EOF
+# REQUIRED: all per-user data lives in PostgreSQL now (see backend/db.py).
+# The backend will not boot without DATABASE_URL. Point it at your Postgres;
+# for an external/managed instance add ?sslmode=require.
+DATABASE_URL=postgresql://feedling:CHANGE_ME@127.0.0.1:5432/feedling
 FEEDLING_DATA_DIR=$DATA_DIR
 FEEDLING_FLASK_URL=http://127.0.0.1:5001
 FEEDLING_MCP_PORT=5002
@@ -45,6 +49,7 @@ FEEDLING_MCP_TRANSPORT=sse
 EOF
     chmod 600 "$ENV_FILE"
     echo "    wrote $ENV_FILE (multi-tenant — users register via iOS and receive per-user api_keys)"
+    echo "    NOTE: edit DATABASE_URL in $ENV_FILE — Postgres is now required."
 else
     echo "    $ENV_FILE already exists — leaving alone"
 fi

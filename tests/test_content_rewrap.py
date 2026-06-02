@@ -19,7 +19,6 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "USERS_FILE", tmp_path / "users.json")
     appmod._users[:] = []
     appmod._key_to_user.clear()
     appmod._stores.clear()
@@ -92,7 +91,7 @@ def _seed_encrypted_content(user_id: str) -> dict[str, str]:
     }
     with store.chat_lock:
         store.chat_messages = [chat]
-        store._persist_chat()
+        appmod.db.chat_append(user_id, chat["id"], chat["ts"], chat, appmod.MAX_CHAT_MESSAGES)
     return {
         "identity_K_user": identity["K_user"],
         "memory_K_user": memory["K_user"],

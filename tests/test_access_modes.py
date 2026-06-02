@@ -19,7 +19,6 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "USERS_FILE", tmp_path / "users.json")
     appmod._users[:] = []
     appmod._key_to_user.clear()
     appmod._stores.clear()
@@ -125,7 +124,7 @@ def test_link_token_claim_issues_new_key_for_same_user(client):
     second_claim = client.post("/v1/access/claim-token", json={"token": token})
     assert second_claim.status_code == 409
 
-    users_json = json.loads((appmod.FEEDLING_DIR / "users.json").read_text())
+    users_json = appmod.db.load_all_users()
     assert len(users_json) == 1
     assert len(users_json[0]["api_keys"]) == 2
 

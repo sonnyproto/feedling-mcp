@@ -1,0 +1,34 @@
+# CI-only override for deploy/docker-compose.yaml.
+#
+# The production compose intentionally does NOT bundle a Postgres service —
+# the backend talks to an EXTERNAL managed Postgres, and baking a DB service
+# in would change the on-chain compose_hash and the trust model. But the CI
+# "compose up + healthcheck" smoke test needs a reachable database, so this
+# override (used only in CI, never published / never part of compose_hash)
+# adds a throwaway Postgres and points the backend at it over the compose
+# network.
+#
+# Usage (CI only):
+#   docker compose -f deploy/docker-compose.yaml -f deploy/docker-compose.ci.yml up -d
+#   docker compose -f deploy/docker-compose.yaml -f deploy/docker-compose.ci.yml down -v
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: feedling
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    environment:
+      # sslmode=disable: the DB is on the trusted compose network in CI, not
+      # an external endpoint, so TLS isn't required for this smoke test.
+      DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/feedling?sslmode=disable"
+    depends_on:
+      postgres:
+        condition: service_healthy

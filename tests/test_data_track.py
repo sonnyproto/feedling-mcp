@@ -19,7 +19,6 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "USERS_FILE", tmp_path / "users.json")
     monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", "admin-test-token")
     appmod._users[:] = []
     appmod._key_to_user.clear()
@@ -134,11 +133,11 @@ def test_admin_data_track_aggregates_counts_without_content(client):
             {"id": "mem_2", "type": "fact", "source": "chat", "created_at": "2026-06-01T02:00:00"},
         ],
     )
-    store.identity_file.write_text(json.dumps({
+    appmod.db.set_blob(store.user_id, "identity", {
         "updated_at": "2026-06-01T03:00:00",
         "relationship_started_at": "2026-06-01",
         "relationship_anchor_evidence": "private evidence",
-    }))
+    })
     store.append_tracking_event(appmod._make_tracking_event(
         store,
         "onboarding_connection_copied",

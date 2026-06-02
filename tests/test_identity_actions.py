@@ -19,7 +19,6 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "USERS_FILE", tmp_path / "users.json")
     appmod._users[:] = []
     appmod._key_to_user.clear()
     appmod._stores.clear()
@@ -62,8 +61,7 @@ def _plain_identity() -> dict:
 
 
 def _seed_identity(user_id: str) -> None:
-    store = appmod.get_store(user_id)
-    store.identity_file.write_text(json.dumps({
+    appmod.db.set_blob(user_id, "identity", {
         "v": 1,
         "id": "identity_1",
         "body_ct": "old",
@@ -77,12 +75,11 @@ def _seed_identity(user_id: str) -> None:
         "relationship_started_at": "2026-04-01",
         "relationship_anchor_source": "test",
         "relationship_anchor_evidence": "seeded identity for test",
-    }))
+    })
 
 
 def _seed_memory(user_id: str, memory_id: str = "mom_1") -> None:
-    store = appmod.get_store(user_id)
-    store.memory_file.write_text(json.dumps([{
+    appmod.db.memory_replace_all(user_id, [{
         "v": 1,
         "id": memory_id,
         "type": "fact",
@@ -95,7 +92,7 @@ def _seed_memory(user_id: str, memory_id: str = "mom_1") -> None:
         "K_enclave": "old_k_enclave",
         "visibility": "shared",
         "owner_user_id": user_id,
-    }]))
+    }])
 
 
 def _plain_memory() -> dict:
@@ -157,7 +154,7 @@ def test_identity_profile_patch_reencrypts_existing_card(client, monkeypatch):
     assert body["effects"][0]["fields"] == ["agent_name"]
     assert captured_plaintexts[-1]["agent_name"] == "小秘"
     assert captured_plaintexts[-1]["self_introduction"] == _plain_identity()["self_introduction"]
-    saved = json.loads(appmod.get_store(user_id).identity_file.read_text())
+    saved = appmod.db.get_blob(user_id, "identity")
     assert saved["id"] == "identity_1"
     assert saved["body_ct"] == "ct_1"
     assert saved["relationship_started_at"] == "2026-04-01"
@@ -243,7 +240,7 @@ def test_memory_content_patch_reencrypts_existing_card(client, monkeypatch):
     assert body["effects"][0]["memory_id"] == "mom_1"
     assert captured_plaintexts[-1]["description"] == "User moved to Tokyo in April."
     assert captured_plaintexts[-1]["title"] == "Wrong city"
-    saved = json.loads(appmod.get_store(user_id).memory_file.read_text())[0]
+    saved = appmod.db.memory_load(user_id)[0]
     assert saved["id"] == "mom_1"
     assert saved["body_ct"] == "ct_1"
     assert saved["updated_at"]

@@ -61,6 +61,22 @@
 #                                     how frame URLs are rendered back to
 #                                     clients. Plaintext frame URLs are
 #                                     authed-only anyway.
+#   DATABASE_URL                    — SECURITY-RELEVANT (attested config, not
+#                                     Category A). Points the backend at the
+#                                     external Postgres that holds every
+#                                     (E2E-encrypted) envelope plus plaintext
+#                                     metadata (user_id / timestamps / app
+#                                     names / visibility). MUST be
+#                                     sslmode=require. The operator cannot
+#                                     silently redirect to a snooping DB: this
+#                                     value is part of the audited deployment
+#                                     config, so changing it changes the data
+#                                     store and MUST be re-published with a new
+#                                     compose_hash. Defaulted to empty (not `:?`)
+#                                     so `compose build` doesn't abort on parse;
+#                                     an unset value still fails loudly at
+#                                     backend startup (db.py), never silently
+#                                     falling back to files.
 
 name: feedling
 
@@ -79,6 +95,13 @@ services:
       FEEDLING_API_KEY: ""
       FEEDLING_DATA_DIR: "/data"
       FEEDLING_WS_PORT: "9998"
+      # --- ATTESTED CONFIG: security-relevant external data store. See the
+      #     §ENV-VAR HYGIENE AUDIT note above. Must include sslmode=require.
+      #     Defaulted to empty (not `:?`) so `docker compose build`, which
+      #     interpolates the whole file before building, does not abort when
+      #     the var is unset. There is still NO silent file fallback: if unset
+      #     at runtime the backend fails fast at startup (db.py raises). ---
+      DATABASE_URL: "${DATABASE_URL:-}"
       # --- MUTABLE: category (A), not security-relevant ---
       FEEDLING_PUBLIC_BASE_URL: "${FEEDLING_PUBLIC_BASE_URL:-}"
       FEEDLING_PUSH_COOLDOWN_SEC: "${FEEDLING_PUSH_COOLDOWN_SEC:-300}"
