@@ -4916,12 +4916,14 @@ HISTORY_IMPORT_STALE_SEC = int(os.environ.get("FEEDLING_HISTORY_IMPORT_STALE_SEC
 _HISTORY_IMPORT_PHASES = {
     "upload_received": (5, "Upload received"),
     "parsing_materials": (15, "Reading materials"),
-    "chat_history_importing": (25, "Reading chat history"),
-    "memory_extracting": (45, "Extracting Memory Garden"),
-    "memory_writing": (60, "Writing Memory Garden"),
-    "identity_deriving": (75, "Deriving Identity Card"),
-    "relationship_anchor_writing": (85, "Writing relationship anchor"),
-    "hosted_chat_preparing": (93, "Preparing hosted chat"),
+    "chat_history_importing": (24, "Reading chat history"),
+    "candidate_extracting": (38, "Distilling memory candidates"),
+    "candidate_merging": (52, "Merging memory candidates"),
+    "memory_writing": (64, "Writing core Memory Garden"),
+    "identity_deriving": (76, "Deriving Identity Card"),
+    "relationship_anchor_writing": (86, "Writing relationship anchor"),
+    "hosted_chat_preparing": (92, "Preparing hosted chat"),
+    "background_importing": (96, "Continuing history distillation"),
     "completed": (100, "Completed"),
     "failed": (100, "Failed"),
 }
@@ -5622,44 +5624,194 @@ def _transcript_extraction_windows(
     max_chars: int = 18000,
     max_windows: int = 8,
 ) -> list[str]:
+    return [w["text"] for w in _build_transcript_windows(messages, max_chars=max_chars, max_windows=max_windows)]
+
+
+def _select_evenly(items: list[Any], limit: int) -> list[Any]:
+    if limit <= 0:
+        return []
+    if len(items) <= limit:
+        return list(items)
+    idxs = {
+        round(i * (len(items) - 1) / max(limit - 1, 1))
+        for i in range(limit)
+    }
+    return [items[i] for i in sorted(idxs)]
+
+
+def _build_transcript_windows(
+    messages: list[dict],
+    *,
+    max_chars: int = 18000,
+    max_windows: int | None = None,
+    overlap_lines: int = 8,
+) -> list[dict]:
     support = [m for m in messages if str(m.get("source") or "") in _IMPORT_SUPPORT_SOURCES]
     history = [m for m in messages if str(m.get("source") or "") not in _IMPORT_SUPPORT_SOURCES]
     support_text = _sequential_transcript_sample(support, min(4500, max_chars // 4))
-    history_lines = [_format_import_message_line(m) for m in history]
-    history_lines = [line for line in history_lines if line]
+    history_lines = [
+        {
+            "line": _format_import_message_line(m),
+            "ts": m.get("ts"),
+            "source": str(m.get("source") or "history_import"),
+        }
+        for m in history
+    ]
+    history_lines = [item for item in history_lines if item["line"]]
 
     if not history_lines:
         only = _transcript_sample(support, max_chars=max_chars)
-        return [only] if only else []
+        return [{
+            "id": "support-1",
+            "index": 1,
+            "total": 1,
+            "text": only,
+            "line_start": 0,
+            "line_end": 0,
+            "first_ts": None,
+            "last_ts": None,
+            "support_only": True,
+        }] if only else []
 
     prefix = ("[Onboarding support material]\n" + support_text + "\n\n") if support_text else ""
     line_budget = max(4000, max_chars - len(prefix) - 80)
-    chunks: list[str] = []
-    current: list[str] = []
+    chunks: list[dict] = []
+    current: list[dict] = []
+    current_start = 0
     total = 0
-    for line in history_lines:
+    for idx, item in enumerate(history_lines):
+        line = item["line"]
         if current and total + len(line) + 1 > line_budget:
-            chunks.append("\n".join(current))
-            current = []
-            total = 0
-        current.append(line)
+            chunks.append({
+                "line_start": current_start,
+                "line_end": current_start + len(current) - 1,
+                "items": current,
+            })
+            overlap = current[-overlap_lines:] if overlap_lines > 0 else []
+            current = list(overlap)
+            current_start = max(0, idx - len(current))
+            total = sum(len(x["line"]) + 1 for x in current)
+        current.append(item)
         total += len(line) + 1
     if current:
-        chunks.append("\n".join(current))
+        chunks.append({
+            "line_start": current_start,
+            "line_end": current_start + len(current) - 1,
+            "items": current,
+        })
 
-    if len(chunks) > max_windows:
-        keep: list[int] = []
-        for i in range(max_windows):
-            keep.append(round(i * (len(chunks) - 1) / max(max_windows - 1, 1)))
-        chunks = [chunks[i] for i in sorted(set(keep))]
+    if max_windows is not None and len(chunks) > max_windows:
+        chunks = _select_evenly(chunks, max_windows)
 
-    windows: list[str] = []
+    windows: list[dict] = []
     total_windows = len(chunks)
     for idx, chunk in enumerate(chunks, start=1):
-        windows.append(
-            f"{prefix}[Chat history window {idx}/{total_windows}]\n{chunk}".strip()
-        )
+        first_ts = next((x.get("ts") for x in chunk["items"] if x.get("ts")), None)
+        last_ts = next((x.get("ts") for x in reversed(chunk["items"]) if x.get("ts")), None)
+        body = "\n".join(x["line"] for x in chunk["items"])
+        windows.append({
+            "id": f"window-{idx:03d}",
+            "index": idx,
+            "total": total_windows,
+            "text": f"{prefix}[Chat history window {idx}/{total_windows}]\n{body}".strip(),
+            "line_start": chunk["line_start"],
+            "line_end": chunk["line_end"],
+            "first_ts": first_ts,
+            "last_ts": last_ts,
+            "support_only": False,
+        })
     return windows
+
+
+def _history_span_days(messages: list[dict]) -> int:
+    dates: list[date] = []
+    for msg in messages:
+        try:
+            ts = msg.get("ts")
+            if ts:
+                dates.append(datetime.fromtimestamp(float(ts)).date())
+        except Exception:
+            pass
+    if len(dates) < 2:
+        return 0
+    return max(0, (max(dates) - min(dates)).days)
+
+
+_HISTORY_IMPORT_TIER_CONFIG = {
+    "small": {
+        "label": "small",
+        "initial_windows": 8,
+        "total_windows": 8,
+        "story": 4,
+        "about_me": 8,
+        "ta_thinking": 0,
+        "total": 12,
+        "chat_ready_cards": 2,
+        "background": False,
+    },
+    "medium": {
+        "label": "medium",
+        "initial_windows": 24,
+        "total_windows": 24,
+        "story": 12,
+        "about_me": 28,
+        "ta_thinking": 2,
+        "total": 42,
+        "chat_ready_cards": 8,
+        "background": False,
+    },
+    "large": {
+        "label": "large",
+        "initial_windows": 36,
+        "total_windows": 64,
+        "story": 24,
+        "about_me": 56,
+        "ta_thinking": 6,
+        "total": 86,
+        "chat_ready_cards": 20,
+        "background": True,
+    },
+    "ultra": {
+        "label": "ultra",
+        "initial_windows": 36,
+        "total_windows": 96,
+        "story": 32,
+        "about_me": 78,
+        "ta_thinking": 10,
+        "total": 120,
+        "chat_ready_cards": 20,
+        "background": True,
+    },
+}
+
+
+def _history_import_profile(
+    history_messages: list[dict],
+    support_messages: list[dict],
+    *,
+    content_chars: int | None = None,
+) -> dict:
+    message_count = len(history_messages)
+    support_chars = sum(len(str(m.get("content") or "")) for m in support_messages)
+    history_chars = content_chars if content_chars is not None else sum(len(str(m.get("content") or "")) for m in history_messages)
+    span_days = _history_span_days(history_messages)
+    if message_count >= 250_000 or history_chars >= 10_000_000 or span_days >= 1095:
+        tier = "ultra"
+    elif message_count >= 50_000 or history_chars >= 2_000_000 or span_days >= 365:
+        tier = "large"
+    elif message_count >= 5_000 or history_chars >= 200_000 or span_days >= 90:
+        tier = "medium"
+    else:
+        tier = "small"
+    return {
+        "tier": tier,
+        "message_count": message_count,
+        "support_count": len(support_messages),
+        "history_chars": int(history_chars),
+        "support_chars": support_chars,
+        "span_days": span_days,
+        **_HISTORY_IMPORT_TIER_CONFIG[tier],
+    }
 
 
 def _json_from_model_text(text: str):
@@ -5687,9 +5839,9 @@ _GENERIC_IMPORT_TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 _LOW_VALUE_IMPORT_PATTERNS = [
-    re.compile(r"请(?:你)?(?:为我)?介绍一下(?:什么是|.+?是什么)"),
-    re.compile(r"(?:什么是|有哪些|可以从哪些方面|如何更好地).*?(?:矿泉水|水源|黄山|北纬30)"),
-    re.compile(r"^(?:继续|还有吗|再举例一些|[0-9]+)$"),
+    re.compile(r"^\s*(?:请|帮我|麻烦|can you|could you|please)\s*.{0,80}(?:介绍|解释|列出|生成|写|改写|优化|summarize|explain|write|list)", re.IGNORECASE),
+    re.compile(r"^\s*(?:什么是|有哪些|如何|怎么|what is|what are|how to|how do i)\b", re.IGNORECASE),
+    re.compile(r"^(?:继续|还有吗|再举例一些|more|continue|[0-9]+)$", re.IGNORECASE),
     re.compile(r"i'?m sorry,?\s+i don'?t understand", re.IGNORECASE),
 ]
 
@@ -5700,6 +5852,35 @@ def _normalize_card_similarity_text(text: str) -> str:
     return raw[:260]
 
 
+def _memory_similarity_tokens(text: str) -> set[str]:
+    raw = str(text or "").lower()
+    latin = set(re.findall(r"[a-z0-9][a-z0-9_-]{2,}", raw))
+    cjk = re.findall(r"[\u4e00-\u9fff]", raw)
+    grams = {''.join(cjk[idx:idx + 2]) for idx in range(max(0, len(cjk) - 1))}
+    if len(cjk) <= 3:
+        grams.update(cjk)
+    return {tok for tok in latin.union(grams) if tok}
+
+
+def _token_jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / max(1, len(a | b))
+
+
+_SENSITIVE_IDENTITY_CLAIM_PATTERNS = [
+    re.compile(r"(?:真实姓名|真实名字|本名|法定姓名|身份证|证件号|住址|家庭住址)"),
+    re.compile(r"\b(?:real|legal)\s+name\b", re.IGNORECASE),
+    re.compile(r"\b(?:id|passport|social security)\s+(?:number|no\.?)\b", re.IGNORECASE),
+    re.compile(r"\b(?:home|residential)\s+address\b", re.IGNORECASE),
+]
+
+
+def _looks_like_sensitive_identity_claim(text: str) -> bool:
+    raw = str(text or "")
+    return any(pattern.search(raw) for pattern in _SENSITIVE_IDENTITY_CLAIM_PATTERNS)
+
+
 def _looks_like_low_value_import_card(title: str, desc: str, mem_type: str) -> bool:
     clean_title = str(title or "").strip()
     clean_desc = str(desc or "").strip()
@@ -5708,13 +5889,546 @@ def _looks_like_low_value_import_card(title: str, desc: str, mem_type: str) -> b
         return True
     if len(clean_desc) < 8:
         return True
-    if any(p.search(joined) for p in _LOW_VALUE_IMPORT_PATTERNS):
+    if any(p.search(joined) or p.search(clean_desc) for p in _LOW_VALUE_IMPORT_PATTERNS):
         return True
     if mem_type in {"fact", "event"}:
         normalized = _normalize_card_similarity_text(clean_desc)
         if len(normalized) < 12:
             return True
     return False
+
+
+def _sort_memory_cards_newest_first(cards: list[dict]) -> list[dict]:
+    def sort_key(card: dict) -> tuple[int, str]:
+        raw_date = str(card.get("occurred_at") or "")[:10]
+        parsed = _parse_iso_calendar_date(raw_date)
+        ordinal = parsed.toordinal() if parsed else 0
+        return ordinal, str(card.get("created_at") or "")
+
+    return sorted(cards, key=sort_key, reverse=True)
+
+
+_IMPORT_CANDIDATE_TYPES = {
+    "user_fact",
+    "preference",
+    "boundary",
+    "relationship_event",
+    "emotional_pattern",
+    "communication_style",
+    "conflict_repair",
+    "ai_character",
+    "external_memory",
+}
+_IMPORT_CANDIDATE_SUBJECTS = {"user", "ai", "relationship"}
+
+
+def _candidate_type_from_memory_type(mem_type: str) -> str:
+    if mem_type in {"moment", "quote"}:
+        return "relationship_event"
+    if mem_type == "insight":
+        return "emotional_pattern"
+    if mem_type == "reflection":
+        return "ai_character"
+    return "user_fact"
+
+
+def _coerce_import_candidates(
+    raw,
+    relationship_start: date,
+    *,
+    window_id: str = "",
+) -> list[dict]:
+    if isinstance(raw, dict):
+        raw_items = raw.get("candidates")
+        if raw_items is None:
+            raw_items = raw.get("memories") or raw.get("cards") or raw.get("items") or []
+    else:
+        raw_items = raw
+    if not isinstance(raw_items, list):
+        return []
+
+    out: list[dict] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        legacy_type = str(item.get("type") or "").strip().lower()
+        cand_type = str(item.get("candidate_type") or item.get("kind") or "").strip().lower()
+        if not cand_type and legacy_type:
+            cand_type = _candidate_type_from_memory_type(legacy_type)
+        if cand_type not in _IMPORT_CANDIDATE_TYPES:
+            cand_type = "user_fact"
+        subject = str(item.get("subject") or "").strip().lower()
+        if subject not in _IMPORT_CANDIDATE_SUBJECTS:
+            subject = "ai" if cand_type == "ai_character" else ("relationship" if cand_type in {"relationship_event", "conflict_repair", "emotional_pattern"} else "user")
+        title = str(item.get("title") or "").strip()[:120]
+        summary = str(item.get("summary") or item.get("description") or item.get("content") or "").strip()
+        summary = _clean_import_memory_text(summary, max_chars=1400)
+        if not summary or _looks_like_low_value_import_card(title, summary, legacy_type or "fact"):
+            continue
+        if _looks_like_import_artifact(summary) or _looks_like_import_artifact(title):
+            continue
+        quotes_raw = item.get("evidence_quotes") or item.get("quotes") or item.get("quote") or item.get("her_quote") or []
+        if isinstance(quotes_raw, str):
+            quotes = [quotes_raw]
+        elif isinstance(quotes_raw, list):
+            quotes = [str(q).strip() for q in quotes_raw if str(q).strip()]
+        else:
+            quotes = []
+        quotes = [
+            _clean_import_memory_text(q, max_chars=360)
+            for q in quotes
+        ]
+        quotes = [q for q in quotes if q and not _looks_like_import_artifact(q)]
+        signals_raw = item.get("importance_signals") or item.get("signals") or []
+        if isinstance(signals_raw, str):
+            signals = [signals_raw]
+        elif isinstance(signals_raw, list):
+            signals = [str(s).strip().lower() for s in signals_raw if str(s).strip()]
+        else:
+            signals = []
+        try:
+            confidence = float(item.get("confidence", 0.55))
+        except Exception:
+            confidence = 0.55
+        first_seen = str(item.get("first_seen_at") or item.get("occurred_at") or item.get("date") or "").strip()
+        last_seen = str(item.get("last_seen_at") or first_seen).strip()
+        if not _parse_iso_calendar_date(first_seen):
+            first_seen = relationship_start.isoformat()
+        if not _parse_iso_calendar_date(last_seen):
+            last_seen = first_seen
+        out.append({
+            "id": f"cand_{uuid.uuid4().hex[:12]}",
+            "candidate_type": cand_type,
+            "subject": subject,
+            "title": title,
+            "summary": summary[:1400],
+            "evidence_quotes": quotes[:3],
+            "first_seen_at": first_seen,
+            "last_seen_at": last_seen,
+            "importance_signals": sorted(set(signals))[:8],
+            "confidence": max(0.0, min(confidence, 1.0)),
+            "source_ids": [str(s)[:160] for s in item.get("source_ids", [])] if isinstance(item.get("source_ids"), list) else [],
+            "chunk_ids": sorted(set([window_id] + ([str(c) for c in item.get("chunk_ids", [])] if isinstance(item.get("chunk_ids"), list) else []))),
+        })
+    return out
+
+
+def _candidate_score(candidate: dict) -> float:
+    ctype = str(candidate.get("candidate_type") or "user_fact")
+    subject = str(candidate.get("subject") or "user")
+    title = str(candidate.get("title") or "")
+    summary = str(candidate.get("summary") or "")
+    signals = set(str(s).lower() for s in candidate.get("importance_signals") or [])
+    score = float(candidate.get("confidence") or 0.55) * 30.0
+    score += {
+        "boundary": 34,
+        "relationship_event": 32,
+        "emotional_pattern": 30,
+        "conflict_repair": 30,
+        "preference": 25,
+        "user_fact": 23,
+        "communication_style": 22,
+        "external_memory": 21,
+        "ai_character": 18,
+    }.get(ctype, 15)
+    if subject == "relationship":
+        score += 10
+    elif subject == "user":
+        score += 6
+    if "explicit_memory" in signals or "remembered" in signals:
+        score += 18
+    if "repeated" in signals or "recurring" in signals:
+        score += 16
+    if "emotional_peak" in signals:
+        score += 15
+    if "relationship_boundary" in signals or "boundary" in signals:
+        score += 14
+    if candidate.get("evidence_quotes"):
+        score += min(10, 4 * len(candidate.get("evidence_quotes") or []))
+    score += min(8, max(0, len(candidate.get("chunk_ids") or []) - 1) * 3)
+    if any(p.search(summary) for p in _LOW_VALUE_IMPORT_PATTERNS):
+        score -= 45
+    if _looks_like_import_artifact(summary):
+        score -= 80
+    if (
+        subject == "user"
+        and ctype in {"user_fact", "external_memory"}
+        and _looks_like_sensitive_identity_claim(title + "\n" + summary)
+        and not candidate.get("evidence_quotes")
+        and not ({"explicit_memory", "repeated", "remembered"} & signals)
+    ):
+        score -= 55
+    return score
+
+
+def _candidate_has_strong_evidence(candidate: dict) -> bool:
+    signals = set(str(s).lower() for s in candidate.get("importance_signals") or [])
+    return bool(candidate.get("evidence_quotes")) or bool({"explicit_memory", "repeated", "remembered"} & signals)
+
+
+def _candidate_should_skip(candidate: dict) -> bool:
+    title = str(candidate.get("title") or "")
+    summary = str(candidate.get("summary") or "")
+    ctype = str(candidate.get("candidate_type") or "")
+    subject = str(candidate.get("subject") or "")
+    mem_type = _candidate_memory_type(candidate)
+    if _looks_like_low_value_import_card(title, summary, mem_type):
+        return True
+    if _looks_like_import_artifact(title) or _looks_like_import_artifact(summary):
+        return True
+    if (
+        subject == "user"
+        and ctype in {"user_fact", "external_memory"}
+        and _looks_like_sensitive_identity_claim(title + "\n" + summary)
+        and not _candidate_has_strong_evidence(candidate)
+    ):
+        return True
+    return False
+
+
+def _candidate_mergeable(existing: dict, candidate: dict) -> bool:
+    if existing.get("subject") != candidate.get("subject"):
+        return False
+    existing_type = _candidate_memory_type(existing)
+    candidate_type = _candidate_memory_type(candidate)
+    if TAB_FOR_TYPE.get(existing_type, "about_me") != TAB_FOR_TYPE.get(candidate_type, "about_me"):
+        return False
+    norm = existing.get("_norm", "")
+    cand_norm = candidate.get("_norm", "")
+    if norm and cand_norm and (
+        norm == cand_norm
+        or norm[:90] == cand_norm[:90]
+        or norm in cand_norm
+        or cand_norm in norm
+    ):
+        return True
+    title_sim = _token_jaccard(
+        _memory_similarity_tokens(existing.get("title") or ""),
+        _memory_similarity_tokens(candidate.get("title") or ""),
+    )
+    body_sim = _token_jaccard(
+        existing.get("_tokens") or set(),
+        candidate.get("_tokens") or set(),
+    )
+    return body_sim >= 0.50 or (body_sim >= 0.40 and title_sim >= 0.25)
+
+
+def _merge_import_candidates(candidates: list[dict]) -> list[dict]:
+    clusters: list[dict] = []
+    for cand in sorted(candidates, key=_candidate_score, reverse=True):
+        if _candidate_should_skip(cand):
+            continue
+        norm = _normalize_card_similarity_text(cand.get("summary", ""))
+        if not norm:
+            continue
+        cand = dict(cand)
+        cand["_norm"] = norm
+        cand["_tokens"] = _memory_similarity_tokens(
+            " ".join([
+                str(cand.get("title") or ""),
+                str(cand.get("summary") or ""),
+                " ".join(str(q) for q in cand.get("evidence_quotes") or []),
+            ])
+        )
+        merged = False
+        for cluster in clusters:
+            if _candidate_mergeable(cluster, cand):
+                cluster["evidence_quotes"] = list(dict.fromkeys((cluster.get("evidence_quotes") or []) + (cand.get("evidence_quotes") or [])))[:4]
+                cluster["source_ids"] = sorted(set((cluster.get("source_ids") or []) + (cand.get("source_ids") or [])))
+                cluster["chunk_ids"] = sorted(set((cluster.get("chunk_ids") or []) + (cand.get("chunk_ids") or [])))
+                cluster["importance_signals"] = sorted(set((cluster.get("importance_signals") or []) + (cand.get("importance_signals") or [])))[:10]
+                cluster["confidence"] = max(float(cluster.get("confidence") or 0), float(cand.get("confidence") or 0))
+                cluster["_tokens"] = (cluster.get("_tokens") or set()).union(cand.get("_tokens") or set())
+                cluster["score"] = _candidate_score(cluster)
+                merged = True
+                break
+        if not merged:
+            cluster = dict(cand)
+            cluster["score"] = _candidate_score(cluster)
+            clusters.append(cluster)
+    clusters.sort(key=lambda c: float(c.get("score") or 0), reverse=True)
+    for cluster in clusters:
+        cluster.pop("_norm", None)
+        cluster.pop("_tokens", None)
+    return clusters
+
+
+def _candidate_memory_type(candidate: dict) -> str:
+    ctype = str(candidate.get("candidate_type") or "")
+    if ctype in {"relationship_event", "conflict_repair"}:
+        return "moment"
+    if ctype == "communication_style" and candidate.get("evidence_quotes"):
+        return "quote"
+    if ctype in {"emotional_pattern", "ai_character"}:
+        return "insight"
+    if ctype in {"boundary", "preference", "user_fact", "external_memory"}:
+        return "fact"
+    return "event"
+
+
+def _candidate_title(candidate: dict, mem_type: str, language: str) -> str:
+    title = str(candidate.get("title") or "").strip()
+    if title and not _GENERIC_IMPORT_TITLE_RE.match(title):
+        return title[:120]
+    summary = str(candidate.get("summary") or "")
+    if str(language).startswith("zh"):
+        prefix = {
+            "moment": "关系片段",
+            "quote": "原话",
+            "fact": "关于用户",
+            "event": "用户事件",
+            "insight": "TA 的理解",
+            "reflection": "TA 在想",
+        }.get(mem_type, "记忆")
+        natural = _natural_import_title(summary, mem_type, language)
+        if natural and natural != "导入的真实片段":
+            return natural[:120]
+        return prefix
+    natural = _natural_import_title(summary, mem_type, language)
+    return natural[:120] or "Memory"
+
+
+def _render_candidates_to_memory_cards(
+    candidates: list[dict],
+    relationship_start: date,
+    targets: dict,
+    *,
+    language: str = "en",
+    max_cards: int | None = None,
+) -> list[dict]:
+    merged = _merge_import_candidates(candidates)
+    quotas = {
+        "story": max(1, int(targets.get("story", 1))),
+        "about_me": max(1, int(targets.get("about_me", 1))),
+        "ta_thinking": max(0, int(targets.get("ta_thinking", 0))),
+    }
+    target_total = int(targets.get("total") or sum(quotas.values()))
+    configured_cap = int(max_cards) if max_cards is not None else target_total
+    extra_allowance = max(6, min(30, max(target_total, configured_cap) // 4))
+    emergency_total = max(target_total, configured_cap) + extra_allowance
+    cards: list[dict] = []
+    used_candidates: set[str] = set()
+
+    def tab_for_candidate(c: dict) -> tuple[str, str]:
+        mem_type = _candidate_memory_type(c)
+        return mem_type, TAB_FOR_TYPE.get(mem_type, "about_me")
+
+    def append_card(c: dict, mem_type: str) -> None:
+        if _candidate_should_skip(c):
+            return
+        cid = str(c.get("id") or "")
+        used_candidates.add(cid)
+        occurred = str(c.get("first_seen_at") or "").strip()
+        if not _parse_iso_calendar_date(occurred):
+            occurred = relationship_start.isoformat()
+        body = {
+            "type": mem_type,
+            "title": _candidate_title(c, mem_type, language),
+            "description": str(c.get("summary") or "")[:1200],
+            "occurred_at": occurred,
+            "context": f"distilled from {len(c.get('chunk_ids') or [])} timeline window(s); score={float(c.get('score') or _candidate_score(c)):.1f}",
+        }
+        quotes = c.get("evidence_quotes") or []
+        if quotes:
+            body["her_quote"] = str(quotes[0])[:500]
+        cards.append(body)
+
+    for tab in ("story", "about_me", "ta_thinking"):
+        for cand in merged:
+            if len(cards) >= target_total:
+                break
+            cid = str(cand.get("id") or "")
+            if cid in used_candidates:
+                continue
+            mem_type, cand_tab = tab_for_candidate(cand)
+            if cand_tab != tab:
+                continue
+            if quotas.get(tab, 0) <= 0:
+                continue
+            append_card(cand, mem_type)
+            quotas[tab] -= 1
+
+    for cand in merged:
+        if len(cards) >= emergency_total:
+            break
+        if len(cards) >= target_total and _candidate_score(cand) < 58:
+            continue
+        cid = str(cand.get("id") or "")
+        if cid in used_candidates:
+            continue
+        mem_type, _ = tab_for_candidate(cand)
+        append_card(cand, mem_type)
+    return _sort_memory_cards_newest_first(_dedupe_memory_cards(cards))
+
+
+def _memory_candidate_extraction_prompt(
+    window: dict,
+    *,
+    idx: int,
+    total: int,
+    per_window_target: int,
+    relationship_start: date,
+    language: str,
+) -> str:
+    sample = str(window.get("text") or "")
+    return (
+        "Distill durable Feedling onboarding memory candidates from this material window. "
+        "This is pass 1 of a two-pass pipeline: output candidates only, not final Memory Garden cards. "
+        "Return JSON only in this exact shape: "
+        "{\"candidates\":[{\"candidate_type\":\"user_fact|preference|boundary|relationship_event|emotional_pattern|communication_style|conflict_repair|ai_character|external_memory\","
+        "\"subject\":\"user|ai|relationship\",\"title\":\"optional natural short title\",\"summary\":\"durable memory candidate\","
+        "\"evidence_quotes\":[\"short exact quote if available\"],\"first_seen_at\":\"YYYY-MM-DD\",\"last_seen_at\":\"YYYY-MM-DD\","
+        "\"importance_signals\":[\"explicit_memory|repeated|emotional_peak|relationship_boundary|future_utility\"],\"confidence\":0.0}],\"why_empty\":\"optional\"}. "
+        f"Return up to {per_window_target} candidates, fewer or zero if this window is generic task Q&A, assistant filler, raw JSON metadata, or has no durable relationship/user/AI-character signal. "
+        "High-value candidates include stable user facts, preferences, boundaries, relationship milestones, emotional patterns, conflict/repair patterns, repeated themes, and AI character/voice definitions. "
+        "Do not preserve ordinary knowledge questions, one-off task instructions, product copy, code/debug chatter, upload wrappers, file delimiters, or raw JSON keys. "
+        "Keep Character card content as subject=ai; keep Personal Profile content as subject=user; keep shared events as subject=relationship. "
+        "Do not make one candidate per message; merge repeated details inside this window. "
+        f"{_language_instruction(language)} "
+        f"If dates are unclear, use {relationship_start.isoformat()}."
+        f"\n\nWindow id: {window.get('id', idx)} ({idx}/{total})\nMaterial:\n{sample}"
+    )
+
+
+def _split_candidate_retry_windows(window: dict, max_chars: int = 8500) -> list[dict]:
+    text = str(window.get("text") or "")
+    if len(text) <= max_chars:
+        return []
+    parts: list[dict] = []
+    for part_idx in range(0, len(text), max_chars):
+        chunk = text[part_idx:part_idx + max_chars].strip()
+        if not chunk:
+            continue
+        copy = dict(window)
+        copy["id"] = f"{window.get('id') or 'window'}:retry-{len(parts) + 1}"
+        copy["text"] = chunk
+        parts.append(copy)
+        if len(parts) >= 4:
+            break
+    return parts
+
+
+def _repair_candidate_json_with_provider(
+    provider: ProviderConfig,
+    raw_reply: str,
+    *,
+    relationship_start: date,
+    window_id: str,
+    language: str,
+) -> list[dict]:
+    prompt = (
+        "The previous model response was not valid JSON for Feedling memory candidate extraction. "
+        "Convert only the durable memory candidates in that response into this exact JSON schema: "
+        "{\"candidates\":[{\"candidate_type\":\"user_fact|preference|boundary|relationship_event|emotional_pattern|communication_style|conflict_repair|ai_character|external_memory\","
+        "\"subject\":\"user|ai|relationship\",\"title\":\"optional natural short title\",\"summary\":\"durable memory candidate\","
+        "\"evidence_quotes\":[\"short exact quote if available\"],\"first_seen_at\":\"YYYY-MM-DD\",\"last_seen_at\":\"YYYY-MM-DD\","
+        "\"importance_signals\":[\"explicit_memory|repeated|emotional_peak|relationship_boundary|future_utility\"],\"confidence\":0.0}]}. "
+        "Return JSON only. Drop raw JSON metadata, generic tasks, and filler. "
+        f"{_language_instruction(language)} "
+        f"If dates are unclear, use {relationship_start.isoformat()}.\n\nPrevious response:\n{str(raw_reply or '')[:12000]}"
+    )
+    result = chat_completion(
+        provider,
+        [
+            {"role": "system", "content": "You repair malformed JSON into strict Feedling memory candidate JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        max_tokens=1800,
+        temperature=0.0,
+        timeout=35.0,
+    )
+    return _coerce_import_candidates(
+        _json_from_model_text(result["reply"]),
+        relationship_start,
+        window_id=window_id,
+    )
+
+
+def _extract_memory_candidates_with_provider(
+    provider: ProviderConfig,
+    windows: list[dict],
+    relationship_start: date,
+    *,
+    per_window_target: int,
+    language: str = "en",
+    on_progress=None,
+) -> tuple[list[dict], list[str]]:
+    warnings: list[str] = []
+    all_candidates: list[dict] = []
+    for idx, window in enumerate(windows, start=1):
+        prompt = _memory_candidate_extraction_prompt(
+            window,
+            idx=idx,
+            total=len(windows),
+            per_window_target=per_window_target,
+            relationship_start=relationship_start,
+            language=language,
+        )
+        reply = ""
+        try:
+            result = chat_completion(
+                provider,
+                [
+                    {"role": "system", "content": "You are a strict JSON candidate extraction engine for long-memory distillation."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=2200,
+                temperature=0.1,
+                timeout=60.0,
+            )
+            reply = str(result.get("reply") or "")
+            parsed = _json_from_model_text(reply)
+            all_candidates.extend(_coerce_import_candidates(parsed, relationship_start, window_id=str(window.get("id") or idx)))
+        except Exception as e:
+            repaired = False
+            if reply:
+                try:
+                    repaired_candidates = _repair_candidate_json_with_provider(
+                        provider,
+                        reply,
+                        relationship_start=relationship_start,
+                        window_id=str(window.get("id") or idx),
+                        language=language,
+                    )
+                    all_candidates.extend(repaired_candidates)
+                    warnings.append(f"provider_candidate_json_repaired_window_{idx}:{len(repaired_candidates)}")
+                    repaired = True
+                except Exception as repair_e:
+                    warnings.append(f"provider_candidate_json_repair_failed_window_{idx}:{type(repair_e).__name__}:{str(repair_e)[:120]}")
+            if not repaired:
+                retry_candidates: list[dict] = []
+                for part_idx, retry_window in enumerate(_split_candidate_retry_windows(window), start=1):
+                    retry_prompt = _memory_candidate_extraction_prompt(
+                        retry_window,
+                        idx=part_idx,
+                        total=1,
+                        per_window_target=max(2, per_window_target // 2),
+                        relationship_start=relationship_start,
+                        language=language,
+                    )
+                    try:
+                        retry_result = chat_completion(
+                            provider,
+                            [
+                                {"role": "system", "content": "You are a strict JSON candidate extraction engine for long-memory distillation."},
+                                {"role": "user", "content": retry_prompt},
+                            ],
+                            max_tokens=1800,
+                            temperature=0.1,
+                            timeout=45.0,
+                        )
+                        retry_parsed = _json_from_model_text(retry_result["reply"])
+                        retry_candidates.extend(_coerce_import_candidates(retry_parsed, relationship_start, window_id=str(retry_window.get("id") or idx)))
+                    except Exception as retry_e:
+                        warnings.append(f"provider_candidate_retry_failed_window_{idx}_part_{part_idx}:{type(retry_e).__name__}:{str(retry_e)[:100]}")
+                if retry_candidates:
+                    all_candidates.extend(retry_candidates)
+                    warnings.append(f"provider_candidate_retry_split_window_{idx}:{len(retry_candidates)}")
+                else:
+                    warnings.append(f"provider_candidate_extraction_failed_window_{idx}:{type(e).__name__}:{str(e)[:160]}")
+        if on_progress:
+            on_progress(idx, len(windows), len(all_candidates))
+    return all_candidates, warnings
 
 
 def _coerce_memory_cards(raw, relationship_start: date) -> list[dict]:
@@ -5856,30 +6570,39 @@ def _fallback_memory_cards(
     return cards
 
 
-def _import_memory_targets(floors: dict, history_messages: list[dict], support_messages: list[dict]) -> dict:
-    history_count = len(history_messages)
-    support_count = len(support_messages)
-    if history_count <= 0:
-        story = 1 if support_count else max(1, int(floors.get("story", 1)))
-        about = 2 if support_count else max(1, int(floors.get("about_me", 1)))
-    elif history_count < 20:
-        story, about = 2, 4
-    elif history_count < 80:
-        story, about = 4, 8
-    elif history_count < 250:
-        story, about = 6, 14
-    elif history_count < 800:
-        story, about = 10, 24
-    else:
-        story, about = 12, 30
-
-    if support_count:
-        about += min(4, support_count * 2)
+def _import_memory_targets(
+    floors: dict,
+    history_messages: list[dict],
+    support_messages: list[dict],
+    profile: dict | None = None,
+) -> dict:
+    profile = profile or _history_import_profile(history_messages, support_messages)
+    cfg = _HISTORY_IMPORT_TIER_CONFIG.get(str(profile.get("tier") or "small"), _HISTORY_IMPORT_TIER_CONFIG["small"])
+    story = int(cfg["story"])
+    about = int(cfg["about_me"])
+    thinking = int(cfg["ta_thinking"])
+    if len(history_messages) <= 0:
+        story = 1
+        about = 2 if support_messages else 1
+        thinking = 0
+    elif str(profile.get("tier")) == "small":
+        # Keep short histories compact; do not pad to the old bootstrap floors.
+        story = min(story, max(2, len(history_messages) // 8 + 2))
+        about = min(about, max(3, len(history_messages) // 5 + 3))
+    if support_messages:
+        about += min(6, len(support_messages) * 2)
+    total = max(2, story + about + thinking)
     return {
         "story": max(1, story),
         "about_me": max(1, about),
-        "ta_thinking": 0,
-        "total": max(2, story + about),
+        "ta_thinking": max(0, thinking),
+        "total": total,
+        "tier": str(profile.get("tier") or "small"),
+        "initial_windows": int(cfg["initial_windows"]),
+        "total_windows": int(cfg["total_windows"]),
+        "chat_ready_cards": int(cfg["chat_ready_cards"]),
+        "background": bool(cfg["background"]),
+        "floor_reference": floors,
     }
 
 
@@ -5969,7 +6692,52 @@ def _ensure_import_memory_floors(
     # Force the first persisted memory to anchor the relationship start date.
     if cards:
         cards[0]["occurred_at"] = relationship_start.isoformat()
+    return _sort_memory_cards_newest_first(_dedupe_memory_cards(cards))
+
+
+def _ensure_import_minimum_cards(
+    cards: list[dict],
+    messages: list[dict],
+    relationship_start: date,
+    *,
+    min_story: int = 1,
+    min_about: int = 1,
+    language: str = "en",
+) -> list[dict]:
+    counts = _memory_counts_for_cards(cards)
+    story_needed = max(0, min_story - counts["story"])
+    about_needed = max(0, min_about - counts["about_me"])
+    if story_needed or about_needed:
+        cards = cards + _fallback_memory_cards(
+            messages,
+            relationship_start,
+            story_needed=story_needed,
+            about_needed=about_needed,
+            language=language,
+        )
+    if cards:
+        cards[0]["occurred_at"] = relationship_start.isoformat()
     return _dedupe_memory_cards(cards)
+
+
+def _card_dedupe_key(card: dict) -> str:
+    return "|".join([
+        str(card.get("type") or ""),
+        _normalize_card_similarity_text(card.get("title") or ""),
+        _normalize_card_similarity_text(card.get("description") or ""),
+    ])
+
+
+def _new_cards_only(existing_cards: list[dict], candidate_cards: list[dict]) -> list[dict]:
+    existing = {_card_dedupe_key(card) for card in existing_cards}
+    out: list[dict] = []
+    for card in candidate_cards:
+        key = _card_dedupe_key(card)
+        if not key or key in existing:
+            continue
+        existing.add(key)
+        out.append(card)
+    return out
 
 
 def _moment_from_memory_card(store: UserStore, card: dict, envelope: dict) -> dict:
@@ -5996,9 +6764,9 @@ def _moment_from_memory_card(store: UserStore, card: dict, envelope: dict) -> di
 def _append_import_memory_cards(store: UserStore, cards: list[dict]) -> list[dict]:
     moments = _load_moments(store)
     created: list[dict] = []
-    for card in cards:
+    for card in _sort_memory_cards_newest_first(cards):
         mem_type = str(card.get("type") or "")
-        if mem_type not in {"moment", "quote", "fact", "event"}:
+        if mem_type not in MEMORY_TYPES:
             continue
         body = {
             "title": str(card.get("title") or "")[:120],
@@ -6051,19 +6819,37 @@ def _fallback_identity_payload(memories: list[dict], days: int, language: str = 
         for idx, name in enumerate(names)
     ]
     return {
-        "agent_name": "IO",
+        "agent_name": "",
         "self_introduction": (
-            "我已经读过你导入的材料，并先搭好了一版记忆和身份。可能还需要你慢慢校正，但我不会再从空白开始。"
+            "我已经读过你导入的材料，并先搭好了一版记忆和身份。现在我还没有名字，你可以告诉我以后该怎么称呼我。"
             if is_zh else
-            "I imported our previous history and built a first version of my memory "
-            "from it. I may still need correction, but I can now answer with that "
-            "context instead of starting blank."
+            "I imported the previous history and built a first version of my memory "
+            "from it. I do not have a confirmed name yet, so you can tell me what "
+            "you would like to call me."
         ),
         "dimensions": dimensions,
         "days_with_user": days,
         "category": "细心 · 稳定" if is_zh else "Attentive · Grounded",
         "signature": ["从材料里醒来", "继续记住你"] if is_zh else ["Built from receipts", "Ready to keep noticing"],
     }
+
+
+def _sanitize_import_agent_name(name: str) -> str:
+    clean = re.sub(r"\s+", " ", str(name or "")).strip()
+    clean = clean.strip(" `\"'“”‘’。，,.;；:：!！?？")
+    if not clean or len(clean) > 80:
+        return ""
+    if any(ch in clean for ch in "\n\r{}[]"):
+        return ""
+    labels = set(globals().get("_IDENTITY_RUNTIME_LABELS", set()))
+    normalized = re.sub(r"\s+", " ", clean.lower())
+    if normalized in labels:
+        return ""
+    if normalized.startswith(("openai/", "anthropic/", "google/", "deepseek/")):
+        return ""
+    if re.search(r"\b(?:api|model|runtime|provider|endpoint|assistant|agent)\b", normalized):
+        return ""
+    return clean[:80]
 
 
 def _normalize_identity_payload(raw, memories: list[dict], days: int, language: str = "en") -> dict:
@@ -6095,7 +6881,7 @@ def _normalize_identity_payload(raw, memories: list[dict], days: int, language: 
         })
     if len(clean_dims) != 7:
         return fallback
-    payload["agent_name"] = str(payload.get("agent_name") or "IO")[:80]
+    payload["agent_name"] = _sanitize_import_agent_name(str(payload.get("agent_name") or ""))
     payload["self_introduction"] = str(payload.get("self_introduction") or "")[:1200]
     if str(language).startswith("zh") and _english_only_for_zh(payload["self_introduction"]):
         payload["self_introduction"] = ""
@@ -6103,10 +6889,17 @@ def _normalize_identity_payload(raw, memories: list[dict], days: int, language: 
         payload["self_introduction"] = fallback["self_introduction"]
     payload["dimensions"] = clean_dims
     payload["days_with_user"] = days
-    if "signature" in payload and not isinstance(payload["signature"], list):
-        payload.pop("signature", None)
-    if "category" in payload:
-        payload["category"] = str(payload["category"])[:120]
+    signature = payload.get("signature")
+    if not isinstance(signature, list):
+        signature = fallback.get("signature", [])
+    clean_signature = [str(item).strip()[:80] for item in signature if str(item).strip()][:2]
+    if str(language).startswith("zh") and any(_english_only_for_zh(item) for item in clean_signature):
+        clean_signature = fallback.get("signature", [])
+    payload["signature"] = clean_signature if len(clean_signature) == 2 else fallback.get("signature", [])
+    category = str(payload.get("category") or "").strip()[:120]
+    if not category or (str(language).startswith("zh") and _english_only_for_zh(category)):
+        category = str(fallback.get("category") or "")
+    payload["category"] = category
     return payload
 
 
@@ -6125,6 +6918,10 @@ def _derive_identity_with_provider(
         "Return JSON only with fields: agent_name, self_introduction, category, "
         "signature (array of two short strings), dimensions (exactly 7 objects with "
         "name, value 0-100, description). Do not invent facts not grounded in input. "
+        "agent_name is the AI companion's own chosen or user-given name, not the user's name, account name, provider, model, runtime, platform, or product name. "
+        "Only set agent_name when the imported Character Card or conversation explicitly names the AI companion; otherwise return an empty string for agent_name. "
+        "self_introduction must be written in the AI companion's own voice; never describe the user as 'I'. "
+        "High-risk personal claims such as legal/real name, address, or IDs require explicit user-authored evidence; otherwise omit them. "
         f"{_language_instruction(language)} "
         f"days_with_user is {days}.\n\nMemory cards:\n{memory_sample}\n\nTranscript sample:\n{transcript}"
     )
@@ -6197,18 +6994,26 @@ def _generate_model_api_onboarding_greeting(
     language: str = "en",
 ) -> tuple[str, list[str]]:
     warnings: list[str] = []
+    agent_name = _sanitize_import_agent_name(str(identity_payload.get("agent_name") or ""))
+    is_zh = str(language).startswith("zh")
     identity_summary = {
-        "agent_name": identity_payload.get("agent_name", "IO"),
+        "agent_name": agent_name,
         "self_introduction": identity_payload.get("self_introduction", ""),
         "category": identity_payload.get("category", ""),
         "signature": identity_payload.get("signature", []),
         "days_with_user": days,
     }
+    name_instruction = (
+        "This identity has no confirmed AI companion name. In this first message, naturally ask the user what they would like to call you. Do not assign yourself a name. "
+        if not agent_name else
+        "Use the confirmed AI companion name only if it feels natural. "
+    )
     prompt = (
         "Write the first visible chat message from the user's IO companion after onboarding. "
         "The imported files have already been analyzed into memory and identity; do not paste, "
         "summarize, or mention the source files, onboarding, import, API keys, encryption, or internal tools. "
         "Speak in the companion's own voice, grounded in the context below. "
+        f"{name_instruction}"
         f"{_language_instruction(language)} "
         "Return only the message text, no JSON, no bullets, 1-3 short sentences.\n\n"
         "Identity JSON:\n"
@@ -6231,13 +7036,27 @@ def _generate_model_api_onboarding_greeting(
         )
     except Exception as e:
         warnings.append(f"provider_onboarding_greeting_failed:{type(e).__name__}:{str(e)[:160]}")
-        return "", warnings
+        fallback = (
+            "我已经先把能读懂的部分整理成记忆了。现在我还没有名字，你想以后怎么叫我？"
+            if is_zh and not agent_name else
+            "I have turned the readable parts into memory first. What would you like to call me?"
+            if not agent_name else
+            ("我已经整理好一版记忆了，接下来可以从这里继续。" if is_zh else "I have a first version of the memory ready, and we can continue from here.")
+        )
+        return fallback, warnings
 
     text = str(result.get("reply") or "").strip()
     text = re.sub(r"^```(?:text)?\s*|\s*```$", "", text).strip()
     if not text:
         warnings.append("provider_onboarding_greeting_empty")
-        return "", warnings
+        fallback = (
+            "我已经先把能读懂的部分整理成记忆了。现在我还没有名字，你想以后怎么叫我？"
+            if is_zh and not agent_name else
+            "I have turned the readable parts into memory first. What would you like to call me?"
+            if not agent_name else
+            ("我已经整理好一版记忆了，接下来可以从这里继续。" if is_zh else "I have a first version of the memory ready, and we can continue from here.")
+        )
+        return fallback, warnings
     return text[:1200], warnings
 
 
@@ -6270,7 +7089,10 @@ def _process_history_import_sync(
     support_messages = _persona_support_messages(payload)
     if not history_messages and not support_messages:
         if not bool(payload.get("fresh_start")):
-            raise ValueError("content, persona_content, or fresh_start=true required")
+            raise ValueError(
+                "content, character_content, personal_profile_content, persona_content, "
+                "or fresh_start=true required"
+            )
         support_messages = [{
             "role": "user",
             "content": "Fresh start. No persona profile or previous chat history was provided.",
@@ -6291,34 +7113,111 @@ def _process_history_import_sync(
         raise ValueError(rel_err)
     days = max(0, (date.today() - relationship_start).days)
     floors = _per_tab_floors_for_days(days)
-    import_targets = _import_memory_targets(floors, history_messages, support_messages)
+    profile = _history_import_profile(
+        history_messages,
+        support_messages,
+        content_chars=len(content),
+    )
+    import_targets = _import_memory_targets(floors, history_messages, support_messages, profile)
     language = _detect_import_language(analysis_messages)
+    windows = _build_transcript_windows(
+        analysis_messages,
+        max_chars=18000,
+        max_windows=int(import_targets.get("total_windows") or 8),
+    )
+    initial_windows = _select_evenly(windows, int(import_targets.get("initial_windows") or len(windows)))
+    initial_window_ids = {str(w.get("id") or "") for w in initial_windows}
+    background_windows = [
+        w for w in windows
+        if bool(import_targets.get("background")) and str(w.get("id") or "") not in initial_window_ids
+    ]
 
     _update_history_job_phase(store, job, "chat_history_importing", **{
         "format": fmt or "plaintext",
         "history_filename": str(payload.get("history_filename") or "")[:240],
-        "persona_filename": str(payload.get("persona_filename") or "")[:240],
+        "character_filename": str(
+            payload.get("character_filename")
+            or payload.get("character_card_filename")
+            or ""
+        )[:240],
+        "persona_filename": str(
+            payload.get("personal_profile_filename")
+            or payload.get("persona_filename")
+            or ""
+        )[:240],
         "messages_parsed": len(history_messages),
         "support_materials": len(support_messages),
+        "character_chars": sum(len(str(m.get("content") or "")) for m in support_messages if m.get("source") == "character_import"),
         "persona_chars": sum(len(str(m.get("content") or "")) for m in support_messages if m.get("source") == "persona_import"),
         "import_language": language,
         "relationship_started_at": relationship_start.isoformat(),
         "relationship_days": days,
         "floors": floors,
         "import_targets": import_targets,
+        "history_profile": profile,
+        "history_tier": profile["tier"],
+        "timeline_span_days": profile["span_days"],
+        "candidate_windows_total": len(windows),
+        "candidate_windows_initial": len(initial_windows),
+        "background_windows_total": len(background_windows),
     })
 
-    _update_history_job_phase(store, job, "memory_extracting")
-    provider_cards, provider_warnings = _extract_memory_cards_with_provider(
+    def initial_progress(done: int, total: int, candidate_count: int) -> None:
+        progress = 24 + int(24 * done / max(total, 1))
+        _update_history_job_phase(
+            store,
+            job,
+            "candidate_extracting",
+            progress=progress,
+            candidate_windows_done=done,
+            candidate_windows_total=total,
+            candidates_extracted=candidate_count,
+        )
+
+    _update_history_job_phase(
+        store,
+        job,
+        "candidate_extracting",
+        candidate_windows_done=0,
+        candidate_windows_total=len(initial_windows),
+        candidates_extracted=0,
+    )
+    per_window_target = max(4, min(10, (int(import_targets.get("total", 12)) + max(len(initial_windows), 1) - 1) // max(len(initial_windows), 1) + 2))
+    initial_candidates, provider_warnings = _extract_memory_candidates_with_provider(
         runtime,
-        analysis_messages,
+        initial_windows,
         relationship_start,
-        import_targets,
-        language,
+        per_window_target=per_window_target,
+        language=language,
+        on_progress=initial_progress,
     )
     warnings.extend(provider_warnings)
-    cards = _ensure_import_memory_floors(provider_cards, fallback_messages, relationship_start, import_targets, language)
+    merged_candidates = _merge_import_candidates(initial_candidates)
+    cards = _render_candidates_to_memory_cards(
+        merged_candidates,
+        relationship_start,
+        import_targets,
+        language=language,
+        max_cards=int(import_targets.get("total") or 12),
+    )
+    cards = _ensure_import_minimum_cards(
+        cards,
+        fallback_messages,
+        relationship_start,
+        min_story=1,
+        min_about=1,
+        language=language,
+    )
+    cards = _sort_memory_cards_newest_first(cards)
 
+    _update_history_job_phase(
+        store,
+        job,
+        "candidate_merging",
+        candidates_extracted=len(initial_candidates),
+        candidates_merged=len(merged_candidates),
+        memories_planned=len(cards),
+    )
     _update_history_job_phase(
         store,
         job,
@@ -6366,6 +7265,83 @@ def _process_history_import_sync(
     )
     warnings.extend(greeting_warnings)
     greeting_row = _append_model_api_onboarding_greeting(store, greeting_text) if greeting_text else None
+    chat_ready_cards = int(import_targets.get("chat_ready_cards") or 2)
+    chat_ready = bool(identity) and bool(greeting_row) and len(memory_rows) >= min(chat_ready_cards, max(2, len(cards)))
+
+    job.update({
+        "chat_ready": chat_ready,
+        "chat_ready_at": _now_iso() if chat_ready else "",
+        "chat_ready_cards_required": chat_ready_cards,
+        "initial_memories_created": len(memory_rows),
+        "candidate_count": len(initial_candidates),
+        "candidate_cluster_count": len(merged_candidates),
+        "background_status": "pending" if background_windows else "not_needed",
+        "warnings": warnings,
+    })
+    if chat_ready and background_windows:
+        _update_history_job_phase(
+            store,
+            job,
+            "background_importing",
+            status="processing",
+            memories_created=len(memory_rows),
+            identity_written=bool(identity),
+            onboarding_greeting_written=bool(greeting_row),
+            background_windows_done=0,
+            background_windows_total=len(background_windows),
+        )
+
+        def background_progress(done: int, total: int, candidate_count: int) -> None:
+            progress = 96 + int(3 * done / max(total, 1))
+            _update_history_job_phase(
+                store,
+                job,
+                "background_importing",
+                status="processing",
+                progress=progress,
+                background_windows_done=done,
+                background_windows_total=total,
+                background_candidates_extracted=candidate_count,
+                memories_created=len(memory_rows),
+            )
+
+        try:
+            background_candidates, bg_warnings = _extract_memory_candidates_with_provider(
+                runtime,
+                background_windows,
+                relationship_start,
+                per_window_target=max(3, min(7, per_window_target - 1)),
+                language=language,
+                on_progress=background_progress,
+            )
+            warnings.extend(bg_warnings)
+            all_candidates = initial_candidates + background_candidates
+            all_cards = _render_candidates_to_memory_cards(
+                all_candidates,
+                relationship_start,
+                import_targets,
+                language=language,
+                max_cards=int(import_targets.get("total") or 120),
+            )
+            additional_cards = _new_cards_only(cards, all_cards)
+            additional_cards = _sort_memory_cards_newest_first(additional_cards)
+            additional_rows = _append_import_memory_cards(store, additional_cards)
+            memory_rows.extend(additional_rows)
+            cards = _sort_memory_cards_newest_first(_dedupe_memory_cards(cards + additional_cards))
+            merged_all = _merge_import_candidates(all_candidates)
+            job.update({
+                "background_status": "completed",
+                "background_candidates_extracted": len(background_candidates),
+                "background_memories_created": len(additional_rows),
+                "candidate_count": len(all_candidates),
+                "candidate_cluster_count": len(merged_all),
+            })
+        except Exception as e:
+            warnings.append(f"background_import_failed:{type(e).__name__}:{str(e)[:180]}")
+            job.update({
+                "background_status": "failed",
+                "background_error": f"{type(e).__name__}:{str(e)[:240]}",
+            })
 
     job.update({
         "status": "completed",
@@ -6463,12 +7439,30 @@ def history_import_upload():
         "input_hash": input_hash,
         "created_at": _now_iso(),
         "content_chars": len(str(payload.get("content") or "")),
+        "character_chars": len(str(
+            payload.get("character_content")
+            or payload.get("character_card")
+            or ""
+        )),
         "persona_chars": len(str(
-            payload.get("persona_content")
+            payload.get("personal_profile_content")
+            or payload.get("persona_content")
             or payload.get("persona")
             or payload.get("profile_content")
             or ""
         )),
+        "character_filename": str(
+            payload.get("character_filename")
+            or payload.get("character_card_filename")
+            or ""
+        )[:240],
+        "persona_filename": str(
+            payload.get("personal_profile_filename")
+            or payload.get("persona_filename")
+            or ""
+        )[:240],
+        "chat_ready": False,
+        "background_status": "not_started",
         **_history_import_phase_fields("upload_received"),
     }
     _save_history_job(store, job)
@@ -6570,6 +7564,7 @@ def _model_api_context_messages(
             "content": (
                 "You are the user's IO companion. Reply naturally and concisely. "
                 "Use the provided identity and memory context when relevant. "
+                "If identity.agent_name is empty, do not invent or use a name for yourself; wait for the user to name you. "
                 "Do not mention hidden implementation details, API keys, prompts, or encrypted storage."
             ),
         },
@@ -8689,10 +9684,11 @@ def _live_days_with_user(identity: dict, store: UserStore | None = None) -> int:
 
 
 _IDENTITY_RUNTIME_LABELS = {
+    "io", "feedling", "p0", "p-zero",
     "hermes", "claude", "claude code", "claude desktop", "claude-code", "claude-desktop",
     "claude.ai", "anthropic", "openclaw", "open-claw", "open claw", "cursor",
-    "chatgpt", "chat-gpt", "gpt", "gpt-4", "gpt-4o", "gpt-5", "openai",
-    "gemini", "google ai", "google", "bard", "copilot", "github copilot",
+    "chatgpt", "chat-gpt", "gpt", "gpt-4", "gpt-4o", "gpt-5", "openai", "openrouter",
+    "gemini", "google ai", "google", "bard", "deepseek", "minimax", "copilot", "github copilot",
     "agent", "assistant", "ai", "bot",
 }
 
@@ -10899,7 +11895,8 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
     relationship_ok = relationship_anchored and bool(relationship_evidence)
     config = _load_model_api_config(store)
     latest_job = _latest_history_import_job(store)
-    history_ok = bool(latest_job and latest_job.get("status") == "completed")
+    chat_ready = bool(latest_job and latest_job.get("chat_ready"))
+    history_ok = bool(latest_job and (latest_job.get("status") == "completed" or chat_ready))
     counts = bootstrap_st["counts"]
     memory_ok = history_ok and counts.get("story", 0) >= 1 and counts.get("about_me", 0) >= 1
     hosted_chat_ok = _model_api_hosted_chat_verified(store)
@@ -10932,6 +11929,16 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
             "messages_parsed": (latest_job or {}).get("messages_parsed", 0),
             "support_materials": (latest_job or {}).get("support_materials", 0),
             "memories_created": (latest_job or {}).get("memories_created", 0),
+            "history_tier": (latest_job or {}).get("history_tier", ""),
+            "timeline_span_days": (latest_job or {}).get("timeline_span_days", 0),
+            "candidate_windows_done": (latest_job or {}).get("candidate_windows_done", 0),
+            "candidate_windows_total": (latest_job or {}).get("candidate_windows_total", 0),
+            "candidates_extracted": (latest_job or {}).get("candidates_extracted", 0),
+            "candidates_merged": (latest_job or {}).get("candidates_merged", 0),
+            "chat_ready": chat_ready,
+            "background_status": (latest_job or {}).get("background_status", ""),
+            "background_windows_done": (latest_job or {}).get("background_windows_done", 0),
+            "background_windows_total": (latest_job or {}).get("background_windows_total", 0),
             "required": (
                 "Start onboarding with a chat history file, persona profile, or confirmed fresh start."
                 if not history_ok else ""

@@ -230,7 +230,7 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "Memory Garden" in joined:
+        if "memory candidate" in joined.lower() or "Memory Garden" in joined:
             return {
                 "reply": (
                     '{"memories":['
@@ -376,7 +376,7 @@ def test_history_import_reuses_inflight_client_job(client, monkeypatch):
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "Memory Garden" in joined:
+        if "memory candidate" in joined.lower() or "Memory Garden" in joined:
             provider_entered.set()
             assert release_provider.wait(timeout=2)
             return {
@@ -490,7 +490,7 @@ def test_history_import_accepts_json_file_and_persona_profile(client, monkeypatc
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "Memory Garden" in joined:
+        if "memory candidate" in joined.lower() or "Memory Garden" in joined:
             assert "Long-term user profile" in joined
             return {
                 "reply": (
@@ -653,8 +653,35 @@ def test_import_memory_targets_do_not_force_historical_floor_padding():
         [],
     )
 
-    assert targets["story"] == 6
-    assert targets["about_me"] == 14
+    assert targets["tier"] == "small"
+    assert targets["story"] == 4
+    assert targets["about_me"] == 8
+
+
+def test_history_import_profile_marks_three_year_history_as_ultra():
+    start = 1_600_000_000
+    messages = [
+        {
+            "role": "user",
+            "content": "long relationship marker",
+            "source": "history_import",
+            "ts": start + idx * 90 * 24 * 3600,
+        }
+        for idx in range(14)
+    ]
+
+    profile = appmod._history_import_profile(messages, [], content_chars=80_000)
+    targets = appmod._import_memory_targets(
+        {"story": 15, "about_me": 60, "ta_thinking": 12, "total": 87},
+        messages,
+        [],
+        profile,
+    )
+
+    assert profile["tier"] == "ultra"
+    assert targets["total"] == 120
+    assert targets["chat_ready_cards"] == 20
+    assert targets["background"] is True
 
 
 def test_import_memory_filters_generic_import_cards_and_repetitive_low_value_content():
@@ -662,25 +689,198 @@ def test_import_memory_filters_generic_import_cards_and_repetitive_low_value_con
         {
             "type": "moment",
             "title": "导入片段 7",
-            "description": "请你为我介绍一下什么是天然矿泉水",
+            "description": "Please explain what this general concept means",
             "occurred_at": "2026-06-01",
         },
         {
             "type": "fact",
-            "title": "黄山矿泉水项目",
-            "description": "用户正在研究黄山天然矿泉水项目，希望文案更清楚。",
+            "title": "Project preference",
+            "description": "User repeatedly cares that long-term memory is written as readable human meaning rather than raw archive fragments.",
             "occurred_at": "2026-06-01",
         },
         {
             "type": "event",
-            "title": "黄山矿泉水文案",
-            "description": "用户正在研究黄山天然矿泉水项目，希望文案更清楚。",
+            "title": "Memory writing preference",
+            "description": "User repeatedly cares that long-term memory is written as readable human meaning rather than raw archive fragments.",
             "occurred_at": "2026-06-01",
         },
     ])
 
     assert len(cards) == 1
-    assert cards[0]["title"] == "黄山矿泉水项目"
+    assert cards[0]["title"] == "Project preference"
+
+
+def test_candidate_pipeline_renders_high_value_cards_without_generic_tasks():
+    raw = {
+        "candidates": [
+            {
+                "candidate_type": "user_fact",
+                "subject": "user",
+                "title": "Generic question",
+                "summary": "How do I explain this generic concept?",
+                "confidence": 0.9,
+            },
+            {
+                "candidate_type": "boundary",
+                "subject": "user",
+                "title": "Memory boundary",
+                "summary": "User wants imported memory to preserve durable relationship meaning and not raw JSON or generic task answers.",
+                "importance_signals": ["relationship_boundary", "future_utility"],
+                "confidence": 0.9,
+                "evidence_quotes": ["memory must be readable human meaning"],
+            },
+            {
+                "candidate_type": "relationship_event",
+                "subject": "relationship",
+                "title": "API onboarding review",
+                "summary": "User reviewed API onboarding quality and asked for memory distillation instead of direct archive dumping.",
+                "importance_signals": ["explicit_memory"],
+                "confidence": 0.85,
+            },
+        ]
+    }
+
+    candidates = appmod._coerce_import_candidates(raw, appmod.date(2026, 6, 1), window_id="w1")
+    cards = appmod._render_candidates_to_memory_cards(
+        candidates,
+        appmod.date(2026, 6, 1),
+        {"story": 2, "about_me": 2, "ta_thinking": 0, "total": 4},
+        language="en",
+    )
+
+    assert len(candidates) == 2
+    assert any(card["type"] == "fact" and "raw JSON" in card["description"] for card in cards)
+    assert any(card["type"] == "moment" and "API onboarding" in card["description"] for card in cards)
+    assert all("generic concept" not in card["description"] for card in cards)
+
+
+def test_identity_import_keeps_unknown_agent_name_empty():
+    payload = _identity_payload()
+    payload["agent_name"] = "IO"
+
+    normalized = appmod._normalize_identity_payload(payload, [], 7, "zh-Hans")
+
+    assert normalized["agent_name"] == ""
+
+    payload["agent_name"] = "小哆啦"
+    normalized = appmod._normalize_identity_payload(payload, [], 7, "zh-Hans")
+
+    assert normalized["agent_name"] == "小哆啦"
+
+
+def test_candidate_render_merges_similar_cards_filters_sensitive_claims_and_sorts_newest_first():
+    raw = {
+        "candidates": [
+            {
+                "candidate_type": "user_fact",
+                "subject": "user",
+                "title": "User real name",
+                "summary": "User's real name is Sven.",
+                "first_seen_at": "2026-05-01",
+                "confidence": 0.95,
+            },
+            {
+                "candidate_type": "preference",
+                "subject": "user",
+                "title": "Direct feedback",
+                "summary": "User repeatedly prefers direct feedback and clear engineering tradeoffs.",
+                "importance_signals": ["repeated"],
+                "first_seen_at": "2026-05-03",
+                "confidence": 0.9,
+            },
+            {
+                "candidate_type": "user_fact",
+                "subject": "user",
+                "title": "Feedback style",
+                "summary": "User prefers direct feedback and clear engineering tradeoffs when reviewing product quality.",
+                "importance_signals": ["repeated"],
+                "first_seen_at": "2026-05-04",
+                "confidence": 0.88,
+            },
+            {
+                "candidate_type": "relationship_event",
+                "subject": "relationship",
+                "title": "Late review",
+                "summary": "User reviewed the imported memory result and corrected the system toward readable memory.",
+                "importance_signals": ["explicit_memory"],
+                "first_seen_at": "2026-05-05",
+                "confidence": 0.85,
+            },
+        ]
+    }
+
+    candidates = appmod._coerce_import_candidates(raw, appmod.date(2026, 5, 1), window_id="w1")
+    cards = appmod._render_candidates_to_memory_cards(
+        candidates,
+        appmod.date(2026, 5, 1),
+        {"story": 2, "about_me": 4, "ta_thinking": 0, "total": 6},
+        language="en",
+    )
+
+    assert all("real name" not in card["description"].lower() for card in cards)
+    assert sum("direct feedback" in card["description"] for card in cards) == 1
+    assert [card["occurred_at"] for card in cards] == sorted([card["occurred_at"] for card in cards], reverse=True)
+
+
+def test_candidate_extraction_repairs_malformed_provider_json(monkeypatch):
+    calls = []
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        calls.append(joined)
+        if "previous model response was not valid json" in joined.lower():
+            return {
+                "reply": appmod.json.dumps({
+                    "candidates": [{
+                        "candidate_type": "preference",
+                        "subject": "user",
+                        "title": "Readable memory",
+                        "summary": "User wants imported history distilled into readable durable memory.",
+                        "importance_signals": ["explicit_memory"],
+                        "first_seen_at": "2026-06-01",
+                        "confidence": 0.9,
+                    }]
+                }),
+                "usage": {},
+            }
+        return {"reply": "Readable memory is important, but this is not JSON.", "usage": {}}
+
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    candidates, warnings = appmod._extract_memory_candidates_with_provider(
+        appmod.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
+        [{"id": "w1", "text": "2026-06-01 User: Please turn this into readable memory."}],
+        appmod.date(2026, 6, 1),
+        per_window_target=3,
+        language="en",
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["title"] == "Readable memory"
+    assert any("provider_candidate_json_repaired_window_1" in warning for warning in warnings)
+
+
+def test_onboarding_greeting_for_unknown_name_asks_for_name(monkeypatch):
+    captured = {}
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        captured["prompt"] = "\n".join(str(m.get("content") or "") for m in messages)
+        return {"reply": "我先把能读懂的部分记下来了。现在我还没有名字，你想怎么叫我？", "usage": {}}
+
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    text, warnings = appmod._generate_model_api_onboarding_greeting(
+        appmod.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
+        [{"role": "user", "content": "这是之前的聊天。", "source": "history_import"}],
+        [],
+        {"agent_name": "", "self_introduction": ""},
+        10,
+        "zh-Hans",
+    )
+
+    assert warnings == []
+    assert "还没有名字" in captured["prompt"]
+    assert "你想怎么叫我" in text
 
 
 def test_support_material_sections_split_character_and_personal_profile():
@@ -705,6 +905,23 @@ def test_support_material_sections_split_character_and_personal_profile():
     assert all("BEGIN " not in m["content"] and "END " not in m["content"] for m in support)
 
 
+def test_support_materials_accept_explicit_character_and_personal_profile_fields():
+    payload = {
+        "character_content": "小哆啦是一个稳定、细心、会记得小事的陪伴型 AI。",
+        "character_filename": "character.md",
+        "personal_profile_content": "用户喜欢直接的反馈，也希望记忆写得像人能读懂的话。",
+        "personal_profile_filename": "profile.md",
+    }
+
+    support = appmod._persona_support_messages(payload)
+
+    assert [m["source"] for m in support] == ["character_import", "persona_import"]
+    assert "Character card (character.md)" in support[0]["content"]
+    assert "Personal profile (profile.md)" in support[1]["content"]
+    assert "小哆啦" in support[0]["content"]
+    assert "用户喜欢直接的反馈" in support[1]["content"]
+
+
 def test_history_import_allows_confirmed_fresh_start_without_materials(client, monkeypatch):
     user_id, api_key = _register(client)
 
@@ -722,7 +939,7 @@ def test_history_import_allows_confirmed_fresh_start_without_materials(client, m
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
         assert "Fresh start" in joined
-        if "Memory Garden" in joined:
+        if "memory candidate" in joined.lower() or "Memory Garden" in joined:
             return {
                 "reply": (
                     '{"memories":['
