@@ -318,9 +318,10 @@ def _split_system_messages_gemini(
     return "\n\n".join(system_parts).strip(), provider_messages
 
 
-def _extract_reply(body: dict[str, Any]) -> str:
+def _extract_reply(body: dict[str, Any], *, required: bool = True) -> str:
     choices = body.get("choices")
-    if isinstance(choices, list) and choices:
+    has_shape = isinstance(choices, list) and len(choices) > 0 and isinstance(choices[0], dict)
+    if has_shape:
         first = choices[0]
         if isinstance(first, dict):
             message = first.get("message")
@@ -331,12 +332,19 @@ def _extract_reply(body: dict[str, Any]) -> str:
             text = first.get("text")
             if isinstance(text, str) and text.strip():
                 return text.strip()
+    # An empty reply is acceptable only when the provider's real success shape is
+    # present (e.g. a thinking model that spent its budget on reasoning). A 2xx
+    # whose body has no success container ({}, {"error": ...}) is still a failure
+    # — otherwise setup would save a config that chat/send can't actually use.
+    if not required and has_shape:
+        return ""
     raise ProviderError("provider response had no usable reply text")
 
 
-def _extract_anthropic_reply(body: dict[str, Any]) -> str:
+def _extract_anthropic_reply(body: dict[str, Any], *, required: bool = True) -> str:
     content = body.get("content")
-    if isinstance(content, list):
+    has_shape = isinstance(content, list)
+    if has_shape:
         parts: list[str] = []
         for item in content:
             if isinstance(item, dict):
@@ -345,12 +353,19 @@ def _extract_anthropic_reply(body: dict[str, Any]) -> str:
                     parts.append(text.strip())
         if parts:
             return "\n".join(parts).strip()
+    # An empty reply is acceptable only when the provider's real success shape is
+    # present (e.g. a thinking model that spent its budget on reasoning). A 2xx
+    # whose body has no success container ({}, {"error": ...}) is still a failure
+    # — otherwise setup would save a config that chat/send can't actually use.
+    if not required and has_shape:
+        return ""
     raise ProviderError("provider response had no usable reply text")
 
 
-def _extract_gemini_reply(body: dict[str, Any]) -> str:
+def _extract_gemini_reply(body: dict[str, Any], *, required: bool = True) -> str:
     candidates = body.get("candidates")
-    if isinstance(candidates, list):
+    has_shape = isinstance(candidates, list) and len(candidates) > 0
+    if has_shape:
         for candidate in candidates:
             if not isinstance(candidate, dict):
                 continue
@@ -368,6 +383,12 @@ def _extract_gemini_reply(body: dict[str, Any]) -> str:
                         text_parts.append(text.strip())
             if text_parts:
                 return "\n".join(text_parts).strip()
+    # An empty reply is acceptable only when the provider's real success shape is
+    # present (e.g. a thinking model that spent its budget on reasoning). A 2xx
+    # whose body has no success container ({}, {"error": ...}) is still a failure
+    # — otherwise setup would save a config that chat/send can't actually use.
+    if not required and has_shape:
+        return ""
     raise ProviderError("provider response had no usable reply text")
 
 
@@ -382,13 +403,14 @@ def _chat_completion_openai_compatible(
     temperature: float,
     timeout: float,
     response_format: dict[str, Any] | None,
+    require_reply: bool = True,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "stream": False,
         "temperature": temperature,
-        "max_tokens": max(1, min(int(max_tokens), 4096)),
+        "max_tokens": max(1, min(int(max_tokens), 8192)),
     }
     if response_format:
         payload["response_format"] = response_format
@@ -413,7 +435,7 @@ def _chat_completion_openai_compatible(
         raise ProviderError("provider returned non-object response")
 
     return {
-        "reply": _extract_reply(body),
+        "reply": _extract_reply(body, required=require_reply),
         "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
         "raw_id": body.get("id", ""),
         "provider": provider,
@@ -431,6 +453,7 @@ def _chat_completion_anthropic(
     temperature: float,
     timeout: float,
     response_format: dict[str, Any] | None,
+    require_reply: bool = True,
 ) -> dict[str, Any]:
     system, provider_messages = _split_system_messages_anthropic(messages)
     json_instruction = _json_only_instruction(response_format)
@@ -439,7 +462,7 @@ def _chat_completion_anthropic(
     payload: dict[str, Any] = {
         "model": model,
         "messages": provider_messages,
-        "max_tokens": max(1, min(int(max_tokens), 4096)),
+        "max_tokens": max(1, min(int(max_tokens), 8192)),
         "temperature": temperature,
     }
     if system:
@@ -469,7 +492,7 @@ def _chat_completion_anthropic(
         raise ProviderError("provider returned non-object response")
 
     return {
-        "reply": _extract_anthropic_reply(body),
+        "reply": _extract_anthropic_reply(body, required=require_reply),
         "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
         "raw_id": body.get("id", ""),
         "provider": "anthropic",
@@ -487,11 +510,12 @@ def _chat_completion_gemini(
     temperature: float,
     timeout: float,
     response_format: dict[str, Any] | None,
+    require_reply: bool = True,
 ) -> dict[str, Any]:
     system, contents = _split_system_messages_gemini(messages)
     generation_config: dict[str, Any] = {
         "temperature": temperature,
-        "maxOutputTokens": max(1, min(int(max_tokens), 4096)),
+        "maxOutputTokens": max(1, min(int(max_tokens), 8192)),
     }
     if response_format and response_format.get("type") in {"json_object", "json_schema"}:
         generation_config["responseMimeType"] = "application/json"
@@ -526,7 +550,7 @@ def _chat_completion_gemini(
         raise ProviderError("provider returned non-object response")
 
     return {
-        "reply": _extract_gemini_reply(body),
+        "reply": _extract_gemini_reply(body, required=require_reply),
         "usage": (
             body.get("usageMetadata")
             if isinstance(body.get("usageMetadata"), dict)
@@ -546,6 +570,7 @@ def chat_completion(
     temperature: float = 0.7,
     timeout: float = 60.0,
     response_format: dict[str, Any] | None = None,
+    require_reply: bool = True,
 ) -> dict[str, Any]:
     provider, model, base_url = validate_config(
         config.provider, config.model, config.base_url
@@ -564,6 +589,7 @@ def chat_completion(
             temperature=temperature,
             timeout=timeout,
             response_format=response_format,
+            require_reply=require_reply,
         )
     if provider == "gemini":
         return _chat_completion_gemini(
@@ -575,6 +601,7 @@ def chat_completion(
             temperature=temperature,
             timeout=timeout,
             response_format=response_format,
+            require_reply=require_reply,
         )
 
     return _chat_completion_openai_compatible(
@@ -587,10 +614,18 @@ def chat_completion(
         temperature=temperature,
         timeout=timeout,
         response_format=response_format,
+        require_reply=require_reply,
     )
 
 
 def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
+    # Validates that the key is usable for this model. We deliberately do NOT
+    # require reply text: thinking/reasoning models (gemini-2.5-*, deepseek-
+    # reasoner, …) may spend the whole token budget on reasoning and return an
+    # empty body with finishReason=MAX_TOKENS. A 2xx response already proves the
+    # key is valid, the model exists, and the account can be billed; an invalid
+    # or quota'd key surfaces as an HTTP 4xx and still raises. max_tokens is set
+    # high enough that most models also produce a short reply for the logs.
     return chat_completion(
         config,
         [
@@ -600,7 +635,8 @@ def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
             },
             {"role": "user", "content": "Say ok."},
         ],
-        max_tokens=8,
+        max_tokens=256,
         temperature=0.0,
         timeout=30.0,
+        require_reply=False,
     )

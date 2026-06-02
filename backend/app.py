@@ -4829,6 +4829,13 @@ def model_api_setup():
     try:
         test = test_provider_key(ProviderConfig(provider, model, provider_key, base_url))
     except ProviderError as e:
+        # Log enough to triage a user-reported "key won't validate" without ever
+        # logging the raw key: the failure detail (e.g. provider_http_404 for a
+        # bad model name, or 401/429 for a bad/quota'd key) only lives here.
+        print(
+            f"[model_api:{store.user_id}] setup FAILED provider={provider} "
+            f"model={model} status_code={e.status_code} detail={str(e)[:160]}"
+        )
         return jsonify({
             "error": "provider_test_failed",
             "detail": str(e),
@@ -6816,7 +6823,10 @@ def model_api_chat_send():
         result = chat_completion(
             runtime,
             provider_messages,
-            max_tokens=int(payload.get("max_tokens") or 900),
+            # Thinking/reasoning models share this budget between reasoning and
+            # output tokens, so keep it generous; non-thinking models stop early
+            # on their own and don't pay for the headroom.
+            max_tokens=int(payload.get("max_tokens") or 2048),
             temperature=float(payload.get("temperature") or 0.7),
             timeout=90.0,
         )

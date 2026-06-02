@@ -125,6 +125,38 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     assert all(step["id"] != "resident_consumer" for step in body["steps"])
 
 
+def test_model_api_setup_logs_provider_test_failure(client, monkeypatch, capsys):
+    # A failed self-test (bad/quota'd key, or an unsupported model name) must
+    # leave a server-side log line with provider/model/status_code so the
+    # failure is traceable — the response body alone never reaches the logs.
+    _, api_key = _register(client)
+
+    def boom(cfg):
+        raise appmod.ProviderError(
+            "provider_http_404: model: claude-3-5-haiku-latest", status_code=404
+        )
+
+    monkeypatch.setattr(appmod, "test_provider_key", boom)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "anthropic",
+            "model": "claude-3-5-haiku-latest",
+            "api_key": "sk-ant-whatever",
+        },
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 400
+    assert setup.get_json()["error"] == "provider_test_failed"
+
+    out = capsys.readouterr().out
+    assert "anthropic" in out
+    assert "claude-3-5-haiku-latest" in out
+    assert "404" in out
+    assert "sk-ant-whatever" not in out  # never log the raw provider key
+
+
 def test_model_api_setup_can_reuse_saved_key_when_model_changes(client, monkeypatch):
     _, api_key = _register(client)
     calls = []
