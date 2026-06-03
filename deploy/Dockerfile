@@ -68,4 +68,9 @@ EXPOSE 5001 5002 9998
 # TDX CVM). Single worker is mandatory — app.py binds the WebSocket ingest
 # on :9998 at import time, so multiple workers would collide on that port;
 # concurrency comes from threads. docker-compose overrides this for MCP.
-CMD ["gunicorn", "--chdir", "backend", "-w", "1", "--threads", "16", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
+# --threads sized for long-poll load: /v1/chat/poll and /v1/proactive/jobs/poll
+# each park a worker thread on a threading.Event for up to 30s, so each tester
+# ties up ~2 threads. 16 starved the pool (reentrant whoami queued 5-10s,
+# stalling replies); 64 leaves headroom for the tiny tester base. Keep this in
+# sync with deploy/docker-compose.yaml.
+CMD ["gunicorn", "--chdir", "backend", "-w", "1", "--threads", "64", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]

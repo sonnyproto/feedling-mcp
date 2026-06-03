@@ -24,20 +24,20 @@ def _fake_client(monkeypatch, response_body: dict) -> list[dict]:
     calls: list[dict] = []
 
     class FakeClient:
-        def __init__(self, timeout: float):
-            self.timeout = timeout
+        # Provider calls now share one pooled client built by `_http_client()`,
+        # so the fake must accept httpx.Client's kwargs (limits/timeout/...) and
+        # take the per-request `timeout` on `.post`.
+        def __init__(self, *args, **kwargs):
+            pass
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def post(self, url: str, *, headers=None, json=None):
+        def post(self, url: str, *, headers=None, json=None, timeout=None):
             calls.append({"url": url, "headers": headers or {}, "json": json or {}})
             return FakeResponse(200, response_body)
 
     monkeypatch.setattr(pc.httpx, "Client", FakeClient)
+    # Drop any client cached from a previous test so `_http_client()` rebuilds
+    # against the fake just installed.
+    monkeypatch.setattr(pc, "_shared_client", None)
     return calls
 
 
@@ -59,6 +59,30 @@ def test_validate_config_accepts_direct_providers(provider, model, base_url):
         assert normalized == "openai_compatible"
     else:
         assert normalized == provider
+
+
+def test_provider_calls_reuse_one_pooled_client(monkeypatch):
+    # The whole point of the pooling change: two back-to-back provider calls must
+    # share a single httpx.Client (built once) instead of opening a fresh client
+    # — and therefore a fresh DNS+TLS handshake — per call.
+    builds: list[int] = []
+
+    class CountingClient:
+        def __init__(self, *args, **kwargs):
+            builds.append(1)
+
+        def post(self, url: str, *, headers=None, json=None, timeout=None):
+            return FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr(pc.httpx, "Client", CountingClient)
+    monkeypatch.setattr(pc, "_shared_client", None)
+
+    cfg = pc.ProviderConfig("deepseek", "deepseek-chat", "k")
+    pc.chat_completion(cfg, [{"role": "user", "content": "one"}])
+    pc.chat_completion(cfg, [{"role": "user", "content": "two"}])
+
+    assert builds == [1]  # constructed exactly once across both calls
+    assert pc._http_client() is pc._shared_client
 
 
 def test_anthropic_chat_completion_uses_messages_api(monkeypatch):
@@ -241,19 +265,14 @@ def _fake_client_status(monkeypatch, status_code: int, response_body: dict) -> N
     """Like _fake_client but lets the fake response carry a non-200 status."""
 
     class FakeClient:
-        def __init__(self, timeout: float):
-            self.timeout = timeout
+        def __init__(self, *args, **kwargs):
+            pass
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def post(self, url: str, *, headers=None, json=None):
+        def post(self, url: str, *, headers=None, json=None, timeout=None):
             return FakeResponse(status_code, response_body)
 
     monkeypatch.setattr(pc.httpx, "Client", FakeClient)
+    monkeypatch.setattr(pc, "_shared_client", None)
 
 
 @pytest.mark.parametrize(("cfg", "body"), _EMPTY_CASES)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -11,6 +12,35 @@ class ProviderError(Exception):
     def __init__(self, message: str, *, status_code: int | None = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+# Process-wide pooled HTTP client for outbound provider calls. Previously every
+# chat_completion opened `with httpx.Client(...)` and closed it on exit, so each
+# call redid DNS + TCP + TLS from scratch. From the prod CVM that cold path cost
+# 13-31s per call (vs ~0.1s from a laptop), which is the bulk of a slow reply.
+# A shared client keeps connections alive and pools them per-origin (httpx keys
+# the pool by scheme/host/port), so back-to-back calls to the same provider skip
+# the handshake. httpx.Client is thread-safe for issuing requests, which matters
+# because both the gunicorn backend (threads) and the threaded enclave call in.
+# Timeout stays per-request (passed to .post) since it varies by call site.
+_shared_client: httpx.Client | None = None
+_shared_client_lock = threading.Lock()
+
+
+def _http_client() -> httpx.Client:
+    global _shared_client
+    if _shared_client is not None:
+        return _shared_client
+    with _shared_client_lock:
+        if _shared_client is None:
+            _shared_client = httpx.Client(
+                limits=httpx.Limits(
+                    max_keepalive_connections=20,
+                    max_connections=100,
+                    keepalive_expiry=90.0,
+                ),
+            )
+    return _shared_client
 
 
 @dataclass(frozen=True)
@@ -416,12 +446,12 @@ def _chat_completion_openai_compatible(
         payload["response_format"] = response_format
 
     try:
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.post(
-                f"{base_url.rstrip('/')}/chat/completions",
-                headers=_headers(ProviderConfig(provider, model, key, base_url)),
-                json=payload,
-            )
+        resp = _http_client().post(
+            f"{base_url.rstrip('/')}/chat/completions",
+            headers=_headers(ProviderConfig(provider, model, key, base_url)),
+            json=payload,
+            timeout=timeout,
+        )
     except httpx.HTTPError as e:
         raise ProviderError(f"provider network error: {type(e).__name__}") from e
 
@@ -469,16 +499,16 @@ def _chat_completion_anthropic(
         payload["system"] = system
 
     try:
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.post(
-                f"{base_url.rstrip('/')}/messages",
-                headers={
-                    "x-api-key": key,
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
+        resp = _http_client().post(
+            f"{base_url.rstrip('/')}/messages",
+            headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=timeout,
+        )
     except httpx.HTTPError as e:
         raise ProviderError(f"provider network error: {type(e).__name__}") from e
 
@@ -528,15 +558,15 @@ def _chat_completion_gemini(
         payload["systemInstruction"] = {"parts": [{"text": system}]}
 
     try:
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.post(
-                f"{base_url.rstrip('/')}/models/{quote(model, safe='')}:generateContent",
-                headers={
-                    "x-goog-api-key": key,
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
+        resp = _http_client().post(
+            f"{base_url.rstrip('/')}/models/{quote(model, safe='')}:generateContent",
+            headers={
+                "x-goog-api-key": key,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=timeout,
+        )
     except httpx.HTTPError as e:
         raise ProviderError(f"provider network error: {type(e).__name__}") from e
 

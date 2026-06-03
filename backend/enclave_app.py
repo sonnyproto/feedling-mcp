@@ -38,6 +38,7 @@ import re
 import ssl
 import sys
 import tempfile
+import threading
 import time
 from typing import Any
 
@@ -455,6 +456,68 @@ def _flask_get(path: str, api_key: str, params: dict | None = None) -> dict:
         return r.json()
 
 
+# Short-TTL cache for api_key -> whoami. Every enclave route resolves the caller
+# through the backend (`/v1/users/whoami`) first — but the enclave runs threaded
+# and the backend is gunicorn -w 1, so a backend -> enclave -> backend re-entrant
+# whoami per call exhausted threads under load (e.g. history import does N
+# decrypts for one user → N whoami round-trips). This cache collapses the
+# read-only decrypt-and-serve routes (chat history, memory, identity, frames) to
+# one round-trip per key per TTL; threaded=True handles the rest of the
+# concurrency. Tradeoff: within the TTL a just-revoked key is still honoured, so
+# the cache is used ONLY by routes that read the user's own stored data. The
+# sensitive unwrap route /v1/envelope/decrypt (which opens a caller-SUPPLIED
+# envelope) deliberately bypasses this and resolves the caller live every call.
+_WHOAMI_CACHE_TTL = 30.0
+_whoami_cache: dict[str, tuple[float, dict]] = {}
+# _whoami_cache_lock is a short-held mutex guarding both _whoami_cache and the
+# _whoami_inflight registry — never held across a backend round-trip.
+_whoami_cache_lock = threading.Lock()
+# Per-key singleflight: a lock per in-flight key so a burst of cold misses for
+# the same key (cold cache at startup, or right after TTL expiry) collapses to a
+# single /v1/users/whoami call instead of fanning out N round-trips.
+_whoami_inflight: dict[str, threading.Lock] = {}
+
+
+def _whoami_cached(api_key: str) -> dict:
+    """whoami via the backend, memoised per sha256(api_key) for a short TTL.
+
+    Misses call `_flask_get` and propagate its httpx errors uncached, so every
+    caller keeps its existing 401-on-HTTPStatusError / 502-on-HTTPError mapping.
+    Concurrent misses for the same key are serialised via singleflight: the
+    first does the round-trip, the rest wait and reuse its cached result.
+    """
+    h = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    with _whoami_cache_lock:
+        hit = _whoami_cache.get(h)
+        if hit is not None and time.monotonic() - hit[0] < _WHOAMI_CACHE_TTL:
+            return hit[1]
+        key_lock = _whoami_inflight.get(h)
+        if key_lock is None:
+            key_lock = threading.Lock()
+            _whoami_inflight[h] = key_lock
+
+    with key_lock:
+        # Re-check under the per-key lock: the winner of the race may have
+        # filled the cache while we were waiting, so we skip the backend call.
+        with _whoami_cache_lock:
+            hit = _whoami_cache.get(h)
+            if hit is not None and time.monotonic() - hit[0] < _WHOAMI_CACHE_TTL:
+                return hit[1]
+        try:
+            whoami = _flask_get("/v1/users/whoami", api_key)
+            if isinstance(whoami, dict) and whoami.get("user_id"):
+                with _whoami_cache_lock:
+                    _whoami_cache[h] = (time.monotonic(), whoami)
+            return whoami
+        finally:
+            # Retire this in-flight lock so the registry stays bounded and a
+            # later miss starts a fresh round; guarded so we never drop a lock
+            # another key generation already replaced.
+            with _whoami_cache_lock:
+                if _whoami_inflight.get(h) is key_lock:
+                    _whoami_inflight.pop(h, None)
+
+
 def _build_aead_aad(owner_user_id: str, v: int, item_id: str) -> bytes:
     """Per docs/DESIGN_E2E.md §3.4, content's AEAD additional-data must
     authenticate (owner_user_id, v, item_id). The enclave recomputes this
@@ -599,6 +662,12 @@ def v1_envelope_decrypt():
         return jsonify({"error": "missing_api_key"}), 401
 
     try:
+        # Deliberately uncached: this endpoint decrypts a caller-SUPPLIED
+        # envelope, and the whoami result is the only authorization gate. A
+        # stale cache entry would keep unwrapping for a key that was just
+        # revoked / a reset account for up to the TTL, so we resolve the caller
+        # live every time. The decrypt-and-serve routes below only read the
+        # user's own stored data, so they can tolerate the cached resolver.
         whoami = _flask_get("/v1/users/whoami", api_key)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:
@@ -713,7 +782,7 @@ def v1_chat_history():
     # Resolve whose content we're decrypting — returns the caller's usr_...
     # from the backend's per-user HMAC-peppered api_key lookup.
     try:
-        whoami = _flask_get("/v1/users/whoami", api_key)
+        whoami = _whoami_cached(api_key)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:
             return jsonify({"error": "unauthorized"}), 401
@@ -731,6 +800,12 @@ def v1_chat_history():
             api_key,
             params={"since": since, "limit": limit},
         )
+    except httpx.HTTPStatusError as e:
+        # whoami may have been cached, so a key revoked since then surfaces here;
+        # keep it a 401, not a generic 502.
+        if e.response.status_code == 401:
+            return jsonify({"error": "unauthorized"}), 401
+        return jsonify({"error": f"backend_error: {e}"}), 502
     except httpx.HTTPError as e:
         return jsonify({"error": f"backend_error: {e}"}), 502
 
@@ -835,7 +910,7 @@ def v1_memory_list():
         return jsonify({"error": "missing api_key"}), 401
 
     try:
-        whoami = _flask_get("/v1/users/whoami", api_key)
+        whoami = _whoami_cached(api_key)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:
             return jsonify({"error": "unauthorized"}), 401
@@ -851,6 +926,12 @@ def v1_memory_list():
         params["since"] = since
     try:
         listing = _flask_get("/v1/memory/list", api_key, params=params)
+    except httpx.HTTPStatusError as e:
+        # whoami may have been cached, so a key revoked since then surfaces here;
+        # keep it a 401, not a generic 502.
+        if e.response.status_code == 401:
+            return jsonify({"error": "unauthorized"}), 401
+        return jsonify({"error": f"backend_error: {e}"}), 502
     except httpx.HTTPError as e:
         return jsonify({"error": f"backend_error: {e}"}), 502
 
@@ -914,7 +995,7 @@ def v1_identity_get():
         return jsonify({"error": "missing api_key"}), 401
 
     try:
-        whoami = _flask_get("/v1/users/whoami", api_key)
+        whoami = _whoami_cached(api_key)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:
             return jsonify({"error": "unauthorized"}), 401
@@ -925,6 +1006,12 @@ def v1_identity_get():
 
     try:
         resp = _flask_get("/v1/identity/get", api_key)
+    except httpx.HTTPStatusError as e:
+        # whoami may have been cached, so a key revoked since then surfaces here;
+        # keep it a 401, not a generic 502.
+        if e.response.status_code == 401:
+            return jsonify({"error": "unauthorized"}), 401
+        return jsonify({"error": f"backend_error: {e}"}), 502
     except httpx.HTTPError as e:
         return jsonify({"error": f"backend_error: {e}"}), 502
 
@@ -1008,7 +1095,7 @@ def v1_frame_decrypt(frame_id):
         return jsonify({"error": "missing api_key"}), 401
 
     try:
-        whoami = _flask_get("/v1/users/whoami", api_key)
+        whoami = _whoami_cached(api_key)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:
             return jsonify({"error": "unauthorized"}), 401
@@ -1020,6 +1107,10 @@ def v1_frame_decrypt(frame_id):
     try:
         env = _flask_get(f"/v1/screen/frames/{frame_id}/envelope", api_key)
     except httpx.HTTPStatusError as e:
+        # whoami may have been cached, so a key revoked since then surfaces here;
+        # keep it a 401, not a generic 502.
+        if e.response.status_code == 401:
+            return jsonify({"error": "unauthorized"}), 401
         if e.response.status_code == 404:
             return jsonify({"error": "frame not found"}), 404
         return jsonify({"error": f"backend_error: {e}"}), 502
@@ -1093,7 +1184,7 @@ def v1_frame_image(frame_id):
         return jsonify({"error": "missing api_key"}), 401
 
     try:
-        whoami = _flask_get("/v1/users/whoami", api_key)
+        whoami = _whoami_cached(api_key)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:
             return jsonify({"error": "unauthorized"}), 401
@@ -1105,6 +1196,10 @@ def v1_frame_image(frame_id):
     try:
         env = _flask_get(f"/v1/screen/frames/{frame_id}/envelope", api_key)
     except httpx.HTTPStatusError as e:
+        # whoami may have been cached, so a key revoked since then surfaces here;
+        # keep it a 401, not a generic 502.
+        if e.response.status_code == 401:
+            return jsonify({"error": "unauthorized"}), 401
         if e.response.status_code == 404:
             return jsonify({"error": "frame not found"}), 404
         return jsonify({"error": f"backend_error: {e}"}), 502
@@ -1152,13 +1247,20 @@ def _get_or_derive_content_sk() -> nacl.public.PrivateKey:
     global _cached_content_sk
     if _cached_content_sk is not None:
         return _cached_content_sk
-    dstack = DstackClient()
-    keys = derive_keys(dstack)
-    _cached_content_sk = keys["content_sk"]
+    # Double-checked lock: the server runs threaded, so two concurrent first
+    # callers must not both derive. Derivation is deterministic (same key
+    # either way), but the lock keeps it to a single DstackClient round-trip.
+    with _content_sk_lock:
+        if _cached_content_sk is not None:
+            return _cached_content_sk
+        dstack = DstackClient()
+        keys = derive_keys(dstack)
+        _cached_content_sk = keys["content_sk"]
     return _cached_content_sk
 
 
 _cached_content_sk: nacl.public.PrivateKey | None = None
+_content_sk_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -1203,4 +1305,8 @@ if __name__ == "__main__":
     ssl_ctx = _build_ssl_context()
     scheme = "https" if ssl_ctx else "http"
     print(f"Feedling enclave service listening on {scheme}://0.0.0.0:{ENCLAVE_PORT}", flush=True)
-    app.run(host="0.0.0.0", port=ENCLAVE_PORT, debug=False, ssl_context=ssl_ctx)
+    # threaded=True: the default Werkzeug server is single-threaded, so every
+    # decrypt-and-serve request (each of which calls back into the backend)
+    # serialised and head-of-line-blocked the rest under concurrent load.
+    app.run(host="0.0.0.0", port=ENCLAVE_PORT, debug=False, ssl_context=ssl_ctx,
+            threaded=True)
