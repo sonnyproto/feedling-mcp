@@ -47,6 +47,88 @@ def _headers(api_key: str) -> dict[str, str]:
     return {"X-API-Key": api_key}
 
 
+def test_whoami_does_not_rewrite_user_table_on_each_call(client, monkeypatch):
+    """Regression guard for the prod lock-convoy incident.
+
+    whoami -> _access_modes_payload used to call _save_users() — a full
+    `DELETE FROM users` + re-INSERT of every row — under the global _users_lock
+    on EVERY request. Under load (and amplified by a larger gunicorn thread
+    pool) this serialized into a lock convoy that drove whoami p50 to ~100s and
+    max to ~247s. Steady-state re-polls must now touch the users table zero
+    times.
+    """
+    _user_id, _principal_id, api_key = _register(client)
+
+    save_all: list = []
+    upserts: list = []
+    monkeypatch.setattr(appmod.db, "save_all_users", lambda users: save_all.append(1))
+    monkeypatch.setattr(appmod.db, "upsert_user", lambda entry: upserts.append(entry.get("user_id")))
+
+    # First whoami may legitimately persist once (binding flips to connected).
+    assert client.get("/v1/users/whoami", headers=_headers(api_key)).status_code == 200
+    save_all.clear()
+    upserts.clear()
+
+    # Steady state: repeated whoami must not rewrite the table or the row.
+    for _ in range(5):
+        assert client.get("/v1/users/whoami", headers=_headers(api_key)).status_code == 200
+
+    assert save_all == [], "whoami must never call save_all_users (full-table DELETE+reINSERT)"
+    assert upserts == [], "steady-state whoami must not write the user row at all"
+
+
+def test_access_modes_payload_rolls_back_binding_on_persist_failure(client, monkeypatch):
+    """Codex P2 guard for the conditional one-shot write.
+
+    _access_modes_payload mutates the in-memory binding to "connected" before
+    persisting it. If db.upsert_user fails transiently, the binding must be
+    rolled back so the NEXT call retries — otherwise was_connected stays True and
+    the write is skipped forever. (access_bindings for an api_key mode are
+    rebuilt from keys by normalization, so to exercise a genuinely new binding
+    we drive the onboarding route to a mode the user has no key for.)
+    """
+    user_id, _principal_id, api_key = _register(client)
+    store = appmod.get_store(user_id)
+
+    # Route to a mode with no api_key → its binding is new and not reconstructed
+    # from keys, so _access_modes_payload must persist it. Set the blob directly
+    # so the route endpoint doesn't persist the binding for us.
+    route = "resident"
+    appmod.db.set_blob(user_id, "onboarding_route", {"route": route})
+
+    def has_connected(mode: str) -> bool:
+        with appmod._users_lock:
+            e = appmod._find_user_entry_locked(user_id)
+            return any(
+                b.get("access_mode") == mode and b.get("status") == "connected"
+                for b in e.get("access_bindings") or []
+            )
+
+    real_upsert = appmod.db.upsert_user
+    fail = {"on": True}
+    calls = {"n": 0}
+
+    def flaky_upsert(entry):
+        calls["n"] += 1
+        if fail["on"]:
+            raise RuntimeError("transient DB error")
+        return real_upsert(entry)
+
+    monkeypatch.setattr(appmod.db, "upsert_user", flaky_upsert)
+
+    # Persist fails → the new binding must be rolled back (not left connected),
+    # and the call must not raise.
+    appmod._access_modes_payload(store)
+    assert calls["n"] == 1
+    assert not has_connected(route), "failed persist must roll back the new binding"
+
+    # Persist succeeds → the retry writes it; the binding now sticks.
+    fail["on"] = False
+    appmod._access_modes_payload(store)
+    assert calls["n"] == 2, "binding persist must be retried after a transient failure"
+    assert has_connected(route)
+
+
 def test_register_creates_principal_and_access_state(client):
     user_id, principal_id, api_key = _register(client)
 
