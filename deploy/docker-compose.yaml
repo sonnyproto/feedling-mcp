@@ -88,14 +88,15 @@ services:
     image: feedling-backend:dev
     # gunicorn = production WSGI. -w 1 is mandatory: app.py binds the :9998
     # WebSocket ingest at import time, so multiple workers collide on it.
-    # --threads must comfortably exceed concurrent long-poll holders: each
-    # /v1/chat/poll and /v1/proactive/jobs/poll parks a worker thread on a
-    # threading.Event for up to 30s, so N testers tie up ~2N threads. At 16
-    # threads a handful of testers starved the pool — even a trivial whoami
-    # (incl. the enclave's reentrant whoami) queued 5-10s, stalling replies.
-    # 64 gives headroom for the (intentionally tiny) tester base; gevent is the
-    # real fix but conflicts with the asyncio WS server + psycopg C-blocking.
-    command: ["gunicorn", "--chdir", "backend", "-w", "1", "--threads", "64", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
+    # --threads is a balance under -w 1 (one GIL): /v1/chat/poll +
+    # /v1/proactive/jobs/poll park a worker thread on a threading.Event for up
+    # to 30s (parked → GIL released, no CPU contention), so too few starves the
+    # pool; but too many *runnable* threads convoy on the single GIL and even a
+    # trivial whoami waits tens of seconds. 16 starved the long-poll pool; 64
+    # made the GIL convoy worse under load — 32 is the middle ground until the
+    # real fix (move the :9998 WS ingest off the import path so -w >1 is possible;
+    # gevent rejected: conflicts with the asyncio WS server + psycopg C-blocking).
+    command: ["gunicorn", "--chdir", "backend", "-w", "1", "--threads", "32", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
     restart: unless-stopped
     environment:
       # --- BAKED: security-relevant, audited by iOS ---
