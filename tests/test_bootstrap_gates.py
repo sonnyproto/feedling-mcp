@@ -709,6 +709,81 @@ def test_chat_verify_loop_marks_live_connection_without_first_message(backend):
     assert status["is_complete"] is False
 
 
+def test_verify_reply_allowed_despite_newer_real_user_message(backend):
+    """Regression (prod 2026-06-03, screenshots who3/who4): a real user
+    message arriving AFTER the synthetic verify ping — i.e. the user keeps
+    typing during the verify window — must NOT cause the resident
+    consumer's reply to be 409'd.
+
+    Before the fix, _reply_is_for_pending_verify_ping required the verify
+    ping to be the single most-recent message. An interleaved real user
+    message (你好 / Hahhh in the report) became 'newest', so even a correct
+    reply to the pending ping was treated as an ordinary chat reply and
+    rejected with needs_live_connection. With the consumer never landing a
+    reply, chat_loop_verified never flipped → the account was wedged at
+    needs_live_connection while actively being chatted with.
+
+    Fix: allow the reply whenever an UNANSWERED verify ping exists in
+    recent history, regardless of newer real messages. One landed reply
+    then satisfies verify_loop and opens the gate permanently.
+    """
+    base = backend["base_url"]
+    user_id, api_key = _register(base)
+    _seed_passing_bootstrap(base, user_id, api_key)
+    assert _init_identity(base, user_id, api_key).status_code == 201
+    _record_consumer_poll(base, api_key)
+
+    # verify_loop posts the synthetic ping and waits for an agent reply.
+    result: dict = {}
+
+    def run_verify():
+        r = requests.post(
+            f"{base}/v1/chat/verify_loop",
+            json={"timeout_sec": 8},
+            headers={"X-API-Key": api_key},
+            timeout=15,
+        )
+        result["status"] = r.status_code
+        result["body"] = r.json()
+
+    t = threading.Thread(target=run_verify)
+    t.start()
+    try:
+        # Let the ping land first, then have the user send a real message
+        # that becomes the newest entry — reproducing the interleave.
+        time.sleep(1.0)
+        real_env = _stub_envelope(user_id, "real-msg-during-verify")
+        rm = requests.post(
+            f"{base}/v1/chat/message",
+            json={"envelope": real_env},
+            headers={"X-API-Key": api_key},
+            timeout=TIMEOUT,
+        )
+        assert rm.status_code in (200, 201), rm.text
+
+        # Consumer replies to the still-pending ping. Must be accepted even
+        # though a real user message is now the most-recent entry.
+        rr = _chat_response(base, user_id, api_key, consumer_headers=True)
+        assert rr.status_code == 200, (
+            "verify reply 409'd despite a pending verify ping — an "
+            "interleaved real user message wedged the live-connection gate: "
+            f"{rr.status_code} {rr.text}"
+        )
+    finally:
+        t.join(timeout=12)
+
+    # The landed reply must satisfy verify_loop and flip chat_loop_verified.
+    assert result.get("status") == 200, result
+    assert result["body"]["passing"] is True, result["body"]
+
+    status = requests.get(
+        f"{base}/v1/bootstrap/status",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    ).json()
+    assert status["chat_loop_verified"] is True, status
+
+
 # ---------------------------------------------------------------------------
 # Phase 3: Typed memory contract (post-2026-05-22 Friend-Test → density rewrite)
 #

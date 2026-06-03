@@ -170,6 +170,164 @@ def test_enclave_history_used_when_configured(monkeypatch):
     assert result_ts == pytest.approx(2000.0)
 
 
+# ---------------------------------------------------------------------------
+# Verify-loop liveness ping must be answered WITHOUT a full agent turn.
+# Regression for the prod 2026-06-03 wedge (account stuck at
+# needs_live_connection): the synthetic ping was routed through the hermes
+# agent (slow / SIGTERM-fragile) and, over the enclave decrypt path, arrived
+# with content=None (the ping is visibility=local_only so the enclave returns
+# null) — falling into the empty-content skip and never replying. Detection
+# keys off `source == "verify_ping"`, which survives BOTH the poll and the
+# enclave/MCP decrypt paths.
+# ---------------------------------------------------------------------------
+
+def test_verify_ping_enclave_path_short_circuits_without_agent():
+    """Enclave path delivers the local_only ping with content=None. The
+    consumer must still recognise it (via source) and reply immediately —
+    not crash on None and not skip it as empty content."""
+    ping = {
+        "role": "user",
+        "ts": 4242.0,
+        "source": "verify_ping",
+        "content": None,            # enclave returns null for local_only
+        "content_type": "text",
+    }
+    with patch.object(crc, "call_agent") as mock_agent, \
+         patch.object(crc, "post_reply") as mock_post:
+        result_ts = crc._process_messages([ping])
+
+    mock_agent.assert_not_called()
+    mock_post.assert_called_once()
+    assert result_ts == pytest.approx(4242.0)
+
+
+def test_verify_ping_poll_marker_short_circuits_without_agent():
+    """Direct /v1/chat/poll path carries the plaintext __VERIFY_PING__ marker
+    (source still verify_ping). Still short-circuits — no agent turn."""
+    ping = _make_msg(role="user", content="__VERIFY_PING__:deadbeef0001", ts=4343.0)
+    ping["source"] = "verify_ping"
+
+    with patch.object(crc, "call_agent") as mock_agent, \
+         patch.object(crc, "post_reply") as mock_post:
+        result_ts = crc._process_messages([ping])
+
+    mock_agent.assert_not_called()
+    mock_post.assert_called_once()
+    assert result_ts == pytest.approx(4343.0)
+
+
+def test_verify_ping_short_circuit_suppresses_push():
+    """The short-circuit must ask post_reply to suppress the user-visible push.
+    A private liveness ack must never surface as an APNs notification while the
+    app is backgrounded — the verify GC removes the chat row but cannot recall
+    an already-delivered push."""
+    ping = {
+        "role": "user",
+        "ts": 4444.0,
+        "source": "verify_ping",
+        "content": None,
+        "content_type": "text",
+    }
+    with patch.object(crc, "call_agent") as mock_agent, \
+         patch.object(crc, "post_reply") as mock_post:
+        crc._process_messages([ping])
+
+    mock_agent.assert_not_called()
+    mock_post.assert_called_once_with(crc.VERIFY_PING_REPLY, suppress_push=True)
+
+
+def test_post_reply_suppress_push_omits_alert_and_push_fields(monkeypatch):
+    """post_reply(..., suppress_push=True) sends an empty alert_body and no
+    push_body / push_live_activity, so /v1/chat/response's push policy is a
+    no-op. The envelope still posts, so verify_loop still sees the reply."""
+    captured: dict = {}
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"id": "m1", "ts": 1.0, "v": 1}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_load_whoami", lambda: True)
+    monkeypatch.setattr(
+        crc, "_whoami_cache",
+        {"user_id": "usr_abc", "user_pk": b"\x01" * 32, "enclave_pk": None},
+    )
+    monkeypatch.setattr(crc, "_build_envelope", lambda **kw: {"stub": "env"})
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    crc.post_reply(crc.VERIFY_PING_REPLY, suppress_push=True)
+    body = captured["json"]
+    assert body["alert_body"] == ""
+    assert not body.get("push_body")
+    assert not body.get("push_live_activity")
+
+    # Contrast: an ordinary reply still carries a visible alert_body.
+    crc.post_reply("hello there")
+    assert captured["json"]["alert_body"] == "hello there"
+
+
+def test_user_message_containing_verify_marker_is_not_short_circuited():
+    """A real user message that merely CONTAINS the literal __VERIFY_PING__
+    text (e.g. someone debugging this very feature) must still reach the agent.
+    Detection keys ONLY on source — the server stamps source='verify_ping' on
+    the synthetic probe across all three delivery paths (poll, enclave, MCP),
+    so matching arbitrary content would just create false positives that
+    silently swallow real chat input."""
+    msg = _make_msg(
+        role="user",
+        content="why does __VERIFY_PING__ keep showing up in my logs?",
+        ts=4545.0,
+    )  # NB: no source key → ordinary chat, not a verify probe
+
+    with patch.object(crc, "call_agent", return_value="here's why") as mock_agent, \
+         patch.object(crc, "post_reply") as mock_post:
+        result_ts = crc._process_messages([msg])
+
+    mock_agent.assert_called_once()
+    mock_post.assert_called_once_with("here's why")
+    assert result_ts == pytest.approx(4545.0)
+
+
+def test_enclave_fetch_logs_response_body_on_http_error(monkeypatch, caplog):
+    """When the enclave returns a non-2xx, the consumer must log the response
+    BODY, not just the bare status line.
+
+    Regression (2026-06-03): the enclave now maps transient dependency
+    failures to self-describing codes — 502 `backend_unreachable` vs 503
+    `key_derivation_unavailable`. httpx's HTTPStatusError string carries the
+    status + URL but NOT the body, so `log.warning("... %s", e)` hid exactly
+    the field that distinguishes the two failure modes. The operator was left
+    with an opaque "all decrypt sources failed" and no way to tell which
+    dependency broke without shelling into the CVM.
+    """
+    import httpx as _httpx
+
+    url = "https://127.0.0.1:5003/v1/chat/history"
+    resp = _httpx.Response(
+        503,
+        json={"error": "key_derivation_unavailable: dstack socket unavailable"},
+        request=_httpx.Request("GET", url),
+    )
+    mock_client = MagicMock()
+    mock_client.get.return_value = resp
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://127.0.0.1:5003")
+    monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", mock_client)
+
+    with caplog.at_level("WARNING"):
+        result = crc._fetch_from_enclave(since=0.0, limit=20)
+
+    assert result is None
+    assert "503" in caplog.text
+    assert "key_derivation_unavailable" in caplog.text
+
+
 def test_image_message_passes_image_context_to_agent(monkeypatch, tmp_path):
     monkeypatch.setattr(crc, "IMAGE_TEMP_DIR", tmp_path)
     msg = _make_image_msg(ts=2100.0)

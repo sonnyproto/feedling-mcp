@@ -185,6 +185,11 @@ SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
 FALLBACK_REPLY = os.environ.get(
     "FALLBACK_REPLY", "（Agent 暂时无法响应，请稍后再试）"
 )
+# Canned reply for /v1/chat/verify_loop liveness pings — see the short-circuit
+# in _process_messages. The server GCs both the ping and this reply once the
+# verify completes, so it never reaches the user's visible chat; it only has
+# to be a non-empty agent-role write that lands fast.
+VERIFY_PING_REPLY = os.environ.get("VERIFY_PING_REPLY", "__verify_ack__")
 SEND_FALLBACK_ON_AGENT_ERROR = _env_bool("SEND_FALLBACK_ON_AGENT_ERROR", False)
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
 WHOAMI_STARTUP_RETRIES = int(os.environ.get("WHOAMI_STARTUP_RETRIES", "8"))
@@ -440,6 +445,18 @@ def _fetch_from_enclave(since: float, limit: int) -> list[dict] | None:
         data = resp.json()
         msgs = data.get("messages") or data.get("history") or []
         return _filter_since(msgs, since)
+    except httpx.HTTPStatusError as e:
+        # The enclave maps transient dependency failures to self-describing
+        # codes (502 backend_unreachable / 503 key_derivation_unavailable).
+        # httpx's str(e) carries the status + URL but NOT the body, so log the
+        # body explicitly — it's the only field that tells the operator WHICH
+        # dependency broke without shelling into the CVM.
+        body = (e.response.text or "").strip().replace("\n", " ")[:300]
+        log.warning(
+            "enclave history fetch failed: HTTP %d — %s",
+            e.response.status_code, body or "(empty body)",
+        )
+        return None
     except Exception as e:
         log.warning("enclave history fetch failed: %s", e)
         return None
@@ -1990,8 +2007,14 @@ def post_reply(
     source: str = "chat",
     gate_decision_id: str = "",
     proactive_job_id: str = "",
+    suppress_push: bool = False,
 ) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
+
+    `suppress_push=True` sends an empty alert_body and no push fields so
+    /v1/chat/response's app-state push policy is a no-op — used for private
+    writes that must land in the store (for liveness/verify) but must never
+    surface as a user-visible APNs notification.
 
     Falls back to plaintext only when encryption is unavailable — this will
     return 400 on v1 backends and is logged as an error so it's visible.
@@ -2021,7 +2044,7 @@ def post_reply(
             enclave_pk_bytes=enc_pk,
             visibility=visibility,
         )
-        visible_body = content[:240]
+        visible_body = "" if suppress_push else content[:240]
         body: dict[str, Any] = {
             "envelope": envelope,
             "source": source,
@@ -2031,7 +2054,7 @@ def post_reply(
             body["gate_decision_id"] = gate_decision_id
         if proactive_job_id:
             body["proactive_job_id"] = proactive_job_id
-        if source == PROACTIVE_JOB_SOURCE:
+        if source == PROACTIVE_JOB_SOURCE and not suppress_push:
             body["push_live_activity"] = True
             body["push_body"] = visible_body
             body["data"] = {
@@ -2051,9 +2074,9 @@ def post_reply(
         url,
         json={
             "content": content,
-            "push_live_activity": source == PROACTIVE_JOB_SOURCE,
-            "push_body": content[:240] if source == PROACTIVE_JOB_SOURCE else "",
-            "alert_body": content[:240],
+            "push_live_activity": source == PROACTIVE_JOB_SOURCE and not suppress_push,
+            "push_body": content[:240] if (source == PROACTIVE_JOB_SOURCE and not suppress_push) else "",
+            "alert_body": "" if suppress_push else content[:240],
             "source": source,
             "gate_decision_id": gate_decision_id,
             "proactive_job_id": proactive_job_id,
@@ -2318,6 +2341,31 @@ def _process_messages(messages: list) -> float:
         key = _msg_key(msg)
         if not _mark_seen(key):
             log.debug("skipping already-processed message key=%s", key)
+            latest = max(latest, ts)
+            continue
+
+        # Synthetic liveness probe from /v1/chat/verify_loop. Identified ONLY
+        # by `source`, which the server stamps as "verify_ping" across all
+        # three delivery paths — direct /v1/chat/poll, the enclave decrypt
+        # proxy (enclave_app.py passes source through even for local_only), and
+        # MCP (mcp_server.py merges source+content back by id). We must NOT also
+        # match the __VERIFY_PING__ content marker: a real user message that
+        # merely contains that string (e.g. debugging this feature) would be
+        # falsely swallowed and never reach the agent. (The probe is
+        # visibility=local_only, so over the enclave path its content is None —
+        # this check sits BEFORE the empty-content skip below so the probe is
+        # still answered.) Reply immediately with a canned token instead of
+        # routing the probe through the full agent — a hermes turn can exceed
+        # verify_loop's timeout and is fragile to mid-run SIGTERM, so the probe
+        # would time out (passing=false) even on a healthy reply pipeline.
+        if msg.get("source") == "verify_ping":
+            log.info("verify ping [ts=%.3f] — short-circuit canned liveness reply", ts)
+            try:
+                # suppress_push: the ack must not surface as an APNs
+                # notification — it's a private probe the verify GC then removes.
+                post_reply(VERIFY_PING_REPLY, suppress_push=True)
+            except Exception as e:
+                log.error("failed to post verify-ping reply: %s", e)
             latest = max(latest, ts)
             continue
 

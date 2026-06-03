@@ -685,7 +685,13 @@ def v1_envelope_decrypt():
     if not isinstance(env, dict):
         return jsonify({"error": "envelope required"}), 400
 
-    content_sk = _get_or_derive_content_sk()
+    try:
+        content_sk = _get_or_derive_content_sk()
+    except Exception as e:
+        # The only runtime dstack round-trip. A socket hiccup deriving the
+        # content key is a transient infra failure, not an enclave bug — return
+        # a retryable 503 rather than a bare 500 the consumer can't interpret.
+        return jsonify({"error": f"key_derivation_unavailable: {e}"}), 503
     try:
         plaintext = _decrypt_envelope(env, authorized_user_id, content_sk)
     except DecryptFailure as e:
@@ -787,6 +793,11 @@ def v1_chat_history():
         if e.response.status_code == 401:
             return jsonify({"error": "unauthorized"}), 401
         return jsonify({"error": f"backend_error: {e}"}), 502
+    except httpx.HTTPError as e:
+        # Connect/timeout reaching the backend whoami (NOT an HTTP status) —
+        # e.g. the reentrant whoami round-trip stalling under load. Map to a
+        # retryable 502 instead of letting it bubble into a bare Flask 500.
+        return jsonify({"error": f"backend_unreachable: {e}"}), 502
     authorized_user_id = whoami.get("user_id", "")
     if not authorized_user_id:
         return jsonify({"error": "cannot resolve user_id"}), 401
@@ -812,7 +823,13 @@ def v1_chat_history():
     # Reconstruct content_sk here — we cached only the pubkey on boot, the
     # privkey is always in-memory under _state but we didn't store it.
     # Fix: also cache the sk. For now, re-derive once on first call.
-    content_sk = _get_or_derive_content_sk()
+    try:
+        content_sk = _get_or_derive_content_sk()
+    except Exception as e:
+        # The only runtime dstack round-trip. A socket hiccup deriving the
+        # content key is a transient infra failure, not an enclave bug — return
+        # a retryable 503 rather than a bare 500 the consumer can't interpret.
+        return jsonify({"error": f"key_derivation_unavailable: {e}"}), 503
 
     decrypted = []
     errors = []
@@ -915,6 +932,11 @@ def v1_memory_list():
         if e.response.status_code == 401:
             return jsonify({"error": "unauthorized"}), 401
         return jsonify({"error": f"backend_error: {e}"}), 502
+    except httpx.HTTPError as e:
+        # Connect/timeout reaching the backend whoami (NOT an HTTP status) —
+        # e.g. the reentrant whoami round-trip stalling under load. Map to a
+        # retryable 502 instead of letting it bubble into a bare Flask 500.
+        return jsonify({"error": f"backend_unreachable: {e}"}), 502
     authorized_user_id = whoami.get("user_id", "")
     if not authorized_user_id:
         return jsonify({"error": "cannot resolve user_id"}), 401
@@ -935,7 +957,13 @@ def v1_memory_list():
     except httpx.HTTPError as e:
         return jsonify({"error": f"backend_error: {e}"}), 502
 
-    content_sk = _get_or_derive_content_sk()
+    try:
+        content_sk = _get_or_derive_content_sk()
+    except Exception as e:
+        # The only runtime dstack round-trip. A socket hiccup deriving the
+        # content key is a transient infra failure, not an enclave bug — return
+        # a retryable 503 rather than a bare 500 the consumer can't interpret.
+        return jsonify({"error": f"key_derivation_unavailable: {e}"}), 503
     decrypted = []
     errors = []
     for m in listing.get("moments", []):
@@ -1000,6 +1028,11 @@ def v1_identity_get():
         if e.response.status_code == 401:
             return jsonify({"error": "unauthorized"}), 401
         return jsonify({"error": f"backend_error: {e}"}), 502
+    except httpx.HTTPError as e:
+        # Connect/timeout reaching the backend whoami (NOT an HTTP status) —
+        # e.g. the reentrant whoami round-trip stalling under load. Map to a
+        # retryable 502 instead of letting it bubble into a bare Flask 500.
+        return jsonify({"error": f"backend_unreachable: {e}"}), 502
     authorized_user_id = whoami.get("user_id", "")
     if not authorized_user_id:
         return jsonify({"error": "cannot resolve user_id"}), 401
@@ -1032,7 +1065,13 @@ def v1_identity_get():
         })
         return jsonify({"identity": base, "user_id": authorized_user_id})
 
-    content_sk = _get_or_derive_content_sk()
+    try:
+        content_sk = _get_or_derive_content_sk()
+    except Exception as e:
+        # The only runtime dstack round-trip. A socket hiccup deriving the
+        # content key is a transient infra failure, not an enclave bug — return
+        # a retryable 503 rather than a bare 500 the consumer can't interpret.
+        return jsonify({"error": f"key_derivation_unavailable: {e}"}), 503
     try:
         plaintext = _decrypt_envelope(identity, authorized_user_id, content_sk)
         inner = json.loads(plaintext.decode("utf-8"))
@@ -1100,6 +1139,11 @@ def v1_frame_decrypt(frame_id):
         if e.response.status_code == 401:
             return jsonify({"error": "unauthorized"}), 401
         return jsonify({"error": f"backend_error: {e}"}), 502
+    except httpx.HTTPError as e:
+        # Connect/timeout reaching the backend whoami (NOT an HTTP status) —
+        # e.g. the reentrant whoami round-trip stalling under load. Map to a
+        # retryable 502 instead of letting it bubble into a bare Flask 500.
+        return jsonify({"error": f"backend_unreachable: {e}"}), 502
     authorized_user_id = whoami.get("user_id", "")
     if not authorized_user_id:
         return jsonify({"error": "cannot resolve user_id"}), 401
@@ -1116,7 +1160,13 @@ def v1_frame_decrypt(frame_id):
         return jsonify({"error": f"backend_error: {e}"}), 502
 
     include_image = request.args.get("include_image", "true").lower() != "false"
-    content_sk = _get_or_derive_content_sk()
+    try:
+        content_sk = _get_or_derive_content_sk()
+    except Exception as e:
+        # The only runtime dstack round-trip. A socket hiccup deriving the
+        # content key is a transient infra failure, not an enclave bug — return
+        # a retryable 503 rather than a bare 500 the consumer can't interpret.
+        return jsonify({"error": f"key_derivation_unavailable: {e}"}), 503
 
     try:
         plaintext = _decrypt_envelope(env, authorized_user_id, content_sk)
@@ -1189,6 +1239,11 @@ def v1_frame_image(frame_id):
         if e.response.status_code == 401:
             return jsonify({"error": "unauthorized"}), 401
         return jsonify({"error": f"backend_error: {e}"}), 502
+    except httpx.HTTPError as e:
+        # Connect/timeout reaching the backend whoami (NOT an HTTP status) —
+        # e.g. the reentrant whoami round-trip stalling under load. Map to a
+        # retryable 502 instead of letting it bubble into a bare Flask 500.
+        return jsonify({"error": f"backend_unreachable: {e}"}), 502
     authorized_user_id = whoami.get("user_id", "")
     if not authorized_user_id:
         return jsonify({"error": "cannot resolve user_id"}), 401
@@ -1204,7 +1259,13 @@ def v1_frame_image(frame_id):
             return jsonify({"error": "frame not found"}), 404
         return jsonify({"error": f"backend_error: {e}"}), 502
 
-    content_sk = _get_or_derive_content_sk()
+    try:
+        content_sk = _get_or_derive_content_sk()
+    except Exception as e:
+        # The only runtime dstack round-trip. A socket hiccup deriving the
+        # content key is a transient infra failure, not an enclave bug — return
+        # a retryable 503 rather than a bare 500 the consumer can't interpret.
+        return jsonify({"error": f"key_derivation_unavailable: {e}"}), 503
     try:
         plaintext = _decrypt_envelope(env, authorized_user_id, content_sk)
     except DecryptFailure as e:

@@ -10358,23 +10358,44 @@ def _chat_loop_verified_by_server(store) -> bool:
 
 
 def _reply_is_for_pending_verify_ping(store) -> bool:
-    """True when the next agent response is the private verify-loop reply.
+    """True when an unanswered synthetic verify ping is awaiting its reply.
 
     /v1/chat/verify_loop must be able to receive one agent response before
-    the visible chat gate is open. The synthetic ping is removed after the
-    verify completes, so this does not leak into user chat.
+    the visible chat gate is open. The synthetic ping (and the matching
+    reply) are removed after the verify completes, so this does not leak
+    into user chat.
+
+    This originally required the verify ping to be the single most-recent
+    message. That wedged actively-chatted accounts (prod 2026-06-03): a real
+    user message arriving during the verify window became 'newest', so the
+    consumer's correct reply to the pending ping was treated as an ordinary
+    chat reply and 409'd with needs_live_connection. With no reply ever
+    landing, chat_loop_verified never flipped and the gate never opened.
+
+    So we now allow the reply whenever an UNANSWERED verify ping exists — a
+    verify_ping user message with no agent/openclaw reply after it — even if
+    newer real user messages have since arrived. A single landed reply then
+    satisfies verify_loop and opens the gate permanently; the liveness proof
+    (an actual reply POST) is unchanged.
     """
     with store.chat_lock:
         chat_msgs = list(store.chat_messages)
-    for m in reversed(chat_msgs):
+    sorted_msgs = sorted(
+        chat_msgs,
+        key=lambda m: float(m.get("ts") or m.get("timestamp") or 0),
+    )
+    pending = False
+    for m in sorted_msgs:
         if not isinstance(m, dict):
             continue
         role = m.get("role")
-        if role in ("agent", "openclaw"):
-            return False
-        if role == "user":
-            return m.get("source") == "verify_ping"
-    return False
+        if role == "user" and m.get("source") == "verify_ping":
+            pending = True
+        elif role in ("agent", "openclaw"):
+            # An agent reply consumes the outstanding ping; a later ping
+            # re-arms it.
+            pending = False
+    return pending
 
 
 def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
