@@ -12735,6 +12735,413 @@ def _history_import_stats(store: UserStore) -> dict:
     }
 
 
+def _data_track_iso(value) -> str:
+    if isinstance(value, (int, float)):
+        return _epoch_to_iso(value)
+    return str(value or "")
+
+
+def _data_track_count_dict(raw: dict | None) -> dict:
+    out: dict[str, int] = {}
+    for key, value in (raw or {}).items():
+        try:
+            out[str(key or "unknown")] = int(value or 0)
+        except Exception:
+            out[str(key or "unknown")] = 0
+    return out
+
+
+def _data_track_days_since(value) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo:
+            dt = dt.replace(tzinfo=None)
+        return max(0, (datetime.now().date() - dt.date()).days)
+    except Exception:
+        return None
+
+
+def _data_track_memory_from_snapshot(snap: dict) -> dict:
+    memory = dict(snap.get("memory") or {})
+    extra = dict(snap.get("memory_extra") or {})
+    log_counts = dict(snap.get("log_counts") or {})
+    by_type = {typ: 0 for typ in MEMORY_TYPES}
+    by_type.update(_data_track_count_dict(memory.get("by_type")))
+    by_tab = {"story": 0, "about_me": 0, "ta_thinking": 0}
+    for mem_type, count in by_type.items():
+        tab = TAB_FOR_TYPE.get(mem_type, "unknown")
+        by_tab[tab] = by_tab.get(tab, 0) + int(count or 0)
+    return {
+        "total": int(memory.get("total") or 0),
+        "by_tab": by_tab,
+        "by_type": by_type,
+        "by_source": _data_track_count_dict(memory.get("by_source")),
+        "changes": int((snap.get("logs") or {}).get("memory_changes", {}).get("count") or 0),
+        "changes_by_action": _data_track_count_dict(log_counts.get("changes_by_action")),
+        "changes_by_capture_mode": _data_track_count_dict(log_counts.get("changes_by_capture_mode")),
+        "capture_jobs": int(extra.get("capture_jobs") or 0),
+        "capture_jobs_by_status": _data_track_count_dict(log_counts.get("capture_jobs_by_status")),
+        "capture_jobs_by_mode": _data_track_count_dict(log_counts.get("capture_jobs_by_mode")),
+        "capture_actions_written": int(extra.get("capture_actions_written") or 0),
+        "last_capture_at": _data_track_iso(extra.get("last_capture_ts")),
+        "first_created_at": _data_track_iso(memory.get("first_created_at")),
+        "last_created_at": _data_track_iso(memory.get("last_created_at")),
+        "earliest_occurred_at": _data_track_iso(memory.get("earliest_occurred_at")),
+        "latest_occurred_at": _data_track_iso(memory.get("latest_occurred_at")),
+    }
+
+
+def _data_track_chat_from_snapshot(snap: dict) -> dict:
+    chat = dict(snap.get("chat") or {})
+    by_role = _data_track_count_dict(chat.get("by_role"))
+    by_source = _data_track_count_dict(chat.get("by_source"))
+    by_content_type = _data_track_count_dict(chat.get("by_content_type"))
+    user_messages = int(chat.get("user_messages") or by_role.get("user", 0))
+    agent_messages = int(
+        chat.get("agent_messages")
+        or by_role.get("agent", 0)
+        + by_role.get("openclaw", 0)
+    )
+    return {
+        "total": int(chat.get("total") or 0),
+        "by_role": by_role,
+        "by_source": by_source,
+        "by_content_type": by_content_type,
+        "user_messages": user_messages,
+        "agent_messages": agent_messages,
+        "image_messages": int(chat.get("image_messages") or by_content_type.get("image", 0)),
+        "proactive_messages": int(chat.get("proactive_messages") or by_source.get(PROACTIVE_JOB_SOURCE, 0)),
+        "model_api_user_messages": int(chat.get("model_api_user_messages") or 0),
+        "model_api_agent_messages": int(chat.get("model_api_agent_messages") or 0),
+        "model_api_greetings": int(chat.get("model_api_greetings") or 0),
+        "first_at": _data_track_iso(chat.get("first_ts")),
+        "last_at": _data_track_iso(chat.get("last_ts")),
+        "last_user_at": _data_track_iso(chat.get("last_user_ts")),
+        "last_agent_at": _data_track_iso(chat.get("last_agent_ts")),
+        "proactive_last_at": _data_track_iso(chat.get("proactive_last_ts")),
+    }
+
+
+def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
+    logs = dict(snap.get("logs") or {})
+    extra = dict(snap.get("proactive_extra") or {})
+    status_counts = _data_track_count_dict(extra.get("jobs_by_status"))
+    live_status_counts = _data_track_count_dict(extra.get("live_activity_status"))
+    alert_status_counts = _data_track_count_dict(extra.get("alert_status"))
+    decisions = int(extra.get("decisions") or logs.get("gate_decisions", {}).get("count") or 0)
+    decision_true = int(extra.get("decision_true") or 0)
+    delivered = (
+        live_status_counts.get("delivered", 0)
+        + alert_status_counts.get("delivered", 0)
+        + alert_status_counts.get("logged_only", 0)
+    )
+    failed = sum(status_counts.get(s, 0) for s in ("failed", "skipped"))
+    failed += sum(live_status_counts.get(s, 0) for s in ("failed", "error"))
+    failed += sum(alert_status_counts.get(s, 0) for s in ("failed", "error"))
+    last_at = _latest_epoch(
+        logs.get("proactive_jobs", {}).get("last_ts"),
+        logs.get("gate_decisions", {}).get("last_ts"),
+        chat.get("proactive_last_at"),
+    )
+    return {
+        "decisions": decisions,
+        "decision_true": decision_true,
+        "decision_false": max(0, decisions - decision_true),
+        "jobs": int(logs.get("proactive_jobs", {}).get("count") or 0),
+        "jobs_by_status": status_counts,
+        "pending_jobs": status_counts.get("pending", 0),
+        "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
+        "failed_jobs": failed,
+        "proactive_messages": int(chat.get("proactive_messages") or 0),
+        "delivery_signals": delivered,
+        "live_activity_status": live_status_counts,
+        "alert_status": alert_status_counts,
+        "device_events": int(logs.get("device_events", {}).get("count") or 0),
+        "last_at": _epoch_to_iso(last_at),
+    }
+
+
+def _data_track_tracking_from_snapshot(snap: dict) -> dict:
+    logs = dict(snap.get("logs") or {})
+    counts = dict(snap.get("log_counts") or {})
+    tracking = logs.get("tracking_events", {}) or {}
+    return {
+        "events": int(tracking.get("count") or 0),
+        "by_type": _data_track_count_dict(counts.get("tracking_by_type")),
+        "last_at": _data_track_iso(tracking.get("last_ts")),
+    }
+
+
+def _data_track_bootstrap_from_snapshot(snap: dict) -> dict:
+    logs = dict(snap.get("logs") or {})
+    counts = dict(snap.get("log_counts") or {})
+    bootstrap = logs.get("bootstrap_events", {}) or {}
+    return {
+        "events": int(bootstrap.get("count") or 0),
+        "by_type": _data_track_count_dict(counts.get("bootstrap_by_type")),
+        "last_at": _data_track_iso(bootstrap.get("last_ts")),
+    }
+
+
+def _data_track_history_import_from_snapshot(snap: dict) -> dict:
+    latest = snap.get("history_import")
+    if not isinstance(latest, dict):
+        return {"has_job": False}
+    return {
+        "has_job": True,
+        "job_id": latest.get("job_id", ""),
+        "status": latest.get("status", ""),
+        "phase": latest.get("phase", ""),
+        "phase_label": latest.get("phase_label", ""),
+        "progress": latest.get("progress", 0),
+        "created_at": latest.get("created_at", ""),
+        "started_at": latest.get("started_at", ""),
+        "updated_at": latest.get("updated_at", ""),
+        "completed_at": latest.get("completed_at", ""),
+        "failed_at": latest.get("failed_at", ""),
+        "error": latest.get("error", ""),
+        "messages_parsed": latest.get("messages_parsed", 0),
+        "support_materials": latest.get("support_materials", 0),
+        "chat_messages_imported": latest.get("chat_messages_imported", 0),
+        "memories_created": latest.get("memories_created", 0),
+        "identity_written": bool(latest.get("identity_written")),
+        "chat_ready": bool(latest.get("chat_ready")),
+    }
+
+
+def _data_track_relationship_days(identity: dict | None, memory: dict) -> int:
+    if identity and identity.get("relationship_started_at"):
+        days = _data_track_days_since(identity.get("relationship_started_at"))
+        if days is not None:
+            return days
+    days = _data_track_days_since(memory.get("earliest_occurred_at"))
+    return days if days is not None else 0
+
+
+def _data_track_fast_validation(
+    *,
+    route: str,
+    chat: dict,
+    memory: dict,
+    identity: dict | None,
+    history_import: dict,
+    model_api_config: dict | None,
+    consumer_state: dict | None,
+    bootstrap_events: dict,
+) -> dict:
+    relationship_days = _data_track_relationship_days(identity, memory)
+    floors = _per_tab_floors_for_days(relationship_days)
+    counts = memory.get("by_tab") or {}
+    missing_tabs = []
+    if int(counts.get("story") or 0) < floors["story"]:
+        missing_tabs.append("story")
+    if int(counts.get("about_me") or 0) < floors["about_me"]:
+        missing_tabs.append("about_me")
+    identity_written = identity is not None
+    relationship_evidence = str((identity or {}).get("relationship_anchor_evidence") or "").strip()
+    relationship_ok = bool(identity and identity.get("relationship_started_at") and relationship_evidence)
+
+    def step(step_id: str, label: str, passing: bool, required: str = "", **extra) -> dict:
+        out = {"id": step_id, "label": label, "passing": bool(passing), "required": "" if passing else required}
+        out.update(extra)
+        return out
+
+    if route == "model_api":
+        history_ok = bool(history_import.get("has_job") and (
+            history_import.get("status") == "completed" or history_import.get("chat_ready")
+        ))
+        memory_ok = history_ok and int(counts.get("story") or 0) >= 1 and int(counts.get("about_me") or 0) >= 1
+        hosted_chat_ok = bool(
+            chat.get("model_api_greetings")
+            or (chat.get("model_api_user_messages") and chat.get("model_api_agent_messages"))
+        )
+        steps = [
+            step("model_api_config", "Model API Config", bool(model_api_config), "Call /v1/model_api/setup."),
+            step(
+                "model_api_test",
+                "Model API Test",
+                bool(model_api_config and model_api_config.get("test_status") == "ok"),
+                "Call /v1/model_api/test until test_status is ok.",
+                test_status=(model_api_config or {}).get("test_status", ""),
+            ),
+            step(
+                "history_import",
+                "Onboarding Materials",
+                history_ok,
+                "Start onboarding with a chat history file, persona profile, or confirmed fresh start.",
+                job_status=history_import.get("status", ""),
+                phase=history_import.get("phase", ""),
+                progress=history_import.get("progress", 0),
+                chat_ready=history_import.get("chat_ready", False),
+            ),
+            step(
+                "memory_garden",
+                "Memory Garden",
+                memory_ok,
+                "History import must write at least one Story card and one About-me card.",
+                counts={"story": counts.get("story", 0), "about_me": counts.get("about_me", 0), "ta_thinking": counts.get("ta_thinking", 0), "total": memory.get("total", 0)},
+            ),
+            step("identity_card", "Identity Card", identity_written, "History import must derive and write Identity Card."),
+            step("relationship_anchor", "Relationship Anchor", relationship_ok, "History import must include relationship_started_at or fresh_start=true."),
+            step("hosted_chat", "Hosted Chat", hosted_chat_ok, "Send one test message through /v1/model_api/chat/send."),
+        ]
+        next_step = next((s for s in steps if not s["passing"]), None)
+        return {
+            "passing": next_step is None,
+            "stage": "complete" if next_step is None else next_step["id"],
+            "route": "model_api",
+            "next_action": "" if next_step is None else next_step["required"],
+            "steps": steps,
+        }
+
+    memory_ok = not missing_tabs
+    if route == "official_import":
+        steps = [
+            step("memory_garden", "Memory Garden", memory_ok, "Memory import must fill required Story and About-me cards."),
+            step("identity_card", "Identity Card", identity_written, "Use the official app/tool client to import memory and identity."),
+            step("relationship_anchor", "Relationship Anchor", relationship_ok, "Set relationship anchor during import."),
+        ]
+        next_step = next((s for s in steps if not s["passing"]), None)
+        return {
+            "passing": next_step is None,
+            "stage": "import_ready" if next_step is None else next_step["id"],
+            "route": "official_import",
+            "next_action": "" if next_step is None else next_step["required"],
+            "steps": steps,
+        }
+
+    consumer = consumer_state or {}
+    try:
+        age_sec = time.time() - float(consumer.get("last_poll_epoch") or 0)
+    except Exception:
+        age_sec = None
+    consumer_ok = bool(consumer.get("official")) and age_sec is not None and age_sec <= _CONSUMER_RECENT_SEC
+    bootstrap_types = bootstrap_events.get("by_type") or {}
+    chat_loop_ok = bool(bootstrap_types.get("chat_loop_verified")) or bool(chat.get("user_messages") and chat.get("agent_messages"))
+    first_greeting_ok = int(chat.get("agent_messages") or 0) > 0
+    real_exchange_ok = bool(chat.get("user_messages") and chat.get("agent_messages"))
+    steps = [
+        step("memory_garden", "Memory Garden", memory_ok, "Memory Garden is below required Story/About-me floors."),
+        step("identity_card", "Identity Card", identity_written, "Call feedling_identity_init after memory verification passes."),
+        step("relationship_anchor", "Relationship Anchor", relationship_ok, "Re-run identity init with relationship_anchor_evidence."),
+        step("resident_consumer", "Resident Consumer", consumer_ok, "Run the standard feedling-chat-resident / IO resident consumer."),
+        step("live_loop", "Live Connection", chat_loop_ok, "Call feedling_chat_verify_loop after resident consumer is polling."),
+        step("first_greeting", "First Greeting", first_greeting_ok, "Send first visible greeting via feedling_chat_post_message."),
+        step("real_chat_acceptance", "Real Chat Acceptance", real_exchange_ok, "Ask the user to send one ordinary IO Chat message and confirm a reply."),
+    ]
+    next_step = next((s for s in steps if not s["passing"]), None)
+    return {
+        "passing": next_step is None,
+        "stage": "complete" if next_step is None else next_step["id"],
+        "route": "resident",
+        "next_action": "" if next_step is None else next_step["required"],
+        "steps": steps,
+    }
+
+
+def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
+    user_id = str(user_entry.get("user_id") or "")
+    blobs = dict(snap.get("blobs") or {})
+    route_data = blobs.get("onboarding_route") or {}
+    route = _normalize_onboarding_route(str((route_data or {}).get("route") or "resident"))
+    route = route if route in MODEL_API_ROUTES else "resident"
+    access_modes = _public_access_mode_state(dict(user_entry), route)
+    access_connected = [
+        mode["access_mode"]
+        for mode in access_modes
+        if mode.get("connected")
+    ]
+    api_keys_count = sum(
+        1
+        for key_entry in user_entry.get("api_keys") or []
+        if isinstance(key_entry, dict) and not key_entry.get("revoked_at")
+    )
+    chat = _data_track_chat_from_snapshot(snap)
+    memory = _data_track_memory_from_snapshot(snap)
+    proactive = _data_track_proactive_from_snapshot(snap, chat)
+    tracking = _data_track_tracking_from_snapshot(snap)
+    bootstrap_events = _data_track_bootstrap_from_snapshot(snap)
+    history_import = _data_track_history_import_from_snapshot(snap)
+    identity = blobs.get("identity") if isinstance(blobs.get("identity"), dict) else None
+    validation = _data_track_fast_validation(
+        route=route,
+        chat=chat,
+        memory=memory,
+        identity=identity,
+        history_import=history_import,
+        model_api_config=blobs.get("model_api") if isinstance(blobs.get("model_api"), dict) else None,
+        consumer_state=blobs.get("consumer_state") if isinstance(blobs.get("consumer_state"), dict) else None,
+        bootstrap_events=bootstrap_events,
+    )
+    steps = validation.get("steps", [])
+    steps_total = len(steps)
+    steps_done = sum(1 for s in steps if bool(s.get("passing")))
+    registered_at = str(user_entry.get("created_at") or "")
+    identity_updated_at = (identity or {}).get("updated_at", "")
+    latest_epoch = _latest_epoch(
+        registered_at,
+        route_data.get("selected_at"),
+        chat.get("last_at"),
+        memory.get("last_created_at"),
+        proactive.get("last_at"),
+        tracking.get("last_at"),
+        bootstrap_events.get("last_at"),
+        identity_updated_at,
+        history_import.get("updated_at"),
+        history_import.get("completed_at"),
+    )
+    passing = bool(validation.get("passing"))
+    stuck_for_sec = 0 if passing else int(max(0, time.time() - latest_epoch)) if latest_epoch else None
+    return {
+        "user_id": user_id,
+        "principal_id": user_entry.get("principal_id") or "",
+        "registered_at": registered_at,
+        "archive_language": user_entry.get("archive_language") or "",
+        "public_key_present": bool(str(user_entry.get("public_key") or "").strip()),
+        "route": route,
+        "route_selected_at": route_data.get("selected_at", ""),
+        "access": {
+            "principal_id": user_entry.get("principal_id") or "",
+            "active_route": route,
+            "connected_modes": access_connected,
+            "modes": access_modes,
+            "api_keys_count": api_keys_count,
+        },
+        "onboarding": {
+            "passing": passing,
+            "stage": "complete" if passing else validation.get("stage") or "unknown",
+            "steps_done": steps_done,
+            "steps_total": steps_total,
+            "next_action": validation.get("next_action", ""),
+            "steps": [],
+            "stuck_for_sec": stuck_for_sec,
+        },
+        "last_activity_at": _epoch_to_iso(latest_epoch),
+        "chat": chat,
+        "memory": memory,
+        "proactive": proactive,
+        "push": _push_stats_from_user_entry(user_entry),
+        "tracking": tracking,
+        "bootstrap_events": bootstrap_events,
+        "history_import": history_import,
+    }
+
+
+def _push_stats_from_user_entry(user_entry: dict) -> dict:
+    tokens = [t for t in (user_entry.get("tokens") or []) if isinstance(t, dict)]
+    statuses = _count_rows(tokens, "status")
+    updated_epochs = [_to_epoch(t.get("updated_at") or t.get("registered_at")) for t in tokens]
+    return {
+        "tokens": len(tokens),
+        "active_tokens": statuses.get("active", 0),
+        "by_status": statuses,
+        "last_token_at": _epoch_to_iso(max(updated_epochs, default=0)),
+    }
+
+
 def _bootstrap_event_stats(store: UserStore, *, include_events: bool = False) -> dict:
     events = _load_bootstrap_events(store)
     by_type = _count_rows(events, "event_type")
@@ -12849,16 +13256,76 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
     return row
 
 
+def _data_track_request_filters() -> dict:
+    raw_since = (
+        request.args.get("since")
+        or request.args.get("registered_since")
+        or ""
+    ).strip()
+    raw_q = (request.args.get("q") or "").strip().lower()
+
+    def read_int(name: str, default: int, minimum: int, maximum: int) -> int:
+        try:
+            value = int(request.args.get(name, default))
+        except Exception:
+            value = default
+        return max(minimum, min(maximum, value))
+
+    return {
+        "since": raw_since,
+        "since_epoch": _to_epoch(raw_since),
+        "q": raw_q,
+        "limit": read_int("limit", 100, 1, 500),
+        "offset": read_int("offset", 0, 0, 1_000_000),
+    }
+
+
+def _data_track_filter_users(users: list[dict], filters: dict) -> list[dict]:
+    since_epoch = float(filters.get("since_epoch") or 0)
+    if not since_epoch:
+        return users
+    return [
+        u for u in users
+        if _to_epoch(u.get("created_at")) >= since_epoch
+    ]
+
+
+def _data_track_apply_text_filter(rows: list[dict], q: str) -> list[dict]:
+    needle = (q or "").strip().lower()
+    if not needle:
+        return rows
+    out = []
+    for row in rows:
+        hay = " ".join([
+            str(row.get("user_id") or ""),
+            str(row.get("principal_id") or ""),
+            str(row.get("route") or ""),
+            str(row.get("archive_language") or ""),
+            str(row.get("onboarding", {}).get("stage") or ""),
+            " ".join(row.get("access", {}).get("connected_modes") or []),
+        ]).lower()
+        if needle in hay:
+            out.append(row)
+    return out
+
+
 def _data_track_payload(*, include_users: bool = True, include_detail_user: str = "") -> dict:
+    filters = _data_track_request_filters()
     with _users_lock:
         if _normalize_all_users():
             _save_users()
         users = [dict(u) for u in _users if u.get("user_id")]
-    rows = [
-        _build_data_track_user(u, include_detail=(include_detail_user == u.get("user_id")))
-        for u in users
-    ]
+    users = _data_track_filter_users(users, filters)
+    snapshot = db.admin_data_track_snapshot([str(u.get("user_id") or "") for u in users])
+    rows = []
+    for u in users:
+        uid = str(u.get("user_id") or "")
+        if include_detail_user and include_detail_user == uid:
+            rows.append(_build_data_track_user(u, include_detail=True))
+        else:
+            rows.append(_build_data_track_user_fast(u, snapshot.get(uid, {})))
     rows.sort(key=lambda r: r.get("registered_at") or "", reverse=True)
+    rows = _data_track_apply_text_filter(rows, str(filters.get("q") or ""))
     completed = sum(1 for r in rows if r["onboarding"]["passing"])
     incomplete = max(0, len(rows) - completed)
     stage_counts: dict[str, int] = {}
@@ -12898,9 +13365,25 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         "proactive_messages_total": proactive_messages,
         "proactive_failed_total": proactive_failed,
     }
-    payload = {"summary": summary}
+    payload = {
+        "summary": summary,
+        "filters": {
+            "since": filters.get("since", ""),
+            "q": filters.get("q", ""),
+        },
+    }
     if include_users:
-        payload["users"] = rows
+        offset = int(filters.get("offset") or 0)
+        limit = int(filters.get("limit") or 100)
+        payload["users"] = rows[offset:offset + limit]
+        payload["pagination"] = {
+            "limit": limit,
+            "offset": offset,
+            "returned": len(payload["users"]),
+            "total": len(rows),
+            "next_offset": offset + limit if offset + limit < len(rows) else None,
+            "prev_offset": max(0, offset - limit) if offset > 0 else None,
+        }
     return payload
 
 
@@ -12934,6 +13417,8 @@ def _render_metric(label: str, value) -> str:
 def _render_data_track_page(payload: dict) -> str:
     summary = payload["summary"]
     users = payload.get("users", [])
+    pagination = payload.get("pagination", {})
+    filters = payload.get("filters", {})
     qs = _admin_qs()
     qs_suffix = f"?{qs}" if qs else ""
     rows_html = []
@@ -13006,6 +13491,7 @@ def _render_data_track_page(payload: dict) -> str:
 <main>
   <h1>Feedling Beta Data Track</h1>
   <div class="muted">Generated {html.escape(summary["generated_at"])}. Metadata only; encrypted content is not read or rendered.</div>
+  <div class="muted">Showing {html.escape(str(pagination.get("returned", len(users))))} of {html.escape(str(pagination.get("total", summary["users_total"])))} filtered users. Since {html.escape(str(filters.get("since") or "all time"))}.</div>
   <section class="metrics">{metrics}</section>
   <h2>Beta users</h2>
   <div class="toolbar"><input id="q" placeholder="Filter user, route, stage"></div>

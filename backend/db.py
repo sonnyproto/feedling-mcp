@@ -12,7 +12,7 @@ Crypto note: the server never decrypts. Every encrypted payload (chat / memory
 stored verbatim as JSONB and returned byte-for-byte, so the enclave's decrypt
 path is unaffected.
 
-Concurrency: one gunicorn process, ``--threads 16``. A single
+Concurrency: one gunicorn process, ``--threads 32`` in production compose. A single
 ``psycopg_pool.ConnectionPool`` (max_size=16) is shared across threads. The
 long-poll endpoints block on in-memory ``threading.Event``s, NOT on a held DB
 connection, so they don't starve the pool.
@@ -252,6 +252,278 @@ def save_all_users(users: list[dict]) -> None:
 def delete_user(user_id: str) -> None:
     with get_pool().connection() as conn:
         conn.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+
+
+# ---------------------------------------------------------------------------
+# Admin/data-track aggregate reads
+# ---------------------------------------------------------------------------
+
+
+def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
+    """Return metadata-only aggregate stats for a set of users.
+
+    This is deliberately SQL-aggregate based: admin dashboards must not pull
+    full encrypted chat envelopes or memory bodies into Python just to count
+    them. The returned shape is consumed by app.py's data-track surface.
+    """
+    ids = [str(uid) for uid in user_ids if uid]
+    if not ids:
+        return {}
+
+    def ensure(out: dict[str, dict], uid: str) -> dict:
+        return out.setdefault(uid, {})
+
+    out: dict[str, dict] = {uid: {} for uid in ids}
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COUNT(*)::int AS total,
+                       COUNT(*) FILTER (WHERE doc->>'role' = 'user')::int AS user_messages,
+                       COUNT(*) FILTER (WHERE doc->>'role' IN ('agent', 'openclaw'))::int AS agent_messages,
+                       COUNT(*) FILTER (WHERE doc->>'content_type' = 'image')::int AS image_messages,
+                       COUNT(*) FILTER (WHERE doc->>'source' = 'agent_initiated_proactive')::int AS proactive_messages,
+                       COUNT(*) FILTER (WHERE doc->>'source' = 'model_api' AND doc->>'role' = 'user')::int AS model_api_user_messages,
+                       COUNT(*) FILTER (WHERE doc->>'source' = 'model_api' AND doc->>'role' IN ('agent', 'openclaw'))::int AS model_api_agent_messages,
+                       COUNT(*) FILTER (WHERE doc->>'source' = 'model_api' AND doc->>'model_api_kind' = 'onboarding_greeting')::int AS model_api_greetings,
+                       MIN(ts) AS first_ts,
+                       MAX(ts) AS last_ts,
+                       MAX(ts) FILTER (WHERE doc->>'source' = 'agent_initiated_proactive') AS proactive_last_ts,
+                       MAX(ts) FILTER (WHERE doc->>'role' = 'user') AS last_user_ts,
+                       MAX(ts) FILTER (WHERE doc->>'role' IN ('agent', 'openclaw')) AS last_agent_ts
+                FROM chat_messages
+                WHERE user_id = ANY(%s)
+                GROUP BY user_id
+                """,
+                (ids,),
+            ).fetchall()
+            for row in rows:
+                uid = row[0]
+                ensure(out, uid)["chat"] = {
+                    "total": row[1],
+                    "user_messages": row[2],
+                    "agent_messages": row[3],
+                    "image_messages": row[4],
+                    "proactive_messages": row[5],
+                    "model_api_user_messages": row[6],
+                    "model_api_agent_messages": row[7],
+                    "model_api_greetings": row[8],
+                    "first_ts": row[9],
+                    "last_ts": row[10],
+                    "proactive_last_ts": row[11],
+                    "last_user_ts": row[12],
+                    "last_agent_ts": row[13],
+                    "by_role": {},
+                    "by_source": {},
+                    "by_content_type": {},
+                }
+
+            for field, target in (
+                ("role", "by_role"),
+                ("source", "by_source"),
+                ("content_type", "by_content_type"),
+            ):
+                rows = conn.execute(
+                    f"""
+                    SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
+                           COUNT(*)::int
+                    FROM chat_messages
+                    WHERE user_id = ANY(%s)
+                    GROUP BY user_id, value
+                    """,
+                    (field, ids),
+                ).fetchall()
+                for uid, value, count in rows:
+                    chat = ensure(out, uid).setdefault("chat", {})
+                    chat.setdefault(target, {})[value] = count
+
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COUNT(*)::int AS total,
+                       MIN(NULLIF(doc->>'created_at', '')) AS first_created_at,
+                       MAX(NULLIF(doc->>'created_at', '')) AS last_created_at,
+                       MIN(NULLIF(doc->>'occurred_at', '')) AS earliest_occurred_at,
+                       MAX(NULLIF(doc->>'occurred_at', '')) AS latest_occurred_at
+                FROM memory_moments
+                WHERE user_id = ANY(%s)
+                GROUP BY user_id
+                """,
+                (ids,),
+            ).fetchall()
+            for row in rows:
+                ensure(out, row[0])["memory"] = {
+                    "total": row[1],
+                    "by_type": {},
+                    "by_source": {},
+                    "first_created_at": row[2] or "",
+                    "last_created_at": row[3] or "",
+                    "earliest_occurred_at": row[4] or "",
+                    "latest_occurred_at": row[5] or "",
+                }
+
+            for field, target in (("type", "by_type"), ("source", "by_source")):
+                rows = conn.execute(
+                    f"""
+                    SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
+                           COUNT(*)::int
+                    FROM memory_moments
+                    WHERE user_id = ANY(%s)
+                    GROUP BY user_id, value
+                    """,
+                    (field, ids),
+                ).fetchall()
+                for uid, value, count in rows:
+                    memory = ensure(out, uid).setdefault("memory", {})
+                    memory.setdefault(target, {})[value] = count
+
+            rows = conn.execute(
+                """
+                SELECT user_id, stream, COUNT(*)::int, MAX(ts)
+                FROM user_logs
+                WHERE user_id = ANY(%s)
+                  AND stream IN (
+                    'memory_changes', 'memory_capture_jobs', 'gate_decisions',
+                    'proactive_jobs', 'device_events', 'tracking_events',
+                    'bootstrap_events'
+                  )
+                GROUP BY user_id, stream
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, stream, count, max_ts in rows:
+                ensure(out, uid).setdefault("logs", {})[stream] = {
+                    "count": count,
+                    "last_ts": max_ts,
+                }
+
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COUNT(*)::int AS decisions,
+                       COUNT(*) FILTER (
+                         WHERE LOWER(COALESCE(doc->>'should_reach_out', '')) IN ('true', '1', 'yes')
+                       )::int AS decision_true
+                FROM user_logs
+                WHERE user_id = ANY(%s) AND stream = 'gate_decisions'
+                GROUP BY user_id
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, decisions, decision_true in rows:
+                ensure(out, uid).setdefault("proactive_extra", {}).update({
+                    "decisions": decisions,
+                    "decision_true": decision_true,
+                })
+
+            rows = conn.execute(
+                """
+                SELECT user_id, COALESCE(NULLIF(doc->>'status', ''), 'unknown') AS status,
+                       COUNT(*)::int
+                FROM user_logs
+                WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
+                GROUP BY user_id, status
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, status, count in rows:
+                ensure(out, uid).setdefault("proactive_extra", {}).setdefault("jobs_by_status", {})[status] = count
+
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COALESCE(NULLIF(doc->>'live_activity_status', ''), 'unknown') AS live_status,
+                       COUNT(*)::int
+                FROM chat_messages
+                WHERE user_id = ANY(%s) AND doc->>'source' = 'agent_initiated_proactive'
+                GROUP BY user_id, live_status
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, status, count in rows:
+                ensure(out, uid).setdefault("proactive_extra", {}).setdefault("live_activity_status", {})[status] = count
+
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COALESCE(NULLIF(doc->>'alert_status', ''), 'unknown') AS alert_status,
+                       COUNT(*)::int
+                FROM chat_messages
+                WHERE user_id = ANY(%s) AND doc->>'source' = 'agent_initiated_proactive'
+                GROUP BY user_id, alert_status
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, status, count in rows:
+                ensure(out, uid).setdefault("proactive_extra", {}).setdefault("alert_status", {})[status] = count
+
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COUNT(*)::int AS capture_jobs,
+                       COALESCE(SUM(NULLIF(doc->>'actions_written', '')::int), 0)::int AS actions_written,
+                       MAX(ts) AS last_capture_ts
+                FROM user_logs
+                WHERE user_id = ANY(%s) AND stream = 'memory_capture_jobs'
+                GROUP BY user_id
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, capture_jobs, actions_written, last_ts in rows:
+                ensure(out, uid).setdefault("memory_extra", {}).update({
+                    "capture_jobs": capture_jobs,
+                    "capture_actions_written": actions_written,
+                    "last_capture_ts": last_ts,
+                })
+
+            for stream, field, out_key in (
+                ("memory_changes", "action", "changes_by_action"),
+                ("memory_changes", "capture_mode", "changes_by_capture_mode"),
+                ("memory_capture_jobs", "status", "capture_jobs_by_status"),
+                ("memory_capture_jobs", "mode", "capture_jobs_by_mode"),
+                ("tracking_events", "type", "tracking_by_type"),
+                ("bootstrap_events", "event_type", "bootstrap_by_type"),
+            ):
+                rows = conn.execute(
+                    """
+                    SELECT user_id, COALESCE(NULLIF(doc->>%s, ''), 'unknown') AS value,
+                           COUNT(*)::int
+                    FROM user_logs
+                    WHERE user_id = ANY(%s) AND stream = %s
+                    GROUP BY user_id, value
+                    """,
+                    (field, ids, stream),
+                ).fetchall()
+                for uid, value, count in rows:
+                    ensure(out, uid).setdefault("log_counts", {}).setdefault(out_key, {})[value] = count
+
+            rows = conn.execute(
+                """
+                SELECT user_id, kind, doc
+                FROM user_blobs
+                WHERE user_id = ANY(%s)
+                  AND kind IN ('onboarding_route', 'identity', 'model_api', 'consumer_state')
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, kind, doc in rows:
+                ensure(out, uid).setdefault("blobs", {})[kind] = doc
+
+            rows = conn.execute(
+                """
+                SELECT DISTINCT ON (user_id) user_id, doc
+                FROM user_blobs
+                WHERE user_id = ANY(%s) AND kind LIKE 'history_import_job:%%'
+                ORDER BY user_id, COALESCE(doc->>'updated_at', doc->>'created_at', '') DESC
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, doc in rows:
+                ensure(out, uid)["history_import"] = doc
+    except Exception as e:
+        log.error("[db] admin_data_track_snapshot failed: %s", e)
+    return out
 
 
 # ---------------------------------------------------------------------------

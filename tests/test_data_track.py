@@ -163,3 +163,41 @@ def test_admin_data_track_aggregates_counts_without_content(client):
     assert "private alert preview" not in dumped
     assert "private copied prompt" not in dumped
     assert "private evidence" not in dumped
+
+
+def test_admin_data_track_supports_since_filter_and_pagination(client):
+    old_user, _ = _register(client)
+    new_user, _ = _register(client)
+
+    with appmod._users_lock:
+        for entry in appmod._users:
+            if entry["user_id"] == old_user:
+                entry["created_at"] = "2026-06-01T17:00:00+00:00"
+            elif entry["user_id"] == new_user:
+                entry["created_at"] = "2026-06-01T19:00:00+00:00"
+        appmod._save_users()
+
+    summary = client.get(
+        "/v1/admin/data-track/summary?since=2026-06-01T18:00:00Z",
+        headers=_admin_headers(),
+    )
+    assert summary.status_code == 200, summary.get_data(as_text=True)
+    summary_body = summary.get_json()
+    assert summary_body["summary"]["users_total"] == 1
+    assert "users" not in summary_body
+
+    users = client.get(
+        "/v1/admin/data-track/users?since=2026-06-01T18:00:00Z&limit=1",
+        headers=_admin_headers(),
+    )
+    assert users.status_code == 200, users.get_data(as_text=True)
+    body = users.get_json()
+    assert body["pagination"] == {
+        "limit": 1,
+        "offset": 0,
+        "returned": 1,
+        "total": 1,
+        "next_offset": None,
+        "prev_offset": None,
+    }
+    assert [row["user_id"] for row in body["users"]] == [new_user]
