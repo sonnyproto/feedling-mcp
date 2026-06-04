@@ -201,3 +201,79 @@ def test_admin_data_track_supports_since_filter_and_pagination(client):
         "prev_offset": None,
     }
     assert [row["user_id"] for row in body["users"]] == [new_user]
+
+
+def test_admin_data_track_sorts_before_pagination(client):
+    low_chat_high_memory, _ = _register(client)
+    mid_chat_mid_memory, _ = _register(client)
+    high_chat_low_memory, _ = _register(client)
+
+    def add_chat(user_id: str, *, regular: int, proactive: int) -> None:
+        store = appmod.get_store(user_id)
+        for idx in range(regular):
+            role = "user" if idx % 2 == 0 else "openclaw"
+            store.append_chat(role, "chat", _env(f"{user_id}_chat_{idx}", user_id))
+        for idx in range(proactive):
+            store.append_chat(
+                "openclaw",
+                appmod.PROACTIVE_JOB_SOURCE,
+                _env(f"{user_id}_proactive_{idx}", user_id),
+            )
+
+    def add_memories(user_id: str, count: int) -> None:
+        store = appmod.get_store(user_id)
+        appmod._save_moments(
+            store,
+            [
+                {
+                    "id": f"{user_id}_mem_{idx}",
+                    "type": "moment" if idx % 2 == 0 else "fact",
+                    "source": "test",
+                    "created_at": f"2026-06-01T00:{idx:02d}:00",
+                }
+                for idx in range(count)
+            ],
+        )
+
+    add_chat(low_chat_high_memory, regular=1, proactive=0)
+    add_memories(low_chat_high_memory, 5)
+    add_chat(mid_chat_mid_memory, regular=2, proactive=1)
+    add_memories(mid_chat_mid_memory, 3)
+    add_chat(high_chat_low_memory, regular=3, proactive=2)
+    add_memories(high_chat_low_memory, 1)
+
+    def sorted_ids(sort: str, direction: str) -> list[str]:
+        res = client.get(
+            f"/v1/admin/data-track/users?sort={sort}&dir={direction}&limit=10",
+            headers=_admin_headers(),
+        )
+        assert res.status_code == 200, res.get_data(as_text=True)
+        return [row["user_id"] for row in res.get_json()["users"]]
+
+    assert sorted_ids("chat", "desc") == [
+        high_chat_low_memory,
+        mid_chat_mid_memory,
+        low_chat_high_memory,
+    ]
+    assert sorted_ids("chat", "asc") == [
+        low_chat_high_memory,
+        mid_chat_mid_memory,
+        high_chat_low_memory,
+    ]
+    assert sorted_ids("memory", "desc") == [
+        low_chat_high_memory,
+        mid_chat_mid_memory,
+        high_chat_low_memory,
+    ]
+    assert sorted_ids("proactive", "desc") == [
+        high_chat_low_memory,
+        mid_chat_mid_memory,
+        low_chat_high_memory,
+    ]
+
+    page = client.get("/admin/data-track?sort=chat&dir=desc", headers=_admin_headers())
+    assert page.status_code == 200, page.get_data(as_text=True)
+    html = page.get_data(as_text=True)
+    assert "Chat desc" in html
+    assert "Memory asc" in html
+    assert "Proactive desc" in html

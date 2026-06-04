@@ -12474,6 +12474,20 @@ def _admin_qs() -> str:
     return urlencode({"admin_key": token}) if token else ""
 
 
+def _data_track_qs(**updates) -> str:
+    params: dict[str, str] = {}
+    for key in ("admin_key", "since", "registered_since", "q", "limit", "offset", "sort", "dir"):
+        value = request.args.get(key, "").strip()
+        if value:
+            params[key] = value
+    for key, value in updates.items():
+        if value is None or value == "":
+            params.pop(key, None)
+        else:
+            params[key] = str(value)
+    return urlencode(params)
+
+
 def _to_epoch(value) -> float:
     if value is None:
         return 0.0
@@ -13263,6 +13277,12 @@ def _data_track_request_filters() -> dict:
         or ""
     ).strip()
     raw_q = (request.args.get("q") or "").strip().lower()
+    raw_sort = (request.args.get("sort") or "").strip().lower()
+    if raw_sort not in {"chat", "memory", "proactive"}:
+        raw_sort = ""
+    raw_dir = (request.args.get("dir") or "desc").strip().lower()
+    if raw_dir not in {"asc", "desc"}:
+        raw_dir = "desc"
 
     def read_int(name: str, default: int, minimum: int, maximum: int) -> int:
         try:
@@ -13275,6 +13295,8 @@ def _data_track_request_filters() -> dict:
         "since": raw_since,
         "since_epoch": _to_epoch(raw_since),
         "q": raw_q,
+        "sort": raw_sort,
+        "dir": raw_dir,
         "limit": read_int("limit", 100, 1, 500),
         "offset": read_int("offset", 0, 0, 1_000_000),
     }
@@ -13309,6 +13331,55 @@ def _data_track_apply_text_filter(rows: list[dict], q: str) -> list[dict]:
     return out
 
 
+def _data_track_sort_rows(rows: list[dict], sort_key: str, direction: str) -> None:
+    def intval(value) -> int:
+        try:
+            return int(value or 0)
+        except Exception:
+            return 0
+
+    def metrics(row: dict) -> tuple[int, ...]:
+        if sort_key == "chat":
+            chat = row.get("chat") or {}
+            return (
+                intval(chat.get("total")),
+                intval(chat.get("user_messages")),
+                intval(chat.get("agent_messages")),
+            )
+        if sort_key == "memory":
+            memory = row.get("memory") or {}
+            by_tab = memory.get("by_tab") or {}
+            return (
+                intval(memory.get("total")),
+                intval(by_tab.get("story")),
+                intval(by_tab.get("about_me")),
+                intval(by_tab.get("ta_thinking")),
+            )
+        if sort_key == "proactive":
+            proactive = row.get("proactive") or {}
+            return (
+                intval(proactive.get("proactive_messages")),
+                intval(proactive.get("jobs")),
+                intval(proactive.get("decisions")),
+                intval(proactive.get("delivery_signals")),
+            )
+        return (0,)
+
+    if not sort_key:
+        rows.sort(key=lambda r: (_to_epoch(r.get("registered_at")), str(r.get("user_id") or "")), reverse=True)
+        return
+
+    desc = direction != "asc"
+
+    def sort_tuple(row: dict) -> tuple:
+        values = metrics(row)
+        if desc:
+            values = tuple(-v for v in values)
+        return (*values, -_to_epoch(row.get("registered_at")), str(row.get("user_id") or ""))
+
+    rows.sort(key=sort_tuple)
+
+
 def _data_track_payload(*, include_users: bool = True, include_detail_user: str = "") -> dict:
     filters = _data_track_request_filters()
     with _users_lock:
@@ -13324,8 +13395,8 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
             rows.append(_build_data_track_user(u, include_detail=True))
         else:
             rows.append(_build_data_track_user_fast(u, snapshot.get(uid, {})))
-    rows.sort(key=lambda r: r.get("registered_at") or "", reverse=True)
     rows = _data_track_apply_text_filter(rows, str(filters.get("q") or ""))
+    _data_track_sort_rows(rows, str(filters.get("sort") or ""), str(filters.get("dir") or "desc"))
     completed = sum(1 for r in rows if r["onboarding"]["passing"])
     incomplete = max(0, len(rows) - completed)
     stage_counts: dict[str, int] = {}
@@ -13370,6 +13441,8 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         "filters": {
             "since": filters.get("since", ""),
             "q": filters.get("q", ""),
+            "sort": filters.get("sort", ""),
+            "dir": filters.get("dir", "desc"),
         },
     }
     if include_users:
@@ -13419,8 +13492,40 @@ def _render_data_track_page(payload: dict) -> str:
     users = payload.get("users", [])
     pagination = payload.get("pagination", {})
     filters = payload.get("filters", {})
-    qs = _admin_qs()
+    qs = _data_track_qs()
     qs_suffix = f"?{qs}" if qs else ""
+    current_sort = str(filters.get("sort") or "")
+    current_dir = str(filters.get("dir") or "desc")
+
+    def page_href(**updates) -> str:
+        qs_inner = _data_track_qs(**updates)
+        return f"/admin/data-track?{qs_inner}" if qs_inner else "/admin/data-track"
+
+    def sort_button(metric: str, direction: str, label: str) -> str:
+        active = current_sort == metric and current_dir == direction
+        cls = "sort-button active" if active else "sort-button"
+        href = page_href(sort=metric, dir=direction, offset=0)
+        return f"<a class='{cls}' href='{html.escape(href, quote=True)}'>{html.escape(label)}</a>"
+
+    sort_controls = "".join([
+        sort_button("chat", "desc", "Chat desc"),
+        sort_button("chat", "asc", "Chat asc"),
+        sort_button("memory", "desc", "Memory desc"),
+        sort_button("memory", "asc", "Memory asc"),
+        sort_button("proactive", "desc", "Proactive desc"),
+        sort_button("proactive", "asc", "Proactive asc"),
+    ])
+    pager = ""
+    if pagination:
+        pager_links = []
+        prev_offset = pagination.get("prev_offset")
+        next_offset = pagination.get("next_offset")
+        if prev_offset is not None:
+            pager_links.append(f"<a class='sort-button' href='{html.escape(page_href(offset=prev_offset), quote=True)}'>Prev</a>")
+        if next_offset is not None:
+            pager_links.append(f"<a class='sort-button' href='{html.escape(page_href(offset=next_offset), quote=True)}'>Next</a>")
+        if pager_links:
+            pager = f"<div class='pager'>{''.join(pager_links)}</div>"
     rows_html = []
     for row in users:
         onboarding = row["onboarding"]
@@ -13474,8 +13579,11 @@ def _render_data_track_page(payload: dict) -> str:
     .metric {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
     .metric-value {{ font-size:24px; font-weight:700; }}
     .metric-label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }}
-    .toolbar {{ display:flex; gap:10px; align-items:center; margin:18px 0; }}
-    input {{ width:320px; max-width:100%; border:1px solid var(--line); border-radius:6px; padding:9px 10px; background:white; color:var(--fg); }}
+	    .toolbar {{ display:flex; gap:10px; align-items:center; margin:18px 0; }}
+	    .sortbar,.pager {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 18px; }}
+	    .sort-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
+	    .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
+	    input {{ width:320px; max-width:100%; border:1px solid var(--line); border-radius:6px; padding:9px 10px; background:white; color:var(--fg); }}
     table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
     th,td {{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }}
     th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }}
@@ -13492,10 +13600,12 @@ def _render_data_track_page(payload: dict) -> str:
   <h1>Feedling Beta Data Track</h1>
   <div class="muted">Generated {html.escape(summary["generated_at"])}. Metadata only; encrypted content is not read or rendered.</div>
   <div class="muted">Showing {html.escape(str(pagination.get("returned", len(users))))} of {html.escape(str(pagination.get("total", summary["users_total"])))} filtered users. Since {html.escape(str(filters.get("since") or "all time"))}.</div>
-  <section class="metrics">{metrics}</section>
-  <h2>Beta users</h2>
-  <div class="toolbar"><input id="q" placeholder="Filter user, route, stage"></div>
-  <table id="users">
+	  <section class="metrics">{metrics}</section>
+	  <h2>Beta users</h2>
+	  <div class="toolbar"><input id="q" placeholder="Filter user, route, stage"></div>
+	  <div class="sortbar">{sort_controls}</div>
+	  {pager}
+	  <table id="users">
     <thead><tr><th>User</th><th>Route</th><th>Access</th><th>Onboarding</th><th>Steps</th><th>Stuck</th><th>Chat</th><th>Memory</th><th>Proactive</th><th>Last activity</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='10' class='muted'>No users yet.</td></tr>"}</tbody>
   </table>
@@ -13514,7 +13624,7 @@ q.addEventListener('input', () => {{
 
 
 def _render_user_detail_page(user: dict) -> str:
-    qs = _admin_qs()
+    qs = _data_track_qs()
     back = f"/admin/data-track?{qs}" if qs else "/admin/data-track"
     safe_json = json.dumps(user, ensure_ascii=False, indent=2)
     return f"""<!doctype html>
