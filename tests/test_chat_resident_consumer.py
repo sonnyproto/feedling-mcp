@@ -115,6 +115,41 @@ def test_timestamp_key_only_advances_checkpoint():
     assert result_ts == pytest.approx(5678.9)
 
 
+def test_filter_messages_to_poll_ids_keeps_only_claimed_rows():
+    decrypted = [
+        {"id": "msg-a", "role": "user", "content": "ours"},
+        {"id": "msg-b", "role": "user", "content": "claimed by someone else"},
+    ]
+    poll_messages = [{"id": "msg-a", "role": "user"}]
+
+    assert crc._filter_messages_to_poll_ids(decrypted, poll_messages) == [decrypted[0]]
+
+
+def test_process_messages_posts_reply_with_source_message_id():
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = {"id": "user-msg-1", "role": "user", "content": "hi", "ts": 1111.0}
+
+    with patch.object(crc, "call_agent", return_value="hey"), \
+         patch.object(crc, "post_reply", return_value={"id": "reply-msg-1"}) as mock_post:
+        result_ts = crc._process_messages([msg])
+
+    assert result_ts == pytest.approx(1111.0)
+    assert mock_post.call_args.kwargs["reply_to_message_id"] == "user-msg-1"
+
+
+def test_process_messages_keeps_checkpoint_when_post_reply_fails():
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = {"id": "user-msg-2", "role": "user", "content": "hi", "ts": 2222.0}
+
+    with patch.object(crc, "call_agent", return_value="hey"), \
+         patch.object(crc, "post_reply", side_effect=RuntimeError("write failed")):
+        result_ts = crc._process_messages([msg])
+
+    assert result_ts == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Case 3: invalid API key → run() exits non-zero
 # ---------------------------------------------------------------------------

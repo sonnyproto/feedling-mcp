@@ -231,6 +231,104 @@ def _chat_response(
     )
 
 
+def test_chat_poll_claims_user_message_for_one_consumer(backend):
+    """Ordinary chat poll is responder-owned: two consumers must not both
+    receive the same user turn."""
+    user_id, api_key = _register(backend["base_url"])
+    env = _stub_envelope(user_id, "claimed-user-message")
+    msg = requests.post(
+        f"{backend['base_url']}/v1/chat/message",
+        json={"envelope": env},
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert msg.status_code == 200, msg.text
+    msg_id = msg.json()["id"]
+
+    headers_a = {
+        "X-API-Key": api_key,
+        "X-Feedling-Consumer": "feedling-chat-resident",
+        "X-Feedling-Consumer-Id": "consumer-a",
+    }
+    headers_b = {
+        "X-API-Key": api_key,
+        "X-Feedling-Consumer": "feedling-chat-resident",
+        "X-Feedling-Consumer-Id": "consumer-b",
+    }
+    first = requests.get(
+        f"{backend['base_url']}/v1/chat/poll?since=0&timeout=0.01",
+        headers=headers_a,
+        timeout=TIMEOUT,
+    )
+    assert first.status_code == 200, first.text
+    first_body = first.json()
+    assert [m["id"] for m in first_body["messages"]] == [msg_id]
+    assert first_body["messages"][0]["reply_claimed_by"] == "consumer-a"
+
+    second = requests.get(
+        f"{backend['base_url']}/v1/chat/poll?since=0&timeout=0.01",
+        headers=headers_b,
+        timeout=TIMEOUT,
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["messages"] == []
+
+
+def test_chat_response_marks_claimed_user_message_replied(backend):
+    """A successful agent response linked to the user turn closes that turn
+    for future pollers."""
+    user_id, api_key = _register(backend["base_url"])
+    _seed_passing_bootstrap(backend["base_url"], user_id, api_key)
+    r = _init_identity(backend["base_url"], user_id, api_key)
+    assert r.status_code == 201, f"identity_init failed: {r.text}"
+    _establish_live_connection(backend["base_url"], user_id, api_key)
+
+    env = _stub_envelope(user_id, "user-message-before-reply")
+    msg = requests.post(
+        f"{backend['base_url']}/v1/chat/message",
+        json={"envelope": env},
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert msg.status_code == 200, msg.text
+    msg_id = msg.json()["id"]
+
+    headers_a = {
+        "X-API-Key": api_key,
+        "X-Feedling-Consumer": "feedling-chat-resident",
+        "X-Feedling-Consumer-Id": "consumer-a",
+    }
+    poll = requests.get(
+        f"{backend['base_url']}/v1/chat/poll?since=0&timeout=0.01",
+        headers=headers_a,
+        timeout=TIMEOUT,
+    )
+    assert poll.status_code == 200, poll.text
+    assert [m["id"] for m in poll.json()["messages"]] == [msg_id]
+
+    reply = _stub_envelope(user_id, "agent-reply")
+    response = requests.post(
+        f"{backend['base_url']}/v1/chat/response",
+        json={"envelope": reply, "reply_to_message_id": msg_id, "alert_body": "hi"},
+        headers=headers_a,
+        timeout=TIMEOUT,
+    )
+    assert response.status_code == 200, response.text
+
+    headers_b = {
+        "X-API-Key": api_key,
+        "X-Feedling-Consumer": "feedling-chat-resident",
+        "X-Feedling-Consumer-Id": "consumer-b",
+    }
+    repoll = requests.get(
+        f"{backend['base_url']}/v1/chat/poll?since=0&timeout=0.01",
+        headers=headers_b,
+        timeout=TIMEOUT,
+    )
+    assert repoll.status_code == 200, repoll.text
+    assert repoll.json()["messages"] == []
+
+
 def _establish_live_connection(base_url: str, user_id: str, api_key: str) -> dict:
     _record_consumer_poll(base_url, api_key)
 

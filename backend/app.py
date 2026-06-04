@@ -71,6 +71,7 @@ ACCESS_MODE_LABELS = {
 }
 ACCESS_LINK_TOKEN_TTL_SEC = int(os.environ.get("FEEDLING_ACCESS_LINK_TOKEN_TTL_SEC", "900"))
 CHAT_HISTORY_INLINE_BODY_CT_MAX = int(os.environ.get("FEEDLING_CHAT_HISTORY_INLINE_BODY_CT_MAX", "262144"))
+CHAT_POLL_CLAIM_TTL_SEC = int(os.environ.get("FEEDLING_CHAT_POLL_CLAIM_TTL_SEC", "120"))
 _ACCESS_MODE_ALIASES = {
     "server": "resident",
     "resident_agent": "resident",
@@ -699,6 +700,13 @@ class UserStore:
                 "app_presence_phase",
                 "app_presence_age_sec",
                 "model_api_kind",
+                "reply_claimed_by",
+                "reply_claimed_at",
+                "reply_claim_expires_at",
+                "reply_status",
+                "reply_message_id",
+                "replied_by",
+                "replied_at",
             ):
                 value = extra.get(key)
                 if isinstance(value, str) and value.strip():
@@ -725,6 +733,13 @@ class UserStore:
             "push_reason",
             "app_presence_phase",
             "app_presence_age_sec",
+            "reply_claimed_by",
+            "reply_claimed_at",
+            "reply_claim_expires_at",
+            "reply_status",
+            "reply_message_id",
+            "replied_by",
+            "replied_at",
         }
         clean: dict = {}
         for key, value in (fields or {}).items():
@@ -9663,6 +9678,19 @@ def chat_response():
         content_type=content_type,
         extra=extra,
     )
+    reply_to_message_id = str(
+        payload.get("reply_to_message_id")
+        or payload.get("reply_to_id")
+        or payload.get("in_reply_to")
+        or ""
+    ).strip()
+    if reply_to_message_id:
+        store.update_chat_message_metadata(reply_to_message_id, {
+            "reply_status": "replied",
+            "reply_message_id": str(msg.get("id") or ""),
+            "replied_by": _request_chat_consumer_id(),
+            "replied_at": f"{time.time():.3f}",
+        })
     delivery_fields: dict = {}
     visible_push_body = (push_body or alert_body).strip()
     # Any plaintext AI reply supplied by the caller enters the same app-state
@@ -9684,6 +9712,74 @@ def chat_response():
     return jsonify({"id": msg["id"], "ts": msg["ts"], "v": msg["v"]})
 
 
+def _request_chat_consumer_id() -> str:
+    """Stable responder id for chat poll claiming.
+
+    /v1/chat/poll is a responder endpoint, not the normal UI history reader.
+    A caller without explicit consumer headers is grouped under "anonymous" so
+    two ad-hoc pollers with the same API key do not both claim the same turn.
+    """
+    raw = (
+        request.headers.get("X-Feedling-Consumer-Id")
+        or request.args.get("consumer_id")
+        or request.headers.get("X-Feedling-Consumer")
+        or "anonymous"
+    )
+    consumer = re.sub(r"[^A-Za-z0-9_.:-]+", "-", str(raw).strip())[:160].strip("-")
+    return consumer or "anonymous"
+
+
+def _request_bool_arg(name: str, default: bool = True) -> bool:
+    raw = request.args.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _float_meta(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _chat_message_claimable(msg: dict, consumer_id: str, now: float) -> bool:
+    if msg.get("role") != "user":
+        return False
+    if msg.get("reply_status") == "replied" or msg.get("reply_message_id"):
+        return False
+    claimed_by = str(msg.get("reply_claimed_by") or "").strip()
+    expires_at = _float_meta(msg.get("reply_claim_expires_at"), 0.0)
+    return (not claimed_by) or claimed_by == consumer_id or expires_at <= now
+
+
+def _pending_chat_messages_for_poll(
+    store: UserStore,
+    *,
+    since: float,
+    consumer_id: str,
+    claim: bool,
+) -> list[dict]:
+    now = time.time()
+    claimed: list[dict] = []
+    with store.chat_lock:
+        for msg in store.chat_messages:
+            if _float_meta(msg.get("ts"), 0.0) <= since:
+                continue
+            if not _chat_message_claimable(msg, consumer_id, now):
+                continue
+            if claim:
+                fields = {
+                    "reply_claimed_by": consumer_id,
+                    "reply_claimed_at": f"{now:.3f}",
+                    "reply_claim_expires_at": f"{now + max(10, CHAT_POLL_CLAIM_TTL_SEC):.3f}",
+                }
+                msg.update(fields)
+                db.chat_update_metadata(store.user_id, str(msg.get("id") or ""), fields)
+            claimed.append(dict(msg))
+    return claimed
+
+
 @app.route("/v1/chat/poll", methods=["GET"])
 def chat_poll():
     store = require_user()
@@ -9693,11 +9789,17 @@ def chat_poll():
     except (TypeError, ValueError):
         return jsonify({"error": "invalid since"}), 400
     timeout = min(float(request.args.get("timeout", 30)), 60)
+    consumer_id = _request_chat_consumer_id()
+    claim = _request_bool_arg("claim", default=True)
 
-    with store.chat_lock:
-        pending = [m for m in store.chat_messages if m["ts"] > since and m["role"] == "user"]
+    pending = _pending_chat_messages_for_poll(
+        store,
+        since=since,
+        consumer_id=consumer_id,
+        claim=claim,
+    )
     if pending:
-        return jsonify({"messages": pending, "timed_out": False})
+        return jsonify({"messages": pending, "timed_out": False, "consumer_id": consumer_id, "claimed": claim})
 
     ev = threading.Event()
     with store.chat_waiters_lock:
@@ -9712,10 +9814,14 @@ def chat_poll():
             pass
 
     if notified:
-        with store.chat_lock:
-            pending = [m for m in store.chat_messages if m["ts"] > since and m["role"] == "user"]
-        return jsonify({"messages": pending, "timed_out": False})
-    return jsonify({"messages": [], "timed_out": True})
+        pending = _pending_chat_messages_for_poll(
+            store,
+            since=since,
+            consumer_id=consumer_id,
+            claim=claim,
+        )
+        return jsonify({"messages": pending, "timed_out": False, "consumer_id": consumer_id, "claimed": claim})
+    return jsonify({"messages": [], "timed_out": True, "consumer_id": consumer_id, "claimed": claim})
 
 
 # ---------------------------------------------------------------------------

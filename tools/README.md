@@ -46,6 +46,11 @@ whether MCP tools exist in some other surface.
 5. Maintains a checkpoint file so it never re-processes old messages
    after restart.
 
+`/v1/chat/poll` is a responder endpoint. It claims a short lease on each
+user message so two auto-reply surfaces do not both answer the same IO turn.
+A read-only web chat UI should render `/v1/chat/history`; only the component
+that will actually reply should poll.
+
 For image messages (`content_type=image`), the daemon extracts `image_b64`
 from the decrypt source. OpenAI-compatible HTTP backends receive a
 multimodal `image_url` block, simple HTTP backends receive an `images`

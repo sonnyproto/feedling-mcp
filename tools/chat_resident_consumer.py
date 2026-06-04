@@ -409,6 +409,28 @@ def _msg_key(msg: dict) -> str:
     return f"{ts}:{msg.get('role', '')}"
 
 
+def _filter_messages_to_poll_ids(messages: list[dict], poll_messages: list[dict]) -> list[dict]:
+    """Keep only decrypted rows that this poll cycle actually claimed.
+
+    /v1/chat/poll is the server-side responder lease. Decrypted history may
+    contain other users' recent messages for the same account, including rows
+    claimed by another responder, so the resident must not treat history as the
+    source of work ownership.
+    """
+    poll_ids = {
+        str(m.get("id") or m.get("message_id") or "").strip()
+        for m in poll_messages
+        if isinstance(m, dict)
+    }
+    poll_ids.discard("")
+    if not poll_ids:
+        return messages
+    return [
+        m for m in messages
+        if str(m.get("id") or m.get("message_id") or "").strip() in poll_ids
+    ]
+
+
 def _mark_seen(key: str) -> bool:
     """Mark key as seen. Returns True (new) or False (already processed)."""
     if key in _seen_ids:
@@ -2008,6 +2030,7 @@ def post_reply(
     gate_decision_id: str = "",
     proactive_job_id: str = "",
     suppress_push: bool = False,
+    reply_to_message_id: str = "",
 ) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
 
@@ -2050,6 +2073,8 @@ def post_reply(
             "source": source,
             "alert_body": visible_body,
         }
+        if reply_to_message_id:
+            body["reply_to_message_id"] = reply_to_message_id
         if gate_decision_id:
             body["gate_decision_id"] = gate_decision_id
         if proactive_job_id:
@@ -2080,6 +2105,7 @@ def post_reply(
             "source": source,
             "gate_decision_id": gate_decision_id,
             "proactive_job_id": proactive_job_id,
+            "reply_to_message_id": reply_to_message_id,
         },
         headers=_HEADERS, timeout=15,
     )
@@ -2461,12 +2487,31 @@ def _process_messages(messages: list) -> float:
                 log.error("agent action execution failed; suppressing optimistic agent reply: %s", e)
                 replies = [_identity_action_failure_reply(content)]
 
+        reply_to_message_id = str(msg.get("id") or msg.get("message_id") or "").strip()
+        posted_any = False
+        terminal_response_error = False
         for reply in replies:
             try:
-                post_reply(reply)
+                post_kwargs = {}
+                if reply_to_message_id:
+                    post_kwargs["reply_to_message_id"] = reply_to_message_id
+                result = post_reply(reply, **post_kwargs)
+                if isinstance(result, dict) and result.get("error"):
+                    if result.get("error") == "bootstrap_incomplete":
+                        terminal_response_error = True
+                        log.error("reply rejected by bootstrap gate; advancing past this dead-end message")
+                        continue
+                    raise RuntimeError(str(result)[:500])
+                posted_any = True
                 log.info("reply sent: %s", reply[:80])
             except Exception as e:
                 log.error("failed to post reply: %s", e)
+
+        if replies and not posted_any and not terminal_response_error:
+            # Keep checkpoint behind this message. The server-side claim lease
+            # will expire, allowing this or another responder to retry instead
+            # of permanently dropping a user turn after a transient write error.
+            continue
 
         latest = max(latest, ts)
 
@@ -2605,7 +2650,13 @@ def run() -> None:
                             last_ts = pts
                             _save_checkpoint(last_ts)
                     continue
-                messages = decrypted
+                messages = _filter_messages_to_poll_ids(decrypted, poll_messages)
+                if not messages:
+                    log.warning(
+                        "poll returned claimed messages but decrypt history did not "
+                        "include those ids; keeping checkpoint for retry"
+                    )
+                    continue
             else:
                 # No decrypt source — fall through with poll content (will be
                 # empty for v1 encrypted messages, skipped in _process_messages).
