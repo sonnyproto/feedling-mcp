@@ -4823,7 +4823,7 @@ def _append_model_api_action_trace(store: UserStore, entry: dict) -> dict:
         "provider", "model", "user_message_id", "assistant_message_id",
         "state_receipt_id", "planner", "effects", "identity_actions",
         "memory_actions", "capture", "context", "error", "duration_ms",
-        "usage",
+        "usage", "reason", "progress",
     ):
         if key in entry:
             record[key] = entry[key]
@@ -4843,6 +4843,23 @@ def _append_model_api_action_trace(store: UserStore, entry: dict) -> dict:
     elif record.get("error"):
         patch["last_runtime_error"] = str(record.get("error"))[:300]
     _patch_model_api_runtime_profile(store, patch)
+    return record
+
+
+def _patch_model_api_action_trace(store: UserStore, trace_id: str, patch: dict) -> dict | None:
+    merged = dict(patch)
+    if patch.get("status") in {"completed", "failed", "skipped"}:
+        merged.setdefault("completed_at", _now_iso())
+    record = db.log_patch_item(store.user_id, MODEL_API_ACTION_TRACE_STREAM, trace_id, merged)
+    profile_patch: dict = {
+        "last_action_trace_id": trace_id,
+        "last_action_trace_at": _now_iso(),
+    }
+    if patch.get("status") in {"completed", "skipped", "ok"}:
+        profile_patch["last_runtime_error"] = ""
+    elif patch.get("error"):
+        profile_patch["last_runtime_error"] = str(patch.get("error"))[:300]
+    _patch_model_api_runtime_profile(store, profile_patch)
     return record
 
 
@@ -8001,6 +8018,10 @@ def _model_api_context_messages(
     identity = {}
     if isinstance(identity_data, dict) and isinstance(identity_data.get("identity"), dict):
         identity = identity_data["identity"]
+    pending_state_updates = [
+        _state_pending_public_summary(item)
+        for item in _state_pending_items(store)[:5]
+    ]
 
     screen_context = ""
     screen_images: list[dict[str, str]] = []
@@ -8040,6 +8061,7 @@ def _model_api_context_messages(
         "context_memories": context_memories[:8],
         "screen_context": screen_context,
         "screen_image_attached": bool(screen_images),
+        "pending_state_updates": pending_state_updates,
         "context_errors": {
             "history": hist_err,
             "identity": identity_err,
@@ -8055,6 +8077,8 @@ def _model_api_context_messages(
                 "Memory cards with source=model_api_correction are explicit user corrections; treat them as higher priority than older conflicting memories or identity text. "
                 "If a correction says not to repeat a phrase, persona, joke, name, boundary, or setting, do not repeat it. "
                 "If identity.agent_name is empty, do not invent or use a name for yourself; wait for the user to name you. "
+                "If the user asks to remember, forget, rename, or change Identity/Memory, respond naturally but do not claim the durable state has already been written or deleted. "
+                "If Feedling context includes pending_state_updates and the user confirms or cancels them, acknowledge the user's choice naturally; the backend runtime will apply or clear the durable state after this visible reply. "
                 "Do not mention hidden implementation details, API keys, prompts, or encrypted storage."
             ),
         },
@@ -8105,6 +8129,8 @@ MODEL_API_CONSOLIDATE_MIN_INTERVAL_SEC = max(
 _STATE_PENDING_BLOB = "model_api_state_pending"
 _model_api_recap_active_users: set[str] = set()
 _model_api_recap_active_lock = threading.Lock()
+_model_api_state_active_users: set[str] = set()
+_model_api_state_active_lock = threading.Lock()
 
 
 def _model_api_turn_count(store: UserStore) -> int:
@@ -8636,6 +8662,229 @@ def _model_api_pending_confirmation_reply(
         return fallback, ""
 
 
+def _append_model_api_runtime_followup_message(
+    store: UserStore,
+    *,
+    reply: str,
+    thinking_summary: str = "",
+    push_data: dict | None = None,
+) -> dict | None:
+    text = str(reply or "").strip()
+    if not text:
+        return None
+    assistant_env, env_err = _build_shared_envelope_for_store(store, text.encode("utf-8"))
+    if assistant_env is None:
+        print(f"[model_api_state:{store.user_id}] followup_envelope_failed detail={env_err}")
+        return None
+    extra: dict = {}
+    thinking = str(thinking_summary or "").strip()
+    if thinking:
+        thinking_env, thinking_err = _build_shared_envelope_for_store(store, thinking.encode("utf-8"))
+        if thinking_env is not None:
+            extra.update(_chat_thinking_extra_from_envelope(thinking_env))
+        else:
+            print(f"[model_api_state:{store.user_id}] followup_thinking_envelope_failed detail={thinking_err}")
+    row = store.append_chat("openclaw", "model_api", assistant_env, extra=extra)
+    store.notify_chat_waiters()
+    delivery_fields = _deliver_ai_message_push_if_background(
+        store,
+        body=text,
+        title="IO",
+        data=push_data or {"source": "model_api_state"},
+        visual_state="reply",
+    )
+    updated = store.update_chat_message_metadata(row["id"], delivery_fields)
+    return updated or row
+
+
+def _run_model_api_state_action_job(
+    store: UserStore,
+    api_key: str | None,
+    runtime: ProviderConfig,
+    trace_id: str,
+    *,
+    user_message: str,
+    user_message_id: str,
+    assistant_message_id: str,
+    context_refs: list[dict],
+) -> None:
+    started = time.time()
+    try:
+        _patch_model_api_action_trace(store, trace_id, {
+            "status": "processing",
+            "progress": 20,
+        })
+        identity_for_plan = {}
+        identity_plan_data, _ = _enclave_get_json_for_gate("/v1/identity/get", api_key)
+        if isinstance(identity_plan_data, dict) and isinstance(identity_plan_data.get("identity"), dict):
+            identity_for_plan = identity_plan_data["identity"]
+        state_plan = _model_api_plan_state_actions(
+            store,
+            api_key,
+            runtime,
+            user_message,
+            context_refs,
+            identity_for_plan,
+        )
+        effects, identity_results, memory_results, state_receipt = _execute_model_api_state_plan(
+            store,
+            api_key,
+            state_plan,
+            user_message_id=user_message_id,
+            user_message=user_message,
+        )
+        pending_items = _state_pending_items(store)
+        just_pending = bool(state_receipt and (state_receipt.get("pending") or []) and not effects)
+        followup_row = None
+        if just_pending:
+            reply, thinking_summary = _model_api_pending_confirmation_reply(
+                runtime,
+                user_message,
+                pending_items,
+                identity_for_plan,
+            )
+            if not thinking_summary:
+                thinking_summary = (
+                    "等你确认具体要改的长期状态。"
+                    if _state_lang_zh(user_message)
+                    else "Waiting for confirmation on the exact long-term state change."
+                )
+            followup_row = _append_model_api_runtime_followup_message(
+                store,
+                reply=reply,
+                thinking_summary=thinking_summary,
+                push_data={"source": "model_api_state", "kind": "pending_confirmation"},
+            )
+        if state_receipt and state_receipt.get("status") == "failed":
+            _patch_model_api_action_trace(store, trace_id, {
+                "status": "failed",
+                "progress": 100,
+                "provider": runtime.provider,
+                "model": runtime.model,
+                "user_message_id": user_message_id,
+                "assistant_message_id": assistant_message_id,
+                "state_receipt_id": state_receipt.get("id", ""),
+                "planner": {
+                    "triggered": bool(state_plan.get("triggered")),
+                    "method": state_plan.get("method", ""),
+                    "error": state_plan.get("error", ""),
+                },
+                "effects": effects,
+                "identity_actions": identity_results,
+                "memory_actions": memory_results,
+                "error": state_receipt.get("error", "state_action_failed"),
+                "duration_ms": int((time.time() - started) * 1000),
+            })
+            return
+        if not effects and not just_pending and not state_plan.get("pending_ids"):
+            status = "skipped"
+            reason = "no_state_action"
+        elif just_pending:
+            status = "pending_confirmation"
+            reason = "needs_user_confirmation"
+        else:
+            status = "completed"
+            reason = "state_actions_applied"
+        _patch_model_api_action_trace(store, trace_id, {
+            "status": status,
+            "progress": 100,
+            "provider": runtime.provider,
+            "model": runtime.model,
+            "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id,
+            "state_receipt_id": (state_receipt or {}).get("id", ""),
+            "planner": {
+                "triggered": bool(state_plan.get("triggered")),
+                "method": state_plan.get("method", ""),
+                "error": state_plan.get("error", ""),
+            },
+            "effects": effects,
+            "identity_actions": identity_results,
+            "memory_actions": memory_results,
+            "context": {"context_refs": len(context_refs)},
+            "reason": reason,
+            "duration_ms": int((time.time() - started) * 1000),
+        })
+        if followup_row:
+            _patch_model_api_action_trace(store, trace_id, {
+                "assistant_message_id": followup_row.get("id", assistant_message_id),
+            })
+    except Exception as e:
+        _patch_model_api_action_trace(store, trace_id, {
+            "status": "failed",
+            "progress": 100,
+            "provider": runtime.provider,
+            "model": runtime.model,
+            "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id,
+            "error": f"{type(e).__name__}:{str(e)[:300]}",
+            "duration_ms": int((time.time() - started) * 1000),
+        })
+    finally:
+        with _model_api_state_active_lock:
+            _model_api_state_active_users.discard(store.user_id)
+
+
+def _start_model_api_state_action_job(
+    store: UserStore,
+    api_key: str | None,
+    runtime: ProviderConfig,
+    *,
+    user_message: str,
+    user_message_id: str,
+    assistant_message_id: str,
+    context_refs: list[dict],
+    run_sync: bool = False,
+) -> dict:
+    with _model_api_state_active_lock:
+        if store.user_id in _model_api_state_active_users:
+            return {
+                "status": "skipped",
+                "reason": "state_runtime_already_running",
+                "actions_written": 0,
+            }
+        _model_api_state_active_users.add(store.user_id)
+    trace = _append_model_api_action_trace(store, {
+        "status": "queued",
+        "provider": runtime.provider,
+        "model": runtime.model,
+        "user_message_id": user_message_id,
+        "assistant_message_id": assistant_message_id,
+        "planner": {
+            "triggered": False,
+            "method": "hosted_runtime_background",
+            "error": "",
+        },
+        "context": {"context_refs": len(context_refs)},
+        "reason": "queued_after_foreground_reply",
+        "progress": 0,
+    })
+    args = (store, api_key, runtime, trace["trace_id"])
+    kwargs = {
+        "user_message": user_message,
+        "user_message_id": user_message_id,
+        "assistant_message_id": assistant_message_id,
+        "context_refs": context_refs,
+    }
+    if run_sync:
+        _run_model_api_state_action_job(*args, **kwargs)
+        latest = db.log_patch_item(
+            store.user_id,
+            MODEL_API_ACTION_TRACE_STREAM,
+            trace["trace_id"],
+            {},
+        )
+        return latest or trace
+    thread = threading.Thread(
+        target=_run_model_api_state_action_job,
+        args=args,
+        kwargs=kwargs,
+        daemon=True,
+    )
+    thread.start()
+    return trace
+
+
 def _identity_actions_default_reply(user_message: str, effects: list[dict]) -> str:
     fields = set()
     has_memory = False
@@ -8803,6 +9052,7 @@ def _model_api_run_memory_capture(
     user_message_id: str,
     assistant_message_id: str,
     context_payload: dict,
+    job_id: str | None = None,
 ) -> dict:
     job_base = {
         "mode": "running",
@@ -8810,8 +9060,15 @@ def _model_api_run_memory_capture(
         "message_chars": len(user_message),
         "reply_chars": len(assistant_reply),
     }
+
+    def finish(entry: dict) -> dict:
+        if job_id:
+            patched = _model_api_patch_recap_job(store, job_id, {**job_base, **entry})
+            return patched or {**job_base, **entry, "job_id": job_id}
+        return _append_memory_capture_job(store, {**job_base, **entry})
+
     if os.environ.get("FEEDLING_MODEL_API_MEMORY_CAPTURE", "1").strip().lower() in {"0", "false", "off", "no"}:
-        return _append_memory_capture_job(store, {**job_base, "status": "skipped", "error": "disabled"})
+        return finish({"status": "skipped", "error": "disabled"})
     try:
         result = chat_completion(
             runtime,
@@ -8856,30 +9113,70 @@ def _model_api_run_memory_capture(
                 "source_chat_message_ids": [user_message_id, assistant_message_id],
             })
         if not actions:
-            return _append_memory_capture_job(store, {**job_base, "status": "completed", "actions_planned": 0, "actions_written": 0})
+            return finish({"status": "completed", "actions_planned": 0, "actions_written": 0})
         body, status = _execute_memory_actions(store, api_key, actions)
         if status >= 400:
-            return _append_memory_capture_job(store, {
-                **job_base,
+            return finish({
                 "status": "failed",
                 "actions_planned": len(actions),
                 "actions_written": len(body.get("effects") or []),
                 "effects": body.get("effects") or [],
                 "error": body.get("error", "memory_action_failed"),
             })
-        return _append_memory_capture_job(store, {
-            **job_base,
+        return finish({
             "status": "completed",
             "actions_planned": len(actions),
             "actions_written": len(body.get("effects") or []),
             "effects": body.get("effects") or [],
         })
     except Exception as e:
-        return _append_memory_capture_job(store, {
-            **job_base,
+        return finish({
             "status": "failed",
             "error": f"{type(e).__name__}:{str(e)[:300]}",
         })
+
+
+def _start_model_api_memory_capture_job(
+    store: UserStore,
+    api_key: str | None,
+    runtime: ProviderConfig,
+    *,
+    user_message: str,
+    assistant_reply: str,
+    user_message_id: str,
+    assistant_message_id: str,
+    context_payload: dict,
+    turn_count: int,
+    run_sync: bool = False,
+) -> dict:
+    job = _append_memory_capture_job(store, {
+        "mode": "running",
+        "status": "queued",
+        "reason": f"cadence:{MODEL_API_CAPTURE_TURN_INTERVAL}",
+        "turn_count": turn_count,
+        "progress": 0,
+        "source_chat_message_ids": [user_message_id, assistant_message_id],
+        "message_chars": len(user_message),
+        "reply_chars": len(assistant_reply),
+    })
+    kwargs = {
+        "user_message": user_message,
+        "assistant_reply": assistant_reply,
+        "user_message_id": user_message_id,
+        "assistant_message_id": assistant_message_id,
+        "context_payload": context_payload,
+        "job_id": job["job_id"],
+    }
+    if run_sync:
+        return _model_api_run_memory_capture(store, api_key, runtime, **kwargs)
+    thread = threading.Thread(
+        target=_model_api_run_memory_capture,
+        args=(store, api_key, runtime),
+        kwargs=kwargs,
+        daemon=True,
+    )
+    thread.start()
+    return job
 
 
 def _model_api_latest_recap_job(store: UserStore) -> dict | None:
@@ -9477,6 +9774,7 @@ def _model_api_maybe_run_memory_capture(
     assistant_message_id: str,
     context_payload: dict,
     effects: list[dict],
+    run_sync: bool = False,
 ) -> dict:
     turn_count = _model_api_turn_count(store)
     has_state_write = any(
@@ -9499,7 +9797,7 @@ def _model_api_maybe_run_memory_capture(
             "turn_count": turn_count,
             "actions_written": 0,
         }
-    job = _model_api_run_memory_capture(
+    job = _start_model_api_memory_capture_job(
         store,
         api_key,
         runtime,
@@ -9508,6 +9806,8 @@ def _model_api_maybe_run_memory_capture(
         user_message_id=user_message_id,
         assistant_message_id=assistant_message_id,
         context_payload=context_payload,
+        turn_count=turn_count,
+        run_sync=run_sync,
     )
     recap_due, recap_reason = _model_api_recap_due(store, turn_count)
     if recap_due:
@@ -9614,126 +9914,6 @@ def model_api_chat_send():
     effects: list[dict] = []
     identity_action_results: list[dict] = []
     memory_action_results: list[dict] = []
-    state_receipt: dict | None = None
-    identity_for_plan = {}
-    identity_plan_data, _ = _enclave_get_json_for_gate("/v1/identity/get", api_key)
-    if isinstance(identity_plan_data, dict) and isinstance(identity_plan_data.get("identity"), dict):
-        identity_for_plan = identity_plan_data["identity"]
-    state_plan = _model_api_plan_state_actions(
-        store,
-        api_key,
-        runtime,
-        message,
-        context_refs,
-        identity_for_plan,
-    )
-    if state_plan.get("triggered") or state_plan.get("actions"):
-        effects, identity_action_results, memory_action_results, state_receipt = _execute_model_api_state_plan(
-            store,
-            api_key,
-            state_plan,
-            user_message_id=user_row["id"],
-            user_message=message,
-        )
-        if state_receipt and state_receipt.get("status") == "failed":
-            trace = _append_model_api_action_trace(store, {
-                "status": "failed",
-                "provider": runtime.provider,
-                "model": runtime.model,
-                "user_message_id": user_row["id"],
-                "state_receipt_id": state_receipt.get("id", ""),
-                "planner": {
-                    "triggered": bool(state_plan.get("triggered")),
-                    "method": state_plan.get("method", ""),
-                    "error": state_plan.get("error", ""),
-                },
-                "effects": effects,
-                "identity_actions": identity_action_results,
-                "memory_actions": memory_action_results,
-                "error": state_receipt.get("error", "state_action_failed"),
-                "context": {"stage": "state_action", "context_refs": len(context_refs)},
-                "duration_ms": int((time.time() - trace_start) * 1000),
-            })
-            return jsonify({
-                "error": "state_action_failed",
-                "detail": state_receipt.get("error", "unknown_error"),
-                "state": {"receipt": _state_receipt_prompt_payload(state_receipt)},
-                "effects": effects,
-                "identity_actions": identity_action_results,
-                "memory_actions": memory_action_results,
-                "user_message_id": user_row["id"],
-                "action_trace_id": trace.get("trace_id", ""),
-            }), 409
-        pending_items = _state_pending_items(store)
-        just_pending = bool(state_receipt and (state_receipt.get("pending") or []) and not effects)
-        if just_pending:
-            reply, thinking_summary = _model_api_pending_confirmation_reply(
-                runtime,
-                message,
-                pending_items,
-                identity_for_plan,
-            )
-            assistant_env, env_err = _build_shared_envelope_for_store(store, reply.encode("utf-8"))
-            if assistant_env is None:
-                return jsonify({"error": "assistant_envelope_failed", "detail": env_err}), 409
-            assistant_row = store.append_chat("openclaw", "model_api", assistant_env)
-            store.notify_chat_waiters()
-            if not thinking_summary:
-                thinking_summary = (
-                    "等你确认具体要改的长期状态。"
-                    if _state_lang_zh(message)
-                    else "Waiting for confirmation on the exact long-term state change."
-                )
-            trace = _append_model_api_action_trace(store, {
-                "status": "pending_confirmation",
-                "provider": runtime.provider,
-                "model": runtime.model,
-                "user_message_id": user_row["id"],
-                "assistant_message_id": assistant_row["id"],
-                "state_receipt_id": (state_receipt or {}).get("id", ""),
-                "planner": {
-                    "triggered": bool(state_plan.get("triggered")),
-                    "method": state_plan.get("method", ""),
-                    "error": state_plan.get("error", ""),
-                },
-                "effects": effects,
-                "identity_actions": identity_action_results,
-                "memory_actions": memory_action_results,
-                "capture": {"status": "skipped", "reason": "pending_confirmation", "actions_written": 0},
-                "context": {"memories": 0, "identity_loaded": bool(identity_for_plan.get("agent_name")), "screen_context": False, "context_refs": len(context_refs)},
-                "duration_ms": int((time.time() - trace_start) * 1000),
-            })
-            return jsonify({
-                "status": "ok",
-                "reply": reply,
-                "thinking_summary": thinking_summary,
-                "user_message": {"id": user_row["id"], "ts": user_row["ts"]},
-                "assistant_message": {"id": assistant_row["id"], "ts": assistant_row["ts"]},
-                "user_content_type": "image" if has_image else "text",
-                "provider": runtime.provider,
-                "model": runtime.model,
-                "usage": {},
-                "effects": effects,
-                "identity_actions": identity_action_results,
-                "memory_actions": memory_action_results,
-                "capture": {"status": "skipped", "reason": "pending_confirmation", "actions_written": 0},
-                "state": {
-                    "action_trace_id": trace.get("trace_id", ""),
-                    "receipt": _state_receipt_prompt_payload(state_receipt),
-                    "pending": state_receipt.get("pending") if state_receipt else [],
-                    "planner": {
-                        "triggered": bool(state_plan.get("triggered")),
-                        "method": state_plan.get("method", ""),
-                        "error": state_plan.get("error", ""),
-                    },
-                },
-                "context": {
-                    "memories": 0,
-                    "identity_loaded": bool(identity_for_plan.get("agent_name")),
-                    "screen_context": False,
-                    "context_refs": len(context_refs),
-                },
-            })
 
     provider_messages, context_payload, screen_images = _model_api_context_messages(
         store,
@@ -9758,21 +9938,6 @@ def model_api_chat_send():
             "role": "system",
             "content": "User-selected context refs JSON:\n" + json.dumps(context_refs, ensure_ascii=False)[:3000],
         })
-    if identity_action_results or memory_action_results:
-        provider_messages.insert(2, {
-            "role": "system",
-            "content": (
-                "Feedling action result JSON:\n"
-                + json.dumps({
-                    "identity_results": identity_action_results,
-                    "memory_results": memory_action_results,
-                    "effects": effects,
-                    "state_receipt": _state_receipt_prompt_payload(state_receipt),
-                }, ensure_ascii=False)[:5000]
-                + "\nIf the user asked for the change, acknowledge that it was written. "
-                "Do not claim an identity or memory update unless the result status is ok."
-            ),
-        })
     provider_messages.insert(2, _model_api_turn_contract_message())
     try:
         result = chat_completion(
@@ -9786,67 +9951,59 @@ def model_api_chat_send():
             timeout=90.0,
         )
     except ProviderError as e:
-        if effects:
-            result = {"reply": _identity_actions_default_reply(message, effects), "usage": {}}
-        else:
-            trace = _append_model_api_action_trace(store, {
-                "status": "failed",
-                "provider": runtime.provider,
-                "model": runtime.model,
-                "user_message_id": user_row["id"],
-                "state_receipt_id": (state_receipt or {}).get("id", ""),
-                "planner": {
-                    "triggered": bool(state_plan.get("triggered")),
-                    "method": state_plan.get("method", ""),
-                    "error": state_plan.get("error", ""),
-                },
-                "effects": effects,
-                "identity_actions": identity_action_results,
-                "memory_actions": memory_action_results,
-                "context": {
-                    "memories": len(context_payload.get("context_memories") or []),
-                    "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
-                    "screen_context": bool(context_payload.get("screen_context")),
-                    "context_refs": len(context_refs),
-                },
-                "error": f"provider_chat_failed:{str(e)[:220]}",
-                "duration_ms": int((time.time() - trace_start) * 1000),
-            })
-            return jsonify({
-                "error": "provider_chat_failed",
-                "detail": str(e),
-                "status_code": e.status_code,
-                "user_message_id": user_row["id"],
-                "action_trace_id": trace.get("trace_id", ""),
-            }), 502
+        trace = _append_model_api_action_trace(store, {
+            "status": "failed",
+            "provider": runtime.provider,
+            "model": runtime.model,
+            "user_message_id": user_row["id"],
+            "planner": {
+                "triggered": False,
+                "method": "hosted_runtime_background_not_started",
+                "error": "",
+            },
+            "effects": effects,
+            "identity_actions": identity_action_results,
+            "memory_actions": memory_action_results,
+            "context": {
+                "memories": len(context_payload.get("context_memories") or []),
+                "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
+                "screen_context": bool(context_payload.get("screen_context")),
+                "context_refs": len(context_refs),
+            },
+            "error": f"provider_chat_failed:{str(e)[:220]}",
+            "duration_ms": int((time.time() - trace_start) * 1000),
+        })
+        return jsonify({
+            "error": "provider_chat_failed",
+            "detail": str(e),
+            "status_code": e.status_code,
+            "user_message_id": user_row["id"],
+            "action_trace_id": trace.get("trace_id", ""),
+        }), 502
 
     raw_reply = str(result.get("reply") or "").strip()
     reply, thinking_summary = _model_api_parse_turn_reply(raw_reply)
     if not reply:
-        if effects:
-            reply = _identity_actions_default_reply(message, effects)
-        else:
-            trace = _append_model_api_action_trace(store, {
-                "status": "failed",
-                "provider": runtime.provider,
-                "model": runtime.model,
-                "user_message_id": user_row["id"],
-                "state_receipt_id": (state_receipt or {}).get("id", ""),
-                "planner": {
-                    "triggered": bool(state_plan.get("triggered")),
-                    "method": state_plan.get("method", ""),
-                    "error": state_plan.get("error", ""),
-                },
-                "context": {
-                    "memories": len(context_payload.get("context_memories") or []),
-                    "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
-                    "screen_context": bool(context_payload.get("screen_context")),
-                    "context_refs": len(context_refs),
-                },
-                "error": "provider_empty_reply",
-                "duration_ms": int((time.time() - trace_start) * 1000),
-            })
-            return jsonify({"error": "provider_empty_reply", "user_message_id": user_row["id"], "action_trace_id": trace.get("trace_id", "")}), 502
+        trace = _append_model_api_action_trace(store, {
+            "status": "failed",
+            "provider": runtime.provider,
+            "model": runtime.model,
+            "user_message_id": user_row["id"],
+            "planner": {
+                "triggered": False,
+                "method": "hosted_runtime_background_not_started",
+                "error": "",
+            },
+            "context": {
+                "memories": len(context_payload.get("context_memories") or []),
+                "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
+                "screen_context": bool(context_payload.get("screen_context")),
+                "context_refs": len(context_refs),
+            },
+            "error": "provider_empty_reply",
+            "duration_ms": int((time.time() - trace_start) * 1000),
+        })
+        return jsonify({"error": "provider_empty_reply", "user_message_id": user_row["id"], "action_trace_id": trace.get("trace_id", "")}), 502
     if not thinking_summary:
         thinking_summary = _model_api_fallback_thinking_summary(
             user_message=message_for_context,
@@ -9885,7 +10042,24 @@ def model_api_chat_send():
         assistant_message_id=assistant_row["id"],
         context_payload=context_payload,
         effects=effects,
+        run_sync=bool(app.config.get("TESTING") and payload.get("capture_sync")),
     )
+    state_job: dict = {
+        "status": "skipped",
+        "reason": "testing_state_runtime_disabled" if app.config.get("TESTING") else "state_runtime_disabled",
+        "actions_written": 0,
+    }
+    if (not app.config.get("TESTING")) or payload.get("state_sync") or payload.get("state_async"):
+        state_job = _start_model_api_state_action_job(
+            store,
+            api_key,
+            runtime,
+            user_message=message_for_context,
+            user_message_id=user_row["id"],
+            assistant_message_id=assistant_row["id"],
+            context_refs=context_refs,
+            run_sync=bool(app.config.get("TESTING") and payload.get("state_sync")),
+        )
     print(
         f"[model_api_chat:{store.user_id}] user_msg={user_row['id']} "
         f"reply={assistant_row['id']} provider={runtime.provider} model={runtime.model}"
@@ -9896,11 +10070,12 @@ def model_api_chat_send():
         "model": runtime.model,
         "user_message_id": user_row["id"],
         "assistant_message_id": assistant_row["id"],
-        "state_receipt_id": (state_receipt or {}).get("id", ""),
         "planner": {
-            "triggered": bool(state_plan.get("triggered")),
-            "method": state_plan.get("method", ""),
-            "error": state_plan.get("error", ""),
+            "triggered": False,
+            "method": "hosted_runtime_background",
+            "status": state_job.get("status", ""),
+            "trace_id": state_job.get("trace_id", ""),
+            "error": state_job.get("error", ""),
         },
         "effects": effects,
         "identity_actions": identity_action_results,
@@ -9949,12 +10124,17 @@ def model_api_chat_send():
         },
         "state": {
             "action_trace_id": trace.get("trace_id", ""),
-            "receipt": _state_receipt_prompt_payload(state_receipt),
-            "pending": (state_receipt or {}).get("pending", []),
+            "background_trace_id": state_job.get("trace_id", ""),
+            "receipt": {},
+            "pending": [
+                _state_pending_public_summary(item)
+                for item in _state_pending_items(store)[:5]
+            ],
             "planner": {
-                "triggered": bool(state_plan.get("triggered")),
-                "method": state_plan.get("method", ""),
-                "error": state_plan.get("error", ""),
+                "triggered": False,
+                "method": "hosted_runtime_background",
+                "status": state_job.get("status", ""),
+                "error": state_job.get("error", ""),
             },
         },
         "context": {

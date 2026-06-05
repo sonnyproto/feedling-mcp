@@ -160,7 +160,7 @@ def test_identity_profile_patch_reencrypts_existing_card(client, monkeypatch):
     assert saved["relationship_started_at"] == "2026-04-01"
 
 
-def test_model_api_chat_executes_detected_identity_rename(client, monkeypatch):
+def test_model_api_chat_background_runtime_executes_detected_identity_rename(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
     captured_plaintexts: list = []
@@ -208,19 +208,20 @@ def test_model_api_chat_executes_detected_identity_rename(client, monkeypatch):
 
     res = client.post(
         "/v1/model_api/chat/send",
-        json={"message": "call yourself 小秘"},
+        json={"message": "call yourself 小秘", "state_sync": True},
         headers=_headers(api_key),
     )
 
     assert res.status_code == 200, res.get_data(as_text=True)
     body = res.get_json()
     assert body["reply"] == "改好了，我现在叫小秘。"
-    assert body["effects"][0]["action"] == "identity.profile_patch"
-    assert body["identity_actions"][0]["changed_fields"] == ["agent_name"]
+    assert body["effects"] == []
+    assert body["identity_actions"] == []
+    assert body["state"]["planner"]["status"] == "completed"
     assert any(isinstance(item, dict) and item.get("agent_name") == "小秘" for item in captured_plaintexts)
 
 
-def test_model_api_chat_runtime_nudges_identity_dimension(client, monkeypatch):
+def test_model_api_chat_background_runtime_nudges_identity_dimension(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
     captured_plaintexts: list = []
@@ -267,14 +268,15 @@ def test_model_api_chat_runtime_nudges_identity_dimension(client, monkeypatch):
 
     res = client.post(
         "/v1/model_api/chat/send",
-        json={"message": "把 Context retention 调高一点。"},
+        json={"message": "把 Context retention 调高一点。", "state_sync": True},
         headers=_headers(api_key),
     )
 
     assert res.status_code == 200, res.get_data(as_text=True)
     body = res.get_json()
-    assert body["effects"][0]["action"] == "identity.dimension_nudge"
-    assert body["identity_actions"][0]["changed_fields"] == ["dimensions"]
+    assert body["effects"] == []
+    assert body["identity_actions"] == []
+    assert body["state"]["planner"]["status"] == "completed"
     saved_identity = next(item for item in captured_plaintexts if isinstance(item, dict) and item.get("dimensions"))
     changed = next(dim for dim in saved_identity["dimensions"] if dim.get("name") == "Context retention")
     assert changed["value"] == 93
@@ -318,7 +320,7 @@ def test_memory_content_patch_reencrypts_existing_card(client, monkeypatch):
     assert saved["updated_at"]
 
 
-def test_model_api_chat_executes_memory_context_patch(client, monkeypatch):
+def test_model_api_chat_background_runtime_executes_memory_context_patch(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
     _seed_memory(user_id)
@@ -378,19 +380,21 @@ def test_model_api_chat_executes_memory_context_patch(client, monkeypatch):
         json={
             "message": "这张记忆写错了，改成 User moved to Tokyo in April.",
             "context_refs": [{"type": "memory", "id": "mom_1", "title": "Wrong city"}],
+            "state_sync": True,
         },
         headers=_headers(api_key),
     )
 
     assert res.status_code == 200, res.get_data(as_text=True)
     body = res.get_json()
-    assert body["effects"][0]["action"] == "memory.content_patch"
-    assert body["memory_actions"][0]["changed_fields"] == ["description"]
+    assert body["effects"] == []
+    assert body["memory_actions"] == []
+    assert body["state"]["planner"]["status"] == "completed"
     assert any(isinstance(item, dict) and item.get("description") == "User moved to Tokyo in April." for item in captured_plaintexts)
     assert body["context"]["context_refs"] == 1
 
 
-def test_model_api_chat_writes_general_correction_memory_and_uses_strict_context(client, monkeypatch):
+def test_model_api_chat_background_runtime_writes_general_correction_memory(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
     captured_plaintexts: list = []
@@ -452,15 +456,16 @@ def test_model_api_chat_writes_general_correction_memory_and_uses_strict_context
 
     res = client.post(
         "/v1/model_api/chat/send",
-        json={"message": "以后不要再用烂梗王设定，改成温柔一点。"},
+        json={"message": "以后不要再用烂梗王设定，改成温柔一点。", "state_sync": True},
         headers=_headers(api_key),
     )
 
     assert res.status_code == 200, res.get_data(as_text=True)
     body = res.get_json()
     assert body["reply"] == "改好了，我以后不会再用这个设定。"
-    assert body["effects"][0]["action"] == "memory.add_correction"
-    assert body["memory_actions"][0]["action"] == "memory.add_correction"
+    assert body["effects"] == []
+    assert body["memory_actions"] == []
+    assert body["state"]["planner"]["status"] == "completed"
     assert context_params[-1]["context_mode"] == "model_api"
     assert any(
         isinstance(item, dict)
@@ -470,7 +475,7 @@ def test_model_api_chat_writes_general_correction_memory_and_uses_strict_context
     )
 
 
-def test_model_api_chat_state_planner_patches_user_preferred_name(client, monkeypatch):
+def test_model_api_chat_background_runtime_patches_user_preferred_name(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
     captured_plaintexts: list = []
@@ -517,14 +522,14 @@ def test_model_api_chat_state_planner_patches_user_preferred_name(client, monkey
 
     res = client.post(
         "/v1/model_api/chat/send",
-        json={"message": "以后不要叫我老板，叫我 Seven。"},
+        json={"message": "以后不要叫我老板，叫我 Seven。", "state_sync": True},
         headers=_headers(api_key),
     )
 
     assert res.status_code == 200, res.get_data(as_text=True)
     body = res.get_json()
-    assert body["effects"][0]["action"] == "identity.profile_patch"
-    assert body["state"]["receipt"]["status"] == "ok"
+    assert body["effects"] == []
+    assert body["state"]["planner"]["status"] == "completed"
     assert any(
         isinstance(item, dict)
         and item.get("user_preferred_name") == "Seven"
@@ -609,25 +614,29 @@ def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(clien
 
     first = client.post(
         "/v1/model_api/chat/send",
-        json={"message": "忘掉烧卖和蒸饺那个设定。"},
+        json={"message": "忘掉烧卖和蒸饺那个设定。", "state_sync": True},
         headers=_headers(api_key),
     )
     assert first.status_code == 200, first.get_data(as_text=True)
     first_body = first.get_json()
-    assert "确认" in first_body["reply"]
-    assert "烧卖和蒸饺设定" in first_body["reply"]
+    assert first_body["state"]["planner"]["status"] == "pending_confirmation"
     assert first_body["state"]["pending"]
     assert first_body["state"]["pending"][0]["target"] == "烧卖和蒸饺设定"
     assert len(appmod.db.memory_load(user_id)) == 1
+    assert any(
+        isinstance(item, str) and "确认" in item and "烧卖和蒸饺设定" in item
+        for item in captured_plaintexts
+    )
 
     second = client.post(
         "/v1/model_api/chat/send",
-        json={"message": "确认"},
+        json={"message": "确认", "state_sync": True},
         headers=_headers(api_key),
     )
     assert second.status_code == 200, second.get_data(as_text=True)
     second_body = second.get_json()
-    assert second_body["effects"][0]["action"] == "memory.delete"
+    assert second_body["effects"] == []
+    assert second_body["state"]["planner"]["status"] == "completed"
     assert len(appmod.db.memory_load(user_id)) == 0
 
 
@@ -647,8 +656,15 @@ def test_model_api_chat_skips_running_capture_on_ordinary_turn_until_cadence(cli
             return {"messages": [], "context_memories": []}, ""
         return {}, ""
 
+    provider_calls: list[str] = []
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        provider_calls.append(joined)
+        return {"reply": "今天可以简单吃点。", "usage": {}}
+
     monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", lambda cfg, messages, **kwargs: {"reply": "今天可以简单吃点。", "usage": {}})
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -667,3 +683,5 @@ def test_model_api_chat_skips_running_capture_on_ordinary_turn_until_cadence(cli
     body = res.get_json()
     assert body["capture"]["status"] == "skipped"
     assert body["capture"]["reason"].startswith("cadence:")
+    assert len(provider_calls) == 1
+    assert "Feedling Hosted Runtime's state action planner" not in provider_calls[0]
