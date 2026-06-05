@@ -586,6 +586,15 @@ def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(clien
                 }),
                 "usage": {},
             }
+        if "Feedling has NOT applied the pending Identity/Memory update yet" in joined:
+            assert "烧卖和蒸饺设定" in joined
+            return {
+                "reply": json.dumps({
+                    "reply": "我先捏住这条不删：`烧卖和蒸饺设定`。你点头回「确认」，我再把它从记忆里拿掉；不对就回「取消」。",
+                    "thinking_summary": "等你确认删除目标。",
+                }, ensure_ascii=False),
+                "usage": {},
+            }
         return {"reply": "已处理。", "usage": {}}
 
     monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
@@ -606,7 +615,9 @@ def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(clien
     assert first.status_code == 200, first.get_data(as_text=True)
     first_body = first.get_json()
     assert "确认" in first_body["reply"]
+    assert "烧卖和蒸饺设定" in first_body["reply"]
     assert first_body["state"]["pending"]
+    assert first_body["state"]["pending"][0]["target"] == "烧卖和蒸饺设定"
     assert len(appmod.db.memory_load(user_id)) == 1
 
     second = client.post(

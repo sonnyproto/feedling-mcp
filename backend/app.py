@@ -8406,11 +8406,7 @@ def _execute_model_api_state_plan(
         },
         "effects": effects,
         "pending": [
-            {
-                "id": item.get("id", ""),
-                "action": ((item.get("planned_action") or {}).get("planner_type") or ""),
-                "confidence": (item.get("planned_action") or {}).get("confidence", 0),
-            }
+            _state_pending_public_summary(item)
             for item in pending
         ],
         "error": error,
@@ -8431,24 +8427,213 @@ def _state_receipt_prompt_payload(receipt: dict | None) -> dict:
     }
 
 
+def _state_preview_value(value, max_chars: int = 260):
+    if isinstance(value, list):
+        out = []
+        for item in value[:5]:
+            text = str(item or "").strip()
+            if text:
+                out.append(text[:max_chars])
+        return out
+    if isinstance(value, dict):
+        return {
+            str(k): _state_preview_value(v, max_chars)
+            for k, v in list(value.items())[:8]
+            if str(v or "").strip()
+        }
+    text = str(value or "").strip()
+    return text[:max_chars]
+
+
+def _state_pending_public_summary(item: dict) -> dict:
+    planned = item.get("planned_action") if isinstance(item.get("planned_action"), dict) else {}
+    executor = planned.get("executor_action") if isinstance(planned.get("executor_action"), dict) else {}
+    preview = planned.get("target_preview") if isinstance(planned.get("target_preview"), dict) else {}
+    planned_target = planned.get("target") if isinstance(planned.get("target"), dict) else {}
+    action = str(planned.get("planner_type") or executor.get("type") or "")
+    result = {
+        "id": str(item.get("id") or ""),
+        "action": action,
+        "confidence": planned.get("confidence", 0),
+        "reason": str(planned.get("reason") or executor.get("reason") or "")[:300],
+    }
+    if action.startswith("identity"):
+        result["domain"] = "identity"
+        result["target"] = "Identity"
+        if executor.get("type") == "identity.dimension_nudge":
+            result["changes"] = [{
+                "field": "dimension",
+                "dimension": str(executor.get("dimension") or ""),
+                "delta": executor.get("delta"),
+            }]
+        else:
+            patch = executor.get("patch") if isinstance(executor.get("patch"), dict) else {}
+            result["changes"] = [
+                {"field": str(k), "to": _state_preview_value(v)}
+                for k, v in patch.items()
+            ][:8]
+        return result
+
+    result["domain"] = "memory"
+    if executor.get("type") in {"memory.add", "memory.add_correction"}:
+        memory = executor.get("memory") if isinstance(executor.get("memory"), dict) else {}
+        result["target"] = str(memory.get("title") or "New Memory Garden card")[:180]
+        result["new_memory"] = {
+            "type": str(memory.get("type") or "")[:80],
+            "title": str(memory.get("title") or "")[:180],
+            "description": str(memory.get("description") or "")[:600],
+        }
+        return result
+
+    memory_id = str(executor.get("memory_id") or planned_target.get("memory_id") or "")
+    result["memory_id"] = memory_id
+    result["target"] = str(preview.get("title") or memory_id or "Memory Garden card")[:180]
+    if preview:
+        result["current_memory"] = {
+            "title": str(preview.get("title") or "")[:180],
+            "description": str(preview.get("description") or "")[:600],
+            "type": str(preview.get("type") or "")[:80],
+            "occurred_at": str(preview.get("occurred_at") or "")[:80],
+        }
+    if executor.get("type") == "memory.delete":
+        result["changes"] = [{"field": "delete", "to": "remove this card"}]
+        return result
+    patch = executor.get("patch") if isinstance(executor.get("patch"), dict) else {}
+    result["changes"] = [
+        {"field": str(k), "to": _state_preview_value(v, 600)}
+        for k, v in patch.items()
+    ][:8]
+    return result
+
+
+def _state_pending_brief_lines(pending: list[dict], *, zh: bool) -> list[str]:
+    lines: list[str] = []
+    for item in pending[:3]:
+        summary = _state_pending_public_summary(item)
+        action = str(summary.get("action") or "")
+        target = str(summary.get("target") or "").strip()
+        if summary.get("domain") == "identity":
+            changes = summary.get("changes") if isinstance(summary.get("changes"), list) else []
+            parts: list[str] = []
+            for c in changes[:4]:
+                if not isinstance(c, dict):
+                    continue
+                if c.get("field") == "dimension":
+                    parts.append(f"{c.get('dimension')}: {c.get('delta'):+d}" if isinstance(c.get("delta"), int) else str(c.get("dimension") or "dimension"))
+                else:
+                    parts.append(f"{c.get('field')}: {c.get('to') or ''}")
+            change_text = "; ".join(part for part in parts if part)
+            lines.append(
+                f"Identity：{change_text or '更新身份设定'}"
+                if zh else f"Identity: {change_text or 'update identity state'}"
+            )
+            continue
+        if action == "memory.delete":
+            lines.append(f"删除记忆：{target}" if zh else f"Delete memory: {target}")
+            continue
+        if action in {"memory.create", "memory.add", "memory.add_correction"}:
+            new_memory = summary.get("new_memory") if isinstance(summary.get("new_memory"), dict) else {}
+            desc = str(new_memory.get("description") or "")[:180]
+            lines.append(
+                f"新增记忆：{target} — {desc}"
+                if zh else f"Create memory: {target} — {desc}"
+            )
+            continue
+        changes = summary.get("changes") if isinstance(summary.get("changes"), list) else []
+        change_text = "; ".join(
+            f"{c.get('field')}: {c.get('to')}"
+            for c in changes[:3] if isinstance(c, dict)
+        )
+        current = summary.get("current_memory") if isinstance(summary.get("current_memory"), dict) else {}
+        old_desc = str(current.get("description") or "")[:160]
+        lines.append(
+            f"修改记忆：{target}；改动：{change_text or '更新内容'}；当前：{old_desc}"
+            if zh else f"Update memory: {target}; change: {change_text or 'update content'}; current: {old_desc}"
+        )
+    return lines
+
+
 def _pending_state_reply(user_message: str, pending: list[dict]) -> str:
     zh = _state_lang_zh(user_message)
     if not pending:
         return ""
-    first = pending[0]
-    planned = first.get("planned_action") if isinstance(first.get("planned_action"), dict) else {}
-    action = str(planned.get("planner_type") or "")
+    lines = _state_pending_brief_lines(pending, zh=zh)
+    detail = "\n".join(f"- {line}" for line in lines)
     if zh:
-        if "delete" in action:
-            return "我找到了可能相关的记忆，但删除前需要你确认。回复「确认」我再删除，或回复「取消」。"
-        if "patch" in action:
-            return "我找到了可能要修改的身份或记忆，但还需要你确认。回复「确认」我就更新，或回复「取消」。"
-        return "这条可能需要写入长期状态。回复「确认」我再写入，或回复「取消」。"
-    if "delete" in action:
-        return "I found a likely memory target, but I need confirmation before deleting it. Reply `confirm` or `cancel`."
-    if "patch" in action:
-        return "I found a likely identity or memory update, but I need confirmation first. Reply `confirm` or `cancel`."
-    return "This may update long-term state. Reply `confirm` to apply it, or `cancel`."
+        return (
+            "我先不直接动长期记忆，怕改错对象。现在准备做的是：\n"
+            f"{detail}\n"
+            "如果这就是你要的，回「确认」；如果不是，回「取消」或直接告诉我该怎么改。"
+        )
+    return (
+        "I am holding this before changing long-term state:\n"
+        f"{detail}\n"
+        "Reply `confirm` if this is right, or `cancel` / correct me if not."
+    )
+
+
+def _pending_state_confirmation_messages(
+    user_message: str,
+    pending: list[dict],
+    identity: dict,
+) -> list[dict]:
+    payload = {
+        "latest_user_message": user_message[:2000],
+        "identity": {
+            "agent_name": str(identity.get("agent_name") or ""),
+            "tone_style": str(identity.get("tone_style") or ""),
+            "signature": identity.get("signature") if isinstance(identity.get("signature"), list) else [],
+            "language_preference": str(identity.get("language_preference") or ""),
+        },
+        "pending_updates": [_state_pending_public_summary(item) for item in pending[:5]],
+        "allowed_user_replies": ["确认", "取消", "confirm", "cancel", "or a natural correction"],
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are the user-visible AI companion, speaking in your established voice. "
+                "Feedling has NOT applied the pending Identity/Memory update yet. "
+                "Ask the user for confirmation naturally, but explicitly state the exact target and intended change. "
+                "Do not use a generic stock template like 'I found a possible identity or memory change'. "
+                "Do not claim the update is already written. "
+                "Tell the user they can reply confirm/cancel or correct the change. "
+                "Return JSON only: {\"reply\":\"...\",\"thinking_summary\":\"...\"}."
+            ),
+        },
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:8000]},
+    ]
+
+
+def _model_api_pending_confirmation_reply(
+    runtime: ProviderConfig,
+    user_message: str,
+    pending: list[dict],
+    identity: dict,
+) -> tuple[str, str]:
+    fallback = _pending_state_reply(user_message, pending)
+    try:
+        result = chat_completion(
+            runtime,
+            _pending_state_confirmation_messages(user_message, pending, identity),
+            max_tokens=700,
+            temperature=0.7,
+            timeout=45.0,
+            response_format=HOSTED_RUNTIME_ACTION_RESPONSE_FORMAT,
+        )
+        reply, thinking = _model_api_parse_turn_reply(str(result.get("reply") or ""))
+        reply = reply.strip()
+        if not reply:
+            return fallback, ""
+        banned = (
+            "我找到了可能要修改的身份或记忆",
+            "I found a likely identity or memory update",
+        )
+        if any(phrase in reply for phrase in banned):
+            return fallback, thinking
+        return reply, thinking
+    except Exception:
+        return fallback, ""
 
 
 def _identity_actions_default_reply(user_message: str, effects: list[dict]) -> str:
@@ -9482,17 +9667,23 @@ def model_api_chat_send():
         pending_items = _state_pending_items(store)
         just_pending = bool(state_receipt and (state_receipt.get("pending") or []) and not effects)
         if just_pending:
-            reply = _pending_state_reply(message, pending_items)
+            reply, thinking_summary = _model_api_pending_confirmation_reply(
+                runtime,
+                message,
+                pending_items,
+                identity_for_plan,
+            )
             assistant_env, env_err = _build_shared_envelope_for_store(store, reply.encode("utf-8"))
             if assistant_env is None:
                 return jsonify({"error": "assistant_envelope_failed", "detail": env_err}), 409
             assistant_row = store.append_chat("openclaw", "model_api", assistant_env)
             store.notify_chat_waiters()
-            thinking_summary = (
-                "需要你确认后再修改长期状态。"
-                if _state_lang_zh(message)
-                else "Waiting for your confirmation before changing long-term state."
-            )
+            if not thinking_summary:
+                thinking_summary = (
+                    "等你确认具体要改的长期状态。"
+                    if _state_lang_zh(message)
+                    else "Waiting for confirmation on the exact long-term state change."
+                )
             trace = _append_model_api_action_trace(store, {
                 "status": "pending_confirmation",
                 "provider": runtime.provider,

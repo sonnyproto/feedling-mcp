@@ -85,6 +85,8 @@ def build_action_planner_messages(
                 "Durable state means Identity or Memory Garden state that should remain true after this turn. "
                 "If the user only chats normally, asks a question, roleplays, jokes, or references a memory without asking to change it, return no actions. "
                 "If the user asks you to remember, forget, correct, rename, change address preferences, update persona/voice/boundaries, or fix a selected Memory Garden card, produce actions. "
+                "For an explicit first-person durable preference or correction with no clear existing card target, prefer memory.create with high confidence instead of memory.patch. "
+                "Use confidence >= 0.9 for explicit, non-destructive state writes. Use lower confidence mainly for destructive actions or ambiguous patch/delete targets. "
                 "Use memory_candidates or user_selected_context_refs for memory.patch/delete targets. If the target is ambiguous, use low confidence. "
                 "If pending_actions_waiting_for_user_confirmation is non-empty and the latest message confirms or rejects one of them, set pending_decision instead of inventing a new action. "
                 "Do not claim actions are applied; this planner only proposes actions and the executor will apply them. "
@@ -233,6 +235,15 @@ def coerce_planned_action(
             planned["candidate_ids"] = ids
         if not memory_id:
             return None
+        preview = next((item for item in memory_candidates if str(item.get("id") or "") == memory_id), {})
+        if isinstance(preview, dict) and preview:
+            planned["target_preview"] = {
+                "id": str(preview.get("id") or ""),
+                "title": clean_text(preview.get("title"), 180),
+                "description": clean_text(preview.get("description"), 600),
+                "type": clean_text(preview.get("type"), 80),
+                "occurred_at": clean_text(preview.get("occurred_at"), 80),
+            }
         planned["target"] = {"memory_id": memory_id}
         planned["domain"] = "memory"
         if action_type == "memory.delete":
