@@ -52,9 +52,9 @@ WARN = "\033[93mWARN\033[0m"
 PROVIDERS = [
     # openai: still 429 (no quota) — proves an unusable key is still rejected.
     ("openai", "OPENAI_API_KEY", ["gpt-4o-mini"]),
-    # deepseek-reasoner + gemini-2.5-* are THINKING models that failed setup
-    # before the fix ("no usable reply text"); they must now pass setup + chat.
-    ("deepseek", "DEEPSEEK_API_KEY", ["deepseek-reasoner"]),
+    # DeepSeek deprecated deepseek-chat / deepseek-reasoner after 2026-07-24.
+    # Live setup tests should use the V4 model id directly.
+    ("deepseek", "DEEPSEEK_API_KEY", ["deepseek-v4-flash"]),
     ("anthropic", "ANTHROPIC_API_KEY", ["claude-haiku-4-5"]),
     ("gemini", "GEMINI_API_KEY", ["gemini-2.5-flash", "gemini-2.5-pro"]),
     ("openrouter", "OPENROUTER_API_KEY", ["openai/gpt-4o-mini"]),

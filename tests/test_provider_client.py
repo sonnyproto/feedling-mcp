@@ -46,7 +46,7 @@ def _fake_client(monkeypatch, response_body: dict) -> list[dict]:
     [
         ("anthropic", "claude-sonnet-4-20250514", "https://api.anthropic.com/v1"),
         ("gemini", "gemini-2.5-flash", "https://generativelanguage.googleapis.com/v1beta"),
-        ("deepseek", "deepseek-chat", "https://api.deepseek.com"),
+        ("deepseek", "deepseek-v4-flash", "https://api.deepseek.com"),
         ("custom", "some-model", "https://custom.example/v1"),
     ],
 )
@@ -141,7 +141,7 @@ def test_gemini_chat_completion_uses_generate_content(monkeypatch):
     assert calls[0]["json"]["generationConfig"]["responseMimeType"] == "application/json"
 
 
-def test_deepseek_chat_completion_uses_openai_compatible_endpoint(monkeypatch):
+def test_deepseek_legacy_chat_maps_to_v4_flash_non_thinking(monkeypatch):
     calls = _fake_client(
         monkeypatch,
         {
@@ -160,7 +160,71 @@ def test_deepseek_chat_completion_uses_openai_compatible_endpoint(monkeypatch):
     assert result["provider"] == "deepseek"
     assert calls[0]["url"] == "https://api.deepseek.com/chat/completions"
     assert calls[0]["headers"]["Authorization"] == "Bearer sk-ds-test"
-    assert calls[0]["json"]["model"] == "deepseek-chat"
+    assert calls[0]["json"]["model"] == "deepseek-v4-flash"
+    assert calls[0]["json"]["thinking"] == {"type": "disabled"}
+
+
+def test_deepseek_legacy_reasoner_maps_to_v4_flash_thinking(monkeypatch):
+    calls = _fake_client(
+        monkeypatch,
+        {
+            "id": "chatcmpl-test",
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"total_tokens": 5},
+        },
+    )
+
+    result = pc.chat_completion(
+        pc.ProviderConfig("deepseek", "deepseek-reasoner", "sk-ds-test"),
+        [{"role": "user", "content": "Say ok."}],
+    )
+
+    assert result["reply"] == "ok"
+    assert result["provider"] == "deepseek"
+    assert calls[0]["json"]["model"] == "deepseek-v4-flash"
+    assert calls[0]["json"]["thinking"] == {"type": "enabled"}
+
+
+def test_deepseek_v4_flash_defaults_to_non_thinking(monkeypatch):
+    calls = _fake_client(
+        monkeypatch,
+        {
+            "id": "chatcmpl-test",
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"total_tokens": 5},
+        },
+    )
+
+    result = pc.chat_completion(
+        pc.ProviderConfig("deepseek", "deepseek-v4-flash", "sk-ds-test"),
+        [{"role": "user", "content": "Say ok."}],
+    )
+
+    assert result["reply"] == "ok"
+    assert result["provider"] == "deepseek"
+    assert calls[0]["json"]["model"] == "deepseek-v4-flash"
+    assert calls[0]["json"]["thinking"] == {"type": "disabled"}
+
+
+def test_openrouter_legacy_deepseek_model_maps_to_v4_flash(monkeypatch):
+    calls = _fake_client(
+        monkeypatch,
+        {
+            "id": "chatcmpl-test",
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"total_tokens": 5},
+        },
+    )
+
+    result = pc.chat_completion(
+        pc.ProviderConfig("openrouter", "deepseek/deepseek-chat", "sk-or-test"),
+        [{"role": "user", "content": "Say ok."}],
+    )
+
+    assert result["reply"] == "ok"
+    assert result["provider"] == "openrouter"
+    assert calls[0]["json"]["model"] == "deepseek/deepseek-v4-flash"
+    assert "thinking" not in calls[0]["json"]
 
 
 def test_openai_compatible_chat_completion_preserves_image_parts(monkeypatch):

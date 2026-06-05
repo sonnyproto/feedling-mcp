@@ -503,7 +503,7 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                 SELECT user_id, kind, doc
                 FROM user_blobs
                 WHERE user_id = ANY(%s)
-                  AND kind IN ('onboarding_route', 'identity', 'model_api', 'consumer_state')
+                  AND kind IN ('onboarding_route', 'identity', 'model_api', 'model_api_runtime', 'consumer_state')
                 """,
                 (ids,),
             ).fetchall()

@@ -59,6 +59,16 @@ _DEFAULT_BASE_URLS = {
     "deepseek": "https://api.deepseek.com",
 }
 
+_DEEPSEEK_V4_FLASH = "deepseek-v4-flash"
+_DEEPSEEK_LEGACY_RUNTIME: dict[str, tuple[str, str]] = {
+    "deepseek-chat": (_DEEPSEEK_V4_FLASH, "disabled"),
+    "deepseek-reasoner": (_DEEPSEEK_V4_FLASH, "enabled"),
+}
+_OPENROUTER_LEGACY_MODELS = {
+    "deepseek/deepseek-chat": "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-reasoner": "deepseek/deepseek-v4-flash",
+}
+
 
 def normalize_provider(provider: str) -> str:
     p = (provider or "").strip().lower().replace("-", "_")
@@ -83,6 +93,26 @@ def normalize_provider(provider: str) -> str:
 
 def default_base_url(provider: str) -> str:
     return _DEFAULT_BASE_URLS.get(normalize_provider(provider), "")
+
+
+def _runtime_model(provider: str, model: str) -> tuple[str, dict[str, Any]]:
+    """Return the provider-facing model id plus provider-specific request knobs."""
+
+    provider = normalize_provider(provider)
+    raw = (model or "").strip()
+    lower = raw.lower()
+
+    if provider == "deepseek" and lower in _DEEPSEEK_LEGACY_RUNTIME:
+        mapped_model, thinking_type = _DEEPSEEK_LEGACY_RUNTIME[lower]
+        return mapped_model, {"thinking": {"type": thinking_type}}
+
+    if provider == "deepseek" and lower == _DEEPSEEK_V4_FLASH:
+        return raw, {"thinking": {"type": "disabled"}}
+
+    if provider == "openrouter" and lower in _OPENROUTER_LEGACY_MODELS:
+        return _OPENROUTER_LEGACY_MODELS[lower], {}
+
+    return raw, {}
 
 
 def public_config(config: dict) -> dict:
@@ -433,6 +463,7 @@ def _chat_completion_openai_compatible(
     temperature: float,
     timeout: float,
     response_format: dict[str, Any] | None,
+    extra_body: dict[str, Any] | None = None,
     require_reply: bool = True,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -444,6 +475,8 @@ def _chat_completion_openai_compatible(
     }
     if response_format:
         payload["response_format"] = response_format
+    if extra_body:
+        payload.update(extra_body)
 
     try:
         resp = _http_client().post(
@@ -605,6 +638,7 @@ def chat_completion(
     provider, model, base_url = validate_config(
         config.provider, config.model, config.base_url
     )
+    request_model, extra_body = _runtime_model(provider, model)
     key = (config.api_key or "").strip()
     if not key:
         raise ProviderError("api_key required")
@@ -636,7 +670,7 @@ def chat_completion(
 
     return _chat_completion_openai_compatible(
         provider=provider,
-        model=model,
+        model=request_model,
         base_url=base_url,
         key=key,
         messages=messages,
@@ -644,6 +678,7 @@ def chat_completion(
         temperature=temperature,
         timeout=timeout,
         response_format=response_format,
+        extra_body=extra_body,
         require_reply=require_reply,
     )
 

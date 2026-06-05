@@ -215,3 +215,40 @@ def test_select_caps_turning_points_at_3():
     turning_ids = [m["id"] for m in out if m["title"].startswith("转折｜")]
     # Top 3 by occurred_at desc should be t4, t3, t2
     assert turning_ids[:3] == ["t4", "t3", "t2"]
+
+
+def test_model_api_mode_skips_unrelated_recent_cards_and_keeps_corrections():
+    moments = [
+        _moment(
+            id="food",
+            title="烧卖和蒸饺",
+            description="用户曾经聊过烧卖和蒸饺。",
+            created_at="2026-06-05T12:00:00",
+        ),
+        _moment(
+            id="drink",
+            title="喜欢柠檬茶",
+            description="用户晚上想喝清爽一点的饮料。",
+            created_at="2026-06-01T12:00:00",
+        ),
+        {
+            **_moment(
+                id="correction",
+                title="用户更新了 AI 设定",
+                description="以后不要再使用烂梗王设定。",
+                created_at="2026-06-04T12:00:00",
+            ),
+            "source": "model_api_correction",
+        },
+    ]
+
+    out = _select_context_memories(
+        moments,
+        "晚上一起喝点什么？",
+        mode="model_api",
+    )
+
+    out_ids = [m["id"] for m in out]
+    assert "correction" in out_ids
+    assert "drink" in out_ids
+    assert "food" not in out_ids

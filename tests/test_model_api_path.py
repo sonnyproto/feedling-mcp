@@ -76,6 +76,31 @@ def _identity_payload() -> dict:
     }
 
 
+def _fake_shared_envelope_builder(captured: list | None = None):
+    counter = {"n": 0}
+
+    def _build(store, plaintext: bytes, *, item_id: str | None = None):
+        counter["n"] += 1
+        if captured is not None:
+            try:
+                captured.append(appmod.json.loads(plaintext.decode("utf-8")))
+            except Exception:
+                captured.append(plaintext.decode("utf-8"))
+        return {
+            "v": 1,
+            "id": item_id or f"env_{counter['n']}",
+            "body_ct": f"ct_{counter['n']}",
+            "nonce": f"nonce_{counter['n']}",
+            "K_user": f"k_user_{counter['n']}",
+            "K_enclave": f"k_enclave_{counter['n']}",
+            "visibility": "shared",
+            "owner_user_id": store.user_id,
+            "enclave_pk_fpr": "test",
+        }, ""
+
+    return _build
+
+
 def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     user_id, api_key = _register(client)
     raw_provider_key = "sk-test-secret"
@@ -123,6 +148,226 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     assert body["route"] == "model_api"
     assert body["stage"] == "history_import"
     assert all(step["id"] != "resident_consumer" for step in body["steps"])
+    runtime = appmod.db.get_blob(user_id, "model_api_runtime")
+    assert runtime["runtime_mode"] == "hosted_resident"
+    assert runtime["tool_action_enabled"] is True
+    assert any(step["id"] == "hosted_runtime" and step["passing"] for step in body["steps"])
+
+
+def test_model_api_runtime_status_tracks_hosted_runtime_and_action_trace(client, monkeypatch):
+    user_id, api_key = _register(client)
+
+    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
+    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(
+        appmod,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose: b"sk-test",
+    )
+    monkeypatch.setattr(
+        appmod,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"messages": [], "context_memories": []}, "")
+        if path == "/v1/chat/history"
+        else ({"identity": {}}, ""),
+    )
+    monkeypatch.setattr(
+        appmod,
+        "chat_completion",
+        lambda cfg, messages, **kwargs: {"reply": "Hosted runtime reply.", "usage": {"total_tokens": 7}},
+    )
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    before = client.get("/v1/model_api/runtime", headers=_headers(api_key))
+    assert before.status_code == 200, before.get_data(as_text=True)
+    before_body = before.get_json()
+    assert before_body["runtime_mode"] == "hosted_resident"
+    assert before_body["tool_action_enabled"] is True
+    assert before_body["last_action_trace_id"] in {"", None}
+
+    chat = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "hello"},
+        headers=_headers(api_key),
+    )
+    assert chat.status_code == 200, chat.get_data(as_text=True)
+    trace_id = chat.get_json()["state"]["action_trace_id"]
+    assert trace_id
+
+    after = client.get("/v1/model_api/runtime", headers=_headers(api_key))
+    assert after.status_code == 200, after.get_data(as_text=True)
+    after_body = after.get_json()
+    assert after_body["last_action_trace_id"] == trace_id
+    assert after_body["last_action_trace_status"] == "ok"
+    assert appmod.db.get_blob(user_id, "model_api_runtime")["last_action_trace_id"] == trace_id
+
+
+def test_model_api_memory_repair_archives_noisy_cards_only_after_replacements(client, monkeypatch):
+    user_id, api_key = _register(client)
+    captured_plaintexts: list = []
+    memory_plaintexts = {
+        "bad_import": {
+            "type": "moment",
+            "title": "导入片段 7",
+            "description": "===== BEGIN CHAT HISTORY FILE: conversations.json =====\n{\"conversation_id\":\"raw\"}",
+            "context": "raw import artifact",
+        },
+        "good_directness": {
+            "type": "fact",
+            "title": "Direct answers",
+            "description": "User prefers direct, concrete engineering answers with clear tradeoffs.",
+        },
+        "good_memory": {
+            "type": "fact",
+            "title": "Readable memory",
+            "description": "User wants imported history distilled into readable long-term memory, not raw archive fragments.",
+        },
+    }
+
+    def fake_decrypt(envelope, key, purpose):
+        if purpose == "model_api_provider_key":
+            return b"sk-test"
+        plain = memory_plaintexts.get(str(envelope.get("id") or ""))
+        if plain is None:
+            plain = {"title": "Unknown", "description": "Unknown memory.", "type": "fact"}
+        return appmod.json.dumps(plain).encode("utf-8")
+
+    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_shared_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", fake_decrypt)
+    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        return {
+            "reply": appmod.json.dumps({
+                "candidates": [
+                    {
+                        "candidate_type": "preference",
+                        "subject": "user",
+                        "title": "Readable memory preference",
+                        "summary": (
+                            "User repeatedly wants imported histories to become readable durable memory "
+                            "instead of raw JSON or generic archive fragments."
+                        ),
+                        "importance_signals": ["explicit_memory", "future_utility"],
+                        "first_seen_at": "2026-06-02",
+                        "confidence": 0.92,
+                    },
+                    {
+                        "candidate_type": "relationship_event",
+                        "subject": "relationship",
+                        "title": "API runtime review",
+                        "summary": (
+                            "User reviewed the API runtime and asked that memory/identity changes be written "
+                            "through Feedling instead of only claimed in chat."
+                        ),
+                        "importance_signals": ["decision_made", "future_utility"],
+                        "first_seen_at": "2026-06-02",
+                        "confidence": 0.9,
+                    },
+                ]
+            }),
+            "usage": {},
+        }
+
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    appmod.db.memory_replace_all(user_id, [
+        {
+            "v": 1,
+            "id": "bad_import",
+            "type": "moment",
+            "occurred_at": "2026-06-01",
+            "created_at": "2026-06-01T00:00:00",
+            "source": "history_import",
+            "body_ct": "ct_bad",
+            "nonce": "n_bad",
+            "K_user": "ku_bad",
+            "K_enclave": "ke_bad",
+            "visibility": "shared",
+            "owner_user_id": user_id,
+        },
+        {
+            "v": 1,
+            "id": "good_directness",
+            "type": "fact",
+            "occurred_at": "2026-06-02",
+            "created_at": "2026-06-02T00:00:00",
+            "source": "history_import",
+            "body_ct": "ct_good_1",
+            "nonce": "n_good_1",
+            "K_user": "ku_good_1",
+            "K_enclave": "ke_good_1",
+            "visibility": "shared",
+            "owner_user_id": user_id,
+        },
+        {
+            "v": 1,
+            "id": "good_memory",
+            "type": "fact",
+            "occurred_at": "2026-06-02",
+            "created_at": "2026-06-02T00:00:01",
+            "source": "history_import",
+            "body_ct": "ct_good_2",
+            "nonce": "n_good_2",
+            "K_user": "ku_good_2",
+            "K_enclave": "ke_good_2",
+            "visibility": "shared",
+            "owner_user_id": user_id,
+        },
+    ])
+
+    dry = client.post(
+        "/v1/model_api/memory/repair",
+        json={"mode": "dry_run"},
+        headers=_headers(api_key),
+    )
+    assert dry.status_code == 200, dry.get_data(as_text=True)
+    dry_preview = dry.get_json()["preview"]
+    assert dry_preview["old_cards_detected"] == 1
+    assert dry_preview["new_cards_planned"] == 6
+    assert dry_preview["noisy_ids"] == ["bad_import"]
+
+    apply = client.post(
+        "/v1/model_api/memory/repair",
+        json={"mode": "apply", "synchronous": True},
+        headers=_headers(api_key),
+    )
+    assert apply.status_code == 200, apply.get_data(as_text=True)
+    job = apply.get_json()["job"]
+    assert job["status"] == "completed"
+    assert job["new_cards_created"] >= 1
+    assert job["old_cards_archived"] == 1
+
+    saved = appmod.db.memory_load(user_id)
+    by_id = {row["id"]: row for row in saved}
+    assert by_id["bad_import"]["is_archived"] is True
+    assert by_id["bad_import"]["archive_reason"]
+    assert any(row.get("source") == "model_api_repair" for row in saved)
+    assert any(
+        isinstance(item, dict) and "readable durable memory" in item.get("description", "")
+        for item in captured_plaintexts
+    )
+
+    visible = client.get("/v1/memory/list?limit=20", headers=_headers(api_key))
+    assert visible.status_code == 200, visible.get_data(as_text=True)
+    assert all(row["id"] != "bad_import" for row in visible.get_json()["moments"])
+
+    with_archived = client.get("/v1/memory/list?limit=20&include_archived=true", headers=_headers(api_key))
+    assert with_archived.status_code == 200, with_archived.get_data(as_text=True)
+    assert any(row["id"] == "bad_import" for row in with_archived.get_json()["moments"])
 
 
 def test_model_api_setup_logs_provider_test_failure(client, monkeypatch, capsys):

@@ -10,7 +10,7 @@ keys are never printed. Set only the providers you want to test:
   OPENAI_API_KEY        [OPENAI_MODEL=gpt-4o-mini]
   ANTHROPIC_API_KEY     [ANTHROPIC_MODEL=claude-haiku-4-5]
   GEMINI_API_KEY        [GEMINI_MODEL=gemini-2.5-flash]
-  DEEPSEEK_API_KEY      [DEEPSEEK_MODEL=deepseek-chat]
+  DEEPSEEK_API_KEY      [DEEPSEEK_MODEL=deepseek-v4-flash]
   OPENROUTER_API_KEY    [OPENROUTER_MODEL=openai/gpt-4o-mini]
   COMPAT_API_KEY        COMPAT_BASE_URL=https://...  [COMPAT_MODEL=...]
 
@@ -39,7 +39,7 @@ PROVIDERS = [
     ("openai", "OPENAI_API_KEY", "OPENAI_MODEL", "gpt-4o-mini", ""),
     ("anthropic", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "claude-haiku-4-5", ""),
     ("gemini", "GEMINI_API_KEY", "GEMINI_MODEL", "gemini-2.5-flash", ""),
-    ("deepseek", "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "deepseek-chat", ""),
+    ("deepseek", "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "deepseek-v4-flash", ""),
     ("openrouter", "OPENROUTER_API_KEY", "OPENROUTER_MODEL", "openai/gpt-4o-mini", ""),
     ("openai_compatible", "COMPAT_API_KEY", "COMPAT_MODEL", "", "COMPAT_BASE_URL"),
 ]

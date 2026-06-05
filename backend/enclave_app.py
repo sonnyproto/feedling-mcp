@@ -757,6 +757,7 @@ def _load_decrypted_moments(
             "title": inner.get("title"),
             "description": inner.get("description"),
             "type": inner.get("type"),
+            "source": m.get("source"),
             "occurred_at": m.get("occurred_at"),
             "created_at": m.get("created_at"),
             "her_quote": inner.get("her_quote"),
@@ -899,7 +900,14 @@ def v1_chat_history():
                 latest_user_text = m["content"]
                 break
         moments = _load_decrypted_moments(api_key, authorized_user_id, content_sk)
-        context_memories = select_context_memories(moments, latest_user_text)
+        context_mode = str(
+            request.args.get("context_mode")
+            or request.args.get("contextMode")
+            or ""
+        ).strip()
+        if not context_mode and str(request.args.get("context_strict") or "").lower() in {"1", "true", "yes", "on"}:
+            context_mode = "strict"
+        context_memories = select_context_memories(moments, latest_user_text, mode=context_mode)
     except Exception as e:
         print(f"[chat/history:{authorized_user_id}] context_memories failed: {e}")
 

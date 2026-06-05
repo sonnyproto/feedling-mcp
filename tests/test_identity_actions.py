@@ -303,3 +303,241 @@ def test_model_api_chat_executes_memory_context_patch(client, monkeypatch):
     assert body["memory_actions"][0]["changed_fields"] == ["description"]
     assert any(isinstance(item, dict) and item.get("description") == "User moved to Tokyo in April." for item in captured_plaintexts)
     assert body["context"]["context_refs"] == 1
+
+
+def test_model_api_chat_writes_general_correction_memory_and_uses_strict_context(client, monkeypatch):
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    captured_plaintexts: list = []
+    context_params: list[dict] = []
+
+    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    def fake_enclave_context(path, key, params=None):
+        if path == "/v1/identity/get":
+            return {"identity": _plain_identity()}, ""
+        if path == "/v1/chat/history":
+            context_params.append(dict(params or {}))
+            return {
+                "messages": [],
+                "context_memories": [{
+                    "id": "mom_correction",
+                    "title": "用户更新了 AI 设定",
+                    "description": "以后不要再使用烂梗王设定。",
+                    "source": "model_api_correction",
+                }],
+            }, ""
+        return {}, ""
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        if "Memory Capture worker" in joined:
+            return {"reply": '{"memories":[]}', "usage": {}}
+        return {"reply": '{"reply":"改好了，我以后不会再用这个设定。","thinking_summary":"写入了一条纠正记忆。"}', "usage": {}}
+
+    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    res = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "以后不要再用烂梗王设定，改成温柔一点。"},
+        headers=_headers(api_key),
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["reply"] == "改好了，我以后不会再用这个设定。"
+    assert body["effects"][0]["action"] == "memory.add_correction"
+    assert body["memory_actions"][0]["action"] == "memory.add_correction"
+    assert context_params[-1]["context_mode"] == "model_api"
+    assert any(
+        isinstance(item, dict)
+        and item.get("source") == "model_api_correction"
+        and "烂梗王" in item.get("description", "")
+        for item in captured_plaintexts
+    )
+
+
+def test_model_api_chat_state_planner_patches_user_preferred_name(client, monkeypatch):
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    captured_plaintexts: list = []
+
+    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    def fake_enclave_context(path, key, params=None):
+        if path == "/v1/identity/get":
+            return {"identity": _plain_identity()}, ""
+        if path == "/v1/chat/history":
+            return {"messages": [], "context_memories": []}, ""
+        return {}, ""
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        if "API State Planner" in joined:
+            return {
+                "reply": json.dumps({
+                    "actions": [{
+                        "type": "identity.patch",
+                        "confidence": 0.96,
+                        "payload": {
+                            "user_preferred_name": "Seven",
+                            "do_not_say": ["老板"],
+                        },
+                        "reason": "User updated address preference.",
+                    }]
+                }),
+                "usage": {},
+            }
+        return {"reply": '{"reply":"好，以后叫你 Seven。","thinking_summary":"更新了称呼偏好。"}', "usage": {}}
+
+    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    res = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "以后不要叫我老板，叫我 Seven。"},
+        headers=_headers(api_key),
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["effects"][0]["action"] == "identity.profile_patch"
+    assert body["state"]["receipt"]["status"] == "ok"
+    assert any(
+        isinstance(item, dict)
+        and item.get("user_preferred_name") == "Seven"
+        and item.get("do_not_say") == ["老板"]
+        for item in captured_plaintexts
+    )
+
+
+def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(client, monkeypatch):
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    _seed_memory(user_id, memory_id="mom_delete")
+    captured_plaintexts: list = []
+
+    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+
+    def fake_decrypt(envelope, key, purpose):
+        if purpose == "model_api_provider_key":
+            return b"sk-test"
+        return json.dumps({
+            "title": "烧卖和蒸饺设定",
+            "description": "用户以前说过烧卖和蒸饺。",
+            "type": "fact",
+        }).encode("utf-8")
+
+    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", fake_decrypt)
+    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    def fake_enclave_context(path, key, params=None):
+        if path == "/v1/identity/get":
+            return {"identity": _plain_identity()}, ""
+        if path == "/v1/chat/history":
+            return {"messages": [], "context_memories": []}, ""
+        return {}, ""
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        if "API State Planner" in joined:
+            return {
+                "reply": json.dumps({
+                    "actions": [{
+                        "type": "memory.delete",
+                        "confidence": 0.7,
+                        "target": {"memory_id": "mom_delete"},
+                        "reason": "User may be asking to delete this setting.",
+                    }]
+                }),
+                "usage": {},
+            }
+        return {"reply": "已处理。", "usage": {}}
+
+    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    first = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "忘掉烧卖和蒸饺那个设定。"},
+        headers=_headers(api_key),
+    )
+    assert first.status_code == 200, first.get_data(as_text=True)
+    first_body = first.get_json()
+    assert "确认" in first_body["reply"]
+    assert first_body["state"]["pending"]
+    assert len(appmod.db.memory_load(user_id)) == 1
+
+    second = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "确认"},
+        headers=_headers(api_key),
+    )
+    assert second.status_code == 200, second.get_data(as_text=True)
+    second_body = second.get_json()
+    assert second_body["effects"][0]["action"] == "memory.delete"
+    assert len(appmod.db.memory_load(user_id)) == 0
+
+
+def test_model_api_chat_skips_running_capture_on_ordinary_turn_until_cadence(client, monkeypatch):
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    captured_plaintexts: list = []
+
+    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    def fake_enclave_context(path, key, params=None):
+        if path == "/v1/identity/get":
+            return {"identity": _plain_identity()}, ""
+        if path == "/v1/chat/history":
+            return {"messages": [], "context_memories": []}, ""
+        return {}, ""
+
+    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(appmod, "chat_completion", lambda cfg, messages, **kwargs: {"reply": "今天可以简单吃点。", "usage": {}})
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    res = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "今天吃什么？"},
+        headers=_headers(api_key),
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["capture"]["status"] == "skipped"
+    assert body["capture"]["reason"].startswith("cadence:")

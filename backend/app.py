@@ -36,6 +36,7 @@ from provider_client import (
     test_provider_key,
     validate_config as validate_provider_config,
 )
+from context_memory_selection import memory_relevance_score
 
 import db
 
@@ -4730,6 +4731,120 @@ def _public_model_api_config(config: dict | None) -> dict:
     return safe
 
 
+MODEL_API_RUNTIME_BLOB = "model_api_runtime"
+MODEL_API_RUNTIME_VERSION = 1
+MODEL_API_RUNTIME_MODE = "hosted_resident"
+MODEL_API_ACTION_TRACE_STREAM = "model_api_action_traces"
+
+
+def _load_model_api_runtime_profile(store: UserStore) -> dict | None:
+    data = db.get_blob(store.user_id, MODEL_API_RUNTIME_BLOB)
+    return data if isinstance(data, dict) else None
+
+
+def _save_model_api_runtime_profile(store: UserStore, profile: dict) -> dict:
+    data = dict(profile)
+    data["runtime_mode"] = MODEL_API_RUNTIME_MODE
+    data["runtime_version"] = MODEL_API_RUNTIME_VERSION
+    data["updated_at"] = _now_iso()
+    if not data.get("created_at"):
+        data["created_at"] = data["updated_at"]
+    db.set_blob(store.user_id, MODEL_API_RUNTIME_BLOB, data)
+    return data
+
+
+def _ensure_model_api_runtime_profile(
+    store: UserStore,
+    config: dict | None = None,
+    *,
+    touch: bool = False,
+) -> dict | None:
+    """Lazily migrate model_api users into the hosted resident runtime.
+
+    This is intentionally metadata-only: provider key envelopes, chat,
+    identity, and memory cards remain untouched.
+    """
+    config = config if isinstance(config, dict) else _load_model_api_config(store)
+    if not config:
+        return None
+    existing = _load_model_api_runtime_profile(store) or {}
+    profile = dict(existing)
+    changed = touch
+
+    defaults = {
+        "runtime_mode": MODEL_API_RUNTIME_MODE,
+        "runtime_version": MODEL_API_RUNTIME_VERSION,
+        "tool_action_enabled": True,
+        "recap_cursor": None,
+        "last_recap_at": None,
+        "last_action_trace_id": None,
+        "memory_quality_warning": None,
+        "provider": str(config.get("provider") or ""),
+        "model": str(config.get("model") or ""),
+    }
+    for key, value in defaults.items():
+        if profile.get(key) != value and (
+            key in {"runtime_mode", "runtime_version", "tool_action_enabled"}
+            or key not in profile
+            or key in {"provider", "model"}
+        ):
+            profile[key] = value
+            changed = True
+    if changed or not existing:
+        profile = _save_model_api_runtime_profile(store, profile)
+    return profile
+
+
+def _patch_model_api_runtime_profile(store: UserStore, patch: dict) -> dict | None:
+    profile = _ensure_model_api_runtime_profile(store) or {}
+    if not profile:
+        return None
+    merged = dict(profile)
+    merged.update({k: v for k, v in patch.items() if v is not None})
+    return _save_model_api_runtime_profile(store, merged)
+
+
+def _append_model_api_action_trace(store: UserStore, entry: dict) -> dict:
+    record = {
+        "trace_id": entry.get("trace_id") or f"mat_{uuid.uuid4().hex[:16]}",
+        "ts": time.time(),
+        "created_at": _now_iso(),
+        "runtime_mode": MODEL_API_RUNTIME_MODE,
+        "runtime_version": MODEL_API_RUNTIME_VERSION,
+        "status": str(entry.get("status") or "ok")[:80],
+    }
+    for key in (
+        "provider", "model", "user_message_id", "assistant_message_id",
+        "state_receipt_id", "planner", "effects", "identity_actions",
+        "memory_actions", "capture", "context", "error", "duration_ms",
+        "usage",
+    ):
+        if key in entry:
+            record[key] = entry[key]
+    db.log_append(
+        store.user_id,
+        MODEL_API_ACTION_TRACE_STREAM,
+        record,
+        ts=record["ts"],
+        item_key=record["trace_id"],
+    )
+    patch = {
+        "last_action_trace_id": record["trace_id"],
+        "last_action_trace_at": record["created_at"],
+    }
+    if record["status"] == "ok":
+        patch["last_runtime_error"] = ""
+    elif record.get("error"):
+        patch["last_runtime_error"] = str(record.get("error"))[:300]
+    _patch_model_api_runtime_profile(store, patch)
+    return record
+
+
+def _latest_model_api_action_trace(store: UserStore) -> dict | None:
+    traces = db.log_read(store.user_id, MODEL_API_ACTION_TRACE_STREAM, limit=1)
+    return traces[-1] if traces else None
+
+
 def _model_api_key_encryption_material(store: UserStore) -> tuple[bytes, bytes] | tuple[None, str]:
     user_pk_b64 = _get_user_public_key(store.user_id)
     if not user_pk_b64:
@@ -4929,6 +5044,7 @@ def model_api_setup():
         "last_test_usage": test.get("usage") or {},
         "privacy_mode": "tdx_cvm_backend_runtime_option_a",
     })
+    _ensure_model_api_runtime_profile(store, config, touch=True)
     _save_onboarding_route(store, "model_api")
     print(f"[model_api:{store.user_id}] setup provider={provider} model={model}")
     return jsonify({"status": "configured", "config": _public_model_api_config(config)})
@@ -4970,6 +5086,7 @@ def model_api_test():
     config["last_test_error"] = ""
     config["last_test_usage"] = test.get("usage") or {}
     _save_model_api_config(store, config)
+    _ensure_model_api_runtime_profile(store, config, touch=True)
     print(f"[model_api:{store.user_id}] test ok provider={config.get('provider')} model={config.get('model')}")
     return jsonify({"status": "ok", "config": _public_model_api_config(config)})
 
@@ -4978,8 +5095,160 @@ def model_api_test():
 def model_api_delete():
     store = require_user()
     deleted = db.delete_blob(store.user_id, "model_api")
+    db.delete_blob(store.user_id, MODEL_API_RUNTIME_BLOB)
     print(f"[model_api:{store.user_id}] deleted={deleted}")
     return jsonify({"deleted": deleted})
+
+
+def _model_api_recap_status(store: UserStore) -> dict:
+    latest = _model_api_latest_recap_job(store)
+    with _model_api_recap_active_lock:
+        active = store.user_id in _model_api_recap_active_users
+    if not latest:
+        return {"status": "idle", "active": active}
+    status = str(latest.get("status") or "idle")
+    if active and status not in {"failed", "completed", "skipped"}:
+        status = "running"
+    return {
+        "status": status,
+        "active": active,
+        "job_id": latest.get("job_id", ""),
+        "mode": latest.get("mode", ""),
+        "progress": latest.get("progress", 0),
+        "updated_at": latest.get("completed_at") or latest.get("created_at") or "",
+    }
+
+
+@app.route("/v1/model_api/runtime", methods=["GET"])
+def model_api_runtime_status():
+    store = require_user()
+    api_key = _extract_api_key()
+    config = _load_model_api_config(store)
+    if not config:
+        return jsonify({
+            "configured": False,
+            "runtime_mode": MODEL_API_RUNTIME_MODE,
+            "runtime_version": MODEL_API_RUNTIME_VERSION,
+            "recap_status": "idle",
+            "memory_quality_warning": None,
+        })
+    profile = _ensure_model_api_runtime_profile(store, config) or {}
+    scan = _model_api_memory_quality_scan(store, api_key=api_key, max_cards=120, fast=True)
+    warning = scan.get("warning")
+    if warning != profile.get("memory_quality_warning"):
+        profile = _patch_model_api_runtime_profile(store, {"memory_quality_warning": warning}) or profile
+    latest_trace = _latest_model_api_action_trace(store)
+    recap = _model_api_recap_status(store)
+    return jsonify({
+        "configured": True,
+        "runtime_mode": profile.get("runtime_mode") or MODEL_API_RUNTIME_MODE,
+        "runtime_version": int(profile.get("runtime_version") or MODEL_API_RUNTIME_VERSION),
+        "tool_action_enabled": bool(profile.get("tool_action_enabled", True)),
+        "provider": config.get("provider", ""),
+        "model": config.get("model", ""),
+        "recap_status": recap.get("status", "idle"),
+        "recap": recap,
+        "memory_quality_warning": warning,
+        "memory_quality": {
+            "scanned": scan.get("scanned", 0),
+            "issue_count": scan.get("issue_count", 0),
+            "noisy_count": scan.get("noisy_count", 0),
+            "duplicate_count": scan.get("duplicate_count", 0),
+        },
+        "last_action_trace_id": profile.get("last_action_trace_id", ""),
+        "last_action_trace_at": profile.get("last_action_trace_at", ""),
+        "last_action_trace_status": (latest_trace or {}).get("status", ""),
+        "last_runtime_error": profile.get("last_runtime_error", ""),
+    })
+
+
+@app.route("/v1/model_api/memory/repair", methods=["POST"])
+def model_api_memory_repair():
+    store = require_user()
+    api_key = _extract_api_key()
+    payload = request.get_json(silent=True) or {}
+    mode = str(payload.get("mode") or "dry_run").strip().lower()
+    if mode not in {"dry_run", "apply"}:
+        return jsonify({"error": "mode must be dry_run or apply"}), 400
+    archive_old = bool(payload.get("archive_old", True))
+    scan = _model_api_memory_quality_scan(store, api_key=api_key, max_cards=2000)
+    noisy_count = int(scan.get("noisy_count") or 0)
+    new_cards_planned = max(6, min(30, noisy_count)) if noisy_count else 0
+    preview = {
+        "old_cards_detected": noisy_count,
+        "issue_count": int(scan.get("issue_count") or 0),
+        "duplicate_count": int(scan.get("duplicate_count") or 0),
+        "new_cards_planned": new_cards_planned,
+        "noisy_ids": scan.get("noisy_ids", [])[:80],
+        "issues": scan.get("issues", [])[:20],
+    }
+    _patch_model_api_runtime_profile(store, {
+        "memory_quality_warning": scan.get("warning"),
+        "last_memory_quality_scan_at": _now_iso(),
+    })
+    if mode == "dry_run":
+        return jsonify({
+            "status": "completed",
+            "mode": "dry_run",
+            "preview": preview,
+            "memory_quality": scan,
+        })
+    if not preview["old_cards_detected"]:
+        return jsonify({
+            "status": "skipped",
+            "mode": "apply",
+            "reason": "no_noisy_memory_cards_detected",
+            "preview": preview,
+        })
+
+    runtime = _load_runtime_provider_config(store, api_key)
+    if isinstance(runtime, tuple):
+        _, err = runtime
+        return jsonify(err), 400
+
+    job = _append_memory_capture_job(store, {
+        "mode": "repair",
+        "status": "queued",
+        "progress": 0,
+        "old_cards_detected": preview["old_cards_detected"],
+        "new_cards_planned": preview["new_cards_planned"],
+        "repair_noisy_ids": preview["noisy_ids"],
+        "archive_old": archive_old,
+    })
+    run_sync = bool(payload.get("synchronous") or payload.get("sync") or app.config.get("TESTING"))
+    if run_sync:
+        _run_model_api_memory_repair_job(
+            store,
+            api_key,
+            runtime,
+            job["job_id"],
+            noisy_ids=preview["noisy_ids"],
+            archive_old=archive_old,
+        )
+        jobs = db.log_read(store.user_id, "memory_capture_jobs", limit=20)
+        latest = next((item for item in reversed(jobs) if item.get("job_id") == job["job_id"]), job)
+        return jsonify({
+            "status": latest.get("status", "completed"),
+            "mode": "apply",
+            "job_id": job["job_id"],
+            "job": latest,
+            "preview": preview,
+        })
+
+    thread = threading.Thread(
+        target=_run_model_api_memory_repair_job,
+        args=(store, api_key, runtime, job["job_id"]),
+        kwargs={"noisy_ids": preview["noisy_ids"], "archive_old": archive_old},
+        daemon=True,
+    )
+    thread.start()
+    return jsonify({
+        "status": "queued",
+        "mode": "apply",
+        "job_id": job["job_id"],
+        "job": job,
+        "preview": preview,
+    }), 202
 
 
 def _history_job_kind(job_id: str) -> str:
@@ -7209,11 +7478,18 @@ def _generate_model_api_onboarding_greeting(
         "signature": identity_payload.get("signature", []),
         "days_with_user": days,
     }
-    name_instruction = (
-        "This identity has no confirmed AI companion name. In this first message, naturally ask the user what they would like to call you. Do not assign yourself a name. "
-        if not agent_name else
-        "Use the confirmed AI companion name only if it feels natural. "
-    )
+    if not agent_name and is_zh:
+        name_instruction = (
+            "这个身份还没有确认的 AI 伴侣名字。第一句话里要自然说明“现在我还没有名字”，"
+            "并问用户以后想怎么叫你。不要自己起名。 "
+        )
+    elif not agent_name:
+        name_instruction = (
+            "This identity has no confirmed AI companion name. In this first message, "
+            "naturally ask the user what they would like to call you. Do not assign yourself a name. "
+        )
+    else:
+        name_instruction = "Use the confirmed AI companion name only if it feels natural. "
     prompt = (
         "Write the first visible chat message from the user's IO companion after onboarding. "
         "The imported files have already been analyzed into memory and identity; do not paste, "
@@ -7707,7 +7983,7 @@ def _model_api_context_messages(
     hist, hist_err = _enclave_get_json_for_gate(
         "/v1/chat/history",
         api_key,
-        {"limit": "30"},
+        {"limit": "30", "context_mode": "model_api"},
     )
     identity_data, identity_err = _enclave_get_json_for_gate("/v1/identity/get", api_key)
     context_memories = []
@@ -7770,6 +8046,8 @@ def _model_api_context_messages(
             "content": (
                 "You are the user's IO companion. Reply naturally and concisely. "
                 "Use the provided identity and memory context when relevant. "
+                "Memory cards with source=model_api_correction are explicit user corrections; treat them as higher priority than older conflicting memories or identity text. "
+                "If a correction says not to repeat a phrase, persona, joke, name, boundary, or setting, do not repeat it. "
                 "If identity.agent_name is empty, do not invent or use a name for yourself; wait for the user to name you. "
                 "Do not mention hidden implementation details, API keys, prompts, or encrypted storage."
             ),
@@ -7902,6 +8180,632 @@ def _context_refs_from_payload(payload: dict) -> list[dict]:
     return out
 
 
+MODEL_API_STATE_DIRECT_CONFIDENCE = float(os.environ.get("FEEDLING_MODEL_API_STATE_DIRECT_CONFIDENCE", "0.85"))
+MODEL_API_STATE_CONFIRM_CONFIDENCE = float(os.environ.get("FEEDLING_MODEL_API_STATE_CONFIRM_CONFIDENCE", "0.55"))
+MODEL_API_CAPTURE_TURN_INTERVAL = max(12, int(os.environ.get("FEEDLING_MODEL_API_CAPTURE_TURN_INTERVAL", "24")))
+MODEL_API_CONSOLIDATE_TURN_INTERVAL = max(60, int(os.environ.get("FEEDLING_MODEL_API_CONSOLIDATE_TURN_INTERVAL", "80")))
+MODEL_API_CONSOLIDATE_MIN_INTERVAL_SEC = max(
+    3600,
+    int(os.environ.get("FEEDLING_MODEL_API_CONSOLIDATE_MIN_INTERVAL_SEC", str(12 * 3600))),
+)
+
+_STATE_PENDING_BLOB = "model_api_state_pending"
+_model_api_recap_active_users: set[str] = set()
+_model_api_recap_active_lock = threading.Lock()
+_STATE_TRIGGER_RE = re.compile(
+    r"(记住|记一下|记得|忘掉|忘记|删掉|删除|移除|以后|今后|从现在起|"
+    r"不要再|别再|不准再|不许再|不要叫|别叫|叫我|喊我|称呼我|叫你|"
+    r"称呼你|你的名字|你不是|你是|设定|人设|口吻|语气|边界|不对|错了|"
+    r"你记错|写错|改成|改为|更新成|更新为|修改|"
+    r"remember|forget|delete|remove|call me|call yourself|your name|my name|"
+    r"do not|don't|never|wrong|incorrect|update|change|persona|boundary|identity|memory)",
+    re.IGNORECASE,
+)
+_STATE_CONFIRM_RE = re.compile(r"^\s*(确认|是|对|可以|就这条|没错|apply|confirm|yes|ok|okay)\s*[。.!！]?\s*$", re.I)
+_STATE_REJECT_RE = re.compile(r"^\s*(取消|不是|不对|算了|都不是|别改|reject|cancel|no|nope)\s*[。.!！]?\s*$", re.I)
+
+
+def _model_api_turn_count(store: UserStore) -> int:
+    with store.chat_lock:
+        return sum(
+            1
+            for msg in store.chat_messages
+            if isinstance(msg, dict)
+            and msg.get("role") == "user"
+            and msg.get("source") == "model_api"
+        )
+
+
+def _state_lang_zh(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+
+
+def _state_pending_items(store: UserStore) -> list[dict]:
+    data = db.get_blob(store.user_id, _STATE_PENDING_BLOB)
+    items = data.get("items") if isinstance(data, dict) else []
+    now = time.time()
+    clean = [
+        item for item in items
+        if isinstance(item, dict) and float(item.get("expires_at") or 0) > now
+    ]
+    if clean != items:
+        db.set_blob(store.user_id, _STATE_PENDING_BLOB, {"items": clean})
+    return clean
+
+
+def _state_save_pending_items(store: UserStore, items: list[dict]) -> None:
+    db.set_blob(store.user_id, _STATE_PENDING_BLOB, {"items": items[:10], "updated_at": _now_iso()})
+
+
+def _state_add_pending(store: UserStore, planned_actions: list[dict], *, user_message_id: str, prompt: str) -> list[dict]:
+    existing = _state_pending_items(store)
+    now = time.time()
+    pending: list[dict] = []
+    for planned in planned_actions[:5]:
+        item = {
+            "id": f"spa_{uuid.uuid4().hex[:12]}",
+            "created_at": _now_iso(),
+            "expires_at": now + 86400,
+            "source": "model_api_chat",
+            "user_message_id": user_message_id,
+            "prompt": prompt[:1000],
+            "planned_action": planned,
+        }
+        pending.append(item)
+    _state_save_pending_items(store, pending + existing)
+    return pending
+
+
+def _state_clear_pending(store: UserStore, pending_ids: set[str]) -> None:
+    if not pending_ids:
+        return
+    items = [item for item in _state_pending_items(store) if str(item.get("id") or "") not in pending_ids]
+    _state_save_pending_items(store, items)
+
+
+def _append_state_receipt(store: UserStore, receipt: dict) -> dict:
+    record = {
+        "id": receipt.get("id") or f"sr_{uuid.uuid4().hex[:14]}",
+        "ts": time.time(),
+        "created_at": _now_iso(),
+        "source": "model_api_chat",
+        "status": str(receipt.get("status") or "ok")[:80],
+    }
+    for key in (
+        "planner", "results", "effects", "pending", "error",
+        "user_message_id", "assistant_message_id", "summary",
+    ):
+        if key in receipt:
+            record[key] = receipt[key]
+    db.log_append(store.user_id, "state_receipts", record, ts=record["ts"], item_key=record["id"])
+    return record
+
+
+def _load_state_receipts(store: UserStore, limit: int = 30) -> list[dict]:
+    entries = db.log_read(store.user_id, "state_receipts", limit=max(1, min(limit, 100)))
+    entries.sort(key=lambda item: float(item.get("ts") or 0), reverse=True)
+    return entries
+
+
+def _model_api_state_is_triggered(message: str, context_refs: list[dict]) -> bool:
+    if context_refs:
+        return True
+    return bool(_STATE_TRIGGER_RE.search(message or ""))
+
+
+def _state_memory_candidate_from_moment(moment: dict, inner: dict, score: float) -> dict:
+    return {
+        "id": str(moment.get("id") or ""),
+        "type": str(moment.get("type") or inner.get("type") or "fact"),
+        "title": str(inner.get("title") or "")[:220],
+        "description": str(inner.get("description") or "")[:1000],
+        "her_quote": str(inner.get("her_quote") or "")[:500],
+        "context": str(inner.get("context") or "")[:500],
+        "occurred_at": str(moment.get("occurred_at") or ""),
+        "created_at": str(moment.get("created_at") or ""),
+        "updated_at": str(moment.get("updated_at") or ""),
+        "source": str(moment.get("source") or ""),
+        "score": round(float(score), 4),
+    }
+
+
+def _model_api_state_memory_candidates(
+    store: UserStore,
+    api_key: str | None,
+    message: str,
+    context_refs: list[dict],
+    *,
+    limit: int = 12,
+) -> list[dict]:
+    ref_ids = {
+        str(ref.get("id") or "")
+        for ref in context_refs
+        if ref.get("type") == "memory" and ref.get("id")
+    }
+    candidates: list[dict] = []
+    for moment in _active_memory_moments(_load_moments(store)):
+        if not isinstance(moment, dict):
+            continue
+        inner, err = _memory_plain_from_envelope(moment, api_key)
+        if inner is None:
+            continue
+        merged = {
+            **inner,
+            "id": moment.get("id", ""),
+            "type": moment.get("type") or inner.get("type"),
+            "source": moment.get("source", ""),
+            "occurred_at": moment.get("occurred_at", ""),
+            "created_at": moment.get("created_at", ""),
+        }
+        score = 1.0 if moment.get("id") in ref_ids else memory_relevance_score(message, merged)
+        if moment.get("id") in ref_ids or score >= 0.05:
+            candidates.append(_state_memory_candidate_from_moment(moment, inner, score))
+    candidates.sort(key=lambda item: (item.get("score", 0), item.get("occurred_at", "")), reverse=True)
+    return candidates[:limit]
+
+
+def _model_api_state_planner_messages(
+    message: str,
+    identity: dict,
+    memory_candidates: list[dict],
+    context_refs: list[dict],
+) -> list[dict]:
+    payload = {
+        "today": date.today().isoformat(),
+        "user_message": message[:4000],
+        "identity": identity,
+        "memory_candidates": memory_candidates[:12],
+        "user_selected_context_refs": context_refs[:8],
+    }
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are Feedling's API State Planner. Convert the latest user message into backend state actions. "
+                "Return JSON only; do not answer the user. The user writes naturally, not commands. "
+                "Plan durable state changes only when the user explicitly or strongly implies a stable change, correction, preference, boundary, identity update, or memory deletion. "
+                "Supported action types: identity.patch, memory.create, memory.patch, memory.delete, memory.query. "
+                "identity.patch payload may include agent_name, user_preferred_name, agent_role, tone_style, language_preference, relationship_anchor, boundaries, do_not_say, stable_definitions, self_introduction, category, signature. "
+                "For memory.patch/delete, use a memory_candidates id when the target is clear. If several targets are plausible, lower confidence and include candidate ids in target.candidate_ids. "
+                "Never fabricate that an action is already applied; this planner only proposes actions. "
+                "Schema: {\"actions\":[{\"type\":\"identity.patch|memory.create|memory.patch|memory.delete|memory.query\","
+                "\"confidence\":0.0,\"target\":{\"memory_id\":\"optional\",\"candidate_ids\":[\"...\"]},"
+                "\"payload\":{},\"reason\":\"short reason\"}],\"why_empty\":\"optional\"}."
+            ),
+        },
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:16000]},
+    ]
+
+
+def _state_list_value(value) -> list[str]:
+    if isinstance(value, str):
+        parts = re.split(r"[;\n；]+", value)
+        return [_identity_action_text(part, 240) for part in parts if _identity_action_text(part, 240)]
+    if isinstance(value, list):
+        return [_identity_action_text(item, 240) for item in value[:12] if _identity_action_text(item, 240)]
+    return []
+
+
+def _coerce_planned_state_action(action: dict, memory_candidates: list[dict]) -> dict | None:
+    if not isinstance(action, dict):
+        return None
+    action_type = str(action.get("type") or action.get("action") or "").strip().lower()
+    confidence = action.get("confidence", 0.0)
+    try:
+        confidence = float(confidence)
+    except Exception:
+        confidence = 0.0
+    target = action.get("target") if isinstance(action.get("target"), dict) else {}
+    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+    reason = _memory_action_text(action.get("reason") or "Planned from API chat.", 500)
+    planned = {
+        "action_id": str(action.get("action_id") or f"sa_{uuid.uuid4().hex[:12]}"),
+        "planner_type": action_type,
+        "confidence": max(0.0, min(confidence, 1.0)),
+        "reason": reason,
+        "requires_confirmation": confidence < MODEL_API_STATE_DIRECT_CONFIDENCE,
+    }
+
+    if action_type in {"identity.patch", "identity.profile_patch"}:
+        patch = {}
+        raw_patch = payload.get("patch") if isinstance(payload.get("patch"), dict) else payload
+        for key in _IDENTITY_PROFILE_STRING_FIELDS:
+            if key in raw_patch:
+                patch[key] = _identity_action_text(raw_patch.get(key), 1200 if key in {"self_introduction", "relationship_anchor", "tone_style"} else 240)
+        for key in _IDENTITY_PROFILE_LIST_FIELDS:
+            if key in raw_patch:
+                values = _state_list_value(raw_patch.get(key))
+                if values:
+                    patch[key] = values
+        if not patch:
+            return None
+        planned["domain"] = "identity"
+        planned["executor_action"] = {
+            "type": "identity.profile_patch",
+            "patch": patch,
+            "reason": reason,
+            "source": "model_api_state_planner",
+        }
+        return planned
+
+    if action_type in {"memory.create", "memory.add", "memory.add_correction"}:
+        raw = payload.get("memory") if isinstance(payload.get("memory"), dict) else payload
+        title = _memory_action_text(raw.get("title"), 180)
+        description = str(raw.get("description") or raw.get("content") or raw.get("summary") or "").strip()[:2000]
+        if not title or not description:
+            return None
+        mem_type = str(raw.get("type") or raw.get("card_type") or "fact").strip().lower()
+        if mem_type not in {"fact", "event", "quote", "moment"}:
+            mem_type = "fact"
+        executor_type = "memory.add_correction" if action_type == "memory.add_correction" else "memory.add"
+        source = "model_api_correction" if executor_type == "memory.add_correction" else "model_api_state"
+        planned["domain"] = "memory"
+        planned["executor_action"] = {
+            "type": executor_type,
+            "memory": {
+                "type": mem_type,
+                "title": title,
+                "description": description,
+                "occurred_at": _memory_action_text(raw.get("occurred_at") or date.today().isoformat(), 80),
+                "source": _memory_action_text(raw.get("source") or source, 80),
+                "context": str(raw.get("context") or "").strip()[:1000],
+                "her_quote": str(raw.get("her_quote") or "").strip()[:1000],
+            },
+            "reason": reason,
+            "capture_mode": "correction" if executor_type == "memory.add_correction" else "state",
+        }
+        return planned
+
+    if action_type in {"memory.patch", "memory.content_patch", "memory.delete"}:
+        memory_id = str(
+            target.get("memory_id")
+            or target.get("id")
+            or payload.get("memory_id")
+            or payload.get("id")
+            or ""
+        ).strip()
+        candidate_ids = target.get("candidate_ids") if isinstance(target.get("candidate_ids"), list) else []
+        if not memory_id and candidate_ids:
+            memory_id = str(candidate_ids[0] or "").strip()
+            planned["requires_confirmation"] = True
+            planned["candidate_ids"] = [str(cid) for cid in candidate_ids[:3] if str(cid or "").strip()]
+        if not memory_id and memory_candidates:
+            best = memory_candidates[0]
+            if float(best.get("score") or 0) >= 0.28:
+                memory_id = str(best.get("id") or "")
+        if not memory_id:
+            if memory_candidates:
+                planned["candidate_ids"] = [str(c.get("id") or "") for c in memory_candidates[:3] if c.get("id")]
+            return None
+        planned["target"] = {"memory_id": memory_id}
+        if action_type == "memory.delete":
+            planned["domain"] = "memory"
+            planned["executor_action"] = {"type": "memory.delete", "memory_id": memory_id, "reason": reason}
+            return planned
+        patch = payload.get("patch") if isinstance(payload.get("patch"), dict) else payload
+        clean_patch = {}
+        for key, max_len in (
+            ("title", 180),
+            ("description", 2000),
+            ("her_quote", 1000),
+            ("context", 1000),
+            ("type", 80),
+            ("occurred_at", 80),
+        ):
+            if key in patch:
+                clean_patch[key] = str(patch.get(key) or "").strip()[:max_len]
+        if not clean_patch:
+            description = str(payload.get("description") or payload.get("content") or payload.get("summary") or "").strip()[:2000]
+            if description:
+                clean_patch["description"] = description
+        if not clean_patch:
+            return None
+        planned["domain"] = "memory"
+        planned["executor_action"] = {
+            "type": "memory.content_patch",
+            "memory_id": memory_id,
+            "patch": clean_patch,
+            "reason": reason,
+        }
+        return planned
+
+    return None
+
+
+def _model_api_user_preferred_name_action(message: str) -> dict | None:
+    text = (message or "").strip()
+    patterns = [
+        r"(?:以后|今后|从现在起)?\s*(?:叫我|喊我|称呼我)\s*[`'\"“”‘’：:为叫成]*([^，,。.!?！？\n]+)",
+        r"\bcall me\s+[`'\"“”‘’]*([^,\n.!?。！？]+)",
+        r"\bmy name is\s+[`'\"“”‘’]*([^,\n.!?。！？]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if not m:
+            continue
+        name = str(m.group(1) or "").strip(" `\"'“”‘’。，,.;；:：!！?？")
+        if not name or len(name) > 80:
+            continue
+        patch = {"user_preferred_name": name}
+        old = re.search(r"(?:不要|别|不准|不许)(?:再)?(?:叫我|喊我|称呼我)\s*([^，,。.!?！？\n]+)", text)
+        if old:
+            old_name = str(old.group(1) or "").strip(" `\"'“”‘’。，,.;；:：!！?？")
+            if old_name:
+                patch["do_not_say"] = [old_name]
+        return {
+            "type": "identity.patch",
+            "confidence": 0.96,
+            "payload": patch,
+            "reason": "User updated how they want to be addressed.",
+        }
+    return None
+
+
+def _model_api_agent_role_action(message: str) -> dict | None:
+    text = (message or "").strip()
+    m = re.search(
+        r"(?:你|你以后|你今后).{0,12}(?:不是|不再是)\s*([^，,。.!?！？\n]{1,40}).{0,12}(?:是|而是|应该是|改成|改为)\s*([^，,。.!?！？\n]{1,80})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        return None
+    old_role = str(m.group(1) or "").strip(" `\"'“”‘’。，,.;；:：!！?？")
+    new_role = str(m.group(2) or "").strip(" `\"'“”‘’。，,.;；:：!！?？")
+    if not new_role:
+        return None
+    patch = {
+        "agent_role": new_role,
+        "stable_definitions": [f"TA is {new_role}."],
+    }
+    if old_role:
+        patch["do_not_say"] = [old_role]
+    if len(new_role) <= 40 and not any(x in new_role.lower() for x in ("不是", "不要", "don't")):
+        patch["agent_name"] = new_role
+    return {
+        "type": "identity.patch",
+        "confidence": 0.92,
+        "payload": patch,
+        "reason": "User corrected the agent identity/role.",
+    }
+
+
+def _model_api_fallback_state_actions(message: str, context_refs: list[dict]) -> list[dict]:
+    raw_actions: list[dict] = []
+    preferred_name = _model_api_user_preferred_name_action(message)
+    if preferred_name:
+        raw_actions.append(preferred_name)
+    role_action = _model_api_agent_role_action(message)
+    if role_action:
+        raw_actions.append(role_action)
+    identity_action = _model_api_name_action_from_message(message)
+    if identity_action:
+        raw_actions.append({
+            "type": "identity.patch",
+            "confidence": 0.96,
+            "payload": identity_action.get("patch") or identity_action,
+            "reason": identity_action.get("reason") or "Detected identity update.",
+        })
+    for mem_action in _model_api_memory_actions_from_message(message, context_refs):
+        raw_actions.append({
+            "type": (
+                "memory.delete" if mem_action.get("type") == "memory.delete"
+                else "memory.add_correction" if mem_action.get("type") == "memory.add_correction"
+                else "memory.patch" if mem_action.get("type") == "memory.content_patch"
+                else "memory.create"
+            ),
+            "confidence": 0.93 if context_refs or mem_action.get("type") == "memory.add_correction" else 0.88,
+            "target": {"memory_id": mem_action.get("memory_id") or mem_action.get("id") or ""},
+            "payload": mem_action.get("patch") or mem_action.get("memory") or {},
+            "reason": mem_action.get("reason") or "Detected memory update.",
+        })
+    return raw_actions
+
+
+def _model_api_pending_followup_actions(store: UserStore, message: str) -> tuple[list[dict], list[str], str]:
+    pending = _state_pending_items(store)
+    if not pending:
+        return [], [], ""
+    if _STATE_REJECT_RE.search(message or ""):
+        ids = {str(item.get("id") or "") for item in pending}
+        _state_clear_pending(store, ids)
+        return [], list(ids), "rejected"
+    if not _STATE_CONFIRM_RE.search(message or ""):
+        return [], [], ""
+    item = pending[0]
+    pending_id = str(item.get("id") or "")
+    planned = item.get("planned_action") if isinstance(item.get("planned_action"), dict) else {}
+    planned = dict(planned)
+    planned["requires_confirmation"] = False
+    planned["confirmed_pending_id"] = pending_id
+    _state_clear_pending(store, {pending_id})
+    return [planned], [pending_id], "confirmed"
+
+
+def _model_api_plan_state_actions(
+    store: UserStore,
+    api_key: str | None,
+    runtime: ProviderConfig,
+    message: str,
+    context_refs: list[dict],
+    identity: dict,
+) -> dict:
+    confirmed, pending_ids, pending_decision = _model_api_pending_followup_actions(store, message)
+    if confirmed or pending_decision:
+        return {
+            "triggered": True,
+            "method": f"pending_{pending_decision}",
+            "actions": confirmed,
+            "memory_candidates": [],
+            "pending_ids": pending_ids,
+            "error": "",
+        }
+    if not _model_api_state_is_triggered(message, context_refs):
+        return {"triggered": False, "method": "none", "actions": [], "memory_candidates": [], "error": ""}
+
+    memory_candidates = _model_api_state_memory_candidates(store, api_key, message, context_refs)
+    raw_actions: list[dict] = []
+    planner_error = ""
+    if os.environ.get("FEEDLING_MODEL_API_STATE_PLANNER_LLM", "1").strip().lower() not in {"0", "false", "off", "no"}:
+        try:
+            result = chat_completion(
+                runtime,
+                _model_api_state_planner_messages(message, identity, memory_candidates, context_refs),
+                max_tokens=900,
+                temperature=0.0,
+                timeout=35.0,
+            )
+            parsed = _json_from_model_text(str(result.get("reply") or ""))
+            if isinstance(parsed, dict) and isinstance(parsed.get("actions"), list):
+                raw_actions = [a for a in parsed.get("actions") if isinstance(a, dict)]
+        except Exception as e:
+            planner_error = f"{type(e).__name__}:{str(e)[:240]}"
+
+    # Heuristic fallback augments the planner so explicit state commands do
+    # not disappear when the provider returns prose or a weak JSON plan.
+    fallback_actions = _model_api_fallback_state_actions(message, context_refs)
+    raw_actions.extend(fallback_actions)
+
+    planned: list[dict] = []
+    seen = set()
+    for raw in raw_actions[:12]:
+        coerced = _coerce_planned_state_action(raw, memory_candidates)
+        if not coerced:
+            continue
+        key = json.dumps({
+            "domain": coerced.get("domain"),
+            "executor": coerced.get("executor_action"),
+        }, sort_keys=True, ensure_ascii=False)
+        if key in seen:
+            continue
+        seen.add(key)
+        if coerced.get("confidence", 0.0) < MODEL_API_STATE_CONFIRM_CONFIDENCE:
+            continue
+        planned.append(coerced)
+
+    return {
+        "triggered": True,
+        "method": "llm+heuristic" if raw_actions else "empty",
+        "actions": planned[:8],
+        "memory_candidates": memory_candidates,
+        "error": planner_error,
+    }
+
+
+def _execute_model_api_state_plan(
+    store: UserStore,
+    api_key: str | None,
+    plan: dict,
+    *,
+    user_message_id: str,
+    user_message: str,
+) -> tuple[list[dict], list[dict], list[dict], dict | None]:
+    planned_actions = plan.get("actions") if isinstance(plan.get("actions"), list) else []
+    if not planned_actions and not plan.get("pending_ids"):
+        return [], [], [], None
+
+    direct = [a for a in planned_actions if not a.get("requires_confirmation")]
+    needs_confirm = [a for a in planned_actions if a.get("requires_confirmation")]
+    pending = _state_add_pending(
+        store,
+        needs_confirm,
+        user_message_id=user_message_id,
+        prompt=user_message,
+    ) if needs_confirm else []
+
+    identity_actions: list[dict] = []
+    memory_actions: list[dict] = []
+    for planned in direct:
+        executor_action = planned.get("executor_action") if isinstance(planned.get("executor_action"), dict) else {}
+        if not executor_action:
+            continue
+        executor_action = dict(executor_action)
+        executor_action.setdefault("state_action_id", planned.get("action_id", ""))
+        if planned.get("domain") == "identity":
+            identity_actions.append(executor_action)
+        elif planned.get("domain") == "memory":
+            executor_action.setdefault("source_chat_message_ids", [user_message_id])
+            memory_actions.append(executor_action)
+
+    effects: list[dict] = []
+    identity_results: list[dict] = []
+    memory_results: list[dict] = []
+    status = "ok"
+    error = ""
+    if identity_actions:
+        body, action_status = _execute_identity_actions(store, api_key, identity_actions)
+        identity_results = body.get("results") or []
+        effects.extend(body.get("effects") or [])
+        if action_status >= 400:
+            status = "failed"
+            error = body.get("error", "identity_action_failed")
+    if status == "ok" and memory_actions:
+        body, action_status = _execute_memory_actions(store, api_key, memory_actions)
+        memory_results = body.get("results") or []
+        effects.extend(body.get("effects") or [])
+        if action_status >= 400:
+            status = "failed"
+            error = body.get("error", "memory_action_failed")
+
+    receipt = _append_state_receipt(store, {
+        "status": status,
+        "planner": {
+            "method": plan.get("method", ""),
+            "triggered": bool(plan.get("triggered")),
+            "error": plan.get("error", ""),
+            "pending_decision": plan.get("method", "") if str(plan.get("method", "")).startswith("pending_") else "",
+        },
+        "results": {
+            "identity": identity_results,
+            "memory": memory_results,
+        },
+        "effects": effects,
+        "pending": [
+            {
+                "id": item.get("id", ""),
+                "action": ((item.get("planned_action") or {}).get("planner_type") or ""),
+                "confidence": (item.get("planned_action") or {}).get("confidence", 0),
+            }
+            for item in pending
+        ],
+        "error": error,
+        "user_message_id": user_message_id,
+    })
+    return effects, identity_results, memory_results, receipt
+
+
+def _state_receipt_prompt_payload(receipt: dict | None) -> dict:
+    if not receipt:
+        return {}
+    return {
+        "status": receipt.get("status", ""),
+        "results": receipt.get("results", {}),
+        "effects": receipt.get("effects", []),
+        "pending": receipt.get("pending", []),
+        "error": receipt.get("error", ""),
+    }
+
+
+def _pending_state_reply(user_message: str, pending: list[dict]) -> str:
+    zh = _state_lang_zh(user_message)
+    if not pending:
+        return ""
+    first = pending[0]
+    planned = first.get("planned_action") if isinstance(first.get("planned_action"), dict) else {}
+    action = str(planned.get("planner_type") or "")
+    if zh:
+        if "delete" in action:
+            return "我找到了可能相关的记忆，但删除前需要你确认。回复「确认」我再删除，或回复「取消」。"
+        if "patch" in action:
+            return "我找到了可能要修改的身份或记忆，但还需要你确认。回复「确认」我就更新，或回复「取消」。"
+        return "这条可能需要写入长期状态。回复「确认」我再写入，或回复「取消」。"
+    if "delete" in action:
+        return "I found a likely memory target, but I need confirmation before deleting it. Reply `confirm` or `cancel`."
+    if "patch" in action:
+        return "I found a likely identity or memory update, but I need confirmation first. Reply `confirm` or `cancel`."
+    return "This may update long-term state. Reply `confirm` to apply it, or `cancel`."
+
+
 def _extract_patch_text_from_message(message: str) -> str:
     text = (message or "").strip()
     patterns = [
@@ -7916,10 +8820,54 @@ def _extract_patch_text_from_message(message: str) -> str:
     return ""
 
 
+def _model_api_correction_memory_action_from_message(message: str) -> dict | None:
+    text = (message or "").strip()
+    if len(text) < 6 or len(text) > 1200:
+        return None
+    lowered = text.lower()
+    patterns = [
+        r"(?:以后|今后|从现在起|接下来).{0,120}(?:不要|别|不准|不许|改成|改为|更新成|更新为|按|用|记住|记得)",
+        r"(?:不要再|别再|不准再|不许再|别老是|不要老是).{0,160}",
+        r"(?:不对|错了|写错|设定错了|不是).{0,160}(?:而是|应该|以后|今后|改成|改为|更新成|更新为)",
+        r"(?:记住|记一下|你要记得|帮我记住).{0,180}",
+        r"(?:设定|人设|prompt|口吻|语气|称呼|边界|boundary|persona).{0,160}(?:改|更新|不要|别|应该|以后|今后)",
+        r"(?:谁说).{0,120}(?:不能|不可以|不准|不许)",
+    ]
+    if not any(re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL) for pattern in patterns):
+        return None
+    # Pure questions such as "你记得吗？" should not become durable corrections.
+    if re.search(r"(吗|么|嘛|？|\?)\s*$", text) and not re.search(
+        r"(以后|今后|从现在起|不要|别|不对|错了|改成|改为|记住|记得|谁说)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return None
+    zh = bool(re.search(r"[\u4e00-\u9fff]", text))
+    title = "用户纠正了长期设定" if zh else "User corrected a long-term setting"
+    if re.search(r"(不要再|别再|不准再|不许再|边界|boundary)", lowered):
+        title = "用户更新了对话边界" if zh else "User updated a conversation boundary"
+    elif re.search(r"(口吻|语气|说话|persona|人设|设定|prompt)", lowered):
+        title = "用户更新了 AI 设定" if zh else "User updated the AI setting"
+    return {
+        "type": "memory.add_correction",
+        "memory": {
+            "type": "fact",
+            "title": title,
+            "description": text[:1200],
+            "occurred_at": date.today().isoformat(),
+            "source": "model_api_correction",
+            "context": "Explicit user correction from hosted API chat.",
+        },
+        "reason": "User explicitly corrected a durable setting or boundary in chat.",
+        "capture_mode": "correction",
+    }
+
+
 def _model_api_memory_actions_from_message(message: str, context_refs: list[dict]) -> list[dict]:
     memory_refs = [ref for ref in context_refs if ref.get("type") == "memory" and ref.get("id")]
     if not memory_refs:
-        return []
+        action = _model_api_correction_memory_action_from_message(message)
+        return [action] if action else []
     memory_id = str(memory_refs[0]["id"])
     text = (message or "").strip()
     lowered = text.lower()
@@ -7942,7 +8890,8 @@ def _model_api_memory_actions_from_message(message: str, context_refs: list[dict
             "patch": patch,
             "reason": "User corrected this Memory Garden card in chat.",
         }]
-    return []
+    action = _model_api_correction_memory_action_from_message(message)
+    return [action] if action else []
 
 
 def _identity_actions_default_reply(user_message: str, effects: list[dict]) -> str:
@@ -8090,7 +9039,8 @@ def _model_api_capture_prompt(user_message: str, assistant_reply: str, context_p
                 "You are Feedling's Memory Capture worker. Return JSON only. "
                 "Extract durable Memory Garden cards from the latest exchange. "
                 "Only write facts, events, quotes, or rare relational moments. "
-                "Do not write vague preferences, duplicate existing memories, or private implementation details. "
+                "Do write explicit user corrections about names, boundaries, persona, voice, preferences, or facts if they are not already present in existing_context_memories. "
+                "Do not write vague preferences, duplicate existing memories, repeated correction cards, or private implementation details. "
                 "Shape: {\"memories\":[{\"type\":\"fact|event|quote|moment\","
                 "\"title\":\"...\",\"description\":\"...\",\"occurred_at\":\"YYYY-MM-DD\","
                 "\"her_quote\":\"optional\",\"context\":\"optional\"}]}. "
@@ -8190,6 +9140,661 @@ def _model_api_run_memory_capture(
         })
 
 
+def _model_api_latest_recap_job(store: UserStore) -> dict | None:
+    jobs = [
+        job for job in db.log_read(store.user_id, "memory_capture_jobs", limit=60)
+        if isinstance(job, dict) and str(job.get("mode") or "") == "recap"
+    ]
+    if not jobs:
+        return None
+    jobs.sort(key=lambda item: float(item.get("ts") or 0), reverse=True)
+    return jobs[0]
+
+
+def _model_api_recent_recap_chat(store: UserStore, api_key: str | None, limit: int = 160) -> tuple[list[dict], list[str]]:
+    warnings: list[str] = []
+    hist, hist_err = _enclave_get_json_for_gate(
+        "/v1/chat/history",
+        api_key,
+        {
+            "limit": str(max(20, min(limit, 200))),
+            "include_image_body": "false",
+            "context_mode": "model_api",
+        },
+    )
+    if hist_err:
+        warnings.append(f"history_read:{hist_err[:180]}")
+    raw_messages = hist.get("messages") if isinstance(hist, dict) and isinstance(hist.get("messages"), list) else []
+    messages: list[dict] = []
+    for msg in raw_messages:
+        if not isinstance(msg, dict):
+            continue
+        content = str(msg.get("content") or "").strip()
+        if not content or _looks_like_import_artifact(content):
+            continue
+        role = "user" if msg.get("role") == "user" else "assistant"
+        source = str(msg.get("source") or "")
+        if source and source != "model_api":
+            continue
+        messages.append({
+            "id": str(msg.get("id") or ""),
+            "role": role,
+            "content": content[:4000],
+            "ts": msg.get("ts"),
+            "source": "model_api_live",
+        })
+    return messages, warnings
+
+
+def _model_api_plain_memory_cards(store: UserStore, api_key: str | None) -> list[dict]:
+    cards: list[dict] = []
+    for moment in _active_memory_moments(_load_moments(store)):
+        if not isinstance(moment, dict):
+            continue
+        inner, _ = _memory_plain_from_envelope(moment, api_key)
+        if inner is None:
+            continue
+        card = {
+            "id": str(moment.get("id") or ""),
+            "type": str(moment.get("type") or inner.get("type") or "fact"),
+            "title": str(inner.get("title") or "")[:180],
+            "description": str(inner.get("description") or "")[:2000],
+            "occurred_at": str(moment.get("occurred_at") or ""),
+            "created_at": str(moment.get("created_at") or ""),
+            "source": str(moment.get("source") or ""),
+        }
+        for key in ("her_quote", "context", "linked_dimension"):
+            value = str(inner.get(key) or "").strip()
+            if value:
+                card[key] = value
+        cards.append(card)
+    return cards
+
+
+def _memory_quality_card_issues(
+    moment: dict,
+    inner: dict,
+    *,
+    archive_language: str = "",
+) -> list[str]:
+    title = str(inner.get("title") or "").strip()
+    desc = str(inner.get("description") or "").strip()
+    context = str(inner.get("context") or "").strip()
+    mem_type = str(moment.get("type") or inner.get("type") or "fact")
+    issues: list[str] = []
+    if _GENERIC_IMPORT_TITLE_RE.match(title):
+        issues.append("generic_import_title")
+    if any(_looks_like_import_artifact(value) for value in (title, desc, context) if value):
+        issues.append("raw_import_artifact")
+    if _looks_like_low_value_import_card(title, desc, mem_type):
+        issues.append("low_value_content")
+    if str(archive_language).lower().startswith("zh") and desc and _english_only_for_zh(title + "\n" + desc):
+        issues.append("language_mismatch")
+    return list(dict.fromkeys(issues))
+
+
+def _model_api_memory_quality_scan(
+    store: UserStore,
+    *,
+    api_key: str | None,
+    max_cards: int = 1000,
+    fast: bool = False,
+) -> dict:
+    archive_language = _get_user_archive_language(store.user_id) or ""
+    moments = _active_memory_moments(_load_moments(store))
+    scanned: list[dict] = []
+    noisy: list[dict] = []
+    decrypt_errors = 0
+    for moment in moments[:max(1, max_cards)]:
+        if not isinstance(moment, dict):
+            continue
+        inner, err = _memory_plain_from_envelope(moment, api_key)
+        if inner is None:
+            decrypt_errors += 1
+            continue
+        issues = _memory_quality_card_issues(moment, inner, archive_language=archive_language)
+        card = {
+            "id": str(moment.get("id") or ""),
+            "type": str(moment.get("type") or inner.get("type") or ""),
+            "title": str(inner.get("title") or "")[:180],
+            "description": str(inner.get("description") or "")[:1200],
+            "occurred_at": str(moment.get("occurred_at") or ""),
+            "created_at": str(moment.get("created_at") or ""),
+            "source": str(moment.get("source") or ""),
+            "issues": issues,
+        }
+        scanned.append(card)
+        if issues:
+            noisy.append(card)
+
+    duplicate_ids: set[str] = set()
+    seen: list[tuple[str, set[str], str]] = []
+    for card in scanned:
+        desc = str(card.get("description") or "")
+        tokens = _memory_similarity_tokens(desc)
+        norm = _normalize_card_similarity_text(desc)
+        if not norm:
+            continue
+        for prev_norm, prev_tokens, prev_id in seen[-250 if fast else -800:]:
+            if norm == prev_norm or norm[:120] == prev_norm[:120] or _token_jaccard(tokens, prev_tokens) >= 0.72:
+                duplicate_ids.add(str(card.get("id") or ""))
+                break
+        seen.append((norm, tokens, str(card.get("id") or "")))
+
+    by_id = {str(item.get("id") or ""): item for item in noisy}
+    for card in scanned:
+        cid = str(card.get("id") or "")
+        if cid in duplicate_ids and cid not in by_id:
+            copy_card = dict(card)
+            copy_card["issues"] = list(dict.fromkeys((copy_card.get("issues") or []) + ["duplicate_or_near_duplicate"]))
+            by_id[cid] = copy_card
+    noisy = list(by_id.values())
+    noisy.sort(key=lambda item: (len(item.get("issues") or []), item.get("created_at") or ""), reverse=True)
+    issue_count = sum(len(item.get("issues") or []) for item in noisy)
+    warning = None
+    if noisy:
+        warning = "memory_quality_warning"
+    return {
+        "scanned": len(scanned),
+        "total_active": len(moments),
+        "decrypt_errors": decrypt_errors,
+        "issue_count": issue_count,
+        "noisy_count": len(noisy),
+        "duplicate_count": len(duplicate_ids),
+        "warning": warning,
+        "noisy_ids": [str(item.get("id") or "") for item in noisy if item.get("id")],
+        "issues": noisy[:40],
+    }
+
+
+def _archive_model_api_memory_cards(
+    store: UserStore,
+    memory_ids: list[str],
+    *,
+    reason: str,
+    job_id: str,
+) -> int:
+    target_ids = {str(mid) for mid in memory_ids if str(mid).strip()}
+    if not target_ids:
+        return 0
+    moments = _load_moments(store)
+    archived = 0
+    now = _now_iso()
+    for idx, moment in enumerate(moments):
+        if not isinstance(moment, dict) or str(moment.get("id") or "") not in target_ids:
+            continue
+        if _memory_is_archived(moment):
+            continue
+        updated = dict(moment)
+        updated["is_archived"] = True
+        updated["archived_at"] = now
+        updated["archive_reason"] = reason[:300]
+        updated["archived_by_repair_job"] = job_id
+        updated["updated_at"] = now
+        moments[idx] = updated
+        archived += 1
+        _append_memory_change(store, {
+            "action": "archive",
+            "memory_id": str(moment.get("id") or ""),
+            "type": str(moment.get("type") or ""),
+            "reason": reason,
+        })
+    if archived:
+        _save_moments(store, moments)
+    return archived
+
+
+def _model_api_repair_material_messages(
+    store: UserStore,
+    api_key: str | None,
+    *,
+    noisy_ids: set[str],
+) -> tuple[list[dict], list[dict], list[str]]:
+    messages, warnings = _model_api_recent_recap_chat(store, api_key, limit=200)
+    good_cards = [
+        card for card in _model_api_plain_memory_cards(store, api_key)
+        if str(card.get("id") or "") not in noisy_ids
+        and not _memory_quality_card_issues(
+            {"type": card.get("type", ""), "source": card.get("source", "")},
+            card,
+            archive_language=_get_user_archive_language(store.user_id) or "",
+        )
+    ]
+    support_messages: list[dict] = []
+    for card in good_cards[:80]:
+        support_messages.append({
+            "role": "user",
+            "content": (
+                f"Existing readable Memory Garden card ({card.get('type')}): "
+                f"{card.get('title')}\n{card.get('description')}"
+            ),
+            "ts": None,
+            "source": "persona_import",
+        })
+    return support_messages + messages, good_cards, warnings
+
+
+def _run_model_api_memory_repair_job(
+    store: UserStore,
+    api_key: str | None,
+    runtime: ProviderConfig,
+    job_id: str,
+    *,
+    noisy_ids: list[str],
+    archive_old: bool,
+) -> None:
+    warnings: list[str] = []
+    try:
+        _model_api_patch_recap_job(store, job_id, {"status": "processing", "progress": 8})
+        noisy_set = {str(mid) for mid in noisy_ids if str(mid).strip()}
+        messages, good_cards, material_warnings = _model_api_repair_material_messages(
+            store,
+            api_key,
+            noisy_ids=noisy_set,
+        )
+        warnings.extend(material_warnings)
+        if len(messages) < 4 and len(good_cards) < 2:
+            _model_api_patch_recap_job(store, job_id, {
+                "status": "failed",
+                "progress": 100,
+                "error": "not_enough_repair_material",
+                "warnings": warnings,
+            })
+            return
+
+        language = _import_language_for_store(store, messages)
+        days = _relationship_age_days(store)
+        relationship_start = date.today() - timedelta(days=max(0, days))
+        windows = _build_transcript_windows(messages, max_chars=14000, max_windows=8)
+        target_total = max(6, min(30, len(noisy_set) or 12))
+        story_target = max(2, min(10, target_total // 3))
+        about_target = max(3, target_total - story_target)
+
+        def progress(done: int, total: int, candidate_count: int) -> None:
+            _model_api_patch_recap_job(store, job_id, {
+                "status": "processing",
+                "progress": 12 + int(50 * done / max(total, 1)),
+                "candidate_windows_done": done,
+                "candidate_windows_total": total,
+                "candidates_extracted": candidate_count,
+                "messages_reviewed": len(messages),
+            })
+
+        candidates, provider_warnings = _extract_memory_candidates_with_provider(
+            runtime,
+            windows,
+            relationship_start,
+            per_window_target=4,
+            language=language,
+            on_progress=progress,
+        )
+        warnings.extend(provider_warnings)
+        cards = _render_candidates_to_memory_cards(
+            candidates,
+            relationship_start,
+            {
+                "story": story_target,
+                "about_me": about_target,
+                "ta_thinking": 0,
+                "total": target_total,
+            },
+            language=language,
+            max_cards=target_total,
+        )
+        cards = [
+            card for card in cards
+            if str(card.get("type") or "") in {"moment", "quote", "fact", "event"}
+        ]
+        new_cards = _new_cards_only(good_cards, cards)[:target_total]
+        actions = [
+            {
+                "type": "memory.add",
+                "memory": {
+                    **card,
+                    "source": "model_api_repair",
+                    "context": (
+                        str(card.get("context") or "").strip()
+                        or f"re-distilled during hosted API memory repair job {job_id}"
+                    )[:1000],
+                },
+                "reason": "Memory repair re-distilled readable cards from existing chat/material.",
+                "capture_mode": "repair",
+            }
+            for card in new_cards
+        ]
+        _model_api_patch_recap_job(store, job_id, {
+            "status": "processing",
+            "progress": 72,
+            "candidate_cluster_count": len(_merge_import_candidates(candidates)),
+            "new_cards_planned": len(actions),
+            "memories_planned": len(actions),
+            "warnings": warnings,
+        })
+        if not actions:
+            _model_api_patch_recap_job(store, job_id, {
+                "status": "failed",
+                "progress": 100,
+                "error": "no_replacement_cards_generated",
+                "warnings": warnings,
+            })
+            return
+
+        body, status = _execute_memory_actions(store, api_key, actions)
+        effects = body.get("effects") or []
+        if status >= 400:
+            _model_api_patch_recap_job(store, job_id, {
+                "status": "failed",
+                "progress": 100,
+                "error": body.get("error", "memory_action_failed"),
+                "effects": effects,
+                "warnings": warnings,
+            })
+            return
+        archived = 0
+        if archive_old:
+            archived = _archive_model_api_memory_cards(
+                store,
+                list(noisy_set),
+                reason="Archived by hosted API memory repair after replacement cards were written.",
+                job_id=job_id,
+            )
+        _model_api_patch_recap_job(store, job_id, {
+            "status": "completed",
+            "progress": 100,
+            "actions_planned": len(actions),
+            "actions_written": len(effects),
+            "new_cards_created": len(effects),
+            "memories_created": len(effects),
+            "old_cards_archived": archived,
+            "effects": effects,
+            "warnings": warnings,
+        })
+        _patch_model_api_runtime_profile(store, {
+            "last_repair_at": _now_iso(),
+            "memory_quality_warning": None if archived else "memory_quality_warning",
+        })
+    except Exception as e:
+        _model_api_patch_recap_job(store, job_id, {
+            "status": "failed",
+            "progress": 100,
+            "error": f"{type(e).__name__}:{str(e)[:300]}",
+            "warnings": warnings,
+        })
+
+
+def _model_api_recap_due(store: UserStore, turn_count: int) -> tuple[bool, str]:
+    if turn_count <= 0 or turn_count % MODEL_API_CONSOLIDATE_TURN_INTERVAL != 0:
+        return False, f"cadence:{MODEL_API_CONSOLIDATE_TURN_INTERVAL}"
+    with _model_api_recap_active_lock:
+        if store.user_id in _model_api_recap_active_users:
+            return False, "recap_already_running"
+    latest = _model_api_latest_recap_job(store)
+    if latest:
+        status = str(latest.get("status") or "")
+        if status in {"queued", "processing"}:
+            return False, "recap_already_running"
+        elapsed = time.time() - float(latest.get("ts") or 0)
+        if elapsed < MODEL_API_CONSOLIDATE_MIN_INTERVAL_SEC:
+            return False, f"min_interval:{MODEL_API_CONSOLIDATE_MIN_INTERVAL_SEC}"
+    return True, "recap_due"
+
+
+def _model_api_patch_recap_job(store: UserStore, job_id: str, patch: dict, *, only_if_status: str | None = None) -> dict | None:
+    merged = dict(patch)
+    if patch.get("status") in {"completed", "failed", "skipped"}:
+        merged.setdefault("completed_at", _now_iso())
+    return db.log_patch_item(store.user_id, "memory_capture_jobs", job_id, merged, only_if_status=only_if_status)
+
+
+def _run_model_api_recap_job(
+    store: UserStore,
+    api_key: str | None,
+    runtime: ProviderConfig,
+    job_id: str,
+    turn_count: int,
+) -> None:
+    try:
+        _model_api_patch_recap_job(store, job_id, {
+            "status": "processing",
+            "progress": 8,
+        })
+        messages, warnings = _model_api_recent_recap_chat(store, api_key)
+        if len(messages) < 12:
+            _model_api_patch_recap_job(store, job_id, {
+                "status": "skipped",
+                "reason": "not_enough_recent_chat",
+                "messages_reviewed": len(messages),
+                "warnings": warnings,
+            })
+            return
+
+        language = _import_language_for_store(store, messages)
+        days = _relationship_age_days(store)
+        relationship_start = date.today() - timedelta(days=max(0, days))
+        windows = _build_transcript_windows(messages, max_chars=14000, max_windows=8)
+        if not windows:
+            _model_api_patch_recap_job(store, job_id, {
+                "status": "skipped",
+                "reason": "empty_windows",
+                "messages_reviewed": len(messages),
+                "warnings": warnings,
+            })
+            return
+
+        def progress(done: int, total: int, candidate_count: int) -> None:
+            _model_api_patch_recap_job(store, job_id, {
+                "status": "processing",
+                "progress": 10 + int(55 * done / max(total, 1)),
+                "candidate_windows_done": done,
+                "candidate_windows_total": total,
+                "candidates_extracted": candidate_count,
+                "messages_reviewed": len(messages),
+            })
+
+        candidates, provider_warnings = _extract_memory_candidates_with_provider(
+            runtime,
+            windows,
+            relationship_start,
+            per_window_target=4,
+            language=language,
+            on_progress=progress,
+        )
+        warnings.extend(provider_warnings)
+        cards = _render_candidates_to_memory_cards(
+            candidates,
+            relationship_start,
+            {
+                "story": 3,
+                "about_me": 5,
+                "ta_thinking": 0,
+                "total": 8,
+            },
+            language=language,
+            max_cards=8,
+        )
+        cards = [card for card in cards if str(card.get("type") or "") in {"moment", "quote", "fact", "event"}]
+        existing_cards = _model_api_plain_memory_cards(store, api_key)
+        new_cards = _new_cards_only(existing_cards, cards)[:8]
+        source_ids = [str(msg.get("id") or "") for msg in messages if msg.get("id")]
+        actions = [
+            {
+                "type": "memory.add",
+                "memory": {
+                    **card,
+                    "source": "model_api_recap",
+                    "context": (
+                        str(card.get("context") or "").strip()
+                        or f"distilled from recent hosted API chat recap at turn {turn_count}"
+                    )[:1000],
+                },
+                "reason": "Periodic recap distilled this from recent hosted API chat.",
+                "capture_mode": "recap",
+                "source_chat_message_ids": source_ids[-80:],
+            }
+            for card in new_cards
+        ]
+        _model_api_patch_recap_job(store, job_id, {
+            "status": "processing",
+            "progress": 76,
+            "candidate_cluster_count": len(_merge_import_candidates(candidates)),
+            "memories_planned": len(actions),
+            "warnings": warnings,
+        })
+        if not actions:
+            _model_api_patch_recap_job(store, job_id, {
+                "status": "completed",
+                "progress": 100,
+                "actions_planned": 0,
+                "actions_written": 0,
+                "memories_created": 0,
+                "messages_reviewed": len(messages),
+                "warnings": warnings,
+            })
+            _patch_model_api_runtime_profile(store, {"last_recap_at": _now_iso()})
+            return
+
+        body, status = _execute_memory_actions(store, api_key, actions)
+        effects = body.get("effects") or []
+        if status >= 400:
+            _model_api_patch_recap_job(store, job_id, {
+                "status": "failed",
+                "progress": 100,
+                "actions_planned": len(actions),
+                "actions_written": len(effects),
+                "effects": effects,
+                "error": body.get("error", "memory_action_failed"),
+                "warnings": warnings,
+            })
+            return
+        _model_api_patch_recap_job(store, job_id, {
+            "status": "completed",
+            "progress": 100,
+            "actions_planned": len(actions),
+            "actions_written": len(effects),
+            "memories_created": len(effects),
+            "effects": effects,
+            "messages_reviewed": len(messages),
+            "first_message_ts": messages[0].get("ts"),
+            "latest_message_ts": messages[-1].get("ts"),
+            "warnings": warnings,
+        })
+        _patch_model_api_runtime_profile(store, {"last_recap_at": _now_iso()})
+    except Exception as e:
+        _model_api_patch_recap_job(store, job_id, {
+            "status": "failed",
+            "progress": 100,
+            "error": f"{type(e).__name__}:{str(e)[:300]}",
+        })
+    finally:
+        with _model_api_recap_active_lock:
+            _model_api_recap_active_users.discard(store.user_id)
+
+
+def _start_model_api_recap_job(
+    store: UserStore,
+    api_key: str | None,
+    runtime: ProviderConfig,
+    *,
+    turn_count: int,
+) -> dict:
+    with _model_api_recap_active_lock:
+        if store.user_id in _model_api_recap_active_users:
+            return {
+                "status": "skipped",
+                "mode": "recap",
+                "reason": "recap_already_running",
+                "turn_count": turn_count,
+                "actions_written": 0,
+            }
+        _model_api_recap_active_users.add(store.user_id)
+    job = _append_memory_capture_job(store, {
+        "mode": "recap",
+        "status": "queued",
+        "reason": f"cadence:{MODEL_API_CONSOLIDATE_TURN_INTERVAL}",
+        "turn_count": turn_count,
+        "progress": 0,
+        "actions_written": 0,
+    })
+    thread = threading.Thread(
+        target=_run_model_api_recap_job,
+        args=(store, api_key, runtime, job["job_id"], turn_count),
+        daemon=True,
+    )
+    thread.start()
+    return job
+
+
+def _model_api_capture_cue(message: str, reply: str) -> bool:
+    text = f"{message}\n{reply}"
+    return bool(re.search(
+        r"(记住|记得|以后|今后|从现在起|不要再|别再|不对|错了|重要|"
+        r"第一次|生日|项目|关系|边界|喜欢|讨厌|习惯|焦虑|生气|感动|"
+        r"remember|important|from now on|don't forget|boundary|prefer|hate|love)",
+        text,
+        flags=re.IGNORECASE,
+    ))
+
+
+def _model_api_maybe_run_memory_capture(
+    store: UserStore,
+    api_key: str | None,
+    runtime: ProviderConfig,
+    *,
+    user_message: str,
+    assistant_reply: str,
+    user_message_id: str,
+    assistant_message_id: str,
+    context_payload: dict,
+    effects: list[dict],
+) -> dict:
+    turn_count = _model_api_turn_count(store)
+    has_state_write = any(
+        str(effect.get("action") or "").startswith(("identity.", "memory."))
+        or str(effect.get("type") or "").startswith(("identity_", "memory_"))
+        for effect in effects
+    )
+    if has_state_write:
+        return {
+            "status": "skipped",
+            "reason": "state_action_already_written",
+            "turn_count": turn_count,
+            "actions_written": 0,
+        }
+    cue = _model_api_capture_cue(user_message, assistant_reply)
+    cadence = turn_count > 0 and turn_count % MODEL_API_CAPTURE_TURN_INTERVAL == 0
+    if not cue and not cadence:
+        return {
+            "status": "skipped",
+            "reason": f"cadence:{MODEL_API_CAPTURE_TURN_INTERVAL}",
+            "turn_count": turn_count,
+            "actions_written": 0,
+        }
+    job = _model_api_run_memory_capture(
+        store,
+        api_key,
+        runtime,
+        user_message=user_message,
+        assistant_reply=assistant_reply,
+        user_message_id=user_message_id,
+        assistant_message_id=assistant_message_id,
+        context_payload=context_payload,
+    )
+    recap_due, recap_reason = _model_api_recap_due(store, turn_count)
+    if recap_due:
+        recap_job = _start_model_api_recap_job(store, api_key, runtime, turn_count=turn_count)
+        job.setdefault("warnings", [])
+        if isinstance(job["warnings"], list):
+            job["warnings"].append("recap_queued")
+        if isinstance(recap_job, dict):
+            job["recap_job_id"] = recap_job.get("job_id", "")
+            job["recap_status"] = recap_job.get("status", "")
+    elif recap_reason not in {f"cadence:{MODEL_API_CONSOLIDATE_TURN_INTERVAL}", ""}:
+        job.setdefault("warnings", [])
+        if isinstance(job["warnings"], list):
+            job["warnings"].append(recap_reason)
+    return job
+
+
 MODEL_API_MAX_IMAGE_BYTES = 2_000_000
 
 
@@ -8237,6 +9842,7 @@ def _model_api_user_content(message: str, images: list[dict[str, str]]) -> Any:
 def model_api_chat_send():
     store = require_user()
     api_key = _extract_api_key()
+    trace_start = time.time()
     payload = request.get_json(silent=True) or {}
     image_bytes, image_mime, image_err = _model_api_image_payload(payload)
     if image_err:
@@ -8254,7 +9860,14 @@ def model_api_chat_send():
     runtime = _load_runtime_provider_config(store, api_key)
     if isinstance(runtime, tuple):
         _, err = runtime
+        _append_model_api_action_trace(store, {
+            "status": "failed",
+            "error": err.get("error", "runtime_load_failed"),
+            "context": {"stage": "load_runtime"},
+            "duration_ms": int((time.time() - trace_start) * 1000),
+        })
         return jsonify(err), 400
+    _ensure_model_api_runtime_profile(store, _load_model_api_config(store), touch=True)
 
     user_plaintext = image_bytes if image_bytes is not None else message.encode("utf-8")
     user_env, env_err = _build_shared_envelope_for_store(store, user_plaintext)
@@ -8271,32 +9884,120 @@ def model_api_chat_send():
     effects: list[dict] = []
     identity_action_results: list[dict] = []
     memory_action_results: list[dict] = []
-    identity_actions = _model_api_identity_actions_from_message(store, api_key, message)
-    if identity_actions:
-        action_body, action_status = _execute_identity_actions(store, api_key, identity_actions)
-        identity_action_results = action_body.get("results") or []
-        effects.extend(action_body.get("effects") or [])
-        if action_status >= 400:
-            return jsonify({
-                "error": "identity_action_failed",
-                "detail": action_body.get("error", "unknown_error"),
-                "results": identity_action_results,
+    state_receipt: dict | None = None
+    identity_for_plan = {}
+    identity_plan_data, _ = _enclave_get_json_for_gate("/v1/identity/get", api_key)
+    if isinstance(identity_plan_data, dict) and isinstance(identity_plan_data.get("identity"), dict):
+        identity_for_plan = identity_plan_data["identity"]
+    state_plan = _model_api_plan_state_actions(
+        store,
+        api_key,
+        runtime,
+        message,
+        context_refs,
+        identity_for_plan,
+    )
+    if state_plan.get("triggered") or state_plan.get("actions"):
+        effects, identity_action_results, memory_action_results, state_receipt = _execute_model_api_state_plan(
+            store,
+            api_key,
+            state_plan,
+            user_message_id=user_row["id"],
+            user_message=message,
+        )
+        if state_receipt and state_receipt.get("status") == "failed":
+            trace = _append_model_api_action_trace(store, {
+                "status": "failed",
+                "provider": runtime.provider,
+                "model": runtime.model,
                 "user_message_id": user_row["id"],
-            }), action_status
-    memory_actions = _model_api_memory_actions_from_message(message, context_refs)
-    if memory_actions:
-        for action in memory_actions:
-            action["source_chat_message_ids"] = [user_row["id"]]
-        memory_body, memory_status = _execute_memory_actions(store, api_key, memory_actions)
-        memory_action_results = memory_body.get("results") or []
-        effects.extend(memory_body.get("effects") or [])
-        if memory_status >= 400:
+                "state_receipt_id": state_receipt.get("id", ""),
+                "planner": {
+                    "triggered": bool(state_plan.get("triggered")),
+                    "method": state_plan.get("method", ""),
+                    "error": state_plan.get("error", ""),
+                },
+                "effects": effects,
+                "identity_actions": identity_action_results,
+                "memory_actions": memory_action_results,
+                "error": state_receipt.get("error", "state_action_failed"),
+                "context": {"stage": "state_action", "context_refs": len(context_refs)},
+                "duration_ms": int((time.time() - trace_start) * 1000),
+            })
             return jsonify({
-                "error": "memory_action_failed",
-                "detail": memory_body.get("error", "unknown_error"),
-                "results": memory_action_results,
+                "error": "state_action_failed",
+                "detail": state_receipt.get("error", "unknown_error"),
+                "state": {"receipt": _state_receipt_prompt_payload(state_receipt)},
+                "effects": effects,
+                "identity_actions": identity_action_results,
+                "memory_actions": memory_action_results,
                 "user_message_id": user_row["id"],
-            }), memory_status
+                "action_trace_id": trace.get("trace_id", ""),
+            }), 409
+        pending_items = _state_pending_items(store)
+        just_pending = bool(state_receipt and (state_receipt.get("pending") or []) and not effects)
+        if just_pending:
+            reply = _pending_state_reply(message, pending_items)
+            assistant_env, env_err = _build_shared_envelope_for_store(store, reply.encode("utf-8"))
+            if assistant_env is None:
+                return jsonify({"error": "assistant_envelope_failed", "detail": env_err}), 409
+            assistant_row = store.append_chat("openclaw", "model_api", assistant_env)
+            store.notify_chat_waiters()
+            thinking_summary = (
+                "需要你确认后再修改长期状态。"
+                if _state_lang_zh(message)
+                else "Waiting for your confirmation before changing long-term state."
+            )
+            trace = _append_model_api_action_trace(store, {
+                "status": "pending_confirmation",
+                "provider": runtime.provider,
+                "model": runtime.model,
+                "user_message_id": user_row["id"],
+                "assistant_message_id": assistant_row["id"],
+                "state_receipt_id": (state_receipt or {}).get("id", ""),
+                "planner": {
+                    "triggered": bool(state_plan.get("triggered")),
+                    "method": state_plan.get("method", ""),
+                    "error": state_plan.get("error", ""),
+                },
+                "effects": effects,
+                "identity_actions": identity_action_results,
+                "memory_actions": memory_action_results,
+                "capture": {"status": "skipped", "reason": "pending_confirmation", "actions_written": 0},
+                "context": {"memories": 0, "identity_loaded": bool(identity_for_plan.get("agent_name")), "screen_context": False, "context_refs": len(context_refs)},
+                "duration_ms": int((time.time() - trace_start) * 1000),
+            })
+            return jsonify({
+                "status": "ok",
+                "reply": reply,
+                "thinking_summary": thinking_summary,
+                "user_message": {"id": user_row["id"], "ts": user_row["ts"]},
+                "assistant_message": {"id": assistant_row["id"], "ts": assistant_row["ts"]},
+                "user_content_type": "image" if has_image else "text",
+                "provider": runtime.provider,
+                "model": runtime.model,
+                "usage": {},
+                "effects": effects,
+                "identity_actions": identity_action_results,
+                "memory_actions": memory_action_results,
+                "capture": {"status": "skipped", "reason": "pending_confirmation", "actions_written": 0},
+                "state": {
+                    "action_trace_id": trace.get("trace_id", ""),
+                    "receipt": _state_receipt_prompt_payload(state_receipt),
+                    "pending": state_receipt.get("pending") if state_receipt else [],
+                    "planner": {
+                        "triggered": bool(state_plan.get("triggered")),
+                        "method": state_plan.get("method", ""),
+                        "error": state_plan.get("error", ""),
+                    },
+                },
+                "context": {
+                    "memories": 0,
+                    "identity_loaded": bool(identity_for_plan.get("agent_name")),
+                    "screen_context": False,
+                    "context_refs": len(context_refs),
+                },
+            })
 
     provider_messages, context_payload, screen_images = _model_api_context_messages(
         store,
@@ -8330,6 +10031,7 @@ def model_api_chat_send():
                     "identity_results": identity_action_results,
                     "memory_results": memory_action_results,
                     "effects": effects,
+                    "state_receipt": _state_receipt_prompt_payload(state_receipt),
                 }, ensure_ascii=False)[:5000]
                 + "\nIf the user asked for the change, acknowledge that it was written. "
                 "Do not claim an identity or memory update unless the result status is ok."
@@ -8351,11 +10053,35 @@ def model_api_chat_send():
         if effects:
             result = {"reply": _identity_actions_default_reply(message, effects), "usage": {}}
         else:
+            trace = _append_model_api_action_trace(store, {
+                "status": "failed",
+                "provider": runtime.provider,
+                "model": runtime.model,
+                "user_message_id": user_row["id"],
+                "state_receipt_id": (state_receipt or {}).get("id", ""),
+                "planner": {
+                    "triggered": bool(state_plan.get("triggered")),
+                    "method": state_plan.get("method", ""),
+                    "error": state_plan.get("error", ""),
+                },
+                "effects": effects,
+                "identity_actions": identity_action_results,
+                "memory_actions": memory_action_results,
+                "context": {
+                    "memories": len(context_payload.get("context_memories") or []),
+                    "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
+                    "screen_context": bool(context_payload.get("screen_context")),
+                    "context_refs": len(context_refs),
+                },
+                "error": f"provider_chat_failed:{str(e)[:220]}",
+                "duration_ms": int((time.time() - trace_start) * 1000),
+            })
             return jsonify({
                 "error": "provider_chat_failed",
                 "detail": str(e),
                 "status_code": e.status_code,
                 "user_message_id": user_row["id"],
+                "action_trace_id": trace.get("trace_id", ""),
             }), 502
 
     raw_reply = str(result.get("reply") or "").strip()
@@ -8364,7 +10090,27 @@ def model_api_chat_send():
         if effects:
             reply = _identity_actions_default_reply(message, effects)
         else:
-            return jsonify({"error": "provider_empty_reply", "user_message_id": user_row["id"]}), 502
+            trace = _append_model_api_action_trace(store, {
+                "status": "failed",
+                "provider": runtime.provider,
+                "model": runtime.model,
+                "user_message_id": user_row["id"],
+                "state_receipt_id": (state_receipt or {}).get("id", ""),
+                "planner": {
+                    "triggered": bool(state_plan.get("triggered")),
+                    "method": state_plan.get("method", ""),
+                    "error": state_plan.get("error", ""),
+                },
+                "context": {
+                    "memories": len(context_payload.get("context_memories") or []),
+                    "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
+                    "screen_context": bool(context_payload.get("screen_context")),
+                    "context_refs": len(context_refs),
+                },
+                "error": "provider_empty_reply",
+                "duration_ms": int((time.time() - trace_start) * 1000),
+            })
+            return jsonify({"error": "provider_empty_reply", "user_message_id": user_row["id"], "action_trace_id": trace.get("trace_id", "")}), 502
     if not thinking_summary:
         thinking_summary = _model_api_fallback_thinking_summary(
             user_message=message_for_context,
@@ -8393,7 +10139,7 @@ def model_api_chat_send():
     updated = store.update_chat_message_metadata(assistant_row["id"], delivery_fields)
     if updated:
         assistant_row = updated
-    capture_job = _model_api_run_memory_capture(
+    capture_job = _model_api_maybe_run_memory_capture(
         store,
         api_key,
         runtime,
@@ -8402,11 +10148,46 @@ def model_api_chat_send():
         user_message_id=user_row["id"],
         assistant_message_id=assistant_row["id"],
         context_payload=context_payload,
+        effects=effects,
     )
     print(
         f"[model_api_chat:{store.user_id}] user_msg={user_row['id']} "
         f"reply={assistant_row['id']} provider={runtime.provider} model={runtime.model}"
     )
+    trace = _append_model_api_action_trace(store, {
+        "status": "ok",
+        "provider": runtime.provider,
+        "model": runtime.model,
+        "user_message_id": user_row["id"],
+        "assistant_message_id": assistant_row["id"],
+        "state_receipt_id": (state_receipt or {}).get("id", ""),
+        "planner": {
+            "triggered": bool(state_plan.get("triggered")),
+            "method": state_plan.get("method", ""),
+            "error": state_plan.get("error", ""),
+        },
+        "effects": effects,
+        "identity_actions": identity_action_results,
+        "memory_actions": memory_action_results,
+        "capture": {
+            "job_id": capture_job.get("job_id", ""),
+            "status": capture_job.get("status", ""),
+            "reason": capture_job.get("reason", ""),
+            "turn_count": capture_job.get("turn_count", 0),
+            "actions_written": capture_job.get("actions_written", 0),
+            "warnings": capture_job.get("warnings", []),
+            "recap_job_id": capture_job.get("recap_job_id", ""),
+            "recap_status": capture_job.get("recap_status", ""),
+        },
+        "context": {
+            "memories": len(context_payload.get("context_memories") or []),
+            "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
+            "screen_context": bool(context_payload.get("screen_context")),
+            "context_refs": len(context_refs),
+        },
+        "usage": result.get("usage") or {},
+        "duration_ms": int((time.time() - trace_start) * 1000),
+    })
     return jsonify({
         "status": "ok",
         "reply": reply,
@@ -8423,7 +10204,22 @@ def model_api_chat_send():
         "capture": {
             "job_id": capture_job.get("job_id", ""),
             "status": capture_job.get("status", ""),
+            "reason": capture_job.get("reason", ""),
+            "turn_count": capture_job.get("turn_count", 0),
             "actions_written": capture_job.get("actions_written", 0),
+            "warnings": capture_job.get("warnings", []),
+            "recap_job_id": capture_job.get("recap_job_id", ""),
+            "recap_status": capture_job.get("recap_status", ""),
+        },
+        "state": {
+            "action_trace_id": trace.get("trace_id", ""),
+            "receipt": _state_receipt_prompt_payload(state_receipt),
+            "pending": (state_receipt or {}).get("pending", []),
+            "planner": {
+                "triggered": bool(state_plan.get("triggered")),
+                "method": state_plan.get("method", ""),
+                "error": state_plan.get("error", ""),
+            },
         },
         "context": {
             "memories": len(context_payload.get("context_memories") or []),
@@ -10169,6 +11965,24 @@ _IDENTITY_RUNTIME_LABELS = {
     "agent", "assistant", "ai", "bot",
 }
 
+_IDENTITY_PROFILE_STRING_FIELDS = (
+    "agent_name",
+    "self_introduction",
+    "category",
+    "user_preferred_name",
+    "agent_role",
+    "tone_style",
+    "language_preference",
+    "relationship_anchor",
+)
+_IDENTITY_PROFILE_LIST_FIELDS = (
+    "signature",
+    "boundaries",
+    "do_not_say",
+    "stable_definitions",
+)
+_IDENTITY_PROFILE_FIELDS = set(_IDENTITY_PROFILE_STRING_FIELDS) | set(_IDENTITY_PROFILE_LIST_FIELDS)
+
 
 def _identity_action_text(value, max_chars: int) -> str:
     text = str(value or "").strip()
@@ -10191,14 +12005,18 @@ def _identity_plain_for_action(store: UserStore, api_key: str | None) -> tuple[d
 
 def _identity_payload_from_plain(identity: dict) -> dict:
     payload = {
-        "agent_name": str(identity.get("agent_name") or "IO")[:80],
+        "agent_name": str(identity.get("agent_name") or "")[:80],
         "self_introduction": str(identity.get("self_introduction") or "")[:1200],
         "dimensions": identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else [],
     }
-    if identity.get("category"):
-        payload["category"] = str(identity.get("category") or "")[:120]
-    if isinstance(identity.get("signature"), list):
-        payload["signature"] = [str(item)[:120] for item in identity["signature"][:6]]
+    for key in _IDENTITY_PROFILE_STRING_FIELDS:
+        if key in {"agent_name", "self_introduction"}:
+            continue
+        if identity.get(key):
+            payload[key] = str(identity.get(key) or "")[:1200 if key in {"relationship_anchor", "tone_style"} else 240]
+    for key in _IDENTITY_PROFILE_LIST_FIELDS:
+        if isinstance(identity.get(key), list):
+            payload[key] = [str(item)[:240] for item in identity[key][:12] if str(item or "").strip()]
     return payload
 
 
@@ -10248,7 +12066,7 @@ def _save_identity_action_payload(
 
 def _identity_profile_patch(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
     patch = action.get("patch") if isinstance(action.get("patch"), dict) else {}
-    for key in ("agent_name", "self_introduction", "category", "signature"):
+    for key in _IDENTITY_PROFILE_FIELDS:
         if key in action and key not in patch:
             patch[key] = action[key]
     if not patch:
@@ -10288,35 +12106,42 @@ def _identity_profile_patch(store: UserStore, api_key: str | None, action: dict)
                 audit_old = old_intro[:120]
                 audit_new = intro[:120]
 
-    if "category" in patch:
-        category = _identity_action_text(patch.get("category"), 120)
-        old_category = str(payload.get("category") or "")
-        if category != old_category:
-            if category:
-                payload["category"] = category
+    for key in _IDENTITY_PROFILE_STRING_FIELDS:
+        if key in {"agent_name", "self_introduction"} or key not in patch:
+            continue
+        max_len = 1200 if key in {"relationship_anchor", "tone_style"} else 240
+        new_value = _identity_action_text(patch.get(key), max_len)
+        old_value = str(payload.get(key) or "")
+        if new_value != old_value:
+            if new_value:
+                payload[key] = new_value
             else:
-                payload.pop("category", None)
-            changed.append("category")
+                payload.pop(key, None)
+            changed.append(key)
             if not audit_old and not audit_new:
-                audit_old = old_category
-                audit_new = category
+                audit_old = old_value[:120]
+                audit_new = new_value[:120]
 
-    if "signature" in patch:
-        sig_raw = patch.get("signature")
-        if not isinstance(sig_raw, list):
-            return {"status": "error", "error": "signature_must_be_list", "action": "identity.profile_patch"}, [], 400
-        signature = [_identity_action_text(item, 120) for item in sig_raw[:6]]
-        signature = [item for item in signature if item]
-        old_signature = payload.get("signature") if isinstance(payload.get("signature"), list) else []
-        if signature != old_signature:
-            if signature:
-                payload["signature"] = signature
+    for key in _IDENTITY_PROFILE_LIST_FIELDS:
+        if key not in patch:
+            continue
+        raw_list = patch.get(key)
+        if isinstance(raw_list, str):
+            raw_list = [raw_list]
+        if not isinstance(raw_list, list):
+            return {"status": "error", "error": f"{key}_must_be_list", "action": "identity.profile_patch"}, [], 400
+        values = [_identity_action_text(item, 240) for item in raw_list[:12]]
+        values = [item for item in values if item]
+        old_values = payload.get(key) if isinstance(payload.get(key), list) else []
+        if values != old_values:
+            if values:
+                payload[key] = values
             else:
-                payload.pop("signature", None)
-            changed.append("signature")
+                payload.pop(key, None)
+            changed.append(key)
             if not audit_old and not audit_new:
-                audit_old = ", ".join(old_signature)[:120]
-                audit_new = ", ".join(signature)[:120]
+                audit_old = ", ".join(old_values)[:120]
+                audit_new = ", ".join(values)[:120]
 
     if not changed:
         return {
@@ -11125,6 +12950,21 @@ def _load_moments(store: UserStore) -> list:
     return []
 
 
+def _memory_is_archived(moment: dict) -> bool:
+    return bool(
+        isinstance(moment, dict)
+        and (
+            moment.get("is_archived") is True
+            or str(moment.get("archived_at") or "").strip()
+            or str(moment.get("archive_reason") or "").strip()
+        )
+    )
+
+
+def _active_memory_moments(moments: list) -> list[dict]:
+    return [m for m in moments if isinstance(m, dict) and not _memory_is_archived(m)]
+
+
 def _save_moments(store: UserStore, moments: list):
     with store.memory_lock:
         db.memory_replace_all(store.user_id, moments)
@@ -11159,6 +12999,13 @@ def _append_memory_capture_job(store: UserStore, entry: dict) -> dict:
     for key in (
         "source_chat_message_ids", "message_chars", "reply_chars",
         "actions_planned", "actions_written", "effects", "error", "warnings",
+        "reason", "turn_count", "progress", "messages_reviewed",
+        "candidate_windows_total", "candidate_windows_done",
+        "candidates_extracted", "candidate_cluster_count",
+        "memories_planned", "memories_created", "first_message_ts",
+        "latest_message_ts", "recap_job_id", "old_cards_detected",
+        "old_cards_archived", "new_cards_planned", "new_cards_created",
+        "repair_noisy_ids", "archive_old",
     ):
         if key in entry:
             job[key] = entry[key]
@@ -11174,6 +13021,8 @@ def _count_by_tab(moments: list) -> dict:
         return counts
     for m in moments:
         if not isinstance(m, dict):
+            continue
+        if _memory_is_archived(m):
             continue
         counts["total"] += 1
         t = m.get("type", "")
@@ -11290,6 +13139,8 @@ def _memory_inner_from_action(data: dict) -> dict:
         "description": str(data.get("description") or "").strip()[:2000],
         "type": str(data.get("type") or "fact").strip().lower(),
     }
+    if data.get("source"):
+        inner["source"] = _memory_action_text(data.get("source"), 160)
     if data.get("her_quote"):
         inner["her_quote"] = str(data.get("her_quote") or "").strip()[:1000]
     if data.get("context"):
@@ -11650,6 +13501,45 @@ def memory_actions():
     return jsonify(body), status
 
 
+@app.route("/v1/state/receipts", methods=["GET"])
+def state_receipts():
+    store = require_user()
+    try:
+        limit = min(max(int(request.args.get("limit", 30)), 1), 100)
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid limit"}), 400
+    return jsonify({
+        "receipts": _load_state_receipts(store, limit=limit),
+        "pending": [
+            {
+                "id": item.get("id", ""),
+                "created_at": item.get("created_at", ""),
+                "expires_at": item.get("expires_at", 0),
+                "action": ((item.get("planned_action") or {}).get("planner_type") or ""),
+                "confidence": (item.get("planned_action") or {}).get("confidence", 0),
+            }
+            for item in _state_pending_items(store)
+        ],
+    })
+
+
+@app.route("/v1/memory/capture_jobs", methods=["GET"])
+def memory_capture_jobs():
+    store = require_user()
+    try:
+        limit = min(max(int(request.args.get("limit", 30)), 1), 100)
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid limit"}), 400
+    jobs = db.log_read(store.user_id, "memory_capture_jobs", limit=limit)
+    jobs.sort(key=lambda item: float(item.get("ts") or 0), reverse=True)
+    with _model_api_recap_active_lock:
+        active_recap = store.user_id in _model_api_recap_active_users
+    return jsonify({
+        "jobs": jobs,
+        "active_recap": active_recap,
+    })
+
+
 @app.route("/v1/memory/list", methods=["GET"])
 def memory_list():
     store = require_user()
@@ -11659,7 +13549,10 @@ def memory_list():
         return jsonify({"error": "invalid limit"}), 400
     since = request.args.get("since", "")
 
+    include_archived = str(request.args.get("include_archived") or "").lower() in {"1", "true", "yes"}
     moments = _load_moments(store)
+    if not include_archived:
+        moments = _active_memory_moments(moments)
     if since:
         moments = [m for m in moments if m.get("occurred_at", "") >= since]
     moments = sorted(moments, key=lambda m: m.get("occurred_at", ""), reverse=True)
@@ -12392,6 +14285,13 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
     relationship_evidence = str((identity or {}).get("relationship_anchor_evidence") or "").strip()
     relationship_ok = relationship_anchored and bool(relationship_evidence)
     config = _load_model_api_config(store)
+    runtime_profile = _ensure_model_api_runtime_profile(store, config) if config else None
+    runtime_ready = bool(
+        runtime_profile
+        and runtime_profile.get("runtime_mode") == MODEL_API_RUNTIME_MODE
+        and int(runtime_profile.get("runtime_version") or 0) >= MODEL_API_RUNTIME_VERSION
+        and runtime_profile.get("tool_action_enabled") is True
+    )
     latest_job = _latest_history_import_job(store)
     chat_ready = bool(latest_job and latest_job.get("chat_ready"))
     history_ok = bool(latest_job and (latest_job.get("status") == "completed" or chat_ready))
@@ -12414,6 +14314,15 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
             "passing": bool(config and config.get("test_status") == "ok"),
             "test_status": (config or {}).get("test_status", ""),
             "required": "Call /v1/model_api/test until test_status is ok." if not (config and config.get("test_status") == "ok") else "",
+        },
+        {
+            "id": "hosted_runtime",
+            "label": "Hosted Runtime",
+            "passing": runtime_ready,
+            "runtime_mode": (runtime_profile or {}).get("runtime_mode", ""),
+            "runtime_version": (runtime_profile or {}).get("runtime_version", 0),
+            "tool_action_enabled": bool((runtime_profile or {}).get("tool_action_enabled")),
+            "required": "Open /v1/model_api/runtime or send one API chat message to initialize hosted runtime." if not runtime_ready else "",
         },
         {
             "id": "history_import",
