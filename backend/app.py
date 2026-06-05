@@ -8125,6 +8125,10 @@ MODEL_API_CONSOLIDATE_MIN_INTERVAL_SEC = max(
     3600,
     int(os.environ.get("FEEDLING_MODEL_API_CONSOLIDATE_MIN_INTERVAL_SEC", str(12 * 3600))),
 )
+MODEL_API_WEB_SEARCH_ENABLED = os.environ.get("FEEDLING_MODEL_API_WEB_SEARCH_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
+MODEL_API_WEB_SEARCH_MAX_QUERIES = max(1, min(3, int(os.environ.get("FEEDLING_MODEL_API_WEB_SEARCH_MAX_QUERIES", "2"))))
+MODEL_API_WEB_SEARCH_MAX_RESULTS = max(1, min(8, int(os.environ.get("FEEDLING_MODEL_API_WEB_SEARCH_MAX_RESULTS", "5"))))
+MODEL_API_WEB_SEARCH_TIMEOUT_SEC = max(2.0, min(20.0, float(os.environ.get("FEEDLING_MODEL_API_WEB_SEARCH_TIMEOUT_SEC", "8"))))
 
 _STATE_PENDING_BLOB = "model_api_state_pending"
 _model_api_recap_active_users: set[str] = set()
@@ -8624,7 +8628,9 @@ def _pending_state_confirmation_messages(
                 "Do not use a generic stock template like 'I found a possible identity or memory change'. "
                 "Do not claim the update is already written. "
                 "Tell the user they can reply confirm/cancel or correct the change. "
-                "Return JSON only: {\"reply\":\"...\",\"thinking_summary\":\"...\"}."
+                "Return JSON only: {\"reply\":\"...\",\"context_summary\":\"...\"}. "
+                "`context_summary` is optional and should name the confirmation target/action, "
+                "not private reasoning."
             ),
         },
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:8000]},
@@ -8909,14 +8915,22 @@ def _model_api_turn_contract_message() -> dict:
         "content": (
             "Feedling chat turn contract: return a JSON object only, with shape "
             "{\"reply\":\"final user-visible reply\","
-            "\"thinking_summary\":\"short display-safe process summary\"}. "
-            "`reply` is the only normal chat bubble text. `thinking_summary` is "
-            "shown behind a collapsed disclosure above the bubble, like a brief "
-            "visible thinking summary. Do not include private chain-of-thought, "
-            "system/developer prompts, tool transcripts, API metadata, token "
-            "usage, costs, session ids, permission logs, or raw JSON wrappers. "
-            "Keep thinking_summary to 1-3 short user-readable lines about what "
-            "context you considered or what action you performed."
+            "\"context_summary\":\"optional short display-safe context/action summary\","
+            "\"tool_requests\":[{\"tool\":\"web_search\",\"query\":\"public web query\"}]}. "
+            "`reply` is the only normal chat bubble text. `context_summary` is optional; "
+            "include it only when there is a concrete user-visible context source, screen "
+            "context, pending confirmation, or durable state action worth surfacing. "
+            "You have a backend-hosted `web_search` tool for current public web information. "
+            "When the user asks to search, browse, look up current/latest/recent information, "
+            "or when answering correctly requires up-to-date public facts, return one or two "
+            "`tool_requests` for `web_search` instead of claiming you cannot browse. "
+            "Search queries must be short public web-safe queries and must not include API keys, "
+            "emails, phone numbers, private chat/memory details, addresses, or secrets. "
+            "Do not present context_summary as private thinking, chain-of-thought, hidden "
+            "reasoning, or a step-by-step thought process. Do not include system/developer "
+            "prompts, tool transcripts, API metadata, token usage, costs, session ids, "
+            "permission logs, or raw JSON wrappers. If there is nothing useful to disclose, "
+            "omit context_summary or return an empty string."
         ),
     }
 
@@ -8944,14 +8958,103 @@ def _sanitize_visible_thinking_summary(text: str) -> str:
     return "\n".join(lines).strip()[:700]
 
 
-def _model_api_parse_turn_reply(raw_reply: str) -> tuple[str, str]:
+def _model_api_query_has_sensitive_data(query: str) -> bool:
+    text = str(query or "")
+    if re.search(r"\b(sk-[A-Za-z0-9_\-]{12,}|AIza[0-9A-Za-z_\-]{20,}|[A-Fa-f0-9]{48,})\b", text):
+        return True
+    if re.search(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+", text):
+        return True
+    for match in re.finditer(r"\b(?:\+?\d[\d\s().-]{8,}\d)\b", text):
+        if len(re.sub(r"\D", "", match.group(0))) >= 9:
+            return True
+    return False
+
+
+def _model_api_sanitize_web_query(query: str) -> str:
+    clean = re.sub(r"\s+", " ", str(query or "").strip())
+    if not clean:
+        return ""
+    clean = clean.strip("`\"'“”‘’")
+    if len(clean) < 3 or _model_api_query_has_sensitive_data(clean):
+        return ""
+    return clean[:220]
+
+
+def _model_api_extract_web_search_requests(parsed: Any) -> list[dict]:
+    if not MODEL_API_WEB_SEARCH_ENABLED:
+        return []
+
+    raw_requests: list[Any] = []
+    if isinstance(parsed, dict):
+        for key in ("tool_requests", "tool_calls", "tools"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                raw_requests.extend(value)
+        web_search = parsed.get("web_search")
+        if isinstance(web_search, list):
+            raw_requests.extend(web_search)
+        elif isinstance(web_search, (dict, str)):
+            raw_requests.append(web_search)
+        for key in ("search_query", "web_search_query", "query"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                raw_requests.append({"tool": "web_search", "query": value})
+
+    requests_out: list[dict] = []
+    seen: set[str] = set()
+    for raw in raw_requests:
+        tool_name = "web_search"
+        query = ""
+        reason = ""
+        if isinstance(raw, str):
+            query = raw
+        elif isinstance(raw, dict):
+            tool_name = str(raw.get("tool") or raw.get("name") or raw.get("type") or "web_search")
+            args_raw: Any = raw.get("arguments")
+            function = raw.get("function") if isinstance(raw.get("function"), dict) else {}
+            if function:
+                tool_name = str(function.get("name") or tool_name)
+                args_raw = function.get("arguments", args_raw)
+            if isinstance(args_raw, str):
+                try:
+                    loaded_args = json.loads(args_raw)
+                    args = loaded_args if isinstance(loaded_args, dict) else {}
+                except Exception:
+                    args = {}
+            else:
+                args = args_raw if isinstance(args_raw, dict) else {}
+            query = str(raw.get("query") or args.get("query") or args.get("q") or args.get("input") or "")
+            reason = str(raw.get("reason") or args.get("reason") or "")
+        else:
+            continue
+        if tool_name.lower().replace("-", "_") not in {"web_search", "search", "internet_search", "browser_search"}:
+            continue
+        clean_query = _model_api_sanitize_web_query(query)
+        if not clean_query:
+            continue
+        dedupe_key = clean_query.lower()
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        requests_out.append({
+            "tool": "web_search",
+            "query": clean_query,
+            "reason": reason[:240],
+            "source": "model_request",
+        })
+        if len(requests_out) >= MODEL_API_WEB_SEARCH_MAX_QUERIES:
+            break
+    return requests_out
+
+
+def _model_api_parse_turn_output(raw_reply: str) -> tuple[str, str, list[dict]]:
     raw = str(raw_reply or "").strip()
     if not raw:
-        return "", ""
+        return "", "", []
     try:
         parsed = _json_from_model_text(raw)
     except Exception:
-        return raw, ""
+        return raw, "", []
 
     def text_from(value) -> str:
         if isinstance(value, str):
@@ -8973,15 +9076,30 @@ def _model_api_parse_turn_reply(raw_reply: str) -> tuple[str, str]:
             if reply:
                 break
         thinking = ""
-        for key in ("thinking_summary", "reasoning_summary", "thought_summary", "visible_reasoning"):
+        for key in (
+            "context_summary",
+            "runtime_summary",
+            "action_summary",
+            "thinking_summary",
+            "reasoning_summary",
+            "thought_summary",
+            "visible_reasoning",
+        ):
             thinking = _sanitize_visible_thinking_summary(str(parsed.get(key) or ""))
+            if thinking and _model_api_is_generic_context_summary(thinking):
+                thinking = ""
             if thinking:
                 break
-        return reply or raw, thinking
+        return reply or "", thinking, _model_api_extract_web_search_requests(parsed)
     if isinstance(parsed, list):
         reply = text_from(parsed)
-        return reply or raw, ""
-    return raw, ""
+        return reply or raw, "", []
+    return raw, "", []
+
+
+def _model_api_parse_turn_reply(raw_reply: str) -> tuple[str, str]:
+    reply, thinking, _ = _model_api_parse_turn_output(raw_reply)
+    return reply, thinking
 
 
 def _model_api_fallback_thinking_summary(
@@ -8992,25 +9110,50 @@ def _model_api_fallback_thinking_summary(
 ) -> str:
     zh = bool(re.search(r"[\u4e00-\u9fff]", user_message or ""))
     parts: list[str] = []
-    memory_count = len(context_payload.get("context_memories") or [])
-    if memory_count:
+    context_ref_count = len(context_payload.get("context_refs") or [])
+    if context_ref_count:
         parts.append(
-            f"参考了 {memory_count} 条相关记忆。"
-            if zh else f"Checked {memory_count} relevant memories."
+            f"使用了你选中的 {context_ref_count} 条参考内容。"
+            if zh else f"Used {context_ref_count} user-selected context refs."
         )
-    if (context_payload.get("identity") or {}).get("agent_name"):
-        parts.append("对齐了当前 Identity 设定。" if zh else "Used the current identity card.")
     if context_payload.get("screen_context"):
         parts.append("结合了最近的屏幕上下文。" if zh else "Included recent screen context.")
+    web_search = context_payload.get("web_search") if isinstance(context_payload.get("web_search"), dict) else {}
+    result_count = int(web_search.get("result_count") or 0) if isinstance(web_search, dict) else 0
+    if result_count:
+        parts.append(
+            f"联网搜索了 {result_count} 条公开结果。"
+            if zh else f"Searched {result_count} public web results."
+        )
     if effects:
         action_count = len(effects)
         parts.append(
             f"执行了 {action_count} 个身份或记忆更新。"
             if zh else f"Applied {action_count} identity or memory updates."
         )
-    if not parts:
-        parts.append("整理了这轮消息后回复。" if zh else "Read this turn and composed the reply.")
     return _sanitize_visible_thinking_summary("\n".join(parts[:3]))
+
+
+def _model_api_is_generic_context_summary(text: str) -> bool:
+    lines = [
+        line.strip(" 。.").strip()
+        for line in str(text or "").splitlines()
+        if line.strip()
+    ]
+    if not lines:
+        return True
+    generic_patterns = [
+        r"^参考了\s*\d+\s*条相关记忆$",
+        r"^对齐了当前\s*Identity\s*设定$",
+        r"^整理了这轮消息后回复$",
+        r"^Checked\s+\d+\s+relevant memories$",
+        r"^Used the current identity card$",
+        r"^Read this turn and composed the reply$",
+    ]
+    return all(
+        any(re.search(pattern, line, re.IGNORECASE) for pattern in generic_patterns)
+        for line in lines
+    )
 
 
 def _model_api_capture_prompt(user_message: str, assistant_reply: str, context_payload: dict) -> list[dict]:
@@ -9868,6 +10011,196 @@ def _model_api_user_content(message: str, images: list[dict[str, str]]) -> Any:
     return parts
 
 
+def _model_api_explicit_web_search_request(message: str) -> list[dict]:
+    if not MODEL_API_WEB_SEARCH_ENABLED:
+        return []
+    text = str(message or "").strip()
+    if not text:
+        return []
+    lowered = text.lower()
+    if any(cue in lowered for cue in ("不要联网", "不用联网", "不要搜索", "不用搜索", "don't search", "do not search", "without web")):
+        return []
+    cues = (
+        "联网", "上网", "网上", "搜索", "搜一下", "搜一搜", "查一下", "查一查",
+        "查最新", "最新", "新闻", "latest", "news", "search the web",
+        "web search", "look up", "browse",
+    )
+    if not any(cue in lowered for cue in cues):
+        return []
+    query = _model_api_sanitize_web_query(text)
+    if not query:
+        return []
+    return [{
+        "tool": "web_search",
+        "query": query,
+        "reason": "explicit_user_request",
+        "source": "explicit_prefetch",
+    }]
+
+
+def _strip_html_text(value: str) -> str:
+    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", str(value or ""))
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _duckduckgo_result_url(raw_href: str) -> str:
+    href = html.unescape(str(raw_href or "")).strip()
+    if not href:
+        return ""
+    if href.startswith("//"):
+        href = "https:" + href
+    parsed = urlparse(href)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+        uddg = parse_qs(parsed.query).get("uddg") or []
+        if uddg:
+            return str(uddg[0])
+    return href
+
+
+def _model_api_web_search_duckduckgo(query: str, *, limit: int) -> list[dict]:
+    resp = httpx.get(
+        "https://duckduckgo.com/html/",
+        params={"q": query, "kl": "us-en"},
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; FeedlingIO/1.0; +https://feedling.app)",
+            "Accept": "text/html,application/xhtml+xml",
+        },
+        follow_redirects=True,
+        timeout=MODEL_API_WEB_SEARCH_TIMEOUT_SEC,
+    )
+    resp.raise_for_status()
+    body = resp.text
+    results: list[dict] = []
+    seen_urls: set[str] = set()
+    anchor_re = re.compile(
+        r'<a[^>]+class="[^"]*\bresult__a\b[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    snippet_re = re.compile(
+        r'class="[^"]*\bresult__snippet\b[^"]*"[^>]*>(.*?)</(?:a|div)>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    for match in anchor_re.finditer(body):
+        url = _duckduckgo_result_url(match.group(1))
+        title = _strip_html_text(match.group(2))
+        if not url or not title or url in seen_urls:
+            continue
+        window = body[match.end(): match.end() + 2600]
+        snippet_match = snippet_re.search(window)
+        snippet = _strip_html_text(snippet_match.group(1)) if snippet_match else ""
+        seen_urls.add(url)
+        results.append({
+            "title": title[:240],
+            "url": url[:600],
+            "snippet": snippet[:700],
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _run_model_api_web_searches(requests_in: list[dict]) -> dict:
+    clean_requests: list[dict] = []
+    seen: set[str] = set()
+    for item in requests_in[:MODEL_API_WEB_SEARCH_MAX_QUERIES]:
+        if not isinstance(item, dict):
+            continue
+        query = _model_api_sanitize_web_query(str(item.get("query") or ""))
+        if not query:
+            continue
+        key = query.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        clean_requests.append({
+            "tool": "web_search",
+            "query": query,
+            "reason": str(item.get("reason") or "")[:240],
+            "source": str(item.get("source") or "model_request")[:80],
+        })
+    if not clean_requests:
+        return {
+            "enabled": MODEL_API_WEB_SEARCH_ENABLED,
+            "status": "skipped",
+            "requests": [],
+            "results": [],
+            "result_count": 0,
+            "errors": [],
+        }
+
+    all_results: list[dict] = []
+    errors: list[dict] = []
+    for item in clean_requests:
+        query = item["query"]
+        try:
+            results = _model_api_web_search_duckduckgo(
+                query,
+                limit=MODEL_API_WEB_SEARCH_MAX_RESULTS,
+            )
+            all_results.append({
+                "query": query,
+                "status": "ok" if results else "empty",
+                "results": results,
+            })
+        except Exception as e:
+            error = f"{type(e).__name__}:{str(e)[:220]}"
+            errors.append({"query": query, "error": error})
+            all_results.append({
+                "query": query,
+                "status": "failed",
+                "results": [],
+                "error": error,
+            })
+    result_count = sum(len(item.get("results") or []) for item in all_results)
+    return {
+        "enabled": MODEL_API_WEB_SEARCH_ENABLED,
+        "status": "ok" if result_count else ("failed" if errors else "empty"),
+        "requests": clean_requests,
+        "results": all_results,
+        "result_count": result_count,
+        "errors": errors,
+    }
+
+
+def _model_api_web_search_results_message(web_search: dict) -> dict:
+    payload = {
+        "tool": "web_search",
+        "status": web_search.get("status", ""),
+        "result_count": web_search.get("result_count", 0),
+        "results": web_search.get("results", []),
+        "errors": web_search.get("errors", []),
+    }
+    return {
+        "role": "system",
+        "content": (
+            "Backend web_search tool results JSON:\n"
+            + json.dumps(payload, ensure_ascii=False)[:14000]
+            + "\nUse these public web snippets to answer the user. Do not expose raw tool JSON. "
+            "If results are weak or failed, say that plainly. Include source names or URLs when useful. "
+            "Return the normal Feedling chat turn JSON only: "
+            "{\"reply\":\"...\",\"context_summary\":\"...\"}."
+        ),
+    }
+
+
+def _model_api_web_search_trace(web_search: dict) -> dict:
+    if not web_search:
+        return {"status": "skipped", "requests": 0, "results": 0}
+    return {
+        "status": str(web_search.get("status") or ""),
+        "requests": len(web_search.get("requests") or []),
+        "results": int(web_search.get("result_count") or 0),
+        "queries": [
+            str(item.get("query") or "")[:160]
+            for item in (web_search.get("requests") or [])[:MODEL_API_WEB_SEARCH_MAX_QUERIES]
+            if isinstance(item, dict)
+        ],
+        "errors": web_search.get("errors") or [],
+    }
+
+
 @app.route("/v1/model_api/chat/send", methods=["POST"])
 def model_api_chat_send():
     store = require_user()
@@ -9939,6 +10272,12 @@ def model_api_chat_send():
             "content": "User-selected context refs JSON:\n" + json.dumps(context_refs, ensure_ascii=False)[:3000],
         })
     provider_messages.insert(2, _model_api_turn_contract_message())
+    web_search: dict = {}
+    prefetch_web_search_requests = _model_api_explicit_web_search_request(message_for_context)
+    if prefetch_web_search_requests:
+        web_search = _run_model_api_web_searches(prefetch_web_search_requests)
+        context_payload["web_search"] = _model_api_web_search_trace(web_search)
+        provider_messages.insert(3, _model_api_web_search_results_message(web_search))
     try:
         result = chat_completion(
             runtime,
@@ -9969,6 +10308,7 @@ def model_api_chat_send():
                 "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
                 "screen_context": bool(context_payload.get("screen_context")),
                 "context_refs": len(context_refs),
+                "web_search": _model_api_web_search_trace(web_search),
             },
             "error": f"provider_chat_failed:{str(e)[:220]}",
             "duration_ms": int((time.time() - trace_start) * 1000),
@@ -9982,7 +10322,74 @@ def model_api_chat_send():
         }), 502
 
     raw_reply = str(result.get("reply") or "").strip()
-    reply, thinking_summary = _model_api_parse_turn_reply(raw_reply)
+    reply, thinking_summary, requested_web_search = _model_api_parse_turn_output(raw_reply)
+    if requested_web_search and (not web_search or not reply):
+        if not web_search:
+            web_search = _run_model_api_web_searches(requested_web_search)
+            context_payload["web_search"] = _model_api_web_search_trace(web_search)
+        final_messages = list(provider_messages)
+        final_messages.append({"role": "assistant", "content": raw_reply[:4000]})
+        final_messages.append(_model_api_web_search_results_message(web_search))
+        final_messages.append({
+            "role": "user",
+            "content": (
+                "Use the backend web_search results above to answer the original user message. "
+                "Return the normal Feedling chat turn JSON only."
+            ),
+        })
+        try:
+            final_result = chat_completion(
+                runtime,
+                final_messages,
+                max_tokens=int(payload.get("max_tokens") or 2048),
+                temperature=float(payload.get("temperature") or 0.7),
+                timeout=90.0,
+            )
+            final_raw_reply = str(final_result.get("reply") or "").strip()
+            final_reply, final_thinking, _ = _model_api_parse_turn_output(final_raw_reply)
+            if final_reply:
+                reply = final_reply
+                thinking_summary = final_thinking or thinking_summary
+                result = {
+                    **final_result,
+                    "usage": {
+                        "initial": result.get("usage") or {},
+                        "final": final_result.get("usage") or {},
+                    },
+                }
+        except ProviderError as e:
+            if not reply:
+                trace = _append_model_api_action_trace(store, {
+                    "status": "failed",
+                    "provider": runtime.provider,
+                    "model": runtime.model,
+                    "user_message_id": user_row["id"],
+                    "planner": {
+                        "triggered": False,
+                        "method": "hosted_runtime_background_not_started",
+                        "error": "",
+                    },
+                    "effects": effects,
+                    "identity_actions": identity_action_results,
+                    "memory_actions": memory_action_results,
+                    "context": {
+                        "memories": len(context_payload.get("context_memories") or []),
+                        "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
+                        "screen_context": bool(context_payload.get("screen_context")),
+                        "context_refs": len(context_refs),
+                        "web_search": _model_api_web_search_trace(web_search),
+                    },
+                    "error": f"provider_chat_after_web_search_failed:{str(e)[:220]}",
+                    "duration_ms": int((time.time() - trace_start) * 1000),
+                })
+                return jsonify({
+                    "error": "provider_chat_after_web_search_failed",
+                    "detail": str(e),
+                    "status_code": e.status_code,
+                    "user_message_id": user_row["id"],
+                    "action_trace_id": trace.get("trace_id", ""),
+                    "tools": {"web_search": _model_api_web_search_trace(web_search)},
+                }), 502
     if not reply:
         trace = _append_model_api_action_trace(store, {
             "status": "failed",
@@ -9999,6 +10406,7 @@ def model_api_chat_send():
                 "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
                 "screen_context": bool(context_payload.get("screen_context")),
                 "context_refs": len(context_refs),
+                "web_search": _model_api_web_search_trace(web_search),
             },
             "error": "provider_empty_reply",
             "duration_ms": int((time.time() - trace_start) * 1000),
@@ -10095,6 +10503,7 @@ def model_api_chat_send():
             "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
             "screen_context": bool(context_payload.get("screen_context")),
             "context_refs": len(context_refs),
+            "web_search": _model_api_web_search_trace(web_search),
         },
         "usage": result.get("usage") or {},
         "duration_ms": int((time.time() - trace_start) * 1000),
@@ -10109,6 +10518,9 @@ def model_api_chat_send():
         "provider": runtime.provider,
         "model": runtime.model,
         "usage": result.get("usage") or {},
+        "tools": {
+            "web_search": _model_api_web_search_trace(web_search),
+        },
         "effects": effects,
         "identity_actions": identity_action_results,
         "memory_actions": memory_action_results,
@@ -10142,6 +10554,7 @@ def model_api_chat_send():
             "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
             "screen_context": bool(context_payload.get("screen_context")),
             "context_refs": len(context_refs),
+            "web_search": _model_api_web_search_trace(web_search),
         },
     })
 

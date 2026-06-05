@@ -208,6 +208,106 @@ def test_model_api_runtime_status_tracks_hosted_runtime_and_action_trace(client,
     assert appmod.db.get_blob(user_id, "model_api_runtime")["last_action_trace_id"] == trace_id
 
 
+def test_model_api_chat_send_runs_backend_web_search_tool(client, monkeypatch):
+    _, api_key = _register(client)
+    provider_calls: list[list[dict]] = []
+    search_requests: list[dict] = []
+
+    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
+    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(
+        appmod,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose: b"sk-test",
+    )
+    monkeypatch.setattr(
+        appmod,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"messages": [], "context_memories": []}, "")
+        if path == "/v1/chat/history"
+        else ({"identity": {}}, ""),
+    )
+
+    def fake_web_search(requests):
+        search_requests.extend(requests)
+        return {
+            "enabled": True,
+            "status": "ok",
+            "requests": requests,
+            "result_count": 1,
+            "errors": [],
+            "results": [
+                {
+                    "query": requests[0]["query"],
+                    "status": "ok",
+                    "results": [
+                        {
+                            "title": "OpenAI product update",
+                            "url": "https://example.com/openai-update",
+                            "snippet": "A current public result.",
+                        }
+                    ],
+                }
+            ],
+        }
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        provider_calls.append(messages)
+        if len(provider_calls) == 1:
+            return {
+                "reply": appmod.json.dumps({
+                    "reply": "",
+                    "tool_requests": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": appmod.json.dumps({
+                                    "query": "OpenAI latest product update",
+                                    "reason": "needs current public information",
+                                }),
+                            },
+                        }
+                    ],
+                }),
+                "usage": {"total_tokens": 3},
+            }
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        assert "Backend web_search tool results JSON" in joined
+        assert "OpenAI product update" in joined
+        return {
+            "reply": appmod.json.dumps({
+                "reply": "The current public result says there was an OpenAI product update.",
+                "context_summary": "Searched the web for OpenAI latest product update.",
+            }),
+            "usage": {"total_tokens": 8},
+        }
+
+    monkeypatch.setattr(appmod, "_run_model_api_web_searches", fake_web_search)
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    chat = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "Tell me what OpenAI announced."},
+        headers=_headers(api_key),
+    )
+    assert chat.status_code == 200, chat.get_data(as_text=True)
+    body = chat.get_json()
+    assert body["reply"] == "The current public result says there was an OpenAI product update."
+    assert body["thinking_summary"] == "Searched the web for OpenAI latest product update."
+    assert body["tools"]["web_search"]["requests"] == 1
+    assert body["tools"]["web_search"]["results"] == 1
+    assert search_requests[0]["query"] == "OpenAI latest product update"
+    assert len(provider_calls) == 2
+
+
 def test_model_api_memory_repair_archives_noisy_cards_only_after_replacements(client, monkeypatch):
     user_id, api_key = _register(client)
     captured_plaintexts: list = []
@@ -580,7 +680,7 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     assert chat.status_code == 200, chat.get_data(as_text=True)
     chat_body = chat.get_json()
     assert chat_body["reply"] == "I can answer from the imported history now."
-    assert chat_body["thinking_summary"]
+    assert chat_body["thinking_summary"] == ""
     assert chat_body["context"]["identity_loaded"] is True
     assert chat_body["context"]["memories"] == 1
 
@@ -600,14 +700,22 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     )
     assert any(row["source"] == "model_api" and row["role"] == "user" for row in rows)
     assert any(row["source"] == "model_api" and row["role"] == "openclaw" for row in rows)
-    assert any(
-        row["source"] == "model_api"
-        and row["role"] == "openclaw"
-        and row.get("thinking_body_ct")
-        for row in rows
-    )
     assert all("body_ct" in row for row in rows if row["source"] == "model_api")
     assert "sk-test-secret" not in appmod.json.dumps(appmod.db.get_blob(user_id, "model_api") or {})
+
+
+def test_model_api_context_summary_parsing_drops_generic_runtime_fallback():
+    reply, summary = appmod._model_api_parse_turn_reply(
+        '{"reply":"好，我在。","thinking_summary":"参考了 8 条相关记忆。\\n对齐了当前 Identity 设定。"}'
+    )
+    assert reply == "好，我在。"
+    assert summary == ""
+
+    reply, summary = appmod._model_api_parse_turn_reply(
+        '{"reply":"我先不删。","context_summary":"准备删除 Memory：烧卖和蒸饺设定，等待用户确认。"}'
+    )
+    assert reply == "我先不删。"
+    assert summary == "准备删除 Memory：烧卖和蒸饺设定，等待用户确认。"
 
 
 def test_history_import_reuses_inflight_client_job(client, monkeypatch):
