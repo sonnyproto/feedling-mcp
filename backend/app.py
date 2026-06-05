@@ -8921,9 +8921,9 @@ def _model_api_turn_contract_message() -> dict:
             "include it only when there is a concrete user-visible context source, screen "
             "context, pending confirmation, or durable state action worth surfacing. "
             "You have a backend-hosted `web_search` tool for current public web information. "
-            "When the user asks to search, browse, look up current/latest/recent information, "
-            "or when answering correctly requires up-to-date public facts, return one or two "
-            "`tool_requests` for `web_search` instead of claiming you cannot browse. "
+            "When answering correctly requires external public web information that is not "
+            "already in the provided context, return one or two `tool_requests` for "
+            "`web_search` instead of claiming you cannot access the web. "
             "Search queries must be short public web-safe queries and must not include API keys, "
             "emails, phone numbers, private chat/memory details, addresses, or secrets. "
             "Do not present context_summary as private thinking, chain-of-thought, hidden "
@@ -10011,33 +10011,6 @@ def _model_api_user_content(message: str, images: list[dict[str, str]]) -> Any:
     return parts
 
 
-def _model_api_explicit_web_search_request(message: str) -> list[dict]:
-    if not MODEL_API_WEB_SEARCH_ENABLED:
-        return []
-    text = str(message or "").strip()
-    if not text:
-        return []
-    lowered = text.lower()
-    if any(cue in lowered for cue in ("不要联网", "不用联网", "不要搜索", "不用搜索", "don't search", "do not search", "without web")):
-        return []
-    cues = (
-        "联网", "上网", "网上", "搜索", "搜一下", "搜一搜", "查一下", "查一查",
-        "查最新", "最新", "新闻", "latest", "news", "search the web",
-        "web search", "look up", "browse",
-    )
-    if not any(cue in lowered for cue in cues):
-        return []
-    query = _model_api_sanitize_web_query(text)
-    if not query:
-        return []
-    return [{
-        "tool": "web_search",
-        "query": query,
-        "reason": "explicit_user_request",
-        "source": "explicit_prefetch",
-    }]
-
-
 def _strip_html_text(value: str) -> str:
     text = re.sub(r"(?is)<(script|style).*?</\1>", " ", str(value or ""))
     text = re.sub(r"(?s)<[^>]+>", " ", text)
@@ -10273,11 +10246,6 @@ def model_api_chat_send():
         })
     provider_messages.insert(2, _model_api_turn_contract_message())
     web_search: dict = {}
-    prefetch_web_search_requests = _model_api_explicit_web_search_request(message_for_context)
-    if prefetch_web_search_requests:
-        web_search = _run_model_api_web_searches(prefetch_web_search_requests)
-        context_payload["web_search"] = _model_api_web_search_trace(web_search)
-        provider_messages.insert(3, _model_api_web_search_results_message(web_search))
     try:
         result = chat_completion(
             runtime,

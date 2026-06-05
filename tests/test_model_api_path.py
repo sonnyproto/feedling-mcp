@@ -263,7 +263,7 @@ def test_model_api_chat_send_runs_backend_web_search_tool(client, monkeypatch):
                             "function": {
                                 "name": "web_search",
                                 "arguments": appmod.json.dumps({
-                                    "query": "OpenAI latest product update",
+                                    "query": "OpenAI product update",
                                     "reason": "needs current public information",
                                 }),
                             },
@@ -276,12 +276,12 @@ def test_model_api_chat_send_runs_backend_web_search_tool(client, monkeypatch):
         assert "Backend web_search tool results JSON" in joined
         assert "OpenAI product update" in joined
         return {
-            "reply": appmod.json.dumps({
-                "reply": "The current public result says there was an OpenAI product update.",
-                "context_summary": "Searched the web for OpenAI latest product update.",
-            }),
-            "usage": {"total_tokens": 8},
-        }
+                "reply": appmod.json.dumps({
+                    "reply": "The current public result says there was an OpenAI product update.",
+                    "context_summary": "Searched the web for OpenAI product update.",
+                }),
+                "usage": {"total_tokens": 8},
+            }
 
     monkeypatch.setattr(appmod, "_run_model_api_web_searches", fake_web_search)
     monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
@@ -301,10 +301,10 @@ def test_model_api_chat_send_runs_backend_web_search_tool(client, monkeypatch):
     assert chat.status_code == 200, chat.get_data(as_text=True)
     body = chat.get_json()
     assert body["reply"] == "The current public result says there was an OpenAI product update."
-    assert body["thinking_summary"] == "Searched the web for OpenAI latest product update."
+    assert body["thinking_summary"] == "Searched the web for OpenAI product update."
     assert body["tools"]["web_search"]["requests"] == 1
     assert body["tools"]["web_search"]["results"] == 1
-    assert search_requests[0]["query"] == "OpenAI latest product update"
+    assert search_requests[0]["query"] == "OpenAI product update"
     assert len(provider_calls) == 2
 
 
