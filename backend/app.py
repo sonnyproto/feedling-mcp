@@ -37,6 +37,12 @@ from provider_client import (
     validate_config as validate_provider_config,
 )
 from context_memory_selection import memory_relevance_score
+from hosted_runtime import (
+    ACTION_RESPONSE_FORMAT as HOSTED_RUNTIME_ACTION_RESPONSE_FORMAT,
+    build_action_planner_messages as build_hosted_runtime_action_planner_messages,
+    coerce_pending_decision as coerce_hosted_runtime_pending_decision,
+    coerce_planned_action as coerce_hosted_runtime_planned_action,
+)
 
 import db
 
@@ -4732,7 +4738,7 @@ def _public_model_api_config(config: dict | None) -> dict:
 
 
 MODEL_API_RUNTIME_BLOB = "model_api_runtime"
-MODEL_API_RUNTIME_VERSION = 1
+MODEL_API_RUNTIME_VERSION = 2
 MODEL_API_RUNTIME_MODE = "hosted_resident"
 MODEL_API_ACTION_TRACE_STREAM = "model_api_action_traces"
 
@@ -8068,99 +8074,6 @@ def _model_api_context_messages(
     return messages, context_payload, screen_images
 
 
-def _model_api_name_action_from_message(message: str) -> dict | None:
-    text = (message or "").strip()
-    if not text:
-        return None
-    patterns = [
-        r"\bcall\s+yourself\s+[`'\"“”‘’]*([^,\n.!?。！？]+)",
-        r"\byour\s+name\s+(?:is|should be|should become|becomes)\s+[`'\"“”‘’]*([^,\n.!?。！？]+)",
-        r"(?:叫你|喊你|称呼你)\s*[`'\"“”‘’：:]*([^，,。.!?！？\n]+)",
-        r"你(?:就|以后|今后|从现在起)叫\s*[`'\"“”‘’：:]*([^，,。.!?！？\n]+)",
-        r"你的名字(?:改成|改为|叫)\s*[`'\"“”‘’：:]*([^，,。.!?！？\n]+)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if not match:
-            continue
-        name = match.group(1).strip()
-        name = re.split(r"\s+(?:btw|please|pls)\b", name, maxsplit=1, flags=re.IGNORECASE)[0]
-        name = name.strip(" `\"'“”‘’。，,.;；:：!！?？")
-        if not name or len(name) > 80:
-            continue
-        if any(ch in name for ch in "\n\r{}[]"):
-            continue
-        if name.lower() in _IDENTITY_RUNTIME_LABELS:
-            continue
-        return {
-            "type": "identity.profile_patch",
-            "patch": {"agent_name": name},
-            "reason": "User asked the agent to update its displayed name in chat.",
-            "source": "model_api_detector",
-        }
-    return None
-
-
-def _model_api_identity_dimension_action_from_message(
-    store: UserStore,
-    api_key: str | None,
-    message: str,
-) -> dict | None:
-    text = (message or "").strip()
-    if not text:
-        return None
-    direction = None
-    if re.search(r"(调高|提高|升高|增加|加|up|increase|raise)", text, flags=re.IGNORECASE):
-        direction = 1
-    elif re.search(r"(调低|降低|减少|减|down|decrease|lower)", text, flags=re.IGNORECASE):
-        direction = -1
-    if direction is None:
-        return None
-    plain, _ = _identity_plain_for_action(store, api_key)
-    dims = plain.get("dimensions") if isinstance(plain, dict) else []
-    if not isinstance(dims, list):
-        return None
-    lowered = text.lower()
-    matched_name = ""
-    for dim in dims:
-        if not isinstance(dim, dict):
-            continue
-        name = str(dim.get("name") or "").strip()
-        if name and name.lower() in lowered:
-            matched_name = name
-            break
-    if not matched_name:
-        return None
-    number_match = re.search(r"([+-]?\d{1,2})", text)
-    try:
-        raw_delta = abs(int(number_match.group(1))) if number_match else 3
-    except Exception:
-        raw_delta = 3
-    delta = max(1, min(raw_delta, 10)) * direction
-    return {
-        "type": "identity.dimension_nudge",
-        "dimension": matched_name,
-        "delta": delta,
-        "reason": "User asked to adjust this Identity dimension in chat.",
-        "source": "model_api_detector",
-    }
-
-
-def _model_api_identity_actions_from_message(
-    store: UserStore,
-    api_key: str | None,
-    message: str,
-) -> list[dict]:
-    actions: list[dict] = []
-    action = _model_api_name_action_from_message(message)
-    if action:
-        actions.append(action)
-    dim_action = _model_api_identity_dimension_action_from_message(store, api_key, message)
-    if dim_action:
-        actions.append(dim_action)
-    return actions
-
-
 def _context_refs_from_payload(payload: dict) -> list[dict]:
     refs = payload.get("context_refs") or payload.get("contextRefs") or []
     if not isinstance(refs, list):
@@ -8192,17 +8105,6 @@ MODEL_API_CONSOLIDATE_MIN_INTERVAL_SEC = max(
 _STATE_PENDING_BLOB = "model_api_state_pending"
 _model_api_recap_active_users: set[str] = set()
 _model_api_recap_active_lock = threading.Lock()
-_STATE_TRIGGER_RE = re.compile(
-    r"(记住|记一下|记得|忘掉|忘记|删掉|删除|移除|以后|今后|从现在起|"
-    r"不要再|别再|不准再|不许再|不要叫|别叫|叫我|喊我|称呼我|叫你|"
-    r"称呼你|你的名字|你不是|你是|设定|人设|口吻|语气|边界|不对|错了|"
-    r"你记错|写错|改成|改为|更新成|更新为|修改|"
-    r"remember|forget|delete|remove|call me|call yourself|your name|my name|"
-    r"do not|don't|never|wrong|incorrect|update|change|persona|boundary|identity|memory)",
-    re.IGNORECASE,
-)
-_STATE_CONFIRM_RE = re.compile(r"^\s*(确认|是|对|可以|就这条|没错|apply|confirm|yes|ok|okay)\s*[。.!！]?\s*$", re.I)
-_STATE_REJECT_RE = re.compile(r"^\s*(取消|不是|不对|算了|都不是|别改|reject|cancel|no|nope)\s*[。.!！]?\s*$", re.I)
 
 
 def _model_api_turn_count(store: UserStore) -> int:
@@ -8217,7 +8119,7 @@ def _model_api_turn_count(store: UserStore) -> int:
 
 
 def _state_lang_zh(text: str) -> bool:
-    return bool(re.search(r"[\u4e00-\u9fff]", text or ""))
+    return any("\u4e00" <= ch <= "\u9fff" for ch in (text or ""))
 
 
 def _state_pending_items(store: UserStore) -> list[dict]:
@@ -8287,12 +8189,6 @@ def _load_state_receipts(store: UserStore, limit: int = 30) -> list[dict]:
     return entries
 
 
-def _model_api_state_is_triggered(message: str, context_refs: list[dict]) -> bool:
-    if context_refs:
-        return True
-    return bool(_STATE_TRIGGER_RE.search(message or ""))
-
-
 def _state_memory_candidate_from_moment(moment: dict, inner: dict, score: float) -> dict:
     return {
         "id": str(moment.get("id") or ""),
@@ -8344,284 +8240,6 @@ def _model_api_state_memory_candidates(
     return candidates[:limit]
 
 
-def _model_api_state_planner_messages(
-    message: str,
-    identity: dict,
-    memory_candidates: list[dict],
-    context_refs: list[dict],
-) -> list[dict]:
-    payload = {
-        "today": date.today().isoformat(),
-        "user_message": message[:4000],
-        "identity": identity,
-        "memory_candidates": memory_candidates[:12],
-        "user_selected_context_refs": context_refs[:8],
-    }
-    return [
-        {
-            "role": "system",
-            "content": (
-                "You are Feedling's API State Planner. Convert the latest user message into backend state actions. "
-                "Return JSON only; do not answer the user. The user writes naturally, not commands. "
-                "Plan durable state changes only when the user explicitly or strongly implies a stable change, correction, preference, boundary, identity update, or memory deletion. "
-                "Supported action types: identity.patch, memory.create, memory.patch, memory.delete, memory.query. "
-                "identity.patch payload may include agent_name, user_preferred_name, agent_role, tone_style, language_preference, relationship_anchor, boundaries, do_not_say, stable_definitions, self_introduction, category, signature. "
-                "For memory.patch/delete, use a memory_candidates id when the target is clear. If several targets are plausible, lower confidence and include candidate ids in target.candidate_ids. "
-                "Never fabricate that an action is already applied; this planner only proposes actions. "
-                "Schema: {\"actions\":[{\"type\":\"identity.patch|memory.create|memory.patch|memory.delete|memory.query\","
-                "\"confidence\":0.0,\"target\":{\"memory_id\":\"optional\",\"candidate_ids\":[\"...\"]},"
-                "\"payload\":{},\"reason\":\"short reason\"}],\"why_empty\":\"optional\"}."
-            ),
-        },
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:16000]},
-    ]
-
-
-def _state_list_value(value) -> list[str]:
-    if isinstance(value, str):
-        parts = re.split(r"[;\n；]+", value)
-        return [_identity_action_text(part, 240) for part in parts if _identity_action_text(part, 240)]
-    if isinstance(value, list):
-        return [_identity_action_text(item, 240) for item in value[:12] if _identity_action_text(item, 240)]
-    return []
-
-
-def _coerce_planned_state_action(action: dict, memory_candidates: list[dict]) -> dict | None:
-    if not isinstance(action, dict):
-        return None
-    action_type = str(action.get("type") or action.get("action") or "").strip().lower()
-    confidence = action.get("confidence", 0.0)
-    try:
-        confidence = float(confidence)
-    except Exception:
-        confidence = 0.0
-    target = action.get("target") if isinstance(action.get("target"), dict) else {}
-    payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
-    reason = _memory_action_text(action.get("reason") or "Planned from API chat.", 500)
-    planned = {
-        "action_id": str(action.get("action_id") or f"sa_{uuid.uuid4().hex[:12]}"),
-        "planner_type": action_type,
-        "confidence": max(0.0, min(confidence, 1.0)),
-        "reason": reason,
-        "requires_confirmation": confidence < MODEL_API_STATE_DIRECT_CONFIDENCE,
-    }
-
-    if action_type in {"identity.patch", "identity.profile_patch"}:
-        patch = {}
-        raw_patch = payload.get("patch") if isinstance(payload.get("patch"), dict) else payload
-        for key in _IDENTITY_PROFILE_STRING_FIELDS:
-            if key in raw_patch:
-                patch[key] = _identity_action_text(raw_patch.get(key), 1200 if key in {"self_introduction", "relationship_anchor", "tone_style"} else 240)
-        for key in _IDENTITY_PROFILE_LIST_FIELDS:
-            if key in raw_patch:
-                values = _state_list_value(raw_patch.get(key))
-                if values:
-                    patch[key] = values
-        if not patch:
-            return None
-        planned["domain"] = "identity"
-        planned["executor_action"] = {
-            "type": "identity.profile_patch",
-            "patch": patch,
-            "reason": reason,
-            "source": "model_api_state_planner",
-        }
-        return planned
-
-    if action_type in {"memory.create", "memory.add", "memory.add_correction"}:
-        raw = payload.get("memory") if isinstance(payload.get("memory"), dict) else payload
-        title = _memory_action_text(raw.get("title"), 180)
-        description = str(raw.get("description") or raw.get("content") or raw.get("summary") or "").strip()[:2000]
-        if not title or not description:
-            return None
-        mem_type = str(raw.get("type") or raw.get("card_type") or "fact").strip().lower()
-        if mem_type not in {"fact", "event", "quote", "moment"}:
-            mem_type = "fact"
-        executor_type = "memory.add_correction" if action_type == "memory.add_correction" else "memory.add"
-        source = "model_api_correction" if executor_type == "memory.add_correction" else "model_api_state"
-        planned["domain"] = "memory"
-        planned["executor_action"] = {
-            "type": executor_type,
-            "memory": {
-                "type": mem_type,
-                "title": title,
-                "description": description,
-                "occurred_at": _memory_action_text(raw.get("occurred_at") or date.today().isoformat(), 80),
-                "source": _memory_action_text(raw.get("source") or source, 80),
-                "context": str(raw.get("context") or "").strip()[:1000],
-                "her_quote": str(raw.get("her_quote") or "").strip()[:1000],
-            },
-            "reason": reason,
-            "capture_mode": "correction" if executor_type == "memory.add_correction" else "state",
-        }
-        return planned
-
-    if action_type in {"memory.patch", "memory.content_patch", "memory.delete"}:
-        memory_id = str(
-            target.get("memory_id")
-            or target.get("id")
-            or payload.get("memory_id")
-            or payload.get("id")
-            or ""
-        ).strip()
-        candidate_ids = target.get("candidate_ids") if isinstance(target.get("candidate_ids"), list) else []
-        if not memory_id and candidate_ids:
-            memory_id = str(candidate_ids[0] or "").strip()
-            planned["requires_confirmation"] = True
-            planned["candidate_ids"] = [str(cid) for cid in candidate_ids[:3] if str(cid or "").strip()]
-        if not memory_id and memory_candidates:
-            best = memory_candidates[0]
-            if float(best.get("score") or 0) >= 0.28:
-                memory_id = str(best.get("id") or "")
-        if not memory_id:
-            if memory_candidates:
-                planned["candidate_ids"] = [str(c.get("id") or "") for c in memory_candidates[:3] if c.get("id")]
-            return None
-        planned["target"] = {"memory_id": memory_id}
-        if action_type == "memory.delete":
-            planned["domain"] = "memory"
-            planned["executor_action"] = {"type": "memory.delete", "memory_id": memory_id, "reason": reason}
-            return planned
-        patch = payload.get("patch") if isinstance(payload.get("patch"), dict) else payload
-        clean_patch = {}
-        for key, max_len in (
-            ("title", 180),
-            ("description", 2000),
-            ("her_quote", 1000),
-            ("context", 1000),
-            ("type", 80),
-            ("occurred_at", 80),
-        ):
-            if key in patch:
-                clean_patch[key] = str(patch.get(key) or "").strip()[:max_len]
-        if not clean_patch:
-            description = str(payload.get("description") or payload.get("content") or payload.get("summary") or "").strip()[:2000]
-            if description:
-                clean_patch["description"] = description
-        if not clean_patch:
-            return None
-        planned["domain"] = "memory"
-        planned["executor_action"] = {
-            "type": "memory.content_patch",
-            "memory_id": memory_id,
-            "patch": clean_patch,
-            "reason": reason,
-        }
-        return planned
-
-    return None
-
-
-def _model_api_user_preferred_name_action(message: str) -> dict | None:
-    text = (message or "").strip()
-    patterns = [
-        r"(?:以后|今后|从现在起)?\s*(?:叫我|喊我|称呼我)\s*[`'\"“”‘’：:为叫成]*([^，,。.!?！？\n]+)",
-        r"\bcall me\s+[`'\"“”‘’]*([^,\n.!?。！？]+)",
-        r"\bmy name is\s+[`'\"“”‘’]*([^,\n.!?。！？]+)",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text, flags=re.IGNORECASE)
-        if not m:
-            continue
-        name = str(m.group(1) or "").strip(" `\"'“”‘’。，,.;；:：!！?？")
-        if not name or len(name) > 80:
-            continue
-        patch = {"user_preferred_name": name}
-        old = re.search(r"(?:不要|别|不准|不许)(?:再)?(?:叫我|喊我|称呼我)\s*([^，,。.!?！？\n]+)", text)
-        if old:
-            old_name = str(old.group(1) or "").strip(" `\"'“”‘’。，,.;；:：!！?？")
-            if old_name:
-                patch["do_not_say"] = [old_name]
-        return {
-            "type": "identity.patch",
-            "confidence": 0.96,
-            "payload": patch,
-            "reason": "User updated how they want to be addressed.",
-        }
-    return None
-
-
-def _model_api_agent_role_action(message: str) -> dict | None:
-    text = (message or "").strip()
-    m = re.search(
-        r"(?:你|你以后|你今后).{0,12}(?:不是|不再是)\s*([^，,。.!?！？\n]{1,40}).{0,12}(?:是|而是|应该是|改成|改为)\s*([^，,。.!?！？\n]{1,80})",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if not m:
-        return None
-    old_role = str(m.group(1) or "").strip(" `\"'“”‘’。，,.;；:：!！?？")
-    new_role = str(m.group(2) or "").strip(" `\"'“”‘’。，,.;；:：!！?？")
-    if not new_role:
-        return None
-    patch = {
-        "agent_role": new_role,
-        "stable_definitions": [f"TA is {new_role}."],
-    }
-    if old_role:
-        patch["do_not_say"] = [old_role]
-    if len(new_role) <= 40 and not any(x in new_role.lower() for x in ("不是", "不要", "don't")):
-        patch["agent_name"] = new_role
-    return {
-        "type": "identity.patch",
-        "confidence": 0.92,
-        "payload": patch,
-        "reason": "User corrected the agent identity/role.",
-    }
-
-
-def _model_api_fallback_state_actions(message: str, context_refs: list[dict]) -> list[dict]:
-    raw_actions: list[dict] = []
-    preferred_name = _model_api_user_preferred_name_action(message)
-    if preferred_name:
-        raw_actions.append(preferred_name)
-    role_action = _model_api_agent_role_action(message)
-    if role_action:
-        raw_actions.append(role_action)
-    identity_action = _model_api_name_action_from_message(message)
-    if identity_action:
-        raw_actions.append({
-            "type": "identity.patch",
-            "confidence": 0.96,
-            "payload": identity_action.get("patch") or identity_action,
-            "reason": identity_action.get("reason") or "Detected identity update.",
-        })
-    for mem_action in _model_api_memory_actions_from_message(message, context_refs):
-        raw_actions.append({
-            "type": (
-                "memory.delete" if mem_action.get("type") == "memory.delete"
-                else "memory.add_correction" if mem_action.get("type") == "memory.add_correction"
-                else "memory.patch" if mem_action.get("type") == "memory.content_patch"
-                else "memory.create"
-            ),
-            "confidence": 0.93 if context_refs or mem_action.get("type") == "memory.add_correction" else 0.88,
-            "target": {"memory_id": mem_action.get("memory_id") or mem_action.get("id") or ""},
-            "payload": mem_action.get("patch") or mem_action.get("memory") or {},
-            "reason": mem_action.get("reason") or "Detected memory update.",
-        })
-    return raw_actions
-
-
-def _model_api_pending_followup_actions(store: UserStore, message: str) -> tuple[list[dict], list[str], str]:
-    pending = _state_pending_items(store)
-    if not pending:
-        return [], [], ""
-    if _STATE_REJECT_RE.search(message or ""):
-        ids = {str(item.get("id") or "") for item in pending}
-        _state_clear_pending(store, ids)
-        return [], list(ids), "rejected"
-    if not _STATE_CONFIRM_RE.search(message or ""):
-        return [], [], ""
-    item = pending[0]
-    pending_id = str(item.get("id") or "")
-    planned = item.get("planned_action") if isinstance(item.get("planned_action"), dict) else {}
-    planned = dict(planned)
-    planned["requires_confirmation"] = False
-    planned["confirmed_pending_id"] = pending_id
-    _state_clear_pending(store, {pending_id})
-    return [planned], [pending_id], "confirmed"
-
-
 def _model_api_plan_state_actions(
     store: UserStore,
     api_key: str | None,
@@ -8630,46 +8248,73 @@ def _model_api_plan_state_actions(
     context_refs: list[dict],
     identity: dict,
 ) -> dict:
-    confirmed, pending_ids, pending_decision = _model_api_pending_followup_actions(store, message)
-    if confirmed or pending_decision:
-        return {
-            "triggered": True,
-            "method": f"pending_{pending_decision}",
-            "actions": confirmed,
-            "memory_candidates": [],
-            "pending_ids": pending_ids,
-            "error": "",
-        }
-    if not _model_api_state_is_triggered(message, context_refs):
-        return {"triggered": False, "method": "none", "actions": [], "memory_candidates": [], "error": ""}
-
+    pending_items = _state_pending_items(store)
     memory_candidates = _model_api_state_memory_candidates(store, api_key, message, context_refs)
     raw_actions: list[dict] = []
     planner_error = ""
-    if os.environ.get("FEEDLING_MODEL_API_STATE_PLANNER_LLM", "1").strip().lower() not in {"0", "false", "off", "no"}:
-        try:
-            result = chat_completion(
-                runtime,
-                _model_api_state_planner_messages(message, identity, memory_candidates, context_refs),
-                max_tokens=900,
-                temperature=0.0,
-                timeout=35.0,
-            )
-            parsed = _json_from_model_text(str(result.get("reply") or ""))
-            if isinstance(parsed, dict) and isinstance(parsed.get("actions"), list):
-                raw_actions = [a for a in parsed.get("actions") if isinstance(a, dict)]
-        except Exception as e:
-            planner_error = f"{type(e).__name__}:{str(e)[:240]}"
+    parsed: dict = {}
+    try:
+        result = chat_completion(
+            runtime,
+            build_hosted_runtime_action_planner_messages(
+                user_message=message,
+                identity=identity,
+                memory_candidates=memory_candidates,
+                context_refs=context_refs,
+                pending_items=pending_items,
+            ),
+            max_tokens=900,
+            temperature=0.0,
+            timeout=35.0,
+            response_format=HOSTED_RUNTIME_ACTION_RESPONSE_FORMAT,
+        )
+        parsed_json = _json_from_model_text(str(result.get("reply") or ""))
+        parsed = parsed_json if isinstance(parsed_json, dict) else {}
+        if isinstance(parsed.get("actions"), list):
+            raw_actions = [a for a in parsed.get("actions") if isinstance(a, dict)]
+    except Exception as e:
+        planner_error = f"{type(e).__name__}:{str(e)[:240]}"
 
-    # Heuristic fallback augments the planner so explicit state commands do
-    # not disappear when the provider returns prose or a weak JSON plan.
-    fallback_actions = _model_api_fallback_state_actions(message, context_refs)
-    raw_actions.extend(fallback_actions)
+    pending_decision, pending_ids = coerce_hosted_runtime_pending_decision(parsed, pending_items)
+    if pending_decision:
+        id_set = set(pending_ids)
+        if pending_decision == "reject":
+            _state_clear_pending(store, id_set)
+            return {
+                "triggered": True,
+                "method": "hosted_runtime_pending_reject",
+                "actions": [],
+                "memory_candidates": memory_candidates,
+                "pending_ids": pending_ids,
+                "error": planner_error,
+            }
+        confirmed: list[dict] = []
+        for item in pending_items:
+            if str(item.get("id") or "") not in id_set:
+                continue
+            planned = item.get("planned_action") if isinstance(item.get("planned_action"), dict) else {}
+            planned = dict(planned)
+            planned["requires_confirmation"] = False
+            planned["confirmed_pending_id"] = str(item.get("id") or "")
+            confirmed.append(planned)
+        _state_clear_pending(store, id_set)
+        return {
+            "triggered": True,
+            "method": "hosted_runtime_pending_confirm",
+            "actions": confirmed,
+            "memory_candidates": memory_candidates,
+            "pending_ids": pending_ids,
+            "error": planner_error,
+        }
 
     planned: list[dict] = []
     seen = set()
     for raw in raw_actions[:12]:
-        coerced = _coerce_planned_state_action(raw, memory_candidates)
+        coerced = coerce_hosted_runtime_planned_action(
+            raw,
+            memory_candidates,
+            direct_confidence=MODEL_API_STATE_DIRECT_CONFIDENCE,
+        )
         if not coerced:
             continue
         key = json.dumps({
@@ -8684,8 +8329,8 @@ def _model_api_plan_state_actions(
         planned.append(coerced)
 
     return {
-        "triggered": True,
-        "method": "llm+heuristic" if raw_actions else "empty",
+        "triggered": bool(planned or raw_actions or pending_items or planner_error),
+        "method": "hosted_runtime_planner" if raw_actions else "hosted_runtime_empty",
         "actions": planned[:8],
         "memory_candidates": memory_candidates,
         "error": planner_error,
@@ -8753,7 +8398,7 @@ def _execute_model_api_state_plan(
             "method": plan.get("method", ""),
             "triggered": bool(plan.get("triggered")),
             "error": plan.get("error", ""),
-            "pending_decision": plan.get("method", "") if str(plan.get("method", "")).startswith("pending_") else "",
+            "pending_decision": plan.get("method", "") if "pending_" in str(plan.get("method", "")) else "",
         },
         "results": {
             "identity": identity_results,
@@ -8804,94 +8449,6 @@ def _pending_state_reply(user_message: str, pending: list[dict]) -> str:
     if "patch" in action:
         return "I found a likely identity or memory update, but I need confirmation first. Reply `confirm` or `cancel`."
     return "This may update long-term state. Reply `confirm` to apply it, or `cancel`."
-
-
-def _extract_patch_text_from_message(message: str) -> str:
-    text = (message or "").strip()
-    patterns = [
-        r"(?:改成|改为|改一下为|更新成|更新为)\s*[「“\"']?(.+?)[」”\"']?$",
-        r"(?:should be|change it to|update it to)\s*[\"']?(.+?)[\"']?$",
-        r"不是.+?(?:是|而是)\s*[「“\"']?(.+?)[」”\"']?$",
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            return str(m.group(1) or "").strip()[:1200]
-    return ""
-
-
-def _model_api_correction_memory_action_from_message(message: str) -> dict | None:
-    text = (message or "").strip()
-    if len(text) < 6 or len(text) > 1200:
-        return None
-    lowered = text.lower()
-    patterns = [
-        r"(?:以后|今后|从现在起|接下来).{0,120}(?:不要|别|不准|不许|改成|改为|更新成|更新为|按|用|记住|记得)",
-        r"(?:不要再|别再|不准再|不许再|别老是|不要老是).{0,160}",
-        r"(?:不对|错了|写错|设定错了|不是).{0,160}(?:而是|应该|以后|今后|改成|改为|更新成|更新为)",
-        r"(?:记住|记一下|你要记得|帮我记住).{0,180}",
-        r"(?:设定|人设|prompt|口吻|语气|称呼|边界|boundary|persona).{0,160}(?:改|更新|不要|别|应该|以后|今后)",
-        r"(?:谁说).{0,120}(?:不能|不可以|不准|不许)",
-    ]
-    if not any(re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL) for pattern in patterns):
-        return None
-    # Pure questions such as "你记得吗？" should not become durable corrections.
-    if re.search(r"(吗|么|嘛|？|\?)\s*$", text) and not re.search(
-        r"(以后|今后|从现在起|不要|别|不对|错了|改成|改为|记住|记得|谁说)",
-        text,
-        flags=re.IGNORECASE,
-    ):
-        return None
-    zh = bool(re.search(r"[\u4e00-\u9fff]", text))
-    title = "用户纠正了长期设定" if zh else "User corrected a long-term setting"
-    if re.search(r"(不要再|别再|不准再|不许再|边界|boundary)", lowered):
-        title = "用户更新了对话边界" if zh else "User updated a conversation boundary"
-    elif re.search(r"(口吻|语气|说话|persona|人设|设定|prompt)", lowered):
-        title = "用户更新了 AI 设定" if zh else "User updated the AI setting"
-    return {
-        "type": "memory.add_correction",
-        "memory": {
-            "type": "fact",
-            "title": title,
-            "description": text[:1200],
-            "occurred_at": date.today().isoformat(),
-            "source": "model_api_correction",
-            "context": "Explicit user correction from hosted API chat.",
-        },
-        "reason": "User explicitly corrected a durable setting or boundary in chat.",
-        "capture_mode": "correction",
-    }
-
-
-def _model_api_memory_actions_from_message(message: str, context_refs: list[dict]) -> list[dict]:
-    memory_refs = [ref for ref in context_refs if ref.get("type") == "memory" and ref.get("id")]
-    if not memory_refs:
-        action = _model_api_correction_memory_action_from_message(message)
-        return [action] if action else []
-    memory_id = str(memory_refs[0]["id"])
-    text = (message or "").strip()
-    lowered = text.lower()
-    if re.search(r"(删除|删掉|移除|forget this|delete this|remove this)", lowered):
-        return [{
-            "type": "memory.delete",
-            "memory_id": memory_id,
-            "reason": "User asked to delete this Memory Garden card in chat.",
-        }]
-    if re.search(r"(不对|错了|写错|修改|改成|改为|更新|change|update|wrong|incorrect)", lowered):
-        replacement = _extract_patch_text_from_message(text)
-        patch: dict = {}
-        if replacement:
-            patch["description"] = replacement
-        else:
-            patch["description"] = text[:1200]
-        return [{
-            "type": "memory.content_patch",
-            "memory_id": memory_id,
-            "patch": patch,
-            "reason": "User corrected this Memory Garden card in chat.",
-        }]
-    action = _model_api_correction_memory_action_from_message(message)
-    return [action] if action else []
 
 
 def _identity_actions_default_reply(user_message: str, effects: list[dict]) -> str:
@@ -9724,17 +9281,6 @@ def _start_model_api_recap_job(
     return job
 
 
-def _model_api_capture_cue(message: str, reply: str) -> bool:
-    text = f"{message}\n{reply}"
-    return bool(re.search(
-        r"(记住|记得|以后|今后|从现在起|不要再|别再|不对|错了|重要|"
-        r"第一次|生日|项目|关系|边界|喜欢|讨厌|习惯|焦虑|生气|感动|"
-        r"remember|important|from now on|don't forget|boundary|prefer|hate|love)",
-        text,
-        flags=re.IGNORECASE,
-    ))
-
-
 def _model_api_maybe_run_memory_capture(
     store: UserStore,
     api_key: str | None,
@@ -9760,9 +9306,8 @@ def _model_api_maybe_run_memory_capture(
             "turn_count": turn_count,
             "actions_written": 0,
         }
-    cue = _model_api_capture_cue(user_message, assistant_reply)
     cadence = turn_count > 0 and turn_count % MODEL_API_CAPTURE_TURN_INTERVAL == 0
-    if not cue and not cadence:
+    if not cadence:
         return {
             "status": "skipped",
             "reason": f"cadence:{MODEL_API_CAPTURE_TURN_INTERVAL}",

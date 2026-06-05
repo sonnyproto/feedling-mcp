@@ -180,12 +180,24 @@ def test_model_api_chat_executes_detected_identity_rename(client, monkeypatch):
             return {"messages": [], "context_memories": []}, ""
         return {}, ""
 
+    def fake_chat_completion(cfg, messages, **kwargs):
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        if "Feedling Hosted Runtime's state action planner" in joined:
+            return {
+                "reply": json.dumps({
+                    "actions": [{
+                        "type": "identity.patch",
+                        "confidence": 0.96,
+                        "payload": {"agent_name": "小秘"},
+                        "reason": "User asked the agent to rename itself.",
+                    }]
+                }),
+                "usage": {"total_tokens": 3},
+            }
+        return {"reply": "改好了，我现在叫小秘。", "usage": {"total_tokens": 9}}
+
     monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(
-        appmod,
-        "chat_completion",
-        lambda cfg, messages, **kwargs: {"reply": "改好了，我现在叫小秘。", "usage": {"total_tokens": 9}},
-    )
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -206,6 +218,66 @@ def test_model_api_chat_executes_detected_identity_rename(client, monkeypatch):
     assert body["effects"][0]["action"] == "identity.profile_patch"
     assert body["identity_actions"][0]["changed_fields"] == ["agent_name"]
     assert any(isinstance(item, dict) and item.get("agent_name") == "小秘" for item in captured_plaintexts)
+
+
+def test_model_api_chat_runtime_nudges_identity_dimension(client, monkeypatch):
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    captured_plaintexts: list = []
+
+    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    def fake_enclave_context(path, key, params=None):
+        if path == "/v1/identity/get":
+            return {"identity": _plain_identity()}, ""
+        if path == "/v1/chat/history":
+            return {"messages": [], "context_memories": []}, ""
+        return {}, ""
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        if "Feedling Hosted Runtime's state action planner" in joined:
+            return {
+                "reply": json.dumps({
+                    "actions": [{
+                        "type": "identity.dimension_nudge",
+                        "confidence": 0.94,
+                        "payload": {
+                            "dimension": "Context retention",
+                            "delta": 5,
+                        },
+                        "reason": "User asked to strengthen this identity dimension.",
+                    }]
+                }),
+                "usage": {},
+            }
+        return {"reply": "好，我会更重视上下文连续性。", "usage": {}}
+
+    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    res = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "把 Context retention 调高一点。"},
+        headers=_headers(api_key),
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["effects"][0]["action"] == "identity.dimension_nudge"
+    assert body["identity_actions"][0]["changed_fields"] == ["dimensions"]
+    saved_identity = next(item for item in captured_plaintexts if isinstance(item, dict) and item.get("dimensions"))
+    changed = next(dim for dim in saved_identity["dimensions"] if dim.get("name") == "Context retention")
+    assert changed["value"] == 93
 
 
 def test_memory_content_patch_reencrypts_existing_card(client, monkeypatch):
@@ -274,6 +346,19 @@ def test_model_api_chat_executes_memory_context_patch(client, monkeypatch):
     def fake_chat_completion(cfg, messages, **kwargs):
         calls["n"] += 1
         joined = "\n".join(str(m.get("content") or "") for m in messages)
+        if "Feedling Hosted Runtime's state action planner" in joined:
+            return {
+                "reply": json.dumps({
+                    "actions": [{
+                        "type": "memory.patch",
+                        "confidence": 0.96,
+                        "target": {"memory_id": "mom_1"},
+                        "payload": {"patch": {"description": "User moved to Tokyo in April."}},
+                        "reason": "User corrected the selected memory card.",
+                    }]
+                }),
+                "usage": {},
+            }
         if "Memory Capture worker" in joined:
             return {"reply": '{"memories":[]}', "usage": {}}
         return {"reply": "改好了，Memory Garden 已更新。", "usage": {}}
@@ -333,6 +418,24 @@ def test_model_api_chat_writes_general_correction_memory_and_uses_strict_context
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
+        if "Feedling Hosted Runtime's state action planner" in joined:
+            return {
+                "reply": json.dumps({
+                    "actions": [{
+                        "type": "memory.add_correction",
+                        "confidence": 0.95,
+                        "payload": {
+                            "memory": {
+                                "type": "fact",
+                                "title": "用户更新了 AI 设定",
+                                "description": "以后不要再使用烂梗王设定，语气改得温柔一点。",
+                            }
+                        },
+                        "reason": "User corrected a durable agent behavior preference.",
+                    }]
+                }),
+                "usage": {},
+            }
         if "Memory Capture worker" in joined:
             return {"reply": '{"memories":[]}', "usage": {}}
         return {"reply": '{"reply":"改好了，我以后不会再用这个设定。","thinking_summary":"写入了一条纠正记忆。"}', "usage": {}}
@@ -385,7 +488,7 @@ def test_model_api_chat_state_planner_patches_user_preferred_name(client, monkey
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "API State Planner" in joined:
+        if "Feedling Hosted Runtime's state action planner" in joined:
             return {
                 "reply": json.dumps({
                     "actions": [{
@@ -459,7 +562,19 @@ def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(clien
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "API State Planner" in joined:
+        if "Feedling Hosted Runtime's state action planner" in joined:
+            if "确认" in joined:
+                return {
+                    "reply": json.dumps({
+                        "pending_decision": {
+                            "decision": "confirm",
+                            "pending_ids": [],
+                            "reason": "User confirmed the pending delete action.",
+                        },
+                        "actions": [],
+                    }),
+                    "usage": {},
+                }
             return {
                 "reply": json.dumps({
                     "actions": [{
