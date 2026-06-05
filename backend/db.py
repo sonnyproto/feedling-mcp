@@ -659,6 +659,21 @@ def chat_delete(user_id: str, msg_id: str) -> bool:
         return False
 
 
+def chat_clear(user_id: str) -> int | None:
+    """Delete every chat row for one user. Returns deleted row count, or None
+    if the database operation failed."""
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM chat_messages WHERE user_id = %s",
+                (user_id,),
+            )
+        return cur.rowcount
+    except Exception as e:
+        log.error("[db] chat_clear(%s) failed: %s", user_id, e)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Memory moments (row-per-item)
 # ---------------------------------------------------------------------------

@@ -71,6 +71,7 @@ Optional:
 """
 
 import base64
+from dataclasses import dataclass, field
 import hashlib
 import inspect
 import json
@@ -114,6 +115,23 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 log = logging.getLogger("feedling.resident")
+
+
+@dataclass
+class AgentTurn:
+    """Canonical shape for one upstream agent turn.
+
+    Raw provider / CLI output may contain final messages, visible reasoning
+    summaries, tool/action intents, and runtime diagnostics in the same JSON
+    object. The resident must classify those buckets before it writes anything
+    to IO Chat; user-visible chat may only receive messages plus an optional
+    display-safe thinking summary.
+    """
+
+    messages: list[str] = field(default_factory=list)
+    thinking_summary: str = ""
+    actions: list[dict] = field(default_factory=list)
+    runtime_debug: dict = field(default_factory=dict)
 
 
 def _mask(val: str) -> str:
@@ -1070,6 +1088,42 @@ _JSON_REPLY_FIELDS = (
     "output",
 )
 
+_JSON_THINKING_FIELDS = (
+    "thinking_summary",
+    "reasoning_summary",
+    "thought_summary",
+    "visible_reasoning",
+    "thinkingSummary",
+    "reasoningSummary",
+)
+
+_JSON_RUNTIME_DEBUG_FIELDS = {
+    "cache_creation",
+    "cache_creation_input_tokens",
+    "cache_read_input_tokens",
+    "contextWindow",
+    "costUSD",
+    "duration_ms",
+    "ephemeral_1h_input_tokens",
+    "ephemeral_5m_input_tokens",
+    "fast_mode_state",
+    "inference_geo",
+    "iterations",
+    "latency_ms",
+    "maxOutputTokens",
+    "modelUsage",
+    "permission_denials",
+    "raw_id",
+    "service_tier",
+    "session_id",
+    "sessionId",
+    "speed",
+    "terminal_reason",
+    "usage",
+    "uuid",
+    "webSearchRequests",
+}
+
 _JSON_NON_FINAL_EVENTS = {
     "debug",
     "delta",
@@ -1146,6 +1200,167 @@ def _reply_from_json_obj(obj: Any) -> str:
                 return text
 
     return ""
+
+
+def _safe_json_loads(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _looks_like_json_text(text: str) -> bool:
+    stripped = (text or "").strip()
+    return bool(stripped) and stripped[0] in "[{"
+
+
+def _sanitize_thinking_summary(text: str) -> str:
+    """Keep only a short, display-safe reasoning summary.
+
+    This is intentionally stricter than reply sanitization. We never expose
+    raw chain-of-thought, system prompts, token/account metadata, or tool
+    transcript text in the chat UI.
+    """
+    if not isinstance(text, str):
+        return ""
+    text = text.replace("\r\n", "\n").strip()
+    if not text:
+        return ""
+    blocked = re.compile(
+        r"(system prompt|developer message|chain[-\s]*of[-\s]*thought|"
+        r"modelUsage|terminal_reason|permission_denials|cache_read|"
+        r"cache_creation|session_id|uuid|costUSD|input_tokens|output_tokens)",
+        re.IGNORECASE,
+    )
+    kept: list[str] = []
+    for raw_ln in text.splitlines():
+        ln = raw_ln.strip()
+        if not ln or blocked.search(ln):
+            continue
+        if _NOISE_LINE_RE.match(ln) or _REASONING_LINE_RE.match(ln):
+            continue
+        ln = re.sub(r"^[`#>*\-\s]+", "", ln).strip()
+        if ln:
+            kept.append(ln)
+        if len(kept) >= 4:
+            break
+    out = "\n".join(kept).strip()
+    return out[:700]
+
+
+def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
+    dst.actions.extend(src.actions)
+    dst.messages.extend(src.messages)
+    if not dst.thinking_summary and src.thinking_summary:
+        dst.thinking_summary = src.thinking_summary
+    dst.runtime_debug.update(src.runtime_debug)
+    return dst
+
+
+def _agent_turn_from_obj(obj: Any) -> AgentTurn:
+    turn = AgentTurn()
+
+    if isinstance(obj, str):
+        raw = obj.strip()
+        if not raw:
+            return turn
+        json_objects = _json_objects_from_cli_output(raw)
+        if json_objects:
+            for item in json_objects:
+                _merge_agent_turn(turn, _agent_turn_from_obj(item))
+            if turn.messages or turn.actions or turn.thinking_summary:
+                return turn
+        nested = _safe_json_loads(raw) if _looks_like_json_text(raw) else None
+        if isinstance(nested, (dict, list)):
+            return _agent_turn_from_obj(nested)
+        clean = _sanitize_reply_text(raw)
+        if clean:
+            turn.messages.append(clean)
+        return turn
+
+    if isinstance(obj, list):
+        for item in obj:
+            _merge_agent_turn(turn, _agent_turn_from_obj(item))
+        return turn
+
+    if not isinstance(obj, dict):
+        return turn
+
+    for key in _JSON_RUNTIME_DEBUG_FIELDS:
+        if key in obj:
+            value = obj.get(key)
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                turn.runtime_debug[key] = value
+            else:
+                turn.runtime_debug[key] = "<structured>"
+
+    raw_actions = obj.get("actions")
+    if isinstance(raw_actions, list):
+        turn.actions.extend([a for a in raw_actions if isinstance(a, dict)])
+
+    for key in _JSON_THINKING_FIELDS:
+        value = obj.get(key)
+        if isinstance(value, str) and value.strip() and not turn.thinking_summary:
+            turn.thinking_summary = _sanitize_thinking_summary(value)
+        elif isinstance(value, dict) and not turn.thinking_summary:
+            summary = value.get("summary") or value.get("content") or value.get("text")
+            if isinstance(summary, str):
+                turn.thinking_summary = _sanitize_thinking_summary(summary)
+
+    messages = obj.get("messages")
+    if isinstance(messages, list):
+        for item in messages:
+            if isinstance(item, dict):
+                role = str(item.get("role") or "").lower()
+                if role and role not in {"assistant", "agent", "openclaw", "model"}:
+                    continue
+            _merge_agent_turn(turn, _agent_turn_from_obj(item))
+
+    choices = obj.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            _merge_agent_turn(turn, _agent_turn_from_obj(choice))
+
+    for field_name in _JSON_REPLY_FIELDS:
+        value = obj.get(field_name)
+        if value is None:
+            continue
+        nested_turn = _agent_turn_from_obj(value)
+        _merge_agent_turn(turn, nested_turn)
+
+    # OpenAI-style choice objects usually nest the final text at
+    # choice.message.content. The generic reply-field loop above sees
+    # `message`, but this explicit path keeps role filtering intact when
+    # other metadata is present beside the message object.
+    message = obj.get("message")
+    if isinstance(message, dict):
+        role = str(message.get("role") or "").lower()
+        if not role or role in {"assistant", "agent", "openclaw", "model"}:
+            _merge_agent_turn(turn, _agent_turn_from_obj(message.get("content")))
+
+    # Drop accidental full-runtime JSON messages when no final-answer field was
+    # found. Returning an empty turn is better than sending token/account JSON
+    # to the user.
+    if not turn.messages and turn.runtime_debug:
+        return turn
+
+    # De-dupe while preserving order.
+    seen = set()
+    unique: list[str] = []
+    for message_text in turn.messages:
+        key = message_text.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(key)
+    turn.messages = unique
+    return turn
+
+
+def _agent_turn_from_raw(raw_reply: Any, max_items: int | None = None) -> AgentTurn:
+    turn = _agent_turn_from_obj(raw_reply)
+    turn.messages = _cap_agent_replies(turn.messages, max_items=max_items)
+    return turn
 
 
 def _multi_reply_json_from_obj(obj: Any) -> str:
@@ -1253,7 +1468,7 @@ def _remember_http_session(resp: httpx.Response) -> None:
         _save_agent_session_id(sid)
 
 
-def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = None) -> str:
+def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = None) -> Any:
     headers = _agent_http_headers()
     payload = {"message": message}
     if images:
@@ -1263,20 +1478,18 @@ def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = 
     _remember_http_session(resp)
     body = resp.json()
     if isinstance(body, dict):
-        if isinstance(body.get("messages"), list):
-            multi = _multi_reply_json_from_obj(body)
-            if multi:
-                return multi
-        for field in (AGENT_HTTP_FIELD, "response", "content", "text", "reply"):
-            if isinstance(body.get(field), str) and body[field].strip():
-                return body[field].strip()
+        turn = _agent_turn_from_raw(body)
+        if turn.actions or turn.thinking_summary or len(turn.messages) > 1:
+            return body
+        if turn.messages:
+            return turn.messages[0]
         raise ValueError(f"response field not found in: {list(body.keys())}")
     if isinstance(body, str):
         return body.strip()
     raise ValueError(f"unexpected response type: {type(body)}")
 
 
-def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = None) -> str:
+def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = None) -> Any:
     headers = _agent_http_headers()
     sid = _load_agent_session_id()
     if sid:
@@ -1305,10 +1518,15 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
     body = resp.json()
     if not isinstance(body, dict):
         raise ValueError(f"unexpected OpenAI response type: {type(body)}")
-    return _extract_openai_reply(body)
+    turn = _agent_turn_from_raw(body)
+    if not turn.messages:
+        raise ValueError("OpenAI-compatible response has no usable reply text")
+    if turn.actions or turn.thinking_summary or len(turn.messages) > 1:
+        return body
+    return turn.messages[0]
 
 
-def call_agent_http(message: str, images: list[dict[str, str]] | None = None) -> str:
+def call_agent_http(message: str, images: list[dict[str, str]] | None = None) -> Any:
     if not AGENT_HTTP_URL:
         raise ValueError("AGENT_HTTP_URL is not set for http mode")
     if AGENT_HTTP_PROTOCOL in {"openai", "hermes", "chat_completions", "chat-completions"}:
@@ -1633,7 +1851,7 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
     return _resolve_cli_executable(cmd)
 
 
-def call_agent_cli(message: str, image_paths: list[str] | None = None) -> str:
+def call_agent_cli(message: str, image_paths: list[str] | None = None) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
 
@@ -1650,6 +1868,9 @@ def call_agent_cli(message: str, image_paths: list[str] | None = None) -> str:
             f"cli agent exited {result.returncode}: {(result.stderr or '')[:300]}"
         )
     raw = result.stdout
+    turn = _agent_turn_from_raw(raw)
+    if turn.messages or turn.actions or turn.thinking_summary:
+        return raw
     text = _extract_text_from_cli_output(raw)
     if not text:
         raise ValueError(
@@ -1728,52 +1949,8 @@ def _normalize_agent_output(raw_reply: Any, max_items: int | None = None) -> tup
     agent-side logic decides whether to return one or many messages. The resident
     only enforces the product cap so one proactive moment cannot flood the user.
     """
-    actions: list[dict] = []
-    if isinstance(raw_reply, dict):
-        obj = raw_reply
-        raw_text = ""
-    elif isinstance(raw_reply, list):
-        obj = raw_reply
-        raw_text = ""
-    elif isinstance(raw_reply, str):
-        raw_text = raw_reply.strip()
-        if not raw_text:
-            return [], []
-        obj = _structured_reply_payload(raw_text)
-    else:
-        return [], []
-
-    items: list[Any] | None = None
-    if isinstance(obj, dict):
-        raw_actions = obj.get("actions")
-        if isinstance(raw_actions, list):
-            actions = [a for a in raw_actions if isinstance(a, dict)]
-        if isinstance(obj.get("messages"), list):
-            items = obj["messages"]
-        else:
-            text = _reply_from_json_obj(obj)
-            nested = _structured_reply_payload(text) if isinstance(text, str) else None
-            if isinstance(nested, (dict, list)):
-                nested_actions, nested_replies = _normalize_agent_output(
-                    nested,
-                    max_items=max_items,
-                )
-                return actions + nested_actions, nested_replies
-            if text:
-                items = [text]
-    elif isinstance(obj, list):
-        items = obj
-    if items is not None:
-        out: list[str] = []
-        for item in items:
-            if isinstance(item, str):
-                clean = _sanitize_reply_text(item)
-                if clean:
-                    out.append(clean)
-        return actions, _cap_agent_replies(out, max_items=max_items)
-
-    clean = _sanitize_reply_text(raw_text)
-    return [], ([clean] if clean else [])
+    turn = _agent_turn_from_raw(raw_reply, max_items=max_items)
+    return turn.actions, turn.messages
 
 
 def _normalize_agent_replies(raw_reply: str, max_items: int | None = None) -> list[str]:
@@ -1782,6 +1959,10 @@ def _normalize_agent_replies(raw_reply: str, max_items: int | None = None) -> li
 
 def _split_agent_result(result: Any, max_items: int | None = None) -> tuple[list[dict], list[str]]:
     return _normalize_agent_output(result, max_items=max_items)
+
+
+def _split_agent_turn(result: Any, max_items: int | None = None) -> AgentTurn:
+    return _agent_turn_from_raw(result, max_items=max_items)
 
 
 def call_agent(
@@ -1796,11 +1977,17 @@ def call_agent(
     else:
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
-    actions, replies = _normalize_agent_output(raw)
-    if actions:
-        return {"actions": actions, "messages": replies}
-    if replies:
-        return replies
+    turn = _agent_turn_from_raw(raw)
+    if turn.actions or turn.messages or turn.thinking_summary:
+        body: dict[str, Any] = {
+            "actions": turn.actions,
+            "messages": turn.messages,
+        }
+        if turn.thinking_summary:
+            body["thinking_summary"] = turn.thinking_summary
+        if turn.runtime_debug:
+            log.debug("agent runtime debug keys: %s", sorted(turn.runtime_debug.keys()))
+        return body
     if SEND_FALLBACK_ON_AGENT_ERROR:
         return [FALLBACK_REPLY]
     raise ValueError("agent produced no usable reply after sanitization")
@@ -2031,6 +2218,7 @@ def post_reply(
     proactive_job_id: str = "",
     suppress_push: bool = False,
     reply_to_message_id: str = "",
+    thinking_summary: str = "",
 ) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
 
@@ -2067,12 +2255,24 @@ def post_reply(
             enclave_pk_bytes=enc_pk,
             visibility=visibility,
         )
+        thinking_envelope = None
+        safe_thinking = _sanitize_thinking_summary(thinking_summary)
+        if safe_thinking:
+            thinking_envelope = _build_envelope(
+                plaintext=safe_thinking.encode("utf-8"),
+                owner_user_id=user_id,
+                user_pk_bytes=user_pk,
+                enclave_pk_bytes=enc_pk,
+                visibility=visibility,
+            )
         visible_body = "" if suppress_push else content[:240]
         body: dict[str, Any] = {
             "envelope": envelope,
             "source": source,
             "alert_body": visible_body,
         }
+        if thinking_envelope:
+            body["thinking_envelope"] = thinking_envelope
         if reply_to_message_id:
             body["reply_to_message_id"] = reply_to_message_id
         if gate_decision_id:
@@ -2106,6 +2306,7 @@ def post_reply(
             "gate_decision_id": gate_decision_id,
             "proactive_job_id": proactive_job_id,
             "reply_to_message_id": reply_to_message_id,
+            "thinking_summary": _sanitize_thinking_summary(thinking_summary),
         },
         headers=_HEADERS, timeout=15,
     )
@@ -2318,20 +2519,23 @@ def _process_proactive_jobs(jobs: list) -> float:
             update_proactive_job_status(job_id, "failed", f"agent_call_failed: {e}")
             continue
 
-        actions, replies = _split_agent_result(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
+        turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
+        actions, replies = turn.actions, turn.messages
         if actions:
             log.warning("ignoring %d identity action(s) from proactive job id=%s", len(actions), job_id)
 
         posted_any = False
         last_error = ""
-        for reply in replies:
+        for idx, reply in enumerate(replies):
             try:
-                result = post_reply(
-                    reply,
-                    source=PROACTIVE_JOB_SOURCE,
-                    gate_decision_id=str(job.get("gate_decision_id") or ""),
-                    proactive_job_id=job_id,
-                )
+                post_kwargs = {
+                    "source": PROACTIVE_JOB_SOURCE,
+                    "gate_decision_id": str(job.get("gate_decision_id") or ""),
+                    "proactive_job_id": job_id,
+                }
+                if idx == 0 and turn.thinking_summary:
+                    post_kwargs["thinking_summary"] = turn.thinking_summary
+                result = post_reply(reply, **post_kwargs)
                 if isinstance(result, dict) and result.get("error"):
                     raise RuntimeError(str(result)[:500])
                 posted_any = True
@@ -2472,7 +2676,8 @@ def _process_messages(messages: list) -> float:
                 latest = max(latest, ts)
                 continue
 
-        actions, replies = _split_agent_result(agent_result)
+        turn = _split_agent_turn(agent_result)
+        actions, replies = turn.actions, turn.messages
         if actions:
             try:
                 action_result = execute_agent_actions(actions)
@@ -2490,11 +2695,13 @@ def _process_messages(messages: list) -> float:
         reply_to_message_id = str(msg.get("id") or msg.get("message_id") or "").strip()
         posted_any = False
         terminal_response_error = False
-        for reply in replies:
+        for idx, reply in enumerate(replies):
             try:
                 post_kwargs = {}
                 if reply_to_message_id:
                     post_kwargs["reply_to_message_id"] = reply_to_message_id
+                if idx == 0 and turn.thinking_summary:
+                    post_kwargs["thinking_summary"] = turn.thinking_summary
                 result = post_reply(reply, **post_kwargs)
                 if isinstance(result, dict) and result.get("error"):
                     if result.get("error") == "bootstrap_incomplete":

@@ -329,6 +329,77 @@ def test_chat_response_marks_claimed_user_message_replied(backend):
     assert repoll.json()["messages"] == []
 
 
+def test_chat_history_clear_only_deletes_chat_rows(backend):
+    """Users can clear the visible transcript without resetting account,
+    Memory Garden, or Identity."""
+    user_id, api_key = _register(backend["base_url"])
+    _seed_passing_bootstrap(backend["base_url"], user_id, api_key)
+    ident = _init_identity(backend["base_url"], user_id, api_key)
+    assert ident.status_code == 201, ident.text
+
+    msg = requests.post(
+        f"{backend['base_url']}/v1/chat/message",
+        json={"envelope": _stub_envelope(user_id, "clear-me")},
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert msg.status_code == 200, msg.text
+
+    before_status = requests.get(
+        f"{backend['base_url']}/v1/bootstrap/status",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert before_status.status_code == 200, before_status.text
+    before = before_status.json()
+    assert before["identity_written"] is True
+    assert before["memories_count"] >= 2
+
+    missing_confirm = requests.delete(
+        f"{backend['base_url']}/v1/chat/history",
+        json={},
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert missing_confirm.status_code == 400
+
+    hist = requests.get(
+        f"{backend['base_url']}/v1/chat/history?limit=10",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert hist.status_code == 200, hist.text
+    assert hist.json()["total"] == 1
+
+    cleared = requests.delete(
+        f"{backend['base_url']}/v1/chat/history",
+        json={"confirm": "clear-chat-history"},
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["deleted"] == 1
+
+    after_hist = requests.get(
+        f"{backend['base_url']}/v1/chat/history?limit=10",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert after_hist.status_code == 200, after_hist.text
+    assert after_hist.json()["messages"] == []
+    assert after_hist.json()["total"] == 0
+
+    after_status = requests.get(
+        f"{backend['base_url']}/v1/bootstrap/status",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert after_status.status_code == 200, after_status.text
+    after = after_status.json()
+    assert after["identity_written"] is True
+    assert after["memories_count"] == before["memories_count"]
+
+
 def _establish_live_connection(base_url: str, user_id: str, api_key: str) -> dict:
     _record_consumer_poll(base_url, api_key)
 

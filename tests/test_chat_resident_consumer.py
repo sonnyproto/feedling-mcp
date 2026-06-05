@@ -1313,6 +1313,58 @@ def test_normalize_agent_replies_unwraps_claude_result_content_json():
     assert crc._normalize_agent_replies(raw) == ["Claude Code 内层 JSON 也应该只显示这句。"]
 
 
+def test_agent_turn_classifies_runtime_json_without_leaking_debug():
+    raw = json.dumps(
+        {
+            "type": "result",
+            "session_id": "sess_should_not_render",
+            "result": "这是用户应该看到的最终回复。",
+            "modelUsage": {
+                "claude-sonnet-4-6": {
+                    "inputTokens": 8,
+                    "outputTokens": 305,
+                    "costUSD": 0.16,
+                }
+            },
+            "terminal_reason": "completed",
+            "permission_denials": [],
+        },
+        ensure_ascii=False,
+    )
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["这是用户应该看到的最终回复。"]
+    assert "modelUsage" in turn.runtime_debug
+    assert "terminal_reason" in turn.runtime_debug
+    assert "modelUsage" not in turn.messages[0]
+    assert "permission_denials" not in turn.messages[0]
+
+
+def test_agent_turn_extracts_visible_thinking_summary_from_nested_result():
+    raw = json.dumps(
+        {
+            "type": "result",
+            "uuid": "43d846de-9d36-4943-a832-23e0650ef6e8",
+            "result": json.dumps(
+                {
+                    "reply": "我只显示最终回复。",
+                    "thinking_summary": "参考了最近对话。\n整理了可见上下文。",
+                    "modelUsage": {"debug": True},
+                },
+                ensure_ascii=False,
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["我只显示最终回复。"]
+    assert turn.thinking_summary == "参考了最近对话。\n整理了可见上下文。"
+    assert "uuid" in turn.runtime_debug
+
+
 def test_extract_cli_output_preserves_structured_multi_messages():
     raw = '{"messages":["第一条","第二条"]}'
 

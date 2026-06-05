@@ -700,6 +700,15 @@ class UserStore:
                 "app_presence_phase",
                 "app_presence_age_sec",
                 "model_api_kind",
+                "thinking_v",
+                "thinking_id",
+                "thinking_body_ct",
+                "thinking_nonce",
+                "thinking_K_user",
+                "thinking_K_enclave",
+                "thinking_enclave_pk_fpr",
+                "thinking_visibility",
+                "thinking_owner_user_id",
                 "reply_claimed_by",
                 "reply_claimed_at",
                 "reply_claim_expires_at",
@@ -4767,6 +4776,24 @@ def _build_shared_envelope_for_store(
         return None, f"envelope_build_failed:{type(e).__name__}:{str(e)[:160]}"
 
 
+def _chat_thinking_extra_from_envelope(envelope: dict | None) -> dict:
+    if not isinstance(envelope, dict):
+        return {}
+    out = {
+        "thinking_v": str(envelope.get("v", 1)),
+        "thinking_id": str(envelope.get("id") or ""),
+        "thinking_body_ct": str(envelope.get("body_ct") or ""),
+        "thinking_nonce": str(envelope.get("nonce") or ""),
+        "thinking_K_user": str(envelope.get("K_user") or ""),
+        "thinking_visibility": str(envelope.get("visibility") or "shared"),
+        "thinking_owner_user_id": str(envelope.get("owner_user_id") or ""),
+        "thinking_enclave_pk_fpr": str(envelope.get("enclave_pk_fpr") or ""),
+    }
+    if envelope.get("K_enclave"):
+        out["thinking_K_enclave"] = str(envelope.get("K_enclave") or "")
+    return {k: v for k, v in out.items() if str(v).strip()}
+
+
 def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpose: str) -> bytes:
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
@@ -7936,6 +7963,116 @@ def _identity_actions_default_reply(user_message: str, effects: list[dict]) -> s
     return "我看到了，但这次没有可写入的 Identity 更新。" if zh else "I saw that, but there was no identity update to write."
 
 
+def _model_api_turn_contract_message() -> dict:
+    return {
+        "role": "system",
+        "content": (
+            "Feedling chat turn contract: return a JSON object only, with shape "
+            "{\"reply\":\"final user-visible reply\","
+            "\"thinking_summary\":\"short display-safe process summary\"}. "
+            "`reply` is the only normal chat bubble text. `thinking_summary` is "
+            "shown behind a collapsed disclosure above the bubble, like a brief "
+            "visible thinking summary. Do not include private chain-of-thought, "
+            "system/developer prompts, tool transcripts, API metadata, token "
+            "usage, costs, session ids, permission logs, or raw JSON wrappers. "
+            "Keep thinking_summary to 1-3 short user-readable lines about what "
+            "context you considered or what action you performed."
+        ),
+    }
+
+
+def _sanitize_visible_thinking_summary(text: str) -> str:
+    raw = str(text or "").replace("\r\n", "\n").strip()
+    if not raw:
+        return ""
+    blocked = re.compile(
+        r"(system prompt|developer message|chain[-\s]*of[-\s]*thought|"
+        r"modelUsage|terminal_reason|permission_denials|cache_read|"
+        r"cache_creation|session_id|uuid|costUSD|input_tokens|output_tokens)",
+        re.IGNORECASE,
+    )
+    lines: list[str] = []
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line or blocked.search(line):
+            continue
+        line = re.sub(r"^[`#>*\-\s]+", "", line).strip()
+        if line:
+            lines.append(line[:220])
+        if len(lines) >= 4:
+            break
+    return "\n".join(lines).strip()[:700]
+
+
+def _model_api_parse_turn_reply(raw_reply: str) -> tuple[str, str]:
+    raw = str(raw_reply or "").strip()
+    if not raw:
+        return "", ""
+    try:
+        parsed = _json_from_model_text(raw)
+    except Exception:
+        return raw, ""
+
+    def text_from(value) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            for key in ("reply", "response", "content", "text", "result", "message", "answer"):
+                nested = text_from(value.get(key))
+                if nested:
+                    return nested
+        if isinstance(value, list):
+            parts = [text_from(item) for item in value]
+            return "\n".join(part for part in parts if part).strip()
+        return ""
+
+    if isinstance(parsed, dict):
+        reply = ""
+        for key in ("reply", "response", "content", "text", "result", "message", "answer"):
+            reply = text_from(parsed.get(key))
+            if reply:
+                break
+        thinking = ""
+        for key in ("thinking_summary", "reasoning_summary", "thought_summary", "visible_reasoning"):
+            thinking = _sanitize_visible_thinking_summary(str(parsed.get(key) or ""))
+            if thinking:
+                break
+        return reply or raw, thinking
+    if isinstance(parsed, list):
+        reply = text_from(parsed)
+        return reply or raw, ""
+    return raw, ""
+
+
+def _model_api_fallback_thinking_summary(
+    *,
+    user_message: str,
+    context_payload: dict,
+    effects: list[dict],
+) -> str:
+    zh = bool(re.search(r"[\u4e00-\u9fff]", user_message or ""))
+    parts: list[str] = []
+    memory_count = len(context_payload.get("context_memories") or [])
+    if memory_count:
+        parts.append(
+            f"参考了 {memory_count} 条相关记忆。"
+            if zh else f"Checked {memory_count} relevant memories."
+        )
+    if (context_payload.get("identity") or {}).get("agent_name"):
+        parts.append("对齐了当前 Identity 设定。" if zh else "Used the current identity card.")
+    if context_payload.get("screen_context"):
+        parts.append("结合了最近的屏幕上下文。" if zh else "Included recent screen context.")
+    if effects:
+        action_count = len(effects)
+        parts.append(
+            f"执行了 {action_count} 个身份或记忆更新。"
+            if zh else f"Applied {action_count} identity or memory updates."
+        )
+    if not parts:
+        parts.append("整理了这轮消息后回复。" if zh else "Read this turn and composed the reply.")
+    return _sanitize_visible_thinking_summary("\n".join(parts[:3]))
+
+
 def _model_api_capture_prompt(user_message: str, assistant_reply: str, context_payload: dict) -> list[dict]:
     memories = context_payload.get("context_memories") or []
     identity = context_payload.get("identity") or {}
@@ -8198,6 +8335,7 @@ def model_api_chat_send():
                 "Do not claim an identity or memory update unless the result status is ok."
             ),
         })
+    provider_messages.insert(2, _model_api_turn_contract_message())
     try:
         result = chat_completion(
             runtime,
@@ -8220,16 +8358,30 @@ def model_api_chat_send():
                 "user_message_id": user_row["id"],
             }), 502
 
-    reply = str(result.get("reply") or "").strip()
+    raw_reply = str(result.get("reply") or "").strip()
+    reply, thinking_summary = _model_api_parse_turn_reply(raw_reply)
     if not reply:
         if effects:
             reply = _identity_actions_default_reply(message, effects)
         else:
             return jsonify({"error": "provider_empty_reply", "user_message_id": user_row["id"]}), 502
+    if not thinking_summary:
+        thinking_summary = _model_api_fallback_thinking_summary(
+            user_message=message_for_context,
+            context_payload=context_payload,
+            effects=effects,
+        )
     assistant_env, env_err = _build_shared_envelope_for_store(store, reply.encode("utf-8"))
     if assistant_env is None:
         return jsonify({"error": "assistant_envelope_failed", "detail": env_err}), 409
-    assistant_row = store.append_chat("openclaw", "model_api", assistant_env)
+    assistant_extra: dict = {}
+    if thinking_summary:
+        thinking_env, thinking_err = _build_shared_envelope_for_store(store, thinking_summary.encode("utf-8"))
+        if thinking_env is not None:
+            assistant_extra.update(_chat_thinking_extra_from_envelope(thinking_env))
+        else:
+            print(f"[model_api_chat:{store.user_id}] thinking_envelope_failed detail={thinking_err}")
+    assistant_row = store.append_chat("openclaw", "model_api", assistant_env, extra=assistant_extra)
     store.notify_chat_waiters()
     delivery_fields = _deliver_ai_message_push_if_background(
         store,
@@ -8258,6 +8410,7 @@ def model_api_chat_send():
     return jsonify({
         "status": "ok",
         "reply": reply,
+        "thinking_summary": thinking_summary,
         "user_message": {"id": user_row["id"], "ts": user_row["ts"]},
         "assistant_message": {"id": assistant_row["id"], "ts": assistant_row["ts"]},
         "user_content_type": "image" if has_image else "text",
@@ -9539,6 +9692,35 @@ def chat_history():
     })
 
 
+@app.route("/v1/chat/history", methods=["DELETE"])
+def chat_history_clear():
+    """Clear only the caller's chat transcript.
+
+    This intentionally does not touch memory, identity, frames, API keys, or
+    onboarding route state. The destructive account reset endpoint remains the
+    only path that wipes the whole user record.
+    """
+    store = require_user()
+    payload = request.get_json(silent=True) or {}
+    confirm = (payload.get("confirm") or "").strip()
+    if confirm != "clear-chat-history":
+        return jsonify({
+            "error": "confirmation_required",
+            "detail": "DELETE body must include {\"confirm\": \"clear-chat-history\"}."
+        }), 400
+
+    deleted = db.chat_clear(store.user_id)
+    if deleted is None:
+        return jsonify({"error": "chat_clear_failed"}), 500
+
+    with store.chat_lock:
+        store.chat_messages = []
+
+    store.notify_chat_waiters()
+    print(f"[chat/clear:{store.user_id}] deleted={deleted}")
+    return jsonify({"cleared": True, "deleted": deleted})
+
+
 def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
     item = dict(m)
     # iOS ChatMessage.content is non-optional. v1 envelope messages are
@@ -9655,6 +9837,30 @@ def chat_response():
     content_type = payload.get("content_type", "text")
     if content_type not in ("text", "image"):
         return jsonify({"error": "content_type must be 'text' or 'image'"}), 400
+    thinking_envelope = payload.get("thinking_envelope")
+    thinking_extra: dict = {}
+    if thinking_envelope is not None:
+        if not isinstance(thinking_envelope, dict):
+            return jsonify({"error": "thinking_envelope must be an object"}), 400
+        missing = [f for f in required if not thinking_envelope.get(f)]
+        if missing:
+            return jsonify({"error": f"thinking_envelope missing fields: {missing}"}), 400
+        if thinking_envelope["visibility"] not in ("shared", "local_only"):
+            return jsonify({"error": "thinking_envelope.visibility must be 'shared' or 'local_only'"}), 400
+        if thinking_envelope["visibility"] == "shared" and not thinking_envelope.get("K_enclave"):
+            return jsonify({"error": "thinking_envelope with visibility=shared requires K_enclave"}), 400
+        thinking_extra = {
+            "thinking_v": str(thinking_envelope.get("v", 1)),
+            "thinking_id": str(thinking_envelope.get("id") or ""),
+            "thinking_body_ct": str(thinking_envelope["body_ct"]),
+            "thinking_nonce": str(thinking_envelope["nonce"]),
+            "thinking_K_user": str(thinking_envelope["K_user"]),
+            "thinking_visibility": str(thinking_envelope["visibility"]),
+            "thinking_owner_user_id": str(thinking_envelope["owner_user_id"]),
+            "thinking_enclave_pk_fpr": str(thinking_envelope.get("enclave_pk_fpr") or ""),
+        }
+        if thinking_envelope.get("K_enclave"):
+            thinking_extra["thinking_K_enclave"] = str(thinking_envelope["K_enclave"])
     source = str(payload.get("source") or "chat").strip() or "chat"
     if source not in {"chat", "live_activity", "heartbeat", PROACTIVE_JOB_SOURCE}:
         return jsonify({"error": "invalid source"}), 400
@@ -9663,6 +9869,7 @@ def chat_response():
     extra = {
         "gate_decision_id": str(payload.get("gate_decision_id") or ""),
         "proactive_job_id": str(payload.get("proactive_job_id") or ""),
+        **thinking_extra,
     }
     if source == PROACTIVE_JOB_SOURCE:
         preview = (alert_body or push_body).strip()

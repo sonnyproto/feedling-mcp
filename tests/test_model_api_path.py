@@ -335,6 +335,7 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     assert chat.status_code == 200, chat.get_data(as_text=True)
     chat_body = chat.get_json()
     assert chat_body["reply"] == "I can answer from the imported history now."
+    assert chat_body["thinking_summary"]
     assert chat_body["context"]["identity_loaded"] is True
     assert chat_body["context"]["memories"] == 1
 
@@ -354,6 +355,12 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     )
     assert any(row["source"] == "model_api" and row["role"] == "user" for row in rows)
     assert any(row["source"] == "model_api" and row["role"] == "openclaw" for row in rows)
+    assert any(
+        row["source"] == "model_api"
+        and row["role"] == "openclaw"
+        and row.get("thinking_body_ct")
+        for row in rows
+    )
     assert all("body_ct" in row for row in rows if row["source"] == "model_api")
     assert "sk-test-secret" not in appmod.json.dumps(appmod.db.get_blob(user_id, "model_api") or {})
 
