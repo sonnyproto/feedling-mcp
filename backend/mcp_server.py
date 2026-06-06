@@ -663,7 +663,11 @@ def screen_decrypt_frame(
     description=(
         "Post a message from the Agent into the Feedling iOS chat window. "
         "Optionally mirror the same text to Live Activity in the same backend call "
-        "to reduce chat/live divergence."
+        "to reduce chat/live divergence. If your runtime has provider-native "
+        "reasoning, a runtime trace, or a display-safe agent summary, pass it "
+        "as reasoning_text so IO can show it in the expandable area above the "
+        "chat bubble. Do not invent reasoning_text when the runtime did not "
+        "produce one."
     ),
 )
 def chat_post_message(
@@ -673,6 +677,11 @@ def chat_post_message(
     title: str = "",
     subtitle: str = "",
     data: dict | None = None,
+    reasoning_text: str = "",
+    reasoning_kind: str = "",
+    reasoning_source: str = "",
+    reasoning_model: str = "",
+    reasoning_native: bool = False,
     ctx: Context = None,
 ) -> dict:
     """Agent posts a reply as a v1 envelope.
@@ -695,6 +704,21 @@ def chat_post_message(
     )
 
     payload: dict = {"envelope": envelope}
+    safe_reasoning = str(reasoning_text or "").strip()
+    if safe_reasoning:
+        thinking_envelope = build_envelope(
+            plaintext=safe_reasoning.encode("utf-8"),
+            owner_user_id=user_id,
+            user_pk_bytes=user_pk,
+            enclave_pk_bytes=enclave_pk,
+            visibility="shared",
+        )
+        payload["thinking_envelope"] = thinking_envelope
+        payload["reasoning_kind"] = str(reasoning_kind or "agent_summary").strip()
+        payload["reasoning_source"] = str(reasoning_source or "mcp").strip()
+        if reasoning_model:
+            payload["reasoning_model"] = str(reasoning_model).strip()
+        payload["reasoning_native"] = bool(reasoning_native)
     # Plaintext for the APNs alert push. MCP has plaintext at this point
     # (we just sealed it), so we hand it directly to Flask — the server
     # never decrypts the envelope itself. Apple's APNs gateway sees this
@@ -711,7 +735,8 @@ def chat_post_message(
 
     print(
         f"[mcp] chat.post_message v1 envelope id={envelope['id']} "
-        f"push_live_activity={bool(push_live_activity)}"
+        f"push_live_activity={bool(push_live_activity)} "
+        f"reasoning={bool(safe_reasoning)}"
     )
     return _post("/v1/chat/response", payload, ctx=ctx)
 

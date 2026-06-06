@@ -130,6 +130,10 @@ class AgentTurn:
 
     messages: list[str] = field(default_factory=list)
     thinking_summary: str = ""
+    thinking_kind: str = ""
+    thinking_source: str = ""
+    thinking_model: str = ""
+    thinking_native: bool | None = None
     actions: list[dict] = field(default_factory=list)
     runtime_debug: dict = field(default_factory=dict)
 
@@ -1089,6 +1093,9 @@ _JSON_REPLY_FIELDS = (
 )
 
 _JSON_THINKING_FIELDS = (
+    "provider_reasoning",
+    "reasoning",
+    "runtime_trace",
     "thinking_summary",
     "reasoning_summary",
     "thought_summary",
@@ -1248,11 +1255,59 @@ def _sanitize_thinking_summary(text: str) -> str:
     return out[:700]
 
 
+_THINKING_KINDS = {
+    "provider_reasoning",
+    "provider_reasoning_summary",
+    "runtime_trace",
+    "agent_summary",
+    "context_summary",
+}
+
+
+def _sanitize_thinking_kind(value: Any) -> str:
+    kind = str(value or "").strip().lower()
+    return kind if kind in _THINKING_KINDS else ""
+
+
+def _sanitize_thinking_meta(value: Any, *, max_len: int = 96) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"[\r\n\t]+", " ", text)[:max_len].strip()
+
+
+def _boolish(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return None
+
+
+def _default_thinking_kind_for_key(key: str) -> str:
+    normalized = key.strip().lower()
+    if normalized in {"provider_reasoning", "reasoning"}:
+        return "provider_reasoning"
+    if normalized == "runtime_trace":
+        return "runtime_trace"
+    if "reasoning" in normalized or "thought" in normalized:
+        return "provider_reasoning_summary"
+    return "agent_summary"
+
+
 def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
     dst.actions.extend(src.actions)
     dst.messages.extend(src.messages)
     if not dst.thinking_summary and src.thinking_summary:
         dst.thinking_summary = src.thinking_summary
+        dst.thinking_kind = src.thinking_kind
+        dst.thinking_source = src.thinking_source
+        dst.thinking_model = src.thinking_model
+        dst.thinking_native = src.thinking_native
     dst.runtime_debug.update(src.runtime_debug)
     return dst
 
@@ -1298,14 +1353,45 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
     if isinstance(raw_actions, list):
         turn.actions.extend([a for a in raw_actions if isinstance(a, dict)])
 
+    explicit_kind = _sanitize_thinking_kind(obj.get("thinking_kind") or obj.get("reasoning_kind"))
+    explicit_source = _sanitize_thinking_meta(
+        obj.get("thinking_source") or obj.get("reasoning_source"),
+        max_len=80,
+    )
+    explicit_model = _sanitize_thinking_meta(
+        obj.get("thinking_model") or obj.get("reasoning_model") or obj.get("model"),
+        max_len=96,
+    )
+    explicit_native = _boolish(obj.get("thinking_native", obj.get("reasoning_native")))
+
     for key in _JSON_THINKING_FIELDS:
         value = obj.get(key)
         if isinstance(value, str) and value.strip() and not turn.thinking_summary:
             turn.thinking_summary = _sanitize_thinking_summary(value)
+            turn.thinking_kind = explicit_kind or _default_thinking_kind_for_key(key)
+            turn.thinking_source = explicit_source
+            turn.thinking_model = explicit_model
+            turn.thinking_native = explicit_native
         elif isinstance(value, dict) and not turn.thinking_summary:
             summary = value.get("summary") or value.get("content") or value.get("text")
             if isinstance(summary, str):
                 turn.thinking_summary = _sanitize_thinking_summary(summary)
+                turn.thinking_kind = (
+                    _sanitize_thinking_kind(value.get("kind"))
+                    or explicit_kind
+                    or _default_thinking_kind_for_key(key)
+                )
+                turn.thinking_source = (
+                    _sanitize_thinking_meta(value.get("source"), max_len=80)
+                    or explicit_source
+                )
+                turn.thinking_model = (
+                    _sanitize_thinking_meta(value.get("model"), max_len=96)
+                    or explicit_model
+                )
+                turn.thinking_native = _boolish(value.get("native"))
+                if turn.thinking_native is None:
+                    turn.thinking_native = explicit_native
 
     messages = obj.get("messages")
     if isinstance(messages, list):
@@ -2219,6 +2305,10 @@ def post_reply(
     suppress_push: bool = False,
     reply_to_message_id: str = "",
     thinking_summary: str = "",
+    thinking_kind: str = "",
+    thinking_source: str = "",
+    thinking_model: str = "",
+    thinking_native: bool | None = None,
 ) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
 
@@ -2273,6 +2363,17 @@ def post_reply(
         }
         if thinking_envelope:
             body["thinking_envelope"] = thinking_envelope
+            kind = _sanitize_thinking_kind(thinking_kind)
+            if kind:
+                body["thinking_kind"] = kind
+            source_label = _sanitize_thinking_meta(thinking_source, max_len=80)
+            if source_label:
+                body["thinking_source"] = source_label
+            model_label = _sanitize_thinking_meta(thinking_model, max_len=96)
+            if model_label:
+                body["thinking_model"] = model_label
+            if thinking_native is not None:
+                body["thinking_native"] = bool(thinking_native)
         if reply_to_message_id:
             body["reply_to_message_id"] = reply_to_message_id
         if gate_decision_id:
@@ -2307,6 +2408,10 @@ def post_reply(
             "proactive_job_id": proactive_job_id,
             "reply_to_message_id": reply_to_message_id,
             "thinking_summary": _sanitize_thinking_summary(thinking_summary),
+            "thinking_kind": _sanitize_thinking_kind(thinking_kind),
+            "thinking_source": _sanitize_thinking_meta(thinking_source, max_len=80),
+            "thinking_model": _sanitize_thinking_meta(thinking_model, max_len=96),
+            "thinking_native": thinking_native,
         },
         headers=_HEADERS, timeout=15,
     )
@@ -2535,6 +2640,10 @@ def _process_proactive_jobs(jobs: list) -> float:
                 }
                 if idx == 0 and turn.thinking_summary:
                     post_kwargs["thinking_summary"] = turn.thinking_summary
+                    post_kwargs["thinking_kind"] = turn.thinking_kind
+                    post_kwargs["thinking_source"] = turn.thinking_source
+                    post_kwargs["thinking_model"] = turn.thinking_model
+                    post_kwargs["thinking_native"] = turn.thinking_native
                 result = post_reply(reply, **post_kwargs)
                 if isinstance(result, dict) and result.get("error"):
                     raise RuntimeError(str(result)[:500])
@@ -2702,6 +2811,10 @@ def _process_messages(messages: list) -> float:
                     post_kwargs["reply_to_message_id"] = reply_to_message_id
                 if idx == 0 and turn.thinking_summary:
                     post_kwargs["thinking_summary"] = turn.thinking_summary
+                    post_kwargs["thinking_kind"] = turn.thinking_kind
+                    post_kwargs["thinking_source"] = turn.thinking_source
+                    post_kwargs["thinking_model"] = turn.thinking_model
+                    post_kwargs["thinking_native"] = turn.thinking_native
                 result = post_reply(reply, **post_kwargs)
                 if isinstance(result, dict) and result.get("error"):
                     if result.get("error") == "bootstrap_incomplete":

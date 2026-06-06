@@ -1365,6 +1365,29 @@ def test_agent_turn_extracts_visible_thinking_summary_from_nested_result():
     assert "uuid" in turn.runtime_debug
 
 
+def test_agent_turn_extracts_provider_reasoning_metadata_from_nested_result():
+    raw = json.dumps(
+        {
+            "reply": "最终回复。",
+            "provider_reasoning": "Provider returned this display-safe reasoning.",
+            "reasoning_kind": "provider_reasoning",
+            "reasoning_source": "anthropic",
+            "reasoning_model": "claude-sonnet-4.5",
+            "reasoning_native": True,
+        },
+        ensure_ascii=False,
+    )
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["最终回复。"]
+    assert turn.thinking_summary == "Provider returned this display-safe reasoning."
+    assert turn.thinking_kind == "provider_reasoning"
+    assert turn.thinking_source == "anthropic"
+    assert turn.thinking_model == "claude-sonnet-4.5"
+    assert turn.thinking_native is True
+
+
 def test_extract_cli_output_preserves_structured_multi_messages():
     raw = '{"messages":["第一条","第二条"]}'
 

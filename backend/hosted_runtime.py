@@ -18,6 +18,7 @@ TOOL_MEMORY_PATCH = "memory.patch"
 TOOL_MEMORY_DELETE = "memory.delete"
 TOOL_IDENTITY_PATCH = "identity.patch"
 TOOL_IDENTITY_DIMENSION_NUDGE = "identity.dimension_nudge"
+TOOL_IDENTITY_RELATIONSHIP_DAYS_SET = "identity.relationship_days_set"
 TOOL_CONFIRMATION_REQUEST = "confirmation.request"
 
 BACKGROUND_METHOD = "feedling_background_execution"
@@ -172,17 +173,18 @@ def build_background_execution_messages(
                 "Your job is to decide whether the latest user message should produce durable Feedling state actions. "
                 "Durable state means Identity or Memory Garden state that should remain true after this turn. "
                 "If the user only chats normally, asks a question, roleplays, jokes, or references a memory without asking to change it, return no actions. "
-                "If the user asks you to remember, forget, correct, rename, change address preferences, update persona/voice/boundaries, or fix a selected Memory Garden card, produce actions. "
+                "If the user asks you to remember, forget, correct, rename, correct relationship day count, change address preferences, update persona/voice/boundaries, or fix a selected Memory Garden card, produce actions. "
                 "For an explicit first-person durable preference or correction with no clear existing card target, prefer memory.create with high confidence instead of memory.patch. "
                 "Use confidence >= 0.9 for explicit, non-destructive state writes. Use lower confidence mainly for destructive actions or ambiguous patch/delete targets. "
                 "Use memory_candidates or user_selected_context_refs for memory.patch/delete targets. If the target is ambiguous, use low confidence. "
                 "If pending_actions_waiting_for_user_confirmation is non-empty and the latest message confirms or rejects one of them, set pending_decision instead of inventing a new action. "
                 "Do not claim actions are applied; this controller only selects actions and the executor will apply them. "
-                "Supported action types: identity.patch, identity.dimension_nudge, memory.create, memory.patch, memory.delete. "
+                "Supported action types: identity.patch, identity.dimension_nudge, identity.relationship_days_set, memory.create, memory.patch, memory.delete. "
                 "Use identity.dimension_nudge only when the user asks to raise or lower an existing identity dimension; payload must include dimension and delta. "
+                "Use identity.relationship_days_set when the user says the displayed days together / relationship day count is wrong; payload must include days_with_user as an integer. "
                 "JSON shape: {"
                 "\"pending_decision\":{\"decision\":\"none|confirm|reject\",\"pending_ids\":[\"...\"],\"reason\":\"optional\"},"
-                "\"actions\":[{\"type\":\"identity.patch|identity.dimension_nudge|memory.create|memory.patch|memory.delete\","
+                "\"actions\":[{\"type\":\"identity.patch|identity.dimension_nudge|identity.relationship_days_set|memory.create|memory.patch|memory.delete\","
                 "\"confidence\":0.0,\"target\":{\"memory_id\":\"optional\",\"candidate_ids\":[\"...\"]},"
                 "\"payload\":{},\"reason\":\"short reason\"}],"
                 "\"why_empty\":\"optional\"}."
@@ -212,6 +214,29 @@ def _candidate_ids(target: dict) -> list[str]:
     return [str(cid) for cid in ids[:3] if str(cid or "").strip()]
 
 
+def _coerce_days_with_user(*sources: dict) -> int | None:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in (
+            "days_with_user",
+            "relationship_days",
+            "days_together",
+            "together_days",
+            "day_count",
+            "days",
+        ):
+            if key not in source:
+                continue
+            try:
+                days = int(source.get(key))
+            except Exception:
+                continue
+            if days >= 0:
+                return days
+    return None
+
+
 def coerce_runtime_action(
     action: dict,
     memory_candidates: list[dict],
@@ -237,8 +262,39 @@ def coerce_runtime_action(
         "requires_confirmation": confidence < direct_confidence,
     }
 
+    if action_type in {
+        "identity.relationship_days_set",
+        "identity.relationship_days",
+        "identity.days_with_user_set",
+        "identity.relationship_anchor",
+    }:
+        days = _coerce_days_with_user(payload, action, target)
+        if days is None:
+            return None
+        runtime_action["domain"] = "identity"
+        runtime_action["executor_action"] = {
+            "type": "identity.relationship_days_set",
+            "days_with_user": days,
+            "reason": reason,
+            "relationship_anchor_evidence": reason,
+            "source": "hosted_runtime_action",
+        }
+        return runtime_action
+
     if action_type in {"identity.patch", "identity.profile_patch"}:
         raw_patch = payload.get("patch") if isinstance(payload.get("patch"), dict) else payload
+        days = _coerce_days_with_user(raw_patch)
+        if days is not None and not any(key in raw_patch for key in (*IDENTITY_STRING_FIELDS, *IDENTITY_LIST_FIELDS)):
+            runtime_action["runtime_type"] = "identity.relationship_days_set"
+            runtime_action["domain"] = "identity"
+            runtime_action["executor_action"] = {
+                "type": "identity.relationship_days_set",
+                "days_with_user": days,
+                "reason": reason,
+                "relationship_anchor_evidence": reason,
+                "source": "hosted_runtime_action",
+            }
+            return runtime_action
         patch: dict[str, Any] = {}
         for key in IDENTITY_STRING_FIELDS:
             if key in raw_patch:

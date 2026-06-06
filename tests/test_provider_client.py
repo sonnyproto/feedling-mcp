@@ -251,6 +251,100 @@ def test_openai_compatible_chat_completion_preserves_image_parts(monkeypatch):
     assert content == [{"type": "text", "text": "look"}, image_part]
 
 
+def test_openrouter_chat_completion_requests_and_extracts_reasoning(monkeypatch):
+    calls = _fake_client(
+        monkeypatch,
+        {
+            "id": "chatcmpl-test",
+            "choices": [{
+                "message": {
+                    "content": "visible answer",
+                    "reasoning": "provider reasoning summary",
+                }
+            }],
+            "usage": {"total_tokens": 9},
+        },
+    )
+
+    result = pc.chat_completion(
+        pc.ProviderConfig("openrouter", "anthropic/claude-sonnet-4.5", "sk-or-test"),
+        [{"role": "user", "content": "hello"}],
+        include_reasoning=True,
+    )
+
+    assert result["reply"] == "visible answer"
+    assert result["reasoning"] == "provider reasoning summary"
+    assert calls[0]["json"]["reasoning"] == {"enabled": True, "exclude": False}
+
+
+def test_openrouter_chat_completion_retries_without_reasoning_when_unsupported(monkeypatch):
+    calls: list[dict] = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "headers": headers or {}, "json": json or {}})
+            if len(calls) == 1:
+                return FakeResponse(400, {"error": {"message": "reasoning is unsupported for this model"}})
+            return FakeResponse(200, {
+                "id": "chatcmpl-test",
+                "choices": [{"message": {"content": "visible answer"}}],
+                "usage": {"total_tokens": 9},
+            })
+
+    monkeypatch.setattr(pc.httpx, "Client", FakeClient)
+    monkeypatch.setattr(pc, "_shared_client", None)
+
+    result = pc.chat_completion(
+        pc.ProviderConfig("openrouter", "openai/gpt-4.1-mini", "sk-or-test"),
+        [{"role": "user", "content": "hello"}],
+        include_reasoning=True,
+    )
+
+    assert result["reply"] == "visible answer"
+    assert calls[0]["json"]["reasoning"] == {"enabled": True, "exclude": False}
+    assert "reasoning" not in calls[1]["json"]
+
+
+def test_openai_reasoning_model_uses_responses_api_and_extracts_summary(monkeypatch):
+    calls = _fake_client(
+        monkeypatch,
+        {
+            "id": "resp_test",
+            "output": [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "checked the arithmetic"}],
+                },
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "391"}],
+                },
+            ],
+            "usage": {"output_tokens_details": {"reasoning_tokens": 192}},
+        },
+    )
+
+    result = pc.chat_completion(
+        pc.ProviderConfig("openai", "gpt-5", "sk-test"),
+        [{"role": "system", "content": "final only"}, {"role": "user", "content": "17*23"}],
+        include_reasoning=True,
+    )
+
+    assert result["reply"] == "391"
+    assert result["reasoning"] == "checked the arithmetic"
+    assert calls[0]["url"] == "https://api.openai.com/v1/responses"
+    assert calls[0]["json"]["instructions"] == "final only"
+    assert calls[0]["json"]["input"] == [{
+        "role": "user",
+        "content": [{"type": "input_text", "text": "17*23"}],
+    }]
+    assert calls[0]["json"]["reasoning"] == {"effort": "medium", "summary": "concise"}
+    assert calls[0]["json"]["store"] is False
+
+
 def test_anthropic_chat_completion_maps_image_parts(monkeypatch):
     calls = _fake_client(
         monkeypatch,
@@ -276,6 +370,32 @@ def test_anthropic_chat_completion_maps_image_parts(monkeypatch):
         "type": "image",
         "source": {"type": "base64", "media_type": "image/png", "data": "abcd"},
     }
+
+
+def test_anthropic_chat_completion_extracts_thinking_block(monkeypatch):
+    calls = _fake_client(
+        monkeypatch,
+        {
+            "id": "msg_test",
+            "content": [
+                {"type": "thinking", "thinking": "anthropic thinking summary"},
+                {"type": "text", "text": "visible answer"},
+            ],
+            "usage": {"input_tokens": 7, "output_tokens": 2},
+        },
+    )
+
+    result = pc.chat_completion(
+        pc.ProviderConfig("anthropic", "claude-sonnet-4-20250514", "sk-ant-test"),
+        [{"role": "user", "content": "hello"}],
+        include_reasoning=True,
+        max_tokens=2048,
+    )
+
+    assert result["reply"] == "visible answer"
+    assert result["reasoning"] == "anthropic thinking summary"
+    assert calls[0]["json"]["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+    assert "temperature" not in calls[0]["json"]
 
 
 def test_gemini_chat_completion_maps_image_parts(monkeypatch):
@@ -304,6 +424,38 @@ def test_gemini_chat_completion_maps_image_parts(monkeypatch):
             {"inline_data": {"mime_type": "image/jpeg", "data": "abcd"}},
         ],
     }]
+
+
+def test_gemini_chat_completion_extracts_thought_parts(monkeypatch):
+    calls = _fake_client(
+        monkeypatch,
+        {
+            "responseId": "gemini_test",
+            "candidates": [{
+                "content": {
+                    "parts": [
+                        {"thought": True, "text": "gemini thought summary"},
+                        {"text": "visible answer"},
+                    ]
+                }
+            }],
+            "usageMetadata": {"totalTokenCount": 8},
+        },
+    )
+
+    result = pc.chat_completion(
+        pc.ProviderConfig("gemini", "gemini-2.5-flash", "AIza-test"),
+        [{"role": "user", "content": "hello"}],
+        include_reasoning=True,
+        max_tokens=2048,
+    )
+
+    assert result["reply"] == "visible answer"
+    assert result["reasoning"] == "gemini thought summary"
+    assert calls[0]["json"]["generationConfig"]["thinkingConfig"] == {
+        "thinkingBudget": 1024,
+        "includeThoughts": True,
+    }
 
 
 # ---------------------------------------------------------------------------

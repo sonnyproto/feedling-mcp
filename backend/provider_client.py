@@ -401,6 +401,32 @@ def _extract_reply(body: dict[str, Any], *, required: bool = True) -> str:
     raise ProviderError("provider response had no usable reply text")
 
 
+def _extract_openai_compatible_reasoning(body: dict[str, Any]) -> str:
+    choices = body.get("choices")
+    if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
+        return ""
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("reasoning", "reasoning_content", "reasoning_text"):
+        value = message.get(key)
+        if isinstance(value, str) and value.strip():
+            parts.append(value.strip())
+    content = message.get("content")
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or "").lower()
+            if "reason" not in item_type and "think" not in item_type:
+                continue
+            text = item.get("text") or item.get("content") or item.get("reasoning")
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+    return "\n\n".join(parts).strip()
+
+
 def _extract_anthropic_reply(body: dict[str, Any], *, required: bool = True) -> str:
     content = body.get("content")
     has_shape = isinstance(content, list)
@@ -422,6 +448,24 @@ def _extract_anthropic_reply(body: dict[str, Any], *, required: bool = True) -> 
     raise ProviderError("provider response had no usable reply text")
 
 
+def _extract_anthropic_reasoning(body: dict[str, Any]) -> str:
+    content = body.get("content")
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "").lower()
+        if item_type == "thinking":
+            thinking = item.get("thinking") or item.get("text")
+            if isinstance(thinking, str) and thinking.strip():
+                parts.append(thinking.strip())
+        elif item_type == "redacted_thinking":
+            parts.append("[redacted thinking]")
+    return "\n\n".join(parts).strip()
+
+
 def _extract_gemini_reply(body: dict[str, Any], *, required: bool = True) -> str:
     candidates = body.get("candidates")
     has_shape = isinstance(candidates, list) and len(candidates) > 0
@@ -437,7 +481,7 @@ def _extract_gemini_reply(body: dict[str, Any], *, required: bool = True) -> str
                 continue
             text_parts: list[str] = []
             for part in parts:
-                if isinstance(part, dict):
+                if isinstance(part, dict) and not part.get("thought"):
                     text = part.get("text")
                     if isinstance(text, str) and text.strip():
                         text_parts.append(text.strip())
@@ -450,6 +494,166 @@ def _extract_gemini_reply(body: dict[str, Any], *, required: bool = True) -> str
     if not required and has_shape:
         return ""
     raise ProviderError("provider response had no usable reply text")
+
+
+def _extract_gemini_reasoning(body: dict[str, Any]) -> str:
+    candidates = body.get("candidates")
+    if not isinstance(candidates, list):
+        return ""
+    parts_out: list[str] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        content = candidate.get("content")
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict) or not part.get("thought"):
+                continue
+            text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                parts_out.append(text.strip())
+    return "\n\n".join(parts_out).strip()
+
+
+def _anthropic_supports_thinking(model: str) -> bool:
+    lower = (model or "").lower()
+    return "claude-3-7" in lower or "claude-sonnet-4" in lower or "claude-opus-4" in lower
+
+
+def _openai_uses_responses_for_reasoning(model: str) -> bool:
+    lower = (model or "").lower()
+    return lower.startswith("gpt-5") or lower.startswith("o1") or lower.startswith("o3") or lower.startswith("o4")
+
+
+def _content_to_openai_responses_parts(content: Any) -> list[dict[str, Any]]:
+    parts: list[dict[str, Any]] = []
+    text = _content_text(content)
+    if text:
+        parts.append({"type": "input_text", "text": text})
+    for image in _image_parts(content):
+        parts.append({
+            "type": "input_image",
+            "image_url": f"data:{image['mime_type']};base64,{image['data']}",
+        })
+    return parts
+
+
+def _openai_responses_input(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    instructions: list[str] = []
+    input_items: list[dict[str, Any]] = []
+    for message in messages:
+        role = str(message.get("role") or "").strip().lower()
+        content = message.get("content")
+        if role == "system":
+            text = _content_text(content)
+            if text:
+                instructions.append(text)
+            continue
+        mapped_role = "assistant" if role in {"assistant", "openclaw", "agent", "model"} else "user"
+        parts = _content_to_openai_responses_parts(content)
+        if not parts:
+            continue
+        input_items.append({"role": mapped_role, "content": parts})
+    if not input_items:
+        input_items.append({"role": "user", "content": [{"type": "input_text", "text": "Say ok."}]})
+    return "\n\n".join(instructions).strip(), input_items
+
+
+def _extract_openai_responses_output(body: dict[str, Any]) -> tuple[str, str]:
+    output = body.get("output")
+    if not isinstance(output, list):
+        return "", ""
+    reply_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type == "message":
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in {"output_text", "text"}:
+                    text = part.get("text")
+                    if isinstance(text, str) and text.strip():
+                        reply_parts.append(text.strip())
+        elif item_type == "reasoning":
+            summary = item.get("summary")
+            if not isinstance(summary, list):
+                continue
+            for part in summary:
+                if not isinstance(part, dict):
+                    continue
+                text = part.get("text")
+                if isinstance(text, str) and text.strip():
+                    reasoning_parts.append(text.strip())
+    return "\n".join(reply_parts).strip(), "\n\n".join(reasoning_parts).strip()
+
+
+def _chat_completion_openai_responses(
+    *,
+    model: str,
+    base_url: str,
+    key: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    timeout: float,
+    response_format: dict[str, Any] | None,
+    require_reply: bool = True,
+    include_reasoning: bool = False,
+) -> dict[str, Any]:
+    instructions, input_items = _openai_responses_input(messages)
+    if response_format:
+        json_instruction = _json_only_instruction(response_format)
+        if json_instruction:
+            instructions = f"{instructions}\n\n{json_instruction}".strip()
+    payload: dict[str, Any] = {
+        "model": model,
+        "input": input_items,
+        "max_output_tokens": max(1, min(int(max_tokens), 8192)),
+        "store": False,
+    }
+    if include_reasoning:
+        payload["reasoning"] = {"effort": "medium", "summary": "concise"}
+    if instructions:
+        payload["instructions"] = instructions
+
+    try:
+        resp = _http_client().post(
+            f"{base_url.rstrip('/')}/responses",
+            headers=_headers(ProviderConfig("openai", model, key, base_url)),
+            json=payload,
+            timeout=timeout,
+        )
+    except httpx.HTTPError as e:
+        raise ProviderError(f"provider network error: {type(e).__name__}") from e
+
+    _raise_for_provider_status(resp)
+
+    try:
+        body = resp.json()
+    except ValueError as e:
+        raise ProviderError("provider returned non-json response") from e
+    if not isinstance(body, dict):
+        raise ProviderError("provider returned non-object response")
+    reply, reasoning = _extract_openai_responses_output(body)
+    if require_reply and not reply:
+        raise ProviderError("provider response had no usable reply text")
+    return {
+        "reply": reply,
+        "reasoning": reasoning,
+        "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
+        "raw_id": body.get("id", ""),
+        "provider": "openai",
+        "model": model,
+    }
 
 
 def _chat_completion_openai_compatible(
@@ -465,6 +669,7 @@ def _chat_completion_openai_compatible(
     response_format: dict[str, Any] | None,
     extra_body: dict[str, Any] | None = None,
     require_reply: bool = True,
+    include_reasoning: bool = False,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
@@ -477,18 +682,31 @@ def _chat_completion_openai_compatible(
         payload["response_format"] = response_format
     if extra_body:
         payload.update(extra_body)
+    if include_reasoning and provider == "openrouter":
+        payload.setdefault("reasoning", {"enabled": True, "exclude": False})
 
+    def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
+        try:
+            return _http_client().post(
+                f"{base_url.rstrip('/')}/chat/completions",
+                headers=_headers(ProviderConfig(provider, model, key, base_url)),
+                json=request_payload,
+                timeout=timeout,
+            )
+        except httpx.HTTPError as e:
+            raise ProviderError(f"provider network error: {type(e).__name__}") from e
+
+    resp = post_with_payload(payload)
     try:
-        resp = _http_client().post(
-            f"{base_url.rstrip('/')}/chat/completions",
-            headers=_headers(ProviderConfig(provider, model, key, base_url)),
-            json=payload,
-            timeout=timeout,
-        )
-    except httpx.HTTPError as e:
-        raise ProviderError(f"provider network error: {type(e).__name__}") from e
-
-    _raise_for_provider_status(resp)
+        _raise_for_provider_status(resp)
+    except ProviderError:
+        if include_reasoning and provider == "openrouter" and resp.status_code in {400, 422} and "reasoning" in payload:
+            fallback_payload = dict(payload)
+            fallback_payload.pop("reasoning", None)
+            resp = post_with_payload(fallback_payload)
+            _raise_for_provider_status(resp)
+        else:
+            raise
 
     try:
         body = resp.json()
@@ -499,6 +717,7 @@ def _chat_completion_openai_compatible(
 
     return {
         "reply": _extract_reply(body, required=require_reply),
+        "reasoning": _extract_openai_compatible_reasoning(body),
         "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
         "raw_id": body.get("id", ""),
         "provider": provider,
@@ -517,17 +736,22 @@ def _chat_completion_anthropic(
     timeout: float,
     response_format: dict[str, Any] | None,
     require_reply: bool = True,
+    include_reasoning: bool = False,
 ) -> dict[str, Any]:
     system, provider_messages = _split_system_messages_anthropic(messages)
     json_instruction = _json_only_instruction(response_format)
     if json_instruction:
         system = f"{system}\n\n{json_instruction}".strip()
+    capped_max_tokens = max(1, min(int(max_tokens), 8192))
     payload: dict[str, Any] = {
         "model": model,
         "messages": provider_messages,
-        "max_tokens": max(1, min(int(max_tokens), 8192)),
-        "temperature": temperature,
+        "max_tokens": capped_max_tokens,
     }
+    if include_reasoning and _anthropic_supports_thinking(model) and capped_max_tokens >= 1536:
+        payload["thinking"] = {"type": "enabled", "budget_tokens": min(1024, capped_max_tokens - 512)}
+    else:
+        payload["temperature"] = temperature
     if system:
         payload["system"] = system
 
@@ -556,6 +780,7 @@ def _chat_completion_anthropic(
 
     return {
         "reply": _extract_anthropic_reply(body, required=require_reply),
+        "reasoning": _extract_anthropic_reasoning(body),
         "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
         "raw_id": body.get("id", ""),
         "provider": "anthropic",
@@ -574,6 +799,7 @@ def _chat_completion_gemini(
     timeout: float,
     response_format: dict[str, Any] | None,
     require_reply: bool = True,
+    include_reasoning: bool = False,
 ) -> dict[str, Any]:
     system, contents = _split_system_messages_gemini(messages)
     generation_config: dict[str, Any] = {
@@ -582,6 +808,11 @@ def _chat_completion_gemini(
     }
     if response_format and response_format.get("type") in {"json_object", "json_schema"}:
         generation_config["responseMimeType"] = "application/json"
+    if include_reasoning and "2.5" in model:
+        generation_config["thinkingConfig"] = {
+            "thinkingBudget": min(1024, max(128, int(max_tokens) // 2)),
+            "includeThoughts": True,
+        }
 
     payload: dict[str, Any] = {
         "contents": contents,
@@ -614,6 +845,7 @@ def _chat_completion_gemini(
 
     return {
         "reply": _extract_gemini_reply(body, required=require_reply),
+        "reasoning": _extract_gemini_reasoning(body),
         "usage": (
             body.get("usageMetadata")
             if isinstance(body.get("usageMetadata"), dict)
@@ -634,6 +866,7 @@ def chat_completion(
     timeout: float = 60.0,
     response_format: dict[str, Any] | None = None,
     require_reply: bool = True,
+    include_reasoning: bool = False,
 ) -> dict[str, Any]:
     provider, model, base_url = validate_config(
         config.provider, config.model, config.base_url
@@ -654,6 +887,7 @@ def chat_completion(
             timeout=timeout,
             response_format=response_format,
             require_reply=require_reply,
+            include_reasoning=include_reasoning,
         )
     if provider == "gemini":
         return _chat_completion_gemini(
@@ -666,6 +900,20 @@ def chat_completion(
             timeout=timeout,
             response_format=response_format,
             require_reply=require_reply,
+            include_reasoning=include_reasoning,
+        )
+
+    if provider == "openai" and _openai_uses_responses_for_reasoning(request_model):
+        return _chat_completion_openai_responses(
+            model=request_model,
+            base_url=base_url,
+            key=key,
+            messages=messages,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            response_format=response_format,
+            require_reply=require_reply,
+            include_reasoning=include_reasoning,
         )
 
     return _chat_completion_openai_compatible(
@@ -680,6 +928,7 @@ def chat_completion(
         response_format=response_format,
         extra_body=extra_body,
         require_reply=require_reply,
+        include_reasoning=include_reasoning,
     )
 
 

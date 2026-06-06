@@ -737,6 +737,10 @@ class UserStore:
                 "thinking_enclave_pk_fpr",
                 "thinking_visibility",
                 "thinking_owner_user_id",
+                "thinking_kind",
+                "thinking_source",
+                "thinking_model",
+                "thinking_native",
                 "reply_claimed_by",
                 "reply_claimed_at",
                 "reply_claim_expires_at",
@@ -4953,6 +4957,70 @@ def _chat_thinking_extra_from_envelope(envelope: dict | None) -> dict:
     return {k: v for k, v in out.items() if str(v).strip()}
 
 
+_CHAT_THINKING_KINDS = {
+    "provider_reasoning",
+    "provider_reasoning_summary",
+    "runtime_trace",
+    "agent_summary",
+    "context_summary",
+}
+
+
+def _bounded_chat_metadata(value: object, *, max_len: int = 96) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return re.sub(r"[\r\n\t]+", " ", text)[:max_len].strip()
+
+
+def _boolish_chat_metadata(value: object) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+    return None
+
+
+def _chat_thinking_metadata_from_payload(payload: dict) -> dict:
+    """Metadata for a separately encrypted reasoning or trace envelope.
+
+    IO stores and renders this metadata; it does not infer or manufacture
+    reasoning. Upstream runtimes must label whether they are sending
+    provider-native reasoning, runtime trace, or agent-authored summary.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    raw_kind = _bounded_chat_metadata(
+        payload.get("thinking_kind") or payload.get("reasoning_kind"),
+        max_len=64,
+    ).lower()
+    out: dict = {}
+    if raw_kind in _CHAT_THINKING_KINDS:
+        out["thinking_kind"] = raw_kind
+    source = _bounded_chat_metadata(
+        payload.get("thinking_source") or payload.get("reasoning_source"),
+        max_len=80,
+    )
+    if source:
+        out["thinking_source"] = source
+    model = _bounded_chat_metadata(
+        payload.get("thinking_model") or payload.get("reasoning_model"),
+        max_len=96,
+    )
+    if model:
+        out["thinking_model"] = model
+    native = _boolish_chat_metadata(
+        payload.get("thinking_native", payload.get("reasoning_native"))
+    )
+    if native is not None:
+        out["thinking_native"] = native
+    return out
+
+
 def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpose: str) -> bytes:
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
@@ -8214,6 +8282,8 @@ MODEL_API_WEB_SEARCH_ENABLED = os.environ.get("FEEDLING_MODEL_API_WEB_SEARCH_ENA
 MODEL_API_WEB_SEARCH_MAX_QUERIES = max(1, min(3, int(os.environ.get("FEEDLING_MODEL_API_WEB_SEARCH_MAX_QUERIES", "2"))))
 MODEL_API_WEB_SEARCH_MAX_RESULTS = max(1, min(8, int(os.environ.get("FEEDLING_MODEL_API_WEB_SEARCH_MAX_RESULTS", "5"))))
 MODEL_API_WEB_SEARCH_TIMEOUT_SEC = max(2.0, min(20.0, float(os.environ.get("FEEDLING_MODEL_API_WEB_SEARCH_TIMEOUT_SEC", "8"))))
+MODEL_API_PROVIDER_REASONING_ENABLED = os.environ.get("FEEDLING_MODEL_API_PROVIDER_REASONING_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
+MODEL_API_PROVIDER_REASONING_MAX_CHARS = max(400, min(6000, int(os.environ.get("FEEDLING_MODEL_API_PROVIDER_REASONING_MAX_CHARS", "2400"))))
 
 _STATE_PENDING_BLOB = "model_api_state_pending"
 _model_api_recap_active_users: set[str] = set()
@@ -8925,6 +8995,29 @@ def _sanitize_visible_thinking_summary(text: str) -> str:
         if len(lines) >= 4:
             break
     return "\n".join(lines).strip()[:700]
+
+
+def _sanitize_provider_reasoning_text(text: str) -> str:
+    raw = str(text or "").replace("\r\n", "\n").strip()
+    if not raw:
+        return ""
+    blocked = re.compile(
+        r"(system prompt|developer message|api[_\s-]*key|authorization|bearer\s+|"
+        r"sk-[A-Za-z0-9]|sk-or-[A-Za-z0-9]|x-api-key|password|secret|session_id|"
+        r"input_tokens|output_tokens|cache_creation|cache_read|costUSD)",
+        re.IGNORECASE,
+    )
+    lines: list[str] = []
+    for raw_line in raw.splitlines():
+        line = raw_line.strip()
+        if not line or blocked.search(line):
+            continue
+        line = re.sub(r"^[`#>*\-\s]+", "", line).strip()
+        if line:
+            lines.append(line[:700])
+        if len("\n".join(lines)) >= MODEL_API_PROVIDER_REASONING_MAX_CHARS:
+            break
+    return "\n".join(lines).strip()[:MODEL_API_PROVIDER_REASONING_MAX_CHARS]
 
 
 def _model_api_extract_web_search_requests(parsed: Any) -> list[dict]:
@@ -9949,6 +10042,7 @@ def model_api_chat_send():
             max_tokens=int(payload.get("max_tokens") or 2048),
             temperature=float(payload.get("temperature") or 0.7),
             timeout=90.0,
+            include_reasoning=MODEL_API_PROVIDER_REASONING_ENABLED,
         )
     except ProviderError as e:
         background_execution = hosted_runtime_background_trace(
@@ -9984,6 +10078,7 @@ def model_api_chat_send():
 
     raw_reply = str(result.get("reply") or "").strip()
     reply, thinking_summary, requested_web_search = _model_api_parse_turn_output(raw_reply)
+    provider_reasoning = _sanitize_provider_reasoning_text(str(result.get("reasoning") or ""))
     if requested_web_search and (not web_search or not reply):
         if not web_search:
             web_search = _run_model_api_web_searches(requested_web_search)
@@ -9999,12 +10094,14 @@ def model_api_chat_send():
                 max_tokens=int(payload.get("max_tokens") or 2048),
                 temperature=float(payload.get("temperature") or 0.7),
                 timeout=90.0,
+                include_reasoning=MODEL_API_PROVIDER_REASONING_ENABLED,
             )
             final_raw_reply = str(final_result.get("reply") or "").strip()
             final_reply, final_thinking, _ = _model_api_parse_turn_output(final_raw_reply)
             if final_reply:
                 reply = final_reply
                 thinking_summary = final_thinking or thinking_summary
+                provider_reasoning = _sanitize_provider_reasoning_text(str(final_result.get("reasoning") or "")) or provider_reasoning
                 result = {
                     **final_result,
                     "usage": {
@@ -10071,10 +10168,12 @@ def model_api_chat_send():
     if assistant_env is None:
         return jsonify({"error": "assistant_envelope_failed", "detail": env_err}), 409
     assistant_extra: dict = {}
-    if thinking_summary:
-        thinking_env, thinking_err = _build_shared_envelope_for_store(store, thinking_summary.encode("utf-8"))
+    display_thinking = provider_reasoning or thinking_summary
+    if display_thinking:
+        thinking_env, thinking_err = _build_shared_envelope_for_store(store, display_thinking.encode("utf-8"))
         if thinking_env is not None:
             assistant_extra.update(_chat_thinking_extra_from_envelope(thinking_env))
+            assistant_extra["thinking_kind"] = "provider_reasoning" if provider_reasoning else "context_summary"
         else:
             print(f"[model_api_chat:{store.user_id}] thinking_envelope_failed detail={thinking_err}")
     assistant_row = store.append_chat("openclaw", "model_api", assistant_env, extra=assistant_extra)
@@ -10153,6 +10252,11 @@ def model_api_chat_send():
             "screen_context": bool(context_payload.get("screen_context")),
             "context_refs": len(context_refs),
             "web_search": _model_api_web_search_trace(web_search),
+            "provider_reasoning": {
+                "enabled": MODEL_API_PROVIDER_REASONING_ENABLED,
+                "present": bool(provider_reasoning),
+                "chars": len(provider_reasoning),
+            },
         },
         "usage": result.get("usage") or {},
         "duration_ms": int((time.time() - trace_start) * 1000),
@@ -10161,7 +10265,9 @@ def model_api_chat_send():
         "status": "ok",
         "reply": reply,
         "context_summary": thinking_summary,
-        "thinking_summary": thinking_summary,
+        "thinking_summary": display_thinking,
+        "thinking_kind": "provider_reasoning" if provider_reasoning else ("context_summary" if thinking_summary else ""),
+        "provider_reasoning": provider_reasoning,
         "user_message": {"id": user_row["id"], "ts": user_row["ts"]},
         "assistant_message": {"id": assistant_row["id"], "ts": assistant_row["ts"]},
         "user_content_type": "image" if has_image else "text",
@@ -11637,6 +11743,7 @@ def chat_response():
         }
         if thinking_envelope.get("K_enclave"):
             thinking_extra["thinking_K_enclave"] = str(thinking_envelope["K_enclave"])
+        thinking_extra.update(_chat_thinking_metadata_from_payload(payload))
     source = str(payload.get("source") or "chat").strip() or "chat"
     if source not in {"chat", "live_activity", "heartbeat", PROACTIVE_JOB_SOURCE}:
         return jsonify({"error": "invalid source"}), 400

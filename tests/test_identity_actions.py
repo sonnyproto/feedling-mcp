@@ -221,6 +221,60 @@ def test_model_api_chat_background_runtime_executes_detected_identity_rename(cli
     assert any(isinstance(item, dict) and item.get("agent_name") == "小秘" for item in captured_plaintexts)
 
 
+def test_model_api_chat_background_runtime_updates_relationship_days(client, monkeypatch):
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+
+    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+
+    def fake_enclave_context(path, key, params=None):
+        if path == "/v1/identity/get":
+            return {"identity": _plain_identity()}, ""
+        if path == "/v1/chat/history":
+            return {"messages": [], "context_memories": []}, ""
+        return {}, ""
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        if "Feedling hosted runtime's background execution controller" in joined:
+            return {
+                "reply": json.dumps({
+                    "actions": [{
+                        "type": "identity.relationship_days_set",
+                        "confidence": 0.97,
+                        "payload": {"days_with_user": 68},
+                        "reason": "User corrected the displayed relationship day count from 368 to 68.",
+                    }]
+                }),
+                "usage": {},
+            }
+        return {"reply": "你说得对，我会按 68 天记。", "usage": {}}
+
+    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    res = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "我们在一起不是 368 天，是 68 天。", "state_sync": True},
+        headers=_headers(api_key),
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["state"]["background_execution"]["status"] == "completed"
+    saved = appmod.db.get_blob(user_id, "identity")
+    assert saved["relationship_anchor_source"] == "user_calibrated"
+    assert appmod._live_days_with_user(saved, store=appmod.get_store(user_id)) == 68
+
+
 def test_model_api_chat_background_runtime_nudges_identity_dimension(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)

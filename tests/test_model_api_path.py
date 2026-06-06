@@ -313,6 +313,57 @@ def test_model_api_chat_send_runs_backend_web_search_tool(client, monkeypatch):
     assert len(provider_calls) == 2
 
 
+def test_model_api_chat_surfaces_provider_reasoning_before_context_summary(client, monkeypatch):
+    _, api_key = _register(client)
+    provider_kwargs: list[dict] = []
+
+    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
+    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(
+        appmod,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"messages": [], "context_memories": []}, "")
+        if path == "/v1/chat/history"
+        else ({"identity": _identity_payload()}, ""),
+    )
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        provider_kwargs.append(kwargs)
+        return {
+            "reply": appmod.json.dumps({
+                "reply": "看到了，我直接回你。",
+                "context_summary": "对齐了当前 Identity 设定。",
+            }),
+            "reasoning": "I considered the user's latest message and relevant memory before answering.",
+            "usage": {"total_tokens": 9},
+        }
+
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openrouter", "model": "anthropic/claude-sonnet-4.5", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    chat = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "hello"},
+        headers=_headers(api_key),
+    )
+
+    assert chat.status_code == 200, chat.get_data(as_text=True)
+    body = chat.get_json()
+    assert provider_kwargs[-1]["include_reasoning"] is True
+    assert body["reply"] == "看到了，我直接回你。"
+    assert body["context_summary"] == ""
+    assert body["thinking_kind"] == "provider_reasoning"
+    assert body["provider_reasoning"] == "I considered the user's latest message and relevant memory before answering."
+    assert body["thinking_summary"] == body["provider_reasoning"]
+
+
 def test_model_api_chat_does_not_treat_generic_query_as_web_search_request(client, monkeypatch):
     _, api_key = _register(client)
     provider_calls: list[list[dict]] = []
