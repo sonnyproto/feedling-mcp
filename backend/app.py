@@ -5425,6 +5425,8 @@ def _history_import_payload_hash(payload: dict) -> str:
             "content",
             "fresh_start",
             "relationship_started_at",
+            "ai_persona_content",
+            "ai_persona_filename",
             "character_content",
             "character_card",
             "character_filename",
@@ -5435,6 +5437,11 @@ def _history_import_payload_hash(payload: dict) -> str:
             "personal_profile_filename",
             "profile_content",
             "persona_filename",
+            "memory_summary_content",
+            "memory_summary",
+            "memory_sample_content",
+            "memory_summary_filename",
+            "memory_sample_filename",
             "history_filename",
         )
     }
@@ -5762,14 +5769,41 @@ def _parse_import_history_content(content: str, fmt: str, warnings: list[str]) -
     raise ValueError("format must be plaintext, text, json, or auto")
 
 
+_AI_PERSONA_SOURCE = "ai_persona_import"
+_USER_PROFILE_SOURCE = "user_profile_import"
+_MEMORY_SUMMARY_SOURCE = "memory_summary_import"
+_HISTORY_SOURCE = "history_import"
+_FRESH_START_SOURCE = "fresh_start"
+
+_IMPORT_SOURCE_FAMILY = {
+    _AI_PERSONA_SOURCE: _AI_PERSONA_SOURCE,
+    "agent_prompt_import": _AI_PERSONA_SOURCE,
+    "character_import": _AI_PERSONA_SOURCE,
+    _USER_PROFILE_SOURCE: _USER_PROFILE_SOURCE,
+    "persona_import": _USER_PROFILE_SOURCE,
+    _MEMORY_SUMMARY_SOURCE: _MEMORY_SUMMARY_SOURCE,
+    _HISTORY_SOURCE: _HISTORY_SOURCE,
+    _FRESH_START_SOURCE: _FRESH_START_SOURCE,
+}
+
+
+def _import_source_family(source: str | None) -> str:
+    raw = str(source or "").strip()
+    return _IMPORT_SOURCE_FAMILY.get(raw, raw or _HISTORY_SOURCE)
+
+
 _SUPPORT_BLOCK_RE = re.compile(
     r"(?ms)^\s*={3,}\s*BEGIN\s+"
     r"(?P<label>AGENT\s+PROMPT|SYSTEM\s+PROMPT|ORIGINAL\s+SYSTEM\s+PROMPT|"
-    r"CHARACTER\s+CARD|PERSONAL\s+PROFILE(?:\s+CARD)?|PERSONA\s+PROFILE|USER\s+PROFILE|PERSONA)"
+    r"AI\s+PERSONA(?:\s+MATERIALS?)?|CHARACTER\s+CARD|"
+    r"PERSONAL\s+PROFILE(?:\s+CARD)?|PERSONA\s+PROFILE|USER\s+PROFILE|PERSONA|"
+    r"MEMORY\s+SUMMARY|MEMORY\s+SAMPLE|MEMORY\s+SAMURAI)"
     r"(?:\s*:(?P<filename>[^=]*))?\s*={3,}\s*"
     r"(?P<body>.*?)(?=^\s*={3,}\s*BEGIN\s+"
     r"(?:AGENT\s+PROMPT|SYSTEM\s+PROMPT|ORIGINAL\s+SYSTEM\s+PROMPT|"
-    r"CHARACTER\s+CARD|PERSONAL\s+PROFILE(?:\s+CARD)?|PERSONA\s+PROFILE|USER\s+PROFILE|PERSONA)"
+    r"AI\s+PERSONA(?:\s+MATERIALS?)?|CHARACTER\s+CARD|"
+    r"PERSONAL\s+PROFILE(?:\s+CARD)?|PERSONA\s+PROFILE|USER\s+PROFILE|PERSONA|"
+    r"MEMORY\s+SUMMARY|MEMORY\s+SAMPLE|MEMORY\s+SAMURAI)"
     r"(?:\s*:[^=]*)?\s*={3,}\s*|\Z)"
 )
 _SUPPORT_MARKER_RE = re.compile(r"^\s*={3,}\s*(?:BEGIN|END)\s+[^=]+={3,}\s*$", re.IGNORECASE)
@@ -5787,18 +5821,30 @@ def _clean_support_material_text(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def _support_message(label: str, source: str, content: str, filename: str = "") -> dict | None:
+def _support_message(
+    label: str,
+    source: str,
+    content: str,
+    filename: str = "",
+    *,
+    source_detail: str = "",
+) -> dict | None:
     clean = _normalize_support_material_text(content, filename)
     if not clean:
         return None
     title = label
     if filename.strip():
         title += f" ({filename.strip()[:120]})"
+    family = _import_source_family(source)
+    cap = 120000 if family == _MEMORY_SUMMARY_SOURCE else 60000 if family in {_AI_PERSONA_SOURCE, _USER_PROFILE_SOURCE} else 30000
     return {
         "role": "user",
-        "content": f"{title}:\n{clean[:30000]}",
+        "content": f"{title}:\n{clean[:cap]}",
         "ts": None,
-        "source": source,
+        "source": family,
+        "source_family": family,
+        "source_detail": source_detail or source,
+        "source_filename": filename.strip()[:240],
     }
 
 
@@ -5809,6 +5855,10 @@ _SUPPORT_JSON_TEXT_KEYS = (
     "persona_profile",
     "user_profile",
     "character_card",
+    "memory_summary",
+    "memory_sample",
+    "memory_samurai",
+    "memory_summaries",
     "persona",
     "profile",
     "memory",
@@ -5926,12 +5976,17 @@ def _split_support_sections(content: str) -> list[tuple[str, str, str, str]]:
         raw_label = re.sub(r"\s+", " ", str(m.group("label") or "").strip().lower())
         filename = str(m.group("filename") or "").strip()
         body = str(m.group("body") or "").strip()
-        if "system prompt" in raw_label or "agent prompt" in raw_label:
-            sections.append(("Original agent prompt", "agent_prompt_import", body, filename))
-        elif "character" in raw_label:
-            sections.append(("Character card", "character_import", body, filename))
+        if (
+            "system prompt" in raw_label
+            or "agent prompt" in raw_label
+            or "character" in raw_label
+            or "ai persona" in raw_label
+        ):
+            sections.append(("AI Persona material", _AI_PERSONA_SOURCE, body, filename))
+        elif "memory summary" in raw_label or "memory sample" in raw_label or "memory samurai" in raw_label:
+            sections.append(("Memory summary", _MEMORY_SUMMARY_SOURCE, body, filename))
         else:
-            sections.append(("Personal profile", "persona_import", body, filename))
+            sections.append(("User profile", _USER_PROFILE_SOURCE, body, filename))
     return sections
 
 
@@ -5940,14 +5995,23 @@ def _persona_support_messages(payload: dict) -> list[dict]:
     seen: set[tuple[str, str]] = set()
 
     def add(label: str, source: str, content: str, filename: str = "") -> None:
-        msg = _support_message(label, source, content, filename)
+        msg = _support_message(label, source, content, filename, source_detail=source)
         if not msg:
             return
-        key = (source, re.sub(r"\s+", " ", str(msg.get("content") or ""))[:1000])
+        key = (_import_source_family(source), re.sub(r"\s+", " ", str(msg.get("content") or ""))[:1000])
         if key in seen:
             return
         seen.add(key)
         messages.append(msg)
+
+    ai_persona = str(payload.get("ai_persona_content") or payload.get("ai_persona") or "").strip()
+    if ai_persona:
+        add(
+            "AI Persona material",
+            _AI_PERSONA_SOURCE,
+            ai_persona,
+            str(payload.get("ai_persona_filename") or "").strip(),
+        )
 
     agent_prompt = str(
         payload.get("agent_prompt_content")
@@ -5959,26 +6023,39 @@ def _persona_support_messages(payload: dict) -> list[dict]:
         or ""
     ).strip()
     if agent_prompt:
-        add(
-            "Original agent prompt",
-            "agent_prompt_import",
+        filename = str(
+            payload.get("agent_prompt_filename")
+            or payload.get("original_system_prompt_filename")
+            or payload.get("system_prompt_filename")
+            or ""
+        ).strip()
+        msg = _support_message(
+            "AI Persona material",
+            _AI_PERSONA_SOURCE,
             agent_prompt,
-            str(
-                payload.get("agent_prompt_filename")
-                or payload.get("original_system_prompt_filename")
-                or payload.get("system_prompt_filename")
-                or ""
-            ).strip(),
+            filename,
+            source_detail="agent_prompt_import",
         )
+        if msg:
+            key = (_AI_PERSONA_SOURCE, re.sub(r"\s+", " ", str(msg.get("content") or ""))[:1000])
+            if key not in seen:
+                seen.add(key)
+                messages.append(msg)
 
     character = str(payload.get("character_content") or payload.get("character_card") or "").strip()
     if character:
-        add(
-            "Character card",
-            "character_import",
+        msg = _support_message(
+            "AI Persona material",
+            _AI_PERSONA_SOURCE,
             character,
             str(payload.get("character_filename") or payload.get("character_card_filename") or "").strip(),
+            source_detail="character_import",
         )
+        if msg:
+            key = (_AI_PERSONA_SOURCE, re.sub(r"\s+", " ", str(msg.get("content") or ""))[:1000])
+            if key not in seen:
+                seen.add(key)
+                messages.append(msg)
 
     profile = str(
         payload.get("personal_profile_content")
@@ -5987,10 +6064,25 @@ def _persona_support_messages(payload: dict) -> list[dict]:
     ).strip()
     if profile:
         add(
-            "Personal profile",
-            "persona_import",
+            "User profile",
+            _USER_PROFILE_SOURCE,
             profile,
             str(payload.get("personal_profile_filename") or payload.get("persona_filename") or "").strip(),
+        )
+
+    memory_summary = str(
+        payload.get("memory_summary_content")
+        or payload.get("memory_summary")
+        or payload.get("memory_sample_content")
+        or payload.get("memory_sample")
+        or ""
+    ).strip()
+    if memory_summary:
+        add(
+            "Memory summary",
+            _MEMORY_SUMMARY_SOURCE,
+            memory_summary,
+            str(payload.get("memory_summary_filename") or payload.get("memory_sample_filename") or "").strip(),
         )
 
     persona = str(payload.get("persona_content") or payload.get("persona") or "").strip()
@@ -6002,8 +6094,8 @@ def _persona_support_messages(payload: dict) -> list[dict]:
                 add(label, source, body, section_filename or outer_filename)
         else:
             add(
-                "Personal profile",
-                "persona_import",
+                "User profile",
+                _USER_PROFILE_SOURCE,
                 persona,
                 str(payload.get("persona_filename") or "").strip(),
             )
@@ -6136,18 +6228,26 @@ def _english_only_for_zh(text: str) -> bool:
     return bool(re.search(r"[A-Za-z]{4,}", raw)) and not re.search(r"[\u4e00-\u9fff]", raw)
 
 
-_IMPORT_SUPPORT_SOURCES = {"agent_prompt_import", "character_import", "persona_import", "fresh_start"}
+_IMPORT_SUPPORT_SOURCES = {
+    _AI_PERSONA_SOURCE,
+    "agent_prompt_import",
+    "character_import",
+    _USER_PROFILE_SOURCE,
+    "persona_import",
+    _MEMORY_SUMMARY_SOURCE,
+    _FRESH_START_SOURCE,
+}
 
 
 def _format_import_message_line(msg: dict) -> str:
-    source = str(msg.get("source") or "")
-    if source == "character_import":
-        role = "Character card"
-    elif source == "agent_prompt_import":
-        role = "Original agent prompt"
-    elif source == "persona_import":
-        role = "Personal profile"
-    elif source == "fresh_start":
+    source = _import_source_family(str(msg.get("source") or msg.get("source_family") or ""))
+    if source == _AI_PERSONA_SOURCE:
+        role = "AI Persona material"
+    elif source == _USER_PROFILE_SOURCE:
+        role = "User profile"
+    elif source == _MEMORY_SUMMARY_SOURCE:
+        role = "Memory summary"
+    elif source == _FRESH_START_SOURCE:
         role = "Fresh start"
     else:
         role = "User" if msg.get("role") == "user" else "Assistant"
@@ -6181,15 +6281,14 @@ def _model_api_agent_profile_context(store: UserStore, identity: dict) -> dict:
         "signature": identity.get("signature", []) if isinstance(identity.get("signature"), list) else [],
         "dimensions": identity.get("dimensions", []) if isinstance(identity.get("dimensions"), list) else [],
         "import_sources": {
-            "original_agent_prompt": bool(latest_job.get("agent_prompt_chars")),
-            "character_card": bool(latest_job.get("character_chars")),
-            "personal_profile": bool(latest_job.get("persona_chars")),
+            "ai_persona": bool(latest_job.get("ai_persona_chars") or latest_job.get("agent_prompt_chars") or latest_job.get("character_chars")),
+            "user_profile": bool(latest_job.get("user_profile_chars") or latest_job.get("persona_chars")),
+            "memory_summary": bool(latest_job.get("memory_summary_chars")),
             "chat_history": bool(latest_job.get("messages_parsed")),
         },
         "source_priority": [
             "explicit user corrections",
-            "original agent/system prompt",
-            "character card",
+            "AI persona materials",
             "Feedling Identity",
             "relevant memory cards",
             "recent chat",
@@ -6249,16 +6348,128 @@ def _stratified_history_sample(messages: list[dict], max_chars: int) -> str:
     return text[:max_chars].strip()
 
 
+def _is_import_support_message(msg: dict) -> bool:
+    return _import_source_family(str(msg.get("source") or msg.get("source_family") or "")) in _IMPORT_SUPPORT_SOURCES
+
+
+def _import_source_stats(messages: list[dict]) -> dict:
+    stats = {
+        _AI_PERSONA_SOURCE: {"count": 0, "chars": 0},
+        _USER_PROFILE_SOURCE: {"count": 0, "chars": 0},
+        _MEMORY_SUMMARY_SOURCE: {"count": 0, "chars": 0},
+        _HISTORY_SOURCE: {"count": 0, "chars": 0},
+        _FRESH_START_SOURCE: {"count": 0, "chars": 0},
+    }
+    for msg in messages:
+        family = _import_source_family(str(msg.get("source") or msg.get("source_family") or ""))
+        if family not in stats:
+            stats[family] = {"count": 0, "chars": 0}
+        stats[family]["count"] += 1
+        stats[family]["chars"] += len(str(msg.get("content") or ""))
+    return stats
+
+
+def _messages_for_source_family(messages: list[dict], family: str) -> list[dict]:
+    return [
+        m for m in messages
+        if _import_source_family(str(m.get("source") or m.get("source_family") or "")) == family
+    ]
+
+
+def _source_briefing_text(support_messages: list[dict], max_chars: int = 7000) -> str:
+    groups = [
+        ("AI Persona materials", _AI_PERSONA_SOURCE, 1800),
+        ("User Profile", _USER_PROFILE_SOURCE, 1600),
+        ("Memory Summary", _MEMORY_SUMMARY_SOURCE, 2600),
+        ("Fresh Start", _FRESH_START_SOURCE, 600),
+    ]
+    parts: list[str] = []
+    budget_used = 0
+    for title, family, family_budget in groups:
+        group = _messages_for_source_family(support_messages, family)
+        if not group:
+            continue
+        text = _sequential_transcript_sample(group, min(family_budget, max_chars - budget_used))
+        if not text:
+            continue
+        part = f"[{title}]\n{text}"
+        if budget_used + len(part) + 2 > max_chars:
+            break
+        parts.append(part)
+        budget_used += len(part) + 2
+    return "\n\n".join(parts).strip()
+
+
+def _split_text_windows(text: str, max_chars: int) -> list[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    if len(raw) <= max_chars:
+        return [raw]
+    paras = re.split(r"\n{2,}", raw)
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for para in paras:
+        para = para.strip()
+        if not para:
+            continue
+        if current and current_len + len(para) + 2 > max_chars:
+            chunks.append("\n\n".join(current).strip())
+            current = []
+            current_len = 0
+        if len(para) > max_chars:
+            for start in range(0, len(para), max_chars):
+                chunk = para[start:start + max_chars].strip()
+                if chunk:
+                    chunks.append(chunk)
+            continue
+        current.append(para)
+        current_len += len(para) + 2
+    if current:
+        chunks.append("\n\n".join(current).strip())
+    return chunks
+
+
+def _support_source_windows(support_messages: list[dict], *, max_chars: int) -> list[dict]:
+    windows: list[dict] = []
+    groups = [
+        (_AI_PERSONA_SOURCE, "AI Persona materials", max(4000, min(12000, max_chars - 1200))),
+        (_USER_PROFILE_SOURCE, "User Profile", max(4000, min(10000, max_chars - 1200))),
+        (_MEMORY_SUMMARY_SOURCE, "Memory Summary", max(5000, min(14000, max_chars - 800))),
+        (_FRESH_START_SOURCE, "Fresh Start", max(1000, min(3000, max_chars))),
+    ]
+    for family, label, family_max in groups:
+        group = _messages_for_source_family(support_messages, family)
+        if not group:
+            continue
+        text = _sequential_transcript_sample(group, family_max * 8)
+        for idx, chunk in enumerate(_split_text_windows(text, family_max), start=1):
+            windows.append({
+                "id": f"{family.replace('_import', '').replace('_', '-')}-{idx:03d}",
+                "index": len(windows) + 1,
+                "total": 0,
+                "text": f"[{label} source window {idx}]\n{chunk}",
+                "line_start": 0,
+                "line_end": 0,
+                "first_ts": None,
+                "last_ts": None,
+                "support_only": True,
+                "source_families": [family],
+            })
+    return windows
+
+
 def _transcript_sample(messages: list[dict], max_chars: int = 18000) -> str:
-    support = [m for m in messages if str(m.get("source") or "") in _IMPORT_SUPPORT_SOURCES]
-    history = [m for m in messages if str(m.get("source") or "") not in _IMPORT_SUPPORT_SOURCES]
+    support = [m for m in messages if _is_import_support_message(m)]
+    history = [m for m in messages if not _is_import_support_message(m)]
     full = "\n".join(_format_import_message_line(m) for m in messages if _format_import_message_line(m))
     if len(full) <= max_chars:
         return full
 
     parts: list[str] = []
-    support_budget = min(5000, max(1200, max_chars // 4))
-    support_text = _sequential_transcript_sample(support, support_budget)
+    support_budget = min(7000, max(2000, max_chars // 3))
+    support_text = _source_briefing_text(support, support_budget)
     if support_text:
         parts.append("[Onboarding support material]\n" + support_text)
     history_budget = max(2000, max_chars - sum(len(p) + 2 for p in parts))
@@ -6296,34 +6507,43 @@ def _build_transcript_windows(
     max_windows: int | None = None,
     overlap_lines: int = 8,
 ) -> list[dict]:
-    support = [m for m in messages if str(m.get("source") or "") in _IMPORT_SUPPORT_SOURCES]
-    history = [m for m in messages if str(m.get("source") or "") not in _IMPORT_SUPPORT_SOURCES]
-    support_text = _sequential_transcript_sample(support, min(4500, max_chars // 4))
+    support = [m for m in messages if _is_import_support_message(m)]
+    history = [m for m in messages if not _is_import_support_message(m)]
+    support_windows = _support_source_windows(support, max_chars=max_chars)
+    support_text = _source_briefing_text(support, min(7000, max_chars // 3))
     history_lines = [
         {
             "line": _format_import_message_line(m),
             "ts": m.get("ts"),
-            "source": str(m.get("source") or "history_import"),
+            "source": _import_source_family(str(m.get("source") or "history_import")),
         }
         for m in history
     ]
     history_lines = [item for item in history_lines if item["line"]]
 
     if not history_lines:
-        only = _transcript_sample(support, max_chars=max_chars)
-        return [{
-            "id": "support-1",
-            "index": 1,
-            "total": 1,
-            "text": only,
-            "line_start": 0,
-            "line_end": 0,
-            "first_ts": None,
-            "last_ts": None,
-            "support_only": True,
-        }] if only else []
+        windows = support_windows
+        if not windows:
+            only = _transcript_sample(support, max_chars=max_chars)
+            windows = [{
+                "id": "support-1",
+                "index": 1,
+                "total": 1,
+                "text": only,
+                "line_start": 0,
+                "line_end": 0,
+                "first_ts": None,
+                "last_ts": None,
+                "support_only": True,
+                "source_families": sorted({_import_source_family(str(m.get("source") or "")) for m in support}),
+            }] if only else []
+        total_support = len(windows)
+        for idx, window in enumerate(windows, start=1):
+            window["index"] = idx
+            window["total"] = total_support
+        return windows
 
-    prefix = ("[Onboarding support material]\n" + support_text + "\n\n") if support_text else ""
+    prefix = ("[Global onboarding source briefing]\n" + support_text + "\n\n") if support_text else ""
     line_budget = max(4000, max_chars - len(prefix) - 80)
     chunks: list[dict] = []
     current: list[dict] = []
@@ -6350,8 +6570,11 @@ def _build_transcript_windows(
             "items": current,
         })
 
-    if max_windows is not None and len(chunks) > max_windows:
-        chunks = _select_evenly(chunks, max_windows)
+    history_window_budget = None
+    if max_windows is not None:
+        history_window_budget = max(1, max_windows - len(support_windows))
+        if len(chunks) > history_window_budget:
+            chunks = _select_evenly(chunks, history_window_budget)
 
     windows: list[dict] = []
     total_windows = len(chunks)
@@ -6369,8 +6592,14 @@ def _build_transcript_windows(
             "first_ts": first_ts,
             "last_ts": last_ts,
             "support_only": False,
+            "source_families": [_HISTORY_SOURCE],
         })
-    return windows
+    combined = support_windows + windows
+    total_combined = len(combined)
+    for idx, window in enumerate(combined, start=1):
+        window["index"] = idx
+        window["total"] = total_combined
+    return combined
 
 
 def _history_span_days(messages: list[dict]) -> int:
@@ -6587,6 +6816,7 @@ def _coerce_import_candidates(
     relationship_start: date,
     *,
     window_id: str = "",
+    source_families: list[str] | None = None,
 ) -> list[dict]:
     if isinstance(raw, dict):
         raw_items = raw.get("candidates")
@@ -6646,6 +6876,13 @@ def _coerce_import_candidates(
             first_seen = relationship_start.isoformat()
         if not _parse_iso_calendar_date(last_seen):
             last_seen = first_seen
+        families = sorted({
+            _import_source_family(str(source))
+            for source in (source_families or [])
+            if str(source or "").strip()
+        })
+        if not families:
+            families = [_HISTORY_SOURCE]
         out.append({
             "id": f"cand_{uuid.uuid4().hex[:12]}",
             "candidate_type": cand_type,
@@ -6659,6 +6896,7 @@ def _coerce_import_candidates(
             "confidence": max(0.0, min(confidence, 1.0)),
             "source_ids": [str(s)[:160] for s in item.get("source_ids", [])] if isinstance(item.get("source_ids"), list) else [],
             "chunk_ids": sorted(set([window_id] + ([str(c) for c in item.get("chunk_ids", [])] if isinstance(item.get("chunk_ids"), list) else []))),
+            "source_families": families,
         })
     return out
 
@@ -6696,6 +6934,16 @@ def _candidate_score(candidate: dict) -> float:
     if candidate.get("evidence_quotes"):
         score += min(10, 4 * len(candidate.get("evidence_quotes") or []))
     score += min(8, max(0, len(candidate.get("chunk_ids") or []) - 1) * 3)
+    families = set(str(s) for s in candidate.get("source_families") or [])
+    if _MEMORY_SUMMARY_SOURCE in families:
+        score += 20
+    if _USER_PROFILE_SOURCE in families and subject == "user":
+        score += 12
+    if _AI_PERSONA_SOURCE in families:
+        if subject == "ai" or ctype == "ai_character":
+            score += 18
+        elif subject == "user":
+            score -= 18
     if any(p.search(summary) for p in _LOW_VALUE_IMPORT_PATTERNS):
         score -= 45
     if _looks_like_import_artifact(summary):
@@ -6786,6 +7034,7 @@ def _merge_import_candidates(candidates: list[dict]) -> list[dict]:
                 cluster["evidence_quotes"] = list(dict.fromkeys((cluster.get("evidence_quotes") or []) + (cand.get("evidence_quotes") or [])))[:4]
                 cluster["source_ids"] = sorted(set((cluster.get("source_ids") or []) + (cand.get("source_ids") or [])))
                 cluster["chunk_ids"] = sorted(set((cluster.get("chunk_ids") or []) + (cand.get("chunk_ids") or [])))
+                cluster["source_families"] = sorted(set((cluster.get("source_families") or []) + (cand.get("source_families") or [])))
                 cluster["importance_signals"] = sorted(set((cluster.get("importance_signals") or []) + (cand.get("importance_signals") or [])))[:10]
                 cluster["confidence"] = max(float(cluster.get("confidence") or 0), float(cand.get("confidence") or 0))
                 cluster["_tokens"] = (cluster.get("_tokens") or set()).union(cand.get("_tokens") or set())
@@ -6848,8 +7097,8 @@ def _render_candidates_to_memory_cards(
 ) -> list[dict]:
     merged = _merge_import_candidates(candidates)
     quotas = {
-        "story": max(1, int(targets.get("story", 1))),
-        "about_me": max(1, int(targets.get("about_me", 1))),
+        "story": max(0, int(targets.get("story", 1))),
+        "about_me": max(0, int(targets.get("about_me", 1))),
         "ta_thinking": max(0, int(targets.get("ta_thinking", 0))),
     }
     target_total = int(targets.get("total") or sum(quotas.values()))
@@ -6876,7 +7125,11 @@ def _render_candidates_to_memory_cards(
             "title": _candidate_title(c, mem_type, language),
             "description": str(c.get("summary") or "")[:1200],
             "occurred_at": occurred,
-            "context": f"distilled from {len(c.get('chunk_ids') or [])} timeline window(s); score={float(c.get('score') or _candidate_score(c)):.1f}",
+            "context": (
+                f"distilled from {len(c.get('chunk_ids') or [])} source window(s); "
+                f"sources={','.join(str(s) for s in (c.get('source_families') or []))}; "
+                f"score={float(c.get('score') or _candidate_score(c)):.1f}"
+            ),
         }
         quotes = c.get("evidence_quotes") or []
         if quotes:
@@ -6921,6 +7174,7 @@ def _memory_candidate_extraction_prompt(
     language: str,
 ) -> str:
     sample = str(window.get("text") or "")
+    source_families = ", ".join(str(s) for s in (window.get("source_families") or [])) or "history_import"
     return (
         "Distill durable Feedling onboarding memory candidates from this material window. "
         "This is pass 1 of a two-pass pipeline: output candidates only, not final Memory Garden cards. "
@@ -6932,11 +7186,14 @@ def _memory_candidate_extraction_prompt(
         f"Return up to {per_window_target} candidates, fewer or zero if this window is generic task Q&A, assistant filler, raw JSON metadata, or has no durable relationship/user/AI-character signal. "
         "High-value candidates include stable user facts, preferences, boundaries, relationship milestones, emotional patterns, conflict/repair patterns, repeated themes, and AI character/voice definitions. "
         "Do not preserve ordinary knowledge questions, one-off task instructions, product copy, code/debug chatter, upload wrappers, file delimiters, or raw JSON keys. "
-        "Keep Character card content as subject=ai; keep Personal Profile content as subject=user; keep shared events as subject=relationship. "
+        "Source contract: AI Persona materials describe the AI companion and should mainly produce subject=ai / ai_character candidates; User Profile describes the user and should mainly produce subject=user candidates; "
+        "Memory Summary is a high-recall migration source, so split every meaningful durable detail into candidates instead of returning empty just because the material is already summarized; "
+        "Chat History is evidence for lived exchanges and relationship patterns. "
+        "Never treat User Profile facts as the AI companion's identity, name, or self-description. "
         "Do not make one candidate per message; merge repeated details inside this window. "
         f"{_language_instruction(language)} "
         f"If dates are unclear, use {relationship_start.isoformat()}."
-        f"\n\nWindow id: {window.get('id', idx)} ({idx}/{total})\nMaterial:\n{sample}"
+        f"\n\nWindow id: {window.get('id', idx)} ({idx}/{total})\nSource families: {source_families}\nMaterial:\n{sample}"
     )
 
 
@@ -6965,6 +7222,7 @@ def _repair_candidate_json_with_provider(
     relationship_start: date,
     window_id: str,
     language: str,
+    source_families: list[str] | None = None,
 ) -> list[dict]:
     prompt = (
         "The previous model response was not valid JSON for Feedling memory candidate extraction. "
@@ -6991,6 +7249,7 @@ def _repair_candidate_json_with_provider(
         _json_from_model_text(result["reply"]),
         relationship_start,
         window_id=window_id,
+        source_families=source_families,
     )
 
 
@@ -7006,6 +7265,7 @@ def _extract_memory_candidates_with_provider(
     warnings: list[str] = []
     all_candidates: list[dict] = []
     for idx, window in enumerate(windows, start=1):
+        source_families = [str(s) for s in (window.get("source_families") or [])]
         prompt = _memory_candidate_extraction_prompt(
             window,
             idx=idx,
@@ -7028,7 +7288,12 @@ def _extract_memory_candidates_with_provider(
             )
             reply = str(result.get("reply") or "")
             parsed = _json_from_model_text(reply)
-            all_candidates.extend(_coerce_import_candidates(parsed, relationship_start, window_id=str(window.get("id") or idx)))
+            all_candidates.extend(_coerce_import_candidates(
+                parsed,
+                relationship_start,
+                window_id=str(window.get("id") or idx),
+                source_families=source_families,
+            ))
         except Exception as e:
             repaired = False
             if reply:
@@ -7039,6 +7304,7 @@ def _extract_memory_candidates_with_provider(
                         relationship_start=relationship_start,
                         window_id=str(window.get("id") or idx),
                         language=language,
+                        source_families=source_families,
                     )
                     all_candidates.extend(repaired_candidates)
                     warnings.append(f"provider_candidate_json_repaired_window_{idx}:{len(repaired_candidates)}")
@@ -7068,7 +7334,12 @@ def _extract_memory_candidates_with_provider(
                             timeout=45.0,
                         )
                         retry_parsed = _json_from_model_text(retry_result["reply"])
-                        retry_candidates.extend(_coerce_import_candidates(retry_parsed, relationship_start, window_id=str(retry_window.get("id") or idx)))
+                        retry_candidates.extend(_coerce_import_candidates(
+                            retry_parsed,
+                            relationship_start,
+                            window_id=str(retry_window.get("id") or idx),
+                            source_families=[str(s) for s in (retry_window.get("source_families") or source_families)],
+                        ))
                     except Exception as retry_e:
                         warnings.append(f"provider_candidate_retry_failed_window_{idx}_part_{part_idx}:{type(retry_e).__name__}:{str(retry_e)[:100]}")
                 if retry_candidates:
@@ -7165,6 +7436,35 @@ def _natural_import_title(content: str, mem_type: str, language: str) -> str:
     return " ".join(words[:8])[:72] or "Imported memory"
 
 
+def _fallback_chunks_from_message(msg: dict, max_chunks: int = 18) -> list[str]:
+    content = _clean_import_memory_text(str(msg.get("content") or ""), max_chars=30000)
+    if not content:
+        return []
+    if ":" in content[:240]:
+        _, body = content.split(":", 1)
+        content = body.strip() or content
+    parts = [
+        part.strip(" \t\r\n-•*0123456789.、)）")
+        for part in re.split(r"(?:\n{2,}|\n\s*(?:[-*•]|\d+[.)、）])\s+)", content)
+    ]
+    chunks: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        clean = _clean_import_memory_text(part, max_chars=900)
+        if len(clean) < 8:
+            continue
+        norm = _normalize_card_similarity_text(clean)
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        chunks.append(clean)
+        if len(chunks) >= max_chunks:
+            break
+    if not chunks and content:
+        chunks = [content[:900]]
+    return chunks
+
+
 def _fallback_memory_cards(
     messages: list[dict],
     relationship_start: date,
@@ -7174,23 +7474,48 @@ def _fallback_memory_cards(
     language: str = "en",
 ) -> list[dict]:
     cards: list[dict] = []
-    usable: list[dict] = []
+    story_pool: list[dict] = []
+    about_pool: list[dict] = []
     for msg in messages:
         content = _clean_import_memory_text(str(msg.get("content") or ""))
         if not content:
             continue
         clean_msg = dict(msg)
         clean_msg["content"] = content
-        usable.append(clean_msg)
-    if not usable:
+        family = _import_source_family(str(clean_msg.get("source") or clean_msg.get("source_family") or ""))
+        if family in {_HISTORY_SOURCE, _MEMORY_SUMMARY_SOURCE, _FRESH_START_SOURCE}:
+            story_pool.append(clean_msg)
+        if family in {_HISTORY_SOURCE, _MEMORY_SUMMARY_SOURCE, _USER_PROFILE_SOURCE, _FRESH_START_SOURCE}:
+            about_pool.append(clean_msg)
+    if not story_pool and not about_pool and any(
+        _import_source_family(str(m.get("source") or m.get("source_family") or "")) == _FRESH_START_SOURCE
+        for m in messages
+    ):
         fallback_text = "从空白状态开始。" if str(language).startswith("zh") else "Fresh start with IO."
-        usable = [{"role": "user", "content": fallback_text, "ts": None}]
+        fresh = {"role": "user", "content": fallback_text, "ts": None, "source": _FRESH_START_SOURCE}
+        story_pool = [fresh]
+        about_pool = [fresh]
+
+    def expand(pool: list[dict], limit: int) -> list[tuple[dict, str]]:
+        expanded: list[tuple[dict, str]] = []
+        for msg in pool:
+            family = _import_source_family(str(msg.get("source") or msg.get("source_family") or ""))
+            chunk_limit = max(1, limit - len(expanded))
+            chunks = _fallback_chunks_from_message(
+                msg,
+                max_chunks=max(chunk_limit, 4 if family == _MEMORY_SUMMARY_SOURCE else 1),
+            )
+            for chunk in chunks:
+                expanded.append((msg, chunk))
+                if len(expanded) >= limit:
+                    return expanded
+        return expanded
 
     idx = 0
     story_types = ["moment", "quote"]
-    while story_needed > 0:
-        msg = usable[idx % len(usable)]
-        content = str(msg.get("content") or "").strip()
+    story_items = expand(story_pool, story_needed)
+    while story_needed > 0 and idx < len(story_items):
+        msg, content = story_items[idx]
         mem_type = story_types[idx % len(story_types)]
         title = _natural_import_title(content, mem_type, language)
         cards.append({
@@ -7199,14 +7524,16 @@ def _fallback_memory_cards(
             "description": content[:900],
             "her_quote": content[:360] if mem_type == "quote" and msg.get("role") == "user" else "",
             "occurred_at": _message_iso_date(msg, relationship_start),
+            "context": f"fallback source={_import_source_family(str(msg.get('source') or msg.get('source_family') or ''))}",
         })
         idx += 1
         story_needed -= 1
 
+    idx = 0
     about_types = ["fact", "event"]
-    while about_needed > 0:
-        msg = usable[idx % len(usable)]
-        content = str(msg.get("content") or "").strip()
+    about_items = expand(about_pool, about_needed)
+    while about_needed > 0 and idx < len(about_items):
+        msg, content = about_items[idx]
         mem_type = about_types[idx % len(about_types)]
         title = _natural_import_title(content, mem_type, language)
         cards.append({
@@ -7214,6 +7541,7 @@ def _fallback_memory_cards(
             "title": title,
             "description": content[:900],
             "occurred_at": _message_iso_date(msg, relationship_start),
+            "context": f"fallback source={_import_source_family(str(msg.get('source') or msg.get('source_family') or ''))}",
         })
         idx += 1
         about_needed -= 1
@@ -7227,24 +7555,38 @@ def _import_memory_targets(
     profile: dict | None = None,
 ) -> dict:
     profile = profile or _history_import_profile(history_messages, support_messages)
+    source_stats = _import_source_stats(support_messages + history_messages)
+    ai_persona_chars = int(source_stats.get(_AI_PERSONA_SOURCE, {}).get("chars") or 0)
+    user_profile_chars = int(source_stats.get(_USER_PROFILE_SOURCE, {}).get("chars") or 0)
+    memory_summary_chars = int(source_stats.get(_MEMORY_SUMMARY_SOURCE, {}).get("chars") or 0)
     cfg = _HISTORY_IMPORT_TIER_CONFIG.get(str(profile.get("tier") or "small"), _HISTORY_IMPORT_TIER_CONFIG["small"])
     story = int(cfg["story"])
     about = int(cfg["about_me"])
     thinking = int(cfg["ta_thinking"])
     if len(history_messages) <= 0:
-        story = 1
-        about = 2 if support_messages else 1
-        thinking = 0
+        story = 2 if memory_summary_chars else (1 if any(_import_source_family(str(m.get("source") or "")) == _FRESH_START_SOURCE for m in support_messages) else 0)
+        about = 3 if (memory_summary_chars or user_profile_chars) else (1 if support_messages else 0)
+        thinking = 2 if ai_persona_chars else 0
     elif str(profile.get("tier")) == "small":
         # Keep short histories compact; do not pad to the old bootstrap floors.
         story = min(story, max(2, len(history_messages) // 8 + 2))
         about = min(about, max(3, len(history_messages) // 5 + 3))
-    if support_messages:
-        about += min(6, len(support_messages) * 2)
+    if user_profile_chars:
+        about = max(about, 3)
+        about += min(5, max(1, user_profile_chars // 2500))
+    if memory_summary_chars:
+        story = max(story, 2)
+        about = max(about, 3)
+        extra = min(36, max(4, memory_summary_chars // 900))
+        story += max(1, extra // 3)
+        about += max(2, extra - (extra // 3))
+    if ai_persona_chars:
+        thinking = max(thinking, 2)
+        thinking += min(6, max(0, ai_persona_chars // 3500))
     total = max(2, story + about + thinking)
     return {
-        "story": max(1, story),
-        "about_me": max(1, about),
+        "story": max(0, story),
+        "about_me": max(0, about),
         "ta_thinking": max(0, thinking),
         "total": total,
         "tier": str(profile.get("tier") or "small"),
@@ -7253,6 +7595,7 @@ def _import_memory_targets(
         "chat_ready_cards": int(cfg["chat_ready_cards"]),
         "background": bool(cfg["background"]),
         "floor_reference": floors,
+        "source_stats": source_stats,
     }
 
 
@@ -7562,18 +7905,35 @@ def _derive_identity_with_provider(
 ) -> tuple[dict, list[str]]:
     warnings: list[str] = []
     memory_sample = json.dumps(memory_cards[:40], ensure_ascii=False)
+    source_stats = _import_source_stats(messages)
+    has_ai_persona = bool(source_stats.get(_AI_PERSONA_SOURCE, {}).get("chars"))
+    has_assistant_history = any(
+        str(m.get("role") or "") in {"assistant", "agent", "openclaw"}
+        for m in messages
+        if _import_source_family(str(m.get("source") or m.get("source_family") or "")) == _HISTORY_SOURCE
+    )
+    has_ai_memory = any(
+        str(card.get("type") or "") in {"insight", "reflection"}
+        or "ai" in str(card.get("context") or "").lower()
+        for card in memory_cards
+    )
     transcript = _transcript_sample(messages, max_chars=12000)
     prompt = (
-        "Derive a Feedling Identity Card from imported chat history and memory cards. "
+        "Derive a Feedling Identity Card for the AI companion from typed onboarding sources and Memory Garden cards. "
         "Return JSON only with fields: agent_name, self_introduction, category, "
         "signature (array of two short strings), dimensions (exactly 7 objects with "
         "name, value 0-100, description). Do not invent facts not grounded in input. "
+        "Source priority: AI Persona materials are the primary source for the AI companion's identity, voice, role, name, and boundaries. "
+        "Memory Garden cards are secondary evidence and may refine the identity. Chat History can show how the AI behaved in relationship. "
+        "User Profile describes the user only; use it as relationship context, never as the AI companion's self-description. "
+        "If there are no AI Persona materials, infer the companion only from assistant-side chat evidence, relationship patterns, and AI-related Memory Garden cards; otherwise keep the identity generic and ask the user to name/define the companion later. "
         "agent_name is the AI companion's own chosen or user-given name, not the user's name, account name, provider, model, runtime, platform, or product name. "
         "Only set agent_name when the imported Character Card or conversation explicitly names the AI companion; otherwise return an empty string for agent_name. "
         "self_introduction must be written in the AI companion's own voice; never describe the user as 'I'. "
         "High-risk personal claims such as legal/real name, address, or IDs require explicit user-authored evidence; otherwise omit them. "
         f"{_language_instruction(language)} "
-        f"days_with_user is {days}.\n\nMemory cards:\n{memory_sample}\n\nTranscript sample:\n{transcript}"
+        f"days_with_user is {days}.\n\nSource stats:\n{json.dumps(source_stats, ensure_ascii=False)}"
+        f"\n\nMemory cards:\n{memory_sample}\n\nTranscript sample:\n{transcript}"
     )
     try:
         result = chat_completion(
@@ -7586,7 +7946,15 @@ def _derive_identity_with_provider(
             temperature=0.3,
             timeout=45.0,
         )
-        return _normalize_identity_payload(_json_from_model_text(result["reply"]), memory_cards, days, language), warnings
+        identity = _normalize_identity_payload(_json_from_model_text(result["reply"]), memory_cards, days, language)
+        if not has_ai_persona and not has_assistant_history and not has_ai_memory:
+            fallback = _fallback_identity_payload(memory_cards, days, language)
+            identity["agent_name"] = ""
+            identity["self_introduction"] = fallback["self_introduction"]
+            identity["category"] = fallback["category"]
+            identity["signature"] = fallback["signature"]
+            warnings.append("identity_guard_no_ai_source_used_generic_identity")
+        return identity, warnings
     except Exception as e:
         warnings.append(f"provider_identity_failed:{type(e).__name__}:{str(e)[:160]}")
         return _fallback_identity_payload(memory_cards, days, language), warnings
@@ -7747,7 +8115,7 @@ def _process_history_import_sync(
     if not history_messages and not support_messages:
         if not bool(payload.get("fresh_start")):
             raise ValueError(
-                "content, agent_prompt_content, character_content, personal_profile_content, persona_content, "
+                "content, ai_persona_content, character_content, personal_profile_content, memory_summary_content, persona_content, "
                 "or fresh_start=true required"
             )
         support_messages = [{
@@ -7765,6 +8133,7 @@ def _process_history_import_sync(
 
     analysis_messages = support_messages + history_messages
     fallback_messages = history_messages if history_messages else support_messages
+    source_stats = _import_source_stats(analysis_messages)
     relationship_start, rel_err = _relationship_start_from_import(payload, fallback_messages)
     if relationship_start is None:
         raise ValueError(rel_err)
@@ -7792,6 +8161,7 @@ def _process_history_import_sync(
     _update_history_job_phase(store, job, "chat_history_importing", **{
         "format": fmt or "plaintext",
         "history_filename": str(payload.get("history_filename") or "")[:240],
+        "ai_persona_filename": str(payload.get("ai_persona_filename") or "")[:240],
         "character_filename": str(
             payload.get("character_filename")
             or payload.get("character_card_filename")
@@ -7808,11 +8178,20 @@ def _process_history_import_sync(
             or payload.get("persona_filename")
             or ""
         )[:240],
+        "memory_summary_filename": str(
+            payload.get("memory_summary_filename")
+            or payload.get("memory_sample_filename")
+            or ""
+        )[:240],
         "messages_parsed": len(history_messages),
         "support_materials": len(support_messages),
-        "agent_prompt_chars": sum(len(str(m.get("content") or "")) for m in support_messages if m.get("source") == "agent_prompt_import"),
-        "character_chars": sum(len(str(m.get("content") or "")) for m in support_messages if m.get("source") == "character_import"),
-        "persona_chars": sum(len(str(m.get("content") or "")) for m in support_messages if m.get("source") == "persona_import"),
+        "source_stats": source_stats,
+        "ai_persona_chars": int(source_stats.get(_AI_PERSONA_SOURCE, {}).get("chars") or 0),
+        "agent_prompt_chars": sum(len(str(m.get("content") or "")) for m in support_messages if m.get("source_detail") == "agent_prompt_import"),
+        "character_chars": sum(len(str(m.get("content") or "")) for m in support_messages if m.get("source_detail") == "character_import"),
+        "user_profile_chars": int(source_stats.get(_USER_PROFILE_SOURCE, {}).get("chars") or 0),
+        "persona_chars": int(source_stats.get(_USER_PROFILE_SOURCE, {}).get("chars") or 0),
+        "memory_summary_chars": int(source_stats.get(_MEMORY_SUMMARY_SOURCE, {}).get("chars") or 0),
         "import_language": language,
         "relationship_started_at": relationship_start.isoformat(),
         "relationship_days": days,
@@ -7868,8 +8247,8 @@ def _process_history_import_sync(
         cards,
         fallback_messages,
         relationship_start,
-        min_story=1,
-        min_about=1,
+        min_story=min(1, int(import_targets.get("story") or 0)),
+        min_about=min(1, int(import_targets.get("about_me") or 0)),
         language=language,
     )
     cards = _sort_memory_cards_newest_first(cards)
@@ -8103,6 +8482,11 @@ def history_import_upload():
         "input_hash": input_hash,
         "created_at": _now_iso(),
         "content_chars": len(str(payload.get("content") or "")),
+        "ai_persona_chars": len(str(
+            payload.get("ai_persona_content")
+            or payload.get("ai_persona")
+            or ""
+        )),
         "character_chars": len(str(
             payload.get("character_content")
             or payload.get("character_card")
@@ -8124,6 +8508,14 @@ def history_import_upload():
             or payload.get("profile_content")
             or ""
         )),
+        "memory_summary_chars": len(str(
+            payload.get("memory_summary_content")
+            or payload.get("memory_summary")
+            or payload.get("memory_sample_content")
+            or payload.get("memory_sample")
+            or ""
+        )),
+        "ai_persona_filename": str(payload.get("ai_persona_filename") or "")[:240],
         "character_filename": str(
             payload.get("character_filename")
             or payload.get("character_card_filename")
@@ -8138,6 +8530,11 @@ def history_import_upload():
         "persona_filename": str(
             payload.get("personal_profile_filename")
             or payload.get("persona_filename")
+            or ""
+        )[:240],
+        "memory_summary_filename": str(
+            payload.get("memory_summary_filename")
+            or payload.get("memory_sample_filename")
             or ""
         )[:240],
         "chat_ready": False,
@@ -14422,6 +14819,10 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
             "progress": (latest_job or {}).get("progress", 0),
             "messages_parsed": (latest_job or {}).get("messages_parsed", 0),
             "support_materials": (latest_job or {}).get("support_materials", 0),
+            "source_stats": (latest_job or {}).get("source_stats", {}),
+            "ai_persona_chars": (latest_job or {}).get("ai_persona_chars", 0),
+            "user_profile_chars": (latest_job or {}).get("user_profile_chars", (latest_job or {}).get("persona_chars", 0)),
+            "memory_summary_chars": (latest_job or {}).get("memory_summary_chars", 0),
             "memories_created": (latest_job or {}).get("memories_created", 0),
             "history_tier": (latest_job or {}).get("history_tier", ""),
             "timeline_span_days": (latest_job or {}).get("timeline_span_days", 0),
@@ -14434,7 +14835,7 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
             "background_windows_done": (latest_job or {}).get("background_windows_done", 0),
             "background_windows_total": (latest_job or {}).get("background_windows_total", 0),
             "required": (
-                "Start onboarding with a chat history file, persona profile, or confirmed fresh start."
+                "Start onboarding with AI persona materials, user profile, memory summary, chat history, or confirmed fresh start."
                 if not history_ok else ""
             ),
         },
@@ -14946,6 +15347,10 @@ def _history_import_stats(store: UserStore) -> dict:
         "error": latest.get("error", ""),
         "messages_parsed": latest.get("messages_parsed", 0),
         "support_materials": latest.get("support_materials", 0),
+        "source_stats": latest.get("source_stats", {}),
+        "ai_persona_chars": latest.get("ai_persona_chars", 0),
+        "user_profile_chars": latest.get("user_profile_chars", latest.get("persona_chars", 0)),
+        "memory_summary_chars": latest.get("memory_summary_chars", 0),
         "chat_messages_imported": latest.get("chat_messages_imported", 0),
         "memories_created": latest.get("memories_created", 0),
         "identity_written": bool(latest.get("identity_written")),
@@ -15122,6 +15527,10 @@ def _data_track_history_import_from_snapshot(snap: dict) -> dict:
         "error": latest.get("error", ""),
         "messages_parsed": latest.get("messages_parsed", 0),
         "support_materials": latest.get("support_materials", 0),
+        "source_stats": latest.get("source_stats", {}),
+        "ai_persona_chars": latest.get("ai_persona_chars", 0),
+        "user_profile_chars": latest.get("user_profile_chars", latest.get("persona_chars", 0)),
+        "memory_summary_chars": latest.get("memory_summary_chars", 0),
         "chat_messages_imported": latest.get("chat_messages_imported", 0),
         "memories_created": latest.get("memories_created", 0),
         "identity_written": bool(latest.get("identity_written")),
@@ -15188,7 +15597,7 @@ def _data_track_fast_validation(
                 "history_import",
                 "Onboarding Materials",
                 history_ok,
-                "Start onboarding with a chat history file, persona profile, or confirmed fresh start.",
+                "Start onboarding with AI persona materials, user profile, memory summary, chat history, or confirmed fresh start.",
                 job_status=history_import.get("status", ""),
                 phase=history_import.get("phase", ""),
                 progress=history_import.get("progress", 0),

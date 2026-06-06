@@ -1368,8 +1368,9 @@ def test_support_material_sections_split_character_and_personal_profile():
 
     support = appmod._persona_support_messages(payload)
 
-    assert [m["source"] for m in support] == ["agent_prompt_import", "character_import", "persona_import"]
-    assert "Original agent prompt (system.md)" in support[0]["content"]
+    assert [m["source"] for m in support] == ["ai_persona_import", "ai_persona_import", "user_profile_import"]
+    assert [m["source_detail"] for m in support] == ["ai_persona_import", "ai_persona_import", "user_profile_import"]
+    assert "AI Persona material (system.md)" in support[0]["content"]
     assert "猫猫语气" in support[0]["content"]
     assert "小哆啦" in support[1]["content"]
     assert "用户喜欢直接的反馈" in support[2]["content"]
@@ -1388,13 +1389,111 @@ def test_support_materials_accept_explicit_agent_character_and_personal_profile_
 
     support = appmod._persona_support_messages(payload)
 
-    assert [m["source"] for m in support] == ["agent_prompt_import", "character_import", "persona_import"]
-    assert "Original agent prompt (system.md)" in support[0]["content"]
-    assert "Character card (character.md)" in support[1]["content"]
-    assert "Personal profile (profile.md)" in support[2]["content"]
+    assert [m["source"] for m in support] == ["ai_persona_import", "ai_persona_import", "user_profile_import"]
+    assert [m["source_detail"] for m in support] == ["agent_prompt_import", "character_import", "user_profile_import"]
+    assert "AI Persona material (system.md)" in support[0]["content"]
+    assert "AI Persona material (character.md)" in support[1]["content"]
+    assert "User profile (profile.md)" in support[2]["content"]
     assert "已经习惯的语气" in support[0]["content"]
     assert "小哆啦" in support[1]["content"]
     assert "用户喜欢直接的反馈" in support[2]["content"]
+
+
+def test_support_materials_accept_memory_summary_as_first_class_source():
+    payload = {
+        "ai_persona_content": "TA 叫小哆啦，语气稳定。",
+        "ai_persona_filename": "persona.txt",
+        "memory_summary_content": "1. 用户在五月反复提到需要稳定陪伴。\n2. 他们约定重要提醒要直接说。",
+        "memory_summary_filename": "memory.txt",
+        "personal_profile_content": "用户喜欢直接反馈。",
+        "personal_profile_filename": "profile.txt",
+    }
+
+    support = appmod._persona_support_messages(payload)
+
+    assert [m["source"] for m in support] == [
+        "ai_persona_import",
+        "user_profile_import",
+        "memory_summary_import",
+    ]
+    assert "AI Persona material (persona.txt)" in support[0]["content"]
+    assert "User profile (profile.txt)" in support[1]["content"]
+    assert "Memory summary (memory.txt)" in support[2]["content"]
+
+
+def test_history_import_windows_keep_memory_summary_separate_from_large_history():
+    payload = {
+        "ai_persona_content": "TA 叫小哆啦，语气稳定。",
+        "memory_summary_content": "用户在五月反复提到需要稳定陪伴。\n他们约定重要提醒要直接说。",
+    }
+    support = appmod._persona_support_messages(payload)
+    history = [
+        {"role": "user", "content": f"history line {idx}", "source": "history_import"}
+        for idx in range(240)
+    ]
+
+    windows = appmod._build_transcript_windows(
+        support + history,
+        max_chars=2500,
+        max_windows=4,
+    )
+
+    assert any(w.get("source_families") == ["memory_summary_import"] for w in windows)
+    assert any(w.get("source_families") == ["ai_persona_import"] for w in windows)
+    assert any(w.get("source_families") == ["history_import"] for w in windows)
+    assert any("用户在五月反复提到需要稳定陪伴" in w["text"] for w in windows)
+
+
+def test_memory_summary_fallback_splits_high_recall_cards_without_ai_persona_story_pollution():
+    messages = appmod._persona_support_messages({
+        "ai_persona_content": "TA 叫小哆啦，温柔稳定。",
+        "memory_summary_content": "1. 用户在五月反复提到需要稳定陪伴。\n2. 用户希望重要提醒要直接说。\n3. 他们在一次争执后约定先确认情绪。",
+        "personal_profile_content": "用户喜欢直接反馈。",
+    })
+
+    cards = appmod._fallback_memory_cards(
+        messages,
+        appmod.date(2026, 5, 1),
+        story_needed=2,
+        about_needed=2,
+        language="zh-Hans",
+    )
+
+    assert len(cards) >= 4
+    assert not any("温柔稳定" in c["description"] and c["type"] in {"moment", "quote"} for c in cards)
+    assert any("稳定陪伴" in c["description"] for c in cards)
+    assert any("直接" in c["description"] for c in cards)
+
+
+def test_identity_without_ai_source_does_not_use_user_profile_as_companion(monkeypatch):
+    def fake_chat_completion(cfg, messages, **kwargs):
+        return {
+            "reply": appmod.json.dumps({
+                "agent_name": "Seven",
+                "self_introduction": "我是 Seven，我喜欢直接反馈，也在做 Feedling。",
+                "category": "用户画像",
+                "signature": ["直接反馈", "做产品"],
+                "dimensions": [
+                    {"name": f"维度{i}", "value": 50, "description": "来自用户档案。"}
+                    for i in range(7)
+                ],
+            }, ensure_ascii=False),
+            "usage": {},
+        }
+
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    identity, warnings = appmod._derive_identity_with_provider(
+        appmod.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
+        [{"role": "user", "content": "User profile:\n用户叫 Seven，喜欢直接反馈。", "source": "user_profile_import"}],
+        [],
+        3,
+        "zh-Hans",
+    )
+
+    assert identity["agent_name"] == ""
+    assert "Seven" not in identity["self_introduction"]
+    assert "identity_guard_no_ai_source_used_generic_identity" in warnings
 
 
 def test_support_materials_extract_chatgpt_memories_json_without_raw_artifacts():
