@@ -182,7 +182,7 @@ def test_model_api_chat_background_runtime_executes_detected_identity_rename(cli
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "Feedling Hosted Runtime's state action planner" in joined:
+        if "Feedling hosted runtime's background execution controller" in joined:
             return {
                 "reply": json.dumps({
                     "actions": [{
@@ -194,7 +194,7 @@ def test_model_api_chat_background_runtime_executes_detected_identity_rename(cli
                 }),
                 "usage": {"total_tokens": 3},
             }
-        return {"reply": "改好了，我现在叫小秘。", "usage": {"total_tokens": 9}}
+        return {"reply": "收到，我以后就叫小秘。", "usage": {"total_tokens": 9}}
 
     monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
     monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
@@ -214,10 +214,10 @@ def test_model_api_chat_background_runtime_executes_detected_identity_rename(cli
 
     assert res.status_code == 200, res.get_data(as_text=True)
     body = res.get_json()
-    assert body["reply"] == "改好了，我现在叫小秘。"
+    assert body["reply"] == "收到，我以后就叫小秘。"
     assert body["effects"] == []
     assert body["identity_actions"] == []
-    assert body["state"]["planner"]["status"] == "completed"
+    assert body["state"]["background_execution"]["status"] == "completed"
     assert any(isinstance(item, dict) and item.get("agent_name") == "小秘" for item in captured_plaintexts)
 
 
@@ -239,7 +239,7 @@ def test_model_api_chat_background_runtime_nudges_identity_dimension(client, mon
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "Feedling Hosted Runtime's state action planner" in joined:
+        if "Feedling hosted runtime's background execution controller" in joined:
             return {
                 "reply": json.dumps({
                     "actions": [{
@@ -276,7 +276,7 @@ def test_model_api_chat_background_runtime_nudges_identity_dimension(client, mon
     body = res.get_json()
     assert body["effects"] == []
     assert body["identity_actions"] == []
-    assert body["state"]["planner"]["status"] == "completed"
+    assert body["state"]["background_execution"]["status"] == "completed"
     saved_identity = next(item for item in captured_plaintexts if isinstance(item, dict) and item.get("dimensions"))
     changed = next(dim for dim in saved_identity["dimensions"] if dim.get("name") == "Context retention")
     assert changed["value"] == 93
@@ -348,7 +348,7 @@ def test_model_api_chat_background_runtime_executes_memory_context_patch(client,
     def fake_chat_completion(cfg, messages, **kwargs):
         calls["n"] += 1
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "Feedling Hosted Runtime's state action planner" in joined:
+        if "Feedling hosted runtime's background execution controller" in joined:
             return {
                 "reply": json.dumps({
                     "actions": [{
@@ -363,7 +363,7 @@ def test_model_api_chat_background_runtime_executes_memory_context_patch(client,
             }
         if "Memory Capture worker" in joined:
             return {"reply": '{"memories":[]}', "usage": {}}
-        return {"reply": "改好了，Memory Garden 已更新。", "usage": {}}
+        return {"reply": "我把这条记忆改成东京了。", "usage": {}}
 
     monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
     monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
@@ -389,7 +389,7 @@ def test_model_api_chat_background_runtime_executes_memory_context_patch(client,
     body = res.get_json()
     assert body["effects"] == []
     assert body["memory_actions"] == []
-    assert body["state"]["planner"]["status"] == "completed"
+    assert body["state"]["background_execution"]["status"] == "completed"
     assert any(isinstance(item, dict) and item.get("description") == "User moved to Tokyo in April." for item in captured_plaintexts)
     assert body["context"]["context_refs"] == 1
 
@@ -422,7 +422,7 @@ def test_model_api_chat_background_runtime_writes_general_correction_memory(clie
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "Feedling Hosted Runtime's state action planner" in joined:
+        if "Feedling hosted runtime's background execution controller" in joined:
             return {
                 "reply": json.dumps({
                     "actions": [{
@@ -442,7 +442,7 @@ def test_model_api_chat_background_runtime_writes_general_correction_memory(clie
             }
         if "Memory Capture worker" in joined:
             return {"reply": '{"memories":[]}', "usage": {}}
-        return {"reply": '{"reply":"改好了，我以后不会再用这个设定。","thinking_summary":"写入了一条纠正记忆。"}', "usage": {}}
+        return {"reply": '{"reply":"我以后不会再用这个设定。","thinking_summary":"记下了这条纠正。"}', "usage": {}}
 
     monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
     monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
@@ -462,10 +462,10 @@ def test_model_api_chat_background_runtime_writes_general_correction_memory(clie
 
     assert res.status_code == 200, res.get_data(as_text=True)
     body = res.get_json()
-    assert body["reply"] == "改好了，我以后不会再用这个设定。"
+    assert body["reply"] == "我以后不会再用这个设定。"
     assert body["effects"] == []
     assert body["memory_actions"] == []
-    assert body["state"]["planner"]["status"] == "completed"
+    assert body["state"]["background_execution"]["status"] == "completed"
     assert context_params[-1]["context_mode"] == "model_api"
     assert any(
         isinstance(item, dict)
@@ -493,7 +493,7 @@ def test_model_api_chat_background_runtime_patches_user_preferred_name(client, m
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "Feedling Hosted Runtime's state action planner" in joined:
+        if "Feedling hosted runtime's background execution controller" in joined:
             return {
                 "reply": json.dumps({
                     "actions": [{
@@ -529,7 +529,7 @@ def test_model_api_chat_background_runtime_patches_user_preferred_name(client, m
     assert res.status_code == 200, res.get_data(as_text=True)
     body = res.get_json()
     assert body["effects"] == []
-    assert body["state"]["planner"]["status"] == "completed"
+    assert body["state"]["background_execution"]["status"] == "completed"
     assert any(
         isinstance(item, dict)
         and item.get("user_preferred_name") == "Seven"
@@ -567,7 +567,7 @@ def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(clien
 
     def fake_chat_completion(cfg, messages, **kwargs):
         joined = "\n".join(str(m.get("content") or "") for m in messages)
-        if "Feedling Hosted Runtime's state action planner" in joined:
+        if "Feedling hosted runtime's background execution controller" in joined:
             if "确认" in joined:
                 return {
                     "reply": json.dumps({
@@ -619,7 +619,7 @@ def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(clien
     )
     assert first.status_code == 200, first.get_data(as_text=True)
     first_body = first.get_json()
-    assert first_body["state"]["planner"]["status"] == "pending_confirmation"
+    assert first_body["state"]["background_execution"]["status"] == "pending_confirmation"
     assert first_body["state"]["pending"]
     assert first_body["state"]["pending"][0]["target"] == "烧卖和蒸饺设定"
     assert len(appmod.db.memory_load(user_id)) == 1
@@ -636,7 +636,7 @@ def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(clien
     assert second.status_code == 200, second.get_data(as_text=True)
     second_body = second.get_json()
     assert second_body["effects"] == []
-    assert second_body["state"]["planner"]["status"] == "completed"
+    assert second_body["state"]["background_execution"]["status"] == "completed"
     assert len(appmod.db.memory_load(user_id)) == 0
 
 
@@ -684,4 +684,4 @@ def test_model_api_chat_skips_running_capture_on_ordinary_turn_until_cadence(cli
     assert body["capture"]["status"] == "skipped"
     assert body["capture"]["reason"].startswith("cadence:")
     assert len(provider_calls) == 1
-    assert "Feedling Hosted Runtime's state action planner" not in provider_calls[0]
+    assert "Feedling hosted runtime's background execution controller" not in provider_calls[0]

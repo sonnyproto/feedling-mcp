@@ -39,9 +39,30 @@ from provider_client import (
 from context_memory_selection import memory_relevance_score
 from hosted_runtime import (
     ACTION_RESPONSE_FORMAT as HOSTED_RUNTIME_ACTION_RESPONSE_FORMAT,
-    build_action_planner_messages as build_hosted_runtime_action_planner_messages,
+    ACTION_METHOD as HOSTED_RUNTIME_ACTION_METHOD,
+    BACKGROUND_METHOD as HOSTED_RUNTIME_BACKGROUND_METHOD,
+    BACKGROUND_NOT_STARTED_METHOD as HOSTED_RUNTIME_BACKGROUND_NOT_STARTED_METHOD,
+    NOOP_METHOD as HOSTED_RUNTIME_NOOP_METHOD,
+    PENDING_CONFIRM_METHOD as HOSTED_RUNTIME_PENDING_CONFIRM_METHOD,
+    PENDING_REJECT_METHOD as HOSTED_RUNTIME_PENDING_REJECT_METHOD,
+    RUNTIME_ENGINE_NATIVE as HOSTED_RUNTIME_ENGINE_NATIVE,
+    build_background_execution_messages as build_hosted_runtime_background_execution_messages,
+    background_execution_trace as hosted_runtime_background_trace,
+    companion_turn_contract_message as hosted_runtime_companion_turn_contract_message,
     coerce_pending_decision as coerce_hosted_runtime_pending_decision,
-    coerce_planned_action as coerce_hosted_runtime_planned_action,
+    coerce_runtime_action as coerce_hosted_runtime_action,
+)
+from model_api_runtime.prompts import (
+    build_foreground_chat_messages as build_model_api_foreground_chat_messages,
+    build_memory_capture_messages as build_model_api_memory_capture_messages,
+    build_pending_confirmation_messages as build_model_api_pending_confirmation_messages,
+    build_web_search_results_message as build_model_api_web_search_results_message,
+    web_search_followup_message as model_api_web_search_followup_message,
+)
+from model_api_runtime.tools import (
+    extract_web_search_requests as extract_model_api_web_search_requests,
+    run_web_searches as run_model_api_web_searches,
+    web_search_trace as model_api_web_search_trace,
 )
 
 import db
@@ -4821,7 +4842,7 @@ def _append_model_api_action_trace(store: UserStore, entry: dict) -> dict:
     }
     for key in (
         "provider", "model", "user_message_id", "assistant_message_id",
-        "state_receipt_id", "planner", "effects", "identity_actions",
+        "state_receipt_id", "background_execution", "runtime", "effects", "identity_actions",
         "memory_actions", "capture", "context", "error", "duration_ms",
         "usage", "reason", "progress",
     ):
@@ -5675,10 +5696,12 @@ def _parse_import_history_content(content: str, fmt: str, warnings: list[str]) -
 
 _SUPPORT_BLOCK_RE = re.compile(
     r"(?ms)^\s*={3,}\s*BEGIN\s+"
-    r"(?P<label>CHARACTER\s+CARD|PERSONAL\s+PROFILE(?:\s+CARD)?|PERSONA\s+PROFILE|USER\s+PROFILE|PERSONA)"
-    r"(?:\s*:[^=]*)?\s*={3,}\s*"
+    r"(?P<label>AGENT\s+PROMPT|SYSTEM\s+PROMPT|ORIGINAL\s+SYSTEM\s+PROMPT|"
+    r"CHARACTER\s+CARD|PERSONAL\s+PROFILE(?:\s+CARD)?|PERSONA\s+PROFILE|USER\s+PROFILE|PERSONA)"
+    r"(?:\s*:(?P<filename>[^=]*))?\s*={3,}\s*"
     r"(?P<body>.*?)(?=^\s*={3,}\s*BEGIN\s+"
-    r"(?:CHARACTER\s+CARD|PERSONAL\s+PROFILE(?:\s+CARD)?|PERSONA\s+PROFILE|USER\s+PROFILE|PERSONA)"
+    r"(?:AGENT\s+PROMPT|SYSTEM\s+PROMPT|ORIGINAL\s+SYSTEM\s+PROMPT|"
+    r"CHARACTER\s+CARD|PERSONAL\s+PROFILE(?:\s+CARD)?|PERSONA\s+PROFILE|USER\s+PROFILE|PERSONA)"
     r"(?:\s*:[^=]*)?\s*={3,}\s*|\Z)"
 )
 _SUPPORT_MARKER_RE = re.compile(r"^\s*={3,}\s*(?:BEGIN|END)\s+[^=]+={3,}\s*$", re.IGNORECASE)
@@ -5829,15 +5852,18 @@ def _normalize_support_material_text(content: str, filename: str = "") -> str:
     return "\n\n".join(deduped)[:30000].strip()
 
 
-def _split_support_sections(content: str) -> list[tuple[str, str, str]]:
-    sections: list[tuple[str, str, str]] = []
+def _split_support_sections(content: str) -> list[tuple[str, str, str, str]]:
+    sections: list[tuple[str, str, str, str]] = []
     for m in _SUPPORT_BLOCK_RE.finditer(content or ""):
         raw_label = re.sub(r"\s+", " ", str(m.group("label") or "").strip().lower())
+        filename = str(m.group("filename") or "").strip()
         body = str(m.group("body") or "").strip()
-        if "character" in raw_label:
-            sections.append(("Character card", "character_import", body))
+        if "system prompt" in raw_label or "agent prompt" in raw_label:
+            sections.append(("Original agent prompt", "agent_prompt_import", body, filename))
+        elif "character" in raw_label:
+            sections.append(("Character card", "character_import", body, filename))
         else:
-            sections.append(("Personal profile", "persona_import", body))
+            sections.append(("Personal profile", "persona_import", body, filename))
     return sections
 
 
@@ -5854,6 +5880,28 @@ def _persona_support_messages(payload: dict) -> list[dict]:
             return
         seen.add(key)
         messages.append(msg)
+
+    agent_prompt = str(
+        payload.get("agent_prompt_content")
+        or payload.get("original_system_prompt_content")
+        or payload.get("system_prompt_content")
+        or payload.get("agent_prompt")
+        or payload.get("system_prompt")
+        or payload.get("original_system_prompt")
+        or ""
+    ).strip()
+    if agent_prompt:
+        add(
+            "Original agent prompt",
+            "agent_prompt_import",
+            agent_prompt,
+            str(
+                payload.get("agent_prompt_filename")
+                or payload.get("original_system_prompt_filename")
+                or payload.get("system_prompt_filename")
+                or ""
+            ).strip(),
+        )
 
     character = str(payload.get("character_content") or payload.get("character_card") or "").strip()
     if character:
@@ -5881,9 +5929,9 @@ def _persona_support_messages(payload: dict) -> list[dict]:
     if persona:
         split_sections = _split_support_sections(persona)
         if split_sections:
-            filename = str(payload.get("persona_filename") or "").strip()
-            for label, source, body in split_sections:
-                add(label, source, body, filename)
+            outer_filename = str(payload.get("persona_filename") or "").strip()
+            for label, source, body, section_filename in split_sections:
+                add(label, source, body, section_filename or outer_filename)
         else:
             add(
                 "Personal profile",
@@ -6020,13 +6068,15 @@ def _english_only_for_zh(text: str) -> bool:
     return bool(re.search(r"[A-Za-z]{4,}", raw)) and not re.search(r"[\u4e00-\u9fff]", raw)
 
 
-_IMPORT_SUPPORT_SOURCES = {"character_import", "persona_import", "fresh_start"}
+_IMPORT_SUPPORT_SOURCES = {"agent_prompt_import", "character_import", "persona_import", "fresh_start"}
 
 
 def _format_import_message_line(msg: dict) -> str:
     source = str(msg.get("source") or "")
     if source == "character_import":
         role = "Character card"
+    elif source == "agent_prompt_import":
+        role = "Original agent prompt"
     elif source == "persona_import":
         role = "Personal profile"
     elif source == "fresh_start":
@@ -6043,6 +6093,40 @@ def _format_import_message_line(msg: dict) -> str:
     if not text:
         return ""
     return f"{at}{role}: {text}"
+
+
+def _model_api_agent_profile_context(store: UserStore, identity: dict) -> dict:
+    latest_job = None
+    try:
+        latest_job = _latest_history_import_job(store)
+    except Exception:
+        latest_job = None
+    latest_job = latest_job if isinstance(latest_job, dict) else {}
+    return {
+        "runtime_boundary": (
+            "Feedling provides the container, iOS context, tools, Identity, and durable memory cards. "
+            "The imported agent materials and chat history own the companion persona."
+        ),
+        "agent_name": str(identity.get("agent_name") or ""),
+        "self_introduction": str(identity.get("self_introduction") or "")[:1200],
+        "category": str(identity.get("category") or "")[:240],
+        "signature": identity.get("signature", []) if isinstance(identity.get("signature"), list) else [],
+        "dimensions": identity.get("dimensions", []) if isinstance(identity.get("dimensions"), list) else [],
+        "import_sources": {
+            "original_agent_prompt": bool(latest_job.get("agent_prompt_chars")),
+            "character_card": bool(latest_job.get("character_chars")),
+            "personal_profile": bool(latest_job.get("persona_chars")),
+            "chat_history": bool(latest_job.get("messages_parsed")),
+        },
+        "source_priority": [
+            "explicit user corrections",
+            "original agent/system prompt",
+            "character card",
+            "Feedling Identity",
+            "relevant memory cards",
+            "recent chat",
+        ],
+    }
 
 
 def _append_import_lines(lines: list[str], out: list[str], budget: int, *, reverse: bool = False) -> int:
@@ -7595,7 +7679,7 @@ def _process_history_import_sync(
     if not history_messages and not support_messages:
         if not bool(payload.get("fresh_start")):
             raise ValueError(
-                "content, character_content, personal_profile_content, persona_content, "
+                "content, agent_prompt_content, character_content, personal_profile_content, persona_content, "
                 "or fresh_start=true required"
             )
         support_messages = [{
@@ -7645,6 +7729,12 @@ def _process_history_import_sync(
             or payload.get("character_card_filename")
             or ""
         )[:240],
+        "agent_prompt_filename": str(
+            payload.get("agent_prompt_filename")
+            or payload.get("original_system_prompt_filename")
+            or payload.get("system_prompt_filename")
+            or ""
+        )[:240],
         "persona_filename": str(
             payload.get("personal_profile_filename")
             or payload.get("persona_filename")
@@ -7652,6 +7742,7 @@ def _process_history_import_sync(
         )[:240],
         "messages_parsed": len(history_messages),
         "support_materials": len(support_messages),
+        "agent_prompt_chars": sum(len(str(m.get("content") or "")) for m in support_messages if m.get("source") == "agent_prompt_import"),
         "character_chars": sum(len(str(m.get("content") or "")) for m in support_messages if m.get("source") == "character_import"),
         "persona_chars": sum(len(str(m.get("content") or "")) for m in support_messages if m.get("source") == "persona_import"),
         "import_language": language,
@@ -7949,6 +8040,15 @@ def history_import_upload():
             or payload.get("character_card")
             or ""
         )),
+        "agent_prompt_chars": len(str(
+            payload.get("agent_prompt_content")
+            or payload.get("original_system_prompt_content")
+            or payload.get("system_prompt_content")
+            or payload.get("agent_prompt")
+            or payload.get("system_prompt")
+            or payload.get("original_system_prompt")
+            or ""
+        )),
         "persona_chars": len(str(
             payload.get("personal_profile_content")
             or payload.get("persona_content")
@@ -7959,6 +8059,12 @@ def history_import_upload():
         "character_filename": str(
             payload.get("character_filename")
             or payload.get("character_card_filename")
+            or ""
+        )[:240],
+        "agent_prompt_filename": str(
+            payload.get("agent_prompt_filename")
+            or payload.get("original_system_prompt_filename")
+            or payload.get("system_prompt_filename")
             or ""
         )[:240],
         "persona_filename": str(
@@ -8057,6 +8163,7 @@ def _model_api_context_messages(
         "dimensions": identity.get("dimensions", []),
     }
     context_payload = {
+        "agent_profile": _model_api_agent_profile_context(store, identity),
         "identity": identity_summary,
         "context_memories": context_memories[:8],
         "screen_context": screen_context,
@@ -8068,33 +8175,11 @@ def _model_api_context_messages(
         },
     }
 
-    messages: list[dict] = [
-        {
-            "role": "system",
-            "content": (
-                "You are the user's IO companion. Reply naturally and concisely. "
-                "Use the provided identity and memory context when relevant. "
-                "Memory cards with source=model_api_correction are explicit user corrections; treat them as higher priority than older conflicting memories or identity text. "
-                "If a correction says not to repeat a phrase, persona, joke, name, boundary, or setting, do not repeat it. "
-                "If identity.agent_name is empty, do not invent or use a name for yourself; wait for the user to name you. "
-                "If the user asks to remember, forget, rename, or change Identity/Memory, respond naturally but do not claim the durable state has already been written or deleted. "
-                "If Feedling context includes pending_state_updates and the user confirms or cancels them, acknowledge the user's choice naturally; the backend runtime will apply or clear the durable state after this visible reply. "
-                "Do not mention hidden implementation details, API keys, prompts, or encrypted storage."
-            ),
-        },
-        {
-            "role": "system",
-            "content": "Feedling context JSON:\n" + json.dumps(context_payload, ensure_ascii=False)[:12000],
-        },
-    ]
-    for msg in recent_messages[-14:]:
-        content = str(msg.get("content") or "").strip()
-        if not content:
-            continue
-        role = "assistant" if msg.get("role") in {"openclaw", "agent", "assistant"} else "user"
-        messages.append({"role": role, "content": content[:4000]})
-    if not any(m.get("role") == "user" and m.get("content") == user_message for m in messages[-3:]):
-        messages.append({"role": "user", "content": user_message})
+    messages = build_model_api_foreground_chat_messages(
+        context_payload=context_payload,
+        recent_messages=recent_messages,
+        user_message=user_message,
+    )
     return messages, context_payload, screen_images
 
 
@@ -8169,19 +8254,19 @@ def _state_save_pending_items(store: UserStore, items: list[dict]) -> None:
     db.set_blob(store.user_id, _STATE_PENDING_BLOB, {"items": items[:10], "updated_at": _now_iso()})
 
 
-def _state_add_pending(store: UserStore, planned_actions: list[dict], *, user_message_id: str, prompt: str) -> list[dict]:
+def _state_add_pending(store: UserStore, runtime_actions: list[dict], *, user_message_id: str, prompt: str) -> list[dict]:
     existing = _state_pending_items(store)
     now = time.time()
     pending: list[dict] = []
-    for planned in planned_actions[:5]:
+    for runtime_action in runtime_actions[:5]:
         item = {
-            "id": f"spa_{uuid.uuid4().hex[:12]}",
+            "id": f"rta_{uuid.uuid4().hex[:12]}",
             "created_at": _now_iso(),
             "expires_at": now + 86400,
             "source": "model_api_chat",
             "user_message_id": user_message_id,
             "prompt": prompt[:1000],
-            "planned_action": planned,
+            "runtime_action": runtime_action,
         }
         pending.append(item)
     _state_save_pending_items(store, pending + existing)
@@ -8204,7 +8289,7 @@ def _append_state_receipt(store: UserStore, receipt: dict) -> dict:
         "status": str(receipt.get("status") or "ok")[:80],
     }
     for key in (
-        "planner", "results", "effects", "pending", "error",
+        "background_execution", "results", "effects", "pending", "error",
         "user_message_id", "assistant_message_id", "summary",
     ):
         if key in receipt:
@@ -8281,12 +8366,12 @@ def _model_api_plan_state_actions(
     pending_items = _state_pending_items(store)
     memory_candidates = _model_api_state_memory_candidates(store, api_key, message, context_refs)
     raw_actions: list[dict] = []
-    planner_error = ""
+    runtime_error = ""
     parsed: dict = {}
     try:
         result = chat_completion(
             runtime,
-            build_hosted_runtime_action_planner_messages(
+            build_hosted_runtime_background_execution_messages(
                 user_message=message,
                 identity=identity,
                 memory_candidates=memory_candidates,
@@ -8303,7 +8388,7 @@ def _model_api_plan_state_actions(
         if isinstance(parsed.get("actions"), list):
             raw_actions = [a for a in parsed.get("actions") if isinstance(a, dict)]
     except Exception as e:
-        planner_error = f"{type(e).__name__}:{str(e)[:240]}"
+        runtime_error = f"{type(e).__name__}:{str(e)[:240]}"
 
     pending_decision, pending_ids = coerce_hosted_runtime_pending_decision(parsed, pending_items)
     if pending_decision:
@@ -8312,35 +8397,35 @@ def _model_api_plan_state_actions(
             _state_clear_pending(store, id_set)
             return {
                 "triggered": True,
-                "method": "hosted_runtime_pending_reject",
+                "method": HOSTED_RUNTIME_PENDING_REJECT_METHOD,
                 "actions": [],
                 "memory_candidates": memory_candidates,
                 "pending_ids": pending_ids,
-                "error": planner_error,
+                "error": runtime_error,
             }
         confirmed: list[dict] = []
         for item in pending_items:
             if str(item.get("id") or "") not in id_set:
                 continue
-            planned = item.get("planned_action") if isinstance(item.get("planned_action"), dict) else {}
-            planned = dict(planned)
-            planned["requires_confirmation"] = False
-            planned["confirmed_pending_id"] = str(item.get("id") or "")
-            confirmed.append(planned)
+            runtime_action = item.get("runtime_action") if isinstance(item.get("runtime_action"), dict) else {}
+            runtime_action = dict(runtime_action)
+            runtime_action["requires_confirmation"] = False
+            runtime_action["confirmed_pending_id"] = str(item.get("id") or "")
+            confirmed.append(runtime_action)
         _state_clear_pending(store, id_set)
         return {
             "triggered": True,
-            "method": "hosted_runtime_pending_confirm",
+            "method": HOSTED_RUNTIME_PENDING_CONFIRM_METHOD,
             "actions": confirmed,
             "memory_candidates": memory_candidates,
             "pending_ids": pending_ids,
-            "error": planner_error,
+            "error": runtime_error,
         }
 
     planned: list[dict] = []
     seen = set()
     for raw in raw_actions[:12]:
-        coerced = coerce_hosted_runtime_planned_action(
+        coerced = coerce_hosted_runtime_action(
             raw,
             memory_candidates,
             direct_confidence=MODEL_API_STATE_DIRECT_CONFIDENCE,
@@ -8359,11 +8444,11 @@ def _model_api_plan_state_actions(
         planned.append(coerced)
 
     return {
-        "triggered": bool(planned or raw_actions or pending_items or planner_error),
-        "method": "hosted_runtime_planner" if raw_actions else "hosted_runtime_empty",
+        "triggered": bool(planned or raw_actions or pending_items or runtime_error),
+        "method": HOSTED_RUNTIME_ACTION_METHOD if raw_actions else HOSTED_RUNTIME_NOOP_METHOD,
         "actions": planned[:8],
         "memory_candidates": memory_candidates,
-        "error": planner_error,
+        "error": runtime_error,
     }
 
 
@@ -8375,12 +8460,12 @@ def _execute_model_api_state_plan(
     user_message_id: str,
     user_message: str,
 ) -> tuple[list[dict], list[dict], list[dict], dict | None]:
-    planned_actions = plan.get("actions") if isinstance(plan.get("actions"), list) else []
-    if not planned_actions and not plan.get("pending_ids"):
+    runtime_actions = plan.get("actions") if isinstance(plan.get("actions"), list) else []
+    if not runtime_actions and not plan.get("pending_ids"):
         return [], [], [], None
 
-    direct = [a for a in planned_actions if not a.get("requires_confirmation")]
-    needs_confirm = [a for a in planned_actions if a.get("requires_confirmation")]
+    direct = [a for a in runtime_actions if not a.get("requires_confirmation")]
+    needs_confirm = [a for a in runtime_actions if a.get("requires_confirmation")]
     pending = _state_add_pending(
         store,
         needs_confirm,
@@ -8422,12 +8507,16 @@ def _execute_model_api_state_plan(
             status = "failed"
             error = body.get("error", "memory_action_failed")
 
+    background_execution = hosted_runtime_background_trace(
+        status=status,
+        method=str(plan.get("method") or ""),
+        triggered=bool(plan.get("triggered")),
+        error=str(plan.get("error") or ""),
+    )
     receipt = _append_state_receipt(store, {
         "status": status,
-        "planner": {
-            "method": plan.get("method", ""),
-            "triggered": bool(plan.get("triggered")),
-            "error": plan.get("error", ""),
+        "background_execution": {
+            **background_execution,
             "pending_decision": plan.get("method", "") if "pending_" in str(plan.get("method", "")) else "",
         },
         "results": {
@@ -8476,16 +8565,16 @@ def _state_preview_value(value, max_chars: int = 260):
 
 
 def _state_pending_public_summary(item: dict) -> dict:
-    planned = item.get("planned_action") if isinstance(item.get("planned_action"), dict) else {}
-    executor = planned.get("executor_action") if isinstance(planned.get("executor_action"), dict) else {}
-    preview = planned.get("target_preview") if isinstance(planned.get("target_preview"), dict) else {}
-    planned_target = planned.get("target") if isinstance(planned.get("target"), dict) else {}
-    action = str(planned.get("planner_type") or executor.get("type") or "")
+    runtime_action = item.get("runtime_action") if isinstance(item.get("runtime_action"), dict) else {}
+    executor = runtime_action.get("executor_action") if isinstance(runtime_action.get("executor_action"), dict) else {}
+    preview = runtime_action.get("target_preview") if isinstance(runtime_action.get("target_preview"), dict) else {}
+    runtime_target = runtime_action.get("target") if isinstance(runtime_action.get("target"), dict) else {}
+    action = str(runtime_action.get("runtime_type") or executor.get("type") or "")
     result = {
         "id": str(item.get("id") or ""),
         "action": action,
-        "confidence": planned.get("confidence", 0),
-        "reason": str(planned.get("reason") or executor.get("reason") or "")[:300],
+        "confidence": runtime_action.get("confidence", 0),
+        "reason": str(runtime_action.get("reason") or executor.get("reason") or "")[:300],
     }
     if action.startswith("identity"):
         result["domain"] = "identity"
@@ -8515,7 +8604,7 @@ def _state_pending_public_summary(item: dict) -> dict:
         }
         return result
 
-    memory_id = str(executor.get("memory_id") or planned_target.get("memory_id") or "")
+    memory_id = str(executor.get("memory_id") or runtime_target.get("memory_id") or "")
     result["memory_id"] = memory_id
     result["target"] = str(preview.get("title") or memory_id or "Memory Garden card")[:180]
     if preview:
@@ -8536,72 +8625,6 @@ def _state_pending_public_summary(item: dict) -> dict:
     return result
 
 
-def _state_pending_brief_lines(pending: list[dict], *, zh: bool) -> list[str]:
-    lines: list[str] = []
-    for item in pending[:3]:
-        summary = _state_pending_public_summary(item)
-        action = str(summary.get("action") or "")
-        target = str(summary.get("target") or "").strip()
-        if summary.get("domain") == "identity":
-            changes = summary.get("changes") if isinstance(summary.get("changes"), list) else []
-            parts: list[str] = []
-            for c in changes[:4]:
-                if not isinstance(c, dict):
-                    continue
-                if c.get("field") == "dimension":
-                    parts.append(f"{c.get('dimension')}: {c.get('delta'):+d}" if isinstance(c.get("delta"), int) else str(c.get("dimension") or "dimension"))
-                else:
-                    parts.append(f"{c.get('field')}: {c.get('to') or ''}")
-            change_text = "; ".join(part for part in parts if part)
-            lines.append(
-                f"Identity：{change_text or '更新身份设定'}"
-                if zh else f"Identity: {change_text or 'update identity state'}"
-            )
-            continue
-        if action == "memory.delete":
-            lines.append(f"删除记忆：{target}" if zh else f"Delete memory: {target}")
-            continue
-        if action in {"memory.create", "memory.add", "memory.add_correction"}:
-            new_memory = summary.get("new_memory") if isinstance(summary.get("new_memory"), dict) else {}
-            desc = str(new_memory.get("description") or "")[:180]
-            lines.append(
-                f"新增记忆：{target} — {desc}"
-                if zh else f"Create memory: {target} — {desc}"
-            )
-            continue
-        changes = summary.get("changes") if isinstance(summary.get("changes"), list) else []
-        change_text = "; ".join(
-            f"{c.get('field')}: {c.get('to')}"
-            for c in changes[:3] if isinstance(c, dict)
-        )
-        current = summary.get("current_memory") if isinstance(summary.get("current_memory"), dict) else {}
-        old_desc = str(current.get("description") or "")[:160]
-        lines.append(
-            f"修改记忆：{target}；改动：{change_text or '更新内容'}；当前：{old_desc}"
-            if zh else f"Update memory: {target}; change: {change_text or 'update content'}; current: {old_desc}"
-        )
-    return lines
-
-
-def _pending_state_reply(user_message: str, pending: list[dict]) -> str:
-    zh = _state_lang_zh(user_message)
-    if not pending:
-        return ""
-    lines = _state_pending_brief_lines(pending, zh=zh)
-    detail = "\n".join(f"- {line}" for line in lines)
-    if zh:
-        return (
-            "我先不直接动长期记忆，怕改错对象。现在准备做的是：\n"
-            f"{detail}\n"
-            "如果这就是你要的，回「确认」；如果不是，回「取消」或直接告诉我该怎么改。"
-        )
-    return (
-        "I am holding this before changing long-term state:\n"
-        f"{detail}\n"
-        "Reply `confirm` if this is right, or `cancel` / correct me if not."
-    )
-
-
 def _pending_state_confirmation_messages(
     user_message: str,
     pending: list[dict],
@@ -8618,23 +8641,7 @@ def _pending_state_confirmation_messages(
         "pending_updates": [_state_pending_public_summary(item) for item in pending[:5]],
         "allowed_user_replies": ["确认", "取消", "confirm", "cancel", "or a natural correction"],
     }
-    return [
-        {
-            "role": "system",
-            "content": (
-                "You are the user-visible AI companion, speaking in your established voice. "
-                "Feedling has NOT applied the pending Identity/Memory update yet. "
-                "Ask the user for confirmation naturally, but explicitly state the exact target and intended change. "
-                "Do not use a generic stock template like 'I found a possible identity or memory change'. "
-                "Do not claim the update is already written. "
-                "Tell the user they can reply confirm/cancel or correct the change. "
-                "Return JSON only: {\"reply\":\"...\",\"context_summary\":\"...\"}. "
-                "`context_summary` is optional and should name the confirmation target/action, "
-                "not private reasoning."
-            ),
-        },
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:8000]},
-    ]
+    return build_model_api_pending_confirmation_messages(payload)
 
 
 def _model_api_pending_confirmation_reply(
@@ -8643,7 +8650,8 @@ def _model_api_pending_confirmation_reply(
     pending: list[dict],
     identity: dict,
 ) -> tuple[str, str]:
-    fallback = _pending_state_reply(user_message, pending)
+    if not pending:
+        return "", ""
     try:
         result = chat_completion(
             runtime,
@@ -8656,16 +8664,19 @@ def _model_api_pending_confirmation_reply(
         reply, thinking = _model_api_parse_turn_reply(str(result.get("reply") or ""))
         reply = reply.strip()
         if not reply:
-            return fallback, ""
+            return "", ""
         banned = (
-            "我找到了可能要修改的身份或记忆",
+            "我找到了可能要修改",
+            "可能要修改的身份或记忆",
+            "需要你确认",
             "I found a likely identity or memory update",
+            "I found a possible identity or memory change",
         )
         if any(phrase in reply for phrase in banned):
-            return fallback, thinking
+            return "", ""
         return reply, thinking
     except Exception:
-        return fallback, ""
+        return "", ""
 
 
 def _append_model_api_runtime_followup_message(
@@ -8749,19 +8760,20 @@ def _run_model_api_state_action_job(
                 pending_items,
                 identity_for_plan,
             )
-            if not thinking_summary:
-                thinking_summary = (
-                    "等你确认具体要改的长期状态。"
-                    if _state_lang_zh(user_message)
-                    else "Waiting for confirmation on the exact long-term state change."
+            if reply:
+                followup_row = _append_model_api_runtime_followup_message(
+                    store,
+                    reply=reply,
+                    thinking_summary=thinking_summary,
+                    push_data={"source": "model_api_state", "kind": "pending_confirmation"},
                 )
-            followup_row = _append_model_api_runtime_followup_message(
-                store,
-                reply=reply,
-                thinking_summary=thinking_summary,
-                push_data={"source": "model_api_state", "kind": "pending_confirmation"},
-            )
         if state_receipt and state_receipt.get("status") == "failed":
+            background_execution = hosted_runtime_background_trace(
+                status="failed",
+                method=str(state_plan.get("method") or ""),
+                triggered=bool(state_plan.get("triggered")),
+                error=str(state_plan.get("error") or state_receipt.get("error") or ""),
+            )
             _patch_model_api_action_trace(store, trace_id, {
                 "status": "failed",
                 "progress": 100,
@@ -8770,11 +8782,7 @@ def _run_model_api_state_action_job(
                 "user_message_id": user_message_id,
                 "assistant_message_id": assistant_message_id,
                 "state_receipt_id": state_receipt.get("id", ""),
-                "planner": {
-                    "triggered": bool(state_plan.get("triggered")),
-                    "method": state_plan.get("method", ""),
-                    "error": state_plan.get("error", ""),
-                },
+                "background_execution": background_execution,
                 "effects": effects,
                 "identity_actions": identity_results,
                 "memory_actions": memory_results,
@@ -8791,6 +8799,12 @@ def _run_model_api_state_action_job(
         else:
             status = "completed"
             reason = "state_actions_applied"
+        background_execution = hosted_runtime_background_trace(
+            status=status,
+            method=str(state_plan.get("method") or ""),
+            triggered=bool(state_plan.get("triggered")),
+            error=str(state_plan.get("error") or ""),
+        )
         _patch_model_api_action_trace(store, trace_id, {
             "status": status,
             "progress": 100,
@@ -8799,11 +8813,7 @@ def _run_model_api_state_action_job(
             "user_message_id": user_message_id,
             "assistant_message_id": assistant_message_id,
             "state_receipt_id": (state_receipt or {}).get("id", ""),
-            "planner": {
-                "triggered": bool(state_plan.get("triggered")),
-                "method": state_plan.get("method", ""),
-                "error": state_plan.get("error", ""),
-            },
+            "background_execution": background_execution,
             "effects": effects,
             "identity_actions": identity_results,
             "memory_actions": memory_results,
@@ -8846,7 +8856,7 @@ def _start_model_api_state_action_job(
         if store.user_id in _model_api_state_active_users:
             return {
                 "status": "skipped",
-                "reason": "state_runtime_already_running",
+                "reason": "background_execution_already_running",
                 "actions_written": 0,
             }
         _model_api_state_active_users.add(store.user_id)
@@ -8856,11 +8866,10 @@ def _start_model_api_state_action_job(
         "model": runtime.model,
         "user_message_id": user_message_id,
         "assistant_message_id": assistant_message_id,
-        "planner": {
-            "triggered": False,
-            "method": "hosted_runtime_background",
-            "error": "",
-        },
+        "background_execution": hosted_runtime_background_trace(
+            status="queued",
+            method=HOSTED_RUNTIME_BACKGROUND_METHOD,
+        ),
         "context": {"context_refs": len(context_refs)},
         "reason": "queued_after_foreground_reply",
         "progress": 0,
@@ -8891,48 +8900,8 @@ def _start_model_api_state_action_job(
     return trace
 
 
-def _identity_actions_default_reply(user_message: str, effects: list[dict]) -> str:
-    fields = set()
-    has_memory = False
-    for effect in effects:
-        if str(effect.get("type") or "").startswith("memory_") or str(effect.get("action") or "").startswith("memory."):
-            has_memory = True
-        for field in effect.get("fields") or []:
-            fields.add(str(field))
-    zh = bool(re.search(r"[\u4e00-\u9fff]", user_message or ""))
-    if has_memory:
-        return "改好了，Memory Garden 已更新。" if zh else "Done. I updated the Memory Garden."
-    if "agent_name" in fields:
-        return "改好了。" if zh else "Done. I updated my displayed name."
-    if fields:
-        return "改好了，Identity 已更新。" if zh else "Done. I updated my identity."
-    return "我看到了，但这次没有可写入的 Identity 更新。" if zh else "I saw that, but there was no identity update to write."
-
-
 def _model_api_turn_contract_message() -> dict:
-    return {
-        "role": "system",
-        "content": (
-            "Feedling chat turn contract: return a JSON object only, with shape "
-            "{\"reply\":\"final user-visible reply\","
-            "\"context_summary\":\"optional short display-safe context/action summary\","
-            "\"tool_requests\":[{\"tool\":\"web_search\",\"query\":\"public web query\"}]}. "
-            "`reply` is the only normal chat bubble text. `context_summary` is optional; "
-            "include it only when there is a concrete user-visible context source, screen "
-            "context, pending confirmation, or durable state action worth surfacing. "
-            "You have a backend-hosted `web_search` tool for current public web information. "
-            "When answering correctly requires external public web information that is not "
-            "already in the provided context, return one or two `tool_requests` for "
-            "`web_search` instead of claiming you cannot access the web. "
-            "Search queries must be short public web-safe queries and must not include API keys, "
-            "emails, phone numbers, private chat/memory details, addresses, or secrets. "
-            "Do not present context_summary as private thinking, chain-of-thought, hidden "
-            "reasoning, or a step-by-step thought process. Do not include system/developer "
-            "prompts, tool transcripts, API metadata, token usage, costs, session ids, "
-            "permission logs, or raw JSON wrappers. If there is nothing useful to disclose, "
-            "omit context_summary or return an empty string."
-        ),
-    }
+    return hosted_runtime_companion_turn_contract_message()
 
 
 def _sanitize_visible_thinking_summary(text: str) -> str:
@@ -8958,93 +8927,12 @@ def _sanitize_visible_thinking_summary(text: str) -> str:
     return "\n".join(lines).strip()[:700]
 
 
-def _model_api_query_has_sensitive_data(query: str) -> bool:
-    text = str(query or "")
-    if re.search(r"\b(sk-[A-Za-z0-9_\-]{12,}|AIza[0-9A-Za-z_\-]{20,}|[A-Fa-f0-9]{48,})\b", text):
-        return True
-    if re.search(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+", text):
-        return True
-    for match in re.finditer(r"\b(?:\+?\d[\d\s().-]{8,}\d)\b", text):
-        if len(re.sub(r"\D", "", match.group(0))) >= 9:
-            return True
-    return False
-
-
-def _model_api_sanitize_web_query(query: str) -> str:
-    clean = re.sub(r"\s+", " ", str(query or "").strip())
-    if not clean:
-        return ""
-    clean = clean.strip("`\"'“”‘’")
-    if len(clean) < 3 or _model_api_query_has_sensitive_data(clean):
-        return ""
-    return clean[:220]
-
-
 def _model_api_extract_web_search_requests(parsed: Any) -> list[dict]:
-    if not MODEL_API_WEB_SEARCH_ENABLED:
-        return []
-
-    raw_requests: list[Any] = []
-    if isinstance(parsed, dict):
-        for key in ("tool_requests", "tool_calls", "tools"):
-            value = parsed.get(key)
-            if isinstance(value, list):
-                raw_requests.extend(value)
-        web_search = parsed.get("web_search")
-        if isinstance(web_search, list):
-            raw_requests.extend(web_search)
-        elif isinstance(web_search, (dict, str)):
-            raw_requests.append(web_search)
-        for key in ("search_query", "web_search_query", "query"):
-            value = parsed.get(key)
-            if isinstance(value, str) and value.strip():
-                raw_requests.append({"tool": "web_search", "query": value})
-
-    requests_out: list[dict] = []
-    seen: set[str] = set()
-    for raw in raw_requests:
-        tool_name = "web_search"
-        query = ""
-        reason = ""
-        if isinstance(raw, str):
-            query = raw
-        elif isinstance(raw, dict):
-            tool_name = str(raw.get("tool") or raw.get("name") or raw.get("type") or "web_search")
-            args_raw: Any = raw.get("arguments")
-            function = raw.get("function") if isinstance(raw.get("function"), dict) else {}
-            if function:
-                tool_name = str(function.get("name") or tool_name)
-                args_raw = function.get("arguments", args_raw)
-            if isinstance(args_raw, str):
-                try:
-                    loaded_args = json.loads(args_raw)
-                    args = loaded_args if isinstance(loaded_args, dict) else {}
-                except Exception:
-                    args = {}
-            else:
-                args = args_raw if isinstance(args_raw, dict) else {}
-            query = str(raw.get("query") or args.get("query") or args.get("q") or args.get("input") or "")
-            reason = str(raw.get("reason") or args.get("reason") or "")
-        else:
-            continue
-        if tool_name.lower().replace("-", "_") not in {"web_search", "search", "internet_search", "browser_search"}:
-            continue
-        clean_query = _model_api_sanitize_web_query(query)
-        if not clean_query:
-            continue
-        dedupe_key = clean_query.lower()
-        if dedupe_key in seen:
-            continue
-        seen.add(dedupe_key)
-        requests_out.append({
-            "tool": "web_search",
-            "query": clean_query,
-            "reason": reason[:240],
-            "source": "model_request",
-        })
-        if len(requests_out) >= MODEL_API_WEB_SEARCH_MAX_QUERIES:
-            break
-    return requests_out
+    return extract_model_api_web_search_requests(
+        parsed,
+        enabled=MODEL_API_WEB_SEARCH_ENABLED,
+        max_queries=MODEL_API_WEB_SEARCH_MAX_QUERIES,
+    )
 
 
 def _model_api_parse_turn_output(raw_reply: str) -> tuple[str, str, list[dict]]:
@@ -9102,38 +8990,6 @@ def _model_api_parse_turn_reply(raw_reply: str) -> tuple[str, str]:
     return reply, thinking
 
 
-def _model_api_fallback_thinking_summary(
-    *,
-    user_message: str,
-    context_payload: dict,
-    effects: list[dict],
-) -> str:
-    zh = bool(re.search(r"[\u4e00-\u9fff]", user_message or ""))
-    parts: list[str] = []
-    context_ref_count = len(context_payload.get("context_refs") or [])
-    if context_ref_count:
-        parts.append(
-            f"使用了你选中的 {context_ref_count} 条参考内容。"
-            if zh else f"Used {context_ref_count} user-selected context refs."
-        )
-    if context_payload.get("screen_context"):
-        parts.append("结合了最近的屏幕上下文。" if zh else "Included recent screen context.")
-    web_search = context_payload.get("web_search") if isinstance(context_payload.get("web_search"), dict) else {}
-    result_count = int(web_search.get("result_count") or 0) if isinstance(web_search, dict) else 0
-    if result_count:
-        parts.append(
-            f"联网搜索了 {result_count} 条公开结果。"
-            if zh else f"Searched {result_count} public web results."
-        )
-    if effects:
-        action_count = len(effects)
-        parts.append(
-            f"执行了 {action_count} 个身份或记忆更新。"
-            if zh else f"Applied {action_count} identity or memory updates."
-        )
-    return _sanitize_visible_thinking_summary("\n".join(parts[:3]))
-
-
 def _model_api_is_generic_context_summary(text: str) -> bool:
     lines = [
         line.strip(" 。.").strip()
@@ -9157,32 +9013,11 @@ def _model_api_is_generic_context_summary(text: str) -> bool:
 
 
 def _model_api_capture_prompt(user_message: str, assistant_reply: str, context_payload: dict) -> list[dict]:
-    memories = context_payload.get("context_memories") or []
-    identity = context_payload.get("identity") or {}
-    payload = {
-        "user_message": user_message[:4000],
-        "assistant_reply": assistant_reply[:4000],
-        "existing_context_memories": memories[:8],
-        "identity": identity,
-        "today": date.today().isoformat(),
-    }
-    return [
-        {
-            "role": "system",
-            "content": (
-                "You are Feedling's Memory Capture worker. Return JSON only. "
-                "Extract durable Memory Garden cards from the latest exchange. "
-                "Only write facts, events, quotes, or rare relational moments. "
-                "Do write explicit user corrections about names, boundaries, persona, voice, preferences, or facts if they are not already present in existing_context_memories. "
-                "Do not write vague preferences, duplicate existing memories, repeated correction cards, or private implementation details. "
-                "Shape: {\"memories\":[{\"type\":\"fact|event|quote|moment\","
-                "\"title\":\"...\",\"description\":\"...\",\"occurred_at\":\"YYYY-MM-DD\","
-                "\"her_quote\":\"optional\",\"context\":\"optional\"}]}. "
-                "Return {\"memories\":[]} if nothing durable should be written."
-            ),
-        },
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:12000]},
-    ]
+    return build_model_api_memory_capture_messages(
+        user_message=user_message,
+        assistant_reply=assistant_reply,
+        context_payload=context_payload,
+    )
 
 
 def _model_api_run_memory_capture(
@@ -10011,167 +9846,25 @@ def _model_api_user_content(message: str, images: list[dict[str, str]]) -> Any:
     return parts
 
 
-def _strip_html_text(value: str) -> str:
-    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", str(value or ""))
-    text = re.sub(r"(?s)<[^>]+>", " ", text)
-    text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _duckduckgo_result_url(raw_href: str) -> str:
-    href = html.unescape(str(raw_href or "")).strip()
-    if not href:
-        return ""
-    if href.startswith("//"):
-        href = "https:" + href
-    parsed = urlparse(href)
-    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
-        uddg = parse_qs(parsed.query).get("uddg") or []
-        if uddg:
-            return str(uddg[0])
-    return href
-
-
-def _model_api_web_search_duckduckgo(query: str, *, limit: int) -> list[dict]:
-    resp = httpx.get(
-        "https://duckduckgo.com/html/",
-        params={"q": query, "kl": "us-en"},
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; FeedlingIO/1.0; +https://feedling.app)",
-            "Accept": "text/html,application/xhtml+xml",
-        },
-        follow_redirects=True,
-        timeout=MODEL_API_WEB_SEARCH_TIMEOUT_SEC,
-    )
-    resp.raise_for_status()
-    body = resp.text
-    results: list[dict] = []
-    seen_urls: set[str] = set()
-    anchor_re = re.compile(
-        r'<a[^>]+class="[^"]*\bresult__a\b[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
-        re.IGNORECASE | re.DOTALL,
-    )
-    snippet_re = re.compile(
-        r'class="[^"]*\bresult__snippet\b[^"]*"[^>]*>(.*?)</(?:a|div)>',
-        re.IGNORECASE | re.DOTALL,
-    )
-    for match in anchor_re.finditer(body):
-        url = _duckduckgo_result_url(match.group(1))
-        title = _strip_html_text(match.group(2))
-        if not url or not title or url in seen_urls:
-            continue
-        window = body[match.end(): match.end() + 2600]
-        snippet_match = snippet_re.search(window)
-        snippet = _strip_html_text(snippet_match.group(1)) if snippet_match else ""
-        seen_urls.add(url)
-        results.append({
-            "title": title[:240],
-            "url": url[:600],
-            "snippet": snippet[:700],
-        })
-        if len(results) >= limit:
-            break
-    return results
-
-
 def _run_model_api_web_searches(requests_in: list[dict]) -> dict:
-    clean_requests: list[dict] = []
-    seen: set[str] = set()
-    for item in requests_in[:MODEL_API_WEB_SEARCH_MAX_QUERIES]:
-        if not isinstance(item, dict):
-            continue
-        query = _model_api_sanitize_web_query(str(item.get("query") or ""))
-        if not query:
-            continue
-        key = query.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        clean_requests.append({
-            "tool": "web_search",
-            "query": query,
-            "reason": str(item.get("reason") or "")[:240],
-            "source": str(item.get("source") or "model_request")[:80],
-        })
-    if not clean_requests:
-        return {
-            "enabled": MODEL_API_WEB_SEARCH_ENABLED,
-            "status": "skipped",
-            "requests": [],
-            "results": [],
-            "result_count": 0,
-            "errors": [],
-        }
-
-    all_results: list[dict] = []
-    errors: list[dict] = []
-    for item in clean_requests:
-        query = item["query"]
-        try:
-            results = _model_api_web_search_duckduckgo(
-                query,
-                limit=MODEL_API_WEB_SEARCH_MAX_RESULTS,
-            )
-            all_results.append({
-                "query": query,
-                "status": "ok" if results else "empty",
-                "results": results,
-            })
-        except Exception as e:
-            error = f"{type(e).__name__}:{str(e)[:220]}"
-            errors.append({"query": query, "error": error})
-            all_results.append({
-                "query": query,
-                "status": "failed",
-                "results": [],
-                "error": error,
-            })
-    result_count = sum(len(item.get("results") or []) for item in all_results)
-    return {
-        "enabled": MODEL_API_WEB_SEARCH_ENABLED,
-        "status": "ok" if result_count else ("failed" if errors else "empty"),
-        "requests": clean_requests,
-        "results": all_results,
-        "result_count": result_count,
-        "errors": errors,
-    }
+    return run_model_api_web_searches(
+        requests_in,
+        enabled=MODEL_API_WEB_SEARCH_ENABLED,
+        max_queries=MODEL_API_WEB_SEARCH_MAX_QUERIES,
+        max_results=MODEL_API_WEB_SEARCH_MAX_RESULTS,
+        timeout_sec=MODEL_API_WEB_SEARCH_TIMEOUT_SEC,
+    )
 
 
 def _model_api_web_search_results_message(web_search: dict) -> dict:
-    payload = {
-        "tool": "web_search",
-        "status": web_search.get("status", ""),
-        "result_count": web_search.get("result_count", 0),
-        "results": web_search.get("results", []),
-        "errors": web_search.get("errors", []),
-    }
-    return {
-        "role": "system",
-        "content": (
-            "Backend web_search tool results JSON:\n"
-            + json.dumps(payload, ensure_ascii=False)[:14000]
-            + "\nUse these public web snippets to answer the user. Do not expose raw tool JSON. "
-            "If results are weak or failed, say that plainly. Include source names or URLs when useful. "
-            "Return the normal Feedling chat turn JSON only: "
-            "{\"reply\":\"...\",\"context_summary\":\"...\"}."
-        ),
-    }
+    return build_model_api_web_search_results_message(web_search)
 
 
 def _model_api_web_search_trace(web_search: dict) -> dict:
-    if not web_search:
-        return {"status": "skipped", "requests": 0, "results": 0}
-    return {
-        "status": str(web_search.get("status") or ""),
-        "requests": len(web_search.get("requests") or []),
-        "results": int(web_search.get("result_count") or 0),
-        "queries": [
-            str(item.get("query") or "")[:160]
-            for item in (web_search.get("requests") or [])[:MODEL_API_WEB_SEARCH_MAX_QUERIES]
-            if isinstance(item, dict)
-        ],
-        "errors": web_search.get("errors") or [],
-    }
+    return model_api_web_search_trace(
+        web_search,
+        max_queries=MODEL_API_WEB_SEARCH_MAX_QUERIES,
+    )
 
 
 @app.route("/v1/model_api/chat/send", methods=["POST"])
@@ -10258,16 +9951,16 @@ def model_api_chat_send():
             timeout=90.0,
         )
     except ProviderError as e:
+        background_execution = hosted_runtime_background_trace(
+            status="not_started",
+            method=HOSTED_RUNTIME_BACKGROUND_NOT_STARTED_METHOD,
+        )
         trace = _append_model_api_action_trace(store, {
             "status": "failed",
             "provider": runtime.provider,
             "model": runtime.model,
             "user_message_id": user_row["id"],
-            "planner": {
-                "triggered": False,
-                "method": "hosted_runtime_background_not_started",
-                "error": "",
-            },
+            "background_execution": background_execution,
             "effects": effects,
             "identity_actions": identity_action_results,
             "memory_actions": memory_action_results,
@@ -10298,13 +9991,7 @@ def model_api_chat_send():
         final_messages = list(provider_messages)
         final_messages.append({"role": "assistant", "content": raw_reply[:4000]})
         final_messages.append(_model_api_web_search_results_message(web_search))
-        final_messages.append({
-            "role": "user",
-            "content": (
-                "Use the backend web_search results above to answer the original user message. "
-                "Return the normal Feedling chat turn JSON only."
-            ),
-        })
+        final_messages.append(model_api_web_search_followup_message())
         try:
             final_result = chat_completion(
                 runtime,
@@ -10327,16 +10014,16 @@ def model_api_chat_send():
                 }
         except ProviderError as e:
             if not reply:
+                background_execution = hosted_runtime_background_trace(
+                    status="not_started",
+                    method=HOSTED_RUNTIME_BACKGROUND_NOT_STARTED_METHOD,
+                )
                 trace = _append_model_api_action_trace(store, {
                     "status": "failed",
                     "provider": runtime.provider,
                     "model": runtime.model,
                     "user_message_id": user_row["id"],
-                    "planner": {
-                        "triggered": False,
-                        "method": "hosted_runtime_background_not_started",
-                        "error": "",
-                    },
+                    "background_execution": background_execution,
                     "effects": effects,
                     "identity_actions": identity_action_results,
                     "memory_actions": memory_action_results,
@@ -10359,16 +10046,16 @@ def model_api_chat_send():
                     "tools": {"web_search": _model_api_web_search_trace(web_search)},
                 }), 502
     if not reply:
+        background_execution = hosted_runtime_background_trace(
+            status="not_started",
+            method=HOSTED_RUNTIME_BACKGROUND_NOT_STARTED_METHOD,
+        )
         trace = _append_model_api_action_trace(store, {
             "status": "failed",
             "provider": runtime.provider,
             "model": runtime.model,
             "user_message_id": user_row["id"],
-            "planner": {
-                "triggered": False,
-                "method": "hosted_runtime_background_not_started",
-                "error": "",
-            },
+            "background_execution": background_execution,
             "context": {
                 "memories": len(context_payload.get("context_memories") or []),
                 "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
@@ -10380,12 +10067,6 @@ def model_api_chat_send():
             "duration_ms": int((time.time() - trace_start) * 1000),
         })
         return jsonify({"error": "provider_empty_reply", "user_message_id": user_row["id"], "action_trace_id": trace.get("trace_id", "")}), 502
-    if not thinking_summary:
-        thinking_summary = _model_api_fallback_thinking_summary(
-            user_message=message_for_context,
-            context_payload=context_payload,
-            effects=effects,
-        )
     assistant_env, env_err = _build_shared_envelope_for_store(store, reply.encode("utf-8"))
     if assistant_env is None:
         return jsonify({"error": "assistant_envelope_failed", "detail": env_err}), 409
@@ -10422,7 +10103,7 @@ def model_api_chat_send():
     )
     state_job: dict = {
         "status": "skipped",
-        "reason": "testing_state_runtime_disabled" if app.config.get("TESTING") else "state_runtime_disabled",
+        "reason": "testing_background_execution_disabled" if app.config.get("TESTING") else "background_execution_disabled",
         "actions_written": 0,
     }
     if (not app.config.get("TESTING")) or payload.get("state_sync") or payload.get("state_async"):
@@ -10440,19 +10121,19 @@ def model_api_chat_send():
         f"[model_api_chat:{store.user_id}] user_msg={user_row['id']} "
         f"reply={assistant_row['id']} provider={runtime.provider} model={runtime.model}"
     )
+    background_execution = hosted_runtime_background_trace(
+        status=str(state_job.get("status") or ""),
+        method=HOSTED_RUNTIME_BACKGROUND_METHOD,
+        trace_id=str(state_job.get("trace_id") or ""),
+        error=str(state_job.get("error") or ""),
+    )
     trace = _append_model_api_action_trace(store, {
         "status": "ok",
         "provider": runtime.provider,
         "model": runtime.model,
         "user_message_id": user_row["id"],
         "assistant_message_id": assistant_row["id"],
-        "planner": {
-            "triggered": False,
-            "method": "hosted_runtime_background",
-            "status": state_job.get("status", ""),
-            "trace_id": state_job.get("trace_id", ""),
-            "error": state_job.get("error", ""),
-        },
+        "background_execution": background_execution,
         "effects": effects,
         "identity_actions": identity_action_results,
         "memory_actions": memory_action_results,
@@ -10479,6 +10160,7 @@ def model_api_chat_send():
     return jsonify({
         "status": "ok",
         "reply": reply,
+        "context_summary": thinking_summary,
         "thinking_summary": thinking_summary,
         "user_message": {"id": user_row["id"], "ts": user_row["ts"]},
         "assistant_message": {"id": assistant_row["id"], "ts": assistant_row["ts"]},
@@ -10510,12 +10192,13 @@ def model_api_chat_send():
                 _state_pending_public_summary(item)
                 for item in _state_pending_items(store)[:5]
             ],
-            "planner": {
-                "triggered": False,
-                "method": "hosted_runtime_background",
-                "status": state_job.get("status", ""),
-                "error": state_job.get("error", ""),
-            },
+            "background_execution": background_execution,
+        },
+        "runtime": {
+            "engine": HOSTED_RUNTIME_ENGINE_NATIVE,
+            "mode": MODEL_API_RUNTIME_MODE,
+            "version": MODEL_API_RUNTIME_VERSION,
+            "background_execution": background_execution,
         },
         "context": {
             "memories": len(context_payload.get("context_memories") or []),
@@ -13812,8 +13495,8 @@ def state_receipts():
                 "id": item.get("id", ""),
                 "created_at": item.get("created_at", ""),
                 "expires_at": item.get("expires_at", 0),
-                "action": ((item.get("planned_action") or {}).get("planner_type") or ""),
-                "confidence": (item.get("planned_action") or {}).get("confidence", 0),
+                "action": ((item.get("runtime_action") or {}).get("runtime_type") or ""),
+                "confidence": (item.get("runtime_action") or {}).get("confidence", 0),
             }
             for item in _state_pending_items(store)
         ],

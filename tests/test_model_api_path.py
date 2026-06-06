@@ -197,8 +197,13 @@ def test_model_api_runtime_status_tracks_hosted_runtime_and_action_trace(client,
         headers=_headers(api_key),
     )
     assert chat.status_code == 200, chat.get_data(as_text=True)
-    trace_id = chat.get_json()["state"]["action_trace_id"]
+    chat_body = chat.get_json()
+    trace_id = chat_body["state"]["action_trace_id"]
     assert trace_id
+    assert chat_body["runtime"]["engine"] == "feedling_native"
+    assert chat_body["runtime"]["background_execution"]["method"] == "feedling_background_execution"
+    assert chat_body["state"]["background_execution"]["method"] == "feedling_background_execution"
+    assert chat_body["state"]["background_execution"]["method"] == "feedling_background_execution"
 
     after = client.get("/v1/model_api/runtime", headers=_headers(api_key))
     assert after.status_code == 200, after.get_data(as_text=True)
@@ -306,6 +311,55 @@ def test_model_api_chat_send_runs_backend_web_search_tool(client, monkeypatch):
     assert body["tools"]["web_search"]["results"] == 1
     assert search_requests[0]["query"] == "OpenAI product update"
     assert len(provider_calls) == 2
+
+
+def test_model_api_chat_does_not_treat_generic_query_as_web_search_request(client, monkeypatch):
+    _, api_key = _register(client)
+    provider_calls: list[list[dict]] = []
+    search_requests: list[dict] = []
+
+    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
+    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(
+        appmod,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"messages": [], "context_memories": []}, "")
+        if path == "/v1/chat/history"
+        else ({"identity": {}}, ""),
+    )
+    monkeypatch.setattr(appmod, "_run_model_api_web_searches", lambda requests: search_requests.extend(requests) or {})
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        provider_calls.append(messages)
+        return {
+            "reply": appmod.json.dumps({
+                "reply": "I can answer without a hosted web search.",
+                "query": "this is ordinary model output metadata",
+            }),
+            "usage": {"total_tokens": 4},
+        }
+
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    chat = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "hello"},
+        headers=_headers(api_key),
+    )
+    assert chat.status_code == 200, chat.get_data(as_text=True)
+    body = chat.get_json()
+    assert body["reply"] == "I can answer without a hosted web search."
+    assert body["tools"]["web_search"]["requests"] == 0
+    assert search_requests == []
+    assert len(provider_calls) == 1
 
 
 def test_model_api_memory_repair_archives_noisy_cards_only_after_replacements(client, monkeypatch):
@@ -1247,6 +1301,10 @@ def test_support_material_sections_split_character_and_personal_profile():
     payload = {
         "persona_filename": "combined.md",
         "persona_content": """
+===== BEGIN ORIGINAL SYSTEM PROMPT: system.md =====
+你是小哆啦，说话要保持原本的猫猫语气，不要改成人设。
+===== END ORIGINAL SYSTEM PROMPT: system.md =====
+
 ===== BEGIN CHARACTER CARD =====
 小哆啦是一个稳定、细心、会记得小事的陪伴型 AI。
 ===== END CHARACTER CARD =====
@@ -1259,14 +1317,18 @@ def test_support_material_sections_split_character_and_personal_profile():
 
     support = appmod._persona_support_messages(payload)
 
-    assert [m["source"] for m in support] == ["character_import", "persona_import"]
-    assert "小哆啦" in support[0]["content"]
-    assert "用户喜欢直接的反馈" in support[1]["content"]
+    assert [m["source"] for m in support] == ["agent_prompt_import", "character_import", "persona_import"]
+    assert "Original agent prompt (system.md)" in support[0]["content"]
+    assert "猫猫语气" in support[0]["content"]
+    assert "小哆啦" in support[1]["content"]
+    assert "用户喜欢直接的反馈" in support[2]["content"]
     assert all("BEGIN " not in m["content"] and "END " not in m["content"] for m in support)
 
 
-def test_support_materials_accept_explicit_character_and_personal_profile_fields():
+def test_support_materials_accept_explicit_agent_character_and_personal_profile_fields():
     payload = {
+        "agent_prompt_content": "你是小哆啦，保持用户已经习惯的语气和边界。",
+        "agent_prompt_filename": "system.md",
         "character_content": "小哆啦是一个稳定、细心、会记得小事的陪伴型 AI。",
         "character_filename": "character.md",
         "personal_profile_content": "用户喜欢直接的反馈，也希望记忆写得像人能读懂的话。",
@@ -1275,11 +1337,13 @@ def test_support_materials_accept_explicit_character_and_personal_profile_fields
 
     support = appmod._persona_support_messages(payload)
 
-    assert [m["source"] for m in support] == ["character_import", "persona_import"]
-    assert "Character card (character.md)" in support[0]["content"]
-    assert "Personal profile (profile.md)" in support[1]["content"]
-    assert "小哆啦" in support[0]["content"]
-    assert "用户喜欢直接的反馈" in support[1]["content"]
+    assert [m["source"] for m in support] == ["agent_prompt_import", "character_import", "persona_import"]
+    assert "Original agent prompt (system.md)" in support[0]["content"]
+    assert "Character card (character.md)" in support[1]["content"]
+    assert "Personal profile (profile.md)" in support[2]["content"]
+    assert "已经习惯的语气" in support[0]["content"]
+    assert "小哆啦" in support[1]["content"]
+    assert "用户喜欢直接的反馈" in support[2]["content"]
 
 
 def test_support_materials_extract_chatgpt_memories_json_without_raw_artifacts():

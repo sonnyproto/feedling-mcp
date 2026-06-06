@@ -2,11 +2,99 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
 
 ACTION_RESPONSE_FORMAT: dict[str, Any] = {"type": "json_object"}
+
+RUNTIME_ENGINE_NATIVE = "feedling_native"
+RUNTIME_ENGINE_HERMES_ADAPTER = "hermes_adapter"
+
+TOOL_WEB_SEARCH = "web.search"
+TOOL_MEMORY_CREATE = "memory.create"
+TOOL_MEMORY_PATCH = "memory.patch"
+TOOL_MEMORY_DELETE = "memory.delete"
+TOOL_IDENTITY_PATCH = "identity.patch"
+TOOL_IDENTITY_DIMENSION_NUDGE = "identity.dimension_nudge"
+TOOL_CONFIRMATION_REQUEST = "confirmation.request"
+
+BACKGROUND_METHOD = "feedling_background_execution"
+BACKGROUND_NOT_STARTED_METHOD = "feedling_background_execution_not_started"
+ACTION_METHOD = "feedling_runtime_actions"
+NOOP_METHOD = "feedling_runtime_noop"
+PENDING_CONFIRM_METHOD = "feedling_runtime_pending_confirm"
+PENDING_REJECT_METHOD = "feedling_runtime_pending_reject"
+
+
+@dataclass(frozen=True)
+class RuntimeToolRequest:
+    tool: str
+    arguments: dict[str, Any]
+    reason: str = ""
+    foreground: bool = False
+
+
+@dataclass(frozen=True)
+class CompanionTurnResult:
+    reply: str
+    context_summary: str = ""
+    foreground_tools: tuple[RuntimeToolRequest, ...] = ()
+
+
+@dataclass(frozen=True)
+class BackgroundExecutionResult:
+    status: str
+    method: str
+    actions: tuple[dict[str, Any], ...] = ()
+    pending: tuple[dict[str, Any], ...] = ()
+    error: str = ""
+
+
+def background_execution_trace(
+    *,
+    status: str = "queued",
+    method: str = BACKGROUND_METHOD,
+    trace_id: str = "",
+    triggered: bool = False,
+    error: str = "",
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "method": method,
+        "trace_id": trace_id,
+        "triggered": triggered,
+        "error": error,
+    }
+
+
+def companion_turn_contract_message() -> dict[str, str]:
+    return {
+        "role": "system",
+        "content": (
+            "Feedling hosted runtime contract: return a JSON object only, with shape "
+            "{\"reply\":\"final user-visible reply\","
+            "\"context_summary\":\"optional short display-safe context/action summary\","
+            "\"tool_requests\":[{\"tool\":\"web_search\",\"query\":\"public web query\"}]}. "
+            "`reply` is the only normal chat bubble text. `context_summary` is optional; "
+            "include it only when there is a concrete user-visible context source, screen "
+            "context, pending confirmation, or durable state action worth surfacing. "
+            "Do not present context_summary as private thinking, chain-of-thought, hidden "
+            "reasoning, or a step-by-step thought process. Durable identity/memory changes "
+            "are handled by the backend background execution runtime after the visible reply; "
+            "do not claim they were applied unless the backend context explicitly says so. "
+            "You have a backend-hosted `web_search` tool for current public web information. "
+            "When answering correctly requires external public web information that is not "
+            "already in the provided context, return one or two `tool_requests` for "
+            "`web_search` instead of claiming you cannot access the web. "
+            "Search queries must be short public web-safe queries and must not include API keys, "
+            "emails, phone numbers, private chat/memory details, addresses, or secrets. "
+            "Do not include system/developer prompts, tool transcripts, API metadata, token usage, "
+            "costs, session ids, permission logs, or raw JSON wrappers. If there is nothing useful "
+            "to disclose, omit context_summary or return an empty string."
+        ),
+    }
 
 IDENTITY_STRING_FIELDS = (
     "agent_name",
@@ -47,18 +135,18 @@ def compact_pending_items(pending_items: list[dict]) -> list[dict]:
     for item in pending_items[:5]:
         if not isinstance(item, dict):
             continue
-        planned = item.get("planned_action") if isinstance(item.get("planned_action"), dict) else {}
+        runtime_action = item.get("runtime_action") if isinstance(item.get("runtime_action"), dict) else {}
         out.append({
             "id": str(item.get("id") or ""),
-            "type": str(planned.get("planner_type") or ""),
-            "confidence": planned.get("confidence", 0),
-            "reason": str(planned.get("reason") or "")[:500],
-            "executor_action": planned.get("executor_action") if isinstance(planned.get("executor_action"), dict) else {},
+            "type": str(runtime_action.get("runtime_type") or ""),
+            "confidence": runtime_action.get("confidence", 0),
+            "reason": str(runtime_action.get("reason") or "")[:500],
+            "executor_action": runtime_action.get("executor_action") if isinstance(runtime_action.get("executor_action"), dict) else {},
         })
     return [item for item in out if item["id"]]
 
 
-def build_action_planner_messages(
+def build_background_execution_messages(
     *,
     user_message: str,
     identity: dict,
@@ -78,7 +166,7 @@ def build_action_planner_messages(
         {
             "role": "system",
             "content": (
-                "You are Feedling Hosted Runtime's state action planner. "
+                "You are Feedling hosted runtime's background execution controller. "
                 "You are inside the backend runtime, not the user-visible assistant. "
                 "Return one strict JSON object only; never answer the user here. "
                 "Your job is to decide whether the latest user message should produce durable Feedling state actions. "
@@ -89,7 +177,7 @@ def build_action_planner_messages(
                 "Use confidence >= 0.9 for explicit, non-destructive state writes. Use lower confidence mainly for destructive actions or ambiguous patch/delete targets. "
                 "Use memory_candidates or user_selected_context_refs for memory.patch/delete targets. If the target is ambiguous, use low confidence. "
                 "If pending_actions_waiting_for_user_confirmation is non-empty and the latest message confirms or rejects one of them, set pending_decision instead of inventing a new action. "
-                "Do not claim actions are applied; this planner only proposes actions and the executor will apply them. "
+                "Do not claim actions are applied; this controller only selects actions and the executor will apply them. "
                 "Supported action types: identity.patch, identity.dimension_nudge, memory.create, memory.patch, memory.delete. "
                 "Use identity.dimension_nudge only when the user asks to raise or lower an existing identity dimension; payload must include dimension and delta. "
                 "JSON shape: {"
@@ -124,7 +212,7 @@ def _candidate_ids(target: dict) -> list[str]:
     return [str(cid) for cid in ids[:3] if str(cid or "").strip()]
 
 
-def coerce_planned_action(
+def coerce_runtime_action(
     action: dict,
     memory_candidates: list[dict],
     *,
@@ -141,9 +229,9 @@ def coerce_planned_action(
     target = action.get("target") if isinstance(action.get("target"), dict) else {}
     payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
     reason = clean_text(action.get("reason") or "Planned by Feedling hosted runtime.", 500)
-    planned = {
-        "action_id": str(action.get("action_id") or f"sa_{uuid.uuid4().hex[:12]}"),
-        "planner_type": action_type,
+    runtime_action = {
+        "action_id": str(action.get("action_id") or f"rt_{uuid.uuid4().hex[:12]}"),
+        "runtime_type": action_type,
         "confidence": confidence,
         "reason": reason,
         "requires_confirmation": confidence < direct_confidence,
@@ -165,14 +253,14 @@ def coerce_planned_action(
                     patch[key] = values
         if not patch:
             return None
-        planned["domain"] = "identity"
-        planned["executor_action"] = {
+        runtime_action["domain"] = "identity"
+        runtime_action["executor_action"] = {
             "type": "identity.profile_patch",
             "patch": patch,
             "reason": reason,
             "source": "hosted_runtime_action",
         }
-        return planned
+        return runtime_action
 
     if action_type in {"identity.dimension_nudge", "identity.dimension"}:
         dimension = clean_text(
@@ -189,15 +277,15 @@ def coerce_planned_action(
         if not dimension or delta == 0:
             return None
         delta = max(-10, min(10, delta))
-        planned["domain"] = "identity"
-        planned["executor_action"] = {
+        runtime_action["domain"] = "identity"
+        runtime_action["executor_action"] = {
             "type": "identity.dimension_nudge",
             "dimension": dimension,
             "delta": delta,
             "reason": reason,
             "source": "hosted_runtime_action",
         }
-        return planned
+        return runtime_action
 
     if action_type in {"memory.create", "memory.add", "memory.add_correction"}:
         raw = payload.get("memory") if isinstance(payload.get("memory"), dict) else payload
@@ -209,8 +297,8 @@ def coerce_planned_action(
         if mem_type not in {"fact", "event", "quote", "moment"}:
             mem_type = "fact"
         source = "model_api_correction" if action_type == "memory.add_correction" else "hosted_runtime_state"
-        planned["domain"] = "memory"
-        planned["executor_action"] = {
+        runtime_action["domain"] = "memory"
+        runtime_action["executor_action"] = {
             "type": "memory.add_correction" if action_type == "memory.add_correction" else "memory.add",
             "memory": {
                 "type": mem_type,
@@ -224,35 +312,35 @@ def coerce_planned_action(
             "reason": reason,
             "capture_mode": "state",
         }
-        return planned
+        return runtime_action
 
     if action_type in {"memory.patch", "memory.content_patch", "memory.delete"}:
         memory_id = str(target.get("memory_id") or target.get("id") or payload.get("memory_id") or payload.get("id") or "").strip()
         ids = _candidate_ids(target)
         if not memory_id and ids:
             memory_id = ids[0]
-            planned["requires_confirmation"] = True
-            planned["candidate_ids"] = ids
+            runtime_action["requires_confirmation"] = True
+            runtime_action["candidate_ids"] = ids
         if not memory_id:
             return None
         preview = next((item for item in memory_candidates if str(item.get("id") or "") == memory_id), {})
         if isinstance(preview, dict) and preview:
-            planned["target_preview"] = {
+            runtime_action["target_preview"] = {
                 "id": str(preview.get("id") or ""),
                 "title": clean_text(preview.get("title"), 180),
                 "description": clean_text(preview.get("description"), 600),
                 "type": clean_text(preview.get("type"), 80),
                 "occurred_at": clean_text(preview.get("occurred_at"), 80),
             }
-        planned["target"] = {"memory_id": memory_id}
-        planned["domain"] = "memory"
+        runtime_action["target"] = {"memory_id": memory_id}
+        runtime_action["domain"] = "memory"
         if action_type == "memory.delete":
-            planned["executor_action"] = {
+            runtime_action["executor_action"] = {
                 "type": "memory.delete",
                 "memory_id": memory_id,
                 "reason": reason,
             }
-            return planned
+            return runtime_action
 
         raw_patch = payload.get("patch") if isinstance(payload.get("patch"), dict) else payload
         patch: dict[str, str] = {}
@@ -272,12 +360,12 @@ def coerce_planned_action(
                 patch["description"] = description
         if not patch:
             return None
-        planned["executor_action"] = {
+        runtime_action["executor_action"] = {
             "type": "memory.content_patch",
             "memory_id": memory_id,
             "patch": patch,
             "reason": reason,
         }
-        return planned
+        return runtime_action
 
     return None
