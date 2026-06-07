@@ -657,6 +657,36 @@ def screen_decrypt_frame(
 # Chat tools
 # ---------------------------------------------------------------------------
 
+_TAGGED_REASONING_RE = re.compile(
+    r"<\s*(?P<tag>think|thinking|reasoning|thought)\s*>\s*"
+    r"(?P<body>.*?)"
+    r"\s*<\s*/\s*(?P=tag)\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_tagged_reasoning(content: str) -> tuple[str, str]:
+    """Split leaked reasoning tags out of user-visible chat text.
+
+    Some upstream runtimes serialize their own reasoning stream into the final
+    text as `<think>...</think>` or similar. That is not provider-native
+    reasoning from IO's point of view, but it is useful display material and
+    should not leak into the visible chat bubble.
+    """
+    text = str(content or "")
+    blocks: list[str] = []
+
+    def _collect(match: re.Match) -> str:
+        body = (match.group("body") or "").strip()
+        if body:
+            blocks.append(body)
+        return "\n"
+
+    visible = _TAGGED_REASONING_RE.sub(_collect, text)
+    visible = re.sub(r"\n{3,}", "\n\n", visible).strip()
+    reasoning = "\n\n".join(blocks).strip()
+    return visible, reasoning
+
 
 @mcp.tool(
     name="feedling_chat_post_message",
@@ -695,8 +725,12 @@ def chat_post_message(
     if not (user_id and user_pk is not None and enclave_pk is not None):
         return {"error": "cannot post chat — pubkeys unavailable"}
 
+    visible_content, tagged_reasoning = _split_tagged_reasoning(content)
+    if tagged_reasoning and not visible_content:
+        return {"error": "content contained only reasoning tags; no user-visible reply"}
+
     envelope = build_envelope(
-        plaintext=content.encode("utf-8"),
+        plaintext=visible_content.encode("utf-8"),
         owner_user_id=user_id,
         user_pk_bytes=user_pk,
         enclave_pk_bytes=enclave_pk,
@@ -705,6 +739,10 @@ def chat_post_message(
 
     payload: dict = {"envelope": envelope}
     safe_reasoning = str(reasoning_text or "").strip()
+    parsed_tagged_reasoning = False
+    if not safe_reasoning and tagged_reasoning:
+        safe_reasoning = tagged_reasoning
+        parsed_tagged_reasoning = True
     if safe_reasoning:
         thinking_envelope = build_envelope(
             plaintext=safe_reasoning.encode("utf-8"),
@@ -714,19 +752,23 @@ def chat_post_message(
             visibility="shared",
         )
         payload["thinking_envelope"] = thinking_envelope
-        payload["reasoning_kind"] = str(reasoning_kind or "agent_summary").strip()
-        payload["reasoning_source"] = str(reasoning_source or "mcp").strip()
+        payload["reasoning_kind"] = str(
+            reasoning_kind or ("provider_reasoning_summary" if parsed_tagged_reasoning else "agent_summary")
+        ).strip()
+        payload["reasoning_source"] = str(
+            reasoning_source or ("mcp_tagged_content" if parsed_tagged_reasoning else "mcp")
+        ).strip()
         if reasoning_model:
             payload["reasoning_model"] = str(reasoning_model).strip()
-        payload["reasoning_native"] = bool(reasoning_native)
+        payload["reasoning_native"] = False if parsed_tagged_reasoning else bool(reasoning_native)
     # Plaintext for the APNs alert push. MCP has plaintext at this point
     # (we just sealed it), so we hand it directly to Flask — the server
     # never decrypts the envelope itself. Apple's APNs gateway sees this
     # string, same privacy posture as Live Activity push.
-    payload["alert_body"] = content
+    payload["alert_body"] = visible_content
     if push_live_activity:
         payload["push_live_activity"] = True
-        payload["push_body"] = push_body or content
+        payload["push_body"] = push_body or visible_content
         payload["title"] = title or ""
         if subtitle:
             payload["subtitle"] = subtitle

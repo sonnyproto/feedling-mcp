@@ -833,6 +833,34 @@ session_id: sess_123
     assert "如果你愿意" in cleaned
 
 
+def test_agent_turn_splits_tagged_thinking_from_cli_text():
+    raw = """<think>
+比较了用户最新问题和已有上下文。
+</think>
+
+这是最终回复。"""
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["这是最终回复。"]
+    assert turn.thinking_summary == "比较了用户最新问题和已有上下文。"
+    assert turn.thinking_kind == "provider_reasoning_summary"
+    assert turn.thinking_source == "tagged_content"
+    assert turn.thinking_native is False
+
+
+def test_agent_turn_splits_reasoning_and_thought_tags_from_cli_text():
+    raw = """<reasoning>先查记忆。</reasoning>
+<thought>再组织语气。</thought>
+好，我在。"""
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["好，我在。"]
+    assert turn.thinking_summary == "先查记忆。\n再组织语气。"
+    assert turn.thinking_kind == "provider_reasoning_summary"
+
+
 def test_extract_cli_output_prefers_structured_json_reply():
     raw = json.dumps(
         {

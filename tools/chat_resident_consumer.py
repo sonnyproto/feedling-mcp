@@ -998,6 +998,35 @@ _REASONING_LINE_RE = re.compile(
 )
 
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
+_TAGGED_THINKING_RE = re.compile(
+    r"<\s*(?P<tag>think|thinking|reasoning|thought)\s*>\s*"
+    r"(?P<body>.*?)"
+    r"\s*<\s*/\s*(?P=tag)\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _split_tagged_thinking(text: str) -> tuple[str, str]:
+    """Split leaked reasoning tags from visible reply text.
+
+    Structured reasoning fields remain the preferred path. This only handles
+    plain terminal text where an upstream wrapper serialized reasoning as
+    `<think>...</think>`, `<reasoning>...</reasoning>`, or `<thought>...</thought>`.
+    """
+    raw = str(text or "")
+    blocks: list[str] = []
+
+    def _collect(match: re.Match) -> str:
+        body = (match.group("body") or "").strip()
+        if body:
+            blocks.append(body)
+        return "\n"
+
+    visible = _TAGGED_THINKING_RE.sub(_collect, raw)
+    visible = re.sub(r"\n{3,}", "\n\n", visible).strip()
+    thinking = "\n\n".join(blocks).strip()
+    return visible, thinking
+
 
 def _strip_leading_non_cjk_preamble(lines: list[str]) -> list[str]:
     """Drop a leading non-CJK transcript block before a CJK final answer.
@@ -1328,6 +1357,12 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         nested = _safe_json_loads(raw) if _looks_like_json_text(raw) else None
         if isinstance(nested, (dict, list)):
             return _agent_turn_from_obj(nested)
+        raw, tagged_thinking = _split_tagged_thinking(raw)
+        if tagged_thinking:
+            turn.thinking_summary = _sanitize_thinking_summary(tagged_thinking)
+            turn.thinking_kind = "provider_reasoning_summary"
+            turn.thinking_source = "tagged_content"
+            turn.thinking_native = False
         clean = _sanitize_reply_text(raw)
         if clean:
             turn.messages.append(clean)
@@ -1507,6 +1542,7 @@ def _extract_text_from_cli_output(raw: str) -> str:
         if text:
             return text
 
+    raw, _tagged_thinking = _split_tagged_thinking(raw)
     raw = _strip_reasoning_sections(raw)
     clean = [ln.rstrip() for ln in raw.splitlines() if not _NOISE_LINE_RE.match(ln)]
     text = "\n".join(clean).strip()
@@ -2071,6 +2107,14 @@ def call_agent(
         }
         if turn.thinking_summary:
             body["thinking_summary"] = turn.thinking_summary
+        if turn.thinking_kind:
+            body["thinking_kind"] = turn.thinking_kind
+        if turn.thinking_source:
+            body["thinking_source"] = turn.thinking_source
+        if turn.thinking_model:
+            body["thinking_model"] = turn.thinking_model
+        if turn.thinking_native is not None:
+            body["thinking_native"] = bool(turn.thinking_native)
         if turn.runtime_debug:
             log.debug("agent runtime debug keys: %s", sorted(turn.runtime_debug.keys()))
         return body

@@ -140,6 +140,24 @@ def test_chat_history_merges_verify_ping_plaintext(monkeypatch):
     assert msgs[1]["content"] == ""
 
 
+def test_split_tagged_reasoning_removes_tags_from_visible_chat():
+    visible, reasoning = mcp_server._split_tagged_reasoning(
+        "<think>\n比较了用户最新问题和已有上下文。\n</think>\n\n这是最终回复。"
+    )
+
+    assert visible == "这是最终回复。"
+    assert reasoning == "比较了用户最新问题和已有上下文。"
+
+
+def test_split_tagged_reasoning_handles_reasoning_and_thought_blocks():
+    visible, reasoning = mcp_server._split_tagged_reasoning(
+        "开头\n<reasoning>第一段推理</reasoning>\n中间\n<thought>第二段思考</thought>\n结尾"
+    )
+
+    assert visible == "开头\n\n中间\n\n结尾"
+    assert reasoning == "第一段推理\n\n第二段思考"
+
+
 def test_missing_session_id_resolves_to_none():
     """The defining post-P0 invariant: no session_id, no fallback, no key."""
     mcp_server._remember("session-X", "key-X")
