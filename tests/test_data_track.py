@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import itertools
 import json
 import sys
 from pathlib import Path
@@ -29,10 +30,16 @@ def client(tmp_path, monkeypatch):
         yield c
 
 
+_pk_counter = itertools.count(1)
+
+
 def _register(client) -> tuple[str, str]:
+    # Distinct public_key per call: the register endpoint now refuses duplicate
+    # content keys (orphan backstop), and these tests need many distinct users.
+    raw = next(_pk_counter).to_bytes(32, "big")
     res = client.post(
         "/v1/users/register",
-        json={"public_key": _b64(b"\x11" * 32), "archive_language": "en"},
+        json={"public_key": _b64(raw), "archive_language": "en"},
     )
     assert res.status_code == 201, res.get_data(as_text=True)
     body = res.get_json()

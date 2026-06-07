@@ -33,3 +33,4 @@ ios/vendor/dcap-qvl/target/
 # Claude Code session scratch (task locks, transient state)
 .claude/
 buildServer.json
+deploy/backups/

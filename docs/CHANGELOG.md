@@ -49,6 +49,73 @@
 
 ---
 
+## 2026-06-07
+
+### [DONE] UserStore 缓存加 TTL + 定向 evict 接口（修 register-orphan 恢复不可见）
+
+- **背景**：排查"内测者历史 chat/memory 全没了"，只读直连 prod RDS 证实**数据没丢、
+  可解密**——是 `/v1/users/register` 在重装/重连时铸新空账号、孤儿化老账号（详见
+  `docs/orphan-account-recovery-plan.md` 与 `tools/recover_orphan_accounts.py`）。合并恢复
+  后发现 `/v1/chat/history` 仍显示旧值：chat 读的是进程内 `UserStore.chat_messages`
+  缓存，`_load_chat` 只在 store 首建时读一次 DB、之后常驻，无良性重载接口（只有
+  delete-all-data 里的 `_stores.pop`）。memory/identity/model_api 实时读 DB，合并后即刻可见。
+- **改动**（`backend/app.py`）：`gunicorn -w 1` → 全后端单一共享 `_stores`。UserStore 是
+  写穿透缓存（DB 唯一真相），故可安全丢弃重建。
+  - `get_store` 加 **TTL**（`STORE_CACHE_TTL_SECONDS=900`）+ `loaded_at`，过期即刷新。
+  - 新增 `UserStore.reload()` + `_evict_store()` + `POST /v1/admin/store/evict`（admin
+    鉴权）。TTL 与 evict 都走**原地刷新（refresh-in-place，保持对象身份不变）**而非换对象——
+    避免 Codex review 指出的竞态：若某请求在过期/驱逐前拿到旧 store、在新对象装入后才写入，
+    写会落 DB 但只进旧实例，新实例漏看（chat 走内存缓存不实时读 DB）。原地刷新下永远只有一个
+    实例，写穿透不被遮蔽；`reload()` 在 `chat_lock` 内重读，与并发 append 串行化、不丢写。
+  - 刷新时 `_wake_store_waiters()` 唤醒长轮询 waiter（chat/proactive），让 park 的 poll 立即
+    返回重连、读到刚浮现的消息。
+  - 恢复工具 survivor 选择修复（Codex P1）：`_pick_survivor` 改为优先「有 live api_key + 最新
+    注册」而非「chat 量最大」——否则刚重装、暂无 chat 的活跃账号会输给有 chat 的死孤儿，把数据
+    搬进死账号。修复后 dry-run 还多识别出 1 个被旧逻辑漏掉的用户（`hlv5AVd7…`，98 chat/39 mem/
+    identity/model_api 滞留死账号）。
+- **部署即生效**：部署本次改动会重启 backend → 冲掉所有陈旧 store → canary 测试者
+  `usr_0f93a433a006b702` 的 209 chat 当场现身；之后带外改动走 evict/TTL，不必再重部署。
+- 测试：新增 `tests/test_store_cache.py`（TDD，5 项：TTL 命中/过期重载、evict 失效/鉴权/
+  刷出带外写）。全套 `tests/` **316 passed**（唯一 1 个 `test_model_api...relationship_days`
+  失败为既有、需 enclave attestation 可达的环境依赖，已 git stash 在干净树复现证明无关）。
+
+### [DONE] 密钥找回账号（堵住 register-orphan 根因：换机/重装丢 api_key）
+
+- **根因确认（确是 app 程序问题）**：DB 证据——同一 public_key 名下的账号在**同一秒/隔
+  2–3 秒**被批量创建（monster lineage 16s 内 6 个），不可能是人手 → 客户端并发/循环连发
+  `/v1/users/register`。两个子 bug：(A) **爆发型**（并发 register）——iOS 已用
+  `registrationTask` 串行化修掉；(B) **换机/重装型**——仍漏：内容密钥对走 iCloud Keychain
+  **同步**跨设备存活，而 api_key 为修 5/10 重启竞态被改成**仅本机**，换机恢复时密钥对在、
+  api_key 没了，守卫标记（UserDefaults）又被重装清空 → 照常 register → 同密钥铸新孤儿。
+- **修复（keypair proof-of-possession 找回）**：让"会同步存活"的密钥对当身份锚。
+  - backend（`app.py`）：`POST /v1/account/recover/challenge`（按 public_key 找规范账号
+    `_canonical_account_for_pubkey`，`build_envelope` local_only 把随机挑战封给该公钥）+
+    `POST /v1/account/recover/verify`（设备回传解密结果证明持私钥 → 为既有账号
+    `_issue_api_key_for_user_locked` 重签 api_key，**不铸新账号**）。挑战一次性 + 300s TTL +
+    `hmac.compare_digest`；复用现有信封 scheme，iOS 用既有解密路径即可解。
+  - iOS（`FeedlingAPI.swift`）：`ensureRegisteredIfCloud` 在 register 前先调
+    `recoverViaKeypairIfPossible()`——用 `loadPrivateKeysForDecryption()`（含**可同步槽**，
+    换机后存活的那把）遍历候选公钥走 challenge/verify，成功即 `setCredentials` 不再 register；
+    404/离线/无密钥则回退原守卫与注册。
+  - **Codex review 跟进修复（iOS）**：(P1) 把 keypair 找回纳入既有 `registrationTask` 单一在途
+    任务（抽出 `acquireCloudCredentials()`）——`@MainActor` 下 guard→任务安装之间无 await 即原子,
+    避免并发启动各自找回、各领一把 api_key 互相覆盖；(P2) `wipeLocalAccountState()`（"删除我的
+    数据"/重置走这里）补 `DiagnosticLog.shared.clear()`,清掉残留 userId/agent 名等可导出 PII；
+    (P3 二轮) 找回从 Bool 改为三态 `KeypairRecoveryOutcome{recovered/noAccount/transientFailure}`:
+    **只有"对所有候选公钥都确定 404"才允许注册**;离线/超时/5xx/解密失败等瞬时错误返回
+    `transientFailure` → 阻止注册并重试,不再因瞬时失败而铸新号孤儿化(纵深防御,与服务端去重叠加)。
+  - **服务端兜底（register 去重）**：`/v1/users/register` 收到**已有账号的 public_key** 时
+    直接返回 **409**（提示走找回），**绝不铸第二个账号**。这关一拦，无论客户端在线与否、
+    版本新旧、iCloud 同步时序如何，孤儿都创建不出来。空 public_key（legacy 客户端）仍放行；
+    Reset-and-reimport 先清密钥对 → 新公钥，不受影响。
+- 测试：`tests/test_account_recover.py`（8 项 TDD，含**完整 X25519+ChaCha20 往返**证明与
+  iOS `box_seal`/`unseal` 线格式一致、多账号共用公钥落到最新活跃账号、错答/重放/未知公钥拒绝、
+  register 去重拒绝重复公钥/放行新公钥/放行空公钥）。因去重改动同步把 `test_data_track` 的
+  注册 helper 改为每次唯一公钥。全套 `tests/` **326 passed**（同上 1 个既有 enclave 环境依赖
+  失败无关）。iOS 侧无法在此跑 XCTest，需设备/CI 构建验证。
+
+---
+
 ## 2026-06-02
 
 ### [DONE] 引入 Alembic 管理数据库 schema

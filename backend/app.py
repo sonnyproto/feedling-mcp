@@ -663,6 +663,23 @@ class UserStore:
     def _load_chat(self):
         self.chat_messages = db.chat_load(self.user_id)
 
+    def reload(self):
+        """Re-read this store's cached state from PostgreSQL IN PLACE, keeping
+        the same object identity (and the same waiter lists). Used by the cache
+        TTL / admin eviction so out-of-band DB writes surface without a swap.
+
+        Each collection is reassigned under its own lock. chat_load + a
+        concurrent append() are both serialized on chat_lock, so no append is
+        lost: either reload reads it from the DB, or append re-adds it to the
+        freshly-loaded list."""
+        with self.chat_lock:
+            self.chat_messages = db.chat_load(self.user_id)
+        with self.frames_lock:
+            self._load_frames_meta()
+        self._load_tokens()
+        self._load_live_activity_state()
+        self._load_push_state()
+
     def append_chat(
         self,
         role: str,
@@ -955,17 +972,72 @@ class UserStore:
 
 
 # Registry of per-user stores
+# In-process per-user store cache. gunicorn runs a single worker, so this is
+# the one shared cache for the whole backend. A UserStore is a write-through
+# cache over PostgreSQL (every mutation persists immediately), so dropping and
+# rebuilding from the DB is always safe. The TTL bounds staleness from
+# out-of-band DB writes (e.g. admin data surgery / the orphan-account recovery
+# tool) so they surface without a backend redeploy; `_evict_store` is the
+# targeted, immediate counterpart.
+STORE_CACHE_TTL_SECONDS = 900  # 15 min
+
 _stores: dict[str, UserStore] = {}
 _stores_lock = threading.Lock()
 
 
+def _wake_store_waiters(store: "UserStore") -> None:
+    """Release threads parked on a store's long-poll waiters (chat / proactive)
+    so they return promptly and re-evaluate against the refreshed state."""
+    try:
+        store.notify_chat_waiters()
+    except Exception:
+        pass
+    try:
+        with store.proactive_job_waiters_lock:
+            for ev in store.proactive_job_waiters:
+                ev.set()
+    except Exception:
+        pass
+
+
+def _evict_store(user_id: str) -> bool:
+    """Force a refresh of a user's cached store from PostgreSQL. Refreshes the
+    state IN PLACE (the same instance is kept) rather than swapping in a new
+    object, so a concurrent request that already holds the store and writes
+    through it can't be lost. Returns whether a cached store was present."""
+    with _stores_lock:
+        store = _stores.get(user_id)
+    if store is None:
+        return False
+    store.reload()
+    store.loaded_at = time.monotonic()
+    _wake_store_waiters(store)
+    return True
+
+
 def get_store(user_id: str) -> UserStore:
+    now = time.monotonic()
+    do_reload = False
     with _stores_lock:
         store = _stores.get(user_id)
         if store is None:
             store = UserStore(user_id)
+            store.loaded_at = time.monotonic()
             _stores[user_id] = store
-        return store
+            return store
+        if (now - getattr(store, "loaded_at", now)) >= STORE_CACHE_TTL_SECONDS:
+            # Expired. Claim the reload by stamping loaded_at now (under the
+            # lock) so concurrent callers don't stampede, then refresh the SAME
+            # instance in place outside the lock. In-place refresh keeps object
+            # identity stable: a request that grabbed this store and writes
+            # through it (write-through to the DB + the same in-memory list)
+            # is never shadowed by a freshly-swapped instance.
+            store.loaded_at = time.monotonic()
+            do_reload = True
+    if do_reload:
+        store.reload()
+        _wake_store_waiters(store)
+    return store
 
 
 # ---------------------------------------------------------------------------
@@ -4412,6 +4484,50 @@ def access_link_token_claim():
 
 
 # ---------------------------------------------------------------------------
+# Keypair proof-of-possession account recovery
+#
+# A device that still holds the content X25519 keypair (it syncs via iCloud
+# Keychain) but lost its device-local api_key must recover its EXISTING account
+# rather than registering a new one — otherwise it orphans the account (the
+# register-orphan bug). The device proves possession of the private key by
+# decrypting a challenge sealed to the account's public_key; the server then
+# issues a fresh api_key for that existing account. No new account is minted.
+# ---------------------------------------------------------------------------
+
+RECOVER_CHALLENGE_TTL_SEC = 300
+_recover_challenges: dict[str, dict] = {}
+_recover_challenges_lock = threading.Lock()
+
+
+def _prune_recover_challenges_locked(now: float) -> None:
+    expired = [cid for cid, c in _recover_challenges.items() if c.get("expires_at", 0) < now]
+    for cid in expired:
+        _recover_challenges.pop(cid, None)
+
+
+def _recover_account_rank(entry: dict) -> tuple:
+    live = len([k for k in (entry.get("api_keys") or [])
+                if isinstance(k, dict) and not k.get("revoked_at")])
+    if live == 0 and entry.get("api_key_hash"):
+        live = 1
+    return (1 if live > 0 else 0, str(entry.get("created_at") or ""))
+
+
+def _canonical_account_for_pubkey(public_key: str) -> dict | None:
+    """The account a recovering device should land on for this public_key: the
+    most recently registered one that still has a live api_key (matches the
+    survivor chosen by tools/recover_orphan_accounts.py)."""
+    pk = (public_key or "").strip()
+    if not pk:
+        return None
+    with _users_lock:
+        matches = [dict(u) for u in _users if (u.get("public_key") or "").strip() == pk]
+    if not matches:
+        return None
+    return max(matches, key=_recover_account_rank)
+
+
+# ---------------------------------------------------------------------------
 # Users: register endpoint (public — no auth required)
 # ---------------------------------------------------------------------------
 
@@ -4423,6 +4539,20 @@ def users_register():
     archive_language = (payload.get("archive_language") or "").strip()
     access_mode = str(payload.get("access_mode") or payload.get("route") or "official_import")
     label = str(payload.get("label") or "").strip()
+    # Server-side orphan backstop: never mint a second account for a content
+    # public key that already has one. The device holds the matching private
+    # key, so it must recover the existing account instead of registering. This
+    # closes the orphan gap even when the client's recover-first guard is
+    # bypassed (offline at first launch, iCloud Keychain sync lag, old app
+    # version). The Reset-and-reimport flow wipes the keypair first, so it gets a
+    # fresh public_key and is unaffected.
+    if public_key and _canonical_account_for_pubkey(public_key) is not None:
+        return jsonify({
+            "error": "account_exists_for_key",
+            "detail": "An account already exists for this content public key. "
+                      "Recover it instead of registering a new one.",
+            "recover_endpoint": "/v1/account/recover/challenge",
+        }), 409
     result = _register_user(
         public_key=public_key or None,
         archive_language=archive_language or None,
@@ -4430,6 +4560,81 @@ def users_register():
         label=label or None,
     )
     return jsonify(result), 201
+
+
+@app.route("/v1/account/recover/challenge", methods=["POST"])
+def account_recover_challenge():
+    """Step 1 of keypair recovery. Given a content public_key, seal a random
+    challenge to it (local_only envelope — the device decrypts with the matching
+    private key) so possession can be proven without an api_key. 404 when no
+    account uses this key (caller should register a fresh account instead)."""
+    payload = request.get_json(silent=True) or {}
+    public_key = str(payload.get("public_key") or "").strip()
+    pk_bytes, err = _decode_content_public_key(public_key)
+    if err:
+        return jsonify({"error": err}), 400
+    account = _canonical_account_for_pubkey(public_key)
+    if not account:
+        return jsonify({"error": "no_recoverable_account"}), 404
+    challenge = secrets.token_hex(32)
+    challenge_id = "rec_" + secrets.token_hex(12)
+    envelope = build_envelope(
+        plaintext=challenge.encode("utf-8"),
+        owner_user_id=account["user_id"],
+        user_pk_bytes=pk_bytes,
+        enclave_pk_bytes=None,
+        visibility="local_only",
+    )
+    now = time.time()
+    with _recover_challenges_lock:
+        _prune_recover_challenges_locked(now)
+        _recover_challenges[challenge_id] = {
+            "public_key": public_key,
+            "user_id": account["user_id"],
+            "challenge": challenge,
+            "expires_at": now + RECOVER_CHALLENGE_TTL_SEC,
+        }
+    print(f"[recover:challenge] user_id={account['user_id']} challenge_id={challenge_id}")
+    return jsonify({"challenge_id": challenge_id, "envelope": envelope}), 200
+
+
+@app.route("/v1/account/recover/verify", methods=["POST"])
+def account_recover_verify():
+    """Step 2 of keypair recovery. The device returns the decrypted challenge,
+    proving it holds the private key. On a match, issue a fresh api_key for the
+    EXISTING account (no new user). The challenge is single-use + short-lived."""
+    payload = request.get_json(silent=True) or {}
+    challenge_id = str(payload.get("challenge_id") or "").strip()
+    answer = str(payload.get("answer") or "")
+    now = time.time()
+    with _recover_challenges_lock:
+        _prune_recover_challenges_locked(now)
+        entry = _recover_challenges.pop(challenge_id, None)  # one-time use
+    if not entry or entry.get("expires_at", 0) < now:
+        return jsonify({"error": "invalid_or_expired_challenge"}), 401
+    if not hmac.compare_digest(answer, str(entry.get("challenge") or "")):
+        return jsonify({"error": "challenge_failed"}), 401
+    user_id = entry["user_id"]
+    with _users_lock:
+        user_entry = _find_user_entry_locked(user_id)
+        if not user_entry:
+            return jsonify({"error": "account_not_found"}), 404
+        existing = [k for k in (user_entry.get("api_keys") or [])
+                    if isinstance(k, dict) and not k.get("revoked_at")]
+        mode = (existing[0].get("access_mode") if existing else "") or "official_import"
+        if mode not in ACCESS_MODES:
+            mode = "official_import"
+        issued = _issue_api_key_for_user_locked(user_entry, access_mode=mode,
+                                                label="Recovered (key)")
+        _save_users()
+        principal_id = user_entry.get("principal_id", "")
+    print(f"[recover:verify] user_id={user_id} recovered via keypair PoP")
+    return jsonify({
+        "user_id": user_id,
+        "principal_id": principal_id,
+        "api_key": issued["api_key"],
+        "public_key": entry["public_key"],
+    }), 200
 
 
 @app.route("/v1/users/whoami", methods=["GET"])
@@ -16313,6 +16518,22 @@ def admin_data_track_user_page(user_id: str):
     if not entry:
         return Response("user not found", status=404, mimetype="text/plain")
     return Response(_render_user_detail_page(_build_data_track_user(entry, include_detail=True)), mimetype="text/html")
+
+
+@app.route("/v1/admin/store/evict", methods=["POST"])
+def admin_store_evict():
+    """Drop a user's cached in-process store so its next access rebuilds from
+    PostgreSQL. Use after an out-of-band DB write (e.g. the orphan-account
+    recovery tool) to surface the change immediately, instead of waiting for the
+    cache TTL or a backend redeploy."""
+    require_admin()
+    payload = request.get_json(silent=True) or {}
+    user_id = str(payload.get("user_id") or request.args.get("user_id") or "").strip()
+    if not user_id:
+        return jsonify({"error": "user_id required"}), 400
+    evicted = _evict_store(user_id)
+    print(f"[admin:store/evict] user_id={user_id} evicted={evicted}")
+    return jsonify({"evicted": evicted, "user_id": user_id})
 
 
 # Synthetic chat-loop ping — server posts a marker user message,
