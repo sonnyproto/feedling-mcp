@@ -101,6 +101,61 @@ def _fake_shared_envelope_builder(captured: list | None = None):
     return _build
 
 
+def test_chat_response_plaintext_reasoning_builds_thinking_extra(monkeypatch):
+    captured_plaintexts: list = []
+
+    class Store:
+        user_id = "user_test"
+
+    monkeypatch.setattr(
+        appmod,
+        "_build_shared_envelope_for_store",
+        _fake_shared_envelope_builder(captured_plaintexts),
+    )
+
+    extra = appmod._chat_plaintext_thinking_extra_for_store(
+        Store(),
+        {
+            "reasoning_text": "Checked the provider-native reasoning field.",
+            "reasoning_kind": "provider_reasoning",
+            "reasoning_source": "openrouter",
+            "reasoning_model": "anthropic/claude-sonnet-4.5",
+            "reasoning_native": True,
+        },
+    )
+
+    assert captured_plaintexts == ["Checked the provider-native reasoning field."]
+    assert extra["thinking_body_ct"] == "ct_1"
+    assert extra["thinking_nonce"] == "nonce_1"
+    assert extra["thinking_kind"] == "provider_reasoning"
+    assert extra["thinking_source"] == "openrouter"
+    assert extra["thinking_model"] == "anthropic/claude-sonnet-4.5"
+    assert extra["thinking_native"] is True
+
+
+def test_chat_response_plaintext_reasoning_default_is_summary(monkeypatch):
+    captured_plaintexts: list = []
+
+    class Store:
+        user_id = "user_test"
+
+    monkeypatch.setattr(
+        appmod,
+        "_build_shared_envelope_for_store",
+        _fake_shared_envelope_builder(captured_plaintexts),
+    )
+
+    extra = appmod._chat_plaintext_thinking_extra_for_store(
+        Store(),
+        {"reasoning_text": "A tagged or flattened reasoning block."},
+    )
+
+    assert captured_plaintexts == ["A tagged or flattened reasoning block."]
+    assert extra["thinking_kind"] == "provider_reasoning_summary"
+    assert extra["thinking_source"] == "chat_response.reasoning_text"
+    assert "thinking_native" not in extra
+
+
 def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     user_id, api_key = _register(client)
     raw_provider_key = "sk-test-secret"

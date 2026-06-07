@@ -5226,6 +5226,70 @@ def _chat_thinking_metadata_from_payload(payload: dict) -> dict:
     return out
 
 
+_CHAT_PLAINTEXT_THINKING_FIELDS = (
+    ("provider_reasoning", "provider_reasoning"),
+    ("reasoning_text", "provider_reasoning_summary"),
+    ("reasoning", "provider_reasoning_summary"),
+    ("reasoning_summary", "provider_reasoning_summary"),
+    ("visible_reasoning", "provider_reasoning_summary"),
+    ("thought_summary", "provider_reasoning_summary"),
+    ("runtime_trace", "runtime_trace"),
+    ("thinking_summary", "agent_summary"),
+    ("thinking", "provider_reasoning_summary"),
+)
+
+
+def _chat_plaintext_thinking_from_payload(payload: dict) -> tuple[str, dict, str]:
+    """Compatibility bridge for callers that post reasoning as plaintext.
+
+    The preferred /v1/chat/response contract is a separately encrypted
+    `thinking_envelope`. Some resident consumers already have provider-native
+    reasoning as plaintext and post it as `reasoning_text`; accept that shape by
+    sealing it server-side so iOS still sees the canonical thinking_* metadata.
+    """
+    if not isinstance(payload, dict):
+        return "", {}, ""
+    for field, default_kind in _CHAT_PLAINTEXT_THINKING_FIELDS:
+        raw = payload.get(field)
+        if raw is None:
+            continue
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        if field == "thinking_summary":
+            text = _sanitize_visible_thinking_summary(text)
+        else:
+            text = _sanitize_provider_reasoning_text(text)
+        if not text:
+            return "", {}, ""
+        metadata = _chat_thinking_metadata_from_payload(payload)
+        metadata.setdefault("thinking_kind", default_kind)
+        metadata.setdefault("thinking_source", f"chat_response.{field}")
+        if field == "provider_reasoning" and "thinking_native" not in metadata:
+            metadata["thinking_native"] = True
+        return text, metadata, field
+    return "", {}, ""
+
+
+def _chat_plaintext_thinking_extra_for_store(store: UserStore, payload: dict) -> dict:
+    text, metadata, field = _chat_plaintext_thinking_from_payload(payload)
+    if not text:
+        return {}
+    envelope, err = _build_shared_envelope_for_store(store, text.encode("utf-8"))
+    if envelope is None:
+        print(
+            f"[chat:{store.user_id}] plaintext_thinking_envelope_failed "
+            f"field={field} detail={err}"
+        )
+        return {
+            "thinking_error": "plaintext_envelope_failed",
+            "thinking_error_detail": str(err or "")[:160],
+        }
+    extra = _chat_thinking_extra_from_envelope(envelope)
+    extra.update(metadata)
+    return extra
+
+
 def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpose: str) -> bytes:
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
@@ -12346,6 +12410,8 @@ def chat_response():
         if thinking_envelope.get("K_enclave"):
             thinking_extra["thinking_K_enclave"] = str(thinking_envelope["K_enclave"])
         thinking_extra.update(_chat_thinking_metadata_from_payload(payload))
+    else:
+        thinking_extra.update(_chat_plaintext_thinking_extra_for_store(store, payload))
     source = str(payload.get("source") or "chat").strip() or "chat"
     if source not in {"chat", "live_activity", "heartbeat", PROACTIVE_JOB_SOURCE}:
         return jsonify({"error": "invalid source"}), 400
