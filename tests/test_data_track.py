@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime
 import itertools
 import json
 import sys
@@ -65,6 +66,20 @@ def _env(msg_id: str, user_id: str) -> dict:
         "visibility": "shared",
         "owner_user_id": user_id,
     }
+
+
+def _epoch(iso: str) -> float:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def _append_chat_at(user_id: str, msg_id: str, role: str, source: str, ts: float) -> None:
+    doc = {
+        **_env(msg_id, user_id),
+        "role": role,
+        "source": source,
+        "ts": ts,
+    }
+    appmod.db.chat_append(user_id, msg_id, ts, doc, appmod.MAX_CHAT_MESSAGES)
 
 
 def test_track_event_scrubs_sensitive_payload(client):
@@ -170,6 +185,63 @@ def test_admin_data_track_aggregates_counts_without_content(client):
     assert "private alert preview" not in dumped
     assert "private copied prompt" not in dumped
     assert "private evidence" not in dumped
+
+
+def test_admin_data_track_dau_counts_user_activity_by_beijing_day(client):
+    user_a, _ = _register(client)
+    user_b, _ = _register(client)
+    user_c, _ = _register(client)
+
+    day2_chat_ts = _epoch("2030-06-01T17:30:00Z")  # 2030-06-02 01:30 Beijing
+    day2_tracking_ts = _epoch("2030-06-01T18:00:00Z")
+    day3_chat_ts = _epoch("2030-06-02T16:30:00Z")  # 2030-06-03 00:30 Beijing
+
+    _append_chat_at(user_a, "dau_user_chat", "user", "chat", day2_chat_ts)
+    _append_chat_at(user_a, "dau_agent_reply", "openclaw", "chat", day2_chat_ts + 1)
+    _append_chat_at(user_c, "dau_verify_ping", "user", "verify_ping", day2_chat_ts + 2)
+    _append_chat_at(user_b, "dau_next_day_chat", "user", "chat", day3_chat_ts)
+
+    appmod.db.log_append(
+        user_a,
+        "tracking_events",
+        {"event_id": "trk_day2_a", "type": "app_open", "ts": day2_tracking_ts},
+        ts=day2_tracking_ts,
+    )
+    appmod.db.log_append(
+        user_b,
+        "tracking_events",
+        {"event_id": "trk_day2_b", "type": "onboarding_view", "ts": day2_tracking_ts + 10},
+        ts=day2_tracking_ts + 10,
+    )
+
+    res = client.get(
+        "/v1/admin/data-track/dau?since=2030-06-01T17:00:00Z&days=10",
+        headers=_admin_headers(),
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    by_day = {row["day"]: row for row in body["rows"]}
+    assert body["definition"]["timezone"] == "Asia/Shanghai"
+    assert by_day["2030-06-03"]["dau"] == 1
+    assert by_day["2030-06-03"]["chat_dau"] == 1
+    assert by_day["2030-06-03"]["tracking_dau"] == 0
+    assert by_day["2030-06-02"]["dau"] == 2
+    assert by_day["2030-06-02"]["chat_dau"] == 1
+    assert by_day["2030-06-02"]["tracking_dau"] == 2
+    assert by_day["2030-06-02"]["user_messages"] == 1
+    assert by_day["2030-06-02"]["tracking_events"] == 2
+    assert by_day["2030-06-02"]["active_events"] == 3
+
+    page = client.get(
+        "/admin/data-track?view=dau&since=2030-06-01T17:00:00Z&days=10",
+        headers=_admin_headers(),
+    )
+    assert page.status_code == 200, page.get_data(as_text=True)
+    html = page.get_data(as_text=True)
+    assert "Daily Active Users" in html
+    assert "Chat DAU" in html
+    assert "2030-06-02" in html
 
 
 def test_admin_data_track_supports_since_filter_and_pagination(client):
@@ -282,5 +354,6 @@ def test_admin_data_track_sorts_before_pagination(client):
     assert page.status_code == 200, page.get_data(as_text=True)
     html = page.get_data(as_text=True)
     assert "Chat desc" in html
+    assert "DAU" in html
     assert "Memory asc" in html
     assert "Proactive desc" in html

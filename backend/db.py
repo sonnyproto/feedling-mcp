@@ -526,6 +526,75 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
     return out
 
 
+def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = "Asia/Shanghai") -> list[dict]:
+    """Return metadata-only daily active user aggregates.
+
+    DAU is intentionally user-initiated activity only: user chat messages plus
+    client tracking events. Agent replies, proactive writes, and synthetic
+    verify pings are excluded so automated reply loops cannot inflate activity.
+    """
+    day_limit = max(1, min(int(days or 30), 366))
+    since = float(since_epoch or 0.0)
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                """
+                WITH active AS (
+                    SELECT user_id, ts, 'chat' AS source
+                    FROM chat_messages
+                    WHERE doc->>'role' = 'user'
+                      AND COALESCE(doc->>'source', '') <> 'verify_ping'
+                      AND (%s = 0 OR ts >= %s)
+
+                    UNION ALL
+
+                    SELECT user_id, ts, 'tracking' AS source
+                    FROM user_logs
+                    WHERE stream = 'tracking_events'
+                      AND ts IS NOT NULL
+                      AND (%s = 0 OR ts >= %s)
+                ),
+                daily AS (
+                    SELECT
+                        to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
+                        COUNT(DISTINCT user_id)::int AS dau,
+                        (COUNT(DISTINCT user_id) FILTER (WHERE source = 'chat'))::int AS chat_dau,
+                        (COUNT(DISTINCT user_id) FILTER (WHERE source = 'tracking'))::int AS tracking_dau,
+                        COUNT(*)::int AS active_events,
+                        (COUNT(*) FILTER (WHERE source = 'chat'))::int AS user_messages,
+                        (COUNT(*) FILTER (WHERE source = 'tracking'))::int AS tracking_events,
+                        MIN(ts) AS first_ts,
+                        MAX(ts) AS last_ts
+                    FROM active
+                    GROUP BY day
+                )
+                SELECT day, dau, chat_dau, tracking_dau, active_events,
+                       user_messages, tracking_events, first_ts, last_ts
+                FROM daily
+                ORDER BY day DESC
+                LIMIT %s
+                """,
+                (since, since, since, since, tz, day_limit),
+            ).fetchall()
+        return [
+            {
+                "day": row[0],
+                "dau": row[1],
+                "chat_dau": row[2],
+                "tracking_dau": row[3],
+                "active_events": row[4],
+                "user_messages": row[5],
+                "tracking_events": row[6],
+                "first_ts": row[7],
+                "last_ts": row[8],
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        log.error("[db] admin_data_track_dau failed: %s", e)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Per-user singleton blobs
 # ---------------------------------------------------------------------------

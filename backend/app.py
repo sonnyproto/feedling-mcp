@@ -15351,7 +15351,7 @@ def _admin_qs() -> str:
 
 def _data_track_qs(**updates) -> str:
     params: dict[str, str] = {}
-    for key in ("admin_key", "since", "registered_since", "q", "limit", "offset", "sort", "dir"):
+    for key in ("admin_key", "since", "registered_since", "q", "limit", "offset", "sort", "dir", "view", "days"):
         value = request.args.get(key, "").strip()
         if value:
             params[key] = value
@@ -16166,6 +16166,9 @@ def _data_track_request_filters() -> dict:
     raw_dir = (request.args.get("dir") or "desc").strip().lower()
     if raw_dir not in {"asc", "desc"}:
         raw_dir = "desc"
+    raw_view = (request.args.get("view") or "users").strip().lower()
+    if raw_view not in {"users", "dau"}:
+        raw_view = "users"
 
     def read_int(name: str, default: int, minimum: int, maximum: int) -> int:
         try:
@@ -16182,6 +16185,8 @@ def _data_track_request_filters() -> dict:
         "dir": raw_dir,
         "limit": read_int("limit", 100, 1, 500),
         "offset": read_int("offset", 0, 0, 1_000_000),
+        "view": raw_view,
+        "days": read_int("days", 30, 1, 366),
     }
 
 
@@ -16343,6 +16348,51 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     return payload
 
 
+def _data_track_dau_payload() -> dict:
+    filters = _data_track_request_filters()
+    days = int(filters.get("days") or 30)
+    rows = db.admin_data_track_dau(
+        since_epoch=float(filters.get("since_epoch") or 0),
+        days=days,
+        tz="Asia/Shanghai",
+    )
+    dau_values = [int(row.get("dau") or 0) for row in rows]
+    latest = rows[0] if rows else {}
+    summary = {
+        "generated_at": datetime.now().isoformat(),
+        "timezone": "Asia/Shanghai",
+        "days_returned": len(rows),
+        "latest_day": latest.get("day", ""),
+        "latest_dau": int(latest.get("dau") or 0),
+        "max_dau": max(dau_values, default=0),
+        "avg_dau": (sum(dau_values) / len(dau_values)) if dau_values else 0,
+        "user_messages": sum(int(row.get("user_messages") or 0) for row in rows),
+        "tracking_events": sum(int(row.get("tracking_events") or 0) for row in rows),
+        "active_events": sum(int(row.get("active_events") or 0) for row in rows),
+    }
+    return {
+        "summary": summary,
+        "filters": {
+            "since": filters.get("since", ""),
+            "days": days,
+            "view": "dau",
+        },
+        "rows": [
+            {
+                **row,
+                "first_at": _epoch_to_iso(row.get("first_ts")),
+                "last_at": _epoch_to_iso(row.get("last_ts")),
+            }
+            for row in rows
+        ],
+        "definition": {
+            "dau": "Distinct users with at least one user chat message or tracking event on the Beijing day.",
+            "excluded": "Agent/openclaw messages, proactive writes, and verify_ping synthetic messages are excluded.",
+            "timezone": "Asia/Shanghai",
+        },
+    }
+
+
 def _format_duration(seconds) -> str:
     if seconds is None:
         return "n/a"
@@ -16370,6 +16420,25 @@ def _render_metric(label: str, value) -> str:
     )
 
 
+def _data_track_page_href(**updates) -> str:
+    qs_inner = _data_track_qs(**updates)
+    return f"/admin/data-track?{qs_inner}" if qs_inner else "/admin/data-track"
+
+
+def _render_data_track_view_nav(active: str) -> str:
+    def nav_item(view: str, label: str) -> str:
+        cls = "sort-button active" if active == view else "sort-button"
+        href = _data_track_page_href(view=None if view == "users" else view, offset=0)
+        return f"<a class='{cls}' href='{html.escape(href, quote=True)}'>{html.escape(label)}</a>"
+
+    return (
+        "<div class='viewbar'>"
+        f"{nav_item('users', 'Users')}"
+        f"{nav_item('dau', 'DAU')}"
+        "</div>"
+    )
+
+
 def _render_data_track_page(payload: dict) -> str:
     summary = payload["summary"]
     users = payload.get("users", [])
@@ -16380,14 +16449,10 @@ def _render_data_track_page(payload: dict) -> str:
     current_sort = str(filters.get("sort") or "")
     current_dir = str(filters.get("dir") or "desc")
 
-    def page_href(**updates) -> str:
-        qs_inner = _data_track_qs(**updates)
-        return f"/admin/data-track?{qs_inner}" if qs_inner else "/admin/data-track"
-
     def sort_button(metric: str, direction: str, label: str) -> str:
         active = current_sort == metric and current_dir == direction
         cls = "sort-button active" if active else "sort-button"
-        href = page_href(sort=metric, dir=direction, offset=0)
+        href = _data_track_page_href(sort=metric, dir=direction, offset=0, view=None)
         return f"<a class='{cls}' href='{html.escape(href, quote=True)}'>{html.escape(label)}</a>"
 
     sort_controls = "".join([
@@ -16404,9 +16469,9 @@ def _render_data_track_page(payload: dict) -> str:
         prev_offset = pagination.get("prev_offset")
         next_offset = pagination.get("next_offset")
         if prev_offset is not None:
-            pager_links.append(f"<a class='sort-button' href='{html.escape(page_href(offset=prev_offset), quote=True)}'>Prev</a>")
+            pager_links.append(f"<a class='sort-button' href='{html.escape(_data_track_page_href(offset=prev_offset, view=None), quote=True)}'>Prev</a>")
         if next_offset is not None:
-            pager_links.append(f"<a class='sort-button' href='{html.escape(page_href(offset=next_offset), quote=True)}'>Next</a>")
+            pager_links.append(f"<a class='sort-button' href='{html.escape(_data_track_page_href(offset=next_offset, view=None), quote=True)}'>Next</a>")
         if pager_links:
             pager = f"<div class='pager'>{''.join(pager_links)}</div>"
     rows_html = []
@@ -16463,7 +16528,7 @@ def _render_data_track_page(payload: dict) -> str:
     .metric-value {{ font-size:24px; font-weight:700; }}
     .metric-label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }}
 	    .toolbar {{ display:flex; gap:10px; align-items:center; margin:18px 0; }}
-	    .sortbar,.pager {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 18px; }}
+	    .viewbar,.sortbar,.pager {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 18px; }}
 	    .sort-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
 	    .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
 	    input {{ width:320px; max-width:100%; border:1px solid var(--line); border-radius:6px; padding:9px 10px; background:white; color:var(--fg); }}
@@ -16480,10 +16545,11 @@ def _render_data_track_page(payload: dict) -> str:
 </head>
 <body>
 <main>
-  <h1>Feedling Beta Data Track</h1>
-  <div class="muted">Generated {html.escape(summary["generated_at"])}. Metadata only; encrypted content is not read or rendered.</div>
-  <div class="muted">Showing {html.escape(str(pagination.get("returned", len(users))))} of {html.escape(str(pagination.get("total", summary["users_total"])))} filtered users. Since {html.escape(str(filters.get("since") or "all time"))}.</div>
-	  <section class="metrics">{metrics}</section>
+	  <h1>Feedling Beta Data Track</h1>
+	  <div class="muted">Generated {html.escape(summary["generated_at"])}. Metadata only; encrypted content is not read or rendered.</div>
+	  <div class="muted">Showing {html.escape(str(pagination.get("returned", len(users))))} of {html.escape(str(pagination.get("total", summary["users_total"])))} filtered users. Since {html.escape(str(filters.get("since") or "all time"))}.</div>
+	  {_render_data_track_view_nav("users")}
+		  <section class="metrics">{metrics}</section>
 	  <h2>Beta users</h2>
 	  <div class="toolbar"><input id="q" placeholder="Filter user, route, stage"></div>
 	  <div class="sortbar">{sort_controls}</div>
@@ -16502,6 +16568,81 @@ q.addEventListener('input', () => {{
   }}
 }});
 </script>
+	</body>
+	</html>"""
+
+
+def _render_data_track_dau_page(payload: dict) -> str:
+    summary = payload["summary"]
+    filters = payload.get("filters", {})
+    rows = payload.get("rows", [])
+    definition = payload.get("definition", {})
+    api_qs = _data_track_qs(view=None, q=None, limit=None, offset=None, sort=None, dir=None)
+    api_url = f"/v1/admin/data-track/dau?{api_qs}" if api_qs else "/v1/admin/data-track/dau"
+    rows_html = []
+    for row in rows:
+        rows_html.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('day') or ''))}</td>"
+            f"<td>{int(row.get('dau') or 0)}</td>"
+            f"<td>{int(row.get('chat_dau') or 0)}</td>"
+            f"<td>{int(row.get('tracking_dau') or 0)}</td>"
+            f"<td>{int(row.get('active_events') or 0)}</td>"
+            f"<td>{int(row.get('user_messages') or 0)}</td>"
+            f"<td>{int(row.get('tracking_events') or 0)}</td>"
+            f"<td>{html.escape(str(row.get('last_at') or ''))}</td>"
+            "</tr>"
+        )
+    metrics = "".join([
+        _render_metric("latest DAU", summary["latest_dau"]),
+        _render_metric("latest day", summary.get("latest_day") or "n/a"),
+        _render_metric("max DAU", summary["max_dau"]),
+        _render_metric("avg DAU", f"{summary['avg_dau']:.1f}"),
+        _render_metric("user messages", summary["user_messages"]),
+        _render_metric("tracking events", summary["tracking_events"]),
+    ])
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Feedling DAU · Data Track</title>
+  <style>
+    :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; }}
+    body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+    main {{ max-width:1280px; margin:0 auto; padding:28px 24px 48px; }}
+    h1 {{ font-size:26px; margin:0 0 4px; }}
+    h2 {{ font-size:16px; margin:28px 0 12px; }}
+    .muted {{ color:var(--muted); }}
+    .metrics {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:22px 0; }}
+    .metric {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
+    .metric-value {{ font-size:24px; font-weight:700; }}
+    .metric-label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }}
+    .viewbar,.toolbar {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0 18px; }}
+    .sort-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
+    .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
+    table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
+    th,td {{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }}
+    th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }}
+    tr:last-child td {{ border-bottom:0; }}
+    a {{ color:var(--accent); text-decoration:none; }}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Feedling Beta Data Track</h1>
+  <div class="muted">Generated {html.escape(summary["generated_at"])}. DAU timezone: {html.escape(summary["timezone"])}.</div>
+  <div class="muted">Showing {html.escape(str(summary["days_returned"]))} active days. Since {html.escape(str(filters.get("since") or "all time"))}; days limit {html.escape(str(filters.get("days") or 30))}.</div>
+  {_render_data_track_view_nav("dau")}
+  <section class="metrics">{metrics}</section>
+  <h2>Daily Active Users</h2>
+  <div class="muted">{html.escape(definition.get("dau") or "")} {html.escape(definition.get("excluded") or "")}</div>
+  <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
+  <table>
+    <thead><tr><th>Beijing day</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>Last active</th></tr></thead>
+    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='8' class='muted'>No DAU activity in this range.</td></tr>"}</tbody>
+  </table>
+</main>
 </body>
 </html>"""
 
@@ -16560,6 +16701,12 @@ def admin_data_track_users():
     return jsonify(_data_track_payload(include_users=True))
 
 
+@app.route("/v1/admin/data-track/dau", methods=["GET"])
+def admin_data_track_dau():
+    require_admin()
+    return jsonify(_data_track_dau_payload())
+
+
 @app.route("/v1/admin/data-track/users/<user_id>", methods=["GET"])
 def admin_data_track_user(user_id: str):
     require_admin()
@@ -16573,6 +16720,8 @@ def admin_data_track_user(user_id: str):
 @app.route("/admin/data-track", methods=["GET"])
 def admin_data_track_page():
     require_admin()
+    if (request.args.get("view") or "").strip().lower() == "dau":
+        return Response(_render_data_track_dau_page(_data_track_dau_payload()), mimetype="text/html")
     return Response(_render_data_track_page(_data_track_payload(include_users=True)), mimetype="text/html")
 
 
