@@ -431,9 +431,6 @@ TRACK_EVENT_RETENTION_DAYS = int(os.environ.get("FEEDLING_TRACK_EVENT_RETENTION_
 TRACK_EVENT_MAX = int(os.environ.get("FEEDLING_TRACK_EVENT_MAX", 2000))
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 PROACTIVE_JOB_MAX = int(os.environ.get("FEEDLING_PROACTIVE_JOB_MAX", 500))
-PROACTIVE_V2_ENABLED = os.environ.get("FEEDLING_PROACTIVE_V2", "true").strip().lower() not in {
-    "0", "false", "no", "off",
-}
 PROACTIVE_V2_WAKE_TTL_SEC = float(os.environ.get("FEEDLING_PROACTIVE_V2_WAKE_TTL_SEC", "180"))
 PROACTIVE_USER_STATES = {"default", "focused", "social", "resting", "away"}
 PROACTIVE_AI_STATES = {"present", "watching", "thinking", "curious", "waiting"}
@@ -444,20 +441,13 @@ PROACTIVE_DEBUG_EVENT_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_EV
 PROACTIVE_DEBUG_REVIEW_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_REVIEW_READ_MAX", 500))
 PROACTIVE_DEBUG_MESSAGE_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_MESSAGE_READ_MAX", 500))
 PROACTIVE_DEBUG_FRAME_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_FRAME_READ_MAX", MAX_FRAMES))
-PROACTIVE_GATE_PROVIDER = os.environ.get("FEEDLING_PROACTIVE_GATE_PROVIDER", "openrouter").strip().lower()
-PROACTIVE_GATE_MODEL = os.environ.get("FEEDLING_PROACTIVE_GATE_MODEL", "google/gemini-3.1-flash-lite").strip()
-PROACTIVE_GATE_TIMEOUT_SEC = float(os.environ.get("FEEDLING_PROACTIVE_GATE_TIMEOUT_SEC", "30"))
-PROACTIVE_GATE_MAX_FRAMES = int(os.environ.get("FEEDLING_PROACTIVE_GATE_MAX_FRAMES", "5"))
-PROACTIVE_GATE_FRAME_CANDIDATE_MAX = int(os.environ.get("FEEDLING_PROACTIVE_GATE_FRAME_CANDIDATE_MAX", "60"))
-PROACTIVE_GATE_SCENE_HASH_THRESHOLD = int(os.environ.get("FEEDLING_PROACTIVE_GATE_SCENE_HASH_THRESHOLD", "5"))
-PROACTIVE_GATE_INCLUDE_IMAGES = os.environ.get("FEEDLING_PROACTIVE_GATE_INCLUDE_IMAGES", "true").lower() not in {
-    "0", "false", "no", "off",
-}
+PROACTIVE_WAKE_MAX_FRAMES = int(os.environ.get("FEEDLING_PROACTIVE_WAKE_MAX_FRAMES", "5"))
+PROACTIVE_WAKE_FRAME_CANDIDATE_MAX = int(os.environ.get("FEEDLING_PROACTIVE_WAKE_FRAME_CANDIDATE_MAX", "60"))
 PROACTIVE_DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/Shanghai").strip() or "UTC"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 PROACTIVE_DEBUG_TRANSLATION_MODEL = os.environ.get(
     "FEEDLING_PROACTIVE_DEBUG_TRANSLATION_MODEL",
-    PROACTIVE_GATE_MODEL,
+    "google/gemini-3.1-flash-lite",
 ).strip()
 PROACTIVE_DEBUG_TRANSLATION_TIMEOUT_SEC = float(
     os.environ.get("FEEDLING_PROACTIVE_DEBUG_TRANSLATION_TIMEOUT_SEC", "10")
@@ -1295,7 +1285,7 @@ from semantic_analysis import analyze as _semantic_analysis  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# Proactive Gate helpers
+# Proactive wake helpers
 # ---------------------------------------------------------------------------
 
 _DEVICE_EVENT_ALLOWED_KEYS = {
@@ -1346,9 +1336,9 @@ def _redact_device_payload(payload: dict) -> dict:
     """Persist only coarse device-event facts.
 
     Raw location/photo/calendar text belongs in the user device or encrypted
-    frame store, not in server-side proactive logs. The Gate needs enough
-    signal to decide whether to create a job; the real agent can ask for richer
-    context later through the normal encrypted path.
+    frame store, not in server-side proactive logs. The wake scheduler only
+    needs coarse state; the real agent can ask for richer context later through
+    the normal encrypted path.
     """
     if not isinstance(payload, dict):
         return {}
@@ -1475,16 +1465,11 @@ def _recent_user_chat_active(store: UserStore, now: float, window_sec: float = 6
 def _recent_frame_meta(store: UserStore, now: float, window_sec: float) -> list[dict]:
     with store.frames_lock:
         frames = [f for f in store.frames_meta if now - float(f.get("ts", 0) or 0) <= window_sec]
-    return frames[-PROACTIVE_GATE_FRAME_CANDIDATE_MAX:]
+    return frames[-PROACTIVE_WAKE_FRAME_CANDIDATE_MAX:]
 
 
-def _sample_frames_for_gate(frames: list[dict], max_frames: int = 5) -> list[dict]:
-    """Metadata fallback sampler for Gate frames.
-
-    The preferred path samples after decryption with visual hashes. This
-    fallback is used when the Gate is blocked before decrypting or in tests
-    that only provide frame metadata.
-    """
+def _sample_frames_for_wake(frames: list[dict], max_frames: int = 5) -> list[dict]:
+    """Metadata sampler for proactive wake frames."""
     clean = [f for f in frames if isinstance(f, dict) and str(f.get("id") or "").strip()]
     clean.sort(key=lambda f: float(f.get("ts", 0) or 0))
     if len(clean) <= max_frames:
@@ -1523,102 +1508,13 @@ def _base64_payload(data_url_or_b64: str) -> str:
     return raw
 
 
-def _visual_hash_for_gate(image_b64: str) -> str | None:
-    """Return a lightweight perceptual hash for decrypted screen frames.
-
-    This uses an 8x8 grayscale average hash. It is intentionally small and
-    deterministic: enough to collapse near-duplicate screen frames before the
-    LLM call without adding a second model to the pipeline.
-    """
-    payload = _base64_payload(image_b64)
-    if not payload:
-        return None
-    try:
-        from PIL import Image  # type: ignore
-
-        image = Image.open(io.BytesIO(base64.b64decode(payload))).convert("L").resize((8, 8))
-        pixels = list(image.getdata())
-        avg = sum(pixels) / max(1, len(pixels))
-        bits = "".join("1" if px >= avg else "0" for px in pixels)
-        return f"{int(bits, 2):016x}"
-    except Exception:
-        return None
-
-
-def _hash_distance(a: str | None, b: str | None) -> int | None:
-    if not a or not b:
-        return None
-    try:
-        return (int(a, 16) ^ int(b, 16)).bit_count()
-    except Exception:
-        return None
-
-
-def _same_scene_fallback(a: dict, b: dict) -> bool:
-    app_a = str(a.get("app") or "").strip().lower()
-    app_b = str(b.get("app") or "").strip().lower()
-    if app_a and app_b and app_a != "unknown" and app_a == app_b:
-        text_a = " ".join(str(a.get("ocr_text") or "").split())[:240]
-        text_b = " ".join(str(b.get("ocr_text") or "").split())[:240]
-        return bool(text_a and text_a == text_b)
-    return False
-
-
-def _sample_frame_contexts_for_gate(frame_contexts: list[dict], max_frames: int = 5) -> list[dict]:
-    """Cluster decrypted frames by scene and keep 3-5 representatives.
-
-    Mirrors the product spec's "cluster by scene, cap at 5" behavior:
-    consecutive near-duplicates collapse, the last frame is always retained,
-    and active app switches get represented.
-    """
-    clean = [
-        f for f in frame_contexts
-        if isinstance(f, dict) and str(f.get("frame_id") or f.get("id") or "").strip()
-    ]
-    clean.sort(key=lambda f: float(f.get("ts", 0) or 0))
-    if len(clean) <= max_frames:
-        return clean
-
-    hashes = [_visual_hash_for_gate(str(f.get("image_b64") or "")) for f in clean]
-    clusters: list[list[int]] = [[0]]
-    for i in range(1, len(clean)):
-        dist = _hash_distance(hashes[i], hashes[i - 1])
-        same_scene = (
-            dist is not None and dist < PROACTIVE_GATE_SCENE_HASH_THRESHOLD
-        ) or _same_scene_fallback(clean[i], clean[i - 1])
-        if same_scene:
-            clusters[-1].append(i)
-        else:
-            clusters.append([i])
-
-    representatives = [clean[c[-1]] for c in clusters]
-    if len(representatives) <= max_frames:
-        return representatives
-
-    rep_hashes = [_visual_hash_for_gate(str(f.get("image_b64") or "")) for f in representatives]
-
-    def change_score(idx: int) -> int:
-        left = _hash_distance(rep_hashes[idx], rep_hashes[idx - 1]) if idx > 0 else 0
-        right = _hash_distance(rep_hashes[idx], rep_hashes[idx + 1]) if idx < len(rep_hashes) - 1 else 0
-        if left is None and right is None:
-            return 0
-        return (left or 0) + (right or 0)
-
-    keep_indexes = {0, len(representatives) - 1}
-    middle = list(range(1, len(representatives) - 1))
-    middle.sort(key=change_score, reverse=True)
-    for idx in middle[:max(0, max_frames - len(keep_indexes))]:
-        keep_indexes.add(idx)
-    return [representatives[i] for i in sorted(keep_indexes)]
-
-
 def _decrypt_frame_metadata_for_gate(
     store: UserStore,
     frame_id: str,
     api_key: str | None,
     include_image: bool = False,
 ) -> dict:
-    """Best-effort decrypt of a frame for the automatic Gate.
+    """Best-effort decrypt of a frame for request-scoped routes.
 
     The Flask backend does not store raw API keys, so only request-scoped
     callers (iOS / resident consumer / manual curl) can run this path.
@@ -1666,22 +1562,7 @@ def _decrypt_frame_metadata_for_gate(
         return {"frame_id": fid, "error": f"decrypt_error:{type(e).__name__}:{str(e)[:160]}"}
 
 
-def _gate_ocr_summary(frame_contexts: list[dict], fallback_frames: list[dict]) -> str:
-    seen: set[str] = set()
-    parts: list[str] = []
-    for frame in reversed(frame_contexts):
-        text = str(frame.get("ocr_text") or "").strip()
-        if text and text not in seen:
-            seen.add(text)
-            parts.append(text[:320])
-            if len(parts) >= 4:
-                break
-    if parts:
-        return " | ".join(reversed(parts))[:1000]
-    return _ocr_summary(fallback_frames)
-
-
-def _gate_current_app(frame_contexts: list[dict], fallback_frames: list[dict]) -> str:
+def _current_app_from_frames(frame_contexts: list[dict], fallback_frames: list[dict]) -> str:
     for frame in reversed(frame_contexts):
         app_name = str(frame.get("app") or "").strip()
         if app_name and app_name != "unknown":
@@ -1693,52 +1574,11 @@ def _gate_current_app(frame_contexts: list[dict], fallback_frames: list[dict]) -
     return "unknown"
 
 
-def _explicit_help_signal(ocr: str) -> bool:
-    text = (ocr or "").lower()
-    if len(text.strip()) < 40:
-        return False
-    cues = (
-        "帮我", "要不要", "怎么", "如何", "哪一个", "选哪个", "压成", "总结",
-        "review", "compare", "which", "should i", "help me", "summarize",
-    )
-    return any(cue in text for cue in cues) or "?" in text or "？" in text
-
-
-def _recent_proactive_fire_active(store: UserStore, now: float, window_sec: float = 600.0) -> bool:
-    with store.chat_lock:
-        for msg in reversed(store.chat_messages):
-            if msg.get("source") != PROACTIVE_JOB_SOURCE:
-                continue
-            ts = float(msg.get("ts", 0) or 0)
-            if now - ts <= window_sec:
-                return True
-            return False
-    return False
-
-
 def _safe_zoneinfo(name: str) -> ZoneInfo:
     try:
         return ZoneInfo(name)
     except ZoneInfoNotFoundError:
         return ZoneInfo("UTC")
-
-
-def _now_local_context(payload: dict, settings: dict, now: float) -> dict:
-    tz_name = str(
-        payload.get("timezone")
-        or payload.get("tz")
-        or settings.get("timezone")
-        or PROACTIVE_DEFAULT_TIMEZONE
-    ).strip() or "UTC"
-    tz = _safe_zoneinfo(tz_name)
-    local_dt = datetime.fromtimestamp(now, tz)
-    return {
-        "iso": local_dt.isoformat(),
-        "date": local_dt.date().isoformat(),
-        "time": local_dt.strftime("%H:%M"),
-        "weekday": local_dt.strftime("%A"),
-        "timezone": tz_name,
-    }
 
 
 def _enclave_get_json_for_gate(path: str, api_key: str | None, params: dict | None = None) -> tuple[dict | None, str]:
@@ -1764,411 +1604,12 @@ def _enclave_get_json_for_gate(path: str, api_key: str | None, params: dict | No
         return None, f"enclave_error:{type(e).__name__}:{str(e)[:120]}"
 
 
-def _summarize_identity_for_gate(identity: dict | None) -> tuple[dict, list[dict]]:
-    if not isinstance(identity, dict):
-        return {}, []
-    agent_name = str(identity.get("agent_name") or "").strip()
-    summary = {
-        "agent_name": agent_name,
-        "self_introduction": str(identity.get("self_introduction") or "")[:800],
-        "days_with_user": identity.get("days_with_user"),
-        "category": str(identity.get("category") or "")[:160],
-        "signature": identity.get("signature") if isinstance(identity.get("signature"), list) else [],
-        "interruption_preferences": identity.get("interruption_preferences")
-        or identity.get("push_preferences")
-        or identity.get("proactive_preferences")
-        or {},
-    }
-    dimensions = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
-    clean_dims: list[dict] = []
-    connection_rows: list[dict] = []
-    for idx, dim in enumerate(dimensions[:12]):
-        if not isinstance(dim, dict):
-            continue
-        name = str(dim.get("name") or dim.get("label") or f"dimension_{idx + 1}").strip()
-        desc = str(dim.get("description") or dim.get("evidence") or "").strip()
-        row = {
-            "id": f"identity.dimension.{idx + 1}",
-            "name": name[:120],
-            "score": dim.get("score"),
-            "description": desc[:400],
-        }
-        clean_dims.append(row)
-        if name or desc:
-            connection_rows.append({
-                "source_type": "identity_card",
-                "source_id": row["id"],
-                "quote": f"{name}: {desc}".strip(": ")[:500],
-            })
-    summary["dimensions"] = clean_dims
-    if agent_name:
-        connection_rows.append({
-            "source_type": "identity_card",
-            "source_id": "identity.agent_name",
-            "quote": f"agent_name={agent_name}",
-        })
-    return summary, connection_rows
-
-
-def _moment_is_passive_observation(moment: dict) -> bool:
-    fields = [
-        moment.get("type"),
-        moment.get("source"),
-        moment.get("category"),
-        *(moment.get("tags") if isinstance(moment.get("tags"), list) else []),
-    ]
-    text = " ".join(str(x or "") for x in fields).lower()
-    return "agent_passive_observation" in text or "passive_observation" in text
-
-
-def _summarize_moments_for_gate(moments: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
-    memory_set: list[dict] = []
-    passive_observations: list[dict] = []
-    connection_rows: list[dict] = []
-    for moment in moments:
-        if not isinstance(moment, dict):
-            continue
-        if moment.get("decrypt_status") and moment.get("decrypt_status") != "ok":
-            continue
-        mid = str(moment.get("id") or "").strip()
-        if not mid:
-            continue
-        title = str(moment.get("title") or "").strip()
-        desc = str(moment.get("description") or "").strip()
-        row = {
-            "id": mid,
-            "type": str(moment.get("type") or "")[:80],
-            "source": str(moment.get("source") or "")[:80],
-            "occurred_at": moment.get("occurred_at"),
-            "title": title[:220],
-            "description": desc[:700],
-        }
-        if _moment_is_passive_observation(moment):
-            passive_observations.append(row)
-            source_type = "passive_observation"
-        else:
-            memory_set.append(row)
-            source_type = "memory_set"
-        quote = " — ".join(part for part in [title, desc] if part)[:700]
-        if quote:
-            connection_rows.append({
-                "source_type": source_type,
-                "source_id": mid,
-                "quote": quote,
-            })
-    return memory_set[:80], passive_observations[:10], connection_rows[:120]
-
-
-def _recent_fires_for_gate(store: UserStore, now: float) -> list[dict]:
-    fires: list[dict] = []
-    since = now - 86400
-    decisions = store.list_gate_decisions(since_epoch=since, limit=80)
-    for row in decisions:
-        if not row.get("should_reach_out"):
-            continue
-        fires.append({
-            "decision_id": row.get("decision_id"),
-            "ts": row.get("ts"),
-            "intent_label": row.get("intent_label", ""),
-            "context_hint": row.get("context_hint", "")[:500],
-            "reason": row.get("reason", ""),
-            "connection": row.get("connection") or {},
-            "frame_ids": row.get("frame_ids", [])[:5],
-        })
-    return fires[-20:]
-
-
-def _build_gate_memory_context(
-    store: UserStore,
-    api_key: str | None,
-    payload: dict,
-    settings: dict,
-    now: float,
-) -> dict:
-    identity_data, identity_error = _enclave_get_json_for_gate("/v1/identity/get", api_key)
-    memory_data, memory_error = _enclave_get_json_for_gate("/v1/memory/list", api_key, {"limit": "200"})
-
-    identity, identity_connections = _summarize_identity_for_gate(
-        (identity_data or {}).get("identity") if isinstance(identity_data, dict) else None
-    )
-    memory_set, passive_observations, memory_connections = _summarize_moments_for_gate(
-        (memory_data or {}).get("moments") if isinstance((memory_data or {}).get("moments"), list) else []
-    )
-    connection_candidates = identity_connections + memory_connections
-    return {
-        "identity_card": identity,
-        "memory_set": memory_set,
-        "passive_observations": passive_observations,
-        "recent_fires": _recent_fires_for_gate(store, now),
-        "now_local": _now_local_context(payload, settings, now),
-        "connection_candidates": connection_candidates,
-        "context_errors": {
-            "identity": identity_error,
-            "memory": memory_error,
-        },
-    }
-
-
-def _gate_context_connection_ids(gate_context: dict) -> set[str]:
-    return {
-        str(row.get("source_id") or "").strip()
-        for row in gate_context.get("connection_candidates", [])
-        if isinstance(row, dict) and str(row.get("source_id") or "").strip()
-    }
-
-
 def _strip_json_code_fence(text: str) -> str:
     cleaned = (text or "").strip()
     if cleaned.startswith("```"):
         cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\s*```$", "", cleaned)
     return cleaned.strip()
-
-
-PROACTIVE_GATE_SYSTEM_PROMPT = (
-    "You are the proactive gate for the user's personal AI companion. "
-    "Your job is to decide whether the companion would naturally think of the user in this moment. "
-    "Naturally think of has exactly one criterion: a concrete connection between the current screen/context "
-    "and something specific in identity_card, memory_set, or passive_observations. "
-    "Return JSON only. Do not reveal chain-of-thought. Do not write the final user-facing message."
-)
-
-
-def _normalize_connection(raw_connection) -> dict:
-    if not isinstance(raw_connection, dict):
-        return {}
-    return {
-        "source_type": str(raw_connection.get("source_type") or "")[:80],
-        "source_id": str(raw_connection.get("source_id") or "")[:160],
-        "quote": str(raw_connection.get("quote") or "")[:700],
-        "why_concrete": str(raw_connection.get("why_concrete") or "")[:700],
-    }
-
-
-def _coerce_llm_gate_payload(
-    raw: dict,
-    selected_frame_ids: list[str],
-    allowed_connection_ids: set[str] | None = None,
-) -> dict:
-    if not isinstance(raw, dict):
-        return {
-            "should_reach_out": False,
-            "confidence": 0.0,
-            "intent_label": "invalid_gate_response",
-            "context_hint": "",
-            "reason": "llm_non_object",
-            "abstention_reason": "llm_non_object",
-            "connection": {},
-            "frame_ids": [],
-        }
-
-    allowed_ids = set(selected_frame_ids)
-    requested_ids = raw.get("frame_ids")
-    if not isinstance(requested_ids, list):
-        requested_ids = selected_frame_ids if raw.get("should_reach_out") else []
-    frame_ids = [
-        str(fid) for fid in requested_ids
-        if str(fid) in allowed_ids
-    ][:PROACTIVE_GATE_MAX_FRAMES]
-
-    connections = raw.get("connections")
-    if not isinstance(connections, list):
-        connections = []
-
-    try:
-        confidence = float(raw.get("confidence", 0.0))
-    except (TypeError, ValueError):
-        confidence = 0.0
-
-    connection = _normalize_connection(raw.get("connection"))
-    connections = raw.get("connections")
-    if isinstance(connections, list) and not connection:
-        for item in connections:
-            connection = _normalize_connection(item)
-            if connection:
-                break
-
-    should = bool(raw.get("should_reach_out"))
-    context_hint = str(raw.get("context_hint") or "").strip()[:2000]
-    abstention_reason = str(raw.get("abstention_reason") or raw.get("reason") or "").strip()[:500]
-    reason = str(raw.get("reason") or ("llm_true" if should else abstention_reason or "llm_false"))[:240]
-
-    allowed_connection_ids = allowed_connection_ids or set()
-    if should:
-        if not context_hint:
-            should = False
-            reason = "llm_missing_context_hint"
-            abstention_reason = "llm_missing_context_hint"
-        elif not connection.get("source_id"):
-            should = False
-            reason = "llm_missing_concrete_connection"
-            abstention_reason = "llm_missing_concrete_connection"
-        elif allowed_connection_ids and connection.get("source_id") not in allowed_connection_ids:
-            should = False
-            reason = "llm_unrecognized_connection"
-            abstention_reason = "llm_unrecognized_connection"
-
-    return {
-        "should_reach_out": should,
-        "confidence": max(0.0, min(1.0, confidence)),
-        "intent_label": str(raw.get("intent_label") or raw.get("intent") or "proactive_screen_context")[:120],
-        "context_hint": context_hint if should else "",
-        "reason": reason,
-        "abstention_reason": "" if should else (abstention_reason or reason),
-        "connection": connection if should else {},
-        "frame_ids": frame_ids,
-    }
-
-
-def _call_openrouter_proactive_gate(
-    *,
-    frame_contexts: list[dict],
-    device_events: list[dict],
-    ocr_summary: str,
-    gate_context: dict,
-) -> dict:
-    """Call the model that decides whether Feedling should proactively speak.
-
-    The model is a Gate only. It writes a hidden job context, not the final
-    user-facing message; the resident consumer still hands that job to the
-    user's real agent entry so persona stays owned by the user's agent.
-    """
-    if PROACTIVE_GATE_PROVIDER != "openrouter":
-        return {"ok": False, "error": f"unsupported_provider:{PROACTIVE_GATE_PROVIDER}"}
-    if not OPENROUTER_API_KEY:
-        return {"ok": False, "error": "model_not_configured"}
-    if not PROACTIVE_GATE_MODEL:
-        return {"ok": False, "error": "model_not_configured"}
-
-    selected_frame_ids = [str(f.get("frame_id") or "") for f in frame_contexts if f.get("frame_id")]
-    allowed_connection_ids = _gate_context_connection_ids(gate_context)
-    metadata_frames = []
-    content: list[dict] = []
-    for idx, frame in enumerate(frame_contexts, start=1):
-        frame_id = str(frame.get("frame_id") or "")
-        image_b64 = str(frame.get("image_b64") or "")
-        metadata_frames.append({
-            "index": idx,
-            "frame_id": frame_id,
-            "ts": frame.get("ts"),
-            "app": frame.get("app") or "unknown",
-            "w": frame.get("w"),
-            "h": frame.get("h"),
-            "ocr_text": str(frame.get("ocr_text") or "")[:1200],
-            "has_image": bool(image_b64),
-            "decrypt_error": frame.get("error", ""),
-        })
-    gate_payload = {
-        "task": "Decide whether the user's own AI companion should proactively send one message now.",
-        "gate_role": (
-            "You are deciding whether the companion would naturally think of the user now. "
-            "This product is for high-recall AI companionship, not a low-interruption work assistant."
-        ),
-        "core_criterion": (
-            "should_reach_out=true requires a concrete connection between visible/current context "
-            "and a specific source_id in connection_candidates."
-        ),
-        "valid_connections": [
-            "A named topic/person/place/object on screen directly matches a memory, identity dimension, or passive observation.",
-            "The user is doing something that matches an established preference, emotional pattern, project, relationship, or repeated concern in memory.",
-            "The local time/context makes a memory-linked ritual or recurring situation relevant now.",
-            "The screen suggests a moment the companion has specifically helped with before, grounded in a named memory or observation.",
-        ],
-        "invalid_connections": [
-            "Generic claims like the user might be overwhelmed, might want help, or perhaps needs a summary.",
-            "A useful work-assistant opportunity with no memory/identity match.",
-            "Idle browsing, repeated content already fired in recent_fires, or vague similarity to the user's interests.",
-            "Any decision based only on OCR keywords without a concrete source_id.",
-        ],
-        "decision_policy": [
-            "Prefer high recall when the connection is concrete and emotionally/contextually natural for a companion.",
-            "Use interruption_preferences from identity_card when present; otherwise keep messages short and easy to ignore.",
-            "Use recent_fires to avoid repeating the same idea within 24 hours.",
-            "Use images as primary evidence. OCR is unreliable auxiliary metadata.",
-            "Do not reveal chain-of-thought. Put only short audit text in reason or abstention_reason.",
-            "Do not write the final user-facing message. Write only hidden context_hint for the user's resident agent.",
-        ],
-        "output_schema": {
-            "should_reach_out": "boolean",
-            "confidence": "number 0..1",
-            "intent_label": "short snake_case label",
-            "context_hint": "hidden context for the user's resident agent, 1-3 sentences",
-            "reason": "short positive audit reason when true",
-            "abstention_reason": "required short reason when false",
-            "connection": {
-                "source_type": "identity_card | memory_set | passive_observation",
-                "source_id": "must match one source_id from connection_candidates",
-                "quote": "short supporting text from that source",
-                "why_concrete": "why the current screen connects to that source",
-            },
-            "frame_ids": "array of frame ids used",
-        },
-        "gate_context": {
-            "identity_card": gate_context.get("identity_card") or {},
-            "memory_set": gate_context.get("memory_set") or [],
-            "passive_observations": gate_context.get("passive_observations") or [],
-            "recent_fires": gate_context.get("recent_fires") or [],
-            "now_local": gate_context.get("now_local") or {},
-            "connection_candidates": gate_context.get("connection_candidates") or [],
-        },
-        "ocr_summary": ocr_summary[:1200],
-        "frames": metadata_frames,
-        "device_events": device_events[-10:],
-    }
-
-    content.append({
-        "type": "text",
-        "text": (
-            "You are Feedling Proactive Gate. Return JSON only, no markdown.\n"
-            + json.dumps(gate_payload, ensure_ascii=False)
-        ),
-    })
-    for frame in frame_contexts:
-        image_b64 = str(frame.get("image_b64") or "")
-        if not image_b64:
-            continue
-        mime = str(frame.get("image_mime") or "image/jpeg")
-        content.append({
-            "type": "image_url",
-            "image_url": {"url": f"data:{mime};base64,{image_b64}"},
-        })
-
-    body = {
-        "model": PROACTIVE_GATE_MODEL,
-        "messages": [
-            {"role": "system", "content": PROACTIVE_GATE_SYSTEM_PROMPT},
-            {"role": "user", "content": content},
-        ],
-        "temperature": 0,
-        "max_tokens": 600,
-    }
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": os.environ.get("FEEDLING_PUBLIC_URL", "https://feedling.app"),
-        "X-Title": "Feedling Proactive Gate",
-    }
-    try:
-        with httpx.Client(timeout=PROACTIVE_GATE_TIMEOUT_SEC) as client:
-            resp = client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body)
-        if resp.status_code >= 400:
-            return {"ok": False, "error": f"llm_http_{resp.status_code}:{resp.text[:240]}"}
-        data = resp.json()
-        content_obj = (((data.get("choices") or [{}])[0].get("message") or {}).get("content"))
-        if isinstance(content_obj, list):
-            text = "\n".join(str(part.get("text") or "") for part in content_obj if isinstance(part, dict))
-        else:
-            text = str(content_obj or "")
-        parsed = json.loads(_strip_json_code_fence(text))
-        return {
-            "ok": True,
-            "raw": _coerce_llm_gate_payload(parsed, selected_frame_ids, allowed_connection_ids),
-            "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
-        }
-    except json.JSONDecodeError as e:
-        return {"ok": False, "error": f"llm_json_parse:{str(e)[:160]}"}
-    except Exception as e:
-        return {"ok": False, "error": f"llm_error:{type(e).__name__}:{str(e)[:160]}"}
 
 
 def _ocr_summary(frames: list[dict]) -> str:
@@ -2185,7 +1626,7 @@ def _ocr_summary(frames: list[dict]) -> str:
     return " | ".join(reversed(parts))[:700]
 
 
-def _recent_device_events_for_gate(store: UserStore, now: float, window_sec: float) -> list[dict]:
+def _recent_device_events_for_wake(store: UserStore, now: float, window_sec: float) -> list[dict]:
     since = max(0.0, now - window_sec)
     return store.list_device_events(since_epoch=since, limit=25)
 
@@ -2242,14 +1683,27 @@ def _proactive_v2_auto_wake_block_reason(trigger: str, *, broadcast_state: str, 
     if normalized_trigger in {"heartbeat_unknown", "heartbeat_no_frame"}:
         return "no_recent_frames"
     if normalized_trigger in {"heartbeat_broadcast_off", "heartbeat_broadcast_paused"}:
-        return normalized_trigger
+        return ""
     if normalized_trigger == "heartbeat_broadcast_on" and not has_frames:
         return "no_recent_frames"
     if normalized_trigger == "broadcast_opened" and not has_frames:
         return "no_recent_frames"
-    if normalized_broadcast in {"off", "paused"} and normalized_trigger.startswith("heartbeat"):
+    if (
+        normalized_broadcast in {"off", "paused"}
+        and normalized_trigger.startswith("heartbeat")
+        and normalized_trigger not in {"heartbeat_broadcast_off", "heartbeat_broadcast_paused"}
+    ):
         return f"broadcast_{normalized_broadcast}"
     return ""
+
+
+def _proactive_v2_wake_kind(trigger: str, *, frame_ids: list[str]) -> str:
+    if frame_ids:
+        return "screen"
+    normalized_trigger = str(trigger or "").strip().lower()
+    if normalized_trigger in {"broadcast_opened", "heartbeat_broadcast_on", "screen_tick"}:
+        return "screen"
+    return "presence"
 
 
 def _latest_payload_state_from_events(store: UserStore, key: str, allowed: set[str]) -> str:
@@ -2265,7 +1719,7 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
     """Create a V2 wake event without doing platform-side semantic judgment.
 
     The platform may decide whether a wake is mechanically allowed, but it does
-    not decrypt frames, require a memory connection, call a Gate model, or infer
+    not decrypt frames, require a memory connection, call a platform model, or infer
     whether the agent should speak. That judgment belongs to the authorized
     companion agent when the resident realizes this job.
     """
@@ -2292,9 +1746,9 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
             now,
             _payload_float(payload, "frame_window_sec", 300.0, 30.0, 3600.0),
         )
-    selected_frames = _sample_frames_for_gate(frames, max_frames=PROACTIVE_GATE_MAX_FRAMES)
+    selected_frames = _sample_frames_for_wake(frames, max_frames=PROACTIVE_WAKE_MAX_FRAMES)
     frame_ids = _frame_ids(selected_frames)
-    device_events = _recent_device_events_for_gate(
+    device_events = _recent_device_events_for_wake(
         store,
         now,
         _payload_float(payload, "device_event_window_sec", 900.0, 30.0, 86400.0),
@@ -2334,9 +1788,10 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
 
     current_app = str(payload.get("current_app") or "").strip()
     if not current_app:
-        current_app = _gate_current_app([], selected_frames)
+        current_app = _current_app_from_frames([], selected_frames)
     ocr = str(payload.get("ocr_summary") or "").strip() or _ocr_summary(selected_frames)
     should_wake_agent = not bool(block_reason)
+    wake_kind = _proactive_v2_wake_kind(trigger, frame_ids=frame_ids)
     decision_id = _new_public_id("gd")
     wake_id = _new_public_id("wake")
     reason = "wake_created" if should_wake_agent else block_reason
@@ -2364,6 +1819,8 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
         "device_event_ids": [str(e.get("event_id")) for e in device_events if e.get("event_id")][:10],
         "current_app": current_app,
         "trigger": trigger,
+        "wake_kind": wake_kind,
+        "screen_context_available": bool(frame_ids),
         "manual": manual,
         "forced": force,
         "user_state": user_state,
@@ -2398,200 +1855,6 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
     }
 
 
-def _build_proactive_gate_decision(store: UserStore, payload: dict, api_key: str | None = None) -> dict:
-    now = time.time()
-    payload = payload if isinstance(payload, dict) else {}
-    force = bool(payload.get("force", False))
-    settings = store.load_proactive_settings()
-    is_manual_hint = bool(str(payload.get("context_hint") or "").strip())
-
-    payload_frames = payload.get("frames")
-    if isinstance(payload_frames, list) and payload_frames:
-        frames = [
-            f for f in payload_frames
-            if isinstance(f, dict) and str(f.get("id") or f.get("frame_id") or "").strip()
-        ]
-        for f in frames:
-            if not f.get("id") and f.get("frame_id"):
-                f["id"] = f.get("frame_id")
-    else:
-        frames = _recent_frame_meta(
-            store,
-            now,
-            _payload_float(payload, "frame_window_sec", 300.0, 30.0, 3600.0),
-        )
-    candidate_frames = _sample_frames_for_gate(
-        frames,
-        max_frames=PROACTIVE_GATE_FRAME_CANDIDATE_MAX,
-    )
-    frame_ids = _frame_ids(candidate_frames)
-    device_events = _recent_device_events_for_gate(
-        store,
-        now,
-        _payload_float(payload, "device_event_window_sec", 900.0, 30.0, 86400.0),
-    )
-
-    block_reason = ""
-    if not settings.get("enabled", True) and not force:
-        block_reason = "proactive_disabled"
-    elif settings.get("dnd", False) and not force:
-        block_reason = "dnd_enabled"
-    elif not frames and not force:
-        block_reason = "no_recent_frames"
-    elif _recent_proactive_fire_active(store, now) and not force:
-        block_reason = "recent_proactive_fire"
-
-    context_hint = str(payload.get("context_hint") or "").strip()
-    connections = payload.get("connections")
-    if not isinstance(connections, list):
-        connections = []
-    connections = [str(c).strip()[:240] for c in connections if str(c).strip()][:5]
-
-    gate_context = (
-        _build_gate_memory_context(store, api_key, payload, settings, now)
-        if not is_manual_hint and not block_reason else {}
-    )
-    allowed_connection_ids = _gate_context_connection_ids(gate_context)
-
-    candidate_frame_contexts = [
-        _decrypt_frame_metadata_for_gate(
-            store,
-            fid,
-            api_key,
-            include_image=bool(PROACTIVE_GATE_INCLUDE_IMAGES and not is_manual_hint and not block_reason),
-        )
-        for fid in frame_ids
-    ] if frame_ids and not is_manual_hint else []
-    frame_contexts = _sample_frame_contexts_for_gate(
-        candidate_frame_contexts,
-        max_frames=PROACTIVE_GATE_MAX_FRAMES,
-    ) if candidate_frame_contexts else []
-    selected_frames = frame_contexts or _sample_frames_for_gate(candidate_frames, max_frames=PROACTIVE_GATE_MAX_FRAMES)
-    frame_ids = _frame_ids(selected_frames)
-    current_app = str(payload.get("current_app") or "").strip()
-    if not current_app:
-        current_app = _gate_current_app(frame_contexts, candidate_frames)
-    ocr = str(payload.get("ocr_summary") or "").strip()
-    if not ocr:
-        ocr = _gate_ocr_summary(frame_contexts, candidate_frames)
-
-    decrypt_errors = [f.get("error") for f in frame_contexts if f.get("error")]
-    decrypt_ok = any(
-        str(f.get("image_b64") or "").strip()
-        or str(f.get("ocr_text") or "").strip()
-        or str(f.get("app") or "").strip() not in {"", "unknown"}
-        for f in frame_contexts
-    )
-    image_count = sum(1 for f in frame_contexts if str(f.get("image_b64") or "").strip())
-
-    semantic_reference = _semantic_analysis(current_app=current_app, ocr_summary=ocr)
-    llm_payload: dict = {}
-    llm_usage: dict = {}
-    llm_error = ""
-    llm_called = False
-
-    if is_manual_hint:
-        should_reach_out = True
-        reason = "manual_hint"
-        intent_label = str(payload.get("intent_label") or "manual_proactive_test").strip()
-    elif block_reason:
-        should_reach_out = False
-        reason = block_reason
-        intent_label = "blocked_before_model"
-    elif frame_ids and not decrypt_ok and not force:
-        should_reach_out = False
-        reason = "frame_decrypt_unavailable"
-        intent_label = "frame_decrypt_unavailable"
-    elif not allowed_connection_ids and not force:
-        should_reach_out = False
-        reason = "memory_context_unavailable"
-        intent_label = "memory_context_unavailable"
-    else:
-        llm_called = True
-        llm_result = _call_openrouter_proactive_gate(
-            frame_contexts=frame_contexts,
-            device_events=device_events,
-            ocr_summary=ocr,
-            gate_context=gate_context,
-        )
-        if llm_result.get("ok"):
-            llm_payload = llm_result.get("raw") or {}
-            llm_usage = llm_result.get("usage") if isinstance(llm_result.get("usage"), dict) else {}
-            should_reach_out = bool(llm_payload.get("should_reach_out"))
-            reason = str(
-                llm_payload.get("reason")
-                or llm_payload.get("abstention_reason")
-                or ("llm_true" if should_reach_out else "llm_false")
-            )[:240]
-            intent_label = str(llm_payload.get("intent_label") or "llm_proactive_gate").strip()
-            if should_reach_out:
-                context_hint = str(llm_payload.get("context_hint") or "").strip()
-                connection = llm_payload.get("connection") if isinstance(llm_payload.get("connection"), dict) else {}
-                connections = [
-                    str(connection.get("quote") or "").strip()[:240],
-                    str(connection.get("why_concrete") or "").strip()[:240],
-                ]
-                connections = [c for c in connections if c][:5]
-                frame_ids = llm_payload.get("frame_ids") if isinstance(llm_payload.get("frame_ids"), list) else frame_ids
-                frame_ids = [str(fid) for fid in frame_ids if str(fid) in set(_frame_ids(selected_frames))][:PROACTIVE_GATE_MAX_FRAMES]
-                if not context_hint:
-                    should_reach_out = False
-                    reason = "llm_missing_context_hint"
-            else:
-                context_hint = ""
-        else:
-            should_reach_out = False
-            llm_error = str(llm_result.get("error") or "llm_error")[:240]
-            reason = llm_error
-            intent_label = "llm_gate_error"
-
-    decision_id = _new_public_id("gd")
-    return {
-        "decision_id": decision_id,
-        "ts": now,
-        "created_at": datetime.fromtimestamp(now).isoformat(),
-        "gate_model": "manual_v0a" if is_manual_hint else f"{PROACTIVE_GATE_PROVIDER}:{PROACTIVE_GATE_MODEL}",
-        "should_reach_out": should_reach_out,
-        "should_garden_passive": False,
-        "abstention_reason": "" if should_reach_out else reason,
-        "reason": reason,
-        "intent_label": intent_label[:120],
-        "context_hint": context_hint[:2000],
-        "connections": connections,
-        "connection": (
-            llm_payload.get("connection")
-            if should_reach_out and isinstance(llm_payload.get("connection"), dict)
-            else {}
-        ),
-        "frame_ids": frame_ids,
-        "device_event_ids": [str(e.get("event_id")) for e in device_events if e.get("event_id")][:10],
-        "current_app": current_app,
-        "semantic": {
-            "reference": semantic_reference,
-            "llm_confidence": llm_payload.get("confidence"),
-            "llm_usage": llm_usage,
-        },
-        "gate_input": {
-            "ocr_chars": len(ocr),
-            "sampled_frame_count": len(selected_frames),
-            "decrypt_ok": decrypt_ok,
-            "image_count": image_count,
-            "decrypt_errors": [str(e)[:120] for e in decrypt_errors[:5]],
-            "llm_called": llm_called,
-            "llm_error": llm_error,
-            "memory_context": {
-                "identity_loaded": bool((gate_context.get("identity_card") or {}).get("agent_name")),
-                "memory_count": len(gate_context.get("memory_set") or []),
-                "passive_observation_count": len(gate_context.get("passive_observations") or []),
-                "recent_fire_count": len(gate_context.get("recent_fires") or []),
-                "connection_candidate_count": len(gate_context.get("connection_candidates") or []),
-                "context_errors": gate_context.get("context_errors") or {},
-            },
-        },
-        "forced": force,
-    }
-
-
 def _proactive_job_from_decision(decision: dict) -> dict:
     now = time.time()
     return {
@@ -2617,6 +1880,8 @@ def _proactive_job_from_decision(decision: dict) -> dict:
         "user_state": decision.get("user_state", ""),
         "ai_state": decision.get("ai_state", ""),
         "broadcast_state": decision.get("broadcast_state", ""),
+        "wake_kind": decision.get("wake_kind", ""),
+        "screen_context_available": bool(decision.get("screen_context_available", False)),
         "agent_action": "",
         "agent_action_status": "",
     }
@@ -2773,7 +2038,7 @@ def _debug_translation_candidate(text: str) -> bool:
 def _translate_debug_texts_to_zh(texts: list[str]) -> dict[str, str]:
     """Best-effort display-only translation for the debug dashboard.
 
-    This never mutates Gate/job records. Raw English remains in JSON logs and
+    This never mutates wake/job records. Raw English remains in JSON logs and
     folded payloads; translated strings are only used for HTML rendering when
     `lang=zh`.
     """
@@ -2803,7 +2068,7 @@ def _translate_debug_texts_to_zh(texts: list[str]) -> dict[str, str]:
                         "content": (
                             "Translate debug-dashboard prose from English to natural, concise Simplified Chinese "
                             "for a product debugging UI. "
-                            "Preserve IDs, model names, JSON keys, product names, and technical terms like Gate, "
+                            "Preserve IDs, model names, JSON keys, product names, and technical terms like Wake, "
                             "context_hint, Live Activity, APNs, OCR. Do not preserve generic words like companion, "
                             "user, screen, response, or reason; translate them naturally. Return JSON only."
                         ),
@@ -2901,6 +2166,8 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         "model": "模型",
         "id": "判定 ID",
         "trigger": "触发来源",
+        "wake_kind": "Wake 类型",
+        "screen_context_available": "屏幕上下文",
         "user_state": "用户状态",
         "ai_state": "AI 状态",
         "broadcast_state": "屏幕共享",
@@ -2913,10 +2180,10 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         "frames": "屏幕帧",
         "frames sent": "已发送帧",
         "connection": "关联依据",
-        "gate_input": "Gate 输入",
+        "gate_input": "Wake 输入",
         "payload": "事件数据",
         "consumer": "消费服务",
-        "decision": "Wake/Gate",
+        "decision": "Wake",
         "job": "任务",
         "preview": "消息预览",
     }
@@ -2963,6 +2230,10 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         "model_false": "模型判断不触发",
         "llm_false": "模型判断不触发",
         "llm_true": "模型判断触发",
+        "screen": "屏幕",
+        "presence": "Presence",
+        "available": "可用",
+        "none": "无",
         "llm_non_object": "模型返回不是 JSON 对象",
         "llm_missing_context_hint": "模型缺少上下文提示",
         "llm_missing_concrete_connection": "模型缺少具体关联",
@@ -3097,7 +2368,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     def fold_json(label: str, payload) -> str:
         """Collapse JSON payloads behind a <details> summary.
 
-        Production debug pages can accumulate large Gate inputs quickly. Keep
+        Production debug pages can accumulate large wake inputs quickly. Keep
         the dashboard response bounded so browsers do not receive a truncated
         HTML document from the edge path.
         """
@@ -3130,7 +2401,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         updates[param] = min(total, current + step)
         return f"<a class='control-link' href='{esc(dashboard_url(**updates))}'>{esc(ui(label_en, label_zh))}</a>"
 
-    # Gate Decisions are the heaviest rendering on this page (13 columns of
+    # Wake decisions are the heaviest rendering on this page (13 columns of
     # mixed text + JSON + form). Converted from a wide table to a stack of
     # cards: each decision is one block, fields laid out in a 2-column grid
     # that wraps to single-column on narrow viewports. JSON payloads
@@ -3160,6 +2431,11 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('intent'))}</span> {value_html(intent)}</span>")
         if d.get("trigger"):
             meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('trigger'))}</span> {value_html(d.get('trigger'))}</span>")
+        if d.get("wake_kind"):
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('wake_kind'))}</span> {value_html(d.get('wake_kind'))}</span>")
+        if "screen_context_available" in d:
+            screen_context = "available" if d.get("screen_context_available") else "none"
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('screen_context_available'))}</span> {value_html(screen_context)}</span>")
         if d.get("user_state"):
             meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('user_state'))}</span> {value_html(d.get('user_state'))}</span>")
         if d.get("ai_state"):
@@ -3221,7 +2497,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         if show_no_frame:
             hidden_body = decision_section(
                 no_frame_decisions,
-                ui("No hidden no-frame Gate ticks.", "没有隐藏的无屏幕帧 Gate 空 tick。"),
+                ui("No hidden legacy no-frame ticks.", "没有隐藏的旧版无屏幕帧空 tick。"),
                 limit=no_frame_cap,
             )
             more_no_frame = section_limit_link(
@@ -3240,19 +2516,19 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             )
         else:
             hidden_body = (
-                f"<div class='empty'>{esc(ui('No-frame Gate ticks are folded to keep this page lightweight.', '无屏幕帧 Gate 空 tick 已折叠，以保持页面轻量。'))} "
+                f"<div class='empty'>{esc(ui('Legacy no-frame ticks are folded to keep this page lightweight.', '旧版无屏幕帧空 tick 已折叠，以保持页面轻量。'))} "
                 f"<a href='{esc(dashboard_url(show_no_frame=1))}'>{esc(ui('show sample', '显示样本'))}</a></div>"
             )
             hidden_hint = ""
         hidden_gate_details = (
             "<details class='debug-details'>"
-            f"<summary>{esc(ui(f'Show hidden no-frame Gate ticks ({len(no_frame_decisions)})', f'显示隐藏的无屏幕帧 Gate 空 tick（{len(no_frame_decisions)}）'))}</summary>"
+            f"<summary>{esc(ui(f'Show hidden legacy no-frame ticks ({len(no_frame_decisions)})', f'显示隐藏的旧版无屏幕帧空 tick（{len(no_frame_decisions)}）'))}</summary>"
             + hidden_hint
             + hidden_body
             + "</details>"
         )
 
-    # Hidden Jobs — same card pattern as Gate Decisions. Fewer JSON blobs
+    # Hidden Jobs — same card pattern as wake decisions. Fewer JSON blobs
     # so cards render lighter, but the wide horizontal table is the
     # bigger problem; cards solve it the same way.
     def job_card(j) -> str:
@@ -3270,6 +2546,11 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('intent'))}</span> {value_html(intent)}</span>")
         if j.get("trigger"):
             meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('trigger'))}</span> {value_html(j.get('trigger'))}</span>")
+        if j.get("wake_kind"):
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('wake_kind'))}</span> {value_html(j.get('wake_kind'))}</span>")
+        if "screen_context_available" in j:
+            screen_context = "available" if j.get("screen_context_available") else "none"
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('screen_context_available'))}</span> {value_html(screen_context)}</span>")
         if j.get("user_state"):
             meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('user_state'))}</span> {value_html(j.get('user_state'))}</span>")
         if j.get("ai_state"):
@@ -3387,12 +2668,12 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         return "".join(rows)
 
     counts = snapshot.get("counts") or {}
-    visible_gate_count = len(frame_decisions)
+    visible_wake_count = len(frame_decisions)
     hidden_no_frame_count = len(no_frame_decisions)
     page_title = "IO Proactive Harness"
     visible_empty_text = ui(
-        f"No visible wake/gate decisions yet. Hidden no-frame legacy ticks: {hidden_no_frame_count}.",
-        f"还没有可见的 Wake/Gate 判定。隐藏旧版空 tick：{hidden_no_frame_count}。",
+        f"No visible wake decisions yet. Hidden legacy no-frame ticks: {hidden_no_frame_count}.",
+        f"还没有可见的 Wake 判定。隐藏旧版空 tick：{hidden_no_frame_count}。",
     )
     detail_toggle = (
         f"<a class='control-link' href='{esc(dashboard_url(detail=0))}'>{esc(ui('hide JSON detail', '隐藏 JSON 详情'))}</a>"
@@ -3407,8 +2688,8 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
                 decision_cap,
                 len(frame_decisions),
                 80,
-                "show more wake/gate decisions",
-                "显示更多 Wake/Gate",
+                "show more wake decisions",
+                "显示更多 Wake",
             ),
             section_limit_link(
                 "job_limit",
@@ -3509,7 +2790,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
       font-style: italic;
     }}
 
-    /* ---- Card layout (Gate Decisions + Hidden Jobs) ---- */
+    /* ---- Card layout (Wake Decisions + Hidden Jobs) ---- */
     .card-list {{ display: flex; flex-direction: column; gap: 12px; }}
     .card {{
       background: #fffaf1;
@@ -3699,7 +2980,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
   </div>
   <div>
     <span class="pill">{esc(ui('all decisions', '全部判定'))} {esc(counts.get('decisions', 0))}</span>
-    <span class="pill">{esc(ui('visible decisions', '主表判定'))} {esc(visible_gate_count)}</span>
+    <span class="pill">{esc(ui('visible decisions', '主表判定'))} {esc(visible_wake_count)}</span>
     <span class="pill">{esc(ui('hidden no-frame ticks', '隐藏空 tick'))} {esc(hidden_no_frame_count)}</span>
     <span class="pill">{esc(ui('human reviews', '人工标注'))} {esc(counts.get('reviews', 0))}</span>
     <span class="pill">{esc(ui('hidden jobs', '隐藏任务'))} {esc(counts.get('jobs', 0))}</span>
@@ -3712,8 +2993,8 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     {control_links}
   </div>
 
-  <h2>{esc(ui('Wake / Gate Decisions', 'Wake / Gate 判定'))}</h2>
-  <div class="hint">{esc(ui('V2 wake events are always shown. Legacy no-frame Gate ticks stay folded below.', 'V2 wake 事件会直接显示；旧版无屏幕帧 Gate 空 tick 会折叠在下方。'))}</div>
+  <h2>{esc(ui('Wake Decisions', 'Wake 判定'))}</h2>
+  <div class="hint">{esc(ui('V2 wake events are always shown. Legacy no-frame ticks stay folded below.', 'V2 wake 事件会直接显示；旧版无屏幕帧空 tick 会折叠在下方。'))}</div>
   {decision_section(frame_decisions, visible_empty_text, limit=decision_cap)}
   {hidden_gate_details}
 
@@ -12268,16 +11549,12 @@ def proactive_tick():
     """Create a proactive wake job.
 
     V2 is agent-owned: the server may mechanically suppress disabled/away
-    automatic wakes, but it no longer decrypts frames, calls a Gate LLM, or
-    requires a memory connection. ``legacy_gate=true`` keeps the old path
-    available for debug replay.
+    automatic wakes, but it no longer decrypts frames, calls a platform LLM, or
+    requires a memory connection.
     """
     store = require_user()
     payload = request.get_json(silent=True) or {}
-    if PROACTIVE_V2_ENABLED and not _proactive_bool(payload, "legacy_gate"):
-        decision = _build_proactive_v2_wake_decision(store, payload, api_key=_extract_api_key())
-    else:
-        decision = _build_proactive_gate_decision(store, payload, api_key=_extract_api_key())
+    decision = _build_proactive_v2_wake_decision(store, payload, api_key=_extract_api_key())
     store.append_gate_decision(decision)
 
     job = None

@@ -46,19 +46,19 @@ Optional:
   CHECKPOINT_FILE       Path to persist last-processed timestamp (default: /tmp/feedling_chat_checkpoint.json)
   PROACTIVE_POLL_ENABLED
                         Default true. Poll hidden proactive jobs created by
-                        Feedling Gate and realize them through the same agent
+                        the proactive wake scheduler and realize them through the same agent
                         entry used for chat replies.
   PROACTIVE_POLL_TIMEOUT
                         Short long-poll timeout for proactive jobs (default: 1)
   PROACTIVE_TICK_ENABLED
-                        Default true. Periodically ask Feedling Gate to inspect
-                        recent screen context and enqueue hidden jobs when true.
+                        Default true. Periodically post agent-owned proactive
+                        wake ticks.
   PROACTIVE_TICK_INTERVAL_SEC
                         Broadcast-on/unknown tick interval in seconds (default: 300)
   PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC
                         Broadcast-off tick interval in seconds (default: 1800)
   PROACTIVE_TICK_START_DELAY_SEC
-                        Delay before the first automatic Gate tick (default: 15)
+                        Delay before the first automatic wake tick (default: 15)
   SEND_FALLBACK_ON_AGENT_ERROR
                         Default false. When false, agent failures are logged
                         and no fake template is posted to the user.
@@ -140,6 +140,17 @@ class AgentTurn:
     runtime_debug: dict = field(default_factory=dict)
 
 
+@dataclass
+class ProactiveChatContext:
+    text: str = ""
+    freshness: str = "empty"
+    included_count: int = 0
+    last_message_age_sec: float | None = None
+    last_user_message_age_sec: float | None = None
+    last_visible_proactive_age_sec: float | None = None
+    visible_proactive_count_24h: int = 0
+
+
 def _mask(val: str) -> str:
     if not val or len(val) < 8:
         return "***"
@@ -200,6 +211,9 @@ PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC = int(
 PROACTIVE_TICK_START_DELAY_SEC = int(os.environ.get("PROACTIVE_TICK_START_DELAY_SEC", "15"))
 PROACTIVE_MAX_REPLY_MESSAGES = int(os.environ.get("PROACTIVE_MAX_REPLY_MESSAGES", "5"))
 PROACTIVE_RECENT_CHAT_LIMIT = int(os.environ.get("PROACTIVE_RECENT_CHAT_LIMIT", "20"))
+PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT = int(os.environ.get("PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT", "50"))
+PROACTIVE_CHAT_FRESH_WINDOW_SEC = int(os.environ.get("PROACTIVE_CHAT_FRESH_WINDOW_SEC", "21600"))
+PROACTIVE_STALE_CHAT_FALLBACK_LIMIT = int(os.environ.get("PROACTIVE_STALE_CHAT_FALLBACK_LIMIT", "2"))
 CONSUMER_ID = os.environ.get(
     "CONSUMER_ID",
     f"{socket.gethostname()}:{os.getpid()}",
@@ -921,7 +935,7 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
 
 
 def _screen_context_for_frame_ids(frame_ids: list[str]) -> tuple[str, list[dict[str, str]], list[str]]:
-    """Attach the concrete frames named by a proactive Gate job."""
+    """Attach the concrete frames named by a proactive wake job."""
     frame_ids = [str(fid).strip() for fid in (frame_ids or []) if str(fid).strip()]
     if not frame_ids:
         return "", [], []
@@ -2575,7 +2589,120 @@ def _message_text_for_context(msg: dict) -> str:
     return text[:500]
 
 
-def recent_chat_context_for_proactive(limit: int | None = None) -> str:
+def _message_ts_for_context(msg: dict) -> float:
+    try:
+        return float(msg.get("ts", msg.get("timestamp", 0)) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _message_role_for_context(msg: dict) -> str:
+    role = "user" if msg.get("role") == "user" else "agent"
+    if msg.get("source") == PROACTIVE_JOB_SOURCE:
+        role = "agent(proactive)"
+    return role
+
+
+def _format_age(age_sec: float | None) -> str:
+    if age_sec is None:
+        return "unknown"
+    try:
+        age = max(0, int(age_sec))
+    except (TypeError, ValueError):
+        return "unknown"
+    if age < 60:
+        return f"{age}s ago"
+    minutes = age // 60
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    rem_minutes = minutes % 60
+    if hours < 24:
+        return f"{hours}h {rem_minutes}m ago" if rem_minutes else f"{hours}h ago"
+    days = hours // 24
+    rem_hours = hours % 24
+    return f"{days}d {rem_hours}h ago" if rem_hours else f"{days}d ago"
+
+
+def _format_message_time(ts: float) -> str:
+    if ts <= 0:
+        return "unknown time"
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def _chat_context_line(msg: dict, *, now: float, stale: bool) -> str:
+    ts = _message_ts_for_context(msg)
+    age = now - ts if ts > 0 else None
+    flags = ["stale"] if stale else ["fresh"]
+    text = _message_text_for_context(msg)
+    return (
+        f"- [{_format_message_time(ts)}, {_format_age(age)}, {', '.join(flags)}] "
+        f"{_message_role_for_context(msg)}: {text}"
+    )
+
+
+def _clean_messages_for_proactive_context(history: list[dict] | None) -> list[dict]:
+    cleaned: list[dict] = []
+    for msg in history or []:
+        if not isinstance(msg, dict):
+            continue
+        text = _message_text_for_context(msg)
+        if not text or "__VERIFY_PING__" in text:
+            continue
+        item = dict(msg)
+        item["_context_text"] = text
+        cleaned.append(item)
+    return cleaned
+
+
+def _proactive_chat_context_from_history(history: list[dict] | None, *, limit: int, now: float) -> ProactiveChatContext:
+    messages = _clean_messages_for_proactive_context(history)
+    if not messages:
+        return ProactiveChatContext()
+
+    def age_for(msg: dict) -> float | None:
+        ts = _message_ts_for_context(msg)
+        return now - ts if ts > 0 else None
+
+    last_message = messages[-1]
+    last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+    last_proactive = next((m for m in reversed(messages) if m.get("source") == PROACTIVE_JOB_SOURCE), None)
+    proactive_count_24h = sum(
+        1
+        for m in messages
+        if m.get("source") == PROACTIVE_JOB_SOURCE
+        and (age_for(m) is not None)
+        and (age_for(m) or 0) <= 86400
+    )
+
+    fresh_window = max(60, PROACTIVE_CHAT_FRESH_WINDOW_SEC)
+    fresh_messages = [
+        m for m in messages
+        if (age_for(m) is not None) and (age_for(m) or 0) <= fresh_window
+    ]
+    if fresh_messages:
+        selected = fresh_messages[-limit:]
+        freshness = "fresh"
+        stale = False
+    else:
+        fallback_limit = max(1, min(PROACTIVE_STALE_CHAT_FALLBACK_LIMIT, limit))
+        selected = messages[-fallback_limit:]
+        freshness = "stale"
+        stale = True
+
+    rows = [_chat_context_line(m, now=now, stale=stale) for m in selected]
+    return ProactiveChatContext(
+        text="\n".join(rows),
+        freshness=freshness,
+        included_count=len(rows),
+        last_message_age_sec=age_for(last_message),
+        last_user_message_age_sec=age_for(last_user) if last_user else None,
+        last_visible_proactive_age_sec=age_for(last_proactive) if last_proactive else None,
+        visible_proactive_count_24h=proactive_count_24h,
+    )
+
+
+def recent_chat_context_for_proactive(limit: int | None = None) -> ProactiveChatContext:
     """Return a short plaintext chat transcript for proactive continuity.
 
     This uses the same decrypt sources as normal chat processing. If no decrypt
@@ -2583,26 +2710,13 @@ def recent_chat_context_for_proactive(limit: int | None = None) -> str:
     recent-chat continuity context.
     """
     limit = max(1, min(limit if limit is not None else PROACTIVE_RECENT_CHAT_LIMIT, 50))
+    fetch_limit = max(limit, min(max(1, PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT), 200))
     try:
-        history = get_decrypted_history(since=0, limit=limit)
+        history = get_decrypted_history(since=0, limit=fetch_limit)
     except Exception as e:
         log.warning("recent chat context fetch failed: %s", e)
-        return ""
-    if not history:
-        return ""
-
-    rows: list[str] = []
-    for msg in history[-limit:]:
-        if not isinstance(msg, dict):
-            continue
-        text = _message_text_for_context(msg)
-        if not text or "__VERIFY_PING__" in text:
-            continue
-        role = "user" if msg.get("role") == "user" else "agent"
-        if msg.get("source") == PROACTIVE_JOB_SOURCE:
-            role = "agent(proactive)"
-        rows.append(f"- {role}: {text}")
-    return "\n".join(rows)
+        return ProactiveChatContext(freshness="unavailable")
+    return _proactive_chat_context_from_history(history, limit=limit, now=time.time())
 
 
 # ---------------------------------------------------------------------------
@@ -2682,50 +2796,52 @@ def _split_proactive_actions(actions: list[dict]) -> tuple[list[dict], list[dict
     return proactive, memory_identity
 
 
+def _coerce_proactive_chat_context(value: Any) -> ProactiveChatContext:
+    if isinstance(value, ProactiveChatContext):
+        return value
+    text = str(value or "").strip()
+    return ProactiveChatContext(
+        text=text,
+        freshness="unknown" if text else "empty",
+        included_count=len([ln for ln in text.splitlines() if ln.strip()]),
+    )
+
+
+def _proactive_wake_kind(job: dict, *, screen_text: str) -> str:
+    explicit = str(job.get("wake_kind") or "").strip().lower()
+    if explicit in {"screen", "presence"}:
+        return explicit
+    return "screen" if screen_text else "presence"
+
+
+def _proactive_attention_facts(chat: ProactiveChatContext) -> str:
+    return "\n".join([
+        "attention_facts:",
+        f"- recent_chat_context_freshness: {chat.freshness}",
+        f"- recent_chat_context_included_messages: {chat.included_count}",
+        f"- last_message_age: {_format_age(chat.last_message_age_sec)}",
+        f"- last_user_message_age: {_format_age(chat.last_user_message_age_sec)}",
+        f"- last_visible_proactive_age: {_format_age(chat.last_visible_proactive_age_sec)}",
+        f"- visible_proactive_count_24h: {chat.visible_proactive_count_24h}",
+    ])
+
+
 def _message_for_proactive_job(
     job: dict,
     screen_text: str = "",
-    recent_chat_context: str = "",
+    recent_chat_context: Any = "",
 ) -> str:
-    try:
-        schema_version = int(job.get("schema_version") or 1)
-    except (TypeError, ValueError):
-        schema_version = 1
-    if schema_version < 2:
-        context_hint = str(job.get("context_hint") or "").strip()
-        intent_label = str(job.get("intent_label") or "proactive_context").strip()
-        connections = job.get("connections")
-        if not isinstance(connections, list):
-            connections = []
-        connection_text = "\n".join(f"- {str(item).strip()}" for item in connections if str(item).strip())
-
-        parts = [
-            "[Feedling proactive hidden job]",
-            "A legacy Feedling Gate decided this may be a good moment to reach out.",
-            "Write only the message the user should see, in your normal voice.",
-            "You may send 1-5 short chat bubbles if that feels more natural than one message.",
-            'For multiple bubbles, return JSON exactly like {"messages":["...","..."]}. Otherwise return plain text.',
-            f"intent: {intent_label}",
-        ]
-        if context_hint:
-            parts.append(f"context_hint:\n{context_hint}")
-        if connection_text:
-            parts.append(f"possible_connections:\n{connection_text}")
-        if recent_chat_context:
-            parts.append(
-                "recent_chat_context:\n"
-                f"{recent_chat_context}\n"
-                "Use this only for local continuity. Do not overfit or imitate these lines. "
-                "Your own runtime identity, memory, and normal voice remain the source of the reply."
-            )
-        if screen_text:
-            parts.append(screen_text)
-        return "\n\n".join(parts)
-
+    chat_context = _coerce_proactive_chat_context(recent_chat_context)
+    wake_kind = _proactive_wake_kind(job, screen_text=screen_text)
+    screen_available = bool(screen_text)
     parts = [
         "[Feedling proactive wake]",
-        "This is not a request to speak. It is one opportunity to notice the user from your own companion identity.",
+        "This wake is not a user request and not an instruction to respond.",
+        "It is an awareness / presence check.",
         "The platform did not judge this moment and did not require a memory match. You decide what to do.",
+        "Before visible speech, ask whether you genuinely want to appear now from your own companion identity.",
+        "Speak only when there is a strong enough self-directed reason, feeling, memory, or presence impulse to appear.",
+        "If the impulse is weak, unclear, generic, or merely caused by this wake, return proactive.sleep.",
         "Do not mention this hidden wake, job metadata, or system wording to the user.",
         "If you speak, use your normal voice. You may send 1-5 short chat bubbles.",
         "If you should stay quiet, return JSON: {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}],\"messages\":[]}",
@@ -2738,18 +2854,28 @@ def _message_for_proactive_job(
             f"- trigger: {str(job.get('trigger') or 'wake')}\n"
             f"- manual: {bool(job.get('manual', False))}\n"
             f"- forced: {bool(job.get('forced', False))}\n"
+            f"- wake_kind: {wake_kind}\n"
             f"- user_state: {str(job.get('user_state') or 'default')}\n"
             f"- ai_state: {str(job.get('ai_state') or 'present')}\n"
             f"- broadcast_state: {str(job.get('broadcast_state') or 'unknown')}\n"
-            f"- current_app: {str(job.get('current_app') or 'unknown')}"
+            f"- current_app: {str(job.get('current_app') or 'unknown')}\n"
+            f"- screen_context_available: {str(screen_available).lower()}"
         ),
+        _proactive_attention_facts(chat_context),
     ]
-    if recent_chat_context:
+    if chat_context.text:
         parts.append(
             "recent_chat_context:\n"
-            f"{recent_chat_context}\n"
-            "Use this only for local continuity. Do not overfit or imitate these lines. "
+            f"{chat_context.text}\n"
+            "Use fresh chat context for local continuity when it genuinely matters. "
+            "If recent_chat_context_freshness is stale, treat it only as relationship background; "
+            "do not continue it as if it just happened. "
             "Your own runtime identity, memory, and normal voice remain the source of the reply."
+        )
+    elif not screen_available:
+        parts.append(
+            "screen_context:\n"
+            "No current screen context is available. Do not imply you can see the user's screen."
         )
     if screen_text:
         parts.append(screen_text)
@@ -3196,7 +3322,7 @@ def run() -> None:
                         ).strip().lower()
                         next_interval = _proactive_tick_interval_for_broadcast_state(last_broadcast_state)
                         log.info(
-                            "proactive gate tick gate=%s reason=%s enqueued=%s frames=%d broadcast=%s next=%ds",
+                            "proactive wake tick wake=%s reason=%s enqueued=%s frames=%d broadcast=%s next=%ds",
                             bool(decision.get("should_reach_out")),
                             decision.get("reason"),
                             bool(tick.get("enqueued")),

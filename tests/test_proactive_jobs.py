@@ -34,11 +34,11 @@ def test_device_event_payload_is_redacted():
     assert "title" not in event["payload"]
 
 
-def test_manual_proactive_gate_creates_hidden_job(tmp_path, monkeypatch):
+def test_manual_proactive_wake_creates_hidden_job(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive")
 
-    decision = appmod._build_proactive_gate_decision(
+    decision = appmod._build_proactive_v2_wake_decision(
         store,
         {
             "force": True,
@@ -51,11 +51,13 @@ def test_manual_proactive_gate_creates_hidden_job(tmp_path, monkeypatch):
     job = store.append_proactive_job(appmod._proactive_job_from_decision(decision))
 
     assert decision["should_reach_out"] is True
+    assert decision["schema_version"] == 2
     assert decision["decision_id"].startswith("gd_")
     assert job["job_id"].startswith("pj_")
     assert job["source"] == appmod.PROACTIVE_JOB_SOURCE
     assert job["gate_decision_id"] == decision["decision_id"]
-    assert job["context_hint"].startswith("The user has been comparing")
+    assert job["context_hint"] == ""
+    assert job["wake_kind"] == "presence"
 
     jobs = store.list_proactive_jobs(since_epoch=0)
     assert len(jobs) == 1
@@ -66,7 +68,7 @@ def test_proactive_debug_derives_job_delivery_state(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive_delivery")
 
-    decision = appmod._build_proactive_gate_decision(
+    decision = appmod._build_proactive_v2_wake_decision(
         store,
         {
             "force": True,
@@ -108,7 +110,7 @@ def test_proactive_debug_derives_job_delivery_state(tmp_path, monkeypatch):
     assert snapshot["jobs"][0]["live_activity_status"] == "delivered"
 
 
-def test_proactive_debug_folds_no_frame_gate_ticks(tmp_path, monkeypatch):
+def test_proactive_debug_folds_legacy_no_frame_ticks(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive_folded_gate")
 
@@ -158,7 +160,7 @@ def test_proactive_debug_folds_no_frame_gate_ticks(tmp_path, monkeypatch):
 
     assert "主表判定 1" in page
     assert "隐藏空 tick 1" in page
-    assert "显示隐藏的无屏幕帧 Gate 空 tick（1）" in page
+    assert "显示隐藏的旧版无屏幕帧空 tick（1）" in page
     assert "frame_backed_false_unit_test" in page
     assert "no_recent_frames_unit_test" not in page
     assert "显示样本" in page
@@ -173,7 +175,7 @@ def test_proactive_debug_folds_no_frame_gate_ticks(tmp_path, monkeypatch):
 
     assert "visible decisions 1" in page_en
     assert "hidden no-frame ticks 1" in page_en
-    assert "Show hidden no-frame Gate ticks (1)" in page_en
+    assert "Show hidden legacy no-frame ticks (1)" in page_en
     assert "no_recent_frames_unit_test" not in page_en
 
 
@@ -430,17 +432,6 @@ def test_auto_proactive_v2_wake_samples_frames_without_gate_llm(tmp_path, monkey
         "_decrypt_frame_metadata_for_gate",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("V2 must not decrypt in tick")),
     )
-    monkeypatch.setattr(
-        appmod,
-        "_call_openrouter_proactive_gate",
-        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("V2 must not call Gate LLM")),
-    )
-    monkeypatch.setattr(
-        appmod,
-        "_build_gate_memory_context",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("V2 must not require memory context")),
-    )
-
     api_key = "test_proactive_auto_key"
     user_id = "usr_endpoint_proactive_auto"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
@@ -507,28 +498,6 @@ def test_auto_proactive_v2_wake_does_not_block_after_recent_user_chat(tmp_path, 
     assert body["job"]["frame_ids"] == ["recentchat123456"]
 
 
-def test_recent_proactive_fire_cooldown_is_ten_minutes(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    store = appmod.UserStore("usr_test_proactive_cooldown")
-    now = appmod.time.time()
-    envelope = {
-        "id": "msg_fire",
-        "v": 1,
-        "body_ct": "ct",
-        "nonce": "nonce",
-        "K_user": "k-user",
-        "visibility": "shared",
-        "owner_user_id": store.user_id,
-    }
-    msg = store.append_chat("openclaw", appmod.PROACTIVE_JOB_SOURCE, envelope)
-
-    msg["ts"] = now - 599
-    assert appmod._recent_proactive_fire_active(store, now) is True
-
-    msg["ts"] = now - 601
-    assert appmod._recent_proactive_fire_active(store, now) is False
-
-
 def test_auto_proactive_v2_wake_does_not_require_gate_model(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     monkeypatch.setattr(appmod, "OPENROUTER_API_KEY", "")
@@ -580,7 +549,7 @@ def test_auto_proactive_v2_wake_suppresses_job_without_frames(tmp_path, monkeypa
     assert body["decision"]["gate_input"]["llm_called"] is False
 
 
-def test_auto_proactive_v2_schedule_heartbeats_need_current_signal(tmp_path, monkeypatch):
+def test_auto_proactive_v2_schedule_heartbeats_split_presence_and_screen_wakes(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
@@ -598,8 +567,12 @@ def test_auto_proactive_v2_schedule_heartbeats_need_current_signal(tmp_path, mon
     )
     assert off.status_code == 200
     off_body = off.get_json()
-    assert off_body["enqueued"] is False
-    assert off_body["decision"]["reason"] == "heartbeat_broadcast_off"
+    assert off_body["enqueued"] is True
+    assert off_body["decision"]["reason"] == "wake_created"
+    assert off_body["decision"]["wake_kind"] == "presence"
+    assert off_body["decision"]["screen_context_available"] is False
+    assert off_body["job"]["wake_kind"] == "presence"
+    assert off_body["job"]["frame_ids"] == []
 
     opened_without_frame = client.post(
         "/v1/proactive/tick",
@@ -627,6 +600,8 @@ def test_auto_proactive_v2_schedule_heartbeats_need_current_signal(tmp_path, mon
     on_body = on_with_frame.get_json()
     assert on_body["enqueued"] is True
     assert on_body["decision"]["reason"] == "wake_created"
+    assert on_body["decision"]["wake_kind"] == "screen"
+    assert on_body["decision"]["screen_context_available"] is True
     assert on_body["job"]["frame_ids"] == ["frameon123456789"]
 
 
@@ -657,29 +632,6 @@ def test_auto_proactive_v2_away_suppresses_automatic_but_manual_bypasses(tmp_pat
     assert manual_body["decision"]["reason"] == "wake_created"
 
 
-def test_llm_gate_true_requires_known_concrete_connection():
-    raw = {
-        "should_reach_out": True,
-        "confidence": 0.9,
-        "intent_label": "screen_context",
-        "context_hint": "The user is on a screen tied to a memory.",
-        "reason": "has_connection",
-        "connection": {
-            "source_type": "memory_set",
-            "source_id": "mom_unknown",
-            "quote": "unknown",
-            "why_concrete": "claims a match",
-        },
-        "frame_ids": ["frame_a"],
-    }
-
-    decision = appmod._coerce_llm_gate_payload(raw, ["frame_a"], {"mom_known"})
-
-    assert decision["should_reach_out"] is False
-    assert decision["abstention_reason"] == "llm_unrecognized_connection"
-    assert decision["context_hint"] == ""
-
-
 def test_gate_review_endpoint_records_human_label(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
@@ -689,7 +641,7 @@ def test_gate_review_endpoint_records_human_label(tmp_path, monkeypatch):
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
     store = appmod.get_store(user_id)
 
-    decision = appmod._build_proactive_gate_decision(
+    decision = appmod._build_proactive_v2_wake_decision(
         store,
         {
             "force": True,
@@ -729,7 +681,7 @@ def test_proactive_job_claim_and_status_lifecycle(tmp_path, monkeypatch):
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
     store = appmod.get_store(user_id)
 
-    decision = appmod._build_proactive_gate_decision(
+    decision = appmod._build_proactive_v2_wake_decision(
         store,
         {"force": True, "context_hint": "claim test"},
     )

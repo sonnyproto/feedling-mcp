@@ -1,5 +1,9 @@
 # Proactive Gate V1
 
+> Archived historical spec. This is not an active runtime path after Proactive V2.
+> `/v1/proactive/tick` now creates agent-owned wake events and no longer calls
+> this Gate model or supports a `legacy_gate` fallback.
+
 V1 changes the Gate from a generic work-assistant trigger into a companion
 connection gate. It should not ask "would help be useful?" first. It asks:
 

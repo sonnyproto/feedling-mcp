@@ -1242,7 +1242,7 @@ def test_openai_http_protocol_sends_multimodal_image_block(monkeypatch):
     assert content[1] == {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,abcd"}}
 
 
-def test_process_proactive_jobs_routes_through_agent_and_posts_metadata(monkeypatch):
+def test_process_proactive_wake_routes_through_agent_and_posts_metadata(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
 
@@ -1281,23 +1281,31 @@ def test_process_proactive_jobs_routes_through_agent_and_posts_metadata(monkeypa
     )
 
     job = {
+        "schema_version": 2,
         "job_id": "pj_1",
+        "wake_id": "wake_1",
         "gate_decision_id": "gd_1",
         "source": crc.PROACTIVE_JOB_SOURCE,
         "ts": 123.0,
-        "intent_label": "screen_context",
-        "context_hint": "The user has stayed on the same technical article.",
-        "connections": ["This relates to the user's current Feedling work."],
+        "trigger": "screen_tick",
+        "wake_kind": "screen",
+        "user_state": "default",
+        "ai_state": "present",
+        "broadcast_state": "on",
+        "current_app": "Docs",
         "frame_ids": ["frame_1"],
     }
 
     assert crc._process_proactive_jobs([job]) == pytest.approx(123.0)
-    assert "Feedling proactive hidden job" in captured["message"]
-    assert "The user has stayed" in captured["message"]
+    assert "Feedling proactive wake" in captured["message"]
+    assert "platform did not judge" in captured["message"].lower()
+    assert "wake_id: wake_1" in captured["message"]
+    assert "wake_kind: screen" in captured["message"]
     assert "recent_chat_context" in captured["message"]
     assert "你刚刚问我这段要不要压成一句话" in captured["message"]
     assert "own runtime identity" in captured["message"]
     assert "screen: user is reading docs" in captured["message"]
+    assert "possible_connections" not in captured["message"]
     assert captured["images"] == [{"data": "x"}]
     assert captured["image_paths"] == ["/tmp/frame.jpg"]
     assert captured["reply"] == "我看到了这个时机。"
@@ -1364,11 +1372,15 @@ def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):
     assert crc._process_proactive_jobs([job]) == pytest.approx(124.0)
     assert "Feedling proactive wake" in captured["message"]
     assert "platform did not judge" in captured["message"].lower()
+    assert "awareness / presence check" in captured["message"]
+    assert "genuinely want to appear" in captured["message"]
     assert "Feedling Gate decided" not in captured["message"]
     assert "possible_connections" not in captured["message"]
     assert "wake_id: wake_1" in captured["message"]
+    assert "wake_kind: screen" in captured["message"]
     assert "user_state: default" in captured["message"]
     assert "broadcast_state: on" in captured["message"]
+    assert "screen_context_available: true" in captured["message"]
     assert captured["images"] == [{"data": "x"}]
     assert captured["image_paths"] == ["/tmp/frame.jpg"]
     assert [p[0] for p in captured["posted"]] == ["第一条", "第二条"]
@@ -1575,11 +1587,13 @@ def test_extract_cli_output_preserves_structured_multi_messages():
     assert crc._normalize_agent_replies(extracted) == ["第一条", "第二条"]
 
 
-def test_message_for_proactive_job_instructs_multi_bubble_without_hiding_context():
+def test_message_for_proactive_job_instructs_multi_bubble_without_gate_context():
     job = {
-        "intent_label": "screen_context",
-        "context_hint": "The user is reading a note tied to an old memory.",
-        "connections": ["memory card mom_1: user likes compact observations"],
+        "schema_version": 2,
+        "wake_id": "wake_test",
+        "trigger": "screen_tick",
+        "wake_kind": "screen",
+        "frame_ids": ["frame_1"],
     }
 
     message = crc._message_for_proactive_job(
@@ -1591,29 +1605,61 @@ def test_message_for_proactive_job_instructs_multi_bubble_without_hiding_context
     assert "1-5 short chat bubbles" in message
     assert '{"messages":["...","..."]}' in message
     assert "recent_chat_context" in message
-    assert "possible_connections" in message
+    assert "possible_connections" not in message
+    assert "Feedling Gate decided" not in message
     assert "screen: dense paragraph" in message
 
 
 def test_recent_chat_context_defaults_to_twenty_messages(monkeypatch):
     captured = {}
+    now = 1780939000.0
 
     def _history(since, limit):
         captured["limit"] = limit
         return [
-            {"role": "user", "content": f"用户消息 {idx}"}
+            {"role": "user", "content": f"用户消息 {idx}", "ts": now - ((24 - idx) * 60)}
             for idx in range(25)
         ]
 
     monkeypatch.setattr(crc, "PROACTIVE_RECENT_CHAT_LIMIT", 20)
+    monkeypatch.setattr(crc.time, "time", lambda: now)
     monkeypatch.setattr(crc, "get_decrypted_history", _history)
 
     context = crc.recent_chat_context_for_proactive()
 
-    assert captured["limit"] == 20
-    assert context.count("- user:") == 20
-    assert "用户消息 5" in context
-    assert "用户消息 24" in context
+    assert captured["limit"] == 50
+    assert context.freshness == "fresh"
+    assert context.included_count == 20
+    assert context.text.count("- [") == 20
+    assert "fresh] user: 用户消息 5" in context.text
+    assert "fresh] user: 用户消息 24" in context.text
+    assert context.last_user_message_age_sec == pytest.approx(0.0)
+
+
+def test_recent_chat_context_stale_falls_back_to_two_timestamped_messages(monkeypatch):
+    now = 1780939000.0
+
+    def _history(since, limit):
+        return [
+            {"role": "user", "content": f"旧消息 {idx}", "ts": now - 28800 - ((4 - idx) * 60)}
+            for idx in range(5)
+        ]
+
+    monkeypatch.setattr(crc, "PROACTIVE_RECENT_CHAT_LIMIT", 20)
+    monkeypatch.setattr(crc, "PROACTIVE_CHAT_FRESH_WINDOW_SEC", 21600)
+    monkeypatch.setattr(crc, "PROACTIVE_STALE_CHAT_FALLBACK_LIMIT", 2)
+    monkeypatch.setattr(crc.time, "time", lambda: now)
+    monkeypatch.setattr(crc, "get_decrypted_history", _history)
+
+    context = crc.recent_chat_context_for_proactive()
+
+    assert context.freshness == "stale"
+    assert context.included_count == 2
+    assert context.text.count("- [") == 2
+    assert "stale] user: 旧消息 3" in context.text
+    assert "stale] user: 旧消息 4" in context.text
+    assert "旧消息 2" not in context.text
+    assert "8h" in context.text
 
 
 def test_proactive_tick_cadence_follows_broadcast_state(monkeypatch):
