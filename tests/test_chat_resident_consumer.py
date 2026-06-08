@@ -1265,7 +1265,9 @@ def test_process_proactive_jobs_routes_through_agent_and_posts_metadata(monkeypa
     monkeypatch.setattr(
         crc,
         "update_proactive_job_status",
-        lambda job_id, status, reason="": captured.setdefault("statuses", []).append((job_id, status, reason)),
+        lambda job_id, status, reason="", **kwargs: captured.setdefault("statuses", []).append(
+            (job_id, status, reason, kwargs)
+        ),
     )
     monkeypatch.setattr(
         crc,
@@ -1304,8 +1306,157 @@ def test_process_proactive_jobs_routes_through_agent_and_posts_metadata(monkeypa
         "gate_decision_id": "gd_1",
         "proactive_job_id": "pj_1",
     }
-    assert ("pj_1", "realizing", "") in captured["statuses"]
+    assert any(s[:3] == ("pj_1", "realizing", "") for s in captured["statuses"])
     assert any(s[0] == "pj_1" and s[1] == "posted" for s in captured["statuses"])
+
+
+def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"posted": [], "statuses": []}
+
+    def _agent(message, images=None, image_paths=None):
+        captured["message"] = message
+        captured["images"] = images
+        captured["image_paths"] = image_paths
+        return {"messages": ["第一条", "第二条"]}
+
+    def _post(reply, **kwargs):
+        captured["posted"].append((reply, kwargs))
+        return {"id": f"msg_{len(captured['posted'])}"}
+
+    def _status(job_id, status, reason="", **kwargs):
+        captured["statuses"].append((job_id, status, reason, kwargs))
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "post_reply", _post)
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", _status)
+    monkeypatch.setattr(
+        crc,
+        "_screen_context_for_frame_ids",
+        lambda frame_ids: ("screen: user is reading docs", [{"data": "x"}], ["/tmp/frame.jpg"]),
+    )
+    monkeypatch.setattr(
+        crc,
+        "recent_chat_context_for_proactive",
+        lambda limit=None: "- user: 刚刚聊过这个问题。",
+    )
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_v2",
+        "wake_id": "wake_1",
+        "gate_decision_id": "gd_1",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 124.0,
+        "trigger": "screen_tick",
+        "manual": False,
+        "forced": False,
+        "user_state": "default",
+        "ai_state": "present",
+        "broadcast_state": "on",
+        "current_app": "xhs",
+        "frame_ids": ["frame_1"],
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(124.0)
+    assert "Feedling proactive wake" in captured["message"]
+    assert "platform did not judge" in captured["message"].lower()
+    assert "Feedling Gate decided" not in captured["message"]
+    assert "possible_connections" not in captured["message"]
+    assert "wake_id: wake_1" in captured["message"]
+    assert "user_state: default" in captured["message"]
+    assert "broadcast_state: on" in captured["message"]
+    assert captured["images"] == [{"data": "x"}]
+    assert captured["image_paths"] == ["/tmp/frame.jpg"]
+    assert [p[0] for p in captured["posted"]] == ["第一条", "第二条"]
+    assert all(p[1]["source"] == crc.PROACTIVE_JOB_SOURCE for p in captured["posted"])
+    assert sum(1 for s in captured["statuses"] if s[1] == "posted") == 2
+
+
+def test_process_proactive_v2_sleep_marks_completed_without_post(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"statuses": []}
+
+    monkeypatch.setattr(
+        crc,
+        "call_agent",
+        lambda message, images=None, image_paths=None: {
+            "actions": [{"type": "proactive.sleep", "reason": "not helpful"}],
+            "messages": [],
+        },
+    )
+    monkeypatch.setattr(crc, "post_reply", lambda *args, **kwargs: captured.setdefault("posted", []).append(args))
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_sleep",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 125.0,
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(125.0)
+    assert captured.get("posted") is None
+    completed = [s for s in captured["statuses"] if s[1] == "completed"]
+    assert completed
+    assert completed[-1][3]["extra"]["agent_action"] == "sleep"
+    assert completed[-1][3]["extra"]["wake_result"] == "sleep"
+
+
+def test_process_proactive_v2_request_broadcast_posts_visible_request(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"posted": [], "statuses": []}
+
+    monkeypatch.setattr(
+        crc,
+        "call_agent",
+        lambda message, images=None, image_paths=None: {
+            "actions": [{
+                "type": "proactive.request_broadcast",
+                "reason": "screen sharing is off",
+                "copy": "我现在看不到你的屏幕，可以重新打开屏幕共享吗？",
+            }],
+            "messages": [],
+        },
+    )
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_b"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_broadcast",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 126.0,
+        "broadcast_state": "off",
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(126.0)
+    assert captured["posted"][0][0] == "我现在看不到你的屏幕，可以重新打开屏幕共享吗？"
+    posted = [s for s in captured["statuses"] if s[1] == "posted"]
+    assert posted
+    assert posted[-1][3]["extra"]["agent_action"] == "request_broadcast"
+    assert posted[-1][3]["extra"]["wake_result"] == "posted"
 
 
 def test_normalize_agent_replies_supports_multiple_messages_with_cap(monkeypatch):

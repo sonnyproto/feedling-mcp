@@ -385,6 +385,13 @@ def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
     body = tick.get_json()
     assert body["enqueued"] is True
     assert body["job"]["source"] == appmod.PROACTIVE_JOB_SOURCE
+    assert body["decision"]["schema_version"] == 2
+    assert body["decision"]["decision_type"] == "wake_event"
+    assert body["decision"]["gate_model"] == "proactive_v2:wake"
+    assert body["decision"]["gate_input"]["llm_called"] is False
+    assert body["job"]["schema_version"] == 2
+    assert body["job"]["trigger"] == "manual_wake"
+    assert body["job"]["context_hint"] == ""
 
     poll = client.get("/v1/proactive/jobs/poll?since=0&timeout=0", headers=headers)
     assert poll.status_code == 200
@@ -413,63 +420,26 @@ def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
     assert b"Hidden Jobs" in page_en.data
 
 
-def test_auto_proactive_gate_uses_decrypted_frame_ocr(tmp_path, monkeypatch):
+def test_auto_proactive_v2_wake_samples_frames_without_gate_llm(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     monkeypatch.setattr(appmod, "OPENROUTER_API_KEY", "sk-test")
     appmod._stores.clear()
 
-    def _fake_decrypt(_store, frame_id, _api_key, include_image=False):
-        return {
-            "frame_id": frame_id,
-            "app": "xhs",
-            "ocr_text": "我在对比两个方案，要不要帮我把这三段压成一句可以发的观点？",
-            "image_b64": "ZmFrZS1qcGVn" if include_image else "",
-            "image_mime": "image/jpeg",
-        }
-
-    def _fake_llm_gate(**kwargs):
-        assert kwargs["frame_contexts"][0]["image_b64"] == "ZmFrZS1qcGVn"
-        assert "要不要帮我" in kwargs["ocr_summary"]
-        assert kwargs["gate_context"]["memory_set"][0]["id"] == "mom_rewrite"
-        return {
-            "ok": True,
-            "raw": {
-                "should_reach_out": True,
-                "confidence": 0.88,
-                "intent_label": "help_compress_point",
-                "context_hint": "The user is looking at a dense post and may want help turning it into one usable sentence.",
-                "reason": "model_detected_helpful_moment",
-                "frame_ids": ["abcd1234abcd1234"],
-                "connection": {
-                    "source_type": "memory_set",
-                    "source_id": "mom_rewrite",
-                    "quote": "The user often asks Dora to compress dense ideas into a sendable point.",
-                    "why_concrete": "The screen asks whether to compress three paragraphs into one point.",
-                },
-            },
-            "usage": {"total_tokens": 123},
-        }
-
-    monkeypatch.setattr(appmod, "_decrypt_frame_metadata_for_gate", _fake_decrypt)
-    monkeypatch.setattr(appmod, "_call_openrouter_proactive_gate", _fake_llm_gate)
-    monkeypatch.setattr(appmod, "_build_gate_memory_context", lambda *_args, **_kwargs: {
-        "identity_card": {"agent_name": "Dora"},
-        "memory_set": [{
-            "id": "mom_rewrite",
-            "type": "fact",
-            "title": "The user likes turning dense arguments into compact sendable points.",
-            "description": "Dora has helped compress notes into concise arguments before.",
-        }],
-        "passive_observations": [],
-        "recent_fires": [],
-        "now_local": {"iso": "2026-05-24T10:00:00-04:00"},
-        "connection_candidates": [{
-            "source_type": "memory_set",
-            "source_id": "mom_rewrite",
-            "quote": "The user likes turning dense arguments into compact sendable points.",
-        }],
-        "context_errors": {"identity": "", "memory": ""},
-    })
+    monkeypatch.setattr(
+        appmod,
+        "_decrypt_frame_metadata_for_gate",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("V2 must not decrypt in tick")),
+    )
+    monkeypatch.setattr(
+        appmod,
+        "_call_openrouter_proactive_gate",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("V2 must not call Gate LLM")),
+    )
+    monkeypatch.setattr(
+        appmod,
+        "_build_gate_memory_context",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("V2 must not require memory context")),
+    )
 
     api_key = "test_proactive_auto_key"
     user_id = "usr_endpoint_proactive_auto"
@@ -490,59 +460,21 @@ def test_auto_proactive_gate_uses_decrypted_frame_ocr(tmp_path, monkeypatch):
     assert resp.status_code == 200
     body = resp.get_json()
     assert body["enqueued"] is True
-    assert body["decision"]["gate_model"] == "openrouter:google/gemini-3.1-flash-lite"
-    assert body["decision"]["reason"] == "model_detected_helpful_moment"
-    assert body["decision"]["gate_input"]["decrypt_ok"] is True
-    assert body["decision"]["gate_input"]["image_count"] == 1
-    assert body["decision"]["gate_input"]["llm_called"] is True
-    assert body["decision"]["connection"]["source_id"] == "mom_rewrite"
+    assert body["decision"]["gate_model"] == "proactive_v2:wake"
+    assert body["decision"]["reason"] == "wake_created"
+    assert body["decision"]["trigger"] == "screen_tick"
+    assert body["decision"]["gate_input"]["decrypt_ok"] is False
+    assert body["decision"]["gate_input"]["image_count"] == 0
+    assert body["decision"]["gate_input"]["llm_called"] is False
+    assert body["decision"]["connection"] == {}
     assert body["job"]["frame_ids"] == ["abcd1234abcd1234"]
-    assert body["job"]["connection"]["source_id"] == "mom_rewrite"
+    assert body["job"]["connection"] == {}
 
 
-def test_auto_proactive_gate_does_not_block_after_recent_user_chat(tmp_path, monkeypatch):
+def test_auto_proactive_v2_wake_does_not_block_after_recent_user_chat(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     monkeypatch.setattr(appmod, "OPENROUTER_API_KEY", "sk-test")
     appmod._stores.clear()
-
-    monkeypatch.setattr(appmod, "_decrypt_frame_metadata_for_gate", lambda _store, frame_id, _api_key, include_image=False: {
-        "frame_id": frame_id,
-        "app": "xhs",
-        "ocr_text": "这段内容和我们之前聊过的压缩观点有关。",
-        "image_b64": "ZmFrZS1qcGVn" if include_image else "",
-        "image_mime": "image/jpeg",
-    })
-    monkeypatch.setattr(appmod, "_call_openrouter_proactive_gate", lambda **kwargs: {
-        "ok": True,
-        "raw": {
-            "should_reach_out": True,
-            "confidence": 0.86,
-            "intent_label": "memory_connection",
-            "context_hint": "The user is looking at a screen tied to a known memory.",
-            "reason": "model_detected_memory_connection",
-            "frame_ids": ["recentchat123456"],
-            "connection": {
-                "source_type": "memory_set",
-                "source_id": "mom_known",
-                "quote": "The user likes compact observations.",
-                "why_concrete": "The screen is about compressing a point.",
-            },
-        },
-        "usage": {"total_tokens": 88},
-    })
-    monkeypatch.setattr(appmod, "_build_gate_memory_context", lambda *_args, **_kwargs: {
-        "identity_card": {"agent_name": "Dora"},
-        "memory_set": [{"id": "mom_known", "title": "The user likes compact observations."}],
-        "passive_observations": [],
-        "recent_fires": [],
-        "now_local": {"iso": "2026-05-24T10:00:00-04:00"},
-        "connection_candidates": [{
-            "source_type": "memory_set",
-            "source_id": "mom_known",
-            "quote": "The user likes compact observations.",
-        }],
-        "context_errors": {"identity": "", "memory": ""},
-    })
 
     api_key = "test_proactive_recent_chat_key"
     user_id = "usr_endpoint_proactive_recent_chat"
@@ -570,7 +502,9 @@ def test_auto_proactive_gate_does_not_block_after_recent_user_chat(tmp_path, mon
     assert resp.status_code == 200
     body = resp.get_json()
     assert body["enqueued"] is True
-    assert body["decision"]["reason"] == "model_detected_memory_connection"
+    assert body["decision"]["reason"] == "wake_created"
+    assert body["decision"]["gate_input"]["llm_called"] is False
+    assert body["job"]["frame_ids"] == ["recentchat123456"]
 
 
 def test_recent_proactive_fire_cooldown_is_ten_minutes(tmp_path, monkeypatch):
@@ -595,34 +529,10 @@ def test_recent_proactive_fire_cooldown_is_ten_minutes(tmp_path, monkeypatch):
     assert appmod._recent_proactive_fire_active(store, now) is False
 
 
-def test_auto_proactive_gate_requires_model_even_with_strong_ocr(tmp_path, monkeypatch):
+def test_auto_proactive_v2_wake_does_not_require_gate_model(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     monkeypatch.setattr(appmod, "OPENROUTER_API_KEY", "")
     appmod._stores.clear()
-
-    def _fake_decrypt(_store, frame_id, _api_key, include_image=False):
-        return {
-            "frame_id": frame_id,
-            "app": "xhs",
-            "ocr_text": "帮我总结这段，然后压成一句可以发的观点。",
-            "image_b64": "ZmFrZS1qcGVn" if include_image else "",
-            "image_mime": "image/jpeg",
-        }
-
-    monkeypatch.setattr(appmod, "_decrypt_frame_metadata_for_gate", _fake_decrypt)
-    monkeypatch.setattr(appmod, "_build_gate_memory_context", lambda *_args, **_kwargs: {
-        "identity_card": {"agent_name": "Dora"},
-        "memory_set": [{"id": "mom_summary", "title": "User often asks for concise summaries."}],
-        "passive_observations": [],
-        "recent_fires": [],
-        "now_local": {"iso": "2026-05-24T10:00:00-04:00"},
-        "connection_candidates": [{
-            "source_type": "memory_set",
-            "source_id": "mom_summary",
-            "quote": "User often asks for concise summaries.",
-        }],
-        "context_errors": {"identity": "", "memory": ""},
-    })
 
     api_key = "test_proactive_auto_no_model_key"
     user_id = "usr_endpoint_proactive_auto_no_model"
@@ -640,13 +550,14 @@ def test_auto_proactive_gate_requires_model_even_with_strong_ocr(tmp_path, monke
 
     assert resp.status_code == 200
     body = resp.get_json()
-    assert body["enqueued"] is False
-    assert body["decision"]["should_reach_out"] is False
-    assert body["decision"]["reason"] == "model_not_configured"
-    assert body["decision"]["gate_input"]["llm_called"] is True
+    assert body["enqueued"] is True
+    assert body["decision"]["should_reach_out"] is True
+    assert body["decision"]["should_wake_agent"] is True
+    assert body["decision"]["reason"] == "wake_created"
+    assert body["decision"]["gate_input"]["llm_called"] is False
 
 
-def test_auto_proactive_gate_records_false_without_frames(tmp_path, monkeypatch):
+def test_auto_proactive_v2_wake_records_job_without_frames(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
@@ -659,9 +570,39 @@ def test_auto_proactive_gate_records_false_without_frames(tmp_path, monkeypatch)
 
     assert resp.status_code == 200
     body = resp.get_json()
-    assert body["enqueued"] is False
-    assert body["decision"]["should_reach_out"] is False
-    assert body["decision"]["reason"] == "no_recent_frames"
+    assert body["enqueued"] is True
+    assert body["decision"]["should_reach_out"] is True
+    assert body["decision"]["reason"] == "wake_created"
+    assert body["decision"]["trigger"] == "heartbeat_no_frame"
+    assert body["decision"]["frame_ids"] == []
+    assert body["decision"]["gate_input"]["llm_called"] is False
+
+
+def test_auto_proactive_v2_away_suppresses_automatic_but_manual_bypasses(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_proactive_away_key"
+    user_id = "usr_endpoint_proactive_away"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    client.post("/v1/proactive/state", headers=headers, json={"user_state": "away"})
+
+    auto = client.post("/v1/proactive/tick", headers=headers, json={})
+    assert auto.status_code == 200
+    auto_body = auto.get_json()
+    assert auto_body["enqueued"] is False
+    assert auto_body["decision"]["should_wake_agent"] is False
+    assert auto_body["decision"]["reason"] == "user_away"
+
+    manual = client.post("/v1/proactive/tick", headers=headers, json={"manual": True})
+    assert manual.status_code == 200
+    manual_body = manual.get_json()
+    assert manual_body["enqueued"] is True
+    assert manual_body["decision"]["manual"] is True
+    assert manual_body["decision"]["reason"] == "wake_created"
 
 
 def test_llm_gate_true_requires_known_concrete_connection():

@@ -431,6 +431,13 @@ TRACK_EVENT_RETENTION_DAYS = int(os.environ.get("FEEDLING_TRACK_EVENT_RETENTION_
 TRACK_EVENT_MAX = int(os.environ.get("FEEDLING_TRACK_EVENT_MAX", 2000))
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 PROACTIVE_JOB_MAX = int(os.environ.get("FEEDLING_PROACTIVE_JOB_MAX", 500))
+PROACTIVE_V2_ENABLED = os.environ.get("FEEDLING_PROACTIVE_V2", "true").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+PROACTIVE_V2_WAKE_TTL_SEC = float(os.environ.get("FEEDLING_PROACTIVE_V2_WAKE_TTL_SEC", "180"))
+PROACTIVE_USER_STATES = {"default", "focused", "social", "resting", "away"}
+PROACTIVE_AI_STATES = {"present", "watching", "thinking", "curious", "waiting"}
+PROACTIVE_BROADCAST_STATES = {"unknown", "on", "off", "paused"}
 PROACTIVE_DEBUG_DECISION_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_DECISION_READ_MAX", 1000))
 PROACTIVE_DEBUG_JOB_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_JOB_READ_MAX", PROACTIVE_JOB_MAX))
 PROACTIVE_DEBUG_EVENT_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_EVENT_READ_MAX", 500))
@@ -825,10 +832,15 @@ class UserStore:
     # ------- proactive presence -------
     def load_proactive_settings(self) -> dict:
         default = {
+            "version": 2,
             "enabled": True,
             "dnd": False,
             "timezone": PROACTIVE_DEFAULT_TIMEZONE,
             "permission_states": {},
+            "user_state": "default",
+            "manual_user_state": "default",
+            "ai_state": "present",
+            "broadcast_state": "unknown",
             "updated_at": datetime.now().isoformat(),
         }
         try:
@@ -838,13 +850,30 @@ class UserStore:
                 merged.update(data)
                 if not isinstance(merged.get("permission_states"), dict):
                     merged["permission_states"] = {}
+                if str(merged.get("user_state") or "") not in PROACTIVE_USER_STATES:
+                    merged["user_state"] = "default"
+                if str(merged.get("manual_user_state") or "") not in PROACTIVE_USER_STATES:
+                    merged["manual_user_state"] = str(merged.get("user_state") or "default")
+                if str(merged.get("ai_state") or "") not in PROACTIVE_AI_STATES:
+                    merged["ai_state"] = "present"
+                if str(merged.get("broadcast_state") or "") not in PROACTIVE_BROADCAST_STATES:
+                    merged["broadcast_state"] = "unknown"
                 return merged
         except Exception as e:
             print(f"[{self.user_id}/proactive] settings load failed: {e}")
         return default
 
     def save_proactive_settings(self, patch: dict) -> dict:
-        allowed = {"enabled", "dnd", "timezone", "permission_states"}
+        allowed = {
+            "enabled",
+            "dnd",
+            "timezone",
+            "permission_states",
+            "user_state",
+            "manual_user_state",
+            "ai_state",
+            "broadcast_state",
+        }
         cur = self.load_proactive_settings()
         for key, value in (patch or {}).items():
             if key not in allowed:
@@ -863,6 +892,19 @@ class UserStore:
                 for pname, pstate in value.items():
                     states[str(pname)] = str(pstate)
                 cur["permission_states"] = states
+            elif key in {"user_state", "manual_user_state"}:
+                state = str(value or "").strip().lower()
+                if state in PROACTIVE_USER_STATES:
+                    cur[key] = state
+            elif key == "ai_state":
+                state = str(value or "").strip().lower()
+                if state in PROACTIVE_AI_STATES:
+                    cur[key] = state
+            elif key == "broadcast_state":
+                state = str(value or "").strip().lower()
+                if state in PROACTIVE_BROADCAST_STATES:
+                    cur[key] = state
+        cur["version"] = 2
         cur["updated_at"] = datetime.now().isoformat()
         with self.proactive_lock:
             db.set_blob(self.user_id, "proactive_settings", cur)
@@ -949,9 +991,17 @@ class UserStore:
             "claimed_at",
             "realizing_at",
             "posted_at",
+            "completed_at",
             "failed_at",
             "updated_at",
             "chat_message_id",
+            "agent_action",
+            "agent_action_status",
+            "agent_actions",
+            "ai_state",
+            "broadcast_state",
+            "request_broadcast",
+            "wake_result",
         }
         patch = {k: v for k, v in (fields or {}).items() if k in allowed}
         if not patch:
@@ -1268,6 +1318,10 @@ _DEVICE_EVENT_ALLOWED_KEYS = {
     "scene_phase",
     "phase",
     "app_state",
+    "broadcast_state",
+    "user_state",
+    "ai_state",
+    "wake_trigger",
     "is_foreground",
     "selected_tab",
     "tab",
@@ -2144,6 +2198,181 @@ def _payload_float(payload: dict, key: str, default: float, lo: float, hi: float
     return max(lo, min(hi, value))
 
 
+def _normalize_proactive_state(value: Any, allowed: set[str], default: str) -> str:
+    raw = str(value or "").strip().lower()
+    return raw if raw in allowed else default
+
+
+def _proactive_bool(payload: dict, *keys: str) -> bool:
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, bool):
+            if value:
+                return True
+            continue
+        if isinstance(value, (int, float)) and value:
+            return True
+        if isinstance(value, str) and value.strip().lower() in {"1", "true", "yes", "y", "on"}:
+            return True
+    return False
+
+
+def _proactive_trigger(payload: dict, *, manual: bool, frames: list[dict]) -> str:
+    raw = (
+        payload.get("trigger")
+        or payload.get("wake_trigger")
+        or payload.get("event_type")
+        or payload.get("type")
+        or ""
+    )
+    trigger = re.sub(r"[^a-zA-Z0-9_.:-]+", "_", str(raw or "").strip().lower()).strip("_.:-")
+    if trigger:
+        return trigger[:120]
+    if manual:
+        return "manual_wake"
+    return "screen_tick" if frames else "heartbeat_no_frame"
+
+
+def _latest_payload_state_from_events(store: UserStore, key: str, allowed: set[str]) -> str:
+    for event in reversed(store.list_device_events(since_epoch=max(0.0, time.time() - 86400), limit=200)):
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        state = str(payload.get(key) or "").strip().lower()
+        if state in allowed:
+            return state
+    return ""
+
+
+def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: str | None = None) -> dict:
+    """Create a V2 wake event without doing platform-side semantic judgment.
+
+    The platform may decide whether a wake is mechanically allowed, but it does
+    not decrypt frames, require a memory connection, call a Gate model, or infer
+    whether the agent should speak. That judgment belongs to the authorized
+    companion agent when the resident realizes this job.
+    """
+    now = time.time()
+    payload = payload if isinstance(payload, dict) else {}
+    settings = store.load_proactive_settings()
+    force = _proactive_bool(payload, "force", "force_response")
+    manual = force or _proactive_bool(payload, "manual", "manual_wake", "user_initiated") or bool(
+        str(payload.get("context_hint") or "").strip()
+    )
+
+    payload_frames = payload.get("frames")
+    if isinstance(payload_frames, list) and payload_frames:
+        frames = [
+            dict(f) for f in payload_frames
+            if isinstance(f, dict) and str(f.get("id") or f.get("frame_id") or "").strip()
+        ]
+        for f in frames:
+            if not f.get("id") and f.get("frame_id"):
+                f["id"] = f.get("frame_id")
+    else:
+        frames = _recent_frame_meta(
+            store,
+            now,
+            _payload_float(payload, "frame_window_sec", 300.0, 30.0, 3600.0),
+        )
+    selected_frames = _sample_frames_for_gate(frames, max_frames=PROACTIVE_GATE_MAX_FRAMES)
+    frame_ids = _frame_ids(selected_frames)
+    device_events = _recent_device_events_for_gate(
+        store,
+        now,
+        _payload_float(payload, "device_event_window_sec", 900.0, 30.0, 86400.0),
+    )
+
+    user_state = _normalize_proactive_state(
+        payload.get("user_state"),
+        PROACTIVE_USER_STATES,
+        _normalize_proactive_state(settings.get("user_state"), PROACTIVE_USER_STATES, "default"),
+    )
+    ai_state = _normalize_proactive_state(
+        payload.get("ai_state"),
+        PROACTIVE_AI_STATES,
+        _normalize_proactive_state(settings.get("ai_state"), PROACTIVE_AI_STATES, "present"),
+    )
+    broadcast_state = _normalize_proactive_state(
+        payload.get("broadcast_state"),
+        PROACTIVE_BROADCAST_STATES,
+        _latest_payload_state_from_events(store, "broadcast_state", PROACTIVE_BROADCAST_STATES)
+        or _normalize_proactive_state(settings.get("broadcast_state"), PROACTIVE_BROADCAST_STATES, "unknown"),
+    )
+    trigger = _proactive_trigger(payload, manual=manual, frames=selected_frames)
+
+    block_reason = ""
+    if not settings.get("enabled", True) and not force:
+        block_reason = "proactive_disabled"
+    elif settings.get("dnd", False) and not manual:
+        block_reason = "dnd_enabled"
+    elif user_state == "away" and not manual:
+        block_reason = "user_away"
+
+    current_app = str(payload.get("current_app") or "").strip()
+    if not current_app:
+        current_app = _gate_current_app([], selected_frames)
+    ocr = str(payload.get("ocr_summary") or "").strip() or _ocr_summary(selected_frames)
+    should_wake_agent = not bool(block_reason)
+    decision_id = _new_public_id("gd")
+    wake_id = _new_public_id("wake")
+    reason = "wake_created" if should_wake_agent else block_reason
+    expires_at = datetime.fromtimestamp(now + PROACTIVE_V2_WAKE_TTL_SEC).isoformat()
+
+    return {
+        "decision_id": decision_id,
+        "wake_id": wake_id,
+        "schema_version": 2,
+        "decision_type": "wake_event",
+        "ts": now,
+        "created_at": datetime.fromtimestamp(now).isoformat(),
+        "expires_at": expires_at,
+        "gate_model": "proactive_v2:wake",
+        "should_reach_out": should_wake_agent,
+        "should_wake_agent": should_wake_agent,
+        "should_garden_passive": False,
+        "abstention_reason": "" if should_wake_agent else reason,
+        "reason": reason,
+        "intent_label": "",
+        "context_hint": "",
+        "connections": [],
+        "connection": {},
+        "frame_ids": frame_ids,
+        "device_event_ids": [str(e.get("event_id")) for e in device_events if e.get("event_id")][:10],
+        "current_app": current_app,
+        "trigger": trigger,
+        "manual": manual,
+        "forced": force,
+        "user_state": user_state,
+        "ai_state": ai_state,
+        "broadcast_state": broadcast_state,
+        "semantic": {
+            "reference": "agent_owned_v2",
+            "llm_confidence": None,
+            "llm_usage": {},
+        },
+        "gate_input": {
+            "v2": True,
+            "judgment": "agent_owned",
+            "ocr_chars": len(ocr),
+            "sampled_frame_count": len(selected_frames),
+            "decrypt_ok": False,
+            "image_count": 0,
+            "decrypt_errors": [],
+            "llm_called": False,
+            "llm_error": "",
+            "mechanical_block": block_reason,
+            "memory_context": {
+                "identity_loaded": False,
+                "memory_count": 0,
+                "passive_observation_count": 0,
+                "recent_fire_count": 0,
+                "connection_candidate_count": 0,
+                "context_errors": {},
+            },
+        },
+        "api_key_present": bool(api_key),
+    }
+
+
 def _build_proactive_gate_decision(store: UserStore, payload: dict, api_key: str | None = None) -> dict:
     now = time.time()
     payload = payload if isinstance(payload, dict) else {}
@@ -2342,10 +2571,13 @@ def _proactive_job_from_decision(decision: dict) -> dict:
     now = time.time()
     return {
         "job_id": _new_public_id("pj"),
+        "schema_version": int(decision.get("schema_version") or 1),
         "ts": now,
         "created_at": datetime.fromtimestamp(now).isoformat(),
+        "expires_at": decision.get("expires_at", ""),
         "source": PROACTIVE_JOB_SOURCE,
         "gate_decision_id": decision.get("decision_id", ""),
+        "wake_id": decision.get("wake_id", decision.get("decision_id", "")),
         "status": "pending",
         "intent_label": decision.get("intent_label", ""),
         "context_hint": decision.get("context_hint", ""),
@@ -2354,6 +2586,14 @@ def _proactive_job_from_decision(decision: dict) -> dict:
         "frame_ids": decision.get("frame_ids", []),
         "device_event_ids": decision.get("device_event_ids", []),
         "current_app": decision.get("current_app", ""),
+        "trigger": decision.get("trigger", ""),
+        "manual": bool(decision.get("manual", False)),
+        "forced": bool(decision.get("forced", False)),
+        "user_state": decision.get("user_state", ""),
+        "ai_state": decision.get("ai_state", ""),
+        "broadcast_state": decision.get("broadcast_state", ""),
+        "agent_action": "",
+        "agent_action_status": "",
     }
 
 
@@ -2475,6 +2715,12 @@ def _gate_input_dict(value) -> dict:
 
 
 def _gate_decision_has_frame_context(decision: dict) -> bool:
+    try:
+        schema_version = int(decision.get("schema_version") or 1)
+    except (TypeError, ValueError):
+        schema_version = 1
+    if schema_version >= 2 or decision.get("decision_type") == "wake_event":
+        return True
     frame_ids = decision.get("frame_ids")
     if isinstance(frame_ids, list) and any(str(fid).strip() for fid in frame_ids):
         return True
@@ -2629,6 +2875,12 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         "ts": "时间戳",
         "model": "模型",
         "id": "判定 ID",
+        "trigger": "触发来源",
+        "user_state": "用户状态",
+        "ai_state": "AI 状态",
+        "broadcast_state": "屏幕共享",
+        "agent_action": "Agent 动作",
+        "wake_result": "Wake 结果",
         "intent": "意图",
         "abstention": "不触发原因",
         "reason": "判定理由",
@@ -2639,7 +2891,7 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         "gate_input": "Gate 输入",
         "payload": "事件数据",
         "consumer": "消费服务",
-        "decision": "Gate 判定",
+        "decision": "Wake/Gate",
         "job": "任务",
         "preview": "消息预览",
     }
@@ -2881,6 +3133,14 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         ]
         if intent:
             meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('intent'))}</span> {value_html(intent)}</span>")
+        if d.get("trigger"):
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('trigger'))}</span> {value_html(d.get('trigger'))}</span>")
+        if d.get("user_state"):
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('user_state'))}</span> {value_html(d.get('user_state'))}</span>")
+        if d.get("ai_state"):
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('ai_state'))}</span> {value_html(d.get('ai_state'))}</span>")
+        if d.get("broadcast_state"):
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('broadcast_state'))}</span> {value_html(d.get('broadcast_state'))}</span>")
         if abstention:
             meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('abstention'))}</span> {prose_or_value_html(abstention)}</span>")
 
@@ -2983,6 +3243,18 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('consumer'))}</span> {short_id(j.get('consumer_id'))}</span>")
         if intent:
             meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('intent'))}</span> {value_html(intent)}</span>")
+        if j.get("trigger"):
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('trigger'))}</span> {value_html(j.get('trigger'))}</span>")
+        if j.get("user_state"):
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('user_state'))}</span> {value_html(j.get('user_state'))}</span>")
+        if j.get("ai_state"):
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('ai_state'))}</span> {value_html(j.get('ai_state'))}</span>")
+        if j.get("broadcast_state"):
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('broadcast_state'))}</span> {value_html(j.get('broadcast_state'))}</span>")
+        if j.get("agent_action"):
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('agent_action'))}</span> {value_html(j.get('agent_action'))}</span>")
+        if j.get("wake_result"):
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('wake_result'))}</span> {value_html(j.get('wake_result'))}</span>")
 
         body_blocks = []
         if j.get("context_hint"):
@@ -2995,6 +3267,10 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         frames_sent = frame_links(j.get("frame_ids"))
         if frames_sent:
             body_blocks.append(f"<div class='block'><span class='block-label'>{esc(tr_label('frames sent'))}</span><div class='block-text'>{frames_sent}</div></div>")
+        if show_payloads and j.get("agent_actions"):
+            body_blocks.append(f"<div class='block'>{fold_json('agent_actions', j.get('agent_actions'))}</div>")
+        if show_payloads and j.get("request_broadcast"):
+            body_blocks.append(f"<div class='block'>{fold_json('request_broadcast', j.get('request_broadcast'))}</div>")
 
         status_pill = f"<span class='verdict {status_class(status)}'>{value_html(status)}</span>"
         chips = []
@@ -3090,8 +3366,8 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     hidden_no_frame_count = len(no_frame_decisions)
     page_title = "IO Proactive Harness"
     visible_empty_text = ui(
-        f"No Gate decisions with screen context yet. Hidden no-frame ticks: {hidden_no_frame_count}.",
-        f"还没有带屏幕上下文的 Gate 判定。隐藏空 tick：{hidden_no_frame_count}。",
+        f"No visible wake/gate decisions yet. Hidden no-frame legacy ticks: {hidden_no_frame_count}.",
+        f"还没有可见的 Wake/Gate 判定。隐藏旧版空 tick：{hidden_no_frame_count}。",
     )
     detail_toggle = (
         f"<a class='control-link' href='{esc(dashboard_url(detail=0))}'>{esc(ui('hide JSON detail', '隐藏 JSON 详情'))}</a>"
@@ -3106,8 +3382,8 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
                 decision_cap,
                 len(frame_decisions),
                 80,
-                "show more Gate decisions",
-                "显示更多 Gate 判定",
+                "show more wake/gate decisions",
+                "显示更多 Wake/Gate",
             ),
             section_limit_link(
                 "job_limit",
@@ -3411,8 +3687,8 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     {control_links}
   </div>
 
-  <h2>{esc(ui('Gate Decisions', 'Gate 判定'))}</h2>
-  <div class="hint">{esc(ui('The main list only shows Gate decisions backed by screen frames, OCR, or image context. Scheduled no-frame ticks are folded below.', '主表只显示带屏幕帧、OCR 或图片上下文的 Gate 判定。没有屏幕帧的定时空 tick 会折叠在下方。'))}</div>
+  <h2>{esc(ui('Wake / Gate Decisions', 'Wake / Gate 判定'))}</h2>
+  <div class="hint">{esc(ui('V2 wake events are always shown. Legacy no-frame Gate ticks stay folded below.', 'V2 wake 事件会直接显示；旧版无屏幕帧 Gate 空 tick 会折叠在下方。'))}</div>
   {decision_section(frame_decisions, visible_empty_text, limit=decision_cap)}
   {hidden_gate_details}
 
@@ -11904,6 +12180,39 @@ def proactive_settings():
     return jsonify(settings)
 
 
+@app.route("/v1/proactive/state", methods=["GET", "POST"])
+def proactive_state():
+    store = require_user()
+    if request.method == "GET":
+        settings = store.load_proactive_settings()
+        return jsonify({
+            "version": settings.get("version", 2),
+            "enabled": bool(settings.get("enabled", True)),
+            "dnd": bool(settings.get("dnd", False)),
+            "user_state": settings.get("user_state", "default"),
+            "manual_user_state": settings.get("manual_user_state", settings.get("user_state", "default")),
+            "ai_state": settings.get("ai_state", "present"),
+            "broadcast_state": settings.get("broadcast_state", "unknown"),
+            "updated_at": settings.get("updated_at", ""),
+        })
+    payload = request.get_json(silent=True) or {}
+    settings = store.save_proactive_settings({
+        key: payload.get(key)
+        for key in ("user_state", "manual_user_state", "ai_state", "broadcast_state", "enabled", "dnd")
+        if key in payload
+    })
+    return jsonify({
+        "version": settings.get("version", 2),
+        "enabled": bool(settings.get("enabled", True)),
+        "dnd": bool(settings.get("dnd", False)),
+        "user_state": settings.get("user_state", "default"),
+        "manual_user_state": settings.get("manual_user_state", settings.get("user_state", "default")),
+        "ai_state": settings.get("ai_state", "present"),
+        "broadcast_state": settings.get("broadcast_state", "unknown"),
+        "updated_at": settings.get("updated_at", ""),
+    })
+
+
 @app.route("/v1/device/events", methods=["GET", "POST"])
 def device_events():
     store = require_user()
@@ -11931,20 +12240,23 @@ def device_events():
 
 @app.route("/v1/proactive/tick", methods=["POST"])
 def proactive_tick():
-    """Manual V0a Gate tick.
+    """Create a proactive wake job.
 
-    This endpoint is intentionally explicit: scheduler policy can be added
-    later, but the first shippable loop should be easy to inspect and replay.
-    If Gate passes, it creates a hidden job. The resident consumer, not the
-    server, realizes that job through the user's real agent entry.
+    V2 is agent-owned: the server may mechanically suppress disabled/away
+    automatic wakes, but it no longer decrypts frames, calls a Gate LLM, or
+    requires a memory connection. ``legacy_gate=true`` keeps the old path
+    available for debug replay.
     """
     store = require_user()
     payload = request.get_json(silent=True) or {}
-    decision = _build_proactive_gate_decision(store, payload, api_key=_extract_api_key())
+    if PROACTIVE_V2_ENABLED and not _proactive_bool(payload, "legacy_gate"):
+        decision = _build_proactive_v2_wake_decision(store, payload, api_key=_extract_api_key())
+    else:
+        decision = _build_proactive_gate_decision(store, payload, api_key=_extract_api_key())
     store.append_gate_decision(decision)
 
     job = None
-    if decision.get("should_reach_out"):
+    if decision.get("should_wake_agent", decision.get("should_reach_out")):
         job = store.append_proactive_job(_proactive_job_from_decision(decision))
 
     return jsonify({
@@ -11968,6 +12280,8 @@ def _job_status_patch(payload: dict, *, default_status: str = "") -> dict:
             patch["realizing_at"] = now_iso
         elif status in {"posted", "delivered"}:
             patch["posted_at"] = now_iso
+        elif status == "completed":
+            patch["completed_at"] = now_iso
         elif status in {"failed", "skipped"}:
             patch["failed_at"] = now_iso
     if reason:
@@ -11976,6 +12290,43 @@ def _job_status_patch(payload: dict, *, default_status: str = "") -> dict:
         patch["consumer_id"] = consumer_id[:160]
     if payload.get("chat_message_id"):
         patch["chat_message_id"] = str(payload.get("chat_message_id"))[:160]
+    if payload.get("agent_action"):
+        patch["agent_action"] = str(payload.get("agent_action"))[:120]
+    if payload.get("agent_action_status"):
+        patch["agent_action_status"] = str(payload.get("agent_action_status"))[:240]
+    if isinstance(payload.get("agent_actions"), list):
+        safe_actions = []
+        for action in payload.get("agent_actions", [])[:10]:
+            if not isinstance(action, dict):
+                continue
+            safe_action = {
+                str(k)[:80]: (v if isinstance(v, (bool, int, float)) or v is None else str(v)[:500])
+                for k, v in action.items()
+                if str(k)
+            }
+            safe_actions.append(safe_action)
+        patch["agent_actions"] = safe_actions
+    if payload.get("wake_result"):
+        patch["wake_result"] = str(payload.get("wake_result"))[:120]
+    if payload.get("ai_state"):
+        ai_state = _normalize_proactive_state(payload.get("ai_state"), PROACTIVE_AI_STATES, "")
+        if ai_state:
+            patch["ai_state"] = ai_state
+    if payload.get("broadcast_state"):
+        broadcast_state = _normalize_proactive_state(payload.get("broadcast_state"), PROACTIVE_BROADCAST_STATES, "")
+        if broadcast_state:
+            patch["broadcast_state"] = broadcast_state
+    if isinstance(payload.get("request_broadcast"), dict):
+        req = payload.get("request_broadcast") or {}
+        try:
+            duration_sec = int(req.get("duration_sec") or 0)
+        except (TypeError, ValueError):
+            duration_sec = 0
+        patch["request_broadcast"] = {
+            "reason": str(req.get("reason") or "")[:500],
+            "duration_sec": max(0, min(duration_sec, 3600)),
+            "copy": str(req.get("copy") or req.get("message") or "")[:500],
+        }
     return patch
 
 

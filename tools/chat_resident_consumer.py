@@ -2320,24 +2320,49 @@ def claim_proactive_job(job_id: str) -> bool:
     return bool(body.get("claimed"))
 
 
-def update_proactive_job_status(job_id: str, status: str, reason: str = "") -> None:
+def update_proactive_job_status(
+    job_id: str,
+    status: str,
+    reason: str = "",
+    *,
+    extra: dict[str, Any] | None = None,
+) -> None:
     if not job_id:
         return
     url = f"{FEEDLING_API_URL}/v1/proactive/jobs/{job_id}/status"
     try:
+        body: dict[str, Any] = {
+            "status": status,
+            "reason": reason,
+            "consumer_id": CONSUMER_ID,
+        }
+        if isinstance(extra, dict):
+            body.update(extra)
         resp = httpx.post(
             url,
-            json={
-                "status": status,
-                "reason": reason,
-                "consumer_id": CONSUMER_ID,
-            },
+            json=body,
             headers=_HEADERS,
             timeout=10,
         )
         resp.raise_for_status()
     except Exception as e:
         log.warning("failed to update proactive job status id=%s status=%s error=%s", job_id, status, e)
+
+
+def update_proactive_state(**patch: Any) -> None:
+    clean = {k: v for k, v in patch.items() if v not in (None, "")}
+    if not clean:
+        return
+    try:
+        resp = httpx.post(
+            f"{FEEDLING_API_URL}/v1/proactive/state",
+            json=clean,
+            headers=_HEADERS,
+            timeout=10,
+        )
+        resp.raise_for_status()
+    except Exception as e:
+        log.warning("failed to update proactive state patch=%s error=%s", clean, e)
 
 
 def post_reply(
@@ -2578,30 +2603,121 @@ def _proactive_job_key(job: dict) -> str:
     return f"proactive:{job.get('ts', job.get('created_at', 'unknown'))}"
 
 
+def _proactive_action_type(action: dict) -> str:
+    return str(action.get("type") or action.get("action") or "").strip().lower()
+
+
+def _compact_action_for_status(action: dict) -> dict:
+    out: dict[str, Any] = {}
+    for key, value in action.items():
+        skey = str(key)[:80]
+        if not skey:
+            continue
+        if isinstance(value, (bool, int, float)) or value is None:
+            out[skey] = value
+        else:
+            out[skey] = str(value)[:500]
+    return out
+
+
+def _first_proactive_action(actions: list[dict], names: set[str]) -> dict | None:
+    for action in actions:
+        typ = _proactive_action_type(action)
+        short = typ.removeprefix("proactive.")
+        if typ in names or short in names:
+            return action
+    return None
+
+
+def _visible_broadcast_request_text(action: dict) -> str:
+    for key in ("copy", "message", "text", "content"):
+        value = str(action.get(key) or "").strip()
+        if value:
+            return value[:1200]
+    reason = str(action.get("reason") or "").strip()
+    if re.search(r"[\u4e00-\u9fff]", reason):
+        return "我现在看不到你的屏幕。如果你愿意，可以重新打开屏幕共享。"
+    return "I cannot see your screen right now. If you want, turn screen sharing back on."
+
+
+def _split_proactive_actions(actions: list[dict]) -> tuple[list[dict], list[dict]]:
+    proactive: list[dict] = []
+    memory_identity: list[dict] = []
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        typ = _proactive_action_type(action)
+        if typ.startswith("identity.") or typ.startswith("memory."):
+            memory_identity.append(action)
+        elif typ.startswith("proactive.") or typ in {"sleep", "set_ai_state", "request_broadcast"}:
+            proactive.append(action)
+        else:
+            log.warning("unsupported proactive wake action ignored type=%s", typ or "<missing>")
+    return proactive, memory_identity
+
+
 def _message_for_proactive_job(
     job: dict,
     screen_text: str = "",
     recent_chat_context: str = "",
 ) -> str:
-    context_hint = str(job.get("context_hint") or "").strip()
-    intent_label = str(job.get("intent_label") or "proactive_context").strip()
-    connections = job.get("connections")
-    if not isinstance(connections, list):
-        connections = []
-    connection_text = "\n".join(f"- {str(item).strip()}" for item in connections if str(item).strip())
+    try:
+        schema_version = int(job.get("schema_version") or 1)
+    except (TypeError, ValueError):
+        schema_version = 1
+    if schema_version < 2:
+        context_hint = str(job.get("context_hint") or "").strip()
+        intent_label = str(job.get("intent_label") or "proactive_context").strip()
+        connections = job.get("connections")
+        if not isinstance(connections, list):
+            connections = []
+        connection_text = "\n".join(f"- {str(item).strip()}" for item in connections if str(item).strip())
+
+        parts = [
+            "[Feedling proactive hidden job]",
+            "A legacy Feedling Gate decided this may be a good moment to reach out.",
+            "Write only the message the user should see, in your normal voice.",
+            "You may send 1-5 short chat bubbles if that feels more natural than one message.",
+            'For multiple bubbles, return JSON exactly like {"messages":["...","..."]}. Otherwise return plain text.',
+            f"intent: {intent_label}",
+        ]
+        if context_hint:
+            parts.append(f"context_hint:\n{context_hint}")
+        if connection_text:
+            parts.append(f"possible_connections:\n{connection_text}")
+        if recent_chat_context:
+            parts.append(
+                "recent_chat_context:\n"
+                f"{recent_chat_context}\n"
+                "Use this only for local continuity. Do not overfit or imitate these lines. "
+                "Your own runtime identity, memory, and normal voice remain the source of the reply."
+            )
+        if screen_text:
+            parts.append(screen_text)
+        return "\n\n".join(parts)
 
     parts = [
-        "[Feedling proactive hidden job]",
-        "A Feedling Gate decided this may be a good moment to reach out.",
-        "Write only the message the user should see, in your normal voice.",
-        "You may send 1-5 short chat bubbles if that feels more natural than one message.",
-        'For multiple bubbles, return JSON exactly like {"messages":["...","..."]}. Otherwise return plain text.',
-        f"intent: {intent_label}",
+        "[Feedling proactive wake]",
+        "This is not a request to speak. It is one opportunity to notice the user from your own companion identity.",
+        "The platform did not judge this moment and did not require a memory match. You decide what to do.",
+        "Do not mention this hidden wake, job metadata, or system wording to the user.",
+        "If you speak, use your normal voice. You may send 1-5 short chat bubbles.",
+        "If you should stay quiet, return JSON: {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}],\"messages\":[]}",
+        "If you need the user to turn screen sharing back on, return JSON: {\"actions\":[{\"type\":\"proactive.request_broadcast\",\"reason\":\"...\",\"copy\":\"...\"}],\"messages\":[]}",
+        "If your presence state changed, include an action like {\"type\":\"proactive.set_ai_state\",\"state\":\"curious\"}.",
+        "For visible replies, return JSON exactly like {\"messages\":[\"...\",\"...\"]}. Plain text is also accepted for a single message.",
+        (
+            "wake_metadata:\n"
+            f"- wake_id: {str(job.get('wake_id') or job.get('gate_decision_id') or '')}\n"
+            f"- trigger: {str(job.get('trigger') or 'wake')}\n"
+            f"- manual: {bool(job.get('manual', False))}\n"
+            f"- forced: {bool(job.get('forced', False))}\n"
+            f"- user_state: {str(job.get('user_state') or 'default')}\n"
+            f"- ai_state: {str(job.get('ai_state') or 'present')}\n"
+            f"- broadcast_state: {str(job.get('broadcast_state') or 'unknown')}\n"
+            f"- current_app: {str(job.get('current_app') or 'unknown')}"
+        ),
     ]
-    if context_hint:
-        parts.append(f"context_hint:\n{context_hint}")
-    if connection_text:
-        parts.append(f"possible_connections:\n{connection_text}")
     if recent_chat_context:
         parts.append(
             "recent_chat_context:\n"
@@ -2670,8 +2786,82 @@ def _process_proactive_jobs(jobs: list) -> float:
 
         turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
         actions, replies = turn.actions, turn.messages
-        if actions:
-            log.warning("ignoring %d identity action(s) from proactive job id=%s", len(actions), job_id)
+        proactive_actions, memory_identity_actions = _split_proactive_actions(actions)
+        status_actions = [_compact_action_for_status(a) for a in proactive_actions]
+        if memory_identity_actions:
+            try:
+                result = execute_agent_actions(memory_identity_actions)
+                log.info(
+                    "proactive memory/identity actions applied id=%s effects=%d",
+                    job_id,
+                    len(result.get("effects") or []),
+                )
+            except Exception as e:
+                log.warning("proactive memory/identity actions failed id=%s error=%s", job_id, e)
+
+        set_ai_state = _first_proactive_action(proactive_actions, {"set_ai_state"})
+        if set_ai_state:
+            ai_state = str(set_ai_state.get("state") or set_ai_state.get("ai_state") or "").strip().lower()
+            if ai_state:
+                update_proactive_state(ai_state=ai_state)
+                update_proactive_job_status(
+                    job_id,
+                    "realizing",
+                    "agent_set_ai_state",
+                    extra={
+                        "agent_action": "set_ai_state",
+                        "agent_action_status": ai_state,
+                        "agent_actions": status_actions,
+                        "ai_state": ai_state,
+                    },
+                )
+
+        request_broadcast = _first_proactive_action(proactive_actions, {"request_broadcast"})
+        if request_broadcast and not replies:
+            replies = [_visible_broadcast_request_text(request_broadcast)]
+            update_proactive_job_status(
+                job_id,
+                "realizing",
+                "agent_request_broadcast",
+                extra={
+                    "agent_action": "request_broadcast",
+                    "agent_action_status": str(request_broadcast.get("reason") or "")[:240],
+                    "agent_actions": status_actions,
+                    "request_broadcast": request_broadcast,
+                },
+            )
+
+        sleep_action = _first_proactive_action(proactive_actions, {"sleep"})
+        if sleep_action and not replies:
+            update_proactive_job_status(
+                job_id,
+                "completed",
+                str(sleep_action.get("reason") or "agent_sleep"),
+                extra={
+                    "agent_action": "sleep",
+                    "agent_action_status": str(sleep_action.get("reason") or "agent_sleep")[:240],
+                    "agent_actions": status_actions,
+                    "wake_result": "sleep",
+                },
+            )
+            log.info("proactive wake slept id=%s reason=%s", job_id, sleep_action.get("reason") or "")
+            continue
+
+        if set_ai_state and not replies:
+            state_label = str(set_ai_state.get("state") or set_ai_state.get("ai_state") or "updated").strip()
+            update_proactive_job_status(
+                job_id,
+                "completed",
+                f"agent_set_ai_state:{state_label}",
+                extra={
+                    "agent_action": "set_ai_state",
+                    "agent_action_status": state_label[:240],
+                    "agent_actions": status_actions,
+                    "wake_result": "state_only",
+                },
+            )
+            log.info("proactive wake updated ai_state without reply id=%s state=%s", job_id, state_label)
+            continue
 
         posted_any = False
         last_error = ""
@@ -2693,10 +2883,19 @@ def _process_proactive_jobs(jobs: list) -> float:
                     raise RuntimeError(str(result)[:500])
                 posted_any = True
                 if isinstance(result, dict):
+                    extra = {
+                        "wake_result": "posted",
+                    }
+                    if status_actions:
+                        extra["agent_actions"] = status_actions
+                    if request_broadcast:
+                        extra["agent_action"] = "request_broadcast"
+                        extra["request_broadcast"] = request_broadcast
                     update_proactive_job_status(
                         job_id,
                         "posted",
                         f"chat_message_id={result.get('id', '')}",
+                        extra=extra,
                     )
                 log.info("proactive reply sent: %s", reply[:80])
             except Exception as e:
