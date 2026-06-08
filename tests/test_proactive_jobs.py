@@ -557,7 +557,7 @@ def test_auto_proactive_v2_wake_does_not_require_gate_model(tmp_path, monkeypatc
     assert body["decision"]["gate_input"]["llm_called"] is False
 
 
-def test_auto_proactive_v2_wake_records_job_without_frames(tmp_path, monkeypatch):
+def test_auto_proactive_v2_wake_suppresses_job_without_frames(tmp_path, monkeypatch):
     monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
@@ -570,12 +570,64 @@ def test_auto_proactive_v2_wake_records_job_without_frames(tmp_path, monkeypatch
 
     assert resp.status_code == 200
     body = resp.get_json()
-    assert body["enqueued"] is True
-    assert body["decision"]["should_reach_out"] is True
-    assert body["decision"]["reason"] == "wake_created"
+    assert body["enqueued"] is False
+    assert body["job"] is None
+    assert body["decision"]["should_reach_out"] is False
+    assert body["decision"]["should_wake_agent"] is False
+    assert body["decision"]["reason"] == "no_recent_frames"
     assert body["decision"]["trigger"] == "heartbeat_no_frame"
     assert body["decision"]["frame_ids"] == []
     assert body["decision"]["gate_input"]["llm_called"] is False
+
+
+def test_auto_proactive_v2_schedule_heartbeats_need_current_signal(tmp_path, monkeypatch):
+    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_proactive_auto_schedule_key"
+    user_id = "usr_endpoint_proactive_auto_schedule"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    off = client.post(
+        "/v1/proactive/tick",
+        headers=headers,
+        json={"trigger": "heartbeat_broadcast_off", "broadcast_state": "off"},
+    )
+    assert off.status_code == 200
+    off_body = off.get_json()
+    assert off_body["enqueued"] is False
+    assert off_body["decision"]["reason"] == "heartbeat_broadcast_off"
+
+    opened_without_frame = client.post(
+        "/v1/proactive/tick",
+        headers=headers,
+        json={"trigger": "broadcast_opened", "broadcast_state": "on"},
+    )
+    assert opened_without_frame.status_code == 200
+    opened_body = opened_without_frame.get_json()
+    assert opened_body["enqueued"] is False
+    assert opened_body["decision"]["reason"] == "no_recent_frames"
+
+    store = appmod.get_store(user_id)
+    store.frames_meta.append({
+        "id": "frameon123456789",
+        "filename": "frameon123456789.env.json",
+        "ts": appmod.time.time(),
+        "encrypted": True,
+    })
+    on_with_frame = client.post(
+        "/v1/proactive/tick",
+        headers=headers,
+        json={"trigger": "heartbeat_broadcast_on", "broadcast_state": "on"},
+    )
+    assert on_with_frame.status_code == 200
+    on_body = on_with_frame.get_json()
+    assert on_body["enqueued"] is True
+    assert on_body["decision"]["reason"] == "wake_created"
+    assert on_body["job"]["frame_ids"] == ["frameon123456789"]
 
 
 def test_auto_proactive_v2_away_suppresses_automatic_but_manual_bypasses(tmp_path, monkeypatch):

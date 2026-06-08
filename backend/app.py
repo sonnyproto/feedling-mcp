@@ -2233,6 +2233,25 @@ def _proactive_trigger(payload: dict, *, manual: bool, frames: list[dict]) -> st
     return "screen_tick" if frames else "heartbeat_no_frame"
 
 
+def _proactive_v2_auto_wake_block_reason(trigger: str, *, broadcast_state: str, frame_ids: list[str]) -> str:
+    """Mechanical suppression for automatic V2 wakes that lack a current signal."""
+    normalized_trigger = str(trigger or "").strip().lower()
+    normalized_broadcast = str(broadcast_state or "").strip().lower()
+    has_frames = bool(frame_ids)
+
+    if normalized_trigger in {"heartbeat_unknown", "heartbeat_no_frame"}:
+        return "no_recent_frames"
+    if normalized_trigger in {"heartbeat_broadcast_off", "heartbeat_broadcast_paused"}:
+        return normalized_trigger
+    if normalized_trigger == "heartbeat_broadcast_on" and not has_frames:
+        return "no_recent_frames"
+    if normalized_trigger == "broadcast_opened" and not has_frames:
+        return "no_recent_frames"
+    if normalized_broadcast in {"off", "paused"} and normalized_trigger.startswith("heartbeat"):
+        return f"broadcast_{normalized_broadcast}"
+    return ""
+
+
 def _latest_payload_state_from_events(store: UserStore, key: str, allowed: set[str]) -> str:
     for event in reversed(store.list_device_events(since_epoch=max(0.0, time.time() - 86400), limit=200)):
         payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
@@ -2306,6 +2325,12 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
         block_reason = "dnd_enabled"
     elif user_state == "away" and not manual:
         block_reason = "user_away"
+    elif not manual:
+        block_reason = _proactive_v2_auto_wake_block_reason(
+            trigger,
+            broadcast_state=broadcast_state,
+            frame_ids=frame_ids,
+        )
 
     current_app = str(payload.get("current_app") or "").strip()
     if not current_app:
