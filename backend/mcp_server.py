@@ -1820,6 +1820,112 @@ def chat_verify_loop(timeout_sec: int = 30, ctx: Context = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Extended Perception — thin pass-throughs to /v1/perception/* (backend module)
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool(
+    name="feedling_context_snapshot",
+    description=(
+        "Get the user's current coarse context in ONE call: place_label, "
+        "wifi_label, app_category, motion_state, device signals (battery / "
+        "silent / last unlock), user_state, and any authorized Tier-2 fields. "
+        "A field that is null means that capability is OFF or its data is stale "
+        "— treat null as 'not permitted, do NOT infer or pretend to sense it.' "
+        "These fields are also attached to every wake, so call this only when "
+        "you need a fresh pull mid-turn."
+    ),
+)
+def context_snapshot(ctx: Context = None) -> dict:
+    return _get("/v1/perception/snapshot", ctx=ctx)
+
+
+@mcp.tool(
+    name="feedling_perception_photos_recent",
+    description=(
+        "List metadata for the user's recent photos the platform deemed "
+        "shareable (faces present, place label, time of day, burst). NO pixels "
+        "— this is step one of the two-step look. Most photos do not need a "
+        "comment; private/document/ID photos are filtered out before they reach "
+        "you. Pull content with feedling_perception_photo_content only if a "
+        "photo looks like a genuine share-able moment."
+    ),
+)
+def perception_photos_recent(limit: int = 20, ctx: Context = None) -> dict:
+    return _get("/v1/perception/photos", {"limit": max(1, min(limit, 100))}, ctx=ctx)
+
+
+@mcp.tool(
+    name="feedling_perception_photo_content",
+    description=(
+        "Step two of the two-step look: fetch the actual pixels for one photo "
+        "id from feedling_perception_photos_recent. The photo is decrypted by "
+        "the enclave (same channel as screen frames); the backend never sees "
+        "pixels. Use sparingly — at most a few share-able moments a day."
+    ),
+)
+def perception_photo_content(photo_id: str, ctx: Context = None) -> dict:
+    # 1. Permission + status gate (and resolve the frame_id) via the backend.
+    meta = _get(f"/v1/perception/photo/{photo_id}/content", ctx=ctx)
+    if not isinstance(meta, dict) or meta.get("error"):
+        return meta
+    frame_id = meta.get("frame_id") or photo_id
+    # 2. Decrypt pixels through the enclave's existing frame-decrypt path.
+    decrypted = _get_decrypted(
+        f"/v1/screen/frames/{frame_id}/decrypt", {"include_image": "true"}, ctx=ctx
+    )
+    return {"metadata": meta.get("metadata"), "content": decrypted}
+
+
+@mcp.tool(
+    name="feedling_perception_calendar",
+    description=(
+        "The user's next calendar event as metadata (how soon, physical vs "
+        "virtual, attendee count, etc.). Titles may be sensitive — don't assume "
+        "you should reference a title; ask her instead. Returns null when nothing "
+        "is upcoming or the calendar capability is off."
+    ),
+)
+def perception_calendar(ctx: Context = None) -> dict:
+    # calendar_next_event is reported via /report and surfaced in the snapshot.
+    snap = _get("/v1/perception/snapshot", ctx=ctx)
+    if isinstance(snap, dict) and not snap.get("error"):
+        return {"calendar_next_event": snap.get("calendar_next_event")}
+    return snap
+
+
+@mcp.tool(
+    name="feedling_perception_health",
+    description=(
+        "Aggregated HealthKit summaries for one category: 'sleep', 'workout', "
+        "or 'vitals'. Companion tone, never clinical — 'slept short last night' "
+        "is fine, diagnosing trends is not. Each category is a separate opt-in; "
+        "an unauthorized category returns 'unauthorized'."
+    ),
+)
+def perception_health(category: str, limit: int = 10, ctx: Context = None) -> dict:
+    kind = {"sleep": "sleep", "workout": "workout", "vitals": "vitals"}.get(
+        (category or "").strip().lower()
+    )
+    if not kind:
+        return {"error": "category must be one of: sleep, workout, vitals"}
+    return _get(f"/v1/perception/items/{kind}", {"limit": max(1, min(limit, 50))}, ctx=ctx)
+
+
+@mcp.tool(
+    name="feedling_perception_app_usage",
+    description=(
+        "Recent app-usage history — when the user opened which apps (reported by "
+        "their iOS Shortcut). Useful for spotting patterns ('on Twitter for a "
+        "while') — the CURRENT app is already in feedling_context_snapshot, so "
+        "use this only when you need the timeline."
+    ),
+)
+def perception_app_usage(limit: int = 50, ctx: Context = None) -> dict:
+    return _get("/v1/perception/app_usage", {"limit": max(1, min(limit, 200))}, ctx=ctx)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

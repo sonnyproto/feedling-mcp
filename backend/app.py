@@ -3183,6 +3183,12 @@ def _access_log_end(response):
 # via compression is a 3-5x latency win for "show me the screen" calls.
 Compress(app)
 
+# Extended Perception — self-contained feature module (backend/perception/).
+# Mounts the /v1/perception/* blueprint; all its logic lives in that package.
+from perception import register as register_perception  # noqa: E402
+from perception import snapshot_for_wake as _perception_wake_snapshot  # noqa: E402
+register_perception(app)
+
 # ---------------------------------------------------------------------------
 # APNs config (global — one Apple dev key for the app)
 # ---------------------------------------------------------------------------
@@ -8488,6 +8494,10 @@ def _model_api_context_messages(
         "screen_context": screen_context,
         "screen_image_attached": bool(screen_images),
         "pending_state_updates": pending_state_updates,
+        # Extended Perception: coarse, permission-gated current state (place
+        # label, motion, battery, user_state, …). null fields = unauthorized or
+        # stale; agent must not infer from null. See backend/perception/.
+        "perception": _perception_wake_snapshot(store.user_id),
         "context_errors": {
             "history": hist_err,
             "identity": identity_err,
