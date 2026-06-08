@@ -20,8 +20,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-buildx-action@v3
-
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -54,8 +52,6 @@ jobs:
           build-args: |
             FEEDLING_GIT_COMMIT=${{ steps.meta.outputs.git_commit }}
             FEEDLING_BUILT_AT=${{ steps.meta.outputs.built_at }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Capture image digest
         run: |
