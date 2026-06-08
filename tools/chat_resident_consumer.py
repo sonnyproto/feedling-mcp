@@ -54,7 +54,9 @@ Optional:
                         Default true. Periodically ask Feedling Gate to inspect
                         recent screen context and enqueue hidden jobs when true.
   PROACTIVE_TICK_INTERVAL_SEC
-                        Gate tick interval in seconds (default: 300)
+                        Broadcast-on/unknown tick interval in seconds (default: 300)
+  PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC
+                        Broadcast-off tick interval in seconds (default: 1800)
   PROACTIVE_TICK_START_DELAY_SEC
                         Delay before the first automatic Gate tick (default: 15)
   SEND_FALLBACK_ON_AGENT_ERROR
@@ -189,6 +191,12 @@ PROACTIVE_POLL_ENABLED = _env_bool("PROACTIVE_POLL_ENABLED", True)
 PROACTIVE_POLL_TIMEOUT = int(os.environ.get("PROACTIVE_POLL_TIMEOUT", "1"))
 PROACTIVE_TICK_ENABLED = _env_bool("PROACTIVE_TICK_ENABLED", True)
 PROACTIVE_TICK_INTERVAL_SEC = int(os.environ.get("PROACTIVE_TICK_INTERVAL_SEC", "300"))
+PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC = int(
+    os.environ.get("PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC", str(PROACTIVE_TICK_INTERVAL_SEC))
+)
+PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC = int(
+    os.environ.get("PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", "1800")
+)
 PROACTIVE_TICK_START_DELAY_SEC = int(os.environ.get("PROACTIVE_TICK_START_DELAY_SEC", "15"))
 PROACTIVE_MAX_REPLY_MESSAGES = int(os.environ.get("PROACTIVE_MAX_REPLY_MESSAGES", "5"))
 PROACTIVE_RECENT_CHAT_LIMIT = int(os.environ.get("PROACTIVE_RECENT_CHAT_LIMIT", "20"))
@@ -2298,9 +2306,27 @@ def poll_proactive_jobs(since: float) -> dict:
     return resp.json()
 
 
-def post_proactive_tick() -> dict:
+def _proactive_tick_trigger_for_broadcast_state(broadcast_state: str) -> str:
+    state = str(broadcast_state or "").strip().lower()
+    if state == "off":
+        return "heartbeat_broadcast_off"
+    if state in {"on", "broadcasting"}:
+        return "heartbeat_broadcast_on"
+    if state == "paused":
+        return "heartbeat_broadcast_paused"
+    return "heartbeat_unknown"
+
+
+def _proactive_tick_interval_for_broadcast_state(broadcast_state: str) -> int:
+    state = str(broadcast_state or "").strip().lower()
+    if state == "off":
+        return max(60, PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC)
+    return max(30, PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC)
+
+
+def post_proactive_tick(payload: dict[str, Any] | None = None) -> dict:
     url = f"{FEEDLING_API_URL}/v1/proactive/tick"
-    resp = httpx.post(url, json={}, headers=_HEADERS, timeout=30)
+    resp = httpx.post(url, json=payload or {}, headers=_HEADERS, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
@@ -3137,16 +3163,18 @@ def run() -> None:
         # replayed after an operator installs the consumer.
         last_job_ts = time.time()
         _save_proactive_checkpoint(last_job_ts)
+    last_broadcast_state = ""
     next_proactive_tick_mono = time.monotonic() + max(0, PROACTIVE_TICK_START_DELAY_SEC)
 
     log.info(
-        "starting poll loop — last_ts=%.3f last_job_ts=%.3f poll_timeout=%ds proactive=%s proactive_tick=%s tick_interval=%ds",
+        "starting poll loop — last_ts=%.3f last_job_ts=%.3f poll_timeout=%ds proactive=%s proactive_tick=%s tick_on=%ds tick_off=%ds",
         last_ts,
         last_job_ts,
         POLL_TIMEOUT,
         proactive_enabled,
         PROACTIVE_TICK_ENABLED,
-        PROACTIVE_TICK_INTERVAL_SEC,
+        PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC,
+        PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC,
     )
 
     consecutive_errors = 0
@@ -3156,16 +3184,27 @@ def run() -> None:
             if proactive_enabled:
                 try:
                     if PROACTIVE_TICK_ENABLED and time.monotonic() >= next_proactive_tick_mono:
-                        tick = post_proactive_tick()
+                        tick_payload = {
+                            "trigger": _proactive_tick_trigger_for_broadcast_state(last_broadcast_state),
+                        }
+                        if last_broadcast_state:
+                            tick_payload["broadcast_state"] = last_broadcast_state
+                        tick = post_proactive_tick(tick_payload)
                         decision = tick.get("decision") or {}
+                        last_broadcast_state = str(
+                            decision.get("broadcast_state") or last_broadcast_state or ""
+                        ).strip().lower()
+                        next_interval = _proactive_tick_interval_for_broadcast_state(last_broadcast_state)
                         log.info(
-                            "proactive gate tick gate=%s reason=%s enqueued=%s frames=%d",
+                            "proactive gate tick gate=%s reason=%s enqueued=%s frames=%d broadcast=%s next=%ds",
                             bool(decision.get("should_reach_out")),
                             decision.get("reason"),
                             bool(tick.get("enqueued")),
                             len(decision.get("frame_ids") or []),
+                            last_broadcast_state or "unknown",
+                            next_interval,
                         )
-                        next_proactive_tick_mono = time.monotonic() + max(30, PROACTIVE_TICK_INTERVAL_SEC)
+                        next_proactive_tick_mono = time.monotonic() + next_interval
                     job_result = poll_proactive_jobs(last_job_ts)
                     jobs = job_result.get("jobs") or []
                     if jobs:

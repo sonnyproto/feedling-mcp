@@ -1616,6 +1616,18 @@ def test_recent_chat_context_defaults_to_twenty_messages(monkeypatch):
     assert "用户消息 24" in context
 
 
+def test_proactive_tick_cadence_follows_broadcast_state(monkeypatch):
+    monkeypatch.setattr(crc, "PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC", 300)
+    monkeypatch.setattr(crc, "PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", 1800)
+
+    assert crc._proactive_tick_trigger_for_broadcast_state("off") == "heartbeat_broadcast_off"
+    assert crc._proactive_tick_interval_for_broadcast_state("off") == 1800
+    assert crc._proactive_tick_trigger_for_broadcast_state("on") == "heartbeat_broadcast_on"
+    assert crc._proactive_tick_interval_for_broadcast_state("on") == 300
+    assert crc._proactive_tick_trigger_for_broadcast_state("") == "heartbeat_unknown"
+    assert crc._proactive_tick_interval_for_broadcast_state("") == 300
+
+
 def test_post_proactive_reply_triggers_alert_and_live_activity(monkeypatch):
     captured = {}
 
