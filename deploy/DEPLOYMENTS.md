@@ -36,13 +36,13 @@ retirement when keeping the exact value no longer helps verification.
 | App ID | `bb9716955423faed3508888e7c654ff46f5f0c2d` |
 | Created | 2026-06-09, instance `tdx.small` |
 | Compose | `deploy/docker-compose.phala.test.yaml` — same 4 services as prod, with test domains + `_test` volumes |
-| Public API | `https://test-api.feedling.app` (via dstack-ingress — pending; see note) |
-| Public MCP | `https://test-mcp.feedling.app/sse?key=<api_key>` (via dstack-ingress — pending; see note) |
+| Public API | `https://test-api.feedling.app` (via dstack-ingress — live, `/healthz` 200) |
+| Public MCP | `https://test-mcp.feedling.app/sse?key=<api_key>` (via dstack-ingress — live, SSE 200) |
 | Database | Dedicated test RDS `feedling-mcp-test-t4g-micro.cgh0oucoe0x9.us-east-1.rds.amazonaws.com:5432/postgres` — fully isolated from prod (separate instance → separate `enclave_content_pk` self-consistent, no shared schema). Injected via `TEST_DATABASE_URL`. |
-| On-chain | **Separate** Sepolia contract to keep the prod release log clean. Deploy via the `deploy-test-contract.yml` workflow, then set repo var `TEST_FEEDLING_APP_AUTH_CONTRACT`. **Pending** as of 2026-06-09. |
+| On-chain | **Separate** Sepolia FeedlingAppAuth `0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5` (owner = the `ETH_DEPLOYER_KEY` address `0xa0eBcd26…`, so the CI `addComposeHash` is authorized), kept apart from prod's contract so the prod release log stays clean. Address lives in repo var `TEST_FEEDLING_APP_AUTH_CONTRACT`. Each `deploy-test-cvm` run publishes the live compose_hash here, fail-loud, same as prod. Deployed 2026-06-09 via a one-shot `workflow_dispatch` (since removed). |
 | Deploy path | GitHub Actions `deploy-test-cvm` job (in `ci.yml`) on push to the `test` branch. Mirrors prod but targets the test compose / CVM / DB / contract and is branch-gated to `refs/heads/test`. |
-| First-boot note | The CVM was created 2026-06-09 WITHOUT a CF token (to mint the app_id quickly), so `dstack-ingress` could not yet issue the `test-*.feedling.app` LE certs. The first `test`-branch CI deploy injects `CF_*` from GitHub secrets and brings the custom domains up. |
-| iOS | The iOS app source is not in this repo. Point its test build at app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` + gateway `dstack-pha-prod9.phala.network` + the test contract address once deployed. |
+| First-boot note | The CVM was first created 2026-06-09 WITHOUT a CF token (to mint the app_id quickly), so `dstack-ingress` couldn't issue the `test-*.feedling.app` LE certs initially. The `test`-branch CI deploy injects `CF_*` from GitHub secrets — domains + certs are now live. Backend also needed the test RDS reachable from the CVM (Publicly accessible + SG inbound 5432) before it stopped crash-looping. |
+| iOS | The iOS app source is not in this repo. Point its test build at app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` + gateway `dstack-pha-prod9.phala.network` + test contract `0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5`. |
 
 ### Retired VPS (historical, redacted)
 
