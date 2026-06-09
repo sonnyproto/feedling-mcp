@@ -2,7 +2,7 @@ name: Publish container image
 
 on:
   push:
-    branches: [main]
+    branches: [main, test]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -34,7 +34,12 @@ jobs:
           # lowercase owner to satisfy ghcr's naming rules
           IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
           echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-          echo "tags=$IMAGE:$COMMIT_SHORT,$IMAGE:latest" >> "$GITHUB_OUTPUT"
+          # :latest only tracks main; test (and other branches) only get :<sha>
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            echo "tags=$IMAGE:$COMMIT_SHORT,$IMAGE:latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "tags=$IMAGE:$COMMIT_SHORT" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Derive release metadata
         id: meta

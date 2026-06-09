@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, test]
   pull_request:
-    branches: [main]
+    branches: [main, test]
   workflow_dispatch:
 
 # Cancel in-progress runs on the same ref — latest push wins.
@@ -208,6 +208,28 @@ jobs:
               - 'deploy/publish-compose-hash.sh'
               - '.github/workflows/ci.yml'
 
+  detect-cvm-changes-test:
+    name: detect CVM changes (test)
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    outputs:
+      cvm: ${{ steps.filter.outputs.cvm }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            cvm:
+              - 'backend/**'
+              - 'tools/chat_resident_consumer.py'
+              - 'deploy/Dockerfile'
+              - 'deploy/docker-compose.phala.test.yaml'
+              - 'deploy/publish-compose-hash.sh'
+              - '.github/workflows/ci.yml'
+
   # =========================================================================
   # DEPLOY — CVM (compose_hash on-chain + phala deploy)
   #
@@ -371,6 +393,145 @@ jobs:
           FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
           PHALA_CLOUD_API_KEY:        ${{ secrets.PHALA_CLOUD_API_KEY }}
           FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.yaml
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyyaml
+          publish_status=1
+          for attempt in 1 2 3; do
+            if ./deploy/publish-compose-hash.sh eth_sepolia; then
+              publish_status=0
+              break
+            fi
+            publish_status=$?
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::compose_hash publish failed with exit $publish_status; retrying in 20s"
+              sleep 20
+            fi
+          done
+          exit "$publish_status"
+
+  deploy-test-cvm:
+    name: deploy CVM (test)
+    needs: [forge-test, python-tests, docker-build, lint, dcap-python, detect-cvm-changes-test]
+    if: |
+      github.ref == 'refs/heads/test' &&
+      github.event_name == 'push' &&
+      needs.detect-cvm-changes-test.outputs.cvm == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: read
+    concurrency:
+      group: deploy-test-cvm
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Wait for ghcr.io image :<sha>
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
+          echo "waiting for ${IMAGE}:$SHA_SHORT"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          for i in $(seq 1 60); do
+            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1; then
+              echo "image :$SHA_SHORT available"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::image :$SHA_SHORT did not appear in 10 min — docker-publish.yml likely failed"
+          exit 1
+
+      - name: Pin image tag in deploy/docker-compose.phala.test.yaml
+        id: pin
+        env:
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          TRIGGER_SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          git fetch origin test
+          git reset --hard origin/test
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
+          sed -i -E "s|ghcr\.io/[^/]+/feedling:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
+            deploy/docker-compose.phala.test.yaml
+          if git diff --quiet -- deploy/docker-compose.phala.test.yaml; then
+            echo "tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
+          else
+            git config user.name  'feedling-ci'
+            git config user.email 'ci@feedling.app'
+            git add deploy/docker-compose.phala.test.yaml
+            git commit -m "deploy(test): bump CVM image to :$TRIGGER_SHA_SHORT [skip ci]"
+            git push origin HEAD:test
+          fi
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install phala CLI
+        run: npm install -g phala
+
+      - name: Resolve CVM_ID
+        id: cvmid
+        run: |
+          CVM_ID=$(tr -d '[:space:]' < deploy/test-cvm-id.txt)
+          if [ -z "$CVM_ID" ]; then
+            echo "::error::deploy/test-cvm-id.txt is empty — cannot target a CVM"
+            exit 1
+          fi
+          echo "cvm_id=$CVM_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy CVM via phala
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+          CF_ZONE_ID:          ${{ secrets.CF_ZONE_ID }}
+          CF_API_TOKEN:        ${{ secrets.CF_API_TOKEN }}
+          APNS_KEY_P8_B64:     ${{ secrets.APNS_KEY_P8_B64 }}
+          APNS_KEY_ID:         ${{ secrets.APNS_KEY_ID }}
+          APNS_TEAM_ID:        ${{ secrets.APNS_TEAM_ID }}
+          OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
+          FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+          DATABASE_URL:        ${{ secrets.TEST_DATABASE_URL }}
+          CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
+        run: |
+          echo ">>> deploy-test-cvm target: $CVM_ID"
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::TEST_DATABASE_URL secret is not set — backend has no datastore"
+            exit 1
+          fi
+          phala deploy \
+            --api-token "$PHALA_CLOUD_API_KEY" \
+            --cvm-id "$CVM_ID" \
+            -c deploy/docker-compose.phala.test.yaml \
+            -e "CF_ZONE_ID=$CF_ZONE_ID" \
+            -e "CF_API_TOKEN=$CF_API_TOKEN" \
+            -e "APNS_KEY_P8_B64=$APNS_KEY_P8_B64" \
+            -e "APNS_KEY_ID=$APNS_KEY_ID" \
+            -e "APNS_TEAM_ID=$APNS_TEAM_ID" \
+            -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
+            -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
+            -e "DATABASE_URL=$DATABASE_URL" \
+            --wait
+
+      - name: Publish live compose_hash on Sepolia (test contract)
+        env:
+          PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
+          ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
+          FEEDLING_APP_AUTH_CONTRACT: ${{ vars.TEST_FEEDLING_APP_AUTH_CONTRACT }}
+          FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
+          PHALA_CLOUD_API_KEY:        ${{ secrets.PHALA_CLOUD_API_KEY }}
+          FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.test.yaml
         run: |
           python3 -m pip install --upgrade pip
           python3 -m pip install pyyaml

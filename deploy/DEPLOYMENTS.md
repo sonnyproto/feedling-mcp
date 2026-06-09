@@ -27,6 +27,23 @@ retirement when keeping the exact value no longer helps verification.
 | MCP pubkey pin | Retired in prod9 architecture: `mcp_tls_cert_pubkey_fingerprint_hex` is empty by design; content-layer envelopes sealed to `enclave_content_pk` are the privacy boundary. |
 | Deploy path | GitHub Actions `deploy-cvm` pins the GHCR image tag, deploys this CVM via Phala, then publishes the live dstack-computed compose hash on Sepolia. |
 
+### Test CVM (prod9, `test` branch)
+
+| | |
+|---|---|
+| Provider | Phala Cloud dstack on prod9 (`dstack-pha-prod9.phala.network`, node id `18`) |
+| CVM ID | `19b13ebe-d12e-4d19-97d1-6cf41389b663` (also in `deploy/test-cvm-id.txt`) |
+| App ID | `bb9716955423faed3508888e7c654ff46f5f0c2d` |
+| Created | 2026-06-09, instance `tdx.small` |
+| Compose | `deploy/docker-compose.phala.test.yaml` — same 4 services as prod, with test domains + `_test` volumes |
+| Public API | `https://test-api.feedling.app` (via dstack-ingress — pending; see note) |
+| Public MCP | `https://test-mcp.feedling.app/sse?key=<api_key>` (via dstack-ingress — pending; see note) |
+| Database | Dedicated test RDS `feedling-mcp-test-t4g-micro.cgh0oucoe0x9.us-east-1.rds.amazonaws.com:5432/postgres` — fully isolated from prod (separate instance → separate `enclave_content_pk` self-consistent, no shared schema). Injected via `TEST_DATABASE_URL`. |
+| On-chain | **Separate** Sepolia contract to keep the prod release log clean. Deploy via the `deploy-test-contract.yml` workflow, then set repo var `TEST_FEEDLING_APP_AUTH_CONTRACT`. **Pending** as of 2026-06-09. |
+| Deploy path | GitHub Actions `deploy-test-cvm` job (in `ci.yml`) on push to the `test` branch. Mirrors prod but targets the test compose / CVM / DB / contract and is branch-gated to `refs/heads/test`. |
+| First-boot note | The CVM was created 2026-06-09 WITHOUT a CF token (to mint the app_id quickly), so `dstack-ingress` could not yet issue the `test-*.feedling.app` LE certs. The first `test`-branch CI deploy injects `CF_*` from GitHub secrets and brings the custom domains up. |
+| iOS | The iOS app source is not in this repo. Point its test build at app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` + gateway `dstack-pha-prod9.phala.network` + the test contract address once deployed. |
+
 ### Retired VPS (historical, redacted)
 
 | | |
