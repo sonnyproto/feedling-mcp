@@ -402,9 +402,12 @@ jobs:
               publish_status=0
               break
             fi
-            publish_status=$?
+            # Do NOT capture `publish_status=$?` here: a failed `if cmd; then …; fi`
+            # with no else makes the whole `if` statement exit 0, so $? reads 0 and
+            # the step false-greens even when the publish reverted. Leave
+            # publish_status=1 until an attempt actually succeeds above.
             if [ "$attempt" -lt 3 ]; then
-              echo "::warning::compose_hash publish failed with exit $publish_status; retrying in 20s"
+              echo "::warning::compose_hash publish failed (attempt $attempt/3); retrying in 20s"
               sleep 20
             fi
           done
@@ -541,9 +544,12 @@ jobs:
               publish_status=0
               break
             fi
-            publish_status=$?
+            # Do NOT capture `publish_status=$?` here: a failed `if cmd; then …; fi`
+            # with no else makes the whole `if` statement exit 0, so $? reads 0 and
+            # the step false-greens even when the publish reverted. Leave
+            # publish_status=1 until an attempt actually succeeds above.
             if [ "$attempt" -lt 3 ]; then
-              echo "::warning::compose_hash publish failed with exit $publish_status; retrying in 20s"
+              echo "::warning::compose_hash publish failed (attempt $attempt/3); retrying in 20s"
               sleep 20
             fi
           done
