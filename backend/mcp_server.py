@@ -1829,11 +1829,12 @@ def chat_verify_loop(timeout_sec: int = 30, ctx: Context = None) -> dict:
     description=(
         "Get the user's current coarse context in ONE call: place_label, "
         "wifi_label, app_category, motion_state, device signals (battery / "
-        "silent / last unlock), user_state, and any authorized Tier-2 fields. "
-        "A field that is null means that capability is OFF or its data is stale "
-        "— treat null as 'not permitted, do NOT infer or pretend to sense it.' "
-        "These fields are also attached to every wake, so call this only when "
-        "you need a fresh pull mid-turn."
+        "silent / last unlock), user_state, calendar_next_event, recent_apps "
+        "(the user's last few app opens), and any Tier-2 fields. "
+        "A field that is null means that data is OFF or stale — treat null as "
+        "'not sensed, do NOT infer or pretend to sense it.' These fields are also "
+        "attached to every wake, so call this only when you need a fresh pull "
+        "mid-turn."
     ),
 )
 def context_snapshot(ctx: Context = None) -> dict:
@@ -1878,23 +1879,6 @@ def perception_photo_content(photo_id: str, ctx: Context = None) -> dict:
 
 
 @mcp.tool(
-    name="feedling_perception_calendar",
-    description=(
-        "The user's next calendar event as metadata (how soon, physical vs "
-        "virtual, attendee count, etc.). Titles may be sensitive — don't assume "
-        "you should reference a title; ask her instead. Returns null when nothing "
-        "is upcoming or the calendar capability is off."
-    ),
-)
-def perception_calendar(ctx: Context = None) -> dict:
-    # calendar_next_event is reported via /report and surfaced in the snapshot.
-    snap = _get("/v1/perception/snapshot", ctx=ctx)
-    if isinstance(snap, dict) and not snap.get("error"):
-        return {"calendar_next_event": snap.get("calendar_next_event")}
-    return snap
-
-
-@mcp.tool(
     name="feedling_perception_health",
     description=(
         "Aggregated HealthKit summaries for one category: 'sleep', 'workout', "
@@ -1910,19 +1894,6 @@ def perception_health(category: str, limit: int = 10, ctx: Context = None) -> di
     if not kind:
         return {"error": "category must be one of: sleep, workout, vitals"}
     return _get(f"/v1/perception/items/{kind}", {"limit": max(1, min(limit, 50))}, ctx=ctx)
-
-
-@mcp.tool(
-    name="feedling_perception_app_usage",
-    description=(
-        "Recent app-usage history — when the user opened which apps (reported by "
-        "their iOS Shortcut). Useful for spotting patterns ('on Twitter for a "
-        "while') — the CURRENT app is already in feedling_context_snapshot, so "
-        "use this only when you need the timeline."
-    ),
-)
-def perception_app_usage(limit: int = 50, ctx: Context = None) -> dict:
-    return _get("/v1/perception/app_usage", {"limit": max(1, min(limit, 200))}, ctx=ctx)
 
 
 # ---------------------------------------------------------------------------

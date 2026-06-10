@@ -54,18 +54,6 @@ def _coerce_ts(client_ts) -> float:
 # Permission gating
 # ---------------------------------------------------------------------------
 
-def is_enabled(user_id: str, cap_key: str, perms: dict | None = None) -> bool:
-    perms = perms if perms is not None else store.get_permissions(user_id)
-    cap = catalog.CAPABILITIES.get(cap_key)
-    if not cap:
-        return False
-    if not bool(perms.get(cap_key, cap.default_on)):
-        return False
-    if cap.gated_by and not is_enabled(user_id, cap.gated_by, perms):
-        return False
-    return True
-
-
 # ---------------------------------------------------------------------------
 # Ingest (generic sparse report)
 # ---------------------------------------------------------------------------
@@ -128,7 +116,6 @@ def _cell(value, ts: float, msg) -> dict:
 
 def _apply(user_id: str, pairs: list, client_ts=None) -> dict:
     now = _coerce_ts(client_ts)
-    perms = store.get_permissions(user_id)
     config = store.get_config(user_id)
     prev_state = store.get_state(user_id)
     results: dict[str, str] = {}
@@ -140,13 +127,18 @@ def _apply(user_id: str, pairs: list, client_ts=None) -> dict:
         if input_name in catalog.IGNORED_KEYS:
             results[input_name] = "ignored"  # e.g. "unsupported" (all-null placeholder)
             continue
+        # Manual user_state arrives as an explicit report key (folds POST /user_state).
+        # The store applies it atomically under a row lock with a ts guard, so a
+        # late/concurrent older report can't overwrite a newer manual value.
+        if input_name == "user_state":
+            doc = store.set_manual_user_state_guarded(
+                user_id, value if value is not None else "default", now)
+            results[input_name] = "accepted" if doc.get("manual_ts") == now else "stale_ignored"
+            continue
         key = catalog.KEY_ALIASES.get(input_name, input_name)
         sig = catalog.SIGNALS.get(key)
         if sig is None:
             results[input_name] = "unknown_signal"
-            continue
-        if not is_enabled(user_id, sig.capability, perms):
-            results[input_name] = "dropped_unauthorized"
             continue
 
         # Focus drives the user_state override stack (value None -> clear).
@@ -190,7 +182,7 @@ def _apply(user_id: str, pairs: list, client_ts=None) -> dict:
         results[input_name] = "accepted" if any(f in written for f in fields) else "stale_ignored"
 
     # device "back after a long lock" wake (only if the field was actually written).
-    _maybe_unlock_wake(user_id, patch, written, perms, prev_state, now, wake_pending)
+    _maybe_unlock_wake(user_id, patch, written, prev_state, now, wake_pending)
 
     for (capk, debounce, f, old, new_v) in wake_pending:
         if f in written:
@@ -217,13 +209,11 @@ def _apply_focus(user_id: str, value, config: dict) -> None:
     store.set_user_state_doc(user_id, doc)
 
 
-def _maybe_unlock_wake(user_id, patch, written, perms, prev_state, now, wake_candidates) -> None:
+def _maybe_unlock_wake(user_id, patch, written, prev_state, now, wake_candidates) -> None:
     if "last_unlock_ago_sec" not in written:
         return
     cell = patch.get("last_unlock_ago_sec")
     if not cell or cell.get("v") is None:
-        return
-    if not is_enabled(user_id, "device", perms):
         return
     try:
         new = float(cell["v"])
@@ -310,20 +300,15 @@ def _fire_wake(user_id: str, cap_key: str, hint: str, now: float) -> None:
 
 def snapshot(user_id: str, now: float | None = None) -> dict:
     now = now or _now()
-    perms = store.get_permissions(user_id)
     state = store.get_state(user_id)
     snap: dict = {}
     for sig in catalog.SIGNALS.values():
         cap = catalog.CAPABILITIES.get(sig.capability)
         if not cap or not cap.context_field:
             continue
-        enabled = is_enabled(user_id, sig.capability, perms)
         for f in sig.outputs:
             if f == "user_state":
                 continue  # owned by the focus/manual stack, set below
-            if not enabled:
-                snap[f] = None
-                continue
             cell = state.get(f)
             if not isinstance(cell, dict):
                 snap[f] = None
@@ -331,9 +316,11 @@ def snapshot(user_id: str, now: float | None = None) -> dict:
             if (now - float(cell.get("ts") or 0)) > sig.ttl_sec:
                 snap[f] = None  # stale -> agent treats as "don't infer"
             else:
-                snap[f] = cell.get("v")
+                snap[f] = cell.get("v")  # null cell -> None (= no permission now)
     # user_state is always present (manual default if nothing set).
     snap["user_state"] = effective_user_state(user_id)
+    # recent_apps folds the old /app_usage read; capped to keep snapshot small.
+    snap["recent_apps"] = store.read_app_opens(user_id, limit=catalog.RECENT_APPS_LIMIT)
     return snap
 
 
@@ -341,54 +328,25 @@ def snapshot(user_id: str, now: float | None = None) -> dict:
 # user_state
 # ---------------------------------------------------------------------------
 
+def _effective_from_doc(doc: dict) -> str:
+    return doc.get("focus_override") or doc.get("manual") or "default"
+
+
 def effective_user_state(user_id: str) -> str:
-    doc = store.get_user_state_doc(user_id)
-    override = doc.get("focus_override")
-    if override:
-        return override
-    return doc.get("manual") or "default"
+    return _effective_from_doc(store.get_user_state_doc(user_id))
 
 
-def set_manual_user_state(user_id: str, value: str) -> str:
-    doc = store.get_user_state_doc(user_id)
-    doc["manual"] = str(value or "default")
-    store.set_user_state_doc(user_id, doc)
-    return effective_user_state(user_id)
+def set_manual_user_state(user_id: str, value: str, ts: float | None = None) -> str:
+    """Set the manual user_state, ts-guarded ATOMICALLY in the store (a write
+    older than the stored manual_ts is dropped under a row lock, so a late/
+    concurrent report can't clobber a newer manual value). ts=None means now."""
+    ts = _now() if ts is None else float(ts)
+    return _effective_from_doc(store.set_manual_user_state_guarded(user_id, value, ts))
 
 
 # ---------------------------------------------------------------------------
 # Permissions & config
 # ---------------------------------------------------------------------------
-
-def permissions_view(user_id: str) -> list[dict]:
-    perms = store.get_permissions(user_id)
-    return [{
-        "key": cap.key,
-        "label": cap.label,
-        "tier": cap.tier,
-        "enabled": is_enabled(user_id, cap.key, perms),
-        "wake_source": cap.wake_source,
-    } for cap in catalog.CAPABILITIES.values()]
-
-
-def set_permissions(user_id: str, patch: dict) -> list[dict]:
-    clean = {k: bool(v) for k, v in (patch or {}).items() if k in catalog.CAPABILITIES}
-    if clean:
-        store.merge_permissions(user_id, clean)
-        # Disabling a capability must immediately remove its fields from state.
-        for k, v in clean.items():
-            if not v:
-                fields: list[str] = []
-                for sig in catalog.signals_for_capability(k):
-                    fields.extend(sig.outputs)
-                if fields:
-                    store.clear_state_fields(user_id, fields)
-    return permissions_view(user_id)
-
-
-def config_view(user_id: str) -> dict:
-    return store.get_config(user_id)
-
 
 def set_config(user_id: str, patch: dict) -> dict:
     return store.merge_config(user_id, patch or {})
@@ -432,8 +390,6 @@ def photo_evaluate(user_id: str, metadata: dict,
       (reuses the enclave's existing frame-decrypt path); the backend never sees
       plaintext. frame_id == photo_id == content_envelope.id.
     """
-    if not is_enabled(user_id, "photos"):
-        return {"error": "unauthorized", "capability": "photos"}, 403
     now = _now()
     metadata = metadata or {}
     config = store.get_config(user_id)
@@ -470,8 +426,6 @@ def photo_evaluate(user_id: str, metadata: dict,
 
 
 def photos_recent(user_id: str, limit: int = 20) -> tuple[dict, int]:
-    if not is_enabled(user_id, "photos"):
-        return {"error": "unauthorized"}, 403
     now = _now()
     items = [i for i in store.item_list(user_id, "photo", limit=limit, now=now)
              if i.get("status") == "confirmed"]
@@ -484,8 +438,6 @@ def photo_content(user_id: str, photo_id: str) -> tuple[dict, int]:
     frame_id; the caller decrypts pixels via the enclave's existing
     /v1/screen/frames/<frame_id>/decrypt path. The backend never holds plaintext
     pixels — only the enclave decrypts."""
-    if not is_enabled(user_id, "photos"):
-        return {"error": "unauthorized"}, 403
     now = _now()
     doc = store.item_get(user_id, "photo", photo_id, now=now)
     if not doc or doc.get("status") != "confirmed":
@@ -506,11 +458,11 @@ def items_ingest(user_id: str, kind: str, items: list[dict]) -> tuple[dict, int]
     cap = catalog.KIND_CAPABILITY.get(kind)
     if not cap:
         return {"error": "unknown_kind"}, 400
-    if not is_enabled(user_id, cap):
-        return {"error": "unauthorized", "capability": cap}, 403
+    if not isinstance(items, list) or not all(isinstance(it, dict) for it in items):
+        return {"error": "invalid_items"}, 400
     now = _now()
     wrote = 0
-    for it in (items or []):
+    for it in items:
         iid = str(it.get("item_id") or random_item_id())
         ts = float(it.get("ts") or now)
         store.item_upsert(user_id, kind, iid, ts, it.get("doc") or {}, it.get("expires_at"))
@@ -522,8 +474,6 @@ def items_recent(user_id: str, kind: str, limit: int = 20) -> tuple[dict, int]:
     cap = catalog.KIND_CAPABILITY.get(kind)
     if not cap:
         return {"error": "unknown_kind"}, 400
-    if not is_enabled(user_id, cap):
-        return {"error": "unauthorized", "capability": cap}, 403
     now = _now()
     return {"items": store.item_list(user_id, kind, limit=limit, now=now)}, 200
 
@@ -536,10 +486,7 @@ def app_open(user_id: str, app: str, category: str | None = None,
              client_ts=None) -> tuple[dict, int]:
     """Record one app-open event (fired by an iOS Shortcut when the user opens an
     app). Updates current app in the snapshot AND appends to the usage time series
-    for later stats. Gated by the `app` capability (default-on; user can turn it
-    off in the transparency panel)."""
-    if not is_enabled(user_id, "app"):
-        return {"error": "unauthorized", "capability": "app"}, 403
+    for later stats."""
     app = (app or "").strip()
     if not app:
         return {"error": "app_required"}, 400
@@ -555,8 +502,3 @@ def app_open(user_id: str, app: str, category: str | None = None,
     return {"status": "ok", "app": app, "category": category, "ts": now}, 200
 
 
-def app_usage(user_id: str, limit: int = 100, since_epoch: float = 0.0) -> tuple[dict, int]:
-    """Read the app-usage time series (agent/stats side)."""
-    if not is_enabled(user_id, "app"):
-        return {"error": "unauthorized", "capability": "app"}, 403
-    return {"events": store.read_app_opens(user_id, limit=limit, since_epoch=since_epoch)}, 200

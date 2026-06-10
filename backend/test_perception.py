@@ -1,7 +1,8 @@
 """Unit tests for the Extended Perception service logic.
 
-These exercise the generic machinery (sparse report, permission gating, raw->
-label resolution + raw discard, snapshot TTL, the user_state override stack,
+These exercise the generic machinery (sparse report, implicit authorization via
+reported values, raw->label resolution + raw discard, snapshot TTL, the
+user_state override stack,
 debounced wakes, and the two-step sensitivity-gated photo flow) WITHOUT a real
 Postgres: the store layer is replaced with an in-memory fake, and the wake
 trigger is captured instead of enqueuing a real proactive job.
@@ -20,7 +21,6 @@ class FakeStore:
     """In-memory stand-in for perception.store."""
     def __init__(self):
         self.blobs = {}   # (uid, kind) -> dict   (kinds collapsed onto attrs below)
-        self.perms = {}
         self.state = {}
         self.config = {}
         self.user_state = {}
@@ -30,10 +30,6 @@ class FakeStore:
         self.app_opens = {}  # uid -> [event...]
 
     # singletons
-    def get_permissions(self, uid): return dict(self.perms.get(uid, {}))
-    def merge_permissions(self, uid, patch):
-        self.perms.setdefault(uid, {}).update(patch); return dict(self.perms[uid])
-
     def get_state(self, uid): return {k: dict(v) for k, v in self.state.get(uid, {}).items()}
     def merge_state(self, uid, patch):
         self.state.setdefault(uid, {}).update(patch); return self.get_state(uid)
@@ -57,6 +53,14 @@ class FakeStore:
 
     def get_user_state_doc(self, uid): return dict(self.user_state.get(uid, {}))
     def set_user_state_doc(self, uid, doc): self.user_state[uid] = dict(doc)
+    def set_manual_user_state_guarded(self, uid, value, ts):
+        doc = dict(self.user_state.get(uid, {}))
+        prev_ts = doc.get("manual_ts")
+        if prev_ts is None or float(ts) >= float(prev_ts):
+            doc["manual"] = str(value or "default")
+            doc["manual_ts"] = float(ts)
+            self.user_state[uid] = doc
+        return dict(self.user_state.get(uid, {}))
 
     # collections
     def item_upsert(self, uid, kind, item_id, ts, doc, expires_at=None):
@@ -121,10 +125,6 @@ def env(monkeypatch):
 UID = "u1"
 
 
-def _enable(fake, *caps):
-    fake.merge_permissions(UID, {c: True for c in caps})
-
-
 # ---------------------------------------------------------------------------
 
 def _item(key, obj, message=""):
@@ -133,7 +133,7 @@ def _item(key, obj, message=""):
 
 
 def test_always_on_signals_stored(env):
-    fake, _ = env  # time/battery/broadcast need no permission (default_on)
+    fake, _ = env  # time/battery/broadcast always available
     service.ingest_snapshot(UID, [
         _item("time", {"local_time": "2026-06-08T15:30:45Z",
                        "timezone": "America/Los_Angeles", "locale": "en"}),
@@ -146,18 +146,18 @@ def test_always_on_signals_stored(env):
     assert snap["broadcast_state"] == "inactive"
 
 
-def test_permission_gate_drops_and_nulls(env):
-    fake, _ = env  # location/motion off by default
+def test_report_no_setup_accepted_and_stored(env):
+    """无任何权限设置：上报即被接受并入库（report 值=有权限）。"""
+    fake, _ = env
     res = service.ingest_snapshot(UID, [_item("motion_state", {"state": "walking"})])
-    assert res["motion_state"] == "dropped_unauthorized"
-    assert service.snapshot(UID)["motion_state"] is None
+    assert res["motion_state"] == "accepted"
+    assert service.snapshot(UID)["motion_state"] == {"state": "walking"}
 
 
 def test_location_signal_keeps_labels_drops_precise(env):
     """location_signal carries PRECISE fields; backend keeps only coarse labels
     (place_label via geofence, wifi_label, country) and drops coords/BSSID/address."""
     fake, _ = env
-    _enable(fake, "location")
     fake.merge_config(UID, {"geofences": [
         {"label": "home", "lat": 37.0, "lon": -122.0, "radius_m": 150}]})
     service.ingest_snapshot(UID, [_item("location_signal", {
@@ -179,7 +179,6 @@ def test_location_signal_keeps_labels_drops_precise(env):
 
 def test_snapshot_ttl_nulls_stale(env):
     fake, _ = env
-    _enable(fake, "motion")
     service.ingest_snapshot(UID, [_item("motion_state", {"state": "running"})])
     # backdate the stored ts beyond the motion ttl (300s)
     fake.state[UID]["motion_state"]["ts"] = time.time() - 10_000
@@ -202,7 +201,6 @@ def test_unsupported_ignored(env):
 
 def test_playback_and_calendar_via_report(env):
     fake, _ = env
-    _enable(fake, "now_playing", "calendar")
     service.ingest_snapshot(UID, [
         _item("playback", {"playback_state": "playing", "title": "晴天", "artist": "周杰伦"}),
         _item("calendar_next_event", {"title": "Team Sync", "minutes_until_start": 45,
@@ -215,7 +213,6 @@ def test_playback_and_calendar_via_report(env):
 
 def test_wake_debounce(env):
     fake, wakes = env
-    _enable(fake, "location")
     fake.merge_config(UID, {"geofences": [
         {"label": "home", "lat": 37.0, "lon": -122.0, "radius_m": 150},
         {"label": "work", "lat": 40.0, "lon": -73.0, "radius_m": 150}]})
@@ -230,7 +227,6 @@ def test_photo_hard_block_discards_ciphertext(env):
     """Hard-blocked scene (id_card): rejected; even an uploaded envelope is NOT
     stored — no frame envelope, not listed."""
     fake, _ = env
-    _enable(fake, "photos")
     out, code = service.photo_evaluate(
         UID, {"scene_hint": "id_card"}, {"id": "p_bad", "body_ct": "x"})
     assert code == 200 and out["usable"] is False and out["status"] == "rejected"
@@ -242,7 +238,6 @@ def test_photo_contextual_scene_stored_and_reaches_agent(env):
     """A 'private' scene is NOT hard-blocked — it's stored and reaches the agent
     (which self-censors per prompt)."""
     fake, _ = env
-    _enable(fake, "photos")
     out, _ = service.photo_evaluate(
         UID, {"scene_hint": "private", "is_indoor": True}, {"id": "p_priv", "body_ct": "c"})
     assert out["usable"] is True and out["status"] == "stored"
@@ -254,7 +249,6 @@ def test_photo_one_step_store(env):
     """Normal photo: a single evaluate call stores the encrypted image in the
     frame channel and fires a wake."""
     fake, wakes = env
-    _enable(fake, "photos")
     out, code = service.photo_evaluate(
         UID, {"has_faces": "true", "scene_hint": "landscape"},
         {"id": "p_ok", "body_ct": "cipher"})
@@ -271,22 +265,23 @@ def test_photo_one_step_store(env):
 def test_photo_usable_requires_envelope(env):
     """A usable photo with no content_envelope is a 400."""
     fake, _ = env
-    _enable(fake, "photos")
     out, code = service.photo_evaluate(UID, {"scene_hint": "food"}, None)
     assert code == 400 and out["error"] == "content_envelope_required"
 
 
-def test_photos_unauthorized(env):
-    fake, _ = env  # photos off
-    out, code = service.photo_evaluate(UID, {"scene_hint": "landscape"})
-    assert code == 403 and out["error"] == "unauthorized"
+def test_photos_no_setup_stored(env):
+    """无任何权限设置：photo_evaluate 直接成功（photos 恒开）。"""
+    fake, _ = env
+    out, code = service.photo_evaluate(
+        UID, {"scene_hint": "landscape"}, {"id": "p_ns", "body_ct": "c"})
+    assert code == 200 and out["status"] == "stored"
+    assert fake.get_photo_envelope(UID, "p_ns")["body_ct"] == "c"
 
 
 def test_items_rejects_photo_kind(env):
     """photo must NOT be ingestable via the generic /items endpoint (would bypass
     the _photo_usable gate). Only /photo/evaluate stores photos."""
     fake, _ = env
-    _enable(fake, "photos")
     out, code = service.items_ingest(UID, "photo", [
         {"item_id": "p_x", "doc": {"status": "confirmed", "metadata": {"scene_hint": "id_card"}}}])
     assert code == 400 and out["error"] == "unknown_kind"
@@ -294,23 +289,20 @@ def test_items_rejects_photo_kind(env):
 
 
 def test_app_open_records_current_and_history(env):
-    """The Shortcut GET endpoint records current app (snapshot) + a usage event."""
-    fake, _ = env  # `app` is default-on
+    """The Shortcut GET endpoint records current app (snapshot) + a usage event
+    surfaced via snapshot.recent_apps."""
+    fake, _ = env  # `app` always available
     out, code = service.app_open(UID, "Instagram", category="social")  # ts defaults to now
     assert code == 200 and out["app"] == "Instagram"
     snap = service.snapshot(UID)
     assert snap["app_name"] == "Instagram" and snap["app_category"] == "social"
-    usage, c2 = service.app_usage(UID)
-    assert c2 == 200 and usage["events"][-1]["app"] == "Instagram"
+    assert snap["recent_apps"][-1]["app"] == "Instagram"
 
 
-def test_app_open_requires_app_and_respects_gate(env):
+def test_app_open_requires_app(env):
     fake, _ = env
     out, code = service.app_open(UID, "")
     assert code == 400 and out["error"] == "app_required"
-    fake.merge_permissions(UID, {"app": False})          # user turned it off
-    out2, code2 = service.app_open(UID, "Instagram")
-    assert code2 == 403 and out2["error"] == "unauthorized"
 
 
 def test_app_open_via_get_route(env, monkeypatch):
@@ -337,7 +329,6 @@ def test_future_client_ts_clamped(env):
     """A far-future client_ts (clock skew / ms) is clamped to now, so it can't
     freeze state by making the ordering guard reject later correct reports."""
     fake, _ = env
-    _enable(fake, "motion")
     future = time.time() + 10 * 365 * 86400        # ~10 years ahead (or ms-as-s)
     service.ingest_snapshot(UID, [_item("motion_state", {"state": "walking"})], client_ts=future)
     stored_ts = fake.get_state(UID)["motion_state"]["ts"]
@@ -351,7 +342,6 @@ def test_future_client_ts_clamped(env):
 def test_photo_metadata_string_bools(env):
     """默认字符串: is_screenshot as string 'false' must NOT be treated truthy."""
     fake, _ = env
-    _enable(fake, "photos")
     out, _ = service.photo_evaluate(
         UID, {"scene_hint": "food", "is_screenshot": "false"}, {"id": "p1", "body_ct": "c"})
     assert out["usable"] is True                       # "false" not wrongly blocked
@@ -371,7 +361,6 @@ def test_string_scalar_values_stored(env):
 
 def test_client_ts_is_logical_time(env):
     fake, _ = env
-    _enable(fake, "motion")
     service.ingest_snapshot(UID, [_item("motion_state", {"state": "walking"})], client_ts=1000.0)
     assert fake.get_state(UID)["motion_state"]["ts"] == 1000.0
 
@@ -379,7 +368,6 @@ def test_client_ts_is_logical_time(env):
 def test_stale_report_does_not_overwrite_newer(env):
     """A late-arriving OLDER record must not clobber a newer value."""
     fake, _ = env
-    _enable(fake, "motion")
     service.ingest_snapshot(UID, [_item("motion_state", {"state": "running"})], client_ts=200.0)
     res = service.ingest_snapshot(UID, [_item("motion_state", {"state": "still"})], client_ts=100.0)
     assert res["motion_state"] == "stale_ignored"
@@ -390,7 +378,6 @@ def test_stale_report_does_not_overwrite_newer(env):
 def test_ingest_snapshot_alias_and_message(env):
     """Aliases resolve (location -> location_signal); message is stored."""
     fake, _ = env
-    _enable(fake, "location", "motion")
     fake.merge_config(UID, {"geofences": [
         {"label": "home", "lat": 37.0, "lon": -122.0, "radius_m": 150}]})
     res = service.ingest_snapshot(UID, [
@@ -408,7 +395,6 @@ def test_ingest_snapshot_null_records_unavailable(env):
     """An authorized capability reported with data:"null" makes its field null
     (unavailable now) and keeps the message."""
     fake, _ = env
-    _enable(fake, "location")
     fake.merge_config(UID, {"geofences": [
         {"label": "home", "lat": 37.0, "lon": -122.0, "radius_m": 150}]})
     service.ingest_snapshot(UID, [_item("location_signal",
@@ -428,7 +414,6 @@ def test_report_endpoint_context_snapshot(env, monkeypatch):
     import perception.routes as routes
 
     fake, _ = env
-    _enable(fake, "motion")
     fake_app = types.ModuleType("app")
     fake_app.require_user = lambda: types.SimpleNamespace(user_id=UID)
     monkeypatch.setitem(sys.modules, "app", fake_app)
@@ -446,3 +431,99 @@ def test_report_endpoint_context_snapshot(env, monkeypatch):
     # missing context_snapshot -> 400
     bad = client.post("/v1/perception/report", json={"signals": {}})
     assert bad.status_code == 400
+
+
+def test_report_user_state_key_sets_manual(env):
+    """/report 携带显式 user_state 键 -> 设置手动 user_state（折叠 POST /user_state）。"""
+    fake, _ = env
+    res = service.ingest_snapshot(UID, [
+        {"key": "user_state", "data": '"focused"', "message": ""}])
+    assert res["user_state"] == "accepted"
+    assert service.snapshot(UID)["user_state"] == "focused"
+
+
+def test_snapshot_includes_recent_apps(env):
+    """app_open 后，snapshot 带 recent_apps（折叠 app 历史读取面）。"""
+    fake, _ = env
+    service.app_open(UID, "Instagram", category="social", client_ts=1000.0)
+    service.app_open(UID, "Maps", category="navigation", client_ts=1001.0)
+    snap = service.snapshot(UID)
+    apps = [e["app"] for e in snap["recent_apps"]]
+    assert "Instagram" in apps and "Maps" in apps
+
+
+def _report_client(env, monkeypatch):
+    import sys
+    import types
+    from flask import Flask
+    import perception.routes as routes
+    fake, _ = env
+    fake_app = types.ModuleType("app")
+    fake_app.require_user = lambda: types.SimpleNamespace(user_id=UID)
+    monkeypatch.setitem(sys.modules, "app", fake_app)
+    app = Flask("t")
+    app.register_blueprint(routes.bp)
+    return fake, app.test_client()
+
+
+def test_report_multiplex_items(env, monkeypatch):
+    """/report 携带 items -> 写入集合，items_recent 读回。"""
+    fake, client = _report_client(env, monkeypatch)
+    r = client.post("/v1/perception/report", json={"items": {
+        "workout": [{"item_id": "w1", "doc": {"kind": "run", "minutes": 30}}]}})
+    assert r.status_code == 200
+    assert r.get_json()["results"]["items"]["workout"]["written"] == 1
+    got, code = service.items_recent(UID, "workout")
+    assert code == 200 and got["items"][0]["minutes"] == 30
+
+
+def test_report_multiplex_config(env, monkeypatch):
+    """/report 携带 config -> 合并进配置。"""
+    fake, client = _report_client(env, monkeypatch)
+    r = client.post("/v1/perception/report", json={"config": {
+        "geofences": [{"label": "home", "lat": 37.0, "lon": -122.0, "radius_m": 150}]}})
+    assert r.status_code == 200
+    assert fake.get_config(UID)["geofences"][0]["label"] == "home"
+
+
+def test_report_empty_body_400(env, monkeypatch):
+    """三者全空 -> 400。"""
+    fake, client = _report_client(env, monkeypatch)
+    r = client.post("/v1/perception/report", json={"signals": {}})
+    assert r.status_code == 400
+
+
+def test_report_user_state_stale_ignored(env):
+    """更晚 client_ts 设定的 user_state 不被更早(延迟到达)的报告覆盖。"""
+    fake, _ = env
+    service.ingest_snapshot(
+        UID, [{"key": "user_state", "data": '"focused"', "message": ""}], client_ts=200.0)
+    res = service.ingest_snapshot(
+        UID, [{"key": "user_state", "data": '"away"', "message": ""}], client_ts=100.0)
+    assert res["user_state"] == "stale_ignored"
+    assert service.snapshot(UID)["user_state"] == "focused"
+
+
+def test_report_items_invalid_kind_400(env, monkeypatch):
+    """items 含非法 kind -> /report 返回 400 并暴露错误（不静默成功）。"""
+    fake, client = _report_client(env, monkeypatch)
+    r = client.post("/v1/perception/report", json={"items": {
+        "photo": [{"item_id": "x", "doc": {"status": "confirmed"}}]}})
+    assert r.status_code == 400
+    assert r.get_json()["results"]["items"]["photo"]["error"] == "unknown_kind"
+
+
+def test_report_empty_sections_400(env, monkeypatch):
+    """空 section（[] / {} / {}）不算 provided -> 400。"""
+    fake, client = _report_client(env, monkeypatch)
+    for body in ({"context_snapshot": []}, {"items": {}}, {"config": {}}):
+        r = client.post("/v1/perception/report", json=body)
+        assert r.status_code == 400, body
+
+
+def test_report_items_malformed_400(env, monkeypatch):
+    """items 的 collection 值不是 list-of-objects -> 400（不 500）。"""
+    fake, client = _report_client(env, monkeypatch)
+    for bad in ({"workout": {"a": 1}}, {"workout": [123]}, {"workout": "x"}):
+        r = client.post("/v1/perception/report", json={"items": bad})
+        assert r.status_code == 400, bad

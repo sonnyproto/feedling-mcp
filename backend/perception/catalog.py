@@ -23,16 +23,16 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class Capability:
-    """One opt-in perceptual ability."""
-    key: str                 # permission key == one opt-in toggle
+    """One perceptual ability (always available; authorization is implicit in
+    whether the client reports a value — see docs/superpowers/specs/
+    2026-06-09-perception-permissions-implicit-design.md)."""
+    key: str                 # canonical capability key
     label: str               # human copy for the transparency UI
     tier: int                # 1 = ships with V2, 2 = follow-up
     wake_source: bool = False
     debounce_sec: float = 0.0
     context_field: bool = False   # appears in cheap wake snapshot
     query_tool: bool = False      # agent pulls on demand
-    gated_by: str | None = None   # also requires this capability enabled
-    default_on: bool = False
 
 
 @dataclass(frozen=True)
@@ -52,9 +52,9 @@ class Signal:
 
 CAPABILITIES: dict[str, Capability] = {c.key: c for c in [
     # --- always-on (no iOS permission) ---
-    Capability("time", "本地时间", 1, context_field=True, default_on=True),
-    Capability("device", "电量", 1, context_field=True, default_on=True),
-    Capability("broadcast", "屏幕采集状态", 1, context_field=True, default_on=True),
+    Capability("time", "本地时间", 1, context_field=True),
+    Capability("device", "电量", 1, context_field=True),
+    Capability("broadcast", "屏幕采集状态", 1, context_field=True),
 
     # --- permissioned ---
     Capability("location", "你大概在哪里（只看地点标签，不看具体地址）", 1,
@@ -64,7 +64,7 @@ CAPABILITIES: dict[str, Capability] = {c.key: c for c in [
     Capability("calendar", "日历下一场日程", 1, context_field=True, query_tool=True),
     Capability("now_playing", "你在听的音乐", 1, context_field=True, query_tool=True),
     Capability("app", "你在用哪个 app（通过 iOS 快捷指令上报）", 1,
-               context_field=True, query_tool=True, default_on=True),
+               context_field=True, query_tool=True),
     Capability("photos", "你拍的照片", 2, wake_source=True, query_tool=True),
     Capability("health_sleep", "睡眠", 2, query_tool=True),
     Capability("health_workout", "运动", 2, query_tool=True),
@@ -168,6 +168,10 @@ PHOTO_METADATA_FIELDS = (
 )
 # "Back after long lock" wake threshold.
 UNLOCK_BACK_THRESHOLD_SEC = 1800.0  # 30 min
+
+# Recent app-open events surfaced in the snapshot (folds the standalone
+# /app_usage read; capped to keep the wake-attached snapshot small).
+RECENT_APPS_LIMIT = 10
 
 
 def signals_for_capability(cap_key: str) -> list[Signal]:

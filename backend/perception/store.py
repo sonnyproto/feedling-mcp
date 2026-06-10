@@ -20,7 +20,6 @@ log = logging.getLogger("perception.store")
 
 # user_blobs kinds (singletons, one row per user)
 STATE = "perception_state"            # {field: {"v": .., "ts": ..}}
-PERMISSIONS = "perception_permissions"  # {capability_key: bool}
 CONFIG = "perception_config"          # geofences / ssid_labels / focus_map / ...
 USER_STATE = "perception_user_state"  # {"manual": "default", "focus_override": None}
 
@@ -148,14 +147,6 @@ def clear_state_fields(user_id: str, fields: list[str]) -> None:
     _delete_state_keys(user_id, fields)
 
 
-def get_permissions(user_id: str) -> dict:
-    return _get_blob(user_id, PERMISSIONS)
-
-
-def merge_permissions(user_id: str, patch: dict) -> dict:
-    return _merge_blob(user_id, PERMISSIONS, patch)
-
-
 def get_config(user_id: str) -> dict:
     return _get_blob(user_id, CONFIG)
 
@@ -170,6 +161,39 @@ def get_user_state_doc(user_id: str) -> dict:
 
 def set_user_state_doc(user_id: str, doc: dict) -> None:
     _set_blob(user_id, USER_STATE, doc)
+
+
+def set_manual_user_state_guarded(user_id: str, value: str, ts: float) -> dict:
+    """Atomically set the manual user_state under a ROW LOCK with a ts guard: the
+    write applies only if `ts` >= the stored manual_ts. Returns the resulting
+    user_state doc (whether or not this write won). Mirrors merge_state_guarded's
+    locked compare-and-write so a late/concurrent older report can't clobber a
+    newer manual value — the read-check-write is one serialized transaction."""
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, '{}'::jsonb) "
+                    "ON CONFLICT (user_id, kind) DO NOTHING",
+                    (user_id, USER_STATE),
+                )
+                row = conn.execute(
+                    "SELECT doc FROM user_blobs WHERE user_id = %s AND kind = %s FOR UPDATE",
+                    (user_id, USER_STATE),
+                ).fetchone()
+                doc = dict(row[0]) if row and isinstance(row[0], dict) else {}
+                prev_ts = doc.get("manual_ts")
+                if prev_ts is None or float(ts) >= float(prev_ts):
+                    doc["manual"] = str(value or "default")
+                    doc["manual_ts"] = float(ts)
+                    conn.execute(
+                        "UPDATE user_blobs SET doc = %s WHERE user_id = %s AND kind = %s",
+                        (Jsonb(doc), user_id, USER_STATE),
+                    )
+                return doc
+    except Exception as e:
+        log.error("set_manual_user_state_guarded(%s) failed: %s", user_id, e)
+        return _get_blob(user_id, USER_STATE)
 
 
 # ---------------------------------------------------------------------------

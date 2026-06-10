@@ -29,23 +29,44 @@ def _body() -> dict:
 
 @bp.route("/report", methods=["POST"])
 def report():
-    """Batch-upload the current context_snapshot — an array of {key, data, message},
-    each item equivalent to one signal:
-      - `key`     : signal name (aliases ok, e.g. location_signal; composite ok, e.g. device)
-      - `data`    : JSON STRING (e.g. "{\\"state\\":\\"walking\\"}") or "null" for no value
-      - `message` : human-readable note (stored; useful when data is null)
-
-    Photos do NOT go through here — they have their own two-endpoint flow.
-    `client_ts` (optional, top-level) timestamps the whole snapshot for the
-    freshness/ordering guard; defaults to server receive time.
+    """Single multiplexed ingest. Body may carry any of:
+      - context_snapshot : list of {key, data, message} signal items (data is a
+        JSON string or "null"); a `user_state` key sets the manual user_state.
+      - items            : {kind: [item, ...]} collections (sleep/workout/vitals).
+      - config           : a config patch (geofences / ssid_labels / focus_map / ...).
+    At least one must be present (else 400). `client_ts` (optional) timestamps the
+    context_snapshot for the freshness/ordering guard. Photos use /photo/evaluate.
     """
     uid = _uid()
     payload = _body()
-    snapshot = payload.get("context_snapshot")
-    if not isinstance(snapshot, list):
-        return jsonify({"error": "context_snapshot (list) required"}), 400
-    results = service.ingest_snapshot(uid, snapshot, client_ts=payload.get("client_ts"))
-    return jsonify({"results": results})
+    results: dict = {}
+    provided = False
+    status = 200
+
+    cs = payload.get("context_snapshot")
+    if isinstance(cs, list) and cs:
+        provided = True
+        results.update(service.ingest_snapshot(uid, cs, client_ts=payload.get("client_ts")))
+
+    items = payload.get("items")
+    if isinstance(items, dict) and items:
+        provided = True
+        item_results: dict = {}
+        for kind, rows in items.items():
+            out, code = service.items_ingest(uid, str(kind), rows)
+            item_results[kind] = out
+            if code != 200:
+                status = 400  # surface rejected/malformed collection uploads, don't 200 them
+        results["items"] = item_results
+
+    config = payload.get("config")
+    if isinstance(config, dict) and config:
+        provided = True
+        results["config"] = service.set_config(uid, config)
+
+    if not provided:
+        return jsonify({"error": "non-empty context_snapshot / items / config required"}), 400
+    return jsonify({"results": results}), status
 
 
 # ---------------------------------------------------------------------------
@@ -55,46 +76,6 @@ def report():
 @bp.route("/snapshot", methods=["GET"])
 def snapshot():
     return jsonify(service.snapshot(_uid()))
-
-
-# ---------------------------------------------------------------------------
-# Permissions (transparency UI)
-# ---------------------------------------------------------------------------
-
-@bp.route("/permissions", methods=["GET"])
-def get_permissions():
-    return jsonify({"capabilities": service.permissions_view(_uid())})
-
-
-@bp.route("/permissions", methods=["POST"])
-def set_permissions():
-    uid = _uid()
-    return jsonify({"capabilities": service.set_permissions(uid, _body())})
-
-
-# ---------------------------------------------------------------------------
-# Config (geofences / ssid labels / focus map / sensitive bundles)
-# ---------------------------------------------------------------------------
-
-@bp.route("/config", methods=["GET"])
-def get_config():
-    return jsonify(service.config_view(_uid()))
-
-
-@bp.route("/config", methods=["POST"])
-def set_config():
-    return jsonify(service.set_config(_uid(), _body()))
-
-
-# ---------------------------------------------------------------------------
-# user_state
-# ---------------------------------------------------------------------------
-
-@bp.route("/user_state", methods=["POST"])
-def set_user_state():
-    uid = _uid()
-    value = _body().get("user_state", "default")
-    return jsonify({"user_state": service.set_manual_user_state(uid, value)})
 
 
 # ---------------------------------------------------------------------------
@@ -126,16 +107,8 @@ def photo_content(photo_id):
 
 
 # ---------------------------------------------------------------------------
-# Tier 2 collections (calendar / health) — generic
+# Tier 2 collections (calendar / health) — generic read (writes go via /report)
 # ---------------------------------------------------------------------------
-
-@bp.route("/items", methods=["POST"])
-def items_ingest():
-    uid = _uid()
-    p = _body()
-    out, code = service.items_ingest(uid, str(p.get("kind") or ""), p.get("items") or [])
-    return jsonify(out), code
-
 
 @bp.route("/items/<kind>", methods=["GET"])
 def items_recent(kind):
@@ -161,13 +134,4 @@ def app_open():
     category = request.args.get("category")
     client_ts = request.args.get("ts") or request.args.get("client_ts")
     out, code = service.app_open(uid, app, category=category, client_ts=client_ts)
-    return jsonify(out), code
-
-
-@bp.route("/app_usage", methods=["GET"])
-def app_usage():
-    uid = _uid()
-    limit = int(request.args.get("limit", 100))
-    since = float(request.args.get("since", 0) or 0)
-    out, code = service.app_usage(uid, limit=limit, since_epoch=since)
     return jsonify(out), code
