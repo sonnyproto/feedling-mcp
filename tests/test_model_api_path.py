@@ -268,6 +268,107 @@ def test_model_api_runtime_status_tracks_hosted_runtime_and_action_trace(client,
     assert appmod.db.get_blob(user_id, "model_api_runtime")["last_action_trace_id"] == trace_id
 
 
+def test_model_api_chat_uses_memory_selection_trace_without_prompting_rejected_cards(client, monkeypatch):
+    user_id, api_key = _register(client)
+    history_params: list[dict] = []
+    provider_messages: list[list[dict]] = []
+
+    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
+    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(
+        appmod,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose: b"sk-test",
+    )
+
+    def fake_enclave(path, key, params=None):
+        if path == "/v1/chat/history":
+            history_params.append(dict(params or {}))
+            return {
+                "messages": [{"role": "user", "content": "明天有一个 project 要完成，好累"}],
+                "context_memories": [
+                    {
+                        "id": "pressure",
+                        "title": "近期项目压力",
+                        "description": "用户明天有一个项目要完成，觉得很累。",
+                        "selection": {
+                            "score": 0.72,
+                            "confidence": "strong",
+                            "matched_units": ["明天", "完成", "很累"],
+                            "reason": "phrase_match",
+                            "bucket": "query",
+                        },
+                    }
+                ],
+                "context_memory_trace": {
+                    "mode": "model_api",
+                    "query_units": ["project", "明天", "完成"],
+                    "selected": [
+                        {
+                            "id": "pressure",
+                            "title": "近期项目压力",
+                            "score": 0.72,
+                            "confidence": "strong",
+                            "matched_units": ["明天", "完成", "很累"],
+                            "reason": "phrase_match",
+                            "bucket": "query",
+                            "selected": True,
+                        }
+                    ],
+                    "rejected_sample": [
+                        {
+                            "id": "toho",
+                            "title": "TOHO Project 老二次元偏好",
+                            "score": 0.18,
+                            "confidence": "weak",
+                            "matched_units": ["project"],
+                            "reason": "weak_generic_overlap",
+                            "bucket": "rejected",
+                            "selected": False,
+                        }
+                    ],
+                },
+            }, ""
+        if path == "/v1/identity/get":
+            return {"identity": _identity_payload()}, ""
+        return {}, ""
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        provider_messages.append(messages)
+        return {"reply": "先把明天那个项目收个尾，别让自己硬扛。", "usage": {"total_tokens": 10}}
+
+    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave)
+    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    chat = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "明天有一个 project 要完成，好累"},
+        headers=_headers(api_key),
+    )
+    assert chat.status_code == 200, chat.get_data(as_text=True)
+    assert history_params[-1]["context_trace"] == "1"
+    prompt = "\n".join(str(m.get("content") or "") for m in provider_messages[0])
+    assert "candidate memory context" in prompt
+    assert "relevant memory cards" not in prompt
+    assert "TOHO Project 老二次元偏好" not in prompt
+    assert "weak_generic_overlap" not in prompt
+
+    trace_id = chat.get_json()["state"]["action_trace_id"]
+    traces = appmod.db.log_read(user_id, appmod.MODEL_API_ACTION_TRACE_STREAM, limit=5)
+    trace = next(item for item in traces if item["trace_id"] == trace_id)
+    selection = trace["context"]["memory_selection"]
+    assert selection["selected"][0]["id"] == "pressure"
+    assert selection["rejected_sample"][0]["id"] == "toho"
+    assert selection["rejected_sample"][0]["reason"] == "weak_generic_overlap"
+
+
 def test_model_api_chat_send_runs_backend_web_search_tool(client, monkeypatch):
     _, api_key = _register(client)
     provider_calls: list[list[dict]] = []

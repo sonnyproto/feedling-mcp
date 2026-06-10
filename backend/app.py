@@ -36,7 +36,7 @@ from provider_client import (
     test_provider_key,
     validate_config as validate_provider_config,
 )
-from context_memory_selection import memory_relevance_score
+from context_memory_selection import memory_relevance_details
 from hosted_runtime import (
     ACTION_RESPONSE_FORMAT as HOSTED_RUNTIME_ACTION_RESPONSE_FORMAT,
     ACTION_METHOD as HOSTED_RUNTIME_ACTION_METHOD,
@@ -8428,13 +8428,15 @@ def _model_api_context_messages(
     hist, hist_err = _enclave_get_json_for_gate(
         "/v1/chat/history",
         api_key,
-        {"limit": "30", "context_mode": "model_api"},
+        {"limit": "30", "context_mode": "model_api", "context_trace": "1"},
     )
     identity_data, identity_err = _enclave_get_json_for_gate("/v1/identity/get", api_key)
     context_memories = []
+    context_memory_trace = {}
     recent_messages = []
     if isinstance(hist, dict):
         context_memories = hist.get("context_memories") if isinstance(hist.get("context_memories"), list) else []
+        context_memory_trace = hist.get("context_memory_trace") if isinstance(hist.get("context_memory_trace"), dict) else {}
         recent_messages = hist.get("messages") if isinstance(hist.get("messages"), list) else []
 
     identity = {}
@@ -8482,6 +8484,7 @@ def _model_api_context_messages(
         "agent_profile": _model_api_agent_profile_context(store, identity),
         "identity": identity_summary,
         "context_memories": context_memories[:8],
+        "context_memory_trace": context_memory_trace,
         "screen_context": screen_context,
         "screen_image_attached": bool(screen_images),
         "pending_state_updates": pending_state_updates,
@@ -8490,13 +8493,76 @@ def _model_api_context_messages(
             "identity": identity_err,
         },
     }
+    prompt_context_payload = dict(context_payload)
+    prompt_context_payload.pop("context_memory_trace", None)
+    if context_memory_trace:
+        prompt_selection = {}
+        selected_trace = context_memory_trace.get("selected") if isinstance(context_memory_trace.get("selected"), list) else []
+        query_units = context_memory_trace.get("query_units") if isinstance(context_memory_trace.get("query_units"), list) else []
+        query_strong = context_memory_trace.get("query_strong_phrases") if isinstance(context_memory_trace.get("query_strong_phrases"), list) else []
+        if selected_trace:
+            prompt_selection["selected"] = selected_trace[:8]
+        if query_units:
+            prompt_selection["query_units"] = query_units[:20]
+        if query_strong:
+            prompt_selection["query_strong_phrases"] = query_strong[:20]
+        if prompt_selection:
+            prompt_context_payload["context_memory_selection"] = prompt_selection
 
     messages = build_model_api_foreground_chat_messages(
-        context_payload=context_payload,
+        context_payload=prompt_context_payload,
         recent_messages=recent_messages,
         user_message=user_message,
     )
     return messages, context_payload, screen_images
+
+
+def _model_api_context_trace_summary(context_payload: dict) -> dict:
+    trace = context_payload.get("context_memory_trace") if isinstance(context_payload, dict) else {}
+    if not isinstance(trace, dict):
+        return {}
+    selected = trace.get("selected") if isinstance(trace.get("selected"), list) else []
+    rejected = trace.get("rejected_sample") if isinstance(trace.get("rejected_sample"), list) else []
+    summary: dict = {}
+    if selected:
+        summary["selected"] = selected[:8]
+    if rejected:
+        summary["rejected_sample"] = rejected[:8]
+    query_units = trace.get("query_units") if isinstance(trace.get("query_units"), list) else []
+    query_strong = trace.get("query_strong_phrases") if isinstance(trace.get("query_strong_phrases"), list) else []
+    if query_units:
+        summary["query_units"] = query_units[:20]
+    if query_strong:
+        summary["query_strong_phrases"] = query_strong[:20]
+    if trace.get("mode"):
+        summary["mode"] = str(trace.get("mode") or "")[:40]
+    return summary
+
+
+def _model_api_context_trace_for_action(
+    context_payload: dict,
+    *,
+    context_refs: list[dict],
+    web_search: dict,
+    provider_reasoning: str | None = None,
+) -> dict:
+    info = {
+        "memories": len(context_payload.get("context_memories") or []),
+        "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
+        "screen_context": bool(context_payload.get("screen_context")),
+        "context_refs": len(context_refs),
+        "web_search": _model_api_web_search_trace(web_search),
+    }
+    memory_selection = _model_api_context_trace_summary(context_payload)
+    if memory_selection:
+        info["memory_selection"] = memory_selection
+    if provider_reasoning is not None:
+        info["provider_reasoning"] = {
+            "enabled": MODEL_API_PROVIDER_REASONING_ENABLED,
+            "present": bool(provider_reasoning),
+            "chars": len(provider_reasoning),
+        }
+    return info
 
 
 def _context_refs_from_payload(payload: dict) -> list[dict]:
@@ -8666,9 +8732,23 @@ def _model_api_state_memory_candidates(
             "occurred_at": moment.get("occurred_at", ""),
             "created_at": moment.get("created_at", ""),
         }
-        score = 1.0 if moment.get("id") in ref_ids else memory_relevance_score(message, merged)
-        if moment.get("id") in ref_ids or score >= 0.05:
-            candidates.append(_state_memory_candidate_from_moment(moment, inner, score))
+        if moment.get("id") in ref_ids:
+            details = {
+                "score": 1.0,
+                "confidence": "strong",
+                "reason": "user_selected_context_ref",
+                "matched_units": [],
+            }
+        else:
+            details = memory_relevance_details(message, merged)
+        score = float(details.get("score") or 0.0)
+        confidence = str(details.get("confidence") or "none")
+        if moment.get("id") in ref_ids or (confidence in {"strong", "medium"} and score >= 0.35):
+            candidate = _state_memory_candidate_from_moment(moment, inner, score)
+            candidate["confidence"] = confidence
+            candidate["reason"] = str(details.get("reason") or "")[:120]
+            candidate["matched_units"] = list(details.get("matched_units") or [])[:8]
+            candidates.append(candidate)
     candidates.sort(key=lambda item: (item.get("score", 0), item.get("occurred_at", "")), reverse=True)
     return candidates[:limit]
 
@@ -10306,13 +10386,11 @@ def model_api_chat_send():
             "effects": effects,
             "identity_actions": identity_action_results,
             "memory_actions": memory_action_results,
-            "context": {
-                "memories": len(context_payload.get("context_memories") or []),
-                "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
-                "screen_context": bool(context_payload.get("screen_context")),
-                "context_refs": len(context_refs),
-                "web_search": _model_api_web_search_trace(web_search),
-            },
+            "context": _model_api_context_trace_for_action(
+                context_payload,
+                context_refs=context_refs,
+                web_search=web_search,
+            ),
             "error": f"provider_chat_failed:{str(e)[:220]}",
             "duration_ms": int((time.time() - trace_start) * 1000),
         })
@@ -10372,13 +10450,11 @@ def model_api_chat_send():
                     "effects": effects,
                     "identity_actions": identity_action_results,
                     "memory_actions": memory_action_results,
-                    "context": {
-                        "memories": len(context_payload.get("context_memories") or []),
-                        "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
-                        "screen_context": bool(context_payload.get("screen_context")),
-                        "context_refs": len(context_refs),
-                        "web_search": _model_api_web_search_trace(web_search),
-                    },
+                    "context": _model_api_context_trace_for_action(
+                        context_payload,
+                        context_refs=context_refs,
+                        web_search=web_search,
+                    ),
                     "error": f"provider_chat_after_web_search_failed:{str(e)[:220]}",
                     "duration_ms": int((time.time() - trace_start) * 1000),
                 })
@@ -10401,13 +10477,11 @@ def model_api_chat_send():
             "model": runtime.model,
             "user_message_id": user_row["id"],
             "background_execution": background_execution,
-            "context": {
-                "memories": len(context_payload.get("context_memories") or []),
-                "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
-                "screen_context": bool(context_payload.get("screen_context")),
-                "context_refs": len(context_refs),
-                "web_search": _model_api_web_search_trace(web_search),
-            },
+            "context": _model_api_context_trace_for_action(
+                context_payload,
+                context_refs=context_refs,
+                web_search=web_search,
+            ),
             "error": "provider_empty_reply",
             "duration_ms": int((time.time() - trace_start) * 1000),
         })
@@ -10494,18 +10568,12 @@ def model_api_chat_send():
             "recap_job_id": capture_job.get("recap_job_id", ""),
             "recap_status": capture_job.get("recap_status", ""),
         },
-        "context": {
-            "memories": len(context_payload.get("context_memories") or []),
-            "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
-            "screen_context": bool(context_payload.get("screen_context")),
-            "context_refs": len(context_refs),
-            "web_search": _model_api_web_search_trace(web_search),
-            "provider_reasoning": {
-                "enabled": MODEL_API_PROVIDER_REASONING_ENABLED,
-                "present": bool(provider_reasoning),
-                "chars": len(provider_reasoning),
-            },
-        },
+        "context": _model_api_context_trace_for_action(
+            context_payload,
+            context_refs=context_refs,
+            web_search=web_search,
+            provider_reasoning=provider_reasoning,
+        ),
         "usage": result.get("usage") or {},
         "duration_ms": int((time.time() - trace_start) * 1000),
     })
@@ -10554,13 +10622,11 @@ def model_api_chat_send():
             "version": MODEL_API_RUNTIME_VERSION,
             "background_execution": background_execution,
         },
-        "context": {
-            "memories": len(context_payload.get("context_memories") or []),
-            "identity_loaded": bool((context_payload.get("identity") or {}).get("agent_name")),
-            "screen_context": bool(context_payload.get("screen_context")),
-            "context_refs": len(context_refs),
-            "web_search": _model_api_web_search_trace(web_search),
-        },
+        "context": _model_api_context_trace_for_action(
+            context_payload,
+            context_refs=context_refs,
+            web_search=web_search,
+        ),
     })
 
 

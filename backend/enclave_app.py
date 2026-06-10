@@ -724,7 +724,10 @@ def v1_envelope_decrypt():
 # module's heavy native deps.
 # ---------------------------------------------------------------------------
 
-from context_memory_selection import select_context_memories  # noqa: E402
+from context_memory_selection import (  # noqa: E402
+    select_context_memories,
+    select_context_memories_with_trace,
+)
 
 
 def _load_decrypted_moments(
@@ -893,6 +896,7 @@ def v1_chat_history():
     # for this conversation moment. Best-effort: if anything fails, return
     # the chat response without them rather than 500-ing.
     context_memories: list[dict] = []
+    context_memory_trace: dict | None = None
     try:
         latest_user_text = ""
         for m in reversed(decrypted):
@@ -907,17 +911,28 @@ def v1_chat_history():
         ).strip()
         if not context_mode and str(request.args.get("context_strict") or "").lower() in {"1", "true", "yes", "on"}:
             context_mode = "strict"
-        context_memories = select_context_memories(moments, latest_user_text, mode=context_mode)
+        want_trace = str(request.args.get("context_trace") or "").lower() in {"1", "true", "yes", "on"}
+        if want_trace:
+            context_memories, context_memory_trace = select_context_memories_with_trace(
+                moments,
+                latest_user_text,
+                mode=context_mode,
+            )
+        else:
+            context_memories = select_context_memories(moments, latest_user_text, mode=context_mode)
     except Exception as e:
         print(f"[chat/history:{authorized_user_id}] context_memories failed: {e}")
 
-    return jsonify({
+    payload = {
         "user_id": authorized_user_id,
         "messages": decrypted,
         "context_memories": context_memories,
         "total": hist.get("total", len(decrypted)),
         "decrypt_errors": errors,
-    })
+    }
+    if context_memory_trace is not None:
+        payload["context_memory_trace"] = context_memory_trace
+    return jsonify(payload)
 
 
 @app.route("/v1/memory/list", methods=["GET"])

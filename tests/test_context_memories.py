@@ -23,6 +23,7 @@ from context_memory_selection import (  # noqa: E402
     char_bigrams as _char_bigrams,
     bigram_jaccard as _bigram_jaccard,
     select_context_memories as _select_context_memories,
+    select_context_memories_with_trace as _select_context_memories_with_trace,
 )
 
 
@@ -47,6 +48,82 @@ def _moment(
         "occurred_at": occurred_at,
         "created_at": created_at,
     }
+
+
+def _retrieval_fixture_moments() -> list[dict]:
+    return [
+        _moment(
+            id="toho",
+            title="TOHO Project 老二次元偏好",
+            description="用户是 toho project（东方Project）老二次元，喜欢东方 Project 相关内容。",
+        ),
+        _moment(
+            id="pressure",
+            title="近期项目压力",
+            description="用户明天有一个项目要完成，觉得很累。",
+        ),
+        _moment(
+            id="lemon",
+            title="喜欢柠檬茶",
+            description="用户晚上想喝清爽一点的饮料。",
+        ),
+        _moment(
+            id="chickens",
+            title="烧卖和蒸饺",
+            description="用户养的两只科钦球母鸡叫烧卖和蒸饺。",
+        ),
+        _moment(
+            id="a03",
+            title="硅基 A03 模型偏好",
+            description="用户提过想看更适合 LLM 的硅基 A03。",
+        ),
+        _moment(
+            id="claude_vps",
+            title="Claude Code VPS 工作流",
+            description="用户在 VPS 上跑 Claude Code，并通过 Feedling 通信。",
+        ),
+        _moment(
+            id="raw_json",
+            title="原始JSON输出问题",
+            description="第一条消息曾把原始 JSON 直接吐出来。",
+        ),
+        _moment(
+            id="job_change",
+            title="深夜你说想换工作",
+            description="用户最近又在想换工作的事。",
+        ),
+        _moment(
+            id="nyu",
+            title="NYU beta 测试",
+            description="Feedling iOS 在 NYU beta 中测试。",
+        ),
+        _moment(
+            id="live_activity",
+            title="灵动岛 start update 策略",
+            description="push to start 可以拉起灵动岛，update 用于更新现有 Live Activity。",
+        ),
+        _moment(
+            id="image_api",
+            title="API 图片上传失败",
+            description="API hosted route 之前不支持图片消息，发送图片会失败。",
+        ),
+        {
+            **_moment(
+                id="correction_global",
+                title="用户更新称呼边界",
+                description="以后不要再叫用户老师。",
+            ),
+            "source": "model_api_correction",
+        },
+        {
+            **_moment(
+                id="correction_lemon",
+                title="柠檬茶纠正",
+                description="用户纠正过柠檬茶不是冰的。",
+            ),
+            "source": "model_api_correction",
+        },
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -252,3 +329,315 @@ def test_model_api_mode_skips_unrelated_recent_cards_and_keeps_corrections():
     assert "correction" in out_ids
     assert "drink" in out_ids
     assert "food" not in out_ids
+
+
+def test_model_api_generic_project_does_not_recall_toho_project():
+    moments = [
+        _moment(
+            id="toho",
+            title="TOHO Project 老二次元偏好",
+            description="用户是 toho project（东方Project）老二次元，喜欢东方 Project 相关内容。",
+        ),
+        _moment(
+            id="pressure",
+            title="近期项目压力",
+            description="用户明天有一个项目要完成，觉得很累。",
+        ),
+    ]
+
+    out, trace = _select_context_memories_with_trace(
+        moments,
+        "明天有一个project要完成，好累",
+        mode="model_api",
+    )
+
+    out_ids = [m["id"] for m in out]
+    assert "toho" not in out_ids
+    assert "pressure" in out_ids
+    rejected = {item["id"]: item for item in trace["rejected_sample"]}
+    assert rejected["toho"]["reason"] == "weak_generic_overlap"
+
+
+def test_model_api_entity_phrase_recalls_toho_project():
+    moments = [
+        _moment(
+            id="toho",
+            title="TOHO Project 老二次元偏好",
+            description="用户是 toho project（东方Project）老二次元，喜欢东方 Project 相关内容。",
+        ),
+        _moment(id="work", title="项目压力", description="用户最近工作项目很多。"),
+    ]
+
+    out, trace = _select_context_memories_with_trace(
+        moments,
+        "我又在听东方Project的曲子",
+        mode="model_api",
+    )
+
+    assert [m["id"] for m in out] == ["toho"]
+    selected = trace["selected"][0]
+    assert selected["confidence"] == "strong"
+    assert selected["reason"] in {"entity_phrase_match", "phrase_match"}
+
+
+def test_model_api_phrase_recalls_chicken_memory():
+    moments = [
+        _moment(
+            id="chickens",
+            title="你第一次告诉我你养了两只鸡当宠物",
+            description="养了两只科钦球母鸡做宠物叫烧卖和蒸饺。",
+        ),
+        _moment(id="drink", title="喜欢柠檬茶", description="用户晚上想喝清爽一点的饮料。"),
+    ]
+
+    out = _select_context_memories(
+        moments,
+        "烧卖和蒸饺是谁？",
+        mode="model_api",
+    )
+
+    assert [m["id"] for m in out] == ["chickens"]
+
+
+def test_model_api_weak_single_char_does_not_recall_preference_card():
+    moments = [
+        _moment(
+            id="preference",
+            title="东方 Project 偏好",
+            description="用户喜欢东方 Project 相关内容。",
+        ),
+    ]
+
+    out, trace = _select_context_memories_with_trace(
+        moments,
+        "好累",
+        mode="model_api",
+    )
+
+    assert out == []
+    assert trace["rejected_sample"][0]["reason"] == "weak_generic_overlap"
+
+
+def test_model_api_trace_includes_selection_metadata():
+    moments = [
+        _moment(
+            id="chickens",
+            title="烧卖和蒸饺",
+            description="用户养的两只科钦球母鸡叫烧卖和蒸饺。",
+        )
+    ]
+
+    out, trace = _select_context_memories_with_trace(
+        moments,
+        "你还记得烧卖和蒸饺吗？",
+        mode="model_api",
+    )
+
+    assert out[0]["selection"]["bucket"] == "query"
+    assert out[0]["selection"]["confidence"] == "strong"
+    assert trace["selected"][0]["id"] == "chickens"
+    assert any("烧卖" in unit or "蒸饺" in unit for unit in trace["selected"][0]["matched_units"])
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_id"),
+    [
+        ("我又在听东方Project的曲子", "toho"),
+        ("toho project 的设定还在吗", "toho"),
+        ("东方 project 老二次元这张卡还记得吗", "toho"),
+        ("烧卖和蒸饺是谁？", "chickens"),
+        ("晚上想喝点清爽的", "lemon"),
+        ("我想喝柠檬茶", "lemon"),
+        ("我们不看看更适合LLM的硅基A03?", "a03"),
+        ("Claude Code 上下文断了", "claude_vps"),
+        ("VPS 上跑 Claude Code 的用户怎么处理", "claude_vps"),
+        ("你还记得换工作的事吗", "job_change"),
+        ("NYU beta 又要测了吗", "nyu"),
+        ("灵动岛 start update 策略怎么走", "live_activity"),
+        ("API onboarding 图片上传失败", "image_api"),
+        ("raw JSON 原始输出又出现了", "raw_json"),
+        ("不要再叫我老师", "correction_global"),
+        ("柠檬茶不是冰的", "correction_lemon"),
+    ],
+)
+def test_model_api_entity_and_phrase_queries_recall_expected_cards(query, expected_id):
+    out, trace = _select_context_memories_with_trace(
+        _retrieval_fixture_moments(),
+        query,
+        mode="model_api",
+    )
+
+    out_ids = [m["id"] for m in out]
+    assert expected_id in out_ids
+    selected = {item["id"]: item for item in trace["selected"]}
+    assert selected[expected_id]["confidence"] in {"strong", "medium"}
+    assert selected[expected_id]["reason"] != "weak_generic_overlap"
+
+
+@pytest.mark.parametrize(
+    ("query", "forbidden_id"),
+    [
+        ("project deadline", "toho"),
+        ("明天有一个project要完成，好累", "toho"),
+        ("好累", "toho"),
+        ("好累", "pressure"),
+        ("api key 过期了吗", "image_api"),
+        ("今天测试一下", "image_api"),
+        ("你怎么看这个模型", "a03"),
+        ("chat 页面卡住了", "claude_vps"),
+        ("代码 prompt 怎么改", "toho"),
+        ("我想完成任务", "pressure"),
+        ("喝水", "lemon"),
+        ("照片在哪里", "image_api"),
+    ],
+)
+def test_model_api_generic_queries_do_not_recall_false_positive_cards(query, forbidden_id):
+    moments = [
+        m for m in _retrieval_fixture_moments()
+        if not str(m.get("source") or "").endswith("correction")
+    ]
+
+    out, trace = _select_context_memories_with_trace(
+        moments,
+        query,
+        mode="model_api",
+    )
+
+    out_ids = [m["id"] for m in out]
+    assert forbidden_id not in out_ids
+    rejected = {item["id"]: item for item in trace["rejected_sample"]}
+    if forbidden_id in rejected:
+        assert rejected[forbidden_id]["confidence"] == "weak"
+
+
+def test_model_api_only_project_word_rejects_toho_even_when_toho_is_newest():
+    moments = [
+        _moment(
+            id="pressure",
+            title="近期项目压力",
+            description="用户明天有一个项目要完成，觉得很累。",
+            occurred_at="2026-01-01T00:00:00",
+        ),
+        _moment(
+            id="toho",
+            title="TOHO Project 老二次元偏好",
+            description="用户是 toho project（东方Project）老二次元。",
+            occurred_at="2026-12-31T00:00:00",
+        ),
+    ]
+
+    out, trace = _select_context_memories_with_trace(moments, "project", mode="model_api")
+
+    assert [m["id"] for m in out] == []
+    assert {item["id"] for item in trace["rejected_sample"]} == {"toho"}
+
+
+def test_model_api_mixed_alias_handles_spaces_between_chinese_and_english():
+    moments = [
+        _moment(
+            id="toho",
+            title="TOHO Project 老二次元偏好",
+            description="用户喜欢东方 Project 和上海爱丽丝幻乐团相关内容。",
+        )
+    ]
+
+    out = _select_context_memories(
+        moments,
+        "东方 Project 的曲子",
+        mode="model_api",
+    )
+
+    assert [m["id"] for m in out] == ["toho"]
+
+
+def test_model_api_keeps_at_most_two_global_corrections():
+    moments = [
+        {
+            **_moment(id=f"corr{i}", title=f"边界更新 {i}", description=f"以后不要再使用称呼 {i}。"),
+            "source": "model_api_correction",
+        }
+        for i in range(4)
+    ]
+
+    out = _select_context_memories(
+        moments,
+        "今天聊点别的",
+        mode="model_api",
+    )
+
+    assert len(out) == 2
+    assert all(m["id"].startswith("corr") for m in out)
+
+
+def test_model_api_keeps_at_most_three_query_relevant_cards():
+    moments = [
+        _moment(id=f"tea{i}", title=f"柠檬茶记忆 {i}", description=f"用户第 {i} 次提到柠檬茶。")
+        for i in range(6)
+    ]
+
+    out = _select_context_memories(
+        moments,
+        "柠檬茶还记得吗",
+        mode="model_api",
+    )
+
+    assert len(out) == 3
+
+
+def test_model_api_archived_cards_are_excluded_even_when_strong_match():
+    moments = [
+        {
+            **_moment(
+                id="archived_toho",
+                title="TOHO Project 老二次元偏好",
+                description="用户喜欢东方Project。",
+            ),
+            "is_archived": True,
+        }
+    ]
+
+    out, trace = _select_context_memories_with_trace(
+        moments,
+        "东方Project",
+        mode="model_api",
+    )
+
+    assert out == []
+    assert trace["selected"] == []
+
+
+def test_public_selector_strips_selection_metadata():
+    out = _select_context_memories(
+        _retrieval_fixture_moments(),
+        "烧卖和蒸饺是谁？",
+        mode="model_api",
+    )
+
+    assert out
+    assert "selection" not in out[0]
+
+
+def test_trace_keeps_rejected_sample_out_of_selected_cards():
+    out, trace = _select_context_memories_with_trace(
+        _retrieval_fixture_moments(),
+        "明天有一个project要完成，好累",
+        mode="model_api",
+    )
+
+    selected_ids = {m["id"] for m in out}
+    rejected_ids = {item["id"] for item in trace["rejected_sample"]}
+    assert "pressure" in selected_ids
+    assert "toho" not in selected_ids
+    assert "toho" in rejected_ids
+
+
+def test_model_api_trace_records_query_units_for_debugging():
+    _out, trace = _select_context_memories_with_trace(
+        _retrieval_fixture_moments(),
+        "明天有一个project要完成，好累",
+        mode="model_api",
+    )
+
+    assert "project" in trace["query_units"]
+    assert "project" in trace["query_weak_terms"]
+    assert "明天" in trace["query_weak_terms"]
