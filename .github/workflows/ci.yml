@@ -28,7 +28,7 @@ jobs:
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          version: 1.7.1   # pin a concrete version: 'stable' makes foundryup hit the rate-limited GitHub API (403 in CI)
 
       - name: forge build
         run: forge build --sizes
@@ -318,7 +318,7 @@ jobs:
 
       - uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          version: 1.7.1   # pin a concrete version: 'stable' makes foundryup hit the rate-limited GitHub API (403 in CI)
 
       - uses: actions/setup-python@v5
         with:
@@ -476,7 +476,7 @@ jobs:
 
       - uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          version: 1.7.1   # pin a concrete version: 'stable' makes foundryup hit the rate-limited GitHub API (403 in CI)
 
       - uses: actions/setup-python@v5
         with:
