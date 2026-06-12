@@ -66,7 +66,7 @@ mkdir -p ~/feedling-data
 EOF
 ```
 
-**Verify:** `ssh <user>@<host> "~/feedling-venv/bin/python -c 'import flask, fastmcp, httpx, jwt, websockets'"` exits 0.
+**Verify:** `ssh <user>@<host> "~/feedling-venv/bin/python -c 'import flask, httpx, jwt, websockets'"` exits 0.
 
 If you have an Apple `.p8` push key, scp it onto the VPS:
 
@@ -103,13 +103,12 @@ shared-key `SINGLE_USER` mode. The first API key is minted in step 5 by
 ```bash
 ssh <user>@<host> <<'EOF'
 sudo cp ~/feedling-mcp/deploy/feedling-backend.service /etc/systemd/system/
-sudo cp ~/feedling-mcp/deploy/feedling-mcp.service     /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now feedling-backend feedling-mcp
+sudo systemctl enable --now feedling-backend
 EOF
 ```
 
-**Verify:** `ssh <user>@<host> "sudo systemctl is-active feedling-backend feedling-mcp"` prints `active` twice.
+**Verify:** `ssh <user>@<host> "sudo systemctl is-active feedling-backend"` prints `active`.
 
 ---
 
@@ -136,7 +135,7 @@ you get 401, the key wasn't captured — check
 ## 6. (Optional but recommended) HTTPS via Caddy
 
 Only run this **after** you've pointed DNS for `api.<your-domain>` and
-`mcp.<your-domain>` at the VPS.
+`api.<your-domain>` at the VPS.
 
 ```bash
 ssh <user>@<host> <<EOF
@@ -196,26 +195,9 @@ launchd, supervisor, pm2) so the consumer is not a child job of the
 current agent chat turn or top-level gateway. See
 **[`tools/README.md`](../tools/README.md)** for the full setup.
 
-### Option B — Chat-client MCP
+### ~~Option B — Chat-client MCP~~（removed 2026-06-12）
 
-Use this for Claude Desktop / Claude.ai / ChatGPT / Gemini-style products
-that connect to tools through MCP. Add the connection in the agent runtime's
-config:
-
-```
-claude mcp add feedling --transport sse "https://mcp.<your-domain>/sse?key=<api_key>"
-```
-
-The agent fetches the public skill from
-`https://raw.githubusercontent.com/teleport-computer/io-onboarding/main/skill-chat-client.md`
-and follows it.
-
-Direct MCP is enough for bootstrap, memory, and identity. For reliable
-ongoing IO Chat, the runtime must keep listening after the user closes the
-window/session. If it cannot, pair the MCP client with Option A before the
-first IO greeting.
-
----
+The MCP user line was removed; use Option A (resident consumer).
 
 ## 9. Verify end-to-end
 
@@ -238,11 +220,10 @@ If the reply never arrives, see **Troubleshooting** below.
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | iOS chat sends but never gets reply | No agent is connected — neither MCP nor chat-resident is running | Run `python tools/check_chat_pipeline.py` against your URL; it will tell you which layer is missing |
-| MCP tool calls return 401 | Wrong `?key=` in the `claude mcp add` command | Re-fetch the MCP String from iOS Settings → Storage and re-import |
 | 401 `user_not_found` (cloud users will see this too) | User just ran Delete Account & Reset; agent is pinned to the dead key | iOS Settings → Storage → copy new MCP String → re-import into the agent runtime |
 | Live Activity never updates | `.p8` key missing or `APNS_SANDBOX=False` on a TestFlight build | Place `AuthKey_<KEY_ID>.p8` in `~/feedling-data/`; flip `APNS_SANDBOX` for App Store builds |
 | Frames not arriving via WebSocket | Port 9998 blocked or WS auth failing | Open port 9998 in the VPS firewall; the broadcast extension forwards the api_key as a Bearer token |
-| `chat-resident` logs "no plaintext content" for every user message | Neither `FEEDLING_ENCLAVE_URL` nor `FEEDLING_MCP_URL` is configured | Set one of them in `~/feedling-chat-resident.env`. See `tools/README.md`. |
+| `chat-resident` logs "no plaintext content" for every user message | `FEEDLING_ENCLAVE_URL` is not configured | Set it in `~/feedling-chat-resident.env`. See `tools/README.md`. |
 
 ### Mandatory re-auth + E2E verification (after any of these events)
 

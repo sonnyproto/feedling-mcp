@@ -266,17 +266,7 @@ _SCREEN_CONTEXT_TRIGGER_RE = re.compile(
 # FEEDLING_ENCLAVE_URL: direct HTTP to the enclave decrypt proxy (fastest,
 #   same value as FEEDLING_ENCLAVE_URL in mcp_server.py, e.g. https://127.0.0.1:5003).
 #
-# FEEDLING_MCP_URL: URL of the Feedling MCP server (e.g. https://mcp.feedling.app
-#   or https://127.0.0.1:5002).  The consumer calls feedling_chat_get_history
-#   via the MCP server, which runs inside the enclave and can decrypt.
-#   Requires FEEDLING_MCP_TRANSPORT=streamable-http on the MCP server.
-#
-# WARNING: if neither is set, /v1/chat/poll returns content="" for all v1
-# encrypted messages and the consumer will never be able to reply.
-# ---------------------------------------------------------------------------
 FEEDLING_ENCLAVE_URL = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
-FEEDLING_MCP_URL = os.environ.get("FEEDLING_MCP_URL", "").rstrip("/")
-FEEDLING_MCP_KEY = os.environ.get("FEEDLING_MCP_KEY", FEEDLING_API_KEY)
 
 
 def _consumer_commit() -> str:
@@ -308,85 +298,8 @@ _ENCLAVE_CLIENT: httpx.Client | None = (
     httpx.Client(timeout=20, verify=False) if FEEDLING_ENCLAVE_URL else None
 )
 
-# Optional FastMCP async client for the MCP-sourced decryption path.
-_fastmcp_cls = None
-try:
-    import asyncio as _asyncio
-    from fastmcp import Client as _FastMCPCls
-    _fastmcp_cls = _FastMCPCls
-except ImportError:
-    pass
-
-# Transport probe cache: base_url → working endpoint URL (or None if unreachable).
-_mcp_transport_cache: dict[str, str | None] = {}
-
-
-def _mcp_supports_headers() -> bool:
-    """Return True if the installed fastmcp.Client.__init__ accepts headers=."""
-    if _fastmcp_cls is None:
-        return False
-    try:
-        return "headers" in inspect.signature(_fastmcp_cls.__init__).parameters
-    except (ValueError, TypeError):
-        return False
-
-
-def _probe_mcp_transport_sync(base_url: str) -> str | None:
-    """Probe MCP server for a working transport endpoint and cache the result.
-
-    Tries streamable-HTTP (/mcp POST) first, then SSE (/sse GET).
-    Returns the working endpoint URL, or None if neither responds.
-    """
-    if base_url in _mcp_transport_cache:
-        return _mcp_transport_cache[base_url]
-
-    url: str | None = None
-    auth_headers = {"Authorization": f"Bearer {FEEDLING_MCP_KEY}"}
-
-    # Probe streamable-HTTP
-    try:
-        resp = httpx.post(
-            f"{base_url}/mcp",
-            headers=auth_headers,
-            content=b"{}",
-            timeout=5,
-            verify=False,
-        )
-        if resp.status_code != 404:
-            url = f"{base_url}/mcp"
-            log.info("MCP transport: streamable-HTTP at %s/mcp", base_url)
-    except Exception as e:
-        log.debug("MCP /mcp probe failed: %s", e)
-
-    # Probe SSE if streamable-HTTP not found
-    if url is None:
-        sse_url = f"{base_url}/sse?key={FEEDLING_MCP_KEY}"
-        try:
-            with httpx.stream(
-                "GET",
-                sse_url,
-                timeout=httpx.Timeout(connect=5.0, read=1.0, write=5.0, pool=5.0),
-                verify=False,
-            ) as resp:
-                if resp.status_code == 200:
-                    url = sse_url
-                    log.info("MCP transport: SSE at %s/sse", base_url)
-        except httpx.ReadTimeout:
-            # ReadTimeout after connect = SSE stream started, endpoint is alive.
-            url = sse_url
-            log.info("MCP transport: SSE at %s/sse (streaming)", base_url)
-        except Exception as e:
-            log.debug("MCP /sse probe failed: %s", e)
-
-    if url is None:
-        log.warning("MCP probe: %s unreachable on /mcp and /sse", base_url)
-
-    _mcp_transport_cache[base_url] = url
-    return url
-
 _decrypt_sources = (
     f"enclave={FEEDLING_ENCLAVE_URL}" if FEEDLING_ENCLAVE_URL else ""
-    + (f" mcp={FEEDLING_MCP_URL}" if FEEDLING_MCP_URL else "")
 ).strip() or "NONE — replies will not work for v1 encrypted messages"
 
 log.info(
@@ -528,162 +441,6 @@ def _fetch_from_enclave(since: float, limit: int) -> list[dict] | None:
         return None
 
 
-def _fetch_from_mcp(since: float, limit: int) -> list[dict] | None:
-    """Call feedling_chat_get_history via the MCP server.
-
-    Supports both streamable-HTTP (/mcp) and SSE (/sse) transports, detected
-    via _probe_mcp_transport_sync.  Handles older fastmcp versions that lack
-    the headers= kwarg by embedding the key in the URL instead.
-
-    Returns list on success, None on error or not configured.
-    """
-    if not FEEDLING_MCP_URL or _fastmcp_cls is None:
-        return None
-
-    transport_url = _probe_mcp_transport_sync(FEEDLING_MCP_URL)
-    if transport_url is None:
-        log.warning("MCP source unreachable — no working transport endpoint")
-        return None
-
-    supports_headers = _mcp_supports_headers()
-
-    def _extract_messages_from_mcp_result(result_obj) -> list[dict]:
-        """Parse FastMCP call_tool return shapes across client versions."""
-        image_blocks: list[str] = []
-
-        def _maybe_parse_json_text(text: str):
-            if not text:
-                return None
-            try:
-                data = json.loads(text)
-            except Exception:
-                return None
-            if isinstance(data, dict):
-                msgs = data.get("messages") or data.get("history")
-                if isinstance(msgs, list):
-                    return msgs
-            return None
-
-        def _maybe_image_b64(item: Any) -> str | None:
-            data = getattr(item, "data", None)
-            mime = getattr(item, "mimeType", None) or getattr(item, "mime_type", None)
-            typ = getattr(item, "type", None)
-            if isinstance(item, dict):
-                data = data if data is not None else item.get("data")
-                mime = mime or item.get("mimeType") or item.get("mime_type")
-                typ = typ or item.get("type")
-            if data is None:
-                return None
-            if typ not in (None, "image") and not str(mime or "").startswith("image/"):
-                return None
-            if isinstance(data, bytes):
-                return base64.b64encode(data).decode("ascii")
-            if isinstance(data, str) and data.strip():
-                value = data.strip()
-                return value.split(",", 1)[1] if value.startswith("data:") else value
-            return None
-
-        def _attach_image_blocks(msgs: list[dict]) -> list[dict]:
-            if not image_blocks:
-                return msgs
-            for msg in msgs:
-                if not isinstance(msg, dict):
-                    continue
-                marker = msg.get("image_b64")
-                if not isinstance(marker, str):
-                    continue
-                m = re.fullmatch(r"<vision_block:(\d+)>", marker.strip())
-                if not m:
-                    continue
-                idx = int(m.group(1))
-                if 0 <= idx < len(image_blocks):
-                    msg["image_b64"] = image_blocks[idx]
-            return msgs
-
-        if result_obj is None:
-            return []
-
-        # Newer shape: CallToolResult(content=[...], structured_content=...)
-        content_list = getattr(result_obj, "content", None)
-        if isinstance(content_list, list):
-            parsed_msgs: list[dict] | None = None
-            for item in content_list:
-                image_b64 = _maybe_image_b64(item)
-                if image_b64:
-                    image_blocks.append(image_b64)
-                    continue
-                text = getattr(item, "text", None)
-                if isinstance(text, str):
-                    parsed = _maybe_parse_json_text(text)
-                    if parsed is not None:
-                        parsed_msgs = parsed
-            if parsed_msgs is not None:
-                return _attach_image_blocks(parsed_msgs)
-
-        structured = getattr(result_obj, "structured_content", None)
-        if isinstance(structured, dict):
-            msgs = structured.get("messages") or structured.get("history")
-            if isinstance(msgs, list):
-                return _attach_image_blocks(msgs)
-
-        text_attr = getattr(result_obj, "text", None)
-        if isinstance(text_attr, str):
-            parsed = _maybe_parse_json_text(text_attr)
-            if parsed is not None:
-                return _attach_image_blocks(parsed)
-
-        # Older shape: list[ContentLike]
-        if isinstance(result_obj, list):
-            parsed_msgs: list[dict] | None = None
-            for item in result_obj:
-                image_b64 = _maybe_image_b64(item)
-                if image_b64:
-                    image_blocks.append(image_b64)
-                    continue
-                text = getattr(item, "text", None)
-                if isinstance(text, str):
-                    parsed = _maybe_parse_json_text(text)
-                    if parsed is not None:
-                        parsed_msgs = parsed
-                        continue
-                parsed = _maybe_parse_json_text(str(item))
-                if parsed is not None:
-                    parsed_msgs = parsed
-            if parsed_msgs is not None:
-                return _attach_image_blocks(parsed_msgs)
-
-        parsed = _maybe_parse_json_text(str(result_obj))
-        return _attach_image_blocks(parsed) if parsed is not None else []
-
-    async def _call():
-        if supports_headers:
-            client_ctx = _fastmcp_cls(
-                transport_url,
-                headers={"Authorization": f"Bearer {FEEDLING_MCP_KEY}"},
-            )
-        else:
-            # Older fastmcp: embed auth in URL.  For SSE the key is already
-            # in the URL from probe; for /mcp add it as a query param.
-            if "?" not in transport_url:
-                keyed_url = f"{transport_url}?key={FEEDLING_MCP_KEY}"
-            else:
-                keyed_url = transport_url  # SSE: ?key=… already present
-            client_ctx = _fastmcp_cls(keyed_url)
-
-        async with client_ctx as client:
-            result = await client.call_tool(
-                "feedling_chat_get_history", {"limit": limit}
-            )
-            msgs = _extract_messages_from_mcp_result(result)
-            return _filter_since(msgs, since)
-
-    try:
-        return _asyncio.run(_call())
-    except Exception as e:
-        log.warning("MCP history fetch failed: %s", e)
-        return None
-
-
 def _verify_decrypt_sources() -> bool:
     """Probe all configured decrypt sources at startup.
 
@@ -711,17 +468,6 @@ def _verify_decrypt_sources() -> bool:
                 FEEDLING_ENCLAVE_URL, e,
             )
 
-    if FEEDLING_MCP_URL:
-        transport_url = _probe_mcp_transport_sync(FEEDLING_MCP_URL)
-        if transport_url:
-            log.info("decrypt source OK: MCP at %s", transport_url)
-            any_ok = True
-        else:
-            log.error(
-                "decrypt source UNREACHABLE: MCP at %s — no working transport",
-                FEEDLING_MCP_URL,
-            )
-
     return any_ok
 
 
@@ -737,13 +483,7 @@ def get_decrypted_history(since: float, limit: int = 20) -> list[dict] | None:
         result = _fetch_from_enclave(since, limit)
         if result is not None:
             return result
-        log.warning("enclave source failed; trying MCP source if configured")
-
-    if FEEDLING_MCP_URL:
-        result = _fetch_from_mcp(since, limit)
-        if result is not None:
-            return result
-        log.warning("MCP source failed")
+        log.warning("enclave source failed")
 
     return None  # no configured source succeeded
 
@@ -3130,8 +2870,7 @@ def _process_messages(messages: list) -> float:
             # Never send a fallback for content we cannot read.
             log.warning(
                 "user message has no plaintext content ts=%.3f content_type=%s "
-                "— skipping (set FEEDLING_ENCLAVE_URL or FEEDLING_MCP_URL to "
-                "enable decryption)",
+                "— skipping (set FEEDLING_ENCLAVE_URL to enable decryption)",
                 ts, content_type,
             )
             latest = max(latest, ts)
@@ -3253,23 +2992,20 @@ def run() -> None:
 
     _warn_if_agent_entry_may_drift()
 
-    if FEEDLING_ENCLAVE_URL or FEEDLING_MCP_URL:
+    if FEEDLING_ENCLAVE_URL:
         if not _verify_decrypt_sources():
             log.critical(
-                "All configured decrypt sources are unreachable "
-                "(enclave=%s mcp=%s). Cannot decrypt user messages — exiting.",
-                FEEDLING_ENCLAVE_URL or "unset",
-                FEEDLING_MCP_URL or "unset",
+                "Decrypt source unreachable (enclave=%s). "
+                "Cannot decrypt user messages — exiting.",
+                FEEDLING_ENCLAVE_URL,
             )
             sys.exit(1)
     else:
         log.warning(
-            "⚠️  No decryption source configured (FEEDLING_ENCLAVE_URL and "
-            "FEEDLING_MCP_URL are both unset). "
+            "⚠️  No decryption source configured (FEEDLING_ENCLAVE_URL is unset). "
             "User messages in v1 encrypted mode have content=\"\" and will be "
             "silently skipped — the consumer will never send replies. "
-            "Set FEEDLING_ENCLAVE_URL (direct enclave) or FEEDLING_MCP_URL "
-            "(via MCP server) to fix this."
+            "Set FEEDLING_ENCLAVE_URL (direct enclave) to fix this."
         )
 
     last_ts = _load_checkpoint()
@@ -3360,7 +3096,7 @@ def run() -> None:
 
             # poll is used only as a trigger — its content fields are "" for
             # v1 encrypted envelopes. Fetch actual plaintext from a decrypt source.
-            if FEEDLING_ENCLAVE_URL or FEEDLING_MCP_URL:
+            if FEEDLING_ENCLAVE_URL:
                 decrypted = get_decrypted_history(since=last_ts, limit=20)
                 if decrypted is None:
                     # All configured sources failed — skip this cycle, keep checkpoint.

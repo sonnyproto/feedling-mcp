@@ -61,7 +61,7 @@ RUN useradd --system --uid 1000 --home-dir /home/feedling --create-home feedling
  && chown -R feedling:feedling /data /tls /app
 USER feedling
 
-EXPOSE 5001 5002 9998
+EXPOSE 5001 9998
 
 # Default command runs the Flask backend under gunicorn (production WSGI;
 # the Werkzeug dev server in app.run() stalls on large responses under the

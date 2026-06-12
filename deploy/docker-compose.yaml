@@ -6,7 +6,6 @@
 #
 # Ports published:
 #   5001  — Flask HTTP API (iOS app + HTTP-skill agents)
-#   5002  — FastMCP SSE (Claude.ai / MCP clients)
 #   9998  — WebSocket frame ingest (iOS broadcast extension)
 #
 # Data persists under the named volume `feedling_data` (maps to /data in the
@@ -17,9 +16,9 @@
 # deploy/Caddyfile) so TLS config stays independent of container restarts.
 #
 # dstack readiness (see docs/DESIGN_E2E.md):
-#   When the E2E phase ships, the `mcp` service here gets replaced by a
+#   When the E2E phase ships, services here get replaced by a
 #   dstack-deployed CVM. This compose file will continue to run the `backend`
-#   service on the non-TEE host. No rewrite; the mcp block just moves out.
+#   service on the non-TEE host.
 #
 # -----------------------------------------------------------------------------
 # § ENV-VAR HYGIENE AUDIT (see docs/DESIGN_E2E.md §7.2, §12.11)
@@ -47,7 +46,6 @@
 #                                     in dev without registering, set a shared
 #                                     key via your own override file and publish
 #                                     its compose_hash.
-#   FEEDLING_MCP_TRANSPORT          — BAKED to sse. No silent downgrade.
 #   FEEDLING_FLASK_URL              — BAKED to the compose-internal DNS name.
 #                                     Operator can't redirect to a snooping
 #                                     Flask.
@@ -125,25 +123,6 @@ services:
       timeout: 3s
       retries: 5
       start_period: 10s
-
-  mcp:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-    image: feedling-mcp:dev
-    command: ["python", "-u", "backend/mcp_server.py"]
-    restart: unless-stopped
-    environment:
-      # --- BAKED: security-relevant ---
-      FEEDLING_API_KEY: ""
-      FEEDLING_FLASK_URL: "http://backend:5001"
-      FEEDLING_MCP_PORT: "5002"
-      FEEDLING_MCP_TRANSPORT: "sse"
-    ports:
-      - "5002:5002"
-    depends_on:
-      backend:
-        condition: service_healthy
 
 volumes:
   feedling_data:

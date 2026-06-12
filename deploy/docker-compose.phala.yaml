@@ -1,14 +1,13 @@
 # Feedling — Phala TDX CVM compose (CVM-only, post-VPS migration).
 #
 # VPS is gone. This compose is the whole production stack:
-#   - dstack-ingress: TLS termination for mcp.feedling.app + api.feedling.app
+#   - dstack-ingress: TLS termination for api.feedling.app
 #   - backend:       Flask (HTTP+WS) — sole source of truth for user data
-#   - mcp:           FastMCP SSE (plain HTTP behind ingress)
 #   - enclave:       decrypt proxy + /attestation (own TLS on :5003,
 #                    reachable via dstack-gateway `-5003s.` passthrough)
 #
 # IMPORTANT: this replaces the prior VPS+CVM split. DNS A-records for
-# both `mcp.feedling.app` and `api.feedling.app` are migrated off
+# `api.feedling.app` is migrated off
 # the retired VPS host and onto Phala's dstack-gateway. Existing prod users
 # re-onboard from scratch (per user direction 2026-04-21).
 #
@@ -20,17 +19,15 @@
 #
 # DNS records dstack-ingress manages automatically (needs CF token with
 # Zone.DNS:Edit on feedling.app):
-#   CNAME mcp.feedling.app → <app-id>.dstack-pha-prod9.phala.network
 #   CNAME api.feedling.app → <app-id>.dstack-pha-prod9.phala.network
-#   TXT   _dstack-app-address.mcp.feedling.app → <app-id>:443
 #   TXT   _dstack-app-address.api.feedling.app → <app-id>:443
-#   CAA   mcp.feedling.app / api.feedling.app pinned to Let's Encrypt
+#   CAA   api.feedling.app pinned to Let's Encrypt
 #
 # Deploy flow:
 #   1. `phala deploy -c deploy/docker-compose.phala.yaml -n feedling-enclave-v2 \
 #         --node-id <prod9-node-id> -e CF_API_TOKEN=... -e CF_ZONE_ID=...`
 #   2. Wait for ingress to issue LE certs (first-time boot ~2–3 min).
-#   3. Update CF DNS: A records for mcp/api → the public IP printed by
+#   3. Update CF DNS: A record for api → the public IP printed by
 #      `phala cvms get feedling-enclave-v2` (or the CNAME target above).
 #   4. Compute compose_hash; publish on-chain via FeedlingAppAuth.addComposeHash.
 #   5. iOS follow-up PR: update `AuditCardView.swift` `makeAttestationURL`
@@ -47,7 +44,7 @@
 name: feedling-enclave
 
 services:
-  # --- Public TLS termination for both custom domains (mcp + api). ---
+  # --- Public TLS termination for the api custom domain. ---
   # HAProxy-based L4/L7 ingress inside the TDX CVM. Issues LE certs via
   # CF DNS-01, routes by SNI. Key material stays inside the enclave
   # volume `letsencrypt` — the CF token only has DNS-edit scope, not
@@ -62,12 +59,9 @@ services:
       GATEWAY_DOMAIN: "_.dstack-pha-prod9.phala.network"
       SET_CAA: "true"
       CERTBOT_EMAIL: "security@feedling.app"
-      # Multi-domain mode: one container, two SNI-routed upstreams.
       DOMAINS: |
-        mcp.feedling.app
         api.feedling.app
       ROUTING_MAP: |
-        mcp.feedling.app=mcp:5002
         api.feedling.app=backend:5001
       # CF_API_TOKEN must be injected via `phala deploy -e` (encrypted
       # env channel, NOT baked into compose_hash). Required scopes:
@@ -83,8 +77,6 @@ services:
       - feedling_ingress_evidences:/evidences
     depends_on:
       backend:
-        condition: service_started
-      mcp:
         condition: service_started
 
   # --- Attestation service + decrypt proxy. ---
@@ -103,16 +95,6 @@ services:
       FEEDLING_DATA_DIR: "/data"
       FEEDLING_ENCLAVE_TLS: "true"
       FEEDLING_FLASK_URL: "http://backend:5001"
-      # Post-prod9 migration: MCP terminates plain HTTP behind
-      # dstack-ingress. The LE cert for mcp.feedling.app lives on the
-      # ingress volume, NOT derived from dstack-KMS path
-      # `feedling-mcp-tls-v1`, so the Phase C.2 pubkey fingerprint no
-      # longer has a live counterpart. Leave empty → iOS renders the
-      # "Pre-Phase-C.2 deployment" disclosure row (already supported).
-      # Flip back to "true" only if restoring the MCP-in-enclave-TLS
-      # mode (compose would also need to re-add ACME env + mount
-      # /var/run/dstack.sock for the mcp service).
-      FEEDLING_MCP_TLS_IN_ENCLAVE: "false"
       # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
       # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
       # even when the value is empty, so an empty string would make it
@@ -192,29 +174,6 @@ services:
     depends_on:
       enclave:
         condition: service_healthy
-
-  # --- MCP SSE server (plain HTTP behind ingress). ---
-  # TLS termination moved to the ingress service; MCP speaks HTTP only.
-  # Consequence: the Phase C.2 MCP-port pubkey-pin (derived from
-  # dstack-KMS at path `feedling-mcp-tls-v1`) is no longer in this path.
-  # Ingress owns the LE cert for mcp.feedling.app. iOS audit card either
-  # (a) drops the MCP-TLS pin row, or (b) pins the ingress cert SPKI via
-  # a new attested fingerprint. See header TODO.
-  mcp:
-    image: ghcr.io/teleport-computer/feedling:857c09e
-    command: ["python", "-u", "backend/mcp_server.py"]
-    restart: unless-stopped
-    environment:
-      FEEDLING_API_KEY: ""
-      FEEDLING_FLASK_URL: "http://backend:5001"
-      FEEDLING_ENCLAVE_URL: "https://enclave:5003"
-      FEEDLING_MCP_PORT: "5002"
-      FEEDLING_MCP_TRANSPORT: "sse"
-      # Plain HTTP — ingress terminates TLS.
-      FEEDLING_MCP_TLS: "false"
-    depends_on:
-      backend:
-        condition: service_started
 
 volumes:
   feedling_enclave_data:

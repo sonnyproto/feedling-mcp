@@ -15,7 +15,7 @@ Pick the highest-priority path that can honestly own Live connection:
 
 1. **Independent resident consumer** — use `chat_resident_consumer.py`. This is the normal path for Hermes / OpenClaw / Mac mini / VPS agents.
 2. **HTTP/API agent backend** — still use `chat_resident_consumer.py`; it polls Feedling and POSTs user messages into your API.
-3. **Desktop MCP runtime** — only skip the bridge if that desktop/runtime process truly stays alive and keeps polling without another operator prompt.
+3. **Long-lived desktop runtime** — only skip the bridge if that desktop/runtime process truly stays alive and keeps polling without another operator prompt.
 
 | Your agent runtime | Use chat-resident? |
 |--|--|
@@ -23,20 +23,19 @@ Pick the highest-priority path that can honestly own Live connection:
 | Hermes / OpenClaw / Claude Code on a Mac mini or VPS | **Yes.** Run this independent consumer and point it at the runtime's HTTP or CLI entry. |
 | Hermes CLI / mcporter / any CLI that exits after one invocation | **Yes.** The consumer keeps the long-running loop and invokes the CLI per message. |
 | Custom Python script that just makes HTTP requests | **Yes.** |
-| Plain Anthropic / OpenAI API loop without MCP support | **Yes.** |
+| Plain Anthropic / OpenAI API loop | **Yes.** |
 | Local Llama / Ollama / vLLM serving a `/chat` endpoint | **Yes.** |
 | A CLI tool you want to use as the agent (Hermes-CLI, etc.) | **Yes.** |
 
 If you're in the "Yes" rows, `chat_resident_consumer.py` is the bridge. The
 test is whether Feedling has a long-running poll owner, not brand name and not
-whether MCP tools exist in some other surface.
+whether agent tools exist in some other surface.
 
 ### What it does
 
 1. Long-polls `GET {FEEDLING_API_URL}/v1/chat/poll` for new user messages.
 2. Fetches each message's plaintext from a configured **decrypt source**
-   (the enclave's `/v1/chat/history` mirror, or — fallback — the MCP
-   server's `feedling_chat_get_history` tool).
+   (the enclave's `/v1/chat/history` mirror).
 3. Calls your agent backend with the plaintext message and, for image
    messages, the decrypted image context (HTTP POST or CLI invocation,
    configurable).
@@ -66,7 +65,7 @@ or in `{image_path}` / `{image_paths}` template slots.
 cp deploy/chat_resident.env.example ~/feedling-chat-resident.env
 chmod 600 ~/feedling-chat-resident.env
 # Edit ~/feedling-chat-resident.env — fill FEEDLING_API_URL, FEEDLING_API_KEY,
-# AGENT_MODE, and one of FEEDLING_ENCLAVE_URL / FEEDLING_MCP_URL.
+# AGENT_MODE, and FEEDLING_ENCLAVE_URL.
 
 # Run in the foreground for testing
 python tools/chat_resident_consumer.py
@@ -139,7 +138,7 @@ be pointed at a decrypt source to read what the user wrote.
 Set one of:
 
 - **`FEEDLING_ENCLAVE_URL`** (recommended) — direct HTTPS to the
-  enclave's decrypt proxy. Same value as `mcp_server.py` uses.
+  enclave's decrypt proxy.
 - **`FEEDLING_MCP_URL`** (fallback) — calls `feedling_chat_get_history`
   on the MCP server. Requires `FEEDLING_MCP_TRANSPORT=streamable-http`.
 

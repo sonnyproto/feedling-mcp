@@ -49,6 +49,52 @@
 
 ## 2026-06-12
 
+### [DONE] 新增 CONTRIBUTING.md：后端代码组织规范
+- 把拆分重构沉淀成团队规则：app.py 只做装配；新路由进领域包 Blueprint、
+  新逻辑进 service 层；依赖只准向下（向上用注入钩子）；跨模块调用
+  `module.func()` 形式保证 monkeypatch 单点生效；全局单例只就地变更
+  不重绑；COMPAT 段只减不增；单文件 800 行预警 / 1500 行强拆；附 PR
+  自查清单。
+- `CLAUDE.md` 阅读顺序加入该文档（写后端代码前必读）。
+
+
+## 2026-06-12
+
+### [DECISION][DONE] 移除 MCP 用户条线（路由 A）
+- **拍板**：不再支持 MCP 客户端（Claude.ai / Claude Desktop）直连这条
+  用户线。现存接入只剩路由 B（Resident Consumer）和路由 C（Model API
+  托管）。
+- **删了什么**：
+  - `backend/mcpsrv/`（13 文件 ~2,180 行）+ `backend/mcp_server.py` 入口
+    + `backend/acme_dns01.py`（MCP LE 证书插件，383 行）
+  - consumer 的 MCP 解密回退路径（`tools/chat_resident_consumer.py` 的
+    `FEEDLING_MCP_URL`/`_fetch_from_mcp`/transport 探测，~250 行）——
+    **resident 用户现在必须配置 `FEEDLING_ENCLAVE_URL` 直连 enclave**
+  - `tests/test_mcp_session_isolation.py`（2026-05-11 P0 回归套件，保护
+    对象已不存在）+ consumer 测试里 5 个 MCP transport 用例；CI 同步去掉
+  - 三个 docker-compose 的 `mcp:` 服务块、ingress 的 `mcp.feedling.app`
+    域名/路由、`FEEDLING_MCP_TLS_IN_ENCLAVE`；`deploy/feedling-mcp.service`、
+    Caddyfile 的 mcp 站点、SELF_HOSTING Option B
+  - `fastmcp` 依赖（requirements.txt + lock 重新生成，纯减 587 行）
+- **attestation 兼容**：enclave 删除了 MCP 证书指纹派生路径
+  （`MCP_TLS_IN_ENCLAVE` / `MCP_TLS_KEY_PATH`），但 bundle 里保留
+  `mcp_tls_cert_pubkey_fingerprint_hex` 字段恒为空——iOS 审计卡走既有的
+  "Pre-Phase-C.2 deployment" 披露行，不破坏解析。生产 compose 本就设
+  `FEEDLING_MCP_TLS_IN_ENCLAVE=false`，行为一致。
+- **留了什么（不是 MCP 专属）**：bootstrap 门禁、`/v1/chat/verify_loop`、
+  consumer 心跳、`official_import` access_mode（默认值未动，是否砍另议）、
+  enclave 解密端点、identity/memory 的 HTTP envelope-action 端点。
+- **部署影响**：compose 变更 → 需要新 compose_hash 上链；Cloudflare 的
+  `mcp.feedling.app` CNAME/TXT/CAA 记录可清理。
+- **外部跟进（其他仓库）**：io-onboarding 的 `skill.md`（MCP agent 说明书）
+  需改写或归档；iOS 的 `ChatEmptyStateView.skillURL` 入口与 MCP String
+  相关 UI 需同步调整。
+- 文档同步：PROJECT_OVERVIEW（§5.2/§5.5 墓碑化 + 拓扑图）、RUNTIME_FLOWS
+  （顶部历史注记）、AUDIT.md（row 5/7 措辞）、README、SELF_HOSTING。
+
+
+## 2026-06-12
+
 ### [DONE] backend 单体拆分：app.py 17.6K 行 → 14 个领域包 + 898 行装配层
 - 按「功能域分包为主 + hosted 条线单独成包」拆分（方案见 2026-06-11 拍板）：
   `core/`（config/util/enclave/envelope/store——UserStore+缓存）、`accounts/`

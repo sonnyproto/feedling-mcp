@@ -60,7 +60,7 @@ from flask import Flask, jsonify, Response, request, send_file
 from flask_compress import Compress
 from dstack_sdk import DstackClient
 
-from dstack_tls import derive_tls_cert_and_key, derive_key_only, TLS_KEY_PATH, MCP_TLS_KEY_PATH
+from dstack_tls import derive_tls_cert_and_key, TLS_KEY_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -91,17 +91,6 @@ ENCLAVE_PORT = int(os.environ.get("FEEDLING_ENCLAVE_PORT", 5003))
 # Off by default so the local dstack simulator + curl/httpx stay HTTP.
 # docker-compose.phala.yaml sets this true on real deployments.
 ENCLAVE_TLS = os.environ.get("FEEDLING_ENCLAVE_TLS", "false").lower() == "true"
-# Phase C.2 MCP pubkey pin lives in enclave_app's REPORT_DATA bundle via
-# the `mcp_tls_cert_pubkey_fingerprint_hex` field. It only makes sense
-# when the MCP server terminates its own TLS (derives the LE cert with
-# a dstack-KMS-derived key via `MCP_TLS_KEY_PATH`). Post-prod9 migration
-# the MCP service sits behind dstack-ingress on plain HTTP — the ingress
-# owns the LE cert for `mcp.feedling.app`, and the key is no longer
-# derived from that KMS path. In that mode leave the fingerprint empty;
-# iOS gracefully falls through to the "Pre-Phase-C.2 deployment" row.
-# Default true keeps the pre-migration behavior for any CVM still on
-# the MCP-in-enclave-TLS path.
-MCP_TLS_IN_ENCLAVE = os.environ.get("FEEDLING_MCP_TLS_IN_ENCLAVE", "true").lower() == "true"
 
 # Internal HTTPS (or HTTP in dev) to the non-TEE Flask backend. This is the
 # only network dependency the enclave has after boot. Requests carry the
@@ -152,7 +141,7 @@ APP_AUTH = {
 
 CONTENT_KEY_PATH = "feedling-content-v1"
 SIGNING_KEY_PATH = "feedling-signing-v1"
-# TLS_KEY_PATH is imported from dstack_tls so mcp_server and enclave_app
+# TLS_KEY_PATH is imported from dstack_tls so enclave_app
 # derive from the same KMS-bound path.
 
 
@@ -199,7 +188,7 @@ def derive_keys(dstack: DstackClient) -> dict[str, Any]:
 PHASE1_TLS_FINGERPRINT = b"\x00" * 32
 
 
-# `derive_tls_cert_and_key` is imported from `dstack_tls` so mcp_server
+# `derive_tls_cert_and_key` is imported from `dstack_tls` so enclave_app
 # (which also terminates TLS inside the enclave in Phase C) derives from
 # the same path and produces the same cert.
 
@@ -285,7 +274,10 @@ _state: dict[str, Any] = {
     "content_pk_hex": None,
     "signing_pk_hex": None,
     "tls_cert_fingerprint_hex": PHASE1_TLS_FINGERPRINT.hex(),
-    "mcp_tls_cert_pubkey_fingerprint_hex": "",  # populated in bootstrap() when ENCLAVE_TLS=true
+    # Always empty since the MCP user line was removed (2026-06-12) —
+    # kept in the payload so existing iOS audit-card parsers fall through
+    # to the "Pre-Phase-C.2 deployment" disclosure row.
+    "mcp_tls_cert_pubkey_fingerprint_hex": "",
     "tls_enabled": False,
     "tls_cert_pem": None,  # bytes; only kept for the SSLContext load path
     "tls_key_pem": None,   # bytes; only kept for the SSLContext load path
@@ -320,27 +312,6 @@ def bootstrap():
                 # without the operator realizing the enclave never set it
                 # up. Fail loudly instead.
                 raise RuntimeError(f"TLS derivation failed: {e}") from e
-
-            # Derive MCP cert key to get its pubkey fingerprint. This is
-            # the same key mcp_server.py uses for the ACME CSR, so the LE
-            # cert's public key fingerprint is stable and pre-computable.
-            # Only meaningful when MCP terminates its own TLS; post-prod9
-            # migration ingress owns the cert and this path is skipped.
-            if MCP_TLS_IN_ENCLAVE:
-                try:
-                    mcp_key = derive_key_only(dstack, MCP_TLS_KEY_PATH)
-                    mcp_pub_der = mcp_key.public_key().public_bytes(
-                        serialization.Encoding.DER,
-                        serialization.PublicFormat.SubjectPublicKeyInfo,
-                    )
-                    _state["mcp_tls_cert_pubkey_fingerprint_hex"] = (
-                        hashlib.sha256(mcp_pub_der).hexdigest()
-                    )
-                except Exception as e:
-                    print(f"[enclave] MCP cert fingerprint derivation failed: {e}", flush=True)
-            else:
-                print("[enclave] MCP_TLS_IN_ENCLAVE=false — leaving mcp_tls_cert_pubkey_fingerprint_hex empty "
-                      "(ingress terminates TLS; iOS will show Pre-Phase-C.2 disclosure row)", flush=True)
 
         report_data = build_report_data(
             content_pk_bytes=keys["content_pk_bytes"],

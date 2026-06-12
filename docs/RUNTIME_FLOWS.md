@@ -1,5 +1,13 @@
 # 运行时流程详解：onboarding 之后的日常 · 两种用户路线的完整旅程
 
+> **2026-06-12 注**：MCP 用户条线（路由 A 及全部 `feedling_*` MCP 工具、
+> `mcp.feedling.app`）已移除，见 CHANGELOG。本文中涉及 MCP 工具的流程图
+> 与段落（bootstrap 的 MCP 工具序列、consumer 的 MCP 解密回退、"agent 的
+> 两条手"等）为历史描述，保留供理解既有数据与设计沿革；现行接入只剩
+> 路由 B（Resident Consumer，HTTP API + enclave 直连解密）与路由 C
+> （Model API 托管）。
+
+
 ## 读前术语速查
 
 | 术语 | 通俗解释 |
@@ -193,7 +201,7 @@ Python 进程。把它理解成**传达室**：它不思考、不扮演角色，
    住"处理到哪条了"，重启不会重复处理、也不会漏。
 2. **拆信**：拿到的是密文。调 `get_decrypted_history()` 把内容变成明文
    ——优先直连 enclave 的 `GET /v1/chat/history`（最快），没配 enclave
-   就退回走 MCP。**两个解密源都没配，consumer 拒绝启动**，不存在
+   （MCP 回退已随 MCP 条线移除）。**解密源没配时 consumer 拒绝启动**，不存在
    "悄悄读不到内容"的状态。
 3. **看需不需要带上屏幕**：消息里提到"屏幕 / 看一下 / share / screen…"
    （正则匹配，`_should_attach_screen_context()`）时，去拉最新屏幕帧、
