@@ -96,7 +96,7 @@ jobs:
           exit 1
 
       - name: Run test suite
-        run: python backend/test_api.py http://127.0.0.1:5001 --multi-tenant
+        run: python tests/test_api.py http://127.0.0.1:5001 --multi-tenant
 
       - name: Stop test backend (the isolation suite spawns its own)
         if: always()

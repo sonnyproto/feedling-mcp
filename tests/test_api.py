@@ -3,9 +3,13 @@
 Feedling backend API test suite.
 
 Usage:
-    python test_api.py                        # needs --key or --multi-tenant (everything is auth-gated)
-    python test_api.py https://api.feedling.app --multi-tenant
-    python test_api.py http://localhost:5001 --key <shared_api_key>
+    python tests/test_api.py                  # needs --key or --multi-tenant (everything is auth-gated)
+    python tests/test_api.py https://api.feedling.app --multi-tenant
+    python tests/test_api.py http://localhost:5001 --key <shared_api_key>
+
+NOTE: this is a live-server integration script (point it at a running
+backend), NOT a pytest suite — keep it excluded from `pytest tests/`
+via --ignore, same as e2e_model_api_test.py.
 
 Post-SINGLE_USER/v0 strip (2026-04-20):
     The backend rejects plaintext chat / identity / memory writes with 400.

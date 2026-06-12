@@ -2,9 +2,13 @@
 (model_api_runtime/wake.py): the wake contract / wake event messages and the
 {"actions":[...]} reply parser. No Flask, no DB.
 
-Run:  ../.venv-test/bin/python -m pytest test_model_api_wake.py -q
+Run:  python -m pytest tests/test_model_api_wake.py -q
 """
 import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from model_api_runtime import wake
 

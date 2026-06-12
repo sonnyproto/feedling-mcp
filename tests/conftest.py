@@ -52,7 +52,19 @@ except Exception as e:  # noqa: BLE001 — any failure means "no usable PG"
 # machine with no Postgres `pytest` exits cleanly instead of erroring. CI always
 # provisions Postgres, so coverage there is unaffected.
 if not _provisioned:
-    collect_ignore_glob = ["test_*.py"]
+    # Pure-unit modules that neither import app nor touch the DB — keep them
+    # collectable so a no-Postgres dev machine still runs something useful.
+    _PURE_UNIT = {
+        "test_semantic_analysis.py",
+        "test_model_api_wake.py",
+        "test_perception.py",
+        "test_provider_client.py",
+    }
+    collect_ignore = sorted(
+        f
+        for f in os.listdir(os.path.dirname(os.path.abspath(__file__)))
+        if f.startswith("test_") and f.endswith(".py") and f not in _PURE_UNIT
+    )
 
 
 def pytest_report_header(config):

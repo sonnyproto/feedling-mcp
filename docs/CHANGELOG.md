@@ -49,6 +49,20 @@
 
 ## 2026-06-12
 
+### [DONE] 测试文件统一收口到 tests/
+- `backend/` 下最后 4 个测试迁入 `tests/`：`test_api.py`（活服务器集成
+  脚本）、`test_model_api_wake.py`、`test_perception.py`、
+  `test_semantic_analysis.py`；后三个加了 tests/ 惯例的
+  `sys.path.insert(..., "backend")` 头。
+- 本地全量命令简化为 `pytest tests/ -q --ignore=tests/e2e_model_api_test.py
+  --ignore=tests/test_api.py`（不再需要带 `backend/`）；CI 的
+  test_api.py 调用路径同步更新。
+- `tests/conftest.py` 的「无 Postgres 全部跳过」改为豁免 `_PURE_UNIT`
+  集合（semantic_analysis / model_api_wake / perception / provider_client），
+  没有数据库的机器仍能跑 95 个纯单元用例。
+- CONTRIBUTING.md §1 决策表与 §6 测试规范新增硬规则：测试只放 tests/。
+- 验证：418 通过 + 2 个已知长期红，零新增失败。
+
 ### [DONE] 新增 CONTRIBUTING.md：后端代码组织规范
 - 把拆分重构沉淀成团队规则：app.py 只做装配；新路由进领域包 Blueprint、
   新逻辑进 service 层；依赖只准向下（向上用注入钩子）；跨模块调用

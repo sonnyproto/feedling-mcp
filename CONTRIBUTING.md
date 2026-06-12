@@ -43,6 +43,7 @@ backend/
 | 新增只属于 hosted（model_api）条线的逻辑 | `hosted/` 下对应模块 |
 | 新增跨域共享的工具函数 | `core/util.py`（必须无业务依赖才算「共享」） |
 | 新增一个完整的新功能域 | 新建包，照抄 `perception/` 的形态：`__init__.py` 提供 `register(app)`，内部 `routes.py` + `service.py` 分层 |
+| 新增测试 | 仓库根的 `tests/`，**绝不放 backend/**（规则见 §6） |
 | 实在不知道放哪 | 问自己「这段代码服务于哪条用户线/哪个名词」，按名词归包；**答案永远不是 app.py** |
 
 **单文件红线**：单个模块超过 **800 行**时，PR 里必须说明为什么不拆；
@@ -134,12 +135,21 @@ result = chat_completion(runtime, messages)
   `monkeypatch.setattr(provider_client, "chat_completion", fake)`、
   `setattr(core_enclave, "_get_enclave_info", fake)`。
   patch `appmod.X` 对已迁出的代码**不生效**（re-export 是独立绑定）。
+- **所有测试文件一律放 `tests/`，不要放 backend/ 或其它代码目录**
+  （2026-06-12 已把 backend/ 下的 4 个测试迁走，别再放回去）。
+  文件开头加一行 `sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))`
+  即可 import 后端模块——照抄 tests/ 里任何一个现有文件。
 - 新功能的测试放 `tests/test_<域名>_*.py`，需要 DB 的走 `tests/conftest.py`
-  的一次性测试库（`FEEDLING_TEST_PG`，默认 `127.0.0.1:55432`）。
+  的一次性测试库（`FEEDLING_TEST_PG`，默认 `127.0.0.1:55432`）；
+  **不需要 DB 的纯单元测试**，把文件名加进 `tests/conftest.py` 的
+  `_PURE_UNIT` 集合，这样没有 Postgres 的机器也能跑它。
+- 两个特例不是 pytest 套件，永远用 `--ignore` 排除：
+  `tests/test_api.py`（活服务器集成脚本，CI 单独起后端再跑它）、
+  `tests/e2e_model_api_test.py`。
 - 提交前本地至少跑：
   ```bash
-  python -m pytest tests/ backend/ -q \
-      --ignore=tests/e2e_model_api_test.py --ignore=backend/test_api.py
+  python -m pytest tests/ -q \
+      --ignore=tests/e2e_model_api_test.py --ignore=tests/test_api.py
   python -m pyflakes backend/<你改动的包>
   ```
   已知 2 个长期红的 enclave 依赖用例（见 backlog #12），判据是**零新增失败**。

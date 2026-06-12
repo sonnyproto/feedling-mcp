@@ -7,12 +7,16 @@ debounced wakes, and the two-step sensitivity-gated photo flow) WITHOUT a real
 Postgres: the store layer is replaced with an in-memory fake, and the wake
 trigger is captured instead of enqueuing a real proactive job.
 
-Run:  ../.venv-test/bin/python -m pytest test_perception.py -q
+Run:  python -m pytest tests/test_perception.py -q
 """
 import json
+import sys
 import time
+from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import perception.service as service
 

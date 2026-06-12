@@ -3,7 +3,12 @@
 Same test cases the Swift port needs to pass. Keep this suite and the
 Swift equivalent (Phase 1E) in lockstep.
 """
+import sys
 import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+
 from semantic_analysis import analyze, contains_any
 
 
