@@ -641,3 +641,58 @@ def test_model_api_trace_records_query_units_for_debugging():
     assert "project" in trace["query_units"]
     assert "project" in trace["query_weak_terms"]
     assert "明天" in trace["query_weak_terms"]
+
+
+# ---------------------------------------------------------------------------
+# Soft-recall index (P3 / D3): strict (model_api) mode attaches a compact
+# `index_sample` of more cards by title/date so the hosted model can recall a
+# card even when it didn't lexically match. Default mode does not attach it.
+# ---------------------------------------------------------------------------
+
+def _index_card(cid, title, occurred_at, mtype="fact"):
+    return {
+        "id": cid,
+        "type": mtype,
+        "title": title,
+        "occurred_at": occurred_at,
+        "created_at": occurred_at,
+        "description": "",
+    }
+
+
+def test_strict_index_sample_excludes_selected_and_lists_rest():
+    moments = [
+        _index_card("a", "用户养了一只叫 Mochi 的猫", "2026-01-01"),
+        _index_card("b", "转折｜第一次一起熬夜赶 deadline", "2026-02-01", "moment"),
+        _index_card("c", "用户搬到了东京", "2026-03-01", "event"),
+    ]
+    # Query shares nothing lexically with any card → strict selects nothing,
+    # so all three fall to the index.
+    _selected, trace = _select_context_memories_with_trace(
+        moments, "zzqqplugh", mode="model_api"
+    )
+    index = trace["index_sample"]
+    selected_ids = {item["id"] for item in trace["selected"]}
+    index_ids = {item["id"] for item in index}
+    assert selected_ids & index_ids == set()  # disjoint from selected
+    assert index_ids == {"a", "b", "c"}
+    for item in index:  # compact shape only — no description/body
+        assert set(item.keys()) == {"id", "type", "title", "occurred_at"}
+    assert index[0]["id"] == "b"  # turning point sorts to the front
+
+
+def test_strict_index_sample_capped_at_20():
+    moments = [
+        _index_card(f"m{i}", f"卡片 {i}", f"2026-01-{(i % 27) + 1:02d}")
+        for i in range(25)
+    ]
+    _selected, trace = _select_context_memories_with_trace(
+        moments, "zzqqplugh", mode="model_api"
+    )
+    assert len(trace["index_sample"]) == 20
+
+
+def test_default_mode_has_no_index_sample():
+    moments = [_index_card("a", "用户养了一只叫 Mochi 的猫", "2026-01-01")]
+    _selected, trace = _select_context_memories_with_trace(moments, "猫", mode="default")
+    assert "index_sample" not in trace

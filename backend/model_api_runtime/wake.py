@@ -46,7 +46,7 @@ def wake_turn_contract_message() -> dict[str, str]:
     }
 
 
-def build_wake_event_message(wake: dict[str, Any]) -> dict[str, str]:
+def build_wake_event_message(wake: dict[str, Any], user_directive: str = "") -> dict[str, str]:
     payload = {
         "kind": "proactive_wake",
         "trigger": str(wake.get("trigger") or ""),
@@ -59,6 +59,12 @@ def build_wake_event_message(wake: dict[str, Any]) -> dict[str, str]:
         "manual": bool(wake.get("manual")),
         "forced": bool(wake.get("forced")),
     }
+    # D2: the user's own "when should you reach out to me" instruction. The agent
+    # weighs this when deciding whether to message or sleep — it's the user's
+    # directive, not a hard rule. Empty = no preference set.
+    directive = str(user_directive or "").strip()
+    if directive:
+        payload["user_wake_directive"] = directive[:1000]
     return {
         "role": "user",
         "content": "[Feedling proactive wake event]\n"

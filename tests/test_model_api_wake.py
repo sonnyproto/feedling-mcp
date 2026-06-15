@@ -114,3 +114,26 @@ def test_hosted_tick_trigger_mapping():
     assert wake.hosted_tick_trigger("unknown") == "heartbeat_broadcast_off"
     assert wake.hosted_tick_trigger("") == "heartbeat_broadcast_off"
     assert wake.hosted_tick_trigger(None) == "heartbeat_broadcast_off"
+
+
+def test_build_wake_event_message_includes_user_directive():
+    # D2: the user's own "when should you reach out" directive must reach the
+    # wake payload so the agent can weigh it.
+    msg = wake.build_wake_event_message(
+        {"trigger": "heartbeat_broadcast_off", "manual": False, "forced": False},
+        user_directive="我加班到很晚的时候可以提醒我休息",
+    )
+    payload = json.loads(msg["content"].split("\n", 1)[1])
+    assert payload["user_wake_directive"] == "我加班到很晚的时候可以提醒我休息"
+
+
+def test_build_wake_event_message_omits_empty_user_directive():
+    # No directive (default) and a blank/whitespace directive both omit the key
+    # entirely, so the model never sees an empty "directive" to anchor on.
+    msg_default = wake.build_wake_event_message({"trigger": "heartbeat_broadcast_off"})
+    msg_blank = wake.build_wake_event_message(
+        {"trigger": "heartbeat_broadcast_off"}, user_directive="   "
+    )
+    for msg in (msg_default, msg_blank):
+        payload = json.loads(msg["content"].split("\n", 1)[1])
+        assert "user_wake_directive" not in payload

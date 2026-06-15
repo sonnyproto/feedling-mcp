@@ -221,7 +221,11 @@ def _run_model_api_wake_job_inner(store: UserStore, api_key: str, job: dict) -> 
             })
             return
 
-        wake_event_msg = build_model_api_wake_event_message(job)
+        wake_settings = store.load_proactive_settings()
+        wake_event_msg = build_model_api_wake_event_message(
+            job,
+            user_directive=str(wake_settings.get("wake_directive") or ""),
+        )
         provider_messages, _context_payload, _screen_images = hosted_context._model_api_context_messages(
             store,
             api_key,

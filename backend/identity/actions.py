@@ -47,7 +47,7 @@ def _identity_payload_from_plain(identity: dict) -> dict:
         if key in {"agent_name", "self_introduction"}:
             continue
         if identity.get(key):
-            payload[key] = str(identity.get(key) or "")[:1200 if key in {"relationship_anchor", "tone_style"} else 240]
+            payload[key] = str(identity.get(key) or "")[:1200 if key in {"relationship_anchor", "tone_style", "custom_persona_prompt"} else 240]
     for key in identity_service._IDENTITY_PROFILE_LIST_FIELDS:
         if isinstance(identity.get(key), list):
             payload[key] = [str(item)[:240] for item in identity[key][:12] if str(item or "").strip()]
@@ -143,7 +143,7 @@ def _identity_profile_patch(store: UserStore, api_key: str | None, action: dict)
     for key in identity_service._IDENTITY_PROFILE_STRING_FIELDS:
         if key in {"agent_name", "self_introduction"} or key not in patch:
             continue
-        max_len = 1200 if key in {"relationship_anchor", "tone_style"} else 240
+        max_len = 1200 if key in {"relationship_anchor", "tone_style", "custom_persona_prompt"} else 240
         new_value = _identity_action_text(patch.get(key), max_len)
         old_value = str(payload.get(key) or "")
         if new_value != old_value:

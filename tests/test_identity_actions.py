@@ -743,3 +743,55 @@ def test_model_api_chat_skips_running_capture_on_ordinary_turn_until_cadence(cli
     assert body["capture"]["reason"].startswith("cadence:")
     assert len(provider_calls) == 1
     assert "Feedling hosted runtime's background execution controller" not in provider_calls[0]
+
+
+def test_identity_profile_patch_writes_custom_persona_prompt(client, monkeypatch):
+    # P1b: the user-authored custom_persona_prompt is a first-class profile field,
+    # writable via profile_patch (the path iOS / corrections use) and round-tripped
+    # into the re-encrypted identity body. (DB-backed — runs in CI.)
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    captured_plaintexts: list = []
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    directive = "像老朋友一样直接损我，别用敬语。"
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={
+            "actions": [{
+                "type": "identity.profile_patch",
+                "patch": {"custom_persona_prompt": directive},
+                "reason": "User set a custom persona directive.",
+            }],
+        },
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["status"] == "ok"
+    assert "custom_persona_prompt" in body["effects"][0]["fields"]
+    assert captured_plaintexts[-1]["custom_persona_prompt"] == directive
+
+
+def test_proactive_settings_wake_directive_validation(client):
+    # P4: wake_directive is whitelisted + capped at 1000 chars. The deferred
+    # wake-cadence knob (wake_interval_sec) and unknown keys are NOT stored — we
+    # don't persist a setting that silently does nothing yet. (DB-backed — CI.)
+    user_id, _api_key = _register(client)
+    store = appmod.get_store(user_id)
+    saved = store.save_proactive_settings({
+        "wake_directive": "x" * 2000,
+        "wake_interval_sec": 100,
+        "bogus_key": "nope",
+    })
+    assert len(saved["wake_directive"]) == 1000          # capped
+    assert "wake_interval_sec" not in saved              # deferred, not whitelisted
+    assert "bogus_key" not in saved                      # unknown keys rejected
+    assert store.load_proactive_settings()["wake_directive"] == "x" * 1000

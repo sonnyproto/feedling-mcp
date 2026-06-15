@@ -154,6 +154,12 @@ _IDENTITY_PROFILE_STRING_FIELDS = (
     "user_preferred_name",
     "agent_role",
     "tone_style",
+    # User-authored persona override (D1 user layer / feedback 4b): a free-text
+    # directive the user writes to pin the agent's role and voice. Highest-
+    # priority persona signal, distinct from the system-distilled tone_style.
+    # Editable via identity.profile_patch and (later) iOS. See prompts.py for
+    # the precedence instruction injected into the foreground chat prompt.
+    "custom_persona_prompt",
     "language_preference",
     "relationship_anchor",
 )

@@ -59,6 +59,8 @@ if not _provisioned:
         "test_model_api_wake.py",
         "test_perception.py",
         "test_provider_client.py",
+        "test_history_import_identity.py",
+        "test_model_api_prompts.py",
     }
     collect_ignore = sorted(
         f

@@ -426,6 +426,14 @@ class UserStore:
             "manual_user_state": "default",
             "ai_state": "present",
             "broadcast_state": "unknown",
+            # User-authored proactive directive (D2 power-user): the user's own
+            # natural-language "when should you reach out to me" instruction,
+            # injected into the wake prompt (see model_api_runtime/wake.py). The
+            # agent weighs it when deciding to message or sleep. Empty = no
+            # preference. (A wake-cadence/heartbeat-frequency knob is deferred to
+            # the follow-up that also wires it into the tick loop + iOS surface,
+            # so we don't ship a setting that silently does nothing.)
+            "wake_directive": "",
             "updated_at": datetime.now().isoformat(),
         }
         try:
@@ -458,6 +466,7 @@ class UserStore:
             "manual_user_state",
             "ai_state",
             "broadcast_state",
+            "wake_directive",
         }
         cur = self.load_proactive_settings()
         for key, value in (patch or {}).items():
@@ -489,6 +498,8 @@ class UserStore:
                 state = str(value or "").strip().lower()
                 if state in PROACTIVE_BROADCAST_STATES:
                     cur[key] = state
+            elif key == "wake_directive":
+                cur[key] = str(value or "").strip()[:1000]
         cur["version"] = 2
         cur["updated_at"] = datetime.now().isoformat()
         with self.proactive_lock:

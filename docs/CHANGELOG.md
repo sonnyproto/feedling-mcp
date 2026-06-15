@@ -47,6 +47,139 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-06-16
+
+### [DONE] 收尾：撤未接线的 wake_interval、加固捕获锁、补测试（push 前清理）
+- **撤掉死旋钮**：P4 初版加了 `wake_interval_sec`（唤醒频率），但只存储、无
+  代码读它生效——正是 P1 批判的"写了没人读"。按"凡发出去的旋钮都得是活的"
+  原则，本批从 `core/store.py` 撤掉它（默认/白名单/校验三处），只保留已真接
+  线的 `wake_directive`。频率旋钮连同**实际接线 + iOS + 测试**整体延到后续
+  （task #6）。
+- **加固捕获锁**：P2 给记忆捕获加的每用户锁，存在一个泄漏窗口——`_start_`
+  占用后若 `_append_memory_capture_job`/线程启动抛异常，`finish()` 不会执行、
+  用户被永久挡在捕获之外。`hosted/turn.py` 用 try/except 包裹交接段，异常时
+  释放守卫再抛。
+- **补测试（纯单元，本地全过）**：
+  - `tests/test_context_memories.py` +3：strict 软召回 `index_sample`（排除已
+    选中、上限 20、转折优先）。
+  - `tests/test_model_api_wake.py` +2：`user_directive` 进/不进 wake payload。
+  - 新增 `tests/test_history_import_identity.py`（5）：`_normalize_identity_payload`
+    的语气字段透传/净化/截断。
+  - 新增 `tests/test_model_api_prompts.py`（5）：前台 prompt 含 custom_persona_prompt
+    优先级指令 + memory_index 召回指令；persona/索引值进 prompt。
+  - 两个文件加入 `conftest.py` 的 `_PURE_UNIT` 白名单（无 DB 也收集）。
+  - 全量无 DB 跑：**107 passed**；显式 context 跑：62 passed。
+- **补测试（DB 依赖，CI 验）**：`tests/test_identity_actions.py` +2，照搬现有
+  通过模式——`custom_persona_prompt` 经 profile_patch 可写回身份体；
+  `wake_directive` 白名单/截断/拒未知键。本地无 Postgres 跑不了，CI 验。
+
+### [DONE] P4(backend)：proactive 自定义（D2 power-user）；iOS 待做
+- D2 定的是"全自定义（默认值 + 高级区）"。本批后端落 `wake_directive`：
+  用户自己的"什么时候来找我"自然语言指令（`proactive_settings`，≤1000 字，
+  现有 `GET/POST /v1/proactive/settings` 即可读写）。
+- **吸取 P1 教训，不加死字段**：`wake_directive` 已**真接进** hosted wake
+  prompt——`model_api_runtime/wake.py` `build_wake_event_message` 增可选
+  `user_directive`，`hosted/wake_consumer.py` 从 settings 取并传入，wake
+  事件 payload 带 `user_wake_directive`，agent 据此权衡发不发（用户指令、
+  非硬规则）。
+- **未做（明确标注待做，task #6）**：唤醒**频率**旋钮（连同 hosted tick
+  cadence + resident consumer 端接线）、**iOS UI**（proactive 设置面板 +
+  `custom_persona_prompt` 编辑入口，在 feedling-mcp-ios 仓库）。
+
+### [DONE] P3：API 召回加"软召回索引"（D3 LLM 软召回，加性、可回退）
+- **问题**：model_api 的 strict 召回只放 corrections + 词面命中阈值的卡
+  （`context_memory_selection.py` 严格分支），语义相关但词面不重叠的卡被
+  硬丢——即 feedback point 2"召回太硬，只是文字对应"。
+- **改法（加性，不删词面路径）**：strict 分支用**同一批已解密 moments**额外
+  构造一个紧凑 `index_sample`（id/type/title/occurred_at，转折优先+最近，
+  上限 20），零额外 provider/enclave 调用。`hosted/context.py` 把它作为
+  `context_memory_selection.memory_index` 注入 prompt；`prompts.py` 加一句
+  指令：标题/日期相关时可自然"想起"，但不得编造标题外细节、也不强行召回。
+  → 模型自己软召回，而非关键词过滤替它决定。
+- **性质**：现有 `selected`/词面选择完全不变（可回退）；index 只是补充面。
+  index 的字段/条数/措辞属可调内容，留待迭代。
+- **验证**：`tests/test_context_memories.py` 59 个纯单元测试全过（含本次改的
+  strict 分支）；新增 `index_sample` key 不影响既有断言。
+
+### [DONE] P2(API)：history import 蒸馏语气 + 记忆捕获加每用户锁
+- **蒸馏语气（修 4a 角色漂移的"蒸馏端"）**：`hosted/history_import.py` 的身份
+  派生 `_derive_identity_with_provider` 之前只产
+  `agent_name/self_introduction/category/signature/dimensions`，语气只能塞进
+  自我介绍。现在 prompt 增产 `tone_style`（怎么说话：语域/口头禅/称呼/句式，
+  要求引用真实例句）、`agent_role`、`do_not_say`、`boundaries`；
+  `_normalize_identity_payload` 对这四个字段做净化（长度上限、zh/en 一致性、
+  list 清洗）并对空值省略。它们随密文身份体落库 → 经 enclave 解密 →
+  P1a 已把它们接进 prompt，**蒸馏端 + 读取端闭环**：API 用户的语气现在
+  能跨 import 存活，而不只是 fact。
+- **记忆捕获加每用户锁（修 USER_PATHS_REVIEW §8）**：`hosted/turn.py` 的状态
+  动作和 recap 各有每用户锁，唯独记忆捕获没有——turn-24 的捕获还在跑时
+  turn-48 又触发会重叠、产重复卡。新增 `_model_api_capture_active_users`
+  守卫：`_start_model_api_memory_capture_job` 入口检查/占用，运行体的唯一出口
+  `finish()` 释放（幂等、覆盖所有 return 分支）。镜像 recap 既有模式。
+- 性质：prompt 内容（蒸馏措辞）后续可调；字段结构与锁是骨架。语法校验通过。
+- **未做（属调参/成本）**：捕获 cadence 仍是默认 24 轮
+  （`FEEDLING_MODEL_API_CAPTURE_TURN_INTERVAL` 可配）；要更"持续"可调小，
+  但有 provider 调用成本，归 P4 自定义一并考虑。
+
+### [DONE] P1b：新增 custom_persona_prompt 用户可编辑 persona 覆盖槽（D1 用户层 / feedback 4b）
+- 用户反馈想要"一个能自己加 prompt 精准定位角色的地方"。新增单个自由文本
+  字段 `custom_persona_prompt`，与系统蒸馏的 `tone_style` 分开、优先级最高。
+- 借现成白名单机制，改动最小：
+  - `identity/service.py`：`custom_persona_prompt` 加入
+    `_IDENTITY_PROFILE_STRING_FIELDS`，故 `identity.profile_patch` 自动支持
+    写入（iOS 编辑入口留待 P4）。
+  - `identity/actions.py`：两处 max_len 把它归入 1200 字一档（自由 prompt
+    需要更长，区别于 240 字的短字段）。
+  - `hosted/context.py`：接进 `identity_summary`，随 P1a 一并进 prompt（前台
+    聊天 + 记忆捕获 + wake 都读 `context_payload["identity"]`）。
+  - `model_api_runtime/prompts.py`：前台 system prompt 加一句——
+    `custom_persona_prompt` 存在时视为**最高优先级** persona 指令，压过其余
+    identity/profile 文本（安全边界除外）。
+- 性质：纯加性，零迁移；空值不渲染。四个改动文件语法校验通过。
+
+### [DONE] P1a：把 persona/语气字段接进 hosted 聊天 prompt（修 API 角色漂移根因）
+- **背景（决策 D0–D3）**：本轮定了记忆/identity 重设计的四个地基决策——
+  D0 卡库=权威外置记忆库（插件模型）、D1 persona 双层（系统蒸馏 + 用户可
+  编辑覆盖）、D2 proactive 全自定义（默认值 + 高级区）、D3 召回改 LLM 软
+  召回。落地按 P1（schema 地基）→ P2（持续落卡 + 蒸馏语气）→ P3（软召回）
+  → P4（自定义暴露）分阶段推进。本条是 P1 的第一个最小落地。
+- **诊断**：`tone_style` / `agent_role` / `do_not_say` / `boundaries` /
+  `stable_definitions` 等 persona 字段在 identity 密文体里**能写**（经
+  `identity.profile_patch`，见 `identity/actions.py` `_IDENTITY_PROFILE_FIELDS`），
+  但 hosted 聊天 prompt 的两个 identity 入口（`hosted/context.py`
+  `identity_summary` 与 `history_import.py` `_model_api_agent_profile_context`）
+  都**不读**它们——persona 是 write-only 死字段。这是 model_api 用户反馈
+  "角色漂移"（只蒸馏 fact 不蒸馏语气）的结构性真凶：两头断（蒸馏不写、
+  prompt 不读）。
+- **改动**：`backend/hosted/context.py` 的 `identity_summary` 补上述 persona
+  字段。prompt builder（`model_api_runtime/prompts.py`）是整包
+  `json.dumps(context_payload)` 注入、不挑 key，故此一处接线即同时惠及
+  **前台聊天**与**记忆捕获 worker**（两者都读 `context_payload["identity"]`）。
+- **性质**：纯读取侧加性改动，零 schema 改动、零迁移；字段为空时只渲染空值，
+  模型忽略。值在 P2 蒸馏阶段填入——"先接线、后填值"。
+- **验证**：语法通过；未跑 DB 测试（本地无 Postgres，按 repo 约定 CI 跑）。
+  无测试断言 `identity_summary` 的 key 集合，改动不影响
+  `test_identity_actions.py` 的已存断言（它校验存盘明文，非 prompt 摘要）。
+- **下一步**：P1b 加"用户可编辑 persona 覆盖槽"（D1 的用户层，4b）——需先定
+  字段命名/语义。
+
+## 2026-06-16
+
+### [DONE] 新增 docs/USER_PATHS_REVIEW.md：BPS/API 两路功能总览 + 缺漏盘点
+- 把 resident（BPS，自建服务器）与 model_api（API，托管）两条用户路的
+  Onboarding / Chat+Memory / Proactive 运行方式并排梳理成一份功能向文档
+  （不含加密/部署）。
+- Part 2 盘点了一次系统性代码阅读发现的缺漏，按 🔴/🟡/🟢 分级：
+  - 🔴 假完成/静默失败：model_api 记忆门槛不分档、实时连接没真验证、
+    provider 失败致用户消息孤儿且无退避、resident proactive job 无回收超时。
+  - 🟡 状态错乱：中途切路由搁浅、记忆删除无引用完整性、天数锚点漂移、
+    后台记忆捕获无每用户锁、`tool_action_enabled` 门形同虚设、import job
+    无恢复、official_import 疑似死代码。
+- 元观察：claim 租约 / 分档门 / 活性验证 / 每用户锁等"三处都该有"的机制
+  普遍只实现一两处——根因是缺一张强制对齐两条路的 capability matrix。
+- 文档明示：行号为阅读近似值，修复前需就地核对；条目待逐项落进
+  OPTIMIZATION_BACKLOG.md。
+
 ## 2026-06-12
 
 ### [DONE] 测试文件统一收口到 tests/

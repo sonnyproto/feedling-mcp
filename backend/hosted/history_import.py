@@ -2581,6 +2581,36 @@ def _normalize_identity_payload(raw, memories: list[dict], days: int, language: 
     if not category or (str(language).startswith("zh") and _english_only_for_zh(category)):
         category = str(fallback.get("category") or "")
     payload["category"] = category
+
+    # Persona / voice layer (P2). Optional fields distilled from AI Persona
+    # materials so the companion's VOICE — not just its facts — survives import.
+    # They round-trip through the encrypted identity body and are read into the
+    # hosted prompt via identity_summary (see hosted/context.py P1a). Sanitize
+    # and omit empties so a model that ignores them costs nothing.
+    tone_style = str(payload.get("tone_style") or "").strip()[:1200]
+    if str(language).startswith("zh") and _english_only_for_zh(tone_style):
+        tone_style = ""
+    if tone_style:
+        payload["tone_style"] = tone_style
+    else:
+        payload.pop("tone_style", None)
+    agent_role = str(payload.get("agent_role") or "").strip()[:240]
+    if str(language).startswith("zh") and _english_only_for_zh(agent_role):
+        agent_role = ""
+    if agent_role:
+        payload["agent_role"] = agent_role
+    else:
+        payload.pop("agent_role", None)
+    for list_field in ("do_not_say", "boundaries"):
+        raw_list = payload.get(list_field)
+        if not isinstance(raw_list, list):
+            payload.pop(list_field, None)
+            continue
+        clean = [str(item).strip()[:240] for item in raw_list[:12] if str(item or "").strip()]
+        if clean:
+            payload[list_field] = clean
+        else:
+            payload.pop(list_field, None)
     return payload
 
 
@@ -2610,7 +2640,17 @@ def _derive_identity_with_provider(
         "Derive a Feedling Identity Card for the AI companion from typed onboarding sources and Memory Garden cards. "
         "Return JSON only with fields: agent_name, self_introduction, category, "
         "signature (array of two short strings), dimensions (exactly 7 objects with "
-        "name, value 0-100, description). Do not invent facts not grounded in input. "
+        "name, value 0-100, description), "
+        "tone_style (1-3 sentences capturing HOW the companion speaks — register, "
+        "verbal tics, how it addresses the user, characteristic phrasings; quote real "
+        "examples from the sources where possible, do not generalize to 'friendly and helpful'), "
+        "agent_role (one short phrase for the companion's role/relationship to the user), "
+        "do_not_say (array of short strings: names, phrasings, or topics the sources show "
+        "the companion never uses — empty array if none), "
+        "boundaries (array of short strings; empty array if none). "
+        "tone_style/agent_role/do_not_say/boundaries capture the companion's VOICE so it "
+        "survives import — extract them from the AI Persona materials and assistant-side "
+        "chat, not just the facts. Do not invent facts not grounded in input. "
         "Source priority: AI Persona materials are the primary source for the AI companion's identity, voice, role, name, and boundaries. "
         "Memory Garden cards are secondary evidence and may refine the identity. Chat History can show how the AI behaved in relationship. "
         "User Profile describes the user only; use it as relationship context, never as the AI companion's self-description. "

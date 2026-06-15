@@ -136,6 +136,25 @@ def _model_api_context_messages(
         "category": identity.get("category", ""),
         "signature": identity.get("signature", []),
         "dimensions": identity.get("dimensions", []),
+        # Persona / voice layer. These profile fields are writable via
+        # identity.profile_patch (see identity/actions.py _IDENTITY_PROFILE_FIELDS)
+        # but were previously dropped from this summary, so the hosted chat
+        # prompt never saw the agent's tone, role, or boundaries — a root cause
+        # of model_api voice drift (the persona was write-only / dead). Surface
+        # them so the foreground prompt and the memory-capture worker can
+        # continue the established voice. Empty until distillation (P2) fills
+        # them; empty values just render as blanks the model ignores.
+        "agent_role": identity.get("agent_role", ""),
+        "tone_style": identity.get("tone_style", ""),
+        # User-authored override (D1 user layer). Highest-priority persona
+        # directive — see the precedence instruction in
+        # model_api_runtime/prompts.py build_foreground_chat_messages.
+        "custom_persona_prompt": identity.get("custom_persona_prompt", ""),
+        "user_preferred_name": identity.get("user_preferred_name", ""),
+        "language_preference": identity.get("language_preference", ""),
+        "boundaries": identity.get("boundaries", []),
+        "do_not_say": identity.get("do_not_say", []),
+        "stable_definitions": identity.get("stable_definitions", []),
     }
     context_payload = {
         "agent_profile": hosted_history_import._model_api_agent_profile_context(store, identity),
@@ -167,6 +186,13 @@ def _model_api_context_messages(
             prompt_selection["query_units"] = query_units[:20]
         if query_strong:
             prompt_selection["query_strong_phrases"] = query_strong[:20]
+        # Soft-recall index (P3 / D3): more of the user's cards by title/date so
+        # the model can recall one even if it didn't lexically match. See
+        # context_memory_selection.py strict branch + the instruction in
+        # model_api_runtime/prompts.py.
+        index_sample = context_memory_trace.get("index_sample") if isinstance(context_memory_trace.get("index_sample"), list) else []
+        if index_sample:
+            prompt_selection["memory_index"] = index_sample[:20]
         if prompt_selection:
             prompt_context_payload["context_memory_selection"] = prompt_selection
 

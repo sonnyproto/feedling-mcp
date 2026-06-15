@@ -94,6 +94,12 @@ _model_api_recap_active_users: set[str] = set()
 _model_api_recap_active_lock = threading.Lock()
 _model_api_state_active_users: set[str] = set()
 _model_api_state_active_lock = threading.Lock()
+# Per-user guard for the running memory-capture job. State actions and recap
+# already have one each; capture did not — overlapping capture windows (the
+# turn-24 job still running when turn-48 fires) could double-write cards. Mirror
+# the recap pattern: add on start, discard in the runner's single exit (finish).
+_model_api_capture_active_users: set[str] = set()
+_model_api_capture_active_lock = threading.Lock()
 
 
 def _model_api_turn_count(store: UserStore) -> int:
@@ -906,6 +912,10 @@ def _model_api_run_memory_capture(
     }
 
     def finish(entry: dict) -> dict:
+        # Single exit for every return path — release the per-user capture guard
+        # here so it is cleared no matter which branch returns. Idempotent.
+        with _model_api_capture_active_lock:
+            _model_api_capture_active_users.discard(store.user_id)
         if job_id:
             patched = _model_api_patch_recap_job(store, job_id, {**job_base, **entry})
             return patched or {**job_base, **entry, "job_id": job_id}
@@ -993,34 +1003,56 @@ def _start_model_api_memory_capture_job(
     turn_count: int,
     run_sync: bool = False,
 ) -> dict:
-    job = memory_service._append_memory_capture_job(store, {
-        "mode": "running",
-        "status": "queued",
-        "reason": f"cadence:{MODEL_API_CAPTURE_TURN_INTERVAL}",
-        "turn_count": turn_count,
-        "progress": 0,
-        "source_chat_message_ids": [user_message_id, assistant_message_id],
-        "message_chars": len(user_message),
-        "reply_chars": len(assistant_reply),
-    })
-    kwargs = {
-        "user_message": user_message,
-        "assistant_reply": assistant_reply,
-        "user_message_id": user_message_id,
-        "assistant_message_id": assistant_message_id,
-        "context_payload": context_payload,
-        "job_id": job["job_id"],
-    }
-    if run_sync:
-        return _model_api_run_memory_capture(store, api_key, runtime, **kwargs)
-    thread = threading.Thread(
-        target=_model_api_run_memory_capture,
-        args=(store, api_key, runtime),
-        kwargs=kwargs,
-        daemon=True,
-    )
-    thread.start()
-    return job
+    # Per-user guard: skip if a capture for this user is already in flight, so
+    # overlapping cadence windows can't double-write cards. Released in the
+    # runner's finish(). (Mirrors _start_model_api_recap_job.)
+    with _model_api_capture_active_lock:
+        if store.user_id in _model_api_capture_active_users:
+            return {
+                "status": "skipped",
+                "mode": "running",
+                "reason": "capture_already_running",
+                "turn_count": turn_count,
+                "actions_written": 0,
+            }
+        _model_api_capture_active_users.add(store.user_id)
+    # From here the guard is held; the runner's finish() releases it on every
+    # return path. But if we fail to hand off to the runner (job append or thread
+    # start raises), finish() never runs — release here so the user isn't wedged
+    # out of all future captures.
+    try:
+        job = memory_service._append_memory_capture_job(store, {
+            "mode": "running",
+            "status": "queued",
+            "reason": f"cadence:{MODEL_API_CAPTURE_TURN_INTERVAL}",
+            "turn_count": turn_count,
+            "progress": 0,
+            "source_chat_message_ids": [user_message_id, assistant_message_id],
+            "message_chars": len(user_message),
+            "reply_chars": len(assistant_reply),
+        })
+        kwargs = {
+            "user_message": user_message,
+            "assistant_reply": assistant_reply,
+            "user_message_id": user_message_id,
+            "assistant_message_id": assistant_message_id,
+            "context_payload": context_payload,
+            "job_id": job["job_id"],
+        }
+        if run_sync:
+            return _model_api_run_memory_capture(store, api_key, runtime, **kwargs)
+        thread = threading.Thread(
+            target=_model_api_run_memory_capture,
+            args=(store, api_key, runtime),
+            kwargs=kwargs,
+            daemon=True,
+        )
+        thread.start()
+        return job
+    except Exception:
+        with _model_api_capture_active_lock:
+            _model_api_capture_active_users.discard(store.user_id)
+        raise
 
 
 def _model_api_latest_recap_job(store: UserStore) -> dict | None:
