@@ -49,6 +49,38 @@
 
 ## 2026-06-16
 
+### [DONE] enclave 改用 gunicorn gthread（撤掉 Werkzeug 开发服务器）
+- `backend/enclave_app.py` 的入口从 `app.run(threaded=True)`（Flask 自带
+  Werkzeug 开发服务器，非生产级 WSGI）换成**编程方式内嵌的 gunicorn**
+  （`BaseApplication`）：`worker_class=gthread`、单 worker、32 线程、
+  `timeout=120` / `graceful_timeout=30`。单 worker 精确沿用原"单进程多线程"
+  模型——进程内 whoami / content-key 缓存与 singleflight（见文件头）保持一致，
+  挡住 history-import 触发的回环鉴权线程风暴。
+- **关键约束：不动 compose。** gunicorn 内嵌进 `__main__`，compose 入口仍是
+  `python -u backend/enclave_app.py`，所以 `compose_hash` 不变、无需重新上链
+  （CONTRIBUTING §7 不变量）。
+- **保住自签 TLS + cert-DER pinning。** bootstrap() 派生的 PEM 写到 tmpfs 临时
+  文件（0600，atexit 清理；TDX 下 /tmp 是内存盘，密钥不落盘）供 gunicorn 翻开
+  `is_ssl`；实际 SSLContext 走 gunicorn 的 `ssl_context` 钩子，复刻原
+  `_build_ssl_context` 的精确姿态——裸 `PROTOCOL_TLS_SERVER`、min TLS 1.2、无
+  客户端证书校验、无 HTTP/2 ALPN，确保握手服务的正是 REPORT_DATA 里 pin 的那张
+  leaf，iOS 审计卡的 `sha256(cert.DER)` 校验不受影响。
+- gunicorn import 延迟到入口，`import enclave_app`（测试套件）不强依赖它。
+- 验证：自签证书冒烟测试确认 gunicorn 起 https、`/healthz` 走 TLS 返回、服务的
+  证书指纹 == 注入证书、明文打 TLS 端口被拒、SIGTERM 优雅退出；
+  `tests/test_enclave_route_errors.py` 11 例全过。
+- `backend/requirements.txt` gunicorn 注释补上 enclave 用法（`ssl_context` 钩子
+  需 >=21.0；已 pin >=23）。**部署：只需 bump CVM 镜像，compose 文件不动。**
+
+### [DONE] 文档：补全历史导入端到端流程（RUNTIME_FLOWS §3.6）
+- 把 `RUNTIME_FLOWS.md` §3.6 从"两遍蒸馏"一句话扩成完整阶段流水线：
+  异步 job + 轮询、job 复用 / stale 判定、解析历史与支撑材料（过滤账号
+  元数据）、关系起点与 small/large 分级、时间窗口提候选、聚类写记忆卡、
+  派生身份卡、生成开场问候、`chat_ready` 首批放行、large/ultra 后台续抽。
+- §4.3 同步补一句指回 §3.6。
+- 只动文档，对照 `hosted/history_import.py:_process_history_import_sync` 与
+  `_HISTORY_IMPORT_PHASES` 校对阶段名，未改代码。
+
 ### [DONE] 收尾：撤未接线的 wake_interval、加固捕获锁、补测试（push 前清理）
 - **撤掉死旋钮**：P4 初版加了 `wake_interval_sec`（唤醒频率），但只存储、无
   代码读它生效——正是 P1 批判的"写了没人读"。按"凡发出去的旋钮都得是活的"

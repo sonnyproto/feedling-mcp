@@ -29,6 +29,7 @@ See docs/DESIGN_E2E.md §5, §7 for the full architecture.
 
 from __future__ import annotations
 
+import atexit
 import base64
 import datetime as _dt
 import hashlib
@@ -1323,13 +1324,28 @@ _content_sk_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 
-def _build_ssl_context() -> ssl.SSLContext | None:
-    """Build an SSLContext from the in-memory cert/key material.
+# Number of worker threads in the single gunicorn worker. The enclave's
+# concurrency profile is I/O-bound: every decrypt-and-serve request calls
+# back into the backend over httpx and parks the thread on that round-trip,
+# so a generously sized thread pool (not CPU count) is what keeps the pool
+# from starving. The whoami short-TTL cache + singleflight (see top of file)
+# already collapse the history-import auth storm, so 32 is ample headroom.
+_ENCLAVE_THREADS = int(os.environ.get("FEEDLING_ENCLAVE_THREADS", 32))
 
-    Python's ssl.SSLContext.load_cert_chain only takes file paths; we
-    materialize the PEM through NamedTemporaryFile and unlink right after
-    load so nothing persists. In a TDX CVM /tmp is in-memory anyway —
-    the bytes never hit persistent storage or the operator's disk.
+
+def _materialize_tls_files() -> tuple[str, str] | None:
+    """Write the in-memory TLS PEM to two tmpfs files for gunicorn.
+
+    gunicorn loads its server cert/key from file paths (and flips SSL on iff
+    a certfile/keyfile is configured), so we materialize the PEM that
+    bootstrap() derived. The files are mode 0600 and unlinked atexit. In a
+    TDX CVM /tmp is an in-memory tmpfs, so the key never touches persistent
+    storage or the operator's disk; outside TDX (local dev) they are ordinary
+    temp files cleaned up on exit.
+
+    Returns (cert_path, key_path), or None when TLS is disabled — in which
+    case gunicorn serves plain HTTP, matching the old app.run(ssl_context=None)
+    behaviour.
     """
     if not _state["tls_enabled"]:
         return None
@@ -1338,30 +1354,98 @@ def _build_ssl_context() -> ssl.SSLContext | None:
     if not cert_pem or not key_pem:
         return None
 
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    # Drop the ephemeral PEM paths as soon as load_cert_chain has read them.
-    with tempfile.NamedTemporaryFile("wb", suffix=".pem", delete=False) as cf, \
-         tempfile.NamedTemporaryFile("wb", suffix=".pem", delete=False) as kf:
-        cf.write(cert_pem); cf.flush()
-        kf.write(key_pem); kf.flush()
-        cert_path, key_path = cf.name, kf.name
-    try:
-        ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
-    finally:
+    paths: list[str] = []
+    for pem in (cert_pem, key_pem):
+        with tempfile.NamedTemporaryFile("wb", suffix=".pem", delete=False) as f:
+            os.chmod(f.name, 0o600)
+            f.write(pem)
+            f.flush()
+            paths.append(f.name)
+    cert_path, key_path = paths
+
+    # Guard cleanup to THIS (master) process. gunicorn forks its worker after
+    # we register, so the worker inherits this atexit handler; a graceful
+    # worker recycle (SIGHUP reload / max_requests) exits the child via
+    # sys.exit, which runs atexit. Without the pid guard the dying worker would
+    # unlink the cert/key while the master lives, and the respawned worker's
+    # load_cert_chain would then FileNotFoundError into a boot crash-loop.
+    owner_pid = os.getpid()
+
+    def _cleanup() -> None:
+        if os.getpid() != owner_pid:
+            return
         for p in (cert_path, key_path):
             try: os.unlink(p)
             except OSError: pass
+    atexit.register(_cleanup)
+    return cert_path, key_path
+
+
+def _enclave_ssl_context(conf, default_ssl_context_factory) -> ssl.SSLContext:
+    """gunicorn `ssl_context` hook — reproduce the enclave's exact TLS posture.
+
+    iOS pins sha256(cert.DER) of the served leaf against the fingerprint baked
+    into REPORT_DATA (see docs/DESIGN_E2E.md §7 + the phala compose enclave
+    note), so the handshake must serve precisely the cert bootstrap() derived
+    and nothing else. We therefore build a bare PROTOCOL_TLS_SERVER context
+    (no client-cert verification, no HTTP/2 ALPN) pinned to TLS 1.2+, exactly
+    as the previous _build_ssl_context did, rather than letting gunicorn's
+    default create_default_context() factory alter the chain or negotiation.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=conf.certfile, keyfile=conf.keyfile)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     return ctx
 
 
+def _run_enclave_server(tls: tuple[str, str] | None) -> None:
+    """Serve `app` under gunicorn's gthread worker (production WSGI).
+
+    Replaces app.run() (the Werkzeug dev server), which is single-threaded
+    and not production-grade under the TDX CVM. We embed gunicorn
+    programmatically — via BaseApplication — instead of changing the compose
+    entrypoint, so the command stays `python -u backend/enclave_app.py` and
+    the published compose_hash is unaffected (CONTRIBUTING.md §7).
+
+    Single worker mirrors the previous single-process model exactly (the
+    process-local whoami/content-key caches stay coherent); gthread + 32
+    threads gives the production-grade concurrency the old `threaded=True`
+    provided, now on a real WSGI server with worker timeouts.
+    """
+    # Imported lazily so that `import enclave_app` in the test suite (which
+    # never reaches this entrypoint) does not hard-require gunicorn.
+    import gunicorn.app.base
+
+    options: dict[str, Any] = {
+        "bind": f"0.0.0.0:{ENCLAVE_PORT}",
+        "workers": 1,
+        "worker_class": "gthread",
+        "threads": _ENCLAVE_THREADS,
+        "timeout": 120,
+        "graceful_timeout": 30,
+    }
+    if tls is not None:
+        cert_path, key_path = tls
+        # certfile/keyfile flip gunicorn's is_ssl on (and satisfy its path
+        # validation); the actual context is built by the ssl_context hook.
+        options["certfile"] = cert_path
+        options["keyfile"] = key_path
+        options["ssl_context"] = _enclave_ssl_context
+
+    class _EnclaveApplication(gunicorn.app.base.BaseApplication):
+        def load_config(self):
+            for key, value in options.items():
+                self.cfg.set(key, value)
+
+        def load(self):
+            return app
+
+    _EnclaveApplication().run()
+
+
 if __name__ == "__main__":
     bootstrap()
-    ssl_ctx = _build_ssl_context()
-    scheme = "https" if ssl_ctx else "http"
+    tls = _materialize_tls_files()
+    scheme = "https" if tls else "http"
     print(f"Feedling enclave service listening on {scheme}://0.0.0.0:{ENCLAVE_PORT}", flush=True)
-    # threaded=True: the default Werkzeug server is single-threaded, so every
-    # decrypt-and-serve request (each of which calls back into the backend)
-    # serialised and head-of-line-blocked the rest under concurrent load.
-    app.run(host="0.0.0.0", port=ENCLAVE_PORT, debug=False, ssl_context=ssl_ctx,
-            threaded=True)
+    _run_enclave_server(tls)
