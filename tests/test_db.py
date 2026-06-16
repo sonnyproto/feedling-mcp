@@ -167,6 +167,69 @@ def test_memory_upsert_replace_delete():
     assert db.memory_load(uid) == []
 
 
+def test_memory_replace_all_diff_semantics():
+    """memory_replace_all reconciles to the input set (full-replace semantics)
+    while only touching changed rows. We assert the final state is exactly the
+    input; the diff optimization is internal but must not change observable
+    behavior."""
+    uid = _uid()
+    base = [
+        {"id": "a", "occurred_at": "2026-01-01", "content": "a"},
+        {"id": "b", "occurred_at": "2026-01-02", "content": "b"},
+        {"id": "c", "occurred_at": "2026-01-03", "content": "c"},
+    ]
+    db.memory_replace_all(uid, base)
+    assert {m["id"]: m["content"] for m in db.memory_load(uid)} == {
+        "a": "a", "b": "b", "c": "c"
+    }
+
+    # Edit only b; a and c are byte-identical and should survive untouched.
+    edited = [
+        {"id": "a", "occurred_at": "2026-01-01", "content": "a"},
+        {"id": "b", "occurred_at": "2026-01-02", "content": "b-edited"},
+        {"id": "c", "occurred_at": "2026-01-03", "content": "c"},
+    ]
+    db.memory_replace_all(uid, edited)
+    assert {m["id"]: m["content"] for m in db.memory_load(uid)} == {
+        "a": "a", "b": "b-edited", "c": "c"
+    }
+
+    # Drop c, add d; a and b unchanged. Final set must be exactly {a, b, d}.
+    reshaped = [
+        {"id": "a", "occurred_at": "2026-01-01", "content": "a"},
+        {"id": "b", "occurred_at": "2026-01-02", "content": "b-edited"},
+        {"id": "d", "occurred_at": "2026-01-04", "content": "d"},
+    ]
+    db.memory_replace_all(uid, reshaped)
+    assert {m["id"] for m in db.memory_load(uid)} == {"a", "b", "d"}
+
+    # id-less dicts are skipped; empty list clears the set.
+    db.memory_replace_all(uid, [{"content": "no-id"}])
+    assert db.memory_load(uid) == []
+
+
+def test_memory_replace_all_rewrites_stale_occurred_at_column():
+    """If the occurred_at column drifts out of sync with the doc (e.g. a row
+    written separately via memory_upsert), an otherwise-unchanged doc must
+    still rewrite the column — otherwise memory_load (ORDER BY occurred_at)
+    returns the wrong order. Mirrors the old full-replace semantics."""
+    uid = _uid()
+    # Seed two rows whose ordering column disagrees with the doc's own field:
+    # x sorts first by column ("1"), y second ("2"), but the docs' occurred_at
+    # fields are the reverse.
+    db.memory_upsert(uid, "x", "1", {"id": "x", "occurred_at": "2026-12-31"})
+    db.memory_upsert(uid, "y", "2", {"id": "y", "occurred_at": "2026-01-01"})
+    assert [m["id"] for m in db.memory_load(uid)] == ["x", "y"]
+
+    # replace_all with the same docs must re-derive the column from each doc,
+    # flipping the order to match occurred_at fields.
+    db.memory_replace_all(uid, [
+        {"id": "x", "occurred_at": "2026-12-31"},
+        {"id": "y", "occurred_at": "2026-01-01"},
+    ])
+    assert [m["id"] for m in db.memory_load(uid)] == ["y", "x"]
+
+
 def test_frame_upsert_get_exists_prune():
     uid = _uid()
     for i in range(5):

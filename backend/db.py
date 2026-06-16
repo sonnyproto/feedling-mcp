@@ -790,23 +790,45 @@ def memory_delete(user_id: str, moment_id: str) -> bool:
 
 
 def memory_replace_all(user_id: str, moments: list[dict]) -> None:
-    """Atomically replace the full moment set for a user. Used where the old
-    code did load-list / mutate / save-whole-list. The id/occurred_at columns
-    are derived from each moment dict; the dict itself is stored verbatim."""
+    """Atomically reconcile the stored moment set to `moments`. The final row
+    set equals the input list (full-replace semantics preserved), but only rows
+    that were removed are deleted and only rows whose doc changed are upserted,
+    so a single-card edit no longer rewrites the user's entire garden. Used
+    where the old code did load-list / mutate / save-whole-list."""
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
-                conn.execute("DELETE FROM memory_moments WHERE user_id = %s", (user_id,))
-                for m in moments:
-                    mid = m.get("id")
-                    if not mid:
+                rows = conn.execute(
+                    "SELECT moment_id, occurred_at, doc FROM memory_moments WHERE user_id = %s",
+                    (user_id,),
+                ).fetchall()
+                existing = {r[0]: (r[1], r[2]) for r in rows}
+
+                # last-writer-wins on duplicate ids, mirroring the old
+                # DELETE-then-INSERT/ON CONFLICT behavior; drop id-less dicts.
+                new = {str(m["id"]): m for m in moments if m.get("id")}
+
+                for mid in existing.keys() - new.keys():
+                    conn.execute(
+                        "DELETE FROM memory_moments WHERE user_id = %s AND moment_id = %s",
+                        (user_id, mid),
+                    )
+                for mid, m in new.items():
+                    occurred_at = str(m.get("occurred_at") or "")
+                    prev = existing.get(mid)
+                    # Skip only when BOTH the doc and the derived occurred_at
+                    # column match — the old full-replace path always rewrote
+                    # occurred_at from the input, so an unchanged doc paired with
+                    # a stale ordering column must still be rewritten or
+                    # memory_load() (ORDER BY occurred_at) returns wrong order.
+                    if prev is not None and prev[0] == occurred_at and prev[1] == m:
                         continue
                     conn.execute(
                         "INSERT INTO memory_moments (user_id, moment_id, occurred_at, doc) "
                         "VALUES (%s, %s, %s, %s) "
                         "ON CONFLICT (user_id, moment_id) DO UPDATE SET "
                         "occurred_at = EXCLUDED.occurred_at, doc = EXCLUDED.doc",
-                        (user_id, str(mid), str(m.get("occurred_at") or ""), Jsonb(m)),
+                        (user_id, mid, occurred_at, Jsonb(m)),
                     )
     except Exception as e:
         log.error("[db] memory_replace_all(%s) failed: %s", user_id, e)
