@@ -1,9 +1,11 @@
 """Per-user state store (write-through cache over PostgreSQL).
 
-gunicorn runs a single worker, so the module-level ``_stores`` dict is the
-one shared cache for the whole backend. Object identity of ``_stores`` and
-``UserStore`` instances matters: tests and the eviction path mutate them
-in place — never rebind them.
+The module-level ``_stores`` dict is this worker's cache. Under ``-w N`` each
+worker has its own; writes persist immediately (write-through) and the
+cross-worker wake bus (``core/wake_bus.py``) refreshes the other workers' cached
+store in place via ``_evict_store`` when a genuine write fires a NOTIFY. Object
+identity of ``_stores`` and ``UserStore`` instances matters: tests and the
+eviction path mutate them in place — never rebind them.
 """
 
 import os
@@ -15,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import db
 from core import config
+from core import wake_bus
 
 MAX_FRAMES = 200
 # Chat history ring buffer per user. Bumped from 500 → 5000 on 2026-05-11
@@ -41,6 +44,15 @@ PROACTIVE_DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/S
 # registered (e.g. unit tests constructing UserStore directly without
 # importing app) appends behave exactly as before.
 on_proactive_job_appended: list = []
+
+# Per-thread "currently loading from the DB" flag. The blob-backed loaders
+# (_load_tokens / _load_frames_meta) re-persist normalized state on read, so a
+# reload triggered by a cross-worker NOTIFY would itself write + re-broadcast →
+# a NOTIFY storm across workers. While this flag is set on the loading thread,
+# _broadcast_store_change suppresses the wake; genuine writes (on other threads /
+# outside a load) still broadcast. Thread-local so a load on one thread can't
+# mute a concurrent genuine write on another.
+_reload_guard = threading.local()
 
 
 # Used from inside UserStore._load_tokens on boot; must be defined before
@@ -113,12 +125,17 @@ class UserStore:
         # a process restart.
         self.last_seen_api_key: str = ""
 
-        # load persistent state
-        self._load_tokens()
-        self._load_push_state()
-        self._load_live_activity_state()
-        self._load_chat()
-        self._load_frames_meta()
+        # load persistent state (write-on-read normalization must not broadcast)
+        _prev_guard = getattr(_reload_guard, "active", False)
+        _reload_guard.active = True
+        try:
+            self._load_tokens()
+            self._load_push_state()
+            self._load_live_activity_state()
+            self._load_chat()
+            self._load_frames_meta()
+        finally:
+            _reload_guard.active = _prev_guard
 
     # ------- frames index -------
     def _load_frames_meta(self):
@@ -148,6 +165,7 @@ class UserStore:
 
     def _persist_frames_meta(self):
         db.set_blob(self.user_id, "frames_meta", self.frames_meta)
+        self._broadcast_store_change("frames")
 
     # ------- tokens -------
     def _load_tokens(self):
@@ -158,6 +176,7 @@ class UserStore:
 
     def _save_tokens(self):
         db.set_blob(self.user_id, "tokens", self.tokens)
+        self._broadcast_store_change("blob")
 
     # ------- push cooldown -------
     def _load_push_state(self):
@@ -177,6 +196,7 @@ class UserStore:
             self.last_push_epoch = time.time()
             self.last_push_mono = time.monotonic()
         db.set_blob(self.user_id, "push_state", {"last_push_epoch": self.last_push_epoch})
+        self._broadcast_store_change("blob")  # other workers' push cooldown must see this
 
     def cooldown_remaining_seconds(self) -> float:
         with self.push_lock:
@@ -199,6 +219,7 @@ class UserStore:
 
     def _save_live_activity_state(self):
         db.set_blob(self.user_id, "live_activity_state", self.live_activity_state)
+        self._broadcast_store_change("blob")
 
     def should_suppress_live_activity(self, message: str, top_app: str) -> tuple[bool, str]:
         normalized_message = " ".join((message or "").strip().split())
@@ -263,14 +284,31 @@ class UserStore:
         Each collection is reassigned under its own lock. chat_load + a
         concurrent append() are both serialized on chat_lock, so no append is
         lost: either reload reads it from the DB, or append re-adds it to the
-        freshly-loaded list."""
-        with self.chat_lock:
-            self.chat_messages = db.chat_load(self.user_id)
-        with self.frames_lock:
-            self._load_frames_meta()
-        self._load_tokens()
-        self._load_live_activity_state()
-        self._load_push_state()
+        freshly-loaded list.
+
+        Guarded so the loaders' write-on-read normalization doesn't re-broadcast
+        a blob/frames wake (this reload is often itself the result of one)."""
+        _prev_guard = getattr(_reload_guard, "active", False)
+        _reload_guard.active = True
+        try:
+            with self.chat_lock:
+                self.chat_messages = db.chat_load(self.user_id)
+            with self.frames_lock:
+                self._load_frames_meta()
+            self._load_tokens()
+            self._load_live_activity_state()
+            self._load_push_state()
+        finally:
+            _reload_guard.active = _prev_guard
+
+    def _broadcast_store_change(self, channel: str) -> None:
+        """Tell other workers to refresh this user's cached blob-backed state
+        (``tokens`` / ``push_state`` / ``live_activity_state`` / ``frames_meta``)
+        so -w N can't serve a stale copy until the 15-min TTL. Suppressed while
+        this thread is loading from the DB — see ``_reload_guard``."""
+        if getattr(_reload_guard, "active", False):
+            return
+        wake_bus.notify(channel, self.user_id)
 
     def append_chat(
         self,
@@ -369,6 +407,12 @@ class UserStore:
             if len(self.chat_messages) > MAX_CHAT_MESSAGES:
                 self.chat_messages[:] = self.chat_messages[-MAX_CHAT_MESSAGES:]
             db.chat_append(self.user_id, msg_id, msg["ts"], msg, MAX_CHAT_MESSAGES)
+        # Cross-worker wake: other workers' pollers for this user park on their
+        # own threading.Events, which our notify_chat_waiters can't reach. The
+        # local fast path (the caller's notify_chat_waiters) stays; this only
+        # broadcasts the genuine write. Emitted here (the sole new-message
+        # chokepoint), never from the wake/reload path, so it can't loop.
+        wake_bus.notify("chat", self.user_id)
         return msg
 
     def update_chat_message_metadata(self, msg_id: str, fields: dict) -> dict | None:
@@ -560,6 +604,7 @@ class UserStore:
         )
         db.log_trim(self.user_id, "proactive_jobs", PROACTIVE_JOB_MAX)
         self.notify_proactive_job_waiters()
+        wake_bus.notify("proactive", self.user_id)  # wake other workers' pollers
         # Post-append hooks: the assembly layer registers the hosted wake
         # consumer here (hosted sits above core, so core must not import it).
         # No-op for resident users (route gate inside the hosted hook).
@@ -613,6 +658,7 @@ class UserStore:
         )
         if changed is not None:
             self.notify_proactive_job_waiters()
+            wake_bus.notify("proactive", self.user_id)  # wake other workers
         return changed
 
     def notify_proactive_job_waiters(self):

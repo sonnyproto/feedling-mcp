@@ -13,6 +13,7 @@ import threading
 from datetime import datetime
 
 import db
+from core import wake_bus
 
 _users_lock = threading.Lock()
 _users: list[dict] = []                    # [{user_id, principal_id, api_keys, public_key, created_at}]
@@ -232,20 +233,53 @@ def _rebuild_key_cache() -> None:
 def load_users():
     """(Re)load the registry from PostgreSQL IN PLACE — ``_users`` keeps its
     object identity because app.py re-exports it and tests clear it via
-    ``appmod._users[:] = []``; rebinding would silently fork the registry."""
-    _users[:] = db.load_all_users()
-    changed = _normalize_all_users()
-    _rebuild_key_cache()
-    if changed:
-        _save_users()
+    ``appmod._users[:] = []``; rebinding would silently fork the registry.
+
+    Holds ``_users_lock`` for the whole reload: under -w N this also runs on the
+    wake-bus listener thread (the ``users`` channel handler), concurrently with
+    request threads that mutate the registry under the same lock — without it the
+    listener could replace ``_users`` / ``_key_to_user`` mid-edit and lose a
+    write or expose a half-rebuilt key cache. Callers must NOT already hold the
+    lock (the two callers — startup assembly and the listener — don't)."""
+    with _users_lock:
+        _users[:] = db.load_all_users()
+        changed = _normalize_all_users()
+        _rebuild_key_cache()
+        if changed:
+            _save_users()
     print(f"[users] loaded {len(_users)} user(s)")
 
 
 def _save_users():
-    """Persist the whole in-memory user registry to PostgreSQL. Called wherever
-    the registry changes (registration, api-key add/revoke, normalization,
-    preference / public-key edits). The file era wrote users.json here."""
+    """Persist the WHOLE in-memory user registry to PostgreSQL (full rewrite via
+    db.save_all_users). Now used only for normalization-on-read and test resets —
+    paths that rewrite this worker's own freshly-read/owned snapshot. Genuine,
+    user-initiated single-user edits must NOT use this under -w N (a stale
+    snapshot's full rewrite would wipe another worker's concurrent edit); they go
+    through ``persist_user`` (per-row upsert + cross-worker ``users`` broadcast).
+    This path deliberately does NOT broadcast — a normalization reload firing a
+    NOTIFY would ping-pong with the load_users handler."""
     db.save_all_users(_users)
+
+
+def notify_users_changed() -> None:
+    """Broadcast a cross-worker ``users`` reload so other workers don't keep
+    serving a stale ``_users`` / ``_key_to_user`` snapshot. Pair it with the
+    persist for any genuine registry edit; ``persist_user`` already does."""
+    wake_bus.notify("users")
+
+
+def persist_user(entry: dict) -> None:
+    """Persist ONE edited user row (non-destructive per-row upsert) and broadcast
+    a cross-worker reload. This is the multi-worker-safe way to persist a genuine
+    single-user edit (registration, api-key add, access-binding flip, public-key
+    / preference change). It replaces ``_save_users(broadcast=True)``, whose
+    ``db.save_all_users`` does a DELETE-all + reinsert from THIS worker's
+    in-memory snapshot — under ``-w N`` two workers editing DIFFERENT users
+    concurrently could each wipe the other's user before the NOTIFY reload lands.
+    A per-row upsert only touches the edited row. Caller holds ``_users_lock``."""
+    db.upsert_user(entry)
+    notify_users_changed()
 
 
 def _resolve_user(api_key: str) -> str | None:
@@ -327,7 +361,7 @@ def _register_user(public_key: str | None = None,
         entry["archive_language"] = archive_language.strip()
     with _users_lock:
         _users.append(entry)
-        _save_users()
+        persist_user(entry)  # per-row upsert (multi-worker-safe) + users broadcast
         _key_to_user[api_key_hash] = user_id
     print(f"[users] registered {user_id} archive_language={entry.get('archive_language', 'unset')}")
     return {"user_id": user_id, "principal_id": principal_id, "api_key": api_key}
@@ -526,5 +560,5 @@ def _set_user_public_key(user_id: str, public_key: str) -> bool:
                 updated = True
                 break
         if updated:
-            db.upsert_user(u)
+            persist_user(u)  # per-row upsert + cross-worker users broadcast
     return updated

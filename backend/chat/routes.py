@@ -11,6 +11,7 @@ from flask import jsonify, request
 
 import db
 from core.store import UserStore
+from core import wake_bus
 from flask import Blueprint, Response
 import threading
 
@@ -128,6 +129,10 @@ def chat_history_clear():
         store.chat_messages = []
 
     store.notify_chat_waiters()
+    # Cross-worker: other workers still hold the now-cleared messages in cache —
+    # refresh them (a delete isn't a new-message append, so it won't route
+    # through append_chat's notify).
+    wake_bus.notify("chat", store.user_id)
     print(f"[chat/clear:{store.user_id}] deleted={deleted}")
     return jsonify({"cleared": True, "deleted": deleted})
 

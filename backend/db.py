@@ -12,10 +12,12 @@ Crypto note: the server never decrypts. Every encrypted payload (chat / memory
 stored verbatim as JSONB and returned byte-for-byte, so the enclave's decrypt
 path is unaffected.
 
-Concurrency: one gunicorn process, ``--threads 32`` in production compose. A single
-``psycopg_pool.ConnectionPool`` (max_size=16) is shared across threads. The
-long-poll endpoints block on in-memory ``threading.Event``s, NOT on a held DB
-connection, so they don't starve the pool.
+Concurrency: ``-w N`` workers, ``--threads 32`` each in production compose. Each
+worker has its own ``psycopg_pool.ConnectionPool`` (max_size=16) shared across
+its threads, plus one pool-external connection for the LISTEN wake bus (see
+``listen_connection`` / ``pg_notify`` and ``core/wake_bus.py``). The long-poll
+endpoints block on in-memory ``threading.Event``s, NOT on a held DB connection,
+so they don't starve the pool; cross-worker wakes ride the NOTIFY channel.
 
 Durability parity: like the old file savers, write helpers swallow-and-log on
 failure (logged at error level) rather than raising, to keep request-path
@@ -108,6 +110,36 @@ def healthcheck() -> bool:
     except Exception as e:
         log.error("[db] healthcheck failed: %s", e)
         return False
+
+
+# ---------------------------------------------------------------------------
+# LISTEN/NOTIFY (cross-worker wake bus — see core/wake_bus.py)
+#
+# These are the only DB-layer primitives for the wake bus; the protocol /
+# payload / dispatch lives in core/wake_bus.py (db.py stays free of business
+# deps). pg_notify() borrows a pooled connection for a fire-and-forget signal;
+# listen_connection() hands out a dedicated, pool-external autocommit
+# connection that one daemon thread per worker holds open and blocks on.
+# ---------------------------------------------------------------------------
+
+
+def pg_notify(channel: str, payload: str) -> None:
+    """Fire a Postgres NOTIFY on ``channel``. Swallow-and-log on failure to keep
+    request-path behavior identical to the file era (a missed wake degrades to
+    the long-poll timeout / cache TTL, never a 500)."""
+    try:
+        with get_pool().connection() as conn:
+            conn.execute("SELECT pg_notify(%s, %s)", (channel, payload))
+    except Exception as e:
+        log.error("[db] pg_notify(%s) failed: %s", channel, e)
+
+
+def listen_connection() -> "psycopg.Connection":
+    """A dedicated, pool-external autocommit connection for LISTEN. The wake bus
+    holds exactly one of these per worker, outside the request pool, and blocks
+    on ``conn.notifies()`` — so it never consumes a pool slot. Raises on connect
+    failure; the caller's reconnect loop handles it."""
+    return psycopg.connect(_database_url(), autocommit=True)
 
 
 # ---------------------------------------------------------------------------
@@ -230,9 +262,14 @@ def upsert_user(entry: dict) -> None:
 
 def save_all_users(users: list[dict]) -> None:
     """Persist the whole in-memory user list. The app calls this (via
-    _save_users) whenever the registry changes — registration, key add/revoke,
-    normalization, preference/public-key edits. Replaces the table contents in
-    one transaction so removed users disappear too."""
+    _save_users) for full-list rewrites — startup normalization and test resets.
+
+    DELETE-all + reinsert, so it reflects removals too. NOTE: this is destructive
+    from THIS worker's snapshot — under ``-w N`` it must not be used for ordinary
+    per-user edits (a stale snapshot would wipe a user another worker just
+    created). Genuine single-user edits go through ``registry.persist_user`` →
+    ``db.upsert_user`` (per-row, non-destructive) instead; the remaining callers
+    here read-then-rewrite their own full snapshot or run pre-fork at startup."""
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
@@ -626,6 +663,31 @@ def set_blob(user_id: str, kind: str, doc) -> None:
         log.error("[db] set_blob(%s,%s) failed: %s", user_id, kind, e)
 
 
+def try_stamp_hosted_tick(user_id: str, doc: dict, now: float, interval_sec: float) -> bool:
+    """Atomically claim this user's next hosted-heartbeat slot. Stamps the
+    ``hosted_tick`` blob with ``doc`` iff there is no prior stamp or the prior
+    one is at least ``interval_sec`` old, and returns whether THIS call won.
+
+    Replaces the read-then-write ts check so that two workers which both hold
+    the user's plaintext key can't each create a heartbeat in the same interval
+    (the per-job consume path is separately deduped by the job-status CAS in
+    log_patch_item). ``doc`` must carry a numeric ``ts`` field."""
+    try:
+        threshold = now - interval_sec
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, 'hosted_tick', %s) "
+                "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc "
+                "WHERE COALESCE((user_blobs.doc->>'ts')::float8, 0) <= %s "
+                "RETURNING doc",
+                (user_id, Jsonb(doc), threshold),
+            ).fetchone()
+        return row is not None
+    except Exception as e:
+        log.error("[db] try_stamp_hosted_tick(%s) failed: %s", user_id, e)
+        return False
+
+
 def delete_blob(user_id: str, kind: str) -> bool:
     try:
         with get_pool().connection() as conn:
@@ -712,6 +774,39 @@ def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None
         return row[0] if row is not None else None
     except Exception as e:
         log.error("[db] chat_update_metadata(%s,%s) failed: %s", user_id, msg_id, e)
+        return None
+
+
+def chat_try_claim_reply(
+    user_id: str, msg_id: str, consumer_id: str, now: float, fields: dict
+) -> dict | None:
+    """Atomically claim a chat reply for ``consumer_id`` — the cross-worker-safe
+    replacement for read-cache-then-write. The claim succeeds iff the row is
+    currently unclaimed, already ours, or the prior claim has expired (the SQL
+    WHERE mirrors chat.service._chat_message_claimable). Returns the merged doc
+    on success, or None if the row is missing or another consumer/worker holds
+    an unexpired claim — so two workers polling the same reply can't both win."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "UPDATE chat_messages SET doc = doc || %s "
+                "WHERE user_id = %s AND msg_id = %s "
+                # Reject already-replied rows in the DB itself, not just via the
+                # caller's (possibly stale) cache pre-gate: another worker may
+                # have posted the reply (reply_status/reply_message_id) after
+                # this worker last refreshed. Mirrors _chat_message_claimable.
+                "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+                "  AND COALESCE(doc->>'reply_message_id','') = '' "
+                "  AND ("
+                "    COALESCE(doc->>'reply_claimed_by','') = '' "
+                "    OR doc->>'reply_claimed_by' = %s "
+                "    OR COALESCE(NULLIF(doc->>'reply_claim_expires_at','')::float8, 0) <= %s"
+                ") RETURNING doc",
+                (Jsonb(fields), user_id, msg_id, consumer_id, now),
+            ).fetchone()
+        return row[0] if row is not None else None
+    except Exception as e:
+        log.error("[db] chat_try_claim_reply(%s,%s) failed: %s", user_id, msg_id, e)
         return None
 
 

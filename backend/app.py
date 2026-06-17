@@ -122,6 +122,8 @@ from screen import ws as screen_ws
 from core import enclave as core_enclave
 from core import envelope as core_envelope
 from core import store as core_store
+from core import wake_bus as core_wake_bus
+from core import leader as core_leader
 from core import util as core_util
 
 # ---------------------------------------------------------------------------
@@ -352,8 +354,23 @@ _render_proactive_dashboard = proactive_dashboard._render_proactive_dashboard
 # ---------------------------------------------------------------------------
 
 # WebSocket ingest server — moved to screen/ws.py; same start timing as before.
+# Under -w N only the elected leader binds the port (the others' bind would
+# collide); a fixed-port server is self-protecting, but electing keeps exactly
+# one and lets a survivor take over if the holder dies.
 WS_PORT = screen_ws.WS_PORT
-screen_ws.start()
+core_leader.run_singleton("ws", screen_ws.start)
+
+# Cross-worker wake bus (one listener per worker). Lets us run -w N: a genuine
+# write on any worker wakes the long-poll waiters and refreshes the cached store
+# on every other worker. No-op under -w 1 (self-origin notifies are skipped).
+# The "users" channel reloads the registry (core may not import accounts, so the
+# handler is injected here); store channels are handled inside wake_bus.
+core_wake_bus.register_handler("users", lambda _uid: accounts_registry.load_users())
+# A proactive-job NOTIFY also nudges the worker holding the user's key to consume
+# any pending hosted wake jobs immediately (cross-worker; the creating worker's
+# append hook already covers the local case). No-op for resident users.
+core_wake_bus.register_handler("proactive", hosted_wake_consumer.try_consume_pending_for_user)
+core_wake_bus.start_listener()
 
 app = Flask(__name__)
 
@@ -832,9 +849,12 @@ _count_rows = admin_data_track._count_rows
 
 
 
-# Hosted Model API proactive heartbeat. Single gunicorn worker (see the
-# UserStore cache comment) so exactly one scheduler runs. Set
-# FEEDLING_HOSTED_TICK_ENABLED=0 to disable (tests / one-off scripts).
+# Hosted Model API proactive heartbeat. Runs on EVERY worker (not leader-
+# elected): heartbeat creation and the model call both need the user's plaintext
+# key, which lives only on the worker that served the user, so each worker ticks
+# its own key-held users. Concurrent ticks are deduped in the DB (the per-user
+# heartbeat-slot CAS + the per-job status CAS). Set FEEDLING_HOSTED_TICK_ENABLED=0
+# to disable (tests / one-off scripts).
 if os.environ.get("FEEDLING_HOSTED_TICK_ENABLED", "1") == "1":
     hosted_wake_consumer.start_tick()
 

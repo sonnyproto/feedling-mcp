@@ -589,6 +589,11 @@ def account_reset():
         for h in to_evict:
             registry._key_to_user.pop(h, None)
         db.delete_user(user_id)
+        # Cross-worker: other workers still hold this user in their _users /
+        # _key_to_user and would keep auth'ing the deleted account's key until
+        # they reload. db.delete_user already removed the row, so their reload
+        # drops the user.
+        registry.notify_users_changed()
 
     # Then hard-delete all of the user's data rows (chat / memory / frames /
     # logs / blobs) and evict the cached in-memory store.

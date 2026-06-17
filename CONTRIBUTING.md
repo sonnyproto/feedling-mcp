@@ -158,8 +158,13 @@ result = chat_completion(runtime, messages)
 
 ## 7. 不变量（动之前先到群里喊一声）
 
-- gunicorn 入口 `"app:app"` + `--chdir backend`、**单 worker**
-  （UserStore 进程内缓存 + WS 线程依赖它）。
+- gunicorn 入口 `"app:app"` + `--chdir backend`。**已支持 `-w N`**（多 worker）：
+  :9998 WS ingest 由 advisory-lock 选主只在一个 worker 绑定（`core/leader.py`），
+  长轮询 waiter + per-user 缓存靠 Postgres LISTEN/NOTIFY 唤醒总线跨 worker 保持
+  一致（`core/wake_bus.py`）。hosted tick 每 worker 各跑、按持 key 用户 key-gate。
+  写新代码若引入「依赖单进程共享内存」的状态，必须同时接上 wake_bus 失效广播，
+  否则多 worker 下会分叉。每 worker 约 +17 个 DB 连接（池 16 + listener 1），
+  调大 `-w` 要核对库的 `max_connections`。
 - `python -u backend/enclave_app.py` 入口；compose 文件的任何字面量变更
   都会改变 `compose_hash`，需要重新上链（`deploy/DEPLOYMENTS.md`）。
 - 服务端永不解密用户内容；新端点收的内容字段必须是 v1 信封

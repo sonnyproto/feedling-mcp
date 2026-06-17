@@ -320,15 +320,30 @@ def _pending_chat_messages_for_poll(
         for msg in store.chat_messages:
             if _float_meta(msg.get("ts"), 0.0) <= since:
                 continue
+            # Gate on role / already-replied / claimable from cache (these don't
+            # race the way the claim itself does). For a claiming poll the
+            # cache's claimed_by read is only an early filter — the authoritative
+            # decision is the DB CAS below.
             if not _chat_message_claimable(msg, consumer_id, now):
                 continue
-            if claim:
-                fields = {
-                    "reply_claimed_by": consumer_id,
-                    "reply_claimed_at": f"{now:.3f}",
-                    "reply_claim_expires_at": f"{now + max(10, CHAT_POLL_CLAIM_TTL_SEC):.3f}",
-                }
-                msg.update(fields)
-                db.chat_update_metadata(store.user_id, str(msg.get("id") or ""), fields)
-            claimed.append(dict(msg))
+            if not claim:
+                claimed.append(dict(msg))  # read-only peek, no lock taken
+                continue
+            # The claim must be atomic in the DB, not decided from this worker's
+            # cache — otherwise two workers polling the same reply would each read
+            # "unclaimed" and both deliver it. chat_try_claim_reply is a
+            # conditional UPDATE; only the winner gets the merged doc back.
+            msg_id = str(msg.get("id") or "")
+            if not msg_id:
+                continue
+            fields = {
+                "reply_claimed_by": consumer_id,
+                "reply_claimed_at": f"{now:.3f}",
+                "reply_claim_expires_at": f"{now + max(10, CHAT_POLL_CLAIM_TTL_SEC):.3f}",
+            }
+            merged = db.chat_try_claim_reply(store.user_id, msg_id, consumer_id, now, fields)
+            if merged is None:
+                continue  # lost the claim to another consumer/worker — skip
+            msg.update(fields)  # keep this worker's cache copy consistent
+            claimed.append(dict(merged))
     return claimed

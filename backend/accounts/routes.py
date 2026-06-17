@@ -39,7 +39,7 @@ def access_modes_switch():
         user_entry = registry._find_user_entry_locked(store.user_id)
         if user_entry:
             registry._upsert_access_binding_locked(user_entry, mode, touch_seen=True)
-            registry._save_users()
+            registry.persist_user(user_entry)
     print(f"[access:{store.user_id}] active_route={data['route']}")
     return jsonify(accounts_access._access_modes_payload(store))
 
@@ -67,7 +67,7 @@ def access_link_token_create():
                 existing_status = str(binding.get("status") or "")
                 break
         registry._upsert_access_binding_locked(user_entry, mode, status=existing_status or "pending")
-        registry._save_users()
+        registry.persist_user(user_entry)
     entry = {
         "token_id": f"flt_{secrets.token_hex(6)}",
         "token_hash": token_hash,
@@ -145,7 +145,7 @@ def access_link_token_claim():
                 access_mode=mode,
                 label=client_label or str(match.get("label") or registry.ACCESS_MODE_LABELS.get(mode, mode)),
             )
-            registry._save_users()
+            registry.persist_user(user_entry)
             principal_id = user_entry.get("principal_id", "")
         if make_active:
             onboarding._save_onboarding_route(core_store.get_store(user_id), mode)
@@ -264,7 +264,7 @@ def account_recover_verify():
             mode = "official_import"
         issued = registry._issue_api_key_for_user_locked(user_entry, access_mode=mode,
                                                 label="Recovered (key)")
-        registry._save_users()
+        registry.persist_user(user_entry)
         principal_id = user_entry.get("principal_id", "")
     print(f"[recover:verify] user_id={user_id} recovered via keypair PoP")
     return jsonify({
@@ -347,7 +347,7 @@ def users_set_preferences():
                 updated = True
                 break
         if updated:
-            db.upsert_user(u)
+            registry.persist_user(u)  # per-row upsert + cross-worker users broadcast
 
     if not updated:
         return jsonify({"error": "user not found"}), 404
@@ -375,6 +375,6 @@ def onboarding_route():
         user_entry = registry._find_user_entry_locked(store.user_id)
         if user_entry:
             registry._upsert_access_binding_locked(user_entry, data["route"], touch_seen=True)
-            registry._save_users()
+            registry.persist_user(user_entry)
     print(f"[onboarding:{store.user_id}] route={data['route']}")
     return jsonify(data)

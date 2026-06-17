@@ -73,7 +73,7 @@ def _save_frame_envelope(store: UserStore, payload: dict, env: dict):
         if len(store.frames_meta) > core_store.MAX_FRAMES:
             removed = store.frames_meta.pop(0)
             db.frame_delete(store.user_id, removed.get("id") or removed["filename"].split(".")[0])
-        store._persist_frames_meta()
+        store._persist_frames_meta()  # also broadcasts the "frames" wake cross-worker
 
     body_len = len(env.get("body_ct") or "")
     print(f"[ingest:{store.user_id}] saved v1 frame id={item_id} body_ct_len={body_len}")

@@ -51,7 +51,7 @@ def _access_modes_payload(store: UserStore) -> dict:
             binding_snapshot = copy.deepcopy(user_entry.get("access_bindings"))
             registry._upsert_access_binding_locked(user_entry, active_route)
             try:
-                db.upsert_user(user_entry)
+                registry.persist_user(user_entry)  # per-row upsert + broadcast, only on genuine flip
             except Exception as e:
                 user_entry["access_bindings"] = binding_snapshot
                 print(f"[access-modes] binding persist failed for {store.user_id}, "

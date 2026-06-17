@@ -131,8 +131,12 @@ services:
   backend:
     image: ghcr.io/teleport-computer/feedling:b14c3db
     # gunicorn = production WSGI (the Werkzeug dev server stalls on large
-    # responses under TDX). -w 1 is mandatory: app.py binds the :9998 WS
-    # ingest at import time, so multiple workers would collide on it.
+    # responses under TDX). -w N is now code-supported (leader-elected :9998 WS
+    # ingest + Postgres LISTEN/NOTIFY wake bus — see core/leader.py /
+    # core/wake_bus.py), BUT the image above is a pinned pre-patch digest that
+    # still binds :9998 at import time, so it MUST stay -w 1. Bump -w (and the ~17
+    # DB connections/worker = pool 16 + 1 listener, vs the DB's max_connections)
+    # IN THE SAME DEPLOY that rolls the image to a build containing this patch.
     command: ["gunicorn", "--chdir", "backend", "-w", "1", "--threads", "32", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
     restart: unless-stopped
     environment:

@@ -49,6 +49,61 @@
 
 ## 2026-06-16
 
+### [DONE] 解除"单 worker 天花板"——后端可跑 `-w N`（LISTEN/NOTIFY 唤醒总线 + advisory-lock 选主）
+- **动机**：生产 `gunicorn -w 1 --threads 32`，32 线程是全部并发预算，而
+  `/v1/chat/poll`、`/v1/proactive/jobs/poll` 天然挂线程（≤30s）。活跃用户一多，
+  等待者吃光线程池、正常请求排队 → 已观察到的 prod 慢/502；且永远无法加 worker。
+  根因是 4 类绑死单进程的状态：① UserStore 进程内写穿缓存 ② threading.Event
+  长轮询 waiter ③ :9998 WS 在 import 期绑端口 ④ 必须单例的 hosted tick/consumer
+  + 明文 `last_seen_api_key`（仅内存）。
+- **Layer A 跨进程唤醒/失效**：新增 `backend/core/wake_bus.py`，用 Postgres
+  LISTEN/NOTIFY（不引新组件）。写 chokepoint（`store.append_chat` /
+  `append_proactive_job` / frame 落库 / 注册表编辑）落库后发 `NOTIFY`；每 worker
+  一个常驻 listener 收到非自己来源的通知就 `_evict_store`（就地 reload + 唤醒本地
+  waiter）。db 层加 `pg_notify` / `listen_connection`（SQL 归 db.py，协议归 core）。
+- **暗雷修复**：① chat-poll 的 reply claim 从"读缓存判可领 + 写穿"改成
+  `db.chat_try_claim_reply` 的 DB 条件 CAS（两 worker 不再双投同一回复）；
+  ② 用户注册表 `_users`/`_key_to_user` 进程内、查 miss 不回库——register/发 key 等
+  真实编辑走 `_save_users(broadcast=True)` 发 `users` 通道，各 worker reload，
+  否则新用户在别的 worker 会 401。
+- **Layer B 单例选主**：新增 `backend/core/leader.py`（`pg_try_advisory_lock`），
+  WS ingest 收进 `run_singleton("ws", …)`，只有持锁 worker 绑 :9998、挂了别的
+  worker 接管。
+- **Layer C hosted wake 分布式 + 按 key 在位执行**（比原计划更简）：发现 job 认领
+  已经是 `update_proactive_job(only_if_status="pending")` 的原子状态 CAS，**无需
+  新表/迁移**。tick 改成每 worker 各跑、只处理本 worker 持 key 的用户
+  （`_hosted_keyholder_user_ids`，创建+模型调用都需明文 key 故必须在 key 所在
+  worker 跑）；重复创建用 `db.try_stamp_hosted_tick` 原子心跳槽 CAS 防住；
+  `try_consume_pending_for_user` 作 `proactive` 通道 handler 跨 worker 即时认领。
+- **compose**：三个 compose `-w 1` → `-w 2`（先小、可灰度再提 N），注释更新；
+  改 compose 字面量会改 `compose_hash`，**部署需重新上链**（CONTRIBUTING §7 /
+  DEPLOYMENTS.md）。每 worker 约 +17 个 DB 连接（池 16 + listener 1），调大 `-w`
+  前核对库 `max_connections`。
+- **验证**：本地 `gunicorn -w 2` 端到端——注册落一个 worker 后 whoami 40/40 全 200
+  （users 通道）；一 worker 长轮询、另一 worker 发消息，10/10 轮真实停泊后均
+  ~10ms 内被唤醒（跨进程唤醒总线）；advisory-lock 选主 + 接管、claim CAS 单赢家
+  均有单测/集成验证。全量 pytest 450 passed（仅 2 个预先存在的 enclave 红用例，
+  零新增失败）。新增测试：`test_wake_bus`、`test_chat_poll_claim_cas`、
+  `test_hosted_wake_distribution`。
+- **Codex review 修复（两轮）**：① 注册表所有真实单用户编辑（注册/发 key/key
+  恢复/link-token/access-binding/公钥/偏好）从 `_save_users` 全表
+  DELETE+重插改成 `registry.persist_user` 单行 upsert + `users` 广播——否则两
+  worker 并发编辑不同用户时，陈旧快照全表重写会抹掉对方刚建的用户（已用 -w 2 并发
+  注册 16 用户验证零丢失）；`_save_users` 全表重写只留给 normalization/测试。
+  ② `load_users()` 整个 reload 包进 `_users_lock`（它现在也在监听线程上跑，与请求
+  线程并发改注册表）。③ chat-poll claim 的 DB CAS 补 replied 状态拒绝
+  （`reply_status='replied'` / `reply_message_id`），防别的 worker 已回复后本
+  worker 凭陈旧缓存重复认领。④ 账号删除路径补 `users` 广播（否则别的 worker 仍
+  鉴权已删账号）。⑤ 缓存型 blob（`tokens`/`push_state`/`live_activity_state`/
+  `frames_meta`）写 chokepoint 补 `blob`/`frames` 广播——否则别的 worker 用陈旧
+  token/推送冷却到 15min TTL，坏掉推送投递/去重；用线程局部 `_reload_guard` 抑制
+  reload 期写穿归一化的回广播（防 NOTIFY 风暴）。⑥ **部署安全**：phala / phala.test
+  两个 compose 用 pinned 旧镜像（`857c09e`/`b14c3db`，import 期绑 :9998），保持
+  `-w 1`，注释写明须与"换含本 patch 的镜像"同一次部署一起提 `-w`；只有带 `build:`
+  的 base `docker-compose.yaml` 设 `-w 2`（从源码构建，安全）。
+- **影响文档**：CONTRIBUTING §7 不变量（单 worker → 多 worker 已支持）、
+  `core/store.py` / `db.py` 模块 docstring、三个 `deploy/docker-compose*.yaml`。
+
 ### [DONE] enclave 改用 gunicorn gthread（撤掉 Werkzeug 开发服务器）
 - `backend/enclave_app.py` 的入口从 `app.run(threaded=True)`（Flask 自带
   Werkzeug 开发服务器，非生产级 WSGI）换成**编程方式内嵌的 gunicorn**

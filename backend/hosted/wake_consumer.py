@@ -398,15 +398,33 @@ def _reconcile_hosted_jobs(store: UserStore, now: float) -> None:
                 print(f"[hosted-wake:{store.user_id}] reaped stale {status} job={job_id}")
 
 
+def _hosted_keyholder_user_ids() -> list[str]:
+    """Users whose plaintext key THIS worker currently holds (set on the store by
+    auth / WS). Under -w N each worker runs the tick only for its own key-held
+    users: heartbeat creation and the model call both need the key, so they must
+    run where the key lives. A user with no key on any worker simply waits — the
+    same as the single-worker era, where the key stayed empty until the user's
+    first request after a restart."""
+    with core_store._stores_lock:
+        return [
+            uid for uid, st in core_store._stores.items()
+            if getattr(st, "last_seen_api_key", "")
+        ]
+
+
 def _run_hosted_tick_once(now: float | None = None) -> int:
-    """One scheduler pass: create heartbeat wakes for due hosted users.
-    Returns the number of jobs enqueued (the append hook consumes them).
-    The trigger name comes from the user's broadcast state so the V2
-    mechanical suppression treats hosted heartbeats exactly like resident
-    ones."""
+    """One scheduler pass on THIS worker: reconcile + create heartbeat wakes for
+    the users whose key this worker holds. Returns the number of jobs enqueued
+    (the append hook consumes them locally — the key is right here). The trigger
+    name comes from the user's broadcast state so the V2 mechanical suppression
+    treats hosted heartbeats exactly like resident ones.
+
+    Runs on every worker (not leader-elected): the per-user heartbeat slot is
+    claimed atomically in the DB (try_stamp_hosted_tick) and each job is consumed
+    under the job-status CAS, so concurrent ticks across workers neither
+    double-create nor double-consume."""
     now = now or time.time()
-    with registry._users_lock:
-        user_ids = [str(u.get("user_id") or "") for u in registry._users if u.get("user_id")]
+    user_ids = _hosted_keyholder_user_ids()
     created = 0
     for user_id in user_ids:
         try:
@@ -424,14 +442,17 @@ def _run_hosted_tick_once(now: float | None = None) -> int:
             # 不创建（也不浪费 stamp），等用户打开后下一轮恢复。
             if not settings.get("enabled", True) or settings.get("dnd", False):
                 continue
-            last = db.get_blob(user_id, "hosted_tick") or {}
-            if now - float(last.get("ts") or 0) < HOSTED_TICK_INTERVAL_SEC:
-                continue
             # 先记 ts 再判定：判定被 suppress 也算一次 tick，避免对被
-            # suppress 的用户每 60s 重复跑判定。
-            db.set_blob(user_id, "hosted_tick", {
-                "ts": now, "at": datetime.fromtimestamp(now).isoformat(),
-            })
+            # suppress 的用户每 60s 重复跑判定。Atomic CAS stamp so two workers
+            # that both hold this user's key can't both create a heartbeat in
+            # the same interval (returns False if another worker just stamped).
+            if not db.try_stamp_hosted_tick(
+                user_id,
+                {"ts": now, "at": datetime.fromtimestamp(now).isoformat()},
+                now,
+                HOSTED_TICK_INTERVAL_SEC,
+            ):
+                continue
             # Same effective source as the decision builder (device events
             # win, settings fall back) — see _effective_broadcast_state.
             decision = proactive_gate._build_proactive_v2_wake_decision(
@@ -461,7 +482,31 @@ def _hosted_tick_loop() -> None:
 
 
 def start_tick():
-    """Start the hosted proactive heartbeat. Single gunicorn worker, so
-    exactly one scheduler runs. Called by app.py under the same
-    FEEDLING_HOSTED_TICK_ENABLED gate as before."""
+    """Start the hosted proactive heartbeat on THIS worker. Under -w N every
+    worker runs its own tick, each key-gated to the users it holds the key for
+    (see _run_hosted_tick_once). Called by app.py under the
+    FEEDLING_HOSTED_TICK_ENABLED gate."""
     threading.Thread(target=_hosted_tick_loop, daemon=True, name="hosted-tick").start()
+
+
+def try_consume_pending_for_user(user_id: str) -> None:
+    """'proactive' wake-bus handler: when another worker creates/updates a
+    proactive job (NOTIFY 'proactive'), the worker holding this user's plaintext
+    key consumes any pending hosted jobs right away — otherwise the next tick's
+    reconcile would, up to HOSTED_TICK_LOOP_SEC later. The job-status CAS dedups
+    against the creating worker's own append hook, so an overlap is harmless.
+
+    Cheap no-op for resident users and for workers that don't hold the key: the
+    store is looked up in-cache only (never loaded), so a notify for a user this
+    worker doesn't serve costs nothing."""
+    with core_store._stores_lock:
+        store = core_store._stores.get(user_id)
+    if store is None or not getattr(store, "last_seen_api_key", ""):
+        return
+    try:
+        eligible, _reason = _hosted_wake_base_eligible(store)
+        if not eligible:
+            return
+        _reconcile_hosted_jobs(store, time.time())
+    except Exception as e:
+        print(f"[hosted-wake:{user_id}] cross-worker consume failed: {e}")
