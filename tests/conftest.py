@@ -58,6 +58,7 @@ if not _provisioned:
         "test_wake_bus.py",
         "test_semantic_analysis.py",
         "test_model_api_wake.py",
+        "test_proactive_runtime_v2.py",
         "test_perception.py",
         "test_provider_client.py",
         "test_history_import_identity.py",
