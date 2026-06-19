@@ -128,6 +128,14 @@ flowchart TD
 
 ### 1.2 主动唤醒循环（agent 主动找用户）
 
+> Current production compatibility path.
+>
+> Round 3 的目标方案见 `docs/PROACTIVE_PERCEPTION_SPEC_V2.md`。下面的
+> `/v1/proactive/jobs/*`、`proactive.sleep`、`proactive.set_ai_state` 等流程
+> 描述的是当前旧执行体和 resident/hosted 兼容通道，不是新 runtime 的目标
+> 设计。新增主动感知能力应接入 `WakeEventV2 -> WakeInboxV2 ->
+> MergedWakeContextV2 -> TurnRunnerV2`，旧 job/status 只做 adapter 或投影。
+
 设计原则（Proactive V2）：**平台只负责递"醒来的机会"，说不说话由
 agent 自己决定**。平台不做任何"这一刻值不值得打扰用户"的 AI 判断。
 

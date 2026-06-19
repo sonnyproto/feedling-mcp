@@ -2,6 +2,18 @@
 
 This branch starts the V2 runtime spine without switching production traffic.
 
+## Canonical Design
+
+The source of truth for Round 3 is
+`docs/PROACTIVE_PERCEPTION_SPEC_V2.md`.
+
+Older proactive docs are historical context only:
+
+- `docs/PROACTIVE_V2_ARCHITECTURE.md` describes the previous Proactive V2
+  architecture and contains superseded `user_state/ai_state/proactive_jobs`
+  concepts.
+- `docs/PROACTIVE_GATE_V1.md` is the archived platform-gate design.
+
 ## Contract
 
 - The new center is

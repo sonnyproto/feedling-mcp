@@ -4,7 +4,8 @@
 
 本文档面向 iOS 客户端接入，**只列前端会调用的接口**（上报 / 配置 / 权限）。
 读取类接口（快照、照片列表/内容、集合读取）由 agent / MCP 使用，见文末附录。
-配套需求见 `EXTENDED_PERCEPTION.md`，后端实现在 `backend/perception/`。
+Round 3 的感知→wake 方案以 `docs/PROACTIVE_PERCEPTION_SPEC_V2.md` 为准；
+本文只保留 HTTP 接入细节，后端实现在 `backend/perception/`。
 
 ---
 
