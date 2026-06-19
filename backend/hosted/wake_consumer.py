@@ -449,6 +449,11 @@ def _hosted_wake_v2_runtime(store: UserStore, runtime, api_key: str | None) -> t
         inbox=DBWakeInboxV2(),
         settings_resolver=settings_store.load,
         metrics_sink=metrics_sink,
+        # Hosted wake execution is job-driven: each compat job is already the
+        # scheduling/ingress unit and is guarded by the foreground turn lease.
+        # Keep the merge delay at zero here so hosted worker threads do not
+        # sit on claimed legacy jobs; resident/inbox runtimes can use a
+        # non-zero merge window when they own the queue end-to-end.
         merge_window_sec=0.0,
     )
     runner = TurnRunnerV2(
