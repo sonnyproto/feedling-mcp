@@ -645,6 +645,7 @@ class UserStore:
             "posted_at",
             "completed_at",
             "failed_at",
+            "recovered_at",
             "updated_at",
             "chat_message_id",
             "agent_action",

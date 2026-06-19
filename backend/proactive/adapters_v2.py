@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import time
+import uuid
+from datetime import datetime
 from typing import Any, Mapping
 
 from proactive.runtime_v2 import WakeEventV2
@@ -56,3 +58,42 @@ def wake_event_v2_from_legacy_job(
         background_payload=job.get("background_payload") if isinstance(job.get("background_payload"), dict) else {},
         payload={"legacy_proactive_job": dict(job)},
     )
+
+
+def legacy_job_from_wake_event_v2(event: WakeEventV2) -> dict[str, Any]:
+    """Project a V2 wake back to the temporary legacy job queue.
+
+    This is an output compatibility boundary for hosted/resident cutover only.
+    The V2 runtime must continue to reason on WakeEventV2 and turn records, not
+    on this shape.
+    """
+    now = float(getattr(event, "created_at", 0.0) or time.time())
+    source = str(getattr(event, "source", "") or "scheduled_wake")
+    raw_trigger = str(getattr(event, "trigger", "") or source)
+    trigger = "background_result" if source == "background_result" else raw_trigger
+    scheduled_note = str(getattr(event, "scheduled_note", "") or "")
+    change_digest = str(getattr(event, "change_digest", "") or scheduled_note)
+    return {
+        "job_id": "pj_" + uuid.uuid4().hex[:16],
+        "wake_id": str(getattr(event, "wake_id", "") or ""),
+        "ts": now,
+        "created_at": datetime.fromtimestamp(now).isoformat(),
+        "source": "agent_initiated_proactive",
+        "status": "pending",
+        "intent_label": raw_trigger[:120],
+        "trigger": trigger[:120],
+        "wake_kind": source[:120],
+        "context_hint": change_digest[:2000],
+        "change_digest": change_digest[:2000],
+        "presence_hints": dict(getattr(event, "presence_hints", {}) or {}),
+        "timezone": str(getattr(event, "timezone", "") or ""),
+        "scheduled_note": scheduled_note[:2000],
+        "origin_refs": list(getattr(event, "origin_refs", ()) or ()),
+        "background_payload": dict(getattr(event, "background_payload", {}) or {}),
+        "connections": [],
+        "connection": {},
+        "frame_ids": [],
+        "device_event_ids": [],
+        "current_app": "",
+        "payload": {"v2_wake": dict(getattr(event, "payload", {}) or {})},
+    }

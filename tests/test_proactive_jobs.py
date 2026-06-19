@@ -13,6 +13,8 @@ appmod = importlib.import_module("app")
 from chat import service as chat_service  # noqa: E402
 from bootstrap import gates as boot_gates  # noqa: E402
 from proactive import dashboard as proactive_dashboard  # noqa: E402
+from proactive import resident_runtime_v2 as proactive_resident_runtime_v2  # noqa: E402
+from proactive import routes as proactive_routes  # noqa: E402
 from push import apns as push_apns  # noqa: E402
 from core import config as core_config  # noqa: E402
 
@@ -719,6 +721,113 @@ def test_proactive_job_claim_and_status_lifecycle(tmp_path, monkeypatch):
     assert row["derived_status"] == "failed"
     assert row["status_reason"] == "agent_call_failed"
     assert row["consumer_id"] == "consumer-a"
+
+
+def test_resident_poll_includes_per_user_runtime_v2_profile(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_resident_runtime_profile_key"
+    user_id = "usr_resident_runtime_profile"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    job = store.append_proactive_job({
+        "job_id": "pj_runtime_profile",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 1000.0,
+        "status": "pending",
+        "trigger": "heartbeat_broadcast_on",
+    })
+
+    monkeypatch.setattr(
+        proactive_resident_runtime_v2,
+        "resident_runtime_v2_public_profile",
+        lambda _store: {proactive_resident_runtime_v2.RESIDENT_WAKE_RUNTIME_V2_FLAG: True},
+    )
+
+    client = appmod.app.test_client()
+    poll = client.get("/v1/proactive/jobs/poll?since=0&timeout=0", headers={"X-API-Key": api_key})
+
+    assert poll.status_code == 200
+    body = poll.get_json()
+    assert body["runtime_v2"][proactive_resident_runtime_v2.RESIDENT_WAKE_RUNTIME_V2_FLAG] is True
+    assert body["jobs"][0]["job_id"] == job["job_id"]
+    assert body["jobs"][0]["runtime_v2"][proactive_resident_runtime_v2.RESIDENT_WAKE_RUNTIME_V2_FLAG] is True
+
+
+def test_resident_stale_claim_is_recovered_and_old_consumer_cannot_complete(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    now = 5000.0
+    api_key = "test_resident_stale_reclaim_key"
+    user_id = "usr_resident_stale_reclaim"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.append_proactive_job({
+        "job_id": "pj_stale_resident",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 100.0,
+        "status": "claimed",
+        "consumer_id": "resident-a",
+        "claimed_at": str(now - proactive_routes.RESIDENT_WAKE_LEASE_SEC - 1),
+        "trigger": "heartbeat_broadcast_on",
+    })
+    monkeypatch.setattr(proactive_routes.time, "time", lambda: now)
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    poll = client.get("/v1/proactive/jobs/poll?since=0&timeout=0", headers=headers)
+
+    assert poll.status_code == 200
+    jobs = poll.get_json()["jobs"]
+    assert [job["job_id"] for job in jobs] == ["pj_stale_resident"]
+    recovered = jobs[0]
+    assert recovered["status"] == "pending"
+    assert recovered["status_reason"] == "resident_stale_claim_recovered"
+    assert recovered["consumer_id"] == "recovered:resident-a"
+    assert recovered.get("recovered_at")
+
+    stale_status = client.post(
+        "/v1/proactive/jobs/pj_stale_resident/status",
+        headers=headers,
+        json={"status": "posted", "consumer_id": "resident-a"},
+    )
+    assert stale_status.status_code == 409
+    assert stale_status.get_json()["error"] == "consumer_mismatch"
+
+
+def test_resident_reaper_does_not_reclaim_hosted_claims(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    now = 6000.0
+    api_key = "test_resident_reaper_hosted_key"
+    user_id = "usr_resident_reaper_hosted"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.append_proactive_job({
+        "job_id": "pj_hosted_claim",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 100.0,
+        "status": "claimed",
+        "consumer_id": "hosted_runtime_v2",
+        "claimed_at": str(now - proactive_routes.RESIDENT_WAKE_LEASE_SEC - 1),
+        "trigger": "heartbeat_broadcast_on",
+    })
+    monkeypatch.setattr(proactive_routes.time, "time", lambda: now)
+
+    client = appmod.app.test_client()
+    poll = client.get(
+        "/v1/proactive/jobs/poll?since=0&timeout=0",
+        headers={"X-API-Key": api_key},
+    )
+
+    assert poll.status_code == 200
+    assert poll.get_json()["jobs"] == []
+    row = store.list_proactive_jobs(since_epoch=0, limit=0)[0]
+    assert row["status"] == "claimed"
+    assert row["consumer_id"] == "hosted_runtime_v2"
 
 
 def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeypatch):

@@ -10,7 +10,6 @@ import re
 import secrets
 import threading
 import time
-import uuid
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Any, Mapping
@@ -63,7 +62,7 @@ from accounts import registry
 from core import store as core_store
 from core import enclave as core_enclave
 from proactive import gate as proactive_gate
-from proactive.adapters_v2 import wake_event_v2_from_legacy_job
+from proactive.adapters_v2 import legacy_job_from_wake_event_v2, wake_event_v2_from_legacy_job
 from proactive.agent_protocol_v2 import actions_for_persistence_v2
 from proactive.controls_v2 import WakeControlDecisionV2, evaluate_delivery_v2, resolve_settings_v2
 from proactive.observability_v2 import DBRuntimeMetricsSinkV2
@@ -709,36 +708,7 @@ def _reconcile_hosted_jobs(store: UserStore, now: float) -> None:
 
 
 def _scheduled_event_compat_job(event) -> dict[str, Any]:
-    now = float(getattr(event, "created_at", 0.0) or time.time())
-    source = str(getattr(event, "source", "") or "scheduled_wake")
-    raw_trigger = str(getattr(event, "trigger", "") or source)
-    trigger = "background_result" if source == "background_result" else raw_trigger
-    scheduled_note = str(getattr(event, "scheduled_note", "") or "")
-    change_digest = str(getattr(event, "change_digest", "") or scheduled_note)
-    return {
-        "job_id": "pj_" + uuid.uuid4().hex[:16],
-        "wake_id": str(getattr(event, "wake_id", "") or ""),
-        "ts": now,
-        "created_at": datetime.fromtimestamp(now).isoformat(),
-        "source": "agent_initiated_proactive",
-        "status": "pending",
-        "intent_label": raw_trigger[:120],
-        "trigger": trigger[:120],
-        "wake_kind": source[:120],
-        "context_hint": change_digest[:2000],
-        "change_digest": change_digest[:2000],
-        "presence_hints": dict(getattr(event, "presence_hints", {}) or {}),
-        "timezone": str(getattr(event, "timezone", "") or ""),
-        "scheduled_note": scheduled_note[:2000],
-        "origin_refs": list(getattr(event, "origin_refs", ()) or ()),
-        "background_payload": dict(getattr(event, "background_payload", {}) or {}),
-        "connections": [],
-        "connection": {},
-        "frame_ids": [],
-        "device_event_ids": [],
-        "current_app": "",
-        "payload": {"v2_wake": dict(getattr(event, "payload", {}) or {})},
-    }
+    return legacy_job_from_wake_event_v2(event)
 
 
 def _run_hosted_scheduled_wake_due_once(store: UserStore, now: float) -> int:
