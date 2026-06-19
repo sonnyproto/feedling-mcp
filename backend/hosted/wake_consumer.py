@@ -65,9 +65,10 @@ from core import enclave as core_enclave
 from proactive import gate as proactive_gate
 from proactive.adapters_v2 import wake_event_v2_from_legacy_job
 from proactive.agent_protocol_v2 import actions_for_persistence_v2
-from proactive.controls_v2 import evaluate_delivery_v2, resolve_settings_v2
+from proactive.controls_v2 import WakeControlDecisionV2, evaluate_delivery_v2, resolve_settings_v2
 from proactive.observability_v2 import DBRuntimeMetricsSinkV2
 from proactive.runtime_v2 import RuntimeSpineV2, TurnOutcomeV2, TurnRunnerV2
+from proactive.scheduled_wake_v2 import DBScheduledWakeStoreV2, ScheduledWakeServiceV2
 from proactive.store_v2 import (
     DBBackgroundJobStoreV2,
     DBProactiveSettingsStoreV2,
@@ -457,6 +458,10 @@ def _hosted_wake_v2_runtime(store: UserStore, runtime, api_key: str | None) -> t
         recent_chat_provider=_hosted_v2_recent_chat_provider(store, api_key),
         turn_store=DBTurnStoreV2(),
         background_jobs=DBBackgroundJobStoreV2(),
+        scheduled_wakes=ScheduledWakeServiceV2(
+            DBScheduledWakeStoreV2(),
+            owner_id=HOSTED_WAKE_CONSUMER_ID_V2,
+        ),
         turn_leases=DBTurnLeaseRegistryV2(),
         metrics_sink=metrics_sink,
         owner_id=HOSTED_WAKE_CONSUMER_ID_V2,
@@ -530,6 +535,7 @@ def _hosted_wake_v2_deliver_messages(
 def _hosted_wake_v2_final_patch(result, sent_message_ids: list[str], delivery_attempts: list[dict[str, Any]]) -> dict:
     outcome = result.outcome or TurnOutcomeV2()
     actions = [dict(action) for action in actions_for_persistence_v2(outcome)]
+    scheduled_results = [dict(item) for item in (getattr(result, "scheduled_action_results", ()) or ())]
     if sent_message_ids:
         wake_result = "message_sent"
     elif result.status == "ignored_manual":
@@ -541,6 +547,7 @@ def _hosted_wake_v2_final_patch(result, sent_message_ids: list[str], delivery_at
     else:
         wake_result = "sleep"
     agent_actions = actions[:10]
+    agent_actions.extend(scheduled_results[: max(0, 10 - len(agent_actions))])
     agent_actions.extend(delivery_attempts[: max(0, 10 - len(agent_actions))])
     patch: dict[str, Any] = {
         "status": "completed",
@@ -548,6 +555,8 @@ def _hosted_wake_v2_final_patch(result, sent_message_ids: list[str], delivery_at
         "agent_action": wake_result,
         "agent_actions": agent_actions[:10],
     }
+    if scheduled_results:
+        patch["scheduled_action_results"] = scheduled_results[:10]
     if sent_message_ids:
         patch["chat_message_id"] = sent_message_ids[0]
         patch["posted_at"] = datetime.now().isoformat()
@@ -699,6 +708,69 @@ def _reconcile_hosted_jobs(store: UserStore, now: float) -> None:
                 print(f"[hosted-wake:{store.user_id}] reaped stale {status} job={job_id}")
 
 
+def _scheduled_event_compat_job(event) -> dict[str, Any]:
+    now = float(getattr(event, "created_at", 0.0) or time.time())
+    source = str(getattr(event, "source", "") or "scheduled_wake")
+    raw_trigger = str(getattr(event, "trigger", "") or source)
+    trigger = "background_result" if source == "background_result" else raw_trigger
+    scheduled_note = str(getattr(event, "scheduled_note", "") or "")
+    change_digest = str(getattr(event, "change_digest", "") or scheduled_note)
+    return {
+        "job_id": "pj_" + uuid.uuid4().hex[:16],
+        "wake_id": str(getattr(event, "wake_id", "") or ""),
+        "ts": now,
+        "created_at": datetime.fromtimestamp(now).isoformat(),
+        "source": "agent_initiated_proactive",
+        "status": "pending",
+        "intent_label": raw_trigger[:120],
+        "trigger": trigger[:120],
+        "wake_kind": source[:120],
+        "context_hint": change_digest[:2000],
+        "change_digest": change_digest[:2000],
+        "presence_hints": dict(getattr(event, "presence_hints", {}) or {}),
+        "timezone": str(getattr(event, "timezone", "") or ""),
+        "scheduled_note": scheduled_note[:2000],
+        "origin_refs": list(getattr(event, "origin_refs", ()) or ()),
+        "background_payload": dict(getattr(event, "background_payload", {}) or {}),
+        "connections": [],
+        "connection": {},
+        "frame_ids": [],
+        "device_event_ids": [],
+        "current_app": "",
+        "payload": {"v2_wake": dict(getattr(event, "payload", {}) or {})},
+    }
+
+
+def _run_hosted_scheduled_wake_due_once(store: UserStore, now: float) -> int:
+    """Fire due V2 timers for this key-held hosted user.
+
+    The hosted V2 flag remains the operational cutover guard. When the flag is
+    off, pending timers stay pending instead of being handed to the legacy wake
+    executor.
+    """
+    if not _hosted_wake_runtime_v2_enabled(store):
+        return 0
+    settings = _hosted_v2_settings(store)
+    service = ScheduledWakeServiceV2(
+        DBScheduledWakeStoreV2(),
+        owner_id=HOSTED_WAKE_CONSUMER_ID_V2,
+    )
+
+    def _submit(event):
+        job = _scheduled_event_compat_job(event)
+        store.append_proactive_job(job)
+        return WakeControlDecisionV2(True, "queued_as_compat_job", settings)
+
+    results = service.fire_due_timers(
+        store.user_id,
+        settings=settings,
+        now=now,
+        submit_wake=_submit,
+        owner_id=HOSTED_WAKE_CONSUMER_ID_V2,
+    )
+    return len(results)
+
+
 def _hosted_keyholder_user_ids() -> list[str]:
     """Users whose plaintext key THIS worker currently holds (set on the store by
     auth / WS). Under -w N each worker runs the tick only for its own key-held
@@ -738,6 +810,7 @@ def _run_hosted_tick_once(now: float | None = None) -> int:
             # Runs on the BASE gate so a pending manual summon still gets
             # consumed (with its dnd bypass) while proactive is dnd'd off.
             _reconcile_hosted_jobs(store, now)
+            created += _run_hosted_scheduled_wake_due_once(store, now)
             settings = store.load_proactive_settings()
             # 心跳是自动 wake，不享受 manual/forced 豁免：开关关/勿扰时
             # 不创建（也不浪费 stamp），等用户打开后下一轮恢复。

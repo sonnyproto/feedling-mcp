@@ -405,6 +405,7 @@ class TurnRunResultV2:
     context: MergedWakeContextV2 | None = None
     agent_context: Mapping[str, Any] = field(default_factory=dict)
     outcome: TurnOutcomeV2 | None = None
+    scheduled_action_results: tuple[Mapping[str, Any], ...] = ()
     turn_lease: LeaseV2 | None = None
     turn_id: str = ""
     contract_violation: str = ""
@@ -498,6 +499,7 @@ class TurnRunnerV2:
         recent_chat_provider: Callable[[str], Sequence[Mapping[str, Any]]] | None = None,
         turn_store: Any | None = None,
         background_jobs: Any | None = None,
+        scheduled_wakes: Any | None = None,
         turn_leases: TurnLeaseRegistryV2 | None = None,
         background_leases: BackgroundLeaseRegistryV2 | None = None,
         metrics_sink: MetricsSinkV2 | None = None,
@@ -510,6 +512,7 @@ class TurnRunnerV2:
         self.recent_chat_provider = recent_chat_provider
         self.turn_store = turn_store
         self.background_jobs = background_jobs
+        self.scheduled_wakes = scheduled_wakes
         self.turn_leases = turn_leases or TurnLeaseRegistryV2()
         self.background_leases = background_leases or BackgroundLeaseRegistryV2()
         self.metrics_sink = metrics_sink if metrics_sink is not None else getattr(spine, "metrics_sink", None)
@@ -525,6 +528,16 @@ class TurnRunnerV2:
         except Exception as e:
             log.error("recent_chat_provider_v2(%s) failed: %s", user_id, e)
             return ()
+
+    def _scheduled_context(self, user_id: str) -> Mapping[str, Any]:
+        if self.scheduled_wakes is None or not hasattr(self.scheduled_wakes, "agent_context_for_user"):
+            return {}
+        try:
+            context = self.scheduled_wakes.agent_context_for_user(user_id)
+            return dict(context or {}) if isinstance(context, Mapping) else {}
+        except Exception as e:
+            log.error("scheduled_context_v2(%s) failed: %s", user_id, e)
+            return {}
 
     def _start_turn_record(
         self,
@@ -546,6 +559,50 @@ class TurnRunnerV2:
         if not actions:
             return
         self.turn_store.record_actions(user_id, turn_id, actions, now=now)
+
+    def _apply_scheduled_actions(
+        self,
+        user_id: str,
+        turn_id: str,
+        context: MergedWakeContextV2,
+        outcome: TurnOutcomeV2,
+        *,
+        now: float,
+    ) -> tuple[Mapping[str, Any], ...]:
+        if self.scheduled_wakes is None or not hasattr(self.scheduled_wakes, "apply_turn_actions"):
+            return ()
+        actions = actions_for_persistence_v2(outcome)
+        if not actions:
+            return ()
+        try:
+            settings_doc = {
+                "switches": dict(context.switches or {}),
+                "timezone": context.timezone,
+            }
+            results = self.scheduled_wakes.apply_turn_actions(
+                user_id,
+                actions,
+                settings=settings_doc,
+                turn_id=turn_id,
+                wake_ids=context.wake_ids,
+                origin_refs=context.origin_refs or context.wake_ids,
+                now=now,
+                submit_wake=self.spine.submit,
+            )
+        except Exception as e:
+            log.error("apply_scheduled_actions_v2(%s,%s) failed: %s", user_id, turn_id, e)
+            return ({
+                "type": "scheduled_action_result",
+                "status": "failed",
+                "reason": type(e).__name__,
+            },)
+        normalized: list[Mapping[str, Any]] = []
+        for result in results or ():
+            if hasattr(result, "as_dict"):
+                normalized.append(result.as_dict())
+            elif isinstance(result, Mapping):
+                normalized.append(dict(result))
+        return tuple(normalized)
 
     def _complete_turn_record(
         self,
@@ -621,6 +678,10 @@ class TurnRunnerV2:
                 context,
                 recent_chat=self._recent_chat(user_id),
             )
+            scheduled_context = self._scheduled_context(user_id)
+            if scheduled_context:
+                agent_context = dict(agent_context)
+                agent_context["scheduled_wakes"] = dict(scheduled_context)
             turn_id = self._start_turn_record(user_id, context, turn_lease, now=now)
             if self.turn_store is not None and not turn_id:
                 return TurnRunResultV2(
@@ -635,6 +696,7 @@ class TurnRunnerV2:
                 parse_agent_response_v2(raw_outcome),
             )
             self._record_actions(user_id, turn_id, outcome, now=now)
+            scheduled_action_results = self._apply_scheduled_actions(user_id, turn_id, context, outcome, now=now)
             contract_violation = manual_contract_violation_v2(context, outcome)
             self._complete_turn_record(user_id, turn_id, turn_lease, outcome, now=now)
             if contract_violation:
@@ -650,6 +712,7 @@ class TurnRunnerV2:
                     context=context,
                     agent_context=agent_context,
                     outcome=outcome,
+                    scheduled_action_results=scheduled_action_results,
                     turn_lease=turn_lease,
                     turn_id=turn_id,
                     contract_violation=contract_violation,
@@ -681,6 +744,7 @@ class TurnRunnerV2:
                     context=context,
                     agent_context=agent_context,
                     outcome=outcome,
+                    scheduled_action_results=scheduled_action_results,
                     turn_lease=turn_lease,
                     turn_id=turn_id,
                     background_job_id=background_job_id,
@@ -692,6 +756,7 @@ class TurnRunnerV2:
                 context=context,
                 agent_context=agent_context,
                 outcome=outcome,
+                scheduled_action_results=scheduled_action_results,
                 turn_lease=turn_lease,
                 turn_id=turn_id,
             )

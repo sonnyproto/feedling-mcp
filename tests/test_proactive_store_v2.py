@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from proactive.runtime_v2 import RuntimeSpineV2, TurnOutcomeV2, WakeEventV2, merge_wakes_v2
+from proactive.scheduled_wake_v2 import DBScheduledWakeStoreV2, SCHEDULED_FIRED, ScheduledWakeServiceV2
 from proactive.store_v2 import (
     BACKGROUND_COMPLETED,
     BACKGROUND_JOB_STREAM_V2,
@@ -278,3 +279,25 @@ def test_db_settings_store_uses_v2_shape_with_legacy_fallback():
     assert "dnd" not in doc
     assert "user_state" not in doc
     assert "ai_state" not in doc
+
+
+def test_db_scheduled_wake_survives_restart_and_fires_once():
+    uid = _uid()
+    first_service = ScheduledWakeServiceV2(DBScheduledWakeStoreV2(), owner_id="worker-a")
+    first_service.apply_turn_actions(
+        uid,
+        [{"type": "schedule_wake", "at": "2026-06-20T09:00:00", "tz": "UTC", "note": "db check"}],
+        now=1.0,
+    )
+    restarted_service = ScheduledWakeServiceV2(DBScheduledWakeStoreV2(), owner_id="worker-b")
+    competing_service = ScheduledWakeServiceV2(DBScheduledWakeStoreV2(), owner_id="worker-c")
+    spine = RuntimeSpineV2(merge_window_sec=0.0)
+
+    first = restarted_service.fire_due_timers(uid, settings={}, now=2_000_000_000.0, submit_wake=spine.submit)
+    second = competing_service.fire_due_timers(uid, settings={}, now=2_000_000_000.1, submit_wake=spine.submit)
+    records = DBScheduledWakeStoreV2().list_records(uid)
+
+    assert len(first) == 1
+    assert second == ()
+    assert records[0].status == SCHEDULED_FIRED
+    assert spine.drain_context(uid, now=2_000_000_000.0).scheduled_note == "db check"

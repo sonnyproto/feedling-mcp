@@ -8,7 +8,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from hosted import wake_consumer  # noqa: E402
 from proactive.controls_v2 import resolve_settings_v2  # noqa: E402
-from proactive.runtime_v2 import RuntimeSpineV2, TurnRunnerV2  # noqa: E402
+from proactive.adapters_v2 import wake_event_v2_from_legacy_job  # noqa: E402
+from proactive.runtime_v2 import RuntimeSpineV2, TurnRunnerV2, WakeEventV2  # noqa: E402
 
 
 class FakeHostedStore:
@@ -253,3 +254,47 @@ def test_hosted_wake_v2_delivery_off_writes_chat_without_push(monkeypatch):
     assert push_calls == []
     assert store.metadata_updates[0]["fields"]["push_decision"] == "suppressed"
     assert store.metadata_updates[0]["fields"]["push_reason"] == "reminders_delivery_disabled"
+
+
+def test_scheduled_wake_compat_job_round_trips_to_v2_event():
+    event = WakeEventV2(
+        user_id="usr_hosted_v2",
+        source="scheduled_wake",
+        trigger="scheduled_wake",
+        created_at=100.0,
+        scheduled_note="check whether she left",
+        change_digest="check whether she left",
+        timezone="Asia/Shanghai",
+        origin_refs=("msg_1",),
+        payload={"scheduled_wake": {"wake_id": "sched_1"}},
+    )
+
+    job = wake_consumer._scheduled_event_compat_job(event)
+    converted = wake_event_v2_from_legacy_job("usr_hosted_v2", job)
+
+    assert job["status"] == "pending"
+    assert job["trigger"] == "scheduled_wake"
+    assert converted.source == "scheduled_wake"
+    assert converted.scheduled_note == "check whether she left"
+    assert converted.origin_refs == ("msg_1",)
+    assert converted.payload["legacy_proactive_job"]["payload"]["v2_wake"]["scheduled_wake"]["wake_id"] == "sched_1"
+
+
+def test_scheduled_transparency_compat_job_round_trips_as_background_result():
+    event = WakeEventV2(
+        user_id="usr_hosted_v2",
+        source="background_result",
+        trigger="scheduled_transparency",
+        created_at=101.0,
+        origin_refs=("msg_1",),
+        background_payload={"type": "scheduled_wake_transparency", "reason": "scheduled_disabled"},
+    )
+
+    job = wake_consumer._scheduled_event_compat_job(event)
+    converted = wake_event_v2_from_legacy_job("usr_hosted_v2", job)
+
+    assert job["intent_label"] == "scheduled_transparency"
+    assert job["trigger"] == "background_result"
+    assert converted.source == "background_result"
+    assert converted.trigger == "background_result"
+    assert converted.background_payload["reason"] == "scheduled_disabled"

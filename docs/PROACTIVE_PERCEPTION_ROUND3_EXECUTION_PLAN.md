@@ -382,6 +382,12 @@ Acceptance tests:
 - Scheduled-off timer decisions consume PR2's explicit `transparency_required`
   contract or reroute into a dedicated transparency notice; fire-and-forget
   callers must not be able to silently drop due timers.
+- Pending timers that become due while Scheduled is off are marked
+  `blocked/scheduled_disabled` and rerouted as `background_result`
+  transparency wakes with the original note/origin refs. They are not retried
+  automatically.
+- Pending cap starts at 20. The scheduler exposes `pending_count/pending_cap`
+  to the agent and reports any evicted oldest timers in the action result.
 
 Do not do:
 

@@ -61,6 +61,8 @@ if not _provisioned:
         "test_proactive_runtime_v2.py",
         "test_proactive_observability_v2.py",
         "test_proactive_tool_executor_v2.py",
+        "test_proactive_scheduled_wake_v2.py",
+        "test_hosted_wake_v2_cutover.py",
         "test_perception.py",
         "test_ios_perception_contract_v2.py",
         "test_perception_ingress_v2.py",

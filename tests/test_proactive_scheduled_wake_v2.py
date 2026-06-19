@@ -1,0 +1,225 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+
+from proactive.controls_v2 import resolve_settings_v2
+from proactive.runtime_v2 import RuntimeSpineV2, TurnOutcomeV2, TurnRunnerV2, WakeEventV2
+from proactive.scheduled_wake_v2 import (
+    InMemoryScheduledWakeStoreV2,
+    SCHEDULED_BLOCKED,
+    SCHEDULED_CANCELED,
+    SCHEDULED_FIRED,
+    SCHEDULED_PENDING,
+    ScheduledWakeServiceV2,
+    schedule_instant_v2,
+)
+
+
+def _service(*, cap: int = 20, claim_ttl: float = 60.0):
+    store = InMemoryScheduledWakeStoreV2()
+    return store, ScheduledWakeServiceV2(store, pending_cap=cap, claim_ttl_sec=claim_ttl, owner_id="worker-a")
+
+
+def test_schedule_action_persists_wall_time_timezone_note_and_origin_refs():
+    store, service = _service()
+
+    result = service.apply_turn_actions(
+        "u1",
+        [{
+            "type": "schedule_wake",
+            "at": "2026-06-20T09:30:00+08:00",
+            "tz": "Asia/Shanghai",
+            "note": "check whether she left for the hospital",
+            "origin_refs": ["msg_1", "msg_2"],
+        }],
+        settings=resolve_settings_v2({"timezone": "Asia/Shanghai"}),
+        turn_id="turn_1",
+        wake_ids=("wake_1",),
+        now=10.0,
+    )[0]
+    record = store.list_records("u1")[0]
+
+    assert result.status == "scheduled"
+    assert result.timer_id == record.timer_id
+    assert record.status == SCHEDULED_PENDING
+    assert record.at == "2026-06-20T09:30:00"
+    assert record.timezone == "Asia/Shanghai"
+    assert record.note == "check whether she left for the hospital"
+    assert record.origin_refs == ("msg_1", "msg_2")
+    assert service.agent_context_for_user("u1")["pending_count"] == 1
+    assert service.agent_context_for_user("u1")["pending_cap"] == 20
+
+
+def test_schedule_instant_keeps_event_timezone_wall_clock_across_dst():
+    wall, tz, due_at = schedule_instant_v2("2026-11-01T01:30:00", "America/New_York")
+
+    assert wall == "2026-11-01T01:30:00"
+    assert tz == "America/New_York"
+    assert due_at > 0
+
+
+def test_pending_cap_eviction_is_reported_and_visible_to_agent():
+    store, service = _service(cap=2)
+
+    first = service.apply_turn_actions("u1", [{"type": "schedule_wake", "at": "2026-06-20T09:00:00", "tz": "UTC"}], now=1.0)[0]
+    second = service.apply_turn_actions("u1", [{"type": "schedule_wake", "at": "2026-06-20T10:00:00", "tz": "UTC"}], now=2.0)[0]
+    third = service.apply_turn_actions("u1", [{"type": "schedule_wake", "at": "2026-06-20T11:00:00", "tz": "UTC"}], now=3.0)[0]
+    records = {record.timer_id: record for record in store.list_records("u1")}
+
+    assert second.status == "scheduled"
+    assert third.evicted_timer_ids == (first.timer_id,)
+    assert records[first.timer_id].status == SCHEDULED_CANCELED
+    assert records[first.timer_id].cancel_reason == "pending_cap_evicted"
+    context = service.agent_context_for_user("u1")
+    assert context["pending_count"] == 2
+    assert [timer["wake_id"] for timer in context["timers"]] == [second.timer_id, third.timer_id]
+
+
+def test_cancel_wake_prevents_future_fire():
+    store, service = _service()
+    scheduled = service.apply_turn_actions("u1", [{"type": "schedule_wake", "at": "2026-06-20T09:00:00", "tz": "UTC"}], now=1.0)[0]
+    canceled = service.apply_turn_actions("u1", [{"type": "cancel_wake", "wake_id": scheduled.timer_id, "reason": "plans_changed"}], now=2.0)[0]
+    spine = RuntimeSpineV2(merge_window_sec=0.0)
+
+    fired = service.fire_due_timers("u1", settings={}, now=2_000_000_000.0, submit_wake=spine.submit)
+
+    assert canceled.status == "canceled"
+    assert canceled.reason == "plans_changed"
+    assert fired == ()
+    assert store.list_records("u1")[0].status == SCHEDULED_CANCELED
+
+
+def test_due_timer_fires_once_across_workers_and_survives_service_restart():
+    store, service_a = _service(claim_ttl=30.0)
+    service_b = ScheduledWakeServiceV2(store, owner_id="worker-b")
+    service_a.apply_turn_actions("u1", [{"type": "schedule_wake", "at": "2026-06-20T09:00:00", "tz": "UTC", "note": "check in"}], now=1.0)
+    spine = RuntimeSpineV2(merge_window_sec=0.0)
+
+    first = service_a.fire_due_timers("u1", settings={}, now=2_000_000_000.0, submit_wake=spine.submit)
+    second = service_b.fire_due_timers("u1", settings={}, now=2_000_000_000.1, submit_wake=spine.submit)
+    ctx = spine.drain_context("u1", now=2_000_000_000.0)
+    record = store.list_records("u1")[0]
+
+    assert len(first) == 1
+    assert second == ()
+    assert record.status == SCHEDULED_FIRED
+    assert ctx is not None
+    assert ctx.trigger == "scheduled_wake"
+    assert ctx.scheduled_note == "check in"
+
+
+def test_claimed_due_timer_is_reclaimed_after_claim_ttl():
+    store, service_a = _service(claim_ttl=5.0)
+    service_b = ScheduledWakeServiceV2(store, claim_ttl_sec=5.0, owner_id="worker-b")
+    service_a.apply_turn_actions("u1", [{"type": "schedule_wake", "at": "2026-06-20T09:00:00", "tz": "UTC"}], now=1.0)
+    timer_id = store.list_records("u1")[0].timer_id
+    claimed = store.claim_due("u1", timer_id, owner_id="worker-a", now=2_000_000_000.0, ttl_sec=5.0)
+    spine = RuntimeSpineV2(merge_window_sec=0.0)
+
+    blocked = service_b.fire_due_timers("u1", settings={}, now=2_000_000_004.0, submit_wake=spine.submit)
+    reclaimed = service_b.fire_due_timers("u1", settings={}, now=2_000_000_006.0, submit_wake=spine.submit)
+
+    assert claimed is not None
+    assert blocked == ()
+    assert len(reclaimed) == 1
+    assert store.list_records("u1")[0].status == SCHEDULED_FIRED
+
+
+def test_scheduled_wake_is_not_suppressed_when_ambient_is_off():
+    store, service = _service()
+    settings = resolve_settings_v2({"switches": {"ambient": False, "scheduled": True}})
+    service.apply_turn_actions("u1", [{"type": "schedule_wake", "at": "2026-06-20T09:00:00", "tz": "UTC"}], settings=settings, now=1.0)
+    spine = RuntimeSpineV2(settings_resolver=lambda _uid: settings, merge_window_sec=0.0)
+
+    fired = service.fire_due_timers("u1", settings=settings, now=2_000_000_000.0, submit_wake=spine.submit)
+    ctx = spine.drain_context("u1", now=2_000_000_000.0)
+
+    assert len(fired) == 1
+    assert ctx is not None
+    assert ctx.trigger == "scheduled_wake"
+    assert ctx.switches["ambient"] is False
+
+
+def test_scheduled_off_due_timer_becomes_transparency_background_result():
+    store, service = _service()
+    service.apply_turn_actions("u1", [{"type": "schedule_wake", "at": "2026-06-20T09:00:00", "tz": "UTC", "note": "hospital"}], now=1.0)
+    settings = resolve_settings_v2({"switches": {"scheduled": False}})
+    spine = RuntimeSpineV2(settings_resolver=lambda _uid: settings, merge_window_sec=0.0)
+
+    fired = service.fire_due_timers("u1", settings=settings, now=2_000_000_000.0, submit_wake=spine.submit)
+    ctx = spine.drain_context("u1", now=2_000_000_000.0)
+    record = store.list_records("u1")[0]
+
+    assert fired[0].status == "blocked"
+    assert fired[0].reason == "scheduled_disabled"
+    assert fired[0].transparency_wake_id
+    assert record.status == SCHEDULED_BLOCKED
+    assert record.block_reason == "scheduled_disabled"
+    assert ctx is not None
+    assert ctx.trigger == "scheduled_transparency"
+    assert ctx.background_payloads[0]["reason"] == "scheduled_disabled"
+    assert ctx.background_payloads[0]["timer"]["note"] == "hospital"
+
+
+def test_scheduled_action_rejected_while_disabled_consumes_transparency_required():
+    store, service = _service()
+    settings = resolve_settings_v2({"switches": {"scheduled": False}})
+    spine = RuntimeSpineV2(settings_resolver=lambda _uid: settings, merge_window_sec=0.0)
+
+    result = service.apply_turn_actions(
+        "u1",
+        [{"type": "schedule_wake", "at": "2026-06-20T09:00:00", "tz": "UTC"}],
+        settings=settings,
+        now=10.0,
+        submit_wake=spine.submit,
+    )[0]
+    ctx = spine.drain_context("u1", now=10.0)
+
+    assert result.status == "rejected"
+    assert result.reason == "scheduled_disabled"
+    assert result.transparency_required is True
+    assert result.transparency_wake_id
+    assert ctx is not None
+    assert ctx.trigger == "scheduled_transparency"
+
+
+def test_delivery_off_is_carried_to_scheduled_wake_context_without_blocking_it():
+    store, service = _service()
+    settings = resolve_settings_v2({"switches": {"reminders_delivery": False}})
+    service.apply_turn_actions("u1", [{"type": "schedule_wake", "at": "2026-06-20T09:00:00", "tz": "UTC"}], settings=settings, now=1.0)
+    spine = RuntimeSpineV2(settings_resolver=lambda _uid: settings, merge_window_sec=0.0)
+
+    service.fire_due_timers("u1", settings=settings, now=2_000_000_000.0, submit_wake=spine.submit)
+    ctx = spine.drain_context("u1", now=2_000_000_000.0)
+
+    assert ctx is not None
+    assert ctx.switches["reminders_delivery"] is False
+
+
+def test_turn_runner_exposes_pending_timer_cap_and_applies_schedule_action():
+    store, scheduled = _service(cap=3)
+    spine = RuntimeSpineV2(merge_window_sec=0.0)
+    spine.submit(WakeEventV2(user_id="u1", source="user_message", trigger="user_message", created_at=10.0))
+    captured = []
+    runner = TurnRunnerV2(
+        spine,
+        scheduled_wakes=scheduled,
+        run_agent=lambda context: captured.append(context) or TurnOutcomeV2(
+            actions=({
+                "type": "schedule_wake",
+                "at": "2026-06-20T09:00:00",
+                "tz": "UTC",
+                "note": "follow up",
+            },),
+        ),
+    )
+
+    result = runner.run_ready_turn("u1", now=10.0)
+
+    assert result.status == "completed"
+    assert captured[0]["scheduled_wakes"]["pending_cap"] == 3
+    assert result.scheduled_action_results[0]["status"] == "scheduled"
+    assert store.list_records("u1")[0].note == "follow up"
