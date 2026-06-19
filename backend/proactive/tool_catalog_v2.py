@@ -45,6 +45,9 @@ class ToolCatalogV2:
     def context_tools(self) -> list[dict[str, Any]]:
         return [spec.as_context() for spec in self._specs]
 
+    def signature(self) -> tuple[tuple[str, str, CostClass], ...]:
+        return tuple((spec.name, spec.group, spec.cost_class) for spec in self._specs)
+
     def get(self, name: str) -> ToolSpecV2:
         return self._by_name[name]
 
@@ -90,3 +93,15 @@ DEFAULT_TOOL_SPECS_V2: tuple[ToolSpecV2, ...] = (
 
 def default_tool_catalog_v2() -> ToolCatalogV2:
     return ToolCatalogV2(DEFAULT_TOOL_SPECS_V2)
+
+
+def tool_catalog_v2_for_runtime(runtime: str) -> ToolCatalogV2:
+    """Return the shared V2 catalog for hosted/resident runtime surfaces."""
+    normalized = str(runtime or "").strip().lower()
+    if normalized not in {"hosted", "resident"}:
+        raise ValueError(f"unknown v2 runtime surface: {runtime}")
+    return default_tool_catalog_v2()
+
+
+def tool_context_v2_for_runtime(runtime: str) -> list[dict[str, Any]]:
+    return tool_catalog_v2_for_runtime(runtime).context_tools()

@@ -277,6 +277,9 @@ Acceptance tests:
 - WiFi/BT anchor transition produces `perception_event`.
 - Repeated same anchor updates `last_seen` without waking.
 - Photo added produces the expected discrete event.
+- Photo ingest removes the v1 sensitive-scene hard block from spec §2.1; cheap
+  layers may transcribe/dedupe but must not gate whether the companion can see
+  the photo.
 - Broadcast off prevents `scene_change` wake.
 - All generated perception wakes include digest and origin refs.
 
