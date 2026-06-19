@@ -13,10 +13,13 @@ from . import service
 bp = Blueprint("perception", __name__, url_prefix="/v1/perception")
 
 
-def _uid() -> str:
+def _user_store():
     from accounts.auth import require_user  # accounts sits below this blueprint — no cycle
-    store = require_user()        # aborts 401 on bad auth
-    return store.user_id
+    return require_user()        # aborts 401 on bad auth
+
+
+def _uid() -> str:
+    return _user_store().user_id
 
 
 def _body() -> dict:
@@ -37,7 +40,9 @@ def report():
     At least one must be present (else 400). `client_ts` (optional) timestamps the
     context_snapshot for the freshness/ordering guard. Photos use /photo/evaluate.
     """
-    uid = _uid()
+    user_store = _user_store()
+    uid = user_store.user_id
+    use_ingress_v2 = service.perception_ingress_runtime_v2_enabled(user_store)
     payload = _body()
     results: dict = {}
     provided = False
@@ -46,7 +51,10 @@ def report():
     cs = payload.get("context_snapshot")
     if isinstance(cs, list) and cs:
         provided = True
-        results.update(service.ingest_snapshot(uid, cs, client_ts=payload.get("client_ts")))
+        if use_ingress_v2:
+            results.update(service.ingest_snapshot_v2(uid, cs, client_ts=payload.get("client_ts")))
+        else:
+            results.update(service.ingest_snapshot(uid, cs, client_ts=payload.get("client_ts")))
 
     items = payload.get("items")
     if isinstance(items, dict) and items:

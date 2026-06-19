@@ -1,16 +1,18 @@
 """Extended Perception business logic.
 
 All the generic machinery driven by catalog.py:
-  - ingest(): sparse, permission-gated report; resolve raw->label; merge into
-    per-field state; trigger debounced wakes on significant change.
+  - ingest_snapshot_v2(): current iOS report adapter; updates snapshot fields
+    while routing wake-capable observations through PerceptionDifferV2.
+  - ingest(): legacy/internal sparse ingest kept during the strangler migration.
   - snapshot(): current authorized+fresh fields; unauthorized/stale -> null.
   - permissions / config views and updates.
   - user_state with the Focus override/restore stack.
-  - photo two-step flow (evaluate+stage with sensitivity gate, then confirm).
+  - photo encrypted ingest; photo_added wakes go through PerceptionDifferV2
+    only when the V2 ingress rollout flag is enabled.
   - generic collection ingest/read for Tier 2 (calendar / health).
 
 No business logic lives in app.py. The only app.py coupling is a lazy import in
-_fire_wake() to enqueue a proactive job (the existing wake mechanism).
+_fire_wake_event_v2() to enqueue a compatibility proactive job during cutover.
 """
 from __future__ import annotations
 
@@ -22,6 +24,13 @@ from datetime import datetime
 from content_encryption import random_item_id
 
 from . import catalog, resolve, store
+from .ingress_v2 import device_event_observations_v2, operation_observations_v2, observe_signal_v2
+from .ios_contract_v2 import (
+    ENCRYPTED_SIGNAL_KEYS_V2,
+    IGNORED_SIGNAL_KEYS_V2,
+    OPERATION_SIGNAL_KEYS_V2,
+    classify_item_v2,
+)
 
 log = logging.getLogger("perception.service")
 
@@ -31,6 +40,7 @@ def _now() -> float:
 
 
 _FUTURE_TS_TOLERANCE_SEC = 60.0  # allow minor client clock skew
+PERCEPTION_INGRESS_RUNTIME_V2_FLAG = "perception_ingress_runtime_v2_enabled"
 
 
 def _coerce_ts(client_ts) -> float:
@@ -48,6 +58,32 @@ def _coerce_ts(client_ts) -> float:
     except (TypeError, ValueError):
         return now
     return now if ts > now + _FUTURE_TS_TOLERANCE_SEC else ts
+
+
+def perception_ingress_runtime_v2_enabled(user_or_store) -> bool:
+    """Per-user rollout flag for live perception ingress cutover.
+
+    Default OFF preserves the legacy ingest path as a dormant fallback. The flag
+    lives next to the hosted runtime profile so rollout can mirror hosted wake
+    V2 and be reverted without a code deploy.
+    """
+    try:
+        user_store = user_or_store
+        if isinstance(user_or_store, str):
+            from core import store as core_store  # lazy
+            user_store = core_store.get_store(user_or_store)
+
+        from hosted import config_store as hosted_config_store  # lazy
+
+        config = hosted_config_store._load_model_api_config(user_store) or {}
+        profile = hosted_config_store._ensure_model_api_runtime_profile(user_store, config) or {}
+        if PERCEPTION_INGRESS_RUNTIME_V2_FLAG in profile:
+            return bool(profile.get(PERCEPTION_INGRESS_RUNTIME_V2_FLAG))
+        return bool(config.get(PERCEPTION_INGRESS_RUNTIME_V2_FLAG))
+    except Exception as e:
+        uid = user_or_store if isinstance(user_or_store, str) else getattr(user_or_store, "user_id", "unknown")
+        log.warning("perception ingress v2 flag load failed for %s; using legacy ingress: %s", uid, e)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -102,9 +138,110 @@ def ingest_snapshot(user_id: str, items: list, client_ts=None) -> dict:
     return _apply(user_id, pairs, client_ts)
 
 
+def ingest_snapshot_v2(user_id: str, items: list, client_ts=None) -> dict:
+    """Ingest the current iOS report contract without letting the old service
+    directly create wakes.
+
+    Plain operation values still update the existing snapshot store. Encrypted
+    sensitive values are accepted as envelopes, but they do not become differ
+    observations until an enclave/decrypt adapter supplies plaintext values.
+    """
+    now = _coerce_ts(client_ts)
+    storage_items: list[dict] = []
+    results: dict[str, str] = {}
+
+    for item in (items or []):
+        if not isinstance(item, dict):
+            continue
+        signal = classify_item_v2(item)
+        key = signal.key
+        if not key:
+            continue
+        if key in IGNORED_SIGNAL_KEYS_V2:
+            results[key] = "ignored"
+            continue
+        if signal.status in {
+            "unknown_signal",
+            "missing_key",
+            "invalid_changed_flag",
+            "invalid_plaintext_sensitive_signal",
+        }:
+            results[key] = signal.status
+            continue
+        if key in OPERATION_SIGNAL_KEYS_V2:
+            if key in catalog.SIGNALS:
+                storage_items.append(item)
+            for observation in operation_observations_v2(key, signal.data):
+                observe_signal_v2(
+                    user_id,
+                    observation.signal,
+                    observation.value,
+                    ts=now,
+                    origin_refs=observation.origin_refs,
+                    submit_wake=_submit_wake_event_v2_compat,
+                )
+            if key not in catalog.SIGNALS:
+                results[key] = "accepted"
+            continue
+        if key in ENCRYPTED_SIGNAL_KEYS_V2:
+            if signal.encrypted:
+                results[key] = "accepted"
+            else:
+                storage_items.append(item)
+            continue
+        results[key] = "unknown_signal"
+
+    if storage_items:
+        results.update(_ingest_snapshot_storage_only(user_id, storage_items, client_ts=client_ts))
+    return results
+
+
+def ingest_device_event_v2(user_id: str, event: dict) -> dict:
+    observations = device_event_observations_v2(event if isinstance(event, dict) else {})
+    submitted = 0
+    for observation in observations:
+        result = observe_signal_v2(
+            user_id,
+            observation.signal,
+            observation.value,
+            ts=float((event or {}).get("ts") or _now()),
+            origin_refs=observation.origin_refs,
+            submit_wake=_submit_wake_event_v2_compat,
+        )
+        submitted += len(result.wake_events)
+    return {
+        "observations": len(observations),
+        "wake_events": submitted,
+    }
+
+
 def ingest(user_id: str, signals: dict, client_ts: float | None = None) -> dict:
     """Back-compat / internal: ingest a flat {key: value} map (no messages)."""
     return _apply(user_id, [(k, v, None) for k, v in (signals or {}).items()], client_ts)
+
+
+def _ingest_snapshot_storage_only(user_id: str, items: list, client_ts=None) -> dict:
+    pairs: list[tuple] = []
+    for it in (items or []):
+        if not isinstance(it, dict):
+            continue
+        key = str(it.get("key") or "").strip()
+        if not key:
+            continue
+        msg = it.get("message")
+        value = _parse_data(it.get("data"))
+        if key in catalog.COMPOSITE_KEYS:
+            subs = catalog.COMPOSITE_KEYS[key]
+            if isinstance(value, dict):
+                for sub in subs:
+                    if sub in value:
+                        pairs.append((sub, value[sub], msg))
+            elif value is None:
+                for sub in subs:
+                    pairs.append((sub, None, msg))
+            continue
+        pairs.append((key, value, msg))
+    return _apply(user_id, pairs, client_ts, emit_legacy_wakes=False)
 
 
 def _cell(value, ts: float, msg) -> dict:
@@ -114,7 +251,7 @@ def _cell(value, ts: float, msg) -> dict:
     return cell
 
 
-def _apply(user_id: str, pairs: list, client_ts=None) -> dict:
+def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool = True) -> dict:
     now = _coerce_ts(client_ts)
     config = store.get_config(user_id)
     prev_state = store.get_state(user_id)
@@ -182,10 +319,11 @@ def _apply(user_id: str, pairs: list, client_ts=None) -> dict:
         results[input_name] = "accepted" if any(f in written for f in fields) else "stale_ignored"
 
     # device "back after a long lock" wake (only if the field was actually written).
-    _maybe_unlock_wake(user_id, patch, written, prev_state, now, wake_pending)
+    if emit_legacy_wakes:
+        _maybe_unlock_wake(user_id, patch, written, prev_state, now, wake_pending)
 
     for (capk, debounce, f, old, new_v) in wake_pending:
-        if f in written:
+        if emit_legacy_wakes and f in written:
             _maybe_wake(user_id, capk, debounce, f, old, new_v, now)
 
     return results
@@ -268,6 +406,83 @@ def _last_wake_ts(user_id: str, cap_key: str) -> float:
         if ev.get("cap") == cap_key and ev.get("type") == "wake":
             return float(ev.get("ts") or 0)
     return 0.0
+
+
+def _settings_v2_for_user(user_id: str):
+    from proactive.store_v2 import DBProactiveSettingsStoreV2  # lazy
+    return DBProactiveSettingsStoreV2().load(user_id)
+
+
+def _submit_wake_event_v2_compat(event) -> None:
+    """Compatibility output: V2 differ event -> old proactive job queue.
+
+    The wake has already been mechanically selected by PerceptionDifferV2. This
+    function only applies the V2 switch gate and writes a legacy job so the
+    existing hosted/resident consumers can pick it up during the strangler
+    migration.
+    """
+    from proactive.controls_v2 import evaluate_wake_control_v2  # lazy
+
+    settings = _settings_v2_for_user(event.user_id)
+    decision = evaluate_wake_control_v2(event.source, manual=event.manual, settings=settings)
+    now = float(event.created_at or _now())
+    if not decision.accepted:
+        store.append_event(event.user_id, {
+            "cap": "runtime_v2",
+            "type": "suppressed",
+            "reason": decision.reason,
+            "source": event.source,
+            "trigger": event.trigger,
+            "change_digest": event.change_digest,
+            "origin_refs": list(event.origin_refs or ()),
+            "ts": now,
+        }, now)
+        return
+    store.append_event(event.user_id, {
+        "cap": "runtime_v2",
+        "type": "wake",
+        "source": event.source,
+        "trigger": event.trigger,
+        "change_digest": event.change_digest,
+        "origin_refs": list(event.origin_refs or ()),
+        "presence_hints": dict(event.presence_hints or {}),
+        "ts": now,
+    }, now)
+    _fire_wake_event_v2(event)
+
+
+def _fire_wake_event_v2(event) -> None:
+    if not event.change_digest or not event.origin_refs:
+        log.error("drop v2 perception wake without digest/origin_refs: %s", event)
+        return
+    try:
+        from core import store as core_store  # lazy
+        from core import util as core_util  # lazy
+        from proactive import service as proactive_service  # lazy
+        s = core_store.get_store(event.user_id)
+        job = {
+            "job_id": core_util._new_public_id("pj"),
+            "ts": float(event.created_at or _now()),
+            "created_at": datetime.fromtimestamp(float(event.created_at or _now())).isoformat(),
+            "source": proactive_service.PROACTIVE_JOB_SOURCE,
+            "status": "pending",
+            "intent_label": str(event.trigger or event.source)[:120],
+            "trigger": str(event.trigger or event.source)[:120],
+            "wake_kind": str(event.source or "perception_event")[:120],
+            "context_hint": str(event.change_digest or "")[:2000],
+            "change_digest": str(event.change_digest or "")[:2000],
+            "presence_hints": dict(event.presence_hints or {}),
+            "origin_refs": list(event.origin_refs or ()),
+            "connections": [],
+            "connection": {},
+            "frame_ids": [],
+            "device_event_ids": [],
+            "current_app": "",
+            "payload": {"v2_wake": dict(event.payload or {})},
+        }
+        s.append_proactive_job(job)
+    except Exception as e:
+        log.error("fire_wake_event_v2(%s,%s) failed: %s", event.user_id, event.trigger, e)
 
 
 def _maybe_wake(user_id, cap_key, debounce, field, old, new_v, now) -> None:
@@ -454,17 +669,17 @@ def photo_evaluate(user_id: str, metadata: dict,
         doc["meta_envelope"] = dict(meta_envelope)
     store.item_upsert(user_id, "photo", photo_id, now, doc, expires_at=None)
 
-    # Burst de-dup backstop: only wake once per cluster window.
-    block = _wake_block_reason(user_id)
-    if block:
-        store.append_event(user_id, {"cap": "photos", "type": "suppressed",
-                                     "reason": block, "item": photo_id,
-                                     "ts": now}, now)
-    elif (now - _last_wake_ts(user_id, "photos")) >= catalog.PHOTO_CLUSTER_SEC:
-        store.append_event(user_id, {"cap": "photos", "type": "wake",
-                                     "item": photo_id, "ts": now}, now)
-        _fire_wake(user_id, "photos",
-                   "她拍了一张可能值得一提的照片（先看元数据，需要再 pull 内容）。", now)
+    if perception_ingress_runtime_v2_enabled(user_id):
+        observe_signal_v2(
+            user_id,
+            "photo_added",
+            {"photo_id": photo_id, "sensitive": sensitive},
+            ts=now,
+            origin_refs=(f"photo:{photo_id}",),
+            submit_wake=_submit_wake_event_v2_compat,
+        )
+    else:
+        _maybe_wake(user_id, "photos", catalog.PHOTO_CLUSTER_SEC, "photo_id", None, photo_id, now)
     return {"photo_id": photo_id, "metadata": meta_out, "usable": True,
             "sensitive": sensitive, "status": "stored"}, 200
 

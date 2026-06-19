@@ -165,9 +165,10 @@ def test_ios_photo_fixture_stores_sensitive_scene_without_hard_block(monkeypatch
     payload = _load("ios_photo_evaluate_document.json")
     fake = _PhotoStore()
     monkeypatch.setattr(service, "store", fake)
-    monkeypatch.setattr(service, "_app_proactive_settings", lambda uid: {})
+    monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled", lambda user_or_store: True)
     wakes = []
-    monkeypatch.setattr(service, "_fire_wake", lambda uid, cap, hint, now: wakes.append((cap, hint)))
+    monkeypatch.setattr(service, "_fire_wake_event_v2", lambda event: wakes.append(event))
 
     out, code = service.photo_evaluate(
         "u_ios_contract",
@@ -187,4 +188,4 @@ def test_ios_photo_fixture_stores_sensitive_scene_without_hard_block(monkeypatch
     content, content_code = service.photo_content("u_ios_contract", payload["content_envelope"]["id"])
     assert content_code == 200
     assert content["meta_envelope"] == payload["meta_envelope"]
-    assert wakes
+    assert wakes and wakes[0].trigger == "photo_added"

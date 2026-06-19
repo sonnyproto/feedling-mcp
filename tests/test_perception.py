@@ -123,6 +123,12 @@ def env(monkeypatch):
     wakes = []
     monkeypatch.setattr(service, "_fire_wake",
                         lambda uid, cap, hint, now: wakes.append((cap, hint)))
+    monkeypatch.setattr(service, "_app_proactive_settings", lambda uid: {})
+    monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
+    monkeypatch.setattr(service, "_fire_wake_event_v2",
+                        lambda event: wakes.append((event.trigger, event.change_digest)))
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
+                        lambda user_or_store: False)
     return fake, wakes
 
 
@@ -265,7 +271,7 @@ def test_photo_one_step_store(env):
     content, c2 = service.photo_content(UID, "p_ok")
     assert c2 == 200 and content["frame_id"] == "p_ok" and "envelope" not in content
     assert fake.get_photo_envelope(UID, "p_ok")["body_ct"] == "cipher"  # in frame channel
-    assert any(c == "photos" for c, _ in wakes)              # fired a wake
+    assert any(c == "photos" for c, _ in wakes)               # legacy dormant fallback fired
 
 
 def test_photo_meta_envelope_is_preserved_only_on_content_read(env):
@@ -338,6 +344,8 @@ def test_app_open_via_get_route(env, monkeypatch):
     fake, _ = env
     import accounts.auth as accounts_auth
     monkeypatch.setattr(accounts_auth, "require_user", lambda: types.SimpleNamespace(user_id=UID))
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
+                        lambda user_or_store: False)
 
     app = Flask("t")
     app.register_blueprint(routes.bp)
@@ -445,15 +453,42 @@ def test_report_endpoint_context_snapshot(env, monkeypatch):
     app.register_blueprint(routes.bp)
     client = app.test_client()
     r = client.post("/v1/perception/report", json={"context_snapshot": [
-        {"key": "motion_state", "data": '{"state":"running"}', "message": "运动状态"},
+        {"key": "motion_state", "data": json.dumps({"state": "walking"})},
     ]})
     assert r.status_code == 200
     assert r.get_json()["results"]["motion_state"] == "accepted"
-    assert fake.get_state(UID)["motion_state"]["v"] == {"state": "running"}
+    assert fake.get_state(UID)["motion_state"]["v"] == {"state": "walking"}
 
     # missing context_snapshot -> 400
     bad = client.post("/v1/perception/report", json={"signals": {}})
     assert bad.status_code == 400
+
+
+def test_report_endpoint_context_snapshot_v2_flag_on(env, monkeypatch):
+    """When the per-user rollout flag is on, /report dispatches to V2 ingress."""
+    import types
+    from flask import Flask
+    import perception.routes as routes
+
+    fake, _ = env
+    import accounts.auth as accounts_auth
+    monkeypatch.setattr(accounts_auth, "require_user", lambda: types.SimpleNamespace(user_id=UID))
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
+                        lambda user_or_store: True)
+
+    app = Flask("t")
+    app.register_blueprint(routes.bp)
+    client = app.test_client()
+    r = client.post("/v1/perception/report", json={"context_snapshot": [
+        {"key": "motion_state", "envelope": {
+            "v": 1, "id": "motion_env", "body_ct": "x", "nonce": "n",
+            "K_user": "ku", "K_enclave": "ke", "visibility": "shared",
+            "owner_user_id": UID,
+        }, "changed": True},
+    ]})
+    assert r.status_code == 200
+    assert r.get_json()["results"]["motion_state"] == "accepted"
+    assert "motion_state" not in fake.get_state(UID)
 
 
 def test_report_user_state_key_sets_manual(env):
@@ -475,7 +510,7 @@ def test_snapshot_includes_recent_apps(env):
     assert "Instagram" in apps and "Maps" in apps
 
 
-def _report_client(env, monkeypatch):
+def _report_client(env, monkeypatch, *, ingress_v2=False):
     import sys
     import types
     from flask import Flask
@@ -483,6 +518,8 @@ def _report_client(env, monkeypatch):
     fake, _ = env
     import accounts.auth as accounts_auth
     monkeypatch.setattr(accounts_auth, "require_user", lambda: types.SimpleNamespace(user_id=UID))
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
+                        lambda user_or_store: ingress_v2)
     app = Flask("t")
     app.register_blueprint(routes.bp)
     return fake, app.test_client()
@@ -624,25 +661,23 @@ def test_app_settings_failure_does_not_block_wake(env, monkeypatch):
     assert len(wakes) == 1
 
 
-def test_photo_suppressed_when_dnd_enabled(env, monkeypatch):
-    """DND 开启时：照片仍被存储，但 wake 被压制；事件记录 suppressed/dnd_enabled。"""
+def test_photo_suppressed_when_ambient_disabled(env, monkeypatch):
+    """Ambient off blocks self-initiated photo wakes; Delivery/DND does not."""
     fake, wakes = env
-    monkeypatch.setattr(service, "_app_proactive_settings",
-                        lambda uid: {"enabled": True, "dnd": True})
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
+                        lambda user_or_store: True)
+    monkeypatch.setattr(service, "_settings_v2_for_user",
+                        lambda uid: {"switches": {"ambient": False}})
     uid = "u_photo_dnd"
     out, code = service.photo_evaluate(
         uid, {"scene_hint": "food"}, {"id": "p_dnd", "body_ct": "cipher"})
-    # 照片应被存储（gate 只影响 wake，不影响存储）
     assert code == 200 and out["status"] == "stored"
-    # wakes 列表为空（未触发 _fire_wake）
     assert wakes == []
     events = fake.read_events(uid)
-    # 有 suppressed 事件，携带 item == photo_id
     suppressed = [e for e in events
-                  if e.get("cap") == "photos" and e.get("type") == "suppressed"]
+                  if e.get("cap") == "runtime_v2" and e.get("type") == "suppressed"]
     assert len(suppressed) == 1
-    assert suppressed[0]["reason"] == "dnd_enabled"
-    assert suppressed[0]["item"] == "p_dnd"
-    # 无 wake 事件
-    assert not any(e.get("cap") == "photos" and e.get("type") == "wake"
+    assert suppressed[0]["reason"] == "ambient_disabled"
+    assert suppressed[0]["origin_refs"] == ["photo:p_dnd"]
+    assert not any(e.get("cap") == "runtime_v2" and e.get("type") == "wake"
                    for e in events)

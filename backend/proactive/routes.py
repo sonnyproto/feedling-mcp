@@ -78,6 +78,12 @@ def device_events():
         payload=payload.get("payload") if isinstance(payload.get("payload"), dict) else {},
     )
     store.append_device_event(event)
+    try:
+        from perception import service as perception_service  # lazy; proactive can run without perception tests importing it
+        if perception_service.perception_ingress_runtime_v2_enabled(store):
+            event["perception_v2"] = perception_service.ingest_device_event_v2(store.user_id, event)
+    except Exception as e:
+        event["perception_v2"] = {"error": f"ingest_failed:{type(e).__name__}"}
     return jsonify(event)
 
 

@@ -49,6 +49,7 @@ def wake_event_v2_from_legacy_job(
         latency_sensitive=manual,
         manual=manual,
         change_digest=str(job.get("change_digest") or job.get("context_hint") or ""),
+        presence_hints=dict(job.get("presence_hints") or {}),
         timezone=str(job.get("timezone") or ""),
         scheduled_note=str(job.get("scheduled_note") or ""),
         origin_refs=tuple(str(x) for x in (job.get("origin_refs") or []) if str(x)),
