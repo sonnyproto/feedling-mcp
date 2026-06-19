@@ -7,6 +7,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from perception.differ_v2 import PerceptionDifferV2
 from proactive.adapters_v2 import wake_event_v2_from_legacy_job
+from proactive.controls_v2 import (
+    evaluate_delivery_v2,
+    evaluate_scheduled_action_v2,
+    evaluate_wake_control_v2,
+    resolve_settings_v2,
+    settings_v2_to_doc,
+)
 from proactive.runtime_v2 import (
     BackgroundLeaseRegistryV2,
     RuntimeSpineV2,
@@ -82,6 +89,146 @@ def test_background_result_is_context_not_direct_chat_write():
     assert turn_context["background_payloads"] == [
         {"tool": "perception.calendar", "result": {"events": 2}}
     ]
+    assert turn_context["switches"] == {
+        "ambient": True,
+        "scheduled": True,
+        "reminders_delivery": True,
+    }
+
+
+def test_v2_settings_compatibility_maps_old_fields_without_resurrecting_old_gates():
+    settings = resolve_settings_v2({
+        "enabled": False,
+        "dnd": True,
+        "user_state": "away",
+        "ai_state": "waiting",
+    })
+
+    assert settings.switches() == {
+        "ambient": False,
+        "scheduled": True,
+        "reminders_delivery": False,
+    }
+    doc = settings_v2_to_doc(settings)
+    assert doc["switches"] == settings.switches()
+    assert "enabled" not in doc
+    assert "dnd" not in doc
+    assert "user_state" not in doc
+    assert "ai_state" not in doc
+
+
+def test_ambient_off_blocks_only_self_initiated_wake_sources():
+    settings = resolve_settings_v2({"switches": {"ambient": False}})
+    for source in ("heartbeat", "perception_event", "scene_change"):
+        decision = evaluate_wake_control_v2(source, settings=settings)
+        assert decision.accepted is False
+        assert decision.reason == "ambient_disabled"
+
+    for source in ("user_message", "scheduled_wake", "background_result"):
+        decision = evaluate_wake_control_v2(source, settings=settings)
+        assert decision.accepted is True
+
+
+def test_runtime_submit_applies_ambient_gate_without_suppressing_scheduled_or_background():
+    settings = resolve_settings_v2({"switches": {"ambient": False}})
+    spine = RuntimeSpineV2(settings_resolver=lambda _user_id: settings, merge_window_sec=1.0)
+
+    blocked = spine.submit(WakeEventV2(user_id="u1", source="heartbeat", trigger="heartbeat", created_at=1.0))
+    scheduled = spine.submit(WakeEventV2(user_id="u1", source="scheduled_wake", trigger="scheduled_wake", created_at=2.0))
+    background = spine.submit(WakeEventV2(user_id="u1", source="background_result", trigger="background_result", created_at=2.1))
+
+    ctx = spine.drain_context("u1", now=3.2)
+
+    assert blocked.accepted is False
+    assert scheduled.accepted is True
+    assert background.accepted is True
+    assert ctx is not None
+    assert ctx.trigger == "scheduled_wake"
+    assert ctx.merged_triggers == ("background_result",)
+    assert ctx.switches == {
+        "ambient": False,
+        "scheduled": True,
+        "reminders_delivery": True,
+    }
+
+
+def test_runtime_settings_resolver_failure_falls_back_to_default_switches():
+    def boom(_user_id: str):
+        raise RuntimeError("settings unavailable")
+
+    spine = RuntimeSpineV2(settings_resolver=boom, merge_window_sec=0.0)
+
+    submit = spine.submit(WakeEventV2(user_id="u1", source="heartbeat", trigger="heartbeat", created_at=1.0))
+    ctx = spine.drain_context("u1", now=1.0)
+
+    assert submit.accepted is True
+    assert ctx is not None
+    assert ctx.switches == {
+        "ambient": True,
+        "scheduled": True,
+        "reminders_delivery": True,
+    }
+
+
+def test_scheduled_off_blocks_timer_execution_without_silent_loss():
+    settings = resolve_settings_v2({"switches": {"scheduled": False}})
+    wake_decision = evaluate_wake_control_v2("scheduled_wake", settings=settings)
+    action_decision = evaluate_scheduled_action_v2({"type": "schedule_wake"}, settings=settings)
+
+    assert wake_decision.accepted is False
+    assert wake_decision.reason == "scheduled_disabled"
+    assert wake_decision.transparency_required is True
+    assert action_decision.accepted is False
+    assert action_decision.reason == "scheduled_disabled"
+    assert action_decision.transparency_required is True
+    assert action_decision.switches["scheduled"] is False
+
+
+def test_delivery_off_blocks_visible_delivery_not_chat_write_and_is_visible_to_agent():
+    settings = resolve_settings_v2({"switches": {"reminders_delivery": False}})
+    delivery = evaluate_delivery_v2(settings, source="heartbeat")
+    spine = RuntimeSpineV2(settings_resolver=lambda _user_id: settings, merge_window_sec=0.0)
+
+    submit = spine.submit(WakeEventV2(user_id="u1", source="heartbeat", trigger="heartbeat", created_at=1.0))
+    ctx = spine.drain_context("u1", now=1.0)
+
+    assert submit.accepted is True
+    assert delivery.allow_chat_write is True
+    assert delivery.allow_visible_delivery is False
+    assert delivery.reason == "reminders_delivery_disabled"
+    assert ctx is not None
+    assert ctx.as_turn_context()["switches"]["reminders_delivery"] is False
+
+
+def test_manual_wake_bypasses_user_silencing_gates():
+    settings = resolve_settings_v2({
+        "switches": {
+            "ambient": False,
+            "scheduled": False,
+            "reminders_delivery": False,
+        }
+    })
+
+    wake_decision = evaluate_wake_control_v2("heartbeat", manual=True, settings=settings)
+    delivery_decision = evaluate_delivery_v2(settings, source="heartbeat", manual=True)
+    action_decision = evaluate_scheduled_action_v2({"type": "send_message"}, settings=settings, manual=True)
+
+    assert wake_decision.accepted is True
+    assert wake_decision.reason == "manual_bypass"
+    assert delivery_decision.allow_visible_delivery is True
+    assert delivery_decision.reason == "manual_bypass"
+    assert action_decision.accepted is True
+    assert action_decision.reason == "manual_bypass"
+
+
+def test_manual_wake_does_not_bypass_scheduled_capability_switch():
+    settings = resolve_settings_v2({"switches": {"scheduled": False}})
+
+    action_decision = evaluate_scheduled_action_v2({"type": "schedule_wake"}, settings=settings, manual=True)
+
+    assert action_decision.accepted is False
+    assert action_decision.reason == "scheduled_disabled"
+    assert action_decision.transparency_required is True
 
 
 def test_scheduled_wake_does_not_preempt_same_episode_event_by_fixed_priority():

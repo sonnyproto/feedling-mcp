@@ -301,11 +301,16 @@ Acceptance tests:
 - Pending timer cap is enforced and visible to the agent.
 - Scheduled wake works when Ambient is off.
 - Delivery off is surfaced transparently instead of silently dropping.
+- Scheduled-off timer decisions consume PR2's explicit `transparency_required`
+  contract or reroute into a dedicated transparency notice; fire-and-forget
+  callers must not be able to silently drop due timers.
 
 Do not do:
 
 - Do not model scheduled wake as a user reminder command only. It is agent-owned
   intent.
+- Do not decide the pending-timer-after-Scheduled-off product behavior in code
+  without updating the spec/acceptance first.
 
 ### PR9. Resident Cutover
 

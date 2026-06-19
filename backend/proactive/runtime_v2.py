@@ -7,13 +7,23 @@ drained through a merge window, and become one merged turn context.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import logging
 import threading
 import time
 import uuid
 from typing import Any, Callable, Mapping
 
+from proactive.controls_v2 import (
+    ProactiveSettingsV2,
+    WakeControlDecisionV2,
+    default_switches_v2,
+    evaluate_wake_control_v2,
+    resolve_settings_v2,
+)
 from proactive.tool_catalog_v2 import ToolCatalogV2, default_tool_catalog_v2
+
+log = logging.getLogger("proactive.runtime_v2")
 
 WAKE_SOURCES = {
     "user_message",
@@ -145,7 +155,7 @@ def merge_wakes_v2(
         if event.wake_id != primary.wake_id
     )
     presence: dict[str, Any] = {}
-    switches: dict[str, bool] = {}
+    switches: dict[str, bool] = default_switches_v2()
     digest_parts: list[str] = []
     origin_refs: list[str] = []
     background_payloads: list[Mapping[str, Any]] = []
@@ -385,14 +395,33 @@ class RuntimeSpineV2:
         *,
         inbox: WakeInboxV2 | None = None,
         tool_catalog: ToolCatalogV2 | None = None,
+        settings_resolver: Callable[[str], ProactiveSettingsV2 | Mapping[str, Any] | None] | None = None,
         merge_window_sec: float = 2.0,
     ) -> None:
         self.inbox = inbox or WakeInboxV2()
         self.tool_catalog = tool_catalog or default_tool_catalog_v2()
+        self.settings_resolver = settings_resolver
         self.merge_window_sec = merge_window_sec
 
-    def submit(self, event: WakeEventV2) -> None:
-        self.inbox.push(event)
+    def _settings_for_event(self, event: WakeEventV2) -> ProactiveSettingsV2:
+        raw: ProactiveSettingsV2 | Mapping[str, Any] | None = None
+        if self.settings_resolver:
+            try:
+                raw = self.settings_resolver(event.user_id)
+            except Exception as e:
+                log.error("settings_resolver_v2(%s) failed: %s", event.user_id, e)
+        settings = resolve_settings_v2(raw)
+        if event.switches:
+            settings = resolve_settings_v2({"switches": {**settings.switches(), **dict(event.switches)}})
+        return settings
+
+    def submit(self, event: WakeEventV2) -> WakeControlDecisionV2:
+        settings = self._settings_for_event(event)
+        decision = evaluate_wake_control_v2(event.source, manual=event.manual, settings=settings)
+        if not decision.accepted:
+            return decision
+        self.inbox.push(replace(event, switches=decision.switches))
+        return decision
 
     def drain_context(self, user_id: str, *, now: float | None = None) -> MergedWakeContextV2 | None:
         wakes = self.inbox.drain_ready(

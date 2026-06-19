@@ -14,6 +14,14 @@ from typing import Any, Mapping
 from psycopg.types.json import Jsonb
 
 import db
+from proactive.controls_v2 import (
+    SETTINGS_KIND_V2,
+    ProactiveSettingsV2,
+    merge_settings_patch_v2,
+    now_settings_updated_at_v2,
+    resolve_settings_v2,
+    settings_v2_to_doc,
+)
 from proactive.runtime_v2 import (
     BackgroundLeaseRegistryV2,
     LeaseV2,
@@ -26,6 +34,7 @@ from proactive.runtime_v2 import (
 WAKE_STREAM_V2 = "proactive_wakes_v2"
 TURN_STREAM_V2 = "proactive_turns_v2"
 LEASE_KIND_PREFIX_V2 = "proactive_v2_lease:"
+LEGACY_PROACTIVE_SETTINGS_KIND = "proactive_settings"
 
 WAKE_PENDING = "pending"
 WAKE_DRAINED = "drained"
@@ -346,6 +355,40 @@ class DBBackgroundLeaseRegistryV2(BackgroundLeaseRegistryV2):
 
     def current_for_job(self, user_id: str, job_id: str, *, now: float | None = None) -> LeaseV2 | None:
         return self._db.current(user_id, f"background:{job_id}", now=now)
+
+
+class DBProactiveSettingsStoreV2:
+    """Persistent V2 settings shape.
+
+    Existing `proactive_settings` is read only as a migration fallback. New V2
+    settings are stored under `proactive_settings_v2` so the three-switch shape
+    does not inherit old enabled/dnd/user_state semantics.
+    """
+
+    def load(self, user_id: str) -> ProactiveSettingsV2:
+        try:
+            doc = db.get_blob(user_id, SETTINGS_KIND_V2)
+            if isinstance(doc, dict):
+                return resolve_settings_v2(doc)
+            legacy = db.get_blob(user_id, LEGACY_PROACTIVE_SETTINGS_KIND)
+            if isinstance(legacy, dict):
+                return resolve_settings_v2(legacy)
+        except Exception as e:
+            import logging
+
+            logging.getLogger("proactive.store_v2").error(
+                "load_settings_v2(%s) failed: %s", user_id, e
+            )
+        return resolve_settings_v2(None)
+
+    def save(self, user_id: str, patch: Mapping[str, Any]) -> ProactiveSettingsV2:
+        settings = merge_settings_patch_v2(
+            self.load(user_id),
+            patch if isinstance(patch, Mapping) else {},
+            updated_at=now_settings_updated_at_v2(),
+        )
+        db.set_blob(user_id, SETTINGS_KIND_V2, settings_v2_to_doc(settings))
+        return settings
 
 
 @dataclass(frozen=True)

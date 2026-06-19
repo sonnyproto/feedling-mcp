@@ -12,9 +12,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from proactive.runtime_v2 import RuntimeSpineV2, TurnOutcomeV2, WakeEventV2, merge_wakes_v2
 from proactive.store_v2 import (
     DBBackgroundLeaseRegistryV2,
+    DBProactiveSettingsStoreV2,
     DBTurnLeaseRegistryV2,
     DBTurnStoreV2,
     DBWakeInboxV2,
+    SETTINGS_KIND_V2,
     TURN_COMPLETED,
     TURN_STALE_RECOVERED,
     TURN_STREAM_V2,
@@ -176,3 +178,35 @@ def test_db_turn_store_recovers_stale_running_turn_without_old_owner_completion(
     assert completed.status == TURN_COMPLETED
     turns = db.log_read_all(uid, TURN_STREAM_V2)
     assert [turn["status"] for turn in turns] == [TURN_STALE_RECOVERED, TURN_COMPLETED]
+
+
+def test_db_settings_store_uses_v2_shape_with_legacy_fallback():
+    uid = _uid()
+    settings_store = DBProactiveSettingsStoreV2()
+    db.set_blob(uid, "proactive_settings", {
+        "enabled": False,
+        "dnd": True,
+        "user_state": "away",
+        "ai_state": "waiting",
+    })
+
+    fallback = settings_store.load(uid)
+    saved = settings_store.save(uid, {"switches": {"ambient": True, "scheduled": False}})
+    doc = db.get_blob(uid, SETTINGS_KIND_V2)
+
+    assert fallback.switches() == {
+        "ambient": False,
+        "scheduled": True,
+        "reminders_delivery": False,
+    }
+    assert saved.switches() == {
+        "ambient": True,
+        "scheduled": False,
+        "reminders_delivery": False,
+    }
+    assert doc["kind"] == SETTINGS_KIND_V2
+    assert doc["switches"] == saved.switches()
+    assert "enabled" not in doc
+    assert "dnd" not in doc
+    assert "user_state" not in doc
+    assert "ai_state" not in doc
