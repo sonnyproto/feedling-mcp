@@ -260,6 +260,7 @@ class LeaseV2:
     lease_id: str = field(default_factory=_new_lease_id)
     acquired_at: float = field(default_factory=time.time)
     expires_at: float = 0.0
+    user_id: str = ""
 
     def expired(self, now: float | None = None) -> bool:
         now = time.time() if now is None else float(now)
@@ -286,6 +287,7 @@ class LeaseRegistryV2:
         owner_id: str,
         now: float | None = None,
         ttl_sec: float,
+        user_id: str = "",
     ) -> LeaseV2 | None:
         now = time.time() if now is None else float(now)
         with self._lock:
@@ -297,6 +299,7 @@ class LeaseRegistryV2:
                 owner_id=str(owner_id or "unknown"),
                 acquired_at=now,
                 expires_at=now + float(ttl_sec),
+                user_id=str(user_id or ""),
             )
             self._leases[scope] = lease
             return lease
@@ -333,6 +336,7 @@ class TurnLeaseRegistryV2(LeaseRegistryV2):
             owner_id=owner_id,
             now=now,
             ttl_sec=ttl_sec,
+            user_id=user_id,
         )
 
 
@@ -341,6 +345,7 @@ class BackgroundLeaseRegistryV2(LeaseRegistryV2):
         self,
         job_id: str,
         *,
+        user_id: str = "",
         owner_id: str,
         now: float | None = None,
         ttl_sec: float,
@@ -350,6 +355,7 @@ class BackgroundLeaseRegistryV2(LeaseRegistryV2):
             owner_id=owner_id,
             now=now,
             ttl_sec=ttl_sec,
+            user_id=user_id,
         )
 
 
@@ -457,6 +463,7 @@ class TurnRunnerV2:
                 background_job_id = "bg_" + uuid.uuid4().hex[:16]
                 background_lease = self.background_leases.try_acquire_job(
                     background_job_id,
+                    user_id=user_id,
                     owner_id=owner,
                     now=now,
                     ttl_sec=self.background_lease_ttl_sec,
