@@ -7,6 +7,9 @@ This branch starts the V2 runtime spine without switching production traffic.
 The source of truth for Round 3 is
 `docs/PROACTIVE_PERCEPTION_SPEC_V2.md`.
 
+The PR-by-PR execution and audit plan is
+`docs/PROACTIVE_PERCEPTION_ROUND3_EXECUTION_PLAN.md`.
+
 Older proactive docs are historical context only:
 
 - `docs/PROACTIVE_V2_ARCHITECTURE.md` describes the previous Proactive V2

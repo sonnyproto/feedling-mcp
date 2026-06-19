@@ -1,0 +1,441 @@
+# Proactive Perception Round 3 Execution Plan
+
+This document is the implementation and audit plan for landing Round 3. It is
+meant to be read by Codex / Claude Code before writing or reviewing code.
+
+## Source Of Truth
+
+- Canonical design: `docs/PROACTIVE_PERCEPTION_SPEC_V2.md`
+- Runtime migration contract: `docs/PROACTIVE_PERCEPTION_RUNTIME_V2_MIGRATION.md`
+- Historical context only: `docs/PROACTIVE_V2_ARCHITECTURE.md`,
+  `docs/PROACTIVE_GATE_V1.md`
+
+If this plan conflicts with `PROACTIVE_PERCEPTION_SPEC_V2.md`, the spec wins.
+If code already implements an older shape, use the strangler migration below
+instead of extending the old shape.
+
+## Migration Strategy
+
+Use a strangler-fig migration:
+
+1. V2 spine is the new trunk.
+2. Old systems may remain only as input adapters or output compatibility layers.
+3. Each production path cutover must delete or make unreachable the old executor
+   for that path.
+4. Legacy `proactive_jobs` status may receive temporary projections for old
+   dashboard visibility, but V2 lease / turn state must not be modeled around
+   that table.
+
+## Non-Negotiable Invariants
+
+Any PR violating these should be rejected.
+
+1. Legacy `proactive_jobs` shape appears only at adapter/projection boundaries
+   and, if preserved, lives under `payload.legacy_*`.
+2. Main V2 dataclasses must not grow legacy fields.
+3. Single-flight, merge, and lease are correctness primitives, not "less
+   proactive" gates.
+4. Turn and background leases must be reclaimable after owner crash, with tests.
+5. Background slow-path workers must never write chat directly. They must submit
+   a `background_result` wake back into the inbox.
+6. Perception signals must pass through `PerceptionDifferV2` before becoming
+   wake events.
+7. Continuous signals produce zero wakes: motion, battery, now playing, time,
+   raw GPS/location drift, and plain `place_label`.
+8. Gate semantics must not mix:
+   - Ambient controls self-initiated wake sources.
+   - Scheduled controls agent-owned timers.
+   - Delivery controls visible chat/push delivery.
+9. Scheduled wake must not be suppressed merely because Ambient is off.
+10. Hosted and resident must share the same tool catalog, cost classes, wake
+    contract, and differ semantics.
+11. Do not add a second judgment model. Cheap VLM/captioning may transcribe; it
+    must not decide whether content is worth the companion's attention.
+12. `scheduled_wake` must not get a hard-coded product priority over same-episode
+    event wakes until reviewed episodes justify that policy.
+
+## PR Sequence
+
+Land this in small PRs. Each PR should include tests, a short migration note,
+and explicit legacy cleanup/projection evidence.
+
+### PR1. DB-Backed Runtime Substrate
+
+Scope:
+
+- Add V2 persistent storage for wake inbox, turn state, foreground leases, and
+  background leases.
+- Replace in-memory lease/inbox in production paths with DB-backed CAS semantics.
+- Keep existing in-memory classes as contract-test fakes if useful.
+
+Implementation notes:
+
+- Prefer append/patch primitives consistent with existing `user_logs` patterns,
+  but do not force V2 turn state into old `proactive_jobs` fields.
+- Model lease ownership, expiry, renewal if needed, and release.
+- Use CAS / advisory-lock semantics so multi-worker attempts dedupe.
+
+Acceptance tests:
+
+- Two workers racing for the same user: only one foreground turn lease wins.
+- Expired foreground lease is reclaimable.
+- Expired background lease is reclaimable.
+- Releasing an old/replaced lease fails.
+- Wake merge survives persistence round trip.
+- Crash simulation: a stale `running` turn can be recovered without duplicate
+  chat writes.
+
+Do not do:
+
+- Do not connect hosted or resident production execution yet.
+- Do not use old `proactive_jobs.status` as the real lease source.
+
+### PR2. V2 Controls: Ambient / Scheduled / Delivery
+
+Scope:
+
+- Introduce V2 settings resolver and persisted settings shape.
+- Map old `enabled/dnd/user_state/ai_state` only for compatibility.
+- Put switch state into `MergedWakeContextV2`.
+
+Acceptance tests:
+
+- Ambient off blocks `heartbeat`, `perception_event`, and self-initiated
+  `scene_change` when applicable.
+- Ambient off does not block `user_message`, `manual`, `scheduled_wake`, or
+  `background_result`.
+- Scheduled off blocks or reroutes agent-owned timer execution according to the
+  spec, without silent loss.
+- Delivery off blocks visible chat/push delivery but lets the agent know the
+  switch state.
+- Manual wake bypasses all user-silencing gates.
+
+Do not do:
+
+- Do not build iOS UI in this PR.
+- Do not keep adding behavior to old `dnd` / `away` semantics.
+
+### PR3. Tool Catalog And Executor V2
+
+Scope:
+
+- Turn `ToolCatalogV2` from a static list into the shared hosted/resident
+  execution contract.
+- Implement first executor layer for available tools.
+- Return explicit unavailable errors for blocked HealthKit tools.
+
+Minimum tools:
+
+- `perception.now`
+- `perception.location`
+- `perception.calendar`
+- `perception.now_playing`
+- `perception.motion`
+- `perception.photo_recent`
+- `memory.index`
+- `memory.fetch`
+- `send_message`
+- `sleep`
+
+Unavailable for now:
+
+- `perception.steps`
+- `perception.sleep_last_night`
+- `perception.workout`
+- `perception.vitals`
+
+Acceptance tests:
+
+- Hosted and resident derive from the same catalog source.
+- Each tool has a stable `cost_class`.
+- Unavailable tools fail explicitly and safely.
+- Tool traces record name, cost class, latency, outcome, and wake/turn id.
+- Fast/slow budget produces soft handoff to background, not silent truncation.
+
+Do not do:
+
+- Do not implement HealthKit server-side placeholders that pretend data exists.
+
+### PR4. TurnRunnerV2 Agent Protocol
+
+Scope:
+
+- Implement real `run_agent` protocol for V2 turns.
+- Parse actions: `send_message`, `sleep`, `schedule_wake`, `cancel_wake`,
+  `needs_background`.
+- Build context from tools/time/switches/digest/recent chat; do not inject
+  perception values directly.
+
+Acceptance tests:
+
+- `user_message` uses the same runner as proactive wake.
+- Manual wake returning only sleep is marked as contract violation
+  (`ignored_manual` or equivalent).
+- Plain background requests do not write chat during foreground turn.
+- Perception snapshot values are not passively injected into the prompt.
+- Agent actions are persisted as V2 turn/action records.
+
+Do not do:
+
+- Do not cut over hosted/resident yet; test runner with injected model stubs.
+
+### PR5. Background Slow Path
+
+Scope:
+
+- Add background worker lifecycle using V2 background leases.
+- Background completion submits `background_result` wake.
+- Foreground turn slot must be free while background work runs.
+
+Acceptance tests:
+
+- Background worker cannot call `append_chat` / push directly.
+- Background result enters wake inbox and merges with newer user messages.
+- Late/stale background result can be dropped or folded by the agent.
+- Background lease timeout is recoverable.
+- Duplicate completion cannot double-send.
+
+Do not do:
+
+- Do not reuse old hosted proactive daemon threads as the canonical worker.
+
+### PR6. Hosted Wake Cutover
+
+Scope:
+
+- Convert hosted wake input into `WakeEventV2`.
+- Execute through `TurnRunnerV2`.
+- Reuse chat write and push only as output compatibility.
+- Remove or make unreachable old hosted wake executor code.
+
+Acceptance tests:
+
+- Hosted heartbeat/perception/manual wakes use V2 context.
+- Hosted manual wake still requires visible response.
+- Old hosted wake prompt/action parser is not used for V2 execution.
+- Existing hosted smoke tests stay green.
+- Old `proactive_jobs` receives only projection fields needed by old dashboard.
+
+Deletion evidence:
+
+- Show which functions in `hosted/wake_consumer.py` were deleted or no longer
+  reachable.
+
+### PR7. Perception Ingress Cutover
+
+Scope:
+
+- Route `/v1/perception/report`, photo ingest, and device events through
+  `PerceptionDifferV2`.
+- Implement WiFi/BT anchor transition semantics.
+- Implement pHash scene-change wake path for broadcast mode if ready; otherwise
+  leave a tested TODO boundary.
+
+Acceptance tests:
+
+- Motion/battery/now-playing/time/plain-place-label produce zero wakes.
+- WiFi/BT anchor transition produces `perception_event`.
+- Repeated same anchor updates `last_seen` without waking.
+- Photo added produces the expected discrete event.
+- Broadcast off prevents `scene_change` wake.
+- All generated perception wakes include digest and origin refs.
+
+Do not do:
+
+- Do not revive named-place or raw GPS drift as wake sources.
+- Do not add a model gate before wake generation.
+
+### PR8. Scheduled Wake
+
+Scope:
+
+- Implement `schedule_wake` and `cancel_wake`.
+- Persist timers with timezone, DST-safe scheduling, origin refs, and note.
+- Trigger scheduled wakes through the same V2 wake inbox.
+
+Acceptance tests:
+
+- Timer fires once across multiple workers.
+- Timer survives process restart.
+- Cancel prevents future wake.
+- Pending timer cap is enforced and visible to the agent.
+- Scheduled wake works when Ambient is off.
+- Delivery off is surfaced transparently instead of silently dropping.
+
+Do not do:
+
+- Do not model scheduled wake as a user reminder command only. It is agent-owned
+  intent.
+
+### PR9. Resident Cutover
+
+Scope:
+
+- Convert resident consumer to the same V2 wake context, catalog, and action
+  contract.
+- Add resident lease/reclaim semantics so claimed jobs cannot strand forever.
+- Delete old resident proactive prompt executor after cutover.
+
+Acceptance tests:
+
+- Resident and hosted see equivalent V2 context for the same synthetic wake.
+- Resident uses the shared tool catalog.
+- Resident crash during claimed/realizing state is recoverable.
+- Old `_message_for_proactive_job` path is deleted or unreachable.
+
+Do not do:
+
+- Do not keep separate resident-only wake semantics.
+
+### PR10. Dashboard, Eval, And Legacy Cleanup
+
+Scope:
+
+- Replace Gate dashboard with Wake / Turn / Agent Action / Tool Trace views.
+- Move review labels to Round 3 terms.
+- Remove old job-status projections after dashboard cutover.
+- Remove dead V1/V2 executor paths.
+
+Review labels:
+
+- `good_presence`
+- `missed_moment`
+- `too_much`
+- `wrong_voice`
+- `ignored_manual`
+- `stutter`
+- `privacy_bad`
+- `late_irrelevant`
+
+Acceptance tests:
+
+- Dashboard reads V2 turn/action/tool records.
+- Old Gate labels are not the primary review interface.
+- Projection code to old `proactive_jobs` is deleted after cutover.
+- A grep audit shows no old executor entrypoint remains reachable.
+
+## Cross-Cutting Audit Checklist
+
+Run this for every PR.
+
+### Legacy Boundary
+
+- Search for `proactive_jobs`, `legacy_`, `user_state`, `ai_state`,
+  `set_ai_state`, `dnd`, `away`.
+- Confirm each occurrence is one of:
+  - adapter from old input,
+  - projection for old dashboard,
+  - historical doc,
+  - compatibility test.
+- Reject if a V2 dataclass or core runtime API grows these concepts.
+
+### Concurrency And Lease
+
+- Is per-user foreground turn single-flight enforced?
+- Can lease ownership be recovered after TTL?
+- Can stale owners release or overwrite new leases? They must not.
+- Are background leases independent from foreground turn leases?
+- Could multi-worker execution double-send a chat message?
+
+### Background Path
+
+- Search for direct chat writes inside background workers.
+- Confirm completion path submits `background_result`.
+- Confirm stale background results are visible to agent arbitration.
+- Confirm foreground slot is released before slow work runs.
+
+### Perception
+
+- Does every perception-triggered wake go through `PerceptionDifferV2`?
+- Are continuous signals guaranteed to produce zero wakes?
+- Are WiFi/BT anchors stateful and deduped?
+- Is pHash mechanical dedupe separate from any VLM captioning?
+- Is any model deciding "worth attention"? If yes, reject.
+
+### Gate Semantics
+
+- Ambient, Scheduled, and Delivery must remain separate.
+- Ambient off must not suppress scheduled commitments.
+- Delivery off must not erase agent reasoning; the agent must see switch state.
+- Manual/user-message paths bypass proactive silence gates.
+
+### Tool Parity
+
+- Hosted and resident import the same catalog source.
+- Tool names and cost classes match across paths.
+- Unavailable tools return explicit errors.
+- Tool traces include turn/wake id and outcome.
+
+### Prompt / Context
+
+- Wake context should include tools, time, switches, digest, hints, recent chat.
+- Wake context should not inject raw perception values by default.
+- Prompts must not tell agent to be "less chatty" as a personality trait.
+- Prompt must not mention internal jobs/triggers in user-facing voice.
+
+### Privacy And TEE
+
+- Do not assume external hosted model providers are inside the TEE boundary.
+- Photo/screen data crossing provider boundaries must be explicit and reviewed.
+- Sensitive data should not be copied into logs or dashboard plaintext.
+- Push payloads must stay appropriate for lock-screen visibility.
+
+### Deletion Evidence
+
+For cutover PRs, include a section in the PR description:
+
+- Old executor removed:
+- Old route still present only as adapter:
+- Old status projection still needed because:
+- Planned removal PR:
+
+## Suggested Claude Code Audit Assignments
+
+Use these as independent review tracks.
+
+1. DB / lease / concurrency reviewer:
+   - Focus on PR1, PR5, PR8, PR9.
+   - Try to prove duplicate turn or duplicate chat write is impossible.
+2. Hosted / resident parity reviewer:
+   - Focus on PR3, PR6, PR9.
+   - Compare context, catalog, actions, and error semantics.
+3. Perception reviewer:
+   - Focus on PR7.
+   - Verify every wake source passes through `PerceptionDifferV2`.
+4. Settings / gate reviewer:
+   - Focus on PR2 and PR8.
+   - Look for Ambient/Scheduled/Delivery mixing.
+5. Dashboard / eval / cleanup reviewer:
+   - Focus on PR10 and all cutover PRs.
+   - Verify old Gate review concepts do not remain primary.
+
+## PR Description Template
+
+```md
+## Scope
+
+## Spec Sections
+
+## Runtime Invariants Touched
+
+## Implementation Notes
+
+## Tests
+
+## Legacy Boundary / Deletion Evidence
+
+## Known Follow-Ups
+```
+
+## Current Starting Point
+
+The branch currently has:
+
+- `backend/proactive/runtime_v2.py`
+- `backend/proactive/tool_catalog_v2.py`
+- `backend/proactive/adapters_v2.py`
+- `backend/perception/differ_v2.py`
+- `tests/test_proactive_runtime_v2.py`
+
+These are contract skeletons. Production routes still use old execution paths
+until the PR sequence above cuts them over.
