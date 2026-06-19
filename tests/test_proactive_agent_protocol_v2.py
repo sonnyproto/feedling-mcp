@@ -205,7 +205,6 @@ def test_user_message_context_omits_perception_digest_and_hints():
             latency_sensitive=True,
             change_digest="should not be injected",
             presence_hints={"in_meeting": True},
-            background_payload={"tool": "perception.now"},
         )
     )
     runner = TurnRunnerV2(
@@ -220,7 +219,6 @@ def test_user_message_context_omits_perception_digest_and_hints():
     assert context["trigger"] == "user_message"
     assert "change_digest" not in context
     assert "presence_hints" not in context
-    assert "background_payloads" not in context
     assert "tools" in context
     assert "time" in context
     assert "switches" in context

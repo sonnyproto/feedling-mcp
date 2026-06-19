@@ -234,6 +234,9 @@ def build_agent_context_v2(
         "tools": [dict(item) for item in (getattr(merged_context, "tools", ()) or ())],
         "recent_chat": [dict(item) for item in (recent_chat or ())],
     }
+    background_payloads = [dict(item) for item in (getattr(merged_context, "background_payloads", ()) or ())]
+    if background_payloads:
+        context["background_payloads"] = background_payloads
 
     if user_led:
         return context
@@ -250,9 +253,6 @@ def build_agent_context_v2(
     origin_refs = list(getattr(merged_context, "origin_refs", ()) or ())
     if origin_refs:
         context["origin_refs"] = origin_refs
-    background_payloads = [dict(item) for item in (getattr(merged_context, "background_payloads", ()) or ())]
-    if background_payloads:
-        context["background_payloads"] = background_payloads
 
     return context
 

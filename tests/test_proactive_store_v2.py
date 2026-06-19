@@ -11,7 +11,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from proactive.runtime_v2 import RuntimeSpineV2, TurnOutcomeV2, WakeEventV2, merge_wakes_v2
 from proactive.store_v2 import (
+    BACKGROUND_COMPLETED,
+    BACKGROUND_JOB_STREAM_V2,
     DBBackgroundLeaseRegistryV2,
+    DBBackgroundJobStoreV2,
     DBProactiveSettingsStoreV2,
     DBTurnLeaseRegistryV2,
     DBTurnStoreV2,
@@ -208,6 +211,36 @@ def test_db_turn_store_records_actions_as_v2_action_stream():
     assert [record.action_type for record in listed] == ["send_message", "schedule_wake"]
     assert listed[0].doc["turn_id"] == turn.turn_id
     assert listed[0].doc["action"]["text"] == "hello"
+
+
+def test_db_background_job_store_lifecycle_and_duplicate_completion_guard():
+    uid = _uid()
+    jobs = DBBackgroundJobStoreV2()
+    leases = DBBackgroundLeaseRegistryV2()
+
+    job = jobs.create_job(
+        uid,
+        {"tool": "memory.fetch"},
+        turn_id="turn_bg",
+        wake_ids=("wake_bg",),
+        now=500.0,
+        job_id="bg_db",
+    )
+    lease = leases.try_acquire_job(job.job_id, user_id=uid, owner_id="worker-a", now=500.1, ttl_sec=30.0)
+    assert lease is not None
+
+    running = jobs.mark_running(uid, job.job_id, lease, now=500.1)
+    completed = jobs.complete_job(uid, job.job_id, lease, {"ok": True}, now=500.2)
+    duplicate = jobs.complete_job(uid, job.job_id, lease, {"ok": True}, now=500.3)
+    rows = db.log_read_all(uid, BACKGROUND_JOB_STREAM_V2)
+
+    assert running is not None
+    assert completed is not None
+    assert completed.status == BACKGROUND_COMPLETED
+    assert completed.request == {"tool": "memory.fetch"}
+    assert duplicate is None
+    assert rows[-1]["status"] == BACKGROUND_COMPLETED
+    assert rows[-1]["result"] == {"ok": True}
 
 
 def test_db_settings_store_uses_v2_shape_with_legacy_fallback():

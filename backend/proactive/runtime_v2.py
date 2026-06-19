@@ -464,6 +464,7 @@ class TurnRunnerV2:
         run_agent: Callable[[Mapping[str, Any]], Any] | None = None,
         recent_chat_provider: Callable[[str], Sequence[Mapping[str, Any]]] | None = None,
         turn_store: Any | None = None,
+        background_jobs: Any | None = None,
         turn_leases: TurnLeaseRegistryV2 | None = None,
         background_leases: BackgroundLeaseRegistryV2 | None = None,
         turn_lease_ttl_sec: float = 120.0,
@@ -474,6 +475,7 @@ class TurnRunnerV2:
         self.run_agent = run_agent or _sleep_outcome_v2
         self.recent_chat_provider = recent_chat_provider
         self.turn_store = turn_store
+        self.background_jobs = background_jobs
         self.turn_leases = turn_leases or TurnLeaseRegistryV2()
         self.background_leases = background_leases or BackgroundLeaseRegistryV2()
         self.turn_lease_ttl_sec = float(turn_lease_ttl_sec)
@@ -575,14 +577,26 @@ class TurnRunnerV2:
                     contract_violation=contract_violation,
                 )
             if outcome.needs_background:
-                background_job_id = "bg_" + uuid.uuid4().hex[:16]
-                background_lease = self.background_leases.try_acquire_job(
-                    background_job_id,
-                    user_id=user_id,
-                    owner_id=owner,
-                    now=now,
-                    ttl_sec=self.background_lease_ttl_sec,
-                )
+                background_lease = None
+                if self.background_jobs is not None and hasattr(self.background_jobs, "create_job"):
+                    background_job = self.background_jobs.create_job(
+                        user_id,
+                        outcome.background_request,
+                        turn_id=turn_id,
+                        wake_ids=context.wake_ids,
+                        origin_refs=context.origin_refs or context.wake_ids,
+                        now=now,
+                    )
+                    background_job_id = str(getattr(background_job, "job_id", "") or "")
+                else:
+                    background_job_id = "bg_" + uuid.uuid4().hex[:16]
+                    background_lease = self.background_leases.try_acquire_job(
+                        background_job_id,
+                        user_id=user_id,
+                        owner_id=owner,
+                        now=now,
+                        ttl_sec=self.background_lease_ttl_sec,
+                    )
                 return TurnRunResultV2(
                     status="background_queued",
                     context=context,

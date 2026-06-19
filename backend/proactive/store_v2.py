@@ -34,6 +34,7 @@ from proactive.runtime_v2 import (
 WAKE_STREAM_V2 = "proactive_wakes_v2"
 TURN_STREAM_V2 = "proactive_turns_v2"
 TURN_ACTION_STREAM_V2 = "proactive_turn_actions_v2"
+BACKGROUND_JOB_STREAM_V2 = "proactive_background_jobs_v2"
 LEASE_KIND_PREFIX_V2 = "proactive_v2_lease:"
 LEGACY_PROACTIVE_SETTINGS_KIND = "proactive_settings"
 
@@ -42,10 +43,18 @@ WAKE_DRAINED = "drained"
 TURN_RUNNING = "running"
 TURN_COMPLETED = "completed"
 TURN_STALE_RECOVERED = "stale_recovered"
+BACKGROUND_PENDING = "pending"
+BACKGROUND_RUNNING = "running"
+BACKGROUND_COMPLETED = "completed"
+BACKGROUND_FAILED = "failed"
 
 
 def _new_turn_id() -> str:
     return "turn_" + uuid.uuid4().hex[:16]
+
+
+def _new_background_job_id() -> str:
+    return "bg_" + uuid.uuid4().hex[:16]
 
 
 def _now(now: float | None = None) -> float:
@@ -390,6 +399,158 @@ class DBProactiveSettingsStoreV2:
         )
         db.set_blob(user_id, SETTINGS_KIND_V2, settings_v2_to_doc(settings))
         return settings
+
+
+@dataclass(frozen=True)
+class BackgroundJobRecordV2:
+    job_id: str
+    user_id: str
+    status: str
+    request: Mapping[str, Any]
+    turn_id: str
+    wake_ids: tuple[str, ...]
+    origin_refs: tuple[str, ...]
+    lease_id: str
+    lease_expires_at: float
+    doc: Mapping[str, Any]
+
+
+class DBBackgroundJobStoreV2:
+    def create_job(
+        self,
+        user_id: str,
+        request: Mapping[str, Any],
+        *,
+        turn_id: str = "",
+        wake_ids: tuple[str, ...] = (),
+        origin_refs: tuple[str, ...] = (),
+        now: float | None = None,
+        job_id: str | None = None,
+    ) -> BackgroundJobRecordV2:
+        now = _now(now)
+        job_id = job_id or _new_background_job_id()
+        doc = {
+            "kind": "background_job_v2",
+            "job_id": job_id,
+            "user_id": user_id,
+            "status": BACKGROUND_PENDING,
+            "request": dict(request or {}),
+            "turn_id": str(turn_id or ""),
+            "wake_ids": list(wake_ids or ()),
+            "origin_refs": list(origin_refs or wake_ids or ()),
+            "created_at": now,
+            "updated_at": now,
+        }
+        db.log_append(user_id, BACKGROUND_JOB_STREAM_V2, doc, ts=now, item_key=job_id)
+        return self._background_record_from_doc(doc)
+
+    def get_job(self, user_id: str, job_id: str) -> BackgroundJobRecordV2 | None:
+        for record in self.list_jobs(user_id):
+            if record.job_id == job_id:
+                return record
+        return None
+
+    def mark_running(
+        self,
+        user_id: str,
+        job_id: str,
+        lease: LeaseV2,
+        *,
+        now: float | None = None,
+    ) -> BackgroundJobRecordV2 | None:
+        now = _now(now)
+        patch = {
+            "status": BACKGROUND_RUNNING,
+            "updated_at": now,
+            "lease_id": lease.lease_id,
+            "lease_owner_id": lease.owner_id,
+            "lease_expires_at": lease.expires_at,
+        }
+        doc = _patch_log_item_guarded(
+            user_id,
+            BACKGROUND_JOB_STREAM_V2,
+            job_id,
+            patch,
+            status=BACKGROUND_PENDING,
+        )
+        if doc is None:
+            doc = _patch_log_item_guarded(
+                user_id,
+                BACKGROUND_JOB_STREAM_V2,
+                job_id,
+                patch,
+                status=BACKGROUND_RUNNING,
+                lease_expired_at_or_before=now,
+            )
+        return self._background_record_from_doc(doc) if doc else None
+
+    def complete_job(
+        self,
+        user_id: str,
+        job_id: str,
+        lease: LeaseV2,
+        result: Mapping[str, Any],
+        *,
+        now: float | None = None,
+    ) -> BackgroundJobRecordV2 | None:
+        now = _now(now)
+        doc = _patch_log_item_guarded(
+            user_id,
+            BACKGROUND_JOB_STREAM_V2,
+            job_id,
+            {
+                "status": BACKGROUND_COMPLETED,
+                "completed_at": now,
+                "updated_at": now,
+                "result": dict(result or {}),
+            },
+            status=BACKGROUND_RUNNING,
+            lease_id=lease.lease_id,
+        )
+        return self._background_record_from_doc(doc) if doc else None
+
+    def fail_job(
+        self,
+        user_id: str,
+        job_id: str,
+        lease: LeaseV2,
+        error: Mapping[str, Any],
+        *,
+        now: float | None = None,
+    ) -> BackgroundJobRecordV2 | None:
+        now = _now(now)
+        doc = _patch_log_item_guarded(
+            user_id,
+            BACKGROUND_JOB_STREAM_V2,
+            job_id,
+            {
+                "status": BACKGROUND_FAILED,
+                "failed_at": now,
+                "updated_at": now,
+                "error": dict(error or {}),
+            },
+            status=BACKGROUND_RUNNING,
+            lease_id=lease.lease_id,
+        )
+        return self._background_record_from_doc(doc) if doc else None
+
+    def list_jobs(self, user_id: str) -> list[BackgroundJobRecordV2]:
+        return [self._background_record_from_doc(doc) for doc in db.log_read_all(user_id, BACKGROUND_JOB_STREAM_V2)]
+
+    @staticmethod
+    def _background_record_from_doc(doc: Mapping[str, Any]) -> BackgroundJobRecordV2:
+        return BackgroundJobRecordV2(
+            job_id=str(doc.get("job_id") or ""),
+            user_id=str(doc.get("user_id") or ""),
+            status=str(doc.get("status") or ""),
+            request=dict(doc.get("request") or {}),
+            turn_id=str(doc.get("turn_id") or ""),
+            wake_ids=tuple(str(item) for item in (doc.get("wake_ids") or ())),
+            origin_refs=tuple(str(item) for item in (doc.get("origin_refs") or ())),
+            lease_id=str(doc.get("lease_id") or ""),
+            lease_expires_at=float(doc.get("lease_expires_at") or 0.0),
+            doc=dict(doc),
+        )
 
 
 @dataclass(frozen=True)
