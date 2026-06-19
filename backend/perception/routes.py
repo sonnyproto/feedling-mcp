@@ -79,7 +79,7 @@ def snapshot():
 
 
 # ---------------------------------------------------------------------------
-# Photos (two-step + sensitivity gate)
+# Photos (single-step encrypted ingest)
 # ---------------------------------------------------------------------------
 
 @bp.route("/photo/evaluate", methods=["POST"])
@@ -88,7 +88,12 @@ def photo_evaluate():
     uid = _uid()
     p = _body()
     out, code = service.photo_evaluate(
-        uid, p.get("metadata") or {}, p.get("content_envelope"), p.get("exif_gps"))
+        uid,
+        p.get("metadata") or {},
+        p.get("content_envelope"),
+        p.get("exif_gps"),
+        p.get("meta_envelope"),
+    )
     return jsonify(out), code
 
 

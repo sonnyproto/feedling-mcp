@@ -397,7 +397,7 @@ def set_config(user_id: str, patch: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Photos (two-step, sensitivity-gated)
+# Photos (single-step encrypted ingest)
 # ---------------------------------------------------------------------------
 
 def _truthy(v) -> bool:
@@ -408,31 +408,29 @@ def _truthy(v) -> bool:
     return bool(v)
 
 
-def _photo_usable(meta: dict) -> tuple[bool, bool, str]:
-    """Two-layer sensitivity gate — metadata only, no pixel decryption. The
-    platform HARD-blocks only objectively-sensitive scenes; contextual ones
-    (private/receipt) pass and the agent self-censors. Returns
-    (usable, sensitive, reason)."""
+def _photo_sensitivity(meta: dict) -> bool:
+    """Return whether metadata says the photo may need careful expression.
+
+    This is not a gate. V2 intentionally lets encrypted photo content reach the
+    companion inside the trusted boundary; the prompt/policy layer decides how
+    to talk about sensitive scenes.
+    """
     scene = str(meta.get("scene_hint") or "").lower()
-    if scene in catalog.HARD_BLOCK_SCENES:
-        return False, True, f"hard_block:{scene}"
-    if _truthy(meta.get("is_screenshot")):
-        return False, False, "screenshot"
-    return True, False, ""
+    return scene in catalog.SENSITIVE_PHOTO_SCENES or _truthy(meta.get("is_screenshot"))
 
 
 def photo_evaluate(user_id: str, metadata: dict,
                    content_envelope: dict | None = None,
-                   exif_gps: dict | None = None) -> tuple[dict, int]:
+                   exif_gps: dict | None = None,
+                   meta_envelope: dict | None = None) -> tuple[dict, int]:
     """Single-step photo ingest: evaluate metadata AND (if usable) store the
     encrypted image in one call.
 
-    - Hard-blocked photos (id_card/medical/document/screenshot) are REJECTED and
-      their ciphertext — even if uploaded — is discarded: never stored, never
-      reaches the agent.
-    - Usable photos: the ciphertext goes into the screen-frame envelope channel
-      (reuses the enclave's existing frame-decrypt path); the backend never sees
-      plaintext. frame_id == photo_id == content_envelope.id.
+    V2 does not hard-block sensitive scene hints. The ciphertext goes into the
+    screen-frame envelope channel (reuses the enclave's existing frame-decrypt
+    path); the backend never sees plaintext. frame_id == photo_id ==
+    content_envelope.id. Optional meta_envelope is stored encrypted and returned
+    only on the single-photo content read path.
     """
     now = _now()
     metadata = metadata or {}
@@ -440,15 +438,10 @@ def photo_evaluate(user_id: str, metadata: dict,
     place_label = None
     if exif_gps:
         place_label = resolve.resolve_geofence(exif_gps, config).get("place_label")
-    usable, sensitive, reason = _photo_usable(metadata)
+    sensitive = _photo_sensitivity(metadata)
     photo_id = str((content_envelope or {}).get("id") or random_item_id())
     meta_out = {k: metadata.get(k) for k in catalog.PHOTO_METADATA_FIELDS}
     meta_out["place_label"] = place_label
-
-    if not usable:
-        # Hard-blocked: do NOT store anything; any uploaded ciphertext is dropped.
-        return {"photo_id": photo_id, "metadata": meta_out, "usable": False,
-                "sensitive": sensitive, "reason": reason, "status": "rejected"}, 200
 
     if not content_envelope:
         return {"error": "content_envelope_required"}, 400
@@ -456,7 +449,9 @@ def photo_evaluate(user_id: str, metadata: dict,
     # Store ciphertext in the frame channel + metadata as a confirmed item.
     store.put_photo_envelope(user_id, photo_id, now, content_envelope)
     doc = {"photo_id": photo_id, "metadata": meta_out, "status": "confirmed",
-           "usable": True, "sensitive": False, "frame_id": photo_id}
+           "usable": True, "sensitive": sensitive, "frame_id": photo_id}
+    if meta_envelope:
+        doc["meta_envelope"] = dict(meta_envelope)
     store.item_upsert(user_id, "photo", photo_id, now, doc, expires_at=None)
 
     # Burst de-dup backstop: only wake once per cluster window.
@@ -471,7 +466,7 @@ def photo_evaluate(user_id: str, metadata: dict,
         _fire_wake(user_id, "photos",
                    "她拍了一张可能值得一提的照片（先看元数据，需要再 pull 内容）。", now)
     return {"photo_id": photo_id, "metadata": meta_out, "usable": True,
-            "sensitive": False, "status": "stored"}, 200
+            "sensitive": sensitive, "status": "stored"}, 200
 
 
 def photos_recent(user_id: str, limit: int = 20) -> tuple[dict, int]:
@@ -491,12 +486,15 @@ def photo_content(user_id: str, photo_id: str) -> tuple[dict, int]:
     doc = store.item_get(user_id, "photo", photo_id, now=now)
     if not doc or doc.get("status") != "confirmed":
         return {"error": "not_found"}, 404
-    return {
+    out = {
         "photo_id": photo_id,
         "frame_id": doc.get("frame_id") or photo_id,
         "metadata": doc.get("metadata"),
         "decrypt_path": f"/v1/screen/frames/{doc.get('frame_id') or photo_id}/decrypt",
-    }, 200
+    }
+    if doc.get("meta_envelope"):
+        out["meta_envelope"] = doc.get("meta_envelope")
+    return out, 200
 
 
 # ---------------------------------------------------------------------------
@@ -549,5 +547,3 @@ def app_open(user_id: str, app: str, category: str | None = None,
     # append to the usage time series
     store.append_app_open(user_id, {"app": app, "category": category, "ts": now}, now)
     return {"status": "ok", "app": app, "category": category, "ts": now}, 200
-
-

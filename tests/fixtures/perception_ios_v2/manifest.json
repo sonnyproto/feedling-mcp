@@ -1,0 +1,42 @@
+{
+  "ios_repo": {
+    "path": "/Users/xiaotingtan/Desktop/feedling-mcp-ios",
+    "branch": "main",
+    "commit": "23d1eba54557b5f133ca720083038dd9a5d68d54"
+  },
+  "source_files": [
+    "App/FeedlingTest/Pages/Settings/Perception/PerceptionContextSnapshot.swift",
+    "App/FeedlingTest/Pages/Settings/Perception/PerceptionPermissionsManager.swift",
+    "App/FeedlingTest/API/FeedlingAPI.swift",
+    "App/FeedlingBroadcast/SharedConfig.swift",
+    "App/FeedlingBroadcast/SampleHandler.swift"
+  ],
+  "fixtures": {
+    "ios_report_full_changed.json": "All currently emitted report keys, encrypted sensitive signals changed=true.",
+    "ios_report_unchanged.json": "Same encrypted sensitive signal shape with changed=false.",
+    "ios_report_missing_permission_unavailable.json": "NSNull data shape for missing permission and authorized-but-unavailable signals.",
+    "ios_report_dropped_upload.json": "Content keys unavailable: encrypted signals are omitted from context_snapshot.",
+    "ios_photo_evaluate_document.json": "Current iOS photo/evaluate body: metadata + content_envelope + optional meta_envelope, no exif_gps."
+  },
+  "dropped_upload": {
+    "missing_keys": [
+      "location_signal",
+      "motion_state",
+      "calendar_next_event",
+      "playback"
+    ],
+    "source_behavior": "encryptedContextItem returns nil when content keys are unavailable, so collectContextSnapshotItems compactMaps the signal out of the report."
+  },
+  "healthkit": {
+    "steps": "ios_unimplemented",
+    "sleep_last_night": "ios_unimplemented",
+    "workout": "ios_unimplemented",
+    "vitals": "ios_unimplemented"
+  },
+  "human_device_report": {
+    "status": "pending_user_verification",
+    "verified_by": null,
+    "verified_at": null,
+    "note": "Agents can prepare fixtures and tests, but only a human can certify that the iOS app hit the backend from a device or simulator."
+  }
+}

@@ -70,12 +70,9 @@ actual adapter.
 ## Known Spec Gap To Audit
 
 `perception.photo_recent` reads through the existing `perception.service`
-read surface. PR3 does not remove the older photo ingest hard-block code in
-`perception.service` / `perception.catalog`. The V2 spec says the hard block
-should be removed; this PR treats that as a separate perception/photo pipeline
-change because PR3 only establishes the shared tool execution contract. If the
-reviewer considers photo hard-block removal part of PR3, split that out before
-commit.
+read surface. PR3 did not remove the older photo ingest hard-block code because
+PR3 only established the shared tool execution contract; PR6b removes that
+hard block while adding the iOS photo contract fixtures.
 
 ## Verification
 

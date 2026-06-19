@@ -187,17 +187,17 @@ snake_case。下表是每个 key 的 data 结构与后端处理（与 `perceptio
 
 ---
 
-## 5. 照片（单接口 + 两层敏感门）
+## 5. 照片（单接口 + V2 无硬拦截）
 
 照片像素是最敏感数据。一个接口完成评估 + 上传：metadata 和加密图片一起传。
 
-- **两层敏感判定**：平台只**硬挡客观敏感**场景（证件/医疗/文档/截图）→ `usable=false`，
-  **后端丢弃图片、不入库、永不到 agent**；**语境敏感**（私密/收据）不硬挡，照常入库给
-  agent，由 agent 按 prompt 自律不评论。
+- **V2 删除敏感场景硬拦截**：`scene_hint` 仍作为 metadata 保存，但不再决定图片能不能
+  被伴侣看到。敏感内容的分寸由 agent 的表达层处理，不由平台 gate 感知。
 - 后端**永不看明文像素**（只存密文信封，agent 要看时才经 enclave 解密）。
 
 **iOS 端**负责：过滤截图（端上直接丢）→ 30s 连拍聚簇只取代表帧 → Vision 生成 metadata
-→ 用 `ContentEncryption.swift` 的 `build_envelope` 加密像素（`visibility:"shared"`）。
+→ 用 `ContentEncryption.swift` 的 `build_envelope` 加密像素（`visibility:"shared"`）。若照片有
+位置，iOS 端本地解析 `place_label` 后放入可选 `meta_envelope`；raw EXIF GPS 不再上行。
 
 ### `POST /v1/perception/photo/evaluate`
 **请求**（metadata + 加密图片一起传）
@@ -215,7 +215,7 @@ snake_case。下表是每个 key 的 data 结构与后端处理（与 `perceptio
     "is_screenshot": "false"
   },
   "content_envelope": { "v":1, "id":"abc123", "body_ct":"<base64 密文>", "nonce":"...", "K_user":"...", "K_enclave":"...", "visibility":"shared", "owner_user_id":"<uid>" },
-  "exif_gps": "37.42,-122.08"
+  "meta_envelope": { "v":1, "id":"meta123", "body_ct":"<base64 密文>", "nonce":"...", "K_user":"...", "K_enclave":"...", "visibility":"shared", "owner_user_id":"<uid>" }
 }
 ```
 - `content_envelope`：`build_envelope` 输出，`body_ct` 是**加密后的照片像素**。
@@ -234,29 +234,25 @@ snake_case。下表是每个 key 的 data 结构与后端处理（与 `perceptio
   | `has_text_block` | 布尔字符串 | 是否含大块文字 |
   | `is_screenshot` | 布尔字符串 | 截图（兜底，正常端上已过滤） |
 
-- `exif_gps`（可选，`"lat,lon"` 字符串）：后端 geofence → `place_label`，原始 GPS 丢弃。
+- `meta_envelope`（可选）：加密敏感上下文，例如端上 geofence 解析出的 `place_label`。
+  后端只存密文，不读取 raw GPS。
 
 **`scene_hint` 枚举（前后端必须对齐）**
 
 | 分组 | 取值 | 处理 |
 |---|---|---|
 | 非敏感 | `landscape` `food` `people` `pet` `activity` `object` `art` `text_note` `other` | 入库 |
-| 语境敏感（**不硬挡**） | `private` `receipt` | `usable=true`，入库，交 agent 自律 |
-| 客观敏感（**硬挡**） | `document` `id_card` `medical` `screenshot` | `usable=false`，丢弃不入库 |
+| 语境敏感 | `private` `receipt` | `usable=true`，入库，交 agent 表达层自律 |
+| 客观敏感 | `document` `id_card` `medical` `screenshot` | `usable=true`，入库，`sensitive=true`，不做平台硬拦截 |
 
 > `private` = 看起来私密的场景（室内洗漱、床上等）。不在枚举内的字符串按 `other` 处理。
 
 **响应** `200`
-- 入库：`{ "photo_id":"abc123", "metadata":{...,"place_label":"outdoor"}, "usable":true, "sensitive":false, "status":"stored" }`
-- 被硬挡：`{ "photo_id":"abc123", "metadata":{...}, "usable":false, "sensitive":true, "reason":"hard_block:id_card", "status":"rejected" }`（图片已丢弃）
-- `400` 缺 `content_envelope`（usable 照片必须带图）；`403` 未授权 `photos`。
+- 入库：`{ "photo_id":"abc123", "metadata":{...}, "usable":true, "sensitive":false, "status":"stored" }`
+- 敏感场景仍入库：`{ "photo_id":"abc123", "metadata":{...}, "usable":true, "sensitive":true, "status":"stored" }`
+- `400` 缺 `content_envelope`；`403` 未授权 `photos`。
 
 > 照片**只走这一个专用接口**，**不经过通用 `/report`**。
-
-> ⚠️ 权衡：因为 metadata 和图一起传，**被硬挡的敏感照其加密密文也会上传一次**（后端
-> 收到后立即丢弃、不入库、agent 永不可见）。若要敏感照的密文也不上传，需前端用同一套
-> `scene_hint` 规则在端上预判、命中硬挡集合就不带 `content_envelope`（只传 metadata 看
-> `usable`）——这是可选的端上优化。
 
 ---
 
@@ -361,14 +357,14 @@ URL 填上面的串、把 `app=` 改成对应 app 名（建议关「运行前询
    { "context_snapshot": [
        { "key": "time",            "data": "{\"local_time\":\"...\",\"timezone\":\"...\",\"locale\":\"en\"}", "message": "本地时间" },
        { "key": "battery",         "data": "{\"level\":\"0.8\",\"charging\":\"false\"}", "message": "电量" },
-       { "key": "location_signal", "data": "{\"signal\":{\"latitude\":37.4,\"longitude\":-122.1},\"wifi_label\":\"home_wifi\"}", "message": "粗粒度位置" },
-       { "key": "motion_state",    "data": "{\"state\":\"walking\",\"confidence\":\"high\"}", "message": "运动状态" }
+       { "key": "location_signal", "envelope": {"id":"...","body_ct":"..."}, "changed": true },
+       { "key": "motion_state",    "envelope": {"id":"...","body_ct":"..."}, "changed": false }
    ] }
    ```
-   未授权/读不到的能力用 `data:"null"` 表达（如 `{"key":"location_signal","data":"null",...}`）。
+   敏感信号有值时只上传 `envelope + changed`；未授权/读不到时用 `data:null` 表达。
 4. **照片**（拍照入库时）：端上过滤截图 + 30s 聚簇取代表帧 + Vision 生成 metadata +
-   `build_envelope` 加密 → `POST /photo/evaluate`（metadata + `content_envelope` 一起传）。
-   被硬挡的敏感照返回 `usable:false, status:rejected`（图片已丢弃）。
+   `build_envelope` 加密 → `POST /photo/evaluate`（metadata + `content_envelope`，可选
+   `meta_envelope` 一起传）。V2 不再硬挡敏感照；敏感 metadata 只影响表达分寸。
 5. **透明性面板**：`GET /permissions` 渲染开关；用户随时可关。
 6. **Tier 2**：健康按 §8。
 7. **App 追踪**（可选）：引导用户为想追踪的 app 配置快捷指令自动化（见 §9）。

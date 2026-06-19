@@ -123,9 +123,9 @@ COMPOSITE_KEYS: dict[str, list[str]] = {}
 # perception_items kinds (collection-style data; see migration 0002) and the
 # capability that gates the GENERIC /items endpoint for each kind.
 # NOTE: "photo" is intentionally ABSENT from KIND_CAPABILITY — photos must go
-# through the dedicated /photo/evaluate flow (which runs _photo_usable + stores
-# the encrypted envelope). Allowing kind=photo via /items would let a caller
-# inject a hard-blocked photo doc with status=confirmed and bypass the gate.
+# through the dedicated /photo/evaluate flow, which stores the encrypted
+# envelope in the frame channel. Allowing kind=photo via /items would let a
+# caller inject a confirmed photo doc without the envelope path.
 # (calendar is reported via /report, not /items.)
 ITEM_KINDS = ("photo", "workout", "sleep", "vitals")
 KIND_CAPABILITY = {
@@ -140,28 +140,23 @@ KIND_CAPABILITY = {
 PHOTO_CLUSTER_SEC = 30.0
 
 # scene_hint — the canonical enum shared with the iOS Vision classifier. The
-# client MUST emit one of these strings; anything else is treated as "other"
-# (non-sensitive) and may reach the agent. Keep this list in lockstep with iOS.
-#
-# Two-layer policy (user decision): the platform HARD-blocks ONLY the
-# objectively-sensitive, low-false-positive scenes (HARD_BLOCK_SCENES) — those
-# never reach the agent. Subjective / contextual scenes (private, receipt) DO
-# reach the agent as metadata; the agent self-censors per its prompt (skill.md).
+# client MUST emit one of these strings; anything else is treated as "other".
+# V2 removes the old platform hard block: sensitive hints are metadata for the
+# companion's expression policy, not a perception gate.
 SCENE_HINTS = (
     # non-sensitive — may reach the agent
     "landscape", "food", "people", "pet", "activity", "object", "art",
     "text_note", "other",
-    # contextual — reach the agent, which self-censors (NOT hard-blocked)
+    # contextual
     "private", "receipt",
-    # hard-blocked at the gate — never reach the agent
+    # objectively sensitive
     "document", "id_card", "medical", "screenshot",
 )
-HARD_BLOCK_SCENES = {"document", "id_card", "medical", "screenshot"}
+SENSITIVE_PHOTO_SCENES = {"private", "receipt", "document", "id_card", "medical", "screenshot"}
 
-# Extended on-device metadata the iOS Vision pass may include. The platform gate
-# only READS `scene_hint` + `is_screenshot`; everything else is passed through to
-# the agent as context for ITS judgment (e.g. is_indoor/has_text_block help the
-# agent decide whether a 'private'/'receipt' photo is worth a comment).
+# Extended on-device metadata the iOS Vision pass may include. The runtime does
+# not use these fields as a gate; they are passed through as context for the
+# agent's own judgment and voice.
 PHOTO_METADATA_FIELDS = (
     "has_faces", "face_count", "scene_hint", "scene_confidence",
     "time_of_day", "is_burst", "is_indoor", "has_text_block", "is_screenshot",

@@ -65,7 +65,7 @@ feedling-mcp/
   enclave 解密后"看到"用户在做什么。
 - **扩展感知（Extended Perception）**：位置标签（粗粒度 geofence，不传
   坐标）、运动状态、日历下一事件、正在播放、电量等 8 类信号，
-  默认全关、逐项授权；照片有单独的敏感场景硬拦截
+  默认全关、逐项授权；照片走专用加密管线，V2 不做敏感场景硬拦截
   （详见 `docs/EXTENDED_PERCEPTION_API.md`）。
 - **审计卡**（Settings → Privacy）：iOS 内置的实时信任验证器，逐行检查
   attestation / 链上授权 / 证书 pin（见 §8）。

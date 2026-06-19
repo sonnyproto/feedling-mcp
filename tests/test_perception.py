@@ -3,7 +3,7 @@
 These exercise the generic machinery (sparse report, implicit authorization via
 reported values, raw->label resolution + raw discard, snapshot TTL, the
 user_state override stack,
-debounced wakes, and the two-step sensitivity-gated photo flow) WITHOUT a real
+debounced wakes, and the encrypted photo flow) WITHOUT a real
 Postgres: the store layer is replaced with an in-memory fake, and the wake
 trigger is captured instead of enqueuing a real proactive job.
 
@@ -227,15 +227,16 @@ def test_wake_debounce(env):
     assert len([w for w in wakes if w[0] == "location"]) == 1
 
 
-def test_photo_hard_block_discards_ciphertext(env):
-    """Hard-blocked scene (id_card): rejected; even an uploaded envelope is NOT
-    stored — no frame envelope, not listed."""
+def test_photo_sensitive_scene_stored_without_hard_block(env):
+    """V2 removes the old sensitive-scene hard block: even an id_card/document
+    hint is stored encrypted and left to the agent's expression policy."""
     fake, _ = env
     out, code = service.photo_evaluate(
         UID, {"scene_hint": "id_card"}, {"id": "p_bad", "body_ct": "x"})
-    assert code == 200 and out["usable"] is False and out["status"] == "rejected"
-    assert fake.get_photo_envelope(UID, "p_bad") is None      # ciphertext discarded
-    assert service.photos_recent(UID)[0]["photos"] == []
+    assert code == 200 and out["usable"] is True and out["status"] == "stored"
+    assert out["sensitive"] is True
+    assert fake.get_photo_envelope(UID, "p_bad")["body_ct"] == "x"
+    assert service.photos_recent(UID)[0]["photos"][0]["photo_id"] == "p_bad"
 
 
 def test_photo_contextual_scene_stored_and_reaches_agent(env):
@@ -245,6 +246,7 @@ def test_photo_contextual_scene_stored_and_reaches_agent(env):
     out, _ = service.photo_evaluate(
         UID, {"scene_hint": "private", "is_indoor": True}, {"id": "p_priv", "body_ct": "c"})
     assert out["usable"] is True and out["status"] == "stored"
+    assert out["sensitive"] is True
     assert out["metadata"]["scene_hint"] == "private"
     assert fake.get_photo_envelope(UID, "p_priv")["body_ct"] == "c"
 
@@ -266,6 +268,23 @@ def test_photo_one_step_store(env):
     assert any(c == "photos" for c, _ in wakes)              # fired a wake
 
 
+def test_photo_meta_envelope_is_preserved_only_on_content_read(env):
+    fake, _ = env
+    meta_env = {"id": "meta_1", "body_ct": "encrypted-place-label"}
+    out, code = service.photo_evaluate(
+        UID,
+        {"scene_hint": "food"},
+        {"id": "p_meta", "body_ct": "cipher"},
+        meta_envelope=meta_env,
+    )
+    assert code == 200 and out["status"] == "stored"
+    listed = service.photos_recent(UID)[0]["photos"]
+    assert "meta_envelope" not in listed[0]
+    content, c2 = service.photo_content(UID, "p_meta")
+    assert c2 == 200
+    assert content["meta_envelope"] == meta_env
+
+
 def test_photo_usable_requires_envelope(env):
     """A usable photo with no content_envelope is a 400."""
     fake, _ = env
@@ -284,7 +303,7 @@ def test_photos_no_setup_stored(env):
 
 def test_items_rejects_photo_kind(env):
     """photo must NOT be ingestable via the generic /items endpoint (would bypass
-    the _photo_usable gate). Only /photo/evaluate stores photos."""
+    the dedicated encrypted envelope path). Only /photo/evaluate stores photos."""
     fake, _ = env
     out, code = service.items_ingest(UID, "photo", [
         {"item_id": "p_x", "doc": {"status": "confirmed", "metadata": {"scene_hint": "id_card"}}}])
@@ -347,10 +366,12 @@ def test_photo_metadata_string_bools(env):
     fake, _ = env
     out, _ = service.photo_evaluate(
         UID, {"scene_hint": "food", "is_screenshot": "false"}, {"id": "p1", "body_ct": "c"})
-    assert out["usable"] is True                       # "false" not wrongly blocked
+    assert out["usable"] is True
+    assert out["sensitive"] is False
     out2, _ = service.photo_evaluate(
         UID, {"scene_hint": "food", "is_screenshot": "true"}, {"id": "p2", "body_ct": "c"})
-    assert out2["usable"] is False                     # "true" blocks
+    assert out2["usable"] is True
+    assert out2["sensitive"] is True
 
 
 def test_string_scalar_values_stored(env):
