@@ -7,12 +7,28 @@ meant to be read by Codex / Claude Code before writing or reviewing code.
 
 - Canonical design: `docs/PROACTIVE_PERCEPTION_SPEC_V2.md`
 - Runtime migration contract: `docs/PROACTIVE_PERCEPTION_RUNTIME_V2_MIGRATION.md`
+- iOS perception producer contract: sibling repo `../feedling-mcp-ios`,
+  especially `PerceptionContextSnapshot`, `PerceptionPermissionsManager`,
+  `FeedlingAPI.reportPerceptionSnapshot`, and the photo/broadcast pipelines.
 - Historical context only: `docs/PROACTIVE_V2_ARCHITECTURE.md`,
   `docs/PROACTIVE_GATE_V1.md`
 
 If this plan conflicts with `PROACTIVE_PERCEPTION_SPEC_V2.md`, the spec wins.
 If code already implements an older shape, use the strangler migration below
 instead of extending the old shape.
+
+## iOS Integration Discipline
+
+Round 3 is not considered end-to-end integrated until the iOS producer contract
+has been checked against the backend V2 ingress. Backend PRs may build the V2
+runtime spine first, but they must not claim iOS/backend integration merely
+because they read the existing perception store.
+
+Before PR7 cuts over perception ingress, sync `../feedling-mcp-ios` to the
+latest upstream `main`, capture the actual `/v1/perception/report` and
+`/v1/perception/photo/evaluate` payload shapes as fixtures, and run backend
+contract tests from those fixtures through `PerceptionDifferV2`. This is a hard
+gate: do not let imagined payloads drive the differ implementation.
 
 ## Migration Strategy
 
@@ -61,6 +77,10 @@ Any PR violating these should be rejected.
     old executor in the same PR. Deletion is a separate follow-up PR after an
     observation window with healthy §10.3 system metrics. (This is the whole
     point of strangler-fig: same-PR deletion removes the rollback path.)
+14. Perception ingress cutover must be proven against real iOS payload fixtures.
+    Backend V2 code may not assume field names, envelope shape, `changed`
+    semantics, or photo metadata shape without a fixture from
+    `../feedling-mcp-ios`.
 
 ## PR Sequence
 
@@ -261,18 +281,69 @@ Cutover evidence:
 - List the functions in `hosted/wake_consumer.py` slated for deletion in the
   follow-up deletion PR (after metrics confirm health).
 
+### PR6b. iOS Perception Contract Sync And Fixtures
+
+Scope:
+
+- Sync `../feedling-mcp-ios` to the latest upstream `main` before touching
+  perception ingress.
+- Audit the actual iOS producers for `/v1/perception/report`,
+  `/v1/perception/photo/evaluate`, and broadcast frame state.
+- Add backend fixture coverage for the current iOS payloads.
+- Map every iOS-emitted field to either a V2 differ input, a pure pull-only
+  signal, or an explicit unsupported/ignored result.
+
+Current iOS files to inspect:
+
+- `App/FeedlingTest/Pages/Settings/Perception/PerceptionContextSnapshot.swift`
+- `App/FeedlingTest/Pages/Settings/Perception/PerceptionPermissionsManager.swift`
+- `App/FeedlingTest/Pages/Settings/Perception/PerceptionLocalConfig.swift`
+- `App/FeedlingTest/Pages/Settings/Perception/PerceptionLocalResolver.swift`
+- `App/FeedlingTest/API/FeedlingAPI.swift`
+- `App/FeedlingBroadcast/SharedConfig.swift`
+- `App/FeedlingBroadcast/SampleHandler*.swift`
+
+Acceptance tests:
+
+- Backend contract tests load real-shape iOS fixtures and pass them through
+  `/v1/perception/report` parsing and `PerceptionDifferV2`.
+- Fixtures cover operation signals (`time`, `battery`, `broadcast`, `focus`)
+  and encrypted/sensitive signals (`location_signal`, `motion_state`,
+  `calendar_next_event`, `playback`) in the current client shape.
+- Fixtures cover `changed=true`, `changed=false`, missing permission,
+  unsupported/unavailable, and dropped-upload cases.
+- Photo fixture covers the current `/v1/perception/photo/evaluate` metadata and
+  envelope shape, including the V2 removal of sensitive-scene hard blocking.
+- Unknown or unimplemented signals fail explicitly instead of silently
+  generating wakes.
+- HealthKit absence remains explicit; do not invent steps/sleep/workout/vitals
+  data until iOS implements it.
+
+Do not do:
+
+- Do not build new iOS UI or HealthKit in this PR.
+- Do not change iOS reporting semantics inside the backend cutover PR. If iOS
+  payloads must change, make that a separate iOS PR/review.
+- Do not claim frontend/backend integration is complete until these fixtures
+  and at least one manual device/simulator report path have been checked. The
+  manual report path is a human-verified step: agents may prepare fixtures and
+  tests, but only the user can certify that the iOS app actually hit the
+  backend from a device or simulator.
+
 ### PR7. Perception Ingress Cutover
 
 Scope:
 
 - Route `/v1/perception/report`, photo ingest, and device events through
   `PerceptionDifferV2`.
+- Use the PR6b iOS fixtures as the contract source for payload parsing.
 - Implement WiFi/BT anchor transition semantics.
 - Implement pHash scene-change wake path for broadcast mode if ready; otherwise
   leave a tested TODO boundary.
 
 Acceptance tests:
 
+- All PR6b iOS fixtures still parse and map to the intended differ inputs.
 - Motion/battery/now-playing/time/plain-place-label produce zero wakes.
 - WiFi/BT anchor transition produces `perception_event`.
 - Repeated same anchor updates `last_seen` without waking.
@@ -411,6 +482,18 @@ Run this for every PR.
 - Is pHash mechanical dedupe separate from any VLM captioning?
 - Is any model deciding "worth attention"? If yes, reject.
 
+### iOS Contract
+
+- Is `../feedling-mcp-ios` synced before perception ingress work starts?
+- Are backend fixtures based on actual Swift producers, not hand-written
+  guesses?
+- Do fixture tests cover encrypted envelope and plaintext operation-signal
+  shapes separately?
+- Are unsupported iOS capabilities, especially HealthKit, represented as
+  explicit unavailable states?
+- Has the PR avoided claiming iOS/backend integration unless fixture tests and
+  a human-verified manual report path have both been checked?
+
 ### Gate Semantics
 
 - Ambient, Scheduled, and Delivery must remain separate.
@@ -498,3 +581,10 @@ The branch currently has:
 
 These are contract skeletons. Production routes still use old execution paths
 until the PR sequence above cuts them over.
+
+The sibling iOS repo `../feedling-mcp-ios` was synced on 2026-06-19 to
+`main`/`origin/main` at `23d1eba` (`Merge pull request #10 from
+teleport-computer/encrypt`). The latest iOS changes materially affect the
+perception contract: local geofence/SSID labeling, encrypted sensitive signal
+upload, tighter cancellation/calendar access, and the perception permissions
+view. Treat that repo as an active contract source before PR7.
