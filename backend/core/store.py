@@ -34,6 +34,10 @@ DEVICE_EVENT_RETENTION_DAYS = int(os.environ.get("FEEDLING_DEVICE_EVENT_RETENTIO
 TRACK_EVENT_RETENTION_DAYS = int(os.environ.get("FEEDLING_TRACK_EVENT_RETENTION_DAYS", 90))
 TRACK_EVENT_MAX = int(os.environ.get("FEEDLING_TRACK_EVENT_MAX", 2000))
 PROACTIVE_JOB_MAX = int(os.environ.get("FEEDLING_PROACTIVE_JOB_MAX", 500))
+# Proactive gate audit trails: one append per gate evaluation (high frequency,
+# background-paced). Kept above the dashboard read caps so debug views stay full.
+GATE_DECISION_MAX = int(os.environ.get("FEEDLING_GATE_DECISION_MAX", 2000))
+GATE_REVIEW_MAX = int(os.environ.get("FEEDLING_GATE_REVIEW_MAX", 1000))
 PROACTIVE_USER_STATES = {"default", "focused", "social", "resting", "away"}
 PROACTIVE_AI_STATES = {"present", "watching", "thinking", "curious", "waiting"}
 PROACTIVE_BROADCAST_STATES = {"unknown", "on", "off", "paused"}
@@ -573,6 +577,7 @@ class UserStore:
 
     def append_gate_decision(self, decision: dict) -> dict:
         db.log_append(self.user_id, "gate_decisions", decision, ts=self._entry_epoch(decision))
+        db.log_trim(self.user_id, "gate_decisions", GATE_DECISION_MAX)
         return decision
 
     def list_gate_decisions(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
@@ -580,6 +585,7 @@ class UserStore:
 
     def append_gate_review(self, review: dict) -> dict:
         db.log_append(self.user_id, "gate_reviews", review, ts=self._entry_epoch(review))
+        db.log_trim(self.user_id, "gate_reviews", GATE_REVIEW_MAX)
         return review
 
     def list_gate_reviews(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:

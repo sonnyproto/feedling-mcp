@@ -20,6 +20,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import app as appmod  # noqa: E402  (wires flask_app + hooks)
 import db  # noqa: E402
+from accounts import registry  # noqa: E402
 from core import store as core_store  # noqa: E402
 from hosted import wake_consumer  # noqa: E402
 
@@ -61,3 +62,16 @@ def test_cross_worker_consume_noop_without_key():
     # doesn't hold the key for — and must not load an uncached store.
     wake_consumer.try_consume_pending_for_user("usr_never_seen")
     assert "usr_never_seen" not in core_store._stores
+
+
+def test_tick_does_not_eager_load_registry_users(monkeypatch):
+    # Backlog #14 regression: the tick must NOT walk registry._users and
+    # get_store() each one — that eager-loaded every user's UserStore every 60s.
+    # registry has a user, but this worker holds no key / has nothing cached.
+    monkeypatch.setattr(
+        registry, "_users", [{"user_id": "usr_registry_only"}], raising=False
+    )
+    created = wake_consumer._run_hosted_tick_once()
+    assert created == 0
+    # The key assertion: an uncached registry user is never loaded by the tick.
+    assert "usr_registry_only" not in core_store._stores

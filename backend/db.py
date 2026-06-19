@@ -1117,21 +1117,33 @@ def log_patch_item(user_id: str, stream: str, item_key: str, patch: dict,
         return None
 
 
-def log_trim(user_id: str, stream: str, max_rows: int) -> None:
-    """Keep only the newest ``max_rows`` rows of a stream."""
+def log_trim(user_id: str, stream: str, max_rows: int,
+             only_statuses: "list[str] | None" = None) -> None:
+    """Keep only the newest ``max_rows`` rows of a stream.
+
+    When ``only_statuses`` is given, a row is eligible for deletion only if its
+    ``doc->>'status'`` is in that set — rows in any other status (e.g. an
+    in-flight ``queued``/``processing`` trace still awaiting its completion
+    patch) are kept regardless of age, so trim never drops a row a later
+    ``log_patch_item`` still expects to update. The newest-``max_rows`` cutoff is
+    computed over all rows; only the *deletion* is status-restricted."""
     if not max_rows or max_rows <= 0:
         return
     try:
+        sql = (
+            "DELETE FROM user_logs WHERE user_id = %s AND stream = %s AND seq < ("
+            "  SELECT MIN(seq) FROM ("
+            "    SELECT seq FROM user_logs WHERE user_id = %s AND stream = %s "
+            "    ORDER BY seq DESC LIMIT %s"
+            "  ) t"
+            ")"
+        )
+        params: list = [user_id, stream, user_id, stream, max_rows]
+        if only_statuses:
+            sql += " AND doc->>'status' = ANY(%s)"
+            params.append(list(only_statuses))
         with get_pool().connection() as conn:
-            conn.execute(
-                "DELETE FROM user_logs WHERE user_id = %s AND stream = %s AND seq < ("
-                "  SELECT MIN(seq) FROM ("
-                "    SELECT seq FROM user_logs WHERE user_id = %s AND stream = %s "
-                "    ORDER BY seq DESC LIMIT %s"
-                "  ) t"
-                ")",
-                (user_id, stream, user_id, stream, max_rows),
-            )
+            conn.execute(sql, params)
     except Exception as e:
         log.error("[db] log_trim(%s,%s) failed: %s", user_id, stream, e)
 

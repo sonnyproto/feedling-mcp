@@ -8,11 +8,12 @@ added by migration 0002; the wake/change audit trail uses user_logs.
 from __future__ import annotations
 
 import logging
+import os
 
 from psycopg.types.json import Jsonb
 
 from db import (
-    get_pool, log_append, log_read,
+    get_pool, log_append, log_read, log_trim,
     frame_upsert, frame_get, frame_delete,
 )
 
@@ -24,6 +25,10 @@ CONFIG = "perception_config"          # geofences / ssid_labels / focus_map / ..
 USER_STATE = "perception_user_state"  # {"manual": "default", "focus_override": None}
 
 EVENT_STREAM = "perception_events"
+# Wake/change audit trail: one append per perception evaluation (wake /
+# suppressed / debounced) — high frequency. Cap the stream so it can't grow
+# without bound; kept above the dashboard's event read cap.
+EVENT_MAX = int(os.environ.get("FEEDLING_PERCEPTION_EVENT_MAX", 2000))
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +332,7 @@ def latest_ts(user_id: str, kind: str) -> float | None:
 
 def append_event(user_id: str, event: dict, ts: float) -> None:
     log_append(user_id, EVENT_STREAM, event, ts=ts)
+    log_trim(user_id, EVENT_STREAM, EVENT_MAX)
 
 
 def read_events(user_id: str, limit: int = 50) -> list[dict]:
@@ -335,10 +341,12 @@ def read_events(user_id: str, limit: int = 50) -> list[dict]:
 
 # App-usage time series (one append per app-open from the iOS Shortcut endpoint).
 APP_USAGE_STREAM = "app_usage"
+APP_USAGE_MAX = int(os.environ.get("FEEDLING_APP_USAGE_MAX", 2000))
 
 
 def append_app_open(user_id: str, doc: dict, ts: float) -> None:
     log_append(user_id, APP_USAGE_STREAM, doc, ts=ts)
+    log_trim(user_id, APP_USAGE_STREAM, APP_USAGE_MAX)
 
 
 def read_app_opens(user_id: str, limit: int = 100, since_epoch: float = 0.0) -> list[dict]:

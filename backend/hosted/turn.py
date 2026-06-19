@@ -86,6 +86,9 @@ MODEL_API_WEB_SEARCH_MAX_RESULTS = max(1, min(8, int(os.environ.get("FEEDLING_MO
 MODEL_API_WEB_SEARCH_TIMEOUT_SEC = max(2.0, min(20.0, float(os.environ.get("FEEDLING_MODEL_API_WEB_SEARCH_TIMEOUT_SEC", "8"))))
 MODEL_API_PROVIDER_REASONING_ENABLED = os.environ.get("FEEDLING_MODEL_API_PROVIDER_REASONING_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
 MODEL_API_PROVIDER_REASONING_MAX_CHARS = chat_service.MODEL_API_PROVIDER_REASONING_MAX_CHARS
+# State receipts: one append per chat turn. Read views cap at 100; keep a
+# generous tail so the stream can't grow without bound across a user's history.
+STATE_RECEIPT_MAX = int(os.environ.get("FEEDLING_STATE_RECEIPT_MAX", 1000))
 _sanitize_visible_thinking_summary = chat_service._sanitize_visible_thinking_summary
 _sanitize_provider_reasoning_text = chat_service._sanitize_provider_reasoning_text
 
@@ -175,6 +178,7 @@ def _append_state_receipt(store: UserStore, receipt: dict) -> dict:
         if key in receipt:
             record[key] = receipt[key]
     db.log_append(store.user_id, "state_receipts", record, ts=record["ts"], item_key=record["id"])
+    db.log_trim(store.user_id, "state_receipts", STATE_RECEIPT_MAX)
     return record
 
 

@@ -96,6 +96,13 @@ MODEL_API_RUNTIME_BLOB = "model_api_runtime"
 MODEL_API_RUNTIME_VERSION = 2
 MODEL_API_RUNTIME_MODE = "hosted_resident"
 MODEL_API_ACTION_TRACE_STREAM = "model_api_action_traces"
+# One append per model-API action (then patched by trace_id on completion).
+# High frequency; cap the stream. A background trace is appended as ``queued``
+# and only later patched to a terminal status, so trim must only evict rows that
+# have already reached a terminal status — never an in-flight one, or the
+# completion patch would target a deleted row (returns None, losing the result).
+MODEL_API_ACTION_TRACE_MAX = int(os.environ.get("FEEDLING_MODEL_API_ACTION_TRACE_MAX", 1000))
+MODEL_API_ACTION_TRACE_TERMINAL_STATUSES = ["ok", "completed", "failed", "skipped"]
 
 
 def _load_model_api_runtime_profile(store: UserStore) -> dict | None:
@@ -188,6 +195,10 @@ def _append_model_api_action_trace(store: UserStore, entry: dict) -> dict:
         record,
         ts=record["ts"],
         item_key=record["trace_id"],
+    )
+    db.log_trim(
+        store.user_id, MODEL_API_ACTION_TRACE_STREAM, MODEL_API_ACTION_TRACE_MAX,
+        only_statuses=MODEL_API_ACTION_TRACE_TERMINAL_STATUSES,
     )
     patch = {
         "last_action_trace_id": record["trace_id"],
