@@ -278,7 +278,7 @@ def test_turn_runner_single_flight_blocks_until_turn_lease_released():
     runner = TurnRunnerV2(
         spine,
         turn_leases=leases,
-        run_agent=lambda context: calls.append(context.trigger) or TurnOutcomeV2(actions=({"type": "sleep"},)),
+        run_agent=lambda context: calls.append(context["trigger"]) or TurnOutcomeV2(actions=({"type": "sleep"},)),
     )
 
     busy = runner.run_ready_turn("u1", now=20.1, owner_id="worker-b")

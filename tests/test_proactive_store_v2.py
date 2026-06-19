@@ -180,6 +180,36 @@ def test_db_turn_store_recovers_stale_running_turn_without_old_owner_completion(
     assert [turn["status"] for turn in turns] == [TURN_STALE_RECOVERED, TURN_COMPLETED]
 
 
+def test_db_turn_store_records_actions_as_v2_action_stream():
+    uid = _uid()
+    leases = DBTurnLeaseRegistryV2()
+    turn_store = DBTurnStoreV2()
+    context = merge_wakes_v2([
+        WakeEventV2(user_id=uid, source="perception_event", trigger="arrived_at_anchor", created_at=400.0)
+    ])
+
+    lease = leases.try_acquire_user(uid, owner_id="worker-a", now=400.0, ttl_sec=30.0)
+    assert lease is not None
+    turn = turn_store.start_turn(uid, context, lease, now=400.0, turn_id="turn_actions")
+    assert turn is not None
+
+    records = turn_store.record_actions(
+        uid,
+        turn.turn_id,
+        (
+            {"type": "send_message", "text": "hello"},
+            {"type": "schedule_wake", "at": "2026-06-20T09:00:00+08:00", "tz": "Asia/Shanghai"},
+        ),
+        now=400.1,
+    )
+    listed = turn_store.list_actions(uid, turn_id=turn.turn_id)
+
+    assert [record.action_type for record in records] == ["send_message", "schedule_wake"]
+    assert [record.action_type for record in listed] == ["send_message", "schedule_wake"]
+    assert listed[0].doc["turn_id"] == turn.turn_id
+    assert listed[0].doc["action"]["text"] == "hello"
+
+
 def test_db_settings_store_uses_v2_shape_with_legacy_fallback():
     uid = _uid()
     settings_store = DBProactiveSettingsStoreV2()

@@ -274,6 +274,10 @@ Acceptance tests:
 - Old hosted wake prompt/action parser is not used for V2 execution (flag on).
 - Existing hosted smoke tests stay green.
 - Old `proactive_jobs` receives only projection fields needed by old dashboard.
+- Live V2 agent context includes the user's timezone or local-rendered time from
+  settings so the hosted cutover cannot ship UTC-blind local-hour reasoning.
+- Visible delivery emits from `outcome.messages` only; `send_message` action
+  records are audit/reconstruction records and must never be re-delivered.
 
 Cutover evidence:
 

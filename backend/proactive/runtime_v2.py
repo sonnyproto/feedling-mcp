@@ -12,8 +12,15 @@ import logging
 import threading
 import time
 import uuid
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
+from proactive.agent_protocol_v2 import (
+    actions_for_persistence_v2,
+    build_agent_context_v2,
+    manual_contract_violation_v2,
+    parse_agent_response_v2,
+    turn_outcome_from_agent_response_v2,
+)
 from proactive.controls_v2 import (
     ProactiveSettingsV2,
     WakeControlDecisionV2,
@@ -381,8 +388,11 @@ class TurnOutcomeV2:
 class TurnRunResultV2:
     status: str
     context: MergedWakeContextV2 | None = None
+    agent_context: Mapping[str, Any] = field(default_factory=dict)
     outcome: TurnOutcomeV2 | None = None
     turn_lease: LeaseV2 | None = None
+    turn_id: str = ""
+    contract_violation: str = ""
     background_job_id: str = ""
     background_lease: LeaseV2 | None = None
 
@@ -434,7 +444,7 @@ class RuntimeSpineV2:
         return merge_wakes_v2(wakes, tool_catalog=self.tool_catalog)
 
 
-def _sleep_outcome_v2(_context: MergedWakeContextV2) -> TurnOutcomeV2:
+def _sleep_outcome_v2(_context: Mapping[str, Any]) -> TurnOutcomeV2:
     return TurnOutcomeV2(actions=({"type": "sleep"},))
 
 
@@ -451,7 +461,9 @@ class TurnRunnerV2:
         self,
         spine: RuntimeSpineV2,
         *,
-        run_agent: Callable[[MergedWakeContextV2], TurnOutcomeV2] | None = None,
+        run_agent: Callable[[Mapping[str, Any]], Any] | None = None,
+        recent_chat_provider: Callable[[str], Sequence[Mapping[str, Any]]] | None = None,
+        turn_store: Any | None = None,
         turn_leases: TurnLeaseRegistryV2 | None = None,
         background_leases: BackgroundLeaseRegistryV2 | None = None,
         turn_lease_ttl_sec: float = 120.0,
@@ -460,11 +472,56 @@ class TurnRunnerV2:
     ) -> None:
         self.spine = spine
         self.run_agent = run_agent or _sleep_outcome_v2
+        self.recent_chat_provider = recent_chat_provider
+        self.turn_store = turn_store
         self.turn_leases = turn_leases or TurnLeaseRegistryV2()
         self.background_leases = background_leases or BackgroundLeaseRegistryV2()
         self.turn_lease_ttl_sec = float(turn_lease_ttl_sec)
         self.background_lease_ttl_sec = float(background_lease_ttl_sec)
         self.owner_id = owner_id
+
+    def _recent_chat(self, user_id: str) -> Sequence[Mapping[str, Any]]:
+        if self.recent_chat_provider is None:
+            return ()
+        try:
+            return tuple(self.recent_chat_provider(user_id) or ())
+        except Exception as e:
+            log.error("recent_chat_provider_v2(%s) failed: %s", user_id, e)
+            return ()
+
+    def _start_turn_record(
+        self,
+        user_id: str,
+        context: MergedWakeContextV2,
+        turn_lease: LeaseV2,
+        *,
+        now: float,
+    ) -> str:
+        if self.turn_store is None or not hasattr(self.turn_store, "start_turn"):
+            return ""
+        record = self.turn_store.start_turn(user_id, context, turn_lease, now=now)
+        return str(getattr(record, "turn_id", "") or "")
+
+    def _record_actions(self, user_id: str, turn_id: str, outcome: TurnOutcomeV2, *, now: float) -> None:
+        if not turn_id or self.turn_store is None or not hasattr(self.turn_store, "record_actions"):
+            return
+        actions = actions_for_persistence_v2(outcome)
+        if not actions:
+            return
+        self.turn_store.record_actions(user_id, turn_id, actions, now=now)
+
+    def _complete_turn_record(
+        self,
+        user_id: str,
+        turn_id: str,
+        turn_lease: LeaseV2,
+        outcome: TurnOutcomeV2,
+        *,
+        now: float,
+    ) -> None:
+        if not turn_id or self.turn_store is None or not hasattr(self.turn_store, "complete_turn"):
+            return
+        self.turn_store.complete_turn(user_id, turn_id, turn_lease, outcome=outcome, now=now)
 
     def run_ready_turn(
         self,
@@ -487,7 +544,36 @@ class TurnRunnerV2:
             context = self.spine.drain_context(user_id, now=now)
             if context is None:
                 return TurnRunResultV2(status="idle", turn_lease=turn_lease)
-            outcome = self.run_agent(context)
+            agent_context = build_agent_context_v2(
+                context,
+                recent_chat=self._recent_chat(user_id),
+            )
+            turn_id = self._start_turn_record(user_id, context, turn_lease, now=now)
+            if self.turn_store is not None and not turn_id:
+                return TurnRunResultV2(
+                    status="turn_record_unavailable",
+                    context=context,
+                    agent_context=agent_context,
+                    turn_lease=turn_lease,
+                )
+            raw_outcome = self.run_agent(agent_context)
+            outcome = turn_outcome_from_agent_response_v2(
+                TurnOutcomeV2,
+                parse_agent_response_v2(raw_outcome),
+            )
+            self._record_actions(user_id, turn_id, outcome, now=now)
+            contract_violation = manual_contract_violation_v2(context, outcome)
+            self._complete_turn_record(user_id, turn_id, turn_lease, outcome, now=now)
+            if contract_violation:
+                return TurnRunResultV2(
+                    status=contract_violation,
+                    context=context,
+                    agent_context=agent_context,
+                    outcome=outcome,
+                    turn_lease=turn_lease,
+                    turn_id=turn_id,
+                    contract_violation=contract_violation,
+                )
             if outcome.needs_background:
                 background_job_id = "bg_" + uuid.uuid4().hex[:16]
                 background_lease = self.background_leases.try_acquire_job(
@@ -500,16 +586,20 @@ class TurnRunnerV2:
                 return TurnRunResultV2(
                     status="background_queued",
                     context=context,
+                    agent_context=agent_context,
                     outcome=outcome,
                     turn_lease=turn_lease,
+                    turn_id=turn_id,
                     background_job_id=background_job_id,
                     background_lease=background_lease,
                 )
             return TurnRunResultV2(
                 status="completed",
                 context=context,
+                agent_context=agent_context,
                 outcome=outcome,
                 turn_lease=turn_lease,
+                turn_id=turn_id,
             )
         finally:
             self.turn_leases.release(turn_lease)

@@ -33,6 +33,7 @@ from proactive.runtime_v2 import (
 
 WAKE_STREAM_V2 = "proactive_wakes_v2"
 TURN_STREAM_V2 = "proactive_turns_v2"
+TURN_ACTION_STREAM_V2 = "proactive_turn_actions_v2"
 LEASE_KIND_PREFIX_V2 = "proactive_v2_lease:"
 LEGACY_PROACTIVE_SETTINGS_KIND = "proactive_settings"
 
@@ -400,6 +401,14 @@ class TurnRecordV2:
     doc: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class TurnActionRecordV2:
+    action_id: str
+    turn_id: str
+    action_type: str
+    doc: Mapping[str, Any]
+
+
 class DBTurnStoreV2:
     def start_turn(
         self,
@@ -472,6 +481,46 @@ class DBTurnStoreV2:
         )
         return self._record_from_doc(doc) if doc else None
 
+    def record_actions(
+        self,
+        user_id: str,
+        turn_id: str,
+        actions: tuple[Mapping[str, Any], ...] | list[Mapping[str, Any]],
+        *,
+        now: float | None = None,
+    ) -> list[TurnActionRecordV2]:
+        now = _now(now)
+        records: list[TurnActionRecordV2] = []
+        if not turn_id:
+            return records
+        for idx, action in enumerate(actions):
+            if not isinstance(action, Mapping):
+                continue
+            action_type = str(action.get("type") or "")
+            if not action_type:
+                continue
+            action_id = str(action.get("action_id") or f"act_{uuid.uuid4().hex[:16]}")
+            doc = {
+                "kind": "turn_action_v2",
+                "turn_id": turn_id,
+                "user_id": user_id,
+                "action_id": action_id,
+                "action_index": idx,
+                "action_type": action_type,
+                "status": "recorded",
+                "created_at": now,
+                "action": dict(action),
+            }
+            db.log_append(
+                user_id,
+                TURN_ACTION_STREAM_V2,
+                doc,
+                ts=now,
+                item_key=f"{turn_id}:{idx}:{action_id}",
+            )
+            records.append(self._action_record_from_doc(doc))
+        return records
+
     def recover_stale_running(
         self,
         user_id: str,
@@ -507,6 +556,12 @@ class DBTurnStoreV2:
     def list_turns(self, user_id: str) -> list[TurnRecordV2]:
         return [self._record_from_doc(doc) for doc in db.log_read_all(user_id, TURN_STREAM_V2)]
 
+    def list_actions(self, user_id: str, *, turn_id: str = "") -> list[TurnActionRecordV2]:
+        records = [self._action_record_from_doc(doc) for doc in db.log_read_all(user_id, TURN_ACTION_STREAM_V2)]
+        if turn_id:
+            records = [record for record in records if record.turn_id == turn_id]
+        return records
+
     @staticmethod
     def _record_from_doc(doc: Mapping[str, Any]) -> TurnRecordV2:
         return TurnRecordV2(
@@ -514,5 +569,14 @@ class DBTurnStoreV2:
             status=str(doc.get("status") or ""),
             lease_id=str(doc.get("lease_id") or ""),
             wake_ids=tuple(str(item) for item in (doc.get("wake_ids") or ())),
+            doc=dict(doc),
+        )
+
+    @staticmethod
+    def _action_record_from_doc(doc: Mapping[str, Any]) -> TurnActionRecordV2:
+        return TurnActionRecordV2(
+            action_id=str(doc.get("action_id") or ""),
+            turn_id=str(doc.get("turn_id") or ""),
+            action_type=str(doc.get("action_type") or ""),
             doc=dict(doc),
         )
