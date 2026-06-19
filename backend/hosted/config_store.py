@@ -147,6 +147,7 @@ def _ensure_model_api_runtime_profile(
         "last_recap_at": None,
         "last_action_trace_id": None,
         "memory_quality_warning": None,
+        "hosted_wake_runtime_v2_enabled": False,
         "provider": str(config.get("provider") or ""),
         "model": str(config.get("model") or ""),
     }

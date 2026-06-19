@@ -170,6 +170,20 @@ def test_runtime_settings_resolver_failure_falls_back_to_default_switches():
     }
 
 
+def test_runtime_submit_carries_settings_timezone_into_merged_context():
+    spine = RuntimeSpineV2(
+        settings_resolver=lambda _user_id: {"timezone": "Asia/Tokyo"},
+        merge_window_sec=0.0,
+    )
+
+    spine.submit(WakeEventV2(user_id="u1", source="heartbeat", trigger="heartbeat", created_at=1.0))
+    ctx = spine.drain_context("u1", now=1.0)
+
+    assert ctx is not None
+    assert ctx.timezone == "Asia/Tokyo"
+    assert ctx.as_turn_context()["timezone"] == "Asia/Tokyo"
+
+
 def test_scheduled_off_blocks_timer_execution_without_silent_loss():
     settings = resolve_settings_v2({"switches": {"scheduled": False}})
     wake_decision = evaluate_wake_control_v2("scheduled_wake", settings=settings)

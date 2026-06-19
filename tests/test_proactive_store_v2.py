@@ -84,7 +84,11 @@ def test_db_background_lease_is_independent_and_reclaimable():
 def test_db_wake_inbox_round_trips_and_merges_persisted_wakes():
     uid = _uid()
     inbox = DBWakeInboxV2()
-    spine = RuntimeSpineV2(inbox=inbox, merge_window_sec=2.0)
+    spine = RuntimeSpineV2(
+        inbox=inbox,
+        settings_resolver=lambda _user_id: {"timezone": "Asia/Tokyo"},
+        merge_window_sec=2.0,
+    )
 
     spine.submit(WakeEventV2(user_id=uid, source="heartbeat", trigger="heartbeat", created_at=100.0))
     spine.submit(WakeEventV2(user_id=uid, source="heartbeat", trigger="heartbeat", created_at=100.3))
@@ -106,6 +110,7 @@ def test_db_wake_inbox_round_trips_and_merges_persisted_wakes():
     assert ctx.merged_triggers == ("heartbeat",)
     assert len(ctx.wake_ids) == 2
     assert "anchor: cafe" in ctx.change_digest
+    assert ctx.timezone == "Asia/Tokyo"
     assert inbox.pending_events(uid) == []
 
 

@@ -64,6 +64,7 @@ class WakeEventV2:
     change_digest: str = ""
     presence_hints: Mapping[str, Any] = field(default_factory=dict)
     switches: Mapping[str, bool] = field(default_factory=dict)
+    timezone: str = ""
     scheduled_note: str = ""
     origin_refs: tuple[str, ...] = ()
     background_payload: Mapping[str, Any] = field(default_factory=dict)
@@ -92,6 +93,7 @@ class MergedWakeContextV2:
     change_digest: str
     presence_hints: Mapping[str, Any]
     switches: Mapping[str, bool]
+    timezone: str = ""
     scheduled_note: str = ""
     origin_refs: tuple[str, ...] = ()
     background_payloads: tuple[Mapping[str, Any], ...] = ()
@@ -107,6 +109,7 @@ class MergedWakeContextV2:
             "change_digest": self.change_digest,
             "presence_hints": dict(self.presence_hints or {}),
             "switches": dict(self.switches or {}),
+            "timezone": self.timezone,
             "scheduled_note": self.scheduled_note,
             "origin_refs": list(self.origin_refs),
             "background_payloads": [dict(item) for item in self.background_payloads],
@@ -163,6 +166,7 @@ def merge_wakes_v2(
     )
     presence: dict[str, Any] = {}
     switches: dict[str, bool] = default_switches_v2()
+    timezone = ""
     digest_parts: list[str] = []
     origin_refs: list[str] = []
     background_payloads: list[Mapping[str, Any]] = []
@@ -171,6 +175,8 @@ def merge_wakes_v2(
     for event in unique:
         presence.update(dict(event.presence_hints or {}))
         switches.update(dict(event.switches or {}))
+        if event.timezone and not timezone:
+            timezone = event.timezone
         if event.change_digest:
             digest_parts.append(event.change_digest)
         if event.scheduled_note and not scheduled_note:
@@ -193,6 +199,7 @@ def merge_wakes_v2(
         change_digest="; ".join(digest_parts),
         presence_hints=presence,
         switches=switches,
+        timezone=timezone,
         scheduled_note=scheduled_note,
         origin_refs=tuple(origin_refs),
         background_payloads=tuple(background_payloads),
@@ -430,7 +437,7 @@ class RuntimeSpineV2:
         decision = evaluate_wake_control_v2(event.source, manual=event.manual, settings=settings)
         if not decision.accepted:
             return decision
-        self.inbox.push(replace(event, switches=decision.switches))
+        self.inbox.push(replace(event, switches=decision.switches, timezone=decision.settings.timezone))
         return decision
 
     def drain_context(self, user_id: str, *, now: float | None = None) -> MergedWakeContextV2 | None:

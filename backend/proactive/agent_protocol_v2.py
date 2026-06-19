@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import json
 import re
 from typing import Any, Mapping, Sequence
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 MAX_MESSAGE_CHARS_V2 = 4000
 MAX_ACTION_NOTE_CHARS_V2 = 1000
@@ -209,6 +210,20 @@ def _iso_time(ts: Any) -> str:
     return datetime.fromtimestamp(value, tz=timezone.utc).isoformat()
 
 
+def _local_iso_time(ts: Any, tz_name: Any) -> tuple[str, str]:
+    tz = str(tz_name or "").strip() or "UTC"
+    try:
+        zone = ZoneInfo(tz)
+    except ZoneInfoNotFoundError:
+        tz = "UTC"
+        zone = timezone.utc
+    try:
+        value = float(ts)
+    except (TypeError, ValueError):
+        value = 0.0
+    return datetime.fromtimestamp(value, tz=zone).isoformat(), tz
+
+
 def build_agent_context_v2(
     merged_context: Any,
     *,
@@ -222,12 +237,18 @@ def build_agent_context_v2(
     """
     trigger = str(getattr(merged_context, "trigger", "") or "")
     user_led = trigger == "user_message"
+    local_time, timezone_name = _local_iso_time(
+        getattr(merged_context, "created_at", 0.0),
+        getattr(merged_context, "timezone", ""),
+    )
     context: dict[str, Any] = {
         "trigger": trigger,
         "merged_triggers": list(getattr(merged_context, "merged_triggers", ()) or ()),
         "latency_sensitive": bool(getattr(merged_context, "latency_sensitive", False)),
         "manual": bool(getattr(merged_context, "manual", False)),
         "time": _iso_time(getattr(merged_context, "created_at", 0.0)),
+        "local_time": local_time,
+        "timezone": timezone_name,
         "created_at": float(getattr(merged_context, "created_at", 0.0) or 0.0),
         "switches": dict(getattr(merged_context, "switches", {}) or {}),
         "wake_ids": list(getattr(merged_context, "wake_ids", ()) or ()),
@@ -258,11 +279,7 @@ def build_agent_context_v2(
 
 
 def visible_message_count_v2(outcome: Any) -> int:
-    count = len(tuple(getattr(outcome, "messages", ()) or ()))
-    for action in tuple(getattr(outcome, "actions", ()) or ()):
-        if isinstance(action, Mapping) and action.get("type") == "send_message" and action.get("text"):
-            count += 1
-    return count
+    return len(tuple(getattr(outcome, "messages", ()) or ()))
 
 
 def manual_contract_violation_v2(merged_context: Any, outcome: Any) -> str:

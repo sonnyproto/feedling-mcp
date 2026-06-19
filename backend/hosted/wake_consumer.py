@@ -13,7 +13,7 @@ import time
 import uuid
 from collections import defaultdict
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, Mapping
 
 import httpx
 from flask import Blueprint, Response, jsonify, request, g
@@ -61,7 +61,19 @@ from content_encryption import build_envelope
 from accounts import onboarding as accounts_onboarding
 from accounts import registry
 from core import store as core_store
+from core import enclave as core_enclave
 from proactive import gate as proactive_gate
+from proactive.adapters_v2 import wake_event_v2_from_legacy_job
+from proactive.agent_protocol_v2 import actions_for_persistence_v2
+from proactive.controls_v2 import evaluate_delivery_v2, resolve_settings_v2
+from proactive.runtime_v2 import RuntimeSpineV2, TurnOutcomeV2, TurnRunnerV2
+from proactive.store_v2 import (
+    DBBackgroundJobStoreV2,
+    DBProactiveSettingsStoreV2,
+    DBTurnLeaseRegistryV2,
+    DBTurnStoreV2,
+    DBWakeInboxV2,
+)
 from push import service as push_service
 import provider_client
 from hosted import config_store as hosted_config_store
@@ -74,6 +86,8 @@ from hosted import turn as hosted_turn
 flask_app = None
 
 HOSTED_WAKE_CONSUMER_ID = "hosted_runtime"
+HOSTED_WAKE_CONSUMER_ID_V2 = "hosted_runtime_v2"
+HOSTED_WAKE_RUNTIME_V2_FLAG = "hosted_wake_runtime_v2_enabled"
 # Thinking/reasoning models share this budget between reasoning and output
 # tokens (same note as the chat path) — too small and the visible reply gets
 # truncated into an unparseable_wake_reply failure.
@@ -186,7 +200,25 @@ def _run_model_api_wake_job(store: UserStore, api_key: str, job: dict) -> None:
         _hosted_wake_slot_release(store.user_id)
 
 
+def _hosted_wake_runtime_v2_enabled(store: UserStore) -> bool:
+    try:
+        config = hosted_config_store._load_model_api_config(store) or {}
+        profile = hosted_config_store._ensure_model_api_runtime_profile(store, config) or {}
+        if HOSTED_WAKE_RUNTIME_V2_FLAG in profile:
+            return bool(profile.get(HOSTED_WAKE_RUNTIME_V2_FLAG))
+        return bool(config.get(HOSTED_WAKE_RUNTIME_V2_FLAG))
+    except Exception as e:
+        print(f"[hosted-wake:{store.user_id}] v2 flag load failed, using legacy executor: {e}")
+        return False
+
+
 def _run_model_api_wake_job_inner(store: UserStore, api_key: str, job: dict) -> None:
+    if _hosted_wake_runtime_v2_enabled(store):
+        return _run_model_api_wake_job_inner_v2(store, api_key, job)
+    return _run_model_api_wake_job_inner_legacy(store, api_key, job)
+
+
+def _run_model_api_wake_job_inner_legacy(store: UserStore, api_key: str, job: dict) -> None:
     """Realize one V2 wake job through the user's own hosted model.
 
     Claim is atomic (only_if_status=pending) so a duplicate consumer or a
@@ -327,6 +359,271 @@ def _run_model_api_wake_job_inner(store: UserStore, api_key: str, job: dict) -> 
         store.update_proactive_job(job_id, {
             "status": "failed",
             "status_reason": f"wake_runner_error:{type(e).__name__}:{str(e)[:200]}",
+        })
+
+
+def _hosted_v2_settings(store: UserStore):
+    try:
+        return DBProactiveSettingsStoreV2().load(store.user_id)
+    except Exception:
+        return resolve_settings_v2(store.load_proactive_settings())
+
+
+def _hosted_v2_recent_chat_provider(store: UserStore, api_key: str | None):
+    def _provider(_user_id: str):
+        try:
+            hist, _hist_err = core_enclave._enclave_get_json_for_gate(
+                "/v1/chat/history",
+                api_key,
+                {"limit": "20", "context_mode": "model_api", "context_trace": "0"},
+            )
+        except Exception:
+            return ()
+        if not isinstance(hist, dict) or not isinstance(hist.get("messages"), list):
+            return ()
+        out: list[dict[str, Any]] = []
+        for item in hist.get("messages", [])[-20:]:
+            if not isinstance(item, dict):
+                continue
+            text = str(
+                item.get("content")
+                or item.get("text")
+                or item.get("message")
+                or ""
+            ).strip()
+            if not text:
+                continue
+            out.append({
+                "role": str(item.get("role") or item.get("sender") or "")[:40],
+                "text": text[:4000],
+                "created_at": str(item.get("created_at") or item.get("ts") or "")[:80],
+            })
+        return tuple(out)
+
+    return _provider
+
+
+def _hosted_wake_v2_provider_messages(agent_context: Mapping[str, Any]) -> list[dict[str, str]]:
+    payload = json.dumps(dict(agent_context), ensure_ascii=False, sort_keys=True, default=str)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You are running Feedling's Proactive/Perception Runtime V2 for the user's hosted IO companion. "
+                "Use the provided V2 turn context, tools catalog, switches, local_time/timezone, recent_chat, "
+                "change_digest, and background_payloads to decide what the companion should do now. "
+                "Return JSON only with this shape: {\"messages\":[\"...\"],\"actions\":[...],\"needs_background\":false,"
+                "\"background_request\":{}}. Prefer visible chat text in top-level messages. "
+                "If you emit send_message actions, this runtime normalizes their text into messages and dedupes same text, "
+                "so do not repeat the same visible text in both places. "
+                "If manual=true, include at least one visible message. If nothing should be said, return a sleep action."
+            ),
+        },
+        {
+            "role": "user",
+            "content": "V2 turn context JSON:\n" + payload,
+        },
+    ]
+
+
+def _hosted_wake_v2_run_agent(runtime):
+    def _run(agent_context: Mapping[str, Any]) -> str:
+        result = provider_client.chat_completion(
+            runtime,
+            _hosted_wake_v2_provider_messages(agent_context),
+            max_tokens=HOSTED_WAKE_MAX_TOKENS,
+            temperature=0.7,
+            timeout=90.0,
+            include_reasoning=hosted_turn.MODEL_API_PROVIDER_REASONING_ENABLED,
+        )
+        return str(result.get("reply") or "")
+
+    return _run
+
+
+def _hosted_wake_v2_runtime(store: UserStore, runtime, api_key: str | None) -> tuple[RuntimeSpineV2, TurnRunnerV2]:
+    settings_store = DBProactiveSettingsStoreV2()
+    spine = RuntimeSpineV2(
+        inbox=DBWakeInboxV2(),
+        settings_resolver=settings_store.load,
+        merge_window_sec=0.0,
+    )
+    runner = TurnRunnerV2(
+        spine,
+        run_agent=_hosted_wake_v2_run_agent(runtime),
+        recent_chat_provider=_hosted_v2_recent_chat_provider(store, api_key),
+        turn_store=DBTurnStoreV2(),
+        background_jobs=DBBackgroundJobStoreV2(),
+        turn_leases=DBTurnLeaseRegistryV2(),
+        owner_id=HOSTED_WAKE_CONSUMER_ID_V2,
+    )
+    return spine, runner
+
+
+def _hosted_wake_v2_deliver_messages(
+    store: UserStore,
+    *,
+    job_id: str,
+    result,
+) -> tuple[list[str], list[dict[str, Any]]]:
+    outcome = result.outcome
+    if outcome is None:
+        return [], []
+    settings = _hosted_v2_settings(store)
+    context = result.context
+    source = str(getattr(context, "trigger", "") or "")
+    if source == "user_message":
+        source = "user_message"
+    delivery = evaluate_delivery_v2(
+        settings,
+        source=source,
+        manual=bool(getattr(context, "manual", False)),
+    )
+    sent_message_ids: list[str] = []
+    attempts: list[dict[str, Any]] = []
+    for text in tuple(getattr(outcome, "messages", ()) or ()):
+        body = str(text or "").strip()
+        if not body:
+            continue
+        env, env_err = core_envelope._build_shared_envelope_for_store(store, body.encode("utf-8"))
+        if env is None:
+            attempts.append({"type": "message", "status": f"envelope_failed:{str(env_err)[:120]}"})
+            continue
+        row = store.append_chat(
+            "openclaw",
+            "model_api",
+            env,
+            extra={"proactive_job_id": job_id, "model_api_kind": "proactive_v2"},
+        )
+        store.notify_chat_waiters()
+        if delivery.allow_visible_delivery:
+            delivery_fields = push_service._deliver_ai_message_push_if_background(
+                store,
+                body=body,
+                title="IO",
+                data={"source": "model_api_proactive_v2"},
+                visual_state="reply",
+            )
+        else:
+            delivery_fields = {
+                "push_decision": "suppressed",
+                "push_reason": delivery.reason,
+                "alert_status": "suppressed",
+                "alert_reason": delivery.reason,
+            }
+        store.update_chat_message_metadata(row["id"], delivery_fields)
+        sent_message_ids.append(row["id"])
+        attempts.append({
+            "type": "message",
+            "status": "posted",
+            "chat_message_id": row["id"],
+            "visible_delivery": bool(delivery.allow_visible_delivery),
+            "delivery_reason": delivery.reason,
+        })
+    return sent_message_ids, attempts
+
+
+def _hosted_wake_v2_final_patch(result, sent_message_ids: list[str], delivery_attempts: list[dict[str, Any]]) -> dict:
+    outcome = result.outcome or TurnOutcomeV2()
+    actions = [dict(action) for action in actions_for_persistence_v2(outcome)]
+    if sent_message_ids:
+        wake_result = "message_sent"
+    elif result.status == "ignored_manual":
+        wake_result = "ignored_manual"
+    elif result.status == "background_queued":
+        wake_result = "background_queued"
+    elif any(action.get("type") == "schedule_wake" for action in actions):
+        wake_result = "scheduled"
+    else:
+        wake_result = "sleep"
+    agent_actions = actions[:10]
+    agent_actions.extend(delivery_attempts[: max(0, 10 - len(agent_actions))])
+    patch: dict[str, Any] = {
+        "status": "completed",
+        "wake_result": wake_result,
+        "agent_action": wake_result,
+        "agent_actions": agent_actions[:10],
+    }
+    if sent_message_ids:
+        patch["chat_message_id"] = sent_message_ids[0]
+        patch["posted_at"] = datetime.now().isoformat()
+    return patch
+
+
+def _run_model_api_wake_job_inner_v2(store: UserStore, api_key: str, job: dict) -> None:
+    job_id = str(job.get("job_id") or "")
+    if not job_id:
+        return
+    claimed = store.update_proactive_job(
+        job_id,
+        {"status": "claimed", "consumer_id": HOSTED_WAKE_CONSUMER_ID_V2},
+        only_if_status="pending",
+    )
+    if claimed is None:
+        return
+    try:
+        eligible, reason = _hosted_wake_base_eligible(store)
+        if not eligible:
+            store.update_proactive_job(job_id, {"status": "skipped", "status_reason": reason})
+            return
+        runtime = hosted_config_store._load_runtime_provider_config(store, api_key)
+        if isinstance(runtime, tuple):
+            _, err = runtime
+            store.update_proactive_job(job_id, {
+                "status": "failed",
+                "status_reason": str(err.get("error") or "runtime_load_failed")[:500],
+            })
+            return
+
+        settings = _hosted_v2_settings(store)
+        job_for_adapter = dict(job)
+        job_for_adapter.setdefault("timezone", settings.timezone)
+        event = wake_event_v2_from_legacy_job(store.user_id, job_for_adapter)
+        spine, runner = _hosted_wake_v2_runtime(store, runtime, api_key)
+        decision = spine.submit(event)
+        if not decision.accepted:
+            store.update_proactive_job(job_id, {
+                "status": "skipped",
+                "status_reason": decision.reason,
+                "wake_result": decision.reason,
+                "agent_action": decision.reason,
+            })
+            return
+        store.update_proactive_job(job_id, {"status": "realizing"})
+        result = runner.run_ready_turn(store.user_id, owner_id=HOSTED_WAKE_CONSUMER_ID_V2)
+        if result.status == "busy":
+            store.update_proactive_job(job_id, {"status": "pending", "status_reason": "v2_turn_busy"}, only_if_status="realizing")
+            return
+        if result.status == "idle":
+            store.update_proactive_job(job_id, {"status": "pending", "status_reason": "v2_inbox_waiting"}, only_if_status="realizing")
+            return
+        if result.status == "turn_record_unavailable":
+            store.update_proactive_job(job_id, {"status": "failed", "status_reason": "v2_turn_record_unavailable"})
+            return
+        if result.outcome is None:
+            store.update_proactive_job(job_id, {"status": "failed", "status_reason": f"v2_turn_{result.status}"})
+            return
+
+        sent_message_ids, delivery_attempts = _hosted_wake_v2_deliver_messages(store, job_id=job_id, result=result)
+        if result.outcome.messages and not sent_message_ids:
+            store.update_proactive_job(job_id, {
+                "status": "failed",
+                "status_reason": "message_envelope_failed",
+                "agent_action": "send_message_failed",
+                "agent_actions": delivery_attempts[:10],
+            })
+            return
+        store.update_proactive_job(job_id, _hosted_wake_v2_final_patch(result, sent_message_ids, delivery_attempts))
+        print(f"[hosted-wake-v2:{store.user_id}] job={job_id} result={result.status}")
+    except provider_client.ProviderError as e:
+        store.update_proactive_job(job_id, {
+            "status": "failed",
+            "status_reason": f"provider_chat_failed:{str(e)[:200]}",
+        })
+    except Exception as e:
+        store.update_proactive_job(job_id, {
+            "status": "failed",
+            "status_reason": f"wake_runner_v2_error:{type(e).__name__}:{str(e)[:200]}",
         })
 
 

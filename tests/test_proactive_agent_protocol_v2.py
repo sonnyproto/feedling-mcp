@@ -133,6 +133,31 @@ def test_manual_wake_returning_only_sleep_is_marked_ignored_manual():
     assert result.outcome.messages == ()
 
 
+def test_send_message_action_promotes_to_visible_message_and_satisfies_manual_contract():
+    spine = RuntimeSpineV2(merge_window_sec=0.0)
+    spine.submit(
+        WakeEventV2(
+            user_id="u1",
+            source="user_message",
+            trigger="user_message",
+            created_at=30.0,
+            latency_sensitive=True,
+            manual=True,
+        )
+    )
+    runner = TurnRunnerV2(
+        spine,
+        run_agent=lambda _context: {"actions": [{"type": "send_message", "text": "audit only"}]},
+    )
+
+    result = runner.run_ready_turn("u1", now=30.0)
+
+    assert result.status == "completed"
+    assert result.outcome is not None
+    assert result.outcome.messages == ("audit only",)
+    assert [action["type"] for action in result.outcome.actions] == ["send_message"]
+
+
 def test_plain_background_request_does_not_emit_foreground_chat_message():
     spine = RuntimeSpineV2(merge_window_sec=0.0)
     spine.submit(
@@ -222,6 +247,34 @@ def test_user_message_context_omits_perception_digest_and_hints():
     assert "tools" in context
     assert "time" in context
     assert "switches" in context
+    assert "timezone" in context
+    assert "local_time" in context
+
+
+def test_agent_context_uses_settings_timezone_for_local_time():
+    spine = RuntimeSpineV2(
+        settings_resolver=lambda _user_id: {"timezone": "America/New_York"},
+        merge_window_sec=0.0,
+    )
+    captured = []
+    spine.submit(
+        WakeEventV2(
+            user_id="u1",
+            source="perception_event",
+            trigger="arrived_at_anchor",
+            created_at=1_788_000_000.0,
+        )
+    )
+    runner = TurnRunnerV2(
+        spine,
+        run_agent=lambda context: captured.append(context) or {"actions": [{"type": "sleep"}]},
+    )
+
+    result = runner.run_ready_turn("u1", now=1_788_000_000.0)
+
+    assert result.status == "completed"
+    assert captured[0]["timezone"] == "America/New_York"
+    assert captured[0]["local_time"].endswith("-04:00")
 
 
 def test_agent_actions_are_persisted_as_v2_turn_action_records():
