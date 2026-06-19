@@ -402,9 +402,11 @@ def _access_log_end(response):
     clen = response.headers.get("Content-Length", "?")
     enc = response.headers.get("Content-Encoding", "-")
     # Keep the query string (limit/since/include_image_body — the useful bits)
-    # but REDACT the `key` param: _extract_api_key() accepts `?key=` as an auth
-    # method, so the URL can carry a live API key that must never reach the logs.
-    if request.args.get("key"):
+    # but REDACT the `key` param: _extract_api_key() accepts `?key=` as a legacy
+    # auth method, so the URL can carry a live API key that must never reach the
+    # logs. Match case-insensitively so a stray `?Key=`/`?KEY=` is redacted too,
+    # not dumped verbatim via the full_path fallback below.
+    if any(k.lower() == "key" for k in request.args):
         pairs = [
             (k, "REDACTED" if k.lower() == "key" else v)
             for k, v in request.args.items(multi=True)

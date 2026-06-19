@@ -13,6 +13,10 @@ def _extract_api_key() -> str | None:
     auth = request.headers.get("Authorization", "").strip()
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
+    # LEGACY / compat only: `?key=` carries the key in the URL, where it leaks
+    # into ingress access logs and client history. Kept working for old
+    # integrations; new callers must use the X-API-Key or Bearer header above.
+    # Do not promote this in docs — the access log redacts it (see app.py).
     qkey = request.args.get("key", "").strip()
     if qkey:
         return qkey

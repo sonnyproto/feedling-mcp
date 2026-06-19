@@ -414,6 +414,8 @@ def _extract_api_key() -> str:
     auth = request.headers.get("Authorization", "").strip()
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
+    # LEGACY / compat only — `?key=` leaks into URLs/logs; prefer the headers
+    # above. Mirrors accounts/auth.py.
     return request.args.get("key", "").strip()
 
 
