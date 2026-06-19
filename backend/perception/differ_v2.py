@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 import time
 from typing import Any, Mapping
 
+from proactive.observability_v2 import METRIC_PHASH_FRAME, MetricsSinkV2, record_metric_v2
+
 
 @dataclass(frozen=True)
 class SignalStateV2:
@@ -56,8 +58,9 @@ class PerceptionDifferV2:
     equivalent.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, metrics_sink: MetricsSinkV2 | None = None) -> None:
         self._state: dict[str, dict[str, SignalStateV2]] = {}
+        self.metrics_sink = metrics_sink
 
     def state_for(self, user_id: str, signal: str) -> SignalStateV2 | None:
         return self._state.get(user_id, {}).get(signal)
@@ -85,6 +88,15 @@ class PerceptionDifferV2:
         )
         events = self._events_for(signal, value, prev, digest, changed)
         hints = self._presence_hints_for(signal, value, changed)
+        if signal == "screen_phash":
+            record_metric_v2(
+                self.metrics_sink,
+                user_id=user_id,
+                name=METRIC_PHASH_FRAME,
+                tags={"outcome": "scene_change" if events else "deduped"},
+                data={"changed": changed},
+                ts=ts,
+            )
         if hints:
             events = tuple(
                 DifferEventV2(

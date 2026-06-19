@@ -17,6 +17,11 @@ from proactive.runtime_v2 import (
     RuntimeSpineV2,
     WakeEventV2,
 )
+from proactive.observability_v2 import (
+    METRIC_BACKGROUND_JOB,
+    MetricsSinkV2,
+    record_metric_v2,
+)
 
 BACKGROUND_PENDING = "pending"
 BACKGROUND_RUNNING = "running"
@@ -205,6 +210,7 @@ class BackgroundWorkerV2:
         *,
         run_background: Callable[[Any], Mapping[str, Any]] | None = None,
         background_leases: BackgroundLeaseRegistryV2 | None = None,
+        metrics_sink: MetricsSinkV2 | None = None,
         lease_ttl_sec: float = 600.0,
         owner_id: str = "background_worker_v2",
     ) -> None:
@@ -212,8 +218,30 @@ class BackgroundWorkerV2:
         self.job_store = job_store
         self.run_background = run_background or (lambda job: {"status": "ok", "request": background_job_request_v2(job)})
         self.background_leases = background_leases or BackgroundLeaseRegistryV2()
+        self.metrics_sink = metrics_sink if metrics_sink is not None else getattr(spine, "metrics_sink", None)
         self.lease_ttl_sec = float(lease_ttl_sec)
         self.owner_id = owner_id
+
+    def _record_job_metric(
+        self,
+        user_id: str,
+        job_id: str,
+        *,
+        status: str,
+        now: float,
+        wake_submitted: bool = False,
+    ) -> None:
+        record_metric_v2(
+            self.metrics_sink,
+            user_id=user_id,
+            name=METRIC_BACKGROUND_JOB,
+            tags={"status": status},
+            data={
+                "background_job_id": job_id,
+                "wake_submitted": bool(wake_submitted),
+            },
+            ts=now,
+        )
 
     def run_job(
         self,
@@ -233,11 +261,13 @@ class BackgroundWorkerV2:
             ttl_sec=self.lease_ttl_sec,
         )
         if lease is None:
+            self._record_job_metric(user_id, job_id, status="busy", now=now)
             return BackgroundRunResultV2(status="busy", job_id=job_id)
 
         try:
             running = self.job_store.mark_running(user_id, job_id, lease, now=now)
             if running is None:
+                self._record_job_metric(user_id, job_id, status="not_claimed", now=now)
                 return BackgroundRunResultV2(status="not_claimed", job_id=job_id, lease=lease)
             try:
                 result = dict(self.run_background(running) or {})
@@ -249,10 +279,12 @@ class BackgroundWorkerV2:
                     {"error": type(e).__name__, "message": str(e)[:240]},
                     now=now,
                 )
+                self._record_job_metric(user_id, job_id, status="failed", now=now)
                 return BackgroundRunResultV2(status="failed", job_id=job_id, job=failed, lease=lease)
 
             completed = self.job_store.complete_job(user_id, job_id, lease, result, now=now)
             if completed is None:
+                self._record_job_metric(user_id, job_id, status="completion_lost", now=now)
                 return BackgroundRunResultV2(status="completion_lost", job_id=job_id, lease=lease)
 
             event = WakeEventV2(
@@ -269,6 +301,7 @@ class BackgroundWorkerV2:
                 },
             )
             self.spine.submit(event)
+            self._record_job_metric(user_id, job_id, status=BACKGROUND_COMPLETED, now=now, wake_submitted=True)
             return BackgroundRunResultV2(
                 status=BACKGROUND_COMPLETED,
                 job_id=job_id,

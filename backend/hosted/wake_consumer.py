@@ -66,6 +66,7 @@ from proactive import gate as proactive_gate
 from proactive.adapters_v2 import wake_event_v2_from_legacy_job
 from proactive.agent_protocol_v2 import actions_for_persistence_v2
 from proactive.controls_v2 import evaluate_delivery_v2, resolve_settings_v2
+from proactive.observability_v2 import DBRuntimeMetricsSinkV2
 from proactive.runtime_v2 import RuntimeSpineV2, TurnOutcomeV2, TurnRunnerV2
 from proactive.store_v2 import (
     DBBackgroundJobStoreV2,
@@ -443,9 +444,11 @@ def _hosted_wake_v2_run_agent(runtime):
 
 def _hosted_wake_v2_runtime(store: UserStore, runtime, api_key: str | None) -> tuple[RuntimeSpineV2, TurnRunnerV2]:
     settings_store = DBProactiveSettingsStoreV2()
+    metrics_sink = DBRuntimeMetricsSinkV2()
     spine = RuntimeSpineV2(
         inbox=DBWakeInboxV2(),
         settings_resolver=settings_store.load,
+        metrics_sink=metrics_sink,
         merge_window_sec=0.0,
     )
     runner = TurnRunnerV2(
@@ -455,6 +458,7 @@ def _hosted_wake_v2_runtime(store: UserStore, runtime, api_key: str | None) -> t
         turn_store=DBTurnStoreV2(),
         background_jobs=DBBackgroundJobStoreV2(),
         turn_leases=DBTurnLeaseRegistryV2(),
+        metrics_sink=metrics_sink,
         owner_id=HOSTED_WAKE_CONSUMER_ID_V2,
     )
     return spine, runner

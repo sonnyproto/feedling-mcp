@@ -20,6 +20,7 @@ from proactive.agent_protocol_v2 import (
     manual_contract_violation_v2,
     parse_agent_response_v2,
     turn_outcome_from_agent_response_v2,
+    visible_message_count_v2,
 )
 from proactive.controls_v2 import (
     ProactiveSettingsV2,
@@ -27,6 +28,13 @@ from proactive.controls_v2 import (
     default_switches_v2,
     evaluate_wake_control_v2,
     resolve_settings_v2,
+)
+from proactive.observability_v2 import (
+    METRIC_TURN_COMPLETED,
+    METRIC_TURN_STARTED,
+    METRIC_WAKE_SUBMITTED,
+    MetricsSinkV2,
+    record_metric_v2,
 )
 from proactive.tool_catalog_v2 import ToolCatalogV2, default_tool_catalog_v2
 
@@ -413,11 +421,13 @@ class RuntimeSpineV2:
         inbox: WakeInboxV2 | None = None,
         tool_catalog: ToolCatalogV2 | None = None,
         settings_resolver: Callable[[str], ProactiveSettingsV2 | Mapping[str, Any] | None] | None = None,
+        metrics_sink: MetricsSinkV2 | None = None,
         merge_window_sec: float = 2.0,
     ) -> None:
         self.inbox = inbox or WakeInboxV2()
         self.tool_catalog = tool_catalog or default_tool_catalog_v2()
         self.settings_resolver = settings_resolver
+        self.metrics_sink = metrics_sink
         self.merge_window_sec = merge_window_sec
 
     def _settings_for_event(self, event: WakeEventV2) -> ProactiveSettingsV2:
@@ -435,6 +445,22 @@ class RuntimeSpineV2:
     def submit(self, event: WakeEventV2) -> WakeControlDecisionV2:
         settings = self._settings_for_event(event)
         decision = evaluate_wake_control_v2(event.source, manual=event.manual, settings=settings)
+        record_metric_v2(
+            self.metrics_sink,
+            user_id=event.user_id,
+            name=METRIC_WAKE_SUBMITTED,
+            tags={
+                "source": event.source,
+                "trigger": event.trigger,
+                "reason": decision.reason,
+            },
+            data={
+                "accepted": decision.accepted,
+                "manual": event.manual,
+                "latency_sensitive": event.latency_sensitive,
+            },
+            ts=event.created_at,
+        )
         if not decision.accepted:
             return decision
         self.inbox.push(replace(event, switches=decision.switches, timezone=decision.settings.timezone))
@@ -474,6 +500,7 @@ class TurnRunnerV2:
         background_jobs: Any | None = None,
         turn_leases: TurnLeaseRegistryV2 | None = None,
         background_leases: BackgroundLeaseRegistryV2 | None = None,
+        metrics_sink: MetricsSinkV2 | None = None,
         turn_lease_ttl_sec: float = 120.0,
         background_lease_ttl_sec: float = 600.0,
         owner_id: str = "turn_runner_v2",
@@ -485,6 +512,7 @@ class TurnRunnerV2:
         self.background_jobs = background_jobs
         self.turn_leases = turn_leases or TurnLeaseRegistryV2()
         self.background_leases = background_leases or BackgroundLeaseRegistryV2()
+        self.metrics_sink = metrics_sink if metrics_sink is not None else getattr(spine, "metrics_sink", None)
         self.turn_lease_ttl_sec = float(turn_lease_ttl_sec)
         self.background_lease_ttl_sec = float(background_lease_ttl_sec)
         self.owner_id = owner_id
@@ -532,6 +560,34 @@ class TurnRunnerV2:
             return
         self.turn_store.complete_turn(user_id, turn_id, turn_lease, outcome=outcome, now=now)
 
+    def _record_turn_metric(
+        self,
+        context: MergedWakeContextV2,
+        *,
+        status: str,
+        now: float,
+        outcome: TurnOutcomeV2 | None = None,
+        contract_violation: str = "",
+    ) -> None:
+        record_metric_v2(
+            self.metrics_sink,
+            user_id=context.user_id,
+            name=METRIC_TURN_COMPLETED,
+            tags={
+                "status": status,
+                "trigger": context.trigger,
+                "contract_violation": contract_violation,
+            },
+            data={
+                "wake_count": len(context.wake_ids),
+                "merged_trigger_count": len(context.merged_triggers),
+                "latency_ms": max(0.0, (now - context.created_at) * 1000.0),
+                "visible_message_count": visible_message_count_v2(outcome) if outcome is not None else 0,
+                "needs_background": bool(getattr(outcome, "needs_background", False)) if outcome is not None else False,
+            },
+            ts=now,
+        )
+
     def run_ready_turn(
         self,
         user_id: str,
@@ -553,6 +609,14 @@ class TurnRunnerV2:
             context = self.spine.drain_context(user_id, now=now)
             if context is None:
                 return TurnRunResultV2(status="idle", turn_lease=turn_lease)
+            record_metric_v2(
+                self.metrics_sink,
+                user_id=user_id,
+                name=METRIC_TURN_STARTED,
+                tags={"trigger": context.trigger},
+                data={"wake_count": len(context.wake_ids)},
+                ts=now,
+            )
             agent_context = build_agent_context_v2(
                 context,
                 recent_chat=self._recent_chat(user_id),
@@ -574,6 +638,13 @@ class TurnRunnerV2:
             contract_violation = manual_contract_violation_v2(context, outcome)
             self._complete_turn_record(user_id, turn_id, turn_lease, outcome, now=now)
             if contract_violation:
+                self._record_turn_metric(
+                    context,
+                    status=contract_violation,
+                    now=now,
+                    outcome=outcome,
+                    contract_violation=contract_violation,
+                )
                 return TurnRunResultV2(
                     status=contract_violation,
                     context=context,
@@ -604,6 +675,7 @@ class TurnRunnerV2:
                         now=now,
                         ttl_sec=self.background_lease_ttl_sec,
                     )
+                self._record_turn_metric(context, status="background_queued", now=now, outcome=outcome)
                 return TurnRunResultV2(
                     status="background_queued",
                     context=context,
@@ -614,6 +686,7 @@ class TurnRunnerV2:
                     background_job_id=background_job_id,
                     background_lease=background_lease,
                 )
+            self._record_turn_metric(context, status="completed", now=now, outcome=outcome)
             return TurnRunResultV2(
                 status="completed",
                 context=context,
