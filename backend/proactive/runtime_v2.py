@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 import threading
 import time
 import uuid
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from proactive.tool_catalog_v2 import ToolCatalogV2, default_tool_catalog_v2
 
@@ -24,18 +24,15 @@ WAKE_SOURCES = {
     "background_result",
 }
 
-SOURCE_PRIORITY = {
-    "user_message": 0,
-    "scheduled_wake": 10,
-    "background_result": 20,
-    "scene_change": 30,
-    "perception_event": 40,
-    "heartbeat": 50,
-}
+PRIMARY_GROUP_ORDER = ("interactive", "event", "heartbeat")
 
 
 def _new_wake_id() -> str:
     return "wake_" + uuid.uuid4().hex[:16]
+
+
+def _new_lease_id() -> str:
+    return "lease_" + uuid.uuid4().hex[:16]
 
 
 @dataclass(frozen=True)
@@ -101,8 +98,23 @@ class MergedWakeContextV2:
         }
 
 
+def _primary_group(event: WakeEventV2) -> str:
+    if event.latency_sensitive or event.source == "user_message":
+        return "interactive"
+    if event.source == "heartbeat":
+        return "heartbeat"
+    # TODO(Round 3 eval): scheduled_wake, perception_event, scene_change, and
+    # background_result are all episode events here. Do not add a product
+    # priority between them until reviewed wake episodes prove one.
+    return "event"
+
+
 def _wake_sort_key(event: WakeEventV2) -> tuple[int, float, str]:
-    return (SOURCE_PRIORITY.get(event.source, 999), event.created_at, event.wake_id)
+    return (
+        PRIMARY_GROUP_ORDER.index(_primary_group(event)),
+        event.created_at,
+        event.wake_id,
+    )
 
 
 def _unique_wakes_v2(wakes: list[WakeEventV2]) -> list[WakeEventV2]:
@@ -241,6 +253,124 @@ class SingleFlightRegistryV2:
         return lock
 
 
+@dataclass(frozen=True)
+class LeaseV2:
+    scope: str
+    owner_id: str
+    lease_id: str = field(default_factory=_new_lease_id)
+    acquired_at: float = field(default_factory=time.time)
+    expires_at: float = 0.0
+
+    def expired(self, now: float | None = None) -> bool:
+        now = time.time() if now is None else float(now)
+        return self.expires_at <= now
+
+
+class LeaseRegistryV2:
+    """In-memory lease registry for contract tests.
+
+    Production should replace this with a DB-backed CAS/advisory-lock lease.
+    The semantics are fixed here: active leases block, expired leases are
+    reclaimed by the next acquirer, and only the current lease holder can
+    release a scope.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._leases: dict[str, LeaseV2] = {}
+
+    def try_acquire(
+        self,
+        scope: str,
+        *,
+        owner_id: str,
+        now: float | None = None,
+        ttl_sec: float,
+    ) -> LeaseV2 | None:
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            current = self._leases.get(scope)
+            if current is not None and not current.expired(now):
+                return None
+            lease = LeaseV2(
+                scope=scope,
+                owner_id=str(owner_id or "unknown"),
+                acquired_at=now,
+                expires_at=now + float(ttl_sec),
+            )
+            self._leases[scope] = lease
+            return lease
+
+    def release(self, lease: LeaseV2) -> bool:
+        with self._lock:
+            current = self._leases.get(lease.scope)
+            if current is None or current.lease_id != lease.lease_id:
+                return False
+            self._leases.pop(lease.scope, None)
+            return True
+
+    def current(self, scope: str, *, now: float | None = None) -> LeaseV2 | None:
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            current = self._leases.get(scope)
+            if current is not None and current.expired(now):
+                self._leases.pop(scope, None)
+                return None
+            return current
+
+
+class TurnLeaseRegistryV2(LeaseRegistryV2):
+    def try_acquire_user(
+        self,
+        user_id: str,
+        *,
+        owner_id: str,
+        now: float | None = None,
+        ttl_sec: float,
+    ) -> LeaseV2 | None:
+        return self.try_acquire(
+            f"turn:{user_id}",
+            owner_id=owner_id,
+            now=now,
+            ttl_sec=ttl_sec,
+        )
+
+
+class BackgroundLeaseRegistryV2(LeaseRegistryV2):
+    def try_acquire_job(
+        self,
+        job_id: str,
+        *,
+        owner_id: str,
+        now: float | None = None,
+        ttl_sec: float,
+    ) -> LeaseV2 | None:
+        return self.try_acquire(
+            f"background:{job_id}",
+            owner_id=owner_id,
+            now=now,
+            ttl_sec=ttl_sec,
+        )
+
+
+@dataclass(frozen=True)
+class TurnOutcomeV2:
+    messages: tuple[str, ...] = ()
+    actions: tuple[Mapping[str, Any], ...] = ()
+    needs_background: bool = False
+    background_request: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class TurnRunResultV2:
+    status: str
+    context: MergedWakeContextV2 | None = None
+    outcome: TurnOutcomeV2 | None = None
+    turn_lease: LeaseV2 | None = None
+    background_job_id: str = ""
+    background_lease: LeaseV2 | None = None
+
+
 class RuntimeSpineV2:
     """Small facade for the new flow: submit wake, drain merged context."""
 
@@ -267,3 +397,102 @@ class RuntimeSpineV2:
         if not wakes:
             return None
         return merge_wakes_v2(wakes, tool_catalog=self.tool_catalog)
+
+
+def _sleep_outcome_v2(_context: MergedWakeContextV2) -> TurnOutcomeV2:
+    return TurnOutcomeV2(actions=({"type": "sleep"},))
+
+
+class TurnRunnerV2:
+    """Single-flight turn executor shell.
+
+    This does not call production LLMs yet. It fixes the runtime contract:
+    foreground turns hold a reclaimable per-user lease; background work has its
+    own lease; foreground leases are released before background results re-enter
+    the inbox as `background_result` wakes.
+    """
+
+    def __init__(
+        self,
+        spine: RuntimeSpineV2,
+        *,
+        run_agent: Callable[[MergedWakeContextV2], TurnOutcomeV2] | None = None,
+        turn_leases: TurnLeaseRegistryV2 | None = None,
+        background_leases: BackgroundLeaseRegistryV2 | None = None,
+        turn_lease_ttl_sec: float = 120.0,
+        background_lease_ttl_sec: float = 600.0,
+        owner_id: str = "turn_runner_v2",
+    ) -> None:
+        self.spine = spine
+        self.run_agent = run_agent or _sleep_outcome_v2
+        self.turn_leases = turn_leases or TurnLeaseRegistryV2()
+        self.background_leases = background_leases or BackgroundLeaseRegistryV2()
+        self.turn_lease_ttl_sec = float(turn_lease_ttl_sec)
+        self.background_lease_ttl_sec = float(background_lease_ttl_sec)
+        self.owner_id = owner_id
+
+    def run_ready_turn(
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        owner_id: str | None = None,
+    ) -> TurnRunResultV2:
+        now = time.time() if now is None else float(now)
+        owner = owner_id or self.owner_id
+        turn_lease = self.turn_leases.try_acquire_user(
+            user_id,
+            owner_id=owner,
+            now=now,
+            ttl_sec=self.turn_lease_ttl_sec,
+        )
+        if turn_lease is None:
+            return TurnRunResultV2(status="busy")
+        try:
+            context = self.spine.drain_context(user_id, now=now)
+            if context is None:
+                return TurnRunResultV2(status="idle", turn_lease=turn_lease)
+            outcome = self.run_agent(context)
+            if outcome.needs_background:
+                background_job_id = "bg_" + uuid.uuid4().hex[:16]
+                background_lease = self.background_leases.try_acquire_job(
+                    background_job_id,
+                    owner_id=owner,
+                    now=now,
+                    ttl_sec=self.background_lease_ttl_sec,
+                )
+                return TurnRunResultV2(
+                    status="background_queued",
+                    context=context,
+                    outcome=outcome,
+                    turn_lease=turn_lease,
+                    background_job_id=background_job_id,
+                    background_lease=background_lease,
+                )
+            return TurnRunResultV2(
+                status="completed",
+                context=context,
+                outcome=outcome,
+                turn_lease=turn_lease,
+            )
+        finally:
+            self.turn_leases.release(turn_lease)
+
+    def submit_background_result(
+        self,
+        user_id: str,
+        payload: Mapping[str, Any],
+        *,
+        origin_refs: tuple[str, ...] = (),
+        now: float | None = None,
+    ) -> WakeEventV2:
+        event = WakeEventV2(
+            user_id=user_id,
+            source="background_result",
+            trigger="background_result",
+            created_at=time.time() if now is None else float(now),
+            origin_refs=origin_refs,
+            background_payload=payload,
+        )
+        self.spine.submit(event)
+        return event

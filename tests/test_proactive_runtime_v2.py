@@ -7,7 +7,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from perception.differ_v2 import PerceptionDifferV2
 from proactive.adapters_v2 import wake_event_v2_from_legacy_job
-from proactive.runtime_v2 import RuntimeSpineV2, WakeEventV2, merge_wakes_v2
+from proactive.runtime_v2 import (
+    BackgroundLeaseRegistryV2,
+    RuntimeSpineV2,
+    TurnLeaseRegistryV2,
+    TurnOutcomeV2,
+    TurnRunnerV2,
+    WakeEventV2,
+    merge_wakes_v2,
+)
 from proactive.tool_catalog_v2 import FAST, SLOW, default_tool_catalog_v2
 
 
@@ -74,6 +82,106 @@ def test_background_result_is_context_not_direct_chat_write():
     assert turn_context["background_payloads"] == [
         {"tool": "perception.calendar", "result": {"events": 2}}
     ]
+
+
+def test_scheduled_wake_does_not_preempt_same_episode_event_by_fixed_priority():
+    ctx = merge_wakes_v2([
+        WakeEventV2(
+            user_id="u1",
+            source="perception_event",
+            trigger="arrived_at_anchor",
+            created_at=100.0,
+        ),
+        WakeEventV2(
+            user_id="u1",
+            source="scheduled_wake",
+            trigger="scheduled_wake",
+            created_at=100.5,
+            scheduled_note="check whether she left for the hospital",
+        ),
+    ])
+
+    assert ctx.trigger == "arrived_at_anchor"
+    assert ctx.merged_triggers == ("scheduled_wake",)
+    assert ctx.scheduled_note == "check whether she left for the hospital"
+
+
+def test_turn_lease_blocks_and_reclaims_after_expiry():
+    leases = TurnLeaseRegistryV2()
+
+    first = leases.try_acquire_user("u1", owner_id="worker-a", now=10.0, ttl_sec=5.0)
+    blocked = leases.try_acquire_user("u1", owner_id="worker-b", now=14.0, ttl_sec=5.0)
+    reclaimed = leases.try_acquire_user("u1", owner_id="worker-b", now=15.1, ttl_sec=5.0)
+
+    assert first is not None
+    assert blocked is None
+    assert reclaimed is not None
+    assert reclaimed.owner_id == "worker-b"
+    assert reclaimed.lease_id != first.lease_id
+    assert leases.release(first) is False
+    assert leases.release(reclaimed) is True
+
+
+def test_turn_runner_single_flight_blocks_until_turn_lease_released():
+    spine = RuntimeSpineV2(merge_window_sec=0.0)
+    spine.submit(WakeEventV2(user_id="u1", source="user_message", trigger="user_message", created_at=20.0))
+    leases = TurnLeaseRegistryV2()
+    held = leases.try_acquire_user("u1", owner_id="worker-a", now=20.0, ttl_sec=60.0)
+    calls = []
+    runner = TurnRunnerV2(
+        spine,
+        turn_leases=leases,
+        run_agent=lambda context: calls.append(context.trigger) or TurnOutcomeV2(actions=({"type": "sleep"},)),
+    )
+
+    busy = runner.run_ready_turn("u1", now=20.1, owner_id="worker-b")
+    assert busy.status == "busy"
+    assert calls == []
+
+    assert held is not None
+    assert leases.release(held) is True
+    completed = runner.run_ready_turn("u1", now=20.2, owner_id="worker-b")
+
+    assert completed.status == "completed"
+    assert calls == ["user_message"]
+    assert leases.current("turn:u1", now=20.3) is None
+
+
+def test_background_path_releases_turn_slot_and_reenters_inbox_as_wake():
+    spine = RuntimeSpineV2(merge_window_sec=0.0)
+    spine.submit(WakeEventV2(user_id="u1", source="user_message", trigger="user_message", created_at=30.0))
+    background_leases = BackgroundLeaseRegistryV2()
+
+    runner = TurnRunnerV2(
+        spine,
+        background_leases=background_leases,
+        run_agent=lambda _context: TurnOutcomeV2(
+            actions=({"type": "sleep"},),
+            needs_background=True,
+            background_request={"tool": "perception.calendar"},
+        ),
+    )
+    queued = runner.run_ready_turn("u1", now=30.0)
+
+    assert queued.status == "background_queued"
+    assert queued.background_job_id.startswith("bg_")
+    assert queued.background_lease is not None
+    assert runner.turn_leases.current("turn:u1", now=30.1) is None
+
+    event = runner.submit_background_result(
+        "u1",
+        {"tool": "perception.calendar", "result": {"events": 2}},
+        origin_refs=tuple(queued.context.wake_ids),
+        now=31.0,
+    )
+    ctx = spine.drain_context("u1", now=31.0)
+
+    assert event.source == "background_result"
+    assert ctx is not None
+    assert ctx.trigger == "background_result"
+    assert ctx.background_payloads == (
+        {"tool": "perception.calendar", "result": {"events": 2}},
+    )
 
 
 def test_tool_catalog_cost_classes_and_pull_only_motion():

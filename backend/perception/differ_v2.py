@@ -71,12 +71,12 @@ class PerceptionDifferV2:
         ts: float | None = None,
     ) -> DifferResultV2:
         ts = time.time() if ts is None else float(ts)
-        user_state = self._state.setdefault(user_id, {})
-        prev = user_state.get(signal)
+        signals = self._state.setdefault(user_id, {})
+        prev = signals.get(signal)
         changed = prev is None or prev.value != value
         last_changed_ts = ts if changed else prev.last_changed_ts
         state = SignalStateV2(value=value, last_seen_ts=ts, last_changed_ts=last_changed_ts)
-        user_state[signal] = state
+        signals[signal] = state
 
         digest = (
             f"{signal}: {_format_value(prev.value if prev else None)} -> {_format_value(value)}"
