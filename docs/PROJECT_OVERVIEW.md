@@ -105,7 +105,8 @@ adapter 或输出 compatibility layer 存在，执行约束见
   语义；差异只在 agent 执行位置。
 
 当前生产代码仍保留 `/v1/proactive/jobs/*` 和旧 dashboard 作为过渡通道。
-新入口切到 V2 后，旧执行体应逐条删除，而不是长期并存。
+新入口应先用 per-user flag 切到 V2，并保留旧执行体作为短期 dormant
+fallback；观察窗口健康后再逐条删除旧执行体，而不是长期并存。
 
 ## 4. 系统架构
 

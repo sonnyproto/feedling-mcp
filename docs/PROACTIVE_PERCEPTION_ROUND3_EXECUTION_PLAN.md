@@ -20,8 +20,11 @@ Use a strangler-fig migration:
 
 1. V2 spine is the new trunk.
 2. Old systems may remain only as input adapters or output compatibility layers.
-3. Each production path cutover must delete or make unreachable the old executor
-   for that path.
+3. Each production path cutover must be reversible: ship the V2 path behind a
+   per-user flag, keep the old executor as a dormant fallback during an
+   observation window, and delete the old executor only in a separate follow-up
+   PR once §10.3 system metrics confirm the V2 path is healthy. Cutover and
+   deletion are two PRs, never one.
 4. Legacy `proactive_jobs` status may receive temporary projections for old
    dashboard visibility, but V2 lease / turn state must not be modeled around
    that table.
@@ -53,6 +56,11 @@ Any PR violating these should be rejected.
     must not decide whether content is worth the companion's attention.
 12. `scheduled_wake` must not get a hard-coded product priority over same-episode
     event wakes until reviewed episodes justify that policy.
+13. Live cutover must be reversible. Convert a production path behind a per-user
+    flag with the old executor retained as a dormant fallback; never delete the
+    old executor in the same PR. Deletion is a separate follow-up PR after an
+    observation window with healthy §10.3 system metrics. (This is the whole
+    point of strangler-fig: same-PR deletion removes the rollback path.)
 
 ## PR Sequence
 
@@ -199,6 +207,34 @@ Do not do:
 
 - Do not reuse old hosted proactive daemon threads as the canonical worker.
 
+### PR5b. Observability And Eval Scaffold (must land before any live cutover)
+
+Scope:
+
+- Land the system-health metrics from spec §10.3: wake volume, merge rate,
+  double-send rate, missed-`scheduled_wake` rate, latency distribution,
+  background append success/stale rate, pHash dedupe rate.
+- Land the per-episode (cross-wake) eval harness and the Round 3 review-label
+  schema (see PR10) so cutovers are judged on behavior, not only unit tests.
+- Seed a small set of replayable synthetic episodes.
+
+Why before PR6/PR9:
+
+- The scariest failures (`stutter`, double-send, `went_dark`, cross-time
+  misses) are cross-wake and invisible to per-wake unit tests. A flagged live
+  cutover (invariant 13) needs these metrics to define a healthy observation
+  window before the old executor is deleted. Eval-first discipline (spec §10):
+  do not cut a live path over with green unit tests alone.
+
+Acceptance tests:
+
+- Metrics increment correctly on synthetic wake/turn/background flows.
+- A replayable episode runs end to end through the harness and emits labels.
+
+Do not do:
+
+- Do not block landing on having real production episodes; seed synthetic.
+
 ### PR6. Hosted Wake Cutover
 
 Scope:
@@ -206,20 +242,24 @@ Scope:
 - Convert hosted wake input into `WakeEventV2`.
 - Execute through `TurnRunnerV2`.
 - Reuse chat write and push only as output compatibility.
-- Remove or make unreachable old hosted wake executor code.
+- Ship behind a per-user flag; keep the old hosted wake executor as a dormant
+  fallback. Do NOT delete it in this PR (invariant 13) — deletion is a separate
+  follow-up after the observation window.
 
 Acceptance tests:
 
-- Hosted heartbeat/perception/manual wakes use V2 context.
+- Hosted heartbeat/perception/manual wakes use V2 context (flag on).
+- With the flag off, the old executor still runs unchanged (rollback path works).
 - Hosted manual wake still requires visible response.
-- Old hosted wake prompt/action parser is not used for V2 execution.
+- Old hosted wake prompt/action parser is not used for V2 execution (flag on).
 - Existing hosted smoke tests stay green.
 - Old `proactive_jobs` receives only projection fields needed by old dashboard.
 
-Deletion evidence:
+Cutover evidence:
 
-- Show which functions in `hosted/wake_consumer.py` were deleted or no longer
-  reachable.
+- Show the per-user flag and the fallback-to-old-executor path.
+- List the functions in `hosted/wake_consumer.py` slated for deletion in the
+  follow-up deletion PR (after metrics confirm health).
 
 ### PR7. Perception Ingress Cutover
 
@@ -274,14 +314,17 @@ Scope:
 - Convert resident consumer to the same V2 wake context, catalog, and action
   contract.
 - Add resident lease/reclaim semantics so claimed jobs cannot strand forever.
-- Delete old resident proactive prompt executor after cutover.
+- Ship behind a per-user flag with the old resident executor as fallback. Delete
+  `_message_for_proactive_job` and the old resident executor in a follow-up PR
+  after the observation window (invariant 13).
 
 Acceptance tests:
 
 - Resident and hosted see equivalent V2 context for the same synthetic wake.
 - Resident uses the shared tool catalog.
 - Resident crash during claimed/realizing state is recoverable.
-- Old `_message_for_proactive_job` path is deleted or unreachable.
+- With the flag on, `_message_for_proactive_job` is unreachable for V2 users;
+  with the flag off, the old resident path still works (rollback).
 
 Do not do:
 
@@ -296,16 +339,24 @@ Scope:
 - Remove old job-status projections after dashboard cutover.
 - Remove dead V1/V2 executor paths.
 
-Review labels:
+Review labels (must match canonical spec §10.4):
 
 - `good_presence`
 - `missed_moment`
-- `too_much`
+- `went_dark` — should have been present and was not. For companion users this
+  is a worse sin than over-presence (D10 recall-first). Spec §10.4 requires it.
+- `too_much_buzz` — Delivery-layer over-notification; a real bug to fix.
+- `too_chatty` — agent chose to say more. **NOT a bad case** (D4: chattiness is
+  a legitimate personality). Tracked for visibility, never penalized.
 - `wrong_voice`
 - `ignored_manual`
-- `stutter`
-- `privacy_bad`
+- `stutter` — multiple uncoordinated bubbles (catches §1.4 concurrency bugs).
 - `late_irrelevant`
+- `privacy_bad`
+
+> Do not collapse `too_much_buzz` and `too_chatty` back into a single
+> `too_much`. Merging them trains reviewers to penalize chattiness, which D4/D10
+> forbid. The split is the point.
 
 Acceptance tests:
 

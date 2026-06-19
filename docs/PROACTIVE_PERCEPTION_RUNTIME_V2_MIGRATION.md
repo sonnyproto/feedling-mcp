@@ -66,8 +66,9 @@ an input adapter or output compatibility layer.
    legacy `enabled/dnd/user_state/ai_state` semantics.
 4. Strangle hosted wake first: legacy hosted wake input adapts into
    `WakeEventV2`, `TurnRunnerV2` executes it, and chat/push delivery remains
-   the output compatibility layer. Delete the old hosted executor when cutover
-   is complete.
+   the output compatibility layer. Ship the live cutover behind a per-user flag
+   with the old executor retained as a dormant fallback; delete that executor
+   only in a follow-up PR after the observation window is healthy.
 5. Route perception report/photo/device-event inputs through
    `PerceptionDifferV2` before any wake is emitted.
 6. Strangle resident wake second, using the same V2 catalog, differ semantics,
@@ -75,4 +76,4 @@ an input adapter or output compatibility layer.
 7. Move dashboard/status to V2 turn storage. Old `proactive_jobs` status may
    temporarily receive a projection for the old dashboard, but V2 lease and
    turn-state semantics must not be shaped around that legacy table. Delete the
-   projection after the dashboard cutover.
+   projection after the dashboard cutover and healthy observation window.
