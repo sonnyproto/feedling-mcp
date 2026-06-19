@@ -10,6 +10,7 @@ from accounts import auth
 from core import store as core_store
 from core import util
 from proactive import dashboard, gate, resident_runtime_v2, service
+from proactive.observability_v2 import ROUND3_REVIEW_LABELS_V2
 
 bp = Blueprint("proactive", __name__)
 
@@ -335,7 +336,7 @@ def proactive_decision_review(decision_id):
         return jsonify({"error": "decision_not_found"}), 404
 
     label = str(payload.get("label") or "").strip()
-    allowed_labels = {
+    legacy_gate_labels = {
         "correct_true",
         "correct_false",
         "missed_opportunity",
@@ -345,6 +346,7 @@ def proactive_decision_review(decision_id):
         "privacy_bad",
         "great_companion_moment",
     }
+    allowed_labels = set(ROUND3_REVIEW_LABELS_V2) | legacy_gate_labels
     if label not in allowed_labels:
         return jsonify({"error": "invalid_label", "allowed": sorted(allowed_labels)}), 400
 
@@ -354,6 +356,7 @@ def proactive_decision_review(decision_id):
         "ts": time.time(),
         "created_at": datetime.now().isoformat(),
         "label": label,
+        "label_family": "round3" if label in ROUND3_REVIEW_LABELS_V2 else "legacy_gate",
         "notes": str(payload.get("notes") or "")[:500],
         "reviewer": str(payload.get("reviewer") or "human")[:80],
         "expected_should_reach_out": payload.get("expected_should_reach_out"),

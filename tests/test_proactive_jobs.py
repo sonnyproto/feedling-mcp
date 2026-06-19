@@ -662,12 +662,13 @@ def test_gate_review_endpoint_records_human_label(tmp_path, monkeypatch):
     resp = client.post(
         f"/v1/proactive/decisions/{decision['decision_id']}/review",
         headers={"X-API-Key": api_key},
-        json={"label": "great_companion_moment", "notes": "felt natural"},
+        json={"label": "good_presence", "notes": "felt natural"},
     )
 
     assert resp.status_code == 200
     review = resp.get_json()["review"]
-    assert review["label"] == "great_companion_moment"
+    assert review["label"] == "good_presence"
+    assert review["label_family"] == "round3"
     assert review["decision_id"] == decision["decision_id"]
 
     snapshot = appmod._proactive_debug_snapshot(store)
@@ -676,7 +677,7 @@ def test_gate_review_endpoint_records_human_label(tmp_path, monkeypatch):
 
     listing = client.get("/v1/proactive/reviews?since=0", headers={"X-API-Key": api_key})
     assert listing.status_code == 200
-    assert listing.get_json()["reviews"][0]["label"] == "great_companion_moment"
+    assert listing.get_json()["reviews"][0]["label"] == "good_presence"
 
 
 def test_proactive_job_claim_and_status_lifecycle(tmp_path, monkeypatch):

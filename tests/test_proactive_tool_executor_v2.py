@@ -12,10 +12,13 @@ from proactive.tool_catalog_v2 import (
     tool_catalog_v2_for_runtime,
 )
 from proactive.tool_executor_v2 import (
+    DBToolTraceSinkV2,
     ToolBudgetV2,
     ToolCallV2,
     ToolExecutorV2,
+    ToolTraceV2,
     ToolRuntimeAdaptersV2,
+    TOOL_TRACE_STREAM_V2,
 )
 
 
@@ -138,6 +141,34 @@ def test_tool_traces_record_name_cost_latency_outcome_and_wake_turn_ids():
     assert trace.turn_id == "turn_trace"
     assert traces == [trace]
     assert executor.traces == [trace]
+
+
+def test_db_tool_trace_sink_writes_standard_stream(monkeypatch):
+    captured = {}
+
+    def _append(user_id, stream, doc, ts=None, item_key=None):
+        captured.update(user_id=user_id, stream=stream, doc=doc, ts=ts, item_key=item_key)
+
+    monkeypatch.setattr("proactive.tool_executor_v2.db.log_append", _append)
+
+    trace = ToolTraceV2(
+        call_id="tool_db_1",
+        name="perception.now",
+        cost_class=FAST,
+        outcome="ok",
+        latency_ms=1.5,
+        wake_id="wake_1",
+        turn_id="turn_1",
+        user_id="usr_tool_trace",
+    )
+    DBToolTraceSinkV2()(trace)
+
+    assert captured["user_id"] == "usr_tool_trace"
+    assert captured["stream"] == TOOL_TRACE_STREAM_V2
+    assert captured["item_key"] == "tool_db_1"
+    assert captured["doc"]["kind"] == "tool_trace_v2"
+    assert captured["doc"]["name"] == "perception.now"
+    assert captured["doc"]["cost_class"] == FAST
 
 
 def test_fast_slow_budget_returns_soft_handoff_not_silent_truncation():

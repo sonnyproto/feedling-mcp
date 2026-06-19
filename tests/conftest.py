@@ -60,6 +60,7 @@ if not _provisioned:
         "test_model_api_wake.py",
         "test_proactive_runtime_v2.py",
         "test_proactive_observability_v2.py",
+        "test_proactive_dashboard_v2.py",
         "test_proactive_tool_executor_v2.py",
         "test_proactive_scheduled_wake_v2.py",
         "test_hosted_wake_v2_cutover.py",

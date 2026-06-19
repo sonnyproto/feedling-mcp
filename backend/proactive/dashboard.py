@@ -12,11 +12,25 @@ import httpx
 from flask import request
 from urllib.parse import quote, urlencode
 
+import db
 from core import util
 
 from core import store as core_store
 from core.store import UserStore
 from proactive import service
+from proactive.observability_v2 import (
+    ProactiveMetricsAggregatorV2,
+    ROUND3_REVIEW_LABELS_V2,
+    RUNTIME_METRICS_STREAM_V2,
+)
+from proactive.scheduled_wake_v2 import SCHEDULED_WAKE_STREAM_V2
+from proactive.store_v2 import (
+    BACKGROUND_JOB_STREAM_V2,
+    TURN_ACTION_STREAM_V2,
+    TURN_STREAM_V2,
+    WAKE_STREAM_V2,
+)
+from proactive.tool_executor_v2 import TOOL_TRACE_STREAM_V2
 
 PROACTIVE_DEBUG_DECISION_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_DECISION_READ_MAX", 1000))
 PROACTIVE_DEBUG_JOB_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_JOB_READ_MAX", core_store.PROACTIVE_JOB_MAX))
@@ -24,6 +38,7 @@ PROACTIVE_DEBUG_EVENT_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_EV
 PROACTIVE_DEBUG_REVIEW_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_REVIEW_READ_MAX", 500))
 PROACTIVE_DEBUG_MESSAGE_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_MESSAGE_READ_MAX", 500))
 PROACTIVE_DEBUG_FRAME_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_FRAME_READ_MAX", core_store.MAX_FRAMES))
+PROACTIVE_DEBUG_V2_READ_MAX = int(os.environ.get("FEEDLING_PROACTIVE_DEBUG_V2_READ_MAX", 500))
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 PROACTIVE_DEBUG_TRANSLATION_MODEL = os.environ.get(
     "FEEDLING_PROACTIVE_DEBUG_TRANSLATION_MODEL",
@@ -34,6 +49,14 @@ PROACTIVE_DEBUG_TRANSLATION_TIMEOUT_SEC = float(
 )
 _debug_translation_cache: dict[str, str] = {}
 _debug_translation_lock = threading.Lock()
+
+
+def _v2_stream(store: UserStore, stream: str, *, limit: int = PROACTIVE_DEBUG_V2_READ_MAX) -> list[dict]:
+    try:
+        return db.log_read(store.user_id, stream, limit=limit)
+    except Exception:
+        return []
+
 
 def _proactive_debug_snapshot(store: UserStore) -> dict:
     # The debug dashboard is used as an investigation surface, not a tiny
@@ -118,14 +141,31 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
             }
             for f in store.frames_meta[-PROACTIVE_DEBUG_FRAME_READ_MAX:]
         ]
+    v2_wakes = _v2_stream(store, WAKE_STREAM_V2)
+    v2_turns = _v2_stream(store, TURN_STREAM_V2)
+    v2_turn_actions = _v2_stream(store, TURN_ACTION_STREAM_V2)
+    v2_background_jobs = _v2_stream(store, BACKGROUND_JOB_STREAM_V2)
+    v2_scheduled_wakes = _v2_stream(store, SCHEDULED_WAKE_STREAM_V2)
+    v2_metrics = _v2_stream(store, RUNTIME_METRICS_STREAM_V2)
+    v2_tool_traces = _v2_stream(store, TOOL_TRACE_STREAM_V2)
+    v2_health = ProactiveMetricsAggregatorV2().snapshot(v2_metrics).to_doc()
     return {
         "user_id": store.user_id,
         "generated_at": datetime.now().isoformat(),
         "settings": store.load_proactive_settings(),
+        "review_labels_v2": list(ROUND3_REVIEW_LABELS_V2),
         "decisions": decisions,
         "reviews": reviews,
         "latest_review_by_decision": latest_review_by_decision,
         "jobs": enriched_jobs,
+        "v2_wakes": v2_wakes,
+        "v2_turns": v2_turns,
+        "v2_turn_actions": v2_turn_actions,
+        "v2_background_jobs": v2_background_jobs,
+        "v2_scheduled_wakes": v2_scheduled_wakes,
+        "v2_runtime_metrics": v2_metrics,
+        "v2_tool_traces": v2_tool_traces,
+        "v2_health": v2_health,
         "device_events": events,
         "proactive_messages": proactive_messages,
         "recent_frames": frames,
@@ -133,6 +173,13 @@ def _proactive_debug_snapshot(store: UserStore) -> dict:
             "decisions": len(decisions),
             "reviews": len(reviews),
             "jobs": len(jobs),
+            "v2_wakes": len(v2_wakes),
+            "v2_turns": len(v2_turns),
+            "v2_turn_actions": len(v2_turn_actions),
+            "v2_background_jobs": len(v2_background_jobs),
+            "v2_scheduled_wakes": len(v2_scheduled_wakes),
+            "v2_runtime_metrics": len(v2_metrics),
+            "v2_tool_traces": len(v2_tool_traces),
             "device_events": len(events),
             "proactive_messages": len(proactive_messages),
             "recent_frames": len(frames),
@@ -334,6 +381,18 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         "decision": "Wake",
         "job": "任务",
         "preview": "消息预览",
+        "wake_id": "Wake ID",
+        "turn_id": "Turn ID",
+        "action_id": "Action ID",
+        "action_type": "动作类型",
+        "tool": "工具",
+        "cost_class": "成本档",
+        "outcome": "结果",
+        "latency": "延迟",
+        "health": "健康度",
+        "source": "来源",
+        "scheduled": "定时任务",
+        "background": "后台任务",
     }
 
     debug_value_labels_zh = {
@@ -359,6 +418,15 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         "repeated": "重复触发",
         "privacy_bad": "隐私不合适",
         "great_companion_moment": "很好的陪伴时机",
+        "good_presence": "好出现",
+        "missed_moment": "漏掉时机",
+        "went_dark": "该出现却沉默",
+        "too_much_buzz": "提醒太打扰",
+        "too_chatty": "话多观察项",
+        "wrong_voice": "语气不对",
+        "ignored_manual": "忽略手动召唤",
+        "stutter": "口吃/重复气泡",
+        "late_irrelevant": "迟到且不相关",
         "blocked_before_model": "模型前拦截",
         "reviewable_false": "可复查的不触发",
         "manual_proactive_test": "手动主动触发测试",
@@ -470,6 +538,14 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     latest_reviews = snapshot.get("latest_review_by_decision") or {}
     jobs = list(reversed(snapshot.get("jobs") or []))
     messages = list(reversed(snapshot.get("proactive_messages") or []))
+    v2_wakes = list(reversed(snapshot.get("v2_wakes") or []))
+    v2_turns = list(reversed(snapshot.get("v2_turns") or []))
+    v2_turn_actions = list(reversed(snapshot.get("v2_turn_actions") or []))
+    v2_background_jobs = list(reversed(snapshot.get("v2_background_jobs") or []))
+    v2_scheduled_wakes = list(reversed(snapshot.get("v2_scheduled_wakes") or []))
+    v2_runtime_metrics = list(reversed(snapshot.get("v2_runtime_metrics") or []))
+    v2_tool_traces = list(reversed(snapshot.get("v2_tool_traces") or []))
+    v2_health = snapshot.get("v2_health") or {}
     frames = list(reversed(snapshot.get("recent_frames") or []))
     events = list(reversed(snapshot.get("device_events") or []))
     translation_map: dict[str, str] = {}
@@ -533,6 +609,14 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
             f"<details class='inline-json'><summary>{esc(tr_label(label))}</summary>"
             f"<pre class='mono'>{esc(pretty)}</pre></details>"
         )
+
+    def review_label_options() -> str:
+        out = []
+        for label in snapshot.get("review_labels_v2") or ROUND3_REVIEW_LABELS_V2:
+            raw = str(label or "")
+            if raw:
+                out.append(f"<option value='{esc(raw)}'>{value_html(raw)}</option>")
+        return "".join(out)
 
     def section_limit_link(
         param: str,
@@ -606,17 +690,10 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
         review_html = (
             f"<div class='review'>"
-            f"<div class='mini'>{esc(ui('last review', '最近标注'))}: <span class='{ 'ok' if review.get('label') == 'correct_true' else '' }'>{value_html(review.get('label') or 'unreviewed')}</span></div>"
+            f"<div class='mini'>{esc(ui('last review', '最近标注'))}: <span class='{ 'ok' if review.get('label') == 'good_presence' else '' }'>{value_html(review.get('label') or 'unreviewed')}</span></div>"
             f"<form method='post' action='{review_action}'>"
             "<select name='label'>"
-            f"<option value='correct_true'>{esc(ui('correct true', '正确触发'))}</option>"
-            f"<option value='correct_false'>{esc(ui('correct false', '正确不触发'))}</option>"
-            f"<option value='missed_opportunity'>{esc(ui('missed opportunity', '漏掉机会'))}</option>"
-            f"<option value='spam'>{esc(ui('spam', '打扰/垃圾'))}</option>"
-            f"<option value='weak_connection'>{esc(ui('weak connection', '关联太弱'))}</option>"
-            f"<option value='repeated'>{esc(ui('repeated', '重复触发'))}</option>"
-            f"<option value='privacy_bad'>{esc(ui('privacy bad', '隐私不合适'))}</option>"
-            f"<option value='great_companion_moment'>{esc(ui('great companion moment', '很好的陪伴时机'))}</option>"
+            f"{review_label_options()}"
             "</select>"
             f"<input name='notes' placeholder='{esc(ui('notes', '标注备注'))}' maxlength='300'>"
             f"<button type='submit'>{esc(ui('save', '保存'))}</button>"
@@ -756,6 +833,132 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
         if not jobs:
             return f"<div class='empty'>{esc(ui('No hidden proactive jobs yet.', '还没有隐藏主动任务。'))}</div>"
         return "<div class='card-list'>" + "".join(job_card(j) for j in jobs[:job_cap]) + "</div>"
+
+    def v2_time(row: dict) -> str:
+        for key in ("ts", "created_at", "updated_at", "completed_at", "fired_at", "blocked_at", "due_at"):
+            if row.get(key) not in (None, ""):
+                return fmt_time(row.get(key))
+        return ""
+
+    def v2_card(row: dict, *, kind: str) -> str:
+        status = str(row.get("status") or row.get("name") or "")
+        title_id = (
+            row.get("turn_id")
+            or row.get("wake_id")
+            or row.get("job_id")
+            or row.get("timer_id")
+            or row.get("event_id")
+            or row.get("call_id")
+            or kind
+        )
+        meta_bits = [
+            f"<span class='meta-bit'><span class='label'>{esc(tr_label('time'))}</span> {esc(v2_time(row))}</span>",
+            f"<span class='meta-bit'><span class='label'>{esc(kind)}</span> {short_id(title_id)}</span>",
+        ]
+        for key in ("source", "trigger", "action_type", "name", "cost_class", "outcome"):
+            if row.get(key):
+                label = "tool" if key == "name" and kind == "tool trace" else key
+                meta_bits.append(
+                    f"<span class='meta-bit'><span class='label'>{esc(tr_label(label))}</span> {value_html(row.get(key))}</span>"
+                )
+        if row.get("wake_ids"):
+            meta_bits.append(f"<span class='meta-bit'><span class='label'>{esc(tr_label('wake_id'))}</span> {esc(', '.join(str(x) for x in row.get('wake_ids') or []))}</span>")
+        body_blocks = []
+        for key in ("change_digest", "scheduled_note", "background_payload", "outcome", "action", "request", "result", "error", "tags", "data"):
+            if row.get(key) not in (None, "", {}, []):
+                body_blocks.append(f"<div class='block'>{fold_json(key, row.get(key))}</div>")
+        if show_payloads:
+            body_blocks.append(f"<div class='block'>{fold_json('payload', row)}</div>")
+        status_pill = f"<span class='verdict {status_class(status)}'>{value_html(status or kind)}</span>"
+        return (
+            f"<article class='card'>"
+            f"  <header class='card-head'>{status_pill}<div class='meta-bits'>{''.join(meta_bits)}</div></header>"
+            f"  <div class='card-body'>{''.join(body_blocks)}</div>"
+            f"</article>"
+        )
+
+    def v2_health_section() -> str:
+        if not v2_runtime_metrics and not v2_turns and not v2_wakes:
+            return f"<div class='empty'>{esc(ui('No Runtime V2 records yet.', '还没有 Runtime V2 记录。'))}</div>"
+        ordered = [
+            ("wake_volume", ui("wake volume", "wake 总量")),
+            ("turn_count", ui("turns", "turn 数")),
+            ("merge_rate", ui("merge rate", "合并率")),
+            ("double_send_rate", ui("double-send rate", "双发率")),
+            ("missed_scheduled_wake_rate", ui("missed scheduled rate", "漏定时率")),
+            ("background_append_success_rate", ui("background append success", "后台回灌成功率")),
+            ("phash_dedupe_rate", ui("pHash dedupe rate", "pHash 去重率")),
+        ]
+        chips = []
+        for key, label in ordered:
+            value = v2_health.get(key)
+            if isinstance(value, float) and key.endswith("_rate"):
+                shown = f"{value:.2%}"
+            elif isinstance(value, float):
+                shown = f"{value:.1f}"
+            else:
+                shown = str(value if value is not None else 0)
+            chips.append(f"<span class='pill'>{esc(label)} {esc(shown)}</span>")
+        return "<div class='runtime-health'>" + "".join(chips) + "</div>"
+
+    def v2_wake_turn_section() -> str:
+        cards = []
+        cards.extend(v2_card(row, kind="wake") for row in v2_wakes[:table_cap])
+        cards.extend(v2_card(row, kind="turn") for row in v2_turns[:table_cap])
+        if not cards:
+            return f"<div class='empty'>{esc(ui('No V2 wakes or turns yet.', '还没有 V2 wake 或 turn。'))}</div>"
+        return "<div class='card-list'>" + "".join(cards) + "</div>"
+
+    def v2_action_tool_rows() -> str:
+        rows = []
+        for action in v2_turn_actions[:table_cap]:
+            rows.append(
+                "<tr>"
+                f"<td>{esc(v2_time(action))}</td>"
+                f"<td>{short_id(action.get('turn_id'))}</td>"
+                f"<td>{value_html(action.get('action_type'))}</td>"
+                f"<td>{fold_json('action', action.get('action') or {}) if show_payloads else short_id(action.get('action_id'))}</td>"
+                "</tr>"
+            )
+        for trace in v2_tool_traces[:table_cap]:
+            rows.append(
+                "<tr>"
+                f"<td>{esc(v2_time(trace))}</td>"
+                f"<td>{short_id(trace.get('turn_id'))}</td>"
+                f"<td>{value_html(trace.get('name'))}</td>"
+                f"<td>{esc(str(trace.get('cost_class') or ''))} / {esc(str(trace.get('outcome') or ''))}"
+                f"<div class='mono mini'>{esc(str(trace.get('latency_ms') or 0))} ms</div></td>"
+                "</tr>"
+            )
+        if not rows:
+            return f"<tr><td colspan='4'>{esc(ui('No V2 turn actions or tool traces yet.', '还没有 V2 turn action 或 tool trace。'))}</td></tr>"
+        return "".join(rows)
+
+    def v2_background_scheduled_rows() -> str:
+        rows = []
+        for bg in v2_background_jobs[:table_cap]:
+            rows.append(
+                "<tr>"
+                f"<td>{esc(v2_time(bg))}</td>"
+                f"<td>{esc(ui('background', '后台任务'))}</td>"
+                f"<td>{short_id(bg.get('job_id'))}</td>"
+                f"<td class='{status_class(bg.get('status'))}'>{value_html(bg.get('status'))}</td>"
+                f"<td>{fold_json('request', bg.get('request') or {}) if show_payloads else short_id(bg.get('turn_id'))}</td>"
+                "</tr>"
+            )
+        for sched in v2_scheduled_wakes[:table_cap]:
+            rows.append(
+                "<tr>"
+                f"<td>{esc(v2_time(sched))}</td>"
+                f"<td>{esc(ui('scheduled', '定时任务'))}</td>"
+                f"<td>{short_id(sched.get('timer_id'))}</td>"
+                f"<td class='{status_class(sched.get('status'))}'>{value_html(sched.get('status'))}</td>"
+                f"<td>{fold_json('payload', sched) if show_payloads else esc(str(sched.get('note') or ''))}</td>"
+                "</tr>"
+            )
+        if not rows:
+            return f"<tr><td colspan='5'>{esc(ui('No V2 background or scheduled records yet.', '还没有 V2 后台或定时记录。'))}</td></tr>"
+        return "".join(rows)
 
     # The remaining three sections (chat writes / frames / events) have
     # fewer columns; tables still fit a reasonable max-width with
@@ -1132,6 +1335,9 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
     <span class="pill">{esc(ui('hidden no-frame ticks', '隐藏空 tick'))} {esc(hidden_no_frame_count)}</span>
     <span class="pill">{esc(ui('human reviews', '人工标注'))} {esc(counts.get('reviews', 0))}</span>
     <span class="pill">{esc(ui('hidden jobs', '隐藏任务'))} {esc(counts.get('jobs', 0))}</span>
+    <span class="pill">{esc(ui('V2 turns', 'V2 Turn'))} {esc(counts.get('v2_turns', 0))}</span>
+    <span class="pill">{esc(ui('V2 actions', 'V2 动作'))} {esc(counts.get('v2_turn_actions', 0))}</span>
+    <span class="pill">{esc(ui('V2 tool traces', 'V2 工具 trace'))} {esc(counts.get('v2_tool_traces', 0))}</span>
     <span class="pill">{esc(ui('proactive writes', '主动写入'))} {esc(counts.get('proactive_messages', 0))}</span>
     <span class="pill">{esc(ui('screen frames', '屏幕帧'))} {esc(counts.get('recent_frames', 0))}</span>
     <span class="pill">{esc(ui('device events', '设备事件'))} {esc(counts.get('device_events', 0))}</span>
@@ -1148,6 +1354,28 @@ def _render_proactive_dashboard(snapshot: dict) -> str:
 
   <h2>{esc(ui('Hidden Jobs', '隐藏任务'))}</h2>
   {job_section()}
+
+  <h2>{esc(ui('Runtime V2 Health', 'Runtime V2 健康度'))}</h2>
+  {v2_health_section()}
+
+  <h2>{esc(ui('Runtime V2 Wakes And Turns', 'Runtime V2 Wake 与 Turn'))}</h2>
+  {v2_wake_turn_section()}
+
+  <h2>{esc(ui('Runtime V2 Actions And Tool Traces', 'Runtime V2 动作与工具 Trace'))}</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>{esc(ui('time', '时间'))}</th><th>{esc(ui('turn', 'Turn'))}</th><th>{esc(ui('type / tool', '类型 / 工具'))}</th><th>{esc(ui('payload / outcome', '内容 / 结果'))}</th></tr></thead>
+      <tbody>{v2_action_tool_rows()}</tbody>
+    </table>
+  </div>
+
+  <h2>{esc(ui('Runtime V2 Background And Scheduled', 'Runtime V2 后台与定时'))}</h2>
+  <div class="table-scroll">
+    <table>
+      <thead><tr><th>{esc(ui('time', '时间'))}</th><th>{esc(ui('kind', '类别'))}</th><th>ID</th><th>{esc(ui('status', '状态'))}</th><th>{esc(ui('payload', '内容'))}</th></tr></thead>
+      <tbody>{v2_background_scheduled_rows()}</tbody>
+    </table>
+  </div>
 
   <h2>{esc(ui('Proactive Chat Writes', '主动消息写入'))}</h2>
   <div class="table-scroll">

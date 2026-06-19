@@ -11,7 +11,10 @@ import time
 import uuid
 from typing import Any, Callable, Mapping, Sequence
 
+import db
 from proactive.tool_catalog_v2 import FAST, SLOW, CostClass, ToolCatalogV2, default_tool_catalog_v2
+
+TOOL_TRACE_STREAM_V2 = "proactive_tool_traces_v2"
 
 HEALTHKIT_UNAVAILABLE_TOOLS_V2 = frozenset({
     "perception.steps",
@@ -65,6 +68,22 @@ class ToolTraceV2:
             "user_id": self.user_id,
             "error_code": self.error_code,
         }
+
+
+class DBToolTraceSinkV2:
+    def __call__(self, trace: ToolTraceV2) -> None:
+        doc = {
+            "kind": "tool_trace_v2",
+            **trace.as_dict(),
+            "ts": time.time(),
+        }
+        db.log_append(
+            trace.user_id,
+            TOOL_TRACE_STREAM_V2,
+            doc,
+            ts=doc["ts"],
+            item_key=trace.call_id,
+        )
 
 
 @dataclass(frozen=True)
