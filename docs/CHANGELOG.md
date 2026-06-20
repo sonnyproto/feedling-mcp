@@ -47,6 +47,44 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-06-20
+
+### [DONE] 三个用户开关（陪伴/定时任务/提醒）端到端落地
+- **后端**（test `b4386f9` → 合 test）：`/v1/proactive/state` GET/POST 暴露
+  `ambient` / `scheduled` / `reminders_delivery`；`scheduled` 升为 first-class
+  持久化；映射单一真相（`enabled=ambient`、`dnd=!reminders_delivery`、scheduled
+  独立）。**iOS**（main `c1dbbbc`/rebase）：Settings 三个 RailToggle，按 subset-accept
+  只发改动键；**清掉死代码** `ProactiveUserState`/`user_state`/`ai_state`（不符合
+  D6，且无处引用）。
+- **为什么**：spec §8.2 的三层 gate（Wake/Voice/Delivery）需要三个用户可见开关，
+  且**定时任务独立于陪伴**（D16，关陪伴不该连坐闹钟）。此前 iOS 根本没有这几个开关
+  入口，后端 settings 也只有 enabled/dnd。
+
+### [DONE] 感知能力 iOS↔后端全量打通（parity review 后收口）
+- **起因**：一次跨仓库 parity review 发现 iOS 发的一批信号后端不接、后端能 wake 的
+  事件 iOS 不发。逐项收口（后端 test `85adbfb`+`dad4900`，CI 绿、镜像已发；iOS main
+  `7663631`）：
+  - **weather / health（睡眠·运动·体征）/ focus** → 注册为加密 **pull-only** 信号，
+    字段名逐字对齐 iOS，走 enclave 解密 + resolver 丢原始；focus 出 `in_focus`
+    pull 提示，**删掉映射到已删 user_state 的死代码**（`resolve_focus`/`_apply_focus`）。
+  - **audio_route**（蓝牙锚点的可行子集）→ iOS 读 `AVAudioSession.currentRoute`
+    （车机/耳机+设备名），加密 pull-only。任意系统级蓝牙连接 iOS 不给第三方 app。
+  - **久别解锁** → iOS 在"前台回归 after >30min 空闲"（gap 端上算）发
+    `unlock_after_absence`；后端早已接好（零改动）。第三方 app 拿不到可用的硬件解锁
+    事件，"重新在场"才是可落地的最直接信号。
+  - **WiFi 锚点 wake（§3.3/D13）** → iOS 发 `wifi_anchor_id`＝BSSID 的端上 HMAC
+    （真 BSSID 永不出设备）；后端把解密 token 喂差分器产 `arrived_at_anchor`，**仅在
+    iOS `changed=true` 时喂**（挡掉"部署后差分器内存态清空+静止用户被批量误唤醒"）。
+  - **后台到达 wake（option B）** → iOS 低功耗 SLC + visit 监测、Always 升权、
+    `location` 后台模式。Seven 选 B（"一到某地就主动找你"）而非 A（只 pull 上下文）。
+- **设计决策（Seven 拍板）**：连续信号一律 pull-only / 不 wake（§3.1/D5）；focus 只作
+  pull 在场提示、绝不复活 user_state（D6/D15）；蓝牙走音频路由子集；WiFi 锚点做哈希
+  指纹**自动学**（不靠用户命名，D13）。
+- **影响文档**：`PROACTIVE_PERCEPTION_SPEC_V2.md`（§2.1/§3.1/§9 B1↓依赖+B1b）、
+  iOS `PERCEPTION_BACKEND_TODO.md`，新增 iOS `PERCEPTION_HANDOFF_2026-06-20.md`。
+- **仍需（工程师，非代码）**：后台定位整条链真机验证（无法在本机 build/跑）、Apple
+  开发者后台开 HealthKit + WeatherKit capability。
+
 ## 2026-06-16
 
 ### [DONE] 解除"单 worker 天花板"——后端可跑 `-w N`（LISTEN/NOTIFY 唤醒总线 + advisory-lock 选主）
