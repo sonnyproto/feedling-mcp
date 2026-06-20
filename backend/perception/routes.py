@@ -22,6 +22,11 @@ def _uid() -> str:
     return _user_store().user_id
 
 
+def _api_key() -> str | None:
+    from accounts.auth import _extract_api_key  # lazy for the same reason as require_user
+    return _extract_api_key()
+
+
 def _body() -> dict:
     return request.get_json(silent=True) or {}
 
@@ -36,7 +41,7 @@ def report():
       - context_snapshot : list of {key, data, message} signal items (data is a
         JSON string or "null"); a `user_state` key sets the manual user_state.
       - items            : {kind: [item, ...]} collections (sleep/workout/vitals).
-      - config           : a config patch (geofences / ssid_labels / focus_map / ...).
+      - config           : a config patch (geofences / ssid_labels / ...).
     At least one must be present (else 400). `client_ts` (optional) timestamps the
     context_snapshot for the freshness/ordering guard. Photos use /photo/evaluate.
     """
@@ -52,7 +57,12 @@ def report():
     if isinstance(cs, list) and cs:
         provided = True
         if use_ingress_v2:
-            results.update(service.ingest_snapshot_v2(uid, cs, client_ts=payload.get("client_ts")))
+            results.update(service.ingest_snapshot_v2(
+                uid,
+                cs,
+                client_ts=payload.get("client_ts"),
+                api_key=_api_key(),
+            ))
         else:
             results.update(service.ingest_snapshot(uid, cs, client_ts=payload.get("client_ts")))
 
@@ -120,7 +130,7 @@ def photo_content(photo_id):
 
 
 # ---------------------------------------------------------------------------
-# Tier 2 collections (calendar / health) — generic read (writes go via /report)
+# Legacy Tier 2 health collections — generic read (writes go via /report)
 # ---------------------------------------------------------------------------
 
 @bp.route("/items/<kind>", methods=["GET"])

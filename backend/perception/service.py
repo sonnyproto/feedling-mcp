@@ -6,10 +6,10 @@ All the generic machinery driven by catalog.py:
   - ingest(): legacy/internal sparse ingest kept during the strangler migration.
   - snapshot(): current authorized+fresh fields; unauthorized/stale -> null.
   - permissions / config views and updates.
-  - user_state with the Focus override/restore stack.
+  - user_state manual override; Focus is pull-only presence context.
   - photo encrypted ingest; photo_added wakes go through PerceptionDifferV2
     only when the V2 ingress rollout flag is enabled.
-  - generic collection ingest/read for Tier 2 (calendar / health).
+  - generic collection ingest/read kept for legacy Tier 2 health clients.
 
 No business logic lives in app.py. The only app.py coupling is a lazy import in
 _fire_wake_event_v2() to enqueue a compatibility proactive job during cutover.
@@ -20,8 +20,10 @@ import logging
 import json
 import time
 from datetime import datetime
+from typing import Any, Callable, Mapping
 
 from content_encryption import random_item_id
+from core import enclave as core_enclave
 
 from . import catalog, resolve, store
 from .ingress_v2 import device_event_observations_v2, operation_observations_v2, observe_signal_v2
@@ -111,6 +113,35 @@ def _parse_data(data):
     return data  # already structured (lenient)
 
 
+def _decode_decrypted_payload_v2(raw: bytes | str | Mapping[str, Any] | list[Any]) -> Any:
+    if isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    if isinstance(raw, str):
+        return json.loads(raw)
+    return raw
+
+
+def _decrypt_signal_payload_v2(
+    key: str,
+    envelope: Mapping[str, Any],
+    *,
+    api_key: str | None = None,
+    decrypt_envelope: Callable[..., bytes | str | Mapping[str, Any] | list[Any]] | None = None,
+) -> tuple[Any | None, str]:
+    if not isinstance(envelope, Mapping):
+        return None, "invalid_envelope"
+    if not api_key and decrypt_envelope is None:
+        return None, "decrypt_skipped"
+    try:
+        decrypt = decrypt_envelope or core_enclave._decrypt_envelope_via_enclave
+        raw = decrypt(dict(envelope), api_key, purpose=f"perception:{key}")
+        return _decode_decrypted_payload_v2(raw), ""
+    except Exception as e:
+        return None, f"decrypt_failed:{type(e).__name__}"
+
+
 def ingest_snapshot(user_id: str, items: list, client_ts=None) -> dict:
     """Ingest a {context_snapshot:[{key,data,message}]} report. `data` is a JSON
     string (or "null"). Composite keys (e.g. device) expand into their sub-signals;
@@ -138,7 +169,14 @@ def ingest_snapshot(user_id: str, items: list, client_ts=None) -> dict:
     return _apply(user_id, pairs, client_ts)
 
 
-def ingest_snapshot_v2(user_id: str, items: list, client_ts=None) -> dict:
+def ingest_snapshot_v2(
+    user_id: str,
+    items: list,
+    client_ts=None,
+    *,
+    api_key: str | None = None,
+    decrypt_envelope: Callable[..., bytes | str | Mapping[str, Any] | list[Any]] | None = None,
+) -> dict:
     """Ingest the current iOS report contract without letting the old service
     directly create wakes.
 
@@ -186,6 +224,18 @@ def ingest_snapshot_v2(user_id: str, items: list, client_ts=None) -> dict:
         if key in ENCRYPTED_SIGNAL_KEYS_V2:
             if signal.encrypted:
                 results[key] = "accepted"
+                plaintext, err = _decrypt_signal_payload_v2(
+                    key,
+                    item.get("envelope") if isinstance(item.get("envelope"), Mapping) else {},
+                    api_key=api_key,
+                    decrypt_envelope=decrypt_envelope,
+                )
+                if err == "":
+                    storage_items.append({
+                        "key": key,
+                        "data": json.dumps(plaintext),
+                        "message": signal.message,
+                    })
             else:
                 storage_items.append(item)
             continue
@@ -278,12 +328,6 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
             results[input_name] = "unknown_signal"
             continue
 
-        # Focus drives the user_state override stack (value None -> clear).
-        if sig.capability == "focus":
-            _apply_focus(user_id, value, config)
-            results[input_name] = "accepted"
-            continue
-
         fields: list[str] = []
         if value is None:
             # data:"null" -> field unavailable now; record null + message. No wake.
@@ -327,24 +371,6 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
             _maybe_wake(user_id, capk, debounce, f, old, new_v, now)
 
     return results
-
-
-def _apply_focus(user_id: str, value, config: dict) -> None:
-    """Maintain the {manual, focus_override} stack. An active Focus overrides the
-    manual user_state; clearing Focus (none/null) restores the manual value.
-    `value` may be a string, a dict ({ios_focus|focus|state:..}), or None."""
-    if isinstance(value, dict):
-        raw = value.get("ios_focus") or value.get("focus") or value.get("state")
-    else:
-        raw = value
-    raw = (str(raw) if raw is not None else "none").strip().lower()
-    doc = store.get_user_state_doc(user_id)
-    doc.setdefault("manual", doc.get("manual") or "default")
-    if raw in ("", "none"):
-        doc["focus_override"] = None
-    else:
-        doc["focus_override"] = resolve.resolve_focus(value, config).get("user_state")
-    store.set_user_state_doc(user_id, doc)
 
 
 def _maybe_unlock_wake(user_id, patch, written, prev_state, now, wake_candidates) -> None:
@@ -569,17 +595,17 @@ def _fire_wake(user_id: str, cap_key: str, hint: str, now: float) -> None:
 # Snapshot
 # ---------------------------------------------------------------------------
 
-def snapshot(user_id: str, now: float | None = None) -> dict:
+def _catalog_snapshot_fields(user_id: str, now: float | None = None, *, include_query_tools: bool = False) -> dict:
     now = now or _now()
     state = store.get_state(user_id)
     snap: dict = {}
     for sig in catalog.SIGNALS.values():
         cap = catalog.CAPABILITIES.get(sig.capability)
-        if not cap or not cap.context_field:
+        if not cap or not (cap.context_field or (include_query_tools and cap.query_tool)):
             continue
         for f in sig.outputs:
             if f == "user_state":
-                continue  # owned by the focus/manual stack, set below
+                continue
             cell = state.get(f)
             if not isinstance(cell, dict):
                 snap[f] = None
@@ -588,6 +614,11 @@ def snapshot(user_id: str, now: float | None = None) -> dict:
                 snap[f] = None  # stale -> agent treats as "don't infer"
             else:
                 snap[f] = cell.get("v")  # null cell -> None (= no permission now)
+    return snap
+
+
+def snapshot(user_id: str, now: float | None = None) -> dict:
+    snap = _catalog_snapshot_fields(user_id, now, include_query_tools=False)
     # user_state is always present (manual default if nothing set).
     snap["user_state"] = effective_user_state(user_id)
     # recent_apps folds the old /app_usage read; capped to keep snapshot small.
@@ -595,12 +626,21 @@ def snapshot(user_id: str, now: float | None = None) -> dict:
     return snap
 
 
+def pull_snapshot(user_id: str, now: float | None = None) -> dict:
+    """Authorized fresh state for explicit pull tools.
+
+    This includes query_tool capabilities such as weather/health without adding
+    them to the cheap wake-attached `perception.now` snapshot.
+    """
+    return _catalog_snapshot_fields(user_id, now, include_query_tools=True)
+
+
 # ---------------------------------------------------------------------------
 # user_state
 # ---------------------------------------------------------------------------
 
 def _effective_from_doc(doc: dict) -> str:
-    return doc.get("focus_override") or doc.get("manual") or "default"
+    return doc.get("manual") or "default"
 
 
 def effective_user_state(user_id: str) -> str:
@@ -734,7 +774,7 @@ def photo_content(user_id: str, photo_id: str) -> tuple[dict, int]:
 
 
 # ---------------------------------------------------------------------------
-# Tier 2 collections (calendar / health) — generic
+# Legacy Tier 2 health collections — generic
 # ---------------------------------------------------------------------------
 
 def items_ingest(user_id: str, kind: str, items: list[dict]) -> tuple[dict, int]:

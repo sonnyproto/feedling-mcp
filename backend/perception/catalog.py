@@ -63,8 +63,10 @@ CAPABILITIES: dict[str, Capability] = {c.key: c for c in [
                wake_source=True, debounce_sec=30.0, context_field=True),
     Capability("calendar", "日历下一场日程", 1, context_field=True, query_tool=True),
     Capability("now_playing", "你在听的音乐", 1, context_field=True, query_tool=True),
+    Capability("focus", "专注模式", 1, context_field=True),
     Capability("app", "你在用哪个 app（通过 iOS 快捷指令上报）", 1,
                context_field=True, query_tool=True),
+    Capability("weather", "粗天气", 2, query_tool=True),
     Capability("photos", "你拍的照片", 2, wake_source=True, query_tool=True),
     Capability("health_sleep", "睡眠", 2, query_tool=True),
     Capability("health_workout", "运动", 2, query_tool=True),
@@ -87,6 +89,8 @@ SIGNALS: dict[str, Signal] = {s.input: s for s in [
            resolver="battery", ttl_sec=600.0, significant=False),
     Signal("broadcast", "broadcast", ("broadcast_state", "broadcast_active"),
            resolver="broadcast", ttl_sec=300.0, significant=False),
+    Signal("focus", "focus", ("focus_authorization_status", "in_focus"),
+           resolver="focus_presence", ttl_sec=300.0, significant=False),
 
     # permissioned
     Signal("location_signal", "location", ("place_label", "wifi_label", "country"),
@@ -96,6 +100,14 @@ SIGNALS: dict[str, Signal] = {s.input: s for s in [
            ttl_sec=3600.0, significant=False),
     Signal("playback", "now_playing", ("now_playing",),
            ttl_sec=600.0, significant=False),
+    Signal("weather", "weather", ("condition", "temperature_bucket", "is_daylight"),
+           resolver="weather", ttl_sec=1800.0, significant=False),
+    Signal("health_sleep", "health_sleep", ("asleep_minutes_bucket",),
+           resolver="health_sleep", ttl_sec=86400.0, significant=False),
+    Signal("health_workout", "health_workout", ("workout_type", "duration_min_bucket", "count_today"),
+           resolver="health_workout", ttl_sec=86400.0, significant=False),
+    Signal("health_vitals", "health_vitals", ("resting_heart_rate_bucket", "step_count_bucket"),
+           resolver="health_vitals", ttl_sec=3600.0, significant=False),
     # `app` is reported via the GET /app_open shortcut endpoint (not /report); this
     # entry exists so app_name/app_category appear in the snapshot with a TTL.
     Signal("app", "app", ("app_name", "app_category"),

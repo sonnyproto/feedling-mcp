@@ -1,7 +1,7 @@
 """Raw -> coarse-label resolvers.
 
 These run on ingest. They take a RAW reported value (lat/lon, ssid, bundle id,
-iOS focus) plus the user's perception_config, and return only the resolved
+device context) plus the user's perception_config, and return only the resolved
 coarse label(s). The caller persists the returned labels and DISCARDS the raw
 value, so the agent never sees an address / SSID / exact bundle.
 
@@ -97,38 +97,6 @@ def resolve_bundle(value, config: dict) -> dict:
     return {"app_category": cat, "app_bundle": bundle}
 
 
-# iOS Focus -> user_state default mapping (per the requirements doc; each row
-# is overridable via config["focus_map"]).
-_DEFAULT_FOCUS_MAP = {
-    "none": "default",
-    "work": "focused",
-    "sleep": "away",
-    "driving": "away",
-    "dnd": "away",
-    "do_not_disturb": "away",
-    "personal": "default",
-    # any custom / unrecognized focus -> focused (doc default)
-}
-
-
-def resolve_focus(value, config: dict) -> dict:
-    """value: ios_focus identifier (or "" / "none" when Focus cleared).
-    config["focus_map"]: per-row overrides of the default mapping.
-    Returns {"user_state": <default|focused|away>}. The override/restore stack
-    (Focus overrides the manual user_state, clearing restores it) is applied in
-    service, which treats the `focus` capability specially.
-    """
-    if isinstance(value, dict):
-        focus = value.get("ios_focus") or value.get("focus") or value.get("state")
-    else:
-        focus = value
-    focus = (str(focus) if focus is not None else "none").strip().lower()
-    fmap = {**_DEFAULT_FOCUS_MAP, **(config.get("focus_map") or {})}
-    if focus in fmap:
-        return {"user_state": fmap[focus]}
-    return {"user_state": "focused"}  # custom focus default
-
-
 # A tiny starter category map. Real lists live in DESIGN/config; this is just a
 # sane fallback so the feature works before a user customizes bundle_categories.
 _DEFAULT_BUNDLE_CATEGORIES = {
@@ -176,6 +144,44 @@ def resolve_broadcast(value, config: dict) -> dict:
             "broadcast_active": value.get("active")}
 
 
+def resolve_focus_presence(value, config: dict) -> dict:
+    """`focus` data: {authorization_status, focused}.
+
+    Focus is pull-only presence context. It must never write user_state or
+    revive the old away/focused platform gate.
+    """
+    if not isinstance(value, dict):
+        return {"focus_authorization_status": None, "in_focus": None}
+    auth = value.get("authorization_status")
+    focused = value.get("focused")
+    return {
+        "focus_authorization_status": auth,
+        "in_focus": bool(focused) if isinstance(focused, bool) else None,
+    }
+
+
+def _copy_fields(value, fields: tuple[str, ...]) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    return {field: value.get(field) for field in fields if field in value}
+
+
+def resolve_weather(value, config: dict) -> dict:
+    return _copy_fields(value, ("condition", "temperature_bucket", "is_daylight"))
+
+
+def resolve_health_sleep(value, config: dict) -> dict:
+    return _copy_fields(value, ("asleep_minutes_bucket",))
+
+
+def resolve_health_workout(value, config: dict) -> dict:
+    return _copy_fields(value, ("workout_type", "duration_min_bucket", "count_today"))
+
+
+def resolve_health_vitals(value, config: dict) -> dict:
+    return _copy_fields(value, ("resting_heart_rate_bucket", "step_count_bucket"))
+
+
 def resolve_location_signal(value, config: dict) -> dict:
     """`location_signal` data is a rich object that (per the iOS contract) carries
     PRECISE fields — exact lat/lon, Wi-Fi BSSID, full placemark address. We keep
@@ -205,9 +211,13 @@ RESOLVERS = {
     "geofence": resolve_geofence,
     "ssid": resolve_ssid,
     "bundle": resolve_bundle,
-    "focus": resolve_focus,
     "time": resolve_time,
     "battery": resolve_battery,
     "broadcast": resolve_broadcast,
+    "focus_presence": resolve_focus_presence,
+    "weather": resolve_weather,
+    "health_sleep": resolve_health_sleep,
+    "health_workout": resolve_health_workout,
+    "health_vitals": resolve_health_vitals,
     "location_signal": resolve_location_signal,
 }

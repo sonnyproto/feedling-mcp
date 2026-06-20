@@ -16,12 +16,6 @@ from proactive.tool_catalog_v2 import FAST, SLOW, CostClass, ToolCatalogV2, defa
 
 TOOL_TRACE_STREAM_V2 = "proactive_tool_traces_v2"
 
-HEALTHKIT_UNAVAILABLE_TOOLS_V2 = frozenset({
-    "perception.steps",
-    "perception.sleep_last_night",
-    "perception.workout",
-    "perception.vitals",
-})
 PR3_UNIMPLEMENTED_TOOLS_V2 = frozenset({
     "screen.read",
     "screen.recent",
@@ -134,6 +128,7 @@ class ToolBudgetStateV2:
 @dataclass(frozen=True)
 class ToolRuntimeAdaptersV2:
     perception_snapshot: Callable[[str], Mapping[str, Any]] | None = None
+    perception_pull_snapshot: Callable[[str], Mapping[str, Any]] | None = None
     photos_recent: Callable[[str, int], Mapping[str, Any]] | None = None
     memory_load: Callable[[str], Sequence[Mapping[str, Any]]] | None = None
     send_message: Callable[[str, str, Mapping[str, Any]], Mapping[str, Any]] | None = None
@@ -144,6 +139,11 @@ def default_tool_runtime_adapters_v2() -> ToolRuntimeAdaptersV2:
         from perception import service as perception_service
 
         return perception_service.snapshot(user_id)
+
+    def perception_pull_snapshot(user_id: str) -> Mapping[str, Any]:
+        from perception import service as perception_service
+
+        return perception_service.pull_snapshot(user_id)
 
     def photos_recent(user_id: str, limit: int) -> Mapping[str, Any]:
         from perception import service as perception_service
@@ -158,6 +158,7 @@ def default_tool_runtime_adapters_v2() -> ToolRuntimeAdaptersV2:
 
     return ToolRuntimeAdaptersV2(
         perception_snapshot=perception_snapshot,
+        perception_pull_snapshot=perception_pull_snapshot,
         photos_recent=photos_recent,
         memory_load=memory_load,
     )
@@ -195,16 +196,6 @@ class ToolExecutorV2:
                 error_message=f"unknown tool: {call.name}",
             )
 
-        if call.name in HEALTHKIT_UNAVAILABLE_TOOLS_V2:
-            return self._finish(
-                call,
-                cost_class,
-                started,
-                ok=False,
-                outcome="unavailable",
-                error_code="healthkit_unavailable",
-                error_message="HealthKit-backed perception is unavailable until iOS support lands.",
-            )
         if call.name in PR3_UNIMPLEMENTED_TOOLS_V2:
             return self._finish(
                 call,
@@ -276,6 +267,14 @@ class ToolExecutorV2:
             "perception.motion",
         } and not self.adapters.perception_snapshot:
             return ("perception_snapshot_adapter_missing", "perception snapshot adapter is not configured")
+        if call.name in {
+            "perception.weather",
+            "perception.steps",
+            "perception.sleep_last_night",
+            "perception.workout",
+            "perception.vitals",
+        } and not (self.adapters.perception_pull_snapshot or self.adapters.perception_snapshot):
+            return ("perception_snapshot_adapter_missing", "perception snapshot adapter is not configured")
         if call.name == "perception.photo_recent" and not self.adapters.photos_recent:
             return ("photo_recent_adapter_missing", "photo recent adapter is not configured")
         if call.name in {"memory.index", "memory.fetch"} and not self.adapters.memory_load:
@@ -322,6 +321,32 @@ class ToolExecutorV2:
             return {"now_playing": self._snapshot(call.user_id).get("now_playing")}
         if call.name == "perception.motion":
             return {"motion_state": self._snapshot(call.user_id).get("motion_state")}
+        if call.name == "perception.weather":
+            state = self._pull_snapshot(call.user_id)
+            return {"weather": {
+                "condition": state.get("condition"),
+                "temperature_bucket": state.get("temperature_bucket"),
+                "is_daylight": state.get("is_daylight"),
+            }}
+        if call.name == "perception.steps":
+            return {"steps": {"step_count_bucket": self._pull_snapshot(call.user_id).get("step_count_bucket")}}
+        if call.name == "perception.sleep_last_night":
+            return {"sleep_last_night": {
+                "asleep_minutes_bucket": self._pull_snapshot(call.user_id).get("asleep_minutes_bucket"),
+            }}
+        if call.name == "perception.workout":
+            state = self._pull_snapshot(call.user_id)
+            return {"workout": {
+                "workout_type": state.get("workout_type"),
+                "duration_min_bucket": state.get("duration_min_bucket"),
+                "count_today": state.get("count_today"),
+            }}
+        if call.name == "perception.vitals":
+            state = self._pull_snapshot(call.user_id)
+            return {"vitals": {
+                "resting_heart_rate_bucket": state.get("resting_heart_rate_bucket"),
+                "step_count_bucket": state.get("step_count_bucket"),
+            }}
         if call.name == "perception.photo_recent":
             limit = _int_arg(args.get("limit"), default=10, lo=1, hi=50)
             assert self.adapters.photos_recent is not None
@@ -344,6 +369,11 @@ class ToolExecutorV2:
         if not self.adapters.perception_snapshot:
             raise ToolUnavailableV2("perception_snapshot_adapter_missing", "perception snapshot adapter is not configured")
         return self.adapters.perception_snapshot(user_id)
+
+    def _pull_snapshot(self, user_id: str) -> Mapping[str, Any]:
+        if self.adapters.perception_pull_snapshot:
+            return self.adapters.perception_pull_snapshot(user_id)
+        return self._snapshot(user_id)
 
     def _memories(self, user_id: str) -> Sequence[Mapping[str, Any]]:
         if not self.adapters.memory_load:

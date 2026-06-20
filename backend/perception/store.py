@@ -21,8 +21,8 @@ log = logging.getLogger("perception.store")
 
 # user_blobs kinds (singletons, one row per user)
 STATE = "perception_state"            # {field: {"v": .., "ts": ..}}
-CONFIG = "perception_config"          # geofences / ssid_labels / focus_map / ...
-USER_STATE = "perception_user_state"  # {"manual": "default", "focus_override": None}
+CONFIG = "perception_config"          # geofences / ssid_labels / ...
+USER_STATE = "perception_user_state"  # {"manual": "default"}
 
 EVENT_STREAM = "perception_events"
 # Wake/change audit trail: one append per perception evaluation (wake /

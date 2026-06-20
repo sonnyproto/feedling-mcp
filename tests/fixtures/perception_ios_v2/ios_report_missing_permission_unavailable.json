@@ -41,6 +41,26 @@
       "message": "未授权媒体资料库，无法读取正在播放上下文"
     },
     {
+      "key": "weather",
+      "data": null,
+      "message": "WeatherKit 不可用，无法读取粗天气"
+    },
+    {
+      "key": "health_sleep",
+      "data": null,
+      "message": "HealthKit 不可用，无法读取睡眠趋势"
+    },
+    {
+      "key": "health_workout",
+      "data": null,
+      "message": "HealthKit 不可用，无法读取运动趋势"
+    },
+    {
+      "key": "health_vitals",
+      "data": null,
+      "message": "HealthKit 不可用，无法读取身体趋势"
+    },
+    {
       "key": "unsupported",
       "data": "{\"frontmost_app\":null,\"precise_unlock\":null,\"silent_mode\":null}",
       "message": "iOS 当前不能稳定提供的感知项"

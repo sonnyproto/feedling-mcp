@@ -30,6 +30,16 @@ def _adapters(*, send_message=None, photos_recent=None) -> ToolRuntimeAdaptersV2
         "calendar_next_event": {"title": "Dentist", "starts_at": "2026-06-20T10:00:00+08:00"},
         "now_playing": {"title": "Song"},
         "motion_state": "walking",
+        "in_focus": True,
+        "condition": "rain",
+        "temperature_bucket": 20,
+        "is_daylight": False,
+        "asleep_minutes_bucket": 420,
+        "workout_type": "running",
+        "duration_min_bucket": 30,
+        "count_today": 1,
+        "resting_heart_rate_bucket": 60,
+        "step_count_bucket": 3500,
     }
     memories = [
         {
@@ -49,6 +59,7 @@ def _adapters(*, send_message=None, photos_recent=None) -> ToolRuntimeAdaptersV2
     ]
     return ToolRuntimeAdaptersV2(
         perception_snapshot=lambda _user_id: snapshot,
+        perception_pull_snapshot=lambda _user_id: snapshot,
         photos_recent=photos_recent or (lambda _user_id, limit: {"photos": [{"photo_id": "p1"}], "limit": limit}),
         memory_load=lambda _user_id: memories,
         send_message=send_message,
@@ -89,6 +100,7 @@ def test_executor_runs_minimum_available_tools_with_injected_action_adapter():
         ToolCallV2("perception.calendar", user_id="u1", args={"window_days": 1}),
         ToolCallV2("perception.now_playing", user_id="u1"),
         ToolCallV2("perception.motion", user_id="u1"),
+        ToolCallV2("perception.weather", user_id="u1"),
         ToolCallV2("perception.photo_recent", user_id="u1", args={"limit": 1}),
         ToolCallV2("memory.index", user_id="u1"),
         ToolCallV2("memory.fetch", user_id="u1", args={"ids": ["mem_2"]}),
@@ -101,25 +113,34 @@ def test_executor_runs_minimum_available_tools_with_injected_action_adapter():
     assert results[0].result["snapshot"]["place_label"] == "home"
     assert results[1].result["location"]["wifi_label"] == "wifi-home"
     assert results[2].result["calendar_next_event"]["title"] == "Dentist"
-    assert results[5].result["photos"][0]["photo_id"] == "p1"
-    assert results[6].result["memories"][0]["id"] == "mem_1"
-    assert results[7].result["memories"][0]["id"] == "mem_2"
+    assert results[5].result["weather"] == {
+        "condition": "rain",
+        "temperature_bucket": 20,
+        "is_daylight": False,
+    }
+    assert results[6].result["photos"][0]["photo_id"] == "p1"
+    assert results[7].result["memories"][0]["id"] == "mem_1"
+    assert results[8].result["memories"][0]["id"] == "mem_2"
     assert sent == [("u1", "hello", {"text": "hello"})]
 
 
-def test_healthkit_tools_fail_explicitly_without_fake_data():
-    executor = ToolExecutorV2(adapters=_adapters())
+def test_weather_and_health_tools_read_ios_snapshot_fields():
+    executor = ToolExecutorV2(adapters=_adapters(), budget=ToolBudgetV2(slow_inline_limit=5))
 
-    for name in ("perception.steps", "perception.sleep_last_night", "perception.workout", "perception.vitals"):
-        result = executor.execute(ToolCallV2(name, user_id="u1", wake_id="wake_1", turn_id="turn_1"))
-        assert result.ok is False
-        assert result.outcome == "unavailable"
-        assert result.error_code == "healthkit_unavailable"
-        assert result.result == {}
-        assert result.trace is not None
-        assert result.trace.name == name
-        assert result.trace.wake_id == "wake_1"
-        assert result.trace.turn_id == "turn_1"
+    weather = executor.execute(ToolCallV2("perception.weather", user_id="u1"))
+    steps = executor.execute(ToolCallV2("perception.steps", user_id="u1"))
+    sleep = executor.execute(ToolCallV2("perception.sleep_last_night", user_id="u1"))
+    workout = executor.execute(ToolCallV2("perception.workout", user_id="u1"))
+    vitals = executor.execute(ToolCallV2("perception.vitals", user_id="u1"))
+
+    assert weather.ok is True
+    assert weather.result["weather"]["condition"] == "rain"
+    assert steps.result["steps"]["step_count_bucket"] == 3500
+    assert sleep.result["sleep_last_night"]["asleep_minutes_bucket"] == 420
+    assert workout.result["workout"]["workout_type"] == "running"
+    assert workout.result["workout"]["count_today"] == 1
+    assert vitals.result["vitals"]["resting_heart_rate_bucket"] == 60
+    assert vitals.result["vitals"]["step_count_bucket"] == 3500
 
 
 def test_tool_traces_record_name_cost_latency_outcome_and_wake_turn_ids():
@@ -213,7 +234,7 @@ def test_unavailable_tools_are_not_masked_by_budget_handoff():
     healthkit = executor.execute(ToolCallV2("perception.steps", user_id="u1"))
     screen = executor.execute(ToolCallV2("screen.read", user_id="u1", args={"mode": "full"}))
 
-    assert healthkit.outcome == "unavailable"
-    assert healthkit.error_code == "healthkit_unavailable"
+    assert healthkit.outcome == "needs_background"
+    assert healthkit.error_code == "slow_budget_soft_handoff"
     assert screen.outcome == "unavailable"
     assert screen.error_code == "tool_not_implemented_in_pr3"

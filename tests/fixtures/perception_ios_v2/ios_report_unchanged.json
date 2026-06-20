@@ -81,6 +81,66 @@
       "changed": false
     },
     {
+      "key": "weather",
+      "envelope": {
+        "v": 1,
+        "id": "dddddddddddddddddddddddddddddddd",
+        "body_ct": "base64-weather-body-2",
+        "nonce": "base64-weather-nonce-2",
+        "K_user": "base64-weather-k-user-2",
+        "K_enclave": "base64-weather-k-enclave-2",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": false
+    },
+    {
+      "key": "health_sleep",
+      "envelope": {
+        "v": 1,
+        "id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "body_ct": "base64-health-sleep-body-2",
+        "nonce": "base64-health-sleep-nonce-2",
+        "K_user": "base64-health-sleep-k-user-2",
+        "K_enclave": "base64-health-sleep-k-enclave-2",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": false
+    },
+    {
+      "key": "health_workout",
+      "envelope": {
+        "v": 1,
+        "id": "ffffffffffffffffffffffffffffffff",
+        "body_ct": "base64-health-workout-body-2",
+        "nonce": "base64-health-workout-nonce-2",
+        "K_user": "base64-health-workout-k-user-2",
+        "K_enclave": "base64-health-workout-k-enclave-2",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": false
+    },
+    {
+      "key": "health_vitals",
+      "envelope": {
+        "v": 1,
+        "id": "abababababababababababababababab",
+        "body_ct": "base64-health-vitals-body-2",
+        "nonce": "base64-health-vitals-nonce-2",
+        "K_user": "base64-health-vitals-k-user-2",
+        "K_enclave": "base64-health-vitals-k-enclave-2",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": false
+    },
+    {
       "key": "unsupported",
       "data": "{\"frontmost_app\":null,\"precise_unlock\":null,\"silent_mode\":null}",
       "message": "iOS 当前不能稳定提供的感知项"

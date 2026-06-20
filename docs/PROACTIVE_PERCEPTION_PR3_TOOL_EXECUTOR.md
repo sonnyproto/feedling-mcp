@@ -38,15 +38,15 @@ Implemented read/action layer:
 - `memory.fetch`
 - `send_message` when a hosted/resident output adapter is injected
 - `sleep`
-
-Explicitly unavailable:
-
+- `perception.weather`
 - `perception.steps`
 - `perception.sleep_last_night`
 - `perception.workout`
 - `perception.vitals`
 
-These return `healthkit_unavailable` with no fake payload.
+Weather and health tools read the iOS encrypted snapshot state after backend
+ingress decrypts it; absent or stale fields return `null` values rather than
+fake data.
 
 Cataloged but not implemented in PR3:
 

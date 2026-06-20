@@ -145,6 +145,57 @@ def test_pr6b_real_ios_report_fixture_is_accepted_without_wake_or_plaintext_stat
     assert "now_playing" not in state
 
 
+def test_weather_health_and_focus_ingress_are_pull_only_after_decrypt(monkeypatch):
+    fake = _Store()
+    emitted = []
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_submit_wake_event_v2_compat", lambda event: emitted.append(event))
+
+    plaintext_by_id = {
+        "env_weather": {"condition": "rain", "temperature_bucket": 20, "is_daylight": False},
+        "env_sleep": {"asleep_minutes_bucket": 420},
+        "env_workout": {"workout_type": "running", "duration_min_bucket": 30, "count_today": 1},
+        "env_vitals": {"resting_heart_rate_bucket": 60, "step_count_bucket": 3500},
+    }
+
+    def decrypt(envelope, api_key, *, purpose):
+        assert api_key == "api-key"
+        assert purpose.startswith("perception:")
+        return json.dumps(plaintext_by_id[envelope["id"]]).encode("utf-8")
+
+    results = service.ingest_snapshot_v2(
+        "u_weather_health",
+        [
+            {"key": "focus", "data": json.dumps({"authorization_status": "authorized", "focused": True})},
+            {"key": "weather", "envelope": {"id": "env_weather"}, "changed": True},
+            {"key": "health_sleep", "envelope": {"id": "env_sleep"}, "changed": True},
+            {"key": "health_workout", "envelope": {"id": "env_workout"}, "changed": True},
+            {"key": "health_vitals", "envelope": {"id": "env_vitals"}, "changed": True},
+        ],
+        client_ts=200.0,
+        api_key="api-key",
+        decrypt_envelope=decrypt,
+    )
+
+    assert results["focus"] == "accepted"
+    for key in ("weather", "health_sleep", "health_workout", "health_vitals"):
+        assert results[key] == "accepted"
+    state = fake.get_state("u_weather_health")
+    assert state["focus_authorization_status"]["v"] == "authorized"
+    assert state["in_focus"]["v"] is True
+    assert state["condition"]["v"] == "rain"
+    assert state["temperature_bucket"]["v"] == 20
+    assert state["is_daylight"]["v"] is False
+    assert state["asleep_minutes_bucket"]["v"] == 420
+    assert state["workout_type"]["v"] == "running"
+    assert state["duration_min_bucket"]["v"] == 30
+    assert state["count_today"]["v"] == 1
+    assert state["resting_heart_rate_bucket"]["v"] == 60
+    assert state["step_count_bucket"]["v"] == 3500
+    assert service.pull_snapshot("u_weather_health", now=200.0)["in_focus"] is True
+    assert emitted == []
+
+
 def test_per_user_ingress_flag_defaults_off_and_prefers_runtime_profile(monkeypatch):
     from hosted import config_store as hosted_config_store
 

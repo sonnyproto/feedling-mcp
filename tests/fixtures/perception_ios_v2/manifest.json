@@ -2,7 +2,7 @@
   "ios_repo": {
     "path": "/Users/xiaotingtan/Desktop/feedling-mcp-ios",
     "branch": "main",
-    "commit": "23d1eba54557b5f133ca720083038dd9a5d68d54"
+    "commit": "fd60d3f5813128e46f4e68b8cc0ed0b0740a53d0"
   },
   "source_files": [
     "App/FeedlingTest/Pages/Settings/Perception/PerceptionContextSnapshot.swift",
@@ -12,8 +12,8 @@
     "App/FeedlingBroadcast/SampleHandler.swift"
   ],
   "fixtures": {
-    "ios_report_full_changed.json": "All currently emitted report keys, encrypted sensitive signals changed=true.",
-    "ios_report_unchanged.json": "Same encrypted sensitive signal shape with changed=false.",
+    "ios_report_full_changed.json": "All currently emitted report keys, encrypted sensitive/weather/health signals changed=true.",
+    "ios_report_unchanged.json": "Same encrypted sensitive/weather/health signal shape with changed=false.",
     "ios_report_missing_permission_unavailable.json": "NSNull data shape for missing permission and authorized-but-unavailable signals.",
     "ios_report_dropped_upload.json": "Content keys unavailable: encrypted signals are omitted from context_snapshot.",
     "ios_photo_evaluate_document.json": "Current iOS photo/evaluate body: metadata + content_envelope + optional meta_envelope, no exif_gps."
@@ -23,15 +23,13 @@
       "location_signal",
       "motion_state",
       "calendar_next_event",
-      "playback"
+      "playback",
+      "weather",
+      "health_sleep",
+      "health_workout",
+      "health_vitals"
     ],
     "source_behavior": "encryptedContextItem returns nil when content keys are unavailable, so collectContextSnapshotItems compactMaps the signal out of the report."
-  },
-  "healthkit": {
-    "steps": "ios_unimplemented",
-    "sleep_last_night": "ios_unimplemented",
-    "workout": "ios_unimplemented",
-    "vitals": "ios_unimplemented"
   },
   "human_device_report": {
     "status": "pending_user_verification",

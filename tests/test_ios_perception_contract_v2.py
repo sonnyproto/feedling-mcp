@@ -7,7 +7,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from perception import service
 from perception.ios_contract_v2 import (  # noqa: E402
     EXPECTED_REPORT_KEYS_V2,
-    HEALTHKIT_UNAVAILABLE_V2,
     classify_item_v2,
     classify_report_v2,
     missing_expected_keys_v2,
@@ -29,8 +28,7 @@ def _by_key(signals):
 def test_ios_contract_manifest_tracks_source_and_human_device_gate():
     manifest = _load("manifest.json")
 
-    assert manifest["ios_repo"]["commit"] == "23d1eba54557b5f133ca720083038dd9a5d68d54"
-    assert manifest["healthkit"] == HEALTHKIT_UNAVAILABLE_V2
+    assert manifest["ios_repo"]["commit"] == "fd60d3f5813128e46f4e68b8cc0ed0b0740a53d0"
     assert manifest["human_device_report"]["status"] == "pending_user_verification"
 
 
@@ -55,7 +53,16 @@ def test_ios_full_report_fixture_classifies_current_payload_shape():
     assert signals["focus"].differ_inputs == ()
     assert signals["focus"].wake_policy == "pull_only"
 
-    for key in ("location_signal", "motion_state", "calendar_next_event", "playback"):
+    for key in (
+        "location_signal",
+        "motion_state",
+        "calendar_next_event",
+        "playback",
+        "weather",
+        "health_sleep",
+        "health_workout",
+        "health_vitals",
+    ):
         signal = signals[key]
         assert signal.status == "changed"
         assert signal.changed is True
@@ -74,6 +81,9 @@ def test_ios_full_report_fixture_classifies_current_payload_shape():
         "calendar_next_event",
     )
     assert signals["playback"].differ_inputs == ("now_playing",)
+    for key in ("weather", "health_sleep", "health_workout", "health_vitals"):
+        assert signals[key].differ_inputs == (key,)
+        assert signals[key].wake_policy == "pull_only_after_decrypt"
     assert signals["unsupported"].status == "ignored"
 
 
@@ -81,7 +91,16 @@ def test_ios_unchanged_encrypted_signals_do_not_imply_wake():
     payload = _load("ios_report_unchanged.json")
     signals = _by_key(classify_report_v2(payload))
 
-    for key in ("location_signal", "motion_state", "calendar_next_event", "playback"):
+    for key in (
+        "location_signal",
+        "motion_state",
+        "calendar_next_event",
+        "playback",
+        "weather",
+        "health_sleep",
+        "health_workout",
+        "health_vitals",
+    ):
         assert signals[key].status == "unchanged"
         assert signals[key].changed is False
         assert signals[key].requires_decrypt is True
@@ -91,7 +110,17 @@ def test_ios_missing_permission_and_unavailable_shapes_are_null_no_wake():
     payload = _load("ios_report_missing_permission_unavailable.json")
     signals = _by_key(classify_report_v2(payload))
 
-    for key in ("location_signal", "motion_state", "focus", "calendar_next_event", "playback"):
+    for key in (
+        "location_signal",
+        "motion_state",
+        "focus",
+        "calendar_next_event",
+        "playback",
+        "weather",
+        "health_sleep",
+        "health_workout",
+        "health_vitals",
+    ):
         assert signals[key].status == "unavailable"
         assert signals[key].wake_policy in {"no_wake", "pull_only"}
         assert signals[key].data is None
@@ -119,6 +148,10 @@ def test_contract_mapped_continuous_signals_produce_zero_differ_events():
         ("motion_state", {"state": "walking", "confidence": "high"}),
         ("now_playing", {"playback_state": "playing", "title": "Song"}),
         ("place_label", "home"),
+        ("weather", {"condition": "rain", "temperature_bucket": 20}),
+        ("health_sleep", {"asleep_minutes_bucket": 420}),
+        ("health_workout", {"workout_type": "running", "count_today": 1}),
+        ("health_vitals", {"resting_heart_rate_bucket": 60, "step_count_bucket": 3500}),
     )
 
     for signal, value in samples:

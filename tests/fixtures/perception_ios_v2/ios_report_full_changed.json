@@ -81,6 +81,66 @@
       "changed": true
     },
     {
+      "key": "weather",
+      "envelope": {
+        "v": 1,
+        "id": "99999999999999999999999999999999",
+        "body_ct": "base64-weather-body",
+        "nonce": "base64-weather-nonce",
+        "K_user": "base64-weather-k-user",
+        "K_enclave": "base64-weather-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_sleep",
+      "envelope": {
+        "v": 1,
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "body_ct": "base64-health-sleep-body",
+        "nonce": "base64-health-sleep-nonce",
+        "K_user": "base64-health-sleep-k-user",
+        "K_enclave": "base64-health-sleep-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_workout",
+      "envelope": {
+        "v": 1,
+        "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "body_ct": "base64-health-workout-body",
+        "nonce": "base64-health-workout-nonce",
+        "K_user": "base64-health-workout-k-user",
+        "K_enclave": "base64-health-workout-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_vitals",
+      "envelope": {
+        "v": 1,
+        "id": "cccccccccccccccccccccccccccccccc",
+        "body_ct": "base64-health-vitals-body",
+        "nonce": "base64-health-vitals-nonce",
+        "K_user": "base64-health-vitals-k-user",
+        "K_enclave": "base64-health-vitals-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
       "key": "unsupported",
       "data": "{\"frontmost_app\":null,\"precise_unlock\":null,\"silent_mode\":null}",
       "message": "iOS 当前不能稳定提供的感知项"

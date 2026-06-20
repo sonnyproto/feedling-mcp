@@ -17,6 +17,10 @@ ENCRYPTED_SIGNAL_KEYS_V2 = frozenset({
     "motion_state",
     "calendar_next_event",
     "playback",
+    "weather",
+    "health_sleep",
+    "health_workout",
+    "health_vitals",
 })
 IGNORED_SIGNAL_KEYS_V2 = frozenset({"unsupported"})
 
@@ -29,15 +33,12 @@ EXPECTED_REPORT_KEYS_V2 = (
     "focus",
     "calendar_next_event",
     "playback",
+    "weather",
+    "health_sleep",
+    "health_workout",
+    "health_vitals",
     "unsupported",
 )
-
-HEALTHKIT_UNAVAILABLE_V2 = {
-    "steps": "ios_unimplemented",
-    "sleep_last_night": "ios_unimplemented",
-    "workout": "ios_unimplemented",
-    "vitals": "ios_unimplemented",
-}
 
 DIFFER_INPUTS_BY_IOS_KEY_V2 = {
     "time": ("time",),
@@ -52,6 +53,10 @@ DIFFER_INPUTS_BY_IOS_KEY_V2 = {
     "motion_state": ("motion_state",),
     "calendar_next_event": ("calendar_presence", "calendar_next_event"),
     "playback": ("now_playing",),
+    "weather": ("weather",),
+    "health_sleep": ("health_sleep",),
+    "health_workout": ("health_workout",),
+    "health_vitals": ("health_vitals",),
 }
 
 WAKE_POLICY_BY_IOS_KEY_V2 = {
@@ -63,6 +68,10 @@ WAKE_POLICY_BY_IOS_KEY_V2 = {
     "motion_state": "pull_only_after_decrypt",
     "calendar_next_event": "presence_hint_after_decrypt",
     "playback": "pull_only_after_decrypt",
+    "weather": "pull_only_after_decrypt",
+    "health_sleep": "pull_only_after_decrypt",
+    "health_workout": "pull_only_after_decrypt",
+    "health_vitals": "pull_only_after_decrypt",
     "unsupported": "ignored",
 }
 
@@ -192,4 +201,3 @@ def keys_in_report_v2(payload: Mapping[str, Any]) -> tuple[str, ...]:
 def missing_expected_keys_v2(payload: Mapping[str, Any]) -> tuple[str, ...]:
     present = set(keys_in_report_v2(payload))
     return tuple(key for key in EXPECTED_REPORT_KEYS_V2 if key not in present)
-
