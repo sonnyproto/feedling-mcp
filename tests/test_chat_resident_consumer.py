@@ -1297,6 +1297,142 @@ def test_process_proactive_v2_request_broadcast_posts_visible_request(monkeypatc
     assert posted[-1][3]["extra"]["wake_result"] == "posted"
 
 
+def test_resident_v2_context_matches_hosted_catalog_for_same_wake(monkeypatch):
+    from proactive.adapters_v2 import wake_event_v2_from_legacy_job
+    from proactive.agent_protocol_v2 import build_agent_context_v2
+    from proactive.runtime_v2 import merge_wakes_v2
+    from proactive.tool_catalog_v2 import tool_catalog_v2_for_runtime
+
+    monkeypatch.setitem(crc._whoami_cache, "user_id", "usr_resident_v2")
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_equiv",
+        "wake_id": "wake_equiv",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 100.0,
+        "trigger": "scheduled_wake",
+        "change_digest": "check whether she left",
+        "scheduled_note": "check whether she left",
+        "timezone": "Asia/Shanghai",
+        "origin_refs": ["msg_1"],
+    }
+
+    resident = crc._resident_v2_agent_context_for_job(job)
+    event = wake_event_v2_from_legacy_job("usr_resident_v2", job)
+    hosted = build_agent_context_v2(
+        merge_wakes_v2([event], tool_catalog=tool_catalog_v2_for_runtime("hosted")),
+        recent_chat=[],
+    )
+
+    assert resident["trigger"] == hosted["trigger"] == "scheduled_wake"
+    assert resident["scheduled_note"] == hosted["scheduled_note"] == "check whether she left"
+    assert resident["origin_refs"] == hosted["origin_refs"] == ["msg_1"]
+    assert resident["tools"] == hosted["tools"]
+    assert ("schedule_wake", "action", "fast") in tool_catalog_v2_for_runtime("resident").signature()
+    assert tool_catalog_v2_for_runtime("resident").signature() == tool_catalog_v2_for_runtime("hosted").signature()
+
+
+def test_process_proactive_runtime_v2_flag_skips_legacy_prompt_and_posts_send_message(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"posted": [], "statuses": []}
+
+    def _legacy_prompt(*_args, **_kwargs):
+        raise AssertionError("legacy proactive prompt must be unreachable for runtime v2 jobs")
+
+    def _agent(message, images=None, image_paths=None):
+        captured["message"] = message
+        return {"actions": [{"type": "send_message", "text": "V2 action bubble"}], "messages": []}
+
+    monkeypatch.setattr(crc, "_message_for_proactive_job", _legacy_prompt)
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_v2"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_runtime_v2",
+        "wake_id": "wake_runtime_v2",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 127.0,
+        "trigger": "heartbeat_broadcast_on",
+        "runtime_v2": {crc.RESIDENT_WAKE_RUNTIME_V2_FLAG: True},
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(127.0)
+    assert "Feedling Runtime V2 proactive wake" in captured["message"]
+    assert "v2_context_json" in captured["message"]
+    assert "Allowed actions" in captured["message"]
+    assert "Feedling proactive wake" not in captured["message"]
+    assert captured["posted"][0][0] == "V2 action bubble"
+    assert captured["posted"][0][1]["proactive_job_id"] == "pj_runtime_v2"
+    assert any(s[0] == "pj_runtime_v2" and s[1] == "posted" for s in captured["statuses"])
+
+
+def test_process_proactive_runtime_v2_schedule_action_calls_backend_without_chat(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"scheduled": [], "statuses": [], "posted": []}
+
+    monkeypatch.setattr(
+        crc,
+        "call_agent",
+        lambda message, images=None, image_paths=None: {
+            "actions": [{
+                "type": "schedule_wake",
+                "at": "2030-01-01T09:30:00",
+                "tz": "Asia/Shanghai",
+                "note": "check in",
+                "origin_refs": ["msg_1"],
+            }],
+            "messages": [],
+        },
+    )
+    monkeypatch.setattr(
+        crc,
+        "execute_scheduled_wake_actions",
+        lambda actions, job: captured["scheduled"].append((actions, job)) or {
+            "results": [{"type": "schedule_wake_result", "status": "scheduled", "timer_id": "sched_1"}],
+        },
+    )
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_schedule",
+        "wake_id": "wake_schedule",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 128.0,
+        "trigger": "heartbeat_broadcast_on",
+        "runtime_v2": {crc.RESIDENT_WAKE_RUNTIME_V2_FLAG: True},
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(128.0)
+    assert captured["scheduled"][0][0][0]["type"] == "schedule_wake"
+    assert captured["posted"] == []
+    completed = [s for s in captured["statuses"] if s[1] == "completed"]
+    assert completed
+    assert completed[-1][2] == "agent_scheduled_wake_actions"
+    assert completed[-1][3]["extra"]["wake_result"] == "action_only"
+
+
 def test_normalize_agent_replies_supports_multiple_messages_with_cap(monkeypatch):
     monkeypatch.setattr(crc, "PROACTIVE_MAX_REPLY_MESSAGES", 5)
 

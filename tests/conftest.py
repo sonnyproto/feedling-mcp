@@ -17,7 +17,9 @@ rather than failing with confusing connection errors.
 """
 
 import os
+import sys
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -33,16 +35,36 @@ def _admin_url_for(dbname: str) -> str:
 
 _provisioned = False
 _PROVISION_ERROR = None
+_created_test_db = False
 try:
     import psycopg
 
     _admin = psycopg.connect(_ADMIN_URL, autocommit=True)
     _admin.execute(f'CREATE DATABASE "{_TEST_DB}"')
     _admin.close()
+    _created_test_db = True
     os.environ["DATABASE_URL"] = _admin_url_for(_TEST_DB)
+    backend_dir = Path(__file__).parent.parent / "backend"
+    sys.path.insert(0, str(backend_dir))
+    import db
+
+    db.init_schema()
     _provisioned = True
 except Exception as e:  # noqa: BLE001 — any failure means "no usable PG"
     _PROVISION_ERROR = e
+    if _created_test_db:
+        try:
+            import psycopg
+
+            admin = psycopg.connect(_ADMIN_URL, autocommit=True)
+            admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
+                (_TEST_DB,),
+            )
+            admin.execute(f'DROP DATABASE IF EXISTS "{_TEST_DB}"')
+            admin.close()
+        except Exception:
+            pass
 
 # If we couldn't provision a test DB, do NOT collect the backend test modules.
 # Several of them import backend/app.py at module scope, which now calls
@@ -58,7 +80,15 @@ if not _provisioned:
         "test_wake_bus.py",
         "test_semantic_analysis.py",
         "test_model_api_wake.py",
+        "test_proactive_runtime_v2.py",
+        "test_proactive_observability_v2.py",
+        "test_proactive_dashboard_v2.py",
+        "test_proactive_tool_executor_v2.py",
+        "test_proactive_scheduled_wake_v2.py",
+        "test_hosted_wake_v2_cutover.py",
         "test_perception.py",
+        "test_ios_perception_contract_v2.py",
+        "test_perception_ingress_v2.py",
         "test_provider_client.py",
         "test_history_import_identity.py",
         "test_model_api_prompts.py",

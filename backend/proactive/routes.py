@@ -9,9 +9,13 @@ from flask import Blueprint, Response, jsonify, request
 from accounts import auth
 from core import store as core_store
 from core import util
-from proactive import dashboard, gate, service
+from proactive import dashboard, gate, resident_runtime_v2, service
+from proactive.observability_v2 import ROUND3_REVIEW_LABELS_V2
 
 bp = Blueprint("proactive", __name__)
+
+RESIDENT_WAKE_LEASE_SEC = 600.0
+_HOSTED_CONSUMER_IDS = frozenset({"hosted_runtime", "hosted_runtime_v2"})
 
 @bp.route("/v1/proactive/settings", methods=["GET", "POST"])
 def proactive_settings():
@@ -78,6 +82,12 @@ def device_events():
         payload=payload.get("payload") if isinstance(payload.get("payload"), dict) else {},
     )
     store.append_device_event(event)
+    try:
+        from perception import service as perception_service  # lazy; proactive can run without perception tests importing it
+        if perception_service.perception_ingress_runtime_v2_enabled(store):
+            event["perception_v2"] = perception_service.ingest_device_event_v2(store.user_id, event)
+    except Exception as e:
+        event["perception_v2"] = {"error": f"ingest_failed:{type(e).__name__}"}
     return jsonify(event)
 
 
@@ -169,6 +179,63 @@ def _job_status_patch(payload: dict, *, default_status: str = "") -> dict:
     return patch
 
 
+def _job_age_ref_epoch(job: dict) -> float:
+    for key in ("realizing_at", "claimed_at", "ts"):
+        raw = job.get(key)
+        if raw in (None, ""):
+            continue
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            pass
+        if isinstance(raw, str):
+            try:
+                return datetime.fromisoformat(raw).timestamp()
+            except ValueError:
+                pass
+    return 0.0
+
+
+def _find_proactive_job(store, job_id: str) -> dict | None:
+    for row in store.list_proactive_jobs(since_epoch=0, limit=0):
+        if str(row.get("job_id") or "") == str(job_id):
+            return row
+    return None
+
+
+def _reclaim_stale_resident_jobs(store, *, now: float | None = None) -> int:
+    now = time.time() if now is None else float(now)
+    reclaimed = 0
+    for job in store.list_proactive_jobs(limit=100):
+        status = str(job.get("status") or "")
+        if status not in {"claimed", "realizing"}:
+            continue
+        consumer_id = str(job.get("consumer_id") or "")
+        if consumer_id in _HOSTED_CONSUMER_IDS:
+            continue
+        age_ref = _job_age_ref_epoch(job)
+        if not age_ref or now - age_ref <= RESIDENT_WAKE_LEASE_SEC:
+            continue
+        job_id = str(job.get("job_id") or "")
+        if not job_id:
+            continue
+        patched = store.update_proactive_job(job_id, {
+            "status": "pending",
+            "status_reason": "resident_stale_claim_recovered",
+            "consumer_id": f"recovered:{consumer_id}"[:160] if consumer_id else "recovered:resident",
+            "recovered_at": datetime.fromtimestamp(now).isoformat(),
+        }, only_if_status=status)
+        if patched is not None:
+            reclaimed += 1
+    return reclaimed
+
+
+def _with_resident_runtime_v2(job: dict, runtime_profile: dict) -> dict:
+    out = dict(job or {})
+    out["runtime_v2"] = dict(runtime_profile or {})
+    return out
+
+
 @bp.route("/v1/proactive/jobs/<job_id>/claim", methods=["POST"])
 def proactive_job_claim(job_id):
     store = auth.require_user()
@@ -176,11 +243,7 @@ def proactive_job_claim(job_id):
     patch = _job_status_patch(payload, default_status="claimed")
     job = store.update_proactive_job(job_id, patch, only_if_status="pending")
     if job is None:
-        current = None
-        for row in store.list_proactive_jobs(since_epoch=0, limit=0):
-            if str(row.get("job_id") or "") == str(job_id):
-                current = row
-                break
+        current = _find_proactive_job(store, str(job_id))
         return jsonify({"claimed": False, "job": current, "reason": "not_pending_or_missing"})
     return jsonify({"claimed": True, "job": job})
 
@@ -192,10 +255,49 @@ def proactive_job_status(job_id):
     patch = _job_status_patch(payload)
     if not patch:
         return jsonify({"error": "empty_status_patch"}), 400
+    incoming_consumer = str(payload.get("consumer_id") or "").strip()
+    current = _find_proactive_job(store, str(job_id))
+    current_consumer = str((current or {}).get("consumer_id") or "").strip()
+    if incoming_consumer and current_consumer and incoming_consumer != current_consumer:
+        return jsonify({
+            "error": "consumer_mismatch",
+            "job": current,
+            "expected_consumer_id": current_consumer,
+        }), 409
     job = store.update_proactive_job(job_id, patch)
     if job is None:
         return jsonify({"error": "job_not_found"}), 404
     return jsonify({"job": job})
+
+
+@bp.route("/v1/proactive/scheduled/actions", methods=["POST"])
+def proactive_scheduled_actions():
+    store = auth.require_user()
+    payload = request.get_json(silent=True) or {}
+    actions = payload.get("actions")
+    if not isinstance(actions, list):
+        return jsonify({"error": "actions_required"}), 400
+    from proactive.adapters_v2 import legacy_job_from_wake_event_v2
+    from proactive.scheduled_wake_v2 import DBScheduledWakeStoreV2, ScheduledWakeServiceV2
+    from proactive.store_v2 import DBProactiveSettingsStoreV2
+
+    settings = DBProactiveSettingsStoreV2().load(store.user_id)
+    scheduler = ScheduledWakeServiceV2(DBScheduledWakeStoreV2(), owner_id="resident_runtime_v2")
+
+    def _submit(event):
+        store.append_proactive_job(legacy_job_from_wake_event_v2(event))
+        return type("_Accepted", (), {"accepted": True, "reason": "queued_as_compat_job"})()
+
+    results = scheduler.apply_turn_actions(
+        store.user_id,
+        actions,
+        settings=settings,
+        turn_id=str(payload.get("turn_id") or ""),
+        wake_ids=tuple(str(item) for item in (payload.get("wake_ids") or ()) if str(item)),
+        origin_refs=tuple(str(item) for item in (payload.get("origin_refs") or ()) if str(item)),
+        submit_wake=_submit,
+    )
+    return jsonify({"results": [result.as_dict() for result in results]})
 
 
 @bp.route("/v1/proactive/decisions", methods=["GET"])
@@ -234,7 +336,7 @@ def proactive_decision_review(decision_id):
         return jsonify({"error": "decision_not_found"}), 404
 
     label = str(payload.get("label") or "").strip()
-    allowed_labels = {
+    legacy_gate_labels = {
         "correct_true",
         "correct_false",
         "missed_opportunity",
@@ -244,6 +346,7 @@ def proactive_decision_review(decision_id):
         "privacy_bad",
         "great_companion_moment",
     }
+    allowed_labels = set(ROUND3_REVIEW_LABELS_V2) | legacy_gate_labels
     if label not in allowed_labels:
         return jsonify({"error": "invalid_label", "allowed": sorted(allowed_labels)}), 400
 
@@ -253,6 +356,7 @@ def proactive_decision_review(decision_id):
         "ts": time.time(),
         "created_at": datetime.now().isoformat(),
         "label": label,
+        "label_family": "round3" if label in ROUND3_REVIEW_LABELS_V2 else "legacy_gate",
         "notes": str(payload.get("notes") or "")[:500],
         "reviewer": str(payload.get("reviewer") or "human")[:80],
         "expected_should_reach_out": payload.get("expected_should_reach_out"),
@@ -304,6 +408,8 @@ def proactive_debug_page():
 @bp.route("/v1/proactive/jobs/poll", methods=["GET"])
 def proactive_jobs_poll():
     store = auth.require_user()
+    _reclaim_stale_resident_jobs(store)
+    runtime_profile = resident_runtime_v2.resident_runtime_v2_public_profile(store)
     try:
         since = float(request.args.get("since", 0))
     except (TypeError, ValueError):
@@ -319,11 +425,12 @@ def proactive_jobs_poll():
     limit = max(1, min(limit, 100))
 
     pending = [
-        j for j in store.list_proactive_jobs(since_epoch=since, limit=limit)
+        _with_resident_runtime_v2(j, runtime_profile)
+        for j in store.list_proactive_jobs(since_epoch=since, limit=limit)
         if str(j.get("status") or "pending") == "pending"
     ]
     if pending:
-        return jsonify({"jobs": pending, "timed_out": False})
+        return jsonify({"jobs": pending, "runtime_v2": runtime_profile, "timed_out": False})
 
     ev = threading.Event()
     with store.proactive_job_waiters_lock:
@@ -339,8 +446,9 @@ def proactive_jobs_poll():
 
     if notified:
         pending = [
-            j for j in store.list_proactive_jobs(since_epoch=since, limit=limit)
+            _with_resident_runtime_v2(j, runtime_profile)
+            for j in store.list_proactive_jobs(since_epoch=since, limit=limit)
             if str(j.get("status") or "pending") == "pending"
         ]
-        return jsonify({"jobs": pending, "timed_out": False})
-    return jsonify({"jobs": [], "timed_out": True})
+        return jsonify({"jobs": pending, "runtime_v2": runtime_profile, "timed_out": False})
+    return jsonify({"jobs": [], "runtime_v2": runtime_profile, "timed_out": True})

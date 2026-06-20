@@ -3,7 +3,7 @@
 These exercise the generic machinery (sparse report, implicit authorization via
 reported values, raw->label resolution + raw discard, snapshot TTL, the
 user_state override stack,
-debounced wakes, and the two-step sensitivity-gated photo flow) WITHOUT a real
+debounced wakes, and the encrypted photo flow) WITHOUT a real
 Postgres: the store layer is replaced with an in-memory fake, and the wake
 trigger is captured instead of enqueuing a real proactive job.
 
@@ -123,6 +123,12 @@ def env(monkeypatch):
     wakes = []
     monkeypatch.setattr(service, "_fire_wake",
                         lambda uid, cap, hint, now: wakes.append((cap, hint)))
+    monkeypatch.setattr(service, "_app_proactive_settings", lambda uid: {})
+    monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
+    monkeypatch.setattr(service, "_fire_wake_event_v2",
+                        lambda event: wakes.append((event.trigger, event.change_digest)))
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
+                        lambda user_or_store: False)
     return fake, wakes
 
 
@@ -227,15 +233,16 @@ def test_wake_debounce(env):
     assert len([w for w in wakes if w[0] == "location"]) == 1
 
 
-def test_photo_hard_block_discards_ciphertext(env):
-    """Hard-blocked scene (id_card): rejected; even an uploaded envelope is NOT
-    stored — no frame envelope, not listed."""
+def test_photo_sensitive_scene_stored_without_hard_block(env):
+    """V2 removes the old sensitive-scene hard block: even an id_card/document
+    hint is stored encrypted and left to the agent's expression policy."""
     fake, _ = env
     out, code = service.photo_evaluate(
         UID, {"scene_hint": "id_card"}, {"id": "p_bad", "body_ct": "x"})
-    assert code == 200 and out["usable"] is False and out["status"] == "rejected"
-    assert fake.get_photo_envelope(UID, "p_bad") is None      # ciphertext discarded
-    assert service.photos_recent(UID)[0]["photos"] == []
+    assert code == 200 and out["usable"] is True and out["status"] == "stored"
+    assert out["sensitive"] is True
+    assert fake.get_photo_envelope(UID, "p_bad")["body_ct"] == "x"
+    assert service.photos_recent(UID)[0]["photos"][0]["photo_id"] == "p_bad"
 
 
 def test_photo_contextual_scene_stored_and_reaches_agent(env):
@@ -245,6 +252,7 @@ def test_photo_contextual_scene_stored_and_reaches_agent(env):
     out, _ = service.photo_evaluate(
         UID, {"scene_hint": "private", "is_indoor": True}, {"id": "p_priv", "body_ct": "c"})
     assert out["usable"] is True and out["status"] == "stored"
+    assert out["sensitive"] is True
     assert out["metadata"]["scene_hint"] == "private"
     assert fake.get_photo_envelope(UID, "p_priv")["body_ct"] == "c"
 
@@ -263,7 +271,24 @@ def test_photo_one_step_store(env):
     content, c2 = service.photo_content(UID, "p_ok")
     assert c2 == 200 and content["frame_id"] == "p_ok" and "envelope" not in content
     assert fake.get_photo_envelope(UID, "p_ok")["body_ct"] == "cipher"  # in frame channel
-    assert any(c == "photos" for c, _ in wakes)              # fired a wake
+    assert any(c == "photos" for c, _ in wakes)               # legacy dormant fallback fired
+
+
+def test_photo_meta_envelope_is_preserved_only_on_content_read(env):
+    fake, _ = env
+    meta_env = {"id": "meta_1", "body_ct": "encrypted-place-label"}
+    out, code = service.photo_evaluate(
+        UID,
+        {"scene_hint": "food"},
+        {"id": "p_meta", "body_ct": "cipher"},
+        meta_envelope=meta_env,
+    )
+    assert code == 200 and out["status"] == "stored"
+    listed = service.photos_recent(UID)[0]["photos"]
+    assert "meta_envelope" not in listed[0]
+    content, c2 = service.photo_content(UID, "p_meta")
+    assert c2 == 200
+    assert content["meta_envelope"] == meta_env
 
 
 def test_photo_usable_requires_envelope(env):
@@ -284,7 +309,7 @@ def test_photos_no_setup_stored(env):
 
 def test_items_rejects_photo_kind(env):
     """photo must NOT be ingestable via the generic /items endpoint (would bypass
-    the _photo_usable gate). Only /photo/evaluate stores photos."""
+    the dedicated encrypted envelope path). Only /photo/evaluate stores photos."""
     fake, _ = env
     out, code = service.items_ingest(UID, "photo", [
         {"item_id": "p_x", "doc": {"status": "confirmed", "metadata": {"scene_hint": "id_card"}}}])
@@ -319,6 +344,8 @@ def test_app_open_via_get_route(env, monkeypatch):
     fake, _ = env
     import accounts.auth as accounts_auth
     monkeypatch.setattr(accounts_auth, "require_user", lambda: types.SimpleNamespace(user_id=UID))
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
+                        lambda user_or_store: False)
 
     app = Flask("t")
     app.register_blueprint(routes.bp)
@@ -347,10 +374,12 @@ def test_photo_metadata_string_bools(env):
     fake, _ = env
     out, _ = service.photo_evaluate(
         UID, {"scene_hint": "food", "is_screenshot": "false"}, {"id": "p1", "body_ct": "c"})
-    assert out["usable"] is True                       # "false" not wrongly blocked
+    assert out["usable"] is True
+    assert out["sensitive"] is False
     out2, _ = service.photo_evaluate(
         UID, {"scene_hint": "food", "is_screenshot": "true"}, {"id": "p2", "body_ct": "c"})
-    assert out2["usable"] is False                     # "true" blocks
+    assert out2["usable"] is True
+    assert out2["sensitive"] is True
 
 
 def test_string_scalar_values_stored(env):
@@ -424,15 +453,42 @@ def test_report_endpoint_context_snapshot(env, monkeypatch):
     app.register_blueprint(routes.bp)
     client = app.test_client()
     r = client.post("/v1/perception/report", json={"context_snapshot": [
-        {"key": "motion_state", "data": '{"state":"running"}', "message": "运动状态"},
+        {"key": "motion_state", "data": json.dumps({"state": "walking"})},
     ]})
     assert r.status_code == 200
     assert r.get_json()["results"]["motion_state"] == "accepted"
-    assert fake.get_state(UID)["motion_state"]["v"] == {"state": "running"}
+    assert fake.get_state(UID)["motion_state"]["v"] == {"state": "walking"}
 
     # missing context_snapshot -> 400
     bad = client.post("/v1/perception/report", json={"signals": {}})
     assert bad.status_code == 400
+
+
+def test_report_endpoint_context_snapshot_v2_flag_on(env, monkeypatch):
+    """When the per-user rollout flag is on, /report dispatches to V2 ingress."""
+    import types
+    from flask import Flask
+    import perception.routes as routes
+
+    fake, _ = env
+    import accounts.auth as accounts_auth
+    monkeypatch.setattr(accounts_auth, "require_user", lambda: types.SimpleNamespace(user_id=UID))
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
+                        lambda user_or_store: True)
+
+    app = Flask("t")
+    app.register_blueprint(routes.bp)
+    client = app.test_client()
+    r = client.post("/v1/perception/report", json={"context_snapshot": [
+        {"key": "motion_state", "envelope": {
+            "v": 1, "id": "motion_env", "body_ct": "x", "nonce": "n",
+            "K_user": "ku", "K_enclave": "ke", "visibility": "shared",
+            "owner_user_id": UID,
+        }, "changed": True},
+    ]})
+    assert r.status_code == 200
+    assert r.get_json()["results"]["motion_state"] == "accepted"
+    assert "motion_state" not in fake.get_state(UID)
 
 
 def test_report_user_state_key_sets_manual(env):
@@ -454,7 +510,7 @@ def test_snapshot_includes_recent_apps(env):
     assert "Instagram" in apps and "Maps" in apps
 
 
-def _report_client(env, monkeypatch):
+def _report_client(env, monkeypatch, *, ingress_v2=False):
     import sys
     import types
     from flask import Flask
@@ -462,6 +518,8 @@ def _report_client(env, monkeypatch):
     fake, _ = env
     import accounts.auth as accounts_auth
     monkeypatch.setattr(accounts_auth, "require_user", lambda: types.SimpleNamespace(user_id=UID))
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
+                        lambda user_or_store: ingress_v2)
     app = Flask("t")
     app.register_blueprint(routes.bp)
     return fake, app.test_client()
@@ -603,25 +661,23 @@ def test_app_settings_failure_does_not_block_wake(env, monkeypatch):
     assert len(wakes) == 1
 
 
-def test_photo_suppressed_when_dnd_enabled(env, monkeypatch):
-    """DND 开启时：照片仍被存储，但 wake 被压制；事件记录 suppressed/dnd_enabled。"""
+def test_photo_suppressed_when_ambient_disabled(env, monkeypatch):
+    """Ambient off blocks self-initiated photo wakes; Delivery/DND does not."""
     fake, wakes = env
-    monkeypatch.setattr(service, "_app_proactive_settings",
-                        lambda uid: {"enabled": True, "dnd": True})
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
+                        lambda user_or_store: True)
+    monkeypatch.setattr(service, "_settings_v2_for_user",
+                        lambda uid: {"switches": {"ambient": False}})
     uid = "u_photo_dnd"
     out, code = service.photo_evaluate(
         uid, {"scene_hint": "food"}, {"id": "p_dnd", "body_ct": "cipher"})
-    # 照片应被存储（gate 只影响 wake，不影响存储）
     assert code == 200 and out["status"] == "stored"
-    # wakes 列表为空（未触发 _fire_wake）
     assert wakes == []
     events = fake.read_events(uid)
-    # 有 suppressed 事件，携带 item == photo_id
     suppressed = [e for e in events
-                  if e.get("cap") == "photos" and e.get("type") == "suppressed"]
+                  if e.get("cap") == "runtime_v2" and e.get("type") == "suppressed"]
     assert len(suppressed) == 1
-    assert suppressed[0]["reason"] == "dnd_enabled"
-    assert suppressed[0]["item"] == "p_dnd"
-    # 无 wake 事件
-    assert not any(e.get("cap") == "photos" and e.get("type") == "wake"
+    assert suppressed[0]["reason"] == "ambient_disabled"
+    assert suppressed[0]["origin_refs"] == ["photo:p_dnd"]
+    assert not any(e.get("cap") == "runtime_v2" and e.get("type") == "wake"
                    for e in events)

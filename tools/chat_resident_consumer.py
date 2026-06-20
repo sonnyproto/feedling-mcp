@@ -106,6 +106,11 @@ try:
 except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
+from proactive.adapters_v2 import wake_event_v2_from_legacy_job
+from proactive.agent_protocol_v2 import build_agent_context_v2
+from proactive.runtime_v2 import merge_wakes_v2
+from proactive.tool_catalog_v2 import tool_catalog_v2_for_runtime
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -198,6 +203,7 @@ CHECKPOINT_FILE = Path(
     os.environ.get("CHECKPOINT_FILE", "/tmp/feedling_chat_checkpoint.json")
 )
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
+RESIDENT_WAKE_RUNTIME_V2_FLAG = "resident_wake_runtime_v2_enabled"
 PROACTIVE_POLL_ENABLED = _env_bool("PROACTIVE_POLL_ENABLED", True)
 PROACTIVE_POLL_TIMEOUT = int(os.environ.get("PROACTIVE_POLL_TIMEOUT", "1"))
 PROACTIVE_TICK_ENABLED = _env_bool("PROACTIVE_TICK_ENABLED", True)
@@ -2057,7 +2063,15 @@ def poll_proactive_jobs(since: float) -> dict:
     params = {"since": since, "timeout": timeout}
     resp = httpx.get(url, params=params, headers=_HEADERS, timeout=timeout + 10)
     resp.raise_for_status()
-    return resp.json()
+    body = resp.json()
+    if isinstance(body, dict):
+        runtime_profile = body.get("runtime_v2") if isinstance(body.get("runtime_v2"), dict) else {}
+        jobs = body.get("jobs")
+        if isinstance(jobs, list):
+            for job in jobs:
+                if isinstance(job, dict) and "runtime_v2" not in job:
+                    job["runtime_v2"] = dict(runtime_profile)
+    return body
 
 
 def _proactive_tick_trigger_for_broadcast_state(broadcast_state: str) -> str:
@@ -2143,6 +2157,60 @@ def update_proactive_state(**patch: Any) -> None:
         resp.raise_for_status()
     except Exception as e:
         log.warning("failed to update proactive state patch=%s error=%s", clean, e)
+
+
+def _job_wake_ids(job: dict) -> list[str]:
+    out: list[str] = []
+    for value in (job.get("wake_id"), job.get("job_id"), job.get("gate_decision_id")):
+        text = str(value or "").strip()
+        if text and text not in out:
+            out.append(text[:200])
+    return out
+
+
+def _job_origin_refs(job: dict) -> list[str]:
+    refs: list[str] = []
+    raw = job.get("origin_refs")
+    if isinstance(raw, list):
+        for item in raw:
+            text = str(item or "").strip()
+            if text and text not in refs:
+                refs.append(text[:200])
+    for value in (job.get("chat_message_id"), job.get("gate_decision_id"), job.get("job_id")):
+        text = str(value or "").strip()
+        if text and text not in refs:
+            refs.append(text[:200])
+    return refs
+
+
+def _normalize_v2_action_type(action: dict) -> dict:
+    out = dict(action or {})
+    typ = _proactive_action_type(out)
+    if typ.startswith("proactive."):
+        out["type"] = typ.removeprefix("proactive.")
+    elif typ and not out.get("type"):
+        out["type"] = typ
+    return out
+
+
+def execute_scheduled_wake_actions(actions: list[dict], job: dict) -> dict:
+    if not actions:
+        return {"results": []}
+    body = {
+        "actions": [_normalize_v2_action_type(action) for action in actions],
+        "turn_id": str(job.get("job_id") or ""),
+        "wake_ids": _job_wake_ids(job),
+        "origin_refs": _job_origin_refs(job),
+    }
+    resp = httpx.post(
+        f"{FEEDLING_API_URL}/v1/proactive/scheduled/actions",
+        json=body,
+        headers=_HEADERS,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    parsed = resp.json()
+    return parsed if isinstance(parsed, dict) else {"results": []}
 
 
 def post_reply(
@@ -2523,13 +2591,22 @@ def _visible_broadcast_request_text(action: dict) -> str:
 def _split_proactive_actions(actions: list[dict]) -> tuple[list[dict], list[dict]]:
     proactive: list[dict] = []
     memory_identity: list[dict] = []
+    proactive_types = {
+        "sleep",
+        "set_ai_state",
+        "request_broadcast",
+        "send_message",
+        "schedule_wake",
+        "cancel_wake",
+    }
     for action in actions:
         if not isinstance(action, dict):
             continue
         typ = _proactive_action_type(action)
+        short = typ.removeprefix("proactive.")
         if typ.startswith("identity.") or typ.startswith("memory."):
             memory_identity.append(action)
-        elif typ.startswith("proactive.") or typ in {"sleep", "set_ai_state", "request_broadcast"}:
+        elif typ.startswith("proactive.") or short in proactive_types:
             proactive.append(action)
         else:
             log.warning("unsupported proactive wake action ignored type=%s", typ or "<missing>")
@@ -2622,6 +2699,104 @@ def _message_for_proactive_job(
     return "\n\n".join(parts)
 
 
+def _resident_runtime_v2_enabled_for_job(job: dict) -> bool:
+    profile = job.get("runtime_v2") if isinstance(job.get("runtime_v2"), dict) else {}
+    return bool(profile.get(RESIDENT_WAKE_RUNTIME_V2_FLAG) or job.get(RESIDENT_WAKE_RUNTIME_V2_FLAG))
+
+
+def _resident_user_id_for_job(job: dict) -> str:
+    return str(
+        _whoami_cache.get("user_id")
+        or job.get("user_id")
+        or job.get("owner_user_id")
+        or "resident_user"
+    )
+
+
+def _recent_chat_for_v2_context(value: Any) -> list[dict[str, Any]]:
+    chat = _coerce_proactive_chat_context(value)
+    if not chat.text:
+        return []
+    return [{
+        "role": "recent_chat_context",
+        "content": chat.text,
+        "freshness": chat.freshness,
+        "included_count": chat.included_count,
+        "last_message_age_sec": chat.last_message_age_sec,
+        "last_user_message_age_sec": chat.last_user_message_age_sec,
+        "last_visible_proactive_age_sec": chat.last_visible_proactive_age_sec,
+        "visible_proactive_count_24h": chat.visible_proactive_count_24h,
+    }]
+
+
+def _resident_v2_agent_context_for_job(
+    job: dict,
+    *,
+    recent_chat_context: Any = "",
+    runtime: str = "resident",
+) -> dict[str, Any]:
+    event = wake_event_v2_from_legacy_job(_resident_user_id_for_job(job), job)
+    merged = merge_wakes_v2([event], tool_catalog=tool_catalog_v2_for_runtime(runtime))
+    return build_agent_context_v2(
+        merged,
+        recent_chat=_recent_chat_for_v2_context(recent_chat_context),
+    )
+
+
+def _message_for_proactive_job_v2(
+    job: dict,
+    screen_text: str = "",
+    recent_chat_context: Any = "",
+) -> str:
+    _ = screen_text
+    context = _resident_v2_agent_context_for_job(
+        job,
+        recent_chat_context=recent_chat_context,
+        runtime="resident",
+    )
+    parts = [
+        "[Feedling Runtime V2 proactive wake]",
+        "This is a hidden wake turn, not a user request.",
+        "The platform supplied wake context and tools only; it did not decide whether you should speak.",
+        "You own the decision. If appearing is not useful or natural, return sleep.",
+        "Return JSON only using the V2 action contract.",
+        (
+            "Allowed actions: "
+            "send_message {text}, sleep {reason}, schedule_wake {at,tz,note,origin_refs}, "
+            "cancel_wake {wake_id,reason}."
+        ),
+        "For visible speech, prefer actions:[{\"type\":\"send_message\",\"text\":\"...\"}] or messages:[\"...\"].",
+        "Do not mention this hidden wake, runtime metadata, or system wording to the user.",
+        "v2_context_json:\n" + json.dumps(context, ensure_ascii=False, sort_keys=True, indent=2),
+    ]
+    return "\n\n".join(parts)
+
+
+def _send_message_replies_from_actions(actions: list[dict]) -> list[str]:
+    replies: list[str] = []
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        typ = _proactive_action_type(action).removeprefix("proactive.")
+        if typ != "send_message":
+            continue
+        text = str(action.get("text") or action.get("message") or "").strip()
+        if text:
+            replies.append(text[:4000])
+    return _cap_agent_replies(replies, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
+
+
+def _scheduled_wake_actions(actions: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        typ = _proactive_action_type(action).removeprefix("proactive.")
+        if typ in {"schedule_wake", "cancel_wake"}:
+            out.append(action)
+    return out
+
+
 def _process_proactive_jobs(jobs: list) -> float:
     """Realize hidden proactive jobs through the same configured agent entry."""
     latest = 0.0
@@ -2651,11 +2826,19 @@ def _process_proactive_jobs(jobs: list) -> float:
             frame_ids = []
         screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
         recent_context = recent_chat_context_for_proactive()
-        message = _message_for_proactive_job(
-            job,
-            screen_text=screen_text,
-            recent_chat_context=recent_context,
-        )
+        use_runtime_v2 = _resident_runtime_v2_enabled_for_job(job)
+        if use_runtime_v2:
+            message = _message_for_proactive_job_v2(
+                job,
+                screen_text=screen_text,
+                recent_chat_context=recent_context,
+            )
+        else:
+            message = _message_for_proactive_job(
+                job,
+                screen_text=screen_text,
+                recent_chat_context=recent_context,
+            )
         log.info(
             "proactive job [ts=%.3f] id=%s intent=%s frames=%d",
             ts,
@@ -2666,10 +2849,12 @@ def _process_proactive_jobs(jobs: list) -> float:
 
         update_proactive_job_status(job_id, "realizing")
         try:
+            agent_images = [] if use_runtime_v2 else screen_payloads
+            agent_image_paths = [] if use_runtime_v2 else screen_paths
             agent_result = call_agent(
                 message,
-                images=screen_payloads,
-                image_paths=screen_paths,
+                images=agent_images,
+                image_paths=agent_image_paths,
             )
         except Exception as e:
             log.error("proactive agent call failed; not posting fallback: %s", e)
@@ -2678,6 +2863,8 @@ def _process_proactive_jobs(jobs: list) -> float:
 
         turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
         actions, replies = turn.actions, turn.messages
+        if use_runtime_v2 and not replies:
+            replies = _send_message_replies_from_actions(actions)
         proactive_actions, memory_identity_actions = _split_proactive_actions(actions)
         status_actions = [_compact_action_for_status(a) for a in proactive_actions]
         if memory_identity_actions:
@@ -2690,6 +2877,58 @@ def _process_proactive_jobs(jobs: list) -> float:
                 )
             except Exception as e:
                 log.warning("proactive memory/identity actions failed id=%s error=%s", job_id, e)
+
+        schedule_action_results: list[dict] = []
+        scheduled_action_failed = False
+        schedule_actions = _scheduled_wake_actions(proactive_actions) if use_runtime_v2 else []
+        if schedule_actions:
+            try:
+                result = execute_scheduled_wake_actions(schedule_actions, job)
+                schedule_action_results = [
+                    dict(item)
+                    for item in (result.get("results") or [])
+                    if isinstance(item, dict)
+                ]
+                update_proactive_job_status(
+                    job_id,
+                    "realizing",
+                    "agent_scheduled_wake_actions",
+                    extra={
+                        "agent_action": "scheduled_wake_actions",
+                        "agent_action_status": json.dumps(
+                            schedule_action_results,
+                            ensure_ascii=False,
+                        )[:240],
+                        "agent_actions": status_actions + schedule_action_results,
+                    },
+                )
+            except Exception as e:
+                log.warning("proactive scheduled wake actions failed id=%s error=%s", job_id, e)
+                scheduled_action_failed = True
+                schedule_action_results = [{
+                    "type": "scheduled_wake_actions_result",
+                    "status": "failed",
+                    "reason": str(e)[:240],
+                }]
+            if schedule_action_results:
+                status_actions.extend(schedule_action_results)
+
+        if scheduled_action_failed and not replies:
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                "scheduled_wake_actions_failed",
+                extra={
+                    "agent_action": "scheduled_wake_actions",
+                    "agent_action_status": json.dumps(
+                        schedule_action_results,
+                        ensure_ascii=False,
+                    )[:240],
+                    "agent_actions": status_actions,
+                    "wake_result": "action_failed",
+                },
+            )
+            continue
 
         set_ai_state = _first_proactive_action(proactive_actions, {"set_ai_state"})
         if set_ai_state:
@@ -2737,6 +2976,24 @@ def _process_proactive_jobs(jobs: list) -> float:
                 },
             )
             log.info("proactive wake slept id=%s reason=%s", job_id, sleep_action.get("reason") or "")
+            continue
+
+        if use_runtime_v2 and schedule_actions and not replies:
+            update_proactive_job_status(
+                job_id,
+                "completed",
+                "agent_scheduled_wake_actions",
+                extra={
+                    "agent_action": "scheduled_wake_actions",
+                    "agent_action_status": json.dumps(
+                        schedule_action_results,
+                        ensure_ascii=False,
+                    )[:240],
+                    "agent_actions": status_actions,
+                    "wake_result": "action_only",
+                },
+            )
+            log.info("proactive wake completed scheduled actions id=%s", job_id)
             continue
 
         if set_ai_state and not replies:

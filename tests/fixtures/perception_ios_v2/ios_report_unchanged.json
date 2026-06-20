@@ -1,0 +1,90 @@
+{
+  "context_snapshot": [
+    {
+      "key": "time",
+      "data": "{\"local_time\":\"2026-06-19T21:00:30+08:00\",\"locale\":\"zh-Hans-CN\",\"timezone\":\"Asia/Shanghai\"}",
+      "message": "本地时间、时区和语言环境"
+    },
+    {
+      "key": "battery",
+      "data": "{\"charging\":true,\"level\":0.82}",
+      "message": "当前电量与充电状态"
+    },
+    {
+      "key": "broadcast",
+      "data": "{\"active\":true,\"state\":\"broadcasting\"}",
+      "message": "屏幕 broadcast 状态"
+    },
+    {
+      "key": "location_signal",
+      "envelope": {
+        "v": 1,
+        "id": "55555555555555555555555555555555",
+        "body_ct": "base64-location-body-2",
+        "nonce": "base64-location-nonce-2",
+        "K_user": "base64-location-k-user-2",
+        "K_enclave": "base64-location-k-enclave-2",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": false
+    },
+    {
+      "key": "motion_state",
+      "envelope": {
+        "v": 1,
+        "id": "66666666666666666666666666666666",
+        "body_ct": "base64-motion-body-2",
+        "nonce": "base64-motion-nonce-2",
+        "K_user": "base64-motion-k-user-2",
+        "K_enclave": "base64-motion-k-enclave-2",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": false
+    },
+    {
+      "key": "focus",
+      "data": "{\"authorization_status\":\"authorized\",\"focused\":true}",
+      "message": "当前是否处于某个专注模式（二值，不含具体名称）"
+    },
+    {
+      "key": "calendar_next_event",
+      "envelope": {
+        "v": 1,
+        "id": "77777777777777777777777777777777",
+        "body_ct": "base64-calendar-body-2",
+        "nonce": "base64-calendar-nonce-2",
+        "K_user": "base64-calendar-k-user-2",
+        "K_enclave": "base64-calendar-k-enclave-2",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": false
+    },
+    {
+      "key": "playback",
+      "envelope": {
+        "v": 1,
+        "id": "88888888888888888888888888888888",
+        "body_ct": "base64-playback-body-2",
+        "nonce": "base64-playback-nonce-2",
+        "K_user": "base64-playback-k-user-2",
+        "K_enclave": "base64-playback-k-enclave-2",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": false
+    },
+    {
+      "key": "unsupported",
+      "data": "{\"frontmost_app\":null,\"precise_unlock\":null,\"silent_mode\":null}",
+      "message": "iOS 当前不能稳定提供的感知项"
+    }
+  ],
+  "client_ts": "1781874030"
+}

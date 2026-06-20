@@ -1,0 +1,35 @@
+{
+  "metadata": {
+    "has_faces": "false",
+    "face_count": "0",
+    "scene_hint": "document",
+    "scene_confidence": "0.94",
+    "time_of_day": "evening",
+    "is_burst": "false",
+    "is_indoor": "false",
+    "has_text_block": "true",
+    "is_screenshot": "false"
+  },
+  "content_envelope": {
+    "v": 1,
+    "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "body_ct": "base64-photo-body",
+    "nonce": "base64-photo-nonce",
+    "K_user": "base64-photo-k-user",
+    "K_enclave": "base64-photo-k-enclave",
+    "visibility": "shared",
+    "owner_user_id": "ios_fixture_user",
+    "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+  },
+  "meta_envelope": {
+    "v": 1,
+    "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "body_ct": "base64-photo-meta-body",
+    "nonce": "base64-photo-meta-nonce",
+    "K_user": "base64-photo-meta-k-user",
+    "K_enclave": "base64-photo-meta-k-enclave",
+    "visibility": "shared",
+    "owner_user_id": "ios_fixture_user",
+    "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+  }
+}

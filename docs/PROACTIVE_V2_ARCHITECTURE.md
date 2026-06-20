@@ -1,5 +1,14 @@
 # Proactive V2 系统方案
 
+> Historical / superseded.
+>
+> 本文保留作为上一代 Proactive V2 的设计和落地记录。Round 3 的唯一主方案是
+> `docs/PROACTIVE_PERCEPTION_SPEC_V2.md`,迁移执行约束见
+> `docs/PROACTIVE_PERCEPTION_RUNTIME_V2_MIGRATION.md`。
+>
+> 不要按本文里的 `user_state`、`ai_state`、`proactive_jobs` lifecycle 或
+> `set_ai_state` 继续扩展新 runtime;这些只解释旧代码和过渡兼容层。
+
 Proactive V2 的核心变化是：把“什么时候主动找用户”从平台系统层移走，交还给用户自己的本体 AI。平台不再用一个系统级 LLM 判断屏幕内容是否值得触发，也不再要求当前屏幕必须和 Memory Garden / Identity Card 有明确关联。
 
 平台只保留物理能力、状态、唤醒、传输和观测。本体 AI 负责感知解释、人格判断、是否说话、说什么、用什么语气。

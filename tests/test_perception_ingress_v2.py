@@ -1,0 +1,288 @@
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+
+from perception import service  # noqa: E402
+from perception.differ_v2 import PerceptionDifferV2  # noqa: E402
+from perception.ingress_v2 import (  # noqa: E402
+    device_event_observations_v2,
+    observe_signal_v2,
+)
+from proactive.adapters_v2 import wake_event_v2_from_legacy_job  # noqa: E402
+
+
+FIXTURES = Path(__file__).parent / "fixtures" / "perception_ios_v2"
+
+
+def _load_fixture(name: str) -> dict:
+    return json.loads((FIXTURES / name).read_text())
+
+
+class _Store:
+    def __init__(self):
+        self.events = {}
+        self.state = {}
+        self.config = {}
+        self.frames = {}
+        self.items = {}
+
+    def append_event(self, uid, event, ts):
+        self.events.setdefault(uid, []).append(dict(event))
+
+    def read_events(self, uid, limit=50):
+        return list(self.events.get(uid, [])[-limit:])
+
+    def get_config(self, uid):
+        return dict(self.config.get(uid, {}))
+
+    def get_state(self, uid):
+        return {k: dict(v) for k, v in self.state.get(uid, {}).items()}
+
+    def merge_state_guarded(self, uid, patch):
+        cur = self.state.setdefault(uid, {})
+        cur.update({k: dict(v) for k, v in patch.items()})
+        return set(patch)
+
+    def put_photo_envelope(self, uid, frame_id, ts, env):
+        self.frames[(uid, frame_id)] = dict(env)
+
+    def item_upsert(self, uid, kind, item_id, ts, doc, expires_at=None):
+        self.items[(uid, kind, item_id)] = dict(doc)
+
+    def item_get(self, uid, kind, item_id, now=None):
+        return self.items.get((uid, kind, item_id))
+
+    def item_list(self, uid, kind, limit=20, now=None):
+        return [
+            doc for (row_uid, row_kind, _), doc in self.items.items()
+            if row_uid == uid and row_kind == kind
+        ][:limit]
+
+
+def test_anchor_transition_wakes_once_and_repeat_only_updates_seen():
+    differ = PerceptionDifferV2()
+    wakes = []
+
+    first = observe_signal_v2(
+        "u1",
+        "wifi_anchor",
+        {"anchor_id": "wifi-home", "label": "home"},
+        ts=10.0,
+        origin_refs=("ios_report:location_signal",),
+        differ=differ,
+        submit_wake=wakes.append,
+    )
+    repeat = observe_signal_v2(
+        "u1",
+        "wifi_anchor",
+        {"anchor_id": "wifi-home", "label": "home"},
+        ts=20.0,
+        origin_refs=("ios_report:location_signal",),
+        differ=differ,
+        submit_wake=wakes.append,
+    )
+
+    assert len(first.wake_events) == 1
+    assert repeat.wake_events == ()
+    assert len(wakes) == 1
+    assert wakes[0].trigger == "arrived_at_anchor"
+    assert wakes[0].origin_refs == ("ios_report:location_signal",)
+    assert "wifi_anchor" in wakes[0].change_digest
+    assert repeat.result.state.last_seen_ts == 20.0
+    assert repeat.result.state.last_changed_ts == 10.0
+
+
+def test_continuous_signals_produce_zero_wakes_through_ingress():
+    differ = PerceptionDifferV2()
+    wakes = []
+
+    for signal, value in (
+        ("motion_state", {"state": "walking"}),
+        ("battery", {"level": 0.7}),
+        ("now_playing", {"title": "Song"}),
+        ("time", {"local_time": "2026-06-19T21:00:00+08:00"}),
+        ("place_label", "home"),
+    ):
+        observed = observe_signal_v2(
+            "u1",
+            signal,
+            value,
+            ts=30.0,
+            origin_refs=(f"test:{signal}",),
+            differ=differ,
+            submit_wake=wakes.append,
+        )
+        assert observed.wake_events == ()
+
+    assert wakes == []
+
+
+def test_pr6b_real_ios_report_fixture_is_accepted_without_wake_or_plaintext_state(monkeypatch):
+    fake = _Store()
+    emitted = []
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
+    monkeypatch.setattr(service, "_fire_wake_event_v2", lambda event: emitted.append(event))
+
+    results = service.ingest_snapshot_v2(
+        "u1",
+        _load_fixture("ios_report_full_changed.json")["context_snapshot"],
+        client_ts=1781874000,
+    )
+
+    assert results["location_signal"] == "accepted"
+    assert results["motion_state"] == "accepted"
+    assert results["calendar_next_event"] == "accepted"
+    assert results["playback"] == "accepted"
+    assert results["focus"] == "accepted"
+    assert emitted == []
+    state = fake.get_state("u1")
+    assert "local_time" in state
+    assert "motion_state" not in state
+    assert "now_playing" not in state
+
+
+def test_per_user_ingress_flag_defaults_off_and_prefers_runtime_profile(monkeypatch):
+    from hosted import config_store as hosted_config_store
+
+    user_store = SimpleNamespace(user_id="u_flag")
+
+    monkeypatch.setattr(
+        hosted_config_store,
+        "_load_model_api_config",
+        lambda store: {service.PERCEPTION_INGRESS_RUNTIME_V2_FLAG: True},
+    )
+    monkeypatch.setattr(
+        hosted_config_store,
+        "_ensure_model_api_runtime_profile",
+        lambda store, config: {service.PERCEPTION_INGRESS_RUNTIME_V2_FLAG: False},
+    )
+    assert service.perception_ingress_runtime_v2_enabled(user_store) is False
+
+    monkeypatch.setattr(
+        hosted_config_store,
+        "_ensure_model_api_runtime_profile",
+        lambda store, config: {},
+    )
+    assert service.perception_ingress_runtime_v2_enabled(user_store) is True
+
+    monkeypatch.setattr(hosted_config_store, "_load_model_api_config", lambda store: None)
+    monkeypatch.setattr(hosted_config_store, "_ensure_model_api_runtime_profile", lambda store, config: None)
+    assert service.perception_ingress_runtime_v2_enabled(user_store) is False
+
+
+def test_photo_added_wake_is_differ_event_with_digest_and_origin_refs(monkeypatch):
+    fake = _Store()
+    emitted = []
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
+    monkeypatch.setattr(service, "_fire_wake_event_v2", lambda event: emitted.append(event))
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled", lambda user_or_store: True)
+
+    out, code = service.photo_evaluate(
+        "u1",
+        {"scene_hint": "food"},
+        {"id": "photo_1", "body_ct": "cipher"},
+    )
+
+    assert code == 200 and out["status"] == "stored"
+    assert len(emitted) == 1
+    assert emitted[0].trigger == "photo_added"
+    assert emitted[0].origin_refs == ("photo:photo_1",)
+    assert "photo_added" in emitted[0].change_digest
+
+
+def test_device_event_route_only_runs_perception_ingress_when_flag_on(monkeypatch):
+    from flask import Flask
+    import proactive.routes as proactive_routes
+
+    class DeviceStore:
+        user_id = "u_device"
+
+        def __init__(self):
+            self.events = []
+
+        def append_device_event(self, event):
+            self.events.append(dict(event))
+
+        def list_device_events(self, since_epoch=0.0, limit=100):
+            return list(self.events)[-limit:]
+
+    fake_store = DeviceStore()
+    calls = []
+
+    monkeypatch.setattr(proactive_routes.auth, "require_user", lambda: fake_store)
+    monkeypatch.setattr(service, "ingest_device_event_v2", lambda uid, event: calls.append((uid, event)) or {
+        "observations": 1,
+        "wake_events": 1,
+    })
+
+    app = Flask("device-route")
+    app.register_blueprint(proactive_routes.bp)
+    client = app.test_client()
+
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled", lambda user_or_store: False)
+    off = client.post("/v1/device/events", json={
+        "type": "screen_frame",
+        "payload": {"safe_screen_phash": "hash_a", "broadcast_state": "on"},
+    })
+    assert off.status_code == 200
+    assert "perception_v2" not in off.get_json()
+    assert calls == []
+
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled", lambda user_or_store: True)
+    on = client.post("/v1/device/events", json={
+        "type": "screen_frame",
+        "payload": {"safe_screen_phash": "hash_b", "broadcast_state": "on"},
+    })
+    assert on.status_code == 200
+    assert on.get_json()["perception_v2"] == {"observations": 1, "wake_events": 1}
+    assert calls and calls[-1][0] == "u_device"
+
+
+def test_device_event_phash_respects_broadcast_state(monkeypatch):
+    fake = _Store()
+    emitted = []
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
+    monkeypatch.setattr(service, "_fire_wake_event_v2", lambda event: emitted.append(event))
+
+    off_event = {
+        "event_id": "evt_off",
+        "ts": 100.0,
+        "type": "screen_frame",
+        "payload": {"safe_screen_phash": "hash_a", "broadcast_state": "off"},
+    }
+    on_event = {
+        "event_id": "evt_on",
+        "ts": 101.0,
+        "type": "screen_frame",
+        "payload": {"safe_screen_phash": "hash_b", "broadcast_state": "on"},
+    }
+
+    assert device_event_observations_v2(off_event) == ()
+    assert service.ingest_device_event_v2("u1", off_event) == {"observations": 0, "wake_events": 0}
+    assert service.ingest_device_event_v2("u1", on_event)["wake_events"] == 1
+    assert emitted[0].source == "scene_change"
+    assert emitted[0].origin_refs == ("device_event:evt_on",)
+
+
+def test_compatibility_job_adapter_preserves_presence_hints():
+    event = wake_event_v2_from_legacy_job(
+        "u1",
+        {
+            "job_id": "pj_1",
+            "trigger": "arrived_at_anchor",
+            "ts": 100.0,
+            "change_digest": "wifi_anchor: none -> home",
+            "presence_hints": {"entered_anchor": "home"},
+            "origin_refs": ["ios_report:location_signal"],
+        },
+    )
+
+    assert event.source == "perception_event"
+    assert event.presence_hints == {"entered_anchor": "home"}
+    assert event.origin_refs == ("ios_report:location_signal",)

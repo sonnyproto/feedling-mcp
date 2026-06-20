@@ -119,6 +119,28 @@ jobs:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: python -m pytest tests/test_db.py tests/test_multi_tenant_isolation.py -v
 
+      - name: Run Round 3 V2 regression suite
+        # Keep these focused: test_api.py is exercised by the server step above,
+        # and enclave route tests require dstack_sdk, so neither belongs here.
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          python -m pytest \
+            tests/test_proactive_store_v2.py \
+            tests/test_proactive_runtime_v2.py \
+            tests/test_proactive_scheduled_wake_v2.py \
+            tests/test_proactive_dashboard_v2.py \
+            tests/test_proactive_observability_v2.py \
+            tests/test_proactive_tool_executor_v2.py \
+            tests/test_hosted_wake_v2_cutover.py \
+            tests/test_perception_ingress_v2.py \
+            tests/test_ios_perception_contract_v2.py \
+            tests/test_perception.py \
+            tests/test_proactive_jobs.py \
+            tests/test_proactive_gate_eval.py \
+            tests/test_model_api_wake.py \
+            -v
+
   # -------------------------------------------------------------------------
   # Docker — confirm the hash-pinned build stays reproducible
   # -------------------------------------------------------------------------

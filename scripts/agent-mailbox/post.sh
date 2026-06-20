@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage:
+  scripts/agent-mailbox/post.sh --from codex --to claude --type review_request --subject "..." [--no-wake] < body.md
+
+Writes a durable mailbox message under .agents/mailbox and, when configured,
+wakes the recipient tmux pane with a fixed read command.
+USAGE
+  exit 2
+}
+
+repo_root() {
+  git rev-parse --show-toplevel 2>/dev/null || pwd
+}
+
+clean_token() {
+  case "$1" in
+    ""|*[!A-Za-z0-9_-]*) return 1 ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
+clean_line() {
+  printf '%s' "$1" | tr '\r\n' '  '
+}
+
+yaml_quote() {
+  clean_line "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/"/'
+}
+
+from=""
+to=""
+msg_type="message"
+subject=""
+no_wake=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --from) [ "$#" -ge 2 ] || usage; from="$2"; shift 2 ;;
+    --to) [ "$#" -ge 2 ] || usage; to="$2"; shift 2 ;;
+    --type) [ "$#" -ge 2 ] || usage; msg_type="$2"; shift 2 ;;
+    --subject) [ "$#" -ge 2 ] || usage; subject="$2"; shift 2 ;;
+    --no-wake) no_wake=1; shift ;;
+    -h|--help) usage ;;
+    *) usage ;;
+  esac
+done
+
+from="$(clean_token "$from")" || usage
+to="$(clean_token "$to")" || usage
+msg_type="$(clean_token "$msg_type")" || usage
+[ -n "$subject" ] || usage
+
+root="$(repo_root)"
+mailbox="${AGENT_MAILBOX_DIR:-$root/.agents/mailbox}"
+messages_dir="$mailbox/messages"
+inbox_dir="$mailbox/inbox/$to"
+outbox_dir="$mailbox/outbox/$from"
+tmp_dir="$mailbox/tmp"
+mkdir -p "$messages_dir" "$inbox_dir" "$outbox_dir" "$tmp_dir"
+
+body_tmp="$tmp_dir/body.$$"
+tmp_msg=""
+trap 'rm -f "$body_tmp" "$tmp_msg"' EXIT
+cat > "$body_tmp"
+
+ts="$(date -u '+%Y%m%dT%H%M%SZ')"
+iso_ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+nonce="$(uuidgen 2>/dev/null | tr 'A-F' 'a-f' | tr -d '-' | cut -c1-8 || true)"
+if [ -z "$nonce" ]; then
+  nonce="$$"
+fi
+id="${ts}_${from}_to_${to}_${nonce}"
+file="$messages_dir/$id.md"
+tmp_msg="$tmp_dir/$id.tmp"
+
+{
+  printf '%s\n' '---'
+  printf 'id: %s\n' "$(yaml_quote "$id")"
+  printf 'from: %s\n' "$(yaml_quote "$from")"
+  printf 'to: %s\n' "$(yaml_quote "$to")"
+  printf 'type: %s\n' "$(yaml_quote "$msg_type")"
+  printf 'subject: %s\n' "$(yaml_quote "$subject")"
+  printf 'created_at: %s\n' "$(yaml_quote "$iso_ts")"
+  printf '%s\n\n' '---'
+  cat "$body_tmp"
+  printf '\n'
+} > "$tmp_msg"
+
+mv "$tmp_msg" "$file"
+cp "$file" "$inbox_dir/$id.md"
+cp "$file" "$outbox_dir/$id.md"
+
+echo "posted $id"
+
+if [ "$no_wake" -eq 1 ]; then
+  exit 0
+fi
+
+config="$mailbox/config.env"
+if [ -f "$config" ]; then
+  # shellcheck disable=SC1090
+  . "$config"
+fi
+
+target_var="$(printf '%s_PANE' "$to" | tr '[:lower:]' '[:upper:]' | tr '-' '_')"
+target_pane="${!target_var:-}"
+if [ -z "$target_pane" ]; then
+  echo "wake skipped: $target_var is not configured in $config" >&2
+  exit 0
+fi
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "wake skipped: tmux not found" >&2
+  exit 0
+fi
+
+notice="New mailbox message for $to: $id. Run scripts/agent-mailbox/read.sh $to $id"
+if tmux send-keys -t "$target_pane" "$notice" Enter; then
+  echo "woke $to at $target_pane"
+else
+  echo "wake failed for $to at $target_pane" >&2
+fi

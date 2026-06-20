@@ -26,6 +26,13 @@ There is no longer a separate HANDOFF.md — it was a session-relay doc
 from the v0→v1 strip era and was deleted 2026-05-12. Recent state lives
 in the CHANGELOG and in git log.
 
+## Agent mailbox
+
+When coordinating with another local coding/audit agent in this repo, use
+`docs/AGENT_MAILBOX.md` and `scripts/agent-mailbox/`. The durable mailbox lives
+under `.agents/mailbox/` and is ignored by git; tmux wakeups only inject a
+fixed read command, never the full message body.
+
 ## Other repo conventions
 
 - TDX enclave operations — cross-reference the local `dstack-tutorial`
