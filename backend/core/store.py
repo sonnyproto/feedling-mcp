@@ -468,6 +468,7 @@ class UserStore:
             "version": 2,
             "enabled": True,
             "dnd": False,
+            "scheduled": True,
             "timezone": PROACTIVE_DEFAULT_TIMEZONE,
             "permission_states": {},
             "user_state": "default",
@@ -489,6 +490,7 @@ class UserStore:
             if isinstance(data, dict):
                 merged = dict(default)
                 merged.update(data)
+                merged["scheduled"] = bool(merged.get("scheduled", True))
                 if not isinstance(merged.get("permission_states"), dict):
                     merged["permission_states"] = {}
                 if str(merged.get("user_state") or "") not in PROACTIVE_USER_STATES:
@@ -508,6 +510,9 @@ class UserStore:
         allowed = {
             "enabled",
             "dnd",
+            "ambient",
+            "scheduled",
+            "reminders_delivery",
             "timezone",
             "permission_states",
             "user_state",
@@ -516,12 +521,21 @@ class UserStore:
             "broadcast_state",
             "wake_directive",
         }
+        patch_doc = dict(patch or {})
+        if "ambient" in patch_doc:
+            patch_doc["enabled"] = patch_doc["ambient"]
+        if "reminders_delivery" in patch_doc:
+            patch_doc["dnd"] = not bool(patch_doc["reminders_delivery"])
         cur = self.load_proactive_settings()
-        for key, value in (patch or {}).items():
+        for key, value in patch_doc.items():
             if key not in allowed:
                 continue
-            if key in {"enabled", "dnd"}:
+            if key in {"enabled", "dnd", "scheduled"}:
                 cur[key] = bool(value)
+            elif key == "ambient":
+                cur["enabled"] = bool(value)
+            elif key == "reminders_delivery":
+                cur["dnd"] = not bool(value)
             elif key == "timezone":
                 tz_name = str(value or "").strip()
                 try:

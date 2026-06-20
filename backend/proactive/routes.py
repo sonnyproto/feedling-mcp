@@ -17,6 +17,25 @@ bp = Blueprint("proactive", __name__)
 RESIDENT_WAKE_LEASE_SEC = 600.0
 _HOSTED_CONSUMER_IDS = frozenset({"hosted_runtime", "hosted_runtime_v2"})
 
+
+def _proactive_state_doc(settings: dict) -> dict:
+    enabled = bool(settings.get("enabled", True))
+    dnd = bool(settings.get("dnd", False))
+    return {
+        "version": settings.get("version", 2),
+        "enabled": enabled,
+        "dnd": dnd,
+        "ambient": enabled,
+        "scheduled": bool(settings.get("scheduled", True)),
+        "reminders_delivery": not dnd,
+        "user_state": settings.get("user_state", "default"),
+        "manual_user_state": settings.get("manual_user_state", settings.get("user_state", "default")),
+        "ai_state": settings.get("ai_state", "present"),
+        "broadcast_state": settings.get("broadcast_state", "unknown"),
+        "updated_at": settings.get("updated_at", ""),
+    }
+
+
 @bp.route("/v1/proactive/settings", methods=["GET", "POST"])
 def proactive_settings():
     store = auth.require_user()
@@ -31,33 +50,24 @@ def proactive_settings():
 def proactive_state():
     store = auth.require_user()
     if request.method == "GET":
-        settings = store.load_proactive_settings()
-        return jsonify({
-            "version": settings.get("version", 2),
-            "enabled": bool(settings.get("enabled", True)),
-            "dnd": bool(settings.get("dnd", False)),
-            "user_state": settings.get("user_state", "default"),
-            "manual_user_state": settings.get("manual_user_state", settings.get("user_state", "default")),
-            "ai_state": settings.get("ai_state", "present"),
-            "broadcast_state": settings.get("broadcast_state", "unknown"),
-            "updated_at": settings.get("updated_at", ""),
-        })
+        return jsonify(_proactive_state_doc(store.load_proactive_settings()))
     payload = request.get_json(silent=True) or {}
     settings = store.save_proactive_settings({
         key: payload.get(key)
-        for key in ("user_state", "manual_user_state", "ai_state", "broadcast_state", "enabled", "dnd")
+        for key in (
+            "user_state",
+            "manual_user_state",
+            "ai_state",
+            "broadcast_state",
+            "enabled",
+            "dnd",
+            "ambient",
+            "scheduled",
+            "reminders_delivery",
+        )
         if key in payload
     })
-    return jsonify({
-        "version": settings.get("version", 2),
-        "enabled": bool(settings.get("enabled", True)),
-        "dnd": bool(settings.get("dnd", False)),
-        "user_state": settings.get("user_state", "default"),
-        "manual_user_state": settings.get("manual_user_state", settings.get("user_state", "default")),
-        "ai_state": settings.get("ai_state", "present"),
-        "broadcast_state": settings.get("broadcast_state", "unknown"),
-        "updated_at": settings.get("updated_at", ""),
-    })
+    return jsonify(_proactive_state_doc(settings))
 
 
 @bp.route("/v1/device/events", methods=["GET", "POST"])
