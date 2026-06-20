@@ -41,6 +41,11 @@
       "message": "未授权媒体资料库，无法读取正在播放上下文"
     },
     {
+      "key": "audio_route",
+      "data": null,
+      "message": "无法读取当前音频输出路由"
+    },
+    {
       "key": "weather",
       "data": null,
       "message": "WeatherKit 不可用，无法读取粗天气"

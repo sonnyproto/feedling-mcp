@@ -58,6 +58,7 @@ def test_ios_full_report_fixture_classifies_current_payload_shape():
         "motion_state",
         "calendar_next_event",
         "playback",
+        "audio_route",
         "weather",
         "health_sleep",
         "health_workout",
@@ -81,7 +82,8 @@ def test_ios_full_report_fixture_classifies_current_payload_shape():
         "calendar_next_event",
     )
     assert signals["playback"].differ_inputs == ("now_playing",)
-    for key in ("weather", "health_sleep", "health_workout", "health_vitals"):
+    assert signals["audio_route"].differ_inputs == ("audio_route",)
+    for key in ("audio_route", "weather", "health_sleep", "health_workout", "health_vitals"):
         assert signals[key].differ_inputs == (key,)
         assert signals[key].wake_policy == "pull_only_after_decrypt"
     assert signals["unsupported"].status == "ignored"
@@ -96,6 +98,7 @@ def test_ios_unchanged_encrypted_signals_do_not_imply_wake():
         "motion_state",
         "calendar_next_event",
         "playback",
+        "audio_route",
         "weather",
         "health_sleep",
         "health_workout",
@@ -116,6 +119,7 @@ def test_ios_missing_permission_and_unavailable_shapes_are_null_no_wake():
         "focus",
         "calendar_next_event",
         "playback",
+        "audio_route",
         "weather",
         "health_sleep",
         "health_workout",
@@ -147,6 +151,7 @@ def test_contract_mapped_continuous_signals_produce_zero_differ_events():
         ("battery", {"level": 0.82, "charging": True}),
         ("motion_state", {"state": "walking", "confidence": "high"}),
         ("now_playing", {"playback_state": "playing", "title": "Song"}),
+        ("audio_route", {"output_type": "speaker", "is_bluetooth": False}),
         ("place_label", "home"),
         ("weather", {"condition": "rain", "temperature_bucket": 20}),
         ("health_sleep", {"asleep_minutes_bucket": 420}),

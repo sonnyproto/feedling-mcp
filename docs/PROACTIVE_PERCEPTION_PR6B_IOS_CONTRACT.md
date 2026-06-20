@@ -41,10 +41,13 @@ The preview-only wrapper fields `generated_at`, `source`, `upload_enabled`, and
 | `battery` | `{key,data,message}`, data is JSON string | Pull-only, differ signal `battery`, zero wake |
 | `broadcast` | `{key,data,message}`, data is JSON string | Runtime context for broadcast regime, no direct wake |
 | `focus` | `{key,data,message}`, data is JSON string or null | Pull/presence-only; must not revive old `user_state/away` gate |
-| `location_signal` | `{key,envelope,changed}` or `{key,data:null,message}` | Decrypt before differ; maps to `connectivity_anchor`, `wifi_anchor`, `place_label` |
+| `location_signal` | `{key,envelope,changed}` or `{key,data:null,message}` | Decrypt before differ; stores coarse labels plus `wifi_anchor_id`; non-empty changed `wifi_anchor_id` feeds `wifi_anchor` differ |
 | `motion_state` | `{key,envelope,changed}` or `{key,data:null,message}` | Decrypt before differ; pull-only `motion_state`, zero wake |
 | `calendar_next_event` | `{key,envelope,changed}` or `{key,data:null,message}` | Decrypt before differ; calendar presence/pull context |
 | `playback` | `{key,envelope,changed}` or `{key,data:null,message}` | Decrypt before differ; pull-only `now_playing`, zero wake |
+| `audio_route` | `{key,envelope,changed}` or `{key,data:null,message}` | Decrypt then store pull-only `output_type` / `is_bluetooth` / `device_name`, zero wake |
+| `weather` | `{key,envelope,changed}` or `{key,data:null,message}` | Decrypt then store pull-only coarse weather, zero wake |
+| `health_sleep` / `health_workout` / `health_vitals` | `{key,envelope,changed}` or `{key,data:null,message}` | Decrypt then store pull-only HealthKit buckets, zero wake |
 | `unsupported` | `{key,data,message}` with null subfields | Explicit ignored result |
 
 Unknown future keys classify as `unknown_signal` / `error`; they must not
@@ -63,8 +66,8 @@ Fixtures live under `tests/fixtures/perception_ios_v2/`.
   signals are omitted by iOS `compactMap`.
 - `ios_photo_evaluate_document.json`: current photo body with `metadata`,
   `content_envelope`, and optional `meta_envelope`; no raw `exif_gps`.
-- `manifest.json`: source commit, dropped-upload explanation, HealthKit
-  unavailable status, and human device verification status.
+- `manifest.json`: source commit, dropped-upload explanation, and human device
+  verification status.
 
 ## Photo V2 Alignment
 
@@ -77,15 +80,11 @@ sensitive-scene hard block. PR6b updates the backend photo path accordingly:
 - Optional iOS `meta_envelope` is preserved encrypted and returned only by the
   single-photo content endpoint, not by the recent-photo list.
 
-## HealthKit
+## HealthKit / Weather / Audio Route
 
-HealthKit-backed tools remain explicit unavailable until iOS implements
-producers:
-
-- `steps`
-- `sleep_last_night`
-- `workout`
-- `vitals`
+HealthKit, WeatherKit, and audio-route producers now report encrypted,
+already-coarsened payloads. Backend ingress accepts them as pull-only after
+decrypt; they must not become wake sources.
 
 ## Manual Device Gate
 
@@ -104,4 +103,3 @@ python3 -m pytest tests/test_ios_perception_contract_v2.py tests/test_perception
 python3 -m py_compile backend/perception/ios_contract_v2.py backend/perception/service.py backend/perception/routes.py
 git diff --check
 ```
-

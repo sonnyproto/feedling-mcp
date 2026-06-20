@@ -12,8 +12,8 @@
     "App/FeedlingBroadcast/SampleHandler.swift"
   ],
   "fixtures": {
-    "ios_report_full_changed.json": "All currently emitted report keys, encrypted sensitive/weather/health signals changed=true.",
-    "ios_report_unchanged.json": "Same encrypted sensitive/weather/health signal shape with changed=false.",
+    "ios_report_full_changed.json": "All currently emitted report keys, encrypted sensitive/audio/weather/health signals changed=true.",
+    "ios_report_unchanged.json": "Same encrypted sensitive/audio/weather/health signal shape with changed=false.",
     "ios_report_missing_permission_unavailable.json": "NSNull data shape for missing permission and authorized-but-unavailable signals.",
     "ios_report_dropped_upload.json": "Content keys unavailable: encrypted signals are omitted from context_snapshot.",
     "ios_photo_evaluate_document.json": "Current iOS photo/evaluate body: metadata + content_envelope + optional meta_envelope, no exif_gps."
@@ -24,6 +24,7 @@
       "motion_state",
       "calendar_next_event",
       "playback",
+      "audio_route",
       "weather",
       "health_sleep",
       "health_workout",

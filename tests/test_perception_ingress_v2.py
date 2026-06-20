@@ -152,6 +152,7 @@ def test_weather_health_and_focus_ingress_are_pull_only_after_decrypt(monkeypatc
     monkeypatch.setattr(service, "_submit_wake_event_v2_compat", lambda event: emitted.append(event))
 
     plaintext_by_id = {
+        "env_audio": {"output_type": "bluetooth", "is_bluetooth": True, "device_name": "Headphones"},
         "env_weather": {"condition": "rain", "temperature_bucket": 20, "is_daylight": False},
         "env_sleep": {"asleep_minutes_bucket": 420},
         "env_workout": {"workout_type": "running", "duration_min_bucket": 30, "count_today": 1},
@@ -167,6 +168,7 @@ def test_weather_health_and_focus_ingress_are_pull_only_after_decrypt(monkeypatc
         "u_weather_health",
         [
             {"key": "focus", "data": json.dumps({"authorization_status": "authorized", "focused": True})},
+            {"key": "audio_route", "envelope": {"id": "env_audio"}, "changed": True},
             {"key": "weather", "envelope": {"id": "env_weather"}, "changed": True},
             {"key": "health_sleep", "envelope": {"id": "env_sleep"}, "changed": True},
             {"key": "health_workout", "envelope": {"id": "env_workout"}, "changed": True},
@@ -178,11 +180,14 @@ def test_weather_health_and_focus_ingress_are_pull_only_after_decrypt(monkeypatc
     )
 
     assert results["focus"] == "accepted"
-    for key in ("weather", "health_sleep", "health_workout", "health_vitals"):
+    for key in ("audio_route", "weather", "health_sleep", "health_workout", "health_vitals"):
         assert results[key] == "accepted"
     state = fake.get_state("u_weather_health")
     assert state["focus_authorization_status"]["v"] == "authorized"
     assert state["in_focus"]["v"] is True
+    assert state["output_type"]["v"] == "bluetooth"
+    assert state["is_bluetooth"]["v"] is True
+    assert state["device_name"]["v"] == "Headphones"
     assert state["condition"]["v"] == "rain"
     assert state["temperature_bucket"]["v"] == 20
     assert state["is_daylight"]["v"] is False
@@ -193,6 +198,87 @@ def test_weather_health_and_focus_ingress_are_pull_only_after_decrypt(monkeypatc
     assert state["resting_heart_rate_bucket"]["v"] == 60
     assert state["step_count_bucket"]["v"] == 3500
     assert service.pull_snapshot("u_weather_health", now=200.0)["in_focus"] is True
+    assert service.pull_snapshot("u_weather_health", now=200.0)["output_type"] == "bluetooth"
+    assert emitted == []
+
+
+def test_location_signal_decrypt_feeds_wifi_anchor_differ_once(monkeypatch):
+    fake = _Store()
+    emitted = []
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_submit_wake_event_v2_compat", lambda event: emitted.append(event))
+
+    plaintext_by_id = {
+        "loc_home_1": {"place_label": "unknown", "wifi_label": None, "country": "US", "wifi_anchor_id": "wifi-home"},
+        "loc_home_2": {"place_label": "unknown", "wifi_label": None, "country": "US", "wifi_anchor_id": "wifi-home"},
+        "loc_work": {"place_label": "unknown", "wifi_label": None, "country": "US", "wifi_anchor_id": "wifi-work"},
+    }
+
+    def decrypt(envelope, api_key, *, purpose):
+        assert api_key == "api-key"
+        assert purpose == "perception:location_signal"
+        return json.dumps(plaintext_by_id[envelope["id"]]).encode("utf-8")
+
+    first = service.ingest_snapshot_v2(
+        "u_wifi_anchor_decrypt",
+        [{"key": "location_signal", "envelope": {"id": "loc_home_1"}, "changed": True}],
+        client_ts=300.0,
+        api_key="api-key",
+        decrypt_envelope=decrypt,
+    )
+    repeat = service.ingest_snapshot_v2(
+        "u_wifi_anchor_decrypt",
+        [{"key": "location_signal", "envelope": {"id": "loc_home_2"}, "changed": True}],
+        client_ts=310.0,
+        api_key="api-key",
+        decrypt_envelope=decrypt,
+    )
+    moved = service.ingest_snapshot_v2(
+        "u_wifi_anchor_decrypt",
+        [{"key": "location_signal", "envelope": {"id": "loc_work"}, "changed": True}],
+        client_ts=320.0,
+        api_key="api-key",
+        decrypt_envelope=decrypt,
+    )
+
+    assert first["location_signal"] == "accepted"
+    assert repeat["location_signal"] == "accepted"
+    assert moved["location_signal"] == "accepted"
+    assert [event.trigger for event in emitted] == ["arrived_at_anchor", "arrived_at_anchor"]
+    assert emitted[0].origin_refs == ("ios_report:location_signal",)
+    assert "wifi_anchor" in emitted[0].change_digest
+    assert fake.get_state("u_wifi_anchor_decrypt")["wifi_anchor_id"]["v"] == "wifi-work"
+
+
+def test_location_signal_null_or_unchanged_anchor_does_not_wake(monkeypatch):
+    fake = _Store()
+    emitted = []
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_submit_wake_event_v2_compat", lambda event: emitted.append(event))
+
+    plaintext_by_id = {
+        "loc_null": {"place_label": "unknown", "wifi_label": None, "country": "US", "wifi_anchor_id": None},
+        "loc_unchanged": {"place_label": "unknown", "wifi_label": None, "country": "US", "wifi_anchor_id": "wifi-home"},
+    }
+
+    def decrypt(envelope, api_key, *, purpose):
+        return json.dumps(plaintext_by_id[envelope["id"]]).encode("utf-8")
+
+    service.ingest_snapshot_v2(
+        "u_wifi_anchor_noop",
+        [{"key": "location_signal", "envelope": {"id": "loc_null"}, "changed": True}],
+        client_ts=300.0,
+        api_key="api-key",
+        decrypt_envelope=decrypt,
+    )
+    service.ingest_snapshot_v2(
+        "u_wifi_anchor_unchanged",
+        [{"key": "location_signal", "envelope": {"id": "loc_unchanged"}, "changed": False}],
+        client_ts=300.0,
+        api_key="api-key",
+        decrypt_envelope=decrypt,
+    )
+
     assert emitted == []
 
 
@@ -319,6 +405,25 @@ def test_device_event_phash_respects_broadcast_state(monkeypatch):
     assert service.ingest_device_event_v2("u1", on_event)["wake_events"] == 1
     assert emitted[0].source == "scene_change"
     assert emitted[0].origin_refs == ("device_event:evt_on",)
+
+
+def test_device_event_unlock_after_absence_wakes(monkeypatch):
+    fake = _Store()
+    emitted = []
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
+    monkeypatch.setattr(service, "_fire_wake_event_v2", lambda event: emitted.append(event))
+
+    out = service.ingest_device_event_v2("u_unlock_after_absence", {
+        "event_id": "evt_unlock",
+        "ts": 400.0,
+        "type": "unlock_after_absence",
+        "payload": {"wake_trigger": "unlock_after_absence", "idle_sec": 3600},
+    })
+
+    assert out == {"observations": 1, "wake_events": 1}
+    assert emitted[0].trigger == "unlock_after_absence"
+    assert emitted[0].origin_refs == ("device_event:evt_unlock",)
 
 
 def test_compatibility_job_adapter_preserves_presence_hints():

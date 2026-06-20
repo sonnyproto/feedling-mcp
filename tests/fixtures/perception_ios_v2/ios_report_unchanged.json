@@ -81,6 +81,21 @@
       "changed": false
     },
     {
+      "key": "audio_route",
+      "envelope": {
+        "v": 1,
+        "id": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "body_ct": "base64-audio-route-body-2",
+        "nonce": "base64-audio-route-nonce-2",
+        "K_user": "base64-audio-route-k-user-2",
+        "K_enclave": "base64-audio-route-k-enclave-2",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": false
+    },
+    {
       "key": "weather",
       "envelope": {
         "v": 1,

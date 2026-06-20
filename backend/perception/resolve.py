@@ -170,6 +170,10 @@ def resolve_weather(value, config: dict) -> dict:
     return _copy_fields(value, ("condition", "temperature_bucket", "is_daylight"))
 
 
+def resolve_audio_route(value, config: dict) -> dict:
+    return _copy_fields(value, ("output_type", "is_bluetooth", "device_name"))
+
+
 def resolve_health_sleep(value, config: dict) -> dict:
     return _copy_fields(value, ("asleep_minutes_bucket",))
 
@@ -201,6 +205,7 @@ def resolve_location_signal(value, config: dict) -> dict:
     else:
         out["place_label"] = value.get("place_label") or "unknown"
     out["wifi_label"] = value.get("wifi_label")
+    out["wifi_anchor_id"] = value.get("wifi_anchor_id")
     crc = value.get("country_region_change") or {}
     pm = value.get("placemark") or {}
     out["country"] = crc.get("locale_region") or pm.get("iso_country_code")
@@ -216,6 +221,7 @@ RESOLVERS = {
     "broadcast": resolve_broadcast,
     "focus_presence": resolve_focus_presence,
     "weather": resolve_weather,
+    "audio_route": resolve_audio_route,
     "health_sleep": resolve_health_sleep,
     "health_workout": resolve_health_workout,
     "health_vitals": resolve_health_vitals,

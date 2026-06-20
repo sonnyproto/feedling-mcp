@@ -75,6 +75,7 @@ DEFAULT_TOOL_SPECS_V2: tuple[ToolSpecV2, ...] = (
     ToolSpecV2("perception.calendar", "perception", FAST, "Calendar window; >7 days is slow."),
     ToolSpecV2("perception.now_playing", "perception", FAST, "Current media playback."),
     ToolSpecV2("perception.motion", "perception", FAST, "Motion is pull-only; it is not a wake source."),
+    ToolSpecV2("perception.audio_route", "perception", FAST, "Current coarse audio output route reported by iOS."),
     ToolSpecV2("perception.weather", "perception", FAST, "Coarse WeatherKit context reported by iOS."),
     ToolSpecV2("perception.steps", "perception", SLOW, "HealthKit-backed step-count bucket reported by iOS."),
     ToolSpecV2("perception.sleep_last_night", "perception", SLOW, "HealthKit-backed sleep trend."),

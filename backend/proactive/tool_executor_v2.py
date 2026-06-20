@@ -268,6 +268,7 @@ class ToolExecutorV2:
         } and not self.adapters.perception_snapshot:
             return ("perception_snapshot_adapter_missing", "perception snapshot adapter is not configured")
         if call.name in {
+            "perception.audio_route",
             "perception.weather",
             "perception.steps",
             "perception.sleep_last_night",
@@ -310,6 +311,7 @@ class ToolExecutorV2:
                 "place_label": snap.get("place_label"),
                 "wifi_label": snap.get("wifi_label"),
                 "country": snap.get("country"),
+                "wifi_anchor_id": snap.get("wifi_anchor_id"),
             }}
         if call.name == "perception.calendar":
             snap = self._snapshot(call.user_id)
@@ -321,6 +323,13 @@ class ToolExecutorV2:
             return {"now_playing": self._snapshot(call.user_id).get("now_playing")}
         if call.name == "perception.motion":
             return {"motion_state": self._snapshot(call.user_id).get("motion_state")}
+        if call.name == "perception.audio_route":
+            state = self._pull_snapshot(call.user_id)
+            return {"audio_route": {
+                "output_type": state.get("output_type"),
+                "is_bluetooth": state.get("is_bluetooth"),
+                "device_name": state.get("device_name"),
+            }}
         if call.name == "perception.weather":
             state = self._pull_snapshot(call.user_id)
             return {"weather": {

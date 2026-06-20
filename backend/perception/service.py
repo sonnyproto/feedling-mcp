@@ -142,6 +142,15 @@ def _decrypt_signal_payload_v2(
         return None, f"decrypt_failed:{type(e).__name__}"
 
 
+def _decrypted_location_anchor_id_v2(plaintext: Any) -> str:
+    if not isinstance(plaintext, Mapping):
+        return ""
+    anchor = plaintext.get("wifi_anchor_id")
+    if anchor is None:
+        return ""
+    return str(anchor).strip()
+
+
 def ingest_snapshot(user_id: str, items: list, client_ts=None) -> dict:
     """Ingest a {context_snapshot:[{key,data,message}]} report. `data` is a JSON
     string (or "null"). Composite keys (e.g. device) expand into their sub-signals;
@@ -186,6 +195,7 @@ def ingest_snapshot_v2(
     """
     now = _coerce_ts(client_ts)
     storage_items: list[dict] = []
+    location_anchor_observations: list[tuple[str, Any]] = []
     results: dict[str, str] = {}
 
     for item in (items or []):
@@ -236,6 +246,8 @@ def ingest_snapshot_v2(
                         "data": json.dumps(plaintext),
                         "message": signal.message,
                     })
+                    if key == "location_signal" and signal.changed is True:
+                        location_anchor_observations.append((key, plaintext))
             else:
                 storage_items.append(item)
             continue
@@ -243,6 +255,20 @@ def ingest_snapshot_v2(
 
     if storage_items:
         results.update(_ingest_snapshot_storage_only(user_id, storage_items, client_ts=client_ts))
+    for key, plaintext in location_anchor_observations:
+        if results.get(key) != "accepted":
+            continue
+        anchor_id = _decrypted_location_anchor_id_v2(plaintext)
+        if not anchor_id:
+            continue
+        observe_signal_v2(
+            user_id,
+            "wifi_anchor",
+            anchor_id,
+            ts=now,
+            origin_refs=("ios_report:location_signal",),
+            submit_wake=_submit_wake_event_v2_compat,
+        )
     return results
 
 

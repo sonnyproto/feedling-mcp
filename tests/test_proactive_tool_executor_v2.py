@@ -31,6 +31,10 @@ def _adapters(*, send_message=None, photos_recent=None) -> ToolRuntimeAdaptersV2
         "now_playing": {"title": "Song"},
         "motion_state": "walking",
         "in_focus": True,
+        "wifi_anchor_id": "wifi-anchor-home",
+        "output_type": "bluetooth",
+        "is_bluetooth": True,
+        "device_name": "Headphones",
         "condition": "rain",
         "temperature_bucket": 20,
         "is_daylight": False,
@@ -100,6 +104,7 @@ def test_executor_runs_minimum_available_tools_with_injected_action_adapter():
         ToolCallV2("perception.calendar", user_id="u1", args={"window_days": 1}),
         ToolCallV2("perception.now_playing", user_id="u1"),
         ToolCallV2("perception.motion", user_id="u1"),
+        ToolCallV2("perception.audio_route", user_id="u1"),
         ToolCallV2("perception.weather", user_id="u1"),
         ToolCallV2("perception.photo_recent", user_id="u1", args={"limit": 1}),
         ToolCallV2("memory.index", user_id="u1"),
@@ -112,27 +117,34 @@ def test_executor_runs_minimum_available_tools_with_injected_action_adapter():
     assert all(result.ok for result in results)
     assert results[0].result["snapshot"]["place_label"] == "home"
     assert results[1].result["location"]["wifi_label"] == "wifi-home"
+    assert results[1].result["location"]["wifi_anchor_id"] == "wifi-anchor-home"
     assert results[2].result["calendar_next_event"]["title"] == "Dentist"
-    assert results[5].result["weather"] == {
+    assert results[5].result["audio_route"]["device_name"] == "Headphones"
+    assert results[6].result["weather"] == {
         "condition": "rain",
         "temperature_bucket": 20,
         "is_daylight": False,
     }
-    assert results[6].result["photos"][0]["photo_id"] == "p1"
-    assert results[7].result["memories"][0]["id"] == "mem_1"
-    assert results[8].result["memories"][0]["id"] == "mem_2"
+    assert results[7].result["photos"][0]["photo_id"] == "p1"
+    assert results[8].result["memories"][0]["id"] == "mem_1"
+    assert results[9].result["memories"][0]["id"] == "mem_2"
     assert sent == [("u1", "hello", {"text": "hello"})]
 
 
 def test_weather_and_health_tools_read_ios_snapshot_fields():
     executor = ToolExecutorV2(adapters=_adapters(), budget=ToolBudgetV2(slow_inline_limit=5))
 
+    audio_route = executor.execute(ToolCallV2("perception.audio_route", user_id="u1"))
     weather = executor.execute(ToolCallV2("perception.weather", user_id="u1"))
     steps = executor.execute(ToolCallV2("perception.steps", user_id="u1"))
     sleep = executor.execute(ToolCallV2("perception.sleep_last_night", user_id="u1"))
     workout = executor.execute(ToolCallV2("perception.workout", user_id="u1"))
     vitals = executor.execute(ToolCallV2("perception.vitals", user_id="u1"))
 
+    assert audio_route.ok is True
+    assert audio_route.result["audio_route"]["output_type"] == "bluetooth"
+    assert audio_route.result["audio_route"]["is_bluetooth"] is True
+    assert audio_route.result["audio_route"]["device_name"] == "Headphones"
     assert weather.ok is True
     assert weather.result["weather"]["condition"] == "rain"
     assert steps.result["steps"]["step_count_bucket"] == 3500
