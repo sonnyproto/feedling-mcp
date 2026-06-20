@@ -58,7 +58,8 @@
 |----|------|------|
 | ~~三个用户开关(陪伴/定时任务/提醒)~~ | ✅ 已补齐(2026-06-20):后端三字段合入 test、iOS 三开关 UI 已 commit | 待 iOS build 后 F 组可全验 |
 | 屏幕看懂内容(screen.read caption)| D14 小模型未接 | C1 只验帧/pHash |
-| 步数 | HealthKit iOS 端 0 | D2 用日历替代 |
+| 天气 / 健康(步数/睡眠/运动/体征)| iOS 已建(2026-06-20 `8bc4504`),但**后端 ingress 未接**(`unknown_signal`)+ Apple 后台 capability 未开 | 后端接前真机测不到;已派 Codex(见 spec §9 B1b)|
+| ~~步数~~ | 同上(并入天气/健康行)| D2 仍可用日历替代演示流程 |
 | WiFi/BT/unlock 离散事件 | iOS 疑似不发 | B3/B4 做了没 wake = 证实缺口 |
 | request_broadcast | 未做 | §5.3 |
 | hosted 窗口内 wake 合并 | merge_window=0(有意)| D1 只验单飞 |

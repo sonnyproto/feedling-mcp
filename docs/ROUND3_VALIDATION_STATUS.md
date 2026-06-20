@@ -122,8 +122,16 @@ what the app actually sends before concluding the V2 wake path works.**
   is `screen_phash` (perceptual-hash change detection) + on-device iOS Vision
   `scene_hint` — **the backend does NOT OCR**. Actual caption/VLM is the TODO;
   engineer plans to hook a small model.
-- **HealthKit.** iOS side is 0; steps/sleep/workout/vitals tools are
-  unavailable stubs. Owned by another engineer.
+- **HealthKit + Weather.** ~~iOS side is 0~~ → **iOS shipped 2026-06-20**
+  (`8bc4504`): encrypted `weather` + `health_sleep`/`health_workout`/
+  `health_vitals` snapshot signals. **Backend ingress NOT yet wired** — these
+  4 keys classify as `unknown_signal`/`error` in `ios_contract_v2.py`. Backend
+  task dispatched to Codex (spec §9 B1b): register as encrypted pull-only
+  signals (Seven confirmed pull-only), field-name-aligned to the iOS
+  `PERCEPTION_BACKEND_TODO.md`; also delete the dead `resolve_focus`/
+  `_apply_focus` (mapped to deleted user_state) and the stale
+  `HEALTHKIT_UNAVAILABLE_V2`. Apple dev-portal must also enable HealthKit +
+  WeatherKit capability before real-device auth works.
 - **request_broadcast (B5) iOS acceptance.** Not done.
 
 When those land, they need their own code-review round.
