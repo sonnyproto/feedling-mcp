@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 appmod = importlib.import_module("app")
 from chat import service as chat_service  # noqa: E402
 from bootstrap import gates as boot_gates  # noqa: E402
+from proactive.controls_v2 import evaluate_wake_control_v2, resolve_settings_v2  # noqa: E402
 from proactive import dashboard as proactive_dashboard  # noqa: E402
 from proactive import resident_runtime_v2 as proactive_resident_runtime_v2  # noqa: E402
 from proactive import routes as proactive_routes  # noqa: E402
@@ -368,6 +369,59 @@ def test_proactive_settings_persists_timezone(tmp_path, monkeypatch):
     )
     assert bad.status_code == 200
     assert bad.get_json()["timezone"] == "Asia/Tokyo"
+
+
+def test_proactive_state_three_switch_contract_drives_v2_scheduled_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_proactive_three_switch_key"
+    user_id = "usr_endpoint_proactive_three_switch"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    resp = client.post(
+        "/v1/proactive/state",
+        headers=headers,
+        json={
+            "ambient": False,
+            "scheduled": False,
+            "reminders_delivery": False,
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ambient"] is False
+    assert body["scheduled"] is False
+    assert body["reminders_delivery"] is False
+    assert body["enabled"] is False
+    assert body["dnd"] is True
+
+    got = client.get("/v1/proactive/state", headers=headers)
+    assert got.status_code == 200
+    state = got.get_json()
+    assert state["ambient"] is False
+    assert state["scheduled"] is False
+    assert state["reminders_delivery"] is False
+
+    settings = appmod.get_store(user_id).load_proactive_settings()
+    assert settings["enabled"] is False
+    assert settings["scheduled"] is False
+    assert settings["dnd"] is True
+
+    resolved = resolve_settings_v2(settings)
+    assert resolved.switches() == {
+        "ambient": False,
+        "scheduled": False,
+        "reminders_delivery": False,
+    }
+    decision = evaluate_wake_control_v2("scheduled_wake", settings=resolved)
+    assert decision.accepted is False
+    assert decision.reason == "scheduled_disabled"
+    assert decision.transparency_required is True
 
 
 def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
