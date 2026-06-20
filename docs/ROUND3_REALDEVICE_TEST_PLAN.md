@@ -27,13 +27,13 @@
 | **D2** | 异步后台 needs_background(用"明天安排"替代步数) | 附A⑤⑧/§6 | ⚠️ | ⬜ | 步数版测不了 |
 | **E1** | agent 自己 schedule_wake(带 tz/origin_refs) | 附A②/§7 | ✅ | ⬜ | |
 | **E2** | 定时器到点 fired(可设1分钟后) | §7 | ✅ | ⬜ | |
-| **F1** | 陪伴关→自发停,但前台/manual 照常 | 附A⑦/§8.2 | ✅* | ⬜ | *依赖开关入口,见下 |
-| **F2** | 陪伴关+定时开→闹钟仍响(不连坐) | 附A⑦/§8.3 | ✅* | ⬜ | 最伤信任点,务必验 |
-| **F3** | 定时任务关→不能设/不触发+透明告知 | §8.4/PR8 | ✅* | ⬜ | |
-| **F4** | 提醒关→醒+写chat但不buzz+透明告知 | 附A⑥/§8.4 | ✅* | ⬜ | |
-| **F5** | 深夜 Delivery 自掐(Wake/Voice 照旧) | §8.4/D4 | ✅* | ⬜ | 依赖 iOS 写时区 |
+| **F1** | 陪伴关→自发停,但前台/manual 照常 | 附A⑦/§8.2 | ✅ | ⬜ | |
+| **F2** | 陪伴关+定时开→闹钟仍响(不连坐) | 附A⑦/§8.3 | ✅ | ⬜ | 最伤信任点,务必验 |
+| **F3** | 定时任务关→不能设/不触发+透明告知 | §8.4/PR8 | ✅ | ⬜ | |
+| **F4** | 提醒关→醒+写chat但不buzz+透明告知 | 附A⑥/§8.4 | ✅ | ⬜ | |
+| **F5** | 深夜 Delivery 自掐(Wake/Voice 照旧) | §8.4/D4 | ✅ | ⬜ | 依赖 iOS 写时区 |
 
-> `*` F 组依赖"三个用户开关"的入口。**当前 iOS 没有这三个开关 UI、后端 settings 只有 enabled/dnd、scheduled 无用户入口**(见下"已知缺口")。在补齐前,F 组只能用 legacy `enabled`(≈陪伴)/`dnd`(≈提醒)间接验,**定时任务(Scheduled)单独开关无法验**。
+> **三个用户开关入口已就位(2026-06-20)。** 后端三字段(`ambient`/`scheduled`/`reminders_delivery`)已合进 `test`(`5ab7a50`),`/v1/proactive/state` GET/POST 都认;iOS Settings 三个开关 UI 已 commit(陪伴/定时任务/提醒,Scheduled 独立于 Ambient)。**剩余前置:把 iOS 测试包重新 build 装到手机**,装好后 F1–F5 即可真机测。其中 F5 另需 iOS 写入时区。
 
 ---
 
@@ -56,7 +56,7 @@
 
 | 项 | 原因 | 影响 |
 |----|------|------|
-| 三个用户开关(陪伴/定时任务/提醒)| **iOS 无 UI + 后端 settings 仅 enabled/dnd + scheduled 无入口** | F 组只能间接/部分验 |
+| ~~三个用户开关(陪伴/定时任务/提醒)~~ | ✅ 已补齐(2026-06-20):后端三字段合入 test、iOS 三开关 UI 已 commit | 待 iOS build 后 F 组可全验 |
 | 屏幕看懂内容(screen.read caption)| D14 小模型未接 | C1 只验帧/pHash |
 | 步数 | HealthKit iOS 端 0 | D2 用日历替代 |
 | WiFi/BT/unlock 离散事件 | iOS 疑似不发 | B3/B4 做了没 wake = 证实缺口 |
