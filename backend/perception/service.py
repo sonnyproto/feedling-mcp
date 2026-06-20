@@ -408,6 +408,18 @@ def _last_wake_ts(user_id: str, cap_key: str) -> float:
     return 0.0
 
 
+def _last_v2_wake_ts(user_id: str, trigger: str) -> float:
+    """Timestamp of the last accepted runtime_v2 wake with this trigger.
+
+    V2 wakes are recorded by _submit_wake_event_v2_compat under cap "runtime_v2";
+    used to reapply the legacy burst/cluster dedup on the v2 path."""
+    for ev in reversed(store.read_events(user_id, limit=50)):
+        if (ev.get("cap") == "runtime_v2" and ev.get("type") == "wake"
+                and ev.get("trigger") == trigger):
+            return float(ev.get("ts") or 0)
+    return 0.0
+
+
 def _settings_v2_for_user(user_id: str):
     from proactive.store_v2 import DBProactiveSettingsStoreV2  # lazy
     return DBProactiveSettingsStoreV2().load(user_id)
@@ -670,14 +682,23 @@ def photo_evaluate(user_id: str, metadata: dict,
     store.item_upsert(user_id, "photo", photo_id, now, doc, expires_at=None)
 
     if perception_ingress_runtime_v2_enabled(user_id):
-        observe_signal_v2(
-            user_id,
-            "photo_added",
-            {"photo_id": photo_id, "sensitive": sensitive},
-            ts=now,
-            origin_refs=(f"photo:{photo_id}",),
-            submit_wake=_submit_wake_event_v2_compat,
-        )
+        # Reapply the legacy 30s burst/cluster dedup: rapid photo captures must
+        # not each spawn a separate wake job. The differ keys on a unique
+        # photo_id so it never debounces these on its own.
+        if (now - _last_v2_wake_ts(user_id, "photo_added")) < catalog.PHOTO_CLUSTER_SEC:
+            store.append_event(user_id, {
+                "cap": "runtime_v2", "type": "debounced", "source": "perception_event",
+                "trigger": "photo_added", "origin_refs": [f"photo:{photo_id}"], "ts": now,
+            }, now)
+        else:
+            observe_signal_v2(
+                user_id,
+                "photo_added",
+                {"photo_id": photo_id, "sensitive": sensitive},
+                ts=now,
+                origin_refs=(f"photo:{photo_id}",),
+                submit_wake=_submit_wake_event_v2_compat,
+            )
     else:
         _maybe_wake(user_id, "photos", catalog.PHOTO_CLUSTER_SEC, "photo_id", None, photo_id, now)
     return {"photo_id": photo_id, "metadata": meta_out, "usable": True,

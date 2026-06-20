@@ -274,6 +274,31 @@ def test_photo_one_step_store(env):
     assert any(c == "photos" for c, _ in wakes)               # legacy dormant fallback fired
 
 
+def test_photo_v2_burst_dedup_collapses_rapid_captures(env, monkeypatch):
+    """V2 photo path reapplies the 30s burst/cluster dedup: rapid captures must
+    collapse to a single wake (regression — the v2 differ keys on a unique
+    photo_id and would otherwise fire one wake per photo)."""
+    fake, wakes = env
+    monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
+                        lambda user_or_store: True)
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(service, "_now", lambda: clock["t"])
+
+    service.photo_evaluate(UID, {"scene_hint": "food"}, {"id": "p1", "body_ct": "c1"})
+    clock["t"] += 5.0  # within the 30s cluster -> debounced, no new wake
+    service.photo_evaluate(UID, {"scene_hint": "food"}, {"id": "p2", "body_ct": "c2"})
+
+    assert len([w for w in wakes if w[0] == "photo_added"]) == 1
+    # Both photos are stored regardless of the wake dedup.
+    assert fake.get_photo_envelope(UID, "p1") and fake.get_photo_envelope(UID, "p2")
+    assert any(e.get("type") == "debounced" and e.get("trigger") == "photo_added"
+               for e in fake.read_events(UID))
+
+    clock["t"] += 30.0  # past the window -> a fresh capture wakes again
+    service.photo_evaluate(UID, {"scene_hint": "food"}, {"id": "p3", "body_ct": "c3"})
+    assert len([w for w in wakes if w[0] == "photo_added"]) == 2
+
+
 def test_photo_meta_envelope_is_preserved_only_on_content_read(env):
     fake, _ = env
     meta_env = {"id": "meta_1", "body_ct": "encrypted-place-label"}

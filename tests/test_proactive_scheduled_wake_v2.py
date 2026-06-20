@@ -11,6 +11,7 @@ from proactive.scheduled_wake_v2 import (
     InMemoryScheduledWakeStoreV2,
     SCHEDULED_BLOCKED,
     SCHEDULED_CANCELED,
+    SCHEDULED_CLAIMED,
     SCHEDULED_FIRED,
     SCHEDULED_PENDING,
     ScheduledWakeServiceV2,
@@ -162,6 +163,70 @@ def test_scheduled_off_due_timer_becomes_transparency_background_result():
     assert ctx.trigger == "scheduled_transparency"
     assert ctx.background_payloads[0]["reason"] == "scheduled_disabled"
     assert ctx.background_payloads[0]["timer"]["note"] == "hospital"
+
+
+def test_blocked_timer_with_undelivered_transparency_is_retried_not_dropped():
+    """If the transparency wake can't be enqueued (submit failure), the timer must
+    not be marked terminally blocked with the explanation silently dropped — it
+    stays claimed and retries once the submit path recovers."""
+    store, service = _service(claim_ttl=5.0)
+    service.apply_turn_actions(
+        "u1",
+        [{"type": "schedule_wake", "at": "2026-06-20T09:00:00", "tz": "UTC", "note": "hospital"}],
+        now=1.0,
+    )
+    settings = resolve_settings_v2({"switches": {"scheduled": False}})
+
+    def failing_submit(_event):
+        raise RuntimeError("inbox down")
+
+    fired = service.fire_due_timers("u1", settings=settings, now=2_000_000_000.0, submit_wake=failing_submit)
+    record = store.list_records("u1")[0]
+
+    assert fired[0].status == "deferred"
+    assert record.status == SCHEDULED_CLAIMED          # left claimed, not terminal
+    assert record.status != SCHEDULED_BLOCKED
+
+    # Submit path recovers and the claim TTL lapses: the timer is reclaimed, the
+    # transparency wake is delivered, and only then is it terminally blocked.
+    spine = RuntimeSpineV2(settings_resolver=lambda _uid: settings, merge_window_sec=0.0)
+    retried = service.fire_due_timers("u1", settings=settings, now=2_000_000_010.0, submit_wake=spine.submit)
+    record2 = store.list_records("u1")[0]
+    ctx = spine.drain_context("u1", now=2_000_000_010.0)
+
+    assert retried[0].status == "blocked"
+    assert retried[0].transparency_wake_id
+    assert record2.status == SCHEDULED_BLOCKED
+    assert ctx is not None and ctx.trigger == "scheduled_transparency"
+
+
+def test_policy_rejected_transparency_still_marks_timer_blocked():
+    """A deliberate transparency rejection (submit returns accepted=False, e.g.
+    policy/backpressure) is terminal — the timer must be marked blocked, not
+    deferred into an endless retry loop."""
+    store, service = _service()
+    service.apply_turn_actions(
+        "u1",
+        [{"type": "schedule_wake", "at": "2026-06-20T09:00:00", "tz": "UTC", "note": "hospital"}],
+        now=1.0,
+    )
+    settings = resolve_settings_v2({"switches": {"scheduled": False}})
+
+    class _Rejected:
+        accepted = False
+        reason = "backpressure"
+        transparency_required = False
+
+    def rejecting_submit(_event):
+        return _Rejected()
+
+    fired = service.fire_due_timers("u1", settings=settings, now=2_000_000_000.0, submit_wake=rejecting_submit)
+    record = store.list_records("u1")[0]
+
+    assert fired[0].status == "blocked"
+    assert fired[0].transparency_wake_id == ""
+    assert record.status == SCHEDULED_BLOCKED
+    assert record.block_reason == "scheduled_disabled"
 
 
 def test_scheduled_action_rejected_while_disabled_consumes_transparency_required():

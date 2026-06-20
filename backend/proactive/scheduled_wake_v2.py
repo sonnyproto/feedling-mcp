@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import logging
 import os
 import threading
 import time
@@ -26,6 +27,8 @@ from proactive.controls_v2 import (
     resolve_settings_v2,
 )
 from proactive.runtime_v2 import WakeEventV2
+
+log = logging.getLogger("proactive.scheduled_wake_v2")
 
 SCHEDULED_WAKE_STREAM_V2 = "proactive_scheduled_wakes_v2"
 
@@ -667,18 +670,35 @@ class ScheduledWakeServiceV2:
                     results.append(ScheduledWakeFireResultV2("fired", claimed.timer_id, wake_id=event.wake_id))
                     continue
                 decision = submitted
+            reason = str(getattr(decision, "reason", "") or "wake_rejected")
             transparency_wake_id = ""
             if getattr(decision, "transparency_required", False):
-                transparency_wake_id = self._submit_transparency_wake(
-                    user_id,
-                    reason=str(getattr(decision, "reason", "") or "scheduled_disabled"),
-                    action={"type": "scheduled_wake", "wake_id": claimed.timer_id, "note": claimed.note},
-                    now=now,
-                    origin_refs=claimed.origin_refs,
-                    submit_wake=submit_wake,
-                    timer=claimed,
-                )
-            reason = str(getattr(decision, "reason", "") or "wake_rejected")
+                try:
+                    transparency_wake_id = self._submit_transparency_wake(
+                        user_id,
+                        reason=str(getattr(decision, "reason", "") or "scheduled_disabled"),
+                        action={"type": "scheduled_wake", "wake_id": claimed.timer_id, "note": claimed.note},
+                        now=now,
+                        origin_refs=claimed.origin_refs,
+                        submit_wake=submit_wake,
+                        timer=claimed,
+                    )
+                except Exception as exc:
+                    # The transparency notification could not be enqueued (transient
+                    # submit/DB failure). Leave the timer claimed so it retries on a
+                    # later tick instead of being marked terminally blocked with the
+                    # explanation silently dropped. A deliberate policy rejection
+                    # (accepted=False) does NOT raise and falls through to mark_blocked.
+                    log.warning(
+                        "scheduled wake transparency submit failed, deferring timer %s (%s): %s",
+                        claimed.timer_id, reason, exc,
+                    )
+                    results.append(ScheduledWakeFireResultV2(
+                        "deferred",
+                        claimed.timer_id,
+                        reason=reason,
+                    ))
+                    continue
             self.store.mark_blocked(
                 user_id,
                 claimed.timer_id,
