@@ -75,6 +75,26 @@ GENERIC_TOPIC_TOKENS = {
 }
 
 
+def _zh_topic_terms(text: str) -> set[str]:
+    """Extract concrete Chinese topic terms from an unsegmented query.
+
+    Single Chinese characters are too noisy for readside selection. A query like
+    "猫咪不吃饭我很担心" should match "猫咪", not any card that happens to
+    contain "想" or "道".
+    """
+
+    terms: set[str] = set()
+    for chunk in re.findall(r"[\u4e00-\u9fff]{2,}", text):
+        max_width = min(6, len(chunk))
+        for width in range(2, max_width + 1):
+            for idx in range(0, len(chunk) - width + 1):
+                term = chunk[idx: idx + width]
+                if all(ch in WEAK_TOPIC_CHARS for ch in term):
+                    continue
+                terms.add(term)
+    return terms
+
+
 def _text(value: Any, limit: int = 240) -> str:
     clean = " ".join(str(value or "").split())
     return clean[:limit]
@@ -137,11 +157,8 @@ def _topic_match(query: str, item: dict) -> bool:
             continue
         if token in haystack:
             return True
-    for chunk in re.findall(r"[\u4e00-\u9fff]{2,}", query_text):
-        if chunk in haystack:
-            return True
-    for ch in re.findall(r"[\u4e00-\u9fff]", query_text):
-        if ch not in WEAK_TOPIC_CHARS and ch in haystack:
+    for term in _zh_topic_terms(query_text):
+        if term in haystack:
             return True
     return False
 

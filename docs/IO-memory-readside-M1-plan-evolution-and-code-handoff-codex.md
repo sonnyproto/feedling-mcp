@@ -1023,3 +1023,115 @@ MemoryIndexItem
 ```
 
 人话：没考试不要换主路，先小样本证明不比旧路差。
+
+## 15. 2026-06-21 route A / MCP 补充
+
+### 15.1 为什么要补 route A
+
+上一版 M1 已经有后端接口：
+
+```text
+POST /v1/memory/index
+POST /v1/memory/fetch
+```
+
+但 route A / self-hosted agent 侧还没有直接可调用的 MCP 工具。也就是说：
+
+```text
+后端有新接口
+agent 还没有新遥控器
+```
+
+所以这次补了两个 MCP tool：
+
+```text
+feedling_memory_index
+feedling_memory_fetch
+```
+
+人话：之前像是仓库里已经有“目录”和“正文接口”，但自建 agent 手上还没有按钮。这次把按钮补上。
+
+### 15.2 feedling_memory_index 做什么
+
+`feedling_memory_index` 调用后端 `/v1/memory/index`，返回最多 50 条安全摘要。
+
+如果传入 `query`，MCP server 会额外跑 `MemoryIndexSelector`，输出：
+
+```json
+{
+  "items": [
+    {
+      "id": "mem_cat",
+      "summary": "用户担心猫咪生病时，需要先共情再给具体观察建议。",
+      "bucket_refs": ["猫咪", "宠物照顾"],
+      "status": "active",
+      "salience": "high",
+      "is_open_thread": true,
+      "is_sensitive": false
+    }
+  ],
+  "suggested_ids": ["mem_cat"],
+  "selector_trace": {
+    "mode": "memory_index_selector_v1",
+    "selected": [
+      {
+        "id": "mem_cat",
+        "reason": "topic_supported..."
+      }
+    ],
+    "skipped_sample": [
+      {
+        "id": "mem_private",
+        "reason": "sensitive_not_allowed_for_query"
+      }
+    ]
+  },
+  "recall_flow": "index_first_fetch_later"
+}
+```
+
+人话：agent 先看目录；如果问的是“猫咪”，工具会建议优先打开猫咪相关记忆；普通问题不会自动建议打开私密/敏感记忆。
+
+### 15.3 feedling_memory_fetch 做什么
+
+`feedling_memory_fetch` 接收 index 里选出来的 ids，调用后端 `/v1/memory/fetch`。
+
+它会：
+
+```text
+去掉空 id
+去掉重复 id
+保持输入顺序
+返回 items / missing_ids / unavailable_ids
+```
+
+人话：agent 不应该一口气打开全部记忆，而是先挑 1-5 条最相关的，再取正文。
+
+### 15.4 这次没有改什么
+
+这次没有改：
+
+```text
+memory 写入
+主 chat recall 链路
+iOS Memory Garden
+旧 feedling_chat_get_history 的 context_memories
+公开 io-onboarding skill 仓库
+```
+
+人话：这是 route A 的新工具入口，不是把线上主回复链路直接换掉。
+
+### 15.5 明早 test 前需要确认
+
+如果要在 test 环境验证 route A 新工具，需要确认：
+
+```text
+MCP server 部署包含本分支代码
+backend 部署包含 /v1/memory/index 和 /v1/memory/fetch
+backend 能访问 FEEDLING_ENCLAVE_URL
+测试账号有带 K_enclave 的 memory
+```
+
+如果 agent 端依赖公开 skill 文档，而不是只看 MCP tool descriptions，还需要把 `io-onboarding` 的 skill.md 同步更新。
+
+人话：代码里按钮已经补了，但 test 环境要同时部署 backend 和 MCP；如果 agent 只读远程 skill 文档，还要更新那份公开说明。

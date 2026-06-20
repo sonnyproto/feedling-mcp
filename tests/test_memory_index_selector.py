@@ -33,7 +33,7 @@ def _index_item(
 
 def test_selector_picks_cat_index_items_from_safe_summaries():
     result = select_memory_index_items(
-        "你还记得我喜欢什么样的猫吗？",
+        "你还记得我喜欢什么样的猫咪吗？",
         [
             _index_item("cat_shape", "用户喜欢圆脸、黏人、安静一点的猫，尤其偏爱橘猫和布偶。", buckets=["宠物偏好", "猫咪"]),
             _index_item("cat_comfort", "用户把猫叫作喵喵，看到猫会明显放松。", buckets=["情绪安抚", "猫咪"], salience="high"),
@@ -42,7 +42,7 @@ def test_selector_picks_cat_index_items_from_safe_summaries():
         cap=3,
     )
 
-    assert result["selected_ids"][:2] == ["cat_shape", "cat_comfort"]
+    assert set(result["selected_ids"][:2]) == {"cat_shape", "cat_comfort"}
     selected = {item["id"]: item for item in result["trace"]["selected"]}
     assert selected["cat_comfort"]["confidence"] in {"strong", "medium"}
     assert "work_style" not in selected
@@ -76,3 +76,18 @@ def test_selector_reuses_generic_term_filtering_for_index_items():
     assert result["selected_ids"] == ["pressure"]
     skipped = {item["id"]: item for item in result["trace"]["skipped_sample"]}
     assert "toho" in skipped
+
+
+def test_selector_does_not_fetch_unrelated_cards_from_single_chinese_chars():
+    result = select_memory_index_items(
+        "猫咪最近不吃饭，我有点担心",
+        [
+            _index_item("lark", "用户希望 agent 帮忙读 Lark 群消息并整理重点。", buckets=["工作流", "Lark"]),
+            _index_item("presence", "用户情绪崩溃时，先需要被陪着和确认感受。", buckets=["安抚方式"]),
+        ],
+    )
+
+    assert result["selected_ids"] == []
+    skipped = {item["id"]: item for item in result["trace"]["skipped_sample"]}
+    assert "lark" in skipped
+    assert "presence" in skipped

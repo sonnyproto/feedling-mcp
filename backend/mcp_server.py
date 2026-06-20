@@ -38,6 +38,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 
 from content_encryption import build_envelope
+from memory_index_selector import select_memory_index_items
 
 FLASK_BASE = os.environ.get("FEEDLING_FLASK_URL", "http://127.0.0.1:5001")
 # When set, MCP routes content reads (chat history, memory list,
@@ -1714,6 +1715,118 @@ def memory_update(
 )
 def memory_list(limit: int = 20, ctx: Context = None) -> dict:
     return _get_decrypted("/v1/memory/list", {"limit": limit}, ctx=ctx)
+
+
+@mcp.tool(
+    name="feedling_memory_index",
+    description=(
+        "Read the user's memory index for recall. Use this before fetching full "
+        "memory bodies when the conversation needs durable context beyond recent "
+        "chat history. The result contains safe summaries only: no user quotes, "
+        "no verbatim text, no follow_up, and no concrete sensitive_scope. If "
+        "`query` is provided, the tool also returns `suggested_ids` and "
+        "`selector_trace` so the Agent can see which index cards look relevant. "
+        "Default behavior is conservative: sensitive cards are not suggested "
+        "unless the user's current request explicitly asks about private, "
+        "intimate, or sensitive topics, or include_sensitive=true is passed."
+    ),
+)
+def memory_index(
+    query: str = "",
+    limit: int = 50,
+    include_sensitive: bool = False,
+    selection_cap: int = 8,
+    ctx: Context = None,
+) -> dict:
+    """Return readside index cards plus an optional selector trace.
+
+    Product meaning: this is the route-A/self-hosted "table of contents" step.
+    The agent can inspect summaries first, then fetch only the few full cards it
+    actually needs.
+    """
+    try:
+        requested_limit = int(limit or 50)
+    except (TypeError, ValueError):
+        requested_limit = 50
+    try:
+        requested_cap = int(selection_cap or 8)
+    except (TypeError, ValueError):
+        requested_cap = 8
+    safe_limit = max(1, min(requested_limit, 50))
+    body = {
+        "limit": safe_limit,
+        "include_sensitive": bool(include_sensitive),
+    }
+    res = _post("/v1/memory/index", body, ctx=ctx)
+    if not isinstance(res, dict) or "items" not in res:
+        return res
+
+    items = [item for item in res.get("items", []) if isinstance(item, dict)]
+    out = {
+        **res,
+        "items": items,
+        "recall_flow": "index_first_fetch_later",
+        "guidance": (
+            "Read item summaries, choose only relevant ids, then call "
+            "feedling_memory_fetch(ids=[...]). Do not fetch every item by default."
+        ),
+    }
+    if query:
+        selection = select_memory_index_items(
+            query,
+            items,
+            cap=max(1, min(requested_cap, 8)),
+            include_sensitive=bool(include_sensitive),
+        )
+        out["suggested_ids"] = selection.get("selected_ids", [])
+        out["selector_trace"] = selection.get("trace", {})
+    return out
+
+
+@mcp.tool(
+    name="feedling_memory_fetch",
+    description=(
+        "Fetch full memory cards by ids after feedling_memory_index has narrowed "
+        "the candidate set. Use this for 1-5 relevant ids, not for bulk dumping "
+        "the whole garden. The response may include verbatim/her_quote/follow_up "
+        "when available, but still does not expose concrete sensitive_scope. "
+        "missing_ids means the id was not found for this user; unavailable_ids "
+        "means the card exists but is not fetchable by default, for example "
+        "local_only, no enclave key, archived, deleted, or superseded."
+    ),
+)
+def memory_fetch(
+    ids: list[str],
+    include_archived: bool = False,
+    include_superseded: bool = False,
+    ctx: Context = None,
+) -> dict:
+    """Return full readside memory cards for selected ids."""
+    clean_ids = []
+    seen = set()
+    for raw_id in ids or []:
+        memory_id = str(raw_id or "").strip()
+        if not memory_id or memory_id in seen:
+            continue
+        seen.add(memory_id)
+        clean_ids.append(memory_id)
+    if not clean_ids:
+        return {
+            "items": [],
+            "missing_ids": [],
+            "unavailable_ids": [],
+            "error": "ids_required",
+            "required": "Pass one or more ids returned by feedling_memory_index.",
+        }
+    return _post(
+        "/v1/memory/fetch",
+        {
+            "ids": clean_ids,
+            "include_archived": bool(include_archived),
+            "include_superseded": bool(include_superseded),
+        },
+        ctx=ctx,
+    )
 
 
 @mcp.tool(

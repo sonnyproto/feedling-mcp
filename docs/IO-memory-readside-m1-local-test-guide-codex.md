@@ -118,3 +118,85 @@ M1 readside 通过后，下一步建议按这个顺序推进：
 5. 最后再做测试环境联调和小范围真用户测试。
 
 人话：现在证明“读记忆”能跑通；下一步要证明“一条新记忆从写入到被 agent 用上”能完整闭环。
+
+## route A / MCP 怎么测
+
+这次还补了 route A / self-hosted agent 可以用的两个 MCP 工具：
+
+```text
+feedling_memory_index
+feedling_memory_fetch
+```
+
+测试方式不是看 iOS UI，而是让 MCP agent 调工具：
+
+```text
+1. 先调用 feedling_memory_index(query="猫咪最近不吃饭，我有点担心")
+2. 看返回的 items、suggested_ids、selector_trace
+3. 再调用 feedling_memory_fetch(ids=[suggested_ids 里的 1-3 个 id])
+4. 看是否拿到完整正文
+```
+
+你应该看到类似：
+
+```json
+{
+  "recall_flow": "index_first_fetch_later",
+  "items": [
+    {
+      "id": "mem_cat",
+      "summary": "用户担心猫咪生病时，需要先共情再给具体观察建议。",
+      "bucket_refs": ["猫咪", "宠物照顾"],
+      "is_sensitive": false
+    }
+  ],
+  "suggested_ids": ["mem_cat"],
+  "selector_trace": {
+    "selected": [
+      {
+        "id": "mem_cat",
+        "reason": "topic_supported..."
+      }
+    ],
+    "skipped_sample": [
+      {
+        "id": "mem_private",
+        "reason": "sensitive_not_allowed_for_query"
+      }
+    ]
+  }
+}
+```
+
+然后 fetch 返回类似：
+
+```json
+{
+  "items": [
+    {
+      "id": "mem_cat",
+      "summary": "用户担心猫咪生病时，需要先共情再给具体观察建议。",
+      "verbatim": "猫咪今天不怎么吃饭，我有点慌。",
+      "follow_up": "先安抚情绪，再建议观察饮水、精神状态和是否持续拒食。"
+    }
+  ],
+  "missing_ids": [],
+  "unavailable_ids": []
+}
+```
+
+人话：你要看的不是页面变了，而是 agent 终于能展示“我先看了哪些目录、建议打开哪些记忆、最后打开了哪些正文”。
+
+## 当前边界
+
+这次 route A 补的是 MCP 工具入口。
+
+还没有做：
+
+```text
+自动把主 chat recall 切到 index -> fetch
+自动更新公开 io-onboarding skill.md
+自动改 memory 写入格式
+```
+
+人话：明早 test 可以验证新按钮是否可用；但不要期待普通聊天已经 100% 自动走新链路。

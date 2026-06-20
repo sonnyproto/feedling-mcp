@@ -86,6 +86,17 @@ def fixture_cards() -> list[MemoryFixture]:
             context="来自 Lark CLI 权限和使用场景讨论。",
             importance=0.6,
         ),
+        MemoryFixture(
+            id="mem_cat_care",
+            summary="用户聊猫咪健康问题时，先需要被安抚，再给观察饮水、精神状态和持续拒食时就医的建议。",
+            verbatim="猫咪今天不怎么吃饭，我有点慌。",
+            bucket_refs=["猫咪", "宠物照顾", "安抚方式"],
+            salience="high",
+            follow_up="先回应担心，再建议观察精神、饮水、排便；如果持续不吃或精神差，及时联系兽医。",
+            context="来自一次关于猫咪不吃饭的担心。",
+            is_open_thread=True,
+            importance=0.88,
+        ),
     ]
 
 
