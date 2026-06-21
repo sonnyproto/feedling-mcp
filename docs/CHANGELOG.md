@@ -49,6 +49,21 @@
 
 ## 2026-06-21
 
+### [BLOCKER] 感知工具循环只在 wake 路,前台聊天未收敛(违反 D1)→ 已派 Codex
+- **审出的缺口**(外部 Claude 排查 + 我代码核实):`run_tool_loop_v2` + `ToolExecutorV2`
+  (全 catalog perception+memory)只接进**主动 wake 路**;**前台聊天两路都没接**——
+  hosted `chat_routes._run_model_api_memory_tool_loop` 只认 memory 工具(`MEMORY_INDEX/FETCH`,
+  无 perception.*),resident `_process_messages`(consumer:3154)走老单发回复、不进 tool loop。
+  结果:**聊天时 agent 无法按上下文 pull 感知**(perception 只是被动 push 的快照)。
+- **定性**:不是 spec 遗漏,是实现缺口 + **违反 D1**(chat 与 proactive 应是同一引擎)。
+  spec 明确要求聊天 agentic 调工具:D1 / §2.1("聊运动 pull 步数")/ §6+B2(前台 agentic =
+  路由器本身,D9 硬前置)。
+- **派 Codex**(mailbox 20260621T145308Z):hosted+resident 聊天两路收敛到 `run_tool_loop_v2` +
+  `combined_runtime_adapters_v2`(全 catalog),flag 默认 OFF;**关键约束**:前台延迟敏感,
+  必须守**快档 cost_class 预算 + 软交棒**(D17/D9/§6)——slow 工具走 `needs_background` 后台
+  回灌,不能像 wake 那样内联跑 slow 工具把用户卡在"思考中"。审计待 Codex 实现后做。
+- 影响文档:`PROACTIVE_PERCEPTION_SPEC_V2.md` §9 B2 状态改为"部分完成"。
+
 ### [DONE] Proactive tool-loop execution (D11: bounded multi-turn for both hosted + resident)
 - **Unified loop shipped**: Both hosted and resident proactive wakes now run `run_tool_loop_v2()` — a bounded multi-turn agent loop that calls the model, parses `tool_calls` JSON, executes tools, and feeds results back (max 4 iterations, capped at `MAX_TOOL_ITERS_V2`). One shared `ToolExecutorV2` instance per run provides budget continuity and unified tool implementations.
 - **Hosted wiring (in-process)**: Proactive runtime injects call-model and call-tool closures into the loop; tools execute immediately in-process.
