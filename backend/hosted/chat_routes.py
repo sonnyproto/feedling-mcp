@@ -61,6 +61,7 @@ from model_api_runtime.wake import (
 from proactive.agent_protocol_v2 import parse_agent_response_v2, agent_tool_calls_v2
 from context_memory_selection import memory_relevance_details
 from content_encryption import build_envelope
+from memory_index_selector import select_memory_index_items
 
 from accounts import auth
 from push import service as push_service
@@ -308,6 +309,48 @@ def model_api_chat_send():
             include_memory_context=True,
         )
         fallback_memories = fallback_context_payload.get("context_memories") or []
+        fallback_source = "auto_readside"
+        fallback_tool_trace: dict = {}
+        fallback_index_selection: dict = {}
+        if not fallback_memories:
+            try:
+                index_result = hosted_memory_tools.execute_memory_tool(
+                    store,
+                    api_key,
+                    hosted_memory_tools.MEMORY_INDEX_TOOL,
+                    {
+                        "query": message_for_context,
+                        "limit": 50,
+                        "include_sensitive": False,
+                    },
+                    trace=fallback_tool_trace,
+                )
+                index_items = index_result.get("items") if isinstance(index_result.get("items"), list) else []
+                fallback_index_selection = select_memory_index_items(
+                    message_for_context,
+                    index_items,
+                    cap=3,
+                    include_sensitive=False,
+                )
+                selected_ids = fallback_index_selection.get("selected_ids") if isinstance(fallback_index_selection.get("selected_ids"), list) else []
+                if selected_ids:
+                    fetch_result = hosted_memory_tools.execute_memory_tool(
+                        store,
+                        api_key,
+                        hosted_memory_tools.MEMORY_FETCH_TOOL,
+                        {"ids": selected_ids[:3]},
+                        trace=fallback_tool_trace,
+                    )
+                    fallback_memories = fetch_result.get("items") if isinstance(fetch_result.get("items"), list) else []
+                    fallback_context_payload["context_memories"] = fallback_memories[:8]
+                    fallback_context_payload["context_memory_trace"] = fallback_index_selection.get("trace") or {}
+                    fallback_source = "index_selector"
+            except Exception as e:
+                fallback_tool_trace.setdefault("tool_calls", []).append({
+                    "name": "memory_fallback_index_selector",
+                    "ok": False,
+                    "error": f"{type(e).__name__}:{str(e)[:160]}",
+                })
         if fallback_memories:
             final_messages = list(fallback_messages)
             final_messages.insert(2, hosted_turn._model_api_turn_contract_message())
@@ -315,9 +358,14 @@ def model_api_chat_send():
                 "role": "system",
                 "content": (
                     "Memory fallback was triggered because the first answer did not call memory tools. "
-                    "The candidate memory context in the runtime JSON is relevant to the user's latest message. "
+                    "The memory fallback JSON below is relevant to the user's latest message. "
                     "Answer the latest user message again using that memory. If a memory directly answers the question, "
-                    "do not say you are unsure or ask the user to tell you again."
+                    "do not say you are unsure or ask the user to tell you again.\n"
+                    "Memory fallback JSON:\n" + json.dumps({
+                        "source": fallback_source,
+                        "context_memories": fallback_memories[:8],
+                        "context_memory_trace": fallback_context_payload.get("context_memory_trace") or {},
+                    }, ensure_ascii=False)[:8000]
                 ),
             })
             try:
@@ -347,10 +395,11 @@ def model_api_chat_send():
                     memory_tools_trace = {
                         "mode": "fallback",
                         "fallback_reason": "no_tool_call_backfilled",
-                        "index_called": False,
-                        "fetch_called": False,
-                        "tool_calls": [],
-                        "fetched_ids": [],
+                        "fallback_source": fallback_source,
+                        "index_called": bool(fallback_tool_trace.get("index_called")),
+                        "fetch_called": bool(fallback_tool_trace.get("fetch_called")),
+                        "tool_calls": fallback_tool_trace.get("tool_calls") or [],
+                        "fetched_ids": fallback_tool_trace.get("fetched_ids") or [],
                     }
             except provider_client.ProviderError:
                 pass

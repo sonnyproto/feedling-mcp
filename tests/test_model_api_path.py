@@ -565,6 +565,119 @@ def test_model_api_chat_falls_back_to_auto_readside_when_model_does_not_call_mem
     assert trace["context"]["memory_tools"]["fallback_reason"] == "no_tool_call_backfilled"
 
 
+def test_model_api_chat_fallback_uses_index_selector_when_auto_readside_is_empty(client, monkeypatch):
+    user_id, api_key = _register(client)
+    provider_calls: list[list[dict]] = []
+    tool_calls: list[tuple[str, dict]] = []
+    monkeypatch.setenv("MODEL_API_MEMORY_TOOLS_ENABLED", "true")
+    monkeypatch.setenv("MODEL_API_AUTO_MEMORY_CONTEXT_ENABLED", "true")
+
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(
+        core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose: b"sk-test",
+    )
+
+    def fake_enclave(path, key, params=None):
+        if path == "/v1/chat/history":
+            return {
+                "messages": [],
+                "context_memories": [],
+                "context_memory_trace": {"mode": "model_api_readside_v1", "selected": []},
+            }, ""
+        if path == "/v1/identity/get":
+            return {"identity": _identity_payload()}, ""
+        return {}, ""
+
+    def fake_execute_memory_tool(store, key, name, args, *, trace=None):
+        tool_calls.append((name, dict(args or {})))
+        if name == "memory_index":
+            if trace is not None:
+                trace["index_called"] = True
+                trace.setdefault("tool_calls", []).append({"name": name, "ok": True, "item_count": 1})
+            return {
+                "ok": True,
+                "name": name,
+                "items": [
+                    {
+                        "id": "mem_cat",
+                        "summary": "用户的橘猫因为长得像老虎，所以给猫取名武松。",
+                        "bucket_refs": [],
+                        "status": "active",
+                        "salience": "medium",
+                        "is_sensitive": False,
+                        "score": 2.5,
+                    }
+                ],
+            }
+        if name == "memory_fetch":
+            if trace is not None:
+                trace["fetch_called"] = True
+                trace["fetched_ids"] = ["mem_cat"]
+                trace.setdefault("tool_calls", []).append({"name": name, "ok": True, "ids": ["mem_cat"], "item_count": 1})
+            return {
+                "ok": True,
+                "name": name,
+                "items": [
+                    {
+                        "id": "mem_cat",
+                        "summary": "用户有一只橘猫，名字叫武松。",
+                        "verbatim": "我家猫叫武松。",
+                        "is_sensitive": False,
+                    }
+                ],
+            }
+        return {"ok": False, "name": name}
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        provider_calls.append(messages)
+        if len(provider_calls) == 1:
+            return {"reply": appmod.json.dumps({"reply": "我不确定。"}), "usage": {"total_tokens": 3}}
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        assert "Memory fallback JSON" in joined
+        assert "武松" in joined
+        return {
+            "reply": appmod.json.dumps({"reply": "有，你有一只橘猫，叫武松。"}),
+            "usage": {"total_tokens": 6},
+        }
+
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave)
+    monkeypatch.setattr(appmod.hosted_chat_routes.hosted_memory_tools, "execute_memory_tool", fake_execute_memory_tool)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    chat = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "我有只猫吗？"},
+        headers=_headers(api_key),
+    )
+
+    assert chat.status_code == 200, chat.get_data(as_text=True)
+    body = chat.get_json()
+    assert body["reply"] == "有，你有一只橘猫，叫武松。"
+    assert tool_calls == [
+        ("memory_index", {"query": "我有只猫吗？", "limit": 50, "include_sensitive": False}),
+        ("memory_fetch", {"ids": ["mem_cat"]}),
+    ]
+    assert body["tools"]["memory"]["mode"] == "fallback"
+    assert body["tools"]["memory"]["fallback_source"] == "index_selector"
+    assert body["tools"]["memory"]["index_called"] is True
+    assert body["tools"]["memory"]["fetch_called"] is True
+
+    trace_id = body["state"]["action_trace_id"]
+    traces = appmod.db.log_read(user_id, appmod.MODEL_API_ACTION_TRACE_STREAM, limit=5)
+    trace = next(item for item in traces if item["trace_id"] == trace_id)
+    assert trace["context"]["memory_tools"]["fallback_source"] == "index_selector"
+
+
 def test_model_api_chat_send_runs_backend_web_search_tool(client, monkeypatch):
     _, api_key = _register(client)
     provider_calls: list[list[dict]] = []

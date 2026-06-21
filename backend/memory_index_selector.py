@@ -38,6 +38,10 @@ SALIENCE_WEIGHT = {
 }
 
 WEAK_TOPIC_CHARS = set("我你他她它的是了在和就都不吗呢啊吧这那什么怎么一个有没给要说想看喜欢记得知道")
+CONCRETE_SINGLE_ZH_TERMS = {
+    "猫",
+    "狗",
+}
 GENERIC_TOPIC_TOKENS = {
     "ai",
     "api",
@@ -84,6 +88,9 @@ def _zh_topic_terms(text: str) -> set[str]:
     """
 
     terms: set[str] = set()
+    for char in re.findall(r"[\u4e00-\u9fff]", text):
+        if char in CONCRETE_SINGLE_ZH_TERMS:
+            terms.add(char)
     for chunk in re.findall(r"[\u4e00-\u9fff]{2,}", text):
         max_width = min(6, len(chunk))
         for width in range(2, max_width + 1):

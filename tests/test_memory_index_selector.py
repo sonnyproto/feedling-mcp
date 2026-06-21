@@ -48,6 +48,19 @@ def test_selector_picks_cat_index_items_from_safe_summaries():
     assert "work_style" not in selected
 
 
+def test_selector_allows_concrete_single_character_pet_terms():
+    result = select_memory_index_items(
+        "我有只猫吗？",
+        [
+            _index_item("cat_name", "用户的橘猫因为长得像老虎，所以给猫取名武松。"),
+            _index_item("bike", "用户提到喜欢一辆叫速比特卡戎的自行车。"),
+        ],
+        cap=3,
+    )
+
+    assert result["selected_ids"] == ["cat_name"]
+
+
 def test_selector_skips_sensitive_items_unless_query_allows_sensitive():
     items = [
         _index_item("comfort", "用户低落时需要先被陪伴，不要马上给建议。", buckets=["安抚方式"]),
