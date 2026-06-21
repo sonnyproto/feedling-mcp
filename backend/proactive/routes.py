@@ -11,7 +11,6 @@ from core import store as core_store
 from core import util
 from proactive import dashboard, gate, resident_runtime_v2, service
 from proactive.observability_v2 import ROUND3_REVIEW_LABELS_V2
-from proactive.store_v2 import DBBackgroundJobStoreV2
 from proactive.tool_executor_v2 import (
     ToolBudgetV2, ToolExecutorV2, ToolCallV2, combined_runtime_adapters_v2,
 )
@@ -490,23 +489,3 @@ def proactive_tool_execute():
     )
     result = executor.execute(ToolCallV2(name=name, args=args, user_id=store.user_id))
     return jsonify(result.as_dict())
-
-
-@bp.route("/v1/proactive/background/queue", methods=["POST"])
-def proactive_background_queue():
-    store = auth.require_user()
-    payload = request.get_json(silent=True) or {}
-    request_doc = payload.get("request") if isinstance(payload.get("request"), dict) else {}
-    if not request_doc:
-        return jsonify({"error": "background request required"}), 400
-    origin_refs = payload.get("origin_refs") if isinstance(payload.get("origin_refs"), list) else []
-    job = DBBackgroundJobStoreV2().create_job(
-        store.user_id,
-        {
-            "source": str(payload.get("source") or "foreground_chat")[:120],
-            **dict(request_doc),
-        },
-        turn_id=str(payload.get("turn_id") or "")[:200],
-        origin_refs=tuple(str(ref)[:200] for ref in origin_refs if str(ref)),
-    )
-    return jsonify({"status": "queued", "job_id": job.job_id})

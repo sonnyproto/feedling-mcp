@@ -109,7 +109,7 @@ except ImportError:
 from proactive.adapters_v2 import wake_event_v2_from_legacy_job
 from proactive.agent_protocol_v2 import build_agent_context_v2
 from proactive.runtime_v2 import merge_wakes_v2
-from proactive.tool_catalog_v2 import tool_catalog_v2_for_runtime
+from proactive.tool_catalog_v2 import foreground_chat_tool_context_v2, tool_catalog_v2_for_runtime
 from proactive.tool_loop_v2 import run_tool_loop_v2
 
 # ---------------------------------------------------------------------------
@@ -1982,67 +1982,41 @@ def _resident_run_agent_v2(message: str, *, foreground_chat: bool = False) -> An
     def call_tool(name: str, args: Any) -> dict:
         if not foreground_chat:
             return _resident_call_tool_v2(name, args)
-        return _resident_call_tool_v2(
+        res = _resident_call_tool_v2(
             name,
             args,
             budget_mode=FOREGROUND_CHAT_TOOL_BUDGET_MODE_V2,
         )
+        if res.get("needs_background"):
+            return {
+                "name": name,
+                "ok": False,
+                "outcome": "unavailable",
+                "result": {},
+                "error_code": "foreground_slow_tool_unavailable",
+                "error_message": "This tool is not available in foreground chat.",
+                "needs_background": False,
+            }
+        return res
 
     return run_tool_loop_v2(call_model, call_tool, base_messages, max_iters=4)
 
 
 def _resident_foreground_chat_message_v2(content: str) -> str:
     tools = json.dumps(
-        [
-            tool for tool in tool_catalog_v2_for_runtime("resident").context_tools()
-            if tool.get("group") in {"perception", "screen", "memory"}
-        ],
+        foreground_chat_tool_context_v2(),
         ensure_ascii=False,
         sort_keys=True,
     )
     return (
         "Feedling foreground chat Runtime V2.\n"
-        "The user is waiting, so call only fast tools inline. If a slow tool is needed, return/tool-trigger "
-        "needs_background and do not block or invent the result. Use tool_calls JSON to gather data, then finish "
+        "The user is waiting, so call only the listed fast perception tools inline. Do not call memory tools, action "
+        "tools, steps, sleep, workout, vitals, photo, screen, or long calendar windows. Use tool_calls JSON to gather data, then finish "
         "with messages/actions and no tool_calls. This is a foreground user message, not a proactive wake; do not "
-        "assume a change_digest.\n\n"
+        "assume a change_digest. If a needed tool is not listed, answer from available context and do not promise a background follow-up.\n\n"
         f"Available tools JSON:\n{tools}\n\n"
         f"User message:\n{content}"
     )
-
-
-def _needs_background_request_from_actions(actions: list[dict]) -> dict:
-    for action in actions:
-        if not isinstance(action, dict):
-            continue
-        typ = _proactive_action_type(action).removeprefix("proactive.")
-        if typ == "needs_background":
-            request = action.get("request")
-            return dict(request) if isinstance(request, dict) else {}
-    return {}
-
-
-def _queue_resident_background_request_v2(request_doc: dict, *, source_message_id: str = "") -> dict:
-    if not request_doc:
-        return {}
-    try:
-        resp = httpx.post(
-            f"{FEEDLING_API_URL}/v1/proactive/background/queue",
-            headers=_HEADERS,
-            json={
-                "source": "resident_foreground_chat",
-                "request": dict(request_doc),
-                "origin_refs": [f"chat:{source_message_id}"] if source_message_id else [],
-                "turn_id": f"resident_chat:{source_message_id}" if source_message_id else "",
-            },
-            timeout=15,
-        )
-        if resp.status_code >= 400:
-            return {"status": "failed", "error": f"http_{resp.status_code}"}
-        return resp.json() if isinstance(resp.json(), dict) else {"status": "queued"}
-    except Exception as e:
-        log.warning("resident foreground background queue failed: %s", e)
-        return {"status": "failed", "error": type(e).__name__}
 
 
 # ---------------------------------------------------------------------------
@@ -2128,11 +2102,6 @@ def _identity_action_success_reply(source_message: str) -> str:
         return "改好了。"
     return "Done. I updated my identity."
 
-
-def _foreground_background_ack(source_message: str) -> str:
-    if re.search(r"[\u4e00-\u9fff]", source_message or ""):
-        return "我看一下，查完再告诉你。"
-    return "I’ll check that and get back to you."
 
 # Message dedup — rolling window prevents reprocessing the same message on
 # restart with a stale checkpoint or if poll races with checkpoint save.
@@ -3369,15 +3338,7 @@ def _process_messages(messages: list) -> float:
 
         turn = _split_agent_turn(agent_result)
         actions, replies = turn.actions, turn.messages
-        background_request = _needs_background_request_from_actions(actions) if use_runtime_v2 else {}
-        if background_request:
-            reply_to_message_id = str(msg.get("id") or msg.get("message_id") or "").strip()
-            queue_result = _queue_resident_background_request_v2(
-                background_request,
-                source_message_id=reply_to_message_id,
-            )
-            log.info("resident foreground background queued: %s", queue_result)
-            replies = replies or [_foreground_background_ack(content)]
+        if use_runtime_v2:
             actions = [
                 action for action in actions
                 if _proactive_action_type(action).removeprefix("proactive.") != "needs_background"

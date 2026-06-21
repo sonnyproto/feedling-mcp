@@ -995,6 +995,72 @@ def test_model_api_chat_surfaces_provider_reasoning_before_context_summary(clien
     assert body["thinking_summary"] == body["provider_reasoning"]
 
 
+def test_hosted_chat_perception_flag_keeps_auto_memory_context(client, monkeypatch):
+    user_id, api_key = _register(client)
+    context_calls: list[dict] = []
+    provider_calls: list[list[dict]] = []
+
+    monkeypatch.delenv("MODEL_API_MEMORY_TOOLS_ENABLED", raising=False)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+
+    def fake_context_messages(store, key, message, **kwargs):
+        context_calls.append(dict(kwargs))
+        return (
+            [
+                {"role": "system", "content": "identity"},
+                {"role": "system", "content": "context_memory: 用户家猫叫武松。"},
+                {"role": "user", "content": message},
+            ],
+            {
+                "identity_loaded": True,
+                "context_memories": [{"id": "mem_cat", "title": "猫叫武松"}],
+                "context_memory_trace": {"selected_ids": ["mem_cat"]},
+            },
+            [],
+        )
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        provider_calls.append(messages)
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        assert "context_memory: 用户家猫叫武松。" in joined
+        assert "perception.weather" in joined
+        assert "memory.fetch" not in joined
+        return {
+            "reply": appmod.json.dumps({"reply": "记得你家猫叫武松。"}),
+            "usage": {"total_tokens": 4},
+        }
+
+    monkeypatch.setattr(appmod.hosted_chat_routes.hosted_context, "_model_api_context_messages", fake_context_messages)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+    store = appmod._stores[user_id]
+    appmod.hosted_config_store._patch_model_api_runtime_profile(
+        store,
+        {appmod.hosted_chat_routes.HOSTED_CHAT_FULL_TOOL_LOOP_V2_FLAG: True},
+    )
+
+    chat = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "我家猫叫什么？外面天气呢？"},
+        headers=_headers(api_key),
+    )
+
+    assert chat.status_code == 200, chat.get_data(as_text=True)
+    assert context_calls[0]["include_memory_context"] is True
+    assert len(provider_calls) == 1
+    body = chat.get_json()
+    assert body["reply"] == "记得你家猫叫武松。"
+    assert body["runtime"]["foreground_tool_loop_v2_enabled"] is True
+
+
 def test_model_api_chat_does_not_treat_generic_query_as_web_search_request(client, monkeypatch):
     _, api_key = _register(client)
     provider_calls: list[list[dict]] = []

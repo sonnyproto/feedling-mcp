@@ -59,15 +59,13 @@ from model_api_runtime.wake import (
     parse_wake_actions as parse_model_api_wake_actions,
 )
 from proactive.agent_protocol_v2 import parse_agent_response_v2, agent_tool_calls_v2
-from proactive.store_v2 import DBBackgroundJobStoreV2
-from proactive.tool_catalog_v2 import default_tool_catalog_v2
+from proactive.tool_catalog_v2 import foreground_chat_tool_catalog_v2, foreground_chat_tool_context_v2
 from proactive.tool_executor_v2 import (
     ToolBudgetV2,
     ToolCallV2,
     ToolExecutorV2,
     combined_runtime_adapters_v2,
 )
-from proactive.tool_loop_v2 import run_tool_loop_v2
 from context_memory_selection import memory_relevance_details
 from content_encryption import build_envelope
 from memory_index_selector import select_memory_index_items
@@ -125,6 +123,45 @@ def _model_api_memory_tool_calls(raw_reply: str) -> list[tuple[str, dict]]:
     ]
 
 
+def _agent_tool_calls_from_reply(raw_reply: str) -> list[tuple[str, dict]]:
+    try:
+        return agent_tool_calls_v2(parse_agent_response_v2(raw_reply))
+    except Exception:
+        return []
+
+
+def _model_api_chat_tool_calls(
+    raw_reply: str,
+    *,
+    memory_tools_enabled: bool,
+    perception_tools_enabled: bool,
+) -> list[tuple[str, dict, str]]:
+    allowed_perception = {tool["name"] for tool in foreground_chat_tool_context_v2()}
+    calls: list[tuple[str, dict, str]] = []
+    for name, args in _agent_tool_calls_from_reply(raw_reply):
+        if memory_tools_enabled and name in {
+            hosted_memory_tools.MEMORY_INDEX_TOOL,
+            hosted_memory_tools.MEMORY_FETCH_TOOL,
+        }:
+            calls.append((name, args, "memory"))
+        elif perception_tools_enabled:
+            calls.append((name, args, "perception" if name in allowed_perception else "foreground_unavailable"))
+    return calls
+
+
+def _foreground_tool_unavailable_result(name: str, *, reason: str) -> dict:
+    return {
+        "ok": False,
+        "name": name,
+        "outcome": "unavailable",
+        "result": {},
+        "error": reason,
+        "error_code": reason,
+        "error_message": "This tool is not available in foreground chat.",
+        "needs_background": False,
+    }
+
+
 def _run_model_api_memory_tool_loop(
     runtime,
     provider_messages: list[dict],
@@ -133,6 +170,8 @@ def _run_model_api_memory_tool_loop(
     api_key: str | None,
     max_tokens: int,
     temperature: float,
+    memory_tools_enabled: bool = True,
+    perception_tools_enabled: bool = False,
 ) -> tuple[dict, str, dict]:
     messages = list(provider_messages)
     memory_trace: dict = {
@@ -142,11 +181,22 @@ def _run_model_api_memory_tool_loop(
         "tool_calls": [],
         "fetched_ids": [],
         "cumulative_fetch_limit": hosted_memory_tools.MEMORY_FETCH_CUMULATIVE_LIMIT,
-    }
+    } if memory_tools_enabled else {}
+    perception_trace: dict = {
+        "mode": "additive_foreground_perception",
+        "budget_mode": FOREGROUND_CHAT_TOOL_BUDGET_MODE_V2,
+        "tool_calls": [],
+        "available_tools": sorted(tool["name"] for tool in foreground_chat_tool_context_v2()),
+    } if perception_tools_enabled else {}
+    executor = ToolExecutorV2(
+        catalog=foreground_chat_tool_catalog_v2(),
+        adapters=combined_runtime_adapters_v2(api_key, store),
+        budget=_foreground_chat_tool_budget_v2(),
+    ) if perception_tools_enabled else None
     result: dict = {}
     raw_reply = ""
     usage_rounds: list[dict] = []
-    for _ in range(3):
+    for _ in range(4 if perception_tools_enabled else 3):
         result = provider_client.chat_completion(
             runtime,
             messages,
@@ -157,54 +207,83 @@ def _run_model_api_memory_tool_loop(
         )
         raw_reply = str(result.get("reply") or "").strip()
         usage_rounds.append(result.get("usage") or {})
-        calls = _model_api_memory_tool_calls(raw_reply)
+        calls = _model_api_chat_tool_calls(
+            raw_reply,
+            memory_tools_enabled=memory_tools_enabled,
+            perception_tools_enabled=perception_tools_enabled,
+        )
         if not calls:
             break
         tool_results: list[dict] = []
-        for name, args in calls:
-            try:
-                tool_results.append(
-                    hosted_memory_tools.execute_memory_tool(
-                        store,
-                        api_key,
-                        name,
-                        args,
-                        trace=memory_trace,
+        for name, args, kind in calls:
+            if kind == "memory":
+                try:
+                    tool_results.append(
+                        hosted_memory_tools.execute_memory_tool(
+                            store,
+                            api_key,
+                            name,
+                            args,
+                            trace=memory_trace,
+                        )
                     )
-                )
-            except Exception as e:
-                memory_trace.setdefault("tool_calls", []).append({
+                except Exception as e:
+                    memory_trace.setdefault("tool_calls", []).append({
+                        "name": name,
+                        "ok": False,
+                        "error": f"{type(e).__name__}:{str(e)[:160]}",
+                    })
+                    tool_results.append({"ok": False, "name": name, "error": "memory_tool_failed"})
+                continue
+            if kind == "foreground_unavailable" or executor is None:
+                result_doc = _foreground_tool_unavailable_result(name, reason="foreground_tool_unavailable")
+                tool_results.append(result_doc)
+                if perception_trace:
+                    perception_trace["tool_calls"].append({
+                        "name": name,
+                        "ok": False,
+                        "outcome": "unavailable",
+                        "error_code": "foreground_tool_unavailable",
+                    })
+                continue
+            res = executor.execute(ToolCallV2(name=name, args=dict(args or {}), user_id=store.user_id)).as_dict()
+            if res.get("needs_background"):
+                res = _foreground_tool_unavailable_result(name, reason="foreground_slow_tool_unavailable")
+            tool_results.append(res)
+            if perception_trace:
+                perception_trace["tool_calls"].append({
                     "name": name,
-                    "ok": False,
-                    "error": f"{type(e).__name__}:{str(e)[:160]}",
+                    "ok": bool(res.get("ok")),
+                    "outcome": str(res.get("outcome") or ""),
+                    "error_code": str(res.get("error_code") or ""),
+                    "needs_background": bool(res.get("needs_background")),
+                    "cost_class": ((res.get("trace") or {}) if isinstance(res.get("trace"), dict) else {}).get("cost_class", ""),
                 })
-                tool_results.append({"ok": False, "name": name, "error": "memory_tool_failed"})
         messages.append({"role": "assistant", "content": raw_reply[:4000]})
         messages.append({"role": "user", "content": hosted_memory_tools.render_memory_tool_results(tool_results)})
     if len(usage_rounds) > 1:
         result = {**result, "usage": {"memory_tool_loop": usage_rounds, "final": result.get("usage") or {}}}
+    if perception_trace:
+        memory_trace["foreground_perception_v2"] = perception_trace
     return result, raw_reply, memory_trace
 
 
-def _model_api_full_tool_loop_instruction_message() -> dict:
+def _model_api_foreground_perception_tool_instruction_message() -> dict:
     tools_json = json.dumps(
-        [
-            tool for tool in default_tool_catalog_v2().context_tools()
-            if tool.get("group") in {"perception", "screen", "memory"}
-        ],
+        foreground_chat_tool_context_v2(),
         ensure_ascii=False,
         sort_keys=True,
     )
     return {
         "role": "system",
         "content": (
-            "Feedling foreground chat Runtime V2 tools are available. The user is waiting, so use only fast tools inline. "
-            "Return JSON only. To gather information, return "
+            "Additional fast foreground perception tools are available for the current chat turn. "
+            "They are additive: keep using the normal foreground chat contract and any separate memory-tool instructions exactly as given. "
+            "To gather current perception data, return "
             "{\"tool_calls\":[{\"name\":\"<tool.name>\",\"args\":{...}}]}; the runtime will return tool results. "
-            "When finished, return {\"messages\":[\"user-visible reply\"],\"actions\":[]}. "
-            "If a needed slow tool is handed off to background, the runtime will stop this foreground turn and send a short ack; "
-            "do not block or invent the slow result. "
-            "Use perception tools only when they help answer the user's current message. "
+            "When finished, return the normal hosted chat final JSON required by the earlier turn contract, e.g. {\"reply\":\"...\"}. "
+            "Only the listed fast tools are available here. Do not call memory.*, action tools, steps, sleep, workout, vitals, photo, screen, or long calendar windows. "
+            "If a needed tool is not listed, answer from available context and do not promise a background follow-up. "
             "Do not include change_digest or proactive wake assumptions in foreground chat. "
             "Available tools JSON:\n" + tools_json
         ),
@@ -213,90 +292,6 @@ def _model_api_full_tool_loop_instruction_message() -> dict:
 
 def _foreground_chat_tool_budget_v2() -> ToolBudgetV2:
     return ToolBudgetV2(slow_inline_limit=0)
-
-
-def _run_model_api_full_tool_loop_v2(
-    runtime,
-    provider_messages: list[dict],
-    *,
-    store,
-    api_key: str | None,
-    max_tokens: int,
-    temperature: float,
-) -> tuple[dict, str, dict]:
-    result: dict = {}
-    raw_reply = ""
-    usage_rounds: list[dict] = []
-    tool_trace: dict = {
-        "mode": "runtime_v2_full_tool_loop",
-        "budget_mode": FOREGROUND_CHAT_TOOL_BUDGET_MODE_V2,
-        "tool_calls": [],
-    }
-    executor = ToolExecutorV2(
-        adapters=combined_runtime_adapters_v2(api_key, store),
-        budget=_foreground_chat_tool_budget_v2(),
-    )
-
-    def call_model(messages: list[dict[str, Any]]) -> str:
-        nonlocal result, raw_reply
-        result = provider_client.chat_completion(
-            runtime,
-            messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            timeout=90.0,
-            include_reasoning=hosted_turn.MODEL_API_PROVIDER_REASONING_ENABLED,
-        )
-        raw_reply = str(result.get("reply") or "").strip()
-        usage_rounds.append(result.get("usage") or {})
-        return raw_reply
-
-    def call_tool(name: str, args: dict) -> dict:
-        res = executor.execute(ToolCallV2(name=name, args=dict(args or {}), user_id=store.user_id)).as_dict()
-        tool_trace["tool_calls"].append({
-            "name": name,
-            "ok": bool(res.get("ok")),
-            "outcome": str(res.get("outcome") or ""),
-            "error_code": str(res.get("error_code") or ""),
-            "needs_background": bool(res.get("needs_background")),
-            "cost_class": ((res.get("trace") or {}) if isinstance(res.get("trace"), dict) else {}).get("cost_class", ""),
-        })
-        return res
-
-    raw_reply = run_tool_loop_v2(call_model, call_tool, list(provider_messages), max_iters=4)
-    if len(usage_rounds) > 1:
-        result = {**result, "usage": {"runtime_v2_tool_loop": usage_rounds, "final": result.get("usage") or {}}}
-    else:
-        result = result or {"reply": raw_reply}
-    return result, raw_reply, tool_trace
-
-
-def _foreground_background_ack(source_message: str) -> str:
-    if re.search(r"[\u4e00-\u9fff]", source_message or ""):
-        return "我看一下，查完再告诉你。"
-    return "I’ll check that and get back to you."
-
-
-def _parse_model_api_full_tool_loop_terminal(raw_reply: str, source_message: str) -> tuple[str, str, list[dict], dict | None]:
-    parsed = parse_agent_response_v2(raw_reply)
-    if parsed.needs_background:
-        return _foreground_background_ack(source_message), "", [], dict(parsed.background_request or {})
-    if parsed.messages:
-        return "\n\n".join(parsed.messages), "", [], None
-    reply, thinking, web_search = hosted_turn._model_api_parse_turn_output(raw_reply)
-    return reply, thinking, web_search, None
-
-
-def _queue_foreground_background_request_v2(store, user_message_id: str, request_doc: dict) -> dict:
-    if not request_doc:
-        return {}
-    job = DBBackgroundJobStoreV2().create_job(
-        store.user_id,
-        {"source": "hosted_foreground_chat", **dict(request_doc or {})},
-        turn_id=f"hosted_chat:{user_message_id}",
-        origin_refs=(f"chat:{user_message_id}",),
-    )
-    return {"status": "queued", "job_id": job.job_id, "request": dict(request_doc or {})}
 
 
 def _memory_fallback_instruction_message(
@@ -378,14 +373,14 @@ def model_api_chat_send():
     memory_action_results: list[dict] = []
 
     full_tool_loop_v2_enabled = _hosted_chat_full_tool_loop_v2_enabled(store)
-    memory_tools_enabled = _model_api_memory_tools_enabled() and not full_tool_loop_v2_enabled
+    memory_tools_enabled = _model_api_memory_tools_enabled()
     auto_memory_context_enabled = _model_api_auto_memory_context_enabled()
     provider_messages, context_payload, screen_images = hosted_context._model_api_context_messages(
         store,
         api_key,
         message_for_context,
         include_screen_context=bool(payload.get("include_screen_context")),
-        include_memory_context=not (memory_tools_enabled or full_tool_loop_v2_enabled),
+        include_memory_context=not memory_tools_enabled,
     )
     provider_images = list(screen_images)
     if has_image:
@@ -404,27 +399,18 @@ def model_api_chat_send():
             "role": "system",
             "content": "User-selected context refs JSON:\n" + json.dumps(context_refs, ensure_ascii=False)[:3000],
         })
+    provider_messages.insert(2, hosted_turn._model_api_turn_contract_message())
+    insert_at = 3
+    if memory_tools_enabled:
+        provider_messages.insert(insert_at, hosted_memory_tools.memory_tool_instruction_message())
+        insert_at += 1
     if full_tool_loop_v2_enabled:
-        provider_messages.insert(2, _model_api_full_tool_loop_instruction_message())
-    else:
-        provider_messages.insert(2, hosted_turn._model_api_turn_contract_message())
-        if memory_tools_enabled:
-            provider_messages.insert(3, hosted_memory_tools.memory_tool_instruction_message())
+        provider_messages.insert(insert_at, _model_api_foreground_perception_tool_instruction_message())
     web_search: dict = {}
     memory_tools_trace: dict = {}
     full_tool_loop_trace: dict = {}
-    foreground_background: dict = {}
     try:
-        if full_tool_loop_v2_enabled:
-            result, raw_reply, full_tool_loop_trace = _run_model_api_full_tool_loop_v2(
-                runtime,
-                provider_messages,
-                store=store,
-                api_key=api_key,
-                max_tokens=int(payload.get("max_tokens") or 2048),
-                temperature=float(payload.get("temperature") or 0.7),
-            )
-        elif memory_tools_enabled:
+        if memory_tools_enabled or full_tool_loop_v2_enabled:
             result, raw_reply, memory_tools_trace = _run_model_api_memory_tool_loop(
                 runtime,
                 provider_messages,
@@ -432,7 +418,10 @@ def model_api_chat_send():
                 api_key=api_key,
                 max_tokens=int(payload.get("max_tokens") or 2048),
                 temperature=float(payload.get("temperature") or 0.7),
+                memory_tools_enabled=memory_tools_enabled,
+                perception_tools_enabled=full_tool_loop_v2_enabled,
             )
+            full_tool_loop_trace = dict(memory_tools_trace.get("foreground_perception_v2") or {})
         else:
             result = provider_client.chat_completion(
                 runtime,
@@ -476,20 +465,7 @@ def model_api_chat_send():
             "action_trace_id": trace.get("trace_id", ""),
         }), 502
 
-    if full_tool_loop_v2_enabled:
-        reply, thinking_summary, requested_web_search, background_request = _parse_model_api_full_tool_loop_terminal(
-            raw_reply,
-            message_for_context,
-        )
-        if background_request:
-            foreground_background = _queue_foreground_background_request_v2(
-                store,
-                user_row["id"],
-                background_request,
-            )
-            full_tool_loop_trace["background"] = dict(foreground_background)
-    else:
-        reply, thinking_summary, requested_web_search = hosted_turn._model_api_parse_turn_output(raw_reply)
+    reply, thinking_summary, requested_web_search = hosted_turn._model_api_parse_turn_output(raw_reply)
     provider_reasoning = hosted_turn._sanitize_provider_reasoning_text(str(result.get("reasoning") or ""))
     if full_tool_loop_trace:
         context_payload["foreground_tool_loop_v2"] = dict(full_tool_loop_trace)
@@ -612,11 +588,11 @@ def model_api_chat_send():
                     }
             except provider_client.ProviderError:
                 pass
-    if memory_tools_trace:
+    if memory_tools_enabled and memory_tools_trace:
         context_payload["memory_tools"] = {
             key: value
             for key, value in memory_tools_trace.items()
-            if key != "cumulative_fetch_limit"
+            if key not in {"cumulative_fetch_limit", "foreground_perception_v2"}
         }
     if requested_web_search and (not web_search or not reply):
         if not web_search:
@@ -836,7 +812,6 @@ def model_api_chat_send():
             "mode": hosted_config_store.MODEL_API_RUNTIME_MODE,
             "version": hosted_config_store.MODEL_API_RUNTIME_VERSION,
             "foreground_tool_loop_v2_enabled": bool(full_tool_loop_v2_enabled),
-            "foreground_background": dict(foreground_background or {}),
             "background_execution": background_execution,
         },
         "context": hosted_context._model_api_context_trace_for_action(

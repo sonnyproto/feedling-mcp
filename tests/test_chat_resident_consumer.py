@@ -163,27 +163,25 @@ def test_process_messages_uses_resident_v2_tool_loop_when_chat_flag_on(monkeypat
     mock_legacy.assert_not_called()
     assert captured["foreground_chat"] is True
     assert "perception.weather" in captured["message"]
+    assert "memory.fetch" not in captured["message"]
+    assert "perception.steps" not in captured["message"]
+    assert "screen.read" not in captured["message"]
     assert "User message:\n天气怎么样？" in captured["message"]
     assert mock_post.call_args.args[0] == "外面下雨。"
     assert mock_post.call_args.kwargs["reply_to_message_id"] == "user-msg-v2"
 
 
-def test_process_messages_v2_needs_background_acks_and_queues(monkeypatch):
+def test_process_messages_v2_drops_needs_background_without_ack(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     crc._update_chat_runtime_v2_profile({crc.RESIDENT_CHAT_RUNTIME_V2_FLAG: True})
     msg = {"id": "user-msg-bg", "role": "user", "content": "今天多少步？", "ts": 1113.0}
-    queued = []
 
     try:
         with patch.object(
             crc,
             "_resident_run_agent_v2",
             return_value={"actions": [{"type": "needs_background", "request": {"tool": "perception.steps", "args": {}}}], "messages": []},
-        ), patch.object(
-            crc,
-            "_queue_resident_background_request_v2",
-            side_effect=lambda request, source_message_id="": queued.append((request, source_message_id)) or {"status": "queued", "job_id": "bg_1"},
         ), patch.object(crc, "execute_agent_actions") as mock_actions, \
              patch.object(crc, "post_reply", return_value={"id": "reply-bg"}) as mock_post:
             result_ts = crc._process_messages([msg])
@@ -191,9 +189,8 @@ def test_process_messages_v2_needs_background_acks_and_queues(monkeypatch):
         crc._update_chat_runtime_v2_profile({})
 
     assert result_ts == pytest.approx(1113.0)
-    assert queued == [({"tool": "perception.steps", "args": {}}, "user-msg-bg")]
     mock_actions.assert_not_called()
-    assert mock_post.call_args.args[0] == "我看一下，查完再告诉你。"
+    mock_post.assert_not_called()
 
 
 def test_process_messages_keeps_checkpoint_when_post_reply_fails():
@@ -1788,6 +1785,38 @@ def test_resident_proactive_runs_tool_loop(monkeypatch):
     assert json.loads(final)["messages"] == ["ok"]
     assert posted == [("screen.read", {})]
     assert any("Inbox" in m for m in fed_back), f"caption not fed back; fed_back={fed_back}"
+
+
+def test_resident_foreground_tool_loop_turns_slow_handoff_into_tool_error(monkeypatch):
+    scripted = [
+        '{"tool_calls": [{"name": "perception.steps", "args": {}}]}',
+        '{"messages": ["我现在不能直接查步数。"]}',
+    ]
+    fed_back: list[str] = []
+
+    def fake_call_agent(message, **kw):
+        fed_back.append(message)
+        return scripted.pop(0)
+
+    def fake_call_tool(name, args, *, budget_mode=""):
+        assert budget_mode == crc.FOREGROUND_CHAT_TOOL_BUDGET_MODE_V2
+        return {
+            "name": name,
+            "ok": False,
+            "outcome": "needs_background",
+            "result": {},
+            "error_code": "slow_budget_soft_handoff",
+            "needs_background": True,
+        }
+
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    monkeypatch.setattr(crc, "_resident_call_tool_v2", fake_call_tool)
+
+    final = crc._resident_run_agent_v2("foreground message", foreground_chat=True)
+
+    assert json.loads(final)["messages"] == ["我现在不能直接查步数。"]
+    assert "foreground_slow_tool_unavailable" in fed_back[-1]
+    assert "needs_background" not in json.loads(final).get("actions", [])
 
 
 def test_resident_proactive_tool_loop_no_python_repr_on_multi_round():

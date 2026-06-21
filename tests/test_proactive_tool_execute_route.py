@@ -90,37 +90,3 @@ def test_tool_execute_foreground_budget_soft_handoffs_slow_tool(monkeypatch):
     assert body["outcome"] == "needs_background"
     assert body["error_code"] == "slow_budget_soft_handoff"
     assert called["pull"] is False
-
-
-def test_background_queue_creates_v2_background_job(monkeypatch):
-    from proactive import routes as proactive_routes
-    from proactive.store_v2 import BACKGROUND_JOB_STREAM_V2
-
-    class _Store:
-        user_id = "u_background_queue"
-        last_seen_api_key = "k"
-
-    monkeypatch.setattr(proactive_routes.auth, "require_user", lambda: _Store())
-
-    resp = _client().post(
-        "/v1/proactive/background/queue",
-        json={
-            "source": "resident_foreground_chat",
-            "request": {"tool": "perception.steps", "args": {}},
-            "origin_refs": ["chat:msg_1"],
-            "turn_id": "resident_chat:msg_1",
-        },
-    )
-    body = resp.get_json()
-    jobs = app_module.db.log_read("u_background_queue", BACKGROUND_JOB_STREAM_V2, limit=5)
-
-    assert resp.status_code == 200
-    assert body["status"] == "queued"
-    assert body["job_id"].startswith("bg_")
-    assert jobs[-1]["job_id"] == body["job_id"]
-    assert jobs[-1]["request"] == {
-        "source": "resident_foreground_chat",
-        "tool": "perception.steps",
-        "args": {},
-    }
-    assert jobs[-1]["origin_refs"] == ["chat:msg_1"]
