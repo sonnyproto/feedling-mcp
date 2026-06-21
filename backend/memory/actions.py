@@ -25,6 +25,19 @@ def _memory_action_text(value, max_chars: int) -> str:
     return text[:max_chars].strip()
 
 
+def _memory_action_float(value, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(0.0, min(1.0, parsed))
+
+
+def _memory_action_salience(value) -> str:
+    salience = str(value or "medium").strip().lower()
+    return salience if salience in {"critical", "high", "medium", "low"} else "medium"
+
+
 def _memory_plain_from_envelope(moment: dict, api_key: str | None) -> tuple[dict | None, str]:
     if moment.get("visibility") == "local_only":
         return None, "memory_local_only_agent_cannot_read"
@@ -39,17 +52,25 @@ def _memory_plain_from_envelope(moment: dict, api_key: str | None) -> tuple[dict
 
 
 def _memory_inner_from_action(data: dict) -> dict:
+    summary = str(data.get("summary") or data.get("description") or data.get("title") or "").strip()[:2000]
+    title = _memory_action_text(data.get("title") or summary, 180)
+    description = summary
+    verbatim = str(data.get("verbatim") or data.get("her_quote") or "").strip()[:1000]
     inner = {
-        "title": _memory_action_text(data.get("title"), 180),
-        "description": str(data.get("description") or "").strip()[:2000],
+        "title": title,
+        "description": description,
         "type": str(data.get("type") or "fact").strip().lower(),
+        "summary": summary,
     }
+    if verbatim:
+        inner["verbatim"] = verbatim
+        inner["her_quote"] = verbatim
     if data.get("source"):
         inner["source"] = _memory_action_text(data.get("source"), 160)
-    if data.get("her_quote"):
-        inner["her_quote"] = str(data.get("her_quote") or "").strip()[:1000]
     if data.get("context"):
         inner["context"] = str(data.get("context") or "").strip()[:1000]
+    if data.get("follow_up"):
+        inner["follow_up"] = str(data.get("follow_up") or "").strip()[:1000]
     if data.get("linked_dimension"):
         inner["linked_dimension"] = str(data.get("linked_dimension") or "").strip()[:160]
     if data.get("quoted_in_chat") is not None:
@@ -129,7 +150,37 @@ def _memory_record_from_envelope(store: UserStore, envelope: dict, *, existing: 
     anchor_ids = envelope.get("anchor_memory_ids") or []
     if anchor_ids:
         moment["anchor_memory_ids"] = list(anchor_ids)
+    for key in (
+        "card_v",
+        "status",
+        "salience",
+        "importance",
+        "source_type",
+        "superseded_by",
+        "is_sensitive",
+        "sensitivity_class",
+    ):
+        if key in envelope:
+            moment[key] = envelope[key]
+        elif existing and key in existing:
+            moment[key] = existing[key]
+    if "supersedes" in envelope:
+        moment["supersedes"] = list(envelope.get("supersedes") or [])
+    elif existing and "supersedes" in existing:
+        moment["supersedes"] = list(existing.get("supersedes") or [])
     return moment
+
+
+def _memory_apply_v1_metadata(envelope: dict, raw: dict, *, source: str, default_status: str = "active") -> None:
+    envelope["card_v"] = 1
+    envelope["status"] = default_status
+    envelope["salience"] = _memory_action_salience(raw.get("salience"))
+    envelope["importance"] = _memory_action_float(raw.get("importance"), 0.5)
+    envelope["source_type"] = source
+    if raw.get("is_sensitive") is not None:
+        envelope["is_sensitive"] = bool(raw.get("is_sensitive"))
+    if raw.get("sensitivity_class"):
+        envelope["sensitivity_class"] = _memory_action_text(raw.get("sensitivity_class"), 80)
 
 
 def _memory_action_effect(action: str, memory_id: str, fields: list[str] | None = None) -> dict:
@@ -144,8 +195,9 @@ def _memory_action_effect(action: str, memory_id: str, fields: list[str] | None 
 def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
     raw = action.get("memory") if isinstance(action.get("memory"), dict) else action
     mem_type = str(raw.get("type") or "fact").strip().lower()
-    title = _memory_action_text(raw.get("title"), 180)
-    description = str(raw.get("description") or "").strip()[:2000]
+    summary = str(raw.get("summary") or raw.get("description") or raw.get("title") or "").strip()[:2000]
+    title = _memory_action_text(raw.get("title") or summary, 180)
+    description = str(raw.get("description") or summary).strip()[:2000]
     if not title:
         return {"status": "error", "error": "title_required", "action": "memory.add"}, [], 400
     if not description and mem_type not in {"quote", "event"}:
@@ -165,6 +217,7 @@ def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict]
     envelope["type"] = mem_type
     envelope["occurred_at"] = _memory_action_text(raw.get("occurred_at") or core_util._now_iso(), 80)
     envelope["source"] = _memory_action_text(raw.get("source") or action.get("source") or "model_api_capture", 80)
+    _memory_apply_v1_metadata(envelope, raw, source=envelope["source"])
     if anchor_ids:
         envelope["anchor_memory_ids"] = list(anchor_ids)
     moment = _memory_record_from_envelope(store, envelope)
@@ -172,7 +225,7 @@ def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict]
     memory_service._save_moments(store, moments)
     boot_gates._log_bootstrap_event(store, "memory_action_added_v1", success=True)
     change = memory_service._append_memory_change(store, {
-        "action": "add",
+        "action": "insert",
         "memory_id": moment["id"],
         "type": mem_type,
         "reason": _memory_action_text(action.get("reason") or "Memory added from chat/capture.", 500),
@@ -184,7 +237,7 @@ def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict]
     return {
         "status": "ok",
         "action": str(action.get("type") or "memory.add"),
-        "memory": {"id": moment["id"], "type": mem_type, "occurred_at": moment["occurred_at"]},
+        "memory": {"id": moment["id"], "type": mem_type, "occurred_at": moment["occurred_at"], "status": moment["status"]},
         "change": change,
     }, [effect], 201
 
@@ -213,8 +266,11 @@ def _memory_content_patch_action(store: UserStore, api_key: str | None, action: 
     for key, max_len in (
         ("title", 180),
         ("description", 2000),
+        ("summary", 2000),
         ("her_quote", 1000),
+        ("verbatim", 1000),
         ("context", 1000),
+        ("follow_up", 1000),
         ("linked_dimension", 160),
     ):
         if key in patch:
@@ -259,6 +315,7 @@ def _memory_content_patch_action(store: UserStore, api_key: str | None, action: 
     envelope["type"] = mem_type
     envelope["occurred_at"] = occurred_at
     envelope["source"] = source
+    _memory_apply_v1_metadata(envelope, {**existing, **patch}, source=source, default_status=str(existing.get("status") or "active"))
     if anchor_ids:
         envelope["anchor_memory_ids"] = list(anchor_ids)
     updated = _memory_record_from_envelope(store, envelope, existing=existing)
@@ -330,6 +387,92 @@ def _memory_retype_action(store: UserStore, action: dict) -> tuple[dict, list[di
     }, [_memory_action_effect("memory.retype", memory_id, ["type", "anchor_memory_ids"])], 200
 
 
+def _memory_supersede_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
+    raw = action.get("memory") if isinstance(action.get("memory"), dict) else {}
+    old_id = _memory_action_text(
+        action.get("supersedes")
+        or action.get("old_id")
+        or action.get("target_id")
+        or action.get("memory_id"),
+        160,
+    )
+    if not old_id:
+        return {"status": "error", "error": "supersedes_required", "action": "memory.supersede"}, [], 400
+
+    mem_type = str(raw.get("type") or "fact").strip().lower()
+    summary = str(raw.get("summary") or raw.get("description") or raw.get("title") or "").strip()[:2000]
+    title = _memory_action_text(raw.get("title") or summary, 180)
+    description = str(raw.get("description") or summary).strip()[:2000]
+    if not title:
+        return {"status": "error", "error": "title_required", "action": "memory.supersede"}, [], 400
+    if not description and mem_type not in {"quote", "event"}:
+        return {"status": "error", "error": "description_required", "action": "memory.supersede"}, [], 400
+
+    anchor_ids = raw.get("anchor_memory_ids") or action.get("anchor_memory_ids") or []
+    if not isinstance(anchor_ids, list):
+        return {"status": "error", "error": "anchor_memory_ids_must_be_list", "action": "memory.supersede"}, [], 400
+    moments = memory_service._load_moments(store)
+    old_idx = next((i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == old_id), None)
+    if old_idx is None:
+        return {"status": "error", "error": "not_found", "action": "memory.supersede"}, [], 404
+    old = moments[old_idx]
+    if old.get("owner_user_id") != store.user_id:
+        return {"status": "error", "error": "not_owned", "action": "memory.supersede"}, [], 403
+
+    ok, err = _memory_validate_write(store, moments, mem_type=mem_type, anchor_ids=anchor_ids)
+    if not ok:
+        return {"status": "error", **(err or {}), "action": "memory.supersede"}, [], 400
+
+    inner = _memory_inner_from_action({**raw, "type": mem_type, "title": title, "description": description})
+    envelope, env_err = _build_memory_envelope_for_store(store, inner)
+    if envelope is None:
+        return {"status": "error", "error": env_err, "action": "memory.supersede"}, [], 409
+    envelope["type"] = mem_type
+    envelope["occurred_at"] = _memory_action_text(raw.get("occurred_at") or core_util._now_iso(), 80)
+    envelope["source"] = _memory_action_text(raw.get("source") or action.get("source") or "hosted_runtime_state", 80)
+    _memory_apply_v1_metadata(envelope, raw, source=envelope["source"])
+    envelope["supersedes"] = [old_id]
+    if anchor_ids:
+        envelope["anchor_memory_ids"] = list(anchor_ids)
+    new_moment = _memory_record_from_envelope(store, envelope)
+
+    now = core_util._now_iso()
+    retired = dict(old)
+    retired["status"] = "superseded"
+    retired["superseded_by"] = new_moment["id"]
+    retired["updated_at"] = now
+    retired["is_archived"] = True
+    retired["archived_at"] = now
+    retired["archive_reason"] = f"superseded_by:{new_moment['id']}"
+
+    moments[old_idx] = retired
+    moments.append(new_moment)
+    memory_service._save_moments(store, moments)
+    change = memory_service._append_memory_change(store, {
+        "action": "supersede",
+        "memory_id": new_moment["id"],
+        "supersedes": old_id,
+        "type": mem_type,
+        "reason": _memory_action_text(action.get("reason") or "Memory superseded from chat.", 500),
+        "source_chat_message_ids": action.get("source_chat_message_ids") or [],
+        "anchor_memory_ids": anchor_ids,
+    })
+    effect = {
+        "type": "memory_superseded",
+        "action": "memory.supersede",
+        "memory_id": new_moment["id"],
+        "supersedes": old_id,
+        "fields": ["created", "status", "supersedes", "superseded_by"],
+    }
+    return {
+        "status": "ok",
+        "action": "memory.supersede",
+        "memory": {"id": new_moment["id"], "type": mem_type, "occurred_at": new_moment["occurred_at"], "status": "active"},
+        "superseded": {"id": old_id, "status": "superseded", "superseded_by": new_moment["id"]},
+        "change": change,
+    }, [effect], 201
+
+
 def _memory_delete_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
     memory_id = _memory_action_text(action.get("id") or action.get("memory_id"), 160)
     if not memory_id:
@@ -361,13 +504,15 @@ def _execute_memory_action(store: UserStore, api_key: str | None, action: dict) 
         return _memory_content_patch_action(store, api_key, action)
     if action_type == "memory.retype":
         return _memory_retype_action(store, action)
+    if action_type == "memory.supersede":
+        return _memory_supersede_action(store, action)
     if action_type == "memory.delete":
         return _memory_delete_action(store, action)
     return {
         "status": "error",
         "error": "unsupported_memory_action",
         "action": action_type,
-        "supported": ["memory.add", "memory.add_correction", "memory.content_patch", "memory.retype", "memory.delete"],
+        "supported": ["memory.add", "memory.add_correction", "memory.content_patch", "memory.retype", "memory.supersede", "memory.delete"],
     }, [], 400
 
 
