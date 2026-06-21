@@ -200,3 +200,55 @@ feedling_memory_fetch
 ```
 
 人话：明早 test 可以验证新按钮是否可用；但不要期待普通聊天已经 100% 自动走新链路。
+
+## route B / API 怎么测
+
+这次 route B 已经接了管道，但默认由 flag 控制。
+
+环境变量：
+
+```text
+MEMORY_READSIDE_FOR_MODEL_API=true
+```
+
+不开这个变量时：
+
+```text
+普通 API 聊天仍然走旧 selector
+```
+
+打开后：
+
+```text
+普通 API 聊天请求 /v1/chat/history?context_mode=model_api
+会在 enclave 内走 index -> selector -> fetch
+再把结果塞回 context_memories
+```
+
+人话：打开 flag 后，用户发普通 API 聊天时，memory 召回来源才真正换成新管道。
+
+你可以用 trace 判断是否生效：
+
+```text
+context_memory_trace.mode == model_api_readside_v1
+context_memory_trace.readside_enabled == true
+```
+
+如果还是：
+
+```text
+context_memory_trace.mode == model_api
+```
+
+说明还在走旧路，通常是 flag 没开，或 enclave 没部署新代码。
+
+当前测试重点：
+
+```text
+1. flag 关：普通聊天不变。
+2. flag 开：trace mode 变成 model_api_readside_v1。
+3. context_memories 字段仍然存在，app.py 不需要改。
+4. 猫咪 query 不应该误取 Lark/私密卡。
+```
+
+人话：这次上线后真正要看的是 trace，不是 UI。UI 不变，底层 memory recall 管道变了。

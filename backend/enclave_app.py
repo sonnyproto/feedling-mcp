@@ -785,6 +785,7 @@ from context_memory_selection import (  # noqa: E402
     select_context_memories,
     select_context_memories_with_trace,
 )
+from memory_index_selector import select_memory_index_items  # noqa: E402
 
 
 def _load_decrypted_moments(
@@ -825,6 +826,117 @@ def _load_decrypted_moments(
             "linked_dimension": inner.get("linked_dimension"),
         })
     return out
+
+
+def _env_flag_enabled(name: str, default: str = "false") -> bool:
+    return str(os.environ.get(name, default) or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _memory_readside_for_model_api_enabled() -> bool:
+    return _env_flag_enabled("MEMORY_READSIDE_FOR_MODEL_API")
+
+
+def _context_moment_to_index_item(moment: dict) -> dict:
+    """Convert the existing plaintext context card into a readside index item.
+
+    Route B still decrypts in-enclave, but selection now goes through the same
+    index selector used by readside/MCP. This avoids the backend top-50 prefilter
+    while unifying the matching pipe.
+    """
+
+    title = _memory_readside_text(moment.get("title"), 500)
+    description = _memory_readside_text(moment.get("description"), 500)
+    linked = _memory_readside_text(moment.get("linked_dimension"), 160)
+    context = _memory_readside_text(moment.get("context"), 240)
+    summary = description or title or context
+    bucket_refs = [item for item in (linked, _memory_readside_text(moment.get("type"), 40)) if item]
+    return {
+        "id": _memory_readside_text(moment.get("id"), 120),
+        "summary": summary,
+        "bucket_refs": bucket_refs,
+        "status": "active",
+        "salience": "medium",
+        "is_open_thread": False,
+        "is_sensitive": False,
+        "score": 0,
+        "occurred_at": _memory_readside_text(moment.get("occurred_at"), 80),
+        "created_at": _memory_readside_text(moment.get("created_at"), 80),
+    }
+
+
+def _select_context_memories_via_readside(
+    moments: list[dict],
+    latest_user_text: str,
+    *,
+    cap: int = 8,
+) -> tuple[list[dict], dict]:
+    """Route B readside pipe: plaintext cards -> safe index -> ids -> cards."""
+
+    if not moments:
+        return [], {
+            "mode": "model_api_readside_v1",
+            "readside_enabled": True,
+            "selected": [],
+            "rejected_sample": [],
+            "index_count": 0,
+        }
+    by_id = {str(moment.get("id") or ""): moment for moment in moments if str(moment.get("id") or "")}
+    index_items = [
+        item for item in (_context_moment_to_index_item(moment) for moment in moments)
+        if item.get("id") and item.get("summary")
+    ]
+    selection = select_memory_index_items(
+        latest_user_text,
+        index_items,
+        cap=cap,
+        include_sensitive=False,
+    )
+    selected_ids = [memory_id for memory_id in selection.get("selected_ids", []) if memory_id in by_id]
+    context_memories = [dict(by_id[memory_id]) for memory_id in selected_ids[:cap]]
+    selector_trace = selection.get("trace") if isinstance(selection.get("trace"), dict) else {}
+    selected_trace = selector_trace.get("selected") if isinstance(selector_trace.get("selected"), list) else []
+    skipped = selector_trace.get("skipped_sample") if isinstance(selector_trace.get("skipped_sample"), list) else []
+    trace = {
+        "mode": "model_api_readside_v1",
+        "readside_enabled": True,
+        "index_count": len(index_items),
+        "selected": [
+            {
+                "id": item.get("id", ""),
+                "title": _memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("title"), 160),
+                "type": _memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("type"), 40),
+                "score": float(item.get("score") or 0.0),
+                "confidence": _memory_readside_text(item.get("confidence"), 40),
+                "matched_units": list(item.get("matched_units") or [])[:8],
+                "matched_phrases": list(item.get("matched_phrases") or [])[:6],
+                "reason": _memory_readside_text(item.get("reason"), 120),
+                "bucket": "readside",
+                "selected": True,
+            }
+            for item in selected_trace[:cap]
+        ],
+        "rejected_sample": [
+            {
+                "id": item.get("id", ""),
+                "title": _memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("title"), 160),
+                "type": _memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("type"), 40),
+                "score": float(item.get("score") or 0.0),
+                "confidence": _memory_readside_text(item.get("confidence"), 40),
+                "matched_units": list(item.get("matched_units") or [])[:8],
+                "matched_phrases": list(item.get("matched_phrases") or [])[:6],
+                "reason": _memory_readside_text(item.get("reason"), 120),
+                "bucket": "rejected",
+                "selected": False,
+            }
+            for item in skipped[:8]
+        ],
+        "selector_trace": selector_trace,
+    }
+    for key in ("query_units", "query_strong_phrases", "query_rare_terms", "query_weak_terms"):
+        value = selector_trace.get(key)
+        if isinstance(value, list):
+            trace[key] = value
+    return context_memories, trace
 
 
 def _memory_readside_text(value, max_chars: int = 2000) -> str:
@@ -1150,7 +1262,16 @@ def v1_chat_history():
         if not context_mode and str(request.args.get("context_strict") or "").lower() in {"1", "true", "yes", "on"}:
             context_mode = "strict"
         want_trace = str(request.args.get("context_trace") or "").lower() in {"1", "true", "yes", "on"}
-        if want_trace:
+        use_readside = context_mode == "model_api" and _memory_readside_for_model_api_enabled()
+        if use_readside:
+            context_memories, context_memory_trace = _select_context_memories_via_readside(
+                moments,
+                latest_user_text,
+                cap=8,
+            )
+            if not want_trace:
+                context_memory_trace = None
+        elif want_trace:
             context_memories, context_memory_trace = select_context_memories_with_trace(
                 moments,
                 latest_user_text,

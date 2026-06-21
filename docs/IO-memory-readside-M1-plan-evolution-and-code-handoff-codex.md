@@ -1135,3 +1135,113 @@ backend 能访问 FEEDLING_ENCLAVE_URL
 如果 agent 端依赖公开 skill 文档，而不是只看 MCP tool descriptions，还需要把 `io-onboarding` 的 skill.md 同步更新。
 
 人话：代码里按钮已经补了，但 test 环境要同时部署 backend 和 MCP；如果 agent 只读远程 skill 文档，还要更新那份公开说明。
+
+## 16. 2026-06-21 route B / API 管道接入
+
+### 16.1 这次为什么继续做
+
+上一版已经完成：
+
+```text
+/v1/memory/index
+/v1/memory/fetch
+feedling_memory_index
+feedling_memory_fetch
+MemoryIndexSelector
+```
+
+但 route B / API 主聊天路径还没有真正用上。也就是说，能力已经有了，但普通 API 回复还是旧的 `select_context_memories`。
+
+这次补的是：
+
+```text
+route B / model_api context_memories
+  从旧 selector
+  接到 readside index -> selector -> fetch 管道
+```
+
+人话：之前是“工具造好了”；这次是“把工具接到 API 路径的水管上”。
+
+### 16.2 接入方式
+
+只改 enclave 的 `/v1/chat/history`。
+
+`app.py` 不改，还是这样拿上下文：
+
+```text
+app.py
+  -> enclave /v1/chat/history?context_mode=model_api&context_trace=1
+  -> 读取 context_memories
+  -> 拼进 model_api prompt
+```
+
+enclave 内部在 flag 打开时改成：
+
+```text
+_load_decrypted_moments(limit=200)
+  -> plaintext moments
+  -> 转 MemoryIndexItem
+  -> select_memory_index_items(query=latest_user_text)
+  -> 按 selected_ids 取回原 context memory
+  -> 返回同样形状的 context_memories
+```
+
+人话：外面看起来还是同一个 `context_memories`，里面的选择管道换成了新 readside。
+
+### 16.3 flag
+
+新增环境变量：
+
+```text
+MEMORY_READSIDE_FOR_MODEL_API=true
+```
+
+默认关闭。
+
+```text
+false / unset:
+  完全走旧路 select_context_memories
+
+true:
+  context_mode=model_api 时走 readside index -> select -> fetch
+```
+
+人话：不开开关，线上行为不变；开开关，API 路径开始吃新管道。
+
+### 16.4 为什么没有用 backend top-50
+
+route B 这次没有让 backend 先 top-50 预筛。
+
+原因：
+
+```text
+旧 route B：enclave 解密最多 200 条再选
+backend top-50：可能漏掉第 51 条以后但相关的旧卡
+```
+
+所以这次 route B 在 enclave 里继续使用已解密的最多 200 条，再转 index 给 selector。
+
+人话：为了先可用和不回归，宁愿不省这点解密成本，也不要突然让用户“记不起来”。
+
+### 16.5 当前边界
+
+这次做了：
+
+```text
+API route B 管道接入
+flag 回滚
+trace mode=model_api_readside_v1
+route A MCP 工具
+```
+
+这次仍然没做：
+
+```text
+embedding
+agentic hosted runtime recall
+memory 写入格式改造
+insert / supersede / merge / decay
+iOS UI 改动
+```
+
+人话：现在目标是“可用、可测、可回滚”，不是宣称召回质量变好了。
