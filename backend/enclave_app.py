@@ -146,6 +146,33 @@ SIGNING_KEY_PATH = "feedling-signing-v1"
 # derive from the same KMS-bound path.
 
 
+def _dev_seed_bytes(path: str) -> bytes:
+    seed = os.environ.get("FEEDLING_DEV_DSTACK_SEED", "").strip()
+    if not seed:
+        raise RuntimeError("FEEDLING_DEV_DSTACK_SEED is not set")
+    return hashlib.sha256(f"{seed}:{path}".encode("utf-8")).digest()
+
+
+def derive_keys_from_dev_seed() -> dict[str, Any]:
+    """Derive deterministic local-only keys for Docker sandboxes.
+
+    This is intentionally opt-in via FEEDLING_DEV_DSTACK_SEED. Production and
+    test deployments do not set it, so they still require dstack KMS.
+    """
+    content_sk = nacl.public.PrivateKey(_dev_seed_bytes(CONTENT_KEY_PATH))
+    content_pk = content_sk.public_key
+    signing_sk = nacl.signing.SigningKey(_dev_seed_bytes(SIGNING_KEY_PATH))
+    signing_pk = signing_sk.verify_key
+    return {
+        "content_sk": content_sk,
+        "content_pk": content_pk,
+        "content_pk_bytes": bytes(content_pk),
+        "signing_sk": signing_sk,
+        "signing_pk": signing_pk,
+        "signing_pk_bytes": bytes(signing_pk),
+    }
+
+
 def derive_keys(dstack: DstackClient) -> dict[str, Any]:
     """Derive the enclave's long-lived keypairs from dstack's KMS.
 
@@ -265,6 +292,27 @@ def fetch_quote_and_measurements(dstack: DstackClient, report_data: bytes) -> di
     }
 
 
+def dev_attestation(report_data: bytes) -> dict[str, Any]:
+    digest = hashlib.sha256(report_data + os.environ.get("FEEDLING_DEV_DSTACK_SEED", "").encode("utf-8")).hexdigest()
+    zero_measurement = "00" * 48
+    return {
+        "tdx_quote_hex": digest,
+        "event_log_json": "[]",
+        "measurements": {
+            "mrtd": zero_measurement,
+            "rtmr0": zero_measurement,
+            "rtmr1": zero_measurement,
+            "rtmr2": zero_measurement,
+            "rtmr3": zero_measurement,
+            "mr_aggregated": zero_measurement,
+            "mr_config_id": "",
+        },
+        "compose_hash": f"dev-memory-sandbox-{digest[:16]}",
+        "app_id": "dev-memory-sandbox",
+        "instance_id": "dev-memory-sandbox",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Cached attestation state
 # ---------------------------------------------------------------------------
@@ -295,12 +343,20 @@ def bootstrap():
     pin the TLS cert against the quote. Off → the old zero placeholder
     stays, and iOS will surface the amber "operator-terminated TLS" row.
     """
+    global _cached_content_sk
     try:
-        dstack = DstackClient()
-        keys = derive_keys(dstack)
+        dev_seed = os.environ.get("FEEDLING_DEV_DSTACK_SEED", "").strip()
+        dstack = None
+        if dev_seed:
+            keys = derive_keys_from_dev_seed()
+        else:
+            dstack = DstackClient()
+            keys = derive_keys(dstack)
 
         tls_fingerprint = PHASE1_TLS_FINGERPRINT
         if ENCLAVE_TLS:
+            if dstack is None:
+                raise RuntimeError("FEEDLING_ENCLAVE_TLS=true is not supported with FEEDLING_DEV_DSTACK_SEED")
             try:
                 tls = derive_tls_cert_and_key(dstack)
                 tls_fingerprint = tls["fingerprint"]
@@ -319,10 +375,11 @@ def bootstrap():
             tls_cert_fingerprint=tls_fingerprint,
             version_tag=b"feedling-v1",
         )
-        attestation = fetch_quote_and_measurements(dstack, report_data)
+        attestation = dev_attestation(report_data) if dstack is None else fetch_quote_and_measurements(dstack, report_data)
 
         _state["content_pk_hex"] = keys["content_pk_bytes"].hex()
         _state["signing_pk_hex"] = keys["signing_pk_bytes"].hex()
+        _cached_content_sk = keys["content_sk"]
         _state["tls_cert_fingerprint_hex"] = tls_fingerprint.hex()
         _state["attestation"] = attestation
         _state["booted_at"] = time.time()
@@ -702,6 +759,7 @@ from context_memory_selection import (  # noqa: E402
     select_context_memories,
     select_context_memories_with_trace,
 )
+from memory_index_selector import select_memory_index_items  # noqa: E402
 
 
 def _load_decrypted_moments(
@@ -742,6 +800,298 @@ def _load_decrypted_moments(
             "linked_dimension": inner.get("linked_dimension"),
         })
     return out
+
+
+def _env_flag_enabled(name: str, default: str = "false") -> bool:
+    return str(os.environ.get(name, default) or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _memory_readside_for_model_api_enabled() -> bool:
+    return _env_flag_enabled("MEMORY_READSIDE_FOR_MODEL_API")
+
+
+def _context_moment_to_index_item(moment: dict) -> dict:
+    """Convert the existing plaintext context card into a readside index item.
+
+    Route B still decrypts in-enclave, but selection now goes through the same
+    index selector used by readside/MCP. This avoids the backend top-50 prefilter
+    while unifying the matching pipe.
+    """
+
+    title = _memory_readside_text(moment.get("title"), 500)
+    description = _memory_readside_text(moment.get("description"), 500)
+    linked = _memory_readside_text(moment.get("linked_dimension"), 160)
+    context = _memory_readside_text(moment.get("context"), 240)
+    summary = description or title or context
+    bucket_refs = [item for item in (linked, _memory_readside_text(moment.get("type"), 40)) if item]
+    return {
+        "id": _memory_readside_text(moment.get("id"), 120),
+        "summary": summary,
+        "bucket_refs": bucket_refs,
+        "status": "active",
+        "salience": "medium",
+        "is_open_thread": False,
+        "is_sensitive": False,
+        "score": 0,
+        "occurred_at": _memory_readside_text(moment.get("occurred_at"), 80),
+        "created_at": _memory_readside_text(moment.get("created_at"), 80),
+    }
+
+
+def _select_context_memories_via_readside(
+    moments: list[dict],
+    latest_user_text: str,
+    *,
+    cap: int = 8,
+) -> tuple[list[dict], dict]:
+    """Route B readside pipe: plaintext cards -> safe index -> ids -> cards."""
+
+    if not moments:
+        return [], {
+            "mode": "model_api_readside_v1",
+            "readside_enabled": True,
+            "selected": [],
+            "rejected_sample": [],
+            "index_count": 0,
+        }
+    by_id = {str(moment.get("id") or ""): moment for moment in moments if str(moment.get("id") or "")}
+    index_items = [
+        item for item in (_context_moment_to_index_item(moment) for moment in moments)
+        if item.get("id") and item.get("summary")
+    ]
+    selection = select_memory_index_items(
+        latest_user_text,
+        index_items,
+        cap=cap,
+        include_sensitive=False,
+    )
+    selected_ids = [memory_id for memory_id in selection.get("selected_ids", []) if memory_id in by_id]
+    context_memories = [dict(by_id[memory_id]) for memory_id in selected_ids[:cap]]
+    selector_trace = selection.get("trace") if isinstance(selection.get("trace"), dict) else {}
+    selected_trace = selector_trace.get("selected") if isinstance(selector_trace.get("selected"), list) else []
+    skipped = selector_trace.get("skipped_sample") if isinstance(selector_trace.get("skipped_sample"), list) else []
+    trace = {
+        "mode": "model_api_readside_v1",
+        "readside_enabled": True,
+        "index_count": len(index_items),
+        "selected": [
+            {
+                "id": item.get("id", ""),
+                "title": _memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("title"), 160),
+                "type": _memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("type"), 40),
+                "score": float(item.get("score") or 0.0),
+                "confidence": _memory_readside_text(item.get("confidence"), 40),
+                "matched_units": list(item.get("matched_units") or [])[:8],
+                "matched_phrases": list(item.get("matched_phrases") or [])[:6],
+                "reason": _memory_readside_text(item.get("reason"), 120),
+                "bucket": "readside",
+                "selected": True,
+            }
+            for item in selected_trace[:cap]
+        ],
+        "rejected_sample": [
+            {
+                "id": item.get("id", ""),
+                "title": _memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("title"), 160),
+                "type": _memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("type"), 40),
+                "score": float(item.get("score") or 0.0),
+                "confidence": _memory_readside_text(item.get("confidence"), 40),
+                "matched_units": list(item.get("matched_units") or [])[:8],
+                "matched_phrases": list(item.get("matched_phrases") or [])[:6],
+                "reason": _memory_readside_text(item.get("reason"), 120),
+                "bucket": "rejected",
+                "selected": False,
+            }
+            for item in skipped[:8]
+        ],
+        "selector_trace": selector_trace,
+    }
+    for key in ("query_units", "query_strong_phrases", "query_rare_terms", "query_weak_terms"):
+        value = selector_trace.get(key)
+        if isinstance(value, list):
+            trace[key] = value
+    return context_memories, trace
+
+
+def _memory_readside_text(value, max_chars: int = 2000) -> str:
+    return str(value or "").strip()[:max_chars]
+
+
+def _memory_readside_list(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip()[:160] for item in value if str(item or "").strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()[:160]]
+    return []
+
+
+def _memory_readside_summary(inner: dict) -> str:
+    for key in ("summary", "description", "title"):
+        text = _memory_readside_text(inner.get(key), 500)
+        if text:
+            return text
+    return ""
+
+
+def _memory_readside_bucket_refs(inner: dict) -> list[str]:
+    refs = _memory_readside_list(inner.get("bucket_refs"))
+    if refs:
+        return refs
+    refs = _memory_readside_list(inner.get("bucket_ids"))
+    if refs:
+        return refs
+    linked = _memory_readside_text(inner.get("linked_dimension"), 160)
+    return [linked] if linked else []
+
+
+def _memory_readside_salience(envelope: dict, inner: dict) -> str:
+    salience = str(envelope.get("salience") or inner.get("salience") or "medium").strip().lower()
+    return salience if salience in {"critical", "high", "medium", "low"} else "medium"
+
+
+def _memory_readside_status(envelope: dict, inner: dict) -> str:
+    return str(envelope.get("status") or inner.get("status") or "active").strip().lower() or "active"
+
+
+def _memory_readside_is_sensitive(envelope: dict, inner: dict) -> bool:
+    for key in ("is_sensitive", "sensitivity_class", "sensitive_scope"):
+        value = inner.get(key)
+        if value:
+            return True if key != "is_sensitive" else bool(value)
+    for key in ("is_sensitive", "sensitivity_class"):
+        value = envelope.get(key)
+        if value:
+            return True if key != "is_sensitive" else bool(value)
+    return False
+
+
+def _build_memory_index_item(envelope: dict, inner: dict) -> dict:
+    return {
+        "id": envelope.get("id", ""),
+        "summary": _memory_readside_summary(inner),
+        "bucket_refs": _memory_readside_bucket_refs(inner),
+        "status": _memory_readside_status(envelope, inner),
+        "salience": _memory_readside_salience(envelope, inner),
+        "is_open_thread": bool(envelope.get("is_open_thread") or inner.get("is_open_thread")),
+        "is_sensitive": _memory_readside_is_sensitive(envelope, inner),
+        "score": float(envelope.get("score") or 0),
+    }
+
+
+def _build_memory_fetch_item(envelope: dict, inner: dict) -> dict:
+    verbatim = _memory_readside_text(inner.get("verbatim") or inner.get("her_quote"), 2000)
+    return {
+        "id": envelope.get("id", ""),
+        "summary": _memory_readside_summary(inner),
+        "verbatim": verbatim,
+        "bucket_refs": _memory_readside_bucket_refs(inner),
+        "status": _memory_readside_status(envelope, inner),
+        "salience": _memory_readside_salience(envelope, inner),
+        "follow_up": _memory_readside_text(inner.get("follow_up"), 1000),
+        "context": _memory_readside_text(inner.get("context"), 1000),
+        "source_type": _memory_readside_text(inner.get("source_type") or envelope.get("source"), 160),
+        "is_sensitive": _memory_readside_is_sensitive(envelope, inner),
+    }
+
+
+def _memory_readside_auth_context() -> tuple[str | None, str | None, object | None, tuple[dict, int] | None]:
+    if not _state["ready"]:
+        return None, None, None, ({"error": "not_ready", "detail": _state["error"]}, 503)
+    api_key = _extract_api_key()
+    if not api_key:
+        return None, None, None, ({"error": "missing api_key"}, 401)
+    try:
+        whoami = _whoami_cached(api_key)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            return None, None, None, ({"error": "unauthorized"}, 401)
+        return None, None, None, ({"error": f"backend_error: {e}"}, 502)
+    except httpx.HTTPError as e:
+        return None, None, None, ({"error": f"backend_unreachable: {e}"}, 502)
+    authorized_user_id = whoami.get("user_id", "")
+    if not authorized_user_id:
+        return None, None, None, ({"error": "cannot resolve user_id"}, 401)
+    try:
+        content_sk = _get_or_derive_content_sk()
+    except Exception as e:
+        return None, None, None, ({"error": f"key_derivation_unavailable: {e}"}, 503)
+    return api_key, authorized_user_id, content_sk, None
+
+
+def _memory_readside_decrypt_items(
+    moments: list,
+    authorized_user_id: str,
+    content_sk,
+    *,
+    item_builder,
+) -> tuple[list[dict], list[str]]:
+    items: list[dict] = []
+    unavailable_ids: list[str] = []
+    for moment in moments:
+        if not isinstance(moment, dict):
+            continue
+        memory_id = str(moment.get("id") or "")
+        if moment.get("visibility") == "local_only" or not moment.get("K_enclave"):
+            if memory_id:
+                unavailable_ids.append(memory_id)
+            continue
+        try:
+            plaintext = _decrypt_envelope(moment, authorized_user_id, content_sk)
+            inner = json.loads(plaintext.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("memory plaintext is not an object")
+        except (DecryptFailure, json.JSONDecodeError, ValueError):
+            if memory_id:
+                unavailable_ids.append(memory_id)
+            continue
+        items.append(item_builder(moment, inner))
+    return items, unavailable_ids
+
+
+@app.route("/v1/memory/index", methods=["POST"])
+def v1_memory_index():
+    _api_key, authorized_user_id, content_sk, error = _memory_readside_auth_context()
+    if error is not None:
+        body, status = error
+        return jsonify(body), status
+    payload = request.get_json(silent=True) or {}
+    moments = payload.get("moments")
+    if not isinstance(moments, list):
+        return jsonify({"error": "moments must be a list"}), 400
+    items, unavailable_ids = _memory_readside_decrypt_items(
+        moments[:50],
+        authorized_user_id or "",
+        content_sk,
+        item_builder=_build_memory_index_item,
+    )
+    return jsonify({
+        "user_id": authorized_user_id,
+        "items": items,
+        "unavailable_ids": unavailable_ids,
+    })
+
+
+@app.route("/v1/memory/fetch", methods=["POST"])
+def v1_memory_fetch():
+    _api_key, authorized_user_id, content_sk, error = _memory_readside_auth_context()
+    if error is not None:
+        body, status = error
+        return jsonify(body), status
+    payload = request.get_json(silent=True) or {}
+    moments = payload.get("moments")
+    if not isinstance(moments, list):
+        return jsonify({"error": "moments must be a list"}), 400
+    items, unavailable_ids = _memory_readside_decrypt_items(
+        moments[:50],
+        authorized_user_id or "",
+        content_sk,
+        item_builder=_build_memory_fetch_item,
+    )
+    return jsonify({
+        "user_id": authorized_user_id,
+        "items": items,
+        "unavailable_ids": unavailable_ids,
+    })
 
 
 @app.route("/v1/chat/history", methods=["GET"])
@@ -886,7 +1236,16 @@ def v1_chat_history():
         if not context_mode and str(request.args.get("context_strict") or "").lower() in {"1", "true", "yes", "on"}:
             context_mode = "strict"
         want_trace = str(request.args.get("context_trace") or "").lower() in {"1", "true", "yes", "on"}
-        if want_trace:
+        use_readside = context_mode == "model_api" and _memory_readside_for_model_api_enabled()
+        if use_readside:
+            context_memories, context_memory_trace = _select_context_memories_via_readside(
+                moments,
+                latest_user_text,
+                cap=8,
+            )
+            if not want_trace:
+                context_memory_trace = None
+        elif want_trace:
             context_memories, context_memory_trace = select_context_memories_with_trace(
                 moments,
                 latest_user_text,
@@ -1295,12 +1654,11 @@ def v1_frame_image(frame_id):
 
 
 def _get_or_derive_content_sk() -> nacl.public.PrivateKey:
-    """Return the enclave's content X25519 private key, deriving if needed.
+    """Return the process-lifetime content X25519 private key.
 
-    bootstrap() stashes only the pubkey hex in _state — we derive on first
-    use and cache in a module-level slot. This keeps the key's exposure
-    surface minimal (one process-lifetime reference), not that there's
-    anywhere for it to leak from inside the enclave anyway.
+    bootstrap() derives this once and stores it in memory. The fallback derive
+    path is kept for defensive compatibility, but normal request handling
+    should not make a fresh dstack KMS round-trip.
     """
     global _cached_content_sk
     if _cached_content_sk is not None:
@@ -1311,8 +1669,8 @@ def _get_or_derive_content_sk() -> nacl.public.PrivateKey:
     with _content_sk_lock:
         if _cached_content_sk is not None:
             return _cached_content_sk
-        dstack = DstackClient()
-        keys = derive_keys(dstack)
+        dev_seed = os.environ.get("FEEDLING_DEV_DSTACK_SEED", "").strip()
+        keys = derive_keys_from_dev_seed() if dev_seed else derive_keys(DstackClient())
         _cached_content_sk = keys["content_sk"]
     return _cached_content_sk
 

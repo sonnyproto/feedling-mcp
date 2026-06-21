@@ -23,6 +23,205 @@ from memory import service as memory_service
 
 bp = Blueprint("memory", __name__)
 
+
+_MEMORY_READSIDE_LIMIT = 50
+_MEMORY_READSIDE_SALIENCE_WEIGHT = {
+    "critical": 4,
+    "high": 3,
+    "medium": 2,
+    "low": 1,
+}
+_MEMORY_READSIDE_INACTIVE_STATUSES = {
+    "archived",
+    "deleted",
+    "superseded",
+}
+
+
+def _memory_readside_status(moment: dict) -> str:
+    return str(moment.get("status") or "active").strip().lower() or "active"
+
+
+def _memory_readside_salience(moment: dict) -> str:
+    salience = str(moment.get("salience") or "medium").strip().lower()
+    return salience if salience in _MEMORY_READSIDE_SALIENCE_WEIGHT else "medium"
+
+
+def _memory_readside_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _memory_readside_time_key(moment: dict) -> str:
+    for key in ("last_active", "updated_at", "occurred_at", "created_at"):
+        value = str(moment.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _memory_readside_available(
+    moment: dict,
+    owner_user_id: str,
+    *,
+    include_archived: bool = False,
+    include_superseded: bool = False,
+) -> bool:
+    if not isinstance(moment, dict):
+        return False
+    if moment.get("owner_user_id") != owner_user_id:
+        return False
+    if moment.get("visibility") == "local_only":
+        return False
+    if not moment.get("K_enclave"):
+        return False
+    status = _memory_readside_status(moment)
+    if status == "superseded" and not include_superseded:
+        return False
+    if status in {"archived", "deleted"} and not include_archived:
+        return False
+    if status in _MEMORY_READSIDE_INACTIVE_STATUSES and status not in {"archived", "superseded"}:
+        return False
+    if memory_service._memory_is_archived(moment) and not include_archived:
+        return False
+    return True
+
+
+def _memory_readside_score(moment: dict) -> float:
+    salience_score = _MEMORY_READSIDE_SALIENCE_WEIGHT.get(_memory_readside_salience(moment), 2)
+    importance = _memory_readside_float(moment.get("importance"), 0.5)
+    open_bonus = 1.0 if moment.get("is_open_thread") is True else 0.0
+    return round(open_bonus + salience_score + importance, 4)
+
+
+def _memory_readside_candidates(moments: list, owner_user_id: str, *, limit: int = _MEMORY_READSIDE_LIMIT) -> list[dict]:
+    candidates = [
+        dict(moment, score=_memory_readside_score(moment))
+        for moment in moments
+        if _memory_readside_available(moment, owner_user_id)
+    ]
+    candidates.sort(
+        key=lambda m: (
+            1 if m.get("is_open_thread") is True else 0,
+            _MEMORY_READSIDE_SALIENCE_WEIGHT.get(_memory_readside_salience(m), 2),
+            _memory_readside_float(m.get("importance"), 0.5),
+            _memory_readside_time_key(m),
+            str(m.get("id") or ""),
+        ),
+        reverse=True,
+    )
+    return candidates[: max(0, min(int(limit or _MEMORY_READSIDE_LIMIT), _MEMORY_READSIDE_LIMIT))]
+
+
+def _memory_readside_post_enclave(
+    api_key: str | None,
+    candidates: list[dict],
+    *,
+    operation: str,
+    payload: dict | None = None,
+) -> dict:
+    enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
+    if not enclave_url:
+        raise RuntimeError("enclave_unavailable")
+    if not api_key:
+        raise RuntimeError("api_key_unavailable")
+    body = dict(payload or {})
+    body["moments"] = candidates
+    try:
+        with httpx.Client(timeout=20, verify=False) as client:
+            resp = client.post(
+                f"{enclave_url}/v1/memory/{operation}",
+                headers={"X-API-Key": api_key},
+                json=body,
+            )
+    except httpx.HTTPError as e:
+        raise RuntimeError(f"enclave_error:{type(e).__name__}") from e
+    if resp.status_code >= 400:
+        raise RuntimeError(f"enclave_http_{resp.status_code}:{resp.text[:180]}")
+    response = resp.json()
+    if not isinstance(response, dict):
+        raise RuntimeError("enclave_invalid_readside_response")
+    return response
+
+
+@bp.route("/v1/memory/index", methods=["POST"])
+def memory_index():
+    store = auth.require_user()
+    api_key = auth._extract_api_key()
+    payload = request.get_json(silent=True) or {}
+    try:
+        requested_limit = int(payload.get("limit") or _MEMORY_READSIDE_LIMIT)
+    except (TypeError, ValueError):
+        return jsonify({"error": "invalid limit"}), 400
+    limit = max(1, min(requested_limit, _MEMORY_READSIDE_LIMIT))
+    candidates = _memory_readside_candidates(memory_service._load_moments(store), store.user_id, limit=limit)
+    try:
+        response = _memory_readside_post_enclave(
+            api_key,
+            candidates,
+            operation="index",
+            payload={"include_sensitive": bool(payload.get("include_sensitive", True))},
+        )
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 503
+    items = response.get("items") if isinstance(response.get("items"), list) else []
+    return jsonify({"items": items})
+
+
+@bp.route("/v1/memory/fetch", methods=["POST"])
+def memory_fetch():
+    store = auth.require_user()
+    api_key = auth._extract_api_key()
+    payload = request.get_json(silent=True) or {}
+    ids = payload.get("ids")
+    if not isinstance(ids, list) or any(not isinstance(mid, str) or not mid.strip() for mid in ids):
+        return jsonify({"error": "ids must be a list of non-empty strings"}), 400
+    ids = [mid.strip() for mid in ids[:_MEMORY_READSIDE_LIMIT]]
+    include_archived = str(payload.get("include_archived") or "").lower() in {"1", "true", "yes", "on"}
+    include_superseded = str(payload.get("include_superseded") or "").lower() in {"1", "true", "yes", "on"}
+    by_id = {m.get("id"): m for m in memory_service._load_moments(store) if isinstance(m, dict)}
+    missing_ids: list[str] = []
+    unavailable_ids: list[str] = []
+    candidates: list[dict] = []
+    for memory_id in ids:
+        moment = by_id.get(memory_id)
+        if not isinstance(moment, dict) or moment.get("owner_user_id") != store.user_id:
+            missing_ids.append(memory_id)
+            continue
+        if not _memory_readside_available(
+            moment,
+            store.user_id,
+            include_archived=include_archived,
+            include_superseded=include_superseded,
+        ):
+            unavailable_ids.append(memory_id)
+            continue
+        candidates.append(moment)
+    try:
+        response = _memory_readside_post_enclave(
+            api_key,
+            candidates,
+            operation="fetch",
+            payload={"ids": [m.get("id") for m in candidates]},
+        )
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 503
+    enclave_unavailable = response.get("unavailable_ids") if isinstance(response.get("unavailable_ids"), list) else []
+    unavailable_ids.extend(str(mid) for mid in enclave_unavailable if isinstance(mid, str))
+    items_by_id = {
+        item.get("id"): item
+        for item in (response.get("items") if isinstance(response.get("items"), list) else [])
+        if isinstance(item, dict)
+    }
+    return jsonify({
+        "items": [items_by_id[mid] for mid in ids if mid in items_by_id],
+        "missing_ids": missing_ids,
+        "unavailable_ids": unavailable_ids,
+    })
+
+
 @bp.route("/v1/memory/actions", methods=["POST"])
 def memory_actions():
     store = auth.require_user()
