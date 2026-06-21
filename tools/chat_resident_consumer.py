@@ -206,6 +206,8 @@ CHECKPOINT_FILE = Path(
 )
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 RESIDENT_WAKE_RUNTIME_V2_FLAG = "resident_wake_runtime_v2_enabled"
+RESIDENT_CHAT_RUNTIME_V2_FLAG = "resident_chat_runtime_v2_enabled"
+FOREGROUND_CHAT_TOOL_BUDGET_MODE_V2 = "foreground_chat_fast"
 PROACTIVE_POLL_ENABLED = _env_bool("PROACTIVE_POLL_ENABLED", True)
 PROACTIVE_POLL_TIMEOUT = int(os.environ.get("PROACTIVE_POLL_TIMEOUT", "1"))
 PROACTIVE_TICK_ENABLED = _env_bool("PROACTIVE_TICK_ENABLED", True)
@@ -1925,17 +1927,20 @@ def call_agent(
 # V2 proactive tool loop (D11) — resident HTTP call_tool + loop entrypoint
 # ---------------------------------------------------------------------------
 
-def _resident_call_tool_v2(name: str, args: Any) -> dict:
+def _resident_call_tool_v2(name: str, args: Any, *, budget_mode: str = "") -> dict:
     """POST to /v1/proactive/tool/execute and return the normalised result dict.
 
     Note: a network-level exception (not an HTTP status, e.g. connection refused)
     propagates out of this function and is caught by _process_proactive_jobs's
     try/except, marking the job failed — this is intentional fail-closed behaviour.
     """
+    body = {"name": name, "args": dict(args or {})}
+    if budget_mode:
+        body["budget_mode"] = budget_mode
     resp = httpx.post(
         f"{FEEDLING_API_URL}/v1/proactive/tool/execute",
         headers=_HEADERS,
-        json={"name": name, "args": dict(args or {})},
+        json=body,
         timeout=60,
     )
     if resp.status_code >= 400:
@@ -1950,7 +1955,7 @@ def _resident_call_tool_v2(name: str, args: Any) -> dict:
     return resp.json()
 
 
-def _resident_run_agent_v2(message: str) -> Any:
+def _resident_run_agent_v2(message: str, *, foreground_chat: bool = False) -> Any:
     """Run the multi-turn V2 tool loop for a proactive resident turn.
 
     The external agent is called via call_agent (CLI or HTTP, no images for V2
@@ -1974,7 +1979,70 @@ def _resident_run_agent_v2(message: str) -> Any:
         )
         return call_agent(text)
 
-    return run_tool_loop_v2(call_model, _resident_call_tool_v2, base_messages, max_iters=4)
+    def call_tool(name: str, args: Any) -> dict:
+        if not foreground_chat:
+            return _resident_call_tool_v2(name, args)
+        return _resident_call_tool_v2(
+            name,
+            args,
+            budget_mode=FOREGROUND_CHAT_TOOL_BUDGET_MODE_V2,
+        )
+
+    return run_tool_loop_v2(call_model, call_tool, base_messages, max_iters=4)
+
+
+def _resident_foreground_chat_message_v2(content: str) -> str:
+    tools = json.dumps(
+        [
+            tool for tool in tool_catalog_v2_for_runtime("resident").context_tools()
+            if tool.get("group") in {"perception", "screen", "memory"}
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return (
+        "Feedling foreground chat Runtime V2.\n"
+        "The user is waiting, so call only fast tools inline. If a slow tool is needed, return/tool-trigger "
+        "needs_background and do not block or invent the result. Use tool_calls JSON to gather data, then finish "
+        "with messages/actions and no tool_calls. This is a foreground user message, not a proactive wake; do not "
+        "assume a change_digest.\n\n"
+        f"Available tools JSON:\n{tools}\n\n"
+        f"User message:\n{content}"
+    )
+
+
+def _needs_background_request_from_actions(actions: list[dict]) -> dict:
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        typ = _proactive_action_type(action).removeprefix("proactive.")
+        if typ == "needs_background":
+            request = action.get("request")
+            return dict(request) if isinstance(request, dict) else {}
+    return {}
+
+
+def _queue_resident_background_request_v2(request_doc: dict, *, source_message_id: str = "") -> dict:
+    if not request_doc:
+        return {}
+    try:
+        resp = httpx.post(
+            f"{FEEDLING_API_URL}/v1/proactive/background/queue",
+            headers=_HEADERS,
+            json={
+                "source": "resident_foreground_chat",
+                "request": dict(request_doc),
+                "origin_refs": [f"chat:{source_message_id}"] if source_message_id else [],
+                "turn_id": f"resident_chat:{source_message_id}" if source_message_id else "",
+            },
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            return {"status": "failed", "error": f"http_{resp.status_code}"}
+        return resp.json() if isinstance(resp.json(), dict) else {"status": "queued"}
+    except Exception as e:
+        log.warning("resident foreground background queue failed: %s", e)
+        return {"status": "failed", "error": type(e).__name__}
 
 
 # ---------------------------------------------------------------------------
@@ -2060,6 +2128,12 @@ def _identity_action_success_reply(source_message: str) -> str:
         return "改好了。"
     return "Done. I updated my identity."
 
+
+def _foreground_background_ack(source_message: str) -> str:
+    if re.search(r"[\u4e00-\u9fff]", source_message or ""):
+        return "我看一下，查完再告诉你。"
+    return "I’ll check that and get back to you."
+
 # Message dedup — rolling window prevents reprocessing the same message on
 # restart with a stale checkpoint or if poll races with checkpoint save.
 _seen_ids: set[str] = set()
@@ -2068,6 +2142,7 @@ _SEEN_MAX = 500
 
 # Persisted agent conversation session id (for CLI agents like Hermes), keyed by user_id.
 _agent_session_id_cache: dict[str, str] = {}
+_chat_runtime_v2_profile: dict[str, Any] = {}
 
 
 def _load_whoami() -> bool:
@@ -2140,7 +2215,22 @@ def poll_chat(since: float) -> dict:
     params = {"since": since, "timeout": POLL_TIMEOUT}
     resp = httpx.get(url, params=params, headers=_HEADERS, timeout=POLL_TIMEOUT + 10)
     resp.raise_for_status()
-    return resp.json()
+    body = resp.json()
+    if isinstance(body, dict):
+        _update_chat_runtime_v2_profile(body.get("runtime_v2"))
+    return body
+
+
+def _update_chat_runtime_v2_profile(profile: Any) -> None:
+    global _chat_runtime_v2_profile
+    _chat_runtime_v2_profile = dict(profile) if isinstance(profile, dict) else {}
+
+
+def _resident_chat_runtime_v2_enabled() -> bool:
+    try:
+        return bool(_chat_runtime_v2_profile.get(RESIDENT_CHAT_RUNTIME_V2_FLAG))
+    except Exception:
+        return False
 
 
 def poll_proactive_jobs(since: float) -> dict:
@@ -3241,8 +3331,14 @@ def _process_messages(messages: list) -> float:
                 len(screen_payloads),
             )
 
+        use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
         try:
-            if image_payloads or image_paths:
+            if use_runtime_v2:
+                agent_result = _resident_run_agent_v2(
+                    _resident_foreground_chat_message_v2(content),
+                    foreground_chat=True,
+                )
+            elif image_payloads or image_paths:
                 agent_result = call_agent(
                     content,
                     images=image_payloads,
@@ -3273,6 +3369,19 @@ def _process_messages(messages: list) -> float:
 
         turn = _split_agent_turn(agent_result)
         actions, replies = turn.actions, turn.messages
+        background_request = _needs_background_request_from_actions(actions) if use_runtime_v2 else {}
+        if background_request:
+            reply_to_message_id = str(msg.get("id") or msg.get("message_id") or "").strip()
+            queue_result = _queue_resident_background_request_v2(
+                background_request,
+                source_message_id=reply_to_message_id,
+            )
+            log.info("resident foreground background queued: %s", queue_result)
+            replies = replies or [_foreground_background_ack(content)]
+            actions = [
+                action for action in actions
+                if _proactive_action_type(action).removeprefix("proactive.") != "needs_background"
+            ]
         if actions:
             try:
                 action_result = execute_agent_actions(actions)

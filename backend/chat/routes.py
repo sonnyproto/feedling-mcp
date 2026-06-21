@@ -302,6 +302,8 @@ def chat_response():
 def chat_poll():
     store = auth.require_user()
     chat_consumer._record_consumer_event(store, "poll")
+    from proactive import resident_runtime_v2  # lazy: chat poll should not own proactive startup
+    runtime_profile = resident_runtime_v2.resident_runtime_v2_public_profile(store)
     try:
         since = float(request.args.get("since", 0))
     except (TypeError, ValueError):
@@ -317,7 +319,13 @@ def chat_poll():
         claim=claim,
     )
     if pending:
-        return jsonify({"messages": pending, "timed_out": False, "consumer_id": consumer_id, "claimed": claim})
+        return jsonify({
+            "messages": pending,
+            "runtime_v2": runtime_profile,
+            "timed_out": False,
+            "consumer_id": consumer_id,
+            "claimed": claim,
+        })
 
     ev = threading.Event()
     with store.chat_waiters_lock:
@@ -338,6 +346,17 @@ def chat_poll():
             consumer_id=consumer_id,
             claim=claim,
         )
-        return jsonify({"messages": pending, "timed_out": False, "consumer_id": consumer_id, "claimed": claim})
-    return jsonify({"messages": [], "timed_out": True, "consumer_id": consumer_id, "claimed": claim})
-
+        return jsonify({
+            "messages": pending,
+            "runtime_v2": runtime_profile,
+            "timed_out": False,
+            "consumer_id": consumer_id,
+            "claimed": claim,
+        })
+    return jsonify({
+        "messages": [],
+        "runtime_v2": runtime_profile,
+        "timed_out": True,
+        "consumer_id": consumer_id,
+        "claimed": claim,
+    })

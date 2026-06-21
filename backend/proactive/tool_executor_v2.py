@@ -126,6 +126,8 @@ class ToolRuntimeAdaptersV2:
     perception_pull_snapshot: Callable[[str], Mapping[str, Any]] | None = None
     photos_recent: Callable[[str, int], Mapping[str, Any]] | None = None
     memory_load: Callable[[str], Sequence[Mapping[str, Any]]] | None = None
+    memory_index: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None
+    memory_fetch: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None
     send_message: Callable[[str, str, Mapping[str, Any]], Mapping[str, Any]] | None = None
     screen_read: Callable[[str, str | None, str], Mapping[str, Any]] | None = None
     screen_recent: Callable[[str, int], Mapping[str, Any]] | None = None
@@ -182,10 +184,21 @@ def combined_runtime_adapters_v2(api_key: str, store) -> ToolRuntimeAdaptersV2:
     """Default perception/memory adapters + screen adapters bound to this turn's
     api_key/store, so the executor can reach every implemented tool."""
     import dataclasses
+    import memory_readside_core
+
     base = default_tool_runtime_adapters_v2()
     screen = screen_runtime_adapters_v2(api_key, store)
+
+    def memory_index(user_id: str, args: Mapping[str, Any]) -> Mapping[str, Any]:
+        return memory_readside_core.memory_index_core(store, api_key, dict(args or {}))
+
+    def memory_fetch(user_id: str, args: Mapping[str, Any]) -> Mapping[str, Any]:
+        return memory_readside_core.memory_fetch_core(store, api_key, dict(args or {}))
+
     return dataclasses.replace(base, screen_read=screen.screen_read,
-                               screen_recent=screen.screen_recent)
+                               screen_recent=screen.screen_recent,
+                               memory_index=memory_index,
+                               memory_fetch=memory_fetch)
 
 
 class ToolExecutorV2:
@@ -302,8 +315,10 @@ class ToolExecutorV2:
             return ("perception_snapshot_adapter_missing", "perception snapshot adapter is not configured")
         if call.name == "perception.photo_recent" and not self.adapters.photos_recent:
             return ("photo_recent_adapter_missing", "photo recent adapter is not configured")
-        if call.name in {"memory.index", "memory.fetch"} and not self.adapters.memory_load:
-            return ("memory_adapter_missing", "memory adapter is not configured")
+        if call.name == "memory.index" and not (self.adapters.memory_index or self.adapters.memory_load):
+            return ("memory_adapter_missing", "memory.index adapter is not configured")
+        if call.name == "memory.fetch" and not (self.adapters.memory_fetch or self.adapters.memory_load):
+            return ("memory_adapter_missing", "memory.fetch adapter is not configured")
         if call.name == "memory.fetch" and not _string_list(args.get("ids") or args.get("id")):
             return ("memory_ids_required", "memory.fetch requires one or more ids")
         if call.name == "send_message":
@@ -389,9 +404,13 @@ class ToolExecutorV2:
             assert self.adapters.photos_recent is not None
             return dict(self.adapters.photos_recent(call.user_id, limit))
         if call.name == "memory.index":
+            if self.adapters.memory_index:
+                return _normalize_memory_tool_result(self.adapters.memory_index(call.user_id, args))
             return {"memories": [_memory_index_item(memory) for memory in self._memories(call.user_id)]}
         if call.name == "memory.fetch":
             ids = _string_list(args.get("ids") or args.get("id"))
+            if self.adapters.memory_fetch:
+                return _normalize_memory_tool_result(self.adapters.memory_fetch(call.user_id, args))
             by_id = {str(memory.get("id") or ""): dict(memory) for memory in self._memories(call.user_id)}
             return {"memories": [by_id[item] for item in ids if item in by_id], "missing_ids": [item for item in ids if item not in by_id]}
         if call.name == "send_message":
@@ -499,3 +518,10 @@ def _memory_index_item(memory: Mapping[str, Any]) -> dict[str, Any]:
         "updated_at": str(memory.get("updated_at") or ""),
         "is_archived": bool(memory.get("is_archived")),
     }
+
+
+def _normalize_memory_tool_result(result: Mapping[str, Any]) -> dict[str, Any]:
+    out = dict(result or {})
+    if "memories" not in out and isinstance(out.get("items"), list):
+        out["memories"] = list(out.get("items") or [])
+    return out

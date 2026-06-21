@@ -138,6 +138,64 @@ def test_process_messages_posts_reply_with_source_message_id():
     assert mock_post.call_args.kwargs["reply_to_message_id"] == "user-msg-1"
 
 
+def test_process_messages_uses_resident_v2_tool_loop_when_chat_flag_on(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    crc._update_chat_runtime_v2_profile({crc.RESIDENT_CHAT_RUNTIME_V2_FLAG: True})
+    msg = {"id": "user-msg-v2", "role": "user", "content": "天气怎么样？", "ts": 1112.0}
+    captured = {}
+
+    def fake_run(message, *, foreground_chat=False):
+        captured["message"] = message
+        captured["foreground_chat"] = foreground_chat
+        return {"messages": ["外面下雨。"]}
+
+    try:
+        with patch.object(crc, "_resident_run_agent_v2", side_effect=fake_run) as mock_v2, \
+             patch.object(crc, "call_agent") as mock_legacy, \
+             patch.object(crc, "post_reply", return_value={"id": "reply-msg-v2"}) as mock_post:
+            result_ts = crc._process_messages([msg])
+    finally:
+        crc._update_chat_runtime_v2_profile({})
+
+    assert result_ts == pytest.approx(1112.0)
+    mock_v2.assert_called_once()
+    mock_legacy.assert_not_called()
+    assert captured["foreground_chat"] is True
+    assert "perception.weather" in captured["message"]
+    assert "User message:\n天气怎么样？" in captured["message"]
+    assert mock_post.call_args.args[0] == "外面下雨。"
+    assert mock_post.call_args.kwargs["reply_to_message_id"] == "user-msg-v2"
+
+
+def test_process_messages_v2_needs_background_acks_and_queues(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    crc._update_chat_runtime_v2_profile({crc.RESIDENT_CHAT_RUNTIME_V2_FLAG: True})
+    msg = {"id": "user-msg-bg", "role": "user", "content": "今天多少步？", "ts": 1113.0}
+    queued = []
+
+    try:
+        with patch.object(
+            crc,
+            "_resident_run_agent_v2",
+            return_value={"actions": [{"type": "needs_background", "request": {"tool": "perception.steps", "args": {}}}], "messages": []},
+        ), patch.object(
+            crc,
+            "_queue_resident_background_request_v2",
+            side_effect=lambda request, source_message_id="": queued.append((request, source_message_id)) or {"status": "queued", "job_id": "bg_1"},
+        ), patch.object(crc, "execute_agent_actions") as mock_actions, \
+             patch.object(crc, "post_reply", return_value={"id": "reply-bg"}) as mock_post:
+            result_ts = crc._process_messages([msg])
+    finally:
+        crc._update_chat_runtime_v2_profile({})
+
+    assert result_ts == pytest.approx(1113.0)
+    assert queued == [({"tool": "perception.steps", "args": {}}, "user-msg-bg")]
+    mock_actions.assert_not_called()
+    assert mock_post.call_args.args[0] == "我看一下，查完再告诉你。"
+
+
 def test_process_messages_keeps_checkpoint_when_post_reply_fails():
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()

@@ -55,3 +55,72 @@ def test_tool_execute_unknown_tool_is_error(monkeypatch):
     assert resp.status_code == 200
     assert body["ok"] is False
     assert body["error_code"] == "unknown_tool"
+
+
+def test_tool_execute_foreground_budget_soft_handoffs_slow_tool(monkeypatch):
+    from proactive import routes as proactive_routes
+    from proactive.tool_executor_v2 import ToolRuntimeAdaptersV2
+
+    class _Store:
+        user_id = "u1"
+        last_seen_api_key = "k"
+
+    called = {"pull": False}
+
+    def pull_snapshot(_user_id):
+        called["pull"] = True
+        return {"step_count_bucket": 6000}
+
+    monkeypatch.setattr(proactive_routes.auth, "require_user", lambda: _Store())
+    monkeypatch.setattr(
+        proactive_routes,
+        "combined_runtime_adapters_v2",
+        lambda api_key, store: ToolRuntimeAdaptersV2(perception_pull_snapshot=pull_snapshot),
+    )
+
+    resp = _client().post(
+        "/v1/proactive/tool/execute",
+        json={"name": "perception.steps", "args": {}, "budget_mode": "foreground_chat_fast"},
+    )
+    body = resp.get_json()
+
+    assert resp.status_code == 200
+    assert body["ok"] is False
+    assert body["needs_background"] is True
+    assert body["outcome"] == "needs_background"
+    assert body["error_code"] == "slow_budget_soft_handoff"
+    assert called["pull"] is False
+
+
+def test_background_queue_creates_v2_background_job(monkeypatch):
+    from proactive import routes as proactive_routes
+    from proactive.store_v2 import BACKGROUND_JOB_STREAM_V2
+
+    class _Store:
+        user_id = "u_background_queue"
+        last_seen_api_key = "k"
+
+    monkeypatch.setattr(proactive_routes.auth, "require_user", lambda: _Store())
+
+    resp = _client().post(
+        "/v1/proactive/background/queue",
+        json={
+            "source": "resident_foreground_chat",
+            "request": {"tool": "perception.steps", "args": {}},
+            "origin_refs": ["chat:msg_1"],
+            "turn_id": "resident_chat:msg_1",
+        },
+    )
+    body = resp.get_json()
+    jobs = app_module.db.log_read("u_background_queue", BACKGROUND_JOB_STREAM_V2, limit=5)
+
+    assert resp.status_code == 200
+    assert body["status"] == "queued"
+    assert body["job_id"].startswith("bg_")
+    assert jobs[-1]["job_id"] == body["job_id"]
+    assert jobs[-1]["request"] == {
+        "source": "resident_foreground_chat",
+        "tool": "perception.steps",
+        "args": {},
+    }
+    assert jobs[-1]["origin_refs"] == ["chat:msg_1"]

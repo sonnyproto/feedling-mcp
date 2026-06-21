@@ -13,6 +13,7 @@ from core.store import UserStore
 
 RESIDENT_RUNTIME_PROFILE_KIND_V2 = "resident_runtime_v2"
 RESIDENT_WAKE_RUNTIME_V2_FLAG = "resident_wake_runtime_v2_enabled"
+RESIDENT_CHAT_RUNTIME_V2_FLAG = "resident_chat_runtime_v2_enabled"
 
 
 def load_resident_runtime_profile_v2(store: UserStore) -> dict[str, Any]:
@@ -27,7 +28,15 @@ def resident_wake_runtime_v2_enabled(store: UserStore) -> bool:
         return False
 
 
+def resident_chat_runtime_v2_enabled(store: UserStore) -> bool:
+    try:
+        return bool(load_resident_runtime_profile_v2(store).get(RESIDENT_CHAT_RUNTIME_V2_FLAG))
+    except Exception:
+        return False
+
+
 def resident_runtime_v2_public_profile(store: UserStore) -> dict[str, Any]:
     return {
         RESIDENT_WAKE_RUNTIME_V2_FLAG: resident_wake_runtime_v2_enabled(store),
+        RESIDENT_CHAT_RUNTIME_V2_FLAG: resident_chat_runtime_v2_enabled(store),
     }
