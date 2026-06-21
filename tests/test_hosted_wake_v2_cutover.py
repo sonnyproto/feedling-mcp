@@ -74,7 +74,7 @@ def _runtime_factory(reply):
         )
         runner = TurnRunnerV2(
             spine,
-            run_agent=wake_consumer._hosted_wake_v2_run_agent(runtime),
+            run_agent=wake_consumer._hosted_wake_v2_run_agent(runtime, _store, _api_key),
         )
         return spine, runner
 
@@ -298,3 +298,25 @@ def test_scheduled_transparency_compat_job_round_trips_as_background_result():
     assert converted.source == "background_result"
     assert converted.trigger == "background_result"
     assert converted.background_payload["reason"] == "scheduled_disabled"
+
+
+def test_hosted_run_agent_executes_tool_loop(monkeypatch):
+    import hosted.wake_consumer as wc
+    from proactive.tool_executor_v2 import ToolRuntimeAdaptersV2
+    scripted = ['{"tool_calls": [{"name": "screen.read", "args": {"mode": "caption"}}]}',
+                '{"messages": ["Saw your inbox."]}']
+    fed_back = []
+    def fake_chat(runtime, messages, **kw):
+        fed_back.append(messages[-1]["content"])
+        return {"reply": scripted.pop(0)}
+    monkeypatch.setattr(wc.provider_client, "chat_completion", fake_chat)
+    monkeypatch.setattr(wc, "combined_runtime_adapters_v2",
+        lambda api_key, store: ToolRuntimeAdaptersV2(
+            screen_read=lambda uid, fid, mode: {"frame_id": "f1", "caption": "Inbox", "mode": mode}))
+    class _Store:
+        user_id = "u1"
+    run = wc._hosted_wake_v2_run_agent(object(), _Store(), "api-key")
+    import json
+    final = run({"trigger": "user_message", "tools": []})
+    assert json.loads(final)["messages"] == ["Saw your inbox."]
+    assert any("Inbox" in m for m in fed_back)

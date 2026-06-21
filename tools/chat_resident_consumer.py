@@ -110,6 +110,7 @@ from proactive.adapters_v2 import wake_event_v2_from_legacy_job
 from proactive.agent_protocol_v2 import build_agent_context_v2
 from proactive.runtime_v2 import merge_wakes_v2
 from proactive.tool_catalog_v2 import tool_catalog_v2_for_runtime
+from proactive.tool_loop_v2 import run_tool_loop_v2
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -143,6 +144,7 @@ class AgentTurn:
     thinking_native: bool | None = None
     actions: list[dict] = field(default_factory=list)
     runtime_debug: dict = field(default_factory=dict)
+    tool_calls: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -1099,6 +1101,7 @@ def _default_thinking_kind_for_key(key: str) -> str:
 def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
     dst.actions.extend(src.actions)
     dst.messages.extend(src.messages)
+    dst.tool_calls.extend(src.tool_calls)
     if not dst.thinking_summary and src.thinking_summary:
         dst.thinking_summary = src.thinking_summary
         dst.thinking_kind = src.thinking_kind
@@ -1120,7 +1123,7 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         if json_objects:
             for item in json_objects:
                 _merge_agent_turn(turn, _agent_turn_from_obj(item))
-            if turn.messages or turn.actions or turn.thinking_summary:
+            if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
                 return turn
         nested = _safe_json_loads(raw) if _looks_like_json_text(raw) else None
         if isinstance(nested, (dict, list)):
@@ -1155,6 +1158,17 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
     raw_actions = obj.get("actions")
     if isinstance(raw_actions, list):
         turn.actions.extend([a for a in raw_actions if isinstance(a, dict)])
+
+    raw_tool_calls = obj.get("tool_calls")
+    if isinstance(raw_tool_calls, list):
+        for tc in raw_tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            name = str(tc.get("name") or "").strip()
+            if not name:
+                continue
+            args = dict(tc["args"]) if isinstance(tc.get("args"), dict) else {}
+            turn.tool_calls.append({"name": name, "args": args})
 
     explicit_kind = _sanitize_thinking_kind(obj.get("thinking_kind") or obj.get("reasoning_kind"))
     explicit_source = _sanitize_thinking_meta(
@@ -1243,6 +1257,20 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         seen.add(key)
         unique.append(key)
     turn.messages = unique
+
+    # De-dupe tool_calls too: one emission can arrive via multiple nested paths
+    # (e.g. an OpenAI choice.message handled by both the reply-field loop and
+    # the explicit message path), and the tool loop would otherwise execute the
+    # same call twice.
+    seen_tc: set = set()
+    unique_tc: list[dict] = []
+    for tc in turn.tool_calls:
+        tc_key = (tc.get("name"), json.dumps(tc.get("args") or {}, sort_keys=True))
+        if tc_key in seen_tc:
+            continue
+        seen_tc.add(tc_key)
+        unique_tc.append(tc)
+    turn.tool_calls = unique_tc
     return turn
 
 
@@ -1369,7 +1397,7 @@ def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = 
     body = resp.json()
     if isinstance(body, dict):
         turn = _agent_turn_from_raw(body)
-        if turn.actions or turn.thinking_summary or len(turn.messages) > 1:
+        if turn.actions or turn.thinking_summary or turn.tool_calls or len(turn.messages) > 1:
             return body
         if turn.messages:
             return turn.messages[0]
@@ -1409,11 +1437,11 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
     if not isinstance(body, dict):
         raise ValueError(f"unexpected OpenAI response type: {type(body)}")
     turn = _agent_turn_from_raw(body)
-    if not turn.messages:
-        raise ValueError("OpenAI-compatible response has no usable reply text")
-    if turn.actions or turn.thinking_summary or len(turn.messages) > 1:
+    if turn.actions or turn.thinking_summary or turn.tool_calls or len(turn.messages) > 1:
         return body
-    return turn.messages[0]
+    if turn.messages:
+        return turn.messages[0]
+    raise ValueError("OpenAI-compatible response has no usable reply text")
 
 
 def call_agent_http(message: str, images: list[dict[str, str]] | None = None) -> Any:
@@ -1759,7 +1787,7 @@ def call_agent_cli(message: str, image_paths: list[str] | None = None) -> Any:
         )
     raw = result.stdout
     turn = _agent_turn_from_raw(raw)
-    if turn.messages or turn.actions or turn.thinking_summary:
+    if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
         return raw
     text = _extract_text_from_cli_output(raw)
     if not text:
@@ -1868,11 +1896,13 @@ def call_agent(
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
     turn = _agent_turn_from_raw(raw)
-    if turn.actions or turn.messages or turn.thinking_summary:
+    if turn.actions or turn.messages or turn.thinking_summary or turn.tool_calls:
         body: dict[str, Any] = {
             "actions": turn.actions,
             "messages": turn.messages,
         }
+        if turn.tool_calls:
+            body["tool_calls"] = turn.tool_calls
         if turn.thinking_summary:
             body["thinking_summary"] = turn.thinking_summary
         if turn.thinking_kind:
@@ -1889,6 +1919,62 @@ def call_agent(
     if SEND_FALLBACK_ON_AGENT_ERROR:
         return [FALLBACK_REPLY]
     raise ValueError("agent produced no usable reply after sanitization")
+
+
+# ---------------------------------------------------------------------------
+# V2 proactive tool loop (D11) — resident HTTP call_tool + loop entrypoint
+# ---------------------------------------------------------------------------
+
+def _resident_call_tool_v2(name: str, args: Any) -> dict:
+    """POST to /v1/proactive/tool/execute and return the normalised result dict.
+
+    Note: a network-level exception (not an HTTP status, e.g. connection refused)
+    propagates out of this function and is caught by _process_proactive_jobs's
+    try/except, marking the job failed — this is intentional fail-closed behaviour.
+    """
+    resp = httpx.post(
+        f"{FEEDLING_API_URL}/v1/proactive/tool/execute",
+        headers=_HEADERS,
+        json={"name": name, "args": dict(args or {})},
+        timeout=60,
+    )
+    if resp.status_code >= 400:
+        return {
+            "name": name,
+            "ok": False,
+            "outcome": "error",
+            "result": {},
+            "error_code": f"http_{resp.status_code}",
+            "needs_background": False,
+        }
+    return resp.json()
+
+
+def _resident_run_agent_v2(message: str) -> Any:
+    """Run the multi-turn V2 tool loop for a proactive resident turn.
+
+    The external agent is called via call_agent (CLI or HTTP, no images for V2
+    jobs).  Tool execution happens via _resident_call_tool_v2 (HTTP bridge to
+    /v1/proactive/tool/execute).  Returns the terminal reply from call_agent
+    (may be a dict in HTTP mode or a str in CLI mode); _split_agent_turn already
+    knows how to parse both.
+    """
+    base_messages: list[dict[str, Any]] = [{"role": "user", "content": message}]
+
+    def call_model(messages: list[dict[str, Any]]) -> Any:
+        # Re-serialise the running transcript as a single text block for the
+        # external agent (CLI / HTTP).  Non-string content (e.g. dict returned
+        # by call_agent in HTTP mode) is serialised as JSON so multi-round
+        # history never arrives as a Python repr like {'tool_calls': [...]}.
+        # V2 jobs never pass images.
+        text = "\n\n".join(
+            m["content"] if isinstance(m["content"], str)
+            else json.dumps(m["content"], ensure_ascii=False)
+            for m in messages
+        )
+        return call_agent(text)
+
+    return run_tool_loop_v2(call_model, _resident_call_tool_v2, base_messages, max_iters=4)
 
 
 # ---------------------------------------------------------------------------
@@ -2767,6 +2853,12 @@ def _message_for_proactive_job_v2(
         ),
         "For visible speech, prefer actions:[{\"type\":\"send_message\",\"text\":\"...\"}] or messages:[\"...\"].",
         "Do not mention this hidden wake, runtime metadata, or system wording to the user.",
+        (
+            "Tool use: you may return {\"tool_calls\":[{\"name\":\"<tool>\",\"args\":{...}}]} to gather "
+            "information from the tools listed in v2_context_json. You will receive results and may call "
+            "more tools (a few rounds). When you have enough information, finish with messages/actions "
+            "and NO tool_calls."
+        ),
         "v2_context_json:\n" + json.dumps(context, ensure_ascii=False, sort_keys=True, indent=2),
     ]
     return "\n\n".join(parts)
@@ -2851,11 +2943,14 @@ def _process_proactive_jobs(jobs: list) -> float:
         try:
             agent_images = [] if use_runtime_v2 else screen_payloads
             agent_image_paths = [] if use_runtime_v2 else screen_paths
-            agent_result = call_agent(
-                message,
-                images=agent_images,
-                image_paths=agent_image_paths,
-            )
+            if use_runtime_v2:
+                agent_result = _resident_run_agent_v2(message)
+            else:
+                agent_result = call_agent(
+                    message,
+                    images=agent_images,
+                    image_paths=agent_image_paths,
+                )
         except Exception as e:
             log.error("proactive agent call failed; not posting fallback: %s", e)
             update_proactive_job_status(job_id, "failed", f"agent_call_failed: {e}")

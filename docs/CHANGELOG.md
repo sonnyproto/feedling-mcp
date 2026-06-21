@@ -49,11 +49,23 @@
 
 ## 2026-06-21
 
+### [DONE] Proactive tool-loop execution (D11: bounded multi-turn for both hosted + resident)
+- **Unified loop shipped**: Both hosted and resident proactive wakes now run `run_tool_loop_v2()` — a bounded multi-turn agent loop that calls the model, parses `tool_calls` JSON, executes tools, and feeds results back (max 4 iterations, capped at `MAX_TOOL_ITERS_V2`). One shared `ToolExecutorV2` instance per run provides budget continuity and unified tool implementations.
+- **Hosted wiring (in-process)**: Proactive runtime injects call-model and call-tool closures into the loop; tools execute immediately in-process.
+- **Resident wiring (HTTP)**: `chat_resident_consumer` wraps the external agent call (`call_agent`, Hermes CLI/HTTP) in `run_tool_loop_v2` for V2 jobs only (legacy single-shot path untouched). Tool calls go to the new endpoint `POST /v1/proactive/tool/execute`, which runs the shared `ToolExecutorV2` server-side (perception/memory/screen tools; only `screen.read` reaches the enclave) and returns `ToolResultV2.as_dict()` (ok, outcome, result, error_code, needs_background, trace).
+- **Budget handoff stops the turn**: when a tool in a turn returns `needs_background`, the loop stops executing that turn's remaining `tool_calls` and defers immediately — avoids wasted inline work (and an HTTP round-trip per call on resident) after the decision to background.
+- **Resident tool-only replies survive normalization**: `tool_calls` are now preserved through the resident agent-output normalizer on every transport — the early-return guards in the string/CLI path (`_agent_turn_from_obj`, `call_agent_cli`) and the OpenAI-HTTP path (`_call_agent_http_openai`) previously only treated messages/actions/thinking as "usable", so a tool-only model reply wrapped in any log/header text was flattened to a plain message and the tool never ran. `tool_calls` are also de-duped (one emission could arrive via multiple nested JSON paths, e.g. an OpenAI `choice.message`), so the loop never double-executes a single call.
+- **Impact**: `screen.read` and all V2 tools now reachable end-to-end for both user types (hosted + resident). Cross-HTTP-call budget accumulation for resident deferred (iteration cap bounds cost per turn).
+- **Changelog + CI**: Added D11 test suite to `.github/workflows/ci.yml` (4 new test files); `tests/test_tool_loop_v2.py` added to pure-unit conftest. No further changes needed.
+- **未做**: Native function-calling; cross-HTTP-call budget accumulation for resident; proactive caption-on-change (tool loop is the foundation, not the feature).
+
+## 2026-06-21
+
 ### [DONE] Screen frame VLM captioning via in-enclave OpenRouter (Tasks 1-6 complete)
 - **Tasks 1-5 shipped**: New enclave route `GET /v1/screen/frames/<id>/caption` decrypts frame IN-ENCLAVE and calls OpenRouter `qwen/qwen3-vl-8b-instruct` via `provider_client`, returning caption text only (never pixels). Backend never holds plaintext pixels. New backend `screen/caption.py` calls that route, caches caption per frame_id. `screen.read`/`screen.recent` tools now implemented in `ToolExecutorV2` for isolated testing.
 - **New per-user flag**: `screen_caption_enabled` (default OFF, fail-closed). Enclave env: `FEEDLING_SCREEN_VLM_API_KEY` (required dstack secret; absent → fail-closed `screen_caption_unconfigured`), optional `FEEDLING_SCREEN_VLM_MODEL` (default `qwen/qwen3-vl-8b-instruct`), `FEEDLING_SCREEN_VLM_BASE_URL` (default OpenRouter). Deployed config documented in `deploy/DEPLOYMENTS.md` § Enclave configuration.
 - **Task 6 (docs-only)**: Updated `deploy/DEPLOYMENTS.md` with VLM secret + optional env overrides, non-code privacy prerequisites (user disclosure + OpenRouter zero-retention config). Added to changelog.
-- **Known limitation**: Model multi-turn tool-execution loop wiring (D11) still pending — `screen.read`/`screen.recent` tools are implemented + tested in isolation but not yet reachable by the live agent. Agent would need the tool-loop harness integration (separate task).
+- **Follow-up (now resolved)**: at the time of this entry the model multi-turn tool-execution loop (D11) was still pending, so these tools were tested in isolation only. D11 landed the same day (see the D11 entry above) — `screen.read`/`screen.recent` are now reachable by the live agent on both hosted and resident paths.
 - **未做（不在本计划范围）**: Proactive frame captioning、per-user API key、on-device VLM、legacy caption deletion。
 
 ## 2026-06-20

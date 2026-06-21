@@ -11,6 +11,9 @@ from core import store as core_store
 from core import util
 from proactive import dashboard, gate, resident_runtime_v2, service
 from proactive.observability_v2 import ROUND3_REVIEW_LABELS_V2
+from proactive.tool_executor_v2 import (
+    ToolExecutorV2, ToolCallV2, combined_runtime_adapters_v2,
+)
 
 bp = Blueprint("proactive", __name__)
 
@@ -462,3 +465,17 @@ def proactive_jobs_poll():
         ]
         return jsonify({"jobs": pending, "runtime_v2": runtime_profile, "timed_out": False})
     return jsonify({"jobs": [], "runtime_v2": runtime_profile, "timed_out": True})
+
+
+@bp.route("/v1/proactive/tool/execute", methods=["POST"])
+def proactive_tool_execute():
+    store = auth.require_user()
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "tool name required"}), 400
+    args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
+    executor = ToolExecutorV2(
+        adapters=combined_runtime_adapters_v2(store.last_seen_api_key, store))
+    result = executor.execute(ToolCallV2(name=name, args=args, user_id=store.user_id))
+    return jsonify(result.as_dict())

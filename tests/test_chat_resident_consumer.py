@@ -1688,3 +1688,226 @@ def test_post_proactive_reply_triggers_alert_and_live_activity(monkeypatch):
         "gate_decision_id": "gd_1",
         "proactive_job_id": "pj_1",
     }
+
+
+# ---------------------------------------------------------------------------
+# Task 5 (D11): resident V2 proactive tool loop
+# ---------------------------------------------------------------------------
+
+def test_resident_proactive_runs_tool_loop(monkeypatch):
+    """_resident_run_agent_v2 should run through the tool loop:
+    turn1 → tool_call(screen.read), turn2 → terminal message.
+    The tool result (caption) must be fed back into the second call.
+    """
+    scripted = [
+        '{"tool_calls": [{"name": "screen.read", "args": {}}]}',
+        '{"messages": ["ok"]}',
+    ]
+    fed_back: list[str] = []
+
+    def fake_call_agent(message, **kw):
+        fed_back.append(message)
+        return scripted.pop(0)
+
+    posted: list[tuple[str, dict]] = []
+
+    def fake_call_tool(name, args):
+        posted.append((name, dict(args or {})))
+        return {
+            "name": name,
+            "ok": True,
+            "outcome": "ok",
+            "result": {"caption": "Inbox"},
+            "error_code": "",
+            "needs_background": False,
+        }
+
+    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
+    monkeypatch.setattr(crc, "_resident_call_tool_v2", fake_call_tool)
+
+    final = crc._resident_run_agent_v2("system+context message")
+
+    assert json.loads(final)["messages"] == ["ok"]
+    assert posted == [("screen.read", {})]
+    assert any("Inbox" in m for m in fed_back), f"caption not fed back; fed_back={fed_back}"
+
+
+def test_resident_proactive_tool_loop_no_python_repr_on_multi_round():
+    """_resident_run_agent_v2 with a dict-returning call_agent (real HTTP mode
+    shape) across TWO tool rounds must never let a Python repr like
+    {'tool_calls': [...]} appear in the transcript text fed to the agent.
+
+    Regression: before Fix 1, str(dict) was used instead of json.dumps, so
+    round-2+ history arrived as Python repr, garbling the agent's context.
+    """
+    # Scripted agent responses — dicts (real HTTP mode shape), not strings.
+    scripted = [
+        {"tool_calls": [{"name": "screen.read", "args": {}}]},
+        {"tool_calls": [{"name": "memory.fetch", "args": {"ids": ["m1"]}}]},
+        {"messages": ["done"]},
+    ]
+    fed_texts: list[str] = []
+
+    def fake_call_agent_dict(message, **kw):
+        fed_texts.append(message)
+        return scripted.pop(0)
+
+    def fake_call_tool_multi(name, args):
+        return {
+            "name": name,
+            "ok": True,
+            "outcome": "ok",
+            "result": {"data": f"result_of_{name}"},
+            "error_code": "",
+            "needs_background": False,
+        }
+
+    import unittest.mock as _mock
+    with _mock.patch.object(crc, "call_agent", fake_call_agent_dict), \
+         _mock.patch.object(crc, "_resident_call_tool_v2", fake_call_tool_multi):
+        final = crc._resident_run_agent_v2("initial prompt")
+
+    # Terminal return must still be the raw dict from call_agent, not a string.
+    assert isinstance(final, dict)
+    assert final.get("messages") == ["done"]
+
+    # At least 3 calls were made (2 tool rounds + 1 terminal).
+    assert len(fed_texts) >= 3, f"expected >=3 calls but got {len(fed_texts)}: {fed_texts}"
+
+    # Round 2 and round 3 texts must NOT contain Python-repr dicts.
+    for round_idx, text in enumerate(fed_texts[1:], start=2):
+        assert "{'tool_calls'" not in text, (
+            f"Round {round_idx} contains Python repr: {text!r}"
+        )
+        assert "{'messages'" not in text, (
+            f"Round {round_idx} contains Python repr: {text!r}"
+        )
+        # The assistant-turn section embedded in the transcript must be
+        # valid JSON (parseable with json.loads) — not Python repr.
+        # Each "\n\n"-separated block is either the user prompt or an
+        # assistant/tool turn; we check that none of the non-initial
+        # blocks that start with '{' are Python repr.
+        sections = text.split("\n\n")
+        for section in sections:
+            stripped = section.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    raise AssertionError(
+                        f"Round {round_idx} section is not valid JSON (likely Python repr): "
+                        f"{stripped!r}"
+                    ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2: tool_calls survives the real call_agent normalizer (masked-bug
+# regression). Monkeypatches ONLY the transport layer (call_agent_http), NOT
+# call_agent itself — so the fix is proven end-to-end through the normalizer.
+# ---------------------------------------------------------------------------
+
+def test_tool_calls_survive_real_call_agent_normalizer(monkeypatch):
+    """Regression for the D11 resident Critical: when the model returns ONLY
+    tool_calls (no messages/actions), call_agent used to raise
+    ValueError('agent produced no usable reply after sanitization') because
+    AgentTurn had no tool_calls field.  This test drives the loop through the
+    REAL call_agent (only call_agent_http is monkeypatched at the transport
+    boundary) to prove that tool_calls now survive the normalizer and reach
+    run_tool_loop_v2.
+    """
+    # Transport layer returns raw dicts: turn 1 = tool-call only, turn 2 = terminal.
+    http_responses = [
+        {"tool_calls": [{"name": "screen.read", "args": {}}]},
+        {"messages": ["done"]},
+    ]
+    http_call_count = []
+
+    def _fake_call_agent_http(message, images=None):
+        body = http_responses[len(http_call_count)]
+        http_call_count.append(1)
+        return body
+
+    tool_calls_seen: list[tuple[str, dict]] = []
+
+    def _fake_call_tool(name, args):
+        tool_calls_seen.append((name, dict(args or {})))
+        return {
+            "name": name,
+            "ok": True,
+            "outcome": "ok",
+            "result": {"caption": "InboxScreen"},
+            "error_code": "",
+            "needs_background": False,
+        }
+
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    # Monkeypatch the transport, NOT call_agent — session management stays real.
+    monkeypatch.setattr(crc, "call_agent_http", _fake_call_agent_http)
+    monkeypatch.setattr(crc, "_resident_call_tool_v2", _fake_call_tool)
+
+    # Drive through the REAL call_agent — not monkeypatched.
+    final = crc._resident_run_agent_v2("test message")
+
+    # The tool must have been executed exactly once with correct name.
+    assert tool_calls_seen == [("screen.read", {})], (
+        f"Expected tool call screen.read but got: {tool_calls_seen}"
+    )
+
+    # The final result must reflect the terminal turn {"messages": ["done"]}.
+    # parse_agent_response_v2 accepts a Mapping, so final (a dict) is fine.
+    from proactive.agent_protocol_v2 import parse_agent_response_v2
+    parsed = parse_agent_response_v2(final)
+    assert "done" in parsed.messages, (
+        f"Terminal message 'done' not found in parsed.messages={parsed.messages}; final={final!r}"
+    )
+
+
+def test_normalizer_keeps_tool_only_json_wrapped_in_log_text():
+    """A tool-only JSON line wrapped in CLI log/header text must NOT be
+    discarded as a plain message — tool_calls must survive normalization."""
+    raw = 'INFO starting agent\n{"tool_calls": [{"name": "screen.read", "args": {}}]}\nINFO done'
+    turn = crc._agent_turn_from_obj(raw)
+    assert [tc["name"] for tc in turn.tool_calls] == ["screen.read"]
+    # The raw JSON line must not also leak through as a junk chat message.
+    assert turn.messages == []
+
+
+def test_cli_tool_only_output_preserves_tool_calls(monkeypatch):
+    """AGENT_MODE=cli: stdout that is a tool-only JSON line surrounded by log
+    text must yield tool_calls (not be flattened into a plain message)."""
+    class _Result:
+        returncode = 0
+        stdout = 'INFO hermes booting\n{"tool_calls": [{"name": "screen.read", "args": {}}]}\n'
+        stderr = ""
+
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["mycli", "ask", message])
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
+
+    result = crc.call_agent_cli("hi")
+    turn = crc._agent_turn_from_raw(result)
+    assert [tc["name"] for tc in turn.tool_calls] == ["screen.read"]
+
+
+def test_openai_http_tool_only_response_preserved(monkeypatch):
+    """AGENT_MODE=http openai protocol: a tool-only model reply must be returned
+    as structured output (not raise 'no usable reply text')."""
+    class _Resp:
+        headers = {}
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"choices": [{"message": {"content":
+                    '{"tool_calls": [{"name": "screen.read", "args": {}}]}'}}]}
+
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://127.0.0.1:8642/v1/chat/completions")
+    monkeypatch.setattr(crc, "AGENT_HTTP_PROTOCOL", "openai")
+    monkeypatch.setattr(crc, "AGENT_HTTP_MODEL", "hermes-agent")
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_abc"})
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_save_agent_session_id", lambda sid: None)
+    monkeypatch.setattr(crc.httpx, "post", lambda *a, **kw: _Resp())
+
+    result = crc.call_agent_http("hi")
+    turn = crc._agent_turn_from_raw(result)
+    assert [tc["name"] for tc in turn.tool_calls] == ["screen.read"]

@@ -178,6 +178,16 @@ def screen_runtime_adapters_v2(api_key: str, store) -> ToolRuntimeAdaptersV2:
     return ToolRuntimeAdaptersV2(screen_read=screen_read, screen_recent=screen_recent)
 
 
+def combined_runtime_adapters_v2(api_key: str, store) -> ToolRuntimeAdaptersV2:
+    """Default perception/memory adapters + screen adapters bound to this turn's
+    api_key/store, so the executor can reach every implemented tool."""
+    import dataclasses
+    base = default_tool_runtime_adapters_v2()
+    screen = screen_runtime_adapters_v2(api_key, store)
+    return dataclasses.replace(base, screen_read=screen.screen_read,
+                               screen_recent=screen.screen_recent)
+
+
 class ToolExecutorV2:
     def __init__(
         self,

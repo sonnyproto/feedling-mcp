@@ -95,6 +95,7 @@ if not _provisioned:
         "test_enclave_frame_caption.py",
         "test_screen_caption_backend.py",
         "test_screen_caption_flag.py",
+        "test_tool_loop_v2.py",
     }
     collect_ignore = sorted(
         f

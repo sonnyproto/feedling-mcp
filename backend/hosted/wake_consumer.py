@@ -80,6 +80,8 @@ import provider_client
 from hosted import config_store as hosted_config_store
 from hosted import context as hosted_context
 from hosted import turn as hosted_turn
+from proactive.tool_loop_v2 import run_tool_loop_v2
+from proactive.tool_executor_v2 import ToolExecutorV2, ToolCallV2, combined_runtime_adapters_v2
 
 
 # Injected by the assembly layer: the Flask app object (threads need an app
@@ -89,6 +91,7 @@ flask_app = None
 HOSTED_WAKE_CONSUMER_ID = "hosted_runtime"
 HOSTED_WAKE_CONSUMER_ID_V2 = "hosted_runtime_v2"
 HOSTED_WAKE_RUNTIME_V2_FLAG = "hosted_wake_runtime_v2_enabled"
+MAX_TOOL_ITERS_V2 = 4
 # Thinking/reasoning models share this budget between reasoning and output
 # tokens (same note as the chat path) — too small and the visible reply gets
 # truncated into an unparseable_wake_reply failure.
@@ -417,7 +420,10 @@ def _hosted_wake_v2_provider_messages(agent_context: Mapping[str, Any]) -> list[
                 "\"background_request\":{}}. Prefer visible chat text in top-level messages. "
                 "If you emit send_message actions, this runtime normalizes their text into messages and dedupes same text, "
                 "so do not repeat the same visible text in both places. "
-                "If manual=true, include at least one visible message. If nothing should be said, return a sleep action."
+                "If manual=true, include at least one visible message. If nothing should be said, return a sleep action. "
+                "To gather information before acting, return {\"tool_calls\":[{\"name\":\"<tool>\",\"args\":{...}}]} "
+                "using the tools listed in context; you will get their results and may call more (a few rounds max). "
+                "When done gathering, finish with messages/actions and NO tool_calls."
             ),
         },
         {
@@ -427,17 +433,22 @@ def _hosted_wake_v2_provider_messages(agent_context: Mapping[str, Any]) -> list[
     ]
 
 
-def _hosted_wake_v2_run_agent(runtime):
+def _hosted_wake_v2_run_agent(runtime, store, api_key):
     def _run(agent_context: Mapping[str, Any]) -> str:
-        result = provider_client.chat_completion(
-            runtime,
-            _hosted_wake_v2_provider_messages(agent_context),
-            max_tokens=HOSTED_WAKE_MAX_TOKENS,
-            temperature=0.7,
-            timeout=90.0,
-            include_reasoning=hosted_turn.MODEL_API_PROVIDER_REASONING_ENABLED,
-        )
-        return str(result.get("reply") or "")
+        base_messages = _hosted_wake_v2_provider_messages(agent_context)
+        executor = ToolExecutorV2(adapters=combined_runtime_adapters_v2(api_key, store))
+
+        def call_model(messages):
+            result = provider_client.chat_completion(
+                runtime, messages, max_tokens=HOSTED_WAKE_MAX_TOKENS, temperature=0.7,
+                timeout=90.0, include_reasoning=hosted_turn.MODEL_API_PROVIDER_REASONING_ENABLED)
+            return str(result.get("reply") or "")
+
+        def call_tool(name, args):
+            return executor.execute(
+                ToolCallV2(name=name, args=args, user_id=store.user_id)).as_dict()
+
+        return run_tool_loop_v2(call_model, call_tool, base_messages, max_iters=MAX_TOOL_ITERS_V2)
 
     return _run
 
@@ -458,7 +469,7 @@ def _hosted_wake_v2_runtime(store: UserStore, runtime, api_key: str | None) -> t
     )
     runner = TurnRunnerV2(
         spine,
-        run_agent=_hosted_wake_v2_run_agent(runtime),
+        run_agent=_hosted_wake_v2_run_agent(runtime, store, api_key),
         recent_chat_provider=_hosted_v2_recent_chat_provider(store, api_key),
         turn_store=DBTurnStoreV2(),
         background_jobs=DBBackgroundJobStoreV2(),

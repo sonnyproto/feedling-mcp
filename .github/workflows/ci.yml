@@ -141,6 +141,10 @@ jobs:
             tests/test_model_api_wake.py \
             tests/test_screen_caption_backend.py \
             tests/test_screen_caption_flag.py \
+            tests/test_proactive_agent_protocol_v2.py \
+            tests/test_tool_loop_v2.py \
+            tests/test_proactive_tool_execute_route.py \
+            tests/test_chat_resident_consumer.py \
             -v
 
   # -------------------------------------------------------------------------

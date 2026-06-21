@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from proactive.agent_protocol_v2 import parse_agent_response_v2
+from proactive.agent_protocol_v2 import parse_agent_response_v2, agent_tool_calls_v2
 from proactive.runtime_v2 import RuntimeSpineV2, TurnOutcomeV2, TurnRunnerV2, WakeEventV2
 
 
@@ -308,3 +308,21 @@ def test_agent_actions_are_persisted_as_v2_turn_action_records():
     assert store.completed[0]["outcome"].messages == ("I'll check later.",)
     persisted = store.recorded_actions[0]["actions"]
     assert [action["type"] for action in persisted] == ["send_message", "schedule_wake"]
+
+
+def test_parse_tool_calls_field():
+    resp = parse_agent_response_v2('{"tool_calls": [{"name": "screen.read", "args": {"mode": "caption"}}]}')
+    assert agent_tool_calls_v2(resp) == [("screen.read", {"mode": "caption"})]
+
+
+def test_parse_tool_calls_absent_is_empty():
+    resp = parse_agent_response_v2('{"messages": ["hi"]}')
+    assert resp.tool_calls == ()
+    assert agent_tool_calls_v2(resp) == []
+
+
+def test_parse_tool_calls_drops_malformed_entries():
+    resp = parse_agent_response_v2(
+        '{"tool_calls": [{"name": "", "args": {}}, {"args": {"x": 1}}, '
+        '{"name": "memory.fetch", "args": {"ids": ["m1"]}}, "nope"]}')
+    assert agent_tool_calls_v2(resp) == [("memory.fetch", {"ids": ["m1"]})]

@@ -33,6 +33,7 @@ class AgentTurnResponseV2:
     actions: tuple[Mapping[str, Any], ...] = ()
     needs_background: bool = False
     background_request: Mapping[str, Any] = field(default_factory=dict)
+    tool_calls: tuple[Mapping[str, Any], ...] = ()
 
 
 def _clean_text(value: Any, limit: int) -> str:
@@ -179,6 +180,18 @@ def parse_agent_response_v2(raw: Any) -> AgentTurnResponseV2:
             if request:
                 background_request = dict(request)
 
+    tool_calls: list[dict[str, Any]] = []
+    raw_tool_calls = payload.get("tool_calls")
+    if isinstance(raw_tool_calls, Sequence) and not isinstance(raw_tool_calls, (str, bytes, bytearray)):
+        for item in raw_tool_calls:
+            if not isinstance(item, Mapping):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            args = dict(item["args"]) if isinstance(item.get("args"), Mapping) else {}
+            tool_calls.append({"name": name, "args": args})
+
     if needs_background and not any(action.get("type") == "needs_background" for action in actions):
         actions.append({"type": "needs_background", "request": dict(background_request or {})})
 
@@ -190,7 +203,13 @@ def parse_agent_response_v2(raw: Any) -> AgentTurnResponseV2:
         actions=tuple(actions),
         needs_background=needs_background,
         background_request=background_request,
+        tool_calls=tuple(tool_calls),
     )
+
+
+def agent_tool_calls_v2(response: AgentTurnResponseV2) -> list[tuple[str, dict]]:
+    """(name, args) pairs the loop should execute this turn."""
+    return [(str(c.get("name")), dict(c.get("args") or {})) for c in response.tool_calls]
 
 
 def turn_outcome_from_agent_response_v2(outcome_cls: Any, response: AgentTurnResponseV2) -> Any:
