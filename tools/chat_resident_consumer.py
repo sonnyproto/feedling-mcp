@@ -86,6 +86,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -244,6 +245,14 @@ FALLBACK_REPLY = os.environ.get(
 # verify completes, so it never reaches the user's visible chat; it only has
 # to be a non-empty agent-role write that lands fast.
 VERIFY_PING_REPLY = os.environ.get("VERIFY_PING_REPLY", "__verify_ack__")
+# Verify probe (real-agent liveness): on a verify_ping we now run a real, bounded
+# agent call so verify catches a broken reply pipeline (e.g. unparseable agent
+# output) instead of always passing via the canned ack. VERIFY_PROBE_MESSAGE is
+# the synthetic prompt sent to the agent; VERIFY_PROBE_TIMEOUT_SEC bounds the
+# wait before we fall back to the canned ack (keeps a slow-but-healthy agent
+# from falsely failing). See the verify_ping branch in _process_messages.
+VERIFY_PROBE_MESSAGE = os.environ.get("VERIFY_PROBE_MESSAGE", "（连接自检）请用一句话回复，确认你能收到我的消息。")
+VERIFY_PROBE_TIMEOUT_SEC = float(os.environ.get("VERIFY_PROBE_TIMEOUT_SEC", "20"))
 SEND_FALLBACK_ON_AGENT_ERROR = _env_bool("SEND_FALLBACK_ON_AGENT_ERROR", False)
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
 WHOAMI_STARTUP_RETRIES = int(os.environ.get("WHOAMI_STARTUP_RETRIES", "8"))
@@ -951,6 +960,31 @@ _JSON_NON_FINAL_EVENTS = {
 }
 
 
+def _openclaw_payload_texts(obj: Any) -> list[str]:
+    """OpenClaw `agent --json` nests its reply under result.payloads[].text.
+
+    The generic reply-field walker stops at `result` (it does not treat
+    `payloads` as a reply field), so without this the consumer reports
+    "no usable reply" for a perfectly good OpenClaw answer. Returns each
+    payload's text in order (multi-bubble preserved); [] when not this shape.
+    """
+    if not isinstance(obj, dict):
+        return []
+    result = obj.get("result")
+    if not isinstance(result, dict):
+        return []
+    payloads = result.get("payloads")
+    if not isinstance(payloads, list):
+        return []
+    texts: list[str] = []
+    for item in payloads:
+        if isinstance(item, dict):
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                texts.append(text.strip())
+    return texts
+
+
 def _reply_from_json_obj(obj: Any) -> str:
     """Extract the final answer from a structured agent response object."""
     if isinstance(obj, str):
@@ -965,6 +999,10 @@ def _reply_from_json_obj(obj: Any) -> str:
 
     if not isinstance(obj, dict):
         return ""
+
+    openclaw_texts = _openclaw_payload_texts(obj)
+    if openclaw_texts:
+        return openclaw_texts[0]
 
     marker = str(
         obj.get("event")
@@ -1149,6 +1187,14 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
     if not isinstance(obj, dict):
         return turn
 
+    # OpenClaw `agent --json` nests reply text under result.payloads[].text,
+    # which the generic reply-field recursion below does not reach. Capture it
+    # explicitly so an OpenClaw resident entry produces usable messages instead
+    # of "no usable reply after sanitization".
+    openclaw_texts = _openclaw_payload_texts(obj)
+    if openclaw_texts:
+        turn.messages.extend(openclaw_texts)
+
     for key in _JSON_RUNTIME_DEBUG_FIELDS:
         if key in obj:
             value = obj.get(key)
@@ -1284,6 +1330,9 @@ def _agent_turn_from_raw(raw_reply: Any, max_items: int | None = None) -> AgentT
 
 def _multi_reply_json_from_obj(obj: Any) -> str:
     """Preserve explicit multi-bubble JSON instead of collapsing it."""
+    openclaw_texts = _openclaw_payload_texts(obj)
+    if openclaw_texts:
+        return json.dumps({"messages": openclaw_texts}, ensure_ascii=False)
     messages: Any = None
     if isinstance(obj, dict) and isinstance(obj.get("messages"), list):
         messages = obj.get("messages")
@@ -3244,11 +3293,44 @@ def _process_messages(messages: list) -> float:
         # verify_loop's timeout and is fragile to mid-run SIGTERM, so the probe
         # would time out (passing=false) even on a healthy reply pipeline.
         if msg.get("source") == "verify_ping":
-            log.info("verify ping [ts=%.3f] — short-circuit canned liveness reply", ts)
+            # Exercise the REAL agent path so verify catches a broken reply
+            # pipeline (e.g. an agent whose output the consumer can't parse).
+            # The old canned short-circuit let verify pass while the live loop
+            # was actually dead. A slow-but-healthy agent must not falsely fail,
+            # so the probe is bounded: on timeout/transient error we fall back to
+            # the canned ack (verify still passes); only a COMPLETED call that
+            # yields no usable reply is a real failure — we then post nothing so
+            # verify_loop stays unsatisfied and onboarding does not green-light a
+            # dead loop. The probe reply is visibility=local_only and GC'd by the
+            # server, so it never reaches the user's visible chat.
+            log.info("verify ping [ts=%.3f] — exercising real agent path", ts)
+            probe: dict[str, Any] = {}
+
+            def _run_verify_probe() -> None:
+                try:
+                    probe["result"] = call_agent(VERIFY_PROBE_MESSAGE)
+                except ValueError as exc:        # no usable reply after sanitization
+                    probe["no_usable_reply"] = str(exc)
+                except Exception as exc:         # timeout / transport / runtime
+                    probe["error"] = str(exc)
+
+            probe_thread = threading.Thread(target=_run_verify_probe, daemon=True)
+            probe_thread.start()
+            probe_thread.join(timeout=VERIFY_PROBE_TIMEOUT_SEC)
             try:
-                # suppress_push: the ack must not surface as an APNs
-                # notification — it's a private probe the verify GC then removes.
-                post_reply(VERIFY_PING_REPLY, suppress_push=True)
+                if probe_thread.is_alive():
+                    log.warning("verify ping — agent slow (>%ss); canned ack fallback so verify still passes", VERIFY_PROBE_TIMEOUT_SEC)
+                    post_reply(VERIFY_PING_REPLY, suppress_push=True)
+                elif "result" in probe:
+                    replies = _normalize_agent_replies(probe["result"]) or [VERIFY_PING_REPLY]
+                    post_reply(replies[0], suppress_push=True)
+                    log.info("verify ping — real agent reply OK")
+                elif "no_usable_reply" in probe:
+                    log.error("verify ping — agent produced no usable reply; NOT acking so verify fails (live loop is broken): %s", probe["no_usable_reply"])
+                    # post nothing — verify_loop stays unsatisfied on purpose
+                else:
+                    log.warning("verify ping — agent call errored (%s); canned ack fallback", probe.get("error"))
+                    post_reply(VERIFY_PING_REPLY, suppress_push=True)
             except Exception as e:
                 log.error("failed to post verify-ping reply: %s", e)
             latest = max(latest, ts)

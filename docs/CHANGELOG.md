@@ -47,6 +47,33 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-06-22
+
+### [DONE] 修 resident reply loop:OpenClaw 输出解析 + verify_loop 真调 agent + skill 路由硬规则
+- **背景**:一次 VPS onboarding 实测——onboarding 各步显示"成功 + 发了问候",但用户回消息后
+  iOS 一直 loading、永远收不到回复。SSH 进 VPS 看 consumer 日志定位到三个叠加问题。
+- **诊断(VPS 日志 + 复现 OpenClaw 命令)**:
+  - consumer 收到了消息、解密成功;调 OpenClaw → OpenClaw **回得好好的**
+    (`result.payloads[0].text="能看到..."`,status=ok);**但 consumer 解析不出来** →
+    `_reply_from_json_obj`/`_agent_turn_from_obj` 不认 `result.payloads[].text`(只认到 `result` 就停)
+    → 判 "no usable reply" + `SEND_FALLBACK_ON_AGENT_ERROR=false` → 什么都不发 → iOS 永转。
+  - **verify_loop=true 是假阳性**:consumer 见 verify ping 走"罐头 liveness 回复"短路、**根本没调
+    真 agent**,所以掩盖了上面的解析失败,让 onboarding 误判通过。
+  - agent 还把 consumer 接到了 **OpenClaw**(用户其实在跟 Hermes 对话),并改了 OpenClaw 的
+    IDENTITY.md/BOOTSTRAP.md——把"agent_name 别叫 Hermes"误套到"换 runtime 当传输"。
+- **改动**:
+  - **②(consumer,feedling-mcp test)**`tools/chat_resident_consumer.py`:加 `_openclaw_payload_texts`
+    显式 extractor,接进 `_reply_from_json_obj` / `_multi_reply_json_from_obj` / `_agent_turn_from_obj`
+    三处,支持 OpenClaw `result.payloads[].text`(含多气泡);加 3 个回归测试。
+  - **③(consumer)**verify ping 不再罐头短路,改成**有界真 agent 探活**:慢(>20s,可配
+    `VERIFY_PROBE_TIMEOUT_SEC`)→ 回退罐头 ack(不冤枉健康慢 agent);完成但无可用回复 →
+    **不 ack,让 verify 失败**(把解析/传输坏掉的链路在 onboarding 阶段就暴露)。
+  - **①(skill,io-onboarding main)**`skill-resident-agent.md` 加硬规则:**consumer 的 agent 入口
+    必须是收到 onboarding 指令的那个 runtime 本身**,多 runtime 同机时不许改接"更顺手"的兄弟;
+    runtime 自报名字是 agent_name 的事,别为此换 runtime 或改 IDENTITY.md/BOOTSTRAP.md。
+- **自测**:② 本地单测 + 3 回归全过;VPS 端到端验证见下条/会话记录。
+- **遗留**:① 是 skill 约束,不能 100% 强制 agent 守规;OpenClaw 仍非文档化入口(但现在能解析了)。
+
 ## 2026-06-21
 
 ### [DONE] 修 VPS resident 入驻接不上(MCP→enclave 迁移残留,跨仓库)

@@ -1998,3 +1998,31 @@ def test_openai_http_tool_only_response_preserved(monkeypatch):
     result = crc.call_agent_http("hi")
     turn = crc._agent_turn_from_raw(result)
     assert [tc["name"] for tc in turn.tool_calls] == ["screen.read"]
+
+
+# ---------------------------------------------------------------------------
+# OpenClaw `agent --json` output: reply text nests under result.payloads[].text.
+# Regression for the VPS onboarding failure where a valid OpenClaw reply was
+# reported as "no usable reply after sanitization".
+# ---------------------------------------------------------------------------
+
+def test_openclaw_payloads_reply_is_extracted():
+    obj = {"runId": "x", "status": "ok", "summary": "completed",
+           "result": {"payloads": [{"text": "能看到，这条消息收到了。", "mediaUrl": None}],
+                      "meta": {"agentMeta": {"sessionId": "s"}}}}
+    # single-reply extractor
+    assert crc._reply_from_json_obj(obj) == "能看到，这条消息收到了。"
+    # turn from dict and from the raw JSON string (the actual CLI stdout path)
+    assert crc._agent_turn_from_raw(obj).messages == ["能看到，这条消息收到了。"]
+    assert crc._agent_turn_from_raw(json.dumps(obj)).messages == ["能看到，这条消息收到了。"]
+
+
+def test_openclaw_multi_payload_preserves_bubbles():
+    obj = {"status": "ok", "result": {"payloads": [{"text": "第一句"}, {"text": "第二句"}]}}
+    assert crc._agent_turn_from_raw(obj).messages == ["第一句", "第二句"]
+
+
+def test_non_openclaw_shapes_unaffected():
+    # plain multi-bubble and a bare string still work (no regression)
+    assert crc._agent_turn_from_raw({"messages": ["你好"]}).messages == ["你好"]
+    assert crc._reply_from_json_obj({"reply": "hi"}) == "hi"
