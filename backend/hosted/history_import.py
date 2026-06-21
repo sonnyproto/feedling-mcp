@@ -998,7 +998,7 @@ def _model_api_agent_profile_context(store: UserStore, identity: dict) -> dict:
             "explicit user corrections",
             "AI persona materials",
             "Feedling Identity",
-            "relevant memory cards",
+            "candidate memory context",
             "recent chat",
         ],
     }

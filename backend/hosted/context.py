@@ -81,6 +81,7 @@ def _model_api_context_messages(
     user_message: str,
     *,
     include_screen_context: bool,
+    include_memory_context: bool = True,
 ) -> tuple[list[dict], dict, list[dict[str, str]]]:
     hist, hist_err = core_enclave._enclave_get_json_for_gate(
         "/v1/chat/history",
@@ -95,6 +96,9 @@ def _model_api_context_messages(
         context_memories = hist.get("context_memories") if isinstance(hist.get("context_memories"), list) else []
         context_memory_trace = hist.get("context_memory_trace") if isinstance(hist.get("context_memory_trace"), dict) else {}
         recent_messages = hist.get("messages") if isinstance(hist.get("messages"), list) else []
+    if not include_memory_context:
+        context_memories = []
+        context_memory_trace = {}
 
     identity = {}
     if isinstance(identity_data, dict) and isinstance(identity_data.get("identity"), dict):
@@ -249,6 +253,9 @@ def _model_api_context_trace_for_action(
             "present": bool(provider_reasoning),
             "chars": len(provider_reasoning),
         }
+    memory_tools = context_payload.get("memory_tools") if isinstance(context_payload.get("memory_tools"), dict) else {}
+    if memory_tools:
+        info["memory_tools"] = memory_tools
     return info
 
 

@@ -1081,6 +1081,8 @@ def v1_memory_index():
         content_sk,
         item_builder=_build_memory_index_item,
     )
+    if not bool(payload.get("include_sensitive", False)):
+        items = [item for item in items if not item.get("is_sensitive")]
     return jsonify({
         "user_id": authorized_user_id,
         "items": items,

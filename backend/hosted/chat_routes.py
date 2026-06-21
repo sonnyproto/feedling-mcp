@@ -51,12 +51,14 @@ from model_api_runtime.tools import (
     run_web_searches as run_model_api_web_searches,
     web_search_trace as model_api_web_search_trace,
 )
+from model_api_runtime import memory_tools as hosted_memory_tools
 from model_api_runtime.wake import (
     wake_turn_contract_message as model_api_wake_turn_contract_message,
     build_wake_event_message as build_model_api_wake_event_message,
     hosted_tick_trigger as model_api_hosted_tick_trigger,
     parse_wake_actions as parse_model_api_wake_actions,
 )
+from proactive.agent_protocol_v2 import parse_agent_response_v2, agent_tool_calls_v2
 from context_memory_selection import memory_relevance_details
 from content_encryption import build_envelope
 
@@ -69,6 +71,95 @@ from hosted import turn as hosted_turn
 
 
 bp = Blueprint("hosted_chat_routes", __name__)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _model_api_memory_tools_enabled() -> bool:
+    return _env_bool("MODEL_API_MEMORY_TOOLS_ENABLED", False)
+
+
+def _model_api_auto_memory_context_enabled() -> bool:
+    return _env_bool("MODEL_API_AUTO_MEMORY_CONTEXT_ENABLED", True)
+
+
+def _model_api_memory_tool_calls(raw_reply: str) -> list[tuple[str, dict]]:
+    try:
+        calls = agent_tool_calls_v2(parse_agent_response_v2(raw_reply))
+    except Exception:
+        return []
+    return [
+        (name, args)
+        for name, args in calls
+        if name in {hosted_memory_tools.MEMORY_INDEX_TOOL, hosted_memory_tools.MEMORY_FETCH_TOOL}
+    ]
+
+
+def _run_model_api_memory_tool_loop(
+    runtime,
+    provider_messages: list[dict],
+    *,
+    store,
+    api_key: str | None,
+    max_tokens: int,
+    temperature: float,
+) -> tuple[dict, str, dict]:
+    messages = list(provider_messages)
+    memory_trace: dict = {
+        "mode": "agent_tools",
+        "index_called": False,
+        "fetch_called": False,
+        "tool_calls": [],
+        "fetched_ids": [],
+        "cumulative_fetch_limit": hosted_memory_tools.MEMORY_FETCH_CUMULATIVE_LIMIT,
+    }
+    result: dict = {}
+    raw_reply = ""
+    usage_rounds: list[dict] = []
+    for _ in range(3):
+        result = provider_client.chat_completion(
+            runtime,
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout=90.0,
+            include_reasoning=hosted_turn.MODEL_API_PROVIDER_REASONING_ENABLED,
+        )
+        raw_reply = str(result.get("reply") or "").strip()
+        usage_rounds.append(result.get("usage") or {})
+        calls = _model_api_memory_tool_calls(raw_reply)
+        if not calls:
+            break
+        tool_results: list[dict] = []
+        for name, args in calls:
+            try:
+                tool_results.append(
+                    hosted_memory_tools.execute_memory_tool(
+                        store,
+                        api_key,
+                        name,
+                        args,
+                        trace=memory_trace,
+                    )
+                )
+            except Exception as e:
+                memory_trace.setdefault("tool_calls", []).append({
+                    "name": name,
+                    "ok": False,
+                    "error": f"{type(e).__name__}:{str(e)[:160]}",
+                })
+                tool_results.append({"ok": False, "name": name, "error": "memory_tool_failed"})
+        messages.append({"role": "assistant", "content": raw_reply[:4000]})
+        messages.append({"role": "user", "content": hosted_memory_tools.render_memory_tool_results(tool_results)})
+    if len(usage_rounds) > 1:
+        result = {**result, "usage": {"memory_tool_loop": usage_rounds, "final": result.get("usage") or {}}}
+    return result, raw_reply, memory_trace
+
 
 @bp.route("/v1/model_api/chat/send", methods=["POST"])
 def model_api_chat_send():
@@ -117,11 +208,14 @@ def model_api_chat_send():
     identity_action_results: list[dict] = []
     memory_action_results: list[dict] = []
 
+    memory_tools_enabled = _model_api_memory_tools_enabled()
+    auto_memory_context_enabled = _model_api_auto_memory_context_enabled()
     provider_messages, context_payload, screen_images = hosted_context._model_api_context_messages(
         store,
         api_key,
         message_for_context,
         include_screen_context=bool(payload.get("include_screen_context")),
+        include_memory_context=not memory_tools_enabled,
     )
     provider_images = list(screen_images)
     if has_image:
@@ -141,19 +235,33 @@ def model_api_chat_send():
             "content": "User-selected context refs JSON:\n" + json.dumps(context_refs, ensure_ascii=False)[:3000],
         })
     provider_messages.insert(2, hosted_turn._model_api_turn_contract_message())
+    if memory_tools_enabled:
+        provider_messages.insert(3, hosted_memory_tools.memory_tool_instruction_message())
     web_search: dict = {}
+    memory_tools_trace: dict = {}
     try:
-        result = provider_client.chat_completion(
-            runtime,
-            provider_messages,
-            # Thinking/reasoning models share this budget between reasoning and
-            # output tokens, so keep it generous; non-thinking models stop early
-            # on their own and don't pay for the headroom.
-            max_tokens=int(payload.get("max_tokens") or 2048),
-            temperature=float(payload.get("temperature") or 0.7),
-            timeout=90.0,
-            include_reasoning=hosted_turn.MODEL_API_PROVIDER_REASONING_ENABLED,
-        )
+        if memory_tools_enabled:
+            result, raw_reply, memory_tools_trace = _run_model_api_memory_tool_loop(
+                runtime,
+                provider_messages,
+                store=store,
+                api_key=api_key,
+                max_tokens=int(payload.get("max_tokens") or 2048),
+                temperature=float(payload.get("temperature") or 0.7),
+            )
+        else:
+            result = provider_client.chat_completion(
+                runtime,
+                provider_messages,
+                # Thinking/reasoning models share this budget between reasoning and
+                # output tokens, so keep it generous; non-thinking models stop early
+                # on their own and don't pay for the headroom.
+                max_tokens=int(payload.get("max_tokens") or 2048),
+                temperature=float(payload.get("temperature") or 0.7),
+                timeout=90.0,
+                include_reasoning=hosted_turn.MODEL_API_PROVIDER_REASONING_ENABLED,
+            )
+            raw_reply = str(result.get("reply") or "").strip()
     except provider_client.ProviderError as e:
         background_execution = hosted_runtime_background_trace(
             status="not_started",
@@ -184,9 +292,72 @@ def model_api_chat_send():
             "action_trace_id": trace.get("trace_id", ""),
         }), 502
 
-    raw_reply = str(result.get("reply") or "").strip()
     reply, thinking_summary, requested_web_search = hosted_turn._model_api_parse_turn_output(raw_reply)
     provider_reasoning = hosted_turn._sanitize_provider_reasoning_text(str(result.get("reasoning") or ""))
+    if (
+        memory_tools_enabled
+        and auto_memory_context_enabled
+        and not memory_tools_trace.get("index_called")
+        and not memory_tools_trace.get("fetch_called")
+    ):
+        fallback_messages, fallback_context_payload, _fallback_images = hosted_context._model_api_context_messages(
+            store,
+            api_key,
+            message_for_context,
+            include_screen_context=False,
+            include_memory_context=True,
+        )
+        fallback_memories = fallback_context_payload.get("context_memories") or []
+        if fallback_memories:
+            final_messages = list(provider_messages)
+            final_messages.append({"role": "assistant", "content": raw_reply[:4000]})
+            final_messages.append({
+                "role": "system",
+                "content": "Auto memory fallback JSON:\n" + json.dumps({
+                    "context_memories": fallback_memories[:8],
+                    "context_memory_trace": fallback_context_payload.get("context_memory_trace") or {},
+                }, ensure_ascii=False)[:8000],
+            })
+            try:
+                final_result = provider_client.chat_completion(
+                    runtime,
+                    final_messages,
+                    max_tokens=int(payload.get("max_tokens") or 2048),
+                    temperature=float(payload.get("temperature") or 0.7),
+                    timeout=90.0,
+                    include_reasoning=hosted_turn.MODEL_API_PROVIDER_REASONING_ENABLED,
+                )
+                final_raw_reply = str(final_result.get("reply") or "").strip()
+                final_reply, final_thinking, _ = hosted_turn._model_api_parse_turn_output(final_raw_reply)
+                if final_reply:
+                    reply = final_reply
+                    thinking_summary = final_thinking or thinking_summary
+                    provider_reasoning = hosted_turn._sanitize_provider_reasoning_text(str(final_result.get("reasoning") or "")) or provider_reasoning
+                    result = {
+                        **final_result,
+                        "usage": {
+                            "initial": result.get("usage") or {},
+                            "fallback": final_result.get("usage") or {},
+                        },
+                    }
+                    context_payload["context_memories"] = fallback_memories[:8]
+                    context_payload["context_memory_trace"] = fallback_context_payload.get("context_memory_trace") or {}
+                    memory_tools_trace = {
+                        "mode": "fallback",
+                        "fallback_reason": "no_tool_call_backfilled",
+                        "index_called": False,
+                        "fetch_called": False,
+                        "tool_calls": [],
+                        "fetched_ids": [],
+                    }
+            except provider_client.ProviderError:
+                pass
+    if memory_tools_trace:
+        context_payload["memory_tools"] = {
+            key: value
+            for key, value in memory_tools_trace.items()
+            if key != "cumulative_fetch_limit"
+        }
     if requested_web_search and (not web_search or not reply):
         if not web_search:
             web_search = hosted_turn._run_model_api_web_searches(requested_web_search)
@@ -374,6 +545,7 @@ def model_api_chat_send():
         "usage": result.get("usage") or {},
         "tools": {
             "web_search": hosted_turn._model_api_web_search_trace(web_search),
+            "memory": context_payload.get("memory_tools") or {},
         },
         "effects": effects,
         "identity_actions": identity_action_results,
@@ -410,4 +582,3 @@ def model_api_chat_send():
             web_search=web_search,
         ),
     })
-

@@ -90,6 +90,7 @@ def test_memory_index_prefilters_top50_and_calls_enclave(client, monkeypatch):
         captured["api_key"] = api_key
         captured["operation"] = operation
         captured["ids"] = [m["id"] for m in candidates]
+        captured["payload"] = dict(payload or {})
         return {"items": [{"id": m["id"], "summary": m["id"]} for m in candidates]}
 
     monkeypatch.setattr(memory_routes, "_memory_readside_post_enclave", fake_enclave)
@@ -99,6 +100,7 @@ def test_memory_index_prefilters_top50_and_calls_enclave(client, monkeypatch):
     assert res.status_code == 200
     assert captured["api_key"] == "key_readside"
     assert captured["operation"] == "index"
+    assert captured["payload"]["include_sensitive"] is False
     assert len(captured["ids"]) == 50
     assert captured["ids"][:2] == ["open_old", "high_new"]
     assert "local" not in captured["ids"]
@@ -174,6 +176,37 @@ def test_enclave_index_item_hides_body_only_fields():
         "is_sensitive": True,
         "score": 0.91,
     }
+
+
+def test_enclave_index_filters_sensitive_items_by_default(monkeypatch):
+    monkeypatch.setattr(
+        enclave_app,
+        "_memory_readside_auth_context",
+        lambda: ("key_readside", "usr_readside", object(), None),
+    )
+    monkeypatch.setattr(
+        enclave_app,
+        "_memory_readside_decrypt_items",
+        lambda moments, authorized_user_id, content_sk, *, item_builder: (
+            [
+                {"id": "plain", "summary": "Plain memory.", "is_sensitive": False},
+                {"id": "sensitive", "summary": "Private memory.", "is_sensitive": True},
+            ],
+            [],
+        ),
+    )
+
+    with enclave_app.app.test_client() as c:
+        default_res = c.post("/v1/memory/index", json={"moments": [{"id": "plain"}, {"id": "sensitive"}]})
+        sensitive_res = c.post(
+            "/v1/memory/index",
+            json={"moments": [{"id": "plain"}, {"id": "sensitive"}], "include_sensitive": True},
+        )
+
+    assert default_res.status_code == 200
+    assert [item["id"] for item in default_res.get_json()["items"]] == ["plain"]
+    assert sensitive_res.status_code == 200
+    assert [item["id"] for item in sensitive_res.get_json()["items"]] == ["plain", "sensitive"]
 
 
 def test_enclave_fetch_item_returns_full_card_without_sensitive_scope():

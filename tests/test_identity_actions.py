@@ -228,9 +228,11 @@ def test_model_api_chat_background_runtime_executes_detected_identity_rename(cli
 def test_model_api_chat_background_runtime_updates_relationship_days(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
+    captured_plaintexts: list = []
 
     monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
     monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":

@@ -375,6 +375,196 @@ def test_model_api_chat_uses_memory_selection_trace_without_prompting_rejected_c
     assert selection["rejected_sample"][0]["reason"] == "weak_generic_overlap"
 
 
+def test_model_api_chat_runs_memory_tool_loop_when_enabled(client, monkeypatch):
+    user_id, api_key = _register(client)
+    provider_calls: list[list[dict]] = []
+    tool_calls: list[tuple[str, dict]] = []
+    monkeypatch.setenv("MODEL_API_MEMORY_TOOLS_ENABLED", "true")
+    monkeypatch.setenv("MODEL_API_AUTO_MEMORY_CONTEXT_ENABLED", "false")
+
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(
+        core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose: b"sk-test",
+    )
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"messages": [], "context_memories": []}, "")
+        if path == "/v1/chat/history"
+        else ({"identity": _identity_payload()}, ""),
+    )
+
+    def fake_execute_memory_tool(store, key, name, args, *, trace):
+        tool_calls.append((name, dict(args or {})))
+        trace.setdefault("tool_calls", [])
+        if name == "memory_index":
+            trace["mode"] = "agent_tools"
+            trace["index_called"] = True
+            trace["user_card_count"] = 1
+            trace["tool_calls"].append({"name": name, "ok": True, "item_count": 1})
+            return {
+                "ok": True,
+                "name": name,
+                "items": [{"id": "mem_cat", "summary": "用户家猫叫武松，名字来自武松打虎。"}],
+                "user_card_count": 1,
+            }
+        if name == "memory_fetch":
+            trace["mode"] = "agent_tools"
+            trace["fetch_called"] = True
+            trace["fetched_ids"] = ["mem_cat"]
+            trace["tool_calls"].append({"name": name, "ok": True, "ids": ["mem_cat"], "item_count": 1})
+            return {
+                "ok": True,
+                "name": name,
+                "items": [{"id": "mem_cat", "summary": "用户家猫叫武松。", "verbatim": "我家猫叫武松。"}],
+                "missing_ids": [],
+                "unavailable_ids": [],
+            }
+        raise AssertionError(f"unexpected tool {name}")
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        provider_calls.append(messages)
+        if len(provider_calls) == 1:
+            joined = "\n".join(str(m.get("content") or "") for m in messages)
+            assert "memory_index" in joined
+            assert "memory_fetch" in joined
+            assert "Tool results (JSON)" not in joined
+            return {
+                "reply": appmod.json.dumps({
+                    "tool_calls": [{"name": "memory_index", "args": {"query": "猫叫什么"}}]
+                }),
+                "usage": {"total_tokens": 3},
+            }
+        if len(provider_calls) == 2:
+            joined = "\n".join(str(m.get("content") or "") for m in messages)
+            assert "用户家猫叫武松" in joined
+            return {
+                "reply": appmod.json.dumps({
+                    "tool_calls": [{"name": "memory_fetch", "args": {"ids": ["mem_cat"]}}]
+                }),
+                "usage": {"total_tokens": 5},
+            }
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        assert "我家猫叫武松" in joined
+        return {
+            "reply": appmod.json.dumps({"reply": "记得，你家猫叫武松，名字来自武松打虎。"}),
+            "usage": {"total_tokens": 8},
+        }
+
+    monkeypatch.setattr(appmod.hosted_chat_routes.hosted_memory_tools, "execute_memory_tool", fake_execute_memory_tool)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    chat = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "你还记得我家猫叫什么吗？"},
+        headers=_headers(api_key),
+    )
+
+    assert chat.status_code == 200, chat.get_data(as_text=True)
+    body = chat.get_json()
+    assert body["reply"] == "记得，你家猫叫武松，名字来自武松打虎。"
+    assert tool_calls == [
+        ("memory_index", {"query": "猫叫什么"}),
+        ("memory_fetch", {"ids": ["mem_cat"]}),
+    ]
+    assert len(provider_calls) == 3
+    assert body["tools"]["memory"]["mode"] == "agent_tools"
+    assert body["tools"]["memory"]["index_called"] is True
+    assert body["tools"]["memory"]["fetch_called"] is True
+    assert body["tools"]["memory"]["fetched_ids"] == ["mem_cat"]
+
+    trace_id = body["state"]["action_trace_id"]
+    traces = appmod.db.log_read(user_id, appmod.MODEL_API_ACTION_TRACE_STREAM, limit=5)
+    trace = next(item for item in traces if item["trace_id"] == trace_id)
+    assert trace["context"]["memory_tools"]["mode"] == "agent_tools"
+    assert trace["context"]["memory_tools"]["fetched_ids"] == ["mem_cat"]
+
+
+def test_model_api_chat_falls_back_to_auto_readside_when_model_does_not_call_memory_tools(client, monkeypatch):
+    user_id, api_key = _register(client)
+    provider_calls: list[list[dict]] = []
+    monkeypatch.setenv("MODEL_API_MEMORY_TOOLS_ENABLED", "true")
+    monkeypatch.setenv("MODEL_API_AUTO_MEMORY_CONTEXT_ENABLED", "true")
+
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(
+        core_enclave,
+        "_decrypt_envelope_via_enclave",
+        lambda envelope, key, purpose: b"sk-test",
+    )
+
+    def fake_enclave(path, key, params=None):
+        if path == "/v1/chat/history":
+            return {
+                "messages": [],
+                "context_memories": [
+                    {
+                        "id": "mem_cat",
+                        "title": "猫叫武松",
+                        "description": "用户家猫叫武松，名字来自武松打虎。",
+                    }
+                ],
+                "context_memory_trace": {
+                    "mode": "model_api_readside_v1",
+                    "selected": [{"id": "mem_cat", "title": "猫叫武松", "selected": True}],
+                },
+            }, ""
+        if path == "/v1/identity/get":
+            return {"identity": _identity_payload()}, ""
+        return {}, ""
+
+    def fake_chat_completion(cfg, messages, **kwargs):
+        provider_calls.append(messages)
+        if len(provider_calls) == 1:
+            return {"reply": appmod.json.dumps({"reply": "我不确定。"}), "usage": {"total_tokens": 3}}
+        joined = "\n".join(str(m.get("content") or "") for m in messages)
+        assert "猫叫武松" in joined
+        return {
+            "reply": appmod.json.dumps({"reply": "记得，你家猫叫武松。"}),
+            "usage": {"total_tokens": 6},
+        }
+
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    chat = client.post(
+        "/v1/model_api/chat/send",
+        json={"message": "你还记得我家猫叫什么吗？"},
+        headers=_headers(api_key),
+    )
+
+    assert chat.status_code == 200, chat.get_data(as_text=True)
+    body = chat.get_json()
+    assert body["reply"] == "记得，你家猫叫武松。"
+    assert len(provider_calls) == 2
+    assert body["tools"]["memory"]["mode"] == "fallback"
+    assert body["tools"]["memory"]["fallback_reason"] == "no_tool_call_backfilled"
+
+    trace_id = body["state"]["action_trace_id"]
+    traces = appmod.db.log_read(user_id, appmod.MODEL_API_ACTION_TRACE_STREAM, limit=5)
+    trace = next(item for item in traces if item["trace_id"] == trace_id)
+    assert trace["context"]["memory_tools"]["mode"] == "fallback"
+    assert trace["context"]["memory_tools"]["fallback_reason"] == "no_tool_call_backfilled"
+
+
 def test_model_api_chat_send_runs_backend_web_search_tool(client, monkeypatch):
     _, api_key = _register(client)
     provider_calls: list[list[dict]] = []

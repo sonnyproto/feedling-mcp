@@ -20,6 +20,7 @@ from bootstrap import gates as boot_gates
 from identity import service as identity_service
 from memory import actions as memory_actions_mod
 from memory import service as memory_service
+import memory_readside_core
 
 bp = Blueprint("memory", __name__)
 
@@ -122,28 +123,12 @@ def _memory_readside_post_enclave(
     operation: str,
     payload: dict | None = None,
 ) -> dict:
-    enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
-    if not enclave_url:
-        raise RuntimeError("enclave_unavailable")
-    if not api_key:
-        raise RuntimeError("api_key_unavailable")
-    body = dict(payload or {})
-    body["moments"] = candidates
-    try:
-        with httpx.Client(timeout=20, verify=False) as client:
-            resp = client.post(
-                f"{enclave_url}/v1/memory/{operation}",
-                headers={"X-API-Key": api_key},
-                json=body,
-            )
-    except httpx.HTTPError as e:
-        raise RuntimeError(f"enclave_error:{type(e).__name__}") from e
-    if resp.status_code >= 400:
-        raise RuntimeError(f"enclave_http_{resp.status_code}:{resp.text[:180]}")
-    response = resp.json()
-    if not isinstance(response, dict):
-        raise RuntimeError("enclave_invalid_readside_response")
-    return response
+    return memory_readside_core.post_enclave_readside(
+        api_key,
+        candidates,
+        operation=operation,
+        payload=payload,
+    )
 
 
 @bp.route("/v1/memory/index", methods=["POST"])
@@ -155,19 +140,16 @@ def memory_index():
         requested_limit = int(payload.get("limit") or _MEMORY_READSIDE_LIMIT)
     except (TypeError, ValueError):
         return jsonify({"error": "invalid limit"}), 400
-    limit = max(1, min(requested_limit, _MEMORY_READSIDE_LIMIT))
-    candidates = _memory_readside_candidates(memory_service._load_moments(store), store.user_id, limit=limit)
     try:
-        response = _memory_readside_post_enclave(
+        response = memory_readside_core.memory_index_core(
+            store,
             api_key,
-            candidates,
-            operation="index",
-            payload={"include_sensitive": bool(payload.get("include_sensitive", True))},
+            {**payload, "limit": requested_limit},
+            post_enclave=_memory_readside_post_enclave,
         )
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 503
-    items = response.get("items") if isinstance(response.get("items"), list) else []
-    return jsonify({"items": items})
+    return jsonify(response)
 
 
 @bp.route("/v1/memory/fetch", methods=["POST"])
@@ -178,48 +160,18 @@ def memory_fetch():
     ids = payload.get("ids")
     if not isinstance(ids, list) or any(not isinstance(mid, str) or not mid.strip() for mid in ids):
         return jsonify({"error": "ids must be a list of non-empty strings"}), 400
-    ids = [mid.strip() for mid in ids[:_MEMORY_READSIDE_LIMIT]]
-    include_archived = str(payload.get("include_archived") or "").lower() in {"1", "true", "yes", "on"}
-    include_superseded = str(payload.get("include_superseded") or "").lower() in {"1", "true", "yes", "on"}
-    by_id = {m.get("id"): m for m in memory_service._load_moments(store) if isinstance(m, dict)}
-    missing_ids: list[str] = []
-    unavailable_ids: list[str] = []
-    candidates: list[dict] = []
-    for memory_id in ids:
-        moment = by_id.get(memory_id)
-        if not isinstance(moment, dict) or moment.get("owner_user_id") != store.user_id:
-            missing_ids.append(memory_id)
-            continue
-        if not _memory_readside_available(
-            moment,
-            store.user_id,
-            include_archived=include_archived,
-            include_superseded=include_superseded,
-        ):
-            unavailable_ids.append(memory_id)
-            continue
-        candidates.append(moment)
     try:
-        response = _memory_readside_post_enclave(
+        response = memory_readside_core.memory_fetch_core(
+            store,
             api_key,
-            candidates,
-            operation="fetch",
-            payload={"ids": [m.get("id") for m in candidates]},
+            payload,
+            post_enclave=_memory_readside_post_enclave,
         )
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 503
-    enclave_unavailable = response.get("unavailable_ids") if isinstance(response.get("unavailable_ids"), list) else []
-    unavailable_ids.extend(str(mid) for mid in enclave_unavailable if isinstance(mid, str))
-    items_by_id = {
-        item.get("id"): item
-        for item in (response.get("items") if isinstance(response.get("items"), list) else [])
-        if isinstance(item, dict)
-    }
-    return jsonify({
-        "items": [items_by_id[mid] for mid in ids if mid in items_by_id],
-        "missing_ids": missing_ids,
-        "unavailable_ids": unavailable_ids,
-    })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify(response)
 
 
 @bp.route("/v1/memory/actions", methods=["POST"])
