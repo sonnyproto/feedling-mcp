@@ -63,6 +63,8 @@ from dstack_sdk import DstackClient
 
 from dstack_tls import derive_tls_cert_and_key, TLS_KEY_PATH
 
+import provider_client
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -98,6 +100,12 @@ ENCLAVE_TLS = os.environ.get("FEEDLING_ENCLAVE_TLS", "false").lower() == "true"
 # caller's api_key so Flask's require_user resolves to the right user's
 # ciphertext. The enclave never sees users.json directly.
 FLASK_URL = os.environ.get("FEEDLING_FLASK_URL", "http://127.0.0.1:5001")
+
+# Screen VLM (caption route) — reads at startup; runtime re-reads os.environ
+# so a secret rotation takes effect without a restart.
+SCREEN_VLM_API_KEY = os.environ.get("FEEDLING_SCREEN_VLM_API_KEY", "")
+SCREEN_VLM_MODEL = os.environ.get("FEEDLING_SCREEN_VLM_MODEL", "qwen/qwen3-vl-8b-instruct")
+SCREEN_VLM_BASE_URL = os.environ.get("FEEDLING_SCREEN_VLM_BASE_URL", "https://openrouter.ai/api/v1")
 
 # Release metadata — normally injected via build-time env or read from a
 # sidecar file baked into the image. For Phase 1 we accept env values with
@@ -1565,6 +1573,115 @@ def v1_frame_decrypt(frame_id):
         result["image_b64"] = None
         result["image_bytes_omitted"] = True
     return jsonify(result)
+
+
+@app.route("/v1/screen/frames/<frame_id>/caption", methods=["GET"])
+def v1_frame_caption(frame_id):
+    """Decrypt a frame IN-ENCLAVE and return a VLM caption — never pixels.
+
+    This is the screen.read tool path. Unlike /decrypt, the plaintext image
+    never leaves the enclave to the backend caller: only the derived caption
+    text crosses back. The image is sent to the VLM (OpenRouter Qwen) from
+    inside the enclave, which is the only place plaintext legitimately lives.
+
+    Query params:
+      mode (str, default "caption"): "caption" returns a 1-2 sentence
+        description; "full" additionally echoes back the on-device OCR text.
+    """
+    if not _state["ready"]:
+        return jsonify({"error": "not_ready", "detail": _state["error"]}), 503
+    if not re.match(r"^[a-f0-9]{16,64}$", frame_id or ""):
+        return jsonify({"error": "bad frame id"}), 400
+    # Read live so tests / rotated secrets take effect without a restart.
+    # VLM key: deliberately NO fallback to the SCREEN_VLM_API_KEY module constant
+    # (fail-closed: an unset key must read as empty so the route returns
+    # screen_caption_unconfigured). model/base_url may fall back to their defaults.
+    vlm_key = os.environ.get("FEEDLING_SCREEN_VLM_API_KEY", "")
+    if not vlm_key:
+        return jsonify({"error": "screen_caption_unconfigured"}), 503
+
+    api_key = _extract_api_key()
+    if not api_key:
+        return jsonify({"error": "missing api_key"}), 401
+    try:
+        whoami = _whoami_cached(api_key)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            return jsonify({"error": "unauthorized"}), 401
+        return jsonify({"error": f"backend_error: {e}"}), 502
+    except httpx.HTTPError as e:
+        return jsonify({"error": f"backend_unreachable: {e}"}), 502
+    authorized_user_id = whoami.get("user_id", "")
+    if not authorized_user_id:
+        return jsonify({"error": "cannot resolve user_id"}), 401
+
+    try:
+        env = _flask_get(f"/v1/screen/frames/{frame_id}/envelope", api_key)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            return jsonify({"error": "unauthorized"}), 401
+        if e.response.status_code == 404:
+            return jsonify({"error": "frame not found"}), 404
+        return jsonify({"error": f"backend_error: {e}"}), 502
+    try:
+        content_sk = _get_or_derive_content_sk()
+    except Exception as e:
+        return jsonify({"error": f"key_derivation_unavailable: {e}"}), 503
+    try:
+        plaintext = _decrypt_envelope(env, authorized_user_id, content_sk)
+        inner = json.loads(plaintext.decode("utf-8"))
+    except DecryptFailure as e:
+        return jsonify({"error": f"decrypt_failed: {e.reason}"}), 502
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        return jsonify({"error": f"plaintext_parse: {e}"}), 502
+
+    image_b64 = inner.get("image", "")
+    ocr_text = str(inner.get("ocr_text") or "")
+    mode = (request.args.get("mode") or "caption").lower()
+    full = mode == "full"
+
+    instruction = (
+        "Describe what is on this phone screen in one or two sentences: what app "
+        "or content it is, and what the user appears to be doing. Be concrete and "
+        "neutral."
+        + (" Then list the key visible text verbatim." if full else "")
+    )
+    user_content = [
+        {"type": "text", "text": instruction},
+        {"type": "image_url",
+         "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+    ]
+    if ocr_text:
+        user_content.append(
+            {"type": "text", "text": f"On-device OCR text:\n{ocr_text[:2000]}"}
+        )
+
+    try:
+        model = os.environ.get("FEEDLING_SCREEN_VLM_MODEL", SCREEN_VLM_MODEL)
+        base_url = os.environ.get("FEEDLING_SCREEN_VLM_BASE_URL", SCREEN_VLM_BASE_URL)
+        result = provider_client.chat_completion(
+            provider_client.ProviderConfig(
+                provider="openrouter", model=model, api_key=vlm_key, base_url=base_url,
+            ),
+            [{"role": "user", "content": user_content}],
+            max_tokens=400 if full else 160,
+            temperature=0.2,
+            timeout=45.0,
+        )
+    except provider_client.ProviderError as e:
+        return jsonify({"error": f"screen_caption_failed: {e}"}), 502
+    except httpx.HTTPError as e:
+        return jsonify({"error": f"screen_caption_failed: {e}"}), 502
+
+    out = {
+        "frame_id": frame_id,
+        "caption": str(result.get("reply") or "").strip(),
+        "model": model,
+        "decrypt_status": "ok",
+    }
+    if full:
+        out["ocr_text"] = ocr_text[:4000]
+    return jsonify(out)
 
 
 @app.route("/v1/screen/frames/<frame_id>/image", methods=["GET"])

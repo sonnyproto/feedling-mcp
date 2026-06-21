@@ -139,6 +139,8 @@ jobs:
             tests/test_proactive_jobs.py \
             tests/test_proactive_gate_eval.py \
             tests/test_model_api_wake.py \
+            tests/test_screen_caption_backend.py \
+            tests/test_screen_caption_flag.py \
             -v
 
   # -------------------------------------------------------------------------

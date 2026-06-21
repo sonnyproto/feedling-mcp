@@ -16,12 +16,7 @@ from proactive.tool_catalog_v2 import FAST, SLOW, CostClass, ToolCatalogV2, defa
 
 TOOL_TRACE_STREAM_V2 = "proactive_tool_traces_v2"
 
-PR3_UNIMPLEMENTED_TOOLS_V2 = frozenset({
-    "screen.read",
-    "screen.recent",
-    "schedule_wake",
-    "cancel_wake",
-})
+PR3_UNIMPLEMENTED_TOOLS_V2 = frozenset({"schedule_wake", "cancel_wake"})  # screen.read/screen.recent now implemented in _execute_available
 
 
 def _new_tool_call_id() -> str:
@@ -132,6 +127,8 @@ class ToolRuntimeAdaptersV2:
     photos_recent: Callable[[str, int], Mapping[str, Any]] | None = None
     memory_load: Callable[[str], Sequence[Mapping[str, Any]]] | None = None
     send_message: Callable[[str, str, Mapping[str, Any]], Mapping[str, Any]] | None = None
+    screen_read: Callable[[str, str | None, str], Mapping[str, Any]] | None = None
+    screen_recent: Callable[[str, int], Mapping[str, Any]] | None = None
 
 
 def default_tool_runtime_adapters_v2() -> ToolRuntimeAdaptersV2:
@@ -162,6 +159,23 @@ def default_tool_runtime_adapters_v2() -> ToolRuntimeAdaptersV2:
         photos_recent=photos_recent,
         memory_load=memory_load,
     )
+
+
+def screen_runtime_adapters_v2(api_key: str, store) -> ToolRuntimeAdaptersV2:
+    """Screen adapters bound to the per-turn api_key (needed to reach the
+    enclave) and gated by the fail-closed screen_caption_enabled flag."""
+    from screen import caption as screen_caption
+    from proactive.screen_flag_v2 import screen_caption_enabled
+
+    def screen_read(user_id: str, frame_id: str | None, mode: str) -> Mapping[str, Any]:
+        if not screen_caption_enabled(store):
+            raise ToolUnavailableV2("screen_caption_disabled", "screen captioning is off for this user")
+        return screen_caption.caption_frame(user_id, api_key, frame_id, mode)
+
+    def screen_recent(user_id: str, limit: int) -> Mapping[str, Any]:
+        return screen_caption.recent_frames(user_id, limit)
+
+    return ToolRuntimeAdaptersV2(screen_read=screen_read, screen_recent=screen_recent)
 
 
 class ToolExecutorV2:
@@ -287,6 +301,10 @@ class ToolExecutorV2:
                 return ("send_message_adapter_missing", "send_message requires a hosted/resident output adapter")
             if not str(args.get("text") or "").strip():
                 return ("send_message_text_required", "send_message requires non-empty text")
+        if call.name == "screen.read" and not self.adapters.screen_read:
+            return ("screen_adapter_missing", "screen.read requires a screen runtime adapter")
+        if call.name == "screen.recent" and not self.adapters.screen_recent:
+            return ("screen_adapter_missing", "screen.recent requires a screen runtime adapter")
         return None
 
     def _budget_handoff_reason(self, cost_class: CostClass) -> str:
@@ -372,6 +390,18 @@ class ToolExecutorV2:
             return dict(self.adapters.send_message(call.user_id, text, args))
         if call.name == "sleep":
             return {"sleep": True, "reason": str(args.get("reason") or "")[:240]}
+        if call.name == "screen.read":
+            assert self.adapters.screen_read is not None
+            mode = str(args.get("mode") or "caption").lower()
+            frame_id = args.get("frame_id")
+            res = dict(self.adapters.screen_read(call.user_id, frame_id, mode))
+            if res.get("error"):
+                raise ToolUnavailableV2(str(res["error"]), f"screen.read: {res['error']}")
+            return res
+        if call.name == "screen.recent":
+            assert self.adapters.screen_recent is not None
+            limit = _int_arg(args.get("limit"), default=10, lo=1, hi=50)
+            return dict(self.adapters.screen_recent(call.user_id, limit))
         raise ToolUnavailableV2("tool_not_implemented_in_pr3", f"{call.name} is cataloged but not implemented in PR3")
 
     def _snapshot(self, user_id: str) -> Mapping[str, Any]:

@@ -149,6 +149,7 @@ def _ensure_model_api_runtime_profile(
         "memory_quality_warning": None,
         "hosted_wake_runtime_v2_enabled": False,
         "perception_ingress_runtime_v2_enabled": False,
+        "screen_caption_enabled": False,
         "provider": str(config.get("provider") or ""),
         "model": str(config.get("model") or ""),
     }

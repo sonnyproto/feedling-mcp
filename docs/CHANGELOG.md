@@ -47,6 +47,15 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-06-21
+
+### [DONE] Screen frame VLM captioning via in-enclave OpenRouter (Tasks 1-6 complete)
+- **Tasks 1-5 shipped**: New enclave route `GET /v1/screen/frames/<id>/caption` decrypts frame IN-ENCLAVE and calls OpenRouter `qwen/qwen3-vl-8b-instruct` via `provider_client`, returning caption text only (never pixels). Backend never holds plaintext pixels. New backend `screen/caption.py` calls that route, caches caption per frame_id. `screen.read`/`screen.recent` tools now implemented in `ToolExecutorV2` for isolated testing.
+- **New per-user flag**: `screen_caption_enabled` (default OFF, fail-closed). Enclave env: `FEEDLING_SCREEN_VLM_API_KEY` (required dstack secret; absent → fail-closed `screen_caption_unconfigured`), optional `FEEDLING_SCREEN_VLM_MODEL` (default `qwen/qwen3-vl-8b-instruct`), `FEEDLING_SCREEN_VLM_BASE_URL` (default OpenRouter). Deployed config documented in `deploy/DEPLOYMENTS.md` § Enclave configuration.
+- **Task 6 (docs-only)**: Updated `deploy/DEPLOYMENTS.md` with VLM secret + optional env overrides, non-code privacy prerequisites (user disclosure + OpenRouter zero-retention config). Added to changelog.
+- **Known limitation**: Model multi-turn tool-execution loop wiring (D11) still pending — `screen.read`/`screen.recent` tools are implemented + tested in isolation but not yet reachable by the live agent. Agent would need the tool-loop harness integration (separate task).
+- **未做（不在本计划范围）**: Proactive frame captioning、per-user API key、on-device VLM、legacy caption deletion。
+
 ## 2026-06-20
 
 ### [DONE] 三个用户开关（陪伴/定时任务/提醒）端到端落地

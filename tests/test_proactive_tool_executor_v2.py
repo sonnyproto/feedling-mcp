@@ -249,4 +249,54 @@ def test_unavailable_tools_are_not_masked_by_budget_handoff():
     assert healthkit.outcome == "needs_background"
     assert healthkit.error_code == "slow_budget_soft_handoff"
     assert screen.outcome == "unavailable"
-    assert screen.error_code == "tool_not_implemented_in_pr3"
+    assert screen.error_code == "screen_adapter_missing"
+
+
+def _exec_with(adapters):
+    return ToolExecutorV2(adapters=adapters)
+
+
+def test_screen_read_returns_caption():
+    adapters = ToolRuntimeAdaptersV2(
+        screen_read=lambda uid, fid, mode: {"frame_id": "f1", "caption": "Mail inbox", "mode": mode},
+    )
+    res = _exec_with(adapters).execute(
+        ToolCallV2(name="screen.read", user_id="u1", args={"mode": "caption"})
+    )
+    assert res.ok
+    assert res.result["caption"] == "Mail inbox"
+
+
+def test_screen_read_unavailable_when_adapter_missing():
+    res = _exec_with(ToolRuntimeAdaptersV2()).execute(
+        ToolCallV2(name="screen.read", user_id="u1", args={})
+    )
+    assert not res.ok
+    assert res.error_code == "screen_adapter_missing"
+
+
+def test_screen_recent_lists_without_model():
+    adapters = ToolRuntimeAdaptersV2(
+        screen_recent=lambda uid, limit: {"frames": [{"frame_id": "f1", "ts": 1.0}]},
+    )
+    res = _exec_with(adapters).execute(
+        ToolCallV2(name="screen.recent", user_id="u1", args={"limit": 5})
+    )
+    assert res.ok
+    assert res.result["frames"][0]["frame_id"] == "f1"
+
+
+def test_screen_read_flag_off_is_disabled(monkeypatch):
+    from proactive.tool_executor_v2 import screen_runtime_adapters_v2
+    import proactive.screen_flag_v2
+
+    monkeypatch.setattr(proactive.screen_flag_v2, "screen_caption_enabled", lambda store: False)
+
+    fake_store = object()
+    adapters = screen_runtime_adapters_v2("api-key", fake_store)
+    res = ToolExecutorV2(adapters=adapters).execute(
+        ToolCallV2(name="screen.read", user_id="u1", args={})
+    )
+
+    assert res.outcome == "unavailable"
+    assert res.error_code == "screen_caption_disabled"

@@ -92,6 +92,9 @@ if not _provisioned:
         "test_provider_client.py",
         "test_history_import_identity.py",
         "test_model_api_prompts.py",
+        "test_enclave_frame_caption.py",
+        "test_screen_caption_backend.py",
+        "test_screen_caption_flag.py",
     }
     collect_ignore = sorted(
         f
