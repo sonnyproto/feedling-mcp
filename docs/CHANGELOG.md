@@ -49,6 +49,33 @@
 
 ## 2026-06-21
 
+### [DONE] 修 VPS resident 入驻接不上(MCP→enclave 迁移残留,跨仓库)
+- **现象**:test 环境 VPS 用户复制连接信息给自己的 agent,agent 卡在 Live
+  connection——consumer 去探 `test-mcp.feedling.app/mcp`、`/sse` 全 404,
+  decrypt source 不可达,verify_loop 永远 false。memory/identity 都没问题。
+- **根因(三个叠加,均非 agent 的错)**:
+  1. iOS `FeedlingAPI.residentConsumerConfig` 仍发死的 `FEEDLING_MCP_URL/KEY`,
+     且**完全不发** `FEEDLING_ENCLAVE_URL`(MCP 下线后 consumer 唯一的解密源)。
+  2. `skill-resident-agent.md` 让 agent 拉 `origin/main` 且以 HEAD==main 为 gate;
+     但 main 停在 MCP 下线**前**(aef4809),那版 consumer 仍走 MCP,与 test 后端对不上。
+     enclave 直连 consumer 在 `test` 分支。
+  3. 结果根本没人给 `FEEDLING_ENCLAVE_URL`。
+- **验证前提**:curl test enclave `-5003s.../v1/chat/history` → 无 key 401、带
+  Bearer key 200、attestation 200 → 解密源可用,方案成立。
+- **改动(决定:consumer ref 用 `test` 分支;解密走 enclave 直连)**:
+  - **iOS**(feedling-mcp-ios):`CVMEndpoints` 加派生量 `enclaveURL`
+    (`https://<appId>-5003s.<gateway>`,按环境自动出 test/prod);
+    `residentConsumerConfig` 去掉 `FEEDLING_MCP_URL/KEY`、改发 `FEEDLING_ENCLAVE_URL`;
+    `connectionDetailsBlock` 删掉死的 "Chat-client MCP command" 行。
+  - **io-onboarding** `skill-resident-agent.md`(EN+ZH):连接信息加 `FEEDLING_ENCLAVE_URL`;
+    consumer 来源 `origin/main`→`origin/test`、删 HEAD==main gate;新增"agent_name(卡里名字)
+    ≠ 选哪个 runtime 当传输,别为改名去换 runtime 或改 IDENTITY.md/BOOTSTRAP.md"。
+- **顺带解释用户的"想让 Hermes 连却选了 OpenClaw"**:agent 把"名字别叫 Hermes"误套到
+  "用哪个 runtime 传输",还改了 IDENTITY.md/BOOTSTRAP.md(违反"别包新人格")——已在 skill 拆清。
+- **未做(留作单独清理)**:chat-client(路由A)的 `mcpConnectionString`/empty-state MCP 命令
+  仍是死的;`main` 落后 `test` 两个月的 release 卫生;prod 是否同病(取决于 prod-mcp 是否还活)。
+- 验证 enclave 可达通过;iOS/skill 改动仅配置/文档,未跑构建(需 Xcode)。
+
 ### [BLOCKER] 感知工具循环只在 wake 路,前台聊天未收敛(违反 D1)→ 已派 Codex
 - **审出的缺口**(外部 Claude 排查 + 我代码核实):`run_tool_loop_v2` + `ToolExecutorV2`
   (全 catalog perception+memory)只接进**主动 wake 路**;**前台聊天两路都没接**——
