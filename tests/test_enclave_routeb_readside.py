@@ -88,7 +88,7 @@ def enclave_history_client(monkeypatch):
     monkeypatch.setattr(
         enclave_app,
         "_load_decrypted_moments",
-        lambda _api_key, _uid, _sk: [
+        lambda _api_key, _uid, _sk, limit=200: [
             _moment("mem_cat", "猫咪照顾", "用户聊猫咪健康问题时，先需要被安抚，再给观察饮水和精神状态的建议。", linked="猫咪"),
             _moment("mem_lark", "Lark 工作流", "用户希望 agent 帮忙读 Lark 群消息并整理重点。", linked="Lark"),
         ],
@@ -136,3 +136,32 @@ def test_routeb_flag_true_uses_readside_selection(enclave_history_client, monkey
     assert [item["id"] for item in body["context_memories"]] == ["mem_cat"]
     assert body["context_memory_trace"]["mode"] == "model_api_readside_v1"
     assert body["context_memory_trace"]["readside_enabled"] is True
+
+
+def test_routeb_readside_uses_configurable_memory_limit(enclave_history_client, monkeypatch):
+    captured_limits = []
+
+    def fake_load(api_key, uid, sk, limit=200):
+        captured_limits.append(limit)
+        return [
+            _moment("mem_cat", "猫咪照顾", "用户聊猫咪健康问题时，先需要被安抚。", linked="猫咪"),
+        ]
+
+    monkeypatch.setattr(enclave_app, "_load_decrypted_moments", fake_load)
+
+    monkeypatch.delenv("MEMORY_READSIDE_FOR_MODEL_API", raising=False)
+    enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1")
+    assert captured_limits[-1] == 200
+
+    monkeypatch.setenv("MEMORY_READSIDE_FOR_MODEL_API", "true")
+    monkeypatch.delenv("MEMORY_READSIDE_MODEL_API_LIMIT", raising=False)
+    enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1")
+    assert captured_limits[-1] == 50
+
+    monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", "80")
+    enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1")
+    assert captured_limits[-1] == 80
+
+    monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", "999")
+    enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1")
+    assert captured_limits[-1] == 200

@@ -810,6 +810,15 @@ def _memory_readside_for_model_api_enabled() -> bool:
     return _env_flag_enabled("MEMORY_READSIDE_FOR_MODEL_API")
 
 
+def _memory_readside_model_api_limit() -> int:
+    raw = os.environ.get("MEMORY_READSIDE_MODEL_API_LIMIT", "50")
+    try:
+        value = int(str(raw or "50").strip())
+    except (TypeError, ValueError):
+        value = 50
+    return max(1, min(value, 200))
+
+
 def _context_moment_to_index_item(moment: dict) -> dict:
     """Convert the existing plaintext context card into a readside index item.
 
@@ -1227,7 +1236,6 @@ def v1_chat_history():
             if m.get("role") == "user" and m.get("content"):
                 latest_user_text = m["content"]
                 break
-        moments = _load_decrypted_moments(api_key, authorized_user_id, content_sk)
         context_mode = str(
             request.args.get("context_mode")
             or request.args.get("contextMode")
@@ -1237,6 +1245,8 @@ def v1_chat_history():
             context_mode = "strict"
         want_trace = str(request.args.get("context_trace") or "").lower() in {"1", "true", "yes", "on"}
         use_readside = context_mode == "model_api" and _memory_readside_for_model_api_enabled()
+        memory_limit = _memory_readside_model_api_limit() if use_readside else 200
+        moments = _load_decrypted_moments(api_key, authorized_user_id, content_sk, limit=memory_limit)
         if use_readside:
             context_memories, context_memory_trace = _select_context_memories_via_readside(
                 moments,
