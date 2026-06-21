@@ -533,8 +533,8 @@ def test_model_api_chat_falls_back_to_auto_readside_when_model_does_not_call_mem
             return {"reply": appmod.json.dumps({"reply": "我不确定。"}), "usage": {"total_tokens": 3}}
         joined = "\n".join(str(m.get("content") or "") for m in messages)
         assert "猫叫武松" in joined
-        assert "Memory fallback cards have higher priority than recent assistant messages" in joined
-        assert "Do not ignore these fallback cards just because their original selection trace says weak" in joined
+        assert "Safety/privacy boundaries >= the user's current explicit message or correction > directly relevant fallback memory > conflicting assistant draft from before this fallback" in joined
+        assert "Do not use fallback memory to argue against the user's current correction" in joined
         return {
             "reply": appmod.json.dumps({"reply": "记得，你家猫叫武松。"}),
             "usage": {"total_tokens": 6},
@@ -568,6 +568,53 @@ def test_model_api_chat_falls_back_to_auto_readside_when_model_does_not_call_mem
     trace = next(item for item in traces if item["trace_id"] == trace_id)
     assert trace["context"]["memory_tools"]["mode"] == "fallback"
     assert trace["context"]["memory_tools"]["fallback_reason"] == "no_tool_call_backfilled"
+
+
+def test_model_api_memory_fallback_instruction_prioritizes_memory_over_conflicting_draft():
+    msg = appmod.hosted_chat_routes._memory_fallback_instruction_message(
+        "auto_readside",
+        [{"id": "mem_cat", "title": "猫叫武松", "description": "用户家猫叫武松。"}],
+        {"selected": [{"id": "mem_cat", "reason": "topic_supported_weak_generic_overlap"}]},
+    )
+
+    content = msg["content"]
+    assert "Safety/privacy boundaries >= the user's current explicit message or correction > directly relevant fallback memory > conflicting assistant draft from before this fallback" in content
+    assert "If fallback memory directly answers the latest user message, use it instead of any conflicting assistant draft" in content
+
+
+def test_model_api_memory_fallback_instruction_does_not_override_user_correction():
+    msg = appmod.hosted_chat_routes._memory_fallback_instruction_message(
+        "auto_readside",
+        [{"id": "mem_old", "title": "用户有一只猫", "description": "旧记忆：用户有一只猫。"}],
+        {},
+    )
+
+    content = msg["content"]
+    assert "Do not use fallback memory to argue against the user's current correction" in content
+    assert "If the user now corrects or updates a fact, follow the current user message" in content
+
+
+def test_model_api_memory_fallback_instruction_uses_content_not_weak_label():
+    msg = appmod.hosted_chat_routes._memory_fallback_instruction_message(
+        "index_selector",
+        [{"id": "mem_cat", "summary": "用户的橘猫叫武松。"}],
+        {"selected": [{"id": "mem_cat", "reason": "topic_supported_weak_generic_overlap"}]},
+    )
+
+    content = msg["content"]
+    assert "Judge fallback memories by whether their content directly answers the latest user message, not by weak/generic/approximate trace labels alone" in content
+
+
+def test_model_api_memory_fallback_instruction_avoids_hard_claims_for_tangential_memory():
+    msg = appmod.hosted_chat_routes._memory_fallback_instruction_message(
+        "auto_readside",
+        [{"id": "mem_bike", "title": "用户喜欢某辆自行车"}],
+        {"selected": [{"id": "mem_bike", "reason": "weak_generic_overlap"}]},
+    )
+
+    content = msg["content"]
+    assert "If fallback memory is only tangentially related, do not make a hard factual claim from it" in content
+    assert "say you are not sure rather than over-asserting" in content
 
 
 def test_model_api_chat_fallback_uses_index_selector_when_auto_readside_is_empty(client, monkeypatch):

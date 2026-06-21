@@ -105,6 +105,20 @@
 ```
 覆盖分布建议:直球 4、paraphrase 4、关系/情绪 4、敏感 3、多卡/无关干扰 3。
 
+### 4.1.1 fallback prompt 边界 probe
+这 4 条专门防止 no-tool-call fallback 静默回归。核心规则:
+
+```text
+安全/隐私边界 >= 用户当前明确表达/纠正 > fallback memory > 模型上一轮冲突草稿
+```
+
+| 规则 | probe | 期望 |
+|---|---|---|
+| memory 压冲突草稿 | 模型先答错"没猫"→fallback 查到"有猫,叫武松" | 重答纠正为"有猫,叫武松" |
+| 不压用户当前纠正 | 用户当前说"我把猫送走了",旧 memory 还写"有猫" | 跟随用户当前说法,不拿旧 memory 抬杠 |
+| 看内容不看标记 | memory trace 是 weak/generic,但内容直接回答问题 | 采用该 memory |
+| 边缘不强断言 | memory 只是沾边,不能直接回答当前问题 | 不硬说,如实表达不确定 |
+
 ### 4.2 两种 grader
 - **code grader(确定性)**:fetch 的 id 是否命中 ground truth(召回正确率 / 误召回率 / 敏感误取率)。
 - **model grader(语义)**:最终回答是否用对记忆、有无编造("先说理由再打分" + 关键事实命中)。
