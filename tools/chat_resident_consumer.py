@@ -107,11 +107,15 @@ try:
 except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
-from proactive.adapters_v2 import wake_event_v2_from_legacy_job
 from proactive.agent_protocol_v2 import build_agent_context_v2
-from proactive.runtime_v2 import merge_wakes_v2
 from proactive.tool_catalog_v2 import foreground_chat_tool_context_v2, tool_catalog_v2_for_runtime
 from proactive.tool_loop_v2 import run_tool_loop_v2
+# NOTE: proactive.adapters_v2 and proactive.runtime_v2 are imported lazily inside
+# the proactive-job path (_resident_v2_agent_context_for_job). They transitively
+# pull the backend DB layer (runtime_v2 -> observability_v2 -> db -> psycopg),
+# which a resident consumer (a pure HTTP client with no database) must not be
+# forced to install just to reply to chat. Keeping them out of module import
+# means the chat reply loop runs psycopg-free.
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -2929,6 +2933,10 @@ def _resident_v2_agent_context_for_job(
     recent_chat_context: Any = "",
     runtime: str = "resident",
 ) -> dict[str, Any]:
+    # Lazy import: these pull the backend DB layer (psycopg) and are only needed
+    # on the proactive-job path, not for chat replies. See the import-block note.
+    from proactive.adapters_v2 import wake_event_v2_from_legacy_job
+    from proactive.runtime_v2 import merge_wakes_v2
     event = wake_event_v2_from_legacy_job(_resident_user_id_for_job(job), job)
     merged = merge_wakes_v2([event], tool_catalog=tool_catalog_v2_for_runtime(runtime))
     return build_agent_context_v2(
