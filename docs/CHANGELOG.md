@@ -71,8 +71,16 @@
   - **①(skill,io-onboarding main)**`skill-resident-agent.md` 加硬规则:**consumer 的 agent 入口
     必须是收到 onboarding 指令的那个 runtime 本身**,多 runtime 同机时不许改接"更顺手"的兄弟;
     runtime 自报名字是 agent_name 的事,别为此换 runtime 或改 IDENTITY.md/BOOTSTRAP.md。
-- **自测**:② 本地单测 + 3 回归全过;VPS 端到端验证见下条/会话记录。
-- **遗留**:① 是 skill 约束,不能 100% 强制 agent 守规;OpenClaw 仍非文档化入口(但现在能解析了)。
+  - **④(consumer)**自测中发现:test 版 consumer 顶层 import `proactive.adapters_v2`/
+    `runtime_v2` → `observability_v2` → `db` → **psycopg**,而 resident(纯 HTTP 客户端、无 DB)
+    的 venv 没有 psycopg → 切 test 分支后 import 直接崩。这俩符号只在 proactive-job 路用,
+    已改**惰性导入**,聊天回复路 import 即 psycopg-free。
+- **端到端自测(真实 VPS + 真实 OpenClaw)**:把 VPS consumer 切到 test 分支、重启(decrypt
+  source OK enclave、无 crash),调 `/v1/chat/verify_loop` → **`passing=true`,response 15.1s**;
+  consumer 日志 `verify ping — exercising real agent path` → `real agent reply OK`。即
+  poll→真调 OpenClaw→解析 payloads→回写 整条链已通,原"回消息没回复"复现并修复。
+- **遗留**:① 是 skill 约束,不能 100% 强制 agent 守规;OpenClaw 仍非文档化入口(但现在能解析了);
+  proactive-job 路仍需 psycopg(把 `merge_wakes_v2` 从 db-bound 模块拆出是单独的后端清理)。
 
 ## 2026-06-21
 
