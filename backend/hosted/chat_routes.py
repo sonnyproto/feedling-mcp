@@ -309,14 +309,16 @@ def model_api_chat_send():
         )
         fallback_memories = fallback_context_payload.get("context_memories") or []
         if fallback_memories:
-            final_messages = list(provider_messages)
-            final_messages.append({"role": "assistant", "content": raw_reply[:4000]})
+            final_messages = list(fallback_messages)
+            final_messages.insert(2, hosted_turn._model_api_turn_contract_message())
             final_messages.append({
                 "role": "system",
-                "content": "Auto memory fallback JSON:\n" + json.dumps({
-                    "context_memories": fallback_memories[:8],
-                    "context_memory_trace": fallback_context_payload.get("context_memory_trace") or {},
-                }, ensure_ascii=False)[:8000],
+                "content": (
+                    "Memory fallback was triggered because the first answer did not call memory tools. "
+                    "The candidate memory context in the runtime JSON is relevant to the user's latest message. "
+                    "Answer the latest user message again using that memory. If a memory directly answers the question, "
+                    "do not say you are unsure or ask the user to tell you again."
+                ),
             })
             try:
                 final_result = provider_client.chat_completion(
