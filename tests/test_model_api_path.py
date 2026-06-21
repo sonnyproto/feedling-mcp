@@ -507,7 +507,10 @@ def test_model_api_chat_falls_back_to_auto_readside_when_model_does_not_call_mem
     def fake_enclave(path, key, params=None):
         if path == "/v1/chat/history":
             return {
-                "messages": [],
+                "messages": [
+                    {"role": "user", "content": "我有只猫吗？"},
+                    {"role": "assistant", "content": "没有。"},
+                ],
                 "context_memories": [
                     {
                         "id": "mem_cat",
@@ -530,6 +533,8 @@ def test_model_api_chat_falls_back_to_auto_readside_when_model_does_not_call_mem
             return {"reply": appmod.json.dumps({"reply": "我不确定。"}), "usage": {"total_tokens": 3}}
         joined = "\n".join(str(m.get("content") or "") for m in messages)
         assert "猫叫武松" in joined
+        assert "Memory fallback cards have higher priority than recent assistant messages" in joined
+        assert "Do not ignore these fallback cards just because their original selection trace says weak" in joined
         return {
             "reply": appmod.json.dumps({"reply": "记得，你家猫叫武松。"}),
             "usage": {"total_tokens": 6},

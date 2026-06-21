@@ -354,18 +354,31 @@ def model_api_chat_send():
         if fallback_memories:
             final_messages = list(fallback_messages)
             final_messages.insert(2, hosted_turn._model_api_turn_contract_message())
+            fallback_json = json.dumps({
+                "source": fallback_source,
+                "context_memories": fallback_memories[:8],
+                "context_memory_trace": fallback_context_payload.get("context_memory_trace") or {},
+            }, ensure_ascii=False)[:8000]
             final_messages.append({
                 "role": "system",
                 "content": (
                     "Memory fallback was triggered because the first answer did not call memory tools. "
                     "The memory fallback JSON below is relevant to the user's latest message. "
-                    "Answer the latest user message again using that memory. If a memory directly answers the question, "
-                    "do not say you are unsure or ask the user to tell you again.\n"
-                    "Memory fallback JSON:\n" + json.dumps({
-                        "source": fallback_source,
-                        "context_memories": fallback_memories[:8],
-                        "context_memory_trace": fallback_context_payload.get("context_memory_trace") or {},
-                    }, ensure_ascii=False)[:8000]
+                    "Memory fallback cards have higher priority than recent assistant messages; recent assistant "
+                    "messages may contain the mistaken answer that triggered this fallback. "
+                    "Do not ignore these fallback cards just because their original selection trace says weak, "
+                    "generic, or approximate; the backend has already selected them as relevant fallback context. "
+                    "If a fallback memory directly answers the user's question, answer from that memory and do not "
+                    "say you are unsure, do not ask the user to tell you again, and do not repeat an earlier "
+                    "conflicting assistant answer. Do not mention memory fallback, tools, traces, or JSON to the user.\n"
+                    "Memory fallback JSON:\n" + fallback_json
+                ),
+            })
+            final_messages.append({
+                "role": "user",
+                "content": (
+                    "Answer my latest message again now. Use the memory fallback cards above as authoritative "
+                    "when they directly answer it. Return the normal Feedling chat turn JSON only."
                 ),
             })
             try:
