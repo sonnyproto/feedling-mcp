@@ -71,19 +71,26 @@
 ## 3. 降级兜底测试(Q1 设计,重点)
 
 文件:`tests/test_memory_tools_fallback.py`(新增)
-目标:证明**任何模型都不会丢召回**(M1.5 prompt-level,唯一兜底 = no-tool-call 回填)。
+目标:证明**任何模型都不会丢召回**。M1.5 prompt-level 下,模型不调工具时按三层回填:
+
+```text
+agent tools 主路径
+→ fallback index-fetch(先查 index,selector 选 id,再 fetch 正文)
+→ fallback auto_readside(旧线上检索最后兜底)
+```
 
 **M1.5 必测(prompt-level):**
 | 用例 | 脚本模型行为 | 断言 trace.mode | 断言行为 |
 |---|---|---|---|
 | 默认挂工具 | 任意模型 | — | prompt 里默认都带 memory 工具说明 |
-| 没调工具+有候选 | 模型不输出 tool_calls;库里有相关记忆 | `fallback` + `fallback_reason=no_tool_call_backfilled` | 跑 selector→注入→**重答一次**;最终答含记忆 |
-| 没调工具+无候选 | 模型不输出 tool_calls;库里无相关 | `agent_tools`(无回填) | selector 空→不回填→直接用原答 |
+| 没调工具+index 有候选 | 模型不输出 tool_calls;index-fetch 命中相关记忆 | `fallback` + `fallback_source=index_selector` | 先跑 index→selector→fetch→注入→**重答一次**;最终答含记忆 |
+| 没调工具+index 无候选但 auto 有候选 | 模型不输出 tool_calls;index-fetch 未命中,旧检索命中 | `fallback` + `fallback_source=auto_readside` | 退回 auto_readside→注入→重答一次;最终答不低于旧线上 |
+| 没调工具+无候选 | 模型不输出 tool_calls;index-fetch 和 auto 都无相关 | `agent_tools`(无回填) | 不回填→直接用原答 |
 | 正常调工具 | 模型输出 index/fetch tool_calls | `agent_tools` | **不触发回填**(用取回的) |
 | 不双塞 | 模型调了工具 | — | 同一轮不再 auto 注入(去重,无重复记忆) |
-| 弱模型≈现状 | 模型从不输出 tool_calls | `fallback` | 召回结果与纯 auto_readside **一致**(不回归) |
+| 弱模型≈现状 | 模型从不输出 tool_calls | `fallback` | 优先验证新 index-fetch;失败再退回 auto_readside,保证不低于旧线上 |
 
-> 关键覆盖:**弱模型(不按格式调工具)召回率必须 = 现状 auto_readside**(不回归);会调工具的才升级。这就是 hx 要的"工具化后弱模型不失忆"。
+> 关键覆盖:**弱模型(不按格式调工具)召回率必须不低于现状 auto_readside**。新链路能命中时优先用新链路;新链路没命中时,旧 auto_readside 最后兜底,避免"工具化后弱模型失忆"。
 
 **推迟到原生 function calling 阶段(M1.5 不测,设计先存档):** provider 拒绝 tools 参数 / 拒绝阈值不决绝 / 429-5xx 不计数 / 自学跳过+定期重探自愈。prompt-level 下没有 tools 参数可被拒,这组用例届时再补。
 

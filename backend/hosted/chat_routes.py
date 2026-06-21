@@ -337,51 +337,63 @@ def model_api_chat_send():
             api_key,
             message_for_context,
             include_screen_context=False,
-            include_memory_context=True,
+            include_memory_context=False,
         )
-        fallback_memories = fallback_context_payload.get("context_memories") or []
-        fallback_source = "auto_readside"
+        fallback_memories = []
+        fallback_source = "index_selector"
         fallback_tool_trace: dict = {}
         fallback_index_selection: dict = {}
-        if not fallback_memories:
-            try:
-                index_result = hosted_memory_tools.execute_memory_tool(
+        try:
+            index_result = hosted_memory_tools.execute_memory_tool(
+                store,
+                api_key,
+                hosted_memory_tools.MEMORY_INDEX_TOOL,
+                {
+                    "query": message_for_context,
+                    "limit": 50,
+                    "include_sensitive": False,
+                },
+                trace=fallback_tool_trace,
+            )
+            index_items = index_result.get("items") if isinstance(index_result.get("items"), list) else []
+            fallback_index_selection = select_memory_index_items(
+                message_for_context,
+                index_items,
+                cap=3,
+                include_sensitive=False,
+            )
+            selected_ids = fallback_index_selection.get("selected_ids") if isinstance(fallback_index_selection.get("selected_ids"), list) else []
+            if selected_ids:
+                fetch_result = hosted_memory_tools.execute_memory_tool(
                     store,
                     api_key,
-                    hosted_memory_tools.MEMORY_INDEX_TOOL,
-                    {
-                        "query": message_for_context,
-                        "limit": 50,
-                        "include_sensitive": False,
-                    },
+                    hosted_memory_tools.MEMORY_FETCH_TOOL,
+                    {"ids": selected_ids[:3]},
                     trace=fallback_tool_trace,
                 )
-                index_items = index_result.get("items") if isinstance(index_result.get("items"), list) else []
-                fallback_index_selection = select_memory_index_items(
-                    message_for_context,
-                    index_items,
-                    cap=3,
-                    include_sensitive=False,
-                )
-                selected_ids = fallback_index_selection.get("selected_ids") if isinstance(fallback_index_selection.get("selected_ids"), list) else []
-                if selected_ids:
-                    fetch_result = hosted_memory_tools.execute_memory_tool(
-                        store,
-                        api_key,
-                        hosted_memory_tools.MEMORY_FETCH_TOOL,
-                        {"ids": selected_ids[:3]},
-                        trace=fallback_tool_trace,
-                    )
-                    fallback_memories = fetch_result.get("items") if isinstance(fetch_result.get("items"), list) else []
-                    fallback_context_payload["context_memories"] = fallback_memories[:8]
-                    fallback_context_payload["context_memory_trace"] = fallback_index_selection.get("trace") or {}
-                    fallback_source = "index_selector"
-            except Exception as e:
-                fallback_tool_trace.setdefault("tool_calls", []).append({
-                    "name": "memory_fallback_index_selector",
-                    "ok": False,
-                    "error": f"{type(e).__name__}:{str(e)[:160]}",
-                })
+                fallback_memories = fetch_result.get("items") if isinstance(fetch_result.get("items"), list) else []
+                fallback_context_payload["context_memories"] = fallback_memories[:8]
+                fallback_context_payload["context_memory_trace"] = fallback_index_selection.get("trace") or {}
+        except Exception as e:
+            fallback_tool_trace.setdefault("tool_calls", []).append({
+                "name": "memory_fallback_index_selector",
+                "ok": False,
+                "error": f"{type(e).__name__}:{str(e)[:160]}",
+            })
+        if not fallback_memories:
+            auto_messages, auto_context_payload, _auto_images = hosted_context._model_api_context_messages(
+                store,
+                api_key,
+                message_for_context,
+                include_screen_context=False,
+                include_memory_context=True,
+            )
+            auto_memories = auto_context_payload.get("context_memories") or []
+            if auto_memories:
+                fallback_messages = auto_messages
+                fallback_context_payload = auto_context_payload
+                fallback_memories = auto_memories
+                fallback_source = "auto_readside"
         if fallback_memories:
             final_messages = list(fallback_messages)
             final_messages.insert(2, hosted_turn._model_api_turn_contract_message())
