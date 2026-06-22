@@ -61,6 +61,7 @@ from accounts import onboarding as accounts_onboarding
 from accounts import registry
 from core import store as core_store
 from core import enclave as core_enclave
+from core import util as core_util
 from proactive import gate as proactive_gate
 from proactive.adapters_v2 import legacy_job_from_wake_event_v2, wake_event_v2_from_legacy_job
 from proactive.agent_protocol_v2 import actions_for_persistence_v2
@@ -210,7 +211,9 @@ def _hosted_wake_runtime_v2_enabled(store: UserStore) -> bool:
         profile = hosted_config_store._ensure_model_api_runtime_profile(store, config) or {}
         if HOSTED_WAKE_RUNTIME_V2_FLAG in profile:
             return bool(profile.get(HOSTED_WAKE_RUNTIME_V2_FLAG))
-        return bool(config.get(HOSTED_WAKE_RUNTIME_V2_FLAG))
+        if HOSTED_WAKE_RUNTIME_V2_FLAG in config:
+            return bool(config.get(HOSTED_WAKE_RUNTIME_V2_FLAG))
+        return core_util.runtime_v2_default_on()
     except Exception as e:
         print(f"[hosted-wake:{store.user_id}] v2 flag load failed, using legacy executor: {e}")
         return False

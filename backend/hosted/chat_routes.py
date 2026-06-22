@@ -21,6 +21,7 @@ from flask import Blueprint, Response, jsonify, request, g
 import db
 from chat import service as chat_service
 from core import envelope as core_envelope
+from core import util as core_util
 from flask import current_app
 from core.store import UserStore
 
@@ -106,7 +107,9 @@ def _hosted_chat_full_tool_loop_v2_enabled(store: UserStore) -> bool:
         profile = hosted_config_store._ensure_model_api_runtime_profile(store, config) or {}
         if HOSTED_CHAT_FULL_TOOL_LOOP_V2_FLAG in profile:
             return bool(profile.get(HOSTED_CHAT_FULL_TOOL_LOOP_V2_FLAG))
-        return bool((config or {}).get(HOSTED_CHAT_FULL_TOOL_LOOP_V2_FLAG))
+        if HOSTED_CHAT_FULL_TOOL_LOOP_V2_FLAG in (config or {}):
+            return bool((config or {}).get(HOSTED_CHAT_FULL_TOOL_LOOP_V2_FLAG))
+        return core_util.runtime_v2_default_on()
     except Exception:
         return False
 

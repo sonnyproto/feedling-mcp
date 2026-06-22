@@ -1,11 +1,14 @@
-"""Per-user fail-closed flag for screen.read VLM captioning.
+"""Per-user flag for screen.read VLM captioning.
 
-Mirrors perception_ingress_runtime_v2_enabled: default OFF, any load error
-falls back to OFF so a config/db hiccup can never silently enable screen
-egress to a third-party VLM.
+Default follows the env-gated baseline (core/util.runtime_v2_default_on): OFF in
+prod-without-env, ON where FEEDLING_RUNTIME_V2_DEFAULT_ON=true. An explicit
+per-user value still wins. NOTE: this gates screen egress to a third-party VLM,
+so it stays fail-closed on errors — any config/db hiccup falls back to OFF and
+never silently enables egress.
 """
 from __future__ import annotations
 
+from core import util as core_util
 from hosted import config_store as hosted_config_store
 
 SCREEN_CAPTION_FLAG = "screen_caption_enabled"
@@ -17,6 +20,8 @@ def screen_caption_enabled(store) -> bool:
         profile = hosted_config_store._ensure_model_api_runtime_profile(store, config) or {}
         if SCREEN_CAPTION_FLAG in profile:
             return bool(profile.get(SCREEN_CAPTION_FLAG))
-        return bool(config.get(SCREEN_CAPTION_FLAG))
+        if SCREEN_CAPTION_FLAG in config:
+            return bool(config.get(SCREEN_CAPTION_FLAG))
+        return core_util.runtime_v2_default_on()
     except Exception:
         return False

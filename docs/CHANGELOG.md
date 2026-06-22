@@ -49,6 +49,15 @@
 
 ## 2026-06-22
 
+### [DECISION] V2 baseline 扩展到全部 4 个 rollout flag + prod 也默认 ON
+- **背景**：上一条只把 `perception_ingress` / `resident_wake` / `resident_chat` 接入 env baseline。但 hosted(API) 用户线还有 `hosted_wake_runtime_v2_enabled`、`hosted_chat_full_tool_loop_v2_enabled` 仍 OFF → hosted 用户感知数据进来了（ingress 已 ON），但 wake 走 legacy executor、前台聊天不 pull 感知工具（半截）。`screen_caption_enabled` 也 OFF。
+- **改动**：
+  - 三个 reader（`hosted/wake_consumer.py`、`hosted/chat_routes.py`、`proactive/screen_flag_v2.py`）改为未设值时回落 `core/util.runtime_v2_default_on()` baseline；显式 per-user 值仍优先。
+  - `hosted/config_store.py` 停止播种这三个 + perception 共 **4 个** flag；scrub 从单 flag 的 bool marker 泛化为 **set marker** `v2_autoseed_scrubbed_flags`（`AUTOSEED_SCRUB_FLAGS` 列表），兼容旧 `perception_v2_autoseed_scrubbed` bool（迁移进 set 并删除旧 key）。每个 flag 一次性清理历史播种 False，之后运维显式写的 False（per-user opt-out）存活。
+  - **prod 也默认 ON**：上一轮已给 `docker-compose.phala.yaml` 加了 `FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"`，所以 4 个 flag 在 test+prod 两个 compose 下都默认 ON。**两个 compose 不用再改**——新接入的 flag 共用同一个 env baseline 自动跟着 ON。
+- **screen_caption 隐私决定**：它把屏幕截图外发第三方 VLM(OpenRouter)，原为 fail-closed opt-in。用户**明确选择默认 ON**（含 prod）。reader 仍保留 error→OFF 的 fail-closed。
+- **测试**：`test_runtime_v2_default_flag.py` 扩展（4-flag scrub + set marker + 旧 bool marker 迁移 + hosted_wake/hosted_chat/screen_caption baseline）；本地非 DB 回归 200 passed。需 PG 的（`test_hosted_wake_v2_cutover` / `test_model_api_wake` / `test_proactive_tool_execute_route`）交给 CI。
+
 ### [DECISION] Perception/Resident V2 rollout flags 改为 env-gated baseline（test 默认 ON / prod OFF）
 - **背景**:三个 V2 灰度 flag(`perception_ingress_runtime_v2_enabled`、
   `resident_wake_runtime_v2_enabled`、`resident_chat_runtime_v2_enabled`)默认全 OFF,

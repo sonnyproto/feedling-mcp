@@ -95,11 +95,21 @@ def _public_model_api_config(config: dict | None) -> dict:
 MODEL_API_RUNTIME_BLOB = "model_api_runtime"
 MODEL_API_RUNTIME_VERSION = 2
 MODEL_API_RUNTIME_MODE = "hosted_resident"
-# Marker for the one-time scrub of the legacy auto-seeded
-# perception_ingress_runtime_v2_enabled=False artifact (see
-# _ensure_model_api_runtime_profile). Once set, deliberate per-user False
-# opt-outs are preserved instead of being scrubbed on every read.
-PERCEPTION_V2_AUTOSEED_SCRUBBED = "perception_v2_autoseed_scrubbed"
+# One-time scrub of legacy auto-seeded `<flag>=False` artifacts. These flags are
+# env-gated rollout baselines (core/util.runtime_v2_default_on); seeding them as
+# False used to pin every profile and defeat the baseline. We scrub the seeded
+# False ONCE per flag (tracked in V2_AUTOSEED_SCRUBBED_FLAGS), then leave the flag
+# alone so a deliberate per-user opt-out written later as False survives. No setter
+# ever writes False, so any pre-scrub False is a seed artifact; explicit True is
+# always preserved.
+PERCEPTION_V2_AUTOSEED_SCRUBBED = "perception_v2_autoseed_scrubbed"  # legacy bool marker (rev 1)
+V2_AUTOSEED_SCRUBBED_FLAGS = "v2_autoseed_scrubbed_flags"
+AUTOSEED_SCRUB_FLAGS = (
+    "perception_ingress_runtime_v2_enabled",
+    "hosted_wake_runtime_v2_enabled",
+    "hosted_chat_full_tool_loop_v2_enabled",
+    "screen_caption_enabled",
+)
 MODEL_API_ACTION_TRACE_STREAM = "model_api_action_traces"
 # One append per model-API action (then patched by trace_id on completion).
 # High frequency; cap the stream. A background trace is appended as ``queued``
@@ -152,12 +162,11 @@ def _ensure_model_api_runtime_profile(
         "last_recap_at": None,
         "last_action_trace_id": None,
         "memory_quality_warning": None,
-        "hosted_wake_runtime_v2_enabled": False,
-        "hosted_chat_full_tool_loop_v2_enabled": False,
-        # perception_ingress_runtime_v2_enabled is intentionally NOT seeded here.
-        # It is an env-gated rollout flag (perception.service.runtime_v2 baseline);
-        # seeding it as False used to pin every profile and defeat that baseline.
-        "screen_caption_enabled": False,
+        # The env-gated rollout flags (perception_ingress / hosted_wake /
+        # hosted_chat_full_tool_loop / screen_caption) are intentionally NOT seeded
+        # here. Their default comes from core/util.runtime_v2_default_on(); seeding
+        # them as False would pin every profile and defeat that baseline. See
+        # AUTOSEED_SCRUB_FLAGS for the one-time cleanup of legacy seeded values.
         "provider": str(config.get("provider") or ""),
         "model": str(config.get("model") or ""),
     }
@@ -169,16 +178,24 @@ def _ensure_model_api_runtime_profile(
         ):
             profile[key] = value
             changed = True
-    # One-time migration: the old code auto-seeded perception_ingress_runtime_v2_enabled
-    # as False, which pinned every profile and defeated the env-gated baseline. Scrub
-    # that legacy artifact ONCE (gated by a marker) so existing users fall through to the
-    # baseline. We must NOT scrub on every read: a deliberate per-user opt-out written
-    # later as False would otherwise be deleted before the reader sees it. After the
-    # marker is set, an explicit False survives and wins over the baseline.
-    if not profile.get(PERCEPTION_V2_AUTOSEED_SCRUBBED):
-        if profile.get("perception_ingress_runtime_v2_enabled") is False:
-            profile.pop("perception_ingress_runtime_v2_enabled", None)
-        profile[PERCEPTION_V2_AUTOSEED_SCRUBBED] = True
+    # One-time migration: scrub the legacy auto-seeded `<flag>=False` for each
+    # env-gated rollout flag exactly once, so existing profiles fall through to the
+    # baseline. We must NOT scrub on every read — a deliberate per-user opt-out
+    # written later as False would be deleted before the reader sees it. Each flag is
+    # recorded in V2_AUTOSEED_SCRUBBED_FLAGS after its one scrub; afterwards an
+    # explicit False survives and wins over the baseline.
+    scrubbed = set(profile.get(V2_AUTOSEED_SCRUBBED_FLAGS) or [])
+    if profile.pop(PERCEPTION_V2_AUTOSEED_SCRUBBED, None):  # migrate legacy rev-1 marker
+        scrubbed.add("perception_ingress_runtime_v2_enabled")
+        changed = True
+    for flag in AUTOSEED_SCRUB_FLAGS:
+        if flag not in scrubbed:
+            if profile.get(flag) is False:
+                profile.pop(flag, None)
+            scrubbed.add(flag)
+            changed = True
+    if profile.get(V2_AUTOSEED_SCRUBBED_FLAGS) != sorted(scrubbed):
+        profile[V2_AUTOSEED_SCRUBBED_FLAGS] = sorted(scrubbed)
         changed = True
     if changed or not existing:
         profile = _save_model_api_runtime_profile(store, profile)

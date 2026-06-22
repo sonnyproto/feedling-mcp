@@ -128,9 +128,11 @@ def test_ensure_profile_preserves_deliberate_false_after_marker_set(monkeypatch)
     assert out.get("perception_ingress_runtime_v2_enabled") is False
 
 
-def test_ensure_profile_sets_scrub_marker(monkeypatch):
-    # The one-time migration stamps the marker so it does not re-run on every read.
+def test_ensure_profile_scrubs_all_four_seeded_flags_and_records_marker(monkeypatch):
+    # The one-time migration scrubs every env-gated rollout flag's seeded False and
+    # records each in the marker set so it does not re-run on every read.
     store = SimpleNamespace(user_id="u_marker")
+    seeded = {f: False for f in hosted_config_store.AUTOSEED_SCRUB_FLAGS}
     monkeypatch.setattr(
         hosted_config_store,
         "_load_model_api_runtime_profile",
@@ -138,7 +140,7 @@ def test_ensure_profile_sets_scrub_marker(monkeypatch):
             "runtime_mode": hosted_config_store.MODEL_API_RUNTIME_MODE,
             "runtime_version": hosted_config_store.MODEL_API_RUNTIME_VERSION,
             "tool_action_enabled": True,
-            "perception_ingress_runtime_v2_enabled": False,
+            **seeded,
         },
     )
     monkeypatch.setattr(
@@ -147,8 +149,88 @@ def test_ensure_profile_sets_scrub_marker(monkeypatch):
     out = hosted_config_store._ensure_model_api_runtime_profile(
         store, {"provider": "p", "model": "m"}
     )
-    assert out.get(hosted_config_store.PERCEPTION_V2_AUTOSEED_SCRUBBED) is True
-    assert "perception_ingress_runtime_v2_enabled" not in out
+    assert set(out.get(hosted_config_store.V2_AUTOSEED_SCRUBBED_FLAGS)) == set(
+        hosted_config_store.AUTOSEED_SCRUB_FLAGS
+    )
+    for flag in hosted_config_store.AUTOSEED_SCRUB_FLAGS:
+        assert flag not in out
+
+
+def test_legacy_bool_marker_migrates_and_preserves_perception_optout(monkeypatch):
+    # A profile carrying the old rev-1 bool marker + a deliberate perception False
+    # must migrate the marker into the set form WITHOUT scrubbing that False.
+    store = SimpleNamespace(user_id="u_legacy")
+    monkeypatch.setattr(
+        hosted_config_store,
+        "_load_model_api_runtime_profile",
+        lambda s: {
+            "runtime_mode": hosted_config_store.MODEL_API_RUNTIME_MODE,
+            "runtime_version": hosted_config_store.MODEL_API_RUNTIME_VERSION,
+            "tool_action_enabled": True,
+            hosted_config_store.PERCEPTION_V2_AUTOSEED_SCRUBBED: True,  # legacy rev-1
+            "perception_ingress_runtime_v2_enabled": False,  # deliberate opt-out
+        },
+    )
+    monkeypatch.setattr(
+        hosted_config_store, "_save_model_api_runtime_profile", lambda s, profile: profile
+    )
+    out = hosted_config_store._ensure_model_api_runtime_profile(
+        store, {"provider": "p", "model": "m"}
+    )
+    assert out.get("perception_ingress_runtime_v2_enabled") is False  # preserved
+    assert "perception_ingress_runtime_v2_enabled" in set(
+        out.get(hosted_config_store.V2_AUTOSEED_SCRUBBED_FLAGS)
+    )
+    assert hosted_config_store.PERCEPTION_V2_AUTOSEED_SCRUBBED not in out  # legacy marker dropped
+
+
+def test_screen_caption_follows_env_baseline_and_explicit_override(monkeypatch):
+    # screen_caption is privacy-sensitive (egress to third-party VLM) but the user
+    # opted it into the baseline; verify it follows env baseline yet honors an
+    # explicit per-user opt-out, and stays fail-closed on error.
+    from proactive import screen_flag_v2
+
+    store = SimpleNamespace(user_id="u_screen")
+    monkeypatch.setattr(hosted_config_store, "_load_model_api_config", lambda s: {})
+    monkeypatch.setattr(
+        hosted_config_store, "_ensure_model_api_runtime_profile", lambda s, c: {}
+    )
+    monkeypatch.setenv(ENV, "true")
+    assert screen_flag_v2.screen_caption_enabled(store) is True
+    monkeypatch.delenv(ENV, raising=False)
+    assert screen_flag_v2.screen_caption_enabled(store) is False
+
+    monkeypatch.setenv(ENV, "true")
+    monkeypatch.setattr(
+        hosted_config_store,
+        "_ensure_model_api_runtime_profile",
+        lambda s, c: {"screen_caption_enabled": False},
+    )
+    assert screen_flag_v2.screen_caption_enabled(store) is False  # explicit opt-out wins
+
+
+def test_hosted_wake_follows_env_baseline(monkeypatch):
+    from hosted import wake_consumer
+
+    store = SimpleNamespace(user_id="u_hw")
+    monkeypatch.setattr(hosted_config_store, "_load_model_api_config", lambda s: {})
+    monkeypatch.setattr(hosted_config_store, "_ensure_model_api_runtime_profile", lambda s, c: {})
+    monkeypatch.setenv(ENV, "true")
+    assert wake_consumer._hosted_wake_runtime_v2_enabled(store) is True
+    monkeypatch.delenv(ENV, raising=False)
+    assert wake_consumer._hosted_wake_runtime_v2_enabled(store) is False
+
+
+def test_hosted_chat_full_tool_loop_follows_env_baseline(monkeypatch):
+    from hosted import chat_routes
+
+    store = SimpleNamespace(user_id="u_hc")
+    monkeypatch.setattr(hosted_config_store, "_load_model_api_config", lambda s: {})
+    monkeypatch.setattr(hosted_config_store, "_ensure_model_api_runtime_profile", lambda s, c: {})
+    monkeypatch.setenv(ENV, "true")
+    assert chat_routes._hosted_chat_full_tool_loop_v2_enabled(store) is True
+    monkeypatch.delenv(ENV, raising=False)
+    assert chat_routes._hosted_chat_full_tool_loop_v2_enabled(store) is False
 
 
 def test_ensure_profile_preserves_explicit_perception_true(monkeypatch):
