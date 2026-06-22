@@ -15,6 +15,7 @@ RUNTIME_ENGINE_HERMES_ADAPTER = "hermes_adapter"
 TOOL_WEB_SEARCH = "web.search"
 TOOL_MEMORY_CREATE = "memory.create"
 TOOL_MEMORY_PATCH = "memory.patch"
+TOOL_MEMORY_SUPERSEDE = "memory.supersede"
 TOOL_MEMORY_DELETE = "memory.delete"
 TOOL_IDENTITY_PATCH = "identity.patch"
 TOOL_IDENTITY_DIMENSION_NUDGE = "identity.dimension_nudge"
@@ -176,15 +177,16 @@ def build_background_execution_messages(
                 "If the user asks you to remember, forget, correct, rename, correct relationship day count, change address preferences, update persona/voice/boundaries, or fix a selected Memory Garden card, produce actions. "
                 "For an explicit first-person durable preference or correction with no clear existing card target, prefer memory.create with high confidence instead of memory.patch. "
                 "Use confidence >= 0.9 for explicit, non-destructive state writes. Use lower confidence mainly for destructive actions or ambiguous patch/delete targets. "
-                "Use memory_candidates or user_selected_context_refs for memory.patch/delete targets. If the target is ambiguous, use low confidence. "
+                "Use memory.supersede when the user corrects or replaces an existing memory; target.memory_id must be the old card being replaced and payload.memory must contain the new card. "
+                "Use memory_candidates or user_selected_context_refs for memory.patch/delete/supersede targets. If the target is ambiguous, use low confidence. "
                 "If pending_actions_waiting_for_user_confirmation is non-empty and the latest message confirms or rejects one of them, set pending_decision instead of inventing a new action. "
                 "Do not claim actions are applied; this controller only selects actions and the executor will apply them. "
-                "Supported action types: identity.patch, identity.dimension_nudge, identity.relationship_days_set, memory.create, memory.patch, memory.delete. "
+                "Supported action types: identity.patch, identity.dimension_nudge, identity.relationship_days_set, memory.create, memory.patch, memory.supersede, memory.delete. "
                 "Use identity.dimension_nudge only when the user asks to raise or lower an existing identity dimension; payload must include dimension and delta. "
                 "Use identity.relationship_days_set when the user says the displayed days together / relationship day count is wrong; payload must include days_with_user as an integer. "
                 "JSON shape: {"
                 "\"pending_decision\":{\"decision\":\"none|confirm|reject\",\"pending_ids\":[\"...\"],\"reason\":\"optional\"},"
-                "\"actions\":[{\"type\":\"identity.patch|identity.dimension_nudge|identity.relationship_days_set|memory.create|memory.patch|memory.delete\","
+                "\"actions\":[{\"type\":\"identity.patch|identity.dimension_nudge|identity.relationship_days_set|memory.create|memory.patch|memory.supersede|memory.delete\","
                 "\"confidence\":0.0,\"target\":{\"memory_id\":\"optional\",\"candidate_ids\":[\"...\"]},"
                 "\"payload\":{},\"reason\":\"short reason\"}],"
                 "\"why_empty\":\"optional\"}."
@@ -345,8 +347,9 @@ def coerce_runtime_action(
 
     if action_type in {"memory.create", "memory.add", "memory.add_correction"}:
         raw = payload.get("memory") if isinstance(payload.get("memory"), dict) else payload
-        title = clean_text(raw.get("title"), 180)
-        description = str(raw.get("description") or raw.get("content") or raw.get("summary") or "").strip()[:2000]
+        summary = str(raw.get("summary") or raw.get("description") or raw.get("content") or raw.get("title") or "").strip()[:2000]
+        title = clean_text(raw.get("title") or summary, 180)
+        description = str(raw.get("description") or raw.get("content") or summary).strip()[:2000]
         if not title or not description:
             return None
         mem_type = str(raw.get("type") or raw.get("card_type") or "fact").strip().lower()
@@ -360,11 +363,50 @@ def coerce_runtime_action(
                 "type": mem_type,
                 "title": title,
                 "description": description,
+                "summary": summary,
                 "occurred_at": clean_text(raw.get("occurred_at") or date.today().isoformat(), 80),
                 "source": clean_text(raw.get("source") or source, 80),
                 "context": str(raw.get("context") or "").strip()[:1000],
                 "her_quote": str(raw.get("her_quote") or "").strip()[:1000],
+                "verbatim": str(raw.get("verbatim") or raw.get("her_quote") or "").strip()[:1000],
             },
+            "reason": reason,
+            "capture_mode": "state",
+        }
+        return runtime_action
+
+    if action_type in {"memory.supersede", "memory.replace", "memory.correct"}:
+        memory_id = str(target.get("memory_id") or target.get("id") or payload.get("memory_id") or payload.get("id") or "").strip()
+        ids = _candidate_ids(target)
+        if not memory_id and ids:
+            memory_id = ids[0]
+            runtime_action["requires_confirmation"] = True
+            runtime_action["candidate_ids"] = ids
+        if not memory_id:
+            return None
+        raw = payload.get("memory") if isinstance(payload.get("memory"), dict) else payload
+        summary = str(raw.get("summary") or raw.get("description") or raw.get("content") or raw.get("title") or "").strip()[:2000]
+        if not summary:
+            return None
+        mem_type = str(raw.get("type") or raw.get("card_type") or "fact").strip().lower()
+        if mem_type not in {"fact", "event", "quote", "moment"}:
+            mem_type = "fact"
+        memory_payload = {
+            "type": mem_type,
+            "summary": summary,
+            "verbatim": str(raw.get("verbatim") or raw.get("her_quote") or "").strip()[:1000],
+            "occurred_at": clean_text(raw.get("occurred_at") or date.today().isoformat(), 80),
+            "source": clean_text(raw.get("source") or "hosted_runtime_state", 80),
+        }
+        context = str(raw.get("context") or "").strip()[:1000]
+        if context:
+            memory_payload["context"] = context
+        runtime_action["domain"] = "memory"
+        runtime_action["target"] = {"memory_id": memory_id}
+        runtime_action["executor_action"] = {
+            "type": "memory.supersede",
+            "supersedes": memory_id,
+            "memory": memory_payload,
             "reason": reason,
             "capture_mode": "state",
         }
