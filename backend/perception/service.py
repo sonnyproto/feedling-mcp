@@ -150,10 +150,44 @@ def _decrypt_signal_payload_v2(
 def _decrypted_location_anchor_id_v2(plaintext: Any) -> str:
     if not isinstance(plaintext, Mapping):
         return ""
+    values = plaintext.get("values")
+    if isinstance(values, Mapping):
+        plaintext = values
     anchor = plaintext.get("wifi_anchor_id")
     if anchor is None:
         return ""
     return str(anchor).strip()
+
+
+def _decrypted_signal_values_and_message_v2(
+    plaintext: Any,
+    *,
+    fallback_message: str = "",
+) -> tuple[Any, str]:
+    """Normalize the iOS EncryptedBody wrapper after enclave decrypt.
+
+    Real iOS payloads decrypt to {"values": {...}, "message": "..."}; older
+    tests and local callers may still provide the values object directly.
+    """
+    if isinstance(plaintext, Mapping):
+        values = plaintext.get("values")
+        if isinstance(values, Mapping):
+            return values, str(plaintext.get("message") or fallback_message or "")
+    return plaintext, fallback_message
+
+
+def _storage_value_for_decrypted_signal_v2(key: str, values: Any) -> Any:
+    sig = catalog.SIGNALS.get(key)
+    if (
+        sig is not None
+        and sig.resolver is None
+        and len(sig.outputs) == 1
+        and isinstance(values, Mapping)
+    ):
+        output_key = sig.outputs[0]
+        if output_key in values:
+            return values[output_key]
+    return values
 
 
 def ingest_snapshot(user_id: str, items: list, client_ts=None) -> dict:
@@ -246,13 +280,17 @@ def ingest_snapshot_v2(
                     decrypt_envelope=decrypt_envelope,
                 )
                 if err == "":
+                    values, msg = _decrypted_signal_values_and_message_v2(
+                        plaintext,
+                        fallback_message=signal.message,
+                    )
                     storage_items.append({
                         "key": key,
-                        "data": json.dumps(plaintext),
-                        "message": signal.message,
+                        "data": json.dumps(_storage_value_for_decrypted_signal_v2(key, values)),
+                        "message": msg,
                     })
                     if key == "location_signal" and signal.changed is True:
-                        location_anchor_observations.append((key, plaintext))
+                        location_anchor_observations.append((key, values))
             else:
                 storage_items.append(item)
             continue

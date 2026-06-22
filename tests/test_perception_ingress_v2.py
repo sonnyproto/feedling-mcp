@@ -152,11 +152,23 @@ def test_weather_health_and_focus_ingress_are_pull_only_after_decrypt(monkeypatc
     monkeypatch.setattr(service, "_submit_wake_event_v2_compat", lambda event: emitted.append(event))
 
     plaintext_by_id = {
-        "env_audio": {"output_type": "bluetooth", "is_bluetooth": True, "device_name": "Headphones"},
-        "env_weather": {"condition": "rain", "temperature_bucket": 20, "is_daylight": False},
-        "env_sleep": {"asleep_minutes_bucket": 420},
-        "env_workout": {"workout_type": "running", "duration_min_bucket": 30, "count_today": 1},
-        "env_vitals": {"resting_heart_rate_bucket": 60, "step_count_bucket": 3500},
+        "env_audio": {
+            "values": {"output_type": "bluetooth", "is_bluetooth": True, "device_name": "Headphones"},
+            "message": "audio fresh",
+        },
+        "env_weather": {
+            "values": {"condition": "rain", "temperature_bucket": 20, "is_daylight": False},
+            "message": "weather fresh",
+        },
+        "env_sleep": {"values": {"asleep_minutes_bucket": 420}, "message": "sleep fresh"},
+        "env_workout": {
+            "values": {"workout_type": "running", "duration_min_bucket": 30, "count_today": 1},
+            "message": "workout fresh",
+        },
+        "env_vitals": {
+            "values": {"resting_heart_rate_bucket": 60, "step_count_bucket": 3500},
+            "message": "vitals fresh",
+        },
     }
 
     def decrypt(envelope, api_key, *, purpose):
@@ -189,6 +201,7 @@ def test_weather_health_and_focus_ingress_are_pull_only_after_decrypt(monkeypatc
     assert state["is_bluetooth"]["v"] is True
     assert state["device_name"]["v"] == "Headphones"
     assert state["condition"]["v"] == "rain"
+    assert state["condition"]["msg"] == "weather fresh"
     assert state["temperature_bucket"]["v"] == 20
     assert state["is_daylight"]["v"] is False
     assert state["asleep_minutes_bucket"]["v"] == 420
@@ -202,6 +215,61 @@ def test_weather_health_and_focus_ingress_are_pull_only_after_decrypt(monkeypatc
     assert emitted == []
 
 
+def test_encrypted_body_output_key_values_are_unwrapped_before_storage(monkeypatch):
+    fake = _Store()
+    emitted = []
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_submit_wake_event_v2_compat", lambda event: emitted.append(event))
+
+    plaintext_by_id = {
+        "env_motion": {
+            "values": {"motion_state": {"state": "walking", "confidence": 0.9, "started_at": 100.0}},
+            "message": "motion fresh",
+        },
+        "env_calendar": {
+            "values": {"calendar_next_event": {"title": "1:1", "starts_in_min": 25}},
+            "message": "calendar fresh",
+        },
+        "env_playback": {
+            "values": {"now_playing": {"title": "Song", "artist": "Artist"}},
+            "message": "playback fresh",
+        },
+    }
+
+    def decrypt(envelope, api_key, *, purpose):
+        assert api_key == "api-key"
+        assert purpose.startswith("perception:")
+        return json.dumps(plaintext_by_id[envelope["id"]]).encode("utf-8")
+
+    results = service.ingest_snapshot_v2(
+        "u_output_key_values",
+        [
+            {"key": "motion_state", "envelope": {"id": "env_motion"}, "changed": True},
+            {"key": "calendar_next_event", "envelope": {"id": "env_calendar"}, "changed": True},
+            {"key": "playback", "envelope": {"id": "env_playback"}, "changed": True},
+        ],
+        client_ts=250.0,
+        api_key="api-key",
+        decrypt_envelope=decrypt,
+    )
+
+    assert results["motion_state"] == "accepted"
+    assert results["calendar_next_event"] == "accepted"
+    assert results["playback"] == "accepted"
+    state = fake.get_state("u_output_key_values")
+    assert state["motion_state"]["v"] == {"state": "walking", "confidence": 0.9, "started_at": 100.0}
+    assert state["motion_state"]["msg"] == "motion fresh"
+    assert state["calendar_next_event"]["v"] == {"title": "1:1", "starts_in_min": 25}
+    assert state["now_playing"]["v"] == {"title": "Song", "artist": "Artist"}
+    assert "values" not in state["motion_state"]["v"]
+    assert "motion_state" not in state["motion_state"]["v"]
+    snapshot = service.pull_snapshot("u_output_key_values", now=250.0)
+    assert snapshot["motion_state"] == {"state": "walking", "confidence": 0.9, "started_at": 100.0}
+    assert snapshot["calendar_next_event"] == {"title": "1:1", "starts_in_min": 25}
+    assert snapshot["now_playing"] == {"title": "Song", "artist": "Artist"}
+    assert emitted == []
+
+
 def test_location_signal_decrypt_feeds_wifi_anchor_differ_once(monkeypatch):
     fake = _Store()
     emitted = []
@@ -209,9 +277,18 @@ def test_location_signal_decrypt_feeds_wifi_anchor_differ_once(monkeypatch):
     monkeypatch.setattr(service, "_submit_wake_event_v2_compat", lambda event: emitted.append(event))
 
     plaintext_by_id = {
-        "loc_home_1": {"place_label": "unknown", "wifi_label": None, "country": "US", "wifi_anchor_id": "wifi-home"},
-        "loc_home_2": {"place_label": "unknown", "wifi_label": None, "country": "US", "wifi_anchor_id": "wifi-home"},
-        "loc_work": {"place_label": "unknown", "wifi_label": None, "country": "US", "wifi_anchor_id": "wifi-work"},
+        "loc_home_1": {
+            "values": {"place_label": "unknown", "wifi_label": None, "country": "US", "wifi_anchor_id": "wifi-home"},
+            "message": "location fresh",
+        },
+        "loc_home_2": {
+            "values": {"place_label": "unknown", "wifi_label": None, "country": "US", "wifi_anchor_id": "wifi-home"},
+            "message": "location fresh",
+        },
+        "loc_work": {
+            "values": {"place_label": "unknown", "wifi_label": None, "country": "US", "wifi_anchor_id": "wifi-work"},
+            "message": "location fresh",
+        },
     }
 
     def decrypt(envelope, api_key, *, purpose):
@@ -257,8 +334,14 @@ def test_location_signal_null_or_unchanged_anchor_does_not_wake(monkeypatch):
     monkeypatch.setattr(service, "_submit_wake_event_v2_compat", lambda event: emitted.append(event))
 
     plaintext_by_id = {
-        "loc_null": {"place_label": "unknown", "wifi_label": None, "country": "US", "wifi_anchor_id": None},
-        "loc_unchanged": {"place_label": "unknown", "wifi_label": None, "country": "US", "wifi_anchor_id": "wifi-home"},
+        "loc_null": {
+            "values": {"place_label": "unknown", "wifi_label": None, "country": "US", "wifi_anchor_id": None},
+            "message": "location fresh",
+        },
+        "loc_unchanged": {
+            "values": {"place_label": "unknown", "wifi_label": None, "country": "US", "wifi_anchor_id": "wifi-home"},
+            "message": "location fresh",
+        },
     }
 
     def decrypt(envelope, api_key, *, purpose):
