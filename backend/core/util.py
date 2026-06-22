@@ -1,10 +1,31 @@
 """Small dependency-free helpers shared across domains."""
 
 import json
+import os
 import re
 import uuid
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+_ENV_TRUTHY = {"1", "true", "yes", "y", "on"}
+
+
+def _env_flag_enabled(name: str, default: str = "false") -> bool:
+    return str(os.environ.get(name, default) or "").strip().lower() in _ENV_TRUTHY
+
+
+RUNTIME_V2_DEFAULT_ON_ENV = "FEEDLING_RUNTIME_V2_DEFAULT_ON"
+
+
+def runtime_v2_default_on() -> bool:
+    """Baseline default for the perception/resident V2 rollout flags.
+
+    OFF by default so prod keeps the dormant legacy path. Set
+    ``FEEDLING_RUNTIME_V2_DEFAULT_ON=true`` in the test enclave so test users run
+    V2 without a per-user blob flip. An explicit per-user blob value still
+    overrides this baseline (operator opt-in/opt-out wins).
+    """
+    return _env_flag_enabled(RUNTIME_V2_DEFAULT_ON_ENV)
 
 
 def _now_iso() -> str:

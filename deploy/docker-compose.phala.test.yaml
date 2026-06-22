@@ -173,6 +173,12 @@ services:
       FEEDLING_PROACTIVE_GATE_MODEL: "${FEEDLING_PROACTIVE_GATE_MODEL:-google/gemini-3.1-flash-lite}"
       MODEL_API_MEMORY_TOOLS_ENABLED: "${MODEL_API_MEMORY_TOOLS_ENABLED:-true}"
       MODEL_API_AUTO_MEMORY_CONTEXT_ENABLED: "${MODEL_API_AUTO_MEMORY_CONTEXT_ENABLED:-true}"
+      # TEST-ONLY: baseline-ON for the perception/resident V2 rollout flags
+      # (perception_ingress / resident_wake / resident_chat). Test users run V2
+      # without a per-user blob flip; an explicit per-user blob value still wins.
+      # Prod compose deliberately omits this so prod keeps the dormant legacy
+      # path (baseline OFF). See core/util.runtime_v2_default_on().
+      FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"
     ports:
       - "5001:5001"
       - "9998:9998"

@@ -95,6 +95,11 @@ def _public_model_api_config(config: dict | None) -> dict:
 MODEL_API_RUNTIME_BLOB = "model_api_runtime"
 MODEL_API_RUNTIME_VERSION = 2
 MODEL_API_RUNTIME_MODE = "hosted_resident"
+# Marker for the one-time scrub of the legacy auto-seeded
+# perception_ingress_runtime_v2_enabled=False artifact (see
+# _ensure_model_api_runtime_profile). Once set, deliberate per-user False
+# opt-outs are preserved instead of being scrubbed on every read.
+PERCEPTION_V2_AUTOSEED_SCRUBBED = "perception_v2_autoseed_scrubbed"
 MODEL_API_ACTION_TRACE_STREAM = "model_api_action_traces"
 # One append per model-API action (then patched by trace_id on completion).
 # High frequency; cap the stream. A background trace is appended as ``queued``
@@ -149,7 +154,9 @@ def _ensure_model_api_runtime_profile(
         "memory_quality_warning": None,
         "hosted_wake_runtime_v2_enabled": False,
         "hosted_chat_full_tool_loop_v2_enabled": False,
-        "perception_ingress_runtime_v2_enabled": False,
+        # perception_ingress_runtime_v2_enabled is intentionally NOT seeded here.
+        # It is an env-gated rollout flag (perception.service.runtime_v2 baseline);
+        # seeding it as False used to pin every profile and defeat that baseline.
         "screen_caption_enabled": False,
         "provider": str(config.get("provider") or ""),
         "model": str(config.get("model") or ""),
@@ -162,6 +169,17 @@ def _ensure_model_api_runtime_profile(
         ):
             profile[key] = value
             changed = True
+    # One-time migration: the old code auto-seeded perception_ingress_runtime_v2_enabled
+    # as False, which pinned every profile and defeated the env-gated baseline. Scrub
+    # that legacy artifact ONCE (gated by a marker) so existing users fall through to the
+    # baseline. We must NOT scrub on every read: a deliberate per-user opt-out written
+    # later as False would otherwise be deleted before the reader sees it. After the
+    # marker is set, an explicit False survives and wins over the baseline.
+    if not profile.get(PERCEPTION_V2_AUTOSEED_SCRUBBED):
+        if profile.get("perception_ingress_runtime_v2_enabled") is False:
+            profile.pop("perception_ingress_runtime_v2_enabled", None)
+        profile[PERCEPTION_V2_AUTOSEED_SCRUBBED] = True
+        changed = True
     if changed or not existing:
         profile = _save_model_api_runtime_profile(store, profile)
     return profile

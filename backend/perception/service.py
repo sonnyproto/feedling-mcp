@@ -24,6 +24,7 @@ from typing import Any, Callable, Mapping
 
 from content_encryption import random_item_id
 from core import enclave as core_enclave
+from core import util as core_util
 
 from . import catalog, resolve, store
 from .ingress_v2 import device_event_observations_v2, operation_observations_v2, observe_signal_v2
@@ -65,9 +66,11 @@ def _coerce_ts(client_ts) -> float:
 def perception_ingress_runtime_v2_enabled(user_or_store) -> bool:
     """Per-user rollout flag for live perception ingress cutover.
 
-    Default OFF preserves the legacy ingest path as a dormant fallback. The flag
-    lives next to the hosted runtime profile so rollout can mirror hosted wake
-    V2 and be reverted without a code deploy.
+    Baseline is the env-gated default (OFF prod / ON test) so the legacy ingest
+    path stays a dormant fallback in prod. An explicit per-user flag still wins,
+    so rollout/rollback remains a per-user toggle without a code deploy. The
+    profile no longer auto-seeds this key (see ``_ensure_model_api_runtime_profile``),
+    so absence genuinely means "unset" and falls through to the baseline.
     """
     try:
         user_store = user_or_store
@@ -81,7 +84,9 @@ def perception_ingress_runtime_v2_enabled(user_or_store) -> bool:
         profile = hosted_config_store._ensure_model_api_runtime_profile(user_store, config) or {}
         if PERCEPTION_INGRESS_RUNTIME_V2_FLAG in profile:
             return bool(profile.get(PERCEPTION_INGRESS_RUNTIME_V2_FLAG))
-        return bool(config.get(PERCEPTION_INGRESS_RUNTIME_V2_FLAG))
+        if PERCEPTION_INGRESS_RUNTIME_V2_FLAG in config:
+            return bool(config.get(PERCEPTION_INGRESS_RUNTIME_V2_FLAG))
+        return core_util.runtime_v2_default_on()
     except Exception as e:
         uid = user_or_store if isinstance(user_or_store, str) else getattr(user_or_store, "user_id", "unknown")
         log.warning("perception ingress v2 flag load failed for %s; using legacy ingress: %s", uid, e)

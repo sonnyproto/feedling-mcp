@@ -49,6 +49,30 @@
 
 ## 2026-06-22
 
+### [DECISION] Perception/Resident V2 rollout flags 改为 env-gated baseline（test 默认 ON / prod OFF）
+- **背景**:三个 V2 灰度 flag(`perception_ingress_runtime_v2_enabled`、
+  `resident_wake_runtime_v2_enabled`、`resident_chat_runtime_v2_enabled`)默认全 OFF,
+  又**没有任何 setter**(只能 `db.set_blob` 直写 per-user blob),test 上每个账号都得手翻,很烦。
+- **改动**:
+  - 新增 `core/util.runtime_v2_default_on()` 读环境变量 `FEEDLING_RUNTIME_V2_DEFAULT_ON`
+    作为三个 flag 的**基线默认**;显式的 per-user blob 值仍然优先(operator opt-in/opt-out 不变)。
+  - 三个 reader(`perception/service.py`、`proactive/resident_runtime_v2.py`)未设值时回落到基线。
+  - **修坑**:`hosted/config_store._ensure_model_api_runtime_profile` 之前会把
+    `perception_ingress_runtime_v2_enabled` 自动播种成 `False`,把每个 hosted profile 钉死、
+    让 env 基线失效。现在①不再播种该 key ②对已存在的"自动播种 False"做**一次性** scrub——
+    用 `perception_v2_autoseed_scrubbed` marker 门控,只清理一次历史 artifact;**marker 落下后,
+    运维日后显式写的 `False`(per-user 回滚/opt-out)会被保留**,不再每读必删(Codex review P2)。
+    显式 `True` 任何时候都保留。
+  - `deploy/docker-compose.phala.test.yaml` 的 **backend** 服务加 `FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"`;
+    **prod compose 不加** → prod 仍 OFF、保留 legacy 回滚口子。
+- **为什么不硬 `True`**:这些 flag 的设计就是"翻一个 flag 即回滚,不用回滚代码";env-gated 既解了
+  test 的手翻痛点,又不动 prod 的回滚安全性。
+- **测试**:`tests/test_runtime_v2_default_flag.py`(6 例:env 基线、显式 override、scrub、保留 True)全过;
+  perception/ingress/runtime_v2 回归 89 passed。resident 聊天 consumer 在 VPS 上无需 env——它从
+  `/v1/proactive/jobs/poll` 的 `runtime_v2` 拿服务端已算好的基线值。
+- **影响文档**:`PROACTIVE_PERCEPTION_PR7_INGRESS_CUTOVER.md` / `PR9_RESIDENT_CUTOVER.md` 里"default
+  false"现在应理解为"prod 基线 false / test 基线 true,per-user 仍可覆盖"。
+
 ### [DONE] 修 resident reply loop:OpenClaw 输出解析 + verify_loop 真调 agent + skill 路由硬规则
 - **背景**:一次 VPS onboarding 实测——onboarding 各步显示"成功 + 发了问候",但用户回消息后
   iOS 一直 loading、永远收不到回复。SSH 进 VPS 看 consumer 日志定位到三个叠加问题。
