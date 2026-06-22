@@ -145,6 +145,7 @@ jobs:
             tests/test_tool_loop_v2.py \
             tests/test_proactive_tool_execute_route.py \
             tests/test_chat_resident_consumer.py \
+            tests/test_runtime_v2_default_flag.py \
             -v
 
   # -------------------------------------------------------------------------

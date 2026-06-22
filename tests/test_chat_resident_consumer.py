@@ -10,6 +10,7 @@ import base64
 import json
 import os
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -271,10 +272,12 @@ def test_enclave_history_used_when_configured(monkeypatch):
 # enclave/MCP decrypt paths.
 # ---------------------------------------------------------------------------
 
-def test_verify_ping_enclave_path_short_circuits_without_agent():
+def test_verify_ping_enclave_path_probes_real_agent():
     """Enclave path delivers the local_only ping with content=None. The
-    consumer must still recognise it (via source) and reply immediately —
-    not crash on None and not skip it as empty content."""
+    consumer must still recognise it (via source) — not crash on None and not
+    skip it as empty content — and now exercise the REAL agent path (bounded
+    probe) so a broken reply pipeline is caught instead of being masked by a
+    canned short-circuit (commit 11279e9)."""
     ping = {
         "role": "user",
         "ts": 4242.0,
@@ -282,35 +285,36 @@ def test_verify_ping_enclave_path_short_circuits_without_agent():
         "content": None,            # enclave returns null for local_only
         "content_type": "text",
     }
-    with patch.object(crc, "call_agent") as mock_agent, \
+    with patch.object(crc, "call_agent", return_value="收到") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
         result_ts = crc._process_messages([ping])
 
-    mock_agent.assert_not_called()
+    mock_agent.assert_called_once_with(crc.VERIFY_PROBE_MESSAGE)
     mock_post.assert_called_once()
     assert result_ts == pytest.approx(4242.0)
 
 
-def test_verify_ping_poll_marker_short_circuits_without_agent():
+def test_verify_ping_poll_marker_probes_real_agent():
     """Direct /v1/chat/poll path carries the plaintext __VERIFY_PING__ marker
-    (source still verify_ping). Still short-circuits — no agent turn."""
+    (source still verify_ping). Still detected via source and routed through the
+    real bounded probe."""
     ping = _make_msg(role="user", content="__VERIFY_PING__:deadbeef0001", ts=4343.0)
     ping["source"] = "verify_ping"
 
-    with patch.object(crc, "call_agent") as mock_agent, \
+    with patch.object(crc, "call_agent", return_value="收到") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
         result_ts = crc._process_messages([ping])
 
-    mock_agent.assert_not_called()
+    mock_agent.assert_called_once_with(crc.VERIFY_PROBE_MESSAGE)
     mock_post.assert_called_once()
     assert result_ts == pytest.approx(4343.0)
 
 
-def test_verify_ping_short_circuit_suppresses_push():
-    """The short-circuit must ask post_reply to suppress the user-visible push.
-    A private liveness ack must never surface as an APNs notification while the
-    app is backgrounded — the verify GC removes the chat row but cannot recall
-    an already-delivered push."""
+def test_verify_ping_success_reply_suppresses_push():
+    """A successful probe posts the agent's real reply but must suppress the
+    user-visible push. A private liveness ack must never surface as an APNs
+    notification while the app is backgrounded — the verify GC removes the chat
+    row but cannot recall an already-delivered push."""
     ping = {
         "role": "user",
         "ts": 4444.0,
@@ -318,12 +322,66 @@ def test_verify_ping_short_circuit_suppresses_push():
         "content": None,
         "content_type": "text",
     }
-    with patch.object(crc, "call_agent") as mock_agent, \
+    with patch.object(crc, "call_agent", return_value="我在") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
         crc._process_messages([ping])
 
-    mock_agent.assert_not_called()
-    mock_post.assert_called_once_with(crc.VERIFY_PING_REPLY, suppress_push=True)
+    mock_agent.assert_called_once()
+    mock_post.assert_called_once()
+    assert mock_post.call_args.kwargs.get("suppress_push") is True
+
+
+def test_verify_ping_slow_agent_falls_back_to_canned_ack():
+    """A slow-but-healthy agent (probe exceeds VERIFY_PROBE_TIMEOUT_SEC) must
+    NOT falsely fail verify: the consumer falls back to the canned ack (push
+    suppressed) so verify_loop still passes."""
+    ping = {
+        "role": "user",
+        "ts": 4547.0,  # unique ts — the global _seen_ids dedup keys on ts:role
+        "source": "verify_ping",
+        "content": None,
+        "content_type": "text",
+    }
+
+    # Block the probe on an Event (not a bare sleep) so the timeout fires
+    # deterministically AND the background probe thread is released before the
+    # test returns — a leaked sleeping thread would wake mid-next-test and
+    # pollute its call_agent mock.
+    release = threading.Event()
+
+    def _slow(_msg):
+        release.wait(timeout=2)
+        return "too late"
+
+    try:
+        with patch.object(crc, "VERIFY_PROBE_TIMEOUT_SEC", 0.01), \
+             patch.object(crc, "call_agent", side_effect=_slow), \
+             patch.object(crc, "post_reply") as mock_post:
+            crc._process_messages([ping])
+            mock_post.assert_called_once_with(crc.VERIFY_PING_REPLY, suppress_push=True)
+    finally:
+        release.set()
+
+
+def test_verify_ping_no_usable_reply_does_not_ack():
+    """A COMPLETED probe that yields no usable reply (consumer can't parse the
+    agent output → ValueError) is a real failure: the consumer posts NOTHING so
+    verify_loop stays unsatisfied and onboarding does not green-light a dead
+    loop."""
+    ping = {
+        "role": "user",
+        "ts": 4646.0,
+        "source": "verify_ping",
+        "content": None,
+        "content_type": "text",
+    }
+    with patch.object(crc, "call_agent", side_effect=ValueError("no usable reply")) as mock_agent, \
+         patch.object(crc, "post_reply") as mock_post:
+        result_ts = crc._process_messages([ping])
+
+    mock_agent.assert_called_once()
+    mock_post.assert_not_called()
+    assert result_ts == pytest.approx(4646.0)
 
 
 def test_post_reply_suppress_push_omits_alert_and_push_fields(monkeypatch):
