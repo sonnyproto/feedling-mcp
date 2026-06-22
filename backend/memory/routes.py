@@ -25,7 +25,9 @@ import memory_readside_core
 bp = Blueprint("memory", __name__)
 
 
-_MEMORY_READSIDE_LIMIT = 50
+# Default only. Effective readside windows are parsed in memory_readside_core so
+# FEEDLING_MEMORY_READSIDE_LIMIT=0 can mean "full window up to HARD_MAX".
+_MEMORY_READSIDE_LIMIT = memory_readside_core.MEMORY_READSIDE_DEFAULT_LIMIT
 _MEMORY_READSIDE_SALIENCE_WEIGHT = {
     "critical": 4,
     "high": 3,
@@ -97,7 +99,7 @@ def _memory_readside_score(moment: dict) -> float:
     return round(open_bonus + salience_score + importance, 4)
 
 
-def _memory_readside_candidates(moments: list, owner_user_id: str, *, limit: int = _MEMORY_READSIDE_LIMIT) -> list[dict]:
+def _memory_readside_candidates(moments: list, owner_user_id: str, *, limit: int | None = None) -> list[dict]:
     candidates = [
         dict(moment, score=_memory_readside_score(moment))
         for moment in moments
@@ -113,7 +115,7 @@ def _memory_readside_candidates(moments: list, owner_user_id: str, *, limit: int
         ),
         reverse=True,
     )
-    return candidates[: max(0, min(int(limit or _MEMORY_READSIDE_LIMIT), _MEMORY_READSIDE_LIMIT))]
+    return candidates[:memory_readside_core.effective_readside_limit(limit)]
 
 
 def _memory_readside_post_enclave(
@@ -137,8 +139,8 @@ def memory_index():
     api_key = auth._extract_api_key()
     payload = request.get_json(silent=True) or {}
     try:
-        requested_limit = int(payload.get("limit") or _MEMORY_READSIDE_LIMIT)
-    except (TypeError, ValueError):
+        requested_limit = memory_readside_core.effective_readside_limit(payload.get("limit"))
+    except ValueError:
         return jsonify({"error": "invalid limit"}), 400
     try:
         response = memory_readside_core.memory_index_core(

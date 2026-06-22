@@ -33,7 +33,7 @@ def test_memory_index_tool_calls_readside_core_and_records_trace(monkeypatch):
         trace=trace,
     )
 
-    assert calls == [("usr_tools", "key_tools", {"query": "猫叫什么", "limit": 50, "include_sensitive": False})]
+    assert calls == [("usr_tools", "key_tools", {"query": "猫叫什么", "limit": 80, "include_sensitive": False})]
     assert result["ok"] is True
     assert result["name"] == "memory_index"
     assert result["items"][0]["id"] == "mem_cat"

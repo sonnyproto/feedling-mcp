@@ -10,7 +10,12 @@ import httpx
 from memory import service as memory_service
 
 
-MEMORY_READSIDE_LIMIT = 50
+MEMORY_READSIDE_DEFAULT_LIMIT = 50
+MEMORY_READSIDE_DEFAULT_HARD_MAX = 1000
+# Backward-compatible default value. Do not use this as the effective cap for
+# recall windows; use effective_readside_limit() so env overrides and the
+# "0 = full window up to HARD_MAX" sentinel are respected.
+MEMORY_READSIDE_LIMIT = MEMORY_READSIDE_DEFAULT_LIMIT
 MEMORY_FETCH_TOOL_LIMIT = 5
 MEMORY_FETCH_LOOP_LIMIT = 8
 
@@ -87,11 +92,58 @@ def memory_score(moment: dict) -> float:
     return round(open_bonus + salience_score + importance, 4)
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def readside_hard_max() -> int:
+    hard_max = _env_int("FEEDLING_MEMORY_READSIDE_HARD_MAX", MEMORY_READSIDE_DEFAULT_HARD_MAX)
+    return max(1, hard_max)
+
+
+def configured_readside_limit() -> int:
+    limit = _env_int("FEEDLING_MEMORY_READSIDE_LIMIT", MEMORY_READSIDE_DEFAULT_LIMIT)
+    return limit if limit >= 0 else MEMORY_READSIDE_DEFAULT_LIMIT
+
+
+def effective_readside_limit(value: Any | None = None) -> int:
+    """Return the effective recall candidate window.
+
+    Config knobs:
+    - FEEDLING_MEMORY_READSIDE_LIMIT defaults to 50.
+    - FEEDLING_MEMORY_READSIDE_LIMIT=0 means "full recall window".
+    - FEEDLING_MEMORY_READSIDE_HARD_MAX is the safety valve; even full-window
+      mode will not decrypt/return more than this many candidate envelopes.
+
+    Important: full-window mode only disables top-N truncation. Eligibility
+    filtering, sorting, and selector behavior must stay enabled.
+    """
+    if value is None or str(value).strip() == "":
+        requested = configured_readside_limit()
+    else:
+        try:
+            requested = int(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid limit") from exc
+        if requested < 0:
+            raise ValueError("invalid limit")
+    hard_max = readside_hard_max()
+    if requested == 0:
+        return hard_max
+    return max(1, min(requested, hard_max))
+
+
 def readside_candidates(
     moments: list,
     owner_user_id: str,
     *,
-    limit: int = MEMORY_READSIDE_LIMIT,
+    limit: int | None = None,
 ) -> tuple[list[dict], int]:
     candidates = [
         dict(moment, score=memory_score(moment))
@@ -108,7 +160,7 @@ def readside_candidates(
         ),
         reverse=True,
     )
-    capped_limit = max(0, min(int(limit or MEMORY_READSIDE_LIMIT), MEMORY_READSIDE_LIMIT))
+    capped_limit = effective_readside_limit(limit)
     return candidates[:capped_limit], len(candidates)
 
 
@@ -143,13 +195,6 @@ def post_enclave_readside(
     return response
 
 
-def _int_payload(value: Any, default: int) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def memory_index_core(
     store,
     api_key: str | None,
@@ -158,8 +203,7 @@ def memory_index_core(
     post_enclave: Callable[..., dict] | None = None,
 ) -> dict:
     payload = dict(payload or {})
-    requested_limit = _int_payload(payload.get("limit"), MEMORY_READSIDE_LIMIT)
-    limit = max(1, min(requested_limit, MEMORY_READSIDE_LIMIT))
+    limit = effective_readside_limit(payload.get("limit"))
     candidates, user_card_count = readside_candidates(
         memory_service._load_moments(store),
         store.user_id,
@@ -171,6 +215,7 @@ def memory_index_core(
         operation="index",
         payload={
             "include_sensitive": bool(payload.get("include_sensitive", False)),
+            "limit": limit,
             "query": str(payload.get("query") or "")[:500],
         },
     )
@@ -178,6 +223,7 @@ def memory_index_core(
     return {
         "items": items,
         "limit": limit,
+        "truncated": user_card_count > len(candidates),
         "user_card_count": user_card_count,
     }
 
@@ -197,7 +243,8 @@ def memory_fetch_core(
     ids = payload.get("ids")
     if not isinstance(ids, list) or any(not isinstance(mid, str) or not mid.strip() for mid in ids):
         raise ValueError("ids must be a list of non-empty strings")
-    ids = [mid.strip() for mid in ids[:MEMORY_READSIDE_LIMIT]]
+    limit = effective_readside_limit(payload.get("limit"))
+    ids = [mid.strip() for mid in ids[:limit]]
     include_archived = _bool_payload(payload.get("include_archived"))
     include_superseded = _bool_payload(payload.get("include_superseded"))
     by_id = {m.get("id"): m for m in memory_service._load_moments(store) if isinstance(m, dict)}
@@ -222,7 +269,7 @@ def memory_fetch_core(
         api_key,
         candidates,
         operation="fetch",
-        payload={"ids": [m.get("id") for m in candidates]},
+        payload={"ids": [m.get("id") for m in candidates], "limit": limit},
     )
     enclave_unavailable = response.get("unavailable_ids") if isinstance(response.get("unavailable_ids"), list) else []
     unavailable_ids.extend(str(mid) for mid in enclave_unavailable if isinstance(mid, str))

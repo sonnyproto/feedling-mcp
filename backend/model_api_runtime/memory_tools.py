@@ -66,9 +66,13 @@ def execute_memory_tool(store, api_key: str | None, name: str, args: dict | None
     args = dict(args or {})
     tr = _trace(trace)
     if name == MEMORY_INDEX_TOOL:
+        try:
+            limit = memory_readside_core.effective_readside_limit(args.get("limit"))
+        except ValueError:
+            return _result_for_error(name, "invalid_limit", trace=tr)
         payload = {
             "query": str(args.get("query") or args.get("q") or "")[:500],
-            "limit": max(1, min(int(args.get("limit") or memory_readside_core.MEMORY_READSIDE_LIMIT), memory_readside_core.MEMORY_READSIDE_LIMIT)),
+            "limit": limit,
             "include_sensitive": bool(args.get("include_sensitive", False)),
         }
         body = memory_readside_core.memory_index_core(store, api_key, payload)
