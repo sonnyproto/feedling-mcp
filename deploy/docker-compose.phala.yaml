@@ -170,6 +170,13 @@ services:
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
       FEEDLING_PROACTIVE_GATE_PROVIDER: "${FEEDLING_PROACTIVE_GATE_PROVIDER:-openrouter}"
       FEEDLING_PROACTIVE_GATE_MODEL: "${FEEDLING_PROACTIVE_GATE_MODEL:-google/gemini-3.1-flash-lite}"
+      # Baseline-ON for the perception/resident V2 rollout flags
+      # (perception_ingress / resident_wake / resident_chat). Prod users run V2
+      # by default; an explicit per-user blob value still wins, so rollback for a
+      # single user is a blob toggle (not a code revert) and the env can be
+      # flipped to "false" to revert the whole fleet. See
+      # core/util.runtime_v2_default_on().
+      FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"
     ports:
       - "5001:5001"
       - "9998:9998"
