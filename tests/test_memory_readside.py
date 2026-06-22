@@ -209,6 +209,78 @@ def test_enclave_index_filters_sensitive_items_by_default(monkeypatch):
     assert [item["id"] for item in sensitive_res.get_json()["items"]] == ["plain", "sensitive"]
 
 
+def test_enclave_index_and_fetch_honor_payload_limit_above_50(monkeypatch):
+    monkeypatch.delenv("FEEDLING_MEMORY_READSIDE_LIMIT", raising=False)
+    monkeypatch.delenv("FEEDLING_MEMORY_READSIDE_HARD_MAX", raising=False)
+    monkeypatch.setattr(
+        enclave_app,
+        "_memory_readside_auth_context",
+        lambda: ("key_readside", "usr_readside", object(), None),
+    )
+    captured_lengths = []
+
+    def fake_decrypt(moments, authorized_user_id, content_sk, *, item_builder):
+        captured_lengths.append(len(moments))
+        return ([{"id": str(moment.get("id")), "summary": str(moment.get("id"))} for moment in moments], [])
+
+    monkeypatch.setattr(enclave_app, "_memory_readside_decrypt_items", fake_decrypt)
+    payload = {"limit": 120, "moments": [{"id": f"mem_{idx:03d}"} for idx in range(130)]}
+
+    with enclave_app.app.test_client() as c:
+        index_res = c.post("/v1/memory/index", json=payload)
+        fetch_res = c.post("/v1/memory/fetch", json=payload)
+
+    assert index_res.status_code == 200
+    assert fetch_res.status_code == 200
+    assert captured_lengths == [120, 120]
+
+
+def test_enclave_limit_zero_uses_hard_max_instead_of_unbounded(monkeypatch):
+    monkeypatch.setenv("FEEDLING_MEMORY_READSIDE_HARD_MAX", "7")
+    monkeypatch.setattr(
+        enclave_app,
+        "_memory_readside_auth_context",
+        lambda: ("key_readside", "usr_readside", object(), None),
+    )
+    captured_lengths = []
+
+    def fake_decrypt(moments, authorized_user_id, content_sk, *, item_builder):
+        captured_lengths.append(len(moments))
+        return ([{"id": str(moment.get("id")), "summary": str(moment.get("id"))} for moment in moments], [])
+
+    monkeypatch.setattr(enclave_app, "_memory_readside_decrypt_items", fake_decrypt)
+    payload = {"limit": 0, "moments": [{"id": f"mem_{idx:03d}"} for idx in range(20)]}
+
+    with enclave_app.app.test_client() as c:
+        res = c.post("/v1/memory/index", json=payload)
+
+    assert res.status_code == 200
+    assert captured_lengths == [7]
+
+
+def test_enclave_negative_env_limit_falls_back_to_default_not_full_open(monkeypatch):
+    monkeypatch.setenv("FEEDLING_MEMORY_READSIDE_LIMIT", "-1")
+    monkeypatch.delenv("FEEDLING_MEMORY_READSIDE_HARD_MAX", raising=False)
+    monkeypatch.setattr(
+        enclave_app,
+        "_memory_readside_auth_context",
+        lambda: ("key_readside", "usr_readside", object(), None),
+    )
+    captured_lengths = []
+
+    def fake_decrypt(moments, authorized_user_id, content_sk, *, item_builder):
+        captured_lengths.append(len(moments))
+        return ([{"id": str(moment.get("id")), "summary": str(moment.get("id"))} for moment in moments], [])
+
+    monkeypatch.setattr(enclave_app, "_memory_readside_decrypt_items", fake_decrypt)
+
+    with enclave_app.app.test_client() as c:
+        res = c.post("/v1/memory/index", json={"moments": [{"id": f"mem_{idx:03d}"} for idx in range(70)]})
+
+    assert res.status_code == 200
+    assert captured_lengths == [50]
+
+
 def test_enclave_fetch_item_returns_full_card_without_sensitive_scope():
     item = enclave_app._build_memory_fetch_item(
         {"id": "mem_1", "status": "active", "salience": "high", "source": "chat"},

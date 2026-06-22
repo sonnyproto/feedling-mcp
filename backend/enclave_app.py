@@ -827,6 +827,40 @@ def _memory_readside_model_api_limit() -> int:
     return max(1, min(value, 200))
 
 
+def _memory_readside_hard_max() -> int:
+    raw = os.environ.get("FEEDLING_MEMORY_READSIDE_HARD_MAX", "1000")
+    try:
+        value = int(str(raw or "1000").strip())
+    except (TypeError, ValueError):
+        value = 1000
+    return max(1, value)
+
+
+def _memory_readside_effective_limit(raw_limit=None) -> int:
+    """Mirror backend readside limit semantics inside the enclave.
+
+    FEEDLING_MEMORY_READSIDE_LIMIT controls index/fetch candidate windows:
+    - unset: 50
+    - positive integer: that many candidates, capped by HARD_MAX
+    - 0: "full window", still capped by FEEDLING_MEMORY_READSIDE_HARD_MAX
+
+    This is separate from MEMORY_READSIDE_MODEL_API_LIMIT, which belongs to the
+    older route-B auto-recall path. Keep both knobs distinct.
+    """
+    if raw_limit is None or str(raw_limit).strip() == "":
+        raw_limit = os.environ.get("FEEDLING_MEMORY_READSIDE_LIMIT", "50")
+    try:
+        requested = int(str(raw_limit).strip())
+    except (TypeError, ValueError):
+        requested = 50
+    if requested < 0:
+        requested = 50
+    hard_max = _memory_readside_hard_max()
+    if requested == 0:
+        return hard_max
+    return max(1, min(requested, hard_max))
+
+
 def _context_moment_to_index_item(moment: dict) -> dict:
     """Convert the existing plaintext context card into a readside index item.
 
@@ -1075,8 +1109,9 @@ def v1_memory_index():
     moments = payload.get("moments")
     if not isinstance(moments, list):
         return jsonify({"error": "moments must be a list"}), 400
+    effective_limit = _memory_readside_effective_limit(payload.get("limit"))
     items, unavailable_ids = _memory_readside_decrypt_items(
-        moments[:50],
+        moments[:effective_limit],
         authorized_user_id or "",
         content_sk,
         item_builder=_build_memory_index_item,
@@ -1100,8 +1135,9 @@ def v1_memory_fetch():
     moments = payload.get("moments")
     if not isinstance(moments, list):
         return jsonify({"error": "moments must be a list"}), 400
+    effective_limit = _memory_readside_effective_limit(payload.get("limit"))
     items, unavailable_ids = _memory_readside_decrypt_items(
-        moments[:50],
+        moments[:effective_limit],
         authorized_user_id or "",
         content_sk,
         item_builder=_build_memory_fetch_item,
