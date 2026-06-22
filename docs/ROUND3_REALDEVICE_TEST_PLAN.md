@@ -40,14 +40,20 @@
 > **三个用户开关入口已就位(2026-06-20)。** 后端三字段已在 `test`、`/v1/proactive/state` 都认;iOS Settings 三开关 UI 已 push(陪伴/定时任务/提醒,Scheduled 独立)。装新包后 F1–F5 可测(F5 另需 iOS 写时区)。
 >
 > **感知打通已完成(2026-06-20,后端 `dad4900` 已部署到 test 环境)。** weather/health/focus/audio_route = 加密 **pull-only**(G 组,装新包后可验);**久别解锁**(B4)iOS 已发+后端已接(装新包即可测);**WiFi 锚点 wake**(B3)后端已接,但实时后台到达**依赖 iOS 后台定位真机验证 + Apple 开 HealthKit/WeatherKit capability**(见 iOS 仓库 `PERCEPTION_HANDOFF_2026-06-20.md`)。
+>
+> **2026-06-22:** ① test 的 V2 flag **默认开**(见 Part 0.1),不用逐账号翻;② **聊天里 pull 感知**已上(`e14c373`,见 Part 0.5);③ 本轮测试走的是 **resident(VPS)路**,VPS consumer 须最新 test(Part 0.4)。
+>
+> **建议起测顺序(由易到难,先打通最短链路):**
+> 1. **聊天 pull(最快验)**:聊"我现在在哪?"→ agent 应调 `perception.location`(debug `v2_tool_traces` 可见)。用 location/motion,**不需要 Apple capability**;天气/健康要 WeatherKit/HealthKit 开了才有数据。同时确认记忆召回照常(没被动)。
+> 2. 照片 wake(B1)→ 久别解锁 wake(B4)→ 三开关(F 组)→ 其余。
+> 3. WiFi 后台到达(B3)/天气健康(G1/G2)等工程师把后台定位真机验 + Apple capability 开了再测。
 
 ---
 
 ## Part 0 · 前置(否则白测)
 
-1. **V2 上线 flag** = 工程内部灰度开关(非用户设置),默认 OFF,需工程师在 test RDS 给测试账号翻开:
-   `hosted_wake_runtime_v2_enabled` / `perception_ingress_runtime_v2_enabled`(hosted 路);`resident_wake_runtime_v2_enabled`(resident 路)。
-   **注意:把 app 切到测试环境 ≠ 翻开了 flag。** 用 debug 页确认:看到 V2 流(wakes_v2/turns_v2)才算开了。
+1. **V2 上线 flag**(2026-06-22 更新):**test 环境现在默认 ON**(`FEEDLING_RUNTIME_V2_DEFAULT_ON=true` 写进 test compose,镜像已部署)——`perception_ingress_runtime_v2_enabled` / `resident_wake_runtime_v2_enabled` / `resident_chat_runtime_v2_enabled` 无 per-user 显式值时即落到这个基线。**所以一般不用再找工程师逐账号翻。** per-user blob 仍可覆盖(回滚)。
+   用 debug 页确认:做一次会触发 V2 的动作后,看到 `v2_wakes/v2_turns/v2_tool_traces` 有数据 = 真生效。(空着不代表没开,可能只是还没触发过。)
 2. **Debug 页**:`https://test-api.feedling.app/debug/proactive`(HTML)、`/v1/proactive/debug`(JSON)。
    **需要带 api_key 鉴权——浏览器直开会 `{"error":"unauthorized"}`。** 三种方式:
    - **浏览器最省事**:URL 后加 `?key=<你的_api_key>`,即
@@ -57,6 +63,8 @@
    - api_key = 你测试账号的 Feedling API key(iOS app 里那把,不是 OpenRouter 那个)。
    区块:V2 health / wake→turn 时间线 / action·tool / background·scheduled,每条带 status+reason。
 3. **memory 重做未完** → 只验机制通断,不评内容质量。
+4. **(resident / VPS 路)VPS 上的 consumer 必须是最新 `test` 分支(含 `e14c373` 聊天感知 + resident 修复)+ 重启**。否则就算 flag 开,resident 聊天也没有感知工具、且可能解析不出回复。注:resident 的 turn 在 VPS 上跑,后端 debug 的 `v2_turns` 可能为 0 属正常;但**聊天里 pull 感知会经 `/v1/proactive/tool/execute` 在后端留 `v2_tool_traces`**,可据此验。
+5. **(2026-06-22 新增)聊天里 pull 感知**(`resident_chat`/`hosted_chat_full_tool_loop` flag):在聊天里问相应问题,agent 应**叠加**调对应 `perception.*` 工具(看 debug `v2_tool_traces`),**且不影响工程师的记忆召回**。只暴露**快档**:`perception.now/location/calendar/motion/weather`;慢档(步数/睡眠/体征/屏幕)聊天里有意暂不开放。
 
 ## Part 1 · 测试用例详情(对应状态表)
 
