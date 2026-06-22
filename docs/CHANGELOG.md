@@ -57,14 +57,6 @@
   - **prod 也默认 ON**：上一轮已给 `docker-compose.phala.yaml` 加了 `FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"`，所以 4 个 flag 在 test+prod 两个 compose 下都默认 ON。**两个 compose 不用再改**——新接入的 flag 共用同一个 env baseline 自动跟着 ON。
 - **screen_caption 隐私决定**：它把屏幕截图外发第三方 VLM(OpenRouter)，原为 fail-closed opt-in。用户**明确选择默认 ON**（含 prod）。reader 仍保留 error→OFF 的 fail-closed。
 - **测试**：`test_runtime_v2_default_flag.py` 扩展（4-flag scrub + set marker + 旧 bool marker 迁移 + hosted_wake/hosted_chat/screen_caption baseline）；本地非 DB 回归 200 passed。需 PG 的（`test_hosted_wake_v2_cutover` / `test_model_api_wake` / `test_proactive_tool_execute_route`）交给 CI。
-### [备忘·privacy] perception_state 明文存外部 RDS(含健康桶值)——记录待修,不紧急
-- 审出:`perception_state` 是明文 jsonb 存在**外部 AWS RDS(TEE 外)**,含 place_label(home/work)/
-  日历详情/audio device_name/**健康桶值(睡眠·心率·步数·运动)**。原始 GPS/BSSID 已在端上丢弃、
-  不出设备(✓);聊天/记忆/帧仍是密文(✓);但粗感知状态不是信封、是明文。健康明文外置是
-  新接 weather/health 时未评估的存储隐私扩张。
-- 建议(分层):低敏粗信号留明文(热路径);健康/日历/device_name 走"加密信封+enclave 解"封起来;
-  立刻可做=关 test RDS 公网访问。详见 **`docs/PRIVACY_MEMO_perception_state_at_rest.md`**。
-
 ### [DECISION] Perception/Resident V2 rollout flags 改为 env-gated baseline（test 默认 ON / prod OFF）
 - **背景**:三个 V2 灰度 flag(`perception_ingress_runtime_v2_enabled`、
   `resident_wake_runtime_v2_enabled`、`resident_chat_runtime_v2_enabled`)默认全 OFF,
