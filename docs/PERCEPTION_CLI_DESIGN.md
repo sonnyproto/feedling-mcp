@@ -6,6 +6,7 @@
 >
 > 状态:2026-06-23 启动。CLI(tools/)= Claude 做;后端 agent-facing verbs = Codex 做;
 > 本文件是两边对齐的**合同**。
+> 后端 MVP:`GET /v1/agent/perception` 已接入 test 分支(2026-06-23);Phase 2 verbs 仍按 §3/§4 单开。
 
 ## 0. 形态与配置
 - 一个 CLI 脚本(`tools/io_cli.py`),随官方 consumer(feedling-mcp `test` 分支)分发——

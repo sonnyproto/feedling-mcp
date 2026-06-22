@@ -96,6 +96,7 @@ if not _provisioned:
         "test_screen_caption_backend.py",
         "test_screen_caption_flag.py",
         "test_tool_loop_v2.py",
+        "test_agent_perception_route.py",
     }
     collect_ignore = sorted(
         f

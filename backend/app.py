@@ -73,6 +73,7 @@ from model_api_runtime.wake import (
 
 import db
 import accounts
+import agent as agent_pkg
 from accounts import access as accounts_access
 from accounts import auth as accounts_auth
 from accounts import onboarding as accounts_onboarding
@@ -433,6 +434,7 @@ Compress(app)
 from perception import register as register_perception  # noqa: E402
 
 accounts.register(app)
+agent_pkg.register(app)
 push_pkg.register(app)
 proactive_pkg.register(app)
 identity_pkg.register(app)
