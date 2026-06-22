@@ -60,9 +60,12 @@ Optional:
   PROACTIVE_TICK_START_DELAY_SEC
                         Delay before the first automatic wake tick (default: 15)
   SEND_FALLBACK_ON_AGENT_ERROR
-                        Default false. When false, agent failures are logged
-                        and no fake template is posted to the user.
-  FALLBACK_REPLY        Optional opt-in fallback text
+                        Default true. Agent failures post a visible, bounded
+                        failure reply instead of silently dropping the turn.
+  FALLBACK_REPLY        Optional user-visible fallback text
+  AGENT_SESSION_MAX_TURNS / AGENT_SESSION_MAX_BYTES
+                        Bound resident-owned CLI/HTTP sessions. When either
+                        limit is reached, the next turn starts a fresh session.
   IMAGE_TEMP_DIR        Where decrypted chat images are written for CLI agents
   SCREEN_CONTEXT_MODE   "on_mention" (default), "always", or "off". When active,
                         recent screen-sharing context is attached to screen
@@ -108,7 +111,7 @@ except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
 from proactive.agent_protocol_v2 import build_agent_context_v2
-from proactive.tool_catalog_v2 import foreground_chat_tool_context_v2, tool_catalog_v2_for_runtime
+from proactive.tool_catalog_v2 import tool_catalog_v2_for_runtime
 from proactive.tool_loop_v2 import run_tool_loop_v2
 # NOTE: proactive.adapters_v2 and proactive.runtime_v2 are imported lazily inside
 # the proactive-job path (_resident_v2_agent_context_for_job). They transitively
@@ -237,12 +240,15 @@ AGENT_SESSION_FILE_TEMPLATE = os.environ.get(
     "AGENT_SESSION_FILE",
     f"/tmp/feedling_agent_session_{hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]}_{{user_id}}.txt",
 )
+AGENT_SESSION_MAX_TURNS = int(os.environ.get("AGENT_SESSION_MAX_TURNS", "40"))
+AGENT_SESSION_MAX_BYTES = int(os.environ.get("AGENT_SESSION_MAX_BYTES", "250000"))
+AGENT_SESSION_ROTATE_PREFIX = os.environ.get("AGENT_SESSION_ROTATE_PREFIX", "feedling-io")
 IMAGE_TEMP_DIR = Path(os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_images"))
 SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "on_mention").strip().lower()
 SCREEN_CONTEXT_MAX_AGE_SEC = int(os.environ.get("SCREEN_CONTEXT_MAX_AGE_SEC", "300"))
 SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
 FALLBACK_REPLY = os.environ.get(
-    "FALLBACK_REPLY", "（Agent 暂时无法响应，请稍后再试）"
+    "FALLBACK_REPLY", "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
 )
 # Canned reply for /v1/chat/verify_loop liveness pings — see the short-circuit
 # in _process_messages. The server GCs both the ping and this reply once the
@@ -257,7 +263,7 @@ VERIFY_PING_REPLY = os.environ.get("VERIFY_PING_REPLY", "__verify_ack__")
 # from falsely failing). See the verify_ping branch in _process_messages.
 VERIFY_PROBE_MESSAGE = os.environ.get("VERIFY_PROBE_MESSAGE", "（连接自检）请用一句话回复，确认你能收到我的消息。")
 VERIFY_PROBE_TIMEOUT_SEC = float(os.environ.get("VERIFY_PROBE_TIMEOUT_SEC", "20"))
-SEND_FALLBACK_ON_AGENT_ERROR = _env_bool("SEND_FALLBACK_ON_AGENT_ERROR", False)
+SEND_FALLBACK_ON_AGENT_ERROR = _env_bool("SEND_FALLBACK_ON_AGENT_ERROR", True)
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
 WHOAMI_STARTUP_RETRIES = int(os.environ.get("WHOAMI_STARTUP_RETRIES", "8"))
 WHOAMI_STARTUP_RETRY_DELAY_SEC = float(
@@ -1435,10 +1441,18 @@ def _extract_openai_reply(body: dict) -> str:
     raise ValueError("OpenAI-compatible response has no usable reply text")
 
 
-def _remember_http_session(resp: httpx.Response) -> None:
+def _response_text_len(resp: httpx.Response) -> int:
+    try:
+        return len((resp.text or "").encode("utf-8"))
+    except Exception:
+        return 0
+
+
+def _remember_http_session(resp: httpx.Response, *, sent_bytes: int = 0, received_bytes: int = 0) -> None:
     sid = (resp.headers.get(AGENT_HTTP_SESSION_HEADER) or "").strip()
     if sid:
         _save_agent_session_id(sid)
+        _record_agent_session_turn(sid, sent_bytes=sent_bytes, received_bytes=received_bytes)
 
 
 def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = None) -> Any:
@@ -1448,7 +1462,11 @@ def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = 
         payload["images"] = images
     resp = httpx.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=60)
     resp.raise_for_status()
-    _remember_http_session(resp)
+    _remember_http_session(
+        resp,
+        sent_bytes=len(message.encode("utf-8")),
+        received_bytes=_response_text_len(resp),
+    )
     body = resp.json()
     if isinstance(body, dict):
         turn = _agent_turn_from_raw(body)
@@ -1487,7 +1505,11 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
     }
     resp = httpx.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=120)
     resp.raise_for_status()
-    _remember_http_session(resp)
+    _remember_http_session(
+        resp,
+        sent_bytes=len(str(content).encode("utf-8")),
+        received_bytes=_response_text_len(resp),
+    )
     body = resp.json()
     if not isinstance(body, dict):
         raise ValueError(f"unexpected OpenAI response type: {type(body)}")
@@ -1510,26 +1532,105 @@ def call_agent_http(message: str, images: list[dict[str, str]] | None = None) ->
 
 
 def _agent_session_file_for_user() -> Path:
-    user_id = (_whoami_cache.get("user_id") or "unknown").strip() or "unknown"
+    user_id = _agent_session_user_id()
     path = AGENT_SESSION_FILE_TEMPLATE.replace("{user_id}", user_id)
     return Path(path)
 
 
-def _load_agent_session_id() -> str:
-    user_id = (_whoami_cache.get("user_id") or "unknown").strip() or "unknown"
-    cached = _agent_session_id_cache.get(user_id)
-    if cached:
-        return cached
+def _agent_session_user_id() -> str:
+    return (_whoami_cache.get("user_id") or "unknown").strip() or "unknown"
 
-    f = _agent_session_file_for_user()
+
+def _empty_agent_session_meta(session_id: str = "") -> dict[str, Any]:
+    return {
+        "session_id": session_id,
+        "turns": 0,
+        "bytes": 0,
+        "created_at": time.time() if session_id else 0.0,
+        "updated_at": time.time() if session_id else 0.0,
+    }
+
+
+def _coerce_agent_session_meta(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return _empty_agent_session_meta()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return _empty_agent_session_meta(text)
+        return _coerce_agent_session_meta(parsed)
+    if not isinstance(raw, dict):
+        return _empty_agent_session_meta()
+
+    sid = str(raw.get("session_id") or raw.get("sessionId") or raw.get("session") or "").strip()
+    meta = _empty_agent_session_meta(sid)
+    for key in ("turns", "bytes"):
+        try:
+            meta[key] = max(0, int(raw.get(key) or 0))
+        except (TypeError, ValueError):
+            meta[key] = 0
+    for key in ("created_at", "updated_at"):
+        try:
+            meta[key] = float(raw.get(key) or meta[key] or 0.0)
+        except (TypeError, ValueError):
+            pass
+    return meta
+
+
+def _agent_session_meta_exceeds_bounds(meta: dict[str, Any]) -> bool:
+    if not str(meta.get("session_id") or "").strip():
+        return False
+    if AGENT_SESSION_MAX_TURNS > 0 and int(meta.get("turns") or 0) >= AGENT_SESSION_MAX_TURNS:
+        return True
+    if AGENT_SESSION_MAX_BYTES > 0 and int(meta.get("bytes") or 0) >= AGENT_SESSION_MAX_BYTES:
+        return True
+    return False
+
+
+def _clear_agent_session_id(reason: str = "") -> None:
+    user_id = _agent_session_user_id()
+    _agent_session_id_cache.pop(user_id, None)
+    _agent_session_meta_cache.pop(user_id, None)
     try:
-        sid = f.read_text(encoding="utf-8").strip()
-        if sid:
-            _agent_session_id_cache[user_id] = sid
-            return sid
-    except Exception:
-        pass
-    return ""
+        _agent_session_file_for_user().unlink(missing_ok=True)
+    except Exception as e:
+        log.warning("failed to clear agent session id: %s", e)
+    if reason:
+        log.warning("rotating resident agent session for user=%s reason=%s", user_id, reason)
+
+
+def _load_agent_session_meta(*, check_bounds: bool = True) -> dict[str, Any]:
+    user_id = _agent_session_user_id()
+    cached_meta = _agent_session_meta_cache.get(user_id)
+    if isinstance(cached_meta, dict):
+        meta = _coerce_agent_session_meta(cached_meta)
+    else:
+        cached_sid = _agent_session_id_cache.get(user_id)
+        if cached_sid:
+            meta = _empty_agent_session_meta(cached_sid)
+        else:
+            f = _agent_session_file_for_user()
+            try:
+                meta = _coerce_agent_session_meta(f.read_text(encoding="utf-8"))
+            except Exception:
+                meta = _empty_agent_session_meta()
+
+    if check_bounds and _agent_session_meta_exceeds_bounds(meta):
+        reason = f"turns={meta.get('turns')} bytes={meta.get('bytes')}"
+        _clear_agent_session_id(reason)
+        return _empty_agent_session_meta()
+
+    sid = str(meta.get("session_id") or "").strip()
+    if sid:
+        _agent_session_id_cache[user_id] = sid
+        _agent_session_meta_cache[user_id] = dict(meta)
+    return dict(meta)
+
+
+def _load_agent_session_id() -> str:
+    return str(_load_agent_session_meta().get("session_id") or "").strip()
 
 
 def _save_agent_session_id(sid: str) -> None:
@@ -1537,32 +1638,82 @@ def _save_agent_session_id(sid: str) -> None:
     if not sid:
         return
 
-    user_id = (_whoami_cache.get("user_id") or "unknown").strip() or "unknown"
+    user_id = _agent_session_user_id()
+    existing = _load_agent_session_meta(check_bounds=False)
+    if str(existing.get("session_id") or "").strip() == sid:
+        meta = dict(existing)
+    else:
+        meta = _empty_agent_session_meta(sid)
+    meta["session_id"] = sid
+    meta["updated_at"] = time.time()
+
     _agent_session_id_cache[user_id] = sid
+    _agent_session_meta_cache[user_id] = dict(meta)
 
     f = _agent_session_file_for_user()
     try:
         f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(sid + "\n", encoding="utf-8")
+        f.write_text(json.dumps(meta, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
     except Exception as e:
         log.warning("failed to persist agent session id: %s", e)
+
+
+def _record_agent_session_turn(sid: str, *, sent_bytes: int = 0, received_bytes: int = 0) -> None:
+    sid = (sid or "").strip()
+    if not sid:
+        return
+    existing = _load_agent_session_meta(check_bounds=False)
+    meta = dict(existing) if str(existing.get("session_id") or "").strip() == sid else _empty_agent_session_meta(sid)
+    meta["session_id"] = sid
+    meta["turns"] = int(meta.get("turns") or 0) + 1
+    meta["bytes"] = int(meta.get("bytes") or 0) + max(0, int(sent_bytes or 0)) + max(0, int(received_bytes or 0))
+    meta["updated_at"] = time.time()
+
+    user_id = _agent_session_user_id()
+    _agent_session_id_cache[user_id] = sid
+    _agent_session_meta_cache[user_id] = dict(meta)
+    try:
+        f = _agent_session_file_for_user()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(meta, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    except Exception as e:
+        log.warning("failed to persist agent session metrics: %s", e)
 
 
 def _extract_session_id(raw: str) -> str:
     if not raw:
         return ""
     for obj in reversed(_json_objects_from_cli_output(raw)):
-        if isinstance(obj, dict):
-            for field in ("session_id", "sessionId", "session"):
-                value = obj.get(field)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
+        sid = _session_id_from_obj(obj)
+        if sid:
+            return sid
     m = re.search(r'"?session_id"?\s*:\s*"?([A-Za-z0-9_\-]+)"?', raw)
+    if m:
+        return m.group(1)
+    m = re.search(r'"?sessionId"?\s*:\s*"?([A-Za-z0-9_\-]+)"?', raw)
     if m:
         return m.group(1)
     m = re.search(r"Resumed session\s+([A-Za-z0-9_\-]+)", raw)
     if m:
         return m.group(1)
+    return ""
+
+
+def _session_id_from_obj(obj: Any) -> str:
+    if isinstance(obj, dict):
+        for field in ("session_id", "sessionId", "session"):
+            value = obj.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in obj.values():
+            sid = _session_id_from_obj(value)
+            if sid:
+                return sid
+    elif isinstance(obj, list):
+        for item in obj:
+            sid = _session_id_from_obj(item)
+            if sid:
+                return sid
     return ""
 
 
@@ -1620,6 +1771,42 @@ def _cli_flag_value(cmd: list[str], flag: str) -> str:
     if idx + 1 >= len(cmd):
         return ""
     return cmd[idx + 1]
+
+
+def _set_cli_option_value(cmd: list[str], flag: str, value: str) -> list[str]:
+    out = list(cmd)
+    try:
+        idx = out.index(flag)
+    except ValueError:
+        return out
+    if idx + 1 >= len(out) or out[idx + 1].startswith("-"):
+        out.insert(idx + 1, value)
+    else:
+        out[idx + 1] = value
+    return out
+
+
+def _new_agent_session_id() -> str:
+    user_id = _agent_session_user_id()
+    user_part = hashlib.sha1((user_id or FEEDLING_API_KEY).encode()).hexdigest()[:8]
+    nonce = f"{int(time.time())}-{os.getpid()}-{int(time.monotonic() * 1000) % 100000}"
+    return f"{AGENT_SESSION_ROTATE_PREFIX}-{user_part}-{nonce}"
+
+
+def _ensure_explicit_cli_session_id(cmd: list[str], sid: str) -> tuple[list[str], str]:
+    if "--session-id" not in cmd:
+        return cmd, sid
+    bounded_sid = sid.strip() if sid else _new_agent_session_id()
+    if not sid:
+        _save_agent_session_id(bounded_sid)
+    fixed_sid = _cli_flag_value(cmd, "--session-id")
+    if fixed_sid and fixed_sid != bounded_sid:
+        log.warning(
+            "replacing fixed AGENT_CLI_CMD --session-id %s with bounded resident session %s",
+            fixed_sid,
+            bounded_sid,
+        )
+    return _set_cli_option_value(cmd, "--session-id", bounded_sid), bounded_sid
 
 
 def _warn_if_agent_entry_may_drift() -> None:
@@ -1791,6 +1978,7 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
     if image_paths and "{image_path" not in AGENT_CLI_CMD:
         rendered_message = _message_for_agent(message, image_paths)
     cmd = _render_cli_template(rendered_message, sid, image_paths=image_paths)
+    cmd, sid = _ensure_explicit_cli_session_id(cmd, sid)
 
     if _is_hermes_chat_cmd(cmd):
         cmd, removed_continue = _strip_hermes_continue(cmd)
@@ -1805,7 +1993,7 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
                 "removed Hermes --output-mode from AGENT_CLI_CMD; this Hermes "
                 "chat CLI does not support that flag in current deployments"
             )
-        if sid and not _has_cli_resume(cmd):
+        if sid and not _has_cli_resume(cmd) and "--session-id" not in cmd:
             cmd = [cmd[0], "--resume", sid, *cmd[1:]]
     elif _is_claude_code_cmd(cmd):
         cmd, removed_continue = _strip_cli_flags(cmd, {"--continue", "-c"})
@@ -1829,12 +2017,19 @@ def call_agent_cli(message: str, image_paths: list[str] | None = None) -> Any:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
 
     cmd = _prepare_cli_command(message, image_paths=image_paths)
+    command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
-    observed_sid = _extract_session_id((result.stdout or "") + "\n" + (result.stderr or ""))
+    raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+    observed_sid = _extract_session_id(raw_transport) or command_sid
     if observed_sid:
         _save_agent_session_id(observed_sid)
+        _record_agent_session_turn(
+            observed_sid,
+            sent_bytes=len((message or "").encode("utf-8")),
+            received_bytes=len(raw_transport.encode("utf-8")),
+        )
 
     if result.returncode != 0:
         raise RuntimeError(
@@ -2056,20 +2251,13 @@ def _resident_run_agent_v2(message: str, *, foreground_chat: bool = False) -> An
 
 
 def _resident_foreground_chat_message_v2(content: str) -> str:
-    tools = json.dumps(
-        foreground_chat_tool_context_v2(),
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-    return (
-        "Feedling foreground chat Runtime V2.\n"
-        "The user is waiting, so call only the listed fast perception tools inline. Do not call memory tools, action "
-        "tools, steps, sleep, workout, vitals, photo, screen, or long calendar windows. Use tool_calls JSON to gather data, then finish "
-        "with messages/actions and no tool_calls. This is a foreground user message, not a proactive wake; do not "
-        "assume a change_digest. If a needed tool is not listed, answer from available context and do not promise a background follow-up.\n\n"
-        f"Available tools JSON:\n{tools}\n\n"
-        f"User message:\n{content}"
-    )
+    """Resident foreground chat is a native-agent turn.
+
+    Hosted LLMs need prompt-injected JSON tool instructions. Resident agents
+    such as OpenClaw/Claude Code should receive the user's message directly and
+    use their registered native tools (io_cli for Feedling perception).
+    """
+    return content
 
 
 # ---------------------------------------------------------------------------
@@ -2080,11 +2268,6 @@ def _resident_foreground_chat_message_v2(content: str) -> str:
 # before every encrypted write so resident agents do not keep wrapping replies
 # to a stale iOS content public key.
 _whoami_cache: dict = {"user_id": "", "user_pk": None, "enclave_pk": None}
-
-# Fallback deduplication — don't flood the user if the agent repeatedly fails.
-FALLBACK_COOLDOWN = int(os.environ.get("FALLBACK_COOLDOWN", "60"))
-_last_fallback_ts: float = 0.0
-
 
 def execute_identity_actions(actions: list[dict]) -> dict:
     if not actions:
@@ -2164,6 +2347,7 @@ _SEEN_MAX = 500
 
 # Persisted agent conversation session id (for CLI agents like Hermes), keyed by user_id.
 _agent_session_id_cache: dict[str, str] = {}
+_agent_session_meta_cache: dict[str, dict[str, Any]] = {}
 _chat_runtime_v2_profile: dict[str, Any] = {}
 
 
@@ -3269,7 +3453,6 @@ def _process_proactive_jobs(jobs: list) -> float:
 
 def _process_messages(messages: list) -> float:
     """Process a batch of messages, return the highest timestamp seen."""
-    global _last_fallback_ts
     latest = 0.0
     for msg in messages:
         # Tolerate both "ts" and "timestamp" key names across API versions.
@@ -3393,10 +3576,7 @@ def _process_messages(messages: list) -> float:
         use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
         try:
             if use_runtime_v2:
-                agent_result = _resident_run_agent_v2(
-                    _resident_foreground_chat_message_v2(content),
-                    foreground_chat=True,
-                )
+                agent_result = call_agent(_resident_foreground_chat_message_v2(content))
             elif image_payloads or image_paths:
                 agent_result = call_agent(
                     content,
@@ -3406,23 +3586,11 @@ def _process_messages(messages: list) -> float:
             else:
                 agent_result = call_agent(content)
         except Exception as e:
-            log.error("agent call failed; not posting user-visible fallback: %s", e)
+            log.error("agent call failed; posting user-visible fallback: %s", e)
             if SEND_FALLBACK_ON_AGENT_ERROR:
-                now = time.time()
-                if now - _last_fallback_ts >= FALLBACK_COOLDOWN:
-                    agent_result = [FALLBACK_REPLY]
-                    _last_fallback_ts = now
-                    log.warning("sending opt-in fallback reply (cooldown starts)")
-                else:
-                    log.warning(
-                        "fallback suppressed — cooldown active (last sent %.0fs ago)",
-                        now - _last_fallback_ts,
-                    )
-                    latest = max(latest, ts)
-                    continue
+                agent_result = [FALLBACK_REPLY]
             else:
-                # Mark this message seen for this process so a broken agent entry
-                # does not create a visible template loop. The error stays in logs.
+                log.warning("agent error fallback disabled by env; this user turn will not get a visible reply")
                 latest = max(latest, ts)
                 continue
 

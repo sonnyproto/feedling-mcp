@@ -139,35 +139,35 @@ def test_process_messages_posts_reply_with_source_message_id():
     assert mock_post.call_args.kwargs["reply_to_message_id"] == "user-msg-1"
 
 
-def test_process_messages_uses_resident_v2_tool_loop_when_chat_flag_on(monkeypatch):
+def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     crc._update_chat_runtime_v2_profile({crc.RESIDENT_CHAT_RUNTIME_V2_FLAG: True})
     msg = {"id": "user-msg-v2", "role": "user", "content": "天气怎么样？", "ts": 1112.0}
     captured = {}
 
-    def fake_run(message, *, foreground_chat=False):
+    def fake_call(message, images=None, image_paths=None):
         captured["message"] = message
-        captured["foreground_chat"] = foreground_chat
         return {"messages": ["外面下雨。"]}
 
     try:
-        with patch.object(crc, "_resident_run_agent_v2", side_effect=fake_run) as mock_v2, \
-             patch.object(crc, "call_agent") as mock_legacy, \
+        with patch.object(crc, "call_agent", side_effect=fake_call) as mock_agent, \
+             patch.object(crc, "_resident_run_agent_v2") as mock_v2, \
              patch.object(crc, "post_reply", return_value={"id": "reply-msg-v2"}) as mock_post:
             result_ts = crc._process_messages([msg])
     finally:
         crc._update_chat_runtime_v2_profile({})
 
     assert result_ts == pytest.approx(1112.0)
-    mock_v2.assert_called_once()
-    mock_legacy.assert_not_called()
-    assert captured["foreground_chat"] is True
-    assert "perception.weather" in captured["message"]
+    mock_agent.assert_called_once()
+    mock_v2.assert_not_called()
+    assert captured["message"] == "天气怎么样？"
+    assert "Available tools JSON" not in captured["message"]
+    assert "tool_calls" not in captured["message"]
+    assert "perception.weather" not in captured["message"]
     assert "memory.fetch" not in captured["message"]
     assert "perception.steps" not in captured["message"]
     assert "screen.read" not in captured["message"]
-    assert "User message:\n天气怎么样？" in captured["message"]
     assert mock_post.call_args.args[0] == "外面下雨。"
     assert mock_post.call_args.kwargs["reply_to_message_id"] == "user-msg-v2"
 
@@ -181,7 +181,7 @@ def test_process_messages_v2_drops_needs_background_without_ack(monkeypatch):
     try:
         with patch.object(
             crc,
-            "_resident_run_agent_v2",
+            "call_agent",
             return_value={"actions": [{"type": "needs_background", "request": {"tool": "perception.steps", "args": {}}}], "messages": []},
         ), patch.object(crc, "execute_agent_actions") as mock_actions, \
              patch.object(crc, "post_reply", return_value={"id": "reply-bg"}) as mock_post:
@@ -649,7 +649,6 @@ def test_empty_content_no_decrypt_source_no_reply_no_fallback(monkeypatch):
     """poll returns content="" and no decrypt source is configured —
     consumer must skip the message silently (no reply, no fallback)."""
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "")
-    crc._last_fallback_ts = 0.0
 
     msg = _make_msg(role="user", content="", ts=5000.0)
 
@@ -662,32 +661,39 @@ def test_empty_content_no_decrypt_source_no_reply_no_fallback(monkeypatch):
     assert result_ts == pytest.approx(5000.0)
 
 
-def test_agent_failure_no_fallback_by_default(monkeypatch):
-    """Agent backend failure should not post a fake user-visible template."""
-    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", False)
-    crc._last_fallback_ts = 0.0
+def test_agent_failure_posts_visible_fallback_by_default(monkeypatch):
+    """Agent backend failure must not silently drop a user turn."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
 
     with patch.object(crc, "call_agent", side_effect=RuntimeError("agent down")), \
          patch.object(crc, "post_reply") as mock_post:
         result_ts = crc._process_messages([
-            _make_msg(role="user", content="msg1", ts=100.0)
+            {"id": "agent-failure-1", "role": "user", "content": "msg1", "ts": 100.0}
         ])
 
-    mock_post.assert_not_called()
+    mock_post.assert_called_once()
+    assert mock_post.call_args.args[0] == crc.FALLBACK_REPLY
+    assert mock_post.call_args.kwargs["reply_to_message_id"] == "agent-failure-1"
     assert result_ts == pytest.approx(100.0)
 
 
-def test_fallback_is_explicit_opt_in(monkeypatch):
-    """The legacy fallback path still exists only when explicitly enabled."""
+def test_agent_failure_fallback_is_not_cooldown_suppressed(monkeypatch):
+    """Each failed user turn receives visible feedback instead of a silent cooldown drop."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
     monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
-    crc._last_fallback_ts = 0.0
 
     with patch.object(crc, "call_agent", side_effect=RuntimeError("agent down")), \
-         patch.object(crc, "post_reply") as mock_post, \
-         patch("time.time", return_value=200.0):
-        crc._process_messages([_make_msg(role="user", content="msg1", ts=101.0)])
+         patch.object(crc, "post_reply") as mock_post:
+        crc._process_messages([
+            {"id": "agent-failure-2", "role": "user", "content": "msg1", "ts": 101.0},
+            {"id": "agent-failure-3", "role": "user", "content": "msg2", "ts": 102.0},
+        ])
 
-    mock_post.assert_called_once()
+    assert mock_post.call_count == 2
+    assert [call.args[0] for call in mock_post.call_args_list] == [crc.FALLBACK_REPLY, crc.FALLBACK_REPLY]
 
 
 def test_sanitize_reply_text_strips_leaks_and_duplicates():
@@ -934,6 +940,45 @@ def test_agent_session_file_scoped_by_user_id(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_abc", "user_pk": None, "enclave_pk": None})
     p = crc._agent_session_file_for_user()
     assert str(p) == "/tmp/feedling_usr_abc.txt"
+
+
+def test_agent_session_meta_rotates_when_turn_bound_reached(monkeypatch, tmp_path):
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_bounded", "user_pk": None, "enclave_pk": None})
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "feedling_{user_id}.json"))
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_TURNS", 2)
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_BYTES", 0)
+
+    crc._save_agent_session_id("sess_a")
+    crc._record_agent_session_turn("sess_a", sent_bytes=10, received_bytes=5)
+    assert crc._load_agent_session_id() == "sess_a"
+
+    crc._record_agent_session_turn("sess_a", sent_bytes=10, received_bytes=5)
+
+    assert crc._load_agent_session_id() == ""
+    assert not crc._agent_session_file_for_user().exists()
+
+
+def test_prepare_cli_replaces_fixed_session_id_after_rotation(monkeypatch, tmp_path):
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_openclaw", "user_pk": None, "enclave_pk": None})
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "feedling_{user_id}.json"))
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_TURNS", 1)
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_BYTES", 0)
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'openclaw agent --json --session-id feedling-io-seven "{message}"')
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    crc._save_agent_session_id("feedling-old")
+    crc._record_agent_session_turn("feedling-old", sent_bytes=100, received_bytes=100)
+
+    cmd = crc._prepare_cli_command("hello")
+    sid = crc._cli_flag_value(cmd, "--session-id")
+
+    assert sid.startswith("feedling-io-")
+    assert sid not in {"feedling-io-seven", "feedling-old"}
+    assert "hello" in cmd
 
 
 def test_prepare_hermes_cli_strips_continue_and_injects_resume(monkeypatch):
@@ -2073,6 +2118,20 @@ def test_openclaw_payloads_reply_is_extracted():
     # turn from dict and from the raw JSON string (the actual CLI stdout path)
     assert crc._agent_turn_from_raw(obj).messages == ["能看到，这条消息收到了。"]
     assert crc._agent_turn_from_raw(json.dumps(obj)).messages == ["能看到，这条消息收到了。"]
+
+
+def test_openclaw_nested_session_id_is_extracted():
+    raw = json.dumps(
+        {
+            "runId": "x",
+            "result": {
+                "payloads": [{"text": "收到。"}],
+                "meta": {"agentMeta": {"sessionId": "openclaw_sess_1"}},
+            },
+        }
+    )
+
+    assert crc._extract_session_id(raw) == "openclaw_sess_1"
 
 
 def test_openclaw_multi_payload_preserves_bubbles():

@@ -255,20 +255,30 @@ The consumer reads Claude Code's `session_id` from JSON output and injects
 service environment cannot find `claude`, use an absolute executable path or set
 `AGENT_CLI_PATH`.
 
-### Failure behavior
+### Session bounds and failure behavior
 
-By default, agent-entry failures are log-only and **no fallback template is
-posted into iOS Chat**:
+The resident owns IO-facing session continuity and keeps it bounded. For CLI
+agents that print a `session_id`, later turns resume that session until either
+bound is reached:
 
 ```
-SEND_FALLBACK_ON_AGENT_ERROR=false
+AGENT_SESSION_MAX_TURNS=40
+AGENT_SESSION_MAX_BYTES=250000
 ```
 
-This keeps user-visible chat clean. If the agent command, HTTP endpoint, or
-reply sanitizer fails, inspect the resident logs and fix the entry; do not
-mask it with "send that once more" / "temporarily unavailable" chat bubbles.
-There is an opt-in fallback knob for local experiments, but production
-onboarding should leave it disabled.
+If a CLI template contains a fixed `--session-id`, the consumer replaces it
+with its own bounded session id so one hardcoded session cannot grow forever.
+
+Agent-entry failures are user-visible by default:
+
+```
+SEND_FALLBACK_ON_AGENT_ERROR=true
+FALLBACK_REPLY=我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。
+```
+
+This prevents a timeout or broken agent entry from silently dropping a user
+turn. Empty plaintext caused by a missing decrypt source is still skipped rather
+than answered, because the consumer cannot know what the user said.
 
 ### Image messages
 
