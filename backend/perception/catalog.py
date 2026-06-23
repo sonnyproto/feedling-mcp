@@ -94,10 +94,10 @@ SIGNALS: dict[str, Signal] = {s.input: s for s in [
            resolver="focus_presence", ttl_sec=300.0, significant=False),
 
     # permissioned
-    Signal("location_signal", "location", ("place_label", "wifi_label", "country", "wifi_anchor_id"),
+    Signal("location_signal", "location", ("place_label", "wifi_label", "country", "locality", "wifi_anchor_id"),
            resolver="location_signal", ttl_sec=900.0),
     Signal("motion_state", "motion", ("motion_state",), ttl_sec=300.0),
-    Signal("calendar_next_event", "calendar", ("calendar_next_event",),
+    Signal("calendar_next_event", "calendar", ("calendar_next_event", "calendar_events", "calendar_events_truncated"),
            ttl_sec=3600.0, significant=False),
     Signal("playback", "now_playing", ("now_playing",),
            ttl_sec=600.0, significant=False),

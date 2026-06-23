@@ -408,6 +408,13 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
             if sig.resolver:
                 fn = resolve.RESOLVERS.get(sig.resolver)
                 resolved = fn(value, config) if fn else {}
+            elif isinstance(value, Mapping) and len(sig.outputs) > 1:
+                if any(fname in value for fname in sig.outputs):
+                    resolved = {fname: value.get(fname) for fname in sig.outputs if fname in value}
+                    if key == "calendar_next_event" and "calendar_next_event" not in resolved:
+                        resolved["calendar_next_event"] = None
+                else:
+                    resolved = {sig.outputs[0]: value}
             else:
                 resolved = {sig.outputs[0]: value}
             cap = catalog.CAPABILITIES[sig.capability]

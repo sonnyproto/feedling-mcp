@@ -227,7 +227,32 @@ def test_encrypted_body_output_key_values_are_unwrapped_before_storage(monkeypat
             "message": "motion fresh",
         },
         "env_calendar": {
-            "values": {"calendar_next_event": {"title": "1:1", "starts_in_min": 25}},
+            "values": {
+                "calendar_next_event": {"title": "1:1", "starts_in_min": 25},
+                "calendar_events": [
+                    {
+                        "title": "Yesterday review",
+                        "next_event_time": "2026-06-22T09:00:00+08:00",
+                        "end_time": "2026-06-22T09:30:00+08:00",
+                        "event_kind": "meeting",
+                        "attendee_count": 2,
+                        "is_all_day": False,
+                        "duration_min": 30,
+                        "minutes_until_start": -1500,
+                    },
+                    {
+                        "title": "1:1",
+                        "next_event_time": "2026-06-23T10:00:00+08:00",
+                        "end_time": "2026-06-23T10:30:00+08:00",
+                        "event_kind": "meeting",
+                        "attendee_count": 2,
+                        "is_all_day": False,
+                        "duration_min": 30,
+                        "minutes_until_start": 25,
+                    },
+                ],
+                "calendar_events_truncated": False,
+            },
             "message": "calendar fresh",
         },
         "env_playback": {
@@ -260,14 +285,65 @@ def test_encrypted_body_output_key_values_are_unwrapped_before_storage(monkeypat
     assert state["motion_state"]["v"] == {"state": "walking", "confidence": 0.9, "started_at": 100.0}
     assert state["motion_state"]["msg"] == "motion fresh"
     assert state["calendar_next_event"]["v"] == {"title": "1:1", "starts_in_min": 25}
+    assert [event["title"] for event in state["calendar_events"]["v"]] == ["Yesterday review", "1:1"]
+    assert state["calendar_events_truncated"]["v"] is False
     assert state["now_playing"]["v"] == {"title": "Song", "artist": "Artist"}
     assert "values" not in state["motion_state"]["v"]
     assert "motion_state" not in state["motion_state"]["v"]
     snapshot = service.pull_snapshot("u_output_key_values", now=250.0)
     assert snapshot["motion_state"] == {"state": "walking", "confidence": 0.9, "started_at": 100.0}
     assert snapshot["calendar_next_event"] == {"title": "1:1", "starts_in_min": 25}
+    assert [event["title"] for event in snapshot["calendar_events"]] == ["Yesterday review", "1:1"]
+    assert snapshot["calendar_events_truncated"] is False
     assert snapshot["now_playing"] == {"title": "Song", "artist": "Artist"}
     assert emitted == []
+
+
+def test_calendar_encrypted_body_missing_next_event_clears_old_next_event(monkeypatch):
+    fake = _Store()
+    monkeypatch.setattr(service, "store", fake)
+    monkeypatch.setattr(service, "_submit_wake_event_v2_compat", lambda event: None)
+
+    fake.merge_state_guarded("u_calendar_clear", {
+        "calendar_next_event": {"v": {"title": "old event"}, "ts": 100.0, "msg": "old"},
+    })
+
+    plaintext = {
+        "values": {
+            "calendar_events": [
+                {
+                    "title": "All hands",
+                    "next_event_time": "2026-06-24T12:00:00+08:00",
+                    "end_time": "2026-06-24T13:00:00+08:00",
+                    "event_kind": "meeting",
+                    "attendee_count": 10,
+                    "is_all_day": False,
+                    "duration_min": 60,
+                    "minutes_until_start": 120,
+                },
+            ],
+            "calendar_events_truncated": False,
+        },
+        "message": "calendar fresh",
+    }
+
+    def decrypt(envelope, api_key, *, purpose):
+        assert purpose == "perception:calendar_next_event"
+        return json.dumps(plaintext).encode("utf-8")
+
+    results = service.ingest_snapshot_v2(
+        "u_calendar_clear",
+        [{"key": "calendar_next_event", "envelope": {"id": "calendar_no_next"}, "changed": True}],
+        client_ts=300.0,
+        api_key="api-key",
+        decrypt_envelope=decrypt,
+    )
+
+    assert results["calendar_next_event"] == "accepted"
+    state = fake.get_state("u_calendar_clear")
+    assert state["calendar_next_event"]["v"] is None
+    assert [event["title"] for event in state["calendar_events"]["v"]] == ["All hands"]
+    assert state["calendar_events_truncated"]["v"] is False
 
 
 def test_location_signal_decrypt_feeds_wifi_anchor_differ_once(monkeypatch):

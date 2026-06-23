@@ -194,9 +194,10 @@ def resolve_location_signal(value, config: dict) -> dict:
         matches the home/work/... vocabulary); raw coords discarded.
       - wifi_label: trusted from the device (backend has no SSID to map); BSSID dropped.
       - country: from country_region_change.locale_region or placemark ISO code.
+      - locality: city-level coarse label explicitly released by iOS.
     """
     if not isinstance(value, dict):
-        return {"place_label": "unknown", "wifi_label": None, "country": None}
+        return {"place_label": "unknown", "wifi_label": None, "country": None, "locality": None}
     out: dict = {}
     sig = value.get("signal") or {}
     lat, lon = sig.get("latitude"), sig.get("longitude")
@@ -206,6 +207,7 @@ def resolve_location_signal(value, config: dict) -> dict:
         out["place_label"] = value.get("place_label") or "unknown"
     out["wifi_label"] = value.get("wifi_label")
     out["wifi_anchor_id"] = value.get("wifi_anchor_id")
+    out["locality"] = value.get("locality")
     crc = value.get("country_region_change") or {}
     pm = value.get("placemark") or {}
     out["country"] = crc.get("locale_region") or pm.get("iso_country_code")

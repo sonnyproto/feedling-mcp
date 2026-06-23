@@ -47,6 +47,7 @@ def test_agent_perception_returns_requested_fast_signals(monkeypatch):
             "place_label": "home",
             "wifi_label": "home_wifi",
             "country": "CN",
+            "locality": "深圳市",
             "wifi_anchor_id": "wifi-home",
             "condition": "rain",
             "temperature_bucket": 20,
@@ -66,7 +67,51 @@ def test_agent_perception_returns_requested_fast_signals(monkeypatch):
         "temperature_bucket": 20,
         "is_daylight": True,
     }
+    assert body["signals"]["location"]["locality"] == "深圳市"
     assert body["signals"]["location"]["wifi_anchor_id"] == "wifi-home"
+
+
+def test_agent_perception_calendar_returns_event_list(monkeypatch):
+    calendar_events = [
+        {
+            "title": "Yesterday review",
+            "next_event_time": "2026-06-22T09:00:00+08:00",
+            "end_time": "2026-06-22T09:30:00+08:00",
+            "event_kind": "meeting",
+            "attendee_count": 2,
+            "is_all_day": False,
+            "duration_min": 30,
+            "minutes_until_start": -1500,
+        },
+        {
+            "title": "1:1",
+            "next_event_time": "2026-06-23T10:00:00+08:00",
+            "end_time": "2026-06-23T10:30:00+08:00",
+            "event_kind": "meeting",
+            "attendee_count": 2,
+            "is_all_day": False,
+            "duration_min": 30,
+            "minutes_until_start": 25,
+        },
+    ]
+    client = _client(
+        monkeypatch,
+        pull={
+            "calendar_next_event": calendar_events[1],
+            "calendar_events": calendar_events,
+            "calendar_events_truncated": False,
+        },
+    )
+
+    resp = client.get("/v1/agent/perception?signals=calendar")
+    body = resp.get_json()
+
+    assert resp.status_code == 200
+    assert body["signals"]["calendar"] == {
+        "calendar_next_event": calendar_events[1],
+        "calendar_events": calendar_events,
+        "calendar_events_truncated": False,
+    }
 
 
 def test_agent_perception_slow_signals_return_inline_without_background(monkeypatch):
@@ -149,7 +194,11 @@ def test_agent_perception_null_permission_message_returns_disabled_but_no_event_
 
     assert resp.status_code == 200
     assert body["signals"]["sleep"] == {"disabled": True, "reason": "not_permitted"}
-    assert body["signals"]["calendar"] == {"calendar_next_event": None}
+    assert body["signals"]["calendar"] == {
+        "calendar_next_event": None,
+        "calendar_events": None,
+        "calendar_events_truncated": None,
+    }
 
 
 def test_agent_perception_rejects_unknown_signals(monkeypatch):
