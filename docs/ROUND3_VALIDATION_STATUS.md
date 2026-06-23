@@ -6,6 +6,11 @@ yet validated for the V2 runtime, so we don't mistake "all PRs PASSED" for
 
 Last updated: 2026-06-20 (before any real-device test, before merge to `test`).
 
+> **⚠️ 2026-06-23 起,真机/真实路径验证的最新状态以 `ROUND3_REALDEVICE_TEST_PLAN.md`
+> 的状态表 + 测试日志、以及 `CHANGELOG.md` 2026-06-23 条目为准。** 本文件下面的
+> "now validated" 是 06-20 那轮的快照,resident 感知端到端、locality/calendar 增强等
+> 后续验证未回填到这里——别把它当当前状态。
+
 ## What "PASS" meant during the audit
 
 Each of the 13 audited artifacts passed = **code reads correctly + the

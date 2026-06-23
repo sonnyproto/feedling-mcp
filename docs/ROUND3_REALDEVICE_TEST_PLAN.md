@@ -43,6 +43,8 @@
 >
 > **2026-06-22:** ① test 的 V2 flag **默认开**(见 Part 0.1),不用逐账号翻;② **聊天里 pull 感知**已上(`e14c373`,见 Part 0.5);③ 本轮测试走的是 **resident(VPS)路**,VPS consumer 须最新 test(Part 0.4)。
 >
+> **2026-06-23(resident 感知端到端打通 + 真机实测):** resident(OpenClaw)经 io_cli 原生工具 + `feedling-io-tools` 插件调 `/v1/agent/perception` **端到端验证通过**——真实聊天里 agent 报出真实**睡眠 390min/位置 outdoor·home/电量 70%**,有真值报真值、无数据如实说空(不编)。修了插件 config 交付崩溃(零硬编码:config→env→报错)+ iOS 聊天 typing 指示器/自递归崩溃。新增 **city `locality`**(iOS `4edf2bd` + 后端 `31ae6c9` 已部署)、**±14天 `calendar_events`** 列表、**日历本地时区**(`a97a73a`)——装新包(⌘R/TestFlight)后可验城市名 + 两周日程真值。仍待:**weather**(WeatherService 抛错,WeatherKit capability,工程师)、**steps 上报节奏**、`focus`/`audio_route` 后端暴露。详见 `PERCEPTION_FIELD_RECONCILIATION_2026-06-23.md` + CHANGELOG 2026-06-23。
+>
 > **建议起测顺序(由易到难,先打通最短链路):**
 > 1. **聊天 pull(最快验)**:聊"我现在在哪?"→ agent 应调 `perception.location`(debug `v2_tool_traces` 可见)。用 location/motion,**不需要 Apple capability**;天气/健康要 WeatherKit/HealthKit 开了才有数据。同时确认记忆召回照常(没被动)。
 > 2. 照片 wake(B1)→ 久别解锁 wake(B4)→ 三开关(F 组)→ 其余。
@@ -90,3 +92,12 @@
 ## 测试日志(按时间追加)
 
 _（Seven 报告结果时,审查员在此追加：时间 · 测试ID · 结果 · 证据/dashboard 观察）_
+
+### 2026-06-23 · resident(VPS/OpenClaw)路真机实测
+- **A1 前台聊天有回应** ✅:连发多条均秒回(修 resident session 无界超时 `baba9ee` 后),真实对话(非罐头)。
+- **聊天 pull 感知(Part 0.5)** ✅ 端到端:真实聊天里 agent 主动调 `perception_*` 并报真值——「我的睡眠」→ 390min/6.5h(=io_cli 真值);「天气」→ 答出 location=outdoor 但 weather 拿不到;「在哪」→ outdoor/home。值与 io_cli 直查**逐字一致,无编造**。
+- **机制**:agent 经 `tools/io_cli.py` + OpenClaw `feedling-io-tools` 插件打 `/v1/agent/perception`。插件 config 交付崩溃已修(零硬编码)。
+- **G2 健康 pull**:sleep ✅(390min);steps 凌晨为 null=今天还没走(正确,非 bug);心率 null=HealthKit 未产。
+- **G1 天气 pull** ❌:恒 null = `WeatherService` 抛错(entitlement 在,疑 Apple Portal WeatherKit capability;Xcode Console 搜 `weather fetch failed`)——**工程师**。
+- **日历**:24h 窗口内有会即返回(实测「io」事件,07:00Z=本地 15:00);±14天列表 + 城市 locality + 本地时区已部署,**装新包后复验**。
+- 字段语义全量对齐见 `PERCEPTION_FIELD_RECONCILIATION_2026-06-23.md`。

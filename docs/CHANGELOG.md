@@ -47,6 +47,33 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-06-23
+
+### [DONE] resident agent 原生感知端到端跑通（io_cli + OpenClaw 插件）+ config 去硬编码
+- 验证 resident（OpenClaw）经 io_cli 原生工具调 `/v1/agent/perception` **端到端通**：agent 在真实聊天里报出真实电量 / 位置 / 睡眠（睡眠 390min=6.5h、位置 outdoor/home、电量 70%）。
+- **根因修复**：OpenClaw `feedling-io-tools` 插件的 config 没经 gateway 交付（`register(api, config)` 收到空 `{}`）→ `path.resolve(undefined)` 抛错 → 发消息时工具崩。改成 **`config → 环境变量 → 报错`（零代码硬编码）**，host 路径放 `openclaw-gateway.service` 的 systemd Environment；插件在 `definePluginEntry` 里声明 `configSchema`；改完必须 `systemctl --user restart openclaw-gateway` 重载（gateway 常驻、缓存插件）。工具失败改返 `{ok:false,error}` 不再崩。
+- 清掉 OpenClaw 两处 stale 配置（`skills.feedling` 指 localhost:5001、`lossless-claw`）。
+- **注**：插件代码只在 VPS（`~/.openclaw/workspace/plugins/feedling-io-tools/`），**未进仓库**——后续应落仓或转 MCP server，见 `AGENT_CLI_INTEGRATION_SURVEY.md`。
+
+### [DONE] 感知增强：上报城市 locality + ±14 天日历列表 + 日历本地时区（iOS + 后端）
+- **#1 city**：iOS location 上报新增 `locality`（反地理编码城市名，如"深圳市"）；后端 catalog/resolver/`/v1/agent/perception` 落地暴露。**有意放开城市级定位口径**（街道 / 坐标仍不出设备）——因 `place_label` 对没配 geofence 的用户恒为 `outdoor`，agent 没有"在哪座城"的感知。
+- **#3 calendar**：从"24h 单个 next_event"扩成 `calendar_events` **前后 14 天列表**（含全天事件、按 start 排序、封顶 40 条 + `calendar_events_truncated`），保留 `calendar_next_event` 给唤醒/快照（changed 判定只看它，避免窗口滑动误唤醒）。
+- **时区**：日历事件时间改用**设备本地时区**输出（ISO8601 带 `+08:00` 偏移），agent 直接读本地钟点（如 15:00），不靠它自觉用 `now.timezone` 换算——少一处出错点。
+- 提交：iOS `4edf2bd`（city + ±14天列表）、`a97a73a`（本地时区）；后端 `31ae6c9`（已部署 test CVM）。后端 71/84 测试过，用**真实信封 body 形状**覆盖。
+
+### [FEEDBACK] 感知字段语义对齐审计（以 iOS 上报端为准）
+- 系统性对齐 iOS 采集/上报 ↔ 后端接收/存储/暴露：**契约逐字 1:1，无后端凭空字段**（`timezone`/`temperature_bucket` 等 iOS 端确实存在）。完整对照 + 修正清单入 `PERCEPTION_FIELD_RECONCILIATION_2026-06-23.md`。
+- 真机查清各信号语义：`location` 恒 `outdoor`=没配 home/work geofence（resolver 回退）；`sleep`=近 24h 滚动入睡时长（凌晨读=昨晚）；`steps` 凌晨 null=今天还没走（正确）；`weather` null=`WeatherService` 抛错（entitlement 在，疑 Apple Portal WeatherKit capability 未生效，**留工程师**，Xcode Console 搜 `weather fetch failed`）；`calendar` 只读 iOS 已同步的日历账户（飞书/Google 工作日历若没同步进 iOS Calendar 就读不到）。
+- `focus` / `audio_route` 后端 `/v1/agent/perception` 未暴露（iOS 在采集）——待补。
+
+### [DONE] iOS 聊天 typing 指示器多条待回修复 + 一个自递归崩溃
+- 修"连发两条、reply1 一到就灭点点点"：改用 `pendingReplies` 计数，全部待回落地才隐藏指示器；`isWaitingForReply=false` 时自动归零防卡死。
+- 修一个**自己引入的崩溃**：上面改动用 `replace_all` 抽取 5 分钟超时块时，误把新加的 `beginAwaitingReply()` helper **自身函数体**也替换成调用自己 → 无限递归 → **发送即崩溃**（栈溢出）。恢复 helper 体。提交 `a1ecd3e`。**教训**：无限递归是运行时错、`xcodebuild` 能过不代表不崩，改完必须真机/模拟器跑一次冒烟。
+
+### [DONE] docs 清理 + agent-CLI 调研文档
+- 删 12 个已 ship 的 Round 3 PR 执行脚手架文档（`PROACTIVE_PERCEPTION_PR1…PR10`；聚合的 `ROUND3_EXECUTION_PLAN` / `RUNTIME_V2_MIGRATION` 保留作 PR 总览 + 迁移契约，仍被 ARCHITECTURE/PROJECT_OVERVIEW/HANDOFF 引用）。
+- 新增 `AGENT_CLI_INTEGRATION_SURVEY.md`：各 agent（OpenClaw/Hermes/Claude Code/Codex）接 CLI 的机制调研。结论——**io_cli + skill/exec 是有 shell 能力 agent 的通用最小公分母**，不必每个 agent 写专属 adapter；native 插件/MCP 是更强的"升级位"；≥2 个非 OpenClaw runtime 要 production-grade typed 工具就做 **Feedling MCP server**，而不是继续扩散 per-agent adapter。
+
 ## 2026-06-22
 
 ### [DECISION] V2 baseline 扩展到全部 4 个 rollout flag + prod 也默认 ON
