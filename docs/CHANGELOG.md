@@ -71,7 +71,8 @@
 - 修一个**自己引入的崩溃**：上面改动用 `replace_all` 抽取 5 分钟超时块时，误把新加的 `beginAwaitingReply()` helper **自身函数体**也替换成调用自己 → 无限递归 → **发送即崩溃**（栈溢出）。恢复 helper 体。提交 `a1ecd3e`。**教训**：无限递归是运行时错、`xcodebuild` 能过不代表不崩，改完必须真机/模拟器跑一次冒烟。
 
 ### [DONE] docs 清理 + agent-CLI 调研文档
-- 删 12 个已 ship 的 Round 3 PR 执行脚手架文档（`PROACTIVE_PERCEPTION_PR1…PR10`；聚合的 `ROUND3_EXECUTION_PLAN` / `RUNTIME_V2_MIGRATION` 保留作 PR 总览 + 迁移契约，仍被 ARCHITECTURE/PROJECT_OVERVIEW/HANDOFF 引用）。
+- 删 12 个已 ship 的 Round 3 PR 执行脚手架文档（`PROACTIVE_PERCEPTION_PR1…PR10`；聚合的 `ROUND3_EXECUTION_PLAN` / `RUNTIME_V2_MIGRATION` 保留作 PR 总览 + 迁移契约）。
+- 二次清理：删 `PROACTIVE_GATE_V1.md`（V2 后自标 archived、非活跃路径）、`ROUND3_HANDOFF.md`（merge-前交接清单，branch 早已 merge 进 test）、`ROUND3_VALIDATION_STATUS.md`（06-20 审计快照；当前真机状态以 `ROUND3_REALDEVICE_TEST_PLAN.md` + 本 changelog 为准）。`MODEL_API_PATH_P0.md` **保留**——它是托管 Model-API 这条 live 路径的唯一设计文档、且被 `PROJECT_OVERVIEW` 文档索引引用。docs 41 → 26。
 - 新增 `AGENT_CLI_INTEGRATION_SURVEY.md`：各 agent（OpenClaw/Hermes/Claude Code/Codex）接 CLI 的机制调研。结论——**io_cli + skill/exec 是有 shell 能力 agent 的通用最小公分母**，不必每个 agent 写专属 adapter；native 插件/MCP 是更强的"升级位"；≥2 个非 OpenClaw runtime 要 production-grade typed 工具就做 **Feedling MCP server**，而不是继续扩散 per-agent adapter。
 
 ## 2026-06-22
