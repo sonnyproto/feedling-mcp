@@ -35,7 +35,7 @@ _SIGNAL_FIELDS: dict[str, tuple[str, ...]] = {
         "broadcast_active",
     ),
     "location": ("place_label", "wifi_label", "country", "locality", "wifi_anchor_id"),
-    "weather": ("condition", "temperature_bucket", "is_daylight"),
+    "weather": ("condition", "temperature", "is_daylight"),
     "motion": ("motion_state",),
     "calendar": ("calendar_next_event", "calendar_events", "calendar_events_truncated"),
     "focus": ("focus_authorization_status", "in_focus"),

@@ -50,7 +50,7 @@ def test_agent_perception_returns_requested_fast_signals(monkeypatch):
             "locality": "深圳市",
             "wifi_anchor_id": "wifi-home",
             "condition": "rain",
-            "temperature_bucket": 20,
+            "temperature": 23.4,
             "is_daylight": True,
         },
     )
@@ -64,7 +64,7 @@ def test_agent_perception_returns_requested_fast_signals(monkeypatch):
     assert body["signals"]["now"]["battery_level"] == 0.72
     assert body["signals"]["weather"] == {
         "condition": "rain",
-        "temperature_bucket": 20,
+        "temperature": 23.4,
         "is_daylight": True,
     }
     assert body["signals"]["location"]["locality"] == "深圳市"

@@ -153,7 +153,7 @@ def test_contract_mapped_continuous_signals_produce_zero_differ_events():
         ("now_playing", {"playback_state": "playing", "title": "Song"}),
         ("audio_route", {"output_type": "speaker", "is_bluetooth": False}),
         ("place_label", "home"),
-        ("weather", {"condition": "rain", "temperature_bucket": 20}),
+        ("weather", {"condition": "rain", "temperature": 23.4}),
         ("health_sleep", {"asleep_minutes_bucket": 420}),
         ("health_workout", {"workout_type": "running", "count_today": 1}),
         ("health_vitals", {"resting_heart_rate_bucket": 60, "step_count_bucket": 3500}),

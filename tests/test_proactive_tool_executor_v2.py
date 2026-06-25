@@ -36,7 +36,7 @@ def _adapters(*, send_message=None, photos_recent=None) -> ToolRuntimeAdaptersV2
         "is_bluetooth": True,
         "device_name": "Headphones",
         "condition": "rain",
-        "temperature_bucket": 20,
+        "temperature": 23.4,
         "is_daylight": False,
         "asleep_minutes_bucket": 420,
         "workout_type": "running",
@@ -122,7 +122,7 @@ def test_executor_runs_minimum_available_tools_with_injected_action_adapter():
     assert results[5].result["audio_route"]["device_name"] == "Headphones"
     assert results[6].result["weather"] == {
         "condition": "rain",
-        "temperature_bucket": 20,
+        "temperature": 23.4,
         "is_daylight": False,
     }
     assert results[7].result["photos"][0]["photo_id"] == "p1"

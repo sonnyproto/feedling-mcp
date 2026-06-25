@@ -82,7 +82,7 @@ def test_full_tool_loop_can_pull_perception_weather(monkeypatch):
         lambda api_key, store: ToolRuntimeAdaptersV2(
             perception_pull_snapshot=lambda _user_id: {
                 "condition": "rain",
-                "temperature_bucket": 20,
+                "temperature": 23.4,
                 "is_daylight": False,
             },
         ),
@@ -136,7 +136,7 @@ def test_foreground_perception_loop_composes_with_existing_memory_tools(monkeypa
         lambda api_key, store: ToolRuntimeAdaptersV2(
             perception_pull_snapshot=lambda _user_id: {
                 "condition": "rain",
-                "temperature_bucket": 20,
+                "temperature": 23.4,
                 "is_daylight": True,
             },
         ),

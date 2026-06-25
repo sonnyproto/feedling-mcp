@@ -168,7 +168,7 @@ def _copy_fields(value, fields: tuple[str, ...]) -> dict:
 
 
 def resolve_weather(value, config: dict) -> dict:
-    return _copy_fields(value, ("condition", "temperature_bucket", "is_daylight"))
+    return _copy_fields(value, ("condition", "temperature", "is_daylight"))
 
 
 def resolve_audio_route(value, config: dict) -> dict:

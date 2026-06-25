@@ -377,7 +377,7 @@ class ToolExecutorV2:
             state = self._pull_snapshot(call.user_id)
             return {"weather": {
                 "condition": state.get("condition"),
-                "temperature_bucket": state.get("temperature_bucket"),
+                "temperature": state.get("temperature"),
                 "is_daylight": state.get("is_daylight"),
             }}
         if call.name == "perception.steps":

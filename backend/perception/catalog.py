@@ -103,7 +103,7 @@ SIGNALS: dict[str, Signal] = {s.input: s for s in [
            ttl_sec=600.0, significant=False),
     Signal("audio_route", "audio_route", ("output_type", "is_bluetooth", "device_name"),
            resolver="audio_route", ttl_sec=600.0, significant=False),
-    Signal("weather", "weather", ("condition", "temperature_bucket", "is_daylight"),
+    Signal("weather", "weather", ("condition", "temperature", "is_daylight"),
            resolver="weather", ttl_sec=1800.0, significant=False),
     Signal("health_sleep", "health_sleep", ("asleep_minutes_bucket",),
            resolver="health_sleep", ttl_sec=86400.0, significant=False),

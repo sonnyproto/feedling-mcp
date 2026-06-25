@@ -157,7 +157,7 @@ def test_weather_health_and_focus_ingress_are_pull_only_after_decrypt(monkeypatc
             "message": "audio fresh",
         },
         "env_weather": {
-            "values": {"condition": "rain", "temperature_bucket": 20, "is_daylight": False},
+            "values": {"condition": "rain", "temperature": 23.4, "is_daylight": False},
             "message": "weather fresh",
         },
         "env_sleep": {"values": {"asleep_minutes_bucket": 420}, "message": "sleep fresh"},
@@ -202,7 +202,7 @@ def test_weather_health_and_focus_ingress_are_pull_only_after_decrypt(monkeypatc
     assert state["device_name"]["v"] == "Headphones"
     assert state["condition"]["v"] == "rain"
     assert state["condition"]["msg"] == "weather fresh"
-    assert state["temperature_bucket"]["v"] == 20
+    assert state["temperature"]["v"] == 23.4
     assert state["is_daylight"]["v"] is False
     assert state["asleep_minutes_bucket"]["v"] == 420
     assert state["workout_type"]["v"] == "running"
