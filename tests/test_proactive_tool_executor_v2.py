@@ -118,12 +118,17 @@ def test_executor_runs_minimum_available_tools_with_injected_action_adapter():
     assert results[0].result["snapshot"]["place_label"] == "home"
     assert results[1].result["location"]["wifi_label"] == "wifi-home"
     assert results[1].result["location"]["wifi_anchor_id"] == "wifi-anchor-home"
-    assert results[2].result["calendar_next_event"]["title"] == "Dentist"
+    assert results[2].result["calendar"]["calendar_next_event"]["title"] == "Dentist"
     assert results[5].result["audio_route"]["device_name"] == "Headphones"
     assert results[6].result["weather"] == {
         "condition": "rain",
         "temperature": 23.4,
+        "apparent_temperature": None,
+        "humidity": None,
+        "precipitation_chance": None,
+        "uv_index": None,
         "is_daylight": False,
+        "alerts": None,
     }
     assert results[7].result["photos"][0]["photo_id"] == "p1"
     assert results[8].result["memories"][0]["id"] == "mem_1"

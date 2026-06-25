@@ -12,9 +12,32 @@ import uuid
 from typing import Any, Callable, Mapping, Sequence
 
 import db
+from perception.agent_fields import project_signal
 from proactive.tool_catalog_v2 import FAST, SLOW, CostClass, ToolCatalogV2, default_tool_catalog_v2
 
 TOOL_TRACE_STREAM_V2 = "proactive_tool_traces_v2"
+
+# proactive perception.* tool -> agent signal name. Both paths project through
+# perception.agent_fields.project_signal so proactive sees the SAME signals/fields
+# as the CLI-tools path (A-lite unification). now / now_playing / photo_recent are
+# special-cased in _execute_available.
+_PERCEPTION_TOOL_SIGNAL_V2 = {
+    "perception.location": "location",
+    "perception.calendar": "calendar",
+    "perception.motion": "motion",
+    "perception.audio_route": "audio_route",
+    "perception.weather": "weather",
+    "perception.steps": "steps",
+    "perception.sleep_last_night": "sleep",
+    "perception.workout": "workout",
+    "perception.vitals": "vitals",
+    "perception.reminders": "reminders",
+    "perception.activity": "activity",
+    "perception.body": "body",
+    "perception.metabolic": "metabolic",
+    "perception.cycle": "cycle",
+    "perception.mood": "mood",
+}
 
 PR3_UNIMPLEMENTED_TOOLS_V2 = frozenset({"schedule_wake", "cancel_wake"})  # screen.read/screen.recent now implemented in _execute_available
 
@@ -298,20 +321,12 @@ class ToolExecutorV2:
     def _dynamic_unavailable(self, call: ToolCallV2, args: Mapping[str, Any]) -> tuple[str, str] | None:
         if call.name in {
             "perception.now",
-            "perception.location",
-            "perception.calendar",
             "perception.now_playing",
-            "perception.motion",
         } and not self.adapters.perception_snapshot:
             return ("perception_snapshot_adapter_missing", "perception snapshot adapter is not configured")
-        if call.name in {
-            "perception.audio_route",
-            "perception.weather",
-            "perception.steps",
-            "perception.sleep_last_night",
-            "perception.workout",
-            "perception.vitals",
-        } and not (self.adapters.perception_pull_snapshot or self.adapters.perception_snapshot):
+        if call.name in _PERCEPTION_TOOL_SIGNAL_V2 and not (
+            self.adapters.perception_pull_snapshot or self.adapters.perception_snapshot
+        ):
             return ("perception_snapshot_adapter_missing", "perception snapshot adapter is not configured")
         if call.name == "perception.photo_recent" and not self.adapters.photos_recent:
             return ("photo_recent_adapter_missing", "photo recent adapter is not configured")
@@ -348,57 +363,16 @@ class ToolExecutorV2:
     def _execute_available(self, call: ToolCallV2, args: Mapping[str, Any]) -> Mapping[str, Any]:
         if call.name == "perception.now":
             return {"snapshot": dict(self._snapshot(call.user_id))}
-        if call.name == "perception.location":
-            snap = self._snapshot(call.user_id)
-            return {"location": {
-                "place_label": snap.get("place_label"),
-                "wifi_label": snap.get("wifi_label"),
-                "country": snap.get("country"),
-                "wifi_anchor_id": snap.get("wifi_anchor_id"),
-            }}
-        if call.name == "perception.calendar":
-            snap = self._snapshot(call.user_id)
-            return {
-                "window_days": args.get("window_days", args.get("days", 1)),
-                "calendar_next_event": snap.get("calendar_next_event"),
-            }
         if call.name == "perception.now_playing":
             return {"now_playing": self._snapshot(call.user_id).get("now_playing")}
-        if call.name == "perception.motion":
-            return {"motion_state": self._snapshot(call.user_id).get("motion_state")}
-        if call.name == "perception.audio_route":
-            state = self._pull_snapshot(call.user_id)
-            return {"audio_route": {
-                "output_type": state.get("output_type"),
-                "is_bluetooth": state.get("is_bluetooth"),
-                "device_name": state.get("device_name"),
-            }}
-        if call.name == "perception.weather":
-            state = self._pull_snapshot(call.user_id)
-            return {"weather": {
-                "condition": state.get("condition"),
-                "temperature": state.get("temperature"),
-                "is_daylight": state.get("is_daylight"),
-            }}
-        if call.name == "perception.steps":
-            return {"steps": {"step_count": self._pull_snapshot(call.user_id).get("step_count")}}
-        if call.name == "perception.sleep_last_night":
-            return {"sleep_last_night": {
-                "asleep_minutes": self._pull_snapshot(call.user_id).get("asleep_minutes"),
-            }}
-        if call.name == "perception.workout":
-            state = self._pull_snapshot(call.user_id)
-            return {"workout": {
-                "workout_type": state.get("workout_type"),
-                "duration_min": state.get("duration_min"),
-                "count_today": state.get("count_today"),
-            }}
-        if call.name == "perception.vitals":
-            state = self._pull_snapshot(call.user_id)
-            return {"vitals": {
-                "resting_heart_rate": state.get("resting_heart_rate"),
-                "step_count": state.get("step_count"),
-            }}
+        sig = _PERCEPTION_TOOL_SIGNAL_V2.get(call.name)
+        if sig is not None:
+            # One projection source of truth with the CLI-tools path: every field
+            # comes from perception.agent_fields.project_signal, so new iOS signals
+            # (reminders/activity/body/metabolic/cycle/mood + expanded weather/
+            # sleep/vitals) reach the proactive agent automatically.
+            doc = project_signal(sig, {}, self._pull_snapshot(call.user_id))
+            return {call.name.split(".", 1)[1]: doc}
         if call.name == "perception.photo_recent":
             limit = _int_arg(args.get("limit"), default=10, lo=1, hi=50)
             assert self.adapters.photos_recent is not None

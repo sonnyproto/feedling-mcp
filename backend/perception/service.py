@@ -455,17 +455,22 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
     # Tier 2 quantitative history: fold each historized signal's observation into
     # its device-local daily rollup (field-agnostic — see perception/history.py).
     # Only for signals that actually wrote a field this report (skips stale/older).
-    if hist_obs:
-        local_date = _local_date(now, tz_seen or (prev_state.get("timezone") or {}).get("v"))
-        for sig_key, obs in hist_obs.items():
-            outs = catalog.SIGNALS[sig_key].outputs if sig_key in catalog.SIGNALS else ()
-            if not any(f in written for f in outs):
-                continue
-            store.merge_perception_daily(
-                user_id, local_date, sig_key,
-                lambda prev, _o=obs, _k=sig_key: history.record_daily(prev, _k, _o, ts=now),
-                now,
-            )
+    # Best-effort: history is Tier 2 and must NEVER break Tier 1 state ingest, so
+    # the whole block is guarded (also tolerates stores without the daily helper).
+    if hist_obs and hasattr(store, "merge_perception_daily"):
+        try:
+            local_date = _local_date(now, tz_seen or (prev_state.get("timezone") or {}).get("v"))
+            for sig_key, obs in hist_obs.items():
+                outs = catalog.SIGNALS[sig_key].outputs if sig_key in catalog.SIGNALS else ()
+                if not any(f in written for f in outs):
+                    continue
+                store.merge_perception_daily(
+                    user_id, local_date, sig_key,
+                    lambda prev, _o=obs, _k=sig_key: history.record_daily(prev, _k, _o, ts=now),
+                    now,
+                )
+        except Exception as e:
+            log.warning("perception_daily history rollup failed (non-fatal): %s", e)
 
     return results
 
