@@ -238,6 +238,141 @@ def test_whoami_startup_retries_transient_failure(monkeypatch):
     assert len(calls) == 3
 
 
+def test_whoami_startup_retries_keep_fixed_delay(monkeypatch):
+    sleeps = []
+
+    monkeypatch.setattr(crc, "_load_whoami", lambda: False)
+    monkeypatch.setattr(crc, "WHOAMI_STARTUP_RETRIES", 3)
+    monkeypatch.setattr(crc, "WHOAMI_STARTUP_RETRY_DELAY_SEC", 5)
+    monkeypatch.setattr(crc.time, "sleep", lambda delay: sleeps.append(delay))
+
+    assert crc._load_whoami_with_retries() is False
+    assert sleeps == [5, 5]
+
+
+def test_whoami_reply_refresh_retries_use_exponential_backoff(monkeypatch):
+    sleeps = []
+
+    monkeypatch.setattr(crc, "_load_whoami", lambda: False)
+    monkeypatch.setattr(crc.time, "sleep", lambda delay: sleeps.append(delay))
+
+    assert crc._load_whoami_with_retries(
+        attempts=3,
+        delay_sec=0.5,
+        context="reply refresh",
+        backoff_multiplier=2.0,
+    ) is False
+    assert sleeps == [0.5, 1.0]
+
+
+def test_post_reply_retries_whoami_refresh_before_encrypted_write(monkeypatch):
+    calls = []
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"id": "m_retry", "ts": 1.0}
+
+    def _load():
+        calls.append(1)
+        if len(calls) < 3:
+            return False
+        crc._whoami_cache.update(
+            user_id="usr_retry",
+            user_pk=b"r" * 32,
+            enclave_pk=None,
+        )
+        return True
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "", "user_pk": None, "enclave_pk": None})
+    monkeypatch.setattr(crc, "_load_whoami", _load)
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRIES", 3)
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRY_DELAY_SEC", 0)
+    monkeypatch.setattr(crc, "_build_envelope", lambda **kw: {"owner": kw["owner_user_id"]})
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    body = crc.post_reply("hello")
+
+    assert body["id"] == "m_retry"
+    assert len(calls) == 3
+    assert captured["json"]["envelope"]["owner"] == "usr_retry"
+
+
+def test_post_reply_uses_cached_whoami_keys_when_refresh_fails(monkeypatch):
+    captured = {}
+    envelope_kwargs = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"id": "m_cached", "ts": 2.0}
+
+    def _load():
+        crc._whoami_cache.update(user_id="", user_pk=None, enclave_pk=None)
+        return False
+
+    def _build(**kwargs):
+        envelope_kwargs.update(kwargs)
+        return {"owner": kwargs["owner_user_id"], "visibility": kwargs["visibility"]}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_cached", "user_pk": b"c" * 32, "enclave_pk": b"e" * 32},
+    )
+    monkeypatch.setattr(crc, "_load_whoami", _load)
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRIES", 2)
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRY_DELAY_SEC", 0)
+    monkeypatch.setattr(crc, "_build_envelope", _build)
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    body = crc.post_reply("hello from cache")
+
+    assert body["id"] == "m_cached"
+    assert envelope_kwargs["owner_user_id"] == "usr_cached"
+    assert envelope_kwargs["user_pk_bytes"] == b"c" * 32
+    assert captured["json"]["envelope"]["visibility"] == "shared"
+
+
+def test_post_reply_skips_when_whoami_refresh_fails_without_cache(monkeypatch):
+    posted = []
+
+    def _post(*args, **kwargs):
+        posted.append((args, kwargs))
+        raise AssertionError("post should not be called without encryption keys")
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "", "user_pk": None, "enclave_pk": None})
+    monkeypatch.setattr(crc, "_load_whoami", lambda: False)
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRIES", 2)
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRY_DELAY_SEC", 0)
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    body = crc.post_reply("lost")
+
+    assert body == {"error": "whoami_refresh_failed"}
+    assert posted == []
+
+
 # ---------------------------------------------------------------------------
 # Bonus: agent failures are fail-hard by default
 # ---------------------------------------------------------------------------

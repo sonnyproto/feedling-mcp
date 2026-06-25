@@ -64,6 +64,10 @@ Optional:
                         and enqueue due hidden jobs.
   PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC
                         Scheduled wake fire cadence in seconds (default: 60)
+  WHOAMI_REFRESH_RETRIES
+                        Short retry count before encrypted reply writes (default: 3)
+  WHOAMI_REFRESH_RETRY_DELAY_SEC
+                        Initial reply whoami retry backoff in seconds (default: 0.5)
   SEND_FALLBACK_ON_AGENT_ERROR
                         Default true. Agent failures post a visible, bounded
                         failure reply instead of silently dropping the turn.
@@ -277,6 +281,8 @@ WHOAMI_STARTUP_RETRIES = int(os.environ.get("WHOAMI_STARTUP_RETRIES", "8"))
 WHOAMI_STARTUP_RETRY_DELAY_SEC = float(
     os.environ.get("WHOAMI_STARTUP_RETRY_DELAY_SEC", "5")
 )
+WHOAMI_REFRESH_RETRIES = int(os.environ.get("WHOAMI_REFRESH_RETRIES", "3"))
+WHOAMI_REFRESH_RETRY_DELAY_SEC = float(os.environ.get("WHOAMI_REFRESH_RETRY_DELAY_SEC", "0.5"))
 
 # Prompt routed only when an agent entry cannot receive a native image object.
 # The consumer still extracts decrypted image bytes and passes them through
@@ -2404,23 +2410,61 @@ def _load_whoami() -> bool:
     return bool(user_id and user_pk)
 
 
-def _load_whoami_with_retries() -> bool:
-    """Fetch whoami at startup, tolerating transient network/TLS failures."""
-    attempts = max(1, WHOAMI_STARTUP_RETRIES)
-    delay = max(0.0, WHOAMI_STARTUP_RETRY_DELAY_SEC)
+def _load_whoami_with_retries(
+    *,
+    attempts: int | None = None,
+    delay_sec: float | None = None,
+    context: str = "startup check",
+    backoff_multiplier: float = 1.0,
+) -> bool:
+    """Fetch whoami with bounded retry/backoff for transient network/TLS failures."""
+    attempts = max(1, WHOAMI_STARTUP_RETRIES if attempts is None else attempts)
+    delay = max(0.0, WHOAMI_STARTUP_RETRY_DELAY_SEC if delay_sec is None else delay_sec)
+    multiplier = max(1.0, float(backoff_multiplier))
 
     for idx in range(attempts):
         if _load_whoami():
             return True
         if idx + 1 < attempts:
             log.warning(
-                "whoami startup check failed; retrying %s/%s in %.1fs",
+                "whoami %s failed; retrying %s/%s in %.1fs",
+                context,
                 idx + 2,
                 attempts,
                 delay,
             )
             if delay:
                 time.sleep(delay)
+            delay *= multiplier
+    return False
+
+
+def _whoami_cache_has_encryption_keys(cache: dict | None = None) -> bool:
+    cache = _whoami_cache if cache is None else cache
+    user_id = str(cache.get("user_id") or "").strip()
+    user_pk = cache.get("user_pk")
+    return bool(user_id and isinstance(user_pk, bytes) and len(user_pk) == 32)
+
+
+def _refresh_whoami_for_encrypted_reply() -> bool:
+    previous = dict(_whoami_cache)
+    if _load_whoami_with_retries(
+        attempts=WHOAMI_REFRESH_RETRIES,
+        delay_sec=WHOAMI_REFRESH_RETRY_DELAY_SEC,
+        context="reply refresh",
+        backoff_multiplier=2.0,
+    ):
+        return True
+    if not _whoami_cache_has_encryption_keys() and _whoami_cache_has_encryption_keys(previous):
+        _whoami_cache.update(previous)
+    if _whoami_cache_has_encryption_keys():
+        log.warning(
+            "whoami refresh failed before encrypted reply; using cached keys user_id=%s user_pk=%s enclave_pk=%s",
+            _whoami_cache.get("user_id") or "",
+            _fingerprint_bytes(_whoami_cache.get("user_pk")),
+            _fingerprint_bytes(_whoami_cache.get("enclave_pk")),
+        )
+        return True
     return False
 
 
@@ -2655,8 +2699,8 @@ def post_reply(
     """
     url = f"{FEEDLING_API_URL}/v1/chat/response"
 
-    if _ENCRYPTION_AVAILABLE and not _load_whoami():
-        log.error("whoami refresh failed before encrypted reply; skipping write")
+    if _ENCRYPTION_AVAILABLE and not _refresh_whoami_for_encrypted_reply():
+        log.error("whoami refresh failed before encrypted reply and no cached keys are available; skipping write")
         return {"error": "whoami_refresh_failed"}
 
     user_id = _whoami_cache["user_id"]
