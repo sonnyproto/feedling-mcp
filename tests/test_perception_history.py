@@ -26,10 +26,15 @@ def test_numeric_dist_is_field_agnostic_new_field_flows():
     assert d["brand_new_metric"] == {"min": 1.0, "max": 3.0, "sum": 4.0, "count": 2}
 
 
-def test_numeric_dist_skips_step_count_dup():
+def test_step_count_aggregates_and_reads_as_daily_total():
+    # step_count is cumulative-within-day: aggregated via numeric_dist, but the
+    # trend representative is max (= daily total), not the average.
     d = history.record_daily(None, "health_vitals", {"step_count": 1000, "current_heart_rate": 65})
-    assert "step_count" not in d
-    assert "current_heart_rate" in d
+    d = history.record_daily(d, "health_vitals", {"step_count": 1801, "current_heart_rate": 68})
+    assert d["step_count"]["max"] == 1801.0
+    rows = [{"date": "2026-06-26", "doc": d}]
+    t = history.read_trend(rows, "health_vitals", "step_count")
+    assert t["current"] == 1801.0  # daily total, not avg
 
 
 def test_cumulative_takes_running_max():

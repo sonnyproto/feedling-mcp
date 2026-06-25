@@ -7,6 +7,7 @@ from typing import Any
 from flask import Blueprint, jsonify, request
 
 from accounts import auth
+from perception import history as perception_history
 from perception import service as perception_service
 from perception import store as perception_store
 
@@ -213,3 +214,65 @@ def agent_perception():
         reason = _permission_states_reason(settings, signal) or _null_state_message_reason(state, signal)
         out[signal] = _disabled(reason) if reason else _signal_doc(signal, snapshot, pull_snapshot)
     return jsonify({"ok": True, "signals": out})
+
+
+# Agent signal name -> canonical catalog signal key for the quantitative history
+# (perception_daily) rollups. Mirrors AGENT_PERCEPTION_SIGNALS where historized.
+_HISTORY_SIGNAL_TO_CATALOG: dict[str, str] = {
+    "vitals": "health_vitals",
+    "steps": "health_vitals",          # step_count lives in the vitals signal
+    "sleep": "health_sleep",
+    "workout": "health_workout",
+    "activity": "health_activity",
+    "body": "health_body",
+    "metabolic": "health_metabolic",
+    "cycle": "health_cycle",
+    "mood": "health_mood",
+    "weather": "weather",
+    "motion": "motion_state",
+    "location": "location_signal",
+    "calendar": "calendar_next_event",
+    "focus": "focus",
+    "audio_route": "audio_route",
+    "reminders": "reminders",
+}
+
+
+def _history_signal(raw: str | None) -> str | None:
+    sig = str(raw or "").strip().lower()
+    return _HISTORY_SIGNAL_TO_CATALOG.get(sig)
+
+
+@bp.route("/v1/agent/perception/trend", methods=["GET"])
+def agent_perception_trend():
+    """Rolling baseline + delta for one numeric field over the last N days, so
+    the agent can sense change vs the user's norm (e.g. RHR up ~14% vs 30d)."""
+    user_store = auth.require_user()
+    sig = _history_signal(request.args.get("signal"))
+    if sig is None:
+        return jsonify({"ok": False, "error": "unknown_or_unhistorized_signal",
+                        "available": sorted(_HISTORY_SIGNAL_TO_CATALOG)}), 400
+    field = (request.args.get("field") or "").strip() or None
+    try:
+        days = max(1, min(int(request.args.get("days", "30")), 365))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "invalid_days"}), 400
+    rows = perception_store.list_perception_daily(user_store.user_id, sig, days)
+    return jsonify({"ok": True, "trend": perception_history.read_trend(rows, sig, field)})
+
+
+@bp.route("/v1/agent/perception/history", methods=["GET"])
+def agent_perception_history():
+    """Raw per-day rollup docs for a signal over the last N days (the agent sees
+    the full daily shape: distributions / totals / event lists / minutes)."""
+    user_store = auth.require_user()
+    sig = _history_signal(request.args.get("signal"))
+    if sig is None:
+        return jsonify({"ok": False, "error": "unknown_or_unhistorized_signal",
+                        "available": sorted(_HISTORY_SIGNAL_TO_CATALOG)}), 400
+    try:
+        days = max(1, min(int(request.args.get("days", "14")), 365))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "invalid_days"}), 400
+    rows = perception_store.list_perception_daily(user_store.user_id, sig, days)
+    return jsonify({"ok": True, "signal": sig, "days": days, "daily": rows})

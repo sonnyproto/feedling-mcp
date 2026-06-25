@@ -26,7 +26,7 @@ from content_encryption import random_item_id
 from core import enclave as core_enclave
 from core import util as core_util
 
-from . import catalog, resolve, store
+from . import catalog, history, resolve, store
 from .ingress_v2 import device_event_observations_v2, operation_observations_v2, observe_signal_v2
 from .ios_contract_v2 import (
     ENCRYPTED_SIGNAL_KEYS_V2,
@@ -378,6 +378,8 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
     patch: dict[str, dict] = {}          # field -> candidate cell (ts-guarded on write)
     input_fields: dict[str, list] = {}   # input_name -> output fields it proposed
     wake_pending: list[tuple] = []       # (cap_key, debounce, field, old, new)
+    hist_obs: dict[str, dict] = {}       # catalog signal key -> resolved values (for Tier 2)
+    tz_seen: str | None = None
 
     for input_name, value, msg in pairs:
         if input_name in catalog.IGNORED_KEYS:
@@ -427,6 +429,10 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
                 old = (prev_state.get(fname) or {}).get("v")
                 if cap.wake_source and sig.significant and new_v != old:
                     wake_pending.append((sig.capability, cap.debounce_sec, fname, old, new_v))
+            if key == "time" and isinstance(resolved, dict):
+                tz_seen = resolved.get("timezone") or tz_seen
+            if history.is_historized(key) and isinstance(resolved, dict):
+                hist_obs[key] = dict(resolved)
         input_fields[input_name] = fields
 
     # Atomic ts-guarded write under a row lock: a field is persisted only if its
@@ -446,7 +452,35 @@ def _apply(user_id: str, pairs: list, client_ts=None, *, emit_legacy_wakes: bool
         if emit_legacy_wakes and f in written:
             _maybe_wake(user_id, capk, debounce, f, old, new_v, now)
 
+    # Tier 2 quantitative history: fold each historized signal's observation into
+    # its device-local daily rollup (field-agnostic — see perception/history.py).
+    # Only for signals that actually wrote a field this report (skips stale/older).
+    if hist_obs:
+        local_date = _local_date(now, tz_seen or (prev_state.get("timezone") or {}).get("v"))
+        for sig_key, obs in hist_obs.items():
+            outs = catalog.SIGNALS[sig_key].outputs if sig_key in catalog.SIGNALS else ()
+            if not any(f in written for f in outs):
+                continue
+            store.merge_perception_daily(
+                user_id, local_date, sig_key,
+                lambda prev, _o=obs, _k=sig_key: history.record_daily(prev, _k, _o, ts=now),
+                now,
+            )
+
     return results
+
+
+def _local_date(now: float, tz: str | None) -> str:
+    """Device-local 'YYYY-MM-DD' for day-bucketing the history rollup. Falls back
+    to UTC when the timezone is unknown/invalid."""
+    from datetime import datetime, timezone as _utc
+    if tz:
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.fromtimestamp(now, ZoneInfo(tz)).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return datetime.fromtimestamp(now, _utc.utc).strftime("%Y-%m-%d")
 
 
 def _maybe_unlock_wake(user_id, patch, written, prev_state, now, wake_candidates) -> None:

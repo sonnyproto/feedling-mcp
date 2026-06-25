@@ -373,3 +373,59 @@ def get_photo_envelope(user_id: str, frame_id: str) -> dict | None:
 
 def delete_photo_envelope(user_id: str, frame_id: str) -> None:
     frame_delete(user_id, frame_id)
+
+
+# ---------------------------------------------------------------------------
+# Quantitative history (perception_daily) — Tier 2 daily rollups.
+# ---------------------------------------------------------------------------
+
+def merge_perception_daily(user_id: str, date: str, signal: str, merge_fn, ts: float) -> dict:
+    """Read-modify-write one (user, local-date, signal) rollup under a row lock:
+    load the running day-doc, hand it to ``merge_fn(prev_doc) -> new_doc`` (the
+    field-agnostic incremental aggregator), and persist. The lock serializes the
+    30s/5min report churn so concurrent reports can't lose increments.
+    Returns the new doc (or {} on failure)."""
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                conn.execute(
+                    "INSERT INTO perception_daily (user_id, date, signal, doc, updated_at) "
+                    "VALUES (%s, %s, %s, '{}'::jsonb, %s) "
+                    "ON CONFLICT (user_id, date, signal) DO NOTHING",
+                    (user_id, date, signal, ts),
+                )
+                row = conn.execute(
+                    "SELECT doc FROM perception_daily "
+                    "WHERE user_id = %s AND date = %s AND signal = %s FOR UPDATE",
+                    (user_id, date, signal),
+                ).fetchone()
+                prev = row[0] if row and isinstance(row[0], dict) else {}
+                new_doc = merge_fn(prev) or {}
+                conn.execute(
+                    "UPDATE perception_daily SET doc = %s, updated_at = %s "
+                    "WHERE user_id = %s AND date = %s AND signal = %s",
+                    (Jsonb(new_doc), ts, user_id, date, signal),
+                )
+        return new_doc
+    except Exception as e:
+        log.error("merge_perception_daily(%s,%s,%s) failed: %s", user_id, date, signal, e)
+        return {}
+
+
+def list_perception_daily(user_id: str, signal: str, days: int = 30) -> list[dict]:
+    """Most-recent ``days`` rollups for a signal, ascending by date:
+    [{"date": "YYYY-MM-DD", "doc": {...}}]."""
+    limit = max(1, min(int(days), 400))
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                "SELECT date, doc FROM perception_daily "
+                "WHERE user_id = %s AND signal = %s ORDER BY date DESC LIMIT %s",
+                (user_id, signal, limit),
+            ).fetchall()
+        out = [{"date": r[0], "doc": r[1] if isinstance(r[1], dict) else {}} for r in rows]
+        out.reverse()  # ascending for trend math
+        return out
+    except Exception as e:
+        log.error("list_perception_daily(%s,%s) failed: %s", user_id, signal, e)
+        return []

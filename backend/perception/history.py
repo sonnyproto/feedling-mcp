@@ -58,8 +58,10 @@ _STATE_FIELD = {
     "audio_route": "output_type",
     "location_signal": "place_label",
 }
-# Fields that are pure-instant noise even inside a historized signal.
-_SKIP_FIELDS = {"step_count"}  # cumulative dup of the `steps` signal; handled there
+# Numeric fields that are cumulative-within-the-day (monotonic), so their daily
+# representative is max(=total), not the average. Read-side hint only — they
+# still aggregate through numeric_dist's {min,max,sum,count}.
+_NUMERIC_MAX_FIELDS = {"step_count"}
 
 
 def is_historized(signal: str) -> bool:
@@ -91,8 +93,6 @@ def _flatten_state(v: Any) -> str | None:
 def _merge_numeric_dist(doc: dict, values: Mapping, **_) -> dict:
     out = dict(doc)
     for field, raw in values.items():
-        if field in _SKIP_FIELDS:
-            continue
         n = _numeric(raw)
         if n is None:
             continue
@@ -233,7 +233,11 @@ def _series_value(doc: Mapping, shape: str, field: str | None) -> float | None:
     """Pull a single comparable daily number out of a day-doc for trending."""
     if shape == NUMERIC_DIST:
         cell = doc.get(field) if field else None
-        if isinstance(cell, Mapping) and cell.get("count"):
+        if not isinstance(cell, Mapping):
+            return None
+        if field in _NUMERIC_MAX_FIELDS:        # cumulative-within-day -> daily total
+            return cell.get("max")
+        if cell.get("count"):
             return round(cell["sum"] / cell["count"], 3)
         return None
     if shape == CUMULATIVE:

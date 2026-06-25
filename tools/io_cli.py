@@ -96,6 +96,34 @@ def cmd_perception(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+def cmd_perception_trend(args):
+    api_url = _env("FEEDLING_API_URL")
+    api_key = _env("FEEDLING_API_KEY")
+    if not api_url or not api_key:
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_API_KEY in env"}, 2)
+    params = {"signal": args.signal, "days": str(args.days)}
+    if args.field:
+        params["field"] = args.field
+    url = f"{api_url.rstrip('/')}/v1/agent/perception/trend?{urllib.parse.urlencode(params)}"
+    status, body = _http_json("GET", url, api_key)
+    if status == 200:
+        _emit(body)
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
+def cmd_perception_history(args):
+    api_url = _env("FEEDLING_API_URL")
+    api_key = _env("FEEDLING_API_KEY")
+    if not api_url or not api_key:
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_API_KEY in env"}, 2)
+    params = {"signal": args.signal, "days": str(args.days)}
+    url = f"{api_url.rstrip('/')}/v1/agent/perception/history?{urllib.parse.urlencode(params)}"
+    status, body = _http_json("GET", url, api_key)
+    if status == 200:
+        _emit(body)
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
 def cmd_phase2(args):
     _emit({"ok": False,
            "error": f"'{args.verb}' is not implemented yet (phase 2)",
@@ -115,6 +143,19 @@ def main():
         help="one or more of: " + ", ".join(PERCEPTION_SIGNALS) + " (default: fast set)",
     )
     pp.set_defaults(func=cmd_perception)
+
+    pt = sub.add_parser("perception-trend",
+                        help="Rolling baseline + delta for one numeric field (sense change vs norm).")
+    pt.add_argument("signal", help="e.g. vitals/steps/sleep/weather/activity/metabolic/body")
+    pt.add_argument("--field", default="", help="numeric field, e.g. resting_heart_rate / step_count / asleep_minutes")
+    pt.add_argument("--days", type=int, default=30)
+    pt.set_defaults(func=cmd_perception_trend)
+
+    ph = sub.add_parser("perception-history",
+                        help="Raw per-day rollup docs for a signal over N days.")
+    ph.add_argument("signal", help="e.g. vitals/sleep/motion/location/calendar/reminders/mood")
+    ph.add_argument("--days", type=int, default=14)
+    ph.set_defaults(func=cmd_perception_history)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")
