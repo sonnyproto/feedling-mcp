@@ -20,6 +20,21 @@ from push import apns as push_apns  # noqa: E402
 from core import config as core_config  # noqa: E402
 
 
+def _patch_resident_scheduled_route_dependencies(monkeypatch):
+    from proactive import scheduled_wake_v2, store_v2
+
+    scheduled_store = scheduled_wake_v2.InMemoryScheduledWakeStoreV2()
+    settings_by_user: dict[str, dict] = {}
+
+    class _SettingsStore:
+        def load(self, user_id: str):
+            return resolve_settings_v2(settings_by_user.get(user_id))
+
+    monkeypatch.setattr(scheduled_wake_v2, "DBScheduledWakeStoreV2", lambda: scheduled_store)
+    monkeypatch.setattr(store_v2, "DBProactiveSettingsStoreV2", _SettingsStore)
+    return scheduled_store, settings_by_user
+
+
 def test_device_event_payload_is_redacted():
     raw = {
         "permission": "authorized",
@@ -895,6 +910,134 @@ def test_resident_poll_applies_v2_wake_controls_to_legacy_jobs(tmp_path, monkeyp
     assert rows["pj_scheduled"]["status"] == "skipped"
     assert rows["pj_scheduled"]["status_reason"] == "scheduled_disabled"
     assert rows["pj_manual"]["status"] == "pending"
+
+
+def test_resident_scheduled_fire_endpoint_queues_due_timer_job(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+    scheduled_store, _settings_by_user = _patch_resident_scheduled_route_dependencies(monkeypatch)
+
+    api_key = "test_resident_scheduled_fire_key"
+    user_id = "usr_resident_scheduled_fire"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    scheduled = client.post(
+        "/v1/proactive/scheduled/actions",
+        headers=headers,
+        json={
+            "actions": [{
+                "type": "schedule_wake",
+                "at": "2000-01-01T00:00:00+00:00",
+                "tz": "UTC",
+                "note": "take meds",
+            }],
+            "turn_id": "turn_test",
+            "wake_ids": ["wake_original"],
+        },
+    )
+    assert scheduled.status_code == 200
+    timer_id = scheduled.get_json()["results"][0]["timer_id"]
+
+    fired = client.post("/v1/proactive/scheduled/fire", headers=headers, json={})
+
+    assert fired.status_code == 200
+    body = fired.get_json()
+    assert body["queued"] == 1
+    assert body["results"][0]["status"] == "fired"
+    assert body["results"][0]["timer_id"] == timer_id
+    job = body["jobs"][0]
+    assert job["trigger"] == "scheduled_wake"
+    assert job["wake_kind"] == "scheduled_wake"
+    assert job["scheduled_note"] == "take meds"
+    assert job["payload"]["v2_wake"]["scheduled_wake"]["wake_id"] == timer_id
+    record = scheduled_store.list_records(user_id)[0]
+    assert record.status == "fired"
+    assert record.fired_wake_id == body["results"][0]["wake_id"]
+
+
+def test_resident_scheduled_fire_endpoint_transparency_when_scheduled_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+    scheduled_store, settings_by_user = _patch_resident_scheduled_route_dependencies(monkeypatch)
+
+    api_key = "test_resident_scheduled_fire_off_key"
+    user_id = "usr_resident_scheduled_fire_off"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    scheduled = client.post(
+        "/v1/proactive/scheduled/actions",
+        headers=headers,
+        json={
+            "actions": [{
+                "type": "schedule_wake",
+                "at": "2000-01-01T00:00:00+00:00",
+                "tz": "UTC",
+                "note": "check in",
+            }],
+        },
+    )
+    assert scheduled.status_code == 200
+    timer_id = scheduled.get_json()["results"][0]["timer_id"]
+    settings_by_user[user_id] = {"scheduled": False}
+
+    fired = client.post("/v1/proactive/scheduled/fire", headers=headers, json={})
+
+    assert fired.status_code == 200
+    body = fired.get_json()
+    assert body["queued"] == 1
+    assert body["results"][0]["status"] == "blocked"
+    assert body["results"][0]["reason"] == "scheduled_disabled"
+    assert body["results"][0]["transparency_wake_id"]
+    job = body["jobs"][0]
+    assert job["trigger"] == "background_result"
+    assert job["intent_label"] == "scheduled_transparency"
+    assert job["wake_kind"] == "background_result"
+    assert job["background_payload"]["reason"] == "scheduled_disabled"
+    assert job["background_payload"]["timer"]["wake_id"] == timer_id
+    record = scheduled_store.list_records(user_id)[0]
+    assert record.status == "blocked"
+    assert record.block_reason == "scheduled_disabled"
+    assert record.transparency_wake_id == body["results"][0]["transparency_wake_id"]
+
+
+def test_resident_scheduled_fire_endpoint_ignores_future_timer(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+    scheduled_store, _settings_by_user = _patch_resident_scheduled_route_dependencies(monkeypatch)
+
+    api_key = "test_resident_scheduled_future_key"
+    user_id = "usr_resident_scheduled_future"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    scheduled = client.post(
+        "/v1/proactive/scheduled/actions",
+        headers=headers,
+        json={
+            "actions": [{
+                "type": "schedule_wake",
+                "at": "2999-01-01T00:00:00+00:00",
+                "tz": "UTC",
+                "note": "future",
+            }],
+        },
+    )
+    assert scheduled.status_code == 200
+
+    fired = client.post("/v1/proactive/scheduled/fire", headers=headers, json={})
+
+    assert fired.status_code == 200
+    body = fired.get_json()
+    assert body["queued"] == 0
+    assert body["results"] == []
+    assert body["jobs"] == []
+    record = scheduled_store.list_records(user_id)[0]
+    assert record.status == "pending"
 
 
 def test_resident_stale_claim_is_recovered_and_old_consumer_cannot_complete(tmp_path, monkeypatch):

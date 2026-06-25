@@ -59,6 +59,11 @@ Optional:
                         Broadcast-off tick interval in seconds (default: 1800)
   PROACTIVE_TICK_START_DELAY_SEC
                         Delay before the first automatic wake tick (default: 15)
+  PROACTIVE_SCHEDULED_FIRE_ENABLED
+                        Default true. Poll resident-owned scheduled_wake timers
+                        and enqueue due hidden jobs.
+  PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC
+                        Scheduled wake fire cadence in seconds (default: 60)
   SEND_FALLBACK_ON_AGENT_ERROR
                         Default true. Agent failures post a visible, bounded
                         failure reply instead of silently dropping the turn.
@@ -227,6 +232,9 @@ PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC = int(
     os.environ.get("PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", "1800")
 )
 PROACTIVE_TICK_START_DELAY_SEC = int(os.environ.get("PROACTIVE_TICK_START_DELAY_SEC", "15"))
+PROACTIVE_SCHEDULED_FIRE_ENABLED = _env_bool("PROACTIVE_SCHEDULED_FIRE_ENABLED", True)
+PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC = int(os.environ.get("PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC", "60"))
+PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC = int(os.environ.get("PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC", "5"))
 PROACTIVE_MAX_REPLY_MESSAGES = int(os.environ.get("PROACTIVE_MAX_REPLY_MESSAGES", "5"))
 PROACTIVE_RECENT_CHAT_LIMIT = int(os.environ.get("PROACTIVE_RECENT_CHAT_LIMIT", "20"))
 PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT = int(os.environ.get("PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT", "50"))
@@ -2481,6 +2489,18 @@ def post_proactive_tick(payload: dict[str, Any] | None = None) -> dict:
     return resp.json()
 
 
+def fire_scheduled_wakes() -> dict:
+    resp = httpx.post(
+        f"{FEEDLING_API_URL}/v1/proactive/scheduled/fire",
+        json={},
+        headers=_HEADERS,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    parsed = resp.json()
+    return parsed if isinstance(parsed, dict) else {"results": [], "jobs": []}
+
+
 def claim_proactive_job(job_id: str) -> bool:
     if not job_id:
         return False
@@ -3715,9 +3735,11 @@ def run() -> None:
         _save_proactive_checkpoint(last_job_ts)
     last_broadcast_state = ""
     next_proactive_tick_mono = time.monotonic() + max(0, PROACTIVE_TICK_START_DELAY_SEC)
+    scheduled_fire_enabled = proactive_enabled and PROACTIVE_SCHEDULED_FIRE_ENABLED
+    next_scheduled_fire_mono = time.monotonic() + max(0, PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC)
 
     log.info(
-        "starting poll loop — last_ts=%.3f last_job_ts=%.3f poll_timeout=%ds proactive=%s proactive_tick=%s tick_on=%ds tick_off=%ds",
+        "starting poll loop — last_ts=%.3f last_job_ts=%.3f poll_timeout=%ds proactive=%s proactive_tick=%s tick_on=%ds tick_off=%ds scheduled_fire=%s scheduled_fire_interval=%ds",
         last_ts,
         last_job_ts,
         POLL_TIMEOUT,
@@ -3725,6 +3747,8 @@ def run() -> None:
         PROACTIVE_TICK_ENABLED,
         PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC,
         PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC,
+        scheduled_fire_enabled,
+        PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC,
     )
 
     consecutive_errors = 0
@@ -3733,6 +3757,36 @@ def run() -> None:
         try:
             if proactive_enabled:
                 try:
+                    if scheduled_fire_enabled and time.monotonic() >= next_scheduled_fire_mono:
+                        try:
+                            fire_result = fire_scheduled_wakes()
+                            fire_results = fire_result.get("results") or []
+                            fire_jobs = fire_result.get("jobs") or []
+                            if fire_results or fire_jobs:
+                                statuses = [
+                                    str(item.get("status") or "")
+                                    for item in fire_results
+                                    if isinstance(item, dict)
+                                ]
+                                log.info(
+                                    "scheduled wake fire results=%d queued=%d statuses=%s",
+                                    len(fire_results),
+                                    len(fire_jobs),
+                                    ",".join(statuses) or "none",
+                                )
+                        except httpx.HTTPStatusError as e:
+                            if e.response.status_code == 404:
+                                scheduled_fire_enabled = False
+                                log.warning(
+                                    "scheduled wake fire endpoint not available on this backend; "
+                                    "disabling scheduled wake fire for this process"
+                                )
+                            else:
+                                raise
+                        finally:
+                            next_scheduled_fire_mono = (
+                                time.monotonic() + max(10, PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC)
+                            )
                     if PROACTIVE_TICK_ENABLED and time.monotonic() >= next_proactive_tick_mono:
                         tick_payload = {
                             "trigger": _proactive_tick_trigger_for_broadcast_state(last_broadcast_state),

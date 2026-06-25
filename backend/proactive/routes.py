@@ -18,6 +18,7 @@ from proactive.tool_executor_v2 import (
 bp = Blueprint("proactive", __name__)
 
 RESIDENT_WAKE_LEASE_SEC = 600.0
+RESIDENT_RUNTIME_OWNER_ID_V2 = "resident_runtime_v2"
 _HOSTED_CONSUMER_IDS = frozenset({"hosted_runtime", "hosted_runtime_v2"})
 FOREGROUND_CHAT_TOOL_BUDGET_MODE_V2 = "foreground_chat_fast"
 
@@ -357,7 +358,7 @@ def proactive_scheduled_actions():
     from proactive.store_v2 import DBProactiveSettingsStoreV2
 
     settings = DBProactiveSettingsStoreV2().load(store.user_id)
-    scheduler = ScheduledWakeServiceV2(DBScheduledWakeStoreV2(), owner_id="resident_runtime_v2")
+    scheduler = ScheduledWakeServiceV2(DBScheduledWakeStoreV2(), owner_id=RESIDENT_RUNTIME_OWNER_ID_V2)
 
     def _submit(event):
         store.append_proactive_job(legacy_job_from_wake_event_v2(event))
@@ -373,6 +374,36 @@ def proactive_scheduled_actions():
         submit_wake=_submit,
     )
     return jsonify({"results": [result.as_dict() for result in results]})
+
+
+@bp.route("/v1/proactive/scheduled/fire", methods=["POST"])
+def proactive_scheduled_fire():
+    store = auth.require_user()
+    from proactive.adapters_v2 import legacy_job_from_wake_event_v2
+    from proactive.controls_v2 import WakeControlDecisionV2
+    from proactive.scheduled_wake_v2 import DBScheduledWakeStoreV2, ScheduledWakeServiceV2
+    from proactive.store_v2 import DBProactiveSettingsStoreV2
+
+    settings = DBProactiveSettingsStoreV2().load(store.user_id)
+    scheduler = ScheduledWakeServiceV2(DBScheduledWakeStoreV2(), owner_id=RESIDENT_RUNTIME_OWNER_ID_V2)
+    queued_jobs: list[dict] = []
+
+    def _submit(event):
+        job = store.append_proactive_job(legacy_job_from_wake_event_v2(event))
+        queued_jobs.append(job)
+        return WakeControlDecisionV2(True, "queued_as_compat_job", settings)
+
+    results = scheduler.fire_due_timers(
+        store.user_id,
+        settings=settings,
+        submit_wake=_submit,
+        owner_id=RESIDENT_RUNTIME_OWNER_ID_V2,
+    )
+    return jsonify({
+        "results": [result.as_dict() for result in results],
+        "jobs": queued_jobs,
+        "queued": len(queued_jobs),
+    })
 
 
 @bp.route("/v1/proactive/decisions", methods=["GET"])

@@ -544,6 +544,8 @@ cp deploy/chat_resident.env.example ~/feedling-chat-resident.env
 chmod 600 ~/feedling-chat-resident.env
 # Edit ~/feedling-chat-resident.env — set FEEDLING_API_URL, FEEDLING_API_KEY,
 # a decrypt source, and the runtime's real HTTP or CLI agent entry.
+# Use the same Python environment that will run feedling-chat-resident.
+python -m pip install -r tools/chat_resident_requirements.txt
 sudo cp deploy/feedling-chat-resident.service /etc/systemd/system/
 sudo systemctl enable --now feedling-chat-resident
 ```

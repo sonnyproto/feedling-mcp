@@ -67,6 +67,12 @@ chmod 600 ~/feedling-chat-resident.env
 # Edit ~/feedling-chat-resident.env — fill FEEDLING_API_URL, FEEDLING_API_KEY,
 # AGENT_MODE, and FEEDLING_ENCLAVE_URL.
 
+# Install the consumer's Python deps into the same Python environment that will
+# run the daemon. Proactive V2 jobs import backend DB modules, so psycopg and
+# psycopg_pool must be present even when normal chat replies only use HTTP.
+python -m pip install -r tools/chat_resident_requirements.txt
+python -c 'import httpx, psycopg, psycopg_pool'
+
 # Run in the foreground for testing
 python tools/chat_resident_consumer.py
 
@@ -103,6 +109,9 @@ WantedBy=default.target
 Then:
 
 ```bash
+cd /home/openclaw/work/feedling-mcp
+/home/openclaw/.hermes/hermes-agent/venv/bin/python -m pip install -r tools/chat_resident_requirements.txt
+/home/openclaw/.hermes/hermes-agent/venv/bin/python -c 'import httpx, psycopg, psycopg_pool'
 systemctl --user daemon-reload
 systemctl --user enable --now feedling-chat-resident.service
 journalctl --user -u feedling-chat-resident.service -f
