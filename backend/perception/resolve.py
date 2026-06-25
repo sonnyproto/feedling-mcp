@@ -35,7 +35,8 @@ def resolve_geofence(value, config: dict) -> dict:
       - {"place_hint"}   a direct label
     Raw coordinates are used transiently and discarded.
     config["geofences"]: [{"label": "home", "lat": .., "lon": .., "radius_m": 150}].
-    Returns {"place_label": <home|work|gym|transit|outdoor|unknown>}.
+    Returns {"place_label": <home|work|gym|transit|unknown_place|unknown>}.
+    ("unknown_place" = has a fix but matched no geofence; not "outdoors".)
     """
     if isinstance(value, str):
         s = value.strip()
@@ -64,7 +65,7 @@ def resolve_geofence(value, config: dict) -> dict:
         radius = float(gf.get("radius_m", 150))
         if d <= radius and d < best_d:
             best_label, best_d = str(gf.get("label") or "unknown"), d
-    return {"place_label": best_label or "outdoor"}
+    return {"place_label": best_label or "unknown_place"}
 
 
 def resolve_ssid(value, config: dict) -> dict:
