@@ -14,7 +14,12 @@ bp = Blueprint("agent", __name__)
 
 FAST_AGENT_PERCEPTION_SIGNALS = ("now", "location", "weather", "motion", "calendar")
 SLOW_AGENT_PERCEPTION_SIGNALS = ("steps", "sleep", "workout", "vitals")
-AGENT_PERCEPTION_SIGNALS = FAST_AGENT_PERCEPTION_SIGNALS + SLOW_AGENT_PERCEPTION_SIGNALS
+PULL_ONLY_AGENT_PERCEPTION_SIGNALS = ("focus", "audio_route")
+AGENT_PERCEPTION_SIGNALS = (
+    FAST_AGENT_PERCEPTION_SIGNALS
+    + SLOW_AGENT_PERCEPTION_SIGNALS
+    + PULL_ONLY_AGENT_PERCEPTION_SIGNALS
+)
 
 _SIGNAL_FIELDS: dict[str, tuple[str, ...]] = {
     "now": (
@@ -33,6 +38,8 @@ _SIGNAL_FIELDS: dict[str, tuple[str, ...]] = {
     "weather": ("condition", "temperature_bucket", "is_daylight"),
     "motion": ("motion_state",),
     "calendar": ("calendar_next_event", "calendar_events", "calendar_events_truncated"),
+    "focus": ("focus_authorization_status", "in_focus"),
+    "audio_route": ("output_type", "is_bluetooth", "device_name"),
     "steps": ("step_count_bucket",),
     "sleep": ("asleep_minutes_bucket",),
     "workout": ("workout_type", "duration_min_bucket", "count_today"),
@@ -45,6 +52,8 @@ _SIGNAL_PERMISSION_KEYS: dict[str, tuple[str, ...]] = {
     "weather": ("weather",),
     "motion": ("motion", "motion_state"),
     "calendar": ("calendar", "calendar_next_event"),
+    "focus": ("focus",),
+    "audio_route": ("audio_route",),
     "steps": ("steps", "health", "health_vitals"),
     "sleep": ("sleep", "health", "health_sleep"),
     "workout": ("workout", "health", "health_workout"),

@@ -145,6 +145,65 @@ def test_agent_perception_slow_signals_return_inline_without_background(monkeypa
     assert "needs_background" not in str(body)
 
 
+def test_agent_perception_pull_only_signals_return_inline(monkeypatch):
+    client = _client(
+        monkeypatch,
+        pull={
+            "focus_authorization_status": "authorized",
+            "in_focus": True,
+            "output_type": "bluetooth",
+            "is_bluetooth": True,
+            "device_name": "AirPods",
+        },
+    )
+
+    resp = client.get("/v1/agent/perception?signals=focus,audio_route")
+    body = resp.get_json()
+
+    assert resp.status_code == 200
+    assert body["signals"]["focus"] == {
+        "focus_authorization_status": "authorized",
+        "in_focus": True,
+    }
+    assert body["signals"]["audio_route"] == {
+        "output_type": "bluetooth",
+        "is_bluetooth": True,
+        "device_name": "AirPods",
+    }
+
+
+def test_agent_perception_pull_only_null_permission_messages_return_disabled(monkeypatch):
+    client = _client(
+        monkeypatch,
+        state={
+            "focus_authorization_status": {
+                "v": None,
+                "ts": 10.0,
+                "msg": "专注模式未授权",
+            },
+            "output_type": {
+                "v": None,
+                "ts": 10.0,
+                "msg": "audio route permission denied",
+            },
+        },
+        pull={
+            "focus_authorization_status": None,
+            "in_focus": None,
+            "output_type": None,
+            "is_bluetooth": None,
+            "device_name": None,
+        },
+    )
+
+    resp = client.get("/v1/agent/perception?signals=focus,audio_route")
+    body = resp.get_json()
+
+    assert resp.status_code == 200
+    assert body["signals"]["focus"] == {"disabled": True, "reason": "not_permitted"}
+    assert body["signals"]["audio_route"] == {"disabled": True, "reason": "not_permitted"}
+
+
 def test_agent_perception_permission_states_return_disabled(monkeypatch):
     client = _client(
         monkeypatch,
@@ -152,20 +211,27 @@ def test_agent_perception_permission_states_return_disabled(monkeypatch):
             "permission_states": {
                 "weather": "off",
                 "location": "not_permitted",
+                "focus": "off",
+                "audio_route": "not_permitted",
             }
         },
         pull={
             "condition": "rain",
             "place_label": "home",
+            "focus_authorization_status": "authorized",
+            "in_focus": True,
+            "output_type": "bluetooth",
         },
     )
 
-    resp = client.get("/v1/agent/perception?signals=weather,location")
+    resp = client.get("/v1/agent/perception?signals=weather,location,focus,audio_route")
     body = resp.get_json()
 
     assert resp.status_code == 200
     assert body["signals"]["weather"] == {"disabled": True, "reason": "switch_off"}
     assert body["signals"]["location"] == {"disabled": True, "reason": "not_permitted"}
+    assert body["signals"]["focus"] == {"disabled": True, "reason": "switch_off"}
+    assert body["signals"]["audio_route"] == {"disabled": True, "reason": "not_permitted"}
 
 
 def test_agent_perception_null_permission_message_returns_disabled_but_no_event_does_not(monkeypatch):
