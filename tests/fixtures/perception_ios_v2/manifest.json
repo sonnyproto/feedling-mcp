@@ -26,9 +26,15 @@
       "playback",
       "audio_route",
       "weather",
+      "reminders",
       "health_sleep",
       "health_workout",
-      "health_vitals"
+      "health_vitals",
+      "health_activity",
+      "health_body",
+      "health_metabolic",
+      "health_cycle",
+      "health_mood"
     ],
     "source_behavior": "encryptedContextItem returns nil when content keys are unavailable, so collectContextSnapshotItems compactMaps the signal out of the report."
   },

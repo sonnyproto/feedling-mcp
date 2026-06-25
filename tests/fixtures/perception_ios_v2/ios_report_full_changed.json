@@ -111,6 +111,21 @@
       "changed": true
     },
     {
+      "key": "reminders",
+      "envelope": {
+        "v": 1,
+        "id": "dddddddddddddddddddddddddddddddd",
+        "body_ct": "base64-reminders-body",
+        "nonce": "base64-reminders-nonce",
+        "K_user": "base64-reminders-k-user",
+        "K_enclave": "base64-reminders-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
       "key": "health_sleep",
       "envelope": {
         "v": 1,
@@ -149,6 +164,81 @@
         "nonce": "base64-health-vitals-nonce",
         "K_user": "base64-health-vitals-k-user",
         "K_enclave": "base64-health-vitals-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_activity",
+      "envelope": {
+        "v": 1,
+        "id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "body_ct": "base64-health-activity-body",
+        "nonce": "base64-health-activity-nonce",
+        "K_user": "base64-health-activity-k-user",
+        "K_enclave": "base64-health-activity-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_body",
+      "envelope": {
+        "v": 1,
+        "id": "ffffffffffffffffffffffffffffffff",
+        "body_ct": "base64-health-body-body",
+        "nonce": "base64-health-body-nonce",
+        "K_user": "base64-health-body-k-user",
+        "K_enclave": "base64-health-body-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_metabolic",
+      "envelope": {
+        "v": 1,
+        "id": "11111111111111111111111111111111",
+        "body_ct": "base64-health-metabolic-body",
+        "nonce": "base64-health-metabolic-nonce",
+        "K_user": "base64-health-metabolic-k-user",
+        "K_enclave": "base64-health-metabolic-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_cycle",
+      "envelope": {
+        "v": 1,
+        "id": "22222222222222222222222222222222",
+        "body_ct": "base64-health-cycle-body",
+        "nonce": "base64-health-cycle-nonce",
+        "K_user": "base64-health-cycle-k-user",
+        "K_enclave": "base64-health-cycle-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_mood",
+      "envelope": {
+        "v": 1,
+        "id": "33333333333333333333333333333333",
+        "body_ct": "base64-health-mood-body",
+        "nonce": "base64-health-mood-nonce",
+        "K_user": "base64-health-mood-k-user",
+        "K_enclave": "base64-health-mood-k-enclave",
         "visibility": "shared",
         "owner_user_id": "ios_fixture_user",
         "enclave_pk_fpr": "ios_fixture_enclave_fpr"

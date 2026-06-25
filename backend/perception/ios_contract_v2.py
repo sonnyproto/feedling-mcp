@@ -19,9 +19,15 @@ ENCRYPTED_SIGNAL_KEYS_V2 = frozenset({
     "playback",
     "audio_route",
     "weather",
+    "reminders",
     "health_sleep",
     "health_workout",
     "health_vitals",
+    "health_activity",
+    "health_body",
+    "health_metabolic",
+    "health_cycle",
+    "health_mood",
 })
 IGNORED_SIGNAL_KEYS_V2 = frozenset({"unsupported"})
 
@@ -36,9 +42,15 @@ EXPECTED_REPORT_KEYS_V2 = (
     "playback",
     "audio_route",
     "weather",
+    "reminders",
     "health_sleep",
     "health_workout",
     "health_vitals",
+    "health_activity",
+    "health_body",
+    "health_metabolic",
+    "health_cycle",
+    "health_mood",
     "unsupported",
 )
 
@@ -57,9 +69,15 @@ DIFFER_INPUTS_BY_IOS_KEY_V2 = {
     "playback": ("now_playing",),
     "audio_route": ("audio_route",),
     "weather": ("weather",),
+    "reminders": ("reminders",),
     "health_sleep": ("health_sleep",),
     "health_workout": ("health_workout",),
     "health_vitals": ("health_vitals",),
+    "health_activity": ("health_activity",),
+    "health_body": ("health_body",),
+    "health_metabolic": ("health_metabolic",),
+    "health_cycle": ("health_cycle",),
+    "health_mood": ("health_mood",),
 }
 
 WAKE_POLICY_BY_IOS_KEY_V2 = {
@@ -73,9 +91,15 @@ WAKE_POLICY_BY_IOS_KEY_V2 = {
     "playback": "pull_only_after_decrypt",
     "audio_route": "pull_only_after_decrypt",
     "weather": "pull_only_after_decrypt",
+    "reminders": "pull_only_after_decrypt",
     "health_sleep": "pull_only_after_decrypt",
     "health_workout": "pull_only_after_decrypt",
     "health_vitals": "pull_only_after_decrypt",
+    "health_activity": "pull_only_after_decrypt",
+    "health_body": "pull_only_after_decrypt",
+    "health_metabolic": "pull_only_after_decrypt",
+    "health_cycle": "pull_only_after_decrypt",
+    "health_mood": "pull_only_after_decrypt",
     "unsupported": "ignored",
 }
 

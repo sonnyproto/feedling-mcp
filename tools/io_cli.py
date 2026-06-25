@@ -30,7 +30,10 @@ import urllib.parse
 import urllib.request
 
 FAST_SIGNALS = ("now", "location", "weather", "motion", "calendar")
-SLOW_SIGNALS = ("steps", "sleep", "workout", "vitals")
+SLOW_SIGNALS = (
+    "steps", "sleep", "workout", "vitals",
+    "activity", "body", "metabolic", "cycle", "mood", "reminders",
+)
 # pull-only context signals (focus = are-you-in-a-focus-mode, audio_route =
 # headphones/car). Valid + pullable, but kept out of the default fast set.
 EXTRA_SIGNALS = ("focus", "audio_route")

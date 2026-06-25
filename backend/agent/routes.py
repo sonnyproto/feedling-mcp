@@ -13,7 +13,10 @@ from perception import store as perception_store
 bp = Blueprint("agent", __name__)
 
 FAST_AGENT_PERCEPTION_SIGNALS = ("now", "location", "weather", "motion", "calendar")
-SLOW_AGENT_PERCEPTION_SIGNALS = ("steps", "sleep", "workout", "vitals")
+SLOW_AGENT_PERCEPTION_SIGNALS = (
+    "steps", "sleep", "workout", "vitals",
+    "activity", "body", "metabolic", "cycle", "mood", "reminders",
+)
 PULL_ONLY_AGENT_PERCEPTION_SIGNALS = ("focus", "audio_route")
 AGENT_PERCEPTION_SIGNALS = (
     FAST_AGENT_PERCEPTION_SIGNALS
@@ -35,15 +38,27 @@ _SIGNAL_FIELDS: dict[str, tuple[str, ...]] = {
         "broadcast_active",
     ),
     "location": ("place_label", "wifi_label", "country", "locality", "wifi_anchor_id"),
-    "weather": ("condition", "temperature", "is_daylight"),
+    "weather": (
+        "condition", "temperature", "apparent_temperature", "humidity",
+        "precipitation_chance", "uv_index", "is_daylight", "alerts",
+    ),
     "motion": ("motion_state",),
     "calendar": ("calendar_next_event", "calendar_events", "calendar_events_truncated"),
     "focus": ("focus_authorization_status", "in_focus"),
     "audio_route": ("output_type", "is_bluetooth", "device_name"),
     "steps": ("step_count",),
-    "sleep": ("asleep_minutes",),
+    "sleep": ("asleep_minutes", "core_minutes", "deep_minutes", "rem_minutes"),
     "workout": ("workout_type", "duration_min", "count_today"),
-    "vitals": ("resting_heart_rate", "step_count"),
+    "vitals": (
+        "resting_heart_rate", "step_count", "current_heart_rate", "hrv_sdnn_ms",
+        "respiratory_rate", "oxygen_saturation_pct", "vo2_max",
+    ),
+    "activity": ("active_energy_kcal", "exercise_minutes", "stand_minutes", "mindful_minutes"),
+    "body": ("weight_kg", "bmi", "body_fat_pct", "height_cm"),
+    "metabolic": ("blood_glucose_mmol_l", "blood_pressure_systolic", "blood_pressure_diastolic"),
+    "cycle": ("flow_level", "is_active_period"),
+    "mood": ("valence", "valence_classification", "kind", "label_count", "recorded_today"),
+    "reminders": ("next_reminder", "reminders", "overdue_count", "due_today_count", "reminders_truncated"),
 }
 
 _SIGNAL_PERMISSION_KEYS: dict[str, tuple[str, ...]] = {
@@ -58,6 +73,12 @@ _SIGNAL_PERMISSION_KEYS: dict[str, tuple[str, ...]] = {
     "sleep": ("sleep", "health", "health_sleep"),
     "workout": ("workout", "health", "health_workout"),
     "vitals": ("vitals", "health", "health_vitals"),
+    "activity": ("activity", "health", "health_activity"),
+    "body": ("body", "health", "health_body"),
+    "metabolic": ("metabolic", "health", "health_metabolic"),
+    "cycle": ("cycle", "health", "health_cycle"),
+    "mood": ("mood", "health", "health_mood"),
+    "reminders": ("reminders",),
 }
 
 _OFF_VALUES = {"0", "false", "off", "disabled", "switch_off", "switch-off", "no"}

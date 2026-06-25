@@ -168,7 +168,10 @@ def _copy_fields(value, fields: tuple[str, ...]) -> dict:
 
 
 def resolve_weather(value, config: dict) -> dict:
-    return _copy_fields(value, ("condition", "temperature", "is_daylight"))
+    return _copy_fields(value, (
+        "condition", "temperature", "apparent_temperature", "humidity",
+        "precipitation_chance", "uv_index", "is_daylight", "alerts",
+    ))
 
 
 def resolve_audio_route(value, config: dict) -> dict:
@@ -176,7 +179,7 @@ def resolve_audio_route(value, config: dict) -> dict:
 
 
 def resolve_health_sleep(value, config: dict) -> dict:
-    return _copy_fields(value, ("asleep_minutes",))
+    return _copy_fields(value, ("asleep_minutes", "core_minutes", "deep_minutes", "rem_minutes"))
 
 
 def resolve_health_workout(value, config: dict) -> dict:
@@ -184,7 +187,10 @@ def resolve_health_workout(value, config: dict) -> dict:
 
 
 def resolve_health_vitals(value, config: dict) -> dict:
-    return _copy_fields(value, ("resting_heart_rate", "step_count"))
+    return _copy_fields(value, (
+        "resting_heart_rate", "step_count", "current_heart_rate", "hrv_sdnn_ms",
+        "respiratory_rate", "oxygen_saturation_pct", "vo2_max",
+    ))
 
 
 def resolve_location_signal(value, config: dict) -> dict:

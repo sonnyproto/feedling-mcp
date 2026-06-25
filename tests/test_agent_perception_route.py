@@ -65,7 +65,12 @@ def test_agent_perception_returns_requested_fast_signals(monkeypatch):
     assert body["signals"]["weather"] == {
         "condition": "rain",
         "temperature": 23.4,
+        "apparent_temperature": None,
+        "humidity": None,
+        "precipitation_chance": None,
+        "uv_index": None,
         "is_daylight": True,
+        "alerts": None,
     }
     assert body["signals"]["location"]["locality"] == "深圳市"
     assert body["signals"]["location"]["wifi_anchor_id"] == "wifi-home"
@@ -132,7 +137,12 @@ def test_agent_perception_slow_signals_return_inline_without_background(monkeypa
 
     assert resp.status_code == 200
     assert body["signals"]["steps"] == {"step_count": 6500}
-    assert body["signals"]["sleep"] == {"asleep_minutes": 420}
+    assert body["signals"]["sleep"] == {
+        "asleep_minutes": 420,
+        "core_minutes": None,
+        "deep_minutes": None,
+        "rem_minutes": None,
+    }
     assert body["signals"]["workout"] == {
         "workout_type": "run",
         "duration_min": 30,
@@ -141,6 +151,11 @@ def test_agent_perception_slow_signals_return_inline_without_background(monkeypa
     assert body["signals"]["vitals"] == {
         "resting_heart_rate": 60,
         "step_count": 6500,
+        "current_heart_rate": None,
+        "hrv_sdnn_ms": None,
+        "respiratory_rate": None,
+        "oxygen_saturation_pct": None,
+        "vo2_max": None,
     }
     assert "needs_background" not in str(body)
 
