@@ -257,6 +257,60 @@ def _with_resident_runtime_v2(job: dict, runtime_profile: dict) -> dict:
     return out
 
 
+def _settings_v2_for_store(store):
+    try:
+        from proactive.store_v2 import DBProactiveSettingsStoreV2
+
+        return DBProactiveSettingsStoreV2().load(store.user_id)
+    except Exception:
+        return store.load_proactive_settings()
+
+
+def _resident_wake_control_decision_v2(store, job: dict):
+    if str((job or {}).get("source") or service.PROACTIVE_JOB_SOURCE) != service.PROACTIVE_JOB_SOURCE:
+        return None
+    try:
+        from proactive.adapters_v2 import wake_event_v2_from_legacy_job
+        from proactive.controls_v2 import evaluate_wake_control_v2
+
+        event = wake_event_v2_from_legacy_job(store.user_id, job)
+        return evaluate_wake_control_v2(
+            event.source,
+            manual=event.manual,
+            settings=_settings_v2_for_store(store),
+        )
+    except Exception:
+        return None
+
+
+def _resident_pollable_pending_jobs(store, *, since: float, limit: int, runtime_profile: dict) -> list[dict]:
+    out: list[dict] = []
+    read_limit = max(limit, 100)
+    for job in store.list_proactive_jobs(since_epoch=since, limit=read_limit):
+        if str(job.get("status") or "pending") != "pending":
+            continue
+        decision = _resident_wake_control_decision_v2(store, job)
+        if decision is not None and not decision.accepted:
+            job_id = str(job.get("job_id") or "")
+            if job_id:
+                store.update_proactive_job(
+                    job_id,
+                    {
+                        "status": "skipped",
+                        "status_reason": decision.reason,
+                        "wake_result": decision.reason,
+                        "agent_action": decision.reason,
+                        "agent_action_status": "resident_poll_wake_gate_v2",
+                    },
+                    only_if_status="pending",
+                )
+            continue
+        out.append(_with_resident_runtime_v2(job, runtime_profile))
+        if len(out) >= limit:
+            break
+    return out
+
+
 @bp.route("/v1/proactive/jobs/<job_id>/claim", methods=["POST"])
 def proactive_job_claim(job_id):
     store = auth.require_user()
@@ -445,11 +499,7 @@ def proactive_jobs_poll():
         return jsonify({"error": "invalid limit"}), 400
     limit = max(1, min(limit, 100))
 
-    pending = [
-        _with_resident_runtime_v2(j, runtime_profile)
-        for j in store.list_proactive_jobs(since_epoch=since, limit=limit)
-        if str(j.get("status") or "pending") == "pending"
-    ]
+    pending = _resident_pollable_pending_jobs(store, since=since, limit=limit, runtime_profile=runtime_profile)
     if pending:
         return jsonify({"jobs": pending, "runtime_v2": runtime_profile, "timed_out": False})
 
@@ -466,11 +516,7 @@ def proactive_jobs_poll():
             pass
 
     if notified:
-        pending = [
-            _with_resident_runtime_v2(j, runtime_profile)
-            for j in store.list_proactive_jobs(since_epoch=since, limit=limit)
-            if str(j.get("status") or "pending") == "pending"
-        ]
+        pending = _resident_pollable_pending_jobs(store, since=since, limit=limit, runtime_profile=runtime_profile)
         return jsonify({"jobs": pending, "runtime_v2": runtime_profile, "timed_out": False})
     return jsonify({"jobs": [], "runtime_v2": runtime_profile, "timed_out": True})
 

@@ -9,9 +9,14 @@ from typing import Any, Mapping
 from proactive.runtime_v2 import WakeEventV2
 
 
-def _source_for_legacy_trigger(trigger: str, *, manual: bool) -> str:
+def _legacy_trigger_is_manual_v2(trigger: str) -> bool:
     normalized = str(trigger or "").strip().lower()
-    if manual:
+    return normalized == "manual_wake" or normalized.startswith("manual_")
+
+
+def source_for_legacy_trigger_v2(trigger: str, *, manual: bool) -> str:
+    normalized = str(trigger or "").strip().lower()
+    if manual or _legacy_trigger_is_manual_v2(normalized):
         return "user_message"
     if normalized.startswith("heartbeat"):
         return "heartbeat"
@@ -40,8 +45,8 @@ def wake_event_v2_from_legacy_job(
     """
     now = time.time() if now is None else float(now)
     trigger = str(job.get("trigger") or job.get("wake_kind") or "legacy_job")
-    manual = bool(job.get("manual"))
-    source = _source_for_legacy_trigger(trigger, manual=manual)
+    manual = bool(job.get("manual")) or _legacy_trigger_is_manual_v2(trigger)
+    source = source_for_legacy_trigger_v2(trigger, manual=manual)
     return WakeEventV2(
         user_id=user_id,
         wake_id=str(job.get("wake_id") or job.get("job_id") or ""),

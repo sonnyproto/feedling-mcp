@@ -25,6 +25,47 @@ from push import service as push_service
 
 bp = Blueprint("chat", __name__)
 
+
+def _settings_v2_for_store(store: UserStore):
+    try:
+        from proactive.store_v2 import DBProactiveSettingsStoreV2
+
+        return DBProactiveSettingsStoreV2().load(store.user_id)
+    except Exception:
+        return store.load_proactive_settings()
+
+
+def _proactive_job_for_response(store: UserStore, job_id: str) -> dict | None:
+    if not job_id:
+        return None
+    try:
+        for job in store.list_proactive_jobs(since_epoch=0, limit=0):
+            if str(job.get("job_id") or "") == str(job_id):
+                return job
+    except Exception:
+        return None
+    return None
+
+
+def _proactive_delivery_decision_v2(store: UserStore, payload: dict):
+    from proactive.controls_v2 import evaluate_delivery_v2
+
+    source = "heartbeat"
+    manual = False
+    job = _proactive_job_for_response(store, str(payload.get("proactive_job_id") or ""))
+    if job:
+        try:
+            from proactive.adapters_v2 import wake_event_v2_from_legacy_job
+
+            event = wake_event_v2_from_legacy_job(store.user_id, job)
+            source = event.source
+            manual = event.manual
+        except Exception:
+            manual = bool(job.get("manual"))
+    manual = manual or bool(payload.get("manual") or payload.get("manual_wake") or payload.get("user_initiated"))
+    return evaluate_delivery_v2(_settings_v2_for_store(store), source=source, manual=manual)
+
+
 @bp.route("/v1/chat/history", methods=["GET"])
 def chat_history():
     store = auth.require_user()
@@ -283,13 +324,26 @@ def chat_response():
     # policy: background/unknown app state gets Live Activity + APNs alert;
     # foreground app state records a suppression instead of interrupting.
     if visible_push_body or payload.get("push_live_activity"):
-        delivery_fields.update(push_service._deliver_ai_message_push_if_background(
-            store,
-            body=visible_push_body,
-            title=payload.get("title", "") or "IO",
-            data=payload.get("data") if isinstance(payload.get("data"), dict) else {},
-            visual_state=payload.get("visualState") or payload.get("visual_state") or "reply",
-        ))
+        delivery = None
+        if source == proactive_service.PROACTIVE_JOB_SOURCE:
+            delivery = _proactive_delivery_decision_v2(store, payload)
+        if delivery is not None and not delivery.allow_visible_delivery:
+            delivery_fields.update({
+                "push_decision": "suppressed",
+                "push_reason": delivery.reason,
+                "alert_status": "suppressed",
+                "alert_reason": delivery.reason,
+                "live_activity_status": "suppressed",
+                "live_activity_reason": delivery.reason,
+            })
+        else:
+            delivery_fields.update(push_service._deliver_ai_message_push_if_background(
+                store,
+                body=visible_push_body,
+                title=payload.get("title", "") or "IO",
+                data=payload.get("data") if isinstance(payload.get("data"), dict) else {},
+                visual_state=payload.get("visualState") or payload.get("visual_state") or "reply",
+            ))
     if delivery_fields:
         updated = store.update_chat_message_metadata(msg["id"], delivery_fields)
         if updated:

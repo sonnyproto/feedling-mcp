@@ -424,6 +424,38 @@ def test_proactive_state_three_switch_contract_drives_v2_scheduled_gate(tmp_path
     assert decision.transparency_required is True
 
 
+def test_proactive_tick_delivery_off_still_allows_presence_wake(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_proactive_delivery_off_wake_key"
+    user_id = "usr_endpoint_proactive_delivery_off_wake"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    state = client.post(
+        "/v1/proactive/state",
+        headers=headers,
+        json={"reminders_delivery": False},
+    )
+    assert state.status_code == 200
+    assert state.get_json()["reminders_delivery"] is False
+    assert state.get_json()["dnd"] is True
+
+    tick = client.post(
+        "/v1/proactive/tick",
+        headers=headers,
+        json={"trigger": "heartbeat_broadcast_off", "broadcast_state": "off"},
+    )
+
+    assert tick.status_code == 200
+    body = tick.get_json()
+    assert body["enqueued"] is True
+    assert body["decision"]["reason"] == "wake_created"
+    assert body["decision"]["wake_kind"] == "presence"
+
+
 def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
@@ -666,7 +698,7 @@ def test_auto_proactive_v2_schedule_heartbeats_split_presence_and_screen_wakes(t
     assert on_body["job"]["frame_ids"] == ["frameon123456789"]
 
 
-def test_auto_proactive_v2_away_suppresses_automatic_but_manual_bypasses(tmp_path, monkeypatch):
+def test_auto_proactive_v2_away_state_does_not_resurrect_legacy_wake_gate(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
@@ -678,12 +710,17 @@ def test_auto_proactive_v2_away_suppresses_automatic_but_manual_bypasses(tmp_pat
     headers = {"X-API-Key": api_key}
     client.post("/v1/proactive/state", headers=headers, json={"user_state": "away"})
 
-    auto = client.post("/v1/proactive/tick", headers=headers, json={})
+    auto = client.post(
+        "/v1/proactive/tick",
+        headers=headers,
+        json={"trigger": "heartbeat_broadcast_off", "broadcast_state": "off"},
+    )
     assert auto.status_code == 200
     auto_body = auto.get_json()
-    assert auto_body["enqueued"] is False
-    assert auto_body["decision"]["should_wake_agent"] is False
-    assert auto_body["decision"]["reason"] == "user_away"
+    assert auto_body["enqueued"] is True
+    assert auto_body["decision"]["should_wake_agent"] is True
+    assert auto_body["decision"]["reason"] == "wake_created"
+    assert auto_body["decision"]["user_state"] == "away"
 
     manual = client.post("/v1/proactive/tick", headers=headers, json={"manual": True})
     assert manual.status_code == 200
@@ -808,6 +845,56 @@ def test_resident_poll_includes_per_user_runtime_v2_profile(tmp_path, monkeypatc
     assert body["runtime_v2"][proactive_resident_runtime_v2.RESIDENT_WAKE_RUNTIME_V2_FLAG] is True
     assert body["jobs"][0]["job_id"] == job["job_id"]
     assert body["jobs"][0]["runtime_v2"][proactive_resident_runtime_v2.RESIDENT_WAKE_RUNTIME_V2_FLAG] is True
+
+
+def test_resident_poll_applies_v2_wake_controls_to_legacy_jobs(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_resident_poll_v2_gate_key"
+    user_id = "usr_resident_poll_v2_gate"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.save_proactive_settings({
+        "ambient": False,
+        "scheduled": False,
+        "reminders_delivery": False,
+    })
+    store.append_proactive_job({
+        "job_id": "pj_photo",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 1000.0,
+        "status": "pending",
+        "trigger": "photo_added",
+    })
+    store.append_proactive_job({
+        "job_id": "pj_scheduled",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 1001.0,
+        "status": "pending",
+        "trigger": "scheduled_wake",
+        "scheduled_note": "check in",
+    })
+    store.append_proactive_job({
+        "job_id": "pj_manual",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 1002.0,
+        "status": "pending",
+        "trigger": "manual_dynamic_island",
+    })
+
+    client = appmod.app.test_client()
+    poll = client.get("/v1/proactive/jobs/poll?since=0&timeout=0", headers={"X-API-Key": api_key})
+
+    assert poll.status_code == 200
+    body = poll.get_json()
+    assert [job["job_id"] for job in body["jobs"]] == ["pj_manual"]
+    rows = {row["job_id"]: row for row in store.list_proactive_jobs(since_epoch=0, limit=0)}
+    assert rows["pj_photo"]["status"] == "skipped"
+    assert rows["pj_photo"]["status_reason"] == "ambient_disabled"
+    assert rows["pj_scheduled"]["status"] == "skipped"
+    assert rows["pj_scheduled"]["status_reason"] == "scheduled_disabled"
+    assert rows["pj_manual"]["status"] == "pending"
 
 
 def test_resident_stale_claim_is_recovered_and_old_consumer_cannot_complete(tmp_path, monkeypatch):
@@ -952,6 +1039,78 @@ def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeyp
     assert msg["alert_preview"] == "我看到你停在这里了。"
     assert msg["alert_status"] == "delivered"
     assert msg["live_activity_status"] == "delivered"
+
+
+def test_proactive_chat_response_delivery_off_writes_chat_without_push(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    appmod._stores.clear()
+
+    sent_push_types = []
+
+    def _fake_send_apns(device_token, payload, push_type, topic, **_kwargs):
+        sent_push_types.append(push_type)
+        return {"status": "delivered"}
+
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
+
+    api_key = "test_proactive_delivery_off_key"
+    user_id = "usr_endpoint_proactive_delivery_off"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.save_proactive_settings({"reminders_delivery": False})
+    store.tokens = [
+        {
+            "type": "live_activity",
+            "token": "live-token",
+            "activity_id": "activity_1",
+            "status": "active",
+            "registered_at": "2026-05-24T00:00:00",
+        },
+        {
+            "type": "device",
+            "token": "device-token",
+            "status": "active",
+            "registered_at": "2026-05-24T00:00:00",
+        },
+    ]
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    envelope = {
+        "id": "msg_delivery_off_1",
+        "v": 1,
+        "body_ct": "ct",
+        "nonce": "nonce",
+        "K_user": "k-user",
+        "K_enclave": "k-enclave",
+        "visibility": "shared",
+        "owner_user_id": user_id,
+    }
+
+    resp = client.post(
+        "/v1/chat/response",
+        headers=headers,
+        json={
+            "envelope": envelope,
+            "source": appmod.PROACTIVE_JOB_SOURCE,
+            "gate_decision_id": "gd_delivery_off",
+            "proactive_job_id": "pj_delivery_off",
+            "alert_body": "这条应该静默写入。",
+            "push_live_activity": True,
+            "push_body": "这条应该静默写入。",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert sent_push_types == []
+    snapshot = appmod._proactive_debug_snapshot(store)
+    msg = snapshot["proactive_messages"][0]
+    assert msg["alert_preview"] == "这条应该静默写入。"
+    assert msg["push_decision"] == "suppressed"
+    assert msg["push_reason"] == "reminders_delivery_disabled"
+    assert msg["alert_status"] == "suppressed"
+    assert msg["live_activity_status"] == "suppressed"
 
 
 def test_ai_chat_response_pushes_when_app_background(tmp_path, monkeypatch):

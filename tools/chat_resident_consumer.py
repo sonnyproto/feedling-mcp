@@ -2458,7 +2458,7 @@ def poll_proactive_jobs(since: float) -> dict:
 
 def _proactive_tick_trigger_for_broadcast_state(broadcast_state: str) -> str:
     state = str(broadcast_state or "").strip().lower()
-    if state == "off":
+    if not state or state == "off":
         return "heartbeat_broadcast_off"
     if state in {"on", "broadcasting"}:
         return "heartbeat_broadcast_on"
@@ -2469,7 +2469,7 @@ def _proactive_tick_trigger_for_broadcast_state(broadcast_state: str) -> str:
 
 def _proactive_tick_interval_for_broadcast_state(broadcast_state: str) -> int:
     state = str(broadcast_state or "").strip().lower()
-    if state == "off":
+    if not state or state == "off":
         return max(60, PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC)
     return max(30, PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC)
 

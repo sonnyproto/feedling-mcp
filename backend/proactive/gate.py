@@ -7,6 +7,8 @@ from datetime import datetime
 from core import store as core_store
 from core import util
 from core.store import UserStore
+from proactive.adapters_v2 import source_for_legacy_trigger_v2
+from proactive.controls_v2 import evaluate_wake_control_v2, resolve_settings_v2
 from proactive import service
 from screen import frames as screen_frames
 
@@ -135,14 +137,15 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
     )
     trigger = _proactive_trigger(payload, manual=manual, frames=selected_frames)
 
-    block_reason = ""
-    if not settings.get("enabled", True) and not force:
-        block_reason = "proactive_disabled"
-    elif settings.get("dnd", False) and not manual:
-        block_reason = "dnd_enabled"
-    elif user_state == "away" and not manual:
-        block_reason = "user_away"
-    elif not manual:
+    wake_source = source_for_legacy_trigger_v2(trigger, manual=manual)
+    wake_control = evaluate_wake_control_v2(
+        wake_source,
+        manual=manual,
+        settings=resolve_settings_v2(settings),
+    )
+
+    block_reason = "" if wake_control.accepted else wake_control.reason
+    if not block_reason and not manual:
         block_reason = _proactive_v2_auto_wake_block_reason(
             trigger,
             broadcast_state=broadcast_state,

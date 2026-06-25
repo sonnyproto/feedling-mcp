@@ -1790,8 +1790,9 @@ def test_proactive_tick_cadence_follows_broadcast_state(monkeypatch):
     assert crc._proactive_tick_interval_for_broadcast_state("off") == 1800
     assert crc._proactive_tick_trigger_for_broadcast_state("on") == "heartbeat_broadcast_on"
     assert crc._proactive_tick_interval_for_broadcast_state("on") == 300
-    assert crc._proactive_tick_trigger_for_broadcast_state("") == "heartbeat_unknown"
-    assert crc._proactive_tick_interval_for_broadcast_state("") == 300
+    assert crc._proactive_tick_trigger_for_broadcast_state("") == "heartbeat_broadcast_off"
+    assert crc._proactive_tick_interval_for_broadcast_state("") == 1800
+    assert crc._proactive_tick_trigger_for_broadcast_state("mystery") == "heartbeat_unknown"
 
 
 def test_post_proactive_reply_triggers_alert_and_live_activity(monkeypatch):
