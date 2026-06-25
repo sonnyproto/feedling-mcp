@@ -49,12 +49,6 @@ from model_api_runtime.tools import (
     run_web_searches as run_model_api_web_searches,
     web_search_trace as model_api_web_search_trace,
 )
-from model_api_runtime.wake import (
-    wake_turn_contract_message as model_api_wake_turn_contract_message,
-    build_wake_event_message as build_model_api_wake_event_message,
-    hosted_tick_trigger as model_api_hosted_tick_trigger,
-    parse_wake_actions as parse_model_api_wake_actions,
-)
 from context_memory_selection import memory_relevance_details
 from content_encryption import build_envelope
 

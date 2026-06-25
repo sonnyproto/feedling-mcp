@@ -53,12 +53,6 @@ from model_api_runtime.tools import (
     web_search_trace as model_api_web_search_trace,
 )
 from model_api_runtime import memory_tools as hosted_memory_tools
-from model_api_runtime.wake import (
-    wake_turn_contract_message as model_api_wake_turn_contract_message,
-    build_wake_event_message as build_model_api_wake_event_message,
-    hosted_tick_trigger as model_api_hosted_tick_trigger,
-    parse_wake_actions as parse_model_api_wake_actions,
-)
 from proactive.agent_protocol_v2 import parse_agent_response_v2, agent_tool_calls_v2
 from proactive.tool_catalog_v2 import foreground_chat_tool_catalog_v2, foreground_chat_tool_context_v2
 from proactive.tool_executor_v2 import (

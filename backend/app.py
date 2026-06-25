@@ -64,13 +64,6 @@ from model_api_runtime.tools import (
     run_web_searches as run_model_api_web_searches,
     web_search_trace as model_api_web_search_trace,
 )
-from model_api_runtime.wake import (
-    wake_turn_contract_message as model_api_wake_turn_contract_message,
-    build_wake_event_message as build_model_api_wake_event_message,
-    hosted_tick_trigger as model_api_hosted_tick_trigger,
-    parse_wake_actions as parse_model_api_wake_actions,
-)
-
 import db
 import accounts
 import agent as agent_pkg
@@ -89,7 +82,6 @@ from hosted import history_import as hosted_history_import
 from hosted import onboarding_validation as hosted_onboarding_validation
 from hosted import setup_routes as hosted_setup_routes
 from hosted import turn as hosted_turn
-from hosted import wake_consumer as hosted_wake_consumer
 import bootstrap as bootstrap_pkg
 import content as content_pkg
 import tracking as tracking_pkg
@@ -318,19 +310,6 @@ _build_proactive_v2_wake_decision = proactive_gate._build_proactive_v2_wake_deci
 _proactive_job_from_decision = proactive_gate._proactive_job_from_decision
 
 
-# ---------------------------------------------------------------------------
-# Hosted wake consumer (model_api route only)
-# ---------------------------------------------------------------------------
-
-# Hosted wake consumer — moved to hosted/wake_consumer.py（COMPAT 迁移期）
-_hosted_wake_base_eligible = hosted_wake_consumer._hosted_wake_base_eligible
-_maybe_start_hosted_wake_consumer = hosted_wake_consumer._maybe_start_hosted_wake_consumer
-_run_model_api_wake_job_inner = hosted_wake_consumer._run_model_api_wake_job_inner
-_run_hosted_tick_once = hosted_wake_consumer._run_hosted_tick_once
-_reconcile_hosted_jobs = hosted_wake_consumer._reconcile_hosted_jobs
-HOSTED_WAKE_CONSUMER_ID = hosted_wake_consumer.HOSTED_WAKE_CONSUMER_ID
-HOSTED_TICK_INTERVAL_SEC = hosted_wake_consumer.HOSTED_TICK_INTERVAL_SEC
-
 # Proactive debug dashboard — moved to proactive/dashboard.py（COMPAT 迁移期）
 PROACTIVE_DEBUG_DECISION_READ_MAX = proactive_dashboard.PROACTIVE_DEBUG_DECISION_READ_MAX
 PROACTIVE_DEBUG_JOB_READ_MAX = proactive_dashboard.PROACTIVE_DEBUG_JOB_READ_MAX
@@ -367,10 +346,8 @@ core_leader.run_singleton("ws", screen_ws.start)
 # The "users" channel reloads the registry (core may not import accounts, so the
 # handler is injected here); store channels are handled inside wake_bus.
 core_wake_bus.register_handler("users", lambda _uid: accounts_registry.load_users())
-# A proactive-job NOTIFY also nudges the worker holding the user's key to consume
-# any pending hosted wake jobs immediately (cross-worker; the creating worker's
-# append hook already covers the local case). No-op for resident users.
-core_wake_bus.register_handler("proactive", hosted_wake_consumer.try_consume_pending_for_user)
+# Note: the "proactive" NOTIFY channel still wakes resident long-poll waiters via
+# the core _STORE_CHANNELS path (_wake_store_waiters) — no extra handler needed.
 core_wake_bus.start_listener()
 
 app = Flask(__name__)
@@ -853,16 +830,6 @@ _count_rows = admin_data_track._count_rows
 
 
 
-# Hosted Model API proactive heartbeat. Runs on EVERY worker (not leader-
-# elected): heartbeat creation and the model call both need the user's plaintext
-# key, which lives only on the worker that served the user, so each worker ticks
-# its own key-held users. Concurrent ticks are deduped in the DB (the per-user
-# heartbeat-slot CAS + the per-job status CAS). Set FEEDLING_HOSTED_TICK_ENABLED=0
-# to disable (tests / one-off scripts).
-if os.environ.get("FEEDLING_HOSTED_TICK_ENABLED", "1") == "1":
-    hosted_wake_consumer.start_tick()
-
-
 @app.errorhandler(401)
 def _unauthorized(e):
     return jsonify({"error": "unauthorized"}), 401
@@ -877,10 +844,6 @@ def _forbidden(e):
 def _unavailable(e):
     return jsonify({"error": "service_unavailable", "detail": "admin token is not configured"}), 503
 
-
-# Assembly wiring: the hosted wake consumer threads need the Flask app object
-# for app_context (push helpers deep-call jsonify).
-hosted_wake_consumer.flask_app = app
 
 # Assembly wiring: identity sits above push — inject the identity-card
 # loader used by Live Activity content state.
@@ -898,7 +861,7 @@ import types as _types
 
 for _mod in (hosted_config_store, hosted_context, hosted_history_import,
              hosted_turn, hosted_setup_routes, hosted_chat_routes,
-             hosted_onboarding_validation, hosted_wake_consumer):
+             hosted_onboarding_validation):
     for _name, _obj in vars(_mod).items():
         if _name.startswith("__") or isinstance(_obj, _types.ModuleType):
             continue

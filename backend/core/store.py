@@ -43,12 +43,6 @@ PROACTIVE_AI_STATES = {"present", "watching", "thinking", "curious", "waiting"}
 PROACTIVE_BROADCAST_STATES = {"unknown", "on", "off", "paused"}
 PROACTIVE_DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/Shanghai").strip() or "UTC"
 
-# Hooks run after UserStore.append_proactive_job persists a job. The assembly
-# layer (app.py) registers the hosted wake consumer; when nothing is
-# registered (e.g. unit tests constructing UserStore directly without
-# importing app) appends behave exactly as before.
-on_proactive_job_appended: list = []
-
 # Per-thread "currently loading from the DB" flag. The blob-backed loaders
 # (_load_tokens / _load_frames_meta) re-persist normalized state on read, so a
 # reload triggered by a cross-worker NOTIFY would itself write + re-broadcast →
@@ -625,11 +619,6 @@ class UserStore:
         db.log_trim(self.user_id, "proactive_jobs", PROACTIVE_JOB_MAX)
         self.notify_proactive_job_waiters()
         wake_bus.notify("proactive", self.user_id)  # wake other workers' pollers
-        # Post-append hooks: the assembly layer registers the hosted wake
-        # consumer here (hosted sits above core, so core must not import it).
-        # No-op for resident users (route gate inside the hosted hook).
-        for _hook in on_proactive_job_appended:
-            _hook(self, job)
         return job
 
     def list_proactive_jobs(self, since_epoch: float = 0.0, limit: int = 100) -> list[dict]:
