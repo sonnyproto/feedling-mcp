@@ -47,6 +47,25 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-06-26
+
+### [DONE] 主动陪伴系统打通（心跳/三开关/定时器）+ 感知后端 catch-up（全新信号暴露给 agent）
+
+**主动陪伴（Bug A/B 端到端修复 + VPS 真测）** — resident 路从"从未真正工作"到全通：
+- **Bug B（心跳从不触发）**：resident consumer 空 broadcast 派生成 `heartbeat_unknown` 被 gate 拦死 → 改成 `heartbeat_broadcast_off`（对齐 hosted）。`008079f`。
+- **Bug A（开关不 gate）**：`/v1/proactive/tick` 改用 `evaluate_wake_control_v2`（移除 legacy dnd/user_state 拦 wake，符合 D6/D16：dnd 只 gate Delivery）；resident `/jobs/poll` 按开关 gate pending job；`/chat/response` 应用 delivery gate（提醒关→写 chat 不 buzz）。`008079f`。
+- **resident 定时器服务端 fire**：新增 `POST /v1/proactive/scheduled/fire` + consumer 60s loop（`fire_due_timers`，复用 scheduled gate + 透明回灌）。`f772691`。
+- **VPS 三个隐藏阻塞**（修复后才跑通）：env `PROACTIVE_POLL/TICK_ENABLED=false`（总开关关着）→ 开；consumer venv 缺 `psycopg`+`psycopg_pool` → 装（已进 `tools/chat_resident_requirements.txt`）；插件 SIGNALS 扩到 17。
+- **真测通过**：心跳→主动消息端到端；C1 关陪伴 gate、F2 不连坐（关陪伴定时仍 fire）、C3 关定时 gate；E2 定时器到点 fire→消息。仅 resident，**API/hosted 一行未动（待砍）**。
+
+**感知后端 catch-up** — iOS 采集远超后端暴露,补齐 `_SIGNAL_FIELDS` 让 agent 真能拉：`7a8be95`。
+- 新增 6 信号:`reminders` + `health_activity/body/metabolic/cycle/mood`;扩 `weather`（体感/湿度/降水/UV/预警）、`health_sleep`（core/deep/rem）、`health_vitals`（current_hr/hrv/呼吸/血氧/vo2max）。catalog + resolve + ios_contract（加密 allowlist）+ agent routes + io_cli + 插件 + 测试/fixture 全同步。
+- **真机验通**:新包上 focus=true（iOS `2504c3e` entitlement 修复）、睡眠分期 511/298/76/137、心率 68/呼吸 17、身高 156/体重 52、活动能量 — 真值端到端;无数据项诚实 null。
+
+**iOS 修复（拉入）**：`2504c3e` focus Communication Notifications entitlement（focus 修好）、`ed9c54f` 发图 picker 改 fullScreenCover（修跳 home）。
+
+**文档整合**：新增 `PROACTIVE_COMPANION_FUNCTION_AND_TEST_SPEC_2026-06-25.md`（功能定义 + 详尽测试)、`PERCEPTION_FIELDS_REALDEVICE_CHECKLIST_2026-06-25.md`（逐字段真机核对)。删除被取代的时点文档:`ROUND3_REALDEVICE_TEST_PLAN.md`（→ 上述两份）、`PERCEPTION_FIELD_RECONCILIATION_2026-06-23.md`（→ 06-25 字段核对表）。
+
 ## 2026-06-25
 
 ### [DONE] 即时感知收口：focus/audio_route 可 pull + place_label/气温口径校正 + spec 校准
