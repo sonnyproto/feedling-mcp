@@ -143,8 +143,6 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
     latest_job = _latest_history_import_job(store)
     chat_ready = bool(latest_job and latest_job.get("chat_ready"))
     history_ok = bool(latest_job and (latest_job.get("status") == "completed" or chat_ready))
-    counts = bootstrap_st["counts"]
-    memory_ok = history_ok and counts.get("story", 0) >= 1 and counts.get("about_me", 0) >= 1
     hosted_chat_ok = _model_api_hosted_chat_verified(store)
 
     steps = [
@@ -204,13 +202,16 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
             ),
         },
         {
+            # A' (2026-06): Memory Garden is informational, not an onboarding gate.
             "id": "memory_garden",
             "label": "Memory Garden",
-            "passing": memory_ok,
+            "passing": True,
+            "blocking": False,
+            "memory_count": bootstrap_st["memory_count"],
             "counts": bootstrap_st["counts"],
             "floors": bootstrap_st["floors"],
             "missing_tabs": bootstrap_st["missing_tabs"],
-            "required": "History import must write at least one Story card and one About-me card." if not memory_ok else "",
+            "required": "",
         },
         {
             "id": "identity_card",
@@ -249,20 +250,22 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
 
 def _official_import_onboarding_validation_payload(store: UserStore) -> dict:
     bootstrap_st = boot_gates._bootstrap_state(store)
-    memory_ok = not bootstrap_st["missing_tabs"]
     identity = identity_service._load_identity(store)
     identity_written = identity is not None
     relationship_evidence = str((identity or {}).get("relationship_anchor_evidence") or "").strip()
     relationship_ok = bool(identity and identity.get("relationship_started_at") and relationship_evidence)
     steps = [
         {
+            # A' (2026-06): Memory Garden is informational, not an onboarding gate.
             "id": "memory_garden",
             "label": "Memory Garden",
-            "passing": memory_ok,
+            "passing": True,
+            "blocking": False,
+            "memory_count": bootstrap_st["memory_count"],
             "counts": bootstrap_st["counts"],
             "floors": bootstrap_st["floors"],
             "missing_tabs": bootstrap_st["missing_tabs"],
-            "required": boot_gates._gate_required_for_missing_tabs(bootstrap_st) if not memory_ok else "",
+            "required": "",
         },
         {
             "id": "identity_card",
@@ -300,7 +303,6 @@ def _onboarding_validation_payload(store: UserStore) -> dict:
         return _official_import_onboarding_validation_payload(store)
 
     bootstrap_st = boot_gates._bootstrap_state(store)
-    memory_ok = not bootstrap_st["missing_tabs"]
     identity = identity_service._load_identity(store)
     identity_written = identity is not None
     relationship_anchored = bool(identity and identity.get("relationship_started_at"))
@@ -314,13 +316,16 @@ def _onboarding_validation_payload(store: UserStore) -> dict:
 
     steps = [
         {
+            # A' (2026-06): Memory Garden is informational, not an onboarding gate.
             "id": "memory_garden",
             "label": "Memory Garden",
-            "passing": memory_ok,
+            "passing": True,
+            "blocking": False,
+            "memory_count": bootstrap_st["memory_count"],
             "counts": bootstrap_st["counts"],
             "floors": bootstrap_st["floors"],
             "missing_tabs": bootstrap_st["missing_tabs"],
-            "required": boot_gates._gate_required_for_missing_tabs(bootstrap_st) if not memory_ok else "",
+            "required": "",
         },
         {
             "id": "identity_card",
@@ -328,7 +333,9 @@ def _onboarding_validation_payload(store: UserStore) -> dict:
             "passing": identity_written,
             "written": identity_written,
             "required": (
-                "Call feedling_identity_init after memory verification passes."
+                "Write the identity card first (feedling_identity_init) — it no "
+                "longer depends on memory floor. The Memory Garden grows naturally "
+                "afterwards."
                 if not identity_written else ""
             ),
         },

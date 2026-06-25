@@ -47,30 +47,29 @@ def _bootstrap_state(store) -> dict:
           counts: {story, about_me, ta_thinking, total},
           floors: {story, about_me, ta_thinking, total},
           identity_written: bool,
-          stage: str ∈ {"needs_memory", "needs_identity", "main_loop"},
-          missing_tabs: [tab_name, ...]     # Which tab floors are unmet
+          stage: str ∈ {"needs_identity", "main_loop"},
+          missing_tabs: []                  # always empty (memory no longer gates)
         }
 
-    Gate semantics (post-typed-memory rewrite):
-      - "needs_memory" means Story floor OR About me floor not yet met.
-        TA 在想 (insight/reflection) is encouraged but not blocking —
-        reflections need substrate from the other two tabs first, so
-        gating on it would create a deadlock at low-density tiers.
+    Gate semantics (A', 2026-06):
+      - Memory is NOT an onboarding gate. Identity is the minimum baseline.
+        stage is "needs_identity" until the identity card is written, then
+        "main_loop". counts / floors / missing_tabs are informational only —
+        the Memory Garden grows naturally and never blocks onboarding.
     """
     moments = memory_service._load_moments(store)
     counts = memory_service._count_by_tab(moments)
     identity_written = identity_service._load_identity(store) is not None
     floors = memory_service._per_tab_floors_for_days(identity_service._relationship_age_days(store))
 
-    missing_tabs = []
-    if counts["story"] < floors["story"]:
-        missing_tabs.append("story")
-    if counts["about_me"] < floors["about_me"]:
-        missing_tabs.append("about_me")
+    # A' (2026-06): memory is no longer an onboarding gate. Identity is the
+    # minimum baseline; the Memory Garden grows naturally afterwards. counts /
+    # floors stay for informational display only — they no longer drive
+    # `stage`, and `missing_tabs` is always empty (kept for response-shape
+    # back-compat; never blocks).
+    missing_tabs: list[str] = []
 
-    if missing_tabs:
-        stage = "needs_memory"
-    elif not identity_written:
+    if not identity_written:
         stage = "needs_identity"
     else:
         stage = "main_loop"
@@ -87,25 +86,15 @@ def _bootstrap_state(store) -> dict:
 
 
 def _gate_required_for_missing_tabs(state) -> str:
-    """Human-readable instruction string for the missing tabs in `state`."""
-    c = state["counts"]
-    f = state["floors"]
-    parts = []
-    if "story" in state["missing_tabs"]:
-        parts.append(
-            f"Story tab {c['story']}/{f['story']} — write more moment/quote memories"
-        )
-    if "about_me" in state["missing_tabs"]:
-        parts.append(
-            f"About me tab {c['about_me']}/{f['about_me']} — write more fact/event memories "
-            f"(this is the density layer — preferences, relationships, dates, habits)"
-        )
+    """DEPRECATED (A', 2026-06). Memory is no longer an onboarding gate, so
+    `missing_tabs` is always empty and this string is no longer surfaced on any
+    blocking path. Retained only because `app.py` re-exports it; returns an
+    informational, A'-aligned message instead of the old "pile memory floor"
+    instruction so no stale caller can revive the old flow.
+    """
     return (
-        "Per-tab memory floors are below threshold: "
-        + "; ".join(parts)
-        + ". Use feedling_memory_add_moment(type=...) for each. Then call "
-        "feedling_identity_init. Do not fabricate Pass 4 summaries — the cards "
-        "must actually exist."
+        "Memory is no longer an onboarding gate. Write the identity card first; "
+        "the Memory Garden grows naturally afterwards — there are no per-tab floors."
     )
 
 
@@ -226,13 +215,13 @@ def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
                 "skill_url": _SKILL_URL,
             }), 409
         return None
-    if state["stage"] == "needs_memory":
-        required = _gate_required_for_missing_tabs(state)
-    else:  # needs_identity
-        required = (
-            "Call feedling_identity_init with the derived identity card "
-            "(7 dimensions + days_with_user) BEFORE you can post chat."
-        )
+    # A' (2026-06): memory no longer gates chat. The only remaining
+    # pre-main_loop stage is "needs_identity" (identity is the baseline that
+    # must exist before the agent speaks, so day-1 isn't ungrounded).
+    required = (
+        "Call feedling_identity_init with the derived identity card "
+        "(7 dimensions + days_with_user) BEFORE you can post chat."
+    )
     print(f"[gate:{store.user_id}] chat_response blocked stage={state['stage']} "
           f"missing={state['missing_tabs']} id={state['identity_written']}")
     return jsonify({
@@ -250,27 +239,12 @@ def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
 
 
 def _gate_bootstrap_for_identity_init(store):
-    """Refuse /v1/identity/init when Story or About me tab floors are unmet.
+    """A' (2026-06): identity init is NO LONGER gated on memory floor.
 
-    Identity must be DERIVED from memory substrate — writing identity in the
-    30+ day tier with only 2 cards means the Agent skipped the depth pass.
-    TA 在想 floor is advisory at this gate (reflections need other-tab
-    substrate first, gating on it would deadlock low-density users).
+    0 memory cards is a valid state — identity is the baseline that comes
+    first; the Memory Garden grows naturally afterwards. Envelope /
+    days_with_user / relationship_anchor_evidence validation still happens in
+    the identity route itself (not here). Kept as a hook (always allows) so
+    call sites stay stable.
     """
-    state = _bootstrap_state(store)
-    if not state["missing_tabs"]:
-        return None
-    print(f"[gate:{store.user_id}] identity_init blocked missing={state['missing_tabs']} "
-          f"counts={state['counts']} floors={state['floors']}")
-    return jsonify({
-        "error": "bootstrap_incomplete",
-        "stage": "needs_memory",
-        "memory_count": state["memory_count"],
-        "memory_floor": state["memory_floor"],
-        "counts": state["counts"],
-        "floors": state["floors"],
-        "missing_tabs": state["missing_tabs"],
-        "required": _gate_required_for_missing_tabs(state)
-                    + " Identity dimensions must be derived from real cards, not invented.",
-        "skill_url": _SKILL_URL,
-    }), 409
+    return None

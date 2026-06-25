@@ -227,11 +227,10 @@ def chat_response():
     app state records a suppression. `push_body` / `alert_body` are plaintext
     metadata (user-visible in APNs surfaces) and are never stored in chat.
 
-    Bootstrap gate: this endpoint 409s if memory_count < the per-age floor
-    (see memory_service._memory_floor_for_days) or identity is not yet written. See
-    boot_gates._gate_bootstrap_for_chat for the rationale — runtime-level skill text
-    isn't enough to stop hallucinated bootstrap completion; the server has
-    to enforce it.
+    Bootstrap gate (A', 2026-06): this endpoint 409s only if identity is not
+    yet written, or the live chat loop (resident consumer + verified loop) is
+    not yet wired. Memory is NO LONGER a gate — 0 memory cards is a valid state.
+    See boot_gates._gate_bootstrap_for_chat.
     """
     store = auth.require_user()
     payload = request.get_json(silent=True) or {}

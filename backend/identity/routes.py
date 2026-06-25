@@ -59,10 +59,10 @@ def identity_init():
     {agent_name, self_introduction, dimensions} serialized as JSON.
     Plaintext metadata: id, created_at, updated_at. See DESIGN_E2E.md §3.2.
 
-    Bootstrap gate: requires memory_count >= the per-age floor (see
-    memory_service._memory_floor_for_days). Identity must be DERIVED from memories per
-    skill protocol; writing identity without depth proportional to the
-    relationship age means the Agent skipped the depth pass.
+    Bootstrap gate (A', 2026-06): identity init is NO LONGER gated on memory
+    floor. 0 memory cards is a valid state — identity is the baseline that comes
+    first; the Memory Garden grows naturally afterwards. Only the envelope /
+    days_with_user / relationship_anchor_evidence validation below applies.
     See boot_gates._gate_bootstrap_for_identity_init.
     """
     store = auth.require_user()

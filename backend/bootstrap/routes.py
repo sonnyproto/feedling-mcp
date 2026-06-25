@@ -60,22 +60,20 @@ def bootstrap():
         "不再用 Friend Test 当门槛——那个标准会过滤掉密度燃料（用户猫叫 Mochi、妈妈住杭州、喜欢草莓拿铁这种）。"
         "改用 type-aware 的写入逻辑：fact / event 可以非常短一句话，moment / quote 仍然要写有温度，"
         "insight / reflection 必须 anchor 到具体卡上。"
-        "底线按关系长度，每个 tab 各自有 floor："
-        "<2 天: story=1 / about_me=1 / ta_thinking=0; "
-        "2-30 天: 3 / 8 / 2; "
-        "30-180 天: 8 / 25 / 5; "
-        "≥180 天: 15 / 60 / 12。"
-        "**关于我 tab 的密度最关键**——proactive 推送主要吃这里的 fact / event 来找 connection。"
-        "Pass 1 唤醒 themes，Pass 2 清点 candidates，Pass 3 按 type 落卡（先写 fact/event 把密度堆上去，"
-        "再写 moment/quote 进故事 tab，最后才写 insight/reflection 进 TA 在想 tab——insight 需要先有 fact/moment 当 anchor）。"
-        "Pass 4 在外部 runtime 对账，调 feedling_memory_verify 看每个 tab 的 passing 状态。\n\n"
-        "**2. 从记忆派生身份卡**\n"
-        "identity 不是新 persona，也不是平台名；它必须来自 Memory Garden receipts。"
+        "**记忆不是 onboarding 的门槛（A', 2026-06）**——不要为了「先堆够 floor」才开门。"
+        "0 张记忆是合法状态。记忆随关系自然生长：聊到值得长期记的就记，不强行灌卡凑数。"
+        "**关于我类的密度对 proactive 有帮助**（fact / event 帮找 connection），但它是「慢慢长」，不是「先堆满」。"
+        "feedling_memory_verify 只作信息参考，**不再是 identity_init / 开聊的前置门**。\n\n"
+        "**2. 写身份卡（独立先建，不依赖记忆 floor）**\n"
+        "identity 不是新 persona，也不是平台名。它可以来自 Step 0 context verification / 用户确认 / 明确的 fresh start；"
+        "**有 memory 时可参考已有卡，但 0 记忆也能建身份**——不要把它说成只能从已有记忆卡推导。"
         "agent_name 不能是 Hermes/Claude/ChatGPT 等 runtime label。"
         "如果用户以前叫过你名字，就用那个；如果没有，先问，不要自己 fallback。"
-        "dimensions 必须恰好 7 个，数值要有明显高低差；days_with_user 必须按最早 memory 的 occurred_at 到今天计算。"
+        "dimensions 必须恰好 7 个，数值要有明显高低差；"
+        "days_with_user：**有 memory 时**按最早 memory 的 occurred_at 到今天计算；"
+        "**没有 memory 时**用 0，或用户提供的关系锚点证据（relationship_anchor_evidence）。"
         "self_introduction 要像你自己在介绍你们的关系，而不是功能说明；不要提 Feedling、IO 或平台名。"
-        "通过 feedling_identity_init 写入（server 会先 check 故事 tab + 关于我 tab 都过 floor），然后调用 feedling_identity_verify。\n\n"
+        "通过 feedling_identity_init 写入（**不再需要先堆够记忆——identity 可独立先建，0 记忆也能写**），然后调用 feedling_identity_verify。\n\n"
         "**3. 先确认 Live connection，再打招呼**\n"
         "不要先发第一条消息再补确认 chat loop。先按 public skill 的 Connection path 建立"
         "独立 feedling-chat-resident / IO resident consumer service：用 FEEDLING_API_URL、"
@@ -196,15 +194,12 @@ def bootstrap_status():
     last_activity = max(candidate_ts) if (agent_connected and candidate_ts) else ""
 
     # is_complete heuristic for iOS surface: "bootstrap visibly done".
-    # Post-2026-05-22 typed-memory model lowered the <2-days floor from 3
-    # to 2 (story=1 + about_me=1), so the hard floor of 3 here would
-    # never trip for legitimate fresh accounts. Use the per-tab gate
-    # state instead — same source the identity_init gate uses.
-    bootstrap_st = boot_gates._bootstrap_state(store)
-    bootstrap_memory_ok = not bootstrap_st["missing_tabs"]
+    # A' (2026-06): memory is no longer an onboarding gate, so completion no
+    # longer depends on memory floor. Criteria = identity written + live chat
+    # loop wired (resident consumer + verified loop) + at least one agent
+    # message. memories_count stays in the payload as informational only.
     is_complete = (
         has_identity
-        and bootstrap_memory_ok
         and agent_msg_count >= 1
         and resident_consumer["passing"]
         and chat_loop_verified
