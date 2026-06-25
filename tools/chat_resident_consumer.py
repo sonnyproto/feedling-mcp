@@ -3183,6 +3183,62 @@ def _recent_chat_for_v2_context(value: Any) -> list[dict[str, Any]]:
     }]
 
 
+def _resident_perception_trend(signal: str, field: str) -> dict:
+    """Best-effort GET of one signal's rolling baseline/delta (Tier 2 history)."""
+    try:
+        resp = httpx.get(
+            f"{FEEDLING_API_URL}/v1/agent/perception/trend",
+            headers=_HEADERS,
+            params={"signal": signal, "field": field, "days": 30},
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            return {}
+        return resp.json()
+    except Exception as e:
+        log.debug("proactive trend pull failed %s.%s: %s", signal, field, e)
+        return {}
+
+
+# Signals worth a "vs your norm" line when a wake fires (cheap to pull, high
+# narrative value). Empty until perception_daily accumulates a few days.
+_PROACTIVE_CHANGE_SIGNALS = (
+    ("vitals", "resting_heart_rate"),
+    ("steps", "step_count"),
+    ("sleep", "asleep_minutes"),
+)
+
+
+def _proactive_perception_digest() -> tuple[dict, list]:
+    """Pre-load real signals into the wake turn so the agent decides from facts,
+    not a blind prompt. presence = current cheap snapshot; change = vs-baseline
+    deltas (Tier 2 trend). Both best-effort — failures degrade to empty."""
+    presence: dict[str, Any] = {}
+    try:
+        res = _resident_call_tool_v2("perception.now", {})
+        snap = ((res or {}).get("result") or {}).get("snapshot")
+        if isinstance(snap, dict):
+            presence = {
+                k: snap.get(k)
+                for k in ("place_label", "motion_state", "now_playing",
+                          "battery_level", "charging", "local_time", "timezone")
+                if snap.get(k) is not None
+            }
+    except Exception as e:
+        log.debug("proactive presence pull failed: %s", e)
+    change: list[dict] = []
+    for signal, field in _PROACTIVE_CHANGE_SIGNALS:
+        tr = (_resident_perception_trend(signal, field) or {}).get("trend") or {}
+        baseline = tr.get("baseline") or {}
+        if tr.get("current") is not None and tr.get("delta") is not None and (baseline.get("n") or 0) >= 2:
+            change.append({
+                "signal": signal, "field": field,
+                "current": tr.get("current"), "baseline_median": baseline.get("median"),
+                "delta": tr.get("delta"), "direction": tr.get("direction"),
+            })
+    return presence, change
+
+
 def _resident_v2_agent_context_for_job(
     job: dict,
     *,
@@ -3195,10 +3251,21 @@ def _resident_v2_agent_context_for_job(
     from proactive.runtime_v2 import merge_wakes_v2
     event = wake_event_v2_from_legacy_job(_resident_user_id_for_job(job), job)
     merged = merge_wakes_v2([event], tool_catalog=tool_catalog_v2_for_runtime(runtime))
-    return build_agent_context_v2(
+    context = build_agent_context_v2(
         merged,
         recent_chat=_recent_chat_for_v2_context(recent_chat_context),
     )
+    # Pre-load real perception so the wake turn isn't blind (presence = now;
+    # perception_change = vs baseline). Best-effort; never blocks the wake.
+    try:
+        presence, change = _proactive_perception_digest()
+        if presence:
+            context["presence_hints"] = {**(context.get("presence_hints") or {}), **presence}
+        if change:
+            context["perception_change"] = change
+    except Exception as e:
+        log.debug("proactive perception digest failed: %s", e)
+    return context
 
 
 def _message_for_proactive_job_v2(
@@ -3216,7 +3283,10 @@ def _message_for_proactive_job_v2(
         "[Feedling Runtime V2 proactive wake]",
         "This is a hidden wake turn, not a user request.",
         "The platform supplied wake context and tools only; it did not decide whether you should speak.",
-        "You own the decision. If appearing is not useful or natural, return sleep.",
+        # Neutral choice — no platform bias toward either side. The proactive vs.
+        # quiet personality lives in your own persona, not here.
+        "You own the decision: choose between send_message and sleep based purely on "
+        "whether there is anything worth surfacing to the user right now. Neither is a default.",
         "Return JSON only using the V2 action contract.",
         (
             "Allowed actions: "
@@ -3225,6 +3295,16 @@ def _message_for_proactive_job_v2(
         ),
         "For visible speech, prefer actions:[{\"type\":\"send_message\",\"text\":\"...\"}] or messages:[\"...\"].",
         "Do not mention this hidden wake, runtime metadata, or system wording to the user.",
+        # Pre-loaded real signals so you don't speak blind: context.presence_hints =
+        # current snapshot, context.perception_change = vs-your-baseline deltas,
+        # context.recent_chat = timestamped recent messages.
+        "Real signals are pre-loaded in v2_context_json (presence_hints, perception_change, "
+        "recent_chat). Ground anything you say in those — never invent facts about the user. "
+        "Pull more detail with tools if useful.",
+        (
+            "If something is worth checking back on later, schedule_wake with origin_refs "
+            "referencing this wake so the future turn has the thread."
+        ),
         (
             "Tool use: you may return {\"tool_calls\":[{\"name\":\"<tool>\",\"args\":{...}}]} to gather "
             "information from the tools listed in v2_context_json. You will receive results and may call "
