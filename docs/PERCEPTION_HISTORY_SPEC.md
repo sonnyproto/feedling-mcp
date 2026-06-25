@@ -73,31 +73,39 @@
 
 ---
 
-## 4. 每信号每日 rollup(当前信号填好;工程师新字段标 TBD-待落地)
+## 4. 每信号每日 rollup(字段已定稿 2026-06-26;**实现按注册表派生,不硬编字段**)
 
-> "记什么"按 §3 形状;**多记**为默认。新字段(心情/HRV/活动三环/参会人/reminders/降水)
-> 等工程师落地后填进本表,一次性建。
+> "记什么"按 §3 形状;**多记**为默认。下表是设计参照;**实现**用一张
+> `HISTORY_SHAPES`(signal→形状[+参与字段])注册表 + 每形状一个通用增量函数,
+> 信号/字段从 `catalog.SIGNALS` 派生。新增字段=注册表加一行,**结构不动**(原则 #2)。
 
 | 信号 | 形状 | 每日记 |
 |---|---|---|
-| `health_vitals.resting_heart_rate` | 数值分布 | min/max/avg/n(基线主轴) |
-| `health_vitals.step_count` | 累加计数 | 当日总步数 |
-| `health_sleep` | 当日代表 | 入睡时长(+ 分期/上下床点,待 iOS 加分期) |
-| `health_workout` | 事件列表 | 当天每次运动(type/时长桶/计数) |
-| `weather` | 数值分布 + 分类 | 当日最高/最低温 + 出现过的 condition(+ 降水,待加) |
-| `motion_state` | 分类时长 | 各状态分钟数(活跃/久坐由此派生,不丢分布) |
+| `vitals.resting_heart_rate` | 数值分布 | min/max/avg/n(基线主轴) |
+| `vitals.current_heart_rate` | 数值分布 | min/max/avg/n |
+| `vitals.hrv_sdnn_ms` | 数值分布 | min/max/avg/n |
+| `vitals.respiratory_rate` | 数值分布 | min/max/avg/n |
+| `vitals.oxygen_saturation_pct` | 数值分布 | min/max/avg/n |
+| `vitals.vo2_max` | 当日代表 | 最近点值(慢变) |
+| `steps.step_count` | 累加计数 | 当日总步数 |
+| `sleep` | 当日代表 | 入睡时长 + 分期 core/deep/rem |
+| `workout` | 事件列表 | 当天每次运动(type/时长/计数) |
+| `activity` | 累加计数 | active_energy_kcal / exercise / stand / mindful 当日总量 |
+| `body` | 当日代表 | weight_kg / bmi / body_fat_pct / height_cm 最近点值 |
+| `metabolic` | 数值分布 | blood_glucose / bp_systolic / bp_diastolic(可多次/天) |
+| `cycle` | 当日代表 | flow_level + is_active_period(最近记录) |
+| `mood` | 主观量表 | 每条 valence/valence_classification/kind/label_count |
+| `weather` | 数值分布 + 分类 | 当日温度 min/max/avg + condition 集合 + 降水/湿度/UV |
+| `motion` | 分类时长 | 各状态分钟数(活跃/久坐由此派生) |
 | `location` | 停留分布 | 各 place 停留时长 + primary + 访问集合 |
 | `calendar` | 事件列表 | 当天实际发生的日程(定格,非 live next_event churn) |
 | `focus` | 分类时长 | 当天处于专注模式分钟数 |
 | `audio_route` | 分类时长 | 当天各输出(耳机/车机)时长 |
-| `now_playing` | 分类时长(可选) | 当天听歌时长 / 类型分布 |
-| **TBD** 心情 State of Mind | 主观量表 | 每条 valence/标签/时间 |
-| **TBD** HRV | 数值分布 | min/max/avg/n |
-| **TBD** 活动三环(active energy/exercise/stand) | 累加计数 | 当日总量 |
-| **TBD** reminders | 事件列表 | 当天到期/完成的待办 |
+| `reminders` | 事件列表 | 当天到期/完成的待办(按 id 去重) |
+| `now_playing` | 分类时长(可选) | 当天听歌时长 |
 
 **不历史化**(纯瞬时、无当日模式意义):电量 %、charging、broadcast 开关态、time、
-now_playing 的曲目身份(听歌时长留、具体哪首不留)。
+locale/timezone、now_playing 的曲目身份(听歌时长留、具体哪首不留)。
 
 ---
 
