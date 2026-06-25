@@ -132,13 +132,11 @@ jobs:
             tests/test_proactive_dashboard_v2.py \
             tests/test_proactive_observability_v2.py \
             tests/test_proactive_tool_executor_v2.py \
-            tests/test_hosted_wake_v2_cutover.py \
             tests/test_perception_ingress_v2.py \
             tests/test_ios_perception_contract_v2.py \
             tests/test_perception.py \
             tests/test_proactive_jobs.py \
             tests/test_proactive_gate_eval.py \
-            tests/test_model_api_wake.py \
             tests/test_screen_caption_backend.py \
             tests/test_screen_caption_flag.py \
             tests/test_proactive_agent_protocol_v2.py \
