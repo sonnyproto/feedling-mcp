@@ -105,11 +105,11 @@ SIGNALS: dict[str, Signal] = {s.input: s for s in [
            resolver="audio_route", ttl_sec=600.0, significant=False),
     Signal("weather", "weather", ("condition", "temperature", "is_daylight"),
            resolver="weather", ttl_sec=1800.0, significant=False),
-    Signal("health_sleep", "health_sleep", ("asleep_minutes_bucket",),
+    Signal("health_sleep", "health_sleep", ("asleep_minutes",),
            resolver="health_sleep", ttl_sec=86400.0, significant=False),
-    Signal("health_workout", "health_workout", ("workout_type", "duration_min_bucket", "count_today"),
+    Signal("health_workout", "health_workout", ("workout_type", "duration_min", "count_today"),
            resolver="health_workout", ttl_sec=86400.0, significant=False),
-    Signal("health_vitals", "health_vitals", ("resting_heart_rate_bucket", "step_count_bucket"),
+    Signal("health_vitals", "health_vitals", ("resting_heart_rate", "step_count"),
            resolver="health_vitals", ttl_sec=3600.0, significant=False),
     # `app` is reported via the GET /app_open shortcut endpoint (not /report); this
     # entry exists so app_name/app_category appear in the snapshot with a TTL.

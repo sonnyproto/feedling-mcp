@@ -160,13 +160,13 @@ def test_weather_health_and_focus_ingress_are_pull_only_after_decrypt(monkeypatc
             "values": {"condition": "rain", "temperature": 23.4, "is_daylight": False},
             "message": "weather fresh",
         },
-        "env_sleep": {"values": {"asleep_minutes_bucket": 420}, "message": "sleep fresh"},
+        "env_sleep": {"values": {"asleep_minutes": 420}, "message": "sleep fresh"},
         "env_workout": {
-            "values": {"workout_type": "running", "duration_min_bucket": 30, "count_today": 1},
+            "values": {"workout_type": "running", "duration_min": 30, "count_today": 1},
             "message": "workout fresh",
         },
         "env_vitals": {
-            "values": {"resting_heart_rate_bucket": 60, "step_count_bucket": 3500},
+            "values": {"resting_heart_rate": 60, "step_count": 3500},
             "message": "vitals fresh",
         },
     }
@@ -204,12 +204,12 @@ def test_weather_health_and_focus_ingress_are_pull_only_after_decrypt(monkeypatc
     assert state["condition"]["msg"] == "weather fresh"
     assert state["temperature"]["v"] == 23.4
     assert state["is_daylight"]["v"] is False
-    assert state["asleep_minutes_bucket"]["v"] == 420
+    assert state["asleep_minutes"]["v"] == 420
     assert state["workout_type"]["v"] == "running"
-    assert state["duration_min_bucket"]["v"] == 30
+    assert state["duration_min"]["v"] == 30
     assert state["count_today"]["v"] == 1
-    assert state["resting_heart_rate_bucket"]["v"] == 60
-    assert state["step_count_bucket"]["v"] == 3500
+    assert state["resting_heart_rate"]["v"] == 60
+    assert state["step_count"]["v"] == 3500
     assert service.pull_snapshot("u_weather_health", now=200.0)["in_focus"] is True
     assert service.pull_snapshot("u_weather_health", now=200.0)["output_type"] == "bluetooth"
     assert emitted == []

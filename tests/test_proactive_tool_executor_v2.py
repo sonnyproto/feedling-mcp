@@ -38,12 +38,12 @@ def _adapters(*, send_message=None, photos_recent=None) -> ToolRuntimeAdaptersV2
         "condition": "rain",
         "temperature": 23.4,
         "is_daylight": False,
-        "asleep_minutes_bucket": 420,
+        "asleep_minutes": 420,
         "workout_type": "running",
-        "duration_min_bucket": 30,
+        "duration_min": 30,
         "count_today": 1,
-        "resting_heart_rate_bucket": 60,
-        "step_count_bucket": 3500,
+        "resting_heart_rate": 60,
+        "step_count": 3500,
     }
     memories = [
         {
@@ -147,12 +147,12 @@ def test_weather_and_health_tools_read_ios_snapshot_fields():
     assert audio_route.result["audio_route"]["device_name"] == "Headphones"
     assert weather.ok is True
     assert weather.result["weather"]["condition"] == "rain"
-    assert steps.result["steps"]["step_count_bucket"] == 3500
-    assert sleep.result["sleep_last_night"]["asleep_minutes_bucket"] == 420
+    assert steps.result["steps"]["step_count"] == 3500
+    assert sleep.result["sleep_last_night"]["asleep_minutes"] == 420
     assert workout.result["workout"]["workout_type"] == "running"
     assert workout.result["workout"]["count_today"] == 1
-    assert vitals.result["vitals"]["resting_heart_rate_bucket"] == 60
-    assert vitals.result["vitals"]["step_count_bucket"] == 3500
+    assert vitals.result["vitals"]["resting_heart_rate"] == 60
+    assert vitals.result["vitals"]["step_count"] == 3500
 
 
 def test_tool_traces_record_name_cost_latency_outcome_and_wake_turn_ids():

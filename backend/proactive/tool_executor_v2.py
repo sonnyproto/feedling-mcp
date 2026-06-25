@@ -381,23 +381,23 @@ class ToolExecutorV2:
                 "is_daylight": state.get("is_daylight"),
             }}
         if call.name == "perception.steps":
-            return {"steps": {"step_count_bucket": self._pull_snapshot(call.user_id).get("step_count_bucket")}}
+            return {"steps": {"step_count": self._pull_snapshot(call.user_id).get("step_count")}}
         if call.name == "perception.sleep_last_night":
             return {"sleep_last_night": {
-                "asleep_minutes_bucket": self._pull_snapshot(call.user_id).get("asleep_minutes_bucket"),
+                "asleep_minutes": self._pull_snapshot(call.user_id).get("asleep_minutes"),
             }}
         if call.name == "perception.workout":
             state = self._pull_snapshot(call.user_id)
             return {"workout": {
                 "workout_type": state.get("workout_type"),
-                "duration_min_bucket": state.get("duration_min_bucket"),
+                "duration_min": state.get("duration_min"),
                 "count_today": state.get("count_today"),
             }}
         if call.name == "perception.vitals":
             state = self._pull_snapshot(call.user_id)
             return {"vitals": {
-                "resting_heart_rate_bucket": state.get("resting_heart_rate_bucket"),
-                "step_count_bucket": state.get("step_count_bucket"),
+                "resting_heart_rate": state.get("resting_heart_rate"),
+                "step_count": state.get("step_count"),
             }}
         if call.name == "perception.photo_recent":
             limit = _int_arg(args.get("limit"), default=10, lo=1, hi=50)

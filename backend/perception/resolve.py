@@ -176,15 +176,15 @@ def resolve_audio_route(value, config: dict) -> dict:
 
 
 def resolve_health_sleep(value, config: dict) -> dict:
-    return _copy_fields(value, ("asleep_minutes_bucket",))
+    return _copy_fields(value, ("asleep_minutes",))
 
 
 def resolve_health_workout(value, config: dict) -> dict:
-    return _copy_fields(value, ("workout_type", "duration_min_bucket", "count_today"))
+    return _copy_fields(value, ("workout_type", "duration_min", "count_today"))
 
 
 def resolve_health_vitals(value, config: dict) -> dict:
-    return _copy_fields(value, ("resting_heart_rate_bucket", "step_count_bucket"))
+    return _copy_fields(value, ("resting_heart_rate", "step_count"))
 
 
 def resolve_location_signal(value, config: dict) -> dict:

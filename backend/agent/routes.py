@@ -40,10 +40,10 @@ _SIGNAL_FIELDS: dict[str, tuple[str, ...]] = {
     "calendar": ("calendar_next_event", "calendar_events", "calendar_events_truncated"),
     "focus": ("focus_authorization_status", "in_focus"),
     "audio_route": ("output_type", "is_bluetooth", "device_name"),
-    "steps": ("step_count_bucket",),
-    "sleep": ("asleep_minutes_bucket",),
-    "workout": ("workout_type", "duration_min_bucket", "count_today"),
-    "vitals": ("resting_heart_rate_bucket", "step_count_bucket"),
+    "steps": ("step_count",),
+    "sleep": ("asleep_minutes",),
+    "workout": ("workout_type", "duration_min", "count_today"),
+    "vitals": ("resting_heart_rate", "step_count"),
 }
 
 _SIGNAL_PERMISSION_KEYS: dict[str, tuple[str, ...]] = {

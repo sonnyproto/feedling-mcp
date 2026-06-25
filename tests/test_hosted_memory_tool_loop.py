@@ -189,7 +189,7 @@ def test_foreground_perception_slow_tool_is_unavailable_without_background_ack(m
     def pull_snapshot(_user_id):
         nonlocal pull_called
         pull_called = True
-        return {"step_count_bucket": 6000}
+        return {"step_count": 6000}
 
     monkeypatch.setattr(chat_routes.provider_client, "chat_completion", fake_chat_completion)
     monkeypatch.setattr(

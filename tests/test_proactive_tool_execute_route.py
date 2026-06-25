@@ -69,7 +69,7 @@ def test_tool_execute_foreground_budget_soft_handoffs_slow_tool(monkeypatch):
 
     def pull_snapshot(_user_id):
         called["pull"] = True
-        return {"step_count_bucket": 6000}
+        return {"step_count": 6000}
 
     monkeypatch.setattr(proactive_routes.auth, "require_user", lambda: _Store())
     monkeypatch.setattr(

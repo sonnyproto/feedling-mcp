@@ -118,12 +118,12 @@ def test_agent_perception_slow_signals_return_inline_without_background(monkeypa
     client = _client(
         monkeypatch,
         pull={
-            "step_count_bucket": 6500,
-            "asleep_minutes_bucket": 420,
+            "step_count": 6500,
+            "asleep_minutes": 420,
             "workout_type": "run",
-            "duration_min_bucket": 30,
+            "duration_min": 30,
             "count_today": 1,
-            "resting_heart_rate_bucket": 60,
+            "resting_heart_rate": 60,
         },
     )
 
@@ -131,16 +131,16 @@ def test_agent_perception_slow_signals_return_inline_without_background(monkeypa
     body = resp.get_json()
 
     assert resp.status_code == 200
-    assert body["signals"]["steps"] == {"step_count_bucket": 6500}
-    assert body["signals"]["sleep"] == {"asleep_minutes_bucket": 420}
+    assert body["signals"]["steps"] == {"step_count": 6500}
+    assert body["signals"]["sleep"] == {"asleep_minutes": 420}
     assert body["signals"]["workout"] == {
         "workout_type": "run",
-        "duration_min_bucket": 30,
+        "duration_min": 30,
         "count_today": 1,
     }
     assert body["signals"]["vitals"] == {
-        "resting_heart_rate_bucket": 60,
-        "step_count_bucket": 6500,
+        "resting_heart_rate": 60,
+        "step_count": 6500,
     }
     assert "needs_background" not in str(body)
 
@@ -238,7 +238,7 @@ def test_agent_perception_null_permission_message_returns_disabled_but_no_event_
     client = _client(
         monkeypatch,
         state={
-            "asleep_minutes_bucket": {
+            "asleep_minutes": {
                 "v": None,
                 "ts": 10.0,
                 "msg": "HealthKit 不可用，无法读取睡眠趋势",
@@ -250,7 +250,7 @@ def test_agent_perception_null_permission_message_returns_disabled_but_no_event_
             },
         },
         pull={
-            "asleep_minutes_bucket": None,
+            "asleep_minutes": None,
             "calendar_next_event": None,
         },
     )
