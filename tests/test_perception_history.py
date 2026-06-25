@@ -102,6 +102,33 @@ def test_subjective_appends_each_entry():
     assert d["entries"][0]["valence"] == 0.4
 
 
+def test_tally_music_digest_minutes_and_top():
+    # play artist A for 10min, then B for 5min
+    d = history.record_daily(None, "playback",
+                             {"now_playing": {"playback_state": "playing", "title": "t1", "artist": "A"}}, ts=0.0)
+    d = history.record_daily(d, "playback",
+                             {"now_playing": {"playback_state": "playing", "title": "t2", "artist": "B"}}, ts=600.0)
+    d = history.record_daily(d, "playback",
+                             {"now_playing": {"playback_state": "paused", "title": "t2", "artist": "B"}}, ts=900.0)
+    assert d["total_minutes"] == 15.0
+    assert d["by_artist"]["A"] == 10.0
+    assert d["by_artist"]["B"] == 5.0
+    assert set(d["distinct"]) == {"t1", "t2"}
+    # total_minutes is trendable
+    t = history.read_trend([{"date": "2026-06-26", "doc": d}], "playback", "total_minutes")
+    assert t["current"] == 15.0
+
+
+def test_tally_caps_top_n():
+    d = None
+    # 40 distinct artists each 1min -> by_artist capped to 30
+    for i in range(41):
+        d = history.record_daily(d, "playback",
+                                 {"now_playing": {"playback_state": "playing", "title": f"t{i}", "artist": f"a{i}"}},
+                                 ts=float(i * 60))
+    assert len(d["by_artist"]) <= 30
+
+
 def test_read_trend_numeric_dist_baseline_and_delta():
     # 3 baseline days avg ~58, current day avg 70 -> up
     rows = [

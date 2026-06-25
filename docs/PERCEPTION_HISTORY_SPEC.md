@@ -102,10 +102,11 @@
 | `focus` | 分类时长 | 当天处于专注模式分钟数 |
 | `audio_route` | 分类时长 | 当天各输出(耳机/车机)时长 |
 | `reminders` | 事件列表 | 当天到期/完成的待办(按 id 去重) |
-| `now_playing` | 分类时长(可选) | 当天听歌时长 |
+| `now_playing` | **每日 digest**(tally) | 当天听歌总时长 + top artists/tracks(按分钟,写时 top-30 封顶)+ distinct 曲目数 |
 
-**不历史化**(纯瞬时、无当日模式意义):电量 %、charging、broadcast 开关态、time、
-locale/timezone、now_playing 的曲目身份(听歌时长留、具体哪首不留)。
+> `now_playing` 记口味随时间的演变(top artist/曲),不是每首播放的流水;时长用相邻样本时间差累加给上一首正在播的曲/artist。
+
+**不历史化**(纯瞬时、无当日模式意义):电量 %、charging、broadcast 开关态、time、locale/timezone。
 
 ---
 

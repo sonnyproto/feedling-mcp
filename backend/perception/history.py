@@ -27,6 +27,9 @@ DURATION_BY_STATE = "duration_by_state"  # minutes spent in each categorical sta
 EVENT_LIST = "event_list"            # discrete items, deduped by id/key
 SUBJECTIVE = "subjective"            # append each self-report entry
 PLACE_DWELL = "place_dwell"          # minutes spent at each place label
+TALLY = "tally"                      # daily digest: total minutes + top artists/tracks
+
+_TALLY_CAP = 30                      # keep only the top-N artists/tracks per day
 
 # Signal (canonical catalog input key) -> shape. ONE line per signal; fields are
 # discovered from the observation. Signals absent here are NOT historized
@@ -44,6 +47,7 @@ SHAPE: dict[str, str] = {
     "focus": DURATION_BY_STATE,
     "audio_route": DURATION_BY_STATE,
     "location_signal": PLACE_DWELL,
+    "playback": TALLY,
     "health_workout": EVENT_LIST,
     "calendar_next_event": EVENT_LIST,
     "reminders": EVENT_LIST,
@@ -192,6 +196,47 @@ def _merge_event_list(doc: dict, values: Mapping, **_) -> dict:
     return out
 
 
+def _cap_top(d: dict, n: int = _TALLY_CAP) -> dict:
+    if len(d) <= n:
+        return d
+    return dict(sorted(d.items(), key=lambda kv: kv[1], reverse=True)[:n])
+
+
+def _merge_tally(doc: dict, values: Mapping, *, ts: float | None = None, **_) -> dict:
+    """now_playing daily music digest: credit each listening interval (between
+    observations, while playing) to the previously-playing track + artist; track
+    distinct titles. Stores total_minutes + by_artist/by_track minutes (top-N) +
+    distinct titles — taste over time, not a per-play stream."""
+    out = dict(doc)
+    np = values.get("now_playing")
+    np = np if isinstance(np, Mapping) else {}
+    playing = str(np.get("playback_state") or "").lower() == "playing"
+    title = np.get("title")
+    artist = np.get("artist")
+    last_ts = out.get("_last_ts")
+    if out.get("_last_playing") and last_ts is not None and ts is not None and ts >= last_ts:
+        mins = round((ts - last_ts) / 60.0, 2)
+        out["total_minutes"] = round((out.get("total_minutes") or 0.0) + mins, 2)
+        la, lt = out.get("_last_artist"), out.get("_last_track")
+        if la:
+            by_a = dict(out.get("by_artist") or {})
+            by_a[la] = round((by_a.get(la) or 0.0) + mins, 2)
+            out["by_artist"] = _cap_top(by_a)
+        if lt:
+            by_t = dict(out.get("by_track") or {})
+            by_t[lt] = round((by_t.get(lt) or 0.0) + mins, 2)
+            out["by_track"] = _cap_top(by_t)
+    if playing and title:
+        distinct = set(out.get("distinct") or [])
+        distinct.add(title)
+        out["distinct"] = sorted(distinct)[:200]
+    out["_last_ts"] = ts
+    out["_last_playing"] = playing
+    out["_last_track"] = title if playing else None
+    out["_last_artist"] = artist if playing else None
+    return out
+
+
 def _merge_subjective(doc: dict, values: Mapping, *, ts: float | None = None, **_) -> dict:
     out = dict(doc)
     entries = list(out.get("entries") or [])
@@ -212,6 +257,7 @@ _MERGERS = {
     PLACE_DWELL: _merge_place_dwell,
     EVENT_LIST: _merge_event_list,
     SUBJECTIVE: _merge_subjective,
+    TALLY: _merge_tally,
 }
 
 
@@ -246,6 +292,8 @@ def _series_value(doc: Mapping, shape: str, field: str | None) -> float | None:
     if shape == MAIN_OF_DAY:
         v = doc.get(field) if field else None
         return _numeric(v)
+    if shape == TALLY:                          # e.g. field=total_minutes
+        return _numeric(doc.get(field)) if field else None
     return None
 
 

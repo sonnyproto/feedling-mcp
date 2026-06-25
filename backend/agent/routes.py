@@ -235,6 +235,8 @@ _HISTORY_SIGNAL_TO_CATALOG: dict[str, str] = {
     "focus": "focus",
     "audio_route": "audio_route",
     "reminders": "reminders",
+    "now_playing": "playback",
+    "music": "playback",
 }
 
 
