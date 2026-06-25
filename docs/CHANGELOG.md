@@ -47,6 +47,17 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-06-25
+
+### [DONE] 即时感知收口：focus/audio_route 可 pull + place_label/气温口径校正 + spec 校准
+- **focus + audio_route 暴露给 agent pull**：发现这俩被 iOS 采集、后端也接收存储，但 `/v1/agent/perception` 的 `_SIGNAL_FIELDS` 漏了它们 → agent 实际拉不到（spec 却把它们列为 pull-only "agent 自己拉"）。补：后端 `_SIGNAL_FIELDS` + `_SIGNAL_PERMISSION_KEYS` 加 focus/audio_route（不入默认快档）、`tools/io_cli.py` 加 `EXTRA_SIGNALS`、OpenClaw `feedling-io-tools` 插件 SIGNALS 9→11 + 重启 gateway。**12 个文档信号现在全可 pull**（io_cli `b7a7e3d` / 后端 `e49b6da` 已部署 test；插件改动仅在 VPS）。
+- **`place_label` 回退 `outdoor` → `unknown_place`**：`outdoor` 误导（用户没配 geofence 时在家也报 outdoor，像"在户外"）。它真实含义是"有定位但不在任何已命名地点"。iOS resolver + 后端 `resolve.py` + spec 同步;`unknown`（无 fix）保留。**未推**（与下条一起，待用户 push）。
+- **气温 `temperature_bucket`(5℃ 桶) → `temperature`(精确摄氏度)**：产品决定——5℃ 桶无价值，天气敏感度低、weather 是 pull-only 不参与 changed，精确值无额外代价。iOS WeatherValues + 后端 catalog/resolve/routes/tool_executor + 5 个测试文件 + spec 同步。**未推**。
+- **删除过时 spec**：`Specs/perception-report-fields.md`（2026-06-08 预 V2 版，声称原样上报精确坐标/BSSID/地址，与部署的 V2 加密粗化口径冲突）已删，统一以 `perception-data-and-reporting.md` 为准。
+- **本轮 spec 校准**（`perception-data-and-reporting.md`）：修"12 个 key"→14（13 信号 + unsupported，对齐 `EXPECTED_REPORT_KEYS_V2`）；§3.8 日历事件时间标注为**设备本地时区**（ISO8601 带偏移）；§3.4/§3.5/§6/§1.1 同步 unknown_place + 精确气温口径。其余逐字段核过与代码一致。
+- 日历加回参会人/组织者、天气加降水预报/体感、HealthKit 加心情(State of Mind)/活动三环/HRV 等**新增**字段 → 用户决定**交给 iOS 工程师**实现，不在本轮 scope。
+- 待推 bundle（用户统一 push）：iOS `cf8ece5`(outdoor)/`96540fa`(temp)/本轮 spec 校准；后端 `7bc2218`(outdoor)/`1d4b717`(temp)。
+
 ## 2026-06-23
 
 ### [DONE] resident agent 原生感知端到端跑通（io_cli + OpenClaw 插件）+ config 去硬编码
