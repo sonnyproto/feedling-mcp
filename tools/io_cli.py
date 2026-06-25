@@ -31,7 +31,10 @@ import urllib.request
 
 FAST_SIGNALS = ("now", "location", "weather", "motion", "calendar")
 SLOW_SIGNALS = ("steps", "sleep", "workout", "vitals")
-PERCEPTION_SIGNALS = FAST_SIGNALS + SLOW_SIGNALS
+# pull-only context signals (focus = are-you-in-a-focus-mode, audio_route =
+# headphones/car). Valid + pullable, but kept out of the default fast set.
+EXTRA_SIGNALS = ("focus", "audio_route")
+PERCEPTION_SIGNALS = FAST_SIGNALS + SLOW_SIGNALS + EXTRA_SIGNALS
 
 PHASE2_VERBS = ("send", "wait-for-wake", "schedule-wake", "photo")
 
