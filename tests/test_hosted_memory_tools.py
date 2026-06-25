@@ -10,6 +10,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from model_api_runtime import memory_tools  # noqa: E402
 
 
+def test_memory_tool_instruction_includes_v1_context_framing():
+    prompt = memory_tools.memory_tool_instruction_message()["content"]
+    assert "Memory context framing" in prompt
+    assert "Ambient memories are background color" in prompt
+
+
 def test_memory_index_tool_calls_readside_core_and_records_trace(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_tools")
     trace: dict = {}
@@ -42,6 +48,29 @@ def test_memory_index_tool_calls_readside_core_and_records_trace(monkeypatch):
     assert trace["user_card_count"] == 12
     assert trace["tool_calls"][0]["name"] == "memory_index"
     assert trace["tool_calls"][0]["item_count"] == 1
+
+
+def test_memory_index_tool_passes_bucket_thread_filters(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_tools")
+    captured = {}
+
+    def fake_index(store_arg, api_key, payload):
+        captured["payload"] = dict(payload)
+        return {"items": [], "limit": 1000, "user_card_count": 0}
+
+    monkeypatch.setattr(memory_tools.memory_readside_core, "memory_index_core", fake_index)
+
+    result = memory_tools.execute_memory_tool(
+        store,
+        "key_tools",
+        "memory_index",
+        {"query": "蛋子", "bucket": "宠物", "thread": "蛋子"},
+        trace={},
+    )
+
+    assert result["ok"] is True
+    assert captured["payload"]["bucket"] == "宠物"
+    assert captured["payload"]["thread"] == "蛋子"
 
 
 def test_memory_fetch_tool_caps_dedupes_and_records_trace(monkeypatch):

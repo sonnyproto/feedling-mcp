@@ -86,10 +86,10 @@ def test_index_core_prefilters_sorts_caps_and_reports_card_count(monkeypatch):
     assert captured["operation"] == "index"
     assert captured["payload"]["include_sensitive"] is False
     assert len(captured["ids"]) == 50
-    assert captured["ids"][:2] == ["open_old", "high_new"]
+    assert captured["ids"][:2] == ["high_new", "open_old"]
     assert body["user_card_count"] == 62
     assert body["limit"] == 50
-    assert body["items"][0]["id"] == "open_old"
+    assert body["items"][0]["id"] == "high_new"
     assert "local" not in captured["ids"]
     assert "no_enclave" not in captured["ids"]
     assert "archived" not in captured["ids"]
@@ -98,7 +98,7 @@ def test_index_core_prefilters_sorts_caps_and_reports_card_count(monkeypatch):
     assert "other_user" not in captured["ids"]
 
 
-def test_index_core_uses_configured_recall_window_above_default_50(monkeypatch):
+def test_index_core_ignores_old_recall_window_env_and_returns_full_light_index(monkeypatch):
     monkeypatch.setenv("FEEDLING_MEMORY_READSIDE_LIMIT", "120")
     monkeypatch.delenv("FEEDLING_MEMORY_READSIDE_HARD_MAX", raising=False)
     store = types.SimpleNamespace(user_id="usr_core")
@@ -115,11 +115,11 @@ def test_index_core_uses_configured_recall_window_above_default_50(monkeypatch):
 
     body = readside_core.memory_index_core(store, "key_core", {})
 
-    assert len(captured["ids"]) == 120
-    assert captured["payload"]["limit"] == 120
-    assert body["limit"] == 120
+    assert len(captured["ids"]) == 130
+    assert captured["payload"]["limit"] == 1000
+    assert body["limit"] == 1000
     assert body["user_card_count"] == 130
-    assert body["truncated"] is True
+    assert body["truncated"] is False
 
 
 def test_index_core_limit_zero_opens_window_but_keeps_eligibility_and_sort(monkeypatch):
@@ -135,6 +135,7 @@ def test_index_core_limit_zero_opens_window_but_keeps_eligibility_and_sort(monke
         _moment("archived", archived=True),
     ]
     monkeypatch.setattr(readside_core.memory_service, "_load_moments", lambda _store: moments)
+    monkeypatch.setattr(readside_core.memory_service, "_save_moments", lambda _store, _moments: None)
     captured = {}
 
     def fake_enclave(api_key, candidates, *, operation, payload=None):
@@ -146,7 +147,7 @@ def test_index_core_limit_zero_opens_window_but_keeps_eligibility_and_sort(monke
 
     body = readside_core.memory_index_core(store, "key_core", {"query": "猫"})
 
-    assert captured["ids"] == ["open_thread", "high_new", "low_old"]
+    assert captured["ids"] == ["high_new", "open_thread", "low_old"]
     assert captured["payload"]["query"] == "猫"
     assert captured["payload"]["limit"] == 1000
     assert body["limit"] == 1000
@@ -178,7 +179,7 @@ def test_index_core_hard_max_caps_full_open_window(monkeypatch):
     assert body["truncated"] is True
 
 
-def test_index_core_negative_env_limit_falls_back_to_default_not_full_open(monkeypatch):
+def test_index_core_negative_env_limit_is_ignored_by_v1_full_index(monkeypatch):
     monkeypatch.setenv("FEEDLING_MEMORY_READSIDE_LIMIT", "-1")
     store = types.SimpleNamespace(user_id="usr_core")
     moments = [_moment(f"card_{idx:03d}") for idx in range(70)]
@@ -194,9 +195,9 @@ def test_index_core_negative_env_limit_falls_back_to_default_not_full_open(monke
 
     body = readside_core.memory_index_core(store, "key_core", {})
 
-    assert len(captured["ids"]) == 50
-    assert captured["payload"]["limit"] == 50
-    assert body["limit"] == 50
+    assert len(captured["ids"]) == 70
+    assert captured["payload"]["limit"] == 1000
+    assert body["limit"] == 1000
 
 
 def test_fetch_core_splits_missing_unavailable_and_preserves_order(monkeypatch):
@@ -210,6 +211,7 @@ def test_fetch_core_splits_missing_unavailable_and_preserves_order(monkeypatch):
         _moment("other_user", owner="usr_other"),
     ]
     monkeypatch.setattr(readside_core.memory_service, "_load_moments", lambda _store: moments)
+    monkeypatch.setattr(readside_core.memory_service, "_save_moments", lambda _store, _moments: None)
     captured = {}
 
     def fake_enclave(api_key, candidates, *, operation, payload=None):

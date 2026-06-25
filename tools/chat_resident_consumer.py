@@ -2568,6 +2568,14 @@ def _job_origin_refs(job: dict) -> list[str]:
 def _normalize_v2_action_type(action: dict) -> dict:
     out = dict(action or {})
     typ = _proactive_action_type(out)
+    if typ in {"memory.create", "memory.add_correction"}:
+        out["type"] = "memory.add"
+        return out
+    if typ in {"memory.patch", "memory.content_patch"}:
+        out["type"] = "memory.supersede"
+        if not out.get("supersedes"):
+            out["supersedes"] = out.get("memory_id") or out.get("id") or out.get("target_id") or ""
+        return out
     if typ.startswith("proactive."):
         out["type"] = typ.removeprefix("proactive.")
     elif typ and not out.get("type"):

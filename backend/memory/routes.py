@@ -176,6 +176,59 @@ def memory_fetch():
     return jsonify(response)
 
 
+def _terms_from_memory_items(items: list[dict]) -> tuple[list[str], list[str]]:
+    buckets: list[str] = []
+    threads: list[str] = []
+
+    def add_unique(target: list[str], value) -> None:
+        text = str(value or "").strip()[:120]
+        if text and text not in target:
+            target.append(text)
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("status") or "active").strip().lower() != "active":
+            continue
+        add_unique(buckets, item.get("bucket"))
+        for thread in item.get("threads") or []:
+            add_unique(threads, thread)
+    return sorted(buckets), sorted(threads)
+
+
+def _memory_existing_terms(store: UserStore, api_key: str | None) -> tuple[list[str], list[str]]:
+    try:
+        response = memory_readside_core.memory_index_core(
+            store,
+            api_key,
+            {"limit": 0},
+            post_enclave=_memory_readside_post_enclave,
+        )
+        items = response.get("items") if isinstance(response.get("items"), list) else []
+        buckets, threads = _terms_from_memory_items(items)
+        if buckets or threads:
+            return buckets, threads
+    except Exception:
+        pass
+    return _terms_from_memory_items(memory_service._load_moments(store))
+
+
+@bp.route("/v1/memory/buckets", methods=["GET"])
+def memory_buckets():
+    store = auth.require_user()
+    api_key = auth._extract_api_key()
+    buckets, _threads = _memory_existing_terms(store, api_key)
+    return jsonify({"buckets": buckets})
+
+
+@bp.route("/v1/memory/threads", methods=["GET"])
+def memory_threads():
+    store = auth.require_user()
+    api_key = auth._extract_api_key()
+    _buckets, threads = _memory_existing_terms(store, api_key)
+    return jsonify({"threads": threads})
+
+
 @bp.route("/v1/memory/actions", methods=["POST"])
 def memory_actions():
     store = auth.require_user()

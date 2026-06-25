@@ -263,6 +263,7 @@ def _model_api_plan_state_actions(
 ) -> dict:
     pending_items = _state_pending_items(store)
     memory_candidates = _model_api_state_memory_candidates(store, api_key, message, context_refs)
+    memory_terms = _model_api_existing_memory_terms(store, api_key)
     raw_actions: list[dict] = []
     runtime_error = ""
     parsed: dict = {}
@@ -275,6 +276,7 @@ def _model_api_plan_state_actions(
                 memory_candidates=memory_candidates,
                 context_refs=context_refs,
                 pending_items=pending_items,
+                memory_terms=memory_terms,
             ),
             max_tokens=900,
             temperature=0.0,
@@ -896,6 +898,28 @@ def _model_api_capture_prompt(user_message: str, assistant_reply: str, context_p
     )
 
 
+def _model_api_existing_memory_terms(store: UserStore, api_key: str | None) -> dict[str, list[str]]:
+    try:
+        from memory import routes as memory_routes
+        buckets, threads = memory_routes._memory_existing_terms(store, api_key)
+    except Exception:
+        buckets, threads = [], []
+    return {
+        "buckets": [str(item) for item in buckets[:80] if str(item or "").strip()],
+        "threads": [str(item) for item in threads[:80] if str(item or "").strip()],
+    }
+
+
+def _model_api_context_with_memory_terms(
+    store: UserStore,
+    api_key: str | None,
+    context_payload: dict,
+) -> dict:
+    out = dict(context_payload or {})
+    out.setdefault("existing_memory_terms", _model_api_existing_memory_terms(store, api_key))
+    return out
+
+
 def _model_api_run_memory_capture(
     store: UserStore,
     api_key: str | None,
@@ -928,9 +952,10 @@ def _model_api_run_memory_capture(
     if os.environ.get("FEEDLING_MODEL_API_MEMORY_CAPTURE", "1").strip().lower() in {"0", "false", "off", "no"}:
         return finish({"status": "skipped", "error": "disabled"})
     try:
+        capture_context = _model_api_context_with_memory_terms(store, api_key, context_payload)
         result = provider_client.chat_completion(
             runtime,
-            _model_api_capture_prompt(user_message, assistant_reply, context_payload),
+            _model_api_capture_prompt(user_message, assistant_reply, capture_context),
             max_tokens=900,
             temperature=0.1,
             timeout=30.0,
@@ -944,27 +969,28 @@ def _model_api_run_memory_capture(
         for item in memories[:4]:
             if not isinstance(item, dict):
                 continue
-            mem_type = str(item.get("type") or "fact").strip().lower()
-            if mem_type not in {"fact", "event", "quote", "moment"}:
+            summary = memory_actions_mod._memory_action_text(
+                item.get("summary") or item.get("title") or item.get("description"),
+                180,
+            )
+            content = str(item.get("content") or item.get("description") or summary).strip()[:2000]
+            if len(summary) < 4 or not content:
                 continue
-            title = memory_actions_mod._memory_action_text(item.get("title"), 180)
-            description = str(item.get("description") or "").strip()[:1200]
-            if len(title) < 4 or (not description and mem_type != "quote"):
-                continue
-            key = title.lower()
+            key = summary.lower()
             if key in seen_titles:
                 continue
             seen_titles.add(key)
             actions.append({
                 "type": "memory.add",
                 "memory": {
-                    "type": mem_type,
-                    "title": title,
-                    "description": description,
+                    "summary": summary,
+                    "content": content,
+                    "bucket": memory_actions_mod._memory_action_text(item.get("bucket") or "未分类", 120),
+                    "threads": item.get("threads") if isinstance(item.get("threads"), list) else [],
+                    "importance": item.get("importance", 0.5),
+                    "pulse": item.get("pulse", 0.3),
                     "occurred_at": memory_actions_mod._memory_action_text(item.get("occurred_at") or date.today().isoformat(), 80),
-                    "source": "model_api_capture",
-                    "her_quote": str(item.get("her_quote") or "").strip()[:1000],
-                    "context": str(item.get("context") or "").strip()[:1000],
+                    "source": str(item.get("source") or "model_api_capture")[:80],
                 },
                 "reason": "Captured from recent chat.",
                 "capture_mode": "running",

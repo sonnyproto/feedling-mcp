@@ -38,6 +38,7 @@
 | `content` | 内容 | 一段事件正文(MD:记忆 / 上下文 / 使用提示);fetch 才返回,index 不返回 |
 
 **排序(读时算)**:`decay = clamp((now - last_referenced_at)/half_life, 0,1)`;综合 ≈ `相关性 × importance × (1-decay)`。half_life 初值:relationship-ish 30d / fact-ish 90d;`importance≥0.8 → half_life×2`。`pulse` 不参与排序。
+**实现备注**:v1 把 `bucket/threads` 放在密文 inner,所以 backend 在解密前无法判断 relationship-ish/fact-ish。当前实现先用 envelope 可见字段版 decay:默认 90d,`importance≥0.8` → 180d;等未来有安全的明文类别或 enclave 内排序,再恢复 relationship-ish 30d。
 `last_referenced_at` **只在**:fetch 后真进 prompt / recall 真注入 / agent 明确用它答 —— 才更新(**扫目录不算**)。
 
 ---

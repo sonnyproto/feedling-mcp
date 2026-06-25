@@ -510,10 +510,12 @@ def _string_list(value: Any) -> list[str]:
 
 
 def _memory_index_item(memory: Mapping[str, Any]) -> dict[str, Any]:
+    title = str(memory.get("title") or memory.get("summary") or memory.get("bucket") or "")[:160]
+    mem_type = str(memory.get("type") or memory.get("bucket") or "memory")[:80]
     return {
         "id": str(memory.get("id") or ""),
-        "type": str(memory.get("type") or "")[:80],
-        "title": str(memory.get("title") or "")[:160],
+        "type": mem_type,
+        "title": title,
         "occurred_at": str(memory.get("occurred_at") or ""),
         "updated_at": str(memory.get("updated_at") or ""),
         "is_archived": bool(memory.get("is_archived")),

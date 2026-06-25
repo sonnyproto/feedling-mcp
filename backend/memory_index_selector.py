@@ -116,7 +116,12 @@ def index_item_to_relevance_memory(item: dict) -> dict:
     """Adapt a MemoryIndexItem into the legacy relevance scorer shape."""
 
     bucket_refs = item.get("bucket_refs") if isinstance(item.get("bucket_refs"), list) else []
-    buckets = " ".join(_text(bucket, 80) for bucket in bucket_refs)
+    v1_terms: list[str] = []
+    if item.get("bucket"):
+        v1_terms.append(_text(item.get("bucket"), 80))
+    if isinstance(item.get("threads"), list):
+        v1_terms.extend(_text(thread, 80) for thread in item.get("threads") or [])
+    buckets = " ".join([_text(bucket, 80) for bucket in bucket_refs] + v1_terms)
     summary = _text(item.get("summary"), 500)
     return {
         "id": _text(item.get("id"), 120),
@@ -158,6 +163,8 @@ def _topic_match(query: str, item: dict) -> bool:
     haystack = " ".join([
         str(item.get("summary") or "").lower(),
         " ".join(str(bucket or "").lower() for bucket in (item.get("bucket_refs") or [])),
+        str(item.get("bucket") or "").lower(),
+        " ".join(str(thread or "").lower() for thread in (item.get("threads") or [])),
     ])
     for token in re.findall(r"[a-z0-9_]{3,}", query_text):
         if token in GENERIC_TOPIC_TOKENS:

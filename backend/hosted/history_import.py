@@ -1753,6 +1753,48 @@ def _candidate_memory_type(candidate: dict) -> str:
     return "event"
 
 
+def _candidate_bucket(candidate: dict) -> str:
+    subject = str(candidate.get("subject") or "")
+    ctype = str(candidate.get("candidate_type") or "")
+    if subject == "ai" or ctype == "ai_character":
+        return "AI 角色"
+    if subject == "relationship" or ctype in {"relationship_event", "conflict_repair", "emotional_pattern"}:
+        return "我们的关系"
+    if ctype in {"preference", "boundary", "communication_style"}:
+        return "偏好与边界"
+    return "用户画像"
+
+
+def _candidate_threads(candidate: dict) -> list[str]:
+    values = [
+        str(candidate.get("title") or "").strip(),
+        str(candidate.get("candidate_type") or "").strip(),
+        str(candidate.get("subject") or "").strip(),
+    ]
+    out: list[str] = []
+    for value in values:
+        if value and value not in out:
+            out.append(value[:80])
+    return out[:4]
+
+
+def _memory_card_summary(card: dict) -> str:
+    return str(card.get("summary") or card.get("description") or card.get("content") or card.get("title") or "").strip()
+
+
+def _memory_card_content(card: dict) -> str:
+    content = str(card.get("content") or "").strip()
+    if content:
+        return content
+    desc = str(card.get("description") or card.get("summary") or card.get("title") or "").strip()
+    quote = str(card.get("her_quote") or card.get("quote") or card.get("context") or "").strip()
+    return "\n".join([
+        f"记忆: {desc}",
+        f"上下文: {quote or '来自导入材料。'}",
+        "使用提示: 自然使用这条记忆，不要机械复述。",
+    ])
+
+
 def _candidate_title(candidate: dict, mem_type: str, language: str) -> str:
     title = str(candidate.get("title") or "").strip()
     if title and not _GENERIC_IMPORT_TITLE_RE.match(title):
@@ -1808,20 +1850,28 @@ def _render_candidates_to_memory_cards(
         occurred = str(c.get("first_seen_at") or "").strip()
         if not identity_service._parse_iso_calendar_date(occurred):
             occurred = relationship_start.isoformat()
-        body = {
-            "type": mem_type,
-            "title": _candidate_title(c, mem_type, language),
-            "description": str(c.get("summary") or "")[:1200],
-            "occurred_at": occurred,
-            "context": (
-                f"distilled from {len(c.get('chunk_ids') or [])} source window(s); "
-                f"sources={','.join(str(s) for s in (c.get('source_families') or []))}; "
-                f"score={float(c.get('score') or _candidate_score(c)):.1f}"
-            ),
-        }
+        summary = str(c.get("summary") or "")[:1200]
+        context = (
+            f"distilled from {len(c.get('chunk_ids') or [])} source window(s); "
+            f"sources={','.join(str(s) for s in (c.get('source_families') or []))}; "
+            f"score={float(c.get('score') or _candidate_score(c)):.1f}"
+        )
         quotes = c.get("evidence_quotes") or []
-        if quotes:
-            body["her_quote"] = str(quotes[0])[:500]
+        quote = str(quotes[0])[:500] if quotes else ""
+        body = {
+            "summary": summary[:500],
+            "content": "\n".join([
+                f"记忆: {summary}",
+                f"上下文: {quote or context}",
+                "使用提示: 自然使用这条记忆，不要机械复述。",
+            ]),
+            "bucket": _candidate_bucket(c),
+            "threads": _candidate_threads(c),
+            "importance": max(0.1, min(1.0, float(c.get("confidence") or 0.55))),
+            "pulse": 0.7 if "emotional_peak" in set(str(s) for s in (c.get("importance_signals") or [])) else 0.3,
+            "occurred_at": occurred,
+            "source": "history_import",
+        }
         cards.append(body)
 
     for tab in ("story", "about_me", "ta_thinking"):
@@ -2057,7 +2107,7 @@ def _coerce_memory_cards(raw, relationship_start: date) -> list[dict]:
         if mem_type not in allowed:
             mem_type = "fact"
         title = str(item.get("title") or "").strip()[:120]
-        desc = str(item.get("description") or item.get("content") or "").strip()[:1200]
+        desc = str(item.get("description") or item.get("content") or item.get("summary") or "").strip()[:1200]
         if not desc:
             continue
         if not title:
@@ -2072,15 +2122,19 @@ def _coerce_memory_cards(raw, relationship_start: date) -> list[dict]:
         if not identity_service._parse_iso_calendar_date(occurred):
             occurred = relationship_start.isoformat()
         card = {
-            "type": mem_type,
-            "title": title,
-            "description": desc,
+            "summary": title or desc[:120],
+            "content": "\n".join([
+                f"记忆: {desc}",
+                f"上下文: {quote[:500] or context[:600] or '来自导入材料。'}",
+                "使用提示: 自然使用这条记忆，不要机械复述。",
+            ]),
+            "bucket": "我们的关系" if mem_type in {"moment", "quote"} else "用户画像",
+            "threads": [title[:80]] if title else [],
+            "importance": 0.55,
+            "pulse": 0.3,
             "occurred_at": occurred,
+            "source": "history_import",
         }
-        if quote:
-            card["her_quote"] = quote[:500]
-        if context:
-            card["context"] = context[:600]
         cards.append(card)
     return cards
 
@@ -2090,9 +2144,9 @@ def _dedupe_memory_cards(cards: list[dict]) -> list[dict]:
     seen: set[str] = set()
     seen_text: set[str] = set()
     for card in cards:
-        title = str(card.get("title") or "")
-        desc = str(card.get("description") or "")
-        mem_type = str(card.get("type") or "")
+        title = str(card.get("summary") or card.get("title") or "")
+        desc = _memory_card_content(card)
+        mem_type = str(card.get("bucket") or card.get("type") or "")
         if _looks_like_low_value_import_card(title, desc, mem_type):
             continue
         key = re.sub(
@@ -2344,11 +2398,9 @@ def _extract_memory_cards_with_provider(
 def _memory_counts_for_cards(cards: list[dict]) -> dict:
     counts = {"story": 0, "about_me": 0, "ta_thinking": 0, "total": 0}
     for card in cards:
-        t = str(card.get("type") or "")
-        tab = memory_service.TAB_FOR_TYPE.get(t)
         counts["total"] += 1
-        if tab:
-            counts[tab] += 1
+        counts["story"] += 1
+        counts["about_me"] += 1
     return counts
 
 
@@ -2403,9 +2455,9 @@ def _ensure_import_minimum_cards(
 
 def _card_dedupe_key(card: dict) -> str:
     return "|".join([
-        str(card.get("type") or ""),
-        _normalize_card_similarity_text(card.get("title") or ""),
-        _normalize_card_similarity_text(card.get("description") or ""),
+        str(card.get("bucket") or ""),
+        _normalize_card_similarity_text(card.get("summary") or card.get("title") or ""),
+        _normalize_card_similarity_text(_memory_card_content(card)),
     ])
 
 
@@ -2426,9 +2478,9 @@ def _moment_from_memory_card(store: UserStore, card: dict, envelope: dict) -> di
     moment = {
         "v": 1,
         "id": envelope.get("id") or f"mom_{uuid.uuid4().hex[:12]}",
-        "type": str(card.get("type") or "fact"),
         "occurred_at": str(card.get("occurred_at") or now),
         "created_at": now,
+        "updated_at": now,
         "source": "history_import",
         "body_ct": envelope["body_ct"],
         "nonce": envelope["nonce"],
@@ -2436,6 +2488,10 @@ def _moment_from_memory_card(store: UserStore, card: dict, envelope: dict) -> di
         "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
         "visibility": envelope["visibility"],
         "owner_user_id": envelope["owner_user_id"],
+        "status": "active",
+        "importance": max(0.0, min(1.0, float(card.get("importance") or 0.55))),
+        "pulse": max(0.0, min(1.0, float(card.get("pulse") or 0.3))),
+        "last_referenced_at": str(card.get("occurred_at") or now),
     }
     if envelope.get("K_enclave"):
         moment["K_enclave"] = envelope["K_enclave"]
@@ -2446,25 +2502,22 @@ def _append_import_memory_cards(store: UserStore, cards: list[dict]) -> list[dic
     moments = memory_service._load_moments(store)
     created: list[dict] = []
     for card in _sort_memory_cards_newest_first(cards):
-        mem_type = str(card.get("type") or "")
-        if mem_type not in memory_service.MEMORY_TYPES:
+        summary = str(card.get("summary") or "").strip()[:500]
+        content = _memory_card_content(card)[:5000]
+        if not summary or not content:
             continue
         body = {
-            "title": str(card.get("title") or "")[:120],
-            "description": str(card.get("description") or "")[:1200],
-            "type": mem_type,
+            "summary": summary,
+            "content": content,
+            "bucket": str(card.get("bucket") or "未分类")[:80],
+            "threads": [str(item).strip()[:80] for item in (card.get("threads") or []) if str(item or "").strip()][:8],
         }
-        for key in ("her_quote", "context", "linked_dimension"):
-            value = str(card.get(key) or "").strip()
-            if value:
-                body[key] = value[:800]
         envelope, err = core_envelope._build_shared_envelope_for_store(
             store,
             json.dumps(body, ensure_ascii=False).encode("utf-8"),
         )
         if envelope is None:
             raise RuntimeError(f"memory_envelope_failed:{err}")
-        envelope["type"] = mem_type
         envelope["occurred_at"] = str(card.get("occurred_at") or date.today().isoformat())
         envelope["source"] = "history_import"
         moments.append(_moment_from_memory_card(store, card, envelope))

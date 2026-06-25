@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 import httpx
@@ -10,11 +11,8 @@ import httpx
 from memory import service as memory_service
 
 
-MEMORY_READSIDE_DEFAULT_LIMIT = 50
+MEMORY_READSIDE_DEFAULT_LIMIT = 0
 MEMORY_READSIDE_DEFAULT_HARD_MAX = 1000
-# Backward-compatible default value. Do not use this as the effective cap for
-# recall windows; use effective_readside_limit() so env overrides and the
-# "0 = full window up to HARD_MAX" sentinel are respected.
 MEMORY_READSIDE_LIMIT = MEMORY_READSIDE_DEFAULT_LIMIT
 MEMORY_FETCH_TOOL_LIMIT = 5
 MEMORY_FETCH_LOOP_LIMIT = 8
@@ -51,11 +49,46 @@ def _float(value: Any, default: float = 0.0) -> float:
 
 
 def _time_key(moment: dict) -> str:
-    for key in ("last_active", "updated_at", "occurred_at", "created_at"):
+    for key in ("last_referenced_at", "last_active", "updated_at", "occurred_at", "created_at"):
         value = str(moment.get(key) or "").strip()
         if value:
             return value
     return ""
+
+
+def _time_ts(moment: dict) -> float:
+    value = _time_key(moment)
+    if not value:
+        return 0.0
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except Exception:
+        return 0.0
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _now_ts() -> float:
+    return datetime.now(timezone.utc).timestamp()
+
+
+def _decay_multiplier(moment: dict) -> float:
+    importance = _float(moment.get("importance"), 0.5)
+    if not _time_key(moment):
+        return 1.0
+    last_ref_ts = _time_ts(moment)
+    age_days = max(0.0, (_now_ts() - last_ref_ts) / 86400.0)
+    # Backend cannot see encrypted bucket, so v1 uses the fact-ish default here.
+    # Relationship-specific half-life can be revisited if a safe plaintext class
+    # is introduced later.
+    half_life = 180.0 if importance >= 0.8 else 90.0
+    decay = max(0.0, min(1.0, age_days / half_life))
+    return 1.0 - decay
 
 
 def memory_available(
@@ -86,10 +119,16 @@ def memory_available(
 
 
 def memory_score(moment: dict) -> float:
-    salience_score = _SALIENCE_WEIGHT.get(_salience(moment), 2)
     importance = _float(moment.get("importance"), 0.5)
-    open_bonus = 1.0 if moment.get("is_open_thread") is True else 0.0
-    return round(open_bonus + salience_score + importance, 4)
+    open_bonus = 0.1 if moment.get("is_open_thread") is True else 0.0
+    return round(open_bonus + importance * _decay_multiplier(moment), 4)
+
+
+def ambient_score(moment: dict) -> float:
+    importance = _float(moment.get("importance"), 0.5)
+    pulse = _float(moment.get("pulse"), 0.3)
+    # Recency is a tie-breaker; importance * pulse is the actual ambient weight.
+    return round(importance * pulse, 6)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -108,24 +147,17 @@ def readside_hard_max() -> int:
 
 
 def configured_readside_limit() -> int:
-    limit = _env_int("FEEDLING_MEMORY_READSIDE_LIMIT", MEMORY_READSIDE_DEFAULT_LIMIT)
-    return limit if limit >= 0 else MEMORY_READSIDE_DEFAULT_LIMIT
+    return MEMORY_READSIDE_DEFAULT_LIMIT
 
 
 def effective_readside_limit(value: Any | None = None) -> int:
     """Return the effective recall candidate window.
 
-    Config knobs:
-    - FEEDLING_MEMORY_READSIDE_LIMIT defaults to 50.
-    - FEEDLING_MEMORY_READSIDE_LIMIT=0 means "full recall window".
-    - FEEDLING_MEMORY_READSIDE_HARD_MAX is the safety valve; even full-window
-      mode will not decrypt/return more than this many candidate envelopes.
-
-    Important: full-window mode only disables top-N truncation. Eligibility
-    filtering, sorting, and selector behavior must stay enabled.
+    v1 defaults to a full lightweight index. HARD_MAX is a safety valve, not a
+    product recall-window knob.
     """
     if value is None or str(value).strip() == "":
-        requested = configured_readside_limit()
+        requested = 0
     else:
         try:
             requested = int(str(value).strip())
@@ -144,23 +176,36 @@ def readside_candidates(
     owner_user_id: str,
     *,
     limit: int | None = None,
+    ambient: bool = False,
+    ambient_top_n: int | None = None,
 ) -> tuple[list[dict], int]:
     candidates = [
         dict(moment, score=memory_score(moment))
         for moment in moments
         if memory_available(moment, owner_user_id)
     ]
-    candidates.sort(
-        key=lambda m: (
-            1 if m.get("is_open_thread") is True else 0,
-            _SALIENCE_WEIGHT.get(_salience(m), 2),
-            _float(m.get("importance"), 0.5),
-            _time_key(m),
-            str(m.get("id") or ""),
-        ),
-        reverse=True,
-    )
-    capped_limit = effective_readside_limit(limit)
+    if ambient:
+        candidates.sort(
+            key=lambda m: (
+                ambient_score(m),
+                _time_ts(m),
+                str(m.get("id") or ""),
+            ),
+            reverse=True,
+        )
+    else:
+        candidates.sort(
+            key=lambda m: (
+                memory_score(m),
+                _time_ts(m),
+                str(m.get("id") or ""),
+            ),
+            reverse=True,
+        )
+    capped_limit = int(ambient_top_n or 0) if ambient and ambient_top_n else effective_readside_limit(limit)
+    if capped_limit <= 0:
+        capped_limit = effective_readside_limit(limit)
+    capped_limit = min(capped_limit, readside_hard_max())
     return candidates[:capped_limit], len(candidates)
 
 
@@ -203,17 +248,29 @@ def memory_index_core(
     post_enclave: Callable[..., dict] | None = None,
 ) -> dict:
     payload = dict(payload or {})
+    ambient = _bool_payload(payload.get("ambient"))
+    ambient_top_n = None
+    if payload.get("ambient_top_n") not in (None, ""):
+        try:
+            ambient_top_n = max(1, int(str(payload.get("ambient_top_n")).strip()))
+        except (TypeError, ValueError):
+            raise ValueError("invalid ambient_top_n")
     limit = effective_readside_limit(payload.get("limit"))
     candidates, user_card_count = readside_candidates(
         memory_service._load_moments(store),
         store.user_id,
         limit=limit,
+        ambient=ambient,
+        ambient_top_n=ambient_top_n,
     )
     response = (post_enclave or post_enclave_readside)(
         api_key,
         candidates,
         operation="index",
         payload={
+            "ambient": ambient,
+            "bucket": str(payload.get("bucket") or "")[:120],
+            "thread": str(payload.get("thread") or "")[:120],
             "include_sensitive": bool(payload.get("include_sensitive", False)),
             "limit": limit,
             "query": str(payload.get("query") or "")[:500],
@@ -247,7 +304,8 @@ def memory_fetch_core(
     ids = [mid.strip() for mid in ids[:limit]]
     include_archived = _bool_payload(payload.get("include_archived"))
     include_superseded = _bool_payload(payload.get("include_superseded"))
-    by_id = {m.get("id"): m for m in memory_service._load_moments(store) if isinstance(m, dict)}
+    moments = memory_service._load_moments(store)
+    by_id = {m.get("id"): m for m in moments if isinstance(m, dict)}
     missing_ids: list[str] = []
     unavailable_ids: list[str] = []
     candidates: list[dict] = []
@@ -278,6 +336,22 @@ def memory_fetch_core(
         for item in (response.get("items") if isinstance(response.get("items"), list) else [])
         if isinstance(item, dict)
     }
+    referenced_ids = {str(mid) for mid in items_by_id.keys() if str(mid or "").strip()}
+    if referenced_ids:
+        now = _now_iso()
+        changed = False
+        updated_moments: list[dict] = []
+        for moment in moments:
+            if isinstance(moment, dict) and str(moment.get("id") or "") in referenced_ids:
+                copy = dict(moment)
+                copy["last_referenced_at"] = now
+                copy["updated_at"] = now
+                updated_moments.append(copy)
+                changed = True
+            else:
+                updated_moments.append(moment)
+        if changed:
+            memory_service._save_moments(store, updated_moments)
     return {
         "items": [items_by_id[mid] for mid in ids if mid in items_by_id],
         "missing_ids": missing_ids,

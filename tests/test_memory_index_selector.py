@@ -14,6 +14,8 @@ def _index_item(
     summary: str,
     *,
     buckets: list[str] | None = None,
+    bucket: str = "",
+    threads: list[str] | None = None,
     salience: str = "medium",
     sensitive: bool = False,
     open_thread: bool = False,
@@ -23,6 +25,8 @@ def _index_item(
         "id": mid,
         "summary": summary,
         "bucket_refs": buckets or [],
+        "bucket": bucket,
+        "threads": threads or [],
         "status": "active",
         "salience": salience,
         "is_open_thread": open_thread,
@@ -59,6 +63,19 @@ def test_selector_allows_concrete_single_character_pet_terms():
     )
 
     assert result["selected_ids"] == ["cat_name"]
+
+
+def test_selector_uses_v1_bucket_and_threads_as_topic_context():
+    result = select_memory_index_items(
+        "蛋子是什么狗？",
+        [
+            _index_item("dog", "用户养了一只比熊。", bucket="宠物", threads=["蛋子", "狗狗"]),
+            _index_item("cat", "用户有只猫叫武松。", bucket="宠物", threads=["武松", "猫"]),
+        ],
+        cap=3,
+    )
+
+    assert result["selected_ids"] == ["dog"]
 
 
 def test_selector_skips_sensitive_items_unless_query_allows_sensitive():

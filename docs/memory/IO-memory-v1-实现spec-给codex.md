@@ -85,6 +85,11 @@ envelope(明文):    { id, occurred_at, created_at, updated_at, source(chat|scre
 
 ## P3.5 · 提示词初版(hx 出,集中一处,Seven 后替)
 - 新增 `backend/memory/prompts_v1.py`(或合同引用处):**写入指引**(判断该不该记 + bucket/threads resolve-before-create + importance/pulse + content 三段)+ **注入框法**(气氛灯=底色别当话题、查到的自然织入别背诵、用每卡"使用提示")。**集中一处便于 Seven 整段替换**。CC 出初版文本。
+- 已接入 route B 真实提示词组装:
+  - 前台 memory tools system prompt 引用 `MEMORY_CONTEXT_FRAMING_V1`,约束 fetch 后怎么自然使用记忆。
+  - 后台 state action prompt 引用 `MEMORY_WRITE_GUIDANCE_V1`,并把现有 `buckets/threads` 词表塞进 `existing_memory_terms`,用于 resolve-before-create。
+  - 后台 memory capture prompt 输出 v1 字段(`summary/content/bucket/threads/importance/pulse/source`),不再要求旧 `title/description/type/her_quote`。
+- route A native foreground 不在 consumer 里把隐藏规则拼进用户消息,避免污染真实 agent 输入。route A 侧应由 zhihao runtime/tool/skill 挂载同一份读写规则;consumer 只继续保证 action 名称规范化和 HTTP executor 收敛。
 
 ---
 
@@ -132,3 +137,61 @@ perception/proactive 核心逻辑 + 命名、hosted_context 主函数、别人 1
 
 ## 给 CC review 的产出
 每个 P 的 diff + P5 测试结果;P6 删除前确认 P4 readers + P5 测试都过。
+
+---
+
+## 合并就绪结论(2026-06-25 Codex 复核)
+
+结论:按当前 `feat/memory-v1-clean-schema` 真代码看,clean v1 合入 test **没有发现后端硬崩点**;但合前需要先吸收最新 `origin/test` 的两个 perception/test-image 提交后再跑同一组测试。
+
+已确认:
+- `/v1/memory/list` 对 clean v1 卡不要求 legacy `type/title/description`,只返回 moment 列表;新增测试覆盖 clean v1 卡可 200 返回。
+- `/v1/memory/verify` 暂时保留 legacy tab-shaped response,但内部 `_count_by_tab` 已是 v1 active-card count shim;新增测试覆盖 clean v1 卡不会因缺 type/tab 崩。
+- bootstrap gate 继续读 `_count_by_tab`,所以 clean v1 卡能降级通过旧 stage 判断;新增测试覆盖无 legacy tab 也能进入 `main_loop`。
+- 老 M2 数据不迁移:backend envelope adapter `to_v1_card` 只补 `status/importance/pulse/last_referenced_at`;enclave inner adapter `_memory_inner_to_v1` 在解密后把旧 `title/description/her_quote/verbatim/context/follow_up/linked_dimension/anchor_memory_ids/type` 映射成 v1 `summary/content/bucket/threads`。默认桶:fact/event→`未分类`,moment/quote→`我们的关系`;threads 从 `threads`/`linked_dimension`/`anchor_memory_ids` 取。
+- `prompts_v1` 不是 inert:route B foreground memory tool prompt import `MEMORY_CONTEXT_FRAMING_V1`;background state-action prompt import `MEMORY_WRITE_GUIDANCE_V1`;memory capture prompt import `MEMORY_WRITE_GUIDANCE_V1` 并要求 v1 output shape。
+- 现有 bucket/thread 词表已注入 route B 写入判断 payload 的 `existing_memory_terms`;capture worker 也带同字段。Seven 后续可替换 `backend/memory/prompts_v1.py` 文案,不需要改执行器。
+
+有意识保留/交接:
+- route A native foreground 不在 consumer 里拼隐藏 prompt,避免污染真实 agent 用户输入;route A 规则由 zhihao runtime/tool/skill 挂载同一份读写合同。consumer 只做 action 名称规范化和 HTTP executor 收敛。
+- `/verify` 的 tab 文案仍是兼容层,不是 v1 最终产品语义;P6 删除旧接口/旧文案前先保持不崩。
+- DB-backed 测试已通过提权连接本机 Docker Postgres 跑过;普通沙箱会拦 `127.0.0.1:55432`,需用可访问 Postgres 的环境运行。
+
+本轮验证命令:
+```bash
+/private/tmp/feedling-m2-venv/bin/python -m pytest \
+  tests/test_memory_v1_schema.py \
+  tests/test_memory_v1_readside.py \
+  tests/test_memory_v1_readers.py \
+  tests/test_memory_action_conformance.py \
+  tests/test_memory_m2_write_loop.py \
+  tests/test_memory_readside.py \
+  tests/test_memory_readside_core.py \
+  tests/test_memory_index_selector.py \
+  tests/test_hosted_memory_tools.py \
+  tests/test_hosted_memory_tool_loop.py \
+  tests/test_model_api_prompts.py \
+  tests/test_history_import_identity.py \
+  tests/test_proactive_tool_executor_v2.py
+```
+
+结果:`81 passed`;普通沙箱下 DB-backed tests 会因 localhost 端口不可达被 skip。
+
+DB-backed 补充验证:
+```bash
+DATABASE_URL=postgresql://postgres:test@127.0.0.1:55432/postgres \
+FEEDLING_TEST_PG=postgresql://postgres:test@127.0.0.1:55432/postgres \
+/private/tmp/feedling-m2-venv/bin/python -m pytest \
+  tests/test_db.py \
+  tests/test_identity_actions.py \
+  tests/test_memory_v1_schema.py \
+  tests/test_memory_v1_readside.py \
+  tests/test_memory_v1_readers.py \
+  tests/test_memory_action_conformance.py \
+  tests/test_memory_m2_write_loop.py \
+  tests/test_memory_readside.py \
+  tests/test_memory_readside_core.py \
+  tests/test_memory_index_selector.py
+```
+
+结果:`78 passed`;pytest provisioned throwaway Postgres DB successfully.

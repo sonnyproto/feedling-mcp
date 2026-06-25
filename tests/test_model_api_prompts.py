@@ -81,3 +81,25 @@ def test_empty_persona_does_not_crash_and_omits_nothing_required():
     msgs = _build({"identity": {"agent_name": ""}})
     assert msgs[0]["role"] == "system"
     assert any(m["role"] == "user" for m in msgs)
+
+
+def test_memory_capture_prompt_uses_v1_shape_and_existing_terms():
+    msgs = prompts.build_memory_capture_messages(
+        user_message="我养了一只狗叫蛋子。",
+        assistant_reply="蛋子是什么样的狗？",
+        context_payload={
+            "existing_memory_terms": {"buckets": ["宠物"], "threads": ["蛋子"]},
+            "context_memories": [],
+            "identity": {},
+        },
+    )
+    blob = _system_blob(msgs)
+    payload = msgs[1]["content"]
+    assert "Memory write guidance" in blob
+    assert "summary" in blob
+    assert "content" in blob
+    assert "bucket" in blob
+    assert "threads" in blob
+    assert "title" not in blob
+    assert "宠物" in payload
+    assert "蛋子" in payload

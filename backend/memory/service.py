@@ -29,10 +29,59 @@ TAB_FOR_TYPE = {
 
 def _load_moments(store: UserStore) -> list:
     try:
-        return db.memory_load(store.user_id)
+        return [to_v1_card(moment) for moment in db.memory_load(store.user_id)]
     except Exception as e:
         print(f"[{store.user_id}/memory] load failed: {e}")
     return []
+
+
+def _salience_to_importance(value, default: float = 0.5) -> float:
+    salience = str(value or "").strip().lower()
+    if salience == "critical":
+        return 0.9
+    if salience == "high":
+        return 0.75
+    if salience == "medium":
+        return 0.5
+    if salience == "low":
+        return 0.25
+    return default
+
+
+def _float_01(value, default: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(0.0, min(1.0, parsed))
+
+
+def to_v1_card(doc: dict) -> dict:
+    """Normalize plaintext envelope fields without looking inside body_ct.
+
+    The content fields are encrypted, so old inner shapes are adapted in the
+    enclave after decryption. This function only supplies v1 envelope defaults.
+    """
+    if not isinstance(doc, dict):
+        return doc
+    card = dict(doc)
+    card["status"] = str(card.get("status") or "active").strip().lower() or "active"
+    if "importance" not in card:
+        card["importance"] = _salience_to_importance(card.get("salience"), 0.5)
+    else:
+        card["importance"] = _float_01(card.get("importance"), _salience_to_importance(card.get("salience"), 0.5))
+    if "pulse" not in card:
+        card["pulse"] = 0.3
+    else:
+        card["pulse"] = _float_01(card.get("pulse"), 0.3)
+    if not str(card.get("last_referenced_at") or "").strip():
+        card["last_referenced_at"] = str(
+            card.get("occurred_at")
+            or card.get("updated_at")
+            or card.get("created_at")
+            or core_util._now_iso()
+        )
+    return card
 
 
 def _memory_is_archived(moment: dict) -> bool:
@@ -100,7 +149,11 @@ def _append_memory_capture_job(store: UserStore, entry: dict) -> dict:
 
 
 def _count_by_tab(moments: list) -> dict:
-    """Return {story: int, about_me: int, ta_thinking: int, total: int}."""
+    """Return legacy-shaped counts backed by v1 active-card count.
+
+    v1 no longer stores type/tab. Keep the old return shape so bootstrap and
+    verify routes do not break while their wording is retired in P6.
+    """
     counts = {"story": 0, "about_me": 0, "ta_thinking": 0, "total": 0}
     if not isinstance(moments, list):
         return counts
@@ -110,10 +163,9 @@ def _count_by_tab(moments: list) -> dict:
         if _memory_is_archived(m):
             continue
         counts["total"] += 1
-        t = m.get("type", "")
-        tab = TAB_FOR_TYPE.get(t)
-        if tab:
-            counts[tab] += 1
+    counts["story"] = counts["total"]
+    counts["about_me"] = counts["total"]
+    counts["ta_thinking"] = counts["total"]
     return counts
 
 

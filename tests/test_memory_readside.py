@@ -67,7 +67,7 @@ def client(monkeypatch):
         yield c, store
 
 
-def test_memory_index_prefilters_top50_and_calls_enclave(client, monkeypatch):
+def test_memory_index_sends_full_light_index_and_calls_enclave(client, monkeypatch):
     c, store = client
     moments = [
         _moment("open_old", salience="medium", importance=0.1, occurred_at="2026-06-19T10:00:00", is_open_thread=True),
@@ -101,8 +101,8 @@ def test_memory_index_prefilters_top50_and_calls_enclave(client, monkeypatch):
     assert captured["api_key"] == "key_readside"
     assert captured["operation"] == "index"
     assert captured["payload"]["include_sensitive"] is False
-    assert len(captured["ids"]) == 50
-    assert captured["ids"][:2] == ["open_old", "high_new"]
+    assert len(captured["ids"]) == 62
+    assert captured["ids"][:2] == ["high_new", "open_old"]
     assert "local" not in captured["ids"]
     assert "no_enclave" not in captured["ids"]
     assert "archived" not in captured["ids"]
@@ -122,6 +122,7 @@ def test_memory_fetch_splits_missing_unavailable_and_preserves_order(client, mon
         _moment("other_user", owner="usr_other"),
     ]
     monkeypatch.setattr(memory_routes.memory_service, "_load_moments", lambda _store: moments)
+    monkeypatch.setattr(memory_routes.memory_service, "_save_moments", lambda _store, _moments: None)
     captured = {}
 
     def fake_enclave(api_key, candidates, *, operation, payload=None):
@@ -147,7 +148,7 @@ def test_memory_fetch_splits_missing_unavailable_and_preserves_order(client, mon
     assert body["unavailable_ids"] == ["local", "archived", "superseded"]
 
 
-def test_enclave_index_item_hides_body_only_fields():
+def test_enclave_index_item_hides_content_body_field():
     item = enclave_app._build_memory_index_item(
         {
             "id": "mem_1",
@@ -158,10 +159,9 @@ def test_enclave_index_item_hides_body_only_fields():
         },
         {
             "summary": "She needs presence first.",
-            "bucket_refs": ["comfort"],
-            "verbatim": "Do not expose this in index.",
-            "her_quote": "Do not expose this either.",
-            "follow_up": "Only fetch should see this.",
+            "content": "记忆: She needs presence first.\n上下文: Do not expose this in index.\n使用提示: Only fetch should see this.",
+            "bucket": "comfort",
+            "threads": ["comfort"],
             "sensitive_scope": "xp_private_detail",
         },
     )
@@ -169,13 +169,17 @@ def test_enclave_index_item_hides_body_only_fields():
     assert item == {
         "id": "mem_1",
         "summary": "She needs presence first.",
-        "bucket_refs": ["comfort"],
+        "bucket": "comfort",
+        "threads": ["comfort"],
+        "importance": 0.5,
+        "pulse": 0.3,
         "status": "active",
-        "salience": "high",
-        "is_open_thread": True,
+        "occurred_at": "",
+        "last_referenced_at": "",
         "is_sensitive": True,
         "score": 0.91,
     }
+    assert "content" not in item
 
 
 def test_enclave_index_filters_sensitive_items_by_default(monkeypatch):
@@ -281,16 +285,14 @@ def test_enclave_negative_env_limit_falls_back_to_default_not_full_open(monkeypa
     assert captured_lengths == [50]
 
 
-def test_enclave_fetch_item_returns_full_card_without_sensitive_scope():
+def test_enclave_fetch_item_returns_v1_full_card_without_sensitive_scope():
     item = enclave_app._build_memory_fetch_item(
         {"id": "mem_1", "status": "active", "salience": "high", "source": "chat"},
         {
             "summary": "She needs presence first.",
-            "verbatim": "I wanted someone to stay.",
-            "bucket_refs": ["comfort"],
-            "follow_up": "Start with comfort.",
-            "context": "Low mood chat.",
-            "source_type": "chat",
+            "content": "记忆: She needs presence first.\n上下文: I wanted someone to stay.\n使用提示: Start with comfort.",
+            "bucket": "comfort",
+            "threads": ["comfort"],
             "sensitive_scope": "xp_private_detail",
         },
     )
@@ -298,13 +300,15 @@ def test_enclave_fetch_item_returns_full_card_without_sensitive_scope():
     assert item == {
         "id": "mem_1",
         "summary": "She needs presence first.",
-        "verbatim": "I wanted someone to stay.",
-        "bucket_refs": ["comfort"],
+        "content": "记忆: She needs presence first.\n上下文: I wanted someone to stay.\n使用提示: Start with comfort.",
+        "bucket": "comfort",
+        "threads": ["comfort"],
+        "importance": 0.5,
+        "pulse": 0.3,
         "status": "active",
-        "salience": "high",
-        "follow_up": "Start with comfort.",
-        "context": "Low mood chat.",
-        "source_type": "chat",
+        "source": "chat",
+        "occurred_at": "",
+        "last_referenced_at": "",
         "is_sensitive": True,
     }
     assert "sensitive_scope" not in item

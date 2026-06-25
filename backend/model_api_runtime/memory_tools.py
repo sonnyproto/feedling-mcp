@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from memory.prompts_v1 import MEMORY_CONTEXT_FRAMING_V1
 import memory_readside_core
 
 
@@ -20,11 +21,12 @@ def memory_tool_instruction_message() -> dict:
         "content": (
             "Memory tools are available through JSON tool_calls.\n"
             "When long-term memory may matter, first call "
-            "{\"tool_calls\":[{\"name\":\"memory_index\",\"args\":{\"query\":\"...\",\"include_sensitive\":false}}]}.\n"
+            "{\"tool_calls\":[{\"name\":\"memory_index\",\"args\":{\"query\":\"...\",\"bucket\":\"optional\",\"thread\":\"optional\",\"include_sensitive\":false}}]}.\n"
             "memory_index returns safe summaries only. Read those summaries, then fetch only directly relevant ids with "
             "{\"tool_calls\":[{\"name\":\"memory_fetch\",\"args\":{\"ids\":[\"mem_id\"]}}]}.\n"
             "Usually fetch 1-3 memories, never every memory. Set include_sensitive=true only when the user explicitly asks "
-            "about a sensitive/private topic. If no index item is clearly relevant, answer without inventing."
+            "about a sensitive/private topic. If no index item is clearly relevant, answer without inventing.\n\n"
+            + MEMORY_CONTEXT_FRAMING_V1
         ),
     }
 
@@ -75,6 +77,14 @@ def execute_memory_tool(store, api_key: str | None, name: str, args: dict | None
             "limit": limit,
             "include_sensitive": bool(args.get("include_sensitive", False)),
         }
+        for key in ("bucket", "thread"):
+            value = str(args.get(key) or "").strip()
+            if value:
+                payload[key] = value[:120]
+        if args.get("ambient") is not None:
+            payload["ambient"] = bool(args.get("ambient"))
+        if args.get("ambient_top_n") is not None:
+            payload["ambient_top_n"] = args.get("ambient_top_n")
         body = memory_readside_core.memory_index_core(store, api_key, payload)
         items = body.get("items") if isinstance(body.get("items"), list) else []
         tr["index_called"] = True

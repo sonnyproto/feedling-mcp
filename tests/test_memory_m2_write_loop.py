@@ -54,7 +54,7 @@ def _inner(moment: dict) -> dict:
     return json.loads(moment["body_ct"])
 
 
-def test_memory_add_writes_card_v1_metadata_and_legacy_body_fields(monkeypatch):
+def test_memory_add_writes_clean_v1_body_fields(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_m2")
     moments: list[dict] = []
     saved = _install_memory_action_fakes(monkeypatch, moments)
@@ -79,17 +79,19 @@ def test_memory_add_writes_card_v1_metadata_and_legacy_body_fields(monkeypatch):
     assert body["status"] == "ok"
     assert len(saved) == 1
     moment = saved[0]
-    assert moment["card_v"] == 1
     assert moment["status"] == "active"
-    assert moment["salience"] == "high"
     assert moment["importance"] == 0.8
-    assert moment["source_type"] == "hosted_runtime_state"
+    assert moment["pulse"] == 0.3
+    assert moment["last_referenced_at"] == moment["occurred_at"]
+    for legacy_key in ("card_v", "salience", "source_type", "type"):
+        assert legacy_key not in moment
     inner = _inner(moment)
     assert inner["summary"] == "用户有只猫叫武松，是狸花猫。"
-    assert inner["verbatim"] == "我有只猫叫武松，是狸花猫。"
-    assert inner["description"] == inner["summary"]
-    assert inner["her_quote"] == inner["verbatim"]
-    assert inner["title"]
+    assert inner["content"].startswith("记忆: 用户有只猫叫武松，是狸花猫。")
+    assert inner["bucket"] == "未分类"
+    assert inner["threads"] == []
+    for legacy_key in ("verbatim", "description", "her_quote", "title"):
+        assert legacy_key not in inner
 
 
 def test_memory_supersede_soft_retires_old_card_and_new_card_is_recallable(monkeypatch):
@@ -170,9 +172,12 @@ def test_coerce_runtime_action_maps_memory_supersede_to_executor_action():
         "type": "memory.supersede",
         "supersedes": "mem_old_cat",
         "memory": {
-            "type": "fact",
             "summary": "武松其实是橘猫。",
-            "verbatim": "我记错了，武松其实是橘猫。",
+            "content": "武松其实是橘猫。",
+            "bucket": "",
+            "threads": [],
+            "importance": 0.5,
+            "pulse": 0.3,
             "occurred_at": "2026-06-21",
             "source": "hosted_runtime_state",
         },
@@ -188,14 +193,18 @@ def test_background_execution_prompt_advertises_memory_supersede():
         memory_candidates=[{"id": "mem_old_cat", "title": "武松是狸花猫"}],
         context_refs=[],
         pending_items=[],
+        memory_terms={"buckets": ["宠物"], "threads": ["武松"]},
     )
 
     system_prompt = messages[0]["content"]
+    payload = json.loads(messages[1]["content"])
     assert "memory.supersede" in system_prompt
     assert "target.memory_id" in system_prompt
+    assert "Memory write guidance" in system_prompt
+    assert payload["existing_memory_terms"] == {"buckets": ["宠物"], "threads": ["武松"]}
 
 
-def test_memory_content_patch_keeps_summary_and_legacy_fields_in_sync(monkeypatch):
+def test_memory_content_patch_supersedes_old_card_with_v1_shape(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_m2")
     existing = {
         "v": 1,
@@ -232,8 +241,11 @@ def test_memory_content_patch_keeps_summary_and_legacy_fields_in_sync(monkeypatc
 
     assert status == 200
     assert body["status"] == "ok"
-    inner = _inner(saved[0])
+    old_after = next(moment for moment in saved if moment["id"] == "mem_patch_cat")
+    new_card = next(moment for moment in saved if moment["id"] != "mem_patch_cat")
+    assert old_after["status"] == "superseded"
+    inner = _inner(new_card)
     assert inner["summary"] == "用户有只猫叫武松，是橘猫。"
-    assert inner["description"] == inner["summary"]
-    assert inner["verbatim"] == "我记错了，武松其实是橘猫。"
-    assert inner["her_quote"] == inner["verbatim"]
+    assert inner["content"].startswith("记忆: 用户有只猫叫武松，是橘猫。")
+    assert "description" not in inner
+    assert "her_quote" not in inner

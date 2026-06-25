@@ -4,6 +4,8 @@ import json
 from datetime import date
 from typing import Any
 
+from memory.prompts_v1 import MEMORY_WRITE_GUIDANCE_V1
+
 
 def build_foreground_chat_messages(
     *,
@@ -84,6 +86,7 @@ def build_memory_capture_messages(
         "user_message": user_message[:4000],
         "assistant_reply": assistant_reply[:4000],
         "existing_context_memories": (context_payload.get("context_memories") or [])[:8],
+        "existing_memory_terms": context_payload.get("existing_memory_terms") or {"buckets": [], "threads": []},
         "identity": context_payload.get("identity") or {},
         "agent_profile": context_payload.get("agent_profile") or {},
         "today": date.today().isoformat(),
@@ -94,13 +97,13 @@ def build_memory_capture_messages(
             "content": (
                 "You are Feedling's Memory Capture worker. Return JSON only. "
                 "Extract durable Memory Garden cards from the latest exchange. "
-                "Only write facts, events, quotes, or rare relational moments. "
                 "Do write explicit user corrections about names, boundaries, persona, voice, preferences, or facts if they are not already present in existing_context_memories. "
-                "Do not write vague preferences, duplicate existing memories, repeated correction cards, or private implementation details. "
-                "Shape: {\"memories\":[{\"type\":\"fact|event|quote|moment\","
-                "\"title\":\"...\",\"description\":\"...\",\"occurred_at\":\"YYYY-MM-DD\","
-                "\"her_quote\":\"optional\",\"context\":\"optional\"}]}. "
+                "Reuse existing_memory_terms.buckets and existing_memory_terms.threads when they fit before creating new names. "
+                "Shape: {\"memories\":[{\"summary\":\"...\",\"content\":\"记忆\\n...\\n\\n上下文\\n...\\n\\n使用提示\\n...\","
+                "\"bucket\":\"...\",\"threads\":[\"...\"],\"importance\":0.0,\"pulse\":0.0,\"occurred_at\":\"YYYY-MM-DD\",\"source\":\"chat\"}]}. "
                 "Return {\"memories\":[]} if nothing durable should be written."
+                "\n\n"
+                + MEMORY_WRITE_GUIDANCE_V1
             ),
         },
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:12000]},

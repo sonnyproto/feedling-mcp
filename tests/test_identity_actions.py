@@ -114,7 +114,7 @@ def _fake_envelope_builder(captured: list):
             captured.append(json.loads(plaintext.decode("utf-8")))
         except Exception:
             captured.append(plaintext.decode("utf-8"))
-        return {
+        envelope = {
             "id": item_id or "env_1",
             "body_ct": f"ct_{len(captured)}",
             "nonce": f"nonce_{len(captured)}",
@@ -123,7 +123,8 @@ def _fake_envelope_builder(captured: list):
             "visibility": "shared",
             "owner_user_id": store.user_id,
             "enclave_pk_fpr": "test",
-        }, ""
+        }
+        return envelope, ""
     return _build
 
 
@@ -370,14 +371,18 @@ def test_memory_content_patch_reencrypts_existing_card(client, monkeypatch):
     assert res.status_code == 200, res.get_data(as_text=True)
     body = res.get_json()
     assert body["status"] == "ok"
-    assert body["effects"][0]["type"] == "memory_updated"
-    assert body["effects"][0]["memory_id"] == "mom_1"
-    assert captured_plaintexts[-1]["description"] == "User moved to Tokyo in April."
-    assert captured_plaintexts[-1]["title"] == "Wrong city"
-    saved = appmod.db.memory_load(user_id)[0]
-    assert saved["id"] == "mom_1"
-    assert saved["body_ct"] == "ct_1"
-    assert saved["updated_at"]
+    assert body["effects"][0]["type"] == "memory_superseded"
+    assert body["effects"][0]["supersedes"] == "mom_1"
+    assert captured_plaintexts[-1]["summary"] == "User moved to Tokyo in April."
+    assert "User moved to Tokyo in April." in captured_plaintexts[-1]["content"]
+    saved = appmod.db.memory_load(user_id)
+    old_card = next(item for item in saved if item["id"] == "mom_1")
+    new_card = next(item for item in saved if item["id"] != "mom_1")
+    assert old_card["status"] == "superseded"
+    assert old_card["superseded_by"] == new_card["id"]
+    assert new_card["body_ct"] == "ct_1"
+    assert new_card["status"] == "active"
+    assert new_card["updated_at"]
 
 
 def test_model_api_chat_background_runtime_executes_memory_context_patch(client, monkeypatch):
@@ -450,7 +455,12 @@ def test_model_api_chat_background_runtime_executes_memory_context_patch(client,
     assert body["effects"] == []
     assert body["memory_actions"] == []
     assert body["state"]["background_execution"]["status"] == "completed"
-    assert any(isinstance(item, dict) and item.get("description") == "User moved to Tokyo in April." for item in captured_plaintexts)
+    assert any(
+        isinstance(item, dict)
+        and item.get("summary") == "User moved to Tokyo in April."
+        and "User moved to Tokyo in April." in item.get("content", "")
+        for item in captured_plaintexts
+    )
     assert body["context"]["context_refs"] == 1
 
 
@@ -529,10 +539,11 @@ def test_model_api_chat_background_runtime_writes_general_correction_memory(clie
     assert context_params[-1]["context_mode"] == "model_api"
     assert any(
         isinstance(item, dict)
-        and item.get("source") == "model_api_correction"
-        and "烂梗王" in item.get("description", "")
+        and "烂梗王" in item.get("content", "")
         for item in captured_plaintexts
     )
+    saved = appmod.db.memory_load(user_id)
+    assert any(item.get("source") == "model_api_correction" for item in saved)
 
 
 def test_model_api_chat_background_runtime_patches_user_preferred_name(client, monkeypatch):

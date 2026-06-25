@@ -984,6 +984,60 @@ def _memory_readside_summary(inner: dict) -> str:
     return ""
 
 
+def _memory_default_bucket(value) -> str:
+    mem_type = str(value or "").strip().lower()
+    if mem_type in {"moment", "quote"}:
+        return "我们的关系"
+    if mem_type in {"fact", "event"}:
+        return "未分类"
+    return "未分类"
+
+
+def _memory_inner_to_v1(inner: dict, envelope: dict | None = None) -> dict:
+    """Adapt decrypted legacy memory body into the v1 inner shape."""
+    envelope = envelope or {}
+    if not isinstance(inner, dict):
+        return {"summary": "", "content": "", "bucket": "未分类", "threads": []}
+    if all(key in inner for key in ("summary", "content", "bucket", "threads")):
+        return {
+            "summary": _memory_readside_text(inner.get("summary"), 500),
+            "content": _memory_readside_text(inner.get("content"), 5000),
+            "bucket": _memory_readside_text(inner.get("bucket"), 80) or "未分类",
+            "threads": _memory_readside_list(inner.get("threads"))[:8],
+            **{
+                key: inner[key]
+                for key in ("is_sensitive", "sensitivity_class", "sensitive_scope")
+                if key in inner
+            },
+        }
+
+    summary = _memory_readside_summary(inner)
+    description = _memory_readside_text(inner.get("description") or inner.get("title") or summary, 2000)
+    quote = _memory_readside_text(inner.get("her_quote") or inner.get("verbatim") or inner.get("context"), 1000)
+    follow_up = _memory_readside_text(inner.get("follow_up"), 1000)
+    content = "\n".join([
+        f"记忆: {description or summary}",
+        f"上下文: {quote or '用户在对话中明确提到。'}",
+        f"使用提示: {follow_up or '自然使用这条记忆，不要机械复述。'}",
+    ])
+    threads = _memory_readside_list(inner.get("threads"))
+    if not threads:
+        threads = _memory_readside_list(inner.get("linked_dimension"))
+    if not threads:
+        threads = _memory_readside_list(inner.get("anchor_memory_ids"))
+    adapted = {
+        "summary": summary,
+        "content": content,
+        "bucket": _memory_readside_text(inner.get("bucket"), 80)
+        or _memory_default_bucket(inner.get("type") or envelope.get("type")),
+        "threads": threads[:8],
+    }
+    for key in ("is_sensitive", "sensitivity_class", "sensitive_scope"):
+        if key in inner:
+            adapted[key] = inner[key]
+    return adapted
+
+
 def _memory_readside_bucket_refs(inner: dict) -> list[str]:
     refs = _memory_readside_list(inner.get("bucket_refs"))
     if refs:
@@ -1017,32 +1071,51 @@ def _memory_readside_is_sensitive(envelope: dict, inner: dict) -> bool:
 
 
 def _build_memory_index_item(envelope: dict, inner: dict) -> dict:
+    adapted = _memory_inner_to_v1(inner, envelope)
     return {
         "id": envelope.get("id", ""),
-        "summary": _memory_readside_summary(inner),
-        "bucket_refs": _memory_readside_bucket_refs(inner),
+        "summary": adapted.get("summary", ""),
+        "bucket": adapted.get("bucket", ""),
+        "threads": list(adapted.get("threads") or [])[:8],
+        "importance": float(envelope.get("importance") or 0.5),
+        "pulse": float(envelope.get("pulse") or 0.3),
         "status": _memory_readside_status(envelope, inner),
-        "salience": _memory_readside_salience(envelope, inner),
-        "is_open_thread": bool(envelope.get("is_open_thread") or inner.get("is_open_thread")),
-        "is_sensitive": _memory_readside_is_sensitive(envelope, inner),
+        "occurred_at": _memory_readside_text(envelope.get("occurred_at"), 80),
+        "last_referenced_at": _memory_readside_text(envelope.get("last_referenced_at"), 80),
+        "is_sensitive": _memory_readside_is_sensitive(envelope, adapted),
         "score": float(envelope.get("score") or 0),
     }
 
 
 def _build_memory_fetch_item(envelope: dict, inner: dict) -> dict:
-    verbatim = _memory_readside_text(inner.get("verbatim") or inner.get("her_quote"), 2000)
+    adapted = _memory_inner_to_v1(inner, envelope)
     return {
         "id": envelope.get("id", ""),
-        "summary": _memory_readside_summary(inner),
-        "verbatim": verbatim,
-        "bucket_refs": _memory_readside_bucket_refs(inner),
+        "summary": adapted.get("summary", ""),
+        "content": adapted.get("content", ""),
+        "bucket": adapted.get("bucket", ""),
+        "threads": list(adapted.get("threads") or [])[:8],
+        "importance": float(envelope.get("importance") or 0.5),
+        "pulse": float(envelope.get("pulse") or 0.3),
         "status": _memory_readside_status(envelope, inner),
-        "salience": _memory_readside_salience(envelope, inner),
-        "follow_up": _memory_readside_text(inner.get("follow_up"), 1000),
-        "context": _memory_readside_text(inner.get("context"), 1000),
-        "source_type": _memory_readside_text(inner.get("source_type") or envelope.get("source"), 160),
-        "is_sensitive": _memory_readside_is_sensitive(envelope, inner),
+        "source": _memory_readside_text(envelope.get("source"), 160),
+        "occurred_at": _memory_readside_text(envelope.get("occurred_at"), 80),
+        "last_referenced_at": _memory_readside_text(envelope.get("last_referenced_at"), 80),
+        "is_sensitive": _memory_readside_is_sensitive(envelope, adapted),
     }
+
+
+def _memory_index_filter_items(items: list[dict], payload: dict) -> list[dict]:
+    bucket = _memory_readside_text(payload.get("bucket"), 120)
+    thread = _memory_readside_text(payload.get("thread"), 120)
+    filtered = []
+    for item in items:
+        if bucket and item.get("bucket") != bucket:
+            continue
+        if thread and thread not in (item.get("threads") or []):
+            continue
+        filtered.append(item)
+    return filtered
 
 
 def _memory_readside_auth_context() -> tuple[str | None, str | None, object | None, tuple[dict, int] | None]:
@@ -1116,6 +1189,7 @@ def v1_memory_index():
         content_sk,
         item_builder=_build_memory_index_item,
     )
+    items = _memory_index_filter_items(items, payload)
     if not bool(payload.get("include_sensitive", False)):
         items = [item for item in items if not item.get("is_sensitive")]
     return jsonify({
@@ -1142,10 +1216,20 @@ def v1_memory_fetch():
         content_sk,
         item_builder=_build_memory_fetch_item,
     )
+    blocked_sensitive_ids: list[str] = []
+    if not bool(payload.get("include_sensitive", False)):
+        allowed = []
+        for item in items:
+            if item.get("is_sensitive"):
+                blocked_sensitive_ids.append(str(item.get("id") or ""))
+            else:
+                allowed.append(item)
+        items = allowed
     return jsonify({
         "user_id": authorized_user_id,
         "items": items,
         "unavailable_ids": unavailable_ids,
+        "blocked_sensitive_ids": [mid for mid in blocked_sensitive_ids if mid],
     })
 
 

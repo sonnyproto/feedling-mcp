@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from memory.prompts_v1 import MEMORY_WRITE_GUIDANCE_V1
+
 
 ACTION_RESPONSE_FORMAT: dict[str, Any] = {"type": "json_object"}
 
@@ -148,6 +150,25 @@ def compact_pending_items(pending_items: list[dict]) -> list[dict]:
     return [item for item in out if item["id"]]
 
 
+def compact_memory_terms(memory_terms: dict | None) -> dict:
+    if not isinstance(memory_terms, dict):
+        return {"buckets": [], "threads": []}
+
+    def clean_list(value: Any) -> list[str]:
+        raw = value if isinstance(value, list) else []
+        out: list[str] = []
+        for item in raw:
+            text = str(item or "").strip()[:120]
+            if text and text not in out:
+                out.append(text)
+        return out[:80]
+
+    return {
+        "buckets": clean_list(memory_terms.get("buckets")),
+        "threads": clean_list(memory_terms.get("threads")),
+    }
+
+
 def build_background_execution_messages(
     *,
     user_message: str,
@@ -155,12 +176,14 @@ def build_background_execution_messages(
     memory_candidates: list[dict],
     context_refs: list[dict],
     pending_items: list[dict],
+    memory_terms: dict | None = None,
 ) -> list[dict]:
     payload = {
         "today": date.today().isoformat(),
         "latest_user_message": user_message[:4000],
         "identity": identity,
         "memory_candidates": memory_candidates[:12],
+        "existing_memory_terms": compact_memory_terms(memory_terms),
         "user_selected_context_refs": context_refs[:8],
         "pending_actions_waiting_for_user_confirmation": compact_pending_items(pending_items),
     }
@@ -175,21 +198,25 @@ def build_background_execution_messages(
                 "Durable state means Identity or Memory Garden state that should remain true after this turn. "
                 "If the user only chats normally, asks a question, roleplays, jokes, or references a memory without asking to change it, return no actions. "
                 "If the user asks you to remember, forget, correct, rename, correct relationship day count, change address preferences, update persona/voice/boundaries, or fix a selected Memory Garden card, produce actions. "
-                "For an explicit first-person durable preference or correction with no clear existing card target, prefer memory.create with high confidence instead of memory.patch. "
+                "For an explicit first-person durable preference or correction with no clear existing card target, prefer memory.add with high confidence instead of memory.patch. "
                 "Use confidence >= 0.9 for explicit, non-destructive state writes. Use lower confidence mainly for destructive actions or ambiguous patch/delete targets. "
                 "Use memory.supersede when the user corrects or replaces an existing memory; target.memory_id must be the old card being replaced and payload.memory must contain the new card. "
                 "Use memory_candidates or user_selected_context_refs for memory.patch/delete/supersede targets. If the target is ambiguous, use low confidence. "
                 "If pending_actions_waiting_for_user_confirmation is non-empty and the latest message confirms or rejects one of them, set pending_decision instead of inventing a new action. "
                 "Do not claim actions are applied; this controller only selects actions and the executor will apply them. "
-                "Supported action types: identity.patch, identity.dimension_nudge, identity.relationship_days_set, memory.create, memory.patch, memory.supersede, memory.delete. "
+                "Supported action types: identity.patch, identity.dimension_nudge, identity.relationship_days_set, memory.add, memory.supersede, memory.delete. "
+                "Legacy memory.create and memory.patch are accepted aliases, but do not prefer them. "
+                "For memory actions, follow the v1 write guidance below and reuse existing_memory_terms.buckets / existing_memory_terms.threads when they fit before creating a new bucket or thread. "
                 "Use identity.dimension_nudge only when the user asks to raise or lower an existing identity dimension; payload must include dimension and delta. "
                 "Use identity.relationship_days_set when the user says the displayed days together / relationship day count is wrong; payload must include days_with_user as an integer. "
                 "JSON shape: {"
                 "\"pending_decision\":{\"decision\":\"none|confirm|reject\",\"pending_ids\":[\"...\"],\"reason\":\"optional\"},"
-                "\"actions\":[{\"type\":\"identity.patch|identity.dimension_nudge|identity.relationship_days_set|memory.create|memory.patch|memory.supersede|memory.delete\","
+                "\"actions\":[{\"type\":\"identity.patch|identity.dimension_nudge|identity.relationship_days_set|memory.add|memory.supersede|memory.delete\","
                 "\"confidence\":0.0,\"target\":{\"memory_id\":\"optional\",\"candidate_ids\":[\"...\"]},"
                 "\"payload\":{},\"reason\":\"short reason\"}],"
                 "\"why_empty\":\"optional\"}."
+                "\n\n"
+                + MEMORY_WRITE_GUIDANCE_V1
             ),
         },
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:16000]},
@@ -348,27 +375,23 @@ def coerce_runtime_action(
     if action_type in {"memory.create", "memory.add", "memory.add_correction"}:
         raw = payload.get("memory") if isinstance(payload.get("memory"), dict) else payload
         summary = str(raw.get("summary") or raw.get("description") or raw.get("content") or raw.get("title") or "").strip()[:2000]
-        title = clean_text(raw.get("title") or summary, 180)
-        description = str(raw.get("description") or raw.get("content") or summary).strip()[:2000]
-        if not title or not description:
+        content = str(raw.get("content") or raw.get("description") or summary).strip()[:5000]
+        if not summary or not content:
             return None
-        mem_type = str(raw.get("type") or raw.get("card_type") or "fact").strip().lower()
-        if mem_type not in {"fact", "event", "quote", "moment"}:
-            mem_type = "fact"
         source = "model_api_correction" if action_type == "memory.add_correction" else "hosted_runtime_state"
         runtime_action["domain"] = "memory"
         runtime_action["executor_action"] = {
-            "type": "memory.add_correction" if action_type == "memory.add_correction" else "memory.add",
+            "type": "memory.add",
             "memory": {
-                "type": mem_type,
-                "title": title,
-                "description": description,
                 "summary": summary,
+                "content": content,
+                "bucket": clean_text(raw.get("bucket") or "未分类", 80),
+                "threads": [str(item).strip()[:80] for item in raw.get("threads", []) if str(item or "").strip()][:8]
+                if isinstance(raw.get("threads"), list) else [],
+                "importance": raw.get("importance", 0.5),
+                "pulse": raw.get("pulse", 0.3),
                 "occurred_at": clean_text(raw.get("occurred_at") or date.today().isoformat(), 80),
                 "source": clean_text(raw.get("source") or source, 80),
-                "context": str(raw.get("context") or "").strip()[:1000],
-                "her_quote": str(raw.get("her_quote") or "").strip()[:1000],
-                "verbatim": str(raw.get("verbatim") or raw.get("her_quote") or "").strip()[:1000],
             },
             "reason": reason,
             "capture_mode": "state",
@@ -388,19 +411,18 @@ def coerce_runtime_action(
         summary = str(raw.get("summary") or raw.get("description") or raw.get("content") or raw.get("title") or "").strip()[:2000]
         if not summary:
             return None
-        mem_type = str(raw.get("type") or raw.get("card_type") or "fact").strip().lower()
-        if mem_type not in {"fact", "event", "quote", "moment"}:
-            mem_type = "fact"
+        content = str(raw.get("content") or raw.get("description") or summary).strip()[:5000]
         memory_payload = {
-            "type": mem_type,
             "summary": summary,
-            "verbatim": str(raw.get("verbatim") or raw.get("her_quote") or "").strip()[:1000],
+            "content": content,
+            "bucket": clean_text(raw.get("bucket") or "", 80),
+            "threads": [str(item).strip()[:80] for item in raw.get("threads", []) if str(item or "").strip()][:8]
+            if isinstance(raw.get("threads"), list) else [],
+            "importance": raw.get("importance", 0.5),
+            "pulse": raw.get("pulse", 0.3),
             "occurred_at": clean_text(raw.get("occurred_at") or date.today().isoformat(), 80),
             "source": clean_text(raw.get("source") or "hosted_runtime_state", 80),
         }
-        context = str(raw.get("context") or "").strip()[:1000]
-        if context:
-            memory_payload["context"] = context
         runtime_action["domain"] = "memory"
         runtime_action["target"] = {"memory_id": memory_id}
         runtime_action["executor_action"] = {
@@ -441,28 +463,26 @@ def coerce_runtime_action(
             return runtime_action
 
         raw_patch = payload.get("patch") if isinstance(payload.get("patch"), dict) else payload
-        patch: dict[str, str] = {}
-        for key, max_len in (
-            ("title", 180),
-            ("description", 2000),
-            ("her_quote", 1000),
-            ("context", 1000),
-            ("type", 80),
-            ("occurred_at", 80),
-        ):
-            if key in raw_patch:
-                patch[key] = str(raw_patch.get(key) or "").strip()[:max_len]
-        if not patch:
-            description = str(payload.get("description") or payload.get("content") or payload.get("summary") or "").strip()[:2000]
-            if description:
-                patch["description"] = description
-        if not patch:
+        summary = str(raw_patch.get("summary") or raw_patch.get("description") or raw_patch.get("content") or "").strip()[:2000]
+        content = str(raw_patch.get("content") or raw_patch.get("description") or summary).strip()[:5000]
+        if not summary or not content:
             return None
         runtime_action["executor_action"] = {
-            "type": "memory.content_patch",
-            "memory_id": memory_id,
-            "patch": patch,
+            "type": "memory.supersede",
+            "supersedes": memory_id,
+            "memory": {
+                "summary": summary,
+                "content": content,
+                "bucket": clean_text(raw_patch.get("bucket") or "", 80),
+                "threads": [str(item).strip()[:80] for item in raw_patch.get("threads", []) if str(item or "").strip()][:8]
+                if isinstance(raw_patch.get("threads"), list) else [],
+                "importance": raw_patch.get("importance", 0.5),
+                "pulse": raw_patch.get("pulse", 0.3),
+                "occurred_at": clean_text(raw_patch.get("occurred_at") or date.today().isoformat(), 80),
+                "source": clean_text(raw_patch.get("source") or "hosted_runtime_state", 80),
+            },
             "reason": reason,
+            "capture_mode": "state",
         }
         return runtime_action
 
