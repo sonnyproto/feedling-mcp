@@ -32,13 +32,23 @@ log = logging.getLogger("feedling.agent_runtime.spawners")
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 # The canonical consumer (repo_root/tools/chat_resident_consumer.py).
 _RESIDENT_CONSUMER = str(_REPO_ROOT / "tools" / "chat_resident_consumer.py")
-# The Feedling perception CLI the hosted agent pulls context through (A1-lite:
-# skill + Bash, see docs/AGENT_CLI_INTEGRATION_SURVEY.md). Absolute so the path
-# resolves the same from the agent's cwd in dev (repo root) and image (/app).
+# The Feedling context CLI the hosted agent pulls perception/memory/screen
+# through (skill + Bash, see docs/AGENT_CLI_INTEGRATION_SURVEY.md). Absolute so
+# the path resolves the same from the agent's cwd in dev (repo root) and image
+# (/app).
 _IO_CLI = str(_REPO_ROOT / "tools" / "io_cli.py")
-# perception verbs io_cli.py exposes; each becomes a scoped Bash allow-rule + is
-# documented in the agent prompt so an unattended `claude -p` can pull context.
-_PERCEPTION_VERBS = ("perception", "perception-trend", "perception-history")
+# io_cli verbs exposed to hosted/resident agents; each becomes a scoped Bash
+# allow-rule + is documented in the agent prompt so an unattended `claude -p`
+# can pull the same native context tools as VPS/OpenClaw.
+_IO_CLI_VERBS = (
+    "perception",
+    "perception-trend",
+    "perception-history",
+    "memory-index",
+    "memory-fetch",
+    "screen-recent",
+    "screen-read",
+)
 # The how-to prompt shipped beside this module (into the image via COPY backend/).
 _AGENT_PROMPT_TEXT = (Path(__file__).resolve().parent / "agent_tools_prompt.md").read_text()
 _AGENT_PROMPT_BASENAME = "agent-tools-prompt.md"
@@ -106,22 +116,22 @@ def _codex_gateway_config(*, base_url: str, model: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _perception_allow_rules(io_cli: str = _IO_CLI) -> list[str]:
+def _io_cli_allow_rules(io_cli: str = _IO_CLI) -> list[str]:
     """Claude Bash permission allow-rules scoping the agent to just io_cli."""
-    return [f"Bash(python {io_cli} {verb}:*)" for verb in _PERCEPTION_VERBS]
+    return [f"Bash(python {io_cli} {verb}:*)" for verb in _IO_CLI_VERBS]
 
 
 def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
     """Default cli command per driver (resident substitutes ``{message}``).
 
-    For claude we pre-grant the io_cli perception verbs (so an unattended
+    For claude we pre-grant the io_cli verbs (so an unattended
     ``claude -p`` runs them without an interactive permission prompt) and append
     the how-to as a system prompt from the per-user home. Operators can override
     the whole thing per roster entry via ``cli_cmd``.
     """
     if driver == "codex":
         return "codex exec --json {message}"
-    grant = ",".join(_perception_allow_rules(io_cli))
+    grant = ",".join(_io_cli_allow_rules(io_cli))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
     return (
         f"claude --allowed-tools '{grant}' "
@@ -154,7 +164,7 @@ def agent_home_files(
             files[f"{home}/codex-home/config.toml"] = _codex_gateway_config(
                 base_url=gateway_base_url, model=model)
     else:
-        settings = {"permissions": {"allow": _perception_allow_rules(io_cli)}}
+        settings = {"permissions": {"allow": _io_cli_allow_rules(io_cli)}}
         files[f"{home}/claude-home/settings.json"] = json.dumps(settings, indent=2)
     return files
 

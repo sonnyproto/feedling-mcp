@@ -3431,6 +3431,7 @@ def _message_for_proactive_job(
     job: dict,
     screen_text: str = "",
     recent_chat_context: Any = "",
+    perception_digest: tuple[dict, list] | None = None,
 ) -> str:
     chat_context = _coerce_proactive_chat_context(recent_chat_context)
     wake_kind = _proactive_wake_kind(job, screen_text=screen_text)
@@ -3463,7 +3464,10 @@ def _message_for_proactive_job(
             f"- screen_context_available: {str(screen_available).lower()}"
         ),
         _proactive_attention_facts(chat_context),
+        _native_reachout_tool_instructions(),
     ]
+    if perception_digest is not None:
+        parts.append(_native_reachout_perception_context(*perception_digest))
     if chat_context.text:
         parts.append(
             "recent_chat_context:\n"
@@ -3481,6 +3485,33 @@ def _message_for_proactive_job(
     if screen_text:
         parts.append(screen_text)
     return "\n\n".join(parts)
+
+
+def _native_reachout_tool_instructions() -> str:
+    return "\n".join([
+        "native_tool_access:",
+        "- Use your runtime's native Feedling tools when more facts are useful; do not return JSON tool_calls for them.",
+        "- OpenClaw tool names: perception_now/perception_location/perception_weather/perception_motion/perception_calendar/perception_focus/perception_audio_route, perception_steps/perception_sleep/perception_workout/perception_vitals/perception_activity/perception_body/perception_metabolic/perception_cycle/perception_mood/perception_reminders, memory_index, memory_fetch, screen_recent, screen_read.",
+        "- Bash/CLI runtimes have the same capability through io_cli: perception, perception-trend, perception-history, memory-index, memory-fetch, screen-recent, screen-read.",
+        "- Cost guide: fast tools are perception_now/location/weather/motion/calendar/focus/audio_route, memory_index, and screen_read caption; slow tools are memory_fetch, screen_recent, health/body/activity/metabolic/cycle/mood/reminders, and image-heavy screen reads.",
+        "- For actions, return JSON messages/actions only: send_message, sleep, schedule_wake, cancel_wake, request_broadcast, set_ai_state.",
+    ])
+
+
+def _native_reachout_perception_context(presence: dict, change: list) -> str:
+    parts = [
+        "real_signal_context:",
+        "Presence and change hints are preloaded facts for this wake. Treat missing fields as unknown; pull native tools for more detail.",
+    ]
+    if presence:
+        parts.append("presence_hints_json:\n" + json.dumps(presence, ensure_ascii=False, sort_keys=True))
+    else:
+        parts.append("presence_hints_json: {}")
+    if change:
+        parts.append("perception_change_json:\n" + json.dumps(change, ensure_ascii=False, sort_keys=True))
+    else:
+        parts.append("perception_change_json: []")
+    return "\n".join(parts)
 
 
 def _resident_runtime_v2_enabled_for_job(job: dict) -> bool:
@@ -3537,6 +3568,30 @@ def _resident_perception_trend(signal: str, field: str) -> dict:
         return {}
 
 
+def _resident_perception_now() -> dict:
+    """Best-effort direct pull of /v1/agent/perception for native/V2 digest.
+
+    This intentionally bypasses /v1/proactive/tool/execute so native reach-out
+    can retire the simulated tool route without losing the cheap presence hints.
+    """
+    try:
+        resp = httpx.get(
+            f"{FEEDLING_API_URL}/v1/agent/perception",
+            headers=_HEADERS,
+            params={"signals": "now"},
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            return {}
+        body = resp.json()
+    except Exception as e:
+        log.debug("proactive presence pull failed: %s", e)
+        return {}
+    signals = body.get("signals") if isinstance(body, dict) else {}
+    now = signals.get("now") if isinstance(signals, dict) else {}
+    return now if isinstance(now, dict) else {}
+
+
 # Signals worth a "vs your norm" line when a wake fires (cheap to pull, high
 # narrative value). Empty until perception_daily accumulates a few days.
 _PROACTIVE_CHANGE_SIGNALS = (
@@ -3551,18 +3606,16 @@ def _proactive_perception_digest() -> tuple[dict, list]:
     not a blind prompt. presence = current cheap snapshot; change = vs-baseline
     deltas (Tier 2 trend). Both best-effort — failures degrade to empty."""
     presence: dict[str, Any] = {}
-    try:
-        res = _resident_call_tool_v2("perception.now", {})
-        snap = ((res or {}).get("result") or {}).get("snapshot")
-        if isinstance(snap, dict):
-            presence = {
-                k: snap.get(k)
-                for k in ("place_label", "motion_state", "now_playing",
-                          "battery_level", "charging", "local_time", "timezone")
-                if snap.get(k) is not None
-            }
-    except Exception as e:
-        log.debug("proactive presence pull failed: %s", e)
+    snap = _resident_perception_now()
+    if isinstance(snap, dict):
+        local_time = snap.get("local_time") if snap.get("local_time") is not None else snap.get("time")
+        keys = (
+            "place_label", "motion_state", "now_playing", "battery_level",
+            "charging", "timezone", "broadcast_state", "broadcast_active",
+        )
+        presence = {k: snap.get(k) for k in keys if snap.get(k) is not None}
+        if local_time is not None:
+            presence["local_time"] = local_time
     change: list[dict] = []
     for signal, field in _PROACTIVE_CHANGE_SIGNALS:
         tr = (_resident_perception_trend(signal, field) or {}).get("trend") or {}
@@ -4175,10 +4228,12 @@ def _process_proactive_jobs(jobs: list) -> float:
                 recent_chat_context=recent_context,
             )
         else:
+            perception_digest = _proactive_perception_digest()
             message = _message_for_proactive_job(
                 job,
                 screen_text=screen_text,
                 recent_chat_context=recent_context,
+                perception_digest=perception_digest,
             )
         log.info(
             "proactive job [ts=%.3f] id=%s intent=%s frames=%d",
@@ -4207,7 +4262,7 @@ def _process_proactive_jobs(jobs: list) -> float:
 
         turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
         actions, replies = turn.actions, turn.messages
-        if use_runtime_v2 and not replies:
+        if not replies:
             replies = _send_message_replies_from_actions(actions)
         proactive_actions, memory_identity_actions = _split_proactive_actions(actions)
         status_actions = [_compact_action_for_status(a) for a in proactive_actions]
@@ -4224,7 +4279,7 @@ def _process_proactive_jobs(jobs: list) -> float:
 
         schedule_action_results: list[dict] = []
         scheduled_action_failed = False
-        schedule_actions = _scheduled_wake_actions(proactive_actions) if use_runtime_v2 else []
+        schedule_actions = _scheduled_wake_actions(proactive_actions)
         if schedule_actions:
             try:
                 result = execute_scheduled_wake_actions(schedule_actions, job)
@@ -4322,7 +4377,7 @@ def _process_proactive_jobs(jobs: list) -> float:
             log.info("proactive wake slept id=%s reason=%s", job_id, sleep_action.get("reason") or "")
             continue
 
-        if use_runtime_v2 and schedule_actions and not replies:
+        if schedule_actions and not replies:
             update_proactive_job_status(
                 job_id,
                 "completed",

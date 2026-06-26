@@ -118,21 +118,25 @@ def test_build_container_argv_runs_resident_consumer_not_supervisor():
     assert "chat_resident_consumer.py" in joined
 
 
-# ---- A1-lite: hosted agent gets Feedling perception tools (skill + Bash) ----
+# ---- A-full: hosted agent gets Feedling native context tools (skill + Bash) ----
 
 
-def test_default_claude_cmd_grants_perception_tool_and_loads_prompt():
+def test_default_claude_cmd_grants_io_cli_tools_and_loads_prompt():
     env = spawners.consumer_env(
         {}, {"api_key": "fk", "provider_key": "sk-ant"},
         user_id="u", home="/agent-data/users/u",
     )
     cmd = env["AGENT_CLI_CMD"]
-    # the io_cli perception verbs are pre-granted so `claude -p` can run them
+    # the io_cli verbs are pre-granted so `claude -p` can run them
     # unattended (no interactive permission prompt), scoped to that one CLI.
     assert "--allowed-tools" in cmd
     assert "io_cli.py perception" in cmd
     assert "io_cli.py perception-trend" in cmd
-    # the perception how-to is appended as a system prompt from the per-user home
+    assert "io_cli.py memory-index" in cmd
+    assert "io_cli.py memory-fetch" in cmd
+    assert "io_cli.py screen-recent" in cmd
+    assert "io_cli.py screen-read" in cmd
+    # the context-tool how-to is appended as a system prompt from the per-user home
     assert "--append-system-prompt-file /agent-data/users/u/agent-tools-prompt.md" in cmd
     # the resident still substitutes the message
     assert cmd.endswith("-p {message}")
@@ -149,16 +153,24 @@ def test_custom_cli_cmd_opts_out_of_default_grant():
 
 def test_agent_home_files_seeds_prompt_and_claude_permission_allow():
     files = spawners.agent_home_files("/agent-data/users/u", driver="claude")
-    # the perception how-to lands in the per-user home (matches --append-system-prompt-file)
+    # the context-tool how-to lands in the per-user home (matches --append-system-prompt-file)
     prompt_path = "/agent-data/users/u/agent-tools-prompt.md"
     assert prompt_path in files
     assert "perception" in files[prompt_path]
+    assert "memory-index" in files[prompt_path]
+    assert "memory-fetch" in files[prompt_path]
+    assert "screen-recent" in files[prompt_path]
+    assert "screen-read" in files[prompt_path]
+    assert "Fast:" in files[prompt_path]
+    assert "Slow:" in files[prompt_path]
     # claude settings.json (under CLAUDE_CONFIG_DIR) pre-allows the io_cli command
     settings_path = "/agent-data/users/u/claude-home/settings.json"
     assert settings_path in files
     settings = json.loads(files[settings_path])
     allow = settings["permissions"]["allow"]
     assert any("io_cli.py perception" in rule for rule in allow)
+    assert any("io_cli.py memory-index" in rule for rule in allow)
+    assert any("io_cli.py screen-read" in rule for rule in allow)
 
 
 def test_agent_home_files_codex_seeds_agents_md():
@@ -166,10 +178,28 @@ def test_agent_home_files_codex_seeds_agents_md():
     # codex reads AGENTS.md; the same how-to is seeded into its home
     assert "/h/codex-home/AGENTS.md" in files
     assert "perception" in files["/h/codex-home/AGENTS.md"]
+    assert "memory-index" in files["/h/codex-home/AGENTS.md"]
+    assert "screen-read" in files["/h/codex-home/AGENTS.md"]
     # no claude settings.json for a codex user
     assert not any(p.endswith("claude-home/settings.json") for p in files)
     # native (default) codex talks straight to OpenAI — no gateway config.toml
     assert "/h/codex-home/config.toml" not in files
+
+
+def test_openclaw_feedling_plugin_declares_native_memory_screen_tools_with_costs():
+    plugin = Path(__file__).parent.parent / "deploy" / "openclaw-plugins" / "feedling-io-tools" / "index.js"
+    text = plugin.read_text()
+
+    assert "name: `perception_${signal}`" in text
+    assert "[${costClass}] Read Feedling perception signal" in text
+    assert 'name: "memory_index"' in text
+    assert "[fast] Read a compact index" in text
+    assert 'name: "memory_fetch"' in text
+    assert "[slow] Fetch verbatim decrypted memory cards" in text
+    assert 'name: "screen_recent"' in text
+    assert "[slow] List recent screen frame metadata" in text
+    assert 'name: "screen_read"' in text
+    assert "[fast caption, slow image] Read the decrypted caption/ocr" in text
 
 
 # ---- codex → LiteLLM gateway (non-openai providers) ----

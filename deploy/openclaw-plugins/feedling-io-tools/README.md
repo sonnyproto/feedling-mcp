@@ -11,15 +11,18 @@ meant the edits were lost on any VPS rebuild.
 
 ## What it does
 - **Perception** — one tool per signal in `SIGNALS` (`perception_now`,
-  `perception_mood`, …). Each shells out to `io_cli.py perception <signal>`.
+  `perception_mood`, …). Each shells out to `io_cli.py perception <signal>`;
+  tool descriptions label fast vs slow signals.
 - **Memory** (A-full Phase-0, read side) — `memory_index` (compact readside
   index → `io_cli.py memory-index`) and `memory_fetch` (verbatim cards by id →
-  `io_cli.py memory-fetch <ids>`). Both plaintext-safe (no client crypto).
-  Memory *writes* (`memory_add`/supersede) need client-side envelope encryption
-  and land in Phase-1.
+  `io_cli.py memory-fetch <ids>`). Both plaintext-safe (no client crypto);
+  `memory_index` is fast, `memory_fetch` is slow.
+  Memory *writes* stay on the consumer/client-encrypted action path, not this
+  read plugin.
 - **Screen** — `screen_recent` (frame metadata → `io_cli.py screen-recent`) and
   `screen_read` (decrypted caption/ocr of the latest frame → `io_cli.py
-  screen-read`; pixels off unless `include_image`).
+  screen-read`; pixels off unless `include_image`). Caption/OCR is fast;
+  recent/image-heavy reads are slow.
 - No hardcoded paths/keys: config (openclaw.json) → env → throw. The service env
   file (`FEEDLING_API_URL`/`FEEDLING_API_KEY`/`FEEDLING_ENCLAVE_URL`) is read at
   call time.

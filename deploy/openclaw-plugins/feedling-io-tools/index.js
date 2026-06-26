@@ -6,6 +6,7 @@ import path from "node:path";
 
 const execFileAsync = promisify(execFile);
 const SIGNALS = ["now","location","weather","motion","calendar","steps","sleep","workout","vitals","focus","audio_route","reminders","activity","body","metabolic","cycle","mood"];
+const FAST_SIGNALS = new Set(["now","location","weather","motion","calendar","focus","audio_route"]);
 
 // Declared in code so the gateway recognizes and forwards the configured config
 // to register(). (Declaring it only in openclaw.plugin.json was not enough — the
@@ -118,9 +119,10 @@ export default definePluginEntry({
   configSchema: CONFIG_SCHEMA,
   register(api, config = {}) {
     for (const signal of SIGNALS) {
+      const costClass = FAST_SIGNALS.has(signal) ? "fast" : "slow";
       api.registerTool({
         name: `perception_${signal}`,
-        description: `Read Feedling perception signal: ${signal} (provider-safe tool name for perception.${signal})`,
+        description: `[${costClass}] Read Feedling perception signal: ${signal} (provider-safe tool name for perception.${signal})`,
         parameters: { type: "object", properties: {}, additionalProperties: false },
         async execute() {
           try {
@@ -152,7 +154,7 @@ export default definePluginEntry({
     // memory.index — compact readside index (plaintext-safe).
     registerCli({
       name: "memory_index",
-      description: "Read a compact index of the user's memory cards (provider-safe name for memory.index). Returns id/summary/bucket/threads/score — use memory_fetch for verbatim content.",
+      description: "[fast] Read a compact index of the user's memory cards (provider-safe name for memory.index). Returns id/summary/bucket/threads/score — use memory_fetch for verbatim content.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -178,7 +180,7 @@ export default definePluginEntry({
     // memory.fetch — verbatim decrypted cards by id (plaintext-safe).
     registerCli({
       name: "memory_fetch",
-      description: "Fetch verbatim decrypted memory cards by id (provider-safe name for memory.fetch). Pass ids from memory_index.",
+      description: "[slow] Fetch verbatim decrypted memory cards by id (provider-safe name for memory.fetch). Pass ids from memory_index.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -200,7 +202,7 @@ export default definePluginEntry({
     // screen.recent — recent frame metadata (no pixels).
     registerCli({
       name: "screen_recent",
-      description: "List recent screen frame metadata (provider-safe name for screen.recent). No pixels; use screen_read for a caption.",
+      description: "[slow] List recent screen frame metadata (provider-safe name for screen.recent). No pixels; use screen_read for a caption.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -212,7 +214,7 @@ export default definePluginEntry({
     // screen.read — decrypted caption/ocr for a frame (latest by default).
     registerCli({
       name: "screen_read",
-      description: "Read the decrypted caption/ocr of a screen frame (provider-safe name for screen.read). Defaults to the latest frame; pixels off unless include_image.",
+      description: "[fast caption, slow image] Read the decrypted caption/ocr of a screen frame (provider-safe name for screen.read). Defaults to the latest frame; pixels off unless include_image.",
       parameters: {
         type: "object",
         additionalProperties: false,

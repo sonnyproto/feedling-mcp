@@ -94,11 +94,13 @@ def test_hosted_env_names_match_resident_and_are_per_user(tmp_path):
     assert out["consumer_id"] == "agent-runner:u1"
     # verify-ping handling is inherited from resident "for free".
     assert out["verify_ping_reply"] == "__verify_ack__"
-    # A1-lite: the default claude command pre-grants the io_cli perception tool
+    # A-full: the default claude command pre-grants the io_cli context tools
     # and appends the how-to from the per-user home; resident still owns {message}.
     cmd = out["agent_cli_cmd"]
     assert cmd.startswith("claude ")
     assert "--allowed-tools" in cmd and "io_cli.py perception" in cmd
+    assert "io_cli.py memory-index" in cmd
+    assert "io_cli.py screen-read" in cmd
     assert f"--append-system-prompt-file {home}/agent-tools-prompt.md" in cmd
     assert cmd.endswith("-p {message}")
 

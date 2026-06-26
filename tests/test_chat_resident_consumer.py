@@ -2008,6 +2008,214 @@ def test_process_proactive_runtime_v2_schedule_action_calls_backend_without_chat
     assert completed[-1][3]["extra"]["wake_result"] == "action_only"
 
 
+def test_process_proactive_native_action_only_send_message_posts(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"posted": [], "statuses": []}
+
+    def _agent(message, images=None, image_paths=None):
+        captured["message"] = message
+        captured["images"] = images
+        captured["image_paths"] = image_paths
+        return {"actions": [{"type": "send_message", "text": "Native action bubble"}], "messages": []}
+
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: ({}, []))
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_native"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_native_send",
+        "wake_id": "wake_native_send",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 128.5,
+        "trigger": "heartbeat",
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(128.5)
+    assert "Feedling proactive wake" in captured["message"]
+    assert "native_tool_access" in captured["message"]
+    assert "memory_index" in captured["message"]
+    assert "screen_read" in captured["message"]
+    assert "v2_context_json" not in captured["message"]
+    assert captured["posted"][0][0] == "Native action bubble"
+    assert captured["posted"][0][1]["proactive_job_id"] == "pj_native_send"
+    assert any(s[0] == "pj_native_send" and s[1] == "posted" for s in captured["statuses"])
+
+
+def test_process_proactive_native_schedule_and_cancel_actions_without_chat(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"scheduled": [], "statuses": [], "posted": []}
+
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: ({}, []))
+    monkeypatch.setattr(
+        crc,
+        "call_agent",
+        lambda message, images=None, image_paths=None: {
+            "actions": [
+                {
+                    "type": "schedule_wake",
+                    "at": "2030-01-01T09:30:00",
+                    "tz": "Asia/Shanghai",
+                    "note": "check in",
+                    "origin_refs": ["msg_1"],
+                },
+                {"type": "cancel_wake", "wake_id": "wake_old", "reason": "rescheduled"},
+            ],
+            "messages": [],
+        },
+    )
+    monkeypatch.setattr(
+        crc,
+        "execute_scheduled_wake_actions",
+        lambda actions, job: captured["scheduled"].append((actions, job)) or {
+            "results": [
+                {"type": "schedule_wake_result", "status": "scheduled", "timer_id": "sched_1"},
+                {"type": "cancel_wake_result", "status": "cancelled", "wake_id": "wake_old"},
+            ],
+        },
+    )
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_native_schedule",
+        "wake_id": "wake_native_schedule",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 128.75,
+        "trigger": "heartbeat",
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(128.75)
+    assert [a["type"] for a in captured["scheduled"][0][0]] == ["schedule_wake", "cancel_wake"]
+    assert captured["posted"] == []
+    completed = [s for s in captured["statuses"] if s[1] == "completed"]
+    assert completed
+    assert completed[-1][2] == "agent_scheduled_wake_actions"
+    assert completed[-1][3]["extra"]["wake_result"] == "action_only"
+    assert any(a.get("type") == "cancel_wake_result" for a in completed[-1][3]["extra"]["agent_actions"])
+
+
+def test_proactive_perception_digest_uses_agent_perception_route_not_v2_tool(monkeypatch):
+    calls = []
+
+    class _Resp:
+        def __init__(self, body):
+            self.status_code = 200
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def _get(url, headers=None, params=None, timeout=None):
+        calls.append((url, params, timeout))
+        if url.endswith("/v1/agent/perception"):
+            return _Resp({
+                "ok": True,
+                "signals": {
+                    "now": {
+                        "time": "2026-06-26T20:30:00+08:00",
+                        "timezone": "Asia/Shanghai",
+                        "place_label": "home",
+                        "motion_state": "still",
+                        "battery_level": 0.61,
+                        "charging": True,
+                    },
+                },
+            })
+        return _Resp({
+            "trend": {
+                "current": 80,
+                "delta": 5,
+                "direction": "up",
+                "baseline": {"median": 75, "n": 2},
+            },
+        })
+
+    monkeypatch.setattr(crc, "_resident_call_tool_v2", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("simulated tool route used")))
+    monkeypatch.setattr(crc.httpx, "get", _get)
+
+    presence, change = crc._proactive_perception_digest()
+
+    assert presence["place_label"] == "home"
+    assert presence["local_time"] == "2026-06-26T20:30:00+08:00"
+    assert any(call[0].endswith("/v1/agent/perception") and call[1] == {"signals": "now"} for call in calls)
+    assert all("/v1/proactive/tool/execute" not in call[0] for call in calls)
+    assert {item["signal"] for item in change} == {"vitals", "steps", "sleep"}
+
+
+def test_native_proactive_prompt_injects_digest_and_native_tool_catalog(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"statuses": []}
+
+    def _agent(message, images=None, image_paths=None):
+        captured["message"] = message
+        return {"actions": [{"type": "sleep", "reason": "nothing to say"}], "messages": []}
+
+    monkeypatch.setattr(
+        crc,
+        "_proactive_perception_digest",
+        lambda: (
+            {"place_label": "home", "motion_state": "still", "local_time": "2026-06-26T20:30:00+08:00"},
+            [{"signal": "steps", "field": "step_count", "current": 4200, "baseline_median": 3000, "delta": 1200}],
+        ),
+    )
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "post_reply", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should sleep")))
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_native_digest",
+        "wake_id": "wake_native_digest",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 128.9,
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(128.9)
+    assert "real_signal_context" in captured["message"]
+    assert "presence_hints_json" in captured["message"]
+    assert "\"place_label\": \"home\"" in captured["message"]
+    assert "perception_change_json" in captured["message"]
+    assert "\"signal\": \"steps\"" in captured["message"]
+    assert "native_tool_access" in captured["message"]
+    assert "perception_now" in captured["message"]
+    assert "memory_index" in captured["message"]
+    assert "memory_fetch" in captured["message"]
+    assert "screen_recent" in captured["message"]
+    assert "screen_read" in captured["message"]
+    assert "io_cli: perception" in captured["message"]
+    assert "Cost guide" in captured["message"]
+
+
 def test_normalize_agent_replies_supports_multiple_messages_with_cap(monkeypatch):
     monkeypatch.setattr(crc, "PROACTIVE_MAX_REPLY_MESSAGES", 5)
 

@@ -80,10 +80,11 @@ python -m pytest tests/test_agent_runtime_*.py tests/test_hosted_agent_runtime_c
   turns (`tests/test_agent_runtime_resident_contract.py`). Gap: codex has no cli
   session-resume branch yet; remaining A0 needs a live backend+enclave+provider
   run for the onboarding green-light.
-- **Stage A1 — Feedling tools (skill + Bash, skeleton done 2026-06-25):** the
-  hosted agent pulls perception via `tools/io_cli.py`, NOT the OpenClaw-only
-  `feedling-io-tools` plugin (see docs/AGENT_CLI_INTEGRATION_SURVEY.md). The
-  default claude command pre-grants the io_cli perception verbs
+- **Stage A1 — Feedling tools (skill + Bash, skeleton done 2026-06-25; expanded
+  for A-full P2-1):** the hosted agent pulls perception, memory readside, and
+  screen context via `tools/io_cli.py`, NOT the OpenClaw-only `feedling-io-tools`
+  plugin (see docs/AGENT_CLI_INTEGRATION_SURVEY.md). The default claude command
+  pre-grants the io_cli context verbs
   (`--allowed-tools`) and appends the how-to
   (`agent_tools_prompt.md` → `--append-system-prompt-file`); `spawners`
   `agent_home_files()` seeds that prompt + a claude `settings.json` allow-list
