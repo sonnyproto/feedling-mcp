@@ -12,10 +12,12 @@ Design notes:
   - Two-head routing:
       perception.*   -> main backend (FEEDLING_API_URL)   [coarse, no decrypt]
       photo/memory   -> enclave (FEEDLING_ENCLAVE_URL)     [decrypt; phase 2]
-  - Auth: X-API-Key = FEEDLING_API_KEY (both backend and enclave accept it).
+  - Auth: X-API-Key = FEEDLING_API_KEY, or (zero-roster host-all) the Stage-D
+    runtime token from FEEDLING_RUNTIME_TOKEN_FILE as X-Feedling-Runtime-Token.
+    Both backend and enclave accept either.
 
 Config via env (same as the resident consumer): FEEDLING_API_URL,
-FEEDLING_API_KEY, FEEDLING_ENCLAVE_URL.
+FEEDLING_API_KEY (or FEEDLING_RUNTIME_TOKEN_FILE), FEEDLING_ENCLAVE_URL.
 
 MVP = `perception`. send / wait-for-wake / schedule-wake / photo are phase 2 and
 currently return a clean "not implemented" JSON so the agent degrades gracefully.
@@ -51,9 +53,28 @@ def _env(name):
     return os.environ.get(name, "").strip()
 
 
-def _http_json(method, url, api_key, *, payload=None, insecure=False, timeout=30):
+def _auth_headers():
+    """Auth header for backend/enclave calls. Prefer ``FEEDLING_API_KEY``; in
+    zero-roster host-all mode it is absent, so fall back to the Stage-D runtime
+    token written to ``FEEDLING_RUNTIME_TOKEN_FILE`` (both backend and enclave
+    accept ``X-Feedling-Runtime-Token``). Empty dict when neither is available."""
+    api_key = _env("FEEDLING_API_KEY")
+    if api_key:
+        return {"X-API-Key": api_key}
+    token_file = _env("FEEDLING_RUNTIME_TOKEN_FILE")
+    if token_file:
+        try:
+            tok = open(token_file).read().strip()
+        except Exception:
+            tok = ""
+        if tok:
+            return {"X-Feedling-Runtime-Token": tok}
+    return {}
+
+
+def _http_json(method, url, auth, *, payload=None, insecure=False, timeout=30):
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
-    headers = {"X-API-Key": api_key, "Accept": "application/json"}
+    headers = {**auth, "Accept": "application/json"}
     if data is not None:
         headers["Content-Type"] = "application/json"
     req = urllib.request.Request(url, data=data, method=method, headers=headers)
@@ -77,9 +98,9 @@ def _http_json(method, url, api_key, *, payload=None, insecure=False, timeout=30
 
 def cmd_perception(args):
     api_url = _env("FEEDLING_API_URL")
-    api_key = _env("FEEDLING_API_KEY")
-    if not api_url or not api_key:
-        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_API_KEY in env"}, 2)
+    auth = _auth_headers()
+    if not api_url or not auth:
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
     signals = list(args.signals) or list(FAST_SIGNALS)
     unknown = [s for s in signals if s not in PERCEPTION_SIGNALS]
     if unknown:
@@ -87,7 +108,7 @@ def cmd_perception(args):
                "available": list(PERCEPTION_SIGNALS)}, 2)
     qs = urllib.parse.urlencode({"signals": ",".join(signals)})
     url = f"{api_url.rstrip('/')}/v1/agent/perception?{qs}"
-    status, body = _http_json("GET", url, api_key)
+    status, body = _http_json("GET", url, auth)
     if status == 200:
         _emit({"ok": True, **body})
     # Surface the backend's shape verbatim so the agent (and we, during
@@ -98,14 +119,14 @@ def cmd_perception(args):
 
 def cmd_perception_trend(args):
     api_url = _env("FEEDLING_API_URL")
-    api_key = _env("FEEDLING_API_KEY")
-    if not api_url or not api_key:
-        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_API_KEY in env"}, 2)
+    auth = _auth_headers()
+    if not api_url or not auth:
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
     params = {"signal": args.signal, "days": str(args.days)}
     if args.field:
         params["field"] = args.field
     url = f"{api_url.rstrip('/')}/v1/agent/perception/trend?{urllib.parse.urlencode(params)}"
-    status, body = _http_json("GET", url, api_key)
+    status, body = _http_json("GET", url, auth)
     if status == 200:
         _emit(body)
     _emit({"ok": False, "http_status": status, "error": body}, 1)
@@ -113,12 +134,12 @@ def cmd_perception_trend(args):
 
 def cmd_perception_history(args):
     api_url = _env("FEEDLING_API_URL")
-    api_key = _env("FEEDLING_API_KEY")
-    if not api_url or not api_key:
-        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_API_KEY in env"}, 2)
+    auth = _auth_headers()
+    if not api_url or not auth:
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
     params = {"signal": args.signal, "days": str(args.days)}
     url = f"{api_url.rstrip('/')}/v1/agent/perception/history?{urllib.parse.urlencode(params)}"
-    status, body = _http_json("GET", url, api_key)
+    status, body = _http_json("GET", url, auth)
     if status == 200:
         _emit(body)
     _emit({"ok": False, "http_status": status, "error": body}, 1)

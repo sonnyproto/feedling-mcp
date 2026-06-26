@@ -406,6 +406,10 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_LITELLM_ENABLE:      ${{ vars.FEEDLING_LITELLM_ENABLE }}
           FEEDLING_LITELLM_API_KEY:     ${{ secrets.FEEDLING_LITELLM_API_KEY }}
+          # Host-all: agent-runner hosts every configured user (zero-roster, via
+          # runtime token) + backend routes their sends to it. Needs the token
+          # secret above. Empty = off. Both services read it from the encrypted env.
+          FEEDLING_HOST_ALL:            ${{ vars.FEEDLING_HOST_ALL }}
           # R2 frame-ciphertext offload (backend/object_storage.py). Encrypted
           # env channel; empty = feature off. The token MUST be scoped to the
           # frames bucket. See deploy/DEPLOYMENTS.md.
@@ -440,6 +444,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
             -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
+            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
             --wait
 
       - name: Publish live compose_hash on Sepolia
@@ -580,6 +585,10 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_LITELLM_ENABLE:      ${{ vars.TEST_FEEDLING_LITELLM_ENABLE }}
           FEEDLING_LITELLM_API_KEY:     ${{ secrets.TEST_FEEDLING_LITELLM_API_KEY }}
+          # Host-all: agent-runner hosts every configured user (zero-roster, via
+          # runtime token) + backend routes their sends to it. Needs the token
+          # secret above. Empty = off. Both services read it from the encrypted env.
+          FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
           # R2 frame-ciphertext offload — TEST_-prefixed secrets, un-prefixed
           # container env. Empty = feature off; token MUST be scoped to the
           # frames bucket. See deploy/DEPLOYMENTS.md.
@@ -614,6 +623,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
             -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
+            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
             --wait
 
       - name: Publish live compose_hash on Sepolia (test contract)

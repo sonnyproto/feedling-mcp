@@ -665,7 +665,8 @@ def set_blob(user_id: str, kind: str, doc) -> None:
         log.error("[db] set_blob(%s,%s) failed: %s", user_id, kind, e)
 
 
-def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict]:
+def list_agent_runtime_enabled_users(include_gateway: bool = False,
+                                     host_all: bool = False) -> list[dict]:
     """Users opted into the hosted agent runtime (Stage C auto-discovery).
 
     A ``model_api`` config that is tested-ok and has hosting enabled
@@ -678,16 +679,30 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict
     supervisor has the LiteLLM gateway enabled. Otherwise they're excluded so a
     user who flipped hosting on for such a provider stays inert (legacy) instead
     of being spawned against a gateway that isn't running.
+
+    ``host_all`` (FEEDLING_HOST_ALL) flips the enable semantics to default-ON: a
+    tested-ok provider config is discovered WITHOUT the per-user flag; only an
+    EXPLICIT opt-out (``agent_runtime_driver`` set to a legacy/off value) is
+    excluded. Default (``host_all=False``) keeps the gradual-rollout gate — the
+    flag must be explicitly set. Mirror this with cutover.host_all_enabled().
     Returns ``[{"user_id", "driver", "provider", "model", "base_url"}]`` sorted by
     user_id. The supervisor reads this directly (it already holds a DB pool for
     leases) to discover who to run instead of a static roster."""
     providers = ["anthropic", "claude", "deepseek", "openai"]
     if include_gateway:
         providers += ["gemini", "openrouter", "openai_compatible"]
+    if host_all:
+        # default-ON: unset/'' is included; only an explicit legacy/off opts out.
+        enable_clause = ("AND LOWER(COALESCE(doc->>'agent_runtime_driver', '')) "
+                         "NOT IN ('legacy', 'off', 'false', '0', 'no', 'disabled')")
+    else:
+        # gradual-rollout gate: the flag must be explicitly enabled (unset → out).
+        enable_clause = ("AND LOWER(COALESCE(doc->>'agent_runtime_driver', 'legacy')) "
+                         "NOT IN ('', 'legacy', 'off', 'false', '0', 'no', 'disabled')")
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT user_id,
                   CASE LOWER(COALESCE(doc->>'provider', ''))
                     WHEN 'anthropic' THEN 'claude'
@@ -701,8 +716,7 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict
                 FROM user_blobs
                 WHERE kind = 'model_api'
                   AND COALESCE(doc->>'test_status', '') = 'ok'
-                  AND LOWER(COALESCE(doc->>'agent_runtime_driver', 'legacy'))
-                      NOT IN ('', 'legacy', 'off', 'false', '0', 'no', 'disabled')
+                  {enable_clause}
                   AND LOWER(COALESCE(doc->>'provider', '')) = ANY(%s)
                 ORDER BY user_id
                 """,

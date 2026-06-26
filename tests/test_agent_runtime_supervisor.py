@@ -369,3 +369,204 @@ def test_resolve_roster_prefers_existing_secret_over_self_fetch(monkeypatch):
     out = supervisor_mod._resolve_roster([{"api_key": "k2", "provider_key": "sk-explicit"}])
     assert out[0]["provider_key"] == "sk-explicit"
     assert called["fetched"] is False
+
+
+# ---- Stage D: zero-roster credential resolution via runtime token ----
+
+
+def test_auth_headers_prefers_runtime_token():
+    assert supervisor_mod._auth_headers(runtime_token="tok") == {"X-Feedling-Runtime-Token": "tok"}
+    assert supervisor_mod._auth_headers(api_key="k") == {"X-API-Key": "k"}
+
+
+def test_resolve_discovered_builds_entries_via_token_without_api_key(monkeypatch):
+    # host-all zero-roster: the supervisor knows only the user_id (from the DB).
+    # It mints a runtime token and uses it to self-fetch + enclave-decrypt the
+    # provider key — NO api_key anywhere.
+    enabled = {"u1": {"driver": "claude", "provider": "anthropic", "model": "claude-x", "base_url": ""}}
+    minted = {}
+
+    def fake_mint(uid):
+        minted[uid] = f"tok-{uid}"
+        return minted[uid]
+
+    monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope",
+                        lambda api_url, api_key="", runtime_token="": ({"ct": "x"} if runtime_token else None))
+    monkeypatch.setattr(supervisor_mod, "_decrypt_provider_key",
+                        lambda enclave_url, api_key="", envelope=None, runtime_token="": ("sk-ant" if runtime_token else ""))
+    out = supervisor_mod._resolve_discovered(enabled, mint_token=fake_mint,
+                                             api_url="http://b:5001", enclave_url="https://e:5003", cache={})
+    e = {x["user_id"]: x for x in out}["u1"]
+    assert e["provider_key"] == "sk-ant" and e["driver"] == "claude"
+    assert "api_key" not in e                       # zero-roster: no api_key
+    assert minted["u1"] == "tok-u1"
+
+
+def test_resolve_discovered_caches_by_user_and_envelope(monkeypatch):
+    # Re-resolving the same user with the same envelope must NOT re-hit the enclave
+    # every tick (decrypt is a network call).
+    enabled = {"u1": {"driver": "claude", "provider": "anthropic", "model": "m", "base_url": ""}}
+    calls = {"n": 0}
+    monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope",
+                        lambda api_url, api_key="", runtime_token="": {"ct": "same"})
+
+    def dec(enclave_url, api_key="", envelope=None, runtime_token=""):
+        calls["n"] += 1
+        return "sk"
+
+    monkeypatch.setattr(supervisor_mod, "_decrypt_provider_key", dec)
+    cache = {}
+    supervisor_mod._resolve_discovered(enabled, mint_token=lambda u: "t",
+                                       api_url="a", enclave_url="e", cache=cache)
+    supervisor_mod._resolve_discovered(enabled, mint_token=lambda u: "t",
+                                       api_url="a", enclave_url="e", cache=cache)
+    assert calls["n"] == 1                           # same envelope → decrypted once
+
+
+def test_effective_roster_host_all_uses_discovered_entries():
+    # When host-all supplies pre-credentialed discovered entries, they ARE the
+    # roster (no api_key roster needed); base_roster only overrides by user_id.
+    discovered = [{"user_id": "u1", "driver": "claude", "provider": "anthropic",
+                   "model": "m", "base_url": "", "provider_key": "sk"}]
+    roster, gateways = supervisor_mod._effective_roster(
+        [], autodiscover=False, gateway_enabled=False, host_all_discovered=discovered)
+    assert [e["user_id"] for e in roster] == ["u1"]
+    assert roster[0]["provider_key"] == "sk" and "api_key" not in roster[0]
+
+
+def test_effective_roster_host_all_base_roster_overrides_by_user_id():
+    # A dev-supplied base_roster entry (with api_key) wins over discovery for the
+    # same user — lets an operator pin a specific credential locally.
+    discovered = [{"user_id": "u1", "driver": "claude", "provider": "anthropic", "provider_key": "sk-disc"}]
+    base = [{"user_id": "u1", "api_key": "k", "driver": "claude", "provider": "anthropic", "provider_key": "sk-dev"}]
+    roster, _ = supervisor_mod._effective_roster(
+        base, autodiscover=False, gateway_enabled=False, host_all_discovered=discovered)
+    assert len(roster) == 1 and roster[0]["provider_key"] == "sk-dev"
+
+
+# ---- Codex P1: host_all must reach the DB discovery query ----
+
+
+def test_discover_enabled_threads_host_all_to_db(monkeypatch):
+    captured = {}
+
+    def fake_list(include_gateway=False, host_all=False):
+        captured["include_gateway"] = include_gateway
+        captured["host_all"] = host_all
+        return []
+
+    monkeypatch.setattr(supervisor_mod.db, "list_agent_runtime_enabled_users", fake_list)
+    supervisor_mod._discover_enabled(include_gateway=True, host_all=True)
+    assert captured == {"include_gateway": True, "host_all": True}
+
+
+# ---- Codex P2: preserve a cached provider key across transient credential failures ----
+
+
+def test_resolve_discovered_keeps_cached_key_on_transient_fetch_failure(monkeypatch):
+    enabled = {"u1": {"driver": "claude", "provider": "anthropic", "model": "m", "base_url": ""}}
+    state = {"env": {"ct": "x"}}
+    monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope",
+                        lambda api_url, api_key="", runtime_token="": state["env"])
+    monkeypatch.setattr(supervisor_mod, "_decrypt_provider_key",
+                        lambda enclave_url, api_key="", envelope=None, runtime_token="": "sk-good")
+    cache = {}
+    out1 = supervisor_mod._resolve_discovered(enabled, mint_token=lambda u: "t",
+                                              api_url="a", enclave_url="e", cache=cache)
+    assert out1[0]["provider_key"] == "sk-good"
+    # fetch fails this tick → must keep the cached key, NOT drop it (else a healthy
+    # consumer respawns keyless on a transient blip).
+    state["env"] = None
+    out2 = supervisor_mod._resolve_discovered(enabled, mint_token=lambda u: "t",
+                                              api_url="a", enclave_url="e", cache=cache)
+    assert out2[0]["provider_key"] == "sk-good"
+
+
+def test_resolve_discovered_keeps_cached_key_on_decrypt_failure(monkeypatch):
+    enabled = {"u1": {"driver": "claude", "provider": "anthropic", "model": "m", "base_url": ""}}
+    envs = iter([{"ct": "x"}, {"ct": "y"}])   # envelope changes → forces a re-decrypt
+    monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope",
+                        lambda api_url, api_key="", runtime_token="": next(envs))
+    decs = iter(["sk-good", ""])              # 2nd decrypt fails
+    monkeypatch.setattr(supervisor_mod, "_decrypt_provider_key",
+                        lambda enclave_url, api_key="", envelope=None, runtime_token="": next(decs))
+    cache = {}
+    supervisor_mod._resolve_discovered(enabled, mint_token=lambda u: "t",
+                                       api_url="a", enclave_url="e", cache=cache)
+    out2 = supervisor_mod._resolve_discovered(enabled, mint_token=lambda u: "t",
+                                              api_url="a", enclave_url="e", cache=cache)
+    assert out2[0]["provider_key"] == "sk-good"   # failed re-decrypt keeps last good key
+
+
+# ---- auto verify_loop: open the bootstrap gate for a freshly-hosted user ----
+
+
+def test_autoverify_triggers_once_then_marks_done():
+    # A freshly-hosted user is dead-ended at needs_live_connection until verify_loop
+    # runs once. Once passing, it is marked done and never re-triggers.
+    calls = []
+    state = {}
+
+    def post_verify(api_url, headers):
+        calls.append(headers)
+        return True   # passing
+
+    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
+                                     state=state, post_verify=post_verify, now=lambda: 100.0)
+    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
+                                     state=state, post_verify=post_verify, now=lambda: 100.0)
+    assert len(calls) == 1                          # second call skipped (done)
+    assert calls[0] == {"X-Feedling-Runtime-Token": "t"}
+    assert state["u1"]["done"] is True
+
+
+def test_autoverify_backs_off_after_failure():
+    # A user that can't pass yet (e.g. still at needs_identity) must NOT be re-probed
+    # every tick — back off so we don't generate avoidable verify traffic.
+    calls = []
+    state = {}
+    clock = {"t": 0.0}
+
+    def post_verify(api_url, headers):
+        calls.append(clock["t"])
+        return False   # never passes
+
+    now = lambda: clock["t"]
+    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
+                                     state=state, post_verify=post_verify, now=now)
+    assert len(calls) == 1                          # first probe at t=0
+    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
+                                     state=state, post_verify=post_verify, now=now)
+    assert len(calls) == 1                          # immediate retry suppressed (backoff)
+    clock["t"] = 10_000.0
+    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
+                                     state=state, post_verify=post_verify, now=now)
+    assert len(calls) == 2                          # probes again only after the window
+
+
+def test_autoverify_stops_probing_once_it_passes_after_failures():
+    state = {}
+    clock = {"t": 0.0}
+    results = iter([False, True])
+
+    def post_verify(api_url, headers):
+        return next(results)
+
+    now = lambda: clock["t"]
+    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
+                                     state=state, post_verify=post_verify, now=now)
+    assert state["u1"]["done"] is False             # failed → backing off
+    clock["t"] = 10_000.0
+    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
+                                     state=state, post_verify=post_verify, now=now)
+    assert state["u1"]["done"] is True              # passed → done
+    called = {"n": 0}
+
+    def pv2(api_url, headers):
+        called["n"] += 1
+        return True
+
+    clock["t"] = 99_999.0
+    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
+                                     state=state, post_verify=pv2, now=now)
+    assert called["n"] == 0                         # done → never probes again

@@ -36,6 +36,7 @@ import logging
 import os
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -194,12 +195,24 @@ def _whoami(api_url: str, api_key: str) -> str:
         return ""
 
 
-def _decrypt_provider_key(enclave_url: str, api_key: str, envelope: dict) -> str:
+def _auth_headers(*, api_key: str = "", runtime_token: str = "") -> dict:
+    """Auth header for a backend/enclave call. A runtime token (Stage D) is
+    preferred when present — it lets the supervisor act for a DB-discovered user
+    WITHOUT holding that user's api_key (zero-roster host-all). Both the backend
+    whoami and the enclave ``/v1/envelope/decrypt`` accept either credential."""
+    if runtime_token:
+        return {"X-Feedling-Runtime-Token": runtime_token}
+    return {"X-API-Key": api_key}
+
+
+def _decrypt_provider_key(enclave_url: str, api_key: str = "", envelope: dict | None = None,
+                          *, runtime_token: str = "") -> str:
     """JIT-decrypt a provider-key envelope via the enclave (purpose reuses the
-    model_api config scheme). Plaintext is handed to the child via env."""
+    model_api config scheme). Plaintext is handed to the child via env. Auth is
+    the api_key, or a runtime token (Stage D zero-roster) when provided."""
     try:
         resp = httpx.post(f"{enclave_url.rstrip('/')}/v1/envelope/decrypt",
-                          headers={"X-API-Key": api_key},
+                          headers=_auth_headers(api_key=api_key, runtime_token=runtime_token),
                           json={"envelope": envelope, "purpose": "model_api_provider_key"},
                           timeout=20, verify=False)
         resp.raise_for_status()
@@ -209,13 +222,14 @@ def _decrypt_provider_key(enclave_url: str, api_key: str, envelope: dict) -> str
         return ""
 
 
-def _fetch_key_envelope(api_url: str, api_key: str) -> dict | None:
+def _fetch_key_envelope(api_url: str, api_key: str = "", *, runtime_token: str = "") -> dict | None:
     """Fetch the user's OWN provider-key envelope ciphertext from the backend
     (Stage B: ``GET /v1/model_api/key_envelope``), so a roster need only carry
-    api_keys. Returns the envelope dict, or None if unconfigured/unreachable."""
+    api_keys (or, Stage D, nothing — a runtime token authenticates instead).
+    Returns the envelope dict, or None if unconfigured/unreachable."""
     try:
         resp = httpx.get(f"{api_url.rstrip('/')}/v1/model_api/key_envelope",
-                         headers={"X-API-Key": api_key}, timeout=10)
+                         headers=_auth_headers(api_key=api_key, runtime_token=runtime_token), timeout=10)
         if resp.status_code == 404:
             return None
         resp.raise_for_status()
@@ -255,17 +269,21 @@ def _resolve_roster(roster: list[dict]) -> list[dict]:
     return resolved
 
 
-def _discover_enabled(include_gateway: bool = False) -> dict[str, dict]:
+def _discover_enabled(include_gateway: bool = False, host_all: bool = False) -> dict[str, dict]:
     """Map ``user_id -> {"driver", "provider"}`` for users opted into the hosted
     runtime (Stage C), read straight from the DB the supervisor already connects
     to for leases. The provider + model + base_url ride along so a codex user can
     be wired native (openai) vs LiteLLM-gateway (gemini/openrouter/…) at spawn, and
     the gateway routing can be built per user. ``include_gateway`` mirrors whether
     the LiteLLM gateway is running — when off, gateway-only providers are excluded
-    so they aren't spawned against a proxy that isn't there."""
+    so they aren't spawned against a proxy that isn't there. ``host_all`` mirrors
+    FEEDLING_HOST_ALL: it discovers every configured user (no per-user flag), so the
+    set matches what the backend cutover routes to hosted — otherwise unflagged
+    users would be routed to a consumer that was never spawned."""
     return {u["user_id"]: {"driver": u["driver"], "provider": u.get("provider", ""),
                            "model": u.get("model", ""), "base_url": u.get("base_url", "")}
-            for u in db.list_agent_runtime_enabled_users(include_gateway=include_gateway)}
+            for u in db.list_agent_runtime_enabled_users(include_gateway=include_gateway,
+                                                         host_all=host_all)}
 
 
 def _apply_discovery(roster: list[dict], enabled: dict[str, dict]) -> list[dict]:
@@ -284,6 +302,87 @@ def _apply_discovery(roster: list[dict], enabled: dict[str, dict]) -> list[dict]
                         "model": info.get("model", ""),
                         "base_url": info.get("base_url", "")})
     return out
+
+
+def _resolve_discovered(enabled: dict, *, mint_token, api_url: str, enclave_url: str,
+                        cache: dict) -> list[dict]:
+    """Stage D zero-roster: build credential-bearing entries for DB-discovered
+    users WITHOUT any api_key. For each user_id the supervisor mints a short-lived
+    runtime token, self-fetches the provider-key envelope and enclave-decrypts it
+    JIT (auth = token). ``cache`` (user_id -> {"sig", "provider_key"}) avoids
+    re-decrypting an unchanged envelope every tick. Entries carry no api_key — the
+    consumer authenticates with the token file the supervisor writes per tick."""
+    out = []
+    for uid, info in enabled.items():
+        tok = mint_token(uid)
+        env = _fetch_key_envelope(api_url, runtime_token=tok)
+        cached = cache.get(uid)
+        provider_key = ""
+        if env and enclave_url:
+            sig = json.dumps(env, sort_keys=True)
+            if cached and cached.get("sig") == sig:
+                provider_key = cached["provider_key"]
+            else:
+                decrypted = _decrypt_provider_key(enclave_url, envelope=env, runtime_token=tok)
+                if decrypted:
+                    provider_key = decrypted
+                    cache[uid] = {"sig": sig, "provider_key": decrypted}
+                elif cached:
+                    # Decrypt failed (transient) on a changed envelope — keep the last
+                    # good key so a healthy consumer isn't respawned keyless this tick.
+                    provider_key = cached["provider_key"]
+        elif cached:
+            # Envelope fetch failed (transient) — fall back to the last good key
+            # rather than dropping it (which _spawn_identity reads as a config change).
+            provider_key = cached["provider_key"]
+        entry = {"user_id": uid, "driver": info["driver"], "provider": info.get("provider", ""),
+                 "model": info.get("model", ""), "base_url": info.get("base_url", "")}
+        if provider_key:
+            entry["provider_key"] = provider_key
+        out.append(entry)
+    return out
+
+
+def _post_verify_loop(api_url: str, headers: dict) -> bool:
+    """POST /v1/chat/verify_loop — a synthetic ping the consumer answers, which
+    flips the user's ``chat_loop_verified`` and opens the bootstrap gate. Returns
+    whether the verify passed (an agent reply landed)."""
+    try:
+        resp = httpx.post(f"{api_url.rstrip('/')}/v1/chat/verify_loop",
+                          headers=headers, json={"timeout_sec": 30}, timeout=40)
+        resp.raise_for_status()
+        return bool(resp.json().get("passing"))
+    except Exception as e:  # noqa: BLE001
+        log.warning("autoverify post failed: %s", e)
+        return False
+
+
+# Backoff (seconds) between verify_loop attempts, indexed by consecutive failure
+# count (capped at the last entry). A user that cannot pass yet — e.g. still at
+# `needs_identity`, where the verify reply is gate-rejected — must NOT be re-probed
+# every tick; this spaces retries out so a genuinely-advancing user still gets
+# verified soon while a stuck one generates little traffic.
+_AUTOVERIFY_BACKOFF = [0.0, 30.0, 120.0, 600.0, 1800.0]
+
+
+def _maybe_autoverify(user_id: str, *, mint_token, api_url: str, state: dict,
+                      post_verify=_post_verify_loop, now=time.time) -> None:
+    """Open the bootstrap gate for a freshly-hosted user by running verify_loop.
+    ``state`` (user_id -> {"done", "fails", "next"}) makes it idempotent AND backed
+    off: a passed user is marked ``done`` and never re-probed; a failed attempt
+    schedules the next try with increasing backoff instead of every tick."""
+    s = state.get(user_id)
+    if s is not None and s.get("done"):
+        return
+    t = now()
+    if s is not None and t < s.get("next", 0.0):
+        return                                  # within the backoff window
+    if post_verify(api_url, _auth_headers(runtime_token=mint_token(user_id))):
+        state[user_id] = {"done": True}
+        return
+    fails = (s.get("fails", 0) if s else 0) + 1
+    delay = _AUTOVERIFY_BACKOFF[min(fails, len(_AUTOVERIFY_BACKOFF) - 1)]
+    state[user_id] = {"done": False, "fails": fails, "next": t + delay}
 
 
 def _spawn_identity(entry: dict) -> tuple:
@@ -353,7 +452,8 @@ def _wire_gateway_models(roster: list[dict]) -> tuple[list[dict], list[dict]]:
 
 
 def _effective_roster(base_roster: list[dict], *, autodiscover: bool,
-                      gateway_enabled: bool) -> tuple[list[dict], list[dict]]:
+                      gateway_enabled: bool,
+                      host_all_discovered: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
     """Compute the roster to actually run this tick + the gateway routing entries.
 
     ``base_roster`` carries credentials (resolved once at boot). Each tick we:
@@ -362,11 +462,23 @@ def _effective_roster(base_roster: list[dict], *, autodiscover: bool,
     gateway is off (no proxy to reach); and when the gateway is on, rewrite those
     users' requested model to ``gw-<uid>`` (returning the real models as gateway
     entries for the LiteLLM config). An empty result is fine — the supervisor
-    idles rather than exiting."""
-    roster = base_roster
-    if autodiscover:
+    idles rather than exiting.
+
+    ``host_all_discovered`` (Stage D host-all) supplies pre-credentialed entries
+    resolved from the DB via runtime token — they BECOME the roster (no api_key
+    roster needed). A ``base_roster`` entry with the same user_id still wins (dev
+    override / pinned local credential)."""
+    if host_all_discovered is not None:
+        by_uid = {e["user_id"]: e for e in host_all_discovered if e.get("user_id")}
+        for e in base_roster:
+            if e.get("user_id"):
+                by_uid[e["user_id"]] = e        # dev override wins
+        roster = list(by_uid.values())
+    elif autodiscover:
         enabled = _discover_enabled(include_gateway=gateway_enabled)
-        roster = _apply_discovery(roster, enabled)
+        roster = _apply_discovery(base_roster, enabled)
+    else:
+        roster = base_roster
     if not gateway_enabled:
         return _drop_gateway_users(roster), []
     return _wire_gateway_models(roster)
@@ -385,12 +497,19 @@ def main() -> int:
 
     gateway_enabled = os.environ.get("FEEDLING_LITELLM_ENABLE", "").strip().lower() in ("1", "true", "yes")
     autodiscover = os.environ.get("AGENT_RUNTIME_AUTODISCOVER", "").strip().lower() in ("1", "true", "yes")
+    # Stage D host-all: every configured user is hosted with NO api_key roster —
+    # the supervisor mints a runtime token per DB-discovered user and resolves the
+    # provider key with it. Requires FEEDLING_RUNTIME_TOKEN_SECRET (set below);
+    # without the secret there is no token to authenticate with, so host-all is inert.
+    host_all = os.environ.get("FEEDLING_HOST_ALL", "").strip().lower() in ("1", "true", "yes")
+    api_url = os.environ.get("FEEDLING_API_URL", "http://localhost:5001")
+    enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "")
 
     # Credentials resolved once (whoami + envelope decrypt are network calls). The
     # backend-enabled intersection + gateway wiring re-run each tick off this base,
     # so enabling/disabling a user (or the gateway) takes effect without a redeploy.
     base_roster = _resolve_roster(_load_roster())
-    if not base_roster and not autodiscover:
+    if not base_roster and not autodiscover and not host_all:
         log.warning("no roster and autodiscover off — supervisor will idle "
                     "(set AGENT_RUNTIME_USERS or AGENT_RUNTIME_AUTODISCOVER=1)")
 
@@ -401,16 +520,19 @@ def main() -> int:
     # tick. The consumer authenticates with the token instead of the long-term
     # API key. Secret unset → no token files → consumer stays on the API key.
     token_writer = None
+    mint_token = None
     secret_raw = os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").strip()
     if secret_raw:
         secret = secret_raw.encode("utf-8")
         ttl = float(os.environ.get("AGENT_RUNTIME_TOKEN_TTL_SEC", "900"))
         scopes = ["chat", "memory", "identity", "perception", "envelope_decrypt"]
 
+        def mint_token(user_id):
+            return runtime_token.mint(secret, user_id=user_id, runtime_instance_id=owner,
+                                      scope=scopes, ttl=ttl)
+
         def _mint_and_write(user_id, home):
-            tok = runtime_token.mint(secret, user_id=user_id, runtime_instance_id=owner,
-                                     scope=scopes, ttl=ttl)
-            spawners.write_runtime_token(home, tok)
+            spawners.write_runtime_token(home, mint_token(user_id))
 
         token_writer = _mint_and_write
 
@@ -426,23 +548,58 @@ def main() -> int:
         gateway_mgr = litellm_gateway.GatewayManager(config_path=cfg_path, port=port)
         log.info("litellm gateway enabled — config=%s port=%d", cfg_path, port)
 
+    if host_all and mint_token is None:
+        log.warning("FEEDLING_HOST_ALL set but FEEDLING_RUNTIME_TOKEN_SECRET is not — "
+                    "host-all is inert (no token to authenticate zero-roster users)")
+    host_all_active = host_all and mint_token is not None
+    cred_cache: dict = {}
+    autoverify_state: dict = {}    # user_id -> {done, fails, next} (backed-off gate-open)
+    autoverify_inflight: set = set()
+
     sup = Supervisor(
         owner=owner, lease_ttl=lease_ttl, data_root=data_root,
         spawn_fn=spawn_fn, alive_fn=alive_fn, kill_fn=kill_fn,
         token_writer=token_writer,
     )
-    log.info("supervisor up — owner=%s base_users=%d autodiscover=%s gateway=%s ttl=%.0fs",
-             owner, len(base_roster), autodiscover, gateway_enabled, lease_ttl)
+    log.info("supervisor up — owner=%s base_users=%d autodiscover=%s host_all=%s gateway=%s ttl=%.0fs",
+             owner, len(base_roster), autodiscover, host_all_active, gateway_enabled, lease_ttl)
     try:
         while True:
             try:
                 # Re-derive the live roster each tick so enabling/disabling a user
                 # (or the gateway) takes effect without restarting the supervisor.
+                discovered = None
+                if host_all_active:
+                    enabled = _discover_enabled(include_gateway=gateway_enabled, host_all=True)
+                    discovered = _resolve_discovered(
+                        enabled, mint_token=mint_token, api_url=api_url,
+                        enclave_url=enclave_url, cache=cred_cache)
                 roster, gateways = _effective_roster(
-                    base_roster, autodiscover=autodiscover, gateway_enabled=gateway_enabled)
+                    base_roster, autodiscover=autodiscover, gateway_enabled=gateway_enabled,
+                    host_all_discovered=discovered)
                 if gateway_mgr is not None:
                     gateway_mgr.reconcile(gateways)
                 sup.tick(roster)
+                # Stage D host-all: a freshly-hosted user is dead-ended at
+                # needs_live_connection until verify_loop runs once. Open the gate
+                # in the background (the POST blocks ~30s for the consumer's reply).
+                # Only for users THIS supervisor owns a running consumer for (sup.children)
+                # — so the verify ping can actually be answered — and backed off so a
+                # user stuck earlier in bootstrap isn't re-probed every tick.
+                if host_all_active:
+                    for uid in list(sup.children):
+                        if uid in autoverify_inflight or autoverify_state.get(uid, {}).get("done"):
+                            continue
+                        autoverify_inflight.add(uid)
+
+                        def _autoverify(uid=uid):
+                            try:
+                                _maybe_autoverify(uid, mint_token=mint_token, api_url=api_url,
+                                                  state=autoverify_state)
+                            finally:
+                                autoverify_inflight.discard(uid)
+
+                        threading.Thread(target=_autoverify, daemon=True).start()
             except Exception as e:  # noqa: BLE001
                 log.exception("supervisor tick failed: %s", e)
             time.sleep(interval)

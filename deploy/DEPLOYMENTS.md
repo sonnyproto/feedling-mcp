@@ -69,11 +69,24 @@ compose_hash — flipping them on later needs **no on-chain re-auth**.
 | `FEEDLING_RUNTIME_TOKEN_SECRET` | Stage-D: mint short-lived per-user runtime tokens (consumer drops the long-term api key) | off → consumer uses api key |
 | `FEEDLING_LITELLM_ENABLE` | run the in-CVM LiteLLM gateway (codex non-openai providers). **Must match the backend's same var** (the cutover routing decision is backend-side) | off |
 | `FEEDLING_LITELLM_API_KEY` | gateway bearer codex presents | — |
+| `FEEDLING_HOST_ALL` | **zero-touch hosting**: every configured user (tested-ok provider, not opted out) is hosted with NO `AGENT_RUNTIME_USERS` roster — the supervisor mints a runtime token per DB-discovered user and resolves the provider key with it; the backend routes their sends to the agent-runner; a freshly-hosted user's chat gate is auto-opened via verify_loop. **Requires `FEEDLING_RUNTIME_TOKEN_SECRET` set on BOTH services** (backend verifies, agent-runner mints) — inert without it. **Must match the backend's same var.** Per-user opt-out: set that user's `agent_runtime_driver="legacy"`. | off → per-user flag still required |
 
 CI secrets/vars (test job; `TEST_`-prefixed): `secrets.TEST_AGENT_RUNTIME_USERS`,
 `vars.TEST_AGENT_RUNTIME_AUTODISCOVER`, `secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET`,
-`vars.TEST_FEEDLING_LITELLM_ENABLE`, `secrets.TEST_FEEDLING_LITELLM_API_KEY`. Prod
-job uses the un-prefixed names.
+`vars.TEST_FEEDLING_LITELLM_ENABLE`, `secrets.TEST_FEEDLING_LITELLM_API_KEY`,
+`vars.TEST_FEEDLING_HOST_ALL`. Prod job uses the un-prefixed names.
+
+**Zero-touch host-all rollout order (`FEEDLING_HOST_ALL`):**
+1. First set `TEST_FEEDLING_RUNTIME_TOKEN_SECRET` (generate a random secret) so
+   BOTH backend + agent-runner share it. Re-deploy `test` with `HOST_ALL` still
+   off — confirms token auth wired, zero behaviour change.
+2. Set `TEST_FEEDLING_HOST_ALL=1`. Re-deploy. A user who only configured an
+   **anthropic** provider (NO `/v1/model_api/driver` flip, NOT in any roster) must
+   now: appear in `agent_runtime_instances` (lease row), get its chat gate
+   auto-opened, and reply via hosted claude on the first message.
+3. Prod: same two steps (secret first, then `FEEDLING_HOST_ALL=1`), gated on your
+   go — prod auto-hosting has only a global kill-switch + per-user opt-out, no
+   per-user gradual ramp.
 
 **To start real-device testing (recommended order — least → most unvalidated):**
 1. Deploy as-is (agent-runner idle). Confirms the 4th service builds + boots

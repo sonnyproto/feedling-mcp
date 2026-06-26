@@ -170,7 +170,9 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     """
     driver = (entry.get("driver") or "claude").strip().lower()
     env = dict(base_env)
-    env["FEEDLING_API_KEY"] = entry["api_key"]
+    # Stage D zero-roster entries carry no api_key — the consumer authenticates
+    # with the runtime-token file instead (FEEDLING_RUNTIME_TOKEN_FILE below).
+    env["FEEDLING_API_KEY"] = entry.get("api_key", "")
     env["AGENT_MODE"] = entry.get("agent_mode", "cli")
     env["AGENT_CLI_CMD"] = entry.get("cli_cmd") or _default_cli_cmd(driver, home)
     # Per-user isolation: separate checkpoint, agent session, image temp dir, and

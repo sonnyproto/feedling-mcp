@@ -43,6 +43,9 @@ _CODEX_PROVIDERS = {"openai", "gemini", "openrouter", "openai_compatible"}
 # then derived from the provider, so a stale "claude"/"codex" still resolves
 # correctly for the configured key.
 _OFF_FLAGS = {"", "legacy", "off", "false", "0", "no", "disabled"}
+# Explicit opt-out values (the OFF flags minus the unset case). Under host-all,
+# an unset flag means default-ON, so only these explicit values force legacy.
+_OPT_OUT_FLAGS = _OFF_FLAGS - {""}
 
 
 def driver_for_provider(provider: str) -> str:
@@ -86,16 +89,34 @@ def gateway_enabled() -> bool:
     return os.environ.get("FEEDLING_LITELLM_ENABLE", "").strip().lower() in ("1", "true", "yes")
 
 
+def host_all_enabled() -> bool:
+    """Whether this deployment hosts every configured user by default
+    (``FEEDLING_HOST_ALL``) instead of requiring the per-user enable flag. Must
+    mirror the supervisor's ``host_all`` discovery — otherwise the send routing
+    and whether a consumer exists disagree, wedging the turn in ``processing``."""
+    return os.environ.get("FEEDLING_HOST_ALL", "").strip().lower() in ("1", "true", "yes")
+
+
 def resolve_driver(config: dict | None, *, default: str = "legacy") -> str:
     """The driver for this user's turn: ``legacy`` unless hosting is enabled, then
     the agent derived from the configured provider (``claude``/``codex``), or
     ``legacy`` if the provider has no hosted-agent fit.
 
+    Two enable modes: by default a per-user flag (``agent_runtime_driver``) must
+    be on (gradual rollout). Under host-all (``FEEDLING_HOST_ALL``) every
+    configured provider is hosted by default; only an explicit per-user opt-out
+    (``agent_runtime_driver`` set to a legacy/off value) stays ``legacy``.
+
     Gateway-only codex providers (gemini/openrouter/openai_compatible) stay
     ``legacy`` until the LiteLLM gateway is enabled — otherwise no consumer runs
     for them and the send would hang in ``processing`` instead of using the legacy
     inline path. Native openai codex is unaffected."""
-    if not hosting_enabled(config):
+    if host_all_enabled():
+        flag = str((config or {}).get("agent_runtime_driver") or "").strip().lower()
+        if flag in _OPT_OUT_FLAGS:        # explicit per-user opt-out
+            return default
+        # otherwise default-ON → fall through to derive from provider
+    elif not hosting_enabled(config):
         return default
     provider = str((config or {}).get("provider") or "")
     driver = driver_for_provider(provider)

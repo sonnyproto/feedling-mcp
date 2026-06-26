@@ -88,6 +88,25 @@ def test_resolve_driver_ignores_stale_chosen_value_and_rederives():
     assert cutover.resolve_driver({"agent_runtime_driver": "codex", "provider": "anthropic"}) == "claude"
 
 
+def test_resolve_driver_host_all_hosts_configured_without_flag(monkeypatch):
+    # FEEDLING_HOST_ALL: a configured provider is hosted with NO per-user flag;
+    # only an explicit opt-out (agent_runtime_driver=legacy) stays legacy.
+    monkeypatch.setenv("FEEDLING_HOST_ALL", "1")
+    monkeypatch.delenv("FEEDLING_LITELLM_ENABLE", raising=False)
+    assert cutover.resolve_driver({"provider": "anthropic"}) == "claude"      # no flag → hosted
+    assert cutover.resolve_driver({"provider": "openai"}) == "codex"
+    assert cutover.resolve_driver({"provider": "anthropic",
+                                   "agent_runtime_driver": "legacy"}) == "legacy"  # explicit opt-out
+    assert cutover.resolve_driver({}) == "legacy"                              # no provider
+    assert cutover.resolve_driver({"provider": "gemini"}) == "legacy"         # gateway off → legacy
+
+
+def test_resolve_driver_host_all_off_keeps_flag_gate(monkeypatch):
+    # Default (FEEDLING_HOST_ALL unset): the per-user enable flag is still required.
+    monkeypatch.delenv("FEEDLING_HOST_ALL", raising=False)
+    assert cutover.resolve_driver({"provider": "anthropic"}) == "legacy"
+
+
 def test_hosting_enabled_gate():
     assert cutover.hosting_enabled({"agent_runtime_driver": "auto"}) is True
     assert cutover.hosting_enabled({"agent_runtime_driver": "legacy"}) is False

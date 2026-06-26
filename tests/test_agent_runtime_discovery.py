@@ -117,3 +117,27 @@ def test_list_enabled_users_includes_gateway_when_enabled(_clean_blobs):
 def test_list_enabled_users_empty_when_none_enabled(_clean_blobs):
     _seed_model_api("anthropic_off", provider="anthropic", test_status="ok", enabled=False)
     assert db.list_agent_runtime_enabled_users() == []
+
+
+# ---- host_all: configured provider is hosted without the per-user enable flag ----
+
+
+def test_list_enabled_users_host_all_includes_unflagged(_clean_blobs):
+    # host_all: a tested-ok provider config is discovered even with NO
+    # agent_runtime_driver flag; only an EXPLICIT opt-out (legacy) is excluded.
+    db.set_blob("anthropic_unset", "model_api",
+                {"provider": "anthropic", "model": "x", "test_status": "ok"})  # no flag
+    _seed_model_api("anthropic_optout", provider="anthropic", test_status="ok", enabled=False)  # =legacy
+    _seed_model_api("openai_failed", provider="openai", test_status="failed", enabled=True)
+    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(host_all=True)}
+    assert "anthropic_unset" in rows and rows["anthropic_unset"]["driver"] == "claude"
+    assert "anthropic_optout" not in rows          # explicit opt-out excluded
+    assert "openai_failed" not in rows             # test_status not ok excluded
+
+
+def test_list_enabled_users_flag_mode_unchanged(_clean_blobs):
+    # Default (host_all=False): an unflagged config is NOT discovered — the
+    # per-user enable flag is still required (gradual-rollout gate).
+    db.set_blob("anthropic_unset", "model_api",
+                {"provider": "anthropic", "model": "x", "test_status": "ok"})
+    assert db.list_agent_runtime_enabled_users(host_all=False) == []

@@ -195,6 +195,14 @@ services:
       # in `processing` (no consumer is spawned). Keep this in sync with the
       # agent-runner value. Default empty = off (safe).
       FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
+      # Host-all: every configured user is served by the agent-runner. The send
+      # routing here must agree with the supervisor's host_all discovery. Empty =
+      # off (per-user flag still required). Mirror the agent-runner's value.
+      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
+      # Stage-D runtime token secret — the BACKEND verifies tokens (enclave whoami
+      # falls back here), so it MUST share the agent-runner's secret or token auth
+      # 401s. Empty = off. Encrypted env, not baked into compose_hash.
+      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
     ports:
       - "5001:5001"
       - "9998:9998"
@@ -230,6 +238,10 @@ services:
       AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
       # Stage-D runtime token signing secret. Empty = off (consumer uses api key).
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+      # Host-all (zero-roster): mint a token per DB-discovered user and resolve its
+      # provider key with it — no AGENT_RUNTIME_USERS needed. Requires the token
+      # secret above. Empty = off. Mirror the backend's FEEDLING_HOST_ALL.
+      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
       # in-CVM LiteLLM gateway (codex non-openai). Empty = off; must mirror the
       # backend's FEEDLING_LITELLM_ENABLE. FEEDLING_LITELLM_PYTHON is baked in the
       # image (isolated venv).

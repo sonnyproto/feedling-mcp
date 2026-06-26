@@ -43,6 +43,18 @@ def test_consumer_env_uses_codex_cli_and_home_for_codex_driver():
     assert "ANTHROPIC_API_KEY" not in env
 
 
+def test_consumer_env_tolerates_missing_api_key_for_zero_roster():
+    # Stage D host-all: a discovered entry has NO api_key (the consumer auths with
+    # the runtime-token file). consumer_env must not KeyError on it.
+    env = spawners.consumer_env(
+        {}, {"provider_key": "sk-ant", "driver": "claude"},
+        user_id="u", home="/agent-data/users/u",
+    )
+    assert env["FEEDLING_API_KEY"] == ""
+    assert env["FEEDLING_RUNTIME_TOKEN_FILE"] == "/agent-data/users/u/runtime-token"
+    assert env["ANTHROPIC_API_KEY"] == "sk-ant"
+
+
 def test_consumer_env_honors_custom_cli_cmd():
     env = spawners.consumer_env(
         {}, {"api_key": "fk", "cli_cmd": "claude --resume -p {message}"},
