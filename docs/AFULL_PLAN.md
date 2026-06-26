@@ -57,9 +57,29 @@ A-full = 把 memory+screen 也做成原生插件,proactive 全走原生 `call_ag
 
 **并发红线**:同用户单飞(最多一个 pending/running capture)+ `capture_key` 幂等(app background + 静默 + 轮数同时触发不重复落卡)。
 
-### Phase 2(退役)
-- **Codex**:原生覆盖全部工具后,proactive 全切原生;删 `run_tool_loop_v2`/`_resident_run_agent_v2`/`_resident_call_tool_v2`/`/v1/proactive/tool/execute` + 相关测试;按 D2 处理 budget。
-- **Claude**:插件收尾 + skill.md(io-onboarding,**test 分支**)文档化新工具 + cost 引导。
+### Phase 2 — 退役模拟工具路(审计后重定义,Seven 2026-06-26 确认方向)
+
+**审计关键发现(`docs/CAPTURE_LANE_VERIFICATION` 第 7 节 + 深审):不能直接删。**
+VPS 上 proactive **主动唤醒(reach-out)目前走的就是模拟路**(`FEEDLING_RUNTIME_V2_DEFAULT_ON=true`),
+且模拟路是**功能完整**的那条:给唤醒 agent 提供 perception/memory/screen 工具 + send_message/sleep/
+schedule_wake/cancel_wake + perception digest 预载。当前 non-V2 "native/legacy" 分支是**退化旧桩**
+(无工具、不处理 schedule_wake、不转 send_message)。**直接删 = 主动陪伴回归(丢感知+定时)。**
+
+**正确做法:先把 reach-out 的原生 CLI 路补到同等能力,再退役。**(和落卡同套路:补 handler→切→删)
+保留 `tool_executor_v2`/`tool_catalog_v2`(hosted/dashboard/runtime_v2 仍用),只删模拟驱动。
+
+- **P2-1 原生 reach-out 补缺口**(Codex backend + Claude 验):
+  - 唤醒走原生 `call_agent`(OpenClaw CLI 运行时,**io_cli 插件已含 perception/memory/screen**,agent 自己拉)。
+  - 在 native 路加动作解析:`send_message` / `sleep` / `schedule_wake` / `cancel_wake`(目前 4227 行 schedule 仅 V2)。
+  - perception digest 注入 native 唤醒 prompt(或靠 agent 用 CLI 自拉)。
+  - 测试:native 唤醒能发消息、能 schedule_wake、能拉感知;invariant 不变。
+- **P2-2 切换 + 退役**(Codex):proactive 默认切 native;删 `run_tool_loop_v2`(tool_loop_v2.py)、
+  `/v1/proactive/tool/execute` 路由、`_resident_run_agent_v2`、`_resident_call_tool_v2`;
+  更新/删测试(test_tool_loop_v2.py、test_proactive_tool_execute_route.py、test_chat_resident_consumer 内 V2 专项);
+  ci.yml 同步移除已删测试文件(EP1 同款)。3555 行 `_resident_call_tool_v2("perception.now")` 健康探针改 io_cli。
+- **P2-3 VPS e2e**:真机 proactive 唤醒走 native → 发消息/定时/感知都在 + 不回归。
+
+- **Claude**:插件收尾 + skill.md(io-onboarding,**test 分支**)文档化新工具 + cost 引导(D2)。
 
 ### Phase 3(联测,EP1 同款四方)
 1. Claude 本地 → 2. Claude VPS e2e → 3. Codex 本地 → 4. Codex VPS e2e。
