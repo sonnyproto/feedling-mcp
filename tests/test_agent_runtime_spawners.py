@@ -27,6 +27,7 @@ def test_consumer_env_drives_resident_in_cli_mode_for_claude():
     # per-user isolation paths under the user's home
     assert env["CHECKPOINT_FILE"] == "/agent-data/users/u_1/checkpoint.json"
     assert env["AGENT_SESSION_FILE"] == "/agent-data/users/u_1/agent-session.txt"
+    assert env["AGENT_SESSION_MAX_TURNS"] == "24"   # host rotates sooner than VPS default (40)
     assert env["CLAUDE_CONFIG_DIR"] == "/agent-data/users/u_1/claude-home"
     assert env["CONSUMER_ID"] == "agent-runner:u_1"
     assert env["PATH"] == "/bin" and env["FEEDLING_API_URL"] == "http://b:5001"  # base preserved
@@ -41,6 +42,22 @@ def test_consumer_env_uses_codex_cli_and_home_for_codex_driver():
     assert env["CODEX_API_KEY"] == "sk-oai"
     assert env["CODEX_HOME"] == "/h/codex-home"
     assert "ANTHROPIC_API_KEY" not in env
+
+
+def test_consumer_env_host_session_cap_default_and_override():
+    # Host (agent-runner) sessions rotate at 24 turns (vs the shared consumer
+    # default 40) to tighten the in-session voice-drift window. Host-only:
+    # VPS consumers don't go through consumer_env. Operator env (base_env) wins.
+    env = spawners.consumer_env(
+        {}, {"api_key": "fk", "provider_key": "sk-ant"},
+        user_id="u_1", home="/h",
+    )
+    assert env["AGENT_SESSION_MAX_TURNS"] == "24"
+    env_override = spawners.consumer_env(
+        {"AGENT_SESSION_MAX_TURNS": "12"}, {"api_key": "fk", "provider_key": "sk-ant"},
+        user_id="u_1", home="/h",
+    )
+    assert env_override["AGENT_SESSION_MAX_TURNS"] == "12"
 
 
 def test_default_codex_cmd_skips_git_repo_check():

@@ -49,6 +49,11 @@ _IO_CLI_VERBS = (
     "screen-recent",
     "screen-read",
 )
+# Host-side resident sessions rotate at this many turns (vs the shared consumer
+# default of 40) so the persona file re-grounds voice more often within a long
+# relationship. Host-only — set via consumer_env(); VPS keeps the default.
+_HOST_SESSION_MAX_TURNS = "24"
+
 # The how-to prompt shipped beside this module (into the image via COPY backend/).
 _AGENT_PROMPT_TEXT = (Path(__file__).resolve().parent / "agent_tools_prompt.md").read_text()
 _AGENT_PROMPT_BASENAME = "agent-tools-prompt.md"
@@ -212,6 +217,13 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     # a per-user agent home (Claude/Codex) so nothing is shared across users.
     env["CHECKPOINT_FILE"] = f"{home}/checkpoint.json"
     env["AGENT_SESSION_FILE"] = f"{home}/agent-session.txt"
+    # Host (agent-runner) sessions rotate sooner than the shared consumer default
+    # (AGENT_SESSION_MAX_TURNS=40 in chat_resident_consumer.py) to tighten the
+    # in-session voice-drift window — the persona file is reread on every fresh
+    # spawn, so a shorter session re-grounds voice more often. This is host-only:
+    # VPS consumers don't go through consumer_env, so they keep the default 40.
+    # Operator env (base_env) wins if it already set the cap.
+    env.setdefault("AGENT_SESSION_MAX_TURNS", _HOST_SESSION_MAX_TURNS)
     env["IMAGE_TEMP_DIR"] = f"{home}/images"
     env["CONSUMER_ID"] = f"agent-runner:{user_id}"
     # Stage D: the consumer reads its short-lived runtime token from this file
