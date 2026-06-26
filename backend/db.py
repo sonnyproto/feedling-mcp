@@ -865,6 +865,49 @@ def genesis_latest_done_job(user_id: str) -> dict | None:
         return _genesis_row(cur, cur.fetchone())
 
 
+def genesis_claim_uploaded_jobs(*, limit: int = 1) -> list[dict]:
+    """Atomically claim uploaded genesis jobs for the CVM worker.
+
+    Uses SKIP LOCKED so multiple worker loops can poll without double-processing
+    the same import. Claimed jobs move uploaded -> processing in the same
+    transaction; genesis_state is updated by the worker service layer.
+    """
+    safe_limit = max(1, min(int(limit or 1), 16))
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            cur = conn.execute(
+                """
+                WITH picked AS (
+                    SELECT user_id, job_id
+                    FROM genesis_import_jobs
+                    WHERE status = 'uploaded'
+                    ORDER BY finalized_at ASC NULLS LAST, updated_at ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE genesis_import_jobs AS j SET
+                    status = 'processing',
+                    error = '',
+                    output = jsonb_build_object('stage', 'worker_claimed'),
+                    updated_at = now()
+                FROM picked
+                WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
+                RETURNING j.*
+                """,
+                (safe_limit,),
+            )
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        out.append(item)
+    return out
+
+
 def genesis_put_chunk(
     user_id: str,
     job_id: str,
@@ -953,6 +996,36 @@ def genesis_missing_chunk_seqs(user_id: str, job_id: str, total_chunks: int) -> 
         ).fetchall()
     have = {int(row[0]) for row in rows}
     return [seq for seq in range(total_chunks) if seq not in have]
+
+
+def genesis_list_chunks(user_id: str, job_id: str) -> list[dict]:
+    """Return all chunk rows, including encrypted body bytes, ordered by seq."""
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            SELECT user_id, job_id, seq, byte_start, byte_end,
+                   ciphertext_sha256, content_sha256, aad, encrypted_body,
+                   size_bytes, status, attempts, map_output_ref, error,
+                   created_at, updated_at
+            FROM genesis_import_chunks
+            WHERE user_id = %s AND job_id = %s
+            ORDER BY seq ASC
+            """,
+            (user_id, job_id),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        body = item.get("encrypted_body")
+        if isinstance(body, memoryview):
+            item["encrypted_body"] = body.tobytes()
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        out.append(item)
+    return out
 
 
 def genesis_mark_finalized(user_id: str, job_id: str) -> dict | None:

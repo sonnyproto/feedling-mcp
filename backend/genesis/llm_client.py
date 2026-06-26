@@ -1,8 +1,8 @@
 """Genesis LLM client interface.
 
 The caller supplies a runtime ProviderConfig whose api_key has been decrypted
-inside the CVM/enclave path. This module never persists that key; only request
-metadata, response text, and usage are cached for idempotency.
+inside the CVM/enclave path. This module never persists that key or LLM reply
+text; only request metadata, response hashes, lengths, and usage are recorded.
 """
 
 from __future__ import annotations

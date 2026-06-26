@@ -88,6 +88,34 @@ def test_create_import_job_writes_state_only_after_real_upload_start(monkeypatch
     assert captured["doc"]["status"] == "processing"
 
 
+def test_create_import_job_drops_plaintext_metadata(monkeypatch):
+    saved = {}
+
+    def fake_create(_user_id, job):
+        saved.update(job)
+        return {"job_id": job["job_id"], "status": "created", "privacy_mode": job["privacy_mode"]}
+
+    monkeypatch.setattr(service.db, "genesis_create_job", fake_create)
+    monkeypatch.setattr(service.db, "set_blob", lambda *_args: None)
+
+    service.create_import_job(_store(), {
+        "job_id": "job_1",
+        "metadata": {
+            "transcript": "raw chat should not persist",
+            "ai_persona": "raw persona should not persist",
+            "file_manifest_hash": "abc123",
+            "file_count": 2,
+        },
+    })
+
+    metadata = saved["metadata"]
+    assert metadata["file_manifest_hash"] == "abc123"
+    assert metadata["file_count"] == 2
+    assert metadata["privacy_copy"] == service.PRIVACY_COPY
+    assert "transcript" not in metadata
+    assert "ai_persona" not in metadata
+
+
 def test_create_import_job_is_idempotent_for_existing_job(monkeypatch):
     monkeypatch.setattr(service.db, "genesis_create_job", lambda *_args: None)
     monkeypatch.setattr(

@@ -53,6 +53,14 @@ RAW_REDUCER_OUTPUT_FIELDS = {
     "chunk_text",
     "chunk_texts",
 }
+SAFE_JOB_METADATA_KEYS = {
+    "archive_format",
+    "client_version",
+    "file_count",
+    "locale",
+    "schema_version",
+    "source_label",
+}
 
 
 def _text(value: Any, max_chars: int) -> str:
@@ -81,6 +89,31 @@ def b64encode(raw: bytes) -> str:
 def _stable_json_sha256(value: Any) -> str:
     raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
     return _sha256_hex(raw.encode("utf-8"))
+
+
+def _safe_job_metadata(metadata: Any) -> dict:
+    """Keep only non-content import metadata.
+
+    Genesis plaintext must arrive as encrypted chunks. Arbitrary metadata is too
+    easy for clients to misuse for raw persona/profile/transcript content, so the
+    persisted job doc keeps only small operational hints and hashes/counts.
+    """
+    if not isinstance(metadata, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    for key, value in metadata.items():
+        name = str(key or "").strip()
+        lower = name.lower()
+        if (
+            name in SAFE_JOB_METADATA_KEYS
+            or lower.endswith("_hash")
+            or lower.endswith("_sha256")
+            or lower.endswith("_count")
+            or lower.endswith("_bytes")
+        ):
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                safe[name] = value
+    return safe
 
 
 def _chunk_envelope_meta(store: UserStore, envelope_meta: dict | None, encrypted_body: bytes) -> dict:
@@ -185,7 +218,7 @@ def create_import_job(store: UserStore, payload: dict) -> tuple[dict, int]:
         raise ValueError("total_chunks_out_of_range")
     if total_bytes < 0:
         raise ValueError("total_bytes_out_of_range")
-    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    metadata = _safe_job_metadata(payload.get("metadata"))
     metadata = {
         **metadata,
         "privacy_copy": PRIVACY_COPY,
