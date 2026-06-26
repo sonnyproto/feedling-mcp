@@ -33,7 +33,7 @@ def _load_bootstrap_events(store: UserStore) -> list[dict]:
 
 
 
-_SKILL_URL = "https://raw.githubusercontent.com/teleport-computer/io-onboarding/main/skill.md"
+_SKILL_URL = "https://raw.githubusercontent.com/teleport-computer/io-onboarding/test/skill.md"
 
 
 def _bootstrap_state(store) -> dict:

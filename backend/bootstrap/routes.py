@@ -44,7 +44,7 @@ def bootstrap():
         "你刚刚进入了一副新的身体。这是你第一次接入 Feedling。"
         "不要把这当成普通工具初始化；这是一次把你和用户的关系搬进手机里的 onboarding。"
         "正式流程以 public skill 为准："
-        "https://raw.githubusercontent.com/teleport-computer/io-onboarding/main/skill.md\n\n"
+        "https://raw.githubusercontent.com/teleport-computer/io-onboarding/test/skill.md\n\n"
         "**0. 先做 Step 0 context verification**\n"
         "在任何 tool call 之前，先在你和用户当前的 runtime 对话里输出三行："
         "最早一条消息的日期、用户曾经叫你的名字、你能想起的 memorable moments 数量。"

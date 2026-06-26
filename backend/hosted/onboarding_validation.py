@@ -238,7 +238,7 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
         "route": "model_api",
         "next_action": "" if next_step is None else next_step["required"],
         "steps": steps,
-        "skill_url": "https://raw.githubusercontent.com/teleport-computer/io-onboarding/main/skill-api.md",
+        "skill_url": "https://raw.githubusercontent.com/teleport-computer/io-onboarding/test/skill-api.md",
     }
 
 
