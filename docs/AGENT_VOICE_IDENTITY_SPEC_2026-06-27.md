@@ -14,7 +14,7 @@
 | agent | 用户自己的 runtime | Feedling 在 CVM 里包 stock `claude -p` / `codex exec`,用户的 key 经 LiteLLM |
 | 家底 | **自带** | **空白** |
 | 声音来源 | runtime 原生,IO 不种 | **genesis 从上传历史蒸,CVM/enclave 内种** |
-| **genesis** | **agent 自己工具写**(读自己记忆) | **大部分在 CVM/enclave 内**(隐私:原始上传不出 TEE;大上传须 map-reduce);agent 只在 respawn 后写声音化的几样 |
+| **genesis** | **agent 自己工具写**(读自己记忆) | **大部分在 CVM/enclave 内**(隐私:明文不进 Feedling backend/存储,仅 CVM 内处理(见 §11.8);大上传须 map-reduce);agent 只在 respawn 后写声音化的几样 |
 | ongoing(capture/chat) | agent 拉/写(pull) | **同左**——ongoing 才是"收敛 VPS"成立的地方 |
 | chat loop | IO 不往 loop 注入任何东西 | 同左 |
 
@@ -301,7 +301,7 @@ opening / emotion / shape(句长断句标点) / address(称呼·自指) / moves(
 
 ### 9.2 host(API)—— 重
 1. **新建 chunked ingestion 组件(在 CVM 内)**:大上传开窗/分块,绝不静默截断(老 history_import cap 不再改)。
-2. **genesis 编排在 CVM/enclave 内跑**(隐私:原始上传不出 TEE;LLM 调用用**用户 key**经 LiteLLM):7.A-map/reduce(声音)+ 7.C-map/write(事实+name+维度)+ 7.B(persona 组装)。抽取逻辑可参考 `history_import` 的开窗/map-reduce,但**需移进 CVM**——history_import 现在跑在主 backend、明文出 TEE,**不能直接复用**。
+2. **genesis 编排在 CVM/enclave 内跑**(隐私:明文不进 Feedling backend/存储,仅 CVM 内处理(见 §11.8);LLM 调用用**用户 key**经 LiteLLM):7.A-map/reduce(声音)+ 7.C-map/write(事实+name+维度)+ 7.B(persona 组装)。抽取逻辑可参考 `history_import` 的开窗/map-reduce,但**需移进 CVM**——history_import 现在跑在主 backend、明文出 TEE,**不能直接复用**。
 3. **Provision persona 文件**:`agent_runtime/agent_home_files()` 多 seed persona 文件并 `--append-system-prompt-file` 挂上(现在只 seed `agent-tools-prompt.md`);install 后 respawn。定 **persona 文件 vs `agent-tools-prompt.md` 的 append 先后**。
 4. **加 agent 工具**:`io_cli` 增 `identity-write`(给 7.D 写 self_intro/签名,用现成 `identity.profile_patch`)+ ongoing capture 的 memory 写(与 A-full 对齐),加进 `_IO_CLI_VERBS` 授权(现在只读)。
 5. **7.D post-respawn**:首次 spawn 后 TA 写 self_intro/签名/"我来了"。
@@ -322,10 +322,11 @@ opening / emotion / shape(句长断句标点) / address(称呼·自指) / moves(
 1. **身份卡 = 服务端写**(name/维度);self_intro/签名 = respawn 后 TA 写。✓ 已并入 §4/§5/§7.C-write/§7.D。
 2. **被问"是不是 AI"**:**非必要不给 prompt**——不写强硬条款("怎么写都是错的")。persona 只保留软角色锚(伴侣不是助手),不碰"是否是 AI"。✓ 已并入 §6/§7.B。
 3. **session cap → 20–30**。✓ 已并入 §8/§9.2。
-4. **genesis 走加密路线 (b)**:在 **CVM/enclave 内**处理原始上传,**不出 TEE**;`history_import` 不能直接复用(它在主 backend、明文出 TEE),逻辑需移进 CVM。✓ §0.1/§9.2。
+4. **genesis 走加密路线 (b)**:在 **CVM/enclave 内**处理原始上传;`history_import` 不能直接复用(它在主 backend、明文经 provider_client 外发),逻辑需移进 CVM。✓ §0.1/§9.2。
 5. **genesis LLM 始终用用户 key**(我们从不提供 API key),CVM 内经 LiteLLM。✓ §9.2.2。
 6. **先 genesis 后 spawn** 明确:抽取+写事实/name/维度+装 persona 全部完成,再 spawn 出 TA。✓ §5。
 7. **「TA」是简称不是名字**:名字 grounded(真实名 / 无则留空 / 展示占位),绝不编名。✓ §3。
+8. **隐私口径(不 overclaim)**:用户给了 provider key = 信任他自己选的 provider,所以用用户 key 经 LiteLLM 调外部 provider 可接受。精确表述 = **"Feedling backend / 持久存储看不到导入明文;明文在 CVM 内处理,且仅用用户授权的 key 发给用户自己配置的 LLM provider。"** **不可声称**"明文完全不出 CVM/TEE"(除非将来模型本身跑在 CVM 内)。user-facing privacy copy 必须把 external provider 明列为"用户授权的数据处理方"。✓ §0.1/§9.2。
 
 ## 12. 开放问题(实现前再敲)
 1. persona 文件 vs `agent-tools-prompt.md` 的 `--append-system-prompt-file` 先后顺序(小)。
