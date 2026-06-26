@@ -64,7 +64,7 @@ def fake(monkeypatch):
     monkeypatch.setenv("R2_ENDPOINT", "https://acct.r2.cloudflarestorage.com")
     monkeypatch.setenv("R2_ACCESS_KEY_ID", "ak")
     monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "sk")
-    monkeypatch.setenv("R2_FRAMES_BUCKET", "fisherman-image-frames")
+    monkeypatch.setenv("R2_FRAMES_BUCKET", "io-image-frames")
     monkeypatch.setattr(object_storage, "_client", lambda: client)
     return client
 
@@ -102,7 +102,7 @@ def test_put_get_roundtrip_preserves_body_ct(fake):
     key = object_storage.put_frame_body("u1", "f1", body_ct)
     assert key == "frames/u1/f1"
     # Stored as raw decoded bytes (smaller than base64), not the b64 string.
-    assert fake.store[("fisherman-image-frames", "frames/u1/f1")] == base64.b64decode(body_ct)
+    assert fake.store[("io-image-frames", "frames/u1/f1")] == base64.b64decode(body_ct)
     # Read back re-encodes to the exact same base64 string.
     assert object_storage.get_frame_body("u1", "f1") == body_ct
 

@@ -1,17 +1,25 @@
 # feedling-io-tools (OpenClaw plugin)
 
-Canonical source for the OpenClaw plugin that exposes the Feedling perception
-CLI (`tools/io_cli.py`) as native `perception_<signal>` tools, so a resident
-agent (OpenClaw / Hermes / Claude Code) can pull perception with real agentic
-tool calls instead of a "make the model emit JSON" prompt.
+Canonical source for the OpenClaw plugin that exposes the Feedling tool CLI
+(`tools/io_cli.py`) as native OpenClaw tools, so a resident agent (OpenClaw /
+Hermes / Claude Code) can pull perception, read/recall memory, and read screen
+with real agentic tool calls instead of a "make the model emit JSON" prompt.
 
 This lives in-repo so it is version-controlled and redeployable — it used to
 exist only on the VPS (`~/.openclaw/workspace/plugins/feedling-io-tools/`), which
 meant the edits were lost on any VPS rebuild.
 
 ## What it does
-- Registers one tool per signal in `SIGNALS` (`perception_now`, `perception_mood`,
-  …). Each shells out to `io_cli.py perception <signal>` and returns the JSON.
+- **Perception** — one tool per signal in `SIGNALS` (`perception_now`,
+  `perception_mood`, …). Each shells out to `io_cli.py perception <signal>`.
+- **Memory** (A-full Phase-0, read side) — `memory_index` (compact readside
+  index → `io_cli.py memory-index`) and `memory_fetch` (verbatim cards by id →
+  `io_cli.py memory-fetch <ids>`). Both plaintext-safe (no client crypto).
+  Memory *writes* (`memory_add`/supersede) need client-side envelope encryption
+  and land in Phase-1.
+- **Screen** — `screen_recent` (frame metadata → `io_cli.py screen-recent`) and
+  `screen_read` (decrypted caption/ocr of the latest frame → `io_cli.py
+  screen-read`; pixels off unless `include_image`).
 - No hardcoded paths/keys: config (openclaw.json) → env → throw. The service env
   file (`FEEDLING_API_URL`/`FEEDLING_API_KEY`/`FEEDLING_ENCLAVE_URL`) is read at
   call time.

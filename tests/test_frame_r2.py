@@ -65,7 +65,7 @@ def _enable_r2(monkeypatch, client):
     monkeypatch.setenv("R2_ENDPOINT", "https://acct.r2.cloudflarestorage.com")
     monkeypatch.setenv("R2_ACCESS_KEY_ID", "ak")
     monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "sk")
-    monkeypatch.setenv("R2_FRAMES_BUCKET", "fisherman-image-frames")
+    monkeypatch.setenv("R2_FRAMES_BUCKET", "io-image-frames")
     monkeypatch.setattr(object_storage, "_client", lambda: client)
 
 
@@ -103,7 +103,7 @@ def test_upsert_offloads_body_to_r2(monkeypatch):
     db.frame_upsert(uid, "f1", 1.0, env)
 
     # ciphertext landed in R2 as raw decoded bytes
-    assert fake.store[("fisherman-image-frames", "frames/%s/f1" % uid)] == base64.b64decode(env["body_ct"])
+    assert fake.store[("io-image-frames", "frames/%s/f1" % uid)] == base64.b64decode(env["body_ct"])
     # PG row holds the pointer + metadata, no inline doc, no body_ct in env_meta
     doc, env_meta, body_key = _row(uid, "f1")
     assert doc is None
@@ -165,10 +165,10 @@ def test_delete_keeps_r2_when_db_delete_fails(monkeypatch):
     _enable_r2(monkeypatch, fake)
     uid = _uid()
     db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
-    assert ("fisherman-image-frames", "frames/%s/f1" % uid) in fake.store
+    assert ("io-image-frames", "frames/%s/f1" % uid) in fake.store
     monkeypatch.setattr(db, "get_pool", lambda: _BoomPool())
     db.frame_delete(uid, "f1")
-    assert ("fisherman-image-frames", "frames/%s/f1" % uid) in fake.store
+    assert ("io-image-frames", "frames/%s/f1" % uid) in fake.store
 
 
 def test_upsert_does_not_overwrite_r2_when_db_write_fails(monkeypatch):
@@ -179,7 +179,7 @@ def test_upsert_does_not_overwrite_r2_when_db_write_fails(monkeypatch):
     _enable_r2(monkeypatch, fake)
     uid = _uid()
     db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1", body=b"AAAA"))
-    key = ("fisherman-image-frames", "frames/%s/f1" % uid)
+    key = ("io-image-frames", "frames/%s/f1" % uid)
     assert fake.store[key] == b"AAAA"
 
     monkeypatch.setattr(db, "get_pool", lambda: _BoomPool())
@@ -209,7 +209,7 @@ def test_pointer_row_written_only_after_object_exists(monkeypatch):
     # at upload time the row was inline (doc present, no pointer yet)
     assert seen["row_at_upload"] == (True, None)
     # final state: object exists AND the row is now a pointer to it
-    assert ("fisherman-image-frames", "frames/%s/f1" % uid) in fake.store
+    assert ("io-image-frames", "frames/%s/f1" % uid) in fake.store
     doc, env_meta, body_key = _row(uid, "f1")
     assert doc is None and body_key == "frames/%s/f1" % uid
 
@@ -221,7 +221,7 @@ def test_delete_removes_r2_object(monkeypatch):
     db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
     db.frame_delete(uid, "f1")
     assert db.frame_exists(uid, "f1") is False
-    assert ("fisherman-image-frames", "frames/%s/f1" % uid) not in fake.store
+    assert ("io-image-frames", "frames/%s/f1" % uid) not in fake.store
 
 
 def test_prune_removes_r2_objects(monkeypatch):
@@ -232,9 +232,9 @@ def test_prune_removes_r2_objects(monkeypatch):
         db.frame_upsert(uid, f"f{i}", float(i), _env(uid, f"f{i}"))
     evicted = db.frame_prune_to(uid, 2)  # keep newest 2 (f2, f3)
     assert set(evicted) == {"f0", "f1"}
-    assert ("fisherman-image-frames", "frames/%s/f0" % uid) not in fake.store
-    assert ("fisherman-image-frames", "frames/%s/f1" % uid) not in fake.store
-    assert ("fisherman-image-frames", "frames/%s/f2" % uid) in fake.store
+    assert ("io-image-frames", "frames/%s/f0" % uid) not in fake.store
+    assert ("io-image-frames", "frames/%s/f1" % uid) not in fake.store
+    assert ("io-image-frames", "frames/%s/f2" % uid) in fake.store
 
 
 def test_delete_user_data_purges_r2(monkeypatch):

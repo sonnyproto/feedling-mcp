@@ -1437,6 +1437,70 @@ def test_process_proactive_wake_routes_through_agent_and_posts_metadata(monkeypa
     assert any(s[0] == "pj_1" and s[1] == "posted" for s in captured["statuses"])
 
 
+def test_capture_job_dispatch_uses_stub_not_proactive_handler(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    captured = {"statuses": [], "proactive_called": False}
+
+    def _fail_agent(*_args, **_kwargs):
+        raise AssertionError("capture job must not call agent in PR A stub")
+
+    def _fail_post(*_args, **_kwargs):
+        raise AssertionError("capture job must not write chat")
+
+    def _proactive_handler(_jobs):
+        captured["proactive_called"] = True
+        return 999.0
+
+    def _status(job_id, status, reason="", **kwargs):
+        captured["statuses"].append((job_id, status, reason, kwargs))
+
+    monkeypatch.setattr(crc, "call_agent", _fail_agent)
+    monkeypatch.setattr(crc, "post_reply", _fail_post)
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", _status)
+    monkeypatch.setattr(crc, "_process_proactive_jobs", _proactive_handler)
+
+    job = {
+        "job_id": "cap_dispatch",
+        "job_kind": "memory_capture",
+        "source": "memory_capture",
+        "status": "pending",
+        "trigger": "session_break",
+        "capture_key": "window:dispatch",
+        "window": {
+            "after_message_id": "msg_a",
+            "until_message_id": "msg_b",
+            "until_ts": 200.0,
+            "message_count": 4,
+        },
+        "ts": 222.0,
+    }
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert captured["proactive_called"] is False
+    assert captured["statuses"] == [
+        (
+            "cap_dispatch",
+            "completed",
+            "capture_stub_noop",
+            {
+                "extra": {
+                    "capture_result": {
+                        "status": "noop",
+                        "reason": "capture_handler_stub",
+                        "job_kind": "memory_capture",
+                    },
+                    "capture_window": job["window"],
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": "capture_handler_stub",
+                }
+            },
+        )
+    ]
+
+
 def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
@@ -1956,6 +2020,34 @@ def test_fire_scheduled_wakes_posts_backend_endpoint(monkeypatch):
     assert captured["headers"]["X-API-Key"] == "test_key_00000000"
     assert captured["timeout"] == 15
     assert body["results"][0]["status"] == "fired"
+
+
+def test_fire_capture_tick_posts_backend_endpoint(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"enqueued": True, "reason": "enqueued"}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        return _Resp()
+
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    body = crc.fire_capture_tick()
+
+    assert captured["url"] == "http://localhost:5001/v1/capture/tick"
+    assert captured["json"] == {}
+    assert captured["headers"]["X-API-Key"] == "test_key_00000000"
+    assert captured["timeout"] == 15
+    assert body["enqueued"] is True
 
 
 def test_post_proactive_reply_triggers_alert_and_live_activity(monkeypatch):

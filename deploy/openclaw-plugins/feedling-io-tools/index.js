@@ -58,7 +58,9 @@ function resolveConfig(config) {
   };
 }
 
-async function runPerception(config, signal) {
+// Generic io_cli.py invoker. `args` is the full argv after the script path
+// (e.g. ["perception", "now"] or ["memory-index", "--limit", "5"]).
+async function runCli(config, args) {
   const c = resolveConfig(config);
   const consumerRoot = path.resolve(c.consumerRoot);
   const serviceEnvPath = path.resolve(c.serviceEnvPath);
@@ -77,15 +79,32 @@ async function runPerception(config, signal) {
 
   const { stdout, stderr } = await execFileAsync(
     c.pythonPath,
-    [cliPath, "perception", signal],
+    [cliPath, ...args],
     { cwd: consumerRoot, env, timeout: c.timeoutMs, maxBuffer: 1024 * 1024 },
   );
   const text = (stdout || stderr || "").trim();
-  if (!text) throw new Error(`empty response from io_cli.py for signal ${signal}`);
+  if (!text) throw new Error(`empty response from io_cli.py for ${args.join(" ")}`);
   let parsed;
   try { parsed = JSON.parse(text); }
-  catch (error) { throw new Error(`non-JSON response for ${signal}: ${text.slice(0, 500)}`); }
+  catch (error) { throw new Error(`non-JSON response for ${args.join(" ")}: ${text.slice(0, 500)}`); }
   return parsed;
+}
+
+async function runPerception(config, signal) {
+  return runCli(config, ["perception", signal]);
+}
+
+// Build io_cli argv from a tool's structured params. Order: positional first,
+// then flags. Booleans become store_true flags only when true.
+function flagsFromParams(params, spec) {
+  const out = [];
+  for (const [key, flag, kind] of spec) {
+    const v = params ? params[key] : undefined;
+    if (v === undefined || v === null || v === "") continue;
+    if (kind === "bool") { if (v) out.push(flag); }
+    else { out.push(flag, String(v)); }
+  }
+  return out;
 }
 
 function toolResult(payload) {
@@ -95,7 +114,7 @@ function toolResult(payload) {
 export default definePluginEntry({
   id: "feedling-io-tools",
   name: "Feedling IO Tools",
-  description: "Expose Feedling IO perception CLI as native OpenClaw tools.",
+  description: "Expose Feedling IO perception/memory/screen CLI as native OpenClaw tools.",
   configSchema: CONFIG_SCHEMA,
   register(api, config = {}) {
     for (const signal of SIGNALS) {
@@ -113,5 +132,99 @@ export default definePluginEntry({
         },
       });
     }
+
+    // Helper: register a tool that maps structured params → io_cli argv.
+    const registerCli = ({ name, description, parameters, build }) => {
+      api.registerTool({
+        name,
+        description,
+        parameters,
+        async execute(params = {}) {
+          try {
+            return toolResult(await runCli(config, build(params || {})));
+          } catch (err) {
+            return toolResult({ ok: false, error: (err && err.message) ? err.message : String(err), tool: name });
+          }
+        },
+      });
+    };
+
+    // memory.index — compact readside index (plaintext-safe).
+    registerCli({
+      name: "memory_index",
+      description: "Read a compact index of the user's memory cards (provider-safe name for memory.index). Returns id/summary/bucket/threads/score — use memory_fetch for verbatim content.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          limit: { type: "integer", minimum: 1, maximum: 200, description: "max cards (default 50)" },
+          bucket: { type: "string", description: "filter by bucket name" },
+          thread: { type: "string", description: "filter by thread/dimension tag" },
+          query: { type: "string", description: "free-text relevance query" },
+          ambient: { type: "boolean", description: "ambient/background selection mode" },
+          include_sensitive: { type: "boolean", description: "include sensitive-classed cards" },
+        },
+      },
+      build: (p) => ["memory-index", ...flagsFromParams(p, [
+        ["limit", "--limit", "value"],
+        ["bucket", "--bucket", "value"],
+        ["thread", "--thread", "value"],
+        ["query", "--query", "value"],
+        ["ambient", "--ambient", "bool"],
+        ["include_sensitive", "--include-sensitive", "bool"],
+      ])],
+    });
+
+    // memory.fetch — verbatim decrypted cards by id (plaintext-safe).
+    registerCli({
+      name: "memory_fetch",
+      description: "Fetch verbatim decrypted memory cards by id (provider-safe name for memory.fetch). Pass ids from memory_index.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["ids"],
+        properties: {
+          ids: { type: "array", items: { type: "string" }, minItems: 1, description: "memory card ids" },
+          limit: { type: "integer", minimum: 1, maximum: 100, description: "max cards (default 20)" },
+          include_archived: { type: "boolean" },
+          include_superseded: { type: "boolean" },
+        },
+      },
+      build: (p) => ["memory-fetch", ...(Array.isArray(p.ids) ? p.ids.map(String) : []), ...flagsFromParams(p, [
+        ["limit", "--limit", "value"],
+        ["include_archived", "--include-archived", "bool"],
+        ["include_superseded", "--include-superseded", "bool"],
+      ])],
+    });
+
+    // screen.recent — recent frame metadata (no pixels).
+    registerCli({
+      name: "screen_recent",
+      description: "List recent screen frame metadata (provider-safe name for screen.recent). No pixels; use screen_read for a caption.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: { limit: { type: "integer", minimum: 1, maximum: 100, description: "max frames (default 10)" } },
+      },
+      build: (p) => ["screen-recent", ...flagsFromParams(p, [["limit", "--limit", "value"]])],
+    });
+
+    // screen.read — decrypted caption/ocr for a frame (latest by default).
+    registerCli({
+      name: "screen_read",
+      description: "Read the decrypted caption/ocr of a screen frame (provider-safe name for screen.read). Defaults to the latest frame; pixels off unless include_image.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          frame_id: { type: "string", description: "frame id; default = latest" },
+          include_image: { type: "boolean", description: "include base64 JPEG (large)" },
+        },
+      },
+      build: (p) => ["screen-read", ...flagsFromParams(p, [
+        ["frame_id", "--frame-id", "value"],
+        ["include_image", "--include-image", "bool"],
+      ])],
+    });
   },
 });

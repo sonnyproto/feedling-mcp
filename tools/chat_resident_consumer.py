@@ -239,6 +239,15 @@ PROACTIVE_TICK_START_DELAY_SEC = int(os.environ.get("PROACTIVE_TICK_START_DELAY_
 PROACTIVE_SCHEDULED_FIRE_ENABLED = _env_bool("PROACTIVE_SCHEDULED_FIRE_ENABLED", True)
 PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC = int(os.environ.get("PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC", "60"))
 PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC = int(os.environ.get("PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC", "5"))
+CAPTURE_TICK_ENABLED = _env_bool("FEEDLING_CAPTURE_TICK_ENABLED", True)
+CAPTURE_TICK_INTERVAL_SEC = int(os.environ.get(
+    "FEEDLING_CAPTURE_TICK_INTERVAL_SEC",
+    str(PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC),
+))
+CAPTURE_TICK_START_DELAY_SEC = int(os.environ.get(
+    "FEEDLING_CAPTURE_TICK_START_DELAY_SEC",
+    str(PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC),
+))
 PROACTIVE_MAX_REPLY_MESSAGES = int(os.environ.get("PROACTIVE_MAX_REPLY_MESSAGES", "5"))
 PROACTIVE_RECENT_CHAT_LIMIT = int(os.environ.get("PROACTIVE_RECENT_CHAT_LIMIT", "20"))
 PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT = int(os.environ.get("PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT", "50"))
@@ -2843,6 +2852,18 @@ def fire_scheduled_wakes() -> dict:
     return parsed if isinstance(parsed, dict) else {"results": [], "jobs": []}
 
 
+def fire_capture_tick() -> dict:
+    resp = httpx.post(
+        f"{FEEDLING_API_URL}/v1/capture/tick",
+        json={},
+        headers=_HEADERS,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    parsed = resp.json()
+    return parsed if isinstance(parsed, dict) else {"enqueued": False, "reason": "invalid_response"}
+
+
 def claim_proactive_job(job_id: str) -> bool:
     if not job_id:
         return False
@@ -3456,6 +3477,13 @@ def _resident_runtime_v2_enabled_for_job(job: dict) -> bool:
     return bool(profile.get(RESIDENT_WAKE_RUNTIME_V2_FLAG) or job.get(RESIDENT_WAKE_RUNTIME_V2_FLAG))
 
 
+def _is_memory_capture_job(job: dict) -> bool:
+    return (
+        str((job or {}).get("job_kind") or "").strip() == "memory_capture"
+        or str((job or {}).get("source") or "").strip() == "memory_capture"
+    )
+
+
 def _resident_user_id_for_job(job: dict) -> str:
     return str(
         _whoami_cache.get("user_id")
@@ -3637,6 +3665,51 @@ def _scheduled_wake_actions(actions: list[dict]) -> list[dict]:
         if typ in {"schedule_wake", "cancel_wake"}:
             out.append(action)
     return out
+
+
+def _process_capture_jobs(jobs: list) -> float:
+    """PR A capture-lane stub.
+
+    Capture jobs are not proactive reach-out jobs: do not call the agent, write
+    chat, request broadcast, or use delivery semantics in this substrate PR.
+    """
+    latest = 0.0
+    for job in jobs:
+        ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
+        latest = max(latest, ts)
+        if not _is_memory_capture_job(job):
+            continue
+        key = _proactive_job_key(job)
+        if not _mark_seen(key):
+            log.debug("skipping already-processed capture job key=%s", key)
+            continue
+        job_id = str(job.get("job_id") or "")
+        try:
+            if not claim_proactive_job(job_id):
+                log.info("capture job not claimed id=%s", job_id)
+                continue
+        except Exception as e:
+            log.error("capture job claim failed id=%s: %s", job_id, e)
+            continue
+        window = job.get("window") if isinstance(job.get("window"), dict) else {}
+        update_proactive_job_status(
+            job_id,
+            "completed",
+            "capture_stub_noop",
+            extra={
+                "capture_result": {
+                    "status": "noop",
+                    "reason": "capture_handler_stub",
+                    "job_kind": "memory_capture",
+                },
+                "capture_window": window,
+                "cards_added": 0,
+                "cards_superseded": 0,
+                "noop_reason": "capture_handler_stub",
+            },
+        )
+        log.info("capture job stub completed id=%s trigger=%s", job_id, job.get("trigger") or "")
+    return latest
 
 
 def _process_proactive_jobs(jobs: list) -> float:
@@ -3901,6 +3974,21 @@ def _process_proactive_jobs(jobs: list) -> float:
     return latest
 
 
+def _process_resident_jobs(jobs: list) -> float:
+    capture_jobs = [
+        job for job in (jobs or [])
+        if isinstance(job, dict) and _is_memory_capture_job(job)
+    ]
+    proactive_jobs = [
+        job for job in (jobs or [])
+        if not (isinstance(job, dict) and _is_memory_capture_job(job))
+    ]
+    return max(
+        _process_capture_jobs(capture_jobs) if capture_jobs else 0.0,
+        _process_proactive_jobs(proactive_jobs) if proactive_jobs else 0.0,
+    )
+
+
 def _process_messages(messages: list) -> float:
     """Process a batch of messages, return the highest timestamp seen."""
     latest = 0.0
@@ -4159,9 +4247,11 @@ def run() -> None:
     next_proactive_tick_mono = time.monotonic() + max(0, PROACTIVE_TICK_START_DELAY_SEC)
     scheduled_fire_enabled = proactive_enabled and PROACTIVE_SCHEDULED_FIRE_ENABLED
     next_scheduled_fire_mono = time.monotonic() + max(0, PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC)
+    capture_tick_enabled = CAPTURE_TICK_ENABLED
+    next_capture_tick_mono = time.monotonic() + max(0, CAPTURE_TICK_START_DELAY_SEC)
 
     log.info(
-        "starting poll loop — last_ts=%.3f last_job_ts=%.3f poll_timeout=%ds proactive=%s proactive_tick=%s tick_on=%ds tick_off=%ds scheduled_fire=%s scheduled_fire_interval=%ds",
+        "starting poll loop — last_ts=%.3f last_job_ts=%.3f poll_timeout=%ds proactive=%s proactive_tick=%s tick_on=%ds tick_off=%ds scheduled_fire=%s scheduled_fire_interval=%ds capture_tick=%s capture_tick_interval=%ds",
         last_ts,
         last_job_ts,
         POLL_TIMEOUT,
@@ -4171,6 +4261,8 @@ def run() -> None:
         PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC,
         scheduled_fire_enabled,
         PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC,
+        capture_tick_enabled,
+        CAPTURE_TICK_INTERVAL_SEC,
     )
 
     consecutive_errors = 0
@@ -4178,6 +4270,27 @@ def run() -> None:
     while _running:
         try:
             _refresh_auth_header()  # pick up a freshly-minted runtime token (Stage D)
+            if capture_tick_enabled and time.monotonic() >= next_capture_tick_mono:
+                try:
+                    capture_result = fire_capture_tick()
+                    if capture_result.get("enqueued") or str(capture_result.get("reason") or "") not in {"", "no_new_messages", "quiet_not_due", "already_captured"}:
+                        log.info(
+                            "capture tick enqueued=%s reason=%s quiet_for=%s",
+                            bool(capture_result.get("enqueued")),
+                            capture_result.get("reason"),
+                            capture_result.get("quiet_for_sec", ""),
+                        )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        capture_tick_enabled = False
+                        log.warning(
+                            "capture tick endpoint not available on this backend; "
+                            "disabling capture tick for this process"
+                        )
+                    else:
+                        raise
+                finally:
+                    next_capture_tick_mono = time.monotonic() + max(10, CAPTURE_TICK_INTERVAL_SEC)
             if proactive_enabled:
                 try:
                     if scheduled_fire_enabled and time.monotonic() >= next_scheduled_fire_mono:
@@ -4235,7 +4348,7 @@ def run() -> None:
                     job_result = poll_proactive_jobs(last_job_ts)
                     jobs = job_result.get("jobs") or []
                     if jobs:
-                        new_job_ts = _process_proactive_jobs(jobs)
+                        new_job_ts = _process_resident_jobs(jobs)
                         if new_job_ts > last_job_ts:
                             last_job_ts = new_job_ts
                             _save_proactive_checkpoint(last_job_ts)

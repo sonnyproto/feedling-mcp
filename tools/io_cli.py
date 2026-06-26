@@ -145,6 +145,84 @@ def cmd_perception_history(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+def _require_backend():
+    api_url = _env("FEEDLING_API_URL")
+    api_key = _env("FEEDLING_API_KEY")
+    if not api_url or not api_key:
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_API_KEY in env"}, 2)
+    return api_url.rstrip("/"), api_key
+
+
+def cmd_memory_index(args):
+    """Compact memory index (plaintext-safe readside). POST /v1/memory/index."""
+    api_url, api_key = _require_backend()
+    payload = {"limit": args.limit}
+    if args.bucket:
+        payload["bucket"] = args.bucket
+    if args.thread:
+        payload["thread"] = args.thread
+    if args.query:
+        payload["query"] = args.query
+    if args.ambient:
+        payload["ambient"] = True
+    if args.include_sensitive:
+        payload["include_sensitive"] = True
+    status, body = _http_json("POST", f"{api_url}/v1/memory/index", api_key, payload=payload)
+    if status == 200:
+        _emit({"ok": True, **body})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
+def cmd_memory_fetch(args):
+    """Verbatim decrypted memory cards by id (plaintext-safe). POST /v1/memory/fetch."""
+    api_url, api_key = _require_backend()
+    ids = list(args.ids)
+    if not ids:
+        _emit({"ok": False, "error": "memory-fetch needs at least one id"}, 2)
+    payload = {"ids": ids, "limit": args.limit}
+    if args.include_archived:
+        payload["include_archived"] = True
+    if args.include_superseded:
+        payload["include_superseded"] = True
+    status, body = _http_json("POST", f"{api_url}/v1/memory/fetch", api_key, payload=payload)
+    if status == 200:
+        _emit({"ok": True, **body})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
+def cmd_screen_recent(args):
+    """Recent screen frame metadata (no pixels). GET /v1/screen/frames."""
+    api_url, api_key = _require_backend()
+    qs = urllib.parse.urlencode({"limit": args.limit})
+    status, body = _http_json("GET", f"{api_url}/v1/screen/frames?{qs}", api_key)
+    if status == 200:
+        _emit({"ok": True, **body})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
+def cmd_screen_read(args):
+    """Decrypted screen frame (caption/ocr; pixels gated off by default).
+
+    GET /v1/screen/frames/<id>/decrypt (backend proxies to the enclave). When no
+    --frame-id is given, resolve the latest frame first.
+    """
+    api_url, api_key = _require_backend()
+    frame_id = args.frame_id
+    if not frame_id:
+        status, body = _http_json("GET", f"{api_url}/v1/screen/frames/latest", api_key)
+        if status != 200:
+            _emit({"ok": False, "http_status": status, "error": body}, 1)
+        frame_id = body.get("frame_id") or body.get("id") or (body.get("filename") or "").split(".")[0]
+        if not frame_id:
+            _emit({"ok": False, "error": "could not resolve latest frame_id", "latest": body}, 1)
+    include_image = "true" if args.include_image else "false"
+    qs = urllib.parse.urlencode({"include_image": include_image})
+    status, body = _http_json("GET", f"{api_url}/v1/screen/frames/{frame_id}/decrypt?{qs}", api_key)
+    if status == 200:
+        _emit({"ok": True, "frame_id": frame_id, **(body if isinstance(body, dict) else {"data": body})})
+    _emit({"ok": False, "http_status": status, "frame_id": frame_id, "error": body}, 1)
+
+
 def cmd_phase2(args):
     _emit({"ok": False,
            "error": f"'{args.verb}' is not implemented yet (phase 2)",
@@ -177,6 +255,31 @@ def main():
     ph.add_argument("signal", help="e.g. vitals/sleep/motion/location/calendar/reminders/mood")
     ph.add_argument("--days", type=int, default=14)
     ph.set_defaults(func=cmd_perception_history)
+
+    mi = sub.add_parser("memory-index", help="Compact memory index (readside, plaintext-safe).")
+    mi.add_argument("--limit", type=int, default=50)
+    mi.add_argument("--bucket", default="", help="filter by bucket name")
+    mi.add_argument("--thread", default="", help="filter by thread/dimension tag")
+    mi.add_argument("--query", default="", help="free-text relevance query")
+    mi.add_argument("--ambient", action="store_true", help="ambient (background) selection mode")
+    mi.add_argument("--include-sensitive", dest="include_sensitive", action="store_true")
+    mi.set_defaults(func=cmd_memory_index)
+
+    mf = sub.add_parser("memory-fetch", help="Verbatim decrypted memory cards by id.")
+    mf.add_argument("ids", nargs="+", help="one or more memory card ids")
+    mf.add_argument("--limit", type=int, default=20)
+    mf.add_argument("--include-archived", dest="include_archived", action="store_true")
+    mf.add_argument("--include-superseded", dest="include_superseded", action="store_true")
+    mf.set_defaults(func=cmd_memory_fetch)
+
+    sr = sub.add_parser("screen-recent", help="Recent screen frame metadata (no pixels).")
+    sr.add_argument("--limit", type=int, default=10)
+    sr.set_defaults(func=cmd_screen_recent)
+
+    sd = sub.add_parser("screen-read", help="Decrypted screen frame caption/ocr (pixels off by default).")
+    sd.add_argument("--frame-id", dest="frame_id", default="", help="frame id; default = latest")
+    sd.add_argument("--include-image", dest="include_image", action="store_true", help="include base64 JPEG (large)")
+    sd.set_defaults(func=cmd_screen_read)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")

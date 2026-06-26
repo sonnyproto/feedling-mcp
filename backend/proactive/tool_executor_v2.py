@@ -40,6 +40,12 @@ _PERCEPTION_TOOL_SIGNAL_V2 = {
 }
 
 PR3_UNIMPLEMENTED_TOOLS_V2 = frozenset({"schedule_wake", "cancel_wake"})  # screen.read/screen.recent now implemented in _execute_available
+MEMORY_WRITE_TOOL_NAMES_V2 = frozenset({
+    "memory.add",
+    "memory.supersede",
+    "memory.delete",
+    "memory.retype",
+})
 
 
 def _new_tool_call_id() -> str:
@@ -151,6 +157,7 @@ class ToolRuntimeAdaptersV2:
     memory_load: Callable[[str], Sequence[Mapping[str, Any]]] | None = None
     memory_index: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None
     memory_fetch: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None
+    memory_action: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None
     send_message: Callable[[str, str, Mapping[str, Any]], Mapping[str, Any]] | None = None
     screen_read: Callable[[str, str | None, str], Mapping[str, Any]] | None = None
     screen_recent: Callable[[str, int], Mapping[str, Any]] | None = None
@@ -218,10 +225,19 @@ def combined_runtime_adapters_v2(api_key: str, store) -> ToolRuntimeAdaptersV2:
     def memory_fetch(user_id: str, args: Mapping[str, Any]) -> Mapping[str, Any]:
         return memory_readside_core.memory_fetch_core(store, api_key, dict(args or {}))
 
+    def memory_action(user_id: str, args: Mapping[str, Any]) -> Mapping[str, Any]:
+        from accounts import runtime_auth
+        from memory import actions as memory_actions
+
+        runtime_auth.authorize_scope("memory")
+        body, status = memory_actions._execute_memory_actions(store, api_key, [dict(args or {})])
+        return {"status_code": status, **dict(body or {})}
+
     return dataclasses.replace(base, screen_read=screen.screen_read,
                                screen_recent=screen.screen_recent,
                                memory_index=memory_index,
-                               memory_fetch=memory_fetch)
+                               memory_fetch=memory_fetch,
+                               memory_action=memory_action)
 
 
 class ToolExecutorV2:
@@ -304,6 +320,17 @@ class ToolExecutorV2:
                 error_code=e.code,
                 error_message=e.message,
             )
+        except ToolExecutionErrorV2 as e:
+            return self._finish(
+                call,
+                cost_class,
+                started,
+                ok=False,
+                outcome="error",
+                result=e.result,
+                error_code=e.code,
+                error_message=e.message,
+            )
         except Exception as e:
             return self._finish(
                 call,
@@ -336,6 +363,8 @@ class ToolExecutorV2:
             return ("memory_adapter_missing", "memory.fetch adapter is not configured")
         if call.name == "memory.fetch" and not _string_list(args.get("ids") or args.get("id")):
             return ("memory_ids_required", "memory.fetch requires one or more ids")
+        if call.name in MEMORY_WRITE_TOOL_NAMES_V2 and not self.adapters.memory_action:
+            return ("memory_action_adapter_missing", f"{call.name} requires a memory action adapter")
         if call.name == "send_message":
             if not self.adapters.send_message:
                 return ("send_message_adapter_missing", "send_message requires a hosted/resident output adapter")
@@ -387,6 +416,8 @@ class ToolExecutorV2:
                 return _normalize_memory_tool_result(self.adapters.memory_fetch(call.user_id, args))
             by_id = {str(memory.get("id") or ""): dict(memory) for memory in self._memories(call.user_id)}
             return {"memories": [by_id[item] for item in ids if item in by_id], "missing_ids": [item for item in ids if item not in by_id]}
+        if call.name in MEMORY_WRITE_TOOL_NAMES_V2:
+            return self._execute_memory_action_tool(call, args)
         if call.name == "send_message":
             text = str(args.get("text") or "").strip()
             assert self.adapters.send_message is not None
@@ -421,6 +452,42 @@ class ToolExecutorV2:
         if not self.adapters.memory_load:
             raise ToolUnavailableV2("memory_adapter_missing", "memory adapter is not configured")
         return self.adapters.memory_load(user_id)
+
+    def _execute_memory_action_tool(self, call: ToolCallV2, args: Mapping[str, Any]) -> Mapping[str, Any]:
+        action = dict(args or {})
+        action["type"] = call.name
+        if call.name in {"memory.add", "memory.supersede"}:
+            envelope = action.get("envelope")
+            if "memory" in action or "content" in action or "summary" in action or "description" in action:
+                raise ToolExecutionErrorV2(
+                    "needs_client_encryption",
+                    f"{call.name} requires a pre-encrypted memory envelope; plaintext memory content is not accepted by this tool.",
+                    result={
+                        "status": "error",
+                        "error": "needs_client_encryption",
+                        "action": call.name,
+                        "required": "Build a v1 memory envelope client-side, then retry with args.envelope.",
+                    },
+                )
+            if not isinstance(envelope, Mapping):
+                raise ToolExecutionErrorV2(
+                    "needs_client_encryption",
+                    f"{call.name} requires args.envelope because memory writes must cross the client encryption boundary before tool execution.",
+                    result={
+                        "status": "error",
+                        "error": "needs_client_encryption",
+                        "action": call.name,
+                        "required": "Provide a sealed v1 envelope with body_ct, nonce, K_user, visibility, owner_user_id, type, and occurred_at.",
+                    },
+                )
+            action["envelope"] = dict(envelope)
+        assert self.adapters.memory_action is not None
+        response = dict(self.adapters.memory_action(call.user_id, action) or {})
+        status_code = _int_arg(response.get("status_code"), default=200, lo=100, hi=599)
+        if status_code >= 400 or str(response.get("status") or "").lower() == "error":
+            code = _memory_action_error_code(response)
+            raise ToolExecutionErrorV2(code, _memory_action_error_message(response, code), result=response)
+        return response
 
     def _finish(
         self,
@@ -467,6 +534,14 @@ class ToolUnavailableV2(Exception):
         self.message = message
 
 
+class ToolExecutionErrorV2(Exception):
+    def __init__(self, code: str, message: str, *, result: Mapping[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.result = dict(result or {})
+
+
 def _int_arg(value: Any, *, default: int, lo: int, hi: int) -> int:
     try:
         parsed = int(value)
@@ -501,3 +576,29 @@ def _normalize_memory_tool_result(result: Mapping[str, Any]) -> dict[str, Any]:
     if "memories" not in out and isinstance(out.get("items"), list):
         out["memories"] = list(out.get("items") or [])
     return out
+
+
+def _memory_action_error_code(response: Mapping[str, Any]) -> str:
+    error = str(response.get("error") or "").strip()
+    if error:
+        return error[:120]
+    results = response.get("results")
+    if isinstance(results, Sequence) and results:
+        first = results[0]
+        if isinstance(first, Mapping) and first.get("error"):
+            return str(first.get("error"))[:120]
+    return "memory_action_failed"
+
+
+def _memory_action_error_message(response: Mapping[str, Any], code: str) -> str:
+    if response.get("required"):
+        return str(response.get("required"))[:240]
+    results = response.get("results")
+    if isinstance(results, Sequence) and results:
+        first = results[0]
+        if isinstance(first, Mapping):
+            if first.get("required"):
+                return str(first.get("required"))[:240]
+            if first.get("message"):
+                return str(first.get("message"))[:240]
+    return f"memory action failed: {code}"

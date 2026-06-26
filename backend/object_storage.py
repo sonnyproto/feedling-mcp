@@ -18,7 +18,7 @@ dedicated var so it never collides with the WAL-G backup ``R2_BUCKET``):
   - ``R2_ACCESS_KEY_ID``      : R2 S3 access key id.
   - ``R2_SECRET_ACCESS_KEY``  : R2 S3 secret.
   - ``R2_FRAMES_BUCKET``      : the bucket for frame ciphertext (e.g.
-                                ``fisherman-image-frames``). The token MUST be
+                                ``io-image-frames``). The token MUST be
                                 scoped to this bucket.
 
 When credentials/bucket are unset, ``enabled()`` returns False and callers keep
