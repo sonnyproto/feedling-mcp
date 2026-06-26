@@ -199,6 +199,7 @@ def test_agent_home_files_seeds_prompt_and_claude_permission_allow():
     allow = settings["permissions"]["allow"]
     assert any("io_cli.py perception" in rule for rule in allow)
     assert any("io_cli.py memory-index" in rule for rule in allow)
+    assert any("io_cli.py identity-write" in rule for rule in allow)  # 7.D post-respawn tool
     assert any("io_cli.py screen-read" in rule for rule in allow)
 
 

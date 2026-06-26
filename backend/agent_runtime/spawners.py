@@ -46,6 +46,7 @@ _IO_CLI_VERBS = (
     "perception-history",
     "memory-index",
     "memory-fetch",
+    "identity-write",
     "screen-recent",
     "screen-read",
 )

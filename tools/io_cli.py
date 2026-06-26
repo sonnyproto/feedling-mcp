@@ -268,6 +268,38 @@ def cmd_photo_read(args):
     _emit(out)
 
 
+def _identity_write_payload(self_introduction, signature):
+    """Build the /v1/identity/actions body for a profile_patch. Pure (testable).
+
+    Returns None when there's nothing to write. signature is a list of short strings.
+    """
+    patch = {}
+    if self_introduction is not None:
+        patch["self_introduction"] = self_introduction
+    if signature:
+        patch["signature"] = list(signature)
+    if not patch:
+        return None
+    return {"action": {"type": "identity.profile_patch", "patch": patch}}
+
+
+def cmd_identity_write(args):
+    """Patch the agent's display identity card (self_introduction / signature).
+
+    POST /v1/identity/actions (identity.profile_patch). The server decrypts the
+    existing card, merges, and re-encrypts (no client crypto). Used by post-respawn
+    7.D so the agent (now itself) writes its own intro + signature in-voice.
+    """
+    api_url, auth = _require_backend()
+    payload = _identity_write_payload(args.self_introduction, args.signature)
+    if payload is None:
+        _emit({"ok": False, "error": "nothing_to_write: need --self-introduction and/or --signature"}, 2)
+    status, body = _http_json("POST", f"{api_url}/v1/identity/actions", auth, payload=payload)
+    if status == 200:
+        _emit({"ok": True, **body})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
 def cmd_phase2(args):
     # send / sleep / schedule-wake / cancel-wake are NOT pull tools in the native
     # model — the agent emits them as output actions (JSON messages/actions) which
@@ -339,6 +371,13 @@ def main():
     pd.add_argument("--id", dest="photo_id", required=True, help="photo id (from photo-recent)")
     pd.add_argument("--include-image", dest="include_image", action="store_true", help="include decrypted base64 JPEG (large)")
     pd.set_defaults(func=cmd_photo_read)
+
+    iw = sub.add_parser("identity-write",
+                        help="Patch the agent's identity card (self_introduction / signature).")
+    iw.add_argument("--self-introduction", dest="self_introduction", default=None)
+    iw.add_argument("--signature", action="append", default=[],
+                    help="repeatable short string(s) for the signature")
+    iw.set_defaults(func=cmd_identity_write)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")
