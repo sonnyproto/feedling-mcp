@@ -208,23 +208,48 @@ def agent_home_files(
     return files
 
 
-def _genesis_persona_content(user_id: str) -> str:
-    """Host genesis voice/persona content for this user, or '' when absent.
+def _persona_from_blob(blob, decrypt_fn) -> str:
+    """Pure: extract the persona markdown from a genesis_persona blob.
 
-    Read at spawn so a host user whose genesis produced a persona boots as
-    themselves. Empty (no genesis / fresh start / VPS / read error) → tools-only
-    append, today's behaviour. Local ``db`` import keeps pure-unit importers of
-    this module free of a DB/PG dependency. Seam: written by Codex's genesis as
-    ``db.set_blob(user_id, 'genesis_persona', {content, sha256, ...})``.
+    Persona is stored ENCRYPTED (``content_envelope``, same shared-envelope posture
+    as identity/memory — no plaintext at rest). ``decrypt_fn(envelope) -> str`` does
+    the enclave decrypt. Absent / legacy / malformed / decrypt-error → '' so the
+    caller falls back to tools-only (fresh start / no genesis / VPS).
+    """
+    if not isinstance(blob, dict):
+        return ""
+    env = blob.get("content_envelope")
+    if not (isinstance(env, dict) and env.get("body_ct")):
+        return ""
+    try:
+        return str(decrypt_fn(env) or "")
+    except Exception:
+        return ""
+
+
+def _genesis_persona_content(user_id: str, api_key: str | None = None) -> str:
+    """Host genesis voice/persona for this user (decrypted), or '' when absent.
+
+    Persona is stored encrypted (db blob 'genesis_persona' → content_envelope);
+    decrypt it via the enclave at spawn so the agent boots as itself. '' on absent /
+    decrypt-error / token-only auth → tools-only append (today's behaviour). Local
+    imports keep this module pure-unit importable without DB/enclave deps. Seam:
+    Codex's genesis writes db.set_blob(user_id, 'genesis_persona',
+    {encrypted, content_envelope, sha256, ...}).
     """
     try:
         import db  # local import: avoid a module-level DB dep for pure-unit tests
         blob = db.get_blob(user_id, "genesis_persona")
-        if isinstance(blob, dict):
-            return str(blob.get("content") or "")
     except Exception as e:
-        log.warning("genesis persona read failed for %s: %s", user_id, e)
-    return ""
+        log.warning("genesis persona blob read failed for %s: %s", user_id, e)
+        return ""
+
+    def _decrypt(env: dict) -> str:
+        from core import enclave as core_enclave
+        raw = core_enclave._decrypt_envelope_via_enclave(env, api_key, purpose="genesis_persona")
+        return raw.decode("utf-8")
+
+    return _persona_from_blob(blob, _decrypt)
 
 
 def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dict:
@@ -335,7 +360,7 @@ class ProcessSpawner:
             codex_transport=_codex_transport(entry),
             gateway_base_url=os.environ.get("FEEDLING_LITELLM_BASE_URL", ""),
             model=str(entry.get("model") or ""),
-            persona_content=_genesis_persona_content(user_id),
+            persona_content=_genesis_persona_content(user_id, entry.get("api_key")),
         )
         for path, content in files.items():
             p = Path(path)

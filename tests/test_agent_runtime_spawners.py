@@ -301,6 +301,23 @@ def test_agent_home_files_prepends_genesis_persona_when_present():
     assert "memory-index" in cfiles["/h/codex-home/AGENTS.md"]
 
 
+def test_persona_from_blob_decrypts_envelope():
+    # Persona is stored encrypted; the reader decrypts content_envelope at spawn.
+    blob = {"encrypted": True, "content_envelope": {"body_ct": "ct"}}
+    assert spawners._persona_from_blob(blob, lambda env: "You are Kai.") == "You are Kai."
+
+
+def test_persona_from_blob_empty_on_absent_or_undecryptable():
+    assert spawners._persona_from_blob(None, lambda env: "x") == ""
+    assert spawners._persona_from_blob({}, lambda env: "x") == ""                        # no envelope
+    assert spawners._persona_from_blob({"content_envelope": {}}, lambda env: "x") == ""  # no body_ct
+    # decrypt failure (enclave down / token-only auth) degrades to tools-only
+
+    def _boom(env):
+        raise RuntimeError("enclave down")
+    assert spawners._persona_from_blob({"content_envelope": {"body_ct": "ct"}}, _boom) == ""
+
+
 def test_agent_home_files_no_persona_is_tools_only():
     # Fresh start / no genesis / VPS → today's behaviour: tools-only, no persona prefix.
     append = spawners.agent_home_files("/h", driver="claude")["/h/agent-tools-prompt.md"]
