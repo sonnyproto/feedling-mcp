@@ -183,12 +183,11 @@ services:
       FEEDLING_PROACTIVE_GATE_MODEL: "${FEEDLING_PROACTIVE_GATE_MODEL:-google/gemini-3.1-flash-lite}"
       MODEL_API_MEMORY_TOOLS_ENABLED: "${MODEL_API_MEMORY_TOOLS_ENABLED:-true}"
       MODEL_API_AUTO_MEMORY_CONTEXT_ENABLED: "${MODEL_API_AUTO_MEMORY_CONTEXT_ENABLED:-true}"
-      # TEST-ONLY: baseline-ON for the perception/resident V2 rollout flags
-      # (perception_ingress / resident_wake / resident_chat). Test users run V2
-      # without a per-user blob flip; an explicit per-user blob value still wins.
-      # Prod compose deliberately omits this so prod keeps the dormant legacy
-      # path (baseline OFF). See core/util.runtime_v2_default_on().
-      FEEDLING_RUNTIME_V2_DEFAULT_ON: "false"
+      # TEST-ONLY: keep the shared runtime V2 baseline aligned with prod for
+      # perception ingress, resident chat, screen caption, and hosted chat.
+      # Proactive wake is native-only after P2-2b and no longer uses this flag.
+      # See core/util.runtime_v2_default_on().
+      FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"
       # Mirrors the agent-runner's flag: the hosted cutover decision lives in the
       # backend, so it needs the same value — gateway-only providers stay legacy
       # (inline) until the in-CVM LiteLLM gateway is actually on. Encrypted env,
