@@ -220,6 +220,48 @@ def _decrypt_chunks(enclave_url: str, runtime_token: str, chunks: list[dict]) ->
     return texts
 
 
+def _decrypt_blob_text(enclave_url: str, runtime_token: str, blob: dict, *, purpose: str) -> str:
+    envelope = blob.get("content_envelope") if isinstance(blob.get("content_envelope"), dict) else {}
+    if not envelope:
+        return ""
+    return _decrypt_envelope(enclave_url, runtime_token, envelope, purpose=purpose).decode("utf-8")
+
+
+def _existing_persona_material(user_id: str, enclave_url: str, runtime_token: str) -> dict:
+    try:
+        blob = db.get_blob(user_id, service.GENESIS_PERSONA_BLOB)
+        if not isinstance(blob, dict):
+            return {}
+        try:
+            priority = int(blob.get("source_priority") or 0)
+        except Exception:
+            priority = 0
+        if priority < 100:
+            return {}
+        content = _decrypt_blob_text(enclave_url, runtime_token, blob, purpose="genesis_persona").strip()
+        if not content:
+            return {}
+        return {
+            "content": content,
+            "source_family": str(blob.get("source_family") or ""),
+            "source_priority": priority,
+        }
+    except Exception:
+        return {}
+
+
+def _existing_voice_workset(user_id: str, enclave_url: str, runtime_token: str) -> dict:
+    try:
+        blob = db.get_blob(user_id, service.GENESIS_VOICE_BLOB)
+        if not isinstance(blob, dict):
+            return {}
+        raw = _decrypt_blob_text(enclave_url, runtime_token, blob, purpose="genesis_voice")
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
 def _complete_json(
     llm: GenesisLLMClient,
     *,
@@ -375,12 +417,22 @@ def _build_reducer_output(
     runtime: provider_client.ProviderConfig,
     chunk_texts: list[str],
     source_kind: str = "history",
+    existing_persona: dict | None = None,
+    existing_voice: dict | None = None,
 ) -> dict:
     llm = GenesisLLMClient()
     source_family = _source_family(source_kind)
     material = _joined_material(chunk_texts)
+    existing_persona = existing_persona if isinstance(existing_persona, dict) else {}
+    existing_voice = existing_voice if isinstance(existing_voice, dict) else {}
 
     if source_family == "ai_persona":
+        existing_notes = existing_voice.get("behavior_notes") if isinstance(existing_voice.get("behavior_notes"), list) else []
+        existing_exemplars = existing_voice.get("exemplars") if isinstance(existing_voice.get("exemplars"), list) else []
+        founding = [item for item in existing_exemplars if isinstance(item, dict) and item.get("founding")]
+        if not founding:
+            founding = [item for item in existing_exemplars if isinstance(item, dict)][:12]
+        persona_source_family = "merged" if existing_notes or founding else "ai_persona"
         identity_doc = _identity_only(_fact_write(
             llm,
             user_id=user_id,
@@ -395,7 +447,7 @@ def _build_reducer_output(
             job_id=job_id,
             task_id="persona-build",
             runtime=runtime,
-            messages=prompts.persona_build_messages(material, [], []),
+            messages=prompts.persona_build_messages(material, existing_notes, founding),
             max_tokens=2600,
             idempotency_key=f"{job_id}:persona_build",
         )
@@ -407,12 +459,12 @@ def _build_reducer_output(
                 "content": persona_content,
                 "prompt_version": "7.B",
                 "source_kind": source_kind,
-                "source_family": source_family,
+                "source_family": persona_source_family,
             },
             "voice": {
-                "behavior_notes_count": 0,
-                "exemplar_count": 0,
-                "founding_exemplar_count": 0,
+                "behavior_notes_count": len(existing_notes),
+                "exemplar_count": len(existing_exemplars),
+                "founding_exemplar_count": len(founding),
             },
         }
 
@@ -476,6 +528,10 @@ def _build_reducer_output(
     if not founding:
         founding = [item for item in exemplars if isinstance(item, dict)][:12]
     behavior_notes = voice_final.get("behavior_notes") if isinstance(voice_final.get("behavior_notes"), list) else []
+    voice_workset = {
+        "behavior_notes": behavior_notes,
+        "exemplars": exemplars,
+    }
 
     fact_write = _fact_write(
         llm,
@@ -497,13 +553,15 @@ def _build_reducer_output(
             },
         }
 
+    persona_material = str(existing_persona.get("content") or "").strip()
+    persona_source_family = "merged" if persona_material else "history"
     persona_content = _complete_text(
         llm,
         user_id=user_id,
         job_id=job_id,
         task_id="persona-build",
         runtime=runtime,
-        messages=prompts.persona_build_messages("", behavior_notes, founding),
+        messages=prompts.persona_build_messages(persona_material, behavior_notes, founding),
         max_tokens=2600,
         idempotency_key=f"{job_id}:persona_build",
     )
@@ -511,12 +569,18 @@ def _build_reducer_output(
         **fact_write,
         "source_kind": source_kind,
         "source_family": source_family,
-        "persona": {"content": persona_content, "prompt_version": "7.B"},
+        "persona": {
+            "content": persona_content,
+            "prompt_version": "7.B",
+            "source_kind": source_kind,
+            "source_family": persona_source_family,
+        },
         "voice": {
             "behavior_notes_count": len(behavior_notes),
             "exemplar_count": len(exemplars),
             "founding_exemplar_count": len(founding),
         },
+        "voice_workset": voice_workset,
     }
 
 
@@ -556,12 +620,16 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
     provider_key = _fetch_provider_key(api_url, enclave_url, token)
     runtime = _runtime_for_user(user_id, provider_key)
     chunk_texts = _decrypt_chunks(enclave_url, token, chunks)
+    existing_persona = _existing_persona_material(user_id, enclave_url, token)
+    existing_voice = _existing_voice_workset(user_id, enclave_url, token)
     reducer_output = _build_reducer_output(
         user_id=user_id,
         job_id=job_id,
         runtime=runtime,
         chunk_texts=chunk_texts,
         source_kind=str(job.get("source_kind") or "history"),
+        existing_persona=existing_persona,
+        existing_voice=existing_voice,
     )
     applied = _apply_reducer_output(api_url, token, job_id, reducer_output)
     return {

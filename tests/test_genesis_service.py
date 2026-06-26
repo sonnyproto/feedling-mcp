@@ -370,6 +370,54 @@ def test_write_persona_artifact_keeps_existing_higher_priority_persona(monkeypat
     assert writes == []
 
 
+def test_write_voice_artifact_encrypts_workset_without_plaintext(monkeypatch):
+    blobs = []
+    captured_plaintext = {}
+
+    def fake_envelope(_store, plaintext, item_id=None):
+        captured_plaintext["raw"] = plaintext
+        return ({
+            "id": item_id,
+            "body_ct": "encrypted_voice",
+            "nonce": "nonce",
+            "K_user": "ku",
+            "K_enclave": "ke",
+            "visibility": "shared",
+            "owner_user_id": "usr_genesis",
+        }, "")
+
+    monkeypatch.setattr(service.db, "set_blob", lambda _user_id, kind, doc: blobs.append({"kind": kind, "doc": doc}))
+    monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", fake_envelope)
+
+    ref, digest = service.write_voice_artifact(
+        _store(),
+        "job_history",
+        {
+            "source_kind": "chat_export",
+            "source_family": "history",
+            "voice_workset": {
+                "behavior_notes": ["短句接住情绪"],
+                "exemplars": [{
+                    "turns": [{"role": "ta", "text": "别急,我在。"}],
+                    "founding": True,
+                    "axis": ["emotion"],
+                }],
+            },
+        },
+    )
+
+    assert ref == service.GENESIS_VOICE_REF
+    assert digest
+    assert "别急".encode("utf-8") in captured_plaintext["raw"]
+    voice_blob = blobs[0]
+    assert voice_blob["kind"] == service.GENESIS_VOICE_BLOB
+    assert voice_blob["doc"]["encrypted"] is True
+    assert voice_blob["doc"]["content_envelope"]["body_ct"] == "encrypted_voice"
+    assert voice_blob["doc"]["behavior_note_count"] == 1
+    assert voice_blob["doc"]["founding_exemplar_count"] == 1
+    assert "别急" not in json.dumps(voice_blob["doc"], ensure_ascii=False)
+
+
 def test_apply_reducer_output_rejects_raw_transcript_fields(monkeypatch):
     monkeypatch.setattr(
         service.db,

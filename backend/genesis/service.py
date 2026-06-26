@@ -19,10 +19,13 @@ from memory import actions as memory_actions
 
 GENESIS_STATE_BLOB = "genesis_state"
 GENESIS_PERSONA_BLOB = "genesis_persona"
+GENESIS_VOICE_BLOB = "genesis_voice"
 GENESIS_SOURCE = "genesis_import"
 GENESIS_PERSONA_REF = f"user_blob:{GENESIS_PERSONA_BLOB}"
+GENESIS_VOICE_REF = f"user_blob:{GENESIS_VOICE_BLOB}"
 PERSONA_SOURCE_PRIORITY = {
     "ai_persona": 100,
+    "merged": 100,
     "history": 50,
     "unknown": 10,
 }
@@ -399,6 +402,49 @@ def _persona_source_priority(source_family: str) -> int:
     return int(PERSONA_SOURCE_PRIORITY.get(source_family, PERSONA_SOURCE_PRIORITY["unknown"]))
 
 
+def _safe_voice_workset(output: dict) -> dict:
+    raw = output.get("voice_workset") if isinstance(output.get("voice_workset"), dict) else {}
+    notes = [
+        _text(item, 500)
+        for item in (raw.get("behavior_notes") if isinstance(raw.get("behavior_notes"), list) else [])
+        if _text(item, 500)
+    ][:16]
+    exemplars: list[dict] = []
+    for item in (raw.get("exemplars") if isinstance(raw.get("exemplars"), list) else []):
+        if not isinstance(item, dict):
+            continue
+        turns = []
+        for turn in (item.get("turns") if isinstance(item.get("turns"), list) else [])[:8]:
+            if not isinstance(turn, dict):
+                continue
+            text = _text(turn.get("text"), 1200)
+            if text:
+                turns.append({"role": _text(turn.get("role"), 40), "text": text})
+        if not turns:
+            continue
+        axis = [
+            _text(axis_item, 40)
+            for axis_item in (item.get("axis") if isinstance(item.get("axis"), list) else [])
+            if _text(axis_item, 40)
+        ][:8]
+        exemplars.append({
+            "turns": turns,
+            "founding": bool(item.get("founding")),
+            "axis": axis,
+            "why": _text(item.get("why"), 500),
+        })
+    if not notes and not exemplars:
+        return {}
+    return {
+        "v": 1,
+        "source": GENESIS_SOURCE,
+        "source_kind": _text(output.get("source_kind"), 80),
+        "source_family": _text(output.get("source_family"), 80),
+        "behavior_notes": notes,
+        "exemplars": exemplars[:80],
+    }
+
+
 def _safe_reducer_doc(job_id: str, output: dict) -> dict:
     raw_items = output.get("memories")
     if raw_items is None:
@@ -428,6 +474,7 @@ def _safe_reducer_doc(job_id: str, output: dict) -> dict:
         "persona_provided": bool(persona_content),
         "persona_sha256": _sha256_hex(persona_content.encode("utf-8")) if persona_content else "",
         "persona_prompt_version": prompt_version if persona_content else "",
+        "voice_workset_provided": bool(output.get("voice_workset")),
     }
 
 
@@ -569,6 +616,39 @@ def write_persona_artifact(store: UserStore, job_id: str, output: dict) -> tuple
     return GENESIS_PERSONA_REF, digest
 
 
+def write_voice_artifact(store: UserStore, job_id: str, output: dict) -> tuple[str, str]:
+    voice_doc = _safe_voice_workset(output)
+    if not voice_doc:
+        return "", ""
+    raw = json.dumps(voice_doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    digest = _sha256_hex(raw)
+    now = _now_iso()
+    envelope, err = core_envelope._build_shared_envelope_for_store(
+        store,
+        raw,
+        item_id=f"genesis_voice_{job_id}",
+    )
+    if envelope is None:
+        raise RuntimeError(f"voice_envelope_failed:{err}")
+    founding_count = len([item for item in voice_doc["exemplars"] if item.get("founding")])
+    db.set_blob(store.user_id, GENESIS_VOICE_BLOB, {
+        "v": 1,
+        "job_id": job_id,
+        "source": GENESIS_SOURCE,
+        "encrypted": True,
+        "content_envelope": envelope,
+        "sha256": digest,
+        "source_kind": voice_doc["source_kind"],
+        "source_family": voice_doc["source_family"],
+        "behavior_note_count": len(voice_doc["behavior_notes"]),
+        "exemplar_count": len(voice_doc["exemplars"]),
+        "founding_exemplar_count": founding_count,
+        "created_at": now,
+        "updated_at": now,
+    })
+    return GENESIS_VOICE_REF, digest
+
+
 def apply_reducer_output(store: UserStore, api_key: str | None, job_id: str, output: dict) -> dict:
     job = db.genesis_get_job(store.user_id, job_id)
     if not job:
@@ -581,12 +661,15 @@ def apply_reducer_output(store: UserStore, api_key: str | None, job_id: str, out
     memory_count, memory_results = apply_memory_outputs(store, api_key, output)
     identity_status = init_identity_if_absent(store, output)
     persona_ref, persona_sha = write_persona_artifact(store, job_id, output)
+    voice_ref, voice_sha = write_voice_artifact(store, job_id, output)
     result_doc = {
         "memory_action_count": memory_count,
         "memory_results": memory_results,
         "identity_status": identity_status,
         "persona_ref": persona_ref,
         "persona_sha256": persona_sha,
+        "voice_ref": voice_ref,
+        "voice_sha256": voice_sha,
     }
     db.genesis_upsert_output(
         store.user_id,
