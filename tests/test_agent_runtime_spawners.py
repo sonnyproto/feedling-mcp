@@ -43,6 +43,18 @@ def test_consumer_env_uses_codex_cli_and_home_for_codex_driver():
     assert "ANTHROPIC_API_KEY" not in env
 
 
+def test_default_codex_cmd_skips_git_repo_check():
+    # The hosted consumer runs codex with cwd = the user's home (NOT a git repo).
+    # Without --skip-git-repo-check, `codex exec` refuses to run ("Not inside a
+    # trusted directory…") and exits 1 BEFORE any model call — so the default
+    # template MUST pass it or every hosted codex turn dead-ends.
+    env = spawners.consumer_env(
+        {}, {"api_key": "fk", "provider_key": "sk-oai", "driver": "codex"},
+        user_id="u_1", home="/h",
+    )
+    assert "--skip-git-repo-check" in env["AGENT_CLI_CMD"]
+
+
 def test_consumer_env_tolerates_missing_api_key_for_zero_roster():
     # Stage D host-all: a discovered entry has NO api_key (the consumer auths with
     # the runtime-token file). consumer_env must not KeyError on it.

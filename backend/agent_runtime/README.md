@@ -21,7 +21,7 @@ only difference is the consumer runs in our CVM instead of on the user's machine
 agent-runner (CVM)
   supervisor (this package)
     per active user → tools/chat_resident_consumer.py
-      AGENT_MODE=cli, AGENT_CLI_CMD="claude -p {message}" / "codex exec --json {message}"
+      AGENT_MODE=cli, AGENT_CLI_CMD="claude -p {message}" / "codex exec --skip-git-repo-check --json {message}"
       per-user home / checkpoint / session / provider key (enclave-decrypted)
 ```
 

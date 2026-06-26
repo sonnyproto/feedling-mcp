@@ -130,7 +130,10 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
     the whole thing per roster entry via ``cli_cmd``.
     """
     if driver == "codex":
-        return "codex exec --json {message}"
+        # --skip-git-repo-check: the consumer's cwd is the user's home, not a git
+        # repo; without it `codex exec` refuses ("Not inside a trusted directory")
+        # and exits 1 before any model call.
+        return "codex exec --skip-git-repo-check --json {message}"
     grant = ",".join(_io_cli_allow_rules(io_cli))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
     return (
