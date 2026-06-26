@@ -785,6 +785,303 @@ def list_blobs(user_id: str, kind_prefix: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Genesis import ledger (chunked import, reducer outputs, runtime-ready state)
+# ---------------------------------------------------------------------------
+
+
+def _genesis_row(cur, row) -> dict | None:
+    if row is None:
+        return None
+    cols = [d[0] for d in cur.description]
+    out = dict(zip(cols, row))
+    for key, value in list(out.items()):
+        if hasattr(value, "isoformat"):
+            out[key] = value.isoformat()
+    return out
+
+
+def genesis_create_job(user_id: str, job: dict) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO genesis_import_jobs
+                (user_id, job_id, status, source_kind, file_manifest_hash,
+                 total_chunks, total_bytes, privacy_mode, metadata, output,
+                 updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, '{}'::jsonb, now())
+            ON CONFLICT (user_id, job_id) DO NOTHING
+            RETURNING *
+            """,
+            (
+                user_id,
+                job["job_id"],
+                job.get("status", "created"),
+                job.get("source_kind", "unknown"),
+                job.get("file_manifest_hash", ""),
+                int(job.get("total_chunks") or 0),
+                int(job.get("total_bytes") or 0),
+                job.get("privacy_mode", ""),
+                Jsonb(job.get("metadata") or {}),
+            ),
+        )
+        return _genesis_row(cur, cur.fetchone())
+
+
+def genesis_get_job(user_id: str, job_id: str) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "SELECT * FROM genesis_import_jobs WHERE user_id = %s AND job_id = %s",
+            (user_id, job_id),
+        )
+        return _genesis_row(cur, cur.fetchone())
+
+
+def genesis_list_jobs(user_id: str, *, limit: int = 20) -> list[dict]:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "SELECT * FROM genesis_import_jobs WHERE user_id = %s "
+            "ORDER BY updated_at DESC LIMIT %s",
+            (user_id, max(1, min(int(limit or 20), 100))),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        out.append(item)
+    return out
+
+
+def genesis_latest_done_job(user_id: str) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "SELECT * FROM genesis_import_jobs WHERE user_id = %s AND status = 'done' "
+            "ORDER BY completed_at DESC NULLS LAST, updated_at DESC LIMIT 1",
+            (user_id,),
+        )
+        return _genesis_row(cur, cur.fetchone())
+
+
+def genesis_put_chunk(
+    user_id: str,
+    job_id: str,
+    *,
+    seq: int,
+    byte_start: int,
+    byte_end: int,
+    ciphertext_sha256: str,
+    content_sha256: str,
+    aad: dict,
+    encrypted_body: bytes,
+) -> dict:
+    size_bytes = len(encrypted_body)
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            existing = conn.execute(
+                "SELECT ciphertext_sha256 FROM genesis_import_chunks "
+                "WHERE user_id = %s AND job_id = %s AND seq = %s",
+                (user_id, job_id, seq),
+            ).fetchone()
+            if existing is not None and existing[0] != ciphertext_sha256:
+                raise ValueError("chunk_hash_conflict")
+            cur = conn.execute(
+                """
+                INSERT INTO genesis_import_chunks
+                    (user_id, job_id, seq, byte_start, byte_end,
+                     ciphertext_sha256, content_sha256, aad, encrypted_body,
+                     size_bytes, status, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'uploaded', now())
+                ON CONFLICT (user_id, job_id, seq) DO UPDATE SET
+                    byte_start = EXCLUDED.byte_start,
+                    byte_end = EXCLUDED.byte_end,
+                    content_sha256 = EXCLUDED.content_sha256,
+                    aad = EXCLUDED.aad,
+                    status = 'uploaded',
+                    updated_at = now()
+                RETURNING user_id, job_id, seq, byte_start, byte_end,
+                          ciphertext_sha256, content_sha256, aad, size_bytes,
+                          status, attempts, map_output_ref, error, created_at,
+                          updated_at
+                """,
+                (
+                    user_id,
+                    job_id,
+                    seq,
+                    byte_start,
+                    byte_end,
+                    ciphertext_sha256,
+                    content_sha256,
+                    Jsonb(aad),
+                    encrypted_body,
+                    size_bytes,
+                ),
+            )
+            chunk = _genesis_row(cur, cur.fetchone()) or {}
+            conn.execute(
+                """
+                UPDATE genesis_import_jobs SET
+                    status = CASE
+                        WHEN status = 'created' THEN 'uploading'
+                        ELSE status
+                    END,
+                    received_chunks = (
+                        SELECT COUNT(*) FROM genesis_import_chunks
+                        WHERE user_id = %s AND job_id = %s
+                    ),
+                    received_bytes = COALESCE((
+                        SELECT SUM(size_bytes) FROM genesis_import_chunks
+                        WHERE user_id = %s AND job_id = %s
+                    ), 0),
+                    updated_at = now()
+                WHERE user_id = %s AND job_id = %s
+                """,
+                (user_id, job_id, user_id, job_id, user_id, job_id),
+            )
+    return chunk
+
+
+def genesis_missing_chunk_seqs(user_id: str, job_id: str, total_chunks: int) -> list[int]:
+    if total_chunks <= 0:
+        return []
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT seq FROM genesis_import_chunks WHERE user_id = %s AND job_id = %s",
+            (user_id, job_id),
+        ).fetchall()
+    have = {int(row[0]) for row in rows}
+    return [seq for seq in range(total_chunks) if seq not in have]
+
+
+def genesis_mark_finalized(user_id: str, job_id: str) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE genesis_import_jobs SET
+                status = 'uploaded',
+                finalized_at = COALESCE(finalized_at, now()),
+                updated_at = now()
+            WHERE user_id = %s AND job_id = %s
+              AND status IN ('created', 'uploading', 'uploaded', 'failed')
+            RETURNING *
+            """,
+            (user_id, job_id),
+        )
+        return _genesis_row(cur, cur.fetchone())
+
+
+def genesis_set_job_status(
+    user_id: str,
+    job_id: str,
+    *,
+    status: str,
+    error: str = "",
+    output: dict | None = None,
+    processed_chunks: int | None = None,
+) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE genesis_import_jobs SET
+                status = %s,
+                error = %s,
+                output = COALESCE(%s::jsonb, output),
+                processed_chunks = COALESCE(%s, processed_chunks),
+                updated_at = now()
+            WHERE user_id = %s AND job_id = %s
+            RETURNING *
+            """,
+            (
+                status,
+                error[:1000],
+                Jsonb(output) if output is not None else None,
+                processed_chunks,
+                user_id,
+                job_id,
+            ),
+        )
+        return _genesis_row(cur, cur.fetchone())
+
+
+def genesis_upsert_output(
+    user_id: str,
+    job_id: str,
+    output_type: str,
+    *,
+    doc: dict,
+    status: str,
+    ref: str = "",
+) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO genesis_import_outputs
+                (user_id, job_id, output_type, ref, status, doc, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT (user_id, job_id, output_type) DO UPDATE SET
+                ref = EXCLUDED.ref,
+                status = EXCLUDED.status,
+                doc = EXCLUDED.doc,
+                updated_at = now()
+            RETURNING *
+            """,
+            (user_id, job_id, output_type, ref, status, Jsonb(doc)),
+        )
+        return _genesis_row(cur, cur.fetchone())
+
+
+def genesis_get_output(user_id: str, job_id: str, output_type: str) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "SELECT * FROM genesis_import_outputs "
+            "WHERE user_id = %s AND job_id = %s AND output_type = %s",
+            (user_id, job_id, output_type),
+        )
+        return _genesis_row(cur, cur.fetchone())
+
+
+def genesis_complete_job(
+    user_id: str,
+    job_id: str,
+    *,
+    output: dict,
+    memory_action_count: int,
+    identity_status: str,
+    persona_ref: str,
+    persona_sha256: str,
+) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE genesis_import_jobs SET
+                status = 'done',
+                output = %s,
+                memory_action_count = %s,
+                identity_status = %s,
+                persona_ref = %s,
+                persona_sha256 = %s,
+                completed_at = COALESCE(completed_at, now()),
+                updated_at = now(),
+                error = ''
+            WHERE user_id = %s AND job_id = %s
+            RETURNING *
+            """,
+            (
+                Jsonb(output),
+                int(memory_action_count),
+                identity_status[:120],
+                persona_ref[:240],
+                persona_sha256[:80],
+                user_id,
+                job_id,
+            ),
+        )
+        return _genesis_row(cur, cur.fetchone())
+
+
+# ---------------------------------------------------------------------------
 # Chat messages (row-per-item ring buffer)
 # ---------------------------------------------------------------------------
 

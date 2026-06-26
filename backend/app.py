@@ -67,6 +67,7 @@ from model_api_runtime.tools import (
 import db
 import accounts
 import agent as agent_pkg
+import genesis as genesis_pkg
 from accounts import access as accounts_access
 from accounts import auth as accounts_auth
 from accounts import onboarding as accounts_onboarding
@@ -418,6 +419,7 @@ proactive_pkg.register(app)
 identity_pkg.register(app)
 memory_pkg.register(app)
 bootstrap_pkg.register(app)
+genesis_pkg.register(app)
 chat_pkg.register(app)
 tracking_pkg.register(app)
 admin_pkg.register(app)
