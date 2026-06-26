@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import os
 from typing import Any
 
 from flask import Blueprint, jsonify, request
@@ -197,6 +198,20 @@ def _history_signal(raw: str | None) -> str | None:
     return _HISTORY_SIGNAL_TO_CATALOG.get(sig)
 
 
+def _digest_days() -> tuple[int | None, tuple[dict, int] | None]:
+    try:
+        return max(1, min(int(request.args.get("days", "30")), 365)), None
+    except (TypeError, ValueError):
+        return None, ({"ok": False, "error": "invalid_days"}, 400)
+
+
+def _digest_notable_max() -> int:
+    try:
+        return max(1, min(int(os.environ.get("FEEDLING_DIGEST_NOTABLE_MAX", "8")), 50))
+    except (TypeError, ValueError):
+        return 8
+
+
 @bp.route("/v1/agent/perception/trend", methods=["GET"])
 def agent_perception_trend():
     """Rolling baseline + delta for one numeric field over the last N days, so
@@ -230,3 +245,21 @@ def agent_perception_history():
         return jsonify({"ok": False, "error": "invalid_days"}), 400
     rows = perception_store.list_perception_daily(user_store.user_id, sig, days)
     return jsonify({"ok": True, "signal": sig, "days": days, "daily": rows})
+
+
+@bp.route("/v1/agent/perception/digest", methods=["GET"])
+def agent_perception_digest():
+    """Top-N notable numeric changes across historized perception signals."""
+    user_store = auth.require_user()
+    days, err = _digest_days()
+    if err:
+        return jsonify(err[0]), err[1]
+    rows_by_signal = {
+        signal: perception_store.list_perception_daily(user_store.user_id, signal, days)
+        for signal in perception_history.comparable_signals()
+    }
+    changes = perception_history.notable_changes(
+        rows_by_signal,
+        max_changes=_digest_notable_max(),
+    )
+    return jsonify({"ok": True, "days": days, "changes": changes})

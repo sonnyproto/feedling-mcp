@@ -292,3 +292,73 @@ def test_agent_perception_rejects_unknown_signals(monkeypatch):
     assert body["ok"] is False
     assert body["error"] == "unknown_signals"
     assert body["unknown"] == ["nope"]
+
+
+def test_agent_perception_digest_returns_top_notable_changes(monkeypatch):
+    rows_by_signal = {
+        "health_vitals": [
+            {"date": "2026-06-23", "doc": {"resting_heart_rate": {"sum": 120, "count": 2, "min": 58, "max": 62}}},
+            {"date": "2026-06-24", "doc": {"resting_heart_rate": {"sum": 120, "count": 2, "min": 59, "max": 61}}},
+            {"date": "2026-06-25", "doc": {"resting_heart_rate": {"sum": 132, "count": 2, "min": 65, "max": 67}}},
+        ],
+        "health_activity": [
+            {"date": "2026-06-23", "doc": {"active_energy_kcal": {"total": 200}}},
+            {"date": "2026-06-24", "doc": {"active_energy_kcal": {"total": 200}}},
+            {"date": "2026-06-25", "doc": {"active_energy_kcal": {"total": 500}}},
+        ],
+    }
+    calls = []
+
+    def fake_list(user_id, signal, days):
+        calls.append((user_id, signal, days))
+        return rows_by_signal.get(signal, [])
+
+    monkeypatch.setenv("FEEDLING_DIGEST_NOTABLE_MAX", "1")
+    monkeypatch.setattr(agent_routes.perception_store, "list_perception_daily", fake_list)
+    client = _client(monkeypatch)
+
+    resp = client.get("/v1/agent/perception/digest?days=7")
+    body = resp.get_json()
+
+    assert resp.status_code == 200
+    assert body["ok"] is True
+    assert body["days"] == 7
+    assert body["changes"] == [{
+        "signal": "health_activity",
+        "field": "active_energy_kcal",
+        "current": 500.0,
+        "baseline_median": 200.0,
+        "delta": 300.0,
+        "direction": "up",
+        "magnitude": 1.5,
+    }]
+    assert all(call[0] == "u_agent" and call[2] == 7 for call in calls)
+    assert {call[1] for call in calls} == set(agent_routes.perception_history.comparable_signals())
+
+
+def test_agent_perception_digest_empty_without_baseline(monkeypatch):
+    monkeypatch.setattr(
+        agent_routes.perception_store,
+        "list_perception_daily",
+        lambda user_id, signal, days: [
+            {"date": "2026-06-24", "doc": {"resting_heart_rate": {"sum": 120, "count": 2, "min": 58, "max": 62}}},
+            {"date": "2026-06-25", "doc": {"resting_heart_rate": {"sum": 132, "count": 2, "min": 65, "max": 67}}},
+        ] if signal == "health_vitals" else [],
+    )
+    client = _client(monkeypatch)
+
+    resp = client.get("/v1/agent/perception/digest")
+    body = resp.get_json()
+
+    assert resp.status_code == 200
+    assert body == {"ok": True, "days": 30, "changes": []}
+
+
+def test_agent_perception_digest_rejects_invalid_days(monkeypatch):
+    client = _client(monkeypatch)
+
+    resp = client.get("/v1/agent/perception/digest?days=nope")
+    body = resp.get_json()
+
+    assert resp.status_code == 400
+    assert body == {"ok": False, "error": "invalid_days"}

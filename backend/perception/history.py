@@ -17,6 +17,7 @@ in separately so the math is unit-testable without Postgres.
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 from typing import Any
 
 # --- shapes -----------------------------------------------------------------
@@ -66,10 +67,17 @@ _STATE_FIELD = {
 # representative is max(=total), not the average. Read-side hint only — they
 # still aggregate through numeric_dist's {min,max,sum,count}.
 _NUMERIC_MAX_FIELDS = {"step_count"}
+_COMPARABLE_SHAPES = {NUMERIC_DIST, CUMULATIVE, MAIN_OF_DAY}
+_SIGNIFICANCE_FLOOR = 1.0
 
 
 def is_historized(signal: str) -> bool:
     return signal in SHAPE
+
+
+def comparable_signals() -> list[str]:
+    """Historized signals that can yield per-day numeric trend values."""
+    return [signal for signal, shape in SHAPE.items() if shape in _COMPARABLE_SHAPES]
 
 
 def _numeric(v: Any) -> float | None:
@@ -345,3 +353,68 @@ def read_trend(rows: list[Mapping], signal: str, field: str | None = None) -> di
         "delta": delta,
         "direction": direction,
     }
+
+
+def _numeric_fields(rows: list[Mapping], signal: str) -> list[str]:
+    shape = SHAPE.get(signal)
+    if shape not in _COMPARABLE_SHAPES:
+        return []
+    fields: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        doc = row.get("doc") or {}
+        if not isinstance(doc, Mapping):
+            continue
+        for field in doc:
+            if not isinstance(field, str) or field.startswith("_") or field in seen:
+                continue
+            if _series_value(doc, shape, field) is None:
+                continue
+            seen.add(field)
+            fields.append(field)
+    return fields
+
+
+def _finite_number(v: Any) -> float | None:
+    n = _numeric(v)
+    if n is None or not math.isfinite(n):
+        return None
+    return n
+
+
+def notable_changes(rows_by_signal: Mapping[str, list[Mapping]], *, max_changes: int = 8) -> list[dict]:
+    """Return top-N relative numeric changes across all comparable history.
+
+    ``rows_by_signal`` maps canonical catalog signals to ascending daily rows,
+    the same shape consumed by ``read_trend``. Fields are discovered from the
+    stored day-docs, then each (signal, field) delegates baseline/current/delta
+    calculation to ``read_trend`` so digest semantics stay aligned with the
+    existing trend endpoint.
+    """
+    cap = max(0, int(max_changes or 0))
+    if cap <= 0:
+        return []
+    changes: list[dict] = []
+    for signal in comparable_signals():
+        rows = list(rows_by_signal.get(signal) or [])
+        for field in _numeric_fields(rows, signal):
+            trend = read_trend(rows, signal, field)
+            baseline = trend.get("baseline") if isinstance(trend.get("baseline"), Mapping) else {}
+            baseline_median = _finite_number(baseline.get("median"))
+            current = _finite_number(trend.get("current"))
+            delta = _finite_number(trend.get("delta"))
+            if (baseline.get("n") or 0) < 2 or baseline_median is None or current is None or delta is None:
+                continue
+            denom = max(abs(baseline_median), _SIGNIFICANCE_FLOOR)
+            magnitude = round(abs(delta) / denom, 6)
+            changes.append({
+                "signal": signal,
+                "field": field,
+                "current": current,
+                "baseline_median": baseline_median,
+                "delta": delta,
+                "direction": trend.get("direction") or "flat",
+                "magnitude": magnitude,
+            })
+    changes.sort(key=lambda c: (-c["magnitude"], c["signal"], c["field"]))
+    return changes[:cap]

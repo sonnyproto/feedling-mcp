@@ -144,6 +144,59 @@ def test_read_trend_numeric_dist_baseline_and_delta():
     assert t["direction"] == "up"
 
 
+def test_notable_changes_discovers_numeric_fields_sorts_and_caps():
+    rows_by_signal = {
+        "health_vitals": [
+            {"date": "2026-06-23", "doc": {"resting_heart_rate": {"sum": 120, "count": 2, "min": 58, "max": 62}}},
+            {"date": "2026-06-24", "doc": {"resting_heart_rate": {"sum": 120, "count": 2, "min": 59, "max": 61}}},
+            {"date": "2026-06-25", "doc": {"resting_heart_rate": {"sum": 132, "count": 2, "min": 65, "max": 67}}},
+        ],
+        "health_activity": [
+            {"date": "2026-06-23", "doc": {"active_energy_kcal": {"total": 200}}},
+            {"date": "2026-06-24", "doc": {"active_energy_kcal": {"total": 200}}},
+            {"date": "2026-06-25", "doc": {"active_energy_kcal": {"total": 500}}},
+        ],
+        "weather": [
+            {"date": "2026-06-23", "doc": {"temperature": {"sum": 40, "count": 2, "min": 19, "max": 21}}},
+            {"date": "2026-06-24", "doc": {"temperature": {"sum": 40, "count": 2, "min": 19, "max": 21}}},
+            {"date": "2026-06-25", "doc": {"temperature": {"sum": 60, "count": 2, "min": 29, "max": 31}}},
+        ],
+        "health_body": [
+            {"date": "2026-06-23", "doc": {"weight_kg": 50.0, "_at": 1.0}},
+            {"date": "2026-06-24", "doc": {"weight_kg": 50.0, "_at": 2.0}},
+            {"date": "2026-06-25", "doc": {"weight_kg": 40.0, "_at": 3.0}},
+        ],
+    }
+
+    changes = history.notable_changes(rows_by_signal, max_changes=2)
+
+    assert [(c["signal"], c["field"]) for c in changes] == [
+        ("health_activity", "active_energy_kcal"),
+        ("weather", "temperature"),
+    ]
+    assert changes[0]["current"] == 500.0
+    assert changes[0]["baseline_median"] == 200.0
+    assert changes[0]["delta"] == 300.0
+    assert changes[0]["direction"] == "up"
+    assert changes[0]["magnitude"] == 1.5
+
+
+def test_notable_changes_requires_two_baseline_values_and_current_delta():
+    rows_by_signal = {
+        "health_vitals": [
+            {"date": "2026-06-24", "doc": {"resting_heart_rate": {"sum": 120, "count": 2, "min": 58, "max": 62}}},
+            {"date": "2026-06-25", "doc": {"resting_heart_rate": {"sum": 132, "count": 2, "min": 65, "max": 67}}},
+        ],
+        "weather": [
+            {"date": "2026-06-23", "doc": {"condition": "rain"}},
+            {"date": "2026-06-24", "doc": {"condition": "sun"}},
+            {"date": "2026-06-25", "doc": {"condition": "sun"}},
+        ],
+    }
+
+    assert history.notable_changes(rows_by_signal) == []
+
+
 def test_record_unhistorized_signal_raises():
     try:
         history.record_daily(None, "now", {"battery_level": 0.5})
