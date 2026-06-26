@@ -2257,7 +2257,7 @@ def test_process_proactive_native_schedule_and_cancel_actions_without_chat(monke
     assert any(a.get("type") == "cancel_wake_result" for a in completed[-1][3]["extra"]["agent_actions"])
 
 
-def test_proactive_perception_digest_uses_agent_perception_route_not_v2_tool(monkeypatch):
+def test_proactive_perception_digest_uses_agent_perception_routes_not_v2_tool(monkeypatch):
     calls = []
 
     class _Resp:
@@ -2284,6 +2284,22 @@ def test_proactive_perception_digest_uses_agent_perception_route_not_v2_tool(mon
                     },
                 },
             })
+        if url.endswith("/v1/agent/perception/digest"):
+            return _Resp({
+                "ok": True,
+                "days": 30,
+                "changes": [
+                    {
+                        "signal": "health_vitals",
+                        "field": "resting_heart_rate",
+                        "current": 80,
+                        "baseline_median": 75,
+                        "delta": 5,
+                        "direction": "up",
+                        "magnitude": 0.066667,
+                    }
+                ],
+            })
         return _Resp({
             "trend": {
                 "current": 80,
@@ -2300,8 +2316,19 @@ def test_proactive_perception_digest_uses_agent_perception_route_not_v2_tool(mon
     assert presence["place_label"] == "home"
     assert presence["local_time"] == "2026-06-26T20:30:00+08:00"
     assert any(call[0].endswith("/v1/agent/perception") and call[1] == {"signals": "now"} for call in calls)
-    assert all(call[0].endswith(("/v1/agent/perception", "/v1/agent/perception/trend")) for call in calls)
-    assert {item["signal"] for item in change} == {"vitals", "steps", "sleep"}
+    assert any(call[0].endswith("/v1/agent/perception/digest") and call[1] == {"days": 30} for call in calls)
+    assert all(call[0].endswith(("/v1/agent/perception", "/v1/agent/perception/digest")) for call in calls)
+    assert change == [
+        {
+            "signal": "health_vitals",
+            "field": "resting_heart_rate",
+            "current": 80,
+            "baseline_median": 75,
+            "delta": 5,
+            "direction": "up",
+            "magnitude": 0.066667,
+        }
+    ]
 
 
 def test_native_proactive_prompt_injects_digest_and_native_tool_catalog(monkeypatch):
