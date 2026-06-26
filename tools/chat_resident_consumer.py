@@ -3550,19 +3550,36 @@ def _resident_perception_now() -> dict:
     return now if isinstance(now, dict) else {}
 
 
-# Signals worth a "vs your norm" line when a wake fires (cheap to pull, high
-# narrative value). Empty until perception_daily accumulates a few days.
-_PROACTIVE_CHANGE_SIGNALS = (
-    ("vitals", "resting_heart_rate"),
-    ("steps", "step_count"),
-    ("sleep", "asleep_minutes"),
-)
+def _resident_perception_digest_changes() -> list:
+    """Best-effort GET of the top-N notable cross-signal digest changes.
+
+    Replaces the old hardcoded 3-field preload (_PROACTIVE_CHANGE_SIGNALS):
+    the backend `/v1/agent/perception/digest` now ranks what actually moved vs
+    the user's own baseline across ALL historized numeric signals (vitals /
+    metabolic / weather / activity / sleep / body / cycle) and returns the most
+    notable. Degrades to [] if the endpoint is unavailable. The agent can still
+    drill into any signal on demand via the perception_trend/history tools."""
+    try:
+        resp = httpx.get(
+            f"{FEEDLING_API_URL}/v1/agent/perception/digest",
+            headers=_HEADERS,
+            params={"days": 30},
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            return []
+        body = resp.json()
+        return list(body.get("changes") or []) if isinstance(body, dict) else []
+    except Exception as e:
+        log.debug("proactive digest pull failed: %s", e)
+        return []
 
 
 def _proactive_perception_digest() -> tuple[dict, list]:
     """Pre-load real signals into the wake turn so the agent decides from facts,
-    not a blind prompt. presence = current cheap snapshot; change = vs-baseline
-    deltas (Tier 2 trend). Both best-effort — failures degrade to empty."""
+    not a blind prompt. presence = current cheap snapshot; change = top-N notable
+    vs-baseline deltas across the whole digest (no longer a hardcoded 3-field
+    list). Both best-effort — failures degrade to empty."""
     presence: dict[str, Any] = {}
     snap = _resident_perception_now()
     if isinstance(snap, dict):
@@ -3574,16 +3591,7 @@ def _proactive_perception_digest() -> tuple[dict, list]:
         presence = {k: snap.get(k) for k in keys if snap.get(k) is not None}
         if local_time is not None:
             presence["local_time"] = local_time
-    change: list[dict] = []
-    for signal, field in _PROACTIVE_CHANGE_SIGNALS:
-        tr = (_resident_perception_trend(signal, field) or {}).get("trend") or {}
-        baseline = tr.get("baseline") or {}
-        if tr.get("current") is not None and tr.get("delta") is not None and (baseline.get("n") or 0) >= 2:
-            change.append({
-                "signal": signal, "field": field,
-                "current": tr.get("current"), "baseline_median": baseline.get("median"),
-                "delta": tr.get("delta"), "direction": tr.get("direction"),
-            })
+    change = _resident_perception_digest_changes()
     return presence, change
 
 
