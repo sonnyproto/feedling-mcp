@@ -49,6 +49,35 @@
 
 ## 2026-06-26
 
+### [DONE] A-full：落卡 capture lane（Phase-1）+ 退役 proactive 模拟工具路（Phase-2）
+
+承接 A-lite（perception 统一到 CLI tools）。memory v1 后端落地后启动，目标：proactive 全走原生
+CLI 工具，消灭"把 agent 当裸模型返 JSON"的双路。
+
+**Phase-1 — 落卡 capture lane（对齐《IO 记忆·落卡+Dream 完整方案》第一部分）**
+- 独立 capture lane（复用 job 原语，不复用 proactive reach-out 语义）：PR A `2136073` 基座
+  (typed `job_kind=memory_capture` + `capture_key` 幂等 + poll 跳 wake gate + 分发)；PR B `457ba01`
+  触发 coordinator（append_chat 钩子 + `/v1/device/events` 边界 + `/v1/capture/tick` 静默兜底 +
+  `capture_state` 去重）；PR C.1 `e148da2` 落卡 prompt+parser；PR C.2 `bf2cf66` 原生 handler
+  （window→原生 call_agent→parse→封 v1 信封→`/v1/memory/actions`，不写 chat/不投递）。
+- 触发 = 会话断点（静默 1200s / 退后台 / 轮数 24 兜底），**不是 agent 每轮主动调**。
+  **不变量（测试钉死）：关「AI 主动找我」≠ 停记忆。**
+- VPS e2e：静默触发→handler 调真 agent 回看 55 轮→写 2 张高质量卡（memory 38→40，桶复用"我们的关系"）。
+- 验证交接文档：`docs/CAPTURE_LANE_VERIFICATION_2026-06-26.md`（给工程师独立验证）。
+
+**Phase-2 — 退役模拟工具路**
+- 审计发现：VPS proactive reach-out 当时走的就是模拟路（`RUNTIME_V2_DEFAULT_ON=true`）且功能完整，
+  native/legacy 是退化旧桩 → 不能直接删。先 P2-1 `a3d2d9b` 补原生 reach-out 同等能力
+  （native send_message action-only / schedule_wake·cancel_wake 解 gate / perception digest 改直连
+  `/v1/agent/perception` / 唤醒 agent 可调原生 perception·memory·screen / cost 标签 D2），再
+  P2-2a `b008909` 翻 test 默认到 native 验证（prod 不动），native VPS e2e 通过后 P2-2b `aa31380`
+  删除：`run_tool_loop_v2`(tool_loop_v2.py)、`/v1/proactive/tool/execute` 路由、`_resident_run_agent_v2`、
+  `_resident_call_tool_v2` + 对应测试/ci。proactive wake 现在**始终走原生**。
+- **保留** `tool_executor_v2`/`tool_catalog_v2`（hosted 前台 chat / dashboard / runtime_v2 仍用）。
+- 删后 VPS e2e：手动+自动唤醒都走 native（digest 直连、agent 跑、sleep 有理有据、**零 `/v1/proactive/tool/execute`**、无报错）。
+- 尾巴：prod `RUNTIME_V2_DEFAULT_ON=true` 删 V2 分支后已 vestigial（待单独清）；Dream（方案 Part 2）后排；
+  io_cli `send/wait-for-wake/schedule-wake/photo` 仍 stub。
+
 ### [DONE] resident consumer 自动更新（路径感知锁步）
 
 自托管 consumer/io_cli 走 git clone 分发，onboarding 后除非手动 `git pull`+重启否则永远跑旧代码。现在让 consumer 自动跟上后端部署的 commit：
