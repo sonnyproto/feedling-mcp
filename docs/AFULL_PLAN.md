@@ -34,13 +34,28 @@ A-full = 把 memory+screen 也做成原生插件,proactive 全走原生 `call_ag
 
 ## 3. 分阶段(安全增量,绝不为退役牺牲功能)
 
-### Phase 0(本轮,并行)
-- **Claude**:① 本 plan;② `io_cli.py` 加**读子命令** `memory index/fetch`、`screen read/recent`(明文安全,无加密);③ 插件 `index.js` 注册 `memory_index/memory_fetch/screen_read/screen_recent`(provider-safe 名);④ 本地自测。
-- **Codex**:backend —— ① 把 memory **写动作** add/supersede/delete/retype 接进 `tool_catalog_v2` + `tool_executor_v2` 的 HTTP 路(**作为 interim,即刻可用可测**),floors/anchor 校验透传为工具可读错误;② 补/改对应测试;③ 不动选路逻辑。
+### Phase 0 ✅ 已完成(commit 94c2f69)
+- **Claude**:`io_cli.py` 读子命令 `memory-index/memory-fetch/screen-recent/screen-read`(明文安全)+ 插件注册原生工具 + 文档;VPS 实测通过。
+- **Codex**:memory 写动作 add/supersede/delete/retype 接进 `tool_catalog_v2` + `tool_executor_v2` HTTP 路(写入原语),floors/anchor 透传 + 明文拒绝(`needs_client_encryption`)。测试 executor 18 + resident 主线 253 passed。
 
-### Phase 1(Phase 0 全绿后)
-- **Claude**:io_cli/consumer 协作做 `memory add`(走 D1 加密方案)+ 插件 `memory_add` 工具。
-- **Codex**:proactive 选路:读类工具先切原生 `call_agent`,写类暂留 loop,直到原生写验证通过。
+---
+
+### Phase 1(本阶段)— 落卡 Capture Lane(对齐《落卡+Dream 完整方案》)
+
+**核心认知(Seven 2026-06-26 + double check):** 落卡的主力机制 = **会话断点触发的回顾落卡**,不是 agent 每轮主动调工具。当前 VPS 用户**几乎没有自动落卡**(hosted turn-cadence capture 走不到、resident 只有少见的当轮 emit、断点回顾没建、Dream 没建)。Phase-1 修这个。
+
+**架构裁定(Claude + Codex 对齐):独立 capture lane,复用 job 原语,不复用 proactive reach-out 语义。**
+- 不要"proactive_jobs 加 kind 然后到处 if";不要完全重搭队列。
+- 物理可短期复用 `proactive_jobs` stream(log/wake_bus/claim/lease/stale-reclaim),但**逻辑上是独立 lane**:typed job (`job_kind=memory_capture` + `capture_key` 幂等 + window)、独立 trigger gate、独立 handler、独立 status 字段、独立测试。
+- **不变量(写测试钉死):关「AI 主动找我」≠ 停记忆。** capture gate 绝不看 ambient/scheduled/delivery/user_state/broadcast。
+
+**PR 顺序(Codex 建议,采纳):**
+- **PR A — Capture job 基座**(Codex backend):typed job doc;enqueue helper;`_resident_pollable_pending_jobs()` 对 `job_kind=memory_capture` **跳过 wake gate**;poll 按 kind 标类型;consumer 第一层按 kind 分发到 `_process_capture_jobs` stub;`update_*_job` 扩展 capture status 字段(`capture_result/cards_added/cards_superseded/noop_reason` 等,不塞进 reach-out 字段)。**测试:ambient off 不阻止 capture poll/claim;proactive wake 仍被 ambient gate 阻止(invariant)。**
+- **PR B — 触发**(Claude iOS 显式信号 + Codex 后端 coordinator):iOS 报 `app background/screen lock/explicit close/晚安` → `/v1/device/events`;后端 `memory/capture_scheduler.py`(或 `capture/service.py`)在 chat append 后更新 `capture_state` window + 轮数兜底,resident/timer tick 处理**静默超时兜底**(不能只靠 iOS);`capture_state` blob 去重(`last_captured_until_message_id/pending_capture_key/...`)。**测试:同一 window 多事件只 enqueue 一次;无新消息 noop。**
+- **PR C — 原生 capture handler**(Claude 落卡 prompt + Codex/Claude consumer):`_process_capture_jobs` 新函数,走原生 `call_agent`(**不走 run_tool_loop_v2**),用方案的落卡 prompt 回看 window + 现有桶/线索 + identity → 产出卡(并入/新增/覆盖/不动)→ consumer 封信封 → `/v1/memory/actions`。**Hard rule:不 post_reply、不过 delivery gate、忽略 agent 返回的 messages。测试:不写 chat;不触发投递;success/noop/failure 都落 status。**
+- **PR D — Dream 复用同一 lane**(后):`job_kind=memory_dream`,不同 trigger(夜间/攒量)/prompt(纯整理:合并/厚化/消矛盾)/cadence,同样不走 reach-out gate;红线:只 superseded 不删、重构前备份、不发消息。
+
+**并发红线**:同用户单飞(最多一个 pending/running capture)+ `capture_key` 幂等(app background + 静默 + 轮数同时触发不重复落卡)。
 
 ### Phase 2(退役)
 - **Codex**:原生覆盖全部工具后,proactive 全切原生;删 `run_tool_loop_v2`/`_resident_run_agent_v2`/`_resident_call_tool_v2`/`/v1/proactive/tool/execute` + 相关测试;按 D2 处理 budget。
@@ -54,6 +69,7 @@ A-full = 把 memory+screen 也做成原生插件,proactive 全走原生 `call_ag
 - memory:index/fetch 读 + add/supersede/delete/retype 写(含 floors/anchor 非法卡被拒)
 - screen:read(caption)/ recent
 - proactive:manual+auto tick → enqueue → consumer claim → 工具调用 → send_message → 投递门
+- **capture lane**:断点触发 → enqueue(单飞+幂等)→ poll **跳过 wake gate** → handler 落卡(不写 chat/不投递)→ /v1/memory/actions;**invariant: ambient/proactive off 仍落记忆**
 - 三开关 gating + timer fire
 - 退役回归:删 loop/route 后上述全部仍通
 
