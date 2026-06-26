@@ -160,16 +160,24 @@ def test_memory_create_alias_writes_clean_v1_add(monkeypatch):
     assert json.loads(saved[0]["body_ct"])["bucket"] == "协作方式"
 
 
-def test_memory_retype_is_unsupported_in_v1(monkeypatch):
+def test_memory_retype_updates_type_in_v1_actions(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_v1")
-    _install_memory_action_fakes(monkeypatch, [])
+    moments = [{
+        "id": "mem_any",
+        "owner_user_id": "usr_v1",
+        "type": "event",
+        "status": "active",
+    }]
+    saved = _install_memory_action_fakes(monkeypatch, moments)
 
     body, status = memory_actions._execute_memory_actions(store, "api_key", [
         {"type": "memory.retype", "memory_id": "mem_any", "new_type": "fact"}
     ])
 
-    assert status == 400
-    assert body["error"] == "unsupported_memory_action"
+    assert status == 200
+    assert body["status"] == "ok"
+    assert body["results"][0]["action"] == "memory.retype"
+    assert saved[0]["type"] == "fact"
 
 
 def test_memory_patch_becomes_supersede_and_inherits_old_bucket_threads(monkeypatch):

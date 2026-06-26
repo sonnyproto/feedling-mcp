@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import sys
+import types
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+from memory import actions as memory_actions
 from proactive.tool_catalog_v2 import (
     FAST,
     SLOW,
@@ -19,6 +21,7 @@ from proactive.tool_executor_v2 import (
     ToolTraceV2,
     ToolRuntimeAdaptersV2,
     TOOL_TRACE_STREAM_V2,
+    combined_runtime_adapters_v2,
 )
 
 
@@ -259,6 +262,167 @@ def test_unavailable_tools_are_not_masked_by_budget_handoff():
 
 def _exec_with(adapters):
     return ToolExecutorV2(adapters=adapters)
+
+
+def _memory_env(user_id: str, memory_id: str, mem_type: str = "fact", *, anchors=None) -> dict:
+    envelope = {
+        "id": memory_id,
+        "body_ct": f"ct_{memory_id}",
+        "nonce": f"nonce_{memory_id}",
+        "K_user": f"ku_{memory_id}",
+        "K_enclave": f"ke_{memory_id}",
+        "visibility": "shared",
+        "owner_user_id": user_id,
+        "type": mem_type,
+        "occurred_at": "2026-06-26T10:00:00Z",
+        "source": "proactive_tool_test",
+    }
+    if anchors is not None:
+        envelope["anchor_memory_ids"] = list(anchors)
+    return envelope
+
+
+def _install_memory_action_adapter(monkeypatch, moments: list[dict], *, user_id: str = "usr_tool_memory") -> ToolRuntimeAdaptersV2:
+    store = types.SimpleNamespace(user_id=user_id)
+
+    def fake_load(_store):
+        return [dict(moment) for moment in moments]
+
+    def fake_save(_store, new_moments):
+        moments[:] = [dict(moment) for moment in new_moments]
+
+    monkeypatch.setattr(memory_actions.memory_service, "_load_moments", fake_load)
+    monkeypatch.setattr(memory_actions.memory_service, "_save_moments", fake_save)
+    monkeypatch.setattr(memory_actions.boot_gates, "_log_bootstrap_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(memory_actions.identity_service, "_relationship_age_days", lambda _store: 365)
+    monkeypatch.setattr(
+        memory_actions.memory_service,
+        "_append_memory_change",
+        lambda _store, change: {"id": f"chg_{change['action']}", **change},
+    )
+
+    def memory_action(_user_id, args):
+        body, status = memory_actions._execute_memory_actions(store, "api_key", [dict(args or {})])
+        return {"status_code": status, **dict(body or {})}
+
+    return ToolRuntimeAdaptersV2(memory_action=memory_action)
+
+
+def test_memory_write_tool_specs_are_cataloged_with_expected_costs():
+    catalog = default_tool_catalog_v2()
+
+    assert catalog.cost_class_for("memory.add") == SLOW
+    assert catalog.cost_class_for("memory.supersede") == SLOW
+    assert catalog.cost_class_for("memory.delete") == FAST
+    assert catalog.cost_class_for("memory.retype") == FAST
+
+
+def test_memory_write_tools_execute_through_memory_actions(monkeypatch):
+    user_id = "usr_tool_memory"
+    moments = [
+        {"id": "mem_old", "owner_user_id": user_id, "type": "fact", "status": "active"},
+        {"id": "mem_delete", "owner_user_id": user_id, "type": "fact", "status": "active"},
+        {"id": "mem_retype", "owner_user_id": user_id, "type": "fact", "status": "active"},
+        {"id": "mem_anchor", "owner_user_id": user_id, "type": "fact", "status": "active"},
+    ]
+    executor = ToolExecutorV2(
+        adapters=_install_memory_action_adapter(monkeypatch, moments, user_id=user_id),
+        budget=ToolBudgetV2(fast_hard_limit=4, slow_inline_limit=4),
+    )
+
+    added = executor.execute(ToolCallV2("memory.add", user_id=user_id, args={"envelope": _memory_env(user_id, "mem_added")}))
+    superseded = executor.execute(ToolCallV2(
+        "memory.supersede",
+        user_id=user_id,
+        args={"supersedes": "mem_old", "envelope": _memory_env(user_id, "mem_new")},
+    ))
+    deleted = executor.execute(ToolCallV2("memory.delete", user_id=user_id, args={"memory_id": "mem_delete"}))
+    retyped = executor.execute(ToolCallV2(
+        "memory.retype",
+        user_id=user_id,
+        args={"memory_id": "mem_retype", "new_type": "insight", "anchor_memory_ids": ["mem_anchor"]},
+    ))
+
+    assert added.ok is True
+    assert added.result["results"][0]["memory"]["id"] == "mem_added"
+    assert superseded.ok is True
+    assert superseded.result["results"][0]["superseded"]["id"] == "mem_old"
+    assert deleted.ok is True
+    assert deleted.result["results"][0]["memory"]["id"] == "mem_delete"
+    assert retyped.ok is True
+    assert retyped.result["results"][0]["memory"]["type"] == "insight"
+    assert any(moment["id"] == "mem_added" for moment in moments)
+    assert next(moment for moment in moments if moment["id"] == "mem_old")["status"] == "superseded"
+    assert not any(moment["id"] == "mem_delete" for moment in moments)
+    assert next(moment for moment in moments if moment["id"] == "mem_retype")["type"] == "insight"
+
+
+def test_memory_write_tool_rejects_plaintext_before_memory_action_adapter(monkeypatch):
+    called = []
+    executor = ToolExecutorV2(
+        adapters=ToolRuntimeAdaptersV2(memory_action=lambda *_args: called.append(True) or {"status": "ok"}),
+        budget=ToolBudgetV2(slow_inline_limit=4),
+    )
+
+    result = executor.execute(ToolCallV2(
+        "memory.add",
+        user_id="usr_tool_memory",
+        args={"memory": {"type": "fact", "summary": "plaintext should not cross this tool boundary"}},
+    ))
+
+    assert result.ok is False
+    assert result.outcome == "error"
+    assert result.error_code == "needs_client_encryption"
+    assert result.result["required"].startswith("Build a v1 memory envelope")
+    assert called == []
+
+
+def test_memory_write_tool_returns_agent_readable_validation_errors(monkeypatch):
+    user_id = "usr_tool_memory"
+    moments = [{"id": "mem_anchor", "owner_user_id": user_id, "type": "fact", "status": "active"}]
+    executor = ToolExecutorV2(
+        adapters=_install_memory_action_adapter(monkeypatch, moments, user_id=user_id),
+        budget=ToolBudgetV2(slow_inline_limit=4),
+    )
+
+    missing_anchor = executor.execute(ToolCallV2(
+        "memory.add",
+        user_id=user_id,
+        args={"envelope": _memory_env(user_id, "mem_insight", "insight")},
+    ))
+    wrong_type = executor.execute(ToolCallV2(
+        "memory.add",
+        user_id=user_id,
+        args={"envelope": _memory_env(user_id, "mem_bad", "bad_type")},
+    ))
+
+    assert missing_anchor.ok is False
+    assert missing_anchor.error_code == "insight_requires_anchor"
+    assert "required" in missing_anchor.result["results"][0]
+    assert wrong_type.ok is False
+    assert wrong_type.error_code == "type_invalid"
+    assert "allowed" in wrong_type.result["results"][0]
+
+
+def test_combined_memory_action_adapter_authorizes_memory_scope(monkeypatch):
+    calls = {}
+    store = types.SimpleNamespace(user_id="usr_tool_scope")
+
+    monkeypatch.setattr("accounts.runtime_auth.authorize_scope", lambda scope: calls.setdefault("scope", scope))
+    monkeypatch.setattr(
+        memory_actions,
+        "_execute_memory_actions",
+        lambda _store, api_key, actions: ({"status": "ok", "api_key": api_key, "actions": actions}, 200),
+    )
+
+    adapters = combined_runtime_adapters_v2("api_scope", store)
+    assert adapters.memory_action is not None
+    result = adapters.memory_action("usr_tool_scope", {"type": "memory.delete", "memory_id": "mem_1"})
+
+    assert calls["scope"] == "memory"
+    assert result["status_code"] == 200
+    assert result["api_key"] == "api_scope"
+    assert result["actions"] == [{"type": "memory.delete", "memory_id": "mem_1"}]
 
 
 def test_screen_read_returns_caption():

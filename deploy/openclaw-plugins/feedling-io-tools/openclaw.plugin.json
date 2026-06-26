@@ -1,7 +1,7 @@
 {
   "id": "feedling-io-tools",
   "name": "Feedling IO Tools",
-  "description": "Expose Feedling IO perception CLI as native OpenClaw tools.",
+  "description": "Expose Feedling IO perception/memory/screen CLI as native OpenClaw tools.",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

@@ -157,6 +157,50 @@ def _memory_validate_write(
     return True, None
 
 
+def _memory_validate_prebuilt_envelope(
+    store: UserStore,
+    moments: list,
+    envelope: dict,
+    *,
+    memory_id: str = "",
+    enforce_reflection_cap: bool = True,
+) -> tuple[bool, dict | None]:
+    required = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
+    missing = [field for field in required if not envelope.get(field)]
+    if missing:
+        return False, {"error": "envelope_missing_fields", "missing": missing}
+    if envelope["visibility"] not in ("shared", "local_only"):
+        return False, {"error": "envelope_visibility_invalid", "allowed": ["shared", "local_only"]}
+    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
+        return False, {"error": "envelope_shared_requires_K_enclave"}
+    occurred_at = _memory_action_text(envelope.get("occurred_at"), 80)
+    if not occurred_at:
+        return False, {
+            "error": "occurred_at_required",
+            "required": "occurred_at is required as plaintext metadata for memory ordering.",
+        }
+    if envelope["owner_user_id"] != store.user_id:
+        return False, {"error": "not_owned", "required": "envelope.owner_user_id must match caller."}
+    mem_type = str(envelope.get("type") or "").strip().lower()
+    if not mem_type:
+        return False, {
+            "error": "type_required",
+            "allowed": list(memory_service.MEMORY_TYPES),
+            "required": "type is mandatory and must be one of moment/quote/fact/event/insight/reflection.",
+        }
+    anchor_ids = envelope.get("anchor_memory_ids") or []
+    if not isinstance(anchor_ids, list):
+        return False, {"error": "anchor_memory_ids_must_be_list"}
+    return _memory_validate_write(
+        store,
+        moments,
+        mem_type=mem_type,
+        anchor_ids=anchor_ids,
+        memory_id=memory_id,
+        enforce_reflection_cap=enforce_reflection_cap,
+    )
+
+
 def _build_memory_envelope_for_store(
     store: UserStore,
     inner: dict,
@@ -168,6 +212,16 @@ def _build_memory_envelope_for_store(
         json.dumps(inner, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
         item_id=item_id,
     )
+
+
+def _memory_record_from_prebuilt_envelope(store: UserStore, envelope: dict, *, existing: dict | None = None) -> dict:
+    moment = _memory_record_from_envelope(store, envelope, existing=existing)
+    moment["type"] = str(envelope.get("type") or "").strip().lower()
+    moment.setdefault("status", str(envelope.get("status") or "active"))
+    anchor_ids = envelope.get("anchor_memory_ids") or []
+    if anchor_ids:
+        moment["anchor_memory_ids"] = list(anchor_ids)
+    return moment
 
 
 def _memory_record_from_envelope(store: UserStore, envelope: dict, *, existing: dict | None = None) -> dict:
@@ -230,6 +284,9 @@ def _memory_action_effect(action: str, memory_id: str, fields: list[str] | None 
 
 
 def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
+    if isinstance(action.get("envelope"), dict):
+        return _memory_add_envelope_action(store, action)
+
     raw = action.get("memory") if isinstance(action.get("memory"), dict) else action
     mem_type = str(raw.get("type") or "fact").strip().lower()
     summary = str(raw.get("summary") or raw.get("description") or raw.get("title") or "").strip()[:2000]
@@ -277,6 +334,45 @@ def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict]
         "memory": {"id": moment["id"], "type": mem_type, "occurred_at": moment["occurred_at"], "status": moment["status"]},
         "change": change,
     }, [effect], 201
+
+
+def _memory_add_envelope_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
+    envelope = dict(action.get("envelope") or {})
+    moments = memory_service._load_moments(store)
+    ok, err = _memory_validate_prebuilt_envelope(
+        store,
+        moments,
+        envelope,
+        memory_id=str(envelope.get("id") or ""),
+    )
+    if not ok:
+        return {"status": "error", **(err or {}), "action": "memory.add"}, [], 400
+
+    moment = _memory_record_from_prebuilt_envelope(store, envelope)
+    moments.append(moment)
+    memory_service._save_moments(store, moments)
+    boot_gates._log_bootstrap_event(store, "memory_action_added_envelope_v1", success=True)
+    anchor_ids = envelope.get("anchor_memory_ids") or []
+    change = memory_service._append_memory_change(store, {
+        "action": "insert",
+        "memory_id": moment["id"],
+        "type": moment.get("type", ""),
+        "reason": _memory_action_text(action.get("reason") or "Memory added from encrypted tool action.", 500),
+        "capture_mode": action.get("capture_mode") or "",
+        "source_chat_message_ids": action.get("source_chat_message_ids") or [],
+        "anchor_memory_ids": anchor_ids,
+    })
+    return {
+        "status": "ok",
+        "action": "memory.add",
+        "memory": {
+            "id": moment["id"],
+            "type": moment.get("type", ""),
+            "occurred_at": moment.get("occurred_at", ""),
+            "status": moment.get("status", "active"),
+        },
+        "change": change,
+    }, [_memory_action_effect("memory.add", moment["id"], ["created"])], 201
 
 
 def _memory_content_patch_action(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
@@ -390,6 +486,8 @@ def _memory_retype_action(store: UserStore, action: dict) -> tuple[dict, list[di
     if idx is None:
         return {"status": "error", "error": "not_found", "action": "memory.retype"}, [], 404
     target = dict(moments[idx])
+    if target.get("owner_user_id") != store.user_id:
+        return {"status": "error", "error": "not_owned", "action": "memory.retype"}, [], 403
     anchor_ids = action.get("anchor_memory_ids") or []
     ok, err = _memory_validate_write(store, moments, mem_type=new_type, anchor_ids=anchor_ids, memory_id=memory_id, enforce_reflection_cap=False)
     if not ok:
@@ -425,6 +523,9 @@ def _memory_retype_action(store: UserStore, action: dict) -> tuple[dict, list[di
 
 
 def _memory_supersede_action(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
+    if isinstance(action.get("envelope"), dict):
+        return _memory_supersede_envelope_action(store, action)
+
     raw = action.get("memory") if isinstance(action.get("memory"), dict) else {}
     old_id = _memory_action_text(
         action.get("supersedes")
@@ -518,6 +619,79 @@ def _memory_supersede_action(store: UserStore, api_key: str | None, action: dict
     }, [effect], 201
 
 
+def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
+    old_id = _memory_action_text(
+        action.get("supersedes")
+        or action.get("old_id")
+        or action.get("target_id")
+        or action.get("memory_id"),
+        160,
+    )
+    if not old_id:
+        return {"status": "error", "error": "supersedes_required", "action": "memory.supersede"}, [], 400
+    envelope = dict(action.get("envelope") or {})
+    moments = memory_service._load_moments(store)
+    old_idx = next((i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == old_id), None)
+    if old_idx is None:
+        return {"status": "error", "error": "not_found", "action": "memory.supersede"}, [], 404
+    old = moments[old_idx]
+    if old.get("owner_user_id") != store.user_id:
+        return {"status": "error", "error": "not_owned", "action": "memory.supersede"}, [], 403
+
+    envelope["supersedes"] = [old_id]
+    ok, err = _memory_validate_prebuilt_envelope(
+        store,
+        moments,
+        envelope,
+        memory_id=str(envelope.get("id") or ""),
+    )
+    if not ok:
+        return {"status": "error", **(err or {}), "action": "memory.supersede"}, [], 400
+
+    new_moment = _memory_record_from_prebuilt_envelope(store, envelope)
+    now = core_util._now_iso()
+    retired = dict(old)
+    retired["status"] = "superseded"
+    retired["superseded_by"] = new_moment["id"]
+    retired["updated_at"] = now
+    retired["is_archived"] = True
+    retired["archived_at"] = now
+    retired["archive_reason"] = f"superseded_by:{new_moment['id']}"
+
+    moments[old_idx] = retired
+    moments.append(new_moment)
+    memory_service._save_moments(store, moments)
+    anchor_ids = envelope.get("anchor_memory_ids") or []
+    change = memory_service._append_memory_change(store, {
+        "action": "supersede",
+        "memory_id": new_moment["id"],
+        "supersedes": old_id,
+        "type": new_moment.get("type", ""),
+        "reason": _memory_action_text(action.get("reason") or "Memory superseded from encrypted tool action.", 500),
+        "source_chat_message_ids": action.get("source_chat_message_ids") or [],
+        "anchor_memory_ids": anchor_ids,
+    })
+    effect = {
+        "type": "memory_superseded",
+        "action": "memory.supersede",
+        "memory_id": new_moment["id"],
+        "supersedes": old_id,
+        "fields": ["created", "status", "supersedes", "superseded_by"],
+    }
+    return {
+        "status": "ok",
+        "action": "memory.supersede",
+        "memory": {
+            "id": new_moment["id"],
+            "type": new_moment.get("type", ""),
+            "occurred_at": new_moment.get("occurred_at", ""),
+            "status": new_moment.get("status", "active"),
+        },
+        "superseded": {"id": old_id, "status": "superseded", "superseded_by": new_moment["id"]},
+        "change": change,
+    }, [effect], 201
+
+
 def _memory_delete_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
     memory_id = _memory_action_text(action.get("id") or action.get("memory_id"), 160)
     if not memory_id:
@@ -568,7 +742,7 @@ def _execute_memory_action(store: UserStore, api_key: str | None, action: dict) 
             "source_chat_message_ids": action.get("source_chat_message_ids") or [],
         })
     if action_type == "memory.retype":
-        return {"status": "error", "error": "unsupported_memory_action", "action": "memory.retype"}, [], 400
+        return _memory_retype_action(store, action)
     if action_type == "memory.supersede":
         return _memory_supersede_action(store, api_key, action)
     if action_type == "memory.delete":
@@ -577,7 +751,7 @@ def _execute_memory_action(store: UserStore, api_key: str | None, action: dict) 
         "status": "error",
         "error": "unsupported_memory_action",
         "action": action_type,
-        "supported": ["memory.add", "memory.supersede", "memory.delete"],
+        "supported": ["memory.add", "memory.supersede", "memory.delete", "memory.retype"],
     }, [], 400
 
 
