@@ -1535,6 +1535,33 @@ def _capture_final_status(captured):
     return captured["statuses"][-1]
 
 
+def test_capture_get_json_disables_tls_verification_for_enclave_only(monkeypatch):
+    calls = []
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"ok": True}
+
+    def _get(url, **kwargs):
+        calls.append((url, kwargs))
+        return _Resp()
+
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enclave.local")
+    monkeypatch.setattr(crc, "FEEDLING_API_URL", "https://backend.local")
+    monkeypatch.setattr(crc.httpx, "get", _get)
+
+    assert crc._capture_get_json("/v1/identity/get", base_url="https://enclave.local") == {"ok": True}
+    assert calls[-1][0] == "https://enclave.local/v1/identity/get"
+    assert calls[-1][1]["verify"] is False
+
+    assert crc._capture_get_json("/v1/memory/buckets") == {"ok": True}
+    assert calls[-1][0] == "https://backend.local/v1/memory/buckets"
+    assert calls[-1][1]["verify"] is True
+
+
 def test_capture_identity_context_prefers_enclave_plaintext_and_filters_ciphertext(monkeypatch):
     calls = []
 

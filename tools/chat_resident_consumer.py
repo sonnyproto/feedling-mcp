@@ -3686,12 +3686,14 @@ def _capture_get_json(
     base_url: str | None = None,
 ) -> dict:
     root = (base_url or FEEDLING_API_URL).rstrip("/")
+    verify_tls = not (FEEDLING_ENCLAVE_URL and root == FEEDLING_ENCLAVE_URL)
     try:
         resp = httpx.get(
             f"{root}{path}",
             params=params or {},
             headers=_HEADERS,
             timeout=timeout,
+            verify=verify_tls,
         )
         resp.raise_for_status()
         body = resp.json()
