@@ -9,7 +9,7 @@ from flask import Blueprint, Response, jsonify, request
 from accounts import auth
 from core import store as core_store
 from core import util
-from proactive import dashboard, gate, resident_runtime_v2, service
+from proactive import capture_jobs, dashboard, gate, resident_runtime_v2, service
 from proactive.observability_v2 import ROUND3_REVIEW_LABELS_V2
 from proactive.tool_executor_v2 import (
     ToolBudgetV2, ToolExecutorV2, ToolCallV2, combined_runtime_adapters_v2,
@@ -198,7 +198,46 @@ def _job_status_patch(payload: dict, *, default_status: str = "") -> dict:
             "duration_sec": max(0, min(duration_sec, 3600)),
             "copy": str(req.get("copy") or req.get("message") or "")[:500],
         }
+    if isinstance(payload.get("capture_result"), dict):
+        patch["capture_result"] = _safe_capture_doc(payload.get("capture_result"), max_items=20)
+    if isinstance(payload.get("capture_window"), dict):
+        patch["capture_window"] = _safe_capture_doc(payload.get("capture_window"), max_items=12)
+    if isinstance(payload.get("memory_action_status"), (dict, list)):
+        patch["memory_action_status"] = _safe_capture_doc(payload.get("memory_action_status"), max_items=20)
+    elif payload.get("memory_action_status"):
+        patch["memory_action_status"] = str(payload.get("memory_action_status"))[:500]
+    if isinstance(payload.get("memory_results"), list):
+        patch["memory_results"] = _safe_capture_doc(payload.get("memory_results"), max_items=20)
+    for key in ("cards_added", "cards_superseded"):
+        if key in payload:
+            try:
+                patch[key] = max(0, int(payload.get(key) or 0))
+            except (TypeError, ValueError):
+                patch[key] = 0
+    if payload.get("noop_reason"):
+        patch["noop_reason"] = str(payload.get("noop_reason"))[:500]
     return patch
+
+
+def _safe_capture_doc(value, *, max_items: int = 20):
+    if isinstance(value, dict):
+        out = {}
+        for key, item in list(value.items())[:max_items]:
+            skey = str(key)[:80]
+            if isinstance(item, (bool, int, float)) or item is None:
+                out[skey] = item
+            elif isinstance(item, str):
+                out[skey] = item[:1000]
+            elif isinstance(item, (dict, list)):
+                out[skey] = _safe_capture_doc(item, max_items=max_items)
+            else:
+                out[skey] = str(item)[:500]
+        return out
+    if isinstance(value, list):
+        return [_safe_capture_doc(item, max_items=max_items) for item in value[:max_items]]
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    return str(value)[:1000]
 
 
 def _job_age_ref_epoch(job: dict) -> float:
@@ -289,6 +328,11 @@ def _resident_pollable_pending_jobs(store, *, since: float, limit: int, runtime_
     read_limit = max(limit, 100)
     for job in store.list_proactive_jobs(since_epoch=since, limit=read_limit):
         if str(job.get("status") or "pending") != "pending":
+            continue
+        if capture_jobs.is_memory_capture_job(job):
+            out.append(_with_resident_runtime_v2(job, runtime_profile))
+            if len(out) >= limit:
+                break
             continue
         decision = _resident_wake_control_decision_v2(store, job)
         if decision is not None and not decision.accepted:

@@ -658,6 +658,13 @@ class UserStore:
             "broadcast_state",
             "request_broadcast",
             "wake_result",
+            "capture_result",
+            "capture_window",
+            "memory_action_status",
+            "memory_results",
+            "cards_added",
+            "cards_superseded",
+            "noop_reason",
         }
         patch = {k: v for k, v in (fields or {}).items() if k in allowed}
         if not patch:

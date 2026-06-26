@@ -13,6 +13,7 @@ appmod = importlib.import_module("app")
 from chat import service as chat_service  # noqa: E402
 from bootstrap import gates as boot_gates  # noqa: E402
 from proactive.controls_v2 import evaluate_wake_control_v2, resolve_settings_v2  # noqa: E402
+from proactive import capture_jobs as proactive_capture_jobs  # noqa: E402
 from proactive import dashboard as proactive_dashboard  # noqa: E402
 from proactive import resident_runtime_v2 as proactive_resident_runtime_v2  # noqa: E402
 from proactive import routes as proactive_routes  # noqa: E402
@@ -910,6 +911,140 @@ def test_resident_poll_applies_v2_wake_controls_to_legacy_jobs(tmp_path, monkeyp
     assert rows["pj_scheduled"]["status"] == "skipped"
     assert rows["pj_scheduled"]["status_reason"] == "scheduled_disabled"
     assert rows["pj_manual"]["status"] == "pending"
+
+
+def test_capture_job_polls_and_claims_when_ambient_is_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_capture_ambient_off_key"
+    user_id = "usr_capture_ambient_off"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.save_proactive_settings({
+        "ambient": False,
+        "scheduled": False,
+        "reminders_delivery": False,
+    })
+
+    job, enqueued, reason = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="session_break",
+        capture_key="window:ambient-off",
+        window={
+            "after_message_id": "msg_before",
+            "until_message_id": "msg_until",
+            "until_ts": 1200.0,
+            "message_count": 8,
+        },
+        now=1201.0,
+    )
+
+    assert enqueued is True
+    assert reason == "enqueued"
+    assert job is not None
+    assert job["job_id"].startswith("cap_")
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    poll = client.get("/v1/proactive/jobs/poll?since=0&timeout=0", headers=headers)
+
+    assert poll.status_code == 200
+    body = poll.get_json()
+    assert [row["job_id"] for row in body["jobs"]] == [job["job_id"]]
+    assert body["jobs"][0]["job_kind"] == "memory_capture"
+    assert body["jobs"][0]["source"] == "memory_capture"
+
+    claim = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/claim",
+        headers=headers,
+        json={"consumer_id": "capture-consumer"},
+    )
+
+    assert claim.status_code == 200
+    assert claim.get_json()["claimed"] is True
+    assert claim.get_json()["job"]["status"] == "claimed"
+
+    status = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json={
+            "status": "completed",
+            "consumer_id": "capture-consumer",
+            "reason": "capture_stub_noop",
+            "capture_result": {"status": "noop", "reason": "capture_handler_stub"},
+            "capture_window": job["window"],
+            "memory_action_status": {"status": "not_run"},
+            "cards_added": 0,
+            "cards_superseded": 0,
+            "noop_reason": "capture_handler_stub",
+        },
+    )
+
+    assert status.status_code == 200
+    patched = status.get_json()["job"]
+    assert patched["capture_result"] == {"status": "noop", "reason": "capture_handler_stub"}
+    assert patched["capture_window"]["until_message_id"] == "msg_until"
+    assert patched["memory_action_status"] == {"status": "not_run"}
+    assert patched["cards_added"] == 0
+    assert patched["cards_superseded"] == 0
+    assert patched["noop_reason"] == "capture_handler_stub"
+
+
+def test_capture_enqueue_single_flight_per_user(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    store = appmod.UserStore("usr_capture_single_flight")
+
+    first, first_enqueued, first_reason = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="session_break",
+        capture_key="window:first",
+        window={"until_message_id": "msg_1", "until_ts": 100.0, "message_count": 3},
+        now=101.0,
+    )
+    second, second_enqueued, second_reason = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="quiet_timeout",
+        capture_key="window:second",
+        window={"until_message_id": "msg_2", "until_ts": 200.0, "message_count": 5},
+        now=201.0,
+    )
+
+    assert first_enqueued is True
+    assert first_reason == "enqueued"
+    assert second_enqueued is False
+    assert second_reason == "capture_already_pending"
+    assert second["job_id"] == first["job_id"]
+    jobs = [row for row in store.list_proactive_jobs(since_epoch=0, limit=0) if row.get("job_kind") == "memory_capture"]
+    assert len(jobs) == 1
+
+
+def test_capture_enqueue_is_idempotent_by_capture_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    store = appmod.UserStore("usr_capture_idempotent")
+
+    first, first_enqueued, _reason = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="session_break",
+        capture_key="window:same",
+        window={"until_message_id": "msg_1", "until_ts": 100.0, "message_count": 3},
+        now=101.0,
+    )
+    store.update_proactive_job(first["job_id"], {"status": "completed"})
+    second, second_enqueued, second_reason = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="quiet_timeout",
+        capture_key="window:same",
+        window={"until_message_id": "msg_1", "until_ts": 100.0, "message_count": 3},
+        now=301.0,
+    )
+
+    assert first_enqueued is True
+    assert second_enqueued is False
+    assert second_reason == "duplicate_capture_key"
+    assert second["job_id"] == first["job_id"]
+    jobs = [row for row in store.list_proactive_jobs(since_epoch=0, limit=0) if row.get("job_kind") == "memory_capture"]
+    assert len(jobs) == 1
 
 
 def test_resident_scheduled_fire_endpoint_queues_due_timer_job(tmp_path, monkeypatch):

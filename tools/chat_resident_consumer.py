@@ -3456,6 +3456,13 @@ def _resident_runtime_v2_enabled_for_job(job: dict) -> bool:
     return bool(profile.get(RESIDENT_WAKE_RUNTIME_V2_FLAG) or job.get(RESIDENT_WAKE_RUNTIME_V2_FLAG))
 
 
+def _is_memory_capture_job(job: dict) -> bool:
+    return (
+        str((job or {}).get("job_kind") or "").strip() == "memory_capture"
+        or str((job or {}).get("source") or "").strip() == "memory_capture"
+    )
+
+
 def _resident_user_id_for_job(job: dict) -> str:
     return str(
         _whoami_cache.get("user_id")
@@ -3637,6 +3644,51 @@ def _scheduled_wake_actions(actions: list[dict]) -> list[dict]:
         if typ in {"schedule_wake", "cancel_wake"}:
             out.append(action)
     return out
+
+
+def _process_capture_jobs(jobs: list) -> float:
+    """PR A capture-lane stub.
+
+    Capture jobs are not proactive reach-out jobs: do not call the agent, write
+    chat, request broadcast, or use delivery semantics in this substrate PR.
+    """
+    latest = 0.0
+    for job in jobs:
+        ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
+        latest = max(latest, ts)
+        if not _is_memory_capture_job(job):
+            continue
+        key = _proactive_job_key(job)
+        if not _mark_seen(key):
+            log.debug("skipping already-processed capture job key=%s", key)
+            continue
+        job_id = str(job.get("job_id") or "")
+        try:
+            if not claim_proactive_job(job_id):
+                log.info("capture job not claimed id=%s", job_id)
+                continue
+        except Exception as e:
+            log.error("capture job claim failed id=%s: %s", job_id, e)
+            continue
+        window = job.get("window") if isinstance(job.get("window"), dict) else {}
+        update_proactive_job_status(
+            job_id,
+            "completed",
+            "capture_stub_noop",
+            extra={
+                "capture_result": {
+                    "status": "noop",
+                    "reason": "capture_handler_stub",
+                    "job_kind": "memory_capture",
+                },
+                "capture_window": window,
+                "cards_added": 0,
+                "cards_superseded": 0,
+                "noop_reason": "capture_handler_stub",
+            },
+        )
+        log.info("capture job stub completed id=%s trigger=%s", job_id, job.get("trigger") or "")
+    return latest
 
 
 def _process_proactive_jobs(jobs: list) -> float:
@@ -3899,6 +3951,21 @@ def _process_proactive_jobs(jobs: list) -> float:
             update_proactive_job_status(job_id, "failed", last_error or "empty_agent_reply")
 
     return latest
+
+
+def _process_resident_jobs(jobs: list) -> float:
+    capture_jobs = [
+        job for job in (jobs or [])
+        if isinstance(job, dict) and _is_memory_capture_job(job)
+    ]
+    proactive_jobs = [
+        job for job in (jobs or [])
+        if not (isinstance(job, dict) and _is_memory_capture_job(job))
+    ]
+    return max(
+        _process_capture_jobs(capture_jobs) if capture_jobs else 0.0,
+        _process_proactive_jobs(proactive_jobs) if proactive_jobs else 0.0,
+    )
 
 
 def _process_messages(messages: list) -> float:
@@ -4235,7 +4302,7 @@ def run() -> None:
                     job_result = poll_proactive_jobs(last_job_ts)
                     jobs = job_result.get("jobs") or []
                     if jobs:
-                        new_job_ts = _process_proactive_jobs(jobs)
+                        new_job_ts = _process_resident_jobs(jobs)
                         if new_job_ts > last_job_ts:
                             last_job_ts = new_job_ts
                             _save_proactive_checkpoint(last_job_ts)
