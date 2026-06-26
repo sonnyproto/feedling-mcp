@@ -187,6 +187,29 @@ def test_agent_perception_pull_only_signals_return_inline(monkeypatch):
     }
 
 
+def test_agent_perception_app_signal_reads_shortcut_snapshot(monkeypatch):
+    client = _client(
+        monkeypatch,
+        snapshot={
+            "app_name": "Spotify",
+            "app_category": "music",
+        },
+        pull={
+            "app_name": "Stale Pull App",
+            "app_category": "stale",
+        },
+    )
+
+    resp = client.get("/v1/agent/perception?signals=app")
+    body = resp.get_json()
+
+    assert resp.status_code == 200
+    assert body["signals"]["app"] == {
+        "app_name": "Spotify",
+        "app_category": "music",
+    }
+
+
 def test_agent_perception_pull_only_null_permission_messages_return_disabled(monkeypatch):
     client = _client(
         monkeypatch,

@@ -18,7 +18,7 @@ SLOW_AGENT_PERCEPTION_SIGNALS = (
     "steps", "sleep", "workout", "vitals",
     "activity", "body", "metabolic", "cycle", "mood", "reminders",
 )
-PULL_ONLY_AGENT_PERCEPTION_SIGNALS = ("focus", "audio_route")
+PULL_ONLY_AGENT_PERCEPTION_SIGNALS = ("focus", "audio_route", "app")
 AGENT_PERCEPTION_SIGNALS = (
     FAST_AGENT_PERCEPTION_SIGNALS
     + SLOW_AGENT_PERCEPTION_SIGNALS
@@ -39,6 +39,7 @@ AGENT_SIGNAL_FIELDS: dict[str, tuple[str, ...]] = {
     "calendar": ("calendar_next_event", "calendar_events", "calendar_events_truncated"),
     "focus": ("focus_authorization_status", "in_focus"),
     "audio_route": ("output_type", "is_bluetooth", "device_name"),
+    "app": ("app_name", "app_category"),
     "steps": ("step_count",),
     "sleep": ("asleep_minutes", "core_minutes", "deep_minutes", "rem_minutes"),
     "workout": ("workout_type", "duration_min", "count_today"),
@@ -60,9 +61,12 @@ def project_signal(
     snapshot: Mapping[str, Any],
     pull_snapshot: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Project one agent signal's fields from the right source. `now` is the
-    cheap aggregate (snapshot); everything else comes from the pull snapshot."""
-    source = snapshot if signal == "now" else pull_snapshot
+    """Project one agent signal's fields from the right source.
+
+    `now` and shortcut-reported `app` are cheap snapshot fields; everything else
+    comes from the pull snapshot.
+    """
+    source = snapshot if signal in {"now", "app"} else pull_snapshot
     out = {field: source.get(field) for field in AGENT_SIGNAL_FIELDS.get(signal, ())}
     if signal == "now":
         out["time"] = source.get("local_time")
