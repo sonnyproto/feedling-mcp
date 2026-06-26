@@ -214,6 +214,35 @@ def test_openclaw_feedling_plugin_declares_native_memory_screen_tools_with_costs
     assert "[fast caption, slow image] Read the decrypted caption/ocr" in text
 
 
+def test_consumer_env_claude_deepseek_points_at_anthropic_compat_endpoint():
+    # deepseek runs on the claude (Anthropic-wire) driver but is NOT anthropic:
+    # the CLI must be pointed at deepseek's /anthropic-compatible endpoint + its
+    # own model, else it hits api.anthropic.com with a foreign key → exit 1.
+    env = spawners.consumer_env(
+        {}, {"driver": "claude", "provider": "deepseek", "model": "deepseek-v4-flash",
+             "base_url": "https://api.deepseek.com", "provider_key": "sk-ds"},
+        user_id="u_1", home="/h",
+    )
+    assert env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+    assert env["ANTHROPIC_API_KEY"] == "sk-ds"
+    assert env["ANTHROPIC_MODEL"] == "deepseek-v4-flash"
+    # claude Code's background "small/fast" calls must use the deepseek model too,
+    # not a claude-* default the endpoint doesn't serve.
+    assert env["ANTHROPIC_SMALL_FAST_MODEL"] == "deepseek-v4-flash"
+
+
+def test_consumer_env_claude_native_anthropic_keeps_default_endpoint():
+    # native anthropic must NOT get a base-url override — the CLI default
+    # (api.anthropic.com) is correct; only foreign claude-wire providers override.
+    env = spawners.consumer_env(
+        {}, {"driver": "claude", "provider": "anthropic", "model": "claude-haiku-4-5",
+             "provider_key": "sk-ant"},
+        user_id="u_1", home="/h",
+    )
+    assert "ANTHROPIC_BASE_URL" not in env
+    assert env["ANTHROPIC_API_KEY"] == "sk-ant"
+
+
 # ---- codex → LiteLLM gateway (non-openai providers) ----
 
 

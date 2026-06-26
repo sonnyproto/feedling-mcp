@@ -121,6 +121,26 @@ def _io_cli_allow_rules(io_cli: str = _IO_CLI) -> list[str]:
     return [f"Bash(python {io_cli} {verb}:*)" for verb in _IO_CLI_VERBS]
 
 
+# claude (Anthropic-wire) providers that are NOT anthropic itself: they expose an
+# Anthropic-compatible API at ``<base_url>/anthropic`` and use their own model id.
+# Keep in sync with hosted/agent_runtime_cutover._CLAUDE_PROVIDERS.
+_CLAUDE_COMPAT_BASE_URLS = {"deepseek": "https://api.deepseek.com"}
+
+
+def _claude_anthropic_base_url(entry: dict) -> str:
+    """For a claude-driver entry, the ANTHROPIC_BASE_URL the CLI must use, or "".
+
+    Native anthropic returns "" (the CLI default api.anthropic.com is correct).
+    deepseek (and any future Anthropic-wire third party) returns its
+    ``<base_url>/anthropic`` endpoint — without this the CLI sends the foreign key
+    to api.anthropic.com and every turn fails with a non-zero exit."""
+    provider = (entry.get("provider") or "").strip().lower()
+    if provider not in _CLAUDE_COMPAT_BASE_URLS:
+        return ""
+    base = (entry.get("base_url") or _CLAUDE_COMPAT_BASE_URLS[provider]).strip().rstrip("/")
+    return f"{base}/anthropic"
+
+
 def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
     """Default cli command per driver (resident substitutes ``{message}``).
 
@@ -213,6 +233,18 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
         env["CLAUDE_CONFIG_DIR"] = f"{home}/claude-home"
         if entry.get("provider_key"):
             env["ANTHROPIC_API_KEY"] = entry["provider_key"]
+        # Non-anthropic claude-wire providers (deepseek) must point the CLI at
+        # their /anthropic endpoint + own model — otherwise the CLI hits
+        # api.anthropic.com with a foreign key and every turn exits non-zero.
+        anthropic_base = _claude_anthropic_base_url(entry)
+        if anthropic_base:
+            env["ANTHROPIC_BASE_URL"] = anthropic_base
+            model = (entry.get("model") or "").strip()
+            if model:
+                env["ANTHROPIC_MODEL"] = model
+                # claude Code also issues background "small/fast" model calls; point
+                # them at the same model so they don't 404 a claude-* default.
+                env["ANTHROPIC_SMALL_FAST_MODEL"] = model
     return env
 
 
