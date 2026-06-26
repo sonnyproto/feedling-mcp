@@ -240,5 +240,43 @@ export default definePluginEntry({
       },
       build: (p) => ["photo-recent", ...flagsFromParams(p, [["limit", "--limit", "value"]])],
     });
+
+    // perception.trend — rolling baseline + delta for one numeric field (sense change vs norm).
+    registerCli({
+      name: "perception_trend",
+      description: "[slow] Rolling baseline + delta for one numeric perception field over N days (provider-safe name for perception.trend). Read the daily digest to sense how a signal changed vs the user's own norm. e.g. signal=vitals field=resting_heart_rate.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["signal"],
+        properties: {
+          signal: { type: "string", description: "e.g. vitals/steps/sleep/weather/activity/metabolic/body" },
+          field: { type: "string", description: "numeric field, e.g. resting_heart_rate / step_count / asleep_minutes" },
+          days: { type: "integer", minimum: 1, maximum: 365, description: "lookback days (default 30)" },
+        },
+      },
+      build: (p) => ["perception-trend", String(p.signal || ""), ...flagsFromParams(p, [
+        ["field", "--field", "value"],
+        ["days", "--days", "value"],
+      ])],
+    });
+
+    // perception.history — raw per-day rollup docs for a signal (the accumulated daily digest).
+    registerCli({
+      name: "perception_history",
+      description: "[slow] Per-day rollup docs for a perception signal over N days (provider-safe name for perception.history). This is the accumulated daily digest — use it to look back over days, not just 'now'.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["signal"],
+        properties: {
+          signal: { type: "string", description: "e.g. vitals/sleep/motion/location/calendar/reminders/mood/now_playing" },
+          days: { type: "integer", minimum: 1, maximum: 365, description: "lookback days (default 14)" },
+        },
+      },
+      build: (p) => ["perception-history", String(p.signal || ""), ...flagsFromParams(p, [
+        ["days", "--days", "value"],
+      ])],
+    });
   },
 });

@@ -13,6 +13,11 @@ meant the edits were lost on any VPS rebuild.
 - **Perception** — one tool per signal in `SIGNALS` (`perception_now`,
   `perception_mood`, …). Each shells out to `io_cli.py perception <signal>`;
   tool descriptions label fast vs slow signals.
+- **Daily digest (perception history)** — `perception_trend` (rolling baseline +
+  delta for a numeric field → `io_cli.py perception-trend`) and
+  `perception_history` (per-day rollup docs → `io_cli.py perception-history`).
+  These let the agent read the **accumulated daily digest** (look back over
+  days vs the user's own norm), not just the `now` snapshot.
 - **Memory** (A-full Phase-0, read side) — `memory_index` (compact readside
   index → `io_cli.py memory-index`) and `memory_fetch` (verbatim cards by id →
   `io_cli.py memory-fetch <ids>`). Both plaintext-safe (no client crypto);

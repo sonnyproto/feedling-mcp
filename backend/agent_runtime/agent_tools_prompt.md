@@ -19,6 +19,7 @@ python <io_cli> memory-index [--query <text>] [--limit <n>] [--bucket <name>] [-
 python <io_cli> memory-fetch <id> [<id> ...] [--limit <n>]
 python <io_cli> screen-recent [--limit <n>]
 python <io_cli> screen-read [--frame-id <id>] [--include-image]
+python <io_cli> photo-recent [--limit <n>]
 ```
 
 - Output is JSON on stdout (`{"ok": true, ...}` or `{"ok": false, "error": ...}`).
