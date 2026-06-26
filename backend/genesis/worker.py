@@ -24,6 +24,27 @@ from genesis import prompts, service
 from genesis.llm_client import GenesisLLMClient
 
 GENESIS_WORKER_SCOPES = ["envelope_decrypt", "genesis"]
+AI_PERSONA_SOURCE_KINDS = {
+    "agent_prompt",
+    "ai_persona",
+    "character",
+    "character_card",
+    "companion_persona",
+    "system_prompt",
+}
+MEMORY_SUMMARY_SOURCE_KINDS = {
+    "memory_summary",
+    "memories_summary",
+    "memory_digest",
+}
+USER_PROFILE_SOURCE_KINDS = {
+    "personal_profile",
+    "persona",
+    "persona_profile",
+    "profile",
+    "user_persona",
+    "user_profile",
+}
 
 
 class GenesisWorkerError(Exception):
@@ -74,6 +95,60 @@ def _json_object(text: str, *, task_id: str) -> dict:
 def _chunks(seq: list[Any], size: int) -> list[list[Any]]:
     safe = max(1, size)
     return [seq[idx:idx + safe] for idx in range(0, len(seq), safe)]
+
+
+def _source_family(source_kind: str) -> str:
+    kind = re.sub(r"[^a-z0-9_]+", "_", str(source_kind or "").strip().lower()).strip("_")
+    if kind.endswith("_import"):
+        kind = kind[:-7]
+    if kind in AI_PERSONA_SOURCE_KINDS:
+        return "ai_persona"
+    if kind in MEMORY_SUMMARY_SOURCE_KINDS:
+        return "memory_summary"
+    if kind in USER_PROFILE_SOURCE_KINDS:
+        return "user_profile"
+    return "history"
+
+
+def _joined_material(chunk_texts: list[str]) -> str:
+    parts = []
+    for idx, text in enumerate(chunk_texts):
+        cleaned = str(text or "").strip()
+        if cleaned:
+            parts.append(f"--- chunk {idx + 1} ---\n{cleaned}")
+    return "\n\n".join(parts).strip()
+
+
+def _source_tagged_fact_text(source_family: str, text: str) -> str:
+    if source_family == "user_profile":
+        return (
+            "source_kind=user_profile\n"
+            "This material is the user's own profile/persona. Extract only durable facts about the user. "
+            "Do not infer the companion's name, identity, personality, dimensions, or voice from it.\n\n"
+            f"{text}"
+        )
+    return text
+
+
+def _strip_identity(doc: dict) -> dict:
+    clean = dict(doc)
+    clean.pop("identity", None)
+    clean.pop("days_with_user", None)
+    clean.pop("relationship_anchor_evidence", None)
+    return clean
+
+
+def _identity_only(doc: dict) -> dict:
+    identity = doc.get("identity") if isinstance(doc.get("identity"), dict) else {}
+    dims = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
+    out = {"memories": []}
+    if identity.get("agent_name") or dims:
+        out["identity"] = identity
+    if out.get("identity") and doc.get("days_with_user") is not None:
+        out["days_with_user"] = doc.get("days_with_user")
+    if out.get("identity") and doc.get("relationship_anchor_evidence"):
+        out["relationship_anchor_evidence"] = doc.get("relationship_anchor_evidence")
+    return out
 
 
 def _fetch_provider_key(api_url: str, enclave_url: str, runtime_token: str) -> str:
@@ -299,29 +374,90 @@ def _build_reducer_output(
     job_id: str,
     runtime: provider_client.ProviderConfig,
     chunk_texts: list[str],
+    source_kind: str = "history",
 ) -> dict:
     llm = GenesisLLMClient()
-    voice_candidates: list[dict] = []
-    fact_candidates: list[dict] = []
-    for idx, text in enumerate(chunk_texts):
-        voice = _complete_json(
+    source_family = _source_family(source_kind)
+    material = _joined_material(chunk_texts)
+
+    if source_family == "ai_persona":
+        identity_doc = _identity_only(_fact_write(
             llm,
             user_id=user_id,
             job_id=job_id,
-            task_id=f"voice-map-{idx}",
             runtime=runtime,
-            messages=prompts.voice_map_messages(text),
-            max_tokens=1800,
-            idempotency_key=f"{job_id}:voice_map:{idx}",
+            fact_candidates=[],
+            persona_material=material,
+        ))
+        persona_content = _complete_text(
+            llm,
+            user_id=user_id,
+            job_id=job_id,
+            task_id="persona-build",
+            runtime=runtime,
+            messages=prompts.persona_build_messages(material, [], []),
+            max_tokens=2600,
+            idempotency_key=f"{job_id}:persona_build",
         )
-        voice_candidates.append(voice)
+        return {
+            **identity_doc,
+            "source_kind": source_kind,
+            "source_family": source_family,
+            "persona": {
+                "content": persona_content,
+                "prompt_version": "7.B",
+                "source_kind": source_kind,
+                "source_family": source_family,
+            },
+            "voice": {
+                "behavior_notes_count": 0,
+                "exemplar_count": 0,
+                "founding_exemplar_count": 0,
+            },
+        }
+
+    if source_family == "memory_summary":
+        fact_write = _strip_identity(_fact_write(
+            llm,
+            user_id=user_id,
+            job_id=job_id,
+            runtime=runtime,
+            fact_candidates=[],
+            memory_summary=material,
+        ))
+        return {
+            **fact_write,
+            "source_kind": source_kind,
+            "source_family": source_family,
+            "voice": {
+                "behavior_notes_count": 0,
+                "exemplar_count": 0,
+                "founding_exemplar_count": 0,
+            },
+        }
+
+    voice_candidates: list[dict] = []
+    fact_candidates: list[dict] = []
+    for idx, text in enumerate(chunk_texts):
+        if source_family == "history":
+            voice = _complete_json(
+                llm,
+                user_id=user_id,
+                job_id=job_id,
+                task_id=f"voice-map-{idx}",
+                runtime=runtime,
+                messages=prompts.voice_map_messages(text),
+                max_tokens=1800,
+                idempotency_key=f"{job_id}:voice_map:{idx}",
+            )
+            voice_candidates.append(voice)
         facts = _complete_json(
             llm,
             user_id=user_id,
             job_id=job_id,
             task_id=f"fact-map-{idx}",
             runtime=runtime,
-            messages=prompts.fact_map_messages(text),
+            messages=prompts.fact_map_messages(_source_tagged_fact_text(source_family, text)),
             max_tokens=1800,
             idempotency_key=f"{job_id}:fact_map:{idx}",
         )
@@ -334,7 +470,7 @@ def _build_reducer_output(
         job_id=job_id,
         runtime=runtime,
         candidates=voice_candidates,
-    )
+    ) if source_family == "history" else {"behavior_notes": [], "exemplars": []}
     exemplars = voice_final.get("exemplars") if isinstance(voice_final.get("exemplars"), list) else []
     founding = [item for item in exemplars if isinstance(item, dict) and item.get("founding")]
     if not founding:
@@ -348,6 +484,19 @@ def _build_reducer_output(
         runtime=runtime,
         fact_candidates=fact_candidates,
     )
+    if source_family == "user_profile":
+        fact_write = _strip_identity(fact_write)
+        return {
+            **fact_write,
+            "source_kind": source_kind,
+            "source_family": source_family,
+            "voice": {
+                "behavior_notes_count": 0,
+                "exemplar_count": 0,
+                "founding_exemplar_count": 0,
+            },
+        }
+
     persona_content = _complete_text(
         llm,
         user_id=user_id,
@@ -360,6 +509,8 @@ def _build_reducer_output(
     )
     return {
         **fact_write,
+        "source_kind": source_kind,
+        "source_family": source_family,
         "persona": {"content": persona_content, "prompt_version": "7.B"},
         "voice": {
             "behavior_notes_count": len(behavior_notes),
@@ -410,6 +561,7 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
         job_id=job_id,
         runtime=runtime,
         chunk_texts=chunk_texts,
+        source_kind=str(job.get("source_kind") or "history"),
     )
     applied = _apply_reducer_output(api_url, token, job_id, reducer_output)
     return {

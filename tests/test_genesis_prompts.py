@@ -27,6 +27,12 @@ def test_fact_write_prompt_preserves_identity_firewall():
     assert payload["fact_digest"] == [{"summary": "用户喜欢草莓拿铁"}]
 
 
+def test_fact_map_prompt_names_user_profile_source_firewall():
+    messages = prompts.fact_map_messages("source_kind=user_profile\n用户叫 Seven。")
+    assert "source_kind=user_profile" in messages[0]["content"]
+    assert "不能推断 TA" in messages[0]["content"]
+
+
 def test_persona_build_prompt_outputs_system_prompt_markdown():
     messages = prompts.persona_build_messages(
         "你叫 Kai。",

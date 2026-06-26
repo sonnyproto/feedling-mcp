@@ -43,6 +43,68 @@ class _Resp:
             raise RuntimeError(f"http_{self.status_code}")
 
 
+def _install_success_harness(monkeypatch, *, source_kind: str, chunk_texts: list[str]):
+    apply_payloads = []
+    minted = []
+    chunks = [_chunk(idx) for idx in range(len(chunk_texts))]
+    plaintext_by_id = {f"chunk-{idx}": text for idx, text in enumerate(chunk_texts)}
+
+    monkeypatch.setattr(worker, "get_store", lambda user_id: types.SimpleNamespace(user_id=user_id))
+    monkeypatch.setattr(worker.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker.service, "mark_failed", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no fail")))
+    monkeypatch.setattr(
+        worker.db,
+        "genesis_claim_uploaded_jobs",
+        lambda limit=1: [{
+            "user_id": "usr_1",
+            "job_id": "job_1",
+            "status": "processing",
+            "total_chunks": len(chunks),
+            "source_kind": source_kind,
+        }],
+    )
+    monkeypatch.setattr(worker.db, "genesis_missing_chunk_seqs", lambda *_args: [])
+    monkeypatch.setattr(worker.db, "genesis_list_chunks", lambda *_args: chunks)
+    monkeypatch.setattr(
+        worker.db,
+        "get_blob",
+        lambda _user_id, kind: {
+            "provider": "openai",
+            "model": "gpt-test",
+            "base_url": "https://api.openai.com/v1",
+            "test_status": "ok",
+        } if kind == "model_api" else None,
+    )
+    monkeypatch.setattr(worker.httpx, "get", lambda *_args, **_kwargs: _Resp({"api_key_envelope": {"id": "provider-key"}}))
+
+    def fake_post(url, *, headers=None, json=None, **_kwargs):
+        assert headers == {"X-Feedling-Runtime-Token": "rtok"}
+        if url.endswith("/v1/envelope/decrypt"):
+            if json["purpose"] == "model_api_provider_key":
+                return _Resp({"plaintext_b64": base64.b64encode(b"sk-user").decode("ascii")})
+            envelope_id = json["envelope"]["id"]
+            return _Resp({"plaintext_b64": base64.b64encode(plaintext_by_id[envelope_id].encode()).decode("ascii")})
+        assert url.endswith("/v1/genesis/imports/job_1/outputs")
+        apply_payloads.append(json)
+        return _Resp({"applied": {"ok": True}})
+
+    monkeypatch.setattr(worker.httpx, "post", fake_post)
+
+    def mint(user_id, scopes):
+        minted.append({"user_id": user_id, "scopes": scopes})
+        return "rtok"
+
+    return apply_payloads, minted, mint
+
+
+def test_source_family_accepts_import_suffix_aliases():
+    assert worker._source_family("ai_persona_import") == "ai_persona"
+    assert worker._source_family("character_import") == "ai_persona"
+    assert worker._source_family("user_profile_import") == "user_profile"
+    assert worker._source_family("memory_summary_import") == "memory_summary"
+    assert worker._source_family("chat_export") == "history"
+
+
 def test_tick_claims_decrypts_all_chunks_and_posts_distilled_output(monkeypatch):
     llm_calls = []
     apply_payloads = []
@@ -140,6 +202,145 @@ def test_tick_claims_decrypts_all_chunks_and_posts_distilled_output(monkeypatch)
     assert reducer_output["memories"][0]["summary"] == "User likes tea"
     assert "raw_text" not in reducer_output
     assert "chunks" not in reducer_output
+
+
+def test_ai_persona_source_uses_persona_material_without_voice_or_fact_map(monkeypatch):
+    llm_calls = []
+    apply_payloads, _minted, mint = _install_success_harness(
+        monkeypatch,
+        source_kind="ai_persona",
+        chunk_texts=["你叫 Mira,保持稳定直接的语气。"],
+    )
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            task_id = kwargs["task_id"]
+            llm_calls.append({"task_id": task_id, "messages": kwargs["messages"]})
+            payload = json.loads(kwargs["messages"][1]["content"])
+            if task_id.startswith("fact-write"):
+                assert payload["fact_digest"] == []
+                assert "你叫 Mira" in payload["persona_material"]
+                assert payload["memory_summary"] == ""
+                text = json.dumps({
+                    "memories": [{"summary": "should be dropped"}],
+                    "identity": {"agent_name": "Mira", "dimensions": [{"name": "Direct", "value": 70, "description": "Persona says direct."}]},
+                    "days_with_user": 5,
+                    "relationship_anchor_evidence": "persona",
+                })
+            elif task_id == "persona-build":
+                assert "你叫 Mira" in payload["persona_material"]
+                assert payload["behavior_notes"] == []
+                assert payload["founding_exemplars"] == []
+                text = "## 你是谁\n\n你叫 Mira。\n\n## 你怎么说话\n\n稳定直接。"
+            else:
+                raise AssertionError(task_id)
+            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=task_id)
+
+    monkeypatch.setattr(worker, "GenesisLLMClient", FakeLLM)
+
+    result = worker.tick(
+        api_url="http://backend:5001",
+        enclave_url="https://enclave:5003",
+        mint_runtime_token=mint,
+    )
+
+    assert result["processed"] == 1
+    assert [call["task_id"] for call in llm_calls] == ["fact-write-0", "persona-build"]
+    reducer_output = apply_payloads[0]["reducer_output"]
+    assert reducer_output["source_family"] == "ai_persona"
+    assert reducer_output["memories"] == []
+    assert reducer_output["identity"]["agent_name"] == "Mira"
+    assert reducer_output["persona"]["source_family"] == "ai_persona"
+    assert reducer_output["voice"]["exemplar_count"] == 0
+    assert "chunk 1" not in json.dumps(reducer_output, ensure_ascii=False)
+
+
+def test_user_profile_source_writes_memory_facts_without_identity_or_persona(monkeypatch):
+    llm_calls = []
+    apply_payloads, _minted, mint = _install_success_harness(
+        monkeypatch,
+        source_kind="user_profile",
+        chunk_texts=["用户叫 Seven,喜欢直接反馈。"],
+    )
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            task_id = kwargs["task_id"]
+            llm_calls.append({"task_id": task_id, "messages": kwargs["messages"]})
+            if task_id.startswith("fact-map"):
+                assert "source_kind=user_profile" in kwargs["messages"][1]["content"]
+                text = json.dumps({"fact_candidates": [{"about": "user", "summary": "User likes direct feedback", "evidence": "direct"}]})
+            elif task_id.startswith("fact-write"):
+                payload = json.loads(kwargs["messages"][1]["content"])
+                assert payload["persona_material"] == ""
+                assert payload["memory_summary"] == ""
+                text = json.dumps({
+                    "memories": [{"type": "fact", "summary": "User likes direct feedback", "content": "User likes direct feedback."}],
+                    "identity": {"agent_name": "Seven", "dimensions": [{"name": "Wrong", "value": 90, "description": "from user profile"}]},
+                    "days_with_user": 9,
+                    "relationship_anchor_evidence": "user profile",
+                })
+            else:
+                raise AssertionError(task_id)
+            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=task_id)
+
+    monkeypatch.setattr(worker, "GenesisLLMClient", FakeLLM)
+
+    result = worker.tick(
+        api_url="http://backend:5001",
+        enclave_url="https://enclave:5003",
+        mint_runtime_token=mint,
+    )
+
+    assert result["processed"] == 1
+    assert [call["task_id"] for call in llm_calls] == ["fact-map-0", "fact-write-0"]
+    reducer_output = apply_payloads[0]["reducer_output"]
+    assert reducer_output["source_family"] == "user_profile"
+    assert reducer_output["memories"][0]["summary"] == "User likes direct feedback"
+    assert "identity" not in reducer_output
+    assert "persona" not in reducer_output
+
+
+def test_memory_summary_source_feeds_fact_write_material_without_maps(monkeypatch):
+    llm_calls = []
+    apply_payloads, _minted, mint = _install_success_harness(
+        monkeypatch,
+        source_kind="memory_summary",
+        chunk_texts=["用户在五月反复提到需要稳定陪伴。"],
+    )
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            task_id = kwargs["task_id"]
+            llm_calls.append({"task_id": task_id, "messages": kwargs["messages"]})
+            if task_id.startswith("fact-write"):
+                payload = json.loads(kwargs["messages"][1]["content"])
+                assert payload["fact_digest"] == []
+                assert payload["persona_material"] == ""
+                assert "稳定陪伴" in payload["memory_summary"]
+                text = json.dumps({
+                    "memories": [{"type": "fact", "summary": "User needs stable companionship", "content": "User needs stable companionship."}],
+                    "identity": {"agent_name": "Wrong", "dimensions": [{"name": "Wrong", "value": 90, "description": "from memory summary"}]},
+                })
+            else:
+                raise AssertionError(task_id)
+            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=task_id)
+
+    monkeypatch.setattr(worker, "GenesisLLMClient", FakeLLM)
+
+    result = worker.tick(
+        api_url="http://backend:5001",
+        enclave_url="https://enclave:5003",
+        mint_runtime_token=mint,
+    )
+
+    assert result["processed"] == 1
+    assert [call["task_id"] for call in llm_calls] == ["fact-write-0"]
+    reducer_output = apply_payloads[0]["reducer_output"]
+    assert reducer_output["source_family"] == "memory_summary"
+    assert reducer_output["memories"][0]["summary"] == "User needs stable companionship"
+    assert "identity" not in reducer_output
+    assert "persona" not in reducer_output
 
 
 def test_tick_marks_failed_when_claimed_job_has_missing_chunks(monkeypatch):

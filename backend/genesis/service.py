@@ -21,6 +21,11 @@ GENESIS_STATE_BLOB = "genesis_state"
 GENESIS_PERSONA_BLOB = "genesis_persona"
 GENESIS_SOURCE = "genesis_import"
 GENESIS_PERSONA_REF = f"user_blob:{GENESIS_PERSONA_BLOB}"
+PERSONA_SOURCE_PRIORITY = {
+    "ai_persona": 100,
+    "history": 50,
+    "unknown": 10,
+}
 
 PRIVACY_MODE = "backend_storage_no_plaintext_user_provider_authorized"
 PRIVACY_COPY = (
@@ -379,6 +384,21 @@ def _persona_content_from_output(output: dict) -> tuple[str, str]:
     return str(persona or "").strip(), "7.B"
 
 
+def _persona_source_family_from_output(output: dict) -> str:
+    persona = output.get("persona") if isinstance(output.get("persona"), dict) else {}
+    source_family = _text(
+        persona.get("source_family") if isinstance(persona, dict) else "",
+        80,
+    ) or _text(output.get("source_family"), 80) or "unknown"
+    if source_family not in PERSONA_SOURCE_PRIORITY:
+        return "unknown"
+    return source_family
+
+
+def _persona_source_priority(source_family: str) -> int:
+    return int(PERSONA_SOURCE_PRIORITY.get(source_family, PERSONA_SOURCE_PRIORITY["unknown"]))
+
+
 def _safe_reducer_doc(job_id: str, output: dict) -> dict:
     raw_items = output.get("memories")
     if raw_items is None:
@@ -397,6 +417,8 @@ def _safe_reducer_doc(job_id: str, output: dict) -> dict:
         "v": 1,
         "job_id": job_id,
         "source": GENESIS_SOURCE,
+        "source_kind": _text(output.get("source_kind"), 80),
+        "source_family": _text(output.get("source_family"), 80),
         "plaintext_stored": False,
         "raw_sha256": _stable_json_sha256(output),
         "memory_count": len(memories),
@@ -445,6 +467,8 @@ def _identity_payload_from_output(output: dict) -> dict | None:
         "self_introduction": "",
         "dimensions": clean_dims,
     }
+    if not payload["agent_name"] and not payload["dimensions"]:
+        return None
     return payload
 
 
@@ -509,6 +533,17 @@ def write_persona_artifact(store: UserStore, job_id: str, output: dict) -> tuple
     if not content:
         return "", ""
     digest = _sha256_hex(content.encode("utf-8"))
+    source_family = _persona_source_family_from_output(output)
+    source_kind = _text(output.get("source_kind"), 80)
+    new_priority = _persona_source_priority(source_family)
+    existing = db.get_blob(store.user_id, GENESIS_PERSONA_BLOB)
+    if isinstance(existing, dict):
+        try:
+            existing_priority = int(existing.get("source_priority") or 0)
+        except Exception:
+            existing_priority = 0
+        if existing_priority > new_priority:
+            return GENESIS_PERSONA_REF, str(existing.get("sha256") or "")
     now = _now_iso()
     envelope, err = core_envelope._build_shared_envelope_for_store(
         store,
@@ -525,6 +560,9 @@ def write_persona_artifact(store: UserStore, job_id: str, output: dict) -> tuple
         "content_envelope": envelope,
         "sha256": digest,
         "prompt_version": prompt_version,
+        "source_kind": source_kind,
+        "source_family": source_family,
+        "source_priority": new_priority,
         "created_at": now,
         "updated_at": now,
     })

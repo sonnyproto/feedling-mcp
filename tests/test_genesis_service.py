@@ -286,6 +286,7 @@ def test_apply_reducer_output_writes_persona_and_done_state(monkeypatch):
         "set_blob",
         lambda _user_id, kind, doc: blobs.append({"kind": kind, "doc": doc}),
     )
+    monkeypatch.setattr(service.db, "get_blob", lambda *_args: None)
     monkeypatch.setattr(
         service.db,
         "genesis_upsert_output",
@@ -339,6 +340,36 @@ def test_apply_reducer_output_writes_persona_and_done_state(monkeypatch):
     assert any(output["type"] == "apply" for output in outputs)
 
 
+def test_write_persona_artifact_keeps_existing_higher_priority_persona(monkeypatch):
+    writes = []
+
+    monkeypatch.setattr(
+        service.db,
+        "get_blob",
+        lambda _user_id, kind: {"source_priority": 100, "sha256": "existing_sha"} if kind == service.GENESIS_PERSONA_BLOB else None,
+    )
+    monkeypatch.setattr(service.db, "set_blob", lambda *_args: writes.append(_args))
+    monkeypatch.setattr(
+        service.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no overwrite")),
+    )
+
+    ref, digest = service.write_persona_artifact(
+        _store(),
+        "job_history",
+        {
+            "source_kind": "chat_export",
+            "source_family": "history",
+            "persona": {"content": "history-derived persona", "prompt_version": "7.B"},
+        },
+    )
+
+    assert ref == service.GENESIS_PERSONA_REF
+    assert digest == "existing_sha"
+    assert writes == []
+
+
 def test_apply_reducer_output_rejects_raw_transcript_fields(monkeypatch):
     monkeypatch.setattr(
         service.db,
@@ -376,6 +407,10 @@ def test_identity_payload_from_output_leaves_intro_and_signature_for_respawn():
             {"name": "Direct", "value": 82, "description": "TA often gives blunt feedback."}
         ],
     }
+
+
+def test_identity_payload_from_output_ignores_empty_identity():
+    assert service._identity_payload_from_output({"identity": {"agent_name": "", "dimensions": []}}) is None
 
 
 def test_apply_memory_outputs_batches_memory_actions(monkeypatch):
