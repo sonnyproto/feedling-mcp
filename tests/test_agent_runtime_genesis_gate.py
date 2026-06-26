@@ -31,3 +31,14 @@ def test_allows_fresh_start_done_failed_and_malformed():
     assert supervisor._genesis_status_blocks_spawn({"status": "done"}) is False
     assert supervisor._genesis_status_blocks_spawn({"status": "failed"}) is False
     assert supervisor._genesis_status_blocks_spawn("not-a-dict") is False
+
+
+def test_genesis_worker_should_start_requires_enable_secret_and_enclave():
+    # Default OFF: the activation hook must not run genesis unless explicitly enabled
+    # AND both prerequisites (runtime-token secret + enclave URL) are present.
+    assert supervisor._genesis_worker_should_start(enabled="", secret="s", enclave_url="u") is False
+    assert supervisor._genesis_worker_should_start(enabled="1", secret="", enclave_url="u") is False
+    assert supervisor._genesis_worker_should_start(enabled="1", secret="s", enclave_url="") is False
+    assert supervisor._genesis_worker_should_start(enabled="true", secret="s", enclave_url="u") is True
+    assert supervisor._genesis_worker_should_start(enabled="on", secret="s", enclave_url="u") is True
+    assert supervisor._genesis_worker_should_start(enabled="false", secret="s", enclave_url="u") is False
