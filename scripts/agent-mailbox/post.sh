@@ -119,7 +119,13 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 notice="New mailbox message for $to: $id. Run scripts/agent-mailbox/read.sh $to $id"
-if tmux send-keys -t "$target_pane" "$notice" Enter; then
+# Submit reliably: type the notice, then send Enter as a SEPARATE key event
+# after a short delay. Sending "$notice" Enter in one call often types the text
+# but doesn't submit it in the Claude/Codex TUI (the Enter arrives as part of the
+# same paste), leaving the read command stuck in the input box.
+if tmux send-keys -t "$target_pane" "$notice"; then
+  sleep 0.5
+  tmux send-keys -t "$target_pane" Enter
   echo "woke $to at $target_pane"
 else
   echo "wake failed for $to at $target_pane" >&2
