@@ -146,16 +146,18 @@ def cmd_perception_history(args):
 
 
 def _require_backend():
+    """Resolve (api_url, auth_headers). auth uses _auth_headers() so memory/screen
+    work in both api-key and host-all runtime-token modes (mirrors perception)."""
     api_url = _env("FEEDLING_API_URL")
-    api_key = _env("FEEDLING_API_KEY")
-    if not api_url or not api_key:
-        _emit({"ok": False, "error": "missing FEEDLING_API_URL / FEEDLING_API_KEY in env"}, 2)
-    return api_url.rstrip("/"), api_key
+    auth = _auth_headers()
+    if not api_url or not auth:
+        _emit({"ok": False, "error": "missing FEEDLING_API_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+    return api_url.rstrip("/"), auth
 
 
 def cmd_memory_index(args):
     """Compact memory index (plaintext-safe readside). POST /v1/memory/index."""
-    api_url, api_key = _require_backend()
+    api_url, auth = _require_backend()
     payload = {"limit": args.limit}
     if args.bucket:
         payload["bucket"] = args.bucket
@@ -167,7 +169,7 @@ def cmd_memory_index(args):
         payload["ambient"] = True
     if args.include_sensitive:
         payload["include_sensitive"] = True
-    status, body = _http_json("POST", f"{api_url}/v1/memory/index", api_key, payload=payload)
+    status, body = _http_json("POST", f"{api_url}/v1/memory/index", auth, payload=payload)
     if status == 200:
         _emit({"ok": True, **body})
     _emit({"ok": False, "http_status": status, "error": body}, 1)
@@ -175,7 +177,7 @@ def cmd_memory_index(args):
 
 def cmd_memory_fetch(args):
     """Verbatim decrypted memory cards by id (plaintext-safe). POST /v1/memory/fetch."""
-    api_url, api_key = _require_backend()
+    api_url, auth = _require_backend()
     ids = list(args.ids)
     if not ids:
         _emit({"ok": False, "error": "memory-fetch needs at least one id"}, 2)
@@ -184,7 +186,7 @@ def cmd_memory_fetch(args):
         payload["include_archived"] = True
     if args.include_superseded:
         payload["include_superseded"] = True
-    status, body = _http_json("POST", f"{api_url}/v1/memory/fetch", api_key, payload=payload)
+    status, body = _http_json("POST", f"{api_url}/v1/memory/fetch", auth, payload=payload)
     if status == 200:
         _emit({"ok": True, **body})
     _emit({"ok": False, "http_status": status, "error": body}, 1)
@@ -192,9 +194,9 @@ def cmd_memory_fetch(args):
 
 def cmd_screen_recent(args):
     """Recent screen frame metadata (no pixels). GET /v1/screen/frames."""
-    api_url, api_key = _require_backend()
+    api_url, auth = _require_backend()
     qs = urllib.parse.urlencode({"limit": args.limit})
-    status, body = _http_json("GET", f"{api_url}/v1/screen/frames?{qs}", api_key)
+    status, body = _http_json("GET", f"{api_url}/v1/screen/frames?{qs}", auth)
     if status == 200:
         _emit({"ok": True, **body})
     _emit({"ok": False, "http_status": status, "error": body}, 1)
@@ -206,10 +208,10 @@ def cmd_screen_read(args):
     GET /v1/screen/frames/<id>/decrypt (backend proxies to the enclave). When no
     --frame-id is given, resolve the latest frame first.
     """
-    api_url, api_key = _require_backend()
+    api_url, auth = _require_backend()
     frame_id = args.frame_id
     if not frame_id:
-        status, body = _http_json("GET", f"{api_url}/v1/screen/frames/latest", api_key)
+        status, body = _http_json("GET", f"{api_url}/v1/screen/frames/latest", auth)
         if status != 200:
             _emit({"ok": False, "http_status": status, "error": body}, 1)
         frame_id = body.get("frame_id") or body.get("id") or (body.get("filename") or "").split(".")[0]
@@ -217,7 +219,7 @@ def cmd_screen_read(args):
             _emit({"ok": False, "error": "could not resolve latest frame_id", "latest": body}, 1)
     include_image = "true" if args.include_image else "false"
     qs = urllib.parse.urlencode({"include_image": include_image})
-    status, body = _http_json("GET", f"{api_url}/v1/screen/frames/{frame_id}/decrypt?{qs}", api_key)
+    status, body = _http_json("GET", f"{api_url}/v1/screen/frames/{frame_id}/decrypt?{qs}", auth)
     if status == 200:
         _emit({"ok": True, "frame_id": frame_id, **(body if isinstance(body, dict) else {"data": body})})
     _emit({"ok": False, "http_status": status, "frame_id": frame_id, "error": body}, 1)
