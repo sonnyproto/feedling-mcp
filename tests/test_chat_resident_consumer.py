@@ -1437,13 +1437,42 @@ def test_process_proactive_wake_routes_through_agent_and_posts_metadata(monkeypa
     assert any(s[0] == "pj_1" and s[1] == "posted" for s in captured["statuses"])
 
 
-def test_capture_job_dispatch_uses_stub_not_proactive_handler(monkeypatch):
+def _install_capture_job_harness(monkeypatch, agent_reply):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
-    captured = {"statuses": [], "proactive_called": False}
+    captured = {
+        "statuses": [],
+        "proactive_called": False,
+        "prompts": [],
+        "actions": [],
+        "envelope_plaintexts": [],
+        "envelope_kwargs": [],
+    }
 
-    def _fail_agent(*_args, **_kwargs):
-        raise AssertionError("capture job must not call agent in PR A stub")
+    history = [
+        {"id": "msg_a", "role": "user", "content": "before window", "ts": 100.0},
+        {"id": "msg_b", "role": "user", "content": "这次会议让我压力很大。", "ts": 150.0},
+        {"id": "msg_c", "role": "assistant", "content": "我记得你说心率也上来了。", "ts": 200.0},
+    ]
+    job = {
+        "job_id": "cap_dispatch",
+        "job_kind": "memory_capture",
+        "source": "memory_capture",
+        "status": "pending",
+        "trigger": "session_break",
+        "capture_key": "window:dispatch",
+        "window": {
+            "after_message_id": "msg_a",
+            "until_message_id": "msg_c",
+            "until_ts": 200.0,
+            "message_count": 2,
+        },
+        "ts": 222.0,
+    }
+
+    def _agent(prompt, *_args, **_kwargs):
+        captured["prompts"].append(prompt)
+        return agent_reply
 
     def _fail_post(*_args, **_kwargs):
         raise AssertionError("capture job must not write chat")
@@ -1455,50 +1484,212 @@ def test_capture_job_dispatch_uses_stub_not_proactive_handler(monkeypatch):
     def _status(job_id, status, reason="", **kwargs):
         captured["statuses"].append((job_id, status, reason, kwargs))
 
-    monkeypatch.setattr(crc, "call_agent", _fail_agent)
+    def _build_envelope(**kwargs):
+        captured["envelope_kwargs"].append(kwargs)
+        captured["envelope_plaintexts"].append(json.loads(kwargs["plaintext"].decode("utf-8")))
+        return {
+            "v": 1,
+            "id": f"env_{len(captured['envelope_plaintexts'])}",
+            "visibility": kwargs["visibility"],
+            "owner_user_id": kwargs["owner_user_id"],
+        }
+
+    def _memory_actions(actions):
+        captured["actions"].extend(actions)
+        return {
+            "status": "ok",
+            "results": [{"status": "ok", "action": action.get("type")} for action in actions],
+            "effects": [{"type": "memory_added"} for _action in actions],
+        }
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
     monkeypatch.setattr(crc, "post_reply", _fail_post)
     monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
     monkeypatch.setattr(crc, "update_proactive_job_status", _status)
     monkeypatch.setattr(crc, "_process_proactive_jobs", _proactive_handler)
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: history)
+    monkeypatch.setattr(crc, "_capture_memory_terms_context", lambda: ("buckets: work", "threads: meeting"))
+    monkeypatch.setattr(
+        crc,
+        "_capture_identity_context",
+        lambda: (
+            {"agent_name": "IO", "user_preferred_name": "Seven"},
+            "IO",
+            "Seven",
+            "identity: IO is Seven's companion",
+        ),
+    )
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_capture", "user_pk": b"u" * 32, "enclave_pk": b"e" * 32},
+    )
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(crc, "_build_envelope", _build_envelope)
+    monkeypatch.setattr(crc, "execute_memory_actions", _memory_actions)
+    return captured, job
 
-    job = {
-        "job_id": "cap_dispatch",
-        "job_kind": "memory_capture",
-        "source": "memory_capture",
-        "status": "pending",
-        "trigger": "session_break",
-        "capture_key": "window:dispatch",
-        "window": {
-            "after_message_id": "msg_a",
-            "until_message_id": "msg_b",
-            "until_ts": 200.0,
-            "message_count": 4,
-        },
-        "ts": 222.0,
-    }
+
+def _capture_final_status(captured):
+    return captured["statuses"][-1]
+
+
+def test_capture_identity_context_prefers_enclave_plaintext_and_filters_ciphertext(monkeypatch):
+    calls = []
+
+    def _get_json(path, **kwargs):
+        calls.append((path, kwargs.get("base_url")))
+        return {
+            "identity": {
+                "agent_name": "IO",
+                "user_preferred_name": "Seven",
+                "self_introduction": "陪 Seven 一起生活。",
+                "dimensions": [{"key": "tone", "value": "direct"}],
+                "body_ct": "ciphertext-must-not-enter-prompt",
+                "K_user": "wrapped-key-must-not-enter-prompt",
+            }
+        }
+
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "http://enclave.local")
+    monkeypatch.setattr(crc, "_capture_get_json", _get_json)
+
+    identity, ai_name, user_name, identity_text = crc._capture_identity_context()
+
+    assert calls == [("/v1/identity/get", "http://enclave.local")]
+    assert ai_name == "IO"
+    assert user_name == "Seven"
+    assert identity["self_introduction"] == "陪 Seven 一起生活。"
+    assert "body_ct" not in identity_text
+    assert "K_user" not in identity_text
+    assert "ciphertext-must-not-enter-prompt" not in identity_text
+
+
+def test_capture_job_add_card_writes_envelope_without_chat_or_delivery(monkeypatch):
+    reply = json.dumps({
+        "cards": [{
+            "action": "add",
+            "type": "event",
+            "bucket": "work",
+            "threads": ["meeting"],
+            "summary": "Seven had a stressful meeting.",
+            "content": "Seven said the meeting was stressful and mentioned elevated heart rate.",
+            "importance": 0.7,
+            "pulse": 0.4,
+        }]
+    }, ensure_ascii=False)
+    captured, job = _install_capture_job_harness(monkeypatch, reply)
 
     assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
     assert captured["proactive_called"] is False
-    assert captured["statuses"] == [
-        (
-            "cap_dispatch",
-            "completed",
-            "capture_stub_noop",
-            {
-                "extra": {
-                    "capture_result": {
-                        "status": "noop",
-                        "reason": "capture_handler_stub",
-                        "job_kind": "memory_capture",
-                    },
-                    "capture_window": job["window"],
-                    "cards_added": 0,
-                    "cards_superseded": 0,
-                    "noop_reason": "capture_handler_stub",
-                }
-            },
-        )
-    ]
+    assert captured["statuses"][0][:3] == ("cap_dispatch", "realizing", "")
+    assert _capture_final_status(captured)[:3] == (
+        "cap_dispatch",
+        "completed",
+        "capture_memory_actions_applied",
+    )
+    action = captured["actions"][0]
+    assert action["type"] == "memory.add"
+    assert action["capture_mode"] == "memory_capture"
+    assert action["source_chat_message_ids"] == ["msg_b", "msg_c"]
+    assert action["envelope"]["visibility"] == "shared"
+    assert action["envelope"]["type"] == "event"
+    assert action["envelope"]["occurred_at"] == "1970-01-01T00:03:20Z"
+    assert action["envelope"]["importance"] == pytest.approx(0.7)
+    assert action["envelope"]["pulse"] == pytest.approx(0.4)
+    assert action["envelope"]["anchor_memory_ids"] == []
+    assert captured["envelope_plaintexts"] == [{
+        "summary": "Seven had a stressful meeting.",
+        "content": "Seven said the meeting was stressful and mentioned elevated heart rate.",
+        "bucket": "work",
+        "threads": ["meeting"],
+    }]
+    assert captured["envelope_kwargs"][0]["visibility"] == "shared"
+    assert "buckets: work" in captured["prompts"][0]
+    assert "threads: meeting" in captured["prompts"][0]
+    assert "identity: IO is Seven's companion" in captured["prompts"][0]
+    assert "这次会议让我压力很大" in captured["prompts"][0]
+    extra = _capture_final_status(captured)[3]["extra"]
+    assert extra["cards_added"] == 1
+    assert extra["cards_superseded"] == 0
+    assert extra["memory_action_status"] == {"status": "ok", "results": 1, "effects": 1}
+
+
+def test_capture_job_supersede_card_writes_supersede_action(monkeypatch):
+    reply = json.dumps({
+        "cards": [{
+            "action": "supersede",
+            "target_id": "mem_old",
+            "type": "event",
+            "bucket": "work",
+            "threads": ["meeting"],
+            "summary": "Seven reframed the meeting stress.",
+            "content": "Seven clarified the stressful meeting was mostly about a boundary issue.",
+            "importance": 0.8,
+            "pulse": 0.6,
+        }]
+    }, ensure_ascii=False)
+    captured, job = _install_capture_job_harness(monkeypatch, reply)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    action = captured["actions"][0]
+    assert action["type"] == "memory.supersede"
+    assert action["supersedes"] == "mem_old"
+    extra = _capture_final_status(captured)[3]["extra"]
+    assert extra["cards_added"] == 0
+    assert extra["cards_superseded"] == 1
+
+
+def test_capture_job_supersede_without_target_falls_back_to_add(monkeypatch):
+    reply = json.dumps({
+        "cards": [{
+            "action": "supersede",
+            "type": "event",
+            "bucket": "work",
+            "threads": ["meeting"],
+            "summary": "Missing target.",
+            "content": "The agent tried to supersede without naming the old card.",
+            "importance": 0.5,
+            "pulse": 0.2,
+        }]
+    }, ensure_ascii=False)
+    captured, job = _install_capture_job_harness(monkeypatch, reply)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert captured["actions"][0]["type"] == "memory.add"
+    assert _capture_final_status(captured)[:3] == (
+        "cap_dispatch",
+        "completed",
+        "capture_memory_actions_applied",
+    )
+    extra = _capture_final_status(captured)[3]["extra"]
+    assert extra["cards_added"] == 1
+    assert extra["cards_superseded"] == 0
+
+
+def test_capture_job_empty_cards_completes_noop_without_memory_write(monkeypatch):
+    captured, job = _install_capture_job_harness(monkeypatch, '{"cards":[]}')
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert captured["actions"] == []
+    assert _capture_final_status(captured)[:3] == (
+        "cap_dispatch",
+        "completed",
+        "nothing_worth_keeping",
+    )
+    extra = _capture_final_status(captured)[3]["extra"]
+    assert extra["cards_added"] == 0
+    assert extra["cards_superseded"] == 0
+    assert extra["noop_reason"] == "nothing_worth_keeping"
+
+
+def test_capture_job_bad_json_fails_without_crash_or_memory_write(monkeypatch):
+    captured, job = _install_capture_job_harness(monkeypatch, "not json")
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert captured["actions"] == []
+    assert _capture_final_status(captured)[:3] == ("cap_dispatch", "failed", "no_json_object")
+    assert _capture_final_status(captured)[3]["extra"]["noop_reason"] == "no_json_object"
 
 
 def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):

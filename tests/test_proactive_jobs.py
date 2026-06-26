@@ -972,24 +972,24 @@ def test_capture_job_polls_and_claims_when_ambient_is_off(tmp_path, monkeypatch)
         json={
             "status": "completed",
             "consumer_id": "capture-consumer",
-            "reason": "capture_stub_noop",
-            "capture_result": {"status": "noop", "reason": "capture_handler_stub"},
+            "reason": "nothing_worth_keeping",
+            "capture_result": {"status": "noop", "reason": "nothing_worth_keeping"},
             "capture_window": job["window"],
             "memory_action_status": {"status": "not_run"},
             "cards_added": 0,
             "cards_superseded": 0,
-            "noop_reason": "capture_handler_stub",
+            "noop_reason": "nothing_worth_keeping",
         },
     )
 
     assert status.status_code == 200
     patched = status.get_json()["job"]
-    assert patched["capture_result"] == {"status": "noop", "reason": "capture_handler_stub"}
+    assert patched["capture_result"] == {"status": "noop", "reason": "nothing_worth_keeping"}
     assert patched["capture_window"]["until_message_id"] == "msg_until"
     assert patched["memory_action_status"] == {"status": "not_run"}
     assert patched["cards_added"] == 0
     assert patched["cards_superseded"] == 0
-    assert patched["noop_reason"] == "capture_handler_stub"
+    assert patched["noop_reason"] == "nothing_worth_keeping"
 
 
 def test_capture_enqueue_single_flight_per_user(tmp_path, monkeypatch):
@@ -1211,9 +1211,9 @@ def test_capture_completion_advances_state_and_blocks_same_window(tmp_path, monk
         headers=headers,
         json={
             "status": "completed",
-            "reason": "capture_stub_noop",
+            "reason": "nothing_worth_keeping",
             "capture_window": full_job["window"],
-            "capture_result": {"status": "noop"},
+            "capture_result": {"status": "noop", "reason": "nothing_worth_keeping"},
         },
     )
     second = client.post(

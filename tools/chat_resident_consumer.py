@@ -119,6 +119,7 @@ try:
 except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
+from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards
 from proactive.agent_protocol_v2 import build_agent_context_v2
 from proactive.tool_catalog_v2 import tool_catalog_v2_for_runtime
 from proactive.tool_loop_v2 import run_tool_loop_v2
@@ -253,6 +254,9 @@ PROACTIVE_RECENT_CHAT_LIMIT = int(os.environ.get("PROACTIVE_RECENT_CHAT_LIMIT", 
 PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT = int(os.environ.get("PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT", "50"))
 PROACTIVE_CHAT_FRESH_WINDOW_SEC = int(os.environ.get("PROACTIVE_CHAT_FRESH_WINDOW_SEC", "21600"))
 PROACTIVE_STALE_CHAT_FALLBACK_LIMIT = int(os.environ.get("PROACTIVE_STALE_CHAT_FALLBACK_LIMIT", "2"))
+CAPTURE_HISTORY_LIMIT = int(os.environ.get("FEEDLING_CAPTURE_HISTORY_LIMIT", "160"))
+CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "12000"))
+CAPTURE_CONTEXT_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_CONTEXT_MAX_CHARS", "4000"))
 CONSUMER_ID = os.environ.get(
     "CONSUMER_ID",
     f"{socket.gethostname()}:{os.getpid()}",
@@ -1516,6 +1520,13 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         return turn
 
     if not isinstance(obj, dict):
+        return turn
+
+    # Capture-lane agents are asked to return a strict {"cards": [...]} JSON
+    # object. Preserve that JSON as the final text so the capture handler can
+    # parse it instead of treating it as an unknown non-chat payload.
+    if isinstance(obj.get("cards"), list):
+        turn.messages.append(json.dumps({"cards": obj.get("cards")}, ensure_ascii=False))
         return turn
 
     # OpenClaw `agent --json` nests reply text under result.payloads[].text,
@@ -3667,11 +3678,296 @@ def _scheduled_wake_actions(actions: list[dict]) -> list[dict]:
     return out
 
 
-def _process_capture_jobs(jobs: list) -> float:
-    """PR A capture-lane stub.
+def _capture_get_json(
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    timeout: int = 15,
+    base_url: str | None = None,
+) -> dict:
+    root = (base_url or FEEDLING_API_URL).rstrip("/")
+    try:
+        resp = httpx.get(
+            f"{root}{path}",
+            params=params or {},
+            headers=_HEADERS,
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+    except Exception as e:
+        log.warning("capture context fetch failed path=%s error=%s", path, e)
+        return {}
 
-    Capture jobs are not proactive reach-out jobs: do not call the agent, write
-    chat, request broadcast, or use delivery semantics in this substrate PR.
+
+def _capture_context_text(value: Any, *, empty: str = "（暂无）") -> str:
+    if value in (None, "", [], {}):
+        return empty
+    if isinstance(value, str):
+        return value[:CAPTURE_CONTEXT_MAX_CHARS]
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)[:CAPTURE_CONTEXT_MAX_CHARS]
+    except Exception:
+        return str(value)[:CAPTURE_CONTEXT_MAX_CHARS]
+
+
+def _capture_identity_context() -> tuple[dict, str, str, str]:
+    body = (
+        _capture_get_json("/v1/identity/get", base_url=FEEDLING_ENCLAVE_URL)
+        if FEEDLING_ENCLAVE_URL
+        else {}
+    )
+    if not isinstance(body.get("identity"), dict):
+        body = _capture_get_json("/v1/identity/get")
+    identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
+    identity = {
+        key: value
+        for key, value in identity.items()
+        if key in {
+            "agent_name",
+            "ai_name",
+            "name",
+            "user_preferred_name",
+            "user_name",
+            "companion_user_name",
+            "self_introduction",
+            "dimensions",
+            "days_with_user",
+            "category",
+            "signature",
+            "visibility",
+            "decrypt_status",
+        }
+        and value not in (None, "", [], {})
+    }
+    ai_name = str(
+        identity.get("agent_name")
+        or identity.get("ai_name")
+        or identity.get("name")
+        or ""
+    ).strip() or "我"
+    user_name = str(
+        identity.get("user_preferred_name")
+        or identity.get("user_name")
+        or identity.get("companion_user_name")
+        or ""
+    ).strip() or "TA"
+    return identity, ai_name, user_name, _capture_context_text(identity)
+
+
+def _capture_memory_terms_context() -> tuple[str, str]:
+    buckets_body = _capture_get_json("/v1/memory/buckets")
+    threads_body = _capture_get_json("/v1/memory/threads")
+    return (
+        _capture_context_text(buckets_body.get("buckets")),
+        _capture_context_text(threads_body.get("threads")),
+    )
+
+
+def _capture_message_text(msg: dict) -> str:
+    text = (
+        msg.get("content")
+        or msg.get("text")
+        or msg.get("plaintext")
+        or msg.get("body")
+        or ""
+    )
+    if isinstance(text, dict):
+        text = json.dumps(text, ensure_ascii=False)
+    if not isinstance(text, str):
+        text = str(text or "")
+    text = re.sub(r"\s+", " ", text.strip())
+    if not text:
+        ctype = str(msg.get("content_type") or "").lower()
+        if ctype == "image" or msg.get("image_b64"):
+            return "[image]"
+    return text[:2000]
+
+
+def _capture_message_role(msg: dict) -> str:
+    role = str(msg.get("role") or "").strip().lower()
+    if role == "user":
+        return "user"
+    return "agent"
+
+
+def _capture_message_id(msg: dict) -> str:
+    return str(msg.get("id") or msg.get("message_id") or "").strip()
+
+
+def _capture_live_history(history: list[dict] | None) -> list[dict]:
+    out: list[dict] = []
+    for msg in history or []:
+        if not isinstance(msg, dict):
+            continue
+        source = str(msg.get("source") or "").strip()
+        if source == "verify_ping":
+            continue
+        role = str(msg.get("role") or "").strip().lower()
+        if role not in {"user", "openclaw", "assistant", "agent"}:
+            continue
+        text = _capture_message_text(msg)
+        if not text or "__VERIFY_PING__" in text:
+            continue
+        item = dict(msg)
+        item["_capture_text"] = text
+        out.append(item)
+    return out
+
+
+def _capture_window_messages(job: dict) -> list[dict]:
+    window = job.get("window") if isinstance(job.get("window"), dict) else {}
+    after_id = str(window.get("after_message_id") or "").strip()
+    until_id = str(window.get("until_message_id") or "").strip()
+    try:
+        until_ts = float(window.get("until_ts") or 0)
+    except (TypeError, ValueError):
+        until_ts = 0.0
+    try:
+        window_count = int(window.get("message_count") or 0)
+    except (TypeError, ValueError):
+        window_count = 0
+    limit = max(20, CAPTURE_HISTORY_LIMIT)
+    history = get_decrypted_history(since=0, limit=limit)
+    live = _capture_live_history(history)
+    if not live:
+        return []
+    selected: list[dict] = []
+    after_seen = not after_id
+    for msg in live:
+        msg_id = _capture_message_id(msg)
+        ts = _message_ts_for_context(msg)
+        if not after_seen:
+            if msg_id == after_id:
+                after_seen = True
+            elif until_ts and ts > until_ts:
+                break
+            continue
+        if until_ts and ts > until_ts:
+            break
+        selected.append(msg)
+        if until_id and msg_id == until_id:
+            break
+    if not selected and until_ts:
+        selected = [msg for msg in live if 0 < _message_ts_for_context(msg) <= until_ts]
+    selected = selected[-limit:]
+    if window_count > 0:
+        selected = selected[-window_count:]
+    return selected
+
+
+def _capture_window_text(messages: list[dict]) -> str:
+    lines: list[str] = []
+    for msg in messages:
+        ts = _message_ts_for_context(msg)
+        lines.append(
+            f"- [{_format_message_time(ts)}] {_capture_message_role(msg)}: "
+            f"{msg.get('_capture_text') or _capture_message_text(msg)}"
+        )
+    text = "\n".join(lines).strip()
+    return text[-CAPTURE_WINDOW_MAX_CHARS:] if len(text) > CAPTURE_WINDOW_MAX_CHARS else text
+
+
+def _capture_occurred_at(job: dict, messages: list[dict]) -> str:
+    window = job.get("window") if isinstance(job.get("window"), dict) else {}
+    try:
+        ts = float(window.get("until_ts") or 0)
+    except (TypeError, ValueError):
+        ts = 0.0
+    if ts <= 0 and messages:
+        ts = _message_ts_for_context(messages[-1])
+    if ts <= 0:
+        ts = time.time()
+    return _format_message_time(ts)
+
+
+def _capture_agent_reply_text(result: Any) -> str:
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        if isinstance(result.get("cards"), list):
+            return json.dumps({"cards": result.get("cards")}, ensure_ascii=False)
+        messages = result.get("messages")
+        if isinstance(messages, list) and messages:
+            return "\n".join(str(item) for item in messages if str(item).strip())
+        return json.dumps(result, ensure_ascii=False)
+    if isinstance(result, list):
+        return json.dumps(result, ensure_ascii=False)
+    return str(result or "")
+
+
+def _capture_build_envelope(card: dict, *, occurred_at: str) -> dict:
+    if not _ENCRYPTION_AVAILABLE:
+        raise RuntimeError("capture_encryption_unavailable")
+    if not _refresh_whoami_for_encrypted_reply():
+        raise RuntimeError("capture_whoami_refresh_failed")
+    user_id = str(_whoami_cache.get("user_id") or "").strip()
+    user_pk: bytes | None = _whoami_cache.get("user_pk")
+    enc_pk: bytes | None = _whoami_cache.get("enclave_pk")
+    if not user_id or not user_pk:
+        raise RuntimeError("capture_missing_user_key")
+    if not enc_pk:
+        raise RuntimeError("capture_shared_envelope_requires_enclave_key")
+
+    inner = {
+        "summary": str(card.get("summary") or "").strip(),
+        "content": str(card.get("content") or "").strip(),
+        "bucket": str(card.get("bucket") or "").strip(),
+        "threads": list(card.get("threads") or []),
+    }
+    envelope = _build_envelope(
+        plaintext=json.dumps(inner, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        owner_user_id=user_id,
+        user_pk_bytes=user_pk,
+        enclave_pk_bytes=enc_pk,
+        visibility="shared",
+    )
+    envelope.update({
+        "type": str(card.get("type") or "event").strip().lower() or "event",
+        "occurred_at": occurred_at,
+        "importance": float(card.get("importance") or 0),
+        "pulse": float(card.get("pulse") or 0),
+        "anchor_memory_ids": [],
+        "source": "memory_capture",
+        "last_referenced_at": occurred_at,
+    })
+    return envelope
+
+
+def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[dict]) -> tuple[list[dict], int, int]:
+    occurred_at = _capture_occurred_at(job, messages)
+    source_ids = [_capture_message_id(msg) for msg in messages if _capture_message_id(msg)]
+    actions: list[dict] = []
+    cards_added = 0
+    cards_superseded = 0
+    for card in cards:
+        action = str(card.get("action") or "").strip().lower()
+        target_id = str(card.get("target_id") or "").strip()
+        envelope = _capture_build_envelope(card, occurred_at=occurred_at)
+        base = {
+            "envelope": envelope,
+            "reason": "Memory captured from a completed chat window.",
+            "capture_mode": "memory_capture",
+            "source_chat_message_ids": source_ids,
+        }
+        if action == "add" or (action in {"merge", "supersede"} and not target_id):
+            actions.append({"type": "memory.add", **base})
+            cards_added += 1
+            continue
+        if action in {"merge", "supersede"} and target_id:
+            actions.append({"type": "memory.supersede", "supersedes": target_id, **base})
+            cards_superseded += 1
+    if cards and not actions:
+        raise ValueError("capture_no_memory_actions")
+    return actions, cards_added, cards_superseded
+
+
+def _process_capture_jobs(jobs: list) -> float:
+    """Realize memory_capture jobs through the native resident agent.
+
+    Capture is background memory maintenance: it never writes chat, never uses
+    delivery gates, and never runs the V2 tool loop.
     """
     latest = 0.0
     for job in jobs:
@@ -3692,23 +3988,151 @@ def _process_capture_jobs(jobs: list) -> float:
             log.error("capture job claim failed id=%s: %s", job_id, e)
             continue
         window = job.get("window") if isinstance(job.get("window"), dict) else {}
+        update_proactive_job_status(job_id, "realizing")
+        messages = _capture_window_messages(job)
+        window_text = _capture_window_text(messages)
+        if not window_text:
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                "capture_window_unavailable",
+                extra={
+                    "capture_result": {"status": "failed", "reason": "capture_window_unavailable"},
+                    "capture_window": window,
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": "capture_window_unavailable",
+                },
+            )
+            continue
+        buckets_text, threads_text = _capture_memory_terms_context()
+        identity, ai_name, user_name, identity_text = _capture_identity_context()
+        prompt = build_capture_prompt(
+            ai_name=ai_name,
+            user_name=user_name,
+            buckets=buckets_text,
+            threads=threads_text,
+            identity=identity_text,
+            window=window_text,
+        )
+        try:
+            reply_text = _capture_agent_reply_text(call_agent(prompt))
+        except Exception as e:
+            reason = f"capture_agent_call_failed:{type(e).__name__}"
+            log.error("capture agent call failed id=%s: %s", job_id, e)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "capture_result": {"status": "failed", "reason": reason},
+                    "capture_window": window,
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": reason,
+                },
+            )
+            continue
+        cards, err = parse_capture_cards(reply_text)
+        if err:
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                err,
+                extra={
+                    "capture_result": {"status": "failed", "reason": err},
+                    "capture_window": window,
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": err,
+                },
+            )
+            continue
+        if not cards:
+            update_proactive_job_status(
+                job_id,
+                "completed",
+                "nothing_worth_keeping",
+                extra={
+                    "capture_result": {"status": "noop", "reason": "nothing_worth_keeping"},
+                    "capture_window": window,
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": "nothing_worth_keeping",
+                },
+            )
+            log.info("capture job completed noop id=%s", job_id)
+            continue
+        try:
+            actions, cards_added, cards_superseded = _capture_actions_from_cards(
+                cards,
+                job=job,
+                messages=messages,
+            )
+            memory_result = execute_memory_actions(actions)
+        except ValueError as e:
+            reason = str(e) or "capture_invalid_memory_action"
+            log.error("capture memory action invalid id=%s: %s", job_id, e)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "capture_result": {"status": "failed", "reason": reason},
+                    "capture_window": window,
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": reason,
+                    "memory_action_status": {"status": "failed", "reason": reason},
+                },
+            )
+            continue
+        except Exception as e:
+            reason = f"capture_memory_write_failed:{type(e).__name__}"
+            log.error("capture memory write failed id=%s: %s", job_id, e)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "capture_result": {"status": "failed", "reason": reason},
+                    "capture_window": window,
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": reason,
+                    "memory_action_status": {"status": "failed", "reason": str(e)[:500]},
+                },
+            )
+            continue
         update_proactive_job_status(
             job_id,
             "completed",
-            "capture_stub_noop",
+            "capture_memory_actions_applied",
             extra={
                 "capture_result": {
-                    "status": "noop",
-                    "reason": "capture_handler_stub",
+                    "status": "ok",
+                    "cards": len(cards),
                     "job_kind": "memory_capture",
                 },
                 "capture_window": window,
-                "cards_added": 0,
-                "cards_superseded": 0,
-                "noop_reason": "capture_handler_stub",
+                "memory_action_status": {
+                    "status": memory_result.get("status", "ok"),
+                    "results": len(memory_result.get("results") or []),
+                    "effects": len(memory_result.get("effects") or []),
+                },
+                "memory_results": memory_result.get("results") or [],
+                "cards_added": cards_added,
+                "cards_superseded": cards_superseded,
             },
         )
-        log.info("capture job stub completed id=%s trigger=%s", job_id, job.get("trigger") or "")
+        log.info(
+            "capture job completed id=%s cards=%d added=%d superseded=%d identity=%s",
+            job_id,
+            len(cards),
+            cards_added,
+            cards_superseded,
+            bool(identity),
+        )
     return latest
 
 
