@@ -14,7 +14,7 @@ Usage::
     DATABASE_URL=postgresql://...?sslmode=require \\
     R2_ENDPOINT=https://<acct>.r2.cloudflarestorage.com \\
     R2_ACCESS_KEY_ID=... R2_SECRET_ACCESS_KEY=... \\
-    R2_FRAMES_BUCKET=fisherman-image-frames \\
+    R2_FRAMES_BUCKET=io-image-frames \\
     python backend/backfill_frames_to_r2.py --dry-run
     # then drop --dry-run to perform the move
 

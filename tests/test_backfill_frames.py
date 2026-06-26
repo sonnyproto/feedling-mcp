@@ -66,7 +66,7 @@ def test_backfill_moves_bodies_and_is_idempotent(monkeypatch):
     assert _pending(uid) == 0
     for fid, env in envs.items():
         # ciphertext now in R2, row reconstructs to the original envelope
-        assert (("fisherman-image-frames", f"frames/{uid}/{fid}")) in fake.store
+        assert (("io-image-frames", f"frames/{uid}/{fid}")) in fake.store
         assert db.frame_get(uid, fid) == env
 
     # second pass is a no-op (nothing left pending)
