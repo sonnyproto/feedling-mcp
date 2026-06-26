@@ -2418,6 +2418,48 @@ def test_cli_tool_only_output_preserves_tool_calls(monkeypatch):
     assert [tc["name"] for tc in turn.tool_calls] == ["screen.read"]
 
 
+def test_call_agent_cli_codex_extracts_agent_message_not_handshake(monkeypatch):
+    """`codex exec --json` streams JSONL events; the assistant text rides in
+    `item.completed` (item.type == "agent_message"). The consumer must extract
+    that, NOT mis-send the `{"type":"thread.started"}` handshake as the reply.
+    Stream shape verified against codex 0.136."""
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec --skip-git-repo-check --json {message}")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+
+    class _R:
+        returncode = 0
+        stdout = (
+            '{"type":"thread.started","thread_id":"t1"}\n'
+            '{"type":"turn.started"}\n'
+            '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Hello from codex!"}}\n'
+            '{"type":"turn.completed","usage":{"input_tokens":1}}\n'
+        )
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    result = crc.call_agent_cli("hi")
+    assert result == "Hello from codex!"
+    assert "thread.started" not in result
+
+
+def test_codex_reply_from_stream_ignores_reasoning_and_handshake():
+    raw = (
+        '{"type":"thread.started","thread_id":"t1"}\n'
+        '{"type":"item.completed","item":{"type":"reasoning","text":"thinking…"}}\n'
+        '{"type":"item.completed","item":{"type":"agent_message","text":"final answer"}}\n'
+        '{"type":"turn.completed"}\n'
+    )
+    assert crc._codex_reply_from_stream(raw) == "final answer"
+
+
+def test_codex_reply_from_stream_empty_when_no_agent_message():
+    # handshake-only / failed turn → "" so call_agent_cli falls back, never leaks.
+    raw = '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.failed"}\n'
+    assert crc._codex_reply_from_stream(raw) == ""
+
+
 def test_openai_http_tool_only_response_preserved(monkeypatch):
     """AGENT_MODE=http openai protocol: a tool-only model reply must be returned
     as structured output (not raise 'no usable reply text')."""

@@ -1700,6 +1700,29 @@ def _json_objects_from_cli_output(raw: str) -> list[Any]:
     return objects
 
 
+def _codex_reply_from_stream(raw: str) -> str:
+    """Extract the assistant's reply from a ``codex exec --json`` event stream.
+
+    codex emits JSONL events; the agent's text rides in ``item.completed`` events
+    whose ``item.type == "agent_message"`` (text at ``item.text``) — verified
+    against codex 0.136. Everything else (thread.started/turn.* handshake,
+    reasoning, command_execution items) is skipped. Returns the agent messages
+    joined in order, or "" when the stream carries none (handshake-only / failed
+    turn) so the caller can fall back instead of leaking a handshake event.
+    """
+    texts: list[str] = []
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict) or obj.get("type") != "item.completed":
+            continue
+        item = obj.get("item")
+        if not isinstance(item, dict) or item.get("type") != "agent_message":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            texts.append(text.strip())
+    return "\n\n".join(texts)
+
+
 def _extract_text_from_cli_output(raw: str) -> str:
     """Best-effort extraction from raw CLI stdout.
 
@@ -2084,6 +2107,10 @@ def _is_claude_code_cmd(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "claude"
 
 
+def _is_codex_cmd(cmd: list[str]) -> bool:
+    return bool(cmd) and Path(cmd[0]).name == "codex"
+
+
 def _cli_flag_value(cmd: list[str], flag: str) -> str:
     try:
         idx = cmd.index(flag)
@@ -2356,6 +2383,16 @@ def call_agent_cli(message: str, image_paths: list[str] | None = None) -> Any:
         raise RuntimeError(
             f"cli agent exited {result.returncode}: {(result.stderr or '')[:300]}"
         )
+
+    # codex `exec --json` streams JSONL events; the assistant's text lives in
+    # `item.completed` events (item.type == "agent_message"), NOT in any field the
+    # generic extractor recognizes. Pull it from the stream before falling through
+    # (else the consumer would mis-send the `thread.started` handshake as the reply).
+    if _is_codex_cmd(cmd):
+        codex_reply = _codex_reply_from_stream(result.stdout)
+        if codex_reply:
+            return codex_reply
+
     raw = result.stdout
     turn = _agent_turn_from_raw(raw)
     if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
