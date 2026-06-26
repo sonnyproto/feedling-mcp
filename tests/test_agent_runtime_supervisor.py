@@ -144,6 +144,20 @@ def test_tick_respawns_alive_child_when_config_changes():
     assert leases.get("u_1")["lease_owner"] == "sup_A"         # lease retained across restart
 
 
+def test_tick_respawn_updates_lease_driver_column():
+    # After an in-place driver switch (codex→claude on an API-key change), the
+    # lease row's `driver` column must reflect the NEW driver — otherwise anything
+    # reading the lease (ops, dashboards) sees a stale agent. Regression: in-place
+    # respawn renewed the lease without updating driver, leaving it at the old value.
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    sup.tick([{"user_id": "u_1", "api_key": "k", "driver": "codex", "provider": "openai"}])
+    assert leases.get("u_1")["driver"] == "codex"
+
+    sup.tick([{"user_id": "u_1", "api_key": "k", "driver": "claude", "provider": "anthropic"}])
+    assert leases.get("u_1")["driver"] == "claude"
+
+
 def test_tick_no_respawn_when_config_unchanged():
     procs = FakeProcTable()
     sup = _sup(procs)

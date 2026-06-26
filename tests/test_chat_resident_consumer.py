@@ -1295,6 +1295,46 @@ def test_cli_nonzero_exit_fails_even_with_stdout(monkeypatch):
         crc.call_agent_cli("hi")
 
 
+def test_cli_failure_surfaces_claude_json_error_from_stdout(monkeypatch):
+    # claude --output-format json reports API failures on STDOUT (is_error+result)
+    # with stderr empty/just a warning. The raised error must carry the real
+    # reason so `cli agent exited 1:` is diagnosable, not blank.
+    class _Result:
+        returncode = 1
+        stdout = '{"type":"result","is_error":true,"api_error_status":429,"result":"Overloaded"}'
+        stderr = ""
+
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p {message}')
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["claude", "-p", message])
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
+
+    with pytest.raises(RuntimeError) as ei:
+        crc.call_agent_cli("hi")
+    assert "Overloaded" in str(ei.value)
+    assert "429" in str(ei.value)
+
+
+def test_cli_failure_surfaces_codex_stream_error_from_stdout(monkeypatch):
+    # codex --json emits the failure as `error` events on STDOUT; stderr is just
+    # the "Reading additional input…" banner. Surface the event message.
+    class _Result:
+        returncode = 1
+        stdout = (
+            '{"type":"thread.started","thread_id":"t1"}\n'
+            '{"type":"error","message":"unexpected status 401 Unauthorized: Incorrect API key"}\n'
+            '{"type":"turn.failed"}'
+        )
+        stderr = "Reading additional input from stdin..."
+
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec --json {message}')
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["codex", "exec", "--json", message])
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
+
+    with pytest.raises(RuntimeError) as ei:
+        crc.call_agent_cli("hi")
+    assert "401 Unauthorized" in str(ei.value)
+
+
 def test_openai_http_protocol_uses_session_headers(monkeypatch):
     captured = {}
 

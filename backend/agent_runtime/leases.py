@@ -72,12 +72,17 @@ def renew(
     status: str | None = None,
     pid: int | None = None,
     session_ref: str | None = None,
+    driver: str | None = None,
     now: float | None = None,
 ) -> bool:
     """Heartbeat: extend the lease iff we still own a live lease.
 
     Returns False if we lost ownership or the lease already expired (the caller
     should then stop its consumer — another supervisor may have taken over).
+
+    ``driver`` updates the recorded agent when a live consumer is respawned in
+    place under a new driver (e.g. the user switches API key openai→anthropic, so
+    codex→claude). Heartbeats pass it as None and leave the column untouched.
     """
     clock = _now(now)
     expires = clock + ttl
@@ -88,6 +93,7 @@ def renew(
             status = COALESCE(%s, status),
             pid = COALESCE(%s, pid),
             session_ref = COALESCE(%s, session_ref),
+            driver = COALESCE(%s, driver),
             updated_at = now()
         WHERE user_id = %s
           AND lease_owner = %s
@@ -96,7 +102,7 @@ def renew(
     """
     with db.get_pool().connection() as conn:
         row = conn.execute(
-            sql, (expires, clock, status, pid, session_ref, user_id, lease_owner, clock)
+            sql, (expires, clock, status, pid, session_ref, driver, user_id, lease_owner, clock)
         ).fetchone()
     return bool(row)
 

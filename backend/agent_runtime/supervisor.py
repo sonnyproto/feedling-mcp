@@ -139,7 +139,8 @@ class Supervisor:
                     pid = self.spawn_fn(entry, user_id, home)
                     self._write_token(user_id, home)
                     leases.renew(user_id, self.owner, ttl=self.lease_ttl, pid=pid,
-                                 status="running", now=self._now())
+                                 status="running", driver=entry.get("driver"),
+                                 now=self._now())
                     self.children[user_id] = {"pid": pid, "entry": entry, "home": home}
                 else:
                     self._write_token(user_id, child["home"])  # refresh short-lived token

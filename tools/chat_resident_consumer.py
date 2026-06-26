@@ -1706,6 +1706,33 @@ def _json_objects_from_cli_output(raw: str) -> list[Any]:
     return objects
 
 
+def _cli_error_detail(stdout: str, stderr: str) -> str:
+    """Best error string for a non-zero CLI exit.
+
+    Both CLIs report API failures on STDOUT while stderr is often empty or just a
+    warning: claude ``--output-format json`` emits a result object
+    (``is_error`` + ``result`` text + ``api_error_status``); codex ``--json`` emits
+    ``error`` events (``message``). Surface that so ``cli agent exited`` is
+    actionable instead of blank. Falls back to stderr, then a stdout snippet.
+    """
+    claude_err = ""
+    codex_err = ""
+    for obj in _json_objects_from_cli_output(stdout or ""):
+        if not isinstance(obj, dict):
+            continue
+        if not claude_err and obj.get("is_error") and isinstance(obj.get("result"), str):
+            status = obj.get("api_error_status")
+            claude_err = obj["result"] + (f" (api_status={status})" if status else "")
+        if obj.get("type") == "error" and isinstance(obj.get("message"), str):
+            codex_err = obj["message"]   # keep the last error event (the final one)
+    detail = claude_err or codex_err
+    if detail:
+        return detail[:300]
+    if (stderr or "").strip():
+        return stderr.strip()[:300]
+    return (stdout or "").strip()[:300]
+
+
 def _codex_reply_from_stream(raw: str) -> str:
     """Extract the assistant's reply from a ``codex exec --json`` event stream.
 
@@ -2387,7 +2414,8 @@ def call_agent_cli(message: str, image_paths: list[str] | None = None) -> Any:
 
     if result.returncode != 0:
         raise RuntimeError(
-            f"cli agent exited {result.returncode}: {(result.stderr or '')[:300]}"
+            f"cli agent exited {result.returncode}: "
+            f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
         )
 
     # codex `exec --json` streams JSONL events; the assistant's text lives in
