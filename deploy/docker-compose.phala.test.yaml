@@ -157,6 +157,16 @@ services:
       # compose synthesis / build never aborts on an unset var; the backend
       # still fails fast at startup (db.py) if it ends up empty at runtime.
       DATABASE_URL: "${DATABASE_URL:-}"
+      # Cloudflare R2 (S3-compatible) offload for the heavy frame ciphertext
+      # (backend/object_storage.py). Injected via `phala deploy -e R2_*=...`
+      # (encrypted env channel). Empty default = feature OFF (body_ct stays
+      # inline in Postgres, legacy shape). The token MUST be scoped to the
+      # frames bucket. Adding these keys changes compose_hash once (the normal
+      # on-chain publish re-auths); rotating the values later is free.
+      R2_ENDPOINT: "${R2_ENDPOINT:-}"
+      R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
+      R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
+      R2_FRAMES_BUCKET: "${R2_FRAMES_BUCKET:-}"
       # APNs developer key for push (Dynamic Island / Live Activity).
       # Injected via `phala deploy -e APNS_KEY_P8_B64=...` (encrypted env
       # channel, NOT baked into compose_hash). Empty default keeps dev
