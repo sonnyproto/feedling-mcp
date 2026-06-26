@@ -38,7 +38,7 @@ SLOW_SIGNALS = (
 )
 # pull-only context signals (focus = are-you-in-a-focus-mode, audio_route =
 # headphones/car). Valid + pullable, but kept out of the default fast set.
-EXTRA_SIGNALS = ("focus", "audio_route")
+EXTRA_SIGNALS = ("focus", "audio_route", "app")
 PERCEPTION_SIGNALS = FAST_SIGNALS + SLOW_SIGNALS + EXTRA_SIGNALS
 
 # Native model handles these as agent OUTPUT actions, not pull tools — kept as
@@ -241,6 +241,33 @@ def cmd_photo_recent(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+def cmd_photo_read(args):
+    """One specific photo's details by id (metadata + optional decrypted image).
+
+    GET /v1/perception/photo/<id>/content returns metadata + frame_id; with
+    --include-image, the pixels are decrypted via the enclave's
+    /v1/screen/frames/<frame_id>/decrypt path (same as screen-read). Pass an id
+    from photo-recent. Lets the agent actually look at a photo it cares about,
+    not just the recent-list metadata."""
+    api_url, auth = _require_backend()
+    pid = (args.photo_id or "").strip()
+    if not pid:
+        _emit({"ok": False, "error": "photo-read needs --id <photo_id> (from photo-recent)"}, 2)
+    status, body = _http_json("GET", f"{api_url}/v1/perception/photo/{pid}/content", auth)
+    if status != 200:
+        _emit({"ok": False, "http_status": status, "photo_id": pid, "error": body}, 1)
+    out = {"ok": True, "photo_id": pid, **(body if isinstance(body, dict) else {"data": body})}
+    if args.include_image:
+        frame_id = (body.get("frame_id") if isinstance(body, dict) else "") or ""
+        if frame_id:
+            qs = urllib.parse.urlencode({"include_image": "true"})
+            istatus, ibody = _http_json("GET", f"{api_url}/v1/screen/frames/{frame_id}/decrypt?{qs}", auth)
+            out["image"] = ibody if istatus == 200 else {"error": ibody, "http_status": istatus}
+        else:
+            out["image"] = {"error": "no frame_id on photo content"}
+    _emit(out)
+
+
 def cmd_phase2(args):
     # send / sleep / schedule-wake / cancel-wake are NOT pull tools in the native
     # model — the agent emits them as output actions (JSON messages/actions) which
@@ -307,6 +334,11 @@ def main():
     pr = sub.add_parser("photo-recent", help="Recent photo metadata (scene/time; no raw pixels).")
     pr.add_argument("--limit", type=int, default=10)
     pr.set_defaults(func=cmd_photo_recent)
+
+    pd = sub.add_parser("photo-read", help="One specific photo's details by id (metadata + optional image).")
+    pd.add_argument("--id", dest="photo_id", required=True, help="photo id (from photo-recent)")
+    pd.add_argument("--include-image", dest="include_image", action="store_true", help="include decrypted base64 JPEG (large)")
+    pd.set_defaults(func=cmd_photo_read)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")

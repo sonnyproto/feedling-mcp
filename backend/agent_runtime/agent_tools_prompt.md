@@ -20,6 +20,7 @@ python <io_cli> memory-fetch <id> [<id> ...] [--limit <n>]
 python <io_cli> screen-recent [--limit <n>]
 python <io_cli> screen-read [--frame-id <id>] [--include-image]
 python <io_cli> photo-recent [--limit <n>]
+python <io_cli> photo-read --id <photo_id> [--include-image]
 ```
 
 - Output is JSON on stdout (`{"ok": true, ...}` or `{"ok": false, "error": ...}`).

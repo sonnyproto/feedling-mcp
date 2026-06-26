@@ -5,7 +5,7 @@ import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 
 const execFileAsync = promisify(execFile);
-const SIGNALS = ["now","location","weather","motion","calendar","steps","sleep","workout","vitals","focus","audio_route","reminders","activity","body","metabolic","cycle","mood"];
+const SIGNALS = ["now","location","weather","motion","calendar","steps","sleep","workout","vitals","focus","audio_route","app","reminders","activity","body","metabolic","cycle","mood"];
 const FAST_SIGNALS = new Set(["now","location","weather","motion","calendar","focus","audio_route"]);
 
 // Declared in code so the gateway recognizes and forwards the configured config
@@ -239,6 +239,25 @@ export default definePluginEntry({
         properties: { limit: { type: "integer", minimum: 1, maximum: 100, description: "max photos (default 10)" } },
       },
       build: (p) => ["photo-recent", ...flagsFromParams(p, [["limit", "--limit", "value"]])],
+    });
+
+    // photo.read — one specific photo's details by id (metadata + optional image).
+    registerCli({
+      name: "photo_read",
+      description: "[slow] Read one specific photo's details by id (provider-safe name for photo.read). Pass an id from photo_recent. Returns metadata; include_image decrypts the actual JPEG (large) for a closer look.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id"],
+        properties: {
+          id: { type: "string", description: "photo id (from photo_recent)" },
+          include_image: { type: "boolean", description: "include decrypted base64 JPEG (large)" },
+        },
+      },
+      build: (p) => ["photo-read", ...flagsFromParams(p, [
+        ["id", "--id", "value"],
+        ["include_image", "--include-image", "bool"],
+      ])],
     });
 
     // perception.trend — rolling baseline + delta for one numeric field (sense change vs norm).
