@@ -11,6 +11,7 @@ from flask import jsonify, request
 
 import db
 from core.store import UserStore
+from core import envelope as core_envelope
 from flask import Blueprint, Response
 import threading
 
@@ -77,8 +78,31 @@ def identity_init():
 
     payload = request.get_json(silent=True) or {}
     envelope = payload.get("envelope")
-    if envelope is None:
-        return jsonify({"error": "envelope required"}), 400
+    identity_plain = payload.get("identity")
+    # Two ways to init:
+    #   (A) pre-built `envelope` — iOS / official client builds it locally.
+    #   (B) plaintext `identity` — a route-A agent has no crypto, so the server
+    #       builds the envelope here via the same path memory.add and
+    #       identity.profile_patch use (_build_shared_envelope_for_store). This
+    #       restores the agent-driven init that lived in the now-removed MCP
+    #       server (mcpsrv/tools_identity), without regressing the client path.
+    if envelope is not None and identity_plain is not None:
+        return jsonify({"error": "provide either envelope or identity, not both"}), 400
+    if envelope is None and identity_plain is None:
+        return jsonify({"error": "envelope or identity required"}), 400
+    if identity_plain is not None:
+        if not isinstance(identity_plain, dict):
+            return jsonify({"error": "identity must be object"}), 400
+        inner = identity_actions_mod._identity_payload_from_plain(identity_plain)
+        built, build_err = core_envelope._build_shared_envelope_for_store(
+            store,
+            json.dumps(inner, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        )
+        if built is None:
+            # Mirrors memory.add: a build failure is usually missing user/enclave
+            # public-key material, not a malformed request -> 409, not 400.
+            return jsonify({"error": build_err or "identity_envelope_failed"}), 409
+        envelope = built
     required = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
     missing = [f for f in required if not envelope.get(f)]
     if missing:
