@@ -239,6 +239,15 @@ PROACTIVE_TICK_START_DELAY_SEC = int(os.environ.get("PROACTIVE_TICK_START_DELAY_
 PROACTIVE_SCHEDULED_FIRE_ENABLED = _env_bool("PROACTIVE_SCHEDULED_FIRE_ENABLED", True)
 PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC = int(os.environ.get("PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC", "60"))
 PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC = int(os.environ.get("PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC", "5"))
+CAPTURE_TICK_ENABLED = _env_bool("FEEDLING_CAPTURE_TICK_ENABLED", True)
+CAPTURE_TICK_INTERVAL_SEC = int(os.environ.get(
+    "FEEDLING_CAPTURE_TICK_INTERVAL_SEC",
+    str(PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC),
+))
+CAPTURE_TICK_START_DELAY_SEC = int(os.environ.get(
+    "FEEDLING_CAPTURE_TICK_START_DELAY_SEC",
+    str(PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC),
+))
 PROACTIVE_MAX_REPLY_MESSAGES = int(os.environ.get("PROACTIVE_MAX_REPLY_MESSAGES", "5"))
 PROACTIVE_RECENT_CHAT_LIMIT = int(os.environ.get("PROACTIVE_RECENT_CHAT_LIMIT", "20"))
 PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT = int(os.environ.get("PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT", "50"))
@@ -2843,6 +2852,18 @@ def fire_scheduled_wakes() -> dict:
     return parsed if isinstance(parsed, dict) else {"results": [], "jobs": []}
 
 
+def fire_capture_tick() -> dict:
+    resp = httpx.post(
+        f"{FEEDLING_API_URL}/v1/capture/tick",
+        json={},
+        headers=_HEADERS,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    parsed = resp.json()
+    return parsed if isinstance(parsed, dict) else {"enqueued": False, "reason": "invalid_response"}
+
+
 def claim_proactive_job(job_id: str) -> bool:
     if not job_id:
         return False
@@ -4226,9 +4247,11 @@ def run() -> None:
     next_proactive_tick_mono = time.monotonic() + max(0, PROACTIVE_TICK_START_DELAY_SEC)
     scheduled_fire_enabled = proactive_enabled and PROACTIVE_SCHEDULED_FIRE_ENABLED
     next_scheduled_fire_mono = time.monotonic() + max(0, PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC)
+    capture_tick_enabled = CAPTURE_TICK_ENABLED
+    next_capture_tick_mono = time.monotonic() + max(0, CAPTURE_TICK_START_DELAY_SEC)
 
     log.info(
-        "starting poll loop — last_ts=%.3f last_job_ts=%.3f poll_timeout=%ds proactive=%s proactive_tick=%s tick_on=%ds tick_off=%ds scheduled_fire=%s scheduled_fire_interval=%ds",
+        "starting poll loop — last_ts=%.3f last_job_ts=%.3f poll_timeout=%ds proactive=%s proactive_tick=%s tick_on=%ds tick_off=%ds scheduled_fire=%s scheduled_fire_interval=%ds capture_tick=%s capture_tick_interval=%ds",
         last_ts,
         last_job_ts,
         POLL_TIMEOUT,
@@ -4238,6 +4261,8 @@ def run() -> None:
         PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC,
         scheduled_fire_enabled,
         PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC,
+        capture_tick_enabled,
+        CAPTURE_TICK_INTERVAL_SEC,
     )
 
     consecutive_errors = 0
@@ -4245,6 +4270,27 @@ def run() -> None:
     while _running:
         try:
             _refresh_auth_header()  # pick up a freshly-minted runtime token (Stage D)
+            if capture_tick_enabled and time.monotonic() >= next_capture_tick_mono:
+                try:
+                    capture_result = fire_capture_tick()
+                    if capture_result.get("enqueued") or str(capture_result.get("reason") or "") not in {"", "no_new_messages", "quiet_not_due", "already_captured"}:
+                        log.info(
+                            "capture tick enqueued=%s reason=%s quiet_for=%s",
+                            bool(capture_result.get("enqueued")),
+                            capture_result.get("reason"),
+                            capture_result.get("quiet_for_sec", ""),
+                        )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        capture_tick_enabled = False
+                        log.warning(
+                            "capture tick endpoint not available on this backend; "
+                            "disabling capture tick for this process"
+                        )
+                    else:
+                        raise
+                finally:
+                    next_capture_tick_mono = time.monotonic() + max(10, CAPTURE_TICK_INTERVAL_SEC)
             if proactive_enabled:
                 try:
                     if scheduled_fire_enabled and time.monotonic() >= next_scheduled_fire_mono:

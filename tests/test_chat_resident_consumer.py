@@ -2022,6 +2022,34 @@ def test_fire_scheduled_wakes_posts_backend_endpoint(monkeypatch):
     assert body["results"][0]["status"] == "fired"
 
 
+def test_fire_capture_tick_posts_backend_endpoint(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"enqueued": True, "reason": "enqueued"}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        return _Resp()
+
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    body = crc.fire_capture_tick()
+
+    assert captured["url"] == "http://localhost:5001/v1/capture/tick"
+    assert captured["json"] == {}
+    assert captured["headers"]["X-API-Key"] == "test_key_00000000"
+    assert captured["timeout"] == 15
+    assert body["enqueued"] is True
+
+
 def test_post_proactive_reply_triggers_alert_and_live_activity(monkeypatch):
     captured = {}
 

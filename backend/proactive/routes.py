@@ -9,7 +9,7 @@ from flask import Blueprint, Response, jsonify, request
 from accounts import auth
 from core import store as core_store
 from core import util
-from proactive import capture_jobs, dashboard, gate, resident_runtime_v2, service
+from proactive import capture_jobs, capture_scheduler, dashboard, gate, resident_runtime_v2, service
 from proactive.observability_v2 import ROUND3_REVIEW_LABELS_V2
 from proactive.tool_executor_v2 import (
     ToolBudgetV2, ToolExecutorV2, ToolCallV2, combined_runtime_adapters_v2,
@@ -104,13 +104,59 @@ def device_events():
         payload=payload.get("payload") if isinstance(payload.get("payload"), dict) else {},
     )
     store.append_device_event(event)
+    capture = capture_scheduler.handle_device_event(store, event)
     try:
         from perception import service as perception_service  # lazy; proactive can run without perception tests importing it
         if perception_service.perception_ingress_runtime_v2_enabled(store):
             event["perception_v2"] = perception_service.ingest_device_event_v2(store.user_id, event)
     except Exception as e:
         event["perception_v2"] = {"error": f"ingest_failed:{type(e).__name__}"}
+    event["capture"] = _capture_response_doc(capture)
     return jsonify(event)
+
+
+def _capture_response_doc(result: dict) -> dict:
+    job = result.get("job") if isinstance(result.get("job"), dict) else None
+    state = result.get("state") if isinstance(result.get("state"), dict) else {}
+    out = {
+        "enqueued": bool(result.get("enqueued")),
+        "reason": str(result.get("reason") or "")[:120],
+        "state": {
+            "last_captured_until_message_id": str(state.get("last_captured_until_message_id") or ""),
+            "last_captured_until_ts": state.get("last_captured_until_ts") or 0,
+            "pending_capture_key": str(state.get("pending_capture_key") or ""),
+            "last_capture_completed_at": state.get("last_capture_completed_at") or 0,
+            "last_seen_message_id": str(state.get("last_seen_message_id") or ""),
+            "last_seen_ts": state.get("last_seen_ts") or 0,
+            "turns_since_capture": state.get("turns_since_capture") or 0,
+            "message_count": state.get("message_count") or 0,
+        },
+    }
+    if "quiet_for_sec" in result:
+        out["quiet_for_sec"] = result.get("quiet_for_sec")
+    if job is not None:
+        out["job"] = {
+            "job_id": str(job.get("job_id") or ""),
+            "job_kind": str(job.get("job_kind") or ""),
+            "status": str(job.get("status") or ""),
+            "trigger": str(job.get("trigger") or ""),
+            "capture_key": str(job.get("capture_key") or ""),
+        }
+    return out
+
+
+@bp.route("/v1/capture/tick", methods=["POST"])
+def capture_tick():
+    store = auth.require_user()
+    payload = request.get_json(silent=True) or {}
+    now = None
+    if "now" in payload:
+        try:
+            now = float(payload.get("now"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid now"}), 400
+    result = capture_scheduler.tick_quiet_capture(store, now=now)
+    return jsonify(_capture_response_doc(result))
 
 
 @bp.route("/v1/proactive/tick", methods=["POST"])
@@ -387,6 +433,12 @@ def proactive_job_status(job_id):
     job = store.update_proactive_job(job_id, patch)
     if job is None:
         return jsonify({"error": "job_not_found"}), 404
+    if capture_jobs.is_memory_capture_job(job):
+        capture_scheduler.record_capture_job_status(
+            store,
+            job,
+            status=str(patch.get("status") or payload.get("status") or ""),
+        )
     return jsonify({"job": job})
 
 

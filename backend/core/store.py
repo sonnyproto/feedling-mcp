@@ -411,6 +411,12 @@ class UserStore:
         # broadcasts the genuine write. Emitted here (the sole new-message
         # chokepoint), never from the wake/reload path, so it can't loop.
         wake_bus.notify("chat", self.user_id)
+        try:
+            from proactive import capture_scheduler
+
+            capture_scheduler.record_chat_append(self, msg)
+        except Exception as e:
+            print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
         return msg
 
     def update_chat_message_metadata(self, msg_id: str, fields: dict) -> dict | None:

@@ -14,6 +14,7 @@ from chat import service as chat_service  # noqa: E402
 from bootstrap import gates as boot_gates  # noqa: E402
 from proactive.controls_v2 import evaluate_wake_control_v2, resolve_settings_v2  # noqa: E402
 from proactive import capture_jobs as proactive_capture_jobs  # noqa: E402
+from proactive import capture_scheduler as proactive_capture_scheduler  # noqa: E402
 from proactive import dashboard as proactive_dashboard  # noqa: E402
 from proactive import resident_runtime_v2 as proactive_resident_runtime_v2  # noqa: E402
 from proactive import routes as proactive_routes  # noqa: E402
@@ -1045,6 +1046,193 @@ def test_capture_enqueue_is_idempotent_by_capture_key(tmp_path, monkeypatch):
     assert second["job_id"] == first["job_id"]
     jobs = [row for row in store.list_proactive_jobs(since_epoch=0, limit=0) if row.get("job_kind") == "memory_capture"]
     assert len(jobs) == 1
+
+
+def _capture_test_envelope(user_id: str, msg_id: str) -> dict:
+    return {
+        "id": msg_id,
+        "v": 1,
+        "body_ct": "ct",
+        "nonce": "nonce",
+        "K_user": "k-user",
+        "K_enclave": "k-enclave",
+        "visibility": "shared",
+        "owner_user_id": user_id,
+    }
+
+
+def _memory_capture_jobs(store) -> list[dict]:
+    return [
+        row for row in store.list_proactive_jobs(since_epoch=0, limit=0)
+        if row.get("job_kind") == "memory_capture"
+    ]
+
+
+def test_capture_coordinator_dedupes_same_window_across_signals(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_CAPTURE_TURN_BACKSTOP", "1")
+    monkeypatch.setenv("FEEDLING_CAPTURE_QUIET_SEC", "0")
+    monkeypatch.setenv("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", "0")
+    appmod._stores.clear()
+
+    api_key = "test_capture_dedupe_key"
+    user_id = "usr_capture_dedupe"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+
+    msg = store.append_chat("user", "chat", _capture_test_envelope(user_id, "msg_capture_dedupe"))
+    first_jobs = _memory_capture_jobs(store)
+    assert len(first_jobs) == 1
+    assert first_jobs[0]["trigger"] == "turn_backstop"
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    background = client.post(
+        "/v1/device/events",
+        headers=headers,
+        json={
+            "source": "ios",
+            "type": "app_presence",
+            "payload": {"scene_phase": "background", "is_chat_visible": False},
+        },
+    )
+    quiet = client.post(
+        "/v1/capture/tick",
+        headers=headers,
+        json={"now": float(msg["ts"]) + 30.0},
+    )
+
+    assert background.status_code == 200
+    assert quiet.status_code == 200
+    assert background.get_json()["capture"]["enqueued"] is False
+    assert quiet.get_json()["enqueued"] is False
+    assert len(_memory_capture_jobs(store)) == 1
+
+
+def test_capture_quiet_tick_noops_without_new_messages(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_capture_quiet_noop_key"
+    user_id = "usr_capture_quiet_noop"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    client = appmod.app.test_client()
+
+    resp = client.post(
+        "/v1/capture/tick",
+        headers={"X-API-Key": api_key},
+        json={"now": 2000.0},
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["enqueued"] is False
+    assert resp.get_json()["reason"] == "no_new_messages"
+    assert _memory_capture_jobs(appmod.get_store(user_id)) == []
+
+
+def test_capture_turn_backstop_enqueues_only_when_due(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_CAPTURE_TURN_BACKSTOP", "2")
+    monkeypatch.setenv("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", "0")
+    store = appmod.UserStore("usr_capture_turn_backstop")
+
+    store.append_chat("user", "chat", _capture_test_envelope(store.user_id, "msg_turn_1"))
+    assert _memory_capture_jobs(store) == []
+
+    store.append_chat("user", "chat", _capture_test_envelope(store.user_id, "msg_turn_2"))
+    jobs = _memory_capture_jobs(store)
+
+    assert len(jobs) == 1
+    assert jobs[0]["trigger"] == "turn_backstop"
+    assert jobs[0]["window"]["until_message_id"] == "msg_turn_2"
+    assert jobs[0]["window"]["message_count"] == 2
+
+
+def test_capture_device_boundary_ignores_proactive_switches(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_CAPTURE_TURN_BACKSTOP", "999")
+    monkeypatch.setenv("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", "0")
+    appmod._stores.clear()
+
+    api_key = "test_capture_switches_off_key"
+    user_id = "usr_capture_switches_off"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.save_proactive_settings({
+        "ambient": False,
+        "scheduled": False,
+        "reminders_delivery": False,
+    })
+    store.append_chat("user", "chat", _capture_test_envelope(user_id, "msg_switches_off"))
+
+    resp = appmod.app.test_client().post(
+        "/v1/device/events",
+        headers={"X-API-Key": api_key},
+        json={
+            "source": "ios",
+            "type": "app_presence",
+            "payload": {"scene_phase": "background", "is_chat_visible": False},
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["capture"]["enqueued"] is True
+    assert len(_memory_capture_jobs(store)) == 1
+
+
+def test_capture_completion_advances_state_and_blocks_same_window(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_CAPTURE_TURN_BACKSTOP", "999")
+    monkeypatch.setenv("FEEDLING_CAPTURE_QUIET_SEC", "0")
+    monkeypatch.setenv("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", "0")
+    appmod._stores.clear()
+
+    api_key = "test_capture_completion_key"
+    user_id = "usr_capture_completion"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    msg = store.append_chat("user", "chat", _capture_test_envelope(user_id, "msg_capture_done"))
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    first = client.post(
+        "/v1/device/events",
+        headers=headers,
+        json={
+            "source": "ios",
+            "type": "app_presence",
+            "payload": {"scene_phase": "background", "is_chat_visible": False},
+        },
+    )
+    job = first.get_json()["capture"]["job"]
+    full_job = _memory_capture_jobs(store)[0]
+    done = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json={
+            "status": "completed",
+            "reason": "capture_stub_noop",
+            "capture_window": full_job["window"],
+            "capture_result": {"status": "noop"},
+        },
+    )
+    second = client.post(
+        "/v1/capture/tick",
+        headers=headers,
+        json={"now": float(msg["ts"]) + 30.0},
+    )
+
+    assert first.status_code == 200
+    assert first.get_json()["capture"]["enqueued"] is True
+    assert done.status_code == 200
+    state = proactive_capture_scheduler.load_capture_state(store)
+    assert state["pending_capture_key"] == ""
+    assert state["last_captured_until_message_id"] == "msg_capture_done"
+    assert state["turns_since_capture"] == 0
+    assert second.status_code == 200
+    assert second.get_json()["enqueued"] is False
+    assert second.get_json()["reason"] in {"no_new_messages", "already_captured"}
+    assert len(_memory_capture_jobs(store)) == 1
 
 
 def test_resident_scheduled_fire_endpoint_queues_due_timer_job(tmp_path, monkeypatch):
