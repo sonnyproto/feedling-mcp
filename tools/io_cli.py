@@ -41,7 +41,9 @@ SLOW_SIGNALS = (
 EXTRA_SIGNALS = ("focus", "audio_route")
 PERCEPTION_SIGNALS = FAST_SIGNALS + SLOW_SIGNALS + EXTRA_SIGNALS
 
-PHASE2_VERBS = ("send", "wait-for-wake", "schedule-wake", "photo")
+# Native model handles these as agent OUTPUT actions, not pull tools — kept as
+# graceful no-op stubs so an agent that tries to call them degrades cleanly.
+PHASE2_VERBS = ("send", "wait-for-wake", "schedule-wake")
 
 
 def _emit(obj, code=0):
@@ -225,10 +227,29 @@ def cmd_screen_read(args):
     _emit({"ok": False, "http_status": status, "frame_id": frame_id, "error": body}, 1)
 
 
+def cmd_photo_recent(args):
+    """Recent photo metadata (scene/time; no raw pixels). GET /v1/perception/photos.
+
+    Plaintext-safe readside, parallel to screen-recent. Raw image content
+    (/photo/<id>/content) is intentionally not exposed here — the agent uses
+    scene/metadata, not bytes."""
+    api_url, auth = _require_backend()
+    qs = urllib.parse.urlencode({"limit": args.limit})
+    status, body = _http_json("GET", f"{api_url}/v1/perception/photos?{qs}", auth)
+    if status == 200:
+        _emit({"ok": True, **body})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
 def cmd_phase2(args):
+    # send / sleep / schedule-wake / cancel-wake are NOT pull tools in the native
+    # model — the agent emits them as output actions (JSON messages/actions) which
+    # the resident consumer parses and executes. They are intentionally not CLI
+    # verbs; calling them here is a no-op stub.
     _emit({"ok": False,
-           "error": f"'{args.verb}' is not implemented yet (phase 2)",
-           "see": "docs/PERCEPTION_CLI_DESIGN.md"}, 3)
+           "error": f"'{args.verb}' is not an io_cli tool — emit it as an agent output action "
+                    f"(messages/send_message/sleep/schedule_wake), not a tool call.",
+           "see": "docs/AFULL_PLAN.md"}, 3)
 
 
 def main():
@@ -282,6 +303,10 @@ def main():
     sd.add_argument("--frame-id", dest="frame_id", default="", help="frame id; default = latest")
     sd.add_argument("--include-image", dest="include_image", action="store_true", help="include base64 JPEG (large)")
     sd.set_defaults(func=cmd_screen_read)
+
+    pr = sub.add_parser("photo-recent", help="Recent photo metadata (scene/time; no raw pixels).")
+    pr.add_argument("--limit", type=int, default=10)
+    pr.set_defaults(func=cmd_photo_recent)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")

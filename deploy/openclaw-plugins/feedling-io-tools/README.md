@@ -23,6 +23,11 @@ meant the edits were lost on any VPS rebuild.
   `screen_read` (decrypted caption/ocr of the latest frame → `io_cli.py
   screen-read`; pixels off unless `include_image`). Caption/OCR is fast;
   recent/image-heavy reads are slow.
+- **Photo** — `photo_recent` (recent photo metadata: scene/time, no raw pixels →
+  `io_cli.py photo-recent`). The agent uses scene/metadata, not bytes.
+- **Actions (send/sleep/schedule_wake/…)** are NOT plugin tools — the agent emits
+  them as output actions which the resident consumer parses. `io_cli.py
+  send/wait-for-wake/schedule-wake` are graceful no-op stubs.
 - No hardcoded paths/keys: config (openclaw.json) → env → throw. The service env
   file (`FEEDLING_API_URL`/`FEEDLING_API_KEY`/`FEEDLING_ENCLAVE_URL`) is read at
   call time.

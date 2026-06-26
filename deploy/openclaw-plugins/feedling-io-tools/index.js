@@ -228,5 +228,17 @@ export default definePluginEntry({
         ["include_image", "--include-image", "bool"],
       ])],
     });
+
+    // photo.recent — recent photo metadata (scene/time; no raw pixels).
+    registerCli({
+      name: "photo_recent",
+      description: "[slow] List recent photo metadata (scene/time; provider-safe name for photo.recent). No raw pixels — the agent uses scene/metadata.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        properties: { limit: { type: "integer", minimum: 1, maximum: 100, description: "max photos (default 10)" } },
+      },
+      build: (p) => ["photo-recent", ...flagsFromParams(p, [["limit", "--limit", "value"]])],
+    });
   },
 });
