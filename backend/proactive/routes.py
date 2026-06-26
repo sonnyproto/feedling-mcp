@@ -9,7 +9,7 @@ from flask import Blueprint, Response, jsonify, request
 from accounts import auth
 from core import store as core_store
 from core import util
-from proactive import capture_jobs, capture_scheduler, dashboard, gate, resident_runtime_v2, service
+from proactive import capture_jobs, capture_scheduler, dashboard, dream_scheduler, gate, resident_runtime_v2, service
 from proactive.observability_v2 import ROUND3_REVIEW_LABELS_V2
 
 bp = Blueprint("proactive", __name__)
@@ -134,6 +134,42 @@ def _capture_response_doc(result: dict) -> dict:
     return out
 
 
+def _dream_response_doc(result: dict) -> dict:
+    job = result.get("job") if isinstance(result.get("job"), dict) else None
+    state = result.get("state") if isinstance(result.get("state"), dict) else {}
+    out = {
+        "enqueued": bool(result.get("enqueued")),
+        "reason": str(result.get("reason") or "")[:120],
+        "new_cards": result.get("new_cards") or 0,
+        "new_turns": result.get("new_turns") or 0,
+        "state": {
+            "last_dream_completed_at": state.get("last_dream_completed_at") or 0,
+            "last_dreamed_until": str(state.get("last_dreamed_until") or ""),
+            "last_dreamed_card_count": state.get("last_dreamed_card_count") or 0,
+            "last_dreamed_turn_count": state.get("last_dreamed_turn_count") or 0,
+            "last_dream_signature": str(state.get("last_dream_signature") or ""),
+            "pending_dream_key": str(state.get("pending_dream_key") or ""),
+        },
+    }
+    snapshot = result.get("snapshot") if isinstance(result.get("snapshot"), dict) else {}
+    if snapshot:
+        out["snapshot"] = {
+            "card_count": snapshot.get("card_count") or 0,
+            "turn_count": snapshot.get("turn_count") or 0,
+            "signature": str(snapshot.get("signature") or ""),
+            "last_until": str(snapshot.get("last_until") or ""),
+        }
+    if job is not None:
+        out["job"] = {
+            "job_id": str(job.get("job_id") or ""),
+            "job_kind": str(job.get("job_kind") or ""),
+            "status": str(job.get("status") or ""),
+            "trigger": str(job.get("trigger") or ""),
+            "dream_key": str(job.get("dream_key") or ""),
+        }
+    return out
+
+
 @bp.route("/v1/capture/tick", methods=["POST"])
 def capture_tick():
     store = auth.require_user()
@@ -145,7 +181,23 @@ def capture_tick():
         except (TypeError, ValueError):
             return jsonify({"error": "invalid now"}), 400
     result = capture_scheduler.tick_quiet_capture(store, now=now)
-    return jsonify(_capture_response_doc(result))
+    out = _capture_response_doc(result)
+    out["dream"] = _dream_response_doc(dream_scheduler.tick_memory_dream(store, now=now))
+    return jsonify(out)
+
+
+@bp.route("/v1/dream/tick", methods=["POST"])
+def dream_tick():
+    store = auth.require_user()
+    payload = request.get_json(silent=True) or {}
+    now = None
+    if "now" in payload:
+        try:
+            now = float(payload.get("now"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid now"}), 400
+    result = dream_scheduler.tick_memory_dream(store, now=now, force=bool(payload.get("force")))
+    return jsonify(_dream_response_doc(result))
 
 
 @bp.route("/v1/proactive/tick", methods=["POST"])
@@ -235,6 +287,8 @@ def _job_status_patch(payload: dict, *, default_status: str = "") -> dict:
         }
     if isinstance(payload.get("capture_result"), dict):
         patch["capture_result"] = _safe_capture_doc(payload.get("capture_result"), max_items=20)
+    if isinstance(payload.get("dream_result"), dict):
+        patch["dream_result"] = _safe_capture_doc(payload.get("dream_result"), max_items=20)
     if isinstance(payload.get("capture_window"), dict):
         patch["capture_window"] = _safe_capture_doc(payload.get("capture_window"), max_items=12)
     if isinstance(payload.get("memory_action_status"), (dict, list)):
@@ -243,7 +297,9 @@ def _job_status_patch(payload: dict, *, default_status: str = "") -> dict:
         patch["memory_action_status"] = str(payload.get("memory_action_status"))[:500]
     if isinstance(payload.get("memory_results"), list):
         patch["memory_results"] = _safe_capture_doc(payload.get("memory_results"), max_items=20)
-    for key in ("cards_added", "cards_superseded"):
+    if isinstance(payload.get("questions"), list):
+        patch["questions"] = _safe_capture_doc(payload.get("questions"), max_items=10)
+    for key in ("cards_added", "cards_superseded", "cards_merged"):
         if key in payload:
             try:
                 patch[key] = max(0, int(payload.get(key) or 0))
@@ -364,7 +420,7 @@ def _resident_pollable_pending_jobs(store, *, since: float, limit: int, runtime_
     for job in store.list_proactive_jobs(since_epoch=since, limit=read_limit):
         if str(job.get("status") or "pending") != "pending":
             continue
-        if capture_jobs.is_memory_capture_job(job):
+        if capture_jobs.is_memory_maintenance_job(job):
             out.append(_with_resident_runtime_v2(job, runtime_profile))
             if len(out) >= limit:
                 break
@@ -424,6 +480,12 @@ def proactive_job_status(job_id):
         return jsonify({"error": "job_not_found"}), 404
     if capture_jobs.is_memory_capture_job(job):
         capture_scheduler.record_capture_job_status(
+            store,
+            job,
+            status=str(patch.get("status") or payload.get("status") or ""),
+        )
+    if capture_jobs.is_memory_dream_job(job):
+        dream_scheduler.record_dream_job_status(
             store,
             job,
             status=str(patch.get("status") or payload.get("status") or ""),

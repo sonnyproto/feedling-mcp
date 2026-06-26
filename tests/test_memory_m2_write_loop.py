@@ -147,6 +147,69 @@ def test_memory_supersede_soft_retires_old_card_and_new_card_is_recallable(monke
     assert readside_core.memory_available(new_card, "usr_m2") is True
 
 
+def test_memory_supersede_prebuilt_envelope_accepts_multiple_old_cards(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_m2")
+    old_a = {
+        "v": 1,
+        "id": "mem_old_a",
+        "type": "fact",
+        "owner_user_id": "usr_m2",
+        "visibility": "shared",
+        "body_ct": json.dumps({"summary": "A", "description": "A"}),
+        "nonce": "nonce_a",
+        "K_user": "ku_a",
+        "K_enclave": "ke_a",
+        "enclave_pk_fpr": "fpr_test",
+        "occurred_at": "2026-06-20",
+        "created_at": "2026-06-20",
+        "updated_at": "2026-06-20",
+        "source": "memory_capture",
+        "status": "active",
+    }
+    old_b = {**old_a, "id": "mem_old_b", "nonce": "nonce_b", "K_user": "ku_b", "K_enclave": "ke_b"}
+    moments = [old_a, old_b]
+    saved = _install_memory_action_fakes(monkeypatch, moments)
+    envelope = {
+        "id": "mem_new_dream",
+        "body_ct": json.dumps({"summary": "Merged A+B", "content": "Merged dream card."}),
+        "nonce": "nonce_new",
+        "K_user": "ku_new",
+        "K_enclave": "ke_new",
+        "enclave_pk_fpr": "fpr_test",
+        "visibility": "shared",
+        "owner_user_id": "usr_m2",
+        "type": "fact",
+        "occurred_at": "2026-06-21",
+        "source": "memory_dream",
+        "importance": 0.8,
+        "pulse": 0.4,
+    }
+
+    body, status = memory_actions._execute_memory_actions(store, "api_key", [
+        {
+            "type": "memory.supersede",
+            "supersedes": ["mem_old_a", "mem_old_b"],
+            "envelope": envelope,
+            "capture_mode": "memory_dream",
+            "reason": "Dream merge.",
+        }
+    ])
+
+    assert status == 200
+    assert body["status"] == "ok"
+    assert len(saved) == 3
+    old_after = {moment["id"]: moment for moment in saved if moment["id"].startswith("mem_old_")}
+    new_card = next(moment for moment in saved if moment["id"] == "mem_new_dream")
+    assert set(old_after) == {"mem_old_a", "mem_old_b"}
+    assert all(moment["status"] == "superseded" for moment in old_after.values())
+    assert all(moment["superseded_by"] == "mem_new_dream" for moment in old_after.values())
+    assert all(moment["is_archived"] is True for moment in old_after.values())
+    assert new_card["status"] == "active"
+    assert new_card["source"] == "memory_dream"
+    assert new_card["supersedes"] == ["mem_old_a", "mem_old_b"]
+    assert body["results"][0]["superseded_ids"] == ["mem_old_a", "mem_old_b"]
+
+
 def test_coerce_runtime_action_maps_memory_supersede_to_executor_action():
     action = {
         "type": "memory.supersede",

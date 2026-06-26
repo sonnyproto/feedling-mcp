@@ -120,6 +120,7 @@ except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
 from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards
+from memory.dream_prompt_v1 import build_dream_prompt, parse_dream_consolidations
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -246,6 +247,11 @@ PROACTIVE_STALE_CHAT_FALLBACK_LIMIT = int(os.environ.get("PROACTIVE_STALE_CHAT_F
 CAPTURE_HISTORY_LIMIT = int(os.environ.get("FEEDLING_CAPTURE_HISTORY_LIMIT", "160"))
 CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "12000"))
 CAPTURE_CONTEXT_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_CONTEXT_MAX_CHARS", "4000"))
+DREAM_MEMORY_INDEX_LIMIT = int(os.environ.get("FEEDLING_DREAM_MEMORY_INDEX_LIMIT", "0"))
+DREAM_FETCH_BATCH_SIZE = int(os.environ.get("FEEDLING_DREAM_FETCH_BATCH_SIZE", "100"))
+DREAM_RECENT_CHAT_LIMIT = int(os.environ.get("FEEDLING_DREAM_RECENT_CHAT_LIMIT", "80"))
+DREAM_MEMORY_MAX_CARDS = int(os.environ.get("FEEDLING_DREAM_MEMORY_MAX_CARDS", "200"))
+DREAM_MAX_CONSOLIDATIONS = int(os.environ.get("FEEDLING_DREAM_MAX_CONSOLIDATIONS", "12"))
 CONSUMER_ID = os.environ.get(
     "CONSUMER_ID",
     f"{socket.gethostname()}:{os.getpid()}",
@@ -3468,6 +3474,13 @@ def _is_memory_capture_job(job: dict) -> bool:
     )
 
 
+def _is_memory_dream_job(job: dict) -> bool:
+    return (
+        str((job or {}).get("job_kind") or "").strip() == "memory_dream"
+        or str((job or {}).get("source") or "").strip() == "memory_dream"
+    )
+
+
 def _resident_perception_trend(signal: str, field: str) -> dict:
     """Best-effort GET of one signal's rolling baseline/delta (Tier 2 history)."""
     try:
@@ -3593,6 +3606,31 @@ def _capture_get_json(
         return body if isinstance(body, dict) else {}
     except Exception as e:
         log.warning("capture context fetch failed path=%s error=%s", path, e)
+        return {}
+
+
+def _capture_post_json(
+    path: str,
+    *,
+    payload: dict[str, Any] | None = None,
+    timeout: int = 20,
+    base_url: str | None = None,
+) -> dict:
+    root = (base_url or FEEDLING_API_URL).rstrip("/")
+    verify_tls = not (FEEDLING_ENCLAVE_URL and root == FEEDLING_ENCLAVE_URL)
+    try:
+        resp = httpx.post(
+            f"{root}{path}",
+            json=payload or {},
+            headers=_HEADERS,
+            timeout=timeout,
+            verify=verify_tls,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+    except Exception as e:
+        log.warning("capture context post failed path=%s error=%s", path, e)
         return {}
 
 
@@ -3792,7 +3830,7 @@ def _capture_agent_reply_text(result: Any) -> str:
     return str(result or "")
 
 
-def _capture_build_envelope(card: dict, *, occurred_at: str) -> dict:
+def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture") -> dict:
     if not _ENCRYPTION_AVAILABLE:
         raise RuntimeError("capture_encryption_unavailable")
     if not _refresh_whoami_for_encrypted_reply():
@@ -3824,7 +3862,7 @@ def _capture_build_envelope(card: dict, *, occurred_at: str) -> dict:
         "importance": float(card.get("importance") or 0),
         "pulse": float(card.get("pulse") or 0),
         "anchor_memory_ids": [],
-        "source": "memory_capture",
+        "source": str(source or "memory_capture")[:80],
         "last_referenced_at": occurred_at,
     })
     return envelope
@@ -4027,6 +4065,348 @@ def _process_capture_jobs(jobs: list) -> float:
             cards_added,
             cards_superseded,
             bool(identity),
+        )
+    return latest
+
+
+def _dream_index_items() -> list[dict]:
+    body = _capture_post_json(
+        "/v1/memory/index",
+        payload={"limit": max(0, DREAM_MEMORY_INDEX_LIMIT)},
+        timeout=30,
+    )
+    items = body.get("items") if isinstance(body.get("items"), list) else []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        memory_id = str(item.get("id") or "").strip()
+        if not memory_id or memory_id in seen:
+            continue
+        seen.add(memory_id)
+        out.append(dict(item))
+        if len(out) >= max(1, DREAM_MEMORY_MAX_CARDS):
+            break
+    return out
+
+
+def _dream_fetch_items(ids: list[str]) -> dict[str, dict]:
+    if not ids:
+        return {}
+    by_id: dict[str, dict] = {}
+    batch_size = max(1, min(DREAM_FETCH_BATCH_SIZE, 200))
+    for offset in range(0, len(ids), batch_size):
+        batch = ids[offset : offset + batch_size]
+        body = _capture_post_json(
+            "/v1/memory/fetch",
+            payload={"ids": batch, "limit": len(batch)},
+            timeout=30,
+        )
+        for item in body.get("items") if isinstance(body.get("items"), list) else []:
+            if isinstance(item, dict) and str(item.get("id") or "").strip():
+                by_id[str(item.get("id") or "").strip()] = dict(item)
+    return by_id
+
+
+def _dream_card_field(card: dict, *names: str) -> str:
+    for name in names:
+        value = card.get(name)
+        if isinstance(value, str) and value.strip():
+            return re.sub(r"\s+", " ", value.strip())
+    return ""
+
+
+def _dream_card_threads(card: dict) -> list[str]:
+    raw = card.get("threads") or card.get("thread") or []
+    values = raw if isinstance(raw, list) else [raw]
+    out: list[str] = []
+    for item in values:
+        text = str(item or "").strip()
+        if text and text not in out:
+            out.append(text[:80])
+    return out[:8]
+
+
+def _dream_cards_context() -> tuple[str, dict[str, dict]]:
+    index_items = _dream_index_items()
+    ids = [str(item.get("id") or "").strip() for item in index_items if str(item.get("id") or "").strip()]
+    fetched = _dream_fetch_items(ids)
+    merged: list[dict] = []
+    by_id: dict[str, dict] = {}
+    for item in index_items:
+        memory_id = str(item.get("id") or "").strip()
+        if not memory_id:
+            continue
+        card = {**item, **fetched.get(memory_id, {})}
+        merged.append(card)
+        by_id[memory_id] = card
+    lines: list[str] = []
+    for card in merged:
+        memory_id = str(card.get("id") or "").strip()
+        bucket = _dream_card_field(card, "bucket", "category")
+        threads = _dream_card_threads(card)
+        summary = _dream_card_field(card, "summary", "title", "description")
+        content = _dream_card_field(card, "content", "body", "text", "plaintext")
+        parts = [f"- id={memory_id}"]
+        if bucket:
+            parts.append(f"bucket={bucket}")
+        if threads:
+            parts.append("threads=" + ",".join(threads))
+        if summary:
+            parts.append(f"summary={summary[:500]}")
+        if content and content != summary:
+            parts.append(f"content={content[:900]}")
+        lines.append(" | ".join(parts))
+    text = "\n".join(lines).strip()
+    return (text or "（暂无卡）")[:20000], by_id
+
+
+def _dream_recent_conversations_context() -> str:
+    try:
+        history = get_decrypted_history(since=0, limit=max(1, min(DREAM_RECENT_CHAT_LIMIT, 240)))
+    except Exception as e:
+        log.warning("dream recent conversation fetch failed: %s", e)
+        return "（这几天没有可读对话）"
+    live = _capture_live_history(history)
+    if not live:
+        return "（这几天没有新对话）"
+    lines: list[str] = []
+    for msg in live[-max(1, min(DREAM_RECENT_CHAT_LIMIT, 240)):]:
+        ts = _message_ts_for_context(msg)
+        lines.append(
+            f"- [{_format_message_time(ts)}] {_capture_message_role(msg)}: "
+            f"{msg.get('_capture_text') or _capture_message_text(msg)}"
+        )
+    text = "\n".join(lines).strip()
+    return text[-12000:] if len(text) > 12000 else text
+
+
+def _dream_actions_from_consolidations(
+    consolidations: list[dict],
+    *,
+    card_map: dict[str, dict],
+    occurred_at: str,
+) -> tuple[list[dict], int, int, int]:
+    actions: list[dict] = []
+    cards_merged = 0
+    cards_thickened = 0
+    cards_superseded = 0
+    for row in consolidations[: max(1, DREAM_MAX_CONSOLIDATIONS)]:
+        op = str(row.get("op") or "").strip().lower()
+        card_ids = [
+            str(memory_id or "").strip()
+            for memory_id in (row.get("card_ids") if isinstance(row.get("card_ids"), list) else [])
+            if str(memory_id or "").strip()
+        ]
+        card_ids = list(dict.fromkeys(card_ids))
+        if not card_ids:
+            continue
+        result = row.get("result") if isinstance(row.get("result"), dict) else {}
+        card = {
+            "type": "fact",
+            "bucket": str(result.get("bucket") or "").strip(),
+            "threads": list(result.get("threads") or []),
+            "summary": str(result.get("summary") or "").strip(),
+            "content": str(result.get("content") or result.get("summary") or "").strip(),
+            "importance": float(result.get("importance") or 0),
+            "pulse": float(result.get("pulse") or 0),
+        }
+        envelope = _capture_build_envelope(card, occurred_at=occurred_at, source="memory_dream")
+        actions.append({
+            "type": "memory.supersede",
+            "supersedes": card_ids,
+            "envelope": envelope,
+            "reason": f"Memory dream {op} consolidation.",
+            "capture_mode": "memory_dream",
+            "dream_op": op,
+            "dream_card_ids": card_ids,
+        })
+        if op == "merge":
+            cards_merged += 1
+        elif op == "thicken":
+            cards_thickened += 1
+        cards_superseded += len(card_ids)
+    if consolidations and not actions:
+        raise ValueError("dream_no_memory_actions")
+    return actions, cards_merged, cards_thickened, cards_superseded
+
+
+def _process_dream_jobs(jobs: list) -> float:
+    """Realize memory_dream jobs through the native resident agent.
+
+    Dream is background memory organization. It writes only memory actions and
+    job status; it never posts chat or uses delivery gates.
+    """
+    latest = 0.0
+    for job in jobs:
+        ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
+        latest = max(latest, ts)
+        if not _is_memory_dream_job(job):
+            continue
+        key = _proactive_job_key(job)
+        if not _mark_seen(key):
+            log.debug("skipping already-processed dream job key=%s", key)
+            continue
+        job_id = str(job.get("job_id") or "")
+        try:
+            if not claim_proactive_job(job_id):
+                log.info("dream job not claimed id=%s", job_id)
+                continue
+        except Exception as e:
+            log.error("dream job claim failed id=%s: %s", job_id, e)
+            continue
+        update_proactive_job_status(job_id, "realizing")
+        cards_text, card_map = _dream_cards_context()
+        if not card_map:
+            update_proactive_job_status(
+                job_id,
+                "completed",
+                "dream_no_cards_available",
+                extra={
+                    "dream_result": {"status": "noop", "reason": "dream_no_cards_available", "job_kind": "memory_dream"},
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": [],
+                    "noop_reason": "dream_no_cards_available",
+                },
+            )
+            continue
+        recent_text = _dream_recent_conversations_context()
+        _identity, ai_name, user_name, _identity_text = _capture_identity_context()
+        prompt = build_dream_prompt(
+            ai_name=ai_name,
+            user_name=user_name,
+            cards=cards_text,
+            recent_conversations=recent_text,
+        )
+        try:
+            reply_text = _capture_agent_reply_text(call_agent(prompt))
+        except Exception as e:
+            reason = f"dream_agent_call_failed:{type(e).__name__}"
+            log.error("dream agent call failed id=%s: %s", job_id, e)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "dream_result": {"status": "failed", "reason": reason, "job_kind": "memory_dream"},
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": [],
+                    "noop_reason": reason,
+                },
+            )
+            continue
+        consolidations, questions, err = parse_dream_consolidations(reply_text)
+        if err:
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                err,
+                extra={
+                    "dream_result": {"status": "failed", "reason": err, "job_kind": "memory_dream"},
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": questions,
+                    "noop_reason": err,
+                },
+            )
+            continue
+        if not consolidations:
+            update_proactive_job_status(
+                job_id,
+                "completed",
+                "dream_nothing_to_consolidate",
+                extra={
+                    "dream_result": {
+                        "status": "noop",
+                        "reason": "dream_nothing_to_consolidate",
+                        "job_kind": "memory_dream",
+                        "questions": len(questions),
+                    },
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": questions,
+                    "noop_reason": "dream_nothing_to_consolidate",
+                },
+            )
+            log.info("dream job completed noop id=%s questions=%d", job_id, len(questions))
+            continue
+        try:
+            occurred_at = _format_message_time(time.time())
+            actions, cards_merged, cards_thickened, cards_superseded = _dream_actions_from_consolidations(
+                consolidations,
+                card_map=card_map,
+                occurred_at=occurred_at,
+            )
+            memory_result = execute_memory_actions(actions)
+        except ValueError as e:
+            reason = str(e) or "dream_invalid_memory_action"
+            log.error("dream memory action invalid id=%s: %s", job_id, e)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "dream_result": {"status": "failed", "reason": reason, "job_kind": "memory_dream"},
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": questions,
+                    "noop_reason": reason,
+                    "memory_action_status": {"status": "failed", "reason": reason},
+                },
+            )
+            continue
+        except Exception as e:
+            reason = f"dream_memory_write_failed:{type(e).__name__}"
+            log.error("dream memory write failed id=%s: %s", job_id, e)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "dream_result": {"status": "failed", "reason": reason, "job_kind": "memory_dream"},
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": questions,
+                    "noop_reason": reason,
+                    "memory_action_status": {"status": "failed", "reason": str(e)[:500]},
+                },
+            )
+            continue
+        update_proactive_job_status(
+            job_id,
+            "completed",
+            "dream_memory_actions_applied",
+            extra={
+                "dream_result": {
+                    "status": "ok",
+                    "job_kind": "memory_dream",
+                    "consolidations": len(consolidations),
+                    "actions": len(actions),
+                    "questions": len(questions),
+                    "cards_thickened": cards_thickened,
+                },
+                "memory_action_status": {
+                    "status": memory_result.get("status", "ok"),
+                    "results": len(memory_result.get("results") or []),
+                    "effects": len(memory_result.get("effects") or []),
+                },
+                "memory_results": memory_result.get("results") or [],
+                "cards_merged": cards_merged,
+                "cards_superseded": cards_superseded,
+                "questions": questions,
+            },
+        )
+        log.info(
+            "dream job completed id=%s consolidations=%d actions=%d merged=%d superseded=%d questions=%d",
+            job_id,
+            len(consolidations),
+            len(actions),
+            cards_merged,
+            cards_superseded,
+            len(questions),
         )
     return latest
 
@@ -4287,12 +4667,20 @@ def _process_resident_jobs(jobs: list) -> float:
         job for job in (jobs or [])
         if isinstance(job, dict) and _is_memory_capture_job(job)
     ]
+    dream_jobs = [
+        job for job in (jobs or [])
+        if isinstance(job, dict) and _is_memory_dream_job(job)
+    ]
     proactive_jobs = [
         job for job in (jobs or [])
-        if not (isinstance(job, dict) and _is_memory_capture_job(job))
+        if not (
+            isinstance(job, dict)
+            and (_is_memory_capture_job(job) or _is_memory_dream_job(job))
+        )
     ]
     return max(
         _process_capture_jobs(capture_jobs) if capture_jobs else 0.0,
+        _process_dream_jobs(dream_jobs) if dream_jobs else 0.0,
         _process_proactive_jobs(proactive_jobs) if proactive_jobs else 0.0,
     )
 

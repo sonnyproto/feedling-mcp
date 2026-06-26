@@ -55,6 +55,16 @@ def _memory_action_list(value, max_items: int = 8, max_chars: int = 80) -> list[
     return out
 
 
+def _memory_supersedes_list(action: dict, *, max_items: int = 20) -> list[str]:
+    for key in ("supersedes", "old_id", "target_id", "memory_id"):
+        if key not in action:
+            continue
+        ids = _memory_action_list(action.get(key), max_items=max_items, max_chars=160)
+        if ids:
+            return ids
+    return []
+
+
 def _memory_default_bucket(value) -> str:
     mem_type = str(value or "").strip().lower()
     if mem_type in {"moment", "quote"}:
@@ -527,14 +537,8 @@ def _memory_supersede_action(store: UserStore, api_key: str | None, action: dict
         return _memory_supersede_envelope_action(store, action)
 
     raw = action.get("memory") if isinstance(action.get("memory"), dict) else {}
-    old_id = _memory_action_text(
-        action.get("supersedes")
-        or action.get("old_id")
-        or action.get("target_id")
-        or action.get("memory_id"),
-        160,
-    )
-    if not old_id:
+    old_ids = _memory_supersedes_list(action)
+    if not old_ids:
         return {"status": "error", "error": "supersedes_required", "action": "memory.supersede"}, [], 400
 
     mem_type = str(raw.get("type") or "fact").strip().lower()
@@ -550,24 +554,31 @@ def _memory_supersede_action(store: UserStore, api_key: str | None, action: dict
     if not isinstance(anchor_ids, list):
         return {"status": "error", "error": "anchor_memory_ids_must_be_list", "action": "memory.supersede"}, [], 400
     moments = memory_service._load_moments(store)
-    old_idx = next((i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == old_id), None)
-    if old_idx is None:
-        return {"status": "error", "error": "not_found", "action": "memory.supersede"}, [], 404
-    old = moments[old_idx]
-    if old.get("owner_user_id") != store.user_id:
+    old_indices: list[int] = []
+    missing: list[str] = []
+    for old_id in old_ids:
+        idx = next((i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == old_id), None)
+        if idx is None:
+            missing.append(old_id)
+        else:
+            old_indices.append(idx)
+    if missing:
+        return {"status": "error", "error": "not_found", "missing": missing, "action": "memory.supersede"}, [], 404
+    old_cards = [moments[idx] for idx in old_indices]
+    if any(old.get("owner_user_id") != store.user_id for old in old_cards):
         return {"status": "error", "error": "not_owned", "action": "memory.supersede"}, [], 403
 
     ok, err = _memory_validate_write(store, moments, mem_type=mem_type, anchor_ids=anchor_ids)
     if not ok:
         return {"status": "error", **(err or {}), "action": "memory.supersede"}, [], 400
 
-    old_inner, _old_inner_err = _memory_plain_from_envelope(old, api_key)
+    old_inner, _old_inner_err = _memory_plain_from_envelope(old_cards[0], api_key)
     inherited = _memory_inheritable_inner_fields(old_inner)
     raw_for_inner = {**inherited, **raw, "type": mem_type, "title": title, "description": description}
-    if "importance" not in raw_for_inner and old.get("importance") is not None:
-        raw_for_inner["importance"] = old.get("importance")
-    if "pulse" not in raw_for_inner and old.get("pulse") is not None:
-        raw_for_inner["pulse"] = old.get("pulse")
+    if "importance" not in raw_for_inner and old_cards[0].get("importance") is not None:
+        raw_for_inner["importance"] = old_cards[0].get("importance")
+    if "pulse" not in raw_for_inner and old_cards[0].get("pulse") is not None:
+        raw_for_inner["pulse"] = old_cards[0].get("pulse")
 
     inner = _memory_inner_from_action(raw_for_inner)
     envelope, env_err = _build_memory_envelope_for_store(store, inner)
@@ -577,29 +588,36 @@ def _memory_supersede_action(store: UserStore, api_key: str | None, action: dict
     envelope["occurred_at"] = _memory_action_text(raw.get("occurred_at") or core_util._now_iso(), 80)
     envelope["source"] = _memory_action_text(raw.get("source") or action.get("source") or "hosted_runtime_state", 80)
     _memory_apply_v1_metadata(envelope, raw_for_inner, source=envelope["source"])
-    envelope["supersedes"] = [old_id]
+    envelope["supersedes"] = list(old_ids)
     if anchor_ids:
         envelope["anchor_memory_ids"] = list(anchor_ids)
     new_moment = _memory_record_from_envelope(store, envelope)
 
     now = core_util._now_iso()
-    retired = dict(old)
-    retired["status"] = "superseded"
-    retired["superseded_by"] = new_moment["id"]
-    retired["updated_at"] = now
-    retired["is_archived"] = True
-    retired["archived_at"] = now
-    retired["archive_reason"] = f"superseded_by:{new_moment['id']}"
-
-    moments[old_idx] = retired
+    retired_docs: list[dict] = []
+    for old_idx in old_indices:
+        retired = dict(moments[old_idx])
+        retired["status"] = "superseded"
+        retired["superseded_by"] = new_moment["id"]
+        retired["updated_at"] = now
+        retired["is_archived"] = True
+        retired["archived_at"] = now
+        retired["archive_reason"] = f"superseded_by:{new_moment['id']}"
+        moments[old_idx] = retired
+        retired_docs.append({
+            "id": retired["id"],
+            "status": "superseded",
+            "superseded_by": new_moment["id"],
+        })
     moments.append(new_moment)
     memory_service._save_moments(store, moments)
     change = memory_service._append_memory_change(store, {
         "action": "supersede",
         "memory_id": new_moment["id"],
-        "supersedes": old_id,
+        "supersedes": list(old_ids),
         "type": mem_type,
         "reason": _memory_action_text(action.get("reason") or "Memory superseded from chat.", 500),
+        "capture_mode": action.get("capture_mode") or "",
         "source_chat_message_ids": action.get("source_chat_message_ids") or [],
         "anchor_memory_ids": anchor_ids,
     })
@@ -607,38 +625,41 @@ def _memory_supersede_action(store: UserStore, api_key: str | None, action: dict
         "type": "memory_superseded",
         "action": "memory.supersede",
         "memory_id": new_moment["id"],
-        "supersedes": old_id,
+        "supersedes": old_ids[0] if len(old_ids) == 1 else list(old_ids),
+        "superseded_ids": list(old_ids),
         "fields": ["created", "status", "supersedes", "superseded_by"],
     }
     return {
         "status": "ok",
         "action": "memory.supersede",
         "memory": {"id": new_moment["id"], "type": mem_type, "occurred_at": new_moment["occurred_at"], "status": "active"},
-        "superseded": {"id": old_id, "status": "superseded", "superseded_by": new_moment["id"]},
+        "superseded": retired_docs[0] if len(retired_docs) == 1 else retired_docs,
+        "superseded_ids": list(old_ids),
         "change": change,
     }, [effect], 201
 
 
 def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
-    old_id = _memory_action_text(
-        action.get("supersedes")
-        or action.get("old_id")
-        or action.get("target_id")
-        or action.get("memory_id"),
-        160,
-    )
-    if not old_id:
+    old_ids = _memory_supersedes_list(action)
+    if not old_ids:
         return {"status": "error", "error": "supersedes_required", "action": "memory.supersede"}, [], 400
     envelope = dict(action.get("envelope") or {})
     moments = memory_service._load_moments(store)
-    old_idx = next((i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == old_id), None)
-    if old_idx is None:
-        return {"status": "error", "error": "not_found", "action": "memory.supersede"}, [], 404
-    old = moments[old_idx]
-    if old.get("owner_user_id") != store.user_id:
+    old_indices: list[int] = []
+    missing: list[str] = []
+    for old_id in old_ids:
+        idx = next((i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == old_id), None)
+        if idx is None:
+            missing.append(old_id)
+        else:
+            old_indices.append(idx)
+    if missing:
+        return {"status": "error", "error": "not_found", "missing": missing, "action": "memory.supersede"}, [], 404
+    old_cards = [moments[idx] for idx in old_indices]
+    if any(old.get("owner_user_id") != store.user_id for old in old_cards):
         return {"status": "error", "error": "not_owned", "action": "memory.supersede"}, [], 403
 
-    envelope["supersedes"] = [old_id]
+    envelope["supersedes"] = list(old_ids)
     ok, err = _memory_validate_prebuilt_envelope(
         store,
         moments,
@@ -650,24 +671,31 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
 
     new_moment = _memory_record_from_prebuilt_envelope(store, envelope)
     now = core_util._now_iso()
-    retired = dict(old)
-    retired["status"] = "superseded"
-    retired["superseded_by"] = new_moment["id"]
-    retired["updated_at"] = now
-    retired["is_archived"] = True
-    retired["archived_at"] = now
-    retired["archive_reason"] = f"superseded_by:{new_moment['id']}"
-
-    moments[old_idx] = retired
+    retired_docs: list[dict] = []
+    for old_idx in old_indices:
+        retired = dict(moments[old_idx])
+        retired["status"] = "superseded"
+        retired["superseded_by"] = new_moment["id"]
+        retired["updated_at"] = now
+        retired["is_archived"] = True
+        retired["archived_at"] = now
+        retired["archive_reason"] = f"superseded_by:{new_moment['id']}"
+        moments[old_idx] = retired
+        retired_docs.append({
+            "id": retired["id"],
+            "status": "superseded",
+            "superseded_by": new_moment["id"],
+        })
     moments.append(new_moment)
     memory_service._save_moments(store, moments)
     anchor_ids = envelope.get("anchor_memory_ids") or []
     change = memory_service._append_memory_change(store, {
         "action": "supersede",
         "memory_id": new_moment["id"],
-        "supersedes": old_id,
+        "supersedes": list(old_ids),
         "type": new_moment.get("type", ""),
         "reason": _memory_action_text(action.get("reason") or "Memory superseded from encrypted tool action.", 500),
+        "capture_mode": action.get("capture_mode") or "",
         "source_chat_message_ids": action.get("source_chat_message_ids") or [],
         "anchor_memory_ids": anchor_ids,
     })
@@ -675,7 +703,8 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
         "type": "memory_superseded",
         "action": "memory.supersede",
         "memory_id": new_moment["id"],
-        "supersedes": old_id,
+        "supersedes": old_ids[0] if len(old_ids) == 1 else list(old_ids),
+        "superseded_ids": list(old_ids),
         "fields": ["created", "status", "supersedes", "superseded_by"],
     }
     return {
@@ -687,7 +716,8 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
             "occurred_at": new_moment.get("occurred_at", ""),
             "status": new_moment.get("status", "active"),
         },
-        "superseded": {"id": old_id, "status": "superseded", "superseded_by": new_moment["id"]},
+        "superseded": retired_docs[0] if len(retired_docs) == 1 else retired_docs,
+        "superseded_ids": list(old_ids),
         "change": change,
     }, [effect], 201
 

@@ -1533,6 +1533,122 @@ def _capture_final_status(captured):
     return captured["statuses"][-1]
 
 
+def _install_dream_job_harness(monkeypatch, agent_reply):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    captured = {
+        "statuses": [],
+        "proactive_called": False,
+        "prompts": [],
+        "actions": [],
+        "envelope_plaintexts": [],
+        "envelope_kwargs": [],
+        "post_called": False,
+    }
+
+    history = [
+        {"id": "msg_dream_a", "role": "user", "content": "我最近都喝燕麦奶。", "ts": 300.0},
+        {"id": "msg_dream_b", "role": "assistant", "content": "我记住了。", "ts": 360.0},
+    ]
+    index_items = [
+        {"id": "mem_a", "summary": "Seven likes oat milk.", "bucket": "life", "threads": ["coffee"]},
+        {"id": "mem_b", "summary": "Seven often orders oat latte.", "bucket": "life", "threads": ["coffee"]},
+        {"id": "mem_c", "summary": "Seven drinks coffee in the morning.", "bucket": "routine", "threads": ["coffee"]},
+    ]
+    fetch_items = [
+        {**item, "content": item["summary"] + " Full card."}
+        for item in index_items
+    ]
+    job = {
+        "job_id": "dream_dispatch",
+        "job_kind": "memory_dream",
+        "source": "memory_dream",
+        "status": "pending",
+        "trigger": "nightly_dream",
+        "dream_key": "dream:dispatch",
+        "dream_stats": {"card_count": 3, "new_cards": 3},
+        "dream_until": {"signature": "sig_dispatch"},
+        "ts": 333.0,
+    }
+
+    def _agent(prompt, *_args, **_kwargs):
+        captured["prompts"].append(prompt)
+        return agent_reply
+
+    def _fail_post(*_args, **_kwargs):
+        captured["post_called"] = True
+        raise AssertionError("dream job must not write chat")
+
+    def _proactive_handler(_jobs):
+        captured["proactive_called"] = True
+        return 999.0
+
+    def _status(job_id, status, reason="", **kwargs):
+        captured["statuses"].append((job_id, status, reason, kwargs))
+
+    def _post_json(path, *, payload=None, **_kwargs):
+        if path == "/v1/memory/index":
+            return {"items": index_items}
+        if path == "/v1/memory/fetch":
+            ids = set((payload or {}).get("ids") or [])
+            return {"items": [item for item in fetch_items if item["id"] in ids]}
+        return {}
+
+    def _build_envelope(**kwargs):
+        captured["envelope_kwargs"].append(kwargs)
+        captured["envelope_plaintexts"].append(json.loads(kwargs["plaintext"].decode("utf-8")))
+        return {
+            "v": 1,
+            "id": f"dream_env_{len(captured['envelope_plaintexts'])}",
+            "visibility": kwargs["visibility"],
+            "owner_user_id": kwargs["owner_user_id"],
+            "body_ct": "ct",
+            "nonce": "nonce",
+            "K_user": "ku",
+            "K_enclave": "ke",
+        }
+
+    def _memory_actions(actions):
+        captured["actions"].extend(actions)
+        return {
+            "status": "ok",
+            "results": [{"status": "ok", "action": action.get("type")} for action in actions],
+            "effects": [{"type": "memory_superseded"} for _action in actions],
+        }
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "post_reply", _fail_post)
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", _status)
+    monkeypatch.setattr(crc, "_process_proactive_jobs", _proactive_handler)
+    monkeypatch.setattr(crc, "_capture_post_json", _post_json)
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: history)
+    monkeypatch.setattr(
+        crc,
+        "_capture_identity_context",
+        lambda: (
+            {"agent_name": "IO", "user_preferred_name": "Seven"},
+            "IO",
+            "Seven",
+            "identity: IO is Seven's companion",
+        ),
+    )
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_dream", "user_pk": b"u" * 32, "enclave_pk": b"e" * 32},
+    )
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(crc, "_build_envelope", _build_envelope)
+    monkeypatch.setattr(crc, "execute_memory_actions", _memory_actions)
+    return captured, job
+
+
+def _dream_final_status(captured):
+    return captured["statuses"][-1]
+
+
 def test_capture_get_json_disables_tls_verification_for_enclave_only(monkeypatch):
     calls = []
 
@@ -1715,6 +1831,130 @@ def test_capture_job_bad_json_fails_without_crash_or_memory_write(monkeypatch):
     assert captured["actions"] == []
     assert _capture_final_status(captured)[:3] == ("cap_dispatch", "failed", "no_json_object")
     assert _capture_final_status(captured)[3]["extra"]["noop_reason"] == "no_json_object"
+
+
+def test_dream_job_merge_writes_multi_supersede_without_chat_or_delivery(monkeypatch):
+    reply = json.dumps({
+        "consolidations": [{
+            "op": "merge",
+            "card_ids": ["mem_a", "mem_b"],
+            "result": {
+                "bucket": "life",
+                "threads": ["coffee"],
+                "summary": "Seven prefers oat milk in coffee.",
+                "content": "Seven has repeatedly mentioned oat milk and oat lattes, especially with morning coffee.",
+                "importance": 0.8,
+                "pulse": 0.5,
+            },
+        }],
+        "questions_to_ask": ["确认是否只是不喝牛奶？"],
+    }, ensure_ascii=False)
+    captured, job = _install_dream_job_harness(monkeypatch, reply)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+    assert captured["proactive_called"] is False
+    assert captured["post_called"] is False
+    assert captured["statuses"][0][:3] == ("dream_dispatch", "realizing", "")
+    assert _dream_final_status(captured)[:3] == (
+        "dream_dispatch",
+        "completed",
+        "dream_memory_actions_applied",
+    )
+    action = captured["actions"][0]
+    assert action["type"] == "memory.supersede"
+    assert action["supersedes"] == ["mem_a", "mem_b"]
+    assert action["capture_mode"] == "memory_dream"
+    assert action["dream_op"] == "merge"
+    assert action["envelope"]["source"] == "memory_dream"
+    assert action["envelope"]["type"] == "fact"
+    assert captured["envelope_plaintexts"] == [{
+        "summary": "Seven prefers oat milk in coffee.",
+        "content": "Seven has repeatedly mentioned oat milk and oat lattes, especially with morning coffee.",
+        "bucket": "life",
+        "threads": ["coffee"],
+    }]
+    assert "id=mem_a" in captured["prompts"][0]
+    assert "id=mem_b" in captured["prompts"][0]
+    assert "我最近都喝燕麦奶" in captured["prompts"][0]
+    extra = _dream_final_status(captured)[3]["extra"]
+    assert extra["dream_result"]["status"] == "ok"
+    assert extra["dream_result"]["job_kind"] == "memory_dream"
+    assert extra["cards_merged"] == 1
+    assert extra["cards_superseded"] == 2
+    assert extra["questions"] == ["确认是否只是不喝牛奶？"]
+
+
+def test_dream_job_thicken_and_supersede_are_memory_supersede_actions(monkeypatch):
+    reply = json.dumps({
+        "consolidations": [
+            {
+                "op": "thicken",
+                "card_ids": ["mem_c"],
+                "result": {
+                    "bucket": "routine",
+                    "threads": ["coffee"],
+                    "summary": "Seven tends to drink coffee in the morning.",
+                    "content": "Seven's morning routine often includes coffee, sometimes oat latte.",
+                    "importance": 0.6,
+                    "pulse": 0.4,
+                },
+            },
+            {
+                "op": "supersede",
+                "card_ids": ["mem_a"],
+                "result": {
+                    "bucket": "life",
+                    "threads": ["coffee"],
+                    "summary": "Seven corrected that oat milk is preferred, not dairy.",
+                    "content": "Seven's newer preference should replace the older milk preference memory.",
+                    "importance": 0.7,
+                    "pulse": 0.3,
+                },
+            },
+        ],
+        "questions_to_ask": [],
+    }, ensure_ascii=False)
+    captured, job = _install_dream_job_harness(monkeypatch, reply)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+    assert [action["type"] for action in captured["actions"]] == ["memory.supersede", "memory.supersede"]
+    assert [action["dream_op"] for action in captured["actions"]] == ["thicken", "supersede"]
+    assert captured["actions"][0]["supersedes"] == ["mem_c"]
+    assert captured["actions"][1]["supersedes"] == ["mem_a"]
+    extra = _dream_final_status(captured)[3]["extra"]
+    assert extra["cards_merged"] == 0
+    assert extra["cards_superseded"] == 2
+    assert extra["dream_result"]["cards_thickened"] == 1
+
+
+def test_dream_job_empty_consolidations_completes_noop_without_memory_write_or_chat(monkeypatch):
+    captured, job = _install_dream_job_harness(
+        monkeypatch,
+        json.dumps({"consolidations": [], "questions_to_ask": ["下次问 TA 是否还喝拿铁"]}, ensure_ascii=False),
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+    assert captured["actions"] == []
+    assert captured["post_called"] is False
+    assert _dream_final_status(captured)[:3] == (
+        "dream_dispatch",
+        "completed",
+        "dream_nothing_to_consolidate",
+    )
+    extra = _dream_final_status(captured)[3]["extra"]
+    assert extra["dream_result"]["status"] == "noop"
+    assert extra["questions"] == ["下次问 TA 是否还喝拿铁"]
+    assert extra["noop_reason"] == "dream_nothing_to_consolidate"
+
+
+def test_dream_job_bad_json_fails_without_crash_or_memory_write(monkeypatch):
+    captured, job = _install_dream_job_harness(monkeypatch, "not json")
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+    assert captured["actions"] == []
+    assert captured["post_called"] is False
+    assert _dream_final_status(captured)[:3] == ("dream_dispatch", "failed", "no_json_object")
+    assert _dream_final_status(captured)[3]["extra"]["noop_reason"] == "no_json_object"
 
 
 def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):

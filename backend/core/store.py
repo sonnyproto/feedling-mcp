@@ -665,11 +665,14 @@ class UserStore:
             "request_broadcast",
             "wake_result",
             "capture_result",
+            "dream_result",
             "capture_window",
             "memory_action_status",
             "memory_results",
             "cards_added",
+            "cards_merged",
             "cards_superseded",
+            "questions",
             "noop_reason",
         }
         patch = {k: v for k, v in (fields or {}).items() if k in allowed}

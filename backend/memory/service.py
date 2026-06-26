@@ -113,7 +113,7 @@ def _append_memory_change(store: UserStore, entry: dict) -> dict:
     }
     for key in (
         "type", "old_type", "new_type", "fields", "reason",
-        "capture_mode", "source_chat_message_ids", "anchor_memory_ids",
+        "capture_mode", "source_chat_message_ids", "anchor_memory_ids", "supersedes",
     ):
         if key in entry:
             record[key] = entry[key]

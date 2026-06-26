@@ -16,6 +16,7 @@ from proactive.controls_v2 import evaluate_wake_control_v2, resolve_settings_v2 
 from proactive import capture_jobs as proactive_capture_jobs  # noqa: E402
 from proactive import capture_scheduler as proactive_capture_scheduler  # noqa: E402
 from proactive import dashboard as proactive_dashboard  # noqa: E402
+from proactive import dream_scheduler as proactive_dream_scheduler  # noqa: E402
 from proactive import resident_runtime_v2 as proactive_resident_runtime_v2  # noqa: E402
 from proactive import routes as proactive_routes  # noqa: E402
 from push import apns as push_apns  # noqa: E402
@@ -1066,6 +1067,182 @@ def _memory_capture_jobs(store) -> list[dict]:
         row for row in store.list_proactive_jobs(since_epoch=0, limit=0)
         if row.get("job_kind") == "memory_capture"
     ]
+
+
+def _memory_dream_jobs(store) -> list[dict]:
+    return [
+        row for row in store.list_proactive_jobs(since_epoch=0, limit=0)
+        if row.get("job_kind") == "memory_dream"
+    ]
+
+
+def _dream_test_memory(user_id: str, memory_id: str, *, occurred_at: str = "2026-06-20T00:00:00Z") -> dict:
+    return {
+        "v": 1,
+        "id": memory_id,
+        "type": "fact",
+        "owner_user_id": user_id,
+        "visibility": "shared",
+        "body_ct": f"ct_{memory_id}",
+        "nonce": f"nonce_{memory_id}",
+        "K_user": f"ku_{memory_id}",
+        "K_enclave": f"ke_{memory_id}",
+        "occurred_at": occurred_at,
+        "created_at": occurred_at,
+        "updated_at": occurred_at,
+        "status": "active",
+        "importance": 0.6,
+        "pulse": 0.3,
+    }
+
+
+def test_dream_tick_threshold_single_flight_and_ambient_off_poll(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "3")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "0")
+    appmod._stores.clear()
+
+    api_key = "test_dream_tick_key"
+    user_id = "usr_dream_tick"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.save_proactive_settings({
+        "ambient": False,
+        "scheduled": False,
+        "reminders_delivery": False,
+    })
+    appmod.db.memory_replace_all(user_id, [
+        _dream_test_memory(user_id, "mem_a"),
+        _dream_test_memory(user_id, "mem_b"),
+    ])
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    not_due = client.post("/v1/dream/tick", headers=headers, json={"now": 1000.0})
+
+    assert not_due.status_code == 200
+    assert not_due.get_json()["enqueued"] is False
+    assert not_due.get_json()["reason"] == "not_enough_new_cards"
+    assert _memory_dream_jobs(store) == []
+
+    appmod.db.memory_replace_all(user_id, [
+        _dream_test_memory(user_id, "mem_a"),
+        _dream_test_memory(user_id, "mem_b"),
+        _dream_test_memory(user_id, "mem_c"),
+    ])
+    queued = client.post("/v1/dream/tick", headers=headers, json={"now": 1100.0})
+    duplicate = client.post("/v1/dream/tick", headers=headers, json={"now": 1101.0})
+    poll = client.get("/v1/proactive/jobs/poll?since=0&timeout=0", headers=headers)
+
+    assert queued.status_code == 200
+    assert queued.get_json()["enqueued"] is True
+    assert queued.get_json()["job"]["job_kind"] == "memory_dream"
+    assert duplicate.status_code == 200
+    assert duplicate.get_json()["enqueued"] is False
+    assert duplicate.get_json()["reason"] == "dream_already_pending"
+    assert len(_memory_dream_jobs(store)) == 1
+    assert poll.status_code == 200
+    assert [job["job_id"] for job in poll.get_json()["jobs"]] == [queued.get_json()["job"]["job_id"]]
+    assert poll.get_json()["jobs"][0]["source"] == "memory_dream"
+
+
+def test_dream_enqueue_idempotent_by_key_and_single_flight(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    store = appmod.UserStore("usr_dream_idempotent")
+
+    first, first_enqueued, first_reason = proactive_capture_jobs.enqueue_memory_dream_job(
+        store,
+        trigger="nightly_dream",
+        dream_key="dream:same",
+        dream_until={"signature": "sig_a"},
+        dream_stats={"card_count": 3, "signature": "sig_a"},
+        now=100.0,
+    )
+    store.update_proactive_job(first["job_id"], {"status": "completed"})
+    duplicate, duplicate_enqueued, duplicate_reason = proactive_capture_jobs.enqueue_memory_dream_job(
+        store,
+        trigger="nightly_dream",
+        dream_key="dream:same",
+        dream_until={"signature": "sig_a"},
+        dream_stats={"card_count": 3, "signature": "sig_a"},
+        now=200.0,
+    )
+    second, second_enqueued, second_reason = proactive_capture_jobs.enqueue_memory_dream_job(
+        store,
+        trigger="nightly_dream",
+        dream_key="dream:second",
+        dream_until={"signature": "sig_b"},
+        dream_stats={"card_count": 4, "signature": "sig_b"},
+        now=300.0,
+    )
+    third, third_enqueued, third_reason = proactive_capture_jobs.enqueue_memory_dream_job(
+        store,
+        trigger="nightly_dream",
+        dream_key="dream:third",
+        dream_until={"signature": "sig_c"},
+        dream_stats={"card_count": 5, "signature": "sig_c"},
+        now=400.0,
+    )
+
+    assert first_enqueued is True
+    assert first_reason == "enqueued"
+    assert duplicate_enqueued is False
+    assert duplicate_reason == "duplicate_dream_key"
+    assert duplicate["job_id"] == first["job_id"]
+    assert second_enqueued is True
+    assert second_reason == "enqueued"
+    assert third_enqueued is False
+    assert third_reason == "dream_already_pending"
+    assert third["job_id"] == second["job_id"]
+    assert len(_memory_dream_jobs(store)) == 2
+
+
+def test_dream_completion_advances_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "1")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "0")
+    appmod._stores.clear()
+
+    api_key = "test_dream_completion_key"
+    user_id = "usr_dream_completion"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    appmod.db.memory_replace_all(user_id, [_dream_test_memory(user_id, "mem_done")])
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    first = client.post("/v1/dream/tick", headers=headers, json={"now": 2000.0})
+    job = first.get_json()["job"]
+    done = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json={
+            "status": "completed",
+            "reason": "dream_nothing_to_consolidate",
+            "dream_result": {"status": "noop"},
+            "cards_merged": 0,
+            "cards_superseded": 0,
+            "questions": ["ask later"],
+            "noop_reason": "dream_nothing_to_consolidate",
+        },
+    )
+    second = client.post("/v1/dream/tick", headers=headers, json={"now": 2100.0})
+
+    assert first.status_code == 200
+    assert first.get_json()["enqueued"] is True
+    assert done.status_code == 200
+    patched = done.get_json()["job"]
+    assert patched["dream_result"] == {"status": "noop"}
+    assert patched["questions"] == ["ask later"]
+    state = proactive_dream_scheduler.load_dream_state(store)
+    assert state["pending_dream_key"] == ""
+    assert state["last_dream_completed_at"] > 0
+    assert state["last_dreamed_card_count"] == 1
+    assert second.status_code == 200
+    assert second.get_json()["enqueued"] is False
+    assert second.get_json()["reason"] == "already_dreamed"
 
 
 def test_capture_coordinator_dedupes_same_window_across_signals(tmp_path, monkeypatch):
