@@ -2592,23 +2592,23 @@ def _normalize_identity_payload(raw, memories: list[dict], days: int, language: 
     for idx, dim in enumerate(dims[:7]):
         if not isinstance(dim, dict):
             continue
-        name = str(dim.get("name") or f"Dimension {idx + 1}")[:60]
+        name = str(dim.get("name") or "").strip()[:60]
         if str(language).startswith("zh") and _english_only_for_zh(name):
-            name = str(fallback["dimensions"][idx].get("name") or f"维度 {idx + 1}")[:60]
+            name = ""
+        desc = str(dim.get("description") or dim.get("evidence") or "").strip()[:500]
+        if str(language).startswith("zh") and _english_only_for_zh(desc):
+            desc = ""
+        if not name or not desc:
+            continue
         try:
             value = int(dim.get("value", 50))
         except Exception:
             value = 50
-        desc = str(dim.get("description") or dim.get("evidence") or "")[:500]
-        if str(language).startswith("zh") and _english_only_for_zh(desc):
-            desc = ""
         clean_dims.append({
             "name": name,
             "value": max(0, min(value, 100)),
-            "description": desc or ("根据导入材料得出。" if str(language).startswith("zh") else "Derived from imported history."),
+            "description": desc,
         })
-    if len(clean_dims) != 7:
-        return fallback
     payload["agent_name"] = _sanitize_import_agent_name(str(payload.get("agent_name") or ""))
     payload["self_introduction"] = str(payload.get("self_introduction") or "")[:1200]
     if str(language).startswith("zh") and _english_only_for_zh(payload["self_introduction"]):
@@ -2686,8 +2686,9 @@ def _derive_identity_with_provider(
     prompt = (
         "Derive a Feedling Identity Card for the AI companion from typed onboarding sources and Memory Garden cards. "
         "Return JSON only with fields: agent_name, self_introduction, category, "
-        "signature (array of two short strings), dimensions (exactly 7 objects with "
-        "name, value 0-100, description), "
+        "signature (array of two short strings), dimensions (at most 7 objects with "
+        "name, value 0-100, description; every dimension must be evidenced by the input; "
+        "sparse is allowed, do not invent dimensions to fill the list), "
         "tone_style (1-3 sentences capturing HOW the companion speaks — register, "
         "verbal tics, how it addresses the user, characteristic phrasings; quote real "
         "examples from the sources where possible, do not generalize to 'friendly and helpful'), "

@@ -69,7 +69,7 @@ def bootstrap():
         "**有 memory 时可参考已有卡，但 0 记忆也能建身份**——不要把它说成只能从已有记忆卡推导。"
         "agent_name 不能是 Hermes/Claude/ChatGPT 等 runtime label。"
         "如果用户以前叫过你名字，就用那个；如果没有，先问，不要自己 fallback。"
-        "dimensions 必须恰好 7 个，数值要有明显高低差；"
+        "dimensions 最多 7 个，每个都要有真实依据；撑不住就少写、可稀疏，绝不凑满；数值要有明显高低差；"
         "days_with_user：**有 memory 时**按最早 memory 的 occurred_at 到今天计算；"
         "**没有 memory 时**用 0，或用户提供的关系锚点证据（relationship_anchor_evidence）。"
         "self_introduction 要像你自己在介绍你们的关系，而不是功能说明；不要提 Feedling、IO 或平台名。"
@@ -217,4 +217,3 @@ def bootstrap_status():
         "resident_consumer": resident_consumer,
         "is_complete": is_complete,
     })
-

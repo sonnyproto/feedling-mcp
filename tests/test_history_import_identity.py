@@ -76,6 +76,43 @@ def test_normalize_cleans_blank_list_items():
     assert out["do_not_say"] == ["老板", "boss"]
 
 
+def test_normalize_keeps_sparse_evidenced_dimensions_without_padding():
+    out = hi._normalize_identity_payload(
+        _raw(
+            dimensions=[
+                {"name": "Direct", "value": 82, "description": "Often gives blunt writing feedback."},
+                {"name": "Playful", "value": 64, "evidence": "Uses recurring private jokes in chat."},
+            ]
+        ),
+        [],
+        10,
+        "en",
+    )
+    assert out["agent_name"] == "Kai"
+    assert out["dimensions"] == [
+        {"name": "Direct", "value": 82, "description": "Often gives blunt writing feedback."},
+        {"name": "Playful", "value": 64, "description": "Uses recurring private jokes in chat."},
+    ]
+
+
+def test_normalize_does_not_invent_missing_dimension_evidence():
+    out = hi._normalize_identity_payload(
+        _raw(
+            dimensions=[
+                {"name": "Direct", "value": 82, "description": "Often gives blunt writing feedback."},
+                {"name": "Warmth", "value": 60},
+                {"value": 50, "description": "No name for this inferred axis."},
+            ]
+        ),
+        [],
+        10,
+        "en",
+    )
+    assert out["dimensions"] == [
+        {"name": "Direct", "value": 82, "description": "Often gives blunt writing feedback."}
+    ]
+
+
 def test_normalize_caps_tone_style_length():
     out = hi._normalize_identity_payload(_raw(tone_style="x" * 5000), [], 10, "en")
     assert len(out["tone_style"]) == 1200
