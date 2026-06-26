@@ -97,15 +97,6 @@ class GenesisLLMClient:
         if not idempotency_key:
             raise ValueError("idempotency_key_required")
         output_type = _safe_output_type(idempotency_key)
-        cached = db.genesis_get_output(user_id, job_id, output_type)
-        if cached and (cached.get("doc") or {}).get("text"):
-            doc = cached["doc"]
-            return GenesisLLMResult(
-                text=str(doc.get("text") or ""),
-                usage=doc.get("usage") if isinstance(doc.get("usage"), dict) else {},
-                cached=True,
-                output_ref=output_type,
-            )
 
         capped_max_tokens = min(max_tokens, _max_tokens_per_call())
         with _user_slot(user_id):
@@ -119,16 +110,19 @@ class GenesisLLMClient:
             )
         text = str(result.get("reply") or "")
         usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        text_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
         doc = {
             "task_id": task_id,
             "provider": runtime.provider,
             "model": runtime.model,
             "base_url": runtime.base_url,
             "messages_sha256": _messages_hash(messages),
+            "response_sha256": text_sha256,
+            "response_chars": len(text),
             "max_tokens": capped_max_tokens,
             "timeout": timeout,
             "budget_label": budget_label,
-            "text": text,
+            "plaintext_stored": False,
             "usage": usage,
         }
         db.genesis_upsert_output(user_id, job_id, output_type, doc=doc, status="done", ref=output_type)

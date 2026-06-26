@@ -19,19 +19,31 @@ def _runtime():
     )
 
 
-def test_genesis_llm_client_reuses_idempotent_output(monkeypatch):
-    def fail_completion(*_args, **_kwargs):
-        raise AssertionError("completion should not be called for cached output")
-
+def test_genesis_llm_client_ignores_plaintext_legacy_cache(monkeypatch):
     from genesis import llm_client
 
+    captured = {}
     monkeypatch.setattr(
         llm_client.db,
-        "genesis_get_output",
-        lambda *_args: {"doc": {"text": "cached text", "usage": {"total_tokens": 3}}},
+        "genesis_upsert_output",
+        lambda user_id, job_id, output_type, *, doc, status, ref: captured.update(
+            {
+                "user_id": user_id,
+                "job_id": job_id,
+                "output_type": output_type,
+                "doc": doc,
+                "status": status,
+                "ref": ref,
+            }
+        ),
     )
 
-    result = GenesisLLMClient(completion_fn=fail_completion).complete(
+    def fake_completion(runtime, messages, **_kwargs):
+        assert runtime.api_key == "sk-user-secret"
+        assert messages[0]["content"] == "hello"
+        return {"reply": "fresh text", "usage": {"total_tokens": 4}}
+
+    result = GenesisLLMClient(completion_fn=fake_completion).complete(
         user_id="usr",
         job_id="job",
         task_id="map-1",
@@ -40,16 +52,16 @@ def test_genesis_llm_client_reuses_idempotent_output(monkeypatch):
         idempotency_key="job:map:1",
     )
 
-    assert result.cached is True
-    assert result.text == "cached text"
-    assert result.usage == {"total_tokens": 3}
+    assert result.cached is False
+    assert result.text == "fresh text"
+    assert captured["doc"]["plaintext_stored"] is False
+    assert "text" not in captured["doc"]
 
 
-def test_genesis_llm_client_persists_response_metadata_without_api_key(monkeypatch):
+def test_genesis_llm_client_persists_response_metadata_without_plaintext_or_api_key(monkeypatch):
     from genesis import llm_client
 
     captured = {}
-    monkeypatch.setattr(llm_client.db, "genesis_get_output", lambda *_args: None)
     monkeypatch.setattr(
         llm_client.db,
         "genesis_upsert_output",
@@ -84,7 +96,11 @@ def test_genesis_llm_client_persists_response_metadata_without_api_key(monkeypat
     assert result.cached is False
     assert result.text == "new text"
     assert captured["status"] == "done"
-    assert captured["doc"]["text"] == "new text"
+    assert captured["doc"]["plaintext_stored"] is False
+    assert captured["doc"]["response_sha256"]
+    assert captured["doc"]["response_chars"] == len("new text")
+    assert "text" not in captured["doc"]
     assert captured["doc"]["usage"] == {"total_tokens": 9}
     assert "api_key" not in json.dumps(captured["doc"])
     assert "sk-user-secret" not in json.dumps(captured["doc"])
+    assert "new text" not in json.dumps(captured["doc"])

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import sys
 import types
 from pathlib import Path
@@ -11,6 +13,20 @@ from genesis import service  # noqa: E402
 
 def _store(user_id: str = "usr_genesis"):
     return types.SimpleNamespace(user_id=user_id)
+
+
+def _chunk_meta(user_id: str = "usr_genesis", *, body: bytes = b"ciphertext") -> dict:
+    return {
+        "v": 1,
+        "id": "genesis_chunk_job_1_0",
+        "body_ct": base64.b64encode(body).decode("ascii"),
+        "nonce": "nonce_b64",
+        "K_user": "ku_b64",
+        "K_enclave": "ke_b64",
+        "visibility": "shared",
+        "owner_user_id": user_id,
+        "enclave_pk_fpr": "fpr",
+    }
 
 
 def test_genesis_state_maps_active_job_to_processing_gate_status(monkeypatch):
@@ -131,6 +147,98 @@ def test_finalize_upload_sets_uploaded_gate_status_when_complete(monkeypatch):
     assert captured["job_status"] == "uploaded"
 
 
+def test_put_chunk_requires_v1_envelope_meta(monkeypatch):
+    monkeypatch.setattr(
+        service.db,
+        "genesis_get_job",
+        lambda _user_id, _job_id: {"job_id": "job_1", "status": "uploading", "total_chunks": 1},
+    )
+
+    try:
+        service.put_chunk(
+            _store(),
+            "job_1",
+            seq=0,
+            encrypted_body=b"ciphertext",
+            byte_start=0,
+            byte_end=10,
+        )
+    except ValueError as e:
+        assert str(e) == "chunk_envelope_required"
+    else:
+        raise AssertionError("expected missing envelope metadata to be rejected")
+
+
+def test_put_chunk_stores_envelope_meta_without_body_ct(monkeypatch):
+    captured = {}
+    body = b"ciphertext"
+    monkeypatch.setattr(
+        service.db,
+        "genesis_get_job",
+        lambda _user_id, _job_id: {"job_id": "job_1", "status": "uploading", "total_chunks": 1},
+    )
+
+    def fake_put(_user_id, _job_id, **kwargs):
+        captured.update(kwargs)
+        return {"seq": kwargs["seq"], "aad": kwargs["aad"]}
+
+    monkeypatch.setattr(service.db, "genesis_put_chunk", fake_put)
+    monkeypatch.setattr(service.db, "set_blob", lambda *_args: None)
+
+    chunk = service.put_chunk(
+        _store(),
+        "job_1",
+        seq=0,
+        encrypted_body=body,
+        byte_start=0,
+        byte_end=len(body),
+        envelope_meta=_chunk_meta(body=body),
+    )
+
+    meta = captured["aad"]["envelope_meta"]
+    assert chunk["seq"] == 0
+    assert meta["owner_user_id"] == "usr_genesis"
+    assert meta["K_enclave"] == "ke_b64"
+    assert "body_ct" not in meta
+
+
+def test_put_chunk_rejects_cross_user_envelope_meta(monkeypatch):
+    monkeypatch.setattr(
+        service.db,
+        "genesis_get_job",
+        lambda _user_id, _job_id: {"job_id": "job_1", "status": "uploading", "total_chunks": 1},
+    )
+
+    try:
+        service.put_chunk(
+            _store("usr_genesis"),
+            "job_1",
+            seq=0,
+            encrypted_body=b"ciphertext",
+            byte_start=0,
+            byte_end=10,
+            envelope_meta=_chunk_meta("usr_other"),
+        )
+    except ValueError as e:
+        assert str(e) == "chunk_envelope_owner_mismatch"
+    else:
+        raise AssertionError("expected cross-user chunk envelope to be rejected")
+
+
+def test_chunk_envelope_from_row_reconstructs_worker_decrypt_payload():
+    body = b"ciphertext"
+    meta = dict(_chunk_meta(body=body))
+    meta.pop("body_ct")
+    envelope = service.chunk_envelope_from_row({
+        "encrypted_body": body,
+        "aad": {"envelope_meta": meta},
+    })
+
+    assert envelope["body_ct"] == base64.b64encode(body).decode("ascii")
+    assert envelope["owner_user_id"] == "usr_genesis"
+    assert envelope["id"] == "genesis_chunk_job_1_0"
+
+
 def test_apply_reducer_output_writes_persona_and_done_state(monkeypatch):
     blobs = []
     outputs = []
@@ -195,8 +303,27 @@ def test_apply_reducer_output_writes_persona_and_done_state(monkeypatch):
     assert "content" not in persona_blob["doc"]
     state_blob = [blob for blob in blobs if blob["kind"] == service.GENESIS_STATE_BLOB][-1]
     assert state_blob["doc"]["status"] == "done"
-    assert any(output["type"] == "reducer" for output in outputs)
+    reducer_doc = next(output["doc"] for output in outputs if output["type"] == "reducer")
+    reducer_json = json.dumps(reducer_doc, ensure_ascii=False)
+    assert reducer_doc["plaintext_stored"] is False
+    assert reducer_doc["persona_provided"] is True
+    assert "You remember the user's voice." not in reducer_json
     assert any(output["type"] == "apply" for output in outputs)
+
+
+def test_apply_reducer_output_rejects_raw_transcript_fields(monkeypatch):
+    monkeypatch.setattr(
+        service.db,
+        "genesis_get_job",
+        lambda _user_id, _job_id: {"job_id": "job_1", "status": "uploaded", "total_chunks": 1},
+    )
+
+    try:
+        service.apply_reducer_output(_store(), "api_key", "job_1", {"raw_text": "do not send raw text"})
+    except ValueError as e:
+        assert str(e) == "raw_reducer_field_not_allowed:raw_text"
+    else:
+        raise AssertionError("expected raw reducer output to be rejected")
 
 
 def test_identity_payload_from_output_leaves_intro_and_signature_for_respawn():

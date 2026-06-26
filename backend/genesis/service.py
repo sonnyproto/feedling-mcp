@@ -33,6 +33,26 @@ DONE_JOB_STATUS = "done"
 FAILED_JOB_STATUS = "failed"
 
 ALLOWED_MEMORY_TYPES = {"fact", "event", "quote", "moment"}
+CHUNK_ENVELOPE_META_REQUIRED = (
+    "v",
+    "id",
+    "nonce",
+    "K_user",
+    "K_enclave",
+    "visibility",
+    "owner_user_id",
+)
+CHUNK_ENVELOPE_META_OPTIONAL = ("enclave_pk_fpr",)
+RAW_REDUCER_OUTPUT_FIELDS = {
+    "raw",
+    "raw_text",
+    "transcript",
+    "transcripts",
+    "chunk",
+    "chunks",
+    "chunk_text",
+    "chunk_texts",
+}
 
 
 def _text(value: Any, max_chars: int) -> str:
@@ -52,6 +72,72 @@ def b64decode_required(value: str) -> bytes:
         return base64.b64decode(str(value or ""), validate=True)
     except Exception as e:  # noqa: BLE001
         raise ValueError("invalid_base64_ciphertext") from e
+
+
+def b64encode(raw: bytes) -> str:
+    return base64.b64encode(raw).decode("ascii")
+
+
+def _stable_json_sha256(value: Any) -> str:
+    raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return _sha256_hex(raw.encode("utf-8"))
+
+
+def _chunk_envelope_meta(store: UserStore, envelope_meta: dict | None, encrypted_body: bytes) -> dict:
+    if not isinstance(envelope_meta, dict):
+        raise ValueError("chunk_envelope_required")
+    body_ct = str(envelope_meta.get("body_ct") or "")
+    if body_ct:
+        if b64decode_required(body_ct) != encrypted_body:
+            raise ValueError("chunk_envelope_body_ct_mismatch")
+
+    meta: dict[str, Any] = {}
+    missing: list[str] = []
+    for key in CHUNK_ENVELOPE_META_REQUIRED:
+        value = envelope_meta.get(key)
+        if value in (None, ""):
+            missing.append(key)
+            continue
+        meta[key] = value
+    for key in CHUNK_ENVELOPE_META_OPTIONAL:
+        value = envelope_meta.get(key)
+        if value not in (None, ""):
+            meta[key] = value
+    if missing:
+        raise ValueError(f"chunk_envelope_missing_fields:{','.join(missing)}")
+    try:
+        meta["v"] = int(meta["v"])
+    except Exception as e:  # noqa: BLE001
+        raise ValueError("chunk_envelope_v_invalid") from e
+    meta["id"] = _text(meta.get("id"), 160)
+    if not meta["id"]:
+        raise ValueError("chunk_envelope_id_required")
+    meta["visibility"] = _text(meta.get("visibility"), 40)
+    if meta["visibility"] != "shared":
+        raise ValueError("chunk_envelope_visibility_must_be_shared")
+    meta["owner_user_id"] = _text(meta.get("owner_user_id"), 160)
+    if meta["owner_user_id"] != store.user_id:
+        raise ValueError("chunk_envelope_owner_mismatch")
+    for key in ("nonce", "K_user", "K_enclave", "enclave_pk_fpr"):
+        if key in meta:
+            meta[key] = str(meta.get(key) or "").strip()
+    return meta
+
+
+def chunk_envelope_from_row(chunk: dict) -> dict:
+    """Reconstruct a v1 envelope from a stored chunk row for the CVM worker."""
+    aad = chunk.get("aad") if isinstance(chunk.get("aad"), dict) else {}
+    meta = aad.get("envelope_meta") if isinstance(aad.get("envelope_meta"), dict) else {}
+    encrypted_body = chunk.get("encrypted_body") or b""
+    if isinstance(encrypted_body, memoryview):
+        encrypted_body = encrypted_body.tobytes()
+    if isinstance(encrypted_body, str):
+        encrypted_body = encrypted_body.encode("utf-8")
+    if not isinstance(encrypted_body, (bytes, bytearray)):
+        raise ValueError("chunk_encrypted_body_required")
+    if not meta:
+        raise ValueError("chunk_envelope_meta_missing")
+    return {**meta, "body_ct": b64encode(bytes(encrypted_body))}
 
 
 def new_job_id() -> str:
@@ -132,6 +218,7 @@ def put_chunk(
     content_sha256: str = "",
     expected_ciphertext_sha256: str = "",
     aad: dict | None = None,
+    envelope_meta: dict | None = None,
 ) -> dict:
     job = db.genesis_get_job(store.user_id, job_id)
     if not job:
@@ -149,13 +236,16 @@ def put_chunk(
     if byte_start < 0 or byte_end < byte_start:
         raise ValueError("invalid_byte_range")
     clean_content_hash = _text(content_sha256, 128)
+    clean_envelope_meta = _chunk_envelope_meta(store, envelope_meta, encrypted_body)
     clean_aad = dict(aad or {})
+    clean_aad.pop("envelope_meta", None)
     clean_aad.update({
         "user_id": store.user_id,
         "job_id": job_id,
         "seq": seq,
         "content_hash": clean_content_hash,
         "ciphertext_sha256": cipher_hash,
+        "envelope_meta": clean_envelope_meta,
     })
     chunk = db.genesis_put_chunk(
         store.user_id,
@@ -238,6 +328,52 @@ def apply_memory_outputs(store: UserStore, api_key: str | None, output: dict) ->
             raise RuntimeError(f"memory_actions_failed:{body.get('error', status)}")
         results.extend(list(body.get("results") or []))
     return len(results), results
+
+
+def _reject_raw_reducer_fields(output: dict) -> None:
+    for key in output:
+        if str(key).strip().lower() in RAW_REDUCER_OUTPUT_FIELDS:
+            raise ValueError(f"raw_reducer_field_not_allowed:{key}")
+
+
+def _persona_content_from_output(output: dict) -> tuple[str, str]:
+    persona = output.get("persona")
+    if isinstance(persona, dict):
+        return str(persona.get("content") or persona.get("text") or "").strip(), _text(
+            persona.get("prompt_version") or "7.B",
+            40,
+        )
+    return str(persona or "").strip(), "7.B"
+
+
+def _safe_reducer_doc(job_id: str, output: dict) -> dict:
+    raw_items = output.get("memories")
+    if raw_items is None:
+        raw_items = output.get("facts")
+    memories = raw_items if isinstance(raw_items, list) else []
+    type_counts: dict[str, int] = {}
+    for item in memories:
+        if not isinstance(item, dict):
+            continue
+        mem_type = _text(item.get("type") or "fact", 40).lower()
+        type_counts[mem_type] = type_counts.get(mem_type, 0) + 1
+    identity = output.get("identity") if isinstance(output.get("identity"), dict) else {}
+    dims = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
+    persona_content, prompt_version = _persona_content_from_output(output)
+    return {
+        "v": 1,
+        "job_id": job_id,
+        "source": GENESIS_SOURCE,
+        "plaintext_stored": False,
+        "raw_sha256": _stable_json_sha256(output),
+        "memory_count": len(memories),
+        "memory_type_counts": type_counts,
+        "identity_provided": bool(identity),
+        "identity_dimension_count": len(dims),
+        "persona_provided": bool(persona_content),
+        "persona_sha256": _sha256_hex(persona_content.encode("utf-8")) if persona_content else "",
+        "persona_prompt_version": prompt_version if persona_content else "",
+    }
 
 
 def _identity_payload_from_output(output: dict) -> dict | None:
@@ -336,14 +472,7 @@ def init_identity_if_absent(store: UserStore, output: dict) -> str:
 
 
 def write_persona_artifact(store: UserStore, job_id: str, output: dict) -> tuple[str, str]:
-    persona = output.get("persona")
-    if isinstance(persona, dict):
-        content = str(persona.get("content") or persona.get("text") or "")
-        prompt_version = _text(persona.get("prompt_version") or "7.B", 40)
-    else:
-        content = str(persona or "")
-        prompt_version = "7.B"
-    content = content.strip()
+    content, prompt_version = _persona_content_from_output(output)
     if not content:
         return "", ""
     digest = _sha256_hex(content.encode("utf-8"))
@@ -374,6 +503,7 @@ def apply_reducer_output(store: UserStore, api_key: str | None, job_id: str, out
     if not job:
         raise LookupError("genesis_job_not_found")
     output = dict(output)
+    _reject_raw_reducer_fields(output)
     output["job_id"] = job_id
     db.genesis_set_job_status(store.user_id, job_id, status="processing", output={"stage": "apply_outputs"})
     write_genesis_state(store, {**job, "status": "processing"})
@@ -387,7 +517,14 @@ def apply_reducer_output(store: UserStore, api_key: str | None, job_id: str, out
         "persona_ref": persona_ref,
         "persona_sha256": persona_sha,
     }
-    db.genesis_upsert_output(store.user_id, job_id, "reducer", doc=output, status="applied", ref="inline")
+    db.genesis_upsert_output(
+        store.user_id,
+        job_id,
+        "reducer",
+        doc=_safe_reducer_doc(job_id, output),
+        status="applied",
+        ref="sanitized",
+    )
     db.genesis_upsert_output(store.user_id, job_id, "apply", doc=result_doc, status="done", ref="inline")
     completed = db.genesis_complete_job(
         store.user_id,

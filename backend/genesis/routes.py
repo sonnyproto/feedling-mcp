@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from typing import Any
 
@@ -10,6 +11,7 @@ from flask import Blueprint, jsonify, request
 
 import db
 from accounts import auth
+from accounts import runtime_auth
 from genesis import service
 
 bp = Blueprint("genesis", __name__)
@@ -61,17 +63,31 @@ def genesis_import_list():
 
 
 def _json_chunk_payload(payload: dict) -> tuple[bytes, dict[str, Any]]:
-    raw = service.b64decode_required(str(payload.get("ciphertext_b64") or ""))
+    envelope = payload.get("envelope") if isinstance(payload.get("envelope"), dict) else {}
+    envelope_meta = payload.get("envelope_meta") if isinstance(payload.get("envelope_meta"), dict) else envelope
+    body_ct = str(payload.get("ciphertext_b64") or envelope.get("body_ct") or "")
+    raw = service.b64decode_required(body_ct)
+    payload = {**payload, "envelope_meta": envelope_meta}
     return raw, payload
 
 
 def _binary_chunk_payload() -> tuple[bytes, dict[str, Any]]:
     raw = request.get_data(cache=False) or b""
+    envelope_meta_raw = request.headers.get("X-Envelope-Meta") or request.args.get("envelope_meta") or ""
+    envelope_meta = {}
+    if envelope_meta_raw:
+        try:
+            envelope_meta = json.loads(envelope_meta_raw)
+        except Exception as e:  # noqa: BLE001
+            raise ValueError("invalid_envelope_meta_json") from e
+        if not isinstance(envelope_meta, dict):
+            raise ValueError("invalid_envelope_meta_json")
     meta = {
         "byte_start": request.headers.get("X-Byte-Start") or request.args.get("byte_start"),
         "byte_end": request.headers.get("X-Byte-End") or request.args.get("byte_end"),
         "content_sha256": request.headers.get("X-Content-SHA256") or request.args.get("content_sha256"),
         "ciphertext_sha256": request.headers.get("X-Ciphertext-SHA256") or request.args.get("ciphertext_sha256"),
+        "envelope_meta": envelope_meta,
     }
     return raw, meta
 
@@ -102,6 +118,7 @@ def genesis_import_put_chunk(job_id: str, seq: int):
             content_sha256=str(meta.get("content_sha256") or ""),
             expected_ciphertext_sha256=expected_hash,
             aad=aad,
+            envelope_meta=meta.get("envelope_meta") if isinstance(meta.get("envelope_meta"), dict) else None,
         )
     except LookupError as e:
         return _bad(str(e), 404)
@@ -134,6 +151,8 @@ def genesis_import_finalize(job_id: str):
             applied = service.apply_reducer_output(store, api_key, job_id, reducer_output)
             job = db.genesis_get_job(store.user_id, job_id) or job
             return jsonify(_job_response(job, extra={"status": "done", "applied": applied})), 200
+        except ValueError as e:
+            return _bad(str(e), 400)
         except Exception as e:  # noqa: BLE001
             failed = service.mark_failed(store, job_id, f"apply_outputs_failed:{type(e).__name__}:{str(e)[:180]}")
             return jsonify(_job_response(failed or job, extra={"status": "failed", "error": str(e)[:240]})), 500
@@ -144,6 +163,7 @@ def genesis_import_finalize(job_id: str):
 @bp.route("/v1/genesis/imports/<job_id>/outputs", methods=["POST"])
 def genesis_import_apply_outputs(job_id: str):
     store = auth.require_user()
+    runtime_auth.authorize_scope("genesis")
     api_key = auth._extract_api_key()
     if not _valid_job_id(job_id):
         return _bad("invalid_job_id", 400)
@@ -155,6 +175,8 @@ def genesis_import_apply_outputs(job_id: str):
         applied = service.apply_reducer_output(store, api_key, job_id, reducer_output)
     except LookupError as e:
         return _bad(str(e), 404)
+    except ValueError as e:
+        return _bad(str(e), 400)
     except Exception as e:  # noqa: BLE001
         failed = service.mark_failed(store, job_id, f"apply_outputs_failed:{type(e).__name__}:{str(e)[:180]}")
         return jsonify(_job_response(failed, extra={"status": "failed", "error": str(e)[:240]})), 500
