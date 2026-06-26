@@ -11,23 +11,12 @@ from core import store as core_store
 from core import util
 from proactive import capture_jobs, capture_scheduler, dashboard, gate, resident_runtime_v2, service
 from proactive.observability_v2 import ROUND3_REVIEW_LABELS_V2
-from proactive.tool_executor_v2 import (
-    ToolBudgetV2, ToolExecutorV2, ToolCallV2, combined_runtime_adapters_v2,
-)
 
 bp = Blueprint("proactive", __name__)
 
 RESIDENT_WAKE_LEASE_SEC = 600.0
 RESIDENT_RUNTIME_OWNER_ID_V2 = "resident_runtime_v2"
 _HOSTED_CONSUMER_IDS = frozenset({"hosted_runtime", "hosted_runtime_v2"})
-FOREGROUND_CHAT_TOOL_BUDGET_MODE_V2 = "foreground_chat_fast"
-
-
-def _tool_budget_from_payload_v2(payload: dict) -> ToolBudgetV2 | None:
-    mode = str(payload.get("budget_mode") or payload.get("budget") or "").strip().lower()
-    if mode in {FOREGROUND_CHAT_TOOL_BUDGET_MODE_V2, "fast_only", "foreground_fast"}:
-        return ToolBudgetV2(slow_inline_limit=0)
-    return None
 
 
 def _proactive_state_doc(settings: dict) -> dict:
@@ -646,19 +635,3 @@ def proactive_jobs_poll():
         pending = _resident_pollable_pending_jobs(store, since=since, limit=limit, runtime_profile=runtime_profile)
         return jsonify({"jobs": pending, "runtime_v2": runtime_profile, "timed_out": False})
     return jsonify({"jobs": [], "runtime_v2": runtime_profile, "timed_out": True})
-
-
-@bp.route("/v1/proactive/tool/execute", methods=["POST"])
-def proactive_tool_execute():
-    store = auth.require_user()
-    payload = request.get_json(silent=True) or {}
-    name = str(payload.get("name") or "").strip()
-    if not name:
-        return jsonify({"error": "tool name required"}), 400
-    args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
-    executor = ToolExecutorV2(
-        adapters=combined_runtime_adapters_v2(store.last_seen_api_key, store),
-        budget=_tool_budget_from_payload_v2(payload),
-    )
-    result = executor.execute(ToolCallV2(name=name, args=args, user_id=store.user_id))
-    return jsonify(result.as_dict())

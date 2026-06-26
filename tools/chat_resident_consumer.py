@@ -120,15 +120,6 @@ except ImportError:
     _ENCRYPTION_AVAILABLE = False
 
 from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards
-from proactive.agent_protocol_v2 import build_agent_context_v2
-from proactive.tool_catalog_v2 import tool_catalog_v2_for_runtime
-from proactive.tool_loop_v2 import run_tool_loop_v2
-# NOTE: proactive.adapters_v2 and proactive.runtime_v2 are imported lazily inside
-# the proactive-job path (_resident_v2_agent_context_for_job). They transitively
-# pull the backend DB layer (runtime_v2 -> observability_v2 -> db -> psycopg),
-# which a resident consumer (a pure HTTP client with no database) must not be
-# forced to install just to reply to chat. Keeping them out of module import
-# means the chat reply loop runs psycopg-free.
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -223,9 +214,7 @@ CHECKPOINT_FILE = Path(
     os.environ.get("CHECKPOINT_FILE", "/tmp/feedling_chat_checkpoint.json")
 )
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
-RESIDENT_WAKE_RUNTIME_V2_FLAG = "resident_wake_runtime_v2_enabled"
 RESIDENT_CHAT_RUNTIME_V2_FLAG = "resident_chat_runtime_v2_enabled"
-FOREGROUND_CHAT_TOOL_BUDGET_MODE_V2 = "foreground_chat_fast"
 PROACTIVE_POLL_ENABLED = _env_bool("PROACTIVE_POLL_ENABLED", True)
 PROACTIVE_POLL_TIMEOUT = int(os.environ.get("PROACTIVE_POLL_TIMEOUT", "1"))
 PROACTIVE_TICK_ENABLED = _env_bool("PROACTIVE_TICK_ENABLED", True)
@@ -2503,85 +2492,6 @@ def call_agent(
     raise ValueError("agent produced no usable reply after sanitization")
 
 
-# ---------------------------------------------------------------------------
-# V2 proactive tool loop (D11) — resident HTTP call_tool + loop entrypoint
-# ---------------------------------------------------------------------------
-
-def _resident_call_tool_v2(name: str, args: Any, *, budget_mode: str = "") -> dict:
-    """POST to /v1/proactive/tool/execute and return the normalised result dict.
-
-    Note: a network-level exception (not an HTTP status, e.g. connection refused)
-    propagates out of this function and is caught by _process_proactive_jobs's
-    try/except, marking the job failed — this is intentional fail-closed behaviour.
-    """
-    body = {"name": name, "args": dict(args or {})}
-    if budget_mode:
-        body["budget_mode"] = budget_mode
-    resp = httpx.post(
-        f"{FEEDLING_API_URL}/v1/proactive/tool/execute",
-        headers=_HEADERS,
-        json=body,
-        timeout=60,
-    )
-    if resp.status_code >= 400:
-        return {
-            "name": name,
-            "ok": False,
-            "outcome": "error",
-            "result": {},
-            "error_code": f"http_{resp.status_code}",
-            "needs_background": False,
-        }
-    return resp.json()
-
-
-def _resident_run_agent_v2(message: str, *, foreground_chat: bool = False) -> Any:
-    """Run the multi-turn V2 tool loop for a proactive resident turn.
-
-    The external agent is called via call_agent (CLI or HTTP, no images for V2
-    jobs).  Tool execution happens via _resident_call_tool_v2 (HTTP bridge to
-    /v1/proactive/tool/execute).  Returns the terminal reply from call_agent
-    (may be a dict in HTTP mode or a str in CLI mode); _split_agent_turn already
-    knows how to parse both.
-    """
-    base_messages: list[dict[str, Any]] = [{"role": "user", "content": message}]
-
-    def call_model(messages: list[dict[str, Any]]) -> Any:
-        # Re-serialise the running transcript as a single text block for the
-        # external agent (CLI / HTTP).  Non-string content (e.g. dict returned
-        # by call_agent in HTTP mode) is serialised as JSON so multi-round
-        # history never arrives as a Python repr like {'tool_calls': [...]}.
-        # V2 jobs never pass images.
-        text = "\n\n".join(
-            m["content"] if isinstance(m["content"], str)
-            else json.dumps(m["content"], ensure_ascii=False)
-            for m in messages
-        )
-        return call_agent(text)
-
-    def call_tool(name: str, args: Any) -> dict:
-        if not foreground_chat:
-            return _resident_call_tool_v2(name, args)
-        res = _resident_call_tool_v2(
-            name,
-            args,
-            budget_mode=FOREGROUND_CHAT_TOOL_BUDGET_MODE_V2,
-        )
-        if res.get("needs_background"):
-            return {
-                "name": name,
-                "ok": False,
-                "outcome": "unavailable",
-                "result": {},
-                "error_code": "foreground_slow_tool_unavailable",
-                "error_message": "This tool is not available in foreground chat.",
-                "needs_background": False,
-            }
-        return res
-
-    return run_tool_loop_v2(call_model, call_tool, base_messages, max_iters=4)
-
-
 def _resident_foreground_chat_message_v2(content: str) -> str:
     """Resident foreground chat is a native-agent turn.
 
@@ -3514,41 +3424,11 @@ def _native_reachout_perception_context(presence: dict, change: list) -> str:
     return "\n".join(parts)
 
 
-def _resident_runtime_v2_enabled_for_job(job: dict) -> bool:
-    profile = job.get("runtime_v2") if isinstance(job.get("runtime_v2"), dict) else {}
-    return bool(profile.get(RESIDENT_WAKE_RUNTIME_V2_FLAG) or job.get(RESIDENT_WAKE_RUNTIME_V2_FLAG))
-
-
 def _is_memory_capture_job(job: dict) -> bool:
     return (
         str((job or {}).get("job_kind") or "").strip() == "memory_capture"
         or str((job or {}).get("source") or "").strip() == "memory_capture"
     )
-
-
-def _resident_user_id_for_job(job: dict) -> str:
-    return str(
-        _whoami_cache.get("user_id")
-        or job.get("user_id")
-        or job.get("owner_user_id")
-        or "resident_user"
-    )
-
-
-def _recent_chat_for_v2_context(value: Any) -> list[dict[str, Any]]:
-    chat = _coerce_proactive_chat_context(value)
-    if not chat.text:
-        return []
-    return [{
-        "role": "recent_chat_context",
-        "content": chat.text,
-        "freshness": chat.freshness,
-        "included_count": chat.included_count,
-        "last_message_age_sec": chat.last_message_age_sec,
-        "last_user_message_age_sec": chat.last_user_message_age_sec,
-        "last_visible_proactive_age_sec": chat.last_visible_proactive_age_sec,
-        "visible_proactive_count_24h": chat.visible_proactive_count_24h,
-    }]
 
 
 def _resident_perception_trend(signal: str, field: str) -> dict:
@@ -3569,10 +3449,10 @@ def _resident_perception_trend(signal: str, field: str) -> dict:
 
 
 def _resident_perception_now() -> dict:
-    """Best-effort direct pull of /v1/agent/perception for native/V2 digest.
+    """Best-effort direct pull of /v1/agent/perception for native reach-out digest.
 
-    This intentionally bypasses /v1/proactive/tool/execute so native reach-out
-    can retire the simulated tool route without losing the cheap presence hints.
+    Native reach-out can preload cheap presence hints without reintroducing the
+    retired simulated resident tool bridge.
     """
     try:
         resp = httpx.get(
@@ -3627,83 +3507,6 @@ def _proactive_perception_digest() -> tuple[dict, list]:
                 "delta": tr.get("delta"), "direction": tr.get("direction"),
             })
     return presence, change
-
-
-def _resident_v2_agent_context_for_job(
-    job: dict,
-    *,
-    recent_chat_context: Any = "",
-    runtime: str = "resident",
-) -> dict[str, Any]:
-    # Lazy import: these pull the backend DB layer (psycopg) and are only needed
-    # on the proactive-job path, not for chat replies. See the import-block note.
-    from proactive.adapters_v2 import wake_event_v2_from_legacy_job
-    from proactive.runtime_v2 import merge_wakes_v2
-    event = wake_event_v2_from_legacy_job(_resident_user_id_for_job(job), job)
-    merged = merge_wakes_v2([event], tool_catalog=tool_catalog_v2_for_runtime(runtime))
-    context = build_agent_context_v2(
-        merged,
-        recent_chat=_recent_chat_for_v2_context(recent_chat_context),
-    )
-    # Pre-load real perception so the wake turn isn't blind (presence = now;
-    # perception_change = vs baseline). Best-effort; never blocks the wake.
-    try:
-        presence, change = _proactive_perception_digest()
-        if presence:
-            context["presence_hints"] = {**(context.get("presence_hints") or {}), **presence}
-        if change:
-            context["perception_change"] = change
-    except Exception as e:
-        log.debug("proactive perception digest failed: %s", e)
-    return context
-
-
-def _message_for_proactive_job_v2(
-    job: dict,
-    screen_text: str = "",
-    recent_chat_context: Any = "",
-) -> str:
-    _ = screen_text
-    context = _resident_v2_agent_context_for_job(
-        job,
-        recent_chat_context=recent_chat_context,
-        runtime="resident",
-    )
-    parts = [
-        "[Feedling Runtime V2 proactive wake]",
-        "This is a hidden wake turn, not a user request.",
-        "The platform supplied wake context and tools only; it did not decide whether you should speak.",
-        # Neutral choice — no platform bias toward either side. The proactive vs.
-        # quiet personality lives in your own persona, not here.
-        "You own the decision: choose between send_message and sleep based purely on "
-        "whether there is anything worth surfacing to the user right now. Neither is a default.",
-        "Return JSON only using the V2 action contract.",
-        (
-            "Allowed actions: "
-            "send_message {text}, sleep {reason}, schedule_wake {at,tz,note,origin_refs}, "
-            "cancel_wake {wake_id,reason}."
-        ),
-        "For visible speech, prefer actions:[{\"type\":\"send_message\",\"text\":\"...\"}] or messages:[\"...\"].",
-        "Do not mention this hidden wake, runtime metadata, or system wording to the user.",
-        # Pre-loaded real signals so you don't speak blind: context.presence_hints =
-        # current snapshot, context.perception_change = vs-your-baseline deltas,
-        # context.recent_chat = timestamped recent messages.
-        "Real signals are pre-loaded in v2_context_json (presence_hints, perception_change, "
-        "recent_chat). Ground anything you say in those — never invent facts about the user. "
-        "Pull more detail with tools if useful.",
-        (
-            "If something is worth checking back on later, schedule_wake with origin_refs "
-            "referencing this wake so the future turn has the thread."
-        ),
-        (
-            "Tool use: you may return {\"tool_calls\":[{\"name\":\"<tool>\",\"args\":{...}}]} to gather "
-            "information from the tools listed in v2_context_json. You will receive results and may call "
-            "more tools (a few rounds). When you have enough information, finish with messages/actions "
-            "and NO tool_calls."
-        ),
-        "v2_context_json:\n" + json.dumps(context, ensure_ascii=False, sort_keys=True, indent=2),
-    ]
-    return "\n\n".join(parts)
 
 
 def _send_message_replies_from_actions(actions: list[dict]) -> list[str]:
@@ -4220,21 +4023,13 @@ def _process_proactive_jobs(jobs: list) -> float:
             frame_ids = []
         screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
         recent_context = recent_chat_context_for_proactive()
-        use_runtime_v2 = _resident_runtime_v2_enabled_for_job(job)
-        if use_runtime_v2:
-            message = _message_for_proactive_job_v2(
-                job,
-                screen_text=screen_text,
-                recent_chat_context=recent_context,
-            )
-        else:
-            perception_digest = _proactive_perception_digest()
-            message = _message_for_proactive_job(
-                job,
-                screen_text=screen_text,
-                recent_chat_context=recent_context,
-                perception_digest=perception_digest,
-            )
+        perception_digest = _proactive_perception_digest()
+        message = _message_for_proactive_job(
+            job,
+            screen_text=screen_text,
+            recent_chat_context=recent_context,
+            perception_digest=perception_digest,
+        )
         log.info(
             "proactive job [ts=%.3f] id=%s intent=%s frames=%d",
             ts,
@@ -4245,16 +4040,11 @@ def _process_proactive_jobs(jobs: list) -> float:
 
         update_proactive_job_status(job_id, "realizing")
         try:
-            agent_images = [] if use_runtime_v2 else screen_payloads
-            agent_image_paths = [] if use_runtime_v2 else screen_paths
-            if use_runtime_v2:
-                agent_result = _resident_run_agent_v2(message)
-            else:
-                agent_result = call_agent(
-                    message,
-                    images=agent_images,
-                    image_paths=agent_image_paths,
-                )
+            agent_result = call_agent(
+                message,
+                images=screen_payloads,
+                image_paths=screen_paths,
+            )
         except Exception as e:
             log.error("proactive agent call failed; not posting fallback: %s", e)
             update_proactive_job_status(job_id, "failed", f"agent_call_failed: {e}")

@@ -152,7 +152,6 @@ def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monk
 
     try:
         with patch.object(crc, "call_agent", side_effect=fake_call) as mock_agent, \
-             patch.object(crc, "_resident_run_agent_v2") as mock_v2, \
              patch.object(crc, "post_reply", return_value={"id": "reply-msg-v2"}) as mock_post:
             result_ts = crc._process_messages([msg])
     finally:
@@ -160,7 +159,6 @@ def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monk
 
     assert result_ts == pytest.approx(1112.0)
     mock_agent.assert_called_once()
-    mock_v2.assert_not_called()
     assert captured["message"] == "天气怎么样？"
     assert "Available tools JSON" not in captured["message"]
     assert "tool_calls" not in captured["message"]
@@ -1872,142 +1870,6 @@ def test_process_proactive_v2_request_broadcast_posts_visible_request(monkeypatc
     assert posted[-1][3]["extra"]["wake_result"] == "posted"
 
 
-def test_resident_v2_context_matches_hosted_catalog_for_same_wake(monkeypatch):
-    from proactive.adapters_v2 import wake_event_v2_from_legacy_job
-    from proactive.agent_protocol_v2 import build_agent_context_v2
-    from proactive.runtime_v2 import merge_wakes_v2
-    from proactive.tool_catalog_v2 import tool_catalog_v2_for_runtime
-
-    monkeypatch.setitem(crc._whoami_cache, "user_id", "usr_resident_v2")
-    job = {
-        "schema_version": 2,
-        "job_id": "pj_equiv",
-        "wake_id": "wake_equiv",
-        "source": crc.PROACTIVE_JOB_SOURCE,
-        "ts": 100.0,
-        "trigger": "scheduled_wake",
-        "change_digest": "check whether she left",
-        "scheduled_note": "check whether she left",
-        "timezone": "Asia/Shanghai",
-        "origin_refs": ["msg_1"],
-    }
-
-    resident = crc._resident_v2_agent_context_for_job(job)
-    event = wake_event_v2_from_legacy_job("usr_resident_v2", job)
-    hosted = build_agent_context_v2(
-        merge_wakes_v2([event], tool_catalog=tool_catalog_v2_for_runtime("hosted")),
-        recent_chat=[],
-    )
-
-    assert resident["trigger"] == hosted["trigger"] == "scheduled_wake"
-    assert resident["scheduled_note"] == hosted["scheduled_note"] == "check whether she left"
-    assert resident["origin_refs"] == hosted["origin_refs"] == ["msg_1"]
-    assert resident["tools"] == hosted["tools"]
-    assert ("schedule_wake", "action", "fast") in tool_catalog_v2_for_runtime("resident").signature()
-    assert tool_catalog_v2_for_runtime("resident").signature() == tool_catalog_v2_for_runtime("hosted").signature()
-
-
-def test_process_proactive_runtime_v2_flag_skips_legacy_prompt_and_posts_send_message(monkeypatch):
-    crc._seen_ids.clear()
-    crc._seen_ids_order.clear()
-
-    captured = {"posted": [], "statuses": []}
-
-    def _legacy_prompt(*_args, **_kwargs):
-        raise AssertionError("legacy proactive prompt must be unreachable for runtime v2 jobs")
-
-    def _agent(message, images=None, image_paths=None):
-        captured["message"] = message
-        return {"actions": [{"type": "send_message", "text": "V2 action bubble"}], "messages": []}
-
-    monkeypatch.setattr(crc, "_message_for_proactive_job", _legacy_prompt)
-    monkeypatch.setattr(crc, "call_agent", _agent)
-    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_v2"})
-    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
-    monkeypatch.setattr(
-        crc,
-        "update_proactive_job_status",
-        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
-    )
-    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
-    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
-
-    job = {
-        "schema_version": 2,
-        "job_id": "pj_runtime_v2",
-        "wake_id": "wake_runtime_v2",
-        "source": crc.PROACTIVE_JOB_SOURCE,
-        "ts": 127.0,
-        "trigger": "heartbeat_broadcast_on",
-        "runtime_v2": {crc.RESIDENT_WAKE_RUNTIME_V2_FLAG: True},
-    }
-
-    assert crc._process_proactive_jobs([job]) == pytest.approx(127.0)
-    assert "Feedling Runtime V2 proactive wake" in captured["message"]
-    assert "v2_context_json" in captured["message"]
-    assert "Allowed actions" in captured["message"]
-    assert "Feedling proactive wake" not in captured["message"]
-    assert captured["posted"][0][0] == "V2 action bubble"
-    assert captured["posted"][0][1]["proactive_job_id"] == "pj_runtime_v2"
-    assert any(s[0] == "pj_runtime_v2" and s[1] == "posted" for s in captured["statuses"])
-
-
-def test_process_proactive_runtime_v2_schedule_action_calls_backend_without_chat(monkeypatch):
-    crc._seen_ids.clear()
-    crc._seen_ids_order.clear()
-
-    captured = {"scheduled": [], "statuses": [], "posted": []}
-
-    monkeypatch.setattr(
-        crc,
-        "call_agent",
-        lambda message, images=None, image_paths=None: {
-            "actions": [{
-                "type": "schedule_wake",
-                "at": "2030-01-01T09:30:00",
-                "tz": "Asia/Shanghai",
-                "note": "check in",
-                "origin_refs": ["msg_1"],
-            }],
-            "messages": [],
-        },
-    )
-    monkeypatch.setattr(
-        crc,
-        "execute_scheduled_wake_actions",
-        lambda actions, job: captured["scheduled"].append((actions, job)) or {
-            "results": [{"type": "schedule_wake_result", "status": "scheduled", "timer_id": "sched_1"}],
-        },
-    )
-    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg"})
-    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
-    monkeypatch.setattr(
-        crc,
-        "update_proactive_job_status",
-        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
-    )
-    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
-    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
-
-    job = {
-        "schema_version": 2,
-        "job_id": "pj_schedule",
-        "wake_id": "wake_schedule",
-        "source": crc.PROACTIVE_JOB_SOURCE,
-        "ts": 128.0,
-        "trigger": "heartbeat_broadcast_on",
-        "runtime_v2": {crc.RESIDENT_WAKE_RUNTIME_V2_FLAG: True},
-    }
-
-    assert crc._process_proactive_jobs([job]) == pytest.approx(128.0)
-    assert captured["scheduled"][0][0][0]["type"] == "schedule_wake"
-    assert captured["posted"] == []
-    completed = [s for s in captured["statuses"] if s[1] == "completed"]
-    assert completed
-    assert completed[-1][2] == "agent_scheduled_wake_actions"
-    assert completed[-1][3]["extra"]["wake_result"] == "action_only"
-
-
 def test_process_proactive_native_action_only_send_message_posts(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
@@ -2151,7 +2013,6 @@ def test_proactive_perception_digest_uses_agent_perception_route_not_v2_tool(mon
             },
         })
 
-    monkeypatch.setattr(crc, "_resident_call_tool_v2", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("simulated tool route used")))
     monkeypatch.setattr(crc.httpx, "get", _get)
 
     presence, change = crc._proactive_perception_digest()
@@ -2159,7 +2020,7 @@ def test_proactive_perception_digest_uses_agent_perception_route_not_v2_tool(mon
     assert presence["place_label"] == "home"
     assert presence["local_time"] == "2026-06-26T20:30:00+08:00"
     assert any(call[0].endswith("/v1/agent/perception") and call[1] == {"signals": "now"} for call in calls)
-    assert all("/v1/proactive/tool/execute" not in call[0] for call in calls)
+    assert all(call[0].endswith(("/v1/agent/perception", "/v1/agent/perception/trend")) for call in calls)
     assert {item["signal"] for item in change} == {"vitals", "steps", "sleep"}
 
 
@@ -2528,210 +2389,6 @@ def test_post_proactive_reply_triggers_alert_and_live_activity(monkeypatch):
         "gate_decision_id": "gd_1",
         "proactive_job_id": "pj_1",
     }
-
-
-# ---------------------------------------------------------------------------
-# Task 5 (D11): resident V2 proactive tool loop
-# ---------------------------------------------------------------------------
-
-def test_resident_proactive_runs_tool_loop(monkeypatch):
-    """_resident_run_agent_v2 should run through the tool loop:
-    turn1 → tool_call(screen.read), turn2 → terminal message.
-    The tool result (caption) must be fed back into the second call.
-    """
-    scripted = [
-        '{"tool_calls": [{"name": "screen.read", "args": {}}]}',
-        '{"messages": ["ok"]}',
-    ]
-    fed_back: list[str] = []
-
-    def fake_call_agent(message, **kw):
-        fed_back.append(message)
-        return scripted.pop(0)
-
-    posted: list[tuple[str, dict]] = []
-
-    def fake_call_tool(name, args):
-        posted.append((name, dict(args or {})))
-        return {
-            "name": name,
-            "ok": True,
-            "outcome": "ok",
-            "result": {"caption": "Inbox"},
-            "error_code": "",
-            "needs_background": False,
-        }
-
-    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
-    monkeypatch.setattr(crc, "_resident_call_tool_v2", fake_call_tool)
-
-    final = crc._resident_run_agent_v2("system+context message")
-
-    assert json.loads(final)["messages"] == ["ok"]
-    assert posted == [("screen.read", {})]
-    assert any("Inbox" in m for m in fed_back), f"caption not fed back; fed_back={fed_back}"
-
-
-def test_resident_foreground_tool_loop_turns_slow_handoff_into_tool_error(monkeypatch):
-    scripted = [
-        '{"tool_calls": [{"name": "perception.steps", "args": {}}]}',
-        '{"messages": ["我现在不能直接查步数。"]}',
-    ]
-    fed_back: list[str] = []
-
-    def fake_call_agent(message, **kw):
-        fed_back.append(message)
-        return scripted.pop(0)
-
-    def fake_call_tool(name, args, *, budget_mode=""):
-        assert budget_mode == crc.FOREGROUND_CHAT_TOOL_BUDGET_MODE_V2
-        return {
-            "name": name,
-            "ok": False,
-            "outcome": "needs_background",
-            "result": {},
-            "error_code": "slow_budget_soft_handoff",
-            "needs_background": True,
-        }
-
-    monkeypatch.setattr(crc, "call_agent", fake_call_agent)
-    monkeypatch.setattr(crc, "_resident_call_tool_v2", fake_call_tool)
-
-    final = crc._resident_run_agent_v2("foreground message", foreground_chat=True)
-
-    assert json.loads(final)["messages"] == ["我现在不能直接查步数。"]
-    assert "foreground_slow_tool_unavailable" in fed_back[-1]
-    assert "needs_background" not in json.loads(final).get("actions", [])
-
-
-def test_resident_proactive_tool_loop_no_python_repr_on_multi_round():
-    """_resident_run_agent_v2 with a dict-returning call_agent (real HTTP mode
-    shape) across TWO tool rounds must never let a Python repr like
-    {'tool_calls': [...]} appear in the transcript text fed to the agent.
-
-    Regression: before Fix 1, str(dict) was used instead of json.dumps, so
-    round-2+ history arrived as Python repr, garbling the agent's context.
-    """
-    # Scripted agent responses — dicts (real HTTP mode shape), not strings.
-    scripted = [
-        {"tool_calls": [{"name": "screen.read", "args": {}}]},
-        {"tool_calls": [{"name": "memory.fetch", "args": {"ids": ["m1"]}}]},
-        {"messages": ["done"]},
-    ]
-    fed_texts: list[str] = []
-
-    def fake_call_agent_dict(message, **kw):
-        fed_texts.append(message)
-        return scripted.pop(0)
-
-    def fake_call_tool_multi(name, args):
-        return {
-            "name": name,
-            "ok": True,
-            "outcome": "ok",
-            "result": {"data": f"result_of_{name}"},
-            "error_code": "",
-            "needs_background": False,
-        }
-
-    import unittest.mock as _mock
-    with _mock.patch.object(crc, "call_agent", fake_call_agent_dict), \
-         _mock.patch.object(crc, "_resident_call_tool_v2", fake_call_tool_multi):
-        final = crc._resident_run_agent_v2("initial prompt")
-
-    # Terminal return must still be the raw dict from call_agent, not a string.
-    assert isinstance(final, dict)
-    assert final.get("messages") == ["done"]
-
-    # At least 3 calls were made (2 tool rounds + 1 terminal).
-    assert len(fed_texts) >= 3, f"expected >=3 calls but got {len(fed_texts)}: {fed_texts}"
-
-    # Round 2 and round 3 texts must NOT contain Python-repr dicts.
-    for round_idx, text in enumerate(fed_texts[1:], start=2):
-        assert "{'tool_calls'" not in text, (
-            f"Round {round_idx} contains Python repr: {text!r}"
-        )
-        assert "{'messages'" not in text, (
-            f"Round {round_idx} contains Python repr: {text!r}"
-        )
-        # The assistant-turn section embedded in the transcript must be
-        # valid JSON (parseable with json.loads) — not Python repr.
-        # Each "\n\n"-separated block is either the user prompt or an
-        # assistant/tool turn; we check that none of the non-initial
-        # blocks that start with '{' are Python repr.
-        sections = text.split("\n\n")
-        for section in sections:
-            stripped = section.strip()
-            if stripped.startswith("{") and stripped.endswith("}"):
-                try:
-                    json.loads(stripped)
-                except json.JSONDecodeError as exc:
-                    raise AssertionError(
-                        f"Round {round_idx} section is not valid JSON (likely Python repr): "
-                        f"{stripped!r}"
-                    ) from exc
-
-
-# ---------------------------------------------------------------------------
-# Fix round 2: tool_calls survives the real call_agent normalizer (masked-bug
-# regression). Monkeypatches ONLY the transport layer (call_agent_http), NOT
-# call_agent itself — so the fix is proven end-to-end through the normalizer.
-# ---------------------------------------------------------------------------
-
-def test_tool_calls_survive_real_call_agent_normalizer(monkeypatch):
-    """Regression for the D11 resident Critical: when the model returns ONLY
-    tool_calls (no messages/actions), call_agent used to raise
-    ValueError('agent produced no usable reply after sanitization') because
-    AgentTurn had no tool_calls field.  This test drives the loop through the
-    REAL call_agent (only call_agent_http is monkeypatched at the transport
-    boundary) to prove that tool_calls now survive the normalizer and reach
-    run_tool_loop_v2.
-    """
-    # Transport layer returns raw dicts: turn 1 = tool-call only, turn 2 = terminal.
-    http_responses = [
-        {"tool_calls": [{"name": "screen.read", "args": {}}]},
-        {"messages": ["done"]},
-    ]
-    http_call_count = []
-
-    def _fake_call_agent_http(message, images=None):
-        body = http_responses[len(http_call_count)]
-        http_call_count.append(1)
-        return body
-
-    tool_calls_seen: list[tuple[str, dict]] = []
-
-    def _fake_call_tool(name, args):
-        tool_calls_seen.append((name, dict(args or {})))
-        return {
-            "name": name,
-            "ok": True,
-            "outcome": "ok",
-            "result": {"caption": "InboxScreen"},
-            "error_code": "",
-            "needs_background": False,
-        }
-
-    monkeypatch.setattr(crc, "AGENT_MODE", "http")
-    # Monkeypatch the transport, NOT call_agent — session management stays real.
-    monkeypatch.setattr(crc, "call_agent_http", _fake_call_agent_http)
-    monkeypatch.setattr(crc, "_resident_call_tool_v2", _fake_call_tool)
-
-    # Drive through the REAL call_agent — not monkeypatched.
-    final = crc._resident_run_agent_v2("test message")
-
-    # The tool must have been executed exactly once with correct name.
-    assert tool_calls_seen == [("screen.read", {})], (
-        f"Expected tool call screen.read but got: {tool_calls_seen}"
-    )
-
-    # The final result must reflect the terminal turn {"messages": ["done"]}.
-    # parse_agent_response_v2 accepts a Mapping, so final (a dict) is fine.
-    from proactive.agent_protocol_v2 import parse_agent_response_v2
-    parsed = parse_agent_response_v2(final)
-    assert "done" in parsed.messages, (
-        f"Terminal message 'done' not found in parsed.messages={parsed.messages}; final={final!r}"
-    )
 
 
 def test_normalizer_keeps_tool_only_json_wrapped_in_log_text():

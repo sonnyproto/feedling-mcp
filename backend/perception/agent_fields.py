@@ -1,10 +1,10 @@
 """Single source of truth for agent-facing perception projection.
 
 Both the CLI-tools path (`/v1/agent/perception`, used by io_cli + the OpenClaw
-native plugin) and the proactive wake path (`tool_executor_v2` /
-`/v1/proactive/tool/execute`) project perception_state through THIS map, so the
-proactive agent sees exactly the same signals/fields as chat — no second, stale
-catalog. (A-lite unification 2026-06-26; see project_proactive_tool_unification.)
+native plugin) and the hosted proactive tool executor path (`tool_executor_v2`)
+project perception_state through THIS map, so the proactive agent sees exactly
+the same signals/fields as chat -- no second, stale catalog. (A-lite
+unification 2026-06-26; see project_proactive_tool_unification.)
 
 Add a new agent-pullable signal/field here ONCE and both paths pick it up.
 """

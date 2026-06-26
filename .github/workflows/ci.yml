@@ -140,8 +140,6 @@ jobs:
             tests/test_screen_caption_backend.py \
             tests/test_screen_caption_flag.py \
             tests/test_proactive_agent_protocol_v2.py \
-            tests/test_tool_loop_v2.py \
-            tests/test_proactive_tool_execute_route.py \
             tests/test_chat_resident_consumer.py \
             tests/test_runtime_v2_default_flag.py \
             tests/test_capture_prompt_v1.py \
