@@ -75,8 +75,19 @@ CLI 工具，消灭"把 agent 当裸模型返 JSON"的双路。
   `_resident_call_tool_v2` + 对应测试/ci。proactive wake 现在**始终走原生**。
 - **保留** `tool_executor_v2`/`tool_catalog_v2`（hosted 前台 chat / dashboard / runtime_v2 仍用）。
 - 删后 VPS e2e：手动+自动唤醒都走 native（digest 直连、agent 跑、sleep 有理有据、**零 `/v1/proactive/tool/execute`**、无报错）。
-- 尾巴：prod `RUNTIME_V2_DEFAULT_ON=true` 删 V2 分支后已 vestigial（待单独清）；Dream（方案 Part 2）后排；
-  io_cli `send/wait-for-wake/schedule-wake/photo` 仍 stub。
+**Tail（同日收尾）**
+- Tail-1 修：`FEEDLING_RUNTIME_V2_DEFAULT_ON` 是**共享 baseline**（perception ingress / chat / screen caption /
+  hosted chat 都跟它），P2-2a 为验 wake 把 test 翻 false 顺带关了 test 感知 v2；wake 已 native-only 后翻回 true
+  恢复（`4d72392`），prod 一直 true 未动。
+- Tail-3 `io_cli`：补 `photo-recent` 原生读工具（`b7d52a6`）；`send/wait-for-wake/schedule-wake` 是 native 输出
+  动作不是 pull 工具，改成澄清 stub。
+- **Tail-2 Dream（方案 Part 2，已 ship）**：`job_kind=memory_dream` 复用 capture 基座（PR D.1 `30378a9`
+  prompt+parser、PR D.2 `6a0f687` lane）。夜间/攒量触发→原生 call_agent 整理（merge/thicken/supersede）→
+  **只 `memory.supersede` 软退绝不硬删**、不写 chat、不走 reach-out gate、questions 落 status 不发用户。
+  VPS e2e：force tick→agent 整理 40 卡→8 consolidations（merged 5 / superseded 31），active 40→17，
+  旧卡 status=superseded 仍可 fetch、superseded_by 链保留、零 chat。
+- 尾巴（后排）：prod 切 native 是一次 prod 部署（待点头，code 已 native-only）；Dream eval 留后；
+  io_cli send/wait/schedule 仍 stub（设计上就是输出动作）。
 
 ### [DONE] resident consumer 自动更新（路径感知锁步）
 
