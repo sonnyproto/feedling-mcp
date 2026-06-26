@@ -48,7 +48,7 @@ _BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from agent_runtime import leases, spawners
+from agent_runtime import leases, litellm_gateway, spawners
 
 log = logging.getLogger("feedling.agent_runtime.supervisor")
 
@@ -228,23 +228,83 @@ def _resolve_roster(roster: list[dict]) -> list[dict]:
     return resolved
 
 
-def _discover_enabled() -> dict[str, str]:
-    """Map ``user_id -> driver`` for users opted into the hosted runtime (Stage C),
-    read straight from the DB the supervisor already connects to for leases."""
-    return {u["user_id"]: u["driver"] for u in db.list_agent_runtime_enabled_users()}
+def _discover_enabled(include_gateway: bool = False) -> dict[str, dict]:
+    """Map ``user_id -> {"driver", "provider"}`` for users opted into the hosted
+    runtime (Stage C), read straight from the DB the supervisor already connects
+    to for leases. The provider + model + base_url ride along so a codex user can
+    be wired native (openai) vs LiteLLM-gateway (gemini/openrouter/…) at spawn, and
+    the gateway routing can be built per user. ``include_gateway`` mirrors whether
+    the LiteLLM gateway is running — when off, gateway-only providers are excluded
+    so they aren't spawned against a proxy that isn't there."""
+    return {u["user_id"]: {"driver": u["driver"], "provider": u.get("provider", ""),
+                           "model": u.get("model", ""), "base_url": u.get("base_url", "")}
+            for u in db.list_agent_runtime_enabled_users(include_gateway=include_gateway)}
 
 
-def _apply_discovery(roster: list[dict], enabled: dict[str, str]) -> list[dict]:
+def _apply_discovery(roster: list[dict], enabled: dict[str, dict]) -> list[dict]:
     """Filter the (credential-bearing) roster to users the backend has enabled,
-    taking each driver from the backend flag — the /v1/model_api/driver setter is
-    the gradual-migration control plane. Roster still supplies api_keys until
-    Stage D's runtime-token. Entries must already have ``user_id`` (whoami)."""
+    taking driver/provider/model/base_url from the backend flag — the
+    /v1/model_api/driver setter is the gradual-migration control plane. Roster
+    still supplies api_keys until Stage D's runtime-token. Entries must already
+    have ``user_id`` (whoami)."""
     out = []
     for entry in roster:
         uid = entry.get("user_id")
-        if uid in enabled:
-            out.append({**entry, "driver": enabled[uid]})
+        info = enabled.get(uid)
+        if info is not None:
+            out.append({**entry, "driver": info["driver"],
+                        "provider": info.get("provider", ""),
+                        "model": info.get("model", ""),
+                        "base_url": info.get("base_url", "")})
     return out
+
+
+def _gateway_entries(roster: list[dict]) -> list[dict]:
+    """Codex users that must be bridged through the in-CVM LiteLLM gateway
+    (gemini/openrouter/openai_compatible). Each carries the REAL upstream
+    provider/model/key for building the per-user LiteLLM routing."""
+    out = []
+    for e in roster:
+        if spawners._codex_transport(e) == "gateway":
+            out.append({
+                "user_id": e["user_id"],
+                "provider": e.get("provider", ""),
+                "model": e.get("model") or "",
+                "base_url": e.get("base_url") or "",
+                "provider_key": e.get("provider_key") or "",
+            })
+    return out
+
+
+def _drop_gateway_users(roster: list[dict]) -> list[dict]:
+    """Remove codex users that would need the LiteLLM gateway — used when the
+    gateway is DISABLED. Without a running proxy, spawning them as gateway codex
+    yields a config pointing at nothing (and usually no gateway key), so they must
+    be dropped rather than half-spawned. Native (openai) + claude users stay."""
+    kept = [e for e in roster if spawners._codex_transport(e) != "gateway"]
+    dropped = [e.get("user_id") for e in roster if spawners._codex_transport(e) == "gateway"]
+    if dropped:
+        log.warning("litellm gateway disabled — dropping %d gateway codex user(s): %s",
+                    len(dropped), dropped)
+    return kept
+
+
+def _wire_gateway_models(roster: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Return (roster, gateway_entries). Gateway codex entries are rewritten so
+    codex REQUESTS the ``gw-<uid>`` model (which LiteLLM maps to the real upstream
+    model+key); the returned gateway_entries retain the real model for building
+    the LiteLLM config. Non-gateway entries pass through unchanged."""
+    gateways = _gateway_entries(roster)
+    if not gateways:
+        return roster, []
+    gateway_uids = {g["user_id"] for g in gateways}
+    wired = [
+        {**e, "model": litellm_gateway.gateway_model_id(e["user_id"])}
+        if e.get("user_id") in gateway_uids and spawners._codex_transport(e) == "gateway"
+        else e
+        for e in roster
+    ]
+    return wired, gateways
 
 
 def main() -> int:
@@ -258,11 +318,18 @@ def main() -> int:
     data_root = os.environ.get("AGENT_DATA_ROOT", "/agent-data")
     isolation = os.environ.get("AGENT_RUNTIME_ISOLATION", "process").strip().lower()
 
+    gateway_enabled = os.environ.get("FEEDLING_LITELLM_ENABLE", "").strip().lower() in ("1", "true", "yes")
+
     roster = _resolve_roster(_load_roster())
     if os.environ.get("AGENT_RUNTIME_AUTODISCOVER", "").strip().lower() in ("1", "true", "yes"):
-        enabled = _discover_enabled()
+        # Only discover gateway-only providers when the gateway is actually running.
+        enabled = _discover_enabled(include_gateway=gateway_enabled)
         roster = _apply_discovery(roster, enabled)
         log.info("autodiscover: %d roster users intersect %d backend-enabled", len(roster), len(enabled))
+    # Defense-in-depth for static rosters: if the gateway is off, a gateway codex
+    # user (e.g. provider=gemini) has nowhere to route — drop rather than half-spawn.
+    if not gateway_enabled:
+        roster = _drop_gateway_users(roster)
     if not roster:
         log.error("empty roster — set AGENT_RUNTIME_USERS or AGENT_RUNTIME_ROSTER")
         return 2
@@ -287,6 +354,22 @@ def main() -> int:
 
         token_writer = _mint_and_write
 
+    # in-CVM LiteLLM gateway (codex non-openai providers). Off by default: only
+    # when FEEDLING_LITELLM_ENABLE is set do we rewrite gateway codex users to the
+    # gw-<uid> model and run a LiteLLM proxy that holds their upstream keys (in the
+    # proxy's env, never on disk). Codex reaches it at 127.0.0.1:<port>.
+    gateway_mgr = None
+    if gateway_enabled:
+        port = int(os.environ.get("FEEDLING_LITELLM_PORT", "4000"))
+        cfg_path = os.environ.get("FEEDLING_LITELLM_CONFIG", f"{data_root}/litellm.yaml")
+        os.environ.setdefault("FEEDLING_LITELLM_BASE_URL", f"http://127.0.0.1:{port}/v1")
+        roster, gateways = _wire_gateway_models(roster)
+        gateway_mgr = litellm_gateway.GatewayManager(config_path=cfg_path, port=port)
+        log.info("litellm gateway enabled — %d gateway users, config=%s port=%d",
+                 len(gateways), cfg_path, port)
+    else:
+        gateways = []
+
     sup = Supervisor(
         owner=owner, lease_ttl=lease_ttl, data_root=data_root,
         spawn_fn=spawn_fn, alive_fn=alive_fn, kill_fn=kill_fn,
@@ -296,6 +379,8 @@ def main() -> int:
     try:
         while True:
             try:
+                if gateway_mgr is not None:
+                    gateway_mgr.reconcile(gateways)
                 sup.tick(roster)
             except Exception as e:  # noqa: BLE001
                 log.exception("supervisor tick failed: %s", e)
@@ -305,6 +390,8 @@ def main() -> int:
         return 0
     finally:
         sup.shutdown()
+        if gateway_mgr is not None:
+            gateway_mgr.shutdown()
 
 
 if __name__ == "__main__":

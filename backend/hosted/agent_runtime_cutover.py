@@ -16,6 +16,7 @@ The wait helper takes injected ``now``/``sleep`` so it is deterministic in tests
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 import provider_client
@@ -24,15 +25,19 @@ log = logging.getLogger("feedling.hosted.agent_runtime_cutover")
 
 # The agent driver is DERIVED from the provider, never user-chosen: each CLI is
 # locked to a wire format (Claude Code = Anthropic Messages, Codex = OpenAI
-# Responses). Empirically (2026-06-25): anthropic + deepseek (its /anthropic
-# endpoint) work with Claude Code; openai works with Codex; gemini/openrouter/
-# openai_compatible have no native fit for either CLI today → stay legacy.
-# Keep this map in sync with the SQL CASE in db.list_agent_runtime_enabled_users.
-_PROVIDER_DRIVER = {
-    "anthropic": "claude",
-    "deepseek": "claude",
-    "openai": "codex",
-}
+# Responses). Empirically (2026-06-25): Claude Code handles ONLY anthropic +
+# deepseek (its /anthropic endpoint). Codex is the catch-all for everything
+# else — openai directly (native OpenAI Responses), and gemini/openrouter/
+# openai_compatible bridged through the in-CVM LiteLLM gateway (Codex speaks
+# Responses; LiteLLM fans out). Keep this map in sync with the SQL CASE in
+# db.list_agent_runtime_enabled_users.
+_CLAUDE_PROVIDERS = {"anthropic", "deepseek"}
+# Codex-driven providers that Codex reaches DIRECTLY (no LiteLLM bridge); every
+# other codex-driven provider must go through the gateway.
+_CODEX_NATIVE_PROVIDERS = {"openai"}
+# Codex-driven providers reachable today (native or via gateway). A provider not
+# here and not in _CLAUDE_PROVIDERS has no hosted fit → ``legacy``.
+_CODEX_PROVIDERS = {"openai", "gemini", "openrouter", "openai_compatible"}
 # Values of ``agent_runtime_driver`` that mean "hosted runtime OFF" (legacy
 # inline path). Anything else is the enable flag — the WHICH-agent decision is
 # then derived from the provider, so a stale "claude"/"codex" still resolves
@@ -43,10 +48,26 @@ _OFF_FLAGS = {"", "legacy", "off", "false", "0", "no", "disabled"}
 def driver_for_provider(provider: str) -> str:
     """The agent driver for a provider key — auto-derived, NOT user-chosen.
 
-    anthropic / deepseek → ``claude`` (Anthropic-wire CLI); openai → ``codex``;
-    anything else (gemini, openrouter, openai_compatible, …) → ``legacy`` (no
-    native hosted-agent fit yet)."""
-    return _PROVIDER_DRIVER.get(provider_client.normalize_provider(provider), "legacy")
+    anthropic / deepseek → ``claude`` (Anthropic-wire CLI); openai / gemini /
+    openrouter / openai_compatible → ``codex`` (the catch-all; non-openai via
+    the LiteLLM gateway). A provider with no configured fit → ``legacy``."""
+    p = provider_client.normalize_provider(provider)
+    if p in _CLAUDE_PROVIDERS:
+        return "claude"
+    if p in _CODEX_PROVIDERS:
+        return "codex"
+    return "legacy"
+
+
+def codex_transport(provider: str) -> str:
+    """For a codex-driven provider, how Codex reaches it: ``native`` (direct
+    OpenAI Responses, openai only) or ``gateway`` (via the in-CVM LiteLLM
+    Responses endpoint). Empty string when the provider is not codex-driven
+    (claude-driven or unconfigured) — the caller has nothing to wire."""
+    p = provider_client.normalize_provider(provider)
+    if p not in _CODEX_PROVIDERS:
+        return ""
+    return "native" if p in _CODEX_NATIVE_PROVIDERS else "gateway"
 
 
 def hosting_enabled(config: dict | None) -> bool:
@@ -57,13 +78,30 @@ def hosting_enabled(config: dict | None) -> bool:
     return str(config.get("agent_runtime_driver") or "").strip().lower() not in _OFF_FLAGS
 
 
+def gateway_enabled() -> bool:
+    """Whether the in-CVM LiteLLM gateway is enabled in this deployment
+    (``FEEDLING_LITELLM_ENABLE``). Must mirror the agent-runner supervisor's flag:
+    gateway-only providers have no consumer spawned unless the gateway is up, so
+    the cutover decision must match or sends wedge in ``processing``."""
+    return os.environ.get("FEEDLING_LITELLM_ENABLE", "").strip().lower() in ("1", "true", "yes")
+
+
 def resolve_driver(config: dict | None, *, default: str = "legacy") -> str:
     """The driver for this user's turn: ``legacy`` unless hosting is enabled, then
     the agent derived from the configured provider (``claude``/``codex``), or
-    ``legacy`` if the provider has no hosted-agent fit."""
+    ``legacy`` if the provider has no hosted-agent fit.
+
+    Gateway-only codex providers (gemini/openrouter/openai_compatible) stay
+    ``legacy`` until the LiteLLM gateway is enabled — otherwise no consumer runs
+    for them and the send would hang in ``processing`` instead of using the legacy
+    inline path. Native openai codex is unaffected."""
     if not hosting_enabled(config):
         return default
-    return driver_for_provider(str((config or {}).get("provider") or ""))
+    provider = str((config or {}).get("provider") or "")
+    driver = driver_for_provider(provider)
+    if driver == "codex" and codex_transport(provider) == "gateway" and not gateway_enabled():
+        return default
+    return driver
 
 
 def is_enabled(driver: str) -> bool:

@@ -38,6 +38,15 @@ RUN npm install -g @anthropic-ai/claude-code @openai/codex
 COPY backend/requirements.lock ./requirements.lock
 RUN pip install --require-hashes -r requirements.lock
 
+# in-CVM LiteLLM proxy — bridges codex (OpenAI Responses wire) to non-openai
+# providers (gemini/openrouter/openai_compatible). The supervisor launches it as
+# a child (`python -m litellm`) ONLY when FEEDLING_LITELLM_ENABLE is set, with a
+# per-user config + the upstream keys injected into the proxy's env (never on
+# disk). Pinned to the empirically-validated version.
+# Hardening TODO (match the rest of the image before prod): fold into
+# requirements.lock with hashes instead of an unpinned-resolver install.
+RUN pip install 'litellm[proxy]==1.89.4'
+
 # Ship the backend (content_encryption / db / proactive imported by the resident
 # consumer) AND tools/ (the resident consumer itself, spawned per user).
 COPY backend/ ./backend/

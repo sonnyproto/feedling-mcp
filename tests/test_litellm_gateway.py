@@ -1,0 +1,216 @@
+"""in-CVM LiteLLM gateway — per-user config + env generation (codex non-openai).
+
+Codex speaks OpenAI Responses only, so non-openai providers (gemini/openrouter/
+openai_compatible) are bridged through a LiteLLM proxy the supervisor runs inside
+the CVM. This module builds, per gateway user:
+  - a LiteLLM ``model_list`` entry named ``gw-<user_id>`` (the model codex
+    requests) routing to the real provider, with the upstream key referenced by
+    env var (``os.environ/...``) — NEVER inlined into the on-disk config;
+  - the {env_var: upstream_key} map the supervisor injects into the LiteLLM
+    subprocess environment (keys stay in memory, never persisted).
+"""
+
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+
+from agent_runtime import litellm_gateway as gw
+
+
+def test_gateway_model_id_and_env_var_are_per_user_and_sanitized():
+    assert gw.gateway_model_id("usr_abc") == "gw-usr_abc"
+    # env var names must be shell/env-safe (user ids are usr_<base32>, already safe,
+    # but be defensive about any stray chars)
+    assert gw.upstream_env_var("usr_abc") == "FEEDLING_UPKEY_usr_abc"
+    assert gw.upstream_env_var("usr-a.b/c") == "FEEDLING_UPKEY_usr_a_b_c"
+
+
+def test_model_entry_references_key_by_env_not_inline():
+    e = gw.build_model_entry(user_id="usr_1", provider="gemini", model="gemini-2.0-flash")
+    assert e["model_name"] == "gw-usr_1"
+    assert e["litellm_params"]["model"] == "gemini/gemini-2.0-flash"
+    # the upstream key is an env reference, never the plaintext
+    assert e["litellm_params"]["api_key"] == "os.environ/FEEDLING_UPKEY_usr_1"
+
+
+def test_model_entry_openrouter_prefix():
+    e = gw.build_model_entry(user_id="u", provider="openrouter", model="anthropic/claude-3.5-sonnet")
+    assert e["litellm_params"]["model"] == "openrouter/anthropic/claude-3.5-sonnet"
+
+
+def test_model_entry_openai_compatible_carries_api_base():
+    e = gw.build_model_entry(
+        user_id="u", provider="openai_compatible", model="my-model",
+        base_url="https://my.host/v1",
+    )
+    assert e["litellm_params"]["model"] == "openai/my-model"
+    assert e["litellm_params"]["api_base"] == "https://my.host/v1"
+
+
+def test_build_config_drops_codex_incompatible_params_and_sets_master_key_env():
+    cfg = gw.build_config([
+        {"user_id": "u1", "provider": "gemini", "model": "gemini-2.0-flash"},
+    ])
+    settings = cfg["litellm_settings"]
+    assert settings["drop_params"] is True
+    # Claude/codex emit Anthropic-only params non-Anthropic backends 400 on
+    for p in ("reasoning", "reasoning_effort", "thinking"):
+        assert p in settings["additional_drop_params"]
+    # codex authenticates with the gateway key; master_key is an env reference
+    assert cfg["general_settings"]["master_key"] == "os.environ/FEEDLING_LITELLM_API_KEY"
+    assert [m["model_name"] for m in cfg["model_list"]] == ["gw-u1"]
+
+
+def test_build_config_never_inlines_upstream_keys():
+    # the on-disk config must not contain any plaintext provider key
+    cfg = gw.build_config([
+        {"user_id": "u1", "provider": "gemini", "model": "m", "provider_key": "SECRET_KEY_123"},
+    ])
+    assert "SECRET_KEY_123" not in gw.render_config_yaml(cfg)
+
+
+def test_render_config_is_json_valid_yaml_subset_round_trips():
+    # Rendered as JSON (a strict YAML subset) so the module needs NO PyYAML
+    # dependency at import time; LiteLLM's yaml.safe_load parses it the same.
+    cfg = gw.build_config([{"user_id": "u1", "provider": "gemini", "model": "m"}])
+    text = gw.render_config_yaml(cfg)
+    assert json.loads(text) == cfg
+
+
+def test_upstream_env_maps_env_var_to_decrypted_key():
+    env = gw.upstream_env([
+        {"user_id": "u1", "provider": "gemini", "model": "m", "provider_key": "k1"},
+        {"user_id": "u2", "provider": "openrouter", "model": "m2", "provider_key": "k2"},
+    ])
+    assert env == {"FEEDLING_UPKEY_u1": "k1", "FEEDLING_UPKEY_u2": "k2"}
+    # entries without a resolved key are skipped (can't route them)
+    assert gw.upstream_env([{"user_id": "u3", "provider": "gemini", "model": "m"}]) == {}
+
+
+def test_config_signature_changes_with_model_or_base_url():
+    a = gw.config_signature([{"user_id": "u1", "provider": "gemini", "model": "m"}])
+    b = gw.config_signature([{"user_id": "u1", "provider": "gemini", "model": "m2"}])
+    assert a != b
+
+
+# ---- GatewayManager (subprocess lifecycle, injected launcher/stopper) ----
+
+
+class _FakeProc:
+    """A launcher handle with a Popen-like ``poll`` so the manager can detect a
+    crashed proxy. ``poll()`` returns None while alive, an exit code once dead."""
+    def __init__(self, name):
+        self.name = name
+        self._rc = None
+
+    def crash(self, rc=1):
+        self._rc = rc
+
+    def poll(self):
+        return self._rc
+
+
+class _FakeLauncher:
+    def __init__(self):
+        self.calls = []
+        self.stopped = []
+        self._n = 0
+
+    def launch(self, config_path, env, port):
+        self._n += 1
+        h = _FakeProc(f"h{self._n}")
+        self.calls.append({"config_path": config_path, "env": dict(env), "port": port, "handle": h})
+        return h
+
+    def stop(self, handle):
+        self.stopped.append(handle.name)
+
+
+def _mgr(tmp_path, fake, writes):
+    return gw.GatewayManager(
+        config_path=str(tmp_path / "litellm.yaml"), port=4123,
+        launcher=fake.launch, stopper=fake.stop,
+        writer=lambda p, c: writes.append((p, c)),
+    )
+
+
+def test_manager_writes_config_and_launches_with_key_env(tmp_path):
+    fake = _FakeLauncher(); writes = []
+    mgr = _mgr(tmp_path, fake, writes)
+    mgr.reconcile([{"user_id": "u1", "provider": "gemini", "model": "m", "provider_key": "k1"}])
+    assert len(fake.calls) == 1
+    call = fake.calls[0]
+    assert call["port"] == 4123
+    # the decrypted upstream key is injected into the subprocess env (not on disk)
+    assert call["env"]["FEEDLING_UPKEY_u1"] == "k1"
+    # config written, and it references the key by env (no plaintext)
+    assert writes and "k1" not in writes[-1][1]
+    assert "gw-u1" in writes[-1][1]
+
+
+def test_manager_no_relaunch_when_nothing_changed(tmp_path):
+    fake = _FakeLauncher(); writes = []
+    mgr = _mgr(tmp_path, fake, writes)
+    entries = [{"user_id": "u1", "provider": "gemini", "model": "m", "provider_key": "k1"}]
+    mgr.reconcile(entries)
+    mgr.reconcile([dict(entries[0])])  # identical routing AND key, proxy alive
+    assert len(fake.calls) == 1  # nothing changed → no bounce
+
+
+def test_manager_relaunches_on_upstream_key_rotation(tmp_path):
+    # The routing signature excludes keys (to avoid bouncing on rotation), but the
+    # key is only injected at launch — so a rotation MUST relaunch, else the proxy
+    # keeps using the stale key.
+    fake = _FakeLauncher(); writes = []
+    mgr = _mgr(tmp_path, fake, writes)
+    mgr.reconcile([{"user_id": "u1", "provider": "gemini", "model": "m", "provider_key": "k1"}])
+    mgr.reconcile([{"user_id": "u1", "provider": "gemini", "model": "m", "provider_key": "rotated"}])
+    assert len(fake.calls) == 2
+    assert fake.calls[-1]["env"]["FEEDLING_UPKEY_u1"] == "rotated"  # fresh key injected
+    assert fake.stopped == ["h1"]
+
+
+def test_manager_relaunches_when_crashed_even_if_unchanged(tmp_path):
+    # If the proxy crashed, a same-signature reconcile must NOT no-op — it has to
+    # bring the proxy back, or all gateway users stay broken until supervisor restart.
+    fake = _FakeLauncher(); writes = []
+    mgr = _mgr(tmp_path, fake, writes)
+    entries = [{"user_id": "u1", "provider": "gemini", "model": "m", "provider_key": "k1"}]
+    mgr.reconcile(entries)
+    fake.calls[0]["handle"].crash()  # proxy dies
+    mgr.reconcile([dict(entries[0])])
+    assert len(fake.calls) == 2  # relaunched the dead proxy
+    assert fake.stopped == ["h1"]
+
+
+def test_manager_relaunches_when_user_set_changes(tmp_path):
+    fake = _FakeLauncher(); writes = []
+    mgr = _mgr(tmp_path, fake, writes)
+    mgr.reconcile([{"user_id": "u1", "provider": "gemini", "model": "m", "provider_key": "k1"}])
+    mgr.reconcile([{"user_id": "u1", "provider": "gemini", "model": "m", "provider_key": "k1"},
+                   {"user_id": "u2", "provider": "openrouter", "model": "m2", "provider_key": "k2"}])
+    assert len(fake.calls) == 2
+    assert fake.stopped == ["h1"]  # old proxy stopped before relaunch
+
+
+def test_manager_stops_proxy_when_no_gateway_users(tmp_path):
+    fake = _FakeLauncher(); writes = []
+    mgr = _mgr(tmp_path, fake, writes)
+    mgr.reconcile([{"user_id": "u1", "provider": "gemini", "model": "m", "provider_key": "k1"}])
+    mgr.reconcile([])
+    assert fake.stopped == ["h1"]
+    assert len(fake.calls) == 1
+
+
+def test_config_signature_changes_with_user_set():
+    a = gw.config_signature([{"user_id": "u1", "provider": "gemini", "model": "m"}])
+    b = gw.config_signature([{"user_id": "u1", "provider": "gemini", "model": "m"},
+                             {"user_id": "u2", "provider": "openrouter", "model": "m2"}])
+    same = gw.config_signature([{"user_id": "u1", "provider": "gemini", "model": "m"}])
+    assert a == same
+    assert a != b
+    # signature must NOT depend on the secret key value (keys live in env)
+    c = gw.config_signature([{"user_id": "u1", "provider": "gemini", "model": "m", "provider_key": "x"}])
+    assert a == c

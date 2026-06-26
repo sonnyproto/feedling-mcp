@@ -98,12 +98,25 @@ def test_enabling_hosting_derives_codex_for_openai(client):
     assert res.get_json()["driver"] == "codex"
 
 
-def test_enabling_hosting_unsupported_provider_stays_legacy(client):
+def test_enabling_hosting_gateway_provider_stays_legacy_until_gateway_enabled(client, monkeypatch):
+    # gemini needs the LiteLLM gateway; with it OFF (default), enabling hosting
+    # reports legacy so the send keeps using the inline path (no consumer exists).
+    monkeypatch.delenv("FEEDLING_LITELLM_ENABLE", raising=False)
     user_id, api_key = _register(client)
     _seed_config(user_id, provider="gemini")
     res = client.post("/v1/model_api/driver", json={"enabled": True}, headers=_headers(api_key))
     assert res.status_code == 200
-    assert res.get_json()["driver"] == "legacy"  # no hosted-agent fit for gemini
+    assert res.get_json()["driver"] == "legacy"
+
+
+def test_enabling_hosting_gateway_provider_derives_codex_when_gateway_enabled(client, monkeypatch):
+    monkeypatch.setenv("FEEDLING_LITELLM_ENABLE", "1")
+    user_id, api_key = _register(client)
+    _seed_config(user_id, provider="gemini")
+    res = client.post("/v1/model_api/driver", json={"enabled": True}, headers=_headers(api_key))
+    assert res.status_code == 200
+    # gemini/openrouter/openai_compatible → codex (LiteLLM-bridged) once gateway on
+    assert res.get_json()["driver"] == "codex"
 
 
 def test_set_driver_requires_configured_model_api(client):

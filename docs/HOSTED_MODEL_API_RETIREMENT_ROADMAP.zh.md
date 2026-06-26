@@ -108,48 +108,102 @@ legacy inline 线现在做、agent-runner **还没做**的：
 - **provider key**：已存为 `api_key_envelope`；agent-runner 经 enclave JIT 解密。
   **【已补 Stage B】** supervisor `_resolve_roster` 用用户 api_key 调
   `GET /v1/model_api/key_envelope` 自取密文信封再 JIT 解 → roster 只需 api_key。
-- **agent 选择 = 按 provider 派生(不让用户选)【改 2026-06-25】**:实测各 CLI 锁
-  wire 格式(claude code=Anthropic Messages、codex 0.136=OpenAI **Responses**,已
-  砍 chat)。映射:`anthropic`/`deepseek`(走其 `/anthropic` 端点)→ **claude**;
-  `openai` → **codex**;`gemini`/`openrouter`/`openai_compatible` → 无原生适配,
-  留 legacy。实现:`cutover.driver_for_provider()`(+ db 发现 SQL CASE 同步)。
-- **【B 计划·可选·已实测】in-CVM LiteLLM 统一网关(扩覆盖面)**:上面的派生只覆盖
-  原生三家(anthropic/deepseek/openai);要把 `gemini`/`openrouter`/任意模型也纳入
-  托管 agent,放**一个 LiteLLM 在 CVM 内**做翻译网关——两个 agent 都指向它:
+- **agent 选择 = 按 provider 派生(不让用户选)【改 2026-06-26:codex 兜底 + 只给
+  codex 包 LiteLLM】**:实测各 CLI 锁 wire 格式(claude code=Anthropic Messages、
+  codex 0.136=OpenAI **Responses**,已砍 chat)。**最终映射**:
+  - `anthropic`/`deepseek`(走其 `/anthropic` 端点)→ **claude**(claude code **只**
+    支持这两家,不接 LiteLLM,保最稳 + prompt caching);
+  - `openai` → **codex (native)**:用原始 OpenAI key 直连 `api.openai.com/v1/responses`;
+  - `gemini`/`openrouter`/`openai_compatible`/其余 → **codex (gateway)**:codex 是
+    **兜底 agent**,这些经 **in-CVM LiteLLM** 翻译(codex 只暴露 Responses,LiteLLM
+    fan-out 到真 provider);
+  - provider 缺失/未知 → `legacy`(不托管)。
+  实现:`cutover.driver_for_provider()` + 新 `cutover.codex_transport()`(native/
+  gateway)+ `db.list_agent_runtime_enabled_users` SQL(CASE 默认 `codex` + 回传
+  provider)+ `spawners`(codex gateway 写 `codex-home/config.toml` 指 LiteLLM、
+  `CODEX_API_KEY`=网关 key 而非上游 key)。**为何只给 codex 包 LiteLLM**:claude 这
+  侧原生只两家、够稳且省成本;扩覆盖面的复杂度全压到 codex 一条线,**单一网关、单一
+  agent×后端 eval 面**,claude 线零网关风险。
+- **in-CVM LiteLLM 网关(codex 专用,已选为默认而非可选 B 计划)**:只服务 codex 的
+  `/v1/responses`(websocket),fan-out 到 gemini/openrouter/openai_compatible:
   ```
-            ┌─ /v1/messages   ← Claude Code (ANTHROPIC_BASE_URL=litellm)
-  LiteLLM ──┤
-            └─ /v1/responses  ← Codex (model_providers.X.wire_api=responses, base_url=litellm/v1)
-     └─ fan-out → Claude / GPT / DeepSeek / OpenRouter / Gemini / …
+  Codex (gateway 档,wire_api=responses, base_url=litellm/v1, CODEX_API_KEY=网关key)
+     └─ LiteLLM /v1/responses ──fan-out──→ Gemini / OpenRouter / OpenAI-compatible / …
+                                            (上游 provider key 在 LiteLLM 配置里,
+                                             永不进 consumer 进程)
+  Claude Code 不经网关:anthropic 直连、deepseek 走其 /anthropic 端点。
   ```
-  **实测(2026-06-25,LiteLLM 1.89.4 + codex 0.136 + claude 2.1.191)**:
+  **实测(2026-06-25,LiteLLM 1.89.4 + codex 0.136)**:
   - `codex → LiteLLM /v1/responses(websocket) → Claude haiku`:**完整工具循环**
-    (发 `command_execution` 真跑 shell、文件真建出、答对字节数)✓
-  - `Claude Code → LiteLLM /v1/messages → GPT-4o-mini`:`is_error=False`、**4 轮
-    agent 循环**、真跑 shell、文件建出 ✓;→ `DeepSeek` 文件也建出 ✓
-  - **唯一坑**:Claude Code 带 Anthropic 专有 `reasoning.effort`/`thinking` 参数,
-    透传给非 Anthropic 后端会 **400 Unsupported parameter** → LiteLLM 模型上配
-    `additional_drop_params: ["reasoning","reasoning_effort","thinking"]` 即解。
+    (发 `command_execution` 真跑 shell、文件真建出、答对字节数)✓ → 证明 codex 经
+    LiteLLM Responses 端点的连接 + 工具调用都成立。
   - codex 直连 OpenRouter/DeepSeek **不行**(它们只有 Chat、没 `/v1/responses`);
     `wire_api=chat` 已被 codex 0.136 移除 → **必须经 LiteLLM 的 Responses 端点**。
-  **代价 / 约束(为何是 B 计划而非默认)**:① LiteLLM 看到**明文 prompt + provider
-  key** → 必须跑在 **enclave 度量域内**(不能用云端 LiteLLM),纳入 compose-hash;
-  ② 丢 prompt caching → 成本上升;③ **工具 schema 兼容因「agent×后端」而异(已实锤)**:
-  `codex → DeepSeek` **失败**——codex 工具定义带 `type:"namespace"`,GPT/Claude 都吃,
-  但 DeepSeek Chat API 只认 `type:"function"` → 400;同一 DeepSeek 下 `Claude Code`
-  却能用(工具格式更简单)。即"能连/能聊"≠"工具循环都稳",**必须逐组合 eval**,越
-  自研/严格的后端越易挑刺;④ 跟着 codex/claude 的 wire 演进维护(codex 刚砍 chat,
-  属移动靶)。**取舍**:默认仍走原生派生(最稳、有 caching);网关作为"想覆盖 gemini/
-  openrouter/任意模型"时的可选档,**每个 agent×后端组合先过工具 eval 再放开**。
+  **代价 / 约束**:① LiteLLM 看到**明文 prompt + 上游 provider key** → 必须跑在
+  **enclave 度量域内**(不能用云端 LiteLLM),纳入 compose-hash;② 丢 prompt caching
+  → 成本上升;③ **工具 schema 兼容因「codex×后端」而异(已实锤)**:`codex → DeepSeek`
+  **失败**——codex 工具定义带 `type:"namespace"`,GPT/Claude 都吃,但 DeepSeek Chat
+  API 只认 `type:"function"` → 400(**所以 deepseek 派给 claude 而非 codex,正好绕开**);
+  `codex → Gemini` 本地没测成(GEMINI key 地理封锁,非翻译问题)→ **放开 gemini/
+  openrouter 前必须各自过一遍 codex 工具 eval**;④ 跟着 codex 的 wire 演进维护。
+  **LiteLLM 服务 + 按用户配置生成【已实现 2026-06-26】**:
+  - 纯模块 `backend/agent_runtime/litellm_gateway.py`:按 gateway 用户生成 LiteLLM
+    `model_list`(`model_name=gw-<uid>` → `<prefix>/<真实model>`,**api_key 用
+    `os.environ/FEEDLING_UPKEY_<uid>` 引用,密文绝不入盘**)。**配置用 `json` 渲染
+    (JSON 是 YAML 合法子集,LiteLLM 的 `yaml.safe_load` 照样解析)→ 模块 import 期
+    零 PyYAML 依赖(Codex 第三轮 P2 修复:supervisor import 它,须在不含 PyYAML 的
+    hash-lock 后端依赖下可加载,否则 CI/镜像 `ModuleNotFoundError: yaml`)。** 另含
+    `drop_params`/
+    `additional_drop_params`(剥 `reasoning`/`thinking`,非 Anthropic 后端不 400)+
+    `master_key=os.environ/FEEDLING_LITELLM_API_KEY`(codex 的 bearer)。
+  - `GatewayManager`:把上游 key 注入 LiteLLM **子进程 env**(在内存、不落盘)。重启
+    条件(**Codex 第二轮 P2 修复**):**路由签名**(user_id/provider/model/base_url,
+    **不含密钥**)变化 **或 上游 key 轮换**(单独比对注入的 env map——key 只在启动注入,
+    不重启则代理一直用旧 key)**或 子进程已死**(`reconcile` no-op 分支先 `poll()` 探活,
+    崩溃则重启,不必等 supervisor 重启);无 gateway 用户则停代理。launcher/stopper/
+    writer 可注入,已单测(写配置/注入 key/不重启/key 轮换重启/崩溃自愈/增删用户/停代理)。
+  - supervisor 接线:`_gateway_entries`(挑 codex-gateway 用户,带真实 model+上游 key)
+    + `_wire_gateway_models`(把这些用户的 codex 请求模型改写成 `gw-<uid>`,真实模型留给
+    LiteLLM 路由);discovery 现回带 `model`;主循环 behind **`FEEDLING_LITELLM_ENABLE`**
+    (默认关=零行为变化)起 `GatewayManager` 每 tick `reconcile`,codex 经
+    `127.0.0.1:<port>/v1` 命中。
+  - 部署:`Dockerfile.agent-runner` 装 `litellm[proxy]==1.89.4`;
+    `docker-compose.agent-runner.yaml` 加 `FEEDLING_LITELLM_ENABLE`/`_PORT`/`_API_KEY`
+    (默认关;master key 走加密 env,不入 compose_hash)。
+  - 测试:`tests/test_litellm_gateway.py`(配置/env/签名/Manager 生命周期)+
+    supervisor `_gateway_entries`/`_wire_gateway_models` 用例。
+  **剩余(Stage E 前 gate)**:真起一遍跑通 codex→LiteLLM→Gemini/OpenRouter 的**工具
+  循环 eval**(本地 gemini 地理封锁未测成,放开前逐家过);`litellm[proxy]` 折进
+  `requirements.lock`(哈希锁,Dockerfile 已留 TODO);压测 LiteLLM 子进程对 CVM 资源
+  /enclave decrypt 的影响。
 - **per-user flag → 启用开关**:`agent_runtime_driver` 退化成**是否启用 hosted**
   (legacy/off=关,非关值如 `auto`=开),**不再承载 agent 选择**。
   `POST /v1/model_api/driver` body 改为 `{"enabled": bool}`,响应回**派生**出的
   driver;`resolve_driver` = 启用时按 provider 派生否则 legacy。新建 setup 默认不
   启用(现网安全)。客户端入口(iOS 开关)待补。
-- **用户发现**：**【已补 Stage C】** `db.list_agent_runtime_enabled_users()`(扫
-  model_api blob:`test_status==ok` 且 `driver∈{claude,codex}`),supervisor 直查 DB
-  把 roster 过滤到启用集（`AGENT_RUNTIME_AUTODISCOVER` 开关）。**约束**:api_key 后端
-  只存哈希,supervisor 仍靠 roster 提供凭据 → "无 roster" 自动发现要等 Stage D。
+- **用户发现**：**【已补 Stage C,2026-06-26 扩 codex 兜底 + 网关门控】**
+  `db.list_agent_runtime_enabled_users(include_gateway=bool)`(扫 model_api blob:
+  `test_status==ok` + hosting 启用),回
+  `[{user_id, driver, provider, model, base_url}]`——**driver 默认 codex(只
+  anthropic/deepseek→claude)** + 回带 provider/model/base_url 供 supervisor 在 spawn
+  时给 codex 选 native(openai)/gateway(其余) + 建 LiteLLM 路由。
+  **网关门控(Codex P1 修复)**:`include_gateway` 跟随 `FEEDLING_LITELLM_ENABLE`——
+  **网关关时,gemini/openrouter/openai_compatible 这些「仅网关」provider 不进发现集**
+  (否则会被以 gateway transport 拉起、打向不存在的代理而坏掉;关时它们保持 inert)。
+  supervisor 另有 `_drop_gateway_users` 对**静态 roster** 同样兜底(网关关则丢弃 gateway
+  codex 条目)。`_apply_discovery` 把 driver/provider/model/**base_url** 一并盖到条目
+  (**Codex 第一轮 P2 修复**:openai_compatible 的自定义 `base_url` 现沿发现链传到
+  `_gateway_entries`→LiteLLM `api_base`,不再丢)。**约束**:api_key 后端只存哈希,
+  supervisor 仍靠 roster 提供凭据 → "无 roster" 自动发现要等 Stage D。
+- **cutover 路由判定同步门控(Codex 第二轮 P1 修复)**:hosted chat 走不走 runtime 的
+  判定在**后端**(`cutover.resolve_driver`),与 supervisor 是两个容器。网关关时 supervisor
+  不为 gemini/openrouter/openai_compatible 拉 consumer,但若 cutover 仍判 codex,
+  `/v1/model_api/chat/send` 会把这轮交给 runtime → **无人服务、卡 `processing` 而非回退
+  legacy inline**。修复:`resolve_driver` 对 `codex+gateway` provider 也加 `gateway_enabled()`
+  门(读后端的 `FEEDLING_LITELLM_ENABLE`),关时回 legacy;native openai 不受影响。
+  → **`FEEDLING_LITELLM_ENABLE` 必须同时设在 backend 与 agent-runner 两个服务**
+  (prod compose backend env 已加 `${FEEDLING_LITELLM_ENABLE:-}` 引用,默认关;`/v1/model_api/driver`
+  启用端点回的 driver 也随之:网关关时给 gemini 启用回 legacy,与实际行为一致)。
 - **runtime-token 鉴权（#2，最硬）**：让 consumer 不再持用户长期 API key。
   **【切片 1–3 已补,端到端通(密钥设置后)】** 后端 `require_user` + enclave 转发
   + supervisor 铸发/刷新文件 + consumer 读取发 header,feature-flag 默认关零回归。

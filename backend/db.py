@@ -663,17 +663,25 @@ def set_blob(user_id: str, kind: str, doc) -> None:
         log.error("[db] set_blob(%s,%s) failed: %s", user_id, kind, e)
 
 
-def list_agent_runtime_enabled_users() -> list[dict]:
+def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict]:
     """Users opted into the hosted agent runtime (Stage C auto-discovery).
 
     A ``model_api`` config that is tested-ok and has hosting enabled
     (``agent_runtime_driver`` set to anything other than legacy/off, via POST
-    /v1/model_api/driver). The agent is DERIVED from the provider, never chosen:
-    anthropic/deepseek → claude, openai → codex (keep this CASE in sync with
-    hosted/agent_runtime_cutover.driver_for_provider). Providers with no hosted
-    fit (gemini/openrouter/…) are excluded. Returns ``[{"user_id", "driver"}]``
-    sorted by user_id. The supervisor reads this directly (it already holds a DB
-    pool for leases) to discover who to run instead of a static roster."""
+    /v1/model_api/driver). The agent is DERIVED from the provider, never chosen
+    (keep this CASE in sync with hosted/agent_runtime_cutover.driver_for_provider):
+    anthropic/deepseek → claude; openai → codex (native). The gateway-only
+    providers (gemini/openrouter/openai_compatible → codex via the in-CVM LiteLLM
+    gateway) are returned ONLY when ``include_gateway`` is set — i.e. when the
+    supervisor has the LiteLLM gateway enabled. Otherwise they're excluded so a
+    user who flipped hosting on for such a provider stays inert (legacy) instead
+    of being spawned against a gateway that isn't running.
+    Returns ``[{"user_id", "driver", "provider", "model", "base_url"}]`` sorted by
+    user_id. The supervisor reads this directly (it already holds a DB pool for
+    leases) to discover who to run instead of a static roster."""
+    providers = ["anthropic", "claude", "deepseek", "openai"]
+    if include_gateway:
+        providers += ["gemini", "openrouter", "openai_compatible"]
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
@@ -683,18 +691,24 @@ def list_agent_runtime_enabled_users() -> list[dict]:
                     WHEN 'anthropic' THEN 'claude'
                     WHEN 'claude'    THEN 'claude'
                     WHEN 'deepseek'  THEN 'claude'
-                    WHEN 'openai'    THEN 'codex'
-                  END AS driver
+                    ELSE 'codex'
+                  END AS driver,
+                  LOWER(COALESCE(doc->>'provider', '')) AS provider,
+                  COALESCE(doc->>'model', '') AS model,
+                  COALESCE(doc->>'base_url', '') AS base_url
                 FROM user_blobs
                 WHERE kind = 'model_api'
                   AND COALESCE(doc->>'test_status', '') = 'ok'
                   AND LOWER(COALESCE(doc->>'agent_runtime_driver', 'legacy'))
                       NOT IN ('', 'legacy', 'off', 'false', '0', 'no', 'disabled')
-                  AND LOWER(COALESCE(doc->>'provider', '')) IN ('anthropic', 'claude', 'deepseek', 'openai')
+                  AND LOWER(COALESCE(doc->>'provider', '')) = ANY(%s)
                 ORDER BY user_id
                 """,
+                (providers,),
             ).fetchall()
-        return [{"user_id": uid, "driver": driver} for uid, driver in rows]
+        return [{"user_id": uid, "driver": driver, "provider": provider,
+                 "model": model, "base_url": base_url}
+                for uid, driver, provider, model, base_url in rows]
     except Exception as e:
         log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
         return []

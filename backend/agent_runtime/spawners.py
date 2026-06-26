@@ -63,6 +63,49 @@ def write_runtime_token(home: str, token: str) -> None:
         pass
 
 
+# Codex speaks the OpenAI Responses wire only. It reaches OpenAI DIRECTLY
+# ("native"); every other codex-driven provider (gemini/openrouter/
+# openai_compatible) is bridged through the in-CVM LiteLLM gateway, which
+# exposes a Responses endpoint and fans out to the real provider. Keep this set
+# in sync with hosted/agent_runtime_cutover._CODEX_NATIVE_PROVIDERS.
+_CODEX_NATIVE_PROVIDERS = {"openai"}
+# The codex provider id for the gateway (referenced in config.toml + cli).
+_GATEWAY_PROVIDER_ID = "feedling_gateway"
+
+
+def _codex_transport(entry: dict) -> str:
+    """For a codex entry, how it reaches the provider: ``native`` (direct OpenAI
+    Responses) or ``gateway`` (via the in-CVM LiteLLM Responses endpoint). Empty
+    for non-codex entries. A missing/unknown provider defaults to ``native`` so a
+    dev roster carrying only an OpenAI ``provider_key`` keeps working."""
+    if (entry.get("driver") or "").strip().lower() != "codex":
+        return ""
+    prov = (entry.get("provider") or "").strip().lower()
+    if not prov or prov in _CODEX_NATIVE_PROVIDERS:
+        return "native"
+    return "gateway"
+
+
+def _codex_gateway_config(*, base_url: str, model: str) -> str:
+    """codex ``config.toml`` routing it through the in-CVM LiteLLM gateway: codex
+    talks OpenAI Responses to ``base_url`` (the gateway), authenticating with the
+    gateway key in ``CODEX_API_KEY``; the gateway holds the upstream provider key
+    and translates to the real provider."""
+    lines = []
+    if model:
+        lines.append(f'model = "{model}"')
+    lines += [
+        f'model_provider = "{_GATEWAY_PROVIDER_ID}"',
+        "",
+        f"[model_providers.{_GATEWAY_PROVIDER_ID}]",
+        'name = "feedling-litellm"',
+        f'base_url = "{base_url}"',
+        'wire_api = "responses"',
+        'env_key = "CODEX_API_KEY"',
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def _perception_allow_rules(io_cli: str = _IO_CLI) -> list[str]:
     """Claude Bash permission allow-rules scoping the agent to just io_cli."""
     return [f"Bash(python {io_cli} {verb}:*)" for verb in _PERCEPTION_VERBS]
@@ -86,17 +129,30 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
     )
 
 
-def agent_home_files(home: str, *, driver: str, io_cli: str = _IO_CLI) -> dict[str, str]:
+def agent_home_files(
+    home: str,
+    *,
+    driver: str,
+    io_cli: str = _IO_CLI,
+    codex_transport: str = "native",
+    gateway_base_url: str = "",
+    model: str = "",
+) -> dict[str, str]:
     """Per-user files seeded into the agent home before spawn (pure: path→content).
 
     Always seeds the perception how-to (referenced by ``--append-system-prompt-file``
     for claude, and read as ``AGENTS.md`` by codex). For claude it also writes a
     ``settings.json`` under ``CLAUDE_CONFIG_DIR`` whose ``permissions.allow``
     pre-authorizes the io_cli command (defense-in-depth alongside the CLI flag).
+    For a codex user on the LiteLLM gateway (non-openai provider) it also writes a
+    ``config.toml`` pointing codex at the gateway's Responses endpoint.
     """
     files = {f"{home}/{_AGENT_PROMPT_BASENAME}": _AGENT_PROMPT_TEXT}
     if driver == "codex":
         files[f"{home}/codex-home/AGENTS.md"] = _AGENT_PROMPT_TEXT
+        if codex_transport == "gateway":
+            files[f"{home}/codex-home/config.toml"] = _codex_gateway_config(
+                base_url=gateway_base_url, model=model)
     else:
         settings = {"permissions": {"allow": _perception_allow_rules(io_cli)}}
         files[f"{home}/claude-home/settings.json"] = json.dumps(settings, indent=2)
@@ -128,7 +184,15 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     env["FEEDLING_RUNTIME_TOKEN_FILE"] = runtime_token_path(home)
     if driver == "codex":
         env["CODEX_HOME"] = f"{home}/codex-home"
-        if entry.get("provider_key"):
+        if _codex_transport(entry) == "gateway":
+            # Codex authenticates to the in-CVM LiteLLM gateway with the GATEWAY
+            # key; the upstream provider key never enters the consumer process
+            # (it lives in the gateway's own config). base_env carries the
+            # gateway creds (supervisor environment).
+            gw_key = base_env.get("FEEDLING_LITELLM_API_KEY", "")
+            if gw_key:
+                env["CODEX_API_KEY"] = gw_key
+        elif entry.get("provider_key"):
             env["CODEX_API_KEY"] = entry["provider_key"]
     else:
         env["CLAUDE_CONFIG_DIR"] = f"{home}/claude-home"
@@ -177,7 +241,13 @@ class ProcessSpawner:
 
     def spawn(self, entry: dict, user_id: str, home: str) -> int:
         driver = (entry.get("driver") or "claude").strip().lower()
-        for path, content in agent_home_files(home, driver=driver).items():
+        files = agent_home_files(
+            home, driver=driver,
+            codex_transport=_codex_transport(entry),
+            gateway_base_url=os.environ.get("FEEDLING_LITELLM_BASE_URL", ""),
+            model=str(entry.get("model") or ""),
+        )
+        for path, content in files.items():
             p = Path(path)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content)
@@ -211,6 +281,7 @@ _CONSUMER_ENV_KEYS = (
     "AGENT_MODE", "AGENT_CLI_CMD", "CHECKPOINT_FILE", "AGENT_SESSION_FILE",
     "IMAGE_TEMP_DIR", "CONSUMER_ID", "FEEDLING_RUNTIME_TOKEN_FILE",
     "ANTHROPIC_API_KEY", "CODEX_API_KEY", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
+    "FEEDLING_LITELLM_BASE_URL", "FEEDLING_LITELLM_API_KEY",
 )
 
 

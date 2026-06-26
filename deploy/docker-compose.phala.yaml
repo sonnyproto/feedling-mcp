@@ -177,6 +177,14 @@ services:
       # flipped to "false" to revert the whole fleet. See
       # core/util.runtime_v2_default_on().
       FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"
+      # Mirrors the agent-runner's FEEDLING_LITELLM_ENABLE (see
+      # docker-compose.agent-runner.yaml). The hosted cutover decision lives in
+      # the backend, so it needs the same flag: gateway-only providers (gemini/
+      # openrouter/openai_compatible) stay on the legacy inline path until the
+      # in-CVM LiteLLM gateway is actually running — otherwise their sends wedge
+      # in `processing` (no consumer is spawned). Keep this in sync with the
+      # agent-runner value. Default empty = off (safe).
+      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
     ports:
       - "5001:5001"
       - "9998:9998"

@@ -208,6 +208,59 @@ def test_no_token_writer_is_a_noop():
     assert procs.spawned == [({"user_id": "u1", "api_key": "key-u1"}, "u1", "/agent-data/users/u1")]
 
 
+# ---- codex gateway wiring (LiteLLM) ----
+
+
+def test_gateway_entries_selects_only_codex_gateway_users():
+    roster = [
+        {"user_id": "a", "driver": "claude", "provider": "anthropic", "provider_key": "ka"},
+        {"user_id": "b", "driver": "codex", "provider": "openai", "provider_key": "kb"},   # native
+        {"user_id": "c", "driver": "codex", "provider": "openai_compatible", "model": "g",
+         "base_url": "https://my.host/v1", "provider_key": "kc"},
+    ]
+    gw = supervisor_mod._gateway_entries(roster)
+    assert [e["user_id"] for e in gw] == ["c"]
+    assert gw[0]["provider"] == "openai_compatible"
+    assert gw[0]["model"] == "g"
+    assert gw[0]["base_url"] == "https://my.host/v1"  # custom endpoint → LiteLLM api_base
+    assert gw[0]["provider_key"] == "kc"  # upstream key carried for LiteLLM env
+
+
+def test_drop_gateway_users_filters_when_gateway_disabled():
+    # With the gateway off, codex-gateway users must NOT be spawned (no proxy to
+    # reach) — they're dropped so enabling hosted for them stays inert, not broken.
+    roster = [
+        {"user_id": "a", "driver": "claude", "provider": "anthropic"},
+        {"user_id": "b", "driver": "codex", "provider": "openai"},          # native — kept
+        {"user_id": "c", "driver": "codex", "provider": "gemini", "model": "g"},  # gateway — dropped
+    ]
+    kept = supervisor_mod._drop_gateway_users(roster)
+    assert [e["user_id"] for e in kept] == ["a", "b"]
+
+
+def test_wire_gateway_models_swaps_requested_model_to_gw_id():
+    roster = [
+        {"user_id": "c", "driver": "codex", "provider": "gemini", "model": "gemini-2.0-flash", "provider_key": "kc"},
+        {"user_id": "b", "driver": "codex", "provider": "openai", "model": "gpt-4o", "provider_key": "kb"},
+    ]
+    wired, gateways = supervisor_mod._wire_gateway_models(roster)
+    by = {e["user_id"]: e for e in wired}
+    # the gateway user's codex now REQUESTS the gw-<uid> model (LiteLLM maps it)
+    assert by["c"]["model"] == "gw-c"
+    # native openai user's model is untouched
+    assert by["b"]["model"] == "gpt-4o"
+    # but the LiteLLM routing keeps the user's REAL upstream model
+    assert gateways[0]["user_id"] == "c"
+    assert gateways[0]["model"] == "gemini-2.0-flash"
+
+
+def test_wire_gateway_models_noop_without_gateway_users():
+    roster = [{"user_id": "b", "driver": "codex", "provider": "openai", "model": "gpt-4o"}]
+    wired, gateways = supervisor_mod._wire_gateway_models(roster)
+    assert gateways == []
+    assert wired == roster
+
+
 def test_resolve_roster_prefers_existing_secret_over_self_fetch(monkeypatch):
     monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "https://enc")
     monkeypatch.setattr(supervisor_mod, "_whoami", lambda api_url, api_key: "usr_2")

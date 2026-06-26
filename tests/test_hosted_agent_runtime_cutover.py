@@ -23,14 +23,29 @@ class FakeStore:
 # ---- flag resolution ----
 
 def test_driver_for_provider_is_derived_not_chosen():
-    # anthropic + deepseek → Claude Code (Anthropic-wire); openai → Codex.
+    # Claude Code (Anthropic-wire) handles ONLY anthropic + deepseek; Codex is
+    # the catch-all for everything else (openai direct, the rest via LiteLLM).
     assert cutover.driver_for_provider("anthropic") == "claude"
     assert cutover.driver_for_provider("claude") == "claude"      # alias → anthropic
     assert cutover.driver_for_provider("deepseek") == "claude"    # via its /anthropic endpoint
     assert cutover.driver_for_provider("openai") == "codex"
-    # no native hosted-agent fit today
-    for p in ("gemini", "openrouter", "openai_compatible", "", "bogus"):
+    # everything non-claude falls back to Codex (gateway-bridged where needed)
+    for p in ("gemini", "openrouter", "openai_compatible"):
+        assert cutover.driver_for_provider(p) == "codex"
+    # no provider configured → no hosted agent
+    for p in ("", "bogus"):
         assert cutover.driver_for_provider(p) == "legacy"
+
+
+def test_codex_transport_native_only_for_openai():
+    # Codex speaks OpenAI Responses; it reaches OpenAI directly ("native") but
+    # any other codex-driven provider must go through the in-CVM LiteLLM gateway.
+    assert cutover.codex_transport("openai") == "native"
+    for p in ("gemini", "openrouter", "openai_compatible"):
+        assert cutover.codex_transport(p) == "gateway"
+    # claude-driven or unconfigured providers are not codex → no transport
+    for p in ("anthropic", "claude", "deepseek", "", "bogus"):
+        assert cutover.codex_transport(p) == ""
 
 
 def test_resolve_driver_defaults_to_legacy_when_disabled():
@@ -44,9 +59,27 @@ def test_resolve_driver_derives_agent_from_provider_when_enabled():
     on = {"agent_runtime_driver": "auto"}
     assert cutover.resolve_driver({**on, "provider": "anthropic"}) == "claude"
     assert cutover.resolve_driver({**on, "provider": "deepseek"}) == "claude"
+    assert cutover.resolve_driver({**on, "provider": "openai"}) == "codex"  # native, no gateway needed
+
+
+def test_resolve_driver_keeps_gateway_providers_legacy_until_gateway_enabled(monkeypatch):
+    # gemini/openrouter/openai_compatible need the in-CVM LiteLLM gateway. With the
+    # gateway OFF (default), routing them to codex would wedge the send in
+    # `processing` (the supervisor spawns no consumer for them) — so they MUST stay
+    # legacy (inline path) until the gateway is actually enabled.
+    monkeypatch.delenv("FEEDLING_LITELLM_ENABLE", raising=False)
+    on = {"agent_runtime_driver": "auto"}
+    for p in ("gemini", "openrouter", "openai_compatible"):
+        assert cutover.resolve_driver({**on, "provider": p}) == "legacy"
+    # openai is native (no gateway) → codex even with the gateway off
     assert cutover.resolve_driver({**on, "provider": "openai"}) == "codex"
-    # enabled but unsupported provider → legacy (no fit)
-    assert cutover.resolve_driver({**on, "provider": "gemini"}) == "legacy"
+
+
+def test_resolve_driver_routes_gateway_providers_to_codex_when_gateway_enabled(monkeypatch):
+    monkeypatch.setenv("FEEDLING_LITELLM_ENABLE", "1")
+    on = {"agent_runtime_driver": "auto"}
+    assert cutover.resolve_driver({**on, "provider": "gemini"}) == "codex"
+    assert cutover.resolve_driver({**on, "provider": "openrouter"}) == "codex"
 
 
 def test_resolve_driver_ignores_stale_chosen_value_and_rederives():

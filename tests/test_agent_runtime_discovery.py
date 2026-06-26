@@ -24,18 +24,25 @@ from agent_runtime import supervisor as supervisor_mod
 # ---- pure merge: _apply_discovery ----
 
 
-def test_apply_discovery_filters_roster_to_enabled_and_sets_driver():
+def test_apply_discovery_filters_roster_to_enabled_and_sets_driver_and_provider():
     roster = [
         {"user_id": "u1", "api_key": "k1", "driver": "claude"},
         {"user_id": "u2", "api_key": "k2"},
         {"user_id": "u3", "api_key": "k3", "driver": "claude"},
     ]
-    enabled = {"u1": "claude", "u2": "codex"}  # u3 not enabled in backend
+    # backend flag carries both the derived driver AND the provider (so a codex
+    # user can be wired native-vs-gateway at spawn).
+    enabled = {"u1": {"driver": "claude", "provider": "anthropic", "model": "claude-x", "base_url": ""},
+               "u2": {"driver": "codex", "provider": "openai_compatible", "model": "qwen",
+                      "base_url": "https://my.host/v1"}}
     out = supervisor_mod._apply_discovery(roster, enabled)
     by_uid = {e["user_id"]: e for e in out}
     assert set(by_uid) == {"u1", "u2"}            # u3 dropped (not enabled)
     assert by_uid["u1"]["driver"] == "claude"
     assert by_uid["u2"]["driver"] == "codex"      # driver taken from backend flag
+    assert by_uid["u2"]["provider"] == "openai_compatible"  # provider stamped for transport
+    assert by_uid["u2"]["model"] == "qwen"        # model stamped for gateway routing
+    assert by_uid["u2"]["base_url"] == "https://my.host/v1"  # custom endpoint preserved
     assert by_uid["u1"]["api_key"] == "k1"        # credential preserved
 
 
@@ -54,27 +61,57 @@ def _clean_blobs():
     yield
 
 
-def _seed_model_api(user_id: str, *, provider: str, test_status: str, enabled: bool):
-    doc = {"provider": provider, "model": "x", "test_status": test_status,
-           "agent_runtime_driver": "auto" if enabled else "legacy"}
+def _seed_model_api(user_id: str, *, provider: str, test_status: str, enabled: bool,
+                    model: str = "x", base_url: str = ""):
+    doc = {"provider": provider, "model": model, "test_status": test_status,
+           "base_url": base_url, "agent_runtime_driver": "auto" if enabled else "legacy"}
     db.set_blob(user_id, "model_api", doc)
 
 
-def test_list_enabled_users_derives_driver_from_provider(_clean_blobs):
+def _seed_all(_clean_blobs):
     _seed_model_api("anthropic_on", provider="anthropic", test_status="ok", enabled=True)
     _seed_model_api("deepseek_on", provider="deepseek", test_status="ok", enabled=True)
     _seed_model_api("openai_on", provider="openai", test_status="ok", enabled=True)
-    _seed_model_api("gemini_on", provider="gemini", test_status="ok", enabled=True)     # no fit → excluded
+    _seed_model_api("gemini_on", provider="gemini", test_status="ok", enabled=True, model="gemini-2.0-flash")  # codex via gateway
+    _seed_model_api("openrouter_on", provider="openrouter", test_status="ok", enabled=True)  # codex via gateway
+    _seed_model_api("compat_on", provider="openai_compatible", test_status="ok", enabled=True,
+                    base_url="https://my.host/v1")  # codex via gateway
     _seed_model_api("anthropic_off", provider="anthropic", test_status="ok", enabled=False)  # not enabled
     _seed_model_api("openai_failed", provider="openai", test_status="failed", enabled=True)  # key not ok
     db.set_blob("noisy", "identity", {"foo": "bar"})                                    # unrelated kind
 
-    by_uid = {u["user_id"]: u["driver"] for u in db.list_agent_runtime_enabled_users()}
-    assert by_uid == {
+
+def test_list_enabled_users_native_only_by_default(_clean_blobs):
+    # With the LiteLLM gateway OFF (default), gateway-only providers must NOT be
+    # discovered — else they'd be spawned with gateway transport into a proxy that
+    # isn't running. Only the native-fit providers (claude/openai) come back.
+    _seed_all(_clean_blobs)
+    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users()}
+    assert {uid: r["driver"] for uid, r in rows.items()} == {
         "anthropic_on": "claude",
         "deepseek_on": "claude",
         "openai_on": "codex",
     }
+
+
+def test_list_enabled_users_includes_gateway_when_enabled(_clean_blobs):
+    _seed_all(_clean_blobs)
+    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(include_gateway=True)}
+    assert {uid: r["driver"] for uid, r in rows.items()} == {
+        "anthropic_on": "claude",
+        "deepseek_on": "claude",
+        "openai_on": "codex",
+        "gemini_on": "codex",
+        "openrouter_on": "codex",
+        "compat_on": "codex",
+    }
+    # provider + model + base_url are carried so the supervisor can wire codex
+    # native vs gateway (and build the per-user LiteLLM routing for gateway users)
+    assert rows["gemini_on"]["provider"] == "gemini"
+    assert rows["gemini_on"]["model"] == "gemini-2.0-flash"
+    assert rows["openai_on"]["provider"] == "openai"
+    # openai_compatible's custom endpoint must survive into LiteLLM's api_base
+    assert rows["compat_on"]["base_url"] == "https://my.host/v1"
 
 
 def test_list_enabled_users_empty_when_none_enabled(_clean_blobs):

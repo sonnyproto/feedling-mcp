@@ -156,6 +156,54 @@ def test_agent_home_files_codex_seeds_agents_md():
     assert "perception" in files["/h/codex-home/AGENTS.md"]
     # no claude settings.json for a codex user
     assert not any(p.endswith("claude-home/settings.json") for p in files)
+    # native (default) codex talks straight to OpenAI — no gateway config.toml
+    assert "/h/codex-home/config.toml" not in files
+
+
+# ---- codex → LiteLLM gateway (non-openai providers) ----
+
+
+def test_codex_native_for_openai_uses_provider_key_directly():
+    # openai is codex's native wire: the OpenAI key goes straight to CODEX_API_KEY
+    # and there is no gateway override.
+    env = spawners.consumer_env(
+        {"FEEDLING_LITELLM_API_KEY": "gw-key"},
+        {"api_key": "fk", "provider_key": "sk-oai", "driver": "codex", "provider": "openai"},
+        user_id="u", home="/h",
+    )
+    assert env["CODEX_API_KEY"] == "sk-oai"
+
+
+def test_codex_gateway_for_non_openai_presents_gateway_key_not_upstream():
+    # gemini/openrouter/openai_compatible reach codex only through the in-CVM
+    # LiteLLM gateway: codex presents the GATEWAY key, never the upstream provider
+    # key (which stays inside the gateway's own config — minimize key exposure).
+    env = spawners.consumer_env(
+        {"FEEDLING_LITELLM_API_KEY": "gw-key", "FEEDLING_LITELLM_BASE_URL": "http://127.0.0.1:4000/v1"},
+        {"api_key": "fk", "provider_key": "sk-upstream", "driver": "codex", "provider": "gemini"},
+        user_id="u", home="/h",
+    )
+    assert env["CODEX_API_KEY"] == "gw-key"
+    assert "sk-upstream" not in env.values()
+
+
+def test_agent_home_files_codex_gateway_writes_responses_config():
+    files = spawners.agent_home_files(
+        "/h", driver="codex", codex_transport="gateway",
+        gateway_base_url="http://127.0.0.1:4000/v1", model="gw-gemini",
+    )
+    cfg = files["/h/codex-home/config.toml"]
+    # codex speaks OpenAI Responses to the gateway, which fans out to the provider
+    assert 'wire_api = "responses"' in cfg
+    assert "http://127.0.0.1:4000/v1" in cfg
+    assert "gw-gemini" in cfg
+    # AGENTS.md still seeded
+    assert "/h/codex-home/AGENTS.md" in files
+
+
+def test_agent_home_files_codex_native_omits_gateway_config():
+    files = spawners.agent_home_files("/h", driver="codex", codex_transport="native")
+    assert "/h/codex-home/config.toml" not in files
 
 
 # ---- Stage D slice 3a: runtime-token file delivery ----
