@@ -131,6 +131,19 @@ The heavy frame ciphertext (`frame_envelopes.doc.body_ct`, >150KB ChaCha20-Poly1
 - **Threat model**: R2 creds live in the TDX CVM; a leak exposes only ciphertext blobs (content_sk is in the enclave/iOS, never the backend) — equivalent to a `DATABASE_URL` leak today.
 - **Migrating existing rows**: run `backend/backfill_frames_to_r2.py` offline against prod `DATABASE_URL` + the R2 creds (`--dry-run` first to count/size). Idempotent + resumable; already-offloaded rows are skipped. The schema migration (`0006`) only adds columns — it does NOT move data.
 
+### Client diagnostic logs to R2 (`backend/diagnostics/`)
+
+Lets a client upload its persistent `diagnostics.log` (`POST /v1/diagnostics/logs`, user auth) so a developer can pull it by user id (`GET /v1/admin/diagnostics/logs/<user_id>`, admin auth → presigned download URLs). See `backend/diagnostics/`.
+
+- **Plaintext, by design**: unlike frame ciphertext, these logs are stored as plaintext — a scoped exception to the "server never sees user plaintext" invariant (user-initiated upload, few testers, private bucket, short retention). Treat the bucket accordingly.
+- **Config** (reuses the same `R2_ENDPOINT` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` credentials as frames):
+  - `R2_USER_LOGS_BUCKET` — dedicated bucket `io-user-logs`, separate from `R2_FRAMES_BUCKET` and the WAL-G backup `R2_BUCKET`.
+  - **The R2 token MUST also be scoped to `io-user-logs`** (a frames-only token returns `AccessDenied` here).
+  - Inject via `phala deploy -e R2_USER_LOGS_BUCKET=io-user-logs` (prod) / `TEST_R2_USER_LOGS_BUCKET` (test), same channel as the frames vars.
+- **Retention**: set a Cloudflare lifecycle rule on `io-user-logs` to expire objects after ~7 days. DB-side, the route trims each user's index stream to the newest 10 rows.
+- **Fail-open to Postgres**: when `R2_USER_LOGS_BUCKET`/creds are absent, the log text is stored inline in the `client_diagnostics` Postgres log stream instead — local dev / tests need no R2.
+- **Egress**: the non-TEE backend (not the enclave) makes outbound HTTPS to R2 on upload/admin-read.
+
 ### Retired VPS (historical, redacted)
 
 | | |

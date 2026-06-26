@@ -430,6 +430,11 @@ screen_pkg.register(app)
 from perception import snapshot_for_wake as _perception_wake_snapshot  # noqa: E402
 register_perception(app)
 
+# Client diagnostic-log collection (backend/diagnostics/). Mounts the
+# /v1/diagnostics/* upload + admin read blueprint.
+from diagnostics import register as register_diagnostics  # noqa: E402
+register_diagnostics(app)
+
 # ---------------------------------------------------------------------------
 # APNs config (global — one Apple dev key for the app)
 # ---------------------------------------------------------------------------
