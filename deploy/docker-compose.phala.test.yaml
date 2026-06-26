@@ -188,7 +188,7 @@ services:
       # without a per-user blob flip; an explicit per-user blob value still wins.
       # Prod compose deliberately omits this so prod keeps the dormant legacy
       # path (baseline OFF). See core/util.runtime_v2_default_on().
-      FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"
+      FEEDLING_RUNTIME_V2_DEFAULT_ON: "false"
       # Mirrors the agent-runner's flag: the hosted cutover decision lives in the
       # backend, so it needs the same value — gateway-only providers stay legacy
       # (inline) until the in-CVM LiteLLM gateway is actually on. Encrypted env,
