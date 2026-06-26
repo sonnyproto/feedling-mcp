@@ -175,19 +175,30 @@ def agent_home_files(
     codex_transport: str = "native",
     gateway_base_url: str = "",
     model: str = "",
+    persona_content: str = "",
 ) -> dict[str, str]:
     """Per-user files seeded into the agent home before spawn (pure: path→content).
 
-    Always seeds the perception how-to (referenced by ``--append-system-prompt-file``
-    for claude, and read as ``AGENTS.md`` by codex). For claude it also writes a
-    ``settings.json`` under ``CLAUDE_CONFIG_DIR`` whose ``permissions.allow``
-    pre-authorizes the io_cli command (defense-in-depth alongside the CLI flag).
-    For a codex user on the LiteLLM gateway (non-openai provider) it also writes a
-    ``config.toml`` pointing codex at the gateway's Responses endpoint.
+    Always seeds the perception/tools how-to (referenced by ``--append-system-prompt-file``
+    for claude, and read as ``AGENTS.md`` by codex). When ``persona_content`` is
+    present (host genesis distilled a voice/persona file), it is prepended to that
+    appended system prompt so the agent boots as itself ("TA"); absent → tools-only,
+    which is today's behaviour (fresh start / no genesis / VPS). A single appended
+    file avoids depending on the CLI honouring repeated --append-system-prompt-file.
+    (persona-first vs tools-first ordering is the open question in spec §12.)
+
+    For claude it also writes a ``settings.json`` under ``CLAUDE_CONFIG_DIR`` whose
+    ``permissions.allow`` pre-authorizes the io_cli command (defense-in-depth alongside
+    the CLI flag). For a codex user on the LiteLLM gateway (non-openai provider) it
+    also writes a ``config.toml`` pointing codex at the gateway's Responses endpoint.
     """
-    files = {f"{home}/{_AGENT_PROMPT_BASENAME}": _AGENT_PROMPT_TEXT}
+    system_append = _AGENT_PROMPT_TEXT
+    persona = (persona_content or "").strip()
+    if persona:
+        system_append = f"{persona}\n\n---\n\n{_AGENT_PROMPT_TEXT}"
+    files = {f"{home}/{_AGENT_PROMPT_BASENAME}": system_append}
     if driver == "codex":
-        files[f"{home}/codex-home/AGENTS.md"] = _AGENT_PROMPT_TEXT
+        files[f"{home}/codex-home/AGENTS.md"] = system_append
         if codex_transport == "gateway":
             files[f"{home}/codex-home/config.toml"] = _codex_gateway_config(
                 base_url=gateway_base_url, model=model)
@@ -195,6 +206,25 @@ def agent_home_files(
         settings = {"permissions": {"allow": _io_cli_allow_rules(io_cli)}}
         files[f"{home}/claude-home/settings.json"] = json.dumps(settings, indent=2)
     return files
+
+
+def _genesis_persona_content(user_id: str) -> str:
+    """Host genesis voice/persona content for this user, or '' when absent.
+
+    Read at spawn so a host user whose genesis produced a persona boots as
+    themselves. Empty (no genesis / fresh start / VPS / read error) → tools-only
+    append, today's behaviour. Local ``db`` import keeps pure-unit importers of
+    this module free of a DB/PG dependency. Seam: written by Codex's genesis as
+    ``db.set_blob(user_id, 'genesis_persona', {content, sha256, ...})``.
+    """
+    try:
+        import db  # local import: avoid a module-level DB dep for pure-unit tests
+        blob = db.get_blob(user_id, "genesis_persona")
+        if isinstance(blob, dict):
+            return str(blob.get("content") or "")
+    except Exception as e:
+        log.warning("genesis persona read failed for %s: %s", user_id, e)
+    return ""
 
 
 def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dict:
@@ -305,6 +335,7 @@ class ProcessSpawner:
             codex_transport=_codex_transport(entry),
             gateway_base_url=os.environ.get("FEEDLING_LITELLM_BASE_URL", ""),
             model=str(entry.get("model") or ""),
+            persona_content=_genesis_persona_content(user_id),
         )
         for path, content in files.items():
             p = Path(path)

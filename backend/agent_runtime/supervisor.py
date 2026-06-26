@@ -151,6 +151,12 @@ class Supervisor:
                 leases.release(user_id, self.owner, now=self._now())
                 self.children.pop(user_id, None)
 
+            if not _genesis_ready_to_spawn(user_id):
+                # "先 genesis 后 spawn" (spec §5): don't boot a blank consumer while
+                # an import genesis is still distilling persona/facts. Fresh-start
+                # (no genesis) and done/failed both fall through to spawn.
+                log.info("genesis in progress for %s; deferring spawn this tick", user_id)
+                continue
             home = self._home(user_id)
             if not leases.acquire(user_id, driver=entry.get("driver", "claude"),
                                   runtime_home=home, lease_owner=self.owner,
@@ -384,6 +390,33 @@ def _maybe_autoverify(user_id: str, *, mint_token, api_url: str, state: dict,
     fails = (s.get("fails", 0) if s else 0) + 1
     delay = _AUTOVERIFY_BACKOFF[min(fails, len(_AUTOVERIFY_BACKOFF) - 1)]
     state[user_id] = {"done": False, "fails": fails, "next": t + delay}
+
+
+# A host user is blocked from spawning only while an import genesis is actively
+# running. No genesis_state blob = fresh start (never uploaded) → allow. done/failed
+# → allow (failed degrades to a normal spawn, never deadlocks the user). Coarse
+# status is maintained by Codex's genesis via db.set_blob(user_id,'genesis_state').
+_GENESIS_BLOCKING_STATUS = frozenset({"uploaded", "finalizing", "processing"})
+
+
+def _genesis_status_blocks_spawn(blob) -> bool:
+    """Pure gate logic (no DB) — True only when genesis is actively in progress."""
+    if not isinstance(blob, dict):
+        return False  # no genesis underway → fresh start, allow
+    return str(blob.get("status") or "").strip().lower() in _GENESIS_BLOCKING_STATUS
+
+
+def _genesis_ready_to_spawn(user_id: str) -> bool:
+    """Gate read: block spawn only while this user's import genesis is in progress.
+    Read errors → allow (don't wedge spawning on a transient DB hiccup). Local ``db``
+    import keeps this module pure-unit importable without a DB/PG dependency."""
+    try:
+        import db  # local import: avoid a module-level DB dep for pure-unit tests
+        blob = db.get_blob(user_id, "genesis_state")
+    except Exception as e:
+        log.warning("genesis_state read failed for %s; allowing spawn: %s", user_id, e)
+        return True
+    return not _genesis_status_blocks_spawn(blob)
 
 
 def _spawn_identity(entry: dict) -> tuple:

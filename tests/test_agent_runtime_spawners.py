@@ -287,6 +287,34 @@ def test_codex_gateway_for_non_openai_presents_gateway_key_not_upstream():
     assert "sk-upstream" not in env.values()
 
 
+def test_agent_home_files_prepends_genesis_persona_when_present():
+    # Host genesis persona is prepended to the appended system prompt so the agent
+    # boots as itself; the tools how-to stays present (single appended file).
+    files = spawners.agent_home_files(
+        "/h", driver="claude", persona_content="You are Kai. Terse; you ask back.")
+    append = files["/h/agent-tools-prompt.md"]
+    assert append.startswith("You are Kai. Terse; you ask back.")  # persona first
+    assert "memory-index" in append and "perception" in append     # tools still there
+    # codex gets the same composed append in AGENTS.md
+    cfiles = spawners.agent_home_files("/h", driver="codex", persona_content="You are Kai.")
+    assert cfiles["/h/codex-home/AGENTS.md"].startswith("You are Kai.")
+    assert "memory-index" in cfiles["/h/codex-home/AGENTS.md"]
+
+
+def test_agent_home_files_no_persona_is_tools_only():
+    # Fresh start / no genesis / VPS → today's behaviour: tools-only, no persona prefix.
+    append = spawners.agent_home_files("/h", driver="claude")["/h/agent-tools-prompt.md"]
+    assert not append.startswith("You are")
+    assert "perception" in append
+
+
+def test_agent_home_files_blank_persona_is_tools_only():
+    # Whitespace-only persona must not inject an empty prefix.
+    append = spawners.agent_home_files(
+        "/h", driver="claude", persona_content="   \n  ")["/h/agent-tools-prompt.md"]
+    assert append.startswith("# Feedling context tools")  # tools how-to header, no prefix
+
+
 def test_agent_home_files_codex_gateway_writes_responses_config():
     files = spawners.agent_home_files(
         "/h", driver="codex", codex_transport="gateway",

@@ -76,6 +76,32 @@ def test_tick_spawns_one_consumer_per_user_with_isolated_homes():
     assert leases.get("u_2")["lease_owner"] == "sup_A"
 
 
+def test_tick_defers_spawn_while_genesis_in_progress(monkeypatch):
+    # "先 genesis 后 spawn": a host user whose import genesis is still running must
+    # NOT boot a blank consumer; once genesis is done the next tick spawns.
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    monkeypatch.setattr(
+        db, "get_blob",
+        lambda uid, kind: {"status": "processing"} if kind == "genesis_state" else None)
+    sup.tick(_roster("u_1"))
+    assert procs.spawned == []                      # deferred while genesis runs
+    monkeypatch.setattr(
+        db, "get_blob",
+        lambda uid, kind: {"status": "done"} if kind == "genesis_state" else None)
+    sup.tick(_roster("u_1"))
+    assert {s[1] for s in procs.spawned} == {"u_1"}  # genesis done → spawned
+
+
+def test_tick_spawns_fresh_start_user_with_no_genesis(monkeypatch):
+    # No genesis_state blob = fresh start (never uploaded) → must still spawn.
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    monkeypatch.setattr(db, "get_blob", lambda uid, kind: None)
+    sup.tick(_roster("u_1"))
+    assert {s[1] for s in procs.spawned} == {"u_1"}
+
+
 def test_tick_is_idempotent_for_live_children():
     procs = FakeProcTable()
     sup = _sup(procs)
