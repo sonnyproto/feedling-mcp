@@ -1,16 +1,16 @@
 # agent-runner — the 4th Phala service (plan §Runtime 拓扑).
 #
-# ⚠️ compose_hash / on-chain: this is delivered as a SEPARATE overlay rather than
-# edited straight into deploy/docker-compose.phala.yaml because every literal in
-# the prod compose becomes part of compose_hash. Folding this service in changes
-# the hash and REQUIRES re-authorizing on-chain (FeedlingAppAuth.addComposeHash)
-# + a redeploy — see deploy/docker-compose.phala.yaml header and CONTRIBUTING §7.
-# Merge the `agent-runner` service + the `feedling_agent_runtime` volume into the
-# prod compose in the SAME deploy that rolls the on-chain hash.
+# ⚠️ SUPERSEDED for prod/test deploys: the `agent-runner` service + the
+# `feedling_agent_runtime` volume are now defined INLINE in
+# deploy/docker-compose.phala.yaml and deploy/docker-compose.phala.test.yaml
+# (folded in so CI builds + deploys them; the image tag is pinned by the same CI
+# step that pins the backend). Those inline definitions are the source of truth —
+# edit them, not this file. This overlay is kept ONLY as a local-dev convenience
+# for running the agent-runner against a non-phala compose; it is NOT used by CI.
 #
-# Local test (compose merge):
-#   docker compose \
-#     -f deploy/docker-compose.phala.yaml \
+# Local dev (against the plain dev compose, NOT the phala ones which already carry
+# the service):
+#   docker compose -f deploy/docker-compose.yaml \
 #     -f deploy/docker-compose.agent-runner.yaml up
 #
 # The agent-runner image is built from deploy/Dockerfile.agent-runner (publish
@@ -35,12 +35,14 @@ services:
       # Lease table (same external Postgres as the backend). Encrypted env
       # channel — carries DB creds, must include sslmode=require.
       DATABASE_URL: "${DATABASE_URL:-}"
-      # Internal supervisor secret — mints per-user runtime tokens. Encrypted
-      # env channel; rotate independently of user provider keys. NOT baked.
-      FEEDLING_AGENT_RUNTIME_SECRET: "${FEEDLING_AGENT_RUNTIME_SECRET:-}"
+      # Stage-D runtime token signing secret — mints short-lived per-user tokens.
+      # Encrypted env channel; NOT baked. (Var name must match what supervisor.py
+      # reads: FEEDLING_RUNTIME_TOKEN_SECRET.)
+      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       # Roster of users to service (JSON: [{"api_key":...,"provider_key":...}]).
       # Encrypted env channel — carries per-user keys, never baked into the hash.
       AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
+      AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
       # in-CVM LiteLLM gateway — bridges codex to non-openai providers
       # (gemini/openrouter/openai_compatible). Off by default; when "1" the
       # supervisor runs `python -m litellm` as a child on 127.0.0.1:<port>, holding

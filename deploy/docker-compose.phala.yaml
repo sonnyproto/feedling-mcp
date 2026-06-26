@@ -194,6 +194,46 @@ services:
       enclave:
         condition: service_healthy
 
+  # agent-runner — 4th CVM service. Multi-tenant supervisor hosting the resident
+  # consumer (tools/chat_resident_consumer.py) per user, driving claude/codex in
+  # cli mode. Idle by default: empty AGENT_RUNTIME_USERS + autodiscover off → it
+  # spawns nobody (zero behaviour change). Enable per-user hosting by injecting a
+  # roster (AGENT_RUNTIME_USERS) via the encrypted env channel — no compose change
+  # / on-chain re-auth needed. See deploy/DEPLOYMENTS.md.
+  agent-runner:
+    image: ghcr.io/teleport-computer/feedling-agent-runner:857c09e
+    command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
+    restart: unless-stopped
+    environment:
+      FEEDLING_API_URL: "http://backend:5001"
+      FEEDLING_ENCLAVE_URL: "https://enclave:5003"
+      AGENT_DATA_ROOT: "/agent-data"
+      AGENT_LEASE_TTL_SEC: "60"
+      AGENT_TICK_INTERVAL_SEC: "15"
+      AGENT_RUNTIME_ISOLATION: "process"
+      # Same external Postgres as the backend (lease table). Encrypted env channel.
+      DATABASE_URL: "${DATABASE_URL:-}"
+      # Roster of users to host (JSON). Carries per-user keys → encrypted env
+      # channel, never baked. Empty = idle.
+      AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
+      # Discover hosted-enabled users from the DB (intersected with roster creds).
+      AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
+      # Stage-D runtime token signing secret. Empty = off (consumer uses api key).
+      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+      # in-CVM LiteLLM gateway (codex non-openai). Empty = off; must mirror the
+      # backend's FEEDLING_LITELLM_ENABLE. FEEDLING_LITELLM_PYTHON is baked in the
+      # image (isolated venv).
+      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
+      FEEDLING_LITELLM_PORT: "${FEEDLING_LITELLM_PORT:-4000}"
+      FEEDLING_LITELLM_API_KEY: "${FEEDLING_LITELLM_API_KEY:-}"
+    volumes:
+      - feedling_agent_runtime:/agent-data
+    depends_on:
+      backend:
+        condition: service_started
+      enclave:
+        condition: service_healthy
+
 volumes:
   feedling_enclave_data:
     name: feedling_enclave_data
@@ -203,3 +243,5 @@ volumes:
     name: feedling_ingress_letsencrypt
   feedling_ingress_evidences:
     name: feedling_ingress_evidences
+  feedling_agent_runtime:
+    name: feedling_agent_runtime

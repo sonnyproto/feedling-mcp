@@ -44,6 +44,49 @@ retirement when keeping the exact value no longer helps verification.
 | First-boot note | The CVM was first created 2026-06-09 WITHOUT a CF token (to mint the app_id quickly), so `dstack-ingress` couldn't issue the `test-*.feedling.app` LE certs initially. The `test`-branch CI deploy injects `CF_*` from GitHub secrets — domains + certs are now live. Backend also needed the test RDS reachable from the CVM (Publicly accessible + SG inbound 5432) before it stopped crash-looping. |
 | iOS | The iOS app source is not in this repo. Point its test build at app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` + gateway `dstack-pha-prod9.phala.network` + test contract `0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5`. |
 
+### agent-runner (hosted agent-runtime) — 4th CVM service
+
+The `agent-runner` service runs `backend/agent_runtime/supervisor.py`: a
+multi-tenant supervisor that hosts the resident consumer
+(`tools/chat_resident_consumer.py`) one process per user, driving `claude` /
+`codex exec` in cli mode. It's defined **inline** in both
+`docker-compose.phala.yaml` and `docker-compose.phala.test.yaml` (its image
+`ghcr.io/teleport-computer/feedling-agent-runner:<sha>` is built by
+`docker-publish.yml` from `deploy/Dockerfile.agent-runner` and pinned by the same
+CI step that pins the backend image). The standalone
+`docker-compose.agent-runner.yaml` overlay is now **local-dev only** (superseded).
+
+**Idle by default = zero behaviour change.** With `AGENT_RUNTIME_USERS` empty and
+`AGENT_RUNTIME_AUTODISCOVER` unset, the supervisor spawns nobody (it idles and
+re-checks each tick instead of exiting). All the knobs below flow through the
+**encrypted env channel** (`phala deploy -e …`), so they are NOT baked into
+compose_hash — flipping them on later needs **no on-chain re-auth**.
+
+| Env | Purpose | Default |
+|---|---|---|
+| `AGENT_RUNTIME_USERS` | roster JSON `[{"api_key":"…"}]` — who to host (carries per-user keys) | empty → idle |
+| `AGENT_RUNTIME_AUTODISCOVER` | also pull hosted-enabled users from the DB (intersected with the roster's creds) | off |
+| `FEEDLING_RUNTIME_TOKEN_SECRET` | Stage-D: mint short-lived per-user runtime tokens (consumer drops the long-term api key) | off → consumer uses api key |
+| `FEEDLING_LITELLM_ENABLE` | run the in-CVM LiteLLM gateway (codex non-openai providers). **Must match the backend's same var** (the cutover routing decision is backend-side) | off |
+| `FEEDLING_LITELLM_API_KEY` | gateway bearer codex presents | — |
+
+CI secrets/vars (test job; `TEST_`-prefixed): `secrets.TEST_AGENT_RUNTIME_USERS`,
+`vars.TEST_AGENT_RUNTIME_AUTODISCOVER`, `secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET`,
+`vars.TEST_FEEDLING_LITELLM_ENABLE`, `secrets.TEST_FEEDLING_LITELLM_API_KEY`. Prod
+job uses the un-prefixed names.
+
+**To start real-device testing (recommended order — least → most unvalidated):**
+1. Deploy as-is (agent-runner idle). Confirms the 4th service builds + boots
+   without disturbing existing users.
+2. Set `TEST_AGENT_RUNTIME_USERS` to a roster with **one** test user whose
+   provider is **anthropic** (→ claude, native, no gateway), leave
+   `TEST_FEEDLING_LITELLM_ENABLE` off. Re-deploy `test`. Validate A0:
+   onboarding/verify_loop green, chat works.
+3. Add an **openai** user (→ codex native).
+4. **Last**, after an offline `codex→LiteLLM→gemini/openrouter` tool-loop eval:
+   set `TEST_FEEDLING_LITELLM_ENABLE=1` (it auto-includes the gateway providers in
+   discovery + starts the proxy) and a gemini/openrouter test user.
+
 ## Enclave configuration
 
 ### Screen frame VLM captioning

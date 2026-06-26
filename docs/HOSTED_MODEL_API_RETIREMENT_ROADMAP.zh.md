@@ -195,6 +195,15 @@ legacy inline 线现在做、agent-runner **还没做**的：
   (**Codex 第一轮 P2 修复**:openai_compatible 的自定义 `base_url` 现沿发现链传到
   `_gateway_entries`→LiteLLM `api_base`,不再丢)。**约束**:api_key 后端只存哈希,
   supervisor 仍靠 roster 提供凭据 → "无 roster" 自动发现要等 Stage D。
+- **supervisor 长驻化(为可部署 + 实时控制面,2026-06-26)**:`main()` 凭据一次解析,
+  `_effective_roster()` **每 tick 重算**(autodiscover 交集 + 网关 drop/wire),空
+  roster **空转不退出**(不再 crashloop);`tick` 新增两条:用户掉出 roster 即
+  kill+release、**配置变更(`_spawn_identity` 比对 driver/provider/model/key)即就地
+  重启子进程**(Codex 第五轮 P2:否则切 provider/网关旧进程一直跑到自己死)。
+  **脚本启动 import 顺序(Codex 第五轮 P1 修复)**:`supervisor.py` 作为脚本直跑时
+  (`python backend/agent_runtime/supervisor.py`,镜像 cwd=/app),sys.path[0] 是脚本
+  自身目录,故把 `sys.path.insert(backend)` **挪到 `import db`/`from core` 之前**,
+  否则一启动就 `ModuleNotFoundError` crashloop。
 - **cutover 路由判定同步门控(Codex 第二轮 P1 修复)**:hosted chat 走不走 runtime 的
   判定在**后端**(`cutover.resolve_driver`),与 supervisor 是两个容器。网关关时 supervisor
   不为 gemini/openrouter/openai_compatible 拉 consumer,但若 cutover 仍判 codex,

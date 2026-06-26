@@ -231,6 +231,7 @@ jobs:
               - 'backend/**'
               - 'tools/chat_resident_consumer.py'
               - 'deploy/Dockerfile'
+              - 'deploy/Dockerfile.agent-runner'
               - 'deploy/docker-compose.phala.yaml'
               - 'deploy/publish-compose-hash.sh'
               - '.github/workflows/ci.yml'
@@ -253,6 +254,7 @@ jobs:
               - 'backend/**'
               - 'tools/chat_resident_consumer.py'
               - 'deploy/Dockerfile'
+              - 'deploy/Dockerfile.agent-runner'
               - 'deploy/docker-compose.phala.test.yaml'
               - 'deploy/publish-compose-hash.sh'
               - '.github/workflows/ci.yml'
@@ -301,13 +303,14 @@ jobs:
           echo "waiting for ${IMAGE}:$SHA_SHORT"
           echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
           for i in $(seq 1 60); do
-            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1; then
-              echo "image :$SHA_SHORT available"
+            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1 \
+               && docker manifest inspect "${IMAGE}-agent-runner:$SHA_SHORT" >/dev/null 2>&1; then
+              echo "images :$SHA_SHORT available (backend + agent-runner)"
               exit 0
             fi
             sleep 10
           done
-          echo "::error::image :$SHA_SHORT did not appear in 10 min — docker-publish.yml likely failed"
+          echo "::error::image :$SHA_SHORT (backend or agent-runner) did not appear in 10 min — docker-publish.yml likely failed"
           exit 1
 
       - name: Pin image tag in deploy/docker-compose.phala.yaml
@@ -331,7 +334,12 @@ jobs:
 
           IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
+          # Pin the backend image, then the sibling agent-runner image. The first
+          # regex requires the literal "/feedling:" so it never matches the
+          # "/feedling-agent-runner:" line; the second pins that one.
           sed -i -E "s|ghcr\.io/[^/]+/feedling:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
+            deploy/docker-compose.phala.yaml
+          sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|${IMAGE}-agent-runner:${TRIGGER_SHA_SHORT}|g" \
             deploy/docker-compose.phala.yaml
           if git diff --quiet -- deploy/docker-compose.phala.yaml; then
             echo "tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
@@ -389,6 +397,15 @@ jobs:
           # into compose_hash. The backend fails fast at boot if this is empty.
           DATABASE_URL:        ${{ secrets.DATABASE_URL }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
+          # agent-runner (4th service) knobs — encrypted env channel, NOT baked
+          # into compose_hash. All default to empty (service idles, gateway off),
+          # so flipping them on later needs no on-chain re-auth. AGENT_RUNTIME_USERS
+          # is the roster JSON (carries per-user keys); the rest are flags/secrets.
+          AGENT_RUNTIME_USERS:          ${{ secrets.AGENT_RUNTIME_USERS }}
+          AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.AGENT_RUNTIME_AUTODISCOVER }}
+          FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
+          FEEDLING_LITELLM_ENABLE:      ${{ vars.FEEDLING_LITELLM_ENABLE }}
+          FEEDLING_LITELLM_API_KEY:     ${{ secrets.FEEDLING_LITELLM_API_KEY }}
         run: |
           echo ">>> deploy-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
@@ -407,6 +424,11 @@ jobs:
             -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
             -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
             -e "DATABASE_URL=$DATABASE_URL" \
+            -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
+            -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+            -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
+            -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
+            -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
             --wait
 
       - name: Publish live compose_hash on Sepolia
@@ -470,13 +492,14 @@ jobs:
           echo "waiting for ${IMAGE}:$SHA_SHORT"
           echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
           for i in $(seq 1 60); do
-            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1; then
-              echo "image :$SHA_SHORT available"
+            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1 \
+               && docker manifest inspect "${IMAGE}-agent-runner:$SHA_SHORT" >/dev/null 2>&1; then
+              echo "images :$SHA_SHORT available (backend + agent-runner)"
               exit 0
             fi
             sleep 10
           done
-          echo "::error::image :$SHA_SHORT did not appear in 10 min — docker-publish.yml likely failed"
+          echo "::error::image :$SHA_SHORT (backend or agent-runner) did not appear in 10 min — docker-publish.yml likely failed"
           exit 1
 
       - name: Pin image tag in deploy/docker-compose.phala.test.yaml
@@ -489,7 +512,10 @@ jobs:
           git reset --hard origin/test
           IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
+          # Pin the backend image, then the sibling agent-runner image (see prod job).
           sed -i -E "s|ghcr\.io/[^/]+/feedling:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
+            deploy/docker-compose.phala.test.yaml
+          sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|${IMAGE}-agent-runner:${TRIGGER_SHA_SHORT}|g" \
             deploy/docker-compose.phala.test.yaml
           if git diff --quiet -- deploy/docker-compose.phala.test.yaml; then
             echo "tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
@@ -534,6 +560,15 @@ jobs:
           FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
           DATABASE_URL:        ${{ secrets.TEST_DATABASE_URL }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
+          # agent-runner (4th service) knobs — encrypted env channel, NOT baked
+          # into compose_hash (see prod deploy step). Default empty = idle + gateway
+          # off; flip on later with no on-chain re-auth. TEST_-prefixed where a
+          # separate test value is wanted; falls back to the shared secret/var.
+          AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
+          AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
+          FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
+          FEEDLING_LITELLM_ENABLE:      ${{ vars.TEST_FEEDLING_LITELLM_ENABLE }}
+          FEEDLING_LITELLM_API_KEY:     ${{ secrets.TEST_FEEDLING_LITELLM_API_KEY }}
         run: |
           echo ">>> deploy-test-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
@@ -552,6 +587,11 @@ jobs:
             -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
             -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
             -e "DATABASE_URL=$DATABASE_URL" \
+            -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
+            -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+            -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
+            -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
+            -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
             --wait
 
       - name: Publish live compose_hash on Sepolia (test contract)

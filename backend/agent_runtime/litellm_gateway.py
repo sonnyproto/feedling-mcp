@@ -166,10 +166,15 @@ def _default_write(path: str, content: str) -> None:
 def _default_launch(config_path: str, env: dict, port: int):
     """Start the LiteLLM proxy as a child, injecting the per-user upstream keys
     into its env (merged over the supervisor's, so FEEDLING_LITELLM_API_KEY and
-    any provider SDK vars are inherited). Returns the Popen handle."""
+    any provider SDK vars are inherited). Returns the Popen handle.
+
+    LiteLLM is installed in its OWN venv (``FEEDLING_LITELLM_PYTHON``) so its large
+    dependency tree never perturbs the supervisor's hash-locked backend env; falls
+    back to the current interpreter when unset (dev)."""
     full_env = {**os.environ, **env}
+    python = os.environ.get("FEEDLING_LITELLM_PYTHON", sys.executable)
     return subprocess.Popen(
-        [sys.executable, "-m", "litellm", "--config", config_path,
+        [python, "-m", "litellm", "--config", config_path,
          "--port", str(port), "--host", "127.0.0.1"],
         env=full_env,
     )

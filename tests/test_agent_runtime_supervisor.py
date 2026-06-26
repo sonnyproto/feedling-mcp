@@ -110,6 +110,63 @@ def test_dead_child_is_reaped_and_respawned():
     assert sup.children["u_1"]["pid"] != pid
 
 
+def test_tick_reaps_child_no_longer_in_roster():
+    # The live roster is re-derived each tick (autodiscover / gateway toggles), so a
+    # user who gets disabled drops out. Their consumer must be killed + lease
+    # released this tick, not left orphaned until lease expiry.
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    sup.tick(_roster("u_1", "u_2"))
+    pid2 = sup.children["u_2"]["pid"]
+
+    sup.tick(_roster("u_1"))            # u_2 dropped from the roster
+    assert pid2 in procs.killed
+    assert "u_2" not in sup.children
+    assert leases.get("u_2")["lease_owner"] is None   # lease released for the dropped user
+    assert "u_1" in sup.children        # u_1 untouched
+
+
+def test_tick_respawns_alive_child_when_config_changes():
+    # Per-tick re-derivation can change a live user's driver/provider/model (e.g.
+    # autodiscover flips them, or native→gateway). The running consumer's env/home
+    # is then stale → it must be restarted, not just heartbeated.
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    sup.tick([{"user_id": "u_1", "api_key": "k", "driver": "claude", "provider": "anthropic"}])
+    pid1 = sup.children["u_1"]["pid"]
+
+    sup.tick([{"user_id": "u_1", "api_key": "k", "driver": "codex", "provider": "openai"}])
+    assert pid1 in procs.killed
+    pid2 = sup.children["u_1"]["pid"]
+    assert pid2 != pid1
+    assert sup.children["u_1"]["entry"]["driver"] == "codex"   # registry holds new config
+    assert len(procs.spawned) == 2
+    assert leases.get("u_1")["lease_owner"] == "sup_A"         # lease retained across restart
+
+
+def test_tick_no_respawn_when_config_unchanged():
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    e = {"user_id": "u_1", "api_key": "k", "driver": "claude", "provider": "anthropic"}
+    sup.tick([dict(e)])
+    sup.tick([dict(e)])      # identical config → heartbeat only
+    assert procs.killed == []
+    assert len(procs.spawned) == 1
+
+
+def test_tick_gateway_upstream_key_rotation_does_not_respawn_consumer():
+    # For a gateway user the upstream provider_key goes to LiteLLM, NOT the consumer
+    # env — rotating it must not bounce the (heavy) consumer process.
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    e = {"user_id": "u_1", "api_key": "k", "driver": "codex", "provider": "gemini",
+         "model": "gw-u_1", "provider_key": "k1"}
+    sup.tick([dict(e)])
+    sup.tick([{**e, "provider_key": "rotated"}])
+    assert procs.killed == []
+    assert len(procs.spawned) == 1
+
+
 def test_heartbeat_advances_lease_expiry():
     procs = FakeProcTable()
     t = {"v": T0}
@@ -236,6 +293,42 @@ def test_drop_gateway_users_filters_when_gateway_disabled():
     ]
     kept = supervisor_mod._drop_gateway_users(roster)
     assert [e["user_id"] for e in kept] == ["a", "b"]
+
+
+def test_effective_roster_autodiscover_off_gateway_off_drops_gateway_users():
+    base = [
+        {"user_id": "a", "driver": "claude", "provider": "anthropic", "api_key": "k"},
+        {"user_id": "c", "driver": "codex", "provider": "gemini", "model": "g", "api_key": "k", "provider_key": "pk"},
+    ]
+    roster, gateways = supervisor_mod._effective_roster(base, autodiscover=False, gateway_enabled=False)
+    assert [e["user_id"] for e in roster] == ["a"]   # gemini gateway user dropped
+    assert gateways == []
+
+
+def test_effective_roster_gateway_on_wires_models():
+    base = [{"user_id": "c", "driver": "codex", "provider": "gemini",
+             "model": "gemini-2.0-flash", "api_key": "k", "provider_key": "pk"}]
+    roster, gateways = supervisor_mod._effective_roster(base, autodiscover=False, gateway_enabled=True)
+    assert {e["user_id"]: e["model"] for e in roster} == {"c": "gw-c"}   # codex requests gw-id
+    assert gateways and gateways[0]["model"] == "gemini-2.0-flash"        # real model → LiteLLM
+
+
+def test_effective_roster_autodiscover_intersects_enabled(monkeypatch):
+    base = [{"user_id": "a", "api_key": "k1"}, {"user_id": "b", "api_key": "k2"}]
+    monkeypatch.setattr(supervisor_mod, "_discover_enabled",
+                        lambda include_gateway: {"a": {"driver": "claude", "provider": "anthropic",
+                                                       "model": "x", "base_url": ""}})
+    roster, gateways = supervisor_mod._effective_roster(base, autodiscover=True, gateway_enabled=False)
+    assert [e["user_id"] for e in roster] == ["a"]   # b not backend-enabled → excluded
+    assert roster[0]["driver"] == "claude"
+
+
+def test_effective_roster_empty_is_tolerated_not_fatal(monkeypatch):
+    # A live agent-runner must idle (not exit/crashloop) when no user is enabled yet
+    # — discovery returns nothing → empty effective roster, no exception.
+    monkeypatch.setattr(supervisor_mod, "_discover_enabled", lambda include_gateway: {})
+    roster, gateways = supervisor_mod._effective_roster([], autodiscover=True, gateway_enabled=False)
+    assert roster == [] and gateways == []
 
 
 def test_wire_gateway_models_swaps_requested_model_to_gw_id():

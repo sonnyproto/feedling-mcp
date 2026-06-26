@@ -40,12 +40,16 @@ RUN pip install --require-hashes -r requirements.lock
 
 # in-CVM LiteLLM proxy — bridges codex (OpenAI Responses wire) to non-openai
 # providers (gemini/openrouter/openai_compatible). The supervisor launches it as
-# a child (`python -m litellm`) ONLY when FEEDLING_LITELLM_ENABLE is set, with a
-# per-user config + the upstream keys injected into the proxy's env (never on
-# disk). Pinned to the empirically-validated version.
-# Hardening TODO (match the rest of the image before prod): fold into
-# requirements.lock with hashes instead of an unpinned-resolver install.
-RUN pip install 'litellm[proxy]==1.89.4'
+# a child ONLY when FEEDLING_LITELLM_ENABLE is set, with a per-user config + the
+# upstream keys injected into the proxy's env (never on disk). Installed in its
+# OWN venv so LiteLLM's large dependency tree never perturbs the hash-locked
+# backend env (the supervisor invokes it via FEEDLING_LITELLM_PYTHON below).
+# Pinned to the empirically-validated version.
+# Hardening TODO (match the rest of the image before prod): hash-lock this venv's
+# deps too (separate lockfile) instead of an unpinned-resolver install.
+RUN python -m venv /opt/litellm-venv \
+ && /opt/litellm-venv/bin/pip install --no-cache-dir 'litellm[proxy]==1.89.4'
+ENV FEEDLING_LITELLM_PYTHON=/opt/litellm-venv/bin/python
 
 # Ship the backend (content_encryption / db / proactive imported by the resident
 # consumer) AND tools/ (the resident consumer itself, spawned per user).

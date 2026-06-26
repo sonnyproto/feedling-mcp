@@ -41,13 +41,16 @@ from pathlib import Path
 
 import httpx
 
-import db
-from core import runtime_token
-
+# Put the backend dir on sys.path BEFORE importing backend modules. When this is
+# launched as a script (``python backend/agent_runtime/supervisor.py`` from /app
+# in the CVM image), sys.path[0] is the script's own dir, NOT backend/ — so
+# ``import db`` / ``from core import …`` would fail unless we insert it first.
 _BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
+import db
+from core import runtime_token
 from agent_runtime import leases, litellm_gateway, spawners
 
 log = logging.getLogger("feedling.agent_runtime.supervisor")
@@ -96,8 +99,20 @@ class Supervisor:
         return f"{self.data_root}/users/{user_id}"
 
     def tick(self, roster: list[dict]) -> None:
-        """One supervision pass: heartbeat live children, reap dead ones, and
-        acquire+spawn for any user we don't already run."""
+        """One supervision pass: heartbeat live children, reap dead ones, drop
+        children whose user left the roster, and acquire+spawn for any user we
+        don't already run."""
+        # Reap children whose user is no longer in the (re-derived) roster — e.g.
+        # a user who disabled hosting. Kill + release so disable takes effect this
+        # tick rather than lingering until lease expiry.
+        roster_uids = {str(e.get("user_id") or "") for e in roster}
+        for user_id in list(self.children):
+            if user_id not in roster_uids:
+                log.info("user %s left the roster; terminating its consumer", user_id)
+                self.kill_fn(self.children[user_id]["pid"])
+                leases.release(user_id, self.owner, now=self._now())
+                self.children.pop(user_id, None)
+
         for entry in roster:
             user_id = str(entry.get("user_id") or "")
             if not user_id:
@@ -113,6 +128,18 @@ class Supervisor:
                     log.warning("lost lease for %s; terminating orphaned child", user_id)
                     self.kill_fn(child["pid"])
                     self.children.pop(user_id, None)
+                elif _spawn_identity(entry) != _spawn_identity(child["entry"]):
+                    # Config changed for a still-running user (driver/provider/model/
+                    # key) — the consumer's env + home are stale. Respawn in place;
+                    # we keep our live lease (just renewed) so no reacquire needed.
+                    log.info("config changed for %s; respawning consumer", user_id)
+                    self.kill_fn(child["pid"])
+                    home = child["home"]
+                    pid = self.spawn_fn(entry, user_id, home)
+                    self._write_token(user_id, home)
+                    leases.renew(user_id, self.owner, ttl=self.lease_ttl, pid=pid,
+                                 status="running", now=self._now())
+                    self.children[user_id] = {"pid": pid, "entry": entry, "home": home}
                 else:
                     self._write_token(user_id, child["home"])  # refresh short-lived token
                 continue
@@ -259,6 +286,24 @@ def _apply_discovery(roster: list[dict], enabled: dict[str, dict]) -> list[dict]
     return out
 
 
+def _spawn_identity(entry: dict) -> tuple:
+    """The spawn-determining fields of a roster entry — when any changes, the
+    running consumer's env/home is stale and it must be respawned. Mirrors what
+    ``spawners.consumer_env`` / ``agent_home_files`` consume. The upstream
+    ``provider_key`` is EXCLUDED for gateway users (it goes to LiteLLM, not the
+    consumer env), so rotating it doesn't bounce the consumer."""
+    driver = (entry.get("driver") or "claude").strip().lower()
+    gateway = spawners._codex_transport(entry) == "gateway"
+    return (
+        entry.get("api_key") or "",
+        driver,
+        entry.get("cli_cmd") or "",
+        entry.get("provider") or "",
+        entry.get("model") or "",
+        "" if gateway else (entry.get("provider_key") or ""),
+    )
+
+
 def _gateway_entries(roster: list[dict]) -> list[dict]:
     """Codex users that must be bridged through the in-CVM LiteLLM gateway
     (gemini/openrouter/openai_compatible). Each carries the REAL upstream
@@ -307,6 +352,26 @@ def _wire_gateway_models(roster: list[dict]) -> tuple[list[dict], list[dict]]:
     return wired, gateways
 
 
+def _effective_roster(base_roster: list[dict], *, autodiscover: bool,
+                      gateway_enabled: bool) -> tuple[list[dict], list[dict]]:
+    """Compute the roster to actually run this tick + the gateway routing entries.
+
+    ``base_roster`` carries credentials (resolved once at boot). Each tick we:
+    optionally intersect it with the backend-enabled set (autodiscover — the
+    gradual-migration control plane); drop gateway-only codex users when the
+    gateway is off (no proxy to reach); and when the gateway is on, rewrite those
+    users' requested model to ``gw-<uid>`` (returning the real models as gateway
+    entries for the LiteLLM config). An empty result is fine — the supervisor
+    idles rather than exiting."""
+    roster = base_roster
+    if autodiscover:
+        enabled = _discover_enabled(include_gateway=gateway_enabled)
+        roster = _apply_discovery(roster, enabled)
+    if not gateway_enabled:
+        return _drop_gateway_users(roster), []
+    return _wire_gateway_models(roster)
+
+
 def main() -> int:
     logging.basicConfig(
         level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -319,20 +384,15 @@ def main() -> int:
     isolation = os.environ.get("AGENT_RUNTIME_ISOLATION", "process").strip().lower()
 
     gateway_enabled = os.environ.get("FEEDLING_LITELLM_ENABLE", "").strip().lower() in ("1", "true", "yes")
+    autodiscover = os.environ.get("AGENT_RUNTIME_AUTODISCOVER", "").strip().lower() in ("1", "true", "yes")
 
-    roster = _resolve_roster(_load_roster())
-    if os.environ.get("AGENT_RUNTIME_AUTODISCOVER", "").strip().lower() in ("1", "true", "yes"):
-        # Only discover gateway-only providers when the gateway is actually running.
-        enabled = _discover_enabled(include_gateway=gateway_enabled)
-        roster = _apply_discovery(roster, enabled)
-        log.info("autodiscover: %d roster users intersect %d backend-enabled", len(roster), len(enabled))
-    # Defense-in-depth for static rosters: if the gateway is off, a gateway codex
-    # user (e.g. provider=gemini) has nowhere to route — drop rather than half-spawn.
-    if not gateway_enabled:
-        roster = _drop_gateway_users(roster)
-    if not roster:
-        log.error("empty roster — set AGENT_RUNTIME_USERS or AGENT_RUNTIME_ROSTER")
-        return 2
+    # Credentials resolved once (whoami + envelope decrypt are network calls). The
+    # backend-enabled intersection + gateway wiring re-run each tick off this base,
+    # so enabling/disabling a user (or the gateway) takes effect without a redeploy.
+    base_roster = _resolve_roster(_load_roster())
+    if not base_roster and not autodiscover:
+        log.warning("no roster and autodiscover off — supervisor will idle "
+                    "(set AGENT_RUNTIME_USERS or AGENT_RUNTIME_AUTODISCOVER=1)")
 
     spawn_fn, alive_fn, kill_fn = spawners.get_spawner(isolation)
 
@@ -355,30 +415,31 @@ def main() -> int:
         token_writer = _mint_and_write
 
     # in-CVM LiteLLM gateway (codex non-openai providers). Off by default: only
-    # when FEEDLING_LITELLM_ENABLE is set do we rewrite gateway codex users to the
-    # gw-<uid> model and run a LiteLLM proxy that holds their upstream keys (in the
-    # proxy's env, never on disk). Codex reaches it at 127.0.0.1:<port>.
+    # when FEEDLING_LITELLM_ENABLE is set do we run a LiteLLM proxy that holds the
+    # gateway users' upstream keys (in the proxy's env, never on disk) and rewrite
+    # those users to the gw-<uid> model. Codex reaches it at 127.0.0.1:<port>.
     gateway_mgr = None
     if gateway_enabled:
         port = int(os.environ.get("FEEDLING_LITELLM_PORT", "4000"))
         cfg_path = os.environ.get("FEEDLING_LITELLM_CONFIG", f"{data_root}/litellm.yaml")
         os.environ.setdefault("FEEDLING_LITELLM_BASE_URL", f"http://127.0.0.1:{port}/v1")
-        roster, gateways = _wire_gateway_models(roster)
         gateway_mgr = litellm_gateway.GatewayManager(config_path=cfg_path, port=port)
-        log.info("litellm gateway enabled — %d gateway users, config=%s port=%d",
-                 len(gateways), cfg_path, port)
-    else:
-        gateways = []
+        log.info("litellm gateway enabled — config=%s port=%d", cfg_path, port)
 
     sup = Supervisor(
         owner=owner, lease_ttl=lease_ttl, data_root=data_root,
         spawn_fn=spawn_fn, alive_fn=alive_fn, kill_fn=kill_fn,
         token_writer=token_writer,
     )
-    log.info("supervisor up — owner=%s users=%d ttl=%.0fs", owner, len(roster), lease_ttl)
+    log.info("supervisor up — owner=%s base_users=%d autodiscover=%s gateway=%s ttl=%.0fs",
+             owner, len(base_roster), autodiscover, gateway_enabled, lease_ttl)
     try:
         while True:
             try:
+                # Re-derive the live roster each tick so enabling/disabling a user
+                # (or the gateway) takes effect without restarting the supervisor.
+                roster, gateways = _effective_roster(
+                    base_roster, autodiscover=autodiscover, gateway_enabled=gateway_enabled)
                 if gateway_mgr is not None:
                     gateway_mgr.reconcile(gateways)
                 sup.tick(roster)
