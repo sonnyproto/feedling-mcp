@@ -10,6 +10,7 @@ from datetime import date, datetime
 from flask import jsonify, request
 
 import db
+from core import util as core_util
 from core.store import UserStore
 
 from chat import consumer as chat_consumer
@@ -33,7 +34,7 @@ def _load_bootstrap_events(store: UserStore) -> list[dict]:
 
 
 
-_SKILL_URL = "https://raw.githubusercontent.com/teleport-computer/io-onboarding/test/skill.md"
+_SKILL_URL = core_util.io_onboarding_skill_url("skill.md")
 
 
 def _bootstrap_state(store) -> dict:

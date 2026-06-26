@@ -19,6 +19,7 @@ import httpx
 from flask import Blueprint, Response, jsonify, request, g
 
 import db
+from core import util as core_util
 from core.store import UserStore
 
 from hosted_runtime import (
@@ -238,7 +239,7 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
         "route": "model_api",
         "next_action": "" if next_step is None else next_step["required"],
         "steps": steps,
-        "skill_url": "https://raw.githubusercontent.com/teleport-computer/io-onboarding/test/skill-api.md",
+        "skill_url": core_util.io_onboarding_skill_url("skill-api.md"),
     }
 
 
@@ -285,7 +286,7 @@ def _official_import_onboarding_validation_payload(store: UserStore) -> dict:
         "realtime_chat_supported": False,
         "next_action": "" if next_step is None else next_step["required"],
         "steps": steps,
-        "skill_url": "https://raw.githubusercontent.com/teleport-computer/io-onboarding/main/skill-chat-client.md",
+        "skill_url": core_util.io_onboarding_skill_url("skill-chat-client.md"),
     }
 
 

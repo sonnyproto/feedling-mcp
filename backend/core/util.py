@@ -28,6 +28,22 @@ def runtime_v2_default_on() -> bool:
     return _env_flag_enabled(RUNTIME_V2_DEFAULT_ON_ENV)
 
 
+# io-onboarding docs branch this code serves skill_url from. MUST match the
+# feedling-mcp deploy branch:
+#   test branch (deploys test-api) -> "test"; main branch (deploys api) -> "main".
+# ⚠️ When merging test->main, flip this to "main" — it is the ONLY line to change;
+#    every skill_url is derived from it via io_onboarding_skill_url().
+IO_ONBOARDING_BRANCH = "test"
+_IO_ONBOARDING_RAW_BASE = (
+    f"https://raw.githubusercontent.com/teleport-computer/io-onboarding/{IO_ONBOARDING_BRANCH}"
+)
+
+
+def io_onboarding_skill_url(filename: str) -> str:
+    """Raw URL for an io-onboarding skill doc on the branch matching this deploy."""
+    return f"{_IO_ONBOARDING_RAW_BASE}/{filename}"
+
+
 def _now_iso() -> str:
     return datetime.now().isoformat()
 
