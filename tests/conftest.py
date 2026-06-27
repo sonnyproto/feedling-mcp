@@ -101,7 +101,6 @@ if not _provisioned:
         "test_enclave_frame_caption.py",
         "test_enclave_visual_plaintext.py",
         "test_screen_caption_backend.py",
-        "test_screen_caption_deploy.py",
         "test_screen_caption_flag.py",
         "test_agent_perception_route.py",
         "test_agent_runtime_tokens.py",

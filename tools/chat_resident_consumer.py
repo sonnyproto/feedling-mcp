@@ -228,6 +228,21 @@ PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC = int(
     os.environ.get("PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", "1800")
 )
 PROACTIVE_TICK_START_DELAY_SEC = int(os.environ.get("PROACTIVE_TICK_START_DELAY_SEC", "15"))
+# Screen-watch lane — decoupled from the heavy heartbeat. While the user is
+# actively screen-sharing, a lightweight loop lets the agent look at recent
+# frames every SCREEN_WATCH_INTERVAL_SEC, but ONLY when the screen actually
+# changed and the user is not mid-conversation. It carries frames + a names-only
+# tool list, NOT the cross-domain board / full tool catalog. The heartbeat keeps
+# its own (broadcast-independent) cadence.
+SCREEN_WATCH_ENABLED = _env_bool("FEEDLING_SCREEN_WATCH_ENABLED", True)
+SCREEN_WATCH_INTERVAL_SEC = int(os.environ.get("FEEDLING_SCREEN_WATCH_INTERVAL_SEC", "120"))
+SCREEN_WATCH_CHAT_SUPPRESS_SEC = int(os.environ.get("FEEDLING_SCREEN_WATCH_CHAT_SUPPRESS_SEC", "180"))
+SCREEN_WATCH_FRAMES = int(os.environ.get("FEEDLING_SCREEN_WATCH_FRAMES", "5"))
+SCREEN_WATCH_START_DELAY_SEC = int(os.environ.get("FEEDLING_SCREEN_WATCH_START_DELAY_SEC", "20"))
+# A frame newer than this means sharing is genuinely live right now (iOS captures
+# ~1 frame / 30 s). Used instead of the heartbeat's broadcast_state, which is only
+# refreshed on the slow heartbeat tick and would be stale for a 2-min loop.
+SCREEN_WATCH_FRESH_SEC = int(os.environ.get("FEEDLING_SCREEN_WATCH_FRESH_SEC", "90"))
 PROACTIVE_SCHEDULED_FIRE_ENABLED = _env_bool("PROACTIVE_SCHEDULED_FIRE_ENABLED", True)
 PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC = int(os.environ.get("PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC", "60"))
 PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC = int(os.environ.get("PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC", "5"))
@@ -2820,10 +2835,12 @@ def _proactive_tick_trigger_for_broadcast_state(broadcast_state: str) -> str:
 
 
 def _proactive_tick_interval_for_broadcast_state(broadcast_state: str) -> int:
-    state = str(broadcast_state or "").strip().lower()
-    if not state or state == "off":
-        return max(60, PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC)
-    return max(30, PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC)
+    # Heartbeat is now DECOUPLED from screen sharing: broadcast no longer
+    # accelerates the heavy presence heartbeat. Screen attention is handled by the
+    # separate lightweight screen-watch lane (SCREEN_WATCH_INTERVAL_SEC). The
+    # heartbeat keeps a single steady cadence regardless of broadcast_state.
+    # (PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC kept for back-compat / override.)
+    return max(60, PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC)
 
 
 def post_proactive_tick(payload: dict[str, Any] | None = None) -> dict:
@@ -2843,6 +2860,43 @@ def fire_scheduled_wakes() -> dict:
     resp.raise_for_status()
     parsed = resp.json()
     return parsed if isinstance(parsed, dict) else {"results": [], "jobs": []}
+
+
+def _screen_watch_recent_frames(limit: int = SCREEN_WATCH_FRAMES) -> tuple[str, float, list[dict]]:
+    """Most-recent screen frames for a screen-watch wake. Returns
+    (latest_frame_id, latest_ts, [{"id": ...}, ...] newest-first) — ("", 0.0, [])
+    if none/unavailable. The /v1/screen/frames route returns newest-first."""
+    body = _fetch_screen_json(f"/v1/screen/frames?limit={max(1, int(limit))}")
+    frames = (body or {}).get("frames") if isinstance(body, dict) else None
+    if not isinstance(frames, list) or not frames:
+        return "", 0.0, []
+    ids: list[dict] = []
+    for f in frames:
+        fid = str((f or {}).get("id") or (f or {}).get("frame_id") or "").strip()
+        if fid:
+            ids.append({"id": fid})
+    latest = ids[0]["id"] if ids else ""
+    try:
+        latest_ts = float((frames[0] or {}).get("ts") or 0.0)
+    except (TypeError, ValueError):
+        latest_ts = 0.0
+    return latest, latest_ts, ids
+
+
+def post_screen_watch_tick(broadcast_state: str, frames: list[dict]) -> dict:
+    """Enqueue a lightweight screen-watch wake. It is a consumer-scheduled
+    self-wake: NOT forced/manual, so it still respects the user's Ambient gate
+    (Ambient off → no screen-watch). job_kind marks it for the light prompt;
+    frames are passed explicitly (the backend does not implicitly sample for
+    this lane). The backend skips the heartbeat no-frame auto-block for it."""
+    payload = {
+        "job_kind": "screen_watch",
+        "trigger": "screen_watch",
+        "frames": frames,
+    }
+    if broadcast_state:
+        payload["broadcast_state"] = broadcast_state
+    return post_proactive_tick(payload)
 
 
 def fire_capture_tick() -> dict:
@@ -3409,6 +3463,73 @@ def _proactive_attention_facts(chat: ProactiveChatContext) -> str:
     ])
 
 
+def _is_screen_watch_job(job: dict) -> bool:
+    """A lightweight screen-watch wake (its own lane, decoupled from the heavy
+    heartbeat). Keyed on job_kind primarily, trigger as a fallback."""
+    return (
+        str((job or {}).get("job_kind") or "").strip().lower() == "screen_watch"
+        or str((job or {}).get("trigger") or "").strip().lower() == "screen_watch"
+    )
+
+
+def _native_tool_names_compact() -> str:
+    """Names-only tool list for the light screen-watch prompt. The runtime always
+    has every tool registered, so this is guidance, not a restriction — listing
+    all names (cheaply) keeps the agent free to pull health/calendar/etc. if the
+    screen calls for it, without the heavy cost-guide the heartbeat carries."""
+    return "\n".join([
+        "tools_available (names only; you have your full toolset — call any if the screen makes it relevant):",
+        "- perception_<signal>: now, location, weather, motion, calendar, focus, audio_route, app, "
+        "steps, sleep, workout, vitals, activity, body, metabolic, cycle, mood, reminders",
+        "- perception_trend, perception_history, memory_index, memory_fetch, "
+        "screen_recent, screen_read, photo_recent, photo_read",
+        "  (Bash/CLI runtimes: same verbs via io_cli.)",
+    ])
+
+
+def _screen_watch_message(
+    job: dict,
+    screen_text: str = "",
+    chat_context: "ProactiveChatContext | None" = None,
+) -> str:
+    """Light screen-watch prompt: state the facts, hand the decision (and the
+    agent's own character) back to it. No cross-domain board, no cost-guide."""
+    screen_available = bool(screen_text)
+    parts = [
+        "[Feedling screen-watch]",
+        "The user is screen-sharing with you right now. Someone sharing their screen "
+        "usually wants you in on a slice of their life as it happens.",
+        "This is not a request and not an instruction to respond — it is a chance to be present.",
+        "Whether you look, and whether you speak, is yours to decide from your own character. "
+        "Staying quiet is just as valid as speaking.",
+        "Read the on-device OCR text first (cheap); open the attached screenshot only if it is "
+        "worth a closer look. If you want to review earlier moments, use screen_recent / screen_read "
+        "(frames are kept ~100 min).",
+        "If something genuinely moves you to speak, use your normal voice (1-3 short bubbles). "
+        "If not, return JSON: {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}],\"messages\":[]}.",
+        "Do not mention this watch, the frames, or any system wording to the user.",
+        (
+            "watch_metadata:\n"
+            f"- trigger: screen_watch\n"
+            f"- broadcast_state: {str(job.get('broadcast_state') or 'unknown')}\n"
+            f"- current_app: {str(job.get('current_app') or 'unknown')}\n"
+            f"- screen_context_available: {str(screen_available).lower()}"
+        ),
+    ]
+    if chat_context is not None:
+        parts.append(_proactive_attention_facts(chat_context))
+        parts.append(
+            "If attention_facts show you are mid-conversation or just spoke, prefer silence over "
+            "interrupting or repeating yourself."
+        )
+    parts.append(_native_tool_names_compact())
+    if screen_text:
+        parts.append(screen_text)
+    else:
+        parts.append("screen_context: no fresh frame available right now; do not imply you can see the screen.")
+    return "\n\n".join(parts)
+
+
 def _message_for_proactive_job(
     job: dict,
     screen_text: str = "",
@@ -3416,6 +3537,8 @@ def _message_for_proactive_job(
     perception_digest: tuple[dict, list, dict] | None = None,
 ) -> str:
     chat_context = _coerce_proactive_chat_context(recent_chat_context)
+    if _is_screen_watch_job(job):
+        return _screen_watch_message(job, screen_text=screen_text, chat_context=chat_context)
     wake_kind = _proactive_wake_kind(job, screen_text=screen_text)
     screen_available = bool(screen_text)
     parts = [
@@ -4494,7 +4617,9 @@ def _process_proactive_jobs(jobs: list) -> float:
             frame_ids = []
         screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
         recent_context = recent_chat_context_for_proactive()
-        perception_digest = _proactive_perception_digest()
+        # Screen-watch is a light lane: skip the heavy cross-domain digest fetch
+        # (its prompt deliberately omits the board).
+        perception_digest = None if _is_screen_watch_job(job) else _proactive_perception_digest()
         message = _message_for_proactive_job(
             job,
             screen_text=screen_text,
@@ -5151,6 +5276,9 @@ def run() -> None:
     next_scheduled_fire_mono = time.monotonic() + max(0, PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC)
     capture_tick_enabled = CAPTURE_TICK_ENABLED
     next_capture_tick_mono = time.monotonic() + max(0, CAPTURE_TICK_START_DELAY_SEC)
+    screen_watch_enabled = proactive_enabled and SCREEN_WATCH_ENABLED
+    next_screen_watch_mono = time.monotonic() + max(0, SCREEN_WATCH_START_DELAY_SEC)
+    last_screen_watch_frame_id = ""
 
     log.info(
         "starting poll loop — last_ts=%.3f last_job_ts=%.3f poll_timeout=%ds proactive=%s proactive_tick=%s tick_on=%ds tick_off=%ds scheduled_fire=%s scheduled_fire_interval=%ds capture_tick=%s capture_tick_interval=%ds",
@@ -5247,6 +5375,38 @@ def run() -> None:
                             next_interval,
                         )
                         next_proactive_tick_mono = time.monotonic() + next_interval
+                    if screen_watch_enabled and time.monotonic() >= next_screen_watch_mono:
+                        try:
+                            latest_fid, latest_ts, watch_frames = _screen_watch_recent_frames()
+                            fresh = bool(latest_fid) and (time.time() - latest_ts) <= SCREEN_WATCH_FRESH_SEC
+                            changed = bool(latest_fid) and latest_fid != last_screen_watch_frame_id
+                            if fresh and changed:
+                                # Only act on genuinely new content; backlog stays
+                                # reachable via screen_recent in the light prompt.
+                                last_screen_watch_frame_id = latest_fid
+                                sw_chat = recent_chat_context_for_proactive()
+                                user_age = sw_chat.last_user_message_age_sec
+                                chatting = (
+                                    user_age is not None
+                                    and user_age < SCREEN_WATCH_CHAT_SUPPRESS_SEC
+                                )
+                                if chatting:
+                                    log.info(
+                                        "screen-watch yielding to active chat (user_msg_age=%.0fs)",
+                                        user_age if user_age is not None else -1,
+                                    )
+                                else:
+                                    sw = post_screen_watch_tick("on", watch_frames)
+                                    log.info(
+                                        "screen-watch tick enqueued=%s frames=%d frame_id=%s",
+                                        bool(sw.get("enqueued")),
+                                        len(watch_frames),
+                                        latest_fid[:12],
+                                    )
+                        except Exception as e:
+                            log.warning("screen-watch tick failed: %s", e)
+                        finally:
+                            next_screen_watch_mono = time.monotonic() + max(30, SCREEN_WATCH_INTERVAL_SEC)
                     job_result = poll_proactive_jobs(last_job_ts)
                     jobs = job_result.get("jobs") or []
                     if jobs:

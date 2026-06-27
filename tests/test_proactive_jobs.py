@@ -533,6 +533,77 @@ def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
     assert b"Hidden Jobs" in page_en.data
 
 
+def test_screen_watch_tick_preserves_job_kind_and_trigger(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_screen_watch_key"
+    user_id = "usr_screen_watch"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    resp = client.post(
+        "/v1/proactive/tick",
+        headers={"X-API-Key": api_key},
+        json={
+            "job_kind": "screen_watch",
+            "broadcast_state": "on",
+            "frames": [
+                {"frame_id": "swframe00000001", "ts": appmod.time.time(), "ocr_text": "Settings"},
+            ],
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["enqueued"] is True
+    assert body["decision"]["job_kind"] == "screen_watch"
+    assert body["decision"]["trigger"] == "screen_watch"
+    assert body["decision"]["wake_kind"] == "screen_watch"
+    assert body["decision"]["manual"] is False
+    assert body["decision"]["forced"] is False
+    assert body["job"]["job_kind"] == "screen_watch"
+    assert body["job"]["trigger"] == "screen_watch"
+    assert body["job"]["frame_ids"] == ["swframe00000001"]
+
+    poll = client.get("/v1/proactive/jobs/poll?since=0&timeout=0", headers={"X-API-Key": api_key})
+    assert poll.status_code == 200
+    jobs = poll.get_json()["jobs"]
+    assert jobs[0]["job_kind"] == "screen_watch"
+    assert jobs[0]["trigger"] == "screen_watch"
+
+
+def test_screen_watch_tick_does_not_sample_recent_frames_implicitly(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    monkeypatch.setattr(
+        appmod.screen_frames,
+        "_recent_frame_meta",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("screen_watch must not sample frames")),
+    )
+
+    api_key = "test_screen_watch_no_sample_key"
+    user_id = "usr_screen_watch_no_sample"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    resp = client.post(
+        "/v1/proactive/tick",
+        headers={"X-API-Key": api_key},
+        json={"job_kind": "screen_watch", "broadcast_state": "on"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["enqueued"] is True
+    assert body["decision"]["job_kind"] == "screen_watch"
+    assert body["decision"]["trigger"] == "screen_watch"
+    assert body["decision"]["frame_ids"] == []
+    assert body["job"]["job_kind"] == "screen_watch"
+    assert body["job"]["frame_ids"] == []
+
+
 def test_auto_proactive_v2_wake_samples_frames_without_gate_llm(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setattr(proactive_dashboard, "OPENROUTER_API_KEY", "sk-test")
@@ -711,9 +782,9 @@ def test_auto_proactive_v2_schedule_heartbeats_split_presence_and_screen_wakes(t
     on_body = on_with_frame.get_json()
     assert on_body["enqueued"] is True
     assert on_body["decision"]["reason"] == "wake_created"
-    assert on_body["decision"]["wake_kind"] == "screen"
-    assert on_body["decision"]["screen_context_available"] is True
-    assert on_body["job"]["frame_ids"] == ["frameon123456789"]
+    assert on_body["decision"]["wake_kind"] == "presence"
+    assert on_body["decision"]["screen_context_available"] is False
+    assert on_body["job"]["frame_ids"] == []
 
 
 def test_auto_proactive_v2_away_state_does_not_resurrect_legacy_wake_gate(tmp_path, monkeypatch):

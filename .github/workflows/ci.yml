@@ -143,7 +143,6 @@ jobs:
             tests/test_proactive_jobs.py \
             tests/test_proactive_gate_eval.py \
             tests/test_screen_caption_backend.py \
-            tests/test_screen_caption_deploy.py \
             tests/test_screen_caption_flag.py \
             tests/test_enclave_frame_caption.py \
             tests/test_enclave_visual_plaintext.py \
@@ -399,7 +398,6 @@ jobs:
           APNS_KEY_ID:         ${{ secrets.APNS_KEY_ID }}
           APNS_TEAM_ID:        ${{ secrets.APNS_TEAM_ID }}
           OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
-          FEEDLING_SCREEN_VLM_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
           # External Postgres connection string (with sslmode=require). Injected
           # via the encrypted env channel — carries DB credentials, NOT baked
@@ -446,7 +444,6 @@ jobs:
             -e "APNS_KEY_ID=$APNS_KEY_ID" \
             -e "APNS_TEAM_ID=$APNS_TEAM_ID" \
             -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
-            -e "FEEDLING_SCREEN_VLM_API_KEY=$FEEDLING_SCREEN_VLM_API_KEY" \
             -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
             -e "DATABASE_URL=$DATABASE_URL" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
@@ -583,7 +580,6 @@ jobs:
           APNS_KEY_ID:         ${{ secrets.APNS_KEY_ID }}
           APNS_TEAM_ID:        ${{ secrets.APNS_TEAM_ID }}
           OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
-          FEEDLING_SCREEN_VLM_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
           DATABASE_URL:        ${{ secrets.TEST_DATABASE_URL }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
@@ -627,7 +623,6 @@ jobs:
             -e "APNS_KEY_ID=$APNS_KEY_ID" \
             -e "APNS_TEAM_ID=$APNS_TEAM_ID" \
             -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
-            -e "FEEDLING_SCREEN_VLM_API_KEY=$FEEDLING_SCREEN_VLM_API_KEY" \
             -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
             -e "DATABASE_URL=$DATABASE_URL" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \

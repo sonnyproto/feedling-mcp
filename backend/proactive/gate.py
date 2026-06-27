@@ -12,7 +12,19 @@ from proactive.controls_v2 import evaluate_wake_control_v2, resolve_settings_v2
 from proactive import service
 from screen import frames as screen_frames
 
-def _proactive_trigger(payload: dict, *, manual: bool, frames: list[dict]) -> str:
+SCREEN_WATCH_JOB_KIND = "screen_watch"
+
+
+def _clean_runtime_token(raw: object) -> str:
+    token = re.sub(r"[^a-zA-Z0-9_.:-]+", "_", str(raw or "").strip().lower()).strip("_.:-")
+    return token[:120]
+
+
+def _canonical_runtime_token(raw: object) -> str:
+    return _clean_runtime_token(raw).replace("-", "_").replace(".", "_").replace(":", "_")
+
+
+def _explicit_proactive_trigger(payload: dict) -> str:
     raw = (
         payload.get("trigger")
         or payload.get("wake_trigger")
@@ -20,9 +32,24 @@ def _proactive_trigger(payload: dict, *, manual: bool, frames: list[dict]) -> st
         or payload.get("type")
         or ""
     )
-    trigger = re.sub(r"[^a-zA-Z0-9_.:-]+", "_", str(raw or "").strip().lower()).strip("_.:-")
+    if _canonical_runtime_token(raw) == SCREEN_WATCH_JOB_KIND:
+        return SCREEN_WATCH_JOB_KIND
+    return _clean_runtime_token(raw)
+
+
+def _proactive_job_kind(payload: dict, *, trigger: str = "") -> str:
+    raw = payload.get("job_kind") or payload.get("jobKind") or payload.get("job_type") or ""
+    if _canonical_runtime_token(raw) == SCREEN_WATCH_JOB_KIND:
+        return SCREEN_WATCH_JOB_KIND
+    if _canonical_runtime_token(trigger) == SCREEN_WATCH_JOB_KIND:
+        return SCREEN_WATCH_JOB_KIND
+    return ""
+
+
+def _proactive_trigger(payload: dict, *, manual: bool, frames: list[dict], explicit_trigger: str = "") -> str:
+    trigger = explicit_trigger or _explicit_proactive_trigger(payload)
     if trigger:
-        return trigger[:120]
+        return trigger
     if manual:
         return "manual_wake"
     return "screen_tick" if frames else "heartbeat_no_frame"
@@ -36,26 +63,24 @@ def _proactive_v2_auto_wake_block_reason(trigger: str, *, broadcast_state: str, 
 
     if normalized_trigger in {"heartbeat_unknown", "heartbeat_no_frame"}:
         return "no_recent_frames"
-    if normalized_trigger in {"heartbeat_broadcast_off", "heartbeat_broadcast_paused"}:
+    if normalized_trigger.startswith("heartbeat_broadcast_"):
         return ""
-    if normalized_trigger == "heartbeat_broadcast_on" and not has_frames:
-        return "no_recent_frames"
     if normalized_trigger == "broadcast_opened" and not has_frames:
         return "no_recent_frames"
-    if (
-        normalized_broadcast in {"off", "paused"}
-        and normalized_trigger.startswith("heartbeat")
-        and normalized_trigger not in {"heartbeat_broadcast_off", "heartbeat_broadcast_paused"}
-    ):
+    if normalized_broadcast in {"off", "paused"} and normalized_trigger.startswith("heartbeat"):
         return f"broadcast_{normalized_broadcast}"
     return ""
 
 
-def _proactive_v2_wake_kind(trigger: str, *, frame_ids: list[str]) -> str:
+def _proactive_v2_wake_kind(trigger: str, *, frame_ids: list[str], job_kind: str = "") -> str:
+    if str(job_kind or "").strip().lower() == SCREEN_WATCH_JOB_KIND:
+        return SCREEN_WATCH_JOB_KIND
+    normalized_trigger = str(trigger or "").strip().lower()
+    if normalized_trigger.startswith("heartbeat_broadcast_"):
+        return "presence"
     if frame_ids:
         return "screen"
-    normalized_trigger = str(trigger or "").strip().lower()
-    if normalized_trigger in {"broadcast_opened", "heartbeat_broadcast_on", "screen_tick"}:
+    if normalized_trigger in {"broadcast_opened", "screen_tick"}:
         return "screen"
     return "presence"
 
@@ -92,13 +117,25 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
     now = time.time()
     payload = payload if isinstance(payload, dict) else {}
     settings = store.load_proactive_settings()
+    explicit_trigger = _explicit_proactive_trigger(payload)
+    job_kind = _proactive_job_kind(payload, trigger=explicit_trigger)
+    is_screen_watch = job_kind == SCREEN_WATCH_JOB_KIND
+    if is_screen_watch and not explicit_trigger:
+        explicit_trigger = SCREEN_WATCH_JOB_KIND
+    explicit_is_heartbeat = explicit_trigger.startswith("heartbeat")
     force = service._proactive_bool(payload, "force", "force_response")
-    manual = force or service._proactive_bool(payload, "manual", "manual_wake", "user_initiated") or bool(
+    requested_manual = force or service._proactive_bool(payload, "manual", "manual_wake", "user_initiated") or bool(
         str(payload.get("context_hint") or "").strip()
     )
+    # screen_watch is a consumer-scheduled self-initiated lane. `force` lets it
+    # enqueue without the screen-heartbeat no-frame gate, but it must not become
+    # a user-message/manual wake for downstream contracts.
+    manual = False if is_screen_watch else requested_manual
 
     payload_frames = payload.get("frames")
-    if isinstance(payload_frames, list) and payload_frames:
+    if explicit_is_heartbeat:
+        frames = []
+    elif isinstance(payload_frames, list) and payload_frames:
         frames = [
             dict(f) for f in payload_frames
             if isinstance(f, dict) and str(f.get("id") or f.get("frame_id") or "").strip()
@@ -106,6 +143,8 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
         for f in frames:
             if not f.get("id") and f.get("frame_id"):
                 f["id"] = f.get("frame_id")
+    elif is_screen_watch:
+        frames = []
     else:
         frames = screen_frames._recent_frame_meta(
             store,
@@ -135,7 +174,9 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
         core_store.PROACTIVE_BROADCAST_STATES,
         _effective_broadcast_state(store, settings),
     )
-    trigger = _proactive_trigger(payload, manual=manual, frames=selected_frames)
+    trigger = _proactive_trigger(payload, manual=manual, frames=selected_frames, explicit_trigger=explicit_trigger)
+    if not job_kind:
+        job_kind = _proactive_job_kind(payload, trigger=trigger)
 
     wake_source = source_for_legacy_trigger_v2(trigger, manual=manual)
     wake_control = evaluate_wake_control_v2(
@@ -145,7 +186,7 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
     )
 
     block_reason = "" if wake_control.accepted else wake_control.reason
-    if not block_reason and not manual:
+    if not block_reason and not manual and not is_screen_watch:
         block_reason = _proactive_v2_auto_wake_block_reason(
             trigger,
             broadcast_state=broadcast_state,
@@ -157,7 +198,7 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
         current_app = screen_frames._current_app_from_frames([], selected_frames)
     ocr = str(payload.get("ocr_summary") or "").strip() or screen_frames._ocr_summary(selected_frames)
     should_wake_agent = not bool(block_reason)
-    wake_kind = _proactive_v2_wake_kind(trigger, frame_ids=frame_ids)
+    wake_kind = _proactive_v2_wake_kind(trigger, frame_ids=frame_ids, job_kind=job_kind)
     decision_id = util._new_public_id("gd")
     wake_id = util._new_public_id("wake")
     reason = "wake_created" if should_wake_agent else block_reason
@@ -185,6 +226,7 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
         "device_event_ids": [str(e.get("event_id")) for e in device_events if e.get("event_id")][:10],
         "current_app": current_app,
         "trigger": trigger,
+        "job_kind": job_kind,
         "wake_kind": wake_kind,
         "screen_context_available": bool(frame_ids),
         "manual": manual,
@@ -241,6 +283,7 @@ def _proactive_job_from_decision(decision: dict) -> dict:
         "device_event_ids": decision.get("device_event_ids", []),
         "current_app": decision.get("current_app", ""),
         "trigger": decision.get("trigger", ""),
+        "job_kind": decision.get("job_kind", ""),
         "manual": bool(decision.get("manual", False)),
         "forced": bool(decision.get("forced", False)),
         "user_state": decision.get("user_state", ""),
