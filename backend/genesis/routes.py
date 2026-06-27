@@ -180,6 +180,8 @@ def genesis_import_apply_outputs(job_id: str):
     except Exception as e:  # noqa: BLE001
         failed = service.mark_failed(store, job_id, f"apply_outputs_failed:{type(e).__name__}:{str(e)[:180]}")
         return jsonify(_job_response(failed, extra={"status": "failed", "error": str(e)[:240]})), 500
+    job = db.genesis_get_job(store.user_id, job_id)
+    return jsonify(_job_response(job, extra={"status": "done", "applied": applied})), 200
 
 
 @bp.route("/v1/genesis/persona_backfill", methods=["POST"])
@@ -212,8 +214,6 @@ def genesis_persona_backfill():
         "job_id": job.get("job_id"),
         "job_status": job.get("status"),
     }), 202
-    job = db.genesis_get_job(store.user_id, job_id)
-    return jsonify(_job_response(job, extra={"status": "done", "applied": applied})), 200
 
 
 @bp.route("/v1/genesis/imports/<job_id>", methods=["GET"])
