@@ -30,6 +30,11 @@ AI_PERSONA_SOURCE_KINDS = {
     "character",
     "character_card",
     "companion_persona",
+    # voice/persona backfill for pre-genesis host users: material is assembled from
+    # the existing identity record (tone_style/custom_persona_prompt/self_introduction),
+    # not an uploaded transcript — but it must route to the ai_persona family so the
+    # worker runs persona_build (cutover gate 4 A).
+    "companion_persona_backfill",
     "system_prompt",
 }
 MEMORY_SUMMARY_SOURCE_KINDS = {
