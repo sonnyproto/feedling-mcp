@@ -459,6 +459,49 @@ def _persona_version(user_id: str) -> str:
     return version
 
 
+# Cutover gate 4 B-3: lazy persona backfill. For a host user with no genesis_persona
+# blob, POST the backfill endpoint so the worker distills voice from their identity.
+# Off by default (cutover-time switch). Bounded so it NEVER blocks the tick.
+_BACKFILL_ATTEMPTED: dict[str, float] = {}
+
+
+def _lazy_persona_backfill_enabled() -> bool:
+    return os.environ.get("FEEDLING_PERSONA_BACKFILL_LAZY", "").strip().lower() in ("1", "true", "yes")
+
+
+def _run_lazy_persona_backfill(roster: list[dict], *, secret_raw: str, owner: str,
+                               api_url: str, now: float) -> None:
+    """POST /v1/genesis/persona_backfill for up to N no-blob users per tick, with a
+    per-user cooldown. Uses a dedicated short-TTL ``["genesis","envelope_decrypt"]``
+    token — NOT the consumer's spawn token (genesis is background maintenance, not a
+    long-lived agent permission — Codex review). Best-effort: errors logged, never
+    raised, so a slow/failed backfill POST never wedges the supervisor tick."""
+    if not secret_raw:
+        return
+    secret = secret_raw.encode("utf-8")
+    cooldown = float(os.environ.get("FEEDLING_PERSONA_BACKFILL_COOLDOWN_SEC", "3600"))
+    cap = int(os.environ.get("FEEDLING_PERSONA_BACKFILL_MAX_PER_TICK", "2"))
+    done = 0
+    for entry in roster:
+        if done >= cap:
+            break
+        if str(entry.get("persona_version") or ""):
+            continue  # already has a persona blob → nothing to backfill
+        uid = str(entry.get("user_id") or "")
+        if not uid or (now - _BACKFILL_ATTEMPTED.get(uid, 0.0)) < cooldown:
+            continue
+        _BACKFILL_ATTEMPTED[uid] = now  # record before the call so a failure still backs off
+        try:
+            token = runtime_token.mint(secret, user_id=uid, runtime_instance_id=owner,
+                                       scope=["genesis", "envelope_decrypt"], ttl=300)
+            resp = httpx.post(f"{api_url.rstrip('/')}/v1/genesis/persona_backfill",
+                              headers={"X-Feedling-Runtime-Token": token}, timeout=15)
+            log.info("persona backfill %s → http=%s %s", uid, resp.status_code, resp.text[:120])
+        except Exception as e:  # noqa: BLE001
+            log.warning("persona backfill POST failed for %s: %s", uid, e)
+        done += 1
+
+
 def _spawn_identity(entry: dict) -> tuple:
     """The spawn-determining fields of a roster entry — when any changes, the
     running consumer's env/home is stale and it must be respawned. Mirrors what
@@ -725,6 +768,11 @@ def main() -> int:
                 if gateway_mgr is not None:
                     gateway_mgr.reconcile(gateways)
                 sup.tick(roster)
+                # Gate 4 B-3: after the spawn reconcile, top up voice for no-blob users
+                # (bounded + cooldown'd so it never blocks the tick). Off by default.
+                if _lazy_persona_backfill_enabled():
+                    _run_lazy_persona_backfill(roster, secret_raw=secret_raw, owner=owner,
+                                               api_url=api_url, now=time.time())
                 # Stage D host-all: a freshly-hosted user is dead-ended at
                 # needs_live_connection until verify_loop runs once. Open the gate
                 # in the background (the POST blocks ~30s for the consumer's reply).
