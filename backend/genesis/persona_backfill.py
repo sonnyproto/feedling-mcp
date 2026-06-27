@@ -115,12 +115,17 @@ def run_persona_backfill(store, identity_plain: dict | None) -> dict | None:
     from genesis import service as genesis_service
 
     mhash = material_sha256(material)
-    key = backfill_idempotency_key(store.user_id, mhash)
 
-    # Idempotency: a non-failed job with this stable key means it's in-flight/done.
+    # Idempotency: a non-failed backfill job for this exact material means it's
+    # already in-flight/done — skip (lazy trigger fires every tick). Match on
+    # source_kind + material_sha256, both of which PERSIST: material_sha256 survives
+    # _safe_job_metadata's ``*_sha256`` rule. (A bespoke ``backfill_key`` would be
+    # FILTERED out by that whitelist, so we must NOT rely on it.)
     for job in db.genesis_list_jobs(store.user_id, limit=50):
+        if str(job.get("source_kind") or "") != _SOURCE_KIND:
+            continue
         meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
-        if meta.get("backfill_key") == key and str(job.get("status") or "") in _INFLIGHT_OR_DONE:
+        if meta.get("material_sha256") == mhash and str(job.get("status") or "") in _INFLIGHT_OR_DONE:
             return job
 
     envelope, err = core_envelope._build_shared_envelope_for_store(store, material.encode("utf-8"))
@@ -132,7 +137,7 @@ def run_persona_backfill(store, identity_plain: dict | None) -> dict | None:
         "source_kind": _SOURCE_KIND,
         "total_chunks": 1,
         "total_bytes": len(encrypted_body),
-        "metadata": {"backfill_key": key, "material_sha256": mhash},
+        "metadata": {"material_sha256": mhash},
     })
     job_id = job["job_id"]
     genesis_service.put_chunk(

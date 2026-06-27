@@ -201,6 +201,9 @@ def write_genesis_state(store: UserStore, job: dict, *, status: str | None = Non
         "status": status or gate_status_for_job_status(job_status),
         "job_status": job_status,
         "job_id": str(job.get("job_id") or ""),
+        # so the spawn gate can tell a founding genesis (block spawn until done) from
+        # a background companion_persona_backfill (must NOT block — cutover gate 4).
+        "source_kind": str(job.get("source_kind") or ""),
         "updated_at": _now_iso(),
         "completed_at": str(job.get("completed_at") or ""),
         "memory_action_count": int(job.get("memory_action_count") or 0),

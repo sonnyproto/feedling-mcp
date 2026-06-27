@@ -406,9 +406,15 @@ _GENESIS_BLOCKING_STATUS = frozenset({"uploaded", "finalizing", "processing"})
 
 
 def _genesis_status_blocks_spawn(blob) -> bool:
-    """Pure gate logic (no DB) — True only when genesis is actively in progress."""
+    """Pure gate logic (no DB) — True only when a FOUNDING genesis is in progress.
+    A background ``companion_persona_backfill`` writes the same in-progress status but
+    must NOT block spawn: the user boots with the identity/tools baseline and picks up
+    voice via the persona_version respawn once the blob lands (cutover gate 4 — avoids
+    "POST backfill before spawn wedges this user's spawn")."""
     if not isinstance(blob, dict):
         return False  # no genesis underway → fresh start, allow
+    if str(blob.get("source_kind") or "").strip().lower() == "companion_persona_backfill":
+        return False  # voice top-up, not a founding genesis — never block spawn
     return str(blob.get("status") or "").strip().lower() in _GENESIS_BLOCKING_STATUS
 
 
