@@ -3412,7 +3412,7 @@ def _message_for_proactive_job(
     job: dict,
     screen_text: str = "",
     recent_chat_context: Any = "",
-    perception_digest: tuple[dict, list] | None = None,
+    perception_digest: tuple[dict, list, dict] | None = None,
 ) -> str:
     chat_context = _coerce_proactive_chat_context(recent_chat_context)
     wake_kind = _proactive_wake_kind(job, screen_text=screen_text)
@@ -3479,19 +3479,30 @@ def _native_reachout_tool_instructions() -> str:
     ])
 
 
-def _native_reachout_perception_context(presence: dict, change: list) -> str:
+def _native_reachout_perception_context(presence: dict, change: list, domains: dict | None = None) -> str:
     parts = [
         "real_signal_context:",
-        "Presence and change hints are preloaded facts for this wake. Treat missing fields as unknown; pull native tools for more detail.",
+        "Presence and the cross-domain board are preloaded facts for this wake. Treat missing fields as unknown; pull native tools for more detail.",
     ]
     if presence:
         parts.append("presence_hints_json:\n" + json.dumps(presence, ensure_ascii=False, sort_keys=True))
     else:
         parts.append("presence_hints_json: {}")
-    if change:
+    if domains:
+        parts.append("cross_domain_board_json:\n" + json.dumps(domains, ensure_ascii=False, sort_keys=True))
+        parts.append(
+            "Reading the board: each domain (location/media/app/health/weather/mood/reminders/calendar/photos/screen) "
+            "is laid out evenly — health is just one entry, not the headline. From the whole board, judge for YOURSELF "
+            "at most 2-3 things genuinely worth appearing about; you may combine across domains, and prefer lived, "
+            "human context (music, place, an app, a photo, an overdue reminder) over reciting health numbers. "
+            "novelty hints (new_artist / long_dwell) are light factual context, not a directive. "
+            "If nothing is truly worth it, return proactive.sleep."
+        )
+    elif change:
+        # Back-compat: an older backend without the board still returns top-N deltas.
         parts.append("perception_change_json:\n" + json.dumps(change, ensure_ascii=False, sort_keys=True))
     else:
-        parts.append("perception_change_json: []")
+        parts.append("cross_domain_board_json: {}")
     return "\n".join(parts)
 
 
@@ -3550,14 +3561,16 @@ def _resident_perception_now() -> dict:
     return now if isinstance(now, dict) else {}
 
 
-def _resident_perception_digest_changes() -> list:
-    """Best-effort GET of the top-N notable cross-signal digest changes.
+def _resident_perception_digest_board() -> tuple[list, dict]:
+    """Best-effort GET of the wake digest. Returns (changes, domains):
 
-    Replaces the old hardcoded 3-field preload (_PROACTIVE_CHANGE_SIGNALS):
-    the backend `/v1/agent/perception/digest` now ranks what actually moved vs
-    the user's own baseline across ALL historized numeric signals (vitals /
-    metabolic / weather / activity / sleep / body / cycle) and returns the most
-    notable. Degrades to [] if the endpoint is unavailable. The agent can still
+    - ``domains`` = the balanced cross-domain board (location/media/app/health/
+      weather/mood/reminders/calendar/photos/screen) — what the agent should
+      judge from, so the wake impulse isn't health-only.
+    - ``changes`` = legacy top-N numeric deltas, kept as a fallback for an older
+      backend that has not shipped the board yet.
+
+    Degrades to ([], {}) if the endpoint is unavailable. The agent can still
     drill into any signal on demand via the perception_trend/history tools."""
     try:
         resp = httpx.get(
@@ -3567,19 +3580,23 @@ def _resident_perception_digest_changes() -> list:
             timeout=15,
         )
         if resp.status_code >= 400:
-            return []
+            return [], {}
         body = resp.json()
-        return list(body.get("changes") or []) if isinstance(body, dict) else []
+        if not isinstance(body, dict):
+            return [], {}
+        changes = list(body.get("changes") or [])
+        domains = body.get("domains") if isinstance(body.get("domains"), dict) else {}
+        return changes, domains
     except Exception as e:
         log.debug("proactive digest pull failed: %s", e)
-        return []
+        return [], {}
 
 
-def _proactive_perception_digest() -> tuple[dict, list]:
+def _proactive_perception_digest() -> tuple[dict, list, dict]:
     """Pre-load real signals into the wake turn so the agent decides from facts,
-    not a blind prompt. presence = current cheap snapshot; change = top-N notable
-    vs-baseline deltas across the whole digest (no longer a hardcoded 3-field
-    list). Both best-effort — failures degrade to empty."""
+    not a blind prompt. presence = current cheap snapshot; domains = balanced
+    cross-domain board the agent judges from; change = legacy top-N deltas kept
+    as a back-compat fallback. All best-effort — failures degrade to empty."""
     presence: dict[str, Any] = {}
     snap = _resident_perception_now()
     if isinstance(snap, dict):
@@ -3591,8 +3608,8 @@ def _proactive_perception_digest() -> tuple[dict, list]:
         presence = {k: snap.get(k) for k in keys if snap.get(k) is not None}
         if local_time is not None:
             presence["local_time"] = local_time
-    change = _resident_perception_digest_changes()
-    return presence, change
+    change, domains = _resident_perception_digest_board()
+    return presence, change, domains
 
 
 def _send_message_replies_from_actions(actions: list[dict]) -> list[str]:

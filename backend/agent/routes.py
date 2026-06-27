@@ -249,17 +249,38 @@ def agent_perception_history():
 
 @bp.route("/v1/agent/perception/digest", methods=["GET"])
 def agent_perception_digest():
-    """Top-N notable numeric changes across historized perception signals."""
+    """Balanced cross-domain wake digest: one compact entry per life-context
+    domain (location/media/app/health/weather/mood/reminders/calendar/photos/
+    screen) so the agent keeps lived context instead of a health-only readout.
+    ``changes`` (legacy top-N numeric deltas) is kept for back-compat."""
     user_store = auth.require_user()
     days, err = _digest_days()
     if err:
         return jsonify(err[0]), err[1]
+    uid = user_store.user_id
+    # History rows for the numeric/health fold (comparable) plus the two
+    # non-comparable shapes the board reads directly: playback tally + place dwell.
+    history_signals = set(perception_history.comparable_signals()) | {"playback", "location_signal"}
     rows_by_signal = {
-        signal: perception_store.list_perception_daily(user_store.user_id, signal, days)
-        for signal in perception_history.comparable_signals()
+        signal: perception_store.list_perception_daily(uid, signal, days)
+        for signal in history_signals
     }
-    changes = perception_history.notable_changes(
-        rows_by_signal,
-        max_changes=_digest_notable_max(),
+    notable_max = _digest_notable_max()
+    changes = perception_history.notable_changes(rows_by_signal, max_changes=notable_max)
+    try:
+        snapshot = perception_service.snapshot(uid)
+        pull = perception_service.pull_snapshot(uid)
+    except Exception:
+        snapshot, pull = {}, {}
+    try:
+        photos = (perception_service.photos_recent(uid, limit=10)[0] or {}).get("photos") or []
+    except Exception:
+        photos = []
+    domains = perception_history.cross_domain_recent(
+        snapshot=snapshot,
+        pull_snapshot=pull,
+        rows_by_signal=rows_by_signal,
+        photos=photos,
+        max_health_notable=notable_max,
     )
-    return jsonify({"ok": True, "days": days, "changes": changes})
+    return jsonify({"ok": True, "days": days, "changes": changes, "domains": domains})

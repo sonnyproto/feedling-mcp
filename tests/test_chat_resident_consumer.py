@@ -2311,10 +2311,13 @@ def test_proactive_perception_digest_uses_agent_perception_routes_not_v2_tool(mo
 
     monkeypatch.setattr(crc.httpx, "get", _get)
 
-    presence, change = crc._proactive_perception_digest()
+    presence, change, domains = crc._proactive_perception_digest()
 
     assert presence["place_label"] == "home"
     assert presence["local_time"] == "2026-06-26T20:30:00+08:00"
+    # Back-compat: a digest response without a board still yields legacy changes
+    # and an empty domains dict.
+    assert domains == {}
     assert any(call[0].endswith("/v1/agent/perception") and call[1] == {"signals": "now"} for call in calls)
     assert any(call[0].endswith("/v1/agent/perception/digest") and call[1] == {"days": 30} for call in calls)
     assert all(call[0].endswith(("/v1/agent/perception", "/v1/agent/perception/digest")) for call in calls)
@@ -2347,6 +2350,10 @@ def test_native_proactive_prompt_injects_digest_and_native_tool_catalog(monkeypa
         lambda: (
             {"place_label": "home", "motion_state": "still", "local_time": "2026-06-26T20:30:00+08:00"},
             [{"signal": "steps", "field": "step_count", "current": 4200, "baseline_median": 3000, "delta": 1200}],
+            {
+                "media": {"now": {"artist": "Phoebe Bridgers"}, "novelty": "new_artist"},
+                "health": {"notable": [{"signal": "steps", "field": "step_count", "current": 4200}]},
+            },
         ),
     )
     monkeypatch.setattr(crc, "call_agent", _agent)
@@ -2372,7 +2379,11 @@ def test_native_proactive_prompt_injects_digest_and_native_tool_catalog(monkeypa
     assert "real_signal_context" in captured["message"]
     assert "presence_hints_json" in captured["message"]
     assert "\"place_label\": \"home\"" in captured["message"]
-    assert "perception_change_json" in captured["message"]
+    # New balanced board (not the legacy health-only change list) drives the wake.
+    assert "cross_domain_board_json" in captured["message"]
+    assert "Phoebe Bridgers" in captured["message"]
+    assert "at most 2-3" in captured["message"]
+    assert "perception_change_json" not in captured["message"]
     assert "\"signal\": \"steps\"" in captured["message"]
     assert "native_tool_access" in captured["message"]
     assert "perception_now" in captured["message"]
@@ -2382,6 +2393,30 @@ def test_native_proactive_prompt_injects_digest_and_native_tool_catalog(monkeypa
     assert "screen_read" in captured["message"]
     assert "io_cli: perception" in captured["message"]
     assert "Cost guide" in captured["message"]
+
+
+def test_native_perception_context_prefers_board_over_legacy_change():
+    text = crc._native_reachout_perception_context(
+        {"place_label": "home"},
+        [{"signal": "steps", "field": "step_count"}],
+        {"media": {"now": {"artist": "Phoebe Bridgers"}}, "health": {"notable": []}},
+    )
+    assert "cross_domain_board_json" in text
+    assert "Phoebe Bridgers" in text
+    assert "at most 2-3" in text
+    assert "perception_change_json" not in text  # board supersedes the legacy list
+
+
+def test_native_perception_context_falls_back_to_change_when_no_board():
+    # Older backend (no domains): legacy top-N change list still renders.
+    text = crc._native_reachout_perception_context(
+        {"place_label": "home"},
+        [{"signal": "steps", "field": "step_count"}],
+        {},
+    )
+    assert "perception_change_json" in text
+    assert "\"signal\": \"steps\"" in text
+    assert "cross_domain_board_json" not in text
 
 
 def test_normalize_agent_replies_supports_multiple_messages_with_cap(monkeypatch):

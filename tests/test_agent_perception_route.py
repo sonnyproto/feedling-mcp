@@ -21,6 +21,8 @@ def _client(monkeypatch, *, settings=None, state=None, snapshot=None, pull=None)
     monkeypatch.setattr(agent_routes.perception_store, "get_state", lambda uid: dict(state or {}))
     monkeypatch.setattr(agent_routes.perception_service, "snapshot", lambda uid: dict(snapshot or {}))
     monkeypatch.setattr(agent_routes.perception_service, "pull_snapshot", lambda uid: dict(pull or {}))
+    monkeypatch.setattr(agent_routes.perception_service, "photos_recent",
+                        lambda uid, limit=20: ({"photos": []}, 200))
 
     app = Flask("agent-route-test")
     app.register_blueprint(agent_routes.bp)
@@ -356,7 +358,17 @@ def test_agent_perception_digest_returns_top_notable_changes(monkeypatch):
         "magnitude": 1.5,
     }]
     assert all(call[0] == "u_agent" and call[2] == 7 for call in calls)
-    assert {call[1] for call in calls} == set(agent_routes.perception_history.comparable_signals())
+    # The board also reads the two non-comparable history shapes it renders directly.
+    assert {call[1] for call in calls} == (
+        set(agent_routes.perception_history.comparable_signals()) | {"playback", "location_signal"}
+    )
+    # The balanced board ships alongside legacy changes; health is one folded entry
+    # and (same rows, same cap) matches the legacy top-N here.
+    assert body["domains"]["health"]["notable"] == body["changes"]
+    assert set(body["domains"]) >= {
+        "location", "media", "app", "health", "weather",
+        "mood", "reminders", "calendar", "photos", "screen",
+    }
 
 
 def test_agent_perception_digest_empty_without_baseline(monkeypatch):
@@ -374,7 +386,11 @@ def test_agent_perception_digest_empty_without_baseline(monkeypatch):
     body = resp.get_json()
 
     assert resp.status_code == 200
-    assert body == {"ok": True, "days": 30, "changes": []}
+    assert body["ok"] is True
+    assert body["days"] == 30
+    assert body["changes"] == []
+    assert body["domains"]["health"]["notable"] == []
+    assert "media" in body["domains"] and "location" in body["domains"]
 
 
 def test_agent_perception_digest_rejects_invalid_days(monkeypatch):
