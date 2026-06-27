@@ -107,11 +107,12 @@ def _memory_inheritable_inner_fields(inner: dict | None) -> dict:
     return fields
 
 
-def _memory_plain_from_envelope(moment: dict, api_key: str | None) -> tuple[dict | None, str]:
+def _memory_plain_from_envelope(moment: dict, api_key: str | None, runtime_token: str = "") -> tuple[dict | None, str]:
     if moment.get("visibility") == "local_only":
         return None, "memory_local_only_agent_cannot_read"
     try:
-        raw = core_enclave._decrypt_envelope_via_enclave(moment, api_key, purpose="memory_action")
+        raw = core_enclave._decrypt_envelope_via_enclave(
+            moment, api_key, purpose="memory_action", runtime_token=runtime_token)
         inner = json.loads(raw.decode("utf-8"))
         if not isinstance(inner, dict):
             return None, "memory_plaintext_not_object"

@@ -284,6 +284,10 @@ def memory_legacy_batch():
     store = auth.require_user()
     runtime_auth.authorize_scope("memory")
     api_key = auth._extract_api_key()
+    # HOST_ALL / route-A consumers drop X-API-Key and send only the runtime token —
+    # thread it through so the per-card decrypt actually opens the envelopes (else
+    # we'd silently see "no legacy cards"). The enclave accepts either.
+    runtime_token = runtime_auth.extract_runtime_token() or ""
     payload = request.get_json(silent=True) or {}
     try:
         batch_size = max(1, min(int(payload.get("batch_size") or memory_migration.DEFAULT_MIGRATE_BATCH), 50))
@@ -294,7 +298,7 @@ def memory_legacy_batch():
     for m in moments:
         if not isinstance(m, dict) or m.get("visibility") == "local_only":
             continue
-        inner, _err = memory_actions_mod._memory_plain_from_envelope(m, api_key)
+        inner, _err = memory_actions_mod._memory_plain_from_envelope(m, api_key, runtime_token=runtime_token)
         if isinstance(inner, dict):
             decrypted.append((m, inner))
     batch = memory_migration.select_legacy_batch(decrypted, batch_size=batch_size)

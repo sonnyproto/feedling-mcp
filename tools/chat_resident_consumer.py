@@ -4767,7 +4767,11 @@ def _process_migrate_jobs(jobs: list) -> float:
             continue
         update_proactive_job_status(job_id, "realizing")
 
-        batch_body = _capture_post_json("/v1/memory/legacy_batch", payload={"batch_size": 8})
+        try:
+            batch_size = max(1, min(int(os.environ.get("FEEDLING_MIGRATE_BATCH", "8")), 50))
+        except (TypeError, ValueError):
+            batch_size = 8
+        batch_body = _capture_post_json("/v1/memory/legacy_batch", payload={"batch_size": batch_size})
         batch = batch_body.get("batch") if isinstance(batch_body.get("batch"), list) else []
         legacy_remaining = int(batch_body.get("legacy_remaining") or 0)
         if not batch:
@@ -4818,9 +4822,12 @@ def _process_migrate_jobs(jobs: list) -> float:
             except Exception as e:
                 log.error("migrate envelope build failed id=%s card=%s: %s", job_id, mid, e)
                 continue  # retry next round
-            # Let memory.upgrade carry the existing importance/pulse (don't reset to 0).
+            # Let memory.upgrade carry the existing metadata (don't reset). Migration
+            # is not a "user just used this memory", so last_referenced_at must NOT be
+            # bumped to now — drop it (and importance/pulse) so existing values stay.
             envelope.pop("importance", None)
             envelope.pop("pulse", None)
+            envelope.pop("last_referenced_at", None)
             body = _capture_post_json("/v1/memory/actions", payload={"action": {
                 "type": "memory.upgrade",
                 "id": mid,

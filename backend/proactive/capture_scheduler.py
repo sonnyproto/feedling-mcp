@@ -54,6 +54,16 @@ def min_interval_sec() -> float:
     return _env_float("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", 600.0, hi=86400.0)
 
 
+def migrate_window_sec() -> float:
+    # One legacy-migration batch per user per this window (default 1h). Lower to
+    # drain a backlog faster in test / quiet windows.
+    return _env_float("FEEDLING_MIGRATE_WINDOW_SEC", 3600.0, lo=60.0, hi=86400.0)
+
+
+def migrate_reaudit_sec() -> float:
+    return _env_float("FEEDLING_MIGRATE_REAUDIT_SEC", memory_migration.DEFAULT_REAUDIT_SEC, hi=2592000.0)
+
+
 def _now_iso(now: float | None = None) -> str:
     ts = time.time() if now is None else float(now)
     return datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
@@ -268,10 +278,13 @@ def tick_quiet_migrate(store, *, now: float | None = None) -> dict[str, Any]:
         return {"enqueued": False, "reason": "quiet_not_due", "quiet_for_sec": quiet_for, "job": None}
     mig_state = db.get_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB)
     if not memory_migration.should_enqueue(mig_state):
-        return {"enqueued": False, "reason": "migration_done", "job": None}
-    # One batch per user per hour (single-flight serializes anyway); a new hour =
-    # a new key = the next batch, so the lane drains a bit faster than dream.
-    window_id = str(int(now_ts // 3600))
+        # 'done' — but periodically re-scan once (a card may have reverted to old
+        # shape via some legacy path); handler re-confirms done if nothing legacy.
+        if not memory_migration.reaudit_due(mig_state, now=now_ts, reaudit_sec=migrate_reaudit_sec()):
+            return {"enqueued": False, "reason": "migration_done", "job": None}
+    # One batch per user per window (single-flight serializes anyway); a new window
+    # = a new key = the next batch. Default 1h; FEEDLING_MIGRATE_WINDOW_SEC to tune.
+    window_id = str(int(now_ts // max(1.0, migrate_window_sec())))
     migrate_key = memory_migration.migrate_key_for_window(store.user_id, window_id)
     job, enqueued, reason = capture_jobs.enqueue_memory_migrate_job(
         store, trigger="quiet_window_migrate", migrate_key=migrate_key, now=now_ts)

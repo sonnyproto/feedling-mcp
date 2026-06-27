@@ -74,6 +74,15 @@ def test_next_state_done_vs_pending():
     assert s2["status"] == "done" and s2["migrated_total"] == 8
 
 
+def test_reaudit_due_only_when_done_and_aged():
+    done = migration.next_state({"status": "done"}, migrated=0, legacy_remaining=0, now=1000.0)
+    assert done["updated_at"] == 1000.0
+    assert migration.reaudit_due(done, now=1000.0, reaudit_sec=100) is False      # fresh
+    assert migration.reaudit_due(done, now=1000.0 + 200, reaudit_sec=100) is True  # aged → re-scan
+    pending = {"status": "pending", "updated_at": 0.0}
+    assert migration.reaudit_due(pending, now=1e9, reaudit_sec=100) is False       # not done → n/a
+
+
 # --- prompt parse ---------------------------------------------------------
 
 def test_parse_drops_bad_dup_empty_and_outofbatch():

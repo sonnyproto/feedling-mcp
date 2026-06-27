@@ -13,10 +13,14 @@ a legacy card read there looks v1 and would never be detected.
 from __future__ import annotations
 
 import hashlib
+import time
 from typing import Any, Mapping
 
 MIGRATION_STATE_BLOB = "memory_migration_state"
 DEFAULT_MIGRATE_BATCH = 8
+# Re-scan even a 'done' user this often, so a card reverted to old shape by some
+# legacy path still self-heals (§5.5-C). Cheap: just re-enqueues one batch job.
+DEFAULT_REAUDIT_SEC = 7 * 24 * 3600
 
 # v1 inners always carry {bucket, threads} (memory._memory_inner_from_action);
 # old inners carry these content fields and none of the v1 structure.
@@ -108,6 +112,7 @@ def next_state(
     *,
     migrated: int,
     legacy_remaining: int,
+    now: float | None = None,
 ) -> dict:
     """Compute the updated state after a batch. legacy_remaining<=0 ⇒ done."""
     base = dict(state) if isinstance(state, Mapping) else initial_state()
@@ -115,4 +120,18 @@ def next_state(
     base["migrated_total"] = int(base.get("migrated_total") or 0) + max(0, int(migrated))
     base["legacy_remaining"] = int(legacy_remaining)
     base["status"] = "done" if int(legacy_remaining) <= 0 else "pending"
+    base["updated_at"] = float(now if now is not None else time.time())
     return base
+
+
+def reaudit_due(state: Mapping[str, Any] | None, *, now: float | None = None, reaudit_sec: float = DEFAULT_REAUDIT_SEC) -> bool:
+    """For a 'done' user, whether enough time passed to re-scan once (self-heal).
+    Non-done users don't need this — should_enqueue already enqueues them."""
+    if not migration_done(state):
+        return False
+    now_ts = float(now if now is not None else time.time())
+    try:
+        updated_at = float((state or {}).get("updated_at") or 0.0)
+    except (TypeError, ValueError):
+        updated_at = 0.0
+    return (now_ts - updated_at) >= float(reaudit_sec)
