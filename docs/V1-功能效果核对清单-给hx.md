@@ -4,6 +4,9 @@
 > 每条:**【功能】这功能该干什么 → 【怎么触发】→【✅预期效果/成功标准】→【❌坏了长这样】**。
 > 这不是"点哪个按钮",是"这个 v1 功能跑出来对不对"。老卡迁移单独一份、最后核。
 
+> 📊 **客观验证(别只凭感觉)**:DebugTool 里开 **"v1 flow trace"** 开关 → 走流程 → 进 **"查看 v1 flow trace"** 面板,看有没有出现下面带 📊 的事件 = 链路客观跑过。
+> 前提:test 部署上 `FEEDLING_V1_FLOW_TRACE` 开着(面板顶部会提示关没关)。当前 M0 只埋了 **route / genesis / memory** 三组,voice/proactive 等暂时还是行为观测(后续补埋)。
+
 ---
 
 ## 1. 新用户 onboarding(genesis 蒸馏)
@@ -12,6 +15,7 @@
 **怎么触发**:开 Genesis 开关(DebugTool 里) → 全新账号走 onboarding → 导入历史 → 提交。
 **✅成功**:进度走完进聊天,且**三层都到位** —— 回复像本人(voice)、身份卡有名字/维度(identity)、问历史里的人/地点答得上(memory)。
 **❌坏**:卡死/报错;或进去后没性格、身份空白、问历史一问三不知(= 蒸馏没产出/没接上)。
+📊 **面板**:出现 `genesis.outputs.applied`(detail 里 source_kind + memory_action_count/identity_status/persona_ref)= 蒸馏真落地了。
 
 ## 2. Voice / persona 注入
 
@@ -33,6 +37,7 @@
 **怎么触发**:聊天说一个事实("我家狗叫蛋子")→ 过会儿问它("我家狗叫啥?")。
 **✅成功**:事实被记住(落卡)、之后问得出(召回);Garden 不崩、能看到这张 v1 卡的核心内容。
 **❌坏**:没落卡 / 问不出 / Garden 崩或显示坏块。
+📊 **面板**:说事实那轮出现 `memory.write.actions`(types 含 memory.add、status=ok)= 落卡了;问它那轮出现 `memory.index.called` / `memory.fetch.called`(detail 有 counts)= 真去召回了。
 > 注:Garden 的分类/线索好不好看 = 体验验收,**不挡后端 v1 上线**(当前 Garden 可能还是简版/给设计看的页)。红线只是"不崩 + 看得到卡内容"。
 
 ## 5. host → agent_runtime 切换(本版核心,非干净切)
@@ -41,6 +46,7 @@
 **怎么触发**:正常文本聊天 / 发图片 / 用 gateway provider 的账号聊 / 期间改身份。
 **✅成功**:文本走新 runtime 正常;**发图片照样能聊(没断)**;**gateway 账号没断**;身份写读一切正常。
 **❌坏**:发图片报错/断;gateway 账号断;身份功能受影响。
+📊 **面板**:纯文本那轮出现 `route.decided mode=agent_runtime`;发图片那轮出现 `route.decided mode=legacy reason=image`;gateway 关时 `mode=legacy reason=driver_legacy` —— 一眼看出走了新路还是回落 legacy。
 > 红线:图片断、gateway 断 = 直接别上。
 
 ## 6. 老用户 voice backfill(不退化)
