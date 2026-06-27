@@ -147,16 +147,24 @@ def cmd_upload(args):
 
 def cmd_verify(args):
     url = f"{args.api_url.rstrip('/')}/v1/genesis/imports/{args.job_id}"
+    def _state_of(b: dict) -> str:
+        # GET /v1/genesis/imports/<id> returns `state` as a dict blob {status,...},
+        # not a string. Read state.status first, then fall back to top-level/job.status
+        # (older/edge shapes) so verify doesn't false-negative on a dict.
+        st = b.get("state")
+        if isinstance(st, dict):
+            return str(st.get("status") or "").lower()
+        return str(st or b.get("status") or b.get("job", {}).get("status") or "").lower()
     deadline = time.time() + args.timeout
     last = {}
     while time.time() < deadline:
         s, b = _http("GET", url, args.api_key)
         last = b
-        state = str((b.get("state") or b.get("status") or b.get("job", {}).get("status") or "")).lower()
+        state = _state_of(b)
         if state in ("done", "failed"):
             break
         time.sleep(args.poll)
-    state = str((last.get("state") or last.get("status") or last.get("job", {}).get("status") or "")).lower()
+    state = _state_of(last)
     out = {"ok": state == "done", "state": state, "job": last}
     # Privacy spot-check (shallow): the status payload must be metadata-only, never
     # raw chunk/transcript text. Deep check (genesis_persona encrypted, outputs
