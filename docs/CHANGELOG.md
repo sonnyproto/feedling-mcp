@@ -47,6 +47,31 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-06-27
+
+### [DONE] Agent 声音/身份/Genesis：全链路建成 + 部署 test CVM（e2e 待跑）
+
+host(API key)用户的空白 runtime,在 **CVM/enclave 内**从上传历史蒸馏出**声音(persona 文件)+
+事实(Garden)+ 展示身份卡**。spec:`docs/AGENT_VOICE_IDENTITY_SPEC_2026-06-27.md`。CC×Codex 分工
+(CC=agent_runtime/prompt/审计;Codex=backend/infra),每个 Codex 交付经 CC 审 diff + 重跑测试再 push。
+
+- **流水线**(origin/test):chunked 加密上传 ledger → CVM worker(claim/解密/map-reduce/写) →
+  按 `source_kind` 路由(history→声音+事实;ai_persona→adopt 主干;memory_summary→事实;
+  user_profile→事实+防火墙) → §7.B persona+voice 跨 job 加密合并 → CC 的 supervisor 激活 hook
+  (default-off daemon,`FEEDLING_GENESIS_WORKER_ENABLED`)。事实走 `/v1/memory/actions` 同 capture
+  lane schema(source=`genesis_import`)。
+- **隐私姿态**(`PRIVACY_MODE=backend_storage_no_plaintext_user_provider_authorized`):raw 上传只存密文;
+  解密+LLM 只在 CVM 内、用**用户自己的 key**;persona/voice/identity blob 全加密;outputs 只存 hash/count;
+  chunk owner 绑定+完整性校验。**不 overclaim**(明文会发给用户自己配的 provider)。
+- **审计抓到并修复**(CC 作为审核员):persona/outputs 明文落库→加密;fresh-start 死锁→gate 放行;
+  AI persona 没 adopt→source_kind 路由;声音丢失→§7.B 合并;spec 隐私 overclaim→改精确口径。
+- **CC 自做**:host session cap 24、persona seed+解密 reader、genesis gate、`io_cli identity-write`(7.D)、
+  激活 hook、`tools/genesis_e2e.py` e2e harness(自助注册测试用户→封装上传→验证)。
+- **已部署**:`a3475c6` 把 `:34ce885` 部署到 test CVM,worker 上线(dormant 待 job)。
+- **待办**:真 e2e 跑一遍(需一把测试 provider key 喂 harness;`TEST_FEEDLING_RUNTIME_TOKEN_SECRET`
+  已确认存在);§7.B order-edge(history 须先于 ai_persona)留 fast-follow;iOS 上传客户端;7.D 触发编排;
+  VPS skill.md 的 grounding 子句。
+
 ## 2026-06-26
 
 ### [DONE] A-full：落卡 capture lane（Phase-1）+ 退役 proactive 模拟工具路（Phase-2）
