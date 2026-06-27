@@ -86,6 +86,24 @@ def _client():
         return _cached_client
 
 
+def client():
+    """Public accessor for the shared boto3 S3 client.
+
+    Lets sibling modules (e.g. ``diagnostics/storage.py``) reuse the same
+    connection pool against a *different* bucket without reaching into the
+    private ``_client``. The client is not bucket-bound; the caller passes
+    ``Bucket=`` per call.
+    """
+    return _client()
+
+
+def credentials_present() -> bool:
+    """True when the R2 credentials (endpoint + key + secret) are configured,
+    independent of any specific bucket. ``enabled()`` additionally requires the
+    *frames* bucket; bucket-specific callers should AND this with their own."""
+    return bool(_endpoint() and _access_key() and _secret_key())
+
+
 def frame_key(user_id: str, frame_id: str) -> str:
     return f"{_KEY_PREFIX}/{user_id}/{frame_id}"
 
