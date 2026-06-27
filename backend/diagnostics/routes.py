@@ -2,7 +2,7 @@
 
 Two endpoints:
   - ``POST /v1/diagnostics/logs``            (user auth)  — a client uploads its
-    ``diagnostics.log`` text + device/env metadata.
+    ``diagnostics.log`` file (multipart/form-data) + device/env metadata.
   - ``GET  /v1/admin/diagnostics/logs/<uid>`` (admin auth) — a developer pulls a
     user's recent uploads (presigned R2 download links, or inline content on the
     no-R2 fallback path).
@@ -18,6 +18,7 @@ Auth helpers are imported lazily to avoid import cycles during app startup
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, timezone
 
@@ -31,18 +32,28 @@ bp = Blueprint("diagnostics", __name__)
 
 _STREAM = "client_diagnostics"
 _MAX_BYTES = 512 * 1024  # mirror the iOS DiagnosticLog ring size
-# Hard request-body ceiling, checked from Content-Length *before* the JSON body
-# is read into memory — so an oversized (even authenticated) upload is rejected
-# 413 rather than buffered. Headroom over _MAX_BYTES covers JSON string-escaping
-# of the log text plus the meta object. Scoped to this route (not a global
+# Hard request-body ceiling, checked from Content-Length *before* the multipart
+# body is read into memory — so an oversized (even authenticated) upload is
+# rejected 413 rather than buffered. Headroom over _MAX_BYTES covers the
+# multipart envelope + meta. Scoped to this route (not a global
 # MAX_CONTENT_LENGTH) so it never clips the larger frame/photo upload paths.
 _MAX_REQUEST_BYTES = 2 * 1024 * 1024
 _MAX_ROWS = 10           # keep the newest N uploads per user
 _PRESIGN_TTL = 3600
 
 
-def _body() -> dict:
-    return request.get_json(silent=True) or {}
+def _parse_meta() -> dict:
+    """Read the optional ``meta`` form field (a JSON object string). Stored
+    as-is; never trusted for control flow."""
+    raw = request.form.get("meta")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except (ValueError, TypeError):
+            pass
+    return {}
 
 
 @bp.route("/v1/diagnostics/logs", methods=["POST"])
@@ -52,19 +63,18 @@ def upload_logs():
     store = require_user()  # aborts 401 on bad auth
     uid = store.user_id
 
-    # Reject oversized bodies from Content-Length before materializing the JSON.
+    # Reject oversized bodies from Content-Length before reading the upload.
     if request.content_length is not None and request.content_length > _MAX_REQUEST_BYTES:
         return jsonify({"error": "payload_too_large"}), 413
 
-    payload = _body()
-    content = payload.get("content")
-    if not isinstance(content, str) or not content:
-        return jsonify({"error": "empty_content"}), 400
-    # Truncate to the same cap the client ring buffer holds (defensive).
-    content = content[:_MAX_BYTES]
-    meta = payload.get("meta")
-    if not isinstance(meta, dict):
-        meta = {}
+    upload = request.files.get("file")
+    if upload is None:
+        return jsonify({"error": "missing_file"}), 400
+    # Read the file bytes and truncate by *bytes* to the ring-buffer cap.
+    raw = upload.read(_MAX_BYTES + 1)[:_MAX_BYTES]
+    if not raw:
+        return jsonify({"error": "empty_file"}), 400
+    meta = _parse_meta()
 
     ts = time.time()
     ts_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S-%fZ")
@@ -72,12 +82,12 @@ def upload_logs():
     doc: dict = {"meta": meta, "ts": ts}
     if storage.enabled():
         try:
-            doc["r2_key"] = storage.put_log(uid, ts_iso, content)
+            doc["r2_key"] = storage.put_log(uid, ts_iso, raw)
         except Exception as e:  # noqa: BLE001 — fall back to inline rather than lose the log
             storage.log.error("[diagnostics] R2 put failed for %s, storing inline: %s", uid, e)
-            doc["content"] = content
+            doc["content"] = raw.decode("utf-8", "replace")
     else:
-        doc["content"] = content
+        doc["content"] = raw.decode("utf-8", "replace")
 
     db.log_append(uid, _STREAM, doc, ts=ts)
     db.log_trim(uid, _STREAM, _MAX_ROWS)

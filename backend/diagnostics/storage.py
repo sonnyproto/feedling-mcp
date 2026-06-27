@@ -41,14 +41,14 @@ def log_key(user_id: str, ts_iso: str) -> str:
     return f"{user_id}/{ts_iso}.log"
 
 
-def put_log(user_id: str, ts_iso: str, text: str) -> str:
-    """Upload the plaintext log; return the R2 object key. Raises on failure so
-    the caller can fall back to inline Postgres storage."""
+def put_log(user_id: str, ts_iso: str, data: bytes) -> str:
+    """Upload the plaintext log file bytes; return the R2 object key. Raises on
+    failure so the caller can fall back to inline Postgres storage."""
     key = log_key(user_id, ts_iso)
     object_storage.client().put_object(
         Bucket=_bucket(),
         Key=key,
-        Body=text.encode("utf-8"),
+        Body=data,
         ContentType="text/plain; charset=utf-8",
     )
     return key
