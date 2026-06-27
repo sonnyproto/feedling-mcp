@@ -158,26 +158,20 @@ def model_api_get():
 
 @bp.route("/v1/model_api/driver", methods=["POST"])
 def model_api_set_hosting():
-    """Enable/disable the hosted agent runtime for this user (gradual-rollout
-    toggle). Body: ``{"enabled": true|false}``.
-
-    The AGENT is NOT user-chosen — it is auto-derived from the configured
-    provider (anthropic/deepseek → claude, openai → codex). This endpoint only
-    flips hosting on/off; the response reports the derived ``driver``. A provider
-    key must be configured first (404 otherwise)."""
+    """报告该用户派生的 agent driver。AGENT 由 provider 自动派生，配了即托管；
+    本端点不再有 enable/disable 开关（保留以兼容旧 client）。"""
     store = auth.require_user()
-    payload = request.get_json(silent=True) or {}
-    enabled = bool(payload.get("enabled"))
     config = hosted_config_store._load_model_api_config(store)
     if not config:
         return jsonify({"error": "model_api_not_configured"}), 404
-    config["agent_runtime_driver"] = "auto" if enabled else "legacy"
-    hosted_config_store._save_model_api_config(store, config)
-    driver = agent_runtime_cutover.resolve_driver(config)
-    print(f"[model_api:{store.user_id}] hosting enabled={enabled} provider={config.get('provider')} -> driver={driver}")
+    try:
+        driver = agent_runtime_cutover.resolve_driver(config)
+    except agent_runtime_cutover.UnsupportedProviderError:
+        return jsonify({"error": "provider_not_hostable"}), 409
+    print(f"[model_api:{store.user_id}] provider={config.get('provider')} -> driver={driver}")
     return jsonify({
         "status": "ok",
-        "enabled": enabled,
+        "enabled": True,
         "driver": driver,
         "config": hosted_config_store._public_model_api_config(config),
     })

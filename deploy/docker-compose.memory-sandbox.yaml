@@ -34,7 +34,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     image: feedling-memory-sandbox-backend:dev
-    command: ["gunicorn", "--chdir", "backend", "-w", "1", "--threads", "16", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
+    command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-w", "1", "--threads", "16", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
     restart: unless-stopped
     environment:
       FEEDLING_API_KEY: ""
@@ -43,6 +43,10 @@ services:
       FEEDLING_ENCLAVE_URL: "http://enclave:5003"
       DATABASE_URL: "postgresql://feedling:feedling@postgres:5432/feedling?sslmode=disable"
       FEEDLING_PUBLIC_BASE_URL: "http://127.0.0.1:5001"
+      # --- 托管三件套（缺一即启动失败 fail-fast）---
+      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
+      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
+      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
     ports:
       - "5001:5001"
       - "9998:9998"

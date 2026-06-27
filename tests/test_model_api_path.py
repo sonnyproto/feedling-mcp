@@ -12,12 +12,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import app as appmod  # noqa: E402
+import db  # noqa: E402
 from accounts import registry as accounts_registry  # noqa: E402
 from hosted import turn as hosted_turn  # noqa: E402
 import provider_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
+from hosted import agent_runtime_cutover  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -36,6 +38,10 @@ def client(tmp_path, monkeypatch):
         "_get_enclave_info",
         lambda: {"content_pk_hex": ("22" * 32), "compose_hash": "test"},
     )
+    # Seed a fresh supervisor heartbeat so the send wedge guard sees a live
+    # hosting runtime (these are full-path tests that route to the agent-runner).
+    db.set_supervisor_heartbeat({"ts": time.time(), "owner": "test",
+                                 "host_all": True, "gateway": True})
     appmod.app.config.update(TESTING=True)
     with appmod.app.test_client() as c:
         yield c
@@ -215,361 +221,6 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     assert any(step["id"] == "hosted_runtime" and step["passing"] for step in body["steps"])
 
 
-def test_model_api_runtime_status_tracks_hosted_runtime_and_action_trace(client, monkeypatch):
-    user_id, api_key = _register(client)
-
-    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
-    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(
-        core_enclave,
-        "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test",
-    )
-    monkeypatch.setattr(
-        core_enclave,
-        "_enclave_get_json_for_gate",
-        lambda path, key, params=None: ({"messages": [], "context_memories": []}, "")
-        if path == "/v1/chat/history"
-        else ({"identity": {}}, ""),
-    )
-    monkeypatch.setattr(
-        provider_client,
-        "chat_completion",
-        lambda cfg, messages, **kwargs: {"reply": "Hosted runtime reply.", "usage": {"total_tokens": 7}},
-    )
-
-    setup = client.post(
-        "/v1/model_api/setup",
-        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
-        headers=_headers(api_key),
-    )
-    assert setup.status_code == 200, setup.get_data(as_text=True)
-
-    before = client.get("/v1/model_api/runtime", headers=_headers(api_key))
-    assert before.status_code == 200, before.get_data(as_text=True)
-    before_body = before.get_json()
-    assert before_body["runtime_mode"] == "hosted_resident"
-    assert before_body["tool_action_enabled"] is True
-    assert before_body["last_action_trace_id"] in {"", None}
-
-    chat = client.post(
-        "/v1/model_api/chat/send",
-        json={"message": "hello"},
-        headers=_headers(api_key),
-    )
-    assert chat.status_code == 200, chat.get_data(as_text=True)
-    chat_body = chat.get_json()
-    trace_id = chat_body["state"]["action_trace_id"]
-    assert trace_id
-    assert chat_body["runtime"]["engine"] == "feedling_native"
-    assert chat_body["runtime"]["background_execution"]["method"] == "feedling_background_execution"
-    assert chat_body["state"]["background_execution"]["method"] == "feedling_background_execution"
-    assert chat_body["state"]["background_execution"]["method"] == "feedling_background_execution"
-
-    after = client.get("/v1/model_api/runtime", headers=_headers(api_key))
-    assert after.status_code == 200, after.get_data(as_text=True)
-    after_body = after.get_json()
-    assert after_body["last_action_trace_id"] == trace_id
-    assert after_body["last_action_trace_status"] == "ok"
-    assert appmod.db.get_blob(user_id, "model_api_runtime")["last_action_trace_id"] == trace_id
-
-
-def test_model_api_chat_uses_memory_selection_trace_without_prompting_rejected_cards(client, monkeypatch):
-    user_id, api_key = _register(client)
-    history_params: list[dict] = []
-    provider_messages: list[list[dict]] = []
-
-    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
-    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(
-        core_enclave,
-        "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test",
-    )
-
-    def fake_enclave(path, key, params=None):
-        if path == "/v1/chat/history":
-            history_params.append(dict(params or {}))
-            return {
-                "messages": [{"role": "user", "content": "明天有一个 project 要完成，好累"}],
-                "context_memories": [
-                    {
-                        "id": "pressure",
-                        "title": "近期项目压力",
-                        "description": "用户明天有一个项目要完成，觉得很累。",
-                        "selection": {
-                            "score": 0.72,
-                            "confidence": "strong",
-                            "matched_units": ["明天", "完成", "很累"],
-                            "reason": "phrase_match",
-                            "bucket": "query",
-                        },
-                    }
-                ],
-                "context_memory_trace": {
-                    "mode": "model_api",
-                    "query_units": ["project", "明天", "完成"],
-                    "selected": [
-                        {
-                            "id": "pressure",
-                            "title": "近期项目压力",
-                            "score": 0.72,
-                            "confidence": "strong",
-                            "matched_units": ["明天", "完成", "很累"],
-                            "reason": "phrase_match",
-                            "bucket": "query",
-                            "selected": True,
-                        }
-                    ],
-                    "rejected_sample": [
-                        {
-                            "id": "toho",
-                            "title": "TOHO Project 老二次元偏好",
-                            "score": 0.18,
-                            "confidence": "weak",
-                            "matched_units": ["project"],
-                            "reason": "weak_generic_overlap",
-                            "bucket": "rejected",
-                            "selected": False,
-                        }
-                    ],
-                },
-            }, ""
-        if path == "/v1/identity/get":
-            return {"identity": _identity_payload()}, ""
-        return {}, ""
-
-    def fake_chat_completion(cfg, messages, **kwargs):
-        provider_messages.append(messages)
-        return {"reply": "先把明天那个项目收个尾，别让自己硬扛。", "usage": {"total_tokens": 10}}
-
-    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave)
-    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
-
-    setup = client.post(
-        "/v1/model_api/setup",
-        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
-        headers=_headers(api_key),
-    )
-    assert setup.status_code == 200, setup.get_data(as_text=True)
-
-    chat = client.post(
-        "/v1/model_api/chat/send",
-        json={"message": "明天有一个 project 要完成，好累"},
-        headers=_headers(api_key),
-    )
-    assert chat.status_code == 200, chat.get_data(as_text=True)
-    assert history_params[-1]["context_trace"] == "1"
-    prompt = "\n".join(str(m.get("content") or "") for m in provider_messages[0])
-    assert "candidate memory context" in prompt
-    assert "relevant memory cards" not in prompt
-    assert "TOHO Project 老二次元偏好" not in prompt
-    assert "weak_generic_overlap" not in prompt
-
-    trace_id = chat.get_json()["state"]["action_trace_id"]
-    traces = appmod.db.log_read(user_id, appmod.MODEL_API_ACTION_TRACE_STREAM, limit=5)
-    trace = next(item for item in traces if item["trace_id"] == trace_id)
-    selection = trace["context"]["memory_selection"]
-    assert selection["selected"][0]["id"] == "pressure"
-    assert selection["rejected_sample"][0]["id"] == "toho"
-    assert selection["rejected_sample"][0]["reason"] == "weak_generic_overlap"
-
-
-def test_model_api_chat_runs_memory_tool_loop_when_enabled(client, monkeypatch):
-    user_id, api_key = _register(client)
-    provider_calls: list[list[dict]] = []
-    tool_calls: list[tuple[str, dict]] = []
-    monkeypatch.setenv("MODEL_API_MEMORY_TOOLS_ENABLED", "true")
-    monkeypatch.setenv("MODEL_API_AUTO_MEMORY_CONTEXT_ENABLED", "false")
-
-    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
-    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(
-        core_enclave,
-        "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test",
-    )
-    monkeypatch.setattr(
-        core_enclave,
-        "_enclave_get_json_for_gate",
-        lambda path, key, params=None: ({"messages": [], "context_memories": []}, "")
-        if path == "/v1/chat/history"
-        else ({"identity": _identity_payload()}, ""),
-    )
-
-    def fake_execute_memory_tool(store, key, name, args, *, trace):
-        tool_calls.append((name, dict(args or {})))
-        trace.setdefault("tool_calls", [])
-        if name == "memory_index":
-            trace["mode"] = "agent_tools"
-            trace["index_called"] = True
-            trace["user_card_count"] = 1
-            trace["tool_calls"].append({"name": name, "ok": True, "item_count": 1})
-            return {
-                "ok": True,
-                "name": name,
-                "items": [{"id": "mem_cat", "summary": "用户家猫叫武松，名字来自武松打虎。"}],
-                "user_card_count": 1,
-            }
-        if name == "memory_fetch":
-            trace["mode"] = "agent_tools"
-            trace["fetch_called"] = True
-            trace["fetched_ids"] = ["mem_cat"]
-            trace["tool_calls"].append({"name": name, "ok": True, "ids": ["mem_cat"], "item_count": 1})
-            return {
-                "ok": True,
-                "name": name,
-                "items": [{"id": "mem_cat", "summary": "用户家猫叫武松。", "verbatim": "我家猫叫武松。"}],
-                "missing_ids": [],
-                "unavailable_ids": [],
-            }
-        raise AssertionError(f"unexpected tool {name}")
-
-    def fake_chat_completion(cfg, messages, **kwargs):
-        provider_calls.append(messages)
-        if len(provider_calls) == 1:
-            joined = "\n".join(str(m.get("content") or "") for m in messages)
-            assert "memory_index" in joined
-            assert "memory_fetch" in joined
-            assert "Tool results (JSON)" not in joined
-            return {
-                "reply": appmod.json.dumps({
-                    "tool_calls": [{"name": "memory_index", "args": {"query": "猫叫什么"}}]
-                }),
-                "usage": {"total_tokens": 3},
-            }
-        if len(provider_calls) == 2:
-            joined = "\n".join(str(m.get("content") or "") for m in messages)
-            assert "用户家猫叫武松" in joined
-            return {
-                "reply": appmod.json.dumps({
-                    "tool_calls": [{"name": "memory_fetch", "args": {"ids": ["mem_cat"]}}]
-                }),
-                "usage": {"total_tokens": 5},
-            }
-        joined = "\n".join(str(m.get("content") or "") for m in messages)
-        assert "我家猫叫武松" in joined
-        return {
-            "reply": appmod.json.dumps({"reply": "记得，你家猫叫武松，名字来自武松打虎。"}),
-            "usage": {"total_tokens": 8},
-        }
-
-    monkeypatch.setattr(appmod.hosted_chat_routes.hosted_memory_tools, "execute_memory_tool", fake_execute_memory_tool)
-    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
-
-    setup = client.post(
-        "/v1/model_api/setup",
-        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
-        headers=_headers(api_key),
-    )
-    assert setup.status_code == 200, setup.get_data(as_text=True)
-
-    chat = client.post(
-        "/v1/model_api/chat/send",
-        json={"message": "你还记得我家猫叫什么吗？"},
-        headers=_headers(api_key),
-    )
-
-    assert chat.status_code == 200, chat.get_data(as_text=True)
-    body = chat.get_json()
-    assert body["reply"] == "记得，你家猫叫武松，名字来自武松打虎。"
-    assert tool_calls == [
-        ("memory_index", {"query": "猫叫什么"}),
-        ("memory_fetch", {"ids": ["mem_cat"]}),
-    ]
-    assert len(provider_calls) == 3
-    assert body["tools"]["memory"]["mode"] == "agent_tools"
-    assert body["tools"]["memory"]["index_called"] is True
-    assert body["tools"]["memory"]["fetch_called"] is True
-    assert body["tools"]["memory"]["fetched_ids"] == ["mem_cat"]
-
-    trace_id = body["state"]["action_trace_id"]
-    traces = appmod.db.log_read(user_id, appmod.MODEL_API_ACTION_TRACE_STREAM, limit=5)
-    trace = next(item for item in traces if item["trace_id"] == trace_id)
-    assert trace["context"]["memory_tools"]["mode"] == "agent_tools"
-    assert trace["context"]["memory_tools"]["fetched_ids"] == ["mem_cat"]
-
-
-def test_model_api_chat_falls_back_to_auto_readside_when_model_does_not_call_memory_tools(client, monkeypatch):
-    user_id, api_key = _register(client)
-    provider_calls: list[list[dict]] = []
-    monkeypatch.setenv("MODEL_API_MEMORY_TOOLS_ENABLED", "true")
-    monkeypatch.setenv("MODEL_API_AUTO_MEMORY_CONTEXT_ENABLED", "true")
-
-    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
-    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(
-        core_enclave,
-        "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test",
-    )
-
-    def fake_enclave(path, key, params=None):
-        if path == "/v1/chat/history":
-            return {
-                "messages": [
-                    {"role": "user", "content": "我有只猫吗？"},
-                    {"role": "assistant", "content": "没有。"},
-                ],
-                "context_memories": [
-                    {
-                        "id": "mem_cat",
-                        "title": "猫叫武松",
-                        "description": "用户家猫叫武松，名字来自武松打虎。",
-                    }
-                ],
-                "context_memory_trace": {
-                    "mode": "model_api_readside_v1",
-                    "selected": [{"id": "mem_cat", "title": "猫叫武松", "selected": True}],
-                },
-            }, ""
-        if path == "/v1/identity/get":
-            return {"identity": _identity_payload()}, ""
-        return {}, ""
-
-    def fake_chat_completion(cfg, messages, **kwargs):
-        provider_calls.append(messages)
-        if len(provider_calls) == 1:
-            return {"reply": appmod.json.dumps({"reply": "我不确定。"}), "usage": {"total_tokens": 3}}
-        joined = "\n".join(str(m.get("content") or "") for m in messages)
-        assert "猫叫武松" in joined
-        assert "Safety/privacy boundaries >= the user's current explicit message or correction > directly relevant fallback memory > conflicting assistant draft from before this fallback" in joined
-        assert "Do not use fallback memory to argue against the user's current correction" in joined
-        return {
-            "reply": appmod.json.dumps({"reply": "记得，你家猫叫武松。"}),
-            "usage": {"total_tokens": 6},
-        }
-
-    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave)
-    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
-
-    setup = client.post(
-        "/v1/model_api/setup",
-        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
-        headers=_headers(api_key),
-    )
-    assert setup.status_code == 200, setup.get_data(as_text=True)
-
-    chat = client.post(
-        "/v1/model_api/chat/send",
-        json={"message": "你还记得我家猫叫什么吗？"},
-        headers=_headers(api_key),
-    )
-
-    assert chat.status_code == 200, chat.get_data(as_text=True)
-    body = chat.get_json()
-    assert body["reply"] == "记得，你家猫叫武松。"
-    assert len(provider_calls) == 2
-    assert body["tools"]["memory"]["mode"] == "fallback"
-    assert body["tools"]["memory"]["fallback_reason"] == "no_tool_call_backfilled"
-
-    trace_id = body["state"]["action_trace_id"]
-    traces = appmod.db.log_read(user_id, appmod.MODEL_API_ACTION_TRACE_STREAM, limit=5)
-    trace = next(item for item in traces if item["trace_id"] == trace_id)
-    assert trace["context"]["memory_tools"]["mode"] == "fallback"
-    assert trace["context"]["memory_tools"]["fallback_reason"] == "no_tool_call_backfilled"
-
-
 def test_model_api_memory_fallback_instruction_prioritizes_memory_over_conflicting_draft():
     msg = appmod.hosted_chat_routes._memory_fallback_instruction_message(
         "auto_readside",
@@ -615,499 +266,6 @@ def test_model_api_memory_fallback_instruction_avoids_hard_claims_for_tangential
     content = msg["content"]
     assert "If fallback memory is only tangentially related, do not make a hard factual claim from it" in content
     assert "say you are not sure rather than over-asserting" in content
-
-
-def test_model_api_chat_fallback_uses_index_selector_when_auto_readside_is_empty(client, monkeypatch):
-    user_id, api_key = _register(client)
-    provider_calls: list[list[dict]] = []
-    tool_calls: list[tuple[str, dict]] = []
-    monkeypatch.setenv("MODEL_API_MEMORY_TOOLS_ENABLED", "true")
-    monkeypatch.setenv("MODEL_API_AUTO_MEMORY_CONTEXT_ENABLED", "true")
-
-    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
-    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(
-        core_enclave,
-        "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test",
-    )
-
-    def fake_enclave(path, key, params=None):
-        if path == "/v1/chat/history":
-            return {
-                "messages": [],
-                "context_memories": [],
-                "context_memory_trace": {"mode": "model_api_readside_v1", "selected": []},
-            }, ""
-        if path == "/v1/identity/get":
-            return {"identity": _identity_payload()}, ""
-        return {}, ""
-
-    def fake_execute_memory_tool(store, key, name, args, *, trace=None):
-        tool_calls.append((name, dict(args or {})))
-        if name == "memory_index":
-            if trace is not None:
-                trace["index_called"] = True
-                trace.setdefault("tool_calls", []).append({"name": name, "ok": True, "item_count": 1})
-            return {
-                "ok": True,
-                "name": name,
-                "items": [
-                    {
-                        "id": "mem_cat",
-                        "summary": "用户的橘猫因为长得像老虎，所以给猫取名武松。",
-                        "bucket_refs": [],
-                        "status": "active",
-                        "salience": "medium",
-                        "is_sensitive": False,
-                        "score": 2.5,
-                    }
-                ],
-            }
-        if name == "memory_fetch":
-            if trace is not None:
-                trace["fetch_called"] = True
-                trace["fetched_ids"] = ["mem_cat"]
-                trace.setdefault("tool_calls", []).append({"name": name, "ok": True, "ids": ["mem_cat"], "item_count": 1})
-            return {
-                "ok": True,
-                "name": name,
-                "items": [
-                    {
-                        "id": "mem_cat",
-                        "summary": "用户有一只橘猫，名字叫武松。",
-                        "verbatim": "我家猫叫武松。",
-                        "is_sensitive": False,
-                    }
-                ],
-            }
-        return {"ok": False, "name": name}
-
-    def fake_chat_completion(cfg, messages, **kwargs):
-        provider_calls.append(messages)
-        if len(provider_calls) == 1:
-            return {"reply": appmod.json.dumps({"reply": "我不确定。"}), "usage": {"total_tokens": 3}}
-        joined = "\n".join(str(m.get("content") or "") for m in messages)
-        assert "Memory fallback JSON" in joined
-        assert "武松" in joined
-        return {
-            "reply": appmod.json.dumps({"reply": "有，你有一只橘猫，叫武松。"}),
-            "usage": {"total_tokens": 6},
-        }
-
-    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave)
-    monkeypatch.setattr(appmod.hosted_chat_routes.hosted_memory_tools, "execute_memory_tool", fake_execute_memory_tool)
-    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
-
-    setup = client.post(
-        "/v1/model_api/setup",
-        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
-        headers=_headers(api_key),
-    )
-    assert setup.status_code == 200, setup.get_data(as_text=True)
-
-    chat = client.post(
-        "/v1/model_api/chat/send",
-        json={"message": "我有只猫吗？"},
-        headers=_headers(api_key),
-    )
-
-    assert chat.status_code == 200, chat.get_data(as_text=True)
-    body = chat.get_json()
-    assert body["reply"] == "有，你有一只橘猫，叫武松。"
-    assert tool_calls == [
-        ("memory_index", {"query": "我有只猫吗？", "limit": 50, "include_sensitive": False}),
-        ("memory_fetch", {"ids": ["mem_cat"]}),
-    ]
-    assert body["tools"]["memory"]["mode"] == "fallback"
-    assert body["tools"]["memory"]["fallback_source"] == "index_selector"
-    assert body["tools"]["memory"]["index_called"] is True
-    assert body["tools"]["memory"]["fetch_called"] is True
-
-    trace_id = body["state"]["action_trace_id"]
-    traces = appmod.db.log_read(user_id, appmod.MODEL_API_ACTION_TRACE_STREAM, limit=5)
-    trace = next(item for item in traces if item["trace_id"] == trace_id)
-    assert trace["context"]["memory_tools"]["fallback_source"] == "index_selector"
-
-
-def test_model_api_chat_fallback_prefers_index_selector_before_auto_readside(client, monkeypatch):
-    user_id, api_key = _register(client)
-    provider_calls: list[list[dict]] = []
-    tool_calls: list[tuple[str, dict]] = []
-    monkeypatch.setenv("MODEL_API_MEMORY_TOOLS_ENABLED", "true")
-    monkeypatch.setenv("MODEL_API_AUTO_MEMORY_CONTEXT_ENABLED", "true")
-
-    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
-    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(
-        core_enclave,
-        "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test",
-    )
-
-    def fake_enclave(path, key, params=None):
-        if path == "/v1/chat/history":
-            return {
-                "messages": [],
-                "context_memories": [
-                    {
-                        "id": "mem_old_auto",
-                        "title": "旧检索命中的猫记忆",
-                        "description": "这条来自 auto_readside。",
-                    }
-                ],
-                "context_memory_trace": {
-                    "mode": "model_api_readside_v1",
-                    "selected": [{"id": "mem_old_auto", "selected": True}],
-                },
-            }, ""
-        if path == "/v1/identity/get":
-            return {"identity": _identity_payload()}, ""
-        return {}, ""
-
-    def fake_execute_memory_tool(store, key, name, args, *, trace=None):
-        tool_calls.append((name, dict(args or {})))
-        if name == "memory_index":
-            if trace is not None:
-                trace["index_called"] = True
-                trace.setdefault("tool_calls", []).append({"name": name, "ok": True, "item_count": 1})
-            return {
-                "ok": True,
-                "name": name,
-                "items": [
-                    {
-                        "id": "mem_cat",
-                        "summary": "用户的橘猫叫武松。",
-                        "bucket_refs": [],
-                        "status": "active",
-                        "salience": "medium",
-                        "is_sensitive": False,
-                        "score": 2.5,
-                    }
-                ],
-            }
-        if name == "memory_fetch":
-            if trace is not None:
-                trace["fetch_called"] = True
-                trace["fetched_ids"] = ["mem_cat"]
-                trace.setdefault("tool_calls", []).append({"name": name, "ok": True, "ids": ["mem_cat"], "item_count": 1})
-            return {
-                "ok": True,
-                "name": name,
-                "items": [{"id": "mem_cat", "summary": "用户有一只橘猫，名字叫武松。"}],
-            }
-        return {"ok": False, "name": name}
-
-    def fake_chat_completion(cfg, messages, **kwargs):
-        provider_calls.append(messages)
-        if len(provider_calls) == 1:
-            return {"reply": appmod.json.dumps({"reply": "我不确定。"}), "usage": {"total_tokens": 3}}
-        joined = "\n".join(str(m.get("content") or "") for m in messages)
-        assert "用户有一只橘猫，名字叫武松" in joined
-        assert "旧检索命中的猫记忆" not in joined
-        return {
-            "reply": appmod.json.dumps({"reply": "有，你有一只橘猫，叫武松。"}),
-            "usage": {"total_tokens": 6},
-        }
-
-    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave)
-    monkeypatch.setattr(appmod.hosted_chat_routes.hosted_memory_tools, "execute_memory_tool", fake_execute_memory_tool)
-    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
-
-    setup = client.post(
-        "/v1/model_api/setup",
-        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
-        headers=_headers(api_key),
-    )
-    assert setup.status_code == 200, setup.get_data(as_text=True)
-
-    chat = client.post(
-        "/v1/model_api/chat/send",
-        json={"message": "我有只猫吗？"},
-        headers=_headers(api_key),
-    )
-
-    assert chat.status_code == 200, chat.get_data(as_text=True)
-    body = chat.get_json()
-    assert body["reply"] == "有，你有一只橘猫，叫武松。"
-    assert tool_calls == [
-        ("memory_index", {"query": "我有只猫吗？", "limit": 50, "include_sensitive": False}),
-        ("memory_fetch", {"ids": ["mem_cat"]}),
-    ]
-    assert body["tools"]["memory"]["fallback_source"] == "index_selector"
-    assert body["tools"]["memory"]["index_called"] is True
-    assert body["tools"]["memory"]["fetch_called"] is True
-
-    trace_id = body["state"]["action_trace_id"]
-    traces = appmod.db.log_read(user_id, appmod.MODEL_API_ACTION_TRACE_STREAM, limit=5)
-    trace = next(item for item in traces if item["trace_id"] == trace_id)
-    assert trace["context"]["memory_tools"]["fallback_source"] == "index_selector"
-
-
-def test_model_api_chat_send_runs_backend_web_search_tool(client, monkeypatch):
-    _, api_key = _register(client)
-    provider_calls: list[list[dict]] = []
-    search_requests: list[dict] = []
-
-    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
-    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(
-        core_enclave,
-        "_decrypt_envelope_via_enclave",
-        lambda envelope, key, purpose: b"sk-test",
-    )
-    monkeypatch.setattr(
-        core_enclave,
-        "_enclave_get_json_for_gate",
-        lambda path, key, params=None: ({"messages": [], "context_memories": []}, "")
-        if path == "/v1/chat/history"
-        else ({"identity": {}}, ""),
-    )
-
-    def fake_web_search(requests):
-        search_requests.extend(requests)
-        return {
-            "enabled": True,
-            "status": "ok",
-            "requests": requests,
-            "result_count": 1,
-            "errors": [],
-            "results": [
-                {
-                    "query": requests[0]["query"],
-                    "status": "ok",
-                    "results": [
-                        {
-                            "title": "OpenAI product update",
-                            "url": "https://example.com/openai-update",
-                            "snippet": "A current public result.",
-                        }
-                    ],
-                }
-            ],
-        }
-
-    def fake_chat_completion(cfg, messages, **kwargs):
-        provider_calls.append(messages)
-        if len(provider_calls) == 1:
-            return {
-                "reply": appmod.json.dumps({
-                    "reply": "",
-                    "tool_requests": [
-                        {
-                            "type": "function",
-                            "function": {
-                                "name": "web_search",
-                                "arguments": appmod.json.dumps({
-                                    "query": "OpenAI product update",
-                                    "reason": "needs current public information",
-                                }),
-                            },
-                        }
-                    ],
-                }),
-                "usage": {"total_tokens": 3},
-            }
-        joined = "\n".join(str(m.get("content") or "") for m in messages)
-        assert "Backend web_search tool results JSON" in joined
-        assert "OpenAI product update" in joined
-        return {
-                "reply": appmod.json.dumps({
-                    "reply": "The current public result says there was an OpenAI product update.",
-                    "context_summary": "Searched the web for OpenAI product update.",
-                }),
-                "usage": {"total_tokens": 8},
-            }
-
-    monkeypatch.setattr(hosted_turn, "_run_model_api_web_searches", fake_web_search)
-    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
-
-    setup = client.post(
-        "/v1/model_api/setup",
-        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
-        headers=_headers(api_key),
-    )
-    assert setup.status_code == 200, setup.get_data(as_text=True)
-
-    chat = client.post(
-        "/v1/model_api/chat/send",
-        json={"message": "Tell me what OpenAI announced."},
-        headers=_headers(api_key),
-    )
-    assert chat.status_code == 200, chat.get_data(as_text=True)
-    body = chat.get_json()
-    assert body["reply"] == "The current public result says there was an OpenAI product update."
-    assert body["thinking_summary"] == "Searched the web for OpenAI product update."
-    assert body["tools"]["web_search"]["requests"] == 1
-    assert body["tools"]["web_search"]["results"] == 1
-    assert search_requests[0]["query"] == "OpenAI product update"
-    assert len(provider_calls) == 2
-
-
-def test_model_api_chat_surfaces_provider_reasoning_before_context_summary(client, monkeypatch):
-    _, api_key = _register(client)
-    provider_kwargs: list[dict] = []
-
-    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
-    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
-    monkeypatch.setattr(
-        core_enclave,
-        "_enclave_get_json_for_gate",
-        lambda path, key, params=None: ({"messages": [], "context_memories": []}, "")
-        if path == "/v1/chat/history"
-        else ({"identity": _identity_payload()}, ""),
-    )
-
-    def fake_chat_completion(cfg, messages, **kwargs):
-        provider_kwargs.append(kwargs)
-        return {
-            "reply": appmod.json.dumps({
-                "reply": "看到了，我直接回你。",
-                "context_summary": "对齐了当前 Identity 设定。",
-            }),
-            "reasoning": "I considered the user's latest message and relevant memory before answering.",
-            "usage": {"total_tokens": 9},
-        }
-
-    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
-
-    setup = client.post(
-        "/v1/model_api/setup",
-        json={"provider": "openrouter", "model": "anthropic/claude-sonnet-4.5", "api_key": "sk-test"},
-        headers=_headers(api_key),
-    )
-    assert setup.status_code == 200, setup.get_data(as_text=True)
-
-    chat = client.post(
-        "/v1/model_api/chat/send",
-        json={"message": "hello"},
-        headers=_headers(api_key),
-    )
-
-    assert chat.status_code == 200, chat.get_data(as_text=True)
-    body = chat.get_json()
-    assert provider_kwargs[-1]["include_reasoning"] is True
-    assert body["reply"] == "看到了，我直接回你。"
-    assert body["context_summary"] == ""
-    assert body["thinking_kind"] == "provider_reasoning"
-    assert body["provider_reasoning"] == "I considered the user's latest message and relevant memory before answering."
-    assert body["thinking_summary"] == body["provider_reasoning"]
-
-
-def test_hosted_chat_perception_flag_keeps_auto_memory_context(client, monkeypatch):
-    user_id, api_key = _register(client)
-    context_calls: list[dict] = []
-    provider_calls: list[list[dict]] = []
-
-    monkeypatch.delenv("MODEL_API_MEMORY_TOOLS_ENABLED", raising=False)
-    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
-    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
-
-    def fake_context_messages(store, key, message, **kwargs):
-        context_calls.append(dict(kwargs))
-        return (
-            [
-                {"role": "system", "content": "identity"},
-                {"role": "system", "content": "context_memory: 用户家猫叫武松。"},
-                {"role": "user", "content": message},
-            ],
-            {
-                "identity_loaded": True,
-                "context_memories": [{"id": "mem_cat", "title": "猫叫武松"}],
-                "context_memory_trace": {"selected_ids": ["mem_cat"]},
-            },
-            [],
-        )
-
-    def fake_chat_completion(cfg, messages, **kwargs):
-        provider_calls.append(messages)
-        joined = "\n".join(str(m.get("content") or "") for m in messages)
-        assert "context_memory: 用户家猫叫武松。" in joined
-        assert "perception.weather" in joined
-        assert "memory.fetch" not in joined
-        return {
-            "reply": appmod.json.dumps({"reply": "记得你家猫叫武松。"}),
-            "usage": {"total_tokens": 4},
-        }
-
-    monkeypatch.setattr(appmod.hosted_chat_routes.hosted_context, "_model_api_context_messages", fake_context_messages)
-    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
-
-    setup = client.post(
-        "/v1/model_api/setup",
-        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
-        headers=_headers(api_key),
-    )
-    assert setup.status_code == 200, setup.get_data(as_text=True)
-    store = appmod._stores[user_id]
-    appmod.hosted_config_store._patch_model_api_runtime_profile(
-        store,
-        {appmod.hosted_chat_routes.HOSTED_CHAT_FULL_TOOL_LOOP_V2_FLAG: True},
-    )
-
-    chat = client.post(
-        "/v1/model_api/chat/send",
-        json={"message": "我家猫叫什么？外面天气呢？"},
-        headers=_headers(api_key),
-    )
-
-    assert chat.status_code == 200, chat.get_data(as_text=True)
-    assert context_calls[0]["include_memory_context"] is True
-    assert len(provider_calls) == 1
-    body = chat.get_json()
-    assert body["reply"] == "记得你家猫叫武松。"
-    assert body["runtime"]["foreground_tool_loop_v2_enabled"] is True
-
-
-def test_model_api_chat_does_not_treat_generic_query_as_web_search_request(client, monkeypatch):
-    _, api_key = _register(client)
-    provider_calls: list[list[dict]] = []
-    search_requests: list[dict] = []
-
-    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_shared_envelope_builder())
-    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
-    monkeypatch.setattr(
-        core_enclave,
-        "_enclave_get_json_for_gate",
-        lambda path, key, params=None: ({"messages": [], "context_memories": []}, "")
-        if path == "/v1/chat/history"
-        else ({"identity": {}}, ""),
-    )
-    monkeypatch.setattr(hosted_turn, "_run_model_api_web_searches", lambda requests: search_requests.extend(requests) or {})
-
-    def fake_chat_completion(cfg, messages, **kwargs):
-        provider_calls.append(messages)
-        return {
-            "reply": appmod.json.dumps({
-                "reply": "I can answer without a hosted web search.",
-                "query": "this is ordinary model output metadata",
-            }),
-            "usage": {"total_tokens": 4},
-        }
-
-    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
-
-    setup = client.post(
-        "/v1/model_api/setup",
-        json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test"},
-        headers=_headers(api_key),
-    )
-    assert setup.status_code == 200, setup.get_data(as_text=True)
-
-    chat = client.post(
-        "/v1/model_api/chat/send",
-        json={"message": "hello"},
-        headers=_headers(api_key),
-    )
-    assert chat.status_code == 200, chat.get_data(as_text=True)
-    body = chat.get_json()
-    assert body["reply"] == "I can answer without a hosted web search."
-    assert body["tools"]["web_search"]["requests"] == 0
-    assert search_requests == []
-    assert len(provider_calls) == 1
 
 
 @pytest.mark.xfail(
@@ -1479,17 +637,23 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
 
     monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
 
+    monkeypatch.setattr(
+        agent_runtime_cutover, "check_supervisor_live",
+        lambda **kw: (True, "ok"),
+    )
+    monkeypatch.setattr(
+        agent_runtime_cutover, "handle_send",
+        lambda store, user_row, driver, **kw: ({"status": "processing"}, 202),
+    )
+
     chat = client.post(
         "/v1/model_api/chat/send",
         json={"message": "Can you reply using my imported history?"},
         headers=_headers(api_key),
     )
-    assert chat.status_code == 200, chat.get_data(as_text=True)
-    chat_body = chat.get_json()
-    assert chat_body["reply"] == "I can answer from the imported history now."
-    assert chat_body["thinking_summary"] == ""
-    assert chat_body["context"]["identity_loaded"] is True
-    assert chat_body["context"]["memories"] == 1
+    # agent-runner 路径：返回 202 而非 inline 200
+    assert chat.status_code == 202, chat.get_data(as_text=True)
+    assert chat.get_json()["status"] == "processing"
 
     final_validate = client.get("/v1/onboarding/validate", headers=_headers(api_key)).get_json()
     assert final_validate["passing"] is True
@@ -1506,10 +670,8 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
         for row in rows
     )
     assert any(row["source"] == "model_api" and row["role"] == "user" for row in rows)
-    assert any(row["source"] == "model_api" and row["role"] == "openclaw" for row in rows)
     assert all("body_ct" in row for row in rows if row["source"] == "model_api")
     assert "sk-test-secret" not in appmod.json.dumps(appmod.db.get_blob(user_id, "model_api") or {})
-
 
 def test_model_api_context_summary_parsing_drops_generic_runtime_fallback():
     reply, summary = appmod._model_api_parse_turn_reply(
@@ -1591,7 +753,6 @@ def test_history_import_reuses_inflight_client_job(client, monkeypatch):
 
 def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
     _, api_key = _register(client)
-    captured = {}
 
     monkeypatch.setattr(
         provider_client,
@@ -1603,14 +764,6 @@ def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
         "_decrypt_envelope_via_enclave",
         lambda envelope, key, purpose: b"sk-test-secret",
     )
-
-    def fake_chat_completion(cfg, messages, **kwargs):
-        if any(isinstance(m.get("content"), list) for m in messages):
-            captured["messages"] = messages
-        return {"reply": "I can see the image.", "usage": {"total_tokens": 11}}
-
-    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
-
     setup = client.post(
         "/v1/model_api/setup",
         json={"provider": "openai", "model": "gpt-4.1-mini", "api_key": "sk-test-secret"},
@@ -1618,6 +771,15 @@ def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
 
+    # 图片 turn 现在路由到 agent-runner（不再走 inline）
+    monkeypatch.setattr(
+        agent_runtime_cutover, "check_supervisor_live",
+        lambda **kw: (True, "ok"),
+    )
+    monkeypatch.setattr(
+        agent_runtime_cutover, "handle_send",
+        lambda store, user_row, driver, **kw: ({"status": "processing"}, 202),
+    )
     chat = client.post(
         "/v1/model_api/chat/send",
         json={
@@ -1627,14 +789,8 @@ def test_model_api_chat_send_accepts_user_image(client, monkeypatch):
         },
         headers=_headers(api_key),
     )
-    assert chat.status_code == 200, chat.get_data(as_text=True)
-    assert chat.get_json()["user_content_type"] == "image"
-
-    user_messages = [m for m in captured["messages"] if m.get("role") == "user"]
-    content = user_messages[-1]["content"]
-    assert content[0] == {"type": "text", "text": "What is in this image?"}
-    assert content[1]["type"] == "image_url"
-    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+    assert chat.status_code == 202, chat.get_data(as_text=True)
+    assert chat.get_json()["status"] == "processing"
 
     history = client.get("/v1/chat/history?limit=10", headers=_headers(api_key))
     rows = history.get_json()["messages"]

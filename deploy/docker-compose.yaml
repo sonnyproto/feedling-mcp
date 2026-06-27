@@ -93,7 +93,7 @@ services:
     # released), so adding workers multiplies the long-poll capacity that used to
     # be capped at one process. Each worker adds ~17 DB connections (pool 16 + 1
     # listener); mind the database's max_connections when raising -w.
-    command: ["gunicorn", "--chdir", "backend", "-w", "2", "--threads", "32", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
+    command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-w", "2", "--threads", "32", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
     restart: unless-stopped
     environment:
       # --- BAKED: security-relevant, audited by iOS ---
@@ -111,6 +111,10 @@ services:
       FEEDLING_PUBLIC_BASE_URL: "${FEEDLING_PUBLIC_BASE_URL:-}"
       FEEDLING_PUSH_COOLDOWN_SEC: "${FEEDLING_PUSH_COOLDOWN_SEC:-300}"
       FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC: "${FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC:-900}"
+      # --- 托管三件套（缺一即启动失败 fail-fast）---
+      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
+      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
+      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
     ports:
       - "5001:5001"
       - "9998:9998"

@@ -98,6 +98,32 @@ def _chat_thinking_extra_from_envelope(envelope: dict | None) -> dict:
     return {k: v for k, v in out.items() if str(v).strip()}
 
 
+def _chat_caption_extra_from_envelope(envelope: dict | None) -> dict:
+    """Image caption (user text) envelope → caption_* extra fields for store.
+
+    Mirrors _chat_thinking_extra_from_envelope; prefix is caption_ instead of
+    thinking_.  caption_K_enclave is included only when present because
+    _decrypt_envelope requires it — if K_enclave is absent the caption cannot
+    be decrypted by the enclave, so we faithfully forward whatever the builder
+    produced.
+    """
+    if not isinstance(envelope, dict):
+        return {}
+    out = {
+        "caption_v": str(envelope.get("v", 1)),
+        "caption_id": str(envelope.get("id") or ""),
+        "caption_body_ct": str(envelope.get("body_ct") or ""),
+        "caption_nonce": str(envelope.get("nonce") or ""),
+        "caption_K_user": str(envelope.get("K_user") or ""),
+        "caption_visibility": str(envelope.get("visibility") or "shared"),
+        "caption_owner_user_id": str(envelope.get("owner_user_id") or ""),
+        "caption_enclave_pk_fpr": str(envelope.get("enclave_pk_fpr") or ""),
+    }
+    if envelope.get("K_enclave"):
+        out["caption_K_enclave"] = str(envelope.get("K_enclave") or "")
+    return {k: v for k, v in out.items() if str(v).strip()}
+
+
 _CHAT_THINKING_KINDS = {
     "provider_reasoning",
     "provider_reasoning_summary",
