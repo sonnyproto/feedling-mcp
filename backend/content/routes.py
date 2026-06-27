@@ -23,6 +23,7 @@ from core import envelope as core_envelope
 from core import store as core_store
 from identity import service as identity_service
 from memory import service as memory_service
+from onboarding_archive import storage as onboarding_archive_storage
 
 bp = Blueprint("content", __name__)
 
@@ -577,6 +578,19 @@ def account_reset():
         }), 400
 
     user_id = store.user_id
+
+    # Purge the user's onboarding R2 archives FIRST. If R2 cleanup fails we abort
+    # the whole reset (nothing deleted yet → safe to retry) rather than wipe the
+    # DB index and leave undiscoverable plaintext originals behind on R2.
+    if onboarding_archive_storage.enabled():
+        try:
+            onboarding_archive_storage.delete_user_archives(user_id)
+        except Exception as e:  # noqa: BLE001
+            print(f"[reset:{user_id}] onboarding archive R2 cleanup failed, aborting reset: {e}")
+            return jsonify({
+                "error": "archive_cleanup_failed",
+                "detail": "Could not purge onboarding archives; reset aborted, safe to retry.",
+            }), 503
 
     # Remove the user record FIRST so any in-flight requests carrying the old
     # api_key fail auth immediately.
