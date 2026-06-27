@@ -188,6 +188,15 @@ def capture_tick():
     return jsonify(out)
 
 
+@bp.route("/v1/capture/force", methods=["POST"])
+def capture_force():
+    """Debug: enqueue a capture job NOW (skip the 20-min quiet window) so a tester
+    doesn't have to wait. Still needs new messages since the last capture."""
+    store = auth.require_user()
+    result = capture_scheduler.force_capture(store)
+    return jsonify(_capture_response_doc(result))
+
+
 @bp.route("/v1/dream/tick", methods=["POST"])
 def dream_tick():
     store = auth.require_user()

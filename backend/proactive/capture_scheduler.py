@@ -264,6 +264,20 @@ def tick_quiet_capture(store, *, now: float | None = None) -> dict[str, Any]:
     return result
 
 
+def force_capture(store, *, now: float | None = None) -> dict[str, Any]:
+    """Debug: enqueue a capture job for the current window NOW, skipping the quiet
+    window (still needs new messages since the last capture). For the test panel's
+    'capture now' button so you don't wait 20 min."""
+    now_ts = time.time() if now is None else float(now)
+    state = refresh_capture_state_from_chat(store, now=now_ts)
+    until_id = str(state.get("last_seen_message_id") or "")
+    if not until_id or int(state.get("message_count") or 0) <= 0:
+        return {"enqueued": False, "reason": "no_new_messages", "state": state, "job": None}
+    if until_id == str(state.get("last_captured_until_message_id") or ""):
+        return {"enqueued": False, "reason": "already_captured", "state": state, "job": None}
+    return _enqueue_window(store, trigger="manual_force", now=now_ts)
+
+
 def tick_quiet_migrate(store, *, now: float | None = None) -> dict[str, Any]:
     """Legacy→v1 migration trigger — rides the same quiet window as capture.
 
