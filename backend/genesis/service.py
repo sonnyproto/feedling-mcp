@@ -32,9 +32,9 @@ PERSONA_SOURCE_PRIORITY = {
 
 PRIVACY_MODE = "backend_storage_no_plaintext_user_provider_authorized"
 PRIVACY_COPY = (
-    "Feedling backend / persistent storage does not see imported plaintext; "
-    "plaintext is processed inside the CVM and sent only to the LLM provider "
-    "the user configured with their authorized key."
+    "Feedling persistent storage does not store imported plaintext; plaintext is "
+    "processed inside the CVM and sent only to the LLM provider the user "
+    "configured with their authorized key."
 )
 
 DONE_JOB_STATUS = "done"
@@ -64,10 +64,14 @@ RAW_REDUCER_OUTPUT_FIELDS = {
 SAFE_JOB_METADATA_KEYS = {
     "archive_format",
     "client_version",
+    "client_job_id",
     "file_count",
+    "history_tier",
+    "ingest",
     "locale",
     "schema_version",
     "source_label",
+    "window_count",
 }
 
 

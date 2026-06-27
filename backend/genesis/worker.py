@@ -694,6 +694,33 @@ def _build_reducer_output(
     }
 
 
+def build_reducer_output_from_texts(
+    *,
+    user_id: str,
+    job_id: str,
+    runtime: provider_client.ProviderConfig,
+    chunk_texts: list[str],
+    source_kind: str = "history",
+    existing_persona: dict | None = None,
+    existing_voice: dict | None = None,
+) -> dict:
+    """Public wrapper for trusted in-memory Genesis inputs.
+
+    The chunked worker path still decrypts uploaded envelopes before calling the
+    private reducer. Plaintext one-shot imports enter the CVM as request bodies
+    and can call this wrapper directly without staging raw text in storage.
+    """
+    return _build_reducer_output(
+        user_id=user_id,
+        job_id=job_id,
+        runtime=runtime,
+        chunk_texts=chunk_texts,
+        source_kind=source_kind,
+        existing_persona=existing_persona,
+        existing_voice=existing_voice,
+    )
+
+
 def _apply_reducer_output(api_url: str, runtime_token: str, job_id: str, output: dict) -> dict:
     try:
         resp = httpx.post(

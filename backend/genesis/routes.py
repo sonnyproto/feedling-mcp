@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 from typing import Any
 
 from flask import Blueprint, jsonify, request
@@ -12,11 +13,15 @@ from flask import Blueprint, jsonify, request
 import db
 from accounts import auth
 from accounts import runtime_auth
-from genesis import service
+from genesis import service, worker
+from hosted import config_store as hosted_config_store
+from hosted import history_import
 
 bp = Blueprint("genesis", __name__)
 
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
+_PLAINTEXT_ACTIVE_LOCK = threading.Lock()
+_PLAINTEXT_ACTIVE_JOBS: set[tuple[str, str]] = set()
 
 
 def _bad(error: str, status: int = 400, **extra):
@@ -38,6 +43,228 @@ def _job_response(job: dict | None, *, extra: dict | None = None) -> dict:
     return body
 
 
+def _plaintext_fresh_start_message() -> dict:
+    return {
+        "role": "user",
+        "content": "Fresh start. No persona profile or previous chat history was provided.",
+        "ts": None,
+        "source": history_import._FRESH_START_SOURCE,
+        "source_family": history_import._FRESH_START_SOURCE,
+    }
+
+
+def _plaintext_source_kind(history_messages: list[dict], support_messages: list[dict]) -> str:
+    if history_messages:
+        return history_import._HISTORY_SOURCE
+    families = {
+        history_import._import_source_family(str(m.get("source") or m.get("source_family") or ""))
+        for m in support_messages
+    }
+    if len(families) == 1:
+        family = next(iter(families))
+        if family == history_import._AI_PERSONA_SOURCE:
+            return "ai_persona"
+        if family == history_import._USER_PROFILE_SOURCE:
+            return "user_profile"
+        if family == history_import._MEMORY_SUMMARY_SOURCE:
+            return "memory_summary"
+    return history_import._HISTORY_SOURCE
+
+
+def _prepare_plaintext_import(payload: dict) -> dict:
+    content = str(payload.get("content") or "")
+    fmt = str(payload.get("format") or "auto").strip().lower()
+    warnings: list[str] = []
+    history_messages = history_import._parse_import_history_content(content, fmt, warnings)
+    support_messages = history_import._persona_support_messages(payload)
+    if not history_messages and not support_messages:
+        if not bool(payload.get("fresh_start")):
+            raise ValueError(
+                "content, ai_persona_content, character_content, personal_profile_content, "
+                "memory_summary_content, persona_content, or fresh_start=true required"
+            )
+        support_messages = [_plaintext_fresh_start_message()]
+        warnings.append("fresh_start_without_support_material")
+
+    analysis_messages = support_messages + history_messages
+    profile = history_import._history_import_profile(
+        history_messages,
+        support_messages,
+        content_chars=len(content),
+    )
+    window_limit = int(profile.get("total_windows") or 8)
+    windows = history_import._build_transcript_windows(
+        analysis_messages,
+        max_chars=18000,
+        max_windows=window_limit,
+    )
+    if len(windows) > window_limit:
+        windows = history_import._select_evenly(windows, window_limit)
+    chunk_texts = [
+        str(window.get("text") or "").strip()
+        for window in windows
+        if str(window.get("text") or "").strip()
+    ]
+    if not chunk_texts:
+        raise ValueError("plaintext_import_empty")
+    return {
+        "chunk_texts": chunk_texts,
+        "content_bytes": len(content.encode("utf-8")),
+        "history_messages": history_messages,
+        "profile": profile,
+        "source_kind": _plaintext_source_kind(history_messages, support_messages),
+        "source_stats": history_import._import_source_stats(analysis_messages),
+        "support_messages": support_messages,
+        "warnings": warnings,
+    }
+
+
+def _plaintext_job_metadata(
+    payload: dict,
+    prepared: dict,
+    *,
+    client_job_id: str,
+    input_hash: str,
+) -> dict:
+    profile = prepared.get("profile") if isinstance(prepared.get("profile"), dict) else {}
+    source_stats = prepared.get("source_stats") if isinstance(prepared.get("source_stats"), dict) else {}
+    metadata: dict[str, Any] = {
+        "ingest": "plaintext",
+        "input_hash": input_hash,
+        "client_job_id": client_job_id,
+        "history_tier": str(profile.get("tier") or "small"),
+        "window_count": len(prepared.get("chunk_texts") or []),
+        "history_count": int(profile.get("message_count") or 0),
+        "support_count": int(profile.get("support_count") or 0),
+        "warning_count": len(prepared.get("warnings") or []),
+        "content_bytes": int(prepared.get("content_bytes") or 0),
+    }
+    filename_fields = [
+        payload.get("history_filename"),
+        payload.get("ai_persona_filename"),
+        payload.get("character_filename") or payload.get("character_card_filename"),
+        payload.get("personal_profile_filename") or payload.get("persona_filename"),
+        payload.get("memory_summary_filename") or payload.get("memory_sample_filename"),
+    ]
+    metadata["file_count"] = len([x for x in filename_fields if str(x or "").strip()])
+    for prefix, family in (
+        ("ai_persona", history_import._AI_PERSONA_SOURCE),
+        ("user_profile", history_import._USER_PROFILE_SOURCE),
+        ("memory_summary", history_import._MEMORY_SUMMARY_SOURCE),
+        ("fresh_start", history_import._FRESH_START_SOURCE),
+    ):
+        stats = source_stats.get(family) if isinstance(source_stats.get(family), dict) else {}
+        metadata[f"{prefix}_count"] = int(stats.get("count") or 0)
+    return metadata
+
+
+def _metadata_for_job(job: dict | None) -> dict:
+    metadata = (job or {}).get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _find_reusable_plaintext_job(
+    store,
+    *,
+    client_job_id: str,
+    input_hash: str,
+) -> dict | None:
+    try:
+        jobs = db.genesis_list_jobs(store.user_id, limit=100)
+    except Exception:
+        return None
+    for job in jobs:
+        if str(job.get("status") or "") == service.FAILED_JOB_STATUS:
+            continue
+        metadata = _metadata_for_job(job)
+        if metadata.get("ingest") != "plaintext":
+            continue
+        if client_job_id and str(metadata.get("client_job_id") or "") == client_job_id:
+            return job
+        if input_hash and str(metadata.get("input_hash") or "") == input_hash:
+            return job
+    return None
+
+
+def _run_plaintext_genesis_job(
+    store,
+    api_key: str | None,
+    job_id: str,
+    *,
+    chunk_texts: list[str],
+    source_kind: str,
+) -> None:
+    active_key = (store.user_id, job_id)
+    try:
+        job = db.genesis_set_job_status(
+            store.user_id,
+            job_id,
+            status="processing",
+            output={"stage": "plaintext_reducer"},
+            processed_chunks=0,
+        )
+        if job:
+            service.write_genesis_state(store, job, status="processing")
+        runtime = hosted_config_store._load_runtime_provider_config(store, api_key)
+        if isinstance(runtime, tuple):
+            _, err = runtime
+            raise RuntimeError(json.dumps(err, ensure_ascii=False))
+        reducer_output = worker.build_reducer_output_from_texts(
+            user_id=store.user_id,
+            job_id=job_id,
+            runtime=runtime,
+            chunk_texts=chunk_texts,
+            source_kind=source_kind,
+            existing_persona={},
+            existing_voice={},
+        )
+        db.genesis_set_job_status(
+            store.user_id,
+            job_id,
+            status="processing",
+            output={"stage": "plaintext_reducer_done"},
+            processed_chunks=len(chunk_texts),
+        )
+        service.apply_reducer_output(store, api_key, job_id, reducer_output)
+    except Exception as e:  # noqa: BLE001
+        service.mark_failed(store, job_id, f"plaintext_import_failed:{type(e).__name__}:{str(e)[:220]}")
+    finally:
+        with _PLAINTEXT_ACTIVE_LOCK:
+            _PLAINTEXT_ACTIVE_JOBS.discard(active_key)
+
+
+def _start_plaintext_genesis_job(
+    store,
+    api_key: str | None,
+    job: dict,
+    *,
+    chunk_texts: list[str],
+    source_kind: str,
+) -> bool:
+    job_id = str(job.get("job_id") or "")
+    if not job_id:
+        return False
+    active_key = (store.user_id, job_id)
+    with _PLAINTEXT_ACTIVE_LOCK:
+        if active_key in _PLAINTEXT_ACTIVE_JOBS:
+            return False
+        _PLAINTEXT_ACTIVE_JOBS.add(active_key)
+    thread = threading.Thread(
+        target=_run_plaintext_genesis_job,
+        args=(store, api_key, job_id),
+        kwargs={"chunk_texts": chunk_texts, "source_kind": source_kind},
+        name=f"genesis-plaintext-{job_id[:24]}",
+        daemon=True,
+    )
+    try:
+        thread.start()
+    except Exception:
+        with _PLAINTEXT_ACTIVE_LOCK:
+            _PLAINTEXT_ACTIVE_JOBS.discard(active_key)
+        raise
+    return True
+
+
 @bp.route("/v1/genesis/imports", methods=["POST"])
 def genesis_import_create():
     store = auth.require_user()
@@ -47,6 +274,83 @@ def genesis_import_create():
     except ValueError as e:
         return _bad(str(e), 400)
     return jsonify(_job_response(job, extra={"status": "created" if status == 201 else "exists"})), status
+
+
+@bp.route("/v1/genesis/imports/plaintext", methods=["POST"])
+def genesis_import_plaintext():
+    store = auth.require_user()
+    api_key = auth._extract_api_key()
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        return _bad("json_object_required", 400)
+
+    input_hash = history_import._history_import_payload_hash(payload)
+    client_job_id = history_import._history_import_client_job_id(payload)
+    existing = _find_reusable_plaintext_job(
+        store,
+        client_job_id=client_job_id,
+        input_hash=input_hash,
+    )
+    if existing and str(existing.get("status") or "") == service.DONE_JOB_STATUS:
+        return jsonify(_job_response(existing, extra={"status": "done"})), 200
+
+    try:
+        prepared = _prepare_plaintext_import(payload)
+    except ValueError as e:
+        return _bad(str(e), 400)
+
+    if existing:
+        existing = db.genesis_set_job_status(
+            store.user_id,
+            str(existing.get("job_id") or ""),
+            status="processing",
+            output={"stage": "plaintext_queued"},
+            processed_chunks=0,
+        ) or existing
+        service.write_genesis_state(store, existing, status="processing")
+        _start_plaintext_genesis_job(
+            store,
+            api_key,
+            existing,
+            chunk_texts=prepared["chunk_texts"],
+            source_kind=prepared["source_kind"],
+        )
+        return jsonify(_job_response(existing, extra={"status": "processing"})), 202
+
+    metadata = _plaintext_job_metadata(
+        payload,
+        prepared,
+        client_job_id=client_job_id,
+        input_hash=input_hash,
+    )
+    total_bytes = sum(len(text.encode("utf-8")) for text in prepared["chunk_texts"])
+    try:
+        job, _status = service.create_import_job(store, {
+            "source_kind": prepared["source_kind"],
+            "file_manifest_hash": input_hash,
+            "total_chunks": len(prepared["chunk_texts"]),
+            "total_bytes": total_bytes,
+            "metadata": metadata,
+        })
+    except ValueError as e:
+        return _bad(str(e), 400)
+
+    job = db.genesis_set_job_status(
+        store.user_id,
+        str(job.get("job_id") or ""),
+        status="processing",
+        output={"stage": "plaintext_queued"},
+        processed_chunks=0,
+    ) or job
+    service.write_genesis_state(store, job, status="processing")
+    _start_plaintext_genesis_job(
+        store,
+        api_key,
+        job,
+        chunk_texts=prepared["chunk_texts"],
+        source_kind=prepared["source_kind"],
+    )
+    return jsonify(_job_response(job, extra={"status": "processing"})), 202
 
 
 @bp.route("/v1/genesis/imports", methods=["GET"])
