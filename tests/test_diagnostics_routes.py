@@ -125,6 +125,18 @@ def test_log_trim_keeps_newest_ten(client):
     assert logs[-1]["content"] == "log-12"
 
 
+def test_upload_rejects_oversized_body(client):
+    _, api_key = _register(client)
+    # >2 MiB request body — rejected from Content-Length before JSON parsing.
+    huge = "x" * (2 * 1024 * 1024 + 1024)
+    res = client.post(
+        "/v1/diagnostics/logs",
+        json={"content": huge},
+        headers=_headers(api_key),
+    )
+    assert res.status_code == 413
+
+
 def test_admin_read_requires_token(client):
     uid, _ = _register(client)
     res = client.get(f"/v1/admin/diagnostics/logs/{uid}")

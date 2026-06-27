@@ -31,6 +31,12 @@ bp = Blueprint("diagnostics", __name__)
 
 _STREAM = "client_diagnostics"
 _MAX_BYTES = 512 * 1024  # mirror the iOS DiagnosticLog ring size
+# Hard request-body ceiling, checked from Content-Length *before* the JSON body
+# is read into memory — so an oversized (even authenticated) upload is rejected
+# 413 rather than buffered. Headroom over _MAX_BYTES covers JSON string-escaping
+# of the log text plus the meta object. Scoped to this route (not a global
+# MAX_CONTENT_LENGTH) so it never clips the larger frame/photo upload paths.
+_MAX_REQUEST_BYTES = 2 * 1024 * 1024
 _MAX_ROWS = 10           # keep the newest N uploads per user
 _PRESIGN_TTL = 3600
 
@@ -45,6 +51,10 @@ def upload_logs():
 
     store = require_user()  # aborts 401 on bad auth
     uid = store.user_id
+
+    # Reject oversized bodies from Content-Length before materializing the JSON.
+    if request.content_length is not None and request.content_length > _MAX_REQUEST_BYTES:
+        return jsonify({"error": "payload_too_large"}), 413
 
     payload = _body()
     content = payload.get("content")
