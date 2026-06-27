@@ -56,6 +56,13 @@ JSON_REPAIR_SYSTEM_PROMPT = (
     "Do not add, remove, translate, summarize, or reinterpret content. "
     "Only fix JSON syntax and escaping so json.loads can parse it."
 )
+TRUNCATION_STOP_REASONS = {
+    "length",
+    "max_output_tokens",
+    "max_tokens",
+    "max_tokens_reached",
+    "max_tokens_stop",
+}
 
 
 class GenesisWorkerError(Exception):
@@ -119,6 +126,61 @@ def _json_repair_messages(task_id: str, raw_text: str, error: str) -> list[dict[
             ),
         },
     ]
+
+
+def _llm_max_tokens_cap() -> int:
+    return max(128, min(_env_int("FEEDLING_GENESIS_LLM_MAX_TOKENS_PER_CALL", 8000), 32000))
+
+
+def _usage_output_tokens(usage: Any) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    for key in ("output_tokens", "completion_tokens", "candidatesTokenCount"):
+        try:
+            value = int(usage.get(key) or 0)
+        except Exception:
+            value = 0
+        if value > 0:
+            return value
+    return 0
+
+
+def _json_text_looks_truncated(text: str) -> bool:
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+    if not raw:
+        return False
+    return "{" in raw and not raw.rstrip().endswith("}")
+
+
+def _llm_result_likely_truncated(result: Any) -> bool:
+    stop_reason = str(getattr(result, "stop_reason", "") or "").strip().lower()
+    normalized_stop = re.sub(r"[^a-z0-9_]+", "_", stop_reason).strip("_")
+    if normalized_stop in TRUNCATION_STOP_REASONS or "max_token" in normalized_stop:
+        return True
+    try:
+        max_tokens = int(getattr(result, "max_tokens", 0) or 0)
+    except Exception:
+        max_tokens = 0
+    output_tokens = _usage_output_tokens(getattr(result, "usage", {}))
+    if max_tokens > 0 and output_tokens >= max(1, int(max_tokens * 0.98)):
+        return True
+    return _json_text_looks_truncated(str(getattr(result, "text", "") or ""))
+
+
+def _json_repair_max_tokens(result: Any, requested_max_tokens: int) -> int:
+    try:
+        original_max = int(getattr(result, "max_tokens", 0) or requested_max_tokens)
+    except Exception:
+        original_max = requested_max_tokens
+    original_max = max(1, original_max)
+    if _llm_result_likely_truncated(result):
+        target = max(original_max * 2, original_max + 1200)
+    else:
+        target = original_max + max(800, original_max // 4)
+    return min(max(original_max + 1, target), _llm_max_tokens_cap())
 
 
 def _chunks(seq: list[Any], size: int) -> list[list[Any]]:
@@ -325,7 +387,7 @@ def _complete_json(
             task_id=f"{task_id}-json-repair",
             runtime=runtime,
             messages=_json_repair_messages(task_id, result.text, str(first_error)),
-            max_tokens=max_tokens,
+            max_tokens=_json_repair_max_tokens(result, max_tokens),
             timeout=float(_env_int("FEEDLING_GENESIS_LLM_TIMEOUT_SEC", 90)),
             idempotency_key=f"{idempotency_key}:json_repair",
             temperature=0.0,
@@ -385,7 +447,7 @@ def _voice_reduce(
                 task_id=f"voice-reduce-{round_no}-{idx}",
                 runtime=runtime,
                 messages=prompts.voice_reduce_messages(batch),
-                max_tokens=2200,
+                max_tokens=4000,
                 idempotency_key=f"{job_id}:voice_reduce:{round_no}:{idx}",
             )
             next_round.append({
@@ -401,7 +463,7 @@ def _voice_reduce(
         task_id=f"voice-reduce-{round_no}",
         runtime=runtime,
         messages=prompts.voice_reduce_messages(current),
-        max_tokens=2600,
+        max_tokens=4000,
         idempotency_key=f"{job_id}:voice_reduce:{round_no}:final",
     )
 
@@ -428,7 +490,7 @@ def _fact_write(
             task_id=f"fact-write-{idx}",
             runtime=runtime,
             messages=prompts.fact_write_messages(batch, persona_material, memory_summary),
-            max_tokens=3000,
+            max_tokens=4000,
             idempotency_key=f"{job_id}:fact_write:{idx}",
         ))
     memories: list[dict] = []
@@ -496,7 +558,7 @@ def _build_reducer_output(
             task_id="persona-build",
             runtime=runtime,
             messages=prompts.persona_build_messages(material, existing_notes, founding),
-            max_tokens=2600,
+            max_tokens=4000,
             idempotency_key=f"{job_id}:persona_build",
         )
         return {
@@ -610,7 +672,7 @@ def _build_reducer_output(
         task_id="persona-build",
         runtime=runtime,
         messages=prompts.persona_build_messages(persona_material, behavior_notes, founding),
-        max_tokens=2600,
+        max_tokens=4000,
         idempotency_key=f"{job_id}:persona_build",
     )
     return {

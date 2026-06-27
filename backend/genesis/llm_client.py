@@ -25,6 +25,8 @@ class GenesisLLMResult:
     usage: dict
     cached: bool
     output_ref: str
+    stop_reason: str = ""
+    max_tokens: int = 0
 
 
 CompletionFn = Callable[..., dict[str, Any]]
@@ -44,7 +46,7 @@ def _per_user_concurrency() -> int:
 
 
 def _max_tokens_per_call() -> int:
-    return max(128, min(_env_int("FEEDLING_GENESIS_LLM_MAX_TOKENS_PER_CALL", 4000), 32000))
+    return max(128, min(_env_int("FEEDLING_GENESIS_LLM_MAX_TOKENS_PER_CALL", 8000), 32000))
 
 
 @contextmanager
@@ -110,6 +112,7 @@ class GenesisLLMClient:
             )
         text = str(result.get("reply") or "")
         usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+        stop_reason = str(result.get("stop_reason") or "").strip()
         text_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
         doc = {
             "task_id": task_id,
@@ -123,7 +126,15 @@ class GenesisLLMClient:
             "timeout": timeout,
             "budget_label": budget_label,
             "plaintext_stored": False,
+            "stop_reason": stop_reason,
             "usage": usage,
         }
         db.genesis_upsert_output(user_id, job_id, output_type, doc=doc, status="done", ref=output_type)
-        return GenesisLLMResult(text=text, usage=usage, cached=False, output_ref=output_type)
+        return GenesisLLMResult(
+            text=text,
+            usage=usage,
+            cached=False,
+            output_ref=output_type,
+            stop_reason=stop_reason,
+            max_tokens=capped_max_tokens,
+        )

@@ -250,6 +250,80 @@ def test_complete_json_repairs_invalid_model_json_once():
     assert [call["task_id"] for call in calls] == ["voice-map-0", "voice-map-0-json-repair"]
 
 
+def test_complete_json_repairs_truncated_model_json_with_larger_budget(monkeypatch):
+    monkeypatch.setenv("FEEDLING_GENESIS_LLM_MAX_TOKENS_PER_CALL", "8000")
+    calls = []
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            calls.append(kwargs)
+            if kwargs["task_id"] == "voice-reduce-0":
+                text = '{"behavior_notes":["short"],"exemplars":[{"turns":[{"role":"ta","text":"'
+                return types.SimpleNamespace(
+                    text=text,
+                    usage={"output_tokens": 4000},
+                    cached=False,
+                    output_ref=kwargs["task_id"],
+                    stop_reason="max_tokens",
+                    max_tokens=4000,
+                )
+            if kwargs["task_id"] == "voice-reduce-0-json-repair":
+                assert kwargs["max_tokens"] == 8000
+                text = json.dumps({
+                    "behavior_notes": ["short"],
+                    "exemplars": [{"turns": [{"role": "ta", "text": "别急,我在。"}]}],
+                })
+                return types.SimpleNamespace(
+                    text=text,
+                    usage={"output_tokens": 210},
+                    cached=False,
+                    output_ref=kwargs["task_id"],
+                    stop_reason="end_turn",
+                    max_tokens=8000,
+                )
+            raise AssertionError(kwargs["task_id"])
+
+    parsed = worker._complete_json(
+        FakeLLM(),
+        user_id="usr_1",
+        job_id="job_1",
+        task_id="voice-reduce-0",
+        runtime=types.SimpleNamespace(),
+        messages=[{"role": "user", "content": "x"}],
+        max_tokens=4000,
+        idempotency_key="job_1:voice_reduce:0:final",
+    )
+
+    assert parsed["exemplars"][0]["turns"][0]["text"] == "别急,我在。"
+    assert [call["task_id"] for call in calls] == ["voice-reduce-0", "voice-reduce-0-json-repair"]
+
+
+def test_voice_reduce_uses_high_output_budget():
+    calls = []
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            calls.append(kwargs)
+            assert kwargs["task_id"] == "voice-reduce-0"
+            assert kwargs["max_tokens"] == 4000
+            text = json.dumps({"behavior_notes": ["short"], "exemplars": []})
+            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
+
+    result = worker._voice_reduce(
+        FakeLLM(),
+        user_id="usr_1",
+        job_id="job_1",
+        runtime=types.SimpleNamespace(),
+        candidates=[{
+            "behavior_notes_candidates": ["short"],
+            "exemplar_candidates": [{"turns": [{"role": "ta", "text": "嗯"}]}],
+        }],
+    )
+
+    assert result == {"behavior_notes": ["short"], "exemplars": []}
+    assert len(calls) == 1
+
+
 def test_ai_persona_source_uses_persona_material_without_voice_or_fact_map(monkeypatch):
     llm_calls = []
     apply_payloads, _minted, mint = _install_success_harness(

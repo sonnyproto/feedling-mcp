@@ -427,6 +427,13 @@ def _extract_openai_compatible_reasoning(body: dict[str, Any]) -> str:
     return "\n\n".join(parts).strip()
 
 
+def _extract_openai_compatible_stop_reason(body: dict[str, Any]) -> str:
+    choices = body.get("choices")
+    if not (isinstance(choices, list) and choices and isinstance(choices[0], dict)):
+        return ""
+    return str(choices[0].get("finish_reason") or "").strip()
+
+
 def _extract_anthropic_reply(body: dict[str, Any], *, required: bool = True) -> str:
     content = body.get("content")
     has_shape = isinstance(content, list)
@@ -517,6 +524,13 @@ def _extract_gemini_reasoning(body: dict[str, Any]) -> str:
             if isinstance(text, str) and text.strip():
                 parts_out.append(text.strip())
     return "\n\n".join(parts_out).strip()
+
+
+def _extract_gemini_stop_reason(body: dict[str, Any]) -> str:
+    candidates = body.get("candidates")
+    if not (isinstance(candidates, list) and candidates and isinstance(candidates[0], dict)):
+        return ""
+    return str(candidates[0].get("finishReason") or "").strip()
 
 
 def _anthropic_supports_thinking(model: str) -> bool:
@@ -651,6 +665,11 @@ def _chat_completion_openai_responses(
         "reasoning": reasoning,
         "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
         "raw_id": body.get("id", ""),
+        "stop_reason": str(
+            (body.get("incomplete_details") if isinstance(body.get("incomplete_details"), dict) else {}).get("reason")
+            or body.get("status")
+            or "",
+        ).strip(),
         "provider": "openai",
         "model": model,
     }
@@ -720,6 +739,7 @@ def _chat_completion_openai_compatible(
         "reasoning": _extract_openai_compatible_reasoning(body),
         "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
         "raw_id": body.get("id", ""),
+        "stop_reason": _extract_openai_compatible_stop_reason(body),
         "provider": provider,
         "model": model,
     }
@@ -783,6 +803,7 @@ def _chat_completion_anthropic(
         "reasoning": _extract_anthropic_reasoning(body),
         "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
         "raw_id": body.get("id", ""),
+        "stop_reason": str(body.get("stop_reason") or "").strip(),
         "provider": "anthropic",
         "model": model,
     }
@@ -852,6 +873,7 @@ def _chat_completion_gemini(
             else {}
         ),
         "raw_id": body.get("responseId", ""),
+        "stop_reason": _extract_gemini_stop_reason(body),
         "provider": "gemini",
         "model": model,
     }

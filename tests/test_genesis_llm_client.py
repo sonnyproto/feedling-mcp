@@ -81,7 +81,11 @@ def test_genesis_llm_client_persists_response_metadata_without_plaintext_or_api_
         assert runtime.api_key == "sk-user-secret"
         assert messages[0]["content"] == "hello"
         assert kwargs["max_tokens"] == 321
-        return {"reply": "new text", "usage": {"total_tokens": 9}}
+        return {
+            "reply": "new text",
+            "usage": {"total_tokens": 9},
+            "stop_reason": "max_tokens",
+        }
 
     result = GenesisLLMClient(completion_fn=fake_completion).complete(
         user_id="usr",
@@ -95,10 +99,13 @@ def test_genesis_llm_client_persists_response_metadata_without_plaintext_or_api_
 
     assert result.cached is False
     assert result.text == "new text"
+    assert result.stop_reason == "max_tokens"
+    assert result.max_tokens == 321
     assert captured["status"] == "done"
     assert captured["doc"]["plaintext_stored"] is False
     assert captured["doc"]["response_sha256"]
     assert captured["doc"]["response_chars"] == len("new text")
+    assert captured["doc"]["stop_reason"] == "max_tokens"
     assert "text" not in captured["doc"]
     assert captured["doc"]["usage"] == {"total_tokens": 9}
     assert "api_key" not in json.dumps(captured["doc"])
