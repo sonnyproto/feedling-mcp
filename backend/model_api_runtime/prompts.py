@@ -99,6 +99,8 @@ def build_memory_capture_messages(
                 "Extract durable Memory Garden cards from the latest exchange. "
                 "Do write explicit user corrections about names, boundaries, persona, voice, preferences, or facts if they are not already present in existing_context_memories. "
                 "Reuse existing_memory_terms.buckets and existing_memory_terms.threads when they fit before creating new names. "
+                "LANGUAGE: write bucket/threads/summary/content in the language the user is chatting in — "
+                "if they chat in Chinese, use Chinese (e.g. 「宠物」not \"pets\", 「旅行」not \"travel\"); only keep proper nouns / brand names / their verbatim quotes in the original. "
                 "Shape: {\"memories\":[{\"summary\":\"...\",\"content\":\"记忆\\n...\\n\\n上下文\\n...\\n\\n使用提示\\n...\","
                 "\"bucket\":\"...\",\"threads\":[\"...\"],\"importance\":0.0,\"pulse\":0.0,\"occurred_at\":\"YYYY-MM-DD\",\"source\":\"chat\"}]}. "
                 "Return {\"memories\":[]} if nothing durable should be written."
