@@ -132,10 +132,12 @@ python3 tests/test_api.py <API_URL> --multi-tenant
 printf 'me: 我家狗叫蛋子\nher: 蛋子今天乖吗？\nme: 上周去了西湖\n' > /tmp/t.txt
 python3 tools/genesis_e2e.py upload --api-url <TEST_API_URL> --register \
   --provider anthropic --model <model_id> --transcript /tmp/t.txt --source-kind history
-python3 tools/genesis_e2e.py verify --api-url <TEST_API_URL> --api-key <key> --job-id <job_id>
+python3 tools/genesis_e2e.py verify --api-url <TEST_API_URL> --api-key <key> --job-id <job_id> \
+  --privacy-needle "蛋子,西湖"
 ```
-**通过标准**:verify 输出 `"ok": true, "state": "done"`;隐私抽检 `status_payload_raw_keys` 为**空**(状态接口不回明文)。
-> 注:`verify` 工具已修 state 解析(GET 返回的 `state` 是 dict、读 `state.status`;旧版当字符串会永远判不出 done)。用本分支的 `tools/genesis_e2e.py`。
+**通过标准**:verify 输出 `"ok": true`(= `state:done` 且无泄露);**`privacy_leak` 为空**(真实原文片段没出现在状态接口里)。
+> 注 1:`verify` 工具已修 state 解析(GET 返回的 `state` 是 dict、读 `state.status`;旧版当字符串永远判不出 done)。
+> 注 2:隐私抽检改用 `--privacy-needle` 查**真实原文片段**(蒸出的句子里挑几个词)。旧的 `status_payload_raw_keys` 通用关键词扫会误报(`chunks`命中 `total_chunks` 字段名、`plaintext`命中 privacy_copy 文案)—— 实测 0627:核心链路通、`ok:true/state:done/persona encrypted`,那次的 raw_keys 报警是工具误报、非真泄露。用本分支的 `tools/genesis_e2e.py`。
 **多源**(对应真机全素材):`--source-kind` 换 `companion_persona`/`user_profile`/`memory_summary` 各跑(同 user 用 `--api-key --user-id`),verify 每个 job 都 done。
 
 ---

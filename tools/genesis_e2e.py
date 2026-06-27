@@ -165,14 +165,19 @@ def cmd_verify(args):
             break
         time.sleep(args.poll)
     state = _state_of(last)
-    out = {"ok": state == "done", "state": state, "job": last}
-    # Privacy spot-check (shallow): the status payload must be metadata-only, never
-    # raw chunk/transcript text. Deep check (genesis_persona encrypted, outputs
-    # sanitized) needs a DB query in the env — see the README note in this file.
+    out = {"state": state, "job": last}
+    # Privacy spot-check. The ACCURATE signal: distinctive transcript fragments
+    # (--privacy-needle, e.g. "蛋子,西湖") must NOT appear in the status payload.
+    # The old generic-keyword scan false-positived on field names (total_chunks)
+    # and on privacy_copy text ("...imported plaintext"), so it's dropped to the
+    # two keys that would only show up if real content leaked.
     blob = json.dumps(last, ensure_ascii=False).lower()
-    out["status_payload_raw_keys"] = [k for k in ("transcript", "raw_text", "chunks", "plaintext") if k in blob]
+    needles = [n.strip().lower() for n in str(getattr(args, "privacy_needle", "") or "").split(",") if n.strip()]
+    out["privacy_leak"] = [n for n in needles if n in blob]
+    out["status_payload_raw_keys"] = [k for k in ("transcript", "raw_text") if k in blob]
+    out["ok"] = (state == "done") and not out["privacy_leak"]
     print(json.dumps(out, ensure_ascii=False))
-    return 0 if state == "done" else 1
+    return 0 if out["ok"] else 1
 
 
 def main():
@@ -202,6 +207,9 @@ def main():
     vf.add_argument("--job-id", required=True)
     vf.add_argument("--timeout", type=float, default=600)
     vf.add_argument("--poll", type=float, default=10)
+    vf.add_argument("--privacy-needle", default="",
+                    help="comma-separated distinctive transcript fragments that MUST NOT "
+                         "appear in the status payload (real leak check, e.g. '蛋子,西湖')")
     vf.set_defaults(func=cmd_verify)
 
     args = p.parse_args()
