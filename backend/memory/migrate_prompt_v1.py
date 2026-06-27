@@ -1,0 +1,142 @@
+"""Migration prompt (v1) — 老卡原地升级成 v1(承接老数据迁移方案 §6）。
+
+只做一件事:把每张老卡(title/description/her_quote/context/linked_dimension)
+**原地**改写成 v1 形状(bucket/threads/summary/content),保 id,不发明事实,
+**不 merge、不 supersede、不删**。复用 capture lane(job_kind=memory_migrate);
+写入走 memory.upgrade(原地、保 id)。本模块只负责 prompt 文本与输出解析。
+
+红线:
+  - 只升级"喂进来的这几张",绝不新建/合并/取代别的卡。
+  - 不发明事实;原文里没有的别补。
+  - resolve-before-create:用已有的桶/线索词表,别膨胀出近义新桶。
+  - 每条必须带回它的原始 id(原地升级靠 id 对回去)。
+"""
+from __future__ import annotations
+
+_MIGRATE_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。现在是一段安静的时间，没人在和你说话。
+你在把一些**旧格式**的记忆卡整理成新格式。这不是重新理解、不是合并、不是新增——
+只是把每一张旧卡**原样升级**成新结构，内容尽量保住，别丢、别编。
+
+【你要做什么】
+下面每张旧卡有一个 id 和一些旧字段（标题/描述/原话/上下文/关联维度）。
+把**每一张**改写成新结构：
+  · bucket（归类）：从下面"已有桶/线索"里选最贴的；实在没有再起一个简短的，别造近义重复桶。
+  · threads（线索，0-3 个）：优先用已有线索；旧的"关联维度"可作线索候选。
+  · summary（一句话主旨）：基于旧的标题/描述。
+  · content（正文）：把描述/上下文/原话融进去，写成连贯的一段；旧"原话"作为依据保留。
+
+【字段映射（参考，不是死规则）】
+  · 描述/标题 → summary + content 主干
+  · 上下文(context) → content 里的背景
+  · 原话(her_quote) → content 里的原话/依据
+  · 关联维度(linked_dimension) → threads 候选
+
+【红线】
+  · 只升级下面这几张，**绝不新建、不合并、不取代别的卡**。
+  · **不发明事实**——旧卡里没有的信息不要补。
+  · 每条**必须带回原始 id**，一一对应。
+  · 一张都不要漏；实在无法判断的，summary 用旧标题、bucket 用"未归类"也行，别丢卡。
+
+【已有的桶/线索词表】{vocab}
+【要升级的旧卡】{old_cards}
+
+【输出】只输出 JSON，不要别的话。
+{{
+  "upgrades": [
+    {{
+      "id": "这张旧卡的原始 id",
+      "bucket": "...",
+      "threads": ["...", "..."],
+      "summary": "...",
+      "content": "...一段连贯正文..."
+    }}
+  ]
+}}"""
+
+
+def build_migrate_prompt(
+    *,
+    ai_name: str,
+    user_name: str,
+    old_cards: str,
+    vocab: str,
+) -> str:
+    """Render the migration prompt. Callers pass already-rendered strings
+    (handler decides formatting/truncation of the batch + the bucket/thread vocab)."""
+    return _MIGRATE_PROMPT_TEMPLATE.format(
+        ai_name=(ai_name or "我").strip(),
+        user_name=(user_name or "TA").strip(),
+        old_cards=old_cards or "（没有要升级的卡）",
+        vocab=vocab or "（暂无已有桶/线索）",
+    )
+
+
+def _extract_json_block(raw: str) -> str:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1] if text.count("```") >= 2 else text.strip("`")
+        if text.lstrip().lower().startswith("json"):
+            text = text.lstrip()[4:]
+    start = text.find("{")
+    if start < 0:
+        return ""
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return ""
+
+
+def parse_migrated_cards(raw: str, *, allowed_ids: set[str] | None = None) -> tuple[list[dict], str | None]:
+    """Parse the migration agent reply.
+
+    Returns (upgrades, error). Each upgrade is normalized and safe to hand to the
+    memory.upgrade path: {id, bucket, threads[], summary, content}. Rows are dropped
+    if they have no id, no usable content, or (when allowed_ids is given) an id that
+    wasn't in the batch — the agent must only upgrade cards it was handed, never
+    invent or retarget. A valid "nothing" reply yields ([], None).
+    """
+    import json
+
+    block = _extract_json_block(raw)
+    if not block:
+        return [], "no_json_object"
+    try:
+        doc = json.loads(block)
+    except (ValueError, TypeError) as e:
+        return [], f"json_decode_error:{type(e).__name__}"
+    if not isinstance(doc, dict):
+        return [], "not_an_object"
+    rows = doc.get("upgrades")
+    if not isinstance(rows, list):
+        return [], "missing_upgrades_list"
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        mid = str(row.get("id") or "").strip()
+        if not mid or mid in seen:
+            continue
+        if allowed_ids is not None and mid not in allowed_ids:
+            continue  # never upgrade a card outside this batch
+        summary = str(row.get("summary") or "").strip()[:2000]
+        content = str(row.get("content") or "").strip()
+        if not summary and not content:
+            continue  # empty result — skip rather than write a hollow card
+        threads_raw = row.get("threads")
+        threads = [str(t).strip()[:80] for t in threads_raw if str(t).strip()][:8] if isinstance(threads_raw, list) else []
+        seen.add(mid)
+        out.append({
+            "id": mid,
+            "bucket": str(row.get("bucket") or "").strip()[:80],
+            "threads": threads,
+            "summary": summary,
+            "content": content,
+        })
+    return out, None

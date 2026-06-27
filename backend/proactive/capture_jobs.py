@@ -19,6 +19,11 @@ CAPTURE_JOB_ID_PREFIX = "cap"
 CAPTURE_JOB_KIND_DREAM = "memory_dream"
 DREAM_JOB_SOURCE = "memory_dream"
 DREAM_JOB_ID_PREFIX = "dream"
+# Legacy-card migration lane (old card → v1). Same substrate as dream: a quiet-window
+# maintenance job, never a reach-out wake. The handler picks the batch at run time.
+CAPTURE_JOB_KIND_MIGRATE = "memory_migrate"
+MIGRATE_JOB_SOURCE = "memory_migrate"
+MIGRATE_JOB_ID_PREFIX = "migr"
 CAPTURE_ACTIVE_STATUSES = frozenset({"pending", "claimed", "realizing"})
 
 
@@ -40,8 +45,17 @@ def is_memory_dream_job(job: Mapping[str, Any] | None) -> bool:
     )
 
 
+def is_memory_migrate_job(job: Mapping[str, Any] | None) -> bool:
+    if not isinstance(job, Mapping):
+        return False
+    return (
+        str(job.get("job_kind") or "").strip() == CAPTURE_JOB_KIND_MIGRATE
+        or str(job.get("source") or "").strip() == MIGRATE_JOB_SOURCE
+    )
+
+
 def is_memory_maintenance_job(job: Mapping[str, Any] | None) -> bool:
-    return is_memory_capture_job(job) or is_memory_dream_job(job)
+    return is_memory_capture_job(job) or is_memory_dream_job(job) or is_memory_migrate_job(job)
 
 
 def _safe_window(window: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -94,6 +108,24 @@ def _find_active_capture(store: UserStore) -> dict | None:
 def _find_active_dream(store: UserStore) -> dict | None:
     for job in store.list_proactive_jobs(since_epoch=0, limit=0):
         if _active_dream_job(job):
+            return dict(job)
+    return None
+
+
+def _active_migrate_job(job: Mapping[str, Any]) -> bool:
+    return is_memory_migrate_job(job) and str(job.get("status") or "pending").strip().lower() in CAPTURE_ACTIVE_STATUSES
+
+
+def _find_migrate_by_key(store: UserStore, migrate_key: str) -> dict | None:
+    for job in store.list_proactive_jobs(since_epoch=0, limit=0):
+        if is_memory_migrate_job(job) and str(job.get("migrate_key") or "") == migrate_key:
+            return dict(job)
+    return None
+
+
+def _find_active_migrate(store: UserStore) -> dict | None:
+    for job in store.list_proactive_jobs(since_epoch=0, limit=0):
+        if _active_migrate_job(job):
             return dict(job)
     return None
 
@@ -206,6 +238,63 @@ def enqueue_memory_dream_job(
         dream_key=key,
         dream_until=dream_until,
         dream_stats=dream_stats,
+        not_before=not_before,
+        now=now,
+    )
+    return store.append_proactive_job(job), True, "enqueued"
+
+
+def make_memory_migrate_job(
+    *,
+    trigger: str,
+    migrate_key: str,
+    migrate_stats: Mapping[str, Any] | None = None,
+    not_before: float | None = None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    now_ts = time.time() if now is None else float(now)
+    not_before_ts = now_ts if not_before is None else float(not_before)
+    return {
+        "job_id": util._new_public_id(MIGRATE_JOB_ID_PREFIX),
+        "job_kind": CAPTURE_JOB_KIND_MIGRATE,
+        "source": MIGRATE_JOB_SOURCE,
+        "status": "pending",
+        "trigger": str(trigger or "quiet_window_migrate")[:120],
+        "migrate_key": str(migrate_key or "")[:240],
+        "migrate_stats": dict(migrate_stats or {}),
+        "not_before": not_before_ts,
+        "ts": now_ts,
+        "created_at": datetime.fromtimestamp(now_ts, timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+
+
+def enqueue_memory_migrate_job(
+    store: UserStore,
+    *,
+    trigger: str,
+    migrate_key: str,
+    migrate_stats: Mapping[str, Any] | None = None,
+    not_before: float | None = None,
+    now: float | None = None,
+) -> tuple[dict | None, bool, str]:
+    """Enqueue one legacy→v1 migration batch job if none equivalent/active exists.
+
+    Single-flight per user (one active migrate at a time) so batches run serially
+    and never race each other; the handler picks the next batch of legacy cards at
+    run time. Idempotent by migrate_key (e.g. the quiet-window day/window id)."""
+    key = str(migrate_key or "").strip()
+    if not key:
+        return None, False, "migrate_key_required"
+    existing_same_key = _find_migrate_by_key(store, key)
+    if existing_same_key is not None:
+        return existing_same_key, False, "duplicate_migrate_key"
+    active = _find_active_migrate(store)
+    if active is not None:
+        return active, False, "migrate_already_pending"
+    job = make_memory_migrate_job(
+        trigger=trigger,
+        migrate_key=key,
+        migrate_stats=migrate_stats,
         not_before=not_before,
         now=now,
     )
