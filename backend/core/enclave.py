@@ -83,17 +83,23 @@ def _get_enclave_info() -> dict | None:
         return None
 
 
-def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpose: str) -> bytes:
+def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpose: str,
+                                  runtime_token: str = "") -> bytes:
+    """Decrypt an envelope via the enclave. Auth = api_key (``X-API-Key``) or a
+    runtime token (``X-Feedling-Runtime-Token``, Stage-D zero-roster host-all where
+    the supervisor has no per-user api_key). The enclave accepts either; mirrors
+    agent_runtime.supervisor._auth_headers."""
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
         raise RuntimeError("enclave_unavailable")
-    if not api_key:
+    if not api_key and not runtime_token:
         raise RuntimeError("api_key_unavailable")
+    headers = {"X-Feedling-Runtime-Token": runtime_token} if runtime_token else {"X-API-Key": api_key}
     try:
         with httpx.Client(timeout=20, verify=False) as client:
             resp = client.post(
                 f"{enclave_url}/v1/envelope/decrypt",
-                headers={"X-API-Key": api_key},
+                headers=headers,
                 json={"envelope": envelope, "purpose": purpose},
             )
     except httpx.HTTPError as e:

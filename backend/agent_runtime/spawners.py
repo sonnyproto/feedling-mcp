@@ -233,15 +233,17 @@ def _persona_from_blob(blob, decrypt_fn) -> str:
         return ""
 
 
-def _genesis_persona_content(user_id: str, api_key: str | None = None) -> str:
+def _genesis_persona_content(user_id: str, api_key: str | None = None,
+                             runtime_token: str = "") -> str:
     """Host genesis voice/persona for this user (decrypted), or '' when absent.
 
     Persona is stored encrypted (db blob 'genesis_persona' → content_envelope);
-    decrypt it via the enclave at spawn so the agent boots as itself. '' on absent /
-    decrypt-error / token-only auth → tools-only append (today's behaviour). Local
-    imports keep this module pure-unit importable without DB/enclave deps. Seam:
-    Codex's genesis writes db.set_blob(user_id, 'genesis_persona',
-    {encrypted, content_envelope, sha256, ...}).
+    decrypt it via the enclave at spawn so the agent boots as itself. Auth = api_key
+    (base roster) OR ``runtime_token`` (Stage-D zero-roster host-all, no per-user
+    api_key — cutover gate 3 P0). '' on absent / decrypt-error / no-credential →
+    tools-only append. Local imports keep this module pure-unit importable without
+    DB/enclave deps. Seam: Codex's genesis writes db.set_blob(user_id,
+    'genesis_persona', {encrypted, content_envelope, sha256, ...}).
     """
     try:
         import db  # local import: avoid a module-level DB dep for pure-unit tests
@@ -252,7 +254,8 @@ def _genesis_persona_content(user_id: str, api_key: str | None = None) -> str:
 
     def _decrypt(env: dict) -> str:
         from core import enclave as core_enclave
-        raw = core_enclave._decrypt_envelope_via_enclave(env, api_key, purpose="genesis_persona")
+        raw = core_enclave._decrypt_envelope_via_enclave(
+            env, api_key, purpose="genesis_persona", runtime_token=runtime_token)
         return raw.decode("utf-8")
 
     return _persona_from_blob(blob, _decrypt)
@@ -366,7 +369,9 @@ class ProcessSpawner:
             codex_transport=_codex_transport(entry),
             gateway_base_url=os.environ.get("FEEDLING_LITELLM_BASE_URL", ""),
             model=str(entry.get("model") or ""),
-            persona_content=_genesis_persona_content(user_id, entry.get("api_key")),
+            persona_content=_genesis_persona_content(
+                user_id, entry.get("api_key"),
+                runtime_token=entry.get("runtime_token", "")),
         )
         for path, content in files.items():
             p = Path(path)

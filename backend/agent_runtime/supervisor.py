@@ -346,6 +346,12 @@ def _resolve_discovered(enabled: dict, *, mint_token, api_url: str, enclave_url:
                  "model": info.get("model", ""), "base_url": info.get("base_url", "")}
         if provider_key:
             entry["provider_key"] = provider_key
+        # Carry the freshly-minted runtime token so ProcessSpawner.spawn can decrypt
+        # the genesis_persona blob at spawn time (zero-roster has no api_key — cutover
+        # gate 3 P0). Minted before spawn (this tick), so timing is solved. Excluded
+        # from _spawn_identity, so per-tick rotation does not bounce the consumer.
+        if tok:
+            entry["runtime_token"] = tok
         out.append(entry)
     return out
 
