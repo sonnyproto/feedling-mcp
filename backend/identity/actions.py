@@ -24,8 +24,10 @@ def _identity_action_text(value, max_chars: int) -> str:
     return text[:max_chars].strip()
 
 
-def _identity_plain_for_action(store: UserStore, api_key: str | None) -> tuple[dict | None, str]:
-    data, err = core_enclave._enclave_get_json_for_gate("/v1/identity/get", api_key)
+def _identity_plain_for_action(store: UserStore, api_key: str | None,
+                               runtime_token: str = "") -> tuple[dict | None, str]:
+    data, err = core_enclave._enclave_get_json_for_gate(
+        "/v1/identity/get", api_key, runtime_token=runtime_token)
     if err:
         return None, err
     if not isinstance(data, dict) or not isinstance(data.get("identity"), dict):

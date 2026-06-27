@@ -13,17 +13,22 @@ import time
 import httpx
 
 
-def _enclave_get_json_for_gate(path: str, api_key: str | None, params: dict | None = None) -> tuple[dict | None, str]:
+def _enclave_get_json_for_gate(path: str, api_key: str | None, params: dict | None = None,
+                               *, runtime_token: str = "") -> tuple[dict | None, str]:
+    """Auth = api_key (``X-API-Key``) or a runtime token (``X-Feedling-Runtime-Token``,
+    Stage-D zero-roster host-all). The enclave accepts either; mirrors
+    agent_runtime.supervisor._auth_headers / _decrypt_envelope_via_enclave."""
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
         return None, "enclave_unavailable"
-    if not api_key:
+    if not api_key and not runtime_token:
         return None, "api_key_unavailable"
+    headers = {"X-Feedling-Runtime-Token": runtime_token} if runtime_token else {"X-API-Key": api_key}
     try:
         with httpx.Client(timeout=20, verify=False) as client:
             resp = client.get(
                 f"{enclave_url}{path}",
-                headers={"X-API-Key": api_key},
+                headers=headers,
                 params=params or {},
             )
         if resp.status_code >= 400:

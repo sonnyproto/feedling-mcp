@@ -180,6 +180,38 @@ def genesis_import_apply_outputs(job_id: str):
     except Exception as e:  # noqa: BLE001
         failed = service.mark_failed(store, job_id, f"apply_outputs_failed:{type(e).__name__}:{str(e)[:180]}")
         return jsonify(_job_response(failed, extra={"status": "failed", "error": str(e)[:240]})), 500
+
+
+@bp.route("/v1/genesis/persona_backfill", methods=["POST"])
+def genesis_persona_backfill():
+    """Cutover gate 4 B: backfill the persona/voice blob for a pre-genesis host user
+    from their existing identity record (NOT a transcript). Decrypts identity (auth =
+    api_key or runtime token), then run_persona_backfill assembles the material and
+    submits ONE genesis import job (source_kind=companion_persona_backfill → worker →
+    persona_build → genesis_persona blob). Idempotent + signal-gated inside
+    run_persona_backfill (no signal → no_signal; already in-flight → the existing job).
+    Triggered by the cutover batch and the supervisor lazy path."""
+    store = auth.require_user()
+    runtime_auth.authorize_scope("genesis")
+    api_key = auth._extract_api_key()
+    runtime_token = request.headers.get("X-Feedling-Runtime-Token", "")
+    from identity import actions as identity_actions
+    from genesis import persona_backfill
+    identity_plain, err = identity_actions._identity_plain_for_action(
+        store, api_key, runtime_token=runtime_token)
+    if identity_plain is None:
+        return _bad(err or "identity_unavailable", 409)
+    try:
+        job = persona_backfill.run_persona_backfill(store, identity_plain)
+    except Exception as e:  # noqa: BLE001
+        return _bad(f"persona_backfill_failed:{type(e).__name__}:{str(e)[:160]}", 500)
+    if job is None:
+        return jsonify({"status": "no_signal"}), 200  # nothing to backfill; Dream grows it
+    return jsonify({
+        "status": "enqueued",
+        "job_id": job.get("job_id"),
+        "job_status": job.get("status"),
+    }), 202
     job = db.genesis_get_job(store.user_id, job_id)
     return jsonify(_job_response(job, extra={"status": "done", "applied": applied})), 200
 
