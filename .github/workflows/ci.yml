@@ -80,6 +80,11 @@ jobs:
           FEEDLING_DATA_DIR: /tmp/feedling-data-ci
           FEEDLING_WS_PORT: "19998"
           DATABASE_URL: "postgresql://postgres:postgres@127.0.0.1:5432/feedling_ci"
+          # 收口后 backend 启动会校验托管前置三件套（assert_hosting_ready）。
+          # CI smoke 用占位值满足校验，让 backend 起得来——不连真 gateway/supervisor。
+          FEEDLING_LITELLM_ENABLE: "1"
+          FEEDLING_HOST_ALL: "1"
+          FEEDLING_RUNTIME_TOKEN_SECRET: "ci-smoke-secret"
         run: |
           mkdir -p "$FEEDLING_DATA_DIR"
           python backend/app.py > /tmp/backend.log 2>&1 &
