@@ -23,6 +23,7 @@ from accounts import auth
 import provider_client
 from chat import service as chat_service
 from hosted import agent_runtime_cutover
+import debug_trace
 from hosted import config_store as hosted_config_store
 from hosted import context as hosted_context
 from hosted import turn as hosted_turn
@@ -331,5 +332,10 @@ def model_api_chat_send():
     store.notify_chat_waiters()
 
     # image turn 不再被挡在 legacy；consumer 已能处理图片 envelope。
+    debug_trace.trace_event(
+        store, subsystem="route", type="route.decided", actor="host_agent_runtime",
+        summary="agent_runtime",
+        detail={"mode": "agent_runtime", "has_image": bool(has_image)},
+    )
     body, status = agent_runtime_cutover.handle_send(store, user_row, driver)
     return jsonify(body), status
