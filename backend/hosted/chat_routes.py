@@ -69,6 +69,7 @@ from accounts import auth
 from push import service as push_service
 import provider_client
 from hosted import agent_runtime_cutover
+import debug_trace
 from hosted import config_store as hosted_config_store
 from hosted import context as hosted_context
 from hosted import turn as hosted_turn
@@ -374,7 +375,17 @@ def model_api_chat_send():
     # rollback is just flipping the flag back.
     # Image turns stay on the legacy multimodal path (the runtime is text-only).
     _arc_driver = agent_runtime_cutover.resolve_driver(hosted_config_store._load_model_api_config(store))
-    if agent_runtime_cutover.should_route(_arc_driver, has_image=has_image):
+    _arc_route = agent_runtime_cutover.should_route(_arc_driver, has_image=has_image)
+    debug_trace.trace_event(
+        store, subsystem="route", type="route.decided", actor="host_agent_runtime",
+        summary="agent_runtime" if _arc_route else "legacy",
+        detail={
+            "mode": "agent_runtime" if _arc_route else "legacy",
+            "reason": "routed" if _arc_route else ("image" if has_image else "driver_legacy"),
+            "has_image": bool(has_image),
+        },
+    )
+    if _arc_route:
         _arc_body, _arc_status = agent_runtime_cutover.handle_send(store, user_row, _arc_driver)
         return jsonify(_arc_body), _arc_status
 

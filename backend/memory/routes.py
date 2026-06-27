@@ -10,6 +10,7 @@ from datetime import date, datetime
 from flask import jsonify, request
 
 import db
+import debug_trace
 from core.store import UserStore
 from flask import Blueprint, Response
 import threading
@@ -153,6 +154,12 @@ def memory_index():
         )
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 503
+    _items = response.get("items") if isinstance(response.get("items"), list) else []
+    debug_trace.trace_event(
+        store, subsystem="memory", type="memory.index.called", actor="agent",
+        summary=f"index returned {len(_items)} items",
+        detail={"counts": {"items": len(_items), "limit": requested_limit}},
+    )
     return jsonify(response)
 
 
@@ -175,6 +182,12 @@ def memory_fetch():
         return jsonify({"error": str(e)}), 503
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+    _items = response.get("items") if isinstance(response.get("items"), list) else []
+    debug_trace.trace_event(
+        store, subsystem="memory", type="memory.fetch.called", actor="agent",
+        summary=f"fetched {len(_items)}/{len(ids)} cards",
+        detail={"counts": {"requested": len(ids), "fetched": len(_items)}, "ids": ids[:20]},
+    )
     return jsonify(response)
 
 
@@ -245,6 +258,18 @@ def memory_actions():
     if not isinstance(actions, list):
         return jsonify({"error": "actions required"}), 400
     body, status = memory_actions_mod._execute_memory_actions(store, api_key, actions)
+    _types = [str(a.get("type") or a.get("action") or "") for a in actions if isinstance(a, dict)][:20]
+    _results = body.get("results") if isinstance(body.get("results"), list) else []
+    debug_trace.trace_event(
+        store, subsystem="memory", type="memory.write.actions", actor="agent",
+        status="ok" if status < 400 else "failed",
+        summary=f"{len(actions)} action(s): " + ",".join(t.split('.')[-1] for t in _types)[:80],
+        detail={
+            "counts": {"actions": len(actions)},
+            "types": _types,
+            "results": [str(r.get("skipped") or r.get("status") or "") for r in _results][:20],
+        },
+    )
     return jsonify(body), status
 
 

@@ -181,6 +181,18 @@ def genesis_import_apply_outputs(job_id: str):
         failed = service.mark_failed(store, job_id, f"apply_outputs_failed:{type(e).__name__}:{str(e)[:180]}")
         return jsonify(_job_response(failed, extra={"status": "failed", "error": str(e)[:240]})), 500
     job = db.genesis_get_job(store.user_id, job_id)
+    import debug_trace
+    _a = applied if isinstance(applied, dict) else {}
+    debug_trace.trace_event(
+        store, subsystem="genesis", type="genesis.outputs.applied", actor="backend",
+        job_id=job_id, summary="genesis outputs applied",
+        detail={
+            "source_kind": str((job or {}).get("source_kind") or ""),
+            "memory_action_count": _a.get("memory_action_count"),
+            "identity_status": str(_a.get("identity_status") or ""),
+            "persona_ref": str(_a.get("persona_ref") or ""),
+        },
+    )
     return jsonify(_job_response(job, extra={"status": "done", "applied": applied})), 200
 
 
