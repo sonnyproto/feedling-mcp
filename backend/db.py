@@ -1697,12 +1697,24 @@ def delete_user_data(user_id: str) -> None:
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
+                # Every table keyed by user_id must be listed here. When a
+                # migration adds a new per-user table, add it below or the
+                # account-reset path will silently orphan that user's rows.
+                # genesis_import_chunks/outputs cascade from genesis_import_jobs,
+                # but we delete them explicitly (children first) so the wipe
+                # stays correct even if those FK cascades are ever dropped.
                 for table in (
                     "chat_messages",
                     "memory_moments",
                     "frame_envelopes",
                     "user_logs",
                     "user_blobs",
+                    "perception_items",
+                    "perception_daily",
+                    "agent_runtime_instances",
+                    "genesis_import_chunks",
+                    "genesis_import_outputs",
+                    "genesis_import_jobs",
                 ):
                     conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
     except Exception as e:
