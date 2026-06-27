@@ -488,14 +488,19 @@ def _run_lazy_persona_backfill(roster: list[dict], *, secret_raw: str, owner: st
         if str(entry.get("persona_version") or ""):
             continue  # already has a persona blob → nothing to backfill
         uid = str(entry.get("user_id") or "")
-        if not uid or (now - _BACKFILL_ATTEMPTED.get(uid, 0.0)) < cooldown:
+        # `uid in dict` first so the very first attempt isn't skipped under a small
+        # test clock (now - 0.0 < cooldown); real time.time() never hits this.
+        if not uid or (uid in _BACKFILL_ATTEMPTED and now - _BACKFILL_ATTEMPTED[uid] < cooldown):
             continue
         _BACKFILL_ATTEMPTED[uid] = now  # record before the call so a failure still backs off
         try:
             token = runtime_token.mint(secret, user_id=uid, runtime_instance_id=owner,
                                        scope=["genesis", "envelope_decrypt"], ttl=300)
+            # Short timeout so a stuck backend can't wedge the tick (worst case =
+            # cap × timeout); the endpoint is normally fast. Backgrounding is a later
+            # hardening if this proves too tight under load.
             resp = httpx.post(f"{api_url.rstrip('/')}/v1/genesis/persona_backfill",
-                              headers={"X-Feedling-Runtime-Token": token}, timeout=15)
+                              headers={"X-Feedling-Runtime-Token": token}, timeout=5)
             log.info("persona backfill %s → http=%s %s", uid, resp.status_code, resp.text[:120])
         except Exception as e:  # noqa: BLE001
             log.warning("persona backfill POST failed for %s: %s", uid, e)

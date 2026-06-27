@@ -26,8 +26,13 @@ def _identity_action_text(value, max_chars: int) -> str:
 
 def _identity_plain_for_action(store: UserStore, api_key: str | None,
                                runtime_token: str = "") -> tuple[dict | None, str]:
-    data, err = core_enclave._enclave_get_json_for_gate(
-        "/v1/identity/get", api_key, runtime_token=runtime_token)
+    # Only pass runtime_token when present, so the api_key path keeps the original
+    # 2-arg call shape (mocks/monkeypatches that predate the runtime_token param).
+    if runtime_token:
+        data, err = core_enclave._enclave_get_json_for_gate(
+            "/v1/identity/get", api_key, runtime_token=runtime_token)
+    else:
+        data, err = core_enclave._enclave_get_json_for_gate("/v1/identity/get", api_key)
     if err:
         return None, err
     if not isinstance(data, dict) or not isinstance(data.get("identity"), dict):
