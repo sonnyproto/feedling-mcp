@@ -1,5 +1,6 @@
 """Memory write actions (add / patch / retype / delete) + executor."""
 
+import hashlib
 import json
 import os
 import re
@@ -484,6 +485,100 @@ def _memory_content_patch_action(store: UserStore, api_key: str | None, action: 
     }, [_memory_action_effect("memory.content_patch", memory_id, changed)], 200
 
 
+def _memory_body_hash(moment: dict | None) -> str:
+    """Stable CAS token = sha256 of the stored ciphertext. `to_v1_card` never
+    looks inside `body_ct`, so this is invariant across reads until a genuine
+    re-encrypt — exactly what a read-modify-write needs to detect concurrent edits."""
+    return hashlib.sha256(str((moment or {}).get("body_ct") or "").encode("utf-8")).hexdigest()
+
+
+def _memory_upgrade_apply(
+    store: UserStore,
+    *,
+    memory_id: str,
+    envelope: dict,
+    old_body_hash: str,
+) -> tuple[dict, list[dict], int]:
+    """In-place legacy→v1 upgrade writer (migration plan §3 / §5.5).
+
+    Re-reads the single card fresh INSIDE `memory_lock`, CAS-guards on
+    `old_body_hash` (skip if the user edited it during the out-of-lock LLM
+    derivation), then writes one row via `db.memory_upsert` — NOT
+    `_save_moments`/`memory_replace_all`, so a concurrent new card is never
+    clobbered. Preserves id/created_at/occurred_at/source; emits clean v1
+    (no `type`). The LLM/encryption happens in the caller, never under the lock."""
+    with store.memory_lock:
+        moments = memory_service._load_moments(store)
+        existing = next((m for m in moments if isinstance(m, dict) and m.get("id") == memory_id), None)
+        if existing is None:
+            # Card deleted while we derived — don't resurrect it.
+            return {"status": "ok", "action": "memory.upgrade", "skipped": "not_found", "noop": True}, [], 200
+        if existing.get("owner_user_id") != store.user_id:
+            return {"status": "error", "error": "not_owned", "action": "memory.upgrade"}, [], 403
+        if old_body_hash and _memory_body_hash(existing) != old_body_hash:
+            # Changed under us during derivation — leave the user's write intact;
+            # the migrator re-detects this card by shape next quiet window.
+            return {"status": "ok", "action": "memory.upgrade", "skipped": "stale", "noop": True}, [], 200
+        envelope = dict(envelope)
+        envelope["occurred_at"] = str(existing.get("occurred_at") or envelope.get("occurred_at") or core_util._now_iso())
+        envelope["source"] = str(existing.get("source") or envelope.get("source") or "live_conversation")
+        for key in ("status", "importance", "pulse", "last_referenced_at", "is_sensitive", "sensitivity_class"):
+            if key not in envelope and key in existing:
+                envelope[key] = existing[key]
+        updated = _memory_record_from_envelope(store, envelope, existing=existing)
+        updated.pop("type", None)  # clean v1 inner carries no `type`
+        db.memory_upsert(store.user_id, memory_id, updated.get("occurred_at") or "", updated)
+    change = memory_service._append_memory_change(store, {
+        "action": "upgrade",
+        "memory_id": memory_id,
+        "reason": "Legacy memory card upgraded to v1 in place.",
+    })
+    effect = _memory_action_effect("memory.upgrade", memory_id, ["body_ct", "bucket", "threads", "summary"])
+    return {
+        "status": "ok",
+        "action": "memory.upgrade",
+        "memory": {"id": memory_id, "occurred_at": updated.get("occurred_at", "")},
+        "change": change,
+    }, [effect], 200
+
+
+def _memory_upgrade_action(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
+    """Plaintext upgrade entry: agent supplies the derived v1 fields
+    (summary/content/bucket/threads); the server seals them (it already holds
+    the shared public keys, same as content_patch) and writes in place."""
+    memory_id = _memory_action_text(action.get("id") or action.get("memory_id"), 160)
+    if not memory_id:
+        return {"status": "error", "error": "memory_id_required", "action": "memory.upgrade"}, [], 400
+    v1 = action.get("v1") if isinstance(action.get("v1"), dict) else action
+    inner = _memory_inner_from_action(v1)
+    if not inner.get("summary"):
+        return {"status": "error", "error": "summary_required", "action": "memory.upgrade"}, [], 400
+    old_body_hash = _memory_action_text(action.get("old_body_hash"), 80)
+    envelope, env_err = _build_memory_envelope_for_store(store, inner, item_id=memory_id)
+    if envelope is None:
+        return {"status": "error", "error": env_err, "action": "memory.upgrade"}, [], 409
+    return _memory_upgrade_apply(store, memory_id=memory_id, envelope=envelope, old_body_hash=old_body_hash)
+
+
+def _memory_upgrade_envelope_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
+    """Prebuilt-envelope upgrade entry: the consumer (VPS io_cli, stdlib-only
+    crypto per D1) already sealed the v1 plaintext; the server just CAS-guards
+    and writes the single row in place."""
+    memory_id = _memory_action_text(action.get("id") or action.get("memory_id"), 160)
+    if not memory_id:
+        return {"status": "error", "error": "memory_id_required", "action": "memory.upgrade"}, [], 400
+    envelope = dict(action.get("envelope") or {})
+    missing = [f for f in ("body_ct", "nonce", "K_user", "visibility", "owner_user_id") if not envelope.get(f)]
+    if missing:
+        return {"status": "error", "error": "envelope_missing_fields", "missing": missing, "action": "memory.upgrade"}, [], 400
+    if envelope["owner_user_id"] != store.user_id:
+        return {"status": "error", "error": "not_owned", "action": "memory.upgrade"}, [], 403
+    if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
+        return {"status": "error", "error": "envelope_shared_requires_K_enclave", "action": "memory.upgrade"}, [], 400
+    old_body_hash = _memory_action_text(action.get("old_body_hash"), 80)
+    return _memory_upgrade_apply(store, memory_id=memory_id, envelope=envelope, old_body_hash=old_body_hash)
+
+
 def _memory_retype_action(store: UserStore, action: dict) -> tuple[dict, list[dict], int]:
     memory_id = _memory_action_text(action.get("id") or action.get("memory_id"), 160)
     new_type = str(action.get("new_type") or action.get("memory_type") or action.get("to_type") or "").strip().lower()
@@ -775,13 +870,19 @@ def _execute_memory_action(store: UserStore, api_key: str | None, action: dict) 
         return _memory_retype_action(store, action)
     if action_type == "memory.supersede":
         return _memory_supersede_action(store, api_key, action)
+    if action_type == "memory.upgrade":
+        # In-place legacy→v1 upgrade (migration). Its OWN branch — must never be
+        # rewritten to supersede (that mints a new id; upgrade preserves id).
+        if isinstance(action.get("envelope"), dict):
+            return _memory_upgrade_envelope_action(store, action)
+        return _memory_upgrade_action(store, api_key, action)
     if action_type == "memory.delete":
         return _memory_delete_action(store, action)
     return {
         "status": "error",
         "error": "unsupported_memory_action",
         "action": action_type,
-        "supported": ["memory.add", "memory.supersede", "memory.delete", "memory.retype"],
+        "supported": ["memory.add", "memory.supersede", "memory.upgrade", "memory.delete", "memory.retype"],
     }, [], 400
 
 
