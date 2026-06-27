@@ -76,6 +76,7 @@ from accounts import registry as accounts_registry
 from core import config as core_config
 import admin as admin_pkg
 import hosted as hosted_pkg
+from hosted import agent_runtime_cutover as hosted_agent_runtime_cutover
 from hosted import chat_routes as hosted_chat_routes
 from hosted import config_store as hosted_config_store
 from hosted import context as hosted_context
@@ -885,6 +886,13 @@ for _mod in (hosted_config_store, hosted_context, hosted_history_import,
 
 
 if __name__ == "__main__":
+    # Fail-fast: gateway-only codex providers (gemini/openrouter/openai_compatible)
+    # have no consumer spawned unless the in-CVM LiteLLM gateway is up; starting
+    # without it would silently wedge those users in "processing". Validate here
+    # so the problem surfaces immediately on launch rather than at request time.
+    # NOTE: gunicorn/wsgi path does not run __main__; that production entry point
+    # runs the same check via backend/gunicorn_conf.py's on_starting hook.
+    hosted_agent_runtime_cutover.assert_hosting_ready()
     # PORT is read so isolation/load tests can spin up a hermetic backend on
     # a random free port without colliding with a developer's local dev
     # server on 5001 (or with another test running in parallel). Production

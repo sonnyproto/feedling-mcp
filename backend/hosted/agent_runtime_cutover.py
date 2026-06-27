@@ -19,9 +19,15 @@ import logging
 import os
 import time
 
+import db
 import provider_client
 
 log = logging.getLogger("feedling.hosted.agent_runtime_cutover")
+
+# Wedge guard: how stale the supervisor heartbeat may be before the backend
+# treats hosting as down. Generous (≈6 ticks at the 15s default) so a brief
+# supervisor restart doesn't 503 sends. Env-overridable for slow deployments.
+_SUPERVISOR_HEARTBEAT_MAX_AGE_SEC = 90.0
 
 # The agent driver is DERIVED from the provider, never user-chosen: each CLI is
 # locked to a wire format (Claude Code = Anthropic Messages, Codex = OpenAI
@@ -38,15 +44,6 @@ _CODEX_NATIVE_PROVIDERS = {"openai"}
 # Codex-driven providers reachable today (native or via gateway). A provider not
 # here and not in _CLAUDE_PROVIDERS has no hosted fit → ``legacy``.
 _CODEX_PROVIDERS = {"openai", "gemini", "openrouter", "openai_compatible"}
-# Values of ``agent_runtime_driver`` that mean "hosted runtime OFF" (legacy
-# inline path). Anything else is the enable flag — the WHICH-agent decision is
-# then derived from the provider, so a stale "claude"/"codex" still resolves
-# correctly for the configured key.
-_OFF_FLAGS = {"", "legacy", "off", "false", "0", "no", "disabled"}
-# Explicit opt-out values (the OFF flags minus the unset case). Under host-all,
-# an unset flag means default-ON, so only these explicit values force legacy.
-_OPT_OUT_FLAGS = _OFF_FLAGS - {""}
-
 
 def driver_for_provider(provider: str) -> str:
     """The agent driver for a provider key — auto-derived, NOT user-chosen.
@@ -73,71 +70,107 @@ def codex_transport(provider: str) -> str:
     return "native" if p in _CODEX_NATIVE_PROVIDERS else "gateway"
 
 
-def hosting_enabled(config: dict | None) -> bool:
-    """Whether the hosted agent runtime is turned on for this user (the gradual
-    -rollout gate). The agent itself is still derived from the provider."""
-    if not isinstance(config, dict):
-        return False
-    return str(config.get("agent_runtime_driver") or "").strip().lower() not in _OFF_FLAGS
+class UnsupportedProviderError(Exception):
+    """provider 未配置或无 agent fit，无法托管到 agent-runner。"""
 
 
-def gateway_enabled() -> bool:
-    """Whether the in-CVM LiteLLM gateway is enabled in this deployment
-    (``FEEDLING_LITELLM_ENABLE``). Must mirror the agent-runner supervisor's flag:
-    gateway-only providers have no consumer spawned unless the gateway is up, so
-    the cutover decision must match or sends wedge in ``processing``."""
-    return os.environ.get("FEEDLING_LITELLM_ENABLE", "").strip().lower() in ("1", "true", "yes")
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
 
 
-def host_all_enabled() -> bool:
-    """Whether this deployment hosts every configured user by default
-    (``FEEDLING_HOST_ALL``) instead of requiring the per-user enable flag. Must
-    mirror the supervisor's ``host_all`` discovery — otherwise the send routing
-    and whether a consumer exists disagree, wedging the turn in ``processing``."""
-    return os.environ.get("FEEDLING_HOST_ALL", "").strip().lower() in ("1", "true", "yes")
+def assert_hosting_ready() -> None:
+    """进程启动时校验托管前置齐全，否则 fail-fast。
+
+    收口后 backend 把配了 fit provider 的用户无条件路由到 agent-runner (resolve_driver)。
+    这些用户只有在 supervisor 的 host-all 发现激活时才会被 spawn consumer——host-all 激活需
+    FEEDLING_HOST_ALL + FEEDLING_RUNTIME_TOKEN_SECRET (supervisor host_all_active)；gateway-only
+    codex 还需 FEEDLING_LITELLM_ENABLE。任一缺失即启动失败，避免请求被路由却无 consumer 而永远
+    卡在 processing。须与 supervisor 的 host_all_active / gateway 判定保持一致。"""
+    missing = []
+    if not _env_truthy("FEEDLING_LITELLM_ENABLE"):
+        missing.append("FEEDLING_LITELLM_ENABLE")
+    if not _env_truthy("FEEDLING_HOST_ALL"):
+        missing.append("FEEDLING_HOST_ALL")
+    if not os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").strip():
+        missing.append("FEEDLING_RUNTIME_TOKEN_SECRET")
+    if missing:
+        raise RuntimeError(
+            "托管前置缺失：" + ", ".join(missing) +
+            "。收口后所有用户走 agent-runner；缺这些 supervisor 不会 spawn consumer、"
+            "请求会卡在 processing。请在 backend 与 agent-runner 两侧设置后再启动。"
+        )
 
 
-def resolve_driver(config: dict | None, *, default: str = "legacy") -> str:
-    """The driver for this user's turn: ``legacy`` unless hosting is enabled, then
-    the agent derived from the configured provider (``claude``/``codex``), or
-    ``legacy`` if the provider has no hosted-agent fit.
+def resolve_driver(config: dict | None) -> str:
+    """该用户该走的 agent driver：``claude`` 或 ``codex``。
 
-    Two enable modes: by default a per-user flag (``agent_runtime_driver``) must
-    be on (gradual rollout). Under host-all (``FEEDLING_HOST_ALL``) every
-    configured provider is hosted by default; only an explicit per-user opt-out
-    (``agent_runtime_driver`` set to a legacy/off value) stays ``legacy``.
-
-    Gateway-only codex providers (gemini/openrouter/openai_compatible) stay
-    ``legacy`` until the LiteLLM gateway is enabled — otherwise no consumer runs
-    for them and the send would hang in ``processing`` instead of using the legacy
-    inline path. Native openai codex is unaffected."""
-    if host_all_enabled():
-        flag = str((config or {}).get("agent_runtime_driver") or "").strip().lower()
-        if flag in _OPT_OUT_FLAGS:        # explicit per-user opt-out
-            return default
-        # otherwise default-ON → fall through to derive from provider
-    elif not hosting_enabled(config):
-        return default
+    配了能 fit 的 provider 即托管（等价于 host-all 永远 on，无 per-user 开关、
+    无 gateway 回退）。无法托管时 raise ``UnsupportedProviderError``。"""
     provider = str((config or {}).get("provider") or "")
     driver = driver_for_provider(provider)
-    if driver == "codex" and codex_transport(provider) == "gateway" and not gateway_enabled():
-        return default
+    if driver not in ("claude", "codex"):
+        raise UnsupportedProviderError(provider or "unconfigured")
     return driver
 
 
-def is_enabled(driver: str) -> bool:
-    """True when the agent runtime (not legacy inline) should handle the turn."""
-    return driver in ("claude", "codex")
+def _heartbeat_max_age() -> float:
+    raw = os.environ.get("FEEDLING_SUPERVISOR_HEARTBEAT_MAX_AGE_SEC", "").strip()
+    if not raw:
+        return _SUPERVISOR_HEARTBEAT_MAX_AGE_SEC
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return _SUPERVISOR_HEARTBEAT_MAX_AGE_SEC
 
 
-def should_route(driver: str, *, has_image: bool) -> bool:
-    """Whether this send should go to the agent runtime.
+def evaluate_supervisor_heartbeat(
+    hb: dict | None, *, now: float, max_age: float, require_gateway: bool = True
+) -> tuple[bool, str]:
+    """Pure verdict on whether a supervisor is actively hosting, from its
+    heartbeat dict. Returns ``(live, reason)``; ``reason`` is "" when live.
 
-    Image turns stay on the legacy multimodal path: the consumer decrypts each
-    polled envelope as UTF-8 text, so an image envelope would fail to process.
-    Route only enabled, text-only turns until the runtime handles images.
-    """
-    return is_enabled(driver) and not has_image
+    Not-live cases (the turn would park in ``processing`` with no consumer): no
+    heartbeat at all, a malformed/absent ts, a stale heartbeat (supervisor dead
+    or wedged), or host-all turned off on the supervisor side (the cross-service
+    config divergence the backend's startup ``assert_hosting_ready`` cannot see).
+
+    The ``gateway`` flag is only checked when ``require_gateway=True`` (the
+    default). Pass ``require_gateway=False`` for providers that do not route
+    through the in-CVM LiteLLM gateway (e.g. anthropic, deepseek via claude
+    driver, openai via codex-native) — those users must not be blocked just
+    because the supervisor's gateway happens to be off."""
+    if not isinstance(hb, dict):
+        return (False, "no_supervisor_heartbeat")
+    try:
+        ts = float(hb.get("ts") or 0)
+    except (TypeError, ValueError):
+        return (False, "bad_supervisor_heartbeat")
+    if ts <= 0:
+        return (False, "bad_supervisor_heartbeat")
+    age = now - ts
+    if age > max_age:
+        return (False, f"stale_supervisor_heartbeat_{int(age)}s")
+    if not hb.get("host_all"):
+        return (False, "supervisor_host_all_inactive")
+    if require_gateway and not hb.get("gateway"):
+        return (False, "supervisor_gateway_disabled")
+    return (True, "")
+
+
+def check_supervisor_live(*, require_gateway: bool = True, now: float | None = None) -> tuple[bool, str]:
+    """Read the supervisor heartbeat and evaluate it. Fail-OPEN on a DB error —
+    the guard must never become a new outage vector; only a heartbeat that is
+    present-and-not-live (or definitively absent) blocks a send.
+
+    Pass ``require_gateway=False`` for providers that do not route through the
+    in-CVM LiteLLM gateway so they are not blocked by a gateway-off heartbeat."""
+    now = time.time() if now is None else now
+    try:
+        hb = db.read_supervisor_heartbeat()
+    except Exception as e:  # noqa: BLE001 — DB hiccup → don't block sends
+        log.warning("supervisor heartbeat read failed; routing send anyway (fail-open): %s", e)
+        return (True, "")
+    return evaluate_supervisor_heartbeat(hb, now=now, max_age=_heartbeat_max_age(), require_gateway=require_gateway)
 
 
 def _is_assistant(row: dict) -> bool:

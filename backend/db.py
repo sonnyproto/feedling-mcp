@@ -26,6 +26,7 @@ behavior identical to the file era. Read helpers return empty/None on failure.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -191,6 +192,37 @@ def set_config(key: str, value: bytes) -> None:
             "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
             (key, value),
         )
+
+
+# The agent-runner supervisor heartbeats here each tick; the backend's
+# /v1/model_api/chat/send wedge guard reads it to confirm a supervisor is
+# actually hosting before routing a turn into the agent-runner (else the turn
+# would park in "processing" with no consumer to answer it).
+AGENT_RUNTIME_SUPERVISOR_HEARTBEAT_KEY = "agent_runtime_supervisor_heartbeat"
+
+
+def set_supervisor_heartbeat(payload: dict) -> None:
+    """Upsert the supervisor's global heartbeat (JSON in server_config)."""
+    set_config(AGENT_RUNTIME_SUPERVISOR_HEARTBEAT_KEY,
+               json.dumps(payload).encode("utf-8"))
+
+
+def read_supervisor_heartbeat() -> dict | None:
+    """Return the parsed supervisor heartbeat, or None when the row is absent or
+    malformed. Raises on a DB/connection error so the caller can fail-open rather
+    than mistake an outage for "no supervisor" (which would 503 every send)."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT value FROM server_config WHERE key = %s",
+            (AGENT_RUNTIME_SUPERVISOR_HEARTBEAT_KEY,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        obj = json.loads(bytes(row[0]))
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 # ---------------------------------------------------------------------------
@@ -665,44 +697,22 @@ def set_blob(user_id: str, kind: str, doc) -> None:
         log.error("[db] set_blob(%s,%s) failed: %s", user_id, kind, e)
 
 
-def list_agent_runtime_enabled_users(include_gateway: bool = False,
-                                     host_all: bool = False) -> list[dict]:
-    """Users opted into the hosted agent runtime (Stage C auto-discovery).
-
-    A ``model_api`` config that is tested-ok and has hosting enabled
-    (``agent_runtime_driver`` set to anything other than legacy/off, via POST
-    /v1/model_api/driver). The agent is DERIVED from the provider, never chosen
-    (keep this CASE in sync with hosted/agent_runtime_cutover.driver_for_provider):
-    anthropic/deepseek → claude; openai → codex (native). The gateway-only
-    providers (gemini/openrouter/openai_compatible → codex via the in-CVM LiteLLM
-    gateway) are returned ONLY when ``include_gateway`` is set — i.e. when the
-    supervisor has the LiteLLM gateway enabled. Otherwise they're excluded so a
-    user who flipped hosting on for such a provider stays inert (legacy) instead
-    of being spawned against a gateway that isn't running.
-
-    ``host_all`` (FEEDLING_HOST_ALL) flips the enable semantics to default-ON: a
-    tested-ok provider config is discovered WITHOUT the per-user flag; only an
-    EXPLICIT opt-out (``agent_runtime_driver`` set to a legacy/off value) is
-    excluded. Default (``host_all=False``) keeps the gradual-rollout gate — the
-    flag must be explicitly set. Mirror this with cutover.host_all_enabled().
-    Returns ``[{"user_id", "driver", "provider", "model", "base_url"}]`` sorted by
-    user_id. The supervisor reads this directly (it already holds a DB pool for
-    leases) to discover who to run instead of a static roster."""
+def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict]:
+    """配了能 fit 的 provider 且 test_status='ok' 的用户都纳入托管（与
+    hosted/agent_runtime_cutover.resolve_driver 一致——不再有 per-user
+    ``agent_runtime_driver`` 开关；kill switch 改用删 config 或改 test_status）。
+    AGENT 由 provider 派生（保持 CASE 与 cutover.driver_for_provider 同步）：
+    anthropic/deepseek → claude；openai → codex (native)。gateway-only provider
+    (gemini/openrouter/openai_compatible → codex via LiteLLM gateway) 仅当
+    ``include_gateway`` 时返回（gateway 关时不发现，避免 spawn 到不存在的 proxy）。
+    Returns [{"user_id","driver","provider","model","base_url"}] sorted by user_id。"""
     providers = ["anthropic", "claude", "deepseek", "openai"]
     if include_gateway:
         providers += ["gemini", "openrouter", "openai_compatible"]
-    if host_all:
-        # default-ON: unset/'' is included; only an explicit legacy/off opts out.
-        enable_clause = ("AND LOWER(COALESCE(doc->>'agent_runtime_driver', '')) "
-                         "NOT IN ('legacy', 'off', 'false', '0', 'no', 'disabled')")
-    else:
-        # gradual-rollout gate: the flag must be explicitly enabled (unset → out).
-        enable_clause = ("AND LOWER(COALESCE(doc->>'agent_runtime_driver', 'legacy')) "
-                         "NOT IN ('', 'legacy', 'off', 'false', '0', 'no', 'disabled')")
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
-                f"""
+                """
                 SELECT user_id,
                   CASE LOWER(COALESCE(doc->>'provider', ''))
                     WHEN 'anthropic' THEN 'claude'
@@ -716,7 +726,6 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False,
                 FROM user_blobs
                 WHERE kind = 'model_api'
                   AND COALESCE(doc->>'test_status', '') = 'ok'
-                  {enable_clause}
                   AND LOWER(COALESCE(doc->>'provider', '')) = ANY(%s)
                 ORDER BY user_id
                 """,

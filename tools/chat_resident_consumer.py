@@ -4835,7 +4835,12 @@ def _process_messages(messages: list) -> float:
                     "routing honest image-unavailable prompt",
                     ts,
                 )
-            content = IMAGE_PLACEHOLDER
+            # Preserve the user's text caption — enclave history now decrypts and
+            # fills `content` for captioned image turns ("what is wrong here?").
+            # Only fall back to the placeholder when there is genuinely no text,
+            # otherwise the agent gets the attachment but loses the actual prompt.
+            if not content:
+                content = IMAGE_PLACEHOLDER
         elif not content:
             # Genuinely empty text — decrypt source missing or failed.
             # Never send a fallback for content we cannot read.

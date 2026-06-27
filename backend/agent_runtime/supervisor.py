@@ -276,21 +276,16 @@ def _resolve_roster(roster: list[dict]) -> list[dict]:
     return resolved
 
 
-def _discover_enabled(include_gateway: bool = False, host_all: bool = False) -> dict[str, dict]:
-    """Map ``user_id -> {"driver", "provider"}`` for users opted into the hosted
-    runtime (Stage C), read straight from the DB the supervisor already connects
-    to for leases. The provider + model + base_url ride along so a codex user can
-    be wired native (openai) vs LiteLLM-gateway (gemini/openrouter/…) at spawn, and
-    the gateway routing can be built per user. ``include_gateway`` mirrors whether
-    the LiteLLM gateway is running — when off, gateway-only providers are excluded
-    so they aren't spawned against a proxy that isn't there. ``host_all`` mirrors
-    FEEDLING_HOST_ALL: it discovers every configured user (no per-user flag), so the
-    set matches what the backend cutover routes to hosted — otherwise unflagged
-    users would be routed to a consumer that was never spawned."""
+def _discover_enabled(include_gateway: bool = False) -> dict[str, dict]:
+    """Map ``user_id -> {"driver", "provider", "model", "base_url"}`` for users
+    whose ``model_api`` config is test_ok and uses a fit provider (Stage C+).
+    No per-user flag required — aligned with hosted/agent_runtime_cutover.resolve_driver.
+    ``include_gateway`` mirrors whether the LiteLLM gateway is running — when off,
+    gateway-only providers are excluded so they aren't spawned against a proxy that
+    isn't there."""
     return {u["user_id"]: {"driver": u["driver"], "provider": u.get("provider", ""),
                            "model": u.get("model", ""), "base_url": u.get("base_url", "")}
-            for u in db.list_agent_runtime_enabled_users(include_gateway=include_gateway,
-                                                         host_all=host_all)}
+            for u in db.list_agent_runtime_enabled_users(include_gateway=include_gateway)}
 
 
 def _apply_discovery(roster: list[dict], enabled: dict[str, dict]) -> list[dict]:
@@ -641,6 +636,14 @@ def _genesis_worker_loop(*, api_url, enclave_url, mint_genesis, interval, stop_e
         stop_event.wait(interval)
 
 
+def _supervisor_heartbeat_payload(owner: str, *, host_all: bool, gateway: bool, ts: float) -> dict:
+    """Global heartbeat the backend's wedge guard reads. ``host_all``/``gateway``
+    let the backend detect the cross-service config divergence (supervisor up but
+    not actually hosting / gateway off) that its own startup check can't see."""
+    return {"ts": float(ts), "owner": str(owner),
+            "host_all": bool(host_all), "gateway": bool(gateway)}
+
+
 def main() -> int:
     logging.basicConfig(
         level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -752,11 +755,21 @@ def main() -> int:
     try:
         while True:
             try:
+                # Heartbeat first each tick: the backend's /v1/model_api/chat/send
+                # wedge guard reads this to confirm a supervisor is actually
+                # hosting before routing a turn here. Best-effort — a write blip
+                # must not kill the supervision loop.
+                try:
+                    db.set_supervisor_heartbeat(_supervisor_heartbeat_payload(
+                        owner, host_all=host_all_active, gateway=gateway_enabled,
+                        ts=time.time()))
+                except Exception as e:  # noqa: BLE001
+                    log.warning("supervisor heartbeat write failed: %s", e)
                 # Re-derive the live roster each tick so enabling/disabling a user
                 # (or the gateway) takes effect without restarting the supervisor.
                 discovered = None
                 if host_all_active:
-                    enabled = _discover_enabled(include_gateway=gateway_enabled, host_all=True)
+                    enabled = _discover_enabled(include_gateway=gateway_enabled)
                     discovered = _resolve_discovered(
                         enabled, mint_token=mint_token, api_url=api_url,
                         enclave_url=enclave_url, cache=cred_cache)
