@@ -23,27 +23,35 @@ def _reset(monkeypatch, store):
     return blobs
 
 
-def test_deploy_off_is_total_noop(monkeypatch):
+def test_flag_off_is_noop_no_env_needed(monkeypatch):
     store = _Store()
     blobs = _reset(monkeypatch, store)
-    monkeypatch.delenv("FEEDLING_V1_FLOW_TRACE", raising=False)  # prod default = off
-    # even with the per-user flag "on", deploy-off means nothing records
-    debug_trace.set_enabled(store, True)
+    monkeypatch.delenv("FEEDLING_V1_FLOW_TRACE", raising=False)  # no env set (default)
+    # per-user toggle is the gate: off → nothing records, nothing written
     debug_trace.trace_event(store, subsystem="route", type="route.decided", summary="x")
     assert debug_trace.is_enabled(store) is False
     assert debug_trace.read_trace(store) == []
-    # no trace buffer was ever written
     assert (store.user_id, debug_trace.DEBUG_TRACE_BLOB) not in blobs
 
 
-def test_records_only_when_deploy_and_user_flag_on(monkeypatch):
+def test_env_zero_hard_disables_even_with_flag_on(monkeypatch):
     store = _Store()
     _reset(monkeypatch, store)
-    monkeypatch.setenv("FEEDLING_V1_FLOW_TRACE", "1")  # test deploy
-    # deploy on but user flag off → still no-op
+    monkeypatch.setenv("FEEDLING_V1_FLOW_TRACE", "0")  # prod kill switch
+    debug_trace.set_enabled(store, True)  # user toggled on, but...
+    debug_trace.trace_event(store, subsystem="route", type="route.decided")
+    assert debug_trace.is_enabled(store) is False
+    assert debug_trace.read_trace(store) == []
+
+
+def test_records_when_flag_on_no_env_needed(monkeypatch):
+    store = _Store()
+    _reset(monkeypatch, store)
+    monkeypatch.delenv("FEEDLING_V1_FLOW_TRACE", raising=False)  # no env — toggle is the gate
+    # flag off → no-op
     debug_trace.trace_event(store, subsystem="route", type="route.decided")
     assert debug_trace.read_trace(store) == []
-    # user opens the debug panel toggle → now it records
+    # user opens the debug panel toggle → now it records (no env/redeploy needed)
     debug_trace.set_enabled(store, True)
     debug_trace.trace_event(store, subsystem="route", type="route.decided",
                             summary="host", detail={"mode": "agent_runtime", "reason": "text"})

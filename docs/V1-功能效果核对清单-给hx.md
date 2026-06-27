@@ -5,7 +5,7 @@
 > 这不是"点哪个按钮",是"这个 v1 功能跑出来对不对"。老卡迁移单独一份、最后核。
 
 > 📊 **客观验证(别只凭感觉)**:DebugTool 里开 **"v1 flow trace"** 开关 → 走流程 → 进 **"查看 v1 flow trace"** 面板,看有没有出现下面带 📊 的事件 = 链路客观跑过。
-> 前提:test 部署上 `FEEDLING_V1_FLOW_TRACE` 开着(面板顶部会提示关没关)。当前 M0 只埋了 **route / genesis / memory** 三组,voice/proactive 等暂时还是行为观测(后续补埋)。
+> **开关就是闸,翻开即用,不用改任何后端 env / 不用重新部署。**(只有当 prod 被 `FEEDLING_V1_FLOW_TRACE=0` 硬关时面板才提示。)当前 M0 只埋了 **route / genesis / memory** 三组,voice/proactive 等暂时还是行为观测(后续补埋)。
 
 ---
 
