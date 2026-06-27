@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import io
 import itertools
+import json
 import sys
 from pathlib import Path
 
@@ -56,28 +58,48 @@ def _admin_headers() -> dict[str, str]:
     return {"X-Admin-Token": "admin-test-token"}
 
 
+def _upload(client, api_key, content: bytes, meta: dict | None = None):
+    """POST a multipart file upload to the diagnostics endpoint."""
+    data = {"file": (io.BytesIO(content), "diagnostics.log")}
+    if meta is not None:
+        data["meta"] = json.dumps(meta)
+    return client.post(
+        "/v1/diagnostics/logs",
+        data=data,
+        content_type="multipart/form-data",
+        headers=_headers(api_key),
+    )
+
+
 def test_storage_disabled_without_env():
     assert diag_storage.enabled() is False
 
 
 def test_upload_requires_auth(client):
-    res = client.post("/v1/diagnostics/logs", json={"content": "hi"})
+    res = client.post(
+        "/v1/diagnostics/logs",
+        data={"file": (io.BytesIO(b"hi"), "diagnostics.log")},
+        content_type="multipart/form-data",
+    )
     assert res.status_code == 401
 
 
-def test_upload_rejects_empty_content(client):
+def test_upload_rejects_missing_file(client):
     _, api_key = _register(client)
-    res = client.post("/v1/diagnostics/logs", json={"content": ""}, headers=_headers(api_key))
+    res = client.post("/v1/diagnostics/logs", data={}, headers=_headers(api_key))
+    assert res.status_code == 400
+
+
+def test_upload_rejects_empty_file(client):
+    _, api_key = _register(client)
+    res = _upload(client, api_key, b"")
     assert res.status_code == 400
 
 
 def test_upload_then_admin_read_roundtrip(client):
     uid, api_key = _register(client)
-    res = client.post(
-        "/v1/diagnostics/logs",
-        json={"content": "hello-log", "meta": {"app_version": "1.2.3", "device": "iPhone"}},
-        headers=_headers(api_key),
-    )
+    res = _upload(client, api_key, "hello-log 测试 🚀".encode("utf-8"),
+                  meta={"app_version": "1.2.3", "device": "iPhone"})
     assert res.status_code == 201, res.get_data(as_text=True)
 
     res = client.get(f"/v1/admin/diagnostics/logs/{uid}", headers=_admin_headers())
@@ -87,19 +109,14 @@ def test_upload_then_admin_read_roundtrip(client):
     assert len(body["logs"]) == 1
     entry = body["logs"][0]
     # No R2 configured → inline content, no download_url.
-    assert entry["content"] == "hello-log"
+    assert entry["content"] == "hello-log 测试 🚀"
     assert entry["meta"]["app_version"] == "1.2.3"
     assert "download_url" not in entry
 
 
 def test_content_truncated_to_512kb(client):
     uid, api_key = _register(client)
-    big = "a" * (600 * 1024)
-    res = client.post(
-        "/v1/diagnostics/logs",
-        json={"content": big},
-        headers=_headers(api_key),
-    )
+    res = _upload(client, api_key, b"a" * (600 * 1024))
     assert res.status_code == 201
 
     res = client.get(f"/v1/admin/diagnostics/logs/{uid}", headers=_admin_headers())
@@ -110,11 +127,7 @@ def test_content_truncated_to_512kb(client):
 def test_log_trim_keeps_newest_ten(client):
     uid, api_key = _register(client)
     for i in range(13):
-        res = client.post(
-            "/v1/diagnostics/logs",
-            json={"content": f"log-{i}"},
-            headers=_headers(api_key),
-        )
+        res = _upload(client, api_key, f"log-{i}".encode("utf-8"))
         assert res.status_code == 201
 
     res = client.get(f"/v1/admin/diagnostics/logs/{uid}", headers=_admin_headers())
@@ -127,13 +140,8 @@ def test_log_trim_keeps_newest_ten(client):
 
 def test_upload_rejects_oversized_body(client):
     _, api_key = _register(client)
-    # >2 MiB request body — rejected from Content-Length before JSON parsing.
-    huge = "x" * (2 * 1024 * 1024 + 1024)
-    res = client.post(
-        "/v1/diagnostics/logs",
-        json={"content": huge},
-        headers=_headers(api_key),
-    )
+    # >2 MiB request body — rejected from Content-Length before reading the file.
+    res = _upload(client, api_key, b"x" * (2 * 1024 * 1024 + 1024))
     assert res.status_code == 413
 
 
