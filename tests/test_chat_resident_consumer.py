@@ -2419,6 +2419,89 @@ def test_native_perception_context_falls_back_to_change_when_no_board():
     assert "cross_domain_board_json" not in text
 
 
+# --- screen-watch lane (decoupled from heartbeat) --------------------------
+
+def test_heartbeat_interval_decoupled_from_broadcast():
+    # Heartbeat keeps one steady cadence regardless of broadcast_state — screen
+    # attention is the separate screen-watch lane now.
+    off = crc._proactive_tick_interval_for_broadcast_state("off")
+    on = crc._proactive_tick_interval_for_broadcast_state("on")
+    assert on == off == max(60, crc.PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC)
+
+
+def test_is_screen_watch_job_keys_on_job_kind_or_trigger():
+    assert crc._is_screen_watch_job({"job_kind": "screen_watch"})
+    assert crc._is_screen_watch_job({"trigger": "screen_watch"})
+    assert not crc._is_screen_watch_job({"job_kind": "memory_capture"})
+    assert not crc._is_screen_watch_job({"trigger": "heartbeat_broadcast_on"})
+
+
+def test_screen_watch_message_is_light_not_heartbeat():
+    job = {"job_kind": "screen_watch", "broadcast_state": "on", "current_app": "com.x"}
+    msg = crc._message_for_proactive_job(
+        job,
+        screen_text="[Feedling proactive screen context]\nocr_text:\nhello",
+        recent_chat_context="",
+        perception_digest=({"place_label": "home"}, [], {"media": {"now": 1}}),
+    )
+    # light screen-watch framing, frames + names-only tools present
+    assert "[Feedling screen-watch]" in msg
+    assert "screen-sharing" in msg
+    assert "tools_available" in msg and "perception_<signal>" in msg
+    assert "ocr_text" in msg  # the frame screen_text is attached
+    # NOT the heavy heartbeat payload
+    assert "[Feedling proactive wake]" not in msg
+    assert "cross_domain_board_json" not in msg
+    assert "Cost guide" not in msg
+
+
+def test_post_screen_watch_tick_posts_kind_and_frames(monkeypatch):
+    captured = {}
+
+    class _R:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["body"] = json
+        return _R({"enqueued": True, "job": {"job_id": "pj_sw"}})
+
+    monkeypatch.setattr(crc.httpx, "post", _post)
+    out = crc.post_screen_watch_tick("on", [{"id": "f1"}, {"id": "f2"}])
+    assert out.get("enqueued") is True
+    assert captured["url"].endswith("/v1/proactive/tick")
+    body = captured["body"]
+    # self-wake (respects Ambient gate) — not forced/manual
+    assert "force" not in body
+    assert body["job_kind"] == "screen_watch"
+    assert body["trigger"] == "screen_watch"
+    assert body["frames"] == [{"id": "f1"}, {"id": "f2"}]
+    assert body["broadcast_state"] == "on"
+
+
+def test_screen_watch_recent_frames_parses_newest_first(monkeypatch):
+    monkeypatch.setattr(
+        crc, "_fetch_screen_json",
+        lambda path: {"frames": [{"id": "new", "ts": 200.0}, {"id": "old", "ts": 100.0}]},
+    )
+    latest, ts, frames = crc._screen_watch_recent_frames(limit=5)
+    assert latest == "new"
+    assert ts == 200.0
+    assert frames == [{"id": "new"}, {"id": "old"}]
+
+
+def test_screen_watch_recent_frames_empty_when_none(monkeypatch):
+    monkeypatch.setattr(crc, "_fetch_screen_json", lambda path: {"frames": []})
+    assert crc._screen_watch_recent_frames() == ("", 0.0, [])
+
+
 def test_normalize_agent_replies_supports_multiple_messages_with_cap(monkeypatch):
     monkeypatch.setattr(crc, "PROACTIVE_MAX_REPLY_MESSAGES", 5)
 
@@ -2610,16 +2693,18 @@ def test_recent_chat_context_stale_falls_back_to_two_timestamped_messages(monkey
     assert "8h" in context.text
 
 
-def test_proactive_tick_cadence_follows_broadcast_state(monkeypatch):
+def test_proactive_tick_cadence_decoupled_from_broadcast_state(monkeypatch):
+    # Heartbeat is now decoupled: broadcast no longer accelerates it (screen
+    # attention moved to the separate screen-watch lane). Cadence is steady.
     monkeypatch.setattr(crc, "PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC", 300)
     monkeypatch.setattr(crc, "PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", 1800)
 
-    assert crc._proactive_tick_trigger_for_broadcast_state("off") == "heartbeat_broadcast_off"
     assert crc._proactive_tick_interval_for_broadcast_state("off") == 1800
-    assert crc._proactive_tick_trigger_for_broadcast_state("on") == "heartbeat_broadcast_on"
-    assert crc._proactive_tick_interval_for_broadcast_state("on") == 300
-    assert crc._proactive_tick_trigger_for_broadcast_state("") == "heartbeat_broadcast_off"
+    assert crc._proactive_tick_interval_for_broadcast_state("on") == 1800
     assert crc._proactive_tick_interval_for_broadcast_state("") == 1800
+    # Triggers (labels) still reflect broadcast_state for the heartbeat gate.
+    assert crc._proactive_tick_trigger_for_broadcast_state("off") == "heartbeat_broadcast_off"
+    assert crc._proactive_tick_trigger_for_broadcast_state("on") == "heartbeat_broadcast_on"
     assert crc._proactive_tick_trigger_for_broadcast_state("mystery") == "heartbeat_unknown"
 
 

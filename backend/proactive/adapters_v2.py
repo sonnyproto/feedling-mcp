@@ -22,7 +22,7 @@ def source_for_legacy_trigger_v2(trigger: str, *, manual: bool) -> str:
         return "heartbeat"
     if normalized.startswith("perception_"):
         return "perception_event"
-    if normalized in {"scene_change", "screen_tick", "broadcast_opened", "heartbeat_broadcast_on"}:
+    if normalized in {"scene_change", "screen_tick", "screen_watch", "broadcast_opened", "heartbeat_broadcast_on"}:
         return "scene_change"
     if normalized.startswith("scheduled"):
         return "scheduled_wake"

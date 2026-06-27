@@ -173,8 +173,14 @@ def _default_launch(config_path: str, env: dict, port: int):
     back to the current interpreter when unset (dev)."""
     full_env = {**os.environ, **env}
     python = os.environ.get("FEEDLING_LITELLM_PYTHON", sys.executable)
+    # LiteLLM has no ``__main__``, so ``python -m litellm`` aborts at startup
+    # with "No module named litellm.__main__" and the proxy never binds :port.
+    # The proxy ships as a ``litellm`` console script in the SAME venv bin dir
+    # (litellm[proxy]); its shebang points back at this interpreter, so invoking
+    # it keeps the isolated-venv guarantee while actually launching the server.
+    litellm_bin = os.path.join(os.path.dirname(python), "litellm")
     return subprocess.Popen(
-        [python, "-m", "litellm", "--config", config_path,
+        [litellm_bin, "--config", config_path,
          "--port", str(port), "--host", "127.0.0.1"],
         env=full_env,
     )

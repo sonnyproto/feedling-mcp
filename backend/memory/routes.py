@@ -153,6 +153,9 @@ def memory_index():
             post_enclave=_memory_readside_post_enclave,
         )
     except RuntimeError as e:
+        debug_trace.trace_event(
+            store, subsystem="memory", type="memory.index.called", actor="agent",
+            status="failed", summary="index failed", detail={"reason": str(e)[:80]})
         return jsonify({"error": str(e)}), 503
     _items = response.get("items") if isinstance(response.get("items"), list) else []
     debug_trace.trace_event(
@@ -179,8 +182,14 @@ def memory_fetch():
             post_enclave=_memory_readside_post_enclave,
         )
     except RuntimeError as e:
+        debug_trace.trace_event(
+            store, subsystem="memory", type="memory.fetch.called", actor="agent",
+            status="failed", summary="fetch failed", detail={"reason": str(e)[:80]})
         return jsonify({"error": str(e)}), 503
     except ValueError as e:
+        debug_trace.trace_event(
+            store, subsystem="memory", type="memory.fetch.called", actor="agent",
+            status="failed", summary="fetch failed", detail={"reason": str(e)[:80]})
         return jsonify({"error": str(e)}), 400
     _items = response.get("items") if isinstance(response.get("items"), list) else []
     debug_trace.trace_event(

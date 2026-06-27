@@ -31,15 +31,21 @@ _FLAG_CACHE_TTL = 30.0
 _flag_cache: dict[str, tuple[bool, float]] = {}
 
 
+def _hard_disabled() -> bool:
+    """Optional prod kill switch. Explicitly OFF (FEEDLING_V1_FLOW_TRACE=0) force-
+    disables everywhere. Unset → the per-user debug-panel toggle is the real gate,
+    so nothing extra is needed to use it on test (just flip the switch)."""
+    return os.environ.get("FEEDLING_V1_FLOW_TRACE", "").strip().lower() in ("0", "false", "off", "no")
+
+
 def _deploy_enabled() -> bool:
-    """Deploy-level kill switch. OFF by default → the whole feature is a pure
-    no-op in production (not even a DB read). Turn ON only on the test deploy;
-    then the per-user debug-panel flag actually controls recording."""
-    return os.environ.get("FEEDLING_V1_FLOW_TRACE", "").strip().lower() in ("1", "true", "yes", "on")
+    """Deploy-level allowed unless hard-disabled. (The per-user toggle still gates
+    actual recording; a normal prod user who never opens DebugTool stays off.)"""
+    return not _hard_disabled()
 
 
 def is_enabled(store) -> bool:
-    if not _deploy_enabled():
+    if _hard_disabled():
         return False
     uid = getattr(store, "user_id", "") or ""
     if not uid:

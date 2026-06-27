@@ -42,6 +42,8 @@ _DREAM_PROMPT_TEMPLATE = """你是 {ai_name}——{user_name} 的伴侣。现在
 · 永远不要硬删 TA 能看到的卡。只用「标记为被取代」（superseded，保留链条）。
 · 大的重构之前，先备份当前状态。
 · 你不在和 TA 对话，不要生成任何要发给 TA 的消息——你只整理记忆。
+· 整理出的字段（bucket/threads/summary/content）用 TA 跟你对话的语言——中文就用中文
+  （用「宠物」不是「pets」），别把中文的事归成英文桶/线索；专有名词/原话保留原文。
 · 没有需要整理的，就什么都不做（consolidations 为空）。这很正常。
 
 【现有的卡】{cards}

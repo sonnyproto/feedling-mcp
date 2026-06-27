@@ -147,7 +147,7 @@ python3 tools/genesis_e2e.py verify --api-url <TEST_API_URL> --api-key <key> --j
 | 测试区 | v1 功能 |
 |---|---|
 | genesis_* / genesis_gate / history_import_identity | **新用户 onboarding**:蒸馏 voice/identity/memory(闸门①) |
-| agent_runtime_* / hosted_*_cutover / runtime_token / enclave_runtime_token / io_cli_auth | **host→agent_runtime 切换**:spawn / persona decrypt(③)/ photo allowlist(⑤)/ 图片·gateway 回 legacy |
+| agent_runtime_* / hosted_*_cutover / runtime_token / enclave_runtime_token / io_cli_auth | **host→agent_runtime 切换**:spawn / persona decrypt(③)/ photo allowlist(⑤)/ **文本+图片都走 runtime**(图片不再回落 legacy,consumer 处理图片 envelope);runtime 不可用→503 |
 | agent_runtime_supervisor / genesis_worker(persona_backfill) | **老用户 voice backfill**(④) |
 | memory_v1_* / memory_readside* / memory_index_selector / capture_prompt / dream_prompt / hosted_memory_tool* | **记忆**:写/落卡/读/召回/索引(v1,非迁移) |
 | identity_* / io_cli_identity | **身份卡**:写/读/服务端加密 |

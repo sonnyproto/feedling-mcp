@@ -308,6 +308,11 @@ def model_api_chat_send():
     _require_gateway = agent_runtime_cutover.codex_transport(_provider) == "gateway"
     live, reason = agent_runtime_cutover.check_supervisor_live(require_gateway=_require_gateway)
     if not live:
+        debug_trace.trace_event(
+            store, subsystem="route", type="route.decided", actor="host_agent_runtime",
+            status="gated", summary="supervisor_unavailable",
+            detail={"mode": "blocked", "reason": "supervisor_unavailable", "live_reason": str(reason or "")[:80]},
+        )
         return jsonify({"error": "hosting_runtime_unavailable", "reason": reason}), 503
 
     extra: dict = {}
@@ -332,9 +337,10 @@ def model_api_chat_send():
     store.notify_chat_waiters()
 
     # image turn 不再被挡在 legacy；consumer 已能处理图片 envelope。
+    _turn_id = str(user_row.get("id") or "") if isinstance(user_row, dict) else ""
     debug_trace.trace_event(
         store, subsystem="route", type="route.decided", actor="host_agent_runtime",
-        summary="agent_runtime",
+        turn_id=_turn_id, summary="agent_runtime",
         detail={"mode": "agent_runtime", "has_image": bool(has_image)},
     )
     body, status = agent_runtime_cutover.handle_send(store, user_row, driver)

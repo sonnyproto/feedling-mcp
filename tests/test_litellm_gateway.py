@@ -195,16 +195,19 @@ def test_manager_relaunches_when_user_set_changes(tmp_path):
     assert fake.stopped == ["h1"]  # old proxy stopped before relaunch
 
 
-def test_default_launch_uses_isolated_litellm_python(monkeypatch):
+def test_default_launch_uses_isolated_litellm_console_script(monkeypatch):
     # LiteLLM lives in its own venv (so its dep tree never disturbs the hash-locked
-    # backend env). _default_launch must invoke that interpreter, not sys.executable.
+    # backend env). _default_launch must invoke the ``litellm`` console script from
+    # THAT venv's bin dir — not ``python -m litellm`` (litellm has no __main__, so
+    # -m aborts at startup and the proxy never binds its port).
     captured = {}
     monkeypatch.setattr(gw.subprocess, "Popen",
                         lambda argv, env: captured.update(argv=argv, env=env) or "proc")
     monkeypatch.setenv("FEEDLING_LITELLM_PYTHON", "/opt/litellm-venv/bin/python")
     gw._default_launch("/cfg.yaml", {"FEEDLING_UPKEY_u1": "k1"}, 4123)
-    assert captured["argv"][0] == "/opt/litellm-venv/bin/python"
-    assert captured["argv"][1:5] == ["-m", "litellm", "--config", "/cfg.yaml"]
+    assert captured["argv"][0] == "/opt/litellm-venv/bin/litellm"
+    assert captured["argv"][1:3] == ["--config", "/cfg.yaml"]
+    assert "-m" not in captured["argv"]  # regression guard: never `python -m litellm`
     assert "--port" in captured["argv"] and "4123" in captured["argv"]
     # the upstream key is injected into the proxy env
     assert captured["env"]["FEEDLING_UPKEY_u1"] == "k1"
