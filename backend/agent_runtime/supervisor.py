@@ -425,19 +425,32 @@ def _genesis_ready_to_spawn(user_id: str) -> bool:
     return not _genesis_status_blocks_spawn(blob)
 
 
+# Last-good persona digest per user. A transient DB read failure must NOT flip
+# persona_version to '' (that would bounce a healthy consumer, then bounce it again
+# when the read recovers). Only a SUCCESSFUL read updates the cache; on exception we
+# return the last-good value so _spawn_identity stays stable through DB blips.
+_PERSONA_VERSION_CACHE: dict[str, str] = {}
+
+
 def _persona_version(user_id: str) -> str:
     """genesis_persona content digest (sha256) for respawn fingerprinting, or ''.
     Read-only, no decrypt — the digest is plaintext metadata on the blob. Empty when
-    absent (no genesis / not backfilled yet), so a user without persona has a stable
-    '' and isn't bounced (cutover gate 4 C)."""
+    legitimately absent (no genesis / not backfilled yet), so a user without persona
+    has a stable '' and isn't bounced. On a transient DB failure we return the last
+    successfully-read value (not '') to avoid respawn flapping (cutover gate 4 C)."""
     if not user_id:
         return ""
     try:
         import db  # local import: keep this module pure-unit importable
         blob = db.get_blob(user_id, "genesis_persona")
-    except Exception:
-        return ""
-    return str(blob.get("sha256") or "") if isinstance(blob, dict) else ""
+    except Exception as e:
+        last = _PERSONA_VERSION_CACHE.get(user_id, "")
+        log.warning("persona_version read failed for %s; keeping last-good %r: %s",
+                    user_id, last, e)
+        return last
+    version = str(blob.get("sha256") or "") if isinstance(blob, dict) else ""
+    _PERSONA_VERSION_CACHE[user_id] = version
+    return version
 
 
 def _spawn_identity(entry: dict) -> tuple:
