@@ -49,6 +49,26 @@
 
 ## 2026-06-27
 
+### [DONE] 照片解密读取修复 + 快捷指令 app 上报打通（真机 e2e）
+
+感知输入真机排查发现两个问题,均已解决:
+
+- **照片像素解密(真 bug,Codex `9b25544` 修)**:enclave 三处解密(`/decrypt` `/caption`
+  `/image`)假设明文是屏幕帧的 UTF-8/JSON,但**照片明文是裸 JPEG 字节**(0xFF D8 FF)→
+  `plaintext_parse` 502,agent 永远拿不到照片像素。修法:`_parse_visual_plaintext` 按 magic-byte
+  (JPEG/PNG/WebP/HEIC/AVIF)识别裸图并 base64 包装;坏字节/非 dict JSON 仍 fail-closed;屏幕帧
+  JSON 路径零改动(无回归)。CC 审计通过。真机验:`photo-read --include-image` → `decrypt_status=ok`,
+  **image_b64_len=208696**;`screen-read` 回归 ok。
+- **caption(enclave VLM)残留 gap**:**test enclave 未配
+  `FEEDLING_SCREEN_VLM_API_KEY`** → `/caption` 在鉴权/解密前返回 503
+  `screen_caption_unconfigured`;raw-photo caption parser 目前由单测覆盖,真实出图描述待部署 key 后补验。
+- **快捷指令 app 上报**:URL/key/端点全对,问题是 iOS 自动化设成了「确认后运行」→ 改「立即运行」
+  后,真机打开淘宝实时落 `recent_apps` + app 信号 ✅。
+- **照片分类**:正常(真照片 `is_screenshot=false`)。
+- **照片仍是"拉取式"**:photo_added wake 只通知,不自动附图;Seven 倾向改"推送式"(wake 自动附
+  解密照片,复用屏幕帧 `images=` 机制)——follow-up 待做。
+- 体检表更新:`docs/PERCEPTION_COVERAGE_HEALTHCHECK_2026-06-27.md` §B。
+
 ### [DONE] 主动 wake digest：从「健康独大 top-N」改成「均衡跨域桌面 + Agent 自判」
 
 `/v1/agent/perception/digest` 之前第二半 `change` = `notable_changes()` 取 top-8,**只比较量化

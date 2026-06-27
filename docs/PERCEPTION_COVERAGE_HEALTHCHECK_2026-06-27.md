@@ -32,7 +32,10 @@ OpenClaw 插件 `SIGNALS`,各 18 个,集合差 = ∅)。
 | 能力 | 工具 | 状态 | 备注 |
 |---|---|---|---|
 | 屏幕共享 | `screen-recent` / `screen-read` | ✅ | 真机正在共享时 broadcast_state=on、8 帧、`screen-read` decrypt_status=ok、960px |
-| 照片 | `photo-recent` / `photo-read` | ✅ | `photo-read --id` 可读单张细节(metadata + 可选解密 JPEG) |
+| 照片(metadata) | `photo-recent` / `photo-read` | ✅ | 列表 + 单张 metadata(scene/time);分类正确(真照片 is_screenshot=false) |
+| 照片(像素解密) | `photo-read --include-image` | ✅(2026-06-27 修复) | 曾坏:enclave 把裸 JPEG 当 UTF-8/JSON → `plaintext_parse`。Codex `9b25544` 修(magic-byte fallback)。真机验:`decrypt_status=ok`, **image_b64_len=208696** |
+| 照片/屏幕 caption(enclave VLM) | enclave `/caption` | ⚠️ 阻塞 | test enclave 未配 `FEEDLING_SCREEN_VLM_API_KEY` → 在鉴权/解密前返回 503 `screen_caption_unconfigured`。raw-photo parser 有单测;真实出图描述需先配 VLM key |
+| app 上报 | iOS 快捷指令 → `/v1/perception/app_open` | ✅ | 自动化需设「立即运行」(非「确认后运行」);淘宝真机上报已落 recent_apps + app 信号 |
 | 趋势/历史 | `perception-trend` / `perception-history` | ✅ | 量化层(perception_daily)|
 | 记忆 | `memory-index` / `memory-fetch` | ✅ | 读侧 |
 

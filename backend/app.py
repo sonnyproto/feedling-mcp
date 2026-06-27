@@ -435,6 +435,11 @@ register_perception(app)
 from diagnostics import register as register_diagnostics  # noqa: E402
 register_diagnostics(app)
 
+# Onboarding original-file archival (backend/onboarding_archive/). Mounts
+# POST /v1/onboarding/archive.
+from onboarding_archive import register as register_onboarding_archive  # noqa: E402
+register_onboarding_archive(app)
+
 # ---------------------------------------------------------------------------
 # APNs config (global — one Apple dev key for the app)
 # ---------------------------------------------------------------------------

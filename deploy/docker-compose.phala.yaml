@@ -95,6 +95,9 @@ services:
       FEEDLING_DATA_DIR: "/data"
       FEEDLING_ENCLAVE_TLS: "true"
       FEEDLING_FLASK_URL: "http://backend:5001"
+      # VLM inference stays inside the enclave. The deploy workflow maps the
+      # existing OpenRouter secret into this service-specific variable.
+      FEEDLING_SCREEN_VLM_API_KEY: "${FEEDLING_SCREEN_VLM_API_KEY:-}"
       # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
       # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
       # even when the value is empty, so an empty string would make it
