@@ -487,3 +487,28 @@ def test_apply_memory_outputs_batches_memory_actions(monkeypatch):
     assert count == 25
     assert len(results) == 25
     assert [len(call) for call in calls] == [20, 5]
+
+
+def test_apply_memory_outputs_coerces_unknown_memory_type_to_fact(monkeypatch):
+    calls = []
+
+    def fake_execute(_store, _api_key, actions):
+        calls.append(actions)
+        return {"status": "ok", "results": [{"memory": {"id": "m1"}}]}, 200
+
+    monkeypatch.setattr(service.memory_actions, "_execute_memory_actions", fake_execute)
+    output = {
+        "memories": [{
+            "type": "habit",
+            "summary": "User asks for direct feedback",
+            "content": "User asks for direct feedback during planning.",
+        }]
+    }
+
+    count, results = service.apply_memory_outputs(_store(), "api_key", output)
+    reducer_doc = service._safe_reducer_doc("job_1", output)
+
+    assert count == 1
+    assert results == [{"memory": {"id": "m1"}}]
+    assert calls[0][0]["memory"]["type"] == "fact"
+    assert reducer_doc["memory_type_counts"] == {"fact": 1}

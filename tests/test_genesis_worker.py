@@ -213,6 +213,43 @@ def test_tick_claims_decrypts_all_chunks_and_posts_distilled_output(monkeypatch)
     assert "chunks" not in reducer_output
 
 
+def test_complete_json_repairs_invalid_model_json_once():
+    calls = []
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            calls.append(kwargs)
+            if kwargs["task_id"] == "voice-map-0":
+                text = '{"behavior_notes_candidates":["keeps "quoted" words"],"exemplar_candidates":[]}'
+            elif kwargs["task_id"] == "voice-map-0-json-repair":
+                payload = json.loads(kwargs["messages"][1]["content"])
+                assert payload["task_id"] == "voice-map-0"
+                assert "malformed_json" in payload
+                assert kwargs["idempotency_key"] == "job_1:voice_map:0:json_repair"
+                assert kwargs["temperature"] == 0.0
+                text = json.dumps({
+                    "behavior_notes_candidates": ['keeps "quoted" words'],
+                    "exemplar_candidates": [],
+                })
+            else:
+                raise AssertionError(kwargs["task_id"])
+            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
+
+    parsed = worker._complete_json(
+        FakeLLM(),
+        user_id="usr_1",
+        job_id="job_1",
+        task_id="voice-map-0",
+        runtime=types.SimpleNamespace(),
+        messages=[{"role": "user", "content": "x"}],
+        max_tokens=1000,
+        idempotency_key="job_1:voice_map:0",
+    )
+
+    assert parsed["behavior_notes_candidates"] == ['keeps "quoted" words']
+    assert [call["task_id"] for call in calls] == ["voice-map-0", "voice-map-0-json-repair"]
+
+
 def test_ai_persona_source_uses_persona_material_without_voice_or_fact_map(monkeypatch):
     llm_calls = []
     apply_payloads, _minted, mint = _install_success_harness(

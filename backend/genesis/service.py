@@ -325,10 +325,15 @@ def mark_failed(store: UserStore, job_id: str, error: str) -> dict | None:
     return job
 
 
-def _memory_action_from_output(item: dict) -> dict:
-    mem_type = _text(item.get("type") or "fact", 40).lower()
+def _coerce_memory_type(value: Any) -> str:
+    mem_type = _text(value or "fact", 40).lower()
     if mem_type not in ALLOWED_MEMORY_TYPES:
-        raise ValueError(f"unsupported_genesis_memory_type:{mem_type}")
+        return "fact"
+    return mem_type
+
+
+def _memory_action_from_output(item: dict) -> dict:
+    mem_type = _coerce_memory_type(item.get("type"))
     memory = {
         "type": mem_type,
         "summary": _text(item.get("summary") or item.get("title") or item.get("description"), 2000),
@@ -454,7 +459,7 @@ def _safe_reducer_doc(job_id: str, output: dict) -> dict:
     for item in memories:
         if not isinstance(item, dict):
             continue
-        mem_type = _text(item.get("type") or "fact", 40).lower()
+        mem_type = _coerce_memory_type(item.get("type"))
         type_counts[mem_type] = type_counts.get(mem_type, 0) + 1
     identity = output.get("identity") if isinstance(output.get("identity"), dict) else {}
     dims = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []

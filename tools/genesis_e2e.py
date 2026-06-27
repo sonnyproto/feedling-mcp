@@ -37,15 +37,27 @@ except Exception as e:  # noqa: BLE001
     sys.exit(2)
 
 
-def _http(method, url, api_key, *, json_body=None, timeout=60):
+def _http(method, url, api_key, *, json_body=None, timeout=60, retries=3):
+    """Single request with retry on transient read/connection errors (IncompleteRead,
+    URLError, socket timeout). HTTPError (a real status) is returned immediately, never
+    retried. Safe because every call site is idempotent (GET) or create-with-no-side-effect
+    on a throwaway test user."""
+    import http.client
+    import socket
     data = json.dumps(json_body).encode("utf-8") if json_body is not None else None
-    req = urllib.request.Request(url, data=data, method=method,
-                                 headers={"X-API-Key": api_key, "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
-    except urllib.error.HTTPError as e:
-        return e.code, {"error": e.read().decode("utf-8", "replace")[:400]}
+    last_exc = None
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=data, method=method,
+                                     headers={"X-API-Key": api_key, "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as e:
+            return e.code, {"error": e.read().decode("utf-8", "replace")[:400]}
+        except (http.client.IncompleteRead, urllib.error.URLError, socket.timeout, ConnectionError) as e:
+            last_exc = e
+            time.sleep(1.5 * (attempt + 1))
+    raise SystemExit(f"{method} {url} failed after {retries} attempts: {last_exc}")
 
 
 def _enclave_pk_bytes(args) -> bytes:
@@ -70,24 +82,29 @@ def _provision_user(args) -> tuple[str, str, bytes, bytes]:
     Returns (api_key, user_id, enclave_pk_bytes, user_pk_bytes). Provider key comes
     from the env (GENESIS_E2E_PROVIDER_API_KEY), never persisted to disk."""
     import os
-    provider_key = os.environ.get("GENESIS_E2E_PROVIDER_API_KEY", "").strip()
-    if not provider_key:
-        raise SystemExit("GENESIS_E2E_PROVIDER_API_KEY env required for --register (worker LLM key)")
     sk = PrivateKey.generate()
     user_pk = bytes(sk.public_key)
     base = args.api_url.rstrip("/")
-    s, b = _http("POST", f"{base}/v1/users/register", "", json_body={"public_key": user_pk.hex()})
+    # Content public key must be base64 of the raw 32-byte X25519 pk (core/envelope.py
+    # _decode_content_public_key base64-decodes it + asserts 32 bytes); hex would
+    # decode to 48 bytes -> user_content_public_key_invalid_length at model_api/setup.
+    user_pk_b64 = base64.b64encode(user_pk).decode("ascii")
+    s, b = _http("POST", f"{base}/v1/users/register", "", json_body={"public_key": user_pk_b64})
     if s >= 400:
         raise SystemExit(f"register failed {s}: {b}")
     api_key = b.get("api_key") or b.get("apiKey") or ""
     user_id = b.get("user_id") or b.get("userId") or ""
     if not api_key or not user_id:
         raise SystemExit(f"register response missing api_key/user_id: {b}")
-    s, b = _http("POST", f"{base}/v1/model_api/setup", api_key, json_body={
-        "provider": args.provider, "model": args.model,
-        "base_url": args.base_url, "api_key": provider_key})
-    if s >= 400 or b.get("test_status") not in ("ok", None):
-        raise SystemExit(f"model_api/setup failed {s}: {b}")
+    if not getattr(args, "skip_setup", False):
+        provider_key = os.environ.get("GENESIS_E2E_PROVIDER_API_KEY", "").strip()
+        if not provider_key:
+            raise SystemExit("GENESIS_E2E_PROVIDER_API_KEY env required (worker LLM key); or use --skip-setup for a plumbing dry-run")
+        s, b = _http("POST", f"{base}/v1/model_api/setup", api_key, json_body={
+            "provider": args.provider, "model": args.model,
+            "base_url": args.base_url, "api_key": provider_key})
+        if s >= 400 or b.get("test_status") not in ("ok", None):
+            raise SystemExit(f"model_api/setup failed {s}: {b}")
     s, b = _http("GET", f"{base}/v1/users/whoami", api_key)
     enclave_hex = b.get("enclave_content_public_key_hex") or ""
     if not enclave_hex:
