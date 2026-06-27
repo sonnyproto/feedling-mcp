@@ -49,6 +49,11 @@ _IO_CLI_VERBS = (
     "identity-write",
     "screen-recent",
     "screen-read",
+    # photo-* are documented in agent_tools_prompt.md and implemented in io_cli;
+    # without them in the allowlist Claude's --allowed-tools blocks the call while
+    # the prompt says it's available (prompt/allowlist consistency, cutover gate 5).
+    "photo-recent",
+    "photo-read",
 )
 # Host-side resident sessions rotate at this many turns (vs the shared consumer
 # default of 40) so the persona file re-grounds voice more often within a long
