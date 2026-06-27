@@ -167,10 +167,12 @@ services:
       R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
       R2_FRAMES_BUCKET: "${R2_FRAMES_BUCKET:-}"
       # Dedicated bucket for client diagnostic logs (backend/diagnostics/),
-      # separate from frames. Plaintext logs (user-initiated upload). Empty
-      # default = feature OFF (logs fall back to inline Postgres). The R2 token
-      # MUST also be scoped to this bucket; set a short lifecycle (7d) on it.
-      R2_USER_LOGS_BUCKET: "${R2_USER_LOGS_BUCKET:-}"
+      # separate from frames. Plaintext logs (user-initiated upload). Bucket
+      # name is non-secret so it defaults on; activates whenever the R2
+      # credentials above are present. The R2 token MUST also be scoped to this
+      # bucket (else PUT 403 → graceful inline Postgres fallback). Set a short
+      # lifecycle (7d) on the bucket.
+      R2_USER_LOGS_BUCKET: "${R2_USER_LOGS_BUCKET:-io-user-logs}"
       # APNs developer key for push (Dynamic Island / Live Activity).
       # Injected via `phala deploy -e APNS_KEY_P8_B64=...` (encrypted env
       # channel, NOT baked into compose_hash). Empty default keeps dev
