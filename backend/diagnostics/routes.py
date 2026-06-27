@@ -112,3 +112,44 @@ def admin_read_logs(user_id):
             entry["content"] = doc["content"]
         entries.append(entry)
     return jsonify({"user_id": user_id, "logs": entries}), 200
+
+
+# --- v1 flow trace (debug panel) — off unless FEEDLING_V1_FLOW_TRACE + per-user opt-in ---
+
+@bp.route("/v1/debug/trace", methods=["GET"])
+def debug_trace_read():
+    from accounts.auth import require_user  # below this blueprint — no cycle
+    import debug_trace
+
+    store = require_user()
+    try:
+        limit = int(request.args.get("limit", 200))
+    except (TypeError, ValueError):
+        limit = 200
+    subsystem = str(request.args.get("subsystem") or "")
+    return jsonify({
+        "enabled": debug_trace.is_enabled(store),
+        "deploy_enabled": debug_trace._deploy_enabled(),
+        "events": debug_trace.read_trace(store, limit=limit, subsystem=subsystem),
+    }), 200
+
+
+@bp.route("/v1/debug/trace/enable", methods=["POST"])
+def debug_trace_enable():
+    from accounts.auth import require_user
+    import debug_trace
+
+    store = require_user()
+    payload = request.get_json(silent=True) or {}
+    doc = debug_trace.set_enabled(store, bool(payload.get("enabled")))
+    return jsonify({"enabled": doc["enabled"], "deploy_enabled": debug_trace._deploy_enabled()}), 200
+
+
+@bp.route("/v1/debug/trace", methods=["DELETE"])
+def debug_trace_clear():
+    from accounts.auth import require_user
+    import debug_trace
+
+    store = require_user()
+    debug_trace.clear_trace(store)
+    return jsonify({"status": "ok"}), 200
