@@ -50,6 +50,12 @@ USER_PROFILE_SOURCE_KINDS = {
     "user_persona",
     "user_profile",
 }
+JSON_REPAIR_SYSTEM_PROMPT = (
+    "You repair malformed JSON produced by a previous model call. "
+    "Return exactly one valid JSON object and nothing else. "
+    "Do not add, remove, translate, summarize, or reinterpret content. "
+    "Only fix JSON syntax and escaping so json.loads can parse it."
+)
 
 
 class GenesisWorkerError(Exception):
@@ -95,6 +101,24 @@ def _json_object(text: str, *, task_id: str) -> dict:
     if not isinstance(parsed, dict):
         raise GenesisWorkerError(f"{task_id}:json_not_object")
     return parsed
+
+
+def _json_repair_messages(task_id: str, raw_text: str, error: str) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": JSON_REPAIR_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "task_id": task_id,
+                    "json_error": str(error or "")[:500],
+                    "malformed_json": str(raw_text or ""),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        },
+    ]
 
 
 def _chunks(seq: list[Any], size: int) -> list[list[Any]]:
@@ -290,7 +314,26 @@ def _complete_json(
         idempotency_key=idempotency_key,
         temperature=temperature,
     )
-    return _json_object(result.text, task_id=task_id)
+    try:
+        return _json_object(result.text, task_id=task_id)
+    except GenesisWorkerError as first_error:
+        if str(first_error) not in {f"{task_id}:invalid_json", f"{task_id}:json_not_object"}:
+            raise
+        repair = llm.complete(
+            user_id=user_id,
+            job_id=job_id,
+            task_id=f"{task_id}-json-repair",
+            runtime=runtime,
+            messages=_json_repair_messages(task_id, result.text, str(first_error)),
+            max_tokens=max_tokens,
+            timeout=float(_env_int("FEEDLING_GENESIS_LLM_TIMEOUT_SEC", 90)),
+            idempotency_key=f"{idempotency_key}:json_repair",
+            temperature=0.0,
+        )
+        try:
+            return _json_object(repair.text, task_id=task_id)
+        except GenesisWorkerError as repair_error:
+            raise GenesisWorkerError(f"{task_id}:invalid_json_after_repair") from repair_error
 
 
 def _complete_text(

@@ -418,3 +418,144 @@ def notable_changes(rows_by_signal: Mapping[str, list[Mapping]], *, max_changes:
             })
     changes.sort(key=lambda c: (-c["magnitude"], c["signal"], c["field"]))
     return changes[:cap]
+
+
+# --- cross-domain digest board ---------------------------------------------
+# notable_changes() ranks health/numeric deltas only, so the wake digest skews
+# into a body-monitoring readout. cross_domain_recent() instead lays out ONE
+# compact entry per life-context domain (location / media / app / health /
+# weather / mood / reminders / calendar / photos / screen) so the agent keeps
+# music/place/app/photo context. The backend does NOT pick the 2-3 things that
+# matter — it only sets a balanced table; the agent reads it and judges. Light,
+# factual per-domain `novelty` hints (new_artist / long_dwell) are context, not
+# a cross-domain ranking. Pure function (no I/O): the route fetches
+# snapshot/pull_snapshot/history/photos and passes them in.
+_LONG_DWELL_MIN = 240.0  # >=4h at one place today -> a light "long_dwell" hint
+
+
+def _as_mapping(v: Any) -> dict:
+    return dict(v) if isinstance(v, Mapping) else {}
+
+
+def _media_domain(snapshot: Mapping, rows: list[Mapping]) -> dict:
+    np = _as_mapping(snapshot.get("now_playing"))
+    title = np.get("title")
+    artist = np.get("artist")
+    title = str(title) if title else None
+    artist = str(artist) if artist else None
+    today = _as_mapping(rows[-1].get("doc")) if rows else {}
+    by_artist = _as_mapping(today.get("by_artist"))
+    top_artists = [a for a, _ in sorted(by_artist.items(), key=lambda kv: kv[1], reverse=True)[:3]]
+    distinct = today.get("distinct")
+    novelty = None
+    if artist:
+        prior: set[str] = set()
+        for r in rows[:-1]:
+            prior.update(_as_mapping(_as_mapping(r.get("doc")).get("by_artist")).keys())
+        if artist not in prior:
+            novelty = "new_artist"
+    return {
+        "now": ({"title": title, "artist": artist} if (title or artist) else None),
+        "top_artists_today": top_artists,
+        "minutes_today": _finite_number(today.get("total_minutes")),
+        "distinct_today": (len(distinct) if isinstance(distinct, list) else None),
+        "novelty": novelty,
+    }
+
+
+def _location_domain(snapshot: Mapping, rows: list[Mapping]) -> dict:
+    place = snapshot.get("place_label")
+    today = _as_mapping(rows[-1].get("doc")) if rows else {}
+    minutes = _as_mapping(today.get("minutes"))
+    visited = today.get("visited")
+    minutes_here = _finite_number(minutes.get(place)) if place else None
+    novelty = "long_dwell" if (minutes_here is not None and minutes_here >= _LONG_DWELL_MIN) else None
+    return {
+        "now": place,
+        "minutes_today": minutes_here,
+        "visited_today": (list(visited) if isinstance(visited, list) else []),
+        "novelty": novelty,
+    }
+
+
+def _app_domain(snapshot: Mapping) -> dict:
+    recent = snapshot.get("recent_apps")
+    entries = [e for e in recent if isinstance(e, Mapping)] if isinstance(recent, list) else []
+    entries.sort(key=lambda e: (_finite_number(e.get("ts")) or 0.0), reverse=True)
+    now_app = entries[0].get("app") if entries else None
+    names: list[str] = []
+    seen: set[str] = set()
+    for e in entries:
+        a = e.get("app")
+        if a and a not in seen:
+            seen.add(a)
+            names.append(str(a))
+    return {"now": now_app, "recent": names[:5], "novelty": None}
+
+
+def _weather_domain(pull: Mapping) -> dict:
+    cond, temp = pull.get("condition"), pull.get("temperature")
+    if cond is None and temp is None:
+        return {"status": "none"}
+    return {"condition": cond, "temperature": temp}
+
+
+def _mood_domain(pull: Mapping) -> dict:
+    val, cls = pull.get("valence"), pull.get("valence_classification")
+    if val is None and cls is None and not pull.get("recorded_today"):
+        return {"status": "none"}
+    return {"valence": val, "classification": cls}
+
+
+def _reminders_domain(pull: Mapping) -> dict:
+    reminders = pull.get("reminders")
+    overdue: list[str] = []
+    if isinstance(reminders, list):
+        for r in reminders:
+            if isinstance(r, Mapping) and r.get("overdue") and r.get("title"):
+                overdue.append(str(r.get("title")))
+    return {
+        "due_today": pull.get("due_today_count"),
+        "overdue_count": pull.get("overdue_count"),
+        "overdue": overdue[:5],
+        "next": pull.get("next_reminder"),
+    }
+
+
+def _photos_domain(photos: Any) -> dict:
+    items = photos if isinstance(photos, list) else []
+    scenes: list[str] = []
+    seen: set[str] = set()
+    for p in items:
+        meta = _as_mapping(p.get("metadata")) if isinstance(p, Mapping) else {}
+        sc = meta.get("scene_hint")
+        if sc and sc not in seen:
+            seen.add(sc)
+            scenes.append(str(sc))
+    return {"recent_count": len(items), "scenes": scenes[:5]}
+
+
+def cross_domain_recent(
+    *,
+    snapshot: Mapping | None,
+    pull_snapshot: Mapping | None,
+    rows_by_signal: Mapping[str, list[Mapping]] | None,
+    photos: Any = None,
+    max_health_notable: int = 8,
+) -> dict:
+    """Balanced cross-domain digest board for the wake turn (see module note)."""
+    snap = _as_mapping(snapshot)
+    pull = _as_mapping(pull_snapshot)
+    rbs = rows_by_signal if isinstance(rows_by_signal, Mapping) else {}
+    return {
+        "location": _location_domain(snap, list(rbs.get("location_signal") or [])),
+        "media": _media_domain(snap, list(rbs.get("playback") or [])),
+        "app": _app_domain(snap),
+        "health": {"notable": notable_changes(rbs, max_changes=max_health_notable)},
+        "weather": _weather_domain(pull),
+        "mood": _mood_domain(pull),
+        "reminders": _reminders_domain(pull),
+        "calendar": {"next": snap.get("calendar_next_event")},
+        "photos": _photos_domain(photos),
+        "screen": {"state": snap.get("broadcast_state")},
+    }

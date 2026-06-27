@@ -49,6 +49,24 @@
 
 ## 2026-06-27
 
+### [DONE] 主动 wake digest：从「健康独大 top-N」改成「均衡跨域桌面 + Agent 自判」
+
+`/v1/agent/perception/digest` 之前第二半 `change` = `notable_changes()` 取 top-8,**只比较量化
+数值信号**(vitals/metabolic/weather/activity/sleep/body/cycle)→「什么值得主动提」结构上只能是
+健康数值,Agent 退化成身体监测机。现改:后端**均衡铺开跨域近况**,健康折叠成 1 行,与音乐/位置/
+app/照片/提醒/天气/心情/日历/屏幕**平级**;**后端不产 flag**,Agent 读桌面自判最多 2-3 条拟人化
+值得一提(可跨域组合,优先生活情境而非健康播报)。spec/示例:`docs/DIGEST_CROSSDOMAIN_REDESIGN_PLAN_2026-06-27.md`。
+
+- **后端**:`backend/perception/history.py` 新增纯函数 `cross_domain_recent()`(10 域;health 复用
+  `notable_changes` 折叠;轻量 novelty `new_artist`/`long_dwell` 作事实上下文,非排名);
+  `backend/agent/routes.py` digest 端点返回 `{days, changes, domains}`(`changes` 保留向后兼容)。
+- **消费端**:`tools/chat_resident_consumer.py` `_proactive_perception_digest` 改 3 元
+  `(presence, change, domains)`;wake prompt 渲染 `cross_domain_board_json` + 自判指令;旧后端无
+  `domains` 时回退 legacy change。
+- **测试**:cross_domain_recent 单测(均衡/折叠/novelty/诚实报空/降级)+ 路由 + 消费端渲染/兼容,
+  本地 276 passed(4 个 `dstack_sdk` 缺失 error 与本改动无关);DB 测试由 CI 跑。VPS resident e2e 待部署后验。
+- **路径**:resident/VPS,不碰 hosted。**全感知接口/字段清单**(对比用):同 spec 文档 §1。
+
 ### [DONE] Agent 声音/身份/Genesis：全链路建成 + 部署 test CVM（e2e 待跑）
 
 host(API key)用户的空白 runtime,在 **CVM/enclave 内**从上传历史蒸馏出**声音(persona 文件)+

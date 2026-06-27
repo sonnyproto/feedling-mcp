@@ -197,6 +197,77 @@ def test_notable_changes_requires_two_baseline_values_and_current_delta():
     assert history.notable_changes(rows_by_signal) == []
 
 
+def test_cross_domain_recent_balances_domains_and_folds_health():
+    rows_by_signal = {
+        # health: two comparable signals -> folded into ONE health domain entry
+        "health_vitals": [
+            {"date": "2026-06-23", "doc": {"resting_heart_rate": {"sum": 120, "count": 2, "min": 58, "max": 62}}},
+            {"date": "2026-06-24", "doc": {"resting_heart_rate": {"sum": 120, "count": 2, "min": 59, "max": 61}}},
+            {"date": "2026-06-25", "doc": {"resting_heart_rate": {"sum": 132, "count": 2, "min": 65, "max": 67}}},
+        ],
+        "health_activity": [
+            {"date": "2026-06-23", "doc": {"active_energy_kcal": {"total": 200}}},
+            {"date": "2026-06-24", "doc": {"active_energy_kcal": {"total": 200}}},
+            {"date": "2026-06-25", "doc": {"active_energy_kcal": {"total": 500}}},
+        ],
+        # media tally: today's artist is new vs. prior days -> novelty new_artist
+        "playback": [
+            {"date": "2026-06-24", "doc": {"by_artist": {"The National": 30.0}, "total_minutes": 30.0,
+                                            "distinct": ["Fake Empire"]}},
+            {"date": "2026-06-25", "doc": {"by_artist": {"Phoebe Bridgers": 90.0}, "total_minutes": 90.0,
+                                            "distinct": ["Motion Sickness", "Garden Song"]}},
+        ],
+        # place dwell: >=4h at the current place today -> novelty long_dwell
+        "location_signal": [
+            {"date": "2026-06-25", "doc": {"minutes": {"公司": 300.0}, "visited": ["家", "公司"]}},
+        ],
+    }
+    snapshot = {
+        "now_playing": {"title": "Motion Sickness", "artist": "Phoebe Bridgers"},
+        "place_label": "公司",
+        "broadcast_state": "off",
+        "calendar_next_event": {"title": "站会", "start_time": "2026-06-26T10:00"},
+        "recent_apps": [
+            {"app": "Spotify", "ts": 30.0}, {"app": "Messages", "ts": 20.0}, {"app": "Spotify", "ts": 10.0},
+        ],
+    }
+    pull = {"condition": "sunny", "temperature": 24.0}  # weather present; mood/reminders absent
+    photos = [{"photo_id": "p1", "metadata": {"scene_hint": "food", "time_of_day": "evening"}}]
+
+    board = history.cross_domain_recent(
+        snapshot=snapshot, pull_snapshot=pull, rows_by_signal=rows_by_signal,
+        photos=photos, max_health_notable=8,
+    )
+
+    # All life-context domains laid out; health is exactly ONE entry, not the headline.
+    assert set(board) == {"location", "media", "app", "health", "weather",
+                          "mood", "reminders", "calendar", "photos", "screen"}
+    assert len(board["health"]["notable"]) == 2  # folded, both health signals as plain rows
+    # media + place novelty surface as light factual hints
+    assert board["media"]["now"] == {"title": "Motion Sickness", "artist": "Phoebe Bridgers"}
+    assert board["media"]["novelty"] == "new_artist"
+    assert board["location"]["now"] == "公司"
+    assert board["location"]["novelty"] == "long_dwell"
+    # app: most-recent first, deduped
+    assert board["app"]["now"] == "Spotify"
+    assert board["app"]["recent"] == ["Spotify", "Messages"]
+    # honest-empty domains when data is missing
+    assert board["weather"] == {"condition": "sunny", "temperature": 24.0}
+    assert board["mood"] == {"status": "none"}
+    assert board["photos"]["scenes"] == ["food"]
+    assert board["screen"] == {"state": "off"}
+
+
+def test_cross_domain_recent_degrades_to_empty_on_no_inputs():
+    board = history.cross_domain_recent(
+        snapshot=None, pull_snapshot=None, rows_by_signal=None, photos=None,
+    )
+    assert board["health"]["notable"] == []
+    assert board["media"]["now"] is None
+    assert board["weather"] == {"status": "none"}
+    assert board["photos"] == {"recent_count": 0, "scenes": []}
+
+
 def test_record_unhistorized_signal_raises():
     try:
         history.record_daily(None, "now", {"battery_level": 0.5})

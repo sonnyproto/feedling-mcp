@@ -10,6 +10,21 @@ import json
 from typing import Any
 
 
+# Hard output contract appended to every JSON-emitting map/reduce prompt. Genesis
+# carries VERBATIM user/TA turns into JSON string values, and real history routinely
+# contains ASCII double-quotes / newlines / backslashes; an un-escaped " closes the
+# string early and json.loads rejects the whole reply (observed live: haiku-4.5
+# voice-map -> "Expecting ',' delimiter"). Forcing escape + bare-JSON output fixed it
+# 3/3 in env replay. The worker parser still adds repair/retry as defense-in-depth.
+_STRICT_JSON_SUFFIX = (
+    "\n\n严格输出要求:只输出一个能被 json.loads 直接解析的合法 JSON;"
+    "不要 markdown 围栏、不要任何前后说明文字。"
+    "需要逐字保留的原话写进 JSON 字符串时必须转义:英文双引号转义为 \\\" ,"
+    "换行转义为 \\n,制表符转义为 \\t,反斜杠转义为 \\\\。"
+    "中文引号「」『』“”‘’ 原样保留、无需转义。"
+)
+
+
 VOICE_MAP_PROMPT = """你在看一段「用户 ↔ TA(AI 伴侣)」真实对话的【其中一块】。
 任务:抽出「TA 怎么说话」的【表层形式】,不是它说了什么。
 
@@ -99,14 +114,14 @@ def _json(data: Any) -> str:
 
 def voice_map_messages(chunk_text: str) -> list[dict[str, str]]:
     return [
-        {"role": "system", "content": VOICE_MAP_PROMPT},
+        {"role": "system", "content": VOICE_MAP_PROMPT + _STRICT_JSON_SUFFIX},
         {"role": "user", "content": str(chunk_text or "")},
     ]
 
 
 def voice_reduce_messages(candidates: list[dict]) -> list[dict[str, str]]:
     return [
-        {"role": "system", "content": VOICE_REDUCE_PROMPT},
+        {"role": "system", "content": VOICE_REDUCE_PROMPT + _STRICT_JSON_SUFFIX},
         {"role": "user", "content": _json({"candidates": candidates})},
     ]
 
@@ -127,14 +142,14 @@ def persona_build_messages(persona_material: str, behavior_notes: list[str], exe
 
 def fact_map_messages(chunk_text: str) -> list[dict[str, str]]:
     return [
-        {"role": "system", "content": FACT_MAP_PROMPT},
+        {"role": "system", "content": FACT_MAP_PROMPT + _STRICT_JSON_SUFFIX},
         {"role": "user", "content": str(chunk_text or "")},
     ]
 
 
 def fact_write_messages(fact_digest: list[dict], persona_material: str = "", memory_summary: str = "") -> list[dict[str, str]]:
     return [
-        {"role": "system", "content": FACT_WRITE_PROMPT},
+        {"role": "system", "content": FACT_WRITE_PROMPT + _STRICT_JSON_SUFFIX},
         {
             "role": "user",
             "content": _json({
