@@ -30,6 +30,7 @@
 - [ ] **A3 capture 那轮的结构化输出可靠性** —— 验 Codex 在 "只许吐 JSON 卡" 的 prompt 下到底吐不吐得出可解析 JSON。若连 capture 都不稳 → 需给 resident runtime 一个**结构化 action 输出协议(reply + actions)**。【**Codex/zhihao 域**:resident runtime / Codex wrapper】
 - [ ] **A4 onboarding validate 加 memory-capture readiness 检查** —— "chat live ≠ capture 可用",validate 不能只证明聊天通。
 - [ ] **A5(次要/可选清理)去掉 memory 的 inline**(`execute_agent_actions` 的 memory.* 分支),全收口到 capture;**identity.* 的 inline 必须保留**。注:对 Codex 本来就没在跑,删=零变化,**不紧急**,当顺手清理。
+- [ ] **🔴 A6 agent 沙箱禁网 → 读不了记忆(0628 实测 bug,真实用户会踩)。** codex agent 子进程沙箱(`--sandbox read-only` / 默认)禁了 io_cli 的网络 → agentic recall 读不到 memory API → 用户问记忆 agent 假性"查不到"(卡其实在)。影响 codex-driver(host+VPS),claude 不受影响;onboarding 只验聊天回路、不验读记忆 → 静默溜过。修=① **host**:`spawners.py:_default_cli_cmd` codex 默认命令加联网沙箱(`--sandbox danger-full-access` 或 workspace-write+network_access,flag 按 codex 版本验);② **VPS**:`skill-resident-agent.md` 文档化"沙箱必须放网"+ 给对的 codex 命令;③ **onboarding validate 加"真让 agent 跑一次 io_cli 读记忆"检查**(网络断就 fail+报因,不再静默)。待 Codex/zhihao 确认 codex 默认沙箱+flag。详见 memory `io-agent-sandbox-blocks-memory-read`。
 
 ---
 
