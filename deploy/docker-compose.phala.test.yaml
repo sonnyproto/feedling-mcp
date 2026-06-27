@@ -87,7 +87,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:f2f34ee
+    image: ghcr.io/teleport-computer/feedling:6fa18f7
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -133,7 +133,7 @@ services:
   # unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:f2f34ee
+    image: ghcr.io/teleport-computer/feedling:6fa18f7
     # gunicorn = production WSGI (the Werkzeug dev server stalls on large
     # responses under TDX). -w N is now code-supported (leader-elected :9998 WS
     # ingest + Postgres LISTEN/NOTIFY wake bus — see core/leader.py /
@@ -226,7 +226,7 @@ services:
   # injecting AGENT_RUNTIME_USERS (roster JSON) via the encrypted env channel —
   # no compose change / on-chain re-auth needed. See deploy/DEPLOYMENTS.md.
   agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:f2f34ee
+    image: ghcr.io/teleport-computer/feedling-agent-runner:6fa18f7
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
     environment:
