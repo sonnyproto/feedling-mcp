@@ -9,12 +9,15 @@
 ## 0. 环境(CI 同款)
 
 ```bash
-# Python 3.12
-pip install --require-hashes -r backend/requirements.lock
-pip install pytest pytest-asyncio requests          # 测试专用
-# 部分用例要 Postgres:
-export FEEDLING_TEST_PG="postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+# ⚠️ 用 Python 3.12。本机默认 python3 可能是 3.14(跑不了),用 3.12 venv,例如
+#    /private/tmp/feedling-m2-venv/bin/python。下文 `python3` = 你的 3.12 解释器。
+# ⚠️ 必须两条独立命令、别合并:--require-hashes 模式下不能跟未 pin 的包同条,否则报 hash 错。
+python3 -m pip install --require-hashes -r backend/requirements.lock
+python3 -m pip install pytest pytest-asyncio requests        # 测试专用,单独一条
+# 部分用例要 Postgres。连接串用你本机实际的(下面只是示例,端口/账号按你的来,如 55432):
+export FEEDLING_TEST_PG="postgresql://<user>:<pw>@127.0.0.1:<port>/postgres"
 ```
+> 实测可跑环境(Codex 0627):`FEEDLING_TEST_PG=postgresql://postgres:test@127.0.0.1:55432/postgres` + `/private/tmp/feedling-m2-venv/bin/python`。
 > ⚠️ **必须 `--ignore` 两个 live 脚本**:`tests/test_api.py`、`tests/e2e_model_api_test.py` —— 它们不是 pytest suite,是 live-server 脚本(import 即打服务/`sys.exit`),被 `pytest tests/` 收集会炸。`test_api.py` 放档2 单独跑。
 > `test_memory_readside_docker_e2e.py` **不要跳**:它只 `read_text()` 读 compose 文本、不起 docker,是普通 pytest。
 > 真正的环境性跳过只有:需 `dstack_sdk` 的少数 enclave 路测 / 需网络的用例 —— 缺环境时 pytest 报 skip(不是断言失败)就行。
@@ -123,7 +126,8 @@ python3 tests/test_api.py <API_URL> --multi-tenant
 
 ## 档 3 · genesis 全链路 live e2e(对 test 部署 — 验真上传→蒸馏→done)
 
-**前置**:`FEEDLING_GENESIS_WORKER_ENABLED=1` + `FEEDLING_RUNTIME_TOKEN_SECRET` + `FEEDLING_ENCLAVE_URL`;一个能蒸馏的 provider key。
+**前置**:`FEEDLING_GENESIS_WORKER_ENABLED=1` + `FEEDLING_RUNTIME_TOKEN_SECRET` + `FEEDLING_ENCLAVE_URL`;**一个能蒸馏的 provider key**(本机/CI 默认没有 → 这档 Codex 跑不了,需 hx 提供 key 才能自动验)。
+> 没 key 时不算缺口:**同一条路径(上传→蒸馏→voice/identity/memory)由 hx 真机 onboarding 覆盖**(`V1-功能效果核对清单-给hx.md` 第 1 条,开 Genesis 开关走新用户)。要 Codex 自动验就给它一个 provider key。
 ```bash
 printf 'me: 我家狗叫蛋子\nher: 蛋子今天乖吗？\nme: 上周去了西湖\n' > /tmp/t.txt
 python3 tools/genesis_e2e.py upload --api-url <TEST_API_URL> --register \
