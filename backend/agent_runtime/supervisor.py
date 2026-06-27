@@ -425,12 +425,29 @@ def _genesis_ready_to_spawn(user_id: str) -> bool:
     return not _genesis_status_blocks_spawn(blob)
 
 
+def _persona_version(user_id: str) -> str:
+    """genesis_persona content digest (sha256) for respawn fingerprinting, or ''.
+    Read-only, no decrypt — the digest is plaintext metadata on the blob. Empty when
+    absent (no genesis / not backfilled yet), so a user without persona has a stable
+    '' and isn't bounced (cutover gate 4 C)."""
+    if not user_id:
+        return ""
+    try:
+        import db  # local import: keep this module pure-unit importable
+        blob = db.get_blob(user_id, "genesis_persona")
+    except Exception:
+        return ""
+    return str(blob.get("sha256") or "") if isinstance(blob, dict) else ""
+
+
 def _spawn_identity(entry: dict) -> tuple:
     """The spawn-determining fields of a roster entry — when any changes, the
     running consumer's env/home is stale and it must be respawned. Mirrors what
     ``spawners.consumer_env`` / ``agent_home_files`` consume. The upstream
     ``provider_key`` is EXCLUDED for gateway users (it goes to LiteLLM, not the
-    consumer env), so rotating it doesn't bounce the consumer."""
+    consumer env), so rotating it doesn't bounce the consumer. ``persona_version``
+    (genesis_persona digest) IS included so a voice backfill/Dream re-seeds the
+    persona prompt via a natural respawn (gate 4 C)."""
     driver = (entry.get("driver") or "claude").strip().lower()
     gateway = spawners._codex_transport(entry) == "gateway"
     return (
@@ -440,6 +457,7 @@ def _spawn_identity(entry: dict) -> tuple:
         entry.get("provider") or "",
         entry.get("model") or "",
         "" if gateway else (entry.get("provider_key") or ""),
+        entry.get("persona_version") or "",
     )
 
 
@@ -678,6 +696,13 @@ def main() -> int:
                 roster, gateways = _effective_roster(
                     base_roster, autodiscover=autodiscover, gateway_enabled=gateway_enabled,
                     host_all_discovered=discovered)
+                # Tag each entry with the genesis_persona digest (unified point: covers
+                # base + discovered). _spawn_identity includes it, so when a voice
+                # backfill/Dream writes a new persona blob the next tick respawns and
+                # re-seeds the persona prompt file (only written at spawn) — cutover
+                # gate 4 C. No kill, no in-place prompt rewrite.
+                for _entry in roster:
+                    _entry["persona_version"] = _persona_version(_entry.get("user_id", ""))
                 if gateway_mgr is not None:
                     gateway_mgr.reconcile(gateways)
                 sup.tick(roster)
