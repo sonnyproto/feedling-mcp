@@ -1667,6 +1667,56 @@ def v1_identity_get():
                         "decrypt_errors": [{"reason": reason}]})
 
 
+def _raw_image_mime(data: bytes) -> str | None:
+    """Return the MIME type when plaintext is a recognized raw image."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}:
+            return "image/heic"
+        if brand in {b"avif", b"avis"}:
+            return "image/avif"
+    return None
+
+
+_IMAGE_EXTENSION_BY_MIME = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/heic": "heic",
+    "image/avif": "avif",
+}
+
+
+def _parse_visual_plaintext(plaintext: bytes) -> dict[str, Any]:
+    """Decode a screen-frame JSON wrapper or a raw encrypted photo.
+
+    Screen capture envelopes contain a UTF-8 JSON object whose ``image`` field
+    is base64 JPEG. Perception photo envelopes reuse the same ciphertext
+    channel but encrypt the image bytes directly. Only recognized image file
+    signatures take the raw-photo fallback so malformed frame JSON still fails
+    closed instead of being forwarded to a vision provider as arbitrary bytes.
+    """
+    try:
+        inner = json.loads(plaintext.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        image_mime = _raw_image_mime(plaintext)
+        if image_mime is None:
+            raise
+        return {
+            "image": base64.b64encode(plaintext).decode("ascii"),
+            "image_mime": image_mime,
+        }
+    if not isinstance(inner, dict):
+        raise ValueError("visual plaintext is not an object")
+    return inner
+
+
 @app.route("/v1/screen/frames/<frame_id>/decrypt", methods=["GET"])
 def v1_frame_decrypt(frame_id):
     """Decrypt a single v1 screen-frame envelope and return its plaintext.
@@ -1734,8 +1784,8 @@ def v1_frame_decrypt(frame_id):
         return jsonify({"error": f"decrypt_failed: {e.reason}"}), 502
 
     try:
-        inner = json.loads(plaintext.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        inner = _parse_visual_plaintext(plaintext)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
         return jsonify({"error": f"plaintext_parse: {e}"}), 502
 
     result = {
@@ -1754,7 +1804,7 @@ def v1_frame_decrypt(frame_id):
     }
     if include_image:
         result["image_b64"] = inner.get("image", "")
-        result["image_mime"] = "image/jpeg"
+        result["image_mime"] = inner.get("image_mime") or "image/jpeg"
     else:
         result["image_b64"] = None
         result["image_bytes_omitted"] = True
@@ -1817,13 +1867,14 @@ def v1_frame_caption(frame_id):
         return jsonify({"error": f"key_derivation_unavailable: {e}"}), 503
     try:
         plaintext = _decrypt_envelope(env, authorized_user_id, content_sk)
-        inner = json.loads(plaintext.decode("utf-8"))
+        inner = _parse_visual_plaintext(plaintext)
     except DecryptFailure as e:
         return jsonify({"error": f"decrypt_failed: {e.reason}"}), 502
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
         return jsonify({"error": f"plaintext_parse: {e}"}), 502
 
     image_b64 = inner.get("image", "")
+    image_mime = inner.get("image_mime") or "image/jpeg"
     ocr_text = str(inner.get("ocr_text") or "")
     mode = (request.args.get("mode") or "caption").lower()
     full = mode == "full"
@@ -1837,7 +1888,7 @@ def v1_frame_caption(frame_id):
     user_content = [
         {"type": "text", "text": instruction},
         {"type": "image_url",
-         "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+         "image_url": {"url": f"data:{image_mime};base64,{image_b64}"}},
     ]
     if ocr_text:
         user_content.append(
@@ -1945,15 +1996,16 @@ def v1_frame_image(frame_id):
         return jsonify({"error": f"decrypt_failed: {e.reason}"}), 502
 
     try:
-        inner = json.loads(plaintext.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        inner = _parse_visual_plaintext(plaintext)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
         return jsonify({"error": f"plaintext_parse: {e}"}), 502
 
     image_b64 = inner.get("image", "")
+    image_mime = inner.get("image_mime") or "image/jpeg"
     if not image_b64:
         return jsonify({"error": "no image in plaintext"}), 404
     try:
-        jpeg_bytes = base64.b64decode(image_b64)
+        image_bytes = base64.b64decode(image_b64)
     except Exception as e:
         return jsonify({"error": f"image_b64_decode: {e}"}), 502
 
@@ -1961,10 +2013,10 @@ def v1_frame_image(frame_id):
     # out of the box — clients can split the JPEG into parallel chunks
     # to bypass the per-TCP-connection throttle on dstack-gateway.
     return send_file(
-        BytesIO(jpeg_bytes),
-        mimetype="image/jpeg",
+        BytesIO(image_bytes),
+        mimetype=image_mime,
         as_attachment=False,
-        download_name=f"{frame_id}.jpg",
+        download_name=f"{frame_id}.{_IMAGE_EXTENSION_BY_MIME.get(image_mime, 'image')}",
         conditional=True,
         max_age=0,
     )
