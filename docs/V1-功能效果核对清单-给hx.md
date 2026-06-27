@@ -40,14 +40,15 @@
 📊 **面板**:说事实那轮出现 `memory.write.actions`(types 含 memory.add、status=ok)= 落卡了;问它那轮出现 `memory.index.called` / `memory.fetch.called`(detail 有 counts)= 真去召回了。
 > 注:Garden 的分类/线索好不好看 = 体验验收,**不挡后端 v1 上线**(当前 Garden 可能还是简版/给设计看的页)。红线只是"不崩 + 看得到卡内容"。
 
-## 5. host → agent_runtime 切换(本版核心,非干净切)
+## 5. host → agent_runtime 切换(本版核心)
 
-**这功能该干什么**:把 host 聊天从老的 route-B 切到 agent_runtime;但**图片和 gateway provider 故意保留老路**,不能切断;identity 写读独立、不受影响。
+**这功能该干什么**:把 host 聊天切到 agent_runtime。**文本和图片现在都走 agent_runtime**(consumer 已能处理图片 envelope,图片不再回落 legacy);identity 写读独立、不受影响。runtime/gateway 不可用时**明确报错(503),不静默卡死**。
 **怎么触发**:正常文本聊天 / 发图片 / 用 gateway provider 的账号聊 / 期间改身份。
-**✅成功**:文本走新 runtime 正常;**发图片照样能聊(没断)**;**gateway 账号没断**;身份写读一切正常。
-**❌坏**:发图片报错/断;gateway 账号断;身份功能受影响。
-📊 **面板**:纯文本那轮出现 `route.decided mode=agent_runtime`;发图片那轮出现 `route.decided mode=legacy reason=image`;gateway 关时 `mode=legacy reason=driver_legacy` —— 一眼看出走了新路还是回落 legacy。
-> 红线:图片断、gateway 断 = 直接别上。
+**✅成功**:文本和图片都能聊(都走 runtime、没断);gateway 账号在 gateway 起着时正常;身份写读一切正常;runtime 真挂时给清楚错误而不是无限转圈。
+**❌坏**:图片报错/断;能聊的账号被无声卡死;身份功能受影响。
+📊 **面板**:每轮出现 `route.decided mode=agent_runtime`(图片那轮 detail `has_image=true`);**runtime/gateway 不可用那轮**出现 `route.decided status=gated reason=supervisor_unavailable` —— 一眼区分"正常走 runtime" vs "被挡住报错"。
+> 红线:图片断、能聊的账号无声卡死 = 直接别上。
+> 注:这版图片**不再走 legacy**(consumer 处理图片);老文档里"图片回落 legacy"已过时。
 
 ## 6. 老用户 voice backfill(不退化)
 
