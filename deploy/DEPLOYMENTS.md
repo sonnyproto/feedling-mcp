@@ -106,7 +106,7 @@ CI secrets/vars (test job; `TEST_`-prefixed): `secrets.TEST_AGENT_RUNTIME_USERS`
 
 Screen perception captioning is opt-in per user via the `screen_caption_enabled` flag (default OFF, fail-closed). To enable:
 
-- **Required secret**: `FEEDLING_SCREEN_VLM_API_KEY` — OpenRouter API key for VLM inference. Injected via `phala deploy -e FEEDLING_SCREEN_VLM_API_KEY=<key>` (encrypted env channel, not in compose_hash). If absent, the `/v1/screen/frames/<id>/caption` route fails closed with `screen_caption_unconfigured`.
+- **Required secret**: `FEEDLING_SCREEN_VLM_API_KEY` — OpenRouter API key for VLM inference. The deploy workflow maps the existing GitHub `OPENROUTER_API_KEY` secret to this service-specific variable and injects it via `phala deploy -e` (encrypted env channel, not in compose_hash). If absent, the `/v1/screen/frames/<id>/caption` route fails closed with `screen_caption_unconfigured`.
 - **Optional overrides**: `FEEDLING_SCREEN_VLM_MODEL` (default `qwen/qwen3-vl-8b-instruct`), `FEEDLING_SCREEN_VLM_BASE_URL` (default `https://openrouter.ai/api/v1`). Injected same way.
 
 **Non-code prerequisites before enabling for any user:**
