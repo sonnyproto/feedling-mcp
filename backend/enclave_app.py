@@ -1391,11 +1391,31 @@ def v1_chat_history():
                 "decrypt_status": "ok",
             }
             if ctype == "image":
-                # Image plaintext is raw JPEG bytes — surface as base64 so
-                # JSON callers (vision-capable agents, iOS clients with
-                # local copies) can decode and render. `content` left empty.
+                # Image plaintext is raw image bytes (JPEG/PNG/WebP) — surface
+                # as base64 so JSON callers (vision-capable agents, iOS clients
+                # with local copies) can decode and render.
+                # If a caption envelope is present (user sent text alongside the
+                # image), decrypt it and fill content so the agent sees the
+                # user's actual question rather than an empty string.
                 entry["content"] = ""
+                cap_ct = m.get("caption_body_ct")
+                if cap_ct:
+                    cap_env = {
+                        "id": m.get("caption_id") or m.get("id"),
+                        "v": int(m.get("caption_v", v) or v),
+                        "body_ct": cap_ct,
+                        "nonce": m.get("caption_nonce"),
+                        "K_enclave": m.get("caption_K_enclave"),
+                        "owner_user_id": m.get("caption_owner_user_id") or m.get("owner_user_id"),
+                    }
+                    try:
+                        entry["content"] = _decrypt_envelope(
+                            cap_env, authorized_user_id, content_sk
+                        ).decode("utf-8", errors="replace")
+                    except Exception as e:
+                        errors.append({"id": m.get("id"), "reason": f"caption_decrypt: {e}"})
                 entry["image_b64"] = base64.b64encode(plaintext).decode("ascii")
+                entry["image_mime"] = m.get("image_mime") or "image/jpeg"
             else:
                 entry["content"] = plaintext.decode("utf-8", errors="replace")
             decrypted.append(entry)

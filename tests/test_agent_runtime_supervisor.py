@@ -484,20 +484,20 @@ def test_effective_roster_host_all_base_roster_overrides_by_user_id():
     assert len(roster) == 1 and roster[0]["provider_key"] == "sk-dev"
 
 
-# ---- Codex P1: host_all must reach the DB discovery query ----
+# ---- P1: _discover_enabled threads include_gateway to DB (host_all removed) ----
 
 
-def test_discover_enabled_threads_host_all_to_db(monkeypatch):
+def test_discover_enabled_threads_include_gateway_to_db(monkeypatch):
+    # host_all parameter removed; _discover_enabled now only passes include_gateway
     captured = {}
 
-    def fake_list(include_gateway=False, host_all=False):
+    def fake_list(include_gateway=False):
         captured["include_gateway"] = include_gateway
-        captured["host_all"] = host_all
         return []
 
     monkeypatch.setattr(supervisor_mod.db, "list_agent_runtime_enabled_users", fake_list)
-    supervisor_mod._discover_enabled(include_gateway=True, host_all=True)
-    assert captured == {"include_gateway": True, "host_all": True}
+    supervisor_mod._discover_enabled(include_gateway=True)
+    assert captured == {"include_gateway": True}
 
 
 # ---- Codex P2: preserve a cached provider key across transient credential failures ----
@@ -610,3 +610,11 @@ def test_autoverify_stops_probing_once_it_passes_after_failures():
     supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
                                      state=state, post_verify=pv2, now=now)
     assert called["n"] == 0                         # done → never probes again
+
+
+def test_supervisor_heartbeat_payload_shape():
+    """每 tick 写入 server_config 的全局心跳载荷：ts + owner + host_all + gateway。
+    backend 的 wedge 守卫据此判断 supervisor 是否在托管。"""
+    p = supervisor_mod._supervisor_heartbeat_payload(
+        "host:7", host_all=True, gateway=False, ts=123.5)
+    assert p == {"ts": 123.5, "owner": "host:7", "host_all": True, "gateway": False}

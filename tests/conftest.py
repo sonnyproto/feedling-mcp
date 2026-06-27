@@ -23,6 +23,13 @@ from pathlib import Path
 
 import pytest
 
+# Let hosting-ready check pass in tests by default. Tests that specifically
+# test the assert_hosting_ready() raise path (test_hosted_agent_runtime_cutover.py)
+# use monkeypatch.delenv to explicitly unset these, overriding setdefault.
+os.environ.setdefault("FEEDLING_LITELLM_ENABLE", "1")
+os.environ.setdefault("FEEDLING_HOST_ALL", "1")
+os.environ.setdefault("FEEDLING_RUNTIME_TOKEN_SECRET", "test-runtime-token-secret")
+
 _ADMIN_URL = os.environ.get("FEEDLING_TEST_PG", "postgresql://postgres:test@127.0.0.1:55432/postgres")
 _TEST_DB = f"feedling_test_{uuid.uuid4().hex[:12]}"
 

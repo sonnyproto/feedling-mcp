@@ -88,6 +88,24 @@ CI secrets/vars (test job; `TEST_`-prefixed): `secrets.TEST_AGENT_RUNTIME_USERS`
    go — prod auto-hosting has only a global kill-switch + per-user opt-out, no
    per-user gradual ramp.
 
+**Wedge guard (cross-service safety).** After the legacy-inline cutover the backend
+routes EVERY fit-provider send to the agent-runner, so a turn wedges in
+`processing` forever if no consumer is hosting. Two layers prevent silent wedges:
+- **Startup** (`assert_hosting_ready`): the backend refuses to boot unless its own
+  `FEEDLING_LITELLM_ENABLE` + `FEEDLING_HOST_ALL` + `FEEDLING_RUNTIME_TOKEN_SECRET`
+  are set (validated in `__main__` and via `gunicorn_conf.py`'s `on_starting`).
+- **Per request** (`check_supervisor_live`): the supervisor writes a global
+  heartbeat to `server_config` each tick (`ts` + `host_all` + `gateway`); before
+  routing a send the backend reads it and returns **503 `hosting_runtime_unavailable`**
+  (with a `reason`) instead of parking the turn — when the heartbeat is missing,
+  stale, or its `host_all`/`gateway` flags are off. This is what catches the case
+  the startup check can't see: the **agent-runner service** crashed, or has the
+  three vars set on the backend but NOT on itself. **So set all three vars on BOTH
+  services** — a backend-only config still 503s every send (loudly) rather than
+  hanging. Staleness window: `FEEDLING_SUPERVISOR_HEARTBEAT_MAX_AGE_SEC` (default
+  90s ≈ 6 ticks); a DB read error fails **open** (routes anyway) so the guard never
+  becomes its own outage.
+
 **To start real-device testing (recommended order — least → most unvalidated):**
 1. Deploy as-is (agent-runner idle). Confirms the 4th service builds + boots
    without disturbing existing users.
@@ -99,6 +117,20 @@ CI secrets/vars (test job; `TEST_`-prefixed): `secrets.TEST_AGENT_RUNTIME_USERS`
 4. **Last**, after an offline `codex→LiteLLM→gemini/openrouter` tool-loop eval:
    set `TEST_FEEDLING_LITELLM_ENABLE=1` (it auto-includes the gateway providers in
    discovery + starts the proxy) and a gemini/openrouter test user.
+
+**Hosted-cutover deployment prerequisites (三件套，缺一不可):**
+
+收口后，backend cutover 无条件把配了合适 provider 且 `test_ok` 的用户路由到
+agent-runner。以下三个变量必须同时设置；缺任何一个会导致全员 hang 或后端启动失败：
+
+| 变量 | 若缺失 |
+|---|---|
+| `FEEDLING_LITELLM_ENABLE` | 后端 `on_starting` **启动失败 fail-fast**（`gunicorn_conf.py` 的 `assert_hosting_ready` 检查此变量）。**纯 native 部署（无 codex/gemini）也必须设**，否则后端拒绝启动。 |
+| `FEEDLING_HOST_ALL` | 后端 `on_starting` **启动失败 fail-fast**；且 supervisor 不 spawn consumer，用户请求被 backend 路由到 agent-runner 但无 consumer 处理。 |
+| `FEEDLING_RUNTIME_TOKEN_SECRET` | 后端 `on_starting` **启动失败 fail-fast**；且 supervisor 无法为 DB 发现的用户 mint runtime token，host-all 发现静默失败。须在 backend 和 agent-runner 两侧同时设置相同的值。 |
+
+部署顺序：先设 `FEEDLING_RUNTIME_TOKEN_SECRET`（backend + agent-runner 共享同一 secret），
+确认 token 鉴权通过、行为不变；再同步开启 `FEEDLING_HOST_ALL` 和 `FEEDLING_LITELLM_ENABLE`。
 
 ## Enclave configuration
 

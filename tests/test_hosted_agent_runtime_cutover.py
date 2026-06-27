@@ -10,6 +10,8 @@ a store-like object exposing ``chat_messages``.
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 from hosted import agent_runtime_cutover as cutover
@@ -48,83 +50,37 @@ def test_codex_transport_native_only_for_openai():
         assert cutover.codex_transport(p) == ""
 
 
-def test_resolve_driver_defaults_to_legacy_when_disabled():
-    assert cutover.resolve_driver({}) == "legacy"
-    assert cutover.resolve_driver(None) == "legacy"
-    # provider present but hosting not enabled → still legacy (gradual-rollout gate)
-    assert cutover.resolve_driver({"provider": "anthropic"}) == "legacy"
+def test_resolve_driver_raises_when_no_provider():
+    # No config or no provider → raise (no legacy fallback anymore)
+    with pytest.raises(cutover.UnsupportedProviderError):
+        cutover.resolve_driver(None)
+    with pytest.raises(cutover.UnsupportedProviderError):
+        cutover.resolve_driver({})
+    with pytest.raises(cutover.UnsupportedProviderError):
+        cutover.resolve_driver({"provider": "bogus"})
 
 
-def test_resolve_driver_derives_agent_from_provider_when_enabled():
-    on = {"agent_runtime_driver": "auto"}
-    assert cutover.resolve_driver({**on, "provider": "anthropic"}) == "claude"
-    assert cutover.resolve_driver({**on, "provider": "deepseek"}) == "claude"
-    assert cutover.resolve_driver({**on, "provider": "openai"}) == "codex"  # native, no gateway needed
-
-
-def test_resolve_driver_keeps_gateway_providers_legacy_until_gateway_enabled(monkeypatch):
-    # gemini/openrouter/openai_compatible need the in-CVM LiteLLM gateway. With the
-    # gateway OFF (default), routing them to codex would wedge the send in
-    # `processing` (the supervisor spawns no consumer for them) — so they MUST stay
-    # legacy (inline path) until the gateway is actually enabled.
-    monkeypatch.delenv("FEEDLING_LITELLM_ENABLE", raising=False)
-    on = {"agent_runtime_driver": "auto"}
-    for p in ("gemini", "openrouter", "openai_compatible"):
-        assert cutover.resolve_driver({**on, "provider": p}) == "legacy"
-    # openai is native (no gateway) → codex even with the gateway off
-    assert cutover.resolve_driver({**on, "provider": "openai"}) == "codex"
-
-
-def test_resolve_driver_routes_gateway_providers_to_codex_when_gateway_enabled(monkeypatch):
-    monkeypatch.setenv("FEEDLING_LITELLM_ENABLE", "1")
-    on = {"agent_runtime_driver": "auto"}
-    assert cutover.resolve_driver({**on, "provider": "gemini"}) == "codex"
-    assert cutover.resolve_driver({**on, "provider": "openrouter"}) == "codex"
-
-
-def test_resolve_driver_ignores_stale_chosen_value_and_rederives():
-    # A legacy stored "codex" for an anthropic key is treated as enabled and
-    # re-derived to claude — the user never picks the agent.
-    assert cutover.resolve_driver({"agent_runtime_driver": "codex", "provider": "anthropic"}) == "claude"
-
-
-def test_resolve_driver_host_all_hosts_configured_without_flag(monkeypatch):
-    # FEEDLING_HOST_ALL: a configured provider is hosted with NO per-user flag;
-    # only an explicit opt-out (agent_runtime_driver=legacy) stays legacy.
-    monkeypatch.setenv("FEEDLING_HOST_ALL", "1")
-    monkeypatch.delenv("FEEDLING_LITELLM_ENABLE", raising=False)
-    assert cutover.resolve_driver({"provider": "anthropic"}) == "claude"      # no flag → hosted
+def test_resolve_driver_derives_agent_from_provider():
+    # Provider alone determines the driver — no per-user flag needed
+    assert cutover.resolve_driver({"provider": "anthropic"}) == "claude"
+    assert cutover.resolve_driver({"provider": "deepseek"}) == "claude"
     assert cutover.resolve_driver({"provider": "openai"}) == "codex"
-    assert cutover.resolve_driver({"provider": "anthropic",
-                                   "agent_runtime_driver": "legacy"}) == "legacy"  # explicit opt-out
-    assert cutover.resolve_driver({}) == "legacy"                              # no provider
-    assert cutover.resolve_driver({"provider": "gemini"}) == "legacy"         # gateway off → legacy
 
 
-def test_resolve_driver_host_all_off_keeps_flag_gate(monkeypatch):
-    # Default (FEEDLING_HOST_ALL unset): the per-user enable flag is still required.
-    monkeypatch.delenv("FEEDLING_HOST_ALL", raising=False)
-    assert cutover.resolve_driver({"provider": "anthropic"}) == "legacy"
+def test_resolve_driver_routes_all_codex_providers_regardless_of_gateway(monkeypatch):
+    # Gateway check removed: gemini/openrouter/openai_compatible always → codex
+    monkeypatch.delenv("FEEDLING_LITELLM_ENABLE", raising=False)
+    for p in ("gemini", "openrouter", "openai_compatible"):
+        assert cutover.resolve_driver({"provider": p}) == "codex"
+    # openai is native (unaffected)
+    assert cutover.resolve_driver({"provider": "openai"}) == "codex"
 
 
-def test_hosting_enabled_gate():
-    assert cutover.hosting_enabled({"agent_runtime_driver": "auto"}) is True
-    assert cutover.hosting_enabled({"agent_runtime_driver": "legacy"}) is False
-    assert cutover.hosting_enabled({}) is False
-
-
-def test_is_enabled():
-    assert cutover.is_enabled("claude") is True
-    assert cutover.is_enabled("legacy") is False
-
-
-def test_should_route_only_for_enabled_text_turns():
-    assert cutover.should_route("claude", has_image=False) is True
-    assert cutover.should_route("codex", has_image=False) is True
-    # legacy never routes
-    assert cutover.should_route("legacy", has_image=False) is False
-    # image turns stay on the legacy multimodal path (runtime is text-only today)
-    assert cutover.should_route("claude", has_image=True) is False
+def test_resolve_driver_ignores_stale_per_user_flag():
+    # Any stored agent_runtime_driver value is ignored; only provider matters
+    assert cutover.resolve_driver({"agent_runtime_driver": "legacy", "provider": "anthropic"}) == "claude"
+    assert cutover.resolve_driver({"agent_runtime_driver": "codex", "provider": "anthropic"}) == "claude"
+    assert cutover.resolve_driver({"agent_runtime_driver": "auto", "provider": "openai"}) == "codex"
 
 
 # ---- reply lookup ----
@@ -222,3 +178,115 @@ def test_handle_send_returns_processing_when_slow():
     store = FakeStore([{"id": "u1", "role": "user", "ts": 1.0}])
     body, status = cutover.handle_send(store, {"id": "u1", "ts": 1.0}, "claude", timeout=0.0)
     assert status == 202 and body["reply_ready"] is False
+
+
+# ---- assert_hosting_ready ----
+
+def test_assert_hosting_ready_raises_when_litellm_disabled(monkeypatch):
+    monkeypatch.setenv("FEEDLING_HOST_ALL", "1")
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "test-secret")
+    monkeypatch.delenv("FEEDLING_LITELLM_ENABLE", raising=False)
+    with pytest.raises(RuntimeError) as exc_info:
+        cutover.assert_hosting_ready()
+    assert "FEEDLING_LITELLM_ENABLE" in str(exc_info.value)
+
+
+def test_assert_hosting_ready_raises_when_host_all_disabled(monkeypatch):
+    monkeypatch.setenv("FEEDLING_LITELLM_ENABLE", "1")
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "test-secret")
+    monkeypatch.delenv("FEEDLING_HOST_ALL", raising=False)
+    with pytest.raises(RuntimeError) as exc_info:
+        cutover.assert_hosting_ready()
+    assert "FEEDLING_HOST_ALL" in str(exc_info.value)
+
+
+def test_assert_hosting_ready_raises_when_token_secret_missing(monkeypatch):
+    monkeypatch.setenv("FEEDLING_LITELLM_ENABLE", "1")
+    monkeypatch.setenv("FEEDLING_HOST_ALL", "1")
+    monkeypatch.delenv("FEEDLING_RUNTIME_TOKEN_SECRET", raising=False)
+    with pytest.raises(RuntimeError) as exc_info:
+        cutover.assert_hosting_ready()
+    assert "FEEDLING_RUNTIME_TOKEN_SECRET" in str(exc_info.value)
+
+
+def test_assert_hosting_ready_passes_when_all_set(monkeypatch):
+    monkeypatch.setenv("FEEDLING_LITELLM_ENABLE", "1")
+    monkeypatch.setenv("FEEDLING_HOST_ALL", "1")
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "test-secret")
+    cutover.assert_hosting_ready()  # 不抛
+
+
+# ---- supervisor heartbeat wedge guard ----
+# 收口后 backend 无条件把 fit-provider 用户路由到 agent-runner。若 supervisor 没在
+# 托管（心跳缺失/陈旧，或其 host_all/gateway 标志为 false），该 turn 会卡在 processing
+# 无人应答。evaluate_supervisor_heartbeat 是纯判定；check_supervisor_live 读 DB 并在
+# DB 出错时 fail-open（不让守卫自身成为新故障源）。
+
+def test_evaluate_heartbeat_fresh_with_flags_on_is_live():
+    hb = {"ts": 1000.0, "owner": "h:1", "host_all": True, "gateway": True}
+    assert cutover.evaluate_supervisor_heartbeat(hb, now=1010.0, max_age=90) == (True, "")
+
+
+def test_evaluate_heartbeat_absent_is_not_live():
+    ok, reason = cutover.evaluate_supervisor_heartbeat(None, now=1000.0, max_age=90)
+    assert ok is False and reason == "no_supervisor_heartbeat"
+
+
+def test_evaluate_heartbeat_stale_is_not_live():
+    hb = {"ts": 1000.0, "host_all": True, "gateway": True}
+    ok, reason = cutover.evaluate_supervisor_heartbeat(hb, now=1200.0, max_age=90)
+    assert ok is False and reason.startswith("stale_supervisor_heartbeat")
+
+
+def test_evaluate_heartbeat_host_all_off_is_not_live():
+    hb = {"ts": 1000.0, "host_all": False, "gateway": True}
+    ok, reason = cutover.evaluate_supervisor_heartbeat(hb, now=1010.0, max_age=90)
+    assert ok is False and reason == "supervisor_host_all_inactive"
+
+
+def test_evaluate_heartbeat_gateway_off_is_not_live():
+    hb = {"ts": 1000.0, "host_all": True, "gateway": False}
+    ok, reason = cutover.evaluate_supervisor_heartbeat(hb, now=1010.0, max_age=90)
+    assert ok is False and reason == "supervisor_gateway_disabled"
+
+
+def test_evaluate_heartbeat_gateway_off_require_gateway_false_is_live():
+    """gateway=False + require_gateway=False → live。
+    anthropic/openai-native 用户不经 gateway，不应被 supervisor_gateway_disabled 误阻断。"""
+    hb = {"ts": 1000.0, "host_all": True, "gateway": False}
+    ok, reason = cutover.evaluate_supervisor_heartbeat(
+        hb, now=1010.0, max_age=90, require_gateway=False
+    )
+    assert ok is True and reason == ""
+
+
+def test_evaluate_heartbeat_gateway_off_require_gateway_true_is_not_live():
+    """gateway=False + require_gateway=True（默认）→ not-live。
+    openrouter/gemini 等 gateway-transport 用户应被阻断。"""
+    hb = {"ts": 1000.0, "host_all": True, "gateway": False}
+    ok, reason = cutover.evaluate_supervisor_heartbeat(
+        hb, now=1010.0, max_age=90, require_gateway=True
+    )
+    assert ok is False and reason == "supervisor_gateway_disabled"
+
+
+def test_evaluate_heartbeat_missing_ts_is_not_live():
+    ok, reason = cutover.evaluate_supervisor_heartbeat(
+        {"host_all": True, "gateway": True}, now=1000.0, max_age=90)
+    assert ok is False and reason == "bad_supervisor_heartbeat"
+
+
+def test_check_supervisor_live_fails_open_on_db_error(monkeypatch):
+    def boom():
+        raise RuntimeError("pg down")
+    monkeypatch.setattr(cutover.db, "read_supervisor_heartbeat", boom)
+    assert cutover.check_supervisor_live(now=1000.0) == (True, "")
+
+
+def test_check_supervisor_live_reads_db_and_evaluates(monkeypatch):
+    monkeypatch.setattr(cutover.db, "read_supervisor_heartbeat",
+                        lambda: {"ts": 999.0, "host_all": True, "gateway": True})
+    assert cutover.check_supervisor_live(now=1000.0)[0] is True
+    monkeypatch.setattr(cutover.db, "read_supervisor_heartbeat", lambda: None)
+    ok, reason = cutover.check_supervisor_live(now=1000.0)
+    assert ok is False and reason == "no_supervisor_heartbeat"

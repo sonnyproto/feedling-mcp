@@ -61,10 +61,15 @@ def _clean_blobs():
     yield
 
 
-def _seed_model_api(user_id: str, *, provider: str, test_status: str, enabled: bool,
+def _seed_model_api(user_id: str, *, provider: str, test_status: str,
+                    enabled: bool | None = None, agent_runtime_driver: str | None = None,
                     model: str = "x", base_url: str = ""):
-    doc = {"provider": provider, "model": model, "test_status": test_status,
-           "base_url": base_url, "agent_runtime_driver": "auto" if enabled else "legacy"}
+    doc: dict = {"provider": provider, "model": model, "test_status": test_status,
+                 "base_url": base_url}
+    if agent_runtime_driver is not None:
+        doc["agent_runtime_driver"] = agent_runtime_driver
+    elif enabled is not None:
+        doc["agent_runtime_driver"] = "auto" if enabled else "legacy"
     db.set_blob(user_id, "model_api", doc)
 
 
@@ -85,10 +90,13 @@ def test_list_enabled_users_native_only_by_default(_clean_blobs):
     # With the LiteLLM gateway OFF (default), gateway-only providers must NOT be
     # discovered — else they'd be spawned with gateway transport into a proxy that
     # isn't running. Only the native-fit providers (claude/openai) come back.
+    # Flag (agent_runtime_driver) is no longer a gate — test_ok + fit provider suffices;
+    # anthropic_off (agent_runtime_driver='legacy') is now included.
     _seed_all(_clean_blobs)
     rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users()}
     assert {uid: r["driver"] for uid, r in rows.items()} == {
         "anthropic_on": "claude",
+        "anthropic_off": "claude",   # legacy flag no longer gates discovery
         "deepseek_on": "claude",
         "openai_on": "codex",
     }
@@ -99,6 +107,7 @@ def test_list_enabled_users_includes_gateway_when_enabled(_clean_blobs):
     rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(include_gateway=True)}
     assert {uid: r["driver"] for uid, r in rows.items()} == {
         "anthropic_on": "claude",
+        "anthropic_off": "claude",   # legacy flag no longer gates discovery
         "deepseek_on": "claude",
         "openai_on": "codex",
         "gemini_on": "codex",
@@ -114,30 +123,35 @@ def test_list_enabled_users_includes_gateway_when_enabled(_clean_blobs):
     assert rows["compat_on"]["base_url"] == "https://my.host/v1"
 
 
-def test_list_enabled_users_empty_when_none_enabled(_clean_blobs):
-    _seed_model_api("anthropic_off", provider="anthropic", test_status="ok", enabled=False)
+def test_list_enabled_users_empty_when_no_tested_config(_clean_blobs):
+    # 无任何 test_status='ok' 的配置时结果为空（flag 已不再是 gate）
+    _seed_model_api("anthropic_failed", provider="anthropic", test_status="failed", enabled=True)
     assert db.list_agent_runtime_enabled_users() == []
 
 
-# ---- host_all: configured provider is hosted without the per-user enable flag ----
+
+# ---- new semantics: test_ok + fit provider → discovered, no per-user flag ----
 
 
-def test_list_enabled_users_host_all_includes_unflagged(_clean_blobs):
-    # host_all: a tested-ok provider config is discovered even with NO
-    # agent_runtime_driver flag; only an EXPLICIT opt-out (legacy) is excluded.
-    db.set_blob("anthropic_unset", "model_api",
-                {"provider": "anthropic", "model": "x", "test_status": "ok"})  # no flag
-    _seed_model_api("anthropic_optout", provider="anthropic", test_status="ok", enabled=False)  # =legacy
-    _seed_model_api("openai_failed", provider="openai", test_status="failed", enabled=True)
-    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(host_all=True)}
-    assert "anthropic_unset" in rows and rows["anthropic_unset"]["driver"] == "claude"
-    assert "anthropic_optout" not in rows          # explicit opt-out excluded
-    assert "openai_failed" not in rows             # test_status not ok excluded
+def test_list_enabled_users_includes_configured_without_flag(_clean_blobs):
+    # 无 agent_runtime_driver flag，只要 test_status=ok + fit provider 就纳入
+    _seed_model_api("usr_a", provider="anthropic", test_status="ok")  # 无 flag
+    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users()}
+    assert "usr_a" in rows and rows["usr_a"]["driver"] == "claude"
 
 
-def test_list_enabled_users_flag_mode_unchanged(_clean_blobs):
-    # Default (host_all=False): an unflagged config is NOT discovered — the
-    # per-user enable flag is still required (gradual-rollout gate).
-    db.set_blob("anthropic_unset", "model_api",
-                {"provider": "anthropic", "model": "x", "test_status": "ok"})
-    assert db.list_agent_runtime_enabled_users(host_all=False) == []
+def test_list_enabled_users_excludes_untested(_clean_blobs):
+    _seed_model_api("usr_b", provider="anthropic", test_status="")  # 未测通
+    assert db.list_agent_runtime_enabled_users() == []
+
+
+def test_list_enabled_users_excludes_non_fit_provider(_clean_blobs):
+    _seed_model_api("usr_c", provider="weird", test_status="ok")
+    assert db.list_agent_runtime_enabled_users() == []
+
+
+def test_list_enabled_users_ignores_explicit_opt_out_flag(_clean_blobs):
+    # 彻底对齐：连显式 agent_runtime_driver=legacy 也不再排除（kill switch 改用删 config/改 test_status）
+    _seed_model_api("usr_d", provider="openai", test_status="ok", agent_runtime_driver="legacy")
+    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users()}
+    assert "usr_d" in rows and rows["usr_d"]["driver"] == "codex"

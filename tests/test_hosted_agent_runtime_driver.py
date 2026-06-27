@@ -98,24 +98,23 @@ def test_enabling_hosting_derives_codex_for_openai(client):
     assert res.get_json()["driver"] == "codex"
 
 
-def test_enabling_hosting_gateway_provider_stays_legacy_until_gateway_enabled(client, monkeypatch):
-    # gemini needs the LiteLLM gateway; with it OFF (default), enabling hosting
-    # reports legacy so the send keeps using the inline path (no consumer exists).
+def test_gateway_provider_derives_codex_regardless_of_gateway_flag(client, monkeypatch):
+    # Gateway check removed: gemini → codex unconditionally (consumer handles it)
     monkeypatch.delenv("FEEDLING_LITELLM_ENABLE", raising=False)
     user_id, api_key = _register(client)
     _seed_config(user_id, provider="gemini")
-    res = client.post("/v1/model_api/driver", json={"enabled": True}, headers=_headers(api_key))
+    res = client.post("/v1/model_api/driver", json={}, headers=_headers(api_key))
     assert res.status_code == 200
-    assert res.get_json()["driver"] == "legacy"
+    assert res.get_json()["driver"] == "codex"
 
 
-def test_enabling_hosting_gateway_provider_derives_codex_when_gateway_enabled(client, monkeypatch):
+def test_gateway_provider_derives_codex_when_gateway_enabled(client, monkeypatch):
     monkeypatch.setenv("FEEDLING_LITELLM_ENABLE", "1")
     user_id, api_key = _register(client)
     _seed_config(user_id, provider="gemini")
-    res = client.post("/v1/model_api/driver", json={"enabled": True}, headers=_headers(api_key))
+    res = client.post("/v1/model_api/driver", json={}, headers=_headers(api_key))
     assert res.status_code == 200
-    # gemini/openrouter/openai_compatible → codex (LiteLLM-bridged) once gateway on
+    # gemini/openrouter/openai_compatible → codex (LiteLLM-bridged)
     assert res.get_json()["driver"] == "codex"
 
 
@@ -125,14 +124,18 @@ def test_set_driver_requires_configured_model_api(client):
     assert res.status_code == 404
 
 
-def test_disabling_hosting_rolls_back_to_legacy(client):
+def test_driver_endpoint_always_derives_from_provider(client):
+    # Endpoint no longer has enable/disable toggle; driver is always derived from provider
     user_id, api_key = _register(client)
     _seed_config(user_id, provider="anthropic", agent_runtime_driver="auto")
     res = client.post("/v1/model_api/driver", json={"enabled": False}, headers=_headers(api_key))
     assert res.status_code == 200
+    body = res.get_json()
+    assert body["enabled"] is True        # always True now
+    assert body["driver"] == "claude"     # derived from provider, not from enabled flag
     store = core_store.get_store(user_id)
     config = appmod.hosted_config_store._load_model_api_config(store)
-    assert agent_runtime_cutover.resolve_driver(config) == "legacy"
+    assert agent_runtime_cutover.resolve_driver(config) == "claude"
 
 
 # ---- GET /v1/model_api/key_envelope ----
@@ -159,3 +162,28 @@ def test_get_key_envelope_404_when_no_envelope(client):
 def test_get_key_envelope_requires_auth(client):
     res = client.get("/v1/model_api/key_envelope")
     assert res.status_code in (401, 403)
+
+
+# ---- pure unit tests for resolve_driver (new semantics) ----
+
+import pytest
+from hosted import agent_runtime_cutover as arc
+
+def test_resolve_driver_returns_codex_for_openrouter():
+    assert arc.resolve_driver({"provider": "openrouter"}) == "codex"
+
+def test_resolve_driver_returns_claude_for_anthropic():
+    assert arc.resolve_driver({"provider": "anthropic"}) == "claude"
+
+def test_resolve_driver_raises_when_unconfigured():
+    with pytest.raises(arc.UnsupportedProviderError):
+        arc.resolve_driver(None)
+
+def test_resolve_driver_raises_for_unknown_provider():
+    with pytest.raises(arc.UnsupportedProviderError):
+        arc.resolve_driver({"provider": "weird"})
+
+def test_resolve_driver_ignores_per_user_flag_and_gateway(monkeypatch):
+    monkeypatch.delenv("FEEDLING_LITELLM_ENABLE", raising=False)
+    monkeypatch.delenv("FEEDLING_HOST_ALL", raising=False)
+    assert arc.resolve_driver({"provider": "openrouter", "agent_runtime_driver": "legacy"}) == "codex"
