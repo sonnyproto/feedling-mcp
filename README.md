@@ -220,7 +220,7 @@ clients                               agents via feedling-chat-resident
 
     iOS audit card ──pins sha256(DER) on -5003s passthrough──► enclave_app
     compose_hash authorized on Ethereum Sepolia ─────────────► FeedlingAppAuth
-                                                               0x6c8A6f1e3eD4180B2048B808f7C4b2874649b88F
+                                                               0x6c8A6f1e3eD4180B2048B808f7C4b2874649b88F 
 ```
 
 ---
