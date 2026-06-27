@@ -20,6 +20,7 @@ from accounts import runtime_auth
 from bootstrap import gates as boot_gates
 from identity import service as identity_service
 from memory import actions as memory_actions_mod
+from memory import migration as memory_migration
 from memory import service as memory_service
 import memory_readside_core
 
@@ -245,6 +246,59 @@ def memory_actions():
         return jsonify({"error": "actions required"}), 400
     body, status = memory_actions_mod._execute_memory_actions(store, api_key, actions)
     return jsonify(body), status
+
+
+@bp.route("/v1/memory/migration_state", methods=["GET", "POST"])
+def memory_migration_state():
+    """Legacy→v1 migration state cache (status: unknown|pending|done).
+
+    GET: read the per-user blob (trigger reads via db.get_blob server-side; this
+    is for the consumer/observability). POST {migrated, legacy_remaining}: the
+    migrate handler reports a finished batch; the server advances the state
+    machine (migration.next_state). The blob is only an enqueue-cache — card
+    SHAPE stays the source of truth, so a stale 'done' still self-heals."""
+    store = auth.require_user()
+    if request.method == "GET":
+        state = db.get_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB)
+        return jsonify({"state": state or memory_migration.initial_state()})
+    runtime_auth.authorize_scope("memory")
+    payload = request.get_json(silent=True) or {}
+    try:
+        migrated = int(payload.get("migrated") or 0)
+        legacy_remaining = int(payload.get("legacy_remaining") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "migrated/legacy_remaining must be ints"}), 400
+    current = db.get_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB)
+    new_state = memory_migration.next_state(current, migrated=migrated, legacy_remaining=legacy_remaining)
+    db.set_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB, new_state)
+    return jsonify({"state": new_state})
+
+
+@bp.route("/v1/memory/legacy_batch", methods=["POST"])
+def memory_legacy_batch():
+    """Return a batch of pre-v1 (old-schema) cards, decrypted to their RAW inner,
+    for the migration handler. Detection + raw decrypt happen server-side (enclave
+    access is natural here); the readside fetch can't be used because it already
+    adapts old→v1 for display. Each row = {id, inner(raw old), old_body_hash}; the
+    consumer feeds these to the agent and writes back via memory.upgrade."""
+    store = auth.require_user()
+    runtime_auth.authorize_scope("memory")
+    api_key = auth._extract_api_key()
+    payload = request.get_json(silent=True) or {}
+    try:
+        batch_size = max(1, min(int(payload.get("batch_size") or memory_migration.DEFAULT_MIGRATE_BATCH), 50))
+    except (TypeError, ValueError):
+        batch_size = memory_migration.DEFAULT_MIGRATE_BATCH
+    moments = memory_service._active_memory_moments(memory_service._load_moments(store))
+    decrypted: list[tuple[dict, dict]] = []
+    for m in moments:
+        if not isinstance(m, dict) or m.get("visibility") == "local_only":
+            continue
+        inner, _err = memory_actions_mod._memory_plain_from_envelope(m, api_key)
+        if isinstance(inner, dict):
+            decrypted.append((m, inner))
+    batch = memory_migration.select_legacy_batch(decrypted, batch_size=batch_size)
+    return jsonify({"batch": batch, "legacy_remaining": memory_migration.count_legacy(decrypted)})
 
 
 @bp.route("/v1/memory/list", methods=["GET"])

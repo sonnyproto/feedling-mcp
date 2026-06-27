@@ -121,6 +121,7 @@ except ImportError:
 
 from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards
 from memory.dream_prompt_v1 import build_dream_prompt, parse_dream_consolidations
+from memory.migrate_prompt_v1 import build_migrate_prompt, parse_migrated_cards
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -4715,6 +4716,141 @@ def _process_proactive_jobs(jobs: list) -> float:
     return latest
 
 
+def _is_memory_migrate_job(job: dict) -> bool:
+    return (
+        str((job or {}).get("job_kind") or "").strip() == "memory_migrate"
+        or str((job or {}).get("source") or "").strip() == "memory_migrate"
+    )
+
+
+def _migrate_render_old_cards(batch: list[dict]) -> str:
+    """Render the legacy batch (raw old inner) for the migrate prompt — id + only
+    the old content fields that are present."""
+    lines: list[str] = []
+    for row in batch:
+        inner = row.get("inner") if isinstance(row.get("inner"), dict) else {}
+        fields = {
+            k: inner.get(k)
+            for k in ("title", "description", "her_quote", "context", "linked_dimension")
+            if inner.get(k)
+        }
+        lines.append(json.dumps({"id": row.get("id"), **fields}, ensure_ascii=False))
+    return "\n".join(lines) if lines else "（没有要升级的卡）"
+
+
+def _process_migrate_jobs(jobs: list) -> float:
+    """Realize memory_migrate jobs: upgrade a batch of legacy cards to v1 in place.
+
+    Server picks + raw-decrypts the legacy batch (/v1/memory/legacy_batch); the
+    agent derives v1; we write each back via memory.upgrade (in-place,保 id, CAS).
+    A card counts as migrated ONLY on upgrade status=ok; skipped(stale)/empty(db
+    write fail)/parser-dropped all stay for the next quiet window (self-heal);
+    skipped(not_found) just drops (card gone). Writes only memory actions + the
+    migration-state cache; never posts chat.
+    """
+    latest = 0.0
+    for job in jobs:
+        ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
+        latest = max(latest, ts)
+        if not _is_memory_migrate_job(job):
+            continue
+        key = _proactive_job_key(job)
+        if not _mark_seen(key):
+            continue
+        job_id = str(job.get("job_id") or "")
+        try:
+            if not claim_proactive_job(job_id):
+                log.info("migrate job not claimed id=%s", job_id)
+                continue
+        except Exception as e:
+            log.error("migrate job claim failed id=%s: %s", job_id, e)
+            continue
+        update_proactive_job_status(job_id, "realizing")
+
+        batch_body = _capture_post_json("/v1/memory/legacy_batch", payload={"batch_size": 8})
+        batch = batch_body.get("batch") if isinstance(batch_body.get("batch"), list) else []
+        legacy_remaining = int(batch_body.get("legacy_remaining") or 0)
+        if not batch:
+            _capture_post_json("/v1/memory/migration_state", payload={"migrated": 0, "legacy_remaining": 0})
+            update_proactive_job_status(
+                job_id, "completed", "migrate_no_legacy",
+                extra={"migrate_result": {"status": "noop", "reason": "no_legacy", "migrated": 0}},
+            )
+            log.info("migrate job completed noop (no legacy) id=%s", job_id)
+            continue
+
+        allowed_ids = {str(r.get("id")) for r in batch if r.get("id")}
+        hash_by_id = {str(r.get("id")): str(r.get("old_body_hash") or "") for r in batch}
+        _identity, ai_name, user_name, _identity_text = _capture_identity_context()
+        buckets_text, threads_text = _capture_memory_terms_context()
+        prompt = build_migrate_prompt(
+            ai_name=ai_name,
+            user_name=user_name,
+            old_cards=_migrate_render_old_cards(batch),
+            vocab=f"已有桶: {buckets_text}\n已有线索: {threads_text}",
+        )
+        try:
+            reply_text = _capture_agent_reply_text(call_agent(prompt))
+        except Exception as e:
+            reason = f"migrate_agent_call_failed:{type(e).__name__}"
+            log.error("migrate agent call failed id=%s: %s", job_id, e)
+            update_proactive_job_status(
+                job_id, "failed", reason,
+                extra={"migrate_result": {"status": "failed", "reason": reason}},
+            )
+            continue
+        upgrades, unmigrated_ids, err = parse_migrated_cards(reply_text, allowed_ids=allowed_ids)
+        if err:
+            update_proactive_job_status(
+                job_id, "failed", err,
+                extra={"migrate_result": {"status": "failed", "reason": err}},
+            )
+            continue
+
+        occurred_at = _format_message_time(time.time())
+        migrated = 0
+        for up in upgrades:
+            mid = str(up.get("id") or "")
+            if not mid:
+                continue
+            try:
+                envelope = _capture_build_envelope(up, occurred_at=occurred_at, source="memory_migrate")
+            except Exception as e:
+                log.error("migrate envelope build failed id=%s card=%s: %s", job_id, mid, e)
+                continue  # retry next round
+            # Let memory.upgrade carry the existing importance/pulse (don't reset to 0).
+            envelope.pop("importance", None)
+            envelope.pop("pulse", None)
+            body = _capture_post_json("/v1/memory/actions", payload={"action": {
+                "type": "memory.upgrade",
+                "id": mid,
+                "envelope": envelope,
+                "old_body_hash": hash_by_id.get(mid, ""),
+            }})
+            res = (body.get("results") or [{}])[0] if isinstance(body, dict) else {}
+            if res.get("status") == "ok" and not res.get("skipped"):
+                migrated += 1
+            # skipped(stale)/empty(db_write_failed,network)/dropped → not counted → retry next window
+
+        remaining = max(0, legacy_remaining - migrated)
+        _capture_post_json("/v1/memory/migration_state", payload={"migrated": migrated, "legacy_remaining": remaining})
+        update_proactive_job_status(
+            job_id, "completed", "migrate_batch_done",
+            extra={"migrate_result": {
+                "status": "ok",
+                "migrated": migrated,
+                "batch": len(batch),
+                "unmigrated": len(unmigrated_ids),
+                "remaining": remaining,
+            }},
+        )
+        log.info(
+            "migrate job completed id=%s migrated=%d/%d unmigrated=%d remaining=%d",
+            job_id, migrated, len(batch), len(unmigrated_ids), remaining,
+        )
+    return latest
+
+
 def _process_resident_jobs(jobs: list) -> float:
     capture_jobs = [
         job for job in (jobs or [])
@@ -4724,16 +4860,21 @@ def _process_resident_jobs(jobs: list) -> float:
         job for job in (jobs or [])
         if isinstance(job, dict) and _is_memory_dream_job(job)
     ]
+    migrate_jobs = [
+        job for job in (jobs or [])
+        if isinstance(job, dict) and _is_memory_migrate_job(job)
+    ]
     proactive_jobs = [
         job for job in (jobs or [])
         if not (
             isinstance(job, dict)
-            and (_is_memory_capture_job(job) or _is_memory_dream_job(job))
+            and (_is_memory_capture_job(job) or _is_memory_dream_job(job) or _is_memory_migrate_job(job))
         )
     ]
     return max(
         _process_capture_jobs(capture_jobs) if capture_jobs else 0.0,
         _process_dream_jobs(dream_jobs) if dream_jobs else 0.0,
+        _process_migrate_jobs(migrate_jobs) if migrate_jobs else 0.0,
         _process_proactive_jobs(proactive_jobs) if proactive_jobs else 0.0,
     )
 

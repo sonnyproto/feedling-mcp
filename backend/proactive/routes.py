@@ -183,6 +183,8 @@ def capture_tick():
     result = capture_scheduler.tick_quiet_capture(store, now=now)
     out = _capture_response_doc(result)
     out["dream"] = _dream_response_doc(dream_scheduler.tick_memory_dream(store, now=now))
+    migrate = capture_scheduler.tick_quiet_migrate(store, now=now)
+    out["migrate"] = {"enqueued": bool(migrate.get("enqueued")), "reason": migrate.get("reason", "")}
     return jsonify(out)
 
 

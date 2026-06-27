@@ -14,6 +14,7 @@ from typing import Any, Mapping
 
 import db
 from proactive import capture_jobs
+from memory import migration as memory_migration
 
 CAPTURE_STATE_KIND = "capture_state"
 CAPTURE_LIVE_SOURCES = frozenset({
@@ -251,6 +252,30 @@ def tick_quiet_capture(store, *, now: float | None = None) -> dict[str, Any]:
     result = _enqueue_window(store, trigger="quiet_timeout", now=now_ts)
     result["quiet_for_sec"] = quiet_for
     return result
+
+
+def tick_quiet_migrate(store, *, now: float | None = None) -> dict[str, Any]:
+    """Legacy→v1 migration trigger — rides the same quiet window as capture.
+
+    Enqueues one migration batch job when the user is quiet AND the migration-state
+    cache isn't 'done'. Card SHAPE stays the source of truth (handler re-scans), so
+    the state blob is only a cheap gate. Single-flight + active-maintenance guard
+    live in enqueue_memory_migrate_job, so this never runs alongside capture/dream."""
+    now_ts = time.time() if now is None else float(now)
+    state = load_capture_state(store)
+    quiet_for = now_ts - _safe_float(state.get("last_seen_ts"), 0.0)
+    if quiet_for < quiet_sec():
+        return {"enqueued": False, "reason": "quiet_not_due", "quiet_for_sec": quiet_for, "job": None}
+    mig_state = db.get_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB)
+    if not memory_migration.should_enqueue(mig_state):
+        return {"enqueued": False, "reason": "migration_done", "job": None}
+    # One batch per user per hour (single-flight serializes anyway); a new hour =
+    # a new key = the next batch, so the lane drains a bit faster than dream.
+    window_id = str(int(now_ts // 3600))
+    migrate_key = memory_migration.migrate_key_for_window(store.user_id, window_id)
+    job, enqueued, reason = capture_jobs.enqueue_memory_migrate_job(
+        store, trigger="quiet_window_migrate", migrate_key=migrate_key, now=now_ts)
+    return {"enqueued": enqueued, "reason": reason, "job": job}
 
 
 def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now: float | None = None) -> dict[str, Any]:
