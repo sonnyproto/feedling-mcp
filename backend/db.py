@@ -1294,7 +1294,9 @@ def memory_load(user_id: str) -> list[dict]:
         return []
 
 
-def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> None:
+def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> bool:
+    """Single-row upsert. Returns True iff the write committed — callers that
+    advance state on success (e.g. memory.upgrade / migration) MUST check it."""
     try:
         with get_pool().connection() as conn:
             conn.execute(
@@ -1304,8 +1306,10 @@ def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> 
                 "occurred_at = EXCLUDED.occurred_at, doc = EXCLUDED.doc",
                 (user_id, moment_id, occurred_at or "", Jsonb(doc)),
             )
+        return True
     except Exception as e:
         log.error("[db] memory_upsert(%s,%s) failed: %s", user_id, moment_id, e)
+        return False
 
 
 def memory_delete(user_id: str, moment_id: str) -> bool:

@@ -288,9 +288,12 @@ def enqueue_memory_migrate_job(
     existing_same_key = _find_migrate_by_key(store, key)
     if existing_same_key is not None:
         return existing_same_key, False, "duplicate_migrate_key"
-    active = _find_active_migrate(store)
+    # Plan §2: migration must not run alongside capture/dream (shared memory_lock +
+    # overlapping read→derive→write windows). Block at enqueue on ANY active
+    # maintenance job, not just another migrate — simplest, single source of truth.
+    active = _find_active_capture(store) or _find_active_dream(store) or _find_active_migrate(store)
     if active is not None:
-        return active, False, "migrate_already_pending"
+        return active, False, "maintenance_already_pending"
     job = make_memory_migrate_job(
         trigger=trigger,
         migrate_key=key,

@@ -527,7 +527,11 @@ def _memory_upgrade_apply(
                 envelope[key] = existing[key]
         updated = _memory_record_from_envelope(store, envelope, existing=existing)
         updated.pop("type", None)  # clean v1 inner carries no `type`
-        db.memory_upsert(store.user_id, memory_id, updated.get("occurred_at") or "", updated)
+        wrote = db.memory_upsert(store.user_id, memory_id, updated.get("occurred_at") or "", updated)
+    if not wrote:
+        # DB write didn't commit — do NOT report ok, so a migrator never advances
+        # state on a phantom success. The card stays legacy and re-migrates later.
+        return {"status": "error", "error": "db_write_failed", "action": "memory.upgrade"}, [], 500
     change = memory_service._append_memory_change(store, {
         "action": "upgrade",
         "memory_id": memory_id,

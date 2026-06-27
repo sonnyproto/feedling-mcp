@@ -23,12 +23,20 @@ DEFAULT_MIGRATE_BATCH = 8
 _OLD_CONTENT_FIELDS = ("title", "description", "her_quote", "context", "linked_dimension")
 
 
+_V1_FIELDS = ("summary", "content", "bucket", "threads")
+
+
 def is_legacy_card_inner(inner: Mapping[str, Any] | None) -> bool:
-    """True if a DECRYPTED RAW inner is a pre-v1 (old-schema) card."""
+    """True if a DECRYPTED RAW inner is a pre-v1 (old-schema) card.
+
+    A genuine v1 inner has the full {summary, content, bucket, threads} set — same
+    criterion the enclave uses to detect v1 (`enclave_app._memory_inner_to_v1`).
+    Requiring all four (not just bucket+threads) avoids skipping a card that was
+    patched to carry bucket/threads but whose body is still title/description."""
     if not isinstance(inner, Mapping):
         return False
-    if ("bucket" in inner) and ("threads" in inner):
-        return False  # has v1 structure
+    if all(k in inner for k in _V1_FIELDS):
+        return False  # full v1 structure
     return any(inner.get(k) for k in _OLD_CONTENT_FIELDS)
 
 
@@ -78,9 +86,20 @@ def migration_done(state: Mapping[str, Any] | None) -> bool:
     return isinstance(state, Mapping) and str(state.get("status") or "").lower() == "done"
 
 
-def should_enqueue(state: Mapping[str, Any] | None) -> bool:
-    """Enqueue a batch unless we've proven nothing is left (status==done). 'unknown'
-    (never scanned) and 'pending' (more remain) both enqueue."""
+def should_enqueue(
+    state: Mapping[str, Any] | None,
+    *,
+    observed_legacy_count: int | None = None,
+) -> bool:
+    """Whether to enqueue a migration batch.
+
+    Card SHAPE is the source of truth; the state blob is only a cache. So when the
+    caller has actually scanned and knows how many legacy cards remain, trust that
+    (`observed_legacy_count`) — this is what makes plan §5.5-C self-heal work: even
+    after status==done, a card reverted to old shape (concurrent replace-all / old
+    path) re-enqueues. Only fall back to the cached state when no observation."""
+    if observed_legacy_count is not None:
+        return int(observed_legacy_count) > 0
     return not migration_done(state)
 
 

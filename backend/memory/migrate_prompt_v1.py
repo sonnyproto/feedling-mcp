@@ -91,29 +91,43 @@ def _extract_json_block(raw: str) -> str:
     return ""
 
 
-def parse_migrated_cards(raw: str, *, allowed_ids: set[str] | None = None) -> tuple[list[dict], str | None]:
+def parse_migrated_cards(
+    raw: str,
+    *,
+    allowed_ids: set[str] | None = None,
+) -> tuple[list[dict], list[str], str | None]:
     """Parse the migration agent reply.
 
-    Returns (upgrades, error). Each upgrade is normalized and safe to hand to the
-    memory.upgrade path: {id, bucket, threads[], summary, content}. Rows are dropped
-    if they have no id, no usable content, or (when allowed_ids is given) an id that
-    wasn't in the batch — the agent must only upgrade cards it was handed, never
-    invent or retarget. A valid "nothing" reply yields ([], None).
+    Returns (upgrades, unmigrated_ids, error). Each upgrade is normalized and safe
+    to hand to the memory.upgrade path: {id, bucket, threads[], summary, content}.
+    Rows are dropped if they have no id, a duplicate id, no usable content, or (when
+    allowed_ids is given) an id that wasn't in the batch — the agent must only
+    upgrade cards it was handed, never invent or retarget.
+
+    `unmigrated_ids` = the batch ids (allowed_ids) that did NOT come back as a valid
+    upgrade — i.e. the agent omitted them OR they were dropped. The handler MUST
+    treat these as not-yet-migrated and retry them next round; it must NOT use
+    "error is None" to mean "whole batch done". Empty allowed_ids ⇒ [].
     """
     import json
 
+    all_ids = set(str(i) for i in allowed_ids) if allowed_ids is not None else None
+
+    def _unmigrated(seen: set[str]) -> list[str]:
+        return sorted(all_ids - seen) if all_ids is not None else []
+
     block = _extract_json_block(raw)
     if not block:
-        return [], "no_json_object"
+        return [], _unmigrated(set()), "no_json_object"
     try:
         doc = json.loads(block)
     except (ValueError, TypeError) as e:
-        return [], f"json_decode_error:{type(e).__name__}"
+        return [], _unmigrated(set()), f"json_decode_error:{type(e).__name__}"
     if not isinstance(doc, dict):
-        return [], "not_an_object"
+        return [], _unmigrated(set()), "not_an_object"
     rows = doc.get("upgrades")
     if not isinstance(rows, list):
-        return [], "missing_upgrades_list"
+        return [], _unmigrated(set()), "missing_upgrades_list"
 
     out: list[dict] = []
     seen: set[str] = set()
@@ -123,7 +137,7 @@ def parse_migrated_cards(raw: str, *, allowed_ids: set[str] | None = None) -> tu
         mid = str(row.get("id") or "").strip()
         if not mid or mid in seen:
             continue
-        if allowed_ids is not None and mid not in allowed_ids:
+        if all_ids is not None and mid not in all_ids:
             continue  # never upgrade a card outside this batch
         summary = str(row.get("summary") or "").strip()[:2000]
         content = str(row.get("content") or "").strip()
@@ -139,4 +153,4 @@ def parse_migrated_cards(raw: str, *, allowed_ids: set[str] | None = None) -> tu
             "summary": summary,
             "content": content,
         })
-    return out, None
+    return out, _unmigrated(seen), None
