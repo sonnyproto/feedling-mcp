@@ -172,6 +172,14 @@ def _default_launch(config_path: str, env: dict, port: int):
     dependency tree never perturbs the supervisor's hash-locked backend env; falls
     back to the current interpreter when unset (dev)."""
     full_env = {**os.environ, **env}
+    # LiteLLM proxy switches to a Prisma/Postgres-backed store the moment it sees
+    # DATABASE_URL in its env, then crashes at startup ("No module named 'prisma'")
+    # — the proxy venv ships no prisma and this gateway is a stateless router (its
+    # whole config is the in-memory model_list). The supervisor's own DATABASE_URL
+    # (RDS, for leases/heartbeats) inherits via os.environ, so strip it (and the
+    # litellm-specific synonym) or every gateway turn dies in a litellm crash-loop.
+    for _db_var in ("DATABASE_URL", "LITELLM_DATABASE_URL"):
+        full_env.pop(_db_var, None)
     python = os.environ.get("FEEDLING_LITELLM_PYTHON", sys.executable)
     # LiteLLM has no ``__main__``, so ``python -m litellm`` aborts at startup
     # with "No module named litellm.__main__" and the proxy never binds :port.

@@ -213,6 +213,24 @@ def test_default_launch_uses_isolated_litellm_console_script(monkeypatch):
     assert captured["env"]["FEEDLING_UPKEY_u1"] == "k1"
 
 
+def test_default_launch_scrubs_database_url_from_litellm_env(monkeypatch):
+    # LiteLLM proxy auto-enables a Prisma/Postgres-backed store the moment it sees
+    # DATABASE_URL in its env, then crashes at startup ("No module named 'prisma'")
+    # — the proxy venv ships no prisma and this gateway is a stateless router. The
+    # supervisor's own DATABASE_URL (RDS, for leases) must NOT leak into the child,
+    # or every gateway turn dies in a litellm crash-loop.
+    captured = {}
+    monkeypatch.setattr(gw.subprocess, "Popen",
+                        lambda argv, env: captured.update(argv=argv, env=env) or "proc")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@host:5432/db?sslmode=require")
+    monkeypatch.setenv("LITELLM_DATABASE_URL", "postgresql://u:p@host:5432/db")
+    gw._default_launch("/cfg.yaml", {"FEEDLING_UPKEY_u1": "k1"}, 4123)
+    assert "DATABASE_URL" not in captured["env"]
+    assert "LITELLM_DATABASE_URL" not in captured["env"]
+    # upstream keys (and other inherited env) still flow through
+    assert captured["env"]["FEEDLING_UPKEY_u1"] == "k1"
+
+
 def test_manager_stops_proxy_when_no_gateway_users(tmp_path):
     fake = _FakeLauncher(); writes = []
     mgr = _mgr(tmp_path, fake, writes)
