@@ -3554,8 +3554,7 @@ def _message_for_proactive_job(
         "Do not mention this hidden wake, job metadata, or system wording to the user.",
         "If you speak, use your normal voice. You may send 1-5 short chat bubbles.",
         "If you should stay quiet, return JSON: {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}],\"messages\":[]}",
-        "If you need the user to turn screen sharing back on, return JSON: {\"actions\":[{\"type\":\"proactive.request_broadcast\",\"reason\":\"...\",\"copy\":\"...\"}],\"messages\":[]}",
-        "If your presence state changed, include an action like {\"type\":\"proactive.set_ai_state\",\"state\":\"curious\"}.",
+        "If you'd like to see their screen and it isn't shared, just ask in a normal message — no special action needed.",
         "For visible replies, return JSON exactly like {\"messages\":[\"...\",\"...\"]}. Plain text is also accepted for a single message.",
         (
             "wake_metadata:\n"
@@ -3564,8 +3563,6 @@ def _message_for_proactive_job(
             f"- manual: {bool(job.get('manual', False))}\n"
             f"- forced: {bool(job.get('forced', False))}\n"
             f"- wake_kind: {wake_kind}\n"
-            f"- user_state: {str(job.get('user_state') or 'default')}\n"
-            f"- ai_state: {str(job.get('ai_state') or 'present')}\n"
             f"- broadcast_state: {str(job.get('broadcast_state') or 'unknown')}\n"
             f"- current_app: {str(job.get('current_app') or 'unknown')}\n"
             f"- screen_context_available: {str(screen_available).lower()}"
@@ -3598,11 +3595,15 @@ def _message_for_proactive_job(
 def _native_reachout_tool_instructions() -> str:
     return "\n".join([
         "native_tool_access:",
-        "- Use your runtime's native Feedling tools when more facts are useful; do not return JSON tool_calls for them.",
-        "- OpenClaw tool names: perception_now/perception_location/perception_weather/perception_motion/perception_calendar/perception_focus/perception_audio_route, perception_steps/perception_sleep/perception_workout/perception_vitals/perception_activity/perception_body/perception_metabolic/perception_cycle/perception_mood/perception_reminders, memory_index, memory_fetch, screen_recent, screen_read.",
-        "- Bash/CLI runtimes have the same capability through io_cli: perception, perception-trend, perception-history, memory-index, memory-fetch, screen-recent, screen-read.",
-        "- Cost guide: fast tools are perception_now/location/weather/motion/calendar/focus/audio_route, memory_index, and screen_read caption; slow tools are memory_fetch, screen_recent, health/body/activity/metabolic/cycle/mood/reminders, and image-heavy screen reads.",
-        "- For actions, return JSON messages/actions only: send_message, sleep, schedule_wake, cancel_wake, request_broadcast, set_ai_state.",
+        "- You have native Feedling tools for the user's real context — perception (now/location/weather/motion/"
+        "calendar/health/…), memory (index/fetch), screen (recent/read), photo (recent/read). Use them when more "
+        "facts genuinely help.",
+        "- You also have native tools to manage your own future wakes: schedule_wake (ask to be woken at a later time) "
+        "and cancel_wake.",
+        "- CLI runtimes call all of these via io_cli: perception, perception-trend, perception-history, memory-index, "
+        "memory-fetch, screen-recent, screen-read, photo-recent, photo-read, schedule-wake, cancel-wake.",
+        "- Your reply IS your message (1-5 short bubbles, or plain text). To stay silent, return proactive.sleep. "
+        "Nothing else needs to be returned as JSON.",
     ])
 
 
@@ -3731,7 +3732,8 @@ def _local_time_anchor(since_sec: float | None = None) -> str:
         body += f" {tzs}"
     line = f"current_time: {body}"
     if since_sec is not None and since_sec >= 1800:  # only note gaps >= 30 min
-        line += f" (距上次互动 {_format_age(since_sec)})"
+        gap = _format_age(since_sec).replace(" ago", " 前")
+        line += f" (距上次互动 {gap})"
     return line
 
 
@@ -4782,23 +4784,6 @@ def _process_proactive_jobs(jobs: list) -> float:
             )
             continue
 
-        set_ai_state = _first_proactive_action(proactive_actions, {"set_ai_state"})
-        if set_ai_state:
-            ai_state = str(set_ai_state.get("state") or set_ai_state.get("ai_state") or "").strip().lower()
-            if ai_state:
-                update_proactive_state(ai_state=ai_state)
-                update_proactive_job_status(
-                    job_id,
-                    "realizing",
-                    "agent_set_ai_state",
-                    extra={
-                        "agent_action": "set_ai_state",
-                        "agent_action_status": ai_state,
-                        "agent_actions": status_actions,
-                        "ai_state": ai_state,
-                    },
-                )
-
         request_broadcast = _first_proactive_action(proactive_actions, {"request_broadcast"})
         if request_broadcast and not replies:
             replies = [_visible_broadcast_request_text(request_broadcast)]
@@ -4846,22 +4831,6 @@ def _process_proactive_jobs(jobs: list) -> float:
                 },
             )
             log.info("proactive wake completed scheduled actions id=%s", job_id)
-            continue
-
-        if set_ai_state and not replies:
-            state_label = str(set_ai_state.get("state") or set_ai_state.get("ai_state") or "updated").strip()
-            update_proactive_job_status(
-                job_id,
-                "completed",
-                f"agent_set_ai_state:{state_label}",
-                extra={
-                    "agent_action": "set_ai_state",
-                    "agent_action_status": state_label[:240],
-                    "agent_actions": status_actions,
-                    "wake_result": "state_only",
-                },
-            )
-            log.info("proactive wake updated ai_state without reply id=%s state=%s", job_id, state_label)
             continue
 
         posted_any = False

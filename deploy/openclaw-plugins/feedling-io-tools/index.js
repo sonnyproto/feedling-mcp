@@ -297,5 +297,45 @@ export default definePluginEntry({
         ["days", "--days", "value"],
       ])],
     });
+
+    // schedule_wake — ask to be woken at a later time (native self-wake; replaces the old JSON action).
+    registerCli({
+      name: "schedule_wake",
+      description: "Ask to be woken at a later time so you can come back to something (provider-safe name for schedule.wake). e.g. at='2026-06-29T18:00' reason='check in after their meeting'.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["at"],
+        properties: {
+          at: { type: "string", description: "when to wake: ISO time (2026-06-29T18:00) or a relative spec" },
+          tz: { type: "string", description: "IANA timezone (optional; defaults to the user's)" },
+          reason: { type: "string", description: "why you're scheduling it (optional)" },
+        },
+      },
+      build: (p) => ["schedule-wake", ...flagsFromParams(p, [
+        ["at", "--at", "value"],
+        ["tz", "--tz", "value"],
+        ["reason", "--reason", "value"],
+      ])],
+    });
+
+    // cancel_wake — cancel a previously scheduled self-wake.
+    registerCli({
+      name: "cancel_wake",
+      description: "Cancel a previously scheduled self-wake (provider-safe name for cancel.wake). Pass the wake/timer id.",
+      parameters: {
+        type: "object",
+        additionalProperties: false,
+        required: ["wake_id"],
+        properties: {
+          wake_id: { type: "string", description: "the scheduled wake/timer id to cancel" },
+          reason: { type: "string", description: "why (optional)" },
+        },
+      },
+      build: (p) => ["cancel-wake", ...flagsFromParams(p, [
+        ["wake_id", "--wake-id", "value"],
+        ["reason", "--reason", "value"],
+      ])],
+    });
   },
 });

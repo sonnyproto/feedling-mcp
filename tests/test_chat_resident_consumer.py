@@ -2064,7 +2064,8 @@ def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):
     assert "possible_connections" not in captured["message"]
     assert "wake_id: wake_1" in captured["message"]
     assert "wake_kind: screen" in captured["message"]
-    assert "user_state: default" in captured["message"]
+    assert "user_state" not in captured["message"]   # removed (D6: user_state/ai_state dropped)
+    assert "ai_state" not in captured["message"]
     assert "broadcast_state: on" in captured["message"]
     assert "screen_context_available: true" in captured["message"]
     assert captured["images"] == [{"data": "x"}]
@@ -2193,8 +2194,8 @@ def test_process_proactive_native_action_only_send_message_posts(monkeypatch):
     assert crc._process_proactive_jobs([job]) == pytest.approx(128.5)
     assert "Feedling proactive wake" in captured["message"]
     assert "native_tool_access" in captured["message"]
-    assert "memory_index" in captured["message"]
-    assert "screen_read" in captured["message"]
+    assert "memory-index" in captured["message"]
+    assert "screen-read" in captured["message"]
     assert "v2_context_json" not in captured["message"]
     assert captured["posted"][0][0] == "Native action bubble"
     assert captured["posted"][0][1]["proactive_job_id"] == "pj_native_send"
@@ -2393,13 +2394,15 @@ def test_native_proactive_prompt_injects_digest_and_native_tool_catalog(monkeypa
     assert "perception_change_json" not in captured["message"]
     assert "\"signal\": \"steps\"" in captured["message"]
     assert "native_tool_access" in captured["message"]
-    assert "perception_now" in captured["message"]
-    assert "memory_index" in captured["message"]
-    assert "memory_fetch" in captured["message"]
-    assert "screen_recent" in captured["message"]
-    assert "screen_read" in captured["message"]
-    assert "io_cli: perception" in captured["message"]
-    assert "Cost guide" in captured["message"]
+    assert "perception" in captured["message"]
+    assert "memory-index" in captured["message"]
+    assert "screen-read" in captured["message"]
+    assert "schedule_wake" in captured["message"]        # newly tool-ified
+    assert "io_cli:" in captured["message"]
+    # cleaned: no OpenClaw-specific names, no cost-guide, no JSON tool_calls framing
+    assert "perception_now" not in captured["message"]
+    assert "Cost guide" not in captured["message"]
+    assert "set_ai_state" not in captured["message"]
 
 
 def test_native_perception_context_prefers_board_over_legacy_change():

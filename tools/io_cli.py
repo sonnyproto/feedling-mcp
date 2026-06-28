@@ -177,6 +177,38 @@ def cmd_memory_index(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+def cmd_schedule_wake(args):
+    """Ask to be woken at a later time (native self-wake). POST /v1/proactive/scheduled/actions."""
+    api_url, auth = _require_backend()
+    at = (args.at or "").strip()
+    if not at:
+        _emit({"ok": False, "error": "schedule-wake needs --at <time> (ISO like 2026-06-29T18:00, or a relative spec)"}, 2)
+    action = {"type": "schedule_wake", "at": at}
+    if args.tz:
+        action["tz"] = args.tz
+    if args.reason:
+        action["reason"] = args.reason
+    status, body = _http_json("POST", f"{api_url}/v1/proactive/scheduled/actions", auth, payload={"actions": [action]})
+    if status == 200:
+        _emit({"ok": True, **body})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
+def cmd_cancel_wake(args):
+    """Cancel a previously scheduled self-wake. POST /v1/proactive/scheduled/actions."""
+    api_url, auth = _require_backend()
+    wid = (args.wake_id or "").strip()
+    if not wid:
+        _emit({"ok": False, "error": "cancel-wake needs --wake-id <id>"}, 2)
+    action = {"type": "cancel_wake", "wake_id": wid}
+    if args.reason:
+        action["reason"] = args.reason
+    status, body = _http_json("POST", f"{api_url}/v1/proactive/scheduled/actions", auth, payload={"actions": [action]})
+    if status == 200:
+        _emit({"ok": True, **body})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
 def cmd_memory_fetch(args):
     """Verbatim decrypted memory cards by id (plaintext-safe). POST /v1/memory/fetch."""
     api_url, auth = _require_backend()
@@ -371,6 +403,17 @@ def main():
     pd.add_argument("--id", dest="photo_id", required=True, help="photo id (from photo-recent)")
     pd.add_argument("--include-image", dest="include_image", action="store_true", help="include decrypted base64 JPEG (large)")
     pd.set_defaults(func=cmd_photo_read)
+
+    sw = sub.add_parser("schedule-wake", help="Ask to be woken at a later time (native self-wake).")
+    sw.add_argument("--at", required=True, help="When to wake: ISO time (e.g. 2026-06-29T18:00) or a relative spec.")
+    sw.add_argument("--tz", default="", help="IANA timezone (optional; defaults to the user's).")
+    sw.add_argument("--reason", default="", help="Why you're scheduling it (optional).")
+    sw.set_defaults(func=cmd_schedule_wake)
+
+    cw = sub.add_parser("cancel-wake", help="Cancel a previously scheduled self-wake.")
+    cw.add_argument("--wake-id", dest="wake_id", required=True, help="The scheduled wake/timer id to cancel.")
+    cw.add_argument("--reason", default="", help="Why (optional).")
+    cw.set_defaults(func=cmd_cancel_wake)
 
     iw = sub.add_parser("identity-write",
                         help="Patch the agent's identity card (self_introduction / signature).")
