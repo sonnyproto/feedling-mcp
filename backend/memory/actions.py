@@ -508,6 +508,18 @@ def _memory_upgrade_apply(
     `_save_moments`/`memory_replace_all`, so a concurrent new card is never
     clobbered. Preserves id/created_at/occurred_at/source; emits clean v1
     (no `type`). The LLM/encryption happens in the caller, never under the lock."""
+    # The card id is part of the AEAD AAD (owner|v|id), so the body was SEALED with
+    # this exact id. We must NOT rewrite envelope["id"] after the fact — that desyncs
+    # it from the AAD and writes a card that stores fine but can never be decrypted
+    # (regression: 92f6849 did this and broke real-deploy readside). The caller must
+    # seal with item_id=memory_id; reject a mismatch up front.
+    if str((envelope or {}).get("id") or "") != memory_id:
+        return {
+            "status": "error",
+            "error": "envelope_id_mismatch",
+            "action": "memory.upgrade",
+            "detail": "envelope.id must equal the target memory_id (id is AEAD-bound; seal with item_id=memory_id).",
+        }, [], 400
     with store.memory_lock:
         moments = memory_service._load_moments(store)
         existing = next((m for m in moments if isinstance(m, dict) and m.get("id") == memory_id), None)
@@ -521,12 +533,6 @@ def _memory_upgrade_apply(
             # the migrator re-detects this card by shape next quiet window.
             return {"status": "ok", "action": "memory.upgrade", "skipped": "stale", "noop": True}, [], 200
         envelope = dict(envelope)
-        # In-place upgrade MUST keep the original id. The DB slot is keyed by
-        # memory_id, but _memory_record_from_envelope prefers envelope["id"], and
-        # a caller (consumer re-seals during migration) may carry a fresh id —
-        # which would make Garden/recall treat the upgraded card as a new one.
-        # Never trust the caller's id here; pin it to the target memory_id.
-        envelope["id"] = memory_id
         envelope["occurred_at"] = str(existing.get("occurred_at") or envelope.get("occurred_at") or core_util._now_iso())
         envelope["source"] = str(existing.get("source") or envelope.get("source") or "live_conversation")
         for key in ("status", "importance", "pulse", "last_referenced_at", "is_sensitive", "sensitivity_class"):

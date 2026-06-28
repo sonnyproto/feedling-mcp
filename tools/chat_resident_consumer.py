@@ -4007,7 +4007,7 @@ def _capture_agent_reply_text(result: Any) -> str:
     return str(result or "")
 
 
-def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture") -> dict:
+def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", item_id: str = "") -> dict:
     if not _ENCRYPTION_AVAILABLE:
         raise RuntimeError("capture_encryption_unavailable")
     if not _refresh_whoami_for_encrypted_reply():
@@ -4032,6 +4032,10 @@ def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memo
         user_pk_bytes=user_pk,
         enclave_pk_bytes=enc_pk,
         visibility="shared",
+        # Migration must seal with the ORIGINAL card id so the AEAD AAD (owner|v|id)
+        # matches on decrypt and the upgraded card stays readable AND id-stable.
+        # capture/dream (new cards) pass "" -> build_envelope mints a random id.
+        item_id=item_id or None,
     )
     envelope.update({
         "type": str(card.get("type") or "event").strip().lower() or "event",
@@ -4943,7 +4947,7 @@ def _process_migrate_jobs(jobs: list) -> float:
             if not mid:
                 continue
             try:
-                envelope = _capture_build_envelope(up, occurred_at=occurred_at, source="memory_migrate")
+                envelope = _capture_build_envelope(up, occurred_at=occurred_at, source="memory_migrate", item_id=mid)
             except Exception as e:
                 log.error("migrate envelope build failed id=%s card=%s: %s", job_id, mid, e)
                 continue  # retry next round

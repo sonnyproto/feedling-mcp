@@ -1,12 +1,16 @@
-"""Regression: legacy→v1 memory.upgrade must keep the ORIGINAL memory_id even
-when the caller's envelope carries a different id.
+"""Regression: legacy→v1 memory.upgrade and the AEAD-bound card id.
 
-Hit in migration e2e (red line): the prebuilt-envelope upgrade path passes the
-consumer's re-sealed envelope, which carries a fresh id. `_memory_record_from_envelope`
-prefers `envelope["id"]`, so the upgraded card's embedded id changed — breaking the
-"in-place upgrade, id stable" invariant (Garden/recall would treat it as a new card).
-Pin it: the stored record's id must equal the target memory_id regardless of the
-envelope's id, for BOTH the storage slot key and the embedded record id.
+The card id is part of the content AEAD AAD (owner_user_id|v|id), so the body must
+be SEALED with the same id the stored record carries. Two failure modes this locks:
+
+1. (real-deploy red line) The migration path re-sealed the v1 body with a RANDOM id,
+   then the server silently rewrote envelope["id"]=memory_id (commit 92f6849). The
+   stored card then had a stable id but a body sealed under a different id -> the
+   enclave could never decrypt it -> readside/fetch returned unavailable. Fix: never
+   rewrite the id post-seal; the server REJECTS an envelope whose id != memory_id, and
+   the consumer seals with item_id=memory_id.
+
+2. The happy path (envelope.id == memory_id) upgrades in place, keeping the id.
 """
 from __future__ import annotations
 
@@ -19,9 +23,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 from memory import actions as memory_actions  # noqa: E402
 
 
-def test_upgrade_keeps_memory_id_when_envelope_carries_new_id(monkeypatch):
-    memory_id = "mom_original_123"
-    existing = {
+def _existing(memory_id: str) -> dict:
+    return {
         "id": memory_id,
         "owner_user_id": "usr_test",
         "occurred_at": "2026-01-01T00:00:00Z",
@@ -33,10 +36,23 @@ def test_upgrade_keeps_memory_id_when_envelope_carries_new_id(monkeypatch):
         "visibility": "shared",
         "type": "moment",
     }
-    captured: dict = {}
 
+
+def _envelope(env_id: str) -> dict:
+    return {
+        "id": env_id,
+        "body_ct": "new_v1_ciphertext",
+        "nonce": "n1",
+        "K_user": "ku1",
+        "K_enclave": "ke1",
+        "visibility": "shared",
+        "owner_user_id": "usr_test",
+        "occurred_at": "2026-06-01T00:00:00Z",
+    }
+
+
+def _patch(monkeypatch, existing: dict, captured: dict):
     def fake_upsert(user_id, slot_id, occurred_at, doc):
-        captured["user_id"] = user_id
         captured["slot_id"] = slot_id
         captured["doc"] = dict(doc)
         return True
@@ -45,29 +61,33 @@ def test_upgrade_keeps_memory_id_when_envelope_carries_new_id(monkeypatch):
     monkeypatch.setattr(memory_actions.db, "memory_upsert", fake_upsert)
     monkeypatch.setattr(memory_actions.memory_service, "_append_memory_change", lambda _s, c: {"id": "chg", **c})
 
-    store = types.SimpleNamespace(user_id="usr_test", memory_lock=threading.Lock())
-    action = {
-        "id": memory_id,
-        "old_body_hash": "",  # skip CAS for this unit test
-        "envelope": {
-            "id": "mom_BRAND_NEW_should_be_ignored",
-            "body_ct": "new_v1_ciphertext",
-            "nonce": "n1",
-            "K_user": "ku1",
-            "K_enclave": "ke1",
-            "visibility": "shared",
-            "owner_user_id": "usr_test",
-            "occurred_at": "2026-06-01T00:00:00Z",
-        },
-    }
 
-    result, effects, status = memory_actions._memory_upgrade_envelope_action(store, action)
+def test_upgrade_rejects_envelope_id_mismatch(monkeypatch):
+    memory_id = "mom_original_123"
+    captured: dict = {}
+    _patch(monkeypatch, _existing(memory_id), captured)
+    store = types.SimpleNamespace(user_id="usr_test", memory_lock=threading.Lock())
+
+    action = {"id": memory_id, "old_body_hash": "", "envelope": _envelope("mom_BRAND_NEW_random")}
+    result, _effects, status = memory_actions._memory_upgrade_envelope_action(store, action)
+
+    assert status == 400, result
+    assert result.get("error") == "envelope_id_mismatch", result
+    # Crucially, NO card was written — we never persist an undecryptable card.
+    assert "doc" not in captured
+
+
+def test_upgrade_writes_when_envelope_id_matches(monkeypatch):
+    memory_id = "mom_original_123"
+    captured: dict = {}
+    _patch(monkeypatch, _existing(memory_id), captured)
+    store = types.SimpleNamespace(user_id="usr_test", memory_lock=threading.Lock())
+
+    action = {"id": memory_id, "old_body_hash": "", "envelope": _envelope(memory_id)}
+    result, _effects, status = memory_actions._memory_upgrade_envelope_action(store, action)
 
     assert status == 200, result
     assert result.get("status") == "ok", result
-    # storage slot keyed by the original id …
     assert captured["slot_id"] == memory_id
-    # … AND the embedded record id is pinned to the original, NOT the envelope's new id
-    assert captured["doc"]["id"] == memory_id
-    # content really did upgrade (new ciphertext written)
-    assert captured["doc"]["body_ct"] == "new_v1_ciphertext"
+    assert captured["doc"]["id"] == memory_id  # id stays
+    assert captured["doc"]["body_ct"] == "new_v1_ciphertext"  # content upgraded
