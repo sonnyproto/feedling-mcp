@@ -1462,8 +1462,8 @@ def test_process_proactive_wake_routes_through_agent_and_posts_metadata(monkeypa
 
     assert crc._process_proactive_jobs([job]) == pytest.approx(123.0)
     assert "Feedling proactive wake" in captured["message"]
-    assert "platform did not judge" in captured["message"].lower()
-    assert "wake_id: wake_1" in captured["message"]
+    assert "presence check" in captured["message"].lower()
+    assert "wake_kind:" in captured["message"]
     assert "wake_kind: screen" in captured["message"]
     assert "recent_chat_context" in captured["message"]
     assert "你刚刚问我这段要不要压成一句话" in captured["message"]
@@ -2057,12 +2057,12 @@ def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):
 
     assert crc._process_proactive_jobs([job]) == pytest.approx(124.0)
     assert "Feedling proactive wake" in captured["message"]
-    assert "platform did not judge" in captured["message"].lower()
-    assert "awareness / presence check" in captured["message"]
-    assert "genuinely want to appear" in captured["message"]
+    assert "presence check" in captured["message"].lower()
+    assert "presence check" in captured["message"]
+    assert "equally valid" in captured["message"]
     assert "Feedling Gate decided" not in captured["message"]
     assert "possible_connections" not in captured["message"]
-    assert "wake_id: wake_1" in captured["message"]
+    assert "wake_kind:" in captured["message"]
     assert "wake_kind: screen" in captured["message"]
     assert "user_state" not in captured["message"]   # removed (D6: user_state/ai_state dropped)
     assert "ai_state" not in captured["message"]
@@ -2322,7 +2322,7 @@ def test_proactive_perception_digest_uses_agent_perception_routes_not_v2_tool(mo
     presence, change, domains = crc._proactive_perception_digest()
 
     assert presence["place_label"] == "home"
-    assert presence["local_time"] == "2026-06-26T20:30:00+08:00"
+    assert "local_time" not in presence  # dropped from presence (current_time anchor is the source)
     # Back-compat: a digest response without a board still yields legacy changes
     # and an empty domains dict.
     assert domains == {}
@@ -2678,8 +2678,8 @@ def test_message_for_proactive_job_instructs_multi_bubble_without_gate_context()
         recent_chat_context="- user: 这段帮我看一下",
     )
 
-    assert "1-5 short chat bubbles" in message
-    assert '{"messages":["...","..."]}' in message
+    assert "a few short bubbles" in message
+    assert '{"messages":["..."]}' in message
     assert "recent_chat_context" in message
     assert "possible_connections" not in message
     assert "Feedling Gate decided" not in message

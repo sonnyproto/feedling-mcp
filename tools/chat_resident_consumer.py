@@ -3524,6 +3524,7 @@ def _screen_watch_message(
             "If attention_facts show you are mid-conversation or just spoke, prefer silence over "
             "interrupting or repeating yourself."
         )
+    parts.append(_reply_language_line())
     parts.append(_native_tool_names_compact())
     if screen_text:
         parts.append(screen_text)
@@ -3543,28 +3544,22 @@ def _message_for_proactive_job(
         return _screen_watch_message(job, screen_text=screen_text, chat_context=chat_context)
     wake_kind = _proactive_wake_kind(job, screen_text=screen_text)
     screen_available = bool(screen_text)
+    presence = perception_digest[0] if (perception_digest and isinstance(perception_digest[0], dict)) else {}
     parts = [
         "[Feedling proactive wake]",
-        "This wake is not a user request and not an instruction to respond.",
-        "It is an awareness / presence check.",
-        "The platform did not judge this moment and did not require a memory match. You decide what to do.",
-        "Before visible speech, ask whether you genuinely want to appear now from your own companion identity.",
-        "Speak only when there is a strong enough self-directed reason, feeling, memory, or presence impulse to appear.",
-        "If the impulse is weak, unclear, generic, or merely caused by this wake, return proactive.sleep.",
-        "Do not mention this hidden wake, job metadata, or system wording to the user.",
-        "If you speak, use your normal voice. You may send 1-5 short chat bubbles.",
-        "If you should stay quiet, return JSON: {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}],\"messages\":[]}",
-        "If you'd like to see their screen and it isn't shared, just ask in a normal message — no special action needed.",
-        "For visible replies, return JSON exactly like {\"messages\":[\"...\",\"...\"]}. Plain text is also accepted for a single message.",
+        "This is a presence check, not a request — no reply is expected. Whether you appear, and whether you stay "
+        "quiet, are equally valid — neither is the default, and neither is the \"safe\" choice. Decide entirely from "
+        "your own character: speak if you want to, stay quiet if you'd rather. You don't need a strong reason either "
+        "way. Use the glance below to decide whether to look closer; pull the real tools if something makes you want "
+        "to understand the moment better. Then do whatever feels right — including nothing. "
+        "Never mention this wake or any system wording to the user.",
+        _reply_protocol_block(),
+        _reply_language_line(presence),
         (
             "wake_metadata:\n"
-            f"- wake_id: {str(job.get('wake_id') or job.get('gate_decision_id') or '')}\n"
             f"- trigger: {str(job.get('trigger') or 'wake')}\n"
-            f"- manual: {bool(job.get('manual', False))}\n"
-            f"- forced: {bool(job.get('forced', False))}\n"
             f"- wake_kind: {wake_kind}\n"
             f"- broadcast_state: {str(job.get('broadcast_state') or 'unknown')}\n"
-            f"- current_app: {str(job.get('current_app') or 'unknown')}\n"
             f"- screen_context_available: {str(screen_available).lower()}"
         ),
         _local_time_anchor(since_sec=chat_context.last_user_message_age_sec),
@@ -3584,12 +3579,35 @@ def _message_for_proactive_job(
         )
     elif not screen_available:
         parts.append(
-            "screen_context:\n"
-            "No current screen context is available. Do not imply you can see the user's screen."
+            "capability_note:\n"
+            "You can tell which app is in the foreground (reliable — see the board's app field) but you cannot see "
+            "the contents of the user's screen right now. Don't imply you can see their screen; you may still refer "
+            "to which app they're in."
         )
     if screen_text:
         parts.append(screen_text)
     return "\n\n".join(parts)
+
+
+def _reply_protocol_block() -> str:
+    """How the agent responds — stated once (no longer repeated across the wake
+    preamble + tool block)."""
+    return "\n".join([
+        "How to respond (exactly one of):",
+        "- speak: reply in your normal voice — a few short bubbles is typical, but length and number are yours. "
+        "Plain text, or JSON {\"messages\":[\"...\"]}.",
+        "- stay quiet: return {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}]}.",
+        "- want to see their screen but it isn't shared: just ask, in a normal message.",
+    ])
+
+
+def _reply_language_line(presence: dict | None = None) -> str:
+    """Anchor the reply language to the user — a proactive wake may have no recent
+    user message to infer it from, so an English prompt must not leak English."""
+    locale = str((presence or {}).get("locale") or "").strip()
+    if locale:
+        return f"Always reply in the user's own language (their locale is {locale})."
+    return "Always reply in the user's own language."
 
 
 def _native_reachout_tool_instructions() -> str:
@@ -3602,15 +3620,15 @@ def _native_reachout_tool_instructions() -> str:
         "and cancel_wake.",
         "- CLI runtimes call all of these via io_cli: perception, perception-trend, perception-history, memory-index, "
         "memory-fetch, screen-recent, screen-read, photo-recent, photo-read, schedule-wake, cancel-wake.",
-        "- Your reply IS your message (1-5 short bubbles, or plain text). To stay silent, return proactive.sleep. "
-        "Nothing else needs to be returned as JSON.",
     ])
 
 
 def _native_reachout_perception_context(presence: dict, change: list, domains: dict | None = None) -> str:
     parts = [
         "real_signal_context:",
-        "Presence and the cross-domain board are preloaded facts for this wake. Treat missing fields as unknown; pull native tools for more detail.",
+        "This is a low-resolution glance, not a list of things to report. It helps you decide WHETHER to look closer "
+        "and WHERE — not what to say. Most fields you just note and move on; if one makes you want to understand the "
+        "moment better, pull the matching tool for detail. Treat missing fields as unknown.",
     ]
     if presence:
         parts.append("presence_hints_json:\n" + json.dumps(presence, ensure_ascii=False, sort_keys=True))
@@ -3620,11 +3638,14 @@ def _native_reachout_perception_context(presence: dict, change: list, domains: d
         parts.append("cross_domain_board_json:\n" + json.dumps(domains, ensure_ascii=False, sort_keys=True))
         parts.append(
             "Reading the board: each domain (location/media/app/health/weather/mood/reminders/calendar/photos/screen) "
-            "is laid out evenly — health is just one entry, not the headline. From the whole board, judge for YOURSELF "
-            "at most 2-3 things genuinely worth appearing about; you may combine across domains, and prefer lived, "
-            "human context (music, place, an app, a photo, an overdue reminder) over reciting health numbers. "
-            "novelty hints (new_artist / long_dwell) are light factual context, not a directive. "
-            "If nothing is truly worth it, return proactive.sleep."
+            "is laid out evenly — health is just one entry, not the headline. Pick at most 2-3 things that stand out "
+            "to you; you may combine across domains, and prefer lived, human context (music, place, an app, a photo, "
+            "an overdue reminder) over the raw figures. Do NOT recite exact numbers (minutes, degrees, counts, sleep "
+            "figures) — use them only to notice what's genuinely about the user; if a number actually matters, pull "
+            "the tool for it. novelty hints (new_artist / long_dwell) are light factual context, not a directive. "
+            "If signals lean low or vulnerable (late hour, sad music, poor sleep), be lighter, not heavier — don't "
+            "diagnose, don't stack worries; one warm, light touch is enough. If nothing stands out, staying quiet is "
+            "equally fine."
         )
     elif change:
         # Back-compat: an older backend without the board still returns top-N deltas.
@@ -3789,14 +3810,16 @@ def _proactive_perception_digest() -> tuple[dict, list, dict]:
     presence: dict[str, Any] = {}
     snap = _resident_perception_now()
     if isinstance(snap, dict):
-        local_time = snap.get("local_time") if snap.get("local_time") is not None else snap.get("time")
+        # local_time/timezone dropped (current_time anchor is the source; device
+        # local_time is UTC-stamped + stale). battery_level/charging dropped on
+        # purpose: device trivia doesn't belong in every wake's glance — whatever
+        # is always in front of the agent is what it ends up reciting. locale stays
+        # so the reply-language line is right.
         keys = (
-            "place_label", "motion_state", "now_playing", "battery_level",
-            "charging", "timezone", "broadcast_state", "broadcast_active",
+            "place_label", "motion_state", "now_playing",
+            "locale", "broadcast_state", "broadcast_active",
         )
         presence = {k: snap.get(k) for k in keys if snap.get(k) is not None}
-        if local_time is not None:
-            presence["local_time"] = local_time
     change, domains = _resident_perception_digest_board()
     return presence, change, domains
 
