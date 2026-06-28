@@ -19,6 +19,7 @@ from accounts import auth
 from bootstrap import gates as boot_gates
 from chat import consumer as chat_consumer
 from chat import service as chat_service
+import debug_trace
 from memory import service as memory_service
 from proactive import service as proactive_service
 from push import service as push_service
@@ -64,6 +65,23 @@ def _proactive_delivery_decision_v2(store: UserStore, payload: dict):
             manual = bool(job.get("manual"))
     manual = manual or bool(payload.get("manual") or payload.get("manual_wake") or payload.get("user_initiated"))
     return evaluate_delivery_v2(_settings_v2_for_store(store), source=source, manual=manual)
+
+
+def _trace_chat_poll_delivered(store: UserStore, pending: list, *, consumer_id: str, claim: bool) -> None:
+    if not pending:
+        return
+    debug_trace.trace_event(
+        store,
+        subsystem="route",
+        type="chat.poll.delivered",
+        actor="consumer",
+        summary=f"delivered {len(pending)} message(s) to consumer",
+        detail={
+            "count": len(pending),
+            "consumer_id": consumer_id,
+            "claimed": bool(claim),
+        },
+    )
 
 
 @bp.route("/v1/chat/history", methods=["GET"])
@@ -234,6 +252,14 @@ def chat_message():
         return jsonify({"error": "content_type must be 'text' or 'image'"}), 400
     msg = store.append_chat("user", "chat", envelope, content_type=content_type)
     store.notify_chat_waiters()
+    debug_trace.trace_event(
+        store,
+        subsystem="route",
+        type="chat.message",
+        actor="ios",
+        summary=f"user message stored id={msg['id']}",
+        detail={"content_type": content_type, "msg_id": msg["id"]},
+    )
     print(f"[chat:{store.user_id}] user(v1, visibility={envelope['visibility']}, type={content_type}) id={msg['id']}")
     return jsonify({"id": msg["id"], "ts": msg["ts"], "v": msg["v"]})
 
@@ -257,6 +283,15 @@ def chat_response():
     allow_verify_reply = boot_gates._reply_is_for_pending_verify_ping(store)
     gated = boot_gates._gate_bootstrap_for_chat(store, allow_verify_reply=allow_verify_reply)
     if gated is not None:
+        debug_trace.trace_event(
+            store,
+            subsystem="route",
+            type="chat.response.gated",
+            actor="agent",
+            status="blocked",
+            summary="bootstrap_incomplete gate fired",
+            detail={"allow_verify_reply": bool(allow_verify_reply)},
+        )
         return gated
     chat_consumer._record_consumer_event(store, "response")
     envelope = payload.get("envelope")
@@ -380,6 +415,14 @@ def chat_response():
         updated = store.update_chat_message_metadata(msg["id"], delivery_fields)
         if updated:
             msg = updated
+    debug_trace.trace_event(
+        store,
+        subsystem="route",
+        type="chat.response",
+        actor="agent",
+        summary=f"agent reply stored id={msg['id']} source={source}",
+        detail={"source": source, "content_type": content_type, "msg_id": msg["id"]},
+    )
     print(f"[chat:{store.user_id}] openclaw(v1, source={source}, type={content_type}) id={msg['id']}")
     return jsonify({"id": msg["id"], "ts": msg["ts"], "v": msg["v"]})
 
@@ -408,6 +451,7 @@ def chat_poll():
         claim=claim,
     )
     if pending:
+        _trace_chat_poll_delivered(store, pending, consumer_id=consumer_id, claim=claim)
         return jsonify({
             "messages": pending,
             "runtime_v2": runtime_profile,
@@ -436,6 +480,7 @@ def chat_poll():
             consumer_id=consumer_id,
             claim=claim,
         )
+        _trace_chat_poll_delivered(store, pending, consumer_id=consumer_id, claim=claim)
         return jsonify({
             "messages": pending,
             "runtime_v2": runtime_profile,
