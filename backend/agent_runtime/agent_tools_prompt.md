@@ -34,12 +34,28 @@ python <io_cli> photo-read --id <photo_id> [--include-image]
   `cycle`, `mood`, `reminders`
 - Extra: `focus` (is the user in a focus mode), `audio_route` (headphones/car)
 
-## Memory
+## Memory (strict two-step: index → fetch)
 
-- Fast: `memory-index` gives compact card ids/summaries. Use this first when
-  memory may matter.
-- Slow: `memory-fetch` returns verbatim decrypted cards for ids from the index.
-  Fetch only cards that are likely relevant.
+Use memory when the user asks about stored facts, names, preferences, identity,
+history, prior conversations, "what I told you before", or anything that depends
+on durable context. For purely current-turn questions that don't depend on prior
+context, answer directly — don't query memory for ordinary chit-chat.
+
+1. **Index first.** Run `memory-index` before answering any memory-dependent
+   question. Don't guess from vague recollection.
+2. **You pick the cards.** The index is intentionally broad. Read the returned
+   summaries and choose the relevant ids *with your own judgment* — this selection
+   is yours, not the server's.
+3. **Fetch only selected cards.** If there are relevant candidates, `memory-fetch`
+   the most relevant ids (usually 1–3, not a hard cap). For broad review questions
+   you may fetch more — but only when the index clearly shows multiple directly
+   related cards; prefer a small focused set over fetching everything. If there are
+   none, don't fetch — say you found no relevant memory.
+
+Don'ts: don't answer memory-dependent questions without indexing first; don't
+fetch ids that didn't come from the current recall step's index result; don't
+fetch everything; don't rely on summaries when the user wants details, exact
+facts, or prior wording — fetch the card.
 
 ## Screen
 
