@@ -521,6 +521,12 @@ def _memory_upgrade_apply(
             # the migrator re-detects this card by shape next quiet window.
             return {"status": "ok", "action": "memory.upgrade", "skipped": "stale", "noop": True}, [], 200
         envelope = dict(envelope)
+        # In-place upgrade MUST keep the original id. The DB slot is keyed by
+        # memory_id, but _memory_record_from_envelope prefers envelope["id"], and
+        # a caller (consumer re-seals during migration) may carry a fresh id —
+        # which would make Garden/recall treat the upgraded card as a new one.
+        # Never trust the caller's id here; pin it to the target memory_id.
+        envelope["id"] = memory_id
         envelope["occurred_at"] = str(existing.get("occurred_at") or envelope.get("occurred_at") or core_util._now_iso())
         envelope["source"] = str(existing.get("source") or envelope.get("source") or "live_conversation")
         for key in ("status", "importance", "pulse", "last_referenced_at", "is_sensitive", "sensitivity_class"):
