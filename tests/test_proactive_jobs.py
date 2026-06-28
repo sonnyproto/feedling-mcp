@@ -1166,6 +1166,35 @@ def test_capture_failed_window_retries_same_key(tmp_path, monkeypatch):
     assert len(jobs) == 2  # first(failed) + second(pending) — no pile-up
 
 
+def test_dream_failed_window_retries_same_key(tmp_path, monkeypatch):
+    # Same scheduler-correctness fix as capture, for dream: a failed dream must be
+    # retryable and must not permanently lock dream_already_pending.
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    store = appmod.UserStore("usr_dream_failed_retry")
+
+    first, first_enqueued, _ = proactive_capture_jobs.enqueue_memory_dream_job(
+        store, trigger="nightly_dream", dream_key="dream:same", now=101.0,
+    )
+    store.update_proactive_job(first["job_id"], {"status": "failed"})
+
+    second, second_enqueued, second_reason = proactive_capture_jobs.enqueue_memory_dream_job(
+        store, trigger="nightly_dream", dream_key="dream:same", now=301.0,
+    )
+    assert first_enqueued is True
+    assert second_enqueued is True  # failed dream IS retried
+    assert second_reason == "enqueued"
+    assert second["job_id"] != first["job_id"]
+
+    third, third_enqueued, third_reason = proactive_capture_jobs.enqueue_memory_dream_job(
+        store, trigger="nightly_dream", dream_key="dream:same", now=401.0,
+    )
+    assert third_enqueued is False  # retry in flight -> single-flighted
+    assert third_reason == "duplicate_dream_key"
+    assert third["job_id"] == second["job_id"]
+    jobs = [row for row in store.list_proactive_jobs(since_epoch=0, limit=0) if row.get("job_kind") == "memory_dream"]
+    assert len(jobs) == 2  # no pile-up
+
+
 def _capture_test_envelope(user_id: str, msg_id: str) -> dict:
     return {
         "id": msg_id,

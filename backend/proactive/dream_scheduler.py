@@ -208,7 +208,12 @@ def tick_memory_dream(store, *, now: float | None = None, force: bool = False) -
         return {"enqueued": False, "reason": "no_memory_cards", "state": state, "job": None, "snapshot": snapshot}
     pending_key = str(state.get("pending_dream_key") or "")
     if pending_key:
-        return {"enqueued": False, "reason": "dream_already_pending", "state": state, "job": None, "snapshot": snapshot}
+        if capture_jobs._find_active_dream(store) is not None:
+            return {"enqueued": False, "reason": "dream_already_pending", "state": state, "job": None, "snapshot": snapshot}
+        # Stale flag: the job it pointed to is terminal/gone — self-heal so a stuck
+        # user isn't blocked forever, then fall through and re-evaluate.
+        state["pending_dream_key"] = ""
+        state = save_dream_state(store, state, now=now_ts)
     if not force and night_only() and not _within_night_window(store, now=now_ts):
         return {"enqueued": False, "reason": "night_not_due", "state": state, "job": None, "snapshot": snapshot}
     last_count = max(0, int(state.get("last_dreamed_card_count") or 0))
@@ -255,7 +260,9 @@ def tick_memory_dream(store, *, now: float | None = None, force: bool = False) -
         dream_stats=stats,
         now=now_ts,
     )
-    if job is not None and (enqueued or reason in {"duplicate_dream_key", "dream_already_pending"}):
+    # Only arm pending for a genuinely in-flight job (mirror capture fix): arming on
+    # a terminal duplicate is what caused the permanent dream_already_pending lock.
+    if job is not None and (enqueued or capture_jobs._active_dream_job(job)):
         state["pending_dream_key"] = str(job.get("dream_key") or key)[:240]
         state = save_dream_state(store, state, now=now_ts)
     return {

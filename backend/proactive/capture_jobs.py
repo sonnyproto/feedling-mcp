@@ -103,10 +103,16 @@ def _find_capture_by_key(store: UserStore, capture_key: str) -> dict | None:
 
 
 def _find_dream_by_key(store: UserStore, dream_key: str) -> dict | None:
-    for job in store.list_proactive_jobs(since_epoch=0, limit=0):
-        if is_memory_dream_job(job) and str(job.get("dream_key") or "") == dream_key:
-            return dict(job)
-    return None
+    matches = [
+        dict(job)
+        for job in store.list_proactive_jobs(since_epoch=0, limit=0)
+        if is_memory_dream_job(job) and str(job.get("dream_key") or "") == dream_key
+    ]
+    if not matches:
+        return None
+    # Latest wins (see _find_capture_by_key): a failed-then-retried dream can leave
+    # several same-key jobs; the newest reflects the current state.
+    return max(matches, key=lambda j: float(j.get("ts") or 0))
 
 
 def _find_active_capture(store: UserStore) -> dict | None:
@@ -244,9 +250,13 @@ def enqueue_memory_dream_job(
     key = str(dream_key or "").strip()
     if not key:
         return None, False, "dream_key_required"
-    existing_same_key = _find_dream_by_key(store, key)
-    if existing_same_key is not None:
-        return existing_same_key, False, "duplicate_dream_key"
+    prior = _find_dream_by_key(store, key)
+    if prior is not None:
+        status = str(prior.get("status") or "pending").strip().lower()
+        if status not in CAPTURE_RETRYABLE_TERMINAL:
+            # same key still in flight (single-flight) or completed (done) → no dup
+            return prior, False, "duplicate_dream_key"
+        # same key failed/skipped → that dream never finished; allow a retry
     active = _find_active_dream(store)
     if active is not None:
         return active, False, "dream_already_pending"
