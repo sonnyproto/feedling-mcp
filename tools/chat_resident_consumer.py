@@ -5069,19 +5069,24 @@ def _process_messages(messages: list) -> float:
             probe_thread.start()
             probe_thread.join(timeout=VERIFY_PROBE_TIMEOUT_SEC)
             try:
+                # All verify replies carry source="verify_ping" so the server
+                # filters them out of the user's visible chat history (and
+                # verify_loop's GC matches them) even when the reply lands after
+                # the GC window — otherwise the (real or canned) ack leaks as a
+                # stray visible message. suppress_push already kills the APNs push.
                 if probe_thread.is_alive():
                     log.warning("verify ping — agent slow (>%ss); canned ack fallback so verify still passes", VERIFY_PROBE_TIMEOUT_SEC)
-                    post_reply(VERIFY_PING_REPLY, suppress_push=True)
+                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True)
                 elif "result" in probe:
                     replies = _normalize_agent_replies(probe["result"]) or [VERIFY_PING_REPLY]
-                    post_reply(replies[0], suppress_push=True)
+                    post_reply(replies[0], source="verify_ping", suppress_push=True)
                     log.info("verify ping — real agent reply OK")
                 elif "no_usable_reply" in probe:
                     log.error("verify ping — agent produced no usable reply; NOT acking so verify fails (live loop is broken): %s", probe["no_usable_reply"])
                     # post nothing — verify_loop stays unsatisfied on purpose
                 else:
                     log.warning("verify ping — agent call errored (%s); canned ack fallback", probe.get("error"))
-                    post_reply(VERIFY_PING_REPLY, suppress_push=True)
+                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True)
             except Exception as e:
                 log.error("failed to post verify-ping reply: %s", e)
             latest = max(latest, ts)

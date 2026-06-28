@@ -462,6 +462,8 @@ def test_verify_ping_success_reply_suppresses_push():
     mock_agent.assert_called_once()
     mock_post.assert_called_once()
     assert mock_post.call_args.kwargs.get("suppress_push") is True
+    # source="verify_ping" so the visible history feed filters the liveness reply
+    assert mock_post.call_args.kwargs.get("source") == "verify_ping"
 
 
 def test_verify_ping_slow_agent_falls_back_to_canned_ack():
@@ -491,7 +493,9 @@ def test_verify_ping_slow_agent_falls_back_to_canned_ack():
              patch.object(crc, "call_agent", side_effect=_slow), \
              patch.object(crc, "post_reply") as mock_post:
             crc._process_messages([ping])
-            mock_post.assert_called_once_with(crc.VERIFY_PING_REPLY, suppress_push=True)
+            mock_post.assert_called_once_with(
+                crc.VERIFY_PING_REPLY, source="verify_ping", suppress_push=True
+            )
     finally:
         release.set()
 

@@ -93,8 +93,28 @@ def chat_history():
     ).lower() not in {"0", "false", "no", "off"}
 
     with store.chat_lock:
-        all_msgs = list(store.chat_messages)
-        total = len(store.chat_messages)
+        # Hide the synthetic verify-loop liveness REPLY (an agent/openclaw row
+        # stamped source="verify_ping") from the visible transcript. verify_loop
+        # GC's it once it completes, but the probe now runs a real, sometimes-slow
+        # agent call that can outlast verify_loop's timeout — a reply landing
+        # after the GC window would otherwise leak as a stray visible message
+        # (e.g. "__verify_ack__"). Filtering it here makes that timing-proof.
+        #
+        # The verify-loop PING itself (a user-role source="verify_ping" row) is
+        # deliberately NOT filtered: the enclave decrypt proxy reuses this very
+        # route (enclave_app.py -> _flask_get("/v1/chat/history")) to deliver the
+        # ping to the resident consumer, which detects it by source. Dropping it
+        # here would starve enclave-backed consumers and wedge verify_loop /
+        # onboarding. The ping is short-lived (verify_loop always GC's it), so it
+        # does not persist in the feed the way a missed reply would.
+        all_msgs = [
+            m for m in store.chat_messages
+            if not (
+                m.get("source") == "verify_ping"
+                and m.get("role") in ("agent", "openclaw")
+            )
+        ]
+        total = len(all_msgs)
 
     if before > 0:
         filtered = [m for m in all_msgs if float(m.get("ts", 0)) < before]
@@ -281,8 +301,21 @@ def chat_response():
     else:
         thinking_extra.update(chat_service._chat_plaintext_thinking_extra_for_store(store, payload))
     source = str(payload.get("source") or "chat").strip() or "chat"
-    if source not in {"chat", "live_activity", "heartbeat", proactive_service.PROACTIVE_JOB_SOURCE}:
+    # "verify_ping": the resident consumer stamps its synthetic liveness reply
+    # with this source so the visible /v1/chat/history feed can filter it out
+    # (and verify_loop's GC can match it) regardless of GC timing. It is never a
+    # user-visible message.
+    if source not in {"chat", "live_activity", "heartbeat", "verify_ping", proactive_service.PROACTIVE_JOB_SOURCE}:
         return jsonify({"error": "invalid source"}), 400
+    # Gate the hidden "verify_ping" source to an actual pending probe. Because
+    # source="verify_ping" rows are scrubbed from the visible transcript, an
+    # ordinary reply that (mis)used this source would silently vanish while still
+    # touching push/metadata. Accept it ONLY as the answer to an outstanding
+    # verify ping (allow_verify_reply, computed above). A late reply that lands
+    # after verify_loop already GC'd its ping is correctly rejected here — that
+    # round's verify has already concluded and the reply is unwanted.
+    if source == "verify_ping" and not allow_verify_reply:
+        return jsonify({"error": "verify_ping reply without a pending verify ping"}), 409
     alert_body = str(payload.get("alert_body") or "")
     push_body = str(payload.get("push_body") or "")
     extra = {
