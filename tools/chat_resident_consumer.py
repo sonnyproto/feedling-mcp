@@ -3516,6 +3516,8 @@ def _screen_watch_message(
             f"- screen_context_available: {str(screen_available).lower()}"
         ),
     ]
+    parts.insert(1, _local_time_anchor(
+        since_sec=chat_context.last_user_message_age_sec if chat_context is not None else None))
     if chat_context is not None:
         parts.append(_proactive_attention_facts(chat_context))
         parts.append(
@@ -3568,6 +3570,7 @@ def _message_for_proactive_job(
             f"- current_app: {str(job.get('current_app') or 'unknown')}\n"
             f"- screen_context_available: {str(screen_available).lower()}"
         ),
+        _local_time_anchor(since_sec=chat_context.last_user_message_age_sec),
         _proactive_attention_facts(chat_context),
         _native_reachout_tool_instructions(),
     ]
@@ -3683,6 +3686,66 @@ def _resident_perception_now() -> dict:
     signals = body.get("signals") if isinstance(body, dict) else {}
     now = signals.get("now") if isinstance(signals, dict) else {}
     return now if isinstance(now, dict) else {}
+
+
+# Time grounding — the agent otherwise has no reliable "what time is it now":
+# foreground chat passed the user's text verbatim, and the device-reported
+# local_time goes stale when the app is backgrounded overnight (the agent then
+# keeps acting on last night's frame). We compute the user's CURRENT local time
+# from the consumer's real clock + the user's timezone (stable; cached from a
+# perception pull), so every turn/wake is anchored to the real present.
+_tz_cache: dict = {"tz": "", "ts": 0.0}
+_last_interaction_unix: float = 0.0
+_WEEKDAYS_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def _user_timezone() -> str:
+    """Best-effort user timezone (IANA), cached ~1h (timezone is stable)."""
+    nowt = time.time()
+    if _tz_cache["tz"] and (nowt - _tz_cache["ts"]) < 3600:
+        return _tz_cache["tz"]
+    snap = _resident_perception_now()
+    tz = str((snap or {}).get("timezone") or "").strip()
+    if tz:
+        _tz_cache.update({"tz": tz, "ts": nowt})
+    return _tz_cache["tz"]
+
+
+def _local_time_anchor(since_sec: float | None = None) -> str:
+    """A reliable 'current local time' line for the agent. Uses the consumer's
+    real clock (never stale) + the user's timezone. Optionally appends how long
+    since the last interaction so the agent notices an overnight gap."""
+    from datetime import datetime, timezone as _tzmod
+    tzs = _user_timezone()
+    local = datetime.now(_tzmod.utc)
+    if tzs:
+        try:
+            from zoneinfo import ZoneInfo
+            local = local.astimezone(ZoneInfo(tzs))
+        except Exception:
+            pass
+    h = local.hour
+    seg = "凌晨" if h < 6 else "上午" if h < 12 else "中午" if h < 14 else "下午" if h < 18 else "晚上"
+    body = f"{local.strftime('%Y-%m-%d')} {_WEEKDAYS_ZH[local.weekday()]} {local.strftime('%H:%M')} {seg}"
+    if tzs:
+        body += f" {tzs}"
+    line = f"current_time: {body}"
+    if since_sec is not None and since_sec >= 1800:  # only note gaps >= 30 min
+        line += f" (距上次互动 {_format_age(since_sec)})"
+    return line
+
+
+def _prepend_time_anchor_foreground(content: str, msg_unix_ts: float) -> str:
+    """Prepend the real current-time anchor to a foreground user turn so the
+    agent is never stuck in a stale (e.g. last-night) frame. since = gap from the
+    previous processed message."""
+    global _last_interaction_unix
+    since = None
+    if _last_interaction_unix > 0 and msg_unix_ts > _last_interaction_unix:
+        since = msg_unix_ts - _last_interaction_unix
+    if msg_unix_ts > _last_interaction_unix:
+        _last_interaction_unix = msg_unix_ts
+    return f"[{_local_time_anchor(since_sec=since)}]\n\n{content}"
 
 
 def _resident_perception_digest_board() -> tuple[list, dict]:
@@ -5146,6 +5209,10 @@ def _process_messages(messages: list) -> float:
                 ts,
                 len(screen_payloads),
             )
+
+        # Ground every foreground turn in the real current time (+ gap since last
+        # interaction) so the agent never carries a stale, e.g. overnight, frame.
+        content = _prepend_time_anchor_foreground(content, ts)
 
         use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
         try:

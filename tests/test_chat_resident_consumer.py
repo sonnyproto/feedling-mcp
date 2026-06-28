@@ -159,7 +159,8 @@ def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monk
 
     assert result_ts == pytest.approx(1112.0)
     mock_agent.assert_called_once()
-    assert captured["message"] == "天气怎么样？"
+    assert captured["message"].endswith("天气怎么样？")  # time anchor prepended, no tool-prompt
+    assert "current_time:" in captured["message"]
     assert "Available tools JSON" not in captured["message"]
     assert "tool_calls" not in captured["message"]
     assert "perception.weather" not in captured["message"]
@@ -390,7 +391,8 @@ def test_enclave_history_used_when_configured(monkeypatch):
          patch.object(crc, "post_reply"):
         result_ts = crc._process_messages(decrypted)
 
-    mock_agent.assert_called_once_with("decrypted hello")
+    mock_agent.assert_called_once()
+    assert mock_agent.call_args[0][0].endswith("decrypted hello")  # time anchor prepended
     assert result_ts == pytest.approx(2000.0)
 
 
@@ -654,7 +656,7 @@ def test_screen_question_attaches_decrypted_screen_context(monkeypatch):
     mock_post.assert_called_once()
     assert result_ts == pytest.approx(2200.0)
     args, kwargs = mock_agent.call_args
-    assert args[0].startswith("你能看到我的屏幕吗")
+    assert "你能看到我的屏幕吗" in args[0]  # time anchor prepended
     assert "hello screen" in args[0]
     assert kwargs["images"] == [screen_image]
     assert kwargs["image_paths"] == ["/tmp/feedling_chat_images/screen.jpg"]
@@ -777,7 +779,8 @@ def test_empty_content_decrypt_source_available_replies(monkeypatch):
         # Consumer uses get_decrypted_history result, not the empty poll message
         result_ts = crc._process_messages([decrypted_msg])
 
-    mock_agent.assert_called_once_with("what's the weather?")
+    mock_agent.assert_called_once()
+    assert mock_agent.call_args[0][0].endswith("what's the weather?")  # time anchor prepended
     mock_post.assert_called_once()
     assert result_ts == pytest.approx(4000.0)
 
@@ -2504,6 +2507,41 @@ def test_screen_watch_recent_frames_parses_newest_first(monkeypatch):
 def test_screen_watch_recent_frames_empty_when_none(monkeypatch):
     monkeypatch.setattr(crc, "_fetch_screen_json", lambda path: {"frames": []})
     assert crc._screen_watch_recent_frames() == ("", 0.0, [])
+
+
+# --- time grounding (current-time anchor in every turn/wake) ----------------
+
+def test_local_time_anchor_uses_timezone_and_gap(monkeypatch):
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "Asia/Shanghai")
+    line = crc._local_time_anchor(since_sec=8 * 3600)
+    assert line.startswith("current_time:")
+    assert "Asia/Shanghai" in line
+    assert "距上次互动" in line  # gap >= 30min is surfaced
+
+
+def test_local_time_anchor_omits_small_gap(monkeypatch):
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "Asia/Shanghai")
+    assert "距上次互动" not in crc._local_time_anchor(since_sec=60)
+    assert "距上次互动" not in crc._local_time_anchor(since_sec=None)
+
+
+def test_prepend_time_anchor_foreground_prepends_and_tracks_gap(monkeypatch):
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "Asia/Shanghai")
+    monkeypatch.setattr(crc, "_last_interaction_unix", 0.0)
+    out = crc._prepend_time_anchor_foreground("早安", 1_000_000.0)
+    assert out.startswith("[current_time:")
+    assert out.endswith("早安")
+    out2 = crc._prepend_time_anchor_foreground("在吗", 1_000_000.0 + 8 * 3600)
+    assert "距上次互动" in out2
+
+
+def test_screen_watch_message_carries_current_time(monkeypatch):
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "Asia/Shanghai")
+    msg = crc._message_for_proactive_job(
+        {"job_kind": "screen_watch", "broadcast_state": "on"},
+        screen_text="ocr_text:\nx", recent_chat_context="",
+    )
+    assert "current_time:" in msg
 
 
 def test_normalize_agent_replies_supports_multiple_messages_with_cap(monkeypatch):
