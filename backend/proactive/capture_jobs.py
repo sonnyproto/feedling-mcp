@@ -25,6 +25,10 @@ CAPTURE_JOB_KIND_MIGRATE = "memory_migrate"
 MIGRATE_JOB_SOURCE = "memory_migrate"
 MIGRATE_JOB_ID_PREFIX = "migr"
 CAPTURE_ACTIVE_STATUSES = frozenset({"pending", "claimed", "realizing"})
+# Same-key terminal states that should NOT block a fresh enqueue: the window was
+# not successfully captured, so re-enqueuing the same window is correct (failed =
+# error; skipped = abnormal terminal — noop is reported as completed, not skipped).
+CAPTURE_RETRYABLE_TERMINAL = frozenset({"failed", "skipped"})
 
 
 def is_memory_capture_job(job: Mapping[str, Any] | None) -> bool:
@@ -85,10 +89,17 @@ def _active_dream_job(job: Mapping[str, Any]) -> bool:
 
 
 def _find_capture_by_key(store: UserStore, capture_key: str) -> dict | None:
-    for job in store.list_proactive_jobs(since_epoch=0, limit=0):
-        if is_memory_capture_job(job) and str(job.get("capture_key") or "") == capture_key:
-            return dict(job)
-    return None
+    matches = [
+        dict(job)
+        for job in store.list_proactive_jobs(since_epoch=0, limit=0)
+        if is_memory_capture_job(job) and str(job.get("capture_key") or "") == capture_key
+    ]
+    if not matches:
+        return None
+    # Latest wins: after a failed-window retry there can be several same-key jobs;
+    # the newest reflects the current state (active retry vs. still-failed) so we
+    # don't keep matching a stale failed job and pile up duplicates.
+    return max(matches, key=lambda j: float(j.get("ts") or 0))
 
 
 def _find_dream_by_key(store: UserStore, dream_key: str) -> dict | None:
@@ -197,9 +208,15 @@ def enqueue_memory_capture_job(
     key = str(capture_key or "").strip()
     if not key:
         return None, False, "capture_key_required"
-    existing_same_key = _find_capture_by_key(store, key)
-    if existing_same_key is not None:
-        return existing_same_key, False, "duplicate_capture_key"
+    prior = _find_capture_by_key(store, key)
+    if prior is not None:
+        status = str(prior.get("status") or "pending").strip().lower()
+        if status not in CAPTURE_RETRYABLE_TERMINAL:
+            # Same key, still in flight (single-flight) OR already completed
+            # (window done) → don't enqueue a duplicate.
+            return prior, False, "duplicate_capture_key"
+        # Same key but failed/skipped: that window was never captured. Fall
+        # through to re-enqueue a fresh job for it (subject to single-flight).
     active = _find_active_capture(store)
     if active is not None:
         return active, False, "capture_already_pending"

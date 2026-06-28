@@ -187,7 +187,13 @@ def _enqueue_window(store, *, trigger: str, now: float | None = None) -> dict[st
         return {"enqueued": False, "reason": "already_captured", "state": state, "job": None}
     pending_key = str(state.get("pending_capture_key") or "")
     if pending_key:
-        return {"enqueued": False, "reason": "capture_already_pending", "state": state, "job": None}
+        if capture_jobs._find_active_capture(store) is not None:
+            return {"enqueued": False, "reason": "capture_already_pending", "state": state, "job": None}
+        # Stale flag: the job it pointed to is terminal/gone (e.g. a failed capture
+        # whose key got re-armed). Self-heal so a stuck user isn't blocked forever,
+        # then fall through and re-evaluate this window.
+        state["pending_capture_key"] = ""
+        state = save_capture_state(store, state, now=now_ts)
     last_completed = _safe_float(state.get("last_capture_completed_at"), 0.0)
     if last_completed and now_ts - last_completed < min_interval_sec():
         return {"enqueued": False, "reason": "min_interval", "state": state, "job": None}
@@ -200,7 +206,11 @@ def _enqueue_window(store, *, trigger: str, now: float | None = None) -> dict[st
         window=window,
         now=now_ts,
     )
-    if job is not None and (enqueued or reason in {"duplicate_capture_key", "capture_already_pending"}):
+    # Only arm pending for a genuinely in-flight job. Arming it on a terminal
+    # (completed/failed) duplicate was the root cause of the permanent
+    # capture_already_pending lock — a terminal job never re-fires a status event
+    # to clear it.
+    if job is not None and (enqueued or capture_jobs._active_capture_job(job)):
         state["pending_capture_key"] = str(job.get("capture_key") or key)[:240]
         state = save_capture_state(store, state, now=now_ts)
     return {"enqueued": bool(enqueued), "reason": reason, "state": state, "job": job}

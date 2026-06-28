@@ -1120,6 +1120,52 @@ def test_capture_enqueue_is_idempotent_by_capture_key(tmp_path, monkeypatch):
     assert len(jobs) == 1
 
 
+def test_capture_failed_window_retries_same_key(tmp_path, monkeypatch):
+    # Regression: a FAILED capture window must be retryable. Previously the
+    # terminal failed job matched as duplicate_capture_key forever (and re-armed
+    # pending_capture_key) -> permanent capture_already_pending, window never
+    # re-captured.
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    store = appmod.UserStore("usr_capture_failed_retry")
+
+    first, first_enqueued, _ = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="session_break",
+        capture_key="window:same",
+        window={"until_message_id": "msg_1", "until_ts": 100.0, "message_count": 3},
+        now=101.0,
+    )
+    store.update_proactive_job(first["job_id"], {"status": "failed"})
+
+    second, second_enqueued, second_reason = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="quiet_timeout",
+        capture_key="window:same",
+        window={"until_message_id": "msg_1", "until_ts": 100.0, "message_count": 3},
+        now=301.0,
+    )
+    assert first_enqueued is True
+    assert second_enqueued is True  # failed window IS retried
+    assert second_reason == "enqueued"
+    assert second["job_id"] != first["job_id"]  # a fresh job …
+    assert second["capture_key"] == first["capture_key"]  # … for the same window
+
+    # While the retry is in flight it's the latest same-key job -> single-flighted,
+    # so retries don't pile up.
+    third, third_enqueued, third_reason = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="quiet_timeout",
+        capture_key="window:same",
+        window={"until_message_id": "msg_1", "until_ts": 100.0, "message_count": 3},
+        now=401.0,
+    )
+    assert third_enqueued is False
+    assert third_reason == "duplicate_capture_key"
+    assert third["job_id"] == second["job_id"]
+    jobs = [row for row in store.list_proactive_jobs(since_epoch=0, limit=0) if row.get("job_kind") == "memory_capture"]
+    assert len(jobs) == 2  # first(failed) + second(pending) — no pile-up
+
+
 def _capture_test_envelope(user_id: str, msg_id: str) -> dict:
     return {
         "id": msg_id,
