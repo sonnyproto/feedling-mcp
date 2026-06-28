@@ -3533,6 +3533,56 @@ def _screen_watch_message(
     return "\n\n".join(parts)
 
 
+def _is_photo_added_job(job: dict) -> bool:
+    return "photo_added" in (
+        str((job or {}).get("trigger") or "").strip().lower(),
+        str((job or {}).get("intent_label") or "").strip().lower(),
+    )
+
+
+def _new_photo_hint(job: dict) -> str:
+    """For a photo_added wake: tell the agent a fresh photo landed in the album +
+    its rough metadata (what it looks like, screenshot or not) + its id, so the
+    agent can DECIDE whether it's worth looking and — only if it wants — pull the
+    real pixels with photo_read. Pull-on-demand, not auto-attached. Best-effort:
+    returns '' on anything unexpected so a wake never breaks over this."""
+    if not _is_photo_added_job(job):
+        return ""
+    try:
+        resp = httpx.get(
+            f"{FEEDLING_API_URL}/v1/perception/photos",
+            headers=_HEADERS,
+            params={"limit": 1},
+            timeout=12,
+        )
+        if resp.status_code >= 400:
+            return ""
+        photos = (resp.json() or {}).get("photos") or []
+    except Exception as exc:  # noqa: BLE001 — hint is optional, never fatal
+        log.debug("new-photo hint fetch failed: %s", exc)
+        return ""
+    if not photos or not isinstance(photos[0], dict):
+        return ""
+    photo = photos[0]
+    pid = str(photo.get("photo_id") or "").strip()
+    if not pid:
+        return ""
+    meta = photo.get("metadata") if isinstance(photo.get("metadata"), dict) else {}
+    scene = str(meta.get("scene_hint") or "").strip() or "unclassified"
+    tod = str(meta.get("time_of_day") or "").strip()
+    is_shot = str(meta.get("is_screenshot")).strip().lower() in ("true", "1", "yes")
+    kind = "a screenshot" if is_shot else f'a photo that looks like "{scene}"'
+    when = f", taken in the {tod}" if tod else ""
+    return (
+        "new_photo:\n"
+        f"A new image just landed in their album — {kind}{when} (id={pid}). "
+        "This is only a rough hint; you cannot see the image itself from here. "
+        "If it sounds worth a look, pull the real pixels: call photo_read with "
+        f"id=\"{pid}\" and include_image=true (decrypts it so you can actually see it). "
+        "It's entirely your call — glance at it, or let it pass."
+    )
+
+
 def _message_for_proactive_job(
     job: dict,
     screen_text: str = "",
@@ -3568,6 +3618,9 @@ def _message_for_proactive_job(
     ]
     if perception_digest is not None:
         parts.append(_native_reachout_perception_context(*perception_digest))
+    photo_hint = _new_photo_hint(job)
+    if photo_hint:
+        parts.append(photo_hint)
     if chat_context.text:
         parts.append(
             "recent_chat_context:\n"

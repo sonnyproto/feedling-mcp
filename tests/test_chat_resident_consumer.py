@@ -2686,6 +2686,71 @@ def test_message_for_proactive_job_instructs_multi_bubble_without_gate_context()
     assert "screen: dense paragraph" in message
 
 
+def test_photo_added_wake_surfaces_pullable_photo_hint(monkeypatch):
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "photos": [
+                    {
+                        "photo_id": "ph_abc123",
+                        "metadata": {
+                            "scene_hint": "food",
+                            "time_of_day": "evening",
+                            "is_screenshot": "false",
+                        },
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+
+    job = {"schema_version": 2, "trigger": "photo_added", "wake_kind": "perception"}
+    message = crc._message_for_proactive_job(
+        job,
+        recent_chat_context="",
+        perception_digest=({}, [], {}),
+    )
+
+    assert "new_photo:" in message
+    assert "ph_abc123" in message
+    assert 'looks like "food"' in message
+    assert "photo_read" in message and "include_image=true" in message
+    # pull-on-demand, not auto-attached: the raw image is NOT inlined
+    assert "your call" in message
+
+
+def test_non_photo_wake_has_no_photo_hint(monkeypatch):
+    def _boom(*a, **kw):  # must not even be called for a non-photo wake
+        raise AssertionError("photos endpoint should not be hit on a non-photo wake")
+
+    monkeypatch.setattr(crc.httpx, "get", _boom)
+
+    job = {"schema_version": 2, "trigger": "wake", "wake_kind": "perception"}
+    message = crc._message_for_proactive_job(
+        job, recent_chat_context="", perception_digest=({}, [], {})
+    )
+    assert "new_photo:" not in message
+
+
+def test_photo_hint_screenshot_framing(monkeypatch):
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "photos": [
+                    {"photo_id": "ph_shot", "metadata": {"is_screenshot": "true"}}
+                ]
+            }
+
+    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+    hint = crc._new_photo_hint({"trigger": "photo_added"})
+    assert "a screenshot" in hint
+    assert "ph_shot" in hint
+
+
 def test_recent_chat_context_defaults_to_twenty_messages(monkeypatch):
     captured = {}
     now = 1780939000.0
