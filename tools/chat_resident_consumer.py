@@ -3579,7 +3579,9 @@ def _new_photo_hint(job: dict) -> str:
         "This is only a rough hint; you cannot see the image itself from here. "
         "If it sounds worth a look, pull the real pixels: call photo_read with "
         f"id=\"{pid}\" and include_image=true (decrypts it so you can actually see it). "
-        "It's entirely your call — glance at it, or let it pass."
+        "It's entirely your call — look or let it pass; and if seeing it makes you want "
+        "to say something, you can reach out to them about it (or not). Treat it like "
+        "noticing a friend's photo, not a task to report on."
     )
 
 

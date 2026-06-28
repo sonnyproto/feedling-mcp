@@ -2718,7 +2718,7 @@ def test_photo_added_wake_surfaces_pullable_photo_hint(monkeypatch):
     assert 'looks like "food"' in message
     assert "photo_read" in message and "include_image=true" in message
     # pull-on-demand, not auto-attached: the raw image is NOT inlined
-    assert "your call" in message
+    assert "reach out to them about it" in message
 
 
 def test_non_photo_wake_has_no_photo_hint(monkeypatch):
