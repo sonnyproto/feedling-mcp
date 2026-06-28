@@ -164,7 +164,25 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
         # --skip-git-repo-check: the consumer's cwd is the user's home, not a git
         # repo; without it `codex exec` refuses ("Not inside a trusted directory")
         # and exits 1 before any model call.
-        return "codex exec --skip-git-repo-check --json {message}"
+        #
+        # --sandbox workspace-write + sandbox_workspace_write.network_access=true:
+        # codex sandboxes the SHELL COMMANDS the model runs, and its default
+        # sandbox BLOCKS network egress. The agent reads memory/perception by
+        # shelling out to io_cli, which makes an HTTPS call to the Feedling API —
+        # under the default sandbox that call dies at DNS ("Could not resolve
+        # host: …feedling.app") and the agent falsely reports "can't find it"
+        # while the data is present. (The model call itself is codex's own,
+        # un-sandboxed network, so chat still replies — only the tool reads
+        # break.) This hits codex-driver on host AND VPS; claude-driver runs its
+        # Bash in the normal process env and is unaffected. workspace-write grants
+        # network without opening full-filesystem write (vs danger-full-access).
+        # Verified on codex-cli 0.136.0: default + workspace-write both fail DNS;
+        # workspace-write + network_access reaches the server.
+        return (
+            "codex exec --skip-git-repo-check --json "
+            "--sandbox workspace-write "
+            "-c 'sandbox_workspace_write.network_access=true' {message}"
+        )
     grant = ",".join(_io_cli_allow_rules(io_cli))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
     return (
@@ -212,6 +230,53 @@ def agent_home_files(
         settings = {"permissions": {"allow": _io_cli_allow_rules(io_cli)}}
         files[f"{home}/claude-home/settings.json"] = json.dumps(settings, indent=2)
     return files
+
+
+def stale_home_files(home: str, *, driver: str, codex_transport: str = "native") -> list[str]:
+    """Per-user home paths a (re)spawn must PRUNE — files ``agent_home_files`` does
+    not write for the current driver/transport but a PERSISTENT home may still carry
+    from a prior config. Absolute paths.
+
+    The motivating case: a codex user who switched from a gateway provider
+    (gemini/openrouter/openai_compatible) to native openai — or to the claude
+    driver — leaves a ``codex-home/config.toml`` pointing at the in-CVM LiteLLM
+    gateway (``127.0.0.1:4000``). ``agent_home_files`` writes that file only for
+    ``gateway`` transport, so on the native/claude path the stale file survives and
+    codex keeps routing every turn to a port the supervisor only opens when gateway
+    users exist → ``error sending request`` → user-visible fallback. Listing it here
+    lets the spawner delete it so native codex falls back to api.openai.com as
+    designed. ``gateway`` transport returns [] — it WRITES that config this spawn and
+    must never prune it."""
+    stale: list[str] = []
+    if codex_transport != "gateway":
+        stale.append(f"{home}/codex-home/config.toml")
+    return stale
+
+
+def materialize_home(
+    home: str,
+    *,
+    driver: str,
+    io_cli: str = _IO_CLI,
+    codex_transport: str = "native",
+    gateway_base_url: str = "",
+    model: str = "",
+    persona_content: str = "",
+) -> None:
+    """Write the per-user home files for a spawn AND prune stale ones a persistent
+    home may carry (see ``stale_home_files``). Idempotent — safe before every
+    (re)spawn. A path written this spawn is never pruned (the prune list excludes the
+    current transport's files, and a final guard skips anything just written)."""
+    files = agent_home_files(
+        home, driver=driver, io_cli=io_cli, codex_transport=codex_transport,
+        gateway_base_url=gateway_base_url, model=model, persona_content=persona_content)
+    for path, content in files.items():
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+    for path in stale_home_files(home, driver=driver, codex_transport=codex_transport):
+        if path not in files:
+            Path(path).unlink(missing_ok=True)
 
 
 def _persona_from_blob(blob, decrypt_fn) -> str:
@@ -364,7 +429,7 @@ class ProcessSpawner:
 
     def spawn(self, entry: dict, user_id: str, home: str) -> int:
         driver = (entry.get("driver") or "claude").strip().lower()
-        files = agent_home_files(
+        materialize_home(
             home, driver=driver,
             codex_transport=_codex_transport(entry),
             gateway_base_url=os.environ.get("FEEDLING_LITELLM_BASE_URL", ""),
@@ -373,10 +438,6 @@ class ProcessSpawner:
                 user_id, entry.get("api_key"),
                 runtime_token=entry.get("runtime_token", "")),
         )
-        for path, content in files.items():
-            p = Path(path)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content)
         env = consumer_env(os.environ, entry, user_id=user_id, home=home)
         return self.register(subprocess.Popen([sys.executable, _RESIDENT_CONSUMER], env=env))
 

@@ -72,6 +72,22 @@ def test_default_codex_cmd_skips_git_repo_check():
     assert "--skip-git-repo-check" in env["AGENT_CLI_CMD"]
 
 
+def test_default_codex_cmd_grants_sandbox_network():
+    # codex sandboxes the shell commands the model runs, and its DEFAULT sandbox
+    # blocks network. The agent reads memory/perception via io_cli (an HTTPS call
+    # to the Feedling API); under the default sandbox that call dies at DNS and
+    # the agent falsely reports "can't find it" while the data is present. The
+    # default template MUST open egress (workspace-write + network_access) or
+    # every hosted codex turn that reads memory silently fails.
+    env = spawners.consumer_env(
+        {}, {"api_key": "fk", "provider_key": "sk-oai", "driver": "codex"},
+        user_id="u_1", home="/h",
+    )
+    cmd = env["AGENT_CLI_CMD"]
+    assert "--sandbox workspace-write" in cmd
+    assert "sandbox_workspace_write.network_access=true" in cmd
+
+
 def test_consumer_env_tolerates_missing_api_key_for_zero_roster():
     # Stage D host-all: a discovered entry has NO api_key (the consumer auths with
     # the runtime-token file). consumer_env must not KeyError on it.
@@ -350,6 +366,44 @@ def test_agent_home_files_codex_gateway_writes_responses_config():
 def test_agent_home_files_codex_native_omits_gateway_config():
     files = spawners.agent_home_files("/h", driver="codex", codex_transport="native")
     assert "/h/codex-home/config.toml" not in files
+
+
+def test_stale_home_files_native_codex_prunes_gateway_config():
+    # A user who switched from a gateway provider (gemini/openrouter/...) to native
+    # openai leaves a codex-home/config.toml pointing at the in-CVM gateway on the
+    # PERSISTENT home. agent_home_files writes nothing for native, so the stale file
+    # would survive and keep routing codex at the (now-dead) :4000 — list it to prune.
+    stale = spawners.stale_home_files("/h", driver="codex", codex_transport="native")
+    assert "/h/codex-home/config.toml" in stale
+
+
+def test_stale_home_files_gateway_codex_keeps_config():
+    # Gateway transport WRITES config.toml this spawn — it must never be pruned.
+    stale = spawners.stale_home_files("/h", driver="codex", codex_transport="gateway")
+    assert "/h/codex-home/config.toml" not in stale
+
+
+def test_materialize_home_prunes_stale_gateway_config_on_native(tmp_path):
+    home = str(tmp_path / "u")
+    cfg = tmp_path / "u" / "codex-home" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text('model_provider = "feedling_gateway"\nbase_url = "http://127.0.0.1:4000/v1"\n')
+    spawners.materialize_home(home, driver="codex", codex_transport="native")
+    # the stale gateway config is gone → codex falls back to native (api.openai.com)
+    assert not cfg.exists()
+    # AGENTS.md still seeded
+    assert (tmp_path / "u" / "codex-home" / "AGENTS.md").exists()
+
+
+def test_materialize_home_writes_and_keeps_gateway_config(tmp_path):
+    home = str(tmp_path / "u")
+    spawners.materialize_home(
+        home, driver="codex", codex_transport="gateway",
+        gateway_base_url="http://127.0.0.1:4000/v1", model="gw-gemini",
+    )
+    cfg = tmp_path / "u" / "codex-home" / "config.toml"
+    assert cfg.exists()
+    assert "http://127.0.0.1:4000/v1" in cfg.read_text()
 
 
 # ---- Stage D slice 3a: runtime-token file delivery ----
