@@ -1461,3 +1461,120 @@ def test_history_import_allows_confirmed_fresh_start_without_materials(client, m
     assert job["support_materials"] == 1
     assert "fresh_start_without_support_material" in job["warnings"]
     assert job["identity_written"] is True
+
+
+def test_chat_history_hides_verify_reply_but_keeps_ping(client):
+    """The visible /v1/chat/history feed must hide the verify-loop liveness
+    REPLY (agent/openclaw, source='verify_ping') so a reply that outlives
+    verify_loop's GC window can never leak as a stray visible message (e.g.
+    '__verify_ack__').
+
+    But the verify PING itself (user-role, source='verify_ping') must REMAIN in
+    this route's output: the enclave decrypt proxy reuses /v1/chat/history to
+    deliver the ping to the resident consumer (which detects it by source).
+    Dropping it here would starve enclave-backed consumers and wedge verify_loop
+    (regression guard for the enclave-poll path)."""
+    import uuid
+
+    from core import store as core_store
+
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+
+    def _env(body: str) -> dict:
+        return {
+            "v": 1,
+            "id": uuid.uuid4().hex,
+            "body_ct": _b64(body.encode("utf-8")),
+            "nonce": _b64(b"\x00" * 12),
+            "K_user": _b64(b"\x00" * 32),
+            "visibility": "local_only",
+            "owner_user_id": user_id,
+        }
+
+    # A normal user message, a synthetic ping, AND a leaked liveness reply.
+    real = store.append_chat("user", "chat", _env("hello"))
+    ping = store.append_chat("user", "verify_ping", _env("__VERIFY_PING__:abc"))
+    reply = store.append_chat("openclaw", "verify_ping", _env("__verify_ack__"))
+
+    res = client.get("/v1/chat/history?limit=50", headers=_headers(api_key))
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+
+    ids = [m.get("id") for m in body["messages"]]
+    # The liveness reply is hidden from the visible feed...
+    assert reply["id"] not in ids, f"verify_ping reply leaked into history: {ids}"
+    # ...but the ping survives so the enclave consumer can still receive it.
+    assert ping["id"] in ids, "verify_ping PING must stay for enclave-backed pollers"
+    assert real["id"] in ids, "the real user message must still appear"
+    # total reflects the visible feed: real + ping (reply filtered out)
+    assert body["total"] == 2, body
+
+
+def _verify_reply_envelope(user_id: str) -> dict:
+    import uuid
+
+    return {
+        "v": 1,
+        "id": uuid.uuid4().hex,
+        "body_ct": _b64(b"__verify_ack__"),
+        "nonce": _b64(b"\x00" * 12),
+        "K_user": _b64(b"\x00" * 32),
+        "visibility": "local_only",
+        "owner_user_id": user_id,
+    }
+
+
+def test_chat_response_rejects_verify_ping_source_without_pending_ping(client, monkeypatch):
+    """Because source=='verify_ping' rows are scrubbed from the visible feed, a
+    reply that (mis)uses this source without an outstanding probe would silently
+    vanish from the transcript. The route must reject it (409) unless an actual
+    verify ping is pending. Bootstrap gate is stubbed open so we isolate the
+    new source gate (a fresh user would otherwise 409 on bootstrap first)."""
+    from bootstrap import gates as boot_gates
+
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        boot_gates, "_gate_bootstrap_for_chat",
+        lambda store, allow_verify_reply=False: None,
+    )
+    # No pending verify ping in the store.
+    res = client.post(
+        "/v1/chat/response",
+        json={"envelope": _verify_reply_envelope(user_id), "source": "verify_ping"},
+        headers=_headers(api_key),
+    )
+    assert res.status_code == 409, res.get_data(as_text=True)
+    assert "pending verify ping" in res.get_json().get("error", "")
+
+
+def test_chat_response_accepts_verify_ping_reply_to_pending_ping(client, monkeypatch):
+    """The legitimate path: when a verify ping is outstanding, the resident
+    consumer's source='verify_ping' liveness reply satisfies the new source gate
+    and is accepted. Bootstrap gate is stubbed open to isolate the source gate
+    (in production allow_verify_reply also bypasses it at the main_loop stage)."""
+    from bootstrap import gates as boot_gates
+    from core import store as core_store
+
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        boot_gates, "_gate_bootstrap_for_chat",
+        lambda store, allow_verify_reply=False: None,
+    )
+    store = core_store.get_store(user_id)
+    # An outstanding synthetic ping with no reply after it → pending.
+    store.append_chat(
+        "user", "verify_ping",
+        {
+            "v": 1, "id": "ping_pending_01",
+            "body_ct": _b64(b"__VERIFY_PING__:x"), "nonce": _b64(b"\x00" * 12),
+            "K_user": _b64(b"\x00" * 32), "visibility": "local_only",
+            "owner_user_id": user_id,
+        },
+    )
+    res = client.post(
+        "/v1/chat/response",
+        json={"envelope": _verify_reply_envelope(user_id), "source": "verify_ping"},
+        headers=_headers(api_key),
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
