@@ -94,6 +94,106 @@ def test_reaudit_due_only_when_done_and_aged():
     assert migration.reaudit_due(pending, now=1e9, reaudit_sec=100) is False       # not done → n/a
 
 
+# --- per-card attempt cap (A11) -------------------------------------------
+
+def _legacy_moments():
+    # 3 legacy cards, all decryptable to old-shape inners.
+    return [
+        ({"id": "m1", "body_ct": "ct1"}, {"title": "a", "description": "x"}),
+        ({"id": "m2", "body_ct": "ct2"}, {"description": "d"}),
+        ({"id": "m3", "body_ct": "ct3"}, {"her_quote": "q"}),
+    ]
+
+
+def test_attempts_default_and_env_override(monkeypatch):
+    monkeypatch.delenv("FEEDLING_MIGRATE_MAX_ATTEMPTS", raising=False)
+    assert migration.max_attempts() == migration.DEFAULT_MAX_ATTEMPTS == 3
+    monkeypatch.setenv("FEEDLING_MIGRATE_MAX_ATTEMPTS", "2")
+    assert migration.max_attempts() == 2
+    monkeypatch.setenv("FEEDLING_MIGRATE_MAX_ATTEMPTS", "garbage")
+    assert migration.max_attempts() == migration.DEFAULT_MAX_ATTEMPTS  # bad → default
+    monkeypatch.setenv("FEEDLING_MIGRATE_MAX_ATTEMPTS", "0")
+    assert migration.max_attempts() == 1  # floored at 1
+
+
+def test_bump_attempts_increments_and_caps():
+    s = migration.initial_state()
+    # fail m1 three times (cap=3) → capped; m2 only once → still eligible
+    s = migration.bump_attempts(s, ["m1", "m2"])
+    s = migration.bump_attempts(s, ["m1"])
+    assert migration.capped_ids(s, cap=3) == set()  # m1 at 2, not yet
+    s = migration.bump_attempts(s, ["m1"])
+    assert s["attempts"]["m1"] == 3 and s["attempts"]["m2"] == 1
+    assert migration.capped_ids(s, cap=3) == {"m1"}
+    assert migration.is_capped(s, "m1", cap=3) and not migration.is_capped(s, "m2", cap=3)
+    # blank ids are ignored
+    s2 = migration.bump_attempts(s, ["", None, "  "])
+    assert s2["attempts"] == s["attempts"]
+
+
+def test_capped_card_excluded_from_select_and_count():
+    moments = _legacy_moments()
+    # m1 has hit the cap → excluded from both selection and the remaining count
+    skip = {"m1"}
+    batch = migration.select_legacy_batch(moments, batch_size=8, exclude_ids=skip)
+    assert [b["id"] for b in batch] == ["m2", "m3"]
+    assert migration.count_legacy(moments, exclude_ids=skip) == 2
+    # under-cap card still selected (no exclusion)
+    batch_all = migration.select_legacy_batch(moments, batch_size=8)
+    assert [b["id"] for b in batch_all] == ["m1", "m2", "m3"]
+    assert migration.count_legacy(moments) == 3
+
+
+def test_card_capped_then_count_reaches_zero_state_done():
+    # one card that can never migrate: after N=3 fails it caps → count→0 → done.
+    moments = [({"id": "m1", "body_ct": "ct1"}, {"title": "a", "description": "x"})]
+    state = migration.initial_state()
+    cap = migration.max_attempts()
+    for i in range(cap):
+        skip = migration.capped_ids(state)
+        remaining = migration.count_legacy(moments, exclude_ids=skip)
+        # still eligible while under the cap → pending
+        assert remaining == 1
+        assert migration.next_state(state, migrated=0, legacy_remaining=remaining)["status"] == "pending"
+        state = migration.bump_attempts(state, ["m1"])  # the round's failure
+    # now capped → excluded → count 0 → state can settle on done
+    skip = migration.capped_ids(state)
+    assert skip == {"m1"}
+    remaining = migration.count_legacy(moments, exclude_ids=skip)
+    assert remaining == 0
+    final = migration.next_state(state, migrated=0, legacy_remaining=remaining)
+    assert final["status"] == "done"
+    # capped card stays legacy (still detected by SHAPE) — just not re-selected
+    assert migration.is_legacy_card_inner(moments[0][1]) is True
+
+
+def test_under_cap_card_still_retries():
+    moments = _legacy_moments()
+    state = migration.initial_state()
+    state = migration.bump_attempts(state, ["m1", "m2"])  # 1 fail each, cap=3
+    skip = migration.capped_ids(state)
+    assert skip == set()  # nobody capped yet
+    assert [b["id"] for b in migration.select_legacy_batch(moments, exclude_ids=skip)] == ["m1", "m2", "m3"]
+
+
+def test_attempts_backcompat_old_blob_without_field():
+    # A pre-A11 blob has no 'attempts' key — readers must treat it as {} not crash.
+    old = {"v": 1, "status": "pending", "legacy_remaining": 2, "migrated_total": 1}
+    assert migration.capped_ids(old) == set()
+    assert migration.is_capped(old, "m1") is False
+    assert migration._attempts_map(old) == {}
+    # bumping an old blob seeds the map without dropping other fields
+    bumped = migration.bump_attempts(old, ["m1"])
+    assert bumped["attempts"] == {"m1": 1}
+    assert bumped["status"] == "pending" and bumped["migrated_total"] == 1
+    # garbage 'attempts' shapes also degrade to {}
+    assert migration.capped_ids({"attempts": "nope"}) == set()
+    assert migration.capped_ids({"attempts": {"m1": "x", "m2": 5}}, cap=3) == {"m2"}
+    # next_state preserves the attempts map across a batch advance
+    nxt = migration.next_state(bumped, migrated=0, legacy_remaining=1)
+    assert nxt["attempts"] == {"m1": 1}
+
+
 # --- prompt parse ---------------------------------------------------------
 
 def test_parse_drops_bad_dup_empty_and_outofbatch():

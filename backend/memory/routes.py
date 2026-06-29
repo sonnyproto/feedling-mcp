@@ -292,8 +292,9 @@ def memory_migration_state():
     """Legacy→v1 migration state cache (status: unknown|pending|done).
 
     GET: read the per-user blob (trigger reads via db.get_blob server-side; this
-    is for the consumer/observability). POST {migrated, legacy_remaining}: the
-    migrate handler reports a finished batch; the server advances the state
+    is for the consumer/observability). POST {migrated, legacy_remaining,
+    failed_ids?}: the migrate handler reports a finished batch; the server bumps the
+    per-card attempt count for each failed_id (A11 cap) then advances the state
     machine (migration.next_state). The blob is only an enqueue-cache — card
     SHAPE stays the source of truth, so a stale 'done' still self-heals."""
     store = auth.require_user()
@@ -307,7 +308,13 @@ def memory_migration_state():
         legacy_remaining = int(payload.get("legacy_remaining") or 0)
     except (TypeError, ValueError):
         return jsonify({"error": "migrated/legacy_remaining must be ints"}), 400
+    failed_raw = payload.get("failed_ids")
+    failed_ids = [str(i) for i in failed_raw if str(i or "").strip()] if isinstance(failed_raw, list) else []
     current = db.get_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB)
+    # A11: count this round's failures per card BEFORE advancing the state machine, so a
+    # card that just hit the cap is already 'skipped' and won't keep 'pending' alive.
+    if failed_ids:
+        current = memory_migration.bump_attempts(current, failed_ids)
     new_state = memory_migration.next_state(current, migrated=migrated, legacy_remaining=legacy_remaining)
     db.set_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB, new_state)
     return jsonify({"state": new_state})
@@ -340,8 +347,12 @@ def memory_legacy_batch():
         inner, _err = memory_actions_mod._memory_plain_from_envelope(m, api_key, runtime_token=runtime_token)
         if isinstance(inner, dict):
             decrypted.append((m, inner))
-    batch = memory_migration.select_legacy_batch(decrypted, batch_size=batch_size)
-    return jsonify({"batch": batch, "legacy_remaining": memory_migration.count_legacy(decrypted)})
+    # A11: drop cards that hit the per-card attempt cap so they're never re-selected
+    # and legacy_remaining can reach 0 (status → done). They stay legacy + readable.
+    state = db.get_blob(store.user_id, memory_migration.MIGRATION_STATE_BLOB)
+    skip = memory_migration.capped_ids(state)
+    batch = memory_migration.select_legacy_batch(decrypted, batch_size=batch_size, exclude_ids=skip)
+    return jsonify({"batch": batch, "legacy_remaining": memory_migration.count_legacy(decrypted, exclude_ids=skip)})
 
 
 @bp.route("/v1/memory/list", methods=["GET"])
