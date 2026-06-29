@@ -1,0 +1,255 @@
+{
+  "context_snapshot": [
+    {
+      "key": "time",
+      "data": "{\"local_time\":\"2026-06-19T21:00:00+08:00\",\"locale\":\"zh-Hans-CN\",\"timezone\":\"Asia/Shanghai\"}",
+      "message": "本地时间、时区和语言环境"
+    },
+    {
+      "key": "battery",
+      "data": "{\"charging\":true,\"level\":0.82}",
+      "message": "当前电量与充电状态"
+    },
+    {
+      "key": "broadcast",
+      "data": "{\"active\":true,\"state\":\"broadcasting\"}",
+      "message": "屏幕 broadcast 状态"
+    },
+    {
+      "key": "location_signal",
+      "envelope": {
+        "v": 1,
+        "id": "11111111111111111111111111111111",
+        "body_ct": "base64-location-body",
+        "nonce": "base64-location-nonce",
+        "K_user": "base64-location-k-user",
+        "K_enclave": "base64-location-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "motion_state",
+      "envelope": {
+        "v": 1,
+        "id": "22222222222222222222222222222222",
+        "body_ct": "base64-motion-body",
+        "nonce": "base64-motion-nonce",
+        "K_user": "base64-motion-k-user",
+        "K_enclave": "base64-motion-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "focus",
+      "data": "{\"authorization_status\":\"authorized\",\"focused\":true}",
+      "message": "当前是否处于某个专注模式（二值，不含具体名称）"
+    },
+    {
+      "key": "calendar_next_event",
+      "envelope": {
+        "v": 1,
+        "id": "33333333333333333333333333333333",
+        "body_ct": "base64-calendar-body",
+        "nonce": "base64-calendar-nonce",
+        "K_user": "base64-calendar-k-user",
+        "K_enclave": "base64-calendar-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "playback",
+      "envelope": {
+        "v": 1,
+        "id": "44444444444444444444444444444444",
+        "body_ct": "base64-playback-body",
+        "nonce": "base64-playback-nonce",
+        "K_user": "base64-playback-k-user",
+        "K_enclave": "base64-playback-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "audio_route",
+      "envelope": {
+        "v": 1,
+        "id": "dddddddddddddddddddddddddddddddd",
+        "body_ct": "base64-audio-route-body",
+        "nonce": "base64-audio-route-nonce",
+        "K_user": "base64-audio-route-k-user",
+        "K_enclave": "base64-audio-route-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "weather",
+      "envelope": {
+        "v": 1,
+        "id": "99999999999999999999999999999999",
+        "body_ct": "base64-weather-body",
+        "nonce": "base64-weather-nonce",
+        "K_user": "base64-weather-k-user",
+        "K_enclave": "base64-weather-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "reminders",
+      "envelope": {
+        "v": 1,
+        "id": "dddddddddddddddddddddddddddddddd",
+        "body_ct": "base64-reminders-body",
+        "nonce": "base64-reminders-nonce",
+        "K_user": "base64-reminders-k-user",
+        "K_enclave": "base64-reminders-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_sleep",
+      "envelope": {
+        "v": 1,
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "body_ct": "base64-health-sleep-body",
+        "nonce": "base64-health-sleep-nonce",
+        "K_user": "base64-health-sleep-k-user",
+        "K_enclave": "base64-health-sleep-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_workout",
+      "envelope": {
+        "v": 1,
+        "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "body_ct": "base64-health-workout-body",
+        "nonce": "base64-health-workout-nonce",
+        "K_user": "base64-health-workout-k-user",
+        "K_enclave": "base64-health-workout-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_vitals",
+      "envelope": {
+        "v": 1,
+        "id": "cccccccccccccccccccccccccccccccc",
+        "body_ct": "base64-health-vitals-body",
+        "nonce": "base64-health-vitals-nonce",
+        "K_user": "base64-health-vitals-k-user",
+        "K_enclave": "base64-health-vitals-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_activity",
+      "envelope": {
+        "v": 1,
+        "id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "body_ct": "base64-health-activity-body",
+        "nonce": "base64-health-activity-nonce",
+        "K_user": "base64-health-activity-k-user",
+        "K_enclave": "base64-health-activity-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_body",
+      "envelope": {
+        "v": 1,
+        "id": "ffffffffffffffffffffffffffffffff",
+        "body_ct": "base64-health-body-body",
+        "nonce": "base64-health-body-nonce",
+        "K_user": "base64-health-body-k-user",
+        "K_enclave": "base64-health-body-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_metabolic",
+      "envelope": {
+        "v": 1,
+        "id": "11111111111111111111111111111111",
+        "body_ct": "base64-health-metabolic-body",
+        "nonce": "base64-health-metabolic-nonce",
+        "K_user": "base64-health-metabolic-k-user",
+        "K_enclave": "base64-health-metabolic-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_cycle",
+      "envelope": {
+        "v": 1,
+        "id": "22222222222222222222222222222222",
+        "body_ct": "base64-health-cycle-body",
+        "nonce": "base64-health-cycle-nonce",
+        "K_user": "base64-health-cycle-k-user",
+        "K_enclave": "base64-health-cycle-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "health_mood",
+      "envelope": {
+        "v": 1,
+        "id": "33333333333333333333333333333333",
+        "body_ct": "base64-health-mood-body",
+        "nonce": "base64-health-mood-nonce",
+        "K_user": "base64-health-mood-k-user",
+        "K_enclave": "base64-health-mood-k-enclave",
+        "visibility": "shared",
+        "owner_user_id": "ios_fixture_user",
+        "enclave_pk_fpr": "ios_fixture_enclave_fpr"
+      },
+      "changed": true
+    },
+    {
+      "key": "unsupported",
+      "data": "{\"frontmost_app\":null,\"precise_unlock\":null,\"silent_mode\":null}",
+      "message": "iOS 当前不能稳定提供的感知项"
+    }
+  ],
+  "client_ts": "1781874000"
+}

@@ -1,0 +1,16 @@
+{
+  "id": "feedling-io-tools",
+  "name": "Feedling IO Tools",
+  "description": "Expose Feedling IO perception/memory/screen CLI as native OpenClaw tools.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "consumerRoot": { "type": "string" },
+      "serviceEnvPath": { "type": "string" },
+      "pythonPath": { "type": "string" },
+      "timeoutMs": { "type": "integer", "minimum": 1000 }
+    },
+    "required": ["consumerRoot", "serviceEnvPath"]
+  }
+}

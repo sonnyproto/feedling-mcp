@@ -47,6 +47,704 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-06-29
+
+### [DONE] photo_added 唤醒加 new-photo 提示（拉取式）
+
+相册来新图时,`photo_added` 唤醒(原触发不变)现在多一条 `new_photo` 提示:大概是什么
+(scene_hint)/是否截图/时段/photo_id,并告诉 agent「想看就 `photo_read(id, include_image=true)`
+拉真实像素」+「看完想说就说,像注意到朋友的照片、不是交差报告」。**拉取式,不自动附图,agent
+自判看不看**。consumer 侧:`_new_photo_hint()`(best-effort,取最近 1 张 metadata,失败则空、不崩
+唤醒),只在 photo_added job 注入。真机前 e2e:提示渲染正确 + `photo_read --include-image` 解出
+~203KB JPEG。提交 `5a13264` + `d9a45ca`。
+
+### [BLOCKER→FIXED] io_cli `PHASE2_VERBS` 冲突 → 所有 io_cli 命令全崩
+
+`schedule-wake` 在 `3f98b39` 被加成真子命令,但仍留在 `PHASE2_VERBS`(「未实现」占位 loop),
+`sub.add_parser('schedule-wake')` 启动即 `conflicting subparser` → **io_cli 一跑就崩 → OpenClaw 所有
+走 io_cli 的原生工具(photo_read/memory_*/screen_*/schedule_wake…)自 3f98b39 起全废**。修:从
+`PHASE2_VERBS` 删掉;加防回归测试 `tests/test_io_cli_parser.py`(PHASE2 永不与真子命令重名 + 子进程
+冒烟)。提交 `517f7e1`。教训:加真子命令时必须同步从占位列表移除。
+
+### [DONE] 今日 wake prompt / action 协议改动部署后双向 e2e
+
+`3f98b39`(schedule/cancel wake 工具化、删死 ai_state、request_broadcast 折叠进 message、message=
+纯回复)+ `a873eeb`(删 battery 字段、平衡 speak/quiet、数字不照报)部署后验证:
+- consumer 侧(CC):prompt 构建无 battery / 有时间锚(距上次 Nh,有间隔才加) / 平衡措辞 /
+  无 ai_state / new_photo 只在照片唤醒;schedule+cancel wake 工具 ok;action 分类(sleep /
+  request_broadcast→可见消息)ok。
+- 后端侧(Codex):`pytest tests/test_proactive_* test_perception_* test_io_cli_*` = **185 passed**;
+  `/v1/proactive/scheduled/actions` 真触发链 schedule→pending→fire→fired、cancel→canceled 验证;
+  gate 路径 / photo_added differ 链完好。
+- 残留(待下次部署一起清,不单独 redeploy):consumer `_split_proactive_actions` 的 `set_ai_state`
+  死分类(本次已本地删、未提交);后端 `ai_state` legacy/dashboard 字段(Codex 评估)。
+
+### [BLOCKER] test CVM 重部署脆弱性 + 链上 compose_hash 依赖 gas（运维教训）
+
+排查"consumer 全 401 崩溃循环"时发现根因**不是账号/key/代码**,而是 **test CVM 后端被当天连环
+部署(4 次 deploy-test-cvm)搞到不健康**:`test-api`/`test-mcp`(走 dstack-ingress)整层 TLS 挂、
+但 enclave :5003 直连口仍活;Andrew 在 Phala 层 restart 后恢复。两条运维教训记下:
+- **这台 test CVM 每次重部署会整体 blip ~2min**(enclave 先回、test-api 随后),通常**自愈**,
+  不要看到瞬时 000 就当宕机;短时间连推多次才会雪崩。
+- **每次 deploy 都要发 compose_hash 上 Sepolia test 合约**(`0x9AC0…F2D5`,owner
+  `0xa0eBcd26…`)。`517f7e1` 这次 publish **因部署钱包 gas 不足而失败** → 新 compose_hash 没上链 →
+  iOS attestation 会拒新 CVM、挡 onboarding。充 Sepolia ETH + re-run `deploy CVM (test)` job 后
+  publish success、白名单补齐。**部署钱包余额是真机 onboarding 的隐性前置依赖。**
+
+## 2026-06-27
+
+### [DONE] 照片解密读取修复 + 快捷指令 app 上报打通（真机 e2e）
+
+感知输入真机排查发现两个问题,均已解决:
+
+- **照片像素解密(真 bug,Codex `9b25544` 修)**:enclave 三处解密(`/decrypt` `/caption`
+  `/image`)假设明文是屏幕帧的 UTF-8/JSON,但**照片明文是裸 JPEG 字节**(0xFF D8 FF)→
+  `plaintext_parse` 502,agent 永远拿不到照片像素。修法:`_parse_visual_plaintext` 按 magic-byte
+  (JPEG/PNG/WebP/HEIC/AVIF)识别裸图并 base64 包装;坏字节/非 dict JSON 仍 fail-closed;屏幕帧
+  JSON 路径零改动(无回归)。CC 审计通过。真机验:`photo-read --include-image` → `decrypt_status=ok`,
+  **image_b64_len=208696**;`screen-read` 回归 ok。
+- **caption(enclave VLM)残留 gap**:**test enclave 未配
+  `FEEDLING_SCREEN_VLM_API_KEY`** → `/caption` 在鉴权/解密前返回 503
+  `screen_caption_unconfigured`;raw-photo caption parser 目前由单测覆盖,真实出图描述待部署 key 后补验。
+- **快捷指令 app 上报**:URL/key/端点全对,问题是 iOS 自动化设成了「确认后运行」→ 改「立即运行」
+  后,真机打开淘宝实时落 `recent_apps` + app 信号 ✅。
+- **照片分类**:正常(真照片 `is_screenshot=false`)。
+- **照片仍是"拉取式"**:photo_added wake 只通知,不自动附图;Seven 倾向改"推送式"(wake 自动附
+  解密照片,复用屏幕帧 `images=` 机制)——follow-up 待做。
+- 体检表更新:`docs/PERCEPTION_COVERAGE_HEALTHCHECK_2026-06-27.md` §B。
+
+### [DONE] 主动 wake digest：从「健康独大 top-N」改成「均衡跨域桌面 + Agent 自判」
+
+`/v1/agent/perception/digest` 之前第二半 `change` = `notable_changes()` 取 top-8,**只比较量化
+数值信号**(vitals/metabolic/weather/activity/sleep/body/cycle)→「什么值得主动提」结构上只能是
+健康数值,Agent 退化成身体监测机。现改:后端**均衡铺开跨域近况**,健康折叠成 1 行,与音乐/位置/
+app/照片/提醒/天气/心情/日历/屏幕**平级**;**后端不产 flag**,Agent 读桌面自判最多 2-3 条拟人化
+值得一提(可跨域组合,优先生活情境而非健康播报)。spec/示例:`docs/DIGEST_CROSSDOMAIN_REDESIGN_PLAN_2026-06-27.md`。
+
+- **后端**:`backend/perception/history.py` 新增纯函数 `cross_domain_recent()`(10 域;health 复用
+  `notable_changes` 折叠;轻量 novelty `new_artist`/`long_dwell` 作事实上下文,非排名);
+  `backend/agent/routes.py` digest 端点返回 `{days, changes, domains}`(`changes` 保留向后兼容)。
+- **消费端**:`tools/chat_resident_consumer.py` `_proactive_perception_digest` 改 3 元
+  `(presence, change, domains)`;wake prompt 渲染 `cross_domain_board_json` + 自判指令;旧后端无
+  `domains` 时回退 legacy change。
+- **测试**:cross_domain_recent 单测(均衡/折叠/novelty/诚实报空/降级)+ 路由 + 消费端渲染/兼容,
+  本地 276 passed(4 个 `dstack_sdk` 缺失 error 与本改动无关);DB 测试由 CI 跑。VPS resident e2e 待部署后验。
+- **路径**:resident/VPS,不碰 hosted。**全感知接口/字段清单**(对比用):同 spec 文档 §1。
+
+### [DONE] Agent 声音/身份/Genesis：全链路建成 + 部署 test CVM（e2e 待跑）
+
+host(API key)用户的空白 runtime,在 **CVM/enclave 内**从上传历史蒸馏出**声音(persona 文件)+
+事实(Garden)+ 展示身份卡**。spec:`docs/AGENT_VOICE_IDENTITY_SPEC_2026-06-27.md`。CC×Codex 分工
+(CC=agent_runtime/prompt/审计;Codex=backend/infra),每个 Codex 交付经 CC 审 diff + 重跑测试再 push。
+
+- **流水线**(origin/test):chunked 加密上传 ledger → CVM worker(claim/解密/map-reduce/写) →
+  按 `source_kind` 路由(history→声音+事实;ai_persona→adopt 主干;memory_summary→事实;
+  user_profile→事实+防火墙) → §7.B persona+voice 跨 job 加密合并 → CC 的 supervisor 激活 hook
+  (default-off daemon,`FEEDLING_GENESIS_WORKER_ENABLED`)。事实走 `/v1/memory/actions` 同 capture
+  lane schema(source=`genesis_import`)。
+- **隐私姿态**(`PRIVACY_MODE=backend_storage_no_plaintext_user_provider_authorized`):raw 上传只存密文;
+  解密+LLM 只在 CVM 内、用**用户自己的 key**;persona/voice/identity blob 全加密;outputs 只存 hash/count;
+  chunk owner 绑定+完整性校验。**不 overclaim**(明文会发给用户自己配的 provider)。
+- **审计抓到并修复**(CC 作为审核员):persona/outputs 明文落库→加密;fresh-start 死锁→gate 放行;
+  AI persona 没 adopt→source_kind 路由;声音丢失→§7.B 合并;spec 隐私 overclaim→改精确口径。
+- **CC 自做**:host session cap 24、persona seed+解密 reader、genesis gate、`io_cli identity-write`(7.D)、
+  激活 hook、`tools/genesis_e2e.py` e2e harness(自助注册测试用户→封装上传→验证)。
+- **已部署**:`a3475c6` 把 `:34ce885` 部署到 test CVM,worker 上线(dormant 待 job)。
+- **待办**:真 e2e 跑一遍(需一把测试 provider key 喂 harness;`TEST_FEEDLING_RUNTIME_TOKEN_SECRET`
+  已确认存在);§7.B order-edge(history 须先于 ai_persona)留 fast-follow;iOS 上传客户端;7.D 触发编排;
+  VPS skill.md 的 grounding 子句。
+
+## 2026-06-26
+
+### [DONE] A-full：落卡 capture lane（Phase-1）+ 退役 proactive 模拟工具路（Phase-2）
+
+承接 A-lite（perception 统一到 CLI tools）。memory v1 后端落地后启动，目标：proactive 全走原生
+CLI 工具，消灭"把 agent 当裸模型返 JSON"的双路。
+
+**Phase-1 — 落卡 capture lane（对齐《IO 记忆·落卡+Dream 完整方案》第一部分）**
+- 独立 capture lane（复用 job 原语，不复用 proactive reach-out 语义）：PR A `2136073` 基座
+  (typed `job_kind=memory_capture` + `capture_key` 幂等 + poll 跳 wake gate + 分发)；PR B `457ba01`
+  触发 coordinator（append_chat 钩子 + `/v1/device/events` 边界 + `/v1/capture/tick` 静默兜底 +
+  `capture_state` 去重）；PR C.1 `e148da2` 落卡 prompt+parser；PR C.2 `bf2cf66` 原生 handler
+  （window→原生 call_agent→parse→封 v1 信封→`/v1/memory/actions`，不写 chat/不投递）。
+- 触发 = 会话断点（静默 1200s / 退后台 / 轮数 24 兜底），**不是 agent 每轮主动调**。
+  **不变量（测试钉死）：关「AI 主动找我」≠ 停记忆。**
+- VPS e2e：静默触发→handler 调真 agent 回看 55 轮→写 2 张高质量卡（memory 38→40，桶复用"我们的关系"）。
+- 验证交接文档：`docs/CAPTURE_LANE_VERIFICATION_2026-06-26.md`（给工程师独立验证）。
+
+**Phase-2 — 退役模拟工具路**
+- 审计发现：VPS proactive reach-out 当时走的就是模拟路（`RUNTIME_V2_DEFAULT_ON=true`）且功能完整，
+  native/legacy 是退化旧桩 → 不能直接删。先 P2-1 `a3d2d9b` 补原生 reach-out 同等能力
+  （native send_message action-only / schedule_wake·cancel_wake 解 gate / perception digest 改直连
+  `/v1/agent/perception` / 唤醒 agent 可调原生 perception·memory·screen / cost 标签 D2），再
+  P2-2a `b008909` 翻 test 默认到 native 验证（prod 不动），native VPS e2e 通过后 P2-2b `aa31380`
+  删除：`run_tool_loop_v2`(tool_loop_v2.py)、`/v1/proactive/tool/execute` 路由、`_resident_run_agent_v2`、
+  `_resident_call_tool_v2` + 对应测试/ci。proactive wake 现在**始终走原生**。
+- **保留** `tool_executor_v2`/`tool_catalog_v2`（hosted 前台 chat / dashboard / runtime_v2 仍用）。
+- 删后 VPS e2e：手动+自动唤醒都走 native（digest 直连、agent 跑、sleep 有理有据、**零 `/v1/proactive/tool/execute`**、无报错）。
+**Tail（同日收尾）**
+- Tail-1 修：`FEEDLING_RUNTIME_V2_DEFAULT_ON` 是**共享 baseline**（perception ingress / chat / screen caption /
+  hosted chat 都跟它），P2-2a 为验 wake 把 test 翻 false 顺带关了 test 感知 v2；wake 已 native-only 后翻回 true
+  恢复（`4d72392`），prod 一直 true 未动。
+- Tail-3 `io_cli`：补 `photo-recent` 原生读工具（`b7d52a6`）；`send/wait-for-wake/schedule-wake` 是 native 输出
+  动作不是 pull 工具，改成澄清 stub。
+- **Tail-2 Dream（方案 Part 2，已 ship）**：`job_kind=memory_dream` 复用 capture 基座（PR D.1 `30378a9`
+  prompt+parser、PR D.2 `6a0f687` lane）。夜间/攒量触发→原生 call_agent 整理（merge/thicken/supersede）→
+  **只 `memory.supersede` 软退绝不硬删**、不写 chat、不走 reach-out gate、questions 落 status 不发用户。
+  VPS e2e：force tick→agent 整理 40 卡→8 consolidations（merged 5 / superseded 31），active 40→17，
+  旧卡 status=superseded 仍可 fetch、superseded_by 链保留、零 chat。
+- 尾巴（后排）：prod 切 native 是一次 prod 部署（待点头，code 已 native-only）；Dream eval 留后；
+  io_cli send/wait/schedule 仍 stub（设计上就是输出动作）。
+
+### [DONE] resident consumer 自动更新（路径感知锁步）
+
+自托管 consumer/io_cli 走 git clone 分发，onboarding 后除非手动 `git pull`+重启否则永远跑旧代码。现在让 consumer 自动跟上后端部署的 commit：
+
+- **后端下发期望版本**：`backend/chat/consumer.py` 新增 `expected_consumer_commit()`（`FEEDLING_EXPECTED_CONSUMER_COMMIT` 显式 pin → 回退 `FEEDLING_GIT_COMMIT`）；`/v1/chat/poll` 三个 return 加 `client_release.expected_consumer_commit`。后端不需要 `.git`。
+- **consumer 路径感知自更新**（`tools/chat_resident_consumer.py`）：idle（timed_out）poll 时比对本地 `HEAD` 与下发 commit；**仅当** `git diff HEAD..target` 命中本进程实际加载的 repo 文件（从 `sys.modules` 自动推导 + 显式补 `io_cli.py`/requirements）才 `git fetch`+`checkout --detach`+`os.execv` 原地重启。**无关后端发版不触发**（解决"每次发版都 pull"）。
+- **安全边界**：默认开（`FEEDLING_AUTO_UPDATE=0` 关）；脏工作区跳过并告警，不丢本地改动；requirements 变了先 `pip install` 兜底；hosted（`FEEDLING_RUNTIME_TOKEN_FILE` 存在的 in-CVM）禁用（镜像不可变 + attestation）。io_cli 同仓库免费搭车。
+- 测试：`tests/test_chat_resident_self_update.py`（纯函数真值表 + 编排 mock）、`tests/test_expected_consumer_commit.py`、`tests/test_chat_poll_client_release.py`。文档：`tools/README.md` § Auto-update、`deploy/chat_resident.env.example`。
+
+## 2026-06-25
+
+### [DONE] 主动陪伴系统打通（心跳/三开关/定时器）+ 感知后端 catch-up（全新信号暴露给 agent）
+
+**主动陪伴（Bug A/B 端到端修复 + VPS 真测）** — resident 路从"从未真正工作"到全通：
+- **Bug B（心跳从不触发）**：resident consumer 空 broadcast 派生成 `heartbeat_unknown` 被 gate 拦死 → 改成 `heartbeat_broadcast_off`（对齐 hosted）。`008079f`。
+- **Bug A（开关不 gate）**：`/v1/proactive/tick` 改用 `evaluate_wake_control_v2`（移除 legacy dnd/user_state 拦 wake，符合 D6/D16：dnd 只 gate Delivery）；resident `/jobs/poll` 按开关 gate pending job；`/chat/response` 应用 delivery gate（提醒关→写 chat 不 buzz）。`008079f`。
+- **resident 定时器服务端 fire**：新增 `POST /v1/proactive/scheduled/fire` + consumer 60s loop（`fire_due_timers`，复用 scheduled gate + 透明回灌）。`f772691`。
+- **VPS 三个隐藏阻塞**（修复后才跑通）：env `PROACTIVE_POLL/TICK_ENABLED=false`（总开关关着）→ 开；consumer venv 缺 `psycopg`+`psycopg_pool` → 装（已进 `tools/chat_resident_requirements.txt`）；插件 SIGNALS 扩到 17。
+- **真测通过**：心跳→主动消息端到端；C1 关陪伴 gate、F2 不连坐（关陪伴定时仍 fire）、C3 关定时 gate；E2 定时器到点 fire→消息。仅 resident，**API/hosted 一行未动（待砍）**。
+
+**感知后端 catch-up** — iOS 采集远超后端暴露,补齐 `_SIGNAL_FIELDS` 让 agent 真能拉：`7a8be95`。
+- 新增 6 信号:`reminders` + `health_activity/body/metabolic/cycle/mood`;扩 `weather`（体感/湿度/降水/UV/预警）、`health_sleep`（core/deep/rem）、`health_vitals`（current_hr/hrv/呼吸/血氧/vo2max）。catalog + resolve + ios_contract（加密 allowlist）+ agent routes + io_cli + 插件 + 测试/fixture 全同步。
+- **真机验通**:新包上 focus=true（iOS `2504c3e` entitlement 修复）、睡眠分期 511/298/76/137、心率 68/呼吸 17、身高 156/体重 52、活动能量 — 真值端到端;无数据项诚实 null。
+
+**iOS 修复（拉入）**：`2504c3e` focus Communication Notifications entitlement（focus 修好）、`ed9c54f` 发图 picker 改 fullScreenCover（修跳 home）。
+
+**文档整合**：新增 `PROACTIVE_COMPANION_FUNCTION_AND_TEST_SPEC_2026-06-25.md`（功能定义 + 详尽测试)、`PERCEPTION_FIELDS_REALDEVICE_CHECKLIST_2026-06-25.md`（逐字段真机核对)。删除被取代的时点文档:`ROUND3_REALDEVICE_TEST_PLAN.md`（→ 上述两份）、`PERCEPTION_FIELD_RECONCILIATION_2026-06-23.md`（→ 06-25 字段核对表）。
+
+## 2026-06-25
+
+### [DONE] 即时感知收口：focus/audio_route 可 pull + place_label/气温口径校正 + spec 校准
+- **focus + audio_route 暴露给 agent pull**：发现这俩被 iOS 采集、后端也接收存储，但 `/v1/agent/perception` 的 `_SIGNAL_FIELDS` 漏了它们 → agent 实际拉不到（spec 却把它们列为 pull-only "agent 自己拉"）。补：后端 `_SIGNAL_FIELDS` + `_SIGNAL_PERMISSION_KEYS` 加 focus/audio_route（不入默认快档）、`tools/io_cli.py` 加 `EXTRA_SIGNALS`、OpenClaw `feedling-io-tools` 插件 SIGNALS 9→11 + 重启 gateway。**12 个文档信号现在全可 pull**（io_cli `b7a7e3d` / 后端 `e49b6da` 已部署 test；插件改动仅在 VPS）。
+- **`place_label` 回退 `outdoor` → `unknown_place`**：`outdoor` 误导（用户没配 geofence 时在家也报 outdoor，像"在户外"）。它真实含义是"有定位但不在任何已命名地点"。iOS resolver + 后端 `resolve.py` + spec 同步;`unknown`（无 fix）保留。**未推**（与下条一起，待用户 push）。
+- **气温 `temperature_bucket`(5℃ 桶) → `temperature`(精确摄氏度)**：产品决定——5℃ 桶无价值，天气敏感度低、weather 是 pull-only 不参与 changed，精确值无额外代价。iOS WeatherValues + 后端 catalog/resolve/routes/tool_executor + 5 个测试文件 + spec 同步。**未推**。
+- **删除过时 spec**：`Specs/perception-report-fields.md`（2026-06-08 预 V2 版，声称原样上报精确坐标/BSSID/地址，与部署的 V2 加密粗化口径冲突）已删，统一以 `perception-data-and-reporting.md` 为准。
+- **本轮 spec 校准**（`perception-data-and-reporting.md`）：修"12 个 key"→14（13 信号 + unsupported，对齐 `EXPECTED_REPORT_KEYS_V2`）；§3.8 日历事件时间标注为**设备本地时区**（ISO8601 带偏移）；§3.4/§3.5/§6/§1.1 同步 unknown_place + 精确气温口径。其余逐字段核过与代码一致。
+- 日历加回参会人/组织者、天气加降水预报/体感、HealthKit 加心情(State of Mind)/活动三环/HRV 等**新增**字段 → 用户决定**交给 iOS 工程师**实现，不在本轮 scope。
+- 待推 bundle（用户统一 push）：iOS `cf8ece5`(outdoor)/`96540fa`(temp)/本轮 spec 校准；后端 `7bc2218`(outdoor)/`1d4b717`(temp)。
+
+## 2026-06-23
+
+### [DONE] resident agent 原生感知端到端跑通（io_cli + OpenClaw 插件）+ config 去硬编码
+- 验证 resident（OpenClaw）经 io_cli 原生工具调 `/v1/agent/perception` **端到端通**：agent 在真实聊天里报出真实电量 / 位置 / 睡眠（睡眠 390min=6.5h、位置 outdoor/home、电量 70%）。
+- **根因修复**：OpenClaw `feedling-io-tools` 插件的 config 没经 gateway 交付（`register(api, config)` 收到空 `{}`）→ `path.resolve(undefined)` 抛错 → 发消息时工具崩。改成 **`config → 环境变量 → 报错`（零代码硬编码）**，host 路径放 `openclaw-gateway.service` 的 systemd Environment；插件在 `definePluginEntry` 里声明 `configSchema`；改完必须 `systemctl --user restart openclaw-gateway` 重载（gateway 常驻、缓存插件）。工具失败改返 `{ok:false,error}` 不再崩。
+- 清掉 OpenClaw 两处 stale 配置（`skills.feedling` 指 localhost:5001、`lossless-claw`）。
+- **注**：插件代码只在 VPS（`~/.openclaw/workspace/plugins/feedling-io-tools/`），**未进仓库**——后续应落仓或转 MCP server，见 `AGENT_CLI_INTEGRATION_SURVEY.md`。
+
+### [DONE] 感知增强：上报城市 locality + ±14 天日历列表 + 日历本地时区（iOS + 后端）
+- **#1 city**：iOS location 上报新增 `locality`（反地理编码城市名，如"深圳市"）；后端 catalog/resolver/`/v1/agent/perception` 落地暴露。**有意放开城市级定位口径**（街道 / 坐标仍不出设备）——因 `place_label` 对没配 geofence 的用户恒为 `outdoor`，agent 没有"在哪座城"的感知。
+- **#3 calendar**：从"24h 单个 next_event"扩成 `calendar_events` **前后 14 天列表**（含全天事件、按 start 排序、封顶 40 条 + `calendar_events_truncated`），保留 `calendar_next_event` 给唤醒/快照（changed 判定只看它，避免窗口滑动误唤醒）。
+- **时区**：日历事件时间改用**设备本地时区**输出（ISO8601 带 `+08:00` 偏移），agent 直接读本地钟点（如 15:00），不靠它自觉用 `now.timezone` 换算——少一处出错点。
+- 提交：iOS `4edf2bd`（city + ±14天列表）、`a97a73a`（本地时区）；后端 `31ae6c9`（已部署 test CVM）。后端 71/84 测试过，用**真实信封 body 形状**覆盖。
+
+### [FEEDBACK] 感知字段语义对齐审计（以 iOS 上报端为准）
+- 系统性对齐 iOS 采集/上报 ↔ 后端接收/存储/暴露：**契约逐字 1:1，无后端凭空字段**（`timezone`/`temperature_bucket` 等 iOS 端确实存在）。完整对照 + 修正清单入 `PERCEPTION_FIELD_RECONCILIATION_2026-06-23.md`。
+- 真机查清各信号语义：`location` 恒 `outdoor`=没配 home/work geofence（resolver 回退）；`sleep`=近 24h 滚动入睡时长（凌晨读=昨晚）；`steps` 凌晨 null=今天还没走（正确）；`weather` null=`WeatherService` 抛错（entitlement 在，疑 Apple Portal WeatherKit capability 未生效，**留工程师**，Xcode Console 搜 `weather fetch failed`）；`calendar` 只读 iOS 已同步的日历账户（飞书/Google 工作日历若没同步进 iOS Calendar 就读不到）。
+- `focus` / `audio_route` 后端 `/v1/agent/perception` 未暴露（iOS 在采集）——待补。
+
+### [DONE] iOS 聊天 typing 指示器多条待回修复 + 一个自递归崩溃
+- 修"连发两条、reply1 一到就灭点点点"：改用 `pendingReplies` 计数，全部待回落地才隐藏指示器；`isWaitingForReply=false` 时自动归零防卡死。
+- 修一个**自己引入的崩溃**：上面改动用 `replace_all` 抽取 5 分钟超时块时，误把新加的 `beginAwaitingReply()` helper **自身函数体**也替换成调用自己 → 无限递归 → **发送即崩溃**（栈溢出）。恢复 helper 体。提交 `a1ecd3e`。**教训**：无限递归是运行时错、`xcodebuild` 能过不代表不崩，改完必须真机/模拟器跑一次冒烟。
+
+### [DONE] docs 清理 + agent-CLI 调研文档
+- 删 12 个已 ship 的 Round 3 PR 执行脚手架文档（`PROACTIVE_PERCEPTION_PR1…PR10`；聚合的 `ROUND3_EXECUTION_PLAN` / `RUNTIME_V2_MIGRATION` 保留作 PR 总览 + 迁移契约）。
+- 二次清理：删 `PROACTIVE_GATE_V1.md`（V2 后自标 archived、非活跃路径）、`ROUND3_HANDOFF.md`（merge-前交接清单，branch 早已 merge 进 test）、`ROUND3_VALIDATION_STATUS.md`（06-20 审计快照；当前真机状态以 `ROUND3_REALDEVICE_TEST_PLAN.md` + 本 changelog 为准）。`MODEL_API_PATH_P0.md` **保留**——它是托管 Model-API 这条 live 路径的唯一设计文档、且被 `PROJECT_OVERVIEW` 文档索引引用。docs 41 → 26。
+- 新增 `AGENT_CLI_INTEGRATION_SURVEY.md`：各 agent（OpenClaw/Hermes/Claude Code/Codex）接 CLI 的机制调研。结论——**io_cli + skill/exec 是有 shell 能力 agent 的通用最小公分母**，不必每个 agent 写专属 adapter；native 插件/MCP 是更强的"升级位"；≥2 个非 OpenClaw runtime 要 production-grade typed 工具就做 **Feedling MCP server**，而不是继续扩散 per-agent adapter。
+
+## 2026-06-22
+
+### [DECISION] V2 baseline 扩展到全部 4 个 rollout flag + prod 也默认 ON
+- **背景**：上一条只把 `perception_ingress` / `resident_wake` / `resident_chat` 接入 env baseline。但 hosted(API) 用户线还有 `hosted_wake_runtime_v2_enabled`、`hosted_chat_full_tool_loop_v2_enabled` 仍 OFF → hosted 用户感知数据进来了（ingress 已 ON），但 wake 走 legacy executor、前台聊天不 pull 感知工具（半截）。`screen_caption_enabled` 也 OFF。
+- **改动**：
+  - 三个 reader（`hosted/wake_consumer.py`、`hosted/chat_routes.py`、`proactive/screen_flag_v2.py`）改为未设值时回落 `core/util.runtime_v2_default_on()` baseline；显式 per-user 值仍优先。
+  - `hosted/config_store.py` 停止播种这三个 + perception 共 **4 个** flag；scrub 从单 flag 的 bool marker 泛化为 **set marker** `v2_autoseed_scrubbed_flags`（`AUTOSEED_SCRUB_FLAGS` 列表），兼容旧 `perception_v2_autoseed_scrubbed` bool（迁移进 set 并删除旧 key）。每个 flag 一次性清理历史播种 False，之后运维显式写的 False（per-user opt-out）存活。
+  - **prod 也默认 ON**：上一轮已给 `docker-compose.phala.yaml` 加了 `FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"`，所以 4 个 flag 在 test+prod 两个 compose 下都默认 ON。**两个 compose 不用再改**——新接入的 flag 共用同一个 env baseline 自动跟着 ON。
+- **screen_caption 隐私决定**：它把屏幕截图外发第三方 VLM(OpenRouter)，原为 fail-closed opt-in。用户**明确选择默认 ON**（含 prod）。reader 仍保留 error→OFF 的 fail-closed。
+- **测试**：`test_runtime_v2_default_flag.py` 扩展（4-flag scrub + set marker + 旧 bool marker 迁移 + hosted_wake/hosted_chat/screen_caption baseline）；本地非 DB 回归 200 passed。需 PG 的（`test_hosted_wake_v2_cutover` / `test_model_api_wake` / `test_proactive_tool_execute_route`）交给 CI。
+### [DECISION] Perception/Resident V2 rollout flags 改为 env-gated baseline（test 默认 ON / prod OFF）
+- **背景**:三个 V2 灰度 flag(`perception_ingress_runtime_v2_enabled`、
+  `resident_wake_runtime_v2_enabled`、`resident_chat_runtime_v2_enabled`)默认全 OFF,
+  又**没有任何 setter**(只能 `db.set_blob` 直写 per-user blob),test 上每个账号都得手翻,很烦。
+- **改动**:
+  - 新增 `core/util.runtime_v2_default_on()` 读环境变量 `FEEDLING_RUNTIME_V2_DEFAULT_ON`
+    作为三个 flag 的**基线默认**;显式的 per-user blob 值仍然优先(operator opt-in/opt-out 不变)。
+  - 三个 reader(`perception/service.py`、`proactive/resident_runtime_v2.py`)未设值时回落到基线。
+  - **修坑**:`hosted/config_store._ensure_model_api_runtime_profile` 之前会把
+    `perception_ingress_runtime_v2_enabled` 自动播种成 `False`,把每个 hosted profile 钉死、
+    让 env 基线失效。现在①不再播种该 key ②对已存在的"自动播种 False"做**一次性** scrub——
+    用 `perception_v2_autoseed_scrubbed` marker 门控,只清理一次历史 artifact;**marker 落下后,
+    运维日后显式写的 `False`(per-user 回滚/opt-out)会被保留**,不再每读必删(Codex review P2)。
+    显式 `True` 任何时候都保留。
+  - `deploy/docker-compose.phala.test.yaml` 的 **backend** 服务加 `FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"`;
+    **prod compose 不加** → prod 仍 OFF、保留 legacy 回滚口子。
+- **为什么不硬 `True`**:这些 flag 的设计就是"翻一个 flag 即回滚,不用回滚代码";env-gated 既解了
+  test 的手翻痛点,又不动 prod 的回滚安全性。
+- **测试**:`tests/test_runtime_v2_default_flag.py`(6 例:env 基线、显式 override、scrub、保留 True)全过;
+  perception/ingress/runtime_v2 回归 89 passed。resident 聊天 consumer 在 VPS 上无需 env——它从
+  `/v1/proactive/jobs/poll` 的 `runtime_v2` 拿服务端已算好的基线值。
+- **影响文档**:`PROACTIVE_PERCEPTION_PR7_INGRESS_CUTOVER.md` / `PR9_RESIDENT_CUTOVER.md` 里"default
+  false"现在应理解为"prod 基线 false / test 基线 true,per-user 仍可覆盖"。
+
+### [DONE] 修 resident reply loop:OpenClaw 输出解析 + verify_loop 真调 agent + skill 路由硬规则
+- **背景**:一次 VPS onboarding 实测——onboarding 各步显示"成功 + 发了问候",但用户回消息后
+  iOS 一直 loading、永远收不到回复。SSH 进 VPS 看 consumer 日志定位到三个叠加问题。
+- **诊断(VPS 日志 + 复现 OpenClaw 命令)**:
+  - consumer 收到了消息、解密成功;调 OpenClaw → OpenClaw **回得好好的**
+    (`result.payloads[0].text="能看到..."`,status=ok);**但 consumer 解析不出来** →
+    `_reply_from_json_obj`/`_agent_turn_from_obj` 不认 `result.payloads[].text`(只认到 `result` 就停)
+    → 判 "no usable reply" + `SEND_FALLBACK_ON_AGENT_ERROR=false` → 什么都不发 → iOS 永转。
+  - **verify_loop=true 是假阳性**:consumer 见 verify ping 走"罐头 liveness 回复"短路、**根本没调
+    真 agent**,所以掩盖了上面的解析失败,让 onboarding 误判通过。
+  - agent 还把 consumer 接到了 **OpenClaw**(用户其实在跟 Hermes 对话),并改了 OpenClaw 的
+    IDENTITY.md/BOOTSTRAP.md——把"agent_name 别叫 Hermes"误套到"换 runtime 当传输"。
+- **改动**:
+  - **②(consumer,feedling-mcp test)**`tools/chat_resident_consumer.py`:加 `_openclaw_payload_texts`
+    显式 extractor,接进 `_reply_from_json_obj` / `_multi_reply_json_from_obj` / `_agent_turn_from_obj`
+    三处,支持 OpenClaw `result.payloads[].text`(含多气泡);加 3 个回归测试。
+  - **③(consumer)**verify ping 不再罐头短路,改成**有界真 agent 探活**:慢(>20s,可配
+    `VERIFY_PROBE_TIMEOUT_SEC`)→ 回退罐头 ack(不冤枉健康慢 agent);完成但无可用回复 →
+    **不 ack,让 verify 失败**(把解析/传输坏掉的链路在 onboarding 阶段就暴露)。
+  - **①(skill,io-onboarding main)**`skill-resident-agent.md` 加硬规则:**consumer 的 agent 入口
+    必须是收到 onboarding 指令的那个 runtime 本身**,多 runtime 同机时不许改接"更顺手"的兄弟;
+    runtime 自报名字是 agent_name 的事,别为此换 runtime 或改 IDENTITY.md/BOOTSTRAP.md。
+  - **④(consumer)**自测中发现:test 版 consumer 顶层 import `proactive.adapters_v2`/
+    `runtime_v2` → `observability_v2` → `db` → **psycopg**,而 resident(纯 HTTP 客户端、无 DB)
+    的 venv 没有 psycopg → 切 test 分支后 import 直接崩。这俩符号只在 proactive-job 路用,
+    已改**惰性导入**,聊天回复路 import 即 psycopg-free。
+- **端到端自测(真实 VPS + 真实 OpenClaw)**:把 VPS consumer 切到 test 分支、重启(decrypt
+  source OK enclave、无 crash),调 `/v1/chat/verify_loop` → **`passing=true`,response 15.1s**;
+  consumer 日志 `verify ping — exercising real agent path` → `real agent reply OK`。即
+  poll→真调 OpenClaw→解析 payloads→回写 整条链已通,原"回消息没回复"复现并修复。
+- **遗留**:① 是 skill 约束,不能 100% 强制 agent 守规;OpenClaw 仍非文档化入口(但现在能解析了);
+  proactive-job 路仍需 psycopg(把 `merge_wakes_v2` 从 db-bound 模块拆出是单独的后端清理)。
+
+## 2026-06-21
+
+### [DONE] 修 VPS resident 入驻接不上(MCP→enclave 迁移残留,跨仓库)
+- **现象**:test 环境 VPS 用户复制连接信息给自己的 agent,agent 卡在 Live
+  connection——consumer 去探 `test-mcp.feedling.app/mcp`、`/sse` 全 404,
+  decrypt source 不可达,verify_loop 永远 false。memory/identity 都没问题。
+- **根因(三个叠加,均非 agent 的错)**:
+  1. iOS `FeedlingAPI.residentConsumerConfig` 仍发死的 `FEEDLING_MCP_URL/KEY`,
+     且**完全不发** `FEEDLING_ENCLAVE_URL`(MCP 下线后 consumer 唯一的解密源)。
+  2. `skill-resident-agent.md` 让 agent 拉 `origin/main` 且以 HEAD==main 为 gate;
+     但 main 停在 MCP 下线**前**(aef4809),那版 consumer 仍走 MCP,与 test 后端对不上。
+     enclave 直连 consumer 在 `test` 分支。
+  3. 结果根本没人给 `FEEDLING_ENCLAVE_URL`。
+- **验证前提**:curl test enclave `-5003s.../v1/chat/history` → 无 key 401、带
+  Bearer key 200、attestation 200 → 解密源可用,方案成立。
+- **改动(决定:consumer ref 用 `test` 分支;解密走 enclave 直连)**:
+  - **iOS**(feedling-mcp-ios):`CVMEndpoints` 加派生量 `enclaveURL`
+    (`https://<appId>-5003s.<gateway>`,按环境自动出 test/prod);
+    `residentConsumerConfig` 去掉 `FEEDLING_MCP_URL/KEY`、改发 `FEEDLING_ENCLAVE_URL`;
+    `connectionDetailsBlock` 删掉死的 "Chat-client MCP command" 行。
+  - **io-onboarding** `skill-resident-agent.md`(EN+ZH):连接信息加 `FEEDLING_ENCLAVE_URL`;
+    consumer 来源 `origin/main`→`origin/test`、删 HEAD==main gate;新增"agent_name(卡里名字)
+    ≠ 选哪个 runtime 当传输,别为改名去换 runtime 或改 IDENTITY.md/BOOTSTRAP.md"。
+- **顺带解释用户的"想让 Hermes 连却选了 OpenClaw"**:agent 把"名字别叫 Hermes"误套到
+  "用哪个 runtime 传输",还改了 IDENTITY.md/BOOTSTRAP.md(违反"别包新人格")——已在 skill 拆清。
+- **未做(留作单独清理)**:chat-client(路由A)的 `mcpConnectionString`/empty-state MCP 命令
+  仍是死的;`main` 落后 `test` 两个月的 release 卫生;prod 是否同病(取决于 prod-mcp 是否还活)。
+- 验证 enclave 可达通过;iOS/skill 改动仅配置/文档,未跑构建(需 Xcode)。
+
+### [BLOCKER] 感知工具循环只在 wake 路,前台聊天未收敛(违反 D1)→ 已派 Codex
+- **审出的缺口**(外部 Claude 排查 + 我代码核实):`run_tool_loop_v2` + `ToolExecutorV2`
+  (全 catalog perception+memory)只接进**主动 wake 路**;**前台聊天两路都没接**——
+  hosted `chat_routes._run_model_api_memory_tool_loop` 只认 memory 工具(`MEMORY_INDEX/FETCH`,
+  无 perception.*),resident `_process_messages`(consumer:3154)走老单发回复、不进 tool loop。
+  结果:**聊天时 agent 无法按上下文 pull 感知**(perception 只是被动 push 的快照)。
+- **定性**:不是 spec 遗漏,是实现缺口 + **违反 D1**(chat 与 proactive 应是同一引擎)。
+  spec 明确要求聊天 agentic 调工具:D1 / §2.1("聊运动 pull 步数")/ §6+B2(前台 agentic =
+  路由器本身,D9 硬前置)。
+- **派 Codex**(mailbox 20260621T145308Z):hosted+resident 聊天两路收敛到 `run_tool_loop_v2` +
+  `combined_runtime_adapters_v2`(全 catalog),flag 默认 OFF;**关键约束**:前台延迟敏感,
+  必须守**快档 cost_class 预算 + 软交棒**(D17/D9/§6)——slow 工具走 `needs_background` 后台
+  回灌,不能像 wake 那样内联跑 slow 工具把用户卡在"思考中"。审计待 Codex 实现后做。
+- 影响文档:`PROACTIVE_PERCEPTION_SPEC_V2.md` §9 B2 状态改为"部分完成"。
+
+### [DONE] Proactive tool-loop execution (D11: bounded multi-turn for both hosted + resident)
+- **Unified loop shipped**: Both hosted and resident proactive wakes now run `run_tool_loop_v2()` — a bounded multi-turn agent loop that calls the model, parses `tool_calls` JSON, executes tools, and feeds results back (max 4 iterations, capped at `MAX_TOOL_ITERS_V2`). One shared `ToolExecutorV2` instance per run provides budget continuity and unified tool implementations.
+- **Hosted wiring (in-process)**: Proactive runtime injects call-model and call-tool closures into the loop; tools execute immediately in-process.
+- **Resident wiring (HTTP)**: `chat_resident_consumer` wraps the external agent call (`call_agent`, Hermes CLI/HTTP) in `run_tool_loop_v2` for V2 jobs only (legacy single-shot path untouched). Tool calls go to the new endpoint `POST /v1/proactive/tool/execute`, which runs the shared `ToolExecutorV2` server-side (perception/memory/screen tools; only `screen.read` reaches the enclave) and returns `ToolResultV2.as_dict()` (ok, outcome, result, error_code, needs_background, trace).
+- **Budget handoff stops the turn**: when a tool in a turn returns `needs_background`, the loop stops executing that turn's remaining `tool_calls` and defers immediately — avoids wasted inline work (and an HTTP round-trip per call on resident) after the decision to background.
+- **Resident tool-only replies survive normalization**: `tool_calls` are now preserved through the resident agent-output normalizer on every transport — the early-return guards in the string/CLI path (`_agent_turn_from_obj`, `call_agent_cli`) and the OpenAI-HTTP path (`_call_agent_http_openai`) previously only treated messages/actions/thinking as "usable", so a tool-only model reply wrapped in any log/header text was flattened to a plain message and the tool never ran. `tool_calls` are also de-duped (one emission could arrive via multiple nested JSON paths, e.g. an OpenAI `choice.message`), so the loop never double-executes a single call.
+- **Impact**: `screen.read` and all V2 tools now reachable end-to-end for both user types (hosted + resident). Cross-HTTP-call budget accumulation for resident deferred (iteration cap bounds cost per turn).
+- **Changelog + CI**: Added D11 test suite to `.github/workflows/ci.yml` (4 new test files); `tests/test_tool_loop_v2.py` added to pure-unit conftest. No further changes needed.
+- **未做**: Native function-calling; cross-HTTP-call budget accumulation for resident; proactive caption-on-change (tool loop is the foundation, not the feature).
+
+## 2026-06-21
+
+### [DONE] Screen frame VLM captioning via in-enclave OpenRouter (Tasks 1-6 complete)
+- **Tasks 1-5 shipped**: New enclave route `GET /v1/screen/frames/<id>/caption` decrypts frame IN-ENCLAVE and calls OpenRouter `qwen/qwen3-vl-8b-instruct` via `provider_client`, returning caption text only (never pixels). Backend never holds plaintext pixels. New backend `screen/caption.py` calls that route, caches caption per frame_id. `screen.read`/`screen.recent` tools now implemented in `ToolExecutorV2` for isolated testing.
+- **New per-user flag**: `screen_caption_enabled` (default OFF, fail-closed). Enclave env: `FEEDLING_SCREEN_VLM_API_KEY` (required dstack secret; absent → fail-closed `screen_caption_unconfigured`), optional `FEEDLING_SCREEN_VLM_MODEL` (default `qwen/qwen3-vl-8b-instruct`), `FEEDLING_SCREEN_VLM_BASE_URL` (default OpenRouter). Deployed config documented in `deploy/DEPLOYMENTS.md` § Enclave configuration.
+- **Task 6 (docs-only)**: Updated `deploy/DEPLOYMENTS.md` with VLM secret + optional env overrides, non-code privacy prerequisites (user disclosure + OpenRouter zero-retention config). Added to changelog.
+- **Follow-up (now resolved)**: at the time of this entry the model multi-turn tool-execution loop (D11) was still pending, so these tools were tested in isolation only. D11 landed the same day (see the D11 entry above) — `screen.read`/`screen.recent` are now reachable by the live agent on both hosted and resident paths.
+- **未做（不在本计划范围）**: Proactive frame captioning、per-user API key、on-device VLM、legacy caption deletion。
+
+## 2026-06-20
+
+### [DONE] 三个用户开关（陪伴/定时任务/提醒）端到端落地
+- **后端**（test `b4386f9` → 合 test）：`/v1/proactive/state` GET/POST 暴露
+  `ambient` / `scheduled` / `reminders_delivery`；`scheduled` 升为 first-class
+  持久化；映射单一真相（`enabled=ambient`、`dnd=!reminders_delivery`、scheduled
+  独立）。**iOS**（main `c1dbbbc`/rebase）：Settings 三个 RailToggle，按 subset-accept
+  只发改动键；**清掉死代码** `ProactiveUserState`/`user_state`/`ai_state`（不符合
+  D6，且无处引用）。
+- **为什么**：spec §8.2 的三层 gate（Wake/Voice/Delivery）需要三个用户可见开关，
+  且**定时任务独立于陪伴**（D16，关陪伴不该连坐闹钟）。此前 iOS 根本没有这几个开关
+  入口，后端 settings 也只有 enabled/dnd。
+
+### [DONE] 感知能力 iOS↔后端全量打通（parity review 后收口）
+- **起因**：一次跨仓库 parity review 发现 iOS 发的一批信号后端不接、后端能 wake 的
+  事件 iOS 不发。逐项收口（后端 test `85adbfb`+`dad4900`，CI 绿、镜像已发；iOS main
+  `7663631`）：
+  - **weather / health（睡眠·运动·体征）/ focus** → 注册为加密 **pull-only** 信号，
+    字段名逐字对齐 iOS，走 enclave 解密 + resolver 丢原始；focus 出 `in_focus`
+    pull 提示，**删掉映射到已删 user_state 的死代码**（`resolve_focus`/`_apply_focus`）。
+  - **audio_route**（蓝牙锚点的可行子集）→ iOS 读 `AVAudioSession.currentRoute`
+    （车机/耳机+设备名），加密 pull-only。任意系统级蓝牙连接 iOS 不给第三方 app。
+  - **久别解锁** → iOS 在"前台回归 after >30min 空闲"（gap 端上算）发
+    `unlock_after_absence`；后端早已接好（零改动）。第三方 app 拿不到可用的硬件解锁
+    事件，"重新在场"才是可落地的最直接信号。
+  - **WiFi 锚点 wake（§3.3/D13）** → iOS 发 `wifi_anchor_id`＝BSSID 的端上 HMAC
+    （真 BSSID 永不出设备）；后端把解密 token 喂差分器产 `arrived_at_anchor`，**仅在
+    iOS `changed=true` 时喂**（挡掉"部署后差分器内存态清空+静止用户被批量误唤醒"）。
+  - **后台到达 wake（option B）** → iOS 低功耗 SLC + visit 监测、Always 升权、
+    `location` 后台模式。Seven 选 B（"一到某地就主动找你"）而非 A（只 pull 上下文）。
+- **设计决策（Seven 拍板）**：连续信号一律 pull-only / 不 wake（§3.1/D5）；focus 只作
+  pull 在场提示、绝不复活 user_state（D6/D15）；蓝牙走音频路由子集；WiFi 锚点做哈希
+  指纹**自动学**（不靠用户命名，D13）。
+- **影响文档**：`PROACTIVE_PERCEPTION_SPEC_V2.md`（§2.1/§3.1/§9 B1↓依赖+B1b）、
+  iOS `PERCEPTION_BACKEND_TODO.md`，新增 iOS `PERCEPTION_HANDOFF_2026-06-20.md`。
+- **仍需（工程师，非代码）**：后台定位整条链真机验证（无法在本机 build/跑）、Apple
+  开发者后台开 HealthKit + WeatherKit capability。
+
+## 2026-06-16
+
+### [DONE] 解除"单 worker 天花板"——后端可跑 `-w N`（LISTEN/NOTIFY 唤醒总线 + advisory-lock 选主）
+- **动机**：生产 `gunicorn -w 1 --threads 32`，32 线程是全部并发预算，而
+  `/v1/chat/poll`、`/v1/proactive/jobs/poll` 天然挂线程（≤30s）。活跃用户一多，
+  等待者吃光线程池、正常请求排队 → 已观察到的 prod 慢/502；且永远无法加 worker。
+  根因是 4 类绑死单进程的状态：① UserStore 进程内写穿缓存 ② threading.Event
+  长轮询 waiter ③ :9998 WS 在 import 期绑端口 ④ 必须单例的 hosted tick/consumer
+  + 明文 `last_seen_api_key`（仅内存）。
+- **Layer A 跨进程唤醒/失效**：新增 `backend/core/wake_bus.py`，用 Postgres
+  LISTEN/NOTIFY（不引新组件）。写 chokepoint（`store.append_chat` /
+  `append_proactive_job` / frame 落库 / 注册表编辑）落库后发 `NOTIFY`；每 worker
+  一个常驻 listener 收到非自己来源的通知就 `_evict_store`（就地 reload + 唤醒本地
+  waiter）。db 层加 `pg_notify` / `listen_connection`（SQL 归 db.py，协议归 core）。
+- **暗雷修复**：① chat-poll 的 reply claim 从"读缓存判可领 + 写穿"改成
+  `db.chat_try_claim_reply` 的 DB 条件 CAS（两 worker 不再双投同一回复）；
+  ② 用户注册表 `_users`/`_key_to_user` 进程内、查 miss 不回库——register/发 key 等
+  真实编辑走 `_save_users(broadcast=True)` 发 `users` 通道，各 worker reload，
+  否则新用户在别的 worker 会 401。
+- **Layer B 单例选主**：新增 `backend/core/leader.py`（`pg_try_advisory_lock`），
+  WS ingest 收进 `run_singleton("ws", …)`，只有持锁 worker 绑 :9998、挂了别的
+  worker 接管。
+- **Layer C hosted wake 分布式 + 按 key 在位执行**（比原计划更简）：发现 job 认领
+  已经是 `update_proactive_job(only_if_status="pending")` 的原子状态 CAS，**无需
+  新表/迁移**。tick 改成每 worker 各跑、只处理本 worker 持 key 的用户
+  （`_hosted_keyholder_user_ids`，创建+模型调用都需明文 key 故必须在 key 所在
+  worker 跑）；重复创建用 `db.try_stamp_hosted_tick` 原子心跳槽 CAS 防住；
+  `try_consume_pending_for_user` 作 `proactive` 通道 handler 跨 worker 即时认领。
+- **compose**：三个 compose `-w 1` → `-w 2`（先小、可灰度再提 N），注释更新；
+  改 compose 字面量会改 `compose_hash`，**部署需重新上链**（CONTRIBUTING §7 /
+  DEPLOYMENTS.md）。每 worker 约 +17 个 DB 连接（池 16 + listener 1），调大 `-w`
+  前核对库 `max_connections`。
+- **验证**：本地 `gunicorn -w 2` 端到端——注册落一个 worker 后 whoami 40/40 全 200
+  （users 通道）；一 worker 长轮询、另一 worker 发消息，10/10 轮真实停泊后均
+  ~10ms 内被唤醒（跨进程唤醒总线）；advisory-lock 选主 + 接管、claim CAS 单赢家
+  均有单测/集成验证。全量 pytest 450 passed（仅 2 个预先存在的 enclave 红用例，
+  零新增失败）。新增测试：`test_wake_bus`、`test_chat_poll_claim_cas`、
+  `test_hosted_wake_distribution`。
+- **Codex review 修复（两轮）**：① 注册表所有真实单用户编辑（注册/发 key/key
+  恢复/link-token/access-binding/公钥/偏好）从 `_save_users` 全表
+  DELETE+重插改成 `registry.persist_user` 单行 upsert + `users` 广播——否则两
+  worker 并发编辑不同用户时，陈旧快照全表重写会抹掉对方刚建的用户（已用 -w 2 并发
+  注册 16 用户验证零丢失）；`_save_users` 全表重写只留给 normalization/测试。
+  ② `load_users()` 整个 reload 包进 `_users_lock`（它现在也在监听线程上跑，与请求
+  线程并发改注册表）。③ chat-poll claim 的 DB CAS 补 replied 状态拒绝
+  （`reply_status='replied'` / `reply_message_id`），防别的 worker 已回复后本
+  worker 凭陈旧缓存重复认领。④ 账号删除路径补 `users` 广播（否则别的 worker 仍
+  鉴权已删账号）。⑤ 缓存型 blob（`tokens`/`push_state`/`live_activity_state`/
+  `frames_meta`）写 chokepoint 补 `blob`/`frames` 广播——否则别的 worker 用陈旧
+  token/推送冷却到 15min TTL，坏掉推送投递/去重；用线程局部 `_reload_guard` 抑制
+  reload 期写穿归一化的回广播（防 NOTIFY 风暴）。⑥ **部署安全**：phala / phala.test
+  两个 compose 用 pinned 旧镜像（`857c09e`/`b14c3db`，import 期绑 :9998），保持
+  `-w 1`，注释写明须与"换含本 patch 的镜像"同一次部署一起提 `-w`；只有带 `build:`
+  的 base `docker-compose.yaml` 设 `-w 2`（从源码构建，安全）。
+- **影响文档**：CONTRIBUTING §7 不变量（单 worker → 多 worker 已支持）、
+  `core/store.py` / `db.py` 模块 docstring、三个 `deploy/docker-compose*.yaml`。
+
+### [DONE] enclave 改用 gunicorn gthread（撤掉 Werkzeug 开发服务器）
+- `backend/enclave_app.py` 的入口从 `app.run(threaded=True)`（Flask 自带
+  Werkzeug 开发服务器，非生产级 WSGI）换成**编程方式内嵌的 gunicorn**
+  （`BaseApplication`）：`worker_class=gthread`、单 worker、32 线程、
+  `timeout=120` / `graceful_timeout=30`。单 worker 精确沿用原"单进程多线程"
+  模型——进程内 whoami / content-key 缓存与 singleflight（见文件头）保持一致，
+  挡住 history-import 触发的回环鉴权线程风暴。
+- **关键约束：不动 compose。** gunicorn 内嵌进 `__main__`，compose 入口仍是
+  `python -u backend/enclave_app.py`，所以 `compose_hash` 不变、无需重新上链
+  （CONTRIBUTING §7 不变量）。
+- **保住自签 TLS + cert-DER pinning。** bootstrap() 派生的 PEM 写到 tmpfs 临时
+  文件（0600，atexit 清理；TDX 下 /tmp 是内存盘，密钥不落盘）供 gunicorn 翻开
+  `is_ssl`；实际 SSLContext 走 gunicorn 的 `ssl_context` 钩子，复刻原
+  `_build_ssl_context` 的精确姿态——裸 `PROTOCOL_TLS_SERVER`、min TLS 1.2、无
+  客户端证书校验、无 HTTP/2 ALPN，确保握手服务的正是 REPORT_DATA 里 pin 的那张
+  leaf，iOS 审计卡的 `sha256(cert.DER)` 校验不受影响。
+- gunicorn import 延迟到入口，`import enclave_app`（测试套件）不强依赖它。
+- 验证：自签证书冒烟测试确认 gunicorn 起 https、`/healthz` 走 TLS 返回、服务的
+  证书指纹 == 注入证书、明文打 TLS 端口被拒、SIGTERM 优雅退出；
+  `tests/test_enclave_route_errors.py` 11 例全过。
+- `backend/requirements.txt` gunicorn 注释补上 enclave 用法（`ssl_context` 钩子
+  需 >=21.0；已 pin >=23）。**部署：只需 bump CVM 镜像，compose 文件不动。**
+
+### [DONE] 文档：补全历史导入端到端流程（RUNTIME_FLOWS §3.6）
+- 把 `RUNTIME_FLOWS.md` §3.6 从"两遍蒸馏"一句话扩成完整阶段流水线：
+  异步 job + 轮询、job 复用 / stale 判定、解析历史与支撑材料（过滤账号
+  元数据）、关系起点与 small/large 分级、时间窗口提候选、聚类写记忆卡、
+  派生身份卡、生成开场问候、`chat_ready` 首批放行、large/ultra 后台续抽。
+- §4.3 同步补一句指回 §3.6。
+- 只动文档，对照 `hosted/history_import.py:_process_history_import_sync` 与
+  `_HISTORY_IMPORT_PHASES` 校对阶段名，未改代码。
+
+### [DONE] 收尾：撤未接线的 wake_interval、加固捕获锁、补测试（push 前清理）
+- **撤掉死旋钮**：P4 初版加了 `wake_interval_sec`（唤醒频率），但只存储、无
+  代码读它生效——正是 P1 批判的"写了没人读"。按"凡发出去的旋钮都得是活的"
+  原则，本批从 `core/store.py` 撤掉它（默认/白名单/校验三处），只保留已真接
+  线的 `wake_directive`。频率旋钮连同**实际接线 + iOS + 测试**整体延到后续
+  （task #6）。
+- **加固捕获锁**：P2 给记忆捕获加的每用户锁，存在一个泄漏窗口——`_start_`
+  占用后若 `_append_memory_capture_job`/线程启动抛异常，`finish()` 不会执行、
+  用户被永久挡在捕获之外。`hosted/turn.py` 用 try/except 包裹交接段，异常时
+  释放守卫再抛。
+- **补测试（纯单元，本地全过）**：
+  - `tests/test_context_memories.py` +3：strict 软召回 `index_sample`（排除已
+    选中、上限 20、转折优先）。
+  - `tests/test_model_api_wake.py` +2：`user_directive` 进/不进 wake payload。
+  - 新增 `tests/test_history_import_identity.py`（5）：`_normalize_identity_payload`
+    的语气字段透传/净化/截断。
+  - 新增 `tests/test_model_api_prompts.py`（5）：前台 prompt 含 custom_persona_prompt
+    优先级指令 + memory_index 召回指令；persona/索引值进 prompt。
+  - 两个文件加入 `conftest.py` 的 `_PURE_UNIT` 白名单（无 DB 也收集）。
+  - 全量无 DB 跑：**107 passed**；显式 context 跑：62 passed。
+- **补测试（DB 依赖，CI 验）**：`tests/test_identity_actions.py` +2，照搬现有
+  通过模式——`custom_persona_prompt` 经 profile_patch 可写回身份体；
+  `wake_directive` 白名单/截断/拒未知键。本地无 Postgres 跑不了，CI 验。
+
+### [DONE] P4(backend)：proactive 自定义（D2 power-user）；iOS 待做
+- D2 定的是"全自定义（默认值 + 高级区）"。本批后端落 `wake_directive`：
+  用户自己的"什么时候来找我"自然语言指令（`proactive_settings`，≤1000 字，
+  现有 `GET/POST /v1/proactive/settings` 即可读写）。
+- **吸取 P1 教训，不加死字段**：`wake_directive` 已**真接进** hosted wake
+  prompt——`model_api_runtime/wake.py` `build_wake_event_message` 增可选
+  `user_directive`，`hosted/wake_consumer.py` 从 settings 取并传入，wake
+  事件 payload 带 `user_wake_directive`，agent 据此权衡发不发（用户指令、
+  非硬规则）。
+- **未做（明确标注待做，task #6）**：唤醒**频率**旋钮（连同 hosted tick
+  cadence + resident consumer 端接线）、**iOS UI**（proactive 设置面板 +
+  `custom_persona_prompt` 编辑入口，在 feedling-mcp-ios 仓库）。
+
+### [DONE] P3：API 召回加"软召回索引"（D3 LLM 软召回，加性、可回退）
+- **问题**：model_api 的 strict 召回只放 corrections + 词面命中阈值的卡
+  （`context_memory_selection.py` 严格分支），语义相关但词面不重叠的卡被
+  硬丢——即 feedback point 2"召回太硬，只是文字对应"。
+- **改法（加性，不删词面路径）**：strict 分支用**同一批已解密 moments**额外
+  构造一个紧凑 `index_sample`（id/type/title/occurred_at，转折优先+最近，
+  上限 20），零额外 provider/enclave 调用。`hosted/context.py` 把它作为
+  `context_memory_selection.memory_index` 注入 prompt；`prompts.py` 加一句
+  指令：标题/日期相关时可自然"想起"，但不得编造标题外细节、也不强行召回。
+  → 模型自己软召回，而非关键词过滤替它决定。
+- **性质**：现有 `selected`/词面选择完全不变（可回退）；index 只是补充面。
+  index 的字段/条数/措辞属可调内容，留待迭代。
+- **验证**：`tests/test_context_memories.py` 59 个纯单元测试全过（含本次改的
+  strict 分支）；新增 `index_sample` key 不影响既有断言。
+
+### [DONE] P2(API)：history import 蒸馏语气 + 记忆捕获加每用户锁
+- **蒸馏语气（修 4a 角色漂移的"蒸馏端"）**：`hosted/history_import.py` 的身份
+  派生 `_derive_identity_with_provider` 之前只产
+  `agent_name/self_introduction/category/signature/dimensions`，语气只能塞进
+  自我介绍。现在 prompt 增产 `tone_style`（怎么说话：语域/口头禅/称呼/句式，
+  要求引用真实例句）、`agent_role`、`do_not_say`、`boundaries`；
+  `_normalize_identity_payload` 对这四个字段做净化（长度上限、zh/en 一致性、
+  list 清洗）并对空值省略。它们随密文身份体落库 → 经 enclave 解密 →
+  P1a 已把它们接进 prompt，**蒸馏端 + 读取端闭环**：API 用户的语气现在
+  能跨 import 存活，而不只是 fact。
+- **记忆捕获加每用户锁（修 USER_PATHS_REVIEW §8）**：`hosted/turn.py` 的状态
+  动作和 recap 各有每用户锁，唯独记忆捕获没有——turn-24 的捕获还在跑时
+  turn-48 又触发会重叠、产重复卡。新增 `_model_api_capture_active_users`
+  守卫：`_start_model_api_memory_capture_job` 入口检查/占用，运行体的唯一出口
+  `finish()` 释放（幂等、覆盖所有 return 分支）。镜像 recap 既有模式。
+- 性质：prompt 内容（蒸馏措辞）后续可调；字段结构与锁是骨架。语法校验通过。
+- **未做（属调参/成本）**：捕获 cadence 仍是默认 24 轮
+  （`FEEDLING_MODEL_API_CAPTURE_TURN_INTERVAL` 可配）；要更"持续"可调小，
+  但有 provider 调用成本，归 P4 自定义一并考虑。
+
+### [DONE] P1b：新增 custom_persona_prompt 用户可编辑 persona 覆盖槽（D1 用户层 / feedback 4b）
+- 用户反馈想要"一个能自己加 prompt 精准定位角色的地方"。新增单个自由文本
+  字段 `custom_persona_prompt`，与系统蒸馏的 `tone_style` 分开、优先级最高。
+- 借现成白名单机制，改动最小：
+  - `identity/service.py`：`custom_persona_prompt` 加入
+    `_IDENTITY_PROFILE_STRING_FIELDS`，故 `identity.profile_patch` 自动支持
+    写入（iOS 编辑入口留待 P4）。
+  - `identity/actions.py`：两处 max_len 把它归入 1200 字一档（自由 prompt
+    需要更长，区别于 240 字的短字段）。
+  - `hosted/context.py`：接进 `identity_summary`，随 P1a 一并进 prompt（前台
+    聊天 + 记忆捕获 + wake 都读 `context_payload["identity"]`）。
+  - `model_api_runtime/prompts.py`：前台 system prompt 加一句——
+    `custom_persona_prompt` 存在时视为**最高优先级** persona 指令，压过其余
+    identity/profile 文本（安全边界除外）。
+- 性质：纯加性，零迁移；空值不渲染。四个改动文件语法校验通过。
+
+### [DONE] P1a：把 persona/语气字段接进 hosted 聊天 prompt（修 API 角色漂移根因）
+- **背景（决策 D0–D3）**：本轮定了记忆/identity 重设计的四个地基决策——
+  D0 卡库=权威外置记忆库（插件模型）、D1 persona 双层（系统蒸馏 + 用户可
+  编辑覆盖）、D2 proactive 全自定义（默认值 + 高级区）、D3 召回改 LLM 软
+  召回。落地按 P1（schema 地基）→ P2（持续落卡 + 蒸馏语气）→ P3（软召回）
+  → P4（自定义暴露）分阶段推进。本条是 P1 的第一个最小落地。
+- **诊断**：`tone_style` / `agent_role` / `do_not_say` / `boundaries` /
+  `stable_definitions` 等 persona 字段在 identity 密文体里**能写**（经
+  `identity.profile_patch`，见 `identity/actions.py` `_IDENTITY_PROFILE_FIELDS`），
+  但 hosted 聊天 prompt 的两个 identity 入口（`hosted/context.py`
+  `identity_summary` 与 `history_import.py` `_model_api_agent_profile_context`）
+  都**不读**它们——persona 是 write-only 死字段。这是 model_api 用户反馈
+  "角色漂移"（只蒸馏 fact 不蒸馏语气）的结构性真凶：两头断（蒸馏不写、
+  prompt 不读）。
+- **改动**：`backend/hosted/context.py` 的 `identity_summary` 补上述 persona
+  字段。prompt builder（`model_api_runtime/prompts.py`）是整包
+  `json.dumps(context_payload)` 注入、不挑 key，故此一处接线即同时惠及
+  **前台聊天**与**记忆捕获 worker**（两者都读 `context_payload["identity"]`）。
+- **性质**：纯读取侧加性改动，零 schema 改动、零迁移；字段为空时只渲染空值，
+  模型忽略。值在 P2 蒸馏阶段填入——"先接线、后填值"。
+- **验证**：语法通过；未跑 DB 测试（本地无 Postgres，按 repo 约定 CI 跑）。
+  无测试断言 `identity_summary` 的 key 集合，改动不影响
+  `test_identity_actions.py` 的已存断言（它校验存盘明文，非 prompt 摘要）。
+- **下一步**：P1b 加"用户可编辑 persona 覆盖槽"（D1 的用户层，4b）——需先定
+  字段命名/语义。
+
+## 2026-06-16
+
+### [DONE] 新增 docs/USER_PATHS_REVIEW.md：BPS/API 两路功能总览 + 缺漏盘点
+- 把 resident（BPS，自建服务器）与 model_api（API，托管）两条用户路的
+  Onboarding / Chat+Memory / Proactive 运行方式并排梳理成一份功能向文档
+  （不含加密/部署）。
+- Part 2 盘点了一次系统性代码阅读发现的缺漏，按 🔴/🟡/🟢 分级：
+  - 🔴 假完成/静默失败：model_api 记忆门槛不分档、实时连接没真验证、
+    provider 失败致用户消息孤儿且无退避、resident proactive job 无回收超时。
+  - 🟡 状态错乱：中途切路由搁浅、记忆删除无引用完整性、天数锚点漂移、
+    后台记忆捕获无每用户锁、`tool_action_enabled` 门形同虚设、import job
+    无恢复、official_import 疑似死代码。
+- 元观察：claim 租约 / 分档门 / 活性验证 / 每用户锁等"三处都该有"的机制
+  普遍只实现一两处——根因是缺一张强制对齐两条路的 capability matrix。
+- 文档明示：行号为阅读近似值，修复前需就地核对；条目待逐项落进
+  OPTIMIZATION_BACKLOG.md。
+
+## 2026-06-12
+
+### [DONE] 测试文件统一收口到 tests/
+- `backend/` 下最后 4 个测试迁入 `tests/`：`test_api.py`（活服务器集成
+  脚本）、`test_model_api_wake.py`、`test_perception.py`、
+  `test_semantic_analysis.py`；后三个加了 tests/ 惯例的
+  `sys.path.insert(..., "backend")` 头。
+- 本地全量命令简化为 `pytest tests/ -q --ignore=tests/e2e_model_api_test.py
+  --ignore=tests/test_api.py`（不再需要带 `backend/`）；CI 的
+  test_api.py 调用路径同步更新。
+- `tests/conftest.py` 的「无 Postgres 全部跳过」改为豁免 `_PURE_UNIT`
+  集合（semantic_analysis / model_api_wake / perception / provider_client），
+  没有数据库的机器仍能跑 95 个纯单元用例。
+- CONTRIBUTING.md §1 决策表与 §6 测试规范新增硬规则：测试只放 tests/。
+- 验证：418 通过 + 2 个已知长期红，零新增失败。
+
+### [DONE] 新增 CONTRIBUTING.md：后端代码组织规范
+- 把拆分重构沉淀成团队规则：app.py 只做装配；新路由进领域包 Blueprint、
+  新逻辑进 service 层；依赖只准向下（向上用注入钩子）；跨模块调用
+  `module.func()` 形式保证 monkeypatch 单点生效；全局单例只就地变更
+  不重绑；COMPAT 段只减不增；单文件 800 行预警 / 1500 行强拆；附 PR
+  自查清单。
+- `CLAUDE.md` 阅读顺序加入该文档（写后端代码前必读）。
+
+
+## 2026-06-12
+
+### [DECISION][DONE] 移除 MCP 用户条线（路由 A）
+- **拍板**：不再支持 MCP 客户端（Claude.ai / Claude Desktop）直连这条
+  用户线。现存接入只剩路由 B（Resident Consumer）和路由 C（Model API
+  托管）。
+- **删了什么**：
+  - `backend/mcpsrv/`（13 文件 ~2,180 行）+ `backend/mcp_server.py` 入口
+    + `backend/acme_dns01.py`（MCP LE 证书插件，383 行）
+  - consumer 的 MCP 解密回退路径（`tools/chat_resident_consumer.py` 的
+    `FEEDLING_MCP_URL`/`_fetch_from_mcp`/transport 探测，~250 行）——
+    **resident 用户现在必须配置 `FEEDLING_ENCLAVE_URL` 直连 enclave**
+  - `tests/test_mcp_session_isolation.py`（2026-05-11 P0 回归套件，保护
+    对象已不存在）+ consumer 测试里 5 个 MCP transport 用例；CI 同步去掉
+  - 三个 docker-compose 的 `mcp:` 服务块、ingress 的 `mcp.feedling.app`
+    域名/路由、`FEEDLING_MCP_TLS_IN_ENCLAVE`；`deploy/feedling-mcp.service`、
+    Caddyfile 的 mcp 站点、SELF_HOSTING Option B
+  - `fastmcp` 依赖（requirements.txt + lock 重新生成，纯减 587 行）
+- **attestation 兼容**：enclave 删除了 MCP 证书指纹派生路径
+  （`MCP_TLS_IN_ENCLAVE` / `MCP_TLS_KEY_PATH`），但 bundle 里保留
+  `mcp_tls_cert_pubkey_fingerprint_hex` 字段恒为空——iOS 审计卡走既有的
+  "Pre-Phase-C.2 deployment" 披露行，不破坏解析。生产 compose 本就设
+  `FEEDLING_MCP_TLS_IN_ENCLAVE=false`，行为一致。
+- **留了什么（不是 MCP 专属）**：bootstrap 门禁、`/v1/chat/verify_loop`、
+  consumer 心跳、`official_import` access_mode（默认值未动，是否砍另议）、
+  enclave 解密端点、identity/memory 的 HTTP envelope-action 端点。
+- **部署影响**：compose 变更 → 需要新 compose_hash 上链；Cloudflare 的
+  `mcp.feedling.app` CNAME/TXT/CAA 记录可清理。
+- **外部跟进（其他仓库）**：io-onboarding 的 `skill.md`（MCP agent 说明书）
+  需改写或归档；iOS 的 `ChatEmptyStateView.skillURL` 入口与 MCP String
+  相关 UI 需同步调整。
+- 文档同步：PROJECT_OVERVIEW（§5.2/§5.5 墓碑化 + 拓扑图）、RUNTIME_FLOWS
+  （顶部历史注记）、AUDIT.md（row 5/7 措辞）、README、SELF_HOSTING。
+
+
+## 2026-06-12
+
+### [DONE] backend 单体拆分：app.py 17.6K 行 → 14 个领域包 + 898 行装配层
+- 按「功能域分包为主 + hosted 条线单独成包」拆分（方案见 2026-06-11 拍板）：
+  `core/`（config/util/enclave/envelope/store——UserStore+缓存）、`accounts/`
+  （registry/auth/onboarding/access/recover/routes）、`push/`（apns/tokens/
+  live_activity/service/routes）、`screen/`（frames/ws/summary/routes）、
+  `proactive/`（service/gate/dashboard/routes）、`identity/`、`memory/`、
+  `bootstrap/`（gates+routes）、`chat/`（service/consumer/routes/verify_loop）、
+  `tracking/`、`admin/`、`content/`、`hosted/`（model_api 托管条线 8 模块：
+  config_store/setup_routes/history_import/context/turn/chat_routes/
+  onboarding_validation/wake_consumer）。`mcp_server.py` 2,029 行 → `mcpsrv/`
+  包（session/client/server/tools_{push,screen,chat,identity,memory,meta}/tls）
+  + 75 行入口。
+- 路由全部转 Blueprint，url_map 与拆分前逐条 diff 为零；gunicorn `app:app`
+  入口、四容器部署拓扑、`python -u backend/mcp_server.py` 入口零改动。
+- 解耦手段：`core/store.py` 新增 `on_proactive_job_appended` 钩子（替代
+  UserStore→hosted 的向上调用）；`core/envelope.get_user_public_key`、
+  `push/live_activity.load_identity`、`hosted/wake_consumer.flask_app`、
+  admin 的 onboarding 验证函数均由 app.py 装配段注入。`_load_users` 改为
+  `_users[:]` 就地替换（避免 re-export 分叉）；pepper 改 lazy（import 不再
+  要求 DB 可达）。
+- 决策变更：`hosted_runtime.py` 与 `model_api_runtime/` 保持原位不吸收进
+  hosted/（本就是独立清晰模块，吸收只增加 shim 风险）。
+- app.py 仍保留「COMPAT re-exports（迁移期）」段 + hosted 符号兜底回灌循环，
+  供测试/工具按旧路径取符号；收敛为白名单是后续独立 PR（见 backlog #6）。
+- 测试：436 通过，与拆分前基线完全一致（仅剩 2 个迁移前就长期红的
+  enclave 依赖用例）；测试的 monkeypatch 目标已同步迁到新模块。
+- 依赖层级（低→高）：db/content_encryption/provider_client → core →
+  accounts → push/screen → proactive/identity/memory → bootstrap.gates →
+  chat → tracking/admin/content → hosted → app.py（装配）。跨模块调用一律
+  `from pkg import module` + `module.func()`，保证 monkeypatch 单点生效。
+
+
 ---
 
 ## 2026-06-07

@@ -1,0 +1,94 @@
+# IO Memory readside sandbox.
+#
+# Purpose:
+#   Local, disposable stack for product-facing memory readside validation:
+#   Postgres + backend + enclave. The enclave uses FEEDLING_DEV_DSTACK_SEED,
+#   a dev-only deterministic key provider, so this does not require a Phala
+#   simulator and never touches production/test data.
+#
+# Usage:
+#   docker compose -f deploy/docker-compose.memory-sandbox.yaml up -d --build
+
+name: feedling-memory-sandbox
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: feedling
+      POSTGRES_PASSWORD: feedling
+      POSTGRES_DB: feedling
+    ports:
+      - "55433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U feedling -d feedling"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - feedling_memory_sandbox_pg:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: feedling-memory-sandbox-backend:dev
+    command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-w", "1", "--threads", "16", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
+    restart: unless-stopped
+    environment:
+      FEEDLING_API_KEY: ""
+      FEEDLING_DATA_DIR: "/data"
+      FEEDLING_WS_PORT: "9998"
+      FEEDLING_ENCLAVE_URL: "http://enclave:5003"
+      DATABASE_URL: "postgresql://feedling:feedling@postgres:5432/feedling?sslmode=disable"
+      FEEDLING_PUBLIC_BASE_URL: "http://127.0.0.1:5001"
+      # --- 托管三件套（缺一即启动失败 fail-fast）---
+      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
+      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
+      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+    ports:
+      - "5001:5001"
+      - "9998:9998"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:5001/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    volumes:
+      - feedling_memory_sandbox_data:/data
+
+  enclave:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: feedling-memory-sandbox-enclave:dev
+    command: ["python", "-u", "backend/enclave_app.py"]
+    restart: unless-stopped
+    environment:
+      FEEDLING_DEV_DSTACK_SEED: "feedling-memory-readside-sandbox-v1"
+      FEEDLING_FLASK_URL: "http://backend:5001"
+      FEEDLING_ENCLAVE_PORT: "5003"
+      FEEDLING_ENCLAVE_TLS: "false"
+    ports:
+      - "5003:5003"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://127.0.0.1:5003/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 15s
+    volumes:
+      - feedling_memory_sandbox_enclave:/data
+
+volumes:
+  feedling_memory_sandbox_pg:
+  feedling_memory_sandbox_data:
+  feedling_memory_sandbox_enclave:

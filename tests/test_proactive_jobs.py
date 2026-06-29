@@ -10,6 +10,32 @@ os.environ.setdefault("FEEDLING_DATA_DIR", _DATA_DIR)
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 appmod = importlib.import_module("app")
+from chat import service as chat_service  # noqa: E402
+from bootstrap import gates as boot_gates  # noqa: E402
+from proactive.controls_v2 import evaluate_wake_control_v2, resolve_settings_v2  # noqa: E402
+from proactive import capture_jobs as proactive_capture_jobs  # noqa: E402
+from proactive import capture_scheduler as proactive_capture_scheduler  # noqa: E402
+from proactive import dashboard as proactive_dashboard  # noqa: E402
+from proactive import dream_scheduler as proactive_dream_scheduler  # noqa: E402
+from proactive import resident_runtime_v2 as proactive_resident_runtime_v2  # noqa: E402
+from proactive import routes as proactive_routes  # noqa: E402
+from push import apns as push_apns  # noqa: E402
+from core import config as core_config  # noqa: E402
+
+
+def _patch_resident_scheduled_route_dependencies(monkeypatch):
+    from proactive import scheduled_wake_v2, store_v2
+
+    scheduled_store = scheduled_wake_v2.InMemoryScheduledWakeStoreV2()
+    settings_by_user: dict[str, dict] = {}
+
+    class _SettingsStore:
+        def load(self, user_id: str):
+            return resolve_settings_v2(settings_by_user.get(user_id))
+
+    monkeypatch.setattr(scheduled_wake_v2, "DBScheduledWakeStoreV2", lambda: scheduled_store)
+    monkeypatch.setattr(store_v2, "DBProactiveSettingsStoreV2", _SettingsStore)
+    return scheduled_store, settings_by_user
 
 
 def test_device_event_payload_is_redacted():
@@ -35,7 +61,7 @@ def test_device_event_payload_is_redacted():
 
 
 def test_manual_proactive_wake_creates_hidden_job(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive")
 
     decision = appmod._build_proactive_v2_wake_decision(
@@ -65,7 +91,7 @@ def test_manual_proactive_wake_creates_hidden_job(tmp_path, monkeypatch):
 
 
 def test_proactive_debug_derives_job_delivery_state(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive_delivery")
 
     decision = appmod._build_proactive_v2_wake_decision(
@@ -111,7 +137,7 @@ def test_proactive_debug_derives_job_delivery_state(tmp_path, monkeypatch):
 
 
 def test_proactive_debug_folds_legacy_no_frame_ticks(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive_folded_gate")
 
     no_frame = {
@@ -180,7 +206,7 @@ def test_proactive_debug_folds_legacy_no_frame_ticks(tmp_path, monkeypatch):
 
 
 def test_proactive_debug_dashboard_defaults_to_deep_full_view(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive_deep_dashboard")
 
     for i in range(12):
@@ -263,7 +289,7 @@ def test_proactive_debug_dashboard_defaults_to_deep_full_view(tmp_path, monkeypa
 
 
 def test_proactive_debug_translates_prose_only_in_zh_view(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive_debug_translate")
     reason = "The screen has a concrete connection to the user's memory garden."
     context_hint = "The user is comparing a dense note and may want one gentle nudge."
@@ -309,7 +335,7 @@ def test_proactive_debug_translates_prose_only_in_zh_view(tmp_path, monkeypatch)
     snapshot = appmod._proactive_debug_snapshot(store)
 
     monkeypatch.setattr(
-        appmod,
+        proactive_dashboard,
         "_translate_debug_texts_to_zh",
         lambda texts: {
             reason: "屏幕内容和用户的记忆花园有明确关联。",
@@ -335,7 +361,7 @@ def test_proactive_debug_translates_prose_only_in_zh_view(tmp_path, monkeypatch)
 
 
 def test_proactive_settings_persists_timezone(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_proactive_timezone_key"
@@ -363,8 +389,93 @@ def test_proactive_settings_persists_timezone(tmp_path, monkeypatch):
     assert bad.get_json()["timezone"] == "Asia/Tokyo"
 
 
+def test_proactive_state_three_switch_contract_drives_v2_scheduled_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_proactive_three_switch_key"
+    user_id = "usr_endpoint_proactive_three_switch"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    resp = client.post(
+        "/v1/proactive/state",
+        headers=headers,
+        json={
+            "ambient": False,
+            "scheduled": False,
+            "reminders_delivery": False,
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["ambient"] is False
+    assert body["scheduled"] is False
+    assert body["reminders_delivery"] is False
+    assert body["enabled"] is False
+    assert body["dnd"] is True
+
+    got = client.get("/v1/proactive/state", headers=headers)
+    assert got.status_code == 200
+    state = got.get_json()
+    assert state["ambient"] is False
+    assert state["scheduled"] is False
+    assert state["reminders_delivery"] is False
+
+    settings = appmod.get_store(user_id).load_proactive_settings()
+    assert settings["enabled"] is False
+    assert settings["scheduled"] is False
+    assert settings["dnd"] is True
+
+    resolved = resolve_settings_v2(settings)
+    assert resolved.switches() == {
+        "ambient": False,
+        "scheduled": False,
+        "reminders_delivery": False,
+    }
+    decision = evaluate_wake_control_v2("scheduled_wake", settings=resolved)
+    assert decision.accepted is False
+    assert decision.reason == "scheduled_disabled"
+    assert decision.transparency_required is True
+
+
+def test_proactive_tick_delivery_off_still_allows_presence_wake(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_proactive_delivery_off_wake_key"
+    user_id = "usr_endpoint_proactive_delivery_off_wake"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    state = client.post(
+        "/v1/proactive/state",
+        headers=headers,
+        json={"reminders_delivery": False},
+    )
+    assert state.status_code == 200
+    assert state.get_json()["reminders_delivery"] is False
+    assert state.get_json()["dnd"] is True
+
+    tick = client.post(
+        "/v1/proactive/tick",
+        headers=headers,
+        json={"trigger": "heartbeat_broadcast_off", "broadcast_state": "off"},
+    )
+
+    assert tick.status_code == 200
+    body = tick.get_json()
+    assert body["enqueued"] is True
+    assert body["decision"]["reason"] == "wake_created"
+    assert body["decision"]["wake_kind"] == "presence"
+
+
 def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_proactive_key"
@@ -422,9 +533,80 @@ def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
     assert b"Hidden Jobs" in page_en.data
 
 
+def test_screen_watch_tick_preserves_job_kind_and_trigger(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_screen_watch_key"
+    user_id = "usr_screen_watch"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    resp = client.post(
+        "/v1/proactive/tick",
+        headers={"X-API-Key": api_key},
+        json={
+            "job_kind": "screen_watch",
+            "broadcast_state": "on",
+            "frames": [
+                {"frame_id": "swframe00000001", "ts": appmod.time.time(), "ocr_text": "Settings"},
+            ],
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["enqueued"] is True
+    assert body["decision"]["job_kind"] == "screen_watch"
+    assert body["decision"]["trigger"] == "screen_watch"
+    assert body["decision"]["wake_kind"] == "screen_watch"
+    assert body["decision"]["manual"] is False
+    assert body["decision"]["forced"] is False
+    assert body["job"]["job_kind"] == "screen_watch"
+    assert body["job"]["trigger"] == "screen_watch"
+    assert body["job"]["frame_ids"] == ["swframe00000001"]
+
+    poll = client.get("/v1/proactive/jobs/poll?since=0&timeout=0", headers={"X-API-Key": api_key})
+    assert poll.status_code == 200
+    jobs = poll.get_json()["jobs"]
+    assert jobs[0]["job_kind"] == "screen_watch"
+    assert jobs[0]["trigger"] == "screen_watch"
+
+
+def test_screen_watch_tick_does_not_sample_recent_frames_implicitly(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    monkeypatch.setattr(
+        appmod.screen_frames,
+        "_recent_frame_meta",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("screen_watch must not sample frames")),
+    )
+
+    api_key = "test_screen_watch_no_sample_key"
+    user_id = "usr_screen_watch_no_sample"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    resp = client.post(
+        "/v1/proactive/tick",
+        headers={"X-API-Key": api_key},
+        json={"job_kind": "screen_watch", "broadcast_state": "on"},
+    )
+
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["enqueued"] is True
+    assert body["decision"]["job_kind"] == "screen_watch"
+    assert body["decision"]["trigger"] == "screen_watch"
+    assert body["decision"]["frame_ids"] == []
+    assert body["job"]["job_kind"] == "screen_watch"
+    assert body["job"]["frame_ids"] == []
+
+
 def test_auto_proactive_v2_wake_samples_frames_without_gate_llm(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(proactive_dashboard, "OPENROUTER_API_KEY", "sk-test")
     appmod._stores.clear()
 
     monkeypatch.setattr(
@@ -463,8 +645,8 @@ def test_auto_proactive_v2_wake_samples_frames_without_gate_llm(tmp_path, monkey
 
 
 def test_auto_proactive_v2_wake_does_not_block_after_recent_user_chat(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(proactive_dashboard, "OPENROUTER_API_KEY", "sk-test")
     appmod._stores.clear()
 
     api_key = "test_proactive_recent_chat_key"
@@ -499,8 +681,8 @@ def test_auto_proactive_v2_wake_does_not_block_after_recent_user_chat(tmp_path, 
 
 
 def test_auto_proactive_v2_wake_does_not_require_gate_model(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "OPENROUTER_API_KEY", "")
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(proactive_dashboard, "OPENROUTER_API_KEY", "")
     appmod._stores.clear()
 
     api_key = "test_proactive_auto_no_model_key"
@@ -527,7 +709,7 @@ def test_auto_proactive_v2_wake_does_not_require_gate_model(tmp_path, monkeypatc
 
 
 def test_auto_proactive_v2_wake_suppresses_job_without_frames(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_proactive_auto_false_key"
@@ -550,7 +732,7 @@ def test_auto_proactive_v2_wake_suppresses_job_without_frames(tmp_path, monkeypa
 
 
 def test_auto_proactive_v2_schedule_heartbeats_split_presence_and_screen_wakes(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_proactive_auto_schedule_key"
@@ -600,13 +782,13 @@ def test_auto_proactive_v2_schedule_heartbeats_split_presence_and_screen_wakes(t
     on_body = on_with_frame.get_json()
     assert on_body["enqueued"] is True
     assert on_body["decision"]["reason"] == "wake_created"
-    assert on_body["decision"]["wake_kind"] == "screen"
-    assert on_body["decision"]["screen_context_available"] is True
-    assert on_body["job"]["frame_ids"] == ["frameon123456789"]
+    assert on_body["decision"]["wake_kind"] == "presence"
+    assert on_body["decision"]["screen_context_available"] is False
+    assert on_body["job"]["frame_ids"] == []
 
 
-def test_auto_proactive_v2_away_suppresses_automatic_but_manual_bypasses(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+def test_auto_proactive_v2_away_state_does_not_resurrect_legacy_wake_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_proactive_away_key"
@@ -617,12 +799,17 @@ def test_auto_proactive_v2_away_suppresses_automatic_but_manual_bypasses(tmp_pat
     headers = {"X-API-Key": api_key}
     client.post("/v1/proactive/state", headers=headers, json={"user_state": "away"})
 
-    auto = client.post("/v1/proactive/tick", headers=headers, json={})
+    auto = client.post(
+        "/v1/proactive/tick",
+        headers=headers,
+        json={"trigger": "heartbeat_broadcast_off", "broadcast_state": "off"},
+    )
     assert auto.status_code == 200
     auto_body = auto.get_json()
-    assert auto_body["enqueued"] is False
-    assert auto_body["decision"]["should_wake_agent"] is False
-    assert auto_body["decision"]["reason"] == "user_away"
+    assert auto_body["enqueued"] is True
+    assert auto_body["decision"]["should_wake_agent"] is True
+    assert auto_body["decision"]["reason"] == "wake_created"
+    assert auto_body["decision"]["user_state"] == "away"
 
     manual = client.post("/v1/proactive/tick", headers=headers, json={"manual": True})
     assert manual.status_code == 200
@@ -633,7 +820,7 @@ def test_auto_proactive_v2_away_suppresses_automatic_but_manual_bypasses(tmp_pat
 
 
 def test_gate_review_endpoint_records_human_label(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_gate_review_key"
@@ -655,12 +842,13 @@ def test_gate_review_endpoint_records_human_label(tmp_path, monkeypatch):
     resp = client.post(
         f"/v1/proactive/decisions/{decision['decision_id']}/review",
         headers={"X-API-Key": api_key},
-        json={"label": "great_companion_moment", "notes": "felt natural"},
+        json={"label": "good_presence", "notes": "felt natural"},
     )
 
     assert resp.status_code == 200
     review = resp.get_json()["review"]
-    assert review["label"] == "great_companion_moment"
+    assert review["label"] == "good_presence"
+    assert review["label_family"] == "round3"
     assert review["decision_id"] == decision["decision_id"]
 
     snapshot = appmod._proactive_debug_snapshot(store)
@@ -669,11 +857,11 @@ def test_gate_review_endpoint_records_human_label(tmp_path, monkeypatch):
 
     listing = client.get("/v1/proactive/reviews?since=0", headers={"X-API-Key": api_key})
     assert listing.status_code == 200
-    assert listing.get_json()["reviews"][0]["label"] == "great_companion_moment"
+    assert listing.get_json()["reviews"][0]["label"] == "good_presence"
 
 
 def test_proactive_job_claim_and_status_lifecycle(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_proactive_claim_key"
@@ -716,9 +904,905 @@ def test_proactive_job_claim_and_status_lifecycle(tmp_path, monkeypatch):
     assert row["consumer_id"] == "consumer-a"
 
 
+def test_resident_poll_includes_per_user_runtime_v2_profile(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_resident_runtime_profile_key"
+    user_id = "usr_resident_runtime_profile"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    job = store.append_proactive_job({
+        "job_id": "pj_runtime_profile",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 1000.0,
+        "status": "pending",
+        "trigger": "heartbeat_broadcast_on",
+    })
+
+    monkeypatch.setattr(
+        proactive_resident_runtime_v2,
+        "resident_runtime_v2_public_profile",
+        lambda _store: {proactive_resident_runtime_v2.RESIDENT_WAKE_RUNTIME_V2_FLAG: True},
+    )
+
+    client = appmod.app.test_client()
+    poll = client.get("/v1/proactive/jobs/poll?since=0&timeout=0", headers={"X-API-Key": api_key})
+
+    assert poll.status_code == 200
+    body = poll.get_json()
+    assert body["runtime_v2"][proactive_resident_runtime_v2.RESIDENT_WAKE_RUNTIME_V2_FLAG] is True
+    assert body["jobs"][0]["job_id"] == job["job_id"]
+    assert body["jobs"][0]["runtime_v2"][proactive_resident_runtime_v2.RESIDENT_WAKE_RUNTIME_V2_FLAG] is True
+
+
+def test_resident_poll_applies_v2_wake_controls_to_legacy_jobs(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_resident_poll_v2_gate_key"
+    user_id = "usr_resident_poll_v2_gate"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.save_proactive_settings({
+        "ambient": False,
+        "scheduled": False,
+        "reminders_delivery": False,
+    })
+    store.append_proactive_job({
+        "job_id": "pj_photo",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 1000.0,
+        "status": "pending",
+        "trigger": "photo_added",
+    })
+    store.append_proactive_job({
+        "job_id": "pj_scheduled",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 1001.0,
+        "status": "pending",
+        "trigger": "scheduled_wake",
+        "scheduled_note": "check in",
+    })
+    store.append_proactive_job({
+        "job_id": "pj_manual",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 1002.0,
+        "status": "pending",
+        "trigger": "manual_dynamic_island",
+    })
+
+    client = appmod.app.test_client()
+    poll = client.get("/v1/proactive/jobs/poll?since=0&timeout=0", headers={"X-API-Key": api_key})
+
+    assert poll.status_code == 200
+    body = poll.get_json()
+    assert [job["job_id"] for job in body["jobs"]] == ["pj_manual"]
+    rows = {row["job_id"]: row for row in store.list_proactive_jobs(since_epoch=0, limit=0)}
+    assert rows["pj_photo"]["status"] == "skipped"
+    assert rows["pj_photo"]["status_reason"] == "ambient_disabled"
+    assert rows["pj_scheduled"]["status"] == "skipped"
+    assert rows["pj_scheduled"]["status_reason"] == "scheduled_disabled"
+    assert rows["pj_manual"]["status"] == "pending"
+
+
+def test_resident_poll_delivers_introduction_even_when_ambient_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_resident_poll_intro_key"
+    user_id = "usr_resident_poll_intro"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.save_proactive_settings({
+        "ambient": False,
+        "scheduled": False,
+        "reminders_delivery": False,
+    })
+    store.append_proactive_job({
+        "job_id": "pj_intro",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 1000.0,
+        "status": "pending",
+        "trigger": "post_spawn_genesis",
+        "job_kind": "introduction",
+    })
+    store.append_proactive_job({
+        "job_id": "pj_old_normal",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 1001.0,
+        "status": "pending",
+        "trigger": "photo_added",
+    })
+
+    client = appmod.app.test_client()
+    poll = client.get("/v1/proactive/jobs/poll?since=2000&timeout=0", headers={"X-API-Key": api_key})
+
+    assert poll.status_code == 200
+    body = poll.get_json()
+    assert [job["job_id"] for job in body["jobs"]] == ["pj_intro"]
+    rows = {row["job_id"]: row for row in store.list_proactive_jobs(since_epoch=0, limit=0)}
+    assert rows["pj_intro"]["status"] == "pending"
+
+
+def test_capture_job_polls_and_claims_when_ambient_is_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_capture_ambient_off_key"
+    user_id = "usr_capture_ambient_off"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.save_proactive_settings({
+        "ambient": False,
+        "scheduled": False,
+        "reminders_delivery": False,
+    })
+
+    job, enqueued, reason = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="session_break",
+        capture_key="window:ambient-off",
+        window={
+            "after_message_id": "msg_before",
+            "until_message_id": "msg_until",
+            "until_ts": 1200.0,
+            "message_count": 8,
+        },
+        now=1201.0,
+    )
+
+    assert enqueued is True
+    assert reason == "enqueued"
+    assert job is not None
+    assert job["job_id"].startswith("cap_")
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    poll = client.get("/v1/proactive/jobs/poll?since=0&timeout=0", headers=headers)
+
+    assert poll.status_code == 200
+    body = poll.get_json()
+    assert [row["job_id"] for row in body["jobs"]] == [job["job_id"]]
+    assert body["jobs"][0]["job_kind"] == "memory_capture"
+    assert body["jobs"][0]["source"] == "memory_capture"
+
+    claim = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/claim",
+        headers=headers,
+        json={"consumer_id": "capture-consumer"},
+    )
+
+    assert claim.status_code == 200
+    assert claim.get_json()["claimed"] is True
+    assert claim.get_json()["job"]["status"] == "claimed"
+
+    status = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json={
+            "status": "completed",
+            "consumer_id": "capture-consumer",
+            "reason": "nothing_worth_keeping",
+            "capture_result": {"status": "noop", "reason": "nothing_worth_keeping"},
+            "capture_window": job["window"],
+            "memory_action_status": {"status": "not_run"},
+            "cards_added": 0,
+            "cards_superseded": 0,
+            "noop_reason": "nothing_worth_keeping",
+        },
+    )
+
+    assert status.status_code == 200
+    patched = status.get_json()["job"]
+    assert patched["capture_result"] == {"status": "noop", "reason": "nothing_worth_keeping"}
+    assert patched["capture_window"]["until_message_id"] == "msg_until"
+    assert patched["memory_action_status"] == {"status": "not_run"}
+    assert patched["cards_added"] == 0
+    assert patched["cards_superseded"] == 0
+    assert patched["noop_reason"] == "nothing_worth_keeping"
+
+
+def test_capture_enqueue_single_flight_per_user(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    store = appmod.UserStore("usr_capture_single_flight")
+
+    first, first_enqueued, first_reason = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="session_break",
+        capture_key="window:first",
+        window={"until_message_id": "msg_1", "until_ts": 100.0, "message_count": 3},
+        now=101.0,
+    )
+    second, second_enqueued, second_reason = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="quiet_timeout",
+        capture_key="window:second",
+        window={"until_message_id": "msg_2", "until_ts": 200.0, "message_count": 5},
+        now=201.0,
+    )
+
+    assert first_enqueued is True
+    assert first_reason == "enqueued"
+    assert second_enqueued is False
+    assert second_reason == "capture_already_pending"
+    assert second["job_id"] == first["job_id"]
+    jobs = [row for row in store.list_proactive_jobs(since_epoch=0, limit=0) if row.get("job_kind") == "memory_capture"]
+    assert len(jobs) == 1
+
+
+def test_capture_enqueue_is_idempotent_by_capture_key(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    store = appmod.UserStore("usr_capture_idempotent")
+
+    first, first_enqueued, _reason = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="session_break",
+        capture_key="window:same",
+        window={"until_message_id": "msg_1", "until_ts": 100.0, "message_count": 3},
+        now=101.0,
+    )
+    store.update_proactive_job(first["job_id"], {"status": "completed"})
+    second, second_enqueued, second_reason = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="quiet_timeout",
+        capture_key="window:same",
+        window={"until_message_id": "msg_1", "until_ts": 100.0, "message_count": 3},
+        now=301.0,
+    )
+
+    assert first_enqueued is True
+    assert second_enqueued is False
+    assert second_reason == "duplicate_capture_key"
+    assert second["job_id"] == first["job_id"]
+    jobs = [row for row in store.list_proactive_jobs(since_epoch=0, limit=0) if row.get("job_kind") == "memory_capture"]
+    assert len(jobs) == 1
+
+
+def test_capture_failed_window_retries_same_key(tmp_path, monkeypatch):
+    # Regression: a FAILED capture window must be retryable. Previously the
+    # terminal failed job matched as duplicate_capture_key forever (and re-armed
+    # pending_capture_key) -> permanent capture_already_pending, window never
+    # re-captured.
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    store = appmod.UserStore("usr_capture_failed_retry")
+
+    first, first_enqueued, _ = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="session_break",
+        capture_key="window:same",
+        window={"until_message_id": "msg_1", "until_ts": 100.0, "message_count": 3},
+        now=101.0,
+    )
+    store.update_proactive_job(first["job_id"], {"status": "failed"})
+
+    second, second_enqueued, second_reason = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="quiet_timeout",
+        capture_key="window:same",
+        window={"until_message_id": "msg_1", "until_ts": 100.0, "message_count": 3},
+        now=301.0,
+    )
+    assert first_enqueued is True
+    assert second_enqueued is True  # failed window IS retried
+    assert second_reason == "enqueued"
+    assert second["job_id"] != first["job_id"]  # a fresh job …
+    assert second["capture_key"] == first["capture_key"]  # … for the same window
+
+    # While the retry is in flight it's the latest same-key job -> single-flighted,
+    # so retries don't pile up.
+    third, third_enqueued, third_reason = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="quiet_timeout",
+        capture_key="window:same",
+        window={"until_message_id": "msg_1", "until_ts": 100.0, "message_count": 3},
+        now=401.0,
+    )
+    assert third_enqueued is False
+    assert third_reason == "duplicate_capture_key"
+    assert third["job_id"] == second["job_id"]
+    jobs = [row for row in store.list_proactive_jobs(since_epoch=0, limit=0) if row.get("job_kind") == "memory_capture"]
+    assert len(jobs) == 2  # first(failed) + second(pending) — no pile-up
+
+
+def test_dream_failed_window_retries_same_key(tmp_path, monkeypatch):
+    # Same scheduler-correctness fix as capture, for dream: a failed dream must be
+    # retryable and must not permanently lock dream_already_pending.
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    store = appmod.UserStore("usr_dream_failed_retry")
+
+    first, first_enqueued, _ = proactive_capture_jobs.enqueue_memory_dream_job(
+        store, trigger="nightly_dream", dream_key="dream:same", now=101.0,
+    )
+    store.update_proactive_job(first["job_id"], {"status": "failed"})
+
+    second, second_enqueued, second_reason = proactive_capture_jobs.enqueue_memory_dream_job(
+        store, trigger="nightly_dream", dream_key="dream:same", now=301.0,
+    )
+    assert first_enqueued is True
+    assert second_enqueued is True  # failed dream IS retried
+    assert second_reason == "enqueued"
+    assert second["job_id"] != first["job_id"]
+
+    third, third_enqueued, third_reason = proactive_capture_jobs.enqueue_memory_dream_job(
+        store, trigger="nightly_dream", dream_key="dream:same", now=401.0,
+    )
+    assert third_enqueued is False  # retry in flight -> single-flighted
+    assert third_reason == "duplicate_dream_key"
+    assert third["job_id"] == second["job_id"]
+    jobs = [row for row in store.list_proactive_jobs(since_epoch=0, limit=0) if row.get("job_kind") == "memory_dream"]
+    assert len(jobs) == 2  # no pile-up
+
+
+def _capture_test_envelope(user_id: str, msg_id: str) -> dict:
+    return {
+        "id": msg_id,
+        "v": 1,
+        "body_ct": "ct",
+        "nonce": "nonce",
+        "K_user": "k-user",
+        "K_enclave": "k-enclave",
+        "visibility": "shared",
+        "owner_user_id": user_id,
+    }
+
+
+def _memory_capture_jobs(store) -> list[dict]:
+    return [
+        row for row in store.list_proactive_jobs(since_epoch=0, limit=0)
+        if row.get("job_kind") == "memory_capture"
+    ]
+
+
+def _memory_dream_jobs(store) -> list[dict]:
+    return [
+        row for row in store.list_proactive_jobs(since_epoch=0, limit=0)
+        if row.get("job_kind") == "memory_dream"
+    ]
+
+
+def _dream_test_memory(user_id: str, memory_id: str, *, occurred_at: str = "2026-06-20T00:00:00Z") -> dict:
+    return {
+        "v": 1,
+        "id": memory_id,
+        "type": "fact",
+        "owner_user_id": user_id,
+        "visibility": "shared",
+        "body_ct": f"ct_{memory_id}",
+        "nonce": f"nonce_{memory_id}",
+        "K_user": f"ku_{memory_id}",
+        "K_enclave": f"ke_{memory_id}",
+        "occurred_at": occurred_at,
+        "created_at": occurred_at,
+        "updated_at": occurred_at,
+        "status": "active",
+        "importance": 0.6,
+        "pulse": 0.3,
+    }
+
+
+def test_dream_tick_threshold_single_flight_and_ambient_off_poll(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "3")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "0")
+    appmod._stores.clear()
+
+    api_key = "test_dream_tick_key"
+    user_id = "usr_dream_tick"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.save_proactive_settings({
+        "ambient": False,
+        "scheduled": False,
+        "reminders_delivery": False,
+    })
+    appmod.db.memory_replace_all(user_id, [
+        _dream_test_memory(user_id, "mem_a"),
+        _dream_test_memory(user_id, "mem_b"),
+    ])
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    not_due = client.post("/v1/dream/tick", headers=headers, json={"now": 1000.0})
+
+    assert not_due.status_code == 200
+    assert not_due.get_json()["enqueued"] is False
+    assert not_due.get_json()["reason"] == "not_enough_new_cards"
+    assert _memory_dream_jobs(store) == []
+
+    appmod.db.memory_replace_all(user_id, [
+        _dream_test_memory(user_id, "mem_a"),
+        _dream_test_memory(user_id, "mem_b"),
+        _dream_test_memory(user_id, "mem_c"),
+    ])
+    queued = client.post("/v1/dream/tick", headers=headers, json={"now": 1100.0})
+    duplicate = client.post("/v1/dream/tick", headers=headers, json={"now": 1101.0})
+    poll = client.get("/v1/proactive/jobs/poll?since=0&timeout=0", headers=headers)
+
+    assert queued.status_code == 200
+    assert queued.get_json()["enqueued"] is True
+    assert queued.get_json()["job"]["job_kind"] == "memory_dream"
+    assert duplicate.status_code == 200
+    assert duplicate.get_json()["enqueued"] is False
+    assert duplicate.get_json()["reason"] == "dream_already_pending"
+    assert len(_memory_dream_jobs(store)) == 1
+    assert poll.status_code == 200
+    assert [job["job_id"] for job in poll.get_json()["jobs"]] == [queued.get_json()["job"]["job_id"]]
+    assert poll.get_json()["jobs"][0]["source"] == "memory_dream"
+
+
+def test_dream_enqueue_idempotent_by_key_and_single_flight(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    store = appmod.UserStore("usr_dream_idempotent")
+
+    first, first_enqueued, first_reason = proactive_capture_jobs.enqueue_memory_dream_job(
+        store,
+        trigger="nightly_dream",
+        dream_key="dream:same",
+        dream_until={"signature": "sig_a"},
+        dream_stats={"card_count": 3, "signature": "sig_a"},
+        now=100.0,
+    )
+    store.update_proactive_job(first["job_id"], {"status": "completed"})
+    duplicate, duplicate_enqueued, duplicate_reason = proactive_capture_jobs.enqueue_memory_dream_job(
+        store,
+        trigger="nightly_dream",
+        dream_key="dream:same",
+        dream_until={"signature": "sig_a"},
+        dream_stats={"card_count": 3, "signature": "sig_a"},
+        now=200.0,
+    )
+    second, second_enqueued, second_reason = proactive_capture_jobs.enqueue_memory_dream_job(
+        store,
+        trigger="nightly_dream",
+        dream_key="dream:second",
+        dream_until={"signature": "sig_b"},
+        dream_stats={"card_count": 4, "signature": "sig_b"},
+        now=300.0,
+    )
+    third, third_enqueued, third_reason = proactive_capture_jobs.enqueue_memory_dream_job(
+        store,
+        trigger="nightly_dream",
+        dream_key="dream:third",
+        dream_until={"signature": "sig_c"},
+        dream_stats={"card_count": 5, "signature": "sig_c"},
+        now=400.0,
+    )
+
+    assert first_enqueued is True
+    assert first_reason == "enqueued"
+    assert duplicate_enqueued is False
+    assert duplicate_reason == "duplicate_dream_key"
+    assert duplicate["job_id"] == first["job_id"]
+    assert second_enqueued is True
+    assert second_reason == "enqueued"
+    assert third_enqueued is False
+    assert third_reason == "dream_already_pending"
+    assert third["job_id"] == second["job_id"]
+    assert len(_memory_dream_jobs(store)) == 2
+
+
+def test_dream_completion_advances_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_DREAM_NIGHT_ONLY", "false")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_NEW_CARDS", "1")
+    monkeypatch.setenv("FEEDLING_DREAM_MIN_INTERVAL_SEC", "0")
+    appmod._stores.clear()
+
+    api_key = "test_dream_completion_key"
+    user_id = "usr_dream_completion"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    appmod.db.memory_replace_all(user_id, [_dream_test_memory(user_id, "mem_done")])
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    first = client.post("/v1/dream/tick", headers=headers, json={"now": 2000.0})
+    job = first.get_json()["job"]
+    done = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json={
+            "status": "completed",
+            "reason": "dream_nothing_to_consolidate",
+            "dream_result": {"status": "noop"},
+            "cards_merged": 0,
+            "cards_superseded": 0,
+            "questions": ["ask later"],
+            "noop_reason": "dream_nothing_to_consolidate",
+        },
+    )
+    second = client.post("/v1/dream/tick", headers=headers, json={"now": 2100.0})
+
+    assert first.status_code == 200
+    assert first.get_json()["enqueued"] is True
+    assert done.status_code == 200
+    patched = done.get_json()["job"]
+    assert patched["dream_result"] == {"status": "noop"}
+    assert patched["questions"] == ["ask later"]
+    state = proactive_dream_scheduler.load_dream_state(store)
+    assert state["pending_dream_key"] == ""
+    assert state["last_dream_completed_at"] > 0
+    assert state["last_dreamed_card_count"] == 1
+    assert second.status_code == 200
+    assert second.get_json()["enqueued"] is False
+    assert second.get_json()["reason"] == "already_dreamed"
+
+
+def test_capture_coordinator_dedupes_same_window_across_signals(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_CAPTURE_TURN_BACKSTOP", "1")
+    monkeypatch.setenv("FEEDLING_CAPTURE_QUIET_SEC", "0")
+    monkeypatch.setenv("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", "0")
+    appmod._stores.clear()
+
+    api_key = "test_capture_dedupe_key"
+    user_id = "usr_capture_dedupe"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+
+    msg = store.append_chat("user", "chat", _capture_test_envelope(user_id, "msg_capture_dedupe"))
+    first_jobs = _memory_capture_jobs(store)
+    assert len(first_jobs) == 1
+    assert first_jobs[0]["trigger"] == "turn_backstop"
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    background = client.post(
+        "/v1/device/events",
+        headers=headers,
+        json={
+            "source": "ios",
+            "type": "app_presence",
+            "payload": {"scene_phase": "background", "is_chat_visible": False},
+        },
+    )
+    quiet = client.post(
+        "/v1/capture/tick",
+        headers=headers,
+        json={"now": float(msg["ts"]) + 30.0},
+    )
+
+    assert background.status_code == 200
+    assert quiet.status_code == 200
+    assert background.get_json()["capture"]["enqueued"] is False
+    assert quiet.get_json()["enqueued"] is False
+    assert len(_memory_capture_jobs(store)) == 1
+
+
+def test_capture_quiet_tick_noops_without_new_messages(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_capture_quiet_noop_key"
+    user_id = "usr_capture_quiet_noop"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    client = appmod.app.test_client()
+
+    resp = client.post(
+        "/v1/capture/tick",
+        headers={"X-API-Key": api_key},
+        json={"now": 2000.0},
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["enqueued"] is False
+    assert resp.get_json()["reason"] == "no_new_messages"
+    assert _memory_capture_jobs(appmod.get_store(user_id)) == []
+
+
+def test_capture_turn_backstop_enqueues_only_when_due(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_CAPTURE_TURN_BACKSTOP", "2")
+    monkeypatch.setenv("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", "0")
+    store = appmod.UserStore("usr_capture_turn_backstop")
+
+    store.append_chat("user", "chat", _capture_test_envelope(store.user_id, "msg_turn_1"))
+    assert _memory_capture_jobs(store) == []
+
+    store.append_chat("user", "chat", _capture_test_envelope(store.user_id, "msg_turn_2"))
+    jobs = _memory_capture_jobs(store)
+
+    assert len(jobs) == 1
+    assert jobs[0]["trigger"] == "turn_backstop"
+    assert jobs[0]["window"]["until_message_id"] == "msg_turn_2"
+    assert jobs[0]["window"]["message_count"] == 2
+
+
+def test_capture_device_boundary_ignores_proactive_switches(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_CAPTURE_TURN_BACKSTOP", "999")
+    monkeypatch.setenv("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", "0")
+    appmod._stores.clear()
+
+    api_key = "test_capture_switches_off_key"
+    user_id = "usr_capture_switches_off"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.save_proactive_settings({
+        "ambient": False,
+        "scheduled": False,
+        "reminders_delivery": False,
+    })
+    store.append_chat("user", "chat", _capture_test_envelope(user_id, "msg_switches_off"))
+
+    resp = appmod.app.test_client().post(
+        "/v1/device/events",
+        headers={"X-API-Key": api_key},
+        json={
+            "source": "ios",
+            "type": "app_presence",
+            "payload": {"scene_phase": "background", "is_chat_visible": False},
+        },
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["capture"]["enqueued"] is True
+    assert len(_memory_capture_jobs(store)) == 1
+
+
+def test_capture_completion_advances_state_and_blocks_same_window(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setenv("FEEDLING_CAPTURE_TURN_BACKSTOP", "999")
+    monkeypatch.setenv("FEEDLING_CAPTURE_QUIET_SEC", "0")
+    monkeypatch.setenv("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", "0")
+    appmod._stores.clear()
+
+    api_key = "test_capture_completion_key"
+    user_id = "usr_capture_completion"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    msg = store.append_chat("user", "chat", _capture_test_envelope(user_id, "msg_capture_done"))
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    first = client.post(
+        "/v1/device/events",
+        headers=headers,
+        json={
+            "source": "ios",
+            "type": "app_presence",
+            "payload": {"scene_phase": "background", "is_chat_visible": False},
+        },
+    )
+    job = first.get_json()["capture"]["job"]
+    full_job = _memory_capture_jobs(store)[0]
+    done = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/status",
+        headers=headers,
+        json={
+            "status": "completed",
+            "reason": "nothing_worth_keeping",
+            "capture_window": full_job["window"],
+            "capture_result": {"status": "noop", "reason": "nothing_worth_keeping"},
+        },
+    )
+    second = client.post(
+        "/v1/capture/tick",
+        headers=headers,
+        json={"now": float(msg["ts"]) + 30.0},
+    )
+
+    assert first.status_code == 200
+    assert first.get_json()["capture"]["enqueued"] is True
+    assert done.status_code == 200
+    state = proactive_capture_scheduler.load_capture_state(store)
+    assert state["pending_capture_key"] == ""
+    assert state["last_captured_until_message_id"] == "msg_capture_done"
+    assert state["turns_since_capture"] == 0
+    assert second.status_code == 200
+    assert second.get_json()["enqueued"] is False
+    assert second.get_json()["reason"] in {"no_new_messages", "already_captured"}
+    assert len(_memory_capture_jobs(store)) == 1
+
+
+def test_resident_scheduled_fire_endpoint_queues_due_timer_job(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+    scheduled_store, _settings_by_user = _patch_resident_scheduled_route_dependencies(monkeypatch)
+
+    api_key = "test_resident_scheduled_fire_key"
+    user_id = "usr_resident_scheduled_fire"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    scheduled = client.post(
+        "/v1/proactive/scheduled/actions",
+        headers=headers,
+        json={
+            "actions": [{
+                "type": "schedule_wake",
+                "at": "2000-01-01T00:00:00+00:00",
+                "tz": "UTC",
+                "note": "take meds",
+            }],
+            "turn_id": "turn_test",
+            "wake_ids": ["wake_original"],
+        },
+    )
+    assert scheduled.status_code == 200
+    timer_id = scheduled.get_json()["results"][0]["timer_id"]
+
+    fired = client.post("/v1/proactive/scheduled/fire", headers=headers, json={})
+
+    assert fired.status_code == 200
+    body = fired.get_json()
+    assert body["queued"] == 1
+    assert body["results"][0]["status"] == "fired"
+    assert body["results"][0]["timer_id"] == timer_id
+    job = body["jobs"][0]
+    assert job["trigger"] == "scheduled_wake"
+    assert job["wake_kind"] == "scheduled_wake"
+    assert job["scheduled_note"] == "take meds"
+    assert job["payload"]["v2_wake"]["scheduled_wake"]["wake_id"] == timer_id
+    record = scheduled_store.list_records(user_id)[0]
+    assert record.status == "fired"
+    assert record.fired_wake_id == body["results"][0]["wake_id"]
+
+
+def test_resident_scheduled_fire_endpoint_transparency_when_scheduled_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+    scheduled_store, settings_by_user = _patch_resident_scheduled_route_dependencies(monkeypatch)
+
+    api_key = "test_resident_scheduled_fire_off_key"
+    user_id = "usr_resident_scheduled_fire_off"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    scheduled = client.post(
+        "/v1/proactive/scheduled/actions",
+        headers=headers,
+        json={
+            "actions": [{
+                "type": "schedule_wake",
+                "at": "2000-01-01T00:00:00+00:00",
+                "tz": "UTC",
+                "note": "check in",
+            }],
+        },
+    )
+    assert scheduled.status_code == 200
+    timer_id = scheduled.get_json()["results"][0]["timer_id"]
+    settings_by_user[user_id] = {"scheduled": False}
+
+    fired = client.post("/v1/proactive/scheduled/fire", headers=headers, json={})
+
+    assert fired.status_code == 200
+    body = fired.get_json()
+    assert body["queued"] == 1
+    assert body["results"][0]["status"] == "blocked"
+    assert body["results"][0]["reason"] == "scheduled_disabled"
+    assert body["results"][0]["transparency_wake_id"]
+    job = body["jobs"][0]
+    assert job["trigger"] == "background_result"
+    assert job["intent_label"] == "scheduled_transparency"
+    assert job["wake_kind"] == "background_result"
+    assert job["background_payload"]["reason"] == "scheduled_disabled"
+    assert job["background_payload"]["timer"]["wake_id"] == timer_id
+    record = scheduled_store.list_records(user_id)[0]
+    assert record.status == "blocked"
+    assert record.block_reason == "scheduled_disabled"
+    assert record.transparency_wake_id == body["results"][0]["transparency_wake_id"]
+
+
+def test_resident_scheduled_fire_endpoint_ignores_future_timer(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+    scheduled_store, _settings_by_user = _patch_resident_scheduled_route_dependencies(monkeypatch)
+
+    api_key = "test_resident_scheduled_future_key"
+    user_id = "usr_resident_scheduled_future"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    scheduled = client.post(
+        "/v1/proactive/scheduled/actions",
+        headers=headers,
+        json={
+            "actions": [{
+                "type": "schedule_wake",
+                "at": "2999-01-01T00:00:00+00:00",
+                "tz": "UTC",
+                "note": "future",
+            }],
+        },
+    )
+    assert scheduled.status_code == 200
+
+    fired = client.post("/v1/proactive/scheduled/fire", headers=headers, json={})
+
+    assert fired.status_code == 200
+    body = fired.get_json()
+    assert body["queued"] == 0
+    assert body["results"] == []
+    assert body["jobs"] == []
+    record = scheduled_store.list_records(user_id)[0]
+    assert record.status == "pending"
+
+
+def test_resident_stale_claim_is_recovered_and_old_consumer_cannot_complete(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    now = 5000.0
+    api_key = "test_resident_stale_reclaim_key"
+    user_id = "usr_resident_stale_reclaim"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.append_proactive_job({
+        "job_id": "pj_stale_resident",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 100.0,
+        "status": "claimed",
+        "consumer_id": "resident-a",
+        "claimed_at": str(now - proactive_routes.RESIDENT_WAKE_LEASE_SEC - 1),
+        "trigger": "heartbeat_broadcast_on",
+    })
+    monkeypatch.setattr(proactive_routes.time, "time", lambda: now)
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    poll = client.get("/v1/proactive/jobs/poll?since=0&timeout=0", headers=headers)
+
+    assert poll.status_code == 200
+    jobs = poll.get_json()["jobs"]
+    assert [job["job_id"] for job in jobs] == ["pj_stale_resident"]
+    recovered = jobs[0]
+    assert recovered["status"] == "pending"
+    assert recovered["status_reason"] == "resident_stale_claim_recovered"
+    assert recovered["consumer_id"] == "recovered:resident-a"
+    assert recovered.get("recovered_at")
+
+    stale_status = client.post(
+        "/v1/proactive/jobs/pj_stale_resident/status",
+        headers=headers,
+        json={"status": "posted", "consumer_id": "resident-a"},
+    )
+    assert stale_status.status_code == 409
+    assert stale_status.get_json()["error"] == "consumer_mismatch"
+
+
+def test_resident_reaper_does_not_reclaim_hosted_claims(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    now = 6000.0
+    api_key = "test_resident_reaper_hosted_key"
+    user_id = "usr_resident_reaper_hosted"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.append_proactive_job({
+        "job_id": "pj_hosted_claim",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 100.0,
+        "status": "claimed",
+        "consumer_id": "hosted_runtime_v2",
+        "claimed_at": str(now - proactive_routes.RESIDENT_WAKE_LEASE_SEC - 1),
+        "trigger": "heartbeat_broadcast_on",
+    })
+    monkeypatch.setattr(proactive_routes.time, "time", lambda: now)
+
+    client = appmod.app.test_client()
+    poll = client.get(
+        "/v1/proactive/jobs/poll?since=0&timeout=0",
+        headers={"X-API-Key": api_key},
+    )
+
+    assert poll.status_code == 200
+    assert poll.get_json()["jobs"] == []
+    row = store.list_proactive_jobs(since_epoch=0, limit=0)[0]
+    assert row["status"] == "claimed"
+    assert row["consumer_id"] == "hosted_runtime_v2"
+
+
 def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
     appmod._stores.clear()
 
     sent_push_types = []
@@ -727,7 +1811,7 @@ def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeyp
         sent_push_types.append(push_type)
         return {"status": "delivered"}
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     api_key = "test_proactive_delivery_key"
     user_id = "usr_endpoint_proactive_delivery"
@@ -785,9 +1869,81 @@ def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeyp
     assert msg["live_activity_status"] == "delivered"
 
 
+def test_proactive_chat_response_delivery_off_writes_chat_without_push(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    appmod._stores.clear()
+
+    sent_push_types = []
+
+    def _fake_send_apns(device_token, payload, push_type, topic, **_kwargs):
+        sent_push_types.append(push_type)
+        return {"status": "delivered"}
+
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
+
+    api_key = "test_proactive_delivery_off_key"
+    user_id = "usr_endpoint_proactive_delivery_off"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.save_proactive_settings({"reminders_delivery": False})
+    store.tokens = [
+        {
+            "type": "live_activity",
+            "token": "live-token",
+            "activity_id": "activity_1",
+            "status": "active",
+            "registered_at": "2026-05-24T00:00:00",
+        },
+        {
+            "type": "device",
+            "token": "device-token",
+            "status": "active",
+            "registered_at": "2026-05-24T00:00:00",
+        },
+    ]
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+    envelope = {
+        "id": "msg_delivery_off_1",
+        "v": 1,
+        "body_ct": "ct",
+        "nonce": "nonce",
+        "K_user": "k-user",
+        "K_enclave": "k-enclave",
+        "visibility": "shared",
+        "owner_user_id": user_id,
+    }
+
+    resp = client.post(
+        "/v1/chat/response",
+        headers=headers,
+        json={
+            "envelope": envelope,
+            "source": appmod.PROACTIVE_JOB_SOURCE,
+            "gate_decision_id": "gd_delivery_off",
+            "proactive_job_id": "pj_delivery_off",
+            "alert_body": "这条应该静默写入。",
+            "push_live_activity": True,
+            "push_body": "这条应该静默写入。",
+        },
+    )
+
+    assert resp.status_code == 200
+    assert sent_push_types == []
+    snapshot = appmod._proactive_debug_snapshot(store)
+    msg = snapshot["proactive_messages"][0]
+    assert msg["alert_preview"] == "这条应该静默写入。"
+    assert msg["push_decision"] == "suppressed"
+    assert msg["push_reason"] == "reminders_delivery_disabled"
+    assert msg["alert_status"] == "suppressed"
+    assert msg["live_activity_status"] == "suppressed"
+
+
 def test_ai_chat_response_pushes_when_app_background(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
     appmod._stores.clear()
 
     sent = []
@@ -800,7 +1956,7 @@ def test_ai_chat_response_pushes_when_app_background(tmp_path, monkeypatch):
         })
         return {"status": "delivered"}
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     api_key = "test_ai_push_background_key"
     user_id = "usr_ai_push_background"
@@ -860,8 +2016,8 @@ def test_ai_chat_response_pushes_when_app_background(tmp_path, monkeypatch):
 
 
 def test_ai_chat_response_suppresses_push_when_app_foreground(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
     appmod._stores.clear()
 
     sent = []
@@ -870,7 +2026,7 @@ def test_ai_chat_response_suppresses_push_when_app_foreground(tmp_path, monkeypa
         sent.append(push_type)
         return {"status": "delivered"}
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     api_key = "test_ai_push_foreground_key"
     user_id = "usr_ai_push_foreground"
@@ -916,8 +2072,8 @@ def test_ai_chat_response_suppresses_push_when_app_foreground(tmp_path, monkeypa
 
 
 def test_chat_history_supports_lightweight_images_and_before_cursor(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "CHAT_HISTORY_INLINE_BODY_CT_MAX", 64)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(chat_service, "CHAT_HISTORY_INLINE_BODY_CT_MAX", 64)
     appmod._stores.clear()
 
     api_key = "test_chat_history_lightweight_key"
@@ -1019,8 +2175,8 @@ def test_chat_history_supports_lightweight_images_and_before_cursor(tmp_path, mo
 
 
 def test_proactive_chat_response_uses_push_to_start_when_start_window_open(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
     appmod._stores.clear()
 
     sent = []
@@ -1035,7 +2191,7 @@ def test_proactive_chat_response_uses_push_to_start_when_start_window_open(tmp_p
         })
         return {"status": "delivered"}
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     api_key = "test_proactive_start_key"
     user_id = "usr_endpoint_proactive_start"
@@ -1110,8 +2266,8 @@ def test_proactive_chat_response_uses_push_to_start_when_start_window_open(tmp_p
 
 
 def test_proactive_chat_response_uses_update_during_start_cooldown(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
-    monkeypatch.setattr(appmod, "_gate_bootstrap_for_chat", lambda store, **_: None)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", lambda store, **_: None)
     appmod._stores.clear()
 
     sent = []
@@ -1126,7 +2282,7 @@ def test_proactive_chat_response_uses_update_during_start_cooldown(tmp_path, mon
         })
         return {"status": "delivered"}
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     api_key = "test_proactive_update_key"
     user_id = "usr_endpoint_proactive_update"
@@ -1199,9 +2355,9 @@ def test_proactive_chat_response_uses_update_during_start_cooldown(tmp_path, mon
 
 
 def test_apns_retries_production_when_sandbox_rejects_testflight_token(monkeypatch):
-    monkeypatch.setattr(appmod, "APNS_KEY", "test-key")
-    monkeypatch.setattr(appmod, "APNS_SANDBOX", True)
-    monkeypatch.setattr(appmod, "_make_apns_jwt", lambda: "jwt")
+    monkeypatch.setattr(push_apns, "APNS_KEY", "test-key")
+    monkeypatch.setattr(push_apns, "APNS_SANDBOX", True)
+    monkeypatch.setattr(push_apns, "_make_apns_jwt", lambda: "jwt")
 
     calls = []
 
@@ -1243,9 +2399,9 @@ def test_apns_retries_production_when_sandbox_rejects_testflight_token(monkeypat
 
 
 def test_apns_retries_production_when_sandbox_returns_bad_environment_key(monkeypatch):
-    monkeypatch.setattr(appmod, "APNS_KEY", "test-key")
-    monkeypatch.setattr(appmod, "APNS_SANDBOX", True)
-    monkeypatch.setattr(appmod, "_make_apns_jwt", lambda: "jwt")
+    monkeypatch.setattr(push_apns, "APNS_KEY", "test-key")
+    monkeypatch.setattr(push_apns, "APNS_SANDBOX", True)
+    monkeypatch.setattr(push_apns, "_make_apns_jwt", lambda: "jwt")
 
     calls = []
 
@@ -1287,7 +2443,7 @@ def test_apns_retries_production_when_sandbox_returns_bad_environment_key(monkey
 
 
 def test_chat_alert_falls_back_from_bad_latest_device_token(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_bad_device_token_key"
@@ -1317,7 +2473,7 @@ def test_chat_alert_falls_back_from_bad_latest_device_token(tmp_path, monkeypatc
             return {"status": "delivered", "apns_env": "production"}
         return {"status": "error", "code": 400, "reason": '{"reason":"BadDeviceToken"}', "apns_env": "production"}
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     result = appmod._send_chat_alert(store, "hello", alert_title="Dora")
 
@@ -1332,7 +2488,7 @@ def test_chat_alert_falls_back_from_bad_latest_device_token(tmp_path, monkeypatc
 
 
 def test_live_activity_falls_back_from_topic_mismatch_token(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_bad_live_activity_token_key"
@@ -1369,7 +2525,7 @@ def test_live_activity_falls_back_from_topic_mismatch_token(tmp_path, monkeypatc
             "apns_env": "production",
         }
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     with appmod.app.test_client() as client:
         resp = client.post(
@@ -1387,7 +2543,7 @@ def test_live_activity_falls_back_from_topic_mismatch_token(tmp_path, monkeypatc
 
 
 def test_live_activity_expires_environment_mismatch_token(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_bad_live_activity_env_key"
@@ -1424,7 +2580,7 @@ def test_live_activity_expires_environment_mismatch_token(tmp_path, monkeypatch)
             "apns_env": "production",
         }
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     with appmod.app.test_client() as client:
         resp = client.post(
@@ -1443,7 +2599,7 @@ def test_live_activity_expires_environment_mismatch_token(tmp_path, monkeypatch)
 
 
 def test_live_activity_expiring_error_requests_token_refresh(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_refresh_bad_live_activity_key"
@@ -1468,7 +2624,7 @@ def test_live_activity_expiring_error_requests_token_refresh(tmp_path, monkeypat
             "apns_env": "production",
         }
 
-    monkeypatch.setattr(appmod, "_send_apns", _fake_send_apns)
+    monkeypatch.setattr(push_apns, "_send_apns", _fake_send_apns)
 
     with appmod.app.test_client() as client:
         resp = client.post(
@@ -1488,7 +2644,7 @@ def test_live_activity_expiring_error_requests_token_refresh(tmp_path, monkeypat
 
 
 def test_register_token_persists_client_push_metadata(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
 
     api_key = "test_token_metadata_key"
@@ -1522,9 +2678,9 @@ def test_register_token_persists_client_push_metadata(tmp_path, monkeypatch):
 
 
 def test_apns_prefers_token_recorded_environment(monkeypatch):
-    monkeypatch.setattr(appmod, "APNS_KEY", "test-key")
-    monkeypatch.setattr(appmod, "APNS_SANDBOX", True)
-    monkeypatch.setattr(appmod, "_make_apns_jwt", lambda: "jwt")
+    monkeypatch.setattr(push_apns, "APNS_KEY", "test-key")
+    monkeypatch.setattr(push_apns, "APNS_SANDBOX", True)
+    monkeypatch.setattr(push_apns, "_make_apns_jwt", lambda: "jwt")
 
     calls = []
 

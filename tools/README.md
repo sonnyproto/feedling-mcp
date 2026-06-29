@@ -15,7 +15,7 @@ Pick the highest-priority path that can honestly own Live connection:
 
 1. **Independent resident consumer** — use `chat_resident_consumer.py`. This is the normal path for Hermes / OpenClaw / Mac mini / VPS agents.
 2. **HTTP/API agent backend** — still use `chat_resident_consumer.py`; it polls Feedling and POSTs user messages into your API.
-3. **Desktop MCP runtime** — only skip the bridge if that desktop/runtime process truly stays alive and keeps polling without another operator prompt.
+3. **Long-lived desktop runtime** — only skip the bridge if that desktop/runtime process truly stays alive and keeps polling without another operator prompt.
 
 | Your agent runtime | Use chat-resident? |
 |--|--|
@@ -23,20 +23,19 @@ Pick the highest-priority path that can honestly own Live connection:
 | Hermes / OpenClaw / Claude Code on a Mac mini or VPS | **Yes.** Run this independent consumer and point it at the runtime's HTTP or CLI entry. |
 | Hermes CLI / mcporter / any CLI that exits after one invocation | **Yes.** The consumer keeps the long-running loop and invokes the CLI per message. |
 | Custom Python script that just makes HTTP requests | **Yes.** |
-| Plain Anthropic / OpenAI API loop without MCP support | **Yes.** |
+| Plain Anthropic / OpenAI API loop | **Yes.** |
 | Local Llama / Ollama / vLLM serving a `/chat` endpoint | **Yes.** |
 | A CLI tool you want to use as the agent (Hermes-CLI, etc.) | **Yes.** |
 
 If you're in the "Yes" rows, `chat_resident_consumer.py` is the bridge. The
 test is whether Feedling has a long-running poll owner, not brand name and not
-whether MCP tools exist in some other surface.
+whether agent tools exist in some other surface.
 
 ### What it does
 
 1. Long-polls `GET {FEEDLING_API_URL}/v1/chat/poll` for new user messages.
 2. Fetches each message's plaintext from a configured **decrypt source**
-   (the enclave's `/v1/chat/history` mirror, or — fallback — the MCP
-   server's `feedling_chat_get_history` tool).
+   (the enclave's `/v1/chat/history` mirror).
 3. Calls your agent backend with the plaintext message and, for image
    messages, the decrypted image context (HTTP POST or CLI invocation,
    configurable).
@@ -66,7 +65,13 @@ or in `{image_path}` / `{image_paths}` template slots.
 cp deploy/chat_resident.env.example ~/feedling-chat-resident.env
 chmod 600 ~/feedling-chat-resident.env
 # Edit ~/feedling-chat-resident.env — fill FEEDLING_API_URL, FEEDLING_API_KEY,
-# AGENT_MODE, and one of FEEDLING_ENCLAVE_URL / FEEDLING_MCP_URL.
+# AGENT_MODE, and FEEDLING_ENCLAVE_URL.
+
+# Install the consumer's Python deps into the same Python environment that will
+# run the daemon. Proactive V2 jobs import backend DB modules, so psycopg and
+# psycopg_pool must be present even when normal chat replies only use HTTP.
+python -m pip install -r tools/chat_resident_requirements.txt
+python -c 'import httpx, psycopg, psycopg_pool'
 
 # Run in the foreground for testing
 python tools/chat_resident_consumer.py
@@ -104,6 +109,9 @@ WantedBy=default.target
 Then:
 
 ```bash
+cd /home/openclaw/work/feedling-mcp
+/home/openclaw/.hermes/hermes-agent/venv/bin/python -m pip install -r tools/chat_resident_requirements.txt
+/home/openclaw/.hermes/hermes-agent/venv/bin/python -c 'import httpx, psycopg, psycopg_pool'
 systemctl --user daemon-reload
 systemctl --user enable --now feedling-chat-resident.service
 journalctl --user -u feedling-chat-resident.service -f
@@ -130,6 +138,34 @@ make it a child job inside the current Hermes chat turn or the top-level
 Hermes gateway; otherwise the IO chat loop dies or restarts with that host
 process.
 
+### Auto-update
+
+Once installed, the consumer keeps itself on the commit the backend deploys —
+you no longer have to remember to `git pull` + restart after a release.
+
+How it works: the backend advertises its deployed commit in every chat-poll
+response (`client_release.expected_consumer_commit`). At an idle poll the
+consumer compares it to its own `HEAD`. **Only if** the difference actually
+touches a file this consumer loads does it `git fetch` + check out that commit
+and re-exec in place. The relevant-file set is auto-derived from the modules it
+imports, plus `tools/io_cli.py`, the requirements files, and the lazily-imported
+runtime surface (`backend/proactive/`, `backend/content_encryption.py`) that may
+not be in `sys.modules` yet on a fresh idle consumer. A backend release that
+doesn't touch any consumer code triggers nothing. `io_cli.py` rides along in the
+same checkout — no separate update.
+
+- **Default on.** Set `FEEDLING_AUTO_UPDATE=0` in your env file to opt out and
+  manage updates manually (the verification steps above).
+- **Dirty working tree is never touched.** If you have local uncommitted edits,
+  the consumer logs a warning and skips the update instead of clobbering them.
+  `git stash` / commit (or set `FEEDLING_AUTO_UPDATE=0`) to control this.
+- **Detached HEAD after update.** Updating pins the checkout to the backend's
+  exact commit (detached HEAD). To take over manually, `git checkout main`.
+- **If requirements changed**, the consumer runs `pip install -r` for the
+  changed requirements file before re-exec, best-effort.
+- **Hosted (in-CVM) runs are excluded** — that code is baked into an attested,
+  immutable image and is updated by redeploying the image, not by self-pull.
+
 ### ⚠️ Decrypt source is mandatory
 
 The backend stores all user chat messages as v1 encrypted envelopes.
@@ -139,7 +175,7 @@ be pointed at a decrypt source to read what the user wrote.
 Set one of:
 
 - **`FEEDLING_ENCLAVE_URL`** (recommended) — direct HTTPS to the
-  enclave's decrypt proxy. Same value as `mcp_server.py` uses.
+  enclave's decrypt proxy.
 - **`FEEDLING_MCP_URL`** (fallback) — calls `feedling_chat_get_history`
   on the MCP server. Requires `FEEDLING_MCP_TRANSPORT=streamable-http`.
 
@@ -256,20 +292,30 @@ The consumer reads Claude Code's `session_id` from JSON output and injects
 service environment cannot find `claude`, use an absolute executable path or set
 `AGENT_CLI_PATH`.
 
-### Failure behavior
+### Session bounds and failure behavior
 
-By default, agent-entry failures are log-only and **no fallback template is
-posted into iOS Chat**:
+The resident owns IO-facing session continuity and keeps it bounded. For CLI
+agents that print a `session_id`, later turns resume that session until either
+bound is reached:
 
 ```
-SEND_FALLBACK_ON_AGENT_ERROR=false
+AGENT_SESSION_MAX_TURNS=40
+AGENT_SESSION_MAX_BYTES=250000
 ```
 
-This keeps user-visible chat clean. If the agent command, HTTP endpoint, or
-reply sanitizer fails, inspect the resident logs and fix the entry; do not
-mask it with "send that once more" / "temporarily unavailable" chat bubbles.
-There is an opt-in fallback knob for local experiments, but production
-onboarding should leave it disabled.
+If a CLI template contains a fixed `--session-id`, the consumer replaces it
+with its own bounded session id so one hardcoded session cannot grow forever.
+
+Agent-entry failures are user-visible by default:
+
+```
+SEND_FALLBACK_ON_AGENT_ERROR=true
+FALLBACK_REPLY=我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。
+```
+
+This prevents a timeout or broken agent entry from silently dropping a user
+turn. Empty plaintext caused by a missing decrypt source is still skipped rather
+than answered, because the consumer cannot know what the user said.
 
 ### Image messages
 

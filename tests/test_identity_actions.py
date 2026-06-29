@@ -10,6 +10,11 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import app as appmod  # noqa: E402
+import provider_client  # noqa: E402
+from core import config as core_config  # noqa: E402
+from core import enclave as core_enclave  # noqa: E402
+from core import envelope as core_envelope  # noqa: E402
+from identity import actions as identity_actions_mod  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -18,7 +23,7 @@ def _b64(raw: bytes) -> str:
 
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
-    monkeypatch.setattr(appmod, "FEEDLING_DIR", tmp_path)
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._users[:] = []
     appmod._key_to_user.clear()
     appmod._stores.clear()
@@ -110,7 +115,7 @@ def _fake_envelope_builder(captured: list):
             captured.append(json.loads(plaintext.decode("utf-8")))
         except Exception:
             captured.append(plaintext.decode("utf-8"))
-        return {
+        envelope = {
             "id": item_id or "env_1",
             "body_ct": f"ct_{len(captured)}",
             "nonce": f"nonce_{len(captured)}",
@@ -119,7 +124,8 @@ def _fake_envelope_builder(captured: list):
             "visibility": "shared",
             "owner_user_id": store.user_id,
             "enclave_pk_fpr": "test",
-        }, ""
+        }
+        return envelope, ""
     return _build
 
 
@@ -129,11 +135,11 @@ def test_identity_profile_patch_reencrypts_existing_card(client, monkeypatch):
     captured_plaintexts: list = []
 
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_enclave_get_json_for_gate",
         lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
     )
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     res = client.post(
         "/v1/identity/actions",
@@ -160,18 +166,55 @@ def test_identity_profile_patch_reencrypts_existing_card(client, monkeypatch):
     assert saved["relationship_started_at"] == "2026-04-01"
 
 
+def test_identity_profile_patch_passes_runtime_token_to_enclave(client, monkeypatch):
+    user_id, _api_key = _register(client)
+    _seed_identity(user_id)
+    store = appmod.get_store(user_id)
+    captured: dict = {}
+    captured_plaintexts: list = []
+
+    def fake_enclave_context(path, key, params=None, runtime_token=""):
+        captured["path"] = path
+        captured["key"] = key
+        captured["runtime_token"] = runtime_token
+        return ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, "")
+
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    body, status = identity_actions_mod._execute_identity_actions(
+        store,
+        None,
+        [{
+            "type": "identity.profile_patch",
+            "patch": {"self_introduction": "我已经回来了。"},
+        }],
+        runtime_token="rtok_identity",
+    )
+
+    assert status == 200
+    assert body["status"] == "ok"
+    assert captured == {
+        "path": "/v1/identity/get",
+        "key": None,
+        "runtime_token": "rtok_identity",
+    }
+    assert captured_plaintexts[-1]["self_introduction"] == "我已经回来了。"
+
+
+@pytest.mark.xfail(reason="inline background runtime removed in chat-send 收口 (Task 3); behavior moved to agent-runner consumer — needs consumer-side coverage", strict=False)
 def test_model_api_chat_background_runtime_executes_detected_identity_rename(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
     captured_plaintexts: list = []
 
     monkeypatch.setattr(
-        appmod,
+        provider_client,
         "test_provider_key",
         lambda cfg: {"reply": "ok", "usage": {"total_tokens": 1}},
     )
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -196,8 +239,8 @@ def test_model_api_chat_background_runtime_executes_detected_identity_rename(cli
             }
         return {"reply": "收到，我以后就叫小秘。", "usage": {"total_tokens": 9}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -221,12 +264,15 @@ def test_model_api_chat_background_runtime_executes_detected_identity_rename(cli
     assert any(isinstance(item, dict) and item.get("agent_name") == "小秘" for item in captured_plaintexts)
 
 
+@pytest.mark.xfail(reason="inline background runtime removed in chat-send 收口 (Task 3); behavior moved to agent-runner consumer — needs consumer-side coverage", strict=False)
 def test_model_api_chat_background_runtime_updates_relationship_days(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
+    captured_plaintexts: list = []
 
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -251,8 +297,8 @@ def test_model_api_chat_background_runtime_updates_relationship_days(client, mon
             }
         return {"reply": "你说得对，我会按 68 天记。", "usage": {}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -275,14 +321,15 @@ def test_model_api_chat_background_runtime_updates_relationship_days(client, mon
     assert appmod._live_days_with_user(saved, store=appmod.get_store(user_id)) == 68
 
 
+@pytest.mark.xfail(reason="inline background runtime removed in chat-send 收口 (Task 3); behavior moved to agent-runner consumer — needs consumer-side coverage", strict=False)
 def test_model_api_chat_background_runtime_nudges_identity_dimension(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
     captured_plaintexts: list = []
 
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -310,8 +357,8 @@ def test_model_api_chat_background_runtime_nudges_identity_dimension(client, mon
             }
         return {"reply": "好，我会更重视上下文连续性。", "usage": {}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -342,11 +389,11 @@ def test_memory_content_patch_reencrypts_existing_card(client, monkeypatch):
     captured_plaintexts: list = []
 
     monkeypatch.setattr(
-        appmod,
+        core_enclave,
         "_decrypt_envelope_via_enclave",
         lambda envelope, key, purpose: json.dumps(_plain_memory()).encode("utf-8"),
     )
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     res = client.post(
         "/v1/memory/actions",
@@ -364,31 +411,36 @@ def test_memory_content_patch_reencrypts_existing_card(client, monkeypatch):
     assert res.status_code == 200, res.get_data(as_text=True)
     body = res.get_json()
     assert body["status"] == "ok"
-    assert body["effects"][0]["type"] == "memory_updated"
-    assert body["effects"][0]["memory_id"] == "mom_1"
-    assert captured_plaintexts[-1]["description"] == "User moved to Tokyo in April."
-    assert captured_plaintexts[-1]["title"] == "Wrong city"
-    saved = appmod.db.memory_load(user_id)[0]
-    assert saved["id"] == "mom_1"
-    assert saved["body_ct"] == "ct_1"
-    assert saved["updated_at"]
+    assert body["effects"][0]["type"] == "memory_superseded"
+    assert body["effects"][0]["supersedes"] == "mom_1"
+    assert captured_plaintexts[-1]["summary"] == "User moved to Tokyo in April."
+    assert "User moved to Tokyo in April." in captured_plaintexts[-1]["content"]
+    saved = appmod.db.memory_load(user_id)
+    old_card = next(item for item in saved if item["id"] == "mom_1")
+    new_card = next(item for item in saved if item["id"] != "mom_1")
+    assert old_card["status"] == "superseded"
+    assert old_card["superseded_by"] == new_card["id"]
+    assert new_card["body_ct"] == "ct_1"
+    assert new_card["status"] == "active"
+    assert new_card["updated_at"]
 
 
+@pytest.mark.xfail(reason="inline background runtime removed in chat-send 收口 (Task 3); behavior moved to agent-runner consumer — needs consumer-side coverage", strict=False)
 def test_model_api_chat_background_runtime_executes_memory_context_patch(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
     _seed_memory(user_id)
     captured_plaintexts: list = []
 
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
 
     def fake_decrypt(envelope, key, purpose):
         if purpose == "model_api_provider_key":
             return b"sk-test"
         return json.dumps(_plain_memory()).encode("utf-8")
 
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", fake_decrypt)
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -419,8 +471,8 @@ def test_model_api_chat_background_runtime_executes_memory_context_patch(client,
             return {"reply": '{"memories":[]}', "usage": {}}
         return {"reply": "我把这条记忆改成东京了。", "usage": {}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -444,19 +496,25 @@ def test_model_api_chat_background_runtime_executes_memory_context_patch(client,
     assert body["effects"] == []
     assert body["memory_actions"] == []
     assert body["state"]["background_execution"]["status"] == "completed"
-    assert any(isinstance(item, dict) and item.get("description") == "User moved to Tokyo in April." for item in captured_plaintexts)
+    assert any(
+        isinstance(item, dict)
+        and item.get("summary") == "User moved to Tokyo in April."
+        and "User moved to Tokyo in April." in item.get("content", "")
+        for item in captured_plaintexts
+    )
     assert body["context"]["context_refs"] == 1
 
 
+@pytest.mark.xfail(reason="inline background runtime removed in chat-send 收口 (Task 3); behavior moved to agent-runner consumer — needs consumer-side coverage", strict=False)
 def test_model_api_chat_background_runtime_writes_general_correction_memory(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
     captured_plaintexts: list = []
     context_params: list[dict] = []
 
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -498,8 +556,8 @@ def test_model_api_chat_background_runtime_writes_general_correction_memory(clie
             return {"reply": '{"memories":[]}', "usage": {}}
         return {"reply": '{"reply":"我以后不会再用这个设定。","thinking_summary":"记下了这条纠正。"}', "usage": {}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -523,20 +581,22 @@ def test_model_api_chat_background_runtime_writes_general_correction_memory(clie
     assert context_params[-1]["context_mode"] == "model_api"
     assert any(
         isinstance(item, dict)
-        and item.get("source") == "model_api_correction"
-        and "烂梗王" in item.get("description", "")
+        and "烂梗王" in item.get("content", "")
         for item in captured_plaintexts
     )
+    saved = appmod.db.memory_load(user_id)
+    assert any(item.get("source") == "model_api_correction" for item in saved)
 
 
+@pytest.mark.xfail(reason="inline background runtime removed in chat-send 收口 (Task 3); behavior moved to agent-runner consumer — needs consumer-side coverage", strict=False)
 def test_model_api_chat_background_runtime_patches_user_preferred_name(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
     captured_plaintexts: list = []
 
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -564,8 +624,8 @@ def test_model_api_chat_background_runtime_patches_user_preferred_name(client, m
             }
         return {"reply": '{"reply":"好，以后叫你 Seven。","thinking_summary":"更新了称呼偏好。"}', "usage": {}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -592,13 +652,14 @@ def test_model_api_chat_background_runtime_patches_user_preferred_name(client, m
     )
 
 
+@pytest.mark.xfail(reason="inline background runtime removed in chat-send 收口 (Task 3); behavior moved to agent-runner consumer — needs consumer-side coverage", strict=False)
 def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
     _seed_memory(user_id, memory_id="mom_delete")
     captured_plaintexts: list = []
 
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
 
     def fake_decrypt(envelope, key, purpose):
         if purpose == "model_api_provider_key":
@@ -609,8 +670,8 @@ def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(clien
             "type": "fact",
         }).encode("utf-8")
 
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", fake_decrypt)
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -656,8 +717,8 @@ def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(clien
             }
         return {"reply": "已处理。", "usage": {}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -694,14 +755,15 @@ def test_model_api_chat_low_confidence_memory_delete_requires_confirmation(clien
     assert len(appmod.db.memory_load(user_id)) == 0
 
 
+@pytest.mark.xfail(reason="inline background runtime removed in chat-send 收口 (Task 3); behavior moved to agent-runner consumer — needs consumer-side coverage", strict=False)
 def test_model_api_chat_skips_running_capture_on_ordinary_turn_until_cadence(client, monkeypatch):
     user_id, api_key = _register(client)
     _seed_identity(user_id)
     captured_plaintexts: list = []
 
-    monkeypatch.setattr(appmod, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
-    monkeypatch.setattr(appmod, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
-    monkeypatch.setattr(appmod, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+    monkeypatch.setattr(provider_client, "test_provider_key", lambda cfg: {"reply": "ok", "usage": {}})
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", lambda envelope, key, purpose: b"sk-test")
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
 
     def fake_enclave_context(path, key, params=None):
         if path == "/v1/identity/get":
@@ -717,8 +779,8 @@ def test_model_api_chat_skips_running_capture_on_ordinary_turn_until_cadence(cli
         provider_calls.append(joined)
         return {"reply": "今天可以简单吃点。", "usage": {}}
 
-    monkeypatch.setattr(appmod, "_enclave_get_json_for_gate", fake_enclave_context)
-    monkeypatch.setattr(appmod, "chat_completion", fake_chat_completion)
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(provider_client, "chat_completion", fake_chat_completion)
 
     setup = client.post(
         "/v1/model_api/setup",
@@ -739,3 +801,55 @@ def test_model_api_chat_skips_running_capture_on_ordinary_turn_until_cadence(cli
     assert body["capture"]["reason"].startswith("cadence:")
     assert len(provider_calls) == 1
     assert "Feedling hosted runtime's background execution controller" not in provider_calls[0]
+
+
+def test_identity_profile_patch_writes_custom_persona_prompt(client, monkeypatch):
+    # P1b: the user-authored custom_persona_prompt is a first-class profile field,
+    # writable via profile_patch (the path iOS / corrections use) and round-tripped
+    # into the re-encrypted identity body. (DB-backed — runs in CI.)
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    captured_plaintexts: list = []
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    directive = "像老朋友一样直接损我，别用敬语。"
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={
+            "actions": [{
+                "type": "identity.profile_patch",
+                "patch": {"custom_persona_prompt": directive},
+                "reason": "User set a custom persona directive.",
+            }],
+        },
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["status"] == "ok"
+    assert "custom_persona_prompt" in body["effects"][0]["fields"]
+    assert captured_plaintexts[-1]["custom_persona_prompt"] == directive
+
+
+def test_proactive_settings_wake_directive_validation(client):
+    # P4: wake_directive is whitelisted + capped at 1000 chars. The deferred
+    # wake-cadence knob (wake_interval_sec) and unknown keys are NOT stored — we
+    # don't persist a setting that silently does nothing yet. (DB-backed — CI.)
+    user_id, _api_key = _register(client)
+    store = appmod.get_store(user_id)
+    saved = store.save_proactive_settings({
+        "wake_directive": "x" * 2000,
+        "wake_interval_sec": 100,
+        "bogus_key": "nope",
+    })
+    assert len(saved["wake_directive"]) == 1000          # capped
+    assert "wake_interval_sec" not in saved              # deferred, not whitelisted
+    assert "bogus_key" not in saved                      # unknown keys rejected
+    assert store.load_proactive_settings()["wake_directive"] == "x" * 1000

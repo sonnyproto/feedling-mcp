@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, test]
   pull_request:
-    branches: [main]
+    branches: [main, test]
   workflow_dispatch:
 
 # Cancel in-progress runs on the same ref — latest push wins.
@@ -28,7 +28,7 @@ jobs:
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          version: 1.7.1   # pin a concrete version: 'stable' makes foundryup hit the rate-limited GitHub API (403 in CI)
 
       - name: forge build
         run: forge build --sizes
@@ -80,6 +80,11 @@ jobs:
           FEEDLING_DATA_DIR: /tmp/feedling-data-ci
           FEEDLING_WS_PORT: "19998"
           DATABASE_URL: "postgresql://postgres:postgres@127.0.0.1:5432/feedling_ci"
+          # 收口后 backend 启动会校验托管前置三件套（assert_hosting_ready）。
+          # CI smoke 用占位值满足校验，让 backend 起得来——不连真 gateway/supervisor。
+          FEEDLING_LITELLM_ENABLE: "1"
+          FEEDLING_HOST_ALL: "1"
+          FEEDLING_RUNTIME_TOKEN_SECRET: "ci-smoke-secret"
         run: |
           mkdir -p "$FEEDLING_DATA_DIR"
           python backend/app.py > /tmp/backend.log 2>&1 &
@@ -96,7 +101,7 @@ jobs:
           exit 1
 
       - name: Run test suite
-        run: python backend/test_api.py http://127.0.0.1:5001 --multi-tenant
+        run: python tests/test_api.py http://127.0.0.1:5001 --multi-tenant
 
       - name: Stop test backend (the isolation suite spawns its own)
         if: always()
@@ -106,7 +111,7 @@ jobs:
           tail -50 /tmp/backend.log || true
 
       # Multi-tenant isolation regression suite (tests/test_multi_tenant_*.py
-      # + tests/test_mcp_session_isolation.py). Added after the 2026-05-11
+      # +). Added after the 2026-05-11
       # P0 cross-tenant data leak — must stay green so we catch any future
       # auth / session / file-routing regression in CI before users see it.
       - name: Install pytest-asyncio (test-only)
@@ -117,7 +122,36 @@ jobs:
         # and the db-layer unit tests.
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
-        run: python -m pytest tests/test_db.py tests/test_multi_tenant_isolation.py tests/test_mcp_session_isolation.py -v
+        run: python -m pytest tests/test_db.py tests/test_multi_tenant_isolation.py -v
+
+      - name: Run Round 3 V2 regression suite
+        # Keep these focused: test_api.py is exercised by the server step above,
+        # and enclave routes included here are dependency-mocked (no live TEE).
+        env:
+          FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
+        run: |
+          python -m pytest \
+            tests/test_proactive_store_v2.py \
+            tests/test_proactive_runtime_v2.py \
+            tests/test_proactive_scheduled_wake_v2.py \
+            tests/test_proactive_dashboard_v2.py \
+            tests/test_proactive_observability_v2.py \
+            tests/test_proactive_tool_executor_v2.py \
+            tests/test_perception_ingress_v2.py \
+            tests/test_ios_perception_contract_v2.py \
+            tests/test_perception.py \
+            tests/test_proactive_jobs.py \
+            tests/test_proactive_gate_eval.py \
+            tests/test_screen_caption_backend.py \
+            tests/test_screen_caption_flag.py \
+            tests/test_enclave_frame_caption.py \
+            tests/test_enclave_visual_plaintext.py \
+            tests/test_proactive_agent_protocol_v2.py \
+            tests/test_chat_resident_consumer.py \
+            tests/test_runtime_v2_default_flag.py \
+            tests/test_capture_prompt_v1.py \
+            tests/test_dream_prompt_v1.py \
+            -v
 
   # -------------------------------------------------------------------------
   # Docker — confirm the hash-pinned build stays reproducible
@@ -204,7 +238,31 @@ jobs:
               - 'backend/**'
               - 'tools/chat_resident_consumer.py'
               - 'deploy/Dockerfile'
+              - 'deploy/Dockerfile.agent-runner'
               - 'deploy/docker-compose.phala.yaml'
+              - 'deploy/publish-compose-hash.sh'
+              - '.github/workflows/ci.yml'
+
+  detect-cvm-changes-test:
+    name: detect CVM changes (test)
+    if: github.ref == 'refs/heads/test' && github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    outputs:
+      cvm: ${{ steps.filter.outputs.cvm }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            cvm:
+              - 'backend/**'
+              - 'tools/chat_resident_consumer.py'
+              - 'deploy/Dockerfile'
+              - 'deploy/Dockerfile.agent-runner'
+              - 'deploy/docker-compose.phala.test.yaml'
               - 'deploy/publish-compose-hash.sh'
               - '.github/workflows/ci.yml'
 
@@ -252,13 +310,14 @@ jobs:
           echo "waiting for ${IMAGE}:$SHA_SHORT"
           echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
           for i in $(seq 1 60); do
-            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1; then
-              echo "image :$SHA_SHORT available"
+            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1 \
+               && docker manifest inspect "${IMAGE}-agent-runner:$SHA_SHORT" >/dev/null 2>&1; then
+              echo "images :$SHA_SHORT available (backend + agent-runner)"
               exit 0
             fi
             sleep 10
           done
-          echo "::error::image :$SHA_SHORT did not appear in 10 min — docker-publish.yml likely failed"
+          echo "::error::image :$SHA_SHORT (backend or agent-runner) did not appear in 10 min — docker-publish.yml likely failed"
           exit 1
 
       - name: Pin image tag in deploy/docker-compose.phala.yaml
@@ -282,7 +341,12 @@ jobs:
 
           IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
           IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
+          # Pin the backend image, then the sibling agent-runner image. The first
+          # regex requires the literal "/feedling:" so it never matches the
+          # "/feedling-agent-runner:" line; the second pins that one.
           sed -i -E "s|ghcr\.io/[^/]+/feedling:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
+            deploy/docker-compose.phala.yaml
+          sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|${IMAGE}-agent-runner:${TRIGGER_SHA_SHORT}|g" \
             deploy/docker-compose.phala.yaml
           if git diff --quiet -- deploy/docker-compose.phala.yaml; then
             echo "tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
@@ -296,7 +360,7 @@ jobs:
 
       - uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          version: 1.7.1   # pin a concrete version: 'stable' makes foundryup hit the rate-limited GitHub API (403 in CI)
 
       - uses: actions/setup-python@v5
         with:
@@ -340,6 +404,27 @@ jobs:
           # into compose_hash. The backend fails fast at boot if this is empty.
           DATABASE_URL:        ${{ secrets.DATABASE_URL }}
           CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
+          # agent-runner (4th service) knobs — encrypted env channel, NOT baked
+          # into compose_hash. All default to empty (service idles, gateway off),
+          # so flipping them on later needs no on-chain re-auth. AGENT_RUNTIME_USERS
+          # is the roster JSON (carries per-user keys); the rest are flags/secrets.
+          AGENT_RUNTIME_USERS:          ${{ secrets.AGENT_RUNTIME_USERS }}
+          AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.AGENT_RUNTIME_AUTODISCOVER }}
+          FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
+          FEEDLING_LITELLM_ENABLE:      ${{ vars.FEEDLING_LITELLM_ENABLE }}
+          FEEDLING_LITELLM_API_KEY:     ${{ secrets.FEEDLING_LITELLM_API_KEY }}
+          # Host-all: agent-runner hosts every configured user (zero-roster, via
+          # runtime token) + backend routes their sends to it. Needs the token
+          # secret above. Empty = off. Both services read it from the encrypted env.
+          FEEDLING_HOST_ALL:            ${{ vars.FEEDLING_HOST_ALL }}
+          FEEDLING_MIGRATE_ENABLE:      ${{ vars.FEEDLING_MIGRATE_ENABLE }}
+          # R2 frame-ciphertext offload (backend/object_storage.py). Encrypted
+          # env channel; empty = feature off. The token MUST be scoped to the
+          # frames bucket. See deploy/DEPLOYMENTS.md.
+          R2_ENDPOINT:                  ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID:             ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY:         ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_FRAMES_BUCKET:             ${{ secrets.R2_FRAMES_BUCKET }}
         run: |
           echo ">>> deploy-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
@@ -350,6 +435,10 @@ jobs:
             --api-token "$PHALA_CLOUD_API_KEY" \
             --cvm-id "$CVM_ID" \
             -c deploy/docker-compose.phala.yaml \
+            -e "R2_ENDPOINT=$R2_ENDPOINT" \
+            -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
+            -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
+            -e "R2_FRAMES_BUCKET=$R2_FRAMES_BUCKET" \
             -e "CF_ZONE_ID=$CF_ZONE_ID" \
             -e "CF_API_TOKEN=$CF_API_TOKEN" \
             -e "APNS_KEY_P8_B64=$APNS_KEY_P8_B64" \
@@ -358,6 +447,13 @@ jobs:
             -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
             -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
             -e "DATABASE_URL=$DATABASE_URL" \
+            -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
+            -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+            -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
+            -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
+            -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
+            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
+            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             --wait
 
       - name: Publish live compose_hash on Sepolia
@@ -380,9 +476,190 @@ jobs:
               publish_status=0
               break
             fi
-            publish_status=$?
+            # Do NOT capture `publish_status=$?` here: a failed `if cmd; then …; fi`
+            # with no else makes the whole `if` statement exit 0, so $? reads 0 and
+            # the step false-greens even when the publish reverted. Leave
+            # publish_status=1 until an attempt actually succeeds above.
             if [ "$attempt" -lt 3 ]; then
-              echo "::warning::compose_hash publish failed with exit $publish_status; retrying in 20s"
+              echo "::warning::compose_hash publish failed (attempt $attempt/3); retrying in 20s"
+              sleep 20
+            fi
+          done
+          exit "$publish_status"
+
+  deploy-test-cvm:
+    name: deploy CVM (test)
+    needs: [forge-test, python-tests, docker-build, lint, dcap-python, detect-cvm-changes-test]
+    if: |
+      github.ref == 'refs/heads/test' &&
+      github.event_name == 'push' &&
+      needs.detect-cvm-changes-test.outputs.cvm == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: read
+    concurrency:
+      group: deploy-test-cvm
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Wait for ghcr.io image :<sha>
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
+          echo "waiting for ${IMAGE}:$SHA_SHORT"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          for i in $(seq 1 60); do
+            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1 \
+               && docker manifest inspect "${IMAGE}-agent-runner:$SHA_SHORT" >/dev/null 2>&1; then
+              echo "images :$SHA_SHORT available (backend + agent-runner)"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::image :$SHA_SHORT (backend or agent-runner) did not appear in 10 min — docker-publish.yml likely failed"
+          exit 1
+
+      - name: Pin image tag in deploy/docker-compose.phala.test.yaml
+        id: pin
+        env:
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          TRIGGER_SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          git fetch origin test
+          git reset --hard origin/test
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling"
+          # Pin the backend image, then the sibling agent-runner image (see prod job).
+          sed -i -E "s|ghcr\.io/[^/]+/feedling:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
+            deploy/docker-compose.phala.test.yaml
+          sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|${IMAGE}-agent-runner:${TRIGGER_SHA_SHORT}|g" \
+            deploy/docker-compose.phala.test.yaml
+          if git diff --quiet -- deploy/docker-compose.phala.test.yaml; then
+            echo "tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
+          else
+            git config user.name  'feedling-ci'
+            git config user.email 'ci@feedling.app'
+            git add deploy/docker-compose.phala.test.yaml
+            git commit -m "deploy(test): bump CVM image to :$TRIGGER_SHA_SHORT [skip ci]"
+            git push origin HEAD:test
+          fi
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: 1.7.1   # pin a concrete version: 'stable' makes foundryup hit the rate-limited GitHub API (403 in CI)
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install phala CLI
+        run: npm install -g phala
+
+      - name: Resolve CVM_ID
+        id: cvmid
+        run: |
+          CVM_ID=$(tr -d '[:space:]' < deploy/test-cvm-id.txt)
+          if [ -z "$CVM_ID" ]; then
+            echo "::error::deploy/test-cvm-id.txt is empty — cannot target a CVM"
+            exit 1
+          fi
+          echo "cvm_id=$CVM_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy CVM via phala
+        env:
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+          CF_ZONE_ID:          ${{ secrets.CF_ZONE_ID }}
+          CF_API_TOKEN:        ${{ secrets.CF_API_TOKEN }}
+          APNS_KEY_P8_B64:     ${{ secrets.APNS_KEY_P8_B64 }}
+          APNS_KEY_ID:         ${{ secrets.APNS_KEY_ID }}
+          APNS_TEAM_ID:        ${{ secrets.APNS_TEAM_ID }}
+          OPENROUTER_API_KEY:  ${{ secrets.OPENROUTER_API_KEY }}
+          FEEDLING_ADMIN_TOKEN: ${{ secrets.FEEDLING_ADMIN_TOKEN }}
+          DATABASE_URL:        ${{ secrets.TEST_DATABASE_URL }}
+          CVM_ID:              ${{ steps.cvmid.outputs.cvm_id }}
+          # agent-runner (4th service) knobs — encrypted env channel, NOT baked
+          # into compose_hash (see prod deploy step). Default empty = idle + gateway
+          # off; flip on later with no on-chain re-auth. TEST_-prefixed where a
+          # separate test value is wanted; falls back to the shared secret/var.
+          AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
+          AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
+          FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
+          FEEDLING_LITELLM_ENABLE:      ${{ vars.TEST_FEEDLING_LITELLM_ENABLE }}
+          FEEDLING_LITELLM_API_KEY:     ${{ secrets.TEST_FEEDLING_LITELLM_API_KEY }}
+          # Host-all: agent-runner hosts every configured user (zero-roster, via
+          # runtime token) + backend routes their sends to it. Needs the token
+          # secret above. Empty = off. Both services read it from the encrypted env.
+          FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
+          FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
+          # R2 frame-ciphertext offload — TEST_-prefixed secrets, un-prefixed
+          # container env. Empty = feature off; token MUST be scoped to the
+          # frames bucket. See deploy/DEPLOYMENTS.md.
+          R2_ENDPOINT:                  ${{ secrets.TEST_R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID:             ${{ secrets.TEST_R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY:         ${{ secrets.TEST_R2_SECRET_ACCESS_KEY }}
+          R2_FRAMES_BUCKET:             ${{ secrets.TEST_R2_FRAMES_BUCKET }}
+        run: |
+          echo ">>> deploy-test-cvm target: $CVM_ID"
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::TEST_DATABASE_URL secret is not set — backend has no datastore"
+            exit 1
+          fi
+          phala deploy \
+            --api-token "$PHALA_CLOUD_API_KEY" \
+            --cvm-id "$CVM_ID" \
+            -c deploy/docker-compose.phala.test.yaml \
+            -e "R2_ENDPOINT=$R2_ENDPOINT" \
+            -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
+            -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
+            -e "R2_FRAMES_BUCKET=$R2_FRAMES_BUCKET" \
+            -e "CF_ZONE_ID=$CF_ZONE_ID" \
+            -e "CF_API_TOKEN=$CF_API_TOKEN" \
+            -e "APNS_KEY_P8_B64=$APNS_KEY_P8_B64" \
+            -e "APNS_KEY_ID=$APNS_KEY_ID" \
+            -e "APNS_TEAM_ID=$APNS_TEAM_ID" \
+            -e "OPENROUTER_API_KEY=$OPENROUTER_API_KEY" \
+            -e "FEEDLING_ADMIN_TOKEN=$FEEDLING_ADMIN_TOKEN" \
+            -e "DATABASE_URL=$DATABASE_URL" \
+            -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
+            -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+            -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
+            -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
+            -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
+            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
+            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
+            --wait
+
+      - name: Publish live compose_hash on Sepolia (test contract)
+        env:
+          PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
+          ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
+          FEEDLING_APP_AUTH_CONTRACT: ${{ vars.TEST_FEEDLING_APP_AUTH_CONTRACT }}
+          FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
+          PHALA_CLOUD_API_KEY:        ${{ secrets.PHALA_CLOUD_API_KEY }}
+          FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.test.yaml
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyyaml
+          publish_status=1
+          for attempt in 1 2 3; do
+            if ./deploy/publish-compose-hash.sh eth_sepolia; then
+              publish_status=0
+              break
+            fi
+            # Do NOT capture `publish_status=$?` here: a failed `if cmd; then …; fi`
+            # with no else makes the whole `if` statement exit 0, so $? reads 0 and
+            # the step false-greens even when the publish reverted. Leave
+            # publish_status=1 until an attempt actually succeeds above.
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::compose_hash publish failed (attempt $attempt/3); retrying in 20s"
               sleep 20
             fi
           done

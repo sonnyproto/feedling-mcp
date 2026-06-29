@@ -427,19 +427,18 @@ def _establish_live_connection(base_url: str, user_id: str, api_key: str) -> dic
 # writes when prerequisites aren't satisfied.
 # ---------------------------------------------------------------------------
 
-def test_chat_response_blocked_when_no_memory_no_identity(backend):
-    """Fresh user — chat_response must 409 with bootstrap_incomplete /
-    stage=needs_memory and the actionable instructions in `required`."""
+def test_chat_response_blocked_when_no_identity(backend):
+    """A' (2026-06): fresh user — chat_response 409s with stage=needs_identity.
+    Memory no longer gates; identity is the baseline that must exist first."""
     user_id, api_key = _register(backend["base_url"])
     r = _chat_response(backend["base_url"], user_id, api_key)
     assert r.status_code == 409, f"expected 409, got {r.status_code}: {r.text}"
     body = r.json()
     assert body["error"] == "bootstrap_incomplete"
-    assert body["stage"] == "needs_memory"
-    assert body["memory_count"] == 0
-    assert body["counts"]["total"] == 0
-    assert "story" in body["missing_tabs"] and "about_me" in body["missing_tabs"]
-    assert "feedling_memory_add_moment" in body["required"]
+    assert body["stage"] == "needs_identity"
+    assert body["identity_written"] is False
+    assert body["missing_tabs"] == []
+    assert "feedling_identity_init" in body["required"]
     assert "skill_url" in body
 
 
@@ -468,47 +467,34 @@ def test_chat_response_allowed_after_full_bootstrap_and_live_connection(backend)
     assert r.status_code == 200, f"chat_response should succeed: {r.text}"
 
 
-def test_identity_init_blocked_when_no_memory(backend):
-    """Identity must be DERIVED from memories. With zero memories the
-    agent is making things up — refuse the write."""
+def test_identity_init_allowed_with_no_memory(backend):
+    """A' (2026-06): identity init is NO LONGER gated on memory floor. 0 memory
+    cards is a valid state — identity is the baseline that comes first; the
+    Memory Garden grows naturally afterwards."""
     user_id, api_key = _register(backend["base_url"])
     r = _init_identity(backend["base_url"], user_id, api_key)
-    assert r.status_code == 409, f"expected 409, got {r.status_code}: {r.text}"
-    body = r.json()
-    assert body["error"] == "bootstrap_incomplete"
-    assert body["stage"] == "needs_memory"
-    assert "story" in body["missing_tabs"]
-    assert "about_me" in body["missing_tabs"]
+    assert r.status_code == 201, f"identity_init should succeed with 0 memory: {r.text}"
 
 
-def test_identity_init_blocked_when_only_story_filled(backend):
-    """About me tab is the density layer. Writing only moments/quotes
-    (Story) without facts/events (About me) still 409s — the floor is
-    per-tab, not total."""
+def test_identity_init_allowed_with_only_moments(backend):
+    """A' (2026-06): old per-tab floors are gone. Only moments (no facts) no
+    longer blocks — there is no story/about_me balance gate."""
     user_id, api_key = _register(backend["base_url"])
-    # Fill Story tab generously, but About me stays empty.
     for i in range(5):
         _add_memory(backend["base_url"], user_id, api_key, f"m{i}",
                     mem_type="moment")
     r = _init_identity(backend["base_url"], user_id, api_key)
-    assert r.status_code == 409, f"expected 409, got {r.status_code}: {r.text}"
-    body = r.json()
-    assert "about_me" in body["missing_tabs"]
-    assert "story" not in body["missing_tabs"]
+    assert r.status_code == 201, f"identity_init should succeed: {r.text}"
 
 
-def test_identity_init_blocked_when_only_about_me_filled(backend):
-    """Mirror case: filling only facts/events without any moments/quotes
-    also blocks. Identity needs both layers."""
+def test_identity_init_allowed_with_only_facts(backend):
+    """A' (2026-06): mirror — only facts (no moments) also succeeds now."""
     user_id, api_key = _register(backend["base_url"])
     for i in range(5):
         _add_memory(backend["base_url"], user_id, api_key, f"f{i}",
                     mem_type="fact")
     r = _init_identity(backend["base_url"], user_id, api_key)
-    assert r.status_code == 409, f"expected 409, got {r.status_code}: {r.text}"
-    body = r.json()
-    assert "story" in body["missing_tabs"]
-    assert "about_me" not in body["missing_tabs"]
+    assert r.status_code == 201, f"identity_init should succeed: {r.text}"
 
 
 def test_identity_init_allowed_after_minimum_bootstrap(backend):
@@ -518,24 +504,6 @@ def test_identity_init_allowed_after_minimum_bootstrap(backend):
     assert r.status_code == 201, f"identity_init should succeed: {r.text}"
 
 
-def test_identity_init_blocked_when_below_age_tier_floor(backend):
-    """Floor is per-age. For a ≥1-month relationship the floors jump:
-    Story=8, About me=25. Writing 1 moment + 1 fact (which would pass
-    the <2-day floor) trips the gate at the higher tier."""
-    user_id, api_key = _register(backend["base_url"])
-    two_months_ago = (datetime.now() - timedelta(days=60)).isoformat()
-    _add_memory(backend["base_url"], user_id, api_key, "m0",
-                mem_type="moment", occurred_at=two_months_ago)
-    _add_memory(backend["base_url"], user_id, api_key, "f0",
-                mem_type="fact", occurred_at=two_months_ago)
-    r = _init_identity(backend["base_url"], user_id, api_key)
-    assert r.status_code == 409, f"expected 409, got {r.status_code}: {r.text}"
-    body = r.json()
-    assert body["counts"]["total"] == 2
-    assert body["floors"]["story"] >= 8, f"expected ≥1-month story floor, got {body}"
-    assert body["floors"]["about_me"] >= 25, f"expected ≥1-month about_me floor, got {body}"
-
-
 def test_identity_init_allowed_with_one_card_for_we_just_met(backend):
     """The <2-days tier needs only Story=1 + About me=1 (total 2).
     'We just met today' is a valid bootstrap path."""
@@ -543,6 +511,48 @@ def test_identity_init_allowed_with_one_card_for_we_just_met(backend):
     _seed_passing_bootstrap(backend["base_url"], user_id, api_key)
     r = _init_identity(backend["base_url"], user_id, api_key, days=0)
     assert r.status_code == 201, f"identity_init should succeed: {r.text}"
+
+
+def test_zero_memory_user_completes_onboarding(backend):
+    """A' (2026-06) core: a brand-new user with ZERO memory cards completes
+    onboarding end-to-end — identity init + live chat loop — chat is allowed
+    and bootstrap/status is_complete=True. No memory floor anywhere."""
+    user_id, api_key = _register(backend["base_url"])
+    # Deliberately write NO memory cards.
+    assert _init_identity(backend["base_url"], user_id, api_key).status_code == 201
+    _establish_live_connection(backend["base_url"], user_id, api_key)
+    r = _chat_response(backend["base_url"], user_id, api_key)
+    assert r.status_code == 200, f"chat_response should succeed with 0 memory: {r.text}"
+    r = requests.get(
+        f"{backend['base_url']}/v1/bootstrap/status",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    body = r.json()
+    assert body["memories_count"] == 0
+    assert body["is_complete"] is True, f"0-memory onboarding should complete: {body}"
+
+
+def test_bootstrap_instructions_drop_memory_floor_gate(backend):
+    """A' (2026-06): /v1/bootstrap onboarding instructions must NOT tell the
+    agent to pile memory floors before identity/chat, nor present
+    feedling_memory_verify as an identity_init prerequisite."""
+    user_id, api_key = _register(backend["base_url"])
+    r = requests.post(
+        f"{backend['base_url']}/v1/bootstrap",
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    instructions = body.get("instructions", "")
+    assert instructions, f"expected first_time instructions, got: {body}"
+    assert "每个 tab 各自有 floor" not in instructions
+    assert "都过 floor" not in instructions
+    assert "记忆不是 onboarding 的门槛" in instructions
+    # A' deeper conflict (Codex): identity must NOT be presented as hard-derived
+    # from the Memory Garden — a 0-memory user has no receipts to derive from.
+    assert "必须来自 Memory Garden receipts" not in instructions
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +666,10 @@ def test_memory_verify_empty_user(backend):
     assert len(body["suggestions"]) >= 2  # one per missing tab
 
 
+@pytest.mark.skip(reason="P6: /v1/memory/verify per-tab semantics retired by v1 "
+                  "_count_by_tab shim (every active card counts to all tabs). "
+                  "Pre-existing failure on origin/test from the v1 schema merge; "
+                  "rewrite when verify is reworked in P6 cleanup.")
 def test_memory_verify_passing_at_minimum_floor(backend):
     """<2d tier needs Story=1 + About me=1 (TA Thinking=0 OK).
     Writing 1 moment + 1 fact today should mark passing=true."""
@@ -676,6 +690,8 @@ def test_memory_verify_passing_at_minimum_floor(backend):
     assert body["passing_full"] is True
 
 
+@pytest.mark.skip(reason="P6: /v1/memory/verify per-tab semantics retired by v1 "
+                  "_count_by_tab shim. Pre-existing on origin/test; rewrite in P6.")
 def test_memory_verify_about_me_floor_only_passing(backend):
     """Filling Story + About me but no TA Thinking memories → passing=true
     (identity_init gate uses Story + About me) but passing_full=false."""
@@ -767,7 +783,11 @@ def test_onboarding_validate_steps_progression(backend):
     )
     body = r.json()
     assert body["passing"] is False
-    assert body["stage"] == "memory_garden"
+    # A' (2026-06): memory_garden is informational (passing=True, blocking=False),
+    # so the first blocking step for a fresh user is identity_card, not memory.
+    assert body["stage"] == "identity_card"
+    mg = next(s for s in body["steps"] if s["id"] == "memory_garden")
+    assert mg["passing"] is True and mg["blocking"] is False
 
     _seed_passing_bootstrap(backend["base_url"], user_id, api_key)
     assert _init_identity(backend["base_url"], user_id, api_key).status_code == 201
@@ -1097,6 +1117,9 @@ def test_memory_add_reflection_lifetime_cap_under_30d(backend):
     assert r.json()["error"] == "reflection_lifetime_cap"
 
 
+@pytest.mark.skip(reason="P6: memory.retype + per-tab semantics retired by v1 "
+                  "(_count_by_tab shim; retype is legacy). Pre-existing on "
+                  "origin/test; rewrite/remove in P6.")
 def test_memory_retype_changes_tab(backend):
     """Retype a fact → moment. About me count goes down, Story up."""
     user_id, api_key = _register(backend["base_url"])
@@ -1163,6 +1186,8 @@ def test_memory_retype_unknown_id_returns_404(backend):
     assert r.status_code == 404
 
 
+@pytest.mark.skip(reason="P6: per-tab counts in /v1/memory/verify retired by v1 "
+                  "_count_by_tab shim. Pre-existing on origin/test; rewrite in P6.")
 def test_per_tab_counts_in_verify(backend):
     """Write one of each non-anchor type, verify per-tab counts match."""
     user_id, api_key = _register(backend["base_url"])

@@ -16,12 +16,22 @@ tokens defined at the bottom of `DESIGN.md`.
 
 1. `docs/CHANGELOG.md` — landmark diffs from recent sessions; this is
    the source of truth for "what shipped, when, why."
-2. `DESIGN.md` — if doing any UI work.
-3. `deploy/DEPLOYMENTS.md` — if doing any enclave/CVM/on-chain work.
+2. `CONTRIBUTING.md` — backend code-organization rules (where new code
+   goes, dependency direction, app.py is assembly-only). Read before
+   writing ANY backend code; PRs are reviewed against it.
+3. `DESIGN.md` — if doing any UI work.
+4. `deploy/DEPLOYMENTS.md` — if doing any enclave/CVM/on-chain work.
 
 There is no longer a separate HANDOFF.md — it was a session-relay doc
 from the v0→v1 strip era and was deleted 2026-05-12. Recent state lives
 in the CHANGELOG and in git log.
+
+## Agent mailbox
+
+When coordinating with another local coding/audit agent in this repo, use
+`docs/AGENT_MAILBOX.md` and `scripts/agent-mailbox/`. The durable mailbox lives
+under `.agents/mailbox/` and is ignored by git; tmux wakeups only inject a
+fixed read command, never the full message body.
 
 ## Other repo conventions
 

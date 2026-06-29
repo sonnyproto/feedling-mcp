@@ -4,6 +4,8 @@ import json
 from datetime import date
 from typing import Any
 
+from memory.prompts_v1 import MEMORY_WRITE_GUIDANCE_V1
+
 
 def build_foreground_chat_messages(
     *,
@@ -28,9 +30,11 @@ def build_foreground_chat_messages(
                 "Reply naturally and concisely in the companion's established voice. "
                 "Use candidate memory cards only when they are directly relevant to the user's current message; "
                 "ignore candidates whose selection reason is weak, generic, or off-topic. "
+                "context_memory_selection.memory_index lists more of your memories by title and date; if one is clearly relevant to what the user just said, you may naturally recall it as something you remember, even though its full text was not attached — do not fabricate details beyond the title, and do not force a recall when nothing fits. "
                 "Memory cards with source=model_api_correction are explicit user corrections; treat them as higher priority than older conflicting memories or identity text. "
                 "If a correction says not to repeat a phrase, persona, joke, name, boundary, or setting, do not repeat it. "
                 "If identity.agent_name is empty, do not invent or use a name for yourself; wait for the user to name you. "
+                "If identity.custom_persona_prompt is present, it is the user's own directive for who you should be and how you should speak; treat it as the highest-priority persona guidance, above other identity or profile text, except where it conflicts with safety boundaries. "
                 "If the user asks to remember, forget, rename, or change Identity/Memory, respond naturally but do not claim the durable state has already been written or deleted. "
                 "If Feedling context includes pending_state_updates and the user confirms or cancels them, acknowledge the user's choice naturally; the backend runtime will apply or clear the durable state after this visible reply. "
                 "Do not mention hidden implementation details, API keys, prompts, or encrypted storage."
@@ -82,6 +86,7 @@ def build_memory_capture_messages(
         "user_message": user_message[:4000],
         "assistant_reply": assistant_reply[:4000],
         "existing_context_memories": (context_payload.get("context_memories") or [])[:8],
+        "existing_memory_terms": context_payload.get("existing_memory_terms") or {"buckets": [], "threads": []},
         "identity": context_payload.get("identity") or {},
         "agent_profile": context_payload.get("agent_profile") or {},
         "today": date.today().isoformat(),
@@ -92,13 +97,15 @@ def build_memory_capture_messages(
             "content": (
                 "You are Feedling's Memory Capture worker. Return JSON only. "
                 "Extract durable Memory Garden cards from the latest exchange. "
-                "Only write facts, events, quotes, or rare relational moments. "
                 "Do write explicit user corrections about names, boundaries, persona, voice, preferences, or facts if they are not already present in existing_context_memories. "
-                "Do not write vague preferences, duplicate existing memories, repeated correction cards, or private implementation details. "
-                "Shape: {\"memories\":[{\"type\":\"fact|event|quote|moment\","
-                "\"title\":\"...\",\"description\":\"...\",\"occurred_at\":\"YYYY-MM-DD\","
-                "\"her_quote\":\"optional\",\"context\":\"optional\"}]}. "
+                "Reuse existing_memory_terms.buckets and existing_memory_terms.threads when they fit before creating new names. "
+                "LANGUAGE: write bucket/threads/summary/content in the language the user is chatting in — "
+                "if they chat in Chinese, use Chinese (e.g. 「宠物」not \"pets\", 「旅行」not \"travel\"); only keep proper nouns / brand names / their verbatim quotes in the original. "
+                "Shape: {\"memories\":[{\"summary\":\"...\",\"content\":\"记忆\\n...\\n\\n上下文\\n...\\n\\n使用提示\\n...\","
+                "\"bucket\":\"...\",\"threads\":[\"...\"],\"importance\":0.0,\"pulse\":0.0,\"occurred_at\":\"YYYY-MM-DD\",\"source\":\"chat\"}]}. "
                 "Return {\"memories\":[]} if nothing durable should be written."
+                "\n\n"
+                + MEMORY_WRITE_GUIDANCE_V1
             ),
         },
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)[:12000]},

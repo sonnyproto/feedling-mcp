@@ -25,8 +25,6 @@ from cryptography.hazmat.primitives import serialization
 
 
 TLS_KEY_PATH = "feedling-tls-v1"
-MCP_TLS_KEY_PATH = "feedling-mcp-tls-v1"
-ACME_ACCOUNT_KEY_PATH = "feedling-acme-account-v1"
 
 
 def derive_key_only(dstack, path: str) -> "ec.EllipticCurvePrivateKey":

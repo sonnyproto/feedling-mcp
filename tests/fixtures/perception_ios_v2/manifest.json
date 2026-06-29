@@ -1,0 +1,47 @@
+{
+  "ios_repo": {
+    "path": "/Users/xiaotingtan/Desktop/feedling-mcp-ios",
+    "branch": "main",
+    "commit": "fd60d3f5813128e46f4e68b8cc0ed0b0740a53d0"
+  },
+  "source_files": [
+    "App/FeedlingTest/Pages/Settings/Perception/PerceptionContextSnapshot.swift",
+    "App/FeedlingTest/Pages/Settings/Perception/PerceptionPermissionsManager.swift",
+    "App/FeedlingTest/API/FeedlingAPI.swift",
+    "App/FeedlingBroadcast/SharedConfig.swift",
+    "App/FeedlingBroadcast/SampleHandler.swift"
+  ],
+  "fixtures": {
+    "ios_report_full_changed.json": "All currently emitted report keys, encrypted sensitive/audio/weather/health signals changed=true.",
+    "ios_report_unchanged.json": "Same encrypted sensitive/audio/weather/health signal shape with changed=false.",
+    "ios_report_missing_permission_unavailable.json": "NSNull data shape for missing permission and authorized-but-unavailable signals.",
+    "ios_report_dropped_upload.json": "Content keys unavailable: encrypted signals are omitted from context_snapshot.",
+    "ios_photo_evaluate_document.json": "Current iOS photo/evaluate body: metadata + content_envelope + optional meta_envelope, no exif_gps."
+  },
+  "dropped_upload": {
+    "missing_keys": [
+      "location_signal",
+      "motion_state",
+      "calendar_next_event",
+      "playback",
+      "audio_route",
+      "weather",
+      "reminders",
+      "health_sleep",
+      "health_workout",
+      "health_vitals",
+      "health_activity",
+      "health_body",
+      "health_metabolic",
+      "health_cycle",
+      "health_mood"
+    ],
+    "source_behavior": "encryptedContextItem returns nil when content keys are unavailable, so collectContextSnapshotItems compactMaps the signal out of the report."
+  },
+  "human_device_report": {
+    "status": "pending_user_verification",
+    "verified_by": null,
+    "verified_at": null,
+    "note": "Agents can prepare fixtures and tests, but only a human can certify that the iOS app hit the backend from a device or simulator."
+  }
+}

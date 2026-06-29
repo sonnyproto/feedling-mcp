@@ -27,6 +27,154 @@ retirement when keeping the exact value no longer helps verification.
 | MCP pubkey pin | Retired in prod9 architecture: `mcp_tls_cert_pubkey_fingerprint_hex` is empty by design; content-layer envelopes sealed to `enclave_content_pk` are the privacy boundary. |
 | Deploy path | GitHub Actions `deploy-cvm` pins the GHCR image tag, deploys this CVM via Phala, then publishes the live dstack-computed compose hash on Sepolia. |
 
+### Test CVM (prod9, `test` branch)
+
+| | |
+|---|---|
+| Provider | Phala Cloud dstack on prod9 (`dstack-pha-prod9.phala.network`, node id `18`) |
+| CVM ID | `19b13ebe-d12e-4d19-97d1-6cf41389b663` (also in `deploy/test-cvm-id.txt`) |
+| App ID | `bb9716955423faed3508888e7c654ff46f5f0c2d` |
+| Created | 2026-06-09, instance `tdx.small` |
+| Compose | `deploy/docker-compose.phala.test.yaml` — same 4 services as prod, with test domains + `_test` volumes |
+| Public API | `https://test-api.feedling.app` (via dstack-ingress — live, `/healthz` 200) |
+| Public MCP | `https://test-mcp.feedling.app/sse?key=<api_key>` (via dstack-ingress — live, SSE 200) |
+| Database | Dedicated test RDS `feedling-mcp-test-t4g-micro.cgh0oucoe0x9.us-east-1.rds.amazonaws.com:5432/postgres` — fully isolated from prod (separate instance → separate `enclave_content_pk` self-consistent, no shared schema). Injected via `TEST_DATABASE_URL`. |
+| On-chain | **Separate** Sepolia FeedlingAppAuth `0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5` (owner = the `ETH_DEPLOYER_KEY` address `0xa0eBcd26…`, so the CI `addComposeHash` is authorized), kept apart from prod's contract so the prod release log stays clean. Address lives in repo var `TEST_FEEDLING_APP_AUTH_CONTRACT`. Each `deploy-test-cvm` run publishes the live compose_hash here, fail-loud, same as prod. Deployed 2026-06-09 via a one-shot `workflow_dispatch` (since removed). |
+| Deploy path | GitHub Actions `deploy-test-cvm` job (in `ci.yml`) on push to the `test` branch. Mirrors prod but targets the test compose / CVM / DB / contract and is branch-gated to `refs/heads/test`. |
+| First-boot note | The CVM was first created 2026-06-09 WITHOUT a CF token (to mint the app_id quickly), so `dstack-ingress` couldn't issue the `test-*.feedling.app` LE certs initially. The `test`-branch CI deploy injects `CF_*` from GitHub secrets — domains + certs are now live. Backend also needed the test RDS reachable from the CVM (Publicly accessible + SG inbound 5432) before it stopped crash-looping. |
+| iOS | The iOS app source is not in this repo. Point its test build at app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` + gateway `dstack-pha-prod9.phala.network` + test contract `0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5`. |
+
+### agent-runner (hosted agent-runtime) — 4th CVM service
+
+The `agent-runner` service runs `backend/agent_runtime/supervisor.py`: a
+multi-tenant supervisor that hosts the resident consumer
+(`tools/chat_resident_consumer.py`) one process per user, driving `claude` /
+`codex exec` in cli mode. It's defined **inline** in both
+`docker-compose.phala.yaml` and `docker-compose.phala.test.yaml` (its image
+`ghcr.io/teleport-computer/feedling-agent-runner:<sha>` is built by
+`docker-publish.yml` from `deploy/Dockerfile.agent-runner` and pinned by the same
+CI step that pins the backend image). The standalone
+`docker-compose.agent-runner.yaml` overlay is now **local-dev only** (superseded).
+
+**Idle by default = zero behaviour change.** With `AGENT_RUNTIME_USERS` empty and
+`AGENT_RUNTIME_AUTODISCOVER` unset, the supervisor spawns nobody (it idles and
+re-checks each tick instead of exiting). All the knobs below flow through the
+**encrypted env channel** (`phala deploy -e …`), so they are NOT baked into
+compose_hash — flipping them on later needs **no on-chain re-auth**.
+
+| Env | Purpose | Default |
+|---|---|---|
+| `AGENT_RUNTIME_USERS` | roster JSON `[{"api_key":"…"}]` — who to host (carries per-user keys) | empty → idle |
+| `AGENT_RUNTIME_AUTODISCOVER` | also pull hosted-enabled users from the DB (intersected with the roster's creds) | off |
+| `FEEDLING_RUNTIME_TOKEN_SECRET` | Stage-D: mint short-lived per-user runtime tokens (consumer drops the long-term api key) | off → consumer uses api key |
+| `FEEDLING_LITELLM_ENABLE` | run the in-CVM LiteLLM gateway (codex non-openai providers). **Must match the backend's same var** (the cutover routing decision is backend-side) | off |
+| `FEEDLING_LITELLM_API_KEY` | gateway bearer codex presents | — |
+| `FEEDLING_HOST_ALL` | **zero-touch hosting**: every configured user (tested-ok provider, not opted out) is hosted with NO `AGENT_RUNTIME_USERS` roster — the supervisor mints a runtime token per DB-discovered user and resolves the provider key with it; the backend routes their sends to the agent-runner; a freshly-hosted user's chat gate is auto-opened via verify_loop. **Requires `FEEDLING_RUNTIME_TOKEN_SECRET` set on BOTH services** (backend verifies, agent-runner mints) — inert without it. **Must match the backend's same var.** Per-user opt-out: set that user's `agent_runtime_driver="legacy"`. | off → per-user flag still required |
+
+CI secrets/vars (test job; `TEST_`-prefixed): `secrets.TEST_AGENT_RUNTIME_USERS`,
+`vars.TEST_AGENT_RUNTIME_AUTODISCOVER`, `secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET`,
+`vars.TEST_FEEDLING_LITELLM_ENABLE`, `secrets.TEST_FEEDLING_LITELLM_API_KEY`,
+`vars.TEST_FEEDLING_HOST_ALL`. Prod job uses the un-prefixed names.
+
+**Zero-touch host-all rollout order (`FEEDLING_HOST_ALL`):**
+1. First set `TEST_FEEDLING_RUNTIME_TOKEN_SECRET` (generate a random secret) so
+   BOTH backend + agent-runner share it. Re-deploy `test` with `HOST_ALL` still
+   off — confirms token auth wired, zero behaviour change.
+2. Set `TEST_FEEDLING_HOST_ALL=1`. Re-deploy. A user who only configured an
+   **anthropic** provider (NO `/v1/model_api/driver` flip, NOT in any roster) must
+   now: appear in `agent_runtime_instances` (lease row), get its chat gate
+   auto-opened, and reply via hosted claude on the first message.
+3. Prod: same two steps (secret first, then `FEEDLING_HOST_ALL=1`), gated on your
+   go — prod auto-hosting has only a global kill-switch + per-user opt-out, no
+   per-user gradual ramp.
+
+**Wedge guard (cross-service safety).** After the legacy-inline cutover the backend
+routes EVERY fit-provider send to the agent-runner, so a turn wedges in
+`processing` forever if no consumer is hosting. Two layers prevent silent wedges:
+- **Startup** (`assert_hosting_ready`): the backend refuses to boot unless its own
+  `FEEDLING_LITELLM_ENABLE` + `FEEDLING_HOST_ALL` + `FEEDLING_RUNTIME_TOKEN_SECRET`
+  are set (validated in `__main__` and via `gunicorn_conf.py`'s `on_starting`).
+- **Per request** (`check_supervisor_live`): the supervisor writes a global
+  heartbeat to `server_config` each tick (`ts` + `host_all` + `gateway`); before
+  routing a send the backend reads it and returns **503 `hosting_runtime_unavailable`**
+  (with a `reason`) instead of parking the turn — when the heartbeat is missing,
+  stale, or its `host_all`/`gateway` flags are off. This is what catches the case
+  the startup check can't see: the **agent-runner service** crashed, or has the
+  three vars set on the backend but NOT on itself. **So set all three vars on BOTH
+  services** — a backend-only config still 503s every send (loudly) rather than
+  hanging. Staleness window: `FEEDLING_SUPERVISOR_HEARTBEAT_MAX_AGE_SEC` (default
+  90s ≈ 6 ticks); a DB read error fails **open** (routes anyway) so the guard never
+  becomes its own outage.
+
+**To start real-device testing (recommended order — least → most unvalidated):**
+1. Deploy as-is (agent-runner idle). Confirms the 4th service builds + boots
+   without disturbing existing users.
+2. Set `TEST_AGENT_RUNTIME_USERS` to a roster with **one** test user whose
+   provider is **anthropic** (→ claude, native, no gateway), leave
+   `TEST_FEEDLING_LITELLM_ENABLE` off. Re-deploy `test`. Validate A0:
+   onboarding/verify_loop green, chat works.
+3. Add an **openai** user (→ codex native).
+4. **Last**, after an offline `codex→LiteLLM→gemini/openrouter` tool-loop eval:
+   set `TEST_FEEDLING_LITELLM_ENABLE=1` (it auto-includes the gateway providers in
+   discovery + starts the proxy) and a gemini/openrouter test user.
+
+**Hosted-cutover deployment prerequisites (三件套，缺一不可):**
+
+收口后，backend cutover 无条件把配了合适 provider 且 `test_ok` 的用户路由到
+agent-runner。以下三个变量必须同时设置；缺任何一个会导致全员 hang 或后端启动失败：
+
+| 变量 | 若缺失 |
+|---|---|
+| `FEEDLING_LITELLM_ENABLE` | 后端 `on_starting` **启动失败 fail-fast**（`gunicorn_conf.py` 的 `assert_hosting_ready` 检查此变量）。**纯 native 部署（无 codex/gemini）也必须设**，否则后端拒绝启动。 |
+| `FEEDLING_HOST_ALL` | 后端 `on_starting` **启动失败 fail-fast**；且 supervisor 不 spawn consumer，用户请求被 backend 路由到 agent-runner 但无 consumer 处理。 |
+| `FEEDLING_RUNTIME_TOKEN_SECRET` | 后端 `on_starting` **启动失败 fail-fast**；且 supervisor 无法为 DB 发现的用户 mint runtime token，host-all 发现静默失败。须在 backend 和 agent-runner 两侧同时设置相同的值。 |
+
+部署顺序：先设 `FEEDLING_RUNTIME_TOKEN_SECRET`（backend + agent-runner 共享同一 secret），
+确认 token 鉴权通过、行为不变；再同步开启 `FEEDLING_HOST_ALL` 和 `FEEDLING_LITELLM_ENABLE`。
+
+## Enclave configuration
+
+### Screen frame VLM captioning
+
+Screen perception captioning is opt-in per user via the `screen_caption_enabled` flag (default OFF, fail-closed). To enable:
+
+- **Required secret**: `FEEDLING_SCREEN_VLM_API_KEY` — OpenRouter API key for VLM inference. Injected via `phala deploy -e FEEDLING_SCREEN_VLM_API_KEY=<key>` (encrypted env channel, not in compose_hash). If absent, the `/v1/screen/frames/<id>/caption` route fails closed with `screen_caption_unconfigured`.
+- **Optional overrides**: `FEEDLING_SCREEN_VLM_MODEL` (default `qwen/qwen3-vl-8b-instruct`), `FEEDLING_SCREEN_VLM_BASE_URL` (default `https://openrouter.ai/api/v1`). Injected same way.
+
+**Non-code prerequisites before enabling for any user:**
+1. **Privacy disclosure**: Disclose to users that screen pixels egress to OpenRouter (third-party inference provider) for captioning. Although the backend never holds plaintext pixels (enclave decrypts, captions only), this is a new privacy expansion.
+2. **Data retention policy**: Configure the OpenRouter account to disable prompt logging, model training, and other retention policies. Prefer zero-retention settings or an explicit no-training SLA.
+
+### Screen frame ciphertext offload to R2 (object storage)
+
+The heavy frame ciphertext (`frame_envelopes.doc.body_ct`, >150KB ChaCha20-Poly1305 screenshot blob) is offloaded to Cloudflare R2 (S3-compatible) so it stops bloating Postgres rows/TOAST and backups. PG keeps only the small envelope metadata (`env_meta`) + an R2 pointer (`body_key`); see `backend/object_storage.py` and migration `0007_frame_body_to_r2`.
+
+- **Config** (reuses the repo's existing `R2_*` credentials; the frame bucket is a dedicated var so it never collides with the WAL-G backup bucket `R2_BUCKET`):
+  - `R2_ENDPOINT` (`https://<accountid>.r2.cloudflarestorage.com`; derived from `R2_ACCOUNT_ID` if unset) — shared R2 endpoint.
+  - `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` — R2 S3 credentials. **The token MUST be scoped to the frames bucket** (a token scoped only to other buckets returns `AccessDenied`).
+  - `R2_FRAMES_BUCKET` — the dedicated frames bucket, e.g. `io-image-frames`.
+  Injected via `phala deploy -e R2_*=<value>` (encrypted env channel; the compose `environment:` keys exist for interpolation, so the *values* are not baked into compose_hash — same mechanism as `DATABASE_URL` / `FEEDLING_SCREEN_VLM_API_KEY`).
+- **GitHub Secrets / CI wiring** (`.github/workflows/ci.yml` deploy jobs map these into the `phala deploy -e` calls; `backend` service env lives in `deploy/docker-compose.phala*.yaml`):
+  - **Prod** (`deploy-cvm`): repo secrets `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_FRAMES_BUCKET`.
+  - **Test** (`deploy-test-cvm`): `TEST_`-prefixed secrets `TEST_R2_ENDPOINT`, `TEST_R2_ACCESS_KEY_ID`, `TEST_R2_SECRET_ACCESS_KEY`, `TEST_R2_FRAMES_BUCKET` (mapped to the un-prefixed container env, same convention as `TEST_DATABASE_URL`).
+  - Note: adding the four `R2_*` keys to the backend compose changes `compose_hash` once; the deploy job's existing on-chain publish step re-auths it. Until the secrets are populated the feature stays OFF (fail-open to legacy inline storage).
+- **Fail-open to legacy**: if the credentials/bucket are absent, the backend keeps storing `body_ct` inline in the row (legacy shape) — the feature is gated on config, so a missing/incomplete secret degrades gracefully rather than dropping frames.
+- **Egress**: the non-TEE backend (not the enclave) makes outbound HTTPS to R2 on the frame write/read paths. The enclave is unaffected — it still pulls frame envelopes via the backend's `/v1/screen/frames/<id>/envelope` route, which now transparently reconstructs `body_ct` from R2.
+- **Threat model**: R2 creds live in the TDX CVM; a leak exposes only ciphertext blobs (content_sk is in the enclave/iOS, never the backend) — equivalent to a `DATABASE_URL` leak today.
+- **Migrating existing rows**: run `backend/backfill_frames_to_r2.py` offline against prod `DATABASE_URL` + the R2 creds (`--dry-run` first to count/size). Idempotent + resumable; already-offloaded rows are skipped. The schema migration (`0006`) only adds columns — it does NOT move data.
+
+### Client diagnostic logs to R2 (`backend/diagnostics/`)
+
+Lets a client upload its persistent `diagnostics.log` (`POST /v1/diagnostics/logs`, user auth) so a developer can pull it by user id (`GET /v1/admin/diagnostics/logs/<user_id>`, admin auth → presigned download URLs). See `backend/diagnostics/`.
+
+- **Plaintext, by design**: unlike frame ciphertext, these logs are stored as plaintext — a scoped exception to the "server never sees user plaintext" invariant (user-initiated upload, few testers, private bucket, short retention). Treat the bucket accordingly.
+- **Config** (reuses the same `R2_ENDPOINT` / `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` credentials as frames):
+  - `R2_USER_LOGS_BUCKET` — dedicated bucket `io-user-logs`, separate from `R2_FRAMES_BUCKET` and the WAL-G backup `R2_BUCKET`. The bucket name is **not** secret, so both compose files (`docker-compose.phala.yaml` / `docker-compose.phala.test.yaml`) default it to `io-user-logs` — no extra GitHub secret / `-e` flag needed. It activates automatically wherever the frames R2 credentials are already injected.
+  - **The R2 token MUST also be scoped to `io-user-logs`** (a frames-only token returns `AccessDenied` here → the route falls back to inline Postgres, see below). Create the bucket and widen the token scope before relying on the R2 path.
+- **Retention**: set a Cloudflare lifecycle rule on `io-user-logs` to expire objects after ~7 days. DB-side, the route trims each user's index stream to the newest 10 rows.
+- **Fail-open to Postgres**: when `R2_USER_LOGS_BUCKET`/creds are absent, the log text is stored inline in the `client_diagnostics` Postgres log stream instead — local dev / tests need no R2.
+- **Egress**: the non-TEE backend (not the enclave) makes outbound HTTPS to R2 on upload/admin-read.
+
 ### Retired VPS (historical, redacted)
 
 | | |

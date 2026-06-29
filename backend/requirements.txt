@@ -4,14 +4,17 @@ websockets>=12.0
 httpx[http2]>=0.27.0
 PyJWT>=2.8.0
 cryptography>=42.0.0
-fastmcp>=2.0.0
 Pillow>=10.0.0
 
-# Production WSGI server for the Flask backend. The dev server in
-# app.run() (Werkzeug) is single-process and stalls on large responses
-# under the TDX CVM; gunicorn gives worker timeouts + better write-out.
-# MUST stay single-worker: app.py starts the WebSocket ingest thread at
-# import time (binds :9998), so multiple workers would collide on it.
+# Production WSGI server for both the Flask backend and the enclave service.
+# The dev server in app.run() (Werkzeug) is single-process and stalls on large
+# responses under the TDX CVM; gunicorn gives worker timeouts + better
+# write-out. The backend MUST stay single-worker: app.py starts the WebSocket
+# ingest thread at import time (binds :9998), so multiple workers would collide
+# on it. The enclave embeds gunicorn programmatically (BaseApplication) from
+# enclave_app.py's __main__ so its compose entrypoint stays
+# `python -u backend/enclave_app.py` (compose_hash unchanged); it serves its
+# in-enclave TLS via the gunicorn `ssl_context` hook (needs >=21.0).
 gunicorn>=23.0.0
 
 # Phase 1 (enclave) deps — see backend/enclave_app.py
@@ -31,3 +34,11 @@ psycopg[binary,pool]>=3.2
 # request path still talks to Postgres directly via the psycopg pool. The
 # migration engine connects with the psycopg3 driver (postgresql+psycopg://).
 alembic>=1.13
+
+# Cloudflare R2 (S3-compatible) object storage for the heavy frame ciphertext
+# (see backend/object_storage.py). The >150KB body_ct blob is offloaded to R2 so
+# it stops bloating frame_envelopes rows / TOAST; PG keeps only metadata + a
+# pointer. Gated on R2_* env (R2_ENDPOINT / R2_ACCESS_KEY_ID /
+# R2_SECRET_ACCESS_KEY / R2_FRAMES_BUCKET) — absent, the backend keeps storing
+# body_ct inline in the row (legacy shape), so this dep is only exercised in prod.
+boto3>=1.34

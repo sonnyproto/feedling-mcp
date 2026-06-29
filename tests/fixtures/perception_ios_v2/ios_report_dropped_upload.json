@@ -1,0 +1,30 @@
+{
+  "context_snapshot": [
+    {
+      "key": "time",
+      "data": "{\"local_time\":\"2026-06-19T21:02:00+08:00\",\"locale\":\"zh-Hans-CN\",\"timezone\":\"Asia/Shanghai\"}",
+      "message": "本地时间、时区和语言环境"
+    },
+    {
+      "key": "battery",
+      "data": "{\"charging\":false,\"level\":0.44}",
+      "message": "当前电量与充电状态"
+    },
+    {
+      "key": "broadcast",
+      "data": "{\"active\":false,\"state\":\"idle\"}",
+      "message": "屏幕 broadcast 状态"
+    },
+    {
+      "key": "focus",
+      "data": "{\"authorization_status\":\"authorized\",\"focused\":false}",
+      "message": "当前是否处于某个专注模式（二值，不含具体名称）"
+    },
+    {
+      "key": "unsupported",
+      "data": "{\"frontmost_app\":null,\"precise_unlock\":null,\"silent_mode\":null}",
+      "message": "iOS 当前不能稳定提供的感知项"
+    }
+  ],
+  "client_ts": "1781874120"
+}

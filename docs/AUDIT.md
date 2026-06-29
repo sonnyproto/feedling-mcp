@@ -51,8 +51,8 @@ on-chain, and users who've accepted an older `compose_hash` see the
 change in the app's consent modal before any new release runs.
 
 The residual trust surface: Intel's TDX silicon, Phala/dstack
-infrastructure, standard CA/DNS trust for `api.feedling.app` and
-`mcp.feedling.app`, and the Feedling team's Ethereum key used to
+infrastructure, standard CA/DNS trust for `api.feedling.app`,
+and the Feedling team's Ethereum key used to
 publish `addComposeHash` transactions. The attestation endpoint still
 uses enclave-owned TLS on the `-5003s.` route so the app can pin the
 certificate fingerprint signed into the TDX quote.
@@ -70,9 +70,9 @@ shell + code-read + web access.
 | 2 | The deployed `compose_hash` is what this repo's `docker-compose.phala.yaml` would produce. | Run `deploy/publish-compose-hash.sh` locally and compare to `/attestation`'s `compose_hash`. | 5 min |
 | 3 | The deployed `compose_hash` is in the on-chain release log. | `cast call --rpc-url <sepolia> 0x6c8A6f1e3eD4180B2048B808f7C4b2874649b88F "isAppAllowed(bytes32)(bool)" 0x<compose_hash>`. Expect `true`. | 1 min |
 | 4 | The TDX quote was signed by Intel hardware. | Run `tools/audit_live_cvm.py`; rows 1–3 are Intel's signature chain + measurement integrity. The script is small enough to read end to end. | 5 min |
-| 5 | The attestation TLS cert on the `-5003s.` URL is the one the enclave attested. | `tools/audit_live_cvm.py` row 7 pins `sha256(cert.DER)` vs the attested fingerprint. Row 8 is now a prod9 disclosure: MCP uses standard Let's Encrypt TLS at `dstack-ingress`; content privacy is enforced by envelopes sealed to `enclave_content_pk`. | 1 min |
+| 5 | The attestation TLS cert on the `-5003s.` URL is the one the enclave attested. | `tools/audit_live_cvm.py` row 7 pins `sha256(cert.DER)` vs the attested fingerprint. Row 8 is now a disclosure row: the MCP service was removed 2026-06-12 (`mcp_tls_cert_pubkey_fingerprint_hex` stays empty in the bundle); content privacy is enforced by envelopes sealed to `enclave_content_pk`. | 1 min |
 | 6 | The backend code doesn't decrypt content. | Read `backend/app.py`. `/v1/chat/message`, `/v1/memory/add`, `/v1/identity/init`, `/v1/content/swap` all require v1 envelopes and store them verbatim — no crypto primitives called, and plaintext bodies now 400. The only place envelope bodies are decrypted is `backend/enclave_app.py`, which runs inside the TDX container. | 20 min |
-| 7 | Identity.nudge can't silently mutate encrypted cards. | The HTTP `/v1/identity/nudge` endpoint was removed in the 2026-04-20 v0 strip. Identity mutation now only happens through MCP `feedling.identity.nudge` (`backend/mcp_server.py`), which runs inside the TDX container and does decrypt-mutate-rewrap before POSTing a full v1 envelope to `/v1/identity/replace`. Plaintext mutation is no longer expressible on the wire. | 2 min |
+| 7 | Identity.nudge can't silently mutate encrypted cards. | The HTTP `/v1/identity/nudge` endpoint was removed in the 2026-04-20 v0 strip; the MCP nudge tool was removed with the MCP line on 2026-06-12. Identity mutation now only happens via `/v1/identity/actions` envelope-rewrap actions (decrypt happens in the enclave). Plaintext mutation is not expressible on the wire. | 2 min |
 | 8 | The iOS app actually pins the TLS cert, not just displays a green check. | Read `testapp/FeedlingTest/AuditCardView.swift` `PinningCaptureDelegate` + `AuditViewModel.run`. The delegate captures the server's `sha256(cert.DER)` during the TLS handshake; the viewmodel compares it to `bundle.enclave_tls_cert_fingerprint_hex`. Mismatch ⇒ red row + "MITM detected". | 10 min |
 | 9 | The iOS app decrypts client-side, not via the server. | Read `testapp/FeedlingTest/ContentEncryption.swift` + `ChatMessage.decryptedIfNeeded`. Envelopes land in view models, are unsealed with `user_sk` from Keychain, body AEAD-opened with the recovered `K`. | 15 min |
 | 10 | Reset actually deletes the ciphertext (not just local). | Read `backend/app.py` `/v1/account/reset`. Calls `shutil.rmtree(store.dir)` + removes the user from `users.json` + evicts the `api_key_hash` cache. Second call with the same key 401s because the user no longer exists. | 5 min |
@@ -92,9 +92,8 @@ source-review work.
   (`derive_keys`), attestation bundle assembly, per-user content
   decrypt handlers. Read top-to-bottom; ~800 lines.
 - `backend/dstack_tls.py` — deterministic TLS cert derivation from
-  dstack-KMS for the attestation port. Earlier MCP-in-enclave TLS
-  modes used the same helper; prod9 now terminates public MCP TLS at
-  `dstack-ingress`.
+  dstack-KMS for the attestation port. (Earlier MCP-in-enclave TLS
+  modes used the same helper; the MCP service was removed 2026-06-12.)
 - `backend/content_encryption.py` — Python mirror of iOS's
   `ContentEncryption.swift`. Same primitives on both sides; if they
   drift, AEAD verification fails on read-back.
@@ -110,8 +109,8 @@ source-review work.
   surfaces every check in a labelled row + a tap-to-expand
   mechanism reveal per row.
 - `tools/audit_live_cvm.py` — the CLI auditor. It runs the same
-  security checks as the iOS card; on prod9 row 8 is a green
-  disclosure about ingress-terminated MCP TLS.
+  security checks as the iOS card; row 8 is a green disclosure row
+  (MCP service removed 2026-06-12, fingerprint field stays empty).
 
 ### On-chain
 
@@ -128,9 +127,6 @@ source-review work.
   auditing data handling.** Every endpoint that accepts user data
   either stores ciphertext verbatim or is explicitly marked as a
   plaintext metadata field.
-- `backend/mcp_server.py` — the MCP server that agents connect to.
-  Wraps plaintext input into v1 envelopes before POSTing to Flask,
-  so agent-authored memory / identity lands as ciphertext on disk.
 
 ### Deploy
 
@@ -193,7 +189,7 @@ Read this section carefully — it's the list of claims we
 - **The TLS cert that your phone uses for `/attestation` on `-5003s.`
   really is generated inside the enclave.** We pin
   `sha256(cert.DER)` against a value signed by Intel's hardware. The
-  public API and MCP domains use normal Let's Encrypt TLS at
+  public API domain uses normal Let's Encrypt TLS at
   `dstack-ingress`; that is transport protection, not the content
   privacy boundary.
 - **The enclave's decryption key is bound to the `compose_hash`.**

@@ -1,0 +1,231 @@
+from __future__ import annotations
+
+import json
+import sys
+import types
+from pathlib import Path
+
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+
+import enclave_app  # noqa: E402
+from memory import actions as memory_actions  # noqa: E402
+from memory import service as memory_service  # noqa: E402
+
+
+def _install_memory_action_fakes(monkeypatch, moments: list[dict]) -> list[dict]:
+    saved: list[dict] = []
+    envelope_counter = {"value": 0}
+
+    def fake_load(_store):
+        return list(moments)
+
+    def fake_save(_store, new_moments):
+        saved[:] = [dict(moment) for moment in new_moments]
+        moments[:] = [dict(moment) for moment in new_moments]
+
+    def fake_envelope(store, inner, *, item_id=None):
+        envelope_counter["value"] += 1
+        eid = item_id or f"mem_v1_{envelope_counter['value']}"
+        return {
+            "id": eid,
+            "body_ct": json.dumps(inner, ensure_ascii=False),
+            "nonce": f"nonce_{eid}",
+            "K_user": f"ku_{eid}",
+            "K_enclave": f"ke_{eid}",
+            "enclave_pk_fpr": "fpr_test",
+            "visibility": "shared",
+            "owner_user_id": store.user_id,
+        }, ""
+
+    monkeypatch.setattr(memory_actions.memory_service, "_load_moments", fake_load)
+    monkeypatch.setattr(memory_actions.memory_service, "_save_moments", fake_save)
+    monkeypatch.setattr(memory_actions, "_build_memory_envelope_for_store", fake_envelope)
+    monkeypatch.setattr(memory_actions.boot_gates, "_log_bootstrap_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        memory_actions.memory_service,
+        "_append_memory_change",
+        lambda _store, change: {"id": "chg_test", **change},
+    )
+    return saved
+
+
+def test_memory_add_writes_clean_v1_schema_without_legacy_fields(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    saved = _install_memory_action_fakes(monkeypatch, [])
+
+    body, status = memory_actions._execute_memory_actions(store, "api_key", [
+        {
+            "type": "memory.add",
+            "memory": {
+                "summary": "用户有只狗叫蛋子，是比熊。",
+                "content": "记忆: 用户养了一只狗，叫蛋子，是比熊。\n上下文: 用户明确告诉过我们。\n使用提示: 问到宠物时自然提起，不要反复确认。",
+                "bucket": "宠物",
+                "threads": ["蛋子", "狗狗"],
+                "importance": 0.72,
+                "pulse": 0.45,
+                "occurred_at": "2026-06-25T12:24:00",
+                "source": "chat",
+            },
+        }
+    ])
+
+    assert status == 200
+    assert body["status"] == "ok"
+    moment = saved[0]
+    assert moment["importance"] == 0.72
+    assert moment["pulse"] == 0.45
+    assert moment["status"] == "active"
+    assert moment["last_referenced_at"] == moment["occurred_at"]
+    for legacy_key in ("type", "card_v", "salience", "source_type", "anchor_memory_ids"):
+        assert legacy_key not in moment
+
+    inner = json.loads(moment["body_ct"])
+    assert inner == {
+        "summary": "用户有只狗叫蛋子，是比熊。",
+        "content": "记忆: 用户养了一只狗，叫蛋子，是比熊。\n上下文: 用户明确告诉过我们。\n使用提示: 问到宠物时自然提起，不要反复确认。",
+        "bucket": "宠物",
+        "threads": ["蛋子", "狗狗"],
+    }
+
+
+def test_backend_envelope_adapter_normalizes_only_plaintext_fields():
+    old_doc = {
+        "id": "mem_old",
+        "type": "fact",
+        "occurred_at": "2026-06-20T10:00:00",
+        "source": "hosted_runtime_state",
+        "body_ct": "encrypted-inner",
+        "nonce": "nonce",
+        "K_user": "ku",
+        "K_enclave": "ke",
+        "visibility": "shared",
+        "owner_user_id": "usr_v1",
+        "salience": "high",
+        "importance": 0.8,
+    }
+
+    adapted = memory_service.to_v1_card(old_doc)
+
+    assert adapted["body_ct"] == "encrypted-inner"
+    assert adapted["importance"] == 0.8
+    assert adapted["pulse"] == 0.3
+    assert adapted["last_referenced_at"] == "2026-06-20T10:00:00"
+    assert adapted["status"] == "active"
+    assert "bucket" not in adapted
+    assert "threads" not in adapted
+
+
+def test_enclave_inner_adapter_maps_old_inner_to_v1_content_bucket_threads():
+    adapted = enclave_app._memory_inner_to_v1(
+        {
+            "summary": "用户有只猫叫武松。",
+            "description": "用户有只猫叫武松，是狸花猫。",
+            "her_quote": "我有只猫叫武松，是狸花猫。",
+            "linked_dimension": "武松",
+        },
+        {"type": "quote"},
+    )
+
+    assert adapted["summary"] == "用户有只猫叫武松。"
+    assert adapted["bucket"] == "我们的关系"
+    assert adapted["threads"] == ["武松"]
+    assert adapted["content"] == (
+        "记忆: 用户有只猫叫武松，是狸花猫。\n"
+        "上下文: 我有只猫叫武松，是狸花猫。\n"
+        "使用提示: 自然使用这条记忆，不要机械复述。"
+    )
+    for legacy_key in ("title", "description", "her_quote", "verbatim", "linked_dimension"):
+        assert legacy_key not in adapted
+
+
+def test_memory_create_alias_writes_clean_v1_add(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    saved = _install_memory_action_fakes(monkeypatch, [])
+
+    body, status = memory_actions._execute_memory_actions(store, "api_key", [
+        {
+            "type": "memory.create",
+            "memory": {
+                "summary": "用户喜欢先看地图再看路线。",
+                "content": "记忆: 用户喜欢先看地图再看路线。\n上下文: 用户多次提出。\n使用提示: 解释复杂系统时先给结构图。",
+                "bucket": "协作方式",
+                "threads": ["解释偏好"],
+            },
+        }
+    ])
+
+    assert status == 200
+    assert body["results"][0]["action"] == "memory.add"
+    assert json.loads(saved[0]["body_ct"])["bucket"] == "协作方式"
+
+
+def test_memory_retype_updates_type_in_v1_actions(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    moments = [{
+        "id": "mem_any",
+        "owner_user_id": "usr_v1",
+        "type": "event",
+        "status": "active",
+    }]
+    saved = _install_memory_action_fakes(monkeypatch, moments)
+
+    body, status = memory_actions._execute_memory_actions(store, "api_key", [
+        {"type": "memory.retype", "memory_id": "mem_any", "new_type": "fact"}
+    ])
+
+    assert status == 200
+    assert body["status"] == "ok"
+    assert body["results"][0]["action"] == "memory.retype"
+    assert saved[0]["type"] == "fact"
+
+
+def test_memory_patch_becomes_supersede_and_inherits_old_bucket_threads(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    old = {
+        "v": 1,
+        "id": "mem_old_dog",
+        "owner_user_id": "usr_v1",
+        "visibility": "shared",
+        "body_ct": json.dumps({
+            "summary": "用户有只狗叫蛋子。",
+            "content": "记忆: 用户有只狗叫蛋子。\n上下文: 用户明确说过。\n使用提示: 宠物话题自然使用。",
+            "bucket": "宠物",
+            "threads": ["蛋子", "狗狗"],
+        }),
+        "nonce": "nonce_old",
+        "K_user": "ku_old",
+        "K_enclave": "ke_old",
+        "enclave_pk_fpr": "fpr_test",
+        "occurred_at": "2026-06-20",
+        "created_at": "2026-06-20",
+        "updated_at": "2026-06-20",
+        "source": "chat",
+        "status": "active",
+        "importance": 0.7,
+        "pulse": 0.4,
+    }
+    moments = [old]
+    saved = _install_memory_action_fakes(monkeypatch, moments)
+    monkeypatch.setattr(memory_actions, "_memory_plain_from_envelope", lambda moment, _api_key: (json.loads(moment["body_ct"]), ""))
+
+    body, status = memory_actions._execute_memory_actions(store, "api_key", [
+        {
+            "type": "memory.patch",
+            "memory_id": "mem_old_dog",
+            "patch": {
+                "summary": "蛋子是一只比熊，屁股上有胎记。",
+                "content": "记忆: 蛋子是一只比熊，屁股上有胎记。\n上下文: 用户纠正并补充。\n使用提示: 问到蛋子时用新事实。",
+            },
+        }
+    ])
+
+    assert status == 200
+    assert body["results"][0]["action"] == "memory.supersede"
+    old_after = next(moment for moment in saved if moment["id"] == "mem_old_dog")
+    new_card = next(moment for moment in saved if moment["id"] != "mem_old_dog")
+    assert old_after["status"] == "superseded"
+    inner = json.loads(new_card["body_ct"])
+    assert inner["bucket"] == "宠物"
+    assert inner["threads"] == ["蛋子", "狗狗"]
+    assert inner["summary"] == "蛋子是一只比熊，屁股上有胎记。"

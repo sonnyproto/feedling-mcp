@@ -10,6 +10,7 @@ import base64
 import json
 import os
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -138,6 +139,60 @@ def test_process_messages_posts_reply_with_source_message_id():
     assert mock_post.call_args.kwargs["reply_to_message_id"] == "user-msg-1"
 
 
+def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    crc._update_chat_runtime_v2_profile({crc.RESIDENT_CHAT_RUNTIME_V2_FLAG: True})
+    msg = {"id": "user-msg-v2", "role": "user", "content": "天气怎么样？", "ts": 1112.0}
+    captured = {}
+
+    def fake_call(message, images=None, image_paths=None):
+        captured["message"] = message
+        return {"messages": ["外面下雨。"]}
+
+    try:
+        with patch.object(crc, "call_agent", side_effect=fake_call) as mock_agent, \
+             patch.object(crc, "post_reply", return_value={"id": "reply-msg-v2"}) as mock_post:
+            result_ts = crc._process_messages([msg])
+    finally:
+        crc._update_chat_runtime_v2_profile({})
+
+    assert result_ts == pytest.approx(1112.0)
+    mock_agent.assert_called_once()
+    assert captured["message"].endswith("天气怎么样？")  # time anchor prepended, no tool-prompt
+    assert "current_time:" in captured["message"]
+    assert "Available tools JSON" not in captured["message"]
+    assert "tool_calls" not in captured["message"]
+    assert "perception.weather" not in captured["message"]
+    assert "memory.fetch" not in captured["message"]
+    assert "perception.steps" not in captured["message"]
+    assert "screen.read" not in captured["message"]
+    assert mock_post.call_args.args[0] == "外面下雨。"
+    assert mock_post.call_args.kwargs["reply_to_message_id"] == "user-msg-v2"
+
+
+def test_process_messages_v2_drops_needs_background_without_ack(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    crc._update_chat_runtime_v2_profile({crc.RESIDENT_CHAT_RUNTIME_V2_FLAG: True})
+    msg = {"id": "user-msg-bg", "role": "user", "content": "今天多少步？", "ts": 1113.0}
+
+    try:
+        with patch.object(
+            crc,
+            "call_agent",
+            return_value={"actions": [{"type": "needs_background", "request": {"tool": "perception.steps", "args": {}}}], "messages": []},
+        ), patch.object(crc, "execute_agent_actions") as mock_actions, \
+             patch.object(crc, "post_reply", return_value={"id": "reply-bg"}) as mock_post:
+            result_ts = crc._process_messages([msg])
+    finally:
+        crc._update_chat_runtime_v2_profile({})
+
+    assert result_ts == pytest.approx(1113.0)
+    mock_actions.assert_not_called()
+    mock_post.assert_not_called()
+
+
 def test_process_messages_keeps_checkpoint_when_post_reply_fails():
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
@@ -182,6 +237,141 @@ def test_whoami_startup_retries_transient_failure(monkeypatch):
     assert len(calls) == 3
 
 
+def test_whoami_startup_retries_keep_fixed_delay(monkeypatch):
+    sleeps = []
+
+    monkeypatch.setattr(crc, "_load_whoami", lambda: False)
+    monkeypatch.setattr(crc, "WHOAMI_STARTUP_RETRIES", 3)
+    monkeypatch.setattr(crc, "WHOAMI_STARTUP_RETRY_DELAY_SEC", 5)
+    monkeypatch.setattr(crc.time, "sleep", lambda delay: sleeps.append(delay))
+
+    assert crc._load_whoami_with_retries() is False
+    assert sleeps == [5, 5]
+
+
+def test_whoami_reply_refresh_retries_use_exponential_backoff(monkeypatch):
+    sleeps = []
+
+    monkeypatch.setattr(crc, "_load_whoami", lambda: False)
+    monkeypatch.setattr(crc.time, "sleep", lambda delay: sleeps.append(delay))
+
+    assert crc._load_whoami_with_retries(
+        attempts=3,
+        delay_sec=0.5,
+        context="reply refresh",
+        backoff_multiplier=2.0,
+    ) is False
+    assert sleeps == [0.5, 1.0]
+
+
+def test_post_reply_retries_whoami_refresh_before_encrypted_write(monkeypatch):
+    calls = []
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"id": "m_retry", "ts": 1.0}
+
+    def _load():
+        calls.append(1)
+        if len(calls) < 3:
+            return False
+        crc._whoami_cache.update(
+            user_id="usr_retry",
+            user_pk=b"r" * 32,
+            enclave_pk=None,
+        )
+        return True
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "", "user_pk": None, "enclave_pk": None})
+    monkeypatch.setattr(crc, "_load_whoami", _load)
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRIES", 3)
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRY_DELAY_SEC", 0)
+    monkeypatch.setattr(crc, "_build_envelope", lambda **kw: {"owner": kw["owner_user_id"]})
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    body = crc.post_reply("hello")
+
+    assert body["id"] == "m_retry"
+    assert len(calls) == 3
+    assert captured["json"]["envelope"]["owner"] == "usr_retry"
+
+
+def test_post_reply_uses_cached_whoami_keys_when_refresh_fails(monkeypatch):
+    captured = {}
+    envelope_kwargs = {}
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"id": "m_cached", "ts": 2.0}
+
+    def _load():
+        crc._whoami_cache.update(user_id="", user_pk=None, enclave_pk=None)
+        return False
+
+    def _build(**kwargs):
+        envelope_kwargs.update(kwargs)
+        return {"owner": kwargs["owner_user_id"], "visibility": kwargs["visibility"]}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_cached", "user_pk": b"c" * 32, "enclave_pk": b"e" * 32},
+    )
+    monkeypatch.setattr(crc, "_load_whoami", _load)
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRIES", 2)
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRY_DELAY_SEC", 0)
+    monkeypatch.setattr(crc, "_build_envelope", _build)
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    body = crc.post_reply("hello from cache")
+
+    assert body["id"] == "m_cached"
+    assert envelope_kwargs["owner_user_id"] == "usr_cached"
+    assert envelope_kwargs["user_pk_bytes"] == b"c" * 32
+    assert captured["json"]["envelope"]["visibility"] == "shared"
+
+
+def test_post_reply_skips_when_whoami_refresh_fails_without_cache(monkeypatch):
+    posted = []
+
+    def _post(*args, **kwargs):
+        posted.append((args, kwargs))
+        raise AssertionError("post should not be called without encryption keys")
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "", "user_pk": None, "enclave_pk": None})
+    monkeypatch.setattr(crc, "_load_whoami", lambda: False)
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRIES", 2)
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRY_DELAY_SEC", 0)
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    body = crc.post_reply("lost")
+
+    assert body == {"error": "whoami_refresh_failed"}
+    assert posted == []
+
+
 # ---------------------------------------------------------------------------
 # Bonus: agent failures are fail-hard by default
 # ---------------------------------------------------------------------------
@@ -201,7 +391,8 @@ def test_enclave_history_used_when_configured(monkeypatch):
          patch.object(crc, "post_reply"):
         result_ts = crc._process_messages(decrypted)
 
-    mock_agent.assert_called_once_with("decrypted hello")
+    mock_agent.assert_called_once()
+    assert mock_agent.call_args[0][0].endswith("decrypted hello")  # time anchor prepended
     assert result_ts == pytest.approx(2000.0)
 
 
@@ -216,10 +407,12 @@ def test_enclave_history_used_when_configured(monkeypatch):
 # enclave/MCP decrypt paths.
 # ---------------------------------------------------------------------------
 
-def test_verify_ping_enclave_path_short_circuits_without_agent():
+def test_verify_ping_enclave_path_probes_real_agent():
     """Enclave path delivers the local_only ping with content=None. The
-    consumer must still recognise it (via source) and reply immediately —
-    not crash on None and not skip it as empty content."""
+    consumer must still recognise it (via source) — not crash on None and not
+    skip it as empty content — and now exercise the REAL agent path (bounded
+    probe) so a broken reply pipeline is caught instead of being masked by a
+    canned short-circuit (commit 11279e9)."""
     ping = {
         "role": "user",
         "ts": 4242.0,
@@ -227,35 +420,36 @@ def test_verify_ping_enclave_path_short_circuits_without_agent():
         "content": None,            # enclave returns null for local_only
         "content_type": "text",
     }
-    with patch.object(crc, "call_agent") as mock_agent, \
+    with patch.object(crc, "call_agent", return_value="收到") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
         result_ts = crc._process_messages([ping])
 
-    mock_agent.assert_not_called()
+    mock_agent.assert_called_once_with(crc.VERIFY_PROBE_MESSAGE)
     mock_post.assert_called_once()
     assert result_ts == pytest.approx(4242.0)
 
 
-def test_verify_ping_poll_marker_short_circuits_without_agent():
+def test_verify_ping_poll_marker_probes_real_agent():
     """Direct /v1/chat/poll path carries the plaintext __VERIFY_PING__ marker
-    (source still verify_ping). Still short-circuits — no agent turn."""
+    (source still verify_ping). Still detected via source and routed through the
+    real bounded probe."""
     ping = _make_msg(role="user", content="__VERIFY_PING__:deadbeef0001", ts=4343.0)
     ping["source"] = "verify_ping"
 
-    with patch.object(crc, "call_agent") as mock_agent, \
+    with patch.object(crc, "call_agent", return_value="收到") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
         result_ts = crc._process_messages([ping])
 
-    mock_agent.assert_not_called()
+    mock_agent.assert_called_once_with(crc.VERIFY_PROBE_MESSAGE)
     mock_post.assert_called_once()
     assert result_ts == pytest.approx(4343.0)
 
 
-def test_verify_ping_short_circuit_suppresses_push():
-    """The short-circuit must ask post_reply to suppress the user-visible push.
-    A private liveness ack must never surface as an APNs notification while the
-    app is backgrounded — the verify GC removes the chat row but cannot recall
-    an already-delivered push."""
+def test_verify_ping_success_reply_suppresses_push():
+    """A successful probe posts the agent's real reply but must suppress the
+    user-visible push. A private liveness ack must never surface as an APNs
+    notification while the app is backgrounded — the verify GC removes the chat
+    row but cannot recall an already-delivered push."""
     ping = {
         "role": "user",
         "ts": 4444.0,
@@ -263,12 +457,70 @@ def test_verify_ping_short_circuit_suppresses_push():
         "content": None,
         "content_type": "text",
     }
-    with patch.object(crc, "call_agent") as mock_agent, \
+    with patch.object(crc, "call_agent", return_value="我在") as mock_agent, \
          patch.object(crc, "post_reply") as mock_post:
         crc._process_messages([ping])
 
-    mock_agent.assert_not_called()
-    mock_post.assert_called_once_with(crc.VERIFY_PING_REPLY, suppress_push=True)
+    mock_agent.assert_called_once()
+    mock_post.assert_called_once()
+    assert mock_post.call_args.kwargs.get("suppress_push") is True
+    # source="verify_ping" so the visible history feed filters the liveness reply
+    assert mock_post.call_args.kwargs.get("source") == "verify_ping"
+
+
+def test_verify_ping_slow_agent_falls_back_to_canned_ack():
+    """A slow-but-healthy agent (probe exceeds VERIFY_PROBE_TIMEOUT_SEC) must
+    NOT falsely fail verify: the consumer falls back to the canned ack (push
+    suppressed) so verify_loop still passes."""
+    ping = {
+        "role": "user",
+        "ts": 4547.0,  # unique ts — the global _seen_ids dedup keys on ts:role
+        "source": "verify_ping",
+        "content": None,
+        "content_type": "text",
+    }
+
+    # Block the probe on an Event (not a bare sleep) so the timeout fires
+    # deterministically AND the background probe thread is released before the
+    # test returns — a leaked sleeping thread would wake mid-next-test and
+    # pollute its call_agent mock.
+    release = threading.Event()
+
+    def _slow(_msg):
+        release.wait(timeout=2)
+        return "too late"
+
+    try:
+        with patch.object(crc, "VERIFY_PROBE_TIMEOUT_SEC", 0.01), \
+             patch.object(crc, "call_agent", side_effect=_slow), \
+             patch.object(crc, "post_reply") as mock_post:
+            crc._process_messages([ping])
+            mock_post.assert_called_once_with(
+                crc.VERIFY_PING_REPLY, source="verify_ping", suppress_push=True
+            )
+    finally:
+        release.set()
+
+
+def test_verify_ping_no_usable_reply_does_not_ack():
+    """A COMPLETED probe that yields no usable reply (consumer can't parse the
+    agent output → ValueError) is a real failure: the consumer posts NOTHING so
+    verify_loop stays unsatisfied and onboarding does not green-light a dead
+    loop."""
+    ping = {
+        "role": "user",
+        "ts": 4646.0,
+        "source": "verify_ping",
+        "content": None,
+        "content_type": "text",
+    }
+    with patch.object(crc, "call_agent", side_effect=ValueError("no usable reply")) as mock_agent, \
+         patch.object(crc, "post_reply") as mock_post:
+        result_ts = crc._process_messages([ping])
+
+    mock_agent.assert_called_once()
+    mock_post.assert_not_called()
+    assert result_ts == pytest.approx(4646.0)
 
 
 def test_post_reply_suppress_push_omits_alert_and_push_fields(monkeypatch):
@@ -404,7 +656,7 @@ def test_screen_question_attaches_decrypted_screen_context(monkeypatch):
     mock_post.assert_called_once()
     assert result_ts == pytest.approx(2200.0)
     args, kwargs = mock_agent.call_args
-    assert args[0].startswith("你能看到我的屏幕吗")
+    assert "你能看到我的屏幕吗" in args[0]  # time anchor prepended
     assert "hello screen" in args[0]
     assert kwargs["images"] == [screen_image]
     assert kwargs["image_paths"] == ["/tmp/feedling_chat_images/screen.jpg"]
@@ -517,7 +769,6 @@ def test_empty_content_decrypt_source_available_replies(monkeypatch):
     decrypted_msg = _make_msg(role="user", content="what's the weather?", ts=4000.0)
 
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://127.0.0.1:5003")
-    monkeypatch.setattr(crc, "FEEDLING_MCP_URL", "")
     monkeypatch.setattr(
         crc, "get_decrypted_history",
         lambda since, limit=20: [decrypted_msg],
@@ -528,7 +779,8 @@ def test_empty_content_decrypt_source_available_replies(monkeypatch):
         # Consumer uses get_decrypted_history result, not the empty poll message
         result_ts = crc._process_messages([decrypted_msg])
 
-    mock_agent.assert_called_once_with("what's the weather?")
+    mock_agent.assert_called_once()
+    assert mock_agent.call_args[0][0].endswith("what's the weather?")  # time anchor prepended
     mock_post.assert_called_once()
     assert result_ts == pytest.approx(4000.0)
 
@@ -537,8 +789,6 @@ def test_empty_content_no_decrypt_source_no_reply_no_fallback(monkeypatch):
     """poll returns content="" and no decrypt source is configured —
     consumer must skip the message silently (no reply, no fallback)."""
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "")
-    monkeypatch.setattr(crc, "FEEDLING_MCP_URL", "")
-    crc._last_fallback_ts = 0.0
 
     msg = _make_msg(role="user", content="", ts=5000.0)
 
@@ -551,204 +801,39 @@ def test_empty_content_no_decrypt_source_no_reply_no_fallback(monkeypatch):
     assert result_ts == pytest.approx(5000.0)
 
 
-def test_agent_failure_no_fallback_by_default(monkeypatch):
-    """Agent backend failure should not post a fake user-visible template."""
-    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", False)
-    crc._last_fallback_ts = 0.0
+def test_agent_failure_posts_visible_fallback_by_default(monkeypatch):
+    """Agent backend failure must not silently drop a user turn."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
 
     with patch.object(crc, "call_agent", side_effect=RuntimeError("agent down")), \
          patch.object(crc, "post_reply") as mock_post:
         result_ts = crc._process_messages([
-            _make_msg(role="user", content="msg1", ts=100.0)
+            {"id": "agent-failure-1", "role": "user", "content": "msg1", "ts": 100.0}
         ])
 
-    mock_post.assert_not_called()
+    mock_post.assert_called_once()
+    assert mock_post.call_args.args[0] == crc.FALLBACK_REPLY
+    assert mock_post.call_args.kwargs["reply_to_message_id"] == "agent-failure-1"
     assert result_ts == pytest.approx(100.0)
 
 
-def test_fallback_is_explicit_opt_in(monkeypatch):
-    """The legacy fallback path still exists only when explicitly enabled."""
+def test_agent_failure_fallback_is_not_cooldown_suppressed(monkeypatch):
+    """Each failed user turn receives visible feedback instead of a silent cooldown drop."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
     monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
-    crc._last_fallback_ts = 0.0
 
     with patch.object(crc, "call_agent", side_effect=RuntimeError("agent down")), \
-         patch.object(crc, "post_reply") as mock_post, \
-         patch("time.time", return_value=200.0):
-        crc._process_messages([_make_msg(role="user", content="msg1", ts=101.0)])
+         patch.object(crc, "post_reply") as mock_post:
+        crc._process_messages([
+            {"id": "agent-failure-2", "role": "user", "content": "msg1", "ts": 101.0},
+            {"id": "agent-failure-3", "role": "user", "content": "msg2", "ts": 102.0},
+        ])
 
-    mock_post.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# Phase 4: MCP client compat + transport probing + startup hard check
-# ---------------------------------------------------------------------------
-
-def test_mcp_client_headers_not_supported(monkeypatch):
-    """Older fastmcp without headers= kwarg: consumer embeds key in URL instead."""
-    captured_urls = []
-
-    class _FakeClientNoHeaders:
-        """Simulates a fastmcp.Client that does NOT accept headers=."""
-        def __init__(self, url):  # no headers= param
-            captured_urls.append(url)
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *_):
-            pass
-        async def call_tool(self, name, args):
-            return []
-
-    monkeypatch.setattr(crc, "_fastmcp_cls", _FakeClientNoHeaders)
-    monkeypatch.setattr(crc, "FEEDLING_MCP_URL", "http://127.0.0.1:5002")
-    monkeypatch.setattr(crc, "FEEDLING_MCP_KEY", "testkey123")
-    # Pre-seed transport cache so probe is not attempted.
-    monkeypatch.setattr(
-        crc, "_mcp_transport_cache",
-        {"http://127.0.0.1:5002": "http://127.0.0.1:5002/mcp"},
-    )
-
-    result = crc._fetch_from_mcp(0.0, 5)
-
-    assert result == [], f"Expected empty list, got {result!r}"
-    assert captured_urls, "FastMCP client was never instantiated"
-    # Key must be in the URL, not passed as a headers= kwarg.
-    assert "testkey123" in captured_urls[0], (
-        f"Key not embedded in URL: {captured_urls[0]!r}"
-    )
-
-
-def test_mcp_probe_404_falls_back_to_sse(monkeypatch):
-    """/mcp returns 404: probe falls back and discovers SSE transport."""
-    import httpx as _httpx
-
-    class _Resp404:
-        status_code = 404
-
-    class _RespSSE:
-        status_code = 200
-        def __enter__(self): return self
-        def __exit__(self, *_): pass
-
-    def _mock_post(url, **kw):
-        return _Resp404()
-
-    def _mock_stream(method, url, **kw):
-        return _RespSSE()
-
-    monkeypatch.setattr(crc, "FEEDLING_MCP_KEY", "testkey")
-    monkeypatch.setattr(crc, "_mcp_transport_cache", {})
-
-    with patch("httpx.post", _mock_post), patch("httpx.stream", _mock_stream):
-        result = crc._probe_mcp_transport_sync("http://127.0.0.1:5002")
-
-    assert result is not None, "probe returned None — expected SSE URL"
-    assert "/sse" in result, f"Expected SSE URL, got {result!r}"
-    assert "testkey" in result, "API key not in SSE URL"
-
-
-def test_sse_only_config(monkeypatch):
-    """With transport cache pointing to SSE, consumer passes that URL to FastMCP."""
-    captured_urls = []
-
-    class _FakeClientWithHeaders:
-        def __init__(self, url, headers=None):
-            captured_urls.append(url)
-        async def __aenter__(self): return self
-        async def __aexit__(self, *_): pass
-        async def call_tool(self, name, args): return []
-
-    sse_url = "http://127.0.0.1:5002/sse?key=testkey"
-    monkeypatch.setattr(crc, "_fastmcp_cls", _FakeClientWithHeaders)
-    monkeypatch.setattr(crc, "FEEDLING_MCP_URL", "http://127.0.0.1:5002")
-    monkeypatch.setattr(crc, "FEEDLING_MCP_KEY", "testkey")
-    monkeypatch.setattr(
-        crc, "_mcp_transport_cache",
-        {"http://127.0.0.1:5002": sse_url},
-    )
-
-    result = crc._fetch_from_mcp(0.0, 5)
-
-    assert result == [], f"Expected empty list, got {result!r}"
-    assert captured_urls, "FastMCP client was never instantiated"
-    assert captured_urls[0] == sse_url, (
-        f"Expected SSE URL {sse_url!r}, FastMCP received {captured_urls[0]!r}"
-    )
-
-
-def test_mcp_calltoolresult_content_shape(monkeypatch):
-    """New MCP clients return CallToolResult objects, not lists. Ensure parser handles
-    .content entries with .text and dict-like text entries."""
-
-    class _TC:
-        def __init__(self, text):
-            self.text = text
-
-    class _Result:
-        def __init__(self, payload):
-            self.content = [_TC(payload)]
-
-    class _FakeClient:
-        def __init__(self, url, headers=None):
-            self.url = url
-            self.headers = headers
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *_):
-            pass
-        async def call_tool(self, name, args):
-            assert name in ("chat_history", "feedling_chat_get_history")
-            assert "limit" in args
-            return _Result('{"messages":[{"role":"user","content":"hi","ts":1.0}]}')
-
-    monkeypatch.setattr(crc, "_fastmcp_cls", _FakeClient)
-    monkeypatch.setattr(crc, "FEEDLING_MCP_URL", "https://mcp.feedling.app")
-    monkeypatch.setattr(crc, "FEEDLING_MCP_KEY", "k")
-    monkeypatch.setattr(crc, "_mcp_transport_cache", {"https://mcp.feedling.app": "https://mcp.feedling.app/sse"})
-
-    out = crc._fetch_from_mcp(0.0, 20)
-    assert isinstance(out, list)
-    assert out and out[0]["content"] == "hi"
-
-
-def test_mcp_calltoolresult_attaches_image_blocks(monkeypatch):
-    """MCP history returns image messages as text JSON plus ImageContent blocks.
-    The resident consumer must reattach image bytes so CLI/HTTP backends can
-    receive real image context instead of a marker string."""
-
-    class _TC:
-        def __init__(self, text):
-            self.text = text
-
-    class _IC:
-        type = "image"
-        mimeType = "image/jpeg"
-        data = base64.b64encode(b"jpeg-bytes").decode("ascii")
-
-    class _Result:
-        content = [
-            _TC('{"messages":[{"role":"user","content":"","content_type":"image","image_b64":"<vision_block:0>","ts":2.0}]}'),
-            _IC(),
-        ]
-
-    class _FakeClient:
-        def __init__(self, url, headers=None):
-            pass
-        async def __aenter__(self):
-            return self
-        async def __aexit__(self, *_):
-            pass
-        async def call_tool(self, name, args):
-            return _Result()
-
-    monkeypatch.setattr(crc, "_fastmcp_cls", _FakeClient)
-    monkeypatch.setattr(crc, "FEEDLING_MCP_URL", "https://mcp.feedling.app")
-    monkeypatch.setattr(crc, "FEEDLING_MCP_KEY", "k")
-    monkeypatch.setattr(crc, "_mcp_transport_cache", {"https://mcp.feedling.app": "https://mcp.feedling.app/sse"})
-
-    out = crc._fetch_from_mcp(0.0, 20)
-
-    assert out and out[0]["content_type"] == "image"
-    assert out[0]["image_b64"] == base64.b64encode(b"jpeg-bytes").decode("ascii")
+    assert mock_post.call_count == 2
+    assert [call.args[0] for call in mock_post.call_args_list] == [crc.FALLBACK_REPLY, crc.FALLBACK_REPLY]
 
 
 def test_sanitize_reply_text_strips_leaks_and_duplicates():
@@ -997,6 +1082,45 @@ def test_agent_session_file_scoped_by_user_id(monkeypatch):
     assert str(p) == "/tmp/feedling_usr_abc.txt"
 
 
+def test_agent_session_meta_rotates_when_turn_bound_reached(monkeypatch, tmp_path):
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_bounded", "user_pk": None, "enclave_pk": None})
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "feedling_{user_id}.json"))
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_TURNS", 2)
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_BYTES", 0)
+
+    crc._save_agent_session_id("sess_a")
+    crc._record_agent_session_turn("sess_a", sent_bytes=10, received_bytes=5)
+    assert crc._load_agent_session_id() == "sess_a"
+
+    crc._record_agent_session_turn("sess_a", sent_bytes=10, received_bytes=5)
+
+    assert crc._load_agent_session_id() == ""
+    assert not crc._agent_session_file_for_user().exists()
+
+
+def test_prepare_cli_replaces_fixed_session_id_after_rotation(monkeypatch, tmp_path):
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_openclaw", "user_pk": None, "enclave_pk": None})
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "feedling_{user_id}.json"))
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_TURNS", 1)
+    monkeypatch.setattr(crc, "AGENT_SESSION_MAX_BYTES", 0)
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'openclaw agent --json --session-id feedling-io-seven "{message}"')
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    crc._save_agent_session_id("feedling-old")
+    crc._record_agent_session_turn("feedling-old", sent_bytes=100, received_bytes=100)
+
+    cmd = crc._prepare_cli_command("hello")
+    sid = crc._cli_flag_value(cmd, "--session-id")
+
+    assert sid.startswith("feedling-io-")
+    assert sid not in {"feedling-io-seven", "feedling-old"}
+    assert "hello" in cmd
+
+
 def test_prepare_hermes_cli_strips_continue_and_injects_resume(monkeypatch):
     monkeypatch.setattr(
         crc,
@@ -1178,6 +1302,46 @@ def test_cli_nonzero_exit_fails_even_with_stdout(monkeypatch):
         crc.call_agent_cli("hi")
 
 
+def test_cli_failure_surfaces_claude_json_error_from_stdout(monkeypatch):
+    # claude --output-format json reports API failures on STDOUT (is_error+result)
+    # with stderr empty/just a warning. The raised error must carry the real
+    # reason so `cli agent exited 1:` is diagnosable, not blank.
+    class _Result:
+        returncode = 1
+        stdout = '{"type":"result","is_error":true,"api_error_status":429,"result":"Overloaded"}'
+        stderr = ""
+
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p {message}')
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["claude", "-p", message])
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
+
+    with pytest.raises(RuntimeError) as ei:
+        crc.call_agent_cli("hi")
+    assert "Overloaded" in str(ei.value)
+    assert "429" in str(ei.value)
+
+
+def test_cli_failure_surfaces_codex_stream_error_from_stdout(monkeypatch):
+    # codex --json emits the failure as `error` events on STDOUT; stderr is just
+    # the "Reading additional input…" banner. Surface the event message.
+    class _Result:
+        returncode = 1
+        stdout = (
+            '{"type":"thread.started","thread_id":"t1"}\n'
+            '{"type":"error","message":"unexpected status 401 Unauthorized: Incorrect API key"}\n'
+            '{"type":"turn.failed"}'
+        )
+        stderr = "Reading additional input from stdin..."
+
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec --json {message}')
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["codex", "exec", "--json", message])
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
+
+    with pytest.raises(RuntimeError) as ei:
+        crc.call_agent_cli("hi")
+    assert "401 Unauthorized" in str(ei.value)
+
+
 def test_openai_http_protocol_uses_session_headers(monkeypatch):
     captured = {}
 
@@ -1298,8 +1462,8 @@ def test_process_proactive_wake_routes_through_agent_and_posts_metadata(monkeypa
 
     assert crc._process_proactive_jobs([job]) == pytest.approx(123.0)
     assert "Feedling proactive wake" in captured["message"]
-    assert "platform did not judge" in captured["message"].lower()
-    assert "wake_id: wake_1" in captured["message"]
+    assert "presence check" in captured["message"].lower()
+    assert "wake_kind:" in captured["message"]
     assert "wake_kind: screen" in captured["message"]
     assert "recent_chat_context" in captured["message"]
     assert "你刚刚问我这段要不要压成一句话" in captured["message"]
@@ -1316,6 +1480,590 @@ def test_process_proactive_wake_routes_through_agent_and_posts_metadata(monkeypa
     }
     assert any(s[:3] == ("pj_1", "realizing", "") for s in captured["statuses"])
     assert any(s[0] == "pj_1" and s[1] == "posted" for s in captured["statuses"])
+
+
+def _install_capture_job_harness(monkeypatch, agent_reply):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    captured = {
+        "statuses": [],
+        "proactive_called": False,
+        "prompts": [],
+        "actions": [],
+        "envelope_plaintexts": [],
+        "envelope_kwargs": [],
+    }
+
+    history = [
+        {"id": "msg_a", "role": "user", "content": "before window", "ts": 100.0},
+        {"id": "msg_b", "role": "user", "content": "这次会议让我压力很大。", "ts": 150.0},
+        {"id": "msg_c", "role": "assistant", "content": "我记得你说心率也上来了。", "ts": 200.0},
+    ]
+    job = {
+        "job_id": "cap_dispatch",
+        "job_kind": "memory_capture",
+        "source": "memory_capture",
+        "status": "pending",
+        "trigger": "session_break",
+        "capture_key": "window:dispatch",
+        "window": {
+            "after_message_id": "msg_a",
+            "until_message_id": "msg_c",
+            "until_ts": 200.0,
+            "message_count": 2,
+        },
+        "ts": 222.0,
+    }
+
+    def _agent(prompt, *_args, **_kwargs):
+        captured["prompts"].append(prompt)
+        return agent_reply
+
+    def _fail_post(*_args, **_kwargs):
+        raise AssertionError("capture job must not write chat")
+
+    def _proactive_handler(_jobs):
+        captured["proactive_called"] = True
+        return 999.0
+
+    def _status(job_id, status, reason="", **kwargs):
+        captured["statuses"].append((job_id, status, reason, kwargs))
+
+    def _build_envelope(**kwargs):
+        captured["envelope_kwargs"].append(kwargs)
+        captured["envelope_plaintexts"].append(json.loads(kwargs["plaintext"].decode("utf-8")))
+        return {
+            "v": 1,
+            "id": f"env_{len(captured['envelope_plaintexts'])}",
+            "visibility": kwargs["visibility"],
+            "owner_user_id": kwargs["owner_user_id"],
+        }
+
+    def _memory_actions(actions):
+        captured["actions"].extend(actions)
+        return {
+            "status": "ok",
+            "results": [{"status": "ok", "action": action.get("type")} for action in actions],
+            "effects": [{"type": "memory_added"} for _action in actions],
+        }
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "post_reply", _fail_post)
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", _status)
+    monkeypatch.setattr(crc, "_process_proactive_jobs", _proactive_handler)
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: history)
+    monkeypatch.setattr(crc, "_capture_memory_terms_context", lambda: ("buckets: work", "threads: meeting"))
+    monkeypatch.setattr(
+        crc,
+        "_capture_identity_context",
+        lambda: (
+            {"agent_name": "IO", "user_preferred_name": "Seven"},
+            "IO",
+            "Seven",
+            "identity: IO is Seven's companion",
+        ),
+    )
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_capture", "user_pk": b"u" * 32, "enclave_pk": b"e" * 32},
+    )
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(crc, "_build_envelope", _build_envelope)
+    monkeypatch.setattr(crc, "execute_memory_actions", _memory_actions)
+    return captured, job
+
+
+def _capture_final_status(captured):
+    return captured["statuses"][-1]
+
+
+def _install_dream_job_harness(monkeypatch, agent_reply):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    captured = {
+        "statuses": [],
+        "proactive_called": False,
+        "prompts": [],
+        "actions": [],
+        "envelope_plaintexts": [],
+        "envelope_kwargs": [],
+        "post_called": False,
+    }
+
+    history = [
+        {"id": "msg_dream_a", "role": "user", "content": "我最近都喝燕麦奶。", "ts": 300.0},
+        {"id": "msg_dream_b", "role": "assistant", "content": "我记住了。", "ts": 360.0},
+    ]
+    index_items = [
+        {"id": "mem_a", "summary": "Seven likes oat milk.", "bucket": "life", "threads": ["coffee"]},
+        {"id": "mem_b", "summary": "Seven often orders oat latte.", "bucket": "life", "threads": ["coffee"]},
+        {"id": "mem_c", "summary": "Seven drinks coffee in the morning.", "bucket": "routine", "threads": ["coffee"]},
+    ]
+    fetch_items = [
+        {**item, "content": item["summary"] + " Full card."}
+        for item in index_items
+    ]
+    job = {
+        "job_id": "dream_dispatch",
+        "job_kind": "memory_dream",
+        "source": "memory_dream",
+        "status": "pending",
+        "trigger": "nightly_dream",
+        "dream_key": "dream:dispatch",
+        "dream_stats": {"card_count": 3, "new_cards": 3},
+        "dream_until": {"signature": "sig_dispatch"},
+        "ts": 333.0,
+    }
+
+    def _agent(prompt, *_args, **_kwargs):
+        captured["prompts"].append(prompt)
+        return agent_reply
+
+    def _fail_post(*_args, **_kwargs):
+        captured["post_called"] = True
+        raise AssertionError("dream job must not write chat")
+
+    def _proactive_handler(_jobs):
+        captured["proactive_called"] = True
+        return 999.0
+
+    def _status(job_id, status, reason="", **kwargs):
+        captured["statuses"].append((job_id, status, reason, kwargs))
+
+    def _post_json(path, *, payload=None, **_kwargs):
+        if path == "/v1/memory/index":
+            return {"items": index_items}
+        if path == "/v1/memory/fetch":
+            ids = set((payload or {}).get("ids") or [])
+            return {"items": [item for item in fetch_items if item["id"] in ids]}
+        return {}
+
+    def _build_envelope(**kwargs):
+        captured["envelope_kwargs"].append(kwargs)
+        captured["envelope_plaintexts"].append(json.loads(kwargs["plaintext"].decode("utf-8")))
+        return {
+            "v": 1,
+            "id": f"dream_env_{len(captured['envelope_plaintexts'])}",
+            "visibility": kwargs["visibility"],
+            "owner_user_id": kwargs["owner_user_id"],
+            "body_ct": "ct",
+            "nonce": "nonce",
+            "K_user": "ku",
+            "K_enclave": "ke",
+        }
+
+    def _memory_actions(actions):
+        captured["actions"].extend(actions)
+        return {
+            "status": "ok",
+            "results": [{"status": "ok", "action": action.get("type")} for action in actions],
+            "effects": [{"type": "memory_superseded"} for _action in actions],
+        }
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "post_reply", _fail_post)
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", _status)
+    monkeypatch.setattr(crc, "_process_proactive_jobs", _proactive_handler)
+    monkeypatch.setattr(crc, "_capture_post_json", _post_json)
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: history)
+    monkeypatch.setattr(
+        crc,
+        "_capture_identity_context",
+        lambda: (
+            {"agent_name": "IO", "user_preferred_name": "Seven"},
+            "IO",
+            "Seven",
+            "identity: IO is Seven's companion",
+        ),
+    )
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_dream", "user_pk": b"u" * 32, "enclave_pk": b"e" * 32},
+    )
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(crc, "_build_envelope", _build_envelope)
+    monkeypatch.setattr(crc, "execute_memory_actions", _memory_actions)
+    return captured, job
+
+
+def _dream_final_status(captured):
+    return captured["statuses"][-1]
+
+
+def test_capture_get_json_disables_tls_verification_for_enclave_only(monkeypatch):
+    calls = []
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"ok": True}
+
+    def _get(url, **kwargs):
+        calls.append((url, kwargs))
+        return _Resp()
+
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enclave.local")
+    monkeypatch.setattr(crc, "FEEDLING_API_URL", "https://backend.local")
+    monkeypatch.setattr(crc.httpx, "get", _get)
+
+    assert crc._capture_get_json("/v1/identity/get", base_url="https://enclave.local") == {"ok": True}
+    assert calls[-1][0] == "https://enclave.local/v1/identity/get"
+    assert calls[-1][1]["verify"] is False
+
+    assert crc._capture_get_json("/v1/memory/buckets") == {"ok": True}
+    assert calls[-1][0] == "https://backend.local/v1/memory/buckets"
+    assert calls[-1][1]["verify"] is True
+
+
+def test_capture_json_helpers_refresh_runtime_token_before_each_request(monkeypatch, tmp_path):
+    calls = []
+    token_file = tmp_path / "runtime.jwt"
+    token_file.write_text("fresh-token")
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"ok": True}
+
+    def _get(url, **kwargs):
+        calls.append(("GET", url, dict(kwargs.get("headers") or {})))
+        return _Resp()
+
+    def _post(url, **kwargs):
+        calls.append(("POST", url, dict(kwargs.get("headers") or {})))
+        return _Resp()
+
+    monkeypatch.setattr(crc, "FEEDLING_RUNTIME_TOKEN_FILE", str(token_file))
+    monkeypatch.setattr(crc, "_runtime_token_exp", lambda token: time.time() + 60)
+    monkeypatch.setitem(crc._HEADERS, "X-API-Key", "stale-api-key")
+    crc._HEADERS.pop("X-Feedling-Runtime-Token", None)
+    monkeypatch.setattr(crc.httpx, "get", _get)
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    assert crc._capture_get_json("/v1/memory/buckets") == {"ok": True}
+    assert crc._capture_post_json("/v1/memory/legacy_batch", payload={"batch_size": 8}) == {"ok": True}
+    assert calls[0][2].get("X-Feedling-Runtime-Token") == "fresh-token"
+    assert calls[1][2].get("X-Feedling-Runtime-Token") == "fresh-token"
+    assert "X-API-Key" not in calls[0][2]
+    assert "X-API-Key" not in calls[1][2]
+
+
+def test_migrate_job_fails_when_legacy_batch_response_missing(monkeypatch):
+    job = {
+        "job_id": "migr_missing_batch",
+        "job_kind": "memory_migrate",
+        "source": "memory_migrate",
+        "status": "pending",
+        "migrate_key": "migrate:v1:u:w1",
+        "ts": 123.0,
+    }
+    statuses = []
+
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status",
+                        lambda job_id, status, reason="", **kwargs: statuses.append((job_id, status, reason, kwargs)))
+    monkeypatch.setattr(crc, "_capture_post_json", lambda path, **kwargs: {})
+    monkeypatch.setattr(crc, "_seen_ids", set())
+    monkeypatch.setattr(crc, "_seen_ids_order", [])
+    monkeypatch.setenv("FEEDLING_MIGRATE_ENABLE", "1")
+
+    assert crc._process_migrate_jobs([job]) == pytest.approx(123.0)
+    assert statuses[0][:3] == ("migr_missing_batch", "realizing", "")
+    assert statuses[-1][0] == "migr_missing_batch"
+    assert statuses[-1][1] == "failed"
+    assert "legacy_batch_unavailable" in statuses[-1][2]
+    assert all(row[2] != "migrate_no_legacy" for row in statuses)
+
+
+def test_capture_identity_context_prefers_enclave_plaintext_and_filters_ciphertext(monkeypatch):
+    calls = []
+
+    def _get_json(path, **kwargs):
+        calls.append((path, kwargs.get("base_url")))
+        return {
+            "identity": {
+                "agent_name": "IO",
+                "user_preferred_name": "Seven",
+                "self_introduction": "陪 Seven 一起生活。",
+                "dimensions": [{"key": "tone", "value": "direct"}],
+                "body_ct": "ciphertext-must-not-enter-prompt",
+                "K_user": "wrapped-key-must-not-enter-prompt",
+            }
+        }
+
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "http://enclave.local")
+    monkeypatch.setattr(crc, "_capture_get_json", _get_json)
+
+    identity, ai_name, user_name, identity_text = crc._capture_identity_context()
+
+    assert calls == [("/v1/identity/get", "http://enclave.local")]
+    assert ai_name == "IO"
+    assert user_name == "Seven"
+    assert identity["self_introduction"] == "陪 Seven 一起生活。"
+    assert "body_ct" not in identity_text
+    assert "K_user" not in identity_text
+    assert "ciphertext-must-not-enter-prompt" not in identity_text
+
+
+def test_capture_job_add_card_writes_envelope_without_chat_or_delivery(monkeypatch):
+    reply = json.dumps({
+        "cards": [{
+            "action": "add",
+            "type": "event",
+            "bucket": "work",
+            "threads": ["meeting"],
+            "summary": "Seven had a stressful meeting.",
+            "content": "Seven said the meeting was stressful and mentioned elevated heart rate.",
+            "importance": 0.7,
+            "pulse": 0.4,
+        }]
+    }, ensure_ascii=False)
+    captured, job = _install_capture_job_harness(monkeypatch, reply)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert captured["proactive_called"] is False
+    assert captured["statuses"][0][:3] == ("cap_dispatch", "realizing", "")
+    assert _capture_final_status(captured)[:3] == (
+        "cap_dispatch",
+        "completed",
+        "capture_memory_actions_applied",
+    )
+    action = captured["actions"][0]
+    assert action["type"] == "memory.add"
+    assert action["capture_mode"] == "memory_capture"
+    assert action["source_chat_message_ids"] == ["msg_b", "msg_c"]
+    assert action["envelope"]["visibility"] == "shared"
+    assert action["envelope"]["type"] == "event"
+    assert action["envelope"]["occurred_at"] == "1970-01-01T00:03:20Z"
+    assert action["envelope"]["importance"] == pytest.approx(0.7)
+    assert action["envelope"]["pulse"] == pytest.approx(0.4)
+    assert action["envelope"]["anchor_memory_ids"] == []
+    assert captured["envelope_plaintexts"] == [{
+        "summary": "Seven had a stressful meeting.",
+        "content": "Seven said the meeting was stressful and mentioned elevated heart rate.",
+        "bucket": "work",
+        "threads": ["meeting"],
+    }]
+    assert captured["envelope_kwargs"][0]["visibility"] == "shared"
+    assert "buckets: work" in captured["prompts"][0]
+    assert "threads: meeting" in captured["prompts"][0]
+    assert "identity: IO is Seven's companion" in captured["prompts"][0]
+    assert "这次会议让我压力很大" in captured["prompts"][0]
+    extra = _capture_final_status(captured)[3]["extra"]
+    assert extra["cards_added"] == 1
+    assert extra["cards_superseded"] == 0
+    assert extra["memory_action_status"] == {"status": "ok", "results": 1, "effects": 1}
+
+
+def test_capture_job_supersede_card_writes_supersede_action(monkeypatch):
+    reply = json.dumps({
+        "cards": [{
+            "action": "supersede",
+            "target_id": "mem_old",
+            "type": "event",
+            "bucket": "work",
+            "threads": ["meeting"],
+            "summary": "Seven reframed the meeting stress.",
+            "content": "Seven clarified the stressful meeting was mostly about a boundary issue.",
+            "importance": 0.8,
+            "pulse": 0.6,
+        }]
+    }, ensure_ascii=False)
+    captured, job = _install_capture_job_harness(monkeypatch, reply)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    action = captured["actions"][0]
+    assert action["type"] == "memory.supersede"
+    assert action["supersedes"] == "mem_old"
+    extra = _capture_final_status(captured)[3]["extra"]
+    assert extra["cards_added"] == 0
+    assert extra["cards_superseded"] == 1
+
+
+def test_capture_job_supersede_without_target_falls_back_to_add(monkeypatch):
+    reply = json.dumps({
+        "cards": [{
+            "action": "supersede",
+            "type": "event",
+            "bucket": "work",
+            "threads": ["meeting"],
+            "summary": "Missing target.",
+            "content": "The agent tried to supersede without naming the old card.",
+            "importance": 0.5,
+            "pulse": 0.2,
+        }]
+    }, ensure_ascii=False)
+    captured, job = _install_capture_job_harness(monkeypatch, reply)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert captured["actions"][0]["type"] == "memory.add"
+    assert _capture_final_status(captured)[:3] == (
+        "cap_dispatch",
+        "completed",
+        "capture_memory_actions_applied",
+    )
+    extra = _capture_final_status(captured)[3]["extra"]
+    assert extra["cards_added"] == 1
+    assert extra["cards_superseded"] == 0
+
+
+def test_capture_job_empty_cards_completes_noop_without_memory_write(monkeypatch):
+    captured, job = _install_capture_job_harness(monkeypatch, '{"cards":[]}')
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert captured["actions"] == []
+    assert _capture_final_status(captured)[:3] == (
+        "cap_dispatch",
+        "completed",
+        "nothing_worth_keeping",
+    )
+    extra = _capture_final_status(captured)[3]["extra"]
+    assert extra["cards_added"] == 0
+    assert extra["cards_superseded"] == 0
+    assert extra["noop_reason"] == "nothing_worth_keeping"
+
+
+def test_capture_job_bad_json_fails_without_crash_or_memory_write(monkeypatch):
+    captured, job = _install_capture_job_harness(monkeypatch, "not json")
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(222.0)
+    assert captured["actions"] == []
+    assert _capture_final_status(captured)[:3] == ("cap_dispatch", "failed", "no_json_object")
+    assert _capture_final_status(captured)[3]["extra"]["noop_reason"] == "no_json_object"
+
+
+def test_dream_job_merge_writes_multi_supersede_without_chat_or_delivery(monkeypatch):
+    reply = json.dumps({
+        "consolidations": [{
+            "op": "merge",
+            "card_ids": ["mem_a", "mem_b"],
+            "result": {
+                "bucket": "life",
+                "threads": ["coffee"],
+                "summary": "Seven prefers oat milk in coffee.",
+                "content": "Seven has repeatedly mentioned oat milk and oat lattes, especially with morning coffee.",
+                "importance": 0.8,
+                "pulse": 0.5,
+            },
+        }],
+        "questions_to_ask": ["确认是否只是不喝牛奶？"],
+    }, ensure_ascii=False)
+    captured, job = _install_dream_job_harness(monkeypatch, reply)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+    assert captured["proactive_called"] is False
+    assert captured["post_called"] is False
+    assert captured["statuses"][0][:3] == ("dream_dispatch", "realizing", "")
+    assert _dream_final_status(captured)[:3] == (
+        "dream_dispatch",
+        "completed",
+        "dream_memory_actions_applied",
+    )
+    action = captured["actions"][0]
+    assert action["type"] == "memory.supersede"
+    assert action["supersedes"] == ["mem_a", "mem_b"]
+    assert action["capture_mode"] == "memory_dream"
+    assert action["dream_op"] == "merge"
+    assert action["envelope"]["source"] == "memory_dream"
+    assert action["envelope"]["type"] == "fact"
+    assert captured["envelope_plaintexts"] == [{
+        "summary": "Seven prefers oat milk in coffee.",
+        "content": "Seven has repeatedly mentioned oat milk and oat lattes, especially with morning coffee.",
+        "bucket": "life",
+        "threads": ["coffee"],
+    }]
+    assert "id=mem_a" in captured["prompts"][0]
+    assert "id=mem_b" in captured["prompts"][0]
+    assert "我最近都喝燕麦奶" in captured["prompts"][0]
+    extra = _dream_final_status(captured)[3]["extra"]
+    assert extra["dream_result"]["status"] == "ok"
+    assert extra["dream_result"]["job_kind"] == "memory_dream"
+    assert extra["cards_merged"] == 1
+    assert extra["cards_superseded"] == 2
+    assert extra["questions"] == ["确认是否只是不喝牛奶？"]
+
+
+def test_dream_job_thicken_and_supersede_are_memory_supersede_actions(monkeypatch):
+    reply = json.dumps({
+        "consolidations": [
+            {
+                "op": "thicken",
+                "card_ids": ["mem_c"],
+                "result": {
+                    "bucket": "routine",
+                    "threads": ["coffee"],
+                    "summary": "Seven tends to drink coffee in the morning.",
+                    "content": "Seven's morning routine often includes coffee, sometimes oat latte.",
+                    "importance": 0.6,
+                    "pulse": 0.4,
+                },
+            },
+            {
+                "op": "supersede",
+                "card_ids": ["mem_a"],
+                "result": {
+                    "bucket": "life",
+                    "threads": ["coffee"],
+                    "summary": "Seven corrected that oat milk is preferred, not dairy.",
+                    "content": "Seven's newer preference should replace the older milk preference memory.",
+                    "importance": 0.7,
+                    "pulse": 0.3,
+                },
+            },
+        ],
+        "questions_to_ask": [],
+    }, ensure_ascii=False)
+    captured, job = _install_dream_job_harness(monkeypatch, reply)
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+    assert [action["type"] for action in captured["actions"]] == ["memory.supersede", "memory.supersede"]
+    assert [action["dream_op"] for action in captured["actions"]] == ["thicken", "supersede"]
+    assert captured["actions"][0]["supersedes"] == ["mem_c"]
+    assert captured["actions"][1]["supersedes"] == ["mem_a"]
+    extra = _dream_final_status(captured)[3]["extra"]
+    assert extra["cards_merged"] == 0
+    assert extra["cards_superseded"] == 2
+    assert extra["dream_result"]["cards_thickened"] == 1
+
+
+def test_dream_job_empty_consolidations_completes_noop_without_memory_write_or_chat(monkeypatch):
+    captured, job = _install_dream_job_harness(
+        monkeypatch,
+        json.dumps({"consolidations": [], "questions_to_ask": ["下次问 TA 是否还喝拿铁"]}, ensure_ascii=False),
+    )
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+    assert captured["actions"] == []
+    assert captured["post_called"] is False
+    assert _dream_final_status(captured)[:3] == (
+        "dream_dispatch",
+        "completed",
+        "dream_nothing_to_consolidate",
+    )
+    extra = _dream_final_status(captured)[3]["extra"]
+    assert extra["dream_result"]["status"] == "noop"
+    assert extra["questions"] == ["下次问 TA 是否还喝拿铁"]
+    assert extra["noop_reason"] == "dream_nothing_to_consolidate"
+
+
+def test_dream_job_bad_json_fails_without_crash_or_memory_write(monkeypatch):
+    captured, job = _install_dream_job_harness(monkeypatch, "not json")
+
+    assert crc._process_resident_jobs([job]) == pytest.approx(333.0)
+    assert captured["actions"] == []
+    assert captured["post_called"] is False
+    assert _dream_final_status(captured)[:3] == ("dream_dispatch", "failed", "no_json_object")
+    assert _dream_final_status(captured)[3]["extra"]["noop_reason"] == "no_json_object"
 
 
 def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):
@@ -1371,14 +2119,15 @@ def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):
 
     assert crc._process_proactive_jobs([job]) == pytest.approx(124.0)
     assert "Feedling proactive wake" in captured["message"]
-    assert "platform did not judge" in captured["message"].lower()
-    assert "awareness / presence check" in captured["message"]
-    assert "genuinely want to appear" in captured["message"]
+    assert "presence check" in captured["message"].lower()
+    assert "presence check" in captured["message"]
+    assert "equally valid" in captured["message"]
     assert "Feedling Gate decided" not in captured["message"]
     assert "possible_connections" not in captured["message"]
-    assert "wake_id: wake_1" in captured["message"]
+    assert "wake_kind:" in captured["message"]
     assert "wake_kind: screen" in captured["message"]
-    assert "user_state: default" in captured["message"]
+    assert "user_state" not in captured["message"]   # removed (D6: user_state/ai_state dropped)
+    assert "ai_state" not in captured["message"]
     assert "broadcast_state: on" in captured["message"]
     assert "screen_context_available: true" in captured["message"]
     assert captured["images"] == [{"data": "x"}]
@@ -1469,6 +2218,539 @@ def test_process_proactive_v2_request_broadcast_posts_visible_request(monkeypatc
     assert posted
     assert posted[-1][3]["extra"]["agent_action"] == "request_broadcast"
     assert posted[-1][3]["extra"]["wake_result"] == "posted"
+
+
+def test_process_proactive_native_action_only_send_message_posts(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"posted": [], "statuses": []}
+
+    def _agent(message, images=None, image_paths=None):
+        captured["message"] = message
+        captured["images"] = images
+        captured["image_paths"] = image_paths
+        return {"actions": [{"type": "send_message", "text": "Native action bubble"}], "messages": []}
+
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: ({}, []))
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_native"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_native_send",
+        "wake_id": "wake_native_send",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 128.5,
+        "trigger": "heartbeat",
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(128.5)
+    assert "Feedling proactive wake" in captured["message"]
+    assert "native_tool_access" in captured["message"]
+    assert "memory-index" in captured["message"]
+    assert "screen-read" in captured["message"]
+    assert "v2_context_json" not in captured["message"]
+    assert captured["posted"][0][0] == "Native action bubble"
+    assert captured["posted"][0][1]["proactive_job_id"] == "pj_native_send"
+    assert any(s[0] == "pj_native_send" and s[1] == "posted" for s in captured["statuses"])
+
+
+def test_message_for_introduction_job_uses_post_respawn_prompt():
+    message = crc._message_for_introduction_job({"job_kind": "introduction"})
+
+    assert "首次登场" in message
+    assert "identity.profile_patch" in message
+    assert "self_introduction" in message
+    assert "signature" in message
+    assert "messages" in message
+    assert "别编不存在的共同经历" in message
+
+
+def test_process_introduction_job_writes_identity_before_first_greeting(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    events = []
+    action = {
+        "type": "identity.profile_patch",
+        "patch": {
+            "self_introduction": "我是小满,我会一直在。",
+            "signature": ["我来了。"],
+        },
+    }
+
+    def _agent(message, images=None, image_paths=None):
+        events.append(("agent", message, images, image_paths))
+        return {"actions": [action], "messages": ["我来了。"]}
+
+    def _execute(actions):
+        events.append(("actions", actions))
+        return {"status": "ok", "effects": [{"type": "identity_updated"}]}
+
+    def _post(reply, **kwargs):
+        events.append(("post", reply, kwargs))
+        return {"id": "msg_intro"}
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "execute_agent_actions", _execute)
+    monkeypatch.setattr(crc, "post_reply", _post)
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *args, **kwargs: events.append(("status", args, kwargs)))
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: (_ for _ in ()).throw(AssertionError("screen context should not be fetched")))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: (_ for _ in ()).throw(AssertionError("recent chat should not be fetched")))
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: (_ for _ in ()).throw(AssertionError("perception digest should not be fetched")))
+
+    job = {
+        "job_id": "pj_intro",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 128.6,
+        "trigger": "post_spawn_genesis",
+        "job_kind": "introduction",
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(128.6)
+    assert events[0][0] == "status" and events[0][1][:2] == ("pj_intro", "realizing")
+    assert events[1][0] == "agent"
+    assert "首次登场" in events[1][1]
+    assert events[1][2] == []
+    assert events[1][3] == []
+    assert events[2] == ("actions", [action])
+    assert events[3][0] == "post"
+    assert events[3][1] == "我来了。"
+    assert events[3][2]["source"] == crc.PROACTIVE_JOB_SOURCE
+    assert events[3][2]["proactive_job_id"] == "pj_intro"
+
+
+def test_process_introduction_job_recovers_greeting_when_agent_omits_message(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    events = []
+    action = {
+        "type": "identity.profile_patch",
+        "patch": {
+            "self_introduction": "我是小满,我会一直在。",
+            "signature": ["我来了。"],
+        },
+    }
+
+    def _agent(message, images=None, image_paths=None):
+        events.append(("agent", message, images, image_paths))
+        return {"actions": [action], "messages": []}
+
+    def _execute(actions):
+        events.append(("actions", actions))
+        return {"status": "ok", "effects": [{"type": "identity_updated"}]}
+
+    def _post(reply, **kwargs):
+        events.append(("post", reply, kwargs))
+        return {"id": "msg_intro_fallback"}
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "execute_agent_actions", _execute)
+    monkeypatch.setattr(crc, "post_reply", _post)
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *args, **kwargs: events.append(("status", args, kwargs)))
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: (_ for _ in ()).throw(AssertionError("screen context should not be fetched")))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: (_ for _ in ()).throw(AssertionError("recent chat should not be fetched")))
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: (_ for _ in ()).throw(AssertionError("perception digest should not be fetched")))
+
+    job = {
+        "job_id": "pj_intro_fallback",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 128.65,
+        "trigger": "post_spawn_genesis",
+        "job_kind": "introduction",
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(128.65)
+    assert events[2] == ("actions", [action])
+    assert events[3][0] == "post"
+    assert events[3][1] == "我来了。"
+    assert events[3][2]["source"] == crc.PROACTIVE_JOB_SOURCE
+    assert events[3][2]["proactive_job_id"] == "pj_intro_fallback"
+
+
+def test_process_introduction_job_does_not_greet_if_identity_action_fails(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    events = []
+    action = {
+        "type": "identity.profile_patch",
+        "patch": {"self_introduction": "我是小满。", "signature": ["我来了。"]},
+    }
+
+    monkeypatch.setattr(crc, "call_agent", lambda *args, **kwargs: {"actions": [action], "messages": ["我来了。"]})
+    monkeypatch.setattr(crc, "execute_agent_actions", lambda actions: (_ for _ in ()).throw(RuntimeError("identity write failed")))
+    monkeypatch.setattr(crc, "post_reply", lambda *args, **kwargs: events.append(("post", args, kwargs)))
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *args, **kwargs: events.append(("status", args, kwargs)))
+
+    job = {
+        "job_id": "pj_intro_fail",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 128.7,
+        "trigger": "post_spawn_genesis",
+        "job_kind": "introduction",
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(128.7)
+    assert not any(item[0] == "post" for item in events)
+    failed = [item for item in events if item[0] == "status" and item[1][1] == "failed"]
+    assert failed
+    assert failed[-1][1][2].startswith("introduction_identity_action_failed")
+
+
+def test_process_proactive_native_schedule_and_cancel_actions_without_chat(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"scheduled": [], "statuses": [], "posted": []}
+
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: ({}, []))
+    monkeypatch.setattr(
+        crc,
+        "call_agent",
+        lambda message, images=None, image_paths=None: {
+            "actions": [
+                {
+                    "type": "schedule_wake",
+                    "at": "2030-01-01T09:30:00",
+                    "tz": "Asia/Shanghai",
+                    "note": "check in",
+                    "origin_refs": ["msg_1"],
+                },
+                {"type": "cancel_wake", "wake_id": "wake_old", "reason": "rescheduled"},
+            ],
+            "messages": [],
+        },
+    )
+    monkeypatch.setattr(
+        crc,
+        "execute_scheduled_wake_actions",
+        lambda actions, job: captured["scheduled"].append((actions, job)) or {
+            "results": [
+                {"type": "schedule_wake_result", "status": "scheduled", "timer_id": "sched_1"},
+                {"type": "cancel_wake_result", "status": "cancelled", "wake_id": "wake_old"},
+            ],
+        },
+    )
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_native_schedule",
+        "wake_id": "wake_native_schedule",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 128.75,
+        "trigger": "heartbeat",
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(128.75)
+    assert [a["type"] for a in captured["scheduled"][0][0]] == ["schedule_wake", "cancel_wake"]
+    assert captured["posted"] == []
+    completed = [s for s in captured["statuses"] if s[1] == "completed"]
+    assert completed
+    assert completed[-1][2] == "agent_scheduled_wake_actions"
+    assert completed[-1][3]["extra"]["wake_result"] == "action_only"
+    assert any(a.get("type") == "cancel_wake_result" for a in completed[-1][3]["extra"]["agent_actions"])
+
+
+def test_proactive_perception_digest_uses_agent_perception_routes_not_v2_tool(monkeypatch):
+    calls = []
+
+    class _Resp:
+        def __init__(self, body):
+            self.status_code = 200
+            self._body = body
+
+        def json(self):
+            return self._body
+
+    def _get(url, headers=None, params=None, timeout=None):
+        calls.append((url, params, timeout))
+        if url.endswith("/v1/agent/perception"):
+            return _Resp({
+                "ok": True,
+                "signals": {
+                    "now": {
+                        "time": "2026-06-26T20:30:00+08:00",
+                        "timezone": "Asia/Shanghai",
+                        "place_label": "home",
+                        "motion_state": "still",
+                        "battery_level": 0.61,
+                        "charging": True,
+                    },
+                },
+            })
+        if url.endswith("/v1/agent/perception/digest"):
+            return _Resp({
+                "ok": True,
+                "days": 30,
+                "changes": [
+                    {
+                        "signal": "health_vitals",
+                        "field": "resting_heart_rate",
+                        "current": 80,
+                        "baseline_median": 75,
+                        "delta": 5,
+                        "direction": "up",
+                        "magnitude": 0.066667,
+                    }
+                ],
+            })
+        return _Resp({
+            "trend": {
+                "current": 80,
+                "delta": 5,
+                "direction": "up",
+                "baseline": {"median": 75, "n": 2},
+            },
+        })
+
+    monkeypatch.setattr(crc.httpx, "get", _get)
+
+    presence, change, domains = crc._proactive_perception_digest()
+
+    assert presence["place_label"] == "home"
+    assert "local_time" not in presence  # dropped from presence (current_time anchor is the source)
+    # Back-compat: a digest response without a board still yields legacy changes
+    # and an empty domains dict.
+    assert domains == {}
+    assert any(call[0].endswith("/v1/agent/perception") and call[1] == {"signals": "now"} for call in calls)
+    assert any(call[0].endswith("/v1/agent/perception/digest") and call[1] == {"days": 30} for call in calls)
+    assert all(call[0].endswith(("/v1/agent/perception", "/v1/agent/perception/digest")) for call in calls)
+    assert change == [
+        {
+            "signal": "health_vitals",
+            "field": "resting_heart_rate",
+            "current": 80,
+            "baseline_median": 75,
+            "delta": 5,
+            "direction": "up",
+            "magnitude": 0.066667,
+        }
+    ]
+
+
+def test_native_proactive_prompt_injects_digest_and_native_tool_catalog(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"statuses": []}
+
+    def _agent(message, images=None, image_paths=None):
+        captured["message"] = message
+        return {"actions": [{"type": "sleep", "reason": "nothing to say"}], "messages": []}
+
+    monkeypatch.setattr(
+        crc,
+        "_proactive_perception_digest",
+        lambda: (
+            {"place_label": "home", "motion_state": "still", "local_time": "2026-06-26T20:30:00+08:00"},
+            [{"signal": "steps", "field": "step_count", "current": 4200, "baseline_median": 3000, "delta": 1200}],
+            {
+                "media": {"now": {"artist": "Phoebe Bridgers"}, "novelty": "new_artist"},
+                "health": {"notable": [{"signal": "steps", "field": "step_count", "current": 4200}]},
+            },
+        ),
+    )
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "post_reply", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should sleep")))
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_native_digest",
+        "wake_id": "wake_native_digest",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 128.9,
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(128.9)
+    assert "real_signal_context" in captured["message"]
+    assert "presence_hints_json" in captured["message"]
+    assert "\"place_label\": \"home\"" in captured["message"]
+    # New balanced board (not the legacy health-only change list) drives the wake.
+    assert "cross_domain_board_json" in captured["message"]
+    assert "Phoebe Bridgers" in captured["message"]
+    assert "at most 2-3" in captured["message"]
+    assert "perception_change_json" not in captured["message"]
+    assert "\"signal\": \"steps\"" in captured["message"]
+    assert "native_tool_access" in captured["message"]
+    assert "perception" in captured["message"]
+    assert "memory-index" in captured["message"]
+    assert "screen-read" in captured["message"]
+    assert "schedule_wake" in captured["message"]        # newly tool-ified
+    assert "io_cli:" in captured["message"]
+    # cleaned: no OpenClaw-specific names, no cost-guide, no JSON tool_calls framing
+    assert "perception_now" not in captured["message"]
+    assert "Cost guide" not in captured["message"]
+    assert "set_ai_state" not in captured["message"]
+
+
+def test_native_perception_context_prefers_board_over_legacy_change():
+    text = crc._native_reachout_perception_context(
+        {"place_label": "home"},
+        [{"signal": "steps", "field": "step_count"}],
+        {"media": {"now": {"artist": "Phoebe Bridgers"}}, "health": {"notable": []}},
+    )
+    assert "cross_domain_board_json" in text
+    assert "Phoebe Bridgers" in text
+    assert "at most 2-3" in text
+    assert "perception_change_json" not in text  # board supersedes the legacy list
+
+
+def test_native_perception_context_falls_back_to_change_when_no_board():
+    # Older backend (no domains): legacy top-N change list still renders.
+    text = crc._native_reachout_perception_context(
+        {"place_label": "home"},
+        [{"signal": "steps", "field": "step_count"}],
+        {},
+    )
+    assert "perception_change_json" in text
+    assert "\"signal\": \"steps\"" in text
+    assert "cross_domain_board_json" not in text
+
+
+# --- screen-watch lane (decoupled from heartbeat) --------------------------
+
+def test_heartbeat_interval_decoupled_from_broadcast():
+    # Heartbeat keeps one steady cadence regardless of broadcast_state — screen
+    # attention is the separate screen-watch lane now.
+    off = crc._proactive_tick_interval_for_broadcast_state("off")
+    on = crc._proactive_tick_interval_for_broadcast_state("on")
+    assert on == off == max(60, crc.PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC)
+
+
+def test_is_screen_watch_job_keys_on_job_kind_or_trigger():
+    assert crc._is_screen_watch_job({"job_kind": "screen_watch"})
+    assert crc._is_screen_watch_job({"trigger": "screen_watch"})
+    assert not crc._is_screen_watch_job({"job_kind": "memory_capture"})
+    assert not crc._is_screen_watch_job({"trigger": "heartbeat_broadcast_on"})
+
+
+def test_screen_watch_message_is_light_not_heartbeat():
+    job = {"job_kind": "screen_watch", "broadcast_state": "on", "current_app": "com.x"}
+    msg = crc._message_for_proactive_job(
+        job,
+        screen_text="[Feedling proactive screen context]\nocr_text:\nhello",
+        recent_chat_context="",
+        perception_digest=({"place_label": "home"}, [], {"media": {"now": 1}}),
+    )
+    # light screen-watch framing, frames + names-only tools present
+    assert "[Feedling screen-watch]" in msg
+    assert "screen-sharing" in msg
+    assert "tools_available" in msg and "perception_<signal>" in msg
+    assert "ocr_text" in msg  # the frame screen_text is attached
+    # NOT the heavy heartbeat payload
+    assert "[Feedling proactive wake]" not in msg
+    assert "cross_domain_board_json" not in msg
+    assert "Cost guide" not in msg
+
+
+def test_post_screen_watch_tick_posts_kind_and_frames(monkeypatch):
+    captured = {}
+
+    class _R:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["body"] = json
+        return _R({"enqueued": True, "job": {"job_id": "pj_sw"}})
+
+    monkeypatch.setattr(crc.httpx, "post", _post)
+    out = crc.post_screen_watch_tick("on", [{"id": "f1"}, {"id": "f2"}])
+    assert out.get("enqueued") is True
+    assert captured["url"].endswith("/v1/proactive/tick")
+    body = captured["body"]
+    # self-wake (respects Ambient gate) — not forced/manual
+    assert "force" not in body
+    assert body["job_kind"] == "screen_watch"
+    assert body["trigger"] == "screen_watch"
+    assert body["frames"] == [{"id": "f1"}, {"id": "f2"}]
+    assert body["broadcast_state"] == "on"
+
+
+def test_screen_watch_recent_frames_parses_newest_first(monkeypatch):
+    monkeypatch.setattr(
+        crc, "_fetch_screen_json",
+        lambda path: {"frames": [{"id": "new", "ts": 200.0}, {"id": "old", "ts": 100.0}]},
+    )
+    latest, ts, frames = crc._screen_watch_recent_frames(limit=5)
+    assert latest == "new"
+    assert ts == 200.0
+    assert frames == [{"id": "new"}, {"id": "old"}]
+
+
+def test_screen_watch_recent_frames_empty_when_none(monkeypatch):
+    monkeypatch.setattr(crc, "_fetch_screen_json", lambda path: {"frames": []})
+    assert crc._screen_watch_recent_frames() == ("", 0.0, [])
+
+
+# --- time grounding (current-time anchor in every turn/wake) ----------------
+
+def test_local_time_anchor_uses_timezone_and_gap(monkeypatch):
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "Asia/Shanghai")
+    line = crc._local_time_anchor(since_sec=8 * 3600)
+    assert line.startswith("current_time:")
+    assert "Asia/Shanghai" in line
+    assert "距上次互动" in line  # gap >= 30min is surfaced
+
+
+def test_local_time_anchor_omits_small_gap(monkeypatch):
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "Asia/Shanghai")
+    assert "距上次互动" not in crc._local_time_anchor(since_sec=60)
+    assert "距上次互动" not in crc._local_time_anchor(since_sec=None)
+
+
+def test_prepend_time_anchor_foreground_prepends_and_tracks_gap(monkeypatch):
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "Asia/Shanghai")
+    monkeypatch.setattr(crc, "_last_interaction_unix", 0.0)
+    out = crc._prepend_time_anchor_foreground("早安", 1_000_000.0)
+    assert out.startswith("[current_time:")
+    assert out.endswith("早安")
+    out2 = crc._prepend_time_anchor_foreground("在吗", 1_000_000.0 + 8 * 3600)
+    assert "距上次互动" in out2
+
+
+def test_screen_watch_message_carries_current_time(monkeypatch):
+    monkeypatch.setattr(crc, "_user_timezone", lambda: "Asia/Shanghai")
+    msg = crc._message_for_proactive_job(
+        {"job_kind": "screen_watch", "broadcast_state": "on"},
+        screen_text="ocr_text:\nx", recent_chat_context="",
+    )
+    assert "current_time:" in msg
 
 
 def test_normalize_agent_replies_supports_multiple_messages_with_cap(monkeypatch):
@@ -1602,12 +2884,77 @@ def test_message_for_proactive_job_instructs_multi_bubble_without_gate_context()
         recent_chat_context="- user: 这段帮我看一下",
     )
 
-    assert "1-5 short chat bubbles" in message
-    assert '{"messages":["...","..."]}' in message
+    assert "a few short bubbles" in message
+    assert '{"messages":["..."]}' in message
     assert "recent_chat_context" in message
     assert "possible_connections" not in message
     assert "Feedling Gate decided" not in message
     assert "screen: dense paragraph" in message
+
+
+def test_photo_added_wake_surfaces_pullable_photo_hint(monkeypatch):
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "photos": [
+                    {
+                        "photo_id": "ph_abc123",
+                        "metadata": {
+                            "scene_hint": "food",
+                            "time_of_day": "evening",
+                            "is_screenshot": "false",
+                        },
+                    }
+                ]
+            }
+
+    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+
+    job = {"schema_version": 2, "trigger": "photo_added", "wake_kind": "perception"}
+    message = crc._message_for_proactive_job(
+        job,
+        recent_chat_context="",
+        perception_digest=({}, [], {}),
+    )
+
+    assert "new_photo:" in message
+    assert "ph_abc123" in message
+    assert 'looks like "food"' in message
+    assert "photo_read" in message and "include_image=true" in message
+    # pull-on-demand, not auto-attached: the raw image is NOT inlined
+    assert "reach out to them about it" in message
+
+
+def test_non_photo_wake_has_no_photo_hint(monkeypatch):
+    def _boom(*a, **kw):  # must not even be called for a non-photo wake
+        raise AssertionError("photos endpoint should not be hit on a non-photo wake")
+
+    monkeypatch.setattr(crc.httpx, "get", _boom)
+
+    job = {"schema_version": 2, "trigger": "wake", "wake_kind": "perception"}
+    message = crc._message_for_proactive_job(
+        job, recent_chat_context="", perception_digest=({}, [], {})
+    )
+    assert "new_photo:" not in message
+
+
+def test_photo_hint_screenshot_framing(monkeypatch):
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "photos": [
+                    {"photo_id": "ph_shot", "metadata": {"is_screenshot": "true"}}
+                ]
+            }
+
+    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+    hint = crc._new_photo_hint({"trigger": "photo_added"})
+    assert "a screenshot" in hint
+    assert "ph_shot" in hint
 
 
 def test_recent_chat_context_defaults_to_twenty_messages(monkeypatch):
@@ -1662,16 +3009,75 @@ def test_recent_chat_context_stale_falls_back_to_two_timestamped_messages(monkey
     assert "8h" in context.text
 
 
-def test_proactive_tick_cadence_follows_broadcast_state(monkeypatch):
+def test_proactive_tick_cadence_decoupled_from_broadcast_state(monkeypatch):
+    # Heartbeat is now decoupled: broadcast no longer accelerates it (screen
+    # attention moved to the separate screen-watch lane). Cadence is steady.
     monkeypatch.setattr(crc, "PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC", 300)
     monkeypatch.setattr(crc, "PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", 1800)
 
-    assert crc._proactive_tick_trigger_for_broadcast_state("off") == "heartbeat_broadcast_off"
     assert crc._proactive_tick_interval_for_broadcast_state("off") == 1800
+    assert crc._proactive_tick_interval_for_broadcast_state("on") == 1800
+    assert crc._proactive_tick_interval_for_broadcast_state("") == 1800
+    # Triggers (labels) still reflect broadcast_state for the heartbeat gate.
+    assert crc._proactive_tick_trigger_for_broadcast_state("off") == "heartbeat_broadcast_off"
     assert crc._proactive_tick_trigger_for_broadcast_state("on") == "heartbeat_broadcast_on"
-    assert crc._proactive_tick_interval_for_broadcast_state("on") == 300
-    assert crc._proactive_tick_trigger_for_broadcast_state("") == "heartbeat_unknown"
-    assert crc._proactive_tick_interval_for_broadcast_state("") == 300
+    assert crc._proactive_tick_trigger_for_broadcast_state("mystery") == "heartbeat_unknown"
+
+
+def test_fire_scheduled_wakes_posts_backend_endpoint(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"results": [{"status": "fired"}], "jobs": [{"job_id": "pj_1"}]}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        return _Resp()
+
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    body = crc.fire_scheduled_wakes()
+
+    assert captured["url"] == "http://localhost:5001/v1/proactive/scheduled/fire"
+    assert captured["json"] == {}
+    assert captured["headers"]["X-API-Key"] == "test_key_00000000"
+    assert captured["timeout"] == 15
+    assert body["results"][0]["status"] == "fired"
+
+
+def test_fire_capture_tick_posts_backend_endpoint(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"enqueued": True, "reason": "enqueued"}
+
+    def _post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        return _Resp()
+
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    body = crc.fire_capture_tick()
+
+    assert captured["url"] == "http://localhost:5001/v1/capture/tick"
+    assert captured["json"] == {}
+    assert captured["headers"]["X-API-Key"] == "test_key_00000000"
+    assert captured["timeout"] == 15
+    assert body["enqueued"] is True
 
 
 def test_post_proactive_reply_triggers_alert_and_live_activity(monkeypatch):
@@ -1726,3 +3132,138 @@ def test_post_proactive_reply_triggers_alert_and_live_activity(monkeypatch):
         "gate_decision_id": "gd_1",
         "proactive_job_id": "pj_1",
     }
+
+
+def test_normalizer_keeps_tool_only_json_wrapped_in_log_text():
+    """A tool-only JSON line wrapped in CLI log/header text must NOT be
+    discarded as a plain message — tool_calls must survive normalization."""
+    raw = 'INFO starting agent\n{"tool_calls": [{"name": "screen.read", "args": {}}]}\nINFO done'
+    turn = crc._agent_turn_from_obj(raw)
+    assert [tc["name"] for tc in turn.tool_calls] == ["screen.read"]
+    # The raw JSON line must not also leak through as a junk chat message.
+    assert turn.messages == []
+
+
+def test_cli_tool_only_output_preserves_tool_calls(monkeypatch):
+    """AGENT_MODE=cli: stdout that is a tool-only JSON line surrounded by log
+    text must yield tool_calls (not be flattened into a plain message)."""
+    class _Result:
+        returncode = 0
+        stdout = 'INFO hermes booting\n{"tool_calls": [{"name": "screen.read", "args": {}}]}\n'
+        stderr = ""
+
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["mycli", "ask", message])
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
+
+    result = crc.call_agent_cli("hi")
+    turn = crc._agent_turn_from_raw(result)
+    assert [tc["name"] for tc in turn.tool_calls] == ["screen.read"]
+
+
+def test_call_agent_cli_codex_extracts_agent_message_not_handshake(monkeypatch):
+    """`codex exec --json` streams JSONL events; the assistant text rides in
+    `item.completed` (item.type == "agent_message"). The consumer must extract
+    that, NOT mis-send the `{"type":"thread.started"}` handshake as the reply.
+    Stream shape verified against codex 0.136."""
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec --skip-git-repo-check --json {message}")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+
+    class _R:
+        returncode = 0
+        stdout = (
+            '{"type":"thread.started","thread_id":"t1"}\n'
+            '{"type":"turn.started"}\n'
+            '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Hello from codex!"}}\n'
+            '{"type":"turn.completed","usage":{"input_tokens":1}}\n'
+        )
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    result = crc.call_agent_cli("hi")
+    assert result == "Hello from codex!"
+    assert "thread.started" not in result
+
+
+def test_codex_reply_from_stream_ignores_reasoning_and_handshake():
+    raw = (
+        '{"type":"thread.started","thread_id":"t1"}\n'
+        '{"type":"item.completed","item":{"type":"reasoning","text":"thinking…"}}\n'
+        '{"type":"item.completed","item":{"type":"agent_message","text":"final answer"}}\n'
+        '{"type":"turn.completed"}\n'
+    )
+    assert crc._codex_reply_from_stream(raw) == "final answer"
+
+
+def test_codex_reply_from_stream_empty_when_no_agent_message():
+    # handshake-only / failed turn → "" so call_agent_cli falls back, never leaks.
+    raw = '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.failed"}\n'
+    assert crc._codex_reply_from_stream(raw) == ""
+
+
+def test_openai_http_tool_only_response_preserved(monkeypatch):
+    """AGENT_MODE=http openai protocol: a tool-only model reply must be returned
+    as structured output (not raise 'no usable reply text')."""
+    class _Resp:
+        headers = {}
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"choices": [{"message": {"content":
+                    '{"tool_calls": [{"name": "screen.read", "args": {}}]}'}}]}
+
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://127.0.0.1:8642/v1/chat/completions")
+    monkeypatch.setattr(crc, "AGENT_HTTP_PROTOCOL", "openai")
+    monkeypatch.setattr(crc, "AGENT_HTTP_MODEL", "hermes-agent")
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_abc"})
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_save_agent_session_id", lambda sid: None)
+    monkeypatch.setattr(crc.httpx, "post", lambda *a, **kw: _Resp())
+
+    result = crc.call_agent_http("hi")
+    turn = crc._agent_turn_from_raw(result)
+    assert [tc["name"] for tc in turn.tool_calls] == ["screen.read"]
+
+
+# ---------------------------------------------------------------------------
+# OpenClaw `agent --json` output: reply text nests under result.payloads[].text.
+# Regression for the VPS onboarding failure where a valid OpenClaw reply was
+# reported as "no usable reply after sanitization".
+# ---------------------------------------------------------------------------
+
+def test_openclaw_payloads_reply_is_extracted():
+    obj = {"runId": "x", "status": "ok", "summary": "completed",
+           "result": {"payloads": [{"text": "能看到，这条消息收到了。", "mediaUrl": None}],
+                      "meta": {"agentMeta": {"sessionId": "s"}}}}
+    # single-reply extractor
+    assert crc._reply_from_json_obj(obj) == "能看到，这条消息收到了。"
+    # turn from dict and from the raw JSON string (the actual CLI stdout path)
+    assert crc._agent_turn_from_raw(obj).messages == ["能看到，这条消息收到了。"]
+    assert crc._agent_turn_from_raw(json.dumps(obj)).messages == ["能看到，这条消息收到了。"]
+
+
+def test_openclaw_nested_session_id_is_extracted():
+    raw = json.dumps(
+        {
+            "runId": "x",
+            "result": {
+                "payloads": [{"text": "收到。"}],
+                "meta": {"agentMeta": {"sessionId": "openclaw_sess_1"}},
+            },
+        }
+    )
+
+    assert crc._extract_session_id(raw) == "openclaw_sess_1"
+
+
+def test_openclaw_multi_payload_preserves_bubbles():
+    obj = {"status": "ok", "result": {"payloads": [{"text": "第一句"}, {"text": "第二句"}]}}
+    assert crc._agent_turn_from_raw(obj).messages == ["第一句", "第二句"]
+
+
+def test_non_openclaw_shapes_unaffected():
+    # plain multi-bubble and a bare string still work (no regression)
+    assert crc._agent_turn_from_raw({"messages": ["你好"]}).messages == ["你好"]
+    assert crc._reply_from_json_obj({"reply": "hi"}) == "hi"

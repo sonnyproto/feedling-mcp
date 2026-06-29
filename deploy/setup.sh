@@ -7,9 +7,9 @@
 #   1. Creates a Python venv
 #   2. Installs deps
 #   3. Writes ~/feedling.env (multi-tenant mode — no shared API key)
-#   4. Installs all three systemd units:
-#        feedling-backend, feedling-mcp, feedling-chat-resident
-#   5. Starts backend + mcp immediately
+#   4. Installs the systemd units:
+#        feedling-backend, feedling-chat-resident
+#   5. Starts the backend immediately
 #   6. Starts feedling-chat-resident if ~/feedling-chat-resident.env exists
 # Pass --install-caddy to also install Caddy and enable HTTPS.
 
@@ -44,8 +44,6 @@ if [ ! -f "$ENV_FILE" ]; then
 DATABASE_URL=postgresql://feedling:CHANGE_ME@127.0.0.1:5432/feedling
 FEEDLING_DATA_DIR=$DATA_DIR
 FEEDLING_FLASK_URL=http://127.0.0.1:5001
-FEEDLING_MCP_PORT=5002
-FEEDLING_MCP_TRANSPORT=sse
 EOF
     chmod 600 "$ENV_FILE"
     echo "    wrote $ENV_FILE (multi-tenant — users register via iOS and receive per-user api_keys)"
@@ -56,13 +54,12 @@ fi
 
 echo "=== 4. Install all systemd service files ==="
 sudo cp "$REPO_DIR/deploy/feedling-backend.service"       /etc/systemd/system/
-sudo cp "$REPO_DIR/deploy/feedling-mcp.service"           /etc/systemd/system/
 sudo cp "$REPO_DIR/deploy/feedling-chat-resident.service" /etc/systemd/system/
 sudo systemctl daemon-reload
 
-echo "=== 5. Enable and start backend + MCP ==="
-sudo systemctl enable feedling-backend feedling-mcp
-sudo systemctl restart feedling-backend feedling-mcp
+echo "=== 5. Enable and start backend ==="
+sudo systemctl enable feedling-backend
+sudo systemctl restart feedling-backend
 
 echo "=== 6. Chat resident (agent auto-reply) ==="
 if [ -f "$RESIDENT_ENV" ]; then
@@ -96,7 +93,6 @@ echo "╔═══════════════════════�
 echo "║         POST-SETUP CHECKLIST — complete before testing          ║"
 echo "╠══════════════════════════════════════════════════════════════════╣"
 echo "║  [✓]  feedling-backend        running                           ║"
-echo "║  [✓]  feedling-mcp            running                           ║"
 if [ -f "$RESIDENT_ENV" ]; then
 echo "║  [✓]  feedling-chat-resident  running  (agent auto-reply live)  ║"
 else
@@ -112,5 +108,5 @@ fi
 echo "╚══════════════════════════════════════════════════════════════════╝"
 echo ""
 echo "Check service status:"
-echo "  sudo systemctl status feedling-backend feedling-mcp feedling-chat-resident"
+echo "  sudo systemctl status feedling-backend feedling-chat-resident"
 echo "  curl -s http://127.0.0.1:5001/healthz"

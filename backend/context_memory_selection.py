@@ -425,10 +425,38 @@ def select_context_memories_with_trace(
             if not any(existing[2].get("id") == m.get("id") for existing in rejected):
                 rejected.append((float(rel.get("score") or 0.0), str(rel.get("reason") or ""), m, rel))
         rejected.sort(key=lambda x: x[0], reverse=True)
+        # Soft-recall index (P3 / D3 "LLM 软召回"): a compact list of MORE cards
+        # than the lexical filter selected, by title + date only. The hosted
+        # model can naturally "recall" one of these if it is relevant to the
+        # current message even though it didn't lexically match — the model
+        # decides, instead of the keyword filter hard-dropping it. Built from the
+        # already-decrypted `moments`, so it costs no extra provider/enclave call.
+        # Turning points first, then most recent. Existing `selected` cards are
+        # excluded (they're already passed in full).
+        index_ids = {item.get("id") for item in selected_trace}
+        index_pool = sorted(
+            [m for m in moments if m.get("id") not in index_ids],
+            key=lambda m: (
+                str(m.get("title") or "").startswith("转折｜"),
+                m.get("occurred_at") or "",
+                m.get("created_at") or "",
+            ),
+            reverse=True,
+        )[:20]
+        index_sample = [
+            {
+                "id": m.get("id"),
+                "type": str(m.get("type") or ""),
+                "title": str(m.get("title") or "")[:120],
+                "occurred_at": str(m.get("occurred_at") or "")[:10],
+            }
+            for m in index_pool
+        ]
         trace = {
             **_query_trace(latest_user_text),
             "mode": "model_api",
             "selected": selected_trace,
+            "index_sample": index_sample,
             "rejected_sample": [
                 _selection_for_trace(m, rel, selected=False, bucket="rejected")
                 for _, __, m, rel in rejected[:8]

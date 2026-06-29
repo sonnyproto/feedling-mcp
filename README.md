@@ -9,9 +9,12 @@ Agent 是大脑，Feedling 是身体。
 
 ## What this repo is
 
-1. **Flask HTTP backend** (`backend/app.py`) — iOS, MCP, resident-consumer, and proactive APIs
-2. **FastMCP server** (`backend/mcp_server.py`) — MCP protocol for Claude.ai / Claude Desktop
-3. **Production CVM stack** (`deploy/docker-compose.phala.yaml`) — dstack-ingress + Flask + FastMCP + enclave services running inside one Phala TDX CVM
+> **Note (2026-06-12)**: the MCP user line (FastMCP server, `mcp.feedling.app`,
+> the 31 `feedling_*` tools) was removed. Historical mentions below are kept
+> only where they describe past milestones.
+
+1. **Flask HTTP backend** (`backend/app.py`) — iOS, resident-consumer, and proactive APIs
+3. **Production CVM stack** (`deploy/docker-compose.phala.yaml`) — dstack-ingress + Flask + enclave services running inside one Phala TDX CVM
 4. **Enclave app** (`backend/enclave_app.py`) — owns the content private key, serves `/attestation` on its own pinnable TLS port, and runs the decrypt proxy
 5. **iOS app** — now lives in the companion repo <https://github.com/teleport-computer/feedling-mcp-ios>. It owns Chat · Identity · Garden · Settings, Live Activity / Dynamic Island, Broadcast Extension for screen capture, and the live audit card.
 6. **Skill** — the agent's bootstrap + behavior spec. Lives in a separate public repo so it can be hot-updated without an iOS rebuild: <https://github.com/teleport-computer/io-onboarding>. Current onboarding splits users into three routes: own server / resident consumer, model API key, and official app import.
@@ -20,14 +23,14 @@ Agent 是大脑，Feedling 是身体。
 
 ```
 feedling-mcp-v1/
-├── backend/        ← Flask (5001) + FastMCP (5002) + enclave_app (5003)
+├── backend/        ← Flask (5001) + enclave_app (5003)
 ├── deploy/         ← docker-compose.yaml (local/self-host)
 │                     + docker-compose.phala.yaml (production CVM)
 │                     + Caddyfile/systemd/setup.sh for self-hosting
 │                     + DEPLOYMENTS.md
 ├── contracts/      ← FeedlingAppAuth (Solidity, Sepolia)
 ├── tools/          ← audit_live_cvm.py + DCAP verifier + envelope tests
-├── tests/          ← multi-tenant isolation + MCP session unit tests (pytest)
+├── tests/          ← multi-tenant isolation unit tests (pytest)
 ├── docs/           ← DESIGN_E2E.md · AUDIT.md · CHANGELOG.md
 ├── DESIGN.md       ← visual / UI design tokens
 └── CLAUDE.md       ← repo-level conventions for Claude Code
@@ -74,7 +77,7 @@ and the current live-verify command is below.
    - `sha256(attestation-port TLS cert DER)` (so the iOS app pins
      the exact cert it's talking to)
    Current production runs on Phala prod9 with `dstack-ingress`
-   terminating `api.feedling.app` and `mcp.feedling.app` inside the
+   terminating `api.feedling.app` inside the
    CVM. The older Phase C.2 MCP TLS pubkey pin is retired in this
    topology, so `mcp_tls_cert_pubkey_fingerprint_hex` is intentionally
    empty and the audit card surfaces that as a transport disclosure,
@@ -93,7 +96,7 @@ and the current live-verify command is below.
 5. **Attestation MITM is detectable, and content privacy does not
    depend on custom-domain TLS.** iOS pins the live attestation-port
    cert's `sha256(DER)` to the fingerprint in the quote. The public
-   `api.feedling.app` and `mcp.feedling.app` domains use standard
+   `api.feedling.app` domain uses standard
    Let's Encrypt TLS at `dstack-ingress`; that protects bystanders
    and normal network traffic, while content confidentiality comes
    from the v1 envelopes sealed to `enclave_content_pk`.
@@ -123,7 +126,7 @@ the running CVM live from the device:
 5. `compose_hash` authorization on `FeedlingAppAuth` (Ethereum Sepolia)
 6. Attestation-port TLS cert `sha256(DER)` matches REPORT_DATA
 7. Current prod9 transport disclosure: `api.feedling.app` and
-   `mcp.feedling.app` use standard Let's Encrypt TLS at
+   use standard Let's Encrypt TLS at
    `dstack-ingress`; content privacy is enforced by the envelope key
    bound to `enclave_content_pk`
 
@@ -164,7 +167,7 @@ shipped:
 - [x] v0/SINGLE_USER strip — multi-tenant only; plaintext writes return 400
 - [x] iOS end-to-end: chat / memory / identity / nudges / agent replies all v1 envelopes
 - [x] Pure-CVM production stack live on Phala prod9: dstack-ingress + backend + MCP + enclave
-- [x] `api.feedling.app` and `mcp.feedling.app` routed through dstack-ingress inside the CVM
+- [x] `api.feedling.app` routed through dstack-ingress inside the CVM
 - [x] Attestation port (5003) still terminates its own dstack-KMS-derived TLS for pinning
 - [x] On-chain `compose_hash` authorization via `FeedlingAppAuth` on Ethereum Sepolia
 - [x] iOS audit card and `tools/audit_live_cvm.py` cover prod9 ingress disclosure + enclave content-key trust
@@ -200,7 +203,6 @@ clients                               agents via feedling-chat-resident
 ┌────────────────────────────────────────────────────────────────┐
 │                    Phala prod9 TDX CVM                         │
 │  dstack-ingress (443, LE TLS)                                  │
-│      ├── mcp.feedling.app ──► mcp     (FastMCP SSE, 5002)      │
 │      └── api.feedling.app ──► backend (Flask API, WS, 5001)    │
 │                                      │                         │
 │                                      ▼                         │
@@ -218,7 +220,7 @@ clients                               agents via feedling-chat-resident
 
     iOS audit card ──pins sha256(DER) on -5003s passthrough──► enclave_app
     compose_hash authorized on Ethereum Sepolia ─────────────► FeedlingAppAuth
-                                                               0x6c8A6f1e3eD4180B2048B808f7C4b2874649b88F
+                                                               0x6c8A6f1e3eD4180B2048B808f7C4b2874649b88F 
 ```
 
 ---
@@ -229,9 +231,8 @@ clients                               agents via feedling-chat-resident
 
 | Process | File | Port | Purpose |
 |---------|------|------|---------|
-| dstack-ingress | `deploy/docker-compose.phala.yaml` | 443 | Production TLS + SNI routing for `api.feedling.app` and `mcp.feedling.app` inside the CVM |
+| dstack-ingress | `deploy/docker-compose.phala.yaml` | 443 | Production TLS for `api.feedling.app` inside the CVM |
 | Flask backend | `backend/app.py` | 5001 | iOS + agent HTTP API, envelope storage |
-| MCP server | `backend/mcp_server.py` | 5002 | MCP SSE for Claude.ai / Claude Desktop |
 | Enclave app | `backend/enclave_app.py` | 5003 | TDX CVM: `/attestation`, own pinnable TLS, decrypt proxy |
 
 Production is CVM-only. `deploy/docker-compose.phala.yaml` runs
@@ -260,7 +261,7 @@ cp deploy/feedling.env.example deploy/.env   # APNs, public base URL, etc.
 docker compose -f deploy/docker-compose.yaml --env-file deploy/.env up -d --build
 ```
 
-Brings up `backend` (5001) + `mcp` (5002). Data persists in the
+Brings up `backend` (5001). Data persists in the
 named volume `feedling_data` (mounted at `/data`). Drop the APNs
 `.p8` into that volume to enable push. This compose is for local
 development and self-hosting; it is not the production prod9 CVM
@@ -543,6 +544,8 @@ cp deploy/chat_resident.env.example ~/feedling-chat-resident.env
 chmod 600 ~/feedling-chat-resident.env
 # Edit ~/feedling-chat-resident.env — set FEEDLING_API_URL, FEEDLING_API_KEY,
 # a decrypt source, and the runtime's real HTTP or CLI agent entry.
+# Use the same Python environment that will run feedling-chat-resident.
+python -m pip install -r tools/chat_resident_requirements.txt
 sudo cp deploy/feedling-chat-resident.service /etc/systemd/system/
 sudo systemctl enable --now feedling-chat-resident
 ```
@@ -593,13 +596,11 @@ Caddy, DNS, iOS pointing at your URL+key).
 |----------|-------|
 | `FEEDLING_API_URL` | `http://localhost:5001` locally; `https://api.feedling.app` in production |
 | `FEEDLING_DATA_DIR` | `~/feedling-data/` |
-| `FEEDLING_MCP_TRANSPORT` | `sse` (default) or `streamable-http` |
 | `FEEDLING_CVM_APP_ID` | `9798850e096d770293c67305c6cfdceed68c1d28` (production iOS default) |
 | `FEEDLING_CVM_GATEWAY_DOMAIN` | `dstack-pha-prod9.phala.network` |
 | Public API domain | `api.feedling.app` via dstack-ingress |
 | Public MCP domain | `mcp.feedling.app` via dstack-ingress |
 | Flask port | `5001` |
-| MCP port | `5002` |
 | Enclave port | `5003` (in CVM only) |
 | WebSocket port | `9998` (`wss://<app_id>-9998.<gateway>/ingest` in production) |
 | App Group | `group.com.feedling.mcp` |

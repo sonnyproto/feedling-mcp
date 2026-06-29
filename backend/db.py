@@ -12,10 +12,12 @@ Crypto note: the server never decrypts. Every encrypted payload (chat / memory
 stored verbatim as JSONB and returned byte-for-byte, so the enclave's decrypt
 path is unaffected.
 
-Concurrency: one gunicorn process, ``--threads 32`` in production compose. A single
-``psycopg_pool.ConnectionPool`` (max_size=16) is shared across threads. The
-long-poll endpoints block on in-memory ``threading.Event``s, NOT on a held DB
-connection, so they don't starve the pool.
+Concurrency: ``-w N`` workers, ``--threads 32`` each in production compose. Each
+worker has its own ``psycopg_pool.ConnectionPool`` (max_size=16) shared across
+its threads, plus one pool-external connection for the LISTEN wake bus (see
+``listen_connection`` / ``pg_notify`` and ``core/wake_bus.py``). The long-poll
+endpoints block on in-memory ``threading.Event``s, NOT on a held DB connection,
+so they don't starve the pool; cross-worker wakes ride the NOTIFY channel.
 
 Durability parity: like the old file savers, write helpers swallow-and-log on
 failure (logged at error level) rather than raising, to keep request-path
@@ -24,6 +26,7 @@ behavior identical to the file era. Read helpers return empty/None on failure.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -32,6 +35,8 @@ from pathlib import Path
 import psycopg
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
+
+import object_storage  # lowest-layer peer: R2 offload for frame body_ct
 
 log = logging.getLogger("feedling.db")
 
@@ -111,6 +116,36 @@ def healthcheck() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# LISTEN/NOTIFY (cross-worker wake bus — see core/wake_bus.py)
+#
+# These are the only DB-layer primitives for the wake bus; the protocol /
+# payload / dispatch lives in core/wake_bus.py (db.py stays free of business
+# deps). pg_notify() borrows a pooled connection for a fire-and-forget signal;
+# listen_connection() hands out a dedicated, pool-external autocommit
+# connection that one daemon thread per worker holds open and blocks on.
+# ---------------------------------------------------------------------------
+
+
+def pg_notify(channel: str, payload: str) -> None:
+    """Fire a Postgres NOTIFY on ``channel``. Swallow-and-log on failure to keep
+    request-path behavior identical to the file era (a missed wake degrades to
+    the long-poll timeout / cache TTL, never a 500)."""
+    try:
+        with get_pool().connection() as conn:
+            conn.execute("SELECT pg_notify(%s, %s)", (channel, payload))
+    except Exception as e:
+        log.error("[db] pg_notify(%s) failed: %s", channel, e)
+
+
+def listen_connection() -> "psycopg.Connection":
+    """A dedicated, pool-external autocommit connection for LISTEN. The wake bus
+    holds exactly one of these per worker, outside the request pool, and blocks
+    on ``conn.notifies()`` — so it never consumes a pool slot. Raises on connect
+    failure; the caller's reconnect loop handles it."""
+    return psycopg.connect(_database_url(), autocommit=True)
+
+
+# ---------------------------------------------------------------------------
 # server_config (pepper, etc.)
 # ---------------------------------------------------------------------------
 
@@ -157,6 +192,37 @@ def set_config(key: str, value: bytes) -> None:
             "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
             (key, value),
         )
+
+
+# The agent-runner supervisor heartbeats here each tick; the backend's
+# /v1/model_api/chat/send wedge guard reads it to confirm a supervisor is
+# actually hosting before routing a turn into the agent-runner (else the turn
+# would park in "processing" with no consumer to answer it).
+AGENT_RUNTIME_SUPERVISOR_HEARTBEAT_KEY = "agent_runtime_supervisor_heartbeat"
+
+
+def set_supervisor_heartbeat(payload: dict) -> None:
+    """Upsert the supervisor's global heartbeat (JSON in server_config)."""
+    set_config(AGENT_RUNTIME_SUPERVISOR_HEARTBEAT_KEY,
+               json.dumps(payload).encode("utf-8"))
+
+
+def read_supervisor_heartbeat() -> dict | None:
+    """Return the parsed supervisor heartbeat, or None when the row is absent or
+    malformed. Raises on a DB/connection error so the caller can fail-open rather
+    than mistake an outage for "no supervisor" (which would 503 every send)."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT value FROM server_config WHERE key = %s",
+            (AGENT_RUNTIME_SUPERVISOR_HEARTBEAT_KEY,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        obj = json.loads(bytes(row[0]))
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 # ---------------------------------------------------------------------------
@@ -230,9 +296,14 @@ def upsert_user(entry: dict) -> None:
 
 def save_all_users(users: list[dict]) -> None:
     """Persist the whole in-memory user list. The app calls this (via
-    _save_users) whenever the registry changes — registration, key add/revoke,
-    normalization, preference/public-key edits. Replaces the table contents in
-    one transaction so removed users disappear too."""
+    _save_users) for full-list rewrites — startup normalization and test resets.
+
+    DELETE-all + reinsert, so it reflects removals too. NOTE: this is destructive
+    from THIS worker's snapshot — under ``-w N`` it must not be used for ordinary
+    per-user edits (a stale snapshot would wipe a user another worker just
+    created). Genuine single-user edits go through ``registry.persist_user`` →
+    ``db.upsert_user`` (per-row, non-destructive) instead; the remaining callers
+    here read-then-rewrite their own full snapshot or run pre-fork at startup."""
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
@@ -626,6 +697,73 @@ def set_blob(user_id: str, kind: str, doc) -> None:
         log.error("[db] set_blob(%s,%s) failed: %s", user_id, kind, e)
 
 
+def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict]:
+    """配了能 fit 的 provider 且 test_status='ok' 的用户都纳入托管（与
+    hosted/agent_runtime_cutover.resolve_driver 一致——不再有 per-user
+    ``agent_runtime_driver`` 开关；kill switch 改用删 config 或改 test_status）。
+    AGENT 由 provider 派生（保持 CASE 与 cutover.driver_for_provider 同步）：
+    anthropic/deepseek → claude；openai → codex (native)。gateway-only provider
+    (gemini/openrouter/openai_compatible → codex via LiteLLM gateway) 仅当
+    ``include_gateway`` 时返回（gateway 关时不发现，避免 spawn 到不存在的 proxy）。
+    Returns [{"user_id","driver","provider","model","base_url"}] sorted by user_id。"""
+    providers = ["anthropic", "claude", "deepseek", "openai"]
+    if include_gateway:
+        providers += ["gemini", "openrouter", "openai_compatible"]
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                  CASE LOWER(COALESCE(doc->>'provider', ''))
+                    WHEN 'anthropic' THEN 'claude'
+                    WHEN 'claude'    THEN 'claude'
+                    WHEN 'deepseek'  THEN 'claude'
+                    ELSE 'codex'
+                  END AS driver,
+                  LOWER(COALESCE(doc->>'provider', '')) AS provider,
+                  COALESCE(doc->>'model', '') AS model,
+                  COALESCE(doc->>'base_url', '') AS base_url
+                FROM user_blobs
+                WHERE kind = 'model_api'
+                  AND COALESCE(doc->>'test_status', '') = 'ok'
+                  AND LOWER(COALESCE(doc->>'provider', '')) = ANY(%s)
+                ORDER BY user_id
+                """,
+                (providers,),
+            ).fetchall()
+        return [{"user_id": uid, "driver": driver, "provider": provider,
+                 "model": model, "base_url": base_url}
+                for uid, driver, provider, model, base_url in rows]
+    except Exception as e:
+        log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
+        return []
+
+
+def try_stamp_hosted_tick(user_id: str, doc: dict, now: float, interval_sec: float) -> bool:
+    """Atomically claim this user's next hosted-heartbeat slot. Stamps the
+    ``hosted_tick`` blob with ``doc`` iff there is no prior stamp or the prior
+    one is at least ``interval_sec`` old, and returns whether THIS call won.
+
+    Replaces the read-then-write ts check so that two workers which both hold
+    the user's plaintext key can't each create a heartbeat in the same interval
+    (the per-job consume path is separately deduped by the job-status CAS in
+    log_patch_item). ``doc`` must carry a numeric ``ts`` field."""
+    try:
+        threshold = now - interval_sec
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, 'hosted_tick', %s) "
+                "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc "
+                "WHERE COALESCE((user_blobs.doc->>'ts')::float8, 0) <= %s "
+                "RETURNING doc",
+                (user_id, Jsonb(doc), threshold),
+            ).fetchone()
+        return row is not None
+    except Exception as e:
+        log.error("[db] try_stamp_hosted_tick(%s) failed: %s", user_id, e)
+        return False
+
+
 def delete_blob(user_id: str, kind: str) -> bool:
     try:
         with get_pool().connection() as conn:
@@ -653,6 +791,376 @@ def list_blobs(user_id: str, kind_prefix: str) -> list[dict]:
     except Exception as e:
         log.error("[db] list_blobs(%s,%s) failed: %s", user_id, kind_prefix, e)
         return []
+
+
+# ---------------------------------------------------------------------------
+# Genesis import ledger (chunked import, reducer outputs, runtime-ready state)
+# ---------------------------------------------------------------------------
+
+
+def _genesis_row(cur, row) -> dict | None:
+    if row is None:
+        return None
+    cols = [d[0] for d in cur.description]
+    out = dict(zip(cols, row))
+    for key, value in list(out.items()):
+        if hasattr(value, "isoformat"):
+            out[key] = value.isoformat()
+    return out
+
+
+def genesis_create_job(user_id: str, job: dict) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO genesis_import_jobs
+                (user_id, job_id, status, source_kind, file_manifest_hash,
+                 total_chunks, total_bytes, privacy_mode, metadata, output,
+                 updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, '{}'::jsonb, now())
+            ON CONFLICT (user_id, job_id) DO NOTHING
+            RETURNING *
+            """,
+            (
+                user_id,
+                job["job_id"],
+                job.get("status", "created"),
+                job.get("source_kind", "unknown"),
+                job.get("file_manifest_hash", ""),
+                int(job.get("total_chunks") or 0),
+                int(job.get("total_bytes") or 0),
+                job.get("privacy_mode", ""),
+                Jsonb(job.get("metadata") or {}),
+            ),
+        )
+        return _genesis_row(cur, cur.fetchone())
+
+
+def genesis_get_job(user_id: str, job_id: str) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "SELECT * FROM genesis_import_jobs WHERE user_id = %s AND job_id = %s",
+            (user_id, job_id),
+        )
+        return _genesis_row(cur, cur.fetchone())
+
+
+def genesis_list_jobs(user_id: str, *, limit: int = 20) -> list[dict]:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "SELECT * FROM genesis_import_jobs WHERE user_id = %s "
+            "ORDER BY updated_at DESC LIMIT %s",
+            (user_id, max(1, min(int(limit or 20), 100))),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        out.append(item)
+    return out
+
+
+def genesis_latest_done_job(user_id: str) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "SELECT * FROM genesis_import_jobs WHERE user_id = %s AND status = 'done' "
+            "ORDER BY completed_at DESC NULLS LAST, updated_at DESC LIMIT 1",
+            (user_id,),
+        )
+        return _genesis_row(cur, cur.fetchone())
+
+
+def genesis_claim_uploaded_jobs(*, limit: int = 1) -> list[dict]:
+    """Atomically claim uploaded genesis jobs for the CVM worker.
+
+    Uses SKIP LOCKED so multiple worker loops can poll without double-processing
+    the same import. Claimed jobs move uploaded -> processing in the same
+    transaction; genesis_state is updated by the worker service layer.
+    """
+    safe_limit = max(1, min(int(limit or 1), 16))
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            cur = conn.execute(
+                """
+                WITH picked AS (
+                    SELECT user_id, job_id
+                    FROM genesis_import_jobs
+                    WHERE status = 'uploaded'
+                    ORDER BY finalized_at ASC NULLS LAST, updated_at ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE genesis_import_jobs AS j SET
+                    status = 'processing',
+                    error = '',
+                    output = jsonb_build_object('stage', 'worker_claimed'),
+                    updated_at = now()
+                FROM picked
+                WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
+                RETURNING j.*
+                """,
+                (safe_limit,),
+            )
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        out.append(item)
+    return out
+
+
+def genesis_put_chunk(
+    user_id: str,
+    job_id: str,
+    *,
+    seq: int,
+    byte_start: int,
+    byte_end: int,
+    ciphertext_sha256: str,
+    content_sha256: str,
+    aad: dict,
+    encrypted_body: bytes,
+) -> dict:
+    size_bytes = len(encrypted_body)
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            existing = conn.execute(
+                "SELECT ciphertext_sha256 FROM genesis_import_chunks "
+                "WHERE user_id = %s AND job_id = %s AND seq = %s",
+                (user_id, job_id, seq),
+            ).fetchone()
+            if existing is not None and existing[0] != ciphertext_sha256:
+                raise ValueError("chunk_hash_conflict")
+            cur = conn.execute(
+                """
+                INSERT INTO genesis_import_chunks
+                    (user_id, job_id, seq, byte_start, byte_end,
+                     ciphertext_sha256, content_sha256, aad, encrypted_body,
+                     size_bytes, status, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'uploaded', now())
+                ON CONFLICT (user_id, job_id, seq) DO UPDATE SET
+                    byte_start = EXCLUDED.byte_start,
+                    byte_end = EXCLUDED.byte_end,
+                    content_sha256 = EXCLUDED.content_sha256,
+                    aad = EXCLUDED.aad,
+                    status = 'uploaded',
+                    updated_at = now()
+                RETURNING user_id, job_id, seq, byte_start, byte_end,
+                          ciphertext_sha256, content_sha256, aad, size_bytes,
+                          status, attempts, map_output_ref, error, created_at,
+                          updated_at
+                """,
+                (
+                    user_id,
+                    job_id,
+                    seq,
+                    byte_start,
+                    byte_end,
+                    ciphertext_sha256,
+                    content_sha256,
+                    Jsonb(aad),
+                    encrypted_body,
+                    size_bytes,
+                ),
+            )
+            chunk = _genesis_row(cur, cur.fetchone()) or {}
+            conn.execute(
+                """
+                UPDATE genesis_import_jobs SET
+                    status = CASE
+                        WHEN status = 'created' THEN 'uploading'
+                        ELSE status
+                    END,
+                    received_chunks = (
+                        SELECT COUNT(*) FROM genesis_import_chunks
+                        WHERE user_id = %s AND job_id = %s
+                    ),
+                    received_bytes = COALESCE((
+                        SELECT SUM(size_bytes) FROM genesis_import_chunks
+                        WHERE user_id = %s AND job_id = %s
+                    ), 0),
+                    updated_at = now()
+                WHERE user_id = %s AND job_id = %s
+                """,
+                (user_id, job_id, user_id, job_id, user_id, job_id),
+            )
+    return chunk
+
+
+def genesis_missing_chunk_seqs(user_id: str, job_id: str, total_chunks: int) -> list[int]:
+    if total_chunks <= 0:
+        return []
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            "SELECT seq FROM genesis_import_chunks WHERE user_id = %s AND job_id = %s",
+            (user_id, job_id),
+        ).fetchall()
+    have = {int(row[0]) for row in rows}
+    return [seq for seq in range(total_chunks) if seq not in have]
+
+
+def genesis_list_chunks(user_id: str, job_id: str) -> list[dict]:
+    """Return all chunk rows, including encrypted body bytes, ordered by seq."""
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            SELECT user_id, job_id, seq, byte_start, byte_end,
+                   ciphertext_sha256, content_sha256, aad, encrypted_body,
+                   size_bytes, status, attempts, map_output_ref, error,
+                   created_at, updated_at
+            FROM genesis_import_chunks
+            WHERE user_id = %s AND job_id = %s
+            ORDER BY seq ASC
+            """,
+            (user_id, job_id),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        body = item.get("encrypted_body")
+        if isinstance(body, memoryview):
+            item["encrypted_body"] = body.tobytes()
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        out.append(item)
+    return out
+
+
+def genesis_mark_finalized(user_id: str, job_id: str) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE genesis_import_jobs SET
+                status = 'uploaded',
+                finalized_at = COALESCE(finalized_at, now()),
+                updated_at = now()
+            WHERE user_id = %s AND job_id = %s
+              AND status IN ('created', 'uploading', 'uploaded', 'failed')
+            RETURNING *
+            """,
+            (user_id, job_id),
+        )
+        return _genesis_row(cur, cur.fetchone())
+
+
+def genesis_set_job_status(
+    user_id: str,
+    job_id: str,
+    *,
+    status: str,
+    error: str = "",
+    output: dict | None = None,
+    processed_chunks: int | None = None,
+) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE genesis_import_jobs SET
+                status = %s,
+                error = %s,
+                output = COALESCE(%s::jsonb, output),
+                processed_chunks = COALESCE(%s, processed_chunks),
+                updated_at = now()
+            WHERE user_id = %s AND job_id = %s
+            RETURNING *
+            """,
+            (
+                status,
+                error[:1000],
+                Jsonb(output) if output is not None else None,
+                processed_chunks,
+                user_id,
+                job_id,
+            ),
+        )
+        return _genesis_row(cur, cur.fetchone())
+
+
+def genesis_upsert_output(
+    user_id: str,
+    job_id: str,
+    output_type: str,
+    *,
+    doc: dict,
+    status: str,
+    ref: str = "",
+) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO genesis_import_outputs
+                (user_id, job_id, output_type, ref, status, doc, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT (user_id, job_id, output_type) DO UPDATE SET
+                ref = EXCLUDED.ref,
+                status = EXCLUDED.status,
+                doc = EXCLUDED.doc,
+                updated_at = now()
+            RETURNING *
+            """,
+            (user_id, job_id, output_type, ref, status, Jsonb(doc)),
+        )
+        return _genesis_row(cur, cur.fetchone())
+
+
+def genesis_get_output(user_id: str, job_id: str, output_type: str) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "SELECT * FROM genesis_import_outputs "
+            "WHERE user_id = %s AND job_id = %s AND output_type = %s",
+            (user_id, job_id, output_type),
+        )
+        return _genesis_row(cur, cur.fetchone())
+
+
+def genesis_complete_job(
+    user_id: str,
+    job_id: str,
+    *,
+    output: dict,
+    memory_action_count: int,
+    identity_status: str,
+    persona_ref: str,
+    persona_sha256: str,
+) -> dict | None:
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE genesis_import_jobs SET
+                status = 'done',
+                output = %s,
+                memory_action_count = %s,
+                identity_status = %s,
+                persona_ref = %s,
+                persona_sha256 = %s,
+                completed_at = COALESCE(completed_at, now()),
+                updated_at = now(),
+                error = ''
+            WHERE user_id = %s AND job_id = %s
+            RETURNING *
+            """,
+            (
+                Jsonb(output),
+                int(memory_action_count),
+                identity_status[:120],
+                persona_ref[:240],
+                persona_sha256[:80],
+                user_id,
+                job_id,
+            ),
+        )
+        return _genesis_row(cur, cur.fetchone())
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +1223,39 @@ def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None
         return None
 
 
+def chat_try_claim_reply(
+    user_id: str, msg_id: str, consumer_id: str, now: float, fields: dict
+) -> dict | None:
+    """Atomically claim a chat reply for ``consumer_id`` — the cross-worker-safe
+    replacement for read-cache-then-write. The claim succeeds iff the row is
+    currently unclaimed, already ours, or the prior claim has expired (the SQL
+    WHERE mirrors chat.service._chat_message_claimable). Returns the merged doc
+    on success, or None if the row is missing or another consumer/worker holds
+    an unexpired claim — so two workers polling the same reply can't both win."""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "UPDATE chat_messages SET doc = doc || %s "
+                "WHERE user_id = %s AND msg_id = %s "
+                # Reject already-replied rows in the DB itself, not just via the
+                # caller's (possibly stale) cache pre-gate: another worker may
+                # have posted the reply (reply_status/reply_message_id) after
+                # this worker last refreshed. Mirrors _chat_message_claimable.
+                "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+                "  AND COALESCE(doc->>'reply_message_id','') = '' "
+                "  AND ("
+                "    COALESCE(doc->>'reply_claimed_by','') = '' "
+                "    OR doc->>'reply_claimed_by' = %s "
+                "    OR COALESCE(NULLIF(doc->>'reply_claim_expires_at','')::float8, 0) <= %s"
+                ") RETURNING doc",
+                (Jsonb(fields), user_id, msg_id, consumer_id, now),
+            ).fetchone()
+        return row[0] if row is not None else None
+    except Exception as e:
+        log.error("[db] chat_try_claim_reply(%s,%s) failed: %s", user_id, msg_id, e)
+        return None
+
+
 def chat_delete(user_id: str, msg_id: str) -> bool:
     try:
         with get_pool().connection() as conn:
@@ -762,7 +1303,9 @@ def memory_load(user_id: str) -> list[dict]:
         return []
 
 
-def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> None:
+def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> bool:
+    """Single-row upsert. Returns True iff the write committed — callers that
+    advance state on success (e.g. memory.upgrade / migration) MUST check it."""
     try:
         with get_pool().connection() as conn:
             conn.execute(
@@ -772,8 +1315,10 @@ def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> 
                 "occurred_at = EXCLUDED.occurred_at, doc = EXCLUDED.doc",
                 (user_id, moment_id, occurred_at or "", Jsonb(doc)),
             )
+        return True
     except Exception as e:
         log.error("[db] memory_upsert(%s,%s) failed: %s", user_id, moment_id, e)
+        return False
 
 
 def memory_delete(user_id: str, moment_id: str) -> bool:
@@ -790,23 +1335,45 @@ def memory_delete(user_id: str, moment_id: str) -> bool:
 
 
 def memory_replace_all(user_id: str, moments: list[dict]) -> None:
-    """Atomically replace the full moment set for a user. Used where the old
-    code did load-list / mutate / save-whole-list. The id/occurred_at columns
-    are derived from each moment dict; the dict itself is stored verbatim."""
+    """Atomically reconcile the stored moment set to `moments`. The final row
+    set equals the input list (full-replace semantics preserved), but only rows
+    that were removed are deleted and only rows whose doc changed are upserted,
+    so a single-card edit no longer rewrites the user's entire garden. Used
+    where the old code did load-list / mutate / save-whole-list."""
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
-                conn.execute("DELETE FROM memory_moments WHERE user_id = %s", (user_id,))
-                for m in moments:
-                    mid = m.get("id")
-                    if not mid:
+                rows = conn.execute(
+                    "SELECT moment_id, occurred_at, doc FROM memory_moments WHERE user_id = %s",
+                    (user_id,),
+                ).fetchall()
+                existing = {r[0]: (r[1], r[2]) for r in rows}
+
+                # last-writer-wins on duplicate ids, mirroring the old
+                # DELETE-then-INSERT/ON CONFLICT behavior; drop id-less dicts.
+                new = {str(m["id"]): m for m in moments if m.get("id")}
+
+                for mid in existing.keys() - new.keys():
+                    conn.execute(
+                        "DELETE FROM memory_moments WHERE user_id = %s AND moment_id = %s",
+                        (user_id, mid),
+                    )
+                for mid, m in new.items():
+                    occurred_at = str(m.get("occurred_at") or "")
+                    prev = existing.get(mid)
+                    # Skip only when BOTH the doc and the derived occurred_at
+                    # column match — the old full-replace path always rewrote
+                    # occurred_at from the input, so an unchanged doc paired with
+                    # a stale ordering column must still be rewritten or
+                    # memory_load() (ORDER BY occurred_at) returns wrong order.
+                    if prev is not None and prev[0] == occurred_at and prev[1] == m:
                         continue
                     conn.execute(
                         "INSERT INTO memory_moments (user_id, moment_id, occurred_at, doc) "
                         "VALUES (%s, %s, %s, %s) "
                         "ON CONFLICT (user_id, moment_id) DO UPDATE SET "
                         "occurred_at = EXCLUDED.occurred_at, doc = EXCLUDED.doc",
-                        (user_id, str(mid), str(m.get("occurred_at") or ""), Jsonb(m)),
+                        (user_id, mid, occurred_at, Jsonb(m)),
                     )
     except Exception as e:
         log.error("[db] memory_replace_all(%s) failed: %s", user_id, e)
@@ -817,17 +1384,66 @@ def memory_replace_all(user_id: str, moments: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
+def _frame_write_row(user_id: str, frame_id: str, ts: float,
+                     doc: dict | None, env_meta: dict | None, body_key: str | None) -> bool:
+    """Upsert one frame_envelopes row. Returns True on success; swallows-and-logs
+    on failure (request-path parity) and returns False so the caller can decide
+    whether it is safe to touch R2."""
     try:
         with get_pool().connection() as conn:
             conn.execute(
-                "INSERT INTO frame_envelopes (user_id, frame_id, ts, doc) "
-                "VALUES (%s, %s, %s, %s) "
-                "ON CONFLICT (user_id, frame_id) DO UPDATE SET ts = EXCLUDED.ts, doc = EXCLUDED.doc",
-                (user_id, frame_id, float(ts), Jsonb(doc)),
+                "INSERT INTO frame_envelopes (user_id, frame_id, ts, doc, env_meta, body_key) "
+                "VALUES (%s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (user_id, frame_id) DO UPDATE SET ts = EXCLUDED.ts, "
+                "doc = EXCLUDED.doc, env_meta = EXCLUDED.env_meta, body_key = EXCLUDED.body_key",
+                (user_id, frame_id, float(ts),
+                 Jsonb(doc) if doc is not None else None,
+                 Jsonb(env_meta) if env_meta is not None else None,
+                 body_key),
             )
+        return True
     except Exception as e:
-        log.error("[db] frame_upsert(%s,%s) failed: %s", user_id, frame_id, e)
+        log.error("[db] frame_upsert(%s,%s) row write failed: %s", user_id, frame_id, e)
+        return False
+
+
+def frame_upsert(user_id: str, frame_id: str, ts: float, doc: dict) -> None:
+    """Persist a v1 frame envelope.
+
+    With R2 configured, the heavy ``body_ct`` is offloaded to object storage and
+    the row keeps only the small envelope metadata (``env_meta``) plus the R2
+    pointer (``body_key``); ``doc`` is NULL. Without R2 the full envelope is
+    stored inline in ``doc`` (legacy shape). The caller's ``doc`` is not mutated.
+
+    Ordering matters — the row is written so it is self-consistent at every
+    durable point, never pointing at an object that does not exist yet:
+      1. write the row INLINE (full envelope, no pointer) — readable immediately;
+      2. upload the body to R2;
+      3. only once the object exists, flip the row to the pointer shape (doc
+         NULL, env_meta + body_key) as the LAST durable step.
+    A crash/abort at any point leaves either an inline (readable) row or a
+    pointer whose object is already present; a failed upload just keeps the
+    inline row. ``doc`` is offloaded out of the row only after the body is in
+    R2, so the at-rest table stays small without a missing-object window."""
+    if object_storage.enabled() and isinstance(doc, dict) and doc.get("body_ct") is not None:
+        # 1) inline first — frame readable, references no R2 object yet.
+        if not _frame_write_row(user_id, frame_id, ts, doc, None, None):
+            return  # DB write failed → nothing committed, R2 untouched.
+        # 2) upload; on failure keep the inline row (frame stays readable).
+        try:
+            object_storage.put_frame_body(user_id, frame_id, doc["body_ct"])
+        except Exception as e:  # noqa: BLE001
+            log.error("[db] frame_upsert(%s,%s) R2 upload failed, leaving inline: %s",
+                      user_id, frame_id, e)
+            return
+        # 3) object now exists → flip to pointer as the last durable step. If
+        #    this write fails the row stays inline (readable); the uploaded
+        #    object is a harmless orphan.
+        env_meta = {k: v for k, v in doc.items() if k != "body_ct"}
+        body_key = object_storage.frame_key(user_id, frame_id)
+        _frame_write_row(user_id, frame_id, ts, None, env_meta, body_key)
+        return
+    _frame_write_row(user_id, frame_id, ts, doc, None, None)
 
 
 def frame_exists(user_id: str, frame_id: str) -> bool:
@@ -846,16 +1462,33 @@ def frame_exists(user_id: str, frame_id: str) -> bool:
 
 
 def frame_get(user_id: str, frame_id: str) -> dict | None:
+    """Return the full v1 envelope, reconstructing ``body_ct`` from R2 for
+    offloaded rows (``body_key`` set) and returning the inline ``doc`` for
+    legacy rows."""
     try:
         with get_pool().connection() as conn:
             row = conn.execute(
-                "SELECT doc FROM frame_envelopes WHERE user_id = %s AND frame_id = %s",
+                "SELECT doc, env_meta, body_key FROM frame_envelopes "
+                "WHERE user_id = %s AND frame_id = %s",
                 (user_id, frame_id),
             ).fetchone()
-        return row[0] if row is not None else None
     except Exception as e:
         log.error("[db] frame_get(%s,%s) failed: %s", user_id, frame_id, e)
         return None
+    if row is None:
+        return None
+    doc, env_meta, body_key = row
+    if body_key:
+        body_ct = object_storage.get_frame_body(user_id, frame_id)
+        if body_ct is None:
+            # The pointer row exists but its R2 body is missing/unreadable.
+            # Report not-found rather than a metadata-only dict — callers treat
+            # any dict as a valid envelope and would serve an undecryptable frame.
+            log.error("[db] frame_get(%s,%s) R2 body missing for key %s",
+                      user_id, frame_id, body_key)
+            return None
+        return {**(env_meta or {}), "body_ct": body_ct}
+    return doc
 
 
 def frame_delete(user_id: str, frame_id: str) -> None:
@@ -866,7 +1499,12 @@ def frame_delete(user_id: str, frame_id: str) -> None:
                 (user_id, frame_id),
             )
     except Exception as e:
+        # Row delete failed → the pointer row survives, so leave the R2 body in
+        # place; deleting it now would corrupt later reads of the still-present row.
         log.error("[db] frame_delete(%s,%s) failed: %s", user_id, frame_id, e)
+        return
+    if object_storage.enabled():
+        object_storage.delete_frame_body(user_id, frame_id)
 
 
 def frame_list_meta(user_id: str) -> list[dict]:
@@ -875,8 +1513,8 @@ def frame_list_meta(user_id: str) -> list[dict]:
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
-                "SELECT frame_id, ts, doc FROM frame_envelopes WHERE user_id = %s "
-                "ORDER BY ts",
+                "SELECT frame_id, ts, COALESCE(env_meta, doc) FROM frame_envelopes "
+                "WHERE user_id = %s ORDER BY ts",
                 (user_id,),
             ).fetchall()
     except Exception as e:
@@ -920,6 +1558,9 @@ def frame_prune_to(user_id: str, max_frames: int) -> list[str]:
                         "DELETE FROM frame_envelopes WHERE user_id = %s AND frame_id = ANY(%s)",
                         (user_id, evicted),
                     )
+        if evicted and object_storage.enabled():
+            for fid in evicted:
+                object_storage.delete_frame_body(user_id, fid)
         return evicted
     except Exception as e:
         log.error("[db] frame_prune_to(%s) failed: %s", user_id, e)
@@ -1000,21 +1641,33 @@ def log_patch_item(user_id: str, stream: str, item_key: str, patch: dict,
         return None
 
 
-def log_trim(user_id: str, stream: str, max_rows: int) -> None:
-    """Keep only the newest ``max_rows`` rows of a stream."""
+def log_trim(user_id: str, stream: str, max_rows: int,
+             only_statuses: "list[str] | None" = None) -> None:
+    """Keep only the newest ``max_rows`` rows of a stream.
+
+    When ``only_statuses`` is given, a row is eligible for deletion only if its
+    ``doc->>'status'`` is in that set — rows in any other status (e.g. an
+    in-flight ``queued``/``processing`` trace still awaiting its completion
+    patch) are kept regardless of age, so trim never drops a row a later
+    ``log_patch_item`` still expects to update. The newest-``max_rows`` cutoff is
+    computed over all rows; only the *deletion* is status-restricted."""
     if not max_rows or max_rows <= 0:
         return
     try:
+        sql = (
+            "DELETE FROM user_logs WHERE user_id = %s AND stream = %s AND seq < ("
+            "  SELECT MIN(seq) FROM ("
+            "    SELECT seq FROM user_logs WHERE user_id = %s AND stream = %s "
+            "    ORDER BY seq DESC LIMIT %s"
+            "  ) t"
+            ")"
+        )
+        params: list = [user_id, stream, user_id, stream, max_rows]
+        if only_statuses:
+            sql += " AND doc->>'status' = ANY(%s)"
+            params.append(list(only_statuses))
         with get_pool().connection() as conn:
-            conn.execute(
-                "DELETE FROM user_logs WHERE user_id = %s AND stream = %s AND seq < ("
-                "  SELECT MIN(seq) FROM ("
-                "    SELECT seq FROM user_logs WHERE user_id = %s AND stream = %s "
-                "    ORDER BY seq DESC LIMIT %s"
-                "  ) t"
-                ")",
-                (user_id, stream, user_id, stream, max_rows),
-            )
+            conn.execute(sql, params)
     except Exception as e:
         log.error("[db] log_trim(%s,%s) failed: %s", user_id, stream, e)
 
@@ -1044,13 +1697,29 @@ def delete_user_data(user_id: str) -> None:
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
+                # Every table keyed by user_id must be listed here. When a
+                # migration adds a new per-user table, add it below or the
+                # account-reset path will silently orphan that user's rows.
+                # genesis_import_chunks/outputs cascade from genesis_import_jobs,
+                # but we delete them explicitly (children first) so the wipe
+                # stays correct even if those FK cascades are ever dropped.
                 for table in (
                     "chat_messages",
                     "memory_moments",
                     "frame_envelopes",
                     "user_logs",
                     "user_blobs",
+                    "perception_items",
+                    "perception_daily",
+                    "agent_runtime_instances",
+                    "genesis_import_chunks",
+                    "genesis_import_outputs",
+                    "genesis_import_jobs",
                 ):
                     conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
     except Exception as e:
+        # Rows survive on failure → keep the R2 bodies so they still resolve.
         log.error("[db] delete_user_data(%s) failed: %s", user_id, e)
+        return
+    if object_storage.enabled():
+        object_storage.delete_user_frames(user_id)

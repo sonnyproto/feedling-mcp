@@ -61,7 +61,7 @@ RUN useradd --system --uid 1000 --home-dir /home/feedling --create-home feedling
  && chown -R feedling:feedling /data /tls /app
 USER feedling
 
-EXPOSE 5001 5002 9998
+EXPOSE 5001 9998
 
 # Default command runs the Flask backend under gunicorn (production WSGI;
 # the Werkzeug dev server in app.run() stalls on large responses under the
@@ -76,4 +76,4 @@ EXPOSE 5001 5002 9998
 # convoy worse under load. 32 is the middle ground until the real fix lands
 # (move the :9998 WS ingest off the import path so we can run -w >1). Keep in
 # sync with deploy/docker-compose.yaml.
-CMD ["gunicorn", "--chdir", "backend", "-w", "1", "--threads", "32", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
+CMD ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-w", "1", "--threads", "32", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]

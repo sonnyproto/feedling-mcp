@@ -32,5 +32,11 @@ ios/vendor/dcap-qvl/target/
 
 # Claude Code session scratch (task locks, transient state)
 .claude/
+
+# Local agent mailbox runtime (messages, inboxes, pane config)
+.agents/
 buildServer.json
 deploy/backups/
+
+# Local dev virtualenv (created for running the test suite)
+.venv/

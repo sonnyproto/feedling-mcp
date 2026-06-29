@@ -30,8 +30,8 @@ def test_proactive_gate_eval_summarizes_human_reviews():
             },
         ],
         "reviews": [
-            {"decision_id": "gd_true", "label": "great_companion_moment", "notes": "felt right"},
-            {"decision_id": "gd_false", "label": "missed_opportunity", "notes": "should have noticed"},
+            {"decision_id": "gd_true", "label": "good_presence", "notes": "felt right"},
+            {"decision_id": "gd_false", "label": "missed_moment", "notes": "should have noticed"},
         ],
     }
 

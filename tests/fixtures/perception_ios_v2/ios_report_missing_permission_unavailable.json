@@ -1,0 +1,75 @@
+{
+  "context_snapshot": [
+    {
+      "key": "time",
+      "data": "{\"local_time\":\"2026-06-19T21:01:00+08:00\",\"locale\":\"zh-Hans-CN\",\"timezone\":\"Asia/Shanghai\"}",
+      "message": "本地时间、时区和语言环境"
+    },
+    {
+      "key": "battery",
+      "data": "{\"charging\":false,\"level\":0.45}",
+      "message": "当前电量与充电状态"
+    },
+    {
+      "key": "broadcast",
+      "data": "{\"active\":false,\"state\":\"idle\"}",
+      "message": "屏幕 broadcast 状态"
+    },
+    {
+      "key": "location_signal",
+      "data": null,
+      "message": "未授权定位，无法读取位置、地址和环境信号"
+    },
+    {
+      "key": "motion_state",
+      "data": null,
+      "message": "Motion & Fitness 已授权，但最近 15 分钟没有可用运动状态"
+    },
+    {
+      "key": "focus",
+      "data": null,
+      "message": "未授权专注状态共享，无法读取是否处于专注模式"
+    },
+    {
+      "key": "calendar_next_event",
+      "data": null,
+      "message": "未来 24 小时内没有可用日程"
+    },
+    {
+      "key": "playback",
+      "data": null,
+      "message": "未授权媒体资料库，无法读取正在播放上下文"
+    },
+    {
+      "key": "audio_route",
+      "data": null,
+      "message": "无法读取当前音频输出路由"
+    },
+    {
+      "key": "weather",
+      "data": null,
+      "message": "WeatherKit 不可用，无法读取粗天气"
+    },
+    {
+      "key": "health_sleep",
+      "data": null,
+      "message": "HealthKit 不可用，无法读取睡眠趋势"
+    },
+    {
+      "key": "health_workout",
+      "data": null,
+      "message": "HealthKit 不可用，无法读取运动趋势"
+    },
+    {
+      "key": "health_vitals",
+      "data": null,
+      "message": "HealthKit 不可用，无法读取身体趋势"
+    },
+    {
+      "key": "unsupported",
+      "data": "{\"frontmost_app\":null,\"precise_unlock\":null,\"silent_mode\":null}",
+      "message": "iOS 当前不能稳定提供的感知项"
+    }
+  ],
+  "client_ts": "1781874060"
+}

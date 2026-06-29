@@ -17,9 +17,18 @@ rather than failing with confusing connection errors.
 """
 
 import os
+import sys
 import uuid
+from pathlib import Path
 
 import pytest
+
+# Let hosting-ready check pass in tests by default. Tests that specifically
+# test the assert_hosting_ready() raise path (test_hosted_agent_runtime_cutover.py)
+# use monkeypatch.delenv to explicitly unset these, overriding setdefault.
+os.environ.setdefault("FEEDLING_LITELLM_ENABLE", "1")
+os.environ.setdefault("FEEDLING_HOST_ALL", "1")
+os.environ.setdefault("FEEDLING_RUNTIME_TOKEN_SECRET", "test-runtime-token-secret")
 
 _ADMIN_URL = os.environ.get("FEEDLING_TEST_PG", "postgresql://postgres:test@127.0.0.1:55432/postgres")
 _TEST_DB = f"feedling_test_{uuid.uuid4().hex[:12]}"
@@ -33,16 +42,36 @@ def _admin_url_for(dbname: str) -> str:
 
 _provisioned = False
 _PROVISION_ERROR = None
+_created_test_db = False
 try:
     import psycopg
 
     _admin = psycopg.connect(_ADMIN_URL, autocommit=True)
     _admin.execute(f'CREATE DATABASE "{_TEST_DB}"')
     _admin.close()
+    _created_test_db = True
     os.environ["DATABASE_URL"] = _admin_url_for(_TEST_DB)
+    backend_dir = Path(__file__).parent.parent / "backend"
+    sys.path.insert(0, str(backend_dir))
+    import db
+
+    db.init_schema()
     _provisioned = True
 except Exception as e:  # noqa: BLE001 — any failure means "no usable PG"
     _PROVISION_ERROR = e
+    if _created_test_db:
+        try:
+            import psycopg
+
+            admin = psycopg.connect(_ADMIN_URL, autocommit=True)
+            admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
+                (_TEST_DB,),
+            )
+            admin.execute(f'DROP DATABASE IF EXISTS "{_TEST_DB}"')
+            admin.close()
+        except Exception:
+            pass
 
 # If we couldn't provision a test DB, do NOT collect the backend test modules.
 # Several of them import backend/app.py at module scope, which now calls
@@ -52,7 +81,39 @@ except Exception as e:  # noqa: BLE001 — any failure means "no usable PG"
 # machine with no Postgres `pytest` exits cleanly instead of erroring. CI always
 # provisions Postgres, so coverage there is unaffected.
 if not _provisioned:
-    collect_ignore_glob = ["test_*.py"]
+    # Pure-unit modules that neither import app nor touch the DB — keep them
+    # collectable so a no-Postgres dev machine still runs something useful.
+    _PURE_UNIT = {
+        "test_object_storage.py",
+        "test_wake_bus.py",
+        "test_semantic_analysis.py",
+        "test_proactive_runtime_v2.py",
+        "test_proactive_observability_v2.py",
+        "test_proactive_dashboard_v2.py",
+        "test_proactive_tool_executor_v2.py",
+        "test_proactive_scheduled_wake_v2.py",
+        "test_perception.py",
+        "test_ios_perception_contract_v2.py",
+        "test_perception_ingress_v2.py",
+        "test_provider_client.py",
+        "test_history_import_identity.py",
+        "test_model_api_prompts.py",
+        "test_onboarding_validation_genesis.py",
+        "test_enclave_frame_caption.py",
+        "test_enclave_visual_plaintext.py",
+        "test_screen_caption_backend.py",
+        "test_screen_caption_flag.py",
+        "test_agent_perception_route.py",
+        "test_agent_runtime_tokens.py",
+        "test_agent_runtime_spawners.py",
+        "test_agent_runtime_resident_contract.py",
+        "test_hosted_agent_runtime_cutover.py",
+    }
+    collect_ignore = sorted(
+        f
+        for f in os.listdir(os.path.dirname(os.path.abspath(__file__)))
+        if f.startswith("test_") and f.endswith(".py") and f not in _PURE_UNIT
+    )
 
 
 def pytest_report_header(config):

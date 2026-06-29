@@ -29,6 +29,7 @@ See docs/DESIGN_E2E.md §5, §7 for the full architecture.
 
 from __future__ import annotations
 
+import atexit
 import base64
 import datetime as _dt
 import hashlib
@@ -60,7 +61,9 @@ from flask import Flask, jsonify, Response, request, send_file
 from flask_compress import Compress
 from dstack_sdk import DstackClient
 
-from dstack_tls import derive_tls_cert_and_key, derive_key_only, TLS_KEY_PATH, MCP_TLS_KEY_PATH
+from dstack_tls import derive_tls_cert_and_key, TLS_KEY_PATH
+
+import provider_client
 
 
 # ---------------------------------------------------------------------------
@@ -91,23 +94,18 @@ ENCLAVE_PORT = int(os.environ.get("FEEDLING_ENCLAVE_PORT", 5003))
 # Off by default so the local dstack simulator + curl/httpx stay HTTP.
 # docker-compose.phala.yaml sets this true on real deployments.
 ENCLAVE_TLS = os.environ.get("FEEDLING_ENCLAVE_TLS", "false").lower() == "true"
-# Phase C.2 MCP pubkey pin lives in enclave_app's REPORT_DATA bundle via
-# the `mcp_tls_cert_pubkey_fingerprint_hex` field. It only makes sense
-# when the MCP server terminates its own TLS (derives the LE cert with
-# a dstack-KMS-derived key via `MCP_TLS_KEY_PATH`). Post-prod9 migration
-# the MCP service sits behind dstack-ingress on plain HTTP — the ingress
-# owns the LE cert for `mcp.feedling.app`, and the key is no longer
-# derived from that KMS path. In that mode leave the fingerprint empty;
-# iOS gracefully falls through to the "Pre-Phase-C.2 deployment" row.
-# Default true keeps the pre-migration behavior for any CVM still on
-# the MCP-in-enclave-TLS path.
-MCP_TLS_IN_ENCLAVE = os.environ.get("FEEDLING_MCP_TLS_IN_ENCLAVE", "true").lower() == "true"
 
 # Internal HTTPS (or HTTP in dev) to the non-TEE Flask backend. This is the
 # only network dependency the enclave has after boot. Requests carry the
 # caller's api_key so Flask's require_user resolves to the right user's
 # ciphertext. The enclave never sees users.json directly.
 FLASK_URL = os.environ.get("FEEDLING_FLASK_URL", "http://127.0.0.1:5001")
+
+# Screen VLM (caption route) — reads at startup; runtime re-reads os.environ
+# so a secret rotation takes effect without a restart.
+SCREEN_VLM_API_KEY = os.environ.get("FEEDLING_SCREEN_VLM_API_KEY", "")
+SCREEN_VLM_MODEL = os.environ.get("FEEDLING_SCREEN_VLM_MODEL", "qwen/qwen3-vl-8b-instruct")
+SCREEN_VLM_BASE_URL = os.environ.get("FEEDLING_SCREEN_VLM_BASE_URL", "https://openrouter.ai/api/v1")
 
 # Release metadata — normally injected via build-time env or read from a
 # sidecar file baked into the image. For Phase 1 we accept env values with
@@ -152,8 +150,35 @@ APP_AUTH = {
 
 CONTENT_KEY_PATH = "feedling-content-v1"
 SIGNING_KEY_PATH = "feedling-signing-v1"
-# TLS_KEY_PATH is imported from dstack_tls so mcp_server and enclave_app
+# TLS_KEY_PATH is imported from dstack_tls so enclave_app
 # derive from the same KMS-bound path.
+
+
+def _dev_seed_bytes(path: str) -> bytes:
+    seed = os.environ.get("FEEDLING_DEV_DSTACK_SEED", "").strip()
+    if not seed:
+        raise RuntimeError("FEEDLING_DEV_DSTACK_SEED is not set")
+    return hashlib.sha256(f"{seed}:{path}".encode("utf-8")).digest()
+
+
+def derive_keys_from_dev_seed() -> dict[str, Any]:
+    """Derive deterministic local-only keys for Docker sandboxes.
+
+    This is intentionally opt-in via FEEDLING_DEV_DSTACK_SEED. Production and
+    test deployments do not set it, so they still require dstack KMS.
+    """
+    content_sk = nacl.public.PrivateKey(_dev_seed_bytes(CONTENT_KEY_PATH))
+    content_pk = content_sk.public_key
+    signing_sk = nacl.signing.SigningKey(_dev_seed_bytes(SIGNING_KEY_PATH))
+    signing_pk = signing_sk.verify_key
+    return {
+        "content_sk": content_sk,
+        "content_pk": content_pk,
+        "content_pk_bytes": bytes(content_pk),
+        "signing_sk": signing_sk,
+        "signing_pk": signing_pk,
+        "signing_pk_bytes": bytes(signing_pk),
+    }
 
 
 def derive_keys(dstack: DstackClient) -> dict[str, Any]:
@@ -199,7 +224,7 @@ def derive_keys(dstack: DstackClient) -> dict[str, Any]:
 PHASE1_TLS_FINGERPRINT = b"\x00" * 32
 
 
-# `derive_tls_cert_and_key` is imported from `dstack_tls` so mcp_server
+# `derive_tls_cert_and_key` is imported from `dstack_tls` so enclave_app
 # (which also terminates TLS inside the enclave in Phase C) derives from
 # the same path and produces the same cert.
 
@@ -275,6 +300,27 @@ def fetch_quote_and_measurements(dstack: DstackClient, report_data: bytes) -> di
     }
 
 
+def dev_attestation(report_data: bytes) -> dict[str, Any]:
+    digest = hashlib.sha256(report_data + os.environ.get("FEEDLING_DEV_DSTACK_SEED", "").encode("utf-8")).hexdigest()
+    zero_measurement = "00" * 48
+    return {
+        "tdx_quote_hex": digest,
+        "event_log_json": "[]",
+        "measurements": {
+            "mrtd": zero_measurement,
+            "rtmr0": zero_measurement,
+            "rtmr1": zero_measurement,
+            "rtmr2": zero_measurement,
+            "rtmr3": zero_measurement,
+            "mr_aggregated": zero_measurement,
+            "mr_config_id": "",
+        },
+        "compose_hash": f"dev-memory-sandbox-{digest[:16]}",
+        "app_id": "dev-memory-sandbox",
+        "instance_id": "dev-memory-sandbox",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Cached attestation state
 # ---------------------------------------------------------------------------
@@ -285,7 +331,10 @@ _state: dict[str, Any] = {
     "content_pk_hex": None,
     "signing_pk_hex": None,
     "tls_cert_fingerprint_hex": PHASE1_TLS_FINGERPRINT.hex(),
-    "mcp_tls_cert_pubkey_fingerprint_hex": "",  # populated in bootstrap() when ENCLAVE_TLS=true
+    # Always empty since the MCP user line was removed (2026-06-12) —
+    # kept in the payload so existing iOS audit-card parsers fall through
+    # to the "Pre-Phase-C.2 deployment" disclosure row.
+    "mcp_tls_cert_pubkey_fingerprint_hex": "",
     "tls_enabled": False,
     "tls_cert_pem": None,  # bytes; only kept for the SSLContext load path
     "tls_key_pem": None,   # bytes; only kept for the SSLContext load path
@@ -302,12 +351,20 @@ def bootstrap():
     pin the TLS cert against the quote. Off → the old zero placeholder
     stays, and iOS will surface the amber "operator-terminated TLS" row.
     """
+    global _cached_content_sk
     try:
-        dstack = DstackClient()
-        keys = derive_keys(dstack)
+        dev_seed = os.environ.get("FEEDLING_DEV_DSTACK_SEED", "").strip()
+        dstack = None
+        if dev_seed:
+            keys = derive_keys_from_dev_seed()
+        else:
+            dstack = DstackClient()
+            keys = derive_keys(dstack)
 
         tls_fingerprint = PHASE1_TLS_FINGERPRINT
         if ENCLAVE_TLS:
+            if dstack is None:
+                raise RuntimeError("FEEDLING_ENCLAVE_TLS=true is not supported with FEEDLING_DEV_DSTACK_SEED")
             try:
                 tls = derive_tls_cert_and_key(dstack)
                 tls_fingerprint = tls["fingerprint"]
@@ -321,36 +378,16 @@ def bootstrap():
                 # up. Fail loudly instead.
                 raise RuntimeError(f"TLS derivation failed: {e}") from e
 
-            # Derive MCP cert key to get its pubkey fingerprint. This is
-            # the same key mcp_server.py uses for the ACME CSR, so the LE
-            # cert's public key fingerprint is stable and pre-computable.
-            # Only meaningful when MCP terminates its own TLS; post-prod9
-            # migration ingress owns the cert and this path is skipped.
-            if MCP_TLS_IN_ENCLAVE:
-                try:
-                    mcp_key = derive_key_only(dstack, MCP_TLS_KEY_PATH)
-                    mcp_pub_der = mcp_key.public_key().public_bytes(
-                        serialization.Encoding.DER,
-                        serialization.PublicFormat.SubjectPublicKeyInfo,
-                    )
-                    _state["mcp_tls_cert_pubkey_fingerprint_hex"] = (
-                        hashlib.sha256(mcp_pub_der).hexdigest()
-                    )
-                except Exception as e:
-                    print(f"[enclave] MCP cert fingerprint derivation failed: {e}", flush=True)
-            else:
-                print("[enclave] MCP_TLS_IN_ENCLAVE=false — leaving mcp_tls_cert_pubkey_fingerprint_hex empty "
-                      "(ingress terminates TLS; iOS will show Pre-Phase-C.2 disclosure row)", flush=True)
-
         report_data = build_report_data(
             content_pk_bytes=keys["content_pk_bytes"],
             tls_cert_fingerprint=tls_fingerprint,
             version_tag=b"feedling-v1",
         )
-        attestation = fetch_quote_and_measurements(dstack, report_data)
+        attestation = dev_attestation(report_data) if dstack is None else fetch_quote_and_measurements(dstack, report_data)
 
         _state["content_pk_hex"] = keys["content_pk_bytes"].hex()
         _state["signing_pk_hex"] = keys["signing_pk_bytes"].hex()
+        _cached_content_sk = keys["content_sk"]
         _state["tls_cert_fingerprint_hex"] = tls_fingerprint.hex()
         _state["attestation"] = attestation
         _state["booted_at"] = time.time()
@@ -442,14 +479,43 @@ def _extract_api_key() -> str:
     auth = request.headers.get("Authorization", "").strip()
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
+    # LEGACY / compat only — `?key=` leaks into URLs/logs; prefer the headers
+    # above. Mirrors accounts/auth.py.
     return request.args.get("key", "").strip()
 
 
+def _caller_runtime_token() -> str:
+    """The caller's runtime token (Stage D), if present. The enclave doesn't
+    verify it — it forwards it to the backend whoami, which does. Returns "" when
+    called outside a request context (so cached resolvers can call it safely)."""
+    try:
+        return request.headers.get("X-Feedling-Runtime-Token", "").strip()
+    except RuntimeError:
+        return ""
+
+
+def _forward_auth_headers(api_key: str, runtime_token: str) -> dict:
+    """Headers to forward the caller's credential to the backend: a runtime token
+    (preferred when present) or the long-term API key — same scope, nothing more."""
+    if runtime_token:
+        return {"X-Feedling-Runtime-Token": runtime_token}
+    if api_key:
+        return {"X-API-Key": api_key}
+    return {}
+
+
 def _flask_get(path: str, api_key: str, params: dict | None = None) -> dict:
-    """Fetch JSON from the backend Flask as the authenticated user. The
-    enclave forwards the caller's key rather than using a privileged one —
-    same scope the user granted, nothing more."""
-    headers = {"X-API-Key": api_key} if api_key else {}
+    """Fetch JSON from the backend Flask as the authenticated caller. The enclave
+    forwards the caller's credential rather than a privileged one — same scope the
+    user granted, nothing more. Stage D: when the request carries a runtime token
+    (api_key absent), forwards the token so decrypt-and-serve routes work without
+    the long-term key."""
+    return _flask_get_headers(path, _forward_auth_headers(api_key, _caller_runtime_token()), params)
+
+
+def _flask_get_headers(path: str, headers: dict, params: dict | None = None) -> dict:
+    """Like ``_flask_get`` but forwarding caller-supplied auth headers verbatim
+    (api_key OR runtime token) — see ``_forward_auth_headers``."""
     with httpx.Client(timeout=15) as client:
         r = client.get(f"{FLASK_URL}{path}", params=params, headers=headers)
         r.raise_for_status()
@@ -478,15 +544,31 @@ _whoami_cache_lock = threading.Lock()
 _whoami_inflight: dict[str, threading.Lock] = {}
 
 
-def _whoami_cached(api_key: str) -> dict:
-    """whoami via the backend, memoised per sha256(api_key) for a short TTL.
+def _prune_whoami_cache(now: float | None = None) -> None:
+    """Drop cache entries past the TTL. Called on every write so rotating runtime
+    tokens (each a new cache key) can't grow the dict unboundedly. Caller holds
+    ``_whoami_cache_lock``."""
+    clock = time.monotonic() if now is None else now
+    for h in [h for h, (ts, _) in _whoami_cache.items() if clock - ts >= _WHOAMI_CACHE_TTL]:
+        _whoami_cache.pop(h, None)
 
-    Misses call `_flask_get` and propagate its httpx errors uncached, so every
-    caller keeps its existing 401-on-HTTPStatusError / 502-on-HTTPError mapping.
-    Concurrent misses for the same key are serialised via singleflight: the
-    first does the round-trip, the rest wait and reuse its cached result.
+
+def _whoami_cached(api_key: str) -> dict:
+    """whoami via the backend, memoised per sha256(credential) for a short TTL.
+
+    Misses call `_flask_get`/`_flask_get_headers` and propagate their httpx errors
+    uncached, so every caller keeps its existing 401-on-HTTPStatusError /
+    502-on-HTTPError mapping. Concurrent misses for the same key are serialised
+    via singleflight: the first does the round-trip, the rest wait and reuse its
+    cached result.
+
+    Stage D: when the caller presents a runtime token (read from the request
+    here, so the 7 decrypt-and-serve routes need no change), resolve + cache by
+    the token instead of the api_key — the api-key path is unchanged.
     """
-    h = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+    runtime_token = _caller_runtime_token()
+    cred = ("rt:" + runtime_token) if runtime_token else ("ak:" + api_key)
+    h = hashlib.sha256(cred.encode("utf-8")).hexdigest()
     with _whoami_cache_lock:
         hit = _whoami_cache.get(h)
         if hit is not None and time.monotonic() - hit[0] < _WHOAMI_CACHE_TTL:
@@ -504,10 +586,15 @@ def _whoami_cached(api_key: str) -> dict:
             if hit is not None and time.monotonic() - hit[0] < _WHOAMI_CACHE_TTL:
                 return hit[1]
         try:
-            whoami = _flask_get("/v1/users/whoami", api_key)
+            if runtime_token:
+                whoami = _flask_get_headers("/v1/users/whoami", {"X-Feedling-Runtime-Token": runtime_token})
+            else:
+                whoami = _flask_get("/v1/users/whoami", api_key)
             if isinstance(whoami, dict) and whoami.get("user_id"):
                 with _whoami_cache_lock:
-                    _whoami_cache[h] = (time.monotonic(), whoami)
+                    now = time.monotonic()
+                    _whoami_cache[h] = (now, whoami)
+                    _prune_whoami_cache(now)  # evict expired so token rotation can't leak
             return whoami
         finally:
             # Retire this in-flight lock so the registry stays bounded and a
@@ -658,7 +745,8 @@ def v1_envelope_decrypt():
         return jsonify({"error": "not_ready", "detail": _state["error"]}), 503
 
     api_key = _extract_api_key()
-    if not api_key:
+    runtime_token = _caller_runtime_token()
+    if not api_key and not runtime_token:
         return jsonify({"error": "missing_api_key"}), 401
 
     try:
@@ -668,7 +756,14 @@ def v1_envelope_decrypt():
         # revoked / a reset account for up to the TTL, so we resolve the caller
         # live every time. The decrypt-and-serve routes below only read the
         # user's own stored data, so they can tolerate the cached resolver.
-        whoami = _flask_get("/v1/users/whoami", api_key)
+        # The caller may present a runtime token instead of the api_key (Stage
+        # D); the backend whoami resolves either — the enclave just forwards it.
+        # The api-key path stays on _flask_get (unchanged); only a token request
+        # takes the header-forwarding path.
+        if runtime_token:
+            whoami = _flask_get_headers("/v1/users/whoami", _forward_auth_headers(api_key, runtime_token))
+        else:
+            whoami = _flask_get("/v1/users/whoami", api_key)
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:
             return jsonify({"error": "unauthorized"}), 401
@@ -728,6 +823,7 @@ from context_memory_selection import (  # noqa: E402
     select_context_memories,
     select_context_memories_with_trace,
 )
+from memory_index_selector import select_memory_index_items  # noqa: E402
 
 
 def _load_decrypted_moments(
@@ -770,6 +866,429 @@ def _load_decrypted_moments(
     return out
 
 
+def _env_flag_enabled(name: str, default: str = "false") -> bool:
+    return str(os.environ.get(name, default) or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _memory_readside_for_model_api_enabled() -> bool:
+    return _env_flag_enabled("MEMORY_READSIDE_FOR_MODEL_API")
+
+
+def _memory_readside_model_api_limit() -> int:
+    raw = os.environ.get("MEMORY_READSIDE_MODEL_API_LIMIT", "50")
+    try:
+        value = int(str(raw or "50").strip())
+    except (TypeError, ValueError):
+        value = 50
+    return max(1, min(value, 200))
+
+
+def _memory_readside_hard_max() -> int:
+    raw = os.environ.get("FEEDLING_MEMORY_READSIDE_HARD_MAX", "1000")
+    try:
+        value = int(str(raw or "1000").strip())
+    except (TypeError, ValueError):
+        value = 1000
+    return max(1, value)
+
+
+def _memory_readside_effective_limit(raw_limit=None) -> int:
+    """Mirror backend readside limit semantics inside the enclave.
+
+    FEEDLING_MEMORY_READSIDE_LIMIT controls index/fetch candidate windows:
+    - unset: 50
+    - positive integer: that many candidates, capped by HARD_MAX
+    - 0: "full window", still capped by FEEDLING_MEMORY_READSIDE_HARD_MAX
+
+    This is separate from MEMORY_READSIDE_MODEL_API_LIMIT, which belongs to the
+    older route-B auto-recall path. Keep both knobs distinct.
+    """
+    if raw_limit is None or str(raw_limit).strip() == "":
+        raw_limit = os.environ.get("FEEDLING_MEMORY_READSIDE_LIMIT", "50")
+    try:
+        requested = int(str(raw_limit).strip())
+    except (TypeError, ValueError):
+        requested = 50
+    if requested < 0:
+        requested = 50
+    hard_max = _memory_readside_hard_max()
+    if requested == 0:
+        return hard_max
+    return max(1, min(requested, hard_max))
+
+
+def _context_moment_to_index_item(moment: dict) -> dict:
+    """Convert the existing plaintext context card into a readside index item.
+
+    Route B still decrypts in-enclave, but selection now goes through the same
+    index selector used by readside/MCP. This avoids the backend top-50 prefilter
+    while unifying the matching pipe.
+    """
+
+    title = _memory_readside_text(moment.get("title"), 500)
+    description = _memory_readside_text(moment.get("description"), 500)
+    linked = _memory_readside_text(moment.get("linked_dimension"), 160)
+    context = _memory_readside_text(moment.get("context"), 240)
+    summary = description or title or context
+    bucket_refs = [item for item in (linked, _memory_readside_text(moment.get("type"), 40)) if item]
+    return {
+        "id": _memory_readside_text(moment.get("id"), 120),
+        "summary": summary,
+        "bucket_refs": bucket_refs,
+        "status": "active",
+        "salience": "medium",
+        "is_open_thread": False,
+        "is_sensitive": False,
+        "score": 0,
+        "occurred_at": _memory_readside_text(moment.get("occurred_at"), 80),
+        "created_at": _memory_readside_text(moment.get("created_at"), 80),
+    }
+
+
+def _select_context_memories_via_readside(
+    moments: list[dict],
+    latest_user_text: str,
+    *,
+    cap: int = 8,
+) -> tuple[list[dict], dict]:
+    """Route B readside pipe: plaintext cards -> safe index -> ids -> cards."""
+
+    if not moments:
+        return [], {
+            "mode": "model_api_readside_v1",
+            "readside_enabled": True,
+            "selected": [],
+            "rejected_sample": [],
+            "index_count": 0,
+        }
+    by_id = {str(moment.get("id") or ""): moment for moment in moments if str(moment.get("id") or "")}
+    index_items = [
+        item for item in (_context_moment_to_index_item(moment) for moment in moments)
+        if item.get("id") and item.get("summary")
+    ]
+    selection = select_memory_index_items(
+        latest_user_text,
+        index_items,
+        cap=cap,
+        include_sensitive=False,
+    )
+    selected_ids = [memory_id for memory_id in selection.get("selected_ids", []) if memory_id in by_id]
+    context_memories = [dict(by_id[memory_id]) for memory_id in selected_ids[:cap]]
+    selector_trace = selection.get("trace") if isinstance(selection.get("trace"), dict) else {}
+    selected_trace = selector_trace.get("selected") if isinstance(selector_trace.get("selected"), list) else []
+    skipped = selector_trace.get("skipped_sample") if isinstance(selector_trace.get("skipped_sample"), list) else []
+    trace = {
+        "mode": "model_api_readside_v1",
+        "readside_enabled": True,
+        "index_count": len(index_items),
+        "selected": [
+            {
+                "id": item.get("id", ""),
+                "title": _memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("title"), 160),
+                "type": _memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("type"), 40),
+                "score": float(item.get("score") or 0.0),
+                "confidence": _memory_readside_text(item.get("confidence"), 40),
+                "matched_units": list(item.get("matched_units") or [])[:8],
+                "matched_phrases": list(item.get("matched_phrases") or [])[:6],
+                "reason": _memory_readside_text(item.get("reason"), 120),
+                "bucket": "readside",
+                "selected": True,
+            }
+            for item in selected_trace[:cap]
+        ],
+        "rejected_sample": [
+            {
+                "id": item.get("id", ""),
+                "title": _memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("title"), 160),
+                "type": _memory_readside_text(by_id.get(str(item.get("id") or ""), {}).get("type"), 40),
+                "score": float(item.get("score") or 0.0),
+                "confidence": _memory_readside_text(item.get("confidence"), 40),
+                "matched_units": list(item.get("matched_units") or [])[:8],
+                "matched_phrases": list(item.get("matched_phrases") or [])[:6],
+                "reason": _memory_readside_text(item.get("reason"), 120),
+                "bucket": "rejected",
+                "selected": False,
+            }
+            for item in skipped[:8]
+        ],
+        "selector_trace": selector_trace,
+    }
+    for key in ("query_units", "query_strong_phrases", "query_rare_terms", "query_weak_terms"):
+        value = selector_trace.get(key)
+        if isinstance(value, list):
+            trace[key] = value
+    return context_memories, trace
+
+
+def _memory_readside_text(value, max_chars: int = 2000) -> str:
+    return str(value or "").strip()[:max_chars]
+
+
+def _memory_readside_list(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip()[:160] for item in value if str(item or "").strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()[:160]]
+    return []
+
+
+def _memory_readside_summary(inner: dict) -> str:
+    for key in ("summary", "description", "title"):
+        text = _memory_readside_text(inner.get(key), 500)
+        if text:
+            return text
+    return ""
+
+
+def _memory_default_bucket(value) -> str:
+    mem_type = str(value or "").strip().lower()
+    if mem_type in {"moment", "quote"}:
+        return "我们的关系"
+    if mem_type in {"fact", "event"}:
+        return "未分类"
+    return "未分类"
+
+
+def _memory_inner_to_v1(inner: dict, envelope: dict | None = None) -> dict:
+    """Adapt decrypted legacy memory body into the v1 inner shape."""
+    envelope = envelope or {}
+    if not isinstance(inner, dict):
+        return {"summary": "", "content": "", "bucket": "未分类", "threads": []}
+    if all(key in inner for key in ("summary", "content", "bucket", "threads")):
+        return {
+            "summary": _memory_readside_text(inner.get("summary"), 500),
+            "content": _memory_readside_text(inner.get("content"), 5000),
+            "bucket": _memory_readside_text(inner.get("bucket"), 80) or "未分类",
+            "threads": _memory_readside_list(inner.get("threads"))[:8],
+            **{
+                key: inner[key]
+                for key in ("is_sensitive", "sensitivity_class", "sensitive_scope")
+                if key in inner
+            },
+        }
+
+    summary = _memory_readside_summary(inner)
+    description = _memory_readside_text(inner.get("description") or inner.get("title") or summary, 2000)
+    quote = _memory_readside_text(inner.get("her_quote") or inner.get("verbatim") or inner.get("context"), 1000)
+    follow_up = _memory_readside_text(inner.get("follow_up"), 1000)
+    content = "\n".join([
+        f"记忆: {description or summary}",
+        f"上下文: {quote or '用户在对话中明确提到。'}",
+        f"使用提示: {follow_up or '自然使用这条记忆，不要机械复述。'}",
+    ])
+    threads = _memory_readside_list(inner.get("threads"))
+    if not threads:
+        threads = _memory_readside_list(inner.get("linked_dimension"))
+    if not threads:
+        threads = _memory_readside_list(inner.get("anchor_memory_ids"))
+    adapted = {
+        "summary": summary,
+        "content": content,
+        "bucket": _memory_readside_text(inner.get("bucket"), 80)
+        or _memory_default_bucket(inner.get("type") or envelope.get("type")),
+        "threads": threads[:8],
+    }
+    for key in ("is_sensitive", "sensitivity_class", "sensitive_scope"):
+        if key in inner:
+            adapted[key] = inner[key]
+    return adapted
+
+
+def _memory_readside_bucket_refs(inner: dict) -> list[str]:
+    refs = _memory_readside_list(inner.get("bucket_refs"))
+    if refs:
+        return refs
+    refs = _memory_readside_list(inner.get("bucket_ids"))
+    if refs:
+        return refs
+    linked = _memory_readside_text(inner.get("linked_dimension"), 160)
+    return [linked] if linked else []
+
+
+def _memory_readside_salience(envelope: dict, inner: dict) -> str:
+    salience = str(envelope.get("salience") or inner.get("salience") or "medium").strip().lower()
+    return salience if salience in {"critical", "high", "medium", "low"} else "medium"
+
+
+def _memory_readside_status(envelope: dict, inner: dict) -> str:
+    return str(envelope.get("status") or inner.get("status") or "active").strip().lower() or "active"
+
+
+def _memory_readside_is_sensitive(envelope: dict, inner: dict) -> bool:
+    for key in ("is_sensitive", "sensitivity_class", "sensitive_scope"):
+        value = inner.get(key)
+        if value:
+            return True if key != "is_sensitive" else bool(value)
+    for key in ("is_sensitive", "sensitivity_class"):
+        value = envelope.get(key)
+        if value:
+            return True if key != "is_sensitive" else bool(value)
+    return False
+
+
+def _build_memory_index_item(envelope: dict, inner: dict) -> dict:
+    adapted = _memory_inner_to_v1(inner, envelope)
+    return {
+        "id": envelope.get("id", ""),
+        "summary": adapted.get("summary", ""),
+        "bucket": adapted.get("bucket", ""),
+        "threads": list(adapted.get("threads") or [])[:8],
+        "importance": float(envelope.get("importance") or 0.5),
+        "pulse": float(envelope.get("pulse") or 0.3),
+        "status": _memory_readside_status(envelope, inner),
+        "occurred_at": _memory_readside_text(envelope.get("occurred_at"), 80),
+        "last_referenced_at": _memory_readside_text(envelope.get("last_referenced_at"), 80),
+        "is_sensitive": _memory_readside_is_sensitive(envelope, adapted),
+        "score": float(envelope.get("score") or 0),
+    }
+
+
+def _build_memory_fetch_item(envelope: dict, inner: dict) -> dict:
+    adapted = _memory_inner_to_v1(inner, envelope)
+    return {
+        "id": envelope.get("id", ""),
+        "summary": adapted.get("summary", ""),
+        "content": adapted.get("content", ""),
+        "bucket": adapted.get("bucket", ""),
+        "threads": list(adapted.get("threads") or [])[:8],
+        "importance": float(envelope.get("importance") or 0.5),
+        "pulse": float(envelope.get("pulse") or 0.3),
+        "status": _memory_readside_status(envelope, inner),
+        "source": _memory_readside_text(envelope.get("source"), 160),
+        "occurred_at": _memory_readside_text(envelope.get("occurred_at"), 80),
+        "last_referenced_at": _memory_readside_text(envelope.get("last_referenced_at"), 80),
+        "is_sensitive": _memory_readside_is_sensitive(envelope, adapted),
+    }
+
+
+def _memory_index_filter_items(items: list[dict], payload: dict) -> list[dict]:
+    bucket = _memory_readside_text(payload.get("bucket"), 120)
+    thread = _memory_readside_text(payload.get("thread"), 120)
+    filtered = []
+    for item in items:
+        if bucket and item.get("bucket") != bucket:
+            continue
+        if thread and thread not in (item.get("threads") or []):
+            continue
+        filtered.append(item)
+    return filtered
+
+
+def _memory_readside_auth_context() -> tuple[str | None, str | None, object | None, tuple[dict, int] | None]:
+    if not _state["ready"]:
+        return None, None, None, ({"error": "not_ready", "detail": _state["error"]}, 503)
+    api_key = _extract_api_key()
+    if not api_key and not _caller_runtime_token():
+        return None, None, None, ({"error": "missing api_key"}, 401)
+    try:
+        whoami = _whoami_cached(api_key)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            return None, None, None, ({"error": "unauthorized"}, 401)
+        return None, None, None, ({"error": f"backend_error: {e}"}, 502)
+    except httpx.HTTPError as e:
+        return None, None, None, ({"error": f"backend_unreachable: {e}"}, 502)
+    authorized_user_id = whoami.get("user_id", "")
+    if not authorized_user_id:
+        return None, None, None, ({"error": "cannot resolve user_id"}, 401)
+    try:
+        content_sk = _get_or_derive_content_sk()
+    except Exception as e:
+        return None, None, None, ({"error": f"key_derivation_unavailable: {e}"}, 503)
+    return api_key, authorized_user_id, content_sk, None
+
+
+def _memory_readside_decrypt_items(
+    moments: list,
+    authorized_user_id: str,
+    content_sk,
+    *,
+    item_builder,
+) -> tuple[list[dict], list[str]]:
+    items: list[dict] = []
+    unavailable_ids: list[str] = []
+    for moment in moments:
+        if not isinstance(moment, dict):
+            continue
+        memory_id = str(moment.get("id") or "")
+        if moment.get("visibility") == "local_only" or not moment.get("K_enclave"):
+            if memory_id:
+                unavailable_ids.append(memory_id)
+            continue
+        try:
+            plaintext = _decrypt_envelope(moment, authorized_user_id, content_sk)
+            inner = json.loads(plaintext.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("memory plaintext is not an object")
+        except (DecryptFailure, json.JSONDecodeError, ValueError):
+            if memory_id:
+                unavailable_ids.append(memory_id)
+            continue
+        items.append(item_builder(moment, inner))
+    return items, unavailable_ids
+
+
+@app.route("/v1/memory/index", methods=["POST"])
+def v1_memory_index():
+    _api_key, authorized_user_id, content_sk, error = _memory_readside_auth_context()
+    if error is not None:
+        body, status = error
+        return jsonify(body), status
+    payload = request.get_json(silent=True) or {}
+    moments = payload.get("moments")
+    if not isinstance(moments, list):
+        return jsonify({"error": "moments must be a list"}), 400
+    effective_limit = _memory_readside_effective_limit(payload.get("limit"))
+    items, unavailable_ids = _memory_readside_decrypt_items(
+        moments[:effective_limit],
+        authorized_user_id or "",
+        content_sk,
+        item_builder=_build_memory_index_item,
+    )
+    items = _memory_index_filter_items(items, payload)
+    if not bool(payload.get("include_sensitive", False)):
+        items = [item for item in items if not item.get("is_sensitive")]
+    return jsonify({
+        "user_id": authorized_user_id,
+        "items": items,
+        "unavailable_ids": unavailable_ids,
+    })
+
+
+@app.route("/v1/memory/fetch", methods=["POST"])
+def v1_memory_fetch():
+    _api_key, authorized_user_id, content_sk, error = _memory_readside_auth_context()
+    if error is not None:
+        body, status = error
+        return jsonify(body), status
+    payload = request.get_json(silent=True) or {}
+    moments = payload.get("moments")
+    if not isinstance(moments, list):
+        return jsonify({"error": "moments must be a list"}), 400
+    effective_limit = _memory_readside_effective_limit(payload.get("limit"))
+    items, unavailable_ids = _memory_readside_decrypt_items(
+        moments[:effective_limit],
+        authorized_user_id or "",
+        content_sk,
+        item_builder=_build_memory_fetch_item,
+    )
+    blocked_sensitive_ids: list[str] = []
+    if not bool(payload.get("include_sensitive", False)):
+        allowed = []
+        for item in items:
+            if item.get("is_sensitive"):
+                blocked_sensitive_ids.append(str(item.get("id") or ""))
+            else:
+                allowed.append(item)
+        items = allowed
+    return jsonify({
+        "user_id": authorized_user_id,
+        "items": items,
+        "unavailable_ids": unavailable_ids,
+        "blocked_sensitive_ids": [mid for mid in blocked_sensitive_ids if mid],
+    })
+
+
 @app.route("/v1/chat/history", methods=["GET"])
 def v1_chat_history():
     """Decrypt-and-serve chat history for the authenticated user.
@@ -786,7 +1305,9 @@ def v1_chat_history():
         return jsonify({"error": "not_ready", "detail": _state["error"]}), 503
 
     api_key = _extract_api_key()
-    if not api_key:
+    if not api_key and not _caller_runtime_token():
+        # Stage D: decrypt-and-serve routes accept a runtime token too; identity
+        # is then resolved from it by the token-aware _whoami_cached below.
         return jsonify({"error": "missing api_key"}), 401
 
     # Resolve whose content we're decrypting — returns the caller's usr_...
@@ -870,11 +1391,31 @@ def v1_chat_history():
                 "decrypt_status": "ok",
             }
             if ctype == "image":
-                # Image plaintext is raw JPEG bytes — surface as base64 so
-                # JSON callers (vision-capable agents, iOS clients with
-                # local copies) can decode and render. `content` left empty.
+                # Image plaintext is raw image bytes (JPEG/PNG/WebP) — surface
+                # as base64 so JSON callers (vision-capable agents, iOS clients
+                # with local copies) can decode and render.
+                # If a caption envelope is present (user sent text alongside the
+                # image), decrypt it and fill content so the agent sees the
+                # user's actual question rather than an empty string.
                 entry["content"] = ""
+                cap_ct = m.get("caption_body_ct")
+                if cap_ct:
+                    cap_env = {
+                        "id": m.get("caption_id") or m.get("id"),
+                        "v": int(m.get("caption_v", v) or v),
+                        "body_ct": cap_ct,
+                        "nonce": m.get("caption_nonce"),
+                        "K_enclave": m.get("caption_K_enclave"),
+                        "owner_user_id": m.get("caption_owner_user_id") or m.get("owner_user_id"),
+                    }
+                    try:
+                        entry["content"] = _decrypt_envelope(
+                            cap_env, authorized_user_id, content_sk
+                        ).decode("utf-8", errors="replace")
+                    except Exception as e:
+                        errors.append({"id": m.get("id"), "reason": f"caption_decrypt: {e}"})
                 entry["image_b64"] = base64.b64encode(plaintext).decode("ascii")
+                entry["image_mime"] = m.get("image_mime") or "image/jpeg"
             else:
                 entry["content"] = plaintext.decode("utf-8", errors="replace")
             decrypted.append(entry)
@@ -903,7 +1444,6 @@ def v1_chat_history():
             if m.get("role") == "user" and m.get("content"):
                 latest_user_text = m["content"]
                 break
-        moments = _load_decrypted_moments(api_key, authorized_user_id, content_sk)
         context_mode = str(
             request.args.get("context_mode")
             or request.args.get("contextMode")
@@ -912,7 +1452,18 @@ def v1_chat_history():
         if not context_mode and str(request.args.get("context_strict") or "").lower() in {"1", "true", "yes", "on"}:
             context_mode = "strict"
         want_trace = str(request.args.get("context_trace") or "").lower() in {"1", "true", "yes", "on"}
-        if want_trace:
+        use_readside = context_mode == "model_api" and _memory_readside_for_model_api_enabled()
+        memory_limit = _memory_readside_model_api_limit() if use_readside else 200
+        moments = _load_decrypted_moments(api_key, authorized_user_id, content_sk, limit=memory_limit)
+        if use_readside:
+            context_memories, context_memory_trace = _select_context_memories_via_readside(
+                moments,
+                latest_user_text,
+                cap=8,
+            )
+            if not want_trace:
+                context_memory_trace = None
+        elif want_trace:
             context_memories, context_memory_trace = select_context_memories_with_trace(
                 moments,
                 latest_user_text,
@@ -946,7 +1497,9 @@ def v1_memory_list():
     if not _state["ready"]:
         return jsonify({"error": "not_ready", "detail": _state["error"]}), 503
     api_key = _extract_api_key()
-    if not api_key:
+    if not api_key and not _caller_runtime_token():
+        # Stage D: decrypt-and-serve routes accept a runtime token too; identity
+        # is then resolved from it by the token-aware _whoami_cached below.
         return jsonify({"error": "missing api_key"}), 401
 
     try:
@@ -1042,7 +1595,9 @@ def v1_identity_get():
     if not _state["ready"]:
         return jsonify({"error": "not_ready", "detail": _state["error"]}), 503
     api_key = _extract_api_key()
-    if not api_key:
+    if not api_key and not _caller_runtime_token():
+        # Stage D: decrypt-and-serve routes accept a runtime token too; identity
+        # is then resolved from it by the token-aware _whoami_cached below.
         return jsonify({"error": "missing api_key"}), 401
 
     try:
@@ -1132,6 +1687,56 @@ def v1_identity_get():
                         "decrypt_errors": [{"reason": reason}]})
 
 
+def _raw_image_mime(data: bytes) -> str | None:
+    """Return the MIME type when plaintext is a recognized raw image."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}:
+            return "image/heic"
+        if brand in {b"avif", b"avis"}:
+            return "image/avif"
+    return None
+
+
+_IMAGE_EXTENSION_BY_MIME = {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/webp": "webp",
+    "image/heic": "heic",
+    "image/avif": "avif",
+}
+
+
+def _parse_visual_plaintext(plaintext: bytes) -> dict[str, Any]:
+    """Decode a screen-frame JSON wrapper or a raw encrypted photo.
+
+    Screen capture envelopes contain a UTF-8 JSON object whose ``image`` field
+    is base64 JPEG. Perception photo envelopes reuse the same ciphertext
+    channel but encrypt the image bytes directly. Only recognized image file
+    signatures take the raw-photo fallback so malformed frame JSON still fails
+    closed instead of being forwarded to a vision provider as arbitrary bytes.
+    """
+    try:
+        inner = json.loads(plaintext.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        image_mime = _raw_image_mime(plaintext)
+        if image_mime is None:
+            raise
+        return {
+            "image": base64.b64encode(plaintext).decode("ascii"),
+            "image_mime": image_mime,
+        }
+    if not isinstance(inner, dict):
+        raise ValueError("visual plaintext is not an object")
+    return inner
+
+
 @app.route("/v1/screen/frames/<frame_id>/decrypt", methods=["GET"])
 def v1_frame_decrypt(frame_id):
     """Decrypt a single v1 screen-frame envelope and return its plaintext.
@@ -1153,7 +1758,9 @@ def v1_frame_decrypt(frame_id):
         return jsonify({"error": "bad frame id"}), 400
 
     api_key = _extract_api_key()
-    if not api_key:
+    if not api_key and not _caller_runtime_token():
+        # Stage D: decrypt-and-serve routes accept a runtime token too; identity
+        # is then resolved from it by the token-aware _whoami_cached below.
         return jsonify({"error": "missing api_key"}), 401
 
     try:
@@ -1197,8 +1804,8 @@ def v1_frame_decrypt(frame_id):
         return jsonify({"error": f"decrypt_failed: {e.reason}"}), 502
 
     try:
-        inner = json.loads(plaintext.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        inner = _parse_visual_plaintext(plaintext)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
         return jsonify({"error": f"plaintext_parse: {e}"}), 502
 
     result = {
@@ -1217,11 +1824,123 @@ def v1_frame_decrypt(frame_id):
     }
     if include_image:
         result["image_b64"] = inner.get("image", "")
-        result["image_mime"] = "image/jpeg"
+        result["image_mime"] = inner.get("image_mime") or "image/jpeg"
     else:
         result["image_b64"] = None
         result["image_bytes_omitted"] = True
     return jsonify(result)
+
+
+@app.route("/v1/screen/frames/<frame_id>/caption", methods=["GET"])
+def v1_frame_caption(frame_id):
+    """Decrypt a frame IN-ENCLAVE and return a VLM caption — never pixels.
+
+    This is the screen.read tool path. Unlike /decrypt, the plaintext image
+    never leaves the enclave to the backend caller: only the derived caption
+    text crosses back. The image is sent to the VLM (OpenRouter Qwen) from
+    inside the enclave, which is the only place plaintext legitimately lives.
+
+    Query params:
+      mode (str, default "caption"): "caption" returns a 1-2 sentence
+        description; "full" additionally echoes back the on-device OCR text.
+    """
+    if not _state["ready"]:
+        return jsonify({"error": "not_ready", "detail": _state["error"]}), 503
+    if not re.match(r"^[a-f0-9]{16,64}$", frame_id or ""):
+        return jsonify({"error": "bad frame id"}), 400
+    # Read live so tests / rotated secrets take effect without a restart.
+    # VLM key: deliberately NO fallback to the SCREEN_VLM_API_KEY module constant
+    # (fail-closed: an unset key must read as empty so the route returns
+    # screen_caption_unconfigured). model/base_url may fall back to their defaults.
+    vlm_key = os.environ.get("FEEDLING_SCREEN_VLM_API_KEY", "")
+    if not vlm_key:
+        return jsonify({"error": "screen_caption_unconfigured"}), 503
+
+    api_key = _extract_api_key()
+    if not api_key and not _caller_runtime_token():
+        # Stage D: decrypt-and-serve routes accept a runtime token too; identity
+        # is then resolved from it by the token-aware _whoami_cached below.
+        return jsonify({"error": "missing api_key"}), 401
+    try:
+        whoami = _whoami_cached(api_key)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            return jsonify({"error": "unauthorized"}), 401
+        return jsonify({"error": f"backend_error: {e}"}), 502
+    except httpx.HTTPError as e:
+        return jsonify({"error": f"backend_unreachable: {e}"}), 502
+    authorized_user_id = whoami.get("user_id", "")
+    if not authorized_user_id:
+        return jsonify({"error": "cannot resolve user_id"}), 401
+
+    try:
+        env = _flask_get(f"/v1/screen/frames/{frame_id}/envelope", api_key)
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            return jsonify({"error": "unauthorized"}), 401
+        if e.response.status_code == 404:
+            return jsonify({"error": "frame not found"}), 404
+        return jsonify({"error": f"backend_error: {e}"}), 502
+    try:
+        content_sk = _get_or_derive_content_sk()
+    except Exception as e:
+        return jsonify({"error": f"key_derivation_unavailable: {e}"}), 503
+    try:
+        plaintext = _decrypt_envelope(env, authorized_user_id, content_sk)
+        inner = _parse_visual_plaintext(plaintext)
+    except DecryptFailure as e:
+        return jsonify({"error": f"decrypt_failed: {e.reason}"}), 502
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
+        return jsonify({"error": f"plaintext_parse: {e}"}), 502
+
+    image_b64 = inner.get("image", "")
+    image_mime = inner.get("image_mime") or "image/jpeg"
+    ocr_text = str(inner.get("ocr_text") or "")
+    mode = (request.args.get("mode") or "caption").lower()
+    full = mode == "full"
+
+    instruction = (
+        "Describe what is on this phone screen in one or two sentences: what app "
+        "or content it is, and what the user appears to be doing. Be concrete and "
+        "neutral."
+        + (" Then list the key visible text verbatim." if full else "")
+    )
+    user_content = [
+        {"type": "text", "text": instruction},
+        {"type": "image_url",
+         "image_url": {"url": f"data:{image_mime};base64,{image_b64}"}},
+    ]
+    if ocr_text:
+        user_content.append(
+            {"type": "text", "text": f"On-device OCR text:\n{ocr_text[:2000]}"}
+        )
+
+    try:
+        model = os.environ.get("FEEDLING_SCREEN_VLM_MODEL", SCREEN_VLM_MODEL)
+        base_url = os.environ.get("FEEDLING_SCREEN_VLM_BASE_URL", SCREEN_VLM_BASE_URL)
+        result = provider_client.chat_completion(
+            provider_client.ProviderConfig(
+                provider="openrouter", model=model, api_key=vlm_key, base_url=base_url,
+            ),
+            [{"role": "user", "content": user_content}],
+            max_tokens=400 if full else 160,
+            temperature=0.2,
+            timeout=45.0,
+        )
+    except provider_client.ProviderError as e:
+        return jsonify({"error": f"screen_caption_failed: {e}"}), 502
+    except httpx.HTTPError as e:
+        return jsonify({"error": f"screen_caption_failed: {e}"}), 502
+
+    out = {
+        "frame_id": frame_id,
+        "caption": str(result.get("reply") or "").strip(),
+        "model": model,
+        "decrypt_status": "ok",
+    }
+    if full:
+        out["ocr_text"] = ocr_text[:4000]
+    return jsonify(out)
 
 
 @app.route("/v1/screen/frames/<frame_id>/image", methods=["GET"])
@@ -1253,7 +1972,9 @@ def v1_frame_image(frame_id):
         return jsonify({"error": "bad frame id"}), 400
 
     api_key = _extract_api_key()
-    if not api_key:
+    if not api_key and not _caller_runtime_token():
+        # Stage D: decrypt-and-serve routes accept a runtime token too; identity
+        # is then resolved from it by the token-aware _whoami_cached below.
         return jsonify({"error": "missing api_key"}), 401
 
     try:
@@ -1295,15 +2016,16 @@ def v1_frame_image(frame_id):
         return jsonify({"error": f"decrypt_failed: {e.reason}"}), 502
 
     try:
-        inner = json.loads(plaintext.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        inner = _parse_visual_plaintext(plaintext)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as e:
         return jsonify({"error": f"plaintext_parse: {e}"}), 502
 
     image_b64 = inner.get("image", "")
+    image_mime = inner.get("image_mime") or "image/jpeg"
     if not image_b64:
         return jsonify({"error": "no image in plaintext"}), 404
     try:
-        jpeg_bytes = base64.b64decode(image_b64)
+        image_bytes = base64.b64decode(image_b64)
     except Exception as e:
         return jsonify({"error": f"image_b64_decode: {e}"}), 502
 
@@ -1311,22 +2033,21 @@ def v1_frame_image(frame_id):
     # out of the box — clients can split the JPEG into parallel chunks
     # to bypass the per-TCP-connection throttle on dstack-gateway.
     return send_file(
-        BytesIO(jpeg_bytes),
-        mimetype="image/jpeg",
+        BytesIO(image_bytes),
+        mimetype=image_mime,
         as_attachment=False,
-        download_name=f"{frame_id}.jpg",
+        download_name=f"{frame_id}.{_IMAGE_EXTENSION_BY_MIME.get(image_mime, 'image')}",
         conditional=True,
         max_age=0,
     )
 
 
 def _get_or_derive_content_sk() -> nacl.public.PrivateKey:
-    """Return the enclave's content X25519 private key, deriving if needed.
+    """Return the process-lifetime content X25519 private key.
 
-    bootstrap() stashes only the pubkey hex in _state — we derive on first
-    use and cache in a module-level slot. This keeps the key's exposure
-    surface minimal (one process-lifetime reference), not that there's
-    anywhere for it to leak from inside the enclave anyway.
+    bootstrap() derives this once and stores it in memory. The fallback derive
+    path is kept for defensive compatibility, but normal request handling
+    should not make a fresh dstack KMS round-trip.
     """
     global _cached_content_sk
     if _cached_content_sk is not None:
@@ -1337,8 +2058,8 @@ def _get_or_derive_content_sk() -> nacl.public.PrivateKey:
     with _content_sk_lock:
         if _cached_content_sk is not None:
             return _cached_content_sk
-        dstack = DstackClient()
-        keys = derive_keys(dstack)
+        dev_seed = os.environ.get("FEEDLING_DEV_DSTACK_SEED", "").strip()
+        keys = derive_keys_from_dev_seed() if dev_seed else derive_keys(DstackClient())
         _cached_content_sk = keys["content_sk"]
     return _cached_content_sk
 
@@ -1352,13 +2073,28 @@ _content_sk_lock = threading.Lock()
 # ---------------------------------------------------------------------------
 
 
-def _build_ssl_context() -> ssl.SSLContext | None:
-    """Build an SSLContext from the in-memory cert/key material.
+# Number of worker threads in the single gunicorn worker. The enclave's
+# concurrency profile is I/O-bound: every decrypt-and-serve request calls
+# back into the backend over httpx and parks the thread on that round-trip,
+# so a generously sized thread pool (not CPU count) is what keeps the pool
+# from starving. The whoami short-TTL cache + singleflight (see top of file)
+# already collapse the history-import auth storm, so 32 is ample headroom.
+_ENCLAVE_THREADS = int(os.environ.get("FEEDLING_ENCLAVE_THREADS", 32))
 
-    Python's ssl.SSLContext.load_cert_chain only takes file paths; we
-    materialize the PEM through NamedTemporaryFile and unlink right after
-    load so nothing persists. In a TDX CVM /tmp is in-memory anyway —
-    the bytes never hit persistent storage or the operator's disk.
+
+def _materialize_tls_files() -> tuple[str, str] | None:
+    """Write the in-memory TLS PEM to two tmpfs files for gunicorn.
+
+    gunicorn loads its server cert/key from file paths (and flips SSL on iff
+    a certfile/keyfile is configured), so we materialize the PEM that
+    bootstrap() derived. The files are mode 0600 and unlinked atexit. In a
+    TDX CVM /tmp is an in-memory tmpfs, so the key never touches persistent
+    storage or the operator's disk; outside TDX (local dev) they are ordinary
+    temp files cleaned up on exit.
+
+    Returns (cert_path, key_path), or None when TLS is disabled — in which
+    case gunicorn serves plain HTTP, matching the old app.run(ssl_context=None)
+    behaviour.
     """
     if not _state["tls_enabled"]:
         return None
@@ -1367,30 +2103,98 @@ def _build_ssl_context() -> ssl.SSLContext | None:
     if not cert_pem or not key_pem:
         return None
 
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    # Drop the ephemeral PEM paths as soon as load_cert_chain has read them.
-    with tempfile.NamedTemporaryFile("wb", suffix=".pem", delete=False) as cf, \
-         tempfile.NamedTemporaryFile("wb", suffix=".pem", delete=False) as kf:
-        cf.write(cert_pem); cf.flush()
-        kf.write(key_pem); kf.flush()
-        cert_path, key_path = cf.name, kf.name
-    try:
-        ctx.load_cert_chain(certfile=cert_path, keyfile=key_path)
-    finally:
+    paths: list[str] = []
+    for pem in (cert_pem, key_pem):
+        with tempfile.NamedTemporaryFile("wb", suffix=".pem", delete=False) as f:
+            os.chmod(f.name, 0o600)
+            f.write(pem)
+            f.flush()
+            paths.append(f.name)
+    cert_path, key_path = paths
+
+    # Guard cleanup to THIS (master) process. gunicorn forks its worker after
+    # we register, so the worker inherits this atexit handler; a graceful
+    # worker recycle (SIGHUP reload / max_requests) exits the child via
+    # sys.exit, which runs atexit. Without the pid guard the dying worker would
+    # unlink the cert/key while the master lives, and the respawned worker's
+    # load_cert_chain would then FileNotFoundError into a boot crash-loop.
+    owner_pid = os.getpid()
+
+    def _cleanup() -> None:
+        if os.getpid() != owner_pid:
+            return
         for p in (cert_path, key_path):
             try: os.unlink(p)
             except OSError: pass
+    atexit.register(_cleanup)
+    return cert_path, key_path
+
+
+def _enclave_ssl_context(conf, default_ssl_context_factory) -> ssl.SSLContext:
+    """gunicorn `ssl_context` hook — reproduce the enclave's exact TLS posture.
+
+    iOS pins sha256(cert.DER) of the served leaf against the fingerprint baked
+    into REPORT_DATA (see docs/DESIGN_E2E.md §7 + the phala compose enclave
+    note), so the handshake must serve precisely the cert bootstrap() derived
+    and nothing else. We therefore build a bare PROTOCOL_TLS_SERVER context
+    (no client-cert verification, no HTTP/2 ALPN) pinned to TLS 1.2+, exactly
+    as the previous _build_ssl_context did, rather than letting gunicorn's
+    default create_default_context() factory alter the chain or negotiation.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=conf.certfile, keyfile=conf.keyfile)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     return ctx
 
 
+def _run_enclave_server(tls: tuple[str, str] | None) -> None:
+    """Serve `app` under gunicorn's gthread worker (production WSGI).
+
+    Replaces app.run() (the Werkzeug dev server), which is single-threaded
+    and not production-grade under the TDX CVM. We embed gunicorn
+    programmatically — via BaseApplication — instead of changing the compose
+    entrypoint, so the command stays `python -u backend/enclave_app.py` and
+    the published compose_hash is unaffected (CONTRIBUTING.md §7).
+
+    Single worker mirrors the previous single-process model exactly (the
+    process-local whoami/content-key caches stay coherent); gthread + 32
+    threads gives the production-grade concurrency the old `threaded=True`
+    provided, now on a real WSGI server with worker timeouts.
+    """
+    # Imported lazily so that `import enclave_app` in the test suite (which
+    # never reaches this entrypoint) does not hard-require gunicorn.
+    import gunicorn.app.base
+
+    options: dict[str, Any] = {
+        "bind": f"0.0.0.0:{ENCLAVE_PORT}",
+        "workers": 1,
+        "worker_class": "gthread",
+        "threads": _ENCLAVE_THREADS,
+        "timeout": 120,
+        "graceful_timeout": 30,
+    }
+    if tls is not None:
+        cert_path, key_path = tls
+        # certfile/keyfile flip gunicorn's is_ssl on (and satisfy its path
+        # validation); the actual context is built by the ssl_context hook.
+        options["certfile"] = cert_path
+        options["keyfile"] = key_path
+        options["ssl_context"] = _enclave_ssl_context
+
+    class _EnclaveApplication(gunicorn.app.base.BaseApplication):
+        def load_config(self):
+            for key, value in options.items():
+                self.cfg.set(key, value)
+
+        def load(self):
+            return app
+
+    _EnclaveApplication().run()
+
+
 if __name__ == "__main__":
     bootstrap()
-    ssl_ctx = _build_ssl_context()
-    scheme = "https" if ssl_ctx else "http"
+    tls = _materialize_tls_files()
+    scheme = "https" if tls else "http"
     print(f"Feedling enclave service listening on {scheme}://0.0.0.0:{ENCLAVE_PORT}", flush=True)
-    # threaded=True: the default Werkzeug server is single-threaded, so every
-    # decrypt-and-serve request (each of which calls back into the backend)
-    # serialised and head-of-line-blocked the rest under concurrent load.
-    app.run(host="0.0.0.0", port=ENCLAVE_PORT, debug=False, ssl_context=ssl_ctx,
-            threaded=True)
+    _run_enclave_server(tls)

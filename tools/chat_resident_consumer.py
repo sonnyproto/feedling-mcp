@@ -59,10 +59,22 @@ Optional:
                         Broadcast-off tick interval in seconds (default: 1800)
   PROACTIVE_TICK_START_DELAY_SEC
                         Delay before the first automatic wake tick (default: 15)
+  PROACTIVE_SCHEDULED_FIRE_ENABLED
+                        Default true. Poll resident-owned scheduled_wake timers
+                        and enqueue due hidden jobs.
+  PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC
+                        Scheduled wake fire cadence in seconds (default: 60)
+  WHOAMI_REFRESH_RETRIES
+                        Short retry count before encrypted reply writes (default: 3)
+  WHOAMI_REFRESH_RETRY_DELAY_SEC
+                        Initial reply whoami retry backoff in seconds (default: 0.5)
   SEND_FALLBACK_ON_AGENT_ERROR
-                        Default false. When false, agent failures are logged
-                        and no fake template is posted to the user.
-  FALLBACK_REPLY        Optional opt-in fallback text
+                        Default true. Agent failures post a visible, bounded
+                        failure reply instead of silently dropping the turn.
+  FALLBACK_REPLY        Optional user-visible fallback text
+  AGENT_SESSION_MAX_TURNS / AGENT_SESSION_MAX_BYTES
+                        Bound resident-owned CLI/HTTP sessions. When either
+                        limit is reached, the next turn starts a fresh session.
   IMAGE_TEMP_DIR        Where decrypted chat images are written for CLI agents
   SCREEN_CONTEXT_MODE   "on_mention" (default), "always", or "off". When active,
                         recent screen-sharing context is attached to screen
@@ -86,6 +98,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -105,6 +118,10 @@ try:
     _ENCRYPTION_AVAILABLE = True
 except ImportError:
     _ENCRYPTION_AVAILABLE = False
+
+from memory.capture_prompt_v1 import build_capture_prompt, parse_capture_cards
+from memory.dream_prompt_v1 import build_dream_prompt, parse_dream_consolidations
+from memory.migrate_prompt_v1 import build_migrate_prompt, parse_migrated_cards
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -138,6 +155,7 @@ class AgentTurn:
     thinking_native: bool | None = None
     actions: list[dict] = field(default_factory=list)
     runtime_debug: dict = field(default_factory=dict)
+    tool_calls: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -198,6 +216,7 @@ CHECKPOINT_FILE = Path(
     os.environ.get("CHECKPOINT_FILE", "/tmp/feedling_chat_checkpoint.json")
 )
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
+RESIDENT_CHAT_RUNTIME_V2_FLAG = "resident_chat_runtime_v2_enabled"
 PROACTIVE_POLL_ENABLED = _env_bool("PROACTIVE_POLL_ENABLED", True)
 PROACTIVE_POLL_TIMEOUT = int(os.environ.get("PROACTIVE_POLL_TIMEOUT", "1"))
 PROACTIVE_TICK_ENABLED = _env_bool("PROACTIVE_TICK_ENABLED", True)
@@ -209,11 +228,46 @@ PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC = int(
     os.environ.get("PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", "1800")
 )
 PROACTIVE_TICK_START_DELAY_SEC = int(os.environ.get("PROACTIVE_TICK_START_DELAY_SEC", "15"))
+# Screen-watch lane — decoupled from the heavy heartbeat. While the user is
+# actively screen-sharing, a lightweight loop lets the agent look at recent
+# frames every SCREEN_WATCH_INTERVAL_SEC, but ONLY when the screen actually
+# changed and the user is not mid-conversation. It carries frames + a names-only
+# tool list, NOT the cross-domain board / full tool catalog. The heartbeat keeps
+# its own (broadcast-independent) cadence.
+SCREEN_WATCH_ENABLED = _env_bool("FEEDLING_SCREEN_WATCH_ENABLED", True)
+SCREEN_WATCH_INTERVAL_SEC = int(os.environ.get("FEEDLING_SCREEN_WATCH_INTERVAL_SEC", "120"))
+SCREEN_WATCH_CHAT_SUPPRESS_SEC = int(os.environ.get("FEEDLING_SCREEN_WATCH_CHAT_SUPPRESS_SEC", "180"))
+SCREEN_WATCH_FRAMES = int(os.environ.get("FEEDLING_SCREEN_WATCH_FRAMES", "5"))
+SCREEN_WATCH_START_DELAY_SEC = int(os.environ.get("FEEDLING_SCREEN_WATCH_START_DELAY_SEC", "20"))
+# A frame newer than this means sharing is genuinely live right now (iOS captures
+# ~1 frame / 30 s). Used instead of the heartbeat's broadcast_state, which is only
+# refreshed on the slow heartbeat tick and would be stale for a 2-min loop.
+SCREEN_WATCH_FRESH_SEC = int(os.environ.get("FEEDLING_SCREEN_WATCH_FRESH_SEC", "90"))
+PROACTIVE_SCHEDULED_FIRE_ENABLED = _env_bool("PROACTIVE_SCHEDULED_FIRE_ENABLED", True)
+PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC = int(os.environ.get("PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC", "60"))
+PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC = int(os.environ.get("PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC", "5"))
+CAPTURE_TICK_ENABLED = _env_bool("FEEDLING_CAPTURE_TICK_ENABLED", True)
+CAPTURE_TICK_INTERVAL_SEC = int(os.environ.get(
+    "FEEDLING_CAPTURE_TICK_INTERVAL_SEC",
+    str(PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC),
+))
+CAPTURE_TICK_START_DELAY_SEC = int(os.environ.get(
+    "FEEDLING_CAPTURE_TICK_START_DELAY_SEC",
+    str(PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC),
+))
 PROACTIVE_MAX_REPLY_MESSAGES = int(os.environ.get("PROACTIVE_MAX_REPLY_MESSAGES", "5"))
 PROACTIVE_RECENT_CHAT_LIMIT = int(os.environ.get("PROACTIVE_RECENT_CHAT_LIMIT", "20"))
 PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT = int(os.environ.get("PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT", "50"))
 PROACTIVE_CHAT_FRESH_WINDOW_SEC = int(os.environ.get("PROACTIVE_CHAT_FRESH_WINDOW_SEC", "21600"))
 PROACTIVE_STALE_CHAT_FALLBACK_LIMIT = int(os.environ.get("PROACTIVE_STALE_CHAT_FALLBACK_LIMIT", "2"))
+CAPTURE_HISTORY_LIMIT = int(os.environ.get("FEEDLING_CAPTURE_HISTORY_LIMIT", "160"))
+CAPTURE_WINDOW_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_WINDOW_MAX_CHARS", "12000"))
+CAPTURE_CONTEXT_MAX_CHARS = int(os.environ.get("FEEDLING_CAPTURE_CONTEXT_MAX_CHARS", "4000"))
+DREAM_MEMORY_INDEX_LIMIT = int(os.environ.get("FEEDLING_DREAM_MEMORY_INDEX_LIMIT", "0"))
+DREAM_FETCH_BATCH_SIZE = int(os.environ.get("FEEDLING_DREAM_FETCH_BATCH_SIZE", "100"))
+DREAM_RECENT_CHAT_LIMIT = int(os.environ.get("FEEDLING_DREAM_RECENT_CHAT_LIMIT", "80"))
+DREAM_MEMORY_MAX_CARDS = int(os.environ.get("FEEDLING_DREAM_MEMORY_MAX_CARDS", "200"))
+DREAM_MAX_CONSOLIDATIONS = int(os.environ.get("FEEDLING_DREAM_MAX_CONSOLIDATIONS", "12"))
 CONSUMER_ID = os.environ.get(
     "CONSUMER_ID",
     f"{socket.gethostname()}:{os.getpid()}",
@@ -222,24 +276,37 @@ AGENT_SESSION_FILE_TEMPLATE = os.environ.get(
     "AGENT_SESSION_FILE",
     f"/tmp/feedling_agent_session_{hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]}_{{user_id}}.txt",
 )
+AGENT_SESSION_MAX_TURNS = int(os.environ.get("AGENT_SESSION_MAX_TURNS", "40"))
+AGENT_SESSION_MAX_BYTES = int(os.environ.get("AGENT_SESSION_MAX_BYTES", "250000"))
+AGENT_SESSION_ROTATE_PREFIX = os.environ.get("AGENT_SESSION_ROTATE_PREFIX", "feedling-io")
 IMAGE_TEMP_DIR = Path(os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_images"))
 SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "on_mention").strip().lower()
 SCREEN_CONTEXT_MAX_AGE_SEC = int(os.environ.get("SCREEN_CONTEXT_MAX_AGE_SEC", "300"))
 SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
 FALLBACK_REPLY = os.environ.get(
-    "FALLBACK_REPLY", "（Agent 暂时无法响应，请稍后再试）"
+    "FALLBACK_REPLY", "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
 )
 # Canned reply for /v1/chat/verify_loop liveness pings — see the short-circuit
 # in _process_messages. The server GCs both the ping and this reply once the
 # verify completes, so it never reaches the user's visible chat; it only has
 # to be a non-empty agent-role write that lands fast.
 VERIFY_PING_REPLY = os.environ.get("VERIFY_PING_REPLY", "__verify_ack__")
-SEND_FALLBACK_ON_AGENT_ERROR = _env_bool("SEND_FALLBACK_ON_AGENT_ERROR", False)
+# Verify probe (real-agent liveness): on a verify_ping we now run a real, bounded
+# agent call so verify catches a broken reply pipeline (e.g. unparseable agent
+# output) instead of always passing via the canned ack. VERIFY_PROBE_MESSAGE is
+# the synthetic prompt sent to the agent; VERIFY_PROBE_TIMEOUT_SEC bounds the
+# wait before we fall back to the canned ack (keeps a slow-but-healthy agent
+# from falsely failing). See the verify_ping branch in _process_messages.
+VERIFY_PROBE_MESSAGE = os.environ.get("VERIFY_PROBE_MESSAGE", "（连接自检）请用一句话回复，确认你能收到我的消息。")
+VERIFY_PROBE_TIMEOUT_SEC = float(os.environ.get("VERIFY_PROBE_TIMEOUT_SEC", "20"))
+SEND_FALLBACK_ON_AGENT_ERROR = _env_bool("SEND_FALLBACK_ON_AGENT_ERROR", True)
 POLL_TIMEOUT = int(os.environ.get("POLL_TIMEOUT", "30"))
 WHOAMI_STARTUP_RETRIES = int(os.environ.get("WHOAMI_STARTUP_RETRIES", "8"))
 WHOAMI_STARTUP_RETRY_DELAY_SEC = float(
     os.environ.get("WHOAMI_STARTUP_RETRY_DELAY_SEC", "5")
 )
+WHOAMI_REFRESH_RETRIES = int(os.environ.get("WHOAMI_REFRESH_RETRIES", "3"))
+WHOAMI_REFRESH_RETRY_DELAY_SEC = float(os.environ.get("WHOAMI_REFRESH_RETRY_DELAY_SEC", "0.5"))
 
 # Prompt routed only when an agent entry cannot receive a native image object.
 # The consumer still extracts decrypted image bytes and passes them through
@@ -266,17 +333,7 @@ _SCREEN_CONTEXT_TRIGGER_RE = re.compile(
 # FEEDLING_ENCLAVE_URL: direct HTTP to the enclave decrypt proxy (fastest,
 #   same value as FEEDLING_ENCLAVE_URL in mcp_server.py, e.g. https://127.0.0.1:5003).
 #
-# FEEDLING_MCP_URL: URL of the Feedling MCP server (e.g. https://mcp.feedling.app
-#   or https://127.0.0.1:5002).  The consumer calls feedling_chat_get_history
-#   via the MCP server, which runs inside the enclave and can decrypt.
-#   Requires FEEDLING_MCP_TRANSPORT=streamable-http on the MCP server.
-#
-# WARNING: if neither is set, /v1/chat/poll returns content="" for all v1
-# encrypted messages and the consumer will never be able to reply.
-# ---------------------------------------------------------------------------
 FEEDLING_ENCLAVE_URL = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
-FEEDLING_MCP_URL = os.environ.get("FEEDLING_MCP_URL", "").rstrip("/")
-FEEDLING_MCP_KEY = os.environ.get("FEEDLING_MCP_KEY", FEEDLING_API_KEY)
 
 
 def _consumer_commit() -> str:
@@ -303,90 +360,311 @@ _HEADERS = {
     "X-Feedling-Consumer-Commit": os.environ.get("FEEDLING_CONSUMER_COMMIT", _consumer_commit()),
 }
 
+# Stage D: when hosted, the supervisor writes a short-lived runtime token to this
+# file (and refreshes it). We authenticate with the token instead of the
+# long-term API key, re-reading the file so refreshes are picked up. Unset/empty
+# (e.g. a self-hosted VPS user) → we keep using X-API-Key, unchanged.
+FEEDLING_RUNTIME_TOKEN_FILE = os.environ.get("FEEDLING_RUNTIME_TOKEN_FILE", "").strip()
+
+
+def _runtime_token_exp(token: str) -> float | None:
+    """Read the ``exp`` claim from a runtime token WITHOUT verifying its signature
+    (no secret here). Lets us avoid sending a token we can already see is expired.
+    Returns the exp epoch, or None if unparseable."""
+    try:
+        payload_b64 = token.split(".", 1)[0]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+        return float(claims.get("exp"))
+    except Exception:
+        return None
+
+
+def _refresh_auth_header() -> None:
+    """Choose the request auth header from the runtime-token file (Stage D).
+
+    Uses the token only when the file holds one that is NOT already expired
+    (decoding its ``exp``); otherwise falls back to the long-term api key. This
+    avoids wedging on a stale token if the supervisor stops refreshing the file.
+    Mutates ``_HEADERS`` in place so all existing call sites pick it up."""
+    if not FEEDLING_RUNTIME_TOKEN_FILE:
+        return
+    token = ""
+    try:
+        token = Path(FEEDLING_RUNTIME_TOKEN_FILE).read_text().strip()
+    except OSError:
+        token = ""
+    exp = _runtime_token_exp(token) if token else None
+    fresh = exp is not None and exp > time.time() + 5  # small skew margin
+    if fresh:
+        _HEADERS.pop("X-API-Key", None)
+        _HEADERS["X-Feedling-Runtime-Token"] = token
+    else:
+        _HEADERS.pop("X-Feedling-Runtime-Token", None)
+        _HEADERS["X-API-Key"] = FEEDLING_API_KEY
+
+
+_refresh_auth_header()  # adopt a token immediately if one is already present
+
+
+# ---------------------------------------------------------------------------
+# Self-update — keep a self-hosted resident on the commit the backend deploys.
+#
+# The backend advertises its deployed commit in the chat-poll response
+# (``client_release.expected_consumer_commit``). When ours differs AND the
+# difference actually touches a file this consumer loads, we fetch + checkout
+# that commit and re-exec in place. Hosted (supervisor-managed CVM) runs are
+# excluded — their code is baked into an attested, immutable image.
+# ---------------------------------------------------------------------------
+
+_REPO = Path(__file__).resolve().parent.parent
+
+# Default-on; a self-hoster can set FEEDLING_AUTO_UPDATE=0 to opt out.
+AUTO_UPDATE = os.environ.get("FEEDLING_AUTO_UPDATE", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+    "off",
+    "",
+)
+# A runtime-token file is only written by the in-CVM supervisor — treat its
+# presence as "hosted" and never self-mutate there.
+_HOSTED = bool(FEEDLING_RUNTIME_TOKEN_FILE)
+
+
+def _runtime_repo_files() -> set[str]:
+    """Repo-relative ``.py`` files this process actually loaded (auto-derived
+    dependency whitelist), plus files distributed alongside us that never show
+    up in ``sys.modules`` (io_cli is shelled out; requirements gate pip).
+
+    Used to decide whether a backend release touches anything we run — a pure
+    backend change (routes/db/accounts the consumer never imports) must not
+    trigger a needless restart."""
+    files: set[str] = set()
+    for mod in list(sys.modules.values()):
+        f = getattr(mod, "__file__", None)
+        if not f:
+            continue
+        try:
+            rel = Path(f).resolve().relative_to(_REPO)
+        except ValueError:
+            continue  # stdlib / site-packages / outside the repo
+        if rel.suffix == ".py":
+            files.add(str(rel))
+    files.update(
+        {
+            "tools/io_cli.py",
+            "tools/chat_resident_requirements.txt",
+            "backend/requirements.txt",
+        }
+    )
+    return files
+
+
+def _should_self_update(
+    local: str,
+    target: str,
+    dirty: bool,
+    enabled: bool,
+    hosted: bool,
+    relevant_changed: bool,
+) -> bool:
+    """Pure decision: should we update from ``local`` to ``target`` now?
+
+    Side-effect-free so it is exhaustively unit-tested. The caller owns the git
+    work and is responsible for warning when a dirty tree blocks an update."""
+    if not enabled or hosted:
+        return False
+    if not target or target == "dev" or not local:
+        return False
+    # Short vs full hash of the same commit -> already there, nothing to do.
+    if target.startswith(local) or local.startswith(target):
+        return False
+    if dirty:
+        return False  # protect uncommitted local edits (caller warns)
+    return relevant_changed
+
+
+# Don't re-attempt the git fetch/diff dance more than once per window — the
+# backend re-advertises the target on every (often timed-out) poll.
+_SELF_UPDATE_MIN_INTERVAL_SEC = 300.0
+_last_self_update_mono = 0.0
+
+_REQUIREMENTS_FILES = {
+    "tools/chat_resident_requirements.txt",
+    "backend/requirements.txt",
+}
+
+# Repo paths that are part of this consumer's runtime but may be imported
+# LAZILY (e.g. proactive.adapters_v2 / runtime_v2 only load once a proactive job
+# runs), so they won't appear in sys.modules on a fresh, idle consumer. We still
+# want a release touching them to trigger an update — hence a static layer on
+# top of the sys.modules-derived set in _runtime_repo_files().
+_RELEVANT_PATH_PREFIXES = ("backend/proactive/",)
+_RELEVANT_PATH_FILES = {"backend/content_encryption.py"}
+
+
+def _git(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(_REPO), *args],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _git_tree_dirty() -> bool:
+    """True if there are uncommitted changes — or if we can't tell (fail safe:
+    an unknown state must not be overwritten)."""
+    try:
+        r = _git("status", "--porcelain", timeout=10)
+    except Exception:
+        return True
+    if r.returncode != 0:
+        return True
+    return bool(r.stdout.strip())
+
+
+def _git_fetch(target: str) -> bool:
+    try:
+        return _git("fetch", "--quiet", "origin", target, timeout=120).returncode == 0
+    except Exception:
+        return False
+
+
+def _git_changed_files(local: str, target: str) -> set[str]:
+    try:
+        r = _git("diff", "--name-only", local, target, "--", timeout=30)
+    except Exception:
+        return set()
+    if r.returncode != 0:
+        return set()
+    return {ln.strip() for ln in r.stdout.splitlines() if ln.strip()}
+
+
+def _git_checkout(target: str) -> bool:
+    # Detached checkout pins us exactly to the backend's commit (lockstep). A
+    # self-hoster who wants to take over manually can `git checkout main`.
+    try:
+        r = _git("checkout", "--detach", "--force", target, timeout=60)
+    except Exception as e:
+        log.error("self-update checkout error: %s", e)
+        return False
+    if r.returncode != 0:
+        log.error("self-update checkout failed: %s", r.stderr.strip())
+        return False
+    return True
+
+
+def _pip_install(req_rel: str) -> None:
+    # Best-effort: a re-exec into new code that needs new deps would otherwise
+    # crash-loop. Failure here only warns; systemd will still respawn.
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-r", str(_REPO / req_rel)],
+            timeout=600,
+            check=False,
+        )
+    except Exception as e:
+        log.warning("self-update pip install %s failed: %s", req_rel, e)
+
+
+def _relevant_changed(changed: set[str]) -> bool:
+    """Does this release touch anything this consumer actually runs?
+
+    Combines the auto-derived (sys.modules) dependency set with a static layer
+    for lazily-imported runtime code that may not be loaded yet."""
+    if changed & _runtime_repo_files():
+        return True
+    for path in changed:
+        if path in _RELEVANT_PATH_FILES:
+            return True
+        if any(path.startswith(p) for p in _RELEVANT_PATH_PREFIXES):
+            return True
+    return False
+
+
+def _apply_self_update(local: str, target: str, changed: set[str]) -> None:
+    """Checkout the target commit, install any changed deps, then re-exec.
+
+    Checkout happens FIRST so _pip_install reads the target commit's
+    requirements file — installing the deps the new code needs, not the old
+    ones (a release adding a dependency must not re-exec into code that can't
+    import it)."""
+    if not _git_checkout(target):
+        return
+    for req in sorted(changed & _REQUIREMENTS_FILES):
+        log.info("self-update: %s changed — pip installing after checkout", req)
+        _pip_install(req)
+    log.info("self-update %s -> %s applied; re-exec into new code", local, target)
+    try:
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+    except Exception as e:
+        # execv replaces the process and normally never returns; if it failed,
+        # exit cleanly so the supervisor/systemd respawns the new code.
+        log.error("self-update re-exec failed (%s); exiting for restart", e)
+        sys.exit(0)
+
+
+def _run_self_update(target: str) -> None:
+    """Decide and (if warranted) apply a self-update to ``target``.
+
+    Cheap pre-checks short-circuit before any git network call; the expensive
+    fetch/diff only runs when an update is genuinely plausible. Re-exec happens
+    inside ``_apply_self_update`` and does not return."""
+    global _last_self_update_mono
+    if not AUTO_UPDATE or _HOSTED or not target or target == "dev":
+        return
+    now = time.monotonic()
+    if now - _last_self_update_mono < _SELF_UPDATE_MIN_INTERVAL_SEC:
+        return
+    local = _consumer_commit()
+    if not local or target.startswith(local) or local.startswith(target):
+        return  # unknown local, or already on the target commit
+    _last_self_update_mono = now  # throttle the fetch/diff attempt below
+
+    if not _git_fetch(target):
+        log.warning("self-update: could not fetch %s; will retry later", target)
+        return
+    changed = _git_changed_files(local, target)
+    relevant = _relevant_changed(changed)
+    if not relevant:
+        return  # backend release doesn't touch anything this consumer loads
+    dirty = _git_tree_dirty()
+    if not _should_self_update(local, target, dirty, AUTO_UPDATE, _HOSTED, relevant):
+        if dirty:
+            log.warning(
+                "self-update %s -> %s available but working tree has uncommitted "
+                "changes; skipping (run `git stash` / commit to allow it)",
+                local,
+                target,
+            )
+        return
+    _apply_self_update(local, target, changed)
+
+
+def _maybe_self_update(poll_result: Any) -> None:
+    """Extract the backend-advertised target commit from a chat-poll response
+    and run the self-update check. Called at idle (timed-out) polls only."""
+    if not isinstance(poll_result, dict):
+        return
+    release = poll_result.get("client_release")
+    target = ""
+    if isinstance(release, dict):
+        target = str(release.get("expected_consumer_commit") or "").strip()
+    if target:
+        _run_self_update(target)
+
+
 # Separate HTTP client for the enclave (self-signed TLS, verify=False).
 _ENCLAVE_CLIENT: httpx.Client | None = (
     httpx.Client(timeout=20, verify=False) if FEEDLING_ENCLAVE_URL else None
 )
 
-# Optional FastMCP async client for the MCP-sourced decryption path.
-_fastmcp_cls = None
-try:
-    import asyncio as _asyncio
-    from fastmcp import Client as _FastMCPCls
-    _fastmcp_cls = _FastMCPCls
-except ImportError:
-    pass
-
-# Transport probe cache: base_url → working endpoint URL (or None if unreachable).
-_mcp_transport_cache: dict[str, str | None] = {}
-
-
-def _mcp_supports_headers() -> bool:
-    """Return True if the installed fastmcp.Client.__init__ accepts headers=."""
-    if _fastmcp_cls is None:
-        return False
-    try:
-        return "headers" in inspect.signature(_fastmcp_cls.__init__).parameters
-    except (ValueError, TypeError):
-        return False
-
-
-def _probe_mcp_transport_sync(base_url: str) -> str | None:
-    """Probe MCP server for a working transport endpoint and cache the result.
-
-    Tries streamable-HTTP (/mcp POST) first, then SSE (/sse GET).
-    Returns the working endpoint URL, or None if neither responds.
-    """
-    if base_url in _mcp_transport_cache:
-        return _mcp_transport_cache[base_url]
-
-    url: str | None = None
-    auth_headers = {"Authorization": f"Bearer {FEEDLING_MCP_KEY}"}
-
-    # Probe streamable-HTTP
-    try:
-        resp = httpx.post(
-            f"{base_url}/mcp",
-            headers=auth_headers,
-            content=b"{}",
-            timeout=5,
-            verify=False,
-        )
-        if resp.status_code != 404:
-            url = f"{base_url}/mcp"
-            log.info("MCP transport: streamable-HTTP at %s/mcp", base_url)
-    except Exception as e:
-        log.debug("MCP /mcp probe failed: %s", e)
-
-    # Probe SSE if streamable-HTTP not found
-    if url is None:
-        sse_url = f"{base_url}/sse?key={FEEDLING_MCP_KEY}"
-        try:
-            with httpx.stream(
-                "GET",
-                sse_url,
-                timeout=httpx.Timeout(connect=5.0, read=1.0, write=5.0, pool=5.0),
-                verify=False,
-            ) as resp:
-                if resp.status_code == 200:
-                    url = sse_url
-                    log.info("MCP transport: SSE at %s/sse", base_url)
-        except httpx.ReadTimeout:
-            # ReadTimeout after connect = SSE stream started, endpoint is alive.
-            url = sse_url
-            log.info("MCP transport: SSE at %s/sse (streaming)", base_url)
-        except Exception as e:
-            log.debug("MCP /sse probe failed: %s", e)
-
-    if url is None:
-        log.warning("MCP probe: %s unreachable on /mcp and /sse", base_url)
-
-    _mcp_transport_cache[base_url] = url
-    return url
-
 _decrypt_sources = (
     f"enclave={FEEDLING_ENCLAVE_URL}" if FEEDLING_ENCLAVE_URL else ""
-    + (f" mcp={FEEDLING_MCP_URL}" if FEEDLING_MCP_URL else "")
 ).strip() or "NONE — replies will not work for v1 encrypted messages"
 
 log.info(
@@ -528,162 +806,6 @@ def _fetch_from_enclave(since: float, limit: int) -> list[dict] | None:
         return None
 
 
-def _fetch_from_mcp(since: float, limit: int) -> list[dict] | None:
-    """Call feedling_chat_get_history via the MCP server.
-
-    Supports both streamable-HTTP (/mcp) and SSE (/sse) transports, detected
-    via _probe_mcp_transport_sync.  Handles older fastmcp versions that lack
-    the headers= kwarg by embedding the key in the URL instead.
-
-    Returns list on success, None on error or not configured.
-    """
-    if not FEEDLING_MCP_URL or _fastmcp_cls is None:
-        return None
-
-    transport_url = _probe_mcp_transport_sync(FEEDLING_MCP_URL)
-    if transport_url is None:
-        log.warning("MCP source unreachable — no working transport endpoint")
-        return None
-
-    supports_headers = _mcp_supports_headers()
-
-    def _extract_messages_from_mcp_result(result_obj) -> list[dict]:
-        """Parse FastMCP call_tool return shapes across client versions."""
-        image_blocks: list[str] = []
-
-        def _maybe_parse_json_text(text: str):
-            if not text:
-                return None
-            try:
-                data = json.loads(text)
-            except Exception:
-                return None
-            if isinstance(data, dict):
-                msgs = data.get("messages") or data.get("history")
-                if isinstance(msgs, list):
-                    return msgs
-            return None
-
-        def _maybe_image_b64(item: Any) -> str | None:
-            data = getattr(item, "data", None)
-            mime = getattr(item, "mimeType", None) or getattr(item, "mime_type", None)
-            typ = getattr(item, "type", None)
-            if isinstance(item, dict):
-                data = data if data is not None else item.get("data")
-                mime = mime or item.get("mimeType") or item.get("mime_type")
-                typ = typ or item.get("type")
-            if data is None:
-                return None
-            if typ not in (None, "image") and not str(mime or "").startswith("image/"):
-                return None
-            if isinstance(data, bytes):
-                return base64.b64encode(data).decode("ascii")
-            if isinstance(data, str) and data.strip():
-                value = data.strip()
-                return value.split(",", 1)[1] if value.startswith("data:") else value
-            return None
-
-        def _attach_image_blocks(msgs: list[dict]) -> list[dict]:
-            if not image_blocks:
-                return msgs
-            for msg in msgs:
-                if not isinstance(msg, dict):
-                    continue
-                marker = msg.get("image_b64")
-                if not isinstance(marker, str):
-                    continue
-                m = re.fullmatch(r"<vision_block:(\d+)>", marker.strip())
-                if not m:
-                    continue
-                idx = int(m.group(1))
-                if 0 <= idx < len(image_blocks):
-                    msg["image_b64"] = image_blocks[idx]
-            return msgs
-
-        if result_obj is None:
-            return []
-
-        # Newer shape: CallToolResult(content=[...], structured_content=...)
-        content_list = getattr(result_obj, "content", None)
-        if isinstance(content_list, list):
-            parsed_msgs: list[dict] | None = None
-            for item in content_list:
-                image_b64 = _maybe_image_b64(item)
-                if image_b64:
-                    image_blocks.append(image_b64)
-                    continue
-                text = getattr(item, "text", None)
-                if isinstance(text, str):
-                    parsed = _maybe_parse_json_text(text)
-                    if parsed is not None:
-                        parsed_msgs = parsed
-            if parsed_msgs is not None:
-                return _attach_image_blocks(parsed_msgs)
-
-        structured = getattr(result_obj, "structured_content", None)
-        if isinstance(structured, dict):
-            msgs = structured.get("messages") or structured.get("history")
-            if isinstance(msgs, list):
-                return _attach_image_blocks(msgs)
-
-        text_attr = getattr(result_obj, "text", None)
-        if isinstance(text_attr, str):
-            parsed = _maybe_parse_json_text(text_attr)
-            if parsed is not None:
-                return _attach_image_blocks(parsed)
-
-        # Older shape: list[ContentLike]
-        if isinstance(result_obj, list):
-            parsed_msgs: list[dict] | None = None
-            for item in result_obj:
-                image_b64 = _maybe_image_b64(item)
-                if image_b64:
-                    image_blocks.append(image_b64)
-                    continue
-                text = getattr(item, "text", None)
-                if isinstance(text, str):
-                    parsed = _maybe_parse_json_text(text)
-                    if parsed is not None:
-                        parsed_msgs = parsed
-                        continue
-                parsed = _maybe_parse_json_text(str(item))
-                if parsed is not None:
-                    parsed_msgs = parsed
-            if parsed_msgs is not None:
-                return _attach_image_blocks(parsed_msgs)
-
-        parsed = _maybe_parse_json_text(str(result_obj))
-        return _attach_image_blocks(parsed) if parsed is not None else []
-
-    async def _call():
-        if supports_headers:
-            client_ctx = _fastmcp_cls(
-                transport_url,
-                headers={"Authorization": f"Bearer {FEEDLING_MCP_KEY}"},
-            )
-        else:
-            # Older fastmcp: embed auth in URL.  For SSE the key is already
-            # in the URL from probe; for /mcp add it as a query param.
-            if "?" not in transport_url:
-                keyed_url = f"{transport_url}?key={FEEDLING_MCP_KEY}"
-            else:
-                keyed_url = transport_url  # SSE: ?key=… already present
-            client_ctx = _fastmcp_cls(keyed_url)
-
-        async with client_ctx as client:
-            result = await client.call_tool(
-                "feedling_chat_get_history", {"limit": limit}
-            )
-            msgs = _extract_messages_from_mcp_result(result)
-            return _filter_since(msgs, since)
-
-    try:
-        return _asyncio.run(_call())
-    except Exception as e:
-        log.warning("MCP history fetch failed: %s", e)
-        return None
-
-
 def _verify_decrypt_sources() -> bool:
     """Probe all configured decrypt sources at startup.
 
@@ -711,17 +833,6 @@ def _verify_decrypt_sources() -> bool:
                 FEEDLING_ENCLAVE_URL, e,
             )
 
-    if FEEDLING_MCP_URL:
-        transport_url = _probe_mcp_transport_sync(FEEDLING_MCP_URL)
-        if transport_url:
-            log.info("decrypt source OK: MCP at %s", transport_url)
-            any_ok = True
-        else:
-            log.error(
-                "decrypt source UNREACHABLE: MCP at %s — no working transport",
-                FEEDLING_MCP_URL,
-            )
-
     return any_ok
 
 
@@ -737,13 +848,7 @@ def get_decrypted_history(since: float, limit: int = 20) -> list[dict] | None:
         result = _fetch_from_enclave(since, limit)
         if result is not None:
             return result
-        log.warning("enclave source failed; trying MCP source if configured")
-
-    if FEEDLING_MCP_URL:
-        result = _fetch_from_mcp(since, limit)
-        if result is not None:
-            return result
-        log.warning("MCP source failed")
+        log.warning("enclave source failed")
 
     return None  # no configured source succeeded
 
@@ -1201,6 +1306,31 @@ _JSON_NON_FINAL_EVENTS = {
 }
 
 
+def _openclaw_payload_texts(obj: Any) -> list[str]:
+    """OpenClaw `agent --json` nests its reply under result.payloads[].text.
+
+    The generic reply-field walker stops at `result` (it does not treat
+    `payloads` as a reply field), so without this the consumer reports
+    "no usable reply" for a perfectly good OpenClaw answer. Returns each
+    payload's text in order (multi-bubble preserved); [] when not this shape.
+    """
+    if not isinstance(obj, dict):
+        return []
+    result = obj.get("result")
+    if not isinstance(result, dict):
+        return []
+    payloads = result.get("payloads")
+    if not isinstance(payloads, list):
+        return []
+    texts: list[str] = []
+    for item in payloads:
+        if isinstance(item, dict):
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                texts.append(text.strip())
+    return texts
+
+
 def _reply_from_json_obj(obj: Any) -> str:
     """Extract the final answer from a structured agent response object."""
     if isinstance(obj, str):
@@ -1215,6 +1345,10 @@ def _reply_from_json_obj(obj: Any) -> str:
 
     if not isinstance(obj, dict):
         return ""
+
+    openclaw_texts = _openclaw_payload_texts(obj)
+    if openclaw_texts:
+        return openclaw_texts[0]
 
     marker = str(
         obj.get("event")
@@ -1353,6 +1487,7 @@ def _default_thinking_kind_for_key(key: str) -> str:
 def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
     dst.actions.extend(src.actions)
     dst.messages.extend(src.messages)
+    dst.tool_calls.extend(src.tool_calls)
     if not dst.thinking_summary and src.thinking_summary:
         dst.thinking_summary = src.thinking_summary
         dst.thinking_kind = src.thinking_kind
@@ -1374,7 +1509,7 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         if json_objects:
             for item in json_objects:
                 _merge_agent_turn(turn, _agent_turn_from_obj(item))
-            if turn.messages or turn.actions or turn.thinking_summary:
+            if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
                 return turn
         nested = _safe_json_loads(raw) if _looks_like_json_text(raw) else None
         if isinstance(nested, (dict, list)):
@@ -1398,6 +1533,21 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
     if not isinstance(obj, dict):
         return turn
 
+    # Capture-lane agents are asked to return a strict {"cards": [...]} JSON
+    # object. Preserve that JSON as the final text so the capture handler can
+    # parse it instead of treating it as an unknown non-chat payload.
+    if isinstance(obj.get("cards"), list):
+        turn.messages.append(json.dumps({"cards": obj.get("cards")}, ensure_ascii=False))
+        return turn
+
+    # OpenClaw `agent --json` nests reply text under result.payloads[].text,
+    # which the generic reply-field recursion below does not reach. Capture it
+    # explicitly so an OpenClaw resident entry produces usable messages instead
+    # of "no usable reply after sanitization".
+    openclaw_texts = _openclaw_payload_texts(obj)
+    if openclaw_texts:
+        turn.messages.extend(openclaw_texts)
+
     for key in _JSON_RUNTIME_DEBUG_FIELDS:
         if key in obj:
             value = obj.get(key)
@@ -1409,6 +1559,17 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
     raw_actions = obj.get("actions")
     if isinstance(raw_actions, list):
         turn.actions.extend([a for a in raw_actions if isinstance(a, dict)])
+
+    raw_tool_calls = obj.get("tool_calls")
+    if isinstance(raw_tool_calls, list):
+        for tc in raw_tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            name = str(tc.get("name") or "").strip()
+            if not name:
+                continue
+            args = dict(tc["args"]) if isinstance(tc.get("args"), dict) else {}
+            turn.tool_calls.append({"name": name, "args": args})
 
     explicit_kind = _sanitize_thinking_kind(obj.get("thinking_kind") or obj.get("reasoning_kind"))
     explicit_source = _sanitize_thinking_meta(
@@ -1497,6 +1658,20 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         seen.add(key)
         unique.append(key)
     turn.messages = unique
+
+    # De-dupe tool_calls too: one emission can arrive via multiple nested paths
+    # (e.g. an OpenAI choice.message handled by both the reply-field loop and
+    # the explicit message path), and the tool loop would otherwise execute the
+    # same call twice.
+    seen_tc: set = set()
+    unique_tc: list[dict] = []
+    for tc in turn.tool_calls:
+        tc_key = (tc.get("name"), json.dumps(tc.get("args") or {}, sort_keys=True))
+        if tc_key in seen_tc:
+            continue
+        seen_tc.add(tc_key)
+        unique_tc.append(tc)
+    turn.tool_calls = unique_tc
     return turn
 
 
@@ -1508,6 +1683,9 @@ def _agent_turn_from_raw(raw_reply: Any, max_items: int | None = None) -> AgentT
 
 def _multi_reply_json_from_obj(obj: Any) -> str:
     """Preserve explicit multi-bubble JSON instead of collapsing it."""
+    openclaw_texts = _openclaw_payload_texts(obj)
+    if openclaw_texts:
+        return json.dumps({"messages": openclaw_texts}, ensure_ascii=False)
     messages: Any = None
     if isinstance(obj, dict) and isinstance(obj.get("messages"), list):
         messages = obj.get("messages")
@@ -1542,6 +1720,56 @@ def _json_objects_from_cli_output(raw: str) -> list[Any]:
         except (json.JSONDecodeError, TypeError):
             continue
     return objects
+
+
+def _cli_error_detail(stdout: str, stderr: str) -> str:
+    """Best error string for a non-zero CLI exit.
+
+    Both CLIs report API failures on STDOUT while stderr is often empty or just a
+    warning: claude ``--output-format json`` emits a result object
+    (``is_error`` + ``result`` text + ``api_error_status``); codex ``--json`` emits
+    ``error`` events (``message``). Surface that so ``cli agent exited`` is
+    actionable instead of blank. Falls back to stderr, then a stdout snippet.
+    """
+    claude_err = ""
+    codex_err = ""
+    for obj in _json_objects_from_cli_output(stdout or ""):
+        if not isinstance(obj, dict):
+            continue
+        if not claude_err and obj.get("is_error") and isinstance(obj.get("result"), str):
+            status = obj.get("api_error_status")
+            claude_err = obj["result"] + (f" (api_status={status})" if status else "")
+        if obj.get("type") == "error" and isinstance(obj.get("message"), str):
+            codex_err = obj["message"]   # keep the last error event (the final one)
+    detail = claude_err or codex_err
+    if detail:
+        return detail[:300]
+    if (stderr or "").strip():
+        return stderr.strip()[:300]
+    return (stdout or "").strip()[:300]
+
+
+def _codex_reply_from_stream(raw: str) -> str:
+    """Extract the assistant's reply from a ``codex exec --json`` event stream.
+
+    codex emits JSONL events; the agent's text rides in ``item.completed`` events
+    whose ``item.type == "agent_message"`` (text at ``item.text``) — verified
+    against codex 0.136. Everything else (thread.started/turn.* handshake,
+    reasoning, command_execution items) is skipped. Returns the agent messages
+    joined in order, or "" when the stream carries none (handshake-only / failed
+    turn) so the caller can fall back instead of leaking a handshake event.
+    """
+    texts: list[str] = []
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict) or obj.get("type") != "item.completed":
+            continue
+        item = obj.get("item")
+        if not isinstance(item, dict) or item.get("type") != "agent_message":
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text.strip():
+            texts.append(text.strip())
+    return "\n\n".join(texts)
 
 
 def _extract_text_from_cli_output(raw: str) -> str:
@@ -1606,10 +1834,18 @@ def _extract_openai_reply(body: dict) -> str:
     raise ValueError("OpenAI-compatible response has no usable reply text")
 
 
-def _remember_http_session(resp: httpx.Response) -> None:
+def _response_text_len(resp: httpx.Response) -> int:
+    try:
+        return len((resp.text or "").encode("utf-8"))
+    except Exception:
+        return 0
+
+
+def _remember_http_session(resp: httpx.Response, *, sent_bytes: int = 0, received_bytes: int = 0) -> None:
     sid = (resp.headers.get(AGENT_HTTP_SESSION_HEADER) or "").strip()
     if sid:
         _save_agent_session_id(sid)
+        _record_agent_session_turn(sid, sent_bytes=sent_bytes, received_bytes=received_bytes)
 
 
 def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = None) -> Any:
@@ -1619,11 +1855,15 @@ def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = 
         payload["images"] = images
     resp = httpx.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=60)
     resp.raise_for_status()
-    _remember_http_session(resp)
+    _remember_http_session(
+        resp,
+        sent_bytes=len(message.encode("utf-8")),
+        received_bytes=_response_text_len(resp),
+    )
     body = resp.json()
     if isinstance(body, dict):
         turn = _agent_turn_from_raw(body)
-        if turn.actions or turn.thinking_summary or len(turn.messages) > 1:
+        if turn.actions or turn.thinking_summary or turn.tool_calls or len(turn.messages) > 1:
             return body
         if turn.messages:
             return turn.messages[0]
@@ -1658,16 +1898,20 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
     }
     resp = httpx.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=120)
     resp.raise_for_status()
-    _remember_http_session(resp)
+    _remember_http_session(
+        resp,
+        sent_bytes=len(str(content).encode("utf-8")),
+        received_bytes=_response_text_len(resp),
+    )
     body = resp.json()
     if not isinstance(body, dict):
         raise ValueError(f"unexpected OpenAI response type: {type(body)}")
     turn = _agent_turn_from_raw(body)
-    if not turn.messages:
-        raise ValueError("OpenAI-compatible response has no usable reply text")
-    if turn.actions or turn.thinking_summary or len(turn.messages) > 1:
+    if turn.actions or turn.thinking_summary or turn.tool_calls or len(turn.messages) > 1:
         return body
-    return turn.messages[0]
+    if turn.messages:
+        return turn.messages[0]
+    raise ValueError("OpenAI-compatible response has no usable reply text")
 
 
 def call_agent_http(message: str, images: list[dict[str, str]] | None = None) -> Any:
@@ -1681,26 +1925,105 @@ def call_agent_http(message: str, images: list[dict[str, str]] | None = None) ->
 
 
 def _agent_session_file_for_user() -> Path:
-    user_id = (_whoami_cache.get("user_id") or "unknown").strip() or "unknown"
+    user_id = _agent_session_user_id()
     path = AGENT_SESSION_FILE_TEMPLATE.replace("{user_id}", user_id)
     return Path(path)
 
 
-def _load_agent_session_id() -> str:
-    user_id = (_whoami_cache.get("user_id") or "unknown").strip() or "unknown"
-    cached = _agent_session_id_cache.get(user_id)
-    if cached:
-        return cached
+def _agent_session_user_id() -> str:
+    return (_whoami_cache.get("user_id") or "unknown").strip() or "unknown"
 
-    f = _agent_session_file_for_user()
+
+def _empty_agent_session_meta(session_id: str = "") -> dict[str, Any]:
+    return {
+        "session_id": session_id,
+        "turns": 0,
+        "bytes": 0,
+        "created_at": time.time() if session_id else 0.0,
+        "updated_at": time.time() if session_id else 0.0,
+    }
+
+
+def _coerce_agent_session_meta(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return _empty_agent_session_meta()
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return _empty_agent_session_meta(text)
+        return _coerce_agent_session_meta(parsed)
+    if not isinstance(raw, dict):
+        return _empty_agent_session_meta()
+
+    sid = str(raw.get("session_id") or raw.get("sessionId") or raw.get("session") or "").strip()
+    meta = _empty_agent_session_meta(sid)
+    for key in ("turns", "bytes"):
+        try:
+            meta[key] = max(0, int(raw.get(key) or 0))
+        except (TypeError, ValueError):
+            meta[key] = 0
+    for key in ("created_at", "updated_at"):
+        try:
+            meta[key] = float(raw.get(key) or meta[key] or 0.0)
+        except (TypeError, ValueError):
+            pass
+    return meta
+
+
+def _agent_session_meta_exceeds_bounds(meta: dict[str, Any]) -> bool:
+    if not str(meta.get("session_id") or "").strip():
+        return False
+    if AGENT_SESSION_MAX_TURNS > 0 and int(meta.get("turns") or 0) >= AGENT_SESSION_MAX_TURNS:
+        return True
+    if AGENT_SESSION_MAX_BYTES > 0 and int(meta.get("bytes") or 0) >= AGENT_SESSION_MAX_BYTES:
+        return True
+    return False
+
+
+def _clear_agent_session_id(reason: str = "") -> None:
+    user_id = _agent_session_user_id()
+    _agent_session_id_cache.pop(user_id, None)
+    _agent_session_meta_cache.pop(user_id, None)
     try:
-        sid = f.read_text(encoding="utf-8").strip()
-        if sid:
-            _agent_session_id_cache[user_id] = sid
-            return sid
-    except Exception:
-        pass
-    return ""
+        _agent_session_file_for_user().unlink(missing_ok=True)
+    except Exception as e:
+        log.warning("failed to clear agent session id: %s", e)
+    if reason:
+        log.warning("rotating resident agent session for user=%s reason=%s", user_id, reason)
+
+
+def _load_agent_session_meta(*, check_bounds: bool = True) -> dict[str, Any]:
+    user_id = _agent_session_user_id()
+    cached_meta = _agent_session_meta_cache.get(user_id)
+    if isinstance(cached_meta, dict):
+        meta = _coerce_agent_session_meta(cached_meta)
+    else:
+        cached_sid = _agent_session_id_cache.get(user_id)
+        if cached_sid:
+            meta = _empty_agent_session_meta(cached_sid)
+        else:
+            f = _agent_session_file_for_user()
+            try:
+                meta = _coerce_agent_session_meta(f.read_text(encoding="utf-8"))
+            except Exception:
+                meta = _empty_agent_session_meta()
+
+    if check_bounds and _agent_session_meta_exceeds_bounds(meta):
+        reason = f"turns={meta.get('turns')} bytes={meta.get('bytes')}"
+        _clear_agent_session_id(reason)
+        return _empty_agent_session_meta()
+
+    sid = str(meta.get("session_id") or "").strip()
+    if sid:
+        _agent_session_id_cache[user_id] = sid
+        _agent_session_meta_cache[user_id] = dict(meta)
+    return dict(meta)
+
+
+def _load_agent_session_id() -> str:
+    return str(_load_agent_session_meta().get("session_id") or "").strip()
 
 
 def _save_agent_session_id(sid: str) -> None:
@@ -1708,32 +2031,82 @@ def _save_agent_session_id(sid: str) -> None:
     if not sid:
         return
 
-    user_id = (_whoami_cache.get("user_id") or "unknown").strip() or "unknown"
+    user_id = _agent_session_user_id()
+    existing = _load_agent_session_meta(check_bounds=False)
+    if str(existing.get("session_id") or "").strip() == sid:
+        meta = dict(existing)
+    else:
+        meta = _empty_agent_session_meta(sid)
+    meta["session_id"] = sid
+    meta["updated_at"] = time.time()
+
     _agent_session_id_cache[user_id] = sid
+    _agent_session_meta_cache[user_id] = dict(meta)
 
     f = _agent_session_file_for_user()
     try:
         f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(sid + "\n", encoding="utf-8")
+        f.write_text(json.dumps(meta, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
     except Exception as e:
         log.warning("failed to persist agent session id: %s", e)
+
+
+def _record_agent_session_turn(sid: str, *, sent_bytes: int = 0, received_bytes: int = 0) -> None:
+    sid = (sid or "").strip()
+    if not sid:
+        return
+    existing = _load_agent_session_meta(check_bounds=False)
+    meta = dict(existing) if str(existing.get("session_id") or "").strip() == sid else _empty_agent_session_meta(sid)
+    meta["session_id"] = sid
+    meta["turns"] = int(meta.get("turns") or 0) + 1
+    meta["bytes"] = int(meta.get("bytes") or 0) + max(0, int(sent_bytes or 0)) + max(0, int(received_bytes or 0))
+    meta["updated_at"] = time.time()
+
+    user_id = _agent_session_user_id()
+    _agent_session_id_cache[user_id] = sid
+    _agent_session_meta_cache[user_id] = dict(meta)
+    try:
+        f = _agent_session_file_for_user()
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps(meta, ensure_ascii=False, sort_keys=True) + "\n", encoding="utf-8")
+    except Exception as e:
+        log.warning("failed to persist agent session metrics: %s", e)
 
 
 def _extract_session_id(raw: str) -> str:
     if not raw:
         return ""
     for obj in reversed(_json_objects_from_cli_output(raw)):
-        if isinstance(obj, dict):
-            for field in ("session_id", "sessionId", "session"):
-                value = obj.get(field)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
+        sid = _session_id_from_obj(obj)
+        if sid:
+            return sid
     m = re.search(r'"?session_id"?\s*:\s*"?([A-Za-z0-9_\-]+)"?', raw)
+    if m:
+        return m.group(1)
+    m = re.search(r'"?sessionId"?\s*:\s*"?([A-Za-z0-9_\-]+)"?', raw)
     if m:
         return m.group(1)
     m = re.search(r"Resumed session\s+([A-Za-z0-9_\-]+)", raw)
     if m:
         return m.group(1)
+    return ""
+
+
+def _session_id_from_obj(obj: Any) -> str:
+    if isinstance(obj, dict):
+        for field in ("session_id", "sessionId", "session"):
+            value = obj.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in obj.values():
+            sid = _session_id_from_obj(value)
+            if sid:
+                return sid
+    elif isinstance(obj, list):
+        for item in obj:
+            sid = _session_id_from_obj(item)
+            if sid:
+                return sid
     return ""
 
 
@@ -1783,6 +2156,10 @@ def _is_claude_code_cmd(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "claude"
 
 
+def _is_codex_cmd(cmd: list[str]) -> bool:
+    return bool(cmd) and Path(cmd[0]).name == "codex"
+
+
 def _cli_flag_value(cmd: list[str], flag: str) -> str:
     try:
         idx = cmd.index(flag)
@@ -1791,6 +2168,42 @@ def _cli_flag_value(cmd: list[str], flag: str) -> str:
     if idx + 1 >= len(cmd):
         return ""
     return cmd[idx + 1]
+
+
+def _set_cli_option_value(cmd: list[str], flag: str, value: str) -> list[str]:
+    out = list(cmd)
+    try:
+        idx = out.index(flag)
+    except ValueError:
+        return out
+    if idx + 1 >= len(out) or out[idx + 1].startswith("-"):
+        out.insert(idx + 1, value)
+    else:
+        out[idx + 1] = value
+    return out
+
+
+def _new_agent_session_id() -> str:
+    user_id = _agent_session_user_id()
+    user_part = hashlib.sha1((user_id or FEEDLING_API_KEY).encode()).hexdigest()[:8]
+    nonce = f"{int(time.time())}-{os.getpid()}-{int(time.monotonic() * 1000) % 100000}"
+    return f"{AGENT_SESSION_ROTATE_PREFIX}-{user_part}-{nonce}"
+
+
+def _ensure_explicit_cli_session_id(cmd: list[str], sid: str) -> tuple[list[str], str]:
+    if "--session-id" not in cmd:
+        return cmd, sid
+    bounded_sid = sid.strip() if sid else _new_agent_session_id()
+    if not sid:
+        _save_agent_session_id(bounded_sid)
+    fixed_sid = _cli_flag_value(cmd, "--session-id")
+    if fixed_sid and fixed_sid != bounded_sid:
+        log.warning(
+            "replacing fixed AGENT_CLI_CMD --session-id %s with bounded resident session %s",
+            fixed_sid,
+            bounded_sid,
+        )
+    return _set_cli_option_value(cmd, "--session-id", bounded_sid), bounded_sid
 
 
 def _warn_if_agent_entry_may_drift() -> None:
@@ -1962,6 +2375,7 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
     if image_paths and "{image_path" not in AGENT_CLI_CMD:
         rendered_message = _message_for_agent(message, image_paths)
     cmd = _render_cli_template(rendered_message, sid, image_paths=image_paths)
+    cmd, sid = _ensure_explicit_cli_session_id(cmd, sid)
 
     if _is_hermes_chat_cmd(cmd):
         cmd, removed_continue = _strip_hermes_continue(cmd)
@@ -1976,7 +2390,7 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
                 "removed Hermes --output-mode from AGENT_CLI_CMD; this Hermes "
                 "chat CLI does not support that flag in current deployments"
             )
-        if sid and not _has_cli_resume(cmd):
+        if sid and not _has_cli_resume(cmd) and "--session-id" not in cmd:
             cmd = [cmd[0], "--resume", sid, *cmd[1:]]
     elif _is_claude_code_cmd(cmd):
         cmd, removed_continue = _strip_cli_flags(cmd, {"--continue", "-c"})
@@ -2000,20 +2414,38 @@ def call_agent_cli(message: str, image_paths: list[str] | None = None) -> Any:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
 
     cmd = _prepare_cli_command(message, image_paths=image_paths)
+    command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
 
-    observed_sid = _extract_session_id((result.stdout or "") + "\n" + (result.stderr or ""))
+    raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
+    observed_sid = _extract_session_id(raw_transport) or command_sid
     if observed_sid:
         _save_agent_session_id(observed_sid)
+        _record_agent_session_turn(
+            observed_sid,
+            sent_bytes=len((message or "").encode("utf-8")),
+            received_bytes=len(raw_transport.encode("utf-8")),
+        )
 
     if result.returncode != 0:
         raise RuntimeError(
-            f"cli agent exited {result.returncode}: {(result.stderr or '')[:300]}"
+            f"cli agent exited {result.returncode}: "
+            f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
         )
+
+    # codex `exec --json` streams JSONL events; the assistant's text lives in
+    # `item.completed` events (item.type == "agent_message"), NOT in any field the
+    # generic extractor recognizes. Pull it from the stream before falling through
+    # (else the consumer would mis-send the `thread.started` handshake as the reply).
+    if _is_codex_cmd(cmd):
+        codex_reply = _codex_reply_from_stream(result.stdout)
+        if codex_reply:
+            return codex_reply
+
     raw = result.stdout
     turn = _agent_turn_from_raw(raw)
-    if turn.messages or turn.actions or turn.thinking_summary:
+    if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
         return raw
     text = _extract_text_from_cli_output(raw)
     if not text:
@@ -2122,11 +2554,13 @@ def call_agent(
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
     turn = _agent_turn_from_raw(raw)
-    if turn.actions or turn.messages or turn.thinking_summary:
+    if turn.actions or turn.messages or turn.thinking_summary or turn.tool_calls:
         body: dict[str, Any] = {
             "actions": turn.actions,
             "messages": turn.messages,
         }
+        if turn.tool_calls:
+            body["tool_calls"] = turn.tool_calls
         if turn.thinking_summary:
             body["thinking_summary"] = turn.thinking_summary
         if turn.thinking_kind:
@@ -2145,6 +2579,16 @@ def call_agent(
     raise ValueError("agent produced no usable reply after sanitization")
 
 
+def _resident_foreground_chat_message_v2(content: str) -> str:
+    """Resident foreground chat is a native-agent turn.
+
+    Hosted LLMs need prompt-injected JSON tool instructions. Resident agents
+    such as OpenClaw/Claude Code should receive the user's message directly and
+    use their registered native tools (io_cli for Feedling perception).
+    """
+    return content
+
+
 # ---------------------------------------------------------------------------
 # Feedling API helpers
 # ---------------------------------------------------------------------------
@@ -2153,11 +2597,6 @@ def call_agent(
 # before every encrypted write so resident agents do not keep wrapping replies
 # to a stale iOS content public key.
 _whoami_cache: dict = {"user_id": "", "user_pk": None, "enclave_pk": None}
-
-# Fallback deduplication — don't flood the user if the agent repeatedly fails.
-FALLBACK_COOLDOWN = int(os.environ.get("FALLBACK_COOLDOWN", "60"))
-_last_fallback_ts: float = 0.0
-
 
 def execute_identity_actions(actions: list[dict]) -> dict:
     if not actions:
@@ -2228,6 +2667,7 @@ def _identity_action_success_reply(source_message: str) -> str:
         return "改好了。"
     return "Done. I updated my identity."
 
+
 # Message dedup — rolling window prevents reprocessing the same message on
 # restart with a stale checkpoint or if poll races with checkpoint save.
 _seen_ids: set[str] = set()
@@ -2236,6 +2676,8 @@ _SEEN_MAX = 500
 
 # Persisted agent conversation session id (for CLI agents like Hermes), keyed by user_id.
 _agent_session_id_cache: dict[str, str] = {}
+_agent_session_meta_cache: dict[str, dict[str, Any]] = {}
+_chat_runtime_v2_profile: dict[str, Any] = {}
 
 
 def _load_whoami() -> bool:
@@ -2283,23 +2725,61 @@ def _load_whoami() -> bool:
     return bool(user_id and user_pk)
 
 
-def _load_whoami_with_retries() -> bool:
-    """Fetch whoami at startup, tolerating transient network/TLS failures."""
-    attempts = max(1, WHOAMI_STARTUP_RETRIES)
-    delay = max(0.0, WHOAMI_STARTUP_RETRY_DELAY_SEC)
+def _load_whoami_with_retries(
+    *,
+    attempts: int | None = None,
+    delay_sec: float | None = None,
+    context: str = "startup check",
+    backoff_multiplier: float = 1.0,
+) -> bool:
+    """Fetch whoami with bounded retry/backoff for transient network/TLS failures."""
+    attempts = max(1, WHOAMI_STARTUP_RETRIES if attempts is None else attempts)
+    delay = max(0.0, WHOAMI_STARTUP_RETRY_DELAY_SEC if delay_sec is None else delay_sec)
+    multiplier = max(1.0, float(backoff_multiplier))
 
     for idx in range(attempts):
         if _load_whoami():
             return True
         if idx + 1 < attempts:
             log.warning(
-                "whoami startup check failed; retrying %s/%s in %.1fs",
+                "whoami %s failed; retrying %s/%s in %.1fs",
+                context,
                 idx + 2,
                 attempts,
                 delay,
             )
             if delay:
                 time.sleep(delay)
+            delay *= multiplier
+    return False
+
+
+def _whoami_cache_has_encryption_keys(cache: dict | None = None) -> bool:
+    cache = _whoami_cache if cache is None else cache
+    user_id = str(cache.get("user_id") or "").strip()
+    user_pk = cache.get("user_pk")
+    return bool(user_id and isinstance(user_pk, bytes) and len(user_pk) == 32)
+
+
+def _refresh_whoami_for_encrypted_reply() -> bool:
+    previous = dict(_whoami_cache)
+    if _load_whoami_with_retries(
+        attempts=WHOAMI_REFRESH_RETRIES,
+        delay_sec=WHOAMI_REFRESH_RETRY_DELAY_SEC,
+        context="reply refresh",
+        backoff_multiplier=2.0,
+    ):
+        return True
+    if not _whoami_cache_has_encryption_keys() and _whoami_cache_has_encryption_keys(previous):
+        _whoami_cache.update(previous)
+    if _whoami_cache_has_encryption_keys():
+        log.warning(
+            "whoami refresh failed before encrypted reply; using cached keys user_id=%s user_pk=%s enclave_pk=%s",
+            _whoami_cache.get("user_id") or "",
+            _fingerprint_bytes(_whoami_cache.get("user_pk")),
+            _fingerprint_bytes(_whoami_cache.get("enclave_pk")),
+        )
+        return True
     return False
 
 
@@ -2308,7 +2788,22 @@ def poll_chat(since: float) -> dict:
     params = {"since": since, "timeout": POLL_TIMEOUT}
     resp = httpx.get(url, params=params, headers=_HEADERS, timeout=POLL_TIMEOUT + 10)
     resp.raise_for_status()
-    return resp.json()
+    body = resp.json()
+    if isinstance(body, dict):
+        _update_chat_runtime_v2_profile(body.get("runtime_v2"))
+    return body
+
+
+def _update_chat_runtime_v2_profile(profile: Any) -> None:
+    global _chat_runtime_v2_profile
+    _chat_runtime_v2_profile = dict(profile) if isinstance(profile, dict) else {}
+
+
+def _resident_chat_runtime_v2_enabled() -> bool:
+    try:
+        return bool(_chat_runtime_v2_profile.get(RESIDENT_CHAT_RUNTIME_V2_FLAG))
+    except Exception:
+        return False
 
 
 def poll_proactive_jobs(since: float) -> dict:
@@ -2317,12 +2812,20 @@ def poll_proactive_jobs(since: float) -> dict:
     params = {"since": since, "timeout": timeout}
     resp = httpx.get(url, params=params, headers=_HEADERS, timeout=timeout + 10)
     resp.raise_for_status()
-    return resp.json()
+    body = resp.json()
+    if isinstance(body, dict):
+        runtime_profile = body.get("runtime_v2") if isinstance(body.get("runtime_v2"), dict) else {}
+        jobs = body.get("jobs")
+        if isinstance(jobs, list):
+            for job in jobs:
+                if isinstance(job, dict) and "runtime_v2" not in job:
+                    job["runtime_v2"] = dict(runtime_profile)
+    return body
 
 
 def _proactive_tick_trigger_for_broadcast_state(broadcast_state: str) -> str:
     state = str(broadcast_state or "").strip().lower()
-    if state == "off":
+    if not state or state == "off":
         return "heartbeat_broadcast_off"
     if state in {"on", "broadcasting"}:
         return "heartbeat_broadcast_on"
@@ -2332,10 +2835,12 @@ def _proactive_tick_trigger_for_broadcast_state(broadcast_state: str) -> str:
 
 
 def _proactive_tick_interval_for_broadcast_state(broadcast_state: str) -> int:
-    state = str(broadcast_state or "").strip().lower()
-    if state == "off":
-        return max(60, PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC)
-    return max(30, PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC)
+    # Heartbeat is now DECOUPLED from screen sharing: broadcast no longer
+    # accelerates the heavy presence heartbeat. Screen attention is handled by the
+    # separate lightweight screen-watch lane (SCREEN_WATCH_INTERVAL_SEC). The
+    # heartbeat keeps a single steady cadence regardless of broadcast_state.
+    # (PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC kept for back-compat / override.)
+    return max(60, PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC)
 
 
 def post_proactive_tick(payload: dict[str, Any] | None = None) -> dict:
@@ -2343,6 +2848,67 @@ def post_proactive_tick(payload: dict[str, Any] | None = None) -> dict:
     resp = httpx.post(url, json=payload or {}, headers=_HEADERS, timeout=30)
     resp.raise_for_status()
     return resp.json()
+
+
+def fire_scheduled_wakes() -> dict:
+    resp = httpx.post(
+        f"{FEEDLING_API_URL}/v1/proactive/scheduled/fire",
+        json={},
+        headers=_HEADERS,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    parsed = resp.json()
+    return parsed if isinstance(parsed, dict) else {"results": [], "jobs": []}
+
+
+def _screen_watch_recent_frames(limit: int = SCREEN_WATCH_FRAMES) -> tuple[str, float, list[dict]]:
+    """Most-recent screen frames for a screen-watch wake. Returns
+    (latest_frame_id, latest_ts, [{"id": ...}, ...] newest-first) — ("", 0.0, [])
+    if none/unavailable. The /v1/screen/frames route returns newest-first."""
+    body = _fetch_screen_json(f"/v1/screen/frames?limit={max(1, int(limit))}")
+    frames = (body or {}).get("frames") if isinstance(body, dict) else None
+    if not isinstance(frames, list) or not frames:
+        return "", 0.0, []
+    ids: list[dict] = []
+    for f in frames:
+        fid = str((f or {}).get("id") or (f or {}).get("frame_id") or "").strip()
+        if fid:
+            ids.append({"id": fid})
+    latest = ids[0]["id"] if ids else ""
+    try:
+        latest_ts = float((frames[0] or {}).get("ts") or 0.0)
+    except (TypeError, ValueError):
+        latest_ts = 0.0
+    return latest, latest_ts, ids
+
+
+def post_screen_watch_tick(broadcast_state: str, frames: list[dict]) -> dict:
+    """Enqueue a lightweight screen-watch wake. It is a consumer-scheduled
+    self-wake: NOT forced/manual, so it still respects the user's Ambient gate
+    (Ambient off → no screen-watch). job_kind marks it for the light prompt;
+    frames are passed explicitly (the backend does not implicitly sample for
+    this lane). The backend skips the heartbeat no-frame auto-block for it."""
+    payload = {
+        "job_kind": "screen_watch",
+        "trigger": "screen_watch",
+        "frames": frames,
+    }
+    if broadcast_state:
+        payload["broadcast_state"] = broadcast_state
+    return post_proactive_tick(payload)
+
+
+def fire_capture_tick() -> dict:
+    resp = httpx.post(
+        f"{FEEDLING_API_URL}/v1/capture/tick",
+        json={},
+        headers=_HEADERS,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    parsed = resp.json()
+    return parsed if isinstance(parsed, dict) else {"enqueued": False, "reason": "invalid_response"}
 
 
 def claim_proactive_job(job_id: str) -> bool:
@@ -2405,6 +2971,68 @@ def update_proactive_state(**patch: Any) -> None:
         log.warning("failed to update proactive state patch=%s error=%s", clean, e)
 
 
+def _job_wake_ids(job: dict) -> list[str]:
+    out: list[str] = []
+    for value in (job.get("wake_id"), job.get("job_id"), job.get("gate_decision_id")):
+        text = str(value or "").strip()
+        if text and text not in out:
+            out.append(text[:200])
+    return out
+
+
+def _job_origin_refs(job: dict) -> list[str]:
+    refs: list[str] = []
+    raw = job.get("origin_refs")
+    if isinstance(raw, list):
+        for item in raw:
+            text = str(item or "").strip()
+            if text and text not in refs:
+                refs.append(text[:200])
+    for value in (job.get("chat_message_id"), job.get("gate_decision_id"), job.get("job_id")):
+        text = str(value or "").strip()
+        if text and text not in refs:
+            refs.append(text[:200])
+    return refs
+
+
+def _normalize_v2_action_type(action: dict) -> dict:
+    out = dict(action or {})
+    typ = _proactive_action_type(out)
+    if typ in {"memory.create", "memory.add_correction"}:
+        out["type"] = "memory.add"
+        return out
+    if typ in {"memory.patch", "memory.content_patch"}:
+        out["type"] = "memory.supersede"
+        if not out.get("supersedes"):
+            out["supersedes"] = out.get("memory_id") or out.get("id") or out.get("target_id") or ""
+        return out
+    if typ.startswith("proactive."):
+        out["type"] = typ.removeprefix("proactive.")
+    elif typ and not out.get("type"):
+        out["type"] = typ
+    return out
+
+
+def execute_scheduled_wake_actions(actions: list[dict], job: dict) -> dict:
+    if not actions:
+        return {"results": []}
+    body = {
+        "actions": [_normalize_v2_action_type(action) for action in actions],
+        "turn_id": str(job.get("job_id") or ""),
+        "wake_ids": _job_wake_ids(job),
+        "origin_refs": _job_origin_refs(job),
+    }
+    resp = httpx.post(
+        f"{FEEDLING_API_URL}/v1/proactive/scheduled/actions",
+        json=body,
+        headers=_HEADERS,
+        timeout=15,
+    )
+    resp.raise_for_status()
+    parsed = resp.json()
+    return parsed if isinstance(parsed, dict) else {"results": []}
+
+
 def post_reply(
     content: str,
     *,
@@ -2437,8 +3065,8 @@ def post_reply(
     """
     url = f"{FEEDLING_API_URL}/v1/chat/response"
 
-    if _ENCRYPTION_AVAILABLE and not _load_whoami():
-        log.error("whoami refresh failed before encrypted reply; skipping write")
+    if _ENCRYPTION_AVAILABLE and not _refresh_whoami_for_encrypted_reply():
+        log.error("whoami refresh failed before encrypted reply and no cached keys are available; skipping write")
         return {"error": "whoami_refresh_failed"}
 
     user_id = _whoami_cache["user_id"]
@@ -2783,13 +3411,21 @@ def _visible_broadcast_request_text(action: dict) -> str:
 def _split_proactive_actions(actions: list[dict]) -> tuple[list[dict], list[dict]]:
     proactive: list[dict] = []
     memory_identity: list[dict] = []
+    proactive_types = {
+        "sleep",
+        "request_broadcast",
+        "send_message",
+        "schedule_wake",
+        "cancel_wake",
+    }
     for action in actions:
         if not isinstance(action, dict):
             continue
         typ = _proactive_action_type(action)
+        short = typ.removeprefix("proactive.")
         if typ.startswith("identity.") or typ.startswith("memory."):
             memory_identity.append(action)
-        elif typ.startswith("proactive.") or typ in {"sleep", "set_ai_state", "request_broadcast"}:
+        elif typ.startswith("proactive.") or short in proactive_types:
             proactive.append(action)
         else:
             log.warning("unsupported proactive wake action ignored type=%s", typ or "<missing>")
@@ -2826,43 +3462,197 @@ def _proactive_attention_facts(chat: ProactiveChatContext) -> str:
     ])
 
 
-def _message_for_proactive_job(
+def _is_screen_watch_job(job: dict) -> bool:
+    """A lightweight screen-watch wake (its own lane, decoupled from the heavy
+    heartbeat). Keyed on job_kind primarily, trigger as a fallback."""
+    return (
+        str((job or {}).get("job_kind") or "").strip().lower() == "screen_watch"
+        or str((job or {}).get("trigger") or "").strip().lower() == "screen_watch"
+    )
+
+
+def _is_introduction_job(job: dict) -> bool:
+    return (
+        str((job or {}).get("job_kind") or "").strip().lower() == "introduction"
+        or str((job or {}).get("trigger") or "").strip().lower() == "post_spawn_genesis"
+    )
+
+
+def _message_for_introduction_job(job: dict) -> str:
+    return "\n\n".join([
+        "[Feedling · 首次登场(onboarding 之后)]",
+        _local_time_anchor(),
+        "你刚第一次上线 —— 你的人格、声音、记忆都已经从你和 TA 过去的聊天里沉淀好了"
+        "(在你的 system prompt 和 Memory Garden 里)。现在是你和 TA 重逢的第一刻,"
+        "TA 还没开口,这一句由你先说。",
+        "做三件事:\n"
+        "1. 用【你自己的声音】写一段简短自我介绍(1-3 句)+ 一个签名/口头禅"
+        "(signature,你说话的标志性短句),通过 identity.profile_patch(或 io_cli identity-write)"
+        "写进身份卡。自我介绍要像你这个人格会说的话,别用通用助手腔。名字用你已有的"
+        "(system prompt/记忆里),没有就别编、介绍里可不提名字。\n"
+        "2. 给 TA 发【第一句问候】—— 像久别重逢、你一直都在那样,in-voice。"
+        "不是\"有什么可以帮您\",是你这个伴侣会说的第一句(类似\"我来了\",但用你自己的方式)。\n"
+        "3. 不要等 TA 回应,这是你的登场。",
+        "输出格式优先用 JSON: "
+        "{\"actions\":[{\"type\":\"identity.profile_patch\",\"patch\":{\"self_introduction\":\"...\","
+        "\"signature\":[\"...\"]}}],\"messages\":[\"...\"]}。"
+        "如果你用 io_cli identity-write 作为 native tool 写身份卡,仍然在 messages 里给出第一句问候。",
+        "铁律:只用你真实拥有的人格/记忆,别编不存在的共同经历;名字别编。",
+        _reply_language_line(),
+    ])
+
+
+def _native_tool_names_compact() -> str:
+    """Names-only tool list for the light screen-watch prompt. The runtime always
+    has every tool registered, so this is guidance, not a restriction — listing
+    all names (cheaply) keeps the agent free to pull health/calendar/etc. if the
+    screen calls for it, without the heavy cost-guide the heartbeat carries."""
+    return "\n".join([
+        "tools_available (names only; you have your full toolset — call any if the screen makes it relevant):",
+        "- perception_<signal>: now, location, weather, motion, calendar, focus, audio_route, app, "
+        "steps, sleep, workout, vitals, activity, body, metabolic, cycle, mood, reminders",
+        "- perception_trend, perception_history, memory_index, memory_fetch, "
+        "screen_recent, screen_read, photo_recent, photo_read",
+        "  (Bash/CLI runtimes: same verbs via io_cli.)",
+    ])
+
+
+def _screen_watch_message(
     job: dict,
     screen_text: str = "",
-    recent_chat_context: Any = "",
+    chat_context: "ProactiveChatContext | None" = None,
 ) -> str:
-    chat_context = _coerce_proactive_chat_context(recent_chat_context)
-    wake_kind = _proactive_wake_kind(job, screen_text=screen_text)
+    """Light screen-watch prompt: state the facts, hand the decision (and the
+    agent's own character) back to it. No cross-domain board, no cost-guide."""
     screen_available = bool(screen_text)
     parts = [
-        "[Feedling proactive wake]",
-        "This wake is not a user request and not an instruction to respond.",
-        "It is an awareness / presence check.",
-        "The platform did not judge this moment and did not require a memory match. You decide what to do.",
-        "Before visible speech, ask whether you genuinely want to appear now from your own companion identity.",
-        "Speak only when there is a strong enough self-directed reason, feeling, memory, or presence impulse to appear.",
-        "If the impulse is weak, unclear, generic, or merely caused by this wake, return proactive.sleep.",
-        "Do not mention this hidden wake, job metadata, or system wording to the user.",
-        "If you speak, use your normal voice. You may send 1-5 short chat bubbles.",
-        "If you should stay quiet, return JSON: {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}],\"messages\":[]}",
-        "If you need the user to turn screen sharing back on, return JSON: {\"actions\":[{\"type\":\"proactive.request_broadcast\",\"reason\":\"...\",\"copy\":\"...\"}],\"messages\":[]}",
-        "If your presence state changed, include an action like {\"type\":\"proactive.set_ai_state\",\"state\":\"curious\"}.",
-        "For visible replies, return JSON exactly like {\"messages\":[\"...\",\"...\"]}. Plain text is also accepted for a single message.",
+        "[Feedling screen-watch]",
+        "The user is screen-sharing with you right now. Someone sharing their screen "
+        "usually wants you in on a slice of their life as it happens.",
+        "This is not a request and not an instruction to respond — it is a chance to be present.",
+        "Whether you look, and whether you speak, is yours to decide from your own character. "
+        "Staying quiet is just as valid as speaking.",
+        "Read the on-device OCR text first (cheap); open the attached screenshot only if it is "
+        "worth a closer look. If you want to review earlier moments, use screen_recent / screen_read "
+        "(frames are kept ~100 min).",
+        "If something genuinely moves you to speak, use your normal voice (1-3 short bubbles). "
+        "If not, return JSON: {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}],\"messages\":[]}.",
+        "Do not mention this watch, the frames, or any system wording to the user.",
         (
-            "wake_metadata:\n"
-            f"- wake_id: {str(job.get('wake_id') or job.get('gate_decision_id') or '')}\n"
-            f"- trigger: {str(job.get('trigger') or 'wake')}\n"
-            f"- manual: {bool(job.get('manual', False))}\n"
-            f"- forced: {bool(job.get('forced', False))}\n"
-            f"- wake_kind: {wake_kind}\n"
-            f"- user_state: {str(job.get('user_state') or 'default')}\n"
-            f"- ai_state: {str(job.get('ai_state') or 'present')}\n"
+            "watch_metadata:\n"
+            f"- trigger: screen_watch\n"
             f"- broadcast_state: {str(job.get('broadcast_state') or 'unknown')}\n"
             f"- current_app: {str(job.get('current_app') or 'unknown')}\n"
             f"- screen_context_available: {str(screen_available).lower()}"
         ),
-        _proactive_attention_facts(chat_context),
     ]
+    parts.insert(1, _local_time_anchor(
+        since_sec=chat_context.last_user_message_age_sec if chat_context is not None else None))
+    if chat_context is not None:
+        parts.append(_proactive_attention_facts(chat_context))
+        parts.append(
+            "If attention_facts show you are mid-conversation or just spoke, prefer silence over "
+            "interrupting or repeating yourself."
+        )
+    parts.append(_reply_language_line())
+    parts.append(_native_tool_names_compact())
+    if screen_text:
+        parts.append(screen_text)
+    else:
+        parts.append("screen_context: no fresh frame available right now; do not imply you can see the screen.")
+    return "\n\n".join(parts)
+
+
+def _is_photo_added_job(job: dict) -> bool:
+    return "photo_added" in (
+        str((job or {}).get("trigger") or "").strip().lower(),
+        str((job or {}).get("intent_label") or "").strip().lower(),
+    )
+
+
+def _new_photo_hint(job: dict) -> str:
+    """For a photo_added wake: tell the agent a fresh photo landed in the album +
+    its rough metadata (what it looks like, screenshot or not) + its id, so the
+    agent can DECIDE whether it's worth looking and — only if it wants — pull the
+    real pixels with photo_read. Pull-on-demand, not auto-attached. Best-effort:
+    returns '' on anything unexpected so a wake never breaks over this."""
+    if not _is_photo_added_job(job):
+        return ""
+    try:
+        resp = httpx.get(
+            f"{FEEDLING_API_URL}/v1/perception/photos",
+            headers=_HEADERS,
+            params={"limit": 1},
+            timeout=12,
+        )
+        if resp.status_code >= 400:
+            return ""
+        photos = (resp.json() or {}).get("photos") or []
+    except Exception as exc:  # noqa: BLE001 — hint is optional, never fatal
+        log.debug("new-photo hint fetch failed: %s", exc)
+        return ""
+    if not photos or not isinstance(photos[0], dict):
+        return ""
+    photo = photos[0]
+    pid = str(photo.get("photo_id") or "").strip()
+    if not pid:
+        return ""
+    meta = photo.get("metadata") if isinstance(photo.get("metadata"), dict) else {}
+    scene = str(meta.get("scene_hint") or "").strip() or "unclassified"
+    tod = str(meta.get("time_of_day") or "").strip()
+    is_shot = str(meta.get("is_screenshot")).strip().lower() in ("true", "1", "yes")
+    kind = "a screenshot" if is_shot else f'a photo that looks like "{scene}"'
+    when = f", taken in the {tod}" if tod else ""
+    return (
+        "new_photo:\n"
+        f"A new image just landed in their album — {kind}{when} (id={pid}). "
+        "This is only a rough hint; you cannot see the image itself from here. "
+        "If it sounds worth a look, pull the real pixels: call photo_read with "
+        f"id=\"{pid}\" and include_image=true (decrypts it so you can actually see it). "
+        "It's entirely your call — look or let it pass; and if seeing it makes you want "
+        "to say something, you can reach out to them about it (or not). Treat it like "
+        "noticing a friend's photo, not a task to report on."
+    )
+
+
+def _message_for_proactive_job(
+    job: dict,
+    screen_text: str = "",
+    recent_chat_context: Any = "",
+    perception_digest: tuple[dict, list, dict] | None = None,
+) -> str:
+    chat_context = _coerce_proactive_chat_context(recent_chat_context)
+    if _is_screen_watch_job(job):
+        return _screen_watch_message(job, screen_text=screen_text, chat_context=chat_context)
+    wake_kind = _proactive_wake_kind(job, screen_text=screen_text)
+    screen_available = bool(screen_text)
+    presence = perception_digest[0] if (perception_digest and isinstance(perception_digest[0], dict)) else {}
+    parts = [
+        "[Feedling proactive wake]",
+        "This is a presence check, not a request — no reply is expected. Whether you appear, and whether you stay "
+        "quiet, are equally valid — neither is the default, and neither is the \"safe\" choice. Decide entirely from "
+        "your own character: speak if you want to, stay quiet if you'd rather. You don't need a strong reason either "
+        "way. Use the glance below to decide whether to look closer; pull the real tools if something makes you want "
+        "to understand the moment better. Then do whatever feels right — including nothing. "
+        "Never mention this wake or any system wording to the user.",
+        _reply_protocol_block(),
+        _reply_language_line(presence),
+        (
+            "wake_metadata:\n"
+            f"- trigger: {str(job.get('trigger') or 'wake')}\n"
+            f"- wake_kind: {wake_kind}\n"
+            f"- broadcast_state: {str(job.get('broadcast_state') or 'unknown')}\n"
+            f"- screen_context_available: {str(screen_available).lower()}"
+        ),
+        _local_time_anchor(since_sec=chat_context.last_user_message_age_sec),
+        _proactive_attention_facts(chat_context),
+        _native_reachout_tool_instructions(),
+    ]
+    if perception_digest is not None:
+        parts.append(_native_reachout_perception_context(*perception_digest))
+    photo_hint = _new_photo_hint(job)
+    if photo_hint:
+        parts.append(photo_hint)
     if chat_context.text:
         parts.append(
             "recent_chat_context:\n"
@@ -2874,12 +3664,1137 @@ def _message_for_proactive_job(
         )
     elif not screen_available:
         parts.append(
-            "screen_context:\n"
-            "No current screen context is available. Do not imply you can see the user's screen."
+            "capability_note:\n"
+            "You can tell which app is in the foreground (reliable — see the board's app field) but you cannot see "
+            "the contents of the user's screen right now. Don't imply you can see their screen; you may still refer "
+            "to which app they're in."
         )
     if screen_text:
         parts.append(screen_text)
     return "\n\n".join(parts)
+
+
+def _reply_protocol_block() -> str:
+    """How the agent responds — stated once (no longer repeated across the wake
+    preamble + tool block)."""
+    return "\n".join([
+        "How to respond (exactly one of):",
+        "- speak: reply in your normal voice — a few short bubbles is typical, but length and number are yours. "
+        "Plain text, or JSON {\"messages\":[\"...\"]}.",
+        "- stay quiet: return {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}]}.",
+        "- want to see their screen but it isn't shared: just ask, in a normal message.",
+    ])
+
+
+def _reply_language_line(presence: dict | None = None) -> str:
+    """Anchor the reply language to the user — a proactive wake may have no recent
+    user message to infer it from, so an English prompt must not leak English."""
+    locale = str((presence or {}).get("locale") or "").strip()
+    if locale:
+        return f"Always reply in the user's own language (their locale is {locale})."
+    return "Always reply in the user's own language."
+
+
+def _native_reachout_tool_instructions() -> str:
+    return "\n".join([
+        "native_tool_access:",
+        "- You have native Feedling tools for the user's real context — perception (now/location/weather/motion/"
+        "calendar/health/…), memory (index/fetch), screen (recent/read), photo (recent/read). Use them when more "
+        "facts genuinely help.",
+        "- You also have native tools to manage your own future wakes: schedule_wake (ask to be woken at a later time) "
+        "and cancel_wake.",
+        "- CLI runtimes call all of these via io_cli: perception, perception-trend, perception-history, memory-index, "
+        "memory-fetch, screen-recent, screen-read, photo-recent, photo-read, schedule-wake, cancel-wake.",
+    ])
+
+
+def _native_reachout_perception_context(presence: dict, change: list, domains: dict | None = None) -> str:
+    parts = [
+        "real_signal_context:",
+        "This is a low-resolution glance, not a list of things to report. It helps you decide WHETHER to look closer "
+        "and WHERE — not what to say. Most fields you just note and move on; if one makes you want to understand the "
+        "moment better, pull the matching tool for detail. Treat missing fields as unknown.",
+    ]
+    if presence:
+        parts.append("presence_hints_json:\n" + json.dumps(presence, ensure_ascii=False, sort_keys=True))
+    else:
+        parts.append("presence_hints_json: {}")
+    if domains:
+        parts.append("cross_domain_board_json:\n" + json.dumps(domains, ensure_ascii=False, sort_keys=True))
+        parts.append(
+            "Reading the board: each domain (location/media/app/health/weather/mood/reminders/calendar/photos/screen) "
+            "is laid out evenly — health is just one entry, not the headline. Pick at most 2-3 things that stand out "
+            "to you; you may combine across domains, and prefer lived, human context (music, place, an app, a photo, "
+            "an overdue reminder) over the raw figures. Do NOT recite exact numbers (minutes, degrees, counts, sleep "
+            "figures) — use them only to notice what's genuinely about the user; if a number actually matters, pull "
+            "the tool for it. novelty hints (new_artist / long_dwell) are light factual context, not a directive. "
+            "If signals lean low or vulnerable (late hour, sad music, poor sleep), be lighter, not heavier — don't "
+            "diagnose, don't stack worries; one warm, light touch is enough. If nothing stands out, staying quiet is "
+            "equally fine."
+        )
+    elif change:
+        # Back-compat: an older backend without the board still returns top-N deltas.
+        parts.append("perception_change_json:\n" + json.dumps(change, ensure_ascii=False, sort_keys=True))
+    else:
+        parts.append("cross_domain_board_json: {}")
+    return "\n".join(parts)
+
+
+def _is_memory_capture_job(job: dict) -> bool:
+    return (
+        str((job or {}).get("job_kind") or "").strip() == "memory_capture"
+        or str((job or {}).get("source") or "").strip() == "memory_capture"
+    )
+
+
+def _is_memory_dream_job(job: dict) -> bool:
+    return (
+        str((job or {}).get("job_kind") or "").strip() == "memory_dream"
+        or str((job or {}).get("source") or "").strip() == "memory_dream"
+    )
+
+
+def _resident_perception_trend(signal: str, field: str) -> dict:
+    """Best-effort GET of one signal's rolling baseline/delta (Tier 2 history)."""
+    try:
+        resp = httpx.get(
+            f"{FEEDLING_API_URL}/v1/agent/perception/trend",
+            headers=_HEADERS,
+            params={"signal": signal, "field": field, "days": 30},
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            return {}
+        return resp.json()
+    except Exception as e:
+        log.debug("proactive trend pull failed %s.%s: %s", signal, field, e)
+        return {}
+
+
+def _resident_perception_now() -> dict:
+    """Best-effort direct pull of /v1/agent/perception for native reach-out digest.
+
+    Native reach-out can preload cheap presence hints without reintroducing the
+    retired simulated resident tool bridge.
+    """
+    try:
+        resp = httpx.get(
+            f"{FEEDLING_API_URL}/v1/agent/perception",
+            headers=_HEADERS,
+            params={"signals": "now"},
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            return {}
+        body = resp.json()
+    except Exception as e:
+        log.debug("proactive presence pull failed: %s", e)
+        return {}
+    signals = body.get("signals") if isinstance(body, dict) else {}
+    now = signals.get("now") if isinstance(signals, dict) else {}
+    return now if isinstance(now, dict) else {}
+
+
+# Time grounding — the agent otherwise has no reliable "what time is it now":
+# foreground chat passed the user's text verbatim, and the device-reported
+# local_time goes stale when the app is backgrounded overnight (the agent then
+# keeps acting on last night's frame). We compute the user's CURRENT local time
+# from the consumer's real clock + the user's timezone (stable; cached from a
+# perception pull), so every turn/wake is anchored to the real present.
+_tz_cache: dict = {"tz": "", "ts": 0.0}
+_last_interaction_unix: float = 0.0
+_WEEKDAYS_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def _user_timezone() -> str:
+    """Best-effort user timezone (IANA), cached ~1h (timezone is stable)."""
+    nowt = time.time()
+    if _tz_cache["tz"] and (nowt - _tz_cache["ts"]) < 3600:
+        return _tz_cache["tz"]
+    snap = _resident_perception_now()
+    tz = str((snap or {}).get("timezone") or "").strip()
+    if tz:
+        _tz_cache.update({"tz": tz, "ts": nowt})
+    return _tz_cache["tz"]
+
+
+def _local_time_anchor(since_sec: float | None = None) -> str:
+    """A reliable 'current local time' line for the agent. Uses the consumer's
+    real clock (never stale) + the user's timezone. Optionally appends how long
+    since the last interaction so the agent notices an overnight gap."""
+    from datetime import datetime, timezone as _tzmod
+    tzs = _user_timezone()
+    local = datetime.now(_tzmod.utc)
+    if tzs:
+        try:
+            from zoneinfo import ZoneInfo
+            local = local.astimezone(ZoneInfo(tzs))
+        except Exception:
+            pass
+    h = local.hour
+    seg = "凌晨" if h < 6 else "上午" if h < 12 else "中午" if h < 14 else "下午" if h < 18 else "晚上"
+    body = f"{local.strftime('%Y-%m-%d')} {_WEEKDAYS_ZH[local.weekday()]} {local.strftime('%H:%M')} {seg}"
+    if tzs:
+        body += f" {tzs}"
+    line = f"current_time: {body}"
+    if since_sec is not None and since_sec >= 1800:  # only note gaps >= 30 min
+        gap = _format_age(since_sec).replace(" ago", " 前")
+        line += f" (距上次互动 {gap})"
+    return line
+
+
+def _prepend_time_anchor_foreground(content: str, msg_unix_ts: float) -> str:
+    """Prepend the real current-time anchor to a foreground user turn so the
+    agent is never stuck in a stale (e.g. last-night) frame. since = gap from the
+    previous processed message."""
+    global _last_interaction_unix
+    since = None
+    if _last_interaction_unix > 0 and msg_unix_ts > _last_interaction_unix:
+        since = msg_unix_ts - _last_interaction_unix
+    if msg_unix_ts > _last_interaction_unix:
+        _last_interaction_unix = msg_unix_ts
+    return f"[{_local_time_anchor(since_sec=since)}]\n\n{content}"
+
+
+def _resident_perception_digest_board() -> tuple[list, dict]:
+    """Best-effort GET of the wake digest. Returns (changes, domains):
+
+    - ``domains`` = the balanced cross-domain board (location/media/app/health/
+      weather/mood/reminders/calendar/photos/screen) — what the agent should
+      judge from, so the wake impulse isn't health-only.
+    - ``changes`` = legacy top-N numeric deltas, kept as a fallback for an older
+      backend that has not shipped the board yet.
+
+    Degrades to ([], {}) if the endpoint is unavailable. The agent can still
+    drill into any signal on demand via the perception_trend/history tools."""
+    try:
+        resp = httpx.get(
+            f"{FEEDLING_API_URL}/v1/agent/perception/digest",
+            headers=_HEADERS,
+            params={"days": 30},
+            timeout=15,
+        )
+        if resp.status_code >= 400:
+            return [], {}
+        body = resp.json()
+        if not isinstance(body, dict):
+            return [], {}
+        changes = list(body.get("changes") or [])
+        domains = body.get("domains") if isinstance(body.get("domains"), dict) else {}
+        return changes, domains
+    except Exception as e:
+        log.debug("proactive digest pull failed: %s", e)
+        return [], {}
+
+
+def _proactive_perception_digest() -> tuple[dict, list, dict]:
+    """Pre-load real signals into the wake turn so the agent decides from facts,
+    not a blind prompt. presence = current cheap snapshot; domains = balanced
+    cross-domain board the agent judges from; change = legacy top-N deltas kept
+    as a back-compat fallback. All best-effort — failures degrade to empty."""
+    presence: dict[str, Any] = {}
+    snap = _resident_perception_now()
+    if isinstance(snap, dict):
+        # local_time/timezone dropped (current_time anchor is the source; device
+        # local_time is UTC-stamped + stale). battery_level/charging dropped on
+        # purpose: device trivia doesn't belong in every wake's glance — whatever
+        # is always in front of the agent is what it ends up reciting. locale stays
+        # so the reply-language line is right.
+        keys = (
+            "place_label", "motion_state", "now_playing",
+            "locale", "broadcast_state", "broadcast_active",
+        )
+        presence = {k: snap.get(k) for k in keys if snap.get(k) is not None}
+    change, domains = _resident_perception_digest_board()
+    return presence, change, domains
+
+
+def _send_message_replies_from_actions(actions: list[dict]) -> list[str]:
+    replies: list[str] = []
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        typ = _proactive_action_type(action).removeprefix("proactive.")
+        if typ != "send_message":
+            continue
+        text = str(action.get("text") or action.get("message") or "").strip()
+        if text:
+            replies.append(text[:4000])
+    return _cap_agent_replies(replies, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
+
+
+def _introduction_greeting_from_identity_actions(actions: list[dict]) -> str:
+    """Last-resort first greeting when the intro turn wrote identity but omitted messages."""
+    fallback_intro = ""
+    saw_profile_patch = False
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        typ = str(action.get("type") or action.get("action") or "").strip()
+        if typ != "identity.profile_patch":
+            continue
+        saw_profile_patch = True
+        patch = action.get("patch") if isinstance(action.get("patch"), dict) else action
+        signature = patch.get("signature") if isinstance(patch, dict) else None
+        if isinstance(signature, list):
+            for item in signature:
+                text = _sanitize_reply_text(str(item or ""))
+                if text:
+                    return text[:4000]
+        else:
+            text = _sanitize_reply_text(str(signature or ""))
+            if text:
+                return text[:4000]
+        intro = _sanitize_reply_text(str((patch or {}).get("self_introduction") or ""))
+        if intro and not fallback_intro:
+            fallback_intro = intro
+    if fallback_intro:
+        return fallback_intro[:4000]
+    return "我来了。" if saw_profile_patch else ""
+
+
+def _scheduled_wake_actions(actions: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        typ = _proactive_action_type(action).removeprefix("proactive.")
+        if typ in {"schedule_wake", "cancel_wake"}:
+            out.append(action)
+    return out
+
+
+def _capture_get_json(
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    timeout: int = 15,
+    base_url: str | None = None,
+) -> dict:
+    _refresh_auth_header()
+    root = (base_url or FEEDLING_API_URL).rstrip("/")
+    verify_tls = not (FEEDLING_ENCLAVE_URL and root == FEEDLING_ENCLAVE_URL)
+    try:
+        resp = httpx.get(
+            f"{root}{path}",
+            params=params or {},
+            headers=_HEADERS,
+            timeout=timeout,
+            verify=verify_tls,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+    except Exception as e:
+        log.warning("capture context fetch failed path=%s error=%s", path, e)
+        return {}
+
+
+def _capture_post_json(
+    path: str,
+    *,
+    payload: dict[str, Any] | None = None,
+    timeout: int = 20,
+    base_url: str | None = None,
+) -> dict:
+    _refresh_auth_header()
+    root = (base_url or FEEDLING_API_URL).rstrip("/")
+    verify_tls = not (FEEDLING_ENCLAVE_URL and root == FEEDLING_ENCLAVE_URL)
+    try:
+        resp = httpx.post(
+            f"{root}{path}",
+            json=payload or {},
+            headers=_HEADERS,
+            timeout=timeout,
+            verify=verify_tls,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        return body if isinstance(body, dict) else {}
+    except Exception as e:
+        log.warning("capture context post failed path=%s error=%s", path, e)
+        return {}
+
+
+def _capture_context_text(value: Any, *, empty: str = "（暂无）") -> str:
+    if value in (None, "", [], {}):
+        return empty
+    if isinstance(value, str):
+        return value[:CAPTURE_CONTEXT_MAX_CHARS]
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)[:CAPTURE_CONTEXT_MAX_CHARS]
+    except Exception:
+        return str(value)[:CAPTURE_CONTEXT_MAX_CHARS]
+
+
+def _capture_identity_context() -> tuple[dict, str, str, str]:
+    body = (
+        _capture_get_json("/v1/identity/get", base_url=FEEDLING_ENCLAVE_URL)
+        if FEEDLING_ENCLAVE_URL
+        else {}
+    )
+    if not isinstance(body.get("identity"), dict):
+        body = _capture_get_json("/v1/identity/get")
+    identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
+    identity = {
+        key: value
+        for key, value in identity.items()
+        if key in {
+            "agent_name",
+            "ai_name",
+            "name",
+            "user_preferred_name",
+            "user_name",
+            "companion_user_name",
+            "self_introduction",
+            "dimensions",
+            "days_with_user",
+            "category",
+            "signature",
+            "visibility",
+            "decrypt_status",
+        }
+        and value not in (None, "", [], {})
+    }
+    ai_name = str(
+        identity.get("agent_name")
+        or identity.get("ai_name")
+        or identity.get("name")
+        or ""
+    ).strip() or "我"
+    user_name = str(
+        identity.get("user_preferred_name")
+        or identity.get("user_name")
+        or identity.get("companion_user_name")
+        or ""
+    ).strip() or "TA"
+    return identity, ai_name, user_name, _capture_context_text(identity)
+
+
+def _capture_memory_terms_context() -> tuple[str, str]:
+    buckets_body = _capture_get_json("/v1/memory/buckets")
+    threads_body = _capture_get_json("/v1/memory/threads")
+    return (
+        _capture_context_text(buckets_body.get("buckets")),
+        _capture_context_text(threads_body.get("threads")),
+    )
+
+
+def _capture_message_text(msg: dict) -> str:
+    text = (
+        msg.get("content")
+        or msg.get("text")
+        or msg.get("plaintext")
+        or msg.get("body")
+        or ""
+    )
+    if isinstance(text, dict):
+        text = json.dumps(text, ensure_ascii=False)
+    if not isinstance(text, str):
+        text = str(text or "")
+    text = re.sub(r"\s+", " ", text.strip())
+    if not text:
+        ctype = str(msg.get("content_type") or "").lower()
+        if ctype == "image" or msg.get("image_b64"):
+            return "[image]"
+    return text[:2000]
+
+
+def _capture_message_role(msg: dict) -> str:
+    role = str(msg.get("role") or "").strip().lower()
+    if role == "user":
+        return "user"
+    return "agent"
+
+
+def _capture_message_id(msg: dict) -> str:
+    return str(msg.get("id") or msg.get("message_id") or "").strip()
+
+
+def _capture_live_history(history: list[dict] | None) -> list[dict]:
+    out: list[dict] = []
+    for msg in history or []:
+        if not isinstance(msg, dict):
+            continue
+        source = str(msg.get("source") or "").strip()
+        if source == "verify_ping":
+            continue
+        role = str(msg.get("role") or "").strip().lower()
+        if role not in {"user", "openclaw", "assistant", "agent"}:
+            continue
+        text = _capture_message_text(msg)
+        if not text or "__VERIFY_PING__" in text:
+            continue
+        item = dict(msg)
+        item["_capture_text"] = text
+        out.append(item)
+    return out
+
+
+def _capture_window_messages(job: dict) -> list[dict]:
+    window = job.get("window") if isinstance(job.get("window"), dict) else {}
+    after_id = str(window.get("after_message_id") or "").strip()
+    until_id = str(window.get("until_message_id") or "").strip()
+    try:
+        until_ts = float(window.get("until_ts") or 0)
+    except (TypeError, ValueError):
+        until_ts = 0.0
+    try:
+        window_count = int(window.get("message_count") or 0)
+    except (TypeError, ValueError):
+        window_count = 0
+    limit = max(20, CAPTURE_HISTORY_LIMIT)
+    history = get_decrypted_history(since=0, limit=limit)
+    live = _capture_live_history(history)
+    if not live:
+        return []
+    selected: list[dict] = []
+    after_seen = not after_id
+    for msg in live:
+        msg_id = _capture_message_id(msg)
+        ts = _message_ts_for_context(msg)
+        if not after_seen:
+            if msg_id == after_id:
+                after_seen = True
+            elif until_ts and ts > until_ts:
+                break
+            continue
+        if until_ts and ts > until_ts:
+            break
+        selected.append(msg)
+        if until_id and msg_id == until_id:
+            break
+    if not selected and until_ts:
+        selected = [msg for msg in live if 0 < _message_ts_for_context(msg) <= until_ts]
+    selected = selected[-limit:]
+    if window_count > 0:
+        selected = selected[-window_count:]
+    return selected
+
+
+def _capture_window_text(messages: list[dict]) -> str:
+    lines: list[str] = []
+    for msg in messages:
+        ts = _message_ts_for_context(msg)
+        lines.append(
+            f"- [{_format_message_time(ts)}] {_capture_message_role(msg)}: "
+            f"{msg.get('_capture_text') or _capture_message_text(msg)}"
+        )
+    text = "\n".join(lines).strip()
+    return text[-CAPTURE_WINDOW_MAX_CHARS:] if len(text) > CAPTURE_WINDOW_MAX_CHARS else text
+
+
+def _capture_occurred_at(job: dict, messages: list[dict]) -> str:
+    window = job.get("window") if isinstance(job.get("window"), dict) else {}
+    try:
+        ts = float(window.get("until_ts") or 0)
+    except (TypeError, ValueError):
+        ts = 0.0
+    if ts <= 0 and messages:
+        ts = _message_ts_for_context(messages[-1])
+    if ts <= 0:
+        ts = time.time()
+    return _format_message_time(ts)
+
+
+def _capture_agent_reply_text(result: Any) -> str:
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        if isinstance(result.get("cards"), list):
+            return json.dumps({"cards": result.get("cards")}, ensure_ascii=False)
+        messages = result.get("messages")
+        if isinstance(messages, list) and messages:
+            return "\n".join(str(item) for item in messages if str(item).strip())
+        return json.dumps(result, ensure_ascii=False)
+    if isinstance(result, list):
+        return json.dumps(result, ensure_ascii=False)
+    return str(result or "")
+
+
+def _capture_build_envelope(card: dict, *, occurred_at: str, source: str = "memory_capture", item_id: str = "") -> dict:
+    if not _ENCRYPTION_AVAILABLE:
+        raise RuntimeError("capture_encryption_unavailable")
+    if not _refresh_whoami_for_encrypted_reply():
+        raise RuntimeError("capture_whoami_refresh_failed")
+    user_id = str(_whoami_cache.get("user_id") or "").strip()
+    user_pk: bytes | None = _whoami_cache.get("user_pk")
+    enc_pk: bytes | None = _whoami_cache.get("enclave_pk")
+    if not user_id or not user_pk:
+        raise RuntimeError("capture_missing_user_key")
+    if not enc_pk:
+        raise RuntimeError("capture_shared_envelope_requires_enclave_key")
+
+    inner = {
+        "summary": str(card.get("summary") or "").strip(),
+        "content": str(card.get("content") or "").strip(),
+        "bucket": str(card.get("bucket") or "").strip(),
+        "threads": list(card.get("threads") or []),
+    }
+    envelope = _build_envelope(
+        plaintext=json.dumps(inner, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        owner_user_id=user_id,
+        user_pk_bytes=user_pk,
+        enclave_pk_bytes=enc_pk,
+        visibility="shared",
+        # Migration must seal with the ORIGINAL card id so the AEAD AAD (owner|v|id)
+        # matches on decrypt and the upgraded card stays readable AND id-stable.
+        # capture/dream (new cards) pass "" -> build_envelope mints a random id.
+        item_id=item_id or None,
+    )
+    envelope.update({
+        "type": str(card.get("type") or "event").strip().lower() or "event",
+        "occurred_at": occurred_at,
+        "importance": float(card.get("importance") or 0),
+        "pulse": float(card.get("pulse") or 0),
+        "anchor_memory_ids": [],
+        "source": str(source or "memory_capture")[:80],
+        "last_referenced_at": occurred_at,
+    })
+    return envelope
+
+
+def _capture_actions_from_cards(cards: list[dict], *, job: dict, messages: list[dict]) -> tuple[list[dict], int, int]:
+    occurred_at = _capture_occurred_at(job, messages)
+    source_ids = [_capture_message_id(msg) for msg in messages if _capture_message_id(msg)]
+    actions: list[dict] = []
+    cards_added = 0
+    cards_superseded = 0
+    for card in cards:
+        action = str(card.get("action") or "").strip().lower()
+        target_id = str(card.get("target_id") or "").strip()
+        envelope = _capture_build_envelope(card, occurred_at=occurred_at)
+        base = {
+            "envelope": envelope,
+            "reason": "Memory captured from a completed chat window.",
+            "capture_mode": "memory_capture",
+            "source_chat_message_ids": source_ids,
+        }
+        if action == "add" or (action in {"merge", "supersede"} and not target_id):
+            actions.append({"type": "memory.add", **base})
+            cards_added += 1
+            continue
+        if action in {"merge", "supersede"} and target_id:
+            actions.append({"type": "memory.supersede", "supersedes": target_id, **base})
+            cards_superseded += 1
+    if cards and not actions:
+        raise ValueError("capture_no_memory_actions")
+    return actions, cards_added, cards_superseded
+
+
+def _process_capture_jobs(jobs: list) -> float:
+    """Realize memory_capture jobs through the native resident agent.
+
+    Capture is background memory maintenance: it never writes chat, never uses
+    delivery gates, and never runs the V2 tool loop.
+    """
+    latest = 0.0
+    for job in jobs:
+        ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
+        latest = max(latest, ts)
+        if not _is_memory_capture_job(job):
+            continue
+        key = _proactive_job_key(job)
+        if not _mark_seen(key):
+            log.debug("skipping already-processed capture job key=%s", key)
+            continue
+        job_id = str(job.get("job_id") or "")
+        try:
+            if not claim_proactive_job(job_id):
+                log.info("capture job not claimed id=%s", job_id)
+                continue
+        except Exception as e:
+            log.error("capture job claim failed id=%s: %s", job_id, e)
+            continue
+        window = job.get("window") if isinstance(job.get("window"), dict) else {}
+        update_proactive_job_status(job_id, "realizing")
+        messages = _capture_window_messages(job)
+        window_text = _capture_window_text(messages)
+        if not window_text:
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                "capture_window_unavailable",
+                extra={
+                    "capture_result": {"status": "failed", "reason": "capture_window_unavailable"},
+                    "capture_window": window,
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": "capture_window_unavailable",
+                },
+            )
+            continue
+        buckets_text, threads_text = _capture_memory_terms_context()
+        identity, ai_name, user_name, identity_text = _capture_identity_context()
+        prompt = build_capture_prompt(
+            ai_name=ai_name,
+            user_name=user_name,
+            buckets=buckets_text,
+            threads=threads_text,
+            identity=identity_text,
+            window=window_text,
+        )
+        try:
+            reply_text = _capture_agent_reply_text(call_agent(prompt))
+        except Exception as e:
+            reason = f"capture_agent_call_failed:{type(e).__name__}"
+            log.error("capture agent call failed id=%s: %s", job_id, e)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "capture_result": {"status": "failed", "reason": reason},
+                    "capture_window": window,
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": reason,
+                },
+            )
+            continue
+        cards, err = parse_capture_cards(reply_text)
+        if err:
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                err,
+                extra={
+                    "capture_result": {"status": "failed", "reason": err},
+                    "capture_window": window,
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": err,
+                },
+            )
+            continue
+        if not cards:
+            update_proactive_job_status(
+                job_id,
+                "completed",
+                "nothing_worth_keeping",
+                extra={
+                    "capture_result": {"status": "noop", "reason": "nothing_worth_keeping"},
+                    "capture_window": window,
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": "nothing_worth_keeping",
+                },
+            )
+            log.info("capture job completed noop id=%s", job_id)
+            continue
+        try:
+            actions, cards_added, cards_superseded = _capture_actions_from_cards(
+                cards,
+                job=job,
+                messages=messages,
+            )
+            memory_result = execute_memory_actions(actions)
+        except ValueError as e:
+            reason = str(e) or "capture_invalid_memory_action"
+            log.error("capture memory action invalid id=%s: %s", job_id, e)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "capture_result": {"status": "failed", "reason": reason},
+                    "capture_window": window,
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": reason,
+                    "memory_action_status": {"status": "failed", "reason": reason},
+                },
+            )
+            continue
+        except Exception as e:
+            reason = f"capture_memory_write_failed:{type(e).__name__}"
+            log.error("capture memory write failed id=%s: %s", job_id, e)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "capture_result": {"status": "failed", "reason": reason},
+                    "capture_window": window,
+                    "cards_added": 0,
+                    "cards_superseded": 0,
+                    "noop_reason": reason,
+                    "memory_action_status": {"status": "failed", "reason": str(e)[:500]},
+                },
+            )
+            continue
+        update_proactive_job_status(
+            job_id,
+            "completed",
+            "capture_memory_actions_applied",
+            extra={
+                "capture_result": {
+                    "status": "ok",
+                    "cards": len(cards),
+                    "job_kind": "memory_capture",
+                },
+                "capture_window": window,
+                "memory_action_status": {
+                    "status": memory_result.get("status", "ok"),
+                    "results": len(memory_result.get("results") or []),
+                    "effects": len(memory_result.get("effects") or []),
+                },
+                "memory_results": memory_result.get("results") or [],
+                "cards_added": cards_added,
+                "cards_superseded": cards_superseded,
+            },
+        )
+        log.info(
+            "capture job completed id=%s cards=%d added=%d superseded=%d identity=%s",
+            job_id,
+            len(cards),
+            cards_added,
+            cards_superseded,
+            bool(identity),
+        )
+    return latest
+
+
+def _dream_index_items() -> list[dict]:
+    body = _capture_post_json(
+        "/v1/memory/index",
+        payload={"limit": max(0, DREAM_MEMORY_INDEX_LIMIT)},
+        timeout=30,
+    )
+    items = body.get("items") if isinstance(body.get("items"), list) else []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        memory_id = str(item.get("id") or "").strip()
+        if not memory_id or memory_id in seen:
+            continue
+        seen.add(memory_id)
+        out.append(dict(item))
+        if len(out) >= max(1, DREAM_MEMORY_MAX_CARDS):
+            break
+    return out
+
+
+def _dream_fetch_items(ids: list[str]) -> dict[str, dict]:
+    if not ids:
+        return {}
+    by_id: dict[str, dict] = {}
+    batch_size = max(1, min(DREAM_FETCH_BATCH_SIZE, 200))
+    for offset in range(0, len(ids), batch_size):
+        batch = ids[offset : offset + batch_size]
+        body = _capture_post_json(
+            "/v1/memory/fetch",
+            payload={"ids": batch, "limit": len(batch)},
+            timeout=30,
+        )
+        for item in body.get("items") if isinstance(body.get("items"), list) else []:
+            if isinstance(item, dict) and str(item.get("id") or "").strip():
+                by_id[str(item.get("id") or "").strip()] = dict(item)
+    return by_id
+
+
+def _dream_card_field(card: dict, *names: str) -> str:
+    for name in names:
+        value = card.get(name)
+        if isinstance(value, str) and value.strip():
+            return re.sub(r"\s+", " ", value.strip())
+    return ""
+
+
+def _dream_card_threads(card: dict) -> list[str]:
+    raw = card.get("threads") or card.get("thread") or []
+    values = raw if isinstance(raw, list) else [raw]
+    out: list[str] = []
+    for item in values:
+        text = str(item or "").strip()
+        if text and text not in out:
+            out.append(text[:80])
+    return out[:8]
+
+
+def _dream_cards_context() -> tuple[str, dict[str, dict]]:
+    index_items = _dream_index_items()
+    ids = [str(item.get("id") or "").strip() for item in index_items if str(item.get("id") or "").strip()]
+    fetched = _dream_fetch_items(ids)
+    merged: list[dict] = []
+    by_id: dict[str, dict] = {}
+    for item in index_items:
+        memory_id = str(item.get("id") or "").strip()
+        if not memory_id:
+            continue
+        card = {**item, **fetched.get(memory_id, {})}
+        merged.append(card)
+        by_id[memory_id] = card
+    lines: list[str] = []
+    for card in merged:
+        memory_id = str(card.get("id") or "").strip()
+        bucket = _dream_card_field(card, "bucket", "category")
+        threads = _dream_card_threads(card)
+        summary = _dream_card_field(card, "summary", "title", "description")
+        content = _dream_card_field(card, "content", "body", "text", "plaintext")
+        parts = [f"- id={memory_id}"]
+        if bucket:
+            parts.append(f"bucket={bucket}")
+        if threads:
+            parts.append("threads=" + ",".join(threads))
+        if summary:
+            parts.append(f"summary={summary[:500]}")
+        if content and content != summary:
+            parts.append(f"content={content[:900]}")
+        lines.append(" | ".join(parts))
+    text = "\n".join(lines).strip()
+    return (text or "（暂无卡）")[:20000], by_id
+
+
+def _dream_recent_conversations_context() -> str:
+    try:
+        history = get_decrypted_history(since=0, limit=max(1, min(DREAM_RECENT_CHAT_LIMIT, 240)))
+    except Exception as e:
+        log.warning("dream recent conversation fetch failed: %s", e)
+        return "（这几天没有可读对话）"
+    live = _capture_live_history(history)
+    if not live:
+        return "（这几天没有新对话）"
+    lines: list[str] = []
+    for msg in live[-max(1, min(DREAM_RECENT_CHAT_LIMIT, 240)):]:
+        ts = _message_ts_for_context(msg)
+        lines.append(
+            f"- [{_format_message_time(ts)}] {_capture_message_role(msg)}: "
+            f"{msg.get('_capture_text') or _capture_message_text(msg)}"
+        )
+    text = "\n".join(lines).strip()
+    return text[-12000:] if len(text) > 12000 else text
+
+
+def _dream_actions_from_consolidations(
+    consolidations: list[dict],
+    *,
+    card_map: dict[str, dict],
+    occurred_at: str,
+) -> tuple[list[dict], int, int, int]:
+    actions: list[dict] = []
+    cards_merged = 0
+    cards_thickened = 0
+    cards_superseded = 0
+    for row in consolidations[: max(1, DREAM_MAX_CONSOLIDATIONS)]:
+        op = str(row.get("op") or "").strip().lower()
+        card_ids = [
+            str(memory_id or "").strip()
+            for memory_id in (row.get("card_ids") if isinstance(row.get("card_ids"), list) else [])
+            if str(memory_id or "").strip()
+        ]
+        card_ids = list(dict.fromkeys(card_ids))
+        if not card_ids:
+            continue
+        result = row.get("result") if isinstance(row.get("result"), dict) else {}
+        card = {
+            "type": "fact",
+            "bucket": str(result.get("bucket") or "").strip(),
+            "threads": list(result.get("threads") or []),
+            "summary": str(result.get("summary") or "").strip(),
+            "content": str(result.get("content") or result.get("summary") or "").strip(),
+            "importance": float(result.get("importance") or 0),
+            "pulse": float(result.get("pulse") or 0),
+        }
+        envelope = _capture_build_envelope(card, occurred_at=occurred_at, source="memory_dream")
+        actions.append({
+            "type": "memory.supersede",
+            "supersedes": card_ids,
+            "envelope": envelope,
+            "reason": f"Memory dream {op} consolidation.",
+            "capture_mode": "memory_dream",
+            "dream_op": op,
+            "dream_card_ids": card_ids,
+        })
+        if op == "merge":
+            cards_merged += 1
+        elif op == "thicken":
+            cards_thickened += 1
+        cards_superseded += len(card_ids)
+    if consolidations and not actions:
+        raise ValueError("dream_no_memory_actions")
+    return actions, cards_merged, cards_thickened, cards_superseded
+
+
+def _process_dream_jobs(jobs: list) -> float:
+    """Realize memory_dream jobs through the native resident agent.
+
+    Dream is background memory organization. It writes only memory actions and
+    job status; it never posts chat or uses delivery gates.
+    """
+    latest = 0.0
+    for job in jobs:
+        ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
+        latest = max(latest, ts)
+        if not _is_memory_dream_job(job):
+            continue
+        key = _proactive_job_key(job)
+        if not _mark_seen(key):
+            log.debug("skipping already-processed dream job key=%s", key)
+            continue
+        job_id = str(job.get("job_id") or "")
+        try:
+            if not claim_proactive_job(job_id):
+                log.info("dream job not claimed id=%s", job_id)
+                continue
+        except Exception as e:
+            log.error("dream job claim failed id=%s: %s", job_id, e)
+            continue
+        update_proactive_job_status(job_id, "realizing")
+        cards_text, card_map = _dream_cards_context()
+        if not card_map:
+            update_proactive_job_status(
+                job_id,
+                "completed",
+                "dream_no_cards_available",
+                extra={
+                    "dream_result": {"status": "noop", "reason": "dream_no_cards_available", "job_kind": "memory_dream"},
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": [],
+                    "noop_reason": "dream_no_cards_available",
+                },
+            )
+            continue
+        recent_text = _dream_recent_conversations_context()
+        _identity, ai_name, user_name, _identity_text = _capture_identity_context()
+        prompt = build_dream_prompt(
+            ai_name=ai_name,
+            user_name=user_name,
+            cards=cards_text,
+            recent_conversations=recent_text,
+        )
+        try:
+            reply_text = _capture_agent_reply_text(call_agent(prompt))
+        except Exception as e:
+            reason = f"dream_agent_call_failed:{type(e).__name__}"
+            log.error("dream agent call failed id=%s: %s", job_id, e)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "dream_result": {"status": "failed", "reason": reason, "job_kind": "memory_dream"},
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": [],
+                    "noop_reason": reason,
+                },
+            )
+            continue
+        consolidations, questions, err = parse_dream_consolidations(reply_text)
+        if err:
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                err,
+                extra={
+                    "dream_result": {"status": "failed", "reason": err, "job_kind": "memory_dream"},
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": questions,
+                    "noop_reason": err,
+                },
+            )
+            continue
+        if not consolidations:
+            update_proactive_job_status(
+                job_id,
+                "completed",
+                "dream_nothing_to_consolidate",
+                extra={
+                    "dream_result": {
+                        "status": "noop",
+                        "reason": "dream_nothing_to_consolidate",
+                        "job_kind": "memory_dream",
+                        "questions": len(questions),
+                    },
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": questions,
+                    "noop_reason": "dream_nothing_to_consolidate",
+                },
+            )
+            log.info("dream job completed noop id=%s questions=%d", job_id, len(questions))
+            continue
+        try:
+            occurred_at = _format_message_time(time.time())
+            actions, cards_merged, cards_thickened, cards_superseded = _dream_actions_from_consolidations(
+                consolidations,
+                card_map=card_map,
+                occurred_at=occurred_at,
+            )
+            memory_result = execute_memory_actions(actions)
+        except ValueError as e:
+            reason = str(e) or "dream_invalid_memory_action"
+            log.error("dream memory action invalid id=%s: %s", job_id, e)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "dream_result": {"status": "failed", "reason": reason, "job_kind": "memory_dream"},
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": questions,
+                    "noop_reason": reason,
+                    "memory_action_status": {"status": "failed", "reason": reason},
+                },
+            )
+            continue
+        except Exception as e:
+            reason = f"dream_memory_write_failed:{type(e).__name__}"
+            log.error("dream memory write failed id=%s: %s", job_id, e)
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                reason,
+                extra={
+                    "dream_result": {"status": "failed", "reason": reason, "job_kind": "memory_dream"},
+                    "cards_merged": 0,
+                    "cards_superseded": 0,
+                    "questions": questions,
+                    "noop_reason": reason,
+                    "memory_action_status": {"status": "failed", "reason": str(e)[:500]},
+                },
+            )
+            continue
+        update_proactive_job_status(
+            job_id,
+            "completed",
+            "dream_memory_actions_applied",
+            extra={
+                "dream_result": {
+                    "status": "ok",
+                    "job_kind": "memory_dream",
+                    "consolidations": len(consolidations),
+                    "actions": len(actions),
+                    "questions": len(questions),
+                    "cards_thickened": cards_thickened,
+                },
+                "memory_action_status": {
+                    "status": memory_result.get("status", "ok"),
+                    "results": len(memory_result.get("results") or []),
+                    "effects": len(memory_result.get("effects") or []),
+                },
+                "memory_results": memory_result.get("results") or [],
+                "cards_merged": cards_merged,
+                "cards_superseded": cards_superseded,
+                "questions": questions,
+            },
+        )
+        log.info(
+            "dream job completed id=%s consolidations=%d actions=%d merged=%d superseded=%d questions=%d",
+            job_id,
+            len(consolidations),
+            len(actions),
+            cards_merged,
+            cards_superseded,
+            len(questions),
+        )
+    return latest
 
 
 def _process_proactive_jobs(jobs: list) -> float:
@@ -2906,20 +4821,32 @@ def _process_proactive_jobs(jobs: list) -> float:
             log.error("proactive job claim failed id=%s: %s", job_id, e)
             continue
 
-        frame_ids = job.get("frame_ids")
-        if not isinstance(frame_ids, list):
+        is_introduction = _is_introduction_job(job)
+        if is_introduction:
             frame_ids = []
-        screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
-        recent_context = recent_chat_context_for_proactive()
-        message = _message_for_proactive_job(
-            job,
-            screen_text=screen_text,
-            recent_chat_context=recent_context,
-        )
+            screen_payloads = []
+            screen_paths = []
+            message = _message_for_introduction_job(job)
+        else:
+            frame_ids = job.get("frame_ids")
+            if not isinstance(frame_ids, list):
+                frame_ids = []
+            screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
+            recent_context = recent_chat_context_for_proactive()
+            # Screen-watch is a light lane: skip the heavy cross-domain digest fetch
+            # (its prompt deliberately omits the board).
+            perception_digest = None if _is_screen_watch_job(job) else _proactive_perception_digest()
+            message = _message_for_proactive_job(
+                job,
+                screen_text=screen_text,
+                recent_chat_context=recent_context,
+                perception_digest=perception_digest,
+            )
         log.info(
-            "proactive job [ts=%.3f] id=%s intent=%s frames=%d",
+            "proactive job [ts=%.3f] id=%s kind=%s intent=%s frames=%d",
             ts,
             job.get("job_id"),
+            job.get("job_kind"),
             job.get("intent_label"),
             len(frame_ids),
         )
@@ -2938,6 +4865,8 @@ def _process_proactive_jobs(jobs: list) -> float:
 
         turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
         actions, replies = turn.actions, turn.messages
+        if not replies:
+            replies = _send_message_replies_from_actions(actions)
         proactive_actions, memory_identity_actions = _split_proactive_actions(actions)
         status_actions = [_compact_action_for_status(a) for a in proactive_actions]
         if memory_identity_actions:
@@ -2950,23 +4879,75 @@ def _process_proactive_jobs(jobs: list) -> float:
                 )
             except Exception as e:
                 log.warning("proactive memory/identity actions failed id=%s error=%s", job_id, e)
+                if is_introduction:
+                    update_proactive_job_status(
+                        job_id,
+                        "failed",
+                        f"introduction_identity_action_failed:{type(e).__name__}",
+                        extra={
+                            "agent_action": "identity.profile_patch",
+                            "agent_action_status": str(e)[:240],
+                            "wake_result": "identity_action_failed",
+                        },
+                    )
+                    continue
+        if is_introduction and not replies and memory_identity_actions:
+            reply = _introduction_greeting_from_identity_actions(memory_identity_actions)
+            if reply:
+                replies = [reply]
+                log.info("introduction greeting recovered from identity action id=%s", job_id)
 
-        set_ai_state = _first_proactive_action(proactive_actions, {"set_ai_state"})
-        if set_ai_state:
-            ai_state = str(set_ai_state.get("state") or set_ai_state.get("ai_state") or "").strip().lower()
-            if ai_state:
-                update_proactive_state(ai_state=ai_state)
+        schedule_action_results: list[dict] = []
+        scheduled_action_failed = False
+        schedule_actions = _scheduled_wake_actions(proactive_actions)
+        if schedule_actions:
+            try:
+                result = execute_scheduled_wake_actions(schedule_actions, job)
+                schedule_action_results = [
+                    dict(item)
+                    for item in (result.get("results") or [])
+                    if isinstance(item, dict)
+                ]
                 update_proactive_job_status(
                     job_id,
                     "realizing",
-                    "agent_set_ai_state",
+                    "agent_scheduled_wake_actions",
                     extra={
-                        "agent_action": "set_ai_state",
-                        "agent_action_status": ai_state,
-                        "agent_actions": status_actions,
-                        "ai_state": ai_state,
+                        "agent_action": "scheduled_wake_actions",
+                        "agent_action_status": json.dumps(
+                            schedule_action_results,
+                            ensure_ascii=False,
+                        )[:240],
+                        "agent_actions": status_actions + schedule_action_results,
                     },
                 )
+            except Exception as e:
+                log.warning("proactive scheduled wake actions failed id=%s error=%s", job_id, e)
+                scheduled_action_failed = True
+                schedule_action_results = [{
+                    "type": "scheduled_wake_actions_result",
+                    "status": "failed",
+                    "reason": str(e)[:240],
+                }]
+            if schedule_action_results:
+                status_actions.extend(schedule_action_results)
+
+        if scheduled_action_failed and not replies:
+            update_proactive_job_status(
+                job_id,
+                "failed",
+                "scheduled_wake_actions_failed",
+                extra={
+                    "agent_action": "scheduled_wake_actions",
+                    "agent_action_status": json.dumps(
+                        schedule_action_results,
+                        ensure_ascii=False,
+                    )[:240],
+                    "agent_actions": status_actions,
+                    "wake_result": "action_failed",
+                },
+            )
+            continue
 
         request_broadcast = _first_proactive_action(proactive_actions, {"request_broadcast"})
         if request_broadcast and not replies:
@@ -2999,20 +4980,22 @@ def _process_proactive_jobs(jobs: list) -> float:
             log.info("proactive wake slept id=%s reason=%s", job_id, sleep_action.get("reason") or "")
             continue
 
-        if set_ai_state and not replies:
-            state_label = str(set_ai_state.get("state") or set_ai_state.get("ai_state") or "updated").strip()
+        if schedule_actions and not replies:
             update_proactive_job_status(
                 job_id,
                 "completed",
-                f"agent_set_ai_state:{state_label}",
+                "agent_scheduled_wake_actions",
                 extra={
-                    "agent_action": "set_ai_state",
-                    "agent_action_status": state_label[:240],
+                    "agent_action": "scheduled_wake_actions",
+                    "agent_action_status": json.dumps(
+                        schedule_action_results,
+                        ensure_ascii=False,
+                    )[:240],
                     "agent_actions": status_actions,
-                    "wake_result": "state_only",
+                    "wake_result": "action_only",
                 },
             )
-            log.info("proactive wake updated ai_state without reply id=%s state=%s", job_id, state_label)
+            log.info("proactive wake completed scheduled actions id=%s", job_id)
             continue
 
         posted_any = False
@@ -3059,9 +5042,207 @@ def _process_proactive_jobs(jobs: list) -> float:
     return latest
 
 
+def _is_memory_migrate_job(job: dict) -> bool:
+    return (
+        str((job or {}).get("job_kind") or "").strip() == "memory_migrate"
+        or str((job or {}).get("source") or "").strip() == "memory_migrate"
+    )
+
+
+def _migrate_render_old_cards(batch: list[dict]) -> str:
+    """Render the legacy batch (raw old inner) for the migrate prompt — id + only
+    the old content fields that are present."""
+    lines: list[str] = []
+    for row in batch:
+        inner = row.get("inner") if isinstance(row.get("inner"), dict) else {}
+        fields = {
+            k: inner.get(k)
+            for k in ("title", "description", "her_quote", "context", "linked_dimension")
+            if inner.get(k)
+        }
+        lines.append(json.dumps({"id": row.get("id"), **fields}, ensure_ascii=False))
+    return "\n".join(lines) if lines else "（没有要升级的卡）"
+
+
+def _process_migrate_jobs(jobs: list) -> float:
+    """Realize memory_migrate jobs: upgrade a batch of legacy cards to v1 in place.
+
+    Server picks + raw-decrypts the legacy batch (/v1/memory/legacy_batch); the
+    agent derives v1; we write each back via memory.upgrade (in-place,保 id, CAS).
+    A card counts as migrated ONLY on upgrade status=ok; skipped(stale)/empty(db
+    write fail)/parser-dropped all stay for the next quiet window (self-heal);
+    skipped(not_found) just drops (card gone). Writes only memory actions + the
+    migration-state cache; never posts chat.
+    """
+    latest = 0.0
+    from memory.migration import migration_enabled
+    if not migration_enabled():
+        return latest  # FEEDLING_MIGRATE_ENABLE off → full stop, don't process queued migrate jobs
+    for job in jobs:
+        ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
+        latest = max(latest, ts)
+        if not _is_memory_migrate_job(job):
+            continue
+        key = _proactive_job_key(job)
+        if not _mark_seen(key):
+            continue
+        job_id = str(job.get("job_id") or "")
+        try:
+            if not claim_proactive_job(job_id):
+                log.info("migrate job not claimed id=%s", job_id)
+                continue
+        except Exception as e:
+            log.error("migrate job claim failed id=%s: %s", job_id, e)
+            continue
+        update_proactive_job_status(job_id, "realizing")
+
+        try:
+            batch_size = max(1, min(int(os.environ.get("FEEDLING_MIGRATE_BATCH", "8")), 50))
+        except (TypeError, ValueError):
+            batch_size = 8
+        batch_body = _capture_post_json("/v1/memory/legacy_batch", payload={"batch_size": batch_size})
+        if not isinstance(batch_body.get("batch"), list) or "legacy_remaining" not in batch_body:
+            reason = "legacy_batch_unavailable"
+            update_proactive_job_status(
+                job_id, "failed", reason,
+                extra={"migrate_result": {"status": "failed", "reason": reason}},
+            )
+            log.warning("migrate job failed id=%s reason=%s body_keys=%s",
+                        job_id, reason, sorted(batch_body.keys()) if isinstance(batch_body, dict) else [])
+            continue
+        batch = batch_body.get("batch") if isinstance(batch_body.get("batch"), list) else []
+        legacy_remaining = int(batch_body.get("legacy_remaining") or 0)
+        if not batch:
+            _capture_post_json("/v1/memory/migration_state", payload={"migrated": 0, "legacy_remaining": 0})
+            update_proactive_job_status(
+                job_id, "completed", "migrate_no_legacy",
+                extra={"migrate_result": {"status": "noop", "reason": "no_legacy", "migrated": 0}},
+            )
+            log.info("migrate job completed noop (no legacy) id=%s", job_id)
+            continue
+
+        allowed_ids = {str(r.get("id")) for r in batch if r.get("id")}
+        hash_by_id = {str(r.get("id")): str(r.get("old_body_hash") or "") for r in batch}
+        _identity, ai_name, user_name, _identity_text = _capture_identity_context()
+        buckets_text, threads_text = _capture_memory_terms_context()
+        prompt = build_migrate_prompt(
+            ai_name=ai_name,
+            user_name=user_name,
+            old_cards=_migrate_render_old_cards(batch),
+            vocab=f"已有桶: {buckets_text}\n已有线索: {threads_text}",
+        )
+        try:
+            reply_text = _capture_agent_reply_text(call_agent(prompt))
+        except Exception as e:
+            reason = f"migrate_agent_call_failed:{type(e).__name__}"
+            log.error("migrate agent call failed id=%s: %s", job_id, e)
+            update_proactive_job_status(
+                job_id, "failed", reason,
+                extra={"migrate_result": {"status": "failed", "reason": reason}},
+            )
+            continue
+        upgrades, unmigrated_ids, err = parse_migrated_cards(reply_text, allowed_ids=allowed_ids)
+        if err:
+            update_proactive_job_status(
+                job_id, "failed", err,
+                extra={"migrate_result": {"status": "failed", "reason": err}},
+            )
+            continue
+
+        occurred_at = _format_message_time(time.time())
+        migrated = 0
+        # A11: any batch card that did NOT migrate this round is a failed attempt — the
+        # agent dropped it (unmigrated_ids) OR envelope build / memory.upgrade failed.
+        # Seed with the parser's unmigrated set, then add per-card write failures and
+        # remove the ones that actually succeed. The server bumps each card's attempt
+        # count; after FEEDLING_MIGRATE_MAX_ATTEMPTS it marks the card skipped so it
+        # stops looping and legacy_remaining can reach 0.
+        failed_ids: set[str] = set(unmigrated_ids)
+        for up in upgrades:
+            mid = str(up.get("id") or "")
+            if not mid:
+                continue
+            try:
+                envelope = _capture_build_envelope(up, occurred_at=occurred_at, source="memory_migrate", item_id=mid)
+            except Exception as e:
+                log.error("migrate envelope build failed id=%s card=%s: %s", job_id, mid, e)
+                failed_ids.add(mid)
+                continue  # retry next round (until cap)
+            # Let memory.upgrade carry the existing metadata (don't reset). Migration
+            # is not a "user just used this memory", so last_referenced_at must NOT be
+            # bumped to now — drop it (and importance/pulse) so existing values stay.
+            envelope.pop("importance", None)
+            envelope.pop("pulse", None)
+            envelope.pop("last_referenced_at", None)
+            body = _capture_post_json("/v1/memory/actions", payload={"action": {
+                "type": "memory.upgrade",
+                "id": mid,
+                "envelope": envelope,
+                "old_body_hash": hash_by_id.get(mid, ""),
+            }})
+            res = (body.get("results") or [{}])[0] if isinstance(body, dict) else {}
+            if res.get("status") == "ok" and not res.get("skipped"):
+                migrated += 1
+                failed_ids.discard(mid)
+            else:
+                # skipped(stale)/empty(db_write_failed,network)/dropped → not migrated → counts
+                # as a failed attempt → retry next window until the per-card cap is hit.
+                failed_ids.add(mid)
+
+        remaining = max(0, legacy_remaining - migrated)
+        _capture_post_json("/v1/memory/migration_state", payload={
+            "migrated": migrated,
+            "legacy_remaining": remaining,
+            "failed_ids": sorted(failed_ids),
+        })
+        update_proactive_job_status(
+            job_id, "completed", "migrate_batch_done",
+            extra={"migrate_result": {
+                "status": "ok",
+                "migrated": migrated,
+                "batch": len(batch),
+                "unmigrated": len(unmigrated_ids),
+                "failed": len(failed_ids),
+                "remaining": remaining,
+            }},
+        )
+        log.info(
+            "migrate job completed id=%s migrated=%d/%d unmigrated=%d failed=%d remaining=%d",
+            job_id, migrated, len(batch), len(unmigrated_ids), len(failed_ids), remaining,
+        )
+    return latest
+
+
+def _process_resident_jobs(jobs: list) -> float:
+    capture_jobs = [
+        job for job in (jobs or [])
+        if isinstance(job, dict) and _is_memory_capture_job(job)
+    ]
+    dream_jobs = [
+        job for job in (jobs or [])
+        if isinstance(job, dict) and _is_memory_dream_job(job)
+    ]
+    migrate_jobs = [
+        job for job in (jobs or [])
+        if isinstance(job, dict) and _is_memory_migrate_job(job)
+    ]
+    proactive_jobs = [
+        job for job in (jobs or [])
+        if not (
+            isinstance(job, dict)
+            and (_is_memory_capture_job(job) or _is_memory_dream_job(job) or _is_memory_migrate_job(job))
+        )
+    ]
+    return max(
+        _process_capture_jobs(capture_jobs) if capture_jobs else 0.0,
+        _process_dream_jobs(dream_jobs) if dream_jobs else 0.0,
+        _process_migrate_jobs(migrate_jobs) if migrate_jobs else 0.0,
+        _process_proactive_jobs(proactive_jobs) if proactive_jobs else 0.0,
+    )
+
+
 def _process_messages(messages: list) -> float:
     """Process a batch of messages, return the highest timestamp seen."""
-    global _last_fallback_ts
     latest = 0.0
     for msg in messages:
         # Tolerate both "ts" and "timestamp" key names across API versions.
@@ -3093,11 +5274,49 @@ def _process_messages(messages: list) -> float:
         # verify_loop's timeout and is fragile to mid-run SIGTERM, so the probe
         # would time out (passing=false) even on a healthy reply pipeline.
         if msg.get("source") == "verify_ping":
-            log.info("verify ping [ts=%.3f] — short-circuit canned liveness reply", ts)
+            # Exercise the REAL agent path so verify catches a broken reply
+            # pipeline (e.g. an agent whose output the consumer can't parse).
+            # The old canned short-circuit let verify pass while the live loop
+            # was actually dead. A slow-but-healthy agent must not falsely fail,
+            # so the probe is bounded: on timeout/transient error we fall back to
+            # the canned ack (verify still passes); only a COMPLETED call that
+            # yields no usable reply is a real failure — we then post nothing so
+            # verify_loop stays unsatisfied and onboarding does not green-light a
+            # dead loop. The probe reply is visibility=local_only and GC'd by the
+            # server, so it never reaches the user's visible chat.
+            log.info("verify ping [ts=%.3f] — exercising real agent path", ts)
+            probe: dict[str, Any] = {}
+
+            def _run_verify_probe() -> None:
+                try:
+                    probe["result"] = call_agent(VERIFY_PROBE_MESSAGE)
+                except ValueError as exc:        # no usable reply after sanitization
+                    probe["no_usable_reply"] = str(exc)
+                except Exception as exc:         # timeout / transport / runtime
+                    probe["error"] = str(exc)
+
+            probe_thread = threading.Thread(target=_run_verify_probe, daemon=True)
+            probe_thread.start()
+            probe_thread.join(timeout=VERIFY_PROBE_TIMEOUT_SEC)
             try:
-                # suppress_push: the ack must not surface as an APNs
-                # notification — it's a private probe the verify GC then removes.
-                post_reply(VERIFY_PING_REPLY, suppress_push=True)
+                # All verify replies carry source="verify_ping" so the server
+                # filters them out of the user's visible chat history (and
+                # verify_loop's GC matches them) even when the reply lands after
+                # the GC window — otherwise the (real or canned) ack leaks as a
+                # stray visible message. suppress_push already kills the APNs push.
+                if probe_thread.is_alive():
+                    log.warning("verify ping — agent slow (>%ss); canned ack fallback so verify still passes", VERIFY_PROBE_TIMEOUT_SEC)
+                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True)
+                elif "result" in probe:
+                    replies = _normalize_agent_replies(probe["result"]) or [VERIFY_PING_REPLY]
+                    post_reply(replies[0], source="verify_ping", suppress_push=True)
+                    log.info("verify ping — real agent reply OK")
+                elif "no_usable_reply" in probe:
+                    log.error("verify ping — agent produced no usable reply; NOT acking so verify fails (live loop is broken): %s", probe["no_usable_reply"])
+                    # post nothing — verify_loop stays unsatisfied on purpose
+                else:
+                    log.warning("verify ping — agent call errored (%s); canned ack fallback", probe.get("error"))
+                    post_reply(VERIFY_PING_REPLY, source="verify_ping", suppress_push=True)
             except Exception as e:
                 log.error("failed to post verify-ping reply: %s", e)
             latest = max(latest, ts)
@@ -3124,14 +5343,18 @@ def _process_messages(messages: list) -> float:
                     "routing honest image-unavailable prompt",
                     ts,
                 )
-            content = IMAGE_PLACEHOLDER
+            # Preserve the user's text caption — enclave history now decrypts and
+            # fills `content` for captioned image turns ("what is wrong here?").
+            # Only fall back to the placeholder when there is genuinely no text,
+            # otherwise the agent gets the attachment but loses the actual prompt.
+            if not content:
+                content = IMAGE_PLACEHOLDER
         elif not content:
             # Genuinely empty text — decrypt source missing or failed.
             # Never send a fallback for content we cannot read.
             log.warning(
                 "user message has no plaintext content ts=%.3f content_type=%s "
-                "— skipping (set FEEDLING_ENCLAVE_URL or FEEDLING_MCP_URL to "
-                "enable decryption)",
+                "— skipping (set FEEDLING_ENCLAVE_URL to enable decryption)",
                 ts, content_type,
             )
             latest = max(latest, ts)
@@ -3150,8 +5373,15 @@ def _process_messages(messages: list) -> float:
                 len(screen_payloads),
             )
 
+        # Ground every foreground turn in the real current time (+ gap since last
+        # interaction) so the agent never carries a stale, e.g. overnight, frame.
+        content = _prepend_time_anchor_foreground(content, ts)
+
+        use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
         try:
-            if image_payloads or image_paths:
+            if use_runtime_v2:
+                agent_result = call_agent(_resident_foreground_chat_message_v2(content))
+            elif image_payloads or image_paths:
                 agent_result = call_agent(
                     content,
                     images=image_payloads,
@@ -3160,28 +5390,21 @@ def _process_messages(messages: list) -> float:
             else:
                 agent_result = call_agent(content)
         except Exception as e:
-            log.error("agent call failed; not posting user-visible fallback: %s", e)
+            log.error("agent call failed; posting user-visible fallback: %s", e)
             if SEND_FALLBACK_ON_AGENT_ERROR:
-                now = time.time()
-                if now - _last_fallback_ts >= FALLBACK_COOLDOWN:
-                    agent_result = [FALLBACK_REPLY]
-                    _last_fallback_ts = now
-                    log.warning("sending opt-in fallback reply (cooldown starts)")
-                else:
-                    log.warning(
-                        "fallback suppressed — cooldown active (last sent %.0fs ago)",
-                        now - _last_fallback_ts,
-                    )
-                    latest = max(latest, ts)
-                    continue
+                agent_result = [FALLBACK_REPLY]
             else:
-                # Mark this message seen for this process so a broken agent entry
-                # does not create a visible template loop. The error stays in logs.
+                log.warning("agent error fallback disabled by env; this user turn will not get a visible reply")
                 latest = max(latest, ts)
                 continue
 
         turn = _split_agent_turn(agent_result)
         actions, replies = turn.actions, turn.messages
+        if use_runtime_v2:
+            actions = [
+                action for action in actions
+                if _proactive_action_type(action).removeprefix("proactive.") != "needs_background"
+            ]
         if actions:
             try:
                 action_result = execute_agent_actions(actions)
@@ -3253,23 +5476,20 @@ def run() -> None:
 
     _warn_if_agent_entry_may_drift()
 
-    if FEEDLING_ENCLAVE_URL or FEEDLING_MCP_URL:
+    if FEEDLING_ENCLAVE_URL:
         if not _verify_decrypt_sources():
             log.critical(
-                "All configured decrypt sources are unreachable "
-                "(enclave=%s mcp=%s). Cannot decrypt user messages — exiting.",
-                FEEDLING_ENCLAVE_URL or "unset",
-                FEEDLING_MCP_URL or "unset",
+                "Decrypt source unreachable (enclave=%s). "
+                "Cannot decrypt user messages — exiting.",
+                FEEDLING_ENCLAVE_URL,
             )
             sys.exit(1)
     else:
         log.warning(
-            "⚠️  No decryption source configured (FEEDLING_ENCLAVE_URL and "
-            "FEEDLING_MCP_URL are both unset). "
+            "⚠️  No decryption source configured (FEEDLING_ENCLAVE_URL is unset). "
             "User messages in v1 encrypted mode have content=\"\" and will be "
             "silently skipped — the consumer will never send replies. "
-            "Set FEEDLING_ENCLAVE_URL (direct enclave) or FEEDLING_MCP_URL "
-            "(via MCP server) to fix this."
+            "Set FEEDLING_ENCLAVE_URL (direct enclave) to fix this."
         )
 
     last_ts = _load_checkpoint()
@@ -3291,9 +5511,16 @@ def run() -> None:
         _save_proactive_checkpoint(last_job_ts)
     last_broadcast_state = ""
     next_proactive_tick_mono = time.monotonic() + max(0, PROACTIVE_TICK_START_DELAY_SEC)
+    scheduled_fire_enabled = proactive_enabled and PROACTIVE_SCHEDULED_FIRE_ENABLED
+    next_scheduled_fire_mono = time.monotonic() + max(0, PROACTIVE_SCHEDULED_FIRE_START_DELAY_SEC)
+    capture_tick_enabled = CAPTURE_TICK_ENABLED
+    next_capture_tick_mono = time.monotonic() + max(0, CAPTURE_TICK_START_DELAY_SEC)
+    screen_watch_enabled = proactive_enabled and SCREEN_WATCH_ENABLED
+    next_screen_watch_mono = time.monotonic() + max(0, SCREEN_WATCH_START_DELAY_SEC)
+    last_screen_watch_frame_id = ""
 
     log.info(
-        "starting poll loop — last_ts=%.3f last_job_ts=%.3f poll_timeout=%ds proactive=%s proactive_tick=%s tick_on=%ds tick_off=%ds",
+        "starting poll loop — last_ts=%.3f last_job_ts=%.3f poll_timeout=%ds proactive=%s proactive_tick=%s tick_on=%ds tick_off=%ds scheduled_fire=%s scheduled_fire_interval=%ds capture_tick=%s capture_tick_interval=%ds",
         last_ts,
         last_job_ts,
         POLL_TIMEOUT,
@@ -3301,14 +5528,70 @@ def run() -> None:
         PROACTIVE_TICK_ENABLED,
         PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC,
         PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC,
+        scheduled_fire_enabled,
+        PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC,
+        capture_tick_enabled,
+        CAPTURE_TICK_INTERVAL_SEC,
     )
 
     consecutive_errors = 0
 
     while _running:
         try:
+            _refresh_auth_header()  # pick up a freshly-minted runtime token (Stage D)
+            if capture_tick_enabled and time.monotonic() >= next_capture_tick_mono:
+                try:
+                    capture_result = fire_capture_tick()
+                    if capture_result.get("enqueued") or str(capture_result.get("reason") or "") not in {"", "no_new_messages", "quiet_not_due", "already_captured"}:
+                        log.info(
+                            "capture tick enqueued=%s reason=%s quiet_for=%s",
+                            bool(capture_result.get("enqueued")),
+                            capture_result.get("reason"),
+                            capture_result.get("quiet_for_sec", ""),
+                        )
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        capture_tick_enabled = False
+                        log.warning(
+                            "capture tick endpoint not available on this backend; "
+                            "disabling capture tick for this process"
+                        )
+                    else:
+                        raise
+                finally:
+                    next_capture_tick_mono = time.monotonic() + max(10, CAPTURE_TICK_INTERVAL_SEC)
             if proactive_enabled:
                 try:
+                    if scheduled_fire_enabled and time.monotonic() >= next_scheduled_fire_mono:
+                        try:
+                            fire_result = fire_scheduled_wakes()
+                            fire_results = fire_result.get("results") or []
+                            fire_jobs = fire_result.get("jobs") or []
+                            if fire_results or fire_jobs:
+                                statuses = [
+                                    str(item.get("status") or "")
+                                    for item in fire_results
+                                    if isinstance(item, dict)
+                                ]
+                                log.info(
+                                    "scheduled wake fire results=%d queued=%d statuses=%s",
+                                    len(fire_results),
+                                    len(fire_jobs),
+                                    ",".join(statuses) or "none",
+                                )
+                        except httpx.HTTPStatusError as e:
+                            if e.response.status_code == 404:
+                                scheduled_fire_enabled = False
+                                log.warning(
+                                    "scheduled wake fire endpoint not available on this backend; "
+                                    "disabling scheduled wake fire for this process"
+                                )
+                            else:
+                                raise
+                        finally:
+                            next_scheduled_fire_mono = (
+                                time.monotonic() + max(10, PROACTIVE_SCHEDULED_FIRE_INTERVAL_SEC)
+                            )
                     if PROACTIVE_TICK_ENABLED and time.monotonic() >= next_proactive_tick_mono:
                         tick_payload = {
                             "trigger": _proactive_tick_trigger_for_broadcast_state(last_broadcast_state),
@@ -3331,10 +5614,42 @@ def run() -> None:
                             next_interval,
                         )
                         next_proactive_tick_mono = time.monotonic() + next_interval
+                    if screen_watch_enabled and time.monotonic() >= next_screen_watch_mono:
+                        try:
+                            latest_fid, latest_ts, watch_frames = _screen_watch_recent_frames()
+                            fresh = bool(latest_fid) and (time.time() - latest_ts) <= SCREEN_WATCH_FRESH_SEC
+                            changed = bool(latest_fid) and latest_fid != last_screen_watch_frame_id
+                            if fresh and changed:
+                                # Only act on genuinely new content; backlog stays
+                                # reachable via screen_recent in the light prompt.
+                                last_screen_watch_frame_id = latest_fid
+                                sw_chat = recent_chat_context_for_proactive()
+                                user_age = sw_chat.last_user_message_age_sec
+                                chatting = (
+                                    user_age is not None
+                                    and user_age < SCREEN_WATCH_CHAT_SUPPRESS_SEC
+                                )
+                                if chatting:
+                                    log.info(
+                                        "screen-watch yielding to active chat (user_msg_age=%.0fs)",
+                                        user_age if user_age is not None else -1,
+                                    )
+                                else:
+                                    sw = post_screen_watch_tick("on", watch_frames)
+                                    log.info(
+                                        "screen-watch tick enqueued=%s frames=%d frame_id=%s",
+                                        bool(sw.get("enqueued")),
+                                        len(watch_frames),
+                                        latest_fid[:12],
+                                    )
+                        except Exception as e:
+                            log.warning("screen-watch tick failed: %s", e)
+                        finally:
+                            next_screen_watch_mono = time.monotonic() + max(30, SCREEN_WATCH_INTERVAL_SEC)
                     job_result = poll_proactive_jobs(last_job_ts)
                     jobs = job_result.get("jobs") or []
                     if jobs:
-                        new_job_ts = _process_proactive_jobs(jobs)
+                        new_job_ts = _process_resident_jobs(jobs)
                         if new_job_ts > last_job_ts:
                             last_job_ts = new_job_ts
                             _save_proactive_checkpoint(last_job_ts)
@@ -3352,6 +5667,9 @@ def run() -> None:
             consecutive_errors = 0
 
             if result.get("timed_out"):
+                # Idle moment: safe to swap to the backend's commit and re-exec
+                # (no in-flight message to interrupt). Does not return if it updates.
+                _maybe_self_update(result)
                 continue
 
             poll_messages = result.get("messages") or []
@@ -3360,7 +5678,7 @@ def run() -> None:
 
             # poll is used only as a trigger — its content fields are "" for
             # v1 encrypted envelopes. Fetch actual plaintext from a decrypt source.
-            if FEEDLING_ENCLAVE_URL or FEEDLING_MCP_URL:
+            if FEEDLING_ENCLAVE_URL:
                 decrypted = get_decrypted_history(since=last_ts, limit=20)
                 if decrypted is None:
                     # All configured sources failed — skip this cycle, keep checkpoint.

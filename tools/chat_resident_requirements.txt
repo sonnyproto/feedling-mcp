@@ -1,0 +1,3 @@
+# The resident consumer imports backend encryption/tooling directly and the
+# proactive V2 job path imports DB-backed runtime modules.
+-r ../backend/requirements.txt

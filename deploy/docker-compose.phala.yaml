@@ -1,14 +1,13 @@
 # Feedling — Phala TDX CVM compose (CVM-only, post-VPS migration).
 #
 # VPS is gone. This compose is the whole production stack:
-#   - dstack-ingress: TLS termination for mcp.feedling.app + api.feedling.app
+#   - dstack-ingress: TLS termination for api.feedling.app
 #   - backend:       Flask (HTTP+WS) — sole source of truth for user data
-#   - mcp:           FastMCP SSE (plain HTTP behind ingress)
 #   - enclave:       decrypt proxy + /attestation (own TLS on :5003,
 #                    reachable via dstack-gateway `-5003s.` passthrough)
 #
 # IMPORTANT: this replaces the prior VPS+CVM split. DNS A-records for
-# both `mcp.feedling.app` and `api.feedling.app` are migrated off
+# `api.feedling.app` is migrated off
 # the retired VPS host and onto Phala's dstack-gateway. Existing prod users
 # re-onboard from scratch (per user direction 2026-04-21).
 #
@@ -20,17 +19,15 @@
 #
 # DNS records dstack-ingress manages automatically (needs CF token with
 # Zone.DNS:Edit on feedling.app):
-#   CNAME mcp.feedling.app → <app-id>.dstack-pha-prod9.phala.network
 #   CNAME api.feedling.app → <app-id>.dstack-pha-prod9.phala.network
-#   TXT   _dstack-app-address.mcp.feedling.app → <app-id>:443
 #   TXT   _dstack-app-address.api.feedling.app → <app-id>:443
-#   CAA   mcp.feedling.app / api.feedling.app pinned to Let's Encrypt
+#   CAA   api.feedling.app pinned to Let's Encrypt
 #
 # Deploy flow:
 #   1. `phala deploy -c deploy/docker-compose.phala.yaml -n feedling-enclave-v2 \
 #         --node-id <prod9-node-id> -e CF_API_TOKEN=... -e CF_ZONE_ID=...`
 #   2. Wait for ingress to issue LE certs (first-time boot ~2–3 min).
-#   3. Update CF DNS: A records for mcp/api → the public IP printed by
+#   3. Update CF DNS: A record for api → the public IP printed by
 #      `phala cvms get feedling-enclave-v2` (or the CNAME target above).
 #   4. Compute compose_hash; publish on-chain via FeedlingAppAuth.addComposeHash.
 #   5. iOS follow-up PR: update `AuditCardView.swift` `makeAttestationURL`
@@ -47,7 +44,7 @@
 name: feedling-enclave
 
 services:
-  # --- Public TLS termination for both custom domains (mcp + api). ---
+  # --- Public TLS termination for the api custom domain. ---
   # HAProxy-based L4/L7 ingress inside the TDX CVM. Issues LE certs via
   # CF DNS-01, routes by SNI. Key material stays inside the enclave
   # volume `letsencrypt` — the CF token only has DNS-edit scope, not
@@ -62,12 +59,9 @@ services:
       GATEWAY_DOMAIN: "_.dstack-pha-prod9.phala.network"
       SET_CAA: "true"
       CERTBOT_EMAIL: "security@feedling.app"
-      # Multi-domain mode: one container, two SNI-routed upstreams.
       DOMAINS: |
-        mcp.feedling.app
         api.feedling.app
       ROUTING_MAP: |
-        mcp.feedling.app=mcp:5002
         api.feedling.app=backend:5001
       # CF_API_TOKEN must be injected via `phala deploy -e` (encrypted
       # env channel, NOT baked into compose_hash). Required scopes:
@@ -83,8 +77,6 @@ services:
       - feedling_ingress_evidences:/evidences
     depends_on:
       backend:
-        condition: service_started
-      mcp:
         condition: service_started
 
   # --- Attestation service + decrypt proxy. ---
@@ -103,16 +95,8 @@ services:
       FEEDLING_DATA_DIR: "/data"
       FEEDLING_ENCLAVE_TLS: "true"
       FEEDLING_FLASK_URL: "http://backend:5001"
-      # Post-prod9 migration: MCP terminates plain HTTP behind
-      # dstack-ingress. The LE cert for mcp.feedling.app lives on the
-      # ingress volume, NOT derived from dstack-KMS path
-      # `feedling-mcp-tls-v1`, so the Phase C.2 pubkey fingerprint no
-      # longer has a live counterpart. Leave empty → iOS renders the
-      # "Pre-Phase-C.2 deployment" disclosure row (already supported).
-      # Flip back to "true" only if restoring the MCP-in-enclave-TLS
-      # mode (compose would also need to re-add ACME env + mount
-      # /var/run/dstack.sock for the mcp service).
-      FEEDLING_MCP_TLS_IN_ENCLAVE: "false"
+      # model_api reads from the memory read-side (mirrors the test enclave).
+      MEMORY_READSIDE_FOR_MODEL_API: "true"
       # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
       # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
       # even when the value is empty, so an empty string would make it
@@ -149,9 +133,13 @@ services:
   backend:
     image: ghcr.io/teleport-computer/feedling:857c09e
     # gunicorn = production WSGI (the Werkzeug dev server stalls on large
-    # responses under TDX). -w 1 is mandatory: app.py binds the :9998 WS
-    # ingest at import time, so multiple workers would collide on it.
-    command: ["gunicorn", "--chdir", "backend", "-w", "1", "--threads", "32", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
+    # responses under TDX). -w N is now code-supported (leader-elected :9998 WS
+    # ingest + Postgres LISTEN/NOTIFY wake bus — see core/leader.py /
+    # core/wake_bus.py), BUT the image above is a pinned pre-patch digest that
+    # still binds :9998 at import time, so it MUST stay -w 1. Bump -w (and the ~17
+    # DB connections/worker = pool 16 + 1 listener, vs the DB's max_connections)
+    # IN THE SAME DEPLOY that rolls the image to a build containing this patch.
+    command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-w", "1", "--threads", "32", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
     restart: unless-stopped
     environment:
       FEEDLING_API_KEY: ""
@@ -170,6 +158,23 @@ services:
       # compose synthesis / build never aborts on an unset var; the backend
       # still fails fast at startup (db.py) if it ends up empty at runtime.
       DATABASE_URL: "${DATABASE_URL:-}"
+      # Cloudflare R2 (S3-compatible) offload for the heavy frame ciphertext
+      # (backend/object_storage.py). Injected via `phala deploy -e R2_*=...`
+      # (encrypted env channel). Empty default = feature OFF (body_ct stays
+      # inline in Postgres, legacy shape). The token MUST be scoped to the
+      # frames bucket. Adding these keys changes compose_hash once (the normal
+      # on-chain publish re-auths); rotating the values later is free.
+      R2_ENDPOINT: "${R2_ENDPOINT:-}"
+      R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
+      R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
+      R2_FRAMES_BUCKET: "${R2_FRAMES_BUCKET:-}"
+      # Dedicated bucket for client diagnostic logs (backend/diagnostics/),
+      # separate from frames. Plaintext logs (user-initiated upload). Bucket
+      # name is non-secret so it defaults on; activates whenever the R2
+      # credentials above are present. The R2 token MUST also be scoped to this
+      # bucket (else PUT 403 → graceful inline Postgres fallback). Set a short
+      # lifecycle (7d) on the bucket.
+      R2_USER_LOGS_BUCKET: "${R2_USER_LOGS_BUCKET:-io-user-logs}"
       # APNs developer key for push (Dynamic Island / Live Activity).
       # Injected via `phala deploy -e APNS_KEY_P8_B64=...` (encrypted env
       # channel, NOT baked into compose_hash). Empty default keeps dev
@@ -179,11 +184,47 @@ services:
       APNS_KEY_P8_B64: "${APNS_KEY_P8_B64:-}"
       APNS_KEY_ID: "${APNS_KEY_ID:-}"
       APNS_TEAM_ID: "${APNS_TEAM_ID:-}"
+      # Production push gateway (api.push.apple.com). apns.py defaults to the
+      # SANDBOX gateway when unset, which silently fails for App Store / TestFlight
+      # device tokens — prod must pin this to "false". (Test deploy keeps the
+      # sandbox default for its sandbox-provisioned tokens.)
+      APNS_SANDBOX: "false"
       # Optional LLM Gate for proactive screen outreach. If unset, automatic
       # Gate records model_not_configured and does not enqueue hidden jobs.
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
       FEEDLING_PROACTIVE_GATE_PROVIDER: "${FEEDLING_PROACTIVE_GATE_PROVIDER:-openrouter}"
       FEEDLING_PROACTIVE_GATE_MODEL: "${FEEDLING_PROACTIVE_GATE_MODEL:-google/gemini-3.1-flash-lite}"
+      # Baseline-ON for the perception/resident V2 rollout flags
+      # (perception_ingress / resident_wake / resident_chat). Prod users run V2
+      # by default; an explicit per-user blob value still wins, so rollback for a
+      # single user is a blob toggle (not a code revert) and the env can be
+      # flipped to "false" to revert the whole fleet. See
+      # core/util.runtime_v2_default_on().
+      FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"
+      # Mirrors the agent-runner's FEEDLING_LITELLM_ENABLE (see
+      # docker-compose.agent-runner.yaml). The hosted cutover decision lives in
+      # the backend, so it needs the same flag: gateway-only providers (gemini/
+      # openrouter/openai_compatible) stay on the legacy inline path until the
+      # in-CVM LiteLLM gateway is actually running — otherwise their sends wedge
+      # in `processing` (no consumer is spawned). Keep this in sync with the
+      # Defaults to "true": the cutover boot gate (assert_hosting_ready) refuses
+      # to start the backend without it, even for pure-native fleets. Still
+      # interpolation-driven so a GitHub var can override; unset/empty → true.
+      # Mirror the agent-runner's value.
+      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-true}"
+      # Host-all: every configured user is served by the agent-runner. The send
+      # routing here must agree with the supervisor's host_all discovery. Defaults
+      # to "true": the cutover routes all fit-provider users to agent-runner with
+      # no per-user flag (resolve_driver) and the boot gate requires it; unset/empty
+      # → true. The only remaining deploy-time secret is FEEDLING_RUNTIME_TOKEN_SECRET.
+      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-true}"
+      # Legacy memory migration is opt-in. Empty = off; set to 1 only after
+      # seeded Garden verification passes. Mirror agent-runner.
+      FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
+      # Stage-D runtime token secret — the BACKEND verifies tokens (enclave whoami
+      # falls back here), so it MUST share the agent-runner's secret or token auth
+      # 401s. Empty = off. Encrypted env, not baked into compose_hash.
+      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
     ports:
       - "5001:5001"
       - "9998:9998"
@@ -193,28 +234,61 @@ services:
       enclave:
         condition: service_healthy
 
-  # --- MCP SSE server (plain HTTP behind ingress). ---
-  # TLS termination moved to the ingress service; MCP speaks HTTP only.
-  # Consequence: the Phase C.2 MCP-port pubkey-pin (derived from
-  # dstack-KMS at path `feedling-mcp-tls-v1`) is no longer in this path.
-  # Ingress owns the LE cert for mcp.feedling.app. iOS audit card either
-  # (a) drops the MCP-TLS pin row, or (b) pins the ingress cert SPKI via
-  # a new attested fingerprint. See header TODO.
-  mcp:
-    image: ghcr.io/teleport-computer/feedling:857c09e
-    command: ["python", "-u", "backend/mcp_server.py"]
+  # agent-runner — 4th CVM service. Multi-tenant supervisor hosting the resident
+  # consumer (tools/chat_resident_consumer.py) per user, driving claude/codex in
+  # cli mode. Idle by default: empty AGENT_RUNTIME_USERS + autodiscover off → it
+  # spawns nobody (zero behaviour change). Enable per-user hosting by injecting a
+  # roster (AGENT_RUNTIME_USERS) via the encrypted env channel — no compose change
+  # / on-chain re-auth needed. See deploy/DEPLOYMENTS.md.
+  agent-runner:
+    image: ghcr.io/teleport-computer/feedling-agent-runner:857c09e
+    command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
     environment:
-      FEEDLING_API_KEY: ""
-      FEEDLING_FLASK_URL: "http://backend:5001"
+      FEEDLING_API_URL: "http://backend:5001"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
-      FEEDLING_MCP_PORT: "5002"
-      FEEDLING_MCP_TRANSPORT: "sse"
-      # Plain HTTP — ingress terminates TLS.
-      FEEDLING_MCP_TLS: "false"
+      AGENT_DATA_ROOT: "/agent-data"
+      AGENT_LEASE_TTL_SEC: "60"
+      AGENT_TICK_INTERVAL_SEC: "15"
+      AGENT_RUNTIME_ISOLATION: "process"
+      # Same external Postgres as the backend (lease table). Encrypted env channel.
+      DATABASE_URL: "${DATABASE_URL:-}"
+      # Roster of users to host (JSON). Carries per-user keys → encrypted env
+      # channel, never baked. Empty = idle.
+      AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
+      # Discover hosted-enabled users from the DB (intersected with roster creds).
+      AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
+      # Stage-D runtime token signing secret. Empty = off (consumer uses api key).
+      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+      # Host-all (zero-roster): mint a token per DB-discovered user and resolve its
+      # provider key with it — no AGENT_RUNTIME_USERS needed. Defaults to "true" to
+      # mirror the backend; host_all_active still also requires the token secret
+      # above (stays dormant until FEEDLING_RUNTIME_TOKEN_SECRET is injected).
+      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-true}"
+      # Same migration kill-switch as backend. Empty = off; when off, the
+      # resident consumer will not process queued memory_migrate jobs.
+      FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
+      # in-CVM LiteLLM gateway (codex non-openai). Defaults to "true" to mirror the
+      # backend's FEEDLING_LITELLM_ENABLE (the cutover boot gate requires it); unset/
+      # empty → true. FEEDLING_LITELLM_PYTHON is baked in the image (isolated venv);
+      # the gateway only actually spins up when a gateway-provider user is present.
+      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-true}"
+      FEEDLING_LITELLM_PORT: "${FEEDLING_LITELLM_PORT:-4000}"
+      FEEDLING_LITELLM_API_KEY: "${FEEDLING_LITELLM_API_KEY:-}"
+      # Genesis import worker (mirrors the test agent-runner). Activates only when
+      # the prerequisites are present (FEEDLING_RUNTIME_TOKEN_SECRET above +
+      # FEEDLING_ENCLAVE_URL); if the secret is unset the supervisor logs a
+      # warning and stays dormant rather than crashing.
+      FEEDLING_GENESIS_WORKER_ENABLED: "1"
+      FEEDLING_GENESIS_WORKER_INTERVAL_SEC: "10"
+      FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC: "7200"
+    volumes:
+      - feedling_agent_runtime:/agent-data
     depends_on:
       backend:
         condition: service_started
+      enclave:
+        condition: service_healthy
 
 volumes:
   feedling_enclave_data:
@@ -225,3 +299,5 @@ volumes:
     name: feedling_ingress_letsencrypt
   feedling_ingress_evidences:
     name: feedling_ingress_evidences
+  feedling_agent_runtime:
+    name: feedling_agent_runtime

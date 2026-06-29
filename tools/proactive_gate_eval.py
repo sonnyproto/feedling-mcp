@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Summarize human-reviewed Proactive Gate decisions.
+"""Summarize human-reviewed Proactive / Runtime V2 decisions.
 
 Inputs are either:
   1. A JSON snapshot from /v1/proactive/debug.
   2. A live backend URL + API key.
 
 The script does not train anything. It gives the review loop a stable confusion
-matrix and the concrete examples to inspect before changing prompt/policy.
+matrix and the concrete examples to inspect before changing runtime policy.
 """
 
 from __future__ import annotations
@@ -20,10 +20,30 @@ from pathlib import Path
 from typing import Any
 
 
-FALSE_POSITIVE_LABELS = {"spam", "weak_connection", "repeated", "privacy_bad"}
-FALSE_NEGATIVE_LABELS = {"missed_opportunity"}
-TRUE_POSITIVE_LABELS = {"correct_true", "great_companion_moment"}
+FALSE_POSITIVE_LABELS = {
+    "too_much_buzz",
+    "wrong_voice",
+    "late_irrelevant",
+    "privacy_bad",
+    # Legacy Gate labels accepted for old snapshots.
+    "spam",
+    "weak_connection",
+    "repeated",
+}
+FALSE_NEGATIVE_LABELS = {
+    "missed_moment",
+    "went_dark",
+    # Legacy Gate label accepted for old snapshots.
+    "missed_opportunity",
+}
+TRUE_POSITIVE_LABELS = {
+    "good_presence",
+    # Legacy Gate labels accepted for old snapshots.
+    "correct_true",
+    "great_companion_moment",
+}
 TRUE_NEGATIVE_LABELS = {"correct_false"}
+RUNTIME_OBSERVATION_LABELS = {"too_chatty", "ignored_manual", "stutter"}
 
 
 def _load_snapshot(args: argparse.Namespace) -> dict[str, Any]:
@@ -49,6 +69,8 @@ def _latest_reviews(snapshot: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def _bucket(label: str, decision_true: bool) -> str:
+    if label in RUNTIME_OBSERVATION_LABELS:
+        return "runtime_observation"
     if label in TRUE_POSITIVE_LABELS:
         return "tp" if decision_true else "fn_review_inconsistent"
     if label in TRUE_NEGATIVE_LABELS:
