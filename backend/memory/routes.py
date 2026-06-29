@@ -128,11 +128,16 @@ def _memory_readside_post_enclave(
     operation: str,
     payload: dict | None = None,
 ) -> dict:
+    # host-all agents call with a Stage-D runtime token and no api_key; forward it
+    # so the enclave readside resolves the user without an api_key (same auth the
+    # io_cli client uses). Read straight from the request — we're in its context.
+    runtime_token = request.headers.get("X-Feedling-Runtime-Token", "").strip() or None
     return memory_readside_core.post_enclave_readside(
         api_key,
         candidates,
         operation=operation,
         payload=payload,
+        runtime_token=runtime_token,
     )
 
 

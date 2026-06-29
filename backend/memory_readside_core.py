@@ -215,11 +215,22 @@ def post_enclave_readside(
     *,
     operation: str,
     payload: dict | None = None,
+    runtime_token: str | None = None,
 ) -> dict:
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
         raise RuntimeError("enclave_unavailable")
-    if not api_key:
+    # host-all / zero-roster agents authenticate with a Stage-D runtime token and
+    # carry NO per-user api_key. The enclave accepts either credential and resolves
+    # the caller from it (enclave_app._forward_auth_headers / _whoami_cached), so
+    # forward the runtime token when there's no api_key. Without this, every hosted
+    # agent's memory read 503s with api_key_unavailable even though the data is
+    # present. Prefer the token when present, mirroring the enclave's own forwarding.
+    if runtime_token:
+        auth_headers = {"X-Feedling-Runtime-Token": runtime_token}
+    elif api_key:
+        auth_headers = {"X-API-Key": api_key}
+    else:
         raise RuntimeError("api_key_unavailable")
     body = dict(payload or {})
     body["moments"] = candidates
@@ -227,7 +238,7 @@ def post_enclave_readside(
         with httpx.Client(timeout=20, verify=False) as client:
             resp = client.post(
                 f"{enclave_url}/v1/memory/{operation}",
-                headers={"X-API-Key": api_key},
+                headers=auth_headers,
                 json=body,
             )
     except httpx.HTTPError as e:

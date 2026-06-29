@@ -233,3 +233,56 @@ def test_fetch_core_splits_missing_unavailable_and_preserves_order(monkeypatch):
     assert [item["id"] for item in body["items"]] == ["ok_a", "ok_b"]
     assert body["missing_ids"] == ["missing", "other_user"]
     assert body["unavailable_ids"] == ["local", "archived", "superseded"]
+
+
+class _FakeResp:
+    status_code = 200
+    text = ""
+
+    def json(self):
+        return {"items": []}
+
+
+class _FakeClient:
+    """Captures the headers post_enclave_readside sends to the enclave."""
+
+    captured: dict = {}
+
+    def __init__(self, *a, **k):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def post(self, url, headers=None, json=None):
+        _FakeClient.captured = {"url": url, "headers": headers}
+        return _FakeResp()
+
+
+def test_post_enclave_readside_forwards_runtime_token(monkeypatch):
+    # host-all / zero-roster agents have a Stage-D runtime token but NO api_key.
+    # The enclave call must forward X-Feedling-Runtime-Token — without this every
+    # hosted agent memory read 503s with api_key_unavailable though data is present.
+    monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "http://enclave:5003")
+    monkeypatch.setattr(readside_core.httpx, "Client", _FakeClient)
+
+    out = readside_core.post_enclave_readside(
+        None, [], operation="index", runtime_token="rt_abc")
+    assert out == {"items": []}
+    assert _FakeClient.captured["headers"] == {"X-Feedling-Runtime-Token": "rt_abc"}
+
+    # api_key path unchanged (back-compat); token preferred when both present.
+    readside_core.post_enclave_readside("ak_1", [], operation="index")
+    assert _FakeClient.captured["headers"] == {"X-API-Key": "ak_1"}
+    readside_core.post_enclave_readside("ak_1", [], operation="index", runtime_token="rt_x")
+    assert _FakeClient.captured["headers"] == {"X-Feedling-Runtime-Token": "rt_x"}
+
+
+def test_post_enclave_readside_requires_some_credential(monkeypatch):
+    import pytest
+    monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "http://enclave:5003")
+    with pytest.raises(RuntimeError, match="api_key_unavailable"):
+        readside_core.post_enclave_readside(None, [], operation="index")
