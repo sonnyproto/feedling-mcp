@@ -1723,6 +1723,68 @@ def test_capture_get_json_disables_tls_verification_for_enclave_only(monkeypatch
     assert calls[-1][1]["verify"] is True
 
 
+def test_capture_json_helpers_refresh_runtime_token_before_each_request(monkeypatch, tmp_path):
+    calls = []
+    token_file = tmp_path / "runtime.jwt"
+    token_file.write_text("fresh-token")
+
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"ok": True}
+
+    def _get(url, **kwargs):
+        calls.append(("GET", url, dict(kwargs.get("headers") or {})))
+        return _Resp()
+
+    def _post(url, **kwargs):
+        calls.append(("POST", url, dict(kwargs.get("headers") or {})))
+        return _Resp()
+
+    monkeypatch.setattr(crc, "FEEDLING_RUNTIME_TOKEN_FILE", str(token_file))
+    monkeypatch.setattr(crc, "_runtime_token_exp", lambda token: time.time() + 60)
+    monkeypatch.setitem(crc._HEADERS, "X-API-Key", "stale-api-key")
+    crc._HEADERS.pop("X-Feedling-Runtime-Token", None)
+    monkeypatch.setattr(crc.httpx, "get", _get)
+    monkeypatch.setattr(crc.httpx, "post", _post)
+
+    assert crc._capture_get_json("/v1/memory/buckets") == {"ok": True}
+    assert crc._capture_post_json("/v1/memory/legacy_batch", payload={"batch_size": 8}) == {"ok": True}
+    assert calls[0][2].get("X-Feedling-Runtime-Token") == "fresh-token"
+    assert calls[1][2].get("X-Feedling-Runtime-Token") == "fresh-token"
+    assert "X-API-Key" not in calls[0][2]
+    assert "X-API-Key" not in calls[1][2]
+
+
+def test_migrate_job_fails_when_legacy_batch_response_missing(monkeypatch):
+    job = {
+        "job_id": "migr_missing_batch",
+        "job_kind": "memory_migrate",
+        "source": "memory_migrate",
+        "status": "pending",
+        "migrate_key": "migrate:v1:u:w1",
+        "ts": 123.0,
+    }
+    statuses = []
+
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status",
+                        lambda job_id, status, reason="", **kwargs: statuses.append((job_id, status, reason, kwargs)))
+    monkeypatch.setattr(crc, "_capture_post_json", lambda path, **kwargs: {})
+    monkeypatch.setattr(crc, "_seen_ids", set())
+    monkeypatch.setattr(crc, "_seen_ids_order", [])
+    monkeypatch.setenv("FEEDLING_MIGRATE_ENABLE", "1")
+
+    assert crc._process_migrate_jobs([job]) == pytest.approx(123.0)
+    assert statuses[0][:3] == ("migr_missing_batch", "realizing", "")
+    assert statuses[-1][0] == "migr_missing_batch"
+    assert statuses[-1][1] == "failed"
+    assert "legacy_batch_unavailable" in statuses[-1][2]
+    assert all(row[2] != "migrate_no_legacy" for row in statuses)
+
+
 def test_capture_identity_context_prefers_enclave_plaintext_and_filters_ciphertext(monkeypatch):
     calls = []
 

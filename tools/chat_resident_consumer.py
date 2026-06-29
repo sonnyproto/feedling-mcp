@@ -3971,6 +3971,7 @@ def _capture_get_json(
     timeout: int = 15,
     base_url: str | None = None,
 ) -> dict:
+    _refresh_auth_header()
     root = (base_url or FEEDLING_API_URL).rstrip("/")
     verify_tls = not (FEEDLING_ENCLAVE_URL and root == FEEDLING_ENCLAVE_URL)
     try:
@@ -3996,6 +3997,7 @@ def _capture_post_json(
     timeout: int = 20,
     base_url: str | None = None,
 ) -> dict:
+    _refresh_auth_header()
     root = (base_url or FEEDLING_API_URL).rstrip("/")
     verify_tls = not (FEEDLING_ENCLAVE_URL and root == FEEDLING_ENCLAVE_URL)
     try:
@@ -5099,6 +5101,15 @@ def _process_migrate_jobs(jobs: list) -> float:
         except (TypeError, ValueError):
             batch_size = 8
         batch_body = _capture_post_json("/v1/memory/legacy_batch", payload={"batch_size": batch_size})
+        if not isinstance(batch_body.get("batch"), list) or "legacy_remaining" not in batch_body:
+            reason = "legacy_batch_unavailable"
+            update_proactive_job_status(
+                job_id, "failed", reason,
+                extra={"migrate_result": {"status": "failed", "reason": reason}},
+            )
+            log.warning("migrate job failed id=%s reason=%s body_keys=%s",
+                        job_id, reason, sorted(batch_body.keys()) if isinstance(batch_body, dict) else [])
+            continue
         batch = batch_body.get("batch") if isinstance(batch_body.get("batch"), list) else []
         legacy_remaining = int(batch_body.get("legacy_remaining") or 0)
         if not batch:
