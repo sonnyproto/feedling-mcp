@@ -1379,6 +1379,74 @@ def test_openai_http_protocol_uses_session_headers(monkeypatch):
     assert saved == ["sess_new"]
 
 
+def test_memory_lane_raw_text_survives_chat_sanitizer(monkeypatch):
+    """memory_dream / memory_capture must parse the model's RAW output.
+
+    Prod regression: the agent-runner (http) path routed dream/capture output
+    through _sanitize_reply_text, the chat-bubble cleaner. A pretty-printed JSON
+    with an ASCII preamble and Chinese values gets decapitated by
+    _strip_leading_non_cjk_preamble (all ASCII structure lines before the first
+    CJK char are dropped), so the robust _extract_json_block then sees a broken
+    fragment -> no_json_object / json_decode_error, and every claimed dream job
+    failed. call_agent(..., raw_text=True) must bypass the chat sanitizer.
+    """
+    from memory.dream_prompt_v1 import parse_dream_consolidations
+
+    dream_json = (
+        "Here is the consolidation result:\n"
+        "{\n"
+        '  "consolidations": [\n'
+        "    {\n"
+        '      "op": "merge",\n'
+        '      "card_ids": ["a", "b"],\n'
+        '      "result": {\n'
+        '        "bucket": "工作",\n'
+        '        "threads": ["加班"],\n'
+        '        "summary": "合并卡",\n'
+        '        "content": "他最近一直在加班，压力很大",\n'
+        '        "importance": 0.7,\n'
+        '        "pulse": 0.3\n'
+        "      }\n"
+        "    }\n"
+        "  ],\n"
+        '  "questions_to_ask": ["要不要问问他周末有没有休息"]\n'
+        "}"
+    )
+
+    class _Resp:
+        headers: dict = {}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"choices": [{"message": {"content": dream_json}}]}
+
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://127.0.0.1:8642/v1/chat/completions")
+    monkeypatch.setattr(crc, "AGENT_HTTP_PROTOCOL", "openai")
+    monkeypatch.setattr(crc, "AGENT_HTTP_MODEL", "hermes-agent")
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_abc", "user_pk": None, "enclave_pk": None})
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_save_agent_session_id", lambda sid: None)
+    monkeypatch.setattr(crc.httpx, "post", lambda url, json=None, headers=None, timeout=None: _Resp())
+
+    # raw_text path: the literal model output reaches the dream parser intact.
+    raw = crc._capture_agent_reply_text(crc.call_agent("dream prompt", raw_text=True))
+    cons, questions, err = parse_dream_consolidations(raw)
+    assert err is None
+    assert len(cons) == 1
+    assert cons[0]["op"] == "merge"
+    assert cons[0]["result"]["content"] == "他最近一直在加班，压力很大"
+    assert questions == ["要不要问问他周末有没有休息"]
+
+    # Guard: the default chat path still mangles it — documents the prod bug and
+    # proves raw_text is what fixes it (not some unrelated parser change).
+    chat = crc._capture_agent_reply_text(crc.call_agent("dream prompt"))
+    _c, _q, chat_err = parse_dream_consolidations(chat)
+    assert chat_err is not None
+
+
 def test_openai_http_protocol_sends_multimodal_image_block(monkeypatch):
     captured = {}
 

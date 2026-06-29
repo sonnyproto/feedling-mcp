@@ -76,6 +76,35 @@ def test_tick_spawns_one_consumer_per_user_with_isolated_homes():
     assert leases.get("u_2")["lease_owner"] == "sup_A"
 
 
+def test_tick_caps_new_spawns_per_tick():
+    """冷启动大量用户时，一次 tick 只新起至多 max_spawns_per_tick 个 consumer，避免
+    一次性 fork 几十个把 CVM 压垮；剩下的下个 tick 继续，最终全部起齐。"""
+    procs = FakeProcTable()
+    sup = Supervisor(owner="sup_A", lease_ttl=300.0, data_root="/agent-data",
+                     spawn_fn=procs.spawn, alive_fn=procs.is_alive,
+                     kill_fn=procs.kill, now=lambda: T0,
+                     max_spawns_per_tick=2)
+    roster = _roster("u1", "u2", "u3", "u4", "u5")
+
+    sup.tick(roster)
+    assert len(procs.spawned) == 2          # 本 tick 只起 2 个
+    sup.tick(roster)
+    assert len(procs.spawned) == 4          # 下个 tick 再起 2 个
+    sup.tick(roster)
+    assert len(procs.spawned) == 5          # 第三 tick 起最后 1 个 → 全部起齐
+    # 已起的不会被重复 spawn
+    sup.tick(roster)
+    assert len(procs.spawned) == 5
+
+
+def test_tick_unlimited_spawns_by_default():
+    """默认（max_spawns_per_tick 未设）保持原行为：一个 tick 把整张 roster 全 spawn。"""
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    sup.tick(_roster("u1", "u2", "u3", "u4", "u5"))
+    assert len(procs.spawned) == 5
+
+
 def test_tick_defers_spawn_while_genesis_in_progress(monkeypatch):
     # "先 genesis 后 spawn": a host user whose import genesis is still running must
     # NOT boot a blank consumer; once genesis is done the next tick spawns.
@@ -552,6 +581,30 @@ def test_resolve_discovered_caches_by_user_and_envelope(monkeypatch):
     assert calls["n"] == 1                           # same envelope → decrypted once
 
 
+def test_resolve_discovered_isolates_per_user_failure(monkeypatch):
+    """一个用户的 mint/fetch/decrypt 抛异常（或超时）绝不能让整圈 resolve 崩掉——
+    其余用户照常解析。否则单个坏用户会拖垮整个 roster，该 tick 谁都起不来。"""
+    enabled = {
+        "bad": {"driver": "claude", "provider": "anthropic", "model": "m", "base_url": ""},
+        "good": {"driver": "claude", "provider": "deepseek", "model": "m", "base_url": ""},
+    }
+
+    def mint(uid):
+        if uid == "bad":
+            raise RuntimeError("token mint hung/failed")
+        return f"tok-{uid}"
+
+    monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope",
+                        lambda api_url, api_key="", runtime_token="": {"ct": "x"})
+    monkeypatch.setattr(supervisor_mod, "_decrypt_provider_key",
+                        lambda enclave_url, api_key="", envelope=None, runtime_token="": "sk")
+    out = supervisor_mod._resolve_discovered(enabled, mint_token=mint,
+                                             api_url="a", enclave_url="e", cache={})
+    uids = {e["user_id"] for e in out}
+    assert "good" in uids        # 好用户照常解析
+    assert "bad" not in uids     # 坏用户被隔离跳过：不抛、不拖累其余
+
+
 def test_effective_roster_host_all_uses_discovered_entries():
     # When host-all supplies pre-credentialed discovered entries, they ARE the
     # roster (no api_key roster needed); base_roster only overrides by user_id.
@@ -707,3 +760,52 @@ def test_supervisor_heartbeat_payload_shape():
     p = supervisor_mod._supervisor_heartbeat_payload(
         "host:7", host_all=True, gateway=False, ts=123.5)
     assert p == {"ts": 123.5, "owner": "host:7", "host_all": True, "gateway": False}
+
+
+def test_heartbeat_loop_writes_on_cadence_until_stopped(monkeypatch):
+    """心跳必须由独立线程按固定节奏写入，不被主循环的 discover→spawn 慢工作阻塞——
+    冷启动大量用户时，wedge 守卫不能因 supervision 跑得慢而误判 supervisor 死掉。"""
+    import threading
+    import time
+
+    writes = []
+    monkeypatch.setattr(supervisor_mod.db, "set_supervisor_heartbeat",
+                        lambda payload: writes.append(payload))
+    stop = threading.Event()
+    t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
+        owner="host:1", host_all=True, gateway=True, interval=0.01, stop_event=stop))
+    t.start()
+    time.sleep(0.05)
+    stop.set()
+    t.join(timeout=2)
+
+    assert not t.is_alive()                  # stop_event 能干净停止线程
+    assert len(writes) >= 1                   # 持续写心跳（不依赖任何 tick 完成）
+    assert writes[0]["owner"] == "host:1"
+    assert writes[0]["host_all"] is True
+    assert writes[0]["gateway"] is True
+    assert "ts" in writes[0]
+
+
+def test_heartbeat_loop_survives_write_errors(monkeypatch):
+    """单次心跳写失败（DB blip）绝不能让心跳线程退出——否则一次抖动后 wedge 永远 503。"""
+    import threading
+    import time
+
+    calls = {"n": 0}
+
+    def flaky(_payload):
+        calls["n"] += 1
+        raise RuntimeError("db blip")
+
+    monkeypatch.setattr(supervisor_mod.db, "set_supervisor_heartbeat", flaky)
+    stop = threading.Event()
+    t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
+        owner="o", host_all=False, gateway=False, interval=0.01, stop_event=stop))
+    t.start()
+    time.sleep(0.05)
+    stop.set()
+    t.join(timeout=2)
+
+    assert not t.is_alive()
+    assert calls["n"] >= 2                     # 写失败后继续重试，没有退出

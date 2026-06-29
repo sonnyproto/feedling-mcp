@@ -1848,7 +1848,58 @@ def _remember_http_session(resp: httpx.Response, *, sent_bytes: int = 0, receive
         _record_agent_session_turn(sid, sent_bytes=sent_bytes, received_bytes=received_bytes)
 
 
-def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = None) -> Any:
+def _content_blocks_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+        return "".join(parts)
+    if isinstance(content, dict) and isinstance(content.get("text"), str):
+        return content["text"]
+    return ""
+
+
+def _raw_assistant_text(body: Any) -> str:
+    """The model's *literal* assistant text, with NO chat-bubble sanitization.
+
+    Memory background lanes (capture/dream) parse JSON out of the model output
+    with their own robust extractors; they must NOT go through
+    _sanitize_reply_text, which is built for user-visible chat and decapitates a
+    pretty-printed JSON object (it strips every non-CJK line before the first
+    Chinese character). Returns "" when no content string can be located, so the
+    caller can fall back to the normal sanitized path.
+    """
+    if isinstance(body, str):
+        return body
+    if not isinstance(body, dict):
+        return ""
+    choices = body.get("choices")
+    if isinstance(choices, list):
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            message = choice.get("message")
+            if isinstance(message, dict):
+                text = _content_blocks_to_text(message.get("content"))
+                if text.strip():
+                    return text
+            text = _content_blocks_to_text(choice.get("text"))
+            if text.strip():
+                return text
+    # Generic / "simple" protocols: a top-level reply field.
+    for reply_field in ("response", "reply", "content", "text", "output"):
+        text = _content_blocks_to_text(body.get(reply_field))
+        if text.strip():
+            return text
+    return ""
+
+
+def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = None, raw_text: bool = False) -> Any:
     headers = _agent_http_headers()
     payload = {"message": message}
     if images:
@@ -1861,6 +1912,10 @@ def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = 
         received_bytes=_response_text_len(resp),
     )
     body = resp.json()
+    if raw_text:
+        text = _raw_assistant_text(body)
+        if text.strip():
+            return text
     if isinstance(body, dict):
         turn = _agent_turn_from_raw(body)
         if turn.actions or turn.thinking_summary or turn.tool_calls or len(turn.messages) > 1:
@@ -1873,7 +1928,7 @@ def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = 
     raise ValueError(f"unexpected response type: {type(body)}")
 
 
-def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = None) -> Any:
+def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = None, raw_text: bool = False) -> Any:
     headers = _agent_http_headers()
     sid = _load_agent_session_id()
     if sid:
@@ -1906,6 +1961,10 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
     body = resp.json()
     if not isinstance(body, dict):
         raise ValueError(f"unexpected OpenAI response type: {type(body)}")
+    if raw_text:
+        text = _raw_assistant_text(body)
+        if text.strip():
+            return text
     turn = _agent_turn_from_raw(body)
     if turn.actions or turn.thinking_summary or turn.tool_calls or len(turn.messages) > 1:
         return body
@@ -1914,13 +1973,13 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
     raise ValueError("OpenAI-compatible response has no usable reply text")
 
 
-def call_agent_http(message: str, images: list[dict[str, str]] | None = None) -> Any:
+def call_agent_http(message: str, images: list[dict[str, str]] | None = None, raw_text: bool = False) -> Any:
     if not AGENT_HTTP_URL:
         raise ValueError("AGENT_HTTP_URL is not set for http mode")
     if AGENT_HTTP_PROTOCOL in {"openai", "hermes", "chat_completions", "chat-completions"}:
-        return _call_agent_http_openai(message, images=images)
+        return _call_agent_http_openai(message, images=images, raw_text=raw_text)
     if AGENT_HTTP_PROTOCOL in {"simple", "generic", "json"}:
-        return _call_agent_http_simple(message, images=images)
+        return _call_agent_http_simple(message, images=images, raw_text=raw_text)
     raise ValueError(f"unknown AGENT_HTTP_PROTOCOL: {AGENT_HTTP_PROTOCOL!r}")
 
 
@@ -2409,7 +2468,7 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
     return _resolve_cli_executable(cmd)
 
 
-def call_agent_cli(message: str, image_paths: list[str] | None = None) -> Any:
+def call_agent_cli(message: str, image_paths: list[str] | None = None, raw_text: bool = False) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
 
@@ -2444,6 +2503,14 @@ def call_agent_cli(message: str, image_paths: list[str] | None = None) -> Any:
             return codex_reply
 
     raw = result.stdout
+    if raw_text:
+        # Memory lanes parse JSON from the model's literal output. Prefer the
+        # extracted assistant text (drops codex/claude transport framing) but do
+        # NOT route it through the chat-bubble sanitizer in _agent_turn_from_raw,
+        # which would decapitate a pretty-printed JSON object.
+        text = _extract_text_from_cli_output(raw)
+        if text.strip():
+            return text
     turn = _agent_turn_from_raw(raw)
     if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
         return raw
@@ -2545,13 +2612,21 @@ def call_agent(
     message: str,
     images: list[dict[str, str]] | None = None,
     image_paths: list[str] | None = None,
+    raw_text: bool = False,
 ) -> Any:
     if AGENT_MODE == "http":
-        raw = call_agent_http(message, images=images)
+        raw = call_agent_http(message, images=images, raw_text=raw_text)
     elif AGENT_MODE == "cli":
-        raw = call_agent_cli(message, image_paths=image_paths)
+        raw = call_agent_cli(message, image_paths=image_paths, raw_text=raw_text)
     else:
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
+
+    if raw_text:
+        # Background memory lanes (capture/dream) parse JSON from the model's
+        # literal output with their own robust extractors. Return it verbatim
+        # and skip the chat-bubble sanitizer below (which strips leading non-CJK
+        # lines and would behead a pretty-printed JSON object).
+        return raw if isinstance(raw, str) else _raw_assistant_text(raw)
 
     turn = _agent_turn_from_raw(raw)
     if turn.actions or turn.messages or turn.thinking_summary or turn.tool_calls:
@@ -4335,7 +4410,7 @@ def _process_capture_jobs(jobs: list) -> float:
             window=window_text,
         )
         try:
-            reply_text = _capture_agent_reply_text(call_agent(prompt))
+            reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
         except Exception as e:
             reason = f"capture_agent_call_failed:{type(e).__name__}"
             log.error("capture agent call failed id=%s: %s", job_id, e)
@@ -4667,7 +4742,7 @@ def _process_dream_jobs(jobs: list) -> float:
             recent_conversations=recent_text,
         )
         try:
-            reply_text = _capture_agent_reply_text(call_agent(prompt))
+            reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
         except Exception as e:
             reason = f"dream_agent_call_failed:{type(e).__name__}"
             log.error("dream agent call failed id=%s: %s", job_id, e)
@@ -5132,7 +5207,7 @@ def _process_migrate_jobs(jobs: list) -> float:
             vocab=f"已有桶: {buckets_text}\n已有线索: {threads_text}",
         )
         try:
-            reply_text = _capture_agent_reply_text(call_agent(prompt))
+            reply_text = _capture_agent_reply_text(call_agent(prompt, raw_text=True))
         except Exception as e:
             reason = f"migrate_agent_call_failed:{type(e).__name__}"
             log.error("migrate agent call failed id=%s: %s", job_id, e)

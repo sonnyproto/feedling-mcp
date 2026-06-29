@@ -25,6 +25,7 @@ Env:
   AGENT_DATA_ROOT       per-user home root (default /agent-data)
   AGENT_LEASE_TTL_SEC   lease TTL / heartbeat budget (default 60)
   AGENT_TICK_INTERVAL_SEC  loop interval (default 15)
+  AGENT_MAX_SPAWNS_PER_TICK  new consumers spawned per tick (default 8; 0=unlimited)
   AGENT_RUNTIME_ISOLATION  process (default) | container
 """
 
@@ -86,6 +87,7 @@ class Supervisor:
         api_url: str | None = None,
         enclave_url: str | None = None,
         introduction_enqueuer=None,
+        max_spawns_per_tick: int = 0,
     ) -> None:
         self.owner = owner
         self.lease_ttl = lease_ttl
@@ -97,6 +99,10 @@ class Supervisor:
         self.api_url = api_url or os.environ.get("FEEDLING_API_URL", "http://localhost:5001")
         self.enclave_url = enclave_url or os.environ.get("FEEDLING_ENCLAVE_URL", "")
         self.introduction_enqueuer = introduction_enqueuer or _enqueue_introduction_job_if_needed
+        # Cold-start fan-out cap: at most N NEW consumers spawned per tick (0 =
+        # unlimited, legacy behaviour). Spreads a many-user cold start across
+        # ticks so the CVM isn't hit by dozens of simultaneous process forks.
+        self.max_spawns_per_tick = int(max_spawns_per_tick or 0)
         self._now = now
         self.children: dict[str, dict] = {}  # user_id -> {pid, entry, home}
 
@@ -144,6 +150,7 @@ class Supervisor:
                 leases.release(user_id, self.owner, now=self._now())
                 self.children.pop(user_id, None)
 
+        spawned_this_tick = 0
         for entry in roster:
             user_id = str(entry.get("user_id") or "")
             if not user_id:
@@ -188,12 +195,17 @@ class Supervisor:
                 # (no genesis) and done/failed both fall through to spawn.
                 log.info("genesis in progress for %s; deferring spawn this tick", user_id)
                 continue
+            if self.max_spawns_per_tick and spawned_this_tick >= self.max_spawns_per_tick:
+                # Per-tick spawn cap reached — spawn the remaining users next tick
+                # (don't even acquire, so another supervisor could take them).
+                continue
             home = self._home(user_id)
             if not leases.acquire(user_id, driver=entry.get("driver", "claude"),
                                   runtime_home=home, lease_owner=self.owner,
                                   ttl=self.lease_ttl, now=self._now()):
                 continue  # another supervisor holds a live lease
             pid = self.spawn_fn(entry, user_id, home)
+            spawned_this_tick += 1
             self._write_token(user_id, home)  # initial short-lived token for the child
             leases.renew(user_id, self.owner, ttl=self.lease_ttl, pid=pid,
                          status="running", now=self._now())
@@ -465,38 +477,46 @@ def _resolve_discovered(enabled: dict, *, mint_token, api_url: str, enclave_url:
     consumer authenticates with the token file the supervisor writes per tick."""
     out = []
     for uid, info in enabled.items():
-        tok = mint_token(uid)
-        env = _fetch_key_envelope(api_url, runtime_token=tok)
-        cached = cache.get(uid)
-        provider_key = ""
-        if env and enclave_url:
-            sig = json.dumps(env, sort_keys=True)
-            if cached and cached.get("sig") == sig:
-                provider_key = cached["provider_key"]
-            else:
-                decrypted = _decrypt_provider_key(enclave_url, envelope=env, runtime_token=tok)
-                if decrypted:
-                    provider_key = decrypted
-                    cache[uid] = {"sig": sig, "provider_key": decrypted}
-                elif cached:
-                    # Decrypt failed (transient) on a changed envelope — keep the last
-                    # good key so a healthy consumer isn't respawned keyless this tick.
+        # Isolate per-user resolution: a single user's mint/fetch/decrypt hang or
+        # failure (a banned/limited gateway upstream, an enclave blip) must NOT
+        # abort the whole pass — the rest of the roster still resolves and spawns.
+        # The HTTP calls carry their own timeouts (fetch 10s, decrypt 20s), so this
+        # bounds a bad user and moves on rather than wedging the tick on it.
+        try:
+            tok = mint_token(uid)
+            env = _fetch_key_envelope(api_url, runtime_token=tok)
+            cached = cache.get(uid)
+            provider_key = ""
+            if env and enclave_url:
+                sig = json.dumps(env, sort_keys=True)
+                if cached and cached.get("sig") == sig:
                     provider_key = cached["provider_key"]
-        elif cached:
-            # Envelope fetch failed (transient) — fall back to the last good key
-            # rather than dropping it (which _spawn_identity reads as a config change).
-            provider_key = cached["provider_key"]
-        entry = {"user_id": uid, "driver": info["driver"], "provider": info.get("provider", ""),
-                 "model": info.get("model", ""), "base_url": info.get("base_url", "")}
-        if provider_key:
-            entry["provider_key"] = provider_key
-        # Carry the freshly-minted runtime token so ProcessSpawner.spawn can decrypt
-        # the genesis_persona blob at spawn time (zero-roster has no api_key — cutover
-        # gate 3 P0). Minted before spawn (this tick), so timing is solved. Excluded
-        # from _spawn_identity, so per-tick rotation does not bounce the consumer.
-        if tok:
-            entry["runtime_token"] = tok
-        out.append(entry)
+                else:
+                    decrypted = _decrypt_provider_key(enclave_url, envelope=env, runtime_token=tok)
+                    if decrypted:
+                        provider_key = decrypted
+                        cache[uid] = {"sig": sig, "provider_key": decrypted}
+                    elif cached:
+                        # Decrypt failed (transient) on a changed envelope — keep the last
+                        # good key so a healthy consumer isn't respawned keyless this tick.
+                        provider_key = cached["provider_key"]
+            elif cached:
+                # Envelope fetch failed (transient) — fall back to the last good key
+                # rather than dropping it (which _spawn_identity reads as a config change).
+                provider_key = cached["provider_key"]
+            entry = {"user_id": uid, "driver": info["driver"], "provider": info.get("provider", ""),
+                     "model": info.get("model", ""), "base_url": info.get("base_url", "")}
+            if provider_key:
+                entry["provider_key"] = provider_key
+            # Carry the freshly-minted runtime token so ProcessSpawner.spawn can decrypt
+            # the genesis_persona blob at spawn time (zero-roster has no api_key — cutover
+            # gate 3 P0). Minted before spawn (this tick), so timing is solved. Excluded
+            # from _spawn_identity, so per-tick rotation does not bounce the consumer.
+            if tok:
+                entry["runtime_token"] = tok
+            out.append(entry)
+        except Exception as e:  # noqa: BLE001
+            log.warning("resolve_discovered failed for %s; skipping this tick: %s", uid, e)
     return out
 
 
@@ -793,6 +813,27 @@ def _supervisor_heartbeat_payload(owner: str, *, host_all: bool, gateway: bool, 
             "host_all": bool(host_all), "gateway": bool(gateway)}
 
 
+def _heartbeat_loop(*, owner: str, host_all: bool, gateway: bool,
+                    interval: float, stop_event) -> None:
+    """Write the global supervisor heartbeat on a fixed cadence from a dedicated
+    thread, decoupled from the (potentially slow) discover→resolve→spawn loop.
+
+    The backend's wedge guard reads this heartbeat to confirm a supervisor is
+    hosting before routing a send. During a cold start of many users, the main
+    loop's per-user token-mint + enclave-decrypt + spawn work can run for minutes
+    in a single pass; if the heartbeat were written inline at the top of that loop
+    it would lag with it and the guard would wrongly 503 every send. Writing it
+    from here keeps it fresh regardless of how long supervision takes. Best-effort
+    — a write blip must never kill the thread (else one DB blip wedges sends)."""
+    while not stop_event.is_set():
+        try:
+            db.set_supervisor_heartbeat(_supervisor_heartbeat_payload(
+                owner, host_all=host_all, gateway=gateway, ts=time.time()))
+        except Exception as e:  # noqa: BLE001
+            log.warning("supervisor heartbeat write failed: %s", e)
+        stop_event.wait(interval)
+
+
 def main() -> int:
     logging.basicConfig(
         level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -801,6 +842,9 @@ def main() -> int:
     owner = f"{socket.gethostname()}:{os.getpid()}"
     lease_ttl = float(os.environ.get("AGENT_LEASE_TTL_SEC", "60"))
     interval = float(os.environ.get("AGENT_TICK_INTERVAL_SEC", "15"))
+    # Spread a many-user cold start across ticks (default 8/tick) instead of
+    # forking dozens of consumers in one pass. Set 0 to restore unlimited.
+    max_spawns_per_tick = int(os.environ.get("AGENT_MAX_SPAWNS_PER_TICK", "8"))
     data_root = os.environ.get("AGENT_DATA_ROOT", "/agent-data")
     isolation = os.environ.get("AGENT_RUNTIME_ISOLATION", "process").strip().lower()
 
@@ -868,7 +912,7 @@ def main() -> int:
     sup = Supervisor(
         owner=owner, lease_ttl=lease_ttl, data_root=data_root,
         spawn_fn=spawn_fn, alive_fn=alive_fn, kill_fn=kill_fn,
-        token_writer=token_writer,
+        token_writer=token_writer, max_spawns_per_tick=max_spawns_per_tick,
     )
     log.info("supervisor up — owner=%s base_users=%d autodiscover=%s host_all=%s gateway=%s ttl=%.0fs",
              owner, len(base_roster), autodiscover, host_all_active, gateway_enabled, lease_ttl)
@@ -901,19 +945,21 @@ def main() -> int:
         log.warning("FEEDLING_GENESIS_WORKER_ENABLED set but prerequisites missing "
                     "(need FEEDLING_RUNTIME_TOKEN_SECRET + FEEDLING_ENCLAVE_URL) — genesis worker dormant")
 
+    # Heartbeat from a dedicated thread, decoupled from the (potentially slow)
+    # discover→resolve→spawn loop below: a multi-minute cold-start pass must not
+    # stall the wedge-guard heartbeat (else the backend 503s every send). Capped
+    # well under the wedge's ~90s staleness threshold.
+    hb_stop = threading.Event()
+    threading.Thread(
+        target=_heartbeat_loop, daemon=True,
+        kwargs={"owner": owner, "host_all": host_all_active,
+                "gateway": gateway_enabled, "interval": min(interval, 15.0),
+                "stop_event": hb_stop},
+    ).start()
+
     try:
         while True:
             try:
-                # Heartbeat first each tick: the backend's /v1/model_api/chat/send
-                # wedge guard reads this to confirm a supervisor is actually
-                # hosting before routing a turn here. Best-effort — a write blip
-                # must not kill the supervision loop.
-                try:
-                    db.set_supervisor_heartbeat(_supervisor_heartbeat_payload(
-                        owner, host_all=host_all_active, gateway=gateway_enabled,
-                        ts=time.time()))
-                except Exception as e:  # noqa: BLE001
-                    log.warning("supervisor heartbeat write failed: %s", e)
                 # Re-derive the live roster each tick so enabling/disabling a user
                 # (or the gateway) takes effect without restarting the supervisor.
                 discovered = None
@@ -967,6 +1013,7 @@ def main() -> int:
         log.info("interrupted; releasing leases")
         return 0
     finally:
+        hb_stop.set()
         genesis_stop.set()
         sup.shutdown()
         if gateway_mgr is not None:

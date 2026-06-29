@@ -75,8 +75,18 @@ def build_model_entry(*, user_id: str, provider: str, model: str, base_url: str 
         "model": litellm_model_string(provider, model),
         "api_key": "os.environ/" + upstream_env_var(user_id),
     }
-    if _norm_provider(provider) == "openai_compatible" and base_url:
-        params["api_base"] = base_url
+    if _norm_provider(provider) == "openai_compatible":
+        # Codex 0.136 only speaks the OpenAI Responses wire (POST /v1/responses),
+        # but the third-party relays behind openai_compatible only implement
+        # /v1/chat/completions. LiteLLM treats provider=openai as natively
+        # Responses-capable (utils.get_provider_responses_api_config →
+        # OpenAIResponsesAPIConfig) and would passthrough /v1/responses → upstream
+        # 500. This first-class flag forces LiteLLM's responses→chat-completions
+        # bridge (responses/main.py `use_chat_completions_api is True`), turning
+        # codex's /v1/responses into a /chat/completions call the relay supports.
+        params["use_chat_completions_api"] = True
+        if base_url:
+            params["api_base"] = base_url
     return {"model_name": gateway_model_id(user_id), "litellm_params": params}
 
 

@@ -403,12 +403,23 @@ def _is_introduction_job(job: dict) -> bool:
     return str((job or {}).get("job_kind") or "").strip() == "introduction"
 
 
-def _resident_pending_introduction_jobs(store, *, limit: int, runtime_profile: dict) -> list[dict]:
+def _is_ts_watermark_exempt_job(job: dict) -> bool:
+    # Jobs that must be recovered by status, ignoring the consumer's ts
+    # watermark. The resident / agent-runner consumer seeds its proactive
+    # checkpoint to "now" on first boot, so any pending job created before that
+    # first poll (introduction posted at spawn; memory_capture/dream/migrate
+    # enqueued while the user was chatting before the consumer came up) has a ts
+    # below `since` and would otherwise be skipped forever (prod: a 17:58 capture
+    # job stayed pending while later dream jobs were claimed).
+    return _is_introduction_job(job) or capture_jobs.is_memory_maintenance_job(job)
+
+
+def _resident_pending_watermark_exempt_jobs(store, *, limit: int, runtime_profile: dict) -> list[dict]:
     out: list[dict] = []
     for job in store.list_proactive_jobs(since_epoch=0, limit=0):
         if str(job.get("status") or "pending") != "pending":
             continue
-        if not _is_introduction_job(job):
+        if not _is_ts_watermark_exempt_job(job):
             continue
         out.append(_with_resident_runtime_v2(job, runtime_profile))
         if len(out) >= limit:
@@ -447,12 +458,14 @@ def _resident_pollable_pending_jobs(store, *, since: float, limit: int, runtime_
     # right after process spawn. On a first boot the resident consumer seeds its
     # proactive checkpoint to "now" to avoid replaying historical hidden jobs, so
     # this one bootstrap job must be recovered by status rather than by ts > since.
-    out: list[dict] = _resident_pending_introduction_jobs(
+    out: list[dict] = _resident_pending_watermark_exempt_jobs(
         store,
         limit=limit,
         runtime_profile=runtime_profile,
     )
     seen = {str(job.get("job_id") or "") for job in out}
+    if len(out) >= limit:
+        return out
     read_limit = max(limit, 100)
     for job in store.list_proactive_jobs(since_epoch=since, limit=read_limit):
         job_id = str(job.get("job_id") or "")
@@ -460,17 +473,10 @@ def _resident_pollable_pending_jobs(store, *, since: float, limit: int, runtime_
             continue
         if str(job.get("status") or "pending") != "pending":
             continue
-        if _is_introduction_job(job):
-            out.append(_with_resident_runtime_v2(job, runtime_profile))
-            if job_id:
-                seen.add(job_id)
-            if len(out) >= limit:
-                break
-            continue
-        if capture_jobs.is_memory_maintenance_job(job):
-            out.append(_with_resident_runtime_v2(job, runtime_profile))
-            if len(out) >= limit:
-                break
+        # introduction + memory-maintenance jobs are already recovered above
+        # (status-based, ts-watermark-exempt); skip them here so they aren't
+        # wake-gated by the v2 controls below.
+        if _is_ts_watermark_exempt_job(job):
             continue
         decision = _resident_wake_control_decision_v2(store, job)
         if decision is not None and not decision.accepted:

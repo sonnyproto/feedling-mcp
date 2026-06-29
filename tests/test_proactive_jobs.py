@@ -1103,6 +1103,62 @@ def test_capture_job_polls_and_claims_when_ambient_is_off(tmp_path, monkeypatch)
     assert patched["noop_reason"] == "nothing_worth_keeping"
 
 
+def test_capture_job_recovered_when_created_before_consumer_watermark(tmp_path, monkeypatch):
+    # Prod regression: a memory_capture job created *before* the resident /
+    # agent-runner consumer's first poll (so its ts is below the consumer's
+    # spawn-time `since` watermark) was permanently skipped — pending forever,
+    # never claimed — while later dream jobs (ts > watermark) were claimed.
+    # Memory-maintenance jobs must be recovered by status, ignoring ts, exactly
+    # like the post-spawn introduction job.
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_capture_watermark_key"
+    user_id = "usr_capture_watermark"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.save_proactive_settings({
+        "ambient": False,
+        "scheduled": False,
+        "reminders_delivery": False,
+    })
+
+    # Capture job created at ts=1000 (== "17:58", before the consumer spawned).
+    job, enqueued, reason = proactive_capture_jobs.enqueue_memory_capture_job(
+        store,
+        trigger="session_break",
+        capture_key="window:pre-watermark",
+        window={
+            "after_message_id": "msg_before",
+            "until_message_id": "msg_until",
+            "until_ts": 999.0,
+            "message_count": 8,
+        },
+        now=1000.0,
+    )
+    assert enqueued is True and job is not None
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    # Consumer first boot seeds its watermark to "now" (== "18:00", ts=2000),
+    # well above the capture job's ts. It must still be delivered.
+    poll = client.get("/v1/proactive/jobs/poll?since=2000&timeout=0", headers=headers)
+
+    assert poll.status_code == 200
+    body = poll.get_json()
+    assert [row["job_id"] for row in body["jobs"]] == [job["job_id"]]
+    assert body["jobs"][0]["job_kind"] == "memory_capture"
+
+    claim = client.post(
+        f"/v1/proactive/jobs/{job['job_id']}/claim",
+        headers=headers,
+        json={"consumer_id": "agent-runner:usr_capture_watermark"},
+    )
+    assert claim.status_code == 200
+    assert claim.get_json()["claimed"] is True
+
+
 def test_capture_enqueue_single_flight_per_user(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_capture_single_flight")
