@@ -75,10 +75,23 @@ def renew(
     driver: str | None = None,
     now: float | None = None,
 ) -> bool:
-    """Heartbeat: extend the lease iff we still own a live lease.
+    """Heartbeat: extend the lease iff we still own the row (``lease_owner`` is us),
+    regardless of expiry.
 
-    Returns False if we lost ownership or the lease already expired (the caller
-    should then stop its consumer — another supervisor may have taken over).
+    Matching on ownership alone — not "ownership AND still-live" — is the reclaim
+    fix: an owner whose own lease briefly lapsed on a slow lap (its row is still
+    stamped with our id, since only ``acquire`` by another or ``release`` by us
+    changes the owner) renews it instead of being told it "lost" a lease nobody
+    took. The original "must still own a LIVE lease" rule killed healthy consumers
+    on every brief self-expiry — on a slow many-user lap a kill→respawn death
+    spiral (and 503'd sends against the expired lease).
+
+    Returns False for every row NOT owned by us — another owner's lease (live OR
+    expired-but-not-released; renew must never steal a row that may have a fresh
+    consumer behind it) AND a released/unowned row (``lease_owner IS NULL``; a
+    row the tick just released for a removed user must not be reanimated with the
+    now-dead pid by an in-flight renew). All ownership (re)acquisition goes
+    through ``acquire``; renew only refreshes what is already ours.
 
     ``driver`` updates the recorded agent when a live consumer is respawned in
     place under a new driver (e.g. the user switches API key openai→anthropic, so
@@ -97,14 +110,60 @@ def renew(
             updated_at = now()
         WHERE user_id = %s
           AND lease_owner = %s
-          AND lease_expires_at >= to_timestamp(%s)
         RETURNING user_id
     """
     with db.get_pool().connection() as conn:
         row = conn.execute(
-            sql, (expires, clock, status, pid, session_ref, driver, user_id, lease_owner, clock)
+            sql, (expires, clock, status, pid, session_ref, driver,
+                  user_id, lease_owner)
         ).fetchone()
     return bool(row)
+
+
+def renew_many(
+    items: list[tuple[str, int]],
+    lease_owner: str,
+    *,
+    ttl: float,
+    status: str = "running",
+    now: float | None = None,
+) -> set[str]:
+    """Renew leases for many ``(user_id, pid)`` pairs in ONE round-trip.
+
+    Same ownership-only reclaim as ``renew``: a pair is renewed iff we still own
+    the row (``lease_owner`` is us), regardless of expiry; any row owned by
+    another supervisor OR released/unowned (``lease_owner IS NULL``) is skipped —
+    (re)acquiring ownership is ``acquire``'s job, never renew's. Returns the set
+    of user_ids we hold afterwards; any pair NOT in the set is no longer ours and
+    the caller reaps its child.
+
+    Collapses the supervisor's per-tick N×serial lease heartbeats (the dominant
+    renew cost at host-all scale) into a single statement, so a growing fleet
+    can't push a renew pass past the TTL and re-open the churn window.
+    """
+    if not items:
+        return set()
+    clock = _now(now)
+    expires = clock + ttl
+    user_ids = [str(u) for u, _ in items]
+    pids = [int(p) for _, p in items]
+    sql = """
+        UPDATE agent_runtime_instances AS a SET
+            lease_expires_at = to_timestamp(%s),
+            last_heartbeat_at = to_timestamp(%s),
+            status = %s,
+            pid = v.pid,
+            updated_at = now()
+        FROM unnest(%s::text[], %s::bigint[]) AS v(user_id, pid)
+        WHERE a.user_id = v.user_id
+          AND a.lease_owner = %s
+        RETURNING a.user_id
+    """
+    with db.get_pool().connection() as conn:
+        rows = conn.execute(
+            sql, (expires, clock, status, user_ids, pids, lease_owner)
+        ).fetchall()
+    return {r[0] for r in rows}
 
 
 def set_session_ref(user_id: str, lease_owner: str, session_ref: str, *, now: float | None = None) -> bool:

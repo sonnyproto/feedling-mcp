@@ -389,6 +389,25 @@ def test_renew_live_reaps_a_dead_child():
     assert leases.get("u_1")["lease_owner"] is None   # lease released
 
 
+def test_renew_live_reclaims_own_expired_lease_without_killing():
+    # The churn bug: if our own lease lapsed (a slow lap outran the TTL) but no
+    # other supervisor took it, the renewer must RECLAIM it — not kill a healthy
+    # child and re-spawn it (the death spiral that 503'd every send).
+    t = {"v": T0}
+    procs = FakeProcTable()
+    sup = _sup(procs, clock=lambda: t["v"])
+    sup.tick(_roster("u_1"))
+    pid = sup.children["u_1"]["pid"]
+
+    t["v"] = T0 + 400                        # past our own ttl (300); nobody took it
+    sup.renew_live()
+    assert pid not in procs.killed           # healthy child NOT killed
+    assert "u_1" in sup.children
+    row = leases.get("u_1")
+    assert row["lease_owner"] == "sup_A"     # reclaimed
+    assert row["lease_expires_at"] is not None
+
+
 def test_renew_live_kills_orphan_after_lease_lost():
     t = {"v": T0}
     procs_a = FakeProcTable()
@@ -404,6 +423,27 @@ def test_renew_live_kills_orphan_after_lease_lost():
     sup_a.renew_live()                       # sup_A's renewer notices it lost the lease
     assert pid in procs_a.killed
     assert "u_1" not in sup_a.children
+
+
+def test_renew_live_reaps_when_other_owner_took_over_then_expired():
+    # Codex P1: A's lease lapses, B takes over and spawns; later B's lease also
+    # briefly lapses. A's renewer must NOT reclaim B's row (that double-runs two
+    # consumers) — it reaps its own orphaned child and leaves B's lease alone.
+    t = {"v": T0}
+    procs_a = FakeProcTable()
+    sup_a = _sup(procs_a, owner="sup_A", clock=lambda: t["v"])
+    sup_a.tick(_roster("u_1"))
+    pid = sup_a.children["u_1"]["pid"]
+
+    sup_b = _sup(FakeProcTable(), owner="sup_B", clock=lambda: T0 + 400)
+    sup_b.tick(_roster("u_1"))                       # B takes the expired lease
+    assert leases.get("u_1")["lease_owner"] == "sup_B"
+
+    t["v"] = T0 + 800                                # B's lease (exp T0+700) lapsed too
+    sup_a.renew_live()
+    assert pid in procs_a.killed                     # A reaps its orphan, doesn't steal
+    assert "u_1" not in sup_a.children
+    assert leases.get("u_1")["lease_owner"] == "sup_B"   # B's row untouched
 
 
 def test_respawn_does_not_lose_lease_to_concurrent_renew():

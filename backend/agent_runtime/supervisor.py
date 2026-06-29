@@ -243,29 +243,40 @@ class Supervisor:
         (spawn new users, respawn on config change) stays in ``tick``; this path
         never spawns, so a slow resolve can't starve heartbeats.
 
-        DB calls run OUTSIDE the lock (the lock only guards the children-dict
-        snapshot and any reap), so a slow renew never blocks the tick. A child
-        we find dead, or whose lease we've lost to another supervisor, is reaped
-        here just as ``tick`` would — keeping "exactly one consumer per user"."""
+        The DB renew runs as ONE batched statement OUTSIDE the lock (the lock
+        only guards the children-dict snapshot and any reap), so a slow renew
+        never blocks the tick and the pass stays well under the TTL regardless of
+        fleet size. A child we find dead, or whose lease we've lost to a live
+        other supervisor, is reaped here just as ``tick`` would — keeping
+        "exactly one consumer per user"."""
         with self._lock:
             snapshot = list(self.children.items())
+        # Reap dead children first so we only renew live ones.
+        live: list[tuple[str, dict]] = []
         for user_id, child in snapshot:
-            pid = child["pid"]
-            if not self.alive_fn(pid):
+            if not self.alive_fn(child["pid"]):
                 with self._lock:
                     if self.children.get(user_id) is child:
                         leases.release(user_id, self.owner, now=self._now())
                         self.children.pop(user_id, None)
                 continue
-            if not leases.renew(user_id, self.owner, ttl=self.lease_ttl,
-                                pid=pid, status="running", now=self._now()):
-                # Lost the lease (expired window → another supervisor took over).
-                # Kill our orphaned child so two consumers don't both run.
-                log.warning("renew lost lease for %s; terminating orphaned child", user_id)
-                with self._lock:
-                    if self.children.get(user_id) is child:
-                        self.kill_fn(pid)
-                        self.children.pop(user_id, None)
+            live.append((user_id, child))
+        if not live:
+            return
+        held = leases.renew_many(
+            [(user_id, child["pid"]) for user_id, child in live],
+            self.owner, ttl=self.lease_ttl, now=self._now())
+        for user_id, child in live:
+            if user_id in held:
+                continue
+            # Lost the lease (a live other supervisor took over). Kill our orphaned
+            # child so two consumers don't both run. A brief self-expiry that
+            # nobody took is reclaimed by renew_many, not killed here.
+            log.warning("renew lost lease for %s; terminating orphaned child", user_id)
+            with self._lock:
+                if self.children.get(user_id) is child:
+                    self.kill_fn(child["pid"])
+                    self.children.pop(user_id, None)
 
     def shutdown(self) -> None:
         with self._lock:
@@ -975,7 +986,12 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     owner = f"{socket.gethostname()}:{os.getpid()}"
-    lease_ttl = float(os.environ.get("AGENT_LEASE_TTL_SEC", "60"))
+    # Default well above a worst-case multi-minute supervision lap so a lease
+    # never lapses between renew passes. The compose pins this explicitly (300);
+    # the code default matches so a missing env can't silently fall back to the
+    # old 60s that re-opened the churn window. (renew now reclaims an uncontested
+    # self-expiry too, so this is defence in depth, not the sole guard.)
+    lease_ttl = float(os.environ.get("AGENT_LEASE_TTL_SEC", "300"))
     interval = float(os.environ.get("AGENT_TICK_INTERVAL_SEC", "15"))
     # Spread a many-user cold start across ticks (default 8/tick) instead of
     # forking dozens of consumers in one pass. Set 0 to restore unlimited.

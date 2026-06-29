@@ -25,6 +25,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 log = logging.getLogger("feedling.agent_runtime.spawners")
@@ -404,9 +405,30 @@ def _signal_alive(pid: int) -> bool:
         return False
 
 
+# How long to wait for a graceful SIGTERM exit before escalating to SIGKILL.
+# A consumer that traps/ignores SIGTERM (or wedges in a syscall) would otherwise
+# linger and double-run with its replacement; short enough not to stall the kill
+# paths (respawn / lost-lease reap) for long.
+_KILL_GRACE_SEC = 3.0
+
+
 def _signal_kill(pid: int) -> None:
+    """SIGTERM a pid we don't hold a Popen handle for, escalating to SIGKILL if it
+    doesn't exit within the grace window (the no-handle fallback path — e.g. after
+    a supervisor restart, or the container strategy)."""
     try:
         os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return  # already gone / not ours
+    deadline = time.monotonic() + _KILL_GRACE_SEC
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return  # exited on SIGTERM
+        time.sleep(0.1)
+    try:
+        os.kill(pid, signal.SIGKILL)  # ignored SIGTERM → force
     except OSError:
         pass
 
@@ -456,7 +478,11 @@ class ProcessSpawner:
         try:
             if proc.poll() is None:
                 proc.terminate()
-                proc.wait(timeout=5)
+                try:
+                    proc.wait(timeout=_KILL_GRACE_SEC)
+                except subprocess.TimeoutExpired:
+                    proc.kill()  # SIGTERM ignored / wedged → force, then reap
+                    proc.wait(timeout=_KILL_GRACE_SEC)
         except Exception:  # noqa: BLE001
             pass
         self._procs.pop(pid, None)
