@@ -105,7 +105,13 @@ def _save_identity_action_payload(
     return identity, change, ""
 
 
-def _identity_profile_patch(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
+def _identity_profile_patch(
+    store: UserStore,
+    api_key: str | None,
+    action: dict,
+    *,
+    runtime_token: str = "",
+) -> tuple[dict, list[dict], int]:
     patch = action.get("patch") if isinstance(action.get("patch"), dict) else {}
     for key in identity_service._IDENTITY_PROFILE_FIELDS:
         if key in action and key not in patch:
@@ -113,7 +119,7 @@ def _identity_profile_patch(store: UserStore, api_key: str | None, action: dict)
     if not patch:
         return {"status": "error", "error": "patch_required", "action": "identity.profile_patch"}, [], 400
 
-    plain, err = _identity_plain_for_action(store, api_key)
+    plain, err = _identity_plain_for_action(store, api_key, runtime_token=runtime_token)
     if plain is None:
         return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409
 
@@ -231,7 +237,13 @@ def _identity_profile_patch(store: UserStore, api_key: str | None, action: dict)
     }, [effect], 200
 
 
-def _identity_dimension_nudge(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
+def _identity_dimension_nudge(
+    store: UserStore,
+    api_key: str | None,
+    action: dict,
+    *,
+    runtime_token: str = "",
+) -> tuple[dict, list[dict], int]:
     dimension_name = _identity_action_text(action.get("dimension") or action.get("dimension_name"), 80)
     if not dimension_name:
         return {"status": "error", "error": "dimension_required", "action": "identity.dimension_nudge"}, [], 400
@@ -240,7 +252,7 @@ def _identity_dimension_nudge(store: UserStore, api_key: str | None, action: dic
     except Exception:
         return {"status": "error", "error": "delta_required", "action": "identity.dimension_nudge"}, [], 400
 
-    plain, err = _identity_plain_for_action(store, api_key)
+    plain, err = _identity_plain_for_action(store, api_key, runtime_token=runtime_token)
     if plain is None:
         return {"status": "error", "error": err, "action": "identity.dimension_nudge"}, [], 409
 
@@ -354,14 +366,20 @@ def _identity_relationship_days_set(store: UserStore, action: dict) -> tuple[dic
     }, [effect], 200
 
 
-def _execute_identity_action(store: UserStore, api_key: str | None, action: dict) -> tuple[dict, list[dict], int]:
+def _execute_identity_action(
+    store: UserStore,
+    api_key: str | None,
+    action: dict,
+    *,
+    runtime_token: str = "",
+) -> tuple[dict, list[dict], int]:
     if not isinstance(action, dict):
         return {"status": "error", "error": "action_must_be_object"}, [], 400
     action_type = str(action.get("type") or action.get("action") or "").strip()
     if action_type == "identity.profile_patch":
-        return _identity_profile_patch(store, api_key, action)
+        return _identity_profile_patch(store, api_key, action, runtime_token=runtime_token)
     if action_type == "identity.dimension_nudge":
-        return _identity_dimension_nudge(store, api_key, action)
+        return _identity_dimension_nudge(store, api_key, action, runtime_token=runtime_token)
     if action_type == "identity.relationship_days_set":
         return _identity_relationship_days_set(store, action)
     return {
@@ -376,13 +394,24 @@ def _execute_identity_action(store: UserStore, api_key: str | None, action: dict
     }, [], 400
 
 
-def _execute_identity_actions(store: UserStore, api_key: str | None, actions: list[dict]) -> tuple[dict, int]:
+def _execute_identity_actions(
+    store: UserStore,
+    api_key: str | None,
+    actions: list[dict],
+    *,
+    runtime_token: str = "",
+) -> tuple[dict, int]:
     if not isinstance(actions, list) or not actions:
         return {"status": "error", "error": "actions_required", "results": [], "effects": []}, 400
     results: list[dict] = []
     effects: list[dict] = []
     for action in actions[:10]:
-        result, action_effects, status = _execute_identity_action(store, api_key, action)
+        result, action_effects, status = _execute_identity_action(
+            store,
+            api_key,
+            action,
+            runtime_token=runtime_token,
+        )
         results.append(result)
         effects.extend(action_effects)
         if status >= 400:

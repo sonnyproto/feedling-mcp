@@ -14,6 +14,7 @@ import provider_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
+from identity import actions as identity_actions_mod  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -163,6 +164,42 @@ def test_identity_profile_patch_reencrypts_existing_card(client, monkeypatch):
     assert saved["id"] == "identity_1"
     assert saved["body_ct"] == "ct_1"
     assert saved["relationship_started_at"] == "2026-04-01"
+
+
+def test_identity_profile_patch_passes_runtime_token_to_enclave(client, monkeypatch):
+    user_id, _api_key = _register(client)
+    _seed_identity(user_id)
+    store = appmod.get_store(user_id)
+    captured: dict = {}
+    captured_plaintexts: list = []
+
+    def fake_enclave_context(path, key, params=None, runtime_token=""):
+        captured["path"] = path
+        captured["key"] = key
+        captured["runtime_token"] = runtime_token
+        return ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, "")
+
+    monkeypatch.setattr(core_enclave, "_enclave_get_json_for_gate", fake_enclave_context)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    body, status = identity_actions_mod._execute_identity_actions(
+        store,
+        None,
+        [{
+            "type": "identity.profile_patch",
+            "patch": {"self_introduction": "我已经回来了。"},
+        }],
+        runtime_token="rtok_identity",
+    )
+
+    assert status == 200
+    assert body["status"] == "ok"
+    assert captured == {
+        "path": "/v1/identity/get",
+        "key": None,
+        "runtime_token": "rtok_identity",
+    }
+    assert captured_plaintexts[-1]["self_introduction"] == "我已经回来了。"
 
 
 @pytest.mark.xfail(reason="inline background runtime removed in chat-send 收口 (Task 3); behavior moved to agent-runner consumer — needs consumer-side coverage", strict=False)

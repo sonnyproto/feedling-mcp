@@ -2202,6 +2202,101 @@ def test_process_proactive_native_action_only_send_message_posts(monkeypatch):
     assert any(s[0] == "pj_native_send" and s[1] == "posted" for s in captured["statuses"])
 
 
+def test_message_for_introduction_job_uses_post_respawn_prompt():
+    message = crc._message_for_introduction_job({"job_kind": "introduction"})
+
+    assert "首次登场" in message
+    assert "identity.profile_patch" in message
+    assert "self_introduction" in message
+    assert "signature" in message
+    assert "messages" in message
+    assert "别编不存在的共同经历" in message
+
+
+def test_process_introduction_job_writes_identity_before_first_greeting(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    events = []
+    action = {
+        "type": "identity.profile_patch",
+        "patch": {
+            "self_introduction": "我是小满,我会一直在。",
+            "signature": ["我来了。"],
+        },
+    }
+
+    def _agent(message, images=None, image_paths=None):
+        events.append(("agent", message, images, image_paths))
+        return {"actions": [action], "messages": ["我来了。"]}
+
+    def _execute(actions):
+        events.append(("actions", actions))
+        return {"status": "ok", "effects": [{"type": "identity_updated"}]}
+
+    def _post(reply, **kwargs):
+        events.append(("post", reply, kwargs))
+        return {"id": "msg_intro"}
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "execute_agent_actions", _execute)
+    monkeypatch.setattr(crc, "post_reply", _post)
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *args, **kwargs: events.append(("status", args, kwargs)))
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: (_ for _ in ()).throw(AssertionError("screen context should not be fetched")))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: (_ for _ in ()).throw(AssertionError("recent chat should not be fetched")))
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: (_ for _ in ()).throw(AssertionError("perception digest should not be fetched")))
+
+    job = {
+        "job_id": "pj_intro",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 128.6,
+        "trigger": "post_spawn_genesis",
+        "job_kind": "introduction",
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(128.6)
+    assert events[0][0] == "status" and events[0][1][:2] == ("pj_intro", "realizing")
+    assert events[1][0] == "agent"
+    assert "首次登场" in events[1][1]
+    assert events[1][2] == []
+    assert events[1][3] == []
+    assert events[2] == ("actions", [action])
+    assert events[3][0] == "post"
+    assert events[3][1] == "我来了。"
+    assert events[3][2]["source"] == crc.PROACTIVE_JOB_SOURCE
+    assert events[3][2]["proactive_job_id"] == "pj_intro"
+
+
+def test_process_introduction_job_does_not_greet_if_identity_action_fails(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    events = []
+    action = {
+        "type": "identity.profile_patch",
+        "patch": {"self_introduction": "我是小满。", "signature": ["我来了。"]},
+    }
+
+    monkeypatch.setattr(crc, "call_agent", lambda *args, **kwargs: {"actions": [action], "messages": ["我来了。"]})
+    monkeypatch.setattr(crc, "execute_agent_actions", lambda actions: (_ for _ in ()).throw(RuntimeError("identity write failed")))
+    monkeypatch.setattr(crc, "post_reply", lambda *args, **kwargs: events.append(("post", args, kwargs)))
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *args, **kwargs: events.append(("status", args, kwargs)))
+
+    job = {
+        "job_id": "pj_intro_fail",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 128.7,
+        "trigger": "post_spawn_genesis",
+        "job_kind": "introduction",
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(128.7)
+    assert not any(item[0] == "post" for item in events)
+    failed = [item for item in events if item[0] == "status" and item[1][1] == "failed"]
+    assert failed
+    assert failed[-1][1][2].startswith("introduction_identity_action_failed")
+
+
 def test_process_proactive_native_schedule_and_cancel_actions_without_chat(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()

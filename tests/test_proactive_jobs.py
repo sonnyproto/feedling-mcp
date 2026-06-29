@@ -986,6 +986,38 @@ def test_resident_poll_applies_v2_wake_controls_to_legacy_jobs(tmp_path, monkeyp
     assert rows["pj_manual"]["status"] == "pending"
 
 
+def test_resident_poll_delivers_introduction_even_when_ambient_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_resident_poll_intro_key"
+    user_id = "usr_resident_poll_intro"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    store = appmod.get_store(user_id)
+    store.save_proactive_settings({
+        "ambient": False,
+        "scheduled": False,
+        "reminders_delivery": False,
+    })
+    store.append_proactive_job({
+        "job_id": "pj_intro",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 1000.0,
+        "status": "pending",
+        "trigger": "post_spawn_genesis",
+        "job_kind": "introduction",
+    })
+
+    client = appmod.app.test_client()
+    poll = client.get("/v1/proactive/jobs/poll?since=0&timeout=0", headers={"X-API-Key": api_key})
+
+    assert poll.status_code == 200
+    body = poll.get_json()
+    assert [job["job_id"] for job in body["jobs"]] == ["pj_intro"]
+    rows = {row["job_id"]: row for row in store.list_proactive_jobs(since_epoch=0, limit=0)}
+    assert rows["pj_intro"]["status"] == "pending"
+
+
 def test_capture_job_polls_and_claims_when_ambient_is_off(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()

@@ -102,6 +102,95 @@ def test_tick_spawns_fresh_start_user_with_no_genesis(monkeypatch):
     assert {s[1] for s in procs.spawned} == {"u_1"}
 
 
+def test_tick_enqueues_introduction_after_spawn(monkeypatch):
+    procs = FakeProcTable()
+    enqueued = []
+    sup = Supervisor(
+        owner="sup_A",
+        lease_ttl=300.0,
+        data_root="/agent-data",
+        spawn_fn=procs.spawn,
+        alive_fn=procs.is_alive,
+        kill_fn=procs.kill,
+        now=lambda: T0,
+        introduction_enqueuer=lambda user_id, entry, **kwargs: enqueued.append((user_id, entry, kwargs)) or {"job_id": "pj_intro"},
+    )
+    monkeypatch.setattr(db, "get_blob", lambda uid, kind: None)
+
+    sup.tick(_roster("u_1"))
+    sup.tick(_roster("u_1"))
+
+    assert len(enqueued) == 1
+    assert enqueued[0][0] == "u_1"
+    assert enqueued[0][1]["api_key"] == "key-u_1"
+    assert enqueued[0][2]["api_url"]
+    assert enqueued[0][2]["enclave_url"] is not None
+
+
+def test_enqueue_introduction_job_when_profile_fields_empty(monkeypatch):
+    class IntroStore:
+        user_id = "u_1"
+
+        def __init__(self):
+            self.jobs = []
+
+        def list_proactive_jobs(self, since_epoch=0, limit=0):
+            return list(self.jobs)
+
+        def append_proactive_job(self, job):
+            self.jobs.append(job)
+            return job
+
+    store = IntroStore()
+    monkeypatch.setattr(
+        supervisor_mod,
+        "_fetch_identity_plain_for_intro",
+        lambda entry, **kwargs: ({"decrypt_status": "ok", "self_introduction": "", "signature": []}, ""),
+    )
+
+    job = supervisor_mod._enqueue_introduction_job_if_needed(
+        "u_1",
+        {"api_key": "k"},
+        api_url="http://backend",
+        enclave_url="https://enclave",
+        now=lambda: T0,
+        get_store_fn=lambda _uid: store,
+    )
+    duplicate = supervisor_mod._enqueue_introduction_job_if_needed(
+        "u_1",
+        {"api_key": "k"},
+        api_url="http://backend",
+        enclave_url="https://enclave",
+        now=lambda: T0 + 1,
+        get_store_fn=lambda _uid: store,
+    )
+
+    assert job["job_kind"] == "introduction"
+    assert job["trigger"] == "post_spawn_genesis"
+    assert job["source"] == "agent_initiated_proactive"
+    assert job["status"] == "pending"
+    assert duplicate is None
+    assert len(store.jobs) == 1
+
+
+def test_enqueue_introduction_skips_existing_profile(monkeypatch):
+    monkeypatch.setattr(
+        supervisor_mod,
+        "_fetch_identity_plain_for_intro",
+        lambda entry, **kwargs: ({"decrypt_status": "ok", "self_introduction": "I am here.", "signature": []}, ""),
+    )
+
+    job = supervisor_mod._enqueue_introduction_job_if_needed(
+        "u_1",
+        {"api_key": "k"},
+        api_url="http://backend",
+        enclave_url="https://enclave",
+        get_store_fn=lambda _uid: (_ for _ in ()).throw(AssertionError("store should not be read")),
+    )
+
+    assert job is None
+
+
 def test_tick_is_idempotent_for_live_children():
     procs = FakeProcTable()
     sup = _sup(procs)

@@ -31,6 +31,7 @@ Env:
 from __future__ import annotations
 
 import base64
+from datetime import datetime
 import json
 import logging
 import os
@@ -56,6 +57,11 @@ from agent_runtime import leases, litellm_gateway, spawners
 
 log = logging.getLogger("feedling.agent_runtime.supervisor")
 
+INTRODUCTION_JOB_KIND = "introduction"
+INTRODUCTION_TRIGGER = "post_spawn_genesis"
+INTRODUCTION_INTENT_LABEL = "post_respawn_introduction"
+_INTRODUCTION_ACTIVE_STATUSES = {"pending", "claimed", "realizing"}
+
 
 def parse_roster(raw) -> list[dict]:
     """Parse a roster (JSON string or list) into entries that have an api_key."""
@@ -77,6 +83,9 @@ class Supervisor:
         kill_fn=spawners._signal_kill,
         now=time.time,
         token_writer=None,
+        api_url: str | None = None,
+        enclave_url: str | None = None,
+        introduction_enqueuer=None,
     ) -> None:
         self.owner = owner
         self.lease_ttl = lease_ttl
@@ -85,6 +94,9 @@ class Supervisor:
         self.alive_fn = alive_fn      # (pid) -> bool
         self.kill_fn = kill_fn        # (pid) -> None
         self.token_writer = token_writer  # (user_id, home) -> None, or None (Stage D off)
+        self.api_url = api_url or os.environ.get("FEEDLING_API_URL", "http://localhost:5001")
+        self.enclave_url = enclave_url or os.environ.get("FEEDLING_ENCLAVE_URL", "")
+        self.introduction_enqueuer = introduction_enqueuer or _enqueue_introduction_job_if_needed
         self._now = now
         self.children: dict[str, dict] = {}  # user_id -> {pid, entry, home}
 
@@ -98,6 +110,24 @@ class Supervisor:
 
     def _home(self, user_id: str) -> str:
         return f"{self.data_root}/users/{user_id}"
+
+    def _enqueue_introduction(self, user_id: str, entry: dict) -> None:
+        try:
+            job = self.introduction_enqueuer(
+                user_id,
+                entry,
+                api_url=self.api_url,
+                enclave_url=self.enclave_url,
+                now=self._now,
+            )
+            if job:
+                log.info(
+                    "enqueued post-respawn introduction for %s job=%s",
+                    user_id,
+                    job.get("job_id", ""),
+                )
+        except Exception as e:  # noqa: BLE001 — introduction is best-effort, spawn must continue
+            log.warning("introduction enqueue failed for %s: %s", user_id, e)
 
     def tick(self, roster: list[dict]) -> None:
         """One supervision pass: heartbeat live children, reap dead ones, drop
@@ -142,6 +172,7 @@ class Supervisor:
                                  status="running", driver=entry.get("driver"),
                                  now=self._now())
                     self.children[user_id] = {"pid": pid, "entry": entry, "home": home}
+                    self._enqueue_introduction(user_id, entry)
                 else:
                     self._write_token(user_id, child["home"])  # refresh short-lived token
                 continue
@@ -168,6 +199,7 @@ class Supervisor:
                          status="running", now=self._now())
             self.children[user_id] = {"pid": pid, "entry": entry, "home": home}
             log.info("spawned resident consumer for %s (pid=%s, home=%s)", user_id, pid, home)
+            self._enqueue_introduction(user_id, entry)
 
     def shutdown(self) -> None:
         for user_id, child in list(self.children.items()):
@@ -227,6 +259,123 @@ def _decrypt_provider_key(enclave_url: str, api_key: str = "", envelope: dict | 
     except Exception as e:  # noqa: BLE001
         log.error("provider key decrypt failed for a roster entry: %s", e)
         return ""
+
+
+def _identity_signature_empty(value) -> bool:
+    if isinstance(value, list):
+        return not any(str(item or "").strip() for item in value)
+    return not str(value or "").strip()
+
+
+def _needs_introduction_identity(identity: dict | None) -> bool:
+    if not isinstance(identity, dict):
+        return False
+    status = str(identity.get("decrypt_status") or "").strip()
+    if status and status != "ok":
+        return False
+    return (
+        not str(identity.get("self_introduction") or "").strip()
+        and _identity_signature_empty(identity.get("signature"))
+    )
+
+
+def _fetch_identity_plain_for_intro(entry: dict, *, api_url: str, enclave_url: str) -> tuple[dict | None, str]:
+    if not str(enclave_url or "").strip():
+        return None, "enclave_url_missing"
+    headers = _auth_headers(
+        api_key=str(entry.get("api_key") or ""),
+        runtime_token=str(entry.get("runtime_token") or ""),
+    )
+    if not headers:
+        return None, "auth_missing"
+    try:
+        resp = httpx.get(
+            f"{enclave_url.rstrip('/')}/v1/identity/get",
+            headers=headers,
+            timeout=10,
+            verify=False,
+        )
+        if resp.status_code == 404:
+            return None, "identity_not_found"
+        resp.raise_for_status()
+        body = resp.json()
+    except Exception as e:  # noqa: BLE001
+        return None, f"identity_fetch_failed:{type(e).__name__}"
+    identity = body.get("identity") if isinstance(body, dict) else None
+    if not isinstance(identity, dict):
+        return None, "identity_not_initialized"
+    return identity, ""
+
+
+def _has_active_introduction_job(store) -> bool:
+    try:
+        jobs = store.list_proactive_jobs(since_epoch=0, limit=0)
+    except Exception as e:  # noqa: BLE001
+        log.warning("introduction active-job scan failed for %s: %s", getattr(store, "user_id", ""), e)
+        return True
+    for job in jobs or []:
+        if str((job or {}).get("job_kind") or "").strip() != INTRODUCTION_JOB_KIND:
+            continue
+        status = str((job or {}).get("status") or "pending").strip()
+        if status in _INTRODUCTION_ACTIVE_STATUSES:
+            return True
+    return False
+
+
+def _build_introduction_job(*, now: float) -> dict:
+    from core import util
+    job_id = util._new_public_id("pj")
+    return {
+        "job_id": job_id,
+        "schema_version": 2,
+        "ts": float(now),
+        "created_at": datetime.fromtimestamp(float(now)).isoformat(),
+        "wake_id": job_id,
+        "source": "agent_initiated_proactive",
+        "status": "pending",
+        "intent_label": INTRODUCTION_INTENT_LABEL,
+        "context_hint": "",
+        "connections": [],
+        "connection": {},
+        "frame_ids": [],
+        "device_event_ids": [],
+        "current_app": "",
+        "trigger": INTRODUCTION_TRIGGER,
+        "job_kind": INTRODUCTION_JOB_KIND,
+        "manual": False,
+        "forced": False,
+        "user_state": "",
+        "ai_state": "",
+        "broadcast_state": "",
+        "wake_kind": "introduction",
+        "screen_context_available": False,
+        "agent_action": "",
+        "agent_action_status": "",
+    }
+
+
+def _enqueue_introduction_job_if_needed(
+    user_id: str,
+    entry: dict,
+    *,
+    api_url: str,
+    enclave_url: str,
+    now=time.time,
+    get_store_fn=None,
+) -> dict | None:
+    identity, reason = _fetch_identity_plain_for_intro(entry, api_url=api_url, enclave_url=enclave_url)
+    if not _needs_introduction_identity(identity):
+        if reason:
+            log.debug("introduction skipped for %s: %s", user_id, reason)
+        return None
+    if get_store_fn is None:
+        from core.store import get_store
+        get_store_fn = get_store
+    store = get_store_fn(user_id)
+    if _has_active_introduction_job(store):
+        return None
+    clock = now() if callable(now) else float(now)
+    return store.append_proactive_job(_build_introduction_job(now=clock))
 
 
 def _fetch_key_envelope(api_url: str, api_key: str = "", *, runtime_token: str = "") -> dict | None:
