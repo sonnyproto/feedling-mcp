@@ -3923,6 +3923,36 @@ def _send_message_replies_from_actions(actions: list[dict]) -> list[str]:
     return _cap_agent_replies(replies, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
 
 
+def _introduction_greeting_from_identity_actions(actions: list[dict]) -> str:
+    """Last-resort first greeting when the intro turn wrote identity but omitted messages."""
+    fallback_intro = ""
+    saw_profile_patch = False
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        typ = str(action.get("type") or action.get("action") or "").strip()
+        if typ != "identity.profile_patch":
+            continue
+        saw_profile_patch = True
+        patch = action.get("patch") if isinstance(action.get("patch"), dict) else action
+        signature = patch.get("signature") if isinstance(patch, dict) else None
+        if isinstance(signature, list):
+            for item in signature:
+                text = _sanitize_reply_text(str(item or ""))
+                if text:
+                    return text[:4000]
+        else:
+            text = _sanitize_reply_text(str(signature or ""))
+            if text:
+                return text[:4000]
+        intro = _sanitize_reply_text(str((patch or {}).get("self_introduction") or ""))
+        if intro and not fallback_intro:
+            fallback_intro = intro
+    if fallback_intro:
+        return fallback_intro[:4000]
+    return "我来了。" if saw_profile_patch else ""
+
+
 def _scheduled_wake_actions(actions: list[dict]) -> list[dict]:
     out: list[dict] = []
     for action in actions:
@@ -4859,6 +4889,11 @@ def _process_proactive_jobs(jobs: list) -> float:
                         },
                     )
                     continue
+        if is_introduction and not replies and memory_identity_actions:
+            reply = _introduction_greeting_from_identity_actions(memory_identity_actions)
+            if reply:
+                replies = [reply]
+                log.info("introduction greeting recovered from identity action id=%s", job_id)
 
         schedule_action_results: list[dict] = []
         scheduled_action_failed = False

@@ -2267,6 +2267,55 @@ def test_process_introduction_job_writes_identity_before_first_greeting(monkeypa
     assert events[3][2]["proactive_job_id"] == "pj_intro"
 
 
+def test_process_introduction_job_recovers_greeting_when_agent_omits_message(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    events = []
+    action = {
+        "type": "identity.profile_patch",
+        "patch": {
+            "self_introduction": "我是小满,我会一直在。",
+            "signature": ["我来了。"],
+        },
+    }
+
+    def _agent(message, images=None, image_paths=None):
+        events.append(("agent", message, images, image_paths))
+        return {"actions": [action], "messages": []}
+
+    def _execute(actions):
+        events.append(("actions", actions))
+        return {"status": "ok", "effects": [{"type": "identity_updated"}]}
+
+    def _post(reply, **kwargs):
+        events.append(("post", reply, kwargs))
+        return {"id": "msg_intro_fallback"}
+
+    monkeypatch.setattr(crc, "call_agent", _agent)
+    monkeypatch.setattr(crc, "execute_agent_actions", _execute)
+    monkeypatch.setattr(crc, "post_reply", _post)
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *args, **kwargs: events.append(("status", args, kwargs)))
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: (_ for _ in ()).throw(AssertionError("screen context should not be fetched")))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: (_ for _ in ()).throw(AssertionError("recent chat should not be fetched")))
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: (_ for _ in ()).throw(AssertionError("perception digest should not be fetched")))
+
+    job = {
+        "job_id": "pj_intro_fallback",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 128.65,
+        "trigger": "post_spawn_genesis",
+        "job_kind": "introduction",
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(128.65)
+    assert events[2] == ("actions", [action])
+    assert events[3][0] == "post"
+    assert events[3][1] == "我来了。"
+    assert events[3][2]["source"] == crc.PROACTIVE_JOB_SOURCE
+    assert events[3][2]["proactive_job_id"] == "pj_intro_fallback"
+
+
 def test_process_introduction_job_does_not_greet_if_identity_action_fails(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
