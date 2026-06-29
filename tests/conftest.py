@@ -98,6 +98,7 @@ if not _provisioned:
         "test_provider_client.py",
         "test_history_import_identity.py",
         "test_model_api_prompts.py",
+        "test_onboarding_validation_genesis.py",
         "test_enclave_frame_caption.py",
         "test_enclave_visual_plaintext.py",
         "test_screen_caption_backend.py",

@@ -62,6 +62,11 @@ from hosted import config_store as hosted_config_store
 
 bp = Blueprint("hosted_onboarding_validation", __name__)
 
+_GENESIS_ACTIVE_STATUSES = {"created", "uploading", "uploaded", "processing"}
+_GENESIS_TERMINAL_STATUSES = {"done", "failed"}
+_GENESIS_BACKFILL_SOURCE_KIND = "companion_persona_backfill"
+
+
 def _visible_agent_message_count(store) -> int:
     with store.chat_lock:
         chat_msgs = list(store.chat_messages)
@@ -120,6 +125,149 @@ def _latest_history_import_job(store: UserStore) -> dict | None:
     return jobs[-1]
 
 
+def _latest_onboarding_genesis_job(store: UserStore) -> dict | None:
+    try:
+        jobs = db.genesis_list_jobs(store.user_id, limit=20)
+    except Exception:
+        return None
+    for job in jobs:
+        source_kind = str((job or {}).get("source_kind") or "").strip()
+        if source_kind == _GENESIS_BACKFILL_SOURCE_KIND:
+            continue
+        status = str((job or {}).get("status") or "").strip().lower()
+        if status in _GENESIS_ACTIVE_STATUSES or status in _GENESIS_TERMINAL_STATUSES:
+            return job
+    return None
+
+
+def _genesis_job_metadata(job: dict | None) -> dict:
+    metadata = (job or {}).get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _genesis_job_output(job: dict | None) -> dict:
+    output = (job or {}).get("output")
+    return output if isinstance(output, dict) else {}
+
+
+def _int_value(value: Any, default: int = 0) -> int:
+    try:
+        return int(value or default)
+    except Exception:
+        return default
+
+
+def _model_api_steps_with_genesis(
+    *,
+    base_steps: list[dict],
+    genesis_job: dict,
+    bootstrap_st: dict,
+    identity: dict | None,
+    identity_written: bool,
+    relationship_anchored: bool,
+    relationship_evidence: str,
+    relationship_ok: bool,
+    store: UserStore,
+) -> list[dict]:
+    status = str(genesis_job.get("status") or "").strip().lower()
+    done = status == "done"
+    failed = status == "failed"
+    metadata = _genesis_job_metadata(genesis_job)
+    output = _genesis_job_output(genesis_job)
+    stage = str(output.get("stage") or ("completed" if done else status or "genesis")).strip()
+    memory_action_count = _int_value(genesis_job.get("memory_action_count"))
+    identity_status = str(genesis_job.get("identity_status") or "")
+    persona_ref = str(genesis_job.get("persona_ref") or "")
+
+    history_step = {
+        "id": "history_import",
+        "label": "Onboarding Materials",
+        "passing": done,
+        "job_id": genesis_job.get("job_id", ""),
+        "job_status": status,
+        "phase": stage,
+        "phase_label": "Genesis complete" if done else ("Genesis failed" if failed else "Genesis processing"),
+        "progress": 100 if done else (100 if failed else 24),
+        "messages_parsed": _int_value(metadata.get("history_count")),
+        "support_materials": _int_value(metadata.get("support_count")),
+        "source_stats": {},
+        "ai_persona_chars": 0,
+        "user_profile_chars": 0,
+        "memory_summary_chars": 0,
+        "memories_created": memory_action_count,
+        "history_tier": str(metadata.get("history_tier") or ""),
+        "timeline_span_days": _int_value(metadata.get("timeline_span_days")),
+        "candidate_windows_done": 0,
+        "candidate_windows_total": _int_value(metadata.get("window_count") or genesis_job.get("total_chunks")),
+        "candidates_extracted": 0,
+        "candidates_merged": 0,
+        "chat_ready": done,
+        "background_status": "",
+        "background_windows_done": 0,
+        "background_windows_total": 0,
+        "genesis": True,
+        "memory_action_count": memory_action_count,
+        "identity_status": identity_status,
+        "persona_ref": persona_ref,
+        "required": (
+            "Genesis import failed. Start onboarding again with the latest app build."
+            if failed else (
+                "Wait for Genesis to finish distilling the onboarding materials."
+                if not done else ""
+            )
+        ),
+    }
+    memory_step = {
+        "id": "memory_garden",
+        "label": "Memory Garden",
+        "passing": done,
+        "blocking": False,
+        "memory_count": bootstrap_st["memory_count"],
+        "counts": bootstrap_st["counts"],
+        "floors": bootstrap_st["floors"],
+        "missing_tabs": bootstrap_st["missing_tabs"],
+        "genesis": True,
+        "memory_action_count": memory_action_count,
+        "required": "" if done else "Wait for Genesis to write Memory Garden cards.",
+    }
+    identity_step = {
+        "id": "identity_card",
+        "label": "Identity Card",
+        "passing": done and identity_written,
+        "written": done and identity_written,
+        "genesis": True,
+        "identity_status": identity_status,
+        "required": "" if done and identity_written else "Wait for Genesis to write Identity Card.",
+    }
+    relationship_step = {
+        "id": "relationship_anchor",
+        "label": "Relationship Anchor",
+        "passing": done and relationship_ok,
+        "relationship_anchored": done and relationship_anchored,
+        "relationship_anchor_source": (identity or {}).get("relationship_anchor_source", "") if done else "",
+        "relationship_anchor_evidence": relationship_evidence if done else "",
+        "days_with_user": identity_service._live_days_with_user(identity, store=store) if done and identity else None,
+        "genesis": True,
+        "required": "" if done and relationship_ok else "Wait for Genesis to write the relationship anchor.",
+    }
+    hosted_chat_step = {
+        "id": "hosted_chat",
+        "label": "Hosted Chat",
+        "passing": done,
+        "genesis": True,
+        "required": "" if done else "Wait for Genesis to finish before opening hosted chat.",
+    }
+
+    replacements = {
+        "history_import": history_step,
+        "memory_garden": memory_step,
+        "identity_card": identity_step,
+        "relationship_anchor": relationship_step,
+        "hosted_chat": hosted_chat_step,
+    }
+    return [replacements.get(str(step.get("id") or ""), step) for step in base_steps]
+
+
 def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
     bootstrap_st = boot_gates._bootstrap_state(store)
     identity = identity_service._load_identity(store)
@@ -139,6 +287,7 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
     chat_ready = bool(latest_job and latest_job.get("chat_ready"))
     history_ok = bool(latest_job and (latest_job.get("status") == "completed" or chat_ready))
     hosted_chat_ok = _model_api_hosted_chat_verified(store)
+    genesis_job = _latest_onboarding_genesis_job(store)
 
     steps = [
         {
@@ -232,6 +381,18 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
             "required": "Send one test message through /v1/model_api/chat/send." if not hosted_chat_ok else "",
         },
     ]
+    if genesis_job:
+        steps = _model_api_steps_with_genesis(
+            base_steps=steps,
+            genesis_job=genesis_job,
+            bootstrap_st=bootstrap_st,
+            identity=identity,
+            identity_written=identity_written,
+            relationship_anchored=relationship_anchored,
+            relationship_evidence=relationship_evidence,
+            relationship_ok=relationship_ok,
+            store=store,
+        )
     next_step = next((step for step in steps if not step["passing"]), None)
     return {
         "passing": next_step is None,
