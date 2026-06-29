@@ -28,20 +28,26 @@ def runtime_v2_default_on() -> bool:
     return _env_flag_enabled(RUNTIME_V2_DEFAULT_ON_ENV)
 
 
-# io-onboarding docs branch this code serves skill_url from. MUST match the
-# feedling-mcp deploy branch:
-#   test branch (deploys test-api) -> "test"; main branch (deploys api) -> "main".
-# ⚠️ When merging test->main, flip this to "main" — it is the ONLY line to change;
-#    every skill_url is derived from it via io_onboarding_skill_url().
-IO_ONBOARDING_BRANCH = "test"
-_IO_ONBOARDING_RAW_BASE = (
-    f"https://raw.githubusercontent.com/teleport-computer/io-onboarding/{IO_ONBOARDING_BRANCH}"
-)
+# io-onboarding docs branch this code serves skill_url from. Defaults to "main"
+# so a merge to main just works with NO code edit (the old hard-coded constant
+# had to be hand-flipped every cutover — that footgun is gone). The per-deploy
+# difference now lives in env: the test deploy (which serves test-api) injects
+# FEEDLING_IO_ONBOARDING_BRANCH=test to point skill docs at the test branch.
+IO_ONBOARDING_BRANCH_ENV = "FEEDLING_IO_ONBOARDING_BRANCH"
+
+
+def io_onboarding_branch() -> str:
+    """io-onboarding docs branch matching this deploy (default ``main``)."""
+    return (os.environ.get(IO_ONBOARDING_BRANCH_ENV, "") or "").strip() or "main"
 
 
 def io_onboarding_skill_url(filename: str) -> str:
     """Raw URL for an io-onboarding skill doc on the branch matching this deploy."""
-    return f"{_IO_ONBOARDING_RAW_BASE}/{filename}"
+    base = (
+        "https://raw.githubusercontent.com/teleport-computer/io-onboarding/"
+        f"{io_onboarding_branch()}"
+    )
+    return f"{base}/{filename}"
 
 
 def _now_iso() -> str:

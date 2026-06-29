@@ -5,11 +5,17 @@
 # user, driven in cli mode against `claude` / `codex exec`. So the image ships
 # the backend + the resident consumer + the agent CLIs (Node).
 #
-# Hardening TODO (match the backend image before prod): pin the base by digest;
-# pin the npm CLI versions. Deps are hash-locked via the backend's
-# requirements.lock (the resident consumer's full import graph resolves from it).
+# Supply-chain pinning (matches the backend image): base pinned by digest below,
+# npm CLIs pinned to exact versions, Python deps hash-locked via the backend's
+# requirements.lock. Remaining gap: the LiteLLM venv deps are not yet hash-locked
+# (see the TODO at that step). To refresh the base digest see deploy/BUILD.md
+# (`docker buildx imagetools inspect python:3.11-slim-bookworm`).
 
-FROM python:3.11-slim-bookworm AS base
+# Pinned by multi-arch index digest. Kept at 3.11 (the backend image is 3.12) to
+# avoid a runtime minor-version change in this hardening pass; the shared
+# requirements.lock carries hashes for both interpreters.
+ARG PYTHON_IMAGE=python:3.11-slim-bookworm@sha256:721dc13fd1be0a771e54b72097634291d628d0007dee9da777e2ce676a9c998f
+FROM ${PYTHON_IMAGE} AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -30,7 +36,7 @@ RUN apt-get update \
 # Agent backend CLIs the resident consumer drives in cli mode:
 #  - Claude Code CLI (`claude`)
 #  - Codex CLI (`codex exec --json`)
-RUN npm install -g @anthropic-ai/claude-code @openai/codex
+RUN npm install -g @anthropic-ai/claude-code@2.1.195 @openai/codex@0.142.4
 
 # Python deps: reuse the backend's hash-locked set so the resident consumer's
 # whole import graph (content_encryption, proactive-v2, db, …) + the supervisor

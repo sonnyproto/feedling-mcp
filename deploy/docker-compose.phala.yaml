@@ -95,6 +95,8 @@ services:
       FEEDLING_DATA_DIR: "/data"
       FEEDLING_ENCLAVE_TLS: "true"
       FEEDLING_FLASK_URL: "http://backend:5001"
+      # model_api reads from the memory read-side (mirrors the test enclave).
+      MEMORY_READSIDE_FOR_MODEL_API: "true"
       # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
       # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
       # even when the value is empty, so an empty string would make it
@@ -182,6 +184,11 @@ services:
       APNS_KEY_P8_B64: "${APNS_KEY_P8_B64:-}"
       APNS_KEY_ID: "${APNS_KEY_ID:-}"
       APNS_TEAM_ID: "${APNS_TEAM_ID:-}"
+      # Production push gateway (api.push.apple.com). apns.py defaults to the
+      # SANDBOX gateway when unset, which silently fails for App Store / TestFlight
+      # device tokens — prod must pin this to "false". (Test deploy keeps the
+      # sandbox default for its sandbox-provisioned tokens.)
+      APNS_SANDBOX: "false"
       # Optional LLM Gate for proactive screen outreach. If unset, automatic
       # Gate records model_not_configured and does not enqueue hidden jobs.
       OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
@@ -200,12 +207,17 @@ services:
       # openrouter/openai_compatible) stay on the legacy inline path until the
       # in-CVM LiteLLM gateway is actually running — otherwise their sends wedge
       # in `processing` (no consumer is spawned). Keep this in sync with the
-      # agent-runner value. Default empty = off (safe).
-      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
+      # Defaults to "true": the cutover boot gate (assert_hosting_ready) refuses
+      # to start the backend without it, even for pure-native fleets. Still
+      # interpolation-driven so a GitHub var can override; unset/empty → true.
+      # Mirror the agent-runner's value.
+      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-true}"
       # Host-all: every configured user is served by the agent-runner. The send
-      # routing here must agree with the supervisor's host_all discovery. Empty =
-      # off (per-user flag still required). Mirror the agent-runner's value.
-      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
+      # routing here must agree with the supervisor's host_all discovery. Defaults
+      # to "true": the cutover routes all fit-provider users to agent-runner with
+      # no per-user flag (resolve_driver) and the boot gate requires it; unset/empty
+      # → true. The only remaining deploy-time secret is FEEDLING_RUNTIME_TOKEN_SECRET.
+      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-true}"
       # Legacy memory migration is opt-in. Empty = off; set to 1 only after
       # seeded Garden verification passes. Mirror agent-runner.
       FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
@@ -249,18 +261,27 @@ services:
       # Stage-D runtime token signing secret. Empty = off (consumer uses api key).
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       # Host-all (zero-roster): mint a token per DB-discovered user and resolve its
-      # provider key with it — no AGENT_RUNTIME_USERS needed. Requires the token
-      # secret above. Empty = off. Mirror the backend's FEEDLING_HOST_ALL.
-      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
+      # provider key with it — no AGENT_RUNTIME_USERS needed. Defaults to "true" to
+      # mirror the backend; host_all_active still also requires the token secret
+      # above (stays dormant until FEEDLING_RUNTIME_TOKEN_SECRET is injected).
+      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-true}"
       # Same migration kill-switch as backend. Empty = off; when off, the
       # resident consumer will not process queued memory_migrate jobs.
       FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
-      # in-CVM LiteLLM gateway (codex non-openai). Empty = off; must mirror the
-      # backend's FEEDLING_LITELLM_ENABLE. FEEDLING_LITELLM_PYTHON is baked in the
-      # image (isolated venv).
-      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
+      # in-CVM LiteLLM gateway (codex non-openai). Defaults to "true" to mirror the
+      # backend's FEEDLING_LITELLM_ENABLE (the cutover boot gate requires it); unset/
+      # empty → true. FEEDLING_LITELLM_PYTHON is baked in the image (isolated venv);
+      # the gateway only actually spins up when a gateway-provider user is present.
+      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-true}"
       FEEDLING_LITELLM_PORT: "${FEEDLING_LITELLM_PORT:-4000}"
       FEEDLING_LITELLM_API_KEY: "${FEEDLING_LITELLM_API_KEY:-}"
+      # Genesis import worker (mirrors the test agent-runner). Activates only when
+      # the prerequisites are present (FEEDLING_RUNTIME_TOKEN_SECRET above +
+      # FEEDLING_ENCLAVE_URL); if the secret is unset the supervisor logs a
+      # warning and stays dormant rather than crashing.
+      FEEDLING_GENESIS_WORKER_ENABLED: "1"
+      FEEDLING_GENESIS_WORKER_INTERVAL_SEC: "10"
+      FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC: "7200"
     volumes:
       - feedling_agent_runtime:/agent-data
     depends_on:
