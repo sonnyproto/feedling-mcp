@@ -47,6 +47,50 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-06-29
+
+### [DONE] photo_added 唤醒加 new-photo 提示（拉取式）
+
+相册来新图时,`photo_added` 唤醒(原触发不变)现在多一条 `new_photo` 提示:大概是什么
+(scene_hint)/是否截图/时段/photo_id,并告诉 agent「想看就 `photo_read(id, include_image=true)`
+拉真实像素」+「看完想说就说,像注意到朋友的照片、不是交差报告」。**拉取式,不自动附图,agent
+自判看不看**。consumer 侧:`_new_photo_hint()`(best-effort,取最近 1 张 metadata,失败则空、不崩
+唤醒),只在 photo_added job 注入。真机前 e2e:提示渲染正确 + `photo_read --include-image` 解出
+~203KB JPEG。提交 `5a13264` + `d9a45ca`。
+
+### [BLOCKER→FIXED] io_cli `PHASE2_VERBS` 冲突 → 所有 io_cli 命令全崩
+
+`schedule-wake` 在 `3f98b39` 被加成真子命令,但仍留在 `PHASE2_VERBS`(「未实现」占位 loop),
+`sub.add_parser('schedule-wake')` 启动即 `conflicting subparser` → **io_cli 一跑就崩 → OpenClaw 所有
+走 io_cli 的原生工具(photo_read/memory_*/screen_*/schedule_wake…)自 3f98b39 起全废**。修:从
+`PHASE2_VERBS` 删掉;加防回归测试 `tests/test_io_cli_parser.py`(PHASE2 永不与真子命令重名 + 子进程
+冒烟)。提交 `517f7e1`。教训:加真子命令时必须同步从占位列表移除。
+
+### [DONE] 今日 wake prompt / action 协议改动部署后双向 e2e
+
+`3f98b39`(schedule/cancel wake 工具化、删死 ai_state、request_broadcast 折叠进 message、message=
+纯回复)+ `a873eeb`(删 battery 字段、平衡 speak/quiet、数字不照报)部署后验证:
+- consumer 侧(CC):prompt 构建无 battery / 有时间锚(距上次 Nh,有间隔才加) / 平衡措辞 /
+  无 ai_state / new_photo 只在照片唤醒;schedule+cancel wake 工具 ok;action 分类(sleep /
+  request_broadcast→可见消息)ok。
+- 后端侧(Codex):`pytest tests/test_proactive_* test_perception_* test_io_cli_*` = **185 passed**;
+  `/v1/proactive/scheduled/actions` 真触发链 schedule→pending→fire→fired、cancel→canceled 验证;
+  gate 路径 / photo_added differ 链完好。
+- 残留(待下次部署一起清,不单独 redeploy):consumer `_split_proactive_actions` 的 `set_ai_state`
+  死分类(本次已本地删、未提交);后端 `ai_state` legacy/dashboard 字段(Codex 评估)。
+
+### [BLOCKER] test CVM 重部署脆弱性 + 链上 compose_hash 依赖 gas（运维教训）
+
+排查"consumer 全 401 崩溃循环"时发现根因**不是账号/key/代码**,而是 **test CVM 后端被当天连环
+部署(4 次 deploy-test-cvm)搞到不健康**:`test-api`/`test-mcp`(走 dstack-ingress)整层 TLS 挂、
+但 enclave :5003 直连口仍活;Andrew 在 Phala 层 restart 后恢复。两条运维教训记下:
+- **这台 test CVM 每次重部署会整体 blip ~2min**(enclave 先回、test-api 随后),通常**自愈**,
+  不要看到瞬时 000 就当宕机;短时间连推多次才会雪崩。
+- **每次 deploy 都要发 compose_hash 上 Sepolia test 合约**(`0x9AC0…F2D5`,owner
+  `0xa0eBcd26…`)。`517f7e1` 这次 publish **因部署钱包 gas 不足而失败** → 新 compose_hash 没上链 →
+  iOS attestation 会拒新 CVM、挡 onboarding。充 Sepolia ETH + re-run `deploy CVM (test)` job 后
+  publish success、白名单补齐。**部署钱包余额是真机 onboarding 的隐性前置依赖。**
+
 ## 2026-06-27
 
 ### [DONE] 照片解密读取修复 + 快捷指令 app 上报打通（真机 e2e）

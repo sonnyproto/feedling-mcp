@@ -3413,7 +3413,6 @@ def _split_proactive_actions(actions: list[dict]) -> tuple[list[dict], list[dict
     memory_identity: list[dict] = []
     proactive_types = {
         "sleep",
-        "set_ai_state",
         "request_broadcast",
         "send_message",
         "schedule_wake",
