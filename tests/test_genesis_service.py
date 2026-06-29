@@ -453,10 +453,56 @@ def test_identity_payload_from_output_leaves_intro_and_signature_for_respawn():
     assert payload == {
         "agent_name": "",
         "self_introduction": "",
+        "category": "Direct",
         "dimensions": [
             {"name": "Direct", "value": 82, "description": "TA often gives blunt feedback."}
         ],
     }
+
+
+def test_identity_payload_from_output_passes_category_through():
+    payload = service._identity_payload_from_output(
+        {
+            "identity": {
+                "agent_name": "Mira",
+                "category": "  细心 · 稳定。 ",
+                "dimensions": [
+                    {"name": "细心驱动", "value": 90, "description": "Always checks details."},
+                    {"name": "稳定型", "value": 40, "description": "Keeps the user steady."},
+                ],
+            }
+        }
+    )
+
+    assert payload is not None
+    assert payload["category"] == "细心 · 稳定"
+
+
+def test_identity_payload_from_output_derives_category_from_dimensions():
+    payload = service._identity_payload_from_output(
+        {
+            "identity": {
+                "agent_name": "Mira",
+                "dimensions": [
+                    {"name": "稳定型", "value": 35, "description": "Keeps the room quiet."},
+                    {"name": "好奇驱动", "value": 91, "description": "Asks sharp questions."},
+                    {"name": "观察性", "value": 70, "description": "Notices small shifts."},
+                ],
+            }
+        }
+    )
+
+    assert payload is not None
+    assert payload["category"] == "好奇 · 稳定"
+
+
+def test_identity_payload_from_output_without_dimensions_leaves_category_empty():
+    payload = service._identity_payload_from_output(
+        {"identity": {"agent_name": "Mira", "category": "", "dimensions": []}}
+    )
+
+    assert payload is not None
+    assert "category" not in payload
 
 
 def test_identity_payload_from_output_ignores_empty_identity():
@@ -516,6 +562,7 @@ def test_init_identity_upserts_genesis_fields_and_preserves_agent_profile(monkey
         {
             "identity": {
                 "agent_name": "Mira",
+                "category": "细心 · 稳定",
                 "dimensions": [{"name": "Steady", "value": 84, "description": "Persona says steady."}],
             },
             "relationship_started_at": "2026-06-01",
@@ -529,6 +576,7 @@ def test_init_identity_upserts_genesis_fields_and_preserves_agent_profile(monkey
     assert captured["runtime_token"] == "runtime_token_1"
     assert captured["item_id"] == "identity_1"
     assert captured["plaintext"]["agent_name"] == "Mira"
+    assert captured["plaintext"]["category"] == "细心 · 稳定"
     assert captured["plaintext"]["dimensions"][0]["name"] == "Steady"
     assert captured["plaintext"]["self_introduction"] == "I wrote this after respawn."
     assert captured["plaintext"]["signature"] == ["Still here", "Receipts first"]

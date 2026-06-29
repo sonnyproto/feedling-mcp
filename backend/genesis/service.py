@@ -522,6 +522,9 @@ def _identity_payload_from_output(output: dict) -> dict | None:
         or re.search(r"\b(?:api|model|runtime|provider|assistant|agent)\b", normalized_name)
     ):
         agent_name = ""
+    category = _clean_identity_category(identity.get("category"))
+    if not category and clean_dims:
+        category = _category_from_dimensions(clean_dims)
     payload = {
         "agent_name": agent_name,
         # 7.C-write deliberately leaves self_intro/signature for post-respawn TA.
@@ -530,7 +533,50 @@ def _identity_payload_from_output(output: dict) -> dict | None:
     }
     if not payload["agent_name"] and not payload["dimensions"]:
         return None
+    if category:
+        payload["category"] = category
     return payload
+
+
+def _clean_identity_category(value: Any) -> str:
+    return _text(value, 120).strip(" `\"'“”‘’。，,.;；:：!！?？")
+
+
+def _category_label_from_dimension_name(value: str) -> str:
+    label = _text(value, 32).strip(" `\"'“”‘’。，,.;；:：!！?？")
+    for suffix in ("驱动", "倾向", "风格", "能力", "特质", "模式", "性", "型", "度"):
+        if label.endswith(suffix) and len(label) > len(suffix) + 1:
+            label = label[: -len(suffix)].strip()
+            break
+    lower = label.lower()
+    for suffix in (" driven", " style", " mode", " orientation", " tendency", " trait"):
+        if lower.endswith(suffix) and len(label) > len(suffix) + 2:
+            label = label[: -len(suffix)].strip()
+            break
+    return label[:24]
+
+
+def _category_from_dimensions(dimensions: list[dict]) -> str:
+    if not dimensions:
+        return ""
+
+    def score(dim: dict) -> int:
+        try:
+            return int(dim.get("value", 50))
+        except Exception:
+            return 50
+
+    strongest = max(dimensions, key=score)
+    weakest = min(dimensions, key=score)
+    labels = [
+        _category_label_from_dimension_name(str(strongest.get("name") or "")),
+        _category_label_from_dimension_name(str(weakest.get("name") or "")),
+    ]
+    out: list[str] = []
+    for label in labels:
+        if label and label not in out:
+            out.append(label)
+    return " · ".join(out)[:120]
 
 
 def _identity_payload_from_existing_plain(identity: dict | None) -> dict:
@@ -604,6 +650,8 @@ def init_identity_if_absent(
     merged_payload = dict(base_payload)
     merged_payload["agent_name"] = payload["agent_name"]
     merged_payload["dimensions"] = payload["dimensions"]
+    if payload.get("category"):
+        merged_payload["category"] = payload["category"]
     if "self_introduction" not in merged_payload:
         merged_payload["self_introduction"] = ""
 
