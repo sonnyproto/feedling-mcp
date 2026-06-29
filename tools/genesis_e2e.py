@@ -366,6 +366,15 @@ def cmd_acceptance(args):
         "failed": failed,
     }
     print(json.dumps(out, ensure_ascii=False, indent=1))
+    if not getattr(args, "no_cleanup", False):
+        # Stop the throwaway from lingering in host-all discovery: each genesis-done +
+        # model_api-ok user keeps a resident consumer, and accumulated test users contend
+        # for agent-runner resources (which can starve a real account's introduction).
+        # Dropping model_api removes it from autodiscover. Best-effort.
+        try:
+            _http("DELETE", f"{base}/v1/model_api/delete", args.api_key)
+        except Exception:  # noqa: BLE001
+            pass
     return 0 if not failed else 1
 
 
@@ -440,6 +449,9 @@ def main():
                          "self_introduction + post a first greeting (needs agent-runner host-all)")
     ac.add_argument("--intro-timeout", type=float, default=180,
                     help="seconds to wait for the 7.D introduction (default 180)")
+    ac.add_argument("--no-cleanup", action="store_true",
+                    help="keep the throwaway's model_api (default: DELETE it after the run "
+                         "so it stops polluting host-all autodiscover)")
     ac.set_defaults(func=cmd_acceptance)
 
     args = p.parse_args()
