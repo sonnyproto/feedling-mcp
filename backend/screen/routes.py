@@ -16,6 +16,23 @@ from semantic_analysis import analyze as _semantic_analysis
 
 bp = Blueprint("screen", __name__)
 
+
+def _enclave_forward_auth() -> dict:
+    """Auth header to forward to the enclave for the current request.
+
+    Prefer the Stage-D runtime token: host-all / zero-roster agents have NO
+    per-user api_key, so the old ``{"X-API-Key": api_key} if api_key else {}``
+    sent the enclave an EMPTY auth header and every hosted-agent screen read
+    failed. The enclave accepts either credential (enclave_app._forward_auth_headers
+    / _whoami_cached); mirror the memory readside fix here. Empty dict only when
+    neither credential is present.
+    """
+    rt = request.headers.get("X-Feedling-Runtime-Token", "").strip()
+    if rt:
+        return {"X-Feedling-Runtime-Token": rt}
+    api_key = auth._extract_api_key()
+    return {"X-API-Key": api_key} if api_key else {}
+
 @bp.route("/v1/screen/ios", methods=["GET"])
 def get_ios():
     store = auth.require_user()
@@ -143,9 +160,9 @@ def frame_decrypt(frame_id):
     if not enclave_url:
         return jsonify({"error": "enclave unreachable — FEEDLING_ENCLAVE_URL not set"}), 503
 
-    # Forward the caller's api_key + any include_image flag.
-    api_key = auth._extract_api_key()
-    headers = {"X-API-Key": api_key} if api_key else {}
+    # Forward the caller's credential (runtime token for host-all agents, else
+    # api_key) + any include_image flag — see _enclave_forward_auth.
+    headers = _enclave_forward_auth()
     params = {"include_image": request.args.get("include_image", "true")}
     try:
         with httpx.Client(timeout=30, verify=False) as client:
@@ -175,10 +192,9 @@ def frame_image(frame_id):
     if not enclave_url:
         return jsonify({"error": "enclave unreachable — FEEDLING_ENCLAVE_URL not set"}), 503
 
-    api_key = auth._extract_api_key()
-    # Forward api_key + Range (if present) so the enclave's send_file
-    # can respond 206 Partial Content with the requested slice.
-    fwd_headers = {"X-API-Key": api_key} if api_key else {}
+    # Forward the caller's credential (runtime token for host-all agents, else
+    # api_key) + Range (if present) so the enclave's send_file can respond 206.
+    fwd_headers = _enclave_forward_auth()
     if request.headers.get("Range"):
         fwd_headers["Range"] = request.headers["Range"]
     try:
