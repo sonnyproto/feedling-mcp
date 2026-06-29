@@ -104,13 +104,16 @@ def test_parse_caps_threads_at_eight():
 # instead of each card minting a fresh near-synonym (工作/职业/事业) or scattering.
 
 def test_capture_prompt_carries_canonical_buckets():
-    from memory.prompts_v1 import COMMON_BUCKETS_LINE_V1, COMMON_BUCKETS_V1
+    from memory.prompts_v1 import COMMON_BUCKETS_V1, _COMMON_BUCKETS_ZH, _COMMON_BUCKETS_EN
     p = build_capture_prompt(
         ai_name="io", user_name="hx", buckets="（暂无）", threads="（暂无）",
         identity="x", window="y",
     )
-    assert COMMON_BUCKETS_LINE_V1 in p   # seed list injected even with no existing buckets
-    assert "工作/Work" in p              # bilingual pair present
+    # zh + en presented as SEPARATE lists (not 工作/Work pairs) so the model writes one
+    # single-language word, not the "健康/Health" pair verbatim (real bug e2e caught).
+    assert _COMMON_BUCKETS_ZH in p and _COMMON_BUCKETS_EN in p
+    assert "宠物" in p and "Pets" in p          # both languages available, single-word
+    assert "别写成「健康/Health」" in p          # explicit anti-mixing example
     assert COMMON_BUCKETS_V1 and all(zh.strip() and en.strip() for zh, en in COMMON_BUCKETS_V1)
     # companion-tuned set (hx): 14 buckets incl. the relationship/emotion/boundary ones
     assert len(COMMON_BUCKETS_V1) == 14
@@ -120,11 +123,11 @@ def test_capture_prompt_carries_canonical_buckets():
 
 
 def test_migrate_and_genesis_share_the_same_canonical_buckets():
-    from memory.prompts_v1 import COMMON_BUCKETS_LINE_V1
+    from memory.prompts_v1 import _COMMON_BUCKETS_ZH
     from memory.migrate_prompt_v1 import build_migrate_prompt
     from genesis.prompts import FACT_WRITE_PROMPT
     mig = build_migrate_prompt(ai_name="io", user_name="hx", old_cards="c", vocab="（暂无）")
-    assert COMMON_BUCKETS_LINE_V1 in mig
+    assert _COMMON_BUCKETS_ZH in mig
     # onboarding (genesis FACT_WRITE) had NO bucket guidance before A9 — now it converges too
-    assert COMMON_BUCKETS_LINE_V1 in FACT_WRITE_PROMPT
+    assert _COMMON_BUCKETS_ZH in FACT_WRITE_PROMPT
     assert "桶名收敛" in FACT_WRITE_PROMPT
