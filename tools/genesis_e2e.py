@@ -37,11 +37,14 @@ except Exception as e:  # noqa: BLE001
     sys.exit(2)
 
 
-def _http(method, url, api_key, *, json_body=None, timeout=60, retries=3):
+def _http(method, url, api_key, *, json_body=None, timeout=60, retries=8):
     """Single request with retry on transient read/connection errors (IncompleteRead,
     URLError, socket timeout). HTTPError (a real status) is returned immediately, never
-    retried. Safe because every call site is idempotent (GET) or create-with-no-side-effect
-    on a throwaway test user."""
+    retried. Generous retries + backoff because the local proxy (198.18 fake-IP) flaps
+    a lot and acceptance runs poll for 10+ min. HTTPError 409 on register (a re-POST
+    after a lost response created the account) is treated as transient-but-fatal -> the
+    caller re-provisions. Safe: every call site is idempotent (GET) or create-on a
+    throwaway test user."""
     import http.client
     import socket
     data = json.dumps(json_body).encode("utf-8") if json_body is not None else None
@@ -56,7 +59,7 @@ def _http(method, url, api_key, *, json_body=None, timeout=60, retries=3):
             return e.code, {"error": e.read().decode("utf-8", "replace")[:400]}
         except (http.client.IncompleteRead, urllib.error.URLError, socket.timeout, ConnectionError) as e:
             last_exc = e
-            time.sleep(1.5 * (attempt + 1))
+            time.sleep(min(2.0 * (attempt + 1), 12.0))
     raise SystemExit(f"{method} {url} failed after {retries} attempts: {last_exc}")
 
 
@@ -82,21 +85,30 @@ def _provision_user(args) -> tuple[str, str, bytes, bytes]:
     Returns (api_key, user_id, enclave_pk_bytes, user_pk_bytes). Provider key comes
     from the env (GENESIS_E2E_PROVIDER_API_KEY), never persisted to disk."""
     import os
-    sk = PrivateKey.generate()
-    user_pk = bytes(sk.public_key)
-    args._user_sk = bytes(sk)  # raw 32-byte X25519 private key, kept for acceptance decrypt
     base = args.api_url.rstrip("/")
+    api_key = user_id = ""
     # Content public key must be base64 of the raw 32-byte X25519 pk (core/envelope.py
     # _decode_content_public_key base64-decodes it + asserts 32 bytes); hex would
     # decode to 48 bytes -> user_content_public_key_invalid_length at model_api/setup.
-    user_pk_b64 = base64.b64encode(user_pk).decode("ascii")
-    s, b = _http("POST", f"{base}/v1/users/register", "", json_body={"public_key": user_pk_b64})
-    if s >= 400:
-        raise SystemExit(f"register failed {s}: {b}")
-    api_key = b.get("api_key") or b.get("apiKey") or ""
-    user_id = b.get("user_id") or b.get("userId") or ""
+    # A flaky proxy can lose the register RESPONSE after the account was created; the
+    # _http retry then re-POSTs the same key -> 409 account_exists. On 409, burn the key
+    # and try a fresh one.
+    for _attempt in range(5):
+        sk = PrivateKey.generate()
+        args._user_sk = bytes(sk)  # raw X25519 private key, kept for acceptance decrypt
+        user_pk_b64 = base64.b64encode(bytes(sk.public_key)).decode("ascii")
+        s, b = _http("POST", f"{base}/v1/users/register", "", json_body={"public_key": user_pk_b64})
+        if s == 409:
+            continue  # key collided via a retried POST whose first response was lost
+        if s >= 400:
+            raise SystemExit(f"register failed {s}: {b}")
+        api_key = b.get("api_key") or b.get("apiKey") or ""
+        user_id = b.get("user_id") or b.get("userId") or ""
+        if api_key and user_id:
+            break
     if not api_key or not user_id:
-        raise SystemExit(f"register response missing api_key/user_id: {b}")
+        raise SystemExit("register failed after retries (proxy/409)")
+    user_pk = bytes(sk.public_key)  # the successful keypair's public key
     if not getattr(args, "skip_setup", False):
         provider_key = os.environ.get("GENESIS_E2E_PROVIDER_API_KEY", "").strip()
         if not provider_key:
@@ -108,9 +120,11 @@ def _provision_user(args) -> tuple[str, str, bytes, bytes]:
             raise SystemExit(f"model_api/setup failed {s}: {b}")
     s, b = _http("GET", f"{base}/v1/users/whoami", api_key)
     enclave_hex = b.get("enclave_content_public_key_hex") or ""
-    if not enclave_hex:
-        raise SystemExit(f"whoami missing enclave_content_public_key_hex: {b}")
-    return api_key, user_id, bytes.fromhex(enclave_hex), user_pk
+    # The plaintext / acceptance path does no client-side sealing, so it doesn't need the
+    # enclave pk; only chunked `upload` does. Don't hard-fail if whoami omits it (e.g. the
+    # enclave is still warming up after a redeploy).
+    enclave_pk = bytes.fromhex(enclave_hex) if enclave_hex else b""
+    return api_key, user_id, enclave_pk, user_pk
 
 
 def cmd_upload(args):
@@ -271,7 +285,10 @@ def cmd_acceptance(args):
     deadline = time.time() + args.timeout
     job, jb = {}, {}
     while time.time() < deadline:
-        _s, jb = _http("GET", f"{base}/v1/genesis/imports/{job_id}", args.api_key)
+        try:
+            _s, jb = _http("GET", f"{base}/v1/genesis/imports/{job_id}", args.api_key)
+        except SystemExit:
+            time.sleep(args.poll); continue  # flaky proxy — keep polling, don't abort the run
         job = jb.get("job") or {}
         if str(job.get("status") or "").lower() in ("done", "failed"):
             break
@@ -309,6 +326,33 @@ def cmd_acceptance(args):
         "firewall_persona": (needle not in persona_text) if needle else None,
         "memories_written": int(job.get("memory_action_count") or 0) > 0,
     }
+    if getattr(args, "check_introduction", False):
+        # §六 7.D: after genesis done, host-all autodiscover spawns the agent, which
+        # should ONCE write its self_introduction (identity.profile_patch) and post a
+        # first greeting. Poll for both within the intro window.
+        intro_self, greeting = "", False
+        intro_deadline = time.time() + args.intro_timeout
+        while time.time() < intro_deadline:
+            try:
+                _s, idy2 = _http("GET", f"{base}/v1/identity/get", args.api_key)
+                ib2 = json.loads(_decrypt_envelope_user(idy2.get("identity") or {}, sk_raw))
+                intro_self = str(ib2.get("self_introduction") or "")
+            except SystemExit:
+                time.sleep(args.poll); continue  # flaky proxy — keep polling
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                _s, ch = _http("GET", f"{base}/v1/chat/history?limit=12", args.api_key)
+                greeting = any(str(m.get("role") or "").lower() not in ("", "user")
+                               for m in (ch.get("messages") or []))
+            except SystemExit:
+                pass  # flaky proxy — retry next iteration
+            if intro_self.strip() and greeting:
+                break
+            time.sleep(args.poll)
+        identity_body["self_introduction"] = intro_self
+        checks["introduction_self_intro_written"] = bool(intro_self.strip())
+        checks["introduction_greeting_posted"] = greeting
     failed = [k for k, v in checks.items() if v is False]
     out = {
         "agent_name": agent_name,
@@ -391,6 +435,11 @@ def main():
                     help="user_profile string that must NOT leak into identity/persona (e.g. 赵铁柱)")
     ac.add_argument("--timeout", type=float, default=900)
     ac.add_argument("--poll", type=float, default=10)
+    ac.add_argument("--check-introduction", action="store_true",
+                    help="§六 7.D: after genesis done, wait for the spawned agent to write "
+                         "self_introduction + post a first greeting (needs agent-runner host-all)")
+    ac.add_argument("--intro-timeout", type=float, default=180,
+                    help="seconds to wait for the 7.D introduction (default 180)")
     ac.set_defaults(func=cmd_acceptance)
 
     args = p.parse_args()
