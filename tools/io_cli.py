@@ -43,7 +43,7 @@ PERCEPTION_SIGNALS = FAST_SIGNALS + SLOW_SIGNALS + EXTRA_SIGNALS
 
 # Native model handles these as agent OUTPUT actions, not pull tools — kept as
 # graceful no-op stubs so an agent that tries to call them degrades cleanly.
-PHASE2_VERBS = ("send", "wait-for-wake", "schedule-wake")
+PHASE2_VERBS = ("send", "wait-for-wake")
 
 
 def _emit(obj, code=0):
