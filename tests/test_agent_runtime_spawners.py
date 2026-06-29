@@ -72,20 +72,20 @@ def test_default_codex_cmd_skips_git_repo_check():
     assert "--skip-git-repo-check" in env["AGENT_CLI_CMD"]
 
 
-def test_default_codex_cmd_grants_sandbox_network():
-    # codex sandboxes the shell commands the model runs, and its DEFAULT sandbox
-    # blocks network. The agent reads memory/perception via io_cli (an HTTPS call
-    # to the Feedling API); under the default sandbox that call dies at DNS and
-    # the agent falsely reports "can't find it" while the data is present. The
-    # default template MUST open egress (workspace-write + network_access) or
-    # every hosted codex turn that reads memory silently fails.
+def test_default_codex_cmd_bypasses_bwrap_sandbox():
+    # codex's Linux sandbox (read-only / workspace-write) wraps commands in
+    # bubblewrap, which needs unprivileged user namespaces — DISABLED in the
+    # dstack/TDX CVM kernel, so bwrap fails and every io_cli read the agent makes
+    # fails to launch. The CVM is already the isolation boundary, so the template
+    # MUST bypass codex's own sandbox or every hosted codex memory read breaks.
     env = spawners.consumer_env(
         {}, {"api_key": "fk", "provider_key": "sk-oai", "driver": "codex"},
         user_id="u_1", home="/h",
     )
     cmd = env["AGENT_CLI_CMD"]
-    assert "--sandbox workspace-write" in cmd
-    assert "sandbox_workspace_write.network_access=true" in cmd
+    assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+    # the bwrap-requiring workspace-write sandbox must NOT be used in-CVM
+    assert "--sandbox workspace-write" not in cmd
 
 
 def test_consumer_env_tolerates_missing_api_key_for_zero_roster():

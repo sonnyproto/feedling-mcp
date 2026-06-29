@@ -165,23 +165,24 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
         # repo; without it `codex exec` refuses ("Not inside a trusted directory")
         # and exits 1 before any model call.
         #
-        # --sandbox workspace-write + sandbox_workspace_write.network_access=true:
-        # codex sandboxes the SHELL COMMANDS the model runs, and its default
-        # sandbox BLOCKS network egress. The agent reads memory/perception by
-        # shelling out to io_cli, which makes an HTTPS call to the Feedling API —
-        # under the default sandbox that call dies at DNS ("Could not resolve
-        # host: …feedling.app") and the agent falsely reports "can't find it"
-        # while the data is present. (The model call itself is codex's own,
-        # un-sandboxed network, so chat still replies — only the tool reads
-        # break.) This hits codex-driver on host AND VPS; claude-driver runs its
-        # Bash in the normal process env and is unaffected. workspace-write grants
-        # network without opening full-filesystem write (vs danger-full-access).
-        # Verified on codex-cli 0.136.0: default + workspace-write both fail DNS;
-        # workspace-write + network_access reaches the server.
+        # --dangerously-bypass-approvals-and-sandbox: codex's Linux sandbox
+        # (read-only / workspace-write) wraps every model-generated command in
+        # bubblewrap, which needs unprivileged user namespaces. The dstack/TDX CVM
+        # kernel DISABLES them, so bwrap dies with "No permissions to create a new
+        # namespace" and EVERY shell command — including the io_cli memory /
+        # perception / identity reads the agent depends on — fails to launch. The
+        # agent then reports "can't read memory" although the data is present.
+        # (Verified in-CVM on codex-cli 0.142.3: `--sandbox workspace-write` → bwrap
+        # namespace error; bypass → commands run and reach the network.) The CVM
+        # itself (TEE + per-user home) is the isolation boundary, so we run codex
+        # with its sandbox bypassed — the documented mode for "environments that
+        # are externally sandboxed". This supersedes the earlier `--sandbox
+        # workspace-write + sandbox_workspace_write.network_access` approach, which
+        # is moot when bwrap cannot initialize at all. claude-driver runs its Bash
+        # in the normal process env and never used bwrap.
         return (
             "codex exec --skip-git-repo-check --json "
-            "--sandbox workspace-write "
-            "-c 'sandbox_workspace_write.network_access=true' {message}"
+            "--dangerously-bypass-approvals-and-sandbox {message}"
         )
     grant = ",".join(_io_cli_allow_rules(io_cli))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
