@@ -97,3 +97,34 @@ def test_parse_caps_threads_at_eight():
            '"threads":["a","b","c","d","e","f","g","h","i","j"]}]}')
     cards, err = parse_capture_cards(raw)
     assert len(cards[0]["threads"]) == 8
+
+
+# --- A9 bucket convergence: one shared bilingual canonical vocabulary ----------
+# onboarding + capture + migration must steer toward the SAME reusable bucket set
+# instead of each card minting a fresh near-synonym (工作/职业/事业) or scattering.
+
+def test_capture_prompt_carries_canonical_buckets():
+    from memory.prompts_v1 import COMMON_BUCKETS_LINE_V1, COMMON_BUCKETS_V1
+    p = build_capture_prompt(
+        ai_name="io", user_name="hx", buckets="（暂无）", threads="（暂无）",
+        identity="x", window="y",
+    )
+    assert COMMON_BUCKETS_LINE_V1 in p   # seed list injected even with no existing buckets
+    assert "工作/Work" in p              # bilingual pair present
+    assert COMMON_BUCKETS_V1 and all(zh.strip() and en.strip() for zh, en in COMMON_BUCKETS_V1)
+    # companion-tuned set (hx): 14 buckets incl. the relationship/emotion/boundary ones
+    assert len(COMMON_BUCKETS_V1) == 14
+    for pair in (("宠物", "Pets"), ("偏好与边界", "Preferences & boundaries"),
+                 ("个性与价值观", "Personality & values"), ("我们的关系", "Our relationship")):
+        assert pair in COMMON_BUCKETS_V1
+
+
+def test_migrate_and_genesis_share_the_same_canonical_buckets():
+    from memory.prompts_v1 import COMMON_BUCKETS_LINE_V1
+    from memory.migrate_prompt_v1 import build_migrate_prompt
+    from genesis.prompts import FACT_WRITE_PROMPT
+    mig = build_migrate_prompt(ai_name="io", user_name="hx", old_cards="c", vocab="（暂无）")
+    assert COMMON_BUCKETS_LINE_V1 in mig
+    # onboarding (genesis FACT_WRITE) had NO bucket guidance before A9 — now it converges too
+    assert COMMON_BUCKETS_LINE_V1 in FACT_WRITE_PROMPT
+    assert "桶名收敛" in FACT_WRITE_PROMPT
