@@ -4988,6 +4988,9 @@ def _process_migrate_jobs(jobs: list) -> float:
     migration-state cache; never posts chat.
     """
     latest = 0.0
+    from memory.migration import migration_enabled
+    if not migration_enabled():
+        return latest  # FEEDLING_MIGRATE_ENABLE off → full stop, don't process queued migrate jobs
     for job in jobs:
         ts = float(job.get("ts", job.get("timestamp", 0)) or 0)
         latest = max(latest, ts)
