@@ -463,6 +463,82 @@ def test_identity_payload_from_output_ignores_empty_identity():
     assert service._identity_payload_from_output({"identity": {"agent_name": "", "dimensions": []}}) is None
 
 
+def test_init_identity_upserts_genesis_fields_and_preserves_agent_profile(monkeypatch):
+    captured: dict = {}
+    existing = {
+        "id": "identity_1",
+        "created_at": "2026-06-01T00:00:00",
+        "relationship_anchor_source": service.GENESIS_SOURCE,
+    }
+
+    monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: existing)
+    monkeypatch.setattr(
+        service.core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda _path, _api_key, **kwargs: (
+            captured.update({"runtime_token": kwargs.get("runtime_token")})
+            or ({
+                "identity": {
+                    "agent_name": "Old",
+                    "self_introduction": "I wrote this after respawn.",
+                    "signature": ["Still here", "Receipts first"],
+                    "dimensions": [{"name": "OldDim", "value": 10, "description": "old"}],
+                }
+            }, "")
+        ),
+    )
+
+    def fake_envelope(_store, plaintext, item_id=None):
+        captured["plaintext"] = json.loads(plaintext.decode("utf-8"))
+        captured["item_id"] = item_id
+        return ({
+            "id": item_id,
+            "body_ct": "encrypted_identity",
+            "nonce": "nonce",
+            "K_user": "ku",
+            "K_enclave": "ke",
+            "visibility": "shared",
+            "owner_user_id": "usr_genesis",
+            "enclave_pk_fpr": "fpr",
+        }, "")
+
+    monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", fake_envelope)
+    monkeypatch.setattr(
+        service.identity_service,
+        "_save_identity",
+        lambda _store, doc: captured.update({"saved": doc}),
+    )
+    monkeypatch.setattr(service.boot_gates, "_log_bootstrap_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service.identity_service, "_append_identity_change", lambda *_args, **_kwargs: None)
+
+    status = service.init_identity_if_absent(
+        _store(),
+        {
+            "identity": {
+                "agent_name": "Mira",
+                "dimensions": [{"name": "Steady", "value": 84, "description": "Persona says steady."}],
+            },
+            "relationship_started_at": "2026-06-01",
+            "relationship_anchor_evidence": "persona card named Mira",
+        },
+        None,
+        "runtime_token_1",
+    )
+
+    assert status == "updated"
+    assert captured["runtime_token"] == "runtime_token_1"
+    assert captured["item_id"] == "identity_1"
+    assert captured["plaintext"]["agent_name"] == "Mira"
+    assert captured["plaintext"]["dimensions"][0]["name"] == "Steady"
+    assert captured["plaintext"]["self_introduction"] == "I wrote this after respawn."
+    assert captured["plaintext"]["signature"] == ["Still here", "Receipts first"]
+    assert captured["saved"]["id"] == "identity_1"
+    assert captured["saved"]["created_at"] == "2026-06-01T00:00:00"
+    assert captured["saved"]["relationship_started_at"] == "2026-06-01"
+    assert captured["saved"]["identity_agent_name_present"] is True
+    assert captured["saved"]["identity_dimension_count"] == 1
+
+
 def test_apply_memory_outputs_batches_memory_actions(monkeypatch):
     calls = []
 

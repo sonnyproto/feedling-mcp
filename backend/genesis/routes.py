@@ -7,6 +7,7 @@ import json
 import math
 import re
 import threading
+from datetime import date
 from typing import Any
 
 from flask import Blueprint, jsonify, request
@@ -17,6 +18,7 @@ from accounts import runtime_auth
 from genesis import service, worker
 from hosted import config_store as hosted_config_store
 from hosted import history_import
+from identity import service as identity_service
 
 bp = Blueprint("genesis", __name__)
 
@@ -24,6 +26,17 @@ _JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
 _SECONDS_PER_DAY = 24 * 60 * 60
 _PLAINTEXT_ACTIVE_LOCK = threading.Lock()
 _PLAINTEXT_ACTIVE_JOBS: set[tuple[str, str]] = set()
+_PLAINTEXT_SOURCE_ORDER = (
+    history_import._AI_PERSONA_SOURCE,
+    history_import._HISTORY_SOURCE,
+    history_import._MEMORY_SUMMARY_SOURCE,
+    history_import._USER_PROFILE_SOURCE,
+)
+_PLAINTEXT_SUPPORT_SOURCE_FAMILIES = {
+    history_import._AI_PERSONA_SOURCE,
+    history_import._USER_PROFILE_SOURCE,
+    history_import._MEMORY_SUMMARY_SOURCE,
+}
 
 
 def _bad(error: str, status: int = 400, **extra):
@@ -73,6 +86,52 @@ def _plaintext_source_kind(history_messages: list[dict], support_messages: list[
     return history_import._HISTORY_SOURCE
 
 
+def _plaintext_route_family(msg: dict) -> str:
+    family = history_import._import_source_family(str(msg.get("source") or msg.get("source_family") or ""))
+    if family in _PLAINTEXT_SUPPORT_SOURCE_FAMILIES:
+        return family
+    return history_import._HISTORY_SOURCE
+
+
+def _plaintext_chunk_texts_for_messages(messages: list[dict], *, window_limit: int) -> list[str]:
+    windows = history_import._build_transcript_windows(
+        messages,
+        max_chars=18000,
+        max_windows=window_limit,
+    )
+    if len(windows) > window_limit:
+        windows = history_import._select_evenly(windows, window_limit)
+    return [
+        str(window.get("text") or "").strip()
+        for window in windows
+        if str(window.get("text") or "").strip()
+    ]
+
+
+def _plaintext_source_groups(analysis_messages: list[dict], *, window_limit: int) -> list[dict]:
+    buckets: dict[str, list[dict]] = {family: [] for family in _PLAINTEXT_SOURCE_ORDER}
+    for msg in analysis_messages:
+        if not isinstance(msg, dict):
+            continue
+        buckets.setdefault(_plaintext_route_family(msg), []).append(msg)
+
+    groups: list[dict] = []
+    for source_kind in _PLAINTEXT_SOURCE_ORDER:
+        messages = buckets.get(source_kind) or []
+        if not messages:
+            continue
+        chunk_texts = _plaintext_chunk_texts_for_messages(messages, window_limit=window_limit)
+        if not chunk_texts:
+            continue
+        groups.append({
+            "source_kind": source_kind,
+            "source_family": worker._source_family(source_kind),
+            "chunk_texts": chunk_texts,
+            "message_count": len(messages),
+        })
+    return groups
+
+
 def _plaintext_timeline_span_days(messages: list[dict]) -> int:
     timestamps: list[float] = []
     for msg in messages:
@@ -90,6 +149,29 @@ def _plaintext_timeline_span_days(messages: list[dict]) -> int:
     if len(timestamps) < 2:
         return 0
     return int(max(0.0, max(timestamps) - min(timestamps)) // _SECONDS_PER_DAY)
+
+
+def _plaintext_relationship_anchor(payload: dict, *, timeline_span_days: int) -> dict:
+    raw = str(payload.get("relationship_started_at") or "").strip()
+    if raw:
+        parsed = identity_service._parse_iso_calendar_date(raw)
+        if parsed:
+            return {
+                "relationship_started_at": parsed.isoformat(),
+                "days_with_user": max(0, (date.today() - parsed).days),
+                "relationship_anchor_evidence": f"plaintext_import:relationship_started_at={parsed.isoformat()}",
+            }
+    if timeline_span_days > 0:
+        return {
+            "relationship_started_at": "",
+            "days_with_user": int(timeline_span_days),
+            "relationship_anchor_evidence": f"plaintext_import:timeline_span_days={int(timeline_span_days)}",
+        }
+    return {
+        "relationship_started_at": "",
+        "days_with_user": 0,
+        "relationship_anchor_evidence": "",
+    }
 
 
 def _prepare_plaintext_import(payload: dict) -> dict:
@@ -114,29 +196,28 @@ def _prepare_plaintext_import(payload: dict) -> dict:
         content_chars=len(content),
     )
     window_limit = int(profile.get("total_windows") or 8)
-    windows = history_import._build_transcript_windows(
-        analysis_messages,
-        max_chars=18000,
-        max_windows=window_limit,
-    )
-    if len(windows) > window_limit:
-        windows = history_import._select_evenly(windows, window_limit)
+    source_groups = _plaintext_source_groups(analysis_messages, window_limit=window_limit)
     chunk_texts = [
-        str(window.get("text") or "").strip()
-        for window in windows
-        if str(window.get("text") or "").strip()
+        text
+        for group in source_groups
+        for text in (group.get("chunk_texts") or [])
+        if str(text or "").strip()
     ]
     if not chunk_texts:
         raise ValueError("plaintext_import_empty")
+    timeline_span_days = _plaintext_timeline_span_days(history_messages)
+    relationship_anchor = _plaintext_relationship_anchor(payload, timeline_span_days=timeline_span_days)
     return {
         "chunk_texts": chunk_texts,
         "content_bytes": len(content.encode("utf-8")),
         "history_messages": history_messages,
         "profile": profile,
+        "relationship_anchor": relationship_anchor,
         "source_kind": _plaintext_source_kind(history_messages, support_messages),
+        "source_groups": source_groups,
         "source_stats": history_import._import_source_stats(analysis_messages),
         "support_messages": support_messages,
-        "timeline_span_days": _plaintext_timeline_span_days(history_messages),
+        "timeline_span_days": timeline_span_days,
         "warnings": warnings,
     }
 
@@ -209,16 +290,220 @@ def _find_reusable_plaintext_job(
     return None
 
 
+def _plaintext_identity_name(identity: dict | None) -> str:
+    if not isinstance(identity, dict):
+        return ""
+    name = str(identity.get("agent_name") or "").strip()
+    return name[:80]
+
+
+def _plaintext_identity_dimensions(identity: dict | None) -> list[dict]:
+    if not isinstance(identity, dict):
+        return []
+    dims = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
+    return [dim for dim in dims if isinstance(dim, dict)][:7]
+
+
+def _plaintext_positive_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except Exception:
+        return 0
+
+
+def _plaintext_memory_key(item: dict) -> str:
+    return "|".join([
+        re.sub(r"\s+", " ", str(item.get("type") or "")).strip().lower(),
+        re.sub(r"\s+", " ", str(item.get("summary") or item.get("title") or "")).strip().lower()[:500],
+        re.sub(r"\s+", " ", str(item.get("content") or item.get("description") or "")).strip().lower()[:1000],
+    ])
+
+
+def _plaintext_merge_memories(outputs: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    merged: list[dict] = []
+    for output in outputs:
+        raw_items = output.get("memories")
+        if raw_items is None:
+            raw_items = output.get("facts")
+        if not isinstance(raw_items, list):
+            continue
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            key = _plaintext_memory_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+    return merged
+
+
+def _plaintext_merge_voice_workset(outputs: list[dict]) -> dict:
+    notes: list[str] = []
+    exemplars: list[dict] = []
+    seen_notes: set[str] = set()
+    seen_exemplars: set[str] = set()
+    for output in outputs:
+        if str(output.get("source_family") or "") == "user_profile":
+            continue
+        workset = output.get("voice_workset") if isinstance(output.get("voice_workset"), dict) else {}
+        for note in workset.get("behavior_notes") if isinstance(workset.get("behavior_notes"), list) else []:
+            clean = re.sub(r"\s+", " ", str(note or "").strip())
+            if not clean or clean in seen_notes:
+                continue
+            seen_notes.add(clean)
+            notes.append(clean)
+        for exemplar in workset.get("exemplars") if isinstance(workset.get("exemplars"), list) else []:
+            if not isinstance(exemplar, dict):
+                continue
+            key = json.dumps(exemplar, ensure_ascii=False, sort_keys=True, default=str)[:2000]
+            if key in seen_exemplars:
+                continue
+            seen_exemplars.add(key)
+            exemplars.append(exemplar)
+    if not notes and not exemplars:
+        return {}
+    return {
+        "behavior_notes": notes[:16],
+        "exemplars": exemplars[:80],
+    }
+
+
+def _plaintext_merge_reducer_outputs(outputs: list[dict], *, relationship_anchor: dict | None = None) -> dict:
+    relationship_anchor = relationship_anchor if isinstance(relationship_anchor, dict) else {}
+    usable_identity_outputs = [
+        output for output in outputs
+        if str(output.get("source_family") or "") != "user_profile"
+        and isinstance(output.get("identity"), dict)
+    ]
+
+    def first_identity_name(*families: str) -> str:
+        for family in families:
+            for output in usable_identity_outputs:
+                if str(output.get("source_family") or "") != family:
+                    continue
+                name = _plaintext_identity_name(output.get("identity"))
+                if name:
+                    return name
+        return ""
+
+    def first_identity_dims(*families: str) -> list[dict]:
+        for family in families:
+            for output in usable_identity_outputs:
+                if str(output.get("source_family") or "") != family:
+                    continue
+                dims = _plaintext_identity_dimensions(output.get("identity"))
+                if dims:
+                    return dims
+        return []
+
+    agent_name = first_identity_name("ai_persona", "history", "memory_summary")
+    dimensions = first_identity_dims("ai_persona", "history")
+    identity = {"agent_name": agent_name, "dimensions": dimensions} if (agent_name or dimensions) else {}
+
+    persona: dict = {}
+    for output in outputs:
+        if str(output.get("source_family") or "") == "user_profile":
+            continue
+        candidate = output.get("persona") if isinstance(output.get("persona"), dict) else {}
+        if str(candidate.get("content") or "").strip():
+            persona = candidate
+
+    voice_workset = _plaintext_merge_voice_workset(outputs)
+    voice = {
+        "behavior_notes_count": len(voice_workset.get("behavior_notes") or []),
+        "exemplar_count": len(voice_workset.get("exemplars") or []),
+        "founding_exemplar_count": len([
+            item for item in (voice_workset.get("exemplars") or [])
+            if isinstance(item, dict) and item.get("founding")
+        ]),
+    }
+    if not voice_workset:
+        for output in reversed(outputs):
+            candidate = output.get("voice") if isinstance(output.get("voice"), dict) else {}
+            if candidate:
+                voice = candidate
+                break
+
+    output_days = max(_plaintext_positive_int(output.get("days_with_user")) for output in outputs) if outputs else 0
+    days = _plaintext_positive_int(relationship_anchor.get("days_with_user")) or output_days
+    evidence = str(relationship_anchor.get("relationship_anchor_evidence") or "").strip()
+    if not evidence:
+        evidence = " | ".join(
+            str(output.get("relationship_anchor_evidence") or "").strip()
+            for output in outputs
+            if str(output.get("relationship_anchor_evidence") or "").strip()
+        )[:500]
+
+    source_families = [str(output.get("source_family") or "") for output in outputs if str(output.get("source_family") or "")]
+    merged: dict[str, Any] = {
+        "memories": _plaintext_merge_memories(outputs),
+        "source_kind": "plaintext_multi_source" if len(source_families) > 1 else str((outputs[0] if outputs else {}).get("source_kind") or "history_import"),
+        "source_family": "merged" if len(set(source_families)) > 1 else (source_families[0] if source_families else "history"),
+        "voice": voice,
+        "days_with_user": days,
+    }
+    if identity:
+        merged["identity"] = identity
+    if evidence:
+        merged["relationship_anchor_evidence"] = evidence
+    if str(relationship_anchor.get("relationship_started_at") or "").strip():
+        merged["relationship_started_at"] = str(relationship_anchor.get("relationship_started_at") or "").strip()
+    if persona:
+        merged["persona"] = persona
+    if voice_workset:
+        merged["voice_workset"] = voice_workset
+    return merged
+
+
+def _plaintext_existing_persona_from_output(output: dict) -> dict:
+    persona = output.get("persona") if isinstance(output.get("persona"), dict) else {}
+    content = str(persona.get("content") or "").strip()
+    if not content:
+        return {}
+    return {
+        "content": content,
+        "source_family": str(persona.get("source_family") or output.get("source_family") or ""),
+    }
+
+
+def _plaintext_existing_voice_from_output(output: dict) -> dict:
+    workset = output.get("voice_workset") if isinstance(output.get("voice_workset"), dict) else {}
+    if not workset:
+        return {}
+    return {
+        "behavior_notes": workset.get("behavior_notes") if isinstance(workset.get("behavior_notes"), list) else [],
+        "exemplars": workset.get("exemplars") if isinstance(workset.get("exemplars"), list) else [],
+    }
+
+
 def _run_plaintext_genesis_job(
     store,
     api_key: str | None,
     job_id: str,
     *,
-    chunk_texts: list[str],
-    source_kind: str,
+    chunk_texts: list[str] | None = None,
+    source_kind: str = history_import._HISTORY_SOURCE,
+    source_groups: list[dict] | None = None,
+    relationship_anchor: dict | None = None,
 ) -> None:
     active_key = (store.user_id, job_id)
     try:
+        if source_groups is None:
+            source_groups = [{
+                "source_kind": source_kind,
+                "source_family": worker._source_family(source_kind),
+                "chunk_texts": list(chunk_texts or []),
+                "message_count": 0,
+            }]
+        source_groups = [
+            group for group in source_groups
+            if isinstance(group, dict) and group.get("chunk_texts")
+        ]
+        if not source_groups:
+            raise ValueError("plaintext_import_empty")
+
         job = db.genesis_set_job_status(
             store.user_id,
             job_id,
@@ -232,21 +517,57 @@ def _run_plaintext_genesis_job(
         if isinstance(runtime, tuple):
             _, err = runtime
             raise RuntimeError(json.dumps(err, ensure_ascii=False))
-        reducer_output = worker.build_reducer_output_from_texts(
-            user_id=store.user_id,
-            job_id=job_id,
-            runtime=runtime,
-            chunk_texts=chunk_texts,
-            source_kind=source_kind,
-            existing_persona={},
-            existing_voice={},
+
+        reducer_outputs: list[dict] = []
+        existing_persona: dict = {}
+        existing_voice: dict = {}
+        processed_chunks = 0
+        for idx, group in enumerate(source_groups, start=1):
+            group_source_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
+            group_source_family = str(group.get("source_family") or worker._source_family(group_source_kind))
+            group_chunk_texts = [str(text) for text in (group.get("chunk_texts") or []) if str(text or "").strip()]
+            if not group_chunk_texts:
+                continue
+            db.genesis_set_job_status(
+                store.user_id,
+                job_id,
+                status="processing",
+                output={
+                    "stage": "plaintext_reducer",
+                    "source_family": group_source_family,
+                    "source_pass": idx,
+                    "source_pass_total": len(source_groups),
+                },
+                processed_chunks=processed_chunks,
+            )
+            output = worker.build_reducer_output_from_texts(
+                user_id=store.user_id,
+                job_id=f"{job_id}:{group_source_family}",
+                runtime=runtime,
+                chunk_texts=group_chunk_texts,
+                source_kind=group_source_kind,
+                existing_persona=existing_persona,
+                existing_voice=existing_voice,
+            )
+            reducer_outputs.append(output)
+            processed_chunks += len(group_chunk_texts)
+            next_persona = _plaintext_existing_persona_from_output(output)
+            if next_persona:
+                existing_persona = next_persona
+            next_voice = _plaintext_existing_voice_from_output(output)
+            if next_voice:
+                existing_voice = next_voice
+
+        reducer_output = _plaintext_merge_reducer_outputs(
+            reducer_outputs,
+            relationship_anchor=relationship_anchor,
         )
         db.genesis_set_job_status(
             store.user_id,
             job_id,
             status="processing",
             output={"stage": "plaintext_reducer_done"},
-            processed_chunks=len(chunk_texts),
+            processed_chunks=sum(len(group.get("chunk_texts") or []) for group in source_groups),
         )
         service.apply_reducer_output(store, api_key, job_id, reducer_output)
     except Exception as e:  # noqa: BLE001
@@ -263,6 +584,8 @@ def _start_plaintext_genesis_job(
     *,
     chunk_texts: list[str],
     source_kind: str,
+    source_groups: list[dict] | None = None,
+    relationship_anchor: dict | None = None,
 ) -> bool:
     job_id = str(job.get("job_id") or "")
     if not job_id:
@@ -275,7 +598,12 @@ def _start_plaintext_genesis_job(
     thread = threading.Thread(
         target=_run_plaintext_genesis_job,
         args=(store, api_key, job_id),
-        kwargs={"chunk_texts": chunk_texts, "source_kind": source_kind},
+        kwargs={
+            "chunk_texts": chunk_texts,
+            "source_kind": source_kind,
+            "source_groups": source_groups,
+            "relationship_anchor": relationship_anchor,
+        },
         name=f"genesis-plaintext-{job_id[:24]}",
         daemon=True,
     )
@@ -337,6 +665,8 @@ def genesis_import_plaintext():
             existing,
             chunk_texts=prepared["chunk_texts"],
             source_kind=prepared["source_kind"],
+            source_groups=prepared["source_groups"],
+            relationship_anchor=prepared["relationship_anchor"],
         )
         return jsonify(_job_response(existing, extra={"status": "processing"})), 202
 
@@ -372,6 +702,8 @@ def genesis_import_plaintext():
         job,
         chunk_texts=prepared["chunk_texts"],
         source_kind=prepared["source_kind"],
+        source_groups=prepared["source_groups"],
+        relationship_anchor=prepared["relationship_anchor"],
     )
     return jsonify(_job_response(job, extra={"status": "processing"})), 202
 
@@ -492,6 +824,7 @@ def genesis_import_apply_outputs(job_id: str):
     store = auth.require_user()
     runtime_auth.authorize_scope("genesis")
     api_key = auth._extract_api_key()
+    runtime_token = runtime_auth.extract_runtime_token() or ""
     if not _valid_job_id(job_id):
         return _bad("invalid_job_id", 400)
     payload = request.get_json(silent=True) or {}
@@ -499,7 +832,13 @@ def genesis_import_apply_outputs(job_id: str):
     if not isinstance(reducer_output, dict):
         return _bad("reducer_output_required", 400)
     try:
-        applied = service.apply_reducer_output(store, api_key, job_id, reducer_output)
+        applied = service.apply_reducer_output(
+            store,
+            api_key,
+            job_id,
+            reducer_output,
+            runtime_token=runtime_token,
+        )
     except LookupError as e:
         return _bad(str(e), 404)
     except ValueError as e:

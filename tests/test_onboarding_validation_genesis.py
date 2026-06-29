@@ -116,3 +116,34 @@ def test_model_api_validate_marks_genesis_done_steps_complete(monkeypatch):
     assert steps["identity_card"]["passing"] is True
     assert steps["relationship_anchor"]["passing"] is True
     assert steps["hosted_chat"]["passing"] is True
+
+
+def test_model_api_validate_rejects_done_genesis_with_empty_identity_card(monkeypatch):
+    _install_model_api_harness(
+        monkeypatch,
+        identity={
+            "relationship_started_at": "2026-06-01",
+            "relationship_anchor_source": "genesis_import",
+            "relationship_anchor_evidence": "Imported chat history.",
+        },
+        genesis_jobs=[
+            {
+                "job_id": "genesis_1",
+                "status": "done",
+                "source_kind": "history_import",
+                "memory_action_count": 2,
+                "identity_status": "updated",
+                "output": {"stage": "complete"},
+                "metadata": {"ingest": "plaintext", "history_count": 2, "timeline_span_days": 1},
+            }
+        ],
+    )
+
+    body = validation._model_api_onboarding_validation_payload(_store())
+    steps = {step["id"]: step for step in body["steps"]}
+
+    assert body["passing"] is False
+    assert body["stage"] == "identity_card"
+    assert steps["identity_card"]["written"] is True
+    assert steps["identity_card"]["complete"] is False
+    assert steps["identity_card"]["passing"] is False

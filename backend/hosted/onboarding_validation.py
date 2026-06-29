@@ -157,6 +157,24 @@ def _int_value(value: Any, default: int = 0) -> int:
         return default
 
 
+def _identity_card_complete(identity: dict | None) -> bool:
+    if not isinstance(identity, dict):
+        return False
+    if str(identity.get("agent_name") or "").strip():
+        return True
+    dims = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
+    if any(isinstance(dim, dict) for dim in dims):
+        return True
+    if bool(identity.get("identity_agent_name_present")):
+        return True
+    if _int_value(identity.get("identity_dimension_count")) > 0:
+        return True
+    # Legacy non-genesis identities predate the completion metadata. Keep them
+    # passing unless the card was written by Genesis, where old empty cards are
+    # exactly the regression this validator must catch.
+    return str(identity.get("relationship_anchor_source") or "") != "genesis_import"
+
+
 def _model_api_steps_with_genesis(
     *,
     base_steps: list[dict],
@@ -178,6 +196,7 @@ def _model_api_steps_with_genesis(
     memory_action_count = _int_value(genesis_job.get("memory_action_count"))
     identity_status = str(genesis_job.get("identity_status") or "")
     persona_ref = str(genesis_job.get("persona_ref") or "")
+    identity_complete = _identity_card_complete(identity)
 
     history_step = {
         "id": "history_import",
@@ -233,11 +252,12 @@ def _model_api_steps_with_genesis(
     identity_step = {
         "id": "identity_card",
         "label": "Identity Card",
-        "passing": done and identity_written,
+        "passing": done and identity_complete,
         "written": done and identity_written,
+        "complete": done and identity_complete,
         "genesis": True,
         "identity_status": identity_status,
-        "required": "" if done and identity_written else "Wait for Genesis to write Identity Card.",
+        "required": "" if done and identity_complete else "Wait for Genesis to write a non-empty Identity Card.",
     }
     relationship_step = {
         "id": "relationship_anchor",
@@ -272,6 +292,7 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
     bootstrap_st = boot_gates._bootstrap_state(store)
     identity = identity_service._load_identity(store)
     identity_written = identity is not None
+    identity_complete = _identity_card_complete(identity)
     relationship_anchored = bool(identity and identity.get("relationship_started_at"))
     relationship_evidence = str((identity or {}).get("relationship_anchor_evidence") or "").strip()
     relationship_ok = relationship_anchored and bool(relationship_evidence)
@@ -360,9 +381,10 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
         {
             "id": "identity_card",
             "label": "Identity Card",
-            "passing": identity_written,
+            "passing": identity_complete,
             "written": identity_written,
-            "required": "History import must derive and write Identity Card." if not identity_written else "",
+            "complete": identity_complete,
+            "required": "History import must derive and write a non-empty Identity Card." if not identity_complete else "",
         },
         {
             "id": "relationship_anchor",
@@ -408,6 +430,7 @@ def _official_import_onboarding_validation_payload(store: UserStore) -> dict:
     bootstrap_st = boot_gates._bootstrap_state(store)
     identity = identity_service._load_identity(store)
     identity_written = identity is not None
+    identity_complete = _identity_card_complete(identity)
     relationship_evidence = str((identity or {}).get("relationship_anchor_evidence") or "").strip()
     relationship_ok = bool(identity and identity.get("relationship_started_at") and relationship_evidence)
     steps = [
@@ -426,9 +449,10 @@ def _official_import_onboarding_validation_payload(store: UserStore) -> dict:
         {
             "id": "identity_card",
             "label": "Identity Card",
-            "passing": identity_written,
+            "passing": identity_complete,
             "written": identity_written,
-            "required": "Use the official app/tool client to import memory and identity." if not identity_written else "",
+            "complete": identity_complete,
+            "required": "Use the official app/tool client to import a non-empty identity." if not identity_complete else "",
         },
         {
             "id": "relationship_anchor",
@@ -461,6 +485,7 @@ def _onboarding_validation_payload(store: UserStore) -> dict:
     bootstrap_st = boot_gates._bootstrap_state(store)
     identity = identity_service._load_identity(store)
     identity_written = identity is not None
+    identity_complete = _identity_card_complete(identity)
     relationship_anchored = bool(identity and identity.get("relationship_started_at"))
     relationship_evidence = str((identity or {}).get("relationship_anchor_evidence") or "").strip()
     relationship_ok = relationship_anchored and bool(relationship_evidence)
@@ -486,13 +511,14 @@ def _onboarding_validation_payload(store: UserStore) -> dict:
         {
             "id": "identity_card",
             "label": "Identity Card",
-            "passing": identity_written,
+            "passing": identity_complete,
             "written": identity_written,
+            "complete": identity_complete,
             "required": (
                 "Write the identity card first (feedling_identity_init) — it no "
                 "longer depends on memory floor. The Memory Garden grows naturally "
                 "afterwards."
-                if not identity_written else ""
+                if not identity_complete else ""
             ),
         },
         {

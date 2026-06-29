@@ -242,6 +242,19 @@ def _identity_only(doc: dict) -> dict:
     return out
 
 
+def _memory_summary_name_only(doc: dict) -> dict:
+    clean = _strip_identity(doc)
+    identity = doc.get("identity") if isinstance(doc.get("identity"), dict) else {}
+    agent_name = str(identity.get("agent_name") or "").strip()
+    if agent_name:
+        clean["identity"] = {"agent_name": agent_name, "dimensions": []}
+    if clean.get("identity") and doc.get("days_with_user") is not None:
+        clean["days_with_user"] = doc.get("days_with_user")
+    if clean.get("identity") and doc.get("relationship_anchor_evidence"):
+        clean["relationship_anchor_evidence"] = doc.get("relationship_anchor_evidence")
+    return clean
+
+
 def _fetch_provider_key(api_url: str, enclave_url: str, runtime_token: str) -> str:
     try:
         resp = httpx.get(
@@ -579,7 +592,7 @@ def _build_reducer_output(
         }
 
     if source_family == "memory_summary":
-        fact_write = _strip_identity(_fact_write(
+        fact_write = _memory_summary_name_only(_fact_write(
             llm,
             user_id=user_id,
             job_id=job_id,

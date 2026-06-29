@@ -554,7 +554,7 @@ def test_memory_summary_source_feeds_fact_write_material_without_maps(monkeypatc
                 assert "稳定陪伴" in payload["memory_summary"]
                 text = json.dumps({
                     "memories": [{"type": "fact", "summary": "User needs stable companionship", "content": "User needs stable companionship."}],
-                    "identity": {"agent_name": "Wrong", "dimensions": [{"name": "Wrong", "value": 90, "description": "from memory summary"}]},
+                    "identity": {"agent_name": "Mira", "dimensions": [{"name": "Wrong", "value": 90, "description": "from memory summary"}]},
                 })
             else:
                 raise AssertionError(task_id)
@@ -573,7 +573,7 @@ def test_memory_summary_source_feeds_fact_write_material_without_maps(monkeypatc
     reducer_output = apply_payloads[0]["reducer_output"]
     assert reducer_output["source_family"] == "memory_summary"
     assert reducer_output["memories"][0]["summary"] == "User needs stable companionship"
-    assert "identity" not in reducer_output
+    assert reducer_output["identity"] == {"agent_name": "Mira", "dimensions": []}
     assert "persona" not in reducer_output
 
 

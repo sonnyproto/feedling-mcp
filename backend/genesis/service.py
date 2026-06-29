@@ -11,6 +11,7 @@ from typing import Any
 
 import db
 from bootstrap import gates as boot_gates
+from core import enclave as core_enclave
 from core import envelope as core_envelope
 from core import util as core_util
 from core.store import UserStore
@@ -532,13 +533,80 @@ def _identity_payload_from_output(output: dict) -> dict | None:
     return payload
 
 
-def init_identity_if_absent(store: UserStore, output: dict) -> str:
+def _identity_payload_from_existing_plain(identity: dict | None) -> dict:
+    if not isinstance(identity, dict):
+        return {"agent_name": "", "self_introduction": "", "dimensions": []}
+    payload = {
+        "agent_name": _text(identity.get("agent_name"), 80),
+        "self_introduction": str(identity.get("self_introduction") or "").strip()[:1200],
+        "dimensions": identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else [],
+    }
+    for key in identity_service._IDENTITY_PROFILE_STRING_FIELDS:
+        if key in {"agent_name", "self_introduction"}:
+            continue
+        if identity.get(key):
+            payload[key] = str(identity.get(key) or "")[:1200 if key in {"relationship_anchor", "tone_style", "custom_persona_prompt"} else 240]
+    for key in identity_service._IDENTITY_PROFILE_LIST_FIELDS:
+        if isinstance(identity.get(key), list):
+            payload[key] = [str(item)[:240] for item in identity[key][:12] if str(item or "").strip()]
+    return payload
+
+
+def _existing_identity_plain_for_update(api_key: str | None, runtime_token: str = "") -> tuple[dict | None, str]:
+    if not api_key and not runtime_token:
+        return None, "api_key_unavailable"
+    data, err = core_enclave._enclave_get_json_for_gate(
+        "/v1/identity/get",
+        api_key,
+        runtime_token=runtime_token,
+    )
+    if err:
+        return None, err
+    if not isinstance(data, dict) or not isinstance(data.get("identity"), dict):
+        return None, "identity_plain_not_available"
+    identity = data["identity"]
+    status = identity.get("decrypt_status")
+    if status and status != "ok":
+        return None, str(status)
+    return identity, ""
+
+
+def _relationship_anchor_from_output(store: UserStore, output: dict, days_int: int) -> str:
+    raw_started_at = _text(output.get("relationship_started_at"), 80)
+    if raw_started_at:
+        parsed = identity_service._parse_iso_calendar_date(raw_started_at)
+        if parsed:
+            return parsed.isoformat()
+    return identity_service._anchor_from_days(days_int, store=store, prefer_memory=True)
+
+
+def init_identity_if_absent(
+    store: UserStore,
+    output: dict,
+    api_key: str | None = None,
+    runtime_token: str = "",
+) -> str:
     existing = identity_service._load_identity(store)
-    if existing:
-        return "already_initialized"
     payload = _identity_payload_from_output(output)
     if not payload:
         return "not_provided"
+
+    base_payload = {"agent_name": "", "self_introduction": "", "dimensions": []}
+    if existing:
+        existing_plain, err = _existing_identity_plain_for_update(api_key, runtime_token)
+        if existing_plain is not None:
+            base_payload = _identity_payload_from_existing_plain(existing_plain)
+        elif str(existing.get("relationship_anchor_source") or "") != GENESIS_SOURCE:
+            return "already_initialized"
+
+    # Genesis owns the derived name/dimensions. Preserve the profile fields that
+    # the live agent writes after respawn, especially self_introduction/signature.
+    merged_payload = dict(base_payload)
+    merged_payload["agent_name"] = payload["agent_name"]
+    merged_payload["dimensions"] = payload["dimensions"]
+    if "self_introduction" not in merged_payload:
+        merged_payload["self_introduction"] = ""
+
     days = output.get("days_with_user")
     identity = output.get("identity") if isinstance(output.get("identity"), dict) else {}
     if days is None:
@@ -557,35 +625,38 @@ def init_identity_if_absent(store: UserStore, output: dict) -> str:
         evidence = f"{GENESIS_SOURCE}:derived from uploaded import"
     envelope, err = core_envelope._build_shared_envelope_for_store(
         store,
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        json.dumps(merged_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        item_id=(existing or {}).get("id") or None,
     )
     if envelope is None:
         raise RuntimeError(f"identity_envelope_failed:{err}")
     now = datetime.now().isoformat()
     identity_doc = {
         "v": 1,
-        "id": envelope.get("id") or core_util._new_public_id("identity"),
+        "id": envelope.get("id") or (existing or {}).get("id") or core_util._new_public_id("identity"),
         "body_ct": envelope["body_ct"],
         "nonce": envelope["nonce"],
         "K_user": envelope["K_user"],
         "enclave_pk_fpr": envelope.get("enclave_pk_fpr", ""),
         "visibility": envelope["visibility"],
         "owner_user_id": envelope["owner_user_id"],
-        "created_at": now,
+        "created_at": (existing or {}).get("created_at") or now,
         "updated_at": now,
-        "relationship_started_at": identity_service._anchor_from_days(days_int, store=store, prefer_memory=True),
+        "relationship_started_at": _relationship_anchor_from_output(store, output, days_int),
         "relationship_anchor_source": GENESIS_SOURCE,
         "relationship_anchor_evidence": evidence,
+        "identity_agent_name_present": bool(merged_payload.get("agent_name")),
+        "identity_dimension_count": len(merged_payload.get("dimensions") or []),
     }
     if envelope.get("K_enclave"):
         identity_doc["K_enclave"] = envelope["K_enclave"]
     identity_service._save_identity(store, identity_doc)
     boot_gates._log_bootstrap_event(store, "genesis_identity_written_v1", success=True)
     identity_service._append_identity_change(store, {
-        "action": "init",
-        "reason": "Identity initialized from Genesis import.",
+        "action": "replace" if existing else "init",
+        "reason": "Identity updated from Genesis import." if existing else "Identity initialized from Genesis import.",
     })
-    return "initialized"
+    return "updated" if existing else "initialized"
 
 
 def write_persona_artifact(store: UserStore, job_id: str, output: dict) -> tuple[str, str]:
@@ -662,7 +733,14 @@ def write_voice_artifact(store: UserStore, job_id: str, output: dict) -> tuple[s
     return GENESIS_VOICE_REF, digest
 
 
-def apply_reducer_output(store: UserStore, api_key: str | None, job_id: str, output: dict) -> dict:
+def apply_reducer_output(
+    store: UserStore,
+    api_key: str | None,
+    job_id: str,
+    output: dict,
+    *,
+    runtime_token: str = "",
+) -> dict:
     job = db.genesis_get_job(store.user_id, job_id)
     if not job:
         raise LookupError("genesis_job_not_found")
@@ -672,7 +750,7 @@ def apply_reducer_output(store: UserStore, api_key: str | None, job_id: str, out
     db.genesis_set_job_status(store.user_id, job_id, status="processing", output={"stage": "apply_outputs"})
     write_genesis_state(store, {**job, "status": "processing"})
     memory_count, memory_results = apply_memory_outputs(store, api_key, output)
-    identity_status = init_identity_if_absent(store, output)
+    identity_status = init_identity_if_absent(store, output, api_key, runtime_token)
     persona_ref, persona_sha = write_persona_artifact(store, job_id, output)
     voice_ref, voice_sha = write_voice_artifact(store, job_id, output)
     result_doc = {
