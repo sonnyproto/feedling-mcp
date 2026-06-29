@@ -399,6 +399,23 @@ def _with_resident_runtime_v2(job: dict, runtime_profile: dict) -> dict:
     return out
 
 
+def _is_introduction_job(job: dict) -> bool:
+    return str((job or {}).get("job_kind") or "").strip() == "introduction"
+
+
+def _resident_pending_introduction_jobs(store, *, limit: int, runtime_profile: dict) -> list[dict]:
+    out: list[dict] = []
+    for job in store.list_proactive_jobs(since_epoch=0, limit=0):
+        if str(job.get("status") or "pending") != "pending":
+            continue
+        if not _is_introduction_job(job):
+            continue
+        out.append(_with_resident_runtime_v2(job, runtime_profile))
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _settings_v2_for_store(store):
     try:
         from proactive.store_v2 import DBProactiveSettingsStoreV2
@@ -426,13 +443,27 @@ def _resident_wake_control_decision_v2(store, job: dict):
 
 
 def _resident_pollable_pending_jobs(store, *, since: float, limit: int, runtime_profile: dict) -> list[dict]:
-    out: list[dict] = []
+    # The post-spawn introduction job is intentionally created by the supervisor
+    # right after process spawn. On a first boot the resident consumer seeds its
+    # proactive checkpoint to "now" to avoid replaying historical hidden jobs, so
+    # this one bootstrap job must be recovered by status rather than by ts > since.
+    out: list[dict] = _resident_pending_introduction_jobs(
+        store,
+        limit=limit,
+        runtime_profile=runtime_profile,
+    )
+    seen = {str(job.get("job_id") or "") for job in out}
     read_limit = max(limit, 100)
     for job in store.list_proactive_jobs(since_epoch=since, limit=read_limit):
+        job_id = str(job.get("job_id") or "")
+        if job_id and job_id in seen:
+            continue
         if str(job.get("status") or "pending") != "pending":
             continue
-        if str(job.get("job_kind") or "").strip() == "introduction":
+        if _is_introduction_job(job):
             out.append(_with_resident_runtime_v2(job, runtime_profile))
+            if job_id:
+                seen.add(job_id)
             if len(out) >= limit:
                 break
             continue

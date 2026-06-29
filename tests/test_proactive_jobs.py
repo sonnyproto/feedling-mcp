@@ -1007,9 +1007,16 @@ def test_resident_poll_delivers_introduction_even_when_ambient_off(tmp_path, mon
         "trigger": "post_spawn_genesis",
         "job_kind": "introduction",
     })
+    store.append_proactive_job({
+        "job_id": "pj_old_normal",
+        "source": appmod.PROACTIVE_JOB_SOURCE,
+        "ts": 1001.0,
+        "status": "pending",
+        "trigger": "photo_added",
+    })
 
     client = appmod.app.test_client()
-    poll = client.get("/v1/proactive/jobs/poll?since=0&timeout=0", headers={"X-API-Key": api_key})
+    poll = client.get("/v1/proactive/jobs/poll?since=2000&timeout=0", headers={"X-API-Key": api_key})
 
     assert poll.status_code == 200
     body = poll.get_json()
