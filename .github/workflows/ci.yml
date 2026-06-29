@@ -417,6 +417,7 @@ jobs:
           # runtime token) + backend routes their sends to it. Needs the token
           # secret above. Empty = off. Both services read it from the encrypted env.
           FEEDLING_HOST_ALL:            ${{ vars.FEEDLING_HOST_ALL }}
+          FEEDLING_MIGRATE_ENABLE:      ${{ vars.FEEDLING_MIGRATE_ENABLE }}
           # R2 frame-ciphertext offload (backend/object_storage.py). Encrypted
           # env channel; empty = feature off. The token MUST be scoped to the
           # frames bucket. See deploy/DEPLOYMENTS.md.
@@ -452,6 +453,7 @@ jobs:
             -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
             -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
+            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             --wait
 
       - name: Publish live compose_hash on Sepolia
@@ -596,6 +598,7 @@ jobs:
           # runtime token) + backend routes their sends to it. Needs the token
           # secret above. Empty = off. Both services read it from the encrypted env.
           FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
+          FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
           # R2 frame-ciphertext offload — TEST_-prefixed secrets, un-prefixed
           # container env. Empty = feature off; token MUST be scoped to the
           # frames bucket. See deploy/DEPLOYMENTS.md.
@@ -631,6 +634,7 @@ jobs:
             -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
             -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
+            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
             --wait
 
       - name: Publish live compose_hash on Sepolia (test contract)

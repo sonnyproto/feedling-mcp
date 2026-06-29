@@ -203,6 +203,9 @@ services:
       # routing must agree with the supervisor's host_all discovery). Empty = off
       # (per-user flag still required). Mirror the agent-runner's value.
       FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
+      # Legacy memory migration is opt-in. Empty = off; set to 1 only after
+      # seeded real-device Garden verification passes. Mirror agent-runner.
+      FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
       # Stage-D runtime token secret — the BACKEND is the verifier (enclave whoami
       # falls back here), so it MUST share the agent-runner's secret or token auth
       # 401s. Empty = off. Encrypted env, not baked into compose_hash.
@@ -253,6 +256,9 @@ services:
       # provider key with it — no AGENT_RUNTIME_USERS needed. Requires the token
       # secret above. Empty = off. Mirror the backend's FEEDLING_HOST_ALL.
       FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
+      # Same migration kill-switch as backend. Empty = off; when off, the
+      # resident consumer will not process queued memory_migrate jobs.
+      FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
       # in-CVM LiteLLM gateway (codex non-openai providers). Empty = off; the proxy
       # only starts when this is set, and FEEDLING_LITELLM_API_KEY is the bearer
       # codex presents. FEEDLING_LITELLM_PYTHON is baked in the image (isolated venv).
