@@ -6,11 +6,22 @@ The memory.upgrade in-place/CAS path is exercised by the memory-action tests.
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
 from memory import migration  # noqa: E402
 from memory import migrate_prompt_v1 as mp  # noqa: E402
 from proactive import capture_jobs  # noqa: E402
+from proactive import capture_scheduler  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _migration_on(monkeypatch):
+    """A10 made migration default-OFF (FEEDLING_MIGRATE_ENABLE kill switch). Every
+    test here predates that and assumes migration runs, so flip it ON for the suite;
+    the dedicated gate tests below monkeypatch it back OFF where they need to."""
+    monkeypatch.setenv("FEEDLING_MIGRATE_ENABLE", "1")
 
 
 # --- is_legacy_card_inner -------------------------------------------------
@@ -148,3 +159,32 @@ def test_enqueue_migrate_clean_then_dup():
     _job2, enqueued2, reason2 = capture_jobs.enqueue_memory_migrate_job(
         store, trigger="quiet", migrate_key="migrate:v1:u:w1")
     assert enqueued2 is False and reason2 in ("duplicate_migrate_key", "maintenance_already_pending")
+
+
+# --- A10 kill switch: FEEDLING_MIGRATE_ENABLE -----------------------------
+
+def test_migration_enabled_flag_parsing(monkeypatch):
+    for val in ("1", "true", "TRUE", "yes", "on", " On "):
+        monkeypatch.setenv("FEEDLING_MIGRATE_ENABLE", val)
+        assert migration.migration_enabled() is True, val
+    for val in ("", "0", "false", "no", "off", "nope", "2"):
+        monkeypatch.setenv("FEEDLING_MIGRATE_ENABLE", val)
+        assert migration.migration_enabled() is False, val
+    monkeypatch.delenv("FEEDLING_MIGRATE_ENABLE", raising=False)
+    assert migration.migration_enabled() is False  # unset → off
+
+
+def test_enqueue_migrate_disabled_short_circuits(monkeypatch):
+    monkeypatch.setenv("FEEDLING_MIGRATE_ENABLE", "0")
+    store = _FakeStore()
+    job, enqueued, reason = capture_jobs.enqueue_memory_migrate_job(
+        store, trigger="quiet", migrate_key="migrate:v1:u:w1")
+    assert job is None and enqueued is False and reason == "migration_disabled"
+    assert store._jobs == []  # nothing enqueued while off
+
+
+def test_tick_quiet_migrate_disabled_short_circuits(monkeypatch):
+    # Gate returns before any state/db read, so a bare fake store is enough.
+    monkeypatch.setenv("FEEDLING_MIGRATE_ENABLE", "off")
+    result = capture_scheduler.tick_quiet_migrate(_FakeStore())
+    assert result == {"enqueued": False, "reason": "migration_disabled", "job": None}

@@ -13,11 +13,25 @@ a legacy card read there looks v1 and would never be detected.
 from __future__ import annotations
 
 import hashlib
+import os
 import time
 from typing import Any, Mapping
 
 MIGRATION_STATE_BLOB = "memory_migration_state"
 DEFAULT_MIGRATE_BATCH = 8
+
+
+def migration_enabled() -> bool:
+    """Legacy→v1 migration runs ONLY when FEEDLING_MIGRATE_ENABLE is truthy.
+
+    Default OFF — unset / empty / 0 / false / no / off all mean disabled. Opt-in
+    kill switch: set =1 (on backend + consumer env) to run migration; unset or set 0
+    + restart to stop it instantly without a deploy. Every migrate surface (enqueue /
+    tick / process / memory.upgrade) checks this, so 'off' is a true full stop —
+    not just 'auto-trigger off'."""
+    return str(os.environ.get("FEEDLING_MIGRATE_ENABLE", "")).strip().lower() in ("1", "true", "yes", "on")
+
+
 # Re-scan even a 'done' user this often, so a card reverted to old shape by some
 # legacy path still self-heals (§5.5-C). Cheap: just re-enqueues one batch job.
 DEFAULT_REAUDIT_SEC = 7 * 24 * 3600

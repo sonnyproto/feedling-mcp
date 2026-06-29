@@ -309,6 +309,9 @@ def enqueue_memory_migrate_job(
     Single-flight per user (one active migrate at a time) so batches run serially
     and never race each other; the handler picks the next batch of legacy cards at
     run time. Idempotent by migrate_key (e.g. the quiet-window day/window id)."""
+    from memory import migration as _migration  # local import avoids load-order cycle
+    if not _migration.migration_enabled():
+        return None, False, "migration_disabled"
     key = str(migrate_key or "").strip()
     if not key:
         return None, False, "migrate_key_required"

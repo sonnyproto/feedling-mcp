@@ -295,6 +295,8 @@ def tick_quiet_migrate(store, *, now: float | None = None) -> dict[str, Any]:
     cache isn't 'done'. Card SHAPE stays the source of truth (handler re-scans), so
     the state blob is only a cheap gate. Single-flight + active-maintenance guard
     live in enqueue_memory_migrate_job, so this never runs alongside capture/dream."""
+    if not memory_migration.migration_enabled():
+        return {"enqueued": False, "reason": "migration_disabled", "job": None}
     now_ts = time.time() if now is None else float(now)
     state = load_capture_state(store)
     quiet_for = now_ts - _safe_float(state.get("last_seen_ts"), 0.0)

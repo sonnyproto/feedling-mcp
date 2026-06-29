@@ -508,6 +508,11 @@ def _memory_upgrade_apply(
     `_save_moments`/`memory_replace_all`, so a concurrent new card is never
     clobbered. Preserves id/created_at/occurred_at/source; emits clean v1
     (no `type`). The LLM/encryption happens in the caller, never under the lock."""
+    from memory import migration as _migration  # local import avoids load-order cycle
+    if not _migration.migration_enabled():
+        # FEEDLING_MIGRATE_ENABLE off → reject the write itself. Last gate, so even a
+        # hand-issued memory.upgrade can't slip a legacy card to v1 while migration is off.
+        return {"status": "ok", "action": "memory.upgrade", "skipped": "migration_disabled", "noop": True}, [], 200
     # The card id is part of the AEAD AAD (owner|v|id), so the body was SEALED with
     # this exact id. We must NOT rewrite envelope["id"] after the fact — that desyncs
     # it from the AAD and writes a card that stores fine but can never be decrypted
