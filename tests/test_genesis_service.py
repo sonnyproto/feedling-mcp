@@ -105,12 +105,14 @@ def test_create_import_job_drops_plaintext_metadata(monkeypatch):
             "ai_persona": "raw persona should not persist",
             "file_manifest_hash": "abc123",
             "file_count": 2,
+            "timeline_span_days": 7,
         },
     })
 
     metadata = saved["metadata"]
     assert metadata["file_manifest_hash"] == "abc123"
     assert metadata["file_count"] == 2
+    assert metadata["timeline_span_days"] == 7
     assert metadata["privacy_copy"] == service.PRIVACY_COPY
     assert "transcript" not in metadata
     assert "ai_persona" not in metadata

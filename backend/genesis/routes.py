@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import threading
 from typing import Any
@@ -20,6 +21,7 @@ from hosted import history_import
 bp = Blueprint("genesis", __name__)
 
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
+_SECONDS_PER_DAY = 24 * 60 * 60
 _PLAINTEXT_ACTIVE_LOCK = threading.Lock()
 _PLAINTEXT_ACTIVE_JOBS: set[tuple[str, str]] = set()
 
@@ -71,6 +73,25 @@ def _plaintext_source_kind(history_messages: list[dict], support_messages: list[
     return history_import._HISTORY_SOURCE
 
 
+def _plaintext_timeline_span_days(messages: list[dict]) -> int:
+    timestamps: list[float] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        raw = msg.get("ts")
+        if raw in (None, ""):
+            continue
+        try:
+            ts = float(raw)
+        except Exception:
+            continue
+        if math.isfinite(ts):
+            timestamps.append(ts)
+    if len(timestamps) < 2:
+        return 0
+    return int(max(0.0, max(timestamps) - min(timestamps)) // _SECONDS_PER_DAY)
+
+
 def _prepare_plaintext_import(payload: dict) -> dict:
     content = str(payload.get("content") or "")
     fmt = str(payload.get("format") or "auto").strip().lower()
@@ -115,6 +136,7 @@ def _prepare_plaintext_import(payload: dict) -> dict:
         "source_kind": _plaintext_source_kind(history_messages, support_messages),
         "source_stats": history_import._import_source_stats(analysis_messages),
         "support_messages": support_messages,
+        "timeline_span_days": _plaintext_timeline_span_days(history_messages),
         "warnings": warnings,
     }
 
@@ -135,6 +157,7 @@ def _plaintext_job_metadata(
         "history_tier": str(profile.get("tier") or "small"),
         "window_count": len(prepared.get("chunk_texts") or []),
         "history_count": int(profile.get("message_count") or 0),
+        "timeline_span_days": int(prepared.get("timeline_span_days") or 0),
         "support_count": int(profile.get("support_count") or 0),
         "warning_count": len(prepared.get("warnings") or []),
         "content_bytes": int(prepared.get("content_bytes") or 0),

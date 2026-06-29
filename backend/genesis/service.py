@@ -71,6 +71,7 @@ SAFE_JOB_METADATA_KEYS = {
     "locale",
     "schema_version",
     "source_label",
+    "timeline_span_days",
     "window_count",
 }
 

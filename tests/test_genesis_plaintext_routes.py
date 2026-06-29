@@ -89,6 +89,7 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
     assert "secret persona text" not in metadata_blob
     assert captured["create_payload"]["metadata"]["ingest"] == "plaintext"
     assert captured["create_payload"]["metadata"]["client_job_id"] == "ios_job_1"
+    assert captured["create_payload"]["metadata"]["timeline_span_days"] == 0
 
 
 def test_plaintext_import_reuses_done_job_without_restart(monkeypatch):
@@ -137,6 +138,38 @@ def test_prepare_plaintext_import_caps_windows(monkeypatch):
 
     assert len(prepared["chunk_texts"]) == 2
     assert prepared["source_kind"] == routes.history_import._HISTORY_SOURCE
+
+
+def test_prepare_plaintext_import_computes_timeline_span_days(monkeypatch):
+    base_ts = 1_700_000_000
+    messages = [
+        {"role": "user", "content": "start", "source": "history_import", "ts": base_ts},
+        {
+            "role": "assistant",
+            "content": "later",
+            "source": "history_import",
+            "ts": base_ts + 3 * 24 * 60 * 60 + 123,
+        },
+        {"role": "user", "content": "ignored", "source": "history_import", "ts": "not-a-timestamp"},
+    ]
+    monkeypatch.setattr(routes.history_import, "_parse_import_history_content", lambda *_args: messages)
+    monkeypatch.setattr(routes.history_import, "_persona_support_messages", lambda _payload: [])
+    monkeypatch.setattr(
+        routes.history_import,
+        "_history_import_profile",
+        lambda *_args, **_kwargs: {"tier": "small", "total_windows": 1, "message_count": 3, "support_count": 0},
+    )
+    monkeypatch.setattr(
+        routes.history_import,
+        "_build_transcript_windows",
+        lambda *_args, **_kwargs: [{"text": "window"}],
+    )
+
+    prepared = routes._prepare_plaintext_import({"content": "x"})
+    metadata = routes._plaintext_job_metadata({}, prepared, client_job_id="", input_hash="input_hash")
+
+    assert prepared["timeline_span_days"] == 3
+    assert metadata["timeline_span_days"] == 3
 
 
 def test_plaintext_background_runner_distills_and_applies(monkeypatch):
