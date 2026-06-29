@@ -357,6 +357,93 @@ def test_losing_lease_kills_the_orphaned_child():
     assert "u_1" not in sup_a.children
 
 
+# ---- T1.1: lease renewal decoupled from the (slow) discover/resolve reconcile ----
+
+
+def test_renew_live_advances_leases_without_a_roster():
+    # The renew thread keeps leases fresh on its own cadence — independent of how
+    # long a host-all resolve lap takes. It renews from in-memory children, no
+    # roster, no spawn/reap reconcile.
+    procs = FakeProcTable()
+    t = {"v": T0}
+    sup = _sup(procs, clock=lambda: t["v"])
+    sup.tick(_roster("u_1", "u_2"))
+    exp1 = leases.get("u_1")["lease_expires_at"]
+
+    t["v"] = T0 + 100
+    sup.renew_live()
+    assert leases.get("u_1")["lease_expires_at"] > exp1
+    assert leases.get("u_2")["lease_expires_at"] > exp1
+    assert len(procs.spawned) == 2          # pure renewal: no new spawns
+
+
+def test_renew_live_reaps_a_dead_child():
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    sup.tick(_roster("u_1"))
+    pid = sup.children["u_1"]["pid"]
+    procs.alive[pid] = False                # child died between ticks
+
+    sup.renew_live()
+    assert "u_1" not in sup.children
+    assert leases.get("u_1")["lease_owner"] is None   # lease released
+
+
+def test_renew_live_kills_orphan_after_lease_lost():
+    t = {"v": T0}
+    procs_a = FakeProcTable()
+    sup_a = _sup(procs_a, owner="sup_A", clock=lambda: t["v"])
+    sup_a.tick(_roster("u_1"))
+    pid = sup_a.children["u_1"]["pid"]
+
+    t["v"] = T0 + 400                        # past sup_A's ttl (300)
+    sup_b = _sup(FakeProcTable(), owner="sup_B", clock=lambda: T0 + 400)
+    sup_b.tick(_roster("u_1"))               # sup_B takes the expired lease
+    assert leases.get("u_1")["lease_owner"] == "sup_B"
+
+    sup_a.renew_live()                       # sup_A's renewer notices it lost the lease
+    assert pid in procs_a.killed
+    assert "u_1" not in sup_a.children
+
+
+def test_respawn_does_not_lose_lease_to_concurrent_renew():
+    # Race regression (Codex [P2]): the in-place respawn kills the old pid before
+    # swapping the tracked child. If renew_live snapshots the old child in that
+    # window and sees its pid dead, it must NOT release the lease that respawn is
+    # about to renew for the replacement consumer. The respawn holds the lock
+    # across kill→spawn→renew→swap, so the renewer can't interleave.
+    import threading
+    import time as _t
+
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    sup.tick([{"user_id": "u_1", "api_key": "k", "driver": "claude", "provider": "anthropic"}])
+    old_pid = sup.children["u_1"]["pid"]
+
+    renew_done = threading.Event()
+    real_kill = procs.kill
+
+    def kill_then_race_renew(pid):
+        real_kill(pid)                       # old pid now reports dead
+        if pid == old_pid:
+            # Fire the renewer at the worst moment — mid-respawn, old pid dead.
+            threading.Thread(
+                target=lambda: (sup.renew_live(), renew_done.set())
+            ).start()
+            _t.sleep(0.05)                   # let it reach the lock / its reap
+    sup.kill_fn = kill_then_race_renew
+
+    # Config change → in-place respawn.
+    sup.tick([{"user_id": "u_1", "api_key": "k", "driver": "codex", "provider": "openai"}])
+    renew_done.wait(2)
+
+    row = leases.get("u_1")
+    assert row is not None
+    assert row["lease_owner"] == "sup_A"            # lease NOT released by the renewer
+    assert row["lease_expires_at"] is not None      # still live
+    assert "u_1" in sup.children                     # replacement child retained
+
+
 def test_shutdown_releases_all_leases_and_kills_children():
     procs = FakeProcTable()
     sup = _sup(procs)

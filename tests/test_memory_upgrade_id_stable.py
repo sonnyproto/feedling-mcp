@@ -57,6 +57,12 @@ def _patch(monkeypatch, existing: dict, captured: dict):
         captured["doc"] = dict(doc)
         return True
 
+    # The upgrade applier short-circuits with noop:migration_disabled unless
+    # FEEDLING_MIGRATE_ENABLE is truthy (memory.migration.migration_enabled).
+    # These tests exercise the post-gate behaviour (id-mismatch reject + in-place
+    # write), so enable migration explicitly.
+    from memory import migration as _migration  # noqa: E402
+    monkeypatch.setattr(_migration, "migration_enabled", lambda: True)
     monkeypatch.setattr(memory_actions.memory_service, "_load_moments", lambda _s: [dict(existing)])
     monkeypatch.setattr(memory_actions.db, "memory_upsert", fake_upsert)
     monkeypatch.setattr(memory_actions.memory_service, "_append_memory_change", lambda _s, c: {"id": "chg", **c})
