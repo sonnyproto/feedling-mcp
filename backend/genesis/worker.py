@@ -201,6 +201,13 @@ def _source_family(source_kind: str) -> str:
     return "history"
 
 
+def _idempotency_prefix(job_id: str, key_prefix: str | None = None) -> str:
+    prefix = str(key_prefix or "").strip()
+    if prefix:
+        return prefix
+    return str(job_id or "").strip()
+
+
 def _joined_material(chunk_texts: list[str]) -> str:
     parts = []
     for idx, text in enumerate(chunk_texts):
@@ -442,11 +449,13 @@ def _voice_reduce(
     *,
     user_id: str,
     job_id: str,
+    key_prefix: str | None = None,
     runtime: provider_client.ProviderConfig,
     candidates: list[dict],
 ) -> dict:
     if not candidates:
         return {"behavior_notes": [], "exemplars": []}
+    idempotency_prefix = _idempotency_prefix(job_id, key_prefix)
     batch_size = max(2, _env_int("FEEDLING_GENESIS_VOICE_REDUCE_BATCH", 24))
     current = list(candidates)
     round_no = 0
@@ -461,7 +470,7 @@ def _voice_reduce(
                 runtime=runtime,
                 messages=prompts.voice_reduce_messages(batch),
                 max_tokens=4000,
-                idempotency_key=f"{job_id}:voice_reduce:{round_no}:{idx}",
+                idempotency_key=f"{idempotency_prefix}:voice_reduce:{round_no}:{idx}",
             )
             next_round.append({
                 "behavior_notes_candidates": reduced.get("behavior_notes") or [],
@@ -477,7 +486,7 @@ def _voice_reduce(
         runtime=runtime,
         messages=prompts.voice_reduce_messages(current),
         max_tokens=4000,
-        idempotency_key=f"{job_id}:voice_reduce:{round_no}:final",
+        idempotency_key=f"{idempotency_prefix}:voice_reduce:{round_no}:final",
     )
 
 
@@ -486,6 +495,7 @@ def _fact_write(
     *,
     user_id: str,
     job_id: str,
+    key_prefix: str | None = None,
     runtime: provider_client.ProviderConfig,
     fact_candidates: list[dict],
     persona_material: str = "",
@@ -493,6 +503,7 @@ def _fact_write(
 ) -> dict:
     if not fact_candidates and not persona_material and not memory_summary:
         return {"memories": [], "identity": {"agent_name": "", "dimensions": []}}
+    idempotency_prefix = _idempotency_prefix(job_id, key_prefix)
     batch_size = max(4, _env_int("FEEDLING_GENESIS_FACT_WRITE_BATCH", 80))
     outputs: list[dict] = []
     for idx, batch in enumerate(_chunks(fact_candidates, batch_size) or [[]]):
@@ -504,7 +515,7 @@ def _fact_write(
             runtime=runtime,
             messages=prompts.fact_write_messages(batch, persona_material, memory_summary),
             max_tokens=4000,
-            idempotency_key=f"{job_id}:fact_write:{idx}",
+            idempotency_key=f"{idempotency_prefix}:fact_write:{idx}",
         ))
     memories: list[dict] = []
     dims: list[dict] = []
@@ -537,6 +548,7 @@ def _build_reducer_output(
     *,
     user_id: str,
     job_id: str,
+    key_prefix: str | None = None,
     runtime: provider_client.ProviderConfig,
     chunk_texts: list[str],
     source_kind: str = "history",
@@ -544,6 +556,7 @@ def _build_reducer_output(
     existing_voice: dict | None = None,
 ) -> dict:
     llm = GenesisLLMClient()
+    idempotency_prefix = _idempotency_prefix(job_id, key_prefix)
     source_family = _source_family(source_kind)
     material = _joined_material(chunk_texts)
     existing_persona = existing_persona if isinstance(existing_persona, dict) else {}
@@ -560,6 +573,7 @@ def _build_reducer_output(
             llm,
             user_id=user_id,
             job_id=job_id,
+            key_prefix=idempotency_prefix,
             runtime=runtime,
             fact_candidates=[],
             persona_material=material,
@@ -572,7 +586,7 @@ def _build_reducer_output(
             runtime=runtime,
             messages=prompts.persona_build_messages(material, existing_notes, founding),
             max_tokens=4000,
-            idempotency_key=f"{job_id}:persona_build",
+            idempotency_key=f"{idempotency_prefix}:persona_build",
         )
         return {
             **identity_doc,
@@ -596,6 +610,7 @@ def _build_reducer_output(
             llm,
             user_id=user_id,
             job_id=job_id,
+            key_prefix=idempotency_prefix,
             runtime=runtime,
             fact_candidates=[],
             memory_summary=material,
@@ -623,7 +638,7 @@ def _build_reducer_output(
                 runtime=runtime,
                 messages=prompts.voice_map_messages(text),
                 max_tokens=1800,
-                idempotency_key=f"{job_id}:voice_map:{idx}",
+                idempotency_key=f"{idempotency_prefix}:voice_map:{idx}",
             )
             voice_candidates.append(voice)
         facts = _complete_json(
@@ -634,7 +649,7 @@ def _build_reducer_output(
             runtime=runtime,
             messages=prompts.fact_map_messages(_source_tagged_fact_text(source_family, text)),
             max_tokens=1800,
-            idempotency_key=f"{job_id}:fact_map:{idx}",
+            idempotency_key=f"{idempotency_prefix}:fact_map:{idx}",
         )
         if isinstance(facts.get("fact_candidates"), list):
             fact_candidates.extend(item for item in facts["fact_candidates"] if isinstance(item, dict))
@@ -643,6 +658,7 @@ def _build_reducer_output(
         llm,
         user_id=user_id,
         job_id=job_id,
+        key_prefix=idempotency_prefix,
         runtime=runtime,
         candidates=voice_candidates,
     ) if source_family == "history" else {"behavior_notes": [], "exemplars": []}
@@ -660,6 +676,7 @@ def _build_reducer_output(
         llm,
         user_id=user_id,
         job_id=job_id,
+        key_prefix=idempotency_prefix,
         runtime=runtime,
         fact_candidates=fact_candidates,
     )
@@ -686,7 +703,7 @@ def _build_reducer_output(
         runtime=runtime,
         messages=prompts.persona_build_messages(persona_material, behavior_notes, founding),
         max_tokens=4000,
-        idempotency_key=f"{job_id}:persona_build",
+        idempotency_key=f"{idempotency_prefix}:persona_build",
     )
     return {
         **fact_write,
@@ -711,6 +728,7 @@ def build_reducer_output_from_texts(
     *,
     user_id: str,
     job_id: str,
+    key_prefix: str | None = None,
     runtime: provider_client.ProviderConfig,
     chunk_texts: list[str],
     source_kind: str = "history",
@@ -726,6 +744,7 @@ def build_reducer_output_from_texts(
     return _build_reducer_output(
         user_id=user_id,
         job_id=job_id,
+        key_prefix=key_prefix,
         runtime=runtime,
         chunk_texts=chunk_texts,
         source_kind=source_kind,

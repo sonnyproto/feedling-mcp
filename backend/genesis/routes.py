@@ -542,7 +542,8 @@ def _run_plaintext_genesis_job(
             )
             output = worker.build_reducer_output_from_texts(
                 user_id=store.user_id,
-                job_id=f"{job_id}:{group_source_family}",
+                job_id=job_id,
+                key_prefix=f"{job_id}:source_pass:{idx}:{group_source_family}",
                 runtime=runtime,
                 chunk_texts=group_chunk_texts,
                 source_kind=group_source_kind,

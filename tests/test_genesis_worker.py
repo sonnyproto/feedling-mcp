@@ -114,6 +114,39 @@ def test_source_family_accepts_import_suffix_aliases():
     assert worker._source_family("chat_export") == "history"
 
 
+def test_plaintext_key_prefix_does_not_replace_persisted_job_id(monkeypatch):
+    calls = []
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            calls.append(kwargs)
+            assert kwargs["task_id"] == "fact-write-0"
+            return types.SimpleNamespace(
+                text=json.dumps({
+                    "memories": [],
+                    "identity": {"agent_name": "Mira", "dimensions": []},
+                }),
+                usage={},
+                cached=False,
+                output_ref=kwargs["task_id"],
+            )
+
+    monkeypatch.setattr(worker, "GenesisLLMClient", FakeLLM)
+
+    output = worker.build_reducer_output_from_texts(
+        user_id="usr_1",
+        job_id="genesis_parent",
+        key_prefix="genesis_parent:source_pass:3:memory_summary",
+        runtime=types.SimpleNamespace(),
+        chunk_texts=["Mira remembers the user."],
+        source_kind="memory_summary_import",
+    )
+
+    assert output["identity"]["agent_name"] == "Mira"
+    assert calls[0]["job_id"] == "genesis_parent"
+    assert calls[0]["idempotency_key"] == "genesis_parent:source_pass:3:memory_summary:fact_write:0"
+
+
 def test_tick_claims_decrypts_all_chunks_and_posts_distilled_output(monkeypatch):
     llm_calls = []
     apply_payloads = []

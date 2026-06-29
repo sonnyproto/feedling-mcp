@@ -391,6 +391,18 @@ def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(mon
         "memory_summary",
         "user_profile",
     ]
+    assert [call["job_id"] for call in calls["builds"]] == [
+        "genesis_job_1",
+        "genesis_job_1",
+        "genesis_job_1",
+        "genesis_job_1",
+    ]
+    assert [call["key_prefix"] for call in calls["builds"]] == [
+        "genesis_job_1:source_pass:1:ai_persona",
+        "genesis_job_1:source_pass:2:history",
+        "genesis_job_1:source_pass:3:memory_summary",
+        "genesis_job_1:source_pass:4:user_profile",
+    ]
     applied = calls["applied"]
     assert applied["identity"]["agent_name"] == "Mira"
     assert applied["identity"]["dimensions"][0]["name"] == "Steady"
