@@ -134,10 +134,39 @@ def _active_migrate_job(job: Mapping[str, Any]) -> bool:
 
 
 def _find_migrate_by_key(store: UserStore, migrate_key: str) -> dict | None:
-    for job in store.list_proactive_jobs(since_epoch=0, limit=0):
-        if is_memory_migrate_job(job) and str(job.get("migrate_key") or "") == migrate_key:
-            return dict(job)
-    return None
+    matches = [
+        dict(job)
+        for job in store.list_proactive_jobs(since_epoch=0, limit=0)
+        if is_memory_migrate_job(job) and str(job.get("migrate_key") or "") == migrate_key
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda j: float(j.get("ts") or 0))
+
+
+def _migrate_same_key_blocks_retry(job: Mapping[str, Any]) -> bool:
+    """Whether a same-window migrate job should suppress another enqueue.
+
+    Migration can legitimately need another job in the same quiet window: a prior
+    no-op may have raced card seeding, and a finished batch can still leave legacy
+    cards. Only active jobs and terminal jobs that settled the window should block.
+    """
+    status = str(job.get("status") or "pending").strip().lower()
+    if status in CAPTURE_ACTIVE_STATUSES:
+        return True
+    if status in CAPTURE_RETRYABLE_TERMINAL:
+        return False
+    if status != "completed":
+        return True
+    reason = str(job.get("status_reason") or "").strip().lower()
+    result = job.get("migrate_result") if isinstance(job.get("migrate_result"), Mapping) else {}
+    if reason == "migrate_no_legacy" or str(result.get("reason") or "").strip().lower() == "no_legacy":
+        return False
+    try:
+        remaining = int(result.get("remaining"))
+    except (TypeError, ValueError):
+        remaining = 0
+    return remaining <= 0
 
 
 def _find_active_migrate(store: UserStore) -> dict | None:
@@ -316,7 +345,7 @@ def enqueue_memory_migrate_job(
     if not key:
         return None, False, "migrate_key_required"
     existing_same_key = _find_migrate_by_key(store, key)
-    if existing_same_key is not None:
+    if existing_same_key is not None and _migrate_same_key_blocks_retry(existing_same_key):
         return existing_same_key, False, "duplicate_migrate_key"
     # Plan §2: migration must not run alongside capture/dream (shared memory_lock +
     # overlapping read→derive→write windows). Block at enqueue on ANY active

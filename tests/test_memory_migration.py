@@ -261,6 +261,52 @@ def test_enqueue_migrate_clean_then_dup():
     assert enqueued2 is False and reason2 in ("duplicate_migrate_key", "maintenance_already_pending")
 
 
+def test_enqueue_migrate_retries_same_key_after_no_legacy_noop():
+    store = _FakeStore([{
+        "job_kind": "memory_migrate",
+        "status": "completed",
+        "status_reason": "migrate_no_legacy",
+        "migrate_key": "migrate:v1:u:w1",
+        "ts": 100.0,
+        "migrate_result": {"status": "noop", "reason": "no_legacy", "migrated": 0},
+    }])
+    job, enqueued, reason = capture_jobs.enqueue_memory_migrate_job(
+        store, trigger="quiet", migrate_key="migrate:v1:u:w1", now=101.0)
+    assert enqueued is True and reason == "enqueued"
+    assert job["job_kind"] == "memory_migrate"
+    assert len(store._jobs) == 2
+
+
+def test_enqueue_migrate_retries_same_key_when_prior_batch_has_remaining():
+    store = _FakeStore([{
+        "job_kind": "memory_migrate",
+        "status": "completed",
+        "status_reason": "migrate_batch_done",
+        "migrate_key": "migrate:v1:u:w1",
+        "ts": 100.0,
+        "migrate_result": {"status": "ok", "migrated": 8, "remaining": 2},
+    }])
+    _job, enqueued, reason = capture_jobs.enqueue_memory_migrate_job(
+        store, trigger="quiet", migrate_key="migrate:v1:u:w1", now=101.0)
+    assert enqueued is True and reason == "enqueued"
+    assert len(store._jobs) == 2
+
+
+def test_enqueue_migrate_same_key_completed_done_still_idempotent():
+    store = _FakeStore([{
+        "job_kind": "memory_migrate",
+        "status": "completed",
+        "status_reason": "migrate_batch_done",
+        "migrate_key": "migrate:v1:u:w1",
+        "ts": 100.0,
+        "migrate_result": {"status": "ok", "migrated": 2, "remaining": 0},
+    }])
+    _job, enqueued, reason = capture_jobs.enqueue_memory_migrate_job(
+        store, trigger="quiet", migrate_key="migrate:v1:u:w1", now=101.0)
+    assert enqueued is False and reason == "duplicate_migrate_key"
+    assert len(store._jobs) == 1
+
+
 # --- A10 kill switch: FEEDLING_MIGRATE_ENABLE -----------------------------
 
 def test_migration_enabled_flag_parsing(monkeypatch):
