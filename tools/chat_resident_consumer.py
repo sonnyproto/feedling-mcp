@@ -5055,6 +5055,13 @@ def _process_migrate_jobs(jobs: list) -> float:
 
         occurred_at = _format_message_time(time.time())
         migrated = 0
+        # A11: any batch card that did NOT migrate this round is a failed attempt — the
+        # agent dropped it (unmigrated_ids) OR envelope build / memory.upgrade failed.
+        # Seed with the parser's unmigrated set, then add per-card write failures and
+        # remove the ones that actually succeed. The server bumps each card's attempt
+        # count; after FEEDLING_MIGRATE_MAX_ATTEMPTS it marks the card skipped so it
+        # stops looping and legacy_remaining can reach 0.
+        failed_ids: set[str] = set(unmigrated_ids)
         for up in upgrades:
             mid = str(up.get("id") or "")
             if not mid:
@@ -5063,7 +5070,8 @@ def _process_migrate_jobs(jobs: list) -> float:
                 envelope = _capture_build_envelope(up, occurred_at=occurred_at, source="memory_migrate", item_id=mid)
             except Exception as e:
                 log.error("migrate envelope build failed id=%s card=%s: %s", job_id, mid, e)
-                continue  # retry next round
+                failed_ids.add(mid)
+                continue  # retry next round (until cap)
             # Let memory.upgrade carry the existing metadata (don't reset). Migration
             # is not a "user just used this memory", so last_referenced_at must NOT be
             # bumped to now — drop it (and importance/pulse) so existing values stay.
@@ -5079,10 +5087,18 @@ def _process_migrate_jobs(jobs: list) -> float:
             res = (body.get("results") or [{}])[0] if isinstance(body, dict) else {}
             if res.get("status") == "ok" and not res.get("skipped"):
                 migrated += 1
-            # skipped(stale)/empty(db_write_failed,network)/dropped → not counted → retry next window
+                failed_ids.discard(mid)
+            else:
+                # skipped(stale)/empty(db_write_failed,network)/dropped → not migrated → counts
+                # as a failed attempt → retry next window until the per-card cap is hit.
+                failed_ids.add(mid)
 
         remaining = max(0, legacy_remaining - migrated)
-        _capture_post_json("/v1/memory/migration_state", payload={"migrated": migrated, "legacy_remaining": remaining})
+        _capture_post_json("/v1/memory/migration_state", payload={
+            "migrated": migrated,
+            "legacy_remaining": remaining,
+            "failed_ids": sorted(failed_ids),
+        })
         update_proactive_job_status(
             job_id, "completed", "migrate_batch_done",
             extra={"migrate_result": {
@@ -5090,12 +5106,13 @@ def _process_migrate_jobs(jobs: list) -> float:
                 "migrated": migrated,
                 "batch": len(batch),
                 "unmigrated": len(unmigrated_ids),
+                "failed": len(failed_ids),
                 "remaining": remaining,
             }},
         )
         log.info(
-            "migrate job completed id=%s migrated=%d/%d unmigrated=%d remaining=%d",
-            job_id, migrated, len(batch), len(unmigrated_ids), remaining,
+            "migrate job completed id=%s migrated=%d/%d unmigrated=%d failed=%d remaining=%d",
+            job_id, migrated, len(batch), len(unmigrated_ids), len(failed_ids), remaining,
         )
     return latest
 
