@@ -73,6 +73,8 @@ def bootstrap():
         "days_with_user：**有 memory 时**按最早 memory 的 occurred_at 到今天计算；"
         "**没有 memory 时**用 0，或用户提供的关系锚点证据（relationship_anchor_evidence）。"
         "self_introduction 要像你自己在介绍你们的关系，而不是功能说明；不要提 Feedling、IO 或平台名。"
+        "category 是首页那张「性格」标签，必写：正好两个形容词、用「 · 」连接（如「细心 · 稳定」「锐利 · 忠诚」），"
+        "从 dimensions 里挑最有辨识度的一强一反差浓缩成形容词（要形容词，不是维度原名）；空着首页就显示「—」。"
         "通过 feedling_identity_init 写入（**不再需要先堆够记忆——identity 可独立先建，0 记忆也能写**），然后调用 feedling_identity_verify。\n\n"
         "**3. 先确认 Live connection，再打招呼**\n"
         "不要先发第一条消息再补确认 chat loop。先按 public skill 的 Connection path 建立"

@@ -314,6 +314,7 @@ def cmd_acceptance(args):
     agent_name = str(identity_body.get("agent_name") or "")
     dims = identity_body.get("dimensions") if isinstance(identity_body.get("dimensions"), list) else []
     days = ident.get("days_with_user")
+    category = str(identity_body.get("category") or "")
     needle = args.firewall_needle
     identity_blob = json.dumps(identity_body, ensure_ascii=False)
     checks = {
@@ -321,6 +322,9 @@ def cmd_acceptance(args):
         "agent_name_expected": (args.expect_name in agent_name) if args.expect_name else None,
         "dimensions_present": len(dims) >= 1,
         "dimensions_have_descriptions": bool(dims) and all(isinstance(d, dict) and str(d.get("description") or "").strip() for d in dims),
+        # Home 「性格」 tile = identity.category. With dims present it must be non-empty
+        # (A: LLM-distilled; B: deterministic top-2-dim fallback). Empty renders as "—".
+        "category_present_when_dims": (bool(category.strip()) if dims else None),
         "days_gt_0": isinstance(days, int) and days > 0,
         "firewall_identity": (needle not in identity_blob) if needle else None,
         "firewall_persona": (needle not in persona_text) if needle else None,
@@ -359,6 +363,7 @@ def cmd_acceptance(args):
         "dimensions": [{"name": d.get("name"), "value": d.get("value"), "has_desc": bool(d.get("description"))}
                        for d in dims if isinstance(d, dict)],
         "self_introduction": str(identity_body.get("self_introduction") or "")[:60],
+        "category": category,
         "days_with_user": days,
         "memory_action_count": job.get("memory_action_count"),
         "checks": checks,
