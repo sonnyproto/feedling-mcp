@@ -84,6 +84,7 @@ def _provision_user(args) -> tuple[str, str, bytes, bytes]:
     import os
     sk = PrivateKey.generate()
     user_pk = bytes(sk.public_key)
+    args._user_sk = bytes(sk)  # raw 32-byte X25519 private key, kept for acceptance decrypt
     base = args.api_url.rstrip("/")
     # Content public key must be base64 of the raw 32-byte X25519 pk (core/envelope.py
     # _decode_content_public_key base64-decodes it + asserts 32 bytes); hex would
@@ -180,6 +181,150 @@ def cmd_verify(args):
     return 0 if out["ok"] else 1
 
 
+def cmd_upload_plaintext(args):
+    """One-shot plaintext genesis ingest — mirrors the iOS uploadGenesisPlaintext:
+    a single POST of the old history_import payload shape to /v1/genesis/imports/plaintext.
+    No client-side sealing/chunking. Then poll with `verify --job-id`."""
+    if args.register:
+        args.api_key, args.user_id, _enclave_pk, _user_pk = _provision_user(args)
+        print(json.dumps({"provisioned": True, "user_id": args.user_id, "api_key": args.api_key}, ensure_ascii=False))
+    content = Path(args.transcript).read_text(encoding="utf-8")
+    payload = {
+        "format": "auto",
+        "content": content,
+        "fresh_start": False,
+        "client_job_id": args.client_job_id or ("e2e_" + hashlib.sha256(content.encode("utf-8")).hexdigest()[:40]),
+    }
+    if args.ai_persona:
+        payload["ai_persona_content"] = Path(args.ai_persona).read_text(encoding="utf-8")
+    if args.personal_profile:
+        payload["personal_profile_content"] = Path(args.personal_profile).read_text(encoding="utf-8")
+    if args.memory_summary:
+        payload["memory_summary_content"] = Path(args.memory_summary).read_text(encoding="utf-8")
+    s, b = _http("POST", f"{args.api_url.rstrip('/')}/v1/genesis/imports/plaintext", args.api_key, json_body=payload)
+    job_id = (b.get("job") or {}).get("job_id") or b.get("job_id")
+    print(json.dumps({"ok": s < 400 and bool(job_id), "step": "plaintext_upload", "status": s,
+                      "job_id": job_id, "body": b}, ensure_ascii=False))
+    return 0 if (s < 400 and job_id) else 1
+
+
+def _box_seal_open(sealed: bytes, sk_raw: bytes) -> bytes:
+    """Reverse of content_encryption.box_seal: X25519 ECDH(sk, ek_pub) ->
+    HKDF-SHA256(info='feedling-box-seal-v1') -> nonce=SHA256(ek_pub||rcp_pub)[:12]
+    -> ChaCha20-Poly1305 decrypt. `sealed` = ek_pub(32) || ct || tag(16)."""
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives.hashes import SHA256
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    from cryptography.hazmat.primitives import serialization
+    ek_pub, ct = sealed[:32], sealed[32:]
+    sk = X25519PrivateKey.from_private_bytes(sk_raw)
+    rcp_pub = sk.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    shared = sk.exchange(X25519PublicKey.from_public_bytes(ek_pub))
+    k_wrap = HKDF(algorithm=SHA256(), length=32, salt=None, info=b"feedling-box-seal-v1").derive(shared)
+    nonce = hashlib.sha256(ek_pub + rcp_pub).digest()[:12]
+    return ChaCha20Poly1305(k_wrap).decrypt(nonce, ct, None)
+
+
+def _decrypt_envelope_user(env: dict, sk_raw: bytes) -> str:
+    """Decrypt a shared envelope's body with the user's content private key.
+    AAD = owner_user_id|v|id (must match content_encryption.build_envelope)."""
+    from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+    K = _box_seal_open(base64.b64decode(env["K_user"]), sk_raw)
+    aad = f"{env['owner_user_id']}|{env.get('v', 1)}|{env['id']}".encode("utf-8")
+    pt = ChaCha20Poly1305(K).decrypt(base64.b64decode(env["nonce"]), base64.b64decode(env["body_ct"]), aad)
+    return pt.decode("utf-8", "replace")
+
+
+def cmd_acceptance(args):
+    """Per-source identity acceptance: upload 4 materials in one plaintext request
+    (history + ai_persona card WITH a name + memory + user_profile WITH a firewall
+    needle), poll to done, DECRYPT the identity card + persona with the user's key,
+    and assert: agent_name present (== expected), dimensions populated (each with a
+    description), days_with_user > 0, the user_profile needle NEVER leaks into
+    identity/persona (firewall), memories written."""
+    import os
+    base = args.api_url.rstrip("/")
+    args.api_key, args.user_id, _enclave_pk, _user_pk = _provision_user(args)
+    sk_raw = args._user_sk
+    print(json.dumps({"provisioned": True, "user_id": args.user_id}, ensure_ascii=False))
+
+    payload = {
+        "format": "auto",
+        "content": Path(args.transcript).read_text(encoding="utf-8"),
+        "fresh_start": False,
+        "relationship_started_at": args.relationship_started_at,
+        "client_job_id": "accept_" + os.urandom(8).hex(),
+    }
+    if args.ai_persona:
+        payload["ai_persona_content"] = Path(args.ai_persona).read_text(encoding="utf-8")
+    if args.personal_profile:
+        payload["personal_profile_content"] = Path(args.personal_profile).read_text(encoding="utf-8")
+    if args.memory_summary:
+        payload["memory_summary_content"] = Path(args.memory_summary).read_text(encoding="utf-8")
+    s, b = _http("POST", f"{base}/v1/genesis/imports/plaintext", args.api_key, json_body=payload)
+    job_id = (b.get("job") or {}).get("job_id") or b.get("job_id")
+    if s >= 400 or not job_id:
+        print(json.dumps({"ok": False, "step": "upload", "status": s, "body": b}, ensure_ascii=False)); return 1
+    print(json.dumps({"upload": "ok", "job_id": job_id}, ensure_ascii=False))
+
+    deadline = time.time() + args.timeout
+    job, jb = {}, {}
+    while time.time() < deadline:
+        _s, jb = _http("GET", f"{base}/v1/genesis/imports/{job_id}", args.api_key)
+        job = jb.get("job") or {}
+        if str(job.get("status") or "").lower() in ("done", "failed"):
+            break
+        time.sleep(args.poll)
+    if str(job.get("status")) != "done":
+        print(json.dumps({"ok": False, "step": "distill", "status": job.get("status"),
+                          "error": job.get("error")}, ensure_ascii=False)); return 1
+
+    _s, idy = _http("GET", f"{base}/v1/identity/get", args.api_key)
+    ident = idy.get("identity") or {}
+    try:
+        identity_body = json.loads(_decrypt_envelope_user(ident, sk_raw))
+    except Exception as e:  # noqa: BLE001
+        print(json.dumps({"ok": False, "step": "identity_decrypt", "error": str(e)}, ensure_ascii=False)); return 1
+    persona_text = ""
+    persona_env = (jb.get("persona") or {}).get("content_envelope") or {}
+    try:
+        if persona_env:
+            persona_text = _decrypt_envelope_user(persona_env, sk_raw)
+    except Exception as e:  # noqa: BLE001
+        persona_text = f"<persona decrypt failed: {e}>"
+
+    agent_name = str(identity_body.get("agent_name") or "")
+    dims = identity_body.get("dimensions") if isinstance(identity_body.get("dimensions"), list) else []
+    days = ident.get("days_with_user")
+    needle = args.firewall_needle
+    identity_blob = json.dumps(identity_body, ensure_ascii=False)
+    checks = {
+        "agent_name_present": bool(agent_name.strip()),
+        "agent_name_expected": (args.expect_name in agent_name) if args.expect_name else None,
+        "dimensions_present": len(dims) >= 1,
+        "dimensions_have_descriptions": bool(dims) and all(isinstance(d, dict) and str(d.get("description") or "").strip() for d in dims),
+        "days_gt_0": isinstance(days, int) and days > 0,
+        "firewall_identity": (needle not in identity_blob) if needle else None,
+        "firewall_persona": (needle not in persona_text) if needle else None,
+        "memories_written": int(job.get("memory_action_count") or 0) > 0,
+    }
+    failed = [k for k, v in checks.items() if v is False]
+    out = {
+        "agent_name": agent_name,
+        "dimensions": [{"name": d.get("name"), "value": d.get("value"), "has_desc": bool(d.get("description"))}
+                       for d in dims if isinstance(d, dict)],
+        "self_introduction": str(identity_body.get("self_introduction") or "")[:60],
+        "days_with_user": days,
+        "memory_action_count": job.get("memory_action_count"),
+        "checks": checks,
+        "ok": not failed,
+        "failed": failed,
+    }
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+    return 0 if not failed else 1
+
+
 def main():
     p = argparse.ArgumentParser(prog="genesis_e2e", description="Genesis e2e harness (test CVM).")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -211,6 +356,42 @@ def main():
                     help="comma-separated distinctive transcript fragments that MUST NOT "
                          "appear in the status payload (real leak check, e.g. '蛋子,西湖')")
     vf.set_defaults(func=cmd_verify)
+
+    upp = sub.add_parser("upload-plaintext",
+                         help="one-shot plaintext genesis ingest (POST /v1/genesis/imports/plaintext); then `verify`")
+    upp.add_argument("--api-url", required=True)
+    upp.add_argument("--register", action="store_true",
+                     help="self-provision a throwaway user (register + model_api/setup + whoami)")
+    upp.add_argument("--provider", default="")
+    upp.add_argument("--model", default="")
+    upp.add_argument("--base-url", default="")
+    upp.add_argument("--api-key", default="")
+    upp.add_argument("--user-id", default="")
+    upp.add_argument("--transcript", required=True, help="plaintext history file")
+    upp.add_argument("--ai-persona", default="", help="optional ai_persona/character file")
+    upp.add_argument("--personal-profile", default="", help="optional personal_profile file")
+    upp.add_argument("--memory-summary", default="", help="optional memory_summary/support file")
+    upp.add_argument("--client-job-id", default="")
+    upp.set_defaults(func=cmd_upload_plaintext)
+
+    ac = sub.add_parser("acceptance",
+                        help="per-source identity acceptance: 4 materials -> done -> decrypt identity -> assert")
+    ac.add_argument("--api-url", required=True)
+    ac.add_argument("--register", action="store_true", default=True)
+    ac.add_argument("--provider", default="anthropic")
+    ac.add_argument("--model", default="claude-haiku-4-5-20251001")
+    ac.add_argument("--base-url", default="")
+    ac.add_argument("--transcript", required=True, help="history file")
+    ac.add_argument("--ai-persona", default="", help="角色卡 (ideally with a name)")
+    ac.add_argument("--personal-profile", default="", help="个人档案")
+    ac.add_argument("--memory-summary", default="", help="长期记忆")
+    ac.add_argument("--relationship-started-at", default="", help="YYYY-MM-DD (tests days_with_user)")
+    ac.add_argument("--expect-name", default="", help="assert agent_name contains this (e.g. 小满)")
+    ac.add_argument("--firewall-needle", default="",
+                    help="user_profile string that must NOT leak into identity/persona (e.g. 赵铁柱)")
+    ac.add_argument("--timeout", type=float, default=900)
+    ac.add_argument("--poll", type=float, default=10)
+    ac.set_defaults(func=cmd_acceptance)
 
     args = p.parse_args()
     sys.exit(args.func(args))
