@@ -6,13 +6,34 @@ import time
 import uuid
 
 import httpx
-from flask import request
+from flask import has_request_context, request
 
 import db
 from core import store as core_store
 from core.store import UserStore
 
 PROACTIVE_WAKE_FRAME_CANDIDATE_MAX = int(os.environ.get("FEEDLING_PROACTIVE_WAKE_FRAME_CANDIDATE_MAX", "60"))
+
+
+def _enclave_auth_headers(api_key: str | None, runtime_token: str | None = None) -> dict | None:
+    """Auth header for an enclave call, preferring the Stage-D runtime token.
+
+    host-all / zero-roster agents have no per-user api_key — their turns (model_api
+    context build, proactive screen reads) are triggered by a request carrying
+    X-Feedling-Runtime-Token. Pick it up from the current request context when no
+    explicit token/api_key is supplied, so these server-side screen reads stop
+    returning api_key_unavailable. Returns None when no credential is available
+    (true non-request background callers behave exactly as before).
+    """
+    rt = runtime_token
+    if not rt and has_request_context():
+        rt = request.headers.get("X-Feedling-Runtime-Token", "").strip() or None
+    if rt:
+        return {"X-Feedling-Runtime-Token": rt}
+    if api_key:
+        return {"X-API-Key": api_key}
+    return None
+
 
 def _frame_url(store: UserStore, filename: str) -> str:
     base = os.environ.get("FEEDLING_PUBLIC_BASE_URL", "").rstrip("/")
@@ -144,13 +165,14 @@ def _decrypt_frame_metadata_for_gate(
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
         return {"frame_id": fid, "error": "enclave_unavailable"}
-    if not api_key:
+    auth = _enclave_auth_headers(api_key)
+    if auth is None:
         return {"frame_id": fid, "error": "api_key_unavailable"}
     try:
         with httpx.Client(timeout=20, verify=False) as client:
             resp = client.get(
                 f"{enclave_url}/v1/screen/frames/{fid}/decrypt",
-                headers={"X-API-Key": api_key},
+                headers=auth,
                 params={"include_image": "true" if include_image else "false"},
             )
         if resp.status_code >= 400:

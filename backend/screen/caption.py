@@ -11,12 +11,32 @@ from __future__ import annotations
 import os
 
 import httpx
+from flask import has_request_context, request
 
 import db
 from perception import store as perception_store
 
 _CACHE_KIND = "screen_caption"
 _CAPTION_TIMEOUT = 50.0
+
+
+def _enclave_auth_headers(api_key: str | None, runtime_token: str | None = None) -> dict | None:
+    """Auth header for an enclave call, preferring the Stage-D runtime token.
+
+    host-all / zero-roster agents have no per-user api_key — their proactive screen
+    captions are triggered by a request carrying X-Feedling-Runtime-Token. Pick it
+    up from the current request context when no explicit token/api_key is supplied,
+    so these reads stop returning api_key_unavailable. Returns None when no
+    credential is available (true non-request background callers behave as before).
+    """
+    rt = runtime_token
+    if not rt and has_request_context():
+        rt = request.headers.get("X-Feedling-Runtime-Token", "").strip() or None
+    if rt:
+        return {"X-Feedling-Runtime-Token": rt}
+    if api_key:
+        return {"X-API-Key": api_key}
+    return None
 
 
 def _enclave_get(url: str, headers=None, params=None):
@@ -75,13 +95,14 @@ def caption_frame(user_id: str, api_key: str, frame_id: str | None,
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "").rstrip("/")
     if not enclave_url:
         return {"frame_id": fid, "error": "enclave_unavailable"}
-    if not api_key:
+    auth = _enclave_auth_headers(api_key)
+    if auth is None:
         return {"frame_id": fid, "error": "api_key_unavailable"}
 
     try:
         resp = _enclave_get(
             f"{enclave_url}/v1/screen/frames/{fid}/caption",
-            headers={"X-API-Key": api_key},
+            headers=auth,
             params={"mode": mode},
         )
     except Exception as e:  # connect/timeout — fail-closed, no pixels involved
