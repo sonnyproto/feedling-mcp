@@ -37,7 +37,12 @@ def identity_actions():
         actions = [payload]
     if not isinstance(actions, list):
         return jsonify({"error": "actions required"}), 400
-    body, status = identity_actions_mod._execute_identity_actions(store, api_key, actions)
+    body, status = identity_actions_mod._execute_identity_actions(
+        store,
+        api_key,
+        actions,
+        runtime_token=runtime_auth.extract_runtime_token() or "",
+    )
     return jsonify(body), status
 
 

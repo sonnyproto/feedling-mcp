@@ -431,6 +431,11 @@ def _resident_pollable_pending_jobs(store, *, since: float, limit: int, runtime_
     for job in store.list_proactive_jobs(since_epoch=since, limit=read_limit):
         if str(job.get("status") or "pending") != "pending":
             continue
+        if str(job.get("job_kind") or "").strip() == "introduction":
+            out.append(_with_resident_runtime_v2(job, runtime_profile))
+            if len(out) >= limit:
+                break
+            continue
         if capture_jobs.is_memory_maintenance_job(job):
             out.append(_with_resident_runtime_v2(job, runtime_profile))
             if len(out) >= limit:

@@ -3472,6 +3472,37 @@ def _is_screen_watch_job(job: dict) -> bool:
     )
 
 
+def _is_introduction_job(job: dict) -> bool:
+    return (
+        str((job or {}).get("job_kind") or "").strip().lower() == "introduction"
+        or str((job or {}).get("trigger") or "").strip().lower() == "post_spawn_genesis"
+    )
+
+
+def _message_for_introduction_job(job: dict) -> str:
+    return "\n\n".join([
+        "[Feedling · 首次登场(onboarding 之后)]",
+        _local_time_anchor(),
+        "你刚第一次上线 —— 你的人格、声音、记忆都已经从你和 TA 过去的聊天里沉淀好了"
+        "(在你的 system prompt 和 Memory Garden 里)。现在是你和 TA 重逢的第一刻,"
+        "TA 还没开口,这一句由你先说。",
+        "做三件事:\n"
+        "1. 用【你自己的声音】写一段简短自我介绍(1-3 句)+ 一个签名/口头禅"
+        "(signature,你说话的标志性短句),通过 identity.profile_patch(或 io_cli identity-write)"
+        "写进身份卡。自我介绍要像你这个人格会说的话,别用通用助手腔。名字用你已有的"
+        "(system prompt/记忆里),没有就别编、介绍里可不提名字。\n"
+        "2. 给 TA 发【第一句问候】—— 像久别重逢、你一直都在那样,in-voice。"
+        "不是\"有什么可以帮您\",是你这个伴侣会说的第一句(类似\"我来了\",但用你自己的方式)。\n"
+        "3. 不要等 TA 回应,这是你的登场。",
+        "输出格式优先用 JSON: "
+        "{\"actions\":[{\"type\":\"identity.profile_patch\",\"patch\":{\"self_introduction\":\"...\","
+        "\"signature\":[\"...\"]}}],\"messages\":[\"...\"]}。"
+        "如果你用 io_cli identity-write 作为 native tool 写身份卡,仍然在 messages 里给出第一句问候。",
+        "铁律:只用你真实拥有的人格/记忆,别编不存在的共同经历;名字别编。",
+        _reply_language_line(),
+    ])
+
+
 def _native_tool_names_compact() -> str:
     """Names-only tool list for the light screen-watch prompt. The runtime always
     has every tool registered, so this is guidance, not a restriction — listing
@@ -4759,24 +4790,32 @@ def _process_proactive_jobs(jobs: list) -> float:
             log.error("proactive job claim failed id=%s: %s", job_id, e)
             continue
 
-        frame_ids = job.get("frame_ids")
-        if not isinstance(frame_ids, list):
+        is_introduction = _is_introduction_job(job)
+        if is_introduction:
             frame_ids = []
-        screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
-        recent_context = recent_chat_context_for_proactive()
-        # Screen-watch is a light lane: skip the heavy cross-domain digest fetch
-        # (its prompt deliberately omits the board).
-        perception_digest = None if _is_screen_watch_job(job) else _proactive_perception_digest()
-        message = _message_for_proactive_job(
-            job,
-            screen_text=screen_text,
-            recent_chat_context=recent_context,
-            perception_digest=perception_digest,
-        )
+            screen_payloads = []
+            screen_paths = []
+            message = _message_for_introduction_job(job)
+        else:
+            frame_ids = job.get("frame_ids")
+            if not isinstance(frame_ids, list):
+                frame_ids = []
+            screen_text, screen_payloads, screen_paths = _screen_context_for_frame_ids(frame_ids)
+            recent_context = recent_chat_context_for_proactive()
+            # Screen-watch is a light lane: skip the heavy cross-domain digest fetch
+            # (its prompt deliberately omits the board).
+            perception_digest = None if _is_screen_watch_job(job) else _proactive_perception_digest()
+            message = _message_for_proactive_job(
+                job,
+                screen_text=screen_text,
+                recent_chat_context=recent_context,
+                perception_digest=perception_digest,
+            )
         log.info(
-            "proactive job [ts=%.3f] id=%s intent=%s frames=%d",
+            "proactive job [ts=%.3f] id=%s kind=%s intent=%s frames=%d",
             ts,
             job.get("job_id"),
+            job.get("job_kind"),
             job.get("intent_label"),
             len(frame_ids),
         )
@@ -4809,6 +4848,18 @@ def _process_proactive_jobs(jobs: list) -> float:
                 )
             except Exception as e:
                 log.warning("proactive memory/identity actions failed id=%s error=%s", job_id, e)
+                if is_introduction:
+                    update_proactive_job_status(
+                        job_id,
+                        "failed",
+                        f"introduction_identity_action_failed:{type(e).__name__}",
+                        extra={
+                            "agent_action": "identity.profile_patch",
+                            "agent_action_status": str(e)[:240],
+                            "wake_result": "identity_action_failed",
+                        },
+                    )
+                    continue
 
         schedule_action_results: list[dict] = []
         scheduled_action_failed = False
