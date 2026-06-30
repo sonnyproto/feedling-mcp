@@ -49,6 +49,69 @@ def test_model_entry_openai_compatible_carries_api_base():
     assert e["litellm_params"]["api_base"] == "https://my.host/v1"
 
 
+def test_model_entry_openai_compatible_bridges_responses_to_chat():
+    # codex only speaks the Responses wire (POST /v1/responses), but the
+    # openai_compatible relays only implement /chat/completions. LiteLLM treats
+    # provider=openai as natively Responses-capable and would passthrough → 500.
+    # The first-class use_chat_completions_api flag forces LiteLLM's
+    # responses→chat-completions bridge.
+    e = gw.build_model_entry(
+        user_id="u", provider="openai_compatible", model="my-model",
+        base_url="https://my.host/v1",
+    )
+    assert e["litellm_params"]["use_chat_completions_api"] is True
+
+
+def test_model_entry_non_openai_compatible_has_no_chat_bridge_flag():
+    # gemini/openrouter are already correct (bridge or native); must NOT carry
+    # the flag, so we don't regress them.
+    for prov, model in [("gemini", "gemini-2.0-flash"),
+                        ("openrouter", "anthropic/claude-3.5-sonnet")]:
+        e = gw.build_model_entry(user_id="u", provider=prov, model=model)
+        assert "use_chat_completions_api" not in e["litellm_params"]
+
+
+def test_model_entry_openai_compatible_native_when_relay_supports_responses():
+    # A relay that natively implements /v1/responses (e.g. gemai.cc) must NOT be
+    # forced through the chat-completions bridge — the bridge breaks codex's tool
+    # loop. Pass it through to its native /responses (no flag), keeping api_base.
+    e = gw.build_model_entry(
+        user_id="u", provider="openai_compatible", model="gpt-5.4",
+        base_url="https://my.host/v1", supports_responses=True,
+    )
+    assert "use_chat_completions_api" not in e["litellm_params"]
+    assert e["litellm_params"]["api_base"] == "https://my.host/v1"
+
+
+def test_model_entry_openai_compatible_bridges_when_relay_lacks_responses():
+    # A chat-only relay (no /v1/responses) is forced through the bridge.
+    e = gw.build_model_entry(
+        user_id="u", provider="openai_compatible", model="m",
+        base_url="https://my.host/v1", supports_responses=False,
+    )
+    assert e["litellm_params"]["use_chat_completions_api"] is True
+
+
+def test_build_config_threads_supports_responses_per_entry():
+    cfg = gw.build_config([
+        {"user_id": "native", "provider": "openai_compatible", "model": "gpt-5.4",
+         "base_url": "https://a.host/v1", "supports_responses": True},
+        {"user_id": "bridge", "provider": "openai_compatible", "model": "m",
+         "base_url": "https://b.host/v1", "supports_responses": False},
+    ])
+    by_id = {e["model_name"]: e["litellm_params"] for e in cfg["model_list"]}
+    assert "use_chat_completions_api" not in by_id["gw-native"]
+    assert by_id["gw-bridge"]["use_chat_completions_api"] is True
+
+
+def test_config_signature_changes_with_supports_responses():
+    base = {"user_id": "u", "provider": "openai_compatible", "model": "m",
+            "base_url": "https://h/v1"}
+    sig_bridge = gw.config_signature([{**base, "supports_responses": False}])
+    sig_native = gw.config_signature([{**base, "supports_responses": True}])
+    assert sig_bridge != sig_native
+
+
 def test_build_config_drops_codex_incompatible_params_and_sets_master_key_env():
     cfg = gw.build_config([
         {"user_id": "u1", "provider": "gemini", "model": "gemini-2.0-flash"},

@@ -248,8 +248,17 @@ services:
       FEEDLING_API_URL: "http://backend:5001"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       AGENT_DATA_ROOT: "/agent-data"
-      AGENT_LEASE_TTL_SEC: "60"
-      AGENT_TICK_INTERVAL_SEC: "15"
+      # Lease TTL. Renewal now runs in its own thread (decoupled from the slow
+      # resolve lap), so a larger TTL is pure headroom against a slow lap and the
+      # single supervisor has no failover to slow down. Tunable via encrypted env
+      # without a re-chain (interpolated). Default 300 (was a hard "60").
+      AGENT_LEASE_TTL_SEC: "${AGENT_LEASE_TTL_SEC:-300}"
+      AGENT_TICK_INTERVAL_SEC: "${AGENT_TICK_INTERVAL_SEC:-15}"
+      # Provider-key envelope cache TTL (s) and per-tick resolution fan-out. These
+      # collapse the host-all resolve lap (was 50× serial backend round-trips/tick)
+      # so leases never sit expired. Tunable via env; code defaults are 300 / 8.
+      AGENT_ENVELOPE_REFETCH_SEC: "${AGENT_ENVELOPE_REFETCH_SEC:-300}"
+      AGENT_RESOLVE_CONCURRENCY: "${AGENT_RESOLVE_CONCURRENCY:-8}"
       AGENT_RUNTIME_ISOLATION: "process"
       # Same external Postgres as the backend (lease table). Encrypted env channel.
       DATABASE_URL: "${DATABASE_URL:-}"

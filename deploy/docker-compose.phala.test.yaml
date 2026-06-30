@@ -87,7 +87,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:b81b2a0
+    image: ghcr.io/teleport-computer/feedling:c7d8124
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -130,7 +130,7 @@ services:
   # unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:b81b2a0
+    image: ghcr.io/teleport-computer/feedling:c7d8124
     # gunicorn = production WSGI (the Werkzeug dev server stalls on large
     # responses under TDX). -w N is now code-supported (leader-elected :9998 WS
     # ingest + Postgres LISTEN/NOTIFY wake bus — see core/leader.py /
@@ -228,15 +228,20 @@ services:
   # injecting AGENT_RUNTIME_USERS (roster JSON) via the encrypted env channel —
   # no compose change / on-chain re-auth needed. See deploy/DEPLOYMENTS.md.
   agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:b81b2a0
+    image: ghcr.io/teleport-computer/feedling-agent-runner:c7d8124
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
     environment:
       FEEDLING_API_URL: "http://backend:5001"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       AGENT_DATA_ROOT: "/agent-data"
-      AGENT_LEASE_TTL_SEC: "60"
-      AGENT_TICK_INTERVAL_SEC: "15"
+      # Lease renewal runs in its own thread (decoupled from the resolve lap), so a
+      # larger TTL is pure headroom. Tunable via encrypted env (interpolated).
+      AGENT_LEASE_TTL_SEC: "${AGENT_LEASE_TTL_SEC:-300}"
+      AGENT_TICK_INTERVAL_SEC: "${AGENT_TICK_INTERVAL_SEC:-15}"
+      # Envelope cache TTL + resolution fan-out — collapse the host-all resolve lap.
+      AGENT_ENVELOPE_REFETCH_SEC: "${AGENT_ENVELOPE_REFETCH_SEC:-300}"
+      AGENT_RESOLVE_CONCURRENCY: "${AGENT_RESOLVE_CONCURRENCY:-8}"
       AGENT_RUNTIME_ISOLATION: "process"
       # Same external Postgres as the backend (lease table). Encrypted env channel.
       DATABASE_URL: "${DATABASE_URL:-}"

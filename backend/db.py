@@ -705,7 +705,10 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict
     anthropic/deepseek → claude；openai → codex (native)。gateway-only provider
     (gemini/openrouter/openai_compatible → codex via LiteLLM gateway) 仅当
     ``include_gateway`` 时返回（gateway 关时不发现，避免 spawn 到不存在的 proxy）。
-    Returns [{"user_id","driver","provider","model","base_url"}] sorted by user_id。"""
+    Returns [{"user_id","driver","provider","model","base_url","supports_responses"}]
+    sorted by user_id (``supports_responses`` is the openai_compatible relay's
+    /v1/responses capability, set at setup; selects native passthrough vs the
+    LiteLLM chat-completions bridge)。"""
     providers = ["anthropic", "claude", "deepseek", "openai"]
     if include_gateway:
         providers += ["gemini", "openrouter", "openai_compatible"]
@@ -722,7 +725,8 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict
                   END AS driver,
                   LOWER(COALESCE(doc->>'provider', '')) AS provider,
                   COALESCE(doc->>'model', '') AS model,
-                  COALESCE(doc->>'base_url', '') AS base_url
+                  COALESCE(doc->>'base_url', '') AS base_url,
+                  COALESCE(doc->>'supports_responses', '') AS supports_responses
                 FROM user_blobs
                 WHERE kind = 'model_api'
                   AND COALESCE(doc->>'test_status', '') = 'ok'
@@ -732,8 +736,9 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict
                 (providers,),
             ).fetchall()
         return [{"user_id": uid, "driver": driver, "provider": provider,
-                 "model": model, "base_url": base_url}
-                for uid, driver, provider, model, base_url in rows]
+                 "model": model, "base_url": base_url,
+                 "supports_responses": supports_responses == "true"}
+                for uid, driver, provider, model, base_url, supports_responses in rows]
     except Exception as e:
         log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
         return []

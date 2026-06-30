@@ -36,6 +36,10 @@ COMMON_BUCKETS_V1 = [
 COMMON_BUCKETS_LINE_V1 = "、".join(f"{zh}/{en}" for zh, en in COMMON_BUCKETS_V1)
 # English-only list for the route-B guidance block below (kept in sync automatically).
 _COMMON_BUCKETS_EN = " / ".join(en for _zh, en in COMMON_BUCKETS_V1)
+# Chinese-only list — the guidance presents zh and en as SEPARATE lists (not 工作/Work
+# pairs), because the joined-pair format made the model copy "健康/Health" verbatim as
+# the bucket name instead of picking one side.
+_COMMON_BUCKETS_ZH = "、".join(zh for zh, _en in COMMON_BUCKETS_V1)
 
 
 MEMORY_WRITE_GUIDANCE_V1 = ("""
@@ -66,7 +70,9 @@ Memory context framing:
 # (capture / migrate / genesis) so onboarding and capture steer toward the same set.
 COMMON_BUCKETS_GUIDANCE_V1 = (
     "桶名要收敛、可复用,别每张卡都新起一个近义桶。优先从这组通用桶里选并复用——\n"
-    "  " + COMMON_BUCKETS_LINE_V1 + "\n"
-    "中文记忆用左侧中文桶、英文记忆用右侧英文桶,同一个桶绝不中英并存(别让「工作」和「Work」同时出现)。"
+    "  中文记忆用:" + _COMMON_BUCKETS_ZH + "\n"
+    "  英文记忆用:" + _COMMON_BUCKETS_EN + "\n"
+    "桶名【只写一个词】、且只用这条记忆本身的语言那一份:中文记忆写「健康」,英文记忆写「Health」。"
+    "⚠️ 绝不要把两种语言拼在一起当桶名——别写成「健康/Health」「宠物/Pets」这种带斜杠的双语串。"
     "这些都不贴合,再起一个简短的具体桶(如 妈妈、房子);别造「工作/职业/事业」这种近义重复桶。"
 ).strip()

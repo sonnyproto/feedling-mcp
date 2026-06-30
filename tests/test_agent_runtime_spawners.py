@@ -147,6 +147,33 @@ def test_process_spawner_reports_running_child_then_kills_it():
     assert sp.is_alive(pid) is False
 
 
+def test_process_spawner_escalates_to_sigkill_when_sigterm_ignored():
+    # A consumer that traps & ignores SIGTERM must still be force-killed, else a
+    # stuck child lingers and can double-run alongside its replacement. kill()
+    # escalates to SIGKILL after a grace window.
+    import time
+    sp = spawners.ProcessSpawner()
+    code = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    proc = subprocess.Popen([sys.executable, "-c", code])
+    pid = sp.register(proc)
+    time.sleep(0.4)                     # let the child install the SIGTERM handler
+    assert sp.is_alive(pid) is True
+    sp.kill(pid)
+    assert sp.is_alive(pid) is False    # SIGKILL took it down despite ignored SIGTERM
+
+
+def test_signal_kill_escalates_to_sigkill_for_sigterm_ignoring_pid():
+    # The no-Popen-handle fallback (used after a supervisor restart / container
+    # path) must also escalate SIGTERM → SIGKILL, not give up after one SIGTERM.
+    import time
+    code = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    proc = subprocess.Popen([sys.executable, "-c", code])
+    time.sleep(0.4)
+    spawners._signal_kill(proc.pid)
+    proc.wait(timeout=10)               # reaps; returns once SIGKILL lands
+    assert proc.returncode is not None
+
+
 def test_get_spawner_returns_spawn_alive_kill_triple_sharing_state():
     spawn, alive, kill = spawners.get_spawner("process")
     # all three bound to the same registry instance

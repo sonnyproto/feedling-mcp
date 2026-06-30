@@ -13,6 +13,7 @@ import db
 from core import util as core_util
 from core.store import UserStore
 
+from accounts import onboarding as accounts_onboarding
 from chat import consumer as chat_consumer
 from identity import service as identity_service
 from memory import service as memory_service
@@ -175,6 +176,16 @@ def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
     state = _bootstrap_state(store)
     if state["stage"] == "main_loop":
         if allow_verify_reply:
+            return None
+        # Host (model_api) accounts don't run an independent resident consumer —
+        # their chat loop is the supervisor-managed agent-runner, which posts via
+        # /v1/model_api/chat/send (gate-free) and never stamps the official
+        # `feedling-chat-resident` heartbeat. Requiring that heartbeat here is a
+        # route mix-up: it 409s host accounts (e.g. an onboarding-validate job
+        # posting its result through /v1/chat/response) with the resident-consumer
+        # text even though their bootstrap is complete. Identity is already
+        # written at main_loop, so let host accounts through.
+        if accounts_onboarding._load_onboarding_route(store) == "model_api":
             return None
         consumer_state = chat_consumer._consumer_validation_state(store)
         if not consumer_state["passing"]:

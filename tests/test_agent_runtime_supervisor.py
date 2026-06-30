@@ -76,6 +76,35 @@ def test_tick_spawns_one_consumer_per_user_with_isolated_homes():
     assert leases.get("u_2")["lease_owner"] == "sup_A"
 
 
+def test_tick_caps_new_spawns_per_tick():
+    """冷启动大量用户时，一次 tick 只新起至多 max_spawns_per_tick 个 consumer，避免
+    一次性 fork 几十个把 CVM 压垮；剩下的下个 tick 继续，最终全部起齐。"""
+    procs = FakeProcTable()
+    sup = Supervisor(owner="sup_A", lease_ttl=300.0, data_root="/agent-data",
+                     spawn_fn=procs.spawn, alive_fn=procs.is_alive,
+                     kill_fn=procs.kill, now=lambda: T0,
+                     max_spawns_per_tick=2)
+    roster = _roster("u1", "u2", "u3", "u4", "u5")
+
+    sup.tick(roster)
+    assert len(procs.spawned) == 2          # 本 tick 只起 2 个
+    sup.tick(roster)
+    assert len(procs.spawned) == 4          # 下个 tick 再起 2 个
+    sup.tick(roster)
+    assert len(procs.spawned) == 5          # 第三 tick 起最后 1 个 → 全部起齐
+    # 已起的不会被重复 spawn
+    sup.tick(roster)
+    assert len(procs.spawned) == 5
+
+
+def test_tick_unlimited_spawns_by_default():
+    """默认（max_spawns_per_tick 未设）保持原行为：一个 tick 把整张 roster 全 spawn。"""
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    sup.tick(_roster("u1", "u2", "u3", "u4", "u5"))
+    assert len(procs.spawned) == 5
+
+
 def test_tick_defers_spawn_while_genesis_in_progress(monkeypatch):
     # "先 genesis 后 spawn": a host user whose import genesis is still running must
     # NOT boot a blank consumer; once genesis is done the next tick spawns.
@@ -328,6 +357,133 @@ def test_losing_lease_kills_the_orphaned_child():
     assert "u_1" not in sup_a.children
 
 
+# ---- T1.1: lease renewal decoupled from the (slow) discover/resolve reconcile ----
+
+
+def test_renew_live_advances_leases_without_a_roster():
+    # The renew thread keeps leases fresh on its own cadence — independent of how
+    # long a host-all resolve lap takes. It renews from in-memory children, no
+    # roster, no spawn/reap reconcile.
+    procs = FakeProcTable()
+    t = {"v": T0}
+    sup = _sup(procs, clock=lambda: t["v"])
+    sup.tick(_roster("u_1", "u_2"))
+    exp1 = leases.get("u_1")["lease_expires_at"]
+
+    t["v"] = T0 + 100
+    sup.renew_live()
+    assert leases.get("u_1")["lease_expires_at"] > exp1
+    assert leases.get("u_2")["lease_expires_at"] > exp1
+    assert len(procs.spawned) == 2          # pure renewal: no new spawns
+
+
+def test_renew_live_reaps_a_dead_child():
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    sup.tick(_roster("u_1"))
+    pid = sup.children["u_1"]["pid"]
+    procs.alive[pid] = False                # child died between ticks
+
+    sup.renew_live()
+    assert "u_1" not in sup.children
+    assert leases.get("u_1")["lease_owner"] is None   # lease released
+
+
+def test_renew_live_reclaims_own_expired_lease_without_killing():
+    # The churn bug: if our own lease lapsed (a slow lap outran the TTL) but no
+    # other supervisor took it, the renewer must RECLAIM it — not kill a healthy
+    # child and re-spawn it (the death spiral that 503'd every send).
+    t = {"v": T0}
+    procs = FakeProcTable()
+    sup = _sup(procs, clock=lambda: t["v"])
+    sup.tick(_roster("u_1"))
+    pid = sup.children["u_1"]["pid"]
+
+    t["v"] = T0 + 400                        # past our own ttl (300); nobody took it
+    sup.renew_live()
+    assert pid not in procs.killed           # healthy child NOT killed
+    assert "u_1" in sup.children
+    row = leases.get("u_1")
+    assert row["lease_owner"] == "sup_A"     # reclaimed
+    assert row["lease_expires_at"] is not None
+
+
+def test_renew_live_kills_orphan_after_lease_lost():
+    t = {"v": T0}
+    procs_a = FakeProcTable()
+    sup_a = _sup(procs_a, owner="sup_A", clock=lambda: t["v"])
+    sup_a.tick(_roster("u_1"))
+    pid = sup_a.children["u_1"]["pid"]
+
+    t["v"] = T0 + 400                        # past sup_A's ttl (300)
+    sup_b = _sup(FakeProcTable(), owner="sup_B", clock=lambda: T0 + 400)
+    sup_b.tick(_roster("u_1"))               # sup_B takes the expired lease
+    assert leases.get("u_1")["lease_owner"] == "sup_B"
+
+    sup_a.renew_live()                       # sup_A's renewer notices it lost the lease
+    assert pid in procs_a.killed
+    assert "u_1" not in sup_a.children
+
+
+def test_renew_live_reaps_when_other_owner_took_over_then_expired():
+    # Codex P1: A's lease lapses, B takes over and spawns; later B's lease also
+    # briefly lapses. A's renewer must NOT reclaim B's row (that double-runs two
+    # consumers) — it reaps its own orphaned child and leaves B's lease alone.
+    t = {"v": T0}
+    procs_a = FakeProcTable()
+    sup_a = _sup(procs_a, owner="sup_A", clock=lambda: t["v"])
+    sup_a.tick(_roster("u_1"))
+    pid = sup_a.children["u_1"]["pid"]
+
+    sup_b = _sup(FakeProcTable(), owner="sup_B", clock=lambda: T0 + 400)
+    sup_b.tick(_roster("u_1"))                       # B takes the expired lease
+    assert leases.get("u_1")["lease_owner"] == "sup_B"
+
+    t["v"] = T0 + 800                                # B's lease (exp T0+700) lapsed too
+    sup_a.renew_live()
+    assert pid in procs_a.killed                     # A reaps its orphan, doesn't steal
+    assert "u_1" not in sup_a.children
+    assert leases.get("u_1")["lease_owner"] == "sup_B"   # B's row untouched
+
+
+def test_respawn_does_not_lose_lease_to_concurrent_renew():
+    # Race regression (Codex [P2]): the in-place respawn kills the old pid before
+    # swapping the tracked child. If renew_live snapshots the old child in that
+    # window and sees its pid dead, it must NOT release the lease that respawn is
+    # about to renew for the replacement consumer. The respawn holds the lock
+    # across kill→spawn→renew→swap, so the renewer can't interleave.
+    import threading
+    import time as _t
+
+    procs = FakeProcTable()
+    sup = _sup(procs)
+    sup.tick([{"user_id": "u_1", "api_key": "k", "driver": "claude", "provider": "anthropic"}])
+    old_pid = sup.children["u_1"]["pid"]
+
+    renew_done = threading.Event()
+    real_kill = procs.kill
+
+    def kill_then_race_renew(pid):
+        real_kill(pid)                       # old pid now reports dead
+        if pid == old_pid:
+            # Fire the renewer at the worst moment — mid-respawn, old pid dead.
+            threading.Thread(
+                target=lambda: (sup.renew_live(), renew_done.set())
+            ).start()
+            _t.sleep(0.05)                   # let it reach the lock / its reap
+    sup.kill_fn = kill_then_race_renew
+
+    # Config change → in-place respawn.
+    sup.tick([{"user_id": "u_1", "api_key": "k", "driver": "codex", "provider": "openai"}])
+    renew_done.wait(2)
+
+    row = leases.get("u_1")
+    assert row is not None
+    assert row["lease_owner"] == "sup_A"            # lease NOT released by the renewer
+    assert row["lease_expires_at"] is not None      # still live
+    assert "u_1" in sup.children                     # replacement child retained
+
+
 def test_shutdown_releases_all_leases_and_kills_children():
     procs = FakeProcTable()
     sup = _sup(procs)
@@ -410,6 +566,21 @@ def test_gateway_entries_selects_only_codex_gateway_users():
     assert gw[0]["model"] == "g"
     assert gw[0]["base_url"] == "https://my.host/v1"  # custom endpoint → LiteLLM api_base
     assert gw[0]["provider_key"] == "kc"  # upstream key carried for LiteLLM env
+
+
+def test_gateway_entries_carry_supports_responses_for_bridge_choice():
+    # supports_responses must reach the gateway entry so build_config can pick
+    # native passthrough (relay has /responses) vs the chat-completions bridge.
+    roster = [
+        {"user_id": "native", "driver": "codex", "provider": "openai_compatible",
+         "model": "gpt-5.4", "base_url": "https://a/v1", "provider_key": "k",
+         "supports_responses": True},
+        {"user_id": "bridge", "driver": "codex", "provider": "openai_compatible",
+         "model": "m", "base_url": "https://b/v1", "provider_key": "k"},  # absent → False
+    ]
+    gw = {e["user_id"]: e for e in supervisor_mod._gateway_entries(roster)}
+    assert gw["native"]["supports_responses"] is True
+    assert gw["bridge"]["supports_responses"] is False
 
 
 def test_drop_gateway_users_filters_when_gateway_disabled():
@@ -550,6 +721,30 @@ def test_resolve_discovered_caches_by_user_and_envelope(monkeypatch):
     supervisor_mod._resolve_discovered(enabled, mint_token=lambda u: "t",
                                        api_url="a", enclave_url="e", cache=cache)
     assert calls["n"] == 1                           # same envelope → decrypted once
+
+
+def test_resolve_discovered_isolates_per_user_failure(monkeypatch):
+    """一个用户的 mint/fetch/decrypt 抛异常（或超时）绝不能让整圈 resolve 崩掉——
+    其余用户照常解析。否则单个坏用户会拖垮整个 roster，该 tick 谁都起不来。"""
+    enabled = {
+        "bad": {"driver": "claude", "provider": "anthropic", "model": "m", "base_url": ""},
+        "good": {"driver": "claude", "provider": "deepseek", "model": "m", "base_url": ""},
+    }
+
+    def mint(uid):
+        if uid == "bad":
+            raise RuntimeError("token mint hung/failed")
+        return f"tok-{uid}"
+
+    monkeypatch.setattr(supervisor_mod, "_fetch_key_envelope",
+                        lambda api_url, api_key="", runtime_token="": {"ct": "x"})
+    monkeypatch.setattr(supervisor_mod, "_decrypt_provider_key",
+                        lambda enclave_url, api_key="", envelope=None, runtime_token="": "sk")
+    out = supervisor_mod._resolve_discovered(enabled, mint_token=mint,
+                                             api_url="a", enclave_url="e", cache={})
+    uids = {e["user_id"] for e in out}
+    assert "good" in uids        # 好用户照常解析
+    assert "bad" not in uids     # 坏用户被隔离跳过：不抛、不拖累其余
 
 
 def test_effective_roster_host_all_uses_discovered_entries():
@@ -707,3 +902,52 @@ def test_supervisor_heartbeat_payload_shape():
     p = supervisor_mod._supervisor_heartbeat_payload(
         "host:7", host_all=True, gateway=False, ts=123.5)
     assert p == {"ts": 123.5, "owner": "host:7", "host_all": True, "gateway": False}
+
+
+def test_heartbeat_loop_writes_on_cadence_until_stopped(monkeypatch):
+    """心跳必须由独立线程按固定节奏写入，不被主循环的 discover→spawn 慢工作阻塞——
+    冷启动大量用户时，wedge 守卫不能因 supervision 跑得慢而误判 supervisor 死掉。"""
+    import threading
+    import time
+
+    writes = []
+    monkeypatch.setattr(supervisor_mod.db, "set_supervisor_heartbeat",
+                        lambda payload: writes.append(payload))
+    stop = threading.Event()
+    t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
+        owner="host:1", host_all=True, gateway=True, interval=0.01, stop_event=stop))
+    t.start()
+    time.sleep(0.05)
+    stop.set()
+    t.join(timeout=2)
+
+    assert not t.is_alive()                  # stop_event 能干净停止线程
+    assert len(writes) >= 1                   # 持续写心跳（不依赖任何 tick 完成）
+    assert writes[0]["owner"] == "host:1"
+    assert writes[0]["host_all"] is True
+    assert writes[0]["gateway"] is True
+    assert "ts" in writes[0]
+
+
+def test_heartbeat_loop_survives_write_errors(monkeypatch):
+    """单次心跳写失败（DB blip）绝不能让心跳线程退出——否则一次抖动后 wedge 永远 503。"""
+    import threading
+    import time
+
+    calls = {"n": 0}
+
+    def flaky(_payload):
+        calls["n"] += 1
+        raise RuntimeError("db blip")
+
+    monkeypatch.setattr(supervisor_mod.db, "set_supervisor_heartbeat", flaky)
+    stop = threading.Event()
+    t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
+        owner="o", host_all=False, gateway=False, interval=0.01, stop_event=stop))
+    t.start()
+    time.sleep(0.05)
+    stop.set()
+    t.join(timeout=2)
+
+    assert not t.is_alive()
+    assert calls["n"] >= 2                     # 写失败后继续重试，没有退出
