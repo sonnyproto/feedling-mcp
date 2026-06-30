@@ -101,6 +101,9 @@ def upsert_task(
     output_ref: str = "",
     output_summary: str = "",
     error_class: str = "",
+    error_type: str = "",
+    error_message: str = "",
+    provider_status_code: int | None = None,
     source_ref: str = "",
     candidate_id: str = "",
     written_memory_ids: Iterable[str] = (),
@@ -127,6 +130,11 @@ def upsert_task(
         "output_summary": str(output_summary or prev.get("output_summary") or "")[:240],
         "attempts": attempts,
         "error_class": str(error_class or ""),
+        # Codex review: keep the ORIGINAL error so ops can tell 402 vs ReadTimeout vs
+        # no-usable-reply vs invalid_json_after_repair — not just transient/provider_config.
+        "error_type": str(error_type or ""),
+        "error_message": str(error_message or "")[:240],
+        "provider_status_code": (int(provider_status_code) if isinstance(provider_status_code, int) else None),
         "source_ref": str(source_ref or prev.get("source_ref") or ""),
         "candidate_id": str(candidate_id or prev.get("candidate_id") or ""),
         "written_memory_ids": ids,
@@ -145,13 +153,33 @@ def pending_tasks(cp: Mapping[str, Any] | None) -> list[dict]:
             if isinstance(t, Mapping) and str(t.get("status") or "") != TASK_DONE]
 
 
+# Phases in which the worker may actually run pending tasks. Critically NOT
+# provider_config_blocked: pending_tasks() lists blocked tasks too (so resume can
+# pick them up), but the worker loop must NOT auto-run them — it has to wait for
+# resume() to flip the phase back. (Codex review point 2.)
+_RUNNABLE_PHASES = frozenset({PHASE_FOREGROUND_PROCESSING, PHASE_BACKGROUND_PROCESSING})
+
+
+def runnable_tasks(cp: Mapping[str, Any] | None) -> list[dict]:
+    """pending_tasks(), but only when the phase permits running. Returns [] while
+    provider_config_blocked / done / failed_terminal, so the worker can't process
+    pending work on a blocked job — it must call resume() first."""
+    phase = str((cp or {}).get("phase") or "") if isinstance(cp, Mapping) else ""
+    if phase not in _RUNNABLE_PHASES:
+        return []
+    return pending_tasks(cp)
+
+
 # --- dedup refs (contracts #1 / #2) ------------------------------------------
 
 def written_refs(cp: Mapping[str, Any] | None) -> set[str]:
     """All source_ref/candidate_id already written (any task) — strong-dedup key set."""
     out: set[str] = set()
     for t in _tasks(cp).values():
-        if not isinstance(t, Mapping):
+        # Only a task that actually finished writing counts as "already written" —
+        # a pending/failed task (incl. one flipped back to pending by resume()) must
+        # NOT block re-processing its candidate.
+        if not isinstance(t, Mapping) or str(t.get("status") or "") != TASK_DONE:
             continue
         for key in ("source_ref", "candidate_id"):
             v = str(t.get(key) or "").strip()
@@ -165,7 +193,8 @@ def foreground_written_refs(cp: Mapping[str, Any] | None) -> set[str]:
     (contract #2: don't re-add the 3-5 core cards)."""
     out: set[str] = set()
     for t in _tasks(cp).values():
-        if not isinstance(t, Mapping) or not t.get("foreground_written"):
+        if (not isinstance(t, Mapping) or not t.get("foreground_written")
+                or str(t.get("status") or "") != TASK_DONE):
             continue
         for key in ("source_ref", "candidate_id"):
             v = str(t.get(key) or "").strip()

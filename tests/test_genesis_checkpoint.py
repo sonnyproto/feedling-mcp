@@ -88,3 +88,29 @@ def test_provider_config_blocked_then_resume_keeps_done():
 def test_set_phase_rejects_unknown():
     with pytest.raises(ValueError):
         cp.set_phase(cp.new_checkpoint(), "bogus_phase")
+
+
+def test_runnable_tasks_gated_by_phase():
+    # Codex point 2 — pending lists blocked tasks (for resume), but the worker must
+    # NOT auto-run them while blocked; runnable_tasks gates on phase.
+    c = cp.new_checkpoint(now=0.0)
+    c = cp.upsert_task(c, task_id="t", chunk_id=0, status=cp.TASK_PENDING)
+    c = cp.set_phase(c, cp.PHASE_BACKGROUND_PROCESSING)
+    assert len(cp.runnable_tasks(c)) == 1
+    c = cp.mark_provider_config_blocked(c, reason="402")
+    assert len(cp.pending_tasks(c)) == 1     # resume still needs to see it
+    assert cp.runnable_tasks(c) == []        # but worker must NOT run it
+    c = cp.resume(c)
+    assert len(cp.runnable_tasks(c)) == 1     # resume re-enables
+
+
+def test_upsert_keeps_original_error_for_ops():
+    # Codex point 1 — keep 402 vs ReadTimeout vs invalid_json, not just the class
+    c = cp.new_checkpoint(now=0.0)
+    c = cp.upsert_task(c, task_id="t", chunk_id=0, status=cp.TASK_TRANSIENT_FAILED,
+                       error_class="transient_exhausted", error_type="ProviderError",
+                       error_message="ReadTimeout on fucheers.top", provider_status_code=None)
+    t = cp.get_task(c, "t", 0)
+    assert t["error_type"] == "ProviderError"
+    assert "ReadTimeout" in t["error_message"]
+    assert t["error_class"] == "transient_exhausted"
