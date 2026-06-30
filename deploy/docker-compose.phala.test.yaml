@@ -196,6 +196,11 @@ services:
       # Proactive wake is native-only after P2-2b and no longer uses this flag.
       # See core/util.runtime_v2_default_on().
       FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"
+      # TEST-ONLY: genesis v2 (foreground-fast onboarding). Greet on 3-5 core +
+      # identity baseline, push the heavy reduce (the ~37% prod failure surface)
+      # to the background. Prod compose deliberately omits this (keeps the v1
+      # one-shot path) until test validation. Read in worker.genesis_v2_enabled().
+      FEEDLING_GENESIS_V2_ENABLED: "true"
       # Mirrors the agent-runner's flag: the hosted cutover decision lives in the
       # backend, so it needs the same value — gateway-only providers stay legacy
       # (inline) until the in-CVM LiteLLM gateway is actually on. Encrypted env,
