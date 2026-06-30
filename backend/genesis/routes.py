@@ -615,6 +615,12 @@ def _run_plaintext_background_enrichment(
             merged["memories"] = kept
     # apply the REST without re-completing: memories (core already excluded), persona, voice
     service.apply_memory_outputs(store, api_key, merged)
+    # CRITICAL: apply the identity from the FULL reduce. The foreground processes only
+    # the history (user facts) so its identity baseline is usually empty — the real
+    # agent identity (name/dimensions/category) is derived here from persona/voice. For
+    # a genesis-source identity init_identity_if_absent fills/updates it, so the home
+    # stops looking blank once the background lands.
+    service.init_identity_if_absent(store, merged, api_key)
     service.write_persona_artifact(store, job_id, merged)
     service.write_voice_artifact(store, job_id, merged)
     db.genesis_set_job_status(
