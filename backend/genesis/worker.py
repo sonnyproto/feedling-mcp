@@ -20,7 +20,7 @@ import httpx
 import db
 import provider_client
 from core.store import get_store
-from genesis import prompts, service
+from genesis import checkpoint, foreground, prompts, service
 from genesis.llm_client import GenesisLLMClient
 
 GENESIS_WORKER_SCOPES = ["envelope_decrypt", "genesis"]
@@ -554,6 +554,7 @@ def _build_reducer_output(
     source_kind: str = "history",
     existing_persona: dict | None = None,
     existing_voice: dict | None = None,
+    skip_fact_texts: set[str] | None = None,
 ) -> dict:
     llm = GenesisLLMClient()
     idempotency_prefix = _idempotency_prefix(job_id, key_prefix)
@@ -654,6 +655,15 @@ def _build_reducer_output(
         if isinstance(facts.get("fact_candidates"), list):
             fact_candidates.extend(item for item in facts["fact_candidates"] if isinstance(item, dict))
 
+    if skip_fact_texts:
+        # Genesis v2: drop the candidates the foreground already wrote as core, so the
+        # background reduce never re-writes them (structural dedup — foreground and
+        # background see the SAME cached candidates, so normalized text matches exactly).
+        fact_candidates = [
+            c for c in fact_candidates
+            if checkpoint.normalize_fact_text(str(c.get("summary") or c.get("content") or "")) not in skip_fact_texts
+        ]
+
     voice_final = _voice_reduce(
         llm,
         user_id=user_id,
@@ -734,6 +744,7 @@ def build_reducer_output_from_texts(
     source_kind: str = "history",
     existing_persona: dict | None = None,
     existing_voice: dict | None = None,
+    skip_fact_texts: set[str] | None = None,
 ) -> dict:
     """Public wrapper for trusted in-memory Genesis inputs.
 
@@ -750,7 +761,83 @@ def build_reducer_output_from_texts(
         source_kind=source_kind,
         existing_persona=existing_persona,
         existing_voice=existing_voice,
+        skip_fact_texts=skip_fact_texts,
     )
+
+
+def genesis_v2_enabled() -> bool:
+    """Genesis v2 (foreground-fast) runs ONLY when FEEDLING_GENESIS_V2_ENABLED is
+    truthy. Default OFF — the existing one-shot path stays byte-for-byte the
+    fallback. Flip on (test first), flip off + restart to revert instantly, no
+    deploy. This is the single gate the whole v2 main-path change hangs off of."""
+    return str(os.environ.get("FEEDLING_GENESIS_V2_ENABLED", "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def build_foreground_output_from_texts(
+    *,
+    user_id: str,
+    job_id: str,
+    key_prefix: str | None = None,
+    runtime: provider_client.ProviderConfig,
+    chunk_texts: list[str],
+    source_kind: str = "history",
+    foreground_core_max: int = foreground.FOREGROUND_CORE_MAX,
+    llm: GenesisLLMClient | None = None,
+) -> dict:
+    """Genesis v2 FOREGROUND — the light "open the door" pass (Codex flow).
+
+    fact_map over every chunk ONCE -> pick 3-5 core fact_candidates -> fact_write
+    ONLY those -> identity baseline. Deliberately NO voice_map/voice_reduce/persona
+    /full fact_write: those are the background's job. The returned dict carries the
+    SAME full fact_candidate list + the chosen core so the background partitions
+    against them (one extraction, shared candidates — never a second, divergent run).
+
+    Cache discipline: fact_map uses the SAME idempotency prefix as the background
+    reduce, so the two SHARE the cached extraction. fact_write uses a distinct
+    `:fg` prefix, so the foreground's core write never collides with the
+    background's fact_write batches.
+    """
+    llm = llm or GenesisLLMClient()
+    source_family = _source_family(source_kind)
+    shared_prefix = _idempotency_prefix(job_id, key_prefix)   # shared with background
+    fg_write_prefix = f"{shared_prefix}:fg"                   # distinct fact_write namespace
+
+    fact_candidates: list[dict] = []
+    for idx, text in enumerate(chunk_texts):
+        facts = _complete_json(
+            llm,
+            user_id=user_id,
+            job_id=job_id,
+            task_id=f"fact-map-{idx}",
+            runtime=runtime,
+            messages=prompts.fact_map_messages(_source_tagged_fact_text(source_family, text)),
+            max_tokens=1800,
+            idempotency_key=f"{shared_prefix}:fact_map:{idx}",   # SAME key as background -> cache shared
+        )
+        if isinstance(facts.get("fact_candidates"), list):
+            fact_candidates.extend(item for item in facts["fact_candidates"] if isinstance(item, dict))
+
+    core = foreground.select_core_for_foreground(fact_candidates, max_n=foreground_core_max)
+    fact_write = _fact_write(
+        llm,
+        user_id=user_id,
+        job_id=job_id,
+        key_prefix=fg_write_prefix,   # distinct -> never collides with background fact_write
+        runtime=runtime,
+        fact_candidates=core,
+    )
+    return {
+        "memories": fact_write.get("memories") or [],
+        "identity": fact_write.get("identity") or {"agent_name": "", "dimensions": []},
+        "source_kind": source_kind,
+        "source_family": source_family,
+        "foreground": True,
+        # handed to the background so it writes only the rest (structural dedup, Codex #1)
+        "all_fact_candidates": fact_candidates,
+        "core_fact_candidates": core,
+    }
 
 
 def _apply_reducer_output(api_url: str, runtime_token: str, job_id: str, output: dict) -> dict:
