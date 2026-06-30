@@ -15,7 +15,7 @@ from flask import Blueprint, jsonify, request
 import db
 from accounts import auth
 from accounts import runtime_auth
-from genesis import service, worker
+from genesis import foreground, service, worker
 from hosted import config_store as hosted_config_store
 from hosted import history_import
 from identity import service as identity_service
@@ -478,6 +478,126 @@ def _plaintext_existing_voice_from_output(output: dict) -> dict:
     }
 
 
+def _run_plaintext_genesis_v2(
+    store,
+    api_key: str | None,
+    job_id: str,
+    *,
+    runtime,
+    source_groups: list[dict],
+    relationship_anchor: dict | None = None,
+) -> bool:
+    """Genesis v2 foreground-fast orchestration (behind FEEDLING_GENESIS_V2_ENABLED).
+
+    Foreground: a light fact pass over the primary group -> 3-5 core memories + an
+    identity baseline -> apply + COMPLETE the job, so the app can greet immediately.
+    Background: the full reduce over every group (skipping the core the foreground
+    already wrote) -> apply the rest (memories + persona + voice) incrementally. The
+    job is already done+greetable, so a background failure NEVER fails onboarding.
+
+    Returns True when it handled the job. Returns False only when the foreground had
+    nothing worth greeting, so the caller runs the v1 full path instead.
+    """
+    # primary group: prefer the real chat history (best greeting signal), else the first
+    fg_group = next(
+        (g for g in source_groups if str(g.get("source_family") or "") == "history"),
+        source_groups[0],
+    )
+    fg_idx = source_groups.index(fg_group) + 1
+    fg_kind = str(fg_group.get("source_kind") or history_import._HISTORY_SOURCE)
+    fg_family = str(fg_group.get("source_family") or worker._source_family(fg_kind))
+    fg_chunks = [str(t) for t in (fg_group.get("chunk_texts") or []) if str(t or "").strip()]
+    if not fg_chunks:
+        return False
+
+    db.genesis_set_job_status(
+        store.user_id, job_id, status="processing",
+        output={"stage": "genesis_v2_foreground", "source_family": fg_family}, processed_chunks=0,
+    )
+    fg_reduce = worker.build_foreground_output_from_texts(
+        user_id=store.user_id, job_id=job_id,
+        key_prefix=f"{job_id}:source_pass:{fg_idx}:{fg_family}",
+        runtime=runtime, chunk_texts=fg_chunks, source_kind=fg_kind,
+    )
+    core = fg_reduce.get("core_fact_candidates") or []
+    has_name = bool(str((fg_reduce.get("identity") or {}).get("agent_name") or "").strip())
+    if not core and not has_name:
+        return False  # nothing greetable -> let the v1 full path handle it
+
+    # apply core + identity baseline AND complete the job -> the app can greet now
+    fg_merged = _plaintext_merge_reducer_outputs([fg_reduce], relationship_anchor=relationship_anchor)
+    service.apply_reducer_output(store, api_key, job_id, fg_merged)
+
+    # background continuation — never fails the (already greetable) job
+    try:
+        _run_plaintext_background_enrichment(
+            store, api_key, job_id, runtime=runtime, source_groups=source_groups,
+            relationship_anchor=relationship_anchor,
+            skip_family=fg_family, skip_texts=foreground.core_skip_texts(core),
+        )
+    except Exception as e:  # noqa: BLE001
+        db.genesis_set_job_status(
+            store.user_id, job_id, status=service.DONE_JOB_STATUS,
+            output={"stage": "genesis_v2_background_deferred",
+                    "error": f"{type(e).__name__}:{str(e)[:180]}"},
+        )
+    return True
+
+
+def _run_plaintext_background_enrichment(
+    store,
+    api_key: str | None,
+    job_id: str,
+    *,
+    runtime,
+    source_groups: list[dict],
+    relationship_anchor: dict | None,
+    skip_family: str,
+    skip_texts: set[str],
+) -> None:
+    """Background continuation: the full reduce over every group (skipping the core the
+    foreground already wrote for skip_family), then apply the REST incrementally —
+    memories + persona + voice. Does NOT re-complete the job (foreground already did)."""
+    reducer_outputs: list[dict] = []
+    existing_persona: dict = {}
+    existing_voice: dict = {}
+    for idx, group in enumerate(source_groups, start=1):
+        group_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
+        group_family = str(group.get("source_family") or worker._source_family(group_kind))
+        group_chunks = [str(t) for t in (group.get("chunk_texts") or []) if str(t or "").strip()]
+        if not group_chunks:
+            continue
+        db.genesis_set_job_status(
+            store.user_id, job_id, status=service.DONE_JOB_STATUS,
+            output={"stage": "genesis_v2_background", "source_family": group_family,
+                    "source_pass": idx, "source_pass_total": len(source_groups)},
+        )
+        output = worker.build_reducer_output_from_texts(
+            user_id=store.user_id, job_id=job_id,
+            key_prefix=f"{job_id}:source_pass:{idx}:{group_family}",
+            runtime=runtime, chunk_texts=group_chunks, source_kind=group_kind,
+            existing_persona=existing_persona, existing_voice=existing_voice,
+            # only the foreground group needs its already-written core skipped
+            skip_fact_texts=skip_texts if group_family == skip_family else None,
+        )
+        reducer_outputs.append(output)
+        next_persona = _plaintext_existing_persona_from_output(output)
+        if next_persona:
+            existing_persona = next_persona
+        next_voice = _plaintext_existing_voice_from_output(output)
+        if next_voice:
+            existing_voice = next_voice
+
+    merged = _plaintext_merge_reducer_outputs(reducer_outputs, relationship_anchor=relationship_anchor)
+    # apply the REST without re-completing: memories (core already excluded), persona, voice
+    service.apply_memory_outputs(store, api_key, merged)
+    service.write_persona_artifact(store, job_id, merged)
+    service.write_voice_artifact(store, job_id, merged)
+    db.genesis_set_job_status(
+        store.user_id, job_id, status=service.DONE_JOB_STATUS, output={"stage": "genesis_v2_done"},
+    )
+
+
 def _run_plaintext_genesis_job(
     store,
     api_key: str | None,
@@ -517,6 +637,15 @@ def _run_plaintext_genesis_job(
         if isinstance(runtime, tuple):
             _, err = runtime
             raise RuntimeError(json.dumps(err, ensure_ascii=False))
+
+        # Genesis v2 (FEEDLING_GENESIS_V2_ENABLED): foreground-fast — greet on 3-5 core
+        # + identity baseline, push the heavy reduce to background. Returns False when
+        # the foreground yields nothing greetable, so we fall through to the v1 path.
+        if worker.genesis_v2_enabled() and _run_plaintext_genesis_v2(
+            store, api_key, job_id,
+            runtime=runtime, source_groups=source_groups, relationship_anchor=relationship_anchor,
+        ):
+            return
 
         reducer_outputs: list[dict] = []
         existing_persona: dict = {}
