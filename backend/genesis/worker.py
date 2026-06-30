@@ -500,6 +500,7 @@ def _fact_write(
     fact_candidates: list[dict],
     persona_material: str = "",
     memory_summary: str = "",
+    known_memories: list[str] | None = None,
 ) -> dict:
     if not fact_candidates and not persona_material and not memory_summary:
         return {"memories": [], "identity": {"agent_name": "", "dimensions": []}}
@@ -513,7 +514,7 @@ def _fact_write(
             job_id=job_id,
             task_id=f"fact-write-{idx}",
             runtime=runtime,
-            messages=prompts.fact_write_messages(batch, persona_material, memory_summary),
+            messages=prompts.fact_write_messages(batch, persona_material, memory_summary, known_memories),
             max_tokens=4000,
             idempotency_key=f"{idempotency_prefix}:fact_write:{idx}",
         ))
@@ -555,6 +556,7 @@ def _build_reducer_output(
     existing_persona: dict | None = None,
     existing_voice: dict | None = None,
     skip_fact_texts: set[str] | None = None,
+    known_memories: list[str] | None = None,
 ) -> dict:
     llm = GenesisLLMClient()
     idempotency_prefix = _idempotency_prefix(job_id, key_prefix)
@@ -710,6 +712,7 @@ def _build_reducer_output(
         key_prefix=idempotency_prefix,
         runtime=runtime,
         fact_candidates=fact_candidates,
+        known_memories=known_memories,   # genesis v2: foreground core -> "已保存,勿重复"
     )
     if source_family == "user_profile":
         fact_write = _strip_identity(fact_write)
@@ -766,6 +769,7 @@ def build_reducer_output_from_texts(
     existing_persona: dict | None = None,
     existing_voice: dict | None = None,
     skip_fact_texts: set[str] | None = None,
+    known_memories: list[str] | None = None,
 ) -> dict:
     """Public wrapper for trusted in-memory Genesis inputs.
 
@@ -783,6 +787,7 @@ def build_reducer_output_from_texts(
         existing_persona=existing_persona,
         existing_voice=existing_voice,
         skip_fact_texts=skip_fact_texts,
+        known_memories=known_memories,
     )
 
 
