@@ -15,7 +15,7 @@ from flask import Blueprint, jsonify, request
 import db
 from accounts import auth
 from accounts import runtime_auth
-from genesis import foreground, service, worker
+from genesis import dedup, foreground, service, worker
 from hosted import config_store as hosted_config_store
 from hosted import history_import
 from identity import service as identity_service
@@ -528,12 +528,22 @@ def _run_plaintext_genesis_v2(
     fg_merged = _plaintext_merge_reducer_outputs([fg_reduce], relationship_anchor=relationship_anchor)
     service.apply_reducer_output(store, api_key, job_id, fg_merged)
 
+    # the foreground core memory texts -> handed to the background as "already saved,
+    # don't repeat" so the model dedups reworded twins semantically (the e2e proved
+    # exact skip_fact_texts misses reworded twins; a lexical filter can't tell a twin
+    # from a same-template-different-value fact, so the dedup must live in the model).
+    core_memory_texts = [
+        t for t in (str((m or {}).get("summary") or (m or {}).get("content") or "").strip()
+                    for m in (fg_merged.get("memories") or [])) if t
+    ]
+
     # background continuation — never fails the (already greetable) job
     try:
         _run_plaintext_background_enrichment(
             store, api_key, job_id, runtime=runtime, source_groups=source_groups,
             relationship_anchor=relationship_anchor,
             skip_family=fg_family, skip_texts=foreground.core_skip_texts(core),
+            known_memories=core_memory_texts,
         )
     except Exception as e:  # noqa: BLE001
         db.genesis_set_job_status(
@@ -554,10 +564,18 @@ def _run_plaintext_background_enrichment(
     relationship_anchor: dict | None,
     skip_family: str,
     skip_texts: set[str],
+    known_memories: list[str] | None = None,
 ) -> None:
     """Background continuation: the full reduce over every group (skipping the core the
     foreground already wrote for skip_family), then apply the REST incrementally —
-    memories + persona + voice. Does NOT re-complete the job (foreground already did)."""
+    memories + persona + voice. Does NOT re-complete the job (foreground already did).
+
+    Dedup is two-layered against the foreground core (`known_memories`): the model
+    dedups reworded twins semantically inside fact_write (known_memories = "already
+    saved, don't repeat"), and a CONSERVATIVE lexical backstop drops any near-identical
+    survivor before apply. The lexical threshold is high on purpose — it must never
+    merge two distinct same-template facts (美式/拿铁, 蛋子/金毛)."""
+    known = [t for t in (str(x or "").strip() for x in (known_memories or [])) if t]
     reducer_outputs: list[dict] = []
     existing_persona: dict = {}
     existing_voice: dict = {}
@@ -577,8 +595,9 @@ def _run_plaintext_background_enrichment(
             key_prefix=f"{job_id}:source_pass:{idx}:{group_family}",
             runtime=runtime, chunk_texts=group_chunks, source_kind=group_kind,
             existing_persona=existing_persona, existing_voice=existing_voice,
-            # only the foreground group needs its already-written core skipped
+            # only the foreground group needs its already-written core skipped/deduped
             skip_fact_texts=skip_texts if group_family == skip_family else None,
+            known_memories=known if group_family == skip_family else None,
         )
         reducer_outputs.append(output)
         next_persona = _plaintext_existing_persona_from_output(output)
@@ -589,6 +608,11 @@ def _run_plaintext_background_enrichment(
             existing_voice = next_voice
 
     merged = _plaintext_merge_reducer_outputs(reducer_outputs, relationship_anchor=relationship_anchor)
+    # conservative lexical backstop: drop any near-identical survivor the model missed
+    if known and isinstance(merged.get("memories"), list):
+        kept, dropped = dedup.filter_semantic_dups(merged["memories"], known)
+        if dropped:
+            merged["memories"] = kept
     # apply the REST without re-completing: memories (core already excluded), persona, voice
     service.apply_memory_outputs(store, api_key, merged)
     service.write_persona_artifact(store, job_id, merged)
