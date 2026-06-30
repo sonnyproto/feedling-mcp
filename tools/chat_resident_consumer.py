@@ -43,7 +43,9 @@ CLI mode:
                         before PATH. Useful for systemd services.
 
 Optional:
-  CHECKPOINT_FILE       Path to persist last-processed timestamp (default: /tmp/feedling_chat_checkpoint.json)
+  CHECKPOINT_FILE       Path to persist last-processed timestamp.
+                        Default is scoped by API key to avoid cross-account
+                        cursor reuse: /tmp/feedling_chat_checkpoint_<keyhash>.json
   PROACTIVE_POLL_ENABLED
                         Default true. Poll hidden proactive jobs created by
                         the proactive wake scheduler and realize them through the same agent
@@ -212,8 +214,12 @@ AGENT_HTTP_SESSION_KEY_HEADER = os.environ.get(
 AGENT_CLI_CMD = os.environ.get("AGENT_CLI_CMD", "")
 AGENT_CLI_PATH = os.environ.get("AGENT_CLI_PATH", "")
 
+CHECKPOINT_API_KEY_FINGERPRINT = hashlib.sha1(FEEDLING_API_KEY.encode()).hexdigest()[:10]
 CHECKPOINT_FILE = Path(
-    os.environ.get("CHECKPOINT_FILE", "/tmp/feedling_chat_checkpoint.json")
+    os.environ.get(
+        "CHECKPOINT_FILE",
+        f"/tmp/feedling_chat_checkpoint_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
+    )
 )
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 RESIDENT_CHAT_RUNTIME_V2_FLAG = "resident_chat_runtime_v2_enabled"
@@ -676,20 +682,62 @@ log.info(
 # Checkpoint (persist last processed message timestamp)
 # ---------------------------------------------------------------------------
 
-def _load_checkpoint_data() -> dict[str, float]:
+def _checkpoint_user_id() -> str:
+    try:
+        return str(_whoami_cache.get("user_id") or "").strip()
+    except NameError:
+        return ""
+
+
+def _empty_checkpoint_data() -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "last_ts": 0.0,
+        "last_job_ts": 0.0,
+        "api_key_fingerprint": CHECKPOINT_API_KEY_FINGERPRINT,
+    }
+    user_id = _checkpoint_user_id()
+    if user_id:
+        data["user_id"] = user_id
+    return data
+
+
+def _load_checkpoint_data() -> dict[str, Any]:
     try:
         data = json.loads(CHECKPOINT_FILE.read_text())
         if not isinstance(data, dict):
             return {}
-        return {
+        current_user_id = _checkpoint_user_id()
+        stored_user_id = str(data.get("user_id") or "").strip()
+        stored_fingerprint = str(data.get("api_key_fingerprint") or "").strip()
+        if stored_fingerprint and stored_fingerprint != CHECKPOINT_API_KEY_FINGERPRINT:
+            log.warning(
+                "checkpoint owner api key changed; resetting cursor file=%s old_key=%s new_key=%s",
+                CHECKPOINT_FILE,
+                stored_fingerprint,
+                CHECKPOINT_API_KEY_FINGERPRINT,
+            )
+            return _empty_checkpoint_data()
+        if current_user_id and stored_user_id and stored_user_id != current_user_id:
+            log.warning(
+                "checkpoint owner user changed; resetting cursor file=%s old_user=%s new_user=%s",
+                CHECKPOINT_FILE,
+                stored_user_id,
+                current_user_id,
+            )
+            return _empty_checkpoint_data()
+        result: dict[str, Any] = {
             "last_ts": float(data.get("last_ts", 0) or 0),
             "last_job_ts": float(data.get("last_job_ts", 0) or 0),
+            "api_key_fingerprint": stored_fingerprint or CHECKPOINT_API_KEY_FINGERPRINT,
         }
+        if stored_user_id or current_user_id:
+            result["user_id"] = stored_user_id or current_user_id
+        return result
     except Exception:
         return {}
 
 
-def _write_checkpoint_data(data: dict[str, float]) -> None:
+def _write_checkpoint_data(data: dict[str, Any]) -> None:
     try:
         CHECKPOINT_FILE.write_text(json.dumps(data))
     except Exception as e:
@@ -704,6 +752,10 @@ def _save_checkpoint(ts: float) -> None:
     data = _load_checkpoint_data()
     data["last_ts"] = ts
     data.setdefault("last_job_ts", 0.0)
+    data["api_key_fingerprint"] = CHECKPOINT_API_KEY_FINGERPRINT
+    user_id = _checkpoint_user_id()
+    if user_id:
+        data["user_id"] = user_id
     _write_checkpoint_data(data)
 
 
@@ -715,6 +767,10 @@ def _save_proactive_checkpoint(ts: float) -> None:
     data = _load_checkpoint_data()
     data.setdefault("last_ts", 0.0)
     data["last_job_ts"] = ts
+    data["api_key_fingerprint"] = CHECKPOINT_API_KEY_FINGERPRINT
+    user_id = _checkpoint_user_id()
+    if user_id:
+        data["user_id"] = user_id
     _write_checkpoint_data(data)
 
 

@@ -205,6 +205,55 @@ def test_process_messages_keeps_checkpoint_when_post_reply_fails():
     assert result_ts == 0.0
 
 
+def test_checkpoint_records_owner_and_resets_when_user_changes(tmp_path, monkeypatch):
+    checkpoint_file = tmp_path / "checkpoint.json"
+    monkeypatch.setattr(crc, "CHECKPOINT_FILE", checkpoint_file)
+    monkeypatch.setattr(crc, "CHECKPOINT_API_KEY_FINGERPRINT", "key-a")
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_a", "user_pk": None, "enclave_pk": None},
+    )
+
+    crc._save_checkpoint(111.0)
+    crc._save_proactive_checkpoint(222.0)
+    saved = json.loads(checkpoint_file.read_text())
+
+    assert saved["last_ts"] == pytest.approx(111.0)
+    assert saved["last_job_ts"] == pytest.approx(222.0)
+    assert saved["api_key_fingerprint"] == "key-a"
+    assert saved["user_id"] == "usr_a"
+
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_b", "user_pk": None, "enclave_pk": None},
+    )
+
+    assert crc._load_checkpoint() == 0.0
+    assert crc._load_proactive_checkpoint() == 0.0
+
+
+def test_checkpoint_resets_when_api_key_fingerprint_changes(tmp_path, monkeypatch):
+    checkpoint_file = tmp_path / "checkpoint.json"
+    checkpoint_file.write_text(json.dumps({
+        "last_ts": 333.0,
+        "last_job_ts": 444.0,
+        "api_key_fingerprint": "key-a",
+        "user_id": "usr_a",
+    }))
+    monkeypatch.setattr(crc, "CHECKPOINT_FILE", checkpoint_file)
+    monkeypatch.setattr(crc, "CHECKPOINT_API_KEY_FINGERPRINT", "key-b")
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_a", "user_pk": None, "enclave_pk": None},
+    )
+
+    assert crc._load_checkpoint() == 0.0
+    assert crc._load_proactive_checkpoint() == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Case 3: invalid API key → run() exits non-zero
 # ---------------------------------------------------------------------------

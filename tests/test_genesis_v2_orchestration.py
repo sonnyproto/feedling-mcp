@@ -102,6 +102,8 @@ def test_v2_background_lexical_backstop_drops_near_identical(monkeypatch):
                         lambda outs, **k: {"memories": outs[0]["memories"]} if outs else {"memories": []})
     monkeypatch.setattr(service, "apply_memory_outputs",
                         lambda store, api_key, merged: applied.update(memories=merged.get("memories")))
+    monkeypatch.setattr(service, "init_identity_if_absent",
+                        lambda store, merged, api_key=None: applied.update(identity_applied=True))
     monkeypatch.setattr(service, "write_persona_artifact", lambda *a, **k: ("", ""))
     monkeypatch.setattr(service, "write_voice_artifact", lambda *a, **k: ("", ""))
 
@@ -114,6 +116,7 @@ def test_v2_background_lexical_backstop_drops_near_identical(monkeypatch):
     summaries = [m["summary"] for m in applied["memories"]]
     assert "用户在杭州工作" in summaries                 # distinct kept
     assert not any("蛋子" in s for s in summaries)       # near-identical twin dropped by backstop
+    assert applied.get("identity_applied") is True       # background writes the real identity
 
 
 def test_genesis_v2_flag_gate_off_by_default(monkeypatch):
