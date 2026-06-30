@@ -1288,11 +1288,16 @@ _JSON_RUNTIME_DEBUG_FIELDS = {
 }
 
 _JSON_NON_FINAL_EVENTS = {
+    "agent_message_delta",
+    "agent_reasoning",
+    "agent_reasoning_delta",
+    "agent_reasoning_section_break",
     "debug",
     "delta",
     "log",
     "progress",
     "reasoning",
+    "reasoning_delta",
     "status",
     "stderr",
     "stdout",
@@ -1533,6 +1538,20 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
     if not isinstance(obj, dict):
         return turn
 
+    # Streaming transport events (reasoning/thinking/tool/delta/handshake) carry
+    # no user-visible reply — only their final-answer sibling does. `_reply_from_
+    # json_obj` already skips these; mirror it here so a stray reasoning event
+    # (e.g. codex 0.142 `agent_reasoning`) can never be emitted as a chat bubble.
+    marker = str(
+        obj.get("event")
+        or obj.get("type")
+        or obj.get("kind")
+        or obj.get("phase")
+        or ""
+    ).strip().lower()
+    if marker in _JSON_NON_FINAL_EVENTS:
+        return turn
+
     # Capture-lane agents are asked to return a strict {"cards": [...]} JSON
     # object. Preserve that JSON as the final text so the capture handler can
     # parse it instead of treating it as an unknown non-chat payload.
@@ -1749,27 +1768,97 @@ def _cli_error_detail(stdout: str, stderr: str) -> str:
     return (stdout or "").strip()[:300]
 
 
-def _codex_reply_from_stream(raw: str) -> str:
-    """Extract the assistant's reply from a ``codex exec --json`` event stream.
+def _codex_turn_from_stream(raw: str) -> tuple[str, str]:
+    """Split a ``codex exec --json`` event stream into (reply, reasoning_summary).
 
-    codex emits JSONL events; the agent's text rides in ``item.completed`` events
-    whose ``item.type == "agent_message"`` (text at ``item.text``) — verified
-    against codex 0.136. Everything else (thread.started/turn.* handshake,
-    reasoning, command_execution items) is skipped. Returns the agent messages
-    joined in order, or "" when the stream carries none (handshake-only / failed
-    turn) so the caller can fall back instead of leaking a handshake event.
+    codex emits JSONL events. Two protocols are seen in the wild and both are
+    handled here so the resident survives codex CLI upgrades:
+
+    - **0.136 item protocol**: ``{"type":"item.completed","item":{"type":
+      "agent_message","text":...}}`` with reasoning under ``item.type ==
+      "reasoning"``.
+    - **0.142 flat EventMsg protocol**: ``{"type":"agent_message","message":...}``
+      with reasoning under ``{"type":"agent_reasoning","text":...}``.
+
+    The assistant reply is joined in order; the reasoning summary is returned
+    SEPARATELY so the caller routes it to the collapsible thinking disclosure
+    instead of letting it leak as a chat bubble (the 0.142 regression: the old
+    reader matched nothing → the turn fell through to the generic extractor →
+    the reasoning event's ``text`` was emitted as a message). Both empty means a
+    handshake-only / failed turn so the caller can fall back without leaking.
     """
-    texts: list[str] = []
+    replies: list[str] = []
+    reasoning: list[str] = []
     for obj in _json_objects_from_cli_output(raw):
-        if not isinstance(obj, dict) or obj.get("type") != "item.completed":
+        if not isinstance(obj, dict):
             continue
-        item = obj.get("item")
-        if not isinstance(item, dict) or item.get("type") != "agent_message":
+        etype = str(obj.get("type") or "").strip()
+
+        # 0.136 item protocol: the payload is nested under `item`.
+        if etype == "item.completed":
+            item = obj.get("item")
+            if not isinstance(item, dict):
+                continue
+            itype = str(item.get("type") or "").strip()
+            text = item.get("text")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if itype == "agent_message":
+                replies.append(text.strip())
+            elif itype in {"reasoning", "agent_reasoning"}:
+                reasoning.append(text.strip())
             continue
-        text = item.get("text")
-        if isinstance(text, str) and text.strip():
-            texts.append(text.strip())
-    return "\n\n".join(texts)
+
+        # 0.142 flat EventMsg protocol: payload is the event object itself. The
+        # final answer rides `message`; reasoning summaries ride `text`. Only the
+        # consolidated `agent_reasoning` event is collected — the streaming
+        # `agent_reasoning_delta` fragments would just duplicate it.
+        if etype == "agent_message":
+            text = obj.get("message")
+            if not isinstance(text, str):
+                text = obj.get("text")
+            if isinstance(text, str) and text.strip():
+                replies.append(text.strip())
+        elif etype == "agent_reasoning":
+            text = obj.get("text")
+            if not isinstance(text, str):
+                text = obj.get("message")
+            if isinstance(text, str) and text.strip():
+                reasoning.append(text.strip())
+
+    return "\n\n".join(replies), "\n\n".join(reasoning)
+
+
+def _codex_reply_from_stream(raw: str) -> str:
+    """Back-compat shim: the assistant reply only (reasoning dropped)."""
+    return _codex_turn_from_stream(raw)[0]
+
+
+def _codex_attach_reasoning(reply: str, reasoning: str) -> str:
+    """Fold codex reasoning-summary text into the reply payload as a thinking
+    summary so the resident routes it to the collapsible disclosure instead of
+    leaking it as a chat bubble.
+
+    The reply's own JSON shape is preserved when present (a codex
+    ``agent_message`` is often an ``{"actions":[...]}`` / ``{"messages":[...]}``
+    object), so this never double-wraps actions into a bubble.
+    """
+    parsed: Any = None
+    try:
+        parsed = json.loads(reply)
+    except (json.JSONDecodeError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        payload = dict(parsed)
+    elif isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
+        payload = {"messages": parsed}
+    else:
+        payload = {"messages": [reply]}
+    payload.setdefault("thinking_summary", reasoning)
+    payload.setdefault("thinking_kind", "provider_reasoning_summary")
+    payload.setdefault("thinking_source", "codex_reasoning")
+    payload.setdefault("thinking_native", True)
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _extract_text_from_cli_output(raw: str) -> str:
@@ -2493,13 +2582,19 @@ def call_agent_cli(message: str, image_paths: list[str] | None = None, raw_text:
             f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
         )
 
-    # codex `exec --json` streams JSONL events; the assistant's text lives in
-    # `item.completed` events (item.type == "agent_message"), NOT in any field the
-    # generic extractor recognizes. Pull it from the stream before falling through
-    # (else the consumer would mis-send the `thread.started` handshake as the reply).
+    # codex `exec --json` streams JSONL events; the assistant's text and its
+    # reasoning summary live in dedicated events, NOT in any field the generic
+    # extractor recognizes. Pull both from the stream before falling through
+    # (else the consumer would mis-send the `thread.started` handshake as the
+    # reply, or — on codex 0.142 — leak the reasoning summary as a chat bubble).
     if _is_codex_cmd(cmd):
-        codex_reply = _codex_reply_from_stream(result.stdout)
+        codex_reply, codex_reasoning = _codex_turn_from_stream(result.stdout)
         if codex_reply:
+            # Background memory lanes (raw_text) parse the model's literal output
+            # with their own extractors — hand them the bare reply untouched. Only
+            # foreground chat folds reasoning into the thinking disclosure.
+            if codex_reasoning and not raw_text:
+                return _codex_attach_reasoning(codex_reply, codex_reasoning)
             return codex_reply
 
     raw = result.stdout
