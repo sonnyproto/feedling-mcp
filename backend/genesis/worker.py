@@ -629,31 +629,52 @@ def _build_reducer_output(
 
     voice_candidates: list[dict] = []
     fact_candidates: list[dict] = []
+    fact_map_attempts = 0
+    fact_map_failures = 0
     for idx, text in enumerate(chunk_texts):
         if source_family == "history":
-            voice = _complete_json(
+            try:
+                voice = _complete_json(
+                    llm,
+                    user_id=user_id,
+                    job_id=job_id,
+                    task_id=f"voice-map-{idx}",
+                    runtime=runtime,
+                    messages=prompts.voice_map_messages(text),
+                    max_tokens=1800,
+                    idempotency_key=f"{idempotency_prefix}:voice_map:{idx}",
+                )
+                voice_candidates.append(voice)
+            except (provider_client.ProviderError, GenesisWorkerError) as e:
+                # Voice is an enhancement; one chunk failing to map (after the
+                # client's own retries) shouldn't sink the whole import. Drop this
+                # chunk's voice contribution and keep going.
+                print(f"[genesis:{job_id}] voice-map-{idx} skipped: {type(e).__name__}:{str(e)[:120]}")
+        fact_map_attempts += 1
+        try:
+            facts = _complete_json(
                 llm,
                 user_id=user_id,
                 job_id=job_id,
-                task_id=f"voice-map-{idx}",
+                task_id=f"fact-map-{idx}",
                 runtime=runtime,
-                messages=prompts.voice_map_messages(text),
+                messages=prompts.fact_map_messages(_source_tagged_fact_text(source_family, text)),
                 max_tokens=1800,
-                idempotency_key=f"{idempotency_prefix}:voice_map:{idx}",
+                idempotency_key=f"{idempotency_prefix}:fact_map:{idx}",
             )
-            voice_candidates.append(voice)
-        facts = _complete_json(
-            llm,
-            user_id=user_id,
-            job_id=job_id,
-            task_id=f"fact-map-{idx}",
-            runtime=runtime,
-            messages=prompts.fact_map_messages(_source_tagged_fact_text(source_family, text)),
-            max_tokens=1800,
-            idempotency_key=f"{idempotency_prefix}:fact_map:{idx}",
-        )
-        if isinstance(facts.get("fact_candidates"), list):
-            fact_candidates.extend(item for item in facts["fact_candidates"] if isinstance(item, dict))
+            if isinstance(facts.get("fact_candidates"), list):
+                fact_candidates.extend(item for item in facts["fact_candidates"] if isinstance(item, dict))
+        except (provider_client.ProviderError, GenesisWorkerError) as e:
+            fact_map_failures += 1
+            print(f"[genesis:{job_id}] fact-map-{idx} skipped: {type(e).__name__}:{str(e)[:120]}")
+        # NB: the job's updated_at heartbeat lives in GenesisLLMClient.complete
+        # (fires on every LLM call), so it covers the reduce phase and early-return
+        # source families too — no per-chunk wiring needed here.
+    # Per-chunk tolerance has a floor: if EVERY fact-map failed, the relay is
+    # effectively unusable for this user — fail loudly so the job stays retryable
+    # rather than writing an empty/garbage memory garden from zero candidates.
+    if fact_map_attempts and fact_map_failures == fact_map_attempts:
+        raise GenesisWorkerError(f"all_fact_maps_failed:{fact_map_failures}/{fact_map_attempts}")
 
     if skip_fact_texts:
         # Genesis v2: drop the candidates the foreground already wrote as core, so the
@@ -895,6 +916,41 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
         "chunks": len(chunks),
         "applied": applied.get("applied", applied),
     }
+
+
+def _genesis_stale_sec() -> int:
+    return max(300, _env_int("FEEDLING_GENESIS_STALE_SEC", 1800))
+
+
+def reap_stale_processing_jobs() -> list[dict]:
+    """Fail genesis imports wedged in 'processing' past the stale cutoff.
+
+    Normal failures flip a job to 'failed' through mark_failed. This catches the
+    worker/plaintext daemon dying mid-LLM-call, which would otherwise leave the
+    job 'processing' forever — blocking the user's agent spawn. Goes through
+    service.mark_failed so the genesis_state blob also flips terminal. Mirrors
+    history-import's stale reaper. One bad reap doesn't stop the rest.
+    """
+    stale_sec = _genesis_stale_sec()
+    error = f"genesis_stale_timeout:{stale_sec}s"
+    reaped: list[dict] = []
+    # The DB flips status processing->failed atomically, conditional on the row
+    # being STILL processing AND STILL past the cutoff (inside the UPDATE), so we
+    # can't race a job another worker just heartbeated or completed. It returns
+    # the rows it actually flipped; we then best-effort sync each one's
+    # genesis_state blob. The job is already failed in the DB, so a blob-sync
+    # hiccup doesn't un-reap it — it still counts as reaped.
+    for job in db.genesis_reap_stale_processing_jobs(stale_sec, error=error):
+        user_id = str(job.get("user_id") or "")
+        job_id = str(job.get("job_id") or "")
+        if not user_id or not job_id:
+            continue
+        try:
+            service.write_genesis_state(get_store(user_id), job, status="failed")
+        except Exception as e:  # noqa: BLE001
+            print(f"[genesis:reaper] blob sync failed for {user_id}/{job_id}: {type(e).__name__}:{str(e)[:120]}")
+        reaped.append({"user_id": user_id, "job_id": job_id})
+    return reaped
 
 
 def tick(

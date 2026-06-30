@@ -52,6 +52,19 @@ class FakeProcTable:
 
 
 def _roster(*uids):
+    # The 0009 FK (agent_runtime_instances.user_id → users) means tick→acquire
+    # INSERTs a row that references `users`, so each hosted user must exist there.
+    # Seed a users row per roster uid — mirrors the real path where every hosted
+    # user is a registered account; without it acquire is FK-rejected and nothing
+    # spawns. (u_ghost-style deleted-account behaviour is covered in the leases
+    # tests, not here.)
+    with db.get_pool().connection() as conn:
+        for u in uids:
+            conn.execute(
+                "INSERT INTO users (user_id, created_at, doc) "
+                "VALUES (%s, '', '{}'::jsonb) ON CONFLICT (user_id) DO NOTHING",
+                (u,),
+            )
     return [{"user_id": u, "api_key": f"key-{u}"} for u in uids]
 
 

@@ -306,7 +306,7 @@ def test_send_unsupported_provider_returns_409(client, monkeypatch):
     monkeypatch.setattr(
         hosted_config_store,
         "_load_runtime_provider_config",
-        lambda store, api_key: fake_runtime,
+        lambda store, api_key, **kwargs: fake_runtime,
     )
     # _ensure_model_api_runtime_profile 在 line 355 调用，接受假 config 即可
     monkeypatch.setattr(

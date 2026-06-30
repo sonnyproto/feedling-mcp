@@ -111,3 +111,31 @@ def test_genesis_llm_client_persists_response_metadata_without_plaintext_or_api_
     assert "api_key" not in json.dumps(captured["doc"])
     assert "sk-user-secret" not in json.dumps(captured["doc"])
     assert "new text" not in json.dumps(captured["doc"])
+
+
+def test_genesis_llm_client_heartbeats_job_after_each_call(monkeypatch):
+    # Every genesis LLM call goes through complete(), so heartbeating the job here
+    # bumps updated_at across the WHOLE reducer (map AND reduce AND early-return
+    # source families), not just the map loop — closing the stale-reaper gap with
+    # no per-call-site wiring to forget.
+    from genesis import llm_client
+
+    monkeypatch.setattr(llm_client.db, "genesis_upsert_output", lambda *a, **k: None)
+    touched = []
+    monkeypatch.setattr(
+        llm_client.db, "genesis_touch_job", lambda user_id, job_id: touched.append((user_id, job_id))
+    )
+
+    def fake_completion(runtime, messages, **_kwargs):
+        return {"reply": "ok", "usage": {}}
+
+    GenesisLLMClient(completion_fn=fake_completion).complete(
+        user_id="usr",
+        job_id="job",
+        task_id="t",
+        runtime=_runtime(),
+        messages=[{"role": "user", "content": "hi"}],
+        idempotency_key="k",
+    )
+
+    assert touched == [("usr", "job")]

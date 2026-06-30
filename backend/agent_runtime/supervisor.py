@@ -930,6 +930,9 @@ def _genesis_worker_loop(*, api_url, enclave_url, mint_genesis, interval, stop_e
     from genesis import worker as genesis_worker
     while not stop_event.is_set():
         try:
+            # Reap imports wedged in 'processing' (worker/daemon died mid-run)
+            # before claiming new work, so a crashed job can't block spawn forever.
+            genesis_worker.reap_stale_processing_jobs()
             genesis_worker.tick(api_url=api_url, enclave_url=enclave_url,
                                 mint_runtime_token=mint_genesis, max_jobs=1)
         except Exception as e:  # noqa: BLE001

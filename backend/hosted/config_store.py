@@ -278,7 +278,7 @@ def _provider_config_from_plain(config: dict, api_key: str) -> provider_client.P
     return provider_client.ProviderConfig(provider=provider, model=model, api_key=api_key, base_url=base_url)
 
 
-def _load_runtime_provider_config(store: UserStore, api_key: str | None) -> provider_client.ProviderConfig | tuple[None, dict]:
+def _load_runtime_provider_config(store: UserStore, api_key: str | None, *, runtime_token: str = "") -> provider_client.ProviderConfig | tuple[None, dict]:
     config = _load_model_api_config(store)
     if not config:
         return None, {"error": "model_api_not_configured"}
@@ -287,11 +287,17 @@ def _load_runtime_provider_config(store: UserStore, api_key: str | None) -> prov
     envelope = config.get("api_key_envelope")
     if not isinstance(envelope, dict):
         return None, {"error": "model_api_key_envelope_missing"}
+    # A hosted (host-all) turn authenticates with a runtime token, not the
+    # long-term api_key — forward it so the enclave can authorize the unwrap.
+    # The enclave's /v1/envelope/decrypt accepts either credential. Only pass
+    # runtime_token through when present, so api-key callers are unchanged.
+    decrypt_kwargs = {"runtime_token": runtime_token} if runtime_token else {}
     try:
         provider_key = core_enclave._decrypt_envelope_via_enclave(
             envelope,
             api_key,
             purpose="model_api_provider_key",
+            **decrypt_kwargs,
         ).decode("utf-8")
     except Exception as e:
         return None, {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}
