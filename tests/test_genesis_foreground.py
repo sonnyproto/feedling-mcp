@@ -36,11 +36,27 @@ def test_core_capped_and_never_padded():
     assert len(fg.select_core_for_foreground(many, max_n=5)) == 5
 
 
-def test_is_low_signal_rules():
-    assert fg.is_low_signal(_c("短", bucket="未分类", importance=0.1))               # too short
-    assert fg.is_low_signal(_c("一句没长期意义的闲聊罢了", bucket="未分类", importance=0.1))  # low imp + no priority
-    assert not fg.is_low_signal(_c("我家狗叫蛋子是比熊", bucket="宠物", importance=0.1))      # priority bucket saves it
-    assert not fg.is_low_signal(_c("一段够长的durable偏好描述", bucket="偏好与边界", importance=0.5))
+def test_is_low_signal_only_excludes_degenerate():
+    # lenient by design — only too-short / empty / non-dict; ranking does the rest
+    assert fg.is_low_signal(_c("短"))                       # 1 char
+    assert fg.is_low_signal({"summary": ""})                # empty
+    assert fg.is_low_signal("not a dict")
+    assert not fg.is_low_signal(_c("一句够长的真实事实", bucket="未分类"))   # length ok → kept
+    assert not fg.is_low_signal(_c("我家狗叫蛋子是比熊", bucket="宠物"))
+
+
+def test_select_on_raw_fact_candidates_relationship_and_grounding():
+    # the REAL pre-fact-write shape from fact_map: {about, summary, evidence}
+    cands = [
+        {"about": "user", "summary": "用户最近在控制饮食戒糖", "evidence": "我在戒糖"},
+        {"about": "relationship", "summary": "我们第一次见面在图书馆", "evidence": "原来是你"},
+        {"about": "user", "summary": "用户怕香菜不能吃", "evidence": ""},          # ungrounded
+    ]
+    core = fg.select_core_for_foreground(cands, max_n=5)
+    assert core[0]["about"] == "relationship"               # relationship anchor first
+    assert len(core) == 3
+    user = [c for c in core if c["about"] == "user"]
+    assert user[0]["summary"] == "用户最近在控制饮食戒糖"     # grounded (has evidence) ranks first
 
 
 def test_greeting_material_is_light():

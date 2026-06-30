@@ -30,8 +30,17 @@ _BUCKET_PRIORITY = {
 _DEFAULT_PRIORITY = 5
 
 
-def candidate_priority(bucket: Any) -> int:
-    return _BUCKET_PRIORITY.get(str(bucket or "").strip(), _DEFAULT_PRIORITY)
+def candidate_priority(c: Mapping[str, Any]) -> int:
+    """Priority rank (lower = picked first). Works on BOTH shapes the pipeline has:
+    the pre-fact-write fact_candidate `{about, summary, evidence}` (use `about`) and
+    the post-fact-write memory `{bucket, importance, ...}` (use `bucket`)."""
+    if not isinstance(c, Mapping):
+        return _DEFAULT_PRIORITY
+    about = str(c.get("about") or "").strip().lower()
+    bucket = str(c.get("bucket") or "").strip()
+    if about == "relationship" or bucket in ("我们的关系", "Our relationship"):
+        return 0  # relationship anchor = greeting gold
+    return _BUCKET_PRIORITY.get(bucket, _DEFAULT_PRIORITY)
 
 
 def _text(c: Mapping[str, Any]) -> str:
@@ -39,30 +48,29 @@ def _text(c: Mapping[str, Any]) -> str:
 
 
 def is_low_signal(c: Mapping[str, Any], *, min_len: int = 4) -> bool:
-    """Exclude one-off / low-confidence / too-short / emotion-only-no-long-term.
-    min_len is in code points and low (Chinese facts are dense: 怕香菜 is real) — it
-    only catches degenerate 1-3 char junk; the importance/priority rule does the rest."""
-    if not isinstance(c, Mapping):
-        return True
-    if len(_text(c)) < min_len:                       # too short / no context
-        return True
-    importance = float(c.get("importance") or 0.0)
-    # low importance AND no priority bucket = not durable enough for the door set
-    if importance < 0.2 and candidate_priority(c.get("bucket")) >= _DEFAULT_PRIORITY:
-        return True
-    return False
+    """Exclude only degenerate candidates (too short / no real text). Lenient by
+    design (Codex: foreground should not hard-gate) — ranking, not exclusion, does
+    the prioritising. min_len is low in code points (Chinese facts are dense)."""
+    return not isinstance(c, Mapping) or len(_text(c)) < min_len
 
 
 def select_core_for_foreground(
     candidates: Sequence[Mapping[str, Any]], *, max_n: int = FOREGROUND_CORE_MAX,
 ) -> list[dict]:
-    """Pick up to `max_n` high-signal core memories for the open-the-door set.
+    """Pick up to `max_n` high-signal core for the open-the-door set, from the RAW
+    fact_candidates (`{about, summary, evidence}`) — i.e. select BEFORE the heavy
+    full fact_write, then fact_write only these (Codex flow).
 
-    Priority: relationship > pet/family/friend > preference/boundary >
-    health/values > goals; then importance desc. Excludes low-signal. NEVER pads —
-    `max_n` is a cap; returns fewer (even 0-1) when signal is thin (Codex)."""
+    Rank: relationship > pet/family/friend > preference/boundary > health/values >
+    goals; then grounded (has evidence) > importance (if present) > longer summary.
+    Excludes only degenerate. NEVER pads — `max_n` is a cap, returns fewer when thin."""
+    def _key(c: Mapping[str, Any]):
+        has_evidence = 1 if str(c.get("evidence") or "").strip() else 0
+        importance = float(c.get("importance") or 0.0)
+        return (candidate_priority(c), -has_evidence, -importance, -min(len(_text(c)), 200))
+
     eligible = [dict(c) for c in (candidates or []) if isinstance(c, Mapping) and not is_low_signal(c)]
-    eligible.sort(key=lambda c: (candidate_priority(c.get("bucket")), -float(c.get("importance") or 0.0)))
+    eligible.sort(key=_key)
     return eligible[: max(1, int(max_n))] if eligible else []
 
 
