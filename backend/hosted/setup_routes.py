@@ -133,10 +133,27 @@ def model_api_setup():
             "status_code": e.status_code,
         }), 400
 
+    # For openai_compatible relays, probe once whether the relay implements the
+    # OpenAI Responses API. codex speaks the Responses wire; the in-CVM LiteLLM
+    # gateway passes that straight through when the relay supports /v1/responses
+    # (preserving codex's tool loop) and otherwise forces the chat-completions
+    # bridge. We persist the answer so the supervisor picks the right transport
+    # without re-probing every tick. Only openai_compatible uses the flag.
+    supports_responses = False
+    if provider == "openai_compatible":
+        supports_responses = provider_client.probe_responses_support(
+            provider_client.ProviderConfig(provider, model, provider_key, base_url)
+        )
+        print(
+            f"[model_api:{store.user_id}] openai_compatible /responses probe -> "
+            f"supports={supports_responses} base_url={base_url}"
+        )
+
     config = hosted_config_store._save_model_api_config(store, {
         "provider": provider,
         "model": model,
         "base_url": base_url,
+        "supports_responses": supports_responses,
         "api_key_hint": api_key_hint,
         "api_key_envelope": envelope,
         "test_status": "ok",

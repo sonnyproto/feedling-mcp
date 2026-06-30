@@ -34,7 +34,7 @@ def test_apply_discovery_filters_roster_to_enabled_and_sets_driver_and_provider(
     # user can be wired native-vs-gateway at spawn).
     enabled = {"u1": {"driver": "claude", "provider": "anthropic", "model": "claude-x", "base_url": ""},
                "u2": {"driver": "codex", "provider": "openai_compatible", "model": "qwen",
-                      "base_url": "https://my.host/v1"}}
+                      "base_url": "https://my.host/v1", "supports_responses": True}}
     out = supervisor_mod._apply_discovery(roster, enabled)
     by_uid = {e["user_id"]: e for e in out}
     assert set(by_uid) == {"u1", "u2"}            # u3 dropped (not enabled)
@@ -43,6 +43,7 @@ def test_apply_discovery_filters_roster_to_enabled_and_sets_driver_and_provider(
     assert by_uid["u2"]["provider"] == "openai_compatible"  # provider stamped for transport
     assert by_uid["u2"]["model"] == "qwen"        # model stamped for gateway routing
     assert by_uid["u2"]["base_url"] == "https://my.host/v1"  # custom endpoint preserved
+    assert by_uid["u2"]["supports_responses"] is True  # /responses capability stamped for transport
     assert by_uid["u1"]["api_key"] == "k1"        # credential preserved
 
 

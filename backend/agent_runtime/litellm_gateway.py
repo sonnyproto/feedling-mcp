@@ -68,23 +68,36 @@ def litellm_model_string(provider: str, model: str) -> str:
     return f"{prefix}/{model}"
 
 
-def build_model_entry(*, user_id: str, provider: str, model: str, base_url: str = "") -> dict:
+def build_model_entry(
+    *, user_id: str, provider: str, model: str, base_url: str = "",
+    supports_responses: bool = False,
+) -> dict:
     """One LiteLLM ``model_list`` entry routing ``gw-<uid>`` to the real provider,
-    keyed by an env reference (never the plaintext upstream key)."""
+    keyed by an env reference (never the plaintext upstream key).
+
+    ``supports_responses`` (openai_compatible only) selects the transport:
+      - True  → the relay implements /v1/responses natively, so pass codex's
+        Responses request straight through (preserves the codex tool loop the
+        chat bridge mangles).
+      - False → chat-only relay; force the bridge (see below). This is the
+        default, matching the pre-detection behaviour and keeping chat-only
+        relays working."""
     params = {
         "model": litellm_model_string(provider, model),
         "api_key": "os.environ/" + upstream_env_var(user_id),
     }
     if _norm_provider(provider) == "openai_compatible":
-        # Codex 0.136 only speaks the OpenAI Responses wire (POST /v1/responses),
-        # but the third-party relays behind openai_compatible only implement
-        # /v1/chat/completions. LiteLLM treats provider=openai as natively
-        # Responses-capable (utils.get_provider_responses_api_config →
-        # OpenAIResponsesAPIConfig) and would passthrough /v1/responses → upstream
-        # 500. This first-class flag forces LiteLLM's responses→chat-completions
-        # bridge (responses/main.py `use_chat_completions_api is True`), turning
-        # codex's /v1/responses into a /chat/completions call the relay supports.
-        params["use_chat_completions_api"] = True
+        # Codex speaks the OpenAI Responses wire (POST /v1/responses) ONLY. LiteLLM
+        # treats provider=openai as natively Responses-capable (utils.get_provider_
+        # responses_api_config → OpenAIResponsesAPIConfig) and passes /v1/responses
+        # straight to the upstream. For a chat-only relay that 500s on /responses,
+        # this first-class flag forces LiteLLM's responses→chat-completions bridge
+        # (responses/main.py `use_chat_completions_api is True`), turning codex's
+        # /v1/responses into a /chat/completions call the relay supports. We set it
+        # ONLY for relays that lack /responses — forcing the bridge on a relay that
+        # DOES implement /responses breaks codex's tool loop.
+        if not supports_responses:
+            params["use_chat_completions_api"] = True
         if base_url:
             params["api_base"] = base_url
     return {"model_name": gateway_model_id(user_id), "litellm_params": params}
@@ -103,6 +116,7 @@ def build_config(entries: list[dict]) -> dict:
             build_model_entry(
                 user_id=e["user_id"], provider=e["provider"],
                 model=e.get("model") or "", base_url=e.get("base_url") or "",
+                supports_responses=bool(e.get("supports_responses", False)),
             )
             for e in entries
         ],
@@ -150,6 +164,7 @@ def config_signature(entries: list[dict]) -> str:
                 "provider": _norm_provider(e["provider"]),
                 "model": e.get("model") or "",
                 "base_url": e.get("base_url") or "",
+                "supports_responses": bool(e.get("supports_responses", False)),
             }
             for e in entries
         ),

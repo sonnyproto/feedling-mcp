@@ -568,6 +568,21 @@ def test_gateway_entries_selects_only_codex_gateway_users():
     assert gw[0]["provider_key"] == "kc"  # upstream key carried for LiteLLM env
 
 
+def test_gateway_entries_carry_supports_responses_for_bridge_choice():
+    # supports_responses must reach the gateway entry so build_config can pick
+    # native passthrough (relay has /responses) vs the chat-completions bridge.
+    roster = [
+        {"user_id": "native", "driver": "codex", "provider": "openai_compatible",
+         "model": "gpt-5.4", "base_url": "https://a/v1", "provider_key": "k",
+         "supports_responses": True},
+        {"user_id": "bridge", "driver": "codex", "provider": "openai_compatible",
+         "model": "m", "base_url": "https://b/v1", "provider_key": "k"},  # absent → False
+    ]
+    gw = {e["user_id"]: e for e in supervisor_mod._gateway_entries(roster)}
+    assert gw["native"]["supports_responses"] is True
+    assert gw["bridge"]["supports_responses"] is False
+
+
 def test_drop_gateway_users_filters_when_gateway_disabled():
     # With the gateway off, codex-gateway users must NOT be spawned (no proxy to
     # reach) — they're dropped so enabling hosted for them stays inert, not broken.

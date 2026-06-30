@@ -221,6 +221,55 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     assert any(step["id"] == "hosted_runtime" and step["passing"] for step in body["steps"])
 
 
+def test_model_api_setup_stores_responses_support_for_openai_compatible(client, monkeypatch):
+    # An openai_compatible relay is probed once at setup; the stored config records
+    # whether it implements /v1/responses, so the gateway picks native passthrough
+    # vs the chat-completions bridge (forcing the bridge on a /responses relay
+    # breaks codex's tool loop).
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(provider_client, "test_provider_key",
+                        lambda cfg: {"reply": "ok", "usage": {}})
+    probed: list = []
+
+    def fake_probe(cfg):
+        probed.append(cfg.base_url)
+        return True
+
+    monkeypatch.setattr(provider_client, "probe_responses_support", fake_probe)
+    client.post("/v1/onboarding/route", json={"route": "model_api"}, headers=_headers(api_key))
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openai_compatible", "model": "gpt-5.4",
+              "base_url": "https://relay.host/v1", "api_key": "sk-relay"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+    assert probed == ["https://relay.host/v1"]  # probed exactly the relay
+    stored = appmod.db.get_blob(user_id, "model_api")
+    assert stored["supports_responses"] is True
+
+
+def test_model_api_setup_does_not_probe_non_openai_compatible(client, monkeypatch):
+    # openai/anthropic/gemini/openrouter never use the bridge flag, so no probe.
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(provider_client, "test_provider_key",
+                        lambda cfg: {"reply": "ok", "usage": {}})
+
+    def boom(cfg):
+        raise AssertionError("probe must not run for non-openai_compatible")
+
+    monkeypatch.setattr(provider_client, "probe_responses_support", boom)
+    client.post("/v1/onboarding/route", json={"route": "model_api"}, headers=_headers(api_key))
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={"provider": "openrouter", "model": "openai/gpt-4.1-mini", "api_key": "sk-x"},
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+    stored = appmod.db.get_blob(user_id, "model_api")
+    assert stored.get("supports_responses", False) is False
+
+
 def test_model_api_memory_fallback_instruction_prioritizes_memory_over_conflicting_draft():
     msg = appmod.hosted_chat_routes._memory_fallback_instruction_message(
         "auto_readside",

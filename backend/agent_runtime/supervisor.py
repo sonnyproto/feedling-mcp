@@ -512,7 +512,8 @@ def _discover_enabled(include_gateway: bool = False) -> dict[str, dict]:
     gateway-only providers are excluded so they aren't spawned against a proxy that
     isn't there."""
     return {u["user_id"]: {"driver": u["driver"], "provider": u.get("provider", ""),
-                           "model": u.get("model", ""), "base_url": u.get("base_url", "")}
+                           "model": u.get("model", ""), "base_url": u.get("base_url", ""),
+                           "supports_responses": bool(u.get("supports_responses", False))}
             for u in db.list_agent_runtime_enabled_users(include_gateway=include_gateway)}
 
 
@@ -530,7 +531,8 @@ def _apply_discovery(roster: list[dict], enabled: dict[str, dict]) -> list[dict]
             out.append({**entry, "driver": info["driver"],
                         "provider": info.get("provider", ""),
                         "model": info.get("model", ""),
-                        "base_url": info.get("base_url", "")})
+                        "base_url": info.get("base_url", ""),
+                        "supports_responses": bool(info.get("supports_responses", False))})
     return out
 
 
@@ -599,7 +601,8 @@ def _resolve_one(uid: str, info: dict, *, mint_token, api_url: str, enclave_url:
             provider_key = cached.get("provider_key", "")
 
         entry = {"user_id": uid, "driver": info["driver"], "provider": info.get("provider", ""),
-                 "model": info.get("model", ""), "base_url": info.get("base_url", "")}
+                 "model": info.get("model", ""), "base_url": info.get("base_url", ""),
+                 "supports_responses": bool(info.get("supports_responses", False))}
         if provider_key:
             entry["provider_key"] = provider_key
         # Carry the freshly-minted runtime token so ProcessSpawner.spawn can decrypt
@@ -832,6 +835,7 @@ def _gateway_entries(roster: list[dict]) -> list[dict]:
                 "provider": e.get("provider", ""),
                 "model": e.get("model") or "",
                 "base_url": e.get("base_url") or "",
+                "supports_responses": bool(e.get("supports_responses", False)),
                 "provider_key": e.get("provider_key") or "",
             })
     return out
