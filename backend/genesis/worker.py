@@ -20,7 +20,7 @@ import httpx
 import db
 import provider_client
 from core.store import get_store
-from genesis import foreground, prompts, service
+from genesis import checkpoint, foreground, prompts, service
 from genesis.llm_client import GenesisLLMClient
 
 GENESIS_WORKER_SCOPES = ["envelope_decrypt", "genesis"]
@@ -554,6 +554,7 @@ def _build_reducer_output(
     source_kind: str = "history",
     existing_persona: dict | None = None,
     existing_voice: dict | None = None,
+    skip_fact_texts: set[str] | None = None,
 ) -> dict:
     llm = GenesisLLMClient()
     idempotency_prefix = _idempotency_prefix(job_id, key_prefix)
@@ -654,6 +655,15 @@ def _build_reducer_output(
         if isinstance(facts.get("fact_candidates"), list):
             fact_candidates.extend(item for item in facts["fact_candidates"] if isinstance(item, dict))
 
+    if skip_fact_texts:
+        # Genesis v2: drop the candidates the foreground already wrote as core, so the
+        # background reduce never re-writes them (structural dedup — foreground and
+        # background see the SAME cached candidates, so normalized text matches exactly).
+        fact_candidates = [
+            c for c in fact_candidates
+            if checkpoint.normalize_fact_text(str(c.get("summary") or c.get("content") or "")) not in skip_fact_texts
+        ]
+
     voice_final = _voice_reduce(
         llm,
         user_id=user_id,
@@ -734,6 +744,7 @@ def build_reducer_output_from_texts(
     source_kind: str = "history",
     existing_persona: dict | None = None,
     existing_voice: dict | None = None,
+    skip_fact_texts: set[str] | None = None,
 ) -> dict:
     """Public wrapper for trusted in-memory Genesis inputs.
 
@@ -750,6 +761,7 @@ def build_reducer_output_from_texts(
         source_kind=source_kind,
         existing_persona=existing_persona,
         existing_voice=existing_voice,
+        skip_fact_texts=skip_fact_texts,
     )
 
 

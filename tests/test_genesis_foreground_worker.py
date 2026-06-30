@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 import db  # noqa: E402
 import provider_client as pc  # noqa: E402
+from genesis import foreground as fg  # noqa: E402
 from genesis import worker  # noqa: E402
 from genesis.llm_client import GenesisLLMClient  # noqa: E402
 
@@ -100,3 +101,54 @@ def test_foreground_never_pads_when_signal_is_thin(monkeypatch):
     out, _ = _run(monkeypatch, max_core=5)
     assert len(out["core_fact_candidates"]) == 5
     assert all(c["summary"] for c in out["core_fact_candidates"])
+
+
+def _full_reduce_fake():
+    """Completion_fn for the FULL background reduce: handles every pass (voice_map,
+    voice_reduce, fact_map, fact_write, persona_build). Records the fact_write digests
+    so a test can assert which candidates actually got written."""
+    seen = {"fact_write_summaries": []}
+
+    def fake(runtime, messages, **kwargs):
+        system = next((m["content"] for m in messages if m["role"] == "system"), "")
+        user = next((m["content"] for m in messages if m["role"] == "user"), "")
+        if '"fact_digest"' in user:                          # fact_write
+            digest = json.loads(user)["fact_digest"]
+            seen["fact_write_summaries"].extend(d["summary"] for d in digest)
+            reply = json.dumps({"memories": [{"bucket": "未分类", "summary": d["summary"],
+                                              "content": d["summary"], "importance": 0.6} for d in digest],
+                                "identity": {"agent_name": "老 A", "dimensions": []}})
+        elif "人格" in system:                                # persona_build
+            reply = json.dumps({"content": "你是老 A。", "prompt_version": "7.B"})
+        elif "声音" in system:                                # voice_map / voice_reduce
+            reply = json.dumps({"behavior_notes": [], "exemplars": [], "voice_candidates": []})
+        else:                                                # fact_map
+            idx = 0 if "图书馆" in user else 1
+            reply = json.dumps({"fact_candidates": _FACTS[idx]})
+        return {"reply": reply, "usage": {}, "stop_reason": "stop"}
+
+    return fake, seen
+
+
+def test_background_reduce_skips_foreground_core(monkeypatch):
+    # foreground picks core -> derive skip set -> background full reduce must NOT
+    # fact_write any of those core facts again (structural dedup, Codex #1).
+    fg_out, _ = _run(monkeypatch, max_core=3)
+    skip = fg.core_skip_texts(fg_out["core_fact_candidates"])
+    assert len(skip) == 3
+    core_summaries = {c["summary"] for c in fg_out["core_fact_candidates"]}
+
+    # build_reducer_output_from_texts builds its OWN GenesisLLMClient, which falls back
+    # to provider_client.reliable_chat_completion — patch that to drive the full reduce.
+    monkeypatch.setattr(db, "genesis_upsert_output", lambda *a, **k: None)
+    import provider_client as pc
+    fake, seen = _full_reduce_fake()
+    monkeypatch.setattr(pc, "reliable_chat_completion", fake)
+    worker.build_reducer_output_from_texts(
+        user_id="u1", job_id="j1", runtime=_RUNTIME,
+        chunk_texts=["第一次见面在图书馆 ...", "戒糖 怕香菜 杭州 ..."],
+        source_kind="history", skip_fact_texts=skip,
+    )
+    written = set(seen["fact_write_summaries"])
+    assert not (written & core_summaries)                    # core never re-written
+    assert written and written <= ({c["summary"] for f in _FACTS.values() for c in f} - core_summaries)

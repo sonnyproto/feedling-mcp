@@ -74,6 +74,20 @@ def select_core_for_foreground(
     return eligible[: max(1, int(max_n))] if eligible else []
 
 
+def core_skip_texts(core_candidates: Sequence[Mapping[str, Any]] | None) -> set[str]:
+    """Normalized fact-text set for the foreground core, for the background reduce to
+    skip (worker.build_reducer_output_from_texts(skip_fact_texts=...)). Same
+    normalization both sides use, so the background's SAME cached candidates match
+    exactly and never get re-written (structural dedup, Codex #1)."""
+    out: set[str] = set()
+    for c in (core_candidates or []):
+        if isinstance(c, Mapping):
+            t = checkpoint.normalize_fact_text(_text(c))
+            if t:
+                out.add(t)
+    return out
+
+
 def build_greeting_material(
     *, identity_baseline: Mapping[str, Any] | None, core_memories: Sequence[Mapping[str, Any]] | None,
 ) -> dict:
