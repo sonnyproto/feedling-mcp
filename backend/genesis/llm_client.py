@@ -79,7 +79,10 @@ class GenesisLLMClient:
     """Thin, idempotent wrapper around provider_client.chat_completion."""
 
     def __init__(self, completion_fn: CompletionFn | None = None):
-        self._completion_fn = completion_fn or provider_client.chat_completion
+        # Genesis v2 Step 1: drive every genesis LLM call through the retry wrapper
+        # so a single cheap-relay blip (timeout / 429 / 5xx / empty) no longer kills
+        # the whole import. provider_config failures (402 / bad key) are NOT retried.
+        self._completion_fn = completion_fn or provider_client.reliable_chat_completion
 
     def complete(
         self,
