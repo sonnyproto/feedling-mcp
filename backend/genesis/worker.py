@@ -845,6 +845,37 @@ def build_foreground_output_from_texts(
     }
 
 
+def derive_identity_from_persona(
+    *,
+    user_id: str,
+    job_id: str,
+    key_prefix: str | None = None,
+    runtime: provider_client.ProviderConfig,
+    persona_content: str,
+    llm: GenesisLLMClient | None = None,
+) -> dict:
+    """Baseline identity guarantee. The reduce can come back with NO structured identity
+    (history-only upload / weak naming signal) even though a persona prose WAS generated
+    — onboarding then wedges on identity_card. This extracts agent_name/dimensions/
+    category from the GENERATED persona prose, via the SAME path an uploaded ai_persona
+    card uses (_fact_write(persona_material)). Returns the identity dict (still empty if
+    the persona truly carries no name/character — we never fabricate). One LLM call."""
+    text = str(persona_content or "").strip()
+    if not text:
+        return {}
+    llm = llm or GenesisLLMClient()
+    doc = _identity_only(_fact_write(
+        llm,
+        user_id=user_id,
+        job_id=job_id,
+        key_prefix=f"{_idempotency_prefix(job_id, key_prefix)}:persona_identity",
+        runtime=runtime,
+        fact_candidates=[],
+        persona_material=text,
+    ))
+    return doc.get("identity") if isinstance(doc.get("identity"), dict) else {}
+
+
 def _apply_reducer_output(api_url: str, runtime_token: str, job_id: str, output: dict) -> dict:
     try:
         resp = httpx.post(
