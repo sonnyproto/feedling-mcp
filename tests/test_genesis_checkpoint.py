@@ -114,3 +114,30 @@ def test_upsert_keeps_original_error_for_ops():
     assert t["error_type"] == "ProviderError"
     assert "ReadTimeout" in t["error_message"]
     assert t["error_class"] == "transient_exhausted"
+
+
+def test_candidate_id_stable_across_formatting():
+    # Codex rule #2 — same fact (different spacing/case) → same id, so foreground
+    # and background agree and dedup doesn't drift.
+    common = dict(user_id="u1", job_id="j1", source_family="history", source_pass="fact", chunk_index=2)
+    a = cp.make_candidate_id(**common, fact_text="她的狗叫蛋子")
+    b = cp.make_candidate_id(**common, fact_text="  她的狗叫蛋子  ")
+    c = cp.make_candidate_id(**common, fact_text="她的狗叫蛋子\n")
+    assert a == b == c and a.startswith("cand_")
+
+
+def test_candidate_id_differs_on_fact_and_locator():
+    common = dict(user_id="u1", job_id="j1", source_family="history", source_pass="fact")
+    base = cp.make_candidate_id(**common, chunk_index=0, fact_text="怕香菜")
+    assert base != cp.make_candidate_id(**common, chunk_index=0, fact_text="喜欢下雨")   # diff fact
+    assert base != cp.make_candidate_id(**common, chunk_index=1, fact_text="怕香菜")      # diff chunk
+    assert base != cp.make_candidate_id(user_id="u2", job_id="j1", source_family="history",
+                                        source_pass="fact", chunk_index=0, fact_text="怕香菜")  # diff user
+
+
+def test_source_ref_carries_locator_and_hash():
+    cid = cp.make_candidate_id(user_id="u1", job_id="j1", source_family="history",
+                               source_pass="fact", chunk_index=3, fact_text="去西湖")
+    ref = cp.make_source_ref(job_id="j1", source_pass="fact", chunk_index=3, candidate_id=cid)
+    assert ref.startswith("genesis:j1:fact:3:")
+    assert cid.split("_")[-1][:16] in ref

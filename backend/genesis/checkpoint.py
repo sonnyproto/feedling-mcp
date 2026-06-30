@@ -20,6 +20,7 @@ Bakes in the 4 v2 safety contracts (CC + Codex, 2026-06-30) so Step 3/4 can't
 """
 from __future__ import annotations
 
+import hashlib
 import time
 from typing import Any, Iterable, Mapping
 
@@ -28,6 +29,40 @@ CHECKPOINT_BLOB_PREFIX = "genesis_checkpoint"  # blob key = f"{prefix}:{job_id}"
 
 def checkpoint_blob_key(job_id: str) -> str:
     return f"{CHECKPOINT_BLOB_PREFIX}:{str(job_id)}"
+
+
+# --- stable candidate_id / source_ref (Codex rule #2: the dedup anchor) -------
+# THE critical dedup rule: foreground and background must derive the SAME id for
+# the SAME fact, or contract #1/#2 dedup drifts and a card gets written twice.
+# So the id is a pure hash of stable inputs and lives HERE (one place), never
+# generated ad-hoc in foreground/background. Deliberately EXCLUDES bucket / thread
+# / importance / pulse — those drift between passes; the fact text does not.
+_FACT_NORM_MAX = 280
+
+
+def normalize_fact_text(text: str, *, max_len: int = _FACT_NORM_MAX) -> str:
+    """Stable normalization for hashing: trim + lower + collapse whitespace +
+    truncate. Same fact phrased with different spacing/case → same string."""
+    return " ".join(str(text or "").split()).strip().lower()[:max_len]
+
+
+def make_candidate_id(
+    *, user_id: str, job_id: str, source_family: str, source_pass: str,
+    chunk_index: Any, fact_text: str,
+) -> str:
+    """Deterministic candidate id. Same (user, job, family, pass, chunk, fact) →
+    same id, whether foreground writes it first or background re-scans it."""
+    raw = "\x1f".join([
+        str(user_id), str(job_id), str(source_family), str(source_pass),
+        str(chunk_index), normalize_fact_text(fact_text),
+    ])
+    return "cand_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def make_source_ref(*, job_id: str, source_pass: str, chunk_index: Any, candidate_id: str) -> str:
+    """Human/ops-readable locator carrying the candidate hash; pairs with candidate_id."""
+    cand_hash = str(candidate_id or "").split("_")[-1][:16]
+    return f"genesis:{job_id}:{source_pass}:{chunk_index}:{cand_hash}"
 
 
 # --- job phase state machine -------------------------------------------------
