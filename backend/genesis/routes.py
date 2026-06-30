@@ -478,6 +478,14 @@ def _plaintext_existing_voice_from_output(output: dict) -> dict:
     }
 
 
+def _merged_has_identity(merged: dict) -> bool:
+    """True when the reduce output carries a usable Identity Card (a name or any
+    dimension). Mirrors service._identity_payload_from_output's emptiness rule."""
+    ident = merged.get("identity") if isinstance(merged.get("identity"), dict) else {}
+    dims = ident.get("dimensions") if isinstance(ident.get("dimensions"), list) else []
+    return bool(str(ident.get("agent_name") or "").strip()) or len(dims) > 0
+
+
 def _run_plaintext_genesis_v2(
     store,
     api_key: str | None,
@@ -615,9 +623,22 @@ def _run_plaintext_background_enrichment(
             merged["memories"] = kept
     # apply the REST without re-completing: memories (core already excluded), persona, voice
     service.apply_memory_outputs(store, api_key, merged)
-    # CRITICAL: apply the identity from the FULL reduce. The foreground processes only
-    # the history (user facts) so its identity baseline is usually empty — the real
-    # agent identity (name/dimensions/category) is derived here from persona/voice. For
+    # Baseline Identity Card guarantee. The reduce can return NO structured identity
+    # (history-only / weak naming signal) even with memories + a persona — then
+    # init_identity reports not_provided and onboarding wedges on identity_card. If we
+    # have a persona but no identity, derive a baseline identity from the persona prose
+    # (same extraction an uploaded character card uses) so there's always a card to write.
+    if not _merged_has_identity(merged) and isinstance(merged.get("persona"), dict):
+        persona_content = str(merged["persona"].get("content") or "").strip()
+        if persona_content:
+            baseline = worker.derive_identity_from_persona(
+                user_id=store.user_id, job_id=job_id, runtime=runtime, persona_content=persona_content,
+            )
+            if baseline.get("agent_name") or baseline.get("dimensions"):
+                merged["identity"] = baseline
+    # CRITICAL: apply the identity from the FULL reduce (or the persona-derived baseline).
+    # The foreground processes only the history (user facts) so its identity baseline is
+    # usually empty — the real agent identity (name/dimensions/category) lands here. For
     # a genesis-source identity init_identity_if_absent fills/updates it, so the home
     # stops looking blank once the background lands.
     service.init_identity_if_absent(store, merged, api_key)
