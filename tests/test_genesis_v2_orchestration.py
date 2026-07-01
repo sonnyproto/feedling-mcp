@@ -14,7 +14,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 import db  # noqa: E402
-from genesis import foreground, routes, service, worker  # noqa: E402
+from genesis import foreground, foreground_identity, routes, service, worker  # noqa: E402
+from hosted import history_import  # noqa: E402
 
 
 class _Store:
@@ -117,6 +118,71 @@ def test_v2_background_lexical_backstop_drops_near_identical(monkeypatch):
     assert "用户在杭州工作" in summaries                 # distinct kept
     assert not any("蛋子" in s for s in summaries)       # near-identical twin dropped by backstop
     assert applied.get("identity_applied") is True       # background writes the real identity
+
+
+def test_v2_foreground_writes_identity_greeting_then_completes(monkeypatch):
+    # identity-first contract (restored from legacy chat_ready): when analysis_messages
+    # exist and the deriver yields a real identity, the FOREGROUND writes identity +
+    # greeting + core, completes the job, and the background does NOT re-write identity.
+    calls = {}
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
+    monkeypatch.setattr(routes, "_plaintext_merge_reducer_outputs",
+                        lambda outs, **k: {"memories": [{"summary": "用户养了一只狗叫蛋子"}]})
+    monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **k: ({"agent_name": "小柒", "dimensions": [{"name": "温柔"}]}, []))
+    monkeypatch.setattr(service, "apply_memory_outputs",
+                        lambda store, api_key, out: (len(out.get("memories") or []), []))
+    monkeypatch.setattr(history_import, "_store_identity_payload",
+                        lambda store, payload, **k: calls.__setitem__("identity_stored", payload))
+    monkeypatch.setattr(history_import, "_generate_model_api_onboarding_greeting",
+                        lambda *a, **k: ("小柒: 好久不见呀", []))
+    monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting",
+                        lambda store, text: calls.__setitem__("greeting", text))
+    monkeypatch.setattr(db, "genesis_complete_job", lambda *a, **k: {"job_id": "job1", "status": "done"})
+    monkeypatch.setattr(service, "write_genesis_state",
+                        lambda store, job, status=None: calls.__setitem__("completed", status))
+    monkeypatch.setattr(service, "apply_reducer_output",
+                        lambda *a, **k: calls.__setitem__("used_apply_reducer", True))
+    monkeypatch.setattr(routes, "_run_plaintext_background_enrichment",
+                        lambda *a, **k: calls.__setitem__("bg_write_identity", k.get("write_identity")))
+
+    handled = routes._run_plaintext_genesis_v2(
+        _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
+        relationship_anchor={"days_with_user": 144},
+        analysis_messages=[{"role": "user", "content": "hi"}])
+
+    assert handled is True
+    assert calls["identity_stored"]["agent_name"] == "小柒"     # identity written in foreground
+    assert "小柒" in calls["greeting"]                          # greeting written in foreground
+    assert calls["completed"] == service.DONE_JOB_STATUS         # job completed after identity+greeting
+    assert calls["bg_write_identity"] is False                   # background must NOT re-write identity
+    assert "used_apply_reducer" not in calls                     # did NOT take the empty-identity fallback
+
+
+def test_v2_foreground_falls_back_when_no_identity(monkeypatch):
+    # deriver yields nothing -> fall back to the current behavior (apply_reducer_output),
+    # and the background is asked to write identity (write_identity=True).
+    calls = {}
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
+    monkeypatch.setattr(routes, "_plaintext_merge_reducer_outputs", lambda outs, **k: {"memories": []})
+    monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **k: ({"agent_name": "", "dimensions": []}, []))
+    monkeypatch.setattr(service, "apply_reducer_output",
+                        lambda *a, **k: calls.__setitem__("used_apply_reducer", True))
+    monkeypatch.setattr(routes, "_run_plaintext_background_enrichment",
+                        lambda *a, **k: calls.__setitem__("bg_write_identity", k.get("write_identity")))
+
+    routes._run_plaintext_genesis_v2(
+        _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
+        relationship_anchor={"days_with_user": 1},
+        analysis_messages=[{"role": "user", "content": "hi"}])
+
+    assert calls.get("used_apply_reducer") is True               # empty-identity fallback
+    assert calls["bg_write_identity"] is True                    # background fills identity
 
 
 def test_merged_has_identity_rule():

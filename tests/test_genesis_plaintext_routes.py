@@ -64,7 +64,7 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
     )
     monkeypatch.setattr(routes.service, "write_genesis_state", lambda *_args, **_kwargs: None)
 
-    def fake_start(_store, _api_key, job, *, chunk_texts, source_kind, source_groups=None, relationship_anchor=None):
+    def fake_start(_store, _api_key, job, *, chunk_texts, source_kind, source_groups=None, relationship_anchor=None, analysis_messages=None):
         captured["started"] = {
             "job_id": job["job_id"],
             "chunk_texts": chunk_texts,
