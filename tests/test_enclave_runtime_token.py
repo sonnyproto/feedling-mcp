@@ -86,6 +86,38 @@ def test_decrypt_rejects_when_no_credential(decrypt_client):
     assert res.status_code == 401
 
 
+def test_decrypt_verifies_runtime_token_locally_without_whoami(decrypt_client, monkeypatch):
+    """B: with the shared secret set, /v1/envelope/decrypt resolves a runtime-token
+    caller locally (HMAC) and skips the live whoami round-trip. The api_key path is
+    unaffected — it still resolves live (test_decrypt_still_forwards_api_key…)."""
+    client, forwarded = decrypt_client
+    secret, tok = _mint_live_token(user_id="usr_from_whoami")  # must match envelope owner
+    monkeypatch.setattr(enclave_app, "_RUNTIME_TOKEN_SECRET", secret, raising=False)
+    res = client.post(
+        "/v1/envelope/decrypt",
+        json={"envelope": _ENV, "purpose": "model_api_provider_key"},
+        headers={"X-Feedling-Runtime-Token": tok},
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+    assert res.get_json()["owner_user_id"] == "usr_from_whoami"
+    assert [c for c in forwarded if c["path"] == "/v1/users/whoami"] == []
+
+
+def test_decrypt_falls_back_to_live_whoami_on_bad_token(decrypt_client, monkeypatch):
+    """B: an invalid/expired runtime token falls back to the live whoami round-trip
+    (never harder-fails than today)."""
+    client, forwarded = decrypt_client
+    secret, tok = _mint_live_token(user_id="usr_from_whoami", ttl=-1.0)  # expired
+    monkeypatch.setattr(enclave_app, "_RUNTIME_TOKEN_SECRET", secret, raising=False)
+    res = client.post(
+        "/v1/envelope/decrypt",
+        json={"envelope": _ENV},
+        headers={"X-Feedling-Runtime-Token": tok},
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+    assert [c for c in forwarded if c["path"] == "/v1/users/whoami"], "expected live fallback"
+
+
 # ---- slice 2b: the cached resolver (decrypt-and-serve routes) honors tokens ----
 
 
@@ -148,6 +180,67 @@ def test_chat_history_with_runtime_token_reaches_decrypt_not_401(monkeypatch):
     enclave_app._state["ready"], enclave_app._state["error"] = prev_ready, prev_err
     assert res.status_code == 200, res.get_data(as_text=True)
     assert res.get_json().get("messages") == []
+
+
+# ---- local runtime-token verification (skip the backend whoami round-trip) ----
+#
+# The enclave shares FEEDLING_RUNTIME_TOKEN_SECRET with the backend + supervisor
+# (same TDX domain). A runtime token is a self-contained HMAC token carrying the
+# user_id claim, so when the secret is configured the enclave can verify it
+# LOCALLY and skip the /v1/users/whoami reentrant round-trip that otherwise
+# serializes the read-only decrypt-and-serve routes under cold-cache load.
+
+
+def _mint_live_token(*, user_id="u_local", ttl=900.0):
+    from core import runtime_token as rt
+    secret = b"enclave-shared-secret"
+    return secret, rt.mint(secret, user_id=user_id, runtime_instance_id="ri-1",
+                           scope=["decrypt"], ttl=ttl)
+
+
+def test_whoami_cached_verifies_runtime_token_locally_without_backend(monkeypatch):
+    """Secret configured + valid token → resolve user_id from claims, NO round-trip."""
+    secret, tok = _mint_live_token(user_id="u_local")
+    monkeypatch.setattr(enclave_app, "_RUNTIME_TOKEN_SECRET", secret, raising=False)
+    called: list[str] = []
+    monkeypatch.setattr(enclave_app, "_flask_get_headers",
+                        lambda p, h, params=None: (called.append(p), {"user_id": "u_backend"})[1])
+    monkeypatch.setattr(enclave_app, "_flask_get",
+                        lambda p, k, params=None: (called.append(p), {"user_id": "u_backend"})[1])
+    enclave_app._whoami_cache.clear()
+    with enclave_app.app.test_request_context(headers={"X-Feedling-Runtime-Token": tok}):
+        out = enclave_app._whoami_cached("")
+    assert out["user_id"] == "u_local"
+    assert called == [], "local verify must not round-trip to the backend"
+
+
+def test_whoami_cached_falls_back_to_backend_on_expired_token(monkeypatch):
+    """A token that fails local verify (expired/bad-sig) falls back to the backend
+    whoami — never harder-fails than today's round-trip."""
+    secret, tok = _mint_live_token(user_id="u_local", ttl=-1.0)  # already expired
+    monkeypatch.setattr(enclave_app, "_RUNTIME_TOKEN_SECRET", secret, raising=False)
+    called: list[str] = []
+    monkeypatch.setattr(enclave_app, "_flask_get_headers",
+                        lambda p, h, params=None: (called.append(p), {"user_id": "u_backend"})[1])
+    enclave_app._whoami_cache.clear()
+    with enclave_app.app.test_request_context(headers={"X-Feedling-Runtime-Token": tok}):
+        out = enclave_app._whoami_cached("")
+    assert out["user_id"] == "u_backend"
+    assert called == ["/v1/users/whoami"]
+
+
+def test_whoami_cached_falls_back_when_no_secret_configured(monkeypatch):
+    """No shared secret → cannot verify locally → round-trip (unchanged behavior)."""
+    _secret, tok = _mint_live_token(user_id="u_local")
+    monkeypatch.setattr(enclave_app, "_RUNTIME_TOKEN_SECRET", b"", raising=False)
+    called: list[str] = []
+    monkeypatch.setattr(enclave_app, "_flask_get_headers",
+                        lambda p, h, params=None: (called.append(p), {"user_id": "u_backend"})[1])
+    enclave_app._whoami_cache.clear()
+    with enclave_app.app.test_request_context(headers={"X-Feedling-Runtime-Token": tok}):
+        out = enclave_app._whoami_cached("")
+    assert out["user_id"] == "u_backend"
+    assert called == ["/v1/users/whoami"]
 
 
 def test_whoami_cached_api_key_path_unchanged(monkeypatch):

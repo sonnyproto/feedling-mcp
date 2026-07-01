@@ -575,7 +575,9 @@ jobs:
 
       - name: Deploy CVM via phala
         env:
-          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+          # Test env runs on a SEPARATE Phala account (amiller-user) from prod.
+          # Uses its own secret so flipping test never touches prod's key.
+          PHALA_CLOUD_API_KEY: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
           CF_ZONE_ID:          ${{ secrets.CF_ZONE_ID }}
           CF_API_TOKEN:        ${{ secrets.CF_API_TOKEN }}
           APNS_KEY_P8_B64:     ${{ secrets.APNS_KEY_P8_B64 }}
@@ -643,7 +645,9 @@ jobs:
           ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
           FEEDLING_APP_AUTH_CONTRACT: ${{ vars.TEST_FEEDLING_APP_AUTH_CONTRACT }}
           FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
-          PHALA_CLOUD_API_KEY:        ${{ secrets.PHALA_CLOUD_API_KEY }}
+          # Separate test account key (see deploy step above) — reads the live
+          # CVM's compose_hash; publish itself is signed by ETH_DEPLOYER_KEY.
+          PHALA_CLOUD_API_KEY:        ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
           FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.test.yaml
         run: |
           python3 -m pip install --upgrade pip
