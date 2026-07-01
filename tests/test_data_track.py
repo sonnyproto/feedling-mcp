@@ -358,3 +358,51 @@ def test_admin_data_track_sorts_before_pagination(client):
     assert "DAU" in html
     assert "Memory asc" in html
     assert "Proactive desc" in html
+
+
+# --- 2026-07 data-track redo: genesis-aware stage + activation funnel ---------
+# Regression guards for the fix that stopped counting genesis (bucket-based)
+# users as stuck at memory_garden. Pure-function tests on _data_track_fast_validation.
+from admin import data_track as _dt  # noqa: E402
+
+
+def _genesis_model_api_memory():
+    # Genesis writes by bucket, so the retired by_tab counters are all zero even
+    # though the garden has cards. This is exactly the shape that used to break.
+    return {"total": 7, "by_tab": {"story": 0, "about_me": 0, "ta_thinking": 0, "unknown": 7},
+            "by_source": {"genesis_import": 7}}
+
+
+def test_fast_validation_genesis_user_is_complete_despite_empty_tabs():
+    v = _dt._data_track_fast_validation(
+        route="model_api",
+        chat={"model_api_greetings": 1, "model_api_user_messages": 2, "model_api_agent_messages": 2,
+              "user_messages": 2, "agent_messages": 2},
+        memory=_genesis_model_api_memory(),
+        identity={"relationship_started_at": "2026-06-25", "relationship_anchor_evidence": "x",
+                  "relationship_anchor_source": "genesis_import", "updated_at": "2026-06-30"},
+        history_import={"has_job": True, "status": "completed", "chat_ready": True},
+        model_api_config={"test_status": "ok"},
+        consumer_state=None,
+        bootstrap_events={"by_type": {}},
+    )
+    assert v["passing"] is True
+    assert v["stage"] == "complete"
+    mg = next(s for s in v["steps"] if s["id"] == "memory_garden")
+    assert mg["passing"] is True  # cards exist -> garden satisfied (bucket-agnostic)
+
+
+def test_fast_validation_no_memories_still_blocks_memory_garden():
+    v = _dt._data_track_fast_validation(
+        route="model_api",
+        chat={},
+        memory={"total": 0, "by_tab": {}, "by_source": {}},
+        identity=None,
+        history_import={"has_job": True, "status": "processing", "chat_ready": False},
+        model_api_config={"test_status": "ok"},
+        consumer_state=None,
+        bootstrap_events={"by_type": {}},
+    )
+    assert v["passing"] is False
+    mg = next(s for s in v["steps"] if s["id"] == "memory_garden")
+    assert mg["passing"] is False  # genuinely empty garden must still flag
