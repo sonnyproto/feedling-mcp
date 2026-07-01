@@ -132,13 +132,16 @@ services:
   backend:
     image: ghcr.io/teleport-computer/feedling:df8ea61
     # gunicorn = production WSGI (the Werkzeug dev server stalls on large
-    # responses under TDX). -w N is now code-supported (leader-elected :9998 WS
-    # ingest + Postgres LISTEN/NOTIFY wake bus — see core/leader.py /
-    # core/wake_bus.py), BUT the image above is a pinned pre-patch digest that
-    # still binds :9998 at import time, so it MUST stay -w 1. Bump -w (and the ~17
-    # DB connections/worker = pool 16 + 1 listener, vs the DB's max_connections)
-    # IN THE SAME DEPLOY that rolls the image to a build containing this patch.
-    command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-w", "1", "--threads", "32", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
+    # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
+    # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
+    # the historical single-worker behavior. -w N is code-supported (leader-elected
+    # :9998 WS ingest + Postgres LISTEN/NOTIFY wake bus — see core/leader.py /
+    # core/wake_bus.py). To enable: set FEEDLING_BACKEND_WORKERS=N via the
+    # encrypted env channel IN A DEPLOY whose image contains the leader-election
+    # patch (a pre-patch image binds :9998 at import → N>1 would double-bind; the
+    # default 1 stays safe on any image). Sizing: ~18 DB conns/worker (pool 16 +
+    # 1 listener + 1 election); test RDS t4g-micro max_connections=79 → N=2 safe.
+    command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "--threads", "32", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
     restart: unless-stopped
     environment:
       FEEDLING_API_KEY: ""

@@ -58,6 +58,8 @@ from cryptography.exceptions import InvalidTag
 from io import BytesIO
 
 from flask import Flask, jsonify, Response, request, send_file
+
+from core import runtime_token as rt_token
 from flask_compress import Compress
 from dstack_sdk import DstackClient
 
@@ -100,6 +102,56 @@ ENCLAVE_TLS = os.environ.get("FEEDLING_ENCLAVE_TLS", "false").lower() == "true"
 # caller's api_key so Flask's require_user resolves to the right user's
 # ciphertext. The enclave never sees users.json directly.
 FLASK_URL = os.environ.get("FEEDLING_FLASK_URL", "http://127.0.0.1:5001")
+
+# Shared runtime-token HMAC secret (same value the backend verifies + the
+# supervisor mints with — all three live in the same TDX domain). When present,
+# the enclave verifies a caller's runtime token LOCALLY and skips the
+# /v1/users/whoami reentrant backend round-trip. Empty → fall back to the
+# round-trip (unchanged behavior). Read once at import; it is deploy-time env.
+_RUNTIME_TOKEN_SECRET = os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").encode("utf-8")
+
+# One process-wide keep-alive client for the enclave→backend hop. Every
+# decrypt-and-serve route calls back into the backend (whoami + the user's
+# ciphertext fetch); opening a fresh httpx.Client per call paid DNS+TCP+TLS
+# each time. A pooled client (thread-safe for issuing requests) reuses warm
+# connections across the 32 gthread workers. Mirrors provider_client._http_client.
+_backend_http_client: httpx.Client | None = None
+_backend_http_client_lock = threading.Lock()
+
+
+def _http_client() -> httpx.Client:
+    global _backend_http_client
+    if _backend_http_client is not None:
+        return _backend_http_client
+    with _backend_http_client_lock:
+        if _backend_http_client is None:
+            _backend_http_client = httpx.Client(
+                timeout=15,
+                limits=httpx.Limits(
+                    max_keepalive_connections=20,
+                    max_connections=100,
+                    keepalive_expiry=90.0,
+                ),
+            )
+    return _backend_http_client
+
+
+def _local_user_id_from_token(runtime_token: str) -> str | None:
+    """Verify a runtime token locally (HMAC) and return its ``user_id`` claim, or
+    ``None`` when no shared secret is configured or the token is invalid/expired.
+
+    A runtime token is a self-contained HMAC token (``core.runtime_token``) and
+    the enclave shares ``FEEDLING_RUNTIME_TOKEN_SECRET`` with the backend +
+    supervisor (same TDX domain), so it can resolve the caller here and skip the
+    reentrant ``/v1/users/whoami`` backend round-trip. Returning ``None`` lets the
+    caller fall back to the live backend resolution — never harder-fails."""
+    if not (runtime_token and _RUNTIME_TOKEN_SECRET):
+        return None
+    try:
+        claims = rt_token.verify(_RUNTIME_TOKEN_SECRET, runtime_token)
+    except rt_token.TokenError:
+        return None
+    return claims.get("user_id") or None
 
 # Screen VLM (caption route) — reads at startup; runtime re-reads os.environ
 # so a secret rotation takes effect without a restart.
@@ -516,10 +568,9 @@ def _flask_get(path: str, api_key: str, params: dict | None = None) -> dict:
 def _flask_get_headers(path: str, headers: dict, params: dict | None = None) -> dict:
     """Like ``_flask_get`` but forwarding caller-supplied auth headers verbatim
     (api_key OR runtime token) — see ``_forward_auth_headers``."""
-    with httpx.Client(timeout=15) as client:
-        r = client.get(f"{FLASK_URL}{path}", params=params, headers=headers)
-        r.raise_for_status()
-        return r.json()
+    r = _http_client().get(f"{FLASK_URL}{path}", params=params, headers=headers)
+    r.raise_for_status()
+    return r.json()
 
 
 # Short-TTL cache for api_key -> whoami. Every enclave route resolves the caller
@@ -567,6 +618,15 @@ def _whoami_cached(api_key: str) -> dict:
     the token instead of the api_key — the api-key path is unchanged.
     """
     runtime_token = _caller_runtime_token()
+    # Local fast-path: a runtime token is a self-contained HMAC token carrying the
+    # user_id claim. When the enclave shares the mint secret it verifies the token
+    # here and returns the user_id directly — skipping the /v1/users/whoami
+    # reentrant round-trip that otherwise serializes these read-only routes under
+    # cold-cache load. Any verify failure (bad sig / expired) or an unset secret
+    # falls through to the backend, so this never harder-fails than the round-trip.
+    local_uid = _local_user_id_from_token(runtime_token)
+    if local_uid:
+        return {"user_id": local_uid}
     cred = ("rt:" + runtime_token) if runtime_token else ("ak:" + api_key)
     h = hashlib.sha256(cred.encode("utf-8")).hexdigest()
     with _whoami_cache_lock:
@@ -749,27 +809,37 @@ def v1_envelope_decrypt():
     if not api_key and not runtime_token:
         return jsonify({"error": "missing_api_key"}), 401
 
-    try:
-        # Deliberately uncached: this endpoint decrypts a caller-SUPPLIED
-        # envelope, and the whoami result is the only authorization gate. A
-        # stale cache entry would keep unwrapping for a key that was just
-        # revoked / a reset account for up to the TTL, so we resolve the caller
-        # live every time. The decrypt-and-serve routes below only read the
-        # user's own stored data, so they can tolerate the cached resolver.
-        # The caller may present a runtime token instead of the api_key (Stage
-        # D); the backend whoami resolves either — the enclave just forwards it.
-        # The api-key path stays on _flask_get (unchanged); only a token request
-        # takes the header-forwarding path.
-        if runtime_token:
-            whoami = _flask_get_headers("/v1/users/whoami", _forward_auth_headers(api_key, runtime_token))
-        else:
-            whoami = _flask_get("/v1/users/whoami", api_key)
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 401:
-            return jsonify({"error": "unauthorized"}), 401
-        return jsonify({"error": f"backend_error: {e}"}), 502
-    except httpx.HTTPError as e:
-        return jsonify({"error": f"backend_error: {e}"}), 502
+    # A runtime token is a self-contained HMAC token: verify it locally (the
+    # enclave shares the mint secret) and resolve the caller WITHOUT the reentrant
+    # backend round-trip. This is still per-call (not cached) so it keeps the
+    # "resolve every request" property this sensitive route needs; the only
+    # relaxation vs. a live whoami is revocation latency, bounded by the token TTL
+    # (≤15min), an accepted tradeoff. The api_key path CANNOT be verified locally
+    # (needs the backend's pepper lookup) so it stays fully live below. Any local
+    # verify miss (bad sig / expired / no secret) also falls through to live.
+    local_uid = _local_user_id_from_token(runtime_token)
+    if local_uid:
+        whoami = {"user_id": local_uid}
+    else:
+        try:
+            # Deliberately uncached: this endpoint decrypts a caller-SUPPLIED
+            # envelope, and the whoami result is the only authorization gate. A
+            # stale cache entry would keep unwrapping for a key that was just
+            # revoked / a reset account for up to the TTL, so we resolve the caller
+            # live every time. The decrypt-and-serve routes below only read the
+            # user's own stored data, so they can tolerate the cached resolver.
+            # The api-key path stays on _flask_get; only a token request takes the
+            # header-forwarding path.
+            if runtime_token:
+                whoami = _flask_get_headers("/v1/users/whoami", _forward_auth_headers(api_key, runtime_token))
+            else:
+                whoami = _flask_get("/v1/users/whoami", api_key)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                return jsonify({"error": "unauthorized"}), 401
+            return jsonify({"error": f"backend_error: {e}"}), 502
+        except httpx.HTTPError as e:
+            return jsonify({"error": f"backend_error: {e}"}), 502
 
     authorized_user_id = whoami.get("user_id", "")
     if not authorized_user_id:
@@ -2082,6 +2152,16 @@ _content_sk_lock = threading.Lock()
 _ENCLAVE_THREADS = int(os.environ.get("FEEDLING_ENCLAVE_THREADS", 32))
 
 
+def _enclave_worker_count() -> int:
+    """gunicorn worker (process) count. Default 1 preserves the historical
+    single-worker model where the process-local whoami/content-sk caches stay
+    coherent. On a multi-vCPU CVM (prod = 8 vCPU) the decrypt crypto is GIL-bound,
+    so once the enclave→backend I/O reentrancy is out of the way, additional
+    worker PROCESSES parallelize decrypts across cores. Read from env so a deploy
+    can flip it without a code change; clamped to ≥1."""
+    return max(1, int(os.environ.get("FEEDLING_ENCLAVE_WORKERS", "1")))
+
+
 def _materialize_tls_files() -> tuple[str, str] | None:
     """Write the in-memory TLS PEM to two tmpfs files for gunicorn.
 
@@ -2147,6 +2227,27 @@ def _enclave_ssl_context(conf, default_ssl_context_factory) -> ssl.SSLContext:
     return ctx
 
 
+def _gunicorn_options(tls: tuple[str, str] | None) -> dict[str, Any]:
+    """Build the gunicorn config for the enclave WSGI server. Worker count is
+    env-driven (``FEEDLING_ENCLAVE_WORKERS``, default 1); threads/bind/timeouts
+    are the historical values. TLS certfile/keyfile flip gunicorn's is_ssl on
+    (the actual context is built by the ssl_context hook)."""
+    options: dict[str, Any] = {
+        "bind": f"0.0.0.0:{ENCLAVE_PORT}",
+        "workers": _enclave_worker_count(),
+        "worker_class": "gthread",
+        "threads": _ENCLAVE_THREADS,
+        "timeout": 120,
+        "graceful_timeout": 30,
+    }
+    if tls is not None:
+        cert_path, key_path = tls
+        options["certfile"] = cert_path
+        options["keyfile"] = key_path
+        options["ssl_context"] = _enclave_ssl_context
+    return options
+
+
 def _run_enclave_server(tls: tuple[str, str] | None) -> None:
     """Serve `app` under gunicorn's gthread worker (production WSGI).
 
@@ -2156,30 +2257,18 @@ def _run_enclave_server(tls: tuple[str, str] | None) -> None:
     entrypoint, so the command stays `python -u backend/enclave_app.py` and
     the published compose_hash is unaffected (CONTRIBUTING.md §7).
 
-    Single worker mirrors the previous single-process model exactly (the
-    process-local whoami/content-key caches stay coherent); gthread + 32
-    threads gives the production-grade concurrency the old `threaded=True`
-    provided, now on a real WSGI server with worker timeouts.
+    Worker count defaults to 1 (``FEEDLING_ENCLAVE_WORKERS``) — mirroring the
+    previous single-process model where the process-local whoami/content-key
+    caches stay coherent — and can be raised on a multi-vCPU CVM to parallelize
+    GIL-bound decrypts across processes. gthread + 32 threads gives the
+    production-grade concurrency the old `threaded=True` provided, now on a real
+    WSGI server with worker timeouts.
     """
     # Imported lazily so that `import enclave_app` in the test suite (which
     # never reaches this entrypoint) does not hard-require gunicorn.
     import gunicorn.app.base
 
-    options: dict[str, Any] = {
-        "bind": f"0.0.0.0:{ENCLAVE_PORT}",
-        "workers": 1,
-        "worker_class": "gthread",
-        "threads": _ENCLAVE_THREADS,
-        "timeout": 120,
-        "graceful_timeout": 30,
-    }
-    if tls is not None:
-        cert_path, key_path = tls
-        # certfile/keyfile flip gunicorn's is_ssl on (and satisfy its path
-        # validation); the actual context is built by the ssl_context hook.
-        options["certfile"] = cert_path
-        options["keyfile"] = key_path
-        options["ssl_context"] = _enclave_ssl_context
+    options = _gunicorn_options(tls)
 
     class _EnclaveApplication(gunicorn.app.base.BaseApplication):
         def load_config(self):
