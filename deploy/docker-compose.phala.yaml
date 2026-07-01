@@ -345,3 +345,9 @@ volumes:
     name: feedling_ingress_evidences
   feedling_agent_runtime:
     name: feedling_agent_runtime
+
+# Deploy trigger: this comment touches a path in the deploy-cvm paths-filter
+# (deploy/docker-compose.phala.yaml) so `detect-cvm-changes` sees a CVM change
+# and runs deploy-cvm. It activates the already-present worker config:
+# FEEDLING_BACKEND_WORKERS=4 / FEEDLING_ENCLAVE_WORKERS=2 + the enclave-side
+# FEEDLING_RUNTIME_TOKEN_SECRET wiring (local whoami verify). Safe no-op.
