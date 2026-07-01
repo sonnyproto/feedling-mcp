@@ -95,6 +95,21 @@ services:
       FEEDLING_DATA_DIR: "/data"
       FEEDLING_ENCLAVE_TLS: "true"
       FEEDLING_FLASK_URL: "http://backend:5001"
+      # Stage-D runtime token secret. The enclave uses it to verify a caller's
+      # runtime token LOCALLY (core/runtime_token.py) in _whoami_cached and
+      # /v1/envelope/decrypt, SKIPPING the reentrant backend /v1/users/whoami
+      # round-trip (backend/enclave_app.py, commit fdb528a). MUST match the
+      # backend's + agent-runner's secret. Empty = falls back to the backend
+      # round-trip (old behavior, no regression). Encrypted env, not baked into
+      # compose_hash. Without this line the local-verify code is dead and every
+      # host-all (runtime-token) decrypt reentrantly hits the backend.
+      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+      # gunicorn worker (process) count for the enclave (enclave_app.py
+      # _enclave_worker_count, default 1). Prod CVM is 8 vCPU so >1 parallelizes
+      # the GIL-bound envelope-decrypt crypto across processes. No :9998 bind in
+      # the enclave (that's the backend's), so N>1 is safe here. Encrypted env,
+      # not baked into compose_hash — flip via var without on-chain re-auth.
+      FEEDLING_ENCLAVE_WORKERS: "${FEEDLING_ENCLAVE_WORKERS:-2}"
       # model_api reads from the memory read-side (mirrors the test enclave).
       MEMORY_READSIDE_FOR_MODEL_API: "true"
       # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
@@ -229,10 +244,22 @@ services:
       # Legacy memory migration is opt-in. Empty = off; set to 1 only after
       # seeded Garden verification passes. Mirror agent-runner.
       FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
-      # Stage-D runtime token secret — the BACKEND verifies tokens (enclave whoami
-      # falls back here), so it MUST share the agent-runner's secret or token auth
-      # 401s. Empty = off. Encrypted env, not baked into compose_hash.
+      # Stage-D runtime token secret — the BACKEND verifies tokens (and the
+      # enclave now verifies them locally too, see the enclave service above),
+      # so it MUST share the agent-runner's secret or token auth 401s. Empty =
+      # off. Encrypted env, not baked into compose_hash.
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+      # gunicorn worker (process) count (backend/gunicorn_conf.py _worker_count,
+      # default 1). N>1 is code-supported: leader-elected :9998 WS bind
+      # (core/leader.py run_singleton, in the deployed image) + Postgres
+      # LISTEN/NOTIFY wake bus (core/wake_bus.py). Needed because each hosted
+      # resident consumer parks a /v1/chat/poll thread for up to 30s — with ~90
+      # consumers, -w1×32 threads starves and even /healthz queues 8-19s. Sizing:
+      # ~18 DB conns/worker; prod RDS max_connections=402 so 4 workers (~72) is
+      # safe. Encrypted env, not baked into compose_hash — flip via var without
+      # on-chain re-auth. Default 4 here since the deployed image has the leader
+      # patch; set to 1 if ever deploying a pre-leader-election image.
+      FEEDLING_BACKEND_WORKERS: "${FEEDLING_BACKEND_WORKERS:-4}"
     ports:
       - "5001:5001"
       - "9998:9998"
