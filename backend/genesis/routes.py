@@ -499,14 +499,19 @@ def _run_plaintext_genesis_v2(
 ) -> bool:
     """Genesis v2 foreground-fast orchestration (behind FEEDLING_GENESIS_V2_ENABLED).
 
-    Foreground: a light fact pass over the primary group -> 3-5 core memories + an
-    identity baseline -> apply + COMPLETE the job, so the app can greet immediately.
-    Background: the full reduce over every group (skipping the core the foreground
-    already wrote) -> apply the rest (memories + persona + voice) incrementally. The
-    job is already done+greetable, so a background failure NEVER fails onboarding.
+    Foreground restores the legacy chat_ready contract: pick 3-5 core memories, derive a
+    REAL Identity Card via the existing hosted deriver (foreground_identity, no new
+    prompt), write identity + relationship anchor (_store_identity_payload) + a greeting,
+    and only THEN complete the job — so the app enters with a named/anchored TA, never a
+    blank home. Background then does the heavy full reduce (rest of memories + voice +
+    persona), skipping the core and NOT re-writing identity; a background failure never
+    fails the already-greetable onboarding.
 
-    Returns True when it handled the job. Returns False only when the foreground had
-    nothing worth greeting, so the caller runs the v1 full path instead.
+    Edge: if the deriver can't produce an identity, fall back to the v1-style apply
+    (complete on core + background fills identity) — never a fake-complete.
+
+    Returns True when it handled the job. Returns False only when there's nothing to work
+    with (no core), so the caller runs the v1 full path instead.
     """
     # primary group: prefer the real chat history (best greeting signal), else the first
     fg_group = next(
@@ -530,13 +535,15 @@ def _run_plaintext_genesis_v2(
         runtime=runtime, chunk_texts=fg_chunks, source_kind=fg_kind,
     )
     core = fg_reduce.get("core_fact_candidates") or []
-    has_name = bool(str((fg_reduce.get("identity") or {}).get("agent_name") or "").strip())
-    if not core and not has_name:
-        return False  # nothing greetable -> let the v1 full path handle it
+    if not core:
+        return False  # nothing to work with -> let the v1 full path handle it
 
     fg_merged = _plaintext_merge_reducer_outputs([fg_reduce], relationship_anchor=relationship_anchor)
     core_memories = fg_merged.get("memories") or []
-    days_hint = int((relationship_anchor or {}).get("days_with_user") or 0)
+    days = int((relationship_anchor or {}).get("days_with_user") or 0)
+    # explicit relationship_started_at (user typed a date) -> honored verbatim below,
+    # per the documented priority; blank -> _store_identity_payload falls back to memory.
+    explicit_started_at = str((relationship_anchor or {}).get("relationship_started_at") or "").strip()
     msgs = analysis_messages if isinstance(analysis_messages, list) else []
     language = history_import._import_language_for_store(store, msgs)
 
@@ -547,12 +554,8 @@ def _run_plaintext_genesis_v2(
     # identity_card passes at entry. Heavy voice/persona/full-memory stay in background.
     identity_payload, _idw = foreground_identity.derive_foreground_identity(
         runtime=runtime, analysis_messages=msgs, core_memories=core_memories,
-        days_with_user=days_hint, language=language,
+        days_with_user=days, language=language,
     )
-    # Prefer the import's relationship span; fall back to the deriver's own
-    # timestamp-derived days so "相处天数" isn't 0 when the anchor lacked a span (mirrors
-    # _plaintext_merge_reducer_outputs: relationship_anchor days OR output_days).
-    days = days_hint or int((identity_payload or {}).get("days_with_user") or 0)
     identity_first = bool(msgs) and foreground_identity.has_identity_signal(identity_payload)
 
     if identity_first:
@@ -562,12 +565,18 @@ def _run_plaintext_genesis_v2(
         history_import._store_identity_payload(
             store, identity_payload, days_with_user=days,
             evidence=f"genesis_foreground:{job_id}", language=language,
+            relationship_started_at=explicit_started_at,
         )
         greeting_text, _gw = history_import._generate_model_api_onboarding_greeting(
             runtime, msgs, core_memories, identity_payload, days, language,
         )
-        if str(greeting_text or "").strip():
-            history_import._append_model_api_onboarding_greeting(store, greeting_text)
+        if not str(greeting_text or "").strip():
+            # greeting is NOT a hard gate — a flaky greeting call must not stall onboarding.
+            # Fall back to a template so hosted_chat still gets a first message.
+            greeting_text = ("好久不见，很高兴又能和你聊天。"
+                             if str(language).startswith("zh")
+                             else "Good to see you again — I'm glad we can talk.")
+        history_import._append_model_api_onboarding_greeting(store, greeting_text)
         completed = db.genesis_complete_job(
             store.user_id, job_id, output={"stage": "genesis_v2_foreground_ready"},
             memory_action_count=mem_count, identity_status="initialized",
