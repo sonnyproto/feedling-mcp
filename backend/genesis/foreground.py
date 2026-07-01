@@ -1,5 +1,13 @@
 """Genesis v2 Step 3 — foreground reducer DECISION logic (pure, unit-testable).
 
+⚠️ LIVE-USE STATUS (2026-07-01): the live foreground orchestration runs in
+routes.py::_run_plaintext_genesis_v2 (identity via foreground_identity + the legacy
+deriver, written directly). Of this module, live uses `select_core_for_foreground` /
+`candidate_priority` / `is_low_signal` / `core_skip_texts`; `mark_foreground_core_written`
+and `build_greeting_material` are NOT wired into prod — they belong to the Step-4
+checkpoint scaffolding (see checkpoint.py) and are exercised only by tests. Kept as the
+foundation, not a shipped path.
+
 The foreground's only job is the "open the door" set, NOT a small full genesis
 (Codex). This module holds the *decisions* — which candidates become core, how the
 greeting material is assembled, how the checkpoint is marked FOREGROUND_READY — as
