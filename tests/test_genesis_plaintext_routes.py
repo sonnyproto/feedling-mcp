@@ -418,3 +418,28 @@ def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(mon
     serialized = json.dumps(applied, ensure_ascii=False)
     assert "WrongUserName" not in serialized
     assert "bad user persona" not in serialized
+
+
+def test_plaintext_relationship_anchor_uses_earliest_timestamp_when_no_date():
+    # documented priority: no typed date -> earliest message timestamp (NOT blank, which
+    # previously fell through to prefer_memory and collapsed 相处天数 to 0).
+    from datetime import datetime, timezone
+
+    def _ts(s):
+        return datetime.fromisoformat(s).replace(tzinfo=timezone.utc).timestamp()
+
+    msgs = [
+        {"role": "user", "content": "a", "ts": _ts("2026-01-10T07:50")},
+        {"role": "agent", "content": "b", "ts": _ts("2026-05-01T10:00")},
+    ]
+    anchor = routes._plaintext_relationship_anchor({}, messages=msgs)  # empty payload = no typed date
+    assert anchor["relationship_started_at"] == "2026-01-10"
+    assert anchor["days_with_user"] > 0
+
+    # typed date still wins
+    anchor2 = routes._plaintext_relationship_anchor({"relationship_started_at": "2024-06-01"}, messages=msgs)
+    assert anchor2["relationship_started_at"] == "2024-06-01"
+
+    # no date + no timestamps -> blank (falls back to prefer_memory/today downstream)
+    anchor3 = routes._plaintext_relationship_anchor({}, messages=[{"role": "user", "content": "x"}])
+    assert anchor3["relationship_started_at"] == ""
