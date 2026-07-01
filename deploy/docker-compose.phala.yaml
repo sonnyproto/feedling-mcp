@@ -201,6 +201,11 @@ services:
       # flipped to "false" to revert the whole fleet. See
       # core/util.runtime_v2_default_on().
       FEEDLING_RUNTIME_V2_DEFAULT_ON: "true"
+      # Genesis v2 (foreground-fast onboarding): greet on 3-5 core + identity
+      # baseline, push the heavy reduce (the old ~37% failure surface) to the
+      # background. Validated on test; flip to "false" to revert to the v1
+      # one-shot path. Read in worker.genesis_v2_enabled().
+      FEEDLING_GENESIS_V2_ENABLED: "true"
       # Mirrors the agent-runner's FEEDLING_LITELLM_ENABLE (see
       # docker-compose.agent-runner.yaml). The hosted cutover decision lives in
       # the backend, so it needs the same flag: gateway-only providers (gemini/
