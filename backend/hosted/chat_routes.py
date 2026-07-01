@@ -20,6 +20,7 @@ from proactive.tool_executor_v2 import (
     combined_runtime_adapters_v2,
 )
 from accounts import auth
+from accounts import runtime_auth
 import provider_client
 from chat import service as chat_service
 from hosted import agent_runtime_cutover
@@ -255,6 +256,11 @@ def _memory_fallback_instruction_message(
 def model_api_chat_send():
     store = auth.require_user()
     api_key = auth._extract_api_key()
+    # Host-all turns carry a runtime token instead of the api_key; require_user
+    # already fail-closed on an invalid one, so a missing api_key here means a
+    # verified runtime token authenticated this request. Forward it so the
+    # provider-key envelope unwrap can authorize against the enclave.
+    runtime_tok = "" if api_key else (runtime_auth.extract_runtime_token() or "")
     trace_start = time.time()
     payload = request.get_json(silent=True) or {}
     image_bytes, image_mime, image_err = hosted_turn._model_api_image_payload(payload)
@@ -270,7 +276,7 @@ def model_api_chat_send():
     if len(message) > 12000:
         return jsonify({"error": "message too long", "max_chars": 12000}), 413
 
-    runtime = hosted_config_store._load_runtime_provider_config(store, api_key)
+    runtime = hosted_config_store._load_runtime_provider_config(store, api_key, runtime_token=runtime_tok)
     if isinstance(runtime, tuple):
         _, err = runtime
         hosted_config_store._append_model_api_action_trace(store, {

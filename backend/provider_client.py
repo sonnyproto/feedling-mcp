@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import random
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -12,6 +14,93 @@ class ProviderError(Exception):
     def __init__(self, message: str, *, status_code: int | None = None):
         super().__init__(message)
         self.status_code = status_code
+
+
+# --- Genesis v2 Step 1: shared retry wrapper + failure classification ---------
+# A NEW explicit wrapper. The default `chat_completion` behaviour is UNCHANGED —
+# callers opt in (genesis first; dream/capture/model_api can adopt later), so the
+# blast radius is small. Why it exists: cheap relay providers fail transiently
+# (timeout / 429 / 5xx / empty reply) across the dozens of serial LLM calls a
+# genesis import makes, and today one blip kills the whole job. Retry the
+# transient ones; NEVER retry user-config ones (402 out-of-credits / 401·403 bad
+# key / 4xx config) — those need the user to fix their provider, not us to hammer it.
+_RETRYABLE_HTTPX = (httpx.TimeoutException, httpx.TransportError)
+_RETRYABLE_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+_PROVIDER_CONFIG_STATUS = frozenset({400, 401, 402, 403, 404, 422})
+
+
+def classify_provider_error(exc: BaseException) -> str:
+    """Classify an LLM-call failure for retry decisions.
+
+    - "transient"       → retry (network/timeout, 429, 5xx, empty / no-usable / bad-json reply)
+    - "provider_config" → DON'T retry; user must fix key / credits / config
+                          (402 out of credits, 401·403 bad key, other 4xx config)
+    - "unknown"         → treat as transient but capped (better a few retries than
+                          silently giving up on an unrecognised blip)
+    """
+    if isinstance(exc, _RETRYABLE_HTTPX):
+        return "transient"
+    if isinstance(exc, ProviderError):
+        sc = exc.status_code
+        if sc in _RETRYABLE_STATUS:
+            return "transient"
+        if sc in _PROVIDER_CONFIG_STATUS:
+            return "provider_config"
+        if sc is None:
+            # No HTTP status = shape error (empty / no usable reply / bad JSON) —
+            # almost always a relay returning garbage; worth a few retries.
+            return "transient"
+        return "unknown"
+    return "unknown"
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """Best-effort 429 Retry-After (seconds) if the error carried it. (ProviderError
+    doesn't populate `.retry_after` yet — this is the hook for when it does.)"""
+    if getattr(exc, "status_code", None) != 429:
+        return None
+    raw = getattr(exc, "retry_after", None)
+    try:
+        return float(raw) if raw is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def reliable_chat_completion(
+    *args: Any,
+    max_attempts: int = 3,
+    base_delay_sec: float = 1.0,
+    max_delay_sec: float = 30.0,
+    **kwargs: Any,
+) -> Any:
+    """`chat_completion` + bounded retry on *transient* failures only.
+
+    Exponential backoff (base·3^n) + jitter, capped; honours 429 Retry-After when
+    present. NEVER retries `provider_config` failures. On final failure the raised
+    exception carries `.feedling_error_class` ("transient_exhausted" | "provider_config")
+    so the caller can label the job. Blocking sleeps — only safe off the request
+    path (genesis CVM worker). Default `chat_completion` is untouched; opt-in.
+    """
+    attempts = max(1, int(max_attempts))
+    last_exc: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return chat_completion(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 — classify, then re-raise or retry
+            cls = classify_provider_error(exc)
+            last_exc = exc
+            if cls == "provider_config" or attempt >= attempts:
+                exc.feedling_error_class = (
+                    "provider_config" if cls == "provider_config" else "transient_exhausted"
+                )
+                raise
+            delay = min(base_delay_sec * (3 ** (attempt - 1)), max_delay_sec)
+            retry_after = _retry_after_seconds(exc)
+            if retry_after is not None:
+                delay = min(max(delay, retry_after), max_delay_sec)
+            time.sleep(delay + random.uniform(0.0, 0.5 * delay))
+    assert last_exc is not None  # loop always sets it before this point
+    raise last_exc
 
 
 # Process-wide pooled HTTP client for outbound provider calls. Previously every

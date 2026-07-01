@@ -205,6 +205,55 @@ def test_process_messages_keeps_checkpoint_when_post_reply_fails():
     assert result_ts == 0.0
 
 
+def test_checkpoint_records_owner_and_resets_when_user_changes(tmp_path, monkeypatch):
+    checkpoint_file = tmp_path / "checkpoint.json"
+    monkeypatch.setattr(crc, "CHECKPOINT_FILE", checkpoint_file)
+    monkeypatch.setattr(crc, "CHECKPOINT_API_KEY_FINGERPRINT", "key-a")
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_a", "user_pk": None, "enclave_pk": None},
+    )
+
+    crc._save_checkpoint(111.0)
+    crc._save_proactive_checkpoint(222.0)
+    saved = json.loads(checkpoint_file.read_text())
+
+    assert saved["last_ts"] == pytest.approx(111.0)
+    assert saved["last_job_ts"] == pytest.approx(222.0)
+    assert saved["api_key_fingerprint"] == "key-a"
+    assert saved["user_id"] == "usr_a"
+
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_b", "user_pk": None, "enclave_pk": None},
+    )
+
+    assert crc._load_checkpoint() == 0.0
+    assert crc._load_proactive_checkpoint() == 0.0
+
+
+def test_checkpoint_resets_when_api_key_fingerprint_changes(tmp_path, monkeypatch):
+    checkpoint_file = tmp_path / "checkpoint.json"
+    checkpoint_file.write_text(json.dumps({
+        "last_ts": 333.0,
+        "last_job_ts": 444.0,
+        "api_key_fingerprint": "key-a",
+        "user_id": "usr_a",
+    }))
+    monkeypatch.setattr(crc, "CHECKPOINT_FILE", checkpoint_file)
+    monkeypatch.setattr(crc, "CHECKPOINT_API_KEY_FINGERPRINT", "key-b")
+    monkeypatch.setattr(
+        crc,
+        "_whoami_cache",
+        {"user_id": "usr_a", "user_pk": None, "enclave_pk": None},
+    )
+
+    assert crc._load_checkpoint() == 0.0
+    assert crc._load_proactive_checkpoint() == 0.0
+
+
 # ---------------------------------------------------------------------------
 # Case 3: invalid API key → run() exits non-zero
 # ---------------------------------------------------------------------------
@@ -3269,6 +3318,145 @@ def test_codex_reply_from_stream_empty_when_no_agent_message():
     # handshake-only / failed turn → "" so call_agent_cli falls back, never leaks.
     raw = '{"type":"thread.started","thread_id":"t1"}\n{"type":"turn.failed"}\n'
     assert crc._codex_reply_from_stream(raw) == ""
+
+
+# ---------------------------------------------------------------------------
+# codex 0.142.x changed `exec --json` from the 0.136 item protocol
+# ({"type":"item.completed","item":{"type":"agent_message","text":...}}) to a
+# flat EventMsg protocol ({"type":"agent_message","message":...} +
+# {"type":"agent_reasoning","text":...}). The old reader matched nothing, the
+# turn fell through to the generic extractor, and the reasoning summary leaked
+# as its own chat bubble. Verified against codex-cli 0.142.4 on the test CVM.
+# ---------------------------------------------------------------------------
+
+def test_codex_turn_from_stream_0142_flat_protocol_splits_reasoning():
+    raw = (
+        '{"type":"task_started"}\n'
+        '{"type":"agent_reasoning","text":"**Clarifying meaning**\\nThe user asked what this means; I will keep it concise."}\n'
+        '{"type":"agent_message","message":"It means hello."}\n'
+        '{"type":"task_complete"}\n'
+    )
+    reply, reasoning = crc._codex_turn_from_stream(raw)
+    assert reply == "It means hello."
+    assert "keep it concise" in reasoning
+
+
+def test_codex_turn_from_stream_0136_item_protocol_still_works():
+    raw = (
+        '{"type":"item.completed","item":{"type":"reasoning","text":"thinking…"}}\n'
+        '{"type":"item.completed","item":{"type":"agent_message","text":"final answer"}}\n'
+    )
+    reply, reasoning = crc._codex_turn_from_stream(raw)
+    assert reply == "final answer"
+    assert reasoning == "thinking…"
+
+
+def test_call_agent_cli_codex_0142_routes_reasoning_to_thinking_not_bubble(monkeypatch):
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        "codex exec --skip-git-repo-check --json --dangerously-bypass-approvals-and-sandbox {message}",
+    )
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+
+    reasoning_text = (
+        'The user has asked, "What does this mean?" but there\'s a typo, so it likely '
+        "refers to a previous message. I'm planning to keep my response concise."
+    )
+
+    class _R:
+        returncode = 0
+        stdout = (
+            '{"type":"task_started"}\n'
+            '{"type":"agent_reasoning","text":' + json.dumps(reasoning_text) + "}\n"
+            '{"type":"agent_message","message":"It means hello."}\n'
+            '{"type":"task_complete"}\n'
+        )
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    raw = crc.call_agent_cli("hi")
+    turn = crc._agent_turn_from_raw(raw)
+    # The real reply is the only chat bubble; reasoning never leaks as a message.
+    assert turn.messages == ["It means hello."]
+    assert reasoning_text not in turn.messages
+    # Reasoning rides the thinking disclosure instead.
+    assert turn.thinking_summary
+    assert "previous message" in turn.thinking_summary or "concise" in turn.thinking_summary
+
+
+def test_call_agent_cli_codex_actions_reply_preserved_with_reasoning(monkeypatch):
+    """A codex agent_message that is itself an actions JSON keeps its actions
+    while reasoning is folded into the thinking summary (no bubble leak)."""
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        "codex exec --skip-git-repo-check --json --dangerously-bypass-approvals-and-sandbox {message}",
+    )
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+
+    actions_msg = '{"actions":[{"type":"proactive.sleep","reason":"broadcast off"}]}'
+
+    class _R:
+        returncode = 0
+        stdout = (
+            '{"type":"agent_reasoning","text":"deciding whether to check in"}\n'
+            '{"type":"agent_message","message":' + json.dumps(actions_msg) + "}\n"
+        )
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    raw = crc.call_agent_cli("hi")
+    turn = crc._agent_turn_from_raw(raw)
+    assert turn.actions == [{"type": "proactive.sleep", "reason": "broadcast off"}]
+    assert turn.messages == []
+    assert turn.thinking_summary
+
+
+def test_call_agent_cli_codex_raw_text_lane_returns_literal_reply(monkeypatch):
+    """Background memory lanes (raw_text=True) parse the model's literal JSON
+    with their own extractors; reasoning must NOT rewrap their output."""
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        "codex exec --skip-git-repo-check --json --dangerously-bypass-approvals-and-sandbox {message}",
+    )
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+
+    cards_json = '{"cards":[{"title":"x"}]}'
+
+    class _R:
+        returncode = 0
+        stdout = (
+            '{"type":"agent_reasoning","text":"deciding what to remember"}\n'
+            '{"type":"agent_message","message":' + json.dumps(cards_json) + "}\n"
+        )
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    out = crc.call_agent_cli("hi", raw_text=True)
+    assert out == cards_json
+
+
+def test_agent_turn_skips_codex_reasoning_event_as_non_final():
+    """Defense in depth: even if a raw codex reasoning event reaches the generic
+    extractor, it must not be emitted as a chat bubble."""
+    raw = '{"type":"agent_reasoning","text":"internal planning the user should never see"}'
+    turn = crc._split_agent_turn(raw)
+    assert turn.messages == []
+
+
+def test_agent_turn_keeps_codex_agent_message_flat_event():
+    """The flat agent_message event is still a real reply (not skipped)."""
+    raw = '{"type":"agent_message","message":"你好"}'
+    turn = crc._split_agent_turn(raw)
+    assert turn.messages == ["你好"]
 
 
 def test_openai_http_tool_only_response_preserved(monkeypatch):

@@ -922,6 +922,58 @@ def genesis_claim_uploaded_jobs(*, limit: int = 1) -> list[dict]:
     return out
 
 
+def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit: int = 50) -> list[dict]:
+    """Atomically fail genesis jobs wedged in 'processing' past a staleness cutoff.
+
+    A normal failure flips a job to 'failed' via the service layer. But if the
+    worker/plaintext daemon crashes or is killed mid-LLM-call, the job stays
+    'processing' forever — the worker only re-claims 'uploaded' jobs, so nothing
+    ever fails it, and that blocks the user's agent spawn.
+
+    The status='processing' AND cutoff checks live INSIDE the UPDATE (with
+    FOR UPDATE SKIP LOCKED), so a row another worker has since heartbeated
+    (updated_at bumped past the cutoff) or completed is not selected and not
+    touched — no list→fail TOCTOU race with live/finished imports under multiple
+    workers. A live reducer heartbeats updated_at per chunk via genesis_touch_job,
+    so a genuinely-progressing job is never older than the cutoff. Returns the
+    rows actually flipped so the caller can sync their genesis_state blobs.
+    """
+    safe_sec = max(60, int(older_than_sec or 0))
+    safe_limit = max(1, min(int(limit or 1), 200))
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            WITH picked AS (
+                SELECT user_id, job_id
+                FROM genesis_import_jobs
+                WHERE status = 'processing'
+                  AND updated_at < now() - make_interval(secs => %s)
+                ORDER BY updated_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE genesis_import_jobs AS j SET
+                status = 'failed',
+                error = %s,
+                updated_at = now()
+            FROM picked
+            WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
+            RETURNING j.*
+            """,
+            (safe_sec, safe_limit, error[:1000]),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        out.append(item)
+    return out
+
+
 def genesis_put_chunk(
     user_id: str,
     job_id: str,
@@ -1090,6 +1142,20 @@ def genesis_set_job_status(
             ),
         )
         return _genesis_row(cur, cur.fetchone())
+
+
+def genesis_touch_job(user_id: str, job_id: str) -> None:
+    """Heartbeat: bump updated_at for a processing genesis job so the stale
+    reaper can tell a live long import from a worker that died mid-run. No-op
+    unless the job is currently 'processing'."""
+    with get_pool().connection() as conn:
+        conn.execute(
+            """
+            UPDATE genesis_import_jobs SET updated_at = now()
+            WHERE user_id = %s AND job_id = %s AND status = 'processing'
+            """,
+            (user_id, job_id),
+        )
 
 
 def genesis_upsert_output(

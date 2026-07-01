@@ -21,6 +21,17 @@ T0 = 1_000_000.0  # fixed epoch base so TTL math is deterministic
 def _clean_table():
     with db.get_pool().connection() as conn:
         conn.execute("TRUNCATE agent_runtime_instances")
+        # The 0009 FK requires the user to exist in `users`. These tests model
+        # the real path where acquire's user is a registered account, so seed a
+        # users row for the ids they use. ``u_ghost`` is deliberately NOT seeded
+        # — it stands in for an account deleted out from under the supervisor,
+        # exercising the FK-guarded race path.
+        for uid in ("u_1", "u_2", "u_3"):
+            conn.execute(
+                "INSERT INTO users (user_id, created_at, doc) "
+                "VALUES (%s, '', '{}'::jsonb) ON CONFLICT (user_id) DO NOTHING",
+                (uid,),
+            )
     yield
 
 
@@ -225,3 +236,27 @@ def test_list_active_returns_only_live_leases():
     assert ids == set()  # both expired at T0+350 (ttl 300)
     active2 = leases.list_active(now=T0 + 100, lease_owner="sup_A")
     assert {r["user_id"] for r in active2} == {"u_1", "u_2"}
+
+
+def test_acquire_skips_user_absent_from_users_table():
+    """删号 race 守卫：对一个 users 表里不存在的 user_id（账号已被 reset 删掉），
+    acquire 必须拒绝并且 **不创建** instance 行。否则一个用「删号前快照的 roster」
+    跑到一半的 supervisor tick 会 INSERT ON CONFLICT 重建该行、spawn 一个已删账号
+    的 consumer，进程因账号不存在立刻死，留下 idle 孤儿（prod 上累积的那批僵尸行）。
+    FK agent_runtime_instances.user_id → users(user_id) 让这次 INSERT 被拒。"""
+    ok = leases.acquire("u_ghost", driver="claude", runtime_home="/d/ghost",
+                        lease_owner="sup_A", ttl=300.0, now=T0)
+    assert ok is False
+    assert leases.get("u_ghost") is None
+
+
+def test_deleting_users_row_cascades_instance_away():
+    """FK ON DELETE CASCADE：删掉 users 行(账号 reset 的 delete_user 步骤)必须
+    连带删掉它的 instance 行。加 FK 之前删 users 不级联 —— 正是 prod 上 delete_user
+    清了账号、instance 行却残留成 idle 孤儿的另一半成因。"""
+    leases.acquire("u_1", driver="claude", runtime_home="/d/u_1",
+                   lease_owner="sup_A", ttl=300.0, now=T0)
+    assert leases.get("u_1") is not None
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM users WHERE user_id = %s", ("u_1",))
+    assert leases.get("u_1") is None

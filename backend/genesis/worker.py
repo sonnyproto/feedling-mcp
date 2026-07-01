@@ -20,7 +20,7 @@ import httpx
 import db
 import provider_client
 from core.store import get_store
-from genesis import prompts, service
+from genesis import checkpoint, foreground, prompts, service
 from genesis.llm_client import GenesisLLMClient
 
 GENESIS_WORKER_SCOPES = ["envelope_decrypt", "genesis"]
@@ -500,6 +500,7 @@ def _fact_write(
     fact_candidates: list[dict],
     persona_material: str = "",
     memory_summary: str = "",
+    known_memories: list[str] | None = None,
 ) -> dict:
     if not fact_candidates and not persona_material and not memory_summary:
         return {"memories": [], "identity": {"agent_name": "", "dimensions": []}}
@@ -513,7 +514,7 @@ def _fact_write(
             job_id=job_id,
             task_id=f"fact-write-{idx}",
             runtime=runtime,
-            messages=prompts.fact_write_messages(batch, persona_material, memory_summary),
+            messages=prompts.fact_write_messages(batch, persona_material, memory_summary, known_memories),
             max_tokens=4000,
             idempotency_key=f"{idempotency_prefix}:fact_write:{idx}",
         ))
@@ -554,6 +555,8 @@ def _build_reducer_output(
     source_kind: str = "history",
     existing_persona: dict | None = None,
     existing_voice: dict | None = None,
+    skip_fact_texts: set[str] | None = None,
+    known_memories: list[str] | None = None,
 ) -> dict:
     llm = GenesisLLMClient()
     idempotency_prefix = _idempotency_prefix(job_id, key_prefix)
@@ -628,31 +631,61 @@ def _build_reducer_output(
 
     voice_candidates: list[dict] = []
     fact_candidates: list[dict] = []
+    fact_map_attempts = 0
+    fact_map_failures = 0
     for idx, text in enumerate(chunk_texts):
         if source_family == "history":
-            voice = _complete_json(
+            try:
+                voice = _complete_json(
+                    llm,
+                    user_id=user_id,
+                    job_id=job_id,
+                    task_id=f"voice-map-{idx}",
+                    runtime=runtime,
+                    messages=prompts.voice_map_messages(text),
+                    max_tokens=1800,
+                    idempotency_key=f"{idempotency_prefix}:voice_map:{idx}",
+                )
+                voice_candidates.append(voice)
+            except (provider_client.ProviderError, GenesisWorkerError) as e:
+                # Voice is an enhancement; one chunk failing to map (after the
+                # client's own retries) shouldn't sink the whole import. Drop this
+                # chunk's voice contribution and keep going.
+                print(f"[genesis:{job_id}] voice-map-{idx} skipped: {type(e).__name__}:{str(e)[:120]}")
+        fact_map_attempts += 1
+        try:
+            facts = _complete_json(
                 llm,
                 user_id=user_id,
                 job_id=job_id,
-                task_id=f"voice-map-{idx}",
+                task_id=f"fact-map-{idx}",
                 runtime=runtime,
-                messages=prompts.voice_map_messages(text),
+                messages=prompts.fact_map_messages(_source_tagged_fact_text(source_family, text)),
                 max_tokens=1800,
-                idempotency_key=f"{idempotency_prefix}:voice_map:{idx}",
+                idempotency_key=f"{idempotency_prefix}:fact_map:{idx}",
             )
-            voice_candidates.append(voice)
-        facts = _complete_json(
-            llm,
-            user_id=user_id,
-            job_id=job_id,
-            task_id=f"fact-map-{idx}",
-            runtime=runtime,
-            messages=prompts.fact_map_messages(_source_tagged_fact_text(source_family, text)),
-            max_tokens=1800,
-            idempotency_key=f"{idempotency_prefix}:fact_map:{idx}",
-        )
-        if isinstance(facts.get("fact_candidates"), list):
-            fact_candidates.extend(item for item in facts["fact_candidates"] if isinstance(item, dict))
+            if isinstance(facts.get("fact_candidates"), list):
+                fact_candidates.extend(item for item in facts["fact_candidates"] if isinstance(item, dict))
+        except (provider_client.ProviderError, GenesisWorkerError) as e:
+            fact_map_failures += 1
+            print(f"[genesis:{job_id}] fact-map-{idx} skipped: {type(e).__name__}:{str(e)[:120]}")
+        # NB: the job's updated_at heartbeat lives in GenesisLLMClient.complete
+        # (fires on every LLM call), so it covers the reduce phase and early-return
+        # source families too — no per-chunk wiring needed here.
+    # Per-chunk tolerance has a floor: if EVERY fact-map failed, the relay is
+    # effectively unusable for this user — fail loudly so the job stays retryable
+    # rather than writing an empty/garbage memory garden from zero candidates.
+    if fact_map_attempts and fact_map_failures == fact_map_attempts:
+        raise GenesisWorkerError(f"all_fact_maps_failed:{fact_map_failures}/{fact_map_attempts}")
+
+    if skip_fact_texts:
+        # Genesis v2: drop the candidates the foreground already wrote as core, so the
+        # background reduce never re-writes them (structural dedup — foreground and
+        # background see the SAME cached candidates, so normalized text matches exactly).
+        fact_candidates = [
+            c for c in fact_candidates
+            if checkpoint.normalize_fact_text(str(c.get("summary") or c.get("content") or "")) not in skip_fact_texts
+        ]
 
     voice_final = _voice_reduce(
         llm,
@@ -679,6 +712,7 @@ def _build_reducer_output(
         key_prefix=idempotency_prefix,
         runtime=runtime,
         fact_candidates=fact_candidates,
+        known_memories=known_memories,   # genesis v2: foreground core -> "已保存,勿重复"
     )
     if source_family == "user_profile":
         fact_write = _strip_identity(fact_write)
@@ -734,6 +768,8 @@ def build_reducer_output_from_texts(
     source_kind: str = "history",
     existing_persona: dict | None = None,
     existing_voice: dict | None = None,
+    skip_fact_texts: set[str] | None = None,
+    known_memories: list[str] | None = None,
 ) -> dict:
     """Public wrapper for trusted in-memory Genesis inputs.
 
@@ -750,7 +786,115 @@ def build_reducer_output_from_texts(
         source_kind=source_kind,
         existing_persona=existing_persona,
         existing_voice=existing_voice,
+        skip_fact_texts=skip_fact_texts,
+        known_memories=known_memories,
     )
+
+
+def genesis_v2_enabled() -> bool:
+    """Genesis v2 (foreground-fast) runs ONLY when FEEDLING_GENESIS_V2_ENABLED is
+    truthy. Default OFF — the existing one-shot path stays byte-for-byte the
+    fallback. Flip on (test first), flip off + restart to revert instantly, no
+    deploy. This is the single gate the whole v2 main-path change hangs off of."""
+    return str(os.environ.get("FEEDLING_GENESIS_V2_ENABLED", "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def build_foreground_output_from_texts(
+    *,
+    user_id: str,
+    job_id: str,
+    key_prefix: str | None = None,
+    runtime: provider_client.ProviderConfig,
+    chunk_texts: list[str],
+    source_kind: str = "history",
+    foreground_core_max: int = foreground.FOREGROUND_CORE_MAX,
+    llm: GenesisLLMClient | None = None,
+) -> dict:
+    """Genesis v2 FOREGROUND — the light "open the door" pass (Codex flow).
+
+    fact_map over every chunk ONCE -> pick 3-5 core fact_candidates -> fact_write
+    ONLY those -> identity baseline. Deliberately NO voice_map/voice_reduce/persona
+    /full fact_write: those are the background's job. The returned dict carries the
+    SAME full fact_candidate list + the chosen core so the background partitions
+    against them (one extraction, shared candidates — never a second, divergent run).
+
+    Cache discipline: fact_map uses the SAME idempotency prefix as the background
+    reduce, so the two SHARE the cached extraction. fact_write uses a distinct
+    `:fg` prefix, so the foreground's core write never collides with the
+    background's fact_write batches.
+    """
+    llm = llm or GenesisLLMClient()
+    source_family = _source_family(source_kind)
+    shared_prefix = _idempotency_prefix(job_id, key_prefix)   # shared with background
+    fg_write_prefix = f"{shared_prefix}:fg"                   # distinct fact_write namespace
+
+    fact_candidates: list[dict] = []
+    for idx, text in enumerate(chunk_texts):
+        facts = _complete_json(
+            llm,
+            user_id=user_id,
+            job_id=job_id,
+            task_id=f"fact-map-{idx}",
+            runtime=runtime,
+            messages=prompts.fact_map_messages(_source_tagged_fact_text(source_family, text)),
+            max_tokens=1800,
+            idempotency_key=f"{shared_prefix}:fact_map:{idx}",   # SAME key as background -> cache shared
+        )
+        if isinstance(facts.get("fact_candidates"), list):
+            fact_candidates.extend(item for item in facts["fact_candidates"] if isinstance(item, dict))
+
+    core = foreground.select_core_for_foreground(fact_candidates, max_n=foreground_core_max)
+    fact_write = _fact_write(
+        llm,
+        user_id=user_id,
+        job_id=job_id,
+        key_prefix=fg_write_prefix,   # distinct -> never collides with background fact_write
+        runtime=runtime,
+        fact_candidates=core,
+    )
+    return {
+        "memories": fact_write.get("memories") or [],
+        "identity": fact_write.get("identity") or {"agent_name": "", "dimensions": []},
+        "source_kind": source_kind,
+        "source_family": source_family,
+        "foreground": True,
+        # handed to the background so it writes only the rest (structural dedup, Codex #1)
+        "all_fact_candidates": fact_candidates,
+        "core_fact_candidates": core,
+    }
+
+
+def derive_identity_from_persona(
+    *,
+    user_id: str,
+    job_id: str,
+    key_prefix: str | None = None,
+    runtime: provider_client.ProviderConfig,
+    persona_content: str,
+    llm: GenesisLLMClient | None = None,
+) -> dict:
+    """Baseline identity guarantee. The reduce can come back with NO structured identity
+    (history-only upload / weak naming signal) even though a persona prose WAS generated
+    — onboarding then wedges on identity_card. This extracts agent_name/dimensions/
+    category from the GENERATED persona prose, via the SAME path an uploaded ai_persona
+    card uses (_fact_write(persona_material)). Returns the identity dict (still empty if
+    the persona truly carries no name/character — we never fabricate). One LLM call."""
+    text = str(persona_content or "").strip()
+    if not text:
+        return {}
+    llm = llm or GenesisLLMClient()
+    doc = _identity_only(_fact_write(
+        llm,
+        user_id=user_id,
+        job_id=job_id,
+        key_prefix=f"{_idempotency_prefix(job_id, key_prefix)}:persona_identity",
+        runtime=runtime,
+        fact_candidates=[],
+        persona_material=text,
+    ))
+    return doc.get("identity") if isinstance(doc.get("identity"), dict) else {}
 
 
 def _apply_reducer_output(api_url: str, runtime_token: str, job_id: str, output: dict) -> dict:
@@ -808,6 +952,41 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
         "chunks": len(chunks),
         "applied": applied.get("applied", applied),
     }
+
+
+def _genesis_stale_sec() -> int:
+    return max(300, _env_int("FEEDLING_GENESIS_STALE_SEC", 1800))
+
+
+def reap_stale_processing_jobs() -> list[dict]:
+    """Fail genesis imports wedged in 'processing' past the stale cutoff.
+
+    Normal failures flip a job to 'failed' through mark_failed. This catches the
+    worker/plaintext daemon dying mid-LLM-call, which would otherwise leave the
+    job 'processing' forever — blocking the user's agent spawn. Goes through
+    service.mark_failed so the genesis_state blob also flips terminal. Mirrors
+    history-import's stale reaper. One bad reap doesn't stop the rest.
+    """
+    stale_sec = _genesis_stale_sec()
+    error = f"genesis_stale_timeout:{stale_sec}s"
+    reaped: list[dict] = []
+    # The DB flips status processing->failed atomically, conditional on the row
+    # being STILL processing AND STILL past the cutoff (inside the UPDATE), so we
+    # can't race a job another worker just heartbeated or completed. It returns
+    # the rows it actually flipped; we then best-effort sync each one's
+    # genesis_state blob. The job is already failed in the DB, so a blob-sync
+    # hiccup doesn't un-reap it — it still counts as reaped.
+    for job in db.genesis_reap_stale_processing_jobs(stale_sec, error=error):
+        user_id = str(job.get("user_id") or "")
+        job_id = str(job.get("job_id") or "")
+        if not user_id or not job_id:
+            continue
+        try:
+            service.write_genesis_state(get_store(user_id), job, status="failed")
+        except Exception as e:  # noqa: BLE001
+            print(f"[genesis:reaper] blob sync failed for {user_id}/{job_id}: {type(e).__name__}:{str(e)[:120]}")
+        reaped.append({"user_id": user_id, "job_id": job_id})
+    return reaped
 
 
 def tick(

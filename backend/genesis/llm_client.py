@@ -79,7 +79,10 @@ class GenesisLLMClient:
     """Thin, idempotent wrapper around provider_client.chat_completion."""
 
     def __init__(self, completion_fn: CompletionFn | None = None):
-        self._completion_fn = completion_fn or provider_client.chat_completion
+        # Genesis v2 Step 1: drive every genesis LLM call through the retry wrapper
+        # so a single cheap-relay blip (timeout / 429 / 5xx / empty) no longer kills
+        # the whole import. provider_config failures (402 / bad key) are NOT retried.
+        self._completion_fn = completion_fn or provider_client.reliable_chat_completion
 
     def complete(
         self,
@@ -101,6 +104,10 @@ class GenesisLLMClient:
         output_type = _safe_output_type(idempotency_key)
 
         capped_max_tokens = min(max_tokens, _max_tokens_per_call())
+        # Retry/backoff lives in provider_client.reliable_chat_completion (the
+        # default completion_fn): transient blips (timeout/429/5xx/empty) retry
+        # there, provider_config (402/401) don't. Do NOT add a second retry layer
+        # here — it would multiply one blip into N×M upstream calls.
         with _user_slot(user_id):
             result = self._completion_fn(
                 runtime,
@@ -130,6 +137,16 @@ class GenesisLLMClient:
             "usage": usage,
         }
         db.genesis_upsert_output(user_id, job_id, output_type, doc=doc, status="done", ref=output_type)
+        # Heartbeat the job after every LLM call. Every genesis LLM call funnels
+        # through here, so this bumps updated_at across the whole reducer — map,
+        # reduce, and the early-return source families alike — letting the stale
+        # reaper tell a live long import from a worker that died mid-run, with no
+        # per-call-site wiring to forget. Best-effort: a heartbeat blip is harmless
+        # (the next call re-touches) and must never fail the LLM call.
+        try:
+            db.genesis_touch_job(user_id, job_id)
+        except Exception:  # noqa: BLE001
+            pass
         return GenesisLLMResult(
             text=text,
             usage=usage,

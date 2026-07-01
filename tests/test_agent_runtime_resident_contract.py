@@ -12,6 +12,7 @@ logs a startup line, so importing it in-process would pollute the suite. Pure
 unit (no Postgres) — the child only renders argv, it never hits network/DB.
 """
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -137,6 +138,27 @@ _AUTH_CHILD = textwrap.dedent(
     """
 )
 
+_DEFAULT_CHECKPOINT_CHILD = textwrap.dedent(
+    """
+    import json, os, sys, importlib.util
+    from pathlib import Path
+
+    repo = Path(sys.argv[1])
+    api_key = sys.argv[2]
+    os.environ["FEEDLING_API_URL"] = "http://localhost:5001"
+    os.environ["FEEDLING_API_KEY"] = api_key
+    os.environ["AGENT_MODE"] = "http"
+    os.environ["AGENT_HTTP_URL"] = "http://localhost:8080/chat"
+    os.environ.pop("CHECKPOINT_FILE", None)
+    sys.path.insert(0, str(repo))
+    sys.path.insert(0, str(repo / "backend"))
+
+    spec = importlib.util.spec_from_file_location("resident", str(repo / "tools" / "chat_resident_consumer.py"))
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    print(json.dumps({"checkpoint": str(m.CHECKPOINT_FILE)}))
+    """
+)
+
 
 def _run_auth_child(tmp_path, token: str) -> dict:
     proc = subprocess.run(
@@ -174,6 +196,30 @@ def test_consumer_keeps_api_key_when_no_token_file(tmp_path):
     headers = _run_auth_child(tmp_path, "")
     assert headers.get("X-API-Key") == "k-longterm"
     assert "X-Feedling-Runtime-Token" not in headers
+
+
+def test_default_checkpoint_file_is_scoped_by_api_key():
+    key_a = "key-a"
+    key_b = "key-b"
+
+    def _run(api_key: str) -> str:
+        proc = subprocess.run(
+            [sys.executable, "-c", _DEFAULT_CHECKPOINT_CHILD, str(REPO), api_key],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert proc.returncode == 0, f"child failed:\n{proc.stderr}"
+        return json.loads(proc.stdout.strip().splitlines()[-1])["checkpoint"]
+
+    checkpoint_a = _run(key_a)
+    checkpoint_b = _run(key_b)
+    expected_a = hashlib.sha1(key_a.encode()).hexdigest()[:10]
+    expected_b = hashlib.sha1(key_b.encode()).hexdigest()[:10]
+
+    assert checkpoint_a == f"/tmp/feedling_chat_checkpoint_{expected_a}.json"
+    assert checkpoint_b == f"/tmp/feedling_chat_checkpoint_{expected_b}.json"
+    assert checkpoint_a != checkpoint_b
 
 
 def test_default_claude_cli_renders_json_and_resumes_session(tmp_path):

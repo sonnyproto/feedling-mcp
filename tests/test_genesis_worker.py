@@ -6,8 +6,11 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+import provider_client  # noqa: E402
 from genesis import worker  # noqa: E402
 
 
@@ -657,3 +660,121 @@ def test_tick_marks_failed_for_empty_import_without_provider_calls(monkeypatch):
     assert result["failed"] == 1
     assert failures[0][0] == "job_1"
     assert "empty_import" in failures[0][1]
+
+
+class _FaultyLLM:
+    """Genesis LLM stub that fails specific tasks (by task_id) and returns
+    plausible JSON for the rest, so we can exercise per-chunk fault tolerance
+    in the map stage of build_reducer_output_from_texts."""
+
+    def __init__(self, fail_tasks):
+        self.fail_tasks = set(fail_tasks)
+        self.calls: list[str] = []
+
+    def complete(self, **kwargs):
+        task = kwargs["task_id"]
+        self.calls.append(task)
+        if task in self.fail_tasks:
+            raise provider_client.ProviderError("provider_http_402", status_code=402)
+        if task.startswith("voice-map") or task.startswith("voice-reduce"):
+            text = json.dumps({"behavior_notes": [], "exemplars": []})
+        elif task.startswith("fact-map"):
+            text = json.dumps({"fact_candidates": [{"text": f"fact:{task}"}]})
+        elif task.startswith("fact-write"):
+            text = json.dumps({"memories": [], "identity": {"agent_name": "Io", "dimensions": []}})
+        elif task == "persona-build":
+            text = "persona text"
+        else:
+            text = json.dumps({})
+        return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=task)
+
+
+def test_build_reducer_tolerates_single_chunk_map_failure(monkeypatch):
+    llm = _FaultyLLM(fail_tasks={"fact-map-1"})
+    monkeypatch.setattr(worker, "GenesisLLMClient", lambda *a, **k: llm)
+
+    output = worker.build_reducer_output_from_texts(
+        user_id="usr_1",
+        job_id="job_partial",
+        runtime=types.SimpleNamespace(),
+        chunk_texts=["c0", "c1", "c2"],
+        source_kind="history",
+    )
+
+    # One chunk's fact-map blew up, but the import still produced an output.
+    assert isinstance(output, dict)
+    assert {"fact-map-0", "fact-map-1", "fact-map-2"} <= set(llm.calls)
+    # Reduce stage still ran (we didn't abort the whole job on one chunk).
+    assert any(t.startswith("fact-write") for t in llm.calls)
+    assert output.get("persona")
+
+
+def test_build_reducer_fails_when_all_fact_maps_fail(monkeypatch):
+    llm = _FaultyLLM(fail_tasks={"fact-map-0", "fact-map-1", "fact-map-2"})
+    monkeypatch.setattr(worker, "GenesisLLMClient", lambda *a, **k: llm)
+
+    with pytest.raises(worker.GenesisWorkerError):
+        worker.build_reducer_output_from_texts(
+            user_id="usr_1",
+            job_id="job_allfail",
+            runtime=types.SimpleNamespace(),
+            chunk_texts=["c0", "c1", "c2"],
+            source_kind="history",
+        )
+
+
+def test_reap_stale_atomically_fails_then_syncs_blobs(monkeypatch):
+    # The DB does the conditional flip atomically (only rows still processing AND
+    # still past the cutoff) and returns them; the reaper then syncs each row's
+    # genesis_state blob to failed. No list->mark_failed TOCTOU window.
+    reaped_rows = [
+        {"user_id": "usr_a", "job_id": "job_a"},
+        {"user_id": "usr_b", "job_id": "job_b"},
+    ]
+    captured = {}
+
+    def fake_reap(older_than_sec, *, error, **_kw):
+        captured["older_than_sec"] = older_than_sec
+        captured["error"] = error
+        return list(reaped_rows)
+
+    monkeypatch.setattr(worker.db, "genesis_reap_stale_processing_jobs", fake_reap)
+    monkeypatch.setattr(worker, "get_store", lambda uid: types.SimpleNamespace(user_id=uid))
+    blobs = []
+    monkeypatch.setattr(
+        worker.service,
+        "write_genesis_state",
+        lambda store, job, status: blobs.append((store.user_id, job["job_id"], status)),
+    )
+
+    reaped = worker.reap_stale_processing_jobs()
+
+    assert captured["older_than_sec"] >= 300
+    assert "stale" in captured["error"]
+    assert {(u, j, s) for u, j, s in blobs} == {("usr_a", "job_a", "failed"), ("usr_b", "job_b", "failed")}
+    assert {r["job_id"] for r in reaped} == {"job_a", "job_b"}
+
+
+def test_reap_stale_blob_sync_failure_still_counts_job_reaped(monkeypatch):
+    # The DB already flipped both to failed atomically; a blob-sync hiccup on one
+    # must not stop the other, and both jobs still count as reaped (they ARE failed).
+    reaped_rows = [
+        {"user_id": "usr_a", "job_id": "job_a"},
+        {"user_id": "usr_b", "job_id": "job_b"},
+    ]
+    monkeypatch.setattr(worker.db, "genesis_reap_stale_processing_jobs", lambda *a, **k: list(reaped_rows))
+    monkeypatch.setattr(worker, "get_store", lambda uid: types.SimpleNamespace(user_id=uid))
+    synced = []
+
+    def flaky_blob(store, job, status):
+        if job["job_id"] == "job_a":
+            raise RuntimeError("blob write blip")
+        synced.append(job["job_id"])
+
+    monkeypatch.setattr(worker.service, "write_genesis_state", flaky_blob)
+
+    reaped = worker.reap_stale_processing_jobs()
+
+    assert synced == ["job_b"]
+    assert {r["job_id"] for r in reaped} == {"job_a", "job_b"}
+

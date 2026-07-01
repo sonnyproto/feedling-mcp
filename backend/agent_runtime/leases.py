@@ -13,10 +13,15 @@ testable; production passes ``time.time()``.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
 
+import psycopg
+
 import db
+
+log = logging.getLogger("feedling.agent_runtime.leases")
 
 
 def _now(now: float | None) -> float:
@@ -57,10 +62,21 @@ def acquire(
            OR agent_runtime_instances.lease_owner = EXCLUDED.lease_owner
         RETURNING lease_owner
     """
-    with db.get_pool().connection() as conn:
-        row = conn.execute(
-            sql, (user_id, driver, pid, lease_owner, expires, runtime_home, clock)
-        ).fetchone()
+    try:
+        with db.get_pool().connection() as conn:
+            row = conn.execute(
+                sql, (user_id, driver, pid, lease_owner, expires, runtime_home, clock)
+            ).fetchone()
+    except psycopg.errors.ForeignKeyViolation:
+        # The account was reset (delete_user removed its users row) after this
+        # supervisor snapshotted the roster but before this acquire. The FK
+        # (0009) refuses to (re)create an instance row for a now-deleted user —
+        # which is exactly what we want: it stops the TOCTOU race that otherwise
+        # spawns a consumer for a gone account and leaves an idle orphan. Treat
+        # it as "did not get the lease"; the tick silently skips this user.
+        log.info("acquire skipped for %s: users row absent (account deleted) — "
+                 "not creating orphan instance", user_id)
+        return False
     return bool(row and row[0] == lease_owner)
 
 
