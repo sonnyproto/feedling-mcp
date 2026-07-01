@@ -87,10 +87,11 @@ def device_events():
         return jsonify({"events": store.list_device_events(since_epoch=since, limit=limit)})
 
     payload = request.get_json(silent=True) or {}
+    inner_payload = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
     event = service._make_device_event(
         source=str(payload.get("source") or "ios"),
         event_type=str(payload.get("type") or payload.get("event_type") or "unknown"),
-        payload=payload.get("payload") if isinstance(payload.get("payload"), dict) else {},
+        payload=inner_payload,
     )
     store.append_device_event(event)
     capture = capture_scheduler.handle_device_event(store, event)
@@ -98,6 +99,14 @@ def device_events():
         from perception import service as perception_service  # lazy; proactive can run without perception tests importing it
         if perception_service.perception_ingress_runtime_v2_enabled(store):
             event["perception_v2"] = perception_service.ingest_device_event_v2(store.user_id, event)
+        # Persist the device timezone from the (already-disclosed) app-presence
+        # channel so proactive can localize its current_time anchor without the
+        # perception-upload opt-in. Read from the RAW payload — the stored event
+        # is redacted to an allowlist that (deliberately) excludes timezone. Kept
+        # out of the wake path: time is a non-significant signal, no wake fires.
+        tz = inner_payload.get("timezone")
+        if tz:
+            perception_service.record_context_timezone(store.user_id, str(tz), str(inner_payload.get("locale") or ""))
     except Exception as e:
         event["perception_v2"] = {"error": f"ingest_failed:{type(e).__name__}"}
     event["capture"] = _capture_response_doc(capture)
