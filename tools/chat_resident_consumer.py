@@ -2613,6 +2613,43 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
     return _resolve_cli_executable(cmd)
 
 
+def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", wall_ms: int) -> None:
+    """Emit ONE structured timing line per CLI agent turn (observability only).
+
+    claude ``--output-format json`` reports its own ``duration_ms`` (agent total)
+    and ``duration_api_ms`` (time spent in LLM/provider calls) plus ``num_turns``
+    (agent steps). Derived splits:
+      cold_start_ms   = wall_ms - agent_ms   (Node boot + MCP server init the CLI
+                        does not count — the per-turn cold-start tax)
+      orchestration_ms = agent_ms - api_ms   (tool loop / memory reads between calls)
+      api_ms          = time actually inside the provider (deepseek) calls
+    Best-effort: never raises, never changes behavior. codex has no such fields,
+    so it logs wall_ms only.
+    """
+    agent_ms = api_ms = num_turns = None
+    try:
+        if not _is_codex_cmd(cmd):
+            for obj in _json_objects_from_cli_output(result.stdout or ""):
+                if isinstance(obj, dict) and obj.get("type") == "result":
+                    agent_ms = obj.get("duration_ms")
+                    api_ms = obj.get("duration_api_ms")
+                    num_turns = obj.get("num_turns")
+                    break
+    except Exception:  # noqa: BLE001 — a timing log must never break a turn
+        pass
+    cold_start_ms = orchestration_ms = None
+    if isinstance(agent_ms, (int, float)):
+        cold_start_ms = max(0, wall_ms - int(agent_ms))
+        if isinstance(api_ms, (int, float)):
+            orchestration_ms = max(0, int(agent_ms) - int(api_ms))
+    log.info(
+        "[turn-timing] rc=%s wall_ms=%d agent_ms=%s api_ms=%s orchestration_ms=%s "
+        "cold_start_ms=%s num_turns=%s out_chars=%d",
+        result.returncode, wall_ms, agent_ms, api_ms, orchestration_ms,
+        cold_start_ms, num_turns, len(result.stdout or ""),
+    )
+
+
 def call_agent_cli(message: str, image_paths: list[str] | None = None, raw_text: bool = False) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
@@ -2620,7 +2657,16 @@ def call_agent_cli(message: str, image_paths: list[str] | None = None, raw_text:
     cmd = _prepare_cli_command(message, image_paths=image_paths)
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    _turn_t0 = time.monotonic()
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "[turn-timing] rc=timeout wall_ms=%d (hit 120s subprocess cap)",
+            int((time.monotonic() - _turn_t0) * 1000),
+        )
+        raise
+    _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
 
     raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
     observed_sid = _extract_session_id(raw_transport) or command_sid
