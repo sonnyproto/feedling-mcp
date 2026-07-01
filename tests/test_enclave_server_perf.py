@@ -64,6 +64,14 @@ def test_gunicorn_options_defaults_to_one_worker(monkeypatch):
     assert enclave_app._gunicorn_options(None)["workers"] == 1
 
 
+def test_gunicorn_options_empty_or_blank_worker_env_defaults_to_one(monkeypatch):
+    # CI expands an unset GitHub var to "" → int("") would crash enclave boot.
+    monkeypatch.setenv("FEEDLING_ENCLAVE_WORKERS", "")
+    assert enclave_app._gunicorn_options(None)["workers"] == 1
+    monkeypatch.setenv("FEEDLING_ENCLAVE_WORKERS", "  ")
+    assert enclave_app._gunicorn_options(None)["workers"] == 1
+
+
 def test_gunicorn_options_preserves_thread_and_bind(monkeypatch):
     monkeypatch.delenv("FEEDLING_ENCLAVE_WORKERS", raising=False)
     opts = enclave_app._gunicorn_options(None)

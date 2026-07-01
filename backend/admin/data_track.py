@@ -517,13 +517,19 @@ def _data_track_fast_validation(
     bootstrap_events: dict,
 ) -> dict:
     relationship_days = _data_track_relationship_days(identity, memory)
-    floors = memory_service._per_tab_floors_for_days(relationship_days)
     counts = memory.get("by_tab") or {}
-    missing_tabs = []
-    if int(counts.get("story") or 0) < floors["story"]:
-        missing_tabs.append("story")
-    if int(counts.get("about_me") or 0) < floors["about_me"]:
-        missing_tabs.append("about_me")
+    # Genesis writes cards by dynamic *bucket*, not the retired
+    # story/about_me/ta_thinking tabs. The old per-tab floor check made every
+    # genesis user look stuck at "memory_garden" even while actively chatting
+    # (2026-07 data-track redo). The garden is satisfied once distillation
+    # produced ANY cards — mirror the authoritative validator
+    # (hosted/onboarding_validation: live_memory = memory_count > 0).
+    memory_total = int(memory.get("total") or 0)
+    has_memories = memory_total > 0
+    is_genesis = (
+        str((identity or {}).get("relationship_anchor_source") or "") == "genesis_import"
+        or int(((memory.get("by_source") or {}).get("genesis_import")) or 0) > 0
+    )
     identity_written = identity is not None
     relationship_evidence = str((identity or {}).get("relationship_anchor_evidence") or "").strip()
     relationship_ok = bool(identity and identity.get("relationship_started_at") and relationship_evidence)
@@ -535,9 +541,13 @@ def _data_track_fast_validation(
 
     if route == "model_api":
         history_ok = bool(history_import.get("has_job") and (
-            history_import.get("status") == "completed" or history_import.get("chat_ready")
+            history_import.get("status") == "completed"
+            or history_import.get("chat_ready")
+            # Genesis done writes cards + identity + greeting before completing;
+            # having cards is the ground-truth proxy the snapshot always carries.
+            or (is_genesis and has_memories)
         ))
-        memory_ok = history_ok and int(counts.get("story") or 0) >= 1 and int(counts.get("about_me") or 0) >= 1
+        memory_ok = history_ok and has_memories
         hosted_chat_ok = bool(
             chat.get("model_api_greetings")
             or (chat.get("model_api_user_messages") and chat.get("model_api_agent_messages"))
@@ -581,10 +591,10 @@ def _data_track_fast_validation(
             "steps": steps,
         }
 
-    memory_ok = not missing_tabs
+    memory_ok = has_memories
     if route == "official_import":
         steps = [
-            step("memory_garden", "Memory Garden", memory_ok, "Memory import must fill required Story and About-me cards."),
+            step("memory_garden", "Memory Garden", memory_ok, "Memory import must write at least one card."),
             step("identity_card", "Identity Card", identity_written, "Use the official app/tool client to import memory and identity."),
             step("relationship_anchor", "Relationship Anchor", relationship_ok, "Set relationship anchor during import."),
         ]
@@ -608,7 +618,7 @@ def _data_track_fast_validation(
     first_greeting_ok = int(chat.get("agent_messages") or 0) > 0
     real_exchange_ok = bool(chat.get("user_messages") and chat.get("agent_messages"))
     steps = [
-        step("memory_garden", "Memory Garden", memory_ok, "Memory Garden is below required Story/About-me floors."),
+        step("memory_garden", "Memory Garden", memory_ok, "Distillation has not written any memory cards yet."),
         step("identity_card", "Identity Card", identity_written, "Call feedling_identity_init after memory verification passes."),
         step("relationship_anchor", "Relationship Anchor", relationship_ok, "Re-run identity init with relationship_anchor_evidence."),
         step("resident_consumer", "Resident Consumer", consumer_ok, "Run the standard feedling-chat-resident / IO resident consumer."),
@@ -982,6 +992,13 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     proactive_jobs = 0
     proactive_messages = 0
     proactive_failed = 0
+    # Ground-truth activation funnel — derived from REAL behaviour (memory
+    # written / messages sent / replies received / recency), independent of the
+    # onboarding-stage label. This is the trustworthy usage view: a user who has
+    # received an agent reply is genuinely onboarded-and-working, regardless of
+    # what the stage validator says.
+    now_epoch = time.time()
+    fn_has_memory = fn_sent = fn_chatting = fn_active_3d = fn_active_1d = 0
     for row in rows:
         stage = row["onboarding"]["stage"]
         route = row["route"]
@@ -994,12 +1011,31 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         proactive_jobs += row["proactive"]["jobs"]
         proactive_messages += row["proactive"]["proactive_messages"]
         proactive_failed += row["proactive"]["failed_jobs"]
+        if int(row["memory"].get("total") or 0) > 0:
+            fn_has_memory += 1
+        if int(row["chat"].get("user_messages") or 0) > 0:
+            fn_sent += 1
+        if int(row["chat"].get("agent_messages") or 0) > 0:
+            fn_chatting += 1
+        act_epoch = core_util._to_epoch(row.get("last_activity_at"))
+        if act_epoch and (now_epoch - act_epoch) <= 3 * 86400:
+            fn_active_3d += 1
+        if act_epoch and (now_epoch - act_epoch) <= 86400:
+            fn_active_1d += 1
     summary = {
         "generated_at": datetime.now().isoformat(),
         "users_total": len(rows),
         "onboarding_completed": completed,
         "onboarding_incomplete": incomplete,
         "completion_rate": (completed / len(rows)) if rows else 0,
+        "activation_funnel": {
+            "registered": len(rows),
+            "has_memory": fn_has_memory,
+            "sent_first_message": fn_sent,
+            "chatting": fn_chatting,
+            "active_3d": fn_active_3d,
+            "active_1d": fn_active_1d,
+        },
         "stage_counts": stage_counts,
         "route_counts": route_counts,
         "access_mode_counts": access_mode_counts,
@@ -1182,21 +1218,44 @@ def _render_data_track_page(payload: dict) -> str:
             f"<td>{onboarding['steps_done']}/{onboarding['steps_total']}</td>"
             f"<td>{html.escape(_format_duration(onboarding['stuck_for_sec']))}</td>"
             f"<td>{row['chat']['total']} <span class='muted'>u{row['chat']['user_messages']} / a{row['chat']['agent_messages']}</span></td>"
-            f"<td>{row['memory']['total']} <span class='muted'>S{row['memory']['by_tab'].get('story', 0)} / A{row['memory']['by_tab'].get('about_me', 0)} / T{row['memory']['by_tab'].get('ta_thinking', 0)}</span>"
+            f"<td>{row['memory']['total']} <span class='muted'>cards</span>"
             f"<br><span class='muted'>cap {row['memory'].get('capture_actions_written', 0)} / edit {row['memory'].get('changes', 0)}</span></td>"
             f"<td>{row['proactive']['proactive_messages']} <span class='muted'>jobs {row['proactive']['jobs']} / fail {row['proactive']['failed_jobs']}</span></td>"
             f"<td>{html.escape(row.get('last_activity_at') or '')}</td>"
             "</tr>"
         )
+    fn = summary.get("activation_funnel", {})
+    reg = max(1, int(fn.get("registered") or summary["users_total"] or 1))
+    def _pct(n): return f"{(int(n or 0) / reg) * 100:.0f}%"
     metrics = "".join([
-        _render_metric("users", summary["users_total"]),
+        _render_metric("registered", summary["users_total"]),
+        _render_metric("chatting (真在聊)", f"{fn.get('chatting', 0)} · {_pct(fn.get('chatting'))}"),
+        _render_metric("active 3d", f"{fn.get('active_3d', 0)} · {_pct(fn.get('active_3d'))}"),
+        _render_metric("active 1d", fn.get("active_1d", 0)),
         _render_metric("onboarding done", summary["onboarding_completed"]),
-        _render_metric("completion", f"{summary['completion_rate'] * 100:.0f}%"),
         _render_metric("chat messages", summary["chat_messages_total"]),
         _render_metric("memories", summary["memory_total"]),
-    _render_metric("proactive jobs", summary["proactive_jobs_total"]),
-    _render_metric("principals", summary.get("principals_total", summary["users_total"])),
+        _render_metric("proactive jobs", summary["proactive_jobs_total"]),
     ])
+    # Ground-truth activation funnel (behaviour-based, not stage-label-based).
+    funnel_steps = [
+        ("registered", "注册"),
+        ("has_memory", "有记忆"),
+        ("sent_first_message", "发过消息"),
+        ("chatting", "收到AI回复(真在聊)"),
+        ("active_3d", "近3天活跃"),
+        ("active_1d", "近1天活跃"),
+    ]
+    funnel_html = "".join(
+        f"<div class='fn-step'><div class='fn-num'>{int(fn.get(k) or 0)}</div>"
+        f"<div class='fn-bar'><span style='width:{(int(fn.get(k) or 0)/reg)*100:.0f}%'></span></div>"
+        f"<div class='fn-label'>{html.escape(label)} · {_pct(fn.get(k))}</div></div>"
+        for k, label in funnel_steps
+    )
+    funnel_section = (
+        "<h2>Activation funnel（真实使用漏斗 · 基于行为,不看 stage 标签）</h2>"
+        f"<section class='funnel'>{funnel_html}</section>"
+    )
     return f"""<!doctype html>
 <html>
 <head>
@@ -1214,6 +1273,12 @@ def _render_data_track_page(payload: dict) -> str:
     .metric {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
     .metric-value {{ font-size:24px; font-weight:700; }}
     .metric-label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }}
+    .funnel {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:8px 0 22px; }}
+    .fn-step {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px; }}
+    .fn-num {{ font-size:22px; font-weight:700; }}
+    .fn-bar {{ height:6px; background:#eee3d9; border-radius:4px; margin:6px 0; overflow:hidden; }}
+    .fn-bar span {{ display:block; height:100%; background:var(--accent); }}
+    .fn-label {{ color:var(--muted); font-size:12px; }}
 	    .toolbar {{ display:flex; gap:10px; align-items:center; margin:18px 0; }}
 	    .viewbar,.sortbar,.pager {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 18px; }}
 	    .sort-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
@@ -1237,6 +1302,7 @@ def _render_data_track_page(payload: dict) -> str:
 	  <div class="muted">Showing {html.escape(str(pagination.get("returned", len(users))))} of {html.escape(str(pagination.get("total", summary["users_total"])))} filtered users. Since {html.escape(str(filters.get("since") or "all time"))}.</div>
 	  {_render_data_track_view_nav("users")}
 		  <section class="metrics">{metrics}</section>
+		  {funnel_section}
 	  <h2>Beta users</h2>
 	  <div class="toolbar"><input id="q" placeholder="Filter user, route, stage"></div>
 	  <div class="sortbar">{sort_controls}</div>
@@ -1305,6 +1371,12 @@ def _render_data_track_dau_page(payload: dict) -> str:
     .metric {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
     .metric-value {{ font-size:24px; font-weight:700; }}
     .metric-label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }}
+    .funnel {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:8px 0 22px; }}
+    .fn-step {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px; }}
+    .fn-num {{ font-size:22px; font-weight:700; }}
+    .fn-bar {{ height:6px; background:#eee3d9; border-radius:4px; margin:6px 0; overflow:hidden; }}
+    .fn-bar span {{ display:block; height:100%; background:var(--accent); }}
+    .fn-label {{ color:var(--muted); font-size:12px; }}
     .viewbar,.toolbar {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0 18px; }}
     .sort-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
     .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}

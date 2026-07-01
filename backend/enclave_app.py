@@ -2159,7 +2159,9 @@ def _enclave_worker_count() -> int:
     so once the enclave→backend I/O reentrancy is out of the way, additional
     worker PROCESSES parallelize decrypts across cores. Read from env so a deploy
     can flip it without a code change; clamped to ≥1."""
-    return max(1, int(os.environ.get("FEEDLING_ENCLAVE_WORKERS", "1")))
+    # ``or "1"`` guards the empty string CI injects for an unset var (int("")
+    # would crash enclave boot).
+    return max(1, int((os.environ.get("FEEDLING_ENCLAVE_WORKERS") or "").strip() or "1"))
 
 
 def _materialize_tls_files() -> tuple[str, str] | None:

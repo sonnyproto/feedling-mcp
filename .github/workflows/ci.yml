@@ -418,6 +418,13 @@ jobs:
           # secret above. Empty = off. Both services read it from the encrypted env.
           FEEDLING_HOST_ALL:            ${{ vars.FEEDLING_HOST_ALL }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.FEEDLING_MIGRATE_ENABLE }}
+          # gunicorn worker counts (compose reads them; empty → compose default
+          # 4/backend, 2/enclave). Encrypted env, NOT baked into compose_hash —
+          # flip via repo var without on-chain re-auth. Gate: the deployed image
+          # must contain the leader-election patch (core/leader.py) for backend
+          # N>1 or it double-binds :9998; the current image has it.
+          FEEDLING_BACKEND_WORKERS:     ${{ vars.FEEDLING_BACKEND_WORKERS }}
+          FEEDLING_ENCLAVE_WORKERS:     ${{ vars.FEEDLING_ENCLAVE_WORKERS }}
           # R2 frame-ciphertext offload (backend/object_storage.py). Encrypted
           # env channel; empty = feature off. The token MUST be scoped to the
           # frames bucket. See deploy/DEPLOYMENTS.md.
@@ -454,6 +461,8 @@ jobs:
             -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
+            -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
+            -e "FEEDLING_ENCLAVE_WORKERS=$FEEDLING_ENCLAVE_WORKERS" \
             --wait
 
       - name: Publish live compose_hash on Sepolia
@@ -601,6 +610,11 @@ jobs:
           # secret above. Empty = off. Both services read it from the encrypted env.
           FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
           FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
+          # gunicorn worker count (backend/gunicorn_conf.py reads it; empty → 1).
+          # Encrypted env channel, NOT baked into compose_hash — flip without
+          # on-chain re-auth. Gate: the deployed image must contain the leader-
+          # election patch (core/leader.py) or N>1 double-binds :9998.
+          FEEDLING_BACKEND_WORKERS:     ${{ vars.TEST_FEEDLING_BACKEND_WORKERS }}
           # R2 frame-ciphertext offload — TEST_-prefixed secrets, un-prefixed
           # container env. Empty = feature off; token MUST be scoped to the
           # frames bucket. See deploy/DEPLOYMENTS.md.
@@ -637,6 +651,7 @@ jobs:
             -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
             -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
+            -e "FEEDLING_BACKEND_WORKERS=$FEEDLING_BACKEND_WORKERS" \
             --wait
 
       - name: Publish live compose_hash on Sepolia (test contract)
