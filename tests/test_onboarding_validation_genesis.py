@@ -13,12 +13,13 @@ def _store(user_id: str = "usr_genesis_validate"):
     return types.SimpleNamespace(user_id=user_id)
 
 
-def _install_model_api_harness(monkeypatch, *, genesis_jobs: list[dict], identity: dict | None = None) -> None:
+def _install_model_api_harness(monkeypatch, *, genesis_jobs: list[dict], identity: dict | None = None,
+                               memory_count: int = 0) -> None:
     monkeypatch.setattr(
         validation.boot_gates,
         "_bootstrap_state",
         lambda _store: {
-            "memory_count": 0,
+            "memory_count": memory_count,
             "counts": {"story": 0, "about_me": 0, "ta_thinking": 0},
             "floors": {"story": 1, "about_me": 1},
             "missing_tabs": ["story", "about_me"],
@@ -112,6 +113,43 @@ def test_model_api_validate_ticks_steps_incrementally_before_done(monkeypatch):
     assert steps["relationship_anchor"]["passing"] is True
     # history_import stays the overall anchor -> still waiting until the job is done
     assert steps["history_import"]["passing"] is False
+
+
+def test_model_api_validate_failed_job_keeps_artifacts_lit_but_overall_fails(monkeypatch):
+    # Codex boundary: already-landed artifacts stay LIT even when the overall job fails
+    # (UI shows 'identity done, but processing failed', not re-extinguished). But the
+    # overall onboarding still fails, anchored on history_import.
+    _install_model_api_harness(
+        monkeypatch,
+        identity={
+            "agent_name": "小柒",
+            "relationship_started_at": "2026-06-01",
+            "relationship_anchor_source": "genesis_import",
+            "relationship_anchor_evidence": "Imported chat history.",
+        },
+        memory_count=3,
+        genesis_jobs=[
+            {
+                "job_id": "genesis_1",
+                "status": "failed",
+                "source_kind": "history_import",
+                "identity_status": "initialized",
+                "output": {"stage": "genesis_v2_background_deferred"},
+                "metadata": {"ingest": "plaintext", "history_count": 2, "timeline_span_days": 1},
+            }
+        ],
+    )
+
+    body = validation._model_api_onboarding_validation_payload(_store())
+    steps = {s["id"]: s for s in body["steps"]}
+
+    assert steps["identity_card"]["passing"] is True          # landed artifact stays lit
+    assert steps["relationship_anchor"]["passing"] is True
+    assert steps["memory_garden"]["passing"] is True
+    assert steps["history_import"]["passing"] is False         # overall anchor fails
+    assert body["passing"] is False                            # onboarding still fails
+    assert body["stage"] == "history_import"
+    assert "failed" in steps["history_import"]["required"].lower()
 
 
 def test_model_api_validate_marks_genesis_done_steps_complete(monkeypatch):

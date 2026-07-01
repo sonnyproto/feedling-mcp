@@ -204,6 +204,10 @@ def _model_api_steps_with_genesis(
     # sequence, so these light up one by one as the user watches.
     # memory/chat have no pure-live signal in every harness, so they pass on `done` too
     # (backward-compatible) OR their live artifact (incremental before done).
+    # NOTE (Codex): hosted_chat leaning on `done` is only sound because the foreground-ready
+    # contract writes the greeting BEFORE done (genesis v2 _run_plaintext_genesis_v2:
+    # identity + greeting + core, THEN genesis_complete_job). If `done` ever fires without a
+    # greeting again, this mis-lights hosted_chat — keep that invariant.
     live_memory = done or int(bootstrap_st.get("memory_count") or 0) > 0
     hosted_chat_ok = done or _model_api_hosted_chat_verified(store)
 
