@@ -2613,28 +2613,82 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
     return _resolve_cli_executable(cmd)
 
 
+def _codex_turn_metrics(raw: str) -> dict:
+    """Best-effort {steps, input_tokens, output_tokens} from a codex event stream.
+
+    codex ``exec --json`` (both the 0.136 ``item.completed`` and 0.142 flat
+    protocols) has NO duration fields — unlike claude — so latency cannot be split
+    from the stream. Token usage + agent-message count still characterize the turn.
+    Token events are cumulative, so we keep the max seen. Never raises.
+    """
+    steps = 0
+    in_tok = out_tok = 0
+
+    def _pull_tokens(o: Any) -> None:
+        nonlocal in_tok, out_tok
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    if k in ("input_tokens", "prompt_tokens"):
+                        in_tok = max(in_tok, int(v))
+                    elif k in ("output_tokens", "completion_tokens"):
+                        out_tok = max(out_tok, int(v))
+                else:
+                    _pull_tokens(v)
+        elif isinstance(o, list):
+            for it in o:
+                _pull_tokens(it)
+
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict):
+            continue
+        etype = str(obj.get("type") or "").strip()
+        item = obj.get("item") if isinstance(obj.get("item"), dict) else {}
+        if etype == "agent_message" or (etype == "item.completed" and item.get("type") == "agent_message"):
+            steps += 1
+        if "token" in etype or "usage" in obj or "info" in obj:
+            _pull_tokens(obj)
+    return {"steps": steps, "input_tokens": in_tok, "output_tokens": out_tok}
+
+
 def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", wall_ms: int) -> None:
     """Emit ONE structured timing line per CLI agent turn (observability only).
 
-    claude ``--output-format json`` reports its own ``duration_ms`` (agent total)
-    and ``duration_api_ms`` (time spent in LLM/provider calls) plus ``num_turns``
-    (agent steps). Derived splits:
-      cold_start_ms   = wall_ms - agent_ms   (Node boot + MCP server init the CLI
-                        does not count — the per-turn cold-start tax)
-      orchestration_ms = agent_ms - api_ms   (tool loop / memory reads between calls)
-      api_ms          = time actually inside the provider (deepseek) calls
-    Best-effort: never raises, never changes behavior. codex has no such fields,
-    so it logs wall_ms only.
+    Driver-aware — the two CLIs expose different metrics:
+
+    - **claude** (``--output-format json``) reports ``duration_ms`` (agent total),
+      ``duration_api_ms`` (time in provider calls) and ``num_turns``, so we derive:
+        cold_start_ms    = wall_ms - agent_ms    (Node boot + MCP init the CLI
+                           does not count — the per-turn cold-start tax)
+        orchestration_ms = agent_ms - api_ms     (tool loop / memory reads)
+        api_ms           = time inside the provider (e.g. deepseek) calls
+    - **codex** (``exec --json``) has no duration fields; we log wall_ms plus
+      best-effort token usage + agent-message step count.
+
+    Best-effort: never raises, never changes behavior. ``driver=`` is always
+    logged so blank fields aren't mistaken for missing claude data.
     """
+    if _is_codex_cmd(cmd):
+        try:
+            m = _codex_turn_metrics(result.stdout or "")
+        except Exception:  # noqa: BLE001 — a timing log must never break a turn
+            m = {"steps": None, "input_tokens": None, "output_tokens": None}
+        log.info(
+            "[turn-timing] driver=codex rc=%s wall_ms=%d steps=%s in_tokens=%s "
+            "out_tokens=%s out_chars=%d",
+            result.returncode, wall_ms, m.get("steps"), m.get("input_tokens"),
+            m.get("output_tokens"), len(result.stdout or ""),
+        )
+        return
+
     agent_ms = api_ms = num_turns = None
     try:
-        if not _is_codex_cmd(cmd):
-            for obj in _json_objects_from_cli_output(result.stdout or ""):
-                if isinstance(obj, dict) and obj.get("type") == "result":
-                    agent_ms = obj.get("duration_ms")
-                    api_ms = obj.get("duration_api_ms")
-                    num_turns = obj.get("num_turns")
-                    break
+        for obj in _json_objects_from_cli_output(result.stdout or ""):
+            if isinstance(obj, dict) and obj.get("type") == "result":
+                agent_ms = obj.get("duration_ms")
+                api_ms = obj.get("duration_api_ms")
+                num_turns = obj.get("num_turns")
+                break
     except Exception:  # noqa: BLE001 — a timing log must never break a turn
         pass
     cold_start_ms = orchestration_ms = None
@@ -2643,8 +2697,8 @@ def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", 
         if isinstance(api_ms, (int, float)):
             orchestration_ms = max(0, int(agent_ms) - int(api_ms))
     log.info(
-        "[turn-timing] rc=%s wall_ms=%d agent_ms=%s api_ms=%s orchestration_ms=%s "
-        "cold_start_ms=%s num_turns=%s out_chars=%d",
+        "[turn-timing] driver=claude rc=%s wall_ms=%d agent_ms=%s api_ms=%s "
+        "orchestration_ms=%s cold_start_ms=%s num_turns=%s out_chars=%d",
         result.returncode, wall_ms, agent_ms, api_ms, orchestration_ms,
         cold_start_ms, num_turns, len(result.stdout or ""),
     )
@@ -2662,7 +2716,8 @@ def call_agent_cli(message: str, image_paths: list[str] | None = None, raw_text:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
         log.warning(
-            "[turn-timing] rc=timeout wall_ms=%d (hit 120s subprocess cap)",
+            "[turn-timing] driver=%s rc=timeout wall_ms=%d (hit 120s subprocess cap)",
+            "codex" if _is_codex_cmd(cmd) else "claude",
             int((time.monotonic() - _turn_t0) * 1000),
         )
         raise
