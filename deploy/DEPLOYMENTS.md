@@ -183,6 +183,96 @@ distinct rows in `agent_runtime_supervisor_heartbeats`, users distribute across
 owners in `agent_runtime_instances`, and killing one runner lets the other take
 over its users after the TTL — all while the main CVM ingress/backend stay up.
 
+#### CI job (`deploy-test-runner-cvm`) — DORMANT by default
+
+`.github/workflows/ci.yml` already carries the recurring deploy job. It is
+**skipped** unless BOTH hold, so merging the multi-node PR is a no-op for Form B:
+
+- repo var `DEPLOY_TEST_RUNNER_CVM == 'true'`, AND
+- `deploy/test-runner-cvm-id.txt` names a provisioned runner CVM.
+
+It runs on the SAME test Phala account as the main CVM (`secrets.TEST_PHALA_CLOUD_API_KEY`),
+shares the test DB / runtime-token-secret / test FeedlingAppAuth contract, and
+`phala deploy --cvm-id …` (update-in-place) → publishes the runner's own
+compose_hash on Sepolia. It reuses these already-set GitHub vars/secrets (no new
+secrets needed — all confirmed present 2026-07-01):
+
+| Wired to | Value / source |
+|---|---|
+| var `TEST_MAIN_API_URL` | `https://test-api.feedling.app` ✅ set |
+| var `TEST_MAIN_ENCLAVE_URL` | `https://173c7f49aeb54acb424676b17b17f78e5e2b2938-5003s.dstack-pha-prod9.phala.network` ✅ set (verified `/attestation` → 200 over in-enclave TLS) |
+| var `TEST_AGENT_MAX_CHILDREN` | `8` ✅ set |
+| var `DEPLOY_TEST_RUNNER_CVM` | `false` ✅ set (flip to `true` last) |
+| secret `TEST_PHALA_CLOUD_API_KEY` | test account (amiller-user) — reused |
+| secret `TEST_DATABASE_URL` | same test RDS as main CVM — reused |
+| secret `TEST_FEEDLING_RUNTIME_TOKEN_SECRET` | **MUST equal** main backend's — reused |
+| secret `TEST_FEEDLING_LITELLM_API_KEY`, `TEST_AGENT_RUNTIME_USERS` | reused |
+| var `TEST_AGENT_RUNTIME_AUTODISCOVER`, `TEST_FEEDLING_HOST_ALL`, `TEST_FEEDLING_LITELLM_ENABLE`, `TEST_FEEDLING_MIGRATE_ENABLE` | reused |
+| var `TEST_RUNNER_FEEDLING_APP_AUTH_CONTRACT` (optional) | falls back to `TEST_FEEDLING_APP_AUTH_CONTRACT` if unset — the runner's compose_hash on the shared test contract is harmless (iOS audit card only checks the MAIN app's hashes) |
+
+#### First-time provisioning (one-shot, needs the Phala test account)
+
+The recurring job only **updates** an existing CVM; it errors if the id file is
+empty. So the runner CVM must be **created once** first. This is the single step
+that needs a human with the test Phala account (`amiller-user`) — it stands up
+paid infra and mints a new dstack app-id. Run locally with `TEST_PHALA_CLOUD_API_KEY`:
+
+```bash
+# 0) pin a real agent-runner image sha (any published :<sha>, e.g. the latest test build)
+SHA=<short-sha>                       # e.g. from `git rev-parse --short origin/test`
+sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|ghcr.io/teleport-computer/feedling-agent-runner:${SHA}|g" \
+  deploy/docker-compose.phala.runner.yaml
+
+# 1) CREATE the runner CVM (NO --cvm-id ⇒ new app). Same -e env the CI job passes.
+#    Pull the values from the GitHub vars/secrets table above.
+phala deploy \
+  --api-token "$TEST_PHALA_CLOUD_API_KEY" \
+  --name feedling-runner-test \
+  --instance-type tdx.small --kms phala \
+  -c deploy/docker-compose.phala.runner.yaml \
+  -e "FEEDLING_API_URL=https://test-api.feedling.app" \
+  -e "FEEDLING_ENCLAVE_URL=https://173c7f49aeb54acb424676b17b17f78e5e2b2938-5003s.dstack-pha-prod9.phala.network" \
+  -e "AGENT_MAX_CHILDREN=8" \
+  -e "DATABASE_URL=<same as TEST_DATABASE_URL>" \
+  -e "FEEDLING_RUNTIME_TOKEN_SECRET=<same as TEST_FEEDLING_RUNTIME_TOKEN_SECRET>" \
+  -e "AGENT_RUNTIME_USERS=<same as TEST_AGENT_RUNTIME_USERS, or empty to idle>" \
+  -e "AGENT_RUNTIME_AUTODISCOVER=1" \
+  -e "FEEDLING_HOST_ALL=1" \
+  -e "FEEDLING_LITELLM_ENABLE=1" \
+  -e "FEEDLING_LITELLM_API_KEY=<same as TEST_FEEDLING_LITELLM_API_KEY>" \
+  -e "FEEDLING_MIGRATE_ENABLE=" \
+  --wait
+
+# 2) resolve the new CVM id and record it (the recurring job reads this file)
+phala cvms list --api-token "$TEST_PHALA_CLOUD_API_KEY" --json \
+  | jq -r '.[] | select(.name=="feedling-runner-test") | .id // .cvm_id // .app_id' \
+  | tr -d '[:space:]' > deploy/test-runner-cvm-id.txt
+cat deploy/test-runner-cvm-id.txt        # sanity: a uuid / app_xxx
+
+# 3) authorize the runner's compose_hash on the test contract (first boot may
+#    key-wait until this lands — same deploy-then-publish order as the main job)
+FEEDLING_COMPOSE_FILE=deploy/docker-compose.phala.runner.yaml \
+FEEDLING_CVM_ID="$(cat deploy/test-runner-cvm-id.txt)" \
+FEEDLING_APP_AUTH_CONTRACT=0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5 \
+ETH_SEPOLIA_RPC_URL=https://ethereum-sepolia-rpc.publicnode.com \
+PRIVATE_KEY=<ETH_DEPLOYER_KEY> \
+PHALA_CLOUD_API_KEY="$TEST_PHALA_CLOUD_API_KEY" \
+  ./deploy/publish-compose-hash.sh eth_sepolia
+
+# 4) commit the id file, then flip the switch — the recurring CI job takes over
+git add deploy/test-runner-cvm-id.txt deploy/docker-compose.phala.runner.yaml
+git commit -m "deploy(test): provision runner CVM <id> [skip ci]"
+gh variable set DEPLOY_TEST_RUNNER_CVM --body true
+```
+
+After step 4, every push to `test` that touches `backend/**` /
+`deploy/docker-compose.phala.runner.yaml` / `ci.yml` re-pins the sha and
+`phala deploy --cvm-id`s the runner in place. **Rollback** = `gh variable set
+DEPLOY_TEST_RUNNER_CVM --body false` (job goes dormant; the CVM keeps running the
+last image until you `phala cvms stop` it). Because coordination is pure-Postgres,
+stopping the runner CVM just lets the main-CVM runner re-acquire its users after
+the lease TTL — no main-CVM change needed.
+
 ## Enclave configuration
 
 ### Screen frame VLM captioning
