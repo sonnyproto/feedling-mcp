@@ -135,7 +135,8 @@ def test_v2_foreground_writes_identity_greeting_then_completes(monkeypatch):
     monkeypatch.setattr(service, "apply_memory_outputs",
                         lambda store, api_key, out: (len(out.get("memories") or []), []))
     monkeypatch.setattr(history_import, "_store_identity_payload",
-                        lambda store, payload, **k: calls.__setitem__("identity_stored", payload))
+                        lambda store, payload, **k: calls.update(identity_stored=payload,
+                                                                 stored_days=k.get("days_with_user")))
     monkeypatch.setattr(history_import, "_generate_model_api_onboarding_greeting",
                         lambda *a, **k: ("小柒: 好久不见呀", []))
     monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting",
@@ -157,8 +158,36 @@ def test_v2_foreground_writes_identity_greeting_then_completes(monkeypatch):
     assert calls["identity_stored"]["agent_name"] == "小柒"     # identity written in foreground
     assert "小柒" in calls["greeting"]                          # greeting written in foreground
     assert calls["completed"] == service.DONE_JOB_STATUS         # job completed after identity+greeting
+    assert calls["stored_days"] == 144                           # relationship anchor days -> identity
     assert calls["bg_write_identity"] is False                   # background must NOT re-write identity
     assert "used_apply_reducer" not in calls                     # did NOT take the empty-identity fallback
+
+
+def test_v2_foreground_days_falls_back_to_deriver_when_anchor_zero(monkeypatch):
+    # anchor has no span (days 0), but the deriver computed days from message timestamps
+    # -> "相处天数" must use the deriver's days, not 0.
+    calls = {}
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
+    monkeypatch.setattr(routes, "_plaintext_merge_reducer_outputs", lambda outs, **k: {"memories": [{"summary": "x"}]})
+    monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **k: ({"agent_name": "小柒", "dimensions": [{"name": "温柔"}], "days_with_user": 90}, []))
+    monkeypatch.setattr(service, "apply_memory_outputs", lambda *a, **k: (1, []))
+    monkeypatch.setattr(history_import, "_store_identity_payload",
+                        lambda store, payload, **k: calls.__setitem__("stored_days", k.get("days_with_user")))
+    monkeypatch.setattr(history_import, "_generate_model_api_onboarding_greeting", lambda *a, **k: ("", []))
+    monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting", lambda *a, **k: None)
+    monkeypatch.setattr(db, "genesis_complete_job", lambda *a, **k: {"job_id": "job1"})
+    monkeypatch.setattr(service, "write_genesis_state", lambda *a, **k: None)
+    monkeypatch.setattr(routes, "_run_plaintext_background_enrichment", lambda *a, **k: None)
+
+    routes._run_plaintext_genesis_v2(
+        _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
+        relationship_anchor={"days_with_user": 0},   # no span
+        analysis_messages=[{"role": "user", "content": "hi"}])
+
+    assert calls["stored_days"] == 90                            # fell back to the deriver's days
 
 
 def test_v2_foreground_falls_back_when_no_identity(monkeypatch):

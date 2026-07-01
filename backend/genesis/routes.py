@@ -536,7 +536,7 @@ def _run_plaintext_genesis_v2(
 
     fg_merged = _plaintext_merge_reducer_outputs([fg_reduce], relationship_anchor=relationship_anchor)
     core_memories = fg_merged.get("memories") or []
-    days = int((relationship_anchor or {}).get("days_with_user") or 0)
+    days_hint = int((relationship_anchor or {}).get("days_with_user") or 0)
     msgs = analysis_messages if isinstance(analysis_messages, list) else []
     language = history_import._import_language_for_store(store, msgs)
 
@@ -547,8 +547,12 @@ def _run_plaintext_genesis_v2(
     # identity_card passes at entry. Heavy voice/persona/full-memory stay in background.
     identity_payload, _idw = foreground_identity.derive_foreground_identity(
         runtime=runtime, analysis_messages=msgs, core_memories=core_memories,
-        days_with_user=days, language=language,
+        days_with_user=days_hint, language=language,
     )
+    # Prefer the import's relationship span; fall back to the deriver's own
+    # timestamp-derived days so "相处天数" isn't 0 when the anchor lacked a span (mirrors
+    # _plaintext_merge_reducer_outputs: relationship_anchor days OR output_days).
+    days = days_hint or int((identity_payload or {}).get("days_with_user") or 0)
     identity_first = bool(msgs) and foreground_identity.has_identity_signal(identity_payload)
 
     if identity_first:
