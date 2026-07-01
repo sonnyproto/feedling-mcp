@@ -151,26 +151,20 @@ def _plaintext_timeline_span_days(messages: list[dict]) -> int:
     return int(max(0.0, max(timestamps) - min(timestamps)) // _SECONDS_PER_DAY)
 
 
-def _plaintext_relationship_anchor(payload: dict, *, timeline_span_days: int) -> dict:
-    raw = str(payload.get("relationship_started_at") or "").strip()
-    if raw:
-        parsed = identity_service._parse_iso_calendar_date(raw)
-        if parsed:
-            return {
-                "relationship_started_at": parsed.isoformat(),
-                "days_with_user": max(0, (date.today() - parsed).days),
-                "relationship_anchor_evidence": f"plaintext_import:relationship_started_at={parsed.isoformat()}",
-            }
-    if timeline_span_days > 0:
-        return {
-            "relationship_started_at": "",
-            "days_with_user": int(timeline_span_days),
-            "relationship_anchor_evidence": f"plaintext_import:timeline_span_days={int(timeline_span_days)}",
-        }
+def _plaintext_relationship_anchor(payload: dict, *, messages: list[dict]) -> dict:
+    # Reuse the ORIGINAL relationship-start logic (history_import._relationship_start_from_import):
+    # typed date -> use it; else the EARLIEST message timestamp; else today (fresh_start).
+    # The genesis path previously reinvented this and left relationship_started_at BLANK
+    # for the no-typed-date case, which fell through to prefer_memory (genesis' today-dated
+    # core memories) and collapsed 相处天数 to 0.
+    start, _evidence = history_import._relationship_start_from_import(payload, messages)
+    if not start:
+        return {"relationship_started_at": "", "days_with_user": 0, "relationship_anchor_evidence": ""}
+    iso = start.isoformat()
     return {
-        "relationship_started_at": "",
-        "days_with_user": 0,
-        "relationship_anchor_evidence": "",
+        "relationship_started_at": iso,
+        "days_with_user": max(0, (date.today() - start).days),
+        "relationship_anchor_evidence": f"plaintext_import:relationship_started_at={iso}",
     }
 
 
@@ -206,7 +200,7 @@ def _prepare_plaintext_import(payload: dict) -> dict:
     if not chunk_texts:
         raise ValueError("plaintext_import_empty")
     timeline_span_days = _plaintext_timeline_span_days(history_messages)
-    relationship_anchor = _plaintext_relationship_anchor(payload, timeline_span_days=timeline_span_days)
+    relationship_anchor = _plaintext_relationship_anchor(payload, messages=history_messages)
     return {
         "analysis_messages": analysis_messages,
         "chunk_texts": chunk_texts,
