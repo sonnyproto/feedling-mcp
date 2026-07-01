@@ -19,7 +19,10 @@ def _worker_count() -> int:
     max_connections: each worker holds ~16 pool + 1 LISTEN + 1 election ≈ 18
     connections, so -w2 ≈ 36, -w3 ≈ 54 — check the RDS instance's max_connections
     before raising (test t4g-micro = 79 → -w2 safe / -w3 edge)."""
-    return max(1, int(os.environ.get("FEEDLING_BACKEND_WORKERS", "1")))
+    # `or "1"` guards the empty string: CI passes `-e FEEDLING_BACKEND_WORKERS=$VAR`
+    # and an unset GitHub var expands to "", so the key is SET-but-empty — int("")
+    # would crash gunicorn config load and the backend would fail to boot.
+    return max(1, int((os.environ.get("FEEDLING_BACKEND_WORKERS") or "").strip() or "1"))
 
 
 # gunicorn reads this module-level name for the worker count (no `-w` on the CLI,

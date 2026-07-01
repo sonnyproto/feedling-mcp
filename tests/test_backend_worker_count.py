@@ -23,3 +23,13 @@ def test_worker_count_defaults_to_one(monkeypatch):
 def test_worker_count_clamped_to_at_least_one(monkeypatch):
     monkeypatch.setenv("FEEDLING_BACKEND_WORKERS", "0")
     assert gunicorn_conf._worker_count() == 1
+
+
+def test_worker_count_empty_or_blank_defaults_to_one(monkeypatch):
+    # CI passes `-e FEEDLING_BACKEND_WORKERS=$VAR`; an unset GitHub var expands to
+    # an empty string, so the container sees the key SET to "" — int("") would
+    # crash gunicorn_conf at import and the backend would fail to boot.
+    monkeypatch.setenv("FEEDLING_BACKEND_WORKERS", "")
+    assert gunicorn_conf._worker_count() == 1
+    monkeypatch.setenv("FEEDLING_BACKEND_WORKERS", "  ")
+    assert gunicorn_conf._worker_count() == 1
