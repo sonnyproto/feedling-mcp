@@ -197,6 +197,19 @@ def _model_api_steps_with_genesis(
     identity_status = str(genesis_job.get("identity_status") or "")
     persona_ref = str(genesis_job.get("persona_ref") or "")
     identity_complete = _identity_card_complete(identity)
+    # Per-artifact live signals so the checklist ticks INCREMENTALLY (each step passes as
+    # its own artifact lands), matching the base/legacy steps — instead of every step
+    # being gated on the single job `done`, which made them all flip at once. The
+    # identity-first foreground writes memories -> identity -> relationship -> greeting in
+    # sequence, so these light up one by one as the user watches.
+    # memory/chat have no pure-live signal in every harness, so they pass on `done` too
+    # (backward-compatible) OR their live artifact (incremental before done).
+    # NOTE (Codex): hosted_chat leaning on `done` is only sound because the foreground-ready
+    # contract writes the greeting BEFORE done (genesis v2 _run_plaintext_genesis_v2:
+    # identity + greeting + core, THEN genesis_complete_job). If `done` ever fires without a
+    # greeting again, this mis-lights hosted_chat — keep that invariant.
+    live_memory = done or int(bootstrap_st.get("memory_count") or 0) > 0
+    hosted_chat_ok = done or _model_api_hosted_chat_verified(store)
 
     history_step = {
         "id": "history_import",
@@ -239,7 +252,7 @@ def _model_api_steps_with_genesis(
     memory_step = {
         "id": "memory_garden",
         "label": "Memory Garden",
-        "passing": done,
+        "passing": live_memory,
         "blocking": False,
         "memory_count": bootstrap_st["memory_count"],
         "counts": bootstrap_st["counts"],
@@ -247,35 +260,35 @@ def _model_api_steps_with_genesis(
         "missing_tabs": bootstrap_st["missing_tabs"],
         "genesis": True,
         "memory_action_count": memory_action_count,
-        "required": "" if done else "Wait for Genesis to write Memory Garden cards.",
+        "required": "" if live_memory else "Wait for Genesis to write Memory Garden cards.",
     }
     identity_step = {
         "id": "identity_card",
         "label": "Identity Card",
-        "passing": done and identity_complete,
-        "written": done and identity_written,
-        "complete": done and identity_complete,
+        "passing": identity_complete,
+        "written": identity_written,
+        "complete": identity_complete,
         "genesis": True,
         "identity_status": identity_status,
-        "required": "" if done and identity_complete else "Wait for Genesis to write a non-empty Identity Card.",
+        "required": "" if identity_complete else "Wait for Genesis to write a non-empty Identity Card.",
     }
     relationship_step = {
         "id": "relationship_anchor",
         "label": "Relationship Anchor",
-        "passing": done and relationship_ok,
-        "relationship_anchored": done and relationship_anchored,
-        "relationship_anchor_source": (identity or {}).get("relationship_anchor_source", "") if done else "",
-        "relationship_anchor_evidence": relationship_evidence if done else "",
-        "days_with_user": identity_service._live_days_with_user(identity, store=store) if done and identity else None,
+        "passing": relationship_ok,
+        "relationship_anchored": relationship_anchored,
+        "relationship_anchor_source": (identity or {}).get("relationship_anchor_source", ""),
+        "relationship_anchor_evidence": relationship_evidence,
+        "days_with_user": identity_service._live_days_with_user(identity, store=store) if identity else None,
         "genesis": True,
-        "required": "" if done and relationship_ok else "Wait for Genesis to write the relationship anchor.",
+        "required": "" if relationship_ok else "Wait for Genesis to write the relationship anchor.",
     }
     hosted_chat_step = {
         "id": "hosted_chat",
         "label": "Hosted Chat",
-        "passing": done,
+        "passing": hosted_chat_ok,
         "genesis": True,
-        "required": "" if done else "Wait for Genesis to finish before opening hosted chat.",
+        "required": "" if hosted_chat_ok else "Wait for Genesis to finish before opening hosted chat.",
     }
 
     replacements = {
