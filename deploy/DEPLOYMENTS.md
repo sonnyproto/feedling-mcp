@@ -31,10 +31,10 @@ retirement when keeping the exact value no longer helps verification.
 
 | | |
 |---|---|
-| Provider | Phala Cloud dstack on prod9 (`dstack-pha-prod9.phala.network`, node id `18`) |
-| CVM ID | `19b13ebe-d12e-4d19-97d1-6cf41389b663` (also in `deploy/test-cvm-id.txt`) |
-| App ID | `bb9716955423faed3508888e7c654ff46f5f0c2d` |
-| Created | 2026-06-09, instance `tdx.small` |
+| Provider | Phala Cloud dstack on prod9 (`dstack-pha-prod9.phala.network`, node id `18`). **Account: `amiller-user` (amiller-users-projects)** since the 2026-07-01 account move — see below. |
+| CVM ID | `5bfa1543-c5b4-42ca-842d-fd88984e5edf` (also in `deploy/test-cvm-id.txt`) |
+| App ID | `173c7f49aeb54acb424676b17b17f78e5e2b2938` |
+| Created | 2026-07-01 as `feedling-io-test`, instance `tdx.small`, **Phala KMS** (prod9 chain-0). Account migration (path B): the old test CVM `19b13ebe-d12e-4d19-97d1-6cf41389b663` / app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` under `sxysun` was abandoned (balance exhausted 2026-06-18). Fresh app_id → new `enclave_content_pk`, so the reused test RDS was wiped of undecryptable rows. iOS test build repointed to the new app_id. Bootstrapped via the one-shot `.github/workflows/bootstrap-test-cvm.yml` (push to `bootstrap-cvm` branch). CI deploy key is now `TEST_PHALA_CLOUD_API_KEY` (separate from prod's `PHALA_CLOUD_API_KEY`). |
 | Compose | `deploy/docker-compose.phala.test.yaml` — same 4 services as prod, with test domains + `_test` volumes |
 | Public API | `https://test-api.feedling.app` (via dstack-ingress — live, `/healthz` 200) |
 | Public MCP | `https://test-mcp.feedling.app/sse?key=<api_key>` (via dstack-ingress — live, SSE 200) |
