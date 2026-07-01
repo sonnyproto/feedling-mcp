@@ -784,7 +784,7 @@ jobs:
 
       - name: Deploy runner CVM via phala
         env:
-          PHALA_CLOUD_API_KEY:          ${{ secrets.PHALA_CLOUD_API_KEY }}
+          PHALA_CLOUD_API_KEY:          ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
           CVM_ID:                       ${{ steps.cvmid.outputs.cvm_id }}
           # Cross-CVM reach to the main CVM (repo vars — public URLs, not secrets):
           #   TEST_MAIN_API_URL     = https://test-api.feedling.app
@@ -838,7 +838,7 @@ jobs:
           # runner hash is harmless there). Override with TEST_RUNNER_FEEDLING_APP_AUTH_CONTRACT.
           FEEDLING_APP_AUTH_CONTRACT: ${{ vars.TEST_RUNNER_FEEDLING_APP_AUTH_CONTRACT || vars.TEST_FEEDLING_APP_AUTH_CONTRACT }}
           FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
-          PHALA_CLOUD_API_KEY:        ${{ secrets.PHALA_CLOUD_API_KEY }}
+          PHALA_CLOUD_API_KEY:        ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
           FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.runner.yaml
         run: |
           python3 -m pip install --upgrade pip
