@@ -31,6 +31,24 @@ PERSONA_SOURCE_PRIORITY = {
     "unknown": 10,
 }
 
+# Map v2-internal genesis stages to the LEGACY phase vocabulary the shipped iOS already
+# knows (localizedHistoryPhase), so old apps show correct copy without an app update.
+# Only what's REPORTED to the client is mapped; stored stages / flow-trace are unchanged.
+_PUBLIC_STAGE_MAP = {
+    "genesis_v2_foreground": "chat_history_importing",
+    "genesis_v2_foreground_ready": "completed",
+    "genesis_v2_background": "background_importing",
+    "genesis_v2_background_deferred": "background_importing",
+    "genesis_v2_done": "completed",
+}
+
+
+def public_stage(stage: str) -> str:
+    """Client-facing stage name. v2-internal stages -> legacy phases the old iOS maps;
+    legacy/unknown stages pass through unchanged."""
+    return _PUBLIC_STAGE_MAP.get(str(stage or ""), str(stage or ""))
+
+
 PRIVACY_MODE = "backend_storage_no_plaintext_user_provider_authorized"
 PRIVACY_COPY = (
     "Feedling persistent storage does not store imported plaintext; plaintext is "

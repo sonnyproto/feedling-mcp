@@ -48,8 +48,14 @@ def _valid_job_id(job_id: str) -> bool:
 
 
 def _job_response(job: dict | None, *, extra: dict | None = None) -> dict:
+    job = job or {}
+    # Report the client-facing stage name (v2-internal -> legacy phase the old iOS maps),
+    # so shipped apps show correct copy without an update. Stored stage is unchanged.
+    out = job.get("output")
+    if isinstance(out, dict) and out.get("stage"):
+        job = {**job, "output": {**out, "stage": service.public_stage(out["stage"])}}
     body = {
-        "job": job or {},
+        "job": job,
         "privacy_mode": service.PRIVACY_MODE,
         "privacy_copy": service.PRIVACY_COPY,
     }

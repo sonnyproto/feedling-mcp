@@ -218,3 +218,28 @@ def test_model_api_validate_rejects_done_genesis_with_empty_identity_card(monkey
     assert steps["identity_card"]["written"] is True
     assert steps["identity_card"]["complete"] is False
     assert steps["identity_card"]["passing"] is False
+
+
+def test_genesis_stage_mapped_to_legacy_phase_for_old_ios(monkeypatch):
+    # v2-internal stage must be reported to the client as the LEGACY phase the shipped
+    # iOS already maps (so old apps don't show raw 'genesis_v2_foreground').
+    from genesis import service as genesis_service
+    assert genesis_service.public_stage("genesis_v2_foreground") == "chat_history_importing"
+    assert genesis_service.public_stage("genesis_v2_background") == "background_importing"
+    assert genesis_service.public_stage("genesis_v2_background_deferred") == "background_importing"
+    assert genesis_service.public_stage("genesis_v2_done") == "completed"
+    assert genesis_service.public_stage("chat_history_importing") == "chat_history_importing"  # passthru
+
+    _install_model_api_harness(
+        monkeypatch,
+        identity={"agent_name": "小柒", "relationship_started_at": "2026-06-01",
+                  "relationship_anchor_source": "genesis_import"},
+        genesis_jobs=[{
+            "job_id": "genesis_1", "status": "processing", "source_kind": "history_import",
+            "output": {"stage": "genesis_v2_foreground"},
+            "metadata": {"ingest": "plaintext", "history_count": 2, "timeline_span_days": 1},
+        }],
+    )
+    steps = {s["id"]: s for s in validation._model_api_onboarding_validation_payload(_store())["steps"]}
+    # the history_import step's phase is the mapped legacy phase, NOT the raw v2 stage
+    assert steps["history_import"]["phase"] == "chat_history_importing"

@@ -57,6 +57,7 @@ from accounts import onboarding as accounts_onboarding
 from bootstrap import gates as boot_gates
 from chat import consumer as chat_consumer
 from identity import service as identity_service
+from genesis import service as genesis_service
 from hosted import config_store as hosted_config_store
 
 
@@ -217,7 +218,8 @@ def _model_api_steps_with_genesis(
         "passing": done,
         "job_id": genesis_job.get("job_id", ""),
         "job_status": status,
-        "phase": stage,
+        # client-facing phase: v2-internal stage -> legacy phase the old iOS maps
+        "phase": genesis_service.public_stage(stage),
         "phase_label": "Genesis complete" if done else ("Genesis failed" if failed else "Genesis processing"),
         "progress": 100 if done else (100 if failed else 24),
         "messages_parsed": _int_value(metadata.get("history_count")),
