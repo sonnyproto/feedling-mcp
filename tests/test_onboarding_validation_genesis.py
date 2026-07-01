@@ -81,6 +81,39 @@ def test_model_api_validate_uses_processing_genesis_job_for_onboarding_steps(mon
     assert steps["hosted_chat"]["passing"] is False
 
 
+def test_model_api_validate_ticks_steps_incrementally_before_done(monkeypatch):
+    # the checklist must light up per-artifact (identity/relationship) as each lands,
+    # NOT wait for the single job `done` — restores the legacy/base behavior. Here the
+    # job is still processing but identity + relationship are already written.
+    _install_model_api_harness(
+        monkeypatch,
+        identity={
+            "agent_name": "小柒",
+            "relationship_started_at": "2026-06-01",
+            "relationship_anchor_source": "genesis_import",
+            "relationship_anchor_evidence": "Imported chat history.",
+        },
+        genesis_jobs=[
+            {
+                "job_id": "genesis_1",
+                "status": "processing",   # NOT done yet
+                "source_kind": "history_import",
+                "identity_status": "initialized",
+                "output": {"stage": "genesis_v2_foreground"},
+                "metadata": {"ingest": "plaintext", "history_count": 2, "timeline_span_days": 1},
+            }
+        ],
+    )
+
+    steps = {s["id"]: s for s in validation._model_api_onboarding_validation_payload(_store())["steps"]}
+
+    # identity + relationship already written -> their steps pass even though not done
+    assert steps["identity_card"]["passing"] is True
+    assert steps["relationship_anchor"]["passing"] is True
+    # history_import stays the overall anchor -> still waiting until the job is done
+    assert steps["history_import"]["passing"] is False
+
+
 def test_model_api_validate_marks_genesis_done_steps_complete(monkeypatch):
     _install_model_api_harness(
         monkeypatch,
