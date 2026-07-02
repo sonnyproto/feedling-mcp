@@ -668,7 +668,63 @@ def test_replace_identity_preserving_anchor_requires_existing_identity(monkeypat
     assert status == "identity_not_initialized"
 
 
-def test_replace_identity_preserving_anchor_rejects_nameless_update(monkeypatch):
+def test_replace_identity_preserving_anchor_allows_nameless_nonempty_update(monkeypatch):
+    captured: dict = {}
+    existing = {
+        "id": "identity_existing",
+        "created_at": "2026-05-01T00:00:00",
+        "relationship_started_at": "2025-01-02",
+        "identity_agent_name_present": True,
+        "identity_dimension_count": 1,
+    }
+    monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: existing)
+
+    def fake_envelope(_store, plaintext, item_id=None):
+        captured["plaintext"] = json.loads(plaintext.decode("utf-8"))
+        captured["item_id"] = item_id
+        return ({
+            "id": item_id,
+            "body_ct": "encrypted_nameless_identity",
+            "nonce": "nonce_new",
+            "K_user": "ku_new",
+            "K_enclave": "ke_new",
+            "visibility": "shared",
+            "owner_user_id": "usr_genesis",
+            "enclave_pk_fpr": "fpr_new",
+        }, "")
+
+    monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", fake_envelope)
+    monkeypatch.setattr(
+        service.identity_service,
+        "_save_identity",
+        lambda _store, doc: captured.update({"saved": doc}),
+    )
+    monkeypatch.setattr(service.boot_gates, "_log_bootstrap_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service.identity_service, "_append_identity_change", lambda *_args, **_kwargs: None)
+
+    status = service.replace_identity_preserving_anchor(
+        _store(),
+        {
+            "identity": {
+                "agent_name": "",
+                "category": "硬核 · 直爽",
+                "self_introduction": "我是懂你的全栈 AI 协作者。",
+                "dimensions": [{"name": "直爽", "value": 90, "description": "说人话，不绕弯。"}],
+            },
+        },
+    )
+
+    assert status == "updated"
+    assert captured["item_id"] == "identity_existing"
+    assert captured["plaintext"]["agent_name"] == ""
+    assert captured["plaintext"]["category"] == "硬核 · 直爽"
+    assert captured["plaintext"]["self_introduction"] == "我是懂你的全栈 AI 协作者。"
+    assert captured["plaintext"]["dimensions"][0]["name"] == "直爽"
+    assert captured["saved"]["id"] == "identity_existing"
+    assert captured["saved"]["body_ct"] == "encrypted_nameless_identity"
+
+
+def test_replace_identity_preserving_anchor_rejects_empty_update(monkeypatch):
     existing = {
         "id": "identity_existing",
         "created_at": "2026-05-01T00:00:00",
@@ -690,17 +746,10 @@ def test_replace_identity_preserving_anchor_rejects_nameless_update(monkeypatch)
 
     status = service.replace_identity_preserving_anchor(
         _store(),
-        {
-            "identity": {
-                "agent_name": "",
-                "category": "硬核 · 直爽",
-                "self_introduction": "我是懂你的全栈 AI 协作者。",
-                "dimensions": [{"name": "直爽", "value": 90, "description": "说人话，不绕弯。"}],
-            },
-        },
+        {"identity": {"agent_name": "", "dimensions": [], "self_introduction": "", "category": "", "signature": []}},
     )
 
-    assert status == "identity_update_incomplete"
+    assert status == "identity_update_empty"
 
 
 def test_apply_memory_outputs_batches_memory_actions(monkeypatch):
@@ -781,3 +830,12 @@ def test_apply_memory_outputs_skips_incomplete_memory_items(monkeypatch):
     assert results == [{"memory": {"id": "m1"}}]
     assert len(calls) == 1
     assert calls[0][0]["memory"]["summary"] == "User likes direct feedback"
+
+
+def test_public_stage_maps_plaintext_reducer_to_friendly_phases():
+    # plaintext_reducer / _done are set before the v2 gate (routes.py), so they can leak
+    # to the client at job start; map them so iOS never shows the raw stage name.
+    assert service.public_stage("plaintext_reducer") == "chat_history_importing"
+    assert service.public_stage("plaintext_reducer_done") == "background_importing"
+    assert service.public_stage("genesis_v2_foreground") == "chat_history_importing"  # unchanged
+    assert service.public_stage("unknown_stage") == "unknown_stage"  # passthrough

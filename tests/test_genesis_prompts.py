@@ -33,6 +33,16 @@ def test_fact_map_prompt_names_user_profile_source_firewall():
     assert "不能推断 TA" in messages[0]["content"]
 
 
+def test_combined_map_prompt_extracts_fact_and_voice_without_touching_reducers():
+    messages = prompts.combined_map_messages("user: 我叫 Z\nta: 别急,我在。")
+    system = messages[0]["content"]
+    assert "fact_candidates" in system
+    assert "voice_candidates" in system
+    assert "逐字" in system
+    assert "绝不编" in system
+    assert messages[1]["content"] == "user: 我叫 Z\nta: 别急,我在。"
+
+
 def test_persona_build_prompt_outputs_system_prompt_markdown():
     messages = prompts.persona_build_messages(
         "你叫 Kai。",

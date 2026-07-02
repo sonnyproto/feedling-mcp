@@ -40,6 +40,11 @@ _PUBLIC_STAGE_MAP = {
     "genesis_v2_background": "background_importing",
     "genesis_v2_background_deferred": "background_importing",
     "genesis_v2_done": "completed",
+    # v1 / pre-gate stages: set at routes.py before the v2 branch, so they leak even on
+    # v2 at job start (and throughout on a v1 fallthrough). iOS localizedHistoryPhase has
+    # no case for them -> shows the raw "plaintext_reducer" text. Map to friendly phases.
+    "plaintext_reducer": "chat_history_importing",
+    "plaintext_reducer_done": "background_importing",
 }
 
 
@@ -571,12 +576,19 @@ def _identity_payload_for_replace(output: dict) -> dict | None:
     relationship anchor metadata. Unlike genesis init, this should preserve the
     user-provided profile fields from the uploaded identity material when present.
     """
-    payload = _identity_payload_from_output(output)
-    if payload is None:
-        return None
     identity = output.get("identity") if isinstance(output.get("identity"), dict) else {}
+    if not identity:
+        return None
+    payload = _identity_payload_from_output(output) or {
+        "agent_name": "",
+        "self_introduction": "",
+        "dimensions": [],
+    }
     if identity.get("self_introduction") is not None:
         payload["self_introduction"] = str(identity.get("self_introduction") or "").strip()[:1200]
+    category = _clean_identity_category(identity.get("category"))
+    if category:
+        payload["category"] = category
     for key in identity_service._IDENTITY_PROFILE_STRING_FIELDS:
         if key in {"agent_name", "self_introduction"}:
             continue
@@ -586,6 +598,20 @@ def _identity_payload_for_replace(output: dict) -> dict | None:
         if isinstance(identity.get(key), list):
             payload[key] = [str(item)[:240] for item in identity[key][:12] if str(item or "").strip()]
     return payload
+
+
+def _identity_replace_payload_has_content(payload: dict) -> bool:
+    if str(payload.get("agent_name") or "").strip():
+        return True
+    if isinstance(payload.get("dimensions"), list) and payload["dimensions"]:
+        return True
+    if str(payload.get("self_introduction") or "").strip():
+        return True
+    if str(payload.get("category") or "").strip():
+        return True
+    if isinstance(payload.get("signature"), list) and payload["signature"]:
+        return True
+    return False
 
 
 def _clean_identity_category(value: Any) -> str:
@@ -770,8 +796,8 @@ def replace_identity_preserving_anchor(store: UserStore, output: dict) -> str:
     payload = _identity_payload_for_replace(output)
     if not payload:
         return "not_provided"
-    if not str(payload.get("agent_name") or "").strip():
-        return "identity_update_incomplete"
+    if not _identity_replace_payload_has_content(payload):
+        return "identity_update_empty"
     envelope, err = core_envelope._build_shared_envelope_for_store(
         store,
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
