@@ -56,7 +56,7 @@ and the Form B section below for the design.
 | CVM ID | `0f065d29-37c6-4c79-b871-04e526c6c91d` (also in `deploy/test-runner-cvm-id.txt`) |
 | App ID | `0cf2da16edc368625cee6898852ebc5dabb51558` |
 | Created | 2026-07-02 as `feedling-io-agents-test`, `tdx.small`, **Phala KMS** (prod9). Provisioned locally via `phala deploy` (no `--cvm-id` ⇒ new app) pinned to `feedling-agent-runner:ab78491` with only the non-secret cross-CVM env (`FEEDLING_API_URL` / `FEEDLING_ENCLAVE_URL` / `AGENT_MAX_CHILDREN`). The **healthy, secret-bearing** deploy + on-chain compose_hash auth are done by the CI `deploy-test-runner-cvm` job (it holds `TEST_DATABASE_URL` / `TEST_FEEDLING_RUNTIME_TOKEN_SECRET` / `ETH_DEPLOYER_KEY`), which `phala deploy --cvm-id`s this same CVM in place. |
-| Compose | `deploy/docker-compose.phala.runner.yaml` — 2 runner containers, own volumes |
+| Compose | `deploy/docker-compose.phala.runner.yaml` — 2 runner containers, own volumes. As of 2026-07-02 also runs the **genesis import worker** (`FEEDLING_GENESIS_WORKER_ENABLED=1` on both; FOR UPDATE SKIP LOCKED de-dupes) — moved here when the main test CVM's inline `agent-runner` was removed. Genesis reaches the main enclave over the passthrough URL (`verify=False`); confirm a real import decrypts once after cutover. |
 | Shares w/ main test CVM | same test RDS (`TEST_DATABASE_URL`), same `FEEDLING_RUNTIME_TOKEN_SECRET`, same Sepolia FeedlingAppAuth `0x9AC0…` (runner publishes its OWN compose_hash there — harmless; iOS audit card only checks the MAIN app's hashes) |
 | Cross-CVM reach | `FEEDLING_API_URL=https://test-api.feedling.app`; `FEEDLING_ENCLAVE_URL=https://173c7f49…-5003s.dstack-pha-prod9.phala.network` (main enclave passthrough, in-enclave TLS, `verify=False`) |
 | Deploy path | CI `deploy-test-runner-cvm` job — DORMANT until repo var `DEPLOY_TEST_RUNNER_CVM=true` AND this CVM id is in the file (both prerequisites now met except the flip). |
@@ -67,12 +67,23 @@ and the Form B section below for the design.
 The `agent-runner` service runs `backend/agent_runtime/supervisor.py`: a
 multi-tenant supervisor that hosts the resident consumer
 (`tools/chat_resident_consumer.py`) one process per user, driving `claude` /
-`codex exec` in cli mode. It's defined **inline** in both
-`docker-compose.phala.yaml` and `docker-compose.phala.test.yaml` (its image
-`ghcr.io/teleport-computer/feedling-agent-runner:<sha>` is built by
-`docker-publish.yml` from `deploy/Dockerfile.agent-runner` and pinned by the same
-CI step that pins the backend image). The standalone
-`docker-compose.agent-runner.yaml` overlay is now **local-dev only** (superseded).
+`codex exec` in cli mode. Its image `ghcr.io/teleport-computer/feedling-agent-runner:<sha>`
+is built by `docker-publish.yml` from `deploy/Dockerfile.agent-runner` and pinned by
+the same CI step that pins the backend image. The standalone
+`docker-compose.agent-runner.yaml` overlay is **local-dev only** (superseded).
+
+**Where it runs (test vs prod diverge as of 2026-07-02):**
+- **prod** — still defined **inline** in `docker-compose.phala.yaml` (hosting +
+  genesis worker on the main prod CVM). Unchanged until prod adopts Form B.
+- **test** — the inline `agent-runner` was **removed** from
+  `docker-compose.phala.test.yaml`. The main test CVM now runs only
+  backend/enclave/ingress; **all** hosting AND the genesis import worker moved to
+  the standalone runner CVM (`feedling-io-agents-test`, see
+  `docker-compose.phala.runner.yaml`). The backend keeps `FEEDLING_HOST_ALL` etc.
+  and still routes sends to the pool — the runner-CVM consumers drain them; the
+  wedge guard stays live off the runner CVM's heartbeats. **Consequence:** if the
+  runner CVM is fully down, test has NO host → sends 503 (fail-loud, by design) and
+  genesis imports pause until it returns.
 
 **Idle by default = zero behaviour change.** With `AGENT_RUNTIME_USERS` empty and
 `AGENT_RUNTIME_AUTODISCOVER` unset, the supervisor spawns nobody (it idles and

@@ -229,65 +229,6 @@ services:
       enclave:
         condition: service_healthy
 
-  # agent-runner — 4th CVM service. Multi-tenant supervisor hosting the resident
-  # consumer (tools/chat_resident_consumer.py) per user, driving claude/codex in
-  # cli mode. Idle by default: with an empty AGENT_RUNTIME_USERS and autodiscover
-  # off it spawns nobody (zero behaviour change). Start real-device testing by
-  # injecting AGENT_RUNTIME_USERS (roster JSON) via the encrypted env channel —
-  # no compose change / on-chain re-auth needed. See deploy/DEPLOYMENTS.md.
-  agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:37d6138
-    command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
-    restart: unless-stopped
-    environment:
-      FEEDLING_API_URL: "http://backend:5001"
-      FEEDLING_ENCLAVE_URL: "https://enclave:5003"
-      AGENT_DATA_ROOT: "/agent-data"
-      # Lease renewal runs in its own thread (decoupled from the resolve lap), so a
-      # larger TTL is pure headroom. Tunable via encrypted env (interpolated).
-      AGENT_LEASE_TTL_SEC: "${AGENT_LEASE_TTL_SEC:-300}"
-      AGENT_TICK_INTERVAL_SEC: "${AGENT_TICK_INTERVAL_SEC:-15}"
-      # Envelope cache TTL + resolution fan-out — collapse the host-all resolve lap.
-      AGENT_ENVELOPE_REFETCH_SEC: "${AGENT_ENVELOPE_REFETCH_SEC:-300}"
-      AGENT_RESOLVE_CONCURRENCY: "${AGENT_RESOLVE_CONCURRENCY:-8}"
-      AGENT_RUNTIME_ISOLATION: "process"
-      # Same external Postgres as the backend (lease table). Encrypted env channel.
-      DATABASE_URL: "${DATABASE_URL:-}"
-      # Roster of users to host (JSON: [{"api_key":...}]). Carries per-user keys →
-      # encrypted env channel, never baked. Empty = idle.
-      AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
-      # Discover hosted-enabled users straight from the DB (intersected with the
-      # roster's credentials). Empty/0 = off.
-      AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
-      # Stage-D runtime token signing secret (mints short-lived per-user tokens so
-      # the consumer drops the long-term api key). Empty = off (consumer uses key).
-      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
-      # TEST e2e: enable the dormant genesis worker in agent-runner. It still
-      # requires FEEDLING_RUNTIME_TOKEN_SECRET + FEEDLING_ENCLAVE_URL at runtime.
-      FEEDLING_GENESIS_WORKER_ENABLED: "1"
-      FEEDLING_GENESIS_WORKER_INTERVAL_SEC: "10"
-      FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC: "7200"
-      # Host-all (zero-roster): mint a token per DB-discovered user and resolve its
-      # provider key with it — no AGENT_RUNTIME_USERS needed. Requires the token
-      # secret above. Empty = off. Mirror the backend's FEEDLING_HOST_ALL.
-      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
-      # Same migration kill-switch as backend. Empty = off; when off, the
-      # resident consumer will not process queued memory_migrate jobs.
-      FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
-      # in-CVM LiteLLM gateway (codex non-openai providers). Empty = off; the proxy
-      # only starts when this is set, and FEEDLING_LITELLM_API_KEY is the bearer
-      # codex presents. FEEDLING_LITELLM_PYTHON is baked in the image (isolated venv).
-      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
-      FEEDLING_LITELLM_PORT: "${FEEDLING_LITELLM_PORT:-4000}"
-      FEEDLING_LITELLM_API_KEY: "${FEEDLING_LITELLM_API_KEY:-}"
-    volumes:
-      - feedling_agent_runtime_test:/agent-data
-    depends_on:
-      backend:
-        condition: service_started
-      enclave:
-        condition: service_healthy
-
 volumes:
   feedling_enclave_data_test:
     name: feedling_enclave_data_test
@@ -297,5 +238,3 @@ volumes:
     name: feedling_ingress_letsencrypt_test
   feedling_ingress_evidences_test:
     name: feedling_ingress_evidences_test
-  feedling_agent_runtime_test:
-    name: feedling_agent_runtime_test
