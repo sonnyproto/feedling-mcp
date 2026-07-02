@@ -21,6 +21,7 @@ import argparse
 import base64
 import hashlib
 import json
+import re
 import sys
 import time
 import urllib.request
@@ -250,6 +251,384 @@ def _decrypt_envelope_user(env: dict, sk_raw: bytes) -> str:
     return pt.decode("utf-8", "replace")
 
 
+def _norm_text(value: object) -> str:
+    text = str(value or "").lower()
+    return re.sub(r"[\s，。、“”‘’：:；;,.!?！？\-_/\\|()（）\[\]{}<>《》]+", "", text)
+
+
+def _memory_text(memory: dict) -> str:
+    parts: list[str] = []
+    for key in ("title", "description", "summary", "content", "her_quote", "context"):
+        value = memory.get(key)
+        if value:
+            parts.append(str(value))
+    if not parts and isinstance(memory.get("inner"), dict):
+        parts.append(_memory_text(memory["inner"]))
+    return "｜".join(parts).strip()
+
+
+def _memory_duplicate_text(memory: dict) -> str:
+    for key in ("description", "content", "summary"):
+        value = str(memory.get(key) or "").strip()
+        if value:
+            return value
+    if isinstance(memory.get("inner"), dict):
+        return _memory_duplicate_text(memory["inner"])
+    return _memory_text(memory)
+
+
+def _fact_keywords(fact: dict) -> list[str]:
+    keywords = fact.get("keywords")
+    if isinstance(keywords, list) and keywords:
+        return [str(k).strip() for k in keywords if str(k).strip()]
+    return [str(fact.get("text") or "").strip()]
+
+
+def _fact_matched(fact: dict, memory_text: str) -> bool:
+    normalized_memory = _norm_text(memory_text)
+    keywords = [_norm_text(k) for k in _fact_keywords(fact)]
+    keywords = [k for k in keywords if k]
+    if not keywords:
+        return False
+    return all(k in normalized_memory for k in keywords)
+
+
+def _dimension_matches(identity_dims: list, expected_dims: list) -> bool:
+    if not expected_dims:
+        return bool(identity_dims)
+    blob = _norm_text(json.dumps(identity_dims, ensure_ascii=False))
+    for dim in expected_dims:
+        name = _norm_text(dim.get("name") if isinstance(dim, dict) else dim)
+        if name and name not in blob:
+            return False
+    return True
+
+
+def _duplicate_pairs(memories: list[dict]) -> list[dict]:
+    seen: dict[str, str] = {}
+    pairs: list[dict] = []
+    for idx, memory in enumerate(memories):
+        text = _norm_text(_memory_duplicate_text(memory))
+        if not text:
+            continue
+        mid = str(memory.get("id") or f"memory_{idx}")
+        if text in seen:
+            pairs.append({"left_id": seen[text], "right_id": mid, "reason": "normalized_text"})
+        else:
+            seen[text] = mid
+    return pairs
+
+
+def evaluate_distill_acceptance(
+    fixture: dict,
+    *,
+    identity: dict,
+    identity_meta: dict,
+    memories: list[dict],
+    validate: dict,
+    persona_text: str,
+    voice_text: str,
+    greeting_messages: list[dict],
+    job: dict,
+) -> dict:
+    expected_persona = fixture.get("persona") if isinstance(fixture.get("persona"), dict) else {}
+    relationship = fixture.get("relationship") if isinstance(fixture.get("relationship"), dict) else {}
+    ground_truth = fixture.get("ground_truth") if isinstance(fixture.get("ground_truth"), dict) else {}
+    expected_facts = [f for f in (ground_truth.get("facts") or []) if isinstance(f, dict)]
+    expected_name = str(expected_persona.get("agent_name") or "").strip()
+    expected_category = str(expected_persona.get("category") or "").strip()
+    expected_dims = [d for d in (expected_persona.get("dimensions") or []) if isinstance(d, dict)]
+    expected_days = relationship.get("expected_days_with_user")
+
+    memory_rows = [
+        {
+            "id": str(memory.get("id") or f"memory_{idx}"),
+            "text": _memory_text(memory),
+            "raw": memory,
+        }
+        for idx, memory in enumerate(memories)
+        if isinstance(memory, dict)
+    ]
+    recalled: list[dict] = []
+    missed: list[dict] = []
+    matched_memory_ids: set[str] = set()
+    for fact in expected_facts:
+        matches = [row for row in memory_rows if _fact_matched(fact, row["text"])]
+        if matches:
+            recalled.append({
+                "id": str(fact.get("id") or ""),
+                "text": str(fact.get("text") or ""),
+                "matched_memory_ids": [m["id"] for m in matches],
+            })
+            matched_memory_ids.update(m["id"] for m in matches)
+        else:
+            missed.append({
+                "id": str(fact.get("id") or ""),
+                "text": str(fact.get("text") or ""),
+                "keywords": _fact_keywords(fact),
+            })
+
+    false_positives = [
+        {"id": row["id"], "text": row["text"]}
+        for row in memory_rows
+        if row["id"] not in matched_memory_ids and row["text"]
+    ]
+    duplicates = _duplicate_pairs([row["raw"] for row in memory_rows])
+    total = len(expected_facts)
+    memory_count = len(memory_rows)
+
+    agent_name = str(identity.get("agent_name") or "").strip()
+    category = str(identity.get("category") or "").strip()
+    self_intro = str(identity.get("self_introduction") or "").strip()
+    dims = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
+    days = identity_meta.get("days_with_user")
+    if not isinstance(days, int):
+        try:
+            days = int(days)
+        except Exception:
+            days = None
+    greeting_ok = any(
+        str(m.get("content") or m.get("text") or "").strip()
+        and str(m.get("role") or "").lower() not in {"", "user"}
+        for m in greeting_messages
+        if isinstance(m, dict)
+    )
+    voice_ok = bool(str(voice_text or "").strip() or job.get("voice_ref") or job.get("voice_sha256"))
+
+    checks = {
+        "identity_agent_name": bool(agent_name) and (not expected_name or expected_name in agent_name),
+        "identity_category": bool(category) and (not expected_category or expected_category in category),
+        "identity_dimensions": bool(dims) and all(
+            isinstance(d, dict) and str(d.get("description") or "").strip()
+            for d in dims
+        ) and _dimension_matches(dims, expected_dims),
+        "identity_self_introduction": bool(self_intro) and all(
+            _norm_text(k) in _norm_text(self_intro)
+            for k in expected_persona.get("self_introduction_keywords", [])
+            if str(k).strip()
+        ),
+        "memory_count_reasonable": memory_count >= min(1, total),
+        "ground_truth_recall": len(missed) == 0,
+        "no_duplicate_memories": len(duplicates) == 0,
+        "relationship_days": (days == expected_days) if isinstance(expected_days, int) else isinstance(days, int),
+        "greeting_non_empty": greeting_ok,
+        "persona_non_empty": bool(str(persona_text or "").strip() or job.get("persona_ref") or job.get("persona_sha256")),
+        "voice_non_empty": voice_ok,
+        "validate_passing": bool(validate.get("passing")),
+    }
+    metrics = {
+        "ground_truth_total": total,
+        "recall_count": len(recalled),
+        "miss_count": len(missed),
+        "recall_rate": (len(recalled) / total) if total else 1.0,
+        "miss_rate": (len(missed) / total) if total else 0.0,
+        "memory_count": memory_count,
+        "false_positive_count": len(false_positives),
+        "false_positive_rate": (len(false_positives) / memory_count) if memory_count else 0.0,
+        "duplicate_pair_count": len(duplicates),
+        "duplicate_rate": (len(duplicates) / memory_count) if memory_count else 0.0,
+    }
+    hard_ok = all(checks.values())
+    # False positives are reported but not a hard fail by default: the model may extract
+    # extra valid facts from support materials. Miss/duplicate/check failures are hard.
+    return {
+        "ok": bool(hard_ok),
+        "job_id": job.get("job_id") or "",
+        "metrics": metrics,
+        "checks": checks,
+        "recalled_facts": recalled,
+        "missed_facts": missed,
+        "false_positives": false_positives,
+        "duplicates": duplicates,
+        "identity": identity,
+        "identity_meta": identity_meta,
+        "validate": validate,
+    }
+
+
+def _pct(value: float) -> str:
+    return f"{value * 100:.1f}%"
+
+
+def render_distill_acceptance_report(report: dict) -> str:
+    metrics = report.get("metrics") if isinstance(report.get("metrics"), dict) else {}
+    lines = [
+        "# Genesis 人物信息蒸馏验收报告",
+        "",
+        f"结论：{'PASS' if report.get('ok') else 'FAIL'}",
+        "",
+        "## 指标总览",
+        f"- ground-truth 总数：{metrics.get('ground_truth_total', 0)}",
+        f"- 召回：{metrics.get('recall_count', 0)} / {metrics.get('ground_truth_total', 0)}",
+        f"- 召回率：{_pct(float(metrics.get('recall_rate') or 0.0))}",
+        f"- 漏抽率：{_pct(float(metrics.get('miss_rate') or 0.0))}",
+        f"- 误报数：{metrics.get('false_positive_count', 0)}（误报率：{_pct(float(metrics.get('false_positive_rate') or 0.0))}）",
+        f"- 重复对：{metrics.get('duplicate_pair_count', 0)}（重复率：{_pct(float(metrics.get('duplicate_rate') or 0.0))}）",
+        "",
+        "## 数据齐检查",
+    ]
+    checks = report.get("checks") if isinstance(report.get("checks"), dict) else {}
+    for key, value in checks.items():
+        lines.append(f"- {key}：{'PASS' if value else 'FAIL'}")
+    lines.extend(["", "## 漏抽"])
+    missed = report.get("missed_facts") if isinstance(report.get("missed_facts"), list) else []
+    if missed:
+        for item in missed:
+            lines.append(f"- 漏抽：{item.get('id', '')}｜{item.get('text', '')}")
+    else:
+        lines.append("- 无")
+    lines.extend(["", "## 误报"])
+    false_positives = report.get("false_positives") if isinstance(report.get("false_positives"), list) else []
+    if false_positives:
+        for item in false_positives:
+            lines.append(f"- 误报：{item.get('id', '')}｜{item.get('text', '')}")
+    else:
+        lines.append("- 无")
+    lines.extend(["", "## 重复"])
+    duplicates = report.get("duplicates") if isinstance(report.get("duplicates"), list) else []
+    if duplicates:
+        for item in duplicates:
+            lines.append(f"- 重复：{item.get('left_id', '')} ↔ {item.get('right_id', '')}｜{item.get('reason', '')}")
+    else:
+        lines.append("- 无")
+    return "\n".join(lines) + "\n"
+
+
+def _load_fixture(path: str) -> dict:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise SystemExit("fixture must be a JSON object")
+    return data
+
+
+def _decrypt_memory_rows(rows: list, sk_raw: bytes) -> list[dict]:
+    out: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        if item.get("body_ct") and not (item.get("title") or item.get("description")):
+            try:
+                inner = json.loads(_decrypt_envelope_user(item, sk_raw))
+                if isinstance(inner, dict):
+                    item.update(inner)
+                    item["inner"] = inner
+            except Exception as e:  # noqa: BLE001
+                item["decrypt_error"] = str(e)[:160]
+        out.append(item)
+    return out
+
+
+def cmd_distill_acceptance(args):
+    import os
+    base = args.api_url.rstrip("/")
+    fixture = _load_fixture(args.fixture)
+    materials = fixture.get("materials") if isinstance(fixture.get("materials"), dict) else {}
+    relationship = fixture.get("relationship") if isinstance(fixture.get("relationship"), dict) else {}
+    args.api_key, args.user_id, _enclave_pk, _user_pk = _provision_user(args)
+    sk_raw = args._user_sk
+    print(json.dumps({"provisioned": True, "user_id": args.user_id}, ensure_ascii=False))
+
+    payload = {
+        "format": str(materials.get("format") or "auto"),
+        "content": str(materials.get("chat_history") or ""),
+        "fresh_start": False,
+        "client_job_id": "distill_accept_" + os.urandom(8).hex(),
+    }
+    if relationship.get("relationship_started_at"):
+        payload["relationship_started_at"] = str(relationship["relationship_started_at"])
+    for src_key, payload_key in (
+        ("ai_persona", "ai_persona_content"),
+        ("personal_profile", "personal_profile_content"),
+        ("memory_summary", "memory_summary_content"),
+    ):
+        value = materials.get(src_key)
+        if value:
+            payload[payload_key] = str(value)
+
+    s, b = _http("POST", f"{base}/v1/genesis/imports/plaintext", args.api_key, json_body=payload)
+    job_id = (b.get("job") or {}).get("job_id") or b.get("job_id")
+    if s >= 400 or not job_id:
+        print(json.dumps({"ok": False, "step": "upload", "status": s, "body": b}, ensure_ascii=False))
+        return 1
+    print(json.dumps({"upload": "ok", "job_id": job_id}, ensure_ascii=False))
+
+    deadline = time.time() + args.timeout
+    job_body: dict = {}
+    job: dict = {}
+    while time.time() < deadline:
+        try:
+            _s, job_body = _http("GET", f"{base}/v1/genesis/imports/{job_id}", args.api_key)
+        except SystemExit:
+            time.sleep(args.poll)
+            continue
+        job = job_body.get("job") if isinstance(job_body.get("job"), dict) else {}
+        if str(job.get("status") or "").lower() in ("done", "failed"):
+            break
+        time.sleep(args.poll)
+    if str(job.get("status") or "").lower() != "done":
+        print(json.dumps({"ok": False, "step": "distill", "job_id": job_id, "job": job}, ensure_ascii=False))
+        return 1
+
+    identity_plain: dict = {}
+    identity_meta: dict = {}
+    chat: dict = {}
+    intro_deadline = time.time() + args.intro_timeout
+    while time.time() < intro_deadline:
+        _s, identity_body = _http("GET", f"{base}/v1/identity/get", args.api_key)
+        identity_payload = identity_body.get("identity") or {}
+        identity_meta = dict(identity_payload) if isinstance(identity_payload, dict) else {}
+        if isinstance(identity_payload, dict) and identity_payload.get("body_ct"):
+            identity_plain = json.loads(_decrypt_envelope_user(identity_payload, sk_raw))
+        elif isinstance(identity_payload, dict):
+            identity_plain = identity_payload
+        _s, chat = _http("GET", f"{base}/v1/chat/history?limit=20", args.api_key)
+        greeting_ok = any(
+            str(m.get("content") or m.get("text") or "").strip()
+            and str(m.get("role") or "").lower() not in {"", "user"}
+            for m in (chat.get("messages") or [])
+            if isinstance(m, dict)
+        )
+        if str(identity_plain.get("self_introduction") or "").strip() and greeting_ok:
+            break
+        time.sleep(args.poll)
+
+    _s, memory_body = _http("GET", f"{base}/v1/memory/list?limit={args.memory_limit}", args.api_key)
+    memories = _decrypt_memory_rows(memory_body.get("moments") or [], sk_raw)
+    _s, validate = _http("GET", f"{base}/v1/onboarding/validate", args.api_key)
+
+    persona_text = ""
+    persona_env = (job_body.get("persona") or {}).get("content_envelope") or {}
+    if persona_env:
+        try:
+            persona_text = _decrypt_envelope_user(persona_env, sk_raw)
+        except Exception as e:  # noqa: BLE001
+            persona_text = f"<persona decrypt failed: {e}>"
+    report = evaluate_distill_acceptance(
+        fixture,
+        identity=identity_plain,
+        identity_meta=identity_meta,
+        memories=memories,
+        validate=validate,
+        persona_text=persona_text,
+        voice_text="",
+        greeting_messages=chat.get("messages") or [],
+        job={**job, "job_id": job_id},
+    )
+    rendered = render_distill_acceptance_report(report)
+    if args.report:
+        Path(args.report).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.report).write_text(rendered + "\n```json\n" + json.dumps(report, ensure_ascii=False, indent=2) + "\n```\n", encoding="utf-8")
+    print(rendered)
+    print(json.dumps(report, ensure_ascii=False))
+    if not getattr(args, "no_cleanup", False):
+        try:
+            _http("DELETE", f"{base}/v1/model_api/delete", args.api_key)
+        except Exception:  # noqa: BLE001
+            pass
+    return 0 if report.get("ok") else 1
+
+
 def cmd_acceptance(args):
     """Per-source identity acceptance: upload 4 materials in one plaintext request
     (history + ai_persona card WITH a name + memory + user_profile WITH a firewall
@@ -458,6 +837,24 @@ def main():
                     help="keep the throwaway's model_api (default: DELETE it after the run "
                          "so it stops polluting host-all autodiscover)")
     ac.set_defaults(func=cmd_acceptance)
+
+    da = sub.add_parser("distill-acceptance",
+                        help="live plaintext genesis distillation acceptance with ground-truth fact scoring")
+    da.add_argument("--api-url", required=True)
+    da.add_argument("--provider", default="anthropic")
+    da.add_argument("--model", default="claude-haiku-4-5-20251001")
+    da.add_argument("--base-url", default="")
+    da.add_argument("--fixture", required=True,
+                    help="JSON fixture with materials, persona expectations, relationship, and ground_truth facts")
+    da.add_argument("--timeout", type=float, default=900)
+    da.add_argument("--poll", type=float, default=10)
+    da.add_argument("--intro-timeout", type=float, default=180,
+                    help="seconds to wait after job done for self_introduction + greeting")
+    da.add_argument("--memory-limit", type=int, default=100)
+    da.add_argument("--report", default="", help="optional markdown report path")
+    da.add_argument("--no-cleanup", action="store_true",
+                    help="keep the throwaway's model_api after the run")
+    da.set_defaults(func=cmd_distill_acceptance)
 
     args = p.parse_args()
     sys.exit(args.func(args))

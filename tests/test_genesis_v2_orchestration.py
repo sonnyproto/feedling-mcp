@@ -11,6 +11,8 @@ What must hold:
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 import db  # noqa: E402
@@ -22,6 +24,21 @@ class _Store:
     user_id = "u1"
 
 
+@pytest.fixture(autouse=True)
+def _stub_full_fact_write(monkeypatch):
+    def fake_full_fact_write(**kwargs):
+        return {
+            "memories": [
+                {"summary": str(item.get("summary") or item.get("content") or "memory")}
+                for item in (kwargs.get("fact_candidates") or [])
+                if isinstance(item, dict)
+            ],
+            "identity": {"agent_name": "小柒", "dimensions": []},
+        }
+
+    monkeypatch.setattr(worker, "build_memory_output_from_fact_candidates", fake_full_fact_write)
+
+
 def _groups():
     return [
         {"source_kind": "history_import", "source_family": "history", "chunk_texts": ["c1", "c2"]},
@@ -30,8 +47,20 @@ def _groups():
 
 
 def _greetable_fg(**_):
-    return {"memories": [{"summary": "x"}], "identity": {"agent_name": "老 A"},
-            "core_fact_candidates": [{"summary": "我家狗叫蛋子"}], "source_family": "history"}
+    return {
+        "memories": [{"summary": "x"}],
+        "identity": {"agent_name": "老 A"},
+        "all_fact_candidates": [
+            {"summary": "我家狗叫蛋子"},
+            {"summary": "用户住在河南焦作"},
+            {"summary": "用户远程做前端开发"},
+            {"summary": "用户喜欢健身"},
+            {"summary": "用户喜欢唱歌"},
+            {"summary": "用户是 INFJ"},
+        ],
+        "core_fact_candidates": [{"summary": "我家狗叫蛋子"}],
+        "source_family": "history",
+    }
 
 
 def test_v2_foreground_completes_then_background_skips_only_history_core(monkeypatch):
@@ -41,6 +70,8 @@ def test_v2_foreground_completes_then_background_skips_only_history_core(monkeyp
     # the foreground-applied merge carries the core memory text -> threaded to background
     monkeypatch.setattr(routes, "_plaintext_merge_reducer_outputs",
                         lambda outs, **k: {"memories": [{"summary": "用户养了一只狗叫蛋子"}]})
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **k: ({"agent_name": "", "dimensions": []}, []))
     monkeypatch.setattr(service, "apply_reducer_output",
                         lambda *a, **k: calls.__setitem__("fg_applied", a[3]))
     monkeypatch.setattr(routes, "_run_plaintext_background_enrichment",
@@ -78,6 +109,8 @@ def test_v2_background_failure_keeps_job_done(monkeypatch):
     monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
     monkeypatch.setattr(routes, "_plaintext_merge_reducer_outputs", lambda outs, **k: {"merged": True})
     monkeypatch.setattr(service, "apply_reducer_output", lambda *a, **k: None)
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **k: ({"agent_name": "", "dimensions": []}, []))
 
     def boom(*a, **k):
         raise RuntimeError("provider 402 out of credits")
@@ -162,6 +195,167 @@ def test_v2_foreground_writes_identity_greeting_then_completes(monkeypatch):
     assert calls["stored_days"] == 144                           # relationship anchor days -> identity
     assert calls["bg_write_identity"] is False                   # background must NOT re-write identity
     assert "used_apply_reducer" not in calls                     # did NOT take the empty-identity fallback
+
+
+def test_v2_foreground_writes_full_memory_set_and_feeds_identity_and_greeting(monkeypatch):
+    calls = {}
+    full_memories = [{"summary": f"full memory {idx}"} for idx in range(6)]
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
+
+    def fake_full_fact_write(**kwargs):
+        calls["full_fact_candidates"] = kwargs["fact_candidates"]
+        return {"memories": full_memories, "identity": {"agent_name": "小柒"}}
+
+    monkeypatch.setattr(worker, "build_memory_output_from_fact_candidates", fake_full_fact_write)
+    monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **k: calls.update(identity_memories=k["core_memories"]) or
+                        ({"agent_name": "小柒", "dimensions": [{"name": "温柔"}]}, []))
+    monkeypatch.setattr(service, "apply_memory_outputs",
+                        lambda store, api_key, out: calls.update(written_memories=out.get("memories")) or
+                        (len(out.get("memories") or []), []))
+    monkeypatch.setattr(history_import, "_store_identity_payload", lambda *a, **k: None)
+    monkeypatch.setattr(history_import, "_generate_model_api_onboarding_greeting",
+                        lambda runtime, msgs, memory_cards, identity_payload, days, language:
+                        calls.update(greeting_memories=memory_cards) or ("你好", []))
+    monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting", lambda *a, **k: None)
+    monkeypatch.setattr(db, "genesis_complete_job", lambda *a, **k: {"job_id": "job1", "status": "done"})
+    monkeypatch.setattr(service, "write_genesis_state", lambda *a, **k: None)
+    monkeypatch.setattr(routes, "_run_plaintext_background_enrichment", lambda *a, **k: None)
+
+    handled = routes._run_plaintext_genesis_v2(
+        _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
+        relationship_anchor={"days_with_user": 144},
+        analysis_messages=[{"role": "user", "content": "hi"}])
+
+    assert handled is True
+    assert len(calls["full_fact_candidates"]) == 12
+    assert calls["written_memories"] == full_memories
+    assert calls["identity_memories"] == full_memories
+    assert calls["greeting_memories"] == full_memories
+
+
+def test_v2_foreground_full_fact_write_spans_all_source_groups(monkeypatch):
+    calls = {"foreground_kinds": []}
+
+    def fake_foreground(**kwargs):
+        source_kind = kwargs["source_kind"]
+        calls["foreground_kinds"].append(source_kind)
+        if source_kind == "history_import":
+            return {
+                "memories": [{"summary": "history"}],
+                "identity": {"agent_name": "小柒"},
+                "all_fact_candidates": [{"summary": "用户养了一只狗叫蛋子"}],
+                "core_fact_candidates": [{"summary": "用户养了一只狗叫蛋子"}],
+                "source_family": "history",
+            }
+        return {
+            "memories": [{"summary": "persona"}],
+            "identity": {"agent_name": "小柒"},
+            "all_fact_candidates": [{"summary": "乔伊是广告设计师和自媒体创作者"}],
+            "core_fact_candidates": [{"summary": "乔伊是广告设计师和自媒体创作者"}],
+            "source_family": "ai_persona",
+        }
+
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts", fake_foreground)
+
+    def fake_full_fact_write(**kwargs):
+        calls["full_fact_candidates"] = kwargs["fact_candidates"]
+        return {"memories": [{"summary": item["summary"]} for item in kwargs["fact_candidates"]]}
+
+    monkeypatch.setattr(worker, "build_memory_output_from_fact_candidates", fake_full_fact_write)
+    monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **k: ({"agent_name": "小柒", "dimensions": [{"name": "温柔"}]}, []))
+    monkeypatch.setattr(service, "apply_memory_outputs", lambda *a, **k: (2, []))
+    monkeypatch.setattr(history_import, "_store_identity_payload", lambda *a, **k: None)
+    monkeypatch.setattr(history_import, "_generate_model_api_onboarding_greeting", lambda *a, **k: ("你好", []))
+    monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting", lambda *a, **k: None)
+    monkeypatch.setattr(db, "genesis_complete_job", lambda *a, **k: {"job_id": "job1", "status": "done"})
+    monkeypatch.setattr(service, "write_genesis_state", lambda *a, **k: None)
+    monkeypatch.setattr(routes, "_run_plaintext_background_enrichment", lambda *a, **k: None)
+
+    handled = routes._run_plaintext_genesis_v2(
+        _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
+        relationship_anchor={"days_with_user": 144},
+        analysis_messages=[{"role": "user", "content": "hi"}])
+
+    assert handled is True
+    assert calls["foreground_kinds"] == ["history_import", "ai_persona_import"]
+    assert [item["summary"] for item in calls["full_fact_candidates"]] == [
+        "用户养了一只狗叫蛋子",
+        "乔伊是广告设计师和自媒体创作者",
+    ]
+
+
+def test_v2_background_can_skip_fact_write_for_voice_persona_only(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+
+    def fake_build(**kwargs):
+        calls.setdefault("include_memory", []).append(kwargs.get("include_memory"))
+        return {
+            "memories": [{"summary": "should not be produced"}] if kwargs.get("include_memory", True) else [],
+            "persona": {"content": "voice-backed persona"},
+            "voice_workset": {
+                "behavior_notes": ["短句"],
+                "exemplars": [{"turns": [{"role": "ta", "text": "我在"}]}],
+            },
+            "source_family": "history",
+        }
+
+    monkeypatch.setattr(worker, "build_reducer_output_from_texts", fake_build)
+    monkeypatch.setattr(routes, "_plaintext_merge_reducer_outputs",
+                        lambda outs, **k: {
+                            "memories": [m for out in outs for m in out.get("memories", [])],
+                            "persona": outs[0].get("persona", {}),
+                            "voice_workset": outs[0].get("voice_workset", {}),
+                        })
+    monkeypatch.setattr(service, "apply_memory_outputs",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("background must not write memory")))
+    monkeypatch.setattr(service, "init_identity_if_absent",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("background must not write identity")))
+    monkeypatch.setattr(service, "write_persona_artifact", lambda *a, **k: calls.update(persona=True) or ("ref", "sha"))
+    monkeypatch.setattr(service, "write_voice_artifact", lambda *a, **k: calls.update(voice=True) or ("vref", "vsha"))
+
+    routes._run_plaintext_background_enrichment(
+        _Store(), "key", "job1", runtime=object(),
+        source_groups=[{"source_kind": "history_import", "source_family": "history", "chunk_texts": ["c"]}],
+        relationship_anchor=None, skip_family="history", skip_texts=set(),
+        known_memories=[], write_identity=False, include_memory=False)
+
+    assert calls["include_memory"] == [False]
+    assert calls["persona"] is True
+    assert calls["voice"] is True
+
+
+def test_v2_foreground_provider_identity_failure_marks_job_failed(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
+    monkeypatch.setattr(worker, "build_memory_output_from_fact_candidates",
+                        lambda **k: {"memories": [{"summary": "用户养狗"}]})
+    monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **k: ({"agent_name": "Fallback", "dimensions": [{"name": "泛化"}]},
+                                     ["provider_identity_failed:ProviderError:provider_http_402:credits"]))
+    monkeypatch.setattr(service, "mark_failed",
+                        lambda store, job_id, error: calls.update(job_id=job_id, error=error) or
+                        {"job_id": job_id, "status": "failed", "error": error})
+    monkeypatch.setattr(service, "apply_memory_outputs",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must fail before writes")))
+
+    handled = routes._run_plaintext_genesis_v2(
+        _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
+        relationship_anchor={"days_with_user": 1},
+        analysis_messages=[{"role": "user", "content": "hi"}])
+
+    assert handled is True
+    assert calls["job_id"] == "job1"
+    assert "provider_identity_failed" in calls["error"]
+    assert "402" in calls["error"]
 
 
 def test_v2_foreground_honors_explicit_relationship_date(monkeypatch):

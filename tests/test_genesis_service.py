@@ -587,6 +587,87 @@ def test_init_identity_upserts_genesis_fields_and_preserves_agent_profile(monkey
     assert captured["saved"]["identity_dimension_count"] == 1
 
 
+def test_replace_identity_preserving_anchor_replaces_body_only(monkeypatch):
+    captured: dict = {}
+    existing = {
+        "id": "identity_existing",
+        "created_at": "2026-05-01T00:00:00",
+        "relationship_started_at": "2025-01-02",
+        "relationship_anchor_source": "user_confirmed",
+        "relationship_anchor_evidence": "typed date",
+        "identity_agent_name_present": True,
+        "identity_dimension_count": 2,
+    }
+
+    monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: existing)
+
+    def fake_envelope(_store, plaintext, item_id=None):
+        captured["plaintext"] = json.loads(plaintext.decode("utf-8"))
+        captured["item_id"] = item_id
+        return ({
+            "id": item_id,
+            "body_ct": "encrypted_new_identity",
+            "nonce": "nonce_new",
+            "K_user": "ku_new",
+            "K_enclave": "ke_new",
+            "visibility": "shared",
+            "owner_user_id": "usr_genesis",
+            "enclave_pk_fpr": "fpr_new",
+        }, "")
+
+    monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", fake_envelope)
+    monkeypatch.setattr(
+        service.identity_service,
+        "_save_identity",
+        lambda _store, doc: captured.update({"saved": doc}),
+    )
+    monkeypatch.setattr(service.boot_gates, "_log_bootstrap_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service.identity_service, "_append_identity_change", lambda *_args, **_kwargs: None)
+
+    status = service.replace_identity_preserving_anchor(
+        _store(),
+        {
+            "identity": {
+                "agent_name": "乔伊",
+                "category": "创意 · 活泼",
+                "self_introduction": "我是乔伊。",
+                "dimensions": [{"name": "创造力", "value": 91, "description": "广告设计师和自媒体创作者。"}],
+            },
+            "relationship_started_at": "2099-12-31",
+            "days_with_user": 9999,
+            "relationship_anchor_evidence": "must not overwrite",
+        },
+    )
+
+    assert status == "updated"
+    assert captured["item_id"] == "identity_existing"
+    assert captured["plaintext"]["agent_name"] == "乔伊"
+    assert captured["plaintext"]["category"] == "创意 · 活泼"
+    assert captured["plaintext"]["dimensions"][0]["name"] == "创造力"
+    assert captured["saved"]["id"] == "identity_existing"
+    assert captured["saved"]["created_at"] == "2026-05-01T00:00:00"
+    assert captured["saved"]["relationship_started_at"] == "2025-01-02"
+    assert captured["saved"]["relationship_anchor_source"] == "user_confirmed"
+    assert captured["saved"]["relationship_anchor_evidence"] == "typed date"
+    assert captured["saved"]["body_ct"] == "encrypted_new_identity"
+
+
+def test_replace_identity_preserving_anchor_requires_existing_identity(monkeypatch):
+    monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: None)
+    monkeypatch.setattr(
+        service.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not build identity")),
+    )
+
+    status = service.replace_identity_preserving_anchor(
+        _store(),
+        {"identity": {"agent_name": "乔伊", "dimensions": []}},
+    )
+
+    assert status == "identity_not_initialized"
+
+
 def test_apply_memory_outputs_batches_memory_actions(monkeypatch):
     calls = []
 
