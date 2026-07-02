@@ -289,6 +289,22 @@ IMAGE_TEMP_DIR = Path(os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_image
 SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "on_mention").strip().lower()
 SCREEN_CONTEXT_MAX_AGE_SEC = int(os.environ.get("SCREEN_CONTEXT_MAX_AGE_SEC", "300"))
 SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
+# Foreground chat continuity. codex has no --resume and the hosted claude command
+# carries no session, so those drivers otherwise forget everything after the first
+# turn. When active we prepend a short recent-chat transcript to each foreground
+# turn so continuity does not depend on the agent's own (missing/fragile) session.
+#   auto (default) — inject only for codex / claude (drivers with no reliable
+#                    cross-turn memory); pi resumes natively and is skipped.
+#   on/always      — inject for every driver (escape hatch).
+#   off            — never inject; claude falls back to its --resume path.
+FOREGROUND_CHAT_CONTEXT_MODE = os.environ.get(
+    "FEEDLING_FOREGROUND_CHAT_CONTEXT", "auto"
+).strip().lower()
+FOREGROUND_CHAT_CONTEXT_LIMIT = int(os.environ.get("FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT", "8"))
+FOREGROUND_CHAT_CONTEXT_HEADER = os.environ.get(
+    "FEEDLING_FOREGROUND_CHAT_CONTEXT_HEADER",
+    "[最近对话记录 — 仅供你保持连续；最后那条用户消息才是此刻要回应的]",
+)
 FALLBACK_REPLY = os.environ.get(
     "FALLBACK_REPLY", "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
 )
@@ -2396,6 +2412,42 @@ def _is_codex_cmd(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "codex"
 
 
+def _cli_cmd_tokens() -> list[str]:
+    """Tokenize the raw AGENT_CLI_CMD template for driver detection.
+
+    Placeholders like ``{message}`` survive shlex.split unharmed; we only need
+    cmd[0] to name the driver, so no substitution is required."""
+    try:
+        return shlex.split(AGENT_CLI_CMD)
+    except ValueError:
+        return AGENT_CLI_CMD.split()
+
+
+def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
+    """Whether foreground turns get a resident-injected recent-chat transcript.
+
+    Gated so we don't double up context for agents that already carry it: only
+    codex (no --resume) and claude (hosted command has no session; its scrape +
+    --resume continuity is unreliable) inject in ``auto``. pi resumes natively so
+    it is skipped. ``on``/``always`` forces it for any driver; ``off`` disables.
+
+    A claude command that ALREADY carries its own continuity in the operator's
+    template (``--resume`` / ``-r`` / ``--session-id``) is skipped in ``auto`` too:
+    it has native session, so a resident transcript would double-supply context.
+    The hosted default claude command has none of these, so it still injects."""
+    mode = FOREGROUND_CHAT_CONTEXT_MODE
+    if mode in {"0", "false", "off", "no", "none", "disabled"}:
+        return False
+    if mode in {"1", "true", "on", "yes", "always"}:
+        return True
+    cmd = cmd if cmd is not None else _cli_cmd_tokens()
+    if _is_codex_cmd(cmd):
+        return True
+    if _is_claude_code_cmd(cmd):
+        return not (_has_cli_resume(cmd) or _has_claude_session_id(cmd))
+    return False
+
+
 def _cli_flag_value(cmd: list[str], flag: str) -> str:
     try:
         idx = cmd.index(flag)
@@ -2639,7 +2691,19 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
             cmd = [cmd[0], "--print", *cmd[1:]]
         if not _has_claude_output_format(cmd):
             cmd = [cmd[0], "--output-format", "json", *cmd[1:]]
-        if sid and not _has_cli_resume(cmd) and not _has_claude_session_id(cmd):
+        # When THIS turn's message actually carries an injected recent-chat
+        # transcript (see _foreground_agent_message), that transcript is the single
+        # continuity source — do NOT also inject claude's fragile --resume, which
+        # would duplicate context or start a fresh session on a stale id. But when
+        # no transcript was injected (injection off, history unavailable, or first
+        # turn), keep --resume as the fallback so continuity is never dropped on
+        # both sides at once.
+        if (
+            sid
+            and not _has_cli_resume(cmd)
+            and not _has_claude_session_id(cmd)
+            and not _message_has_injected_history(message)
+        ):
             cmd = [cmd[0], "--resume", sid, *cmd[1:]]
 
     return _resolve_cli_executable(cmd)
@@ -2946,6 +3010,53 @@ def _resident_foreground_chat_message_v2(content: str) -> str:
     use their registered native tools (io_cli for Feedling perception).
     """
     return content
+
+
+def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = None) -> str:
+    """Short plaintext transcript of recent chat turns STRICTLY older than the
+    current turn, for injecting cross-turn continuity into foreground messages.
+
+    Uses the same decrypt sources as normal chat processing. Returns "" when no
+    decrypt source is configured/reachable or there is no prior turn — the caller
+    then sends the bare message (graceful degradation, never raises)."""
+    limit = max(1, min(limit if limit is not None else FOREGROUND_CHAT_CONTEXT_LIMIT, 50))
+    fetch_limit = max(limit + 4, 20)
+    try:
+        history = get_decrypted_history(since=0, limit=fetch_limit)
+    except Exception as e:  # noqa: BLE001 — continuity is best-effort, never fatal
+        log.warning("foreground chat context fetch failed: %s", e)
+        return ""
+    if not history:
+        return ""
+    messages = _clean_messages_for_proactive_context(history)
+    if before_ts > 0:
+        messages = [m for m in messages if _message_ts_for_context(m) < before_ts]
+    selected = messages[-limit:]
+    if not selected:
+        return ""
+    now = time.time()
+    return "\n".join(_chat_context_line(m, now=now, stale=False) for m in selected)
+
+
+def _foreground_agent_message(content: str, *, current_ts: float) -> str:
+    """Prepend a recent-chat transcript to a foreground turn when the active
+    driver has no reliable session of its own (codex / claude). Returns ``content``
+    unchanged when injection is disabled or no prior context is available."""
+    if not _foreground_history_injection_enabled():
+        return content
+    transcript = _recent_chat_context_for_foreground(before_ts=current_ts)
+    if not transcript:
+        return content
+    return f"{FOREGROUND_CHAT_CONTEXT_HEADER}\n{transcript}\n\n{content}"
+
+
+def _message_has_injected_history(message: str) -> bool:
+    """True when ``message`` was produced by _foreground_agent_message with a
+    transcript actually prepended. This is the single signal used to decide
+    whether claude's --resume can be safely suppressed for THIS turn — keeping
+    the resume-suppression and the transcript-injection decisions consistent even
+    when history is unavailable and injection silently degrades to bare content."""
+    return isinstance(message, str) and message.startswith(FOREGROUND_CHAT_CONTEXT_HEADER)
 
 
 # ---------------------------------------------------------------------------
@@ -5784,6 +5895,12 @@ def _process_messages(messages: list) -> float:
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
         content = _prepend_time_anchor_foreground(content, ts)
+        # Then inject cross-turn continuity for drivers with no reliable session of
+        # their own (codex / hosted claude). No-op for pi / when disabled / when
+        # there is no prior turn. Done once here so every dispatch branch below
+        # (v2, image, plain) carries the same context. Wraps the time-anchored
+        # content so the transcript sits above this turn's grounded message.
+        content = _foreground_agent_message(content, current_ts=ts)
 
         use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
         try:
