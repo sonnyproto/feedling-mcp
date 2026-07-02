@@ -3523,3 +3523,94 @@ def test_non_openclaw_shapes_unaffected():
     # plain multi-bubble and a bare string still work (no regression)
     assert crc._agent_turn_from_raw({"messages": ["你好"]}).messages == ["你好"]
     assert crc._reply_from_json_obj({"reply": "hi"}) == "hi"
+
+
+# ---------------------------------------------------------------------------
+# whoami TTL cache tests
+# ---------------------------------------------------------------------------
+
+
+def _seed_valid_whoami_cache():
+    crc._whoami_cache.update(
+        user_id="usr_test", user_pk=b"\x01" * 32, enclave_pk=b"\x02" * 32
+    )
+
+
+def test_refresh_whoami_skips_network_when_fresh(monkeypatch):
+    _seed_valid_whoami_cache()
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_TTL_SEC", 300.0)
+    monkeypatch.setattr(crc, "_whoami_cache_loaded_at", time.monotonic())
+    called = MagicMock(return_value=True)
+    monkeypatch.setattr(crc, "_load_whoami_with_retries", called)
+
+    assert crc._refresh_whoami_for_encrypted_reply() is True
+    called.assert_not_called()
+
+
+def test_refresh_whoami_fetches_when_stale(monkeypatch):
+    _seed_valid_whoami_cache()
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_TTL_SEC", 300.0)
+    monkeypatch.setattr(crc, "_whoami_cache_loaded_at", time.monotonic() - 10_000)
+    called = MagicMock(return_value=True)
+    monkeypatch.setattr(crc, "_load_whoami_with_retries", called)
+
+    assert crc._refresh_whoami_for_encrypted_reply() is True
+    called.assert_called_once()
+
+
+def test_refresh_whoami_ttl_zero_always_fetches(monkeypatch):
+    _seed_valid_whoami_cache()
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_TTL_SEC", 0.0)
+    monkeypatch.setattr(crc, "_whoami_cache_loaded_at", time.monotonic())
+    called = MagicMock(return_value=True)
+    monkeypatch.setattr(crc, "_load_whoami_with_retries", called)
+
+    assert crc._refresh_whoami_for_encrypted_reply() is True
+    called.assert_called_once()
+
+
+def test_refresh_whoami_refetches_when_enclave_pk_missing(monkeypatch):
+    # Partial whoami: identity present but enclave_pk missing must NOT be
+    # treated as fresh — the gate must fall through and refetch so the
+    # missing enclave key can heal.
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_test", "user_pk": b"\x01" * 32, "enclave_pk": None})
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_TTL_SEC", 300.0)
+    monkeypatch.setattr(crc, "_whoami_cache_loaded_at", time.monotonic())
+    called = MagicMock(return_value=True)
+    monkeypatch.setattr(crc, "_load_whoami_with_retries", called)
+
+    assert crc._refresh_whoami_for_encrypted_reply() is True
+    called.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Provider payment (402) circuit breaker tests
+# ---------------------------------------------------------------------------
+
+
+def test_is_provider_payment_error_matches_402_runtimeerror():
+    exc = RuntimeError(
+        "cli agent exited 1: unexpected status 402 Payment Required: "
+        "This request requires more credits"
+    )
+    assert crc._is_provider_payment_error(exc) is True
+
+
+def test_is_provider_payment_error_ignores_other_errors():
+    assert crc._is_provider_payment_error(RuntimeError("connection reset")) is False
+
+
+def test_provider_payment_cooldown_lifecycle(monkeypatch):
+    monkeypatch.setattr(crc, "PROVIDER_PAYMENT_COOLDOWN_SEC", 600.0)
+    crc._clear_provider_payment_cooldown()
+    assert crc._provider_payment_cooling_down() is False
+
+    crc._note_provider_payment_failure()
+    assert crc._provider_payment_cooling_down() is True
+
+    # Simulate cooldown expiry.
+    monkeypatch.setattr(crc, "_provider_payment_cooldown_until", time.monotonic() - 1)
+    assert crc._provider_payment_cooling_down() is False
+
+    crc._clear_provider_payment_cooldown()
+    assert crc._provider_payment_cooling_down() is False
