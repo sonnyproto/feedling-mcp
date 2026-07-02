@@ -636,16 +636,15 @@ def _run_plaintext_genesis_v2(
             evidence=f"genesis_foreground:{job_id}", language=language,
             relationship_started_at=explicit_started_at,
         )
-        greeting_text, _gw = history_import._generate_model_api_onboarding_greeting(
-            runtime, msgs, full_memories, identity_payload, days, language,
+        _append_plaintext_onboarding_greeting(
+            store,
+            runtime=runtime,
+            analysis_messages=msgs,
+            memories=full_memories,
+            identity_payload=identity_payload,
+            days=days,
+            language=language,
         )
-        if not str(greeting_text or "").strip():
-            # greeting is NOT a hard gate — a flaky greeting call must not stall onboarding.
-            # Fall back to a template so hosted_chat still gets a first message.
-            greeting_text = ("好久不见，很高兴又能和你聊天。"
-                             if str(language).startswith("zh")
-                             else "Good to see you again — I'm glad we can talk.")
-        history_import._append_model_api_onboarding_greeting(store, greeting_text)
         completed = db.genesis_complete_job(
             store.user_id, job_id, output={"stage": "genesis_v2_foreground_ready"},
             memory_action_count=mem_count, identity_status="initialized",
@@ -657,6 +656,15 @@ def _run_plaintext_genesis_v2(
         # edge: foreground couldn't derive an identity -> current backstop (complete on
         # core + let the background fill identity via init_identity/persona baseline).
         # Rare, never worse than before; the iOS minimal-seed page is the real fix.
+        _append_plaintext_onboarding_greeting(
+            store,
+            runtime=runtime,
+            analysis_messages=msgs,
+            memories=full_memories,
+            identity_payload=identity_payload,
+            days=days,
+            language=language,
+        )
         service.apply_reducer_output(store, api_key, job_id, fg_merged)
 
     # foreground core memory texts -> background as "already saved, don't repeat"
@@ -769,6 +777,40 @@ def _run_plaintext_background_enrichment(
     db.genesis_set_job_status(
         store.user_id, job_id, status=service.DONE_JOB_STATUS, output={"stage": "genesis_v2_done"},
     )
+
+
+def _append_plaintext_onboarding_greeting(
+    store,
+    *,
+    runtime,
+    analysis_messages: list[dict],
+    memories: list[dict],
+    identity_payload: dict,
+    days: int,
+    language: str,
+) -> str:
+    try:
+        greeting_text, _warnings = history_import._generate_model_api_onboarding_greeting(
+            runtime,
+            analysis_messages,
+            memories,
+            identity_payload,
+            days,
+            language,
+        )
+    except Exception:
+        greeting_text = ""
+    if not str(greeting_text or "").strip():
+        greeting_text = (
+            "好久不见，很高兴又能和你聊天。"
+            if str(language).startswith("zh")
+            else "Good to see you again — I'm glad we can talk."
+        )
+    try:
+        history_import._append_model_api_onboarding_greeting(store, greeting_text)
+    except Exception:
+        return ""
+    return str(greeting_text or "")
 
 
 def _run_plaintext_add_memory_job(

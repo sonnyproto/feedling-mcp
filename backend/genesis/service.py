@@ -761,6 +761,8 @@ def replace_identity_preserving_anchor(store: UserStore, output: dict) -> str:
     payload = _identity_payload_for_replace(output)
     if not payload:
         return "not_provided"
+    if not str(payload.get("agent_name") or "").strip():
+        return "identity_update_incomplete"
     envelope, err = core_envelope._build_shared_envelope_for_store(
         store,
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
