@@ -153,6 +153,52 @@ def _claude_anthropic_base_url(entry: dict) -> str:
     return f"{base}/anthropic"
 
 
+def _is_official_identity(provider: str, base_url: str) -> bool:
+    """True 仅当模型按官方原生对待——保留壳子身份、不注入改写块。
+
+    provider 缺省（空）按官方处理：真实第三方托管条目一定带显式 provider（driver 即
+    由它派生），缺省 provider 只出现在 legacy/native/default 路径（claude→原生
+    anthropic、codex→原生 openai——见 ``_codex_transport`` 「missing provider → native」
+    的同款约定），改写它们会误伤原生身份。
+
+    官方 provider（anthropic/openai）的 base_url 若为空或等于该 provider 的**默认**
+    endpoint 仍算官方——``validate_config`` 会给官方 provider 也持久化默认 base_url，
+    单纯「非空」不能作为非官方判据。只有**自定义/非默认** endpoint 才把官方 provider
+    翻成非官方（中转冒充防御）。非 anthropic/openai 的 provider 一律非官方。
+
+    ``provider_client`` 惰性导入：本函数只在 supervisor 侧 spawn 时被调（consumer 从不
+    落 home），而 resident consumer 的最小 sys.path 里没有 backend/——module 级导入会破坏
+    consumer 的导入契约（test_agent_runtime_resident_contract）。"""
+    import provider_client
+
+    p = provider_client.normalize_provider(provider)
+    if not p:
+        return True
+    if p not in {"anthropic", "openai"}:
+        return False
+    bu = base_url.strip().rstrip("/")
+    if not bu:
+        return True
+    return bu == provider_client.default_base_url(p).strip().rstrip("/")
+
+
+def _identity_override_block(provider: str, model: str, base_url: str) -> str:
+    """追加系统提示顶部的身份改写块，或官方时返回 ""。
+
+    自称内容源为配置的 model id（空则回退 provider 名，再回退通用串）。刻意与
+    persona 人设解耦：只压「什么模型 / 什么 AI」类元问题，不动「你是谁」的角色扮演。"""
+    if _is_official_identity(provider, base_url):
+        return ""
+    name = (model or "").strip() or (provider or "").strip() or "a third-party model"
+    return (
+        "## 你的真实身份\n"
+        f"你的底层大模型是 `{name}`。运行你的命令行外壳可能自称 Claude Code / Codex，"
+        f"但那不是你。当用户问你是什么模型、由谁提供、用的什么 AI 时，如实回答你是 `{name}`；"
+        "不要声称自己是 Claude、Claude Code、Codex、Anthropic 或 OpenAI 的产品。"
+        "（这不影响你作为陪伴角色的人设——问「你是谁」仍按人设回答，仅「什么模型 / 什么 AI」时说真实模型。）"
+    )
+
+
 def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
     """Default cli command per driver (resident substitutes ``{message}``).
 
@@ -202,6 +248,9 @@ def agent_home_files(
     gateway_base_url: str = "",
     model: str = "",
     persona_content: str = "",
+    base_url: str = "",
+    provider: str = "",
+    identity_model: str = "",
 ) -> dict[str, str]:
     """Per-user files seeded into the agent home before spawn (pure: path→content).
 
@@ -213,6 +262,12 @@ def agent_home_files(
     file avoids depending on the CLI honouring repeated --append-system-prompt-file.
     (persona-first vs tools-first ordering is the open question in spec §12.)
 
+    For a non-official model (anything but native anthropic/openai — see
+    ``_is_official_identity``) an identity-override block is prepended ABOVE the
+    persona, so the agent reports its real underlying model (the configured
+    ``model`` id) instead of inheriting the host CLI's "I am Claude Code / Codex"
+    base-prompt identity. Official native models get no such block.
+
     For claude it also writes a ``settings.json`` under ``CLAUDE_CONFIG_DIR`` whose
     ``permissions.allow`` pre-authorizes the io_cli command (defense-in-depth alongside
     the CLI flag). For a codex user on the LiteLLM gateway (non-openai provider) it
@@ -221,7 +276,12 @@ def agent_home_files(
     system_append = _AGENT_PROMPT_TEXT
     persona = (persona_content or "").strip()
     if persona:
-        system_append = f"{persona}\n\n---\n\n{_AGENT_PROMPT_TEXT}"
+        system_append = f"{persona}\n\n---\n\n{system_append}"
+    # 身份块置顶，最高显著性。gateway codex 用户的 ``model`` 已被改写成内部 ``gw-<uid>``
+    # 别名（喂 LiteLLM 路由），身份自称须用真实上游模型 ``identity_model``（缺省回退 model）。
+    identity = _identity_override_block(provider, identity_model or model, base_url)
+    if identity:
+        system_append = f"{identity}\n\n---\n\n{system_append}"
     files = {f"{home}/{_AGENT_PROMPT_BASENAME}": system_append}
     if driver == "codex":
         files[f"{home}/codex-home/AGENTS.md"] = system_append
@@ -264,14 +324,22 @@ def materialize_home(
     gateway_base_url: str = "",
     model: str = "",
     persona_content: str = "",
+    base_url: str = "",
+    provider: str = "",
+    identity_model: str = "",
 ) -> None:
     """Write the per-user home files for a spawn AND prune stale ones a persistent
     home may carry (see ``stale_home_files``). Idempotent — safe before every
     (re)spawn. A path written this spawn is never pruned (the prune list excludes the
-    current transport's files, and a final guard skips anything just written)."""
+    current transport's files, and a final guard skips anything just written).
+
+    ``provider``/``base_url`` drive the identity-override block in the appended
+    system prompt (see ``agent_home_files``) — a non-official model reseeds with a
+    prompt stating its real underlying model."""
     files = agent_home_files(
         home, driver=driver, io_cli=io_cli, codex_transport=codex_transport,
-        gateway_base_url=gateway_base_url, model=model, persona_content=persona_content)
+        gateway_base_url=gateway_base_url, model=model, persona_content=persona_content,
+        base_url=base_url, provider=provider, identity_model=identity_model)
     for path, content in files.items():
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -457,6 +525,9 @@ class ProcessSpawner:
             codex_transport=_codex_transport(entry),
             gateway_base_url=os.environ.get("FEEDLING_LITELLM_BASE_URL", ""),
             model=str(entry.get("model") or ""),
+            base_url=str(entry.get("base_url") or ""),
+            provider=str(entry.get("provider") or ""),
+            identity_model=str(entry.get("identity_model") or ""),
             persona_content=_genesis_persona_content(
                 user_id, entry.get("api_key"),
                 runtime_token=entry.get("runtime_token", "")),

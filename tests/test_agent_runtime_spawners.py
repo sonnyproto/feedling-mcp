@@ -224,7 +224,8 @@ def test_custom_cli_cmd_opts_out_of_default_grant():
 
 
 def test_agent_home_files_seeds_prompt_and_claude_permission_allow():
-    files = spawners.agent_home_files("/agent-data/users/u", driver="claude")
+    # 明确指定为官方 provider，所以不会注入身份块
+    files = spawners.agent_home_files("/agent-data/users/u", driver="claude", provider="anthropic")
     # the context-tool how-to lands in the per-user home (matches --append-system-prompt-file)
     prompt_path = "/agent-data/users/u/agent-tools-prompt.md"
     assert prompt_path in files
@@ -247,7 +248,8 @@ def test_agent_home_files_seeds_prompt_and_claude_permission_allow():
 
 
 def test_agent_home_files_codex_seeds_agents_md():
-    files = spawners.agent_home_files("/h", driver="codex")
+    # 明确指定为官方 provider，所以不会注入身份块
+    files = spawners.agent_home_files("/h", driver="codex", provider="openai")
     # codex reads AGENTS.md; the same how-to is seeded into its home
     assert "/h/codex-home/AGENTS.md" in files
     assert "perception" in files["/h/codex-home/AGENTS.md"]
@@ -334,13 +336,14 @@ def test_codex_gateway_for_non_openai_presents_gateway_key_not_upstream():
 def test_agent_home_files_prepends_genesis_persona_when_present():
     # Host genesis persona is prepended to the appended system prompt so the agent
     # boots as itself; the tools how-to stays present (single appended file).
+    # 明确指定为官方 provider，所以不会注入身份块
     files = spawners.agent_home_files(
-        "/h", driver="claude", persona_content="You are Kai. Terse; you ask back.")
+        "/h", driver="claude", provider="anthropic", persona_content="You are Kai. Terse; you ask back.")
     append = files["/h/agent-tools-prompt.md"]
     assert append.startswith("You are Kai. Terse; you ask back.")  # persona first
     assert "memory-index" in append and "perception" in append     # tools still there
     # codex gets the same composed append in AGENTS.md
-    cfiles = spawners.agent_home_files("/h", driver="codex", persona_content="You are Kai.")
+    cfiles = spawners.agent_home_files("/h", driver="codex", provider="openai", persona_content="You are Kai.")
     assert cfiles["/h/codex-home/AGENTS.md"].startswith("You are Kai.")
     assert "memory-index" in cfiles["/h/codex-home/AGENTS.md"]
 
@@ -364,21 +367,24 @@ def test_persona_from_blob_empty_on_absent_or_undecryptable():
 
 def test_agent_home_files_no_persona_is_tools_only():
     # Fresh start / no genesis / VPS → today's behaviour: tools-only, no persona prefix.
-    append = spawners.agent_home_files("/h", driver="claude")["/h/agent-tools-prompt.md"]
+    # 明确指定为官方 provider，所以不会注入身份块
+    append = spawners.agent_home_files("/h", driver="claude", provider="anthropic")["/h/agent-tools-prompt.md"]
     assert not append.startswith("You are")
     assert "perception" in append
 
 
 def test_agent_home_files_blank_persona_is_tools_only():
     # Whitespace-only persona must not inject an empty prefix.
+    # 明确指定为官方 provider，所以不会注入身份块
     append = spawners.agent_home_files(
-        "/h", driver="claude", persona_content="   \n  ")["/h/agent-tools-prompt.md"]
+        "/h", driver="claude", provider="anthropic", persona_content="   \n  ")["/h/agent-tools-prompt.md"]
     assert append.startswith("# Feedling context tools")  # tools how-to header, no prefix
 
 
 def test_agent_home_files_codex_gateway_writes_responses_config():
+    # 明确指定为非官方 provider，会注入身份块。测试检查 gateway config 仍被创建
     files = spawners.agent_home_files(
-        "/h", driver="codex", codex_transport="gateway",
+        "/h", driver="codex", provider="gemini", codex_transport="gateway",
         gateway_base_url="http://127.0.0.1:4000/v1", model="gw-gemini",
     )
     cfg = files["/h/codex-home/config.toml"]
@@ -391,7 +397,8 @@ def test_agent_home_files_codex_gateway_writes_responses_config():
 
 
 def test_agent_home_files_codex_native_omits_gateway_config():
-    files = spawners.agent_home_files("/h", driver="codex", codex_transport="native")
+    # 明确指定为官方 openai provider，native codex 不会创建 gateway config
+    files = spawners.agent_home_files("/h", driver="codex", provider="openai", codex_transport="native")
     assert "/h/codex-home/config.toml" not in files
 
 
@@ -415,7 +422,8 @@ def test_materialize_home_prunes_stale_gateway_config_on_native(tmp_path):
     cfg = tmp_path / "u" / "codex-home" / "config.toml"
     cfg.parent.mkdir(parents=True)
     cfg.write_text('model_provider = "feedling_gateway"\nbase_url = "http://127.0.0.1:4000/v1"\n')
-    spawners.materialize_home(home, driver="codex", codex_transport="native")
+    # 明确指定为官方 provider，所以不会注入身份块
+    spawners.materialize_home(home, driver="codex", provider="openai", codex_transport="native")
     # the stale gateway config is gone → codex falls back to native (api.openai.com)
     assert not cfg.exists()
     # AGENTS.md still seeded
@@ -424,8 +432,9 @@ def test_materialize_home_prunes_stale_gateway_config_on_native(tmp_path):
 
 def test_materialize_home_writes_and_keeps_gateway_config(tmp_path):
     home = str(tmp_path / "u")
+    # 明确指定为非官方 provider，会注入身份块。测试检查 gateway config 仍被创建
     spawners.materialize_home(
-        home, driver="codex", codex_transport="gateway",
+        home, driver="codex", provider="gemini", codex_transport="gateway",
         gateway_base_url="http://127.0.0.1:4000/v1", model="gw-gemini",
     )
     cfg = tmp_path / "u" / "codex-home" / "config.toml"
@@ -454,3 +463,117 @@ def test_write_runtime_token_creates_home_if_missing(tmp_path):
     home = str(tmp_path / "nope")
     spawners.write_runtime_token(home, "tok2")
     assert (tmp_path / "nope" / "runtime-token").read_text() == "tok2"
+
+
+def test_is_official_identity_native_anthropic_and_openai_only():
+    assert spawners._is_official_identity("anthropic", "") is True
+    assert spawners._is_official_identity("openai", "") is True
+    assert spawners._is_official_identity("OpenAI", "  ") is True  # 大小写/空白容忍
+    assert spawners._is_official_identity("deepseek", "https://api.deepseek.com") is False
+    assert spawners._is_official_identity("gemini", "") is False
+    assert spawners._is_official_identity("openai_compatible", "") is False
+    # 冒充防御：anthropic 但配了中转 base_url → 判非官方
+    assert spawners._is_official_identity("anthropic", "https://relay.example/anthropic") is False
+    # provider 缺省 → 按官方处理（legacy/native/default 路径不误伤，即便带 base_url）
+    assert spawners._is_official_identity("", "") is True
+    assert spawners._is_official_identity("  ", "https://x") is True
+    # 官方 provider 存了「默认」base_url 仍算官方（validate_config 会持久化默认值）——
+    # 单纯非空不等于非官方；只有自定义/非默认 endpoint 才翻非官方（Codex P1）
+    assert spawners._is_official_identity("anthropic", "https://api.anthropic.com/v1") is True
+    assert spawners._is_official_identity("openai", "https://api.openai.com/v1") is True
+    assert spawners._is_official_identity("openai", "https://api.openai.com/v1/") is True  # 尾斜杠容忍
+    assert spawners._is_official_identity("openai", "https://relay.example/v1") is False    # 自定义
+
+
+def test_identity_override_block_empty_for_official():
+    assert spawners._identity_override_block("anthropic", "claude-3.5-sonnet", "") == ""
+    assert spawners._identity_override_block("openai", "gpt-4o", "") == ""
+
+
+def test_identity_override_block_uses_model_id_for_third_party():
+    block = spawners._identity_override_block("deepseek", "deepseek-chat", "https://api.deepseek.com")
+    assert "deepseek-chat" in block
+    assert "Claude Code" in block  # 明确点名不许冒充的壳子身份
+    assert "Codex" in block
+
+
+def test_identity_override_block_falls_back_to_provider_name_when_model_empty():
+    assert "gemini" in spawners._identity_override_block("gemini", "", "")
+
+
+def test_identity_override_block_empty_when_provider_absent():
+    # provider 缺省按官方处理，不注块（回归防护：Codex P2 —— legacy/native/default 路径）
+    assert spawners._identity_override_block("", "", "") == ""
+    assert spawners._identity_override_block("", "gpt-4o", "") == ""
+
+
+def test_agent_home_files_injects_identity_block_for_third_party_claude():
+    files = spawners.agent_home_files(
+        "/h", driver="claude", provider="deepseek",
+        base_url="https://api.deepseek.com", model="deepseek-chat")
+    append = files["/h/agent-tools-prompt.md"]
+    assert "deepseek-chat" in append
+    assert append.startswith("## 你的真实身份")  # 身份块置顶
+
+
+def test_agent_home_files_no_identity_block_for_native_anthropic():
+    files = spawners.agent_home_files(
+        "/h", driver="claude", provider="anthropic", model="claude-3.5-sonnet")
+    append = files["/h/agent-tools-prompt.md"]
+    assert "你的真实身份" not in append
+
+
+def test_agent_home_files_no_identity_block_for_native_openai_codex():
+    files = spawners.agent_home_files(
+        "/h", driver="codex", provider="openai", model="gpt-4o")
+    agents_md = files["/h/codex-home/AGENTS.md"]
+    assert "你的真实身份" not in agents_md
+
+
+def test_agent_home_files_no_identity_block_when_provider_absent():
+    # 回归防护(Codex P2)：provider 缺省的 legacy/native/default 条目不得被注入第三方块。
+    # _codex_transport 把缺省 provider 当原生 OpenAI，claude 缺省即原生 anthropic。
+    claude_append = spawners.agent_home_files("/h", driver="claude")["/h/agent-tools-prompt.md"]
+    assert "你的真实身份" not in claude_append
+    codex_md = spawners.agent_home_files("/h", driver="codex")["/h/codex-home/AGENTS.md"]
+    assert "你的真实身份" not in codex_md
+
+
+def test_agent_home_files_official_provider_with_default_base_url_no_block():
+    # 官方 provider 带默认 base_url（validate_config 持久化）仍不注块（Codex P1）
+    files = spawners.agent_home_files(
+        "/h", driver="claude", provider="anthropic",
+        base_url="https://api.anthropic.com/v1", model="claude-3.5-sonnet")
+    assert "你的真实身份" not in files["/h/agent-tools-prompt.md"]
+
+
+def test_agent_home_files_identity_block_uses_identity_model_over_gateway_alias():
+    # gateway codex：model 已改写成内部 gw-<uid> 别名，身份自称须用真实上游模型（Codex P2）
+    files = spawners.agent_home_files(
+        "/h", driver="codex", provider="gemini", codex_transport="gateway",
+        gateway_base_url="http://127.0.0.1:4000/v1",
+        model="gw-u123", identity_model="gemini-2.0-flash")
+    agents_md = files["/h/codex-home/AGENTS.md"]
+    assert "gemini-2.0-flash" in agents_md   # 身份块用真实模型
+    assert "gw-u123" not in agents_md          # 不暴露内部别名
+    # gateway config.toml 仍用 gw-<uid> 别名做 LiteLLM 路由
+    assert 'model = "gw-u123"' in files["/h/codex-home/config.toml"]
+
+
+def test_agent_home_files_identity_block_reaches_codex_and_pi():
+    cfiles = spawners.agent_home_files(
+        "/h", driver="codex", provider="gemini", model="gemini-2.0-flash")
+    assert "gemini-2.0-flash" in cfiles["/h/codex-home/AGENTS.md"]
+    pfiles = spawners.agent_home_files(
+        "/h", driver="pi", provider="openai_compatible",
+        base_url="https://relay.example/v1", model="some-relay-model")
+    assert "some-relay-model" in pfiles["/h/agent-tools-prompt.md"]
+
+
+def test_agent_home_files_identity_block_sits_above_persona():
+    files = spawners.agent_home_files(
+        "/h", driver="claude", provider="deepseek",
+        base_url="https://api.deepseek.com", model="deepseek-chat",
+        persona_content="You are Kai.")
+    append = files["/h/agent-tools-prompt.md"]
+    assert append.index("你的真实身份") < append.index("You are Kai.")

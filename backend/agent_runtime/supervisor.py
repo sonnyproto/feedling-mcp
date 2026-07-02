@@ -855,6 +855,10 @@ def _spawn_identity(entry: dict) -> tuple:
         entry.get("cli_cmd") or "",
         entry.get("provider") or "",
         entry.get("model") or "",
+        entry.get("base_url") or "",
+        # gateway 用户 ``model`` 是稳定的 gw-<uid> 别名；真实上游模型放在 identity_model，
+        # 纳入签名使切换上游模型时 respawn 并重新落盘身份块。
+        entry.get("identity_model") or "",
         "" if gateway else (entry.get("provider_key") or ""),
         entry.get("persona_version") or "",
     )
@@ -917,8 +921,11 @@ def _wire_gateway_models(roster: list[dict]) -> tuple[list[dict], list[dict]]:
     if not gateways:
         return roster, []
     gateway_uids = {g["user_id"] for g in gateways}
+    # ``model`` becomes the internal ``gw-<uid>`` alias codex requests; ``identity_model``
+    # keeps the REAL upstream model so the identity-honesty prompt names it, not the alias.
     wired = [
-        {**e, "model": litellm_gateway.gateway_model_id(e["user_id"])}
+        {**e, "model": litellm_gateway.gateway_model_id(e["user_id"]),
+         "identity_model": e.get("model") or ""}
         if e.get("user_id") in gateway_uids and spawners._codex_transport(e) == "gateway"
         else e
         for e in roster

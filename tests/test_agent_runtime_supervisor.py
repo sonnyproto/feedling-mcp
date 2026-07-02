@@ -658,6 +658,11 @@ def test_wire_gateway_models_swaps_requested_model_to_gw_id():
     # but the LiteLLM routing keeps the user's REAL upstream model
     assert gateways[0]["user_id"] == "c"
     assert gateways[0]["model"] == "gemini-2.0-flash"
+    # the wired gateway entry also keeps the real model in identity_model so the
+    # identity-honesty prompt names it, not the gw-<uid> alias (Codex P2)
+    assert by["c"]["identity_model"] == "gemini-2.0-flash"
+    # native openai user is untouched — no identity_model rewrite
+    assert "identity_model" not in by["b"]
 
 
 def test_wire_gateway_models_noop_without_gateway_users():
@@ -1171,3 +1176,18 @@ def test_owned_gateway_entries_accepts_id_set_snapshot():
     ]
     owned = supervisor_mod._owned_gateway_entries(gw_all, {"u2"})
     assert [g["user_id"] for g in owned] == ["u2"]
+
+
+def test_spawn_identity_changes_when_base_url_changes():
+    a = {"api_key": "k", "driver": "claude", "provider": "anthropic",
+         "model": "claude-3.5-sonnet", "base_url": ""}
+    b = dict(a, base_url="https://relay.example/anthropic")
+    assert supervisor_mod._spawn_identity(a) != supervisor_mod._spawn_identity(b)
+
+
+def test_spawn_identity_changes_when_identity_model_changes():
+    # gateway 用户 model 是稳定的 gw-<uid> 别名；切换真实上游模型须触发 respawn 重落身份块
+    a = {"driver": "codex", "provider": "gemini", "model": "gw-u1",
+         "identity_model": "gemini-2.0-flash"}
+    b = dict(a, identity_model="gemini-1.5-pro")
+    assert supervisor_mod._spawn_identity(a) != supervisor_mod._spawn_identity(b)
