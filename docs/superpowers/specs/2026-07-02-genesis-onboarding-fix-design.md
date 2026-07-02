@@ -70,7 +70,7 @@ iOS `pollGenesisImport`([ChatEmptyStateView.swift:4497](App/FeedlingTest/Pages/C
 |---|---|---|---|---|---|
 | **onboarding** | ✅ 全量(前台) | ✅ 全量卡派生(前台) | ✅ | ✅(后台) | ✅ |
 | **add_memory** | ✅ 追加 | ❌ 不碰 | ❌ **不动** | ❌ | ❌ |
-| **update_identity** | ❌ 不写 | ✅ 更新 | ❌ 不动 | 可选(跟随身份) | ❌ |
+| **update_identity** | ❌ 不写 | ✅ 整张覆盖 | ❌ 不动 | ❌ 不重建 | ❌ |
 
 ### 1.3 onboarding mode 的具体改动(= B)
 在 `_run_plaintext_genesis_v2`(前台)里:
@@ -79,19 +79,25 @@ iOS `pollGenesisImport`([ChatEmptyStateView.swift:4497](App/FeedlingTest/Pages/C
 - 后台 `_run_plaintext_background_enrichment` **去掉那次重复的 `fact_write`**(记忆已在前台写完);后台只留 voice_map/voice_reduce/persona_build。
 - 快进契约不变:chat_ready 仍 = identity + greeting + 够记忆;voice/persona 仍在后台,用户不等。
 
-### 1.4 add_memory mode
-- 复用现有"只写记忆"能力(`apply_memory_outputs`),抽事实 → 写入花园。
+### 1.4 add_memory mode(决策已锁)
+- 复用现有"只写记忆"能力(`apply_memory_outputs`),抽事实 → **直接追加**写入花园。
+- **不去重**(MVP):同段材料反复传会堆重复,由 **dream 夜间 merge 兜底**(见 §1.7)+ 用户可手删。
 - **明确跳过**:identity 派生、`_store_identity_payload`、relationship anchor 重算、persona/voice、greeting。
 - 相处天数绝不能被这条路改动(这是之前踩过的坑)。
 
-### 1.5 update_identity mode
-- 只走身份更新(用上传的 character 材料派生/更新 identity 卡)。
-- **跳过**:memory 写入、relationship anchor 重算。
-- persona/voice 是否跟随更新 = Codex review 时定(倾向:身份变了 persona 可跟随重建,但不写 memory、不动 anchor)。
+### 1.5 update_identity mode(决策已锁)
+- 用上传的 character 材料跑一遍身份派生 → 生成一份身份卡 → **无脑整张覆盖**(blind replace,不合并)。
+- **跳过**:memory 写入、relationship anchor 重算、persona/voice 重建。
+- ⚠️ **这是破坏性覆盖,且 dream 不兜底**(见 §1.7):新角色卡没写的旧身份内容**永久丢失**。这是**有意为之**的产品决策(用户主动传新卡=重定义 TA),不是 bug。
 
 ### 1.6 约束落地
 - 不新增/修改任何派生函数(`_derive_identity_with_provider` / `fact_map/fact_write/voice/persona` prompt 全不动)。
 - 只改:路由读 mode → 决定调用哪几步 + 传全量卡 vs core。
+
+### 1.7 Dream 兜底边界(定性,别误用)
+最新 test 的 dream(`backend/memory/dream_prompt_v1.py` + `dream_scheduler.py`)**只整理 memory 卡**(`merge`/`thicken`/`supersede`,软替换不硬删,夜间/攒量触发)。
+- ✅ **memory 靠 dream 兜底成立**:add_memory 不去重 → dream 夜里合并重复。
+- ❌ **identity 不在 dream 范围**:dream **不碰身份卡**(它"不形成对 TA 的理解")。所以 update_identity 的覆盖是**不可恢复**的 —— 别指望 dream 修回被覆盖掉的身份内容。
 
 ---
 
