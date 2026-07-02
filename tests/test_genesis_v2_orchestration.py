@@ -390,7 +390,8 @@ def test_v2_foreground_honors_explicit_relationship_date(monkeypatch):
 
 def test_v2_foreground_falls_back_when_no_identity(monkeypatch):
     # deriver yields nothing -> fall back to the current behavior (apply_reducer_output),
-    # and the background is asked to write identity (write_identity=True).
+    # append a fallback greeting, and the background is asked to write identity
+    # (write_identity=True).
     calls = {}
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
     monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
@@ -400,6 +401,10 @@ def test_v2_foreground_falls_back_when_no_identity(monkeypatch):
                         lambda **k: ({"agent_name": "", "dimensions": []}, []))
     monkeypatch.setattr(service, "apply_reducer_output",
                         lambda *a, **k: calls.__setitem__("used_apply_reducer", True))
+    monkeypatch.setattr(history_import, "_generate_model_api_onboarding_greeting",
+                        lambda *a, **k: ("", []))
+    monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting",
+                        lambda store, text: calls.__setitem__("greeting", text))
     monkeypatch.setattr(routes, "_run_plaintext_background_enrichment",
                         lambda *a, **k: calls.__setitem__("bg_write_identity", k.get("write_identity")))
 
@@ -409,6 +414,7 @@ def test_v2_foreground_falls_back_when_no_identity(monkeypatch):
         analysis_messages=[{"role": "user", "content": "hi"}])
 
     assert calls.get("used_apply_reducer") is True               # empty-identity fallback
+    assert calls["greeting"] == "好久不见，很高兴又能和你聊天。"  # fallback branch still greets
     assert calls["bg_write_identity"] is True                    # background fills identity
 
 

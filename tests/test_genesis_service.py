@@ -668,6 +668,41 @@ def test_replace_identity_preserving_anchor_requires_existing_identity(monkeypat
     assert status == "identity_not_initialized"
 
 
+def test_replace_identity_preserving_anchor_rejects_nameless_update(monkeypatch):
+    existing = {
+        "id": "identity_existing",
+        "created_at": "2026-05-01T00:00:00",
+        "relationship_started_at": "2025-01-02",
+        "identity_agent_name_present": True,
+        "identity_dimension_count": 1,
+    }
+    monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: existing)
+    monkeypatch.setattr(
+        service.core_envelope,
+        "_build_shared_envelope_for_store",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not overwrite identity")),
+    )
+    monkeypatch.setattr(
+        service.identity_service,
+        "_save_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not save identity")),
+    )
+
+    status = service.replace_identity_preserving_anchor(
+        _store(),
+        {
+            "identity": {
+                "agent_name": "",
+                "category": "硬核 · 直爽",
+                "self_introduction": "我是懂你的全栈 AI 协作者。",
+                "dimensions": [{"name": "直爽", "value": 90, "description": "说人话，不绕弯。"}],
+            },
+        },
+    )
+
+    assert status == "identity_update_incomplete"
+
+
 def test_apply_memory_outputs_batches_memory_actions(monkeypatch):
     calls = []
 
