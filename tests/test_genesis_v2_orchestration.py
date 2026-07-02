@@ -236,6 +236,72 @@ def test_v2_foreground_writes_full_memory_set_and_feeds_identity_and_greeting(mo
     assert calls["greeting_memories"] == full_memories
 
 
+def test_v2_combined_flag_writes_voice_persona_before_completion(monkeypatch):
+    calls = {"order": []}
+    monkeypatch.setenv("FEEDLING_GENESIS_COMBINED_MAP", "1")
+    monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
+
+    def fake_foreground(**kwargs):
+        assert kwargs["include_voice_candidates"] is True
+        is_history = kwargs["source_kind"] == "history_import"
+        return {
+            "memories": [{"summary": "history"}],
+            "identity": {"agent_name": "小柒"},
+            "all_fact_candidates": [{"summary": "用户叫 Z"}],
+            "core_fact_candidates": [{"summary": "用户叫 Z"}],
+            "voice_candidates": [{"behavior_notes_candidates": ["短句"], "exemplar_candidates": []}] if is_history else [],
+            "source_family": "history" if is_history else "ai_persona",
+        }
+
+    monkeypatch.setattr(worker, "build_foreground_output_from_texts", fake_foreground)
+    monkeypatch.setattr(worker, "build_memory_output_from_fact_candidates",
+                        lambda **k: {"memories": [{"summary": "用户叫 Z"}], "identity": {"agent_name": "小柒"}})
+
+    def fake_voice_persona(**kwargs):
+        calls["voice_persona_candidates"] = kwargs["voice_candidates"]
+        calls["existing_persona"] = kwargs.get("existing_persona")
+        return {
+            "persona": {"content": "## 你是谁\n\n你叫小柒。"},
+            "voice_workset": {"behavior_notes": ["短句"], "exemplars": []},
+            "voice": {"behavior_notes_count": 1, "exemplar_count": 0, "founding_exemplar_count": 0},
+        }
+
+    monkeypatch.setattr(worker, "build_voice_persona_output_from_candidates", fake_voice_persona, raising=False)
+    monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
+    monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
+                        lambda **k: ({"agent_name": "小柒", "dimensions": [{"name": "直接"}]}, []))
+    monkeypatch.setattr(service, "apply_memory_outputs", lambda *a, **k: (1, []))
+    monkeypatch.setattr(history_import, "_store_identity_payload", lambda *a, **k: None)
+    monkeypatch.setattr(history_import, "_generate_model_api_onboarding_greeting", lambda *a, **k: ("你好", []))
+    monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting", lambda *a, **k: None)
+    monkeypatch.setattr(service, "write_persona_artifact",
+                        lambda *a, **k: calls["order"].append("persona") or ("persona-ref", "persona-sha"))
+    monkeypatch.setattr(service, "write_voice_artifact",
+                        lambda *a, **k: calls["order"].append("voice") or ("voice-ref", "voice-sha"))
+
+    def fake_complete(*_a, **kwargs):
+        calls["order"].append("complete")
+        calls["complete"] = kwargs
+        return {"job_id": "job1", "status": "done"}
+
+    monkeypatch.setattr(db, "genesis_complete_job", fake_complete)
+    monkeypatch.setattr(service, "write_genesis_state", lambda *a, **k: None)
+    monkeypatch.setattr(routes, "_run_plaintext_background_enrichment",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("combined path must not rely on background")))
+
+    handled = routes._run_plaintext_genesis_v2(
+        _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
+        relationship_anchor={"days_with_user": 144},
+        analysis_messages=[{"role": "user", "content": "hi"}])
+
+    assert handled is True
+    assert calls["voice_persona_candidates"] == [{"behavior_notes_candidates": ["短句"], "exemplar_candidates": []}]
+    assert calls["existing_persona"] == {"content": "p1"}
+    assert calls["order"] == ["persona", "voice", "complete"]
+    assert calls["complete"]["persona_ref"] == "persona-ref"
+    assert calls["complete"]["persona_sha256"] == "persona-sha"
+
+
 def test_v2_foreground_full_fact_write_spans_all_source_groups(monkeypatch):
     calls = {"foreground_kinds": []}
 

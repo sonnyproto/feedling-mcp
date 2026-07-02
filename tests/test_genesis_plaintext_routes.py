@@ -494,6 +494,7 @@ def test_plaintext_relationship_anchor_uses_earliest_timestamp_when_no_date():
 def test_add_memory_mode_writes_only_memory(monkeypatch):
     store = _store()
     calls: dict = {}
+    monkeypatch.setenv("FEEDLING_GENESIS_COMBINED_MAP", "1")
     monkeypatch.setattr(routes.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
     monkeypatch.setattr(routes.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_add", "status": "processing"})
     monkeypatch.setattr(routes.service, "write_genesis_state", lambda *_args, **_kwargs: None)
@@ -557,6 +558,7 @@ def test_add_memory_mode_writes_only_memory(monkeypatch):
 
     assert calls.get("full_reducer_calls", []) == []
     assert calls["foreground"]["write_core"] is False
+    assert calls["foreground"].get("include_voice_candidates") in (None, False)
     assert calls["fact_write"]["fact_candidates"] == [{"summary": "用户养了一条狗"}]
     assert [item["summary"] for item in calls["memory_output"]["memories"]] == ["用户养了一条狗"]
     assert calls["completed"]["memory_action_count"] == 1
@@ -599,7 +601,7 @@ def test_update_identity_mode_replaces_identity_without_writing_memory(monkeypat
     assert calls["completed"]["identity_status"] == "updated"
 
 
-def test_update_identity_mode_fails_on_incomplete_identity(monkeypatch):
+def test_update_identity_mode_allows_nameless_nonempty_identity(monkeypatch):
     store = _store()
     calls: dict = {}
     monkeypatch.setattr(routes.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
@@ -612,10 +614,13 @@ def test_update_identity_mode_fails_on_incomplete_identity(monkeypatch):
         "_derive_identity_with_provider",
         lambda *_args, **_kwargs: ({"agent_name": "", "dimensions": [{"name": "直爽", "description": "说人话。"}]}, []),
     )
-    monkeypatch.setattr(routes.service, "replace_identity_preserving_anchor", lambda _store, _output: "identity_update_incomplete")
-    monkeypatch.setattr(routes.db, "genesis_complete_job", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("incomplete identity must not complete job")))
+    monkeypatch.setattr(routes.service, "replace_identity_preserving_anchor", lambda _store, output: calls.update({"identity_output": output}) or "updated")
+    monkeypatch.setattr(
+        routes.db,
+        "genesis_complete_job",
+        lambda _user_id, _job_id, **kwargs: calls.update({"completed": kwargs}) or {"job_id": "job_identity", "status": "done"},
+    )
     monkeypatch.setattr(routes.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
-    monkeypatch.setattr(routes.service, "mark_failed", lambda _store, job_id, error: calls.update({"job_id": job_id, "error": error}))
 
     routes._run_plaintext_genesis_job(
         store,
@@ -627,7 +632,41 @@ def test_update_identity_mode_fails_on_incomplete_identity(monkeypatch):
         relationship_anchor={"days_with_user": 9999, "relationship_started_at": "2099-01-01"},
     )
 
-    assert calls == {"job_id": "job_identity", "error": "identity_update_incomplete"}
+    assert calls["identity_output"]["identity"]["agent_name"] == ""
+    assert calls["identity_output"]["identity"]["dimensions"][0]["name"] == "直爽"
+    assert calls["completed"]["memory_action_count"] == 0
+    assert calls["completed"]["identity_status"] == "updated"
+
+
+def test_update_identity_mode_fails_on_empty_identity(monkeypatch):
+    store = _store()
+    calls: dict = {}
+    monkeypatch.setattr(routes.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    monkeypatch.setattr(routes.identity_service, "_load_identity", lambda _store: {"id": "identity_1"})
+    monkeypatch.setattr(routes.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_identity", "status": "processing"})
+    monkeypatch.setattr(routes.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes.history_import, "_import_language_for_store", lambda _store, _msgs: "zh")
+    monkeypatch.setattr(
+        routes.history_import,
+        "_derive_identity_with_provider",
+        lambda *_args, **_kwargs: ({"agent_name": "", "dimensions": [], "self_introduction": "", "category": "", "signature": []}, []),
+    )
+    monkeypatch.setattr(routes.service, "replace_identity_preserving_anchor", lambda _store, _output: "identity_update_empty")
+    monkeypatch.setattr(routes.db, "genesis_complete_job", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("empty identity must not complete job")))
+    monkeypatch.setattr(routes.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
+    monkeypatch.setattr(routes.service, "mark_failed", lambda _store, job_id, error: calls.update({"job_id": job_id, "error": error}))
+
+    routes._run_plaintext_genesis_job(
+        store,
+        "api_key",
+        "job_identity",
+        mode="update_identity",
+        source_groups=[{"source_kind": "ai_persona_import", "source_family": "ai_persona", "chunk_texts": ["Role:"]}],
+        analysis_messages=[{"role": "user", "content": "Role:", "source": "ai_persona_import"}],
+        relationship_anchor={"days_with_user": 9999, "relationship_started_at": "2099-01-01"},
+    )
+
+    assert calls == {"job_id": "job_identity", "error": "identity_update_empty"}
 
 
 def test_update_identity_plaintext_requires_existing_identity(monkeypatch):
