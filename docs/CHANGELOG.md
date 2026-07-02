@@ -47,6 +47,31 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-02
+
+### [DONE] 非官方托管模型如实报自身模型（identity honesty，未部署未提交）
+
+deepseek/gemini/中转站等跑在 claude/codex/pi 壳子里的模型，被问「你是什么模型」
+会继承壳子自带 base prompt 的「我是 Claude Code / Codex」身份。在三 driver 共用的
+追加系统提示（`spawners.agent_home_files` 拼的 `system_append`）顶部按 provider 注入
+一段身份改写块：非官方模型如实自称配置的 model id，官方原生 anthropic/openai 不加
+任何 prompt。判定与内容均为纯函数（`_is_official_identity` / `_identity_override_block`，
+白名单＝provider∈{anthropic,openai} 且 base_url 空；**provider 缺省也按官方处理**——
+legacy/native/default 条目（claude→原生 anthropic、codex→原生 openai，同 `_codex_transport`
+「missing→native」约定）不误伤，真实第三方一定带显式 provider；自称源＝model id，空则回退
+provider 名）。身份块置于 persona 之上、与人设解耦（只压「什么模型」不动「你是谁」）。`base_url`
+纳入 `_spawn_identity` 使 endpoint 变更触发 reseed。纯 prompt 软约束，个别模型可能偶发
+漏说。**未提交、未部署。**
+
+两轮 Codex review 修复：(1) 缺省 provider 按官方处理，legacy/native/default 条目不误伤
+（`_codex_transport`「missing→native」同款约定）；(2) 官方 provider 的 base_url 只有为
+**非默认**值才翻非官方——`validate_config` 会给官方 provider 也持久化默认 base_url，单纯
+非空不算冒充（用 `provider_client.default_base_url` 比对，惰性导入避免破坏 consumer 导入
+契约）；(3) gateway codex 用户 `model` 已被改写成内部 `gw-<uid>` 别名，新增 `identity_model`
+贯穿 `_wire_gateway_models`→`materialize_home`，身份块自称真实上游模型而非别名，并纳入
+`_spawn_identity`。
+spec/plan：`docs/superpowers/{specs,plans}/2026-07-02-agent-model-identity-honesty*.md`。
+
 ## 2026-06-29
 
 ### [DONE] photo_added 唤醒加 new-photo 提示（拉取式）

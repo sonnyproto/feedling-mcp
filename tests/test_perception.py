@@ -195,6 +195,45 @@ def test_snapshot_ttl_nulls_stale(env):
     assert service.snapshot(UID)["motion_state"] is None
 
 
+def test_snapshot_timezone_survives_ttl_but_local_time_expires(env):
+    """Stable identity fields (timezone/locale) must NOT be nulled out by the
+    freshness TTL: a proactive wake fires long after the last foreground report,
+    and the resident consumer's current_time anchor needs the real timezone or it
+    silently falls back to UTC. The volatile local_time in the same signal still
+    expires normally."""
+    fake, _ = env
+    service.ingest_snapshot(UID, [
+        _item("time", {"local_time": "2026-06-08T15:30:45Z",
+                       "timezone": "Asia/Shanghai", "locale": "zh"}),
+    ])
+    # backdate every stored `time` field beyond the time ttl (300s)
+    for field in ("local_time", "timezone", "locale"):
+        fake.state[UID][field]["ts"] = time.time() - 10_000
+    snap = service.snapshot(UID)
+    assert snap["timezone"] == "Asia/Shanghai"   # stable -> survives
+    assert snap["locale"] == "zh"                # stable -> survives
+    assert snap["local_time"] is None            # volatile -> expires
+
+
+def test_record_context_timezone_writes_state(env):
+    """The proactive app-presence channel persists the device timezone without the
+    perception-upload pipeline, so proactive's current_time anchor can localize."""
+    fake, _ = env
+    assert service.record_context_timezone(UID, "Asia/Shanghai", "zh") is True
+    snap = service.snapshot(UID)
+    assert snap["timezone"] == "Asia/Shanghai"
+    assert snap["locale"] == "zh"
+
+
+def test_record_context_timezone_rejects_junk(env):
+    """Empty/unknown zones are no-ops — never poison state with a junk timezone
+    (which would then be TTL-exempt and stick)."""
+    fake, _ = env
+    assert service.record_context_timezone(UID, "", "en") is False
+    assert service.record_context_timezone(UID, "Not/AZone", "en") is False
+    assert service.snapshot(UID)["timezone"] is None
+
+
 def test_manual_user_state(env):
     fake, _ = env
     assert service.snapshot(UID)["user_state"] == "default"   # always present

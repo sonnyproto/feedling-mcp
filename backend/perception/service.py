@@ -217,6 +217,40 @@ def ingest_snapshot(user_id: str, items: list, client_ts=None) -> dict:
     return _apply(user_id, pairs, client_ts)
 
 
+def record_context_timezone(user_id: str, timezone: str, locale: str = "") -> bool:
+    """Persist the device timezone/locale from a NON-perception, already-disclosed
+    channel (the proactive app-presence device event), NOT the perception upload
+    pipeline. This lets the resident consumer's current_time anchor localize
+    proactive messages even when the user has turned the perception-data upload
+    opt-out OFF — timezone/locale are stable, non-sensitive proactive context, and
+    routing them here (instead of forging a /v1/perception/report item) respects
+    that opt-out. Returns True when a valid timezone was written.
+
+    `local_time` is derived here only to satisfy the `time` signal shape; it is
+    volatile and expires on the normal TTL, while timezone/locale are exempt (see
+    _STABLE_CONTEXT_FIELDS)."""
+    tz = str(timezone or "").strip()
+    if not tz:
+        return False
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(tz)  # reject unknown zones; don't poison state with junk
+    except Exception:
+        return False
+    from datetime import timezone as _utc
+    item = {
+        "key": "time",
+        "data": json.dumps({
+            "local_time": datetime.now(_utc.utc).isoformat(),
+            "timezone": tz,
+            "locale": str(locale or "").strip(),
+        }),
+        "message": "device timezone (proactive app-presence)",
+    }
+    ingest_snapshot(user_id, [item])
+    return True
+
+
 def ingest_snapshot_v2(
     user_id: str,
     items: list,
@@ -710,6 +744,15 @@ def _fire_wake(user_id: str, cap_key: str, hint: str, now: float) -> None:
 # Snapshot
 # ---------------------------------------------------------------------------
 
+# Stable identity-ish context fields don't go stale like volatile sensor
+# readings: a timezone/locale reported hours ago is still the user's timezone/
+# locale. Exempt them from the freshness null-out so a proactive wake that fires
+# long after the last foreground report still resolves the user's real timezone
+# (the resident consumer's current_time anchor) instead of falling back to UTC.
+# The volatile `local_time` in the same `time` signal keeps expiring normally.
+_STABLE_CONTEXT_FIELDS = frozenset({"timezone", "locale"})
+
+
 def _catalog_snapshot_fields(user_id: str, now: float | None = None, *, include_query_tools: bool = False) -> dict:
     now = now or _now()
     state = store.get_state(user_id)
@@ -725,7 +768,7 @@ def _catalog_snapshot_fields(user_id: str, now: float | None = None, *, include_
             if not isinstance(cell, dict):
                 snap[f] = None
                 continue
-            if (now - float(cell.get("ts") or 0)) > sig.ttl_sec:
+            if f not in _STABLE_CONTEXT_FIELDS and (now - float(cell.get("ts") or 0)) > sig.ttl_sec:
                 snap[f] = None  # stale -> agent treats as "don't infer"
             else:
                 snap[f] = cell.get("v")  # null cell -> None (= no permission now)

@@ -525,6 +525,129 @@ def test_history_source_merges_existing_ai_persona_with_voice_exemplars(monkeypa
     assert reducer_output["voice_workset"]["exemplars"][0]["founding"] is True
 
 
+def test_foreground_combined_map_extracts_fact_and_voice_in_one_call(monkeypatch):
+    monkeypatch.setenv("FEEDLING_GENESIS_COMBINED_MAP", "1")
+    calls = []
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            calls.append(kwargs["task_id"])
+            assert kwargs["task_id"] == "combined-map-0"
+            text = json.dumps({
+                "fact_candidates": [{"about": "user", "summary": "用户叫 Z", "evidence": "我叫 Z"}],
+                "voice_candidates": {
+                    "behavior_notes_candidates": ["短句接住"],
+                    "exemplar_candidates": [{"turns": [{"role": "ta", "text": "别急,我在。"}]}],
+                },
+            })
+            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
+
+    monkeypatch.setattr(worker, "GenesisLLMClient", FakeLLM)
+
+    output = worker.build_foreground_output_from_texts(
+        user_id="usr_1",
+        job_id="job_1",
+        runtime=types.SimpleNamespace(),
+        chunk_texts=["user: 我叫 Z\nta: 别急,我在。"],
+        source_kind="history",
+        write_core=False,
+        include_voice_candidates=True,
+    )
+
+    assert calls == ["combined-map-0"]
+    assert output["all_fact_candidates"] == [{"about": "user", "summary": "用户叫 Z", "evidence": "我叫 Z"}]
+    assert output["voice_candidates"] == [{
+        "behavior_notes_candidates": ["短句接住"],
+        "exemplar_candidates": [{"turns": [{"role": "ta", "text": "别急,我在。"}]}],
+    }]
+
+
+def test_foreground_combined_map_retries_once_when_empty(monkeypatch):
+    monkeypatch.setenv("FEEDLING_GENESIS_COMBINED_MAP", "1")
+    calls = []
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            calls.append({"task_id": kwargs["task_id"], "idempotency_key": kwargs["idempotency_key"]})
+            if len(calls) == 1:
+                text = json.dumps({"fact_candidates": [], "voice_candidates": {}})
+            elif len(calls) == 2:
+                text = json.dumps({
+                    "fact_candidates": [{"about": "user", "summary": "用户叫 Z", "evidence": "我叫 Z"}],
+                    "voice_candidates": {"behavior_notes_candidates": ["直说"], "exemplar_candidates": []},
+                })
+            else:
+                raise AssertionError(kwargs["task_id"])
+            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
+
+    output = worker.build_foreground_output_from_texts(
+        user_id="usr_1",
+        job_id="job_1",
+        runtime=types.SimpleNamespace(),
+        chunk_texts=["user: 我叫 Z"],
+        source_kind="history",
+        llm=FakeLLM(),
+        write_core=False,
+        include_voice_candidates=True,
+    )
+
+    assert [call["task_id"] for call in calls] == ["combined-map-0", "combined-map-0-empty-retry-1"]
+    assert calls[0]["idempotency_key"] != calls[1]["idempotency_key"]
+    assert output["all_fact_candidates"][0]["summary"] == "用户叫 Z"
+    assert output["voice_candidates"][0]["behavior_notes_candidates"] == ["直说"]
+
+
+def test_fact_write_retries_once_when_empty(monkeypatch):
+    calls = []
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            calls.append({"task_id": kwargs["task_id"], "idempotency_key": kwargs["idempotency_key"]})
+            if len(calls) == 1:
+                text = json.dumps({"memories": [], "identity": {"agent_name": "", "dimensions": []}})
+            elif len(calls) == 2:
+                text = json.dumps({
+                    "memories": [{"summary": "用户叫 Z", "content": "用户叫 Z"}],
+                    "identity": {"agent_name": "乔伊", "dimensions": []},
+                })
+            else:
+                raise AssertionError(kwargs["task_id"])
+            return types.SimpleNamespace(text=text, usage={}, cached=False, output_ref=kwargs["task_id"])
+
+    output = worker.build_memory_output_from_fact_candidates(
+        user_id="usr_1",
+        job_id="job_1",
+        runtime=types.SimpleNamespace(),
+        fact_candidates=[{"about": "user", "summary": "用户叫 Z", "evidence": "我叫 Z"}],
+        llm=FakeLLM(),
+    )
+
+    assert [call["task_id"] for call in calls] == ["fact-write-0", "fact-write-0-empty-retry-1"]
+    assert calls[0]["idempotency_key"] != calls[1]["idempotency_key"]
+    assert output["memories"][0]["summary"] == "用户叫 Z"
+    assert output["identity"]["agent_name"] == "乔伊"
+
+
+def test_fact_write_provider_config_error_does_not_retry(monkeypatch):
+    calls = []
+
+    class FakeLLM:
+        def complete(self, **kwargs):
+            calls.append(kwargs["task_id"])
+            raise provider_client.ProviderError("out of credits", status_code=402)
+
+    with pytest.raises(provider_client.ProviderError):
+        worker.build_memory_output_from_fact_candidates(
+            user_id="usr_1",
+            job_id="job_1",
+            runtime=types.SimpleNamespace(),
+            fact_candidates=[{"about": "user", "summary": "用户叫 Z", "evidence": "我叫 Z"}],
+            llm=FakeLLM(),
+        )
+
+    assert calls == ["fact-write-0"]
+
+
 def test_user_profile_source_writes_memory_facts_without_identity_or_persona(monkeypatch):
     llm_calls = []
     apply_payloads, _minted, mint = _install_success_harness(
@@ -777,4 +900,3 @@ def test_reap_stale_blob_sync_failure_still_counts_job_reaped(monkeypatch):
 
     assert synced == ["job_b"]
     assert {r["job_id"] for r in reaped} == {"job_a", "job_b"}
-

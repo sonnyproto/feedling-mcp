@@ -15,6 +15,7 @@ from flask import Blueprint, jsonify, request
 import db
 from accounts import auth
 from accounts import runtime_auth
+from core import enclave as core_enclave
 from genesis import dedup, foreground, foreground_identity, service, worker
 from hosted import config_store as hosted_config_store
 from hosted import history_import
@@ -37,6 +38,7 @@ _PLAINTEXT_SUPPORT_SOURCE_FAMILIES = {
     history_import._USER_PROFILE_SOURCE,
     history_import._MEMORY_SUMMARY_SOURCE,
 }
+_PLAINTEXT_MODES = {"onboarding", "add_memory", "update_identity"}
 
 
 def _bad(error: str, status: int = 400, **extra):
@@ -90,6 +92,22 @@ def _plaintext_source_kind(history_messages: list[dict], support_messages: list[
         if family == history_import._MEMORY_SUMMARY_SOURCE:
             return "memory_summary"
     return history_import._HISTORY_SOURCE
+
+
+def _plaintext_mode_from_client_job_id(client_job_id: str) -> str:
+    lowered = str(client_job_id or "").strip().lower()
+    if lowered.startswith("garden-"):
+        return "add_memory"
+    if lowered.startswith("identity-"):
+        return "update_identity"
+    return "onboarding"
+
+
+def _plaintext_mode(payload: dict, *, client_job_id: str) -> str:
+    explicit = str(payload.get("mode") or "").strip().lower()
+    if explicit in _PLAINTEXT_MODES:
+        return explicit
+    return _plaintext_mode_from_client_job_id(client_job_id)
 
 
 def _plaintext_route_family(msg: dict) -> str:
@@ -229,6 +247,7 @@ def _plaintext_job_metadata(
     *,
     client_job_id: str,
     input_hash: str,
+    mode: str,
 ) -> dict:
     profile = prepared.get("profile") if isinstance(prepared.get("profile"), dict) else {}
     source_stats = prepared.get("source_stats") if isinstance(prepared.get("source_stats"), dict) else {}
@@ -236,6 +255,7 @@ def _plaintext_job_metadata(
         "ingest": "plaintext",
         "input_hash": input_hash,
         "client_job_id": client_job_id,
+        "mode": mode if mode in _PLAINTEXT_MODES else "onboarding",
         "history_tier": str(profile.get("tier") or "small"),
         "window_count": len(prepared.get("chunk_texts") or []),
         "history_count": int(profile.get("message_count") or 0),
@@ -268,11 +288,19 @@ def _metadata_for_job(job: dict | None) -> dict:
     return metadata if isinstance(metadata, dict) else {}
 
 
+def _metadata_plaintext_mode(metadata: dict) -> str:
+    mode = str(metadata.get("mode") or "").strip().lower()
+    if mode in _PLAINTEXT_MODES:
+        return mode
+    return _plaintext_mode_from_client_job_id(str(metadata.get("client_job_id") or ""))
+
+
 def _find_reusable_plaintext_job(
     store,
     *,
     client_job_id: str,
     input_hash: str,
+    mode: str,
 ) -> dict | None:
     try:
         jobs = db.genesis_list_jobs(store.user_id, limit=100)
@@ -283,6 +311,8 @@ def _find_reusable_plaintext_job(
             continue
         metadata = _metadata_for_job(job)
         if metadata.get("ingest") != "plaintext":
+            continue
+        if _metadata_plaintext_mode(metadata) != mode:
             continue
         if client_job_id and str(metadata.get("client_job_id") or "") == client_job_id:
             return job
@@ -479,12 +509,71 @@ def _plaintext_existing_voice_from_output(output: dict) -> dict:
     }
 
 
+def _plaintext_persona_material_from_messages(messages: list[dict] | None) -> str:
+    chunks: list[str] = []
+    seen: set[str] = set()
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        source = history_import._import_source_family(str(msg.get("source") or msg.get("source_family") or ""))
+        if source != history_import._AI_PERSONA_SOURCE:
+            continue
+        content = str(msg.get("content") or "").strip()
+        if not content or content in seen:
+            continue
+        seen.add(content)
+        chunks.append(content)
+    return "\n\n".join(chunks).strip()
+
+
+def _plaintext_existing_voice_workset_for_update(store, api_key: str | None) -> dict:
+    try:
+        blob = db.get_blob(store.user_id, service.GENESIS_VOICE_BLOB)
+        if not isinstance(blob, dict):
+            return {}
+        envelope = blob.get("content_envelope")
+        if not isinstance(envelope, dict):
+            return {}
+        raw = core_enclave._decrypt_envelope_via_enclave(envelope, api_key, purpose="genesis_voice")
+        parsed = json.loads(raw.decode("utf-8"))
+        if not isinstance(parsed, dict):
+            return {}
+        notes = parsed.get("behavior_notes") if isinstance(parsed.get("behavior_notes"), list) else []
+        exemplars = parsed.get("exemplars") if isinstance(parsed.get("exemplars"), list) else []
+        return {"behavior_notes": notes, "exemplars": exemplars}
+    except Exception:
+        return {}
+
+
 def _merged_has_identity(merged: dict) -> bool:
     """True when the reduce output carries a usable Identity Card (a name or any
     dimension). Mirrors service._identity_payload_from_output's emptiness rule."""
     ident = merged.get("identity") if isinstance(merged.get("identity"), dict) else {}
     dims = ident.get("dimensions") if isinstance(ident.get("dimensions"), list) else []
     return bool(str(ident.get("agent_name") or "").strip()) or len(dims) > 0
+
+
+def _identity_payload_has_content(identity_payload: dict | None) -> bool:
+    payload = identity_payload if isinstance(identity_payload, dict) else {}
+    if str(payload.get("agent_name") or "").strip():
+        return True
+    if str(payload.get("self_introduction") or "").strip():
+        return True
+    if str(payload.get("category") or "").strip():
+        return True
+    dimensions = payload.get("dimensions") if isinstance(payload.get("dimensions"), list) else []
+    if dimensions:
+        return True
+    signature = payload.get("signature") if isinstance(payload.get("signature"), list) else []
+    return bool(signature)
+
+
+def _provider_identity_failure(warnings: list[str] | tuple[str, ...] | None) -> str:
+    for warning in warnings or []:
+        text = str(warning or "")
+        if text.startswith("provider_identity_failed:"):
+            return text
+    return ""
 
 
 def _run_plaintext_genesis_v2(
@@ -521,25 +610,73 @@ def _run_plaintext_genesis_v2(
     fg_idx = source_groups.index(fg_group) + 1
     fg_kind = str(fg_group.get("source_kind") or history_import._HISTORY_SOURCE)
     fg_family = str(fg_group.get("source_family") or worker._source_family(fg_kind))
-    fg_chunks = [str(t) for t in (fg_group.get("chunk_texts") or []) if str(t or "").strip()]
-    if not fg_chunks:
-        return False
 
     db.genesis_set_job_status(
         store.user_id, job_id, status="processing",
         output={"stage": "genesis_v2_foreground", "source_family": fg_family}, processed_chunks=0,
     )
-    fg_reduce = worker.build_foreground_output_from_texts(
-        user_id=store.user_id, job_id=job_id,
-        key_prefix=f"{job_id}:source_pass:{fg_idx}:{fg_family}",
-        runtime=runtime, chunk_texts=fg_chunks, source_kind=fg_kind,
-    )
-    core = fg_reduce.get("core_fact_candidates") or []
+    combined_map = worker.genesis_combined_map_enabled()
+    foreground_reduces: list[dict] = []
+    primary_reduce: dict | None = None
+    voice_candidates: list[dict] = []
+    persona_material_parts: list[str] = []
+    for idx, group in enumerate(source_groups, start=1):
+        group_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
+        group_family = str(group.get("source_family") or worker._source_family(group_kind))
+        group_chunks = [str(t) for t in (group.get("chunk_texts") or []) if str(t or "").strip()]
+        if not group_chunks:
+            continue
+        if combined_map and group_family == "ai_persona":
+            persona_material_parts.extend(group_chunks)
+        reduce = worker.build_foreground_output_from_texts(
+            user_id=store.user_id, job_id=job_id,
+            key_prefix=f"{job_id}:source_pass:{idx}:{group_family}",
+            runtime=runtime, chunk_texts=group_chunks, source_kind=group_kind,
+            include_voice_candidates=combined_map,
+            write_core=False,
+        )
+        foreground_reduces.append(reduce)
+        voice_candidates.extend([c for c in (reduce.get("voice_candidates") or []) if isinstance(c, dict)])
+        if idx == fg_idx:
+            primary_reduce = reduce
+
+    if not foreground_reduces:
+        return False
+    primary_reduce = primary_reduce or foreground_reduces[0]
+    all_fact_candidates: list[dict] = []
+    for reduce in foreground_reduces:
+        candidates = reduce.get("all_fact_candidates") or reduce.get("core_fact_candidates") or []
+        all_fact_candidates.extend([c for c in candidates if isinstance(c, dict)])
+
+    core = primary_reduce.get("core_fact_candidates") or foreground.select_core_for_foreground(all_fact_candidates)
     if not core:
         return False  # nothing to work with -> let the v1 full path handle it
 
-    fg_merged = _plaintext_merge_reducer_outputs([fg_reduce], relationship_anchor=relationship_anchor)
-    core_memories = fg_merged.get("memories") or []
+    full_fact_write = worker.build_memory_output_from_fact_candidates(
+        user_id=store.user_id,
+        job_id=job_id,
+        key_prefix=f"{job_id}:foreground_full",
+        runtime=runtime,
+        fact_candidates=all_fact_candidates,
+    )
+    fg_merged = _plaintext_merge_reducer_outputs(
+        [{**primary_reduce, **full_fact_write}],
+        relationship_anchor=relationship_anchor,
+    )
+    if combined_map:
+        voice_persona_output = worker.build_voice_persona_output_from_candidates(
+            user_id=store.user_id,
+            job_id=job_id,
+            key_prefix=f"{job_id}:foreground_voice_persona",
+            runtime=runtime,
+            voice_candidates=voice_candidates,
+            existing_persona={"content": "\n\n".join(persona_material_parts).strip()} if persona_material_parts else None,
+        )
+        fg_merged = _plaintext_merge_reducer_outputs(
+            [{**fg_merged, **voice_persona_output}],
+            relationship_anchor=relationship_anchor,
+        )
+    full_memories = fg_merged.get("memories") or []
     days = int((relationship_anchor or {}).get("days_with_user") or 0)
     # explicit relationship_started_at (user typed a date) -> honored verbatim below,
     # per the documented priority; blank -> _store_identity_payload falls back to memory.
@@ -552,35 +689,43 @@ def _run_plaintext_genesis_v2(
     # (orchestration only — no new prompt/logic), then write identity + relationship
     # anchor + a greeting BEFORE completing. So the home is never blank and validate's
     # identity_card passes at entry. Heavy voice/persona/full-memory stay in background.
-    identity_payload, _idw = foreground_identity.derive_foreground_identity(
-        runtime=runtime, analysis_messages=msgs, core_memories=core_memories,
+    identity_payload, id_warnings = foreground_identity.derive_foreground_identity(
+        runtime=runtime, analysis_messages=msgs, core_memories=full_memories,
         days_with_user=days, language=language,
     )
+    provider_failure = _provider_identity_failure(id_warnings)
+    if provider_failure:
+        service.mark_failed(store, job_id, f"foreground_identity_failed:{provider_failure}")
+        return True
     identity_first = bool(msgs) and foreground_identity.has_identity_signal(identity_payload)
+    persona_ref = ""
+    persona_sha = ""
+    if combined_map:
+        persona_ref, persona_sha = service.write_persona_artifact(store, job_id, fg_merged)
+        service.write_voice_artifact(store, job_id, fg_merged)
 
     if identity_first:
         # core memories now; identity via the legacy _store_identity_payload (exact old
         # path — writes the card + relationship anchor); greeting via the legacy pair.
-        mem_count, _mr = service.apply_memory_outputs(store, api_key, {"memories": core_memories})
+        mem_count, _mr = service.apply_memory_outputs(store, api_key, {"memories": full_memories})
         history_import._store_identity_payload(
             store, identity_payload, days_with_user=days,
             evidence=f"genesis_foreground:{job_id}", language=language,
             relationship_started_at=explicit_started_at,
         )
-        greeting_text, _gw = history_import._generate_model_api_onboarding_greeting(
-            runtime, msgs, core_memories, identity_payload, days, language,
+        _append_plaintext_onboarding_greeting(
+            store,
+            runtime=runtime,
+            analysis_messages=msgs,
+            memories=full_memories,
+            identity_payload=identity_payload,
+            days=days,
+            language=language,
         )
-        if not str(greeting_text or "").strip():
-            # greeting is NOT a hard gate — a flaky greeting call must not stall onboarding.
-            # Fall back to a template so hosted_chat still gets a first message.
-            greeting_text = ("好久不见，很高兴又能和你聊天。"
-                             if str(language).startswith("zh")
-                             else "Good to see you again — I'm glad we can talk.")
-        history_import._append_model_api_onboarding_greeting(store, greeting_text)
         completed = db.genesis_complete_job(
             store.user_id, job_id, output={"stage": "genesis_v2_foreground_ready"},
             memory_action_count=mem_count, identity_status="initialized",
-            persona_ref="", persona_sha256="",
+            persona_ref=persona_ref, persona_sha256=persona_sha,
         )
         if completed:
             service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
@@ -588,13 +733,25 @@ def _run_plaintext_genesis_v2(
         # edge: foreground couldn't derive an identity -> current backstop (complete on
         # core + let the background fill identity via init_identity/persona baseline).
         # Rare, never worse than before; the iOS minimal-seed page is the real fix.
+        _append_plaintext_onboarding_greeting(
+            store,
+            runtime=runtime,
+            analysis_messages=msgs,
+            memories=full_memories,
+            identity_payload=identity_payload,
+            days=days,
+            language=language,
+        )
         service.apply_reducer_output(store, api_key, job_id, fg_merged)
+
+    if combined_map:
+        return True
 
     # foreground core memory texts -> background as "already saved, don't repeat"
     # (semantic dedup of reworded twins lives in the model).
     core_memory_texts = [
         t for t in (str((m or {}).get("summary") or (m or {}).get("content") or "").strip()
-                    for m in core_memories) if t
+                    for m in full_memories) if t
     ]
 
     # background continuation — never fails the (already greetable) job. When the
@@ -605,6 +762,7 @@ def _run_plaintext_genesis_v2(
             relationship_anchor=relationship_anchor,
             skip_family=fg_family, skip_texts=foreground.core_skip_texts(core),
             known_memories=core_memory_texts, write_identity=not identity_first,
+            include_memory=False,
         )
     except Exception as e:  # noqa: BLE001
         db.genesis_set_job_status(
@@ -627,6 +785,7 @@ def _run_plaintext_background_enrichment(
     skip_texts: set[str],
     known_memories: list[str] | None = None,
     write_identity: bool = True,
+    include_memory: bool = True,
 ) -> None:
     """Background continuation: the full reduce over every group (skipping the core the
     foreground already wrote for skip_family), then apply the REST incrementally —
@@ -660,6 +819,7 @@ def _run_plaintext_background_enrichment(
             # only the foreground group needs its already-written core skipped/deduped
             skip_fact_texts=skip_texts if group_family == skip_family else None,
             known_memories=known if group_family == skip_family else None,
+            include_memory=include_memory,
         )
         reducer_outputs.append(output)
         next_persona = _plaintext_existing_persona_from_output(output)
@@ -671,12 +831,13 @@ def _run_plaintext_background_enrichment(
 
     merged = _plaintext_merge_reducer_outputs(reducer_outputs, relationship_anchor=relationship_anchor)
     # conservative lexical backstop: drop any near-identical survivor the model missed
-    if known and isinstance(merged.get("memories"), list):
+    if include_memory and known and isinstance(merged.get("memories"), list):
         kept, dropped = dedup.filter_semantic_dups(merged["memories"], known)
         if dropped:
             merged["memories"] = kept
     # apply the REST without re-completing: memories (core already excluded), persona, voice
-    service.apply_memory_outputs(store, api_key, merged)
+    if include_memory:
+        service.apply_memory_outputs(store, api_key, merged)
     # Identity is normally written by the FOREGROUND now (identity-first contract), so the
     # background skips it (write_identity=False). Only the edge fallback (foreground could
     # not derive an identity) asks the background to fill it — from the full reduce, or a
@@ -698,11 +859,177 @@ def _run_plaintext_background_enrichment(
     )
 
 
+def _append_plaintext_onboarding_greeting(
+    store,
+    *,
+    runtime,
+    analysis_messages: list[dict],
+    memories: list[dict],
+    identity_payload: dict,
+    days: int,
+    language: str,
+) -> str:
+    try:
+        greeting_text, _warnings = history_import._generate_model_api_onboarding_greeting(
+            runtime,
+            analysis_messages,
+            memories,
+            identity_payload,
+            days,
+            language,
+        )
+    except Exception:
+        greeting_text = ""
+    if not str(greeting_text or "").strip():
+        greeting_text = (
+            "好久不见，很高兴又能和你聊天。"
+            if str(language).startswith("zh")
+            else "Good to see you again — I'm glad we can talk."
+        )
+    try:
+        history_import._append_model_api_onboarding_greeting(store, greeting_text)
+    except Exception:
+        return ""
+    return str(greeting_text or "")
+
+
+def _run_plaintext_add_memory_job(
+    store,
+    api_key: str | None,
+    job_id: str,
+    *,
+    runtime,
+    source_groups: list[dict],
+) -> None:
+    fact_candidates: list[dict] = []
+    first_output: dict = {}
+    for idx, group in enumerate(source_groups, start=1):
+        group_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
+        group_family = str(group.get("source_family") or worker._source_family(group_kind))
+        group_chunks = [str(text) for text in (group.get("chunk_texts") or []) if str(text or "").strip()]
+        if not group_chunks:
+            continue
+        db.genesis_set_job_status(
+            store.user_id,
+            job_id,
+            status="processing",
+            output={
+                "stage": "plaintext_add_memory",
+                "source_family": group_family,
+                "source_pass": idx,
+                "source_pass_total": len(source_groups),
+            },
+        )
+        output = worker.build_foreground_output_from_texts(
+            user_id=store.user_id,
+            job_id=job_id,
+            key_prefix=f"{job_id}:add_memory:{idx}:{group_family}",
+            runtime=runtime,
+            chunk_texts=group_chunks,
+            source_kind=group_kind,
+            write_core=False,
+        )
+        if not first_output:
+            first_output = output
+        candidates = output.get("all_fact_candidates") or output.get("core_fact_candidates") or []
+        fact_candidates.extend([item for item in candidates if isinstance(item, dict)])
+
+    memory_output = worker.build_memory_output_from_fact_candidates(
+        user_id=store.user_id,
+        job_id=job_id,
+        key_prefix=f"{job_id}:add_memory:fact_write",
+        runtime=runtime,
+        fact_candidates=fact_candidates,
+    )
+    merged = _plaintext_merge_reducer_outputs([{**first_output, **memory_output}], relationship_anchor={})
+    mem_count, _results = service.apply_memory_outputs(store, api_key, merged)
+    completed = db.genesis_complete_job(
+        store.user_id,
+        job_id,
+        output={"stage": "plaintext_add_memory_done"},
+        memory_action_count=mem_count,
+        identity_status="skipped",
+        persona_ref="",
+        persona_sha256="",
+    )
+    if completed:
+        service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
+
+
+def _run_plaintext_update_identity_job(
+    store,
+    api_key: str | None,
+    job_id: str,
+    *,
+    runtime,
+    analysis_messages: list[dict] | None,
+) -> None:
+    if not identity_service._load_identity(store):
+        service.mark_failed(store, job_id, "identity_not_initialized")
+        return
+    msgs = analysis_messages if isinstance(analysis_messages, list) else []
+    language = history_import._import_language_for_store(store, msgs)
+    identity_payload, warnings = history_import._derive_identity_with_provider(
+        runtime,
+        msgs,
+        [],
+        0,
+        language,
+    )
+    provider_failure = _provider_identity_failure(warnings)
+    if provider_failure:
+        service.mark_failed(store, job_id, f"update_identity_failed:{provider_failure}")
+        return
+    if not _identity_payload_has_content(identity_payload):
+        service.mark_failed(store, job_id, "identity_update_empty")
+        return
+    persona_material = _plaintext_persona_material_from_messages(msgs)
+    if not persona_material:
+        service.mark_failed(store, job_id, "persona_material_required")
+        return
+    voice_workset = _plaintext_existing_voice_workset_for_update(store, api_key)
+    try:
+        persona_output = worker.build_persona_output_from_material(
+            user_id=store.user_id,
+            job_id=job_id,
+            key_prefix=f"{job_id}:update_identity",
+            runtime=runtime,
+            persona_material=persona_material,
+            voice_workset=voice_workset,
+            source_kind="identity_update",
+            source_family="ai_persona",
+        )
+    except Exception as e:  # noqa: BLE001
+        service.mark_failed(store, job_id, f"persona_rebuild_failed:{type(e).__name__}:{str(e)[:160]}")
+        return
+    status = service.replace_identity_preserving_anchor(store, {"identity": identity_payload})
+    if status != "updated":
+        service.mark_failed(store, job_id, status)
+        return
+    try:
+        persona_ref, persona_sha = service.write_persona_artifact(store, job_id, persona_output)
+    except Exception as e:  # noqa: BLE001
+        service.mark_failed(store, job_id, f"persona_write_failed:{type(e).__name__}:{str(e)[:160]}")
+        return
+    completed = db.genesis_complete_job(
+        store.user_id,
+        job_id,
+        output={"stage": "plaintext_update_identity_done"},
+        memory_action_count=0,
+        identity_status="updated",
+        persona_ref=persona_ref,
+        persona_sha256=persona_sha,
+    )
+    if completed:
+        service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
+
+
 def _run_plaintext_genesis_job(
     store,
     api_key: str | None,
     job_id: str,
     *,
+    mode: str = "onboarding",
     chunk_texts: list[str] | None = None,
     source_kind: str = history_import._HISTORY_SOURCE,
     source_groups: list[dict] | None = None,
@@ -738,6 +1065,25 @@ def _run_plaintext_genesis_job(
         if isinstance(runtime, tuple):
             _, err = runtime
             raise RuntimeError(json.dumps(err, ensure_ascii=False))
+
+        if mode == "add_memory":
+            _run_plaintext_add_memory_job(
+                store,
+                api_key,
+                job_id,
+                runtime=runtime,
+                source_groups=source_groups,
+            )
+            return
+        if mode == "update_identity":
+            _run_plaintext_update_identity_job(
+                store,
+                api_key,
+                job_id,
+                runtime=runtime,
+                analysis_messages=analysis_messages,
+            )
+            return
 
         # Genesis v2 (FEEDLING_GENESIS_V2_ENABLED): foreground-fast — greet on 3-5 core
         # + identity baseline, push the heavy reduce to background. Returns False when
@@ -814,6 +1160,7 @@ def _start_plaintext_genesis_job(
     api_key: str | None,
     job: dict,
     *,
+    mode: str = "onboarding",
     chunk_texts: list[str],
     source_kind: str,
     source_groups: list[dict] | None = None,
@@ -832,6 +1179,7 @@ def _start_plaintext_genesis_job(
         target=_run_plaintext_genesis_job,
         args=(store, api_key, job_id),
         kwargs={
+            "mode": mode,
             "chunk_texts": chunk_texts,
             "source_kind": source_kind,
             "source_groups": source_groups,
@@ -871,10 +1219,14 @@ def genesis_import_plaintext():
 
     input_hash = history_import._history_import_payload_hash(payload)
     client_job_id = history_import._history_import_client_job_id(payload)
+    mode = _plaintext_mode(payload, client_job_id=client_job_id)
+    if mode == "update_identity" and not identity_service._load_identity(store):
+        return _bad("identity_not_initialized", 409)
     existing = _find_reusable_plaintext_job(
         store,
         client_job_id=client_job_id,
         input_hash=input_hash,
+        mode=mode,
     )
     if existing and str(existing.get("status") or "") == service.DONE_JOB_STATUS:
         return jsonify(_job_response(existing, extra={"status": "done"})), 200
@@ -897,6 +1249,7 @@ def genesis_import_plaintext():
             store,
             api_key,
             existing,
+            mode=mode,
             chunk_texts=prepared["chunk_texts"],
             source_kind=prepared["source_kind"],
             source_groups=prepared["source_groups"],
@@ -910,6 +1263,7 @@ def genesis_import_plaintext():
         prepared,
         client_job_id=client_job_id,
         input_hash=input_hash,
+        mode=mode,
     )
     total_bytes = sum(len(text.encode("utf-8")) for text in prepared["chunk_texts"])
     try:
@@ -935,6 +1289,7 @@ def genesis_import_plaintext():
         store,
         api_key,
         job,
+        mode=mode,
         chunk_texts=prepared["chunk_texts"],
         source_kind=prepared["source_kind"],
         source_groups=prepared["source_groups"],

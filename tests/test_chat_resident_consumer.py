@@ -1253,12 +1253,16 @@ def test_prepare_claude_cli_first_turn_forces_print_json_and_strips_continue(mon
 
 
 def test_prepare_claude_cli_injects_stored_resume(monkeypatch):
+    # Resume is the fallback continuity path, kept only when foreground history
+    # injection is disabled. With injection on (the auto default for claude) the
+    # resident drops --resume — see test_claude_resume_injection_skipped_*.
     sid = "123e4567-e89b-12d3-a456-426614174000"
     monkeypatch.setattr(
         crc,
         "AGENT_CLI_CMD",
         'claude -p "{message}"',
     )
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: sid)
     monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
 
@@ -3523,3 +3527,240 @@ def test_non_openclaw_shapes_unaffected():
     # plain multi-bubble and a bare string still work (no regression)
     assert crc._agent_turn_from_raw({"messages": ["你好"]}).messages == ["你好"]
     assert crc._reply_from_json_obj({"reply": "hi"}) == "hi"
+
+
+# ---------------------------------------------------------------------------
+# whoami TTL cache tests
+# ---------------------------------------------------------------------------
+
+
+def _seed_valid_whoami_cache():
+    crc._whoami_cache.update(
+        user_id="usr_test", user_pk=b"\x01" * 32, enclave_pk=b"\x02" * 32
+    )
+
+
+def test_refresh_whoami_skips_network_when_fresh(monkeypatch):
+    _seed_valid_whoami_cache()
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_TTL_SEC", 300.0)
+    monkeypatch.setattr(crc, "_whoami_cache_loaded_at", time.monotonic())
+    called = MagicMock(return_value=True)
+    monkeypatch.setattr(crc, "_load_whoami_with_retries", called)
+
+    assert crc._refresh_whoami_for_encrypted_reply() is True
+    called.assert_not_called()
+
+
+def test_refresh_whoami_fetches_when_stale(monkeypatch):
+    _seed_valid_whoami_cache()
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_TTL_SEC", 300.0)
+    monkeypatch.setattr(crc, "_whoami_cache_loaded_at", time.monotonic() - 10_000)
+    called = MagicMock(return_value=True)
+    monkeypatch.setattr(crc, "_load_whoami_with_retries", called)
+
+    assert crc._refresh_whoami_for_encrypted_reply() is True
+    called.assert_called_once()
+
+
+def test_refresh_whoami_ttl_zero_always_fetches(monkeypatch):
+    _seed_valid_whoami_cache()
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_TTL_SEC", 0.0)
+    monkeypatch.setattr(crc, "_whoami_cache_loaded_at", time.monotonic())
+    called = MagicMock(return_value=True)
+    monkeypatch.setattr(crc, "_load_whoami_with_retries", called)
+
+    assert crc._refresh_whoami_for_encrypted_reply() is True
+    called.assert_called_once()
+
+
+def test_refresh_whoami_refetches_when_enclave_pk_missing(monkeypatch):
+    # Partial whoami: identity present but enclave_pk missing must NOT be
+    # treated as fresh — the gate must fall through and refetch so the
+    # missing enclave key can heal.
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_test", "user_pk": b"\x01" * 32, "enclave_pk": None})
+    monkeypatch.setattr(crc, "WHOAMI_REFRESH_TTL_SEC", 300.0)
+    monkeypatch.setattr(crc, "_whoami_cache_loaded_at", time.monotonic())
+    called = MagicMock(return_value=True)
+    monkeypatch.setattr(crc, "_load_whoami_with_retries", called)
+
+    assert crc._refresh_whoami_for_encrypted_reply() is True
+    called.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Provider payment (402) circuit breaker tests
+# ---------------------------------------------------------------------------
+
+
+def test_is_provider_payment_error_matches_402_runtimeerror():
+    exc = RuntimeError(
+        "cli agent exited 1: unexpected status 402 Payment Required: "
+        "This request requires more credits"
+    )
+    assert crc._is_provider_payment_error(exc) is True
+
+
+def test_is_provider_payment_error_ignores_other_errors():
+    assert crc._is_provider_payment_error(RuntimeError("connection reset")) is False
+
+
+def test_provider_payment_cooldown_lifecycle(monkeypatch):
+    monkeypatch.setattr(crc, "PROVIDER_PAYMENT_COOLDOWN_SEC", 600.0)
+    crc._clear_provider_payment_cooldown()
+    assert crc._provider_payment_cooling_down() is False
+
+    crc._note_provider_payment_failure()
+    assert crc._provider_payment_cooling_down() is True
+
+    # Simulate cooldown expiry.
+    monkeypatch.setattr(crc, "_provider_payment_cooldown_until", time.monotonic() - 1)
+    assert crc._provider_payment_cooling_down() is False
+
+    crc._clear_provider_payment_cooldown()
+    assert crc._provider_payment_cooling_down() is False
+
+
+# ---------------------------------------------------------------------------
+# Foreground chat context injection (codex / claude hosted BYOK)
+# ---------------------------------------------------------------------------
+# codex has no --resume and hosted claude's default command carries no session,
+# so cross-turn continuity is injected by the resident: a short recent-chat
+# transcript is prepended to the current turn. pi resumes natively and is skipped
+# to avoid double context. See _foreground_history_injection_enabled /
+# _foreground_agent_message.
+
+_CODEX_CLI = (
+    "codex exec --skip-git-repo-check --json "
+    "--dangerously-bypass-approvals-and-sandbox {message}"
+)
+_CLAUDE_CLI = "claude --allowed-tools 'Bash' --append-system-prompt-file /h/p -p {message}"
+_PI_CLI = "pi --mode json -t bash --session-id {session_id} {message}"
+
+
+def test_foreground_injection_enabled_for_codex(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    assert crc._foreground_history_injection_enabled() is True
+
+
+def test_foreground_injection_enabled_for_claude(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CLAUDE_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    assert crc._foreground_history_injection_enabled() is True
+
+
+def test_foreground_injection_skipped_for_pi(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _PI_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    assert crc._foreground_history_injection_enabled() is False
+
+
+def test_foreground_injection_skipped_for_claude_with_resume_in_template(monkeypatch):
+    # An operator-configured claude command that already carries native
+    # continuity (--resume) must NOT also get a resident-prepended transcript.
+    monkeypatch.setattr(
+        crc, "AGENT_CLI_CMD", "claude --resume {session_id} -p {message}"
+    )
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    assert crc._foreground_history_injection_enabled() is False
+
+
+def test_foreground_injection_skipped_for_claude_with_session_id_in_template(monkeypatch):
+    monkeypatch.setattr(
+        crc, "AGENT_CLI_CMD", "claude --session-id {session_id} -p {message}"
+    )
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    assert crc._foreground_history_injection_enabled() is False
+
+
+def test_foreground_injection_off_mode_disables_even_codex(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "off")
+    assert crc._foreground_history_injection_enabled() is False
+
+
+def test_foreground_injection_on_mode_forces_even_pi(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _PI_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "on")
+    assert crc._foreground_history_injection_enabled() is True
+
+
+def test_foreground_message_prepends_recent_transcript(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    now = time.time()
+    hist = [
+        {"role": "user", "content": "今天北京天气怎么样", "ts": now - 120},
+        {"role": "agent", "content": "晴，十八度", "ts": now - 118},
+        {"role": "user", "content": "那要穿外套吗", "ts": now},  # current turn
+    ]
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: list(hist))
+
+    out = crc._foreground_agent_message("那要穿外套吗", current_ts=now)
+
+    assert "那要穿外套吗" in out          # the current message is still present
+    assert "今天北京天气" in out          # prior user turn injected
+    assert "十八度" in out               # prior agent turn injected
+    assert out.count("那要穿外套吗") == 1  # current turn not duplicated in transcript
+    # transcript (older context) appears before the current message
+    assert out.index("今天北京天气") < out.index("那要穿外套吗")
+
+
+def test_foreground_message_no_decrypt_source_returns_plain_content(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: None)
+    assert crc._foreground_agent_message("你好", current_ts=time.time()) == "你好"
+
+
+def test_foreground_message_first_turn_has_no_prior_returns_plain(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    now = time.time()
+    # history holds only the current message — nothing strictly older
+    monkeypatch.setattr(
+        crc, "get_decrypted_history",
+        lambda since, limit=20: [{"role": "user", "content": "第一句", "ts": now}],
+    )
+    assert crc._foreground_agent_message("第一句", current_ts=now) == "第一句"
+
+
+def test_foreground_message_skipped_for_pi_returns_plain(monkeypatch):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _PI_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(
+        crc, "get_decrypted_history",
+        lambda since, limit=20: [{"role": "user", "content": "早", "ts": 1.0}],
+    )
+    assert crc._foreground_agent_message("hi", current_ts=9.0) == "hi"
+
+
+def test_claude_resume_skipped_when_transcript_was_injected(monkeypatch):
+    # When THIS turn's message actually carries an injected transcript, the
+    # resident drops the fragile --resume: the transcript is the single source.
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    injected = f"{crc.FOREGROUND_CHAT_CONTEXT_HEADER}\n- prior turn\n\nhello"
+    cmd = crc._prepare_cli_command(injected)
+
+    assert "--resume" not in cmd
+    assert "sess_123" not in cmd
+    # print/json framing is unchanged
+    assert "--output-format" in cmd and "json" in cmd
+
+
+def test_claude_resume_kept_when_no_transcript_injected(monkeypatch):
+    # Injection is configured (auto + claude) but this turn's history was
+    # unavailable (no enclave / empty fetch), so the message is bare. Resume must
+    # survive as the fallback continuity path instead of being dropped blindly.
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p "{message}"')
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_123")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("hello")  # no injected-transcript header
+
+    assert cmd[:3] == ["claude", "--resume", "sess_123"]

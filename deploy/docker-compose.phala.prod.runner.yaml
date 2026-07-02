@@ -1,0 +1,93 @@
+# docker-compose.phala.prod.runner.yaml — STANDALONE prod agent-runner CVM (Form B)
+#
+# ONE runner per CVM (deliberate — see below). A separate Phala CVM that runs a
+# SINGLE agent-runner supervisor: no backend, no enclave, no ingress. It hosts the
+# API-user resident consumers OFF the main prod CVM, which (measured 2026-07-02)
+# was RAM-saturated running 99 consumers (~6.4GB) alongside backend+enclave on one
+# 15GB box (≈1.1GB free). Moving hosting here frees the main CVM.
+#
+# ── Why ONE runner per CVM (not N containers per CVM) ──────────────────────────
+#   A single supervisor already hosts ~99 users fine (that's exactly what the main
+#   prod CVM was doing). Capacity is RAM-bound (~65MB per idle consumer; concurrency
+#   is low, ~3% active turns), not supervisor-bound. So extra containers per CVM buy
+#   no throughput — only shared VM blast radius. Scaling out = add MORE runner CVMs
+#   (each 1 runner), giving VM-level failure domains: one CVM dying loses only its
+#   share, the rest take over via the Postgres lease TTL. List every runner CVM id
+#   in deploy/prod-runner-cvm-ids.txt (one per line); the CI job deploys this same
+#   compose to each.
+#
+# ── Cross-CVM reach to the main prod CVM ───────────────────────────────────────
+#   FEEDLING_API_URL     → https://api.feedling.app (public ingress; NOT backend:5001)
+#   FEEDLING_ENCLAVE_URL → the main prod enclave via dstack-gateway passthrough:
+#        https://9798850e096d770293c67305c6cfdceed68c1d28-5003s.dstack-pha-prod9.phala.network
+#        (in-enclave TLS + attestation; runner auths per-user with a short-lived
+#        Stage-D runtime token, verify=False on the self-signed enclave cert — the
+#        SAME decrypt path clients use, so it widens nothing. Validated on test:
+#        /v1/envelope/decrypt over this passthrough → 200.)
+#
+# ── Capacity ───────────────────────────────────────────────────────────────────
+#   AGENT_MAX_CHILDREN = 120 per runner (measured ~65MB/consumer; 120 ≈ 8GB, fits a
+#   15GB CVM with CLI-spike headroom). Deliberately sized to hold ALL current users
+#   (~99) on a SINGLE runner, so: (a) you can start with one runner CVM and it covers
+#   everyone, and (b) as you scale out, ANY single runner can absorb the whole fleet
+#   on failover. Σ(max_children over ALL live runner CVMs) MUST stay ≥ hosted-user
+#   count — else over-capacity users' sends wedge (the guard does not capacity-gate).
+#   ⚠️ ONE runner CVM = single point of failure (no runner to take over if it dies).
+#   Keep the main prod CVM's inline agent-runner as a fallback until you run >=2
+#   runner CVMs; only then remove it (see DEPLOYMENTS.md “prod Form B”).
+#
+# ── Deploy ─────────────────────────────────────────────────────────────────────
+#   Each runner CVM is its OWN dstack app (own app-id + compose_hash + on-chain auth
+#   on the prod FeedlingAppAuth 0x6c8A6f1e3eD4180B2048B808f7C4b2874649b88F). All
+#   secrets flow via the ENCRYPTED env channel (phala deploy -e …) — never baked.
+#   Reuses the main prod CVM's secrets (DATABASE_URL / FEEDLING_RUNTIME_TOKEN_SECRET
+#   — MUST match — / FEEDLING_LITELLM_API_KEY / AGENT_RUNTIME_USERS). Provision +
+#   activation: see deploy/DEPLOYMENTS.md “prod Form B”. DORMANT until the CI job's
+#   repo var DEPLOY_PROD_RUNNER_CVM=true AND prod-runner-cvm-ids.txt is non-empty.
+
+name: feedling-prod-runner
+
+services:
+  # Exactly one runner. Distinct CVM hostname → distinct lease owner + heartbeat row.
+  # No per-runner config: every prod runner CVM deploys this identical compose.
+  agent-runner:
+    image: ghcr.io/teleport-computer/feedling-agent-runner:a9b6770   # CI pins the sha
+    command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
+    restart: unless-stopped
+    environment:
+      FEEDLING_API_URL: "${FEEDLING_API_URL:-}"          # main prod ingress URL
+      FEEDLING_ENCLAVE_URL: "${FEEDLING_ENCLAVE_URL:-}"  # main prod enclave passthrough URL
+      AGENT_DATA_ROOT: "/agent-data"
+      AGENT_LEASE_TTL_SEC: "${AGENT_LEASE_TTL_SEC:-300}"
+      AGENT_TICK_INTERVAL_SEC: "${AGENT_TICK_INTERVAL_SEC:-15}"
+      AGENT_ENVELOPE_REFETCH_SEC: "${AGENT_ENVELOPE_REFETCH_SEC:-300}"
+      AGENT_RESOLVE_CONCURRENCY: "${AGENT_RESOLVE_CONCURRENCY:-8}"
+      AGENT_RUNTIME_ISOLATION: "process"
+      # Per-runner capacity ceiling. Sized to hold ALL users on one runner (see
+      # header) so a single CVM works and any CVM absorbs the fleet on failover.
+      AGENT_MAX_CHILDREN: "${AGENT_MAX_CHILDREN:-120}"
+      DATABASE_URL: "${DATABASE_URL:-}"
+      AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
+      AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
+      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
+      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
+      FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
+      # in-CVM LiteLLM gateway (codex non-openai providers) — each runner runs its
+      # own proxy child on 127.0.0.1:<port>; codex on this runner connects locally.
+      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
+      FEEDLING_LITELLM_PORT: "${FEEDLING_LITELLM_PORT:-4000}"
+      FEEDLING_LITELLM_API_KEY: "${FEEDLING_LITELLM_API_KEY:-}"
+      # Genesis import worker: ON here because once the main prod CVM's inline
+      # agent-runner is removed, the runner CVMs are the ONLY place genesis import
+      # jobs get drained. Safe on multiple runner CVMs — claim is FOR UPDATE SKIP
+      # LOCKED, so every runner CVM running it de-dupes. Reaches the main enclave
+      # over the passthrough URL above.
+      FEEDLING_GENESIS_WORKER_ENABLED: "1"
+      FEEDLING_GENESIS_WORKER_INTERVAL_SEC: "${FEEDLING_GENESIS_WORKER_INTERVAL_SEC:-10}"
+      FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC: "${FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC:-7200}"
+    volumes:
+      - feedling_agent_runtime_prod_runner:/agent-data
+
+volumes:
+  feedling_agent_runtime_prod_runner:
+    name: feedling_agent_runtime_prod_runner

@@ -44,17 +44,46 @@ retirement when keeping the exact value no longer helps verification.
 | First-boot note | The CVM was first created 2026-06-09 WITHOUT a CF token (to mint the app_id quickly), so `dstack-ingress` couldn't issue the `test-*.feedling.app` LE certs initially. The `test`-branch CI deploy injects `CF_*` from GitHub secrets — domains + certs are now live. Backend also needed the test RDS reachable from the CVM (Publicly accessible + SG inbound 5432) before it stopped crash-looping. |
 | iOS | The iOS app source is not in this repo. Point its test build at app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` + gateway `dstack-pha-prod9.phala.network` + test contract `0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5`. |
 
+### Runner CVM (test, `feedling-io-agents-test`) — multi-node Form B
+
+Standalone agent-runner-only CVM (no backend/enclave/ingress) that scales the
+hosted agent-runtime off the main test CVM. See `docker-compose.phala.runner.yaml`
+and the Form B section below for the design.
+
+| | |
+|---|---|
+| Provider | Phala Cloud dstack on prod9, account `amiller-user` (same as main test CVM) |
+| CVM ID | `0f065d29-37c6-4c79-b871-04e526c6c91d` (also in `deploy/test-runner-cvm-id.txt`) |
+| App ID | `0cf2da16edc368625cee6898852ebc5dabb51558` |
+| Created | 2026-07-02 as `feedling-io-agents-test`, `tdx.small`, **Phala KMS** (prod9). Provisioned locally via `phala deploy` (no `--cvm-id` ⇒ new app) pinned to `feedling-agent-runner:ab78491` with only the non-secret cross-CVM env (`FEEDLING_API_URL` / `FEEDLING_ENCLAVE_URL` / `AGENT_MAX_CHILDREN`). The **healthy, secret-bearing** deploy + on-chain compose_hash auth are done by the CI `deploy-test-runner-cvm` job (it holds `TEST_DATABASE_URL` / `TEST_FEEDLING_RUNTIME_TOKEN_SECRET` / `ETH_DEPLOYER_KEY`), which `phala deploy --cvm-id`s this same CVM in place. |
+| Compose | `deploy/docker-compose.phala.runner.yaml` — 2 runner containers, own volumes. As of 2026-07-02 also runs the **genesis import worker** (`FEEDLING_GENESIS_WORKER_ENABLED=1` on both; FOR UPDATE SKIP LOCKED de-dupes) — moved here when the main test CVM's inline `agent-runner` was removed. Genesis reaches the main enclave over the passthrough URL (`verify=False`); confirm a real import decrypts once after cutover. |
+| Shares w/ main test CVM | same test RDS (`TEST_DATABASE_URL`), same `FEEDLING_RUNTIME_TOKEN_SECRET`, same Sepolia FeedlingAppAuth `0x9AC0…` (runner publishes its OWN compose_hash there — harmless; iOS audit card only checks the MAIN app's hashes) |
+| Cross-CVM reach | `FEEDLING_API_URL=https://test-api.feedling.app`; `FEEDLING_ENCLAVE_URL=https://173c7f49…-5003s.dstack-pha-prod9.phala.network` (main enclave passthrough, in-enclave TLS, `verify=False`) |
+| Deploy path | CI `deploy-test-runner-cvm` job — DORMANT until repo var `DEPLOY_TEST_RUNNER_CVM=true` AND this CVM id is in the file (both prerequisites now met except the flip). |
+| Status | Provisioned 2026-07-02, idle shell (no DB env yet). Flip `DEPLOY_TEST_RUNNER_CVM=true` + push `test` → CI does the first real deploy. |
+
 ### agent-runner (hosted agent-runtime) — 4th CVM service
 
 The `agent-runner` service runs `backend/agent_runtime/supervisor.py`: a
 multi-tenant supervisor that hosts the resident consumer
 (`tools/chat_resident_consumer.py`) one process per user, driving `claude` /
-`codex exec` in cli mode. It's defined **inline** in both
-`docker-compose.phala.yaml` and `docker-compose.phala.test.yaml` (its image
-`ghcr.io/teleport-computer/feedling-agent-runner:<sha>` is built by
-`docker-publish.yml` from `deploy/Dockerfile.agent-runner` and pinned by the same
-CI step that pins the backend image). The standalone
-`docker-compose.agent-runner.yaml` overlay is now **local-dev only** (superseded).
+`codex exec` in cli mode. Its image `ghcr.io/teleport-computer/feedling-agent-runner:<sha>`
+is built by `docker-publish.yml` from `deploy/Dockerfile.agent-runner` and pinned by
+the same CI step that pins the backend image. The standalone
+`docker-compose.agent-runner.yaml` overlay is **local-dev only** (superseded).
+
+**Where it runs (test vs prod diverge as of 2026-07-02):**
+- **prod** — still defined **inline** in `docker-compose.phala.yaml` (hosting +
+  genesis worker on the main prod CVM). Unchanged until prod adopts Form B.
+- **test** — the inline `agent-runner` was **removed** from
+  `docker-compose.phala.test.yaml`. The main test CVM now runs only
+  backend/enclave/ingress; **all** hosting AND the genesis import worker moved to
+  the standalone runner CVM (`feedling-io-agents-test`, see
+  `docker-compose.phala.runner.yaml`). The backend keeps `FEEDLING_HOST_ALL` etc.
+  and still routes sends to the pool — the runner-CVM consumers drain them; the
+  wedge guard stays live off the runner CVM's heartbeats. **Consequence:** if the
+  runner CVM is fully down, test has NO host → sends 503 (fail-loud, by design) and
+  genesis imports pause until it returns.
 
 **Idle by default = zero behaviour change.** With `AGENT_RUNTIME_USERS` empty and
 `AGENT_RUNTIME_AUTODISCOVER` unset, the supervisor spawns nobody (it idles and
@@ -131,6 +160,209 @@ agent-runner。以下三个变量必须同时设置；缺任何一个会导致�
 
 部署顺序：先设 `FEEDLING_RUNTIME_TOKEN_SECRET`（backend + agent-runner 共享同一 secret），
 确认 token 鉴权通过、行为不变；再同步开启 `FEEDLING_HOST_ALL` 和 `FEEDLING_LITELLM_ENABLE`。
+
+### 横向扩展 — 多节点 agent-runner
+
+The supervisor is **multi-node ready with no per-runner index**. Coordination is
+entirely via Postgres: the per-user lease (`agent_runtime_instances`, owner =
+`<hostname>:<pid>`) guarantees exactly one consumer per user and lets a survivor
+take over a dead runner's users after the lease TTL; the per-owner heartbeat table
+(`agent_runtime_supervisor_heartbeats`, migration `0010`) records each runner
+independently so the backend's `check_supervisor_live` aggregates the cluster
+(any one fresh hosting runner ⇒ live; empty/all-stale ⇒ legacy-key fallback, so a
+rollback/mixed fleet doesn't 503). There is **no static shard** — every runner
+scans the full host-all set and races to acquire; `AGENT_MAX_CHILDREN` bounds how
+many each takes so they split the load.
+
+| Env (per runner) | Purpose | Default |
+|---|---|---|
+| `AGENT_MAX_CHILDREN` | steady-state per-runner capacity ceiling (0 = unlimited). **Σ across ALL runners must ≥ hosted-user count**, else some users go unserved. Distinct from `AGENT_MAX_SPAWNS_PER_TICK` (cold-start rate). | 0 |
+| `AGENT_SUPERVISOR_HEARTBEAT_PRUNE_SEC` | drop dead-runner heartbeat rows older than this (each restart is a new `<host>:<pid>` owner) | 3600 |
+
+**Form A — multiple containers, same CVM** (quickest validation): duplicate the
+inline `agent-runner` service into `agent-runner-0` / `agent-runner-1` (distinct
+container names ⇒ distinct owners). Same-CVM containers MAY share the
+`feedling_agent_runtime*` volume so a takeover reuses the per-user home; set
+`AGENT_MAX_CHILDREN` on each. Editing the compose changes `compose_hash` →
+requires `addComposeHash()` on-chain. Caveat: CPU/OOM still share the main CVM.
+
+**Form B — independent runner CVM(s)** (production scale-out, fault-isolated):
+`deploy/docker-compose.phala.runner.yaml` is a standalone runner-only CVM (no
+backend / enclave / ingress; 2 runner containers, each its own volume). It is its
+**own dstack app** (own app-id + compose_hash + on-chain auth) sharing the main
+CVM's Postgres + secrets via the encrypted env channel.
+
+Cross-CVM reachability (the only real wiring):
+- `FEEDLING_API_URL` → the main CVM's **public ingress** domain (e.g.
+  `https://test-api.feedling.app`), NOT `http://backend:5001`.
+- `FEEDLING_ENCLAVE_URL` → the main CVM enclave's **dstack-gateway passthrough**
+  (`https://<main-app-id>-5003s.dstack-pha-prod9.phala.network`) — the same
+  attested, in-enclave-TLS decrypt endpoint clients already use. The runner auths
+  per-user with a short-lived Stage-D runtime token (no api key), so this is the
+  existing exposure, not a new one. Confirm `/v1/envelope/decrypt` accepts the
+  runtime token over this path before rollout.
+- `DATABASE_URL` + `FEEDLING_RUNTIME_TOKEN_SECRET` (MUST equal the main backend's)
+  + `FEEDLING_LITELLM_API_KEY` via encrypted env.
+
+Rollout: provision the runner CVM (own dstack app) → build/pin
+`feedling-agent-runner:<sha>` → set the encrypted env above → boot with
+`AGENT_RUNTIME_USERS` empty / `FEEDLING_HOST_ALL` matching the main CVM →
+`addComposeHash()` on-chain for the runner app. Verify: both runners appear as
+distinct rows in `agent_runtime_supervisor_heartbeats`, users distribute across
+owners in `agent_runtime_instances`, and killing one runner lets the other take
+over its users after the TTL — all while the main CVM ingress/backend stay up.
+
+#### CI job (`deploy-test-runner-cvm`) — DORMANT by default
+
+`.github/workflows/ci.yml` already carries the recurring deploy job. It is
+**skipped** unless BOTH hold, so merging the multi-node PR is a no-op for Form B:
+
+- repo var `DEPLOY_TEST_RUNNER_CVM == 'true'`, AND
+- `deploy/test-runner-cvm-id.txt` names a provisioned runner CVM.
+
+It runs on the SAME test Phala account as the main CVM (`secrets.TEST_PHALA_CLOUD_API_KEY`),
+shares the test DB / runtime-token-secret / test FeedlingAppAuth contract, and
+`phala deploy --cvm-id …` (update-in-place) → publishes the runner's own
+compose_hash on Sepolia. It reuses these already-set GitHub vars/secrets (no new
+secrets needed — all confirmed present 2026-07-01):
+
+| Wired to | Value / source |
+|---|---|
+| var `TEST_MAIN_API_URL` | `https://test-api.feedling.app` ✅ set |
+| var `TEST_MAIN_ENCLAVE_URL` | `https://173c7f49aeb54acb424676b17b17f78e5e2b2938-5003s.dstack-pha-prod9.phala.network` ✅ set (verified `/attestation` → 200 over in-enclave TLS) |
+| var `TEST_AGENT_MAX_CHILDREN` | `8` ✅ set |
+| var `DEPLOY_TEST_RUNNER_CVM` | `false` ✅ set (flip to `true` last) |
+| secret `TEST_PHALA_CLOUD_API_KEY` | test account (amiller-user) — reused |
+| secret `TEST_DATABASE_URL` | same test RDS as main CVM — reused |
+| secret `TEST_FEEDLING_RUNTIME_TOKEN_SECRET` | **MUST equal** main backend's — reused |
+| secret `TEST_FEEDLING_LITELLM_API_KEY`, `TEST_AGENT_RUNTIME_USERS` | reused |
+| var `TEST_AGENT_RUNTIME_AUTODISCOVER`, `TEST_FEEDLING_HOST_ALL`, `TEST_FEEDLING_LITELLM_ENABLE`, `TEST_FEEDLING_MIGRATE_ENABLE` | reused |
+| var `TEST_RUNNER_FEEDLING_APP_AUTH_CONTRACT` (optional) | falls back to `TEST_FEEDLING_APP_AUTH_CONTRACT` if unset — the runner's compose_hash on the shared test contract is harmless (iOS audit card only checks the MAIN app's hashes) |
+
+#### First-time provisioning (one-shot, needs the Phala test account)
+
+The recurring job only **updates** an existing CVM; it errors if the id file is
+empty. So the runner CVM must be **created once** first. This is the single step
+that needs a human with the test Phala account (`amiller-user`) — it stands up
+paid infra and mints a new dstack app-id. Run locally with `TEST_PHALA_CLOUD_API_KEY`:
+
+```bash
+# 0) pin a real agent-runner image sha (any published :<sha>, e.g. the latest test build)
+SHA=<short-sha>                       # e.g. from `git rev-parse --short origin/test`
+sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|ghcr.io/teleport-computer/feedling-agent-runner:${SHA}|g" \
+  deploy/docker-compose.phala.runner.yaml
+
+# 1) CREATE the runner CVM (NO --cvm-id ⇒ new app). Same -e env the CI job passes.
+#    Pull the values from the GitHub vars/secrets table above.
+phala deploy \
+  --api-token "$TEST_PHALA_CLOUD_API_KEY" \
+  --name feedling-runner-test \
+  --instance-type tdx.small --kms phala \
+  -c deploy/docker-compose.phala.runner.yaml \
+  -e "FEEDLING_API_URL=https://test-api.feedling.app" \
+  -e "FEEDLING_ENCLAVE_URL=https://173c7f49aeb54acb424676b17b17f78e5e2b2938-5003s.dstack-pha-prod9.phala.network" \
+  -e "AGENT_MAX_CHILDREN=8" \
+  -e "DATABASE_URL=<same as TEST_DATABASE_URL>" \
+  -e "FEEDLING_RUNTIME_TOKEN_SECRET=<same as TEST_FEEDLING_RUNTIME_TOKEN_SECRET>" \
+  -e "AGENT_RUNTIME_USERS=<same as TEST_AGENT_RUNTIME_USERS, or empty to idle>" \
+  -e "AGENT_RUNTIME_AUTODISCOVER=1" \
+  -e "FEEDLING_HOST_ALL=1" \
+  -e "FEEDLING_LITELLM_ENABLE=1" \
+  -e "FEEDLING_LITELLM_API_KEY=<same as TEST_FEEDLING_LITELLM_API_KEY>" \
+  -e "FEEDLING_MIGRATE_ENABLE=" \
+  --wait
+
+# 2) resolve the new CVM id and record it (the recurring job reads this file)
+phala cvms list --api-token "$TEST_PHALA_CLOUD_API_KEY" --json \
+  | jq -r '.[] | select(.name=="feedling-runner-test") | .id // .cvm_id // .app_id' \
+  | tr -d '[:space:]' > deploy/test-runner-cvm-id.txt
+cat deploy/test-runner-cvm-id.txt        # sanity: a uuid / app_xxx
+
+# 3) authorize the runner's compose_hash on the test contract (first boot may
+#    key-wait until this lands — same deploy-then-publish order as the main job)
+FEEDLING_COMPOSE_FILE=deploy/docker-compose.phala.runner.yaml \
+FEEDLING_CVM_ID="$(cat deploy/test-runner-cvm-id.txt)" \
+FEEDLING_APP_AUTH_CONTRACT=0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5 \
+ETH_SEPOLIA_RPC_URL=https://ethereum-sepolia-rpc.publicnode.com \
+PRIVATE_KEY=<ETH_DEPLOYER_KEY> \
+PHALA_CLOUD_API_KEY="$TEST_PHALA_CLOUD_API_KEY" \
+  ./deploy/publish-compose-hash.sh eth_sepolia
+
+# 4) commit the id file, then flip the switch — the recurring CI job takes over
+git add deploy/test-runner-cvm-id.txt deploy/docker-compose.phala.runner.yaml
+git commit -m "deploy(test): provision runner CVM <id> [skip ci]"
+gh variable set DEPLOY_TEST_RUNNER_CVM --body true
+```
+
+After step 4, every push to `test` that touches `backend/**` /
+`deploy/docker-compose.phala.runner.yaml` / `ci.yml` re-pins the sha and
+`phala deploy --cvm-id`s the runner in place. **Rollback** = `gh variable set
+DEPLOY_TEST_RUNNER_CVM --body false` (job goes dormant; the CVM keeps running the
+last image until you `phala cvms stop` it). Because coordination is pure-Postgres,
+stopping the runner CVM just lets the main-CVM runner re-acquire its users after
+the lease TTL — no main-CVM change needed.
+
+### prod Form B — standalone runner CVMs (PREPARED, DORMANT as of 2026-07-02)
+
+Prod artifacts are staged but **not activated** (no prod runner CVM provisioned yet).
+Design principle: **one runner per CVM**; scale out by adding more runner CVMs, not
+more containers per CVM.
+
+**Why (measured 2026-07-02 on the main prod CVM, 8 vCPU / 15GB):** the inline
+`agent-runner` was hosting **99 consumers ≈ 6.4GB** (≈65MB each, min 49 / max 72;
+concurrency low — only ~3 active CLI turns at sample) alongside backend (2.6GB) +
+enclave — leaving **~1.1GB free** (RAM-saturated → the source of prod slowness).
+Capacity is **RAM-bound**, not supervisor-bound: one supervisor hosts ~99 fine.
+Moving hosting to dedicated runner CVMs frees ~6.7GB + 70% CPU on the main CVM.
+
+Staged artifacts:
+- `deploy/docker-compose.phala.prod.runner.yaml` — SINGLE `agent-runner` container,
+  genesis worker ON, `AGENT_MAX_CHILDREN` default 120 (sized to hold ALL ~99 users
+  on one runner, so a single CVM covers everyone and any CVM absorbs the fleet on
+  failover). Deployed identically to every prod runner CVM.
+- `deploy/prod-runner-cvm-ids.txt` — one CVM id per line (currently empty). Add a
+  line per provisioned runner CVM to scale horizontally.
+- CI job `deploy-prod-runner-cvm` (in `ci.yml`) — DORMANT: skipped unless repo var
+  `DEPLOY_PROD_RUNNER_CVM == 'true'` AND the ids file is non-empty. On `main`, it
+  pins the sha, then loops every id: `phala deploy --cvm-id` (prod encrypted env) +
+  publishes that CVM's compose_hash on the prod contract.
+
+Repo vars already set (dormant): `PROD_MAIN_API_URL=https://api.feedling.app`,
+`PROD_MAIN_ENCLAVE_URL=https://9798850e…-5003s.dstack-pha-prod9.phala.network`,
+`PROD_AGENT_MAX_CHILDREN=120`, `DEPLOY_PROD_RUNNER_CVM=false`. Secrets are **reused**
+from the main prod CVM (no new ones): `PHALA_CLOUD_API_KEY` (prod/sxysun account),
+`DATABASE_URL`, `FEEDLING_RUNTIME_TOKEN_SECRET` (MUST match), `FEEDLING_LITELLM_API_KEY`,
+`AGENT_RUNTIME_USERS`, `ETH_DEPLOYER_KEY`, contract `FEEDLING_APP_AUTH_CONTRACT`.
+
+**Sizing (`AGENT_MAX_CHILDREN=120`, ≈15GB CVMs):** 120 is deliberately ≥ all ~99
+users so it works from ONE runner CVM and scales out unchanged. Σ(max_children over
+live runners) MUST stay ≥ user count or over-capacity users' sends wedge (guard does
+not capacity-gate) — 120 satisfies that at any fleet size ≥1.
+
+**Starting with ONE runner CVM (then scaling out):** fully supported — put a single
+id in `prod-runner-cvm-ids.txt`. But one runner CVM is a **single point of failure**
+(no peer to take over if that CVM dies → all hosting 503s + genesis pauses until it
+recovers; `restart: unless-stopped` only covers process crashes, not VM loss). So
+while you run just one: **do NOT remove the main prod CVM's inline `agent-runner`** —
+keep it as a fallback (main + 1 runner CVM = 2 runners racing, so either can cover if
+the other dies). Only remove the inline main runner once you run **≥2 runner CVMs**
+(real VM-level fault isolation). Scaling out = add lines to the ids file + provision;
+`max_children=120` needs no change.
+
+**Activation (when ready):** provision N prod runner CVMs on the **sxysun** phala
+account (`phala deploy --name feedling-prod-runner-N --instance-type tdx.medium
+--kms phala -c deploy/docker-compose.phala.prod.runner.yaml` — first create WITHOUT
+`--cvm-id`, pin a real sha first; see the test runbook above for the exact shape) →
+put each CVM id on its own line in `deploy/prod-runner-cvm-ids.txt` → `gh variable
+set DEPLOY_PROD_RUNNER_CVM --body true` → push `main`. Verify: N fresh rows in
+`agent_runtime_supervisor_heartbeats` (each `host_all=t gateway=t max=120`), the 99
+users redistribute across owners in `agent_runtime_instances`, main prod CVM RAM
+recovers. **Only once you run ≥2 runner CVMs AND it's stable**, remove the inline
+`agent-runner` from `deploy/docker-compose.phala.yaml` (mirror the test change) and
+move genesis fully to the runner CVMs — with a single runner CVM, keep the inline
+main runner as the fallback (removing it would make hosting a single point of
+failure). **Rollback** = `DEPLOY_PROD_RUNNER_CVM=false`; the inline main-CVM runner
+keeps hosting until you cut it, so there is no gap.
 
 ## Enclave configuration
 

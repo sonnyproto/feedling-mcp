@@ -289,6 +289,22 @@ IMAGE_TEMP_DIR = Path(os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_image
 SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "on_mention").strip().lower()
 SCREEN_CONTEXT_MAX_AGE_SEC = int(os.environ.get("SCREEN_CONTEXT_MAX_AGE_SEC", "300"))
 SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
+# Foreground chat continuity. codex has no --resume and the hosted claude command
+# carries no session, so those drivers otherwise forget everything after the first
+# turn. When active we prepend a short recent-chat transcript to each foreground
+# turn so continuity does not depend on the agent's own (missing/fragile) session.
+#   auto (default) — inject only for codex / claude (drivers with no reliable
+#                    cross-turn memory); pi resumes natively and is skipped.
+#   on/always      — inject for every driver (escape hatch).
+#   off            — never inject; claude falls back to its --resume path.
+FOREGROUND_CHAT_CONTEXT_MODE = os.environ.get(
+    "FEEDLING_FOREGROUND_CHAT_CONTEXT", "auto"
+).strip().lower()
+FOREGROUND_CHAT_CONTEXT_LIMIT = int(os.environ.get("FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT", "8"))
+FOREGROUND_CHAT_CONTEXT_HEADER = os.environ.get(
+    "FEEDLING_FOREGROUND_CHAT_CONTEXT_HEADER",
+    "[最近对话记录 — 仅供你保持连续；最后那条用户消息才是此刻要回应的]",
+)
 FALLBACK_REPLY = os.environ.get(
     "FALLBACK_REPLY", "我这会儿有点慢，刚刚没接上。你稍后再发一次，我会继续接。"
 )
@@ -313,6 +329,38 @@ WHOAMI_STARTUP_RETRY_DELAY_SEC = float(
 )
 WHOAMI_REFRESH_RETRIES = int(os.environ.get("WHOAMI_REFRESH_RETRIES", "3"))
 WHOAMI_REFRESH_RETRY_DELAY_SEC = float(os.environ.get("WHOAMI_REFRESH_RETRY_DELAY_SEC", "0.5"))
+# TTL gate for the pre-reply whoami refresh. Encryption keys are stable (the
+# user's own pubkey never changes; the enclave content pubkey is dstack-KMS
+# derived and stable across compose rotations), so re-fetching before every
+# reply just adds a reentrant backend round-trip under load. 0 = always refresh.
+WHOAMI_REFRESH_TTL_SEC = float(os.environ.get("WHOAMI_REFRESH_TTL_SEC", "300"))
+
+# Provider payment (HTTP 402 / out-of-credits) circuit breaker. After a provider
+# payment failure, pause PROACTIVE agent calls for this window so a broke key
+# stops flooding the logs with per-tick retries. User-initiated chat replies are
+# NOT gated. 0 = disabled (always attempt).
+PROVIDER_PAYMENT_COOLDOWN_SEC = float(os.environ.get("PROVIDER_PAYMENT_COOLDOWN_SEC", "600"))
+_provider_payment_cooldown_until: float = 0.0
+_PROVIDER_PAYMENT_MARKERS = ("402", "payment required", "requires more credits")
+
+
+def _is_provider_payment_error(exc: BaseException) -> bool:
+    s = str(exc).lower()
+    return any(m in s for m in _PROVIDER_PAYMENT_MARKERS)
+
+
+def _provider_payment_cooling_down() -> bool:
+    return PROVIDER_PAYMENT_COOLDOWN_SEC > 0 and time.monotonic() < _provider_payment_cooldown_until
+
+
+def _note_provider_payment_failure() -> None:
+    global _provider_payment_cooldown_until
+    _provider_payment_cooldown_until = time.monotonic() + PROVIDER_PAYMENT_COOLDOWN_SEC
+
+
+def _clear_provider_payment_cooldown() -> None:
+    global _provider_payment_cooldown_until
+    _provider_payment_cooldown_until = 0.0
 
 # Prompt routed only when an agent entry cannot receive a native image object.
 # The consumer still extracts decrypted image bytes and passes them through
@@ -2364,6 +2412,42 @@ def _is_codex_cmd(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "codex"
 
 
+def _cli_cmd_tokens() -> list[str]:
+    """Tokenize the raw AGENT_CLI_CMD template for driver detection.
+
+    Placeholders like ``{message}`` survive shlex.split unharmed; we only need
+    cmd[0] to name the driver, so no substitution is required."""
+    try:
+        return shlex.split(AGENT_CLI_CMD)
+    except ValueError:
+        return AGENT_CLI_CMD.split()
+
+
+def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
+    """Whether foreground turns get a resident-injected recent-chat transcript.
+
+    Gated so we don't double up context for agents that already carry it: only
+    codex (no --resume) and claude (hosted command has no session; its scrape +
+    --resume continuity is unreliable) inject in ``auto``. pi resumes natively so
+    it is skipped. ``on``/``always`` forces it for any driver; ``off`` disables.
+
+    A claude command that ALREADY carries its own continuity in the operator's
+    template (``--resume`` / ``-r`` / ``--session-id``) is skipped in ``auto`` too:
+    it has native session, so a resident transcript would double-supply context.
+    The hosted default claude command has none of these, so it still injects."""
+    mode = FOREGROUND_CHAT_CONTEXT_MODE
+    if mode in {"0", "false", "off", "no", "none", "disabled"}:
+        return False
+    if mode in {"1", "true", "on", "yes", "always"}:
+        return True
+    cmd = cmd if cmd is not None else _cli_cmd_tokens()
+    if _is_codex_cmd(cmd):
+        return True
+    if _is_claude_code_cmd(cmd):
+        return not (_has_cli_resume(cmd) or _has_claude_session_id(cmd))
+    return False
+
+
 def _cli_flag_value(cmd: list[str], flag: str) -> str:
     try:
         idx = cmd.index(flag)
@@ -2607,10 +2691,113 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
             cmd = [cmd[0], "--print", *cmd[1:]]
         if not _has_claude_output_format(cmd):
             cmd = [cmd[0], "--output-format", "json", *cmd[1:]]
-        if sid and not _has_cli_resume(cmd) and not _has_claude_session_id(cmd):
+        # When THIS turn's message actually carries an injected recent-chat
+        # transcript (see _foreground_agent_message), that transcript is the single
+        # continuity source — do NOT also inject claude's fragile --resume, which
+        # would duplicate context or start a fresh session on a stale id. But when
+        # no transcript was injected (injection off, history unavailable, or first
+        # turn), keep --resume as the fallback so continuity is never dropped on
+        # both sides at once.
+        if (
+            sid
+            and not _has_cli_resume(cmd)
+            and not _has_claude_session_id(cmd)
+            and not _message_has_injected_history(message)
+        ):
             cmd = [cmd[0], "--resume", sid, *cmd[1:]]
 
     return _resolve_cli_executable(cmd)
+
+
+def _codex_turn_metrics(raw: str) -> dict:
+    """Best-effort {steps, input_tokens, output_tokens} from a codex event stream.
+
+    codex ``exec --json`` (both the 0.136 ``item.completed`` and 0.142 flat
+    protocols) has NO duration fields — unlike claude — so latency cannot be split
+    from the stream. Token usage + agent-message count still characterize the turn.
+    Token events are cumulative, so we keep the max seen. Never raises.
+    """
+    steps = 0
+    in_tok = out_tok = 0
+
+    def _pull_tokens(o: Any) -> None:
+        nonlocal in_tok, out_tok
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    if k in ("input_tokens", "prompt_tokens"):
+                        in_tok = max(in_tok, int(v))
+                    elif k in ("output_tokens", "completion_tokens"):
+                        out_tok = max(out_tok, int(v))
+                else:
+                    _pull_tokens(v)
+        elif isinstance(o, list):
+            for it in o:
+                _pull_tokens(it)
+
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict):
+            continue
+        etype = str(obj.get("type") or "").strip()
+        item = obj.get("item") if isinstance(obj.get("item"), dict) else {}
+        if etype == "agent_message" or (etype == "item.completed" and item.get("type") == "agent_message"):
+            steps += 1
+        if "token" in etype or "usage" in obj or "info" in obj:
+            _pull_tokens(obj)
+    return {"steps": steps, "input_tokens": in_tok, "output_tokens": out_tok}
+
+
+def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", wall_ms: int) -> None:
+    """Emit ONE structured timing line per CLI agent turn (observability only).
+
+    Driver-aware — the two CLIs expose different metrics:
+
+    - **claude** (``--output-format json``) reports ``duration_ms`` (agent total),
+      ``duration_api_ms`` (time in provider calls) and ``num_turns``, so we derive:
+        cold_start_ms    = wall_ms - agent_ms    (Node boot + MCP init the CLI
+                           does not count — the per-turn cold-start tax)
+        orchestration_ms = agent_ms - api_ms     (tool loop / memory reads)
+        api_ms           = time inside the provider (e.g. deepseek) calls
+    - **codex** (``exec --json``) has no duration fields; we log wall_ms plus
+      best-effort token usage + agent-message step count.
+
+    Best-effort: never raises, never changes behavior. ``driver=`` is always
+    logged so blank fields aren't mistaken for missing claude data.
+    """
+    if _is_codex_cmd(cmd):
+        try:
+            m = _codex_turn_metrics(result.stdout or "")
+        except Exception:  # noqa: BLE001 — a timing log must never break a turn
+            m = {"steps": None, "input_tokens": None, "output_tokens": None}
+        log.info(
+            "[turn-timing] driver=codex rc=%s wall_ms=%d steps=%s in_tokens=%s "
+            "out_tokens=%s out_chars=%d",
+            result.returncode, wall_ms, m.get("steps"), m.get("input_tokens"),
+            m.get("output_tokens"), len(result.stdout or ""),
+        )
+        return
+
+    agent_ms = api_ms = num_turns = None
+    try:
+        for obj in _json_objects_from_cli_output(result.stdout or ""):
+            if isinstance(obj, dict) and obj.get("type") == "result":
+                agent_ms = obj.get("duration_ms")
+                api_ms = obj.get("duration_api_ms")
+                num_turns = obj.get("num_turns")
+                break
+    except Exception:  # noqa: BLE001 — a timing log must never break a turn
+        pass
+    cold_start_ms = orchestration_ms = None
+    if isinstance(agent_ms, (int, float)):
+        cold_start_ms = max(0, wall_ms - int(agent_ms))
+        if isinstance(api_ms, (int, float)):
+            orchestration_ms = max(0, int(agent_ms) - int(api_ms))
+    log.info(
+        "[turn-timing] driver=claude rc=%s wall_ms=%d agent_ms=%s api_ms=%s "
+        "orchestration_ms=%s cold_start_ms=%s num_turns=%s out_chars=%d",
+        result.returncode, wall_ms, agent_ms, api_ms, orchestration_ms,
+        cold_start_ms, num_turns, len(result.stdout or ""),
+    )
 
 
 def call_agent_cli(message: str, image_paths: list[str] | None = None, raw_text: bool = False) -> Any:
@@ -2620,7 +2807,17 @@ def call_agent_cli(message: str, image_paths: list[str] | None = None, raw_text:
     cmd = _prepare_cli_command(message, image_paths=image_paths)
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    _turn_t0 = time.monotonic()
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        log.warning(
+            "[turn-timing] driver=%s rc=timeout wall_ms=%d (hit 120s subprocess cap)",
+            "codex" if _is_codex_cmd(cmd) else "claude",
+            int((time.monotonic() - _turn_t0) * 1000),
+        )
+        raise
+    _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
 
     raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
     observed_sid = _extract_session_id(raw_transport) or command_sid
@@ -2815,6 +3012,53 @@ def _resident_foreground_chat_message_v2(content: str) -> str:
     return content
 
 
+def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = None) -> str:
+    """Short plaintext transcript of recent chat turns STRICTLY older than the
+    current turn, for injecting cross-turn continuity into foreground messages.
+
+    Uses the same decrypt sources as normal chat processing. Returns "" when no
+    decrypt source is configured/reachable or there is no prior turn — the caller
+    then sends the bare message (graceful degradation, never raises)."""
+    limit = max(1, min(limit if limit is not None else FOREGROUND_CHAT_CONTEXT_LIMIT, 50))
+    fetch_limit = max(limit + 4, 20)
+    try:
+        history = get_decrypted_history(since=0, limit=fetch_limit)
+    except Exception as e:  # noqa: BLE001 — continuity is best-effort, never fatal
+        log.warning("foreground chat context fetch failed: %s", e)
+        return ""
+    if not history:
+        return ""
+    messages = _clean_messages_for_proactive_context(history)
+    if before_ts > 0:
+        messages = [m for m in messages if _message_ts_for_context(m) < before_ts]
+    selected = messages[-limit:]
+    if not selected:
+        return ""
+    now = time.time()
+    return "\n".join(_chat_context_line(m, now=now, stale=False) for m in selected)
+
+
+def _foreground_agent_message(content: str, *, current_ts: float) -> str:
+    """Prepend a recent-chat transcript to a foreground turn when the active
+    driver has no reliable session of its own (codex / claude). Returns ``content``
+    unchanged when injection is disabled or no prior context is available."""
+    if not _foreground_history_injection_enabled():
+        return content
+    transcript = _recent_chat_context_for_foreground(before_ts=current_ts)
+    if not transcript:
+        return content
+    return f"{FOREGROUND_CHAT_CONTEXT_HEADER}\n{transcript}\n\n{content}"
+
+
+def _message_has_injected_history(message: str) -> bool:
+    """True when ``message`` was produced by _foreground_agent_message with a
+    transcript actually prepended. This is the single signal used to decide
+    whether claude's --resume can be safely suppressed for THIS turn — keeping
+    the resume-suppression and the transcript-injection decisions consistent even
+    when history is unavailable and injection silently degrades to bare content."""
+    return isinstance(message, str) and message.startswith(FOREGROUND_CHAT_CONTEXT_HEADER)
+
+
 # ---------------------------------------------------------------------------
 # Feedling API helpers
 # ---------------------------------------------------------------------------
@@ -2823,6 +3067,10 @@ def _resident_foreground_chat_message_v2(content: str) -> str:
 # before every encrypted write so resident agents do not keep wrapping replies
 # to a stale iOS content public key.
 _whoami_cache: dict = {"user_id": "", "user_pk": None, "enclave_pk": None}
+
+# monotonic ts of the last successful _load_whoami() that yielded encryption
+# keys; 0.0 until the first success so the first reply still fetches.
+_whoami_cache_loaded_at: float = 0.0
 
 def execute_identity_actions(actions: list[dict]) -> dict:
     if not actions:
@@ -2942,13 +3190,17 @@ def _load_whoami() -> bool:
         enc_pk = None
 
     _whoami_cache.update(user_id=user_id, user_pk=user_pk, enclave_pk=enc_pk)
+    ok = bool(user_id and user_pk)
+    if _whoami_cache_has_full_keys():
+        global _whoami_cache_loaded_at
+        _whoami_cache_loaded_at = time.monotonic()
     log.info(
         "whoami loaded — user_id=%s user_pk=%s enclave_pk=%s",
         user_id,
         _fingerprint_bytes(user_pk),
         _fingerprint_bytes(enc_pk),
     )
-    return bool(user_id and user_pk)
+    return ok
 
 
 def _load_whoami_with_retries(
@@ -2987,8 +3239,27 @@ def _whoami_cache_has_encryption_keys(cache: dict | None = None) -> bool:
     return bool(user_id and isinstance(user_pk, bytes) and len(user_pk) == 32)
 
 
+def _whoami_cache_has_full_keys(cache: dict | None = None) -> bool:
+    cache = _whoami_cache if cache is None else cache
+    user_id = str(cache.get("user_id") or "").strip()
+    user_pk = cache.get("user_pk")
+    enc_pk = cache.get("enclave_pk")
+    return bool(
+        user_id
+        and isinstance(user_pk, bytes) and len(user_pk) == 32
+        and isinstance(enc_pk, bytes) and len(enc_pk) == 32
+    )
+
+
 def _refresh_whoami_for_encrypted_reply() -> bool:
     previous = dict(_whoami_cache)
+    # Skip the network refresh while cached keys are fresh (see WHOAMI_REFRESH_TTL_SEC).
+    if (
+        WHOAMI_REFRESH_TTL_SEC > 0
+        and _whoami_cache_has_full_keys()
+        and (time.monotonic() - _whoami_cache_loaded_at) < WHOAMI_REFRESH_TTL_SEC
+    ):
+        return True
     if _load_whoami_with_retries(
         attempts=WHOAMI_REFRESH_RETRIES,
         delay_sec=WHOAMI_REFRESH_RETRY_DELAY_SEC,
@@ -5077,6 +5348,15 @@ def _process_proactive_jobs(jobs: list) -> float:
             len(frame_ids),
         )
 
+        if _provider_payment_cooling_down():
+            log.warning(
+                "proactive job skipped — provider payment required (cooling down); job_id=%s",
+                job_id,
+            )
+            update_proactive_job_status(
+                job_id, "failed", "provider_payment_required: cooling down"
+            )
+            continue
         update_proactive_job_status(job_id, "realizing")
         try:
             agent_result = call_agent(
@@ -5085,9 +5365,22 @@ def _process_proactive_jobs(jobs: list) -> float:
                 image_paths=screen_paths,
             )
         except Exception as e:
+            if _is_provider_payment_error(e):
+                _note_provider_payment_failure()
+                log.error(
+                    "proactive agent call failed — provider payment required; "
+                    "cooling down %.0fs: %s",
+                    PROVIDER_PAYMENT_COOLDOWN_SEC,
+                    e,
+                )
+                update_proactive_job_status(
+                    job_id, "failed", f"provider_payment_required: {e}"
+                )
+                continue
             log.error("proactive agent call failed; not posting fallback: %s", e)
             update_proactive_job_status(job_id, "failed", f"agent_call_failed: {e}")
             continue
+        _clear_provider_payment_cooldown()
 
         turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
         actions, replies = turn.actions, turn.messages
@@ -5602,6 +5895,12 @@ def _process_messages(messages: list) -> float:
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
         content = _prepend_time_anchor_foreground(content, ts)
+        # Then inject cross-turn continuity for drivers with no reliable session of
+        # their own (codex / hosted claude). No-op for pi / when disabled / when
+        # there is no prior turn. Done once here so every dispatch branch below
+        # (v2, image, plain) carries the same context. Wraps the time-anchored
+        # content so the transcript sits above this turn's grounded message.
+        content = _foreground_agent_message(content, current_ts=ts)
 
         use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
         try:

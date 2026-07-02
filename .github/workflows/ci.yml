@@ -240,6 +240,7 @@ jobs:
               - 'deploy/Dockerfile'
               - 'deploy/Dockerfile.agent-runner'
               - 'deploy/docker-compose.phala.yaml'
+              - 'deploy/docker-compose.phala.prod.runner.yaml'
               - 'deploy/publish-compose-hash.sh'
               - '.github/workflows/ci.yml'
 
@@ -263,6 +264,7 @@ jobs:
               - 'deploy/Dockerfile'
               - 'deploy/Dockerfile.agent-runner'
               - 'deploy/docker-compose.phala.test.yaml'
+              - 'deploy/docker-compose.phala.runner.yaml'
               - 'deploy/publish-compose-hash.sh'
               - '.github/workflows/ci.yml'
 
@@ -476,6 +478,11 @@ jobs:
           # is the roster JSON (carries per-user keys); the rest are flags/secrets.
           AGENT_RUNTIME_USERS:          ${{ secrets.AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.AGENT_RUNTIME_AUTODISCOVER }}
+          # Supervisor cold-start ramp pace: tick interval (compose default 15s).
+          # Lowered to 5 so ~90 consumers respawn ~3× faster after a restart,
+          # shrinking the window where an incoming message hits a not-yet-spawned
+          # consumer. Encrypted env, NOT in compose_hash — override via repo var.
+          AGENT_TICK_INTERVAL_SEC:      ${{ vars.AGENT_TICK_INTERVAL_SEC || '5' }}
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           FEEDLING_LITELLM_ENABLE:      ${{ vars.FEEDLING_LITELLM_ENABLE }}
           FEEDLING_LITELLM_API_KEY:     ${{ secrets.FEEDLING_LITELLM_API_KEY }}
@@ -522,6 +529,7 @@ jobs:
             -e "DATABASE_URL=$DATABASE_URL" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+            -e "AGENT_TICK_INTERVAL_SEC=$AGENT_TICK_INTERVAL_SEC" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
             -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
@@ -788,6 +796,7 @@ jobs:
             -e "DATABASE_URL=$DATABASE_URL" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+            -e "AGENT_TICK_INTERVAL_SEC=$AGENT_TICK_INTERVAL_SEC" \
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
             -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
@@ -825,3 +834,353 @@ jobs:
             fi
           done
           exit "$publish_status"
+
+  # =========================================================================
+  # DEPLOY — standalone runner CVM (test, multi-node Form B)
+  #
+  # Deploys deploy/docker-compose.phala.runner.yaml to a SEPARATE Phala CVM that
+  # runs only agent-runner supervisors (see deploy/DEPLOYMENTS.md “横向扩展”). It
+  # reuses the same feedling-agent-runner:<sha> image, shares the main CVM's
+  # Postgres + token secret, and reaches the main CVM's backend/enclave over their
+  # public ingress + gateway-passthrough URLs.
+  #
+  # DORMANT BY DEFAULT: skipped unless the repo var DEPLOY_TEST_RUNNER_CVM == 'true'
+  # AND deploy/test-runner-cvm-id.txt names a provisioned runner CVM. So merging
+  # this is a no-op until you (1) provision the runner dstack app, (2) put its CVM
+  # id in that file, (3) set the runner secrets/vars below, (4) flip the var. Runs
+  # AFTER deploy-test-cvm (serialized: shares the branch push + the main CVM must
+  # be up for the runner to reach it).
+  # =========================================================================
+  deploy-test-runner-cvm:
+    name: deploy runner CVM (test)
+    needs: [deploy-test-cvm, detect-cvm-changes-test]
+    if: |
+      github.ref == 'refs/heads/test' &&
+      github.event_name == 'push' &&
+      needs.detect-cvm-changes-test.outputs.cvm == 'true' &&
+      vars.DEPLOY_TEST_RUNNER_CVM == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: read
+    concurrency:
+      group: deploy-test-runner-cvm
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Wait for ghcr.io agent-runner image :<sha>
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling-agent-runner"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          for i in $(seq 1 60); do
+            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1; then
+              echo "agent-runner image :$SHA_SHORT available"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::agent-runner image :$SHA_SHORT did not appear in 10 min"
+          exit 1
+
+      - name: Pin image tag in deploy/docker-compose.phala.runner.yaml
+        env:
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          TRIGGER_SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          # deploy-test-cvm already pushed the main test bump; sync to it so this
+          # push fast-forwards (no race — the two deploy jobs are serialized).
+          git fetch origin test
+          git reset --hard origin/test
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling-agent-runner"
+          sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
+            deploy/docker-compose.phala.runner.yaml
+          if git diff --quiet -- deploy/docker-compose.phala.runner.yaml; then
+            echo "runner tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
+          else
+            git config user.name  'feedling-ci'
+            git config user.email 'ci@feedling.app'
+            git add deploy/docker-compose.phala.runner.yaml
+            git commit -m "deploy: bump runner CVM image to :$TRIGGER_SHA_SHORT [skip ci]"
+            git push origin HEAD:test
+          fi
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: 1.7.1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install phala CLI
+        run: npm install -g phala
+
+      - name: Resolve runner CVM_ID
+        id: cvmid
+        run: |
+          CVM_ID=$(tr -d '[:space:]' < deploy/test-runner-cvm-id.txt)
+          if [ -z "$CVM_ID" ]; then
+            echo "::error::deploy/test-runner-cvm-id.txt is empty — provision the runner CVM first"
+            exit 1
+          fi
+          echo "cvm_id=$CVM_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy runner CVM via phala
+        env:
+          PHALA_CLOUD_API_KEY:          ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          CVM_ID:                       ${{ steps.cvmid.outputs.cvm_id }}
+          # Cross-CVM reach to the main CVM (repo vars — public URLs, not secrets):
+          #   TEST_MAIN_API_URL     = https://test-api.feedling.app
+          #   TEST_MAIN_ENCLAVE_URL = https://<main-app-id>-5003s.dstack-pha-prod9.phala.network
+          FEEDLING_API_URL:             ${{ vars.TEST_MAIN_API_URL }}
+          FEEDLING_ENCLAVE_URL:         ${{ vars.TEST_MAIN_ENCLAVE_URL }}
+          AGENT_MAX_CHILDREN:           ${{ vars.TEST_AGENT_MAX_CHILDREN }}
+          # Shared with the main test CVM — MUST match (esp. the token secret).
+          DATABASE_URL:                 ${{ secrets.TEST_DATABASE_URL }}
+          FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
+          AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
+          AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
+          FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
+          FEEDLING_LITELLM_ENABLE:      ${{ vars.TEST_FEEDLING_LITELLM_ENABLE }}
+          FEEDLING_LITELLM_API_KEY:     ${{ secrets.TEST_FEEDLING_LITELLM_API_KEY }}
+          FEEDLING_MIGRATE_ENABLE:      ${{ vars.TEST_FEEDLING_MIGRATE_ENABLE }}
+        run: |
+          echo ">>> deploy-runner-cvm target: $CVM_ID"
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::TEST_DATABASE_URL not set — runner has no lease store"
+            exit 1
+          fi
+          if [ -z "$FEEDLING_API_URL" ] || [ -z "$FEEDLING_ENCLAVE_URL" ]; then
+            echo "::error::TEST_MAIN_API_URL / TEST_MAIN_ENCLAVE_URL not set — runner can't reach the main CVM"
+            exit 1
+          fi
+          phala deploy \
+            --api-token "$PHALA_CLOUD_API_KEY" \
+            --cvm-id "$CVM_ID" \
+            -c deploy/docker-compose.phala.runner.yaml \
+            -e "FEEDLING_API_URL=$FEEDLING_API_URL" \
+            -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
+            -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
+            -e "DATABASE_URL=$DATABASE_URL" \
+            -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
+            -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
+            -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+            -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
+            -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
+            -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
+            -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
+            --wait
+
+      - name: Publish live runner compose_hash on Sepolia (test contract)
+        env:
+          PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
+          ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
+          # The runner is a distinct dstack app → distinct compose_hash. Reuses the
+          # same FeedlingAppAuth contract by default (addComposeHash is onlyOwner +
+          # per-hash; the iOS audit card only checks the MAIN app's hashes, so the
+          # runner hash is harmless there). Override with TEST_RUNNER_FEEDLING_APP_AUTH_CONTRACT.
+          FEEDLING_APP_AUTH_CONTRACT: ${{ vars.TEST_RUNNER_FEEDLING_APP_AUTH_CONTRACT || vars.TEST_FEEDLING_APP_AUTH_CONTRACT }}
+          FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
+          PHALA_CLOUD_API_KEY:        ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.runner.yaml
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyyaml
+          publish_status=1
+          for attempt in 1 2 3; do
+            if ./deploy/publish-compose-hash.sh eth_sepolia; then
+              publish_status=0
+              break
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::runner compose_hash publish failed (attempt $attempt/3); retrying in 20s"
+              sleep 20
+            fi
+          done
+          exit "$publish_status"
+
+  # =========================================================================
+  # DEPLOY — standalone prod runner CVM(s) (Form B, multi-node)
+  #
+  # ONE runner per CVM; scale out by listing MORE CVM ids in
+  # deploy/prod-runner-cvm-ids.txt (one per line). Deploys the SAME
+  # deploy/docker-compose.phala.prod.runner.yaml to each, sharing the main prod
+  # CVM's Postgres + secrets via the encrypted env channel. See deploy/DEPLOYMENTS.md.
+  #
+  # DORMANT BY DEFAULT: skipped unless repo var DEPLOY_PROD_RUNNER_CVM == 'true'
+  # AND prod-runner-cvm-ids.txt names >=1 provisioned runner CVM. So merging this is
+  # a no-op until you (1) provision N runner dstack apps on the PROD phala account,
+  # (2) put their ids in that file, (3) set PROD_MAIN_* vars, (4) flip the var. The
+  # runner secrets reuse the main prod CVM's (DATABASE_URL / FEEDLING_RUNTIME_TOKEN_
+  # SECRET — MUST match — / FEEDLING_LITELLM_API_KEY / AGENT_RUNTIME_USERS).
+  deploy-prod-runner-cvm:
+    name: deploy runner CVM (prod)
+    needs: [deploy-cvm, detect-cvm-changes]
+    if: |
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push' &&
+      needs.detect-cvm-changes.outputs.cvm == 'true' &&
+      vars.DEPLOY_PROD_RUNNER_CVM == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: read
+    concurrency:
+      group: deploy-prod-runner-cvm
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Wait for ghcr.io agent-runner image :<sha>
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling-agent-runner"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin >/dev/null
+          for i in $(seq 1 60); do
+            if docker manifest inspect "${IMAGE}:$SHA_SHORT" >/dev/null 2>&1; then
+              echo "agent-runner image :$SHA_SHORT available"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::agent-runner image :$SHA_SHORT did not appear in 10 min"
+          exit 1
+
+      - name: Pin image tag in deploy/docker-compose.phala.prod.runner.yaml
+        env:
+          GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          TRIGGER_SHA_SHORT=$(git rev-parse --short "$GITHUB_SHA")
+          # deploy-cvm already pushed the main prod bump; sync to it so this push
+          # fast-forwards (the two prod deploy jobs are serialized by needs:).
+          git fetch origin main
+          git reset --hard origin/main
+          IMAGE_OWNER=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${IMAGE_OWNER}/feedling-agent-runner"
+          sed -i -E "s|ghcr\.io/[^/]+/feedling-agent-runner:[a-f0-9]+|${IMAGE}:${TRIGGER_SHA_SHORT}|g" \
+            deploy/docker-compose.phala.prod.runner.yaml
+          if git diff --quiet -- deploy/docker-compose.phala.prod.runner.yaml; then
+            echo "prod runner tag already pinned to :$TRIGGER_SHA_SHORT — no-op bump"
+          else
+            git config user.name  'feedling-ci'
+            git config user.email 'ci@feedling.app'
+            git add deploy/docker-compose.phala.prod.runner.yaml
+            git commit -m "deploy: bump prod runner CVM image to :$TRIGGER_SHA_SHORT [skip ci]"
+            git push origin HEAD:main
+          fi
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: 1.7.1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install phala CLI
+        run: npm install -g phala
+
+      - name: Read prod runner CVM ids
+        id: ids
+        run: |
+          # one id per line; ignore blank lines and # comments
+          IDS=$(grep -vE '^[[:space:]]*(#|$)' deploy/prod-runner-cvm-ids.txt | tr -d '[:space:]' | grep . || true)
+          if [ -z "$IDS" ]; then
+            echo "::error::deploy/prod-runner-cvm-ids.txt has no CVM ids — provision >=1 prod runner CVM first"
+            exit 1
+          fi
+          echo "count=$(printf '%s\n' "$IDS" | wc -l)"
+          printf '%s\n' "$IDS"
+          # stash newline-joined ids for later steps
+          { echo 'ids<<EOF'; printf '%s\n' "$IDS"; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+
+      - name: Deploy each prod runner CVM via phala
+        env:
+          PHALA_CLOUD_API_KEY:           ${{ secrets.PHALA_CLOUD_API_KEY }}
+          IDS:                           ${{ steps.ids.outputs.ids }}
+          # Cross-CVM reach to the main prod CVM (repo vars — public URLs):
+          #   PROD_MAIN_API_URL     = https://api.feedling.app
+          #   PROD_MAIN_ENCLAVE_URL = https://<prod-app-id>-5003s.dstack-pha-prod9.phala.network
+          FEEDLING_API_URL:              ${{ vars.PROD_MAIN_API_URL }}
+          FEEDLING_ENCLAVE_URL:          ${{ vars.PROD_MAIN_ENCLAVE_URL }}
+          AGENT_MAX_CHILDREN:            ${{ vars.PROD_AGENT_MAX_CHILDREN }}
+          # Reused from the main prod CVM — MUST match (esp. the token secret).
+          DATABASE_URL:                  ${{ secrets.DATABASE_URL }}
+          FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
+          AGENT_RUNTIME_USERS:           ${{ secrets.AGENT_RUNTIME_USERS }}
+          AGENT_RUNTIME_AUTODISCOVER:    ${{ vars.AGENT_RUNTIME_AUTODISCOVER }}
+          FEEDLING_HOST_ALL:             ${{ vars.FEEDLING_HOST_ALL }}
+          FEEDLING_LITELLM_ENABLE:       ${{ vars.FEEDLING_LITELLM_ENABLE }}
+          FEEDLING_LITELLM_API_KEY:      ${{ secrets.FEEDLING_LITELLM_API_KEY }}
+          FEEDLING_MIGRATE_ENABLE:       ${{ vars.FEEDLING_MIGRATE_ENABLE }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::DATABASE_URL not set — runner has no lease store"; exit 1
+          fi
+          if [ -z "$FEEDLING_API_URL" ] || [ -z "$FEEDLING_ENCLAVE_URL" ]; then
+            echo "::error::PROD_MAIN_API_URL / PROD_MAIN_ENCLAVE_URL not set — runner can't reach the main CVM"; exit 1
+          fi
+          printf '%s\n' "$IDS" | while IFS= read -r CVM_ID; do
+            [ -z "$CVM_ID" ] && continue
+            echo ">>> deploy prod runner CVM: $CVM_ID"
+            phala deploy \
+              --api-token "$PHALA_CLOUD_API_KEY" \
+              --cvm-id "$CVM_ID" \
+              -c deploy/docker-compose.phala.prod.runner.yaml \
+              -e "FEEDLING_API_URL=$FEEDLING_API_URL" \
+              -e "FEEDLING_ENCLAVE_URL=$FEEDLING_ENCLAVE_URL" \
+              -e "AGENT_MAX_CHILDREN=$AGENT_MAX_CHILDREN" \
+              -e "DATABASE_URL=$DATABASE_URL" \
+              -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
+              -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
+              -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+              -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL" \
+              -e "FEEDLING_LITELLM_ENABLE=$FEEDLING_LITELLM_ENABLE" \
+              -e "FEEDLING_LITELLM_API_KEY=$FEEDLING_LITELLM_API_KEY" \
+              -e "FEEDLING_MIGRATE_ENABLE=$FEEDLING_MIGRATE_ENABLE" \
+              --wait
+          done
+
+      - name: Publish live prod runner compose_hash on Sepolia (per CVM)
+        env:
+          PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
+          ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
+          # Distinct dstack app per runner CVM → its own compose_hash (identical
+          # compose ⇒ identical hash; addComposeHash is onlyOwner + per-hash, so
+          # publishing per CVM is idempotent). Reuses the prod contract by default;
+          # override with PROD_RUNNER_FEEDLING_APP_AUTH_CONTRACT.
+          FEEDLING_APP_AUTH_CONTRACT: ${{ vars.PROD_RUNNER_FEEDLING_APP_AUTH_CONTRACT || vars.FEEDLING_APP_AUTH_CONTRACT }}
+          PHALA_CLOUD_API_KEY:        ${{ secrets.PHALA_CLOUD_API_KEY }}
+          FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.prod.runner.yaml
+          IDS:                        ${{ steps.ids.outputs.ids }}
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pyyaml
+          printf '%s\n' "$IDS" | while IFS= read -r CVM_ID; do
+            [ -z "$CVM_ID" ] && continue
+            echo ">>> publish compose_hash for prod runner CVM: $CVM_ID"
+            FEEDLING_CVM_ID="$CVM_ID"
+            export FEEDLING_CVM_ID
+            publish_status=1
+            for attempt in 1 2 3; do
+              if ./deploy/publish-compose-hash.sh eth_sepolia; then
+                publish_status=0; break
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "::warning::runner compose_hash publish failed for $CVM_ID (attempt $attempt/3); retrying in 20s"
+                sleep 20
+              fi
+            done
+            [ "$publish_status" -eq 0 ] || { echo "::error::publish failed for $CVM_ID"; exit 1; }
+          done

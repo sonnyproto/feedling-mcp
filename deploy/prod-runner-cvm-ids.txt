@@ -1,0 +1,3 @@
+# One prod runner CVM id per line (UUID or app_id). Empty = job stays dormant.
+# Add a line per provisioned runner CVM to scale out horizontally.
+130fdfc6-5736-4cdc-9d0f-a35af8957cf2
