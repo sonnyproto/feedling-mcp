@@ -13,9 +13,12 @@
 
 **这修正 Round2 的 ②**:改身份**必须重建 persona**,否则改了等于没改。
 
-### 改法
+### 改法(注意 persona_build 的真实输入)
+`persona_build` **不吃 identity 卡**;它吃三样:`persona_material`(上传的**角色卡原文**)+ `behavior_notes` + `founding_exemplars`(后两者来自 voice)。名字是从 **persona_material(角色卡原文)** 进 persona 的。
+
 `_run_plaintext_update_identity_job` 里,`replace_identity_preserving_anchor` 成功后:
-1. 用**新 identity** + **现有 voice**(从当前 voice/persona 产物取 behavior_notes/exemplars)重跑 **`persona_build`(现有 prompt,不改)**。
+1. 用 **`persona_material` = 本次 update_identity 上传的【角色卡原文】**(job 已有该材料)+ **现有 voice**(从当前 voice 产物取 behavior_notes/founding_exemplars)重跑 **`persona_build`(现有 prompt,不改)**。
+   - ⚠️ 不是"喂新 identity 卡";喂的是**新角色卡原文**。新名字通过角色卡原文进 persona。
 2. 写**新 persona blob**(`service.write_persona_artifact` / `GENESIS_PERSONA_BLOB`),使 **persona_version 变化 → supervisor 下一 tick respawn**,agent 拿到新名字/自我介绍。
 3. self_introduction、signature 等也随 persona 一并更新(它们本就属人设)。
 
