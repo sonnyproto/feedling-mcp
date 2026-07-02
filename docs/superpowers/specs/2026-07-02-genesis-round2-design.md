@@ -19,12 +19,16 @@
 
 产品语义:用户主动传新角色卡 = 重定义 TA。与 onboarding 保持一致——onboarding 派生身份**也不要求必须有 agent_name**,所以 update 这里也不该有这个限制。
 
-- **强替换**:派生出什么就整替什么,**agent_name 为空也照替**,不兜底、不报错。
-- **移除 Round1 的 C 底线**:删掉 `replace_identity_preserving_anchor` 里 `if not agent_name: return "identity_update_incomplete"` 及 runner 对应的 mark_failed 分支。
-- **唯一守卫 = 空上传**:上传内容为空(没填、没传任何 character 材料)→ 不生成 job / 拒绝(复用现有 `not_provided` / 空内容校验)。**只在输入空时拦,不在输出空时拦。**
+- **强替换**:派生出什么就整替什么,**agent_name 为空也照替**,不兜底、不报错(与 onboarding 对齐:onboarding 也不要求有名字)。
+- **移除 Round1 的 agent_name 底线**:删掉 `replace_identity_preserving_anchor` 里 `if not agent_name: return "identity_update_incomplete"` 及 runner 对应分支。**不再要求有名字。**
+- **两层守卫(Codex R1,已采纳)**:
+  1. **输入空**:上传内容为空(没填、没传 character 材料)→ 不生成 job / 拒绝。
+  2. **输出废卡**:派生出的 identity payload **彻底空壳**(agent_name / dimensions / self_introduction / category / signature **全都没有**)→ `identity_update_empty`(runner mark_failed),**不覆盖旧身份**。
+     - 有 agent_name → 替 ✅;没名字但**任一** dimensions/self_introduction/category/signature 有值 → 也替 ✅;**全空才 failed**。
+     - 关键:这**不是** Round1 的"没名字就失败"(那太硬)。这只拦"模型抽了张啥都没有的废卡"——**不要求名字,只要求至少有一样有效身份内容**。
 - **保留**:无已有 identity → 409(先 onboarding);字段保留 id/created_at/relationship_started_at/anchor 不变。
 
-> 注:这会让"新卡没名字 → 名字被替空"重新成为可能,但这是**有意与 onboarding 对齐**的产品决策,不是 bug。
+> 注:这会让"新卡没名字 → 名字被替空"成为可能(有意与 onboarding 对齐),但**不会拿彻底空壳覆盖好身份**(废卡守卫挡住)。
 
 ---
 
@@ -49,10 +53,12 @@
 ```
 用户诉求:**不在意时间,要成功率 + 体感**。合并把 per-chunk 从 2N 降到 N(更少失败点=更高成功率);全前台 = 进门即有完整语气/人设(体感)。
 
-### ⚠️ 偏离项(需 Codex/hx 确认)
-**合并 fact+voice 到一次调用,必然要一个"同时抽事实+语气"的 combined 抽取 prompt** —— 这打破了"派生 prompt 一行不动"铁律。没有别的方式减少那 N 次(不合并就只是挪位置、调用数不变)。
-- 实现:combined 抽取 prompt = 复用 FACT_MAP_PROMPT + VOICE_MAP_PROMPT 的意图,合成一个输出 `{fact_candidates:[...], voice_candidates:[...]}` 的 system prompt。fact_write / voice_reduce / persona_build 三个 reduce prompt **不动**。
-- **风险**:一个 prompt 干两件事,可能两头质量都降。**必须真机 e2e 验**(对比合并前后:记忆命中率、语气/人设质量)。若质量明显掉 → 回退到"不合并、voice 仍逐块单抽但放前台"(不减调用但保质量)。
+### ⚠️ 偏离项 + 落地方式(Codex R2,已采纳:flag 门控 + 新函数 + 可回退)
+**合并 fact+voice 到一次调用,必然要一个"同时抽事实+语气"的 combined 抽取 prompt** —— 打破"派生 prompt 一行不动"铁律。没有别的方式减少那 N 次。落地必须:
+- **新增 `combined_map`(新函数 + 新 combined prompt),不改废旧的 `fact_map` / `voice_map`**(保留可回退)。combined prompt 意图 = 复用 FACT_MAP + VOICE_MAP,合成输出 `{fact_candidates:[...], voice_candidates:[...]}`。fact_write / voice_reduce / persona_build 三个 reduce prompt **不动**。
+- **feature flag 门控**:`FEEDLING_GENESIS_COMBINED_MAP=1` 开;onboarding 开时走 combined,关时走旧的 fact+voice 分抽(都在前台)。
+- **add_memory 无论 flag 开关都只 fact-only,绝不抽 voice**(见 §4)。
+- **可回退**:真机 e2e 若记忆命中率 / voice 质量掉 → 关 flag 回退到"不合并、voice 逐块单抽但放前台"(不减调用但保质量)。质量对照是硬门槛。
 
 ### chat_ready / 进门时机
 - 全前台后,job 完成 = 全套就绪。chat_ready 仍 = identity + greeting + 记忆;但由于都在同一前台顺序里,用户进门时 persona/voice 已就绪。
@@ -94,6 +100,19 @@
 4. **#3 报错**:制造失败/超时 → iOS 明确报错带真实原因、不无限 loading。
 
 ---
+
+## §7 执行顺序(Codex R,已采纳)
+先做确定性的、把有风险的 combined 放最后灰度:
+1. **#1 强替换 + 废卡守卫**(确定性,先做)。
+2. **#3 iOS 报错硬化**(低风险)。
+3. **#2 combined map**(flag 门控,最后做,带 e2e 对照)。
+
+e2e 对照(#2 上/下线都要比):
+- memory 数量 + ground-truth 命中率
+- identity 是否稳定抽到"乔伊"(用非模型名 fixture)
+- greeting 是否真实写入且可解密
+- persona/voice 是否前台生成
+- add_memory 是否 **0** voice/persona 调用
 
 ## §6 铁律与红线
 - **reduce prompt(fact_write/voice_reduce/persona_build)不动**;唯一的 prompt 变动 = §2 的 combined 抽取(已标偏离,需 e2e 验)。
