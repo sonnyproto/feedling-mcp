@@ -313,6 +313,38 @@ WHOAMI_STARTUP_RETRY_DELAY_SEC = float(
 )
 WHOAMI_REFRESH_RETRIES = int(os.environ.get("WHOAMI_REFRESH_RETRIES", "3"))
 WHOAMI_REFRESH_RETRY_DELAY_SEC = float(os.environ.get("WHOAMI_REFRESH_RETRY_DELAY_SEC", "0.5"))
+# TTL gate for the pre-reply whoami refresh. Encryption keys are stable (the
+# user's own pubkey never changes; the enclave content pubkey is dstack-KMS
+# derived and stable across compose rotations), so re-fetching before every
+# reply just adds a reentrant backend round-trip under load. 0 = always refresh.
+WHOAMI_REFRESH_TTL_SEC = float(os.environ.get("WHOAMI_REFRESH_TTL_SEC", "300"))
+
+# Provider payment (HTTP 402 / out-of-credits) circuit breaker. After a provider
+# payment failure, pause PROACTIVE agent calls for this window so a broke key
+# stops flooding the logs with per-tick retries. User-initiated chat replies are
+# NOT gated. 0 = disabled (always attempt).
+PROVIDER_PAYMENT_COOLDOWN_SEC = float(os.environ.get("PROVIDER_PAYMENT_COOLDOWN_SEC", "600"))
+_provider_payment_cooldown_until: float = 0.0
+_PROVIDER_PAYMENT_MARKERS = ("402", "payment required", "requires more credits")
+
+
+def _is_provider_payment_error(exc: BaseException) -> bool:
+    s = str(exc).lower()
+    return any(m in s for m in _PROVIDER_PAYMENT_MARKERS)
+
+
+def _provider_payment_cooling_down() -> bool:
+    return PROVIDER_PAYMENT_COOLDOWN_SEC > 0 and time.monotonic() < _provider_payment_cooldown_until
+
+
+def _note_provider_payment_failure() -> None:
+    global _provider_payment_cooldown_until
+    _provider_payment_cooldown_until = time.monotonic() + PROVIDER_PAYMENT_COOLDOWN_SEC
+
+
+def _clear_provider_payment_cooldown() -> None:
+    global _provider_payment_cooldown_until
+    _provider_payment_cooldown_until = 0.0
 
 # Prompt routed only when an agent entry cannot receive a native image object.
 # The consumer still extracts decrypted image bytes and passes them through
@@ -2925,6 +2957,10 @@ def _resident_foreground_chat_message_v2(content: str) -> str:
 # to a stale iOS content public key.
 _whoami_cache: dict = {"user_id": "", "user_pk": None, "enclave_pk": None}
 
+# monotonic ts of the last successful _load_whoami() that yielded encryption
+# keys; 0.0 until the first success so the first reply still fetches.
+_whoami_cache_loaded_at: float = 0.0
+
 def execute_identity_actions(actions: list[dict]) -> dict:
     if not actions:
         return {"status": "ok", "results": [], "effects": []}
@@ -3043,13 +3079,17 @@ def _load_whoami() -> bool:
         enc_pk = None
 
     _whoami_cache.update(user_id=user_id, user_pk=user_pk, enclave_pk=enc_pk)
+    ok = bool(user_id and user_pk)
+    if _whoami_cache_has_full_keys():
+        global _whoami_cache_loaded_at
+        _whoami_cache_loaded_at = time.monotonic()
     log.info(
         "whoami loaded — user_id=%s user_pk=%s enclave_pk=%s",
         user_id,
         _fingerprint_bytes(user_pk),
         _fingerprint_bytes(enc_pk),
     )
-    return bool(user_id and user_pk)
+    return ok
 
 
 def _load_whoami_with_retries(
@@ -3088,8 +3128,27 @@ def _whoami_cache_has_encryption_keys(cache: dict | None = None) -> bool:
     return bool(user_id and isinstance(user_pk, bytes) and len(user_pk) == 32)
 
 
+def _whoami_cache_has_full_keys(cache: dict | None = None) -> bool:
+    cache = _whoami_cache if cache is None else cache
+    user_id = str(cache.get("user_id") or "").strip()
+    user_pk = cache.get("user_pk")
+    enc_pk = cache.get("enclave_pk")
+    return bool(
+        user_id
+        and isinstance(user_pk, bytes) and len(user_pk) == 32
+        and isinstance(enc_pk, bytes) and len(enc_pk) == 32
+    )
+
+
 def _refresh_whoami_for_encrypted_reply() -> bool:
     previous = dict(_whoami_cache)
+    # Skip the network refresh while cached keys are fresh (see WHOAMI_REFRESH_TTL_SEC).
+    if (
+        WHOAMI_REFRESH_TTL_SEC > 0
+        and _whoami_cache_has_full_keys()
+        and (time.monotonic() - _whoami_cache_loaded_at) < WHOAMI_REFRESH_TTL_SEC
+    ):
+        return True
     if _load_whoami_with_retries(
         attempts=WHOAMI_REFRESH_RETRIES,
         delay_sec=WHOAMI_REFRESH_RETRY_DELAY_SEC,
@@ -5178,6 +5237,15 @@ def _process_proactive_jobs(jobs: list) -> float:
             len(frame_ids),
         )
 
+        if _provider_payment_cooling_down():
+            log.warning(
+                "proactive job skipped — provider payment required (cooling down); job_id=%s",
+                job_id,
+            )
+            update_proactive_job_status(
+                job_id, "failed", "provider_payment_required: cooling down"
+            )
+            continue
         update_proactive_job_status(job_id, "realizing")
         try:
             agent_result = call_agent(
@@ -5186,9 +5254,22 @@ def _process_proactive_jobs(jobs: list) -> float:
                 image_paths=screen_paths,
             )
         except Exception as e:
+            if _is_provider_payment_error(e):
+                _note_provider_payment_failure()
+                log.error(
+                    "proactive agent call failed — provider payment required; "
+                    "cooling down %.0fs: %s",
+                    PROVIDER_PAYMENT_COOLDOWN_SEC,
+                    e,
+                )
+                update_proactive_job_status(
+                    job_id, "failed", f"provider_payment_required: {e}"
+                )
+                continue
             log.error("proactive agent call failed; not posting fallback: %s", e)
             update_proactive_job_status(job_id, "failed", f"agent_call_failed: {e}")
             continue
+        _clear_provider_payment_cooldown()
 
         turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
         actions, replies = turn.actions, turn.messages
