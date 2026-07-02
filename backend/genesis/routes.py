@@ -563,21 +563,28 @@ def _run_plaintext_genesis_v2(
         store.user_id, job_id, status="processing",
         output={"stage": "genesis_v2_foreground", "source_family": fg_family}, processed_chunks=0,
     )
+    combined_map = worker.genesis_combined_map_enabled()
     foreground_reduces: list[dict] = []
     primary_reduce: dict | None = None
+    voice_candidates: list[dict] = []
+    persona_material_parts: list[str] = []
     for idx, group in enumerate(source_groups, start=1):
         group_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
         group_family = str(group.get("source_family") or worker._source_family(group_kind))
         group_chunks = [str(t) for t in (group.get("chunk_texts") or []) if str(t or "").strip()]
         if not group_chunks:
             continue
+        if combined_map and group_family == "ai_persona":
+            persona_material_parts.extend(group_chunks)
         reduce = worker.build_foreground_output_from_texts(
             user_id=store.user_id, job_id=job_id,
             key_prefix=f"{job_id}:source_pass:{idx}:{group_family}",
             runtime=runtime, chunk_texts=group_chunks, source_kind=group_kind,
+            include_voice_candidates=combined_map,
             write_core=False,
         )
         foreground_reduces.append(reduce)
+        voice_candidates.extend([c for c in (reduce.get("voice_candidates") or []) if isinstance(c, dict)])
         if idx == fg_idx:
             primary_reduce = reduce
 
@@ -604,6 +611,19 @@ def _run_plaintext_genesis_v2(
         [{**primary_reduce, **full_fact_write}],
         relationship_anchor=relationship_anchor,
     )
+    if combined_map:
+        voice_persona_output = worker.build_voice_persona_output_from_candidates(
+            user_id=store.user_id,
+            job_id=job_id,
+            key_prefix=f"{job_id}:foreground_voice_persona",
+            runtime=runtime,
+            voice_candidates=voice_candidates,
+            existing_persona={"content": "\n\n".join(persona_material_parts).strip()} if persona_material_parts else None,
+        )
+        fg_merged = _plaintext_merge_reducer_outputs(
+            [{**fg_merged, **voice_persona_output}],
+            relationship_anchor=relationship_anchor,
+        )
     full_memories = fg_merged.get("memories") or []
     days = int((relationship_anchor or {}).get("days_with_user") or 0)
     # explicit relationship_started_at (user typed a date) -> honored verbatim below,
@@ -626,6 +646,11 @@ def _run_plaintext_genesis_v2(
         service.mark_failed(store, job_id, f"foreground_identity_failed:{provider_failure}")
         return True
     identity_first = bool(msgs) and foreground_identity.has_identity_signal(identity_payload)
+    persona_ref = ""
+    persona_sha = ""
+    if combined_map:
+        persona_ref, persona_sha = service.write_persona_artifact(store, job_id, fg_merged)
+        service.write_voice_artifact(store, job_id, fg_merged)
 
     if identity_first:
         # core memories now; identity via the legacy _store_identity_payload (exact old
@@ -648,7 +673,7 @@ def _run_plaintext_genesis_v2(
         completed = db.genesis_complete_job(
             store.user_id, job_id, output={"stage": "genesis_v2_foreground_ready"},
             memory_action_count=mem_count, identity_status="initialized",
-            persona_ref="", persona_sha256="",
+            persona_ref=persona_ref, persona_sha256=persona_sha,
         )
         if completed:
             service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
@@ -666,6 +691,9 @@ def _run_plaintext_genesis_v2(
             language=language,
         )
         service.apply_reducer_output(store, api_key, job_id, fg_merged)
+
+    if combined_map:
+        return True
 
     # foreground core memory texts -> background as "already saved, don't repeat"
     # (semantic dedup of reworded twins lives in the model).
