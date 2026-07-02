@@ -15,6 +15,7 @@ from flask import Blueprint, jsonify, request
 import db
 from accounts import auth
 from accounts import runtime_auth
+from core import enclave as core_enclave
 from genesis import dedup, foreground, foreground_identity, service, worker
 from hosted import config_store as hosted_config_store
 from hosted import history_import
@@ -508,12 +509,63 @@ def _plaintext_existing_voice_from_output(output: dict) -> dict:
     }
 
 
+def _plaintext_persona_material_from_messages(messages: list[dict] | None) -> str:
+    chunks: list[str] = []
+    seen: set[str] = set()
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        source = history_import._import_source_family(str(msg.get("source") or msg.get("source_family") or ""))
+        if source != history_import._AI_PERSONA_SOURCE:
+            continue
+        content = str(msg.get("content") or "").strip()
+        if not content or content in seen:
+            continue
+        seen.add(content)
+        chunks.append(content)
+    return "\n\n".join(chunks).strip()
+
+
+def _plaintext_existing_voice_workset_for_update(store, api_key: str | None) -> dict:
+    try:
+        blob = db.get_blob(store.user_id, service.GENESIS_VOICE_BLOB)
+        if not isinstance(blob, dict):
+            return {}
+        envelope = blob.get("content_envelope")
+        if not isinstance(envelope, dict):
+            return {}
+        raw = core_enclave._decrypt_envelope_via_enclave(envelope, api_key, purpose="genesis_voice")
+        parsed = json.loads(raw.decode("utf-8"))
+        if not isinstance(parsed, dict):
+            return {}
+        notes = parsed.get("behavior_notes") if isinstance(parsed.get("behavior_notes"), list) else []
+        exemplars = parsed.get("exemplars") if isinstance(parsed.get("exemplars"), list) else []
+        return {"behavior_notes": notes, "exemplars": exemplars}
+    except Exception:
+        return {}
+
+
 def _merged_has_identity(merged: dict) -> bool:
     """True when the reduce output carries a usable Identity Card (a name or any
     dimension). Mirrors service._identity_payload_from_output's emptiness rule."""
     ident = merged.get("identity") if isinstance(merged.get("identity"), dict) else {}
     dims = ident.get("dimensions") if isinstance(ident.get("dimensions"), list) else []
     return bool(str(ident.get("agent_name") or "").strip()) or len(dims) > 0
+
+
+def _identity_payload_has_content(identity_payload: dict | None) -> bool:
+    payload = identity_payload if isinstance(identity_payload, dict) else {}
+    if str(payload.get("agent_name") or "").strip():
+        return True
+    if str(payload.get("self_introduction") or "").strip():
+        return True
+    if str(payload.get("category") or "").strip():
+        return True
+    dimensions = payload.get("dimensions") if isinstance(payload.get("dimensions"), list) else []
+    if dimensions:
+        return True
+    signature = payload.get("signature") if isinstance(payload.get("signature"), list) else []
+    return bool(signature)
 
 
 def _provider_identity_failure(warnings: list[str] | tuple[str, ...] | None) -> str:
@@ -906,6 +958,7 @@ def _run_plaintext_add_memory_job(
 
 def _run_plaintext_update_identity_job(
     store,
+    api_key: str | None,
     job_id: str,
     *,
     runtime,
@@ -927,9 +980,36 @@ def _run_plaintext_update_identity_job(
     if provider_failure:
         service.mark_failed(store, job_id, f"update_identity_failed:{provider_failure}")
         return
+    if not _identity_payload_has_content(identity_payload):
+        service.mark_failed(store, job_id, "identity_update_empty")
+        return
+    persona_material = _plaintext_persona_material_from_messages(msgs)
+    if not persona_material:
+        service.mark_failed(store, job_id, "persona_material_required")
+        return
+    voice_workset = _plaintext_existing_voice_workset_for_update(store, api_key)
+    try:
+        persona_output = worker.build_persona_output_from_material(
+            user_id=store.user_id,
+            job_id=job_id,
+            key_prefix=f"{job_id}:update_identity",
+            runtime=runtime,
+            persona_material=persona_material,
+            voice_workset=voice_workset,
+            source_kind="identity_update",
+            source_family="ai_persona",
+        )
+    except Exception as e:  # noqa: BLE001
+        service.mark_failed(store, job_id, f"persona_rebuild_failed:{type(e).__name__}:{str(e)[:160]}")
+        return
     status = service.replace_identity_preserving_anchor(store, {"identity": identity_payload})
     if status != "updated":
         service.mark_failed(store, job_id, status)
+        return
+    try:
+        persona_ref, persona_sha = service.write_persona_artifact(store, job_id, persona_output)
+    except Exception as e:  # noqa: BLE001
+        service.mark_failed(store, job_id, f"persona_write_failed:{type(e).__name__}:{str(e)[:160]}")
         return
     completed = db.genesis_complete_job(
         store.user_id,
@@ -937,8 +1017,8 @@ def _run_plaintext_update_identity_job(
         output={"stage": "plaintext_update_identity_done"},
         memory_action_count=0,
         identity_status="updated",
-        persona_ref="",
-        persona_sha256="",
+        persona_ref=persona_ref,
+        persona_sha256=persona_sha,
     )
     if completed:
         service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
@@ -998,6 +1078,7 @@ def _run_plaintext_genesis_job(
         if mode == "update_identity":
             _run_plaintext_update_identity_job(
                 store,
+                api_key,
                 job_id,
                 runtime=runtime,
                 analysis_messages=analysis_messages,

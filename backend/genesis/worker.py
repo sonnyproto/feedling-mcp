@@ -418,6 +418,63 @@ def _complete_json(
             raise GenesisWorkerError(f"{task_id}:invalid_json_after_repair") from repair_error
 
 
+def _complete_json_retry_empty(
+    llm: GenesisLLMClient,
+    *,
+    user_id: str,
+    job_id: str,
+    task_id: str,
+    runtime: provider_client.ProviderConfig,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    idempotency_key: str,
+    is_empty,
+    temperature: float = 0.2,
+    max_attempts: int = 2,
+) -> dict:
+    attempts = max(1, int(max_attempts))
+    last: dict = {}
+    for attempt in range(attempts):
+        suffix = "" if attempt == 0 else f"-empty-retry-{attempt}"
+        key_suffix = "" if attempt == 0 else f":empty_retry:{attempt}"
+        last = _complete_json(
+            llm,
+            user_id=user_id,
+            job_id=job_id,
+            task_id=f"{task_id}{suffix}",
+            runtime=runtime,
+            messages=messages,
+            max_tokens=max_tokens,
+            idempotency_key=f"{idempotency_key}{key_suffix}",
+            temperature=temperature,
+        )
+        if not is_empty(last):
+            return last
+    return last
+
+
+def _combined_map_empty(output: dict) -> bool:
+    facts = output.get("fact_candidates") if isinstance(output.get("fact_candidates"), list) else []
+    voice = _voice_candidate_from_combined_map(output)
+    notes = voice.get("behavior_notes_candidates") if isinstance(voice.get("behavior_notes_candidates"), list) else []
+    exemplars = voice.get("exemplar_candidates") if isinstance(voice.get("exemplar_candidates"), list) else []
+    return not facts and not notes and not exemplars
+
+
+def _fact_write_output_empty(output: dict) -> bool:
+    memories = output.get("memories") if isinstance(output.get("memories"), list) else []
+    identity = output.get("identity") if isinstance(output.get("identity"), dict) else {}
+    dims = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
+    if memories or str(identity.get("agent_name") or "").strip() or dims:
+        return False
+    try:
+        if int(output.get("days_with_user") or 0) > 0:
+            return False
+    except Exception:
+        pass
+    return not str(output.get("relationship_anchor_evidence") or "").strip()
+
+
 def _complete_text(
     llm: GenesisLLMClient,
     *,
@@ -508,7 +565,7 @@ def _fact_write(
     batch_size = max(4, _env_int("FEEDLING_GENESIS_FACT_WRITE_BATCH", 80))
     outputs: list[dict] = []
     for idx, batch in enumerate(_chunks(fact_candidates, batch_size) or [[]]):
-        outputs.append(_complete_json(
+        outputs.append(_complete_json_retry_empty(
             llm,
             user_id=user_id,
             job_id=job_id,
@@ -517,6 +574,7 @@ def _fact_write(
             messages=prompts.fact_write_messages(batch, persona_material, memory_summary, known_memories),
             max_tokens=4000,
             idempotency_key=f"{idempotency_prefix}:fact_write:{idx}",
+            is_empty=_fact_write_output_empty,
         ))
     memories: list[dict] = []
     dims: list[dict] = []
@@ -894,6 +952,58 @@ def build_voice_persona_output_from_candidates(
     }
 
 
+def build_persona_output_from_material(
+    *,
+    user_id: str,
+    job_id: str,
+    key_prefix: str | None = None,
+    runtime: provider_client.ProviderConfig,
+    persona_material: str,
+    voice_workset: dict | None = None,
+    source_kind: str = "identity_update",
+    source_family: str = "ai_persona",
+    llm: GenesisLLMClient | None = None,
+) -> dict:
+    """Build a persona artifact from explicit role-card material.
+
+    Used by update_identity: the agent's spawned persona is generated from the
+    uploaded role card, not from the normalized Identity Card. Existing voice
+    workset is reused when present so name/persona updates do not rewrite voice.
+    """
+    llm = llm or GenesisLLMClient()
+    prefix = _idempotency_prefix(job_id, key_prefix)
+    workset = voice_workset if isinstance(voice_workset, dict) else {}
+    behavior_notes = workset.get("behavior_notes") if isinstance(workset.get("behavior_notes"), list) else []
+    exemplars = workset.get("exemplars") if isinstance(workset.get("exemplars"), list) else []
+    founding = [item for item in exemplars if isinstance(item, dict) and item.get("founding")]
+    if not founding:
+        founding = [item for item in exemplars if isinstance(item, dict)][:12]
+    persona_content = _complete_text(
+        llm,
+        user_id=user_id,
+        job_id=job_id,
+        task_id="persona-build",
+        runtime=runtime,
+        messages=prompts.persona_build_messages(str(persona_material or "").strip(), behavior_notes, founding),
+        max_tokens=4000,
+        idempotency_key=f"{prefix}:persona_build",
+    )
+    return {
+        "persona": {
+            "content": persona_content,
+            "prompt_version": "7.B",
+            "source_kind": source_kind,
+            "source_family": source_family,
+        },
+        "source_kind": source_kind,
+        "source_family": source_family,
+        "voice_workset": {
+            "behavior_notes": behavior_notes,
+            "exemplars": exemplars,
+        },
+    }
+
+
 def genesis_v2_enabled() -> bool:
     """Genesis v2 (foreground-fast) runs ONLY when FEEDLING_GENESIS_V2_ENABLED is
     truthy. Default OFF — the existing one-shot path stays byte-for-byte the
@@ -975,7 +1085,7 @@ def build_foreground_output_from_texts(
     voice_candidates: list[dict] = []
     for idx, text in enumerate(chunk_texts):
         if include_voice_candidates and source_family == "history" and genesis_combined_map_enabled():
-            facts = _complete_json(
+            facts = _complete_json_retry_empty(
                 llm,
                 user_id=user_id,
                 job_id=job_id,
@@ -984,6 +1094,7 @@ def build_foreground_output_from_texts(
                 messages=prompts.combined_map_messages(text),
                 max_tokens=2400,
                 idempotency_key=f"{shared_prefix}:combined_map:{idx}",
+                is_empty=_combined_map_empty,
             )
             voice_candidates.append(_voice_candidate_from_combined_map(facts))
         else:
