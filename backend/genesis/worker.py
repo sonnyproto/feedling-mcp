@@ -557,6 +557,8 @@ def _build_reducer_output(
     existing_voice: dict | None = None,
     skip_fact_texts: set[str] | None = None,
     known_memories: list[str] | None = None,
+    include_memory: bool = True,
+    include_persona_voice: bool = True,
 ) -> dict:
     llm = GenesisLLMClient()
     idempotency_prefix = _idempotency_prefix(job_id, key_prefix)
@@ -580,33 +582,35 @@ def _build_reducer_output(
             runtime=runtime,
             fact_candidates=[],
             persona_material=material,
-        ))
-        persona_content = _complete_text(
-            llm,
-            user_id=user_id,
-            job_id=job_id,
-            task_id="persona-build",
-            runtime=runtime,
-            messages=prompts.persona_build_messages(material, existing_notes, founding),
-            max_tokens=4000,
-            idempotency_key=f"{idempotency_prefix}:persona_build",
-        )
-        return {
+        )) if include_memory else {"memories": []}
+        out = {
             **identity_doc,
             "source_kind": source_kind,
             "source_family": source_family,
-            "persona": {
-                "content": persona_content,
-                "prompt_version": "7.B",
-                "source_kind": source_kind,
-                "source_family": persona_source_family,
-            },
             "voice": {
                 "behavior_notes_count": len(existing_notes),
                 "exemplar_count": len(existing_exemplars),
                 "founding_exemplar_count": len(founding),
             },
         }
+        if include_persona_voice:
+            persona_content = _complete_text(
+                llm,
+                user_id=user_id,
+                job_id=job_id,
+                task_id="persona-build",
+                runtime=runtime,
+                messages=prompts.persona_build_messages(material, existing_notes, founding),
+                max_tokens=4000,
+                idempotency_key=f"{idempotency_prefix}:persona_build",
+            )
+            out["persona"] = {
+                "content": persona_content,
+                "prompt_version": "7.B",
+                "source_kind": source_kind,
+                "source_family": persona_source_family,
+            }
+        return out
 
     if source_family == "memory_summary":
         fact_write = _memory_summary_name_only(_fact_write(
@@ -617,7 +621,7 @@ def _build_reducer_output(
             runtime=runtime,
             fact_candidates=[],
             memory_summary=material,
-        ))
+        )) if include_memory else {"memories": []}
         return {
             **fact_write,
             "source_kind": source_kind,
@@ -634,7 +638,7 @@ def _build_reducer_output(
     fact_map_attempts = 0
     fact_map_failures = 0
     for idx, text in enumerate(chunk_texts):
-        if source_family == "history":
+        if include_persona_voice and source_family == "history":
             try:
                 voice = _complete_json(
                     llm,
@@ -652,6 +656,8 @@ def _build_reducer_output(
                 # client's own retries) shouldn't sink the whole import. Drop this
                 # chunk's voice contribution and keep going.
                 print(f"[genesis:{job_id}] voice-map-{idx} skipped: {type(e).__name__}:{str(e)[:120]}")
+        if not include_memory:
+            continue
         fact_map_attempts += 1
         try:
             facts = _complete_json(
@@ -675,10 +681,10 @@ def _build_reducer_output(
     # Per-chunk tolerance has a floor: if EVERY fact-map failed, the relay is
     # effectively unusable for this user — fail loudly so the job stays retryable
     # rather than writing an empty/garbage memory garden from zero candidates.
-    if fact_map_attempts and fact_map_failures == fact_map_attempts:
+    if include_memory and fact_map_attempts and fact_map_failures == fact_map_attempts:
         raise GenesisWorkerError(f"all_fact_maps_failed:{fact_map_failures}/{fact_map_attempts}")
 
-    if skip_fact_texts:
+    if include_memory and skip_fact_texts:
         # Genesis v2: drop the candidates the foreground already wrote as core, so the
         # background reduce never re-writes them (structural dedup — foreground and
         # background see the SAME cached candidates, so normalized text matches exactly).
@@ -694,7 +700,7 @@ def _build_reducer_output(
         key_prefix=idempotency_prefix,
         runtime=runtime,
         candidates=voice_candidates,
-    ) if source_family == "history" else {"behavior_notes": [], "exemplars": []}
+    ) if include_persona_voice and source_family == "history" else {"behavior_notes": [], "exemplars": []}
     exemplars = voice_final.get("exemplars") if isinstance(voice_final.get("exemplars"), list) else []
     founding = [item for item in exemplars if isinstance(item, dict) and item.get("founding")]
     if not founding:
@@ -713,7 +719,7 @@ def _build_reducer_output(
         runtime=runtime,
         fact_candidates=fact_candidates,
         known_memories=known_memories,   # genesis v2: foreground core -> "已保存,勿重复"
-    )
+    ) if include_memory else {"memories": [], "identity": {"agent_name": "", "dimensions": []}}
     if source_family == "user_profile":
         fact_write = _strip_identity(fact_write)
         return {
@@ -729,26 +735,10 @@ def _build_reducer_output(
 
     persona_material = str(existing_persona.get("content") or "").strip()
     persona_source_family = "merged" if persona_material else "history"
-    persona_content = _complete_text(
-        llm,
-        user_id=user_id,
-        job_id=job_id,
-        task_id="persona-build",
-        runtime=runtime,
-        messages=prompts.persona_build_messages(persona_material, behavior_notes, founding),
-        max_tokens=4000,
-        idempotency_key=f"{idempotency_prefix}:persona_build",
-    )
-    return {
+    out = {
         **fact_write,
         "source_kind": source_kind,
         "source_family": source_family,
-        "persona": {
-            "content": persona_content,
-            "prompt_version": "7.B",
-            "source_kind": source_kind,
-            "source_family": persona_source_family,
-        },
         "voice": {
             "behavior_notes_count": len(behavior_notes),
             "exemplar_count": len(exemplars),
@@ -756,6 +746,24 @@ def _build_reducer_output(
         },
         "voice_workset": voice_workset,
     }
+    if include_persona_voice:
+        persona_content = _complete_text(
+            llm,
+            user_id=user_id,
+            job_id=job_id,
+            task_id="persona-build",
+            runtime=runtime,
+            messages=prompts.persona_build_messages(persona_material, behavior_notes, founding),
+            max_tokens=4000,
+            idempotency_key=f"{idempotency_prefix}:persona_build",
+        )
+        out["persona"] = {
+            "content": persona_content,
+            "prompt_version": "7.B",
+            "source_kind": source_kind,
+            "source_family": persona_source_family,
+        }
+    return out
 
 
 def build_reducer_output_from_texts(
@@ -770,6 +778,8 @@ def build_reducer_output_from_texts(
     existing_voice: dict | None = None,
     skip_fact_texts: set[str] | None = None,
     known_memories: list[str] | None = None,
+    include_memory: bool = True,
+    include_persona_voice: bool = True,
 ) -> dict:
     """Public wrapper for trusted in-memory Genesis inputs.
 
@@ -787,6 +797,36 @@ def build_reducer_output_from_texts(
         existing_persona=existing_persona,
         existing_voice=existing_voice,
         skip_fact_texts=skip_fact_texts,
+        known_memories=known_memories,
+        include_memory=include_memory,
+        include_persona_voice=include_persona_voice,
+    )
+
+
+def build_memory_output_from_fact_candidates(
+    *,
+    user_id: str,
+    job_id: str,
+    key_prefix: str | None = None,
+    runtime: provider_client.ProviderConfig,
+    fact_candidates: list[dict],
+    known_memories: list[str] | None = None,
+    llm: GenesisLLMClient | None = None,
+) -> dict:
+    """Run the Genesis fact_write step directly for already-mapped candidates.
+
+    Foreground v2 already has all fact candidates after fact_map. This helper lets
+    the route write the full memory set once, without re-mapping the transcript or
+    waiting for voice/persona.
+    """
+    llm = llm or GenesisLLMClient()
+    return _fact_write(
+        llm,
+        user_id=user_id,
+        job_id=job_id,
+        key_prefix=key_prefix,
+        runtime=runtime,
+        fact_candidates=[item for item in fact_candidates if isinstance(item, dict)],
         known_memories=known_memories,
     )
 
@@ -811,6 +851,7 @@ def build_foreground_output_from_texts(
     source_kind: str = "history",
     foreground_core_max: int = foreground.FOREGROUND_CORE_MAX,
     llm: GenesisLLMClient | None = None,
+    write_core: bool = True,
 ) -> dict:
     """Genesis v2 FOREGROUND — the light "open the door" pass (Codex flow).
 
@@ -853,7 +894,7 @@ def build_foreground_output_from_texts(
         key_prefix=fg_write_prefix,   # distinct -> never collides with background fact_write
         runtime=runtime,
         fact_candidates=core,
-    )
+    ) if write_core else {"memories": [], "identity": {"agent_name": "", "dimensions": []}}
     return {
         "memories": fact_write.get("memories") or [],
         "identity": fact_write.get("identity") or {"agent_name": "", "dimensions": []},

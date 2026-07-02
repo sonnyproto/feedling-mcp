@@ -88,6 +88,7 @@ SAFE_JOB_METADATA_KEYS = {
     "history_tier",
     "ingest",
     "locale",
+    "mode",
     "schema_version",
     "source_label",
     "timeline_span_days",
@@ -556,6 +557,28 @@ def _identity_payload_from_output(output: dict) -> dict | None:
     return payload
 
 
+def _identity_payload_for_replace(output: dict) -> dict | None:
+    """Identity update mode replaces the encrypted identity body, but not the
+    relationship anchor metadata. Unlike genesis init, this should preserve the
+    user-provided profile fields from the uploaded identity material when present.
+    """
+    payload = _identity_payload_from_output(output)
+    if payload is None:
+        return None
+    identity = output.get("identity") if isinstance(output.get("identity"), dict) else {}
+    if identity.get("self_introduction") is not None:
+        payload["self_introduction"] = str(identity.get("self_introduction") or "").strip()[:1200]
+    for key in identity_service._IDENTITY_PROFILE_STRING_FIELDS:
+        if key in {"agent_name", "self_introduction"}:
+            continue
+        if identity.get(key) is not None:
+            payload[key] = str(identity.get(key) or "")[:1200 if key in {"relationship_anchor", "tone_style", "custom_persona_prompt"} else 240]
+    for key in identity_service._IDENTITY_PROFILE_LIST_FIELDS:
+        if isinstance(identity.get(key), list):
+            payload[key] = [str(item)[:240] for item in identity[key][:12] if str(item or "").strip()]
+    return payload
+
+
 def _clean_identity_category(value: Any) -> str:
     return _text(value, 120).strip(" `\"'“”‘’。，,.;；:：!！?？")
 
@@ -723,6 +746,56 @@ def init_identity_if_absent(
         "reason": "Identity updated from Genesis import." if existing else "Identity initialized from Genesis import.",
     })
     return "updated" if existing else "initialized"
+
+
+def replace_identity_preserving_anchor(store: UserStore, output: dict) -> str:
+    """Replace identity content for explicit update_identity imports.
+
+    Product meaning: the user is redefining the companion's identity card. This
+    must NOT recompute relationship_started_at/days/evidence; those are history
+    anchors, not editable persona content.
+    """
+    existing = identity_service._load_identity(store)
+    if not existing:
+        return "identity_not_initialized"
+    payload = _identity_payload_for_replace(output)
+    if not payload:
+        return "not_provided"
+    envelope, err = core_envelope._build_shared_envelope_for_store(
+        store,
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
+        item_id=existing.get("id") or None,
+    )
+    if envelope is None:
+        raise RuntimeError(f"identity_envelope_failed:{err}")
+    now = datetime.now().isoformat()
+    identity_doc = {
+        **existing,
+        "v": 1,
+        "id": existing.get("id") or envelope.get("id") or core_util._new_public_id("identity"),
+        "body_ct": envelope["body_ct"],
+        "nonce": envelope["nonce"],
+        "K_user": envelope["K_user"],
+        "enclave_pk_fpr": envelope.get("enclave_pk_fpr", existing.get("enclave_pk_fpr", "")),
+        "visibility": envelope["visibility"],
+        "owner_user_id": envelope["owner_user_id"],
+        "created_at": existing.get("created_at") or now,
+        "updated_at": now,
+        "relationship_started_at": existing.get("relationship_started_at", ""),
+        "relationship_anchor_source": existing.get("relationship_anchor_source", ""),
+        "relationship_anchor_evidence": existing.get("relationship_anchor_evidence", ""),
+        "identity_agent_name_present": bool(payload.get("agent_name")),
+        "identity_dimension_count": len(payload.get("dimensions") or []),
+    }
+    if envelope.get("K_enclave"):
+        identity_doc["K_enclave"] = envelope["K_enclave"]
+    identity_service._save_identity(store, identity_doc)
+    boot_gates._log_bootstrap_event(store, "genesis_identity_replaced_v1", success=True)
+    identity_service._append_identity_change(store, {
+        "action": "replace",
+        "reason": "Identity replaced from explicit Genesis identity update.",
+    })
+    return "updated"
 
 
 def write_persona_artifact(store: UserStore, job_id: str, output: dict) -> tuple[str, str]:
