@@ -204,6 +204,11 @@ services:
       # to the background. Prod compose deliberately omits this (keeps the v1
       # one-shot path) until test validation. Read in worker.genesis_v2_enabled().
       FEEDLING_GENESIS_V2_ENABLED: "true"
+      # TEST-ONLY: genesis Round2 combined-map — one per-chunk call extracts fact+voice
+      # together (fewer LLM calls) + voice/persona to foreground. Read in
+      # worker.genesis_combined_map_enabled(). Flip off to revert to the exact old
+      # split-map path (hard rollback). On test for real-device quality comparison.
+      FEEDLING_GENESIS_COMBINED_MAP: "true"
       # Mirrors the agent-runner's flag: the hosted cutover decision lives in the
       # backend, so it needs the same value — gateway-only providers stay legacy
       # (inline) until the in-CVM LiteLLM gateway is actually on. Encrypted env,
