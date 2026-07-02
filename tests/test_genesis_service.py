@@ -830,3 +830,12 @@ def test_apply_memory_outputs_skips_incomplete_memory_items(monkeypatch):
     assert results == [{"memory": {"id": "m1"}}]
     assert len(calls) == 1
     assert calls[0][0]["memory"]["summary"] == "User likes direct feedback"
+
+
+def test_public_stage_maps_plaintext_reducer_to_friendly_phases():
+    # plaintext_reducer / _done are set before the v2 gate (routes.py), so they can leak
+    # to the client at job start; map them so iOS never shows the raw stage name.
+    assert service.public_stage("plaintext_reducer") == "chat_history_importing"
+    assert service.public_stage("plaintext_reducer_done") == "background_importing"
+    assert service.public_stage("genesis_v2_foreground") == "chat_history_importing"  # unchanged
+    assert service.public_stage("unknown_stage") == "unknown_stage"  # passthrough

@@ -40,6 +40,11 @@ _PUBLIC_STAGE_MAP = {
     "genesis_v2_background": "background_importing",
     "genesis_v2_background_deferred": "background_importing",
     "genesis_v2_done": "completed",
+    # v1 / pre-gate stages: set at routes.py before the v2 branch, so they leak even on
+    # v2 at job start (and throughout on a v1 fallthrough). iOS localizedHistoryPhase has
+    # no case for them -> shows the raw "plaintext_reducer" text. Map to friendly phases.
+    "plaintext_reducer": "chat_history_importing",
+    "plaintext_reducer_done": "background_importing",
 }
 
 
