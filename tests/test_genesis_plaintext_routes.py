@@ -24,6 +24,24 @@ def _client(monkeypatch):
     return app.test_client()
 
 
+def _stub_update_identity_persona(monkeypatch):
+    monkeypatch.setattr(routes, "_plaintext_existing_voice_workset_for_update", lambda *_args: {}, raising=False)
+    monkeypatch.setattr(
+        routes.worker,
+        "build_persona_output_from_material",
+        lambda **_kwargs: {
+            "persona": {
+                "content": "## 你是谁\n\n测试 persona",
+                "prompt_version": "7.B",
+                "source_kind": "identity_update",
+                "source_family": "ai_persona",
+            },
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(routes.service, "write_persona_artifact", lambda *_args, **_kwargs: ("user_blob:genesis_persona", "sha-persona"))
+
+
 def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypatch):
     client = _client(monkeypatch)
     payload = {
@@ -578,6 +596,7 @@ def test_update_identity_mode_replaces_identity_without_writing_memory(monkeypat
         "_derive_identity_with_provider",
         lambda *_args, **_kwargs: ({"agent_name": "乔伊", "dimensions": [{"name": "活泼", "description": "ENFP"}]}, []),
     )
+    _stub_update_identity_persona(monkeypatch)
     monkeypatch.setattr(routes.service, "replace_identity_preserving_anchor", lambda _store, output: calls.update({"identity_output": output}) or "updated")
     monkeypatch.setattr(routes.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
     monkeypatch.setattr(
@@ -601,6 +620,109 @@ def test_update_identity_mode_replaces_identity_without_writing_memory(monkeypat
     assert calls["completed"]["identity_status"] == "updated"
 
 
+def test_update_identity_rebuilds_persona_from_uploaded_role_card_material(monkeypatch):
+    store = _store()
+    calls: dict = {}
+    monkeypatch.setattr(routes.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    monkeypatch.setattr(routes.identity_service, "_load_identity", lambda _store: {"id": "identity_1"})
+    monkeypatch.setattr(routes.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_identity", "status": "processing"})
+    monkeypatch.setattr(routes.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes.history_import, "_import_language_for_store", lambda _store, _msgs: "zh")
+    monkeypatch.setattr(
+        routes.history_import,
+        "_derive_identity_with_provider",
+        lambda *_args, **_kwargs: ({"agent_name": "乔伊", "dimensions": [{"name": "直爽", "description": "说人话。"}]}, []),
+    )
+    monkeypatch.setattr(
+        routes,
+        "_plaintext_existing_voice_workset_for_update",
+        lambda _store, _api_key: {
+            "behavior_notes": ["短句接住, 不绕弯。"],
+            "exemplars": [{"founding": True, "turns": [{"speaker": "agent", "text": "我直接说。"}]}],
+        },
+        raising=False,
+    )
+
+    def fake_build_persona(**kwargs):
+        calls["persona_kwargs"] = kwargs
+        return {
+            "persona": {
+                "content": "## 你是谁\n\n你叫乔伊, 是一个硬核直爽的 AI 协作者。",
+                "prompt_version": "7.B",
+                "source_kind": "identity_update",
+                "source_family": "ai_persona",
+            },
+            "voice_workset": kwargs["voice_workset"],
+        }
+
+    monkeypatch.setattr(routes.worker, "build_persona_output_from_material", fake_build_persona, raising=False)
+    monkeypatch.setattr(routes.service, "replace_identity_preserving_anchor", lambda _store, output: calls.update({"identity_output": output}) or "updated")
+    monkeypatch.setattr(routes.service, "write_persona_artifact", lambda _store, _job_id, output: calls.update({"persona_output": output}) or ("user_blob:genesis_persona", "sha-new"))
+    monkeypatch.setattr(routes.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
+    monkeypatch.setattr(
+        routes.db,
+        "genesis_complete_job",
+        lambda _user_id, _job_id, **kwargs: calls.update({"completed": kwargs}) or {"job_id": "job_identity", "status": "done"},
+    )
+
+    role_card = "名字：乔伊\n性格：硬核、直爽、懂你的全栈 AI 协作者"
+    routes._run_plaintext_genesis_job(
+        store,
+        "api_key",
+        "job_identity",
+        mode="update_identity",
+        source_groups=[{"source_kind": "ai_persona_import", "source_family": "ai_persona", "chunk_texts": [role_card]}],
+        analysis_messages=[{"role": "user", "content": role_card, "source": "ai_persona_import"}],
+        relationship_anchor={"days_with_user": 9999, "relationship_started_at": "2099-01-01"},
+    )
+
+    assert calls["identity_output"]["identity"]["agent_name"] == "乔伊"
+    assert calls["persona_kwargs"]["persona_material"] == role_card
+    assert "identity" not in calls["persona_kwargs"]["persona_material"].lower()
+    assert calls["persona_kwargs"]["voice_workset"]["behavior_notes"] == ["短句接住, 不绕弯。"]
+    assert calls["completed"]["memory_action_count"] == 0
+    assert calls["completed"]["identity_status"] == "updated"
+    assert calls["completed"]["persona_ref"] == "user_blob:genesis_persona"
+    assert calls["completed"]["persona_sha256"] == "sha-new"
+
+
+def test_update_identity_persona_rebuild_failure_does_not_replace_identity(monkeypatch):
+    store = _store()
+    calls: dict = {}
+    monkeypatch.setattr(routes.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    monkeypatch.setattr(routes.identity_service, "_load_identity", lambda _store: {"id": "identity_1"})
+    monkeypatch.setattr(routes.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_identity", "status": "processing"})
+    monkeypatch.setattr(routes.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(routes.history_import, "_import_language_for_store", lambda _store, _msgs: "zh")
+    monkeypatch.setattr(
+        routes.history_import,
+        "_derive_identity_with_provider",
+        lambda *_args, **_kwargs: ({"agent_name": "乔伊", "dimensions": [{"name": "直爽", "description": "说人话。"}]}, []),
+    )
+    monkeypatch.setattr(routes, "_plaintext_existing_voice_workset_for_update", lambda *_args: {}, raising=False)
+    monkeypatch.setattr(
+        routes.worker,
+        "build_persona_output_from_material",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("provider timeout")),
+        raising=False,
+    )
+    monkeypatch.setattr(routes.service, "replace_identity_preserving_anchor", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not replace identity when persona rebuild fails")))
+    monkeypatch.setattr(routes.db, "genesis_complete_job", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("failed persona rebuild must not complete job")))
+    monkeypatch.setattr(routes.service, "mark_failed", lambda _store, job_id, error: calls.update({"job_id": job_id, "error": error}))
+
+    routes._run_plaintext_genesis_job(
+        store,
+        "api_key",
+        "job_identity",
+        mode="update_identity",
+        source_groups=[{"source_kind": "ai_persona_import", "source_family": "ai_persona", "chunk_texts": ["名字：乔伊"]}],
+        analysis_messages=[{"role": "user", "content": "名字：乔伊", "source": "ai_persona_import"}],
+    )
+
+    assert calls["job_id"] == "job_identity"
+    assert calls["error"].startswith("persona_rebuild_failed:")
+
+
 def test_update_identity_mode_allows_nameless_nonempty_identity(monkeypatch):
     store = _store()
     calls: dict = {}
@@ -614,6 +736,7 @@ def test_update_identity_mode_allows_nameless_nonempty_identity(monkeypatch):
         "_derive_identity_with_provider",
         lambda *_args, **_kwargs: ({"agent_name": "", "dimensions": [{"name": "直爽", "description": "说人话。"}]}, []),
     )
+    _stub_update_identity_persona(monkeypatch)
     monkeypatch.setattr(routes.service, "replace_identity_preserving_anchor", lambda _store, output: calls.update({"identity_output": output}) or "updated")
     monkeypatch.setattr(
         routes.db,
@@ -650,6 +773,12 @@ def test_update_identity_mode_fails_on_empty_identity(monkeypatch):
         routes.history_import,
         "_derive_identity_with_provider",
         lambda *_args, **_kwargs: ({"agent_name": "", "dimensions": [], "self_introduction": "", "category": "", "signature": []}, []),
+    )
+    monkeypatch.setattr(
+        routes.worker,
+        "build_persona_output_from_material",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("empty identity must not rebuild persona")),
+        raising=False,
     )
     monkeypatch.setattr(routes.service, "replace_identity_preserving_anchor", lambda _store, _output: "identity_update_empty")
     monkeypatch.setattr(routes.db, "genesis_complete_job", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("empty identity must not complete job")))
