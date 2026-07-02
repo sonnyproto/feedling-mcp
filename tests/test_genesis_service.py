@@ -754,3 +754,30 @@ def test_apply_memory_outputs_coerces_unknown_memory_type_to_fact(monkeypatch):
     assert results == [{"memory": {"id": "m1"}}]
     assert calls[0][0]["memory"]["type"] == "fact"
     assert reducer_doc["memory_type_counts"] == {"fact": 1}
+
+
+def test_apply_memory_outputs_skips_incomplete_memory_items(monkeypatch):
+    calls = []
+
+    def fake_execute(_store, _api_key, actions):
+        calls.append(actions)
+        return {"status": "ok", "results": [{"memory": {"id": "m1"}}]}, 200
+
+    monkeypatch.setattr(service.memory_actions, "_execute_memory_actions", fake_execute)
+    output = {
+        "memories": [
+            {"type": "fact", "content": "Missing summary should be skipped."},
+            {
+                "type": "fact",
+                "summary": "User likes direct feedback",
+                "content": "User likes direct feedback during planning.",
+            },
+        ]
+    }
+
+    count, results = service.apply_memory_outputs(_store(), "api_key", output)
+
+    assert count == 1
+    assert results == [{"memory": {"id": "m1"}}]
+    assert len(calls) == 1
+    assert calls[0][0]["memory"]["summary"] == "User likes direct feedback"

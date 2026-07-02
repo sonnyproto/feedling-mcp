@@ -391,7 +391,16 @@ def apply_memory_outputs(store: UserStore, api_key: str | None, output: dict) ->
         raw_items = output.get("facts")
     if not isinstance(raw_items, list) or not raw_items:
         return 0, []
-    actions = [_memory_action_from_output(item) for item in raw_items if isinstance(item, dict)]
+    actions: list[dict] = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            actions.append(_memory_action_from_output(item))
+        except ValueError:
+            # LLM reducers can occasionally emit a partial memory object. Keep the
+            # import alive and write the valid cards instead of failing the whole job.
+            continue
     if not actions:
         return 0, []
     results: list[dict] = []
