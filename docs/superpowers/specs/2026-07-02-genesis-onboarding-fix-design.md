@@ -1,6 +1,6 @@
 # Genesis Onboarding 蒸馏修复 + 三入口写范围 + 报错硬化 — 设计方案
 
-状态:待 Codex review → 执行 → CC review
+状态:Codex 已 review(R1-R5 + 6 断言已折进,见各节标注)→ **待 Codex 按此收敛版执行** → CC review
 分支:后端 `feat/genesis-onboarding-fix`(基于 origin/test);iOS `feat/genesis-material-entries`(基于 origin/main,含三个 material sheet)
 
 ---
@@ -54,15 +54,16 @@ iOS `pollGenesisImport`([ChatEmptyStateView.swift:4497](App/FeedlingTest/Pages/C
 
 ## Part 1:后端 — genesis plaintext 变成 mode-aware
 
-### 1.1 引入 mode(三选一)
+### 1.1 引入 mode(三选一)+ 进幂等逻辑(Codex R1)
 `/v1/genesis/imports/plaintext` 请求体加 `mode` 字段:`onboarding` | `add_memory` | `update_identity`。
 
-**向后兼容**:老 app 不传 `mode` 时,后端按 `client_job_id` 前缀兜底推断:
-- `garden-*` → `add_memory`
-- `identity-*` → `update_identity`
-- 其它 / 无 → `onboarding`(默认)
+**向后兼容**:老 app 不传 `mode` 时,后端按 `client_job_id` 前缀兜底**推断** mode:
+- `garden-*` → `add_memory`;`identity-*` → `update_identity`;其它 / 无 → `onboarding`(默认)。
+- 显式 `mode` 优先;前缀**只用于推断出 mode**,不绕过下面的 mode 匹配。
 
-(显式 `mode` 优先;前缀兜底只为老 app 不发版也能对。)
+**mode 必须进幂等 + metadata(否则串入口)**:
+- `mode` 加进 `SAFE_JOB_METADATA_KEYS`(否则 `_safe_job_metadata` 会把它过滤掉),或单列 `genesis_mode` 字段持久化。
+- `_find_reusable_plaintext_job` 复用判定**必须要求 mode 一致**:现在只看 `client_job_id` / `input_hash`,同一份材料先 `add_memory` 再 `update_identity` 时 input_hash 相同 → 会错误复用旧 job 导致第二次不执行。加上 mode 匹配后才不串。
 
 ### 1.2 三种 mode 的写范围
 
@@ -72,11 +73,11 @@ iOS `pollGenesisImport`([ChatEmptyStateView.swift:4497](App/FeedlingTest/Pages/C
 | **add_memory** | ✅ 追加 | ❌ 不碰 | ❌ **不动** | ❌ | ❌ |
 | **update_identity** | ❌ 不写 | ✅ 整张覆盖 | ❌ 不动 | ❌ 不重建 | ❌ |
 
-### 1.3 onboarding mode 的具体改动(= B)
+### 1.3 onboarding mode 的具体改动(= B)(Codex R2 + R3)
 在 `_run_plaintext_genesis_v2`(前台)里:
-- `fact_write` 从"只写 core 3-5 条"改成"**写全量记忆**"(候选已在手,1 次调用)。
-- `identity` / `greeting` 传入的 `memory_cards` 用**全量卡**(不再是 3-5 条 core)。
-- 后台 `_run_plaintext_background_enrichment` **去掉那次重复的 `fact_write`**(记忆已在前台写完);后台只留 voice_map/voice_reduce/persona_build。
+- **前台真正写全量记忆(R2):现在前台对所有 chunk 跑了 `fact_map` 但只对 core 做 `fact_write`**。要改成:前台对 **`all_fact_candidates` 做一次 full `fact_write`**,把候选真正落成全量卡。**不是把 `core_memories` 换个变量名**——中间隔着"对全量候选执行一次写入"这步。
+- `identity` / `greeting` 传入的 `memory_cards` 用**这份 full memory set**(不再是 3-5 条 core)。
+- **后台去掉 fact_write 要从根上省,不是只删调用(R3)**:后台 `_run_plaintext_background_enrichment` 调的 `worker.build_reducer_output_from_texts` **内部仍会跑 `_fact_write`**;只删 `routes.py` 那行 `apply_memory_outputs` → LLM 还是白跑一次(成本 + 402 风险仍在)。正解:**给 worker 加编排开关**(如 `include_memory=False` / `skip_fact_write=True`),后台只跑 voice_map/voice_reduce/persona_build。**只改调用范围,不动 prompt,符合铁律。**
 - 快进契约不变:chat_ready 仍 = identity + greeting + 够记忆;voice/persona 仍在后台,用户不等。
 
 ### 1.4 add_memory mode(决策已锁)
@@ -85,8 +86,11 @@ iOS `pollGenesisImport`([ChatEmptyStateView.swift:4497](App/FeedlingTest/Pages/C
 - **明确跳过**:identity 派生、`_store_identity_payload`、relationship anchor 重算、persona/voice、greeting。
 - 相处天数绝不能被这条路改动(这是之前踩过的坑)。
 
-### 1.5 update_identity mode(决策已锁)
+### 1.5 update_identity mode(决策已锁)(Codex R4)
 - 用上传的 character 材料跑一遍身份派生 → 生成一份身份卡 → **无脑整张覆盖**(blind replace,不合并)。
+- **不能复用 `init_identity_if_absent`**:它有身份时也更新,且 `_relationship_anchor_from_output` **会重算相处天数**(service.py:65),与"绝不动相处天数"冲突。
+- **新做一个 `replace_identity_preserving_anchor`**:只替换加密 body,**保留原 identity 的 `id / created_at / relationship_started_at / relationship_anchor_source / relationship_anchor_evidence`**。
+- **原本没有 identity 时 → 返回 409**(让用户先完成 onboarding,别硬造一张)。
 - **跳过**:memory 写入、relationship anchor 重算、persona/voice 重建。
 - ⚠️ **这是破坏性覆盖,且 dream 不兜底**(见 §1.7):新角色卡没写的旧身份内容**永久丢失**。这是**有意为之**的产品决策(用户主动传新卡=重定义 TA),不是 bug。
 
@@ -122,6 +126,11 @@ iOS 三个 sheet 已存在(origin/main:GardenMaterialSheet / IdentityMaterialShe
 ### 3.2 后端
 - 确认 **stale-job reaping / heartbeat**(zhihao `6c5d5f8`)覆盖 v2 的前台/后台 job:worker 挂/超时的 job 要被标 `failed`(否则 iOS 只能靠 240 次超时兜底)。若没覆盖,补上。
 
+### 3.3 provider 402 别被"假身份"吞掉(Codex R5)
+`foreground_identity.py` 调的 deriver 会把 provider 错误(如 402 欠费)**变成 fallback 身份 + warning**,调用方现在**不处理 warning** → 欠费被当成"身份生成成功"咽下去(这很可能就是"欠费一直 loading / 不知咋回事"的来源)。
+- 修:provider 硬错误(402/额度/鉴权)要**一路冒到顶,把 job 标 `failed`**,**不能写一张 generic 身份当成功**。
+- 前台的"deriver 失败 → fallback"只该用于"模型能连但没抽出身份"这类软情况,**不该盖住 provider 层的硬失败**。
+
 ---
 
 ## 验收标准
@@ -134,6 +143,14 @@ iOS 三个 sheet 已存在(origin/main:GardenMaterialSheet / IdentityMaterialShe
    - update_identity:传新角色卡 → identity 更新,**没新增记忆、相处天数不变**。
    - onboarding:全套齐(identity + 记忆 + anchor + greeting + persona/voice)。
 3. **报错**:人为制造失败(如无 provider 额度)+ 制造卡死(超时)→ UI **明确报错、不无限 loading**,且失败时能看到真实原因。
+
+### 6 条硬断言(Codex,必须写成测试)
+1. **同内容不同 mode 不复用**:同一 input_hash,`add_memory` 后再 `update_identity` → 是**两个 job 都执行**,不被复用跳过。
+2. **add_memory 后 identity 不变**(byte 级/字段级比对)。
+3. **add_memory 后相处天数不变**。
+4. **update_identity 后 memory 条数不变**(没偷写记忆)。
+5. **update_identity 后相处天数 / relationship_started_at 不变**;无 identity 时返回 **409**。
+6. **onboarding 的 full memory 条数明显 > core**(证明前台真写了全量,不是还只写 5 条);且 **provider 402 时 UI 显示真实错误、job=failed**(不是假身份 + 转圈)。
 
 ---
 
