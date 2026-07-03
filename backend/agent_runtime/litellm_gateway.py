@@ -122,7 +122,11 @@ def build_config(entries: list[dict]) -> dict:
         ],
         "litellm_settings": {
             "drop_params": True,
-            "additional_drop_params": ["reasoning", "reasoning_effort", "thinking"],
+            # Preserve OpenAI Responses reasoning params from codex so gateway
+            # providers can emit reasoning summaries. Native Anthropic/DeepSeek
+            # thinking uses the claude driver; gateway backends still drop the
+            # Anthropic-only `thinking` param to avoid 400s.
+            "additional_drop_params": ["thinking"],
         },
         "general_settings": {
             "master_key": "os.environ/" + GATEWAY_KEY_ENV,
