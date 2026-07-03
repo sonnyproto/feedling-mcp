@@ -87,7 +87,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:a9b6770
+    image: ghcr.io/teleport-computer/feedling:22b0ed6
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -146,7 +146,7 @@ services:
   # unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:a9b6770
+    image: ghcr.io/teleport-computer/feedling:22b0ed6
     # gunicorn = production WSGI (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -276,7 +276,7 @@ services:
   # roster (AGENT_RUNTIME_USERS) via the encrypted env channel — no compose change
   # / on-chain re-auth needed. See deploy/DEPLOYMENTS.md.
   agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:a9b6770
+    image: ghcr.io/teleport-computer/feedling-agent-runner:22b0ed6
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
     environment:
@@ -345,3 +345,9 @@ volumes:
     name: feedling_ingress_evidences
   feedling_agent_runtime:
     name: feedling_agent_runtime
+
+# Deploy trigger: this comment touches a path in the deploy-cvm paths-filter
+# (deploy/docker-compose.phala.yaml) so `detect-cvm-changes` sees a CVM change
+# and runs deploy-cvm. It activates the already-present worker config:
+# FEEDLING_BACKEND_WORKERS=4 / FEEDLING_ENCLAVE_WORKERS=2 + the enclave-side
+# FEEDLING_RUNTIME_TOKEN_SECRET wiring (local whoami verify). Safe no-op.

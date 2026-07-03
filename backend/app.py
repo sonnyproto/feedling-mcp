@@ -94,6 +94,7 @@ from tracking import routes as tracking_routes
 import chat as chat_pkg
 import identity as identity_pkg
 import memory as memory_pkg
+import worldbook as worldbook_pkg
 import proactive as proactive_pkg
 from bootstrap import gates as boot_gates
 from bootstrap import routes as bootstrap_routes
@@ -419,6 +420,7 @@ push_pkg.register(app)
 proactive_pkg.register(app)
 identity_pkg.register(app)
 memory_pkg.register(app)
+worldbook_pkg.register(app)
 bootstrap_pkg.register(app)
 genesis_pkg.register(app)
 chat_pkg.register(app)

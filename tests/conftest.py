@@ -109,6 +109,8 @@ if not _provisioned:
         "test_agent_runtime_spawners.py",
         "test_agent_runtime_resident_contract.py",
         "test_hosted_agent_runtime_cutover.py",
+        "test_worldbook_match.py",
+        "test_worldbook_readside_core.py",
     }
     collect_ignore = sorted(
         f

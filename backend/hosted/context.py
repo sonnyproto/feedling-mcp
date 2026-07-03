@@ -16,9 +16,10 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 import httpx
-from flask import Blueprint, Response, jsonify, request, g
+from flask import Blueprint, Response, jsonify, request, g, has_request_context
 
 import db
+import debug_trace
 from core import enclave as core_enclave
 from perception import snapshot_for_wake as _perception_wake_snapshot
 from core.store import UserStore
@@ -56,6 +57,7 @@ from content_encryption import build_envelope
 from screen import frames as screen_frames
 from hosted import history_import as hosted_history_import
 from hosted import turn as hosted_turn
+import worldbook_readside_core
 
 
 def _model_api_should_attach_screen(message: str, include_flag: bool) -> bool:
@@ -67,6 +69,44 @@ def _model_api_should_attach_screen(message: str, include_flag: bool) -> bool:
         "current app", "current page", "屏幕", "截图", "现在这个", "帮我看",
     )
     return any(cue in text for cue in cues)
+
+
+def _model_api_worldbook_context(
+    store: UserStore,
+    api_key: str | None,
+    recent_messages: list[dict],
+    user_message: str,
+) -> dict:
+    with store.world_books_lock:
+        world_books = [dict(item) for item in getattr(store, "world_books", [])]
+    if not world_books:
+        return {"block": "", "matched_names": [], "rejected_over_cap": [], "unavailable_ids": []}
+    messages = list(recent_messages or [])
+    if user_message and not (
+        messages
+        and str(messages[-1].get("role") or "") == "user"
+        and str(messages[-1].get("content") or "") == user_message
+    ):
+        messages.append({"role": "user", "content": user_message})
+    runtime_token = None
+    if has_request_context():
+        runtime_token = request.headers.get("X-Feedling-Runtime-Token", "").strip() or None
+    try:
+        result = worldbook_readside_core.post_enclave_worldbook_match(
+            api_key,
+            world_books,
+            messages,
+            runtime_token=runtime_token,
+        )
+    except Exception as e:
+        print(f"[worldbook:{store.user_id}] match failed: {type(e).__name__}: {e}")
+        return {"block": "", "matched_names": [], "rejected_over_cap": [], "unavailable_ids": []}
+    return {
+        "block": str(result.get("block") or ""),
+        "matched_names": result.get("matched_names") if isinstance(result.get("matched_names"), list) else [],
+        "rejected_over_cap": result.get("rejected_over_cap") if isinstance(result.get("rejected_over_cap"), list) else [],
+        "unavailable_ids": result.get("unavailable_ids") if isinstance(result.get("unavailable_ids"), list) else [],
+    }
 
 
 def _model_api_context_messages(
@@ -97,6 +137,7 @@ def _model_api_context_messages(
     identity = {}
     if isinstance(identity_data, dict) and isinstance(identity_data.get("identity"), dict):
         identity = identity_data["identity"]
+    world_book = _model_api_worldbook_context(store, api_key, recent_messages, user_message)
     pending_state_updates = [
         hosted_turn._state_pending_public_summary(item)
         for item in hosted_turn._state_pending_items(store)[:5]
@@ -159,6 +200,11 @@ def _model_api_context_messages(
         "identity": identity_summary,
         "context_memories": context_memories[:8],
         "context_memory_trace": context_memory_trace,
+        "world_book": {
+            "matched_names": world_book["matched_names"],
+            "rejected_over_cap": world_book["rejected_over_cap"],
+            "unavailable_ids": world_book["unavailable_ids"],
+        },
         "screen_context": screen_context,
         "screen_image_attached": bool(screen_images),
         "pending_state_updates": pending_state_updates,
@@ -173,6 +219,17 @@ def _model_api_context_messages(
     }
     prompt_context_payload = dict(context_payload)
     prompt_context_payload.pop("context_memory_trace", None)
+    if world_book["block"]:
+        prompt_context_payload["world_book_block"] = world_book["block"]
+        if debug_trace.is_enabled(store):
+            debug_trace.trace_event(
+                store,
+                subsystem="worldbook",
+                type="worldbook_injected",
+                actor="host_agent_runtime",
+                summary=f"worldbook injected {len(world_book['matched_names'])} entries",
+                detail={"names": world_book["matched_names"]},
+            )
     if context_memory_trace:
         prompt_selection = {}
         selected_trace = context_memory_trace.get("selected") if isinstance(context_memory_trace.get("selected"), list) else []

@@ -78,6 +78,11 @@ def _seed_all_per_user_tables(user_id: str) -> None:
             "VALUES (%s, 'job1', 'persona')",
             (user_id,),
         )
+        conn.execute(
+            "INSERT INTO world_book_entries (user_id, entry_id, updated_at, doc) "
+            "VALUES (%s, 'wb1', '2026-07-03T00:00:00', '{}'::jsonb)",
+            (user_id,),
+        )
 
 
 _PER_USER_TABLES = (
@@ -87,6 +92,7 @@ _PER_USER_TABLES = (
     "genesis_import_jobs",
     "genesis_import_chunks",
     "genesis_import_outputs",
+    "world_book_entries",
 )
 
 
