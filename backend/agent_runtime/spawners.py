@@ -255,9 +255,20 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
     grant = ",".join(_claude_allow_rules(io_cli, home))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
     return (
-        f"claude --allowed-tools '{grant}' "
+        f"claude {_CLAUDE_PERMISSION_FLAG} --allowed-tools '{grant}' "
         f"--append-system-prompt-file {prompt_file} -p {{message}}"
     )
+
+
+# `claude -p` (esp. --output-format stream-json, the thinking path) DENIES its own
+# allow-listed Read of the decrypted chat image unless a non-interactive permission
+# mode is set on the CLI — the allow rule alone (or in settings.json) is treated as a
+# hint and the default mode auto-denies file reads with no interactive approver, so a
+# vision model hallucinates ("I need permission to see the image"). acceptEdits makes
+# the pre-granted allowlist honored non-interactively WITHOUT the blanket
+# --dangerously-skip-permissions (codex-style bypass); Bash stays scoped to io_cli.
+# (Verified in-CVM + locally on claude-code 2.1.195, sonnet-4-5 image turns.)
+_CLAUDE_PERMISSION_FLAG = "--permission-mode acceptEdits"
 
 
 def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
@@ -269,8 +280,8 @@ def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
     grant = ",".join(_claude_allow_rules(io_cli, home))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
     return (
-        "claude --verbose --output-format stream-json --include-partial-messages "
-        f"--effort high --allowed-tools '{grant}' "
+        f"claude {_CLAUDE_PERMISSION_FLAG} --verbose --output-format stream-json "
+        f"--include-partial-messages --effort high --allowed-tools '{grant}' "
         f"--append-system-prompt-file {prompt_file} -p {{message}}"
     )
 
@@ -339,7 +350,19 @@ def agent_home_files(
             files[f"{home}/codex-home/config.toml"] = _codex_gateway_config(
                 base_url=gateway_base_url, model=model)
     else:
-        settings = {"permissions": {"allow": _claude_allow_rules(io_cli, home)}}
+        # defaultMode acceptEdits is REQUIRED, not cosmetic: a settings.json that
+        # carries `permissions.allow` but no defaultMode makes `claude -p` (esp. in
+        # --output-format stream-json, the thinking path) DENY the allow-listed
+        # Read of the decrypted chat image ("I need permission to see the image") —
+        # the allow rules are treated as hints and the default mode auto-denies
+        # non-interactively. acceptEdits makes the pre-granted allowlist actually
+        # honored without a prompt. (Verified in-CVM: sonnet-4-5 image turns.)
+        settings = {
+            "permissions": {
+                "defaultMode": "acceptEdits",
+                "allow": _claude_allow_rules(io_cli, home),
+            }
+        }
         files[f"{home}/claude-home/settings.json"] = json.dumps(settings, indent=2)
     return files
 

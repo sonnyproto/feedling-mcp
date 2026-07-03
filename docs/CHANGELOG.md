@@ -49,6 +49,22 @@
 
 ## 2026-07-04
 
+### [BLOCKER→FIXED] claude 有 Read 授权仍"没权限读图"——非交互缺 permission-mode → 幻觉
+
+单 runner + wedge 修好后,claude(sonnet-4-5)发图**仍"我需要权限才能读取这张图片"**。
+本地用部署完全同款命令 + claude-code 2.1.195 复现并二分定位:**即便 `Read({home}/images/**)`
+在 `--allowed-tools` 和 settings.json 里都有**,`claude -p`(尤其 `--output-format stream-json`
+的 thinking 路径)在**非交互**下仍**拒绝自己的 Read**——allow 规则被当"提示",默认 permission
+模式无交互审批者时对文件读 auto-deny,vision 模型于是**瞎编**(实测回过"棒棒糖小熊",探针图实为
+蓝底黄框 MANGO-7391)。二分结论:元凶是缺 permission-mode,不是授权缺失;`--allowed-tools` 单独
+(无 settings.json)反而能读,加了 settings.json 的 `permissions.allow` 但没 `defaultMode` 才触发拒绝。
+
+修:两个 claude 命令 builder 都加 **`--permission-mode acceptEdits`**(`spawners.py`,
+`_CLAUDE_PERMISSION_FLAG`),外加 settings.json 的 `permissions.defaultMode=acceptEdits`。这是能让
+预授权 allowlist 在非交互下被认可的**最小权限**做法,不用 `--dangerously-skip-permissions`
+那种 codex 式全 bypass;Bash 仍限定 io_cli。实测:同款命令现在正确读出图(暗号+配色),不再幻觉。
+1512 passed。教训:claude headless 读文件要显式给 permission-mode,光有 allow 规则/settings 不够。
+
 ### [BLOCKER→FIXED] 测试用户切 claude 后"没响应" — checkpoint wedge + 测试 runner 改单节点
 
 修完 thinking-claude Read 后,测试用户切 claude 发图**仍没响应**(连报错都没有)。SSH 进测试
