@@ -415,23 +415,34 @@ _HEADERS = {
 }
 
 
+def _post_debug_trace_event(payload: dict) -> None:
+    """Actual network call for a debug-trace event. Runs on a background
+    thread (see `_emit_debug_trace`) — never raises, short timeout."""
+    try:
+        httpx.post(
+            f"{FEEDLING_API_URL}/v1/debug/trace/event",
+            json=payload,
+            headers=_HEADERS, timeout=2,
+        )
+    except Exception:
+        pass  # observability must never affect the turn
+
+
 def _emit_debug_trace(subsystem: str, type: str, *, status: str = "ok",
                       summary: str = "", explain: str = "", detail: dict | None = None,
                       content_excerpt: dict | None = None, trace_id: str = "",
                       dur_ms: float | None = None) -> None:
-    """Fire-and-forget flow-trace emit. Best-effort: short timeout, never raises,
-    never blocks a turn. The backend gates + drops it if debug is off."""
+    """Fire-and-forget flow-trace emit. Offloads the POST to a daemon thread
+    and returns immediately, so it never blocks or slows a turn — even if the
+    backend is slow/unreachable. The backend gates + drops it if debug is off."""
     try:
-        httpx.post(
-            f"{FEEDLING_API_URL}/v1/debug/trace/event",
-            json={"event": {
-                "subsystem": subsystem, "type": type, "status": status,
-                "summary": summary, "explain": explain, "detail": detail or {},
-                "content_excerpt": content_excerpt or {}, "trace_id": trace_id,
-                "turn_id": trace_id, "actor": "vps_resident", "dur_ms": dur_ms,
-            }},
-            headers=_HEADERS, timeout=3,
-        )
+        payload = {"event": {
+            "subsystem": subsystem, "type": type, "status": status,
+            "summary": summary, "explain": explain, "detail": detail or {},
+            "content_excerpt": content_excerpt or {}, "trace_id": trace_id,
+            "turn_id": trace_id, "actor": "vps_resident", "dur_ms": dur_ms,
+        }}
+        threading.Thread(target=_post_debug_trace_event, args=(payload,), daemon=True).start()
     except Exception:
         pass  # observability must never affect the turn
 
