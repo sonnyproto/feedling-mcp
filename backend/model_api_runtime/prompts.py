@@ -19,6 +19,9 @@ def build_foreground_chat_messages(
     durable-state rules. The imported agent profile, identity, memory, and chat
     history own the companion persona.
     """
+    world_book_block = str(context_payload.get("world_book_block") or "").strip()
+    visible_context_payload = dict(context_payload)
+    visible_context_payload.pop("world_book_block", None)
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
@@ -42,9 +45,14 @@ def build_foreground_chat_messages(
         },
         {
             "role": "system",
-            "content": "Feedling runtime context JSON:\n" + json.dumps(context_payload, ensure_ascii=False)[:12000],
+            "content": "Feedling runtime context JSON:\n" + json.dumps(visible_context_payload, ensure_ascii=False)[:12000],
         },
     ]
+    if world_book_block:
+        messages.append({
+            "role": "system",
+            "content": "World book context:\n" + world_book_block,
+        })
     for msg in recent_messages[-14:]:
         content = str(msg.get("content") or "").strip()
         if not content:
