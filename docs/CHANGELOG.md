@@ -47,6 +47,20 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-04
+
+### [BLOCKER→FIXED] 图片修复不完整:thinking-claude 命令漏了 Read 授权（claude 仍看不到图）
+
+PR #40 合并部署后,用户切 anthropic/claude-sonnet-4-5 实测**仍"没获得看图片的权限"**。
+SSH 进测试 runner CVM 读到实况:该 claude consumer 的 `--allowed-tools`(AGENT_CLI_CMD)里
+**没有 Read**,而 settings.json 里**有**——`claude -p` 下 `--allowed-tools` 覆盖 settings.json,
+故 Read 被拒。真因:除 `_default_cli_cmd` 外还有一条 **`_default_thinking_claude_cmd`**
+(stream-json/effort,`_claude_cli_should_stream_thinking` 判定 deepseek + anthropic 的
+sonnet-4/opus-4/3-7 走它),它仍用 `_io_cli_allow_rules`(无 Read)——#40 只补了非 thinking 分支
+与 settings.json,漏了这条。修:thinking 分支也改用 `_claude_allow_rules(io_cli, home)`
+(`spawners.py`,一行 + 两个 thinking 测试加 Read 断言)。三处 claude 授权点(非thinking/thinking/
+settings)现已统一带图片 Read。教训:改 claude 授权要覆盖**所有** claude 命令 builder。1487 passed。
+
 ## 2026-07-03
 
 ### [DONE] 聊天 AI「看不到图片/截图/屏幕共享」— cli 路径像素从没喂进模型（API+VPS 双中招）

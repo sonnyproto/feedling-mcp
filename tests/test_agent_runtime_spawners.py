@@ -51,6 +51,9 @@ def test_consumer_env_uses_stream_json_for_deepseek_claude_thinking():
     assert "--output-format stream-json" in cmd
     assert "--include-partial-messages" in cmd
     assert "--effort high" in cmd
+    # the thinking-claude command must ALSO grant Read on the image temp dir, or a
+    # thinking model (deepseek/sonnet-4) can't open chat images (Read denied under -p)
+    assert "Read(/agent-data/users/u_1/images/**)" in cmd
     assert env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
     assert env["ANTHROPIC_MODEL"] == "deepseek-v4-pro"
 
@@ -73,6 +76,9 @@ def test_consumer_env_uses_stream_json_for_native_anthropic_sonnet_thinking():
     assert "--output-format stream-json" in cmd
     assert "--include-partial-messages" in cmd
     assert "--effort high" in cmd
+    # thinking-claude must grant Read on the image dir too (sonnet-4-5 is a thinking
+    # model → this branch → otherwise chat images are invisible: Read denied)
+    assert "Read(/agent-data/users/u_1/images/**)" in cmd
     assert "ANTHROPIC_BASE_URL" not in env
     assert env["ANTHROPIC_MODEL"] == "claude-sonnet-4-5"
 

@@ -262,7 +262,11 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
 
 def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
     """Claude Code exposes thinking blocks in stream-json output."""
-    grant = ",".join(_io_cli_allow_rules(io_cli))
+    # Same allowlist as the non-thinking claude cmd: io_cli verbs + Read on the
+    # decrypted-image dir. Without the Read rule a thinking model (deepseek /
+    # sonnet-4 / opus-4 / 3-7) runs `claude -p` with no image permission and denies
+    # its own Read of the chat image ("I need permission to see the image").
+    grant = ",".join(_claude_allow_rules(io_cli, home))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
     return (
         "claude --verbose --output-format stream-json --include-partial-messages "
