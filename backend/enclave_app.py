@@ -66,6 +66,7 @@ from dstack_sdk import DstackClient
 from dstack_tls import derive_tls_cert_and_key, TLS_KEY_PATH
 
 import provider_client
+import worldbook_readside_core
 
 
 # ---------------------------------------------------------------------------
@@ -1357,6 +1358,47 @@ def v1_memory_fetch():
         "unavailable_ids": unavailable_ids,
         "blocked_sensitive_ids": [mid for mid in blocked_sensitive_ids if mid],
     })
+
+
+@app.route("/v1/worldbook/match", methods=["POST"])
+def v1_worldbook_match():
+    _api_key, authorized_user_id, content_sk, error = _memory_readside_auth_context()
+    if error is not None:
+        body, status = error
+        return jsonify(body), status
+    payload = request.get_json(silent=True) or {}
+    envelopes = payload.get("world_books")
+    if not isinstance(envelopes, list):
+        return jsonify({"error": "world_books must be a list"}), 400
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return jsonify({"error": "messages must be a list"}), 400
+
+    entries: list[dict] = []
+    unavailable_ids: list[str] = []
+    for envelope in envelopes:
+        if not isinstance(envelope, dict):
+            continue
+        entry_id = str(envelope.get("id") or "")
+        if envelope.get("visibility") == "local_only" or not envelope.get("K_enclave"):
+            if entry_id:
+                unavailable_ids.append(entry_id)
+            continue
+        try:
+            plaintext = _decrypt_envelope(envelope, authorized_user_id or "", content_sk)
+            inner = json.loads(plaintext.decode("utf-8"))
+            if not isinstance(inner, dict):
+                raise ValueError("world book plaintext is not an object")
+        except (DecryptFailure, json.JSONDecodeError, ValueError):
+            if entry_id:
+                unavailable_ids.append(entry_id)
+            continue
+        entries.append(inner)
+
+    response = worldbook_readside_core.build_block(entries, messages)
+    response["user_id"] = authorized_user_id
+    response["unavailable_ids"] = unavailable_ids
+    return jsonify(response)
 
 
 @app.route("/v1/chat/history", methods=["GET"])
