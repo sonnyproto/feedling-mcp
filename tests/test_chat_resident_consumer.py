@@ -146,7 +146,7 @@ def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monk
     msg = {"id": "user-msg-v2", "role": "user", "content": "天气怎么样？", "ts": 1112.0}
     captured = {}
 
-    def fake_call(message, images=None, image_paths=None):
+    def fake_call(message, images=None, image_paths=None, trace_id=""):
         captured["message"] = message
         return {"messages": ["外面下雨。"]}
 

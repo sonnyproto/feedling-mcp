@@ -2962,7 +2962,12 @@ def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", 
     )
 
 
-def call_agent_cli(message: str, image_paths: list[str] | None = None, raw_text: bool = False) -> Any:
+def call_agent_cli(
+    message: str,
+    image_paths: list[str] | None = None,
+    raw_text: bool = False,
+    trace_id: str = "",
+) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
 
@@ -2970,16 +2975,37 @@ def call_agent_cli(message: str, image_paths: list[str] | None = None, raw_text:
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     _turn_t0 = time.monotonic()
+    _emit_debug_trace("agent", "agent.model.call.start", trace_id=trace_id,
+                      summary="cli turn start",
+                      explain="模型调用发起（" + ("codex" if _is_codex_cmd(cmd) else "claude") + "）",
+                      content_excerpt={"prompt_head": (message or "")[:1000]})
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
+        _emit_debug_trace("agent", "agent.model.call.error", status="error", trace_id=trace_id,
+                          dur_ms=(time.monotonic() - _turn_t0) * 1000,
+                          summary="cli turn timeout", explain="模型调用超时（120s 上限）— 卡在模型这一步")
         log.warning(
             "[turn-timing] driver=%s rc=timeout wall_ms=%d (hit 120s subprocess cap)",
             "codex" if _is_codex_cmd(cmd) else "claude",
             int((time.monotonic() - _turn_t0) * 1000),
         )
         raise
-    _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
+    _wall_ms = int((time.monotonic() - _turn_t0) * 1000)
+    _log_cli_turn_timing(cmd, result, _wall_ms)
+    _m = _cli_turn_metrics(cmd, result, _wall_ms)
+    _emit_debug_trace(
+        "agent", "agent.model.call.done" if result.returncode == 0 else "agent.model.call.error",
+        status="ok" if result.returncode == 0 else "error", trace_id=trace_id, dur_ms=_wall_ms,
+        summary=f"cli turn rc={result.returncode} {_m['driver']}",
+        explain=(f"模型返回（{_m['driver']}，{_wall_ms}ms" +
+                 (f"，{_m['num_turns']} 轮" if _m.get('num_turns') else "") + "）"
+                 if result.returncode == 0 else f"模型调用失败 rc={result.returncode}"),
+        detail={k: _m[k] for k in ("driver", "rc", "agent_ms", "api_ms", "num_turns",
+                                   "steps", "input_tokens", "output_tokens")},
+        content_excerpt={"reply_head": (result.stdout or "")[:1000],
+                         "stderr_head": (result.stderr or "")[:500]},
+    )
 
     raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
     observed_sid = _extract_session_id(raw_transport) or command_sid
@@ -3123,11 +3149,14 @@ def call_agent(
     images: list[dict[str, str]] | None = None,
     image_paths: list[str] | None = None,
     raw_text: bool = False,
+    trace_id: str = "",
 ) -> Any:
     if AGENT_MODE == "http":
+        # http path metrics/timing are out of scope for this event pair (cli-only);
+        # trace_id is accepted here for a uniform call signature but unused.
         raw = call_agent_http(message, images=images, raw_text=raw_text)
     elif AGENT_MODE == "cli":
-        raw = call_agent_cli(message, image_paths=image_paths, raw_text=raw_text)
+        raw = call_agent_cli(message, image_paths=image_paths, raw_text=raw_text, trace_id=trace_id)
     else:
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
@@ -6060,7 +6089,14 @@ def _process_messages(messages: list) -> float:
         else:
             log.info("user message [ts=%.3f]: %s", ts, content[:80])
 
+        trace_id = str(msg.get("id") or msg.get("message_id") or "").strip()
+
         screen_text, screen_payloads, screen_paths = _screen_context_for_message(content)
+        screen_attached = bool(screen_payloads or screen_paths)
+        _emit_debug_trace("context", "context.build", trace_id=trace_id,
+                          summary="context assembled",
+                          explain=("本轮附加了屏幕上下文" if screen_attached else "本轮未附加屏幕上下文"),
+                          detail={"screen_attached": screen_attached})
         if screen_text:
             content = f"{content}\n\n{screen_text}"
             image_payloads.extend(screen_payloads)
@@ -6087,15 +6123,16 @@ def _process_messages(messages: list) -> float:
         use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
         try:
             if use_runtime_v2:
-                agent_result = call_agent(_resident_foreground_chat_message_v2(content))
+                agent_result = call_agent(_resident_foreground_chat_message_v2(content), trace_id=trace_id)
             elif image_payloads or image_paths:
                 agent_result = call_agent(
                     content,
                     images=image_payloads,
                     image_paths=image_paths,
+                    trace_id=trace_id,
                 )
             else:
-                agent_result = call_agent(content)
+                agent_result = call_agent(content, trace_id=trace_id)
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
             if SEND_FALLBACK_ON_AGENT_ERROR:
