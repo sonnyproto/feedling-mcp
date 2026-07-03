@@ -1143,6 +1143,31 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
     return "\n".join(parts), payloads, paths
 
 
+def _worldbook_context_for_foreground(content: str) -> str:
+    text = str(content or "").strip()
+    if not text:
+        return ""
+    try:
+        resp = httpx.post(
+            f"{FEEDLING_API_URL}/v1/worldbook/match",
+            headers=_HEADERS,
+            json={"message": text},
+            timeout=20,
+        )
+        if resp.status_code == 404:
+            return ""
+        resp.raise_for_status()
+        body = resp.json()
+        block = str((body or {}).get("block") or "").strip()
+        if block:
+            names = (body or {}).get("matched_names") or []
+            log.info("worldbook context injected names=%s", names)
+        return block
+    except Exception as exc:
+        log.warning("worldbook context fetch failed: %s", exc)
+        return ""
+
+
 def _screen_context_for_frame_ids(frame_ids: list[str]) -> tuple[str, list[dict[str, str]], list[str]]:
     """Attach the concrete frames named by a proactive wake job."""
     frame_ids = [str(fid).strip() for fid in (frame_ids or []) if str(fid).strip()]
@@ -5893,6 +5918,9 @@ def _process_messages(messages: list) -> float:
                 ts,
                 len(screen_payloads),
             )
+        worldbook_text = _worldbook_context_for_foreground(content)
+        if worldbook_text:
+            content = f"World book context:\n{worldbook_text}\n\n{content}"
 
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.

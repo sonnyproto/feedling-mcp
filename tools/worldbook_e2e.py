@@ -15,10 +15,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import secrets
+import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -146,7 +151,7 @@ def _check(label: str, condition: bool, detail: str = "") -> None:
     raise SystemExit(f"{FAIL} {label}{suffix}")
 
 
-def _setup_hosted_account(client: SmokeClient, sess, provider: str, cfg: dict) -> str:
+def _setup_hosted_account(client: SmokeClient, sess, provider: str, cfg: dict, *, open_gate: bool = True) -> str:
     last_detail = ""
     for model in cfg["models"]:
         try:
@@ -159,9 +164,74 @@ def _setup_hosted_account(client: SmokeClient, sess, provider: str, cfg: dict) -
         raise SystemExit(f"{FAIL} model_api/setup failed for {provider}: {last_detail}")
     client.init_identity(sess)
     driver = client.enable_hosting(sess)
-    client.open_chat_gate(sess)
+    if open_gate:
+        client.open_chat_gate(sess)
     print(f"{PASS} hosted account ready driver={driver}")
     return driver
+
+
+class _FakeAgentHandler(BaseHTTPRequestHandler):
+    def do_POST(self):  # noqa: N802 - stdlib callback name
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        self.rfile.read(length)
+        body = json.dumps({"response": "WORLD_BOOK_E2E_MARKER fake agent reply"}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):  # noqa: A003 - stdlib callback name
+        return
+
+
+@contextmanager
+def _fake_agent_server():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeAgentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@contextmanager
+def _resident_consumer(api_url: str, api_key: str, agent_url: str):
+    with tempfile.TemporaryDirectory(prefix="worldbook-e2e-") as tmp:
+        env = os.environ.copy()
+        env.update({
+            "FEEDLING_API_URL": api_url.rstrip("/"),
+            "FEEDLING_API_KEY": api_key,
+            "AGENT_MODE": "http",
+            "AGENT_HTTP_URL": agent_url,
+            "AGENT_HTTP_FIELD": "response",
+            "AGENT_HTTP_PROTOCOL": "simple",
+            "CHECKPOINT_FILE": str(Path(tmp) / "checkpoint.json"),
+            "PROACTIVE_POLL_ENABLED": "0",
+            "PROACTIVE_TICK_ENABLED": "0",
+            "PROACTIVE_SCHEDULED_FIRE_ENABLED": "0",
+            "LOG_LEVEL": "WARNING",
+            "POLL_TIMEOUT": "5",
+        })
+        proc = subprocess.Popen(
+            [sys.executable, str(ROOT / "tools" / "chat_resident_consumer.py")],
+            cwd=str(ROOT),
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+        try:
+            yield proc
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
 
 
 def _wait_for_worldbook_trace(client: SmokeClient, api_key: str, name: str, timeout: float) -> dict:
@@ -190,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--provider", default="")
     parser.add_argument("--api-key", default=os.environ.get("FEEDLING_WORLDBOOK_E2E_API_KEY", ""))
     parser.add_argument("--skip-chat", action="store_true", help="Only test encrypted storage/list/delete + over-cap validation.")
+    parser.add_argument("--start-consumer", action="store_true", help="Start a local resident consumer and fake HTTP agent for the chat injection check.")
     parser.add_argument("--timeout", type=float, default=180.0)
     args = parser.parse_args(argv)
 
@@ -258,14 +329,25 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{PASS} skipped hosted chat injection check")
     else:
         if not args.api_key:
-            _setup_hosted_account(client, sess, provider, cfg)
+            driver = _setup_hosted_account(client, sess, provider, cfg, open_gate=not args.start_consumer)
+            if args.start_consumer:
+                print(f"{PASS} local resident consumer requested driver={driver}")
         client._req("DELETE", "/v1/debug/trace", api_key=sess.api_key)
         status, body = client._req("POST", "/v1/debug/trace/enable", api_key=sess.api_key, body={"enabled": True})
         _check("debug trace enabled", status == 200 and body.get("enabled") is True, str(body))
 
-        sent = client.send(sess, f"Please use context for {token}. Reply briefly.")
-        _check("chat/send accepted hosted turn", bool(sent.get("user_message")), str(sent))
-        event = _wait_for_worldbook_trace(client, sess.api_key, name, args.timeout)
+        if args.start_consumer:
+            with _fake_agent_server() as agent_url, _resident_consumer(args.base_url, sess.api_key, agent_url):
+                print(f"{PASS} local fake agent ready")
+                client.open_chat_gate(sess)
+                print(f"{PASS} hosted chat gate passed")
+                sent = client.send(sess, f"Please use context for {token}. Reply briefly.")
+                _check("chat/send accepted hosted turn", bool(sent.get("user_message")), str(sent))
+                event = _wait_for_worldbook_trace(client, sess.api_key, name, args.timeout)
+        else:
+            sent = client.send(sess, f"Please use context for {token}. Reply briefly.")
+            _check("chat/send accepted hosted turn", bool(sent.get("user_message")), str(sent))
+            event = _wait_for_worldbook_trace(client, sess.api_key, name, args.timeout)
         print(f"{PASS} worldbook_injected trace observed summary={event.get('summary')!r}")
 
     status, body = client._req("DELETE", f"/v1/worldbook/delete?id={entry_id}", api_key=sess.api_key)

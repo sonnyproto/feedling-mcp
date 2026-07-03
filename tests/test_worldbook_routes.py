@@ -153,3 +153,37 @@ def test_worldbook_upsert_rejects_when_enclave_cannot_validate_envelope(client, 
     assert res.status_code == 400
     assert res.get_json() == {"error": "worldbook_validate_failed", "id": "bad-env"}
     assert client.get("/v1/worldbook/list", headers=_headers(api_key)).get_json() == {"envelopes": []}
+
+
+def test_worldbook_match_calls_enclave_with_stored_envelopes(client, monkeypatch):
+    user_id, api_key = _register(client)
+    upsert = client.post("/v1/worldbook/upsert", json=_env(user_id, "wb-match"), headers=_headers(api_key))
+    assert upsert.status_code == 200
+
+    def fake_match(api_key_arg, world_books, messages, *, runtime_token=None):
+        assert api_key_arg == api_key
+        assert [item["id"] for item in world_books] == ["wb-match"]
+        assert messages == [{"role": "user", "content": "hello trigger"}]
+        return {
+            "block": "<world_book>\nhello\n</world_book>",
+            "matched_names": ["Match"],
+            "rejected_over_cap": [],
+            "unavailable_ids": [],
+        }
+
+    monkeypatch.setattr(
+        worldbook_routes.worldbook_readside_core,
+        "post_enclave_worldbook_match",
+        fake_match,
+    )
+
+    res = client.post(
+        "/v1/worldbook/match",
+        json={"message": "hello trigger"},
+        headers=_headers(api_key),
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["block"] == "<world_book>\nhello\n</world_book>"
+    assert body["matched_names"] == ["Match"]
