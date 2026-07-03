@@ -1933,6 +1933,7 @@ def delete_user_data(user_id: str) -> None:
                 for table in (
                     "chat_messages",
                     "memory_moments",
+                    "world_book_entries",
                     "frame_envelopes",
                     "user_logs",
                     "user_blobs",
