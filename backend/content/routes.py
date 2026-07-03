@@ -408,18 +408,21 @@ def content_rewrap_to_current_key():
         "summary": summary,
         "results": results,
     }
-
-    if summary["total_errors"] > 0:
-        response["status"] = "failed"
-        response["error"] = "rewrap_failed"
-        code = 200 if dry_run else 409
-        print(f"[content-rewrap:{store.user_id}] failed errors={summary['total_errors']} dry_run={dry_run}")
-        return jsonify(response), code
+    # pending = 本轮 error 的条目;客户端只需重试这些即可收敛。
+    pending = [
+        {"type": r["type"], "id": r["id"], "reason": r.get("reason", "")}
+        for r in results if r["status"] == "error"
+    ]
+    response["pending"] = pending
 
     if dry_run:
-        print(f"[content-rewrap:{store.user_id}] dry_run rewrappable={summary['total_rewrapped']} skipped={summary['total_skipped']}")
-        return jsonify(response)
+        response["status"] = "dry_run"
+        print(f"[content-rewrap:{store.user_id}] dry_run rewrappable={summary['total_rewrapped']} skipped={summary['total_skipped']} errors={summary['total_errors']}")
+        return jsonify(response), 200
 
+    # 无条件落盘所有已成功 rewrap 的条目。部分进度是安全的:仍停在旧钥的条目
+    # 本就不可解(设备已丢旧 SK,这正是调 rewrap 的前提),故落盘成功项只增不减
+    # 可解内容。收敛来自客户端重试 pending。
     now = datetime.now().isoformat()
     if identity is not None and identity_plan is not None:
         new_identity = dict(identity)
@@ -440,23 +443,37 @@ def content_rewrap_to_current_key():
 
     swapped_ids: set[str] = set()
     for item_id, env in chat_plans:
-        # _swap_chat persists the swapped envelope fields to the DB itself.
+        # _swap_chat 自行把交换后的信封字段写回 DB。
         if _swap_chat(store, item_id, env) == "ok":
             swapped_ids.add(item_id)
     if swapped_ids:
-        # Stamp rewrapped_at on the affected in-memory messages and persist the
-        # full updated rows (chat is row-per-message in PostgreSQL now).
         with store.chat_lock:
             for msg in store.chat_messages:
                 if isinstance(msg, dict) and msg.get("id") in swapped_ids:
                     msg["rewrapped_at"] = now
                     db.chat_append(store.user_id, msg["id"], msg["ts"], msg, core_store.MAX_CHAT_MESSAGES)
 
-    if not registry._set_user_public_key(store.user_id, requested_public_key):
-        return jsonify({"error": "user not found"}), 404
+    # 有进展(至少一条 rewrap)或完全无错 → 推进注册钥,使新内容 wrap 到当前设备钥、
+    # 下一轮工作集单调收缩。零进展且有错 → 不动钥,返回 409 让客户端退避重试。
+    made_progress = summary["total_rewrapped"] > 0
+    clean = summary["total_errors"] == 0
+    if clean or made_progress:
+        if not registry._set_user_public_key(store.user_id, requested_public_key):
+            return jsonify({"error": "user not found"}), 404
 
-    print(f"[content-rewrap:{store.user_id}] ok rewrapped={summary['total_rewrapped']} skipped={summary['total_skipped']} fpr={response['public_key_fpr']}")
-    return jsonify(response)
+    if clean:
+        response["status"] = "ok"
+        code = 200
+    elif made_progress:
+        response["status"] = "partial"
+        code = 200
+    else:
+        response["status"] = "failed"
+        response["error"] = "rewrap_failed_no_progress"
+        code = 409
+
+    print(f"[content-rewrap:{store.user_id}] {response['status']} rewrapped={summary['total_rewrapped']} skipped={summary['total_skipped']} errors={summary['total_errors']} pending={len(pending)} fpr={response['public_key_fpr']}")
+    return jsonify(response), code
 
 
 # ---------------------------------------------------------------------------
