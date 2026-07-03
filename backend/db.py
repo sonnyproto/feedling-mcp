@@ -1528,6 +1528,85 @@ def memory_replace_all(user_id: str, moments: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# World book entries (row-per-item)
+# ---------------------------------------------------------------------------
+
+
+def world_book_load(user_id: str) -> list[dict]:
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                "SELECT doc FROM world_book_entries WHERE user_id = %s "
+                "ORDER BY updated_at, entry_id",
+                (user_id,),
+            ).fetchall()
+        return [r[0] for r in rows]
+    except Exception as e:
+        log.error("[db] world_book_load(%s) failed: %s", user_id, e)
+        return []
+
+
+def world_book_upsert(user_id: str, entry_id: str, updated_at: str, doc: dict) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO world_book_entries (user_id, entry_id, updated_at, doc) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (user_id, entry_id) DO UPDATE SET "
+                "updated_at = EXCLUDED.updated_at, doc = EXCLUDED.doc",
+                (user_id, entry_id, updated_at or "", Jsonb(doc)),
+            )
+        return True
+    except Exception as e:
+        log.error("[db] world_book_upsert(%s,%s) failed: %s", user_id, entry_id, e)
+        return False
+
+
+def world_book_delete(user_id: str, entry_id: str) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM world_book_entries WHERE user_id = %s AND entry_id = %s",
+                (user_id, entry_id),
+            )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error("[db] world_book_delete(%s,%s) failed: %s", user_id, entry_id, e)
+        return False
+
+
+def world_book_replace_all(user_id: str, entries: list[dict]) -> None:
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                rows = conn.execute(
+                    "SELECT entry_id, updated_at, doc FROM world_book_entries WHERE user_id = %s",
+                    (user_id,),
+                ).fetchall()
+                existing = {r[0]: (r[1], r[2]) for r in rows}
+                new = {str(e["id"]): e for e in entries if e.get("id")}
+                for entry_id in existing.keys() - new.keys():
+                    conn.execute(
+                        "DELETE FROM world_book_entries WHERE user_id = %s AND entry_id = %s",
+                        (user_id, entry_id),
+                    )
+                for entry_id, entry in new.items():
+                    updated_at = str(entry.get("updated_at") or "")
+                    prev = existing.get(entry_id)
+                    if prev is not None and prev[0] == updated_at and prev[1] == entry:
+                        continue
+                    conn.execute(
+                        "INSERT INTO world_book_entries (user_id, entry_id, updated_at, doc) "
+                        "VALUES (%s, %s, %s, %s) "
+                        "ON CONFLICT (user_id, entry_id) DO UPDATE SET "
+                        "updated_at = EXCLUDED.updated_at, doc = EXCLUDED.doc",
+                        (user_id, entry_id, updated_at, Jsonb(entry)),
+                    )
+    except Exception as e:
+        log.error("[db] world_book_replace_all(%s) failed: %s", user_id, e)
+
+
+# ---------------------------------------------------------------------------
 # Frame envelopes (heavy body_ct lives here; frames_meta index stays a blob)
 # ---------------------------------------------------------------------------
 

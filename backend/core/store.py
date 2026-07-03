@@ -108,6 +108,8 @@ class UserStore:
         # identity / memory locks
         self.identity_lock = threading.Lock()
         self.memory_lock = threading.Lock()
+        self.world_books: list[dict] = []
+        self.world_books_lock = threading.Lock()
         self.consumer_state_lock = threading.Lock()
 
         # proactive presence state
@@ -132,6 +134,7 @@ class UserStore:
             self._load_live_activity_state()
             self._load_chat()
             self._load_frames_meta()
+            self._load_world_books()
         finally:
             _reload_guard.active = _prev_guard
 
@@ -293,6 +296,8 @@ class UserStore:
                 self.chat_messages = db.chat_load(self.user_id)
             with self.frames_lock:
                 self._load_frames_meta()
+            with self.world_books_lock:
+                self._load_world_books()
             self._load_tokens()
             self._load_live_activity_state()
             self._load_push_state()
@@ -428,6 +433,44 @@ class UserStore:
         except Exception as e:
             print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
         return msg
+
+    # ------- world book -------
+    def _load_world_books(self):
+        self.world_books = db.world_book_load(self.user_id)
+
+    def upsert_world_book(self, record: dict) -> dict:
+        entry_id = str(record.get("id") or "").strip()
+        if not entry_id:
+            raise ValueError("world book record id is required")
+        stored = dict(record)
+        stored["id"] = entry_id
+        stored.setdefault("owner_user_id", self.user_id)
+        stored.setdefault("updated_at", datetime.now().isoformat())
+        with self.world_books_lock:
+            replaced = False
+            for i, existing in enumerate(self.world_books):
+                if str(existing.get("id") or "") == entry_id:
+                    self.world_books[i] = stored
+                    replaced = True
+                    break
+            if not replaced:
+                self.world_books.append(stored)
+            db.world_book_upsert(self.user_id, entry_id, str(stored.get("updated_at") or ""), stored)
+        return stored
+
+    def delete_world_book(self, entry_id: str) -> bool:
+        entry_id = str(entry_id or "").strip()
+        if not entry_id:
+            return False
+        with self.world_books_lock:
+            before = len(self.world_books)
+            self.world_books[:] = [
+                item for item in self.world_books
+                if str(item.get("id") or "") != entry_id
+            ]
+            removed_local = len(self.world_books) != before
+            removed_db = db.world_book_delete(self.user_id, entry_id)
+        return removed_local or removed_db
 
     def update_chat_message_metadata(self, msg_id: str, fields: dict) -> dict | None:
         allowed = {
