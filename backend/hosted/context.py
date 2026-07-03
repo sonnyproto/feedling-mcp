@@ -19,6 +19,7 @@ import httpx
 from flask import Blueprint, Response, jsonify, request, g, has_request_context
 
 import db
+import debug_trace
 from core import enclave as core_enclave
 from perception import snapshot_for_wake as _perception_wake_snapshot
 from core.store import UserStore
@@ -220,6 +221,15 @@ def _model_api_context_messages(
     prompt_context_payload.pop("context_memory_trace", None)
     if world_book["block"]:
         prompt_context_payload["world_book_block"] = world_book["block"]
+        if debug_trace.is_enabled(store):
+            debug_trace.trace_event(
+                store,
+                subsystem="worldbook",
+                type="worldbook_injected",
+                actor="host_agent_runtime",
+                summary=f"worldbook injected {len(world_book['matched_names'])} entries",
+                detail={"names": world_book["matched_names"]},
+            )
     if context_memory_trace:
         prompt_selection = {}
         selected_trace = context_memory_trace.get("selected") if isinstance(context_memory_trace.get("selected"), list) else []
