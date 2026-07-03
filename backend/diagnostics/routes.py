@@ -130,6 +130,7 @@ def debug_trace_read():
     return jsonify({
         "enabled": debug_trace.is_enabled(store),
         "deploy_enabled": debug_trace._deploy_enabled(),
+        "verbose": debug_trace.verbose_enabled(store),
         "events": debug_trace.read_trace(store, limit=limit, subsystem=subsystem),
     }), 200
 
@@ -152,4 +153,37 @@ def debug_trace_clear():
 
     store = require_user()
     debug_trace.clear_trace(store)
+    return jsonify({"status": "ok"}), 200
+
+
+@bp.route("/v1/debug/trace/event", methods=["POST"])
+def debug_trace_emit():
+    """A resident consumer (HTTP-only, no DB) reports one flow event. Auth via
+    the same per-user key; recording is gated + best-effort. Field-picking keeps
+    a careless caller from injecting arbitrary keys."""
+    from accounts.auth import require_user
+    import debug_trace
+
+    store = require_user()
+    payload = request.get_json(silent=True) or {}
+    ev = payload.get("event") if isinstance(payload.get("event"), dict) else {}
+    dur = ev.get("dur_ms")
+    try:
+        dur = float(dur) if dur is not None else None
+    except (TypeError, ValueError):
+        dur = None
+    debug_trace.trace_event(
+        store,
+        subsystem=str(ev.get("subsystem") or ""),
+        type=str(ev.get("type") or ""),
+        summary=str(ev.get("summary") or ""),
+        explain=str(ev.get("explain") or ""),
+        detail=ev.get("detail") if isinstance(ev.get("detail"), dict) else None,
+        content_excerpt=ev.get("content_excerpt") if isinstance(ev.get("content_excerpt"), dict) else None,
+        actor=str(ev.get("actor") or "vps_resident"),
+        status=str(ev.get("status") or "ok"),
+        trace_id=str(ev.get("trace_id") or ""),
+        turn_id=str(ev.get("turn_id") or ""),
+        dur_ms=dur,
+    )
     return jsonify({"status": "ok"}), 200
