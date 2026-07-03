@@ -9,6 +9,7 @@ from flask import Blueprint, jsonify, request
 
 from accounts import auth
 from content.routes import _apply_envelope_fields, _swap_envelope_missing
+import debug_trace
 import worldbook_readside_core
 
 bp = Blueprint("worldbook", __name__)
@@ -102,6 +103,48 @@ def worldbook_upsert():
         return jsonify(body), status
     saved = store.upsert_world_book(record)
     return jsonify({"id": saved["id"]})
+
+
+@bp.route("/v1/worldbook/match", methods=["POST"])
+def worldbook_match():
+    store = auth.require_user()
+    api_key = auth._extract_api_key()
+    payload = request.get_json(silent=True) or {}
+    messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+    current = str(payload.get("message") or "").strip()
+    if current:
+        messages = list(messages) + [{"role": "user", "content": current}]
+    with store.world_books_lock:
+        world_books = [dict(item) for item in store.world_books]
+    if not world_books:
+        return jsonify({"block": "", "matched_names": [], "rejected_over_cap": [], "unavailable_ids": []})
+    runtime_token = request.headers.get("X-Feedling-Runtime-Token", "").strip() or None
+    try:
+        result = worldbook_readside_core.post_enclave_worldbook_match(
+            api_key,
+            world_books,
+            messages,
+            runtime_token=runtime_token,
+        )
+    except RuntimeError as e:
+        return jsonify({"error": "worldbook_match_unavailable", "detail": str(e)}), 503
+    block = str(result.get("block") or "")
+    matched_names = result.get("matched_names") if isinstance(result.get("matched_names"), list) else []
+    if block:
+        debug_trace.trace_event(
+            store,
+            subsystem="worldbook",
+            type="worldbook_injected",
+            actor="host_agent_runtime",
+            summary=f"worldbook injected {len(matched_names)} entries",
+            detail={"names": matched_names},
+        )
+    return jsonify({
+        "block": block,
+        "matched_names": matched_names,
+        "rejected_over_cap": result.get("rejected_over_cap") if isinstance(result.get("rejected_over_cap"), list) else [],
+        "unavailable_ids": result.get("unavailable_ids") if isinstance(result.get("unavailable_ids"), list) else [],
+    })
 
 
 @bp.route("/v1/worldbook/delete", methods=["DELETE"])
