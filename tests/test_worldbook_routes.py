@@ -129,3 +129,27 @@ def test_worldbook_upsert_rejects_over_cap_content_reported_by_enclave(client, m
     assert res.status_code == 400
     assert res.get_json() == {"error": "content_too_long", "id": "too-big", "max_chars": 20000}
     assert client.get("/v1/worldbook/list", headers=_headers(api_key)).get_json() == {"envelopes": []}
+
+
+def test_worldbook_upsert_rejects_when_enclave_cannot_validate_envelope(client, monkeypatch):
+    user_id, api_key = _register(client)
+
+    def fake_validate(api_key_arg, world_books, messages, *, runtime_token=None):
+        return {"block": "", "matched_names": [], "rejected_over_cap": [], "unavailable_ids": ["bad-env"]}
+
+    monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "http://enclave.test")
+    monkeypatch.setattr(
+        worldbook_routes.worldbook_readside_core,
+        "post_enclave_worldbook_match",
+        fake_validate,
+    )
+
+    res = client.post(
+        "/v1/worldbook/upsert",
+        json=_env(user_id, "bad-env"),
+        headers=_headers(api_key),
+    )
+
+    assert res.status_code == 400
+    assert res.get_json() == {"error": "worldbook_validate_failed", "id": "bad-env"}
+    assert client.get("/v1/worldbook/list", headers=_headers(api_key)).get_json() == {"envelopes": []}

@@ -69,6 +69,9 @@ def _validate_content_cap_with_enclave(record: dict) -> tuple[dict, int] | None:
             "id": entry_id,
             "max_chars": worldbook_readside_core.WORLD_BOOK_CONTENT_CAP,
         }, 400
+    unavailable = {str(item) for item in result.get("unavailable_ids") or []}
+    if entry_id in unavailable:
+        return {"error": "worldbook_validate_failed", "id": entry_id}, 400
     return None
 
 
