@@ -239,14 +239,28 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
     )
 
 
-def _default_deepseek_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
-    """Claude Code only exposes DeepSeek thinking blocks in stream-json output."""
+def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
+    """Claude Code exposes thinking blocks in stream-json output."""
     grant = ",".join(_io_cli_allow_rules(io_cli))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
     return (
         "claude --verbose --output-format stream-json --include-partial-messages "
         f"--effort high --allowed-tools '{grant}' "
         f"--append-system-prompt-file {prompt_file} -p {{message}}"
+    )
+
+
+def _claude_cli_should_stream_thinking(entry: dict) -> bool:
+    provider = (entry.get("provider") or "").strip().lower()
+    if provider == "deepseek":
+        return True
+    if provider != "anthropic":
+        return False
+    model = (entry.get("model") or "").strip().lower()
+    return (
+        "claude-3-7" in model
+        or "claude-sonnet-4" in model
+        or "claude-opus-4" in model
     )
 
 
@@ -423,8 +437,8 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     env["FEEDLING_API_KEY"] = entry.get("api_key", "")
     env["AGENT_MODE"] = entry.get("agent_mode", "cli")
     cli_cmd = entry.get("cli_cmd")
-    if not cli_cmd and driver == "claude" and (entry.get("provider") or "").strip().lower() == "deepseek":
-        cli_cmd = _default_deepseek_claude_cmd(home)
+    if not cli_cmd and driver == "claude" and _claude_cli_should_stream_thinking(entry):
+        cli_cmd = _default_thinking_claude_cmd(home)
     env["AGENT_CLI_CMD"] = cli_cmd or _default_cli_cmd(driver, home)
     # Per-user isolation: separate checkpoint, agent session, image temp dir, and
     # a per-user agent home (Claude/Codex) so nothing is shared across users.
@@ -458,15 +472,16 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
         env["CLAUDE_CONFIG_DIR"] = f"{home}/claude-home"
         if entry.get("provider_key"):
             env["ANTHROPIC_API_KEY"] = entry["provider_key"]
+        model = (entry.get("model") or "").strip()
+        if model:
+            env["ANTHROPIC_MODEL"] = model
         # Non-anthropic claude-wire providers (deepseek) must point the CLI at
         # their /anthropic endpoint + own model — otherwise the CLI hits
         # api.anthropic.com with a foreign key and every turn exits non-zero.
         anthropic_base = _claude_anthropic_base_url(entry)
         if anthropic_base:
             env["ANTHROPIC_BASE_URL"] = anthropic_base
-            model = (entry.get("model") or "").strip()
             if model:
-                env["ANTHROPIC_MODEL"] = model
                 # claude Code also issues background "small/fast" model calls; point
                 # them at the same model so they don't 404 a claude-* default.
                 env["ANTHROPIC_SMALL_FAST_MODEL"] = model

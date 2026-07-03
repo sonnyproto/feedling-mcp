@@ -55,6 +55,28 @@ def test_consumer_env_uses_stream_json_for_deepseek_claude_thinking():
     assert env["ANTHROPIC_MODEL"] == "deepseek-v4-pro"
 
 
+def test_consumer_env_uses_stream_json_for_native_anthropic_sonnet_thinking():
+    env = spawners.consumer_env(
+        {"PATH": "/bin"},
+        {
+            "api_key": "fk",
+            "provider": "anthropic",
+            "provider_key": "sk-ant",
+            "driver": "claude",
+            "model": "claude-sonnet-4-5",
+        },
+        user_id="u_1",
+        home="/agent-data/users/u_1",
+    )
+
+    cmd = env["AGENT_CLI_CMD"]
+    assert "--output-format stream-json" in cmd
+    assert "--include-partial-messages" in cmd
+    assert "--effort high" in cmd
+    assert "ANTHROPIC_BASE_URL" not in env
+    assert env["ANTHROPIC_MODEL"] == "claude-sonnet-4-5"
+
+
 def test_consumer_env_uses_codex_cli_and_home_for_codex_driver():
     env = spawners.consumer_env(
         {}, {"api_key": "fk", "provider_key": "sk-oai", "driver": "codex"},
