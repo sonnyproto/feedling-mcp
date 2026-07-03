@@ -49,6 +49,32 @@
 
 ## 2026-07-04
 
+### [BLOCKER→FIXED] 测试用户切 claude 后"没响应" — checkpoint wedge + 测试 runner 改单节点
+
+修完 thinking-claude Read 后,测试用户切 claude 发图**仍没响应**(连报错都没有)。SSH 进测试
+runner CVM 看日志坐实:consumer 的聊天 checkpoint 卡在 12:11(`checkpoint.json last_ts`),日志
+反复刷 `poll returned claimed messages but decrypt history did not include those ids; keeping
+checkpoint for retry` —— poll 认领了消息 id,但 `get_decrypted_history(since=cursor)` 返回里不含这些
+id(解不出 / 或该消息 ts 正好等于 exclusive `since` 边界取不到)→ `_filter_messages_to_poll_ids`
+得空 → **无限重试、cursor 永不前进** → 16:15/16:18 等新消息全被堵。**跟看图修复无关**(该用户
+AGENT_CLI_CMD 已带 Read,已验证)。
+
+结构性诱因:测试 runner CVM `feedling-io-agents-test` 跑**两个** agent-runner 容器(0/1),**各自
+独立数据卷**(`feedling_agent_runtime_r0/r1`);per-user 聊天 checkpoint 存在卷里、**不在 lease 行**,
+所以 lease 从一个 runner 漂到另一个时,会从另一卷的**陈旧 checkpoint** 重放并 wedge。线上 runner
+(`docker-compose.phala.prod.runner.yaml`)本就是**单 runner 单卷**,不犯此病。
+
+两处修复:
+1. **测试 runner 改单节点**(`deploy/docker-compose.phala.runner.yaml`):2 runner→1 `agent-runner`、
+   全新卷 `feedling_agent_runtime_runner`(对齐线上;新卷顺带清掉旧陈旧 checkpoint)。test/prod compose
+   分开,不影响线上。CI 的镜像 pin 用全局 sed 匹配,单服务不受影响。
+2. **wedge 根因**(`tools/chat_resident_consumer.py`):认领消息持续取不到时不再无限重试——同一 cursor
+   连续 `CHAT_POLL_WEDGE_SKIP_AFTER`(默认 5)次 miss 后,`_advance_past_unfetchable` 把 cursor 推过这批
+   认领消息的最大 ts(边界情况 nudge `+1e-3`),跳过解不出的消息、放行后续。有界重试保留了瞬时解密抖动
+   的自愈窗口。纯函数 + 两个单测。1512 passed。
+
+### [BLOCKER→FIXED] 图片修复不完整:thinking-claude 命令漏了 Read 授权（claude 仍看不到图）
+
 ### [BLOCKER→FIXED] 图片修复不完整:thinking-claude 命令漏了 Read 授权（claude 仍看不到图）
 
 PR #40 合并部署后,用户切 anthropic/claude-sonnet-4-5 实测**仍"没获得看图片的权限"**。

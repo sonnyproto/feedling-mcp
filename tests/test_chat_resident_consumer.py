@@ -4036,3 +4036,19 @@ def test_claude_resume_kept_when_no_transcript_injected(monkeypatch):
     cmd = crc._prepare_cli_command("hello")  # no injected-transcript header
 
     assert cmd[:3] == ["claude", "--resume", "sess_123"]
+
+
+def test_advance_past_unfetchable_skips_to_max_claimed_ts():
+    # When decrypt-history never returns the poll-claimed rows, the cursor must jump
+    # past the newest claimed message so a later, decryptable message isn't blocked.
+    poll = [{"id": "a", "ts": 100.0}, {"id": "b", "ts": 250.5}, {"id": "c", "ts": 175.0}]
+    assert crc._advance_past_unfetchable(100.0, poll) == 250.5
+
+
+def test_advance_past_unfetchable_boundary_message_gets_nudged():
+    # The wedge case: the stuck message sits exactly at the cursor (exclusive
+    # `since` can never return it). Advancing to max==last_ts would loop forever, so
+    # the cursor must be nudged strictly past it.
+    ts = 1783080703.7508044
+    out = crc._advance_past_unfetchable(ts, [{"id": "x", "ts": ts}])
+    assert out > ts

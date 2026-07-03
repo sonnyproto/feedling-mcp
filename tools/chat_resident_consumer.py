@@ -857,6 +857,27 @@ def _filter_messages_to_poll_ids(messages: list[dict], poll_messages: list[dict]
     ]
 
 
+# The chat cursor wedges when /v1/chat/poll keeps claiming message ids the enclave
+# decrypt-history never returns (an undecryptable row, or one sitting exactly at the
+# exclusive `since` boundary). We retry a bounded number of cycles — transient
+# decrypt hiccups self-heal — then skip PAST the claimed batch so one permanently
+# unreturnable message can't block every newer message forever.
+CHAT_POLL_WEDGE_SKIP_AFTER = int(os.environ.get("CHAT_POLL_WEDGE_SKIP_AFTER", "5"))
+_WEDGE_SKIP_EPSILON = 1e-3
+
+
+def _advance_past_unfetchable(last_ts: float, poll_messages: list[dict]) -> float:
+    """Next checkpoint that skips the poll-claimed rows the decrypt source won't
+    return. Jumps to the newest claimed ts; if that is not strictly past the cursor
+    (the stuck row sits at the boundary), nudge just beyond it so the next poll
+    excludes it."""
+    max_ts = max(
+        (float(m.get("ts", m.get("timestamp", 0)) or 0) for m in poll_messages),
+        default=last_ts,
+    )
+    return max_ts if max_ts > last_ts else last_ts + _WEDGE_SKIP_EPSILON
+
+
 def _mark_seen(key: str) -> bool:
     """Mark key as seen. Returns True (new) or False (already processed)."""
     if key in _seen_ids:
@@ -6171,6 +6192,11 @@ def run() -> None:
             log.warning("could not seed from history: %s", e)
 
     _save_checkpoint(last_ts)
+    # Wedge guard: consecutive poll cycles where the claimed ids never show up in
+    # decrypt history, keyed on the cursor they're stuck behind (see
+    # _advance_past_unfetchable). After CHAT_POLL_WEDGE_SKIP_AFTER we skip past them.
+    wedge_miss_ts: float | None = None
+    wedge_miss_count = 0
     last_job_ts = _load_proactive_checkpoint()
     proactive_enabled = PROACTIVE_POLL_ENABLED
     if proactive_enabled and last_job_ts == 0.0:
@@ -6367,10 +6393,29 @@ def run() -> None:
                     continue
                 messages = _filter_messages_to_poll_ids(decrypted, poll_messages)
                 if not messages:
-                    log.warning(
-                        "poll returned claimed messages but decrypt history did not "
-                        "include those ids; keeping checkpoint for retry"
-                    )
+                    if wedge_miss_ts == last_ts:
+                        wedge_miss_count += 1
+                    else:
+                        wedge_miss_ts = last_ts
+                        wedge_miss_count = 1
+                    if wedge_miss_count >= CHAT_POLL_WEDGE_SKIP_AFTER:
+                        skip_ts = _advance_past_unfetchable(last_ts, poll_messages)
+                        log.error(
+                            "poll claimed %d message(s) absent from decrypt history "
+                            "for %d cycles; advancing cursor %.3f→%.3f to unwedge "
+                            "(undecryptable/boundary message skipped)",
+                            len(poll_messages), wedge_miss_count, last_ts, skip_ts,
+                        )
+                        last_ts = skip_ts
+                        _save_checkpoint(last_ts)
+                        wedge_miss_ts = None
+                        wedge_miss_count = 0
+                    else:
+                        log.warning(
+                            "poll returned claimed messages but decrypt history did "
+                            "not include those ids; keeping checkpoint for retry "
+                            "(%d/%d)", wedge_miss_count, CHAT_POLL_WEDGE_SKIP_AFTER,
+                        )
                     continue
             else:
                 # No decrypt source — fall through with poll content (will be
