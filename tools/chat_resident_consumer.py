@@ -414,6 +414,28 @@ _HEADERS = {
     "X-Feedling-Consumer-Commit": os.environ.get("FEEDLING_CONSUMER_COMMIT", _consumer_commit()),
 }
 
+
+def _emit_debug_trace(subsystem: str, type: str, *, status: str = "ok",
+                      summary: str = "", explain: str = "", detail: dict | None = None,
+                      content_excerpt: dict | None = None, trace_id: str = "",
+                      dur_ms: float | None = None) -> None:
+    """Fire-and-forget flow-trace emit. Best-effort: short timeout, never raises,
+    never blocks a turn. The backend gates + drops it if debug is off."""
+    try:
+        httpx.post(
+            f"{FEEDLING_API_URL}/v1/debug/trace/event",
+            json={"event": {
+                "subsystem": subsystem, "type": type, "status": status,
+                "summary": summary, "explain": explain, "detail": detail or {},
+                "content_excerpt": content_excerpt or {}, "trace_id": trace_id,
+                "turn_id": trace_id, "actor": "vps_resident", "dur_ms": dur_ms,
+            }},
+            headers=_HEADERS, timeout=3,
+        )
+    except Exception:
+        pass  # observability must never affect the turn
+
+
 # Stage D: when hosted, the supervisor writes a short-lived runtime token to this
 # file (and refreshes it). We authenticate with the token instead of the
 # long-term API key, re-reading the file so refreshes are picked up. Unset/empty
@@ -2871,6 +2893,33 @@ def _codex_turn_metrics(raw: str) -> dict:
     return {"steps": steps, "input_tokens": in_tok, "output_tokens": out_tok}
 
 
+def _cli_turn_metrics(cmd: list[str], result: "subprocess.CompletedProcess", wall_ms: int) -> dict:
+    """Driver-aware metrics for one CLI turn. Never raises.
+
+    Returns a dict with keys shared across drivers so callers (timing logs,
+    debug-trace events) don't need driver-specific branching:
+    ``driver, rc, wall_ms, agent_ms, api_ms, num_turns, steps, input_tokens,
+    output_tokens, out_chars``. Fields the driver doesn't report stay ``None``.
+    """
+    m = {"driver": "codex" if _is_codex_cmd(cmd) else "claude", "rc": result.returncode,
+         "wall_ms": wall_ms, "agent_ms": None, "api_ms": None, "num_turns": None,
+         "steps": None, "input_tokens": None, "output_tokens": None,
+         "out_chars": len(result.stdout or "")}
+    try:
+        if m["driver"] == "codex":
+            m.update(_codex_turn_metrics(result.stdout or ""))
+        else:
+            for obj in _json_objects_from_cli_output(result.stdout or ""):
+                if isinstance(obj, dict) and obj.get("type") == "result":
+                    m["agent_ms"] = obj.get("duration_ms")
+                    m["api_ms"] = obj.get("duration_api_ms")
+                    m["num_turns"] = obj.get("num_turns")
+                    break
+    except Exception:  # noqa: BLE001 — a metrics computation must never break a turn
+        pass
+    return m
+
+
 def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", wall_ms: int) -> None:
     """Emit ONE structured timing line per CLI agent turn (observability only).
 
@@ -2888,29 +2937,18 @@ def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", 
     Best-effort: never raises, never changes behavior. ``driver=`` is always
     logged so blank fields aren't mistaken for missing claude data.
     """
-    if _is_codex_cmd(cmd):
-        try:
-            m = _codex_turn_metrics(result.stdout or "")
-        except Exception:  # noqa: BLE001 — a timing log must never break a turn
-            m = {"steps": None, "input_tokens": None, "output_tokens": None}
+    m = _cli_turn_metrics(cmd, result, wall_ms)
+
+    if m["driver"] == "codex":
         log.info(
             "[turn-timing] driver=codex rc=%s wall_ms=%d steps=%s in_tokens=%s "
             "out_tokens=%s out_chars=%d",
-            result.returncode, wall_ms, m.get("steps"), m.get("input_tokens"),
-            m.get("output_tokens"), len(result.stdout or ""),
+            m["rc"], m["wall_ms"], m.get("steps"), m.get("input_tokens"),
+            m.get("output_tokens"), m["out_chars"],
         )
         return
 
-    agent_ms = api_ms = num_turns = None
-    try:
-        for obj in _json_objects_from_cli_output(result.stdout or ""):
-            if isinstance(obj, dict) and obj.get("type") == "result":
-                agent_ms = obj.get("duration_ms")
-                api_ms = obj.get("duration_api_ms")
-                num_turns = obj.get("num_turns")
-                break
-    except Exception:  # noqa: BLE001 — a timing log must never break a turn
-        pass
+    agent_ms, api_ms = m.get("agent_ms"), m.get("api_ms")
     cold_start_ms = orchestration_ms = None
     if isinstance(agent_ms, (int, float)):
         cold_start_ms = max(0, wall_ms - int(agent_ms))
@@ -2919,8 +2957,8 @@ def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", 
     log.info(
         "[turn-timing] driver=claude rc=%s wall_ms=%d agent_ms=%s api_ms=%s "
         "orchestration_ms=%s cold_start_ms=%s num_turns=%s out_chars=%d",
-        result.returncode, wall_ms, agent_ms, api_ms, orchestration_ms,
-        cold_start_ms, num_turns, len(result.stdout or ""),
+        m["rc"], m["wall_ms"], agent_ms, api_ms, orchestration_ms,
+        cold_start_ms, m.get("num_turns"), m["out_chars"],
     )
 
 
