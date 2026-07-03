@@ -47,6 +47,40 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-03
+
+### [DONE] 聊天 AI「看不到图片/截图/屏幕共享」— cli 路径像素从没喂进模型（API+VPS 双中招）
+
+**真因**:托管(API)+ VPS 用户跑同一份 `chat_resident_consumer.py`,在 `AGENT_MODE=cli`
+下,图片虽已解密落盘(`IMAGE_TEMP_DIR={home}/images`)、路径也下传,但**像素从没作为
+多模态输入到达模型**。`_prepare_cli_command` 只在模板含 `{image_path}` token 时附图,否则
+退化到 `_message_for_agent`——把**文件路径当纯文本**塞进 prompt。而两个 driver 的默认命令
+都不含该 token:codex(`codex exec … {message}`)从不带 `-i`;claude(`claude -p`)的
+`--allowed-tools` 只有 io_cli 动词、**无 Read**,`-p` 非交互下打不开那个图片文件。结果模型
+只看到一句路径字符串,如实回答"看不到图"。`usr_6d8c6387242778cb` 报的「API 屏幕共享看不到
+内容」即此。
+
+**改了什么**(分支 `fix/chat-images-cli-vision`,PR #40 → test):
+- **codex**(`tools/chat_resident_consumer.py`):`_prepare_cli_command` 检测 codex 命令且有
+  图时,注入 `_inject_codex_images`——按图加 **`--image=<path>`**(codex 原生 vision 输入),插在
+  `exec` 子命令后。用 `=` 绑定单值而非裸 `-i <path>`,否则 clap 的变参 `--image <FILE>...` 会把
+  紧跟的 positional prompt 当成第二个图片值吞掉(精简模板 `codex exec {message}` 会丢消息——Codex
+  review P2 抓到)。同时**跳过**误导性的路径文本(codex 直接拿到像素)。已含 `-i`/`--image`/
+  `{image_path}` 的自配模板不双注入。修复托管 + VPS codex,VPS 零配置。
+- **claude**(`backend/agent_runtime/spawners.py`):默认 `--allowed-tools` 与 `settings.json`
+  的 allowlist 加 `Read({home}/images/**)`(`_claude_allow_rules` = io_cli 动词 + 图片 Read),
+  紧扣 IMAGE_TEMP_DIR、最小授权,让 `claude -p` 能打开被注入路径的图。自配 `cli_cmd` 的 VPS
+  用户需自己加(README 已说明)。
+- **文档**:`tools/README.md` 补 CLI 模式"怎么让模型真看到图"一节 + 屏幕帧 `on_mention` 触发词/
+  `SCREEN_CONTEXT_MODE=always` 说明。
+- 测试:`tests/test_chat_resident_consumer.py`(codex `--image=` 注入 + prompt 不被吞 + 自配
+  `-i` 不双注入)、`tests/test_agent_runtime_spawners.py`(默认 claude cmd + settings.json 含图片
+  Read)。rebase 到 test 后全量 `tests/` 通过。
+
+**没改**(刻意):屏幕 `SCREEN_CONTEXT_MODE=on_mention` 默认与触发正则——正则已很宽(屏幕/共享/
+画面/看到/这个/screen/share/look at…),`always` 有隐私/token 成本,真凶是上面的像素投递,已修。
+仅文档化。
+
 ## 2026-07-02
 
 ### [DONE] 非官方托管模型如实报自身模型（identity honesty，未部署未提交）

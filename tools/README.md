@@ -229,6 +229,29 @@ the decrypted image to `IMAGE_TEMP_DIR` and either appends the file path to
 `{message}` or fills explicit `{image_path}` / `{image_paths}` placeholders
 if your CLI supports image arguments.
 
+**Getting the model to actually see the image (CLI mode).** Writing the path
+into `{message}` only tells the model a file exists — it does not feed pixels.
+Make sure the image reaches the model as real vision input:
+
+- **codex** (`codex exec …`): the consumer auto-attaches each decrypted image
+  with an `--image=<path>` flag (codex's native image input; the `=`-bound form
+  keeps clap's variadic `--image` from swallowing the positional prompt), so no
+  template change is needed. If you wire your own `-i {image_path}` /
+  `{image_paths}`, the consumer respects it and does not double-attach.
+- **claude** (`claude -p …`): claude opens the image via its `Read` tool, so its
+  path must be inside `--allowed-tools`. If you pin your own `--allowed-tools`
+  allowlist, add `Read(<IMAGE_TEMP_DIR>/**)` (e.g. `Read(/home/agent/images/**)`)
+  — otherwise unattended `claude -p` cannot open the file and the image stays
+  invisible. The managed default grant already includes this.
+- Any CLI with a first-class image flag: use the `{image_path}` / `{image_paths}`
+  template slot so pixels are attached, not just referenced.
+
+Note screen-share frames are attached only when `SCREEN_CONTEXT_MODE=on_mention`
+(default) *and* the message mentions the screen (屏幕 / 共享 / 看到 / 这个 /
+screen / share / look at …), and only if fresher than
+`SCREEN_CONTEXT_MAX_AGE_SEC` (300s). Set `SCREEN_CONTEXT_MODE=always` to attach
+the latest frame on every turn (higher token cost / less private).
+
 When running under `systemd`, do not assume your interactive shell `PATH`
 is available. Prefer an absolute executable path in `AGENT_CLI_CMD`; if that
 is not stable, set `AGENT_CLI_PATH` to the directory that contains the agent
