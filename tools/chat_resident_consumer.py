@@ -1355,6 +1355,8 @@ _JSON_REPLY_FIELDS = (
 _JSON_THINKING_FIELDS = (
     "provider_reasoning",
     "reasoning",
+    "reasoning_content",
+    "reasoning_text",
     "runtime_trace",
     "thinking_summary",
     "reasoning_summary",
@@ -1584,7 +1586,7 @@ def _boolish(value: Any) -> bool | None:
 
 def _default_thinking_kind_for_key(key: str) -> str:
     normalized = key.strip().lower()
-    if normalized in {"provider_reasoning", "reasoning"}:
+    if normalized in {"provider_reasoning", "reasoning", "reasoning_content", "reasoning_text"}:
         return "provider_reasoning"
     if normalized == "runtime_trace":
         return "runtime_trace"

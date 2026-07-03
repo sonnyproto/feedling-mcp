@@ -3308,6 +3308,45 @@ def test_call_agent_cli_codex_extracts_agent_message_not_handshake(monkeypatch):
     assert "thread.started" not in result
 
 
+def test_call_agent_http_openai_preserves_reasoning_content(monkeypatch):
+    """DeepSeek/OpenAI-compatible reasoning can arrive on message.reasoning_content.
+    The HTTP adapter must keep the structured body so _process_messages can post
+    it as thinking_summary instead of collapsing the turn to a plain reply.
+    """
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://agent.local/v1/chat/completions")
+    monkeypatch.setattr(crc, "AGENT_HTTP_PROTOCOL", "openai")
+    monkeypatch.setattr(crc, "AGENT_HTTP_MODEL", "deepseek-reasoner")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_agent_session_key", lambda: "")
+
+    class _Resp:
+        headers = {}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "model": "deepseek-reasoner",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "我会这样回复。",
+                        "reasoning_content": "比较了用户问题和最近记忆。",
+                    }
+                }],
+            }
+
+    monkeypatch.setattr(crc.httpx, "post", lambda *a, **kw: _Resp())
+
+    result = crc.call_agent_http("hi")
+    turn = crc._split_agent_turn(result)
+
+    assert turn.messages == ["我会这样回复。"]
+    assert turn.thinking_summary == "比较了用户问题和最近记忆。"
+    assert turn.thinking_kind == "provider_reasoning"
+
+
 def test_codex_reply_from_stream_ignores_reasoning_and_handshake():
     raw = (
         '{"type":"thread.started","thread_id":"t1"}\n'
