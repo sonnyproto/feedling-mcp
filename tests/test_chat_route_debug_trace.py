@@ -94,6 +94,10 @@ def test_resident_chat_message_and_poll_emit_route_trace(client):
     assert events[0]["detail"]["count"] == 1
     assert events[0]["detail"]["consumer_id"] == "resident-test"
     assert events[1]["actor"] == "ios"
+    message_id = msg.get_json()["id"]
+    assert events[1]["trace_id"] == message_id
+    assert events[1]["turn_id"] == message_id
+    assert events[1]["explain"]
 
 
 def test_resident_chat_response_emits_route_trace(client, monkeypatch):
@@ -108,7 +112,11 @@ def test_resident_chat_response_emits_route_trace(client, monkeypatch):
     res = client.post(
         "/v1/chat/response",
         headers=_headers(api_key),
-        json={"envelope": _env(user_id, "reply"), "source": "chat"},
+        json={
+            "envelope": _env(user_id, "reply"),
+            "source": "chat",
+            "reply_to_message_id": "user-msg-1",
+        },
     )
     assert res.status_code == 200, res.get_data(as_text=True)
 
@@ -116,6 +124,9 @@ def test_resident_chat_response_emits_route_trace(client, monkeypatch):
     assert event["type"] == "chat.response"
     assert event["actor"] == "agent"
     assert event["detail"]["source"] == "chat"
+    assert event["trace_id"] == "user-msg-1"
+    assert event["turn_id"] == "user-msg-1"
+    assert event["explain"]
 
 
 def test_resident_chat_response_gate_emits_route_trace(client, monkeypatch):
@@ -126,9 +137,15 @@ def test_resident_chat_response_gate_emits_route_trace(client, monkeypatch):
     _user_id, api_key = _register(client)
     _enable_trace(client, api_key)
 
-    res = client.post("/v1/chat/response", headers=_headers(api_key), json={})
+    res = client.post(
+        "/v1/chat/response",
+        headers=_headers(api_key),
+        json={"reply_to_message_id": "user-msg-gated"},
+    )
     assert res.status_code == 409, res.get_data(as_text=True)
 
     event = _route_events(client, api_key)[0]
     assert event["type"] == "chat.response.gated"
     assert event["status"] == "blocked"
+    assert event["trace_id"] == "user-msg-gated"
+    assert event["turn_id"] == "user-msg-gated"

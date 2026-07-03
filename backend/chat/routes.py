@@ -67,6 +67,12 @@ def _proactive_delivery_decision_v2(store: UserStore, payload: dict):
     return evaluate_delivery_v2(_settings_v2_for_store(store), source=source, manual=manual)
 
 
+def _plaintext_for_trace(payload: dict, envelope: dict) -> str:
+    """Best-effort plaintext for the debug excerpt ONLY. The server never
+    decrypts; use a client-provided preview if present, else empty."""
+    return str(payload.get("debug_preview") or envelope.get("synthetic_marker") or "")[:1000]
+
+
 def _trace_chat_poll_delivered(store: UserStore, pending: list, *, consumer_id: str, claim: bool) -> None:
     if not pending:
         return
@@ -257,8 +263,12 @@ def chat_message():
         subsystem="route",
         type="chat.message",
         actor="ios",
+        trace_id=msg["id"],
+        turn_id=msg["id"],
         summary=f"user message stored id={msg['id']}",
+        explain="收到用户消息，已入库并唤醒 resident consumer",
         detail={"content_type": content_type, "msg_id": msg["id"]},
+        content_excerpt={"user_message": _plaintext_for_trace(payload, envelope)} if content_type == "text" else None,
     )
     print(f"[chat:{store.user_id}] user(v1, visibility={envelope['visibility']}, type={content_type}) id={msg['id']}")
     return jsonify({"id": msg["id"], "ts": msg["ts"], "v": msg["v"]})
@@ -280,6 +290,12 @@ def chat_response():
     """
     store = auth.require_user()
     payload = request.get_json(silent=True) or {}
+    reply_to_message_id = str(
+        payload.get("reply_to_message_id")
+        or payload.get("reply_to_id")
+        or payload.get("in_reply_to")
+        or ""
+    ).strip()
     allow_verify_reply = boot_gates._reply_is_for_pending_verify_ping(store)
     gated = boot_gates._gate_bootstrap_for_chat(store, allow_verify_reply=allow_verify_reply)
     if gated is not None:
@@ -289,6 +305,8 @@ def chat_response():
             type="chat.response.gated",
             actor="agent",
             status="blocked",
+            trace_id=reply_to_message_id,
+            turn_id=reply_to_message_id,
             summary="bootstrap_incomplete gate fired",
             detail={"allow_verify_reply": bool(allow_verify_reply)},
         )
@@ -372,12 +390,6 @@ def chat_response():
         content_type=content_type,
         extra=extra,
     )
-    reply_to_message_id = str(
-        payload.get("reply_to_message_id")
-        or payload.get("reply_to_id")
-        or payload.get("in_reply_to")
-        or ""
-    ).strip()
     if reply_to_message_id:
         store.update_chat_message_metadata(reply_to_message_id, {
             "reply_status": "replied",
@@ -420,7 +432,10 @@ def chat_response():
         subsystem="route",
         type="chat.response",
         actor="agent",
+        trace_id=(reply_to_message_id or msg["id"]),
+        turn_id=(reply_to_message_id or msg["id"]),
         summary=f"agent reply stored id={msg['id']} source={source}",
+        explain=f"agent 回复已入库（source={source}）",
         detail={"source": source, "content_type": content_type, "msg_id": msg["id"]},
     )
     print(f"[chat:{store.user_id}] openclaw(v1, source={source}, type={content_type}) id={msg['id']}")
