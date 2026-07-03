@@ -49,6 +49,33 @@
 
 ## 2026-07-04
 
+### [DONE] 自定义陪伴频率 wake_interval_sec + 心跳激活门（三层，已 ship）
+
+两件事一起落地（Seven 主导）。**① 自定义陪伴频率**:用户在设置页选「陪伴频率」7 档
+(15min–12h,**默认 2h**),per-user `wake_interval_sec`(clamp `[900,43200]`),consumer 即时
+生效、无需重启。为什么:原写死全局 30min 太勤/费 token——Seven 拍默认改 2h、最小档 15min(去 10min);
+硬地板同步提到 900,防客户端绕 UI。**② 心跳激活门**:**首次成功聊天前,所有自发主动唤醒
+(heartbeat/photo_added/arrived_at_anchor/unlock_after_absence/screen_watch/introduction)在
+enqueue 前拦掉、零 token**;首聊成功后自然开启。为什么:用户刚填 API key、卡 onboarding、根本没和
+AI 说过话时就开心跳纯烧 token、不符预期(Seven 要求加门)。
+
+- **后端(Codex)**:`core/store.py` 加 `wake_interval_sec`(常量+`normalize_*`+F1 keep-old-on-save)
+  与 `first_chat_ok_at` flag(幂等、不进 save 白名单防伪造激活);`proactive/gate.py`
+  `_build_proactive_v2_wake_decision` decision 带 `wake_interval_sec`,且**未激活 && 非 manual →
+  `activation_pending` 不 enqueue**(优先于原 wake_control);`perception/service.py` 4 条 direct-wake
+  旁路(`_maybe_wake`/`_fire_wake`/`_submit_wake_event_v2_compat`/`_fire_wake_event_v2`)同拦;
+  `agent_runtime/supervisor.py` post-respawn introduction 也拦;`chat/routes.py` **flip 点**=
+  `/v1/chat/response` 成功回复 `role=user & source=model_api` 消息时 `mark_first_chat_ok()`。
+- **consumer(CC)**:`_proactive_tick_interval_for_broadcast_state` 加 per-user 入参,读
+  `decision.wake_interval_sec` + clamp `[900,43200]`,env fallback 对齐 7200;调度点 L6271 接线。
+- **iOS(CC)**:设置页 `proactiveCard` 7 档 Menu 选择器(默认高亮 2h、ambient 关置灰)+
+  `ProactiveStateResponse.wake_interval_sec` + `updateProactiveSwitch(wakeIntervalSec:)` + 双语文案。
+- **验证**:全量 PG e2e **1462 passed**(10 个 pre-existing 非本次,已用清洁 origin/test worktree 隔离);
+  consumer 189 passed;iOS `xcodebuild`(iphonesimulator) **BUILD SUCCEEDED**。双向 review(CC 审后端 /
+  Codex 审 consumer)。e2e 中揪出并修:F1 introduction 旁路未拦、11 个 perception 测试漏更新激活。
+- **commit**:test `0bc9e7d`、iOS main `758c823`。默认 30min→2h、最小 10min→15min。
+- **影响文档**:`docs/WAKE_INTERVAL_CUSTOM_PLAN_2026-06-29.md` 整合成 SHIPPED 最终版(含激活门)。
+
 ### [BLOCKER→FIXED] claude 有 Read 授权仍"没权限读图"——非交互缺 permission-mode → 幻觉
 
 单 runner + wedge 修好后,claude(sonnet-4-5)发图**仍"我需要权限才能读取这张图片"**。
