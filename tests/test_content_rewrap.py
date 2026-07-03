@@ -283,3 +283,42 @@ def test_rewrap_skips_already_current_items_on_second_pass(client, monkeypatch):
     assert calls["n"] == first_calls  # 未新增解密调用
     assert b2["summary"]["total_skipped"] >= 3
     assert b2["summary"]["total_rewrapped"] == 0
+
+
+def test_client_swap_clears_stale_content_pk_fpr_no_false_skip(client, monkeypatch):
+    user_id, api_key = _register(client)
+    _seed_encrypted_content(user_id)
+    key_a = _b64(b"\x33" * 32)
+
+    calls = {"n": 0}
+    def fake_decrypt(envelope, key, purpose):
+        calls["n"] += 1
+        return f"plaintext:{purpose}:{envelope.get('id')}".encode()
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)
+
+    # First rewrap to key A stamps content_pk_fpr on chat1.
+    r1 = client.post("/v1/content/rewrap-to-current-key",
+                     json={"public_key": key_a}, headers=_headers(api_key))
+    assert r1.get_json()["status"] == "ok"
+
+    # Client swaps chat1 in place: new K_user + a FORGED stamp matching key A.
+    fpr_a = appmod.core_envelope._content_public_key_fingerprint(base64.b64decode(key_a))
+    swap_env = _old_env(user_id, "chat1")
+    swap_env["K_user"] = _b64(b"\x09" * 48)
+    swap_env["content_pk_fpr"] = fpr_a
+    sres = client.post("/v1/content/swap",
+                       json={"items": [{"type": "chat", "id": "chat1", "envelope": swap_env}]},
+                       headers=_headers(api_key))
+    assert sres.status_code == 200, sres.get_data(as_text=True)
+
+    # Stored stamp must have been cleared (not the forged fpr_a).
+    store = appmod.get_store(user_id)
+    with store.chat_lock:
+        chat = [m for m in store.chat_messages if m["id"] == "chat1"][0]
+    assert chat.get("content_pk_fpr") != fpr_a
+
+    # A subsequent rewrap to key A must NOT false-skip chat1: it must re-decrypt it.
+    before = calls["n"]
+    client.post("/v1/content/rewrap-to-current-key",
+                json={"public_key": key_a}, headers=_headers(api_key))
+    assert calls["n"] > before

@@ -139,6 +139,8 @@ def _swap_chat(store: "UserStore", msg_id: str, env: dict) -> str:
             msg["enclave_pk_fpr"] = env.get("enclave_pk_fpr", "")
             if env.get("content_pk_fpr"):
                 msg["content_pk_fpr"] = env["content_pk_fpr"]
+            else:
+                msg.pop("content_pk_fpr", None)
             msg["visibility"] = env["visibility"]
             msg["owner_user_id"] = env["owner_user_id"]
             # Full-row replace: the K_enclave key may have been removed, which a
@@ -161,6 +163,7 @@ def _swap_memory_inplace(moments: list, mom_id: str, env: dict) -> str:
         else:
             m.pop("K_enclave", None)
         m["enclave_pk_fpr"] = env.get("enclave_pk_fpr", "")
+        m.pop("content_pk_fpr", None)  # swap is not a rewrap; drop any stale server stamp
         m["visibility"] = env["visibility"]
         m["owner_user_id"] = env["owner_user_id"]
         return "ok"
@@ -223,6 +226,8 @@ def _apply_envelope_fields(record: dict, env: dict) -> None:
     record["enclave_pk_fpr"] = env.get("enclave_pk_fpr", "")
     if env.get("content_pk_fpr"):
         record["content_pk_fpr"] = env["content_pk_fpr"]
+    else:
+        record.pop("content_pk_fpr", None)
     record["visibility"] = env["visibility"]
     record["owner_user_id"] = env["owner_user_id"]
 
@@ -311,6 +316,8 @@ def content_swap():
         if env["owner_user_id"] != store.user_id:
             results.append({"type": itype, "id": iid, "status": "error: owner_user_id does not match caller"})
             continue
+
+        env.pop("content_pk_fpr", None)  # content_pk_fpr is a server-only stamp; never trust the client
 
         if itype == "chat":
             # _swap_chat persists the matched message to the DB itself.
