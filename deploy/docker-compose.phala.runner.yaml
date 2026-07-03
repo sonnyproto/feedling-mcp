@@ -83,7 +83,7 @@ services:
   # and (unlike same-CVM shared-volume) a cross-runner takeover re-materializes the
   # home (cheap; the driver resume handle lives in the lease row, not the volume).
   agent-runner-0:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:b5e8ea8   # CI pins the sha
+    image: ghcr.io/teleport-computer/feedling-agent-runner:01788c0   # CI pins the sha
     container_name: agent-runner-0
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
@@ -94,7 +94,7 @@ services:
       - feedling_agent_runtime_r0:/agent-data
 
   agent-runner-1:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:b5e8ea8   # CI pins the sha
+    image: ghcr.io/teleport-computer/feedling-agent-runner:01788c0   # CI pins the sha
     container_name: agent-runner-1
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
