@@ -19,10 +19,15 @@ from proactive import dashboard as proactive_dashboard  # noqa: E402
 from proactive import dream_scheduler as proactive_dream_scheduler  # noqa: E402
 from proactive import resident_runtime_v2 as proactive_resident_runtime_v2  # noqa: E402
 from proactive import routes as proactive_routes  # noqa: E402
+from perception import service as perception_service  # noqa: E402
 from push import apns as push_apns  # noqa: E402
 from core import config as core_config  # noqa: E402
 
 from conftest import seed_user  # noqa: E402
+
+
+def _mark_proactive_activated(user_id: str) -> None:
+    appmod.get_store(user_id).mark_first_chat_ok(at_iso="2026-07-03T00:00:00")
 
 
 def _patch_resident_scheduled_route_dependencies(monkeypatch):
@@ -534,6 +539,74 @@ def test_proactive_tick_response_includes_wake_interval_sec(tmp_path, monkeypatc
     assert body["decision"]["wake_interval_sec"] == 900
 
 
+def test_proactive_activation_gate_blocks_self_initiated_wakes_until_first_chat_ok(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_proactive_activation_gate_key"
+    user_id = "usr_endpoint_proactive_activation_gate"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
+    store = appmod.get_store(user_id)
+
+    blocked_payloads = [
+        {"trigger": "heartbeat_broadcast_off", "broadcast_state": "off"},
+        {"trigger": "photo_added"},
+        {"trigger": "arrived_at_anchor"},
+        {"trigger": "unlock_after_absence"},
+        {"job_kind": "screen_watch", "broadcast_state": "on"},
+    ]
+    for payload in blocked_payloads:
+        decision = appmod._build_proactive_v2_wake_decision(store, payload)
+        assert decision["should_reach_out"] is False
+        assert decision["should_wake_agent"] is False
+        assert decision["reason"] == "activation_pending"
+        assert decision["gate_input"]["activation_pending"] is True
+
+    client = appmod.app.test_client()
+    tick = client.post(
+        "/v1/proactive/tick",
+        headers={"X-API-Key": api_key},
+        json={"trigger": "heartbeat_broadcast_off", "broadcast_state": "off"},
+    )
+    assert tick.status_code == 200
+    body = tick.get_json()
+    assert body["enqueued"] is False
+    assert body["job"] is None
+    assert body["decision"]["reason"] == "activation_pending"
+
+    manual = appmod._build_proactive_v2_wake_decision(store, {"manual": True})
+    assert manual["should_wake_agent"] is True
+    assert manual["reason"] == "wake_created"
+
+    store.mark_first_chat_ok(at_iso="2026-07-03T00:00:00")
+    activated = appmod._build_proactive_v2_wake_decision(
+        store,
+        {"trigger": "heartbeat_broadcast_off", "broadcast_state": "off"},
+    )
+    assert activated["should_wake_agent"] is True
+    assert activated["reason"] == "wake_created"
+    assert activated["gate_input"]["activation_pending"] is False
+
+
+def test_perception_direct_wake_respects_proactive_activation_gate(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    user_id = "usr_perception_direct_wake_activation"
+    seed_user(user_id)
+    store = appmod.get_store(user_id)
+
+    perception_service._fire_wake(user_id, "device", "unlock after absence", 1000.0)
+    assert store.list_proactive_jobs(since_epoch=0) == []
+
+    store.mark_first_chat_ok(at_iso="2026-07-03T00:00:00")
+    perception_service._fire_wake(user_id, "device", "unlock after absence", 1001.0)
+    jobs = store.list_proactive_jobs(since_epoch=0)
+    assert len(jobs) == 1
+    assert jobs[0]["trigger"] == "perception_device"
+
+
 def test_proactive_tick_delivery_off_still_allows_presence_wake(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
@@ -542,6 +615,7 @@ def test_proactive_tick_delivery_off_still_allows_presence_wake(tmp_path, monkey
     user_id = "usr_endpoint_proactive_delivery_off_wake"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    _mark_proactive_activated(user_id)
 
     client = appmod.app.test_client()
     headers = {"X-API-Key": api_key}
@@ -635,6 +709,7 @@ def test_screen_watch_tick_preserves_job_kind_and_trigger(tmp_path, monkeypatch)
     user_id = "usr_screen_watch"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    _mark_proactive_activated(user_id)
 
     client = appmod.app.test_client()
     resp = client.post(
@@ -682,6 +757,7 @@ def test_screen_watch_tick_does_not_sample_recent_frames_implicitly(tmp_path, mo
     user_id = "usr_screen_watch_no_sample"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    _mark_proactive_activated(user_id)
 
     client = appmod.app.test_client()
     resp = client.post(
@@ -714,6 +790,7 @@ def test_auto_proactive_v2_wake_samples_frames_without_gate_llm(tmp_path, monkey
     user_id = "usr_endpoint_proactive_auto"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    _mark_proactive_activated(user_id)
     store = appmod.get_store(user_id)
     store.frames_meta.append({
         "id": "abcd1234abcd1234",
@@ -750,6 +827,7 @@ def test_auto_proactive_v2_wake_does_not_block_after_recent_user_chat(tmp_path, 
     user_id = "usr_endpoint_proactive_recent_chat"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    _mark_proactive_activated(user_id)
     store = appmod.get_store(user_id)
     store.append_chat("user", "ios", {
         "id": "msg_recent_user",
@@ -787,6 +865,7 @@ def test_auto_proactive_v2_wake_does_not_require_gate_model(tmp_path, monkeypatc
     user_id = "usr_endpoint_proactive_auto_no_model"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    _mark_proactive_activated(user_id)
     store = appmod.get_store(user_id)
     store.frames_meta.append({
         "id": "efef1234efef1234",
@@ -815,6 +894,7 @@ def test_auto_proactive_v2_wake_suppresses_job_without_frames(tmp_path, monkeypa
     user_id = "usr_endpoint_proactive_auto_false"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    _mark_proactive_activated(user_id)
 
     client = appmod.app.test_client()
     resp = client.post("/v1/proactive/tick", headers={"X-API-Key": api_key}, json={})
@@ -839,6 +919,7 @@ def test_auto_proactive_v2_schedule_heartbeats_split_presence_and_screen_wakes(t
     user_id = "usr_endpoint_proactive_auto_schedule"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    _mark_proactive_activated(user_id)
 
     client = appmod.app.test_client()
     headers = {"X-API-Key": api_key}
@@ -896,6 +977,7 @@ def test_auto_proactive_v2_away_state_does_not_resurrect_legacy_wake_gate(tmp_pa
     user_id = "usr_endpoint_proactive_away"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
     seed_user(user_id)
+    _mark_proactive_activated(user_id)
 
     client = appmod.app.test_client()
     headers = {"X-API-Key": api_key}

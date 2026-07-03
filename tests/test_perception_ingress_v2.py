@@ -21,6 +21,10 @@ def _load_fixture(name: str) -> dict:
     return json.loads((FIXTURES / name).read_text())
 
 
+def _activate_proactive(monkeypatch) -> None:
+    monkeypatch.setattr(service, "_proactive_activation_ready", lambda uid: True)
+
+
 class _Store:
     def __init__(self):
         self.events = {}
@@ -477,6 +481,7 @@ def test_photo_added_wake_is_differ_event_with_digest_and_origin_refs(monkeypatc
     monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
     monkeypatch.setattr(service, "_fire_wake_event_v2", lambda event: emitted.append(event))
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled", lambda user_or_store: True)
+    _activate_proactive(monkeypatch)
 
     out, code = service.photo_evaluate(
         "u1",
@@ -545,6 +550,7 @@ def test_device_event_phash_respects_broadcast_state(monkeypatch):
     monkeypatch.setattr(service, "store", fake)
     monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
     monkeypatch.setattr(service, "_fire_wake_event_v2", lambda event: emitted.append(event))
+    _activate_proactive(monkeypatch)
 
     off_event = {
         "event_id": "evt_off",
@@ -572,6 +578,7 @@ def test_device_event_unlock_after_absence_wakes(monkeypatch):
     monkeypatch.setattr(service, "store", fake)
     monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
     monkeypatch.setattr(service, "_fire_wake_event_v2", lambda event: emitted.append(event))
+    _activate_proactive(monkeypatch)
 
     out = service.ingest_device_event_v2("u_unlock_after_absence", {
         "event_id": "evt_unlock",

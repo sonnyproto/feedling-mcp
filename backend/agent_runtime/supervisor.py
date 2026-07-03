@@ -488,6 +488,8 @@ def _enqueue_introduction_job_if_needed(
         from core.store import get_store
         get_store_fn = get_store
     store = get_store_fn(user_id)
+    if not store.proactive_activation_ready():
+        return None
     if _has_active_introduction_job(store):
         return None
     clock = now() if callable(now) else float(now)

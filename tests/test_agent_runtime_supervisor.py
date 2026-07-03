@@ -175,6 +175,10 @@ def test_enqueue_introduction_job_when_profile_fields_empty(monkeypatch):
 
         def __init__(self):
             self.jobs = []
+            self.activated = False
+
+        def proactive_activation_ready(self):
+            return self.activated
 
         def list_proactive_jobs(self, since_epoch=0, limit=0):
             return list(self.jobs)
@@ -190,6 +194,15 @@ def test_enqueue_introduction_job_when_profile_fields_empty(monkeypatch):
         lambda entry, **kwargs: ({"decrypt_status": "ok", "self_introduction": "", "signature": []}, ""),
     )
 
+    pending = supervisor_mod._enqueue_introduction_job_if_needed(
+        "u_1",
+        {"api_key": "k"},
+        api_url="http://backend",
+        enclave_url="https://enclave",
+        now=lambda: T0 - 1,
+        get_store_fn=lambda _uid: store,
+    )
+    store.activated = True
     job = supervisor_mod._enqueue_introduction_job_if_needed(
         "u_1",
         {"api_key": "k"},
@@ -207,6 +220,8 @@ def test_enqueue_introduction_job_when_profile_fields_empty(monkeypatch):
         get_store_fn=lambda _uid: store,
     )
 
+    assert pending is None
+    assert store.jobs == [job]
     assert job["job_kind"] == "introduction"
     assert job["trigger"] == "post_spawn_genesis"
     assert job["source"] == "agent_initiated_proactive"

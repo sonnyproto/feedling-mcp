@@ -4052,3 +4052,41 @@ def test_advance_past_unfetchable_boundary_message_gets_nudged():
     ts = 1783080703.7508044
     out = crc._advance_past_unfetchable(ts, [{"id": "x", "ts": ts}])
     assert out > ts
+
+
+# ---------------------------------------------------------------------------
+# Per-user heartbeat cadence: _proactive_tick_interval_for_broadcast_state reads
+# the user's wake_interval_sec (companionship frequency) from the tick decision.
+# ---------------------------------------------------------------------------
+
+def test_wake_interval_per_user_value_wins():
+    # A valid per-user value is used verbatim (within clamp range).
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 900) == 900
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 3600) == 3600
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 43200) == 43200
+
+
+def test_wake_interval_clamps_out_of_range():
+    # Below the 15min floor is raised to 900; above the 12h ceiling capped at 43200.
+    assert crc._proactive_tick_interval_for_broadcast_state("off", -5) == 900
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 0) == 900
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 100) == 900
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 899) == 900
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 43201) == 43200
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 999999) == 43200
+
+
+def test_wake_interval_falls_back_when_absent_or_invalid():
+    # Missing / non-numeric -> env fallback (aligned to 7200 default).
+    fallback = max(60, crc.PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC)
+    assert crc._proactive_tick_interval_for_broadcast_state("off", None) == fallback
+    assert crc._proactive_tick_interval_for_broadcast_state("off", "abc") == fallback
+    # Fallback default itself is the 2h product default when env is unset.
+    assert crc.PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC == 7200
+
+
+def test_wake_interval_independent_of_broadcast_state():
+    # Heartbeat cadence is decoupled from screen-share broadcast_state: the
+    # per-user value applies regardless of on/off/paused/unknown.
+    for state in ("off", "on", "broadcasting", "paused", "unknown", ""):
+        assert crc._proactive_tick_interval_for_broadcast_state(state, 3600) == 3600

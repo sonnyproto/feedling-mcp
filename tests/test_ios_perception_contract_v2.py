@@ -205,6 +205,7 @@ def test_ios_photo_fixture_stores_sensitive_scene_without_hard_block(monkeypatch
     monkeypatch.setattr(service, "store", fake)
     monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled", lambda user_or_store: True)
+    monkeypatch.setattr(service, "_proactive_activation_ready", lambda uid: True)
     wakes = []
     monkeypatch.setattr(service, "_fire_wake_event_v2", lambda event: wakes.append(event))
 

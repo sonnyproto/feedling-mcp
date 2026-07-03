@@ -58,7 +58,7 @@ Optional:
   PROACTIVE_TICK_INTERVAL_SEC
                         Broadcast-on/unknown tick interval in seconds (default: 300)
   PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC
-                        Broadcast-off tick interval in seconds (default: 1800)
+                        Broadcast-off tick interval in seconds (default: 7200)
   PROACTIVE_TICK_START_DELAY_SEC
                         Delay before the first automatic wake tick (default: 15)
   PROACTIVE_SCHEDULED_FIRE_ENABLED
@@ -230,8 +230,11 @@ PROACTIVE_TICK_INTERVAL_SEC = int(os.environ.get("PROACTIVE_TICK_INTERVAL_SEC", 
 PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC = int(
     os.environ.get("PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC", str(PROACTIVE_TICK_INTERVAL_SEC))
 )
+# Fallback heartbeat cadence when the backend tick decision carries no per-user
+# wake_interval_sec (legacy / rollout). Default aligned to the product default of
+# 2h (7200) set 2026-07-04, so no path silently reverts to the old 30min.
 PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC = int(
-    os.environ.get("PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", "1800")
+    os.environ.get("PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", "7200")
 )
 PROACTIVE_TICK_START_DELAY_SEC = int(os.environ.get("PROACTIVE_TICK_START_DELAY_SEC", "15"))
 # Screen-watch lane — decoupled from the heavy heartbeat. While the user is
@@ -3493,12 +3496,35 @@ def _proactive_tick_trigger_for_broadcast_state(broadcast_state: str) -> str:
     return "heartbeat_unknown"
 
 
-def _proactive_tick_interval_for_broadcast_state(broadcast_state: str) -> int:
+# Per-user "companionship frequency" (wake_interval_sec) clamp — mirrors the
+# backend hard floor/ceiling (backend/core/store.py): min 15min, max 12h.
+PROACTIVE_WAKE_INTERVAL_MIN_SEC = 900
+PROACTIVE_WAKE_INTERVAL_MAX_SEC = 43200
+
+
+def _proactive_tick_interval_for_broadcast_state(
+    broadcast_state: str, wake_interval_sec: Any = None
+) -> int:
     # Heartbeat is now DECOUPLED from screen sharing: broadcast no longer
     # accelerates the heavy presence heartbeat. Screen attention is handled by the
     # separate lightweight screen-watch lane (SCREEN_WATCH_INTERVAL_SEC). The
     # heartbeat keeps a single steady cadence regardless of broadcast_state.
     # (PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC kept for back-compat / override.)
+    #
+    # Per-user cadence: the backend tick decision carries the user's chosen
+    # wake_interval_sec ("companionship frequency"). When present and numeric it
+    # wins, clamped defensively to [900, 43200] to mirror the backend guard. A
+    # missing or non-numeric value falls back to the env default.
+    if wake_interval_sec is not None:
+        try:
+            interval = int(wake_interval_sec)
+        except (TypeError, ValueError):
+            pass
+        else:
+            return max(
+                PROACTIVE_WAKE_INTERVAL_MIN_SEC,
+                min(PROACTIVE_WAKE_INTERVAL_MAX_SEC, interval),
+            )
     return max(60, PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC)
 
 
@@ -6298,7 +6324,9 @@ def run() -> None:
                         last_broadcast_state = str(
                             decision.get("broadcast_state") or last_broadcast_state or ""
                         ).strip().lower()
-                        next_interval = _proactive_tick_interval_for_broadcast_state(last_broadcast_state)
+                        next_interval = _proactive_tick_interval_for_broadcast_state(
+                            last_broadcast_state, decision.get("wake_interval_sec")
+                        )
                         log.info(
                             "proactive wake tick wake=%s reason=%s enqueued=%s frames=%d broadcast=%s next=%ds",
                             bool(decision.get("should_reach_out")),

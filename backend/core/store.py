@@ -546,6 +546,7 @@ class UserStore:
             # preference.
             "wake_directive": "",
             "wake_interval_sec": PROACTIVE_WAKE_INTERVAL_DEFAULT_SEC,
+            "first_chat_ok_at": "",
             "updated_at": datetime.now().isoformat(),
         }
         try:
@@ -641,6 +642,24 @@ class UserStore:
         cur["version"] = 2
         cur["updated_at"] = datetime.now().isoformat()
         with self.proactive_lock:
+            db.set_blob(self.user_id, "proactive_settings", cur)
+        return cur
+
+    def first_chat_ok_at(self) -> str:
+        settings = self.load_proactive_settings()
+        return str(settings.get("first_chat_ok_at") or "").strip()
+
+    def proactive_activation_ready(self) -> bool:
+        return bool(self.first_chat_ok_at())
+
+    def mark_first_chat_ok(self, *, at_iso: str | None = None) -> dict:
+        with self.proactive_lock:
+            cur = self.load_proactive_settings()
+            if str(cur.get("first_chat_ok_at") or "").strip():
+                return cur
+            cur["first_chat_ok_at"] = str(at_iso or datetime.now().isoformat())
+            cur["version"] = 2
+            cur["updated_at"] = datetime.now().isoformat()
             db.set_blob(self.user_id, "proactive_settings", cur)
         return cur
 

@@ -127,6 +127,7 @@ def env(monkeypatch):
     monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
     monkeypatch.setattr(service, "_fire_wake_event_v2",
                         lambda event: wakes.append((event.trigger, event.change_digest)))
+    monkeypatch.setattr(service, "_proactive_activation_ready", lambda uid: True)
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
                         lambda user_or_store: False)
     return fake, wakes
@@ -692,6 +693,19 @@ def test_wake_suppressed_when_settings_disabled_or_dnd_or_away(env, monkeypatch)
         assert wakes == [], f"case {reason}: wake should be suppressed"
         assert any(e.get("type") == "suppressed" and e.get("reason") == reason
                    for e in fake.read_events(uid)), f"case {reason}"
+
+
+def test_wake_suppressed_until_proactive_activation(env, monkeypatch):
+    fake, wakes = env
+    monkeypatch.setattr(service, "_app_proactive_settings", lambda uid: {})
+    monkeypatch.setattr(service, "_proactive_activation_ready", lambda uid: False)
+    uid = "u_activation_pending"
+    _ingest_location(uid, "gym")
+    assert wakes == []
+    events = fake.read_events(uid)
+    assert any(e.get("type") == "suppressed" and e.get("reason") == "activation_pending"
+               for e in events)
+    assert not any(e.get("type") == "wake" for e in events)
 
 
 def test_wake_fires_normally_when_gate_open(env, monkeypatch):
