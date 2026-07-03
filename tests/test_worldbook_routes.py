@@ -8,6 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import app as appmod  # noqa: E402
+from worldbook import routes as worldbook_routes  # noqa: E402
 from core import config as core_config  # noqa: E402
 
 
@@ -101,3 +102,30 @@ def test_worldbook_upsert_rejects_wrong_owner(client):
     )
     assert res.status_code == 400
     assert res.get_json()["error"] == "owner_user_id does not match caller"
+
+
+def test_worldbook_upsert_rejects_over_cap_content_reported_by_enclave(client, monkeypatch):
+    user_id, api_key = _register(client)
+
+    def fake_validate(api_key_arg, world_books, messages, *, runtime_token=None):
+        assert api_key_arg == api_key
+        assert [item["id"] for item in world_books] == ["too-big"]
+        assert messages == []
+        return {"block": "", "matched_names": [], "rejected_over_cap": ["too-big"]}
+
+    monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "http://enclave.test")
+    monkeypatch.setattr(
+        worldbook_routes.worldbook_readside_core,
+        "post_enclave_worldbook_match",
+        fake_validate,
+    )
+
+    res = client.post(
+        "/v1/worldbook/upsert",
+        json=_env(user_id, "too-big"),
+        headers=_headers(api_key),
+    )
+
+    assert res.status_code == 400
+    assert res.get_json() == {"error": "content_too_long", "id": "too-big", "max_chars": 20000}
+    assert client.get("/v1/worldbook/list", headers=_headers(api_key)).get_json() == {"envelopes": []}

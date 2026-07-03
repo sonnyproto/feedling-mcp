@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime
+import os
 
 from flask import Blueprint, jsonify, request
 
 from accounts import auth
 from content.routes import _apply_envelope_fields, _swap_envelope_missing
+import worldbook_readside_core
 
 bp = Blueprint("worldbook", __name__)
 
@@ -43,6 +45,33 @@ def _validate_envelope(env: dict, owner_user_id: str) -> str | None:
     return None
 
 
+def _validate_content_cap_with_enclave(record: dict) -> tuple[dict, int] | None:
+    """Fail closed on deploys that have the enclave configured.
+
+    The upsert endpoint receives ciphertext, so it cannot inspect plaintext
+    length locally. The enclave decrypt path owns that check; this call makes the
+    write path reject over-cap world book content before it is persisted.
+    """
+    if not os.environ.get("FEEDLING_ENCLAVE_URL", "").strip():
+        return None
+    api_key = auth._extract_api_key()
+    runtime_token = request.headers.get("X-Feedling-Runtime-Token", "").strip() or None
+    try:
+        result = worldbook_readside_core.post_enclave_worldbook_match(
+            api_key, [record], [], runtime_token=runtime_token)
+    except RuntimeError as e:
+        return {"error": "worldbook_validate_unavailable", "detail": str(e)}, 503
+    rejected = {str(item) for item in result.get("rejected_over_cap") or []}
+    entry_id = str(record.get("id") or "").strip()
+    if entry_id in rejected:
+        return {
+            "error": "content_too_long",
+            "id": entry_id,
+            "max_chars": worldbook_readside_core.WORLD_BOOK_CONTENT_CAP,
+        }, 400
+    return None
+
+
 @bp.route("/v1/worldbook/list", methods=["GET"])
 def worldbook_list():
     store = auth.require_user()
@@ -64,6 +93,10 @@ def worldbook_upsert():
 
     record = {"id": str(env.get("id") or "").strip(), "updated_at": datetime.now().isoformat()}
     _apply_envelope_fields(record, env)
+    cap_error = _validate_content_cap_with_enclave(record)
+    if cap_error:
+        body, status = cap_error
+        return jsonify(body), status
     saved = store.upsert_world_book(record)
     return jsonify({"id": saved["id"]})
 
