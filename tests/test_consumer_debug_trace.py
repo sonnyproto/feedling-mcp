@@ -47,6 +47,19 @@ except ModuleNotFoundError:
 import tools.chat_resident_consumer as crc  # noqa: E402  (after env setup)
 
 
+@pytest.fixture(autouse=True)
+def _reset_debug_trace_cache():
+    """The `_DBG_TRACE_ENABLED` module-level cache must not leak between
+    tests — each test seeds it explicitly to exercise a specific state."""
+    crc._DBG_TRACE_ENABLED = {"val": None, "exp": 0.0}
+    yield
+    crc._DBG_TRACE_ENABLED = {"val": None, "exp": 0.0}
+
+
+def _seed_cache(val, ttl=999.0):
+    crc._DBG_TRACE_ENABLED = {"val": val, "exp": time.monotonic() + ttl}
+
+
 # ---------------------------------------------------------------------------
 # _cli_turn_metrics — claude driver
 # ---------------------------------------------------------------------------
@@ -155,6 +168,7 @@ def test_emit_debug_trace_returns_immediately_and_never_raises():
     by test_post_debug_trace_event_swallows_errors). Here we use a slow
     fake to prove dispatch is instant — the caller does not wait on the
     network call at all."""
+    _seed_cache(True)  # fresh + enabled, so a thread is spawned
     done = threading.Event()
 
     def _slow_post(payload):
@@ -176,6 +190,7 @@ def test_emit_debug_trace_returns_immediately_and_never_raises():
 def test_emit_debug_trace_dispatches_to_daemon_thread_with_expected_payload():
     """The event is posted asynchronously on a background thread; join it
     with a short timeout to confirm it actually fires with the right shape."""
+    _seed_cache(True)  # fresh + enabled, so a thread is spawned and posts
     recorded = {}
     done = threading.Event()
 
@@ -207,8 +222,128 @@ def test_emit_debug_trace_dispatches_to_daemon_thread_with_expected_payload():
 def test_emit_debug_trace_swallows_thread_spawn_failure():
     """Even if threading.Thread.start() itself raises, _emit_debug_trace
     must not propagate the exception."""
+    _seed_cache(True)  # fresh + enabled, so we actually attempt to spawn
     with patch.object(crc.threading, "Thread", side_effect=RuntimeError("boom")):
         assert crc._emit_debug_trace("agent", "x") is None
+
+
+# ---------------------------------------------------------------------------
+# TTL-cached enabled gate — the zero-cost off path, and the refresh path.
+# ---------------------------------------------------------------------------
+
+def test_emit_debug_trace_fresh_disabled_dispatches_nothing():
+    """Warm cache says disabled → no thread spawned, no network at all."""
+    _seed_cache(False)
+    with patch.object(crc.threading, "Thread") as mock_thread, \
+         patch.object(crc, "_post_debug_trace_event") as mock_post:
+        result = crc._emit_debug_trace("agent", "x")
+
+    assert result is None
+    assert mock_thread.call_count == 0
+    assert mock_post.call_count == 0
+
+
+def test_emit_debug_trace_fresh_enabled_dispatches_and_posts():
+    """Warm cache says enabled → a thread is spawned and it posts."""
+    _seed_cache(True)
+    done = threading.Event()
+    recorded = {}
+
+    def _fake_post_event(payload):
+        recorded["payload"] = payload
+        done.set()
+
+    with patch.object(crc, "_post_debug_trace_event", side_effect=_fake_post_event):
+        crc._emit_debug_trace("agent", "turn.done", trace_id="t-2")
+        assert done.wait(timeout=2), "background thread did not post within timeout"
+
+    assert recorded["payload"]["event"]["trace_id"] == "t-2"
+
+
+def test_emit_debug_trace_stale_unknown_probes_and_posts_when_enabled():
+    """Stale/unknown cache → try: refresh on the daemon thread, then post
+    if the refreshed value is enabled."""
+    crc._DBG_TRACE_ENABLED = {"val": None, "exp": 0.0}  # stale/unknown
+    done = threading.Event()
+    get_calls = []
+    post_calls = []
+
+    def _fake_get(url, params=None, headers=None, timeout=None):
+        get_calls.append(url)
+        resp = types.SimpleNamespace()
+        resp.raise_for_status = lambda: None
+        resp.json = lambda: {"enabled": True, "deploy_enabled": True}
+        return resp
+
+    def _fake_post_event(payload):
+        post_calls.append(payload)
+        done.set()
+
+    with patch.object(crc.httpx, "get", side_effect=_fake_get), \
+         patch.object(crc, "_post_debug_trace_event", side_effect=_fake_post_event):
+        crc._emit_debug_trace("agent", "x")
+        assert done.wait(timeout=2), "background thread did not complete within timeout"
+
+    assert len(get_calls) == 1
+    assert len(post_calls) == 1
+    assert crc._DBG_TRACE_ENABLED["val"] is True
+
+
+def test_refresh_debug_trace_enabled_caches_false_on_get_failure():
+    """Any failure talking to the backend (network error, bad JSON, non-2xx)
+    must be swallowed and cache False (fail-closed) — never raise."""
+    crc._DBG_TRACE_ENABLED = {"val": None, "exp": 0.0}
+    with patch.object(crc.httpx, "get", side_effect=RuntimeError("boom")):
+        crc._refresh_debug_trace_enabled()  # must not raise
+
+    assert crc._DBG_TRACE_ENABLED["val"] is False
+    assert crc._DBG_TRACE_ENABLED["exp"] > time.monotonic()
+
+
+def test_refresh_debug_trace_enabled_caches_true_when_both_flags_set():
+    crc._DBG_TRACE_ENABLED = {"val": None, "exp": 0.0}
+
+    def _fake_get(url, params=None, headers=None, timeout=None):
+        resp = types.SimpleNamespace()
+        resp.raise_for_status = lambda: None
+        resp.json = lambda: {"enabled": True, "deploy_enabled": True}
+        return resp
+
+    with patch.object(crc.httpx, "get", side_effect=_fake_get):
+        crc._refresh_debug_trace_enabled()
+
+    assert crc._DBG_TRACE_ENABLED["val"] is True
+    assert crc._DBG_TRACE_ENABLED["exp"] > time.monotonic()
+
+
+def test_refresh_debug_trace_enabled_false_when_deploy_disabled():
+    """Both the per-user gate AND the deploy kill-switch must be true."""
+    crc._DBG_TRACE_ENABLED = {"val": None, "exp": 0.0}
+
+    def _fake_get(url, params=None, headers=None, timeout=None):
+        resp = types.SimpleNamespace()
+        resp.raise_for_status = lambda: None
+        resp.json = lambda: {"enabled": True, "deploy_enabled": False}
+        return resp
+
+    with patch.object(crc.httpx, "get", side_effect=_fake_get):
+        crc._refresh_debug_trace_enabled()
+
+    assert crc._DBG_TRACE_ENABLED["val"] is False
+
+
+def test_debug_trace_probably_enabled_stale_returns_unknown():
+    crc._DBG_TRACE_ENABLED = {"val": True, "exp": 0.0}  # expired
+    known, enabled = crc._debug_trace_probably_enabled()
+    assert known is False
+    assert enabled is False
+
+
+def test_debug_trace_probably_enabled_fresh_returns_cached_value():
+    _seed_cache(True)
+    assert crc._debug_trace_probably_enabled() == (True, True)
+    _seed_cache(False)
+    assert crc._debug_trace_probably_enabled() == (True, False)
 
 
 # ---------------------------------------------------------------------------

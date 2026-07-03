@@ -428,21 +428,75 @@ def _post_debug_trace_event(payload: dict) -> None:
         pass  # observability must never affect the turn
 
 
+# Short-TTL cache of whether debug-trace recording is enabled (per-user gate AND
+# deploy kill-switch both true). Lets the hot path (`_emit_debug_trace`) skip
+# all work — including spawning a thread — on every turn while it's off,
+# instead of paying a POST (that the backend would just no-op) each time.
+_DBG_TRACE_ENABLED = {"val": None, "exp": 0.0}
+_DBG_TRACE_TTL = 60.0
+
+
+def _debug_trace_probably_enabled() -> tuple[bool, bool]:
+    """Pure, non-network read of the cached enabled flag.
+
+    Returns (known, enabled). `known` is True only when the cache is fresh
+    (not expired) and has a value; in that case `enabled` reflects it.
+    Otherwise returns (False, False) — the enabled value is meaningless when
+    stale/unknown and callers must not act on it."""
+    if _DBG_TRACE_ENABLED["val"] is not None and time.monotonic() < _DBG_TRACE_ENABLED["exp"]:
+        return True, bool(_DBG_TRACE_ENABLED["val"])
+    return False, False
+
+
+def _refresh_debug_trace_enabled() -> None:
+    """Refresh the cached debug-trace enabled flag from the backend. Runs on
+    the daemon thread spawned by `_emit_debug_trace` — never on the calling
+    thread, never raises. Fail-closed: any error (network, bad JSON, non-2xx)
+    caches False so we don't keep hammering an unhappy backend every turn."""
+    enabled = False
+    try:
+        resp = httpx.get(
+            f"{FEEDLING_API_URL}/v1/debug/trace",
+            params={"limit": 1},
+            headers=_HEADERS, timeout=2,
+        )
+        resp.raise_for_status()
+        body = resp.json() or {}
+        enabled = bool(body.get("enabled") and body.get("deploy_enabled"))
+    except Exception:
+        enabled = False  # observability must never affect the turn; fail closed
+    _DBG_TRACE_ENABLED["val"] = enabled
+    _DBG_TRACE_ENABLED["exp"] = time.monotonic() + _DBG_TRACE_TTL
+
+
 def _emit_debug_trace(subsystem: str, type: str, *, status: str = "ok",
                       summary: str = "", explain: str = "", detail: dict | None = None,
                       content_excerpt: dict | None = None, trace_id: str = "",
                       dur_ms: float | None = None) -> None:
-    """Fire-and-forget flow-trace emit. Offloads the POST to a daemon thread
-    and returns immediately, so it never blocks or slows a turn — even if the
-    backend is slow/unreachable. The backend gates + drops it if debug is off."""
+    """Fire-and-forget flow-trace emit. Offloads all network I/O (both the
+    cache-refresh GET and the event POST) to a daemon thread and returns
+    immediately, so it never blocks or slows a turn — even if the backend is
+    slow/unreachable. When the cache is warm and says disabled, this is a
+    zero-cost no-op: no thread spawned, no network at all."""
     try:
+        known, enabled = _debug_trace_probably_enabled()
+        if known and not enabled:
+            return  # warm cache says off — do essentially zero work
         payload = {"event": {
             "subsystem": subsystem, "type": type, "status": status,
             "summary": summary, "explain": explain, "detail": detail or {},
             "content_excerpt": content_excerpt or {}, "trace_id": trace_id,
             "turn_id": trace_id, "actor": "vps_resident", "dur_ms": dur_ms,
         }}
-        threading.Thread(target=_post_debug_trace_event, args=(payload,), daemon=True).start()
+
+        def _dispatch() -> None:
+            if not known:
+                _refresh_debug_trace_enabled()
+            _, still_enabled = _debug_trace_probably_enabled()
+            if still_enabled:
+                _post_debug_trace_event(payload)
+
+        threading.Thread(target=_dispatch, daemon=True).start()
     except Exception:
         pass  # observability must never affect the turn
 
