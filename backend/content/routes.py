@@ -137,6 +137,10 @@ def _swap_chat(store: "UserStore", msg_id: str, env: dict) -> str:
             else:
                 msg.pop("K_enclave", None)
             msg["enclave_pk_fpr"] = env.get("enclave_pk_fpr", "")
+            if env.get("content_pk_fpr"):
+                msg["content_pk_fpr"] = env["content_pk_fpr"]
+            else:
+                msg.pop("content_pk_fpr", None)
             msg["visibility"] = env["visibility"]
             msg["owner_user_id"] = env["owner_user_id"]
             # Full-row replace: the K_enclave key may have been removed, which a
@@ -159,6 +163,7 @@ def _swap_memory_inplace(moments: list, mom_id: str, env: dict) -> str:
         else:
             m.pop("K_enclave", None)
         m["enclave_pk_fpr"] = env.get("enclave_pk_fpr", "")
+        m.pop("content_pk_fpr", None)  # swap is not a rewrap; drop any stale server stamp
         m["visibility"] = env["visibility"]
         m["owner_user_id"] = env["owner_user_id"]
         return "ok"
@@ -219,6 +224,10 @@ def _apply_envelope_fields(record: dict, env: dict) -> None:
     else:
         record.pop("K_enclave", None)
     record["enclave_pk_fpr"] = env.get("enclave_pk_fpr", "")
+    if env.get("content_pk_fpr"):
+        record["content_pk_fpr"] = env["content_pk_fpr"]
+    else:
+        record.pop("content_pk_fpr", None)
     record["visibility"] = env["visibility"]
     record["owner_user_id"] = env["owner_user_id"]
 
@@ -231,6 +240,7 @@ def _build_rewrapped_envelope(
     user_pk: bytes,
     enclave_pk: bytes,
     kind: str,
+    current_fpr: str = "",
 ) -> tuple[dict | None, str, str]:
     item_id = str(record.get("id") or "")
     if not _has_encrypted_content_record(record):
@@ -239,6 +249,10 @@ def _build_rewrapped_envelope(
         return None, "skipped_local_only", ""
     if not record.get("K_enclave"):
         return None, "skipped_missing_enclave_key", ""
+    # 已是当前钥 → 跳过,不进 enclave。仅 rewrap 会盖 content_pk_fpr,故字段与
+    # K_user 始终由同一 env 原子写入、二者一致可信。
+    if current_fpr and record.get("content_pk_fpr") == current_fpr:
+        return None, "skipped_already_current", ""
     try:
         plaintext = core_enclave._decrypt_envelope_via_enclave(
             record,
@@ -256,6 +270,7 @@ def _build_rewrapped_envelope(
             visibility="shared",
             item_id=item_id or None,
         )
+        env["content_pk_fpr"] = current_fpr
         return env, "rewrapped", ""
     except Exception as e:
         return None, "error", f"envelope_build_failed:{type(e).__name__}:{str(e)}"
@@ -302,6 +317,8 @@ def content_swap():
             results.append({"type": itype, "id": iid, "status": "error: owner_user_id does not match caller"})
             continue
 
+        env.pop("content_pk_fpr", None)  # content_pk_fpr is a server-only stamp; never trust the client
+
         if itype == "chat":
             # _swap_chat persists the matched message to the DB itself.
             status = _swap_chat(store, iid, env)
@@ -342,6 +359,7 @@ def content_rewrap_to_current_key():
     enclave_pk, enclave_fpr, enclave_err = core_envelope._enclave_content_public_key_material()
     if enclave_err or enclave_pk is None:
         return jsonify({"error": enclave_err or "enclave_info_unavailable"}), 503
+    current_fpr = core_envelope._content_public_key_fingerprint(user_pk)
 
     summary = _rewrap_summary()
     results: list[dict] = []
@@ -358,6 +376,7 @@ def content_rewrap_to_current_key():
             user_pk=user_pk,
             enclave_pk=enclave_pk,
             kind="identity",
+            current_fpr=current_fpr,
         )
         item_id = str(identity.get("id") or "identity")
         results.append(_rewrap_record_result(summary, "identity", item_id, status, reason=reason))
@@ -375,6 +394,7 @@ def content_rewrap_to_current_key():
             user_pk=user_pk,
             enclave_pk=enclave_pk,
             kind="memory",
+            current_fpr=current_fpr,
         )
         item_id = str(moment.get("id") or "")
         results.append(_rewrap_record_result(summary, "memory", item_id, status, reason=reason))
@@ -393,6 +413,7 @@ def content_rewrap_to_current_key():
             user_pk=user_pk,
             enclave_pk=enclave_pk,
             kind="chat",
+            current_fpr=current_fpr,
         )
         item_id = str(msg.get("id") or "")
         results.append(_rewrap_record_result(summary, "chat", item_id, status, reason=reason))
@@ -408,18 +429,21 @@ def content_rewrap_to_current_key():
         "summary": summary,
         "results": results,
     }
-
-    if summary["total_errors"] > 0:
-        response["status"] = "failed"
-        response["error"] = "rewrap_failed"
-        code = 200 if dry_run else 409
-        print(f"[content-rewrap:{store.user_id}] failed errors={summary['total_errors']} dry_run={dry_run}")
-        return jsonify(response), code
+    # pending = 本轮 error 的条目;客户端只需重试这些即可收敛。
+    pending = [
+        {"type": r["type"], "id": r["id"], "reason": r.get("reason", "")}
+        for r in results if r["status"] == "error"
+    ]
+    response["pending"] = pending
 
     if dry_run:
-        print(f"[content-rewrap:{store.user_id}] dry_run rewrappable={summary['total_rewrapped']} skipped={summary['total_skipped']}")
-        return jsonify(response)
+        response["status"] = "dry_run"
+        print(f"[content-rewrap:{store.user_id}] dry_run rewrappable={summary['total_rewrapped']} skipped={summary['total_skipped']} errors={summary['total_errors']}")
+        return jsonify(response), 200
 
+    # 无条件落盘所有已成功 rewrap 的条目。部分进度是安全的:仍停在旧钥的条目
+    # 本就不可解(设备已丢旧 SK,这正是调 rewrap 的前提),故落盘成功项只增不减
+    # 可解内容。收敛来自客户端重试 pending。
     now = datetime.now().isoformat()
     if identity is not None and identity_plan is not None:
         new_identity = dict(identity)
@@ -440,23 +464,37 @@ def content_rewrap_to_current_key():
 
     swapped_ids: set[str] = set()
     for item_id, env in chat_plans:
-        # _swap_chat persists the swapped envelope fields to the DB itself.
+        # _swap_chat 自行把交换后的信封字段写回 DB。
         if _swap_chat(store, item_id, env) == "ok":
             swapped_ids.add(item_id)
     if swapped_ids:
-        # Stamp rewrapped_at on the affected in-memory messages and persist the
-        # full updated rows (chat is row-per-message in PostgreSQL now).
         with store.chat_lock:
             for msg in store.chat_messages:
                 if isinstance(msg, dict) and msg.get("id") in swapped_ids:
                     msg["rewrapped_at"] = now
                     db.chat_append(store.user_id, msg["id"], msg["ts"], msg, core_store.MAX_CHAT_MESSAGES)
 
-    if not registry._set_user_public_key(store.user_id, requested_public_key):
-        return jsonify({"error": "user not found"}), 404
+    # 有进展(至少一条 rewrap)或完全无错 → 推进注册钥,使新内容 wrap 到当前设备钥、
+    # 下一轮工作集单调收缩。零进展且有错 → 不动钥,返回 409 让客户端退避重试。
+    made_progress = summary["total_rewrapped"] > 0
+    clean = summary["total_errors"] == 0
+    if clean or made_progress:
+        if not registry._set_user_public_key(store.user_id, requested_public_key):
+            return jsonify({"error": "user not found"}), 404
 
-    print(f"[content-rewrap:{store.user_id}] ok rewrapped={summary['total_rewrapped']} skipped={summary['total_skipped']} fpr={response['public_key_fpr']}")
-    return jsonify(response)
+    if clean:
+        response["status"] = "ok"
+        code = 200
+    elif made_progress:
+        response["status"] = "partial"
+        code = 200
+    else:
+        response["status"] = "failed"
+        response["error"] = "rewrap_failed_no_progress"
+        code = 409
+
+    print(f"[content-rewrap:{store.user_id}] {response['status']} rewrapped={summary['total_rewrapped']} skipped={summary['total_skipped']} errors={summary['total_errors']} pending={len(pending)} fpr={response['public_key_fpr']}")
+    return jsonify(response), code
 
 
 # ---------------------------------------------------------------------------
