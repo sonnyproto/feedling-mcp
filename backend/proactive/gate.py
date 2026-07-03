@@ -174,6 +174,9 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
         core_store.PROACTIVE_BROADCAST_STATES,
         _effective_broadcast_state(store, settings),
     )
+    wake_interval_sec = core_store.normalize_proactive_wake_interval_sec(
+        settings.get("wake_interval_sec")
+    )
     trigger = _proactive_trigger(payload, manual=manual, frames=selected_frames, explicit_trigger=explicit_trigger)
     if not job_kind:
         job_kind = _proactive_job_kind(payload, trigger=trigger)
@@ -234,6 +237,7 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
         "user_state": user_state,
         "ai_state": ai_state,
         "broadcast_state": broadcast_state,
+        "wake_interval_sec": wake_interval_sec,
         "semantic": {
             "reference": "agent_owned_v2",
             "llm_confidence": None,

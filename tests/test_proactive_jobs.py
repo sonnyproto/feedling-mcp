@@ -397,6 +397,57 @@ def test_proactive_settings_persists_timezone(tmp_path, monkeypatch):
     assert bad.get_json()["timezone"] == "Asia/Tokyo"
 
 
+def test_proactive_state_wake_interval_defaults_clamps_and_round_trips(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_proactive_wake_interval_key"
+    user_id = "usr_endpoint_proactive_wake_interval"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    default_state = client.get("/v1/proactive/state", headers=headers)
+    assert default_state.status_code == 200
+    assert default_state.get_json()["wake_interval_sec"] == 7200
+    assert appmod.get_store(user_id).load_proactive_settings()["wake_interval_sec"] == 7200
+
+    appmod.db.set_blob(user_id, "proactive_settings", {"wake_interval_sec": "not-a-number"})
+    corrupt_state = client.get("/v1/proactive/state", headers=headers)
+    assert corrupt_state.status_code == 200
+    assert corrupt_state.get_json()["wake_interval_sec"] == 7200
+
+    cases = [
+        (899, 900),
+        (43201, 43200),
+        (7200, 7200),
+    ]
+    for raw, expected in cases:
+        resp = client.post(
+            "/v1/proactive/state",
+            headers=headers,
+            json={"wake_interval_sec": raw},
+        )
+        assert resp.status_code == 200
+        assert resp.get_json()["wake_interval_sec"] == expected
+        assert appmod.get_store(user_id).load_proactive_settings()["wake_interval_sec"] == expected
+
+        got = client.get("/v1/proactive/state", headers=headers)
+        assert got.status_code == 200
+        assert got.get_json()["wake_interval_sec"] == expected
+
+    invalid = client.post(
+        "/v1/proactive/state",
+        headers=headers,
+        json={"wake_interval_sec": "not-a-number"},
+    )
+    assert invalid.status_code == 200
+    assert invalid.get_json()["wake_interval_sec"] == 7200
+    assert appmod.get_store(user_id).load_proactive_settings()["wake_interval_sec"] == 7200
+
+
 def test_proactive_state_three_switch_contract_drives_v2_scheduled_gate(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     appmod._stores.clear()
@@ -449,6 +500,38 @@ def test_proactive_state_three_switch_contract_drives_v2_scheduled_gate(tmp_path
     assert decision.accepted is False
     assert decision.reason == "scheduled_disabled"
     assert decision.transparency_required is True
+
+
+def test_proactive_tick_response_includes_wake_interval_sec(tmp_path, monkeypatch):
+    monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
+    appmod._stores.clear()
+
+    api_key = "test_proactive_tick_wake_interval_key"
+    user_id = "usr_endpoint_proactive_tick_wake_interval"
+    appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
+
+    client = appmod.app.test_client()
+    headers = {"X-API-Key": api_key}
+
+    state = client.post(
+        "/v1/proactive/state",
+        headers=headers,
+        json={"wake_interval_sec": 900},
+    )
+    assert state.status_code == 200
+    assert state.get_json()["wake_interval_sec"] == 900
+
+    tick = client.post(
+        "/v1/proactive/tick",
+        headers=headers,
+        json={"trigger": "heartbeat_broadcast_off", "broadcast_state": "off"},
+    )
+
+    assert tick.status_code == 200
+    body = tick.get_json()
+    assert body["decision"]["broadcast_state"] == "off"
+    assert body["decision"]["wake_interval_sec"] == 900
 
 
 def test_proactive_tick_delivery_off_still_allows_presence_wake(tmp_path, monkeypatch):

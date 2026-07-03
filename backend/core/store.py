@@ -42,6 +42,9 @@ PROACTIVE_USER_STATES = {"default", "focused", "social", "resting", "away"}
 PROACTIVE_AI_STATES = {"present", "watching", "thinking", "curious", "waiting"}
 PROACTIVE_BROADCAST_STATES = {"unknown", "on", "off", "paused"}
 PROACTIVE_DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/Shanghai").strip() or "UTC"
+PROACTIVE_WAKE_INTERVAL_DEFAULT_SEC = 7200
+PROACTIVE_WAKE_INTERVAL_MIN_SEC = 900
+PROACTIVE_WAKE_INTERVAL_MAX_SEC = 43200
 
 # Per-thread "currently loading from the DB" flag. The blob-backed loaders
 # (_load_tokens / _load_frames_meta) re-persist normalized state on read, so a
@@ -51,6 +54,14 @@ PROACTIVE_DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/S
 # outside a load) still broadcast. Thread-local so a load on one thread can't
 # mute a concurrent genuine write on another.
 _reload_guard = threading.local()
+
+
+def normalize_proactive_wake_interval_sec(value) -> int:
+    try:
+        interval = int(value)
+    except (TypeError, ValueError):
+        return PROACTIVE_WAKE_INTERVAL_DEFAULT_SEC
+    return max(PROACTIVE_WAKE_INTERVAL_MIN_SEC, min(PROACTIVE_WAKE_INTERVAL_MAX_SEC, interval))
 
 
 # Used from inside UserStore._load_tokens on boot; must be defined before
@@ -532,10 +543,9 @@ class UserStore:
             # natural-language "when should you reach out to me" instruction,
             # injected into the wake prompt (see model_api_runtime/wake.py). The
             # agent weighs it when deciding to message or sleep. Empty = no
-            # preference. (A wake-cadence/heartbeat-frequency knob is deferred to
-            # the follow-up that also wires it into the tick loop + iOS surface,
-            # so we don't ship a setting that silently does nothing.)
+            # preference.
             "wake_directive": "",
+            "wake_interval_sec": PROACTIVE_WAKE_INTERVAL_DEFAULT_SEC,
             "updated_at": datetime.now().isoformat(),
         }
         try:
@@ -554,6 +564,9 @@ class UserStore:
                     merged["ai_state"] = "present"
                 if str(merged.get("broadcast_state") or "") not in PROACTIVE_BROADCAST_STATES:
                     merged["broadcast_state"] = "unknown"
+                merged["wake_interval_sec"] = normalize_proactive_wake_interval_sec(
+                    merged.get("wake_interval_sec")
+                )
                 return merged
         except Exception as e:
             print(f"[{self.user_id}/proactive] settings load failed: {e}")
@@ -573,6 +586,7 @@ class UserStore:
             "ai_state",
             "broadcast_state",
             "wake_directive",
+            "wake_interval_sec",
         }
         patch_doc = dict(patch or {})
         if "ambient" in patch_doc:
@@ -615,6 +629,15 @@ class UserStore:
                     cur[key] = state
             elif key == "wake_directive":
                 cur[key] = str(value or "").strip()[:1000]
+            elif key == "wake_interval_sec":
+                try:
+                    interval = int(value)
+                except (TypeError, ValueError):
+                    continue
+                cur[key] = max(
+                    PROACTIVE_WAKE_INTERVAL_MIN_SEC,
+                    min(PROACTIVE_WAKE_INTERVAL_MAX_SEC, interval),
+                )
         cur["version"] = 2
         cur["updated_at"] = datetime.now().isoformat()
         with self.proactive_lock:
