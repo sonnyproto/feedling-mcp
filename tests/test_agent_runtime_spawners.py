@@ -271,6 +271,18 @@ def test_default_claude_cmd_grants_io_cli_tools_and_loads_prompt():
     assert cmd.endswith("-p {message}")
 
 
+def test_default_claude_cmd_grants_image_read():
+    env = spawners.consumer_env(
+        {}, {"api_key": "fk", "provider_key": "sk-ant"},
+        user_id="u", home="/agent-data/users/u",
+    )
+    cmd = env["AGENT_CLI_CMD"]
+    # claude -p must be allowed to Read the decrypted image temp files (IMAGE_TEMP_DIR
+    # = {home}/images), or it cannot open the screenshot/photo whose path the resident
+    # injects into the prompt — the image would stay invisible to the model.
+    assert "Read(/agent-data/users/u/images/" in cmd
+
+
 def test_custom_cli_cmd_opts_out_of_default_grant():
     env = spawners.consumer_env(
         {}, {"api_key": "fk", "cli_cmd": "claude -p {message}"},
@@ -302,6 +314,8 @@ def test_agent_home_files_seeds_prompt_and_claude_permission_allow():
     assert any("io_cli.py memory-index" in rule for rule in allow)
     assert any("io_cli.py identity-write" in rule for rule in allow)  # 7.D post-respawn tool
     assert any("io_cli.py screen-read" in rule for rule in allow)
+    # and Read on the decrypted image temp dir, so the CLI can open attached images
+    assert any(rule.startswith("Read(/agent-data/users/u/images/") for rule in allow)
 
 
 def test_agent_home_files_codex_seeds_agents_md():

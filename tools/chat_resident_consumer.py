@@ -2535,6 +2535,33 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
     return False
 
 
+def _cli_template_is_codex() -> bool:
+    """True when AGENT_CLI_CMD drives ``codex`` (so we attach images natively)."""
+    return _is_codex_cmd(_cli_cmd_tokens())
+
+
+def _inject_codex_images(cmd: list[str], image_paths: list[str]) -> list[str]:
+    """Attach decrypted image files to a ``codex exec`` command as vision input.
+
+    codex's ``--image <FILE>`` feeds the image as real vision input, unlike the
+    text file-path the model can't actually see. We emit the *=-bound* form
+    ``--image=<path>`` (one per image): each occurrence carries exactly one value,
+    so clap's variadic ``--image <FILE>...`` cannot greedily swallow the positional
+    prompt — critical for minimal templates like ``codex exec {message}`` where the
+    prompt immediately follows the injected flags (a bare ``-i <path> <prompt>``
+    would eat ``<prompt>`` as a second image). No-op when the operator already wired
+    an explicit ``-i``/``--image`` into their own template — they own images then.
+    """
+    if not image_paths or any(t == "-i" or t.startswith("--image") for t in cmd):
+        return cmd
+    try:
+        insert_at = cmd.index("exec") + 1
+    except ValueError:
+        insert_at = 1
+    flags = [f"--image={path}" for path in image_paths]
+    return [*cmd[:insert_at], *flags, *cmd[insert_at:]]
+
+
 def _cli_flag_value(cmd: list[str], flag: str) -> str:
     try:
         idx = cmd.index(flag)
@@ -2746,8 +2773,15 @@ def _render_cli_template(message: str, sid: str, image_paths: list[str] | None =
 
 def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> list[str]:
     sid = _load_agent_session_id()
+    template_has_image_slot = "{image_path" in AGENT_CLI_CMD
+    # codex gets pixels natively via injected --image= flags (_inject_codex_images);
+    # skip the file-path prose that only makes sense for a runtime that must open
+    # the file itself (e.g. claude reading it via its Read tool).
+    codex_native_images = (
+        bool(image_paths) and not template_has_image_slot and _cli_template_is_codex()
+    )
     rendered_message = message
-    if image_paths and "{image_path" not in AGENT_CLI_CMD:
+    if image_paths and not template_has_image_slot and not codex_native_images:
         rendered_message = _message_for_agent(message, image_paths)
     cmd = _render_cli_template(rendered_message, sid, image_paths=image_paths)
     cmd, sid = _ensure_explicit_cli_session_id(cmd, sid)
@@ -2792,6 +2826,9 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
             and not _message_has_injected_history(message)
         ):
             cmd = [cmd[0], "--resume", sid, *cmd[1:]]
+
+    if codex_native_images:
+        cmd = _inject_codex_images(cmd, image_paths or [])
 
     return _resolve_cli_executable(cmd)
 

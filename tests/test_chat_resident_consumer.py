@@ -1341,6 +1341,65 @@ def test_prepare_cli_uses_image_path_template(monkeypatch, tmp_path):
     assert cmd == ["mycli", "ask", "--image", image_path, "look at this"]
 
 
+def test_prepare_cli_injects_codex_image_flags(monkeypatch, tmp_path):
+    # codex exec supports `-i/--image <FILE>`; the default managed codex template
+    # has no image slot, so the resident must attach the decrypted image files
+    # natively — otherwise the model only ever sees a text file-path (can't see it).
+    img1 = str(tmp_path / "a.jpg")
+    img2 = str(tmp_path / "b.jpg")
+    monkeypatch.setattr(
+        crc, "AGENT_CLI_CMD",
+        "codex exec --skip-git-repo-check --json {message}",
+    )
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("look", image_paths=[img1, img2])
+
+    # each image attached via the =-bound --image form, so clap's variadic
+    # --image cannot swallow the positional prompt (see the regression test below)
+    assert cmd.count(f"--image={img1}") == 1
+    assert cmd.count(f"--image={img2}") == 1
+    # image flags sit after the `exec` subcommand
+    assert cmd.index("exec") < cmd.index(f"--image={img1}")
+    # the message stays clean — no misleading "Decrypted image file(s)" path prose
+    assert "Decrypted image file(s)" not in " ".join(cmd)
+    assert "look" in cmd
+
+
+def test_prepare_cli_codex_image_flags_do_not_swallow_prompt(monkeypatch, tmp_path):
+    # Regression (Codex review P2): with a minimal `codex exec {message}` template
+    # the prompt immediately follows the injected image flags. A bare `-i <path>`
+    # would let clap's variadic --image consume the prompt token as another image;
+    # the =-bound form keeps the prompt a standalone positional.
+    img = str(tmp_path / "a.jpg")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec {message}")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("hello there", image_paths=[img])
+
+    assert cmd == ["codex", "exec", f"--image={img}", "hello there"]
+    # never a bare `-i` whose value the prompt could be mistaken for
+    assert "-i" not in cmd
+
+
+def test_prepare_cli_codex_respects_explicit_image_flag(monkeypatch, tmp_path):
+    # A VPS operator who already wired {image_path} into their codex template owns
+    # image handling; the resident must not double-inject a second -i.
+    img = str(tmp_path / "a.jpg")
+    monkeypatch.setattr(
+        crc, "AGENT_CLI_CMD",
+        "codex exec -i {image_path} --json {message}",
+    )
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("look", image_paths=[img])
+
+    assert cmd == ["codex", "exec", "-i", img, "--json", "look"]
+
+
 def test_cli_nonzero_exit_fails_even_with_stdout(monkeypatch):
     class _Result:
         returncode = 2

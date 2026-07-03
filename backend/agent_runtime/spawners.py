@@ -133,6 +133,21 @@ def _io_cli_allow_rules(io_cli: str = _IO_CLI) -> list[str]:
     return [f"Bash(python {io_cli} {verb}:*)" for verb in _IO_CLI_VERBS]
 
 
+def _image_read_allow_rule(home: str) -> str:
+    """Claude Read allow-rule for the decrypted-image temp dir (IMAGE_TEMP_DIR).
+
+    Chat photos and screen-share frames are decrypted to ``{home}/images/*.jpg|png``
+    and their path is injected into the prompt; without Read on that dir an
+    unattended ``claude -p`` (whose --allowed-tools is otherwise io_cli-only) cannot
+    open them, so the model never sees the image. Scoped to the image dir only."""
+    return f"Read({home}/images/**)"
+
+
+def _claude_allow_rules(io_cli: str, home: str) -> list[str]:
+    """Full claude --allowed-tools / settings allowlist: io_cli verbs + image Read."""
+    return [*_io_cli_allow_rules(io_cli), _image_read_allow_rule(home)]
+
+
 # claude (Anthropic-wire) providers that are NOT anthropic itself: they expose an
 # Anthropic-compatible API at ``<base_url>/anthropic`` and use their own model id.
 # Keep in sync with hosted/agent_runtime_cutover._CLAUDE_PROVIDERS.
@@ -237,7 +252,7 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
             "-c model_reasoning_summary=auto "
             "--dangerously-bypass-approvals-and-sandbox {message}"
         )
-    grant = ",".join(_io_cli_allow_rules(io_cli))
+    grant = ",".join(_claude_allow_rules(io_cli, home))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
     return (
         f"claude --allowed-tools '{grant}' "
@@ -320,7 +335,7 @@ def agent_home_files(
             files[f"{home}/codex-home/config.toml"] = _codex_gateway_config(
                 base_url=gateway_base_url, model=model)
     else:
-        settings = {"permissions": {"allow": _io_cli_allow_rules(io_cli)}}
+        settings = {"permissions": {"allow": _claude_allow_rules(io_cli, home)}}
         files[f"{home}/claude-home/settings.json"] = json.dumps(settings, indent=2)
     return files
 
