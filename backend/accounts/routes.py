@@ -289,6 +289,8 @@ def users_whoami():
       - `archive_language` — the locale code the iOS app supplied at
         registration (e.g. "en", "zh-Hans"). Null for legacy accounts;
         callers fall back to inferring from existing card content.
+      - `timezone` — the caller's IANA timezone (record value, or
+        perception-snapshot fallback). Omitted when unknown.
     """
     store = auth.require_user()
     access = accounts_access._access_modes_payload(store)
@@ -308,6 +310,15 @@ def users_whoami():
     archive_language = registry._get_user_archive_language(store.user_id)
     if archive_language:
         resp["archive_language"] = archive_language
+    tz = registry._get_user_timezone(store.user_id)
+    if not tz:
+        try:
+            from perception import service as perception_service  # lazy: avoid import cycle
+            tz = perception_service.stable_context_timezone(store.user_id)
+        except Exception:
+            tz = None
+    if tz:
+        resp["timezone"] = tz
     return jsonify(resp)
 
 
@@ -315,46 +326,72 @@ def users_whoami():
 def users_set_preferences():
     """Update mutable preferences on the authenticated user's record.
 
-    Currently the only supported preference is `archive_language` — the
-    locale code that the agent should use as the source of truth for
-    Memory Garden / Identity Card language. iOS posts this on first
-    launch for legacy accounts that registered before the field existed,
-    and again whenever the user explicitly changes their iOS system
-    language and re-launches the app.
+    Supports two independent preferences, each optional:
 
-    Body: {"archive_language": "<bcp-47 string>" | null}
-    Pass null to clear (agent falls back to inferred behavior).
+    - `archive_language` — the locale code that the agent should use as
+      the source of truth for Memory Garden / Identity Card language.
+      iOS posts this on first launch for legacy accounts that registered
+      before the field existed, and again whenever the user explicitly
+      changes their iOS system language and re-launches the app.
+    - `timezone` — the caller's IANA timezone (e.g. "Asia/Shanghai").
+      Must be a valid IANA zone name.
+
+    Body: {"archive_language": "<bcp-47 string>" | null,
+           "timezone": "<IANA zone>" | null}
+    Pass null for either field to clear it (agent falls back to inferred
+    behavior). At least one of the two fields must be present.
     """
     store = auth.require_user()
     payload = request.get_json(silent=True) or {}
-    if "archive_language" not in payload:
-        return jsonify({
-            "error": "archive_language required (string or null)",
-        }), 400
+
     raw = payload.get("archive_language")
     if raw is not None and not isinstance(raw, str):
         return jsonify({"error": "archive_language must be a string or null"}), 400
+    has_lang = "archive_language" in payload
     new_value = (raw or "").strip() if isinstance(raw, str) else ""
+
+    tz_raw = payload.get("timezone")
+    has_tz = "timezone" in payload
+    if has_tz and tz_raw is not None and not isinstance(tz_raw, str):
+        return jsonify({"error": "timezone must be a string or null"}), 400
+
+    if not has_lang and not has_tz:
+        return jsonify({
+            "error": "provide archive_language and/or timezone (string or null)",
+        }), 400
+
+    # Validate timezone up front so an invalid zone can't half-apply the
+    # archive_language write below.
+    if has_tz and isinstance(tz_raw, str) and tz_raw.strip() and not registry._is_valid_iana_timezone(tz_raw.strip()):
+        return jsonify({"error": "timezone must be a valid IANA zone or null"}), 400
 
     updated = False
     with registry._users_lock:
         for u in registry._users:
             if u.get("user_id") == store.user_id:
-                if new_value:
-                    u["archive_language"] = new_value
-                else:
-                    u.pop("archive_language", None)
+                if has_lang:
+                    if new_value:
+                        u["archive_language"] = new_value
+                    else:
+                        u.pop("archive_language", None)
                 updated = True
                 break
-        if updated:
-            registry.persist_user(u)  # per-row upsert + cross-worker users broadcast
+        if updated and has_lang:
+            registry.persist_user(u)
 
     if not updated:
         return jsonify({"error": "user not found"}), 404
-    print(f"[users] {store.user_id} archive_language → {new_value or 'cleared'}")
+
+    if has_tz:
+        if not registry._set_user_timezone(store.user_id, tz_raw):
+            return jsonify({"error": "timezone must be a valid IANA zone or null"}), 400
+
+    tz_now = registry._get_user_timezone(store.user_id)
+    print(f"[users] {store.user_id} prefs archive_language={new_value or 'unchanged'} timezone={tz_now or 'unset'}")
     return jsonify({
         "status": "updated",
-        "archive_language": new_value or None,
+        "archive_language": registry._get_user_archive_language(store.user_id),
+        "timezone": tz_now or None,
     })
 
 

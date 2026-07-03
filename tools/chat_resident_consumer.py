@@ -2955,7 +2955,7 @@ def _resident_foreground_chat_message_v2(content: str) -> str:
 # Cached from /v1/users/whoami for diagnostics and fallback state. Refreshed
 # before every encrypted write so resident agents do not keep wrapping replies
 # to a stale iOS content public key.
-_whoami_cache: dict = {"user_id": "", "user_pk": None, "enclave_pk": None}
+_whoami_cache: dict = {"user_id": "", "user_pk": None, "enclave_pk": None, "timezone": ""}
 
 # monotonic ts of the last successful _load_whoami() that yielded encryption
 # keys; 0.0 until the first success so the first reply still fetches.
@@ -3078,7 +3078,16 @@ def _load_whoami() -> bool:
     except Exception:
         enc_pk = None
 
-    _whoami_cache.update(user_id=user_id, user_pk=user_pk, enclave_pk=enc_pk)
+    tz = str(info.get("timezone") or "").strip()
+    _whoami_cache.update(
+        user_id=user_id, user_pk=user_pk, enclave_pk=enc_pk,
+        # A successful whoami is authoritative — adopt its timezone verbatim,
+        # including empty (user cleared it / no fallback), so a stale zone is
+        # never served after the server stops reporting one. Last-known is
+        # retained only across whoami FAILURES, which return above before this
+        # update runs.
+        timezone=tz,
+    )
     ok = bool(user_id and user_pk)
     if _whoami_cache_has_full_keys():
         global _whoami_cache_loaded_at
@@ -4185,23 +4194,17 @@ def _resident_perception_now() -> dict:
 # foreground chat passed the user's text verbatim, and the device-reported
 # local_time goes stale when the app is backgrounded overnight (the agent then
 # keeps acting on last night's frame). We compute the user's CURRENT local time
-# from the consumer's real clock + the user's timezone (stable; cached from a
-# perception pull), so every turn/wake is anchored to the real present.
-_tz_cache: dict = {"tz": "", "ts": 0.0}
+# from the consumer's real clock + the user's timezone (stable; sourced from
+# the whoami cache), so every turn/wake is anchored to the real present.
 _last_interaction_unix: float = 0.0
 _WEEKDAYS_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
 def _user_timezone() -> str:
-    """Best-effort user timezone (IANA), cached ~1h (timezone is stable)."""
-    nowt = time.time()
-    if _tz_cache["tz"] and (nowt - _tz_cache["ts"]) < 3600:
-        return _tz_cache["tz"]
-    snap = _resident_perception_now()
-    tz = str((snap or {}).get("timezone") or "").strip()
-    if tz:
-        _tz_cache.update({"tz": tz, "ts": nowt})
-    return _tz_cache["tz"]
+    """User's IANA timezone, sourced from the whoami cache (refreshed with the
+    encryption-key whoami fetch). whoami already resolves record-or-perception
+    fallback server-side, so this needs no perception pull."""
+    return str(_whoami_cache.get("timezone") or "").strip()
 
 
 def _local_time_anchor(since_sec: float | None = None) -> str:

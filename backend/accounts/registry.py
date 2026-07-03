@@ -380,6 +380,50 @@ def _get_user_archive_language(user_id: str) -> str | None:
     return None
 
 
+def _get_user_timezone(user_id: str) -> str | None:
+    """Return the user's stored IANA timezone, or None if unset. Thin read
+    mirroring _get_user_archive_language; used by /v1/users/whoami and any
+    subsystem needing the user's device timezone."""
+    with _users_lock:
+        for u in _users:
+            if u.get("user_id") == user_id:
+                val = u.get("timezone")
+                return val if val else None
+    return None
+
+
+def _is_valid_iana_timezone(tz: str) -> bool:
+    """True if tz is a resolvable IANA zone. Empty string is NOT valid here
+    (callers treat empty/None as 'clear', handled separately)."""
+    if not tz:
+        return False
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(tz)
+        return True
+    except Exception:
+        return False
+
+
+def _set_user_timezone(user_id: str, tz: str | None) -> bool:
+    """Set (or clear, when tz is falsy) the user's first-class timezone field.
+    Validates IANA before writing — never poisons the record with a junk zone.
+    Returns True when the record was found and updated, False when the user is
+    unknown or tz is a non-empty invalid zone."""
+    value = str(tz or "").strip()
+    if value and not _is_valid_iana_timezone(value):
+        return False
+    with _users_lock:
+        for u in _users:
+            if u.get("user_id") == user_id:
+                if value:
+                    u["timezone"] = value
+                else:
+                    u.pop("timezone", None)
+                persist_user(u)  # per-row upsert + cross-worker users broadcast
+                return True
+    return False
+
 
 def _find_user_entry_locked(user_id: str) -> dict | None:
     for user_entry in _users:
