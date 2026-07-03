@@ -33,6 +33,28 @@ def test_consumer_env_drives_resident_in_cli_mode_for_claude():
     assert env["PATH"] == "/bin" and env["FEEDLING_API_URL"] == "http://b:5001"  # base preserved
 
 
+def test_consumer_env_uses_stream_json_for_deepseek_claude_thinking():
+    env = spawners.consumer_env(
+        {"PATH": "/bin"},
+        {
+            "api_key": "fk",
+            "provider": "deepseek",
+            "provider_key": "sk-ds",
+            "driver": "claude",
+            "model": "deepseek-v4-pro",
+        },
+        user_id="u_1",
+        home="/agent-data/users/u_1",
+    )
+
+    cmd = env["AGENT_CLI_CMD"]
+    assert "--output-format stream-json" in cmd
+    assert "--include-partial-messages" in cmd
+    assert "--effort high" in cmd
+    assert env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+    assert env["ANTHROPIC_MODEL"] == "deepseek-v4-pro"
+
+
 def test_consumer_env_uses_codex_cli_and_home_for_codex_driver():
     env = spawners.consumer_env(
         {}, {"api_key": "fk", "provider_key": "sk-oai", "driver": "codex"},

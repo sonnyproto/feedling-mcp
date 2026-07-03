@@ -239,6 +239,17 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
     )
 
 
+def _default_deepseek_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
+    """Claude Code only exposes DeepSeek thinking blocks in stream-json output."""
+    grant = ",".join(_io_cli_allow_rules(io_cli))
+    prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
+    return (
+        "claude --verbose --output-format stream-json --include-partial-messages "
+        f"--effort high --allowed-tools '{grant}' "
+        f"--append-system-prompt-file {prompt_file} -p {{message}}"
+    )
+
+
 def agent_home_files(
     home: str,
     *,
@@ -411,7 +422,10 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     # with the runtime-token file instead (FEEDLING_RUNTIME_TOKEN_FILE below).
     env["FEEDLING_API_KEY"] = entry.get("api_key", "")
     env["AGENT_MODE"] = entry.get("agent_mode", "cli")
-    env["AGENT_CLI_CMD"] = entry.get("cli_cmd") or _default_cli_cmd(driver, home)
+    cli_cmd = entry.get("cli_cmd")
+    if not cli_cmd and driver == "claude" and (entry.get("provider") or "").strip().lower() == "deepseek":
+        cli_cmd = _default_deepseek_claude_cmd(home)
+    env["AGENT_CLI_CMD"] = cli_cmd or _default_cli_cmd(driver, home)
     # Per-user isolation: separate checkpoint, agent session, image temp dir, and
     # a per-user agent home (Claude/Codex) so nothing is shared across users.
     env["CHECKPOINT_FILE"] = f"{home}/checkpoint.json"

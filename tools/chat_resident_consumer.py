@@ -1609,6 +1609,55 @@ def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
     return dst
 
 
+def _agent_turn_from_content_blocks(
+    blocks: Any,
+    *,
+    thinking_source: str = "",
+    thinking_model: str = "",
+) -> AgentTurn:
+    turn = AgentTurn()
+    if not isinstance(blocks, list):
+        return turn
+    for block in blocks:
+        if isinstance(block, str):
+            clean = _sanitize_reply_text(block)
+            if clean:
+                turn.messages.append(clean)
+            continue
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "").strip().lower()
+        if block_type == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                clean = _sanitize_reply_text(text)
+                if clean:
+                    turn.messages.append(clean)
+            continue
+        if block_type == "thinking" and not turn.thinking_summary:
+            summary = block.get("thinking") or block.get("text")
+            if isinstance(summary, str):
+                turn.thinking_summary = _sanitize_thinking_summary(summary)
+                turn.thinking_kind = "provider_reasoning"
+                turn.thinking_source = thinking_source or "anthropic_thinking"
+                turn.thinking_model = thinking_model
+                turn.thinking_native = True
+    return turn
+
+
+def _dedupe_agent_turn_messages(turn: AgentTurn) -> AgentTurn:
+    seen = set()
+    unique: list[str] = []
+    for message_text in turn.messages:
+        key = message_text.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(key)
+    turn.messages = unique
+    return turn
+
+
 def _agent_turn_from_obj(obj: Any) -> AgentTurn:
     turn = AgentTurn()
 
@@ -1621,7 +1670,7 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
             for item in json_objects:
                 _merge_agent_turn(turn, _agent_turn_from_obj(item))
             if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
-                return turn
+                return _dedupe_agent_turn_messages(turn)
         nested = _safe_json_loads(raw) if _looks_like_json_text(raw) else None
         if isinstance(nested, (dict, list)):
             return _agent_turn_from_obj(nested)
@@ -1706,6 +1755,17 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         max_len=96,
     )
     explicit_native = _boolish(obj.get("thinking_native", obj.get("reasoning_native")))
+
+    role = str(obj.get("role") or "").lower()
+    if (not role or role in {"assistant", "agent", "openclaw", "model"}) and isinstance(obj.get("content"), list):
+        _merge_agent_turn(
+            turn,
+            _agent_turn_from_content_blocks(
+                obj.get("content"),
+                thinking_source=explicit_source,
+                thinking_model=explicit_model,
+            ),
+        )
 
     for key in _JSON_THINKING_FIELDS:
         value = obj.get(key)

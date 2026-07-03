@@ -2959,6 +2959,46 @@ def test_agent_turn_extracts_visible_thinking_summary_from_nested_result():
     assert "uuid" in turn.runtime_debug
 
 
+def test_agent_turn_extracts_claude_stream_json_thinking_blocks():
+    raw = "\n".join([
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "deepseek-v4-pro",
+                "content": [{
+                    "type": "thinking",
+                    "thinking": "The user is asking a simple math question.",
+                }],
+            },
+        }),
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "deepseek-v4-pro",
+                "content": [{
+                    "type": "text",
+                    "text": "1 + 1 等于 2。",
+                }],
+            },
+        }),
+        json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "result": "1 + 1 等于 2。",
+        }),
+    ])
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["1 + 1 等于 2。"]
+    assert turn.thinking_summary == "The user is asking a simple math question."
+    assert turn.thinking_kind == "provider_reasoning"
+    assert turn.thinking_source == "anthropic_thinking"
+    assert turn.thinking_native is True
+
+
 def test_agent_turn_extracts_provider_reasoning_metadata_from_nested_result():
     raw = json.dumps(
         {
