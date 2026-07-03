@@ -317,6 +317,19 @@ def tick_quiet_migrate(store, *, now: float | None = None) -> dict[str, Any]:
     return {"enqueued": enqueued, "reason": reason, "job": job}
 
 
+def _capture_trace_job_id(job: Mapping[str, Any]) -> str:
+    return str(job.get("job_id") or "")[:120]
+
+
+def _capture_trace_card_titles(job: Mapping[str, Any]) -> str:
+    result = job.get("capture_result") if isinstance(job.get("capture_result"), Mapping) else {}
+    titles = result.get("titles") if isinstance(result.get("titles"), list) else []
+    if not titles:
+        cards = result.get("cards") if isinstance(result.get("cards"), list) else []
+        titles = [c.get("title", "") for c in cards if isinstance(c, Mapping)]
+    return " | ".join(str(t) for t in titles if t)[:1000]
+
+
 def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now: float | None = None) -> dict[str, Any]:
     if not capture_jobs.is_memory_capture_job(job):
         return load_capture_state(store)
@@ -340,4 +353,39 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
             state["last_captured_until_ts"] = until_ts
             state["last_capture_completed_at"] = now_ts
     state = save_capture_state(store, state, now=now_ts)
-    return refresh_capture_state_from_chat(store, now=now_ts)
+    result = refresh_capture_state_from_chat(store, now=now_ts)
+
+    import debug_trace  # local import avoids load-order cycle
+
+    job_id = _capture_trace_job_id(job)
+    if status_text == "completed":
+        try:
+            cards_added = int(job.get("cards_added") or 0)
+        except (TypeError, ValueError):
+            cards_added = 0
+        titles = _capture_trace_card_titles(job)
+        debug_trace.trace_event(
+            store,
+            subsystem="memory",
+            type="memory.capture.done",
+            actor="backend",
+            job_id=job_id,
+            summary=f"captured {cards_added} card(s)",
+            explain=(f"记忆抓取完成：新增 {cards_added} 条" if cards_added else "本轮没有可抓取的新记忆（合法）"),
+            detail={"cards_added": cards_added},
+            content_excerpt={"titles": titles} if titles else None,
+        )
+    else:
+        reason = str(job.get("status_reason") or job.get("noop_reason") or "").strip()
+        debug_trace.trace_event(
+            store,
+            subsystem="memory",
+            type="memory.capture.error",
+            actor="backend",
+            status="error",
+            job_id=job_id,
+            summary=f"capture job {status_text}",
+            explain="记忆抓取失败",
+            detail={"status": status_text, "reason": reason[:200]} if reason else {"status": status_text},
+        )
+    return result
