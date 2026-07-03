@@ -27,6 +27,8 @@ from proactive.store_v2 import (
 )
 import db
 
+from conftest import seed_user
+
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DATABASE_URL"),
     reason="DB-backed V2 substrate tests require the PostgreSQL test fixture",
@@ -39,6 +41,7 @@ def _uid() -> str:
 
 def test_db_turn_lease_allows_only_one_worker_to_win():
     uid = _uid()
+    seed_user(uid)
     leases = DBTurnLeaseRegistryV2()
 
     first = leases.try_acquire_user(uid, owner_id="worker-a", now=10.0, ttl_sec=30.0)
@@ -52,6 +55,7 @@ def test_db_turn_lease_allows_only_one_worker_to_win():
 
 def test_db_turn_lease_reclaims_expired_owner_and_rejects_old_release():
     uid = _uid()
+    seed_user(uid)
     leases = DBTurnLeaseRegistryV2()
 
     first = leases.try_acquire_user(uid, owner_id="worker-a", now=10.0, ttl_sec=5.0)
@@ -68,6 +72,7 @@ def test_db_turn_lease_reclaims_expired_owner_and_rejects_old_release():
 
 def test_db_background_lease_is_independent_and_reclaimable():
     uid = _uid()
+    seed_user(uid)
     leases = DBBackgroundLeaseRegistryV2()
 
     first = leases.try_acquire_job("bg_1", user_id=uid, owner_id="worker-a", now=20.0, ttl_sec=5.0)
@@ -84,6 +89,7 @@ def test_db_background_lease_is_independent_and_reclaimable():
 
 def test_db_wake_inbox_round_trips_and_merges_persisted_wakes():
     uid = _uid()
+    seed_user(uid)
     inbox = DBWakeInboxV2()
     spine = RuntimeSpineV2(
         inbox=inbox,
@@ -117,6 +123,7 @@ def test_db_wake_inbox_round_trips_and_merges_persisted_wakes():
 
 def test_db_wake_inbox_latency_sensitive_flushes_persisted_queue():
     uid = _uid()
+    seed_user(uid)
     inbox = DBWakeInboxV2()
     spine = RuntimeSpineV2(inbox=inbox, merge_window_sec=10.0)
 
@@ -142,6 +149,7 @@ def test_db_wake_inbox_latency_sensitive_flushes_persisted_queue():
 
 def test_db_turn_store_recovers_stale_running_turn_without_old_owner_completion():
     uid = _uid()
+    seed_user(uid)
     leases = DBTurnLeaseRegistryV2()
     turn_store = DBTurnStoreV2()
     context = merge_wakes_v2([
@@ -191,6 +199,7 @@ def test_db_turn_store_recovers_stale_running_turn_without_old_owner_completion(
 
 def test_db_turn_store_records_actions_as_v2_action_stream():
     uid = _uid()
+    seed_user(uid)
     leases = DBTurnLeaseRegistryV2()
     turn_store = DBTurnStoreV2()
     context = merge_wakes_v2([
@@ -221,6 +230,7 @@ def test_db_turn_store_records_actions_as_v2_action_stream():
 
 def test_db_background_job_store_lifecycle_and_duplicate_completion_guard():
     uid = _uid()
+    seed_user(uid)
     jobs = DBBackgroundJobStoreV2()
     leases = DBBackgroundLeaseRegistryV2()
 
@@ -251,6 +261,7 @@ def test_db_background_job_store_lifecycle_and_duplicate_completion_guard():
 
 def test_db_settings_store_uses_v2_shape_with_legacy_fallback():
     uid = _uid()
+    seed_user(uid)
     settings_store = DBProactiveSettingsStoreV2()
     db.set_blob(uid, "proactive_settings", {
         "enabled": False,
@@ -283,6 +294,7 @@ def test_db_settings_store_uses_v2_shape_with_legacy_fallback():
 
 def test_db_scheduled_wake_survives_restart_and_fires_once():
     uid = _uid()
+    seed_user(uid)
     first_service = ScheduledWakeServiceV2(DBScheduledWakeStoreV2(), owner_id="worker-a")
     first_service.apply_turn_actions(
         uid,

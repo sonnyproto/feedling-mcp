@@ -375,22 +375,41 @@ def save_all_users(users: list[dict]) -> None:
     """Persist the whole in-memory user list. The app calls this (via
     _save_users) for full-list rewrites — startup normalization and test resets.
 
-    DELETE-all + reinsert, so it reflects removals too. NOTE: this is destructive
-    from THIS worker's snapshot — under ``-w N`` it must not be used for ordinary
-    per-user edits (a stale snapshot would wipe a user another worker just
-    created). Genuine single-user edits go through ``registry.persist_user`` →
-    ``db.upsert_user`` (per-row, non-destructive) instead; the remaining callers
-    here read-then-rewrite their own full snapshot or run pre-fork at startup."""
+    Upsert each snapshot user + delete ONLY users absent from the snapshot (genuine
+    removals). It deliberately does NOT ``DELETE FROM users`` wholesale: under the
+    per-user ``ON DELETE CASCADE`` FKs (0011) a blanket delete would cascade-wipe
+    every KEPT user's chat/memory/frames/logs/blobs/imports before the reinsert —
+    the reinsert restores the ``users`` row but not the cascaded child rows. So
+    kept users are upserted in place (their child rows untouched); a user in the DB
+    but not in this snapshot is truly removed and its data cascade-deleted.
+
+    NOTE: still destructive from THIS worker's snapshot — under ``-w N`` it must not
+    be used for ordinary per-user edits (a stale snapshot missing a user another
+    worker just created would delete that user + cascade its data). Genuine
+    single-user edits go through ``registry.persist_user`` → ``db.upsert_user``
+    (per-row, non-destructive); the remaining callers here read-then-rewrite their
+    own full snapshot or run pre-fork at startup."""
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
-                conn.execute("DELETE FROM users")
+                keep_ids = [str(e.get("user_id")) for e in users if e.get("user_id")]
+                # Remove only genuinely-absent users (empty snapshot ⇒ remove all).
+                if keep_ids:
+                    conn.execute(
+                        "DELETE FROM users WHERE NOT (user_id = ANY(%s))", (keep_ids,)
+                    )
+                else:
+                    conn.execute("DELETE FROM users")
                 for entry in users:
                     uid = entry.get("user_id")
                     if not uid:
                         continue
+                    # Upsert (not plain INSERT): kept rows still exist, so a plain
+                    # INSERT would hit the users PK. Upsert leaves child rows intact.
                     conn.execute(
-                        "INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s)",
+                        "INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s) "
+                        "ON CONFLICT (user_id) DO UPDATE SET "
+                        "created_at = EXCLUDED.created_at, doc = EXCLUDED.doc",
                         (uid, entry.get("created_at"), Jsonb(entry)),
                     )
     except Exception as e:
@@ -400,6 +419,22 @@ def save_all_users(users: list[dict]) -> None:
 def delete_user(user_id: str) -> None:
     with get_pool().connection() as conn:
         conn.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+
+
+def user_exists(user_id: str) -> bool:
+    """Authoritative membership check against the users table. The push path uses
+    it to close the sub-second window where another worker committed a delete but
+    THIS worker's in-memory registry hasn't processed the ``users`` wake-bus
+    reload yet — the stale snapshot would otherwise pass the guard and send a push
+    to a just-deleted account. One indexed PK lookup; negligible next to the store
+    load / chat work a push already does."""
+    if not user_id:
+        return False
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM users WHERE user_id = %s LIMIT 1", (user_id,)
+        ).fetchone()
+    return row is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1919,17 +1954,11 @@ def log_prune_older_than(user_id: str, stream: str, cutoff_epoch: float) -> None
 
 
 def delete_user_data(user_id: str) -> None:
-    """Hard-delete all per-user rows (everything except the global users row,
-    which the caller removes via delete_user). Single transaction."""
+    """Redundant DB belt: per-user 行现由 delete_user 的 CASCADE 原子清净
+    (0011)。保留供 migrate_to_pg 等旧调用方；删账号主路径不再依赖它做 R2。"""
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
-                # Every table keyed by user_id must be listed here. When a
-                # migration adds a new per-user table, add it below or the
-                # account-reset path will silently orphan that user's rows.
-                # genesis_import_chunks/outputs cascade from genesis_import_jobs,
-                # but we delete them explicitly (children first) so the wipe
-                # stays correct even if those FK cascades are ever dropped.
                 for table in (
                     "chat_messages",
                     "memory_moments",
@@ -1946,8 +1975,11 @@ def delete_user_data(user_id: str) -> None:
                 ):
                     conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
     except Exception as e:
-        # Rows survive on failure → keep the R2 bodies so they still resolve.
         log.error("[db] delete_user_data(%s) failed: %s", user_id, e)
-        return
+
+
+def delete_user_frames(user_id: str) -> None:
+    """Best-effort R2 frame-body 清理(无 DB 行)。从 delete_user_data 拆出，
+    使 DB 删除保持原子、R2 失败非致命。"""
     if object_storage.enabled():
         object_storage.delete_user_frames(user_id)

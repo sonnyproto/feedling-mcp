@@ -3153,7 +3153,13 @@ def _message_has_injected_history(message: str) -> bool:
 # Cached from /v1/users/whoami for diagnostics and fallback state. Refreshed
 # before every encrypted write so resident agents do not keep wrapping replies
 # to a stale iOS content public key.
-_whoami_cache: dict = {"user_id": "", "user_pk": None, "enclave_pk": None, "timezone": ""}
+_whoami_cache: dict = {
+    "user_id": "",
+    "user_pk": None,
+    "enclave_pk": None,
+    "timezone": "",
+    "archive_language": "",
+}
 
 # monotonic ts of the last successful _load_whoami() that yielded encryption
 # keys; 0.0 until the first success so the first reply still fetches.
@@ -3277,6 +3283,7 @@ def _load_whoami() -> bool:
         enc_pk = None
 
     tz = str(info.get("timezone") or "").strip()
+    archive_language = str(info.get("archive_language") or "").strip()
     _whoami_cache.update(
         user_id=user_id, user_pk=user_pk, enclave_pk=enc_pk,
         # A successful whoami is authoritative — adopt its timezone verbatim,
@@ -3285,6 +3292,7 @@ def _load_whoami() -> bool:
         # retained only across whoami FAILURES, which return above before this
         # update runs.
         timezone=tz,
+        archive_language=archive_language,
     )
     ok = bool(user_id and user_pk)
     if _whoami_cache_has_full_keys():
@@ -4281,11 +4289,17 @@ def _reply_protocol_block() -> str:
 
 def _reply_language_line(presence: dict | None = None) -> str:
     """Anchor the reply language to the user — a proactive wake may have no recent
-    user message to infer it from, so an English prompt must not leak English."""
+    user message to infer it from, so an English prompt must not leak English.
+    Fallback chain: device locale → stored archive_language → 简体中文 (product default)."""
     locale = str((presence or {}).get("locale") or "").strip()
     if locale:
         return f"Always reply in the user's own language (their locale is {locale})."
-    return "Always reply in the user's own language."
+    archive_language = str(_whoami_cache.get("archive_language") or "").strip()
+    if archive_language:
+        return f"Always reply in the user's own language (their language is {archive_language})."
+    # 既无设备 locale 也无存储的语言偏好（空语境/刚铸的新号）——裸的
+    # "user's own language" 会让模型默认英文。产品主用户群为中文，默认简体中文。
+    return "默认用简体中文回复，除非用户明显在使用其它语言。"
 
 
 def _native_reachout_tool_instructions() -> str:

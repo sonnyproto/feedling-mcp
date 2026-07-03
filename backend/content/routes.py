@@ -21,6 +21,7 @@ from core import config as core_config
 from core import enclave as core_enclave
 from core import envelope as core_envelope
 from core import store as core_store
+from core import wake_bus
 from identity import service as identity_service
 from memory import service as memory_service
 from onboarding_archive import storage as onboarding_archive_storage
@@ -553,6 +554,36 @@ def content_export():
     return resp
 
 
+# onboarding 归档是 R2 上的**明文**用户数据，删账号前必须先清干净。删除按前缀、
+# 幂等，所以瞬时抖动可安全重试;仍持续失败则中止重置(此时尚未删任何东西,客户端可重试)。
+_ARCHIVE_DELETE_ATTEMPTS = 3
+_ARCHIVE_DELETE_BASE_DELAY = 0.3
+
+
+def _purge_onboarding_archives_with_retry(user_id: str) -> Exception | None:
+    """Delete the user's plaintext onboarding archives from R2 with bounded retry.
+
+    Returns None on success (or when archive storage is disabled), else the last
+    exception. A non-None return MUST abort the reset BEFORE the account is deleted:
+    deleting the account first removes the authenticated retry path / DB ownership,
+    so a failed purge would orphan undiscoverable plaintext originals on R2 while we
+    report success. ``onboarding_archive.storage.delete_user_archives`` raises for
+    exactly this reason."""
+    if not onboarding_archive_storage.enabled():
+        return None
+    import time
+    last: Exception | None = None
+    for attempt in range(_ARCHIVE_DELETE_ATTEMPTS):
+        try:
+            onboarding_archive_storage.delete_user_archives(user_id)
+            return None
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if attempt < _ARCHIVE_DELETE_ATTEMPTS - 1 and _ARCHIVE_DELETE_BASE_DELAY > 0:
+                time.sleep(_ARCHIVE_DELETE_BASE_DELAY * (attempt + 1))
+    return last
+
+
 @bp.route("/v1/account/reset", methods=["POST"])
 def account_reset():
     """Hard-delete the caller's account: wipe the user dir, revoke the
@@ -579,21 +610,19 @@ def account_reset():
 
     user_id = store.user_id
 
-    # Purge the user's onboarding R2 archives FIRST. If R2 cleanup fails we abort
-    # the whole reset (nothing deleted yet → safe to retry) rather than wipe the
-    # DB index and leave undiscoverable plaintext originals behind on R2.
-    if onboarding_archive_storage.enabled():
-        try:
-            onboarding_archive_storage.delete_user_archives(user_id)
-        except Exception as e:  # noqa: BLE001
-            print(f"[reset:{user_id}] onboarding archive R2 cleanup failed, aborting reset: {e}")
-            return jsonify({
-                "error": "archive_cleanup_failed",
-                "detail": "Could not purge onboarding archives; reset aborted, safe to retry.",
-            }), 503
+    # 隐私关键第一步：删账号前先清掉该用户的 R2 明文 onboarding 归档。若先删账号，
+    # 就没了带鉴权的重试路径，一次瞬时 R2 失败会在"报告成功"的同时留下无从发现的
+    # 明文孤儿(无 reaper 兜底)。有界重试抹平抖动;持续失败则中止(此刻尚未删任何东西，
+    # 状态一致、客户端可安全重试;iOS 会把非 200/401 当错误提示，不会误以为已删)。
+    archive_err = _purge_onboarding_archives_with_retry(user_id)
+    if archive_err is not None:
+        print(f"[reset:{user_id}] onboarding archive R2 cleanup failed after retries, aborting: {archive_err}")
+        return jsonify({
+            "error": "archive_cleanup_failed",
+            "detail": "Could not purge onboarding archives; reset aborted, safe to retry.",
+        }), 503
 
-    # Remove the user record FIRST so any in-flight requests carrying the old
-    # api_key fail auth immediately.
+    # DB 权威、原子：删 users 行即 CASCADE 清净所有 per-user 数据(0011)。
     with registry._users_lock:
         before = len(registry._users)
         registry._users[:] = [u for u in registry._users if u.get("user_id") != user_id]
@@ -602,16 +631,28 @@ def account_reset():
         to_evict = [h for h, uid in registry._key_to_user.items() if uid == user_id]
         for h in to_evict:
             registry._key_to_user.pop(h, None)
-        db.delete_user(user_id)
+        db.delete_user(user_id)                 # CASCADE 原子清净
         # Cross-worker: other workers still hold this user in their _users /
         # _key_to_user and would keep auth'ing the deleted account's key until
         # they reload. db.delete_user already removed the row, so their reload
         # drops the user.
         registry.notify_users_changed()
 
-    # Then hard-delete all of the user's data rows (chat / memory / frames /
-    # logs / blobs) and evict the cached in-memory store.
-    db.delete_user_data(user_id)
+    # 跨 worker evict 缓存 store(丢掉脏 token)——本 worker 下面再 pop。
+    wake_bus.notify("blob", user_id)
+
+    # 以下 best-effort：DB 已原子删净(CASCADE)，剩余 R2 frames / DB 兜底清理失败只
+    # 记日志，绝不 abort、绝不改 200——它们不是明文、且已被 CASCADE 覆盖。明文 onboarding
+    # 归档不在此列：它在删账号之前就已清理并在失败时 abort(见上)。
+    for label, fn in (
+        ("frames-r2", lambda: db.delete_user_frames(user_id)),
+        ("db-belt", lambda: db.delete_user_data(user_id)),
+    ):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            print(f"[reset:{user_id}] {label} cleanup failed (non-fatal): {e}")
+
     with core_store._stores_lock:
         core_store._stores.pop(user_id, None)
 
