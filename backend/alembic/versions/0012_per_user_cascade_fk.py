@@ -1,7 +1,7 @@
 """per-user 表补 users FK (ON DELETE CASCADE) — 让删号原子化
 
-Revision ID: 0011_per_user_cascade_fk
-Revises: 0010_supervisor_heartbeats
+Revision ID: 0012_per_user_cascade_fk
+Revises: 0011_world_book_entries
 Create Date: 2026-07-03
 
 根因：account_reset 里 delete_user(删 users 行) 与 delete_user_data(删 per-user 行)
@@ -13,12 +13,15 @@ genesis_import_chunks/outputs 已 CASCADE 引 genesis_import_jobs；给 jobs 加
 的 FK 后整条链补全(删 users→级联 jobs→级联 chunks/outputs)。
 
 加约束前先清"users 已不存在"的孤儿(否则 ADD CONSTRAINT 校验失败)。幂等。
+
+NOTE: 本迁移原为 0011_per_user_cascade_fk；因 test 分支并入了同号的
+0011_world_book_entries 导致 alembic 双头，改挂其后重编号为 0012（内容不变）。
 """
 
 from alembic import op
 
-revision = "0011_per_user_cascade_fk"
-down_revision = "0010_supervisor_heartbeats"
+revision = "0012_per_user_cascade_fk"
+down_revision = "0011_world_book_entries"
 branch_labels = None
 depends_on = None
 
