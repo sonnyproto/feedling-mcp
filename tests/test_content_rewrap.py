@@ -254,3 +254,32 @@ def test_rewrap_no_progress_returns_failed_and_keeps_key(client, monkeypatch):
     assert len(body["pending"]) == 3
     # 零进展 → 注册钥保持旧值
     assert appmod._get_user_public_key(user_id) == old_registered
+
+
+def test_rewrap_skips_already_current_items_on_second_pass(client, monkeypatch):
+    user_id, api_key = _register(client)
+    _seed_encrypted_content(user_id)
+    new_public_key = _b64(b"\x33" * 32)
+
+    calls = {"n": 0}
+    def fake_decrypt(envelope, key, purpose):
+        calls["n"] += 1
+        return f"plaintext:{purpose}:{envelope.get('id')}".encode()
+
+    monkeypatch.setattr(core_enclave, "_decrypt_envelope_via_enclave", fake_decrypt)
+
+    r1 = client.post("/v1/content/rewrap-to-current-key",
+                     json={"public_key": new_public_key}, headers=_headers(api_key))
+    assert r1.get_json()["status"] == "ok"
+    first_calls = calls["n"]
+    assert first_calls == 3  # 首轮解了 3 条
+
+    # 同钥再来一次:全部已是当前钥 → 一次 enclave 解密都不发生。
+    r2 = client.post("/v1/content/rewrap-to-current-key",
+                     json={"public_key": new_public_key}, headers=_headers(api_key))
+    b2 = r2.get_json()
+    assert r2.status_code == 200
+    assert b2["status"] == "ok"
+    assert calls["n"] == first_calls  # 未新增解密调用
+    assert b2["summary"]["total_skipped"] >= 3
+    assert b2["summary"]["total_rewrapped"] == 0

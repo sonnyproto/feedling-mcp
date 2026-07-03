@@ -137,6 +137,8 @@ def _swap_chat(store: "UserStore", msg_id: str, env: dict) -> str:
             else:
                 msg.pop("K_enclave", None)
             msg["enclave_pk_fpr"] = env.get("enclave_pk_fpr", "")
+            if env.get("content_pk_fpr"):
+                msg["content_pk_fpr"] = env["content_pk_fpr"]
             msg["visibility"] = env["visibility"]
             msg["owner_user_id"] = env["owner_user_id"]
             # Full-row replace: the K_enclave key may have been removed, which a
@@ -219,6 +221,8 @@ def _apply_envelope_fields(record: dict, env: dict) -> None:
     else:
         record.pop("K_enclave", None)
     record["enclave_pk_fpr"] = env.get("enclave_pk_fpr", "")
+    if env.get("content_pk_fpr"):
+        record["content_pk_fpr"] = env["content_pk_fpr"]
     record["visibility"] = env["visibility"]
     record["owner_user_id"] = env["owner_user_id"]
 
@@ -231,6 +235,7 @@ def _build_rewrapped_envelope(
     user_pk: bytes,
     enclave_pk: bytes,
     kind: str,
+    current_fpr: str = "",
 ) -> tuple[dict | None, str, str]:
     item_id = str(record.get("id") or "")
     if not _has_encrypted_content_record(record):
@@ -239,6 +244,10 @@ def _build_rewrapped_envelope(
         return None, "skipped_local_only", ""
     if not record.get("K_enclave"):
         return None, "skipped_missing_enclave_key", ""
+    # 已是当前钥 → 跳过,不进 enclave。仅 rewrap 会盖 content_pk_fpr,故字段与
+    # K_user 始终由同一 env 原子写入、二者一致可信。
+    if current_fpr and record.get("content_pk_fpr") == current_fpr:
+        return None, "skipped_already_current", ""
     try:
         plaintext = core_enclave._decrypt_envelope_via_enclave(
             record,
@@ -256,6 +265,7 @@ def _build_rewrapped_envelope(
             visibility="shared",
             item_id=item_id or None,
         )
+        env["content_pk_fpr"] = current_fpr
         return env, "rewrapped", ""
     except Exception as e:
         return None, "error", f"envelope_build_failed:{type(e).__name__}:{str(e)}"
@@ -342,6 +352,7 @@ def content_rewrap_to_current_key():
     enclave_pk, enclave_fpr, enclave_err = core_envelope._enclave_content_public_key_material()
     if enclave_err or enclave_pk is None:
         return jsonify({"error": enclave_err or "enclave_info_unavailable"}), 503
+    current_fpr = core_envelope._content_public_key_fingerprint(user_pk)
 
     summary = _rewrap_summary()
     results: list[dict] = []
@@ -358,6 +369,7 @@ def content_rewrap_to_current_key():
             user_pk=user_pk,
             enclave_pk=enclave_pk,
             kind="identity",
+            current_fpr=current_fpr,
         )
         item_id = str(identity.get("id") or "identity")
         results.append(_rewrap_record_result(summary, "identity", item_id, status, reason=reason))
@@ -375,6 +387,7 @@ def content_rewrap_to_current_key():
             user_pk=user_pk,
             enclave_pk=enclave_pk,
             kind="memory",
+            current_fpr=current_fpr,
         )
         item_id = str(moment.get("id") or "")
         results.append(_rewrap_record_result(summary, "memory", item_id, status, reason=reason))
@@ -393,6 +406,7 @@ def content_rewrap_to_current_key():
             user_pk=user_pk,
             enclave_pk=enclave_pk,
             kind="chat",
+            current_fpr=current_fpr,
         )
         item_id = str(msg.get("id") or "")
         results.append(_rewrap_record_result(summary, "chat", item_id, status, reason=reason))
