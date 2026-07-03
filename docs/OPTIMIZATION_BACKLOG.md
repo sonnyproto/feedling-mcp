@@ -7,9 +7,9 @@
 ## 推荐启动顺序
 
 1. **#4 memory 写放大改单行 upsert** —— 一天内完成，立刻见效
-2. **#2 enclave 换生产 WSGI 服务器** —— 半天，去掉已知脆弱点
-3. **#1 规划 LISTEN/NOTIFY 替代进程内 waiter** —— 结构性，解锁多
-   worker，是其余扩展性问题的总开关
+2. ~~**#2 enclave 换生产 WSGI 服务器**~~ —— ✅ 已完成（gunicorn gthread）
+3. ~~**#1 规划 LISTEN/NOTIFY 替代进程内 waiter**~~ —— ✅ 多 worker 已 ship+deploy
+   （2026-07-01，backend `-w4`）；#3 回环鉴权亦已本地 HMAC 化。**本节 #1/#2/#3 均已过时，待整体复核。**
 
 ---
 
@@ -32,14 +32,14 @@
   打通后 `-w 1` 限制解除。
 - **时机**：用户量增长前唯一需要"早做"的结构性工作。
 
-### #2 enclave 跑在 Werkzeug 开发服务器上 ⬜ P1 · 半天
+### #2 enclave 跑在 Werkzeug 开发服务器上 ✅ 已完成（2026-06，见 CHANGELOG「enclave 改用 gunicorn gthread」）
 
-- **现状**：`backend/enclave_app.py:1395` 是 `app.run(threaded=True)`
-  ——Flask 自带 dev server，非生产级 WSGI。
-- **缓解已有**：whoami 短 TTL 缓存 + in-flight 合并
-  （`enclave_app.py:459-478`）已挡住"history import 触发 N 次回环鉴权"
-  的线程风暴。
-- **方向**：换 gunicorn gthread（注意保留自签 TLS 配置）。低风险小改动。
+- **~~现状~~（已过时）**：曾是 `app.run(threaded=True)`（Flask dev server）。
+- **已做**：入口已换成 **gunicorn gthread**（`worker_class="gthread"`，
+  `_gunicorn_options`/`_enclave_worker_count` @ `backend/enclave_app.py`；
+  `FEEDLING_ENCLAVE_WORKERS` compose 默认 2 × 每 worker 32 线程，保留自签 TLS）。
+  → **enclave 早已不是「单线程 Werkzeug」**。真正残余瓶颈是 backend 线程饱和 +
+  内存墙，见 `docs/superpowers/specs/2026-07-02-backend-longpoll-concurrency-investigation.md`。
 
 ### #3 enclave→backend 回环鉴权耦合 ⬜ P2 · 中等
 

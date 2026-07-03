@@ -7,6 +7,14 @@ Phala 账号**。
 > 触发背景：当前账号预付费余额耗尽，Phala 在 2026-06-18 ~12:00 UTC 自动停掉了
 > 账号下所有 CVM（prod `feedling-enclave-v2` + test `feedling-test`）。决定换号。
 
+> ⚠️ **实际结果（2026-07-01，回填）：test 走了「路径 B」——不是复用旧 app_id，而是
+> 在新账号 `amiller-user` 下新建了 app_id `173c7f49aeb54acb424676b17b17f78e5e2b2938`**
+> （见 DEPLOYMENTS.md 的 *Test CVM* 表）。因此**本文档下面所有 `bb97169…` 指的是被迁移
+> 掉的旧 test app（已废弃），不是现役 test app_id。** test RDS 因换了 app_id → 换了
+> `enclave_content_pk`，旧库不可解密的行已清空、iOS test build 已 repoint 到 `173c7f49`。
+> 路径 A（复用 app_id、零数据迁移）的 go/no-go 未成立；下文路径 A 章节保留作历史参考。
+> prod（`9798850e…`）迁移见 §Phase 2——以 DEPLOYMENTS.md 的 *Production CVM* 表为准。
+
 ---
 
 ## 0. TL;DR + 唯一的成败手
@@ -39,7 +47,7 @@ iOS 重发版，重活）。
 
 | 资产 | 绑定在什么上 | 换 Phala 账号会变吗 | 证据 |
 |---|---|---|---|
-| `enclave_content_pk`（数据加密密钥） | `(kms_root, app_id, path="feedling-content-v1")` | **不变**（前提：同 app_id + 同 prod9 集群） | `backend/enclave_app.py:143-177`；DEPLOYMENTS.md:128-153（8+ 次 compose 升级密钥不变） |
+| `enclave_content_pk`（数据加密密钥） | `(kms_root, app_id, path="feedling-content-v1")` | **不变**（前提：同 app_id + 同 prod9 集群） | `backend/enclave_app.py:143-177`；DEPLOYMENTS.md 各 Phase 表的 *Enclave content pk* 行（8+ 次 compose 升级密钥不变），现役基线见 *Production CVM (prod9, current)* 表 = `2d642ec1…` |
 | `app_id` | 链上 AppAuth 合约地址 | **不变**（前提：复用现有合约） | dstack-tutorial `03-keys-and-replication/deploy_replica.py:62` |
 | 密钥释放授权 | `FeedlingAppAuth.isAppAllowed(composeHash)`，**只查 compose_hash 白名单、不绑 device** | 不受账号影响 | `contracts/src/FeedlingAppAuth.sol:145-146` |
 | AppAuth owner（能加 compose_hash） | `ETH_DEPLOYER_KEY` 私钥 `0xa0eBcd26…` | 不受账号影响（你们持有该私钥） | DEPLOYMENTS.md:78 |
@@ -82,8 +90,9 @@ iOS 重发版，重活）。
    curl -sk https://bb9716955423faed3508888e7c654ff46f5f0c2d-5003s.dstack-pha-prod9.phala.network/attestation \
      | python3 -c 'import sys,json;print("OLD content_pk:",json.load(sys.stdin).get("enclave_content_pk_hex"))'
    ```
-   预期 test 的 content pk 是该 app_id 自洽的一个固定值（prod 的已知是 `f50c90f7…`，
-   test 因独立 RDS/独立 app_id 是另一个值——以这步实测为准）。
+   预期 test 的 content pk 是该 app_id 自洽的一个固定值（⚠️ 注意：live **prod9** 的
+   已知是 `2d642ec1…`；`f50c90f7…` 是退役 **prod5** app `051a174f` 的钥，不是现役基线。
+   test 因独立 RDS/独立 app_id 又是另一个值——以这步实测为准）。
 
 2. 在**新账号**用 dstack 的 "existing-app" 流程开 CVM（复用 app_id，**不铸新合约**）。
    参考 `~/Projects/teleport/dstack-tutorial/03-keys-and-replication/deploy_replica.py`
@@ -167,8 +176,11 @@ iOS 重发版，重活）。
   compose 文件 `deploy/docker-compose.phala.yaml`，`DATABASE_URL`（prod RDS）。
 - 旧 prod CVM 现在也是 stopped；迁移期间保持 stopped，避免与新 CVM 双写。
 - 更新 `deploy/prod-cvm-id.txt` + DEPLOYMENTS.md 的 Production 表。
-- prod content pk 基线应为 `f50c90f711e8484c7178a69657cad99944cba7c0cdeaa3cccb0388021e7d2744`
-  （DEPLOYMENTS.md:129）——新 CVM 必须派生出**同一个**值才算成功。
+- prod content pk 基线应为 `2d642ec1f54719d8c6088e8cbaf394961cb804a533bd4d7366d48d1d543f5620`
+  （live prod9 app `9798850e…` `/attestation`，2026-07-03 实测；见 DEPLOYMENTS.md
+  的 Production CVM 表）——新 CVM 复用同一 app_id 时必须派生出**同一个**值才算成功。
+  ⚠️ **勿用 `f50c90f7…`**：那是退役 prod5 app `051a174f` 的钥，不是 prod9 基线；
+  拿它当判据会把正确的 prod9 迁移误判成失败（正是 2026-07 假警报的军火之一）。
 
 ---
 
