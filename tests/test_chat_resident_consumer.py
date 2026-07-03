@@ -2882,6 +2882,62 @@ def test_normalize_agent_replies_supports_multiple_messages_with_cap(monkeypatch
     assert crc._normalize_agent_replies(raw) == ["第一条", "第二条", "第三条", "第四条", "第五条"]
 
 
+def test_user_timezone_reads_from_whoami_cache(monkeypatch):
+    monkeypatch.setitem(crc._whoami_cache, "timezone", "Asia/Shanghai")
+    assert crc._user_timezone() == "Asia/Shanghai"
+
+
+def test_local_time_anchor_localizes_with_whoami_timezone(monkeypatch):
+    monkeypatch.setitem(crc._whoami_cache, "timezone", "Asia/Shanghai")
+    line = crc._local_time_anchor()
+    assert line.startswith("current_time:")
+    assert "Asia/Shanghai" in line
+
+
+def test_user_timezone_empty_when_whoami_has_none(monkeypatch):
+    monkeypatch.setitem(crc._whoami_cache, "timezone", "")
+    assert crc._user_timezone() == ""
+
+
+class _FakeWhoamiResp:
+    def __init__(self, body):
+        self._body = body
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._body
+
+
+def test_load_whoami_clears_cached_timezone_when_omitted(monkeypatch):
+    # A successful whoami that no longer carries a timezone (user cleared it,
+    # no fallback) must clear the cache — not keep serving the stale zone.
+    monkeypatch.setitem(crc._whoami_cache, "timezone", "Asia/Shanghai")
+    body = {
+        "user_id": "usr_x",
+        "public_key": base64.b64encode(b"\x11" * 32).decode(),
+        "enclave_content_public_key_hex": "22" * 32,
+    }
+    monkeypatch.setattr(crc.httpx, "get", lambda *a, **k: _FakeWhoamiResp(body))
+    assert crc._load_whoami() is True
+    assert crc._whoami_cache["timezone"] == ""
+
+
+def test_load_whoami_keeps_cached_timezone_on_fetch_failure(monkeypatch):
+    # A FAILED whoami (network error) must retain the last-known timezone —
+    # last-known is a guard against transient failures, not against a
+    # successful response that happens to omit the field.
+    monkeypatch.setitem(crc._whoami_cache, "timezone", "Asia/Shanghai")
+
+    def _boom(*a, **k):
+        raise RuntimeError("net down")
+
+    monkeypatch.setattr(crc.httpx, "get", _boom)
+    assert crc._load_whoami() is False
+    assert crc._whoami_cache["timezone"] == "Asia/Shanghai"
+
+
 def test_normalize_agent_replies_extracts_content_field():
     raw = '{"content":"正常应该只显示 content 里的文字。","content_type":"text"}'
 

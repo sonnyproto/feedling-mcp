@@ -215,9 +215,11 @@ def test_snapshot_timezone_survives_ttl_but_local_time_expires(env):
     assert snap["local_time"] is None            # volatile -> expires
 
 
-def test_record_context_timezone_writes_state(env):
-    """The proactive app-presence channel persists the device timezone without the
-    perception-upload pipeline, so proactive's current_time anchor can localize."""
+def test_record_context_timezone_writes_locale_to_snapshot(env):
+    """The app-presence channel must still populate the perception snapshot with
+    timezone AND locale: the resident consumer's reply-language guardrail
+    (_reply_language_line) reads `locale` from /v1/agent/perception?signals=now,
+    so a perception-upload-OFF user relies on this write for it."""
     fake, _ = env
     assert service.record_context_timezone(UID, "Asia/Shanghai", "zh") is True
     snap = service.snapshot(UID)

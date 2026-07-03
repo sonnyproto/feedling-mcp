@@ -220,15 +220,23 @@ def ingest_snapshot(user_id: str, items: list, client_ts=None) -> dict:
 def record_context_timezone(user_id: str, timezone: str, locale: str = "") -> bool:
     """Persist the device timezone/locale from a NON-perception, already-disclosed
     channel (the proactive app-presence device event), NOT the perception upload
-    pipeline. This lets the resident consumer's current_time anchor localize
-    proactive messages even when the user has turned the perception-data upload
-    opt-out OFF — timezone/locale are stable, non-sensitive proactive context, and
-    routing them here (instead of forging a /v1/perception/report item) respects
-    that opt-out. Returns True when a valid timezone was written.
+    pipeline. Writes TWO places:
 
-    `local_time` is derived here only to satisfy the `time` signal shape; it is
-    volatile and expires on the normal TTL, while timezone/locale are exempt (see
-    _STABLE_CONTEXT_FIELDS)."""
+    1. The first-class user RECORD (via registry) — the timezone migration's
+       authoritative source, read by /v1/users/whoami and the resident consumer's
+       current_time anchor, decoupled from perception.
+    2. The perception snapshot `time` signal (timezone + locale) — STILL written
+       because `locale` from this channel feeds the resident consumer's
+       reply-language guardrail: `_reply_language_line` reads `locale` from
+       /v1/agent/perception?signals=now, so a perception-upload-OFF user relies on
+       this write to keep proactive replies in their language. It also keeps the
+       whoami perception fallback (stable_context_timezone) fed for transitional
+       users.
+
+    timezone/locale are TTL-exempt (see _STABLE_CONTEXT_FIELDS); the volatile
+    `local_time` in the same signal expires normally. Returns True when a valid
+    timezone was written. Kept out of the wake path: time is a non-significant
+    signal, no wake fires."""
     tz = str(timezone or "").strip()
     if not tz:
         return False
@@ -245,9 +253,11 @@ def record_context_timezone(user_id: str, timezone: str, locale: str = "") -> bo
             "timezone": tz,
             "locale": str(locale or "").strip(),
         }),
-        "message": "device timezone (proactive app-presence)",
+        "message": "device timezone/locale (proactive app-presence)",
     }
     ingest_snapshot(user_id, [item])
+    from accounts import registry
+    registry._set_user_timezone(user_id, tz)  # first-class record (may no-op if user unknown)
     return True
 
 
@@ -751,6 +761,18 @@ def _fire_wake(user_id: str, cap_key: str, hint: str, now: float) -> None:
 # (the resident consumer's current_time anchor) instead of falling back to UTC.
 # The volatile `local_time` in the same `time` signal keeps expiring normally.
 _STABLE_CONTEXT_FIELDS = frozenset({"timezone", "locale"})
+
+
+def stable_context_timezone(user_id: str) -> str | None:
+    """Device timezone from the perception snapshot state. Used ONLY as the
+    transitional fallback in /v1/users/whoami for users whose first-class
+    record timezone is not yet populated. Returns None when unset. `timezone`
+    is a stable-context field (never TTL-expired), so a raw cell read is safe."""
+    cell = store.get_state(user_id).get("timezone")
+    if isinstance(cell, dict):
+        v = str(cell.get("v") or "").strip()
+        return v or None
+    return None
 
 
 def _catalog_snapshot_fields(user_id: str, now: float | None = None, *, include_query_tools: bool = False) -> dict:
