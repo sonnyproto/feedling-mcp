@@ -125,6 +125,32 @@ def test_record_capture_job_status_completed_zero_cards_is_legal_noop_wording(tm
     assert "没有可抓取的新记忆" in done[0]["explain"]
 
 
+def test_record_capture_job_status_skipped_emits_done_event_not_error(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch, "usr_capture_trace_skipped")
+
+    job, enqueued, _ = capture_jobs.enqueue_memory_capture_job(
+        store, trigger="session_break", capture_key="cap_key_skipped",
+        window={"after_message_id": "m1", "until_message_id": "m2", "message_count": 1},
+    )
+    assert enqueued is True
+
+    skipped_job = dict(job)
+    skipped_job.update({"status": "skipped", "status_reason": "throttled"})
+
+    capture_scheduler.record_capture_job_status(store, skipped_job, status="skipped")
+
+    events = debug_trace.read_trace(store, subsystem="memory")
+    errors = [e for e in events if e["type"] == "memory.capture.error"]
+    assert len(errors) == 0
+
+    done = [e for e in events if e["type"] == "memory.capture.done"]
+    assert len(done) == 1
+    assert done[0]["job_id"] == job["job_id"]
+    assert done[0]["status"] != "error"
+    assert done[0]["status"] == "ok"
+    assert done[0]["detail"]["status"] == "skipped"
+
+
 def test_record_capture_job_status_failed_emits_error_event(tmp_path, monkeypatch):
     store = _store(tmp_path, monkeypatch, "usr_capture_trace_error")
 

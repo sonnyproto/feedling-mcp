@@ -375,6 +375,27 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
             detail={"cards_added": cards_added},
             content_excerpt={"titles": titles} if titles else None,
         )
+    elif status_text == "skipped":
+        # Scheduler declined/deferred the job (e.g. throttled / wake-gate) — this is
+        # NOT a failure. Keep it distinct from "failed" so the dashboard doesn't
+        # render it red (see CAPTURE_RETRYABLE_TERMINAL comment in capture_jobs.py:
+        # "failed = error; skipped = abnormal terminal — noop is reported as
+        # completed, not skipped").
+        reason = str(job.get("status_reason") or job.get("noop_reason") or "").strip()
+        detail = {"status": status_text}
+        if reason:
+            detail["reason"] = reason[:200]
+        debug_trace.trace_event(
+            store,
+            subsystem="memory",
+            type="memory.capture.done",
+            actor="backend",
+            status="ok",
+            job_id=job_id,
+            summary="capture job skipped",
+            explain="记忆抓取跳过：调度器暂缓执行（未失败）",
+            detail=detail,
+        )
     else:
         reason = str(job.get("status_reason") or job.get("noop_reason") or "").strip()
         debug_trace.trace_event(
