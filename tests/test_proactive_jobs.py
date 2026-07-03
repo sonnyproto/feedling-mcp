@@ -22,6 +22,8 @@ from proactive import routes as proactive_routes  # noqa: E402
 from push import apns as push_apns  # noqa: E402
 from core import config as core_config  # noqa: E402
 
+from conftest import seed_user  # noqa: E402
+
 
 def _patch_resident_scheduled_route_dependencies(monkeypatch):
     from proactive import scheduled_wake_v2, store_v2
@@ -63,6 +65,7 @@ def test_device_event_payload_is_redacted():
 def test_manual_proactive_wake_creates_hidden_job(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive")
+    seed_user(store.user_id)
 
     decision = appmod._build_proactive_v2_wake_decision(
         store,
@@ -93,6 +96,7 @@ def test_manual_proactive_wake_creates_hidden_job(tmp_path, monkeypatch):
 def test_proactive_debug_derives_job_delivery_state(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive_delivery")
+    seed_user(store.user_id)
 
     decision = appmod._build_proactive_v2_wake_decision(
         store,
@@ -139,6 +143,7 @@ def test_proactive_debug_derives_job_delivery_state(tmp_path, monkeypatch):
 def test_proactive_debug_folds_legacy_no_frame_ticks(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive_folded_gate")
+    seed_user(store.user_id)
 
     no_frame = {
         "decision_id": "gd_no_frame",
@@ -208,6 +213,7 @@ def test_proactive_debug_folds_legacy_no_frame_ticks(tmp_path, monkeypatch):
 def test_proactive_debug_dashboard_defaults_to_deep_full_view(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive_deep_dashboard")
+    seed_user(store.user_id)
 
     for i in range(12):
         decision_id = f"gd_frame_{i}"
@@ -291,6 +297,7 @@ def test_proactive_debug_dashboard_defaults_to_deep_full_view(tmp_path, monkeypa
 def test_proactive_debug_translates_prose_only_in_zh_view(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_test_proactive_debug_translate")
+    seed_user(store.user_id)
     reason = "The screen has a concrete connection to the user's memory garden."
     context_hint = "The user is comparing a dense note and may want one gentle nudge."
     abstention = "The companion has already successfully engaged with the user's current context and provided a relevant response."
@@ -367,6 +374,7 @@ def test_proactive_settings_persists_timezone(tmp_path, monkeypatch):
     api_key = "test_proactive_timezone_key"
     user_id = "usr_endpoint_proactive_timezone"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
 
     client = appmod.app.test_client()
     headers = {"X-API-Key": api_key}
@@ -396,6 +404,7 @@ def test_proactive_state_three_switch_contract_drives_v2_scheduled_gate(tmp_path
     api_key = "test_proactive_three_switch_key"
     user_id = "usr_endpoint_proactive_three_switch"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
 
     client = appmod.app.test_client()
     headers = {"X-API-Key": api_key}
@@ -449,6 +458,7 @@ def test_proactive_tick_delivery_off_still_allows_presence_wake(tmp_path, monkey
     api_key = "test_proactive_delivery_off_wake_key"
     user_id = "usr_endpoint_proactive_delivery_off_wake"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
 
     client = appmod.app.test_client()
     headers = {"X-API-Key": api_key}
@@ -481,6 +491,7 @@ def test_proactive_tick_endpoint_enqueues_pollable_job(tmp_path, monkeypatch):
     api_key = "test_proactive_key"
     user_id = "usr_endpoint_proactive"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
 
     client = appmod.app.test_client()
     headers = {"X-API-Key": api_key}
@@ -540,6 +551,7 @@ def test_screen_watch_tick_preserves_job_kind_and_trigger(tmp_path, monkeypatch)
     api_key = "test_screen_watch_key"
     user_id = "usr_screen_watch"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
 
     client = appmod.app.test_client()
     resp = client.post(
@@ -586,6 +598,7 @@ def test_screen_watch_tick_does_not_sample_recent_frames_implicitly(tmp_path, mo
     api_key = "test_screen_watch_no_sample_key"
     user_id = "usr_screen_watch_no_sample"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
 
     client = appmod.app.test_client()
     resp = client.post(
@@ -617,6 +630,7 @@ def test_auto_proactive_v2_wake_samples_frames_without_gate_llm(tmp_path, monkey
     api_key = "test_proactive_auto_key"
     user_id = "usr_endpoint_proactive_auto"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.frames_meta.append({
         "id": "abcd1234abcd1234",
@@ -652,6 +666,7 @@ def test_auto_proactive_v2_wake_does_not_block_after_recent_user_chat(tmp_path, 
     api_key = "test_proactive_recent_chat_key"
     user_id = "usr_endpoint_proactive_recent_chat"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.append_chat("user", "ios", {
         "id": "msg_recent_user",
@@ -688,6 +703,7 @@ def test_auto_proactive_v2_wake_does_not_require_gate_model(tmp_path, monkeypatc
     api_key = "test_proactive_auto_no_model_key"
     user_id = "usr_endpoint_proactive_auto_no_model"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.frames_meta.append({
         "id": "efef1234efef1234",
@@ -715,6 +731,7 @@ def test_auto_proactive_v2_wake_suppresses_job_without_frames(tmp_path, monkeypa
     api_key = "test_proactive_auto_false_key"
     user_id = "usr_endpoint_proactive_auto_false"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
 
     client = appmod.app.test_client()
     resp = client.post("/v1/proactive/tick", headers={"X-API-Key": api_key}, json={})
@@ -738,6 +755,7 @@ def test_auto_proactive_v2_schedule_heartbeats_split_presence_and_screen_wakes(t
     api_key = "test_proactive_auto_schedule_key"
     user_id = "usr_endpoint_proactive_auto_schedule"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
 
     client = appmod.app.test_client()
     headers = {"X-API-Key": api_key}
@@ -794,6 +812,7 @@ def test_auto_proactive_v2_away_state_does_not_resurrect_legacy_wake_gate(tmp_pa
     api_key = "test_proactive_away_key"
     user_id = "usr_endpoint_proactive_away"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
 
     client = appmod.app.test_client()
     headers = {"X-API-Key": api_key}
@@ -826,6 +845,7 @@ def test_gate_review_endpoint_records_human_label(tmp_path, monkeypatch):
     api_key = "test_gate_review_key"
     user_id = "usr_gate_review"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
 
     decision = appmod._build_proactive_v2_wake_decision(
@@ -867,6 +887,7 @@ def test_proactive_job_claim_and_status_lifecycle(tmp_path, monkeypatch):
     api_key = "test_proactive_claim_key"
     user_id = "usr_endpoint_proactive_claim"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
 
     decision = appmod._build_proactive_v2_wake_decision(
@@ -911,6 +932,7 @@ def test_resident_poll_includes_per_user_runtime_v2_profile(tmp_path, monkeypatc
     api_key = "test_resident_runtime_profile_key"
     user_id = "usr_resident_runtime_profile"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     job = store.append_proactive_job({
         "job_id": "pj_runtime_profile",
@@ -943,6 +965,7 @@ def test_resident_poll_applies_v2_wake_controls_to_legacy_jobs(tmp_path, monkeyp
     api_key = "test_resident_poll_v2_gate_key"
     user_id = "usr_resident_poll_v2_gate"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.save_proactive_settings({
         "ambient": False,
@@ -993,6 +1016,7 @@ def test_resident_poll_delivers_introduction_even_when_ambient_off(tmp_path, mon
     api_key = "test_resident_poll_intro_key"
     user_id = "usr_resident_poll_intro"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.save_proactive_settings({
         "ambient": False,
@@ -1032,6 +1056,7 @@ def test_capture_job_polls_and_claims_when_ambient_is_off(tmp_path, monkeypatch)
     api_key = "test_capture_ambient_off_key"
     user_id = "usr_capture_ambient_off"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.save_proactive_settings({
         "ambient": False,
@@ -1116,6 +1141,7 @@ def test_capture_job_recovered_when_created_before_consumer_watermark(tmp_path, 
     api_key = "test_capture_watermark_key"
     user_id = "usr_capture_watermark"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.save_proactive_settings({
         "ambient": False,
@@ -1162,6 +1188,7 @@ def test_capture_job_recovered_when_created_before_consumer_watermark(tmp_path, 
 def test_capture_enqueue_single_flight_per_user(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_capture_single_flight")
+    seed_user(store.user_id)
 
     first, first_enqueued, first_reason = proactive_capture_jobs.enqueue_memory_capture_job(
         store,
@@ -1190,6 +1217,7 @@ def test_capture_enqueue_single_flight_per_user(tmp_path, monkeypatch):
 def test_capture_enqueue_is_idempotent_by_capture_key(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_capture_idempotent")
+    seed_user(store.user_id)
 
     first, first_enqueued, _reason = proactive_capture_jobs.enqueue_memory_capture_job(
         store,
@@ -1222,6 +1250,7 @@ def test_capture_failed_window_retries_same_key(tmp_path, monkeypatch):
     # re-captured.
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_capture_failed_retry")
+    seed_user(store.user_id)
 
     first, first_enqueued, _ = proactive_capture_jobs.enqueue_memory_capture_job(
         store,
@@ -1266,6 +1295,7 @@ def test_dream_failed_window_retries_same_key(tmp_path, monkeypatch):
     # retryable and must not permanently lock dream_already_pending.
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_dream_failed_retry")
+    seed_user(store.user_id)
 
     first, first_enqueued, _ = proactive_capture_jobs.enqueue_memory_dream_job(
         store, trigger="nightly_dream", dream_key="dream:same", now=101.0,
@@ -1347,6 +1377,7 @@ def test_dream_tick_threshold_single_flight_and_ambient_off_poll(tmp_path, monke
     api_key = "test_dream_tick_key"
     user_id = "usr_dream_tick"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.save_proactive_settings({
         "ambient": False,
@@ -1391,6 +1422,7 @@ def test_dream_tick_threshold_single_flight_and_ambient_off_poll(tmp_path, monke
 def test_dream_enqueue_idempotent_by_key_and_single_flight(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     store = appmod.UserStore("usr_dream_idempotent")
+    seed_user(store.user_id)
 
     first, first_enqueued, first_reason = proactive_capture_jobs.enqueue_memory_dream_job(
         store,
@@ -1449,6 +1481,7 @@ def test_dream_completion_advances_state(tmp_path, monkeypatch):
     api_key = "test_dream_completion_key"
     user_id = "usr_dream_completion"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     appmod.db.memory_replace_all(user_id, [_dream_test_memory(user_id, "mem_done")])
     client = appmod.app.test_client()
@@ -1496,6 +1529,7 @@ def test_capture_coordinator_dedupes_same_window_across_signals(tmp_path, monkey
     api_key = "test_capture_dedupe_key"
     user_id = "usr_capture_dedupe"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
 
     msg = store.append_chat("user", "chat", _capture_test_envelope(user_id, "msg_capture_dedupe"))
@@ -1534,6 +1568,7 @@ def test_capture_quiet_tick_noops_without_new_messages(tmp_path, monkeypatch):
     api_key = "test_capture_quiet_noop_key"
     user_id = "usr_capture_quiet_noop"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     client = appmod.app.test_client()
 
     resp = client.post(
@@ -1553,6 +1588,7 @@ def test_capture_turn_backstop_enqueues_only_when_due(tmp_path, monkeypatch):
     monkeypatch.setenv("FEEDLING_CAPTURE_TURN_BACKSTOP", "2")
     monkeypatch.setenv("FEEDLING_CAPTURE_MIN_INTERVAL_SEC", "0")
     store = appmod.UserStore("usr_capture_turn_backstop")
+    seed_user(store.user_id)
 
     store.append_chat("user", "chat", _capture_test_envelope(store.user_id, "msg_turn_1"))
     assert _memory_capture_jobs(store) == []
@@ -1575,6 +1611,7 @@ def test_capture_device_boundary_ignores_proactive_switches(tmp_path, monkeypatc
     api_key = "test_capture_switches_off_key"
     user_id = "usr_capture_switches_off"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.save_proactive_settings({
         "ambient": False,
@@ -1608,6 +1645,7 @@ def test_capture_completion_advances_state_and_blocks_same_window(tmp_path, monk
     api_key = "test_capture_completion_key"
     user_id = "usr_capture_completion"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     msg = store.append_chat("user", "chat", _capture_test_envelope(user_id, "msg_capture_done"))
     client = appmod.app.test_client()
@@ -1661,6 +1699,7 @@ def test_resident_scheduled_fire_endpoint_queues_due_timer_job(tmp_path, monkeyp
     api_key = "test_resident_scheduled_fire_key"
     user_id = "usr_resident_scheduled_fire"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
 
     client = appmod.app.test_client()
     headers = {"X-API-Key": api_key}
@@ -1706,6 +1745,7 @@ def test_resident_scheduled_fire_endpoint_transparency_when_scheduled_off(tmp_pa
     api_key = "test_resident_scheduled_fire_off_key"
     user_id = "usr_resident_scheduled_fire_off"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
 
     client = appmod.app.test_client()
     headers = {"X-API-Key": api_key}
@@ -1753,6 +1793,7 @@ def test_resident_scheduled_fire_endpoint_ignores_future_timer(tmp_path, monkeyp
     api_key = "test_resident_scheduled_future_key"
     user_id = "usr_resident_scheduled_future"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
 
     client = appmod.app.test_client()
     headers = {"X-API-Key": api_key}
@@ -1789,6 +1830,7 @@ def test_resident_stale_claim_is_recovered_and_old_consumer_cannot_complete(tmp_
     api_key = "test_resident_stale_reclaim_key"
     user_id = "usr_resident_stale_reclaim"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.append_proactive_job({
         "job_id": "pj_stale_resident",
@@ -1831,6 +1873,7 @@ def test_resident_reaper_does_not_reclaim_hosted_claims(tmp_path, monkeypatch):
     api_key = "test_resident_reaper_hosted_key"
     user_id = "usr_resident_reaper_hosted"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.append_proactive_job({
         "job_id": "pj_hosted_claim",
@@ -1872,6 +1915,7 @@ def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeyp
     api_key = "test_proactive_delivery_key"
     user_id = "usr_endpoint_proactive_delivery"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.tokens = [
         {
@@ -1941,6 +1985,7 @@ def test_proactive_chat_response_delivery_off_writes_chat_without_push(tmp_path,
     api_key = "test_proactive_delivery_off_key"
     user_id = "usr_endpoint_proactive_delivery_off"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.save_proactive_settings({"reminders_delivery": False})
     store.tokens = [
@@ -2017,6 +2062,7 @@ def test_ai_chat_response_pushes_when_app_background(tmp_path, monkeypatch):
     api_key = "test_ai_push_background_key"
     user_id = "usr_ai_push_background"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.tokens = [
         {
@@ -2087,6 +2133,7 @@ def test_ai_chat_response_suppresses_push_when_app_foreground(tmp_path, monkeypa
     api_key = "test_ai_push_foreground_key"
     user_id = "usr_ai_push_foreground"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.tokens = [
         {"type": "live_activity", "token": "live-token", "activity_id": "activity_1", "status": "active"},
@@ -2135,6 +2182,7 @@ def test_chat_history_supports_lightweight_images_and_before_cursor(tmp_path, mo
     api_key = "test_chat_history_lightweight_key"
     user_id = "usr_chat_history_lightweight"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
 
     def _append(idx: int, *, content_type: str = "text", body_ct: str = "ct"):
@@ -2252,6 +2300,7 @@ def test_proactive_chat_response_uses_push_to_start_when_start_window_open(tmp_p
     api_key = "test_proactive_start_key"
     user_id = "usr_endpoint_proactive_start"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.tokens = [
         {
@@ -2343,6 +2392,7 @@ def test_proactive_chat_response_uses_update_during_start_cooldown(tmp_path, mon
     api_key = "test_proactive_update_key"
     user_id = "usr_endpoint_proactive_update"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.tokens = [
         {
@@ -2505,6 +2555,7 @@ def test_chat_alert_falls_back_from_bad_latest_device_token(tmp_path, monkeypatc
     api_key = "test_bad_device_token_key"
     user_id = "usr_bad_device_token"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.tokens = [
         {
@@ -2550,6 +2601,7 @@ def test_live_activity_falls_back_from_topic_mismatch_token(tmp_path, monkeypatc
     api_key = "test_bad_live_activity_token_key"
     user_id = "usr_bad_live_activity_token"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.tokens = [
         {
@@ -2605,6 +2657,7 @@ def test_live_activity_expires_environment_mismatch_token(tmp_path, monkeypatch)
     api_key = "test_bad_live_activity_env_key"
     user_id = "usr_bad_live_activity_env"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.tokens = [
         {
@@ -2661,6 +2714,7 @@ def test_live_activity_expiring_error_requests_token_refresh(tmp_path, monkeypat
     api_key = "test_refresh_bad_live_activity_key"
     user_id = "usr_refresh_bad_live"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
     store = appmod.get_store(user_id)
     store.tokens = [
         {
@@ -2706,6 +2760,7 @@ def test_register_token_persists_client_push_metadata(tmp_path, monkeypatch):
     api_key = "test_token_metadata_key"
     user_id = "usr_token_metadata"
     appmod._key_to_user[appmod._hash_api_key(api_key)] = user_id
+    seed_user(user_id)
 
     with appmod.app.test_client() as client:
         resp = client.post(

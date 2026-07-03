@@ -25,6 +25,8 @@ if not os.environ.get("DATABASE_URL"):
 
 import db  # noqa: E402
 
+from conftest import seed_user  # noqa: E402
+
 db.init_schema()
 
 
@@ -104,6 +106,7 @@ def test_global_blob():
 
 def test_blob_get_set():
     uid = _uid()
+    seed_user(uid)
     assert db.get_blob(uid, "identity") is None
     db.set_blob(uid, "identity", {"agent_name": "Iris", "v": 1})
     assert db.get_blob(uid, "identity") == {"agent_name": "Iris", "v": 1}
@@ -114,6 +117,7 @@ def test_blob_get_set():
 
 def test_blob_delete_and_list_by_prefix():
     uid = _uid()
+    seed_user(uid)
     db.set_blob(uid, "model_api", {"provider": "openrouter"})
     assert db.delete_blob(uid, "model_api") is True
     assert db.delete_blob(uid, "model_api") is False
@@ -128,6 +132,7 @@ def test_blob_delete_and_list_by_prefix():
 
 def test_chat_append_order_and_ring_buffer():
     uid = _uid()
+    seed_user(uid)
     for i in range(5):
         db.chat_append(uid, f"m{i}", float(i), {"id": f"m{i}", "body_ct": f"ct{i}"}, max_messages=3)
     loaded = db.chat_load(uid)
@@ -138,6 +143,7 @@ def test_chat_append_order_and_ring_buffer():
 
 def test_chat_update_metadata_merges():
     uid = _uid()
+    seed_user(uid)
     db.chat_append(uid, "x1", 1.0, {"id": "x1", "body_ct": "ct", "visibility": "shared"}, max_messages=0)
     merged = db.chat_update_metadata(uid, "x1", {"alert_status": "sent"})
     assert merged["alert_status"] == "sent"
@@ -147,6 +153,7 @@ def test_chat_update_metadata_merges():
 
 def test_chat_delete():
     uid = _uid()
+    seed_user(uid)
     db.chat_append(uid, "d1", 1.0, {"id": "d1"}, max_messages=0)
     assert db.chat_delete(uid, "d1") is True
     assert db.chat_delete(uid, "d1") is False
@@ -155,6 +162,7 @@ def test_chat_delete():
 
 def test_memory_upsert_replace_delete():
     uid = _uid()
+    seed_user(uid)
     db.memory_upsert(uid, "a", "2026-01-02", {"id": "a", "content": "one"})
     db.memory_upsert(uid, "b", "2026-01-01", {"id": "b", "content": "two"})
     loaded = db.memory_load(uid)
@@ -173,6 +181,7 @@ def test_memory_replace_all_diff_semantics():
     input; the diff optimization is internal but must not change observable
     behavior."""
     uid = _uid()
+    seed_user(uid)
     base = [
         {"id": "a", "occurred_at": "2026-01-01", "content": "a"},
         {"id": "b", "occurred_at": "2026-01-02", "content": "b"},
@@ -214,6 +223,7 @@ def test_memory_replace_all_rewrites_stale_occurred_at_column():
     still rewrite the column — otherwise memory_load (ORDER BY occurred_at)
     returns the wrong order. Mirrors the old full-replace semantics."""
     uid = _uid()
+    seed_user(uid)
     # Seed two rows whose ordering column disagrees with the doc's own field:
     # x sorts first by column ("1"), y second ("2"), but the docs' occurred_at
     # fields are the reverse.
@@ -232,6 +242,7 @@ def test_memory_replace_all_rewrites_stale_occurred_at_column():
 
 def test_frame_upsert_get_exists_prune():
     uid = _uid()
+    seed_user(uid)
     for i in range(5):
         db.frame_upsert(uid, f"f{i}", float(i), {"id": f"f{i}", "body_ct": f"big{i}"})
     assert db.frame_exists(uid, "f3") is True
@@ -247,6 +258,7 @@ def test_frame_upsert_get_exists_prune():
 
 def test_log_append_read_trim_prune():
     uid = _uid()
+    seed_user(uid)
     for i in range(10):
         db.log_append(uid, "device_events", {"event": i, "ts": float(i)}, ts=float(i))
     # newest 3, chronological
@@ -266,6 +278,7 @@ def test_log_append_read_trim_prune():
 
 def test_log_patch_item_only_if_status():
     uid = _uid()
+    seed_user(uid)
     db.log_append(uid, "proactive_jobs", {"job_id": "j1", "status": "pending"},
                   ts=1.0, item_key="j1")
     # guard mismatch → no change
@@ -281,6 +294,7 @@ def test_log_patch_item_only_if_status():
 
 def test_delete_user_data_wipes_everything():
     uid = _uid()
+    seed_user(uid)
     db.set_blob(uid, "identity", {"a": 1})
     db.chat_append(uid, "c1", 1.0, {"id": "c1"}, max_messages=0)
     db.memory_upsert(uid, "m1", "2026-01-01", {"id": "m1"})
@@ -365,6 +379,7 @@ def test_envelope_fields_stored_byte_for_byte():
     """Crypto-fidelity guard: the opaque base64 envelope fields the enclave
     needs to decrypt must survive a store→load round-trip unchanged."""
     uid = _uid()
+    seed_user(uid)
     env = {
         "id": "abc123",
         "v": 1,

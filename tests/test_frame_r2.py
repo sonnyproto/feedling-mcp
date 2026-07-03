@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db  # noqa: E402
 import object_storage  # noqa: E402
 
+from conftest import seed_user  # noqa: E402
+
 
 class _Streaming:
     def __init__(self, data: bytes):
@@ -99,6 +101,7 @@ def test_upsert_offloads_body_to_r2(monkeypatch):
     fake = _FakeS3()
     _enable_r2(monkeypatch, fake)
     uid = _uid()
+    seed_user(uid)
     env = _env(uid, "f1")
     db.frame_upsert(uid, "f1", 1.0, env)
 
@@ -117,6 +120,7 @@ def test_get_reconstructs_full_envelope(monkeypatch):
     fake = _FakeS3()
     _enable_r2(monkeypatch, fake)
     uid = _uid()
+    seed_user(uid)
     env = _env(uid, "f1")
     db.frame_upsert(uid, "f1", 1.0, env)
     assert db.frame_get(uid, "f1") == env  # byte-for-byte, incl body_ct
@@ -126,6 +130,7 @@ def test_caller_dict_not_mutated(monkeypatch):
     fake = _FakeS3()
     _enable_r2(monkeypatch, fake)
     uid = _uid()
+    seed_user(uid)
     env = _env(uid, "f1")
     db.frame_upsert(uid, "f1", 1.0, env)
     assert "body_ct" in env  # upsert must not pop body_ct off the caller's dict
@@ -137,6 +142,7 @@ def test_get_returns_none_when_r2_body_missing(monkeypatch):
     fake = _FakeS3()
     _enable_r2(monkeypatch, fake)
     uid = _uid()
+    seed_user(uid)
     db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
     fake.store.clear()  # the R2 body vanished
     assert db.frame_get(uid, "f1") is None
@@ -164,6 +170,7 @@ def test_delete_keeps_r2_when_db_delete_fails(monkeypatch):
     fake = _FakeS3()
     _enable_r2(monkeypatch, fake)
     uid = _uid()
+    seed_user(uid)
     db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
     assert ("io-image-frames", "frames/%s/f1" % uid) in fake.store
     monkeypatch.setattr(db, "get_pool", lambda: _BoomPool())
@@ -178,6 +185,7 @@ def test_upsert_does_not_overwrite_r2_when_db_write_fails(monkeypatch):
     fake = _FakeS3()
     _enable_r2(monkeypatch, fake)
     uid = _uid()
+    seed_user(uid)
     db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1", body=b"AAAA"))
     key = ("io-image-frames", "frames/%s/f1" % uid)
     assert fake.store[key] == b"AAAA"
@@ -195,6 +203,7 @@ def test_pointer_row_written_only_after_object_exists(monkeypatch):
     fake = _FakeS3()
     _enable_r2(monkeypatch, fake)
     uid = _uid()
+    seed_user(uid)
     seen = {}
     real_put = fake.put_object
 
@@ -218,6 +227,7 @@ def test_delete_removes_r2_object(monkeypatch):
     fake = _FakeS3()
     _enable_r2(monkeypatch, fake)
     uid = _uid()
+    seed_user(uid)
     db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
     db.frame_delete(uid, "f1")
     assert db.frame_exists(uid, "f1") is False
@@ -228,6 +238,7 @@ def test_prune_removes_r2_objects(monkeypatch):
     fake = _FakeS3()
     _enable_r2(monkeypatch, fake)
     uid = _uid()
+    seed_user(uid)
     for i in range(4):
         db.frame_upsert(uid, f"f{i}", float(i), _env(uid, f"f{i}"))
     evicted = db.frame_prune_to(uid, 2)  # keep newest 2 (f2, f3)
@@ -237,14 +248,29 @@ def test_prune_removes_r2_objects(monkeypatch):
     assert ("io-image-frames", "frames/%s/f2" % uid) in fake.store
 
 
-def test_delete_user_data_purges_r2(monkeypatch):
+def test_delete_user_data_does_not_touch_r2(monkeypatch):
+    """delete_user_data is now a DB-only belt (0011 CASCADE does the real
+    deletion); R2 cleanup is the caller's job via delete_user_frames, kept
+    separate so a slow/flaky R2 never blocks or half-aborts the DB wipe."""
     fake = _FakeS3()
     _enable_r2(monkeypatch, fake)
     uid = _uid()
+    seed_user(uid)
     db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
     db.frame_upsert(uid, "f2", 2.0, _env(uid, "f2"))
     db.delete_user_data(uid)
     assert db.frame_list_meta(uid) == []
+    assert [k for (b, k) in fake.store if k.startswith("frames/%s/" % uid)]
+
+
+def test_delete_user_frames_purges_r2(monkeypatch):
+    fake = _FakeS3()
+    _enable_r2(monkeypatch, fake)
+    uid = _uid()
+    seed_user(uid)
+    db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
+    db.frame_upsert(uid, "f2", 2.0, _env(uid, "f2"))
+    db.delete_user_frames(uid)
     assert not [k for (b, k) in fake.store if k.startswith("frames/%s/" % uid)]
 
 
@@ -252,6 +278,7 @@ def test_list_meta_reads_env_meta_without_r2(monkeypatch):
     fake = _FakeS3()
     _enable_r2(monkeypatch, fake)
     uid = _uid()
+    seed_user(uid)
     db.frame_upsert(uid, "f1", 1.0, _env(uid, "f1"))
     # drop the R2 object to prove list_meta never reaches for the body
     fake.store.clear()
@@ -265,6 +292,7 @@ def test_upsert_falls_back_to_inline_doc_on_upload_failure(monkeypatch):
     fake = _FakeS3(fail_put=True)
     _enable_r2(monkeypatch, fake)
     uid = _uid()
+    seed_user(uid)
     env = _env(uid, "f1")
     db.frame_upsert(uid, "f1", 1.0, env)
     # upload failed → row keeps inline doc, no pointer; read still works

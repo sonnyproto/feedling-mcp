@@ -3781,6 +3781,84 @@ def test_refresh_whoami_refetches_when_enclave_pk_missing(monkeypatch):
     called.assert_called_once()
 
 
+def test_load_whoami_caches_archive_language(monkeypatch):
+    # /v1/users/whoami now returns archive_language (backend/accounts/routes.py)
+    # — the consumer must cache it so proactive/introduction wakes with no
+    # perception locale still have a language to anchor on.
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "user_id": "usr_lang",
+                "public_key": base64.b64encode(b"p" * 32).decode(),
+                "enclave_content_public_key_hex": (b"e" * 32).hex(),
+                "archive_language": "en",
+            }
+
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "", "user_pk": None, "enclave_pk": None, "archive_language": ""})
+    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+
+    assert crc._load_whoami() is True
+    assert crc._whoami_cache["archive_language"] == "en"
+
+
+def test_load_whoami_defaults_archive_language_to_empty_when_absent(monkeypatch):
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "user_id": "usr_nolang",
+                "public_key": base64.b64encode(b"p" * 32).decode(),
+                "enclave_content_public_key_hex": (b"e" * 32).hex(),
+            }
+
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "", "user_pk": None, "enclave_pk": None, "archive_language": "stale"})
+    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+
+    assert crc._load_whoami() is True
+    assert crc._whoami_cache["archive_language"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Reply language fallback chain: locale → archive_language → 简体中文 default
+# ---------------------------------------------------------------------------
+
+
+def test_reply_language_line_prefers_presence_locale(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
+    line = crc._reply_language_line({"locale": "zh-Hans"})
+    assert "zh-Hans" in line
+
+
+def test_reply_language_line_falls_back_to_archive_language(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
+    line = crc._reply_language_line(None)
+    assert "en" in line
+
+
+def test_reply_language_line_treats_empty_locale_as_missing(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
+    line = crc._reply_language_line({"locale": ""})
+    assert "en" in line
+
+
+def test_reply_language_line_defaults_to_chinese_with_no_locale_or_archive(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": ""})
+    line = crc._reply_language_line(None)
+    assert "中文" in line
+    assert "Always reply in the user's own language." != line
+
+
+def test_reply_language_line_defaults_to_chinese_when_archive_language_key_missing(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {})
+    line = crc._reply_language_line(None)
+    assert "中文" in line
+
+
 # ---------------------------------------------------------------------------
 # Provider payment (402) circuit breaker tests
 # ---------------------------------------------------------------------------
