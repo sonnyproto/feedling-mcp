@@ -1,4 +1,4 @@
-"""v1 flow trace — gated per-user observability ring buffer (M0).
+"""v1 flow trace — per-user observability ring buffer (M0).
 
 Turns "I feel like the flow ran" into "I did X, the panel shows event Y, so the
 path objectively ran." Covers host(agent_runtime) + vps(resident consumer) +
@@ -6,10 +6,11 @@ genesis/memory/identity/perception/proactive because the events are recorded
 where the flow actually happens (backend turn internals + incoming tool calls +
 the resident consumer).
 
-PRIVACY: the panel is a flow indicator, NOT a plaintext log. Callers must pass
-METADATA ONLY in `detail` — ids, counts, route reasons, status, source_kind,
-persona_version hash. Never raw memory content / transcript / persona text. The
-whole thing is a no-op unless the per-user flag is on (off by default).
+PRIVACY: `detail` should stay metadata-oriented. Plaintext snippets belong in
+`content_excerpt`, which is capped and can be stripped deploy-wide with
+FEEDLING_DEBUG_VERBOSE=0. During beta, trace recording is default-on for every
+user so admin can inspect real failures; FEEDLING_V1_FLOW_TRACE=0 remains the
+deploy-wide kill switch, and a per-user flag can still opt a user out.
 """
 from __future__ import annotations
 
@@ -43,9 +44,23 @@ def _hard_disabled() -> bool:
 
 
 def _deploy_enabled() -> bool:
-    """Deploy-level allowed unless hard-disabled. (The per-user toggle still gates
-    actual recording; a normal prod user who never opens DebugTool stays off.)"""
+    """Deploy-level allowed unless hard-disabled."""
     return not _hard_disabled()
+
+
+def _default_enabled() -> bool:
+    """Beta default: record flow traces for all users unless explicitly disabled.
+
+    FEEDLING_V1_FLOW_TRACE_DEFAULT=0 is a softer rollout valve than the hard
+    deploy kill switch: it restores old opt-in behavior while leaving explicit
+    per-user enables working.
+    """
+    return os.environ.get("FEEDLING_V1_FLOW_TRACE_DEFAULT", "").strip().lower() not in (
+        "0",
+        "false",
+        "off",
+        "no",
+    )
 
 
 def is_enabled(store) -> bool:
@@ -58,8 +73,13 @@ def is_enabled(store) -> bool:
     cached = _flag_cache.get(uid)
     if cached and cached[1] > now:
         return cached[0]
-    flag = db.get_blob(uid, DEBUG_TRACE_FLAG_BLOB) or {}
-    enabled = bool(flag.get("enabled")) if isinstance(flag, dict) else bool(flag)
+    flag = db.get_blob(uid, DEBUG_TRACE_FLAG_BLOB)
+    if isinstance(flag, dict) and "enabled" in flag:
+        enabled = bool(flag.get("enabled"))
+    elif flag is None:
+        enabled = _default_enabled()
+    else:
+        enabled = bool(flag)
     _flag_cache[uid] = (enabled, now + _FLAG_CACHE_TTL)
     return enabled
 

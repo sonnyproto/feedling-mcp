@@ -13,6 +13,7 @@ from urllib.parse import quote
 from core.reqctx import request
 
 import db
+import debug_trace
 from core.store import UserStore
 from urllib.parse import urlencode
 import html
@@ -1158,7 +1159,14 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
 
 def _debug_trace_events_for_user(user_id: str) -> tuple[bool, list[dict]]:
     enabled_raw = db.get_blob(user_id, "v1_flow_trace_enabled")
-    enabled = bool(enabled_raw.get("enabled")) if isinstance(enabled_raw, dict) else bool(enabled_raw)
+    if debug_trace._hard_disabled():
+        enabled = False
+    elif isinstance(enabled_raw, dict) and "enabled" in enabled_raw:
+        enabled = bool(enabled_raw.get("enabled"))
+    elif enabled_raw is None:
+        enabled = debug_trace._default_enabled()
+    else:
+        enabled = bool(enabled_raw)
     raw = db.get_blob(user_id, "v1_flow_trace") or {}
     events = raw.get("events") if isinstance(raw, dict) and isinstance(raw.get("events"), list) else []
     out = []

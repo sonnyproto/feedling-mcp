@@ -85,6 +85,32 @@ def test_debug_payload_groups_multi_user_trace_and_marks_stalled(monkeypatch):
     assert turns["t-ok"]["total_dur_ms"] == 3000
 
 
+def test_debug_payload_treats_missing_trace_flag_as_enabled_by_default(monkeypatch):
+    with registry._users_lock:
+        registry._users[:] = [
+            {"user_id": "user_a", "principal_id": "p_a", "created_at": "2026-07-04T00:00:00Z"},
+        ]
+
+    blobs = {}
+    monkeypatch.delenv("FEEDLING_V1_FLOW_TRACE", raising=False)
+    monkeypatch.delenv("FEEDLING_V1_FLOW_TRACE_DEFAULT", raising=False)
+    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+
+    with bind("view=debug"):
+        payload = data_track._data_track_debug_payload()
+
+    assert payload["users"] == [
+        {
+            "user_id": "user_a",
+            "principal_id": "p_a",
+            "enabled": True,
+            "events": 0,
+            "last_ts": 0,
+            "last_at": "",
+        }
+    ]
+
+
 def test_debug_page_renders_nav_filters_and_redacts_plaintext_by_default(monkeypatch):
     with registry._users_lock:
         registry._users[:] = [{"user_id": "user_a", "principal_id": "p_a"}]

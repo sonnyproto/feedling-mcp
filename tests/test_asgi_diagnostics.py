@@ -260,7 +260,7 @@ def test_trace_read_parity(env):
     a = _asgi("GET", "/v1/debug/trace", headers=_key(api_key))
     assert f == a
     assert f[0] == 200
-    assert f[1] == {"enabled": False, "deploy_enabled": True, "verbose": False, "events": []}
+    assert f[1] == {"enabled": True, "deploy_enabled": True, "verbose": True, "events": []}
 
 
 def test_trace_read_requires_auth_parity(env):
