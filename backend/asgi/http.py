@@ -19,6 +19,7 @@ import json
 from typing import Any, Optional
 
 from fastapi import Request
+from starlette.requests import ClientDisconnect
 
 
 def _is_json_content_type(content_type: str) -> bool:
@@ -34,7 +35,13 @@ async def read_json_silent(request: Request) -> Optional[Any]:
     empty, or parsing fails — matching Flask ``request.get_json(silent=True)``."""
     if not _is_json_content_type(request.headers.get("content-type", "")):
         return None
-    body = await request.body()
+    try:
+        body = await request.body()
+    except ClientDisconnect:
+        # Client dropped mid-upload (iOS background reports). Flask saw this as
+        # a truncated body -> parse failure -> None; an uncaught raise here is a
+        # 500 + traceback to a peer that's already gone.
+        return None
     if not body:
         return None
     try:
