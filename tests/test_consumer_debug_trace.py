@@ -187,6 +187,49 @@ def test_emit_debug_trace_returns_immediately_and_never_raises():
     assert elapsed < 0.5
 
 
+# ---------------------------------------------------------------------------
+# agent.reply — the M2 "clean parsed reply + thinking excerpt" event emitted
+# right after `_split_agent_turn` in `_process_messages`. We don't drive the
+# full message loop here (too heavy to unit-test); instead we build an
+# `AgentTurn` the same way `_process_messages` does and emit the same event
+# shape, verifying the posted payload actually carries the clean reply text
+# and thinking summary (not just a raw stdout head).
+# ---------------------------------------------------------------------------
+
+def test_agent_reply_trace_event_carries_clean_reply_and_thinking():
+    _seed_cache(True)  # fresh + enabled, so _post_debug_trace_event actually fires
+    turn = crc.AgentTurn(messages=["hello world"], thinking_summary="let me think")
+
+    captured = {}
+    done = threading.Event()
+
+    def _fake_post(payload):
+        captured["payload"] = payload
+        done.set()
+
+    with patch.object(crc, "_post_debug_trace_event", side_effect=_fake_post):
+        reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
+        crc._emit_debug_trace(
+            "agent", "agent.reply", trace_id="t-1",
+            summary=f"reply parsed ({len(turn.messages)} msg)",
+            explain=("回复已解析：" + f"{len(turn.messages)} 段"
+                     + ("，含思考摘要" if turn.thinking_summary else "，无思考摘要")),
+            detail={"n_messages": len(turn.messages), "n_actions": len(turn.actions),
+                    "thinking_kind": turn.thinking_kind or "", "thinking_model": turn.thinking_model or ""},
+            content_excerpt={"reply": reply_text[:3000], "thinking": (turn.thinking_summary or "")[:2000]},
+        )
+        assert done.wait(timeout=3), "background dispatch thread did not post within timeout"
+
+    assert "payload" in captured
+    event = captured["payload"]["event"]
+    assert event["subsystem"] == "agent"
+    assert event["type"] == "agent.reply"
+    assert event["trace_id"] == "t-1"
+    assert "hello world" in event["content_excerpt"]["reply"]
+    assert "let me think" in event["content_excerpt"]["thinking"]
+    assert event["detail"]["n_messages"] == 1
+
+
 def test_emit_debug_trace_dispatches_to_daemon_thread_with_expected_payload():
     """The event is posted asynchronously on a background thread; join it
     with a short timeout to confirm it actually fires with the right shape."""

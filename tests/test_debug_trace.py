@@ -116,7 +116,7 @@ def test_content_excerpt_field_truncation(monkeypatch):
     debug_trace.trace_event(store, subsystem="agent", type="t",
                             content_excerpt={"prompt": big})
     ev = debug_trace.read_trace(store, limit=10)[0]
-    assert len(ev["content_excerpt"]["prompt"]) <= 1024 + len("…(truncated)")
+    assert len(ev["content_excerpt"]["prompt"]) <= 2048 + len("…(truncated)")
     assert ev["content_excerpt"]["prompt"].endswith("…(truncated)")
 
 

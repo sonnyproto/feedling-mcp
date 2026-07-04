@@ -6255,6 +6255,16 @@ def _process_messages(messages: list) -> float:
                 continue
 
         turn = _split_agent_turn(agent_result)
+        _reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
+        _emit_debug_trace(
+            "agent", "agent.reply", trace_id=trace_id,
+            summary=f"reply parsed ({len(turn.messages)} msg)",
+            explain=("回复已解析：" + f"{len(turn.messages)} 段"
+                     + ("，含思考摘要" if turn.thinking_summary else "，无思考摘要")),
+            detail={"n_messages": len(turn.messages), "n_actions": len(turn.actions),
+                    "thinking_kind": turn.thinking_kind or "", "thinking_model": turn.thinking_model or ""},
+            content_excerpt={"reply": _reply_text[:3000], "thinking": (turn.thinking_summary or "")[:2000]},
+        )
         actions, replies = turn.actions, turn.messages
         if use_runtime_v2:
             actions = [
