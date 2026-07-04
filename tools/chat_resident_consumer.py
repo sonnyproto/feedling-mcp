@@ -4260,6 +4260,44 @@ def _proactive_control_reason_from_replies(replies: list[str]) -> str:
     return "\n".join(reasons).strip()
 
 
+def _proactive_control_reason_from_value(value: Any) -> str:
+    if isinstance(value, list):
+        reasons = [
+            reason
+            for item in value
+            if (reason := _proactive_control_reason_from_value(item))
+        ]
+        return "\n".join(reasons).strip()
+    if not isinstance(value, dict):
+        return ""
+
+    messages = value.get("messages")
+    if isinstance(messages, list) and any(str(item or "").strip() for item in messages):
+        return ""
+    for key in ("actions", "tool_calls"):
+        items = value.get(key)
+        if isinstance(items, list) and items:
+            return ""
+
+    reason = value.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        return reason.strip()
+
+    for key in ("result", "payload", "output"):
+        nested = value.get(key)
+        if isinstance(nested, (dict, list)):
+            if reason := _proactive_control_reason_from_value(nested):
+                return reason
+    return ""
+
+
+def _proactive_control_reason_from_result(agent_result: Any, replies: list[str]) -> str:
+    return (
+        _proactive_control_reason_from_replies(replies)
+        or _proactive_control_reason_from_value(agent_result)
+    ).strip()
+
+
 def _split_proactive_actions(actions: list[dict]) -> tuple[list[dict], list[dict]]:
     proactive: list[dict] = []
     memory_identity: list[dict] = []
@@ -5743,7 +5781,7 @@ def _process_proactive_jobs(jobs: list) -> float:
             replies = _send_message_replies_from_actions(actions)
         proactive_actions, memory_identity_actions = _split_proactive_actions(actions)
         status_actions = [_compact_action_for_status(a) for a in proactive_actions]
-        control_reply_reason = _proactive_control_reason_from_replies(replies)
+        control_reply_reason = _proactive_control_reason_from_result(agent_result, replies)
         if control_reply_reason and not proactive_actions and not memory_identity_actions:
             update_proactive_job_status(
                 job_id,
