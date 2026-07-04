@@ -1145,12 +1145,25 @@ def _message_for_agent(content: str, image_paths: list[str] | None = None) -> st
     if not image_paths:
         return content
     joined = ", ".join(image_paths)
+    # This text is the ONLY channel by which a claude/other-CLI agent (no native
+    # --image injection) learns a pixel image is attached. It must be unambiguous, or
+    # live transcripts show two failure modes: the model reaches for io_cli
+    # photo-recent (wrong tool, wrong path) instead of Read, OR it invents a
+    # "click allow to authorize" approval flow that does not exist and then
+    # fabricates the image contents. So: name the Read tool + exact path, assert
+    # permission is already granted (there is no approval UI), and forbid asking the
+    # user to authorize / re-send.
     return (
         f"{content}\n\n"
-        f"Decrypted image file(s) for this IO message: {joined}\n"
-        "Open/inspect the image before replying if your runtime has local "
-        "vision or file-image support. Do not ask the user to describe the "
-        "image unless this runtime truly cannot inspect local image files."
+        f"Decrypted image file(s) for THIS message, already saved on local disk: {joined}\n"
+        "Use the Read tool on that exact absolute path to view the image, then reply "
+        "about what you actually see. You ALREADY have permission to read these "
+        "files — there is no approval step and no 'allow' button for the user to "
+        "click, so never ask the user to authorize, grant access, enable a "
+        "permission, or re-send the image. Do NOT use the io_cli photo-recent / "
+        "photo-read tools for this image (those fetch OLDER photos); this file is the "
+        "current attachment. Only say you cannot see it if the Read tool itself "
+        "returns an error — never claim you can see an image you have not Read."
     )
 
 

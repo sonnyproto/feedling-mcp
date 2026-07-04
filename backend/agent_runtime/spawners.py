@@ -139,13 +139,33 @@ def _image_read_allow_rule(home: str) -> str:
     Chat photos and screen-share frames are decrypted to ``{home}/images/*.jpg|png``
     and their path is injected into the prompt; without Read on that dir an
     unattended ``claude -p`` (whose --allowed-tools is otherwise io_cli-only) cannot
-    open them, so the model never sees the image. Scoped to the image dir only."""
-    return f"Read({home}/images/**)"
+    open them, so the model never sees the image. Scoped to the image dir only.
+
+    ⚠️ DOUBLE leading slash is load-bearing. In Claude Code permission rules a SINGLE
+    leading slash anchors the path at the *settings source* (the cwd, ``/app``), so
+    ``Read(/agent-data/.../images/**)`` silently means ``/app/agent-data/...`` and
+    never matches the real absolute path — the read is DENIED under ``-p`` and the
+    vision model then hallucinates ("I need permission / I can see …" for an image it
+    never opened). A filesystem-absolute rule needs ``//``. ``home`` is already
+    absolute (``/agent-data/users/<uid>``), so prefix one more slash.
+    (Verified on cc 2.1.x: single-slash denied, double-slash allowed.)"""
+    return f"Read(//{home.strip('/')}/images/**)"
 
 
 def _claude_allow_rules(io_cli: str, home: str) -> list[str]:
     """Full claude --allowed-tools / settings allowlist: io_cli verbs + image Read."""
     return [*_io_cli_allow_rules(io_cli), _image_read_allow_rule(home)]
+
+
+def _image_dir_add_dir(home: str) -> str:
+    """`--add-dir` flag putting the decrypted-image dir inside claude's trusted
+    workspace. Belt-and-suspenders with the Read allow-rule: the agent's cwd is
+    ``/app`` and the image dir is OUTSIDE it, so headless ``claude -p`` enforces a
+    workspace-trust boundary that rejects out-of-cwd reads BEFORE consulting allow
+    rules. ``--add-dir`` extends the workspace so files there are readable without a
+    prompt. ``materialize_home`` pre-creates the dir so this target always exists
+    (claude warns/errors on a missing --add-dir path)."""
+    return f"--add-dir {home}/images"
 
 
 # claude (Anthropic-wire) providers that are NOT anthropic itself: they expose an
@@ -255,7 +275,8 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
     grant = ",".join(_claude_allow_rules(io_cli, home))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
     return (
-        f"claude {_CLAUDE_PERMISSION_FLAG} --allowed-tools '{grant}' "
+        f"claude {_CLAUDE_PERMISSION_FLAG} {_image_dir_add_dir(home)} "
+        f"--allowed-tools '{grant}' "
         f"--append-system-prompt-file {prompt_file} -p {{message}}"
     )
 
@@ -280,8 +301,9 @@ def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
     grant = ",".join(_claude_allow_rules(io_cli, home))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
     return (
-        f"claude {_CLAUDE_PERMISSION_FLAG} --verbose --output-format stream-json "
-        f"--include-partial-messages --effort high --allowed-tools '{grant}' "
+        f"claude {_CLAUDE_PERMISSION_FLAG} {_image_dir_add_dir(home)} --verbose "
+        f"--output-format stream-json --include-partial-messages --effort high "
+        f"--allowed-tools '{grant}' "
         f"--append-system-prompt-file {prompt_file} -p {{message}}"
     )
 
@@ -334,7 +356,13 @@ def agent_home_files(
     the CLI flag). For a codex user on the LiteLLM gateway (non-openai provider) it
     also writes a ``config.toml`` pointing codex at the gateway's Responses endpoint.
     """
-    system_append = _AGENT_PROMPT_TEXT
+    # The prompt template ships literal ``<io_cli>`` placeholders in every usage
+    # example (``python <io_cli> perception …``). Substitute the real path here, or
+    # the model has no idea where io_cli lives and guesses a nonexistent path
+    # (observed live: ``/feedling-io-cli/io_cli.py``) → every Bash call misses the
+    # ``Bash(python /app/tools/io_cli.py …)`` allowlist and is denied ("requires
+    # approval"), silently breaking perception/memory/photo tools.
+    system_append = _AGENT_PROMPT_TEXT.replace("<io_cli>", io_cli)
     persona = (persona_content or "").strip()
     if persona:
         system_append = f"{persona}\n\n---\n\n{system_append}"
@@ -420,6 +448,12 @@ def materialize_home(
     for path in stale_home_files(home, driver=driver, codex_transport=codex_transport):
         if path not in files:
             Path(path).unlink(missing_ok=True)
+    # Pre-create the decrypted-image dir (IMAGE_TEMP_DIR = {home}/images). The claude
+    # command passes `--add-dir {home}/images` on EVERY turn, but the consumer only
+    # creates the dir lazily when the first image is decrypted — so the first turns
+    # (before any image) would --add-dir a missing path. Claude warns/errors on that;
+    # creating it here keeps every turn's --add-dir valid. Cheap + idempotent.
+    Path(f"{home}/images").mkdir(parents=True, exist_ok=True)
 
 
 def _persona_from_blob(blob, decrypt_fn) -> str:

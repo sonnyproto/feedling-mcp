@@ -1330,6 +1330,23 @@ def test_prepare_cli_appends_image_path_when_template_has_no_image_slot(monkeypa
     assert image_path in cmd[2]
 
 
+def test_message_for_agent_steers_claude_to_read_not_authorize():
+    # For claude (no native --image), the ONLY way pixels reach the model is the Read
+    # tool on the injected path. Live transcripts showed the model either (a) reaching
+    # for io_cli photo-recent instead of Read, or (b) refusing with a hallucinated
+    # "click allow to authorize" flow (there is no such UI) and then FABRICATING the
+    # image contents. The prose must: name the Read tool, assert permission is already
+    # granted (no approval step), and forbid asking the user to authorize.
+    out = crc._message_for_agent("what is this", ["/agent-data/users/u/images/x.jpg"])
+    assert "/agent-data/users/u/images/x.jpg" in out
+    assert "Read" in out  # names the tool to use
+    low = out.lower()
+    # must not instruct the model to seek authorization / a click-to-allow step
+    assert "authoriz" in low or "no approval" in low or "already have permission" in low
+    # steer away from the historical-photo tools for a live attachment
+    assert "photo-recent" in out or "photo-read" in out
+
+
 def test_prepare_cli_uses_image_path_template(monkeypatch, tmp_path):
     image_path = str(tmp_path / "photo.jpg")
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask --image "{image_path}" "{message}"')

@@ -53,8 +53,13 @@ def test_consumer_env_uses_stream_json_for_deepseek_claude_thinking():
     assert "--effort high" in cmd
     assert "--permission-mode acceptEdits" in cmd  # non-interactive image Read
     # the thinking-claude command must ALSO grant Read on the image temp dir, or a
-    # thinking model (deepseek/sonnet-4) can't open chat images (Read denied under -p)
-    assert "Read(/agent-data/users/u_1/images/**)" in cmd
+    # thinking model (deepseek/sonnet-4) can't open chat images (Read denied under -p).
+    # DOUBLE leading slash: a single slash anchors at the settings source (cwd /app),
+    # so Read(/agent-data/...) resolves to /app/agent-data/... and never matches.
+    assert "Read(//agent-data/users/u_1/images/**)" in cmd
+    # --add-dir puts the out-of-cwd image dir inside claude's trusted workspace, so
+    # the Read is permitted even under the headless workspace-trust boundary.
+    assert "--add-dir /agent-data/users/u_1/images" in cmd
     assert env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
     assert env["ANTHROPIC_MODEL"] == "deepseek-v4-pro"
 
@@ -79,8 +84,10 @@ def test_consumer_env_uses_stream_json_for_native_anthropic_sonnet_thinking():
     assert "--effort high" in cmd
     assert "--permission-mode acceptEdits" in cmd  # non-interactive image Read
     # thinking-claude must grant Read on the image dir too (sonnet-4-5 is a thinking
-    # model → this branch → otherwise chat images are invisible: Read denied)
-    assert "Read(/agent-data/users/u_1/images/**)" in cmd
+    # model → this branch → otherwise chat images are invisible: Read denied).
+    # Double-slash = filesystem-absolute; --add-dir trusts the out-of-cwd dir.
+    assert "Read(//agent-data/users/u_1/images/**)" in cmd
+    assert "--add-dir /agent-data/users/u_1/images" in cmd
     assert "ANTHROPIC_BASE_URL" not in env
     assert env["ANTHROPIC_MODEL"] == "claude-sonnet-4-5"
 
@@ -291,7 +298,24 @@ def test_default_claude_cmd_grants_image_read():
     # claude -p must be allowed to Read the decrypted image temp files (IMAGE_TEMP_DIR
     # = {home}/images), or it cannot open the screenshot/photo whose path the resident
     # injects into the prompt — the image would stay invisible to the model.
-    assert "Read(/agent-data/users/u/images/" in cmd
+    # Double leading slash → filesystem-absolute (single slash anchors at cwd /app).
+    assert "Read(//agent-data/users/u/images/" in cmd
+    # …and the dir is added to claude's trusted workspace (out-of-cwd read boundary).
+    assert "--add-dir /agent-data/users/u/images" in cmd
+
+
+def test_default_claude_cmd_substitutes_io_cli_path_in_prompt():
+    # The system prompt template ships literal `<io_cli>` placeholders. They MUST be
+    # substituted with the real io_cli path, or the model can't know where io_cli is
+    # and guesses a nonexistent path (observed: /feedling-io-cli/io_cli.py) → every
+    # perception/memory/photo Bash call is denied ("requires approval").
+    files = spawners.agent_home_files(
+        "/agent-data/users/u", driver="claude", provider="anthropic",
+        io_cli="/app/tools/io_cli.py",
+    )
+    prompt = files["/agent-data/users/u/agent-tools-prompt.md"]
+    assert "<io_cli>" not in prompt
+    assert "python /app/tools/io_cli.py perception" in prompt
 
 
 def test_custom_cli_cmd_opts_out_of_default_grant():
@@ -330,7 +354,8 @@ def test_agent_home_files_seeds_prompt_and_claude_permission_allow():
     assert any("io_cli.py identity-write" in rule for rule in allow)  # 7.D post-respawn tool
     assert any("io_cli.py screen-read" in rule for rule in allow)
     # and Read on the decrypted image temp dir, so the CLI can open attached images
-    assert any(rule.startswith("Read(/agent-data/users/u/images/") for rule in allow)
+    # (double leading slash = filesystem-absolute; single slash anchors at cwd /app)
+    assert any(rule.startswith("Read(//agent-data/users/u/images/") for rule in allow)
 
 
 def test_agent_home_files_codex_seeds_agents_md():
@@ -526,6 +551,16 @@ def test_materialize_home_writes_and_keeps_gateway_config(tmp_path):
     cfg = tmp_path / "u" / "codex-home" / "config.toml"
     assert cfg.exists()
     assert "http://127.0.0.1:4000/v1" in cfg.read_text()
+
+
+def test_materialize_home_creates_image_dir_for_claude(tmp_path):
+    # The claude command adds `--add-dir {home}/images`; claude refuses/warns on a
+    # missing --add-dir target, and the dir is created lazily only when the FIRST
+    # image is decrypted. Create it at spawn so the very first turn's --add-dir is
+    # valid even before any image has arrived.
+    home = str(tmp_path / "u")
+    spawners.materialize_home(home, driver="claude", provider="anthropic")
+    assert (tmp_path / "u" / "images").is_dir()
 
 
 # ---- Stage D slice 3a: runtime-token file delivery ----
