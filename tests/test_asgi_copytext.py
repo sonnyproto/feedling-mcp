@@ -155,6 +155,27 @@ def test_get_304_on_matching_etag_parity(admin_env):
     assert f_304[2] == a_304[2] == '"1"'
 
 
+def test_get_304_has_empty_body(admin_env):
+    """A 304 MUST carry a zero-length body. copytext_core returns ``{}`` on an
+    If-None-Match hit; rendering that as JSON (``b"{}"``) makes real uvicorn
+    (httptools) raise "Response content longer than Content-Length" → 500. The
+    ASGITransport used by the other tests does not enforce that rule, so assert
+    the empty body explicitly here."""
+    _asgi_post("/v1/copytext", headers=_admin(), json_body=SEED)
+    etag = _asgi_get("/v1/copytext")[2]
+
+    async def go():
+        transport = httpx.ASGITransport(app=_ASGI)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+            resp = await client.get("/v1/copytext", headers={"If-None-Match": etag})
+            return resp.status_code, resp.content, resp.headers.get("etag")
+
+    status, content, got_etag = asyncio.run(go())
+    assert status == 304
+    assert content == b"", f"304 must have empty body, got {content!r}"
+    assert got_etag == etag
+
+
 def test_get_stale_etag_returns_200_parity(admin_env):
     _flask_post("/v1/copytext", headers=_admin(), json_body=SEED)
     f = _flask_get("/v1/copytext", {"If-None-Match": '"0"'})

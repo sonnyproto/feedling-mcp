@@ -16,7 +16,7 @@ import json
 import os
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from asgi import threadpool
 from copytext import copytext_core, service
@@ -70,6 +70,12 @@ async def get_copytext(request: Request):
         service.store,
         if_none_match=request.headers.get("If-None-Match", ""),
     )
+    # A 304 MUST carry no body — copytext_core returns an empty ``{}`` body on an
+    # If-None-Match hit, but even ``b"{}"`` (2 bytes) trips uvicorn's "content
+    # longer than Content-Length" on a 304 (Starlette declares zero length for
+    # 304/204). Flask silently dropped the body; the ASGI port must do it here.
+    if result["status"] == 304:
+        return Response(status_code=304, headers={"ETag": result["etag"]})
     return JSONResponse(
         result["body"],
         status_code=result["status"],
