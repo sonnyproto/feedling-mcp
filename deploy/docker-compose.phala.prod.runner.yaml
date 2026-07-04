@@ -26,15 +26,14 @@
 #        /v1/envelope/decrypt over this passthrough → 200.)
 #
 # ── Capacity ───────────────────────────────────────────────────────────────────
-#   AGENT_MAX_CHILDREN = 120 per runner (measured ~65MB/consumer; 120 ≈ 8GB, fits a
-#   15GB CVM with CLI-spike headroom). Deliberately sized to hold ALL current users
-#   (~99) on a SINGLE runner, so: (a) you can start with one runner CVM and it covers
-#   everyone, and (b) as you scale out, ANY single runner can absorb the whole fleet
-#   on failover. Σ(max_children over ALL live runner CVMs) MUST stay ≥ hosted-user
-#   count — else over-capacity users' sends wedge (the guard does not capacity-gate).
-#   ⚠️ ONE runner CVM = single point of failure (no runner to take over if it dies).
-#   Keep the main prod CVM's inline agent-runner as a fallback until you run >=2
-#   runner CVMs; only then remove it (see DEPLOYMENTS.md “prod Form B”).
+#   AGENT_MAX_CHILDREN = 0 (UNBOUNDED) per runner. The main prod CVM's inline
+#   agent-runner has been removed, so this runner CVM is the ONLY host: a fixed cap
+#   could leave users beyond it unserved (the send guard does not capacity-gate),
+#   so 0 lets one runner hold everyone AND absorb future growth. Capacity ref:
+#   measured ~65MB/consumer, so ~120 consumers ~= 8GB fits a 15GB CVM -- watch RAM
+#   as users grow and add another runner CVM (also 0) before memory is exhausted.
+#   WARNING: ONE runner CVM = single point of failure (nothing takes over if it
+#   dies); run >=2 runner CVMs for failover.
 #
 # ── Deploy ─────────────────────────────────────────────────────────────────────
 #   Each runner CVM is its OWN dstack app (own app-id + compose_hash + on-chain auth
@@ -63,9 +62,12 @@ services:
       AGENT_ENVELOPE_REFETCH_SEC: "${AGENT_ENVELOPE_REFETCH_SEC:-300}"
       AGENT_RESOLVE_CONCURRENCY: "${AGENT_RESOLVE_CONCURRENCY:-8}"
       AGENT_RUNTIME_ISOLATION: "process"
-      # Per-runner capacity ceiling. Sized to hold ALL users on one runner (see
-      # header) so a single CVM works and any CVM absorbs the fleet on failover.
-      AGENT_MAX_CHILDREN: "${AGENT_MAX_CHILDREN:-120}"
+      # Per-runner capacity ceiling. 0 = UNBOUNDED (no cap): this single runner
+      # takes every hosted user and absorbs future growth. With the main CVM's
+      # inline agent-runner now removed there is no other runner to split with, so
+      # a fixed cap could strand over-cap users; 0 avoids that. Scale by adding
+      # runner CVMs (each also 0 -> any one can hold the whole fleet).
+      AGENT_MAX_CHILDREN: "${AGENT_MAX_CHILDREN:-0}"
       DATABASE_URL: "${DATABASE_URL:-}"
       AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
       AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"

@@ -277,70 +277,14 @@ services:
       enclave:
         condition: service_healthy
 
-  # agent-runner — 4th CVM service. Multi-tenant supervisor hosting the resident
-  # consumer (tools/chat_resident_consumer.py) per user, driving claude/codex in
-  # cli mode. Idle by default: empty AGENT_RUNTIME_USERS + autodiscover off → it
-  # spawns nobody (zero behaviour change). Enable per-user hosting by injecting a
-  # roster (AGENT_RUNTIME_USERS) via the encrypted env channel — no compose change
-  # / on-chain re-auth needed. See deploy/DEPLOYMENTS.md.
-  agent-runner:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:22b0ed6
-    command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
-    restart: unless-stopped
-    environment:
-      FEEDLING_API_URL: "http://backend:5001"
-      FEEDLING_ENCLAVE_URL: "https://enclave:5003"
-      AGENT_DATA_ROOT: "/agent-data"
-      # Lease TTL. Renewal now runs in its own thread (decoupled from the slow
-      # resolve lap), so a larger TTL is pure headroom against a slow lap and the
-      # single supervisor has no failover to slow down. Tunable via encrypted env
-      # without a re-chain (interpolated). Default 300 (was a hard "60").
-      AGENT_LEASE_TTL_SEC: "${AGENT_LEASE_TTL_SEC:-300}"
-      AGENT_TICK_INTERVAL_SEC: "${AGENT_TICK_INTERVAL_SEC:-15}"
-      # Provider-key envelope cache TTL (s) and per-tick resolution fan-out. These
-      # collapse the host-all resolve lap (was 50× serial backend round-trips/tick)
-      # so leases never sit expired. Tunable via env; code defaults are 300 / 8.
-      AGENT_ENVELOPE_REFETCH_SEC: "${AGENT_ENVELOPE_REFETCH_SEC:-300}"
-      AGENT_RESOLVE_CONCURRENCY: "${AGENT_RESOLVE_CONCURRENCY:-8}"
-      AGENT_RUNTIME_ISOLATION: "process"
-      # Same external Postgres as the backend (lease table). Encrypted env channel.
-      DATABASE_URL: "${DATABASE_URL:-}"
-      # Roster of users to host (JSON). Carries per-user keys → encrypted env
-      # channel, never baked. Empty = idle.
-      AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
-      # Discover hosted-enabled users from the DB (intersected with roster creds).
-      AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
-      # Stage-D runtime token signing secret. Empty = off (consumer uses api key).
-      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
-      # Host-all (zero-roster): mint a token per DB-discovered user and resolve its
-      # provider key with it — no AGENT_RUNTIME_USERS needed. Defaults to "true" to
-      # mirror the backend; host_all_active still also requires the token secret
-      # above (stays dormant until FEEDLING_RUNTIME_TOKEN_SECRET is injected).
-      FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-true}"
-      # Same migration kill-switch as backend. Empty = off; when off, the
-      # resident consumer will not process queued memory_migrate jobs.
-      FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
-      # in-CVM LiteLLM gateway (codex non-openai). Defaults to "true" to mirror the
-      # backend's FEEDLING_LITELLM_ENABLE (the cutover boot gate requires it); unset/
-      # empty → true. FEEDLING_LITELLM_PYTHON is baked in the image (isolated venv);
-      # the gateway only actually spins up when a gateway-provider user is present.
-      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-true}"
-      FEEDLING_LITELLM_PORT: "${FEEDLING_LITELLM_PORT:-4000}"
-      FEEDLING_LITELLM_API_KEY: "${FEEDLING_LITELLM_API_KEY:-}"
-      # Genesis import worker (mirrors the test agent-runner). Activates only when
-      # the prerequisites are present (FEEDLING_RUNTIME_TOKEN_SECRET above +
-      # FEEDLING_ENCLAVE_URL); if the secret is unset the supervisor logs a
-      # warning and stays dormant rather than crashing.
-      FEEDLING_GENESIS_WORKER_ENABLED: "1"
-      FEEDLING_GENESIS_WORKER_INTERVAL_SEC: "10"
-      FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC: "7200"
-    volumes:
-      - feedling_agent_runtime:/agent-data
-    depends_on:
-      backend:
-        condition: service_started
-      enclave:
-        condition: service_healthy
+  # NOTE: the inline agent-runner service was removed here — the hosted agent-
+  # runtime now runs on a DEDICATED runner CVM
+  # (deploy/docker-compose.phala.prod.runner.yaml). This CVM runs only ingress +
+  # enclave + backend. The backend env above intentionally still mirrors the
+  # runner's FEEDLING_HOST_ALL / FEEDLING_LITELLM_ENABLE / FEEDLING_RUNTIME_TOKEN_
+  # SECRET so the hosted-cutover gate stays satisfied and the runner CVM shares
+  # the same token auth. Scale hosting by adding runner CVMs, not by re-adding
+  # this service (that would put key-bearing hosting back on the enclave CVM).
 
 volumes:
   feedling_enclave_data:
@@ -351,8 +295,6 @@ volumes:
     name: feedling_ingress_letsencrypt
   feedling_ingress_evidences:
     name: feedling_ingress_evidences
-  feedling_agent_runtime:
-    name: feedling_agent_runtime
 
 # Deploy trigger: this comment touches a path in the deploy-cvm paths-filter
 # (deploy/docker-compose.phala.yaml) so `detect-cvm-changes` sees a CVM change
