@@ -171,6 +171,27 @@ def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monk
     assert mock_post.call_args.kwargs["reply_to_message_id"] == "user-msg-v2"
 
 
+def test_process_messages_prompt_requests_visible_thinking_summary(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = {"id": "user-msg-thinking", "role": "user", "content": "刚才怎么没思考过程？", "ts": 1112.5}
+    captured = {}
+
+    def fake_call(message, images=None, image_paths=None, trace_id=""):
+        captured["message"] = message
+        return {"messages": ["我查一下。"]}
+
+    with patch.object(crc, "call_agent", side_effect=fake_call), \
+         patch.object(crc, "post_reply", return_value={"id": "reply-msg-thinking"}):
+        result_ts = crc._process_messages([msg])
+
+    assert result_ts == pytest.approx(1112.5)
+    assert '"thinking_summary"' in captured["message"]
+    assert '"messages"' in captured["message"]
+    assert "display-safe" in captured["message"]
+    assert "hidden chain-of-thought" in captured["message"]
+
+
 def test_process_messages_v2_drops_needs_background_without_ack(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
@@ -2319,6 +2340,9 @@ def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):
     assert "presence check" in captured["message"].lower()
     assert "presence check" in captured["message"]
     assert "equally valid" in captured["message"]
+    assert '"thinking_summary"' in captured["message"]
+    assert "display-safe" in captured["message"]
+    assert "hidden chain-of-thought" in captured["message"]
     assert "Feedling Gate decided" not in captured["message"]
     assert "possible_connections" not in captured["message"]
     assert "wake_kind:" in captured["message"]
@@ -2549,11 +2573,27 @@ def test_message_for_introduction_job_uses_post_respawn_prompt():
     message = crc._message_for_introduction_job({"job_kind": "introduction"})
 
     assert "首次登场" in message
+    assert '"thinking_summary"' in message
+    assert "display-safe" in message
+    assert "hidden chain-of-thought" in message
     assert "identity.profile_patch" in message
     assert "self_introduction" in message
     assert "signature" in message
     assert "messages" in message
     assert "别编不存在的共同经历" in message
+
+
+def test_screen_watch_message_requests_visible_thinking_summary():
+    message = crc._screen_watch_message(
+        {"trigger": "screen_watch", "job_kind": "screen_watch", "broadcast_state": "on"},
+        screen_text="screen_context: 用户在看聊天记录",
+        chat_context=crc.ProactiveChatContext(text=""),
+    )
+
+    assert '"thinking_summary"' in message
+    assert "display-safe" in message
+    assert "hidden chain-of-thought" in message
+    assert "screen_context: 用户在看聊天记录" in message
 
 
 def test_process_introduction_job_writes_identity_before_first_greeting(monkeypatch):
@@ -3287,7 +3327,7 @@ def test_message_for_proactive_job_instructs_multi_bubble_without_gate_context()
     )
 
     assert "a few short bubbles" in message
-    assert '{"messages":["..."]}' in message
+    assert '{"thinking_summary":"...","messages":["..."]}' in message
     assert "recent_chat_context" in message
     assert "possible_connections" not in message
     assert "Feedling Gate decided" not in message

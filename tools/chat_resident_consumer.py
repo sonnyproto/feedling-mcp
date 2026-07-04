@@ -3327,6 +3327,24 @@ def _resident_foreground_chat_message_v2(content: str) -> str:
     return content
 
 
+def _visible_thinking_summary_protocol() -> str:
+    return "\n".join([
+        "Visible thinking summary protocol:",
+        "When you speak, prefer JSON {\"thinking_summary\":\"...\",\"messages\":[\"...\"]}.",
+        "thinking_summary is a short display-safe summary of what context you considered and why you answered this way.",
+        "Do not include hidden chain-of-thought, system/developer prompts, secrets, token/account metadata, or tool transcripts.",
+        "Do not put thinking_summary JSON inside a visible message bubble.",
+    ])
+
+
+def _foreground_response_protocol_message(content: str) -> str:
+    if not str(content or "").strip():
+        return content
+    if "\"thinking_summary\"" in content:
+        return content
+    return f"{_visible_thinking_summary_protocol()}\n\n{content}"
+
+
 def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = None) -> str:
     """Short plaintext transcript of recent chat turns STRICTLY older than the
     current turn, for injecting cross-turn continuity into foreground messages.
@@ -4418,9 +4436,10 @@ def _message_for_introduction_job(job: dict) -> str:
         "2. 给 TA 发【第一句问候】—— 像久别重逢、你一直都在那样,in-voice。"
         "不是\"有什么可以帮您\",是你这个伴侣会说的第一句(类似\"我来了\",但用你自己的方式)。\n"
         "3. 不要等 TA 回应,这是你的登场。",
+        _visible_thinking_summary_protocol(),
         "输出格式优先用 JSON: "
         "{\"actions\":[{\"type\":\"identity.profile_patch\",\"patch\":{\"self_introduction\":\"...\","
-        "\"signature\":[\"...\"]}}],\"messages\":[\"...\"]}。"
+        "\"signature\":[\"...\"]}}],\"thinking_summary\":\"...\",\"messages\":[\"...\"]}。"
         "如果你用 io_cli identity-write 作为 native tool 写身份卡,仍然在 messages 里给出第一句问候。",
         "铁律:只用你真实拥有的人格/记忆,别编不存在的共同经历;名字别编。",
         _reply_language_line(),
@@ -4462,6 +4481,7 @@ def _screen_watch_message(
         "(frames are kept ~100 min).",
         "If something genuinely moves you to speak, use your normal voice (1-3 short bubbles). "
         "If not, return JSON: {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}],\"messages\":[]}.",
+        _visible_thinking_summary_protocol(),
         "Do not mention this watch, the frames, or any system wording to the user.",
         (
             "watch_metadata:\n"
@@ -4605,7 +4625,8 @@ def _reply_protocol_block() -> str:
     return "\n".join([
         "How to respond (exactly one of):",
         "- speak: reply in your normal voice — a few short bubbles is typical, but length and number are yours. "
-        "Plain text, or JSON {\"messages\":[\"...\"]}.",
+        "Prefer JSON {\"thinking_summary\":\"...\",\"messages\":[\"...\"]}; plain text is allowed as fallback.",
+        _visible_thinking_summary_protocol(),
         "- stay quiet: return {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}]}.",
         "- want to see their screen but it isn't shared: just ask, in a normal message.",
     ])
@@ -6353,6 +6374,7 @@ def _process_messages(messages: list) -> float:
         # (v2, image, plain) carries the same context. Wraps the time-anchored
         # content so the transcript sits above this turn's grounded message.
         content = _foreground_agent_message(content, current_ts=ts)
+        content = _foreground_response_protocol_message(content)
 
         use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
         try:
