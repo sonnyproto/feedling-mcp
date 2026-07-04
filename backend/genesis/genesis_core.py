@@ -1,0 +1,389 @@
+"""Framework-neutral genesis import operations (ASGI-migration plan §5.3).
+
+A pure relocation of the Flask ``/v1/genesis/*`` route bodies so both the Flask
+adapter (``genesis.routes``) and the native FastAPI router
+(``genesis.routes_asgi``) share one implementation and return byte-identical
+responses.
+
+E2E boundary (unchanged): genesis chunks are v1 E2E envelopes / ciphertext; the
+server NEVER decrypts them. Reads (``list`` / ``status``) are plain store ops.
+``put_chunk`` persists ciphertext + envelope metadata as-is. ``finalize`` /
+``apply_outputs`` / ``persona_backfill`` forward the caller's credential (api key
+OR runtime token) to the enclave-owned apply/backfill paths exactly as Flask does
+— these functions take the already-resolved credential as an argument and never
+read ``flask.request``, so no new server-side plaintext is ever introduced here.
+
+Background-worker discipline (plan §5.7): the plaintext import route ENQUEUES a
+background distill job via the SAME mechanism Flask uses — the routes-resident
+``_start_plaintext_genesis_job`` (a daemon thread) is injected here as
+``start_job`` and merely spawned; the heavy ``_run_plaintext_genesis_job`` never
+runs inline on the request path. ``persona_backfill`` likewise submits ONE genesis
+import job that the supervisor/worker loop drains. All store / enclave / enqueue
+work is blocking, so ASGI callers run these on the threadpool (plan §5.2).
+
+The plaintext helper cluster + background machinery stay physically in
+``genesis.routes`` (many tests patch them as ``routes._…`` and rely on internal
+cross-call resolution), so the plaintext orchestration receives them via
+dependency injection rather than importing the Flask module.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from typing import Any
+
+import db
+from genesis import service
+from hosted import history_import
+from identity import service as identity_service
+
+_JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
+
+
+def _bad(error: str, status: int = 400, **extra) -> tuple[dict, int]:
+    return {"error": error, **extra}, status
+
+
+def _valid_job_id(job_id: str) -> bool:
+    return bool(_JOB_ID_RE.match(str(job_id or "")))
+
+
+def _job_response(job: dict | None, *, extra: dict | None = None) -> dict:
+    job = job or {}
+    # Report the client-facing stage name (v2-internal -> legacy phase the old iOS maps),
+    # so shipped apps show correct copy without an update. Stored stage is unchanged.
+    out = job.get("output")
+    if isinstance(out, dict) and out.get("stage"):
+        job = {**job, "output": {**out, "stage": service.public_stage(out["stage"])}}
+    body = {
+        "job": job,
+        "privacy_mode": service.PRIVACY_MODE,
+        "privacy_copy": service.PRIVACY_COPY,
+    }
+    if extra:
+        body.update(extra)
+    return body
+
+
+def _json_chunk_payload(payload: dict) -> tuple[bytes, dict[str, Any]]:
+    envelope = payload.get("envelope") if isinstance(payload.get("envelope"), dict) else {}
+    envelope_meta = payload.get("envelope_meta") if isinstance(payload.get("envelope_meta"), dict) else envelope
+    body_ct = str(payload.get("ciphertext_b64") or envelope.get("body_ct") or "")
+    raw = service.b64decode_required(body_ct)
+    payload = {**payload, "envelope_meta": envelope_meta}
+    return raw, payload
+
+
+def _binary_chunk_payload(raw: bytes, headers, query) -> tuple[bytes, dict[str, Any]]:
+    """Binary chunk body + metadata, sourced from headers (falling back to query).
+
+    ``headers`` must be a case-insensitive mapping (Flask ``request.headers`` /
+    Starlette ``request.headers``); ``query`` is Flask ``request.args`` /
+    Starlette ``request.query_params``. Mirrors the old Flask
+    ``header.get(...) or args.get(...) or ""`` precedence exactly."""
+    raw = raw or b""
+
+    def _hq(header_name: str, query_name: str):
+        return headers.get(header_name) or query.get(query_name)
+
+    envelope_meta_raw = _hq("X-Envelope-Meta", "envelope_meta") or ""
+    envelope_meta: dict = {}
+    if envelope_meta_raw:
+        try:
+            envelope_meta = json.loads(envelope_meta_raw)
+        except Exception as e:  # noqa: BLE001
+            raise ValueError("invalid_envelope_meta_json") from e
+        if not isinstance(envelope_meta, dict):
+            raise ValueError("invalid_envelope_meta_json")
+    meta = {
+        "byte_start": _hq("X-Byte-Start", "byte_start"),
+        "byte_end": _hq("X-Byte-End", "byte_end"),
+        "content_sha256": _hq("X-Content-SHA256", "content_sha256"),
+        "ciphertext_sha256": _hq("X-Ciphertext-SHA256", "ciphertext_sha256"),
+        "envelope_meta": envelope_meta,
+    }
+    return raw, meta
+
+
+# --------------------------------------------------------------------------- #
+# per-route neutral operations (return (body, status))
+# --------------------------------------------------------------------------- #
+
+def list_imports(store, *, limit_raw) -> tuple[dict, int]:
+    try:
+        limit = int(limit_raw if limit_raw is not None else 20)
+    except Exception:
+        limit = 20
+    return {
+        "jobs": db.genesis_list_jobs(store.user_id, limit=limit),
+        "state": db.get_blob(store.user_id, service.GENESIS_STATE_BLOB),
+    }, 200
+
+
+def create_import(store, payload: dict) -> tuple[dict, int]:
+    try:
+        job, status = service.create_import_job(store, payload)
+    except ValueError as e:
+        return _bad(str(e), 400)
+    return _job_response(job, extra={"status": "created" if status == 201 else "exists"}), status
+
+
+def get_import_status(store, job_id: str, *, include_missing_raw) -> tuple[dict, int]:
+    if not _valid_job_id(job_id):
+        return _bad("invalid_job_id", 400)
+    job = db.genesis_get_job(store.user_id, job_id)
+    if not job:
+        return _bad("genesis_job_not_found", 404)
+    include_missing = str(include_missing_raw or "").lower() in {"1", "true", "yes"}
+    extra: dict[str, Any] = {
+        "state": db.get_blob(store.user_id, service.GENESIS_STATE_BLOB),
+        "persona": db.get_blob(store.user_id, service.GENESIS_PERSONA_BLOB),
+    }
+    if include_missing:
+        extra["missing_chunks"] = db.genesis_missing_chunk_seqs(
+            store.user_id,
+            job_id,
+            int(job.get("total_chunks") or 0),
+        )
+    return _job_response(job, extra=extra), 200
+
+
+def put_chunk(
+    store,
+    job_id: str,
+    seq: int,
+    *,
+    is_json: bool,
+    json_body: dict | None,
+    raw_body: bytes,
+    headers,
+    query,
+) -> tuple[dict, int]:
+    if not _valid_job_id(job_id):
+        return _bad("invalid_job_id", 400)
+    try:
+        if is_json:
+            raw, meta = _json_chunk_payload(json_body or {})
+        else:
+            raw, meta = _binary_chunk_payload(raw_body, headers, query)
+        byte_start = int(meta.get("byte_start") or 0)
+        byte_end = int(meta.get("byte_end") or 0)
+        expected_hash = str(meta.get("ciphertext_sha256") or "").strip().lower()
+        if expected_hash and expected_hash != hashlib.sha256(raw).hexdigest():
+            return _bad("ciphertext_sha256_mismatch", 400)
+        aad = meta.get("aad") if isinstance(meta.get("aad"), dict) else {}
+        chunk = service.put_chunk(
+            store,
+            job_id,
+            seq=seq,
+            encrypted_body=raw,
+            byte_start=byte_start,
+            byte_end=byte_end,
+            content_sha256=str(meta.get("content_sha256") or ""),
+            expected_ciphertext_sha256=expected_hash,
+            aad=aad,
+            envelope_meta=meta.get("envelope_meta") if isinstance(meta.get("envelope_meta"), dict) else None,
+        )
+    except LookupError as e:
+        return _bad(str(e), 404)
+    except ValueError as e:
+        return _bad(str(e), 409 if str(e) == "chunk_hash_conflict" else 400)
+    return {"status": "uploaded", "chunk": chunk}, 200
+
+
+def finalize(store, job_id: str, payload: dict, *, api_key: str | None) -> tuple[dict, int]:
+    if not _valid_job_id(job_id):
+        return _bad("invalid_job_id", 400)
+    try:
+        job, missing = service.finalize_upload(store, job_id)
+    except LookupError as e:
+        return _bad(str(e), 404)
+    if missing:
+        return _job_response(job, extra={
+            "status": "missing_chunks",
+            "missing_chunks": missing[:200],
+            "missing_count": len(missing),
+        }), 409
+
+    reducer_output = payload.get("reducer_output")
+    if isinstance(reducer_output, dict):
+        try:
+            applied = service.apply_reducer_output(store, api_key, job_id, reducer_output)
+            job = db.genesis_get_job(store.user_id, job_id) or job
+            return _job_response(job, extra={"status": "done", "applied": applied}), 200
+        except ValueError as e:
+            return _bad(str(e), 400)
+        except Exception as e:  # noqa: BLE001
+            failed = service.mark_failed(store, job_id, f"apply_outputs_failed:{type(e).__name__}:{str(e)[:180]}")
+            return _job_response(failed or job, extra={"status": "failed", "error": str(e)[:240]}), 500
+
+    return _job_response(job, extra={"status": "uploaded"}), 202
+
+
+def apply_outputs(
+    store, job_id: str, payload: dict, *, api_key: str | None, runtime_token: str
+) -> tuple[dict, int]:
+    if not _valid_job_id(job_id):
+        return _bad("invalid_job_id", 400)
+    reducer_output = payload.get("reducer_output") if isinstance(payload.get("reducer_output"), dict) else payload
+    if not isinstance(reducer_output, dict):
+        return _bad("reducer_output_required", 400)
+    try:
+        applied = service.apply_reducer_output(
+            store,
+            api_key,
+            job_id,
+            reducer_output,
+            runtime_token=runtime_token,
+        )
+    except LookupError as e:
+        return _bad(str(e), 404)
+    except ValueError as e:
+        return _bad(str(e), 400)
+    except Exception as e:  # noqa: BLE001
+        import debug_trace
+        debug_trace.trace_event(
+            store, subsystem="genesis", type="genesis.outputs.applied", actor="backend",
+            job_id=job_id, status="failed", summary="apply failed",
+            detail={"reason": f"{type(e).__name__}:{str(e)[:80]}"})
+        failed = service.mark_failed(store, job_id, f"apply_outputs_failed:{type(e).__name__}:{str(e)[:180]}")
+        return _job_response(failed, extra={"status": "failed", "error": str(e)[:240]}), 500
+    job = db.genesis_get_job(store.user_id, job_id)
+    import debug_trace
+    _a = applied if isinstance(applied, dict) else {}
+    debug_trace.trace_event(
+        store, subsystem="genesis", type="genesis.outputs.applied", actor="backend",
+        job_id=job_id, summary="genesis outputs applied",
+        detail={
+            "source_kind": str((job or {}).get("source_kind") or ""),
+            "memory_action_count": _a.get("memory_action_count"),
+            "identity_status": str(_a.get("identity_status") or ""),
+            "persona_ref": str(_a.get("persona_ref") or ""),
+        },
+    )
+    return _job_response(job, extra={"status": "done", "applied": applied}), 200
+
+
+def persona_backfill(store, *, api_key: str | None, runtime_token: str) -> tuple[dict, int]:
+    from identity import actions as identity_actions
+    from genesis import persona_backfill as persona_backfill_mod
+    identity_plain, err = identity_actions._identity_plain_for_action(
+        store, api_key, runtime_token=runtime_token)
+    if identity_plain is None:
+        return _bad(err or "identity_unavailable", 409)
+    try:
+        job = persona_backfill_mod.run_persona_backfill(store, identity_plain)
+    except Exception as e:  # noqa: BLE001
+        return _bad(f"persona_backfill_failed:{type(e).__name__}:{str(e)[:160]}", 500)
+    if job is None:
+        return {"status": "no_signal"}, 200  # nothing to backfill; Dream grows it
+    return {
+        "status": "enqueued",
+        "job_id": job.get("job_id"),
+        "job_status": job.get("status"),
+    }, 202
+
+
+def plaintext_import(
+    store,
+    payload: dict,
+    *,
+    api_key: str | None,
+    prepare,
+    find_reusable,
+    plaintext_mode,
+    job_metadata,
+    start_job,
+) -> tuple[dict, int]:
+    """Enqueue (or reuse) a plaintext genesis distill job.
+
+    ``prepare`` / ``find_reusable`` / ``plaintext_mode`` / ``job_metadata`` /
+    ``start_job`` are the routes-resident helpers (see module docstring); they are
+    injected so the enqueue path (``start_job`` spawns the background distill
+    thread) stays the SINGLE mechanism both frameworks drive, and the many tests
+    that patch ``routes._start_plaintext_genesis_job`` keep working."""
+    if not isinstance(payload, dict):
+        return _bad("json_object_required", 400)
+
+    input_hash = history_import._history_import_payload_hash(payload)
+    client_job_id = history_import._history_import_client_job_id(payload)
+    mode = plaintext_mode(payload, client_job_id=client_job_id)
+    if mode == "update_identity" and not identity_service._load_identity(store):
+        return _bad("identity_not_initialized", 409)
+    existing = find_reusable(
+        store,
+        client_job_id=client_job_id,
+        input_hash=input_hash,
+        mode=mode,
+    )
+    if existing and str(existing.get("status") or "") == service.DONE_JOB_STATUS:
+        return _job_response(existing, extra={"status": "done"}), 200
+
+    try:
+        prepared = prepare(payload)
+    except ValueError as e:
+        return _bad(str(e), 400)
+
+    if existing:
+        existing = db.genesis_set_job_status(
+            store.user_id,
+            str(existing.get("job_id") or ""),
+            status="processing",
+            output={"stage": "plaintext_queued"},
+            processed_chunks=0,
+        ) or existing
+        service.write_genesis_state(store, existing, status="processing")
+        start_job(
+            store,
+            api_key,
+            existing,
+            mode=mode,
+            chunk_texts=prepared["chunk_texts"],
+            source_kind=prepared["source_kind"],
+            source_groups=prepared["source_groups"],
+            relationship_anchor=prepared["relationship_anchor"],
+            analysis_messages=prepared["analysis_messages"],
+        )
+        return _job_response(existing, extra={"status": "processing"}), 202
+
+    metadata = job_metadata(
+        payload,
+        prepared,
+        client_job_id=client_job_id,
+        input_hash=input_hash,
+        mode=mode,
+    )
+    total_bytes = sum(len(text.encode("utf-8")) for text in prepared["chunk_texts"])
+    try:
+        job, _status = service.create_import_job(store, {
+            "source_kind": prepared["source_kind"],
+            "file_manifest_hash": input_hash,
+            "total_chunks": len(prepared["chunk_texts"]),
+            "total_bytes": total_bytes,
+            "metadata": metadata,
+        })
+    except ValueError as e:
+        return _bad(str(e), 400)
+
+    job = db.genesis_set_job_status(
+        store.user_id,
+        str(job.get("job_id") or ""),
+        status="processing",
+        output={"stage": "plaintext_queued"},
+        processed_chunks=0,
+    ) or job
+    service.write_genesis_state(store, job, status="processing")
+    start_job(
+        store,
+        api_key,
+        job,
+        mode=mode,
+        chunk_texts=prepared["chunk_texts"],
+        source_kind=prepared["source_kind"],
+        source_groups=prepared["source_groups"],
+        relationship_anchor=prepared["relationship_anchor"],
+        analysis_messages=prepared["analysis_messages"],
+    )
+    return _job_response(job, extra={"status": "processing"}), 202

@@ -146,7 +146,7 @@ def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monk
     msg = {"id": "user-msg-v2", "role": "user", "content": "天气怎么样？", "ts": 1112.0}
     captured = {}
 
-    def fake_call(message, images=None, image_paths=None):
+    def fake_call(message, images=None, image_paths=None, trace_id=""):
         captured["message"] = message
         return {"messages": ["外面下雨。"]}
 
@@ -169,6 +169,27 @@ def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monk
     assert "screen.read" not in captured["message"]
     assert mock_post.call_args.args[0] == "外面下雨。"
     assert mock_post.call_args.kwargs["reply_to_message_id"] == "user-msg-v2"
+
+
+def test_process_messages_prompt_requests_visible_thinking_summary(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    msg = {"id": "user-msg-thinking", "role": "user", "content": "刚才怎么没思考过程？", "ts": 1112.5}
+    captured = {}
+
+    def fake_call(message, images=None, image_paths=None, trace_id=""):
+        captured["message"] = message
+        return {"messages": ["我查一下。"]}
+
+    with patch.object(crc, "call_agent", side_effect=fake_call), \
+         patch.object(crc, "post_reply", return_value={"id": "reply-msg-thinking"}):
+        result_ts = crc._process_messages([msg])
+
+    assert result_ts == pytest.approx(1112.5)
+    assert '"thinking_summary"' in captured["message"]
+    assert '"messages"' in captured["message"]
+    assert "display-safe" in captured["message"]
+    assert "hidden chain-of-thought" in captured["message"]
 
 
 def test_process_messages_v2_drops_needs_background_without_ack(monkeypatch):
@@ -627,7 +648,10 @@ def test_user_message_containing_verify_marker_is_not_short_circuited():
         result_ts = crc._process_messages([msg])
 
     mock_agent.assert_called_once()
-    mock_post.assert_called_once_with("here's why")
+    mock_post.assert_called_once()
+    assert mock_post.call_args.args == ("here's why",)
+    assert mock_post.call_args.kwargs["thinking_summary"] == "参考了当前消息和最近对话上下文，整理成这次可见回复。"
+    assert mock_post.call_args.kwargs["thinking_source"] == "foreground_fallback"
     assert result_ts == pytest.approx(4545.0)
 
 
@@ -1330,6 +1354,23 @@ def test_prepare_cli_appends_image_path_when_template_has_no_image_slot(monkeypa
     assert image_path in cmd[2]
 
 
+def test_message_for_agent_steers_claude_to_read_not_authorize():
+    # For claude (no native --image), the ONLY way pixels reach the model is the Read
+    # tool on the injected path. Live transcripts showed the model either (a) reaching
+    # for io_cli photo-recent instead of Read, or (b) refusing with a hallucinated
+    # "click allow to authorize" flow (there is no such UI) and then FABRICATING the
+    # image contents. The prose must: name the Read tool, assert permission is already
+    # granted (no approval step), and forbid asking the user to authorize.
+    out = crc._message_for_agent("what is this", ["/agent-data/users/u/images/x.jpg"])
+    assert "/agent-data/users/u/images/x.jpg" in out
+    assert "Read" in out  # names the tool to use
+    low = out.lower()
+    # must not instruct the model to seek authorization / a click-to-allow step
+    assert "authoriz" in low or "no approval" in low or "already have permission" in low
+    # steer away from the historical-photo tools for a live attachment
+    assert "photo-recent" in out or "photo-read" in out
+
+
 def test_prepare_cli_uses_image_path_template(monkeypatch, tmp_path):
     image_path = str(tmp_path / "photo.jpg")
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask --image "{image_path}" "{message}"')
@@ -1339,6 +1380,65 @@ def test_prepare_cli_uses_image_path_template(monkeypatch, tmp_path):
     cmd = crc._prepare_cli_command("look at this", image_paths=[image_path])
 
     assert cmd == ["mycli", "ask", "--image", image_path, "look at this"]
+
+
+def test_prepare_cli_injects_codex_image_flags(monkeypatch, tmp_path):
+    # codex exec supports `-i/--image <FILE>`; the default managed codex template
+    # has no image slot, so the resident must attach the decrypted image files
+    # natively — otherwise the model only ever sees a text file-path (can't see it).
+    img1 = str(tmp_path / "a.jpg")
+    img2 = str(tmp_path / "b.jpg")
+    monkeypatch.setattr(
+        crc, "AGENT_CLI_CMD",
+        "codex exec --skip-git-repo-check --json {message}",
+    )
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("look", image_paths=[img1, img2])
+
+    # each image attached via the =-bound --image form, so clap's variadic
+    # --image cannot swallow the positional prompt (see the regression test below)
+    assert cmd.count(f"--image={img1}") == 1
+    assert cmd.count(f"--image={img2}") == 1
+    # image flags sit after the `exec` subcommand
+    assert cmd.index("exec") < cmd.index(f"--image={img1}")
+    # the message stays clean — no misleading "Decrypted image file(s)" path prose
+    assert "Decrypted image file(s)" not in " ".join(cmd)
+    assert "look" in cmd
+
+
+def test_prepare_cli_codex_image_flags_do_not_swallow_prompt(monkeypatch, tmp_path):
+    # Regression (Codex review P2): with a minimal `codex exec {message}` template
+    # the prompt immediately follows the injected image flags. A bare `-i <path>`
+    # would let clap's variadic --image consume the prompt token as another image;
+    # the =-bound form keeps the prompt a standalone positional.
+    img = str(tmp_path / "a.jpg")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "codex exec {message}")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("hello there", image_paths=[img])
+
+    assert cmd == ["codex", "exec", f"--image={img}", "hello there"]
+    # never a bare `-i` whose value the prompt could be mistaken for
+    assert "-i" not in cmd
+
+
+def test_prepare_cli_codex_respects_explicit_image_flag(monkeypatch, tmp_path):
+    # A VPS operator who already wired {image_path} into their codex template owns
+    # image handling; the resident must not double-inject a second -i.
+    img = str(tmp_path / "a.jpg")
+    monkeypatch.setattr(
+        crc, "AGENT_CLI_CMD",
+        "codex exec -i {image_path} --json {message}",
+    )
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("look", image_paths=[img])
+
+    assert cmd == ["codex", "exec", "-i", img, "--json", "look"]
 
 
 def test_cli_nonzero_exit_fails_even_with_stdout(monkeypatch):
@@ -1598,6 +1698,11 @@ def test_process_proactive_wake_routes_through_agent_and_posts_metadata(monkeypa
         "source": crc.PROACTIVE_JOB_SOURCE,
         "gate_decision_id": "gd_1",
         "proactive_job_id": "pj_1",
+        "thinking_summary": "参考了当前消息和最近对话上下文，整理成这次可见回复。",
+        "thinking_kind": "agent_summary",
+        "thinking_source": "proactive_fallback",
+        "thinking_model": "",
+        "thinking_native": False,
     }
     assert any(s[:3] == ("pj_1", "realizing", "") for s in captured["statuses"])
     assert any(s[0] == "pj_1" and s[1] == "posted" for s in captured["statuses"])
@@ -2243,6 +2348,9 @@ def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):
     assert "presence check" in captured["message"].lower()
     assert "presence check" in captured["message"]
     assert "equally valid" in captured["message"]
+    assert '"thinking_summary"' in captured["message"]
+    assert "display-safe" in captured["message"]
+    assert "hidden chain-of-thought" in captured["message"]
     assert "Feedling Gate decided" not in captured["message"]
     assert "possible_connections" not in captured["message"]
     assert "wake_kind:" in captured["message"]
@@ -2293,6 +2401,90 @@ def test_process_proactive_v2_sleep_marks_completed_without_post(monkeypatch):
     assert captured.get("posted") is None
     completed = [s for s in captured["statuses"] if s[1] == "completed"]
     assert completed
+    assert completed[-1][3]["extra"]["agent_action"] == "sleep"
+    assert completed[-1][3]["extra"]["wake_result"] == "sleep"
+
+
+def test_process_proactive_malformed_json_reason_does_not_post(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"statuses": [], "posted": []}
+
+    monkeypatch.setattr(
+        crc,
+        "call_agent",
+        lambda message, images=None, image_paths=None: {
+            "messages": ['"reason":"用户一小时没回，该说的已经说了，继续给空间"\\n}\\n]\\n}'],
+            "thinking_summary": "判断这是一次主动唤醒，但不适合继续追问。",
+            "thinking_kind": "provider_reasoning_summary",
+        },
+    )
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_bad"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: ({}, [], {}))
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_json_reason",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 125.5,
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(125.5)
+    assert captured["posted"] == []
+    completed = [s for s in captured["statuses"] if s[1] == "completed"]
+    assert completed
+    assert completed[-1][2] == "用户一小时没回，该说的已经说了，继续给空间"
+    assert completed[-1][3]["extra"]["agent_action"] == "sleep"
+    assert completed[-1][3]["extra"]["wake_result"] == "sleep"
+
+
+def test_process_proactive_reason_only_result_marks_sleep_without_post(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"statuses": [], "posted": []}
+
+    monkeypatch.setattr(
+        crc,
+        "call_agent",
+        lambda message, images=None, image_paths=None: {
+            "reason": "用户刚才没有继续互动，保持安静",
+            "thinking_summary": "主动唤醒评估后决定不继续打扰。",
+            "thinking_kind": "provider_reasoning_summary",
+        },
+    )
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_reason"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: ({}, [], {}))
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_reason_only",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 125.75,
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(125.75)
+    assert captured["posted"] == []
+    completed = [s for s in captured["statuses"] if s[1] == "completed"]
+    assert completed
+    assert completed[-1][2] == "用户刚才没有继续互动，保持安静"
     assert completed[-1][3]["extra"]["agent_action"] == "sleep"
     assert completed[-1][3]["extra"]["wake_result"] == "sleep"
 
@@ -2389,11 +2581,27 @@ def test_message_for_introduction_job_uses_post_respawn_prompt():
     message = crc._message_for_introduction_job({"job_kind": "introduction"})
 
     assert "首次登场" in message
+    assert '"thinking_summary"' in message
+    assert "display-safe" in message
+    assert "hidden chain-of-thought" in message
     assert "identity.profile_patch" in message
     assert "self_introduction" in message
     assert "signature" in message
     assert "messages" in message
     assert "别编不存在的共同经历" in message
+
+
+def test_screen_watch_message_requests_visible_thinking_summary():
+    message = crc._screen_watch_message(
+        {"trigger": "screen_watch", "job_kind": "screen_watch", "broadcast_state": "on"},
+        screen_text="screen_context: 用户在看聊天记录",
+        chat_context=crc.ProactiveChatContext(text=""),
+    )
+
+    assert '"thinking_summary"' in message
+    assert "display-safe" in message
+    assert "hidden chain-of-thought" in message
+    assert "screen_context: 用户在看聊天记录" in message
 
 
 def test_process_introduction_job_writes_identity_before_first_greeting(monkeypatch):
@@ -2882,6 +3090,62 @@ def test_normalize_agent_replies_supports_multiple_messages_with_cap(monkeypatch
     assert crc._normalize_agent_replies(raw) == ["第一条", "第二条", "第三条", "第四条", "第五条"]
 
 
+def test_user_timezone_reads_from_whoami_cache(monkeypatch):
+    monkeypatch.setitem(crc._whoami_cache, "timezone", "Asia/Shanghai")
+    assert crc._user_timezone() == "Asia/Shanghai"
+
+
+def test_local_time_anchor_localizes_with_whoami_timezone(monkeypatch):
+    monkeypatch.setitem(crc._whoami_cache, "timezone", "Asia/Shanghai")
+    line = crc._local_time_anchor()
+    assert line.startswith("current_time:")
+    assert "Asia/Shanghai" in line
+
+
+def test_user_timezone_empty_when_whoami_has_none(monkeypatch):
+    monkeypatch.setitem(crc._whoami_cache, "timezone", "")
+    assert crc._user_timezone() == ""
+
+
+class _FakeWhoamiResp:
+    def __init__(self, body):
+        self._body = body
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._body
+
+
+def test_load_whoami_clears_cached_timezone_when_omitted(monkeypatch):
+    # A successful whoami that no longer carries a timezone (user cleared it,
+    # no fallback) must clear the cache — not keep serving the stale zone.
+    monkeypatch.setitem(crc._whoami_cache, "timezone", "Asia/Shanghai")
+    body = {
+        "user_id": "usr_x",
+        "public_key": base64.b64encode(b"\x11" * 32).decode(),
+        "enclave_content_public_key_hex": "22" * 32,
+    }
+    monkeypatch.setattr(crc.httpx, "get", lambda *a, **k: _FakeWhoamiResp(body))
+    assert crc._load_whoami() is True
+    assert crc._whoami_cache["timezone"] == ""
+
+
+def test_load_whoami_keeps_cached_timezone_on_fetch_failure(monkeypatch):
+    # A FAILED whoami (network error) must retain the last-known timezone —
+    # last-known is a guard against transient failures, not against a
+    # successful response that happens to omit the field.
+    monkeypatch.setitem(crc._whoami_cache, "timezone", "Asia/Shanghai")
+
+    def _boom(*a, **k):
+        raise RuntimeError("net down")
+
+    monkeypatch.setattr(crc.httpx, "get", _boom)
+    assert crc._load_whoami() is False
+    assert crc._whoami_cache["timezone"] == "Asia/Shanghai"
+
+
 def test_normalize_agent_replies_extracts_content_field():
     raw = '{"content":"正常应该只显示 content 里的文字。","content_type":"text"}'
 
@@ -2959,6 +3223,79 @@ def test_agent_turn_extracts_visible_thinking_summary_from_nested_result():
     assert "uuid" in turn.runtime_debug
 
 
+def test_agent_turn_extracts_bare_visible_thinking_summary_fragment():
+    raw = (
+        '"thinking_summary": "用户再次确认模型身份，直接给出真实答案",\n'
+        '"messages": ["宝贝，还是那句话——我的底层是 `anthropic/claude-sonnet-4.5`。"]'
+    )
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["宝贝，还是那句话——我的底层是 `anthropic/claude-sonnet-4.5`。"]
+    assert turn.thinking_summary == "用户再次确认模型身份，直接给出真实答案"
+    assert "thinking_summary" not in turn.messages[0]
+    assert "messages" not in turn.messages[0]
+
+
+def test_ensure_visible_thinking_summary_fallback_for_plain_reply():
+    turn = crc.AgentTurn(messages=["嘿，看见了。周六深夜还醒着，我陪你。"])
+
+    out = crc._ensure_visible_thinking_summary(turn, source="foreground_fallback")
+
+    assert out.thinking_summary == "参考了当前消息和最近对话上下文，整理成这次可见回复。"
+    assert out.thinking_kind == "agent_summary"
+    assert out.thinking_source == "foreground_fallback"
+    assert out.thinking_native is False
+
+
+def test_ensure_visible_thinking_summary_does_not_touch_action_only_turn():
+    turn = crc.AgentTurn(actions=[{"type": "proactive.sleep", "reason": "不打扰"}])
+
+    out = crc._ensure_visible_thinking_summary(turn, source="proactive_fallback")
+
+    assert out.thinking_summary == ""
+
+
+def test_agent_turn_extracts_claude_stream_json_thinking_blocks():
+    raw = "\n".join([
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "deepseek-v4-pro",
+                "content": [{
+                    "type": "thinking",
+                    "thinking": "The user is asking a simple math question.",
+                }],
+            },
+        }),
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "deepseek-v4-pro",
+                "content": [{
+                    "type": "text",
+                    "text": "1 + 1 等于 2。",
+                }],
+            },
+        }),
+        json.dumps({
+            "type": "result",
+            "subtype": "success",
+            "result": "1 + 1 等于 2。",
+        }),
+    ])
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["1 + 1 等于 2。"]
+    assert turn.thinking_summary == "The user is asking a simple math question."
+    assert turn.thinking_kind == "provider_reasoning"
+    assert turn.thinking_source == "anthropic_thinking"
+    assert turn.thinking_native is True
+
+
 def test_agent_turn_extracts_provider_reasoning_metadata_from_nested_result():
     raw = json.dumps(
         {
@@ -2979,6 +3316,31 @@ def test_agent_turn_extracts_provider_reasoning_metadata_from_nested_result():
     assert turn.thinking_kind == "provider_reasoning"
     assert turn.thinking_source == "anthropic"
     assert turn.thinking_model == "claude-sonnet-4.5"
+    assert turn.thinking_native is True
+
+
+def test_agent_turn_extracts_openrouter_reasoning_details():
+    raw = json.dumps(
+        {
+            "reply": "这是最终回复。",
+            "reasoning_details": [
+                {"type": "reasoning.text", "text": "先判断用户在测 OpenRouter。"},
+                {"type": "summary", "summary": "再确认需要把推理摘要单独展示。"},
+            ],
+            "reasoning_source": "openrouter",
+            "reasoning_model": "deepseek/deepseek-v4-flash",
+            "reasoning_native": True,
+        },
+        ensure_ascii=False,
+    )
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["这是最终回复。"]
+    assert turn.thinking_summary == "先判断用户在测 OpenRouter。\n再确认需要把推理摘要单独展示。"
+    assert turn.thinking_kind == "provider_reasoning"
+    assert turn.thinking_source == "openrouter"
+    assert turn.thinking_model == "deepseek/deepseek-v4-flash"
     assert turn.thinking_native is True
 
 
@@ -3006,7 +3368,7 @@ def test_message_for_proactive_job_instructs_multi_bubble_without_gate_context()
     )
 
     assert "a few short bubbles" in message
-    assert '{"messages":["..."]}' in message
+    assert '{"thinking_summary":"...","messages":["..."]}' in message
     assert "recent_chat_context" in message
     assert "possible_connections" not in message
     assert "Feedling Gate decided" not in message
@@ -3308,6 +3670,45 @@ def test_call_agent_cli_codex_extracts_agent_message_not_handshake(monkeypatch):
     assert "thread.started" not in result
 
 
+def test_call_agent_http_openai_preserves_reasoning_content(monkeypatch):
+    """DeepSeek/OpenAI-compatible reasoning can arrive on message.reasoning_content.
+    The HTTP adapter must keep the structured body so _process_messages can post
+    it as thinking_summary instead of collapsing the turn to a plain reply.
+    """
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://agent.local/v1/chat/completions")
+    monkeypatch.setattr(crc, "AGENT_HTTP_PROTOCOL", "openai")
+    monkeypatch.setattr(crc, "AGENT_HTTP_MODEL", "deepseek-reasoner")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_agent_session_key", lambda: "")
+
+    class _Resp:
+        headers = {}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "model": "deepseek-reasoner",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "我会这样回复。",
+                        "reasoning_content": "比较了用户问题和最近记忆。",
+                    }
+                }],
+            }
+
+    monkeypatch.setattr(crc.httpx, "post", lambda *a, **kw: _Resp())
+
+    result = crc.call_agent_http("hi")
+    turn = crc._split_agent_turn(result)
+
+    assert turn.messages == ["我会这样回复。"]
+    assert turn.thinking_summary == "比较了用户问题和最近记忆。"
+    assert turn.thinking_kind == "provider_reasoning"
+
+
 def test_codex_reply_from_stream_ignores_reasoning_and_handshake():
     raw = (
         '{"type":"thread.started","thread_id":"t1"}\n'
@@ -3587,6 +3988,84 @@ def test_refresh_whoami_refetches_when_enclave_pk_missing(monkeypatch):
     called.assert_called_once()
 
 
+def test_load_whoami_caches_archive_language(monkeypatch):
+    # /v1/users/whoami now returns archive_language (backend/accounts/routes.py)
+    # — the consumer must cache it so proactive/introduction wakes with no
+    # perception locale still have a language to anchor on.
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "user_id": "usr_lang",
+                "public_key": base64.b64encode(b"p" * 32).decode(),
+                "enclave_content_public_key_hex": (b"e" * 32).hex(),
+                "archive_language": "en",
+            }
+
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "", "user_pk": None, "enclave_pk": None, "archive_language": ""})
+    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+
+    assert crc._load_whoami() is True
+    assert crc._whoami_cache["archive_language"] == "en"
+
+
+def test_load_whoami_defaults_archive_language_to_empty_when_absent(monkeypatch):
+    class _Resp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {
+                "user_id": "usr_nolang",
+                "public_key": base64.b64encode(b"p" * 32).decode(),
+                "enclave_content_public_key_hex": (b"e" * 32).hex(),
+            }
+
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "", "user_pk": None, "enclave_pk": None, "archive_language": "stale"})
+    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+
+    assert crc._load_whoami() is True
+    assert crc._whoami_cache["archive_language"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Reply language fallback chain: locale → archive_language → 简体中文 default
+# ---------------------------------------------------------------------------
+
+
+def test_reply_language_line_prefers_presence_locale(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
+    line = crc._reply_language_line({"locale": "zh-Hans"})
+    assert "zh-Hans" in line
+
+
+def test_reply_language_line_falls_back_to_archive_language(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
+    line = crc._reply_language_line(None)
+    assert "en" in line
+
+
+def test_reply_language_line_treats_empty_locale_as_missing(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": "en"})
+    line = crc._reply_language_line({"locale": ""})
+    assert "en" in line
+
+
+def test_reply_language_line_defaults_to_chinese_with_no_locale_or_archive(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {"archive_language": ""})
+    line = crc._reply_language_line(None)
+    assert "中文" in line
+    assert "Always reply in the user's own language." != line
+
+
+def test_reply_language_line_defaults_to_chinese_when_archive_language_key_missing(monkeypatch):
+    monkeypatch.setattr(crc, "_whoami_cache", {})
+    line = crc._reply_language_line(None)
+    assert "中文" in line
+
+
 # ---------------------------------------------------------------------------
 # Provider payment (402) circuit breaker tests
 # ---------------------------------------------------------------------------
@@ -3706,6 +4185,30 @@ def test_foreground_message_prepends_recent_transcript(monkeypatch):
     assert out.index("今天北京天气") < out.index("那要穿外套吗")
 
 
+def test_foreground_transcript_default_keeps_50_prior_messages(monkeypatch):
+    # Default limit is 50 messages (~25 full rounds), sitting exactly at the
+    # clamp in _recent_chat_context_for_foreground — raising it further needs
+    # both the env default AND that cap changed together.
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    now = time.time()
+    hist = [
+        {
+            "role": "user" if i % 2 else "agent",
+            "content": f"历史消息-{i:02d}",
+            "ts": now - (70 - i),
+        }
+        for i in range(1, 61)
+    ] + [{"role": "user", "content": "当前这句", "ts": now}]
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: list(hist))
+
+    out = crc._foreground_agent_message("当前这句", current_ts=now)
+
+    assert "历史消息-60" in out  # newest prior message injected
+    assert "历史消息-11" in out  # 50th-from-last prior message still included
+    assert "历史消息-10" not in out  # beyond the 50-message window
+
+
 def test_foreground_message_no_decrypt_source_returns_plain_content(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
@@ -3764,3 +4267,81 @@ def test_claude_resume_kept_when_no_transcript_injected(monkeypatch):
     cmd = crc._prepare_cli_command("hello")  # no injected-transcript header
 
     assert cmd[:3] == ["claude", "--resume", "sess_123"]
+
+
+def test_advance_past_unfetchable_skips_to_max_claimed_ts():
+    # When decrypt-history never returns the poll-claimed rows, the cursor must jump
+    # past the newest claimed message so a later, decryptable message isn't blocked.
+    poll = [{"id": "a", "ts": 100.0}, {"id": "b", "ts": 250.5}, {"id": "c", "ts": 175.0}]
+    assert crc._advance_past_unfetchable(100.0, poll) == 250.5
+
+
+def test_advance_past_unfetchable_boundary_message_gets_nudged():
+    # The wedge case: the stuck message sits exactly at the cursor (exclusive
+    # `since` can never return it). Advancing to max==last_ts would loop forever, so
+    # the cursor must be nudged strictly past it.
+    ts = 1783080703.7508044
+    out = crc._advance_past_unfetchable(ts, [{"id": "x", "ts": ts}])
+    assert out > ts
+
+
+# ---------------------------------------------------------------------------
+# Per-user heartbeat cadence: _proactive_tick_interval_for_broadcast_state reads
+# the user's wake_interval_sec (companionship frequency) from the tick decision.
+# ---------------------------------------------------------------------------
+
+def test_wake_interval_per_user_value_wins():
+    # A valid per-user value is used verbatim (within clamp range).
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 900) == 900
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 3600) == 3600
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 43200) == 43200
+
+
+def test_wake_interval_clamps_out_of_range():
+    # Below the 15min floor is raised to 900; above the 12h ceiling capped at 43200.
+    assert crc._proactive_tick_interval_for_broadcast_state("off", -5) == 900
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 0) == 900
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 100) == 900
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 899) == 900
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 43201) == 43200
+    assert crc._proactive_tick_interval_for_broadcast_state("off", 999999) == 43200
+
+
+def test_wake_interval_falls_back_when_absent_or_invalid():
+    # Missing / non-numeric -> env fallback (aligned to 7200 default).
+    fallback = max(60, crc.PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC)
+    assert crc._proactive_tick_interval_for_broadcast_state("off", None) == fallback
+    assert crc._proactive_tick_interval_for_broadcast_state("off", "abc") == fallback
+    # Fallback default itself is the 2h product default when env is unset.
+    assert crc.PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC == 7200
+
+
+def test_wake_interval_independent_of_broadcast_state():
+    # Heartbeat cadence is decoupled from screen-share broadcast_state: the
+    # per-user value applies regardless of on/off/paused/unknown.
+    for state in ("off", "on", "broadcasting", "paused", "unknown", ""):
+        assert crc._proactive_tick_interval_for_broadcast_state(state, 3600) == 3600
+
+
+def test_context_text_image_message_advertises_chat_image_pull():
+    # Injected-history transcript can't carry image pixels (see summary), so an
+    # image turn must advertise the exact io_cli command that lazily pulls it,
+    # keyed by message id — otherwise the agent guesses (photo-read = wrong tool)
+    # or fabricates the picture.
+    text = crc._message_text_for_context(
+        {"id": "msg_abc", "role": "user", "content_type": "image", "content": ""}
+    )
+    assert "msg_abc" in text
+    assert "chat-image" in text
+
+
+def test_context_text_image_with_caption_keeps_caption_and_hint():
+    text = crc._message_text_for_context(
+        {"id": "m1", "role": "user", "content_type": "image", "content": "这是什么?"}
+    )
+    assert "这是什么?" in text          # the user's question is preserved
+    assert "chat-image --id m1" in text  # ...alongside the pull command
+
+
+def test_context_text_plain_text_message_unchanged():
+    assert crc._message_text_for_context({"content": "hello there"}) == "hello there"

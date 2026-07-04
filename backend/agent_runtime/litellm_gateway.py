@@ -86,7 +86,19 @@ def build_model_entry(
         "model": litellm_model_string(provider, model),
         "api_key": "os.environ/" + upstream_env_var(user_id),
     }
-    if _norm_provider(provider) == "openai_compatible":
+    normalized_provider = _norm_provider(provider)
+    if normalized_provider == "openrouter":
+        # OpenRouter only returns provider reasoning when the request explicitly
+        # asks for it and does not exclude it from the response. Codex already
+        # asks for reasoning summaries on its side; this makes the gateway's
+        # upstream chat call carry the OpenRouter-native body shape too.
+        params["extra_body"] = {
+            "reasoning": {
+                "enabled": True,
+                "exclude": False,
+            },
+        }
+    if normalized_provider == "openai_compatible":
         # Codex speaks the OpenAI Responses wire (POST /v1/responses) ONLY. LiteLLM
         # treats provider=openai as natively Responses-capable (utils.get_provider_
         # responses_api_config → OpenAIResponsesAPIConfig) and passes /v1/responses
@@ -122,7 +134,11 @@ def build_config(entries: list[dict]) -> dict:
         ],
         "litellm_settings": {
             "drop_params": True,
-            "additional_drop_params": ["reasoning", "reasoning_effort", "thinking"],
+            # Preserve OpenAI Responses reasoning params from codex so gateway
+            # providers can emit reasoning summaries. Native Anthropic/DeepSeek
+            # thinking uses the claude driver; gateway backends still drop the
+            # Anthropic-only `thinking` param to avoid 400s.
+            "additional_drop_params": ["thinking"],
         },
         "general_settings": {
             "master_key": "os.environ/" + GATEWAY_KEY_ENV,

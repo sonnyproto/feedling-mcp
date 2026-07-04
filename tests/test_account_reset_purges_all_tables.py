@@ -78,6 +78,11 @@ def _seed_all_per_user_tables(user_id: str) -> None:
             "VALUES (%s, 'job1', 'persona')",
             (user_id,),
         )
+        conn.execute(
+            "INSERT INTO world_book_entries (user_id, entry_id, updated_at, doc) "
+            "VALUES (%s, 'wb1', '2026-07-03T00:00:00', '{}'::jsonb)",
+            (user_id,),
+        )
 
 
 _PER_USER_TABLES = (
@@ -87,6 +92,7 @@ _PER_USER_TABLES = (
     "genesis_import_jobs",
     "genesis_import_chunks",
     "genesis_import_outputs",
+    "world_book_entries",
 )
 
 
@@ -117,6 +123,60 @@ def test_reset_purges_every_per_user_table(client):
 
     leftover = {t: n for t, n in _remaining_rows(uid).items() if n > 0}
     assert leftover == {}, f"删账号后这些表仍有残留行: {leftover}"
+
+
+@pytest.fixture()
+def seeded_user(client) -> dict:
+    """已注册 + 各 per-user 表有行的用户（供 R2-failure 测试沿用既有 fixture 风格）。"""
+    uid, api_key = _register(client)
+    _seed_all_per_user_tables(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, 'model_api', %s)",
+            (uid, db.Jsonb({"provider": "anthropic"})),
+        )
+        conn.execute(
+            "INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
+            "VALUES (%s, 'chat', 1.0, 'k1', '{}'::jsonb)",
+            (uid,),
+        )
+        conn.execute(
+            "INSERT INTO memory_moments (user_id, moment_id, occurred_at, doc) "
+            "VALUES (%s, 'm1', 1.0, '{}'::jsonb)",
+            (uid,),
+        )
+    return {"user_id": uid, "api_key": api_key}
+
+
+def test_reset_besteffort_downstream_failure_does_not_abort_or_half_delete(client, seeded_user, monkeypatch):
+    """DB 删除后的 best-effort 下游清理（R2 frames / DB 兜底）失败不应让 reset
+    503 abort、更不应半删——DB 是原子权威源（0011 CASCADE）。
+    （明文 onboarding 归档是例外：它在删账号之前清理、失败会 abort，见
+    test_onboarding_archive_reset.py::test_reset_aborts_when_archive_cleanup_fails_persistently。）"""
+    uid = seeded_user["user_id"]
+    from onboarding_archive import storage as arch
+    monkeypatch.setattr(arch, "enabled", lambda: False)  # 归档不启用 → 不影响本用例
+
+    def _boom(_uid):
+        raise RuntimeError("R2 frames down")
+
+    monkeypatch.setattr(db, "delete_user_frames", _boom)  # best-effort 步骤抖动
+
+    resp = client.post(
+        "/v1/account/reset",
+        headers={"X-API-Key": seeded_user["api_key"]},
+        json={"confirm": "delete-all-data"},
+    )
+    assert resp.status_code == 200  # best-effort 下游失败不 abort
+    assert resp.get_json().get("deleted") is True
+
+    with db.get_pool().connection() as conn:
+        for t in ("users", "user_blobs", "user_logs", "memory_moments"):
+            col = "user_id"
+            n = conn.execute(
+                f"SELECT count(*) FROM {t} WHERE {col} = %s", (uid,)
+            ).fetchone()[0]
+            assert n == 0, f"{t} not purged despite best-effort downstream failure ({n} rows)"
 
 
 def test_reset_stops_hosted_agent(client):

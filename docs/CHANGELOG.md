@@ -47,6 +47,123 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-04
+
+### [DONE] 自定义陪伴频率 wake_interval_sec + 心跳激活门（三层，已 ship）
+
+两件事一起落地（Seven 主导）。**① 自定义陪伴频率**:用户在设置页选「陪伴频率」7 档
+(15min–12h,**默认 2h**),per-user `wake_interval_sec`(clamp `[900,43200]`),consumer 即时
+生效、无需重启。为什么:原写死全局 30min 太勤/费 token——Seven 拍默认改 2h、最小档 15min(去 10min);
+硬地板同步提到 900,防客户端绕 UI。**② 心跳激活门**:**首次成功聊天前,所有自发主动唤醒
+(heartbeat/photo_added/arrived_at_anchor/unlock_after_absence/screen_watch/introduction)在
+enqueue 前拦掉、零 token**;首聊成功后自然开启。为什么:用户刚填 API key、卡 onboarding、根本没和
+AI 说过话时就开心跳纯烧 token、不符预期(Seven 要求加门)。
+
+- **后端(Codex)**:`core/store.py` 加 `wake_interval_sec`(常量+`normalize_*`+F1 keep-old-on-save)
+  与 `first_chat_ok_at` flag(幂等、不进 save 白名单防伪造激活);`proactive/gate.py`
+  `_build_proactive_v2_wake_decision` decision 带 `wake_interval_sec`,且**未激活 && 非 manual →
+  `activation_pending` 不 enqueue**(优先于原 wake_control);`perception/service.py` 4 条 direct-wake
+  旁路(`_maybe_wake`/`_fire_wake`/`_submit_wake_event_v2_compat`/`_fire_wake_event_v2`)同拦;
+  `agent_runtime/supervisor.py` post-respawn introduction 也拦;`chat/routes.py` **flip 点**=
+  `/v1/chat/response` 成功回复 `role=user & source=model_api` 消息时 `mark_first_chat_ok()`。
+- **consumer(CC)**:`_proactive_tick_interval_for_broadcast_state` 加 per-user 入参,读
+  `decision.wake_interval_sec` + clamp `[900,43200]`,env fallback 对齐 7200;调度点 L6271 接线。
+- **iOS(CC)**:设置页 `proactiveCard` 7 档 Menu 选择器(默认高亮 2h、ambient 关置灰)+
+  `ProactiveStateResponse.wake_interval_sec` + `updateProactiveSwitch(wakeIntervalSec:)` + 双语文案。
+- **验证**:全量 PG e2e **1462 passed**(10 个 pre-existing 非本次,已用清洁 origin/test worktree 隔离);
+  consumer 189 passed;iOS `xcodebuild`(iphonesimulator) **BUILD SUCCEEDED**。双向 review(CC 审后端 /
+  Codex 审 consumer)。e2e 中揪出并修:F1 introduction 旁路未拦、11 个 perception 测试漏更新激活。
+- **commit**:test `0bc9e7d`、iOS main `758c823`。默认 30min→2h、最小 10min→15min。
+- **影响文档**:`docs/WAKE_INTERVAL_CUSTOM_PLAN_2026-06-29.md` 整合成 SHIPPED 最终版(含激活门)。
+
+### [BLOCKER→FIXED] claude 有 Read 授权仍"没权限读图"——非交互缺 permission-mode → 幻觉
+
+单 runner + wedge 修好后,claude(sonnet-4-5)发图**仍"我需要权限才能读取这张图片"**。
+本地用部署完全同款命令 + claude-code 2.1.195 复现并二分定位:**即便 `Read({home}/images/**)`
+在 `--allowed-tools` 和 settings.json 里都有**,`claude -p`(尤其 `--output-format stream-json`
+的 thinking 路径)在**非交互**下仍**拒绝自己的 Read**——allow 规则被当"提示",默认 permission
+模式无交互审批者时对文件读 auto-deny,vision 模型于是**瞎编**(实测回过"棒棒糖小熊",探针图实为
+蓝底黄框 MANGO-7391)。二分结论:元凶是缺 permission-mode,不是授权缺失;`--allowed-tools` 单独
+(无 settings.json)反而能读,加了 settings.json 的 `permissions.allow` 但没 `defaultMode` 才触发拒绝。
+
+修:两个 claude 命令 builder 都加 **`--permission-mode acceptEdits`**(`spawners.py`,
+`_CLAUDE_PERMISSION_FLAG`),外加 settings.json 的 `permissions.defaultMode=acceptEdits`。这是能让
+预授权 allowlist 在非交互下被认可的**最小权限**做法,不用 `--dangerously-skip-permissions`
+那种 codex 式全 bypass;Bash 仍限定 io_cli。实测:同款命令现在正确读出图(暗号+配色),不再幻觉。
+1512 passed。教训:claude headless 读文件要显式给 permission-mode,光有 allow 规则/settings 不够。
+
+### [BLOCKER→FIXED] 测试用户切 claude 后"没响应" — checkpoint wedge + 测试 runner 改单节点
+
+修完 thinking-claude Read 后,测试用户切 claude 发图**仍没响应**(连报错都没有)。SSH 进测试
+runner CVM 看日志坐实:consumer 的聊天 checkpoint 卡在 12:11(`checkpoint.json last_ts`),日志
+反复刷 `poll returned claimed messages but decrypt history did not include those ids; keeping
+checkpoint for retry` —— poll 认领了消息 id,但 `get_decrypted_history(since=cursor)` 返回里不含这些
+id(解不出 / 或该消息 ts 正好等于 exclusive `since` 边界取不到)→ `_filter_messages_to_poll_ids`
+得空 → **无限重试、cursor 永不前进** → 16:15/16:18 等新消息全被堵。**跟看图修复无关**(该用户
+AGENT_CLI_CMD 已带 Read,已验证)。
+
+结构性诱因:测试 runner CVM `feedling-io-agents-test` 跑**两个** agent-runner 容器(0/1),**各自
+独立数据卷**(`feedling_agent_runtime_r0/r1`);per-user 聊天 checkpoint 存在卷里、**不在 lease 行**,
+所以 lease 从一个 runner 漂到另一个时,会从另一卷的**陈旧 checkpoint** 重放并 wedge。线上 runner
+(`docker-compose.phala.prod.runner.yaml`)本就是**单 runner 单卷**,不犯此病。
+
+两处修复:
+1. **测试 runner 改单节点**(`deploy/docker-compose.phala.runner.yaml`):2 runner→1 `agent-runner`、
+   全新卷 `feedling_agent_runtime_runner`(对齐线上;新卷顺带清掉旧陈旧 checkpoint)。test/prod compose
+   分开,不影响线上。CI 的镜像 pin 用全局 sed 匹配,单服务不受影响。
+2. **wedge 根因**(`tools/chat_resident_consumer.py`):认领消息持续取不到时不再无限重试——同一 cursor
+   连续 `CHAT_POLL_WEDGE_SKIP_AFTER`(默认 5)次 miss 后,`_advance_past_unfetchable` 把 cursor 推过这批
+   认领消息的最大 ts(边界情况 nudge `+1e-3`),跳过解不出的消息、放行后续。有界重试保留了瞬时解密抖动
+   的自愈窗口。纯函数 + 两个单测。1512 passed。
+
+### [BLOCKER→FIXED] 图片修复不完整:thinking-claude 命令漏了 Read 授权（claude 仍看不到图）
+
+### [BLOCKER→FIXED] 图片修复不完整:thinking-claude 命令漏了 Read 授权（claude 仍看不到图）
+
+PR #40 合并部署后,用户切 anthropic/claude-sonnet-4-5 实测**仍"没获得看图片的权限"**。
+SSH 进测试 runner CVM 读到实况:该 claude consumer 的 `--allowed-tools`(AGENT_CLI_CMD)里
+**没有 Read**,而 settings.json 里**有**——`claude -p` 下 `--allowed-tools` 覆盖 settings.json,
+故 Read 被拒。真因:除 `_default_cli_cmd` 外还有一条 **`_default_thinking_claude_cmd`**
+(stream-json/effort,`_claude_cli_should_stream_thinking` 判定 deepseek + anthropic 的
+sonnet-4/opus-4/3-7 走它),它仍用 `_io_cli_allow_rules`(无 Read)——#40 只补了非 thinking 分支
+与 settings.json,漏了这条。修:thinking 分支也改用 `_claude_allow_rules(io_cli, home)`
+(`spawners.py`,一行 + 两个 thinking 测试加 Read 断言)。三处 claude 授权点(非thinking/thinking/
+settings)现已统一带图片 Read。教训:改 claude 授权要覆盖**所有** claude 命令 builder。1487 passed。
+
+## 2026-07-03
+
+### [DONE] 聊天 AI「看不到图片/截图/屏幕共享」— cli 路径像素从没喂进模型（API+VPS 双中招）
+
+**真因**:托管(API)+ VPS 用户跑同一份 `chat_resident_consumer.py`,在 `AGENT_MODE=cli`
+下,图片虽已解密落盘(`IMAGE_TEMP_DIR={home}/images`)、路径也下传,但**像素从没作为
+多模态输入到达模型**。`_prepare_cli_command` 只在模板含 `{image_path}` token 时附图,否则
+退化到 `_message_for_agent`——把**文件路径当纯文本**塞进 prompt。而两个 driver 的默认命令
+都不含该 token:codex(`codex exec … {message}`)从不带 `-i`;claude(`claude -p`)的
+`--allowed-tools` 只有 io_cli 动词、**无 Read**,`-p` 非交互下打不开那个图片文件。结果模型
+只看到一句路径字符串,如实回答"看不到图"。`usr_6d8c6387242778cb` 报的「API 屏幕共享看不到
+内容」即此。
+
+**改了什么**(分支 `fix/chat-images-cli-vision`,PR #40 → test):
+- **codex**(`tools/chat_resident_consumer.py`):`_prepare_cli_command` 检测 codex 命令且有
+  图时,注入 `_inject_codex_images`——按图加 **`--image=<path>`**(codex 原生 vision 输入),插在
+  `exec` 子命令后。用 `=` 绑定单值而非裸 `-i <path>`,否则 clap 的变参 `--image <FILE>...` 会把
+  紧跟的 positional prompt 当成第二个图片值吞掉(精简模板 `codex exec {message}` 会丢消息——Codex
+  review P2 抓到)。同时**跳过**误导性的路径文本(codex 直接拿到像素)。已含 `-i`/`--image`/
+  `{image_path}` 的自配模板不双注入。修复托管 + VPS codex,VPS 零配置。
+- **claude**(`backend/agent_runtime/spawners.py`):默认 `--allowed-tools` 与 `settings.json`
+  的 allowlist 加 `Read({home}/images/**)`(`_claude_allow_rules` = io_cli 动词 + 图片 Read),
+  紧扣 IMAGE_TEMP_DIR、最小授权,让 `claude -p` 能打开被注入路径的图。自配 `cli_cmd` 的 VPS
+  用户需自己加(README 已说明)。
+- **文档**:`tools/README.md` 补 CLI 模式"怎么让模型真看到图"一节 + 屏幕帧 `on_mention` 触发词/
+  `SCREEN_CONTEXT_MODE=always` 说明。
+- 测试:`tests/test_chat_resident_consumer.py`(codex `--image=` 注入 + prompt 不被吞 + 自配
+  `-i` 不双注入)、`tests/test_agent_runtime_spawners.py`(默认 claude cmd + settings.json 含图片
+  Read)。rebase 到 test 后全量 `tests/` 通过。
+
+**没改**(刻意):屏幕 `SCREEN_CONTEXT_MODE=on_mention` 默认与触发正则——正则已很宽(屏幕/共享/
+画面/看到/这个/screen/share/look at…),`always` 有隐私/token 成本,真凶是上面的像素投递,已修。
+仅文档化。
+
 ## 2026-07-02
 
 ### [DONE] 非官方托管模型如实报自身模型（identity honesty，未部署未提交）

@@ -17,6 +17,8 @@ def test_relationship_days_use_calendar_dates_and_memory_anchor(tmp_path, monkey
 
     import backend.app as app
 
+    from conftest import seed_user
+
     class FakeDatetime(datetime):
         @classmethod
         def now(cls, tz=None):
@@ -27,6 +29,7 @@ def test_relationship_days_use_calendar_dates_and_memory_anchor(tmp_path, monkey
     monkeypatch.setattr(identity_service, "datetime", FakeDatetime)
     # Moments now live in PostgreSQL (see backend/db.py), so seed them through
     # the persistence layer instead of writing a memory.json file.
+    seed_user("usr_test")
     app.db.memory_replace_all("usr_test", [
         {"id": "m1", "occurred_at": "2026-04-10T09:00:00"},
         {"id": "m2", "occurred_at": "2026-04-12T09:00:00"},

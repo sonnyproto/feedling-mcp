@@ -23,8 +23,10 @@ MVP = `perception`. send / wait-for-wake / schedule-wake / photo are phase 2 and
 currently return a clean "not implemented" JSON so the agent degrades gracefully.
 """
 import argparse
+import base64
 import json
 import os
+import re
 import ssl
 import sys
 import urllib.error
@@ -49,6 +51,43 @@ PHASE2_VERBS = ("send", "wait-for-wake")
 def _emit(obj, code=0):
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
     sys.exit(code)
+
+
+def _materialize_decrypted_image(prefix, body):
+    """Turn a decrypt response's inline base64 image into a FILE the agent can Read.
+
+    A vision CLI agent (claude via its Read tool; codex via native file open) sees
+    an image only from a local file — an ``image_b64`` blob printed on stdout is
+    just useless (undecodable) text and bloats the tool output. So when a
+    ``*/decrypt?include_image=true`` body carries pixels, write them into
+    ``IMAGE_TEMP_DIR`` (the same dir the consumer decrypts chat images to, so the
+    claude command's ``--add-dir`` / ``Read(//…/images/**)`` grant already covers
+    it) and return a copy of ``body`` with ``image_b64`` swapped for an
+    ``image_file`` path + a Read hint. Non-dict / no image / write failure → return
+    the body unchanged so the tool still degrades to caption/OCR gracefully."""
+    if not isinstance(body, dict):
+        return body
+    b64 = body.get("image_b64")
+    if not isinstance(b64, str) or not b64.strip():
+        return body
+    raw_b64 = b64.split(",", 1)[1] if b64.startswith("data:") else b64
+    mime = str(body.get("image_mime") or "image/jpeg")
+    ext = ".png" if "png" in mime.lower() else ".jpg"
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(prefix))[:96] or "image"
+    image_dir = os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_images")
+    out = dict(body)
+    try:
+        os.makedirs(image_dir, exist_ok=True)
+        path = os.path.join(image_dir, f"{safe}{ext}")
+        with open(path, "wb") as f:
+            f.write(base64.b64decode(raw_b64))
+    except Exception as e:  # pragma: no cover - defensive
+        out["image_error"] = f"could not save decrypted image: {e}"
+        return out
+    out.pop("image_b64", None)
+    out["image_file"] = path
+    out["image_hint"] = "Use the Read tool on image_file to view the pixels."
+    return out
 
 
 def _env(name):
@@ -255,6 +294,10 @@ def cmd_screen_read(args):
     qs = urllib.parse.urlencode({"include_image": include_image})
     status, body = _http_json("GET", f"{api_url}/v1/screen/frames/{frame_id}/decrypt?{qs}", auth)
     if status == 200:
+        if isinstance(body, dict):
+            # Save pixels to a file the agent can Read instead of dumping base64
+            # text it can't see (see _materialize_decrypted_image).
+            body = _materialize_decrypted_image(f"screen_{frame_id}", body)
         _emit({"ok": True, "frame_id": frame_id, **(body if isinstance(body, dict) else {"data": body})})
     _emit({"ok": False, "http_status": status, "frame_id": frame_id, "error": body}, 1)
 
@@ -294,10 +337,67 @@ def cmd_photo_read(args):
         if frame_id:
             qs = urllib.parse.urlencode({"include_image": "true"})
             istatus, ibody = _http_json("GET", f"{api_url}/v1/screen/frames/{frame_id}/decrypt?{qs}", auth)
-            out["image"] = ibody if istatus == 200 else {"error": ibody, "http_status": istatus}
+            if istatus == 200:
+                # Save pixels to a Read-able file rather than emitting base64 the
+                # vision model can't decode (see _materialize_decrypted_image).
+                out["image"] = (
+                    _materialize_decrypted_image(f"photo_{pid}", ibody)
+                    if isinstance(ibody, dict) else ibody
+                )
+            else:
+                out["image"] = {"error": ibody, "http_status": istatus}
         else:
             out["image"] = {"error": "no frame_id on photo content"}
     _emit(out)
+
+
+def cmd_chat_image(args):
+    """Pull ONE past chat message's decrypted image by id, saved as a Read-able file.
+
+    Chat-history images are NOT reachable via ``photo-read`` (that command hits the
+    perception photo library, not the chat feed). The recent-chat transcript that
+    gets injected into a turn shows historical image messages only as an
+    ``[image] … io_cli chat-image --id <id>`` placeholder — the pixels are never in
+    the transcript. This command lazily fetches the pixels of a specific past chat
+    image WHEN the agent actually needs them, instead of eagerly decrypting every
+    history image on every turn.
+
+    Decrypt source is the enclave's ``GET /v1/chat/history`` (same source the
+    resident consumer uses). It presents a dstack-gateway TEE cert the stdlib
+    client does not verify, so the call is made insecure=True (mirrors the
+    consumer's verify=False)."""
+    enclave_url = _env("FEEDLING_ENCLAVE_URL")
+    auth = _auth_headers()
+    mid = (args.message_id or "").strip()
+    if not enclave_url or not auth:
+        _emit({"ok": False, "error": "missing FEEDLING_ENCLAVE_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+    if not mid:
+        _emit({"ok": False, "error": "chat-image needs --id <message_id> (from the [image] placeholder in the recent-chat transcript)"}, 2)
+    qs = urllib.parse.urlencode({"since": 0, "limit": args.limit})
+    status, body = _http_json("GET", f"{enclave_url}/v1/chat/history?{qs}", auth, insecure=True)
+    if status != 200:
+        _emit({"ok": False, "http_status": status, "message_id": mid, "error": body}, 1)
+    messages = (body.get("messages") or body.get("history") or []) if isinstance(body, dict) else []
+    msg = next((m for m in messages if isinstance(m, dict) and str(m.get("id") or "") == mid), None)
+    if not msg:
+        _emit({
+            "ok": False,
+            "message_id": mid,
+            "error": "message not found in recent history",
+            "hint": f"only the {args.limit} most recent messages are searched; raise --limit if the image is older",
+        }, 1)
+    if not msg.get("image_b64"):
+        _emit({
+            "ok": True,
+            "message_id": mid,
+            "role": msg.get("role"),
+            "content": msg.get("content"),
+            "note": "this message has no image (text-only turn)",
+        })
+    # Save pixels to a Read-able file rather than emitting base64 the vision model
+    # can't decode (see _materialize_decrypted_image).
+    out = _materialize_decrypted_image(f"chat_{mid}", msg)
+    _emit({"ok": True, "message_id": mid, **(out if isinstance(out, dict) else {"data": out})})
 
 
 def _identity_write_payload(self_introduction, signature):
@@ -392,7 +492,7 @@ def main():
 
     sd = sub.add_parser("screen-read", help="Decrypted screen frame caption/ocr (pixels off by default).")
     sd.add_argument("--frame-id", dest="frame_id", default="", help="frame id; default = latest")
-    sd.add_argument("--include-image", dest="include_image", action="store_true", help="include base64 JPEG (large)")
+    sd.add_argument("--include-image", dest="include_image", action="store_true", help="save decrypted frame to a file; returns image_file path to Read")
     sd.set_defaults(func=cmd_screen_read)
 
     pr = sub.add_parser("photo-recent", help="Recent photo metadata (scene/time; no raw pixels).")
@@ -401,8 +501,13 @@ def main():
 
     pd = sub.add_parser("photo-read", help="One specific photo's details by id (metadata + optional image).")
     pd.add_argument("--id", dest="photo_id", required=True, help="photo id (from photo-recent)")
-    pd.add_argument("--include-image", dest="include_image", action="store_true", help="include decrypted base64 JPEG (large)")
+    pd.add_argument("--include-image", dest="include_image", action="store_true", help="save decrypted photo to a file; returns image_file path to Read")
     pd.set_defaults(func=cmd_photo_read)
+
+    ci = sub.add_parser("chat-image", help="Pull one PAST chat message's image by id (saves a file to Read).")
+    ci.add_argument("--id", dest="message_id", required=True, help="chat message id (from the [image] placeholder in the transcript)")
+    ci.add_argument("--limit", type=int, default=20, help="how many recent messages to search for the id")
+    ci.set_defaults(func=cmd_chat_image)
 
     sw = sub.add_parser("schedule-wake", help="Ask to be woken at a later time (native self-wake).")
     sw.add_argument("--at", required=True, help="When to wake: ISO time (e.g. 2026-06-29T18:00) or a relative spec.")

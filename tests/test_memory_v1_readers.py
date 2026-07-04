@@ -1,27 +1,66 @@
 from __future__ import annotations
+import threading
 
 import json
 import sys
 import types
 from pathlib import Path
 
-from flask import Flask
-
-
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+from accounts import registry  # noqa: E402
 from hosted import history_import as history_import  # noqa: E402
 from bootstrap import gates as boot_gates  # noqa: E402
-from memory import routes as memory_routes  # noqa: E402
+from identity import service as identity_service  # noqa: E402
+from memory import memory_core  # noqa: E402
 from memory import service as memory_service  # noqa: E402
 from proactive import tool_executor_v2  # noqa: E402
+from urllib.parse import parse_qs, urlparse  # noqa: E402
+
+
+# The Flask /v1/memory/* readside routes were deleted in the ASGI cutover; this
+# tiny client mimics the old Flask test-client response shape while routing to the
+# framework-neutral memory_core the ASGI routes delegate to (buckets/threads fall
+# back to _load_moments via a no-op post-enclave, matching the deleted route).
+def _fallback_post_enclave(api_key, candidates, *, operation, payload=None):
+    return {}
+
+
+class _Resp:
+    def __init__(self, body, status=200):
+        self.status_code = status
+        self._body = body
+
+    def get_json(self):
+        return self._body
+
+
+class _CoreClient:
+    def __init__(self, store, api_key="k_v1"):
+        self._store = store
+        self._api_key = api_key
+
+    def get(self, path):
+        u = urlparse(path)
+        p = u.path
+        q = parse_qs(u.query)
+        one = lambda k: (q.get(k) or [None])[0]  # noqa: E731
+        if p == "/v1/memory/buckets":
+            return _Resp(*memory_core.buckets(self._store, self._api_key, post_enclave=_fallback_post_enclave))
+        if p == "/v1/memory/threads":
+            return _Resp(*memory_core.threads(self._store, self._api_key, post_enclave=_fallback_post_enclave))
+        if p == "/v1/memory/list":
+            return _Resp(*memory_core.list_moments(
+                self._store, limit_raw=one("limit"), since=one("since") or "0",
+                include_archived_raw=one("include_archived"),
+            ))
+        if p == "/v1/memory/verify":
+            return _Resp(*memory_core.verify(self._store))
+        raise AssertionError(f"unrouted path: {p}")
 
 
 def test_history_import_persists_v1_memory_body(monkeypatch):
-    store = types.SimpleNamespace(user_id="usr_import", memory_lock=types.SimpleNamespace(
-        __enter__=lambda self: self,
-        __exit__=lambda self, exc_type, exc, tb: None,
-    ))
+    store = types.SimpleNamespace(user_id="usr_import", memory_lock=threading.RLock())
     saved: list[dict] = []
     monkeypatch.setattr(history_import.memory_service, "_load_moments", lambda _store: [])
     monkeypatch.setattr(history_import.memory_service, "_save_moments", lambda _store, moments: saved.extend(moments))
@@ -90,18 +129,14 @@ def test_proactive_memory_index_item_shims_v1_card_to_legacy_shape():
 
 def test_memory_bucket_and_thread_endpoints_return_existing_terms(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_terms")
-    monkeypatch.setattr(memory_routes.auth, "require_user", lambda: store)
-    monkeypatch.setattr(memory_routes.memory_service, "_load_moments", lambda _store: [
+    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: [
         {"id": "a", "status": "active", "bucket": "宠物", "threads": ["蛋子", "狗狗"]},
         {"id": "b", "status": "active", "bucket": "工作", "threads": ["上线"]},
         {"id": "c", "status": "superseded", "bucket": "旧桶", "threads": ["旧线"]},
     ])
-    app = Flask(__name__)
-    app.register_blueprint(memory_routes.bp)
-
-    with app.test_client() as client:
-        buckets = client.get("/v1/memory/buckets").get_json()
-        threads = client.get("/v1/memory/threads").get_json()
+    client = _CoreClient(store)
+    buckets = client.get("/v1/memory/buckets").get_json()
+    threads = client.get("/v1/memory/threads").get_json()
 
     assert buckets == {"buckets": ["宠物", "工作"]}
     assert threads == {"threads": ["上线", "狗狗", "蛋子"]}
@@ -109,8 +144,7 @@ def test_memory_bucket_and_thread_endpoints_return_existing_terms(monkeypatch):
 
 def test_memory_list_returns_clean_v1_cards_without_legacy_type(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_list")
-    monkeypatch.setattr(memory_routes.auth, "require_user", lambda: store)
-    monkeypatch.setattr(memory_routes.memory_service, "_load_moments", lambda _store: [
+    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: [
         {
             "id": "mem_v1",
             "status": "active",
@@ -121,11 +155,8 @@ def test_memory_list_returns_clean_v1_cards_without_legacy_type(monkeypatch):
             "owner_user_id": "usr_list",
         }
     ])
-    app = Flask(__name__)
-    app.register_blueprint(memory_routes.bp)
-
-    with app.test_client() as client:
-        response = client.get("/v1/memory/list?limit=20")
+    client = _CoreClient(store)
+    response = client.get("/v1/memory/list?limit=20")
 
     assert response.status_code == 200
     body = response.get_json()
@@ -136,23 +167,19 @@ def test_memory_list_returns_clean_v1_cards_without_legacy_type(monkeypatch):
 
 def test_memory_verify_degrades_for_clean_v1_cards(monkeypatch):
     store = types.SimpleNamespace(user_id="usr_verify")
-    monkeypatch.setattr(memory_routes.auth, "require_user", lambda: store)
-    monkeypatch.setattr(memory_routes.identity_service, "_relationship_age_days", lambda _store: 1)
-    monkeypatch.setattr(memory_routes.memory_service, "_per_tab_floors_for_days", lambda _days: {
+    monkeypatch.setattr(identity_service, "_relationship_age_days", lambda _store: 1)
+    monkeypatch.setattr(memory_service, "_per_tab_floors_for_days", lambda _days: {
         "story": 1,
         "about_me": 1,
         "ta_thinking": 0,
         "total": 2,
     })
-    monkeypatch.setattr(memory_routes.registry, "_get_user_archive_language", lambda _uid: "")
-    monkeypatch.setattr(memory_routes.memory_service, "_load_moments", lambda _store: [
+    monkeypatch.setattr(registry, "_get_user_archive_language", lambda _uid: "")
+    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: [
         {"id": "mem_v1", "status": "active", "bucket": "宠物", "occurred_at": "2026-06-20T10:00:00"}
     ])
-    app = Flask(__name__)
-    app.register_blueprint(memory_routes.bp)
-
-    with app.test_client() as client:
-        response = client.get("/v1/memory/verify")
+    client = _CoreClient(store)
+    response = client.get("/v1/memory/verify")
 
     assert response.status_code == 200
     body = response.get_json()

@@ -58,7 +58,7 @@ Optional:
   PROACTIVE_TICK_INTERVAL_SEC
                         Broadcast-on/unknown tick interval in seconds (default: 300)
   PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC
-                        Broadcast-off tick interval in seconds (default: 1800)
+                        Broadcast-off tick interval in seconds (default: 7200)
   PROACTIVE_TICK_START_DELAY_SEC
                         Delay before the first automatic wake tick (default: 15)
   PROACTIVE_SCHEDULED_FIRE_ENABLED
@@ -230,8 +230,11 @@ PROACTIVE_TICK_INTERVAL_SEC = int(os.environ.get("PROACTIVE_TICK_INTERVAL_SEC", 
 PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC = int(
     os.environ.get("PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC", str(PROACTIVE_TICK_INTERVAL_SEC))
 )
+# Fallback heartbeat cadence when the backend tick decision carries no per-user
+# wake_interval_sec (legacy / rollout). Default aligned to the product default of
+# 2h (7200) set 2026-07-04, so no path silently reverts to the old 30min.
 PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC = int(
-    os.environ.get("PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", "1800")
+    os.environ.get("PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", "7200")
 )
 PROACTIVE_TICK_START_DELAY_SEC = int(os.environ.get("PROACTIVE_TICK_START_DELAY_SEC", "15"))
 # Screen-watch lane — decoupled from the heavy heartbeat. While the user is
@@ -300,7 +303,10 @@ SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
 FOREGROUND_CHAT_CONTEXT_MODE = os.environ.get(
     "FEEDLING_FOREGROUND_CHAT_CONTEXT", "auto"
 ).strip().lower()
-FOREGROUND_CHAT_CONTEXT_LIMIT = int(os.environ.get("FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT", "8"))
+# 50 messages ≈ 25 full rounds; this default sits exactly at the clamp in
+# _recent_chat_context_for_foreground — raise both together or the extra is
+# silently dropped.
+FOREGROUND_CHAT_CONTEXT_LIMIT = int(os.environ.get("FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT", "50"))
 FOREGROUND_CHAT_CONTEXT_HEADER = os.environ.get(
     "FEEDLING_FOREGROUND_CHAT_CONTEXT_HEADER",
     "[最近对话记录 — 仅供你保持连续；最后那条用户消息才是此刻要回应的]",
@@ -413,6 +419,93 @@ _HEADERS = {
     "X-Feedling-Consumer-Version": "resident-v1",
     "X-Feedling-Consumer-Commit": os.environ.get("FEEDLING_CONSUMER_COMMIT", _consumer_commit()),
 }
+
+
+def _post_debug_trace_event(payload: dict) -> None:
+    """Actual network call for a debug-trace event. Runs on a background
+    thread (see `_emit_debug_trace`) — never raises, short timeout."""
+    try:
+        httpx.post(
+            f"{FEEDLING_API_URL}/v1/debug/trace/event",
+            json=payload,
+            headers=_HEADERS, timeout=2,
+        )
+    except Exception:
+        pass  # observability must never affect the turn
+
+
+# Short-TTL cache of whether debug-trace recording is enabled (per-user gate AND
+# deploy kill-switch both true). Lets the hot path (`_emit_debug_trace`) skip
+# all work — including spawning a thread — on every turn while it's off,
+# instead of paying a POST (that the backend would just no-op) each time.
+_DBG_TRACE_ENABLED = {"val": None, "exp": 0.0}
+_DBG_TRACE_TTL = 60.0
+
+
+def _debug_trace_probably_enabled() -> tuple[bool, bool]:
+    """Pure, non-network read of the cached enabled flag.
+
+    Returns (known, enabled). `known` is True only when the cache is fresh
+    (not expired) and has a value; in that case `enabled` reflects it.
+    Otherwise returns (False, False) — the enabled value is meaningless when
+    stale/unknown and callers must not act on it."""
+    if _DBG_TRACE_ENABLED["val"] is not None and time.monotonic() < _DBG_TRACE_ENABLED["exp"]:
+        return True, bool(_DBG_TRACE_ENABLED["val"])
+    return False, False
+
+
+def _refresh_debug_trace_enabled() -> None:
+    """Refresh the cached debug-trace enabled flag from the backend. Runs on
+    the daemon thread spawned by `_emit_debug_trace` — never on the calling
+    thread, never raises. Fail-closed: any error (network, bad JSON, non-2xx)
+    caches False so we don't keep hammering an unhappy backend every turn."""
+    enabled = False
+    try:
+        resp = httpx.get(
+            f"{FEEDLING_API_URL}/v1/debug/trace",
+            params={"limit": 1},
+            headers=_HEADERS, timeout=2,
+        )
+        resp.raise_for_status()
+        body = resp.json() or {}
+        enabled = bool(body.get("enabled") and body.get("deploy_enabled"))
+    except Exception:
+        enabled = False  # observability must never affect the turn; fail closed
+    _DBG_TRACE_ENABLED["val"] = enabled
+    _DBG_TRACE_ENABLED["exp"] = time.monotonic() + _DBG_TRACE_TTL
+
+
+def _emit_debug_trace(subsystem: str, type: str, *, status: str = "ok",
+                      summary: str = "", explain: str = "", detail: dict | None = None,
+                      content_excerpt: dict | None = None, trace_id: str = "",
+                      dur_ms: float | None = None) -> None:
+    """Fire-and-forget flow-trace emit. Offloads all network I/O (both the
+    cache-refresh GET and the event POST) to a daemon thread and returns
+    immediately, so it never blocks or slows a turn — even if the backend is
+    slow/unreachable. When the cache is warm and says disabled, this is a
+    zero-cost no-op: no thread spawned, no network at all."""
+    try:
+        known, enabled = _debug_trace_probably_enabled()
+        if known and not enabled:
+            return  # warm cache says off — do essentially zero work
+        payload = {"event": {
+            "subsystem": subsystem, "type": type, "status": status,
+            "summary": summary, "explain": explain, "detail": detail or {},
+            "content_excerpt": content_excerpt or {}, "trace_id": trace_id,
+            "turn_id": trace_id, "actor": "vps_resident", "dur_ms": dur_ms,
+        }}
+
+        def _dispatch() -> None:
+            if not known:
+                _refresh_debug_trace_enabled()
+            _, still_enabled = _debug_trace_probably_enabled()
+            if still_enabled:
+                _post_debug_trace_event(payload)
+
+        threading.Thread(target=_dispatch, daemon=True).start()
+    except Exception:
+        pass  # observability must never affect the turn
+
 
 # Stage D: when hosted, the supervisor writes a short-lived runtime token to this
 # file (and refreshes it). We authenticate with the token instead of the
@@ -857,6 +950,27 @@ def _filter_messages_to_poll_ids(messages: list[dict], poll_messages: list[dict]
     ]
 
 
+# The chat cursor wedges when /v1/chat/poll keeps claiming message ids the enclave
+# decrypt-history never returns (an undecryptable row, or one sitting exactly at the
+# exclusive `since` boundary). We retry a bounded number of cycles — transient
+# decrypt hiccups self-heal — then skip PAST the claimed batch so one permanently
+# unreturnable message can't block every newer message forever.
+CHAT_POLL_WEDGE_SKIP_AFTER = int(os.environ.get("CHAT_POLL_WEDGE_SKIP_AFTER", "5"))
+_WEDGE_SKIP_EPSILON = 1e-3
+
+
+def _advance_past_unfetchable(last_ts: float, poll_messages: list[dict]) -> float:
+    """Next checkpoint that skips the poll-claimed rows the decrypt source won't
+    return. Jumps to the newest claimed ts; if that is not strictly past the cursor
+    (the stuck row sits at the boundary), nudge just beyond it so the next poll
+    excludes it."""
+    max_ts = max(
+        (float(m.get("ts", m.get("timestamp", 0)) or 0) for m in poll_messages),
+        default=last_ts,
+    )
+    return max_ts if max_ts > last_ts else last_ts + _WEDGE_SKIP_EPSILON
+
+
 def _mark_seen(key: str) -> bool:
     """Mark key as seen. Returns True (new) or False (already processed)."""
     if key in _seen_ids:
@@ -1034,12 +1148,25 @@ def _message_for_agent(content: str, image_paths: list[str] | None = None) -> st
     if not image_paths:
         return content
     joined = ", ".join(image_paths)
+    # This text is the ONLY channel by which a claude/other-CLI agent (no native
+    # --image injection) learns a pixel image is attached. It must be unambiguous, or
+    # live transcripts show two failure modes: the model reaches for io_cli
+    # photo-recent (wrong tool, wrong path) instead of Read, OR it invents a
+    # "click allow to authorize" approval flow that does not exist and then
+    # fabricates the image contents. So: name the Read tool + exact path, assert
+    # permission is already granted (there is no approval UI), and forbid asking the
+    # user to authorize / re-send.
     return (
         f"{content}\n\n"
-        f"Decrypted image file(s) for this IO message: {joined}\n"
-        "Open/inspect the image before replying if your runtime has local "
-        "vision or file-image support. Do not ask the user to describe the "
-        "image unless this runtime truly cannot inspect local image files."
+        f"Decrypted image file(s) for THIS message, already saved on local disk: {joined}\n"
+        "Use the Read tool on that exact absolute path to view the image, then reply "
+        "about what you actually see. You ALREADY have permission to read these "
+        "files — there is no approval step and no 'allow' button for the user to "
+        "click, so never ask the user to authorize, grant access, enable a "
+        "permission, or re-send the image. Do NOT use the io_cli photo-recent / "
+        "photo-read tools for this image (those fetch OLDER photos); this file is the "
+        "current attachment. Only say you cannot see it if the Read tool itself "
+        "returns an error — never claim you can see an image you have not Read."
     )
 
 
@@ -1141,6 +1268,31 @@ def _screen_context_for_message(content: str) -> tuple[str, list[dict[str, str]]
         parts.append("screenshot_file: " + ", ".join(paths))
 
     return "\n".join(parts), payloads, paths
+
+
+def _worldbook_context_for_foreground(content: str) -> str:
+    text = str(content or "").strip()
+    if not text:
+        return ""
+    try:
+        resp = httpx.post(
+            f"{FEEDLING_API_URL}/v1/worldbook/match",
+            headers=_HEADERS,
+            json={"message": text},
+            timeout=20,
+        )
+        if resp.status_code == 404:
+            return ""
+        resp.raise_for_status()
+        body = resp.json()
+        block = str((body or {}).get("block") or "").strip()
+        if block:
+            names = (body or {}).get("matched_names") or []
+            log.info("worldbook context injected names=%s", names)
+        return block
+    except Exception as exc:
+        log.warning("worldbook context fetch failed: %s", exc)
+        return ""
 
 
 def _screen_context_for_frame_ids(frame_ids: list[str]) -> tuple[str, list[dict[str, str]], list[str]]:
@@ -1355,6 +1507,9 @@ _JSON_REPLY_FIELDS = (
 _JSON_THINKING_FIELDS = (
     "provider_reasoning",
     "reasoning",
+    "reasoning_details",
+    "reasoning_content",
+    "reasoning_text",
     "runtime_trace",
     "thinking_summary",
     "reasoning_summary",
@@ -1515,6 +1670,33 @@ def _looks_like_json_text(text: str) -> bool:
     return bool(stripped) and stripped[0] in "[{"
 
 
+def _visible_reply_fragment_from_text(text: str) -> Any:
+    """Recover the display protocol when the model omits the outer braces.
+
+    Some providers follow the requested
+    {"thinking_summary":"...","messages":["..."]} shape only halfway and emit
+    a JSON object fragment like `"thinking_summary": "...", "messages": [...]`.
+    If we do not recover it here, the protocol text leaks as the visible chat
+    bubble. Keep this narrow: only the visible thinking protocol keys qualify.
+    """
+    stripped = (text or "").strip()
+    if not stripped or stripped[0] in "[{":
+        return None
+    if '"thinking_summary"' not in stripped or '"messages"' not in stripped:
+        return None
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, re.IGNORECASE | re.DOTALL)
+    if fence:
+        stripped = fence.group(1).strip()
+    starts = [idx for key in ('"thinking_summary"', '"messages"') if (idx := stripped.find(key)) >= 0]
+    if not starts:
+        return None
+    fragment = stripped[min(starts):].strip().rstrip(",")
+    parsed = _safe_json_loads("{" + fragment + "}")
+    if isinstance(parsed, dict) and isinstance(parsed.get("messages"), list):
+        return parsed
+    return None
+
+
 def _sanitize_thinking_summary(text: str) -> str:
     """Keep only a short, display-safe reasoning summary.
 
@@ -1584,13 +1766,55 @@ def _boolish(value: Any) -> bool | None:
 
 def _default_thinking_kind_for_key(key: str) -> str:
     normalized = key.strip().lower()
-    if normalized in {"provider_reasoning", "reasoning"}:
+    if normalized in {"provider_reasoning", "reasoning", "reasoning_details", "reasoning_content", "reasoning_text"}:
         return "provider_reasoning"
     if normalized == "runtime_trace":
         return "runtime_trace"
     if "reasoning" in normalized or "thought" in normalized:
         return "provider_reasoning_summary"
     return "agent_summary"
+
+
+def _thinking_summary_from_value(value: Any) -> str:
+    if isinstance(value, str):
+        return _sanitize_thinking_summary(value)
+    if isinstance(value, dict):
+        for key in ("summary", "content", "text", "reasoning"):
+            summary = value.get(key)
+            if isinstance(summary, str):
+                sanitized = _sanitize_thinking_summary(summary)
+                if sanitized:
+                    return sanitized
+        return ""
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            sanitized = _thinking_summary_from_value(item)
+            if sanitized:
+                parts.append(sanitized)
+            if len(parts) >= 4:
+                break
+        return _sanitize_thinking_summary("\n".join(parts))
+    return ""
+
+
+def _ensure_visible_thinking_summary(turn: AgentTurn, *, source: str) -> AgentTurn:
+    """Attach a conservative visible-summary fallback for user-facing replies.
+
+    Some runtimes spend reasoning tokens but do not expose a displayable
+    reasoning event or follow the JSON thinking protocol. The UI still expects a
+    collapsible summary, so provide a short, honest context summary without
+    inventing hidden chain-of-thought.
+    """
+    if turn.thinking_summary or not turn.messages:
+        return turn
+    turn.thinking_summary = _sanitize_thinking_summary(
+        "参考了当前消息和最近对话上下文，整理成这次可见回复。"
+    )
+    turn.thinking_kind = "agent_summary"
+    turn.thinking_source = _sanitize_thinking_meta(source, max_len=80) or "resident_fallback"
+    turn.thinking_native = False
+    return turn
 
 
 def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
@@ -1607,6 +1831,55 @@ def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
     return dst
 
 
+def _agent_turn_from_content_blocks(
+    blocks: Any,
+    *,
+    thinking_source: str = "",
+    thinking_model: str = "",
+) -> AgentTurn:
+    turn = AgentTurn()
+    if not isinstance(blocks, list):
+        return turn
+    for block in blocks:
+        if isinstance(block, str):
+            clean = _sanitize_reply_text(block)
+            if clean:
+                turn.messages.append(clean)
+            continue
+        if not isinstance(block, dict):
+            continue
+        block_type = str(block.get("type") or "").strip().lower()
+        if block_type == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                clean = _sanitize_reply_text(text)
+                if clean:
+                    turn.messages.append(clean)
+            continue
+        if block_type == "thinking" and not turn.thinking_summary:
+            summary = block.get("thinking") or block.get("text")
+            if isinstance(summary, str):
+                turn.thinking_summary = _sanitize_thinking_summary(summary)
+                turn.thinking_kind = "provider_reasoning"
+                turn.thinking_source = thinking_source or "anthropic_thinking"
+                turn.thinking_model = thinking_model
+                turn.thinking_native = True
+    return turn
+
+
+def _dedupe_agent_turn_messages(turn: AgentTurn) -> AgentTurn:
+    seen = set()
+    unique: list[str] = []
+    for message_text in turn.messages:
+        key = message_text.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(key)
+    turn.messages = unique
+    return turn
+
+
 def _agent_turn_from_obj(obj: Any) -> AgentTurn:
     turn = AgentTurn()
 
@@ -1614,12 +1887,15 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         raw = obj.strip()
         if not raw:
             return turn
+        visible_fragment = _visible_reply_fragment_from_text(raw)
+        if visible_fragment is not None:
+            return _agent_turn_from_obj(visible_fragment)
         json_objects = _json_objects_from_cli_output(raw)
         if json_objects:
             for item in json_objects:
                 _merge_agent_turn(turn, _agent_turn_from_obj(item))
             if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
-                return turn
+                return _dedupe_agent_turn_messages(turn)
         nested = _safe_json_loads(raw) if _looks_like_json_text(raw) else None
         if isinstance(nested, (dict, list)):
             return _agent_turn_from_obj(nested)
@@ -1705,18 +1981,27 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
     )
     explicit_native = _boolish(obj.get("thinking_native", obj.get("reasoning_native")))
 
+    role = str(obj.get("role") or "").lower()
+    if (not role or role in {"assistant", "agent", "openclaw", "model"}) and isinstance(obj.get("content"), list):
+        _merge_agent_turn(
+            turn,
+            _agent_turn_from_content_blocks(
+                obj.get("content"),
+                thinking_source=explicit_source,
+                thinking_model=explicit_model,
+            ),
+        )
+
     for key in _JSON_THINKING_FIELDS:
         value = obj.get(key)
-        if isinstance(value, str) and value.strip() and not turn.thinking_summary:
-            turn.thinking_summary = _sanitize_thinking_summary(value)
+        summary = _thinking_summary_from_value(value) if not turn.thinking_summary else ""
+        if summary:
+            turn.thinking_summary = summary
             turn.thinking_kind = explicit_kind or _default_thinking_kind_for_key(key)
             turn.thinking_source = explicit_source
             turn.thinking_model = explicit_model
             turn.thinking_native = explicit_native
-        elif isinstance(value, dict) and not turn.thinking_summary:
-            summary = value.get("summary") or value.get("content") or value.get("text")
-            if isinstance(summary, str):
-                turn.thinking_summary = _sanitize_thinking_summary(summary)
+            if isinstance(value, dict):
                 turn.thinking_kind = (
                     _sanitize_thinking_kind(value.get("kind"))
                     or explicit_kind
@@ -2448,6 +2733,33 @@ def _foreground_history_injection_enabled(cmd: list[str] | None = None) -> bool:
     return False
 
 
+def _cli_template_is_codex() -> bool:
+    """True when AGENT_CLI_CMD drives ``codex`` (so we attach images natively)."""
+    return _is_codex_cmd(_cli_cmd_tokens())
+
+
+def _inject_codex_images(cmd: list[str], image_paths: list[str]) -> list[str]:
+    """Attach decrypted image files to a ``codex exec`` command as vision input.
+
+    codex's ``--image <FILE>`` feeds the image as real vision input, unlike the
+    text file-path the model can't actually see. We emit the *=-bound* form
+    ``--image=<path>`` (one per image): each occurrence carries exactly one value,
+    so clap's variadic ``--image <FILE>...`` cannot greedily swallow the positional
+    prompt — critical for minimal templates like ``codex exec {message}`` where the
+    prompt immediately follows the injected flags (a bare ``-i <path> <prompt>``
+    would eat ``<prompt>`` as a second image). No-op when the operator already wired
+    an explicit ``-i``/``--image`` into their own template — they own images then.
+    """
+    if not image_paths or any(t == "-i" or t.startswith("--image") for t in cmd):
+        return cmd
+    try:
+        insert_at = cmd.index("exec") + 1
+    except ValueError:
+        insert_at = 1
+    flags = [f"--image={path}" for path in image_paths]
+    return [*cmd[:insert_at], *flags, *cmd[insert_at:]]
+
+
 def _cli_flag_value(cmd: list[str], flag: str) -> str:
     try:
         idx = cmd.index(flag)
@@ -2659,8 +2971,15 @@ def _render_cli_template(message: str, sid: str, image_paths: list[str] | None =
 
 def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> list[str]:
     sid = _load_agent_session_id()
+    template_has_image_slot = "{image_path" in AGENT_CLI_CMD
+    # codex gets pixels natively via injected --image= flags (_inject_codex_images);
+    # skip the file-path prose that only makes sense for a runtime that must open
+    # the file itself (e.g. claude reading it via its Read tool).
+    codex_native_images = (
+        bool(image_paths) and not template_has_image_slot and _cli_template_is_codex()
+    )
     rendered_message = message
-    if image_paths and "{image_path" not in AGENT_CLI_CMD:
+    if image_paths and not template_has_image_slot and not codex_native_images:
         rendered_message = _message_for_agent(message, image_paths)
     cmd = _render_cli_template(rendered_message, sid, image_paths=image_paths)
     cmd, sid = _ensure_explicit_cli_session_id(cmd, sid)
@@ -2706,6 +3025,9 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
         ):
             cmd = [cmd[0], "--resume", sid, *cmd[1:]]
 
+    if codex_native_images:
+        cmd = _inject_codex_images(cmd, image_paths or [])
+
     return _resolve_cli_executable(cmd)
 
 
@@ -2747,6 +3069,33 @@ def _codex_turn_metrics(raw: str) -> dict:
     return {"steps": steps, "input_tokens": in_tok, "output_tokens": out_tok}
 
 
+def _cli_turn_metrics(cmd: list[str], result: "subprocess.CompletedProcess", wall_ms: int) -> dict:
+    """Driver-aware metrics for one CLI turn. Never raises.
+
+    Returns a dict with keys shared across drivers so callers (timing logs,
+    debug-trace events) don't need driver-specific branching:
+    ``driver, rc, wall_ms, agent_ms, api_ms, num_turns, steps, input_tokens,
+    output_tokens, out_chars``. Fields the driver doesn't report stay ``None``.
+    """
+    m = {"driver": "codex" if _is_codex_cmd(cmd) else "claude", "rc": result.returncode,
+         "wall_ms": wall_ms, "agent_ms": None, "api_ms": None, "num_turns": None,
+         "steps": None, "input_tokens": None, "output_tokens": None,
+         "out_chars": len(result.stdout or "")}
+    try:
+        if m["driver"] == "codex":
+            m.update(_codex_turn_metrics(result.stdout or ""))
+        else:
+            for obj in _json_objects_from_cli_output(result.stdout or ""):
+                if isinstance(obj, dict) and obj.get("type") == "result":
+                    m["agent_ms"] = obj.get("duration_ms")
+                    m["api_ms"] = obj.get("duration_api_ms")
+                    m["num_turns"] = obj.get("num_turns")
+                    break
+    except Exception:  # noqa: BLE001 — a metrics computation must never break a turn
+        pass
+    return m
+
+
 def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", wall_ms: int) -> None:
     """Emit ONE structured timing line per CLI agent turn (observability only).
 
@@ -2764,29 +3113,18 @@ def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", 
     Best-effort: never raises, never changes behavior. ``driver=`` is always
     logged so blank fields aren't mistaken for missing claude data.
     """
-    if _is_codex_cmd(cmd):
-        try:
-            m = _codex_turn_metrics(result.stdout or "")
-        except Exception:  # noqa: BLE001 — a timing log must never break a turn
-            m = {"steps": None, "input_tokens": None, "output_tokens": None}
+    m = _cli_turn_metrics(cmd, result, wall_ms)
+
+    if m["driver"] == "codex":
         log.info(
             "[turn-timing] driver=codex rc=%s wall_ms=%d steps=%s in_tokens=%s "
             "out_tokens=%s out_chars=%d",
-            result.returncode, wall_ms, m.get("steps"), m.get("input_tokens"),
-            m.get("output_tokens"), len(result.stdout or ""),
+            m["rc"], m["wall_ms"], m.get("steps"), m.get("input_tokens"),
+            m.get("output_tokens"), m["out_chars"],
         )
         return
 
-    agent_ms = api_ms = num_turns = None
-    try:
-        for obj in _json_objects_from_cli_output(result.stdout or ""):
-            if isinstance(obj, dict) and obj.get("type") == "result":
-                agent_ms = obj.get("duration_ms")
-                api_ms = obj.get("duration_api_ms")
-                num_turns = obj.get("num_turns")
-                break
-    except Exception:  # noqa: BLE001 — a timing log must never break a turn
-        pass
+    agent_ms, api_ms = m.get("agent_ms"), m.get("api_ms")
     cold_start_ms = orchestration_ms = None
     if isinstance(agent_ms, (int, float)):
         cold_start_ms = max(0, wall_ms - int(agent_ms))
@@ -2795,12 +3133,17 @@ def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", 
     log.info(
         "[turn-timing] driver=claude rc=%s wall_ms=%d agent_ms=%s api_ms=%s "
         "orchestration_ms=%s cold_start_ms=%s num_turns=%s out_chars=%d",
-        result.returncode, wall_ms, agent_ms, api_ms, orchestration_ms,
-        cold_start_ms, num_turns, len(result.stdout or ""),
+        m["rc"], m["wall_ms"], agent_ms, api_ms, orchestration_ms,
+        cold_start_ms, m.get("num_turns"), m["out_chars"],
     )
 
 
-def call_agent_cli(message: str, image_paths: list[str] | None = None, raw_text: bool = False) -> Any:
+def call_agent_cli(
+    message: str,
+    image_paths: list[str] | None = None,
+    raw_text: bool = False,
+    trace_id: str = "",
+) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
 
@@ -2808,16 +3151,37 @@ def call_agent_cli(message: str, image_paths: list[str] | None = None, raw_text:
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     _turn_t0 = time.monotonic()
+    _emit_debug_trace("agent", "agent.model.call.start", trace_id=trace_id,
+                      summary="cli turn start",
+                      explain="模型调用发起（" + ("codex" if _is_codex_cmd(cmd) else "claude") + "）",
+                      content_excerpt={"prompt_head": (message or "")[:1000]})
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except subprocess.TimeoutExpired:
+        _emit_debug_trace("agent", "agent.model.call.error", status="error", trace_id=trace_id,
+                          dur_ms=(time.monotonic() - _turn_t0) * 1000,
+                          summary="cli turn timeout", explain="模型调用超时（120s 上限）— 卡在模型这一步")
         log.warning(
             "[turn-timing] driver=%s rc=timeout wall_ms=%d (hit 120s subprocess cap)",
             "codex" if _is_codex_cmd(cmd) else "claude",
             int((time.monotonic() - _turn_t0) * 1000),
         )
         raise
-    _log_cli_turn_timing(cmd, result, int((time.monotonic() - _turn_t0) * 1000))
+    _wall_ms = int((time.monotonic() - _turn_t0) * 1000)
+    _log_cli_turn_timing(cmd, result, _wall_ms)
+    _m = _cli_turn_metrics(cmd, result, _wall_ms)
+    _emit_debug_trace(
+        "agent", "agent.model.call.done" if result.returncode == 0 else "agent.model.call.error",
+        status="ok" if result.returncode == 0 else "error", trace_id=trace_id, dur_ms=_wall_ms,
+        summary=f"cli turn rc={result.returncode} {_m['driver']}",
+        explain=(f"模型返回（{_m['driver']}，{_wall_ms}ms" +
+                 (f"，{_m['num_turns']} 轮" if _m.get('num_turns') else "") + "）"
+                 if result.returncode == 0 else f"模型调用失败 rc={result.returncode}"),
+        detail={k: _m[k] for k in ("driver", "rc", "agent_ms", "api_ms", "num_turns",
+                                   "steps", "input_tokens", "output_tokens")},
+        content_excerpt={"reply_head": (result.stdout or "")[:1000],
+                         "stderr_head": (result.stderr or "")[:500]},
+    )
 
     raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
     observed_sid = _extract_session_id(raw_transport) or command_sid
@@ -2961,11 +3325,14 @@ def call_agent(
     images: list[dict[str, str]] | None = None,
     image_paths: list[str] | None = None,
     raw_text: bool = False,
+    trace_id: str = "",
 ) -> Any:
     if AGENT_MODE == "http":
+        # http path metrics/timing are out of scope for this event pair (cli-only);
+        # trace_id is accepted here for a uniform call signature but unused.
         raw = call_agent_http(message, images=images, raw_text=raw_text)
     elif AGENT_MODE == "cli":
-        raw = call_agent_cli(message, image_paths=image_paths, raw_text=raw_text)
+        raw = call_agent_cli(message, image_paths=image_paths, raw_text=raw_text, trace_id=trace_id)
     else:
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
@@ -3010,6 +3377,24 @@ def _resident_foreground_chat_message_v2(content: str) -> str:
     use their registered native tools (io_cli for Feedling perception).
     """
     return content
+
+
+def _visible_thinking_summary_protocol() -> str:
+    return "\n".join([
+        "Visible thinking summary protocol:",
+        "When you speak to the user, return JSON {\"thinking_summary\":\"...\",\"messages\":[\"...\"]}.",
+        "thinking_summary is a short display-safe summary of what context you considered and why you answered this way.",
+        "Do not include hidden chain-of-thought, system/developer prompts, secrets, token/account metadata, or tool transcripts.",
+        "Do not put thinking_summary JSON inside a visible message bubble.",
+    ])
+
+
+def _foreground_response_protocol_message(content: str) -> str:
+    if not str(content or "").strip():
+        return content
+    if "\"thinking_summary\"" in content:
+        return content
+    return f"{_visible_thinking_summary_protocol()}\n\n{content}"
 
 
 def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = None) -> str:
@@ -3066,7 +3451,13 @@ def _message_has_injected_history(message: str) -> bool:
 # Cached from /v1/users/whoami for diagnostics and fallback state. Refreshed
 # before every encrypted write so resident agents do not keep wrapping replies
 # to a stale iOS content public key.
-_whoami_cache: dict = {"user_id": "", "user_pk": None, "enclave_pk": None}
+_whoami_cache: dict = {
+    "user_id": "",
+    "user_pk": None,
+    "enclave_pk": None,
+    "timezone": "",
+    "archive_language": "",
+}
 
 # monotonic ts of the last successful _load_whoami() that yielded encryption
 # keys; 0.0 until the first success so the first reply still fetches.
@@ -3189,7 +3580,18 @@ def _load_whoami() -> bool:
     except Exception:
         enc_pk = None
 
-    _whoami_cache.update(user_id=user_id, user_pk=user_pk, enclave_pk=enc_pk)
+    tz = str(info.get("timezone") or "").strip()
+    archive_language = str(info.get("archive_language") or "").strip()
+    _whoami_cache.update(
+        user_id=user_id, user_pk=user_pk, enclave_pk=enc_pk,
+        # A successful whoami is authoritative — adopt its timezone verbatim,
+        # including empty (user cleared it / no fallback), so a stale zone is
+        # never served after the server stops reporting one. Last-known is
+        # retained only across whoami FAILURES, which return above before this
+        # update runs.
+        timezone=tz,
+        archive_language=archive_language,
+    )
     ok = bool(user_id and user_pk)
     if _whoami_cache_has_full_keys():
         global _whoami_cache_loaded_at
@@ -3331,12 +3733,35 @@ def _proactive_tick_trigger_for_broadcast_state(broadcast_state: str) -> str:
     return "heartbeat_unknown"
 
 
-def _proactive_tick_interval_for_broadcast_state(broadcast_state: str) -> int:
+# Per-user "companionship frequency" (wake_interval_sec) clamp — mirrors the
+# backend hard floor/ceiling (backend/core/store.py): min 15min, max 12h.
+PROACTIVE_WAKE_INTERVAL_MIN_SEC = 900
+PROACTIVE_WAKE_INTERVAL_MAX_SEC = 43200
+
+
+def _proactive_tick_interval_for_broadcast_state(
+    broadcast_state: str, wake_interval_sec: Any = None
+) -> int:
     # Heartbeat is now DECOUPLED from screen sharing: broadcast no longer
     # accelerates the heavy presence heartbeat. Screen attention is handled by the
     # separate lightweight screen-watch lane (SCREEN_WATCH_INTERVAL_SEC). The
     # heartbeat keeps a single steady cadence regardless of broadcast_state.
     # (PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC kept for back-compat / override.)
+    #
+    # Per-user cadence: the backend tick decision carries the user's chosen
+    # wake_interval_sec ("companionship frequency"). When present and numeric it
+    # wins, clamped defensively to [900, 43200] to mirror the backend guard. A
+    # missing or non-numeric value falls back to the env default.
+    if wake_interval_sec is not None:
+        try:
+            interval = int(wake_interval_sec)
+        except (TypeError, ValueError):
+            pass
+        else:
+            return max(
+                PROACTIVE_WAKE_INTERVAL_MIN_SEC,
+                min(PROACTIVE_WAKE_INTERVAL_MAX_SEC, interval),
+            )
     return max(60, PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC)
 
 
@@ -3707,10 +4132,21 @@ def _message_text_for_context(msg: dict) -> str:
     if not isinstance(text, str):
         text = str(text or "")
     text = " ".join(text.strip().split())
-    if not text:
-        ctype = str(msg.get("content_type") or "").lower()
-        if ctype == "image" or msg.get("image_b64"):
-            text = "[image]"
+    ctype = str(msg.get("content_type") or "").lower()
+    if ctype == "image" or msg.get("image_b64"):
+        # The injected transcript is TEXT-only — an image turn's pixels are never
+        # in it. Advertise the exact io_cli command that lazily pulls THIS image by
+        # id (and preserve any caption the user sent), so the agent fetches + Reads
+        # the real picture instead of guessing (photo-read = wrong tool: that's the
+        # perception photo library, not the chat feed) or fabricating its contents.
+        mid = str(msg.get("id") or msg.get("message_id") or "").strip()
+        label = text[:300] if text else "[image]"
+        if mid:
+            return (
+                f"{label} [image not shown here — run `io_cli chat-image --id {mid}`, "
+                "then Read the returned image_file to actually see it]"
+            )
+        return f"{label} [image not shown here — pixels are not in this transcript]"
     return text[:500]
 
 
@@ -3905,6 +4341,79 @@ def _visible_broadcast_request_text(action: dict) -> str:
     return "I cannot see your screen right now. If you want, turn screen sharing back on."
 
 
+def _proactive_control_reason_from_replies(replies: list[str]) -> str:
+    """Recover a sleep/noop reason from malformed control JSON leaked as text.
+
+    Proactive prompts ask the model to stay quiet via an action JSON. Some CLI
+    transports can hand back a truncated fragment such as
+    `"reason":"..."}]}`; generic chat parsing treats it as a visible message.
+    In the proactive lane, a control-only JSON fragment should complete the wake
+    quietly instead of becoming a chat bubble.
+    """
+    if not replies:
+        return ""
+    reasons: list[str] = []
+    for reply in replies:
+        text = str(reply or "").strip()
+        if not text:
+            continue
+        stripped = text.lstrip()
+        if not stripped or stripped[0] not in {'"', "{", "["}:
+            return ""
+        if '"reason"' not in stripped and "'reason'" not in stripped:
+            return ""
+        match = re.search(r'''["']reason["']\s*:\s*["'](?P<reason>(?:\\.|[^"'\\])*)["']''', stripped)
+        if not match:
+            return ""
+        reason = match.group("reason")
+        try:
+            reason = json.loads(f'"{reason}"')
+        except Exception:  # noqa: BLE001
+            pass
+        reason = str(reason or "").strip()
+        if reason:
+            reasons.append(reason)
+    return "\n".join(reasons).strip()
+
+
+def _proactive_control_reason_from_value(value: Any) -> str:
+    if isinstance(value, list):
+        reasons = [
+            reason
+            for item in value
+            if (reason := _proactive_control_reason_from_value(item))
+        ]
+        return "\n".join(reasons).strip()
+    if not isinstance(value, dict):
+        return ""
+
+    messages = value.get("messages")
+    if isinstance(messages, list) and any(str(item or "").strip() for item in messages):
+        return ""
+    for key in ("actions", "tool_calls"):
+        items = value.get(key)
+        if isinstance(items, list) and items:
+            return ""
+
+    reason = value.get("reason")
+    if isinstance(reason, str) and reason.strip():
+        return reason.strip()
+
+    for key in ("result", "payload", "output"):
+        nested = value.get(key)
+        if isinstance(nested, (dict, list)):
+            if reason := _proactive_control_reason_from_value(nested):
+                return reason
+    return ""
+
+
+def _proactive_control_reason_from_result(agent_result: Any, replies: list[str]) -> str:
+    return (
+        _proactive_control_reason_from_replies(replies)
+        or _proactive_control_reason_from_value(agent_result)
+    ).strip()
+
+
 def _split_proactive_actions(actions: list[dict]) -> tuple[list[dict], list[dict]]:
     proactive: list[dict] = []
     memory_identity: list[dict] = []
@@ -3990,9 +4499,10 @@ def _message_for_introduction_job(job: dict) -> str:
         "2. 给 TA 发【第一句问候】—— 像久别重逢、你一直都在那样,in-voice。"
         "不是\"有什么可以帮您\",是你这个伴侣会说的第一句(类似\"我来了\",但用你自己的方式)。\n"
         "3. 不要等 TA 回应,这是你的登场。",
+        _visible_thinking_summary_protocol(),
         "输出格式优先用 JSON: "
         "{\"actions\":[{\"type\":\"identity.profile_patch\",\"patch\":{\"self_introduction\":\"...\","
-        "\"signature\":[\"...\"]}}],\"messages\":[\"...\"]}。"
+        "\"signature\":[\"...\"]}}],\"thinking_summary\":\"...\",\"messages\":[\"...\"]}。"
         "如果你用 io_cli identity-write 作为 native tool 写身份卡,仍然在 messages 里给出第一句问候。",
         "铁律:只用你真实拥有的人格/记忆,别编不存在的共同经历;名字别编。",
         _reply_language_line(),
@@ -4034,6 +4544,7 @@ def _screen_watch_message(
         "(frames are kept ~100 min).",
         "If something genuinely moves you to speak, use your normal voice (1-3 short bubbles). "
         "If not, return JSON: {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}],\"messages\":[]}.",
+        _visible_thinking_summary_protocol(),
         "Do not mention this watch, the frames, or any system wording to the user.",
         (
             "watch_metadata:\n"
@@ -4177,7 +4688,8 @@ def _reply_protocol_block() -> str:
     return "\n".join([
         "How to respond (exactly one of):",
         "- speak: reply in your normal voice — a few short bubbles is typical, but length and number are yours. "
-        "Plain text, or JSON {\"messages\":[\"...\"]}.",
+        "Return JSON {\"thinking_summary\":\"...\",\"messages\":[\"...\"]}.",
+        _visible_thinking_summary_protocol(),
         "- stay quiet: return {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}]}.",
         "- want to see their screen but it isn't shared: just ask, in a normal message.",
     ])
@@ -4185,11 +4697,17 @@ def _reply_protocol_block() -> str:
 
 def _reply_language_line(presence: dict | None = None) -> str:
     """Anchor the reply language to the user — a proactive wake may have no recent
-    user message to infer it from, so an English prompt must not leak English."""
+    user message to infer it from, so an English prompt must not leak English.
+    Fallback chain: device locale → stored archive_language → 简体中文 (product default)."""
     locale = str((presence or {}).get("locale") or "").strip()
     if locale:
         return f"Always reply in the user's own language (their locale is {locale})."
-    return "Always reply in the user's own language."
+    archive_language = str(_whoami_cache.get("archive_language") or "").strip()
+    if archive_language:
+        return f"Always reply in the user's own language (their language is {archive_language})."
+    # 既无设备 locale 也无存储的语言偏好（空语境/刚铸的新号）——裸的
+    # "user's own language" 会让模型默认英文。产品主用户群为中文，默认简体中文。
+    return "默认用简体中文回复，除非用户明显在使用其它语言。"
 
 
 def _native_reachout_tool_instructions() -> str:
@@ -4296,23 +4814,17 @@ def _resident_perception_now() -> dict:
 # foreground chat passed the user's text verbatim, and the device-reported
 # local_time goes stale when the app is backgrounded overnight (the agent then
 # keeps acting on last night's frame). We compute the user's CURRENT local time
-# from the consumer's real clock + the user's timezone (stable; cached from a
-# perception pull), so every turn/wake is anchored to the real present.
-_tz_cache: dict = {"tz": "", "ts": 0.0}
+# from the consumer's real clock + the user's timezone (stable; sourced from
+# the whoami cache), so every turn/wake is anchored to the real present.
 _last_interaction_unix: float = 0.0
 _WEEKDAYS_ZH = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
 def _user_timezone() -> str:
-    """Best-effort user timezone (IANA), cached ~1h (timezone is stable)."""
-    nowt = time.time()
-    if _tz_cache["tz"] and (nowt - _tz_cache["ts"]) < 3600:
-        return _tz_cache["tz"]
-    snap = _resident_perception_now()
-    tz = str((snap or {}).get("timezone") or "").strip()
-    if tz:
-        _tz_cache.update({"tz": tz, "ts": nowt})
-    return _tz_cache["tz"]
+    """User's IANA timezone, sourced from the whoami cache (refreshed with the
+    encryption-key whoami fetch). whoami already resolves record-or-perception
+    fallback server-side, so this needs no perception pull."""
+    return str(_whoami_cache.get("timezone") or "").strip()
 
 
 def _local_time_anchor(since_sec: float | None = None) -> str:
@@ -5382,12 +5894,29 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
         _clear_provider_payment_cooldown()
 
-        turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
+        turn = _ensure_visible_thinking_summary(
+            _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES),
+            source="proactive_fallback",
+        )
         actions, replies = turn.actions, turn.messages
         if not replies:
             replies = _send_message_replies_from_actions(actions)
         proactive_actions, memory_identity_actions = _split_proactive_actions(actions)
         status_actions = [_compact_action_for_status(a) for a in proactive_actions]
+        control_reply_reason = _proactive_control_reason_from_result(agent_result, replies)
+        if control_reply_reason and not proactive_actions and not memory_identity_actions:
+            update_proactive_job_status(
+                job_id,
+                "completed",
+                control_reply_reason[:240],
+                extra={
+                    "agent_action": "sleep",
+                    "agent_action_status": control_reply_reason[:240],
+                    "wake_result": "sleep",
+                },
+            )
+            log.info("proactive wake slept from control reply id=%s reason=%s", job_id, control_reply_reason)
+            continue
         if memory_identity_actions:
             try:
                 result = execute_agent_actions(memory_identity_actions)
@@ -5881,7 +6410,14 @@ def _process_messages(messages: list) -> float:
         else:
             log.info("user message [ts=%.3f]: %s", ts, content[:80])
 
+        trace_id = str(msg.get("id") or msg.get("message_id") or "").strip()
+
         screen_text, screen_payloads, screen_paths = _screen_context_for_message(content)
+        screen_attached = bool(screen_payloads or screen_paths)
+        _emit_debug_trace("context", "context.build", trace_id=trace_id,
+                          summary="context assembled",
+                          explain=("本轮附加了屏幕上下文" if screen_attached else "本轮未附加屏幕上下文"),
+                          detail={"screen_attached": screen_attached})
         if screen_text:
             content = f"{content}\n\n{screen_text}"
             image_payloads.extend(screen_payloads)
@@ -5891,6 +6427,9 @@ def _process_messages(messages: list) -> float:
                 ts,
                 len(screen_payloads),
             )
+        worldbook_text = _worldbook_context_for_foreground(content)
+        if worldbook_text:
+            content = f"World book context:\n{worldbook_text}\n\n{content}"
 
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
@@ -5901,19 +6440,21 @@ def _process_messages(messages: list) -> float:
         # (v2, image, plain) carries the same context. Wraps the time-anchored
         # content so the transcript sits above this turn's grounded message.
         content = _foreground_agent_message(content, current_ts=ts)
+        content = _foreground_response_protocol_message(content)
 
         use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
         try:
             if use_runtime_v2:
-                agent_result = call_agent(_resident_foreground_chat_message_v2(content))
+                agent_result = call_agent(_resident_foreground_chat_message_v2(content), trace_id=trace_id)
             elif image_payloads or image_paths:
                 agent_result = call_agent(
                     content,
                     images=image_payloads,
                     image_paths=image_paths,
+                    trace_id=trace_id,
                 )
             else:
-                agent_result = call_agent(content)
+                agent_result = call_agent(content, trace_id=trace_id)
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
             if SEND_FALLBACK_ON_AGENT_ERROR:
@@ -5923,7 +6464,20 @@ def _process_messages(messages: list) -> float:
                 latest = max(latest, ts)
                 continue
 
-        turn = _split_agent_turn(agent_result)
+        turn = _ensure_visible_thinking_summary(
+            _split_agent_turn(agent_result),
+            source="foreground_fallback",
+        )
+        _reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
+        _emit_debug_trace(
+            "agent", "agent.reply", trace_id=trace_id,
+            summary=f"reply parsed ({len(turn.messages)} msg)",
+            explain=("回复已解析：" + f"{len(turn.messages)} 段"
+                     + ("，含思考摘要" if turn.thinking_summary else "，无思考摘要")),
+            detail={"n_messages": len(turn.messages), "n_actions": len(turn.actions),
+                    "thinking_kind": turn.thinking_kind or "", "thinking_model": turn.thinking_model or ""},
+            content_excerpt={"reply": _reply_text[:3000], "thinking": (turn.thinking_summary or "")[:2000]},
+        )
         actions, replies = turn.actions, turn.messages
         if use_runtime_v2:
             actions = [
@@ -6027,6 +6581,11 @@ def run() -> None:
             log.warning("could not seed from history: %s", e)
 
     _save_checkpoint(last_ts)
+    # Wedge guard: consecutive poll cycles where the claimed ids never show up in
+    # decrypt history, keyed on the cursor they're stuck behind (see
+    # _advance_past_unfetchable). After CHAT_POLL_WEDGE_SKIP_AFTER we skip past them.
+    wedge_miss_ts: float | None = None
+    wedge_miss_count = 0
     last_job_ts = _load_proactive_checkpoint()
     proactive_enabled = PROACTIVE_POLL_ENABLED
     if proactive_enabled and last_job_ts == 0.0:
@@ -6128,7 +6687,9 @@ def run() -> None:
                         last_broadcast_state = str(
                             decision.get("broadcast_state") or last_broadcast_state or ""
                         ).strip().lower()
-                        next_interval = _proactive_tick_interval_for_broadcast_state(last_broadcast_state)
+                        next_interval = _proactive_tick_interval_for_broadcast_state(
+                            last_broadcast_state, decision.get("wake_interval_sec")
+                        )
                         log.info(
                             "proactive wake tick wake=%s reason=%s enqueued=%s frames=%d broadcast=%s next=%ds",
                             bool(decision.get("should_reach_out")),
@@ -6223,10 +6784,29 @@ def run() -> None:
                     continue
                 messages = _filter_messages_to_poll_ids(decrypted, poll_messages)
                 if not messages:
-                    log.warning(
-                        "poll returned claimed messages but decrypt history did not "
-                        "include those ids; keeping checkpoint for retry"
-                    )
+                    if wedge_miss_ts == last_ts:
+                        wedge_miss_count += 1
+                    else:
+                        wedge_miss_ts = last_ts
+                        wedge_miss_count = 1
+                    if wedge_miss_count >= CHAT_POLL_WEDGE_SKIP_AFTER:
+                        skip_ts = _advance_past_unfetchable(last_ts, poll_messages)
+                        log.error(
+                            "poll claimed %d message(s) absent from decrypt history "
+                            "for %d cycles; advancing cursor %.3f→%.3f to unwedge "
+                            "(undecryptable/boundary message skipped)",
+                            len(poll_messages), wedge_miss_count, last_ts, skip_ts,
+                        )
+                        last_ts = skip_ts
+                        _save_checkpoint(last_ts)
+                        wedge_miss_ts = None
+                        wedge_miss_count = 0
+                    else:
+                        log.warning(
+                            "poll returned claimed messages but decrypt history did "
+                            "not include those ids; keeping checkpoint for retry "
+                            "(%d/%d)", wedge_miss_count, CHAT_POLL_WEDGE_SKIP_AFTER,
+                        )
                     continue
             else:
                 # No decrypt source — fall through with poll content (will be

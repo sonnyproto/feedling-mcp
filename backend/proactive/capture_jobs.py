@@ -262,7 +262,20 @@ def enqueue_memory_capture_job(
         not_before=not_before,
         now=now,
     )
-    return store.append_proactive_job(job), True, "enqueued"
+    created = store.append_proactive_job(job)
+    import debug_trace  # local import avoids load-order cycle
+
+    job_id = str((created or job or {}).get("job_id") or "")
+    debug_trace.trace_event(
+        store,
+        subsystem="memory",
+        type="memory.capture.queued",
+        actor="backend",
+        job_id=job_id,
+        summary="memory capture job enqueued",
+        explain=f"已排队一次记忆抓取（job {job_id}）",
+    )
+    return created, True, "enqueued"
 
 
 def enqueue_memory_dream_job(

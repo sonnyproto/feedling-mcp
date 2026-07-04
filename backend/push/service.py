@@ -3,6 +3,8 @@
 import os
 import time
 
+import db
+from accounts import registry
 from core.store import UserStore
 from push import apns, live_activity
 from push import tokens as push_tokens
@@ -95,6 +97,13 @@ def _send_chat_alert(store: UserStore, alert_body: str, alert_title: str = ""):
     Body is truncated to ~80 chars so long replies render as "...".
     Tap on the notification opens the app (iOS handles routing).
     """
+    # Two-tier: free in-memory negative first (covers already-propagated deletes,
+    # no DB call), then an authoritative DB check (closes the sub-second window
+    # where THIS worker's registry is stale after another worker committed the
+    # delete). `or` short-circuits so a None snapshot skips without touching the DB.
+    if registry._user_entry_snapshot(store.user_id) is None or not db.user_exists(store.user_id):
+        print(f"[chat-alert:{store.user_id}] account gone — skip push")
+        return {"status": "skipped", "reason": "account_gone"}
     if not alert_body:
         return {"status": "skipped", "reason": "empty_body"}
     # Match iOS-registered token type: LiveActivityManager registers
@@ -147,6 +156,14 @@ def _deliver_ai_message_push_if_background(
     data: dict | None = None,
     visual_state: str = "reply",
 ) -> dict:
+    # Two-tier gate (see _send_chat_alert): free in-memory negative, then
+    # authoritative DB check to close the stale-worker race after a cross-worker
+    # delete. Short-circuits so a None snapshot skips without a DB call.
+    if registry._user_entry_snapshot(store.user_id) is None or not db.user_exists(store.user_id):
+        print(f"[ai-push:{store.user_id}] account gone — skip push")
+        return {"push_decision": "skip", "push_reason": "account_gone",
+                "live_activity_status": "skipped", "live_activity_reason": "account_gone",
+                "alert_status": "skipped", "alert_reason": "account_gone"}
     visible_body = (body or "").strip()
     decision = _ai_push_decision(store)
     fields: dict = {
@@ -186,7 +203,9 @@ def _deliver_ai_message_push_if_background(
         "data": data or {},
         "visualState": visual_state or "reply",
     }
-    live_body = _json_body_from_response(live_activity.push_live_activity_hybrid_inner(store, push_payload))
+    # Neutral dict path (no Flask jsonify): this runs off the event loop in an
+    # ASGI worker thread with no Flask app context.
+    live_body = live_activity.push_live_activity_hybrid_dict(store, push_payload)
     fields["live_activity_status"] = live_body.get("status", "unknown")
     fields["live_activity_reason"] = live_body.get("reason", "")
     fields["live_activity_activity_id"] = live_body.get("activity_id", "")

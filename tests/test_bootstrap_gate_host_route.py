@@ -55,17 +55,14 @@ def _patch(monkeypatch, route: str) -> None:
 
 def test_host_account_not_blocked_by_resident_consumer_gate(monkeypatch):
     _patch(monkeypatch, "model_api")
-    with appmod.app.test_request_context():
-        gated = boot_gates._gate_bootstrap_for_chat(_Store())
+    gated = boot_gates._gate_bootstrap_for_chat(_Store())
     assert gated is None, "host (model_api) account must pass the chat gate at main_loop"
 
 
 def test_resident_account_still_blocked_by_resident_consumer_gate(monkeypatch):
     _patch(monkeypatch, "resident")
-    with appmod.app.test_request_context():
-        gated = boot_gates._gate_bootstrap_for_chat(_Store())
+    gated = boot_gates._gate_bootstrap_for_chat(_Store())
     assert gated is not None, "resident account must still require a live resident consumer"
-    resp, status = gated
+    body, status = gated
     assert status == 409
-    body = resp.get_json()
     assert body["stage"] == "needs_resident_consumer"

@@ -67,9 +67,13 @@ def test_reset_skips_archive_cleanup_when_disabled(client, monkeypatch):
     assert calls == []  # enabled() False → 不调用
 
 
-def test_reset_aborts_when_archive_cleanup_fails(client, monkeypatch):
-    """R2 清理失败时重置必须中止并返回 503，账号不得被删除（P1 修复）。"""
+def test_reset_aborts_when_archive_cleanup_fails_persistently(client, monkeypatch):
+    """onboarding 归档是 R2 上的**明文**用户数据 —— 删账号前必须先清干净。持续
+    删除失败时重置必须 503 abort 且**不删账号**（此刻尚未删任何东西，状态一致、
+    可安全重试），绝不能在报告成功的同时留下无从发现的明文孤儿（无 reaper 兜底）。"""
     uid, api_key = _register(client)
+    import content.content_core as routes
+    monkeypatch.setattr(routes, "_ARCHIVE_DELETE_BASE_DELAY", 0)  # 测试里不真 sleep
 
     def _boom(_u):
         raise RuntimeError("r2 delete failed")
@@ -81,8 +85,34 @@ def test_reset_aborts_when_archive_cleanup_fails(client, monkeypatch):
                       headers={"X-API-Key": api_key})
     assert res.status_code == 503, res.get_data(as_text=True)
     assert res.get_json()["error"] == "archive_cleanup_failed"
-    # 中止后账号未被删：用同一 key 再次请求仍能通过鉴权（不是 401）
+
+    # 账号未被删：修好归档后同一 key 仍能成功重置（证明账号一直在、可重试）。
+    calls = []
+    monkeypatch.setattr(oa_storage, "delete_user_archives", lambda u: calls.append(u))
     res2 = client.post("/v1/account/reset",
-                       json={"confirm": "wrong"},
+                       json={"confirm": "delete-all-data"},
                        headers={"X-API-Key": api_key})
-    assert res2.status_code == 400  # 通过鉴权、卡在 confirm 校验 → 证明用户还在
+    assert res2.status_code == 200, res2.get_data(as_text=True)
+    assert calls == [uid]
+
+
+def test_reset_retries_transient_archive_failure_then_succeeds(client, monkeypatch):
+    """瞬时 R2 抖动应被有界重试抹平：前两次失败、第三次成功 → 归档删净、账号正常删除。"""
+    uid, api_key = _register(client)
+    import content.content_core as routes
+    monkeypatch.setattr(routes, "_ARCHIVE_DELETE_BASE_DELAY", 0)
+    attempts = {"n": 0}
+
+    def _flaky(_u):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise RuntimeError("transient r2")
+        # 第三次成功（无异常）
+
+    monkeypatch.setattr(oa_storage, "enabled", lambda: True)
+    monkeypatch.setattr(oa_storage, "delete_user_archives", _flaky)
+    res = client.post("/v1/account/reset",
+                      json={"confirm": "delete-all-data"},
+                      headers={"X-API-Key": api_key})
+    assert res.status_code == 200, res.get_data(as_text=True)
+    assert attempts["n"] == 3  # 重试到第三次成功

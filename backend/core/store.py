@@ -42,6 +42,9 @@ PROACTIVE_USER_STATES = {"default", "focused", "social", "resting", "away"}
 PROACTIVE_AI_STATES = {"present", "watching", "thinking", "curious", "waiting"}
 PROACTIVE_BROADCAST_STATES = {"unknown", "on", "off", "paused"}
 PROACTIVE_DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/Shanghai").strip() or "UTC"
+PROACTIVE_WAKE_INTERVAL_DEFAULT_SEC = 7200
+PROACTIVE_WAKE_INTERVAL_MIN_SEC = 900
+PROACTIVE_WAKE_INTERVAL_MAX_SEC = 43200
 
 # Per-thread "currently loading from the DB" flag. The blob-backed loaders
 # (_load_tokens / _load_frames_meta) re-persist normalized state on read, so a
@@ -51,6 +54,14 @@ PROACTIVE_DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/S
 # outside a load) still broadcast. Thread-local so a load on one thread can't
 # mute a concurrent genuine write on another.
 _reload_guard = threading.local()
+
+
+def normalize_proactive_wake_interval_sec(value) -> int:
+    try:
+        interval = int(value)
+    except (TypeError, ValueError):
+        return PROACTIVE_WAKE_INTERVAL_DEFAULT_SEC
+    return max(PROACTIVE_WAKE_INTERVAL_MIN_SEC, min(PROACTIVE_WAKE_INTERVAL_MAX_SEC, interval))
 
 
 # Used from inside UserStore._load_tokens on boot; must be defined before
@@ -107,7 +118,16 @@ class UserStore:
 
         # identity / memory locks
         self.identity_lock = threading.Lock()
-        self.memory_lock = threading.Lock()
+        # Reentrant: memory mutations hold this across load→mutate→save (see
+        # memory_service.mutate) so same-user concurrent writes can't lost-update,
+        # and _save_moments re-acquires it inside that hold. RLock makes the
+        # nested acquire a no-op instead of a deadlock. Plain Lock previously
+        # only guarded the final write, which under the ASGI threadpool (same-user
+        # requests now truly overlap) let a stale-snapshot save delete a
+        # concurrently-added moment.
+        self.memory_lock = threading.RLock()
+        self.world_books: list[dict] = []
+        self.world_books_lock = threading.Lock()
         self.consumer_state_lock = threading.Lock()
 
         # proactive presence state
@@ -132,6 +152,7 @@ class UserStore:
             self._load_live_activity_state()
             self._load_chat()
             self._load_frames_meta()
+            self._load_world_books()
         finally:
             _reload_guard.active = _prev_guard
 
@@ -293,6 +314,8 @@ class UserStore:
                 self.chat_messages = db.chat_load(self.user_id)
             with self.frames_lock:
                 self._load_frames_meta()
+            with self.world_books_lock:
+                self._load_world_books()
             self._load_tokens()
             self._load_live_activity_state()
             self._load_push_state()
@@ -429,6 +452,44 @@ class UserStore:
             print(f"[{self.user_id}/capture] chat_append coordinator failed: {e}")
         return msg
 
+    # ------- world book -------
+    def _load_world_books(self):
+        self.world_books = db.world_book_load(self.user_id)
+
+    def upsert_world_book(self, record: dict) -> dict:
+        entry_id = str(record.get("id") or "").strip()
+        if not entry_id:
+            raise ValueError("world book record id is required")
+        stored = dict(record)
+        stored["id"] = entry_id
+        stored.setdefault("owner_user_id", self.user_id)
+        stored.setdefault("updated_at", datetime.now().isoformat())
+        with self.world_books_lock:
+            replaced = False
+            for i, existing in enumerate(self.world_books):
+                if str(existing.get("id") or "") == entry_id:
+                    self.world_books[i] = stored
+                    replaced = True
+                    break
+            if not replaced:
+                self.world_books.append(stored)
+            db.world_book_upsert(self.user_id, entry_id, str(stored.get("updated_at") or ""), stored)
+        return stored
+
+    def delete_world_book(self, entry_id: str) -> bool:
+        entry_id = str(entry_id or "").strip()
+        if not entry_id:
+            return False
+        with self.world_books_lock:
+            before = len(self.world_books)
+            self.world_books[:] = [
+                item for item in self.world_books
+                if str(item.get("id") or "") != entry_id
+            ]
+            removed_local = len(self.world_books) != before
+            removed_db = db.world_book_delete(self.user_id, entry_id)
+        return removed_local or removed_db
+
     def update_chat_message_metadata(self, msg_id: str, fields: dict) -> dict | None:
         allowed = {
             "live_activity_status",
@@ -471,6 +532,7 @@ class UserStore:
             for ev in self.chat_waiters:
                 ev.set()
             self.chat_waiters.clear()
+        _fire_async_wake("chat", self.user_id)
 
     # ------- proactive presence -------
     def load_proactive_settings(self) -> dict:
@@ -489,10 +551,10 @@ class UserStore:
             # natural-language "when should you reach out to me" instruction,
             # injected into the wake prompt (see model_api_runtime/wake.py). The
             # agent weighs it when deciding to message or sleep. Empty = no
-            # preference. (A wake-cadence/heartbeat-frequency knob is deferred to
-            # the follow-up that also wires it into the tick loop + iOS surface,
-            # so we don't ship a setting that silently does nothing.)
+            # preference.
             "wake_directive": "",
+            "wake_interval_sec": PROACTIVE_WAKE_INTERVAL_DEFAULT_SEC,
+            "first_chat_ok_at": "",
             "updated_at": datetime.now().isoformat(),
         }
         try:
@@ -511,6 +573,9 @@ class UserStore:
                     merged["ai_state"] = "present"
                 if str(merged.get("broadcast_state") or "") not in PROACTIVE_BROADCAST_STATES:
                     merged["broadcast_state"] = "unknown"
+                merged["wake_interval_sec"] = normalize_proactive_wake_interval_sec(
+                    merged.get("wake_interval_sec")
+                )
                 return merged
         except Exception as e:
             print(f"[{self.user_id}/proactive] settings load failed: {e}")
@@ -530,6 +595,7 @@ class UserStore:
             "ai_state",
             "broadcast_state",
             "wake_directive",
+            "wake_interval_sec",
         }
         patch_doc = dict(patch or {})
         if "ambient" in patch_doc:
@@ -572,9 +638,36 @@ class UserStore:
                     cur[key] = state
             elif key == "wake_directive":
                 cur[key] = str(value or "").strip()[:1000]
+            elif key == "wake_interval_sec":
+                try:
+                    interval = int(value)
+                except (TypeError, ValueError):
+                    continue
+                cur[key] = max(
+                    PROACTIVE_WAKE_INTERVAL_MIN_SEC,
+                    min(PROACTIVE_WAKE_INTERVAL_MAX_SEC, interval),
+                )
         cur["version"] = 2
         cur["updated_at"] = datetime.now().isoformat()
         with self.proactive_lock:
+            db.set_blob(self.user_id, "proactive_settings", cur)
+        return cur
+
+    def first_chat_ok_at(self) -> str:
+        settings = self.load_proactive_settings()
+        return str(settings.get("first_chat_ok_at") or "").strip()
+
+    def proactive_activation_ready(self) -> bool:
+        return bool(self.first_chat_ok_at())
+
+    def mark_first_chat_ok(self, *, at_iso: str | None = None) -> dict:
+        with self.proactive_lock:
+            cur = self.load_proactive_settings()
+            if str(cur.get("first_chat_ok_at") or "").strip():
+                return cur
+            cur["first_chat_ok_at"] = str(at_iso or datetime.now().isoformat())
+            cur["version"] = 2
+            cur["updated_at"] = datetime.now().isoformat()
             db.set_blob(self.user_id, "proactive_settings", cur)
         return cur
 
@@ -702,6 +795,7 @@ class UserStore:
             for ev in self.proactive_job_waiters:
                 ev.set()
             self.proactive_job_waiters.clear()
+        _fire_async_wake("proactive", self.user_id)
 
 
 # Registry of per-user stores
@@ -718,11 +812,35 @@ _stores: dict[str, UserStore] = {}
 _stores_lock = threading.Lock()
 
 
+# Async long-poll wake hook (ASGI-migration plan §9.3 / §19.2). Injected by the
+# ASGI lifespan as `runtime.waiters.registry.wake`; None under legacy Flask (the
+# threading.Event waiters above are the only waiters then). Called from BOTH the
+# same-worker write path (notify_*_waiters, directly — NOT via the self-origin-
+# filtered wake bus, which is what closes the §19.2 gap) and the cross-worker
+# LISTEN path (_wake_store_waiters). The hook must be thread-safe.
+_async_wake_hook = None
+
+
+def set_async_wake_hook(fn) -> None:
+    global _async_wake_hook
+    _async_wake_hook = fn
+
+
+def _fire_async_wake(channel: str, user_id: str) -> None:
+    hook = _async_wake_hook
+    if hook is None:
+        return
+    try:
+        hook(channel, user_id)
+    except Exception:
+        pass
+
+
 def _wake_store_waiters(store: "UserStore") -> None:
     """Release threads parked on a store's long-poll waiters (chat / proactive)
     so they return promptly and re-evaluate against the refreshed state."""
     try:
-        store.notify_chat_waiters()
+        store.notify_chat_waiters()  # also fires the async "chat" hook
     except Exception:
         pass
     try:
@@ -731,6 +849,9 @@ def _wake_store_waiters(store: "UserStore") -> None:
                 ev.set()
     except Exception:
         pass
+    # notify_chat_waiters already fired the chat hook; the proactive branch above
+    # is inline (not the notify method) so fire the async proactive hook here.
+    _fire_async_wake("proactive", store.user_id)
 
 
 def _evict_store(user_id: str) -> bool:

@@ -87,7 +87,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:7adeb43
+    image: ghcr.io/teleport-computer/feedling:5e19979
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -130,7 +130,7 @@ services:
   # unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:7adeb43
+    image: ghcr.io/teleport-computer/feedling:5e19979
     # gunicorn = production WSGI (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -141,13 +141,20 @@ services:
     # patch (a pre-patch image binds :9998 at import → N>1 would double-bind; the
     # default 1 stays safe on any image). Sizing: ~18 DB conns/worker (pool 16 +
     # 1 listener + 1 election); test RDS t4g-micro max_connections=79 → N=2 safe.
-    command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "--threads", "32", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
+    command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-k", "asgi.worker.FeedlingUvicornWorker", "--timeout", "120", "-b", "0.0.0.0:5001", "asgi_app:app"]
     restart: unless-stopped
     environment:
       FEEDLING_API_KEY: ""
       FEEDLING_ADMIN_TOKEN: "${FEEDLING_ADMIN_TOKEN:-}"
       FEEDLING_DATA_DIR: "/data"
       FEEDLING_WS_PORT: "9998"
+      # ASGI backend: start the per-worker background services (the :9998 WS
+      # ingest server via leader election + the cross-worker wake bus). Default
+      # is OFF (asgi/settings.py) so the dev A/B parallel instance (:5005) does
+      # not contend for WS leadership with the live backend; a REAL deploy MUST
+      # turn it on or the iOS broadcast-extension frame ingest on :9998 never
+      # binds (pre-ASGI app.py started it unconditionally). See asgi/lifespan.py.
+      FEEDLING_ASGI_BACKGROUND: "true"
       FEEDLING_ENCLAVE_URL: "https://enclave:5003"
       # This deploy serves test-api, so skill_url must point at io-onboarding's
       # test branch. Code defaults to "main" (so prod just works); the test

@@ -7,12 +7,9 @@ import time
 import uuid
 from datetime import date, datetime
 
-from flask import jsonify, request
-
 import db
 from core import envelope as core_envelope
 from core.store import UserStore
-from flask import g
 
 
 
@@ -292,25 +289,25 @@ def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
     return item
 
 
-def _request_chat_consumer_id() -> str:
-    """Stable responder id for chat poll claiming.
+def _parse_consumer_id(headers, query) -> str:
+    """Framework-neutral: stable responder id from headers/query mappings.
 
-    /v1/chat/poll is a responder endpoint, not the normal UI history reader.
-    A caller without explicit consumer headers is grouped under "anonymous" so
-    two ad-hoc pollers with the same API key do not both claim the same turn.
-    """
+    Both Flask (request.headers/request.args) and ASGI (request.headers/
+    request.query_params) pass case-insensitive-header + .get()-query objects,
+    so the ASGI poll route reuses this exact parsing (plan §9.1)."""
     raw = (
-        request.headers.get("X-Feedling-Consumer-Id")
-        or request.args.get("consumer_id")
-        or request.headers.get("X-Feedling-Consumer")
+        headers.get("X-Feedling-Consumer-Id")
+        or query.get("consumer_id")
+        or headers.get("X-Feedling-Consumer")
         or "anonymous"
     )
     consumer = re.sub(r"[^A-Za-z0-9_.:-]+", "-", str(raw).strip())[:160].strip("-")
     return consumer or "anonymous"
 
 
-def _request_bool_arg(name: str, default: bool = True) -> bool:
-    raw = request.args.get(name)
+def _parse_bool_arg(query, name: str, default: bool = True) -> bool:
+    """Framework-neutral bool query arg (shared by Flask + ASGI poll routes)."""
+    raw = query.get(name)
     if raw is None:
         return default
     return str(raw).strip().lower() not in {"0", "false", "no", "off"}

@@ -19,6 +19,8 @@ from core import store as core_store  # noqa: E402
 from perception import store as perception_store  # noqa: E402
 from hosted import config_store  # noqa: E402
 
+from conftest import seed_user  # noqa: E402
+
 # This module doesn't import app, so the schema isn't created as a side effect
 # of import the way the app-importing test modules get it. Create it explicitly
 # (idempotent) against the conftest-provisioned throwaway DB.
@@ -32,6 +34,7 @@ def _uid() -> str:
 def test_gate_decision_stream_is_trimmed(monkeypatch):
     monkeypatch.setattr(core_store, "GATE_DECISION_MAX", 5)
     store = core_store.UserStore(_uid())
+    seed_user(store.user_id)
     for i in range(12):
         store.append_gate_decision({"decision_id": f"gd_{i}", "ts": float(i)})
     kept = db.log_read_all(store.user_id, "gate_decisions")
@@ -41,6 +44,7 @@ def test_gate_decision_stream_is_trimmed(monkeypatch):
 def test_gate_review_stream_is_trimmed(monkeypatch):
     monkeypatch.setattr(core_store, "GATE_REVIEW_MAX", 3)
     store = core_store.UserStore(_uid())
+    seed_user(store.user_id)
     for i in range(9):
         store.append_gate_review({"review_id": f"gr_{i}", "ts": float(i)})
     kept = db.log_read_all(store.user_id, "gate_reviews")
@@ -50,6 +54,7 @@ def test_gate_review_stream_is_trimmed(monkeypatch):
 def test_perception_event_stream_is_trimmed(monkeypatch):
     monkeypatch.setattr(perception_store, "EVENT_MAX", 4)
     uid = _uid()
+    seed_user(uid)
     for i in range(10):
         perception_store.append_event(uid, {"n": i, "ts": float(i)}, float(i))
     kept = db.log_read_all(uid, perception_store.EVENT_STREAM)
@@ -59,6 +64,7 @@ def test_perception_event_stream_is_trimmed(monkeypatch):
 def test_app_usage_stream_is_trimmed(monkeypatch):
     monkeypatch.setattr(perception_store, "APP_USAGE_MAX", 4)
     uid = _uid()
+    seed_user(uid)
     for i in range(10):
         perception_store.append_app_open(uid, {"n": i, "ts": float(i)}, float(i))
     kept = db.log_read_all(uid, perception_store.APP_USAGE_STREAM)
@@ -69,6 +75,7 @@ def test_log_trim_only_statuses_keeps_non_terminal_rows():
     # An in-flight (non-terminal) row must survive trim regardless of age — only
     # rows whose status is in ``only_statuses`` are eligible for deletion.
     uid = _uid()
+    seed_user(uid)
     db.log_append(uid, "s", {"id": "inflight", "status": "queued"}, ts=0.0)
     for i in range(8):
         db.log_append(uid, "s", {"id": f"done_{i}", "status": "ok"}, ts=float(i + 1))
@@ -87,6 +94,7 @@ def test_action_trace_trim_preserves_queued_until_patched(monkeypatch):
     # later terminal traces push it past MODEL_API_ACTION_TRACE_MAX.
     monkeypatch.setattr(config_store, "MODEL_API_ACTION_TRACE_MAX", 3)
     store = core_store.UserStore(_uid())
+    seed_user(store.user_id)
     config_store._append_model_api_action_trace(store, {"trace_id": "mat_inflight", "status": "queued"})
     for i in range(6):
         config_store._append_model_api_action_trace(store, {"trace_id": f"mat_{i}", "status": "ok"})

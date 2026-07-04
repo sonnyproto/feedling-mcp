@@ -55,6 +55,11 @@ _IO_CLI_VERBS = (
     # the prompt says it's available (prompt/allowlist consistency, cutover gate 5).
     "photo-recent",
     "photo-read",
+    # chat-image pulls a past chat image by id — advertised by the consumer's
+    # recent-chat placeholder AND documented in the prompt, so it MUST be granted
+    # here too, or claude's acceptEdits mode denies it ("requires approval") and the
+    # agent loops "waiting for permission approval" instead of showing the image.
+    "chat-image",
 )
 # Host-side resident sessions rotate at this many turns (vs the shared consumer
 # default of 40) so the persona file re-grounds voice more often within a long
@@ -131,6 +136,41 @@ def _codex_gateway_config(*, base_url: str, model: str) -> str:
 def _io_cli_allow_rules(io_cli: str = _IO_CLI) -> list[str]:
     """Claude Bash permission allow-rules scoping the agent to just io_cli."""
     return [f"Bash(python {io_cli} {verb}:*)" for verb in _IO_CLI_VERBS]
+
+
+def _image_read_allow_rule(home: str) -> str:
+    """Claude Read allow-rule for the decrypted-image temp dir (IMAGE_TEMP_DIR).
+
+    Chat photos and screen-share frames are decrypted to ``{home}/images/*.jpg|png``
+    and their path is injected into the prompt; without Read on that dir an
+    unattended ``claude -p`` (whose --allowed-tools is otherwise io_cli-only) cannot
+    open them, so the model never sees the image. Scoped to the image dir only.
+
+    ⚠️ DOUBLE leading slash is load-bearing. In Claude Code permission rules a SINGLE
+    leading slash anchors the path at the *settings source* (the cwd, ``/app``), so
+    ``Read(/agent-data/.../images/**)`` silently means ``/app/agent-data/...`` and
+    never matches the real absolute path — the read is DENIED under ``-p`` and the
+    vision model then hallucinates ("I need permission / I can see …" for an image it
+    never opened). A filesystem-absolute rule needs ``//``. ``home`` is already
+    absolute (``/agent-data/users/<uid>``), so prefix one more slash.
+    (Verified on cc 2.1.x: single-slash denied, double-slash allowed.)"""
+    return f"Read(//{home.strip('/')}/images/**)"
+
+
+def _claude_allow_rules(io_cli: str, home: str) -> list[str]:
+    """Full claude --allowed-tools / settings allowlist: io_cli verbs + image Read."""
+    return [*_io_cli_allow_rules(io_cli), _image_read_allow_rule(home)]
+
+
+def _image_dir_add_dir(home: str) -> str:
+    """`--add-dir` flag putting the decrypted-image dir inside claude's trusted
+    workspace. Belt-and-suspenders with the Read allow-rule: the agent's cwd is
+    ``/app`` and the image dir is OUTSIDE it, so headless ``claude -p`` enforces a
+    workspace-trust boundary that rejects out-of-cwd reads BEFORE consulting allow
+    rules. ``--add-dir`` extends the workspace so files there are readable without a
+    prompt. ``materialize_home`` pre-creates the dir so this target always exists
+    (claude warns/errors on a missing --add-dir path)."""
+    return f"--add-dir {home}/images"
 
 
 # claude (Anthropic-wire) providers that are NOT anthropic itself: they expose an
@@ -227,15 +267,63 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
         # workspace-write + sandbox_workspace_write.network_access` approach, which
         # is moot when bwrap cannot initialize at all. claude-driver runs its Bash
         # in the normal process env and never used bwrap.
+        #
+        # model_reasoning_* is verified against codex-cli 0.142.5 with
+        # --strict-config. The resident consumer already routes codex reasoning
+        # events into thinking_summary; this asks the CLI to emit them.
         return (
             "codex exec --skip-git-repo-check --json "
+            "-c model_reasoning_effort=medium "
+            "-c model_reasoning_summary=auto "
             "--dangerously-bypass-approvals-and-sandbox {message}"
         )
-    grant = ",".join(_io_cli_allow_rules(io_cli))
+    grant = ",".join(_claude_allow_rules(io_cli, home))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
     return (
-        f"claude --allowed-tools '{grant}' "
+        f"claude {_CLAUDE_PERMISSION_FLAG} {_image_dir_add_dir(home)} "
+        f"--allowed-tools '{grant}' "
         f"--append-system-prompt-file {prompt_file} -p {{message}}"
+    )
+
+
+# `claude -p` (esp. --output-format stream-json, the thinking path) DENIES its own
+# allow-listed Read of the decrypted chat image unless a non-interactive permission
+# mode is set on the CLI — the allow rule alone (or in settings.json) is treated as a
+# hint and the default mode auto-denies file reads with no interactive approver, so a
+# vision model hallucinates ("I need permission to see the image"). acceptEdits makes
+# the pre-granted allowlist honored non-interactively WITHOUT the blanket
+# --dangerously-skip-permissions (codex-style bypass); Bash stays scoped to io_cli.
+# (Verified in-CVM + locally on claude-code 2.1.195, sonnet-4-5 image turns.)
+_CLAUDE_PERMISSION_FLAG = "--permission-mode acceptEdits"
+
+
+def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
+    """Claude Code exposes thinking blocks in stream-json output."""
+    # Same allowlist as the non-thinking claude cmd: io_cli verbs + Read on the
+    # decrypted-image dir. Without the Read rule a thinking model (deepseek /
+    # sonnet-4 / opus-4 / 3-7) runs `claude -p` with no image permission and denies
+    # its own Read of the chat image ("I need permission to see the image").
+    grant = ",".join(_claude_allow_rules(io_cli, home))
+    prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
+    return (
+        f"claude {_CLAUDE_PERMISSION_FLAG} {_image_dir_add_dir(home)} --verbose "
+        f"--output-format stream-json --include-partial-messages --effort high "
+        f"--allowed-tools '{grant}' "
+        f"--append-system-prompt-file {prompt_file} -p {{message}}"
+    )
+
+
+def _claude_cli_should_stream_thinking(entry: dict) -> bool:
+    provider = (entry.get("provider") or "").strip().lower()
+    if provider == "deepseek":
+        return True
+    if provider != "anthropic":
+        return False
+    model = (entry.get("model") or "").strip().lower()
+    return (
+        "claude-3-7" in model
+        or "claude-sonnet-4" in model
+        or "claude-opus-4" in model
     )
 
 
@@ -273,7 +361,13 @@ def agent_home_files(
     the CLI flag). For a codex user on the LiteLLM gateway (non-openai provider) it
     also writes a ``config.toml`` pointing codex at the gateway's Responses endpoint.
     """
-    system_append = _AGENT_PROMPT_TEXT
+    # The prompt template ships literal ``<io_cli>`` placeholders in every usage
+    # example (``python <io_cli> perception …``). Substitute the real path here, or
+    # the model has no idea where io_cli lives and guesses a nonexistent path
+    # (observed live: ``/feedling-io-cli/io_cli.py``) → every Bash call misses the
+    # ``Bash(python /app/tools/io_cli.py …)`` allowlist and is denied ("requires
+    # approval"), silently breaking perception/memory/photo tools.
+    system_append = _AGENT_PROMPT_TEXT.replace("<io_cli>", io_cli)
     persona = (persona_content or "").strip()
     if persona:
         system_append = f"{persona}\n\n---\n\n{system_append}"
@@ -289,7 +383,19 @@ def agent_home_files(
             files[f"{home}/codex-home/config.toml"] = _codex_gateway_config(
                 base_url=gateway_base_url, model=model)
     else:
-        settings = {"permissions": {"allow": _io_cli_allow_rules(io_cli)}}
+        # defaultMode acceptEdits is REQUIRED, not cosmetic: a settings.json that
+        # carries `permissions.allow` but no defaultMode makes `claude -p` (esp. in
+        # --output-format stream-json, the thinking path) DENY the allow-listed
+        # Read of the decrypted chat image ("I need permission to see the image") —
+        # the allow rules are treated as hints and the default mode auto-denies
+        # non-interactively. acceptEdits makes the pre-granted allowlist actually
+        # honored without a prompt. (Verified in-CVM: sonnet-4-5 image turns.)
+        settings = {
+            "permissions": {
+                "defaultMode": "acceptEdits",
+                "allow": _claude_allow_rules(io_cli, home),
+            }
+        }
         files[f"{home}/claude-home/settings.json"] = json.dumps(settings, indent=2)
     return files
 
@@ -347,6 +453,12 @@ def materialize_home(
     for path in stale_home_files(home, driver=driver, codex_transport=codex_transport):
         if path not in files:
             Path(path).unlink(missing_ok=True)
+    # Pre-create the decrypted-image dir (IMAGE_TEMP_DIR = {home}/images). The claude
+    # command passes `--add-dir {home}/images` on EVERY turn, but the consumer only
+    # creates the dir lazily when the first image is decrypted — so the first turns
+    # (before any image) would --add-dir a missing path. Claude warns/errors on that;
+    # creating it here keeps every turn's --add-dir valid. Cheap + idempotent.
+    Path(f"{home}/images").mkdir(parents=True, exist_ok=True)
 
 
 def _persona_from_blob(blob, decrypt_fn) -> str:
@@ -411,7 +523,10 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     # with the runtime-token file instead (FEEDLING_RUNTIME_TOKEN_FILE below).
     env["FEEDLING_API_KEY"] = entry.get("api_key", "")
     env["AGENT_MODE"] = entry.get("agent_mode", "cli")
-    env["AGENT_CLI_CMD"] = entry.get("cli_cmd") or _default_cli_cmd(driver, home)
+    cli_cmd = entry.get("cli_cmd")
+    if not cli_cmd and driver == "claude" and _claude_cli_should_stream_thinking(entry):
+        cli_cmd = _default_thinking_claude_cmd(home)
+    env["AGENT_CLI_CMD"] = cli_cmd or _default_cli_cmd(driver, home)
     # Per-user isolation: separate checkpoint, agent session, image temp dir, and
     # a per-user agent home (Claude/Codex) so nothing is shared across users.
     env["CHECKPOINT_FILE"] = f"{home}/checkpoint.json"
@@ -444,15 +559,16 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
         env["CLAUDE_CONFIG_DIR"] = f"{home}/claude-home"
         if entry.get("provider_key"):
             env["ANTHROPIC_API_KEY"] = entry["provider_key"]
+        model = (entry.get("model") or "").strip()
+        if model:
+            env["ANTHROPIC_MODEL"] = model
         # Non-anthropic claude-wire providers (deepseek) must point the CLI at
         # their /anthropic endpoint + own model — otherwise the CLI hits
         # api.anthropic.com with a foreign key and every turn exits non-zero.
         anthropic_base = _claude_anthropic_base_url(entry)
         if anthropic_base:
             env["ANTHROPIC_BASE_URL"] = anthropic_base
-            model = (entry.get("model") or "").strip()
             if model:
-                env["ANTHROPIC_MODEL"] = model
                 # claude Code also issues background "small/fast" model calls; point
                 # them at the same model so they don't 404 a claude-* default.
                 env["ANTHROPIC_SMALL_FAST_MODEL"] = model

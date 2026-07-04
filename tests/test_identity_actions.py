@@ -839,9 +839,9 @@ def test_identity_profile_patch_writes_custom_persona_prompt(client, monkeypatch
 
 
 def test_proactive_settings_wake_directive_validation(client):
-    # P4: wake_directive is whitelisted + capped at 1000 chars. The deferred
-    # wake-cadence knob (wake_interval_sec) and unknown keys are NOT stored — we
-    # don't persist a setting that silently does nothing yet. (DB-backed — CI.)
+    # P4: wake_directive is whitelisted + capped at 1000 chars. wake_interval_sec
+    # is whitelisted and clamped now that the tick loop contract carries it.
+    # Unknown keys are still rejected. (DB-backed — CI.)
     user_id, _api_key = _register(client)
     store = appmod.get_store(user_id)
     saved = store.save_proactive_settings({
@@ -850,6 +850,7 @@ def test_proactive_settings_wake_directive_validation(client):
         "bogus_key": "nope",
     })
     assert len(saved["wake_directive"]) == 1000          # capped
-    assert "wake_interval_sec" not in saved              # deferred, not whitelisted
+    assert saved["wake_interval_sec"] == 900             # clamped
     assert "bogus_key" not in saved                      # unknown keys rejected
     assert store.load_proactive_settings()["wake_directive"] == "x" * 1000
+    assert store.load_proactive_settings()["wake_interval_sec"] == 900

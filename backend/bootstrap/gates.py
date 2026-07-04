@@ -7,8 +7,6 @@ import time
 import uuid
 from datetime import date, datetime
 
-from flask import jsonify, request
-
 import db
 from core import util as core_util
 from core.store import UserStore
@@ -193,7 +191,7 @@ def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
                 f"[gate:{store.user_id}] chat_response blocked stage=needs_resident_consumer "
                 f"consumer={consumer_state.get('consumer_name')} recent={consumer_state.get('age_sec')}"
             )
-            return jsonify({
+            return ({
                 "error": "bootstrap_incomplete",
                 "stage": "needs_resident_consumer",
                 "memory_count": state["memory_count"],
@@ -213,7 +211,7 @@ def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
                 "sending any visible IO Chat greeting."
             )
             print(f"[gate:{store.user_id}] chat_response blocked stage=needs_live_connection")
-            return jsonify({
+            return ({
                 "error": "bootstrap_incomplete",
                 "stage": "needs_live_connection",
                 "memory_count": state["memory_count"],
@@ -236,7 +234,7 @@ def _gate_bootstrap_for_chat(store, allow_verify_reply: bool = False):
     )
     print(f"[gate:{store.user_id}] chat_response blocked stage={state['stage']} "
           f"missing={state['missing_tabs']} id={state['identity_written']}")
-    return jsonify({
+    return ({
         "error": "bootstrap_incomplete",
         "stage": state["stage"],
         "memory_count": state["memory_count"],

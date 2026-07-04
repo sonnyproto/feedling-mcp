@@ -20,12 +20,15 @@ import backfill_frames_to_r2 as backfill  # noqa: E402
 
 from test_frame_r2 import _FakeS3, _enable_r2, _env  # noqa: E402
 
+from conftest import seed_user  # noqa: E402
+
 
 def _uid() -> str:
     return f"bf_{uuid.uuid4().hex[:10]}"
 
 
 def _insert_legacy(uid: str, fid: str, ts: float) -> dict:
+    seed_user(uid)
     env = _env(uid, fid)
     with db.get_pool().connection() as conn:
         conn.execute(
@@ -78,6 +81,7 @@ def test_skips_row_without_body_ct(monkeypatch):
     fake = _FakeS3()
     _enable_r2(monkeypatch, fake)
     uid = _uid()
+    seed_user(uid)
     with db.get_pool().connection() as conn:
         conn.execute(
             "INSERT INTO frame_envelopes (user_id, frame_id, ts, doc) VALUES (%s, %s, %s, %s)",

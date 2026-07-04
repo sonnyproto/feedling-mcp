@@ -3,13 +3,25 @@
 > 背景：2026-06-12 我们把 17,600 行的 `backend/app.py` 单体拆成了 13 个
 > 领域包（见 `docs/CHANGELOG.md` 当日条目）。这份文档的目的只有一个：
 > **别让它长回去。** 所有后端 PR 按此检查。
+>
+> **⚠️ ASGI 迁移已 cutover（2026-07-04）：后端 web 层从 Flask 全量切到
+> FastAPI/ASGI（入口 `asgi_app:app`，gunicorn `-k asgi.worker.FeedlingUvicornWorker`）。
+> 每个领域包的 Flask `routes.py`（+ 各包的 `bp`/`register(app)`）已删除，
+> 由 `routes_asgi.py`（FastAPI `APIRouter` + `register_asgi(app)`）取代；路由体委托
+> 给框架中立的 `*_core.py`（拿 store + 已解析参数，无 `flask.request`），Flask 与
+> ASGI 曾共用一份实现。`app.py` 不再是 Flask app：它是一个无 Flask 的符号 re-export
+> facade + 装配注入 + 一个 ASGI-backed test-client shim（`backend/asgi_test_client.py`，
+> 让老测试的 `app.app.test_client()` 照跑真实 ASGI app）。`flask` 依赖仅为
+> enclave 内独立服务 `enclave_app.py` 保留。下文凡提到「Flask 创建 / Blueprint /
+> routes.py / register(app)」均为迁移前语境；新路由请照 `routes_asgi.py` 三件套。**
 
 ---
 
 ## 一句话版本
 
-**app.py 只做装配，业务代码进领域包；新路由进对应包的 `routes.py`，
-新逻辑进 `service.py`；依赖只能向下，向上要用注入。**
+**app.py 只做装配（现为无 Flask 的 facade + 注入），业务逻辑进领域包的
+`*_core.py`（框架中立）；新路由进对应包的 `routes_asgi.py`（FastAPI `APIRouter`，
+经 `run_db` 把阻塞调用移出事件循环）；依赖只能向下，向上要用注入。**
 
 ---
 
@@ -45,7 +57,7 @@ backend/
 
 | 你要做的事 | 放哪 |
 |---|---|
-| 新增一个 `/v1/...` HTTP 端点 | 对应领域包的 `routes.py`，挂在该包的 Blueprint 上 |
+| 新增一个 `/v1/...` HTTP 端点 | 对应领域包的 `routes_asgi.py`（FastAPI `APIRouter` + `register_asgi(app)`，在 `asgi_app._ASGI_PACKAGES` 注册）；路由体委托给同包的 `*_core.py`，阻塞调用走 `await threadpool.run_db(...)` |
 | 新增业务逻辑/存取逻辑 | 对应包的 `service.py`（或 `actions.py`，如果是 envelope-action） |
 | 新增 Model API 托管线的 HTTP/存储逻辑 | `hosted/` 下对应模块 |
 | 新增 Model API agent 运行时（prompt/工具/wake）逻辑 | `model_api_runtime/` 下对应模块（独立包，与 `hosted/` 平级） |

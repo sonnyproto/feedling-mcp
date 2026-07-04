@@ -40,6 +40,15 @@ def test_model_entry_openrouter_prefix():
     assert e["litellm_params"]["model"] == "openrouter/anthropic/claude-3.5-sonnet"
 
 
+def test_model_entry_openrouter_requests_visible_reasoning():
+    e = gw.build_model_entry(user_id="u", provider="openrouter", model="deepseek/deepseek-v4-flash")
+
+    assert e["litellm_params"]["extra_body"]["reasoning"] == {
+        "enabled": True,
+        "exclude": False,
+    }
+
+
 def test_model_entry_openai_compatible_carries_api_base():
     e = gw.build_model_entry(
         user_id="u", provider="openai_compatible", model="my-model",
@@ -112,15 +121,20 @@ def test_config_signature_changes_with_supports_responses():
     assert sig_bridge != sig_native
 
 
-def test_build_config_drops_codex_incompatible_params_and_sets_master_key_env():
+def test_build_config_preserves_reasoning_params_and_sets_master_key_env():
     cfg = gw.build_config([
         {"user_id": "u1", "provider": "gemini", "model": "gemini-2.0-flash"},
     ])
     settings = cfg["litellm_settings"]
     assert settings["drop_params"] is True
-    # Claude/codex emit Anthropic-only params non-Anthropic backends 400 on
-    for p in ("reasoning", "reasoning_effort", "thinking"):
-        assert p in settings["additional_drop_params"]
+    # Codex uses OpenAI Responses reasoning params; if the gateway strips them,
+    # OpenRouter/Gemini/openai-compatible models never get a chance to emit
+    # provider-native thinking summaries for the iOS disclosure.
+    for p in ("reasoning", "reasoning_effort"):
+        assert p not in settings["additional_drop_params"]
+    # Keep dropping Anthropic-only thinking blocks for non-Anthropic gateway
+    # backends; native Anthropic/DeepSeek thinking goes through the claude driver.
+    assert "thinking" in settings["additional_drop_params"]
     # codex authenticates with the gateway key; master_key is an env reference
     assert cfg["general_settings"]["master_key"] == "os.environ/FEEDLING_LITELLM_API_KEY"
     assert [m["model_name"] for m in cfg["model_list"]] == ["gw-u1"]

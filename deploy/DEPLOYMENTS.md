@@ -4,6 +4,46 @@ Canonical record of deployed artifacts. Entries accumulate as we move through
 the phases. Historical operational identifiers may be redacted after
 retirement when keeping the exact value no longer helps verification.
 
+## 🚨 看到 "decrypt failed" 先跑这四步（triage runbook）
+
+> Background: 2026-07 的假警报——一个 prod 用户全部 iOS 历史显示
+> `[encrypted — decrypt failed]`，工程师误判为「enclave KMS 钥变了、prod 数据不可解」。
+> **真因是那台设备的 Keychain 丢了 X25519 `content_sk`**（`K_user` 层，客户端侧），
+> enclave 钥从未改变。下面四步专门防止再次跳到「KMS」结论。
+
+**1. 一个用户，还是所有用户？** enclave/KMS 层的钥变会**在同一瞬间**打死所有用户。
+   只有一个用户报 ⇒ 在证明相反之前，一律按**设备/账号侧**（`K_user`）处理，别碰 enclave。
+   （2026-07 是 136 个聊天用户里仅 1 个受影响 → 明显是客户端。）
+
+**2. 哪一层的 key？** `K_user`（设备 Keychain）vs `K_enclave`（enclave 内容钥）。
+   证明 enclave 侧健康——现役 register→seal→enclave 解密往返：
+   ```bash
+   curl -sk https://9798850e096d770293c67305c6cfdceed68c1d28-5003s.dstack-pha-prod9.phala.network/attestation \
+     | python3 -c 'import sys,json;print("live enclave_content_pk:",json.load(sys.stdin)["enclave_content_pk_hex"])'
+   # 期望 = 2d642ec1f54719d8c6088e8cbaf394961cb804a533bd4d7366d48d1d543f5620（现役基线）
+   ```
+   等 §3 部署 canary 落地后，直接看它的绿灯即可（green ⇒ enclave 正常 ⇒ 客户端问题）。
+   另一条快证据：受影响用户**自己的托管 agent**当天若还能用 `K_enclave` 解出历史，enclave 就没坏。
+
+**3. 老数据还解得开吗？** §2 的 register→seal 只证明**新写入**能往返；本次事故的真正问题是
+   「enclave 还能不能打开**旧** envelope」。等 §4 的 day-0 连续性 canary 落地后看它的绿灯；
+   在此之前，手动跑一遍旧数据解密扫描（脚本 `tools/incident_unwrap_sweep.py` 为 §4 待补）。
+   老数据仍能解 ⇒ 不是钥事件。
+
+**4. 只有当「全员受影响」且上面 canary 全红时**，才比对 `/attestation`：
+   - 比对**基线 repo var**（`ENCLAVE_CONTENT_PK_BASELINE`，见 §2）或本文件顶部
+     Production CVM 表里的 `2d642ec1…`——**绝不要**拿退役部署表里的数字
+     （尤其 `f50c90f7…`，那是死掉的 prod5 app `051a174f` 的钥）。
+   - 跑 §5 的 `enclave_pk_fpr` SQL 找钥变日期。envelope 上 `sha256(pk)[:16]` 自 4 月起
+     恒为 `50f9a01800d4a230de85507d25b86eb1`——一旦某月这个值变了，才是真的换了钥。
+   - **只有到这一步，才联系 Phala。**
+
+> ⚠️ runner CVM（`0cf2da16…` / 老记录里的 `87305c…` 等）有自己独立的 dstack app 与钥，
+> **按设计从不持有内容钥**（它们通过 `FEEDLING_ENCLAVE_URL` 调主 enclave）。
+> 它们的钥和主 enclave 不匹配是正常的，**不构成主 enclave 钥变的证据**。
+
+> 用户可读版镜像到 io-onboarding `troubleshooting.md`（公共仓，另行 push）。
+
 ## Live services
 
 ### Production CVM (prod9, current)
@@ -15,16 +55,19 @@ retirement when keeping the exact value no longer helps verification.
 | App ID | `9798850e096d770293c67305c6cfdceed68c1d28` |
 | Instance ID | `6fe9b54c9f2b428158c3e74de615d0f0a0c457ba` |
 | Compose | `deploy/docker-compose.phala.yaml` — `ingress`, `backend`, `mcp`, `enclave` |
-| Current image | `ghcr.io/teleport-computer/feedling:b1e72a6` |
-| Live git commit | `b1e72a6404560f3cbde72e62f7a0f97950c8fd7b` |
-| Live built at | `2026-05-16T05:55:43Z` |
-| Live compose hash | `0xf09f1ddc41a5fc1b5ee434f1a7beafbefba880b93bcad33582ac64ad5f14bc09` |
+| Current image | `ghcr.io/teleport-computer/feedling:22b0ed6` |
+| Live git commit | `22b0ed6aa92a05d76951768f1924f45010ecda15` |
+| Live built at | `2026-07-02T19:04:02Z` |
+| Live compose hash | `0x0f136ba9dbc65dadfe2ad20cb663e6621d37d1e0c460830e22f6275bce3bad5d` |
 | Public API | `https://api.feedling.app` via `dstack-ingress` |
 | Public MCP | `https://mcp.feedling.app/sse?key=<api_key>` via `dstack-ingress` |
 | Attestation | `https://9798850e096d770293c67305c6cfdceed68c1d28-5003s.dstack-pha-prod9.phala.network/attestation` |
 | WS ingest | `wss://9798850e096d770293c67305c6cfdceed68c1d28-9998.dstack-pha-prod9.phala.network/ingest` |
 | TLS model | `api.feedling.app` + `mcp.feedling.app` terminate at `dstack-ingress`; `/attestation` keeps its own dstack-KMS-derived TLS on `:5003` for iOS pinning. |
 | MCP pubkey pin | Retired in prod9 architecture: `mcp_tls_cert_pubkey_fingerprint_hex` is empty by design; content-layer envelopes sealed to `enclave_content_pk` are the privacy boundary. |
+| **Enclave content pk** | `2d642ec1f54719d8c6088e8cbaf394961cb804a533bd4d7366d48d1d543f5620` — **THE prod9 content-key baseline.** Verified against live `/attestation` 2026-07-03. Envelope `enclave_pk_fpr` = `sha256(pk)[:16]` = `50f9a01800d4a230de85507d25b86eb1`, a constant stamped on envelopes April→July → the enclave content key has **never changed**. ⚠️ Do NOT confuse with the retired prod5 value `f50c90f7…` (app `051a174f`) that still appears in the Phase A/B tables below — that is a different, dead CVM and is NOT this baseline. |
+| mr-kms | `692afc6d7a86a32cfc1ebd9cad1a576aab012bab46986ba609bc8d6407270572` (live `/attestation` 2026-07-03) |
+| KMS | legacy Phala KMS at `kms.dstack-pha-prod7.phala.network` (chain_id null — a KMS instance, NOT an on-chain KMS). The app-auth contract is on Sepolia: `0x6c8A6f1e3eD4180B2048B808f7C4b2874649b88F` (chain_id 11155111), per `/attestation` `app_auth`. |
 | Deploy path | GitHub Actions `deploy-cvm` pins the GHCR image tag, deploys this CVM via Phala, then publishes the live dstack-computed compose hash on Sepolia. |
 
 ### Test CVM (prod9, `test` branch)
@@ -42,7 +85,7 @@ retirement when keeping the exact value no longer helps verification.
 | On-chain | **Separate** Sepolia FeedlingAppAuth `0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5` (owner = the `ETH_DEPLOYER_KEY` address `0xa0eBcd26…`, so the CI `addComposeHash` is authorized), kept apart from prod's contract so the prod release log stays clean. Address lives in repo var `TEST_FEEDLING_APP_AUTH_CONTRACT`. Each `deploy-test-cvm` run publishes the live compose_hash here, fail-loud, same as prod. Deployed 2026-06-09 via a one-shot `workflow_dispatch` (since removed). |
 | Deploy path | GitHub Actions `deploy-test-cvm` job (in `ci.yml`) on push to the `test` branch. Mirrors prod but targets the test compose / CVM / DB / contract and is branch-gated to `refs/heads/test`. |
 | First-boot note | The CVM was first created 2026-06-09 WITHOUT a CF token (to mint the app_id quickly), so `dstack-ingress` couldn't issue the `test-*.feedling.app` LE certs initially. The `test`-branch CI deploy injects `CF_*` from GitHub secrets — domains + certs are now live. Backend also needed the test RDS reachable from the CVM (Publicly accessible + SG inbound 5432) before it stopped crash-looping. |
-| iOS | The iOS app source is not in this repo. Point its test build at app_id `bb9716955423faed3508888e7c654ff46f5f0c2d` + gateway `dstack-pha-prod9.phala.network` + test contract `0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5`. |
+| iOS | The iOS app source is not in this repo. Point its test build at app_id `173c7f49aeb54acb424676b17b17f78e5e2b2938` + gateway `dstack-pha-prod9.phala.network` + test contract `0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5`. ⚠️ (Was `bb9716955423…` before the 2026-07-01 path-B account move — that app_id is **retired**; do not point new builds at it.) |
 
 ### Runner CVM (test, `feedling-io-agents-test`) — multi-node Form B
 
@@ -489,7 +532,7 @@ via the normal `POST /v1/users/register` flow from iOS.
 | Image | `ghcr.io/account-link/feedling:90c8ff6` — adds `POST /v1/content/rewrap` (batched v0→v1 migration endpoint) and surfaces a clear `409 nudge_not_supported_on_v1_cards_yet` instead of silent 404 when `identity.nudge` hits a v1 card |
 | Compose hash | `0x9f7fe0a823bf2820877851863d322b0f3be7fff819a40a8826e6ca994597cf48` (attested by `mr_config_id[1:33]` + `compose-hash` event in RTMR3) |
 | TLS cert fingerprint | `5698f0ade4bb412d6b0847a62d695138f3bbd287dc7d1dbdeb67b15dc445e5ef` — unchanged from Phase 3 because the TLS key derivation path (`feedling-tls-v1`) is stable for this app_id. Phala dstack-KMS derives keys from `(kms_root, app_id, path)`, not `compose_hash`, so compose updates do not rotate keys. |
-| Enclave content pk | `f50c90f711e8484c7178a69657cad99944cba7c0cdeaa3cccb0388021e7d2744` — also stable across compose updates, same reason. Implication: v1 envelopes wrapped for this enclave survive compose rotations without a rewrap dance. |
+| Enclave content pk | `f50c90f711e8484c7178a69657cad99944cba7c0cdeaa3cccb0388021e7d2744` — ⚠️ **retired prod5 app `051a174f` ONLY — NOT the prod9 baseline.** The live prod9 content pk is `2d642ec1…` (see the Production CVM table at the top). Do not compare live `/attestation` against this value. — also stable across compose updates, same reason. Implication: v1 envelopes wrapped for this enclave survive compose rotations without a rewrap dance. |
 | MRTD | `f06dfda6dce1cf904d4e2bab1dc37063…` (unchanged — same base image) |
 | Endpoints | unchanged from Phase 3 — app-id-bound URLs at dstack-pha-prod5, with `-5003s.` passthrough for /attestation |
 | Enclave /attestation | https://051a174f2457a6c474680a5d745372398f97b6ad-5003s.dstack-pha-prod5.phala.network/attestation |
@@ -513,7 +556,7 @@ via the normal `POST /v1/users/register` flow from iOS.
 | Image | `ghcr.io/account-link/feedling:123a45b` — adds `GET /v1/content/export` + `POST /v1/account/reset` endpoints powering the Phase B Settings → Privacy flows |
 | Compose hash | `0x83a415ad16718ceab6eb9bab04a69c05157324c9deaf911d570b10051a772a18` (attested by `mr_config_id[1:33]` + `compose-hash` event in RTMR3) |
 | TLS cert fingerprint | `5698f0ade4bb412d6b0847a62d695138f3bbd287dc7d1dbdeb67b15dc445e5ef` — unchanged from Phase 3 (dstack-KMS derivation is stable per app_id across four compose rotations now) |
-| Enclave content pk | `f50c90f711e8484c7178a69657cad99944cba7c0cdeaa3cccb0388021e7d2744` — unchanged for the same reason. Implication stands: v1 envelopes from earlier compose states are still decryptable after this deploy. |
+| Enclave content pk | `f50c90f711e8484c7178a69657cad99944cba7c0cdeaa3cccb0388021e7d2744` — ⚠️ **retired prod5 app `051a174f` ONLY — NOT the prod9 baseline** (live prod9 = `2d642ec1…`). — unchanged for the same reason. Implication stands: v1 envelopes from earlier compose states are still decryptable after this deploy. |
 | MRTD | `f06dfda6dce1cf904d4e2bab1dc37063…` (unchanged) |
 | On-chain entry | compose_hash `0x83a415ad…`: Sepolia tx `0x8b9b77165cd45aeaf99e9976a8f9cfb2091db45dc2b04134b5b32af8332681fa`. Every prior compose hash still `isAppAllowed()=true`. |
 | Audit evidence | CLI 7/7 green. Live E2E: register → seed chat + memory → export returns JSON with `attestation_snapshot.compose_hash == 0x83a415ad…` and a Content-Disposition suggesting `feedling-export-…` filename → reset w/o confirm body returns 400 → reset with `{"confirm":"delete-all-data"}` returns `{deleted: true}` → subsequent call returns 401 (account gone). |
@@ -589,7 +632,7 @@ from the single CVM described in **Production CVM (prod9, current)** above.
 | App ID | `9798850e096d770293c67305c6cfdceed68c1d28` |
 | CVM ID | `0711c9a4-afdc-40c6-ba49-d8cb95f7e850` |
 | Compose | `deploy/docker-compose.phala.yaml` — now 4 services: `ingress` (dstack-ingress 2.2 multi-domain, HAProxy-based), `enclave` (decrypt + attestation, own TLS on :5003), `backend` (Flask HTTP + WS ingest), `mcp` (FastMCP SSE, plain HTTP behind ingress). |
-| Current live compose_hash | `0xf09f1ddc41a5fc1b5ee434f1a7beafbefba880b93bcad33582ac64ad5f14bc09` (from `/attestation`, 2026-05-18; live build `b1e72a6`, built `2026-05-16T05:55:43Z`). |
+| Compose_hash at Phase-E writeup | `0xf09f1ddc41a5fc1b5ee434f1a7beafbefba880b93bcad33582ac64ad5f14bc09` (from `/attestation`, 2026-05-18; build `b1e72a6`). ⚠️ **Historical — this is the value as of the Phase E writeup, NOT current.** Live prod9 is now compose `0x0f136ba9…` / build `22b0ed6` (2026-07-02) — see the **Production CVM (prod9, current)** table at the top of this file for the live values. |
 | TLS termination | **Migrated**: mcp.feedling.app + api.feedling.app are terminated by `dstack-ingress` inside the CVM (LE certs issued via CF DNS-01, `CLOUDFLARE_API_TOKEN` injected via `phala deploy -e`, not in compose_hash). `enclave` service still terminates its own TLS on :5003 (reached via `-5003s.` passthrough) — iOS audit card Row 7 still pins `sha256(cert.DER)` to REPORT_DATA. WS ingest on :9998 stays gateway-TLS with FrameEnvelope v1 app-layer crypto. |
 | MCP pubkey pin (Phase C.2) | **Retired**: `FEEDLING_MCP_TLS_IN_ENCLAVE=false` on the enclave service, so `mcp_tls_cert_pubkey_fingerprint_hex` is empty. iOS audit card shows the existing "Pre-Phase-C.2 deployment" disclosure row. Content-layer envelope crypto (enclave_content_pk) remains the real trust boundary for reads/writes. |
 | VPS | **Decommissioned**: `deploy-vps` CI job deleted; `api.feedling.app` + `mcp.feedling.app` DNS moved off the retired host and onto dstack-gateway/ingress. Prod user re-onboards from scratch per 2026-04-21 user direction (no v0→v1-style migration path). |

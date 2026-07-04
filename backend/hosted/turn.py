@@ -16,7 +16,6 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 import httpx
-from flask import Blueprint, Response, jsonify, request, g
 
 import db
 from core import envelope as core_envelope
@@ -894,8 +893,8 @@ def _model_api_capture_prompt(user_message: str, assistant_reply: str, context_p
 
 def _model_api_existing_memory_terms(store: UserStore, api_key: str | None) -> dict[str, list[str]]:
     try:
-        from memory import routes as memory_routes
-        buckets, threads = memory_routes._memory_existing_terms(store, api_key)
+        from memory import memory_core
+        buckets, threads = memory_core.existing_terms_via_api_key(store, api_key)
     except Exception:
         buckets, threads = [], []
     return {
@@ -1256,30 +1255,34 @@ def _archive_model_api_memory_cards(
     target_ids = {str(mid) for mid in memory_ids if str(mid).strip()}
     if not target_ids:
         return 0
-    moments = memory_service._load_moments(store)
+    # Hold memory_lock across load→archive→save (this background repair job is a
+    # concurrent writer vs foreground memory.add — the exact collision the plain
+    # Lock masked under Flask -w1). RLock lets _append_memory_change re-enter.
     archived = 0
     now = core_util._now_iso()
-    for idx, moment in enumerate(moments):
-        if not isinstance(moment, dict) or str(moment.get("id") or "") not in target_ids:
-            continue
-        if memory_service._memory_is_archived(moment):
-            continue
-        updated = dict(moment)
-        updated["is_archived"] = True
-        updated["archived_at"] = now
-        updated["archive_reason"] = reason[:300]
-        updated["archived_by_repair_job"] = job_id
-        updated["updated_at"] = now
-        moments[idx] = updated
-        archived += 1
-        memory_service._append_memory_change(store, {
-            "action": "archive",
-            "memory_id": str(moment.get("id") or ""),
-            "type": str(moment.get("type") or ""),
-            "reason": reason,
-        })
-    if archived:
-        memory_service._save_moments(store, moments)
+    with memory_service.mutation_lock(store):
+        moments = memory_service._load_moments(store)
+        for idx, moment in enumerate(moments):
+            if not isinstance(moment, dict) or str(moment.get("id") or "") not in target_ids:
+                continue
+            if memory_service._memory_is_archived(moment):
+                continue
+            updated = dict(moment)
+            updated["is_archived"] = True
+            updated["archived_at"] = now
+            updated["archive_reason"] = reason[:300]
+            updated["archived_by_repair_job"] = job_id
+            updated["updated_at"] = now
+            moments[idx] = updated
+            archived += 1
+            memory_service._append_memory_change(store, {
+                "action": "archive",
+                "memory_id": str(moment.get("id") or ""),
+                "type": str(moment.get("type") or ""),
+                "reason": reason,
+            })
+        if archived:
+            memory_service._save_moments(store, moments)
     return archived
 
 

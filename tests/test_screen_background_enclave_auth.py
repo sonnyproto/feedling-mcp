@@ -9,18 +9,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import pytest  # noqa: E402
-from flask import Flask  # noqa: E402
 
+from core import reqctx  # noqa: E402
 from screen import frames as screen_frames  # noqa: E402
 from screen import caption as screen_caption  # noqa: E402
 
-_app = Flask(__name__)
 _MODS = [screen_frames, screen_caption]
 
 
 @pytest.mark.parametrize("mod", _MODS)
 def test_picks_request_runtime_token_when_no_api_key(mod):
-    with _app.test_request_context(headers={"X-Feedling-Runtime-Token": "rt_1"}):
+    with reqctx.bind(headers={"X-Feedling-Runtime-Token": "rt_1"}):
         assert mod._enclave_auth_headers(None) == {"X-Feedling-Runtime-Token": "rt_1"}
 
 

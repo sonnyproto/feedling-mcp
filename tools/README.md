@@ -223,11 +223,59 @@ AGENT_MODE=cli
 AGENT_CLI_CMD=mycli ask {message}
 ```
 
+A known-good **claude** command that can actually see chat images (assumes
+`IMAGE_TEMP_DIR=/home/agent/images`; adjust the path to yours — see the vision
+notes below for why `--add-dir` and the `//` are required):
+
+```
+AGENT_MODE=cli
+IMAGE_TEMP_DIR=/home/agent/images
+AGENT_CLI_CMD=claude --permission-mode acceptEdits --add-dir /home/agent/images --allowed-tools 'Read(//home/agent/images/**)' -p {message}
+```
+
 `{message}` is substituted with the user's plaintext message. The
 command's stdout becomes the reply. For image messages, the consumer writes
 the decrypted image to `IMAGE_TEMP_DIR` and either appends the file path to
 `{message}` or fills explicit `{image_path}` / `{image_paths}` placeholders
 if your CLI supports image arguments.
+
+**Getting the model to actually see the image (CLI mode).** Writing the path
+into `{message}` only tells the model a file exists — it does not feed pixels.
+Make sure the image reaches the model as real vision input:
+
+- **codex** (`codex exec …`): the consumer auto-attaches each decrypted image
+  with an `--image=<path>` flag (codex's native image input; the `=`-bound form
+  keeps clap's variadic `--image` from swallowing the positional prompt), so no
+  template change is needed. If you wire your own `-i {image_path}` /
+  `{image_paths}`, the consumer respects it and does not double-attach.
+- **claude** (`claude -p …`): claude opens the image via its `Read` tool, which is
+  gated by **two** things — get either wrong and the read is silently denied, the
+  bubble stays blank, and a vision model will often *hallucinate* the contents
+  instead of admitting it saw nothing:
+    1. **Workspace boundary.** Headless `claude -p` refuses to read files outside its
+       current working directory (plus any `--add-dir`) *before* it even consults the
+       allowlist. `IMAGE_TEMP_DIR` is almost always outside your CLI's cwd, so pass
+       **`--add-dir <IMAGE_TEMP_DIR>`** (e.g. `--add-dir /home/agent/images`). This is
+       the single most reliable fix — `--add-dir` makes files there readable and does
+       not widen Bash. (Alternatively, launch claude with its cwd at the image dir's
+       parent so `images/` is inside the workspace.)
+    2. **Allow-rule path syntax.** In `--allowed-tools`, a Read rule's path is
+       gitignore-style: a **single** leading slash anchors at the *settings source*
+       (your cwd), **not** the filesystem root. So `Read(/home/agent/images/**)`
+       silently means `<cwd>/home/agent/images/**` and never matches — you must use a
+       **double** slash for a filesystem-absolute path:
+       `Read(//home/agent/images/**)`. (With `--add-dir` this rule is optional, but if
+       you pin a strict `--allowed-tools` allowlist, use the `//` form.)
+  The managed (hosted) default command already passes `--add-dir` and the `//` rule;
+  VPS operators pinning their own command must add them.
+- Any CLI with a first-class image flag: use the `{image_path}` / `{image_paths}`
+  template slot so pixels are attached, not just referenced.
+
+Note screen-share frames are attached only when `SCREEN_CONTEXT_MODE=on_mention`
+(default) *and* the message mentions the screen (屏幕 / 共享 / 看到 / 这个 /
+screen / share / look at …), and only if fresher than
+`SCREEN_CONTEXT_MAX_AGE_SEC` (300s). Set `SCREEN_CONTEXT_MODE=always` to attach
+the latest frame on every turn (higher token cost / less private).
 
 When running under `systemd`, do not assume your interactive shell `PATH`
 is available. Prefer an absolute executable path in `AGENT_CLI_CMD`; if that
@@ -292,6 +340,22 @@ The consumer reads Claude Code's `session_id` from JSON output and injects
 service environment cannot find `claude`, use an absolute executable path or set
 `AGENT_CLI_PATH`.
 
+The bare command above cannot **see images / screen frames** — claude needs its
+image dir in the workspace and a correctly-anchored Read grant. Add
+`--add-dir <IMAGE_TEMP_DIR>` and `--allowed-tools 'Read(//<IMAGE_TEMP_DIR>/**)'`
+(note the **double** slash — see "Getting the model to actually see the image"
+above for why a single slash silently fails), e.g.:
+
+```
+AGENT_CLI_CMD=claude --print --output-format json --add-dir /home/agent/images --allowed-tools 'Read(//home/agent/images/**)' "{message}"
+```
+
+To also let the agent pull screen frames / photos on its own
+(`io_cli screen-read --include-image`, `photo-read --include-image`), grant the
+matching `Bash(python <io_cli> …)` verbs too — those tools now save the decrypted
+picture into `IMAGE_TEMP_DIR` and return an `image_file` path the same Read grant
+covers.
+
 ### Session bounds and failure behavior
 
 The resident owns IO-facing session continuity and keeps it bounded. For CLI
@@ -333,6 +397,18 @@ agent CLI has a first-class image flag.
 If the decrypt source cannot provide image bytes, the consumer logs the
 failure and routes only the honest placeholder; it should not pretend to
 have seen the image.
+
+The above delivers the pixels of the image in the **current** turn. Images
+from **earlier** turns are a different case: the recent-chat transcript that
+gets injected for cross-turn continuity is text-only and cannot carry pixels,
+so a past image turn appears there as `[image] … io_cli chat-image --id <id>`.
+An agent that wants to look at that older picture runs
+`io_cli chat-image --id <message_id>`, which pulls just that one message's
+decrypted image from the enclave and writes it to a Read-able file (same
+`IMAGE_TEMP_DIR` + Read grant as `screen-read`/`photo-read --include-image`).
+This is lazy on purpose — history images are only decrypted when the agent
+actually asks. Do not point the agent at `photo-read` for chat images; that
+command serves the perception photo library, a separate feed.
 
 ### Re-auth checklist
 

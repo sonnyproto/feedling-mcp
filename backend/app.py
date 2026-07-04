@@ -23,8 +23,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import httpx
 import jwt
 import websockets
-from flask import Flask, abort, g, jsonify, request, Response, send_file
-from flask_compress import Compress
+
+import asgi_test_client
 
 from content_encryption import build_envelope
 from provider_client import (
@@ -69,7 +69,6 @@ import accounts
 import agent as agent_pkg
 import genesis as genesis_pkg
 from accounts import access as accounts_access
-from accounts import auth as accounts_auth
 from accounts import onboarding as accounts_onboarding
 from accounts import recover as accounts_recover
 from accounts import registry as accounts_registry
@@ -89,14 +88,15 @@ import content as content_pkg
 import copytext as copytext_pkg
 import tracking as tracking_pkg
 from admin import data_track as admin_data_track
-from content import routes as content_routes
-from tracking import routes as tracking_routes
+from content import content_core
+from tracking import tracking_core
 import chat as chat_pkg
 import identity as identity_pkg
 import memory as memory_pkg
+import worldbook as worldbook_pkg
 import proactive as proactive_pkg
 from bootstrap import gates as boot_gates
-from bootstrap import routes as bootstrap_routes
+from bootstrap import bootstrap_core
 from chat import consumer as chat_consumer
 from chat import service as chat_service
 from identity import actions as identity_actions
@@ -228,11 +228,6 @@ PROACTIVE_WAKE_FRAME_CANDIDATE_MAX = screen_frames.PROACTIVE_WAKE_FRAME_CANDIDAT
 # ---------------------------------------------------------------------------
 
 
-# Auth moved to accounts/auth.py（COMPAT re-exports 迁移期）
-_extract_api_key = accounts_auth._extract_api_key
-require_user = accounts_auth.require_user
-
-
 # ---------------------------------------------------------------------------
 # Frames helpers
 # ---------------------------------------------------------------------------
@@ -341,105 +336,22 @@ _render_proactive_dashboard = proactive_dashboard._render_proactive_dashboard
 # collide); a fixed-port server is self-protecting, but electing keeps exactly
 # one and lets a survivor take over if the holder dies.
 WS_PORT = screen_ws.WS_PORT
-core_leader.run_singleton("ws", screen_ws.start)
 
-# Cross-worker wake bus (one listener per worker). Lets us run -w N: a genuine
-# write on any worker wakes the long-poll waiters and refreshes the cached store
-# on every other worker. No-op under -w 1 (self-origin notifies are skipped).
-# The "users" channel reloads the registry (core may not import accounts, so the
-# handler is injected here); store channels are handled inside wake_bus.
-core_wake_bus.register_handler("users", lambda _uid: accounts_registry.load_users())
-# Note: the "proactive" NOTIFY channel still wakes resident long-poll waiters via
-# the core _STORE_CHANNELS path (_wake_store_waiters) — no extra handler needed.
-core_wake_bus.start_listener()
+# The Flask web layer was deleted (ASGI-migration §13): production serves through
+# ``asgi_app`` only, and every startup side effect that used to run here on
+# ``import app`` (WS-leader election, the cross-worker wake-bus LISTEN, the
+# per-request access log, gzip compression, the db-schema upgrade) now lives in
+# ``asgi.lifespan`` / ``gunicorn_conf.on_starting``. What remains in this module
+# is the symbol re-export facade the test suite consumes plus the assembly
+# dependency-injection wiring below.
+#
+# ``app`` is no longer a Flask app: it is a tiny ASGI-backed stand-in whose
+# ``test_client()`` drives the real assembled FastAPI app (asgi_app.app) with the
+# Flask-test-client API the suite uses. See backend/asgi_test_client.py.
+app = asgi_test_client._AsgiApp()
 
-app = Flask(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Per-request access log
-# ---------------------------------------------------------------------------
-# gunicorn (production) does not emit Flask's old dev-server access line, so
-# without this the only per-request visibility in `phala cvms logs` is whatever
-# individual handlers happen to print. This logs ONE structured line per
-# request with the server-side handler time (dur_ms) and the on-the-wire
-# response size + encoding — enough to tell "backend slow" from "network slow"
-# and to spot oversized responses straight from the CVM logs. Registered
-# before Compress(app) so it runs AFTER compression and records the final
-# Content-Length / Content-Encoding.
-@app.before_request
-def _access_log_start():
-    g._req_start = time.monotonic()
-
-
-@app.after_request
-def _access_log_end(response):
-    # /healthz is hit constantly by the HAProxy/uptime probe — skip the noise.
-    if request.path == "/healthz":
-        return response
-    start = getattr(g, "_req_start", None)
-    dur_ms = int((time.monotonic() - start) * 1000) if start is not None else -1
-    uid = getattr(g, "user_id", "-")
-    clen = response.headers.get("Content-Length", "?")
-    enc = response.headers.get("Content-Encoding", "-")
-    # Keep the query string (limit/since/include_image_body — the useful bits)
-    # but REDACT the `key` param: _extract_api_key() accepts `?key=` as a legacy
-    # auth method, so the URL can carry a live API key that must never reach the
-    # logs. Match case-insensitively so a stray `?Key=`/`?KEY=` is redacted too,
-    # not dumped verbatim via the full_path fallback below.
-    if any(k.lower() == "key" for k in request.args):
-        pairs = [
-            (k, "REDACTED" if k.lower() == "key" else v)
-            for k, v in request.args.items(multi=True)
-        ]
-        path = f"{request.path}?{urlencode(pairs)}"
-    else:
-        path = request.full_path.rstrip("?")
-    print(
-        f"[req] uid={uid} {request.method} {path} status={response.status_code} "
-        f"bytes={clen} enc={enc} dur_ms={dur_ms}",
-        flush=True,
-    )
-    return response
-
-
-# gzip responses when the client sends Accept-Encoding: gzip. CVM egress
-# throughput is ~30-50 KB/s for large payloads; the decrypt-with-image
-# path was shipping 470 KB of JSON per call, and dropping that in half
-# via compression is a 3-5x latency win for "show me the screen" calls.
-Compress(app)
-
-# Extended Perception — self-contained feature module (backend/perception/).
-# Mounts the /v1/perception/* blueprint; all its logic lives in that package.
-from perception import register as register_perception  # noqa: E402
-
-accounts.register(app)
-agent_pkg.register(app)
-push_pkg.register(app)
-proactive_pkg.register(app)
-identity_pkg.register(app)
-memory_pkg.register(app)
-bootstrap_pkg.register(app)
-genesis_pkg.register(app)
-chat_pkg.register(app)
-tracking_pkg.register(app)
-admin_pkg.register(app)
-content_pkg.register(app)
-copytext_pkg.register(app)
-hosted_pkg.register(app)
-screen_pkg.register(app)
+# Facade re-export (kept from the perception assembly; not a route registration).
 from perception import snapshot_for_wake as _perception_wake_snapshot  # noqa: E402
-register_perception(app)
-
-# Client diagnostic-log collection (backend/diagnostics/). Mounts the
-# /v1/diagnostics/* upload + admin read blueprint.
-from diagnostics import register as register_diagnostics  # noqa: E402
-register_diagnostics(app)
-
-# Onboarding original-file archival (backend/onboarding_archive/). Mounts
-# POST /v1/onboarding/archive.
-from onboarding_archive import register as register_onboarding_archive  # noqa: E402
-register_onboarding_archive(app)
 
 # ---------------------------------------------------------------------------
 # APNs config (global — one Apple dev key for the app)
@@ -532,8 +444,8 @@ _save_onboarding_route = accounts_onboarding._save_onboarding_route
 
 
 # Encrypted-content counts — moved to content/routes.py（COMPAT 迁移期）
-_has_encrypted_content_record = content_routes._has_encrypted_content_record
-_encrypted_content_counts = content_routes._encrypted_content_counts
+_has_encrypted_content_record = content_core._has_encrypted_content_record
+_encrypted_content_counts = content_core._encrypted_content_counts
 
 # ---------------------------------------------------------------------------
 # IO-hosted Model API key route
@@ -601,10 +513,7 @@ _live_activity_identity_context = push_live_activity._live_activity_identity_con
 _live_activity_content_state = push_live_activity._live_activity_content_state
 _live_activity_body = push_live_activity._live_activity_body
 _live_activity_top_app = push_live_activity._live_activity_top_app
-push_live_activity_inner = push_live_activity.push_live_activity_inner
 push_live_activity_end_inner = push_live_activity.push_live_activity_end_inner
-push_live_start_inner = push_live_activity.push_live_start_inner
-push_live_activity_hybrid_inner = push_live_activity.push_live_activity_hybrid_inner
 _send_chat_alert = push_service._send_chat_alert
 _json_body_from_response = push_service._json_body_from_response
 _deliver_ai_message_push_if_background = push_service._deliver_ai_message_push_if_background
@@ -638,7 +547,7 @@ _deliver_ai_message_push_if_background = push_service._deliver_ai_message_push_i
 # ---------------------------------------------------------------------------
 
 # Tracking — moved to tracking/routes.py（COMPAT 迁移期）
-_make_tracking_event = tracking_routes._make_tracking_event
+_make_tracking_event = tracking_core._make_tracking_event
 
 # ---------------------------------------------------------------------------
 # Chat
@@ -652,8 +561,6 @@ _chat_history_item = chat_service._chat_history_item
 
 
 
-_request_chat_consumer_id = chat_service._request_chat_consumer_id
-_request_bool_arg = chat_service._request_bool_arg
 _float_meta = chat_service._float_meta
 _chat_message_claimable = chat_service._chat_message_claimable
 _pending_chat_messages_for_poll = chat_service._pending_chat_messages_for_poll
@@ -783,7 +690,7 @@ _execute_memory_actions = memory_actions._execute_memory_actions
 
 
 # Bootstrap routes — moved to bootstrap/routes.py（COMPAT 迁移期）
-_load_bootstrap = bootstrap_routes._load_bootstrap
+_load_bootstrap = bootstrap_core._load_bootstrap
 
 # ---------------------------------------------------------------------------
 # Verification endpoints — Phase 2 of the post-2026-05-15 onboarding
@@ -820,8 +727,6 @@ _onboarding_validation_payload = hosted_onboarding_validation._onboarding_valida
 # ---------------------------------------------------------------------------
 
 # Admin data-track — moved to admin/data_track.py（COMPAT 迁移期）
-_extract_admin_token = admin_data_track._extract_admin_token
-require_admin = admin_data_track.require_admin
 _latest_epoch = admin_data_track._latest_epoch
 _count_rows = admin_data_track._count_rows
 
@@ -845,19 +750,8 @@ _count_rows = admin_data_track._count_rows
 
 
 
-@app.errorhandler(401)
-def _unauthorized(e):
-    return jsonify({"error": "unauthorized"}), 401
-
-
-@app.errorhandler(403)
-def _forbidden(e):
-    return jsonify({"error": "forbidden"}), 403
-
-
-@app.errorhandler(503)
-def _unavailable(e):
-    return jsonify({"error": "service_unavailable", "detail": "admin token is not configured"}), 503
+# The 401/403/503 fixed-body error mapping now lives in asgi.middleware
+# (register_exception_handlers) — the ASGI parity of the old Flask errorhandlers.
 
 
 # Assembly wiring: identity sits above push — inject the identity-card
@@ -886,22 +780,24 @@ for _mod in (hosted_config_store, hosted_context, hosted_history_import,
 
 
 if __name__ == "__main__":
-    # Fail-fast: gateway-only codex providers (gemini/openrouter/openai_compatible)
-    # have no consumer spawned unless the in-CVM LiteLLM gateway is up; starting
-    # without it would silently wedge those users in "processing". Validate here
-    # so the problem surfaces immediately on launch rather than at request time.
-    # NOTE: gunicorn/wsgi path does not run __main__; that production entry point
-    # runs the same check via backend/gunicorn_conf.py's on_starting hook.
+    # Dev / hermetic-test entry point. Production serves via gunicorn's
+    # UvicornWorker (deploy/*compose*, ``asgi_app:app``); this ``python app.py``
+    # path boots the SAME assembled ASGI app under a single uvicorn process so
+    # the subprocess-based integration tests (and local dev) get a real HTTP
+    # server with the full lifespan (wake-bus, threadpool limiter, wake hook).
+    # It replaces the old Flask ``app.run`` dev server deleted with the Flask
+    # web layer (ASGI-migration §13). Plain uvicorn (no gunicorn fork) sidesteps
+    # the macOS fork+C-extension SIGSEGV.
+    #
+    # Fail-fast: gateway-only codex providers have no consumer spawned unless the
+    # in-CVM LiteLLM gateway is up; validate here so a misconfig surfaces at
+    # launch, not at request time (gunicorn runs the same check in on_starting).
     hosted_agent_runtime_cutover.assert_hosting_ready()
-    # PORT is read so isolation/load tests can spin up a hermetic backend on
-    # a random free port without colliding with a developer's local dev
-    # server on 5001 (or with another test running in parallel). Production
-    # deploys can leave it unset — the 5001 default matches the published
-    # compose/Dockerfile contract.
+
+    import uvicorn
+
+    import asgi_app
+
     port = int(os.environ.get("FEEDLING_PORT", os.environ.get("PORT", "5001")))
-    # Production and all containers run gunicorn (see deploy/Dockerfile CMD
-    # and the compose files): the Werkzeug dev server below is single-process
-    # and stalls on large responses under the TDX CVM. Keep this path for
-    # local dev and the hermetic test harness ONLY — never for real traffic.
-    print(f"Feedling DEV server running at http://0.0.0.0:{port} (mode=multi-tenant, auth=api-key; prod uses gunicorn)")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    print(f"Feedling backend (ASGI) running at http://0.0.0.0:{port} (mode=multi-tenant, auth=api-key)")
+    uvicorn.run(asgi_app.app, host="0.0.0.0", port=port, log_level="info")

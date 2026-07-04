@@ -10,14 +10,3 @@ Integration is two one-liners in app.py:
     from diagnostics import register as register_diagnostics
     register_diagnostics(app)
 """
-
-from __future__ import annotations
-
-from .routes import bp
-
-__all__ = ["register"]
-
-
-def register(app) -> None:
-    """Mount the diagnostics blueprint (/v1/diagnostics/* and the admin read)."""
-    app.register_blueprint(bp)

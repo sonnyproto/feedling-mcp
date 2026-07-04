@@ -13,12 +13,52 @@ import json
 import sys
 import time
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 import perception.service as service
+from perception import perception_read_core
+
+
+# The Flask /v1/perception/* blueprint was deleted in the ASGI cutover; this tiny
+# client mimics the old Flask test-client response for the two routes these tests
+# exercise (/report, /app_open), routing straight to the framework-neutral
+# perception_read_core the ASGI routes delegate to.
+class _PResp:
+    def __init__(self, body, status=200):
+        self.status_code = status
+        self._body = body
+
+    def get_json(self):
+        return self._body
+
+
+class _PerceptionClient:
+    def __init__(self, store, api_key="apikey-perc"):
+        # The old Flask route resolved a separate auth store carrying ``user_id``;
+        # the neutral core reads ``store.user_id`` then does all state I/O via the
+        # (monkeypatched) ``service.store``. The FakeStore is that service store, so
+        # just stamp the same UID on it.
+        if not hasattr(store, "user_id"):
+            store.user_id = UID
+        self._store = store
+        self._api_key = api_key
+
+    def post(self, path, json=None):
+        p = urlparse(path).path
+        if p == "/v1/perception/report":
+            return _PResp(*perception_read_core.report(self._store, json or {}, api_key=self._api_key))
+        raise AssertionError(f"unrouted path: {p}")
+
+    def get(self, path):
+        u = urlparse(path)
+        if u.path == "/v1/perception/app_open":
+            q = {k: v[0] for k, v in parse_qs(u.query).items()}
+            return _PResp(*perception_read_core.app_open(self._store, q))
+        raise AssertionError(f"unrouted path: {u.path}")
 
 
 class FakeStore:
@@ -127,6 +167,7 @@ def env(monkeypatch):
     monkeypatch.setattr(service, "_settings_v2_for_user", lambda uid: None)
     monkeypatch.setattr(service, "_fire_wake_event_v2",
                         lambda event: wakes.append((event.trigger, event.change_digest)))
+    monkeypatch.setattr(service, "_proactive_activation_ready", lambda uid: True)
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
                         lambda user_or_store: False)
     return fake, wakes
@@ -215,9 +256,11 @@ def test_snapshot_timezone_survives_ttl_but_local_time_expires(env):
     assert snap["local_time"] is None            # volatile -> expires
 
 
-def test_record_context_timezone_writes_state(env):
-    """The proactive app-presence channel persists the device timezone without the
-    perception-upload pipeline, so proactive's current_time anchor can localize."""
+def test_record_context_timezone_writes_locale_to_snapshot(env):
+    """The app-presence channel must still populate the perception snapshot with
+    timezone AND locale: the resident consumer's reply-language guardrail
+    (_reply_language_line) reads `locale` from /v1/agent/perception?signals=now,
+    so a perception-upload-OFF user relies on this write for it."""
     fake, _ = env
     assert service.record_context_timezone(UID, "Asia/Shanghai", "zh") is True
     snap = service.snapshot(UID)
@@ -403,17 +446,12 @@ def test_app_open_via_get_route(env, monkeypatch):
     import sys
     import types
     from flask import Flask
-    import perception.routes as routes
 
     fake, _ = env
-    import accounts.auth as accounts_auth
-    monkeypatch.setattr(accounts_auth, "require_user", lambda: types.SimpleNamespace(user_id=UID))
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
                         lambda user_or_store: False)
 
-    app = Flask("t")
-    app.register_blueprint(routes.bp)
-    client = app.test_client()
+    client = _PerceptionClient(fake)
     r = client.get("/v1/perception/app_open?key=APIKEY&app=Instagram&category=social&ts=1000")
     assert r.status_code == 200 and r.get_json()["app"] == "Instagram"
     assert fake.get_state(UID)["app_name"]["v"] == "Instagram"
@@ -507,15 +545,10 @@ def test_report_endpoint_context_snapshot(env, monkeypatch):
     import sys
     import types
     from flask import Flask
-    import perception.routes as routes
 
     fake, _ = env
-    import accounts.auth as accounts_auth
-    monkeypatch.setattr(accounts_auth, "require_user", lambda: types.SimpleNamespace(user_id=UID))
 
-    app = Flask("t")
-    app.register_blueprint(routes.bp)
-    client = app.test_client()
+    client = _PerceptionClient(fake)
     r = client.post("/v1/perception/report", json={"context_snapshot": [
         {"key": "motion_state", "data": json.dumps({"state": "walking"})},
     ]})
@@ -532,17 +565,12 @@ def test_report_endpoint_context_snapshot_v2_flag_on(env, monkeypatch):
     """When the per-user rollout flag is on, /report dispatches to V2 ingress."""
     import types
     from flask import Flask
-    import perception.routes as routes
 
     fake, _ = env
-    import accounts.auth as accounts_auth
-    monkeypatch.setattr(accounts_auth, "require_user", lambda: types.SimpleNamespace(user_id=UID))
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
                         lambda user_or_store: True)
 
-    app = Flask("t")
-    app.register_blueprint(routes.bp)
-    client = app.test_client()
+    client = _PerceptionClient(fake)
     r = client.post("/v1/perception/report", json={"context_snapshot": [
         {"key": "motion_state", "envelope": {
             "v": 1, "id": "motion_env", "body_ct": "x", "nonce": "n",
@@ -578,15 +606,10 @@ def _report_client(env, monkeypatch, *, ingress_v2=False):
     import sys
     import types
     from flask import Flask
-    import perception.routes as routes
     fake, _ = env
-    import accounts.auth as accounts_auth
-    monkeypatch.setattr(accounts_auth, "require_user", lambda: types.SimpleNamespace(user_id=UID))
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
                         lambda user_or_store: ingress_v2)
-    app = Flask("t")
-    app.register_blueprint(routes.bp)
-    return fake, app.test_client()
+    return fake, _PerceptionClient(fake)
 
 
 def test_report_multiplex_items(env, monkeypatch):
@@ -690,6 +713,19 @@ def test_wake_suppressed_when_settings_disabled_or_dnd_or_away(env, monkeypatch)
         assert wakes == [], f"case {reason}: wake should be suppressed"
         assert any(e.get("type") == "suppressed" and e.get("reason") == reason
                    for e in fake.read_events(uid)), f"case {reason}"
+
+
+def test_wake_suppressed_until_proactive_activation(env, monkeypatch):
+    fake, wakes = env
+    monkeypatch.setattr(service, "_app_proactive_settings", lambda uid: {})
+    monkeypatch.setattr(service, "_proactive_activation_ready", lambda uid: False)
+    uid = "u_activation_pending"
+    _ingest_location(uid, "gym")
+    assert wakes == []
+    events = fake.read_events(uid)
+    assert any(e.get("type") == "suppressed" and e.get("reason") == "activation_pending"
+               for e in events)
+    assert not any(e.get("type") == "wake" for e in events)
 
 
 def test_wake_fires_normally_when_gate_open(env, monkeypatch):

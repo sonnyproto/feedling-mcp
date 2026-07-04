@@ -373,7 +373,7 @@ def _memory_action_from_output(item: dict) -> dict:
         "content": str(item.get("content") or "").strip()[:5000],
         "bucket": _text(item.get("bucket"), 80),
         "threads": item.get("threads") if isinstance(item.get("threads"), list) else [],
-        "occurred_at": _text(item.get("occurred_at") or _now_iso(), 80),
+        "occurred_at": _text(item.get("occurred_at"), 80),
         "source": GENESIS_SOURCE,
         "importance": item.get("importance", 0.5),
         "pulse": item.get("pulse", 0.3),

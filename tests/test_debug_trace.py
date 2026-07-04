@@ -74,3 +74,57 @@ def test_detail_is_size_bounded_metadata(monkeypatch):
     debug_trace.trace_event(store, subsystem="memory", type="t", detail={"big": "x" * 9999})
     ev = debug_trace.read_trace(store)[0]
     assert len(ev["detail"]["big"]) <= 200  # caller content can't bloat the buffer
+
+
+# --- M1: explain / content_excerpt / dur_ms + verbose gate + caps -----------
+
+
+class FakeStore:
+    def __init__(self, uid="u1"):
+        self.user_id = uid
+
+
+def _reset_verbose(monkeypatch):
+    """In-memory blob store + force gate ON."""
+    blobs = {}
+    monkeypatch.setattr(debug_trace.db, "get_blob", lambda uid, k: blobs.get((uid, k)))
+    monkeypatch.setattr(debug_trace.db, "set_blob", lambda uid, k, v: blobs.__setitem__((uid, k), v))
+    monkeypatch.setattr(debug_trace, "_hard_disabled", lambda: False)
+    debug_trace._flag_cache.clear()
+    return blobs
+
+
+def test_verbose_off_strips_content_excerpt(monkeypatch):
+    _reset_verbose(monkeypatch)
+    store = FakeStore()
+    debug_trace.set_enabled(store, True)
+    monkeypatch.setenv("FEEDLING_DEBUG_VERBOSE", "0")  # force strip
+    debug_trace.trace_event(store, subsystem="agent", type="agent.model.call.done",
+                            explain="模型返回", content_excerpt={"reply": "hello"}, dur_ms=12.0)
+    ev = debug_trace.read_trace(store, limit=10)[0]
+    assert ev["explain"] == "模型返回"
+    assert ev["dur_ms"] == 12.0
+    assert ev.get("content_excerpt") in (None, {}, )  # stripped when verbose off
+
+
+def test_content_excerpt_field_truncation(monkeypatch):
+    _reset_verbose(monkeypatch)
+    store = FakeStore()
+    debug_trace.set_enabled(store, True)
+    monkeypatch.delenv("FEEDLING_DEBUG_VERBOSE", raising=False)  # verbose defaults ON with gate
+    big = "x" * 5000
+    debug_trace.trace_event(store, subsystem="agent", type="t",
+                            content_excerpt={"prompt": big})
+    ev = debug_trace.read_trace(store, limit=10)[0]
+    assert len(ev["content_excerpt"]["prompt"]) <= 2048 + len("…(truncated)")
+    assert ev["content_excerpt"]["prompt"].endswith("…(truncated)")
+
+
+def test_verbose_ring_cap(monkeypatch):
+    _reset_verbose(monkeypatch)
+    store = FakeStore()
+    debug_trace.set_enabled(store, True)
+    monkeypatch.delenv("FEEDLING_DEBUG_VERBOSE", raising=False)
+    for i in range(260):
+        debug_trace.trace_event(store, subsystem="route", type=f"t{i}")
+    assert len(debug_trace.read_trace(store, limit=1000)) == 200  # verbose cap

@@ -109,12 +109,41 @@ if not _provisioned:
         "test_agent_runtime_spawners.py",
         "test_agent_runtime_resident_contract.py",
         "test_hosted_agent_runtime_cutover.py",
+        "test_worldbook_match.py",
+        "test_worldbook_readside_core.py",
+        "test_asgi_app_import_guard.py",
+        "test_asgi_waiters.py",
     }
     collect_ignore = sorted(
         f
         for f in os.listdir(os.path.dirname(os.path.abspath(__file__)))
         if f.startswith("test_") and f.endswith(".py") and f not in _PURE_UNIT
     )
+
+
+def seed_user(user_id: str, **doc) -> None:
+    """Test-only: insert a minimal row into the ``users`` table so per-user
+    writes aren't rejected by the 0011 CASCADE FK. Production guarantees
+    users-first via the registration path; tests that write per-user tables
+    directly must call this first.
+
+    Also mirrors the entry into the in-memory registry (``accounts.registry
+    ._users`` — the same list object ``app.py`` binds as ``_users``), since a
+    real ``/v1/users/register`` call populates both the DB row and the
+    process-local registry. Callers that skip the registry half end up with a
+    DB-only "ghost" user that ``registry._user_entry_snapshot()`` can't see —
+    which trips gates like the push-service account-existence check into
+    treating the seeded user as deleted. Idempotent: won't double-append if
+    the user_id is already present (e.g. re-seeded across tests sharing the
+    session-scoped DB/registry)."""
+    import db
+    from accounts import registry
+
+    entry = {"user_id": user_id, **doc}
+    db.upsert_user(entry)
+    with registry._users_lock:
+        if not any(u.get("user_id") == user_id for u in registry._users):
+            registry._users.append(entry)
 
 
 def pytest_report_header(config):

@@ -8,7 +8,6 @@ import time
 import uuid
 from datetime import date, datetime
 
-from flask import jsonify, request
 
 import db
 from core.store import UserStore
@@ -24,6 +23,14 @@ def _memory_action_text(value, max_chars: int) -> str:
     text = str(value or "").strip()
     text = re.sub(r"\s+", " ", text)
     return text[:max_chars].strip()
+
+
+def _memory_action_occurred_at(raw: dict, envelope: dict | None = None, *, default: str = "") -> str:
+    if isinstance(raw, dict) and "occurred_at" in raw:
+        return _memory_action_text(raw.get("occurred_at"), 80)
+    if isinstance(envelope, dict) and "occurred_at" in envelope:
+        return _memory_action_text(envelope.get("occurred_at"), 80)
+    return _memory_action_text(default, 80)
 
 
 def _memory_action_float(value, default: float) -> float:
@@ -238,10 +245,16 @@ def _memory_record_from_prebuilt_envelope(store: UserStore, envelope: dict, *, e
 
 def _memory_record_from_envelope(store: UserStore, envelope: dict, *, existing: dict | None = None) -> dict:
     now = core_util._now_iso()
+    if "occurred_at" in envelope:
+        occurred_at = str(envelope.get("occurred_at") or "")
+    elif existing and "occurred_at" in existing:
+        occurred_at = str(existing.get("occurred_at") or "")
+    else:
+        occurred_at = now
     moment = {
         "v": 1,
         "id": envelope.get("id") or (existing.get("id") if existing else f"mom_{uuid.uuid4().hex[:12]}"),
-        "occurred_at": str(envelope.get("occurred_at") or (existing or {}).get("occurred_at") or now),
+        "occurred_at": occurred_at,
         "created_at": (existing or {}).get("created_at") or now,
         "updated_at": now,
         "source": str(envelope.get("source") or (existing or {}).get("source") or "live_conversation"),
@@ -278,8 +291,12 @@ def _memory_apply_v1_metadata(envelope: dict, raw: dict, *, source: str, default
     envelope["status"] = default_status
     envelope["importance"] = _memory_action_float(raw.get("importance"), 0.5)
     envelope["pulse"] = _memory_action_float(raw.get("pulse"), 0.3)
-    occurred_at = _memory_action_text(raw.get("occurred_at") or envelope.get("occurred_at") or core_util._now_iso(), 80)
-    envelope["last_referenced_at"] = _memory_action_text(raw.get("last_referenced_at") or occurred_at, 80)
+    occurred_at = _memory_action_occurred_at(raw, envelope, default=core_util._now_iso())
+    last_referenced_at = _memory_action_text(raw.get("last_referenced_at"), 80)
+    if not last_referenced_at and occurred_at:
+        last_referenced_at = occurred_at
+    if last_referenced_at:
+        envelope["last_referenced_at"] = last_referenced_at
     if raw.get("is_sensitive") is not None:
         envelope["is_sensitive"] = bool(raw.get("is_sensitive"))
     if raw.get("sensitivity_class"):
@@ -321,14 +338,18 @@ def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict]
     if envelope is None:
         return {"status": "error", "error": env_err, "action": "memory.add"}, [], 409
     envelope["type"] = mem_type
-    envelope["occurred_at"] = _memory_action_text(raw.get("occurred_at") or core_util._now_iso(), 80)
+    envelope["occurred_at"] = _memory_action_occurred_at(raw, default=core_util._now_iso())
     envelope["source"] = _memory_action_text(raw.get("source") or action.get("source") or "model_api_capture", 80)
     _memory_apply_v1_metadata(envelope, raw, source=envelope["source"])
     if anchor_ids:
         envelope["anchor_memory_ids"] = list(anchor_ids)
     moment = _memory_record_from_envelope(store, envelope)
-    moments.append(moment)
-    memory_service._save_moments(store, moments)
+    # Re-read + append + save under one memory_lock hold (the load above was for
+    # validation only) so a concurrent same-user write can't lost-update.
+    with memory_service.mutation_lock(store):
+        moments = memory_service._load_moments(store)
+        moments.append(moment)
+        memory_service._save_moments(store, moments)
     boot_gates._log_bootstrap_event(store, "memory_action_added_v1", success=True)
     change = memory_service._append_memory_change(store, {
         "action": "insert",
@@ -361,8 +382,10 @@ def _memory_add_envelope_action(store: UserStore, action: dict) -> tuple[dict, l
         return {"status": "error", **(err or {}), "action": "memory.add"}, [], 400
 
     moment = _memory_record_from_prebuilt_envelope(store, envelope)
-    moments.append(moment)
-    memory_service._save_moments(store, moments)
+    with memory_service.mutation_lock(store):
+        moments = memory_service._load_moments(store)
+        moments.append(moment)
+        memory_service._save_moments(store, moments)
     boot_gates._log_bootstrap_event(store, "memory_action_added_envelope_v1", success=True)
     anchor_ids = envelope.get("anchor_memory_ids") or []
     change = memory_service._append_memory_change(store, {
@@ -464,8 +487,19 @@ def _memory_content_patch_action(store: UserStore, api_key: str | None, action: 
     if anchor_ids:
         envelope["anchor_memory_ids"] = list(anchor_ids)
     updated = _memory_record_from_envelope(store, envelope, existing=existing)
-    moments[idx] = updated
-    memory_service._save_moments(store, moments)
+    # Re-read + re-find + replace-by-id + save under one memory_lock hold (the
+    # enclave decrypt above stays OUTSIDE the lock) so a concurrent same-user
+    # write is not lost-updated by this stale-snapshot save.
+    with memory_service.mutation_lock(store):
+        moments = memory_service._load_moments(store)
+        fresh_idx = next(
+            (i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == memory_id),
+            None,
+        )
+        if fresh_idx is None:
+            return {"status": "error", "error": "not_found", "action": "memory.content_patch"}, [], 404
+        moments[fresh_idx] = updated
+        memory_service._save_moments(store, moments)
     boot_gates._log_bootstrap_event(store, "memory_action_patched_v1", success=True)
     change = memory_service._append_memory_change(store, {
         "action": "content_patch",
@@ -525,7 +559,7 @@ def _memory_upgrade_apply(
             "action": "memory.upgrade",
             "detail": "envelope.id must equal the target memory_id (id is AEAD-bound; seal with item_id=memory_id).",
         }, [], 400
-    with store.memory_lock:
+    with memory_service.mutation_lock(store):
         moments = memory_service._load_moments(store)
         existing = next((m for m in moments if isinstance(m, dict) and m.get("id") == memory_id), None)
         if existing is None:
@@ -629,8 +663,18 @@ def _memory_retype_action(store: UserStore, action: dict) -> tuple[dict, list[di
         target["anchor_memory_ids"] = list(anchor_ids)
     else:
         target.pop("anchor_memory_ids", None)
-    moments[idx] = target
-    memory_service._save_moments(store, moments)
+    # Re-read + re-find + replace-by-id + save under one memory_lock hold so a
+    # concurrent same-user write can't lost-update.
+    with memory_service.mutation_lock(store):
+        moments = memory_service._load_moments(store)
+        fresh_idx = next(
+            (i for i, m in enumerate(moments) if isinstance(m, dict) and m.get("id") == memory_id),
+            None,
+        )
+        if fresh_idx is None:
+            return {"status": "error", "error": "not_found", "action": "memory.retype"}, [], 404
+        moments[fresh_idx] = target
+        memory_service._save_moments(store, moments)
     change = memory_service._append_memory_change(store, {
         "action": "retype",
         "memory_id": memory_id,
@@ -712,22 +756,29 @@ def _memory_supersede_action(store: UserStore, api_key: str | None, action: dict
 
     now = core_util._now_iso()
     retired_docs: list[dict] = []
-    for old_idx in old_indices:
-        retired = dict(moments[old_idx])
-        retired["status"] = "superseded"
-        retired["superseded_by"] = new_moment["id"]
-        retired["updated_at"] = now
-        retired["is_archived"] = True
-        retired["archived_at"] = now
-        retired["archive_reason"] = f"superseded_by:{new_moment['id']}"
-        moments[old_idx] = retired
-        retired_docs.append({
-            "id": retired["id"],
-            "status": "superseded",
-            "superseded_by": new_moment["id"],
-        })
-    moments.append(new_moment)
-    memory_service._save_moments(store, moments)
+    # Re-read + re-find-by-id + retire + append + save under one memory_lock hold
+    # (any enclave decrypt above stays OUTSIDE the lock). Find by stable id, not
+    # the pre-reload index, so a concurrent same-user write can't lost-update.
+    with memory_service.mutation_lock(store):
+        moments = memory_service._load_moments(store)
+        by_id = {m.get("id"): m for m in moments if isinstance(m, dict)}
+        for old_id in old_ids:
+            retired = by_id.get(old_id)
+            if retired is None:
+                continue
+            retired["status"] = "superseded"
+            retired["superseded_by"] = new_moment["id"]
+            retired["updated_at"] = now
+            retired["is_archived"] = True
+            retired["archived_at"] = now
+            retired["archive_reason"] = f"superseded_by:{new_moment['id']}"
+            retired_docs.append({
+                "id": retired["id"],
+                "status": "superseded",
+                "superseded_by": new_moment["id"],
+            })
+        moments.append(new_moment)
+        memory_service._save_moments(store, moments)
     change = memory_service._append_memory_change(store, {
         "action": "supersede",
         "memory_id": new_moment["id"],
@@ -789,22 +840,29 @@ def _memory_supersede_envelope_action(store: UserStore, action: dict) -> tuple[d
     new_moment = _memory_record_from_prebuilt_envelope(store, envelope)
     now = core_util._now_iso()
     retired_docs: list[dict] = []
-    for old_idx in old_indices:
-        retired = dict(moments[old_idx])
-        retired["status"] = "superseded"
-        retired["superseded_by"] = new_moment["id"]
-        retired["updated_at"] = now
-        retired["is_archived"] = True
-        retired["archived_at"] = now
-        retired["archive_reason"] = f"superseded_by:{new_moment['id']}"
-        moments[old_idx] = retired
-        retired_docs.append({
-            "id": retired["id"],
-            "status": "superseded",
-            "superseded_by": new_moment["id"],
-        })
-    moments.append(new_moment)
-    memory_service._save_moments(store, moments)
+    # Re-read + re-find-by-id + retire + append + save under one memory_lock hold
+    # (any enclave decrypt above stays OUTSIDE the lock). Find by stable id, not
+    # the pre-reload index, so a concurrent same-user write can't lost-update.
+    with memory_service.mutation_lock(store):
+        moments = memory_service._load_moments(store)
+        by_id = {m.get("id"): m for m in moments if isinstance(m, dict)}
+        for old_id in old_ids:
+            retired = by_id.get(old_id)
+            if retired is None:
+                continue
+            retired["status"] = "superseded"
+            retired["superseded_by"] = new_moment["id"]
+            retired["updated_at"] = now
+            retired["is_archived"] = True
+            retired["archived_at"] = now
+            retired["archive_reason"] = f"superseded_by:{new_moment['id']}"
+            retired_docs.append({
+                "id": retired["id"],
+                "status": "superseded",
+                "superseded_by": new_moment["id"],
+            })
+        moments.append(new_moment)
+        memory_service._save_moments(store, moments)
     anchor_ids = envelope.get("anchor_memory_ids") or []
     change = memory_service._append_memory_change(store, {
         "action": "supersede",
@@ -843,12 +901,13 @@ def _memory_delete_action(store: UserStore, action: dict) -> tuple[dict, list[di
     memory_id = _memory_action_text(action.get("id") or action.get("memory_id"), 160)
     if not memory_id:
         return {"status": "error", "error": "memory_id_required", "action": "memory.delete"}, [], 400
-    moments = memory_service._load_moments(store)
-    target = next((m for m in moments if isinstance(m, dict) and m.get("id") == memory_id), None)
-    if target is None:
-        return {"status": "error", "error": "not_found", "action": "memory.delete"}, [], 404
-    new_moments = [m for m in moments if not (isinstance(m, dict) and m.get("id") == memory_id)]
-    memory_service._save_moments(store, new_moments)
+    with memory_service.mutation_lock(store):
+        moments = memory_service._load_moments(store)
+        target = next((m for m in moments if isinstance(m, dict) and m.get("id") == memory_id), None)
+        if target is None:
+            return {"status": "error", "error": "not_found", "action": "memory.delete"}, [], 404
+        new_moments = [m for m in moments if not (isinstance(m, dict) and m.get("id") == memory_id)]
+        memory_service._save_moments(store, new_moments)
     change = memory_service._append_memory_change(store, {
         "action": "delete",
         "memory_id": memory_id,

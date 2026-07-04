@@ -20,6 +20,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import db
 from agent_runtime import supervisor as supervisor_mod
 
+from conftest import seed_user
+
 
 # ---- pure merge: _apply_discovery ----
 
@@ -65,6 +67,7 @@ def _clean_blobs():
 def _seed_model_api(user_id: str, *, provider: str, test_status: str,
                     enabled: bool | None = None, agent_runtime_driver: str | None = None,
                     model: str = "x", base_url: str = ""):
+    seed_user(user_id)
     doc: dict = {"provider": provider, "model": model, "test_status": test_status,
                  "base_url": base_url}
     if agent_runtime_driver is not None:
@@ -84,6 +87,7 @@ def _seed_all(_clean_blobs):
                     base_url="https://my.host/v1")  # codex via gateway
     _seed_model_api("anthropic_off", provider="anthropic", test_status="ok", enabled=False)  # not enabled
     _seed_model_api("openai_failed", provider="openai", test_status="failed", enabled=True)  # key not ok
+    seed_user("noisy")
     db.set_blob("noisy", "identity", {"foo": "bar"})                                    # unrelated kind
 
 

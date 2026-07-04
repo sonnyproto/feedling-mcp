@@ -16,7 +16,6 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 import httpx
-from flask import Blueprint, Response, jsonify, request, g
 
 import db
 from core import envelope as core_envelope
@@ -52,7 +51,6 @@ from model_api_runtime.tools import (
 from context_memory_selection import memory_relevance_details
 from content_encryption import build_envelope
 
-from accounts import auth
 from accounts import registry
 from bootstrap import gates as boot_gates
 from core import util as core_util
@@ -60,10 +58,10 @@ from identity import service as identity_service
 from memory import service as memory_service
 import provider_client
 from hosted import config_store as hosted_config_store
+from hosted import history_import_core
 from hosted import onboarding_validation as hosted_onboarding_validation
 
 
-bp = Blueprint("hosted_history_import", __name__)
 
 def _history_job_kind(job_id: str) -> str:
     """user_blobs kind for a single history-import job. One blob per job_id."""
@@ -804,14 +802,14 @@ def _persona_support_messages(payload: dict) -> list[dict]:
     return messages
 
 
-def _message_iso_date(msg: dict, fallback: date) -> str:
+def _message_iso_date(msg: dict, fallback: date | None = None) -> str:
     try:
         ts = msg.get("ts")
         if ts:
             return datetime.fromtimestamp(float(ts)).date().isoformat()
     except Exception:
         pass
-    return fallback.isoformat()
+    return fallback.isoformat() if fallback else ""
 
 
 _IMPORT_ARTIFACT_KEYS = (
@@ -1555,7 +1553,7 @@ def _coerce_import_candidates(
         first_seen = str(item.get("first_seen_at") or item.get("occurred_at") or item.get("date") or "").strip()
         last_seen = str(item.get("last_seen_at") or first_seen).strip()
         if not identity_service._parse_iso_calendar_date(first_seen):
-            first_seen = relationship_start.isoformat()
+            first_seen = ""
         if not identity_service._parse_iso_calendar_date(last_seen):
             last_seen = first_seen
         families = sorted({
@@ -1843,7 +1841,7 @@ def _render_candidates_to_memory_cards(
         used_candidates.add(cid)
         occurred = str(c.get("first_seen_at") or "").strip()
         if not identity_service._parse_iso_calendar_date(occurred):
-            occurred = relationship_start.isoformat()
+            occurred = ""
         summary = str(c.get("summary") or "")[:1200]
         context = (
             f"distilled from {len(c.get('chunk_ids') or [])} source window(s); "
@@ -1913,7 +1911,7 @@ def _memory_candidate_extraction_prompt(
         "Return JSON only in this exact shape: "
         "{\"candidates\":[{\"candidate_type\":\"user_fact|preference|boundary|relationship_event|emotional_pattern|communication_style|conflict_repair|ai_character|external_memory\","
         "\"subject\":\"user|ai|relationship\",\"title\":\"optional natural short title\",\"summary\":\"durable memory candidate\","
-        "\"evidence_quotes\":[\"short exact quote if available\"],\"first_seen_at\":\"YYYY-MM-DD\",\"last_seen_at\":\"YYYY-MM-DD\","
+        "\"evidence_quotes\":[\"short exact quote if available\"],\"first_seen_at\":\"YYYY-MM-DD or empty string\",\"last_seen_at\":\"YYYY-MM-DD or empty string\","
         "\"importance_signals\":[\"explicit_memory|repeated|emotional_peak|relationship_boundary|future_utility\"],\"confidence\":0.0}],\"why_empty\":\"optional\"}. "
         f"Return up to {per_window_target} candidates, fewer or zero if this window is generic task Q&A, assistant filler, raw JSON metadata, or has no durable relationship/user/AI-character signal. "
         "High-value candidates include stable user facts, preferences, boundaries, relationship milestones, emotional patterns, conflict/repair patterns, repeated themes, and AI character/voice definitions. "
@@ -1924,7 +1922,7 @@ def _memory_candidate_extraction_prompt(
         "Never treat User Profile facts as the AI companion's identity, name, or self-description. "
         "Do not make one candidate per message; merge repeated details inside this window. "
         f"{_language_instruction(language)} "
-        f"If dates are unclear, use {relationship_start.isoformat()}."
+        "If dates are unclear, leave first_seen_at and last_seen_at empty."
         f"\n\nWindow id: {window.get('id', idx)} ({idx}/{total})\nSource families: {source_families}\nMaterial:\n{sample}"
     )
 
@@ -1961,11 +1959,11 @@ def _repair_candidate_json_with_provider(
         "Convert only the durable memory candidates in that response into this exact JSON schema: "
         "{\"candidates\":[{\"candidate_type\":\"user_fact|preference|boundary|relationship_event|emotional_pattern|communication_style|conflict_repair|ai_character|external_memory\","
         "\"subject\":\"user|ai|relationship\",\"title\":\"optional natural short title\",\"summary\":\"durable memory candidate\","
-        "\"evidence_quotes\":[\"short exact quote if available\"],\"first_seen_at\":\"YYYY-MM-DD\",\"last_seen_at\":\"YYYY-MM-DD\","
+        "\"evidence_quotes\":[\"short exact quote if available\"],\"first_seen_at\":\"YYYY-MM-DD or empty string\",\"last_seen_at\":\"YYYY-MM-DD or empty string\","
         "\"importance_signals\":[\"explicit_memory|repeated|emotional_peak|relationship_boundary|future_utility\"],\"confidence\":0.0}]}. "
         "Return JSON only. Drop raw JSON metadata, generic tasks, and filler. "
         f"{_language_instruction(language)} "
-        f"If dates are unclear, use {relationship_start.isoformat()}.\n\nPrevious response:\n{str(raw_reply or '')[:12000]}"
+        f"If dates are unclear, leave first_seen_at and last_seen_at empty.\n\nPrevious response:\n{str(raw_reply or '')[:12000]}"
     )
     result = provider_client.chat_completion(
         provider,
@@ -2114,7 +2112,7 @@ def _coerce_memory_cards(raw, relationship_start: date) -> list[dict]:
             continue
         occurred = str(item.get("occurred_at") or item.get("date") or "").strip()
         if not identity_service._parse_iso_calendar_date(occurred):
-            occurred = relationship_start.isoformat()
+            occurred = ""
         card = {
             "summary": title or desc[:120],
             "content": "\n".join([
@@ -2259,7 +2257,7 @@ def _fallback_memory_cards(
             "title": title,
             "description": content[:900],
             "her_quote": content[:360] if mem_type == "quote" and msg.get("role") == "user" else "",
-            "occurred_at": _message_iso_date(msg, relationship_start),
+            "occurred_at": _message_iso_date(msg),
             "context": f"fallback source={_import_source_family(str(msg.get('source') or msg.get('source_family') or ''))}",
         })
         idx += 1
@@ -2276,7 +2274,7 @@ def _fallback_memory_cards(
             "type": mem_type,
             "title": title,
             "description": content[:900],
-            "occurred_at": _message_iso_date(msg, relationship_start),
+            "occurred_at": _message_iso_date(msg),
             "context": f"fallback source={_import_source_family(str(msg.get('source') or msg.get('source_family') or ''))}",
         })
         idx += 1
@@ -2359,7 +2357,7 @@ def _extract_memory_cards_with_provider(
             "without assuming it is the whole relationship. Return JSON only in this shape: "
             "{\"memories\":[{\"type\":\"moment|quote|fact|event\",\"title\":\"...\","
             "\"description\":\"...\",\"her_quote\":\"optional exact user quote\","
-            "\"occurred_at\":\"YYYY-MM-DD\"}]}. "
+            "\"occurred_at\":\"YYYY-MM-DD or empty string\"}]}. "
             f"Window {idx}/{len(windows)}. Return up to {per_window_target} cards from this window, fewer or zero if the material is repetitive, generic, or not personal. "
             "moment/quote cards belong to Story and must be specific lived exchanges or exact user wording. "
             "fact/event cards belong to About me and must be durable user preferences, relationships, habits, projects, dates, or boundaries. "
@@ -2368,7 +2366,7 @@ def _extract_memory_cards_with_provider(
             "Use natural, specific titles. Never use titles like Imported exchange, Imported quote, 导入片段, 导入原话, 导入的个人细节, or 导入的事件. "
             "Character card material describes the AI companion; personal profile material describes the user. Do not confuse the two. "
             f"{_language_instruction(language)} "
-            f"If dates are unclear, use {relationship_start.isoformat()}."
+            "Use YYYY-MM-DD only when the material provides a real date; otherwise leave occurred_at empty."
             "\n\nMaterial window:\n" + sample
         )
         try:
@@ -2416,9 +2414,6 @@ def _ensure_import_memory_floors(
             about_needed=about_needed,
             language=language,
         )
-    # Force the first persisted memory to anchor the relationship start date.
-    if cards:
-        cards[0]["occurred_at"] = relationship_start.isoformat()
     return _sort_memory_cards_newest_first(_dedupe_memory_cards(cards))
 
 
@@ -2442,8 +2437,6 @@ def _ensure_import_minimum_cards(
             about_needed=about_needed,
             language=language,
         )
-    if cards:
-        cards[0]["occurred_at"] = relationship_start.isoformat()
     return _dedupe_memory_cards(cards)
 
 
@@ -2469,10 +2462,11 @@ def _new_cards_only(existing_cards: list[dict], candidate_cards: list[dict]) -> 
 
 def _moment_from_memory_card(store: UserStore, card: dict, envelope: dict) -> dict:
     now = core_util._now_iso()
+    occurred_at = str(card.get("occurred_at") or "")
     moment = {
         "v": 1,
         "id": envelope.get("id") or f"mom_{uuid.uuid4().hex[:12]}",
-        "occurred_at": str(card.get("occurred_at") or now),
+        "occurred_at": occurred_at,
         "created_at": now,
         "updated_at": now,
         "source": "history_import",
@@ -2485,7 +2479,7 @@ def _moment_from_memory_card(store: UserStore, card: dict, envelope: dict) -> di
         "status": "active",
         "importance": max(0.0, min(1.0, float(card.get("importance") or 0.55))),
         "pulse": max(0.0, min(1.0, float(card.get("pulse") or 0.3))),
-        "last_referenced_at": str(card.get("occurred_at") or now),
+        "last_referenced_at": occurred_at or now,
     }
     if envelope.get("K_enclave"):
         moment["K_enclave"] = envelope["K_enclave"]
@@ -2493,7 +2487,6 @@ def _moment_from_memory_card(store: UserStore, card: dict, envelope: dict) -> di
 
 
 def _append_import_memory_cards(store: UserStore, cards: list[dict]) -> list[dict]:
-    moments = memory_service._load_moments(store)
     created: list[dict] = []
     for card in _sort_memory_cards_newest_first(cards):
         summary = str(card.get("summary") or "").strip()[:500]
@@ -2512,11 +2505,15 @@ def _append_import_memory_cards(store: UserStore, cards: list[dict]) -> list[dic
         )
         if envelope is None:
             raise RuntimeError(f"memory_envelope_failed:{err}")
-        envelope["occurred_at"] = str(card.get("occurred_at") or date.today().isoformat())
+        envelope["occurred_at"] = str(card.get("occurred_at") or "")
         envelope["source"] = "history_import"
-        moments.append(_moment_from_memory_card(store, card, envelope))
-        created.append(moments[-1])
-    memory_service._save_moments(store, moments)
+        created.append(_moment_from_memory_card(store, card, envelope))
+    # Re-read + extend + save under one memory_lock hold so a concurrent
+    # same-user write can't lost-update this bulk import (and vice-versa).
+    with memory_service.mutation_lock(store):
+        fresh = memory_service._load_moments(store)
+        fresh.extend(created)
+        memory_service._save_moments(store, fresh)
     if created:
         boot_gates._log_bootstrap_event(store, "history_import_memory_written", success=True)
     return created
@@ -3073,6 +3070,7 @@ def _process_history_import_sync(
         days_with_user=days,
         evidence=f"history_import:{job['job_id']} relationship_started_at={relationship_start.isoformat()}",
         language=language,
+        relationship_started_at=relationship_start.isoformat(),
     )
     _update_history_job_phase(
         store,
@@ -3239,102 +3237,3 @@ def _start_history_import_job(
     thread.start()
     return True
 
-
-@bp.route("/v1/history_import/upload", methods=["POST"])
-def history_import_upload():
-    store = auth.require_user()
-    api_key = auth._extract_api_key()
-    payload = request.get_json(silent=True) or {}
-    input_hash = _history_import_payload_hash(payload)
-    client_job_id = _history_import_client_job_id(payload)
-    existing = _history_import_find_reusable_job(
-        store,
-        client_job_id=client_job_id,
-        input_hash=input_hash,
-    )
-    if existing:
-        if str(existing.get("status") or "") in {"queued", "processing"}:
-            _start_history_import_job(store, api_key, existing, payload)
-            return jsonify({"job": existing}), 202
-        return jsonify({"job": existing}), 200
-
-    job_id = f"hi_{uuid.uuid4().hex[:16]}"
-    job = {
-        "job_id": job_id,
-        "status": "queued",
-        "client_job_id": client_job_id,
-        "input_hash": input_hash,
-        "created_at": core_util._now_iso(),
-        "content_chars": len(str(payload.get("content") or "")),
-        "ai_persona_chars": len(str(
-            payload.get("ai_persona_content")
-            or payload.get("ai_persona")
-            or ""
-        )),
-        "character_chars": len(str(
-            payload.get("character_content")
-            or payload.get("character_card")
-            or ""
-        )),
-        "agent_prompt_chars": len(str(
-            payload.get("agent_prompt_content")
-            or payload.get("original_system_prompt_content")
-            or payload.get("system_prompt_content")
-            or payload.get("agent_prompt")
-            or payload.get("system_prompt")
-            or payload.get("original_system_prompt")
-            or ""
-        )),
-        "persona_chars": len(str(
-            payload.get("personal_profile_content")
-            or payload.get("persona_content")
-            or payload.get("persona")
-            or payload.get("profile_content")
-            or ""
-        )),
-        "memory_summary_chars": len(str(
-            payload.get("memory_summary_content")
-            or payload.get("memory_summary")
-            or payload.get("memory_sample_content")
-            or payload.get("memory_sample")
-            or ""
-        )),
-        "ai_persona_filename": str(payload.get("ai_persona_filename") or "")[:240],
-        "character_filename": str(
-            payload.get("character_filename")
-            or payload.get("character_card_filename")
-            or ""
-        )[:240],
-        "agent_prompt_filename": str(
-            payload.get("agent_prompt_filename")
-            or payload.get("original_system_prompt_filename")
-            or payload.get("system_prompt_filename")
-            or ""
-        )[:240],
-        "persona_filename": str(
-            payload.get("personal_profile_filename")
-            or payload.get("persona_filename")
-            or ""
-        )[:240],
-        "memory_summary_filename": str(
-            payload.get("memory_summary_filename")
-            or payload.get("memory_sample_filename")
-            or ""
-        )[:240],
-        "chat_ready": False,
-        "background_status": "not_started",
-        **_history_import_phase_fields("upload_received"),
-    }
-    _save_history_job(store, job)
-    _start_history_import_job(store, api_key, job, payload)
-    print(f"[history_import:{store.user_id}] job={job_id} queued async=1 client_job_id={client_job_id[:24]}")
-    return jsonify({"job": job}), 202
-
-
-@bp.route("/v1/history_import/status/<job_id>", methods=["GET"])
-def history_import_status(job_id):
-    store = auth.require_user()
-    data = db.get_blob(store.user_id, _history_job_kind(job_id))
-    if not data:
-        return jsonify({"error": "job_not_found"}), 404
-    return jsonify({"job": data})

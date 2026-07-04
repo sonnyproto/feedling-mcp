@@ -7,7 +7,6 @@ import time
 import uuid
 from datetime import date, datetime, timedelta
 
-from flask import jsonify, request
 
 import db
 from core.store import UserStore

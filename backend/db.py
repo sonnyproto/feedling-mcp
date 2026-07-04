@@ -375,22 +375,41 @@ def save_all_users(users: list[dict]) -> None:
     """Persist the whole in-memory user list. The app calls this (via
     _save_users) for full-list rewrites — startup normalization and test resets.
 
-    DELETE-all + reinsert, so it reflects removals too. NOTE: this is destructive
-    from THIS worker's snapshot — under ``-w N`` it must not be used for ordinary
-    per-user edits (a stale snapshot would wipe a user another worker just
-    created). Genuine single-user edits go through ``registry.persist_user`` →
-    ``db.upsert_user`` (per-row, non-destructive) instead; the remaining callers
-    here read-then-rewrite their own full snapshot or run pre-fork at startup."""
+    Upsert each snapshot user + delete ONLY users absent from the snapshot (genuine
+    removals). It deliberately does NOT ``DELETE FROM users`` wholesale: under the
+    per-user ``ON DELETE CASCADE`` FKs (0011) a blanket delete would cascade-wipe
+    every KEPT user's chat/memory/frames/logs/blobs/imports before the reinsert —
+    the reinsert restores the ``users`` row but not the cascaded child rows. So
+    kept users are upserted in place (their child rows untouched); a user in the DB
+    but not in this snapshot is truly removed and its data cascade-deleted.
+
+    NOTE: still destructive from THIS worker's snapshot — under ``-w N`` it must not
+    be used for ordinary per-user edits (a stale snapshot missing a user another
+    worker just created would delete that user + cascade its data). Genuine
+    single-user edits go through ``registry.persist_user`` → ``db.upsert_user``
+    (per-row, non-destructive); the remaining callers here read-then-rewrite their
+    own full snapshot or run pre-fork at startup."""
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
-                conn.execute("DELETE FROM users")
+                keep_ids = [str(e.get("user_id")) for e in users if e.get("user_id")]
+                # Remove only genuinely-absent users (empty snapshot ⇒ remove all).
+                if keep_ids:
+                    conn.execute(
+                        "DELETE FROM users WHERE NOT (user_id = ANY(%s))", (keep_ids,)
+                    )
+                else:
+                    conn.execute("DELETE FROM users")
                 for entry in users:
                     uid = entry.get("user_id")
                     if not uid:
                         continue
+                    # Upsert (not plain INSERT): kept rows still exist, so a plain
+                    # INSERT would hit the users PK. Upsert leaves child rows intact.
                     conn.execute(
-                        "INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s)",
+                        "INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s) "
+                        "ON CONFLICT (user_id) DO UPDATE SET "
+                        "created_at = EXCLUDED.created_at, doc = EXCLUDED.doc",
                         (uid, entry.get("created_at"), Jsonb(entry)),
                     )
     except Exception as e:
@@ -400,6 +419,22 @@ def save_all_users(users: list[dict]) -> None:
 def delete_user(user_id: str) -> None:
     with get_pool().connection() as conn:
         conn.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+
+
+def user_exists(user_id: str) -> bool:
+    """Authoritative membership check against the users table. The push path uses
+    it to close the sub-second window where another worker committed a delete but
+    THIS worker's in-memory registry hasn't processed the ``users`` wake-bus
+    reload yet — the stale snapshot would otherwise pass the guard and send a push
+    to a just-deleted account. One indexed PK lookup; negligible next to the store
+    load / chat work a push already does."""
+    if not user_id:
+        return False
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM users WHERE user_id = %s LIMIT 1", (user_id,)
+        ).fetchone()
+    return row is not None
 
 
 # ---------------------------------------------------------------------------
@@ -578,6 +613,33 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
             for uid, status, count in rows:
                 ensure(out, uid).setdefault("proactive_extra", {}).setdefault("jobs_by_status", {})[status] = count
 
+            # Split proactive jobs by lane (heartbeat vs screen-share vs other).
+            # The persisted job doc carries job_kind / wake_kind / trigger; group
+            # by the first non-empty of those and let the caller bucket the raw
+            # kind strings (data_track._classify_proactive_kind).
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COALESCE(
+                         NULLIF(doc->>'job_kind', ''),
+                         NULLIF(doc->>'wake_kind', ''),
+                         NULLIF(doc->>'trigger', ''),
+                         'unknown'
+                       ) AS kind,
+                       COUNT(*)::int AS total,
+                       (COUNT(*) FILTER (
+                          WHERE doc->>'status' IN ('failed', 'skipped')))::int AS failed
+                FROM user_logs
+                WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
+                GROUP BY user_id, kind
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, kind, total, failed in rows:
+                pex = ensure(out, uid).setdefault("proactive_extra", {})
+                pex.setdefault("jobs_by_kind", {})[kind] = total
+                pex.setdefault("jobs_failed_by_kind", {})[kind] = failed
+
             rows = conn.execute(
                 """
                 SELECT user_id,
@@ -740,6 +802,59 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
         ]
     except Exception as e:
         log.error("[db] admin_data_track_dau failed: %s", e)
+        return []
+
+
+def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30,
+                                     tz: str = "Asia/Shanghai") -> list[dict]:
+    """Per-Beijing-day proactive-job aggregates for the ops trend view.
+
+    Answers "is the proactive success rate improving day over day", split into
+    the two runtime lanes (heartbeat vs screen-share). ``delivered`` = jobs that
+    reached posted/delivered; ``failed`` = failed/skipped. Success rate is
+    computed by the caller (delivered / non-pending)."""
+    day_limit = max(1, min(int(days or 30), 366))
+    since = float(since_epoch or 0.0)
+    screen_kinds = "('screen_watch','scene_change','screen_tick','broadcast_opened','heartbeat_broadcast_on')"
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                f"""
+                WITH jobs AS (
+                    SELECT
+                        to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
+                        COALESCE(NULLIF(doc->>'job_kind',''), NULLIF(doc->>'wake_kind',''),
+                                 NULLIF(doc->>'trigger',''), 'unknown') AS kind,
+                        COALESCE(doc->>'status','') AS status
+                    FROM user_logs
+                    WHERE stream = 'proactive_jobs'
+                      AND ts IS NOT NULL
+                      AND (%s = 0 OR ts >= %s)
+                )
+                SELECT day,
+                       COUNT(*)::int AS jobs,
+                       (COUNT(*) FILTER (WHERE status IN ('posted','delivered')))::int AS delivered,
+                       (COUNT(*) FILTER (WHERE status IN ('failed','skipped')))::int AS failed,
+                       (COUNT(*) FILTER (WHERE status = 'pending'))::int AS pending,
+                       (COUNT(*) FILTER (WHERE kind IN {screen_kinds}))::int AS screen,
+                       (COUNT(*) FILTER (WHERE kind LIKE 'heartbeat%%'
+                                          AND kind NOT IN {screen_kinds}))::int AS heartbeat
+                FROM jobs
+                GROUP BY day
+                ORDER BY day DESC
+                LIMIT %s
+                """,
+                (tz, since, since, day_limit),
+            ).fetchall()
+        return [
+            {
+                "day": r[0], "jobs": r[1], "delivered": r[2], "failed": r[3],
+                "pending": r[4], "screen": r[5], "heartbeat": r[6],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        log.error("[db] admin_data_track_proactive_daily failed: %s", e)
         return []
 
 
@@ -1528,6 +1643,85 @@ def memory_replace_all(user_id: str, moments: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# World book entries (row-per-item)
+# ---------------------------------------------------------------------------
+
+
+def world_book_load(user_id: str) -> list[dict]:
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                "SELECT doc FROM world_book_entries WHERE user_id = %s "
+                "ORDER BY updated_at, entry_id",
+                (user_id,),
+            ).fetchall()
+        return [r[0] for r in rows]
+    except Exception as e:
+        log.error("[db] world_book_load(%s) failed: %s", user_id, e)
+        return []
+
+
+def world_book_upsert(user_id: str, entry_id: str, updated_at: str, doc: dict) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            conn.execute(
+                "INSERT INTO world_book_entries (user_id, entry_id, updated_at, doc) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (user_id, entry_id) DO UPDATE SET "
+                "updated_at = EXCLUDED.updated_at, doc = EXCLUDED.doc",
+                (user_id, entry_id, updated_at or "", Jsonb(doc)),
+            )
+        return True
+    except Exception as e:
+        log.error("[db] world_book_upsert(%s,%s) failed: %s", user_id, entry_id, e)
+        return False
+
+
+def world_book_delete(user_id: str, entry_id: str) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM world_book_entries WHERE user_id = %s AND entry_id = %s",
+                (user_id, entry_id),
+            )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error("[db] world_book_delete(%s,%s) failed: %s", user_id, entry_id, e)
+        return False
+
+
+def world_book_replace_all(user_id: str, entries: list[dict]) -> None:
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                rows = conn.execute(
+                    "SELECT entry_id, updated_at, doc FROM world_book_entries WHERE user_id = %s",
+                    (user_id,),
+                ).fetchall()
+                existing = {r[0]: (r[1], r[2]) for r in rows}
+                new = {str(e["id"]): e for e in entries if e.get("id")}
+                for entry_id in existing.keys() - new.keys():
+                    conn.execute(
+                        "DELETE FROM world_book_entries WHERE user_id = %s AND entry_id = %s",
+                        (user_id, entry_id),
+                    )
+                for entry_id, entry in new.items():
+                    updated_at = str(entry.get("updated_at") or "")
+                    prev = existing.get(entry_id)
+                    if prev is not None and prev[0] == updated_at and prev[1] == entry:
+                        continue
+                    conn.execute(
+                        "INSERT INTO world_book_entries (user_id, entry_id, updated_at, doc) "
+                        "VALUES (%s, %s, %s, %s) "
+                        "ON CONFLICT (user_id, entry_id) DO UPDATE SET "
+                        "updated_at = EXCLUDED.updated_at, doc = EXCLUDED.doc",
+                        (user_id, entry_id, updated_at, Jsonb(entry)),
+                    )
+    except Exception as e:
+        log.error("[db] world_book_replace_all(%s) failed: %s", user_id, e)
+
+
+# ---------------------------------------------------------------------------
 # Frame envelopes (heavy body_ct lives here; frames_meta index stays a blob)
 # ---------------------------------------------------------------------------
 
@@ -1840,20 +2034,15 @@ def log_prune_older_than(user_id: str, stream: str, cutoff_epoch: float) -> None
 
 
 def delete_user_data(user_id: str) -> None:
-    """Hard-delete all per-user rows (everything except the global users row,
-    which the caller removes via delete_user). Single transaction."""
+    """Redundant DB belt: per-user 行现由 delete_user 的 CASCADE 原子清净
+    (0011)。保留供 migrate_to_pg 等旧调用方；删账号主路径不再依赖它做 R2。"""
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
-                # Every table keyed by user_id must be listed here. When a
-                # migration adds a new per-user table, add it below or the
-                # account-reset path will silently orphan that user's rows.
-                # genesis_import_chunks/outputs cascade from genesis_import_jobs,
-                # but we delete them explicitly (children first) so the wipe
-                # stays correct even if those FK cascades are ever dropped.
                 for table in (
                     "chat_messages",
                     "memory_moments",
+                    "world_book_entries",
                     "frame_envelopes",
                     "user_logs",
                     "user_blobs",
@@ -1866,8 +2055,11 @@ def delete_user_data(user_id: str) -> None:
                 ):
                     conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
     except Exception as e:
-        # Rows survive on failure → keep the R2 bodies so they still resolve.
         log.error("[db] delete_user_data(%s) failed: %s", user_id, e)
-        return
+
+
+def delete_user_frames(user_id: str) -> None:
+    """Best-effort R2 frame-body 清理(无 DB 行)。从 delete_user_data 拆出，
+    使 DB 删除保持原子、R2 失败非致命。"""
     if object_storage.enabled():
         object_storage.delete_user_frames(user_id)
