@@ -25,6 +25,14 @@ def _memory_action_text(value, max_chars: int) -> str:
     return text[:max_chars].strip()
 
 
+def _memory_action_occurred_at(raw: dict, envelope: dict | None = None, *, default: str = "") -> str:
+    if isinstance(raw, dict) and "occurred_at" in raw:
+        return _memory_action_text(raw.get("occurred_at"), 80)
+    if isinstance(envelope, dict) and "occurred_at" in envelope:
+        return _memory_action_text(envelope.get("occurred_at"), 80)
+    return _memory_action_text(default, 80)
+
+
 def _memory_action_float(value, default: float) -> float:
     try:
         parsed = float(value)
@@ -237,10 +245,16 @@ def _memory_record_from_prebuilt_envelope(store: UserStore, envelope: dict, *, e
 
 def _memory_record_from_envelope(store: UserStore, envelope: dict, *, existing: dict | None = None) -> dict:
     now = core_util._now_iso()
+    if "occurred_at" in envelope:
+        occurred_at = str(envelope.get("occurred_at") or "")
+    elif existing and "occurred_at" in existing:
+        occurred_at = str(existing.get("occurred_at") or "")
+    else:
+        occurred_at = now
     moment = {
         "v": 1,
         "id": envelope.get("id") or (existing.get("id") if existing else f"mom_{uuid.uuid4().hex[:12]}"),
-        "occurred_at": str(envelope.get("occurred_at") or (existing or {}).get("occurred_at") or now),
+        "occurred_at": occurred_at,
         "created_at": (existing or {}).get("created_at") or now,
         "updated_at": now,
         "source": str(envelope.get("source") or (existing or {}).get("source") or "live_conversation"),
@@ -277,8 +291,12 @@ def _memory_apply_v1_metadata(envelope: dict, raw: dict, *, source: str, default
     envelope["status"] = default_status
     envelope["importance"] = _memory_action_float(raw.get("importance"), 0.5)
     envelope["pulse"] = _memory_action_float(raw.get("pulse"), 0.3)
-    occurred_at = _memory_action_text(raw.get("occurred_at") or envelope.get("occurred_at") or core_util._now_iso(), 80)
-    envelope["last_referenced_at"] = _memory_action_text(raw.get("last_referenced_at") or occurred_at, 80)
+    occurred_at = _memory_action_occurred_at(raw, envelope, default=core_util._now_iso())
+    last_referenced_at = _memory_action_text(raw.get("last_referenced_at"), 80)
+    if not last_referenced_at and occurred_at:
+        last_referenced_at = occurred_at
+    if last_referenced_at:
+        envelope["last_referenced_at"] = last_referenced_at
     if raw.get("is_sensitive") is not None:
         envelope["is_sensitive"] = bool(raw.get("is_sensitive"))
     if raw.get("sensitivity_class"):
@@ -320,7 +338,7 @@ def _memory_add_action(store: UserStore, action: dict) -> tuple[dict, list[dict]
     if envelope is None:
         return {"status": "error", "error": env_err, "action": "memory.add"}, [], 409
     envelope["type"] = mem_type
-    envelope["occurred_at"] = _memory_action_text(raw.get("occurred_at") or core_util._now_iso(), 80)
+    envelope["occurred_at"] = _memory_action_occurred_at(raw, default=core_util._now_iso())
     envelope["source"] = _memory_action_text(raw.get("source") or action.get("source") or "model_api_capture", 80)
     _memory_apply_v1_metadata(envelope, raw, source=envelope["source"])
     if anchor_ids:

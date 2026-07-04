@@ -89,6 +89,30 @@ def test_memory_add_writes_clean_v1_schema_without_legacy_fields(monkeypatch):
     }
 
 
+def test_memory_add_preserves_explicit_empty_occurred_at(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_v1")
+    saved = _install_memory_action_fakes(monkeypatch, [])
+
+    body, status = memory_actions._execute_memory_actions(store, "api_key", [
+        {
+            "type": "memory.add",
+            "memory": {
+                "summary": "用户希望导入记忆保持可读。",
+                "content": "记忆: 用户希望导入记忆保持可读。\n上下文: 导入材料没有明确事件日期。\n使用提示: 用作长期偏好。",
+                "bucket": "协作方式",
+                "threads": ["记忆导入"],
+                "occurred_at": "",
+                "source": "genesis_import",
+            },
+        }
+    ])
+
+    assert status == 200
+    assert body["status"] == "ok"
+    assert saved[0]["occurred_at"] == ""
+    assert "last_referenced_at" not in saved[0]
+
+
 def test_backend_envelope_adapter_normalizes_only_plaintext_fields():
     old_doc = {
         "id": "mem_old",

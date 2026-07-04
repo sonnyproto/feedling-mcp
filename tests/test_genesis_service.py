@@ -778,6 +778,7 @@ def test_apply_memory_outputs_batches_memory_actions(monkeypatch):
     assert count == 25
     assert len(results) == 25
     assert [len(call) for call in calls] == [20, 5]
+    assert calls[0][0]["memory"]["occurred_at"] == ""
 
 
 def test_apply_memory_outputs_coerces_unknown_memory_type_to_fact(monkeypatch):

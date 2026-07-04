@@ -11,7 +11,10 @@ Run:  python -m pytest tests/test_history_import_identity.py -q
 """
 from __future__ import annotations
 
+import json
 import sys
+import types
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
@@ -125,3 +128,68 @@ def test_normalize_without_persona_fields_is_unaffected():
     assert len(out["dimensions"]) == 7
     for key in ("tone_style", "agent_role", "do_not_say", "boundaries"):
         assert key not in out
+
+
+def test_import_candidates_and_cards_preserve_unclear_dates_as_empty():
+    candidates = hi._coerce_import_candidates(
+        {
+            "candidates": [
+                {
+                    "candidate_type": "preference",
+                    "subject": "user",
+                    "title": "Readable memory",
+                    "summary": "User wants imported memory to preserve durable relationship meaning instead of raw archive fragments.",
+                    "confidence": 0.9,
+                }
+            ]
+        },
+        date(2026, 5, 1),
+        window_id="w1",
+    )
+
+    cards = hi._render_candidates_to_memory_cards(
+        candidates,
+        date(2026, 5, 1),
+        {"story": 0, "about_me": 1, "ta_thinking": 0, "total": 1},
+        language="en",
+    )
+
+    assert candidates[0]["first_seen_at"] == ""
+    assert cards[0]["occurred_at"] == ""
+
+
+def test_append_import_memory_cards_preserves_undated_occurred_at(monkeypatch):
+    store = types.SimpleNamespace(user_id="usr_history_import")
+    saved: list[dict] = []
+
+    def fake_envelope(_store, plaintext):
+        assert json.loads(plaintext.decode("utf-8"))["summary"] == "Readable memory"
+        return {
+            "id": "mom_import_1",
+            "body_ct": "encrypted",
+            "nonce": "nonce",
+            "K_user": "ku",
+            "K_enclave": "ke",
+            "visibility": "shared",
+            "owner_user_id": "usr_history_import",
+            "enclave_pk_fpr": "fpr",
+        }, ""
+
+    monkeypatch.setattr(hi.memory_service, "_load_moments", lambda _store: [])
+    monkeypatch.setattr(hi.memory_service, "_save_moments", lambda _store, moments: saved.extend(moments))
+    monkeypatch.setattr(hi.core_envelope, "_build_shared_envelope_for_store", fake_envelope)
+    monkeypatch.setattr(hi.boot_gates, "_log_bootstrap_event", lambda *_args, **_kwargs: None)
+
+    created = hi._append_import_memory_cards(store, [
+        {
+            "summary": "Readable memory",
+            "content": "记忆: User wants imported memory to stay readable.\n上下文: The source had no event date.",
+            "bucket": "协作方式",
+            "threads": ["memory import"],
+            "occurred_at": "",
+        }
+    ])
+
+    assert saved == created
+    assert created[0]["occurred_at"] == ""
+    assert created[0]["last_referenced_at"] == created[0]["created_at"]
