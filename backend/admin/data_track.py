@@ -1975,14 +1975,21 @@ def _render_data_track_debug_page(payload: dict) -> str:
             f"{html.escape(label)}</button>"
         )
 
+    def event_anchor(ev: dict) -> str:
+        return f"event-{_debug_event_key(ev)}"
+
+    def turn_anchor(value: str) -> str:
+        return f"turn-{hashlib.sha1(str(value or 'ungrouped').encode('utf-8')).hexdigest()[:12]}"
+
     def reveal_href(ev: dict) -> str:
-        return _data_track_page_href(
+        href = _data_track_page_href(
             view="debug",
             mode=mode,
             user_id=ev.get("user_id") or "",
             trace_id=ev.get("trace_id") or "",
             reveal=_debug_event_key(ev),
         )
+        return f"{href}#{event_anchor(ev)}"
 
     def event_actions(ev: dict, *, include_open_turn: bool) -> str:
         buttons = [
@@ -1993,6 +2000,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
         ]
         if include_open_turn:
             href = _data_track_page_href(view="debug", mode="timeline", user_id=ev.get("user_id") or "", trace_id=ev.get("trace_id") or "")
+            href = f"{href}#{turn_anchor(str(ev.get('trace_id') or 'ungrouped'))}"
             buttons.append(f"<a class='mini-button' href='{html.escape(href, quote=True)}'>open turn</a>")
         buttons.append(
             f"<a class='mini-button reveal-button' data-reveal='1' href='{html.escape(reveal_href(ev), quote=True)}'>Reveal plaintext</a>"
@@ -2037,9 +2045,10 @@ def _render_data_track_debug_page(payload: dict) -> str:
         ev_status = str(ev.get("status") or "ok").lower()
         ev_cls = "bad" if ev_status in {"error", "failed"} else ("warn" if ev_status == "blocked" else "ok")
         trace_href = _data_track_page_href(view="debug", mode="timeline", user_id=ev.get("user_id") or "", trace_id=ev.get("trace_id") or "")
+        trace_href = f"{trace_href}#{turn_anchor(str(ev.get('trace_id') or 'ungrouped'))}"
         user_href = _data_track_page_href(view="debug", mode=mode, user_id=ev.get("user_id") or "")
         flat_rows.append(
-            "<tr>"
+            f"<tr id='{html.escape(event_anchor(ev), quote=True)}'>"
             f"<td><span class='mono'>{html.escape(_debug_time(ev.get('ts')))}</span></td>"
             f"<td><a class='mono' href='{html.escape(user_href, quote=True)}'>{html.escape(str(ev.get('user_id') or ''))}</a></td>"
             f"<td><a class='mono trace-link' href='{html.escape(trace_href, quote=True)}'>{html.escape(str(ev.get('trace_id') or 'ungrouped'))}</a></td>"
@@ -2077,7 +2086,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
             if turn.get("is_stalled") else ""
         )
         turn_cards.append(
-            "<section class='turn'>"
+            f"<section class='turn' id='{html.escape(turn_anchor(str(turn.get('trace_id') or 'ungrouped')), quote=True)}'>"
             f"<h3><span>{mark}</span> <span>{html.escape(str(turn.get('title') or ''))}</span>"
             f"<span class='pill {status_cls}'>{html.escape(status)}</span>"
             f"<span class='muted mono'>{html.escape(str(turn.get('user_id') or ''))} · {html.escape(str(turn.get('trace_id') or ''))}</span>"

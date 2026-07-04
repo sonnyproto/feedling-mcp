@@ -145,6 +145,8 @@ def test_debug_page_renders_nav_filters_and_redacts_plaintext_by_default(monkeyp
     assert "Timeline" in html
     assert "<select name=\"subsystem\">" in html
     assert "trace_id 时可直接定位" in html
+    assert "#event-" in html
+    assert "#turn-" in html
 
 
 def test_debug_page_reveals_plaintext_for_one_event(monkeypatch):
@@ -172,6 +174,7 @@ def test_debug_page_reveals_plaintext_for_one_event(monkeypatch):
     assert "private prompt" in html
     assert "Plaintext revealed for this event only" in html
     assert 'http-equiv="refresh"' not in html
+    assert f'id="event-{key}"' in html or f"id='event-{key}'" in html
 
 
 def test_debug_page_can_render_timeline_mode(monkeypatch):
