@@ -4225,6 +4225,41 @@ def _visible_broadcast_request_text(action: dict) -> str:
     return "I cannot see your screen right now. If you want, turn screen sharing back on."
 
 
+def _proactive_control_reason_from_replies(replies: list[str]) -> str:
+    """Recover a sleep/noop reason from malformed control JSON leaked as text.
+
+    Proactive prompts ask the model to stay quiet via an action JSON. Some CLI
+    transports can hand back a truncated fragment such as
+    `"reason":"..."}]}`; generic chat parsing treats it as a visible message.
+    In the proactive lane, a control-only JSON fragment should complete the wake
+    quietly instead of becoming a chat bubble.
+    """
+    if not replies:
+        return ""
+    reasons: list[str] = []
+    for reply in replies:
+        text = str(reply or "").strip()
+        if not text:
+            continue
+        stripped = text.lstrip()
+        if not stripped or stripped[0] not in {'"', "{", "["}:
+            return ""
+        if '"reason"' not in stripped and "'reason'" not in stripped:
+            return ""
+        match = re.search(r'''["']reason["']\s*:\s*["'](?P<reason>(?:\\.|[^"'\\])*)["']''', stripped)
+        if not match:
+            return ""
+        reason = match.group("reason")
+        try:
+            reason = json.loads(f'"{reason}"')
+        except Exception:  # noqa: BLE001
+            pass
+        reason = str(reason or "").strip()
+        if reason:
+            reasons.append(reason)
+    return "\n".join(reasons).strip()
+
+
 def _split_proactive_actions(actions: list[dict]) -> tuple[list[dict], list[dict]]:
     proactive: list[dict] = []
     memory_identity: list[dict] = []
@@ -5708,6 +5743,20 @@ def _process_proactive_jobs(jobs: list) -> float:
             replies = _send_message_replies_from_actions(actions)
         proactive_actions, memory_identity_actions = _split_proactive_actions(actions)
         status_actions = [_compact_action_for_status(a) for a in proactive_actions]
+        control_reply_reason = _proactive_control_reason_from_replies(replies)
+        if control_reply_reason and not proactive_actions and not memory_identity_actions:
+            update_proactive_job_status(
+                job_id,
+                "completed",
+                control_reply_reason[:240],
+                extra={
+                    "agent_action": "sleep",
+                    "agent_action_status": control_reply_reason[:240],
+                    "wake_result": "sleep",
+                },
+            )
+            log.info("proactive wake slept from control reply id=%s reason=%s", job_id, control_reply_reason)
+            continue
         if memory_identity_actions:
             try:
                 result = execute_agent_actions(memory_identity_actions)

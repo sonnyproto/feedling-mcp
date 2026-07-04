@@ -2356,6 +2356,48 @@ def test_process_proactive_v2_sleep_marks_completed_without_post(monkeypatch):
     assert completed[-1][3]["extra"]["wake_result"] == "sleep"
 
 
+def test_process_proactive_malformed_json_reason_does_not_post(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"statuses": [], "posted": []}
+
+    monkeypatch.setattr(
+        crc,
+        "call_agent",
+        lambda message, images=None, image_paths=None: {
+            "messages": ['"reason":"用户一小时没回，该说的已经说了，继续给空间"\\n}\\n]\\n}'],
+            "thinking_summary": "判断这是一次主动唤醒，但不适合继续追问。",
+            "thinking_kind": "provider_reasoning_summary",
+        },
+    )
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_bad"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: ({}, [], {}))
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_json_reason",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 125.5,
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(125.5)
+    assert captured["posted"] == []
+    completed = [s for s in captured["statuses"] if s[1] == "completed"]
+    assert completed
+    assert completed[-1][2] == "用户一小时没回，该说的已经说了，继续给空间"
+    assert completed[-1][3]["extra"]["agent_action"] == "sleep"
+    assert completed[-1][3]["extra"]["wake_result"] == "sleep"
+
+
 def test_process_proactive_v2_request_broadcast_posts_visible_request(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
