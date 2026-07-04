@@ -27,7 +27,7 @@ _MAX_EVENTS_VERBOSE = 200
 _EXCERPT_FIELD_MAX = 2048
 _EXCERPT_EVENT_MAX = 8192
 _TRUNC_MARK = "…(truncated)"
-_TTL_SEC = 24 * 3600
+_TTL_SEC = 48 * 3600  # beta debug retention: enough to inspect yesterday's reports
 _FLAG_CACHE_TTL = 30.0
 
 # subsystem ∈ memory|genesis|identity|route|voice|perception|proactive|fallback|account
