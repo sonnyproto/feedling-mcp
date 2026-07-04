@@ -10,7 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import app as appmod  # noqa: E402
 import debug_trace  # noqa: E402
-from chat import routes as chat_routes  # noqa: E402
+from bootstrap import gates as boot_gates  # noqa: E402
 from core import config as core_config  # noqa: E402
 
 
@@ -102,7 +102,7 @@ def test_resident_chat_message_and_poll_emit_route_trace(client):
 
 def test_resident_chat_response_emits_route_trace(client, monkeypatch):
     monkeypatch.setattr(
-        chat_routes.boot_gates,
+        boot_gates,
         "_gate_bootstrap_for_chat",
         lambda store, allow_verify_reply=False: None,
     )
@@ -131,9 +131,9 @@ def test_resident_chat_response_emits_route_trace(client, monkeypatch):
 
 def test_resident_chat_response_gate_emits_route_trace(client, monkeypatch):
     def fake_gate(_store, *, allow_verify_reply=False):
-        return appmod.jsonify({"error": "bootstrap_incomplete"}), 409
+        return {"error": "bootstrap_incomplete"}, 409
 
-    monkeypatch.setattr(chat_routes.boot_gates, "_gate_bootstrap_for_chat", fake_gate)
+    monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", fake_gate)
     _user_id, api_key = _register(client)
     _enable_trace(client, api_key)
 

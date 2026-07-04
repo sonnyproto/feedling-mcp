@@ -1,3 +1,7 @@
+# flask/flask-compress are needed ONLY by enclave_app.py — the separate Flask
+# service that runs inside the TDX enclave (attestation + decrypt-and-serve). The
+# main backend is now native FastAPI/ASGI and imports no flask at all, so these
+# can be dropped only if/when the enclave is migrated too.
 flask>=3.0.0
 flask-compress>=1.14
 websockets>=12.0
@@ -6,16 +10,34 @@ PyJWT>=2.8.0
 cryptography>=42.0.0
 Pillow>=10.0.0
 
-# Production WSGI server for both the Flask backend and the enclave service.
+# Production server (process manager) for both the backend and the enclave.
 # The dev server in app.run() (Werkzeug) is single-process and stalls on large
 # responses under the TDX CVM; gunicorn gives worker timeouts + better
-# write-out. The backend MUST stay single-worker: app.py starts the WebSocket
-# ingest thread at import time (binds :9998), so multiple workers would collide
-# on it. The enclave embeds gunicorn programmatically (BaseApplication) from
-# enclave_app.py's __main__ so its compose entrypoint stays
-# `python -u backend/enclave_app.py` (compose_hash unchanged); it serves its
-# in-enclave TLS via the gunicorn `ssl_context` hook (needs >=21.0).
+# write-out. The backend runs multi-worker (`-w N` via FEEDLING_BACKEND_WORKERS
+# in gunicorn_conf.py): the :9998 WebSocket ingest is bound by a single
+# advisory-lock-elected worker (core/leader.py) and cross-worker state stays
+# consistent via Postgres LISTEN/NOTIFY (core/wake_bus.py), so workers no longer
+# collide — the old "MUST stay single-worker" constraint is retired. Under the
+# FastAPI/ASGI backend gunicorn manages UvicornWorker processes (see the ASGI
+# deps below); under legacy Flask it serves the WSGI app directly. The enclave
+# embeds gunicorn programmatically (BaseApplication) from enclave_app.py's
+# __main__ so its compose entrypoint stays `python -u backend/enclave_app.py`
+# (compose_hash unchanged); it serves its in-enclave TLS via the gunicorn
+# `ssl_context` hook (needs >=21.0).
 gunicorn>=23.0.0
+
+# ASGI/async backend stack (backend/asgi_app.py). The backend is migrating from
+# Flask/WSGI to a native FastAPI/ASGI app so waiting I/O (long-poll is the
+# bullseye) no longer pins an OS thread. gunicorn runs the app under
+# `-k uvicorn_worker.UvicornWorker` (the standalone uvicorn-worker package —
+# uvicorn.workers is deprecated since uvicorn 0.30). anyio backs the bounded
+# sync->thread bridge (asgi/threadpool.py). No WSGI adapter is pulled in: there
+# is no runtime Flask fallback and the main backend imports no flask (only the
+# enclave still does — see the flask note at the top of this file).
+fastapi>=0.115
+uvicorn[standard]>=0.30
+uvicorn-worker>=0.3
+anyio>=4
 
 # Phase 1 (enclave) deps — see backend/enclave_app.py
 PyNaCl>=1.5.0

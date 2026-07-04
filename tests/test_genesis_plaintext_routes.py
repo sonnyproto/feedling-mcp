@@ -5,29 +5,55 @@ import sys
 import types
 from pathlib import Path
 
-from flask import Flask
-
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from genesis import routes, service  # noqa: E402
+from genesis import genesis_core, plaintext, service  # noqa: E402
+from urllib.parse import urlparse  # noqa: E402
 
 
 def _store(user_id: str = "usr_plaintext"):
     return types.SimpleNamespace(user_id=user_id)
 
 
+class _Resp:
+    def __init__(self, body, status=200):
+        self.status_code = status
+        self._body = body
+
+    def get_json(self):
+        return self._body
+
+
+class _CoreClient:
+    # The Flask genesis blueprint was deleted in the ASGI cutover; this plaintext the
+    # one endpoint these tests exercise to genesis_core.plaintext_import, injecting
+    # the (monkeypatchable) plaintext-pipeline helpers exactly like genesis.routes_asgi.
+    def __init__(self, store):
+        self._store = store
+
+    def post(self, path, json=None):
+        p = urlparse(path).path
+        if p == "/v1/genesis/imports/plaintext":
+            body, status = genesis_core.plaintext_import(
+                self._store, json or {}, api_key="user_api_key",
+                prepare=plaintext._prepare_plaintext_import,
+                find_reusable=plaintext._find_reusable_plaintext_job,
+                plaintext_mode=plaintext._plaintext_mode,
+                job_metadata=plaintext._plaintext_job_metadata,
+                start_job=plaintext._start_plaintext_genesis_job,
+            )
+            return _Resp(body, status)
+        raise AssertionError(f"unrouted path: {p}")
+
+
 def _client(monkeypatch):
-    app = Flask(__name__)
-    app.register_blueprint(routes.bp)
-    monkeypatch.setattr(routes.auth, "require_user", lambda: _store())
-    monkeypatch.setattr(routes.auth, "_extract_api_key", lambda: "user_api_key")
-    return app.test_client()
+    return _CoreClient(_store())
 
 
 def _stub_update_identity_persona(monkeypatch):
-    monkeypatch.setattr(routes, "_plaintext_existing_voice_workset_for_update", lambda *_args: {}, raising=False)
+    monkeypatch.setattr(plaintext, "_plaintext_existing_voice_workset_for_update", lambda *_args: {}, raising=False)
     monkeypatch.setattr(
-        routes.worker,
+        plaintext.worker,
         "build_persona_output_from_material",
         lambda **_kwargs: {
             "persona": {
@@ -39,7 +65,7 @@ def _stub_update_identity_persona(monkeypatch):
         },
         raising=False,
     )
-    monkeypatch.setattr(routes.service, "write_persona_artifact", lambda *_args, **_kwargs: ("user_blob:genesis_persona", "sha-persona"))
+    monkeypatch.setattr(plaintext.service, "write_persona_artifact", lambda *_args, **_kwargs: ("user_blob:genesis_persona", "sha-persona"))
 
 
 def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypatch):
@@ -52,7 +78,7 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
     }
     captured: dict = {}
 
-    monkeypatch.setattr(routes.db, "genesis_list_jobs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [])
 
     def fake_create(_store, create_payload):
         captured["create_payload"] = create_payload
@@ -68,9 +94,9 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
         }
         return job, 201
 
-    monkeypatch.setattr(routes.service, "create_import_job", fake_create)
+    monkeypatch.setattr(plaintext.service, "create_import_job", fake_create)
     monkeypatch.setattr(
-        routes.db,
+        plaintext.db,
         "genesis_set_job_status",
         lambda _user_id, _job_id, **_kwargs: {
             "job_id": "genesis_job_1",
@@ -80,7 +106,7 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
             "privacy_mode": service.PRIVACY_MODE,
         },
     )
-    monkeypatch.setattr(routes.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
 
     def fake_start(_store, _api_key, job, *, mode="onboarding", chunk_texts, source_kind, source_groups=None, relationship_anchor=None, analysis_messages=None):
         captured["started"] = {
@@ -93,7 +119,7 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
         }
         return True
 
-    monkeypatch.setattr(routes, "_start_plaintext_genesis_job", fake_start)
+    monkeypatch.setattr(plaintext, "_start_plaintext_genesis_job", fake_start)
 
     resp = client.post("/v1/genesis/imports/plaintext", json=payload)
 
@@ -118,15 +144,15 @@ def test_plaintext_import_returns_genesis_job_and_does_not_persist_raw(monkeypat
 def test_plaintext_import_reuses_done_job_without_restart(monkeypatch):
     client = _client(monkeypatch)
     payload = {"format": "plaintext", "content": "User: hello"}
-    input_hash = routes.history_import._history_import_payload_hash(payload)
+    input_hash = plaintext.history_import._history_import_payload_hash(payload)
     existing = {
         "job_id": "genesis_done",
         "status": "done",
         "metadata": {"ingest": "plaintext", "input_hash": input_hash},
     }
-    monkeypatch.setattr(routes.db, "genesis_list_jobs", lambda *_args, **_kwargs: [existing])
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [existing])
     monkeypatch.setattr(
-        routes,
+        plaintext,
         "_start_plaintext_genesis_job",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not restart done job")),
     )
@@ -141,28 +167,28 @@ def test_plaintext_import_reuses_done_job_without_restart(monkeypatch):
 
 def test_prepare_plaintext_import_caps_windows(monkeypatch):
     monkeypatch.setattr(
-        routes.history_import,
+        plaintext.history_import,
         "_parse_import_history_content",
         lambda *_args: [{"role": "user", "content": "x", "source": "history_import"}],
     )
-    monkeypatch.setattr(routes.history_import, "_persona_support_messages", lambda _payload: [])
+    monkeypatch.setattr(plaintext.history_import, "_persona_support_messages", lambda _payload: [])
     monkeypatch.setattr(
-        routes.history_import,
+        plaintext.history_import,
         "_history_import_profile",
         lambda *_args, **_kwargs: {"tier": "small", "total_windows": 2, "message_count": 1, "support_count": 0},
     )
     monkeypatch.setattr(
-        routes.history_import,
+        plaintext.history_import,
         "_build_transcript_windows",
         lambda *_args, **_kwargs: [{"text": f"window {idx}"} for idx in range(5)],
     )
 
-    prepared = routes._prepare_plaintext_import({"content": "x"})
+    prepared = plaintext._prepare_plaintext_import({"content": "x"})
 
     assert len(prepared["chunk_texts"]) == 2
     assert len(prepared["source_groups"]) == 1
     assert prepared["source_groups"][0]["source_family"] == "history"
-    assert prepared["source_kind"] == routes.history_import._HISTORY_SOURCE
+    assert prepared["source_kind"] == plaintext.history_import._HISTORY_SOURCE
 
 
 def test_prepare_plaintext_import_computes_timeline_span_days(monkeypatch):
@@ -177,21 +203,21 @@ def test_prepare_plaintext_import_computes_timeline_span_days(monkeypatch):
         },
         {"role": "user", "content": "ignored", "source": "history_import", "ts": "not-a-timestamp"},
     ]
-    monkeypatch.setattr(routes.history_import, "_parse_import_history_content", lambda *_args: messages)
-    monkeypatch.setattr(routes.history_import, "_persona_support_messages", lambda _payload: [])
+    monkeypatch.setattr(plaintext.history_import, "_parse_import_history_content", lambda *_args: messages)
+    monkeypatch.setattr(plaintext.history_import, "_persona_support_messages", lambda _payload: [])
     monkeypatch.setattr(
-        routes.history_import,
+        plaintext.history_import,
         "_history_import_profile",
         lambda *_args, **_kwargs: {"tier": "small", "total_windows": 1, "message_count": 3, "support_count": 0},
     )
     monkeypatch.setattr(
-        routes.history_import,
+        plaintext.history_import,
         "_build_transcript_windows",
         lambda *_args, **_kwargs: [{"text": "window"}],
     )
 
-    prepared = routes._prepare_plaintext_import({"content": "x"})
-    metadata = routes._plaintext_job_metadata({}, prepared, client_job_id="", input_hash="input_hash", mode="onboarding")
+    prepared = plaintext._prepare_plaintext_import({"content": "x"})
+    metadata = plaintext._plaintext_job_metadata({}, prepared, client_job_id="", input_hash="input_hash", mode="onboarding")
 
     assert prepared["timeline_span_days"] == 3
     assert metadata["timeline_span_days"] == 3
@@ -206,7 +232,7 @@ def test_plaintext_job_reuse_requires_matching_mode(monkeypatch):
         "warnings": [],
         "content_bytes": 13,
     }
-    metadata = routes._plaintext_job_metadata(
+    metadata = plaintext._plaintext_job_metadata(
         {},
         prepared,
         client_job_id="same-client-id",
@@ -225,15 +251,15 @@ def test_plaintext_job_reuse_requires_matching_mode(monkeypatch):
             "mode": "add_memory",
         },
     }
-    monkeypatch.setattr(routes.db, "genesis_list_jobs", lambda *_args, **_kwargs: [add_memory_job])
+    monkeypatch.setattr(plaintext.db, "genesis_list_jobs", lambda *_args, **_kwargs: [add_memory_job])
 
-    assert routes._find_reusable_plaintext_job(
+    assert plaintext._find_reusable_plaintext_job(
         _store(),
         client_job_id="same-client-id",
         input_hash="same-input-hash",
         mode="add_memory",
     ) == add_memory_job
-    assert routes._find_reusable_plaintext_job(
+    assert plaintext._find_reusable_plaintext_job(
         _store(),
         client_job_id="same-client-id",
         input_hash="same-input-hash",
@@ -243,43 +269,43 @@ def test_plaintext_job_reuse_requires_matching_mode(monkeypatch):
 
 def test_prepare_plaintext_import_builds_ordered_per_source_groups(monkeypatch):
     history_messages = [
-        {"role": "user", "content": "hello", "source": routes.history_import._HISTORY_SOURCE},
+        {"role": "user", "content": "hello", "source": plaintext.history_import._HISTORY_SOURCE},
     ]
     support_messages = [
         {
             "role": "user",
             "content": "AI name is Mira",
-            "source": routes.history_import._AI_PERSONA_SOURCE,
-            "source_family": routes.history_import._AI_PERSONA_SOURCE,
+            "source": plaintext.history_import._AI_PERSONA_SOURCE,
+            "source_family": plaintext.history_import._AI_PERSONA_SOURCE,
         },
         {
             "role": "user",
             "content": "User likes direct feedback",
-            "source": routes.history_import._USER_PROFILE_SOURCE,
-            "source_family": routes.history_import._USER_PROFILE_SOURCE,
+            "source": plaintext.history_import._USER_PROFILE_SOURCE,
+            "source_family": plaintext.history_import._USER_PROFILE_SOURCE,
         },
         {
             "role": "user",
             "content": "Long memory says Mira stayed",
-            "source": routes.history_import._MEMORY_SUMMARY_SOURCE,
-            "source_family": routes.history_import._MEMORY_SUMMARY_SOURCE,
+            "source": plaintext.history_import._MEMORY_SUMMARY_SOURCE,
+            "source_family": plaintext.history_import._MEMORY_SUMMARY_SOURCE,
         },
     ]
-    monkeypatch.setattr(routes.history_import, "_parse_import_history_content", lambda *_args: history_messages)
-    monkeypatch.setattr(routes.history_import, "_persona_support_messages", lambda _payload: support_messages)
+    monkeypatch.setattr(plaintext.history_import, "_parse_import_history_content", lambda *_args: history_messages)
+    monkeypatch.setattr(plaintext.history_import, "_persona_support_messages", lambda _payload: support_messages)
     monkeypatch.setattr(
-        routes.history_import,
+        plaintext.history_import,
         "_history_import_profile",
         lambda *_args, **_kwargs: {"tier": "small", "total_windows": 2, "message_count": 1, "support_count": 3},
     )
 
     def fake_windows(messages, **_kwargs):
-        family = routes.history_import._import_source_family(str(messages[0].get("source") or ""))
+        family = plaintext.history_import._import_source_family(str(messages[0].get("source") or ""))
         return [{"text": f"{family}:{len(messages)}"}]
 
-    monkeypatch.setattr(routes.history_import, "_build_transcript_windows", fake_windows)
+    monkeypatch.setattr(plaintext.history_import, "_build_transcript_windows", fake_windows)
 
-    prepared = routes._prepare_plaintext_import({"content": "history"})
+    prepared = plaintext._prepare_plaintext_import({"content": "history"})
 
     assert [group["source_family"] for group in prepared["source_groups"]] == [
         "ai_persona",
@@ -308,27 +334,27 @@ def test_plaintext_background_runner_distills_and_applies(monkeypatch):
             "privacy_mode": service.PRIVACY_MODE,
         }
 
-    monkeypatch.setattr(routes.db, "genesis_set_job_status", fake_set_status)
-    monkeypatch.setattr(routes.service, "write_genesis_state", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(routes.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    monkeypatch.setattr(plaintext.db, "genesis_set_job_status", fake_set_status)
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plaintext.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
 
     def fake_build(**kwargs):
         calls["build"] = kwargs
         return {"memories": [], "identity": {}, "voice": {}, "persona": {}}
 
-    monkeypatch.setattr(routes.worker, "build_reducer_output_from_texts", fake_build)
+    monkeypatch.setattr(plaintext.worker, "build_reducer_output_from_texts", fake_build)
     monkeypatch.setattr(
-        routes.service,
+        plaintext.service,
         "apply_reducer_output",
         lambda _store, _api_key, _job_id, output: calls.update({"applied": output}),
     )
     monkeypatch.setattr(
-        routes.service,
+        plaintext.service,
         "mark_failed",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not fail")),
     )
 
-    routes._run_plaintext_genesis_job(
+    plaintext._run_plaintext_genesis_job(
         store,
         "user_api_key",
         "genesis_job_1",
@@ -348,29 +374,29 @@ def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(mon
     calls: dict = {"builds": []}
     source_groups = [
         {
-            "source_kind": routes.history_import._AI_PERSONA_SOURCE,
+            "source_kind": plaintext.history_import._AI_PERSONA_SOURCE,
             "source_family": "ai_persona",
             "chunk_texts": ["persona window"],
         },
         {
-            "source_kind": routes.history_import._HISTORY_SOURCE,
+            "source_kind": plaintext.history_import._HISTORY_SOURCE,
             "source_family": "history",
             "chunk_texts": ["history window"],
         },
         {
-            "source_kind": routes.history_import._MEMORY_SUMMARY_SOURCE,
+            "source_kind": plaintext.history_import._MEMORY_SUMMARY_SOURCE,
             "source_family": "memory_summary",
             "chunk_texts": ["memory window"],
         },
         {
-            "source_kind": routes.history_import._USER_PROFILE_SOURCE,
+            "source_kind": plaintext.history_import._USER_PROFILE_SOURCE,
             "source_family": "user_profile",
             "chunk_texts": ["profile window"],
         },
     ]
 
     monkeypatch.setattr(
-        routes.db,
+        plaintext.db,
         "genesis_set_job_status",
         lambda _user_id, _job_id, **kwargs: {
             "job_id": "genesis_job_1",
@@ -379,12 +405,12 @@ def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(mon
             "privacy_mode": service.PRIVACY_MODE,
         },
     )
-    monkeypatch.setattr(routes.service, "write_genesis_state", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(routes.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plaintext.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
 
     def fake_build(**kwargs):
         calls["builds"].append(kwargs)
-        family = routes.worker._source_family(kwargs["source_kind"])
+        family = plaintext.worker._source_family(kwargs["source_kind"])
         if family == "ai_persona":
             return {
                 "source_kind": kwargs["source_kind"],
@@ -429,19 +455,19 @@ def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(mon
             "voice_workset": {"behavior_notes": ["bad"], "exemplars": []},
         }
 
-    monkeypatch.setattr(routes.worker, "build_reducer_output_from_texts", fake_build)
+    monkeypatch.setattr(plaintext.worker, "build_reducer_output_from_texts", fake_build)
     monkeypatch.setattr(
-        routes.service,
+        plaintext.service,
         "apply_reducer_output",
         lambda _store, _api_key, _job_id, output: calls.update({"applied": output}),
     )
     monkeypatch.setattr(
-        routes.service,
+        plaintext.service,
         "mark_failed",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not fail")),
     )
 
-    routes._run_plaintext_genesis_job(
+    plaintext._run_plaintext_genesis_job(
         store,
         "user_api_key",
         "genesis_job_1",
@@ -449,7 +475,7 @@ def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(mon
         relationship_anchor={"days_with_user": 7, "relationship_anchor_evidence": "timeline span"},
     )
 
-    assert [routes.worker._source_family(call["source_kind"]) for call in calls["builds"]] == [
+    assert [plaintext.worker._source_family(call["source_kind"]) for call in calls["builds"]] == [
         "ai_persona",
         "history",
         "memory_summary",
@@ -496,16 +522,16 @@ def test_plaintext_relationship_anchor_uses_earliest_timestamp_when_no_date():
         {"role": "user", "content": "a", "ts": _ts("2026-01-10T07:50")},
         {"role": "agent", "content": "b", "ts": _ts("2026-05-01T10:00")},
     ]
-    anchor = routes._plaintext_relationship_anchor({}, messages=msgs)  # empty payload = no typed date
+    anchor = plaintext._plaintext_relationship_anchor({}, messages=msgs)  # empty payload = no typed date
     assert anchor["relationship_started_at"] == "2026-01-10"
     assert anchor["days_with_user"] > 0
 
     # typed date still wins
-    anchor2 = routes._plaintext_relationship_anchor({"relationship_started_at": "2024-06-01"}, messages=msgs)
+    anchor2 = plaintext._plaintext_relationship_anchor({"relationship_started_at": "2024-06-01"}, messages=msgs)
     assert anchor2["relationship_started_at"] == "2024-06-01"
 
     # no date + no timestamps -> blank (falls back to prefer_memory/today downstream)
-    anchor3 = routes._plaintext_relationship_anchor({}, messages=[{"role": "user", "content": "x"}])
+    anchor3 = plaintext._plaintext_relationship_anchor({}, messages=[{"role": "user", "content": "x"}])
     assert anchor3["relationship_started_at"] == ""
 
 
@@ -513,9 +539,9 @@ def test_add_memory_mode_writes_only_memory(monkeypatch):
     store = _store()
     calls: dict = {}
     monkeypatch.setenv("FEEDLING_GENESIS_COMBINED_MAP", "1")
-    monkeypatch.setattr(routes.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
-    monkeypatch.setattr(routes.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_add", "status": "processing"})
-    monkeypatch.setattr(routes.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plaintext.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    monkeypatch.setattr(plaintext.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_add", "status": "processing"})
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
 
     def fake_full_reducer(**kwargs):
         calls.setdefault("full_reducer_calls", []).append(kwargs)
@@ -528,7 +554,7 @@ def test_add_memory_mode_writes_only_memory(monkeypatch):
             "voice_workset": {"behavior_notes": ["bad"], "exemplars": []},
         }
 
-    monkeypatch.setattr(routes.worker, "build_reducer_output_from_texts", fake_full_reducer)
+    monkeypatch.setattr(plaintext.worker, "build_reducer_output_from_texts", fake_full_reducer)
 
     def fake_foreground(**kwargs):
         calls["foreground"] = kwargs
@@ -539,7 +565,7 @@ def test_add_memory_mode_writes_only_memory(monkeypatch):
             "core_fact_candidates": [{"summary": "用户养了一条狗"}],
         }
 
-    monkeypatch.setattr(routes.worker, "build_foreground_output_from_texts", fake_foreground)
+    monkeypatch.setattr(plaintext.worker, "build_foreground_output_from_texts", fake_foreground)
 
     def fake_fact_write(**kwargs):
         calls["fact_write"] = kwargs
@@ -550,22 +576,22 @@ def test_add_memory_mode_writes_only_memory(monkeypatch):
             "voice_workset": {"behavior_notes": ["bad"], "exemplars": []},
         }
 
-    monkeypatch.setattr(routes.worker, "build_memory_output_from_fact_candidates", fake_fact_write)
+    monkeypatch.setattr(plaintext.worker, "build_memory_output_from_fact_candidates", fake_fact_write)
     monkeypatch.setattr(
-        routes.service,
+        plaintext.service,
         "apply_memory_outputs",
         lambda _store, _api_key, output: calls.update({"memory_output": output}) or (1, [{"memory": {"id": "m1"}}]),
     )
-    monkeypatch.setattr(routes.service, "init_identity_if_absent", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("add_memory must not touch identity")))
-    monkeypatch.setattr(routes.service, "write_persona_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("add_memory must not write persona")))
-    monkeypatch.setattr(routes.service, "write_voice_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("add_memory must not write voice")))
+    monkeypatch.setattr(plaintext.service, "init_identity_if_absent", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("add_memory must not touch identity")))
+    monkeypatch.setattr(plaintext.service, "write_persona_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("add_memory must not write persona")))
+    monkeypatch.setattr(plaintext.service, "write_voice_artifact", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("add_memory must not write voice")))
     monkeypatch.setattr(
-        routes.db,
+        plaintext.db,
         "genesis_complete_job",
         lambda _user_id, _job_id, **kwargs: calls.update({"completed": kwargs}) or {"job_id": "job_add", "status": "done"},
     )
 
-    routes._run_plaintext_genesis_job(
+    plaintext._run_plaintext_genesis_job(
         store,
         "api_key",
         "job_add",
@@ -586,26 +612,26 @@ def test_add_memory_mode_writes_only_memory(monkeypatch):
 def test_update_identity_mode_replaces_identity_without_writing_memory(monkeypatch):
     store = _store()
     calls: dict = {}
-    monkeypatch.setattr(routes.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
-    monkeypatch.setattr(routes.identity_service, "_load_identity", lambda _store: {"id": "identity_1"})
-    monkeypatch.setattr(routes.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_identity", "status": "processing"})
-    monkeypatch.setattr(routes.service, "write_genesis_state", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(routes.history_import, "_import_language_for_store", lambda _store, _msgs: "zh")
+    monkeypatch.setattr(plaintext.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    monkeypatch.setattr(plaintext.identity_service, "_load_identity", lambda _store: {"id": "identity_1"})
+    monkeypatch.setattr(plaintext.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_identity", "status": "processing"})
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plaintext.history_import, "_import_language_for_store", lambda _store, _msgs: "zh")
     monkeypatch.setattr(
-        routes.history_import,
+        plaintext.history_import,
         "_derive_identity_with_provider",
         lambda *_args, **_kwargs: ({"agent_name": "乔伊", "dimensions": [{"name": "活泼", "description": "ENFP"}]}, []),
     )
     _stub_update_identity_persona(monkeypatch)
-    monkeypatch.setattr(routes.service, "replace_identity_preserving_anchor", lambda _store, output: calls.update({"identity_output": output}) or "updated")
-    monkeypatch.setattr(routes.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
+    monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda _store, output: calls.update({"identity_output": output}) or "updated")
+    monkeypatch.setattr(plaintext.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
     monkeypatch.setattr(
-        routes.db,
+        plaintext.db,
         "genesis_complete_job",
         lambda _user_id, _job_id, **kwargs: calls.update({"completed": kwargs}) or {"job_id": "job_identity", "status": "done"},
     )
 
-    routes._run_plaintext_genesis_job(
+    plaintext._run_plaintext_genesis_job(
         store,
         "api_key",
         "job_identity",
@@ -623,18 +649,18 @@ def test_update_identity_mode_replaces_identity_without_writing_memory(monkeypat
 def test_update_identity_rebuilds_persona_from_uploaded_role_card_material(monkeypatch):
     store = _store()
     calls: dict = {}
-    monkeypatch.setattr(routes.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
-    monkeypatch.setattr(routes.identity_service, "_load_identity", lambda _store: {"id": "identity_1"})
-    monkeypatch.setattr(routes.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_identity", "status": "processing"})
-    monkeypatch.setattr(routes.service, "write_genesis_state", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(routes.history_import, "_import_language_for_store", lambda _store, _msgs: "zh")
+    monkeypatch.setattr(plaintext.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    monkeypatch.setattr(plaintext.identity_service, "_load_identity", lambda _store: {"id": "identity_1"})
+    monkeypatch.setattr(plaintext.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_identity", "status": "processing"})
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plaintext.history_import, "_import_language_for_store", lambda _store, _msgs: "zh")
     monkeypatch.setattr(
-        routes.history_import,
+        plaintext.history_import,
         "_derive_identity_with_provider",
         lambda *_args, **_kwargs: ({"agent_name": "乔伊", "dimensions": [{"name": "直爽", "description": "说人话。"}]}, []),
     )
     monkeypatch.setattr(
-        routes,
+        plaintext,
         "_plaintext_existing_voice_workset_for_update",
         lambda _store, _api_key: {
             "behavior_notes": ["短句接住, 不绕弯。"],
@@ -655,18 +681,18 @@ def test_update_identity_rebuilds_persona_from_uploaded_role_card_material(monke
             "voice_workset": kwargs["voice_workset"],
         }
 
-    monkeypatch.setattr(routes.worker, "build_persona_output_from_material", fake_build_persona, raising=False)
-    monkeypatch.setattr(routes.service, "replace_identity_preserving_anchor", lambda _store, output: calls.update({"identity_output": output}) or "updated")
-    monkeypatch.setattr(routes.service, "write_persona_artifact", lambda _store, _job_id, output: calls.update({"persona_output": output}) or ("user_blob:genesis_persona", "sha-new"))
-    monkeypatch.setattr(routes.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
+    monkeypatch.setattr(plaintext.worker, "build_persona_output_from_material", fake_build_persona, raising=False)
+    monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda _store, output: calls.update({"identity_output": output}) or "updated")
+    monkeypatch.setattr(plaintext.service, "write_persona_artifact", lambda _store, _job_id, output: calls.update({"persona_output": output}) or ("user_blob:genesis_persona", "sha-new"))
+    monkeypatch.setattr(plaintext.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
     monkeypatch.setattr(
-        routes.db,
+        plaintext.db,
         "genesis_complete_job",
         lambda _user_id, _job_id, **kwargs: calls.update({"completed": kwargs}) or {"job_id": "job_identity", "status": "done"},
     )
 
     role_card = "名字：乔伊\n性格：硬核、直爽、懂你的全栈 AI 协作者"
-    routes._run_plaintext_genesis_job(
+    plaintext._run_plaintext_genesis_job(
         store,
         "api_key",
         "job_identity",
@@ -689,28 +715,28 @@ def test_update_identity_rebuilds_persona_from_uploaded_role_card_material(monke
 def test_update_identity_persona_rebuild_failure_does_not_replace_identity(monkeypatch):
     store = _store()
     calls: dict = {}
-    monkeypatch.setattr(routes.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
-    monkeypatch.setattr(routes.identity_service, "_load_identity", lambda _store: {"id": "identity_1"})
-    monkeypatch.setattr(routes.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_identity", "status": "processing"})
-    monkeypatch.setattr(routes.service, "write_genesis_state", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(routes.history_import, "_import_language_for_store", lambda _store, _msgs: "zh")
+    monkeypatch.setattr(plaintext.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    monkeypatch.setattr(plaintext.identity_service, "_load_identity", lambda _store: {"id": "identity_1"})
+    monkeypatch.setattr(plaintext.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_identity", "status": "processing"})
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plaintext.history_import, "_import_language_for_store", lambda _store, _msgs: "zh")
     monkeypatch.setattr(
-        routes.history_import,
+        plaintext.history_import,
         "_derive_identity_with_provider",
         lambda *_args, **_kwargs: ({"agent_name": "乔伊", "dimensions": [{"name": "直爽", "description": "说人话。"}]}, []),
     )
-    monkeypatch.setattr(routes, "_plaintext_existing_voice_workset_for_update", lambda *_args: {}, raising=False)
+    monkeypatch.setattr(plaintext, "_plaintext_existing_voice_workset_for_update", lambda *_args: {}, raising=False)
     monkeypatch.setattr(
-        routes.worker,
+        plaintext.worker,
         "build_persona_output_from_material",
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("provider timeout")),
         raising=False,
     )
-    monkeypatch.setattr(routes.service, "replace_identity_preserving_anchor", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not replace identity when persona rebuild fails")))
-    monkeypatch.setattr(routes.db, "genesis_complete_job", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("failed persona rebuild must not complete job")))
-    monkeypatch.setattr(routes.service, "mark_failed", lambda _store, job_id, error: calls.update({"job_id": job_id, "error": error}))
+    monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not replace identity when persona rebuild fails")))
+    monkeypatch.setattr(plaintext.db, "genesis_complete_job", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("failed persona rebuild must not complete job")))
+    monkeypatch.setattr(plaintext.service, "mark_failed", lambda _store, job_id, error: calls.update({"job_id": job_id, "error": error}))
 
-    routes._run_plaintext_genesis_job(
+    plaintext._run_plaintext_genesis_job(
         store,
         "api_key",
         "job_identity",
@@ -726,26 +752,26 @@ def test_update_identity_persona_rebuild_failure_does_not_replace_identity(monke
 def test_update_identity_mode_allows_nameless_nonempty_identity(monkeypatch):
     store = _store()
     calls: dict = {}
-    monkeypatch.setattr(routes.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
-    monkeypatch.setattr(routes.identity_service, "_load_identity", lambda _store: {"id": "identity_1"})
-    monkeypatch.setattr(routes.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_identity", "status": "processing"})
-    monkeypatch.setattr(routes.service, "write_genesis_state", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(routes.history_import, "_import_language_for_store", lambda _store, _msgs: "zh")
+    monkeypatch.setattr(plaintext.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    monkeypatch.setattr(plaintext.identity_service, "_load_identity", lambda _store: {"id": "identity_1"})
+    monkeypatch.setattr(plaintext.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_identity", "status": "processing"})
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plaintext.history_import, "_import_language_for_store", lambda _store, _msgs: "zh")
     monkeypatch.setattr(
-        routes.history_import,
+        plaintext.history_import,
         "_derive_identity_with_provider",
         lambda *_args, **_kwargs: ({"agent_name": "", "dimensions": [{"name": "直爽", "description": "说人话。"}]}, []),
     )
     _stub_update_identity_persona(monkeypatch)
-    monkeypatch.setattr(routes.service, "replace_identity_preserving_anchor", lambda _store, output: calls.update({"identity_output": output}) or "updated")
+    monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda _store, output: calls.update({"identity_output": output}) or "updated")
     monkeypatch.setattr(
-        routes.db,
+        plaintext.db,
         "genesis_complete_job",
         lambda _user_id, _job_id, **kwargs: calls.update({"completed": kwargs}) or {"job_id": "job_identity", "status": "done"},
     )
-    monkeypatch.setattr(routes.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
+    monkeypatch.setattr(plaintext.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
 
-    routes._run_plaintext_genesis_job(
+    plaintext._run_plaintext_genesis_job(
         store,
         "api_key",
         "job_identity",
@@ -764,28 +790,28 @@ def test_update_identity_mode_allows_nameless_nonempty_identity(monkeypatch):
 def test_update_identity_mode_fails_on_empty_identity(monkeypatch):
     store = _store()
     calls: dict = {}
-    monkeypatch.setattr(routes.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
-    monkeypatch.setattr(routes.identity_service, "_load_identity", lambda _store: {"id": "identity_1"})
-    monkeypatch.setattr(routes.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_identity", "status": "processing"})
-    monkeypatch.setattr(routes.service, "write_genesis_state", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(routes.history_import, "_import_language_for_store", lambda _store, _msgs: "zh")
+    monkeypatch.setattr(plaintext.hosted_config_store, "_load_runtime_provider_config", lambda *_args: "runtime")
+    monkeypatch.setattr(plaintext.identity_service, "_load_identity", lambda _store: {"id": "identity_1"})
+    monkeypatch.setattr(plaintext.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id": "job_identity", "status": "processing"})
+    monkeypatch.setattr(plaintext.service, "write_genesis_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(plaintext.history_import, "_import_language_for_store", lambda _store, _msgs: "zh")
     monkeypatch.setattr(
-        routes.history_import,
+        plaintext.history_import,
         "_derive_identity_with_provider",
         lambda *_args, **_kwargs: ({"agent_name": "", "dimensions": [], "self_introduction": "", "category": "", "signature": []}, []),
     )
     monkeypatch.setattr(
-        routes.worker,
+        plaintext.worker,
         "build_persona_output_from_material",
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError("empty identity must not rebuild persona")),
         raising=False,
     )
-    monkeypatch.setattr(routes.service, "replace_identity_preserving_anchor", lambda _store, _output: "identity_update_empty")
-    monkeypatch.setattr(routes.db, "genesis_complete_job", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("empty identity must not complete job")))
-    monkeypatch.setattr(routes.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
-    monkeypatch.setattr(routes.service, "mark_failed", lambda _store, job_id, error: calls.update({"job_id": job_id, "error": error}))
+    monkeypatch.setattr(plaintext.service, "replace_identity_preserving_anchor", lambda _store, _output: "identity_update_empty")
+    monkeypatch.setattr(plaintext.db, "genesis_complete_job", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("empty identity must not complete job")))
+    monkeypatch.setattr(plaintext.service, "apply_memory_outputs", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update_identity must not write memory")))
+    monkeypatch.setattr(plaintext.service, "mark_failed", lambda _store, job_id, error: calls.update({"job_id": job_id, "error": error}))
 
-    routes._run_plaintext_genesis_job(
+    plaintext._run_plaintext_genesis_job(
         store,
         "api_key",
         "job_identity",
@@ -800,9 +826,9 @@ def test_update_identity_mode_fails_on_empty_identity(monkeypatch):
 
 def test_update_identity_plaintext_requires_existing_identity(monkeypatch):
     client = _client(monkeypatch)
-    monkeypatch.setattr(routes.identity_service, "_load_identity", lambda _store: None)
+    monkeypatch.setattr(plaintext.identity_service, "_load_identity", lambda _store: None)
     monkeypatch.setattr(
-        routes.service,
+        plaintext.service,
         "create_import_job",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not create job")),
     )

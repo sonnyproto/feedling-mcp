@@ -1,0 +1,117 @@
+"""Native ASGI hosted-setup surface (ASGI-migration plan §5.3 / §9).
+
+Mirrors the Flask ``hosted.setup_routes`` blueprint: each route requires an
+authenticated user (``Depends(require_auth)`` — the ASGI equivalent of
+``auth.require_user()``) and delegates to the framework-neutral
+``hosted.setup_core`` so the response bodies are byte-identical to Flask's.
+
+Auth/scope: the Flask routes gate on ``auth.require_user()`` only — none call
+``runtime_auth.authorize_scope(...)`` — so there is deliberately NO
+``require_scope`` here; adding one would diverge from the Flask surface.
+
+Credentials: the Flask routes that need the caller's provider credential read it
+via ``auth._extract_api_key()``; the ASGI equivalent is
+``auth_core.extract_api_key(headers, query_params)`` (X-API-Key / Bearer / legacy
+``?key=``), forwarded to the neutral core exactly as Flask forwards it. The core
+never touches ``flask.request``.
+
+E2E boundary: ``/v1/model_api/key_envelope`` returns the caller's OWN
+``api_key_envelope`` ciphertext — never decrypted server-side. ``setup`` seals a
+provider key via the same envelope/enclave functions Flask calls; no server-side
+decrypt is added here.
+
+All store / enclave / provider work is blocking, so it runs off the event loop
+via ``threadpool.run_db`` (plan §5.2).
+"""
+
+from __future__ import annotations
+
+from fastapi import APIRouter, Depends, Request
+from fastapi.responses import JSONResponse
+
+from accounts import auth_core
+from accounts.auth_core import AuthResult
+from asgi import http as asgi_http
+from asgi import threadpool
+from asgi.deps import require_auth
+from hosted import setup_core
+
+router = APIRouter()
+
+
+@router.post("/v1/model_api/setup")
+async def model_api_setup(request: Request, auth: AuthResult = Depends(require_auth)):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.model_api_setup, auth.store, payload, caller_api_key=caller_api_key)
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/model_api/get")
+async def model_api_get(auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(setup_core.model_api_get, auth.store)
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/model_api/driver")
+async def model_api_set_hosting(auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(setup_core.model_api_set_hosting, auth.store)
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/model_api/key_envelope")
+async def model_api_key_envelope(auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(setup_core.model_api_key_envelope, auth.store)
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/model_api/test")
+async def model_api_test(request: Request, auth: AuthResult = Depends(require_auth)):
+    api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(setup_core.model_api_test, auth.store, api_key=api_key)
+    return JSONResponse(body, status_code=status)
+
+
+@router.delete("/v1/model_api/delete")
+async def model_api_delete(auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(setup_core.model_api_delete, auth.store)
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/model_api/runtime")
+async def model_api_runtime_status(request: Request, auth: AuthResult = Depends(require_auth)):
+    api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.model_api_runtime_status, auth.store, api_key=api_key)
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/model_api/memory/repair")
+async def model_api_memory_repair(request: Request, auth: AuthResult = Depends(require_auth)):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    # No Flask app config under ASGI; production Flask has TESTING=False, so the
+    # sync path is driven solely by the payload's synchronous/sync flags — matching
+    # production Flask (only the Flask test harness flips config TESTING on).
+    body, status = await threadpool.run_db(
+        setup_core.model_api_memory_repair, auth.store, payload, api_key=api_key, testing=False)
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/state/receipts")
+async def state_receipts(request: Request, auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(
+        setup_core.state_receipts, auth.store, request.query_params.get("limit", 30))
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/memory/capture_jobs")
+async def memory_capture_jobs(request: Request, auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(
+        setup_core.memory_capture_jobs, auth.store, request.query_params.get("limit", 30))
+    return JSONResponse(body, status_code=status)
+
+
+def register_asgi(app) -> None:
+    app.include_router(router)

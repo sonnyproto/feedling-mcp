@@ -16,7 +16,6 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 import httpx
-from flask import Blueprint, Response, jsonify, request, g
 
 import db
 from core import util as core_util
@@ -52,16 +51,15 @@ from model_api_runtime.tools import (
 from context_memory_selection import memory_relevance_details
 from content_encryption import build_envelope
 
-from accounts import auth
 from accounts import onboarding as accounts_onboarding
 from bootstrap import gates as boot_gates
 from chat import consumer as chat_consumer
 from identity import service as identity_service
 from genesis import service as genesis_service
 from hosted import config_store as hosted_config_store
+from hosted import onboarding_validation_core
 
 
-bp = Blueprint("hosted_onboarding_validation", __name__)
 
 _GENESIS_ACTIVE_STATUSES = {"created", "uploading", "uploaded", "processing"}
 _GENESIS_TERMINAL_STATUSES = {"done", "failed"}
@@ -604,15 +602,3 @@ def _onboarding_validation_payload(store: UserStore) -> dict:
         "skill_url": boot_gates._SKILL_URL,
     }
 
-
-@bp.route("/v1/onboarding/validate", methods=["GET"])
-def onboarding_validate():
-    """Authoritative onboarding acceptance check.
-
-    This is deliberately server-side and artifact-based: agents can report
-    anything, but the validator only passes a step when Feedling can see the
-    corresponding write, resident-consumer heartbeat, verify-loop event, or
-    real user→agent exchange.
-    """
-    store = auth.require_user()
-    return jsonify(_onboarding_validation_payload(store))

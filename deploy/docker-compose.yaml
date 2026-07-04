@@ -93,7 +93,7 @@ services:
     # released), so adding workers multiplies the long-poll capacity that used to
     # be capped at one process. Each worker adds ~17 DB connections (pool 16 + 1
     # listener); mind the database's max_connections when raising -w.
-    command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-w", "2", "--threads", "32", "--timeout", "120", "-b", "0.0.0.0:5001", "app:app"]
+    command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-w", "2", "-k", "asgi.worker.FeedlingUvicornWorker", "--timeout", "120", "-b", "0.0.0.0:5001", "asgi_app:app"]
     restart: unless-stopped
     environment:
       # --- BAKED: security-relevant, audited by iOS ---

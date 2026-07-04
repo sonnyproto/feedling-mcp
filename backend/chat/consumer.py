@@ -7,8 +7,6 @@ import time
 import uuid
 from datetime import date, datetime
 
-from flask import jsonify, request
-
 import db
 from core.store import UserStore
 
@@ -47,23 +45,28 @@ def _save_consumer_state(store: UserStore, state: dict) -> None:
     db.set_blob(store.user_id, "consumer_state", state)
 
 
-def _consumer_headers_from_request() -> dict:
-    name = (request.headers.get("X-Feedling-Consumer") or "").strip()
+def _consumer_headers_from_map(headers, remote_addr: str = "") -> dict:
+    """Framework-neutral: consumer identity from a headers mapping + remote addr.
+
+    Both Flask (request.headers) and ASGI (request.headers) expose a
+    case-insensitive ``.get``, so the ASGI poll route reuses this (plan §9.1)."""
+    name = (headers.get("X-Feedling-Consumer") or "").strip()
     if not name:
         return {}
     return {
         "consumer_name": name,
-        "consumer_id": (request.headers.get("X-Feedling-Consumer-Id") or "").strip(),
-        "consumer_version": (request.headers.get("X-Feedling-Consumer-Version") or "").strip(),
-        "consumer_commit": (request.headers.get("X-Feedling-Consumer-Commit") or "").strip(),
+        "consumer_id": (headers.get("X-Feedling-Consumer-Id") or "").strip(),
+        "consumer_version": (headers.get("X-Feedling-Consumer-Version") or "").strip(),
+        "consumer_commit": (headers.get("X-Feedling-Consumer-Commit") or "").strip(),
         "official": name == _OFFICIAL_CONSUMER_NAME,
-        "remote_addr": request.remote_addr or "",
-        "user_agent": request.headers.get("User-Agent", ""),
+        "remote_addr": remote_addr or "",
+        "user_agent": headers.get("User-Agent", ""),
     }
 
 
-def _record_consumer_event(store: UserStore, event_type: str) -> None:
-    info = _consumer_headers_from_request()
+def _record_consumer_event(store: UserStore, event_type: str, *, info: dict | None = None) -> None:
+    # ASGI callers always pass ``info`` (computed from the ASGI request off the
+    # loop). Missing/empty info is a no-op.
     if not info:
         return
     now_epoch = time.time()

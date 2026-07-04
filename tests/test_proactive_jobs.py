@@ -18,10 +18,11 @@ from proactive import capture_scheduler as proactive_capture_scheduler  # noqa: 
 from proactive import dashboard as proactive_dashboard  # noqa: E402
 from proactive import dream_scheduler as proactive_dream_scheduler  # noqa: E402
 from proactive import resident_runtime_v2 as proactive_resident_runtime_v2  # noqa: E402
-from proactive import routes as proactive_routes  # noqa: E402
 from perception import service as perception_service  # noqa: E402
+from proactive import poll_core as proactive_poll_core  # noqa: E402
 from push import apns as push_apns  # noqa: E402
 from core import config as core_config  # noqa: E402
+from core import reqctx  # noqa: E402
 
 from conftest import seed_user  # noqa: E402
 
@@ -191,7 +192,7 @@ def test_proactive_debug_folds_legacy_no_frame_ticks(tmp_path, monkeypatch):
     assert appmod._gate_decision_has_frame_context(with_frame) is True
 
     snapshot = appmod._proactive_debug_snapshot(store)
-    with appmod.app.test_request_context("/debug/proactive?key=test&lang=zh"):
+    with reqctx.bind(query_string="key=test&lang=zh"):
         page = appmod._render_proactive_dashboard(snapshot)
 
     assert "主表判定 1" in page
@@ -201,12 +202,12 @@ def test_proactive_debug_folds_legacy_no_frame_ticks(tmp_path, monkeypatch):
     assert "no_recent_frames_unit_test" not in page
     assert "显示样本" in page
 
-    with appmod.app.test_request_context("/debug/proactive?key=test&lang=zh&show_no_frame=1"):
+    with reqctx.bind(query_string="key=test&lang=zh&show_no_frame=1"):
         expanded_page = appmod._render_proactive_dashboard(snapshot)
 
     assert expanded_page.find("frame_backed_false_unit_test") < expanded_page.find("no_recent_frames_unit_test")
 
-    with appmod.app.test_request_context("/debug/proactive?key=test&lang=en"):
+    with reqctx.bind(query_string="key=test&lang=en"):
         page_en = appmod._render_proactive_dashboard(snapshot)
 
     assert "visible decisions 1" in page_en
@@ -286,7 +287,7 @@ def test_proactive_debug_dashboard_defaults_to_deep_full_view(tmp_path, monkeypa
         )
 
     snapshot = appmod._proactive_debug_snapshot(store)
-    with appmod.app.test_request_context("/debug/proactive?key=test&lang=en"):
+    with reqctx.bind(query_string="key=test&lang=en"):
         page = appmod._render_proactive_dashboard(snapshot)
 
     assert "lang-switch" in page
@@ -356,9 +357,9 @@ def test_proactive_debug_translates_prose_only_in_zh_view(tmp_path, monkeypatch)
         },
     )
 
-    with appmod.app.test_request_context("/debug/proactive?key=test&lang=zh"):
+    with reqctx.bind(query_string="key=test&lang=zh"):
         page_zh = appmod._render_proactive_dashboard(snapshot)
-    with appmod.app.test_request_context("/debug/proactive?key=test&lang=en"):
+    with reqctx.bind(query_string="key=test&lang=en"):
         page_en = appmod._render_proactive_dashboard(snapshot)
 
     assert "屏幕内容和用户的记忆花园有明确关联。" in page_zh
@@ -2003,10 +2004,10 @@ def test_resident_stale_claim_is_recovered_and_old_consumer_cannot_complete(tmp_
         "ts": 100.0,
         "status": "claimed",
         "consumer_id": "resident-a",
-        "claimed_at": str(now - proactive_routes.RESIDENT_WAKE_LEASE_SEC - 1),
+        "claimed_at": str(now - proactive_poll_core.RESIDENT_WAKE_LEASE_SEC - 1),
         "trigger": "heartbeat_broadcast_on",
     })
-    monkeypatch.setattr(proactive_routes.time, "time", lambda: now)
+    monkeypatch.setattr(proactive_poll_core.time, "time", lambda: now)
 
     client = appmod.app.test_client()
     headers = {"X-API-Key": api_key}
@@ -2046,10 +2047,10 @@ def test_resident_reaper_does_not_reclaim_hosted_claims(tmp_path, monkeypatch):
         "ts": 100.0,
         "status": "claimed",
         "consumer_id": "hosted_runtime_v2",
-        "claimed_at": str(now - proactive_routes.RESIDENT_WAKE_LEASE_SEC - 1),
+        "claimed_at": str(now - proactive_poll_core.RESIDENT_WAKE_LEASE_SEC - 1),
         "trigger": "heartbeat_broadcast_on",
     })
-    monkeypatch.setattr(proactive_routes.time, "time", lambda: now)
+    monkeypatch.setattr(proactive_poll_core.time, "time", lambda: now)
 
     client = appmod.app.test_client()
     poll = client.get(

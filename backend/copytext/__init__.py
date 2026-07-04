@@ -11,13 +11,3 @@ Integration with the rest of the backend is one line in app.py:
 
 Everything else (routing, DB access, validation) lives here.
 """
-from __future__ import annotations
-
-from .routes import bp
-
-__all__ = ["register"]
-
-
-def register(app) -> None:
-    """Mount the /v1/copytext blueprint onto the Flask app."""
-    app.register_blueprint(bp)

@@ -3,14 +3,69 @@ from __future__ import annotations
 import sys
 import types
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pytest
-from flask import Flask
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import enclave_app  # noqa: E402
-from memory import routes as memory_routes  # noqa: E402
+from memory import memory_core  # noqa: E402
+from memory import service as memory_service  # noqa: E402
+
+
+# The Flask /v1/memory/* readside routes were deleted in the ASGI cutover. This
+# module-level hook is what the readside tests monkeypatch (previously
+# ``memory.routes._memory_readside_post_enclave``); the _CoreClient below reads it
+# at call time and threads it into the framework-neutral memory_core the ASGI
+# routes delegate to.
+_memory_readside_post_enclave = None
+
+
+def _readside_post_enclave(api_key, candidates, *, operation, payload=None):
+    return _memory_readside_post_enclave(api_key, candidates, operation=operation, payload=payload)
+
+
+class _Resp:
+    def __init__(self, body, status=200):
+        self.status_code = status
+        self._body = body
+
+    def get_json(self):
+        return self._body
+
+
+class _CoreClient:
+    """Mimics the old Flask test-client for the deleted memory readside routes,
+    routing straight to memory_core with the current module-level post-enclave hook."""
+
+    def __init__(self, store, api_key="key_readside"):
+        self._store = store
+        self._api_key = api_key
+
+    def _key(self, headers):
+        return (headers or {}).get("X-API-Key", self._api_key)
+
+    def post(self, path, json=None, headers=None):
+        p = urlparse(path).path
+        api_key = self._key(headers)
+        pe = _readside_post_enclave
+        if p == "/v1/memory/index":
+            return _Resp(*memory_core.index(self._store, api_key, json or {}, post_enclave=pe))
+        if p == "/v1/memory/fetch":
+            return _Resp(*memory_core.fetch(self._store, api_key, json or {}, post_enclave=pe))
+        raise AssertionError(f"unrouted path: {p}")
+
+    def get(self, path, headers=None):
+        u = urlparse(path)
+        p = u.path
+        api_key = self._key(headers)
+        pe = _readside_post_enclave
+        if p == "/v1/memory/buckets":
+            return _Resp(*memory_core.buckets(self._store, api_key, post_enclave=pe))
+        if p == "/v1/memory/threads":
+            return _Resp(*memory_core.threads(self._store, api_key, post_enclave=pe))
+        raise AssertionError(f"unrouted path: {p}")
 
 
 def _moment(
@@ -56,15 +111,9 @@ def _moment(
 
 
 @pytest.fixture()
-def client(monkeypatch):
+def client():
     store = types.SimpleNamespace(user_id="usr_readside")
-    monkeypatch.setattr(memory_routes.auth, "require_user", lambda: store)
-    monkeypatch.setattr(memory_routes.auth, "_extract_api_key", lambda: "key_readside")
-    app = Flask(__name__)
-    app.register_blueprint(memory_routes.bp)
-    app.config.update(TESTING=True)
-    with app.test_client() as c:
-        yield c, store
+    return _CoreClient(store, "key_readside"), store
 
 
 def test_memory_index_sends_full_light_index_and_calls_enclave(client, monkeypatch):
@@ -83,7 +132,7 @@ def test_memory_index_sends_full_light_index_and_calls_enclave(client, monkeypat
         _moment(f"bulk_{idx:02d}", salience="low", importance=0.1, occurred_at=f"2026-06-18T{idx:02d}:00:00")
         for idx in range(60)
     )
-    monkeypatch.setattr(memory_routes.memory_service, "_load_moments", lambda _store: moments)
+    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: moments)
     captured = {}
 
     def fake_enclave(api_key, candidates, *, operation, payload=None):
@@ -93,7 +142,7 @@ def test_memory_index_sends_full_light_index_and_calls_enclave(client, monkeypat
         captured["payload"] = dict(payload or {})
         return {"items": [{"id": m["id"], "summary": m["id"]} for m in candidates]}
 
-    monkeypatch.setattr(memory_routes, "_memory_readside_post_enclave", fake_enclave)
+    monkeypatch.setattr(sys.modules[__name__], "_memory_readside_post_enclave", fake_enclave)
 
     res = c.post("/v1/memory/index", json={}, headers={"X-API-Key": "key_readside"})
 
@@ -121,8 +170,8 @@ def test_memory_fetch_splits_missing_unavailable_and_preserves_order(client, mon
         _moment("superseded", status="superseded"),
         _moment("other_user", owner="usr_other"),
     ]
-    monkeypatch.setattr(memory_routes.memory_service, "_load_moments", lambda _store: moments)
-    monkeypatch.setattr(memory_routes.memory_service, "_save_moments", lambda _store, _moments: None)
+    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: moments)
+    monkeypatch.setattr(memory_service, "_save_moments", lambda _store, _moments: None)
     captured = {}
 
     def fake_enclave(api_key, candidates, *, operation, payload=None):
@@ -132,7 +181,7 @@ def test_memory_fetch_splits_missing_unavailable_and_preserves_order(client, mon
             "unavailable_ids": [],
         }
 
-    monkeypatch.setattr(memory_routes, "_memory_readside_post_enclave", fake_enclave)
+    monkeypatch.setattr(sys.modules[__name__], "_memory_readside_post_enclave", fake_enclave)
 
     res = c.post(
         "/v1/memory/fetch",

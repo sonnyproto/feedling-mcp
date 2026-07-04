@@ -2,12 +2,45 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-
-from flask import Flask
+from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-from agent import routes as agent_routes  # noqa: E402
+from agent import perception_core  # noqa: E402
+from perception import history as perception_history  # noqa: E402
+from perception import service as perception_service  # noqa: E402
+from perception import store as perception_store  # noqa: E402
+
+
+# The Flask /v1/agent/perception* routes were deleted in the ASGI cutover; this
+# tiny client mimics the old Flask test-client response shape (.status_code /
+# .get_json()) while routing straight to the framework-neutral perception_core
+# the ASGI routes delegate to — so the test bodies below are unchanged.
+class _Resp:
+    def __init__(self, body, status=200):
+        self.status_code = status
+        self._body = body
+
+    def get_json(self):
+        return self._body
+
+
+class _CoreClient:
+    def __init__(self, store):
+        self._store = store
+
+    def get(self, path):
+        u = urlparse(path)
+        q = parse_qs(u.query)
+        one = lambda k: (q.get(k) or [None])[0]  # noqa: E731
+        try:
+            if u.path == "/v1/agent/perception":
+                return _Resp(perception_core.agent_perception_payload(self._store, signals_raw=one("signals")))
+            if u.path == "/v1/agent/perception/digest":
+                return _Resp(perception_core.perception_digest_payload(self._store, days_raw=one("days")))
+            raise AssertionError(f"unrouted path: {u.path}")
+        except perception_core.AgentRouteError as err:
+            return _Resp(err.body, err.status_code)
 
 
 def _client(monkeypatch, *, settings=None, state=None, snapshot=None, pull=None):
@@ -17,16 +50,12 @@ def _client(monkeypatch, *, settings=None, state=None, snapshot=None, pull=None)
         def load_proactive_settings(self):
             return dict(settings or {})
 
-    monkeypatch.setattr(agent_routes.auth, "require_user", lambda: Store())
-    monkeypatch.setattr(agent_routes.perception_store, "get_state", lambda uid: dict(state or {}))
-    monkeypatch.setattr(agent_routes.perception_service, "snapshot", lambda uid: dict(snapshot or {}))
-    monkeypatch.setattr(agent_routes.perception_service, "pull_snapshot", lambda uid: dict(pull or {}))
-    monkeypatch.setattr(agent_routes.perception_service, "photos_recent",
+    monkeypatch.setattr(perception_store, "get_state", lambda uid: dict(state or {}))
+    monkeypatch.setattr(perception_service, "snapshot", lambda uid: dict(snapshot or {}))
+    monkeypatch.setattr(perception_service, "pull_snapshot", lambda uid: dict(pull or {}))
+    monkeypatch.setattr(perception_service, "photos_recent",
                         lambda uid, limit=20: ({"photos": []}, 200))
-
-    app = Flask("agent-route-test")
-    app.register_blueprint(agent_routes.bp)
-    return app.test_client()
+    return _CoreClient(Store())
 
 
 def test_agent_perception_returns_requested_fast_signals(monkeypatch):
@@ -339,7 +368,7 @@ def test_agent_perception_digest_returns_top_notable_changes(monkeypatch):
         return rows_by_signal.get(signal, [])
 
     monkeypatch.setenv("FEEDLING_DIGEST_NOTABLE_MAX", "1")
-    monkeypatch.setattr(agent_routes.perception_store, "list_perception_daily", fake_list)
+    monkeypatch.setattr(perception_store, "list_perception_daily", fake_list)
     client = _client(monkeypatch)
 
     resp = client.get("/v1/agent/perception/digest?days=7")
@@ -360,7 +389,7 @@ def test_agent_perception_digest_returns_top_notable_changes(monkeypatch):
     assert all(call[0] == "u_agent" and call[2] == 7 for call in calls)
     # The board also reads the two non-comparable history shapes it renders directly.
     assert {call[1] for call in calls} == (
-        set(agent_routes.perception_history.comparable_signals()) | {"playback", "location_signal"}
+        set(perception_history.comparable_signals()) | {"playback", "location_signal"}
     )
     # The balanced board ships alongside legacy changes; health is one folded entry
     # and (same rows, same cap) matches the legacy top-N here.
@@ -373,7 +402,7 @@ def test_agent_perception_digest_returns_top_notable_changes(monkeypatch):
 
 def test_agent_perception_digest_empty_without_baseline(monkeypatch):
     monkeypatch.setattr(
-        agent_routes.perception_store,
+        perception_store,
         "list_perception_daily",
         lambda user_id, signal, days: [
             {"date": "2026-06-24", "doc": {"resting_heart_rate": {"sum": 120, "count": 2, "min": 58, "max": 62}}},

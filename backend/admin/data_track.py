@@ -7,10 +7,9 @@ import threading
 import time
 from datetime import datetime, timedelta
 
-import hmac
 from urllib.parse import quote
 
-from flask import Blueprint, Response, abort, jsonify, request
+from core.reqctx import request
 
 import db
 from core.store import UserStore
@@ -28,7 +27,6 @@ from core import store as core_store
 from core import util as core_util
 from identity import service as identity_service
 
-bp = Blueprint("admin", __name__)
 
 
 # Injected by the assembly layer — these live with the hosted/onboarding
@@ -39,30 +37,6 @@ def _latest_history_import_job(store):
 
 def _onboarding_validation_payload(store):
     return {}
-
-
-def _extract_admin_token() -> str:
-    key = request.headers.get("X-Admin-Token", "").strip()
-    if key:
-        return key
-    auth = request.headers.get("Authorization", "").strip()
-    if auth.lower().startswith("bearer "):
-        return auth[7:].strip()
-    return request.args.get("admin_key", "").strip()
-
-
-def require_admin() -> None:
-    configured = os.environ.get("FEEDLING_ADMIN_TOKEN", "").strip()
-    if not configured:
-        abort(503)
-    supplied = _extract_admin_token()
-    if not supplied or not hmac.compare_digest(supplied, configured):
-        abort(401)
-
-
-def _admin_qs() -> str:
-    token = request.args.get("admin_key", "").strip()
-    return urlencode({"admin_key": token}) if token else ""
 
 
 def _data_track_qs(**updates) -> str:
@@ -1680,77 +1654,6 @@ def _render_user_detail_page(user: dict) -> str:
 </main>
 </body>
 </html>"""
-
-
-@bp.route("/v1/admin/data-track/summary", methods=["GET"])
-def admin_data_track_summary():
-    require_admin()
-    return jsonify(_data_track_payload(include_users=False))
-
-
-@bp.route("/v1/admin/data-track/users", methods=["GET"])
-def admin_data_track_users():
-    require_admin()
-    return jsonify(_data_track_payload(include_users=True))
-
-
-@bp.route("/v1/admin/data-track/dau", methods=["GET"])
-def admin_data_track_dau():
-    require_admin()
-    return jsonify(_data_track_dau_payload())
-
-
-@bp.route("/v1/admin/data-track/proactive-daily", methods=["GET"])
-def admin_data_track_proactive_daily():
-    require_admin()
-    return jsonify(_data_track_proactive_daily_payload())
-
-
-@bp.route("/v1/admin/data-track/users/<user_id>", methods=["GET"])
-def admin_data_track_user(user_id: str):
-    require_admin()
-    with registry._users_lock:
-        entry = next((dict(u) for u in registry._users if u.get("user_id") == user_id), None)
-    if not entry:
-        return jsonify({"error": "user_not_found"}), 404
-    return jsonify({"user": _build_data_track_user(entry, include_detail=True)})
-
-
-@bp.route("/admin/data-track", methods=["GET"])
-def admin_data_track_page():
-    require_admin()
-    view = (request.args.get("view") or "").strip().lower()
-    if view == "dau":
-        return Response(_render_data_track_dau_page(_data_track_dau_payload()), mimetype="text/html")
-    if view == "proactive":
-        return Response(_render_proactive_daily_page(_data_track_proactive_daily_payload()), mimetype="text/html")
-    return Response(_render_data_track_page(_data_track_payload(include_users=True)), mimetype="text/html")
-
-
-@bp.route("/admin/data-track/users/<user_id>", methods=["GET"])
-def admin_data_track_user_page(user_id: str):
-    require_admin()
-    with registry._users_lock:
-        entry = next((dict(u) for u in registry._users if u.get("user_id") == user_id), None)
-    if not entry:
-        return Response("user not found", status=404, mimetype="text/plain")
-    return Response(_render_user_detail_page(_build_data_track_user(entry, include_detail=True)), mimetype="text/html")
-
-
-@bp.route("/v1/admin/store/evict", methods=["POST"])
-def admin_store_evict():
-    """Drop a user's cached in-process store so its next access rebuilds from
-    PostgreSQL. Use after an out-of-band DB write (e.g. the orphan-account
-    recovery tool) to surface the change immediately, instead of waiting for the
-    cache TTL or a backend redeploy."""
-    require_admin()
-    payload = request.get_json(silent=True) or {}
-    user_id = str(payload.get("user_id") or request.args.get("user_id") or "").strip()
-    if not user_id:
-        return jsonify({"error": "user_id required"}), 400
-    evicted = core_store._evict_store(user_id)
-    print(f"[admin:store/evict] user_id={user_id} evicted={evicted}")
-    return jsonify({"evicted": evicted, "user_id": user_id})
 
 
 # Synthetic chat-loop ping — server posts a marker user message,

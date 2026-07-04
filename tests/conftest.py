@@ -111,6 +111,8 @@ if not _provisioned:
         "test_hosted_agent_runtime_cutover.py",
         "test_worldbook_match.py",
         "test_worldbook_readside_core.py",
+        "test_asgi_app_import_guard.py",
+        "test_asgi_waiters.py",
     }
     collect_ignore = sorted(
         f
