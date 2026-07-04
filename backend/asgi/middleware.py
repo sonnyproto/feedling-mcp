@@ -24,6 +24,8 @@ from accounts import auth_core
 from asgi import responses
 from asgi.context import current_user_id
 from asgi.settings import settings
+from starlette.requests import ClientDisconnect
+from starlette.responses import Response
 
 try:  # Starlette re-exports the same class; import defensively.
     from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -104,6 +106,17 @@ def register_exception_handlers(app) -> None:
     @app.exception_handler(auth_core.AuthError)
     async def _auth_error(request, exc: auth_core.AuthError):
         return responses.json_error(exc.status_code, {"error": exc.code})
+
+    # Routes that read the body/form directly (copytext, diagnostics, proactive,
+    # genesis) hit a raised ClientDisconnect when the peer drops mid-upload —
+    # e.g. iOS backgrounding during a log upload. The peer is gone, so the only
+    # observable effect of letting it bubble is a 500 traceback in the logs;
+    # answer with nginx's 499 instead so the access line stays greppable and
+    # distinct from real 4xx/5xx. (read_json_silent additionally swallows it
+    # locally to keep Flask's silent=True parity for JSON routes.)
+    @app.exception_handler(ClientDisconnect)
+    async def _client_disconnect(request, exc):
+        return Response(status_code=499)
 
     @app.exception_handler(StarletteHTTPException)
     async def _http_exception(request, exc: StarletteHTTPException):
