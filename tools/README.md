@@ -223,6 +223,16 @@ AGENT_MODE=cli
 AGENT_CLI_CMD=mycli ask {message}
 ```
 
+A known-good **claude** command that can actually see chat images (assumes
+`IMAGE_TEMP_DIR=/home/agent/images`; adjust the path to yours — see the vision
+notes below for why `--add-dir` and the `//` are required):
+
+```
+AGENT_MODE=cli
+IMAGE_TEMP_DIR=/home/agent/images
+AGENT_CLI_CMD=claude --permission-mode acceptEdits --add-dir /home/agent/images --allowed-tools 'Read(//home/agent/images/**)' -p {message}
+```
+
 `{message}` is substituted with the user's plaintext message. The
 command's stdout becomes the reply. For image messages, the consumer writes
 the decrypted image to `IMAGE_TEMP_DIR` and either appends the file path to
@@ -238,11 +248,26 @@ Make sure the image reaches the model as real vision input:
   keeps clap's variadic `--image` from swallowing the positional prompt), so no
   template change is needed. If you wire your own `-i {image_path}` /
   `{image_paths}`, the consumer respects it and does not double-attach.
-- **claude** (`claude -p …`): claude opens the image via its `Read` tool, so its
-  path must be inside `--allowed-tools`. If you pin your own `--allowed-tools`
-  allowlist, add `Read(<IMAGE_TEMP_DIR>/**)` (e.g. `Read(/home/agent/images/**)`)
-  — otherwise unattended `claude -p` cannot open the file and the image stays
-  invisible. The managed default grant already includes this.
+- **claude** (`claude -p …`): claude opens the image via its `Read` tool, which is
+  gated by **two** things — get either wrong and the read is silently denied, the
+  bubble stays blank, and a vision model will often *hallucinate* the contents
+  instead of admitting it saw nothing:
+    1. **Workspace boundary.** Headless `claude -p` refuses to read files outside its
+       current working directory (plus any `--add-dir`) *before* it even consults the
+       allowlist. `IMAGE_TEMP_DIR` is almost always outside your CLI's cwd, so pass
+       **`--add-dir <IMAGE_TEMP_DIR>`** (e.g. `--add-dir /home/agent/images`). This is
+       the single most reliable fix — `--add-dir` makes files there readable and does
+       not widen Bash. (Alternatively, launch claude with its cwd at the image dir's
+       parent so `images/` is inside the workspace.)
+    2. **Allow-rule path syntax.** In `--allowed-tools`, a Read rule's path is
+       gitignore-style: a **single** leading slash anchors at the *settings source*
+       (your cwd), **not** the filesystem root. So `Read(/home/agent/images/**)`
+       silently means `<cwd>/home/agent/images/**` and never matches — you must use a
+       **double** slash for a filesystem-absolute path:
+       `Read(//home/agent/images/**)`. (With `--add-dir` this rule is optional, but if
+       you pin a strict `--allowed-tools` allowlist, use the `//` form.)
+  The managed (hosted) default command already passes `--add-dir` and the `//` rule;
+  VPS operators pinning their own command must add them.
 - Any CLI with a first-class image flag: use the `{image_path}` / `{image_paths}`
   template slot so pixels are attached, not just referenced.
 
@@ -314,6 +339,22 @@ The consumer reads Claude Code's `session_id` from JSON output and injects
 "latest local conversation" and can attach IO to the wrong session. If the
 service environment cannot find `claude`, use an absolute executable path or set
 `AGENT_CLI_PATH`.
+
+The bare command above cannot **see images / screen frames** — claude needs its
+image dir in the workspace and a correctly-anchored Read grant. Add
+`--add-dir <IMAGE_TEMP_DIR>` and `--allowed-tools 'Read(//<IMAGE_TEMP_DIR>/**)'`
+(note the **double** slash — see "Getting the model to actually see the image"
+above for why a single slash silently fails), e.g.:
+
+```
+AGENT_CLI_CMD=claude --print --output-format json --add-dir /home/agent/images --allowed-tools 'Read(//home/agent/images/**)' "{message}"
+```
+
+To also let the agent pull screen frames / photos on its own
+(`io_cli screen-read --include-image`, `photo-read --include-image`), grant the
+matching `Bash(python <io_cli> …)` verbs too — those tools now save the decrypted
+picture into `IMAGE_TEMP_DIR` and return an `image_file` path the same Read grant
+covers.
 
 ### Session bounds and failure behavior
 

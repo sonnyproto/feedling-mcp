@@ -57,11 +57,16 @@ fetch ids that didn't come from the current recall step's index result; don't
 fetch everything; don't rely on summaries when the user wants details, exact
 facts, or prior wording — fetch the card.
 
-## Screen
+## Screen & photos
 
 - Fast: `screen-read` without `--include-image` returns the latest caption/OCR.
 - Slow: `screen-recent` over many frames and any `screen-read --include-image`.
   Use image reads only when caption/OCR is not enough.
+- `--include-image` (on `screen-read` and `photo-read`) saves the decrypted
+  picture to a local file and returns its path as `image_file` — then **use the
+  Read tool on that `image_file` path to actually see the pixels**. Do not expect
+  the JSON to contain the image itself. If a Read fails, say you couldn't open it;
+  never describe an image you have not Read.
 
 ## Rules
 
