@@ -8,7 +8,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote
 
 from core.reqctx import request
 
@@ -46,7 +46,7 @@ def _data_track_qs(**updates) -> str:
     for key in (
         "admin_key", "since", "registered_since", "q", "limit", "offset", "sort",
         "dir", "view", "days", "user_id", "subsystem", "status", "trace_id",
-        "mode", "reveal",
+        "mode", "reveal", "page",
     ):
         value = request.args.get(key, "").strip()
         if value:
@@ -1336,6 +1336,12 @@ def _data_track_debug_payload() -> dict:
     filters = _data_track_request_filters()
     limit = int(filters.get("limit") or 100)
     offset = int(filters.get("offset") or 0)
+    try:
+        page = int((request.args.get("page") or "").strip() or 0)
+    except (TypeError, ValueError):
+        page = 0
+    if page > 0:
+        offset = (page - 1) * limit
     user_filter = (request.args.get("user_id") or "").strip()
     subsystem_filter = (request.args.get("subsystem") or "").strip()
     status_filter = (request.args.get("status") or "").strip().lower()
@@ -1414,6 +1420,8 @@ def _data_track_debug_payload() -> dict:
         "returned": len(turns_out) if mode == "timeline" else len(events_out),
         "next_offset": offset + limit if offset + limit < total else None,
         "prev_offset": max(0, offset - limit) if offset > 0 else None,
+        "current_page": (offset // limit) + 1 if limit else 1,
+        "total_pages": ((total + limit - 1) // limit) if limit else 1,
     }
 
     users_out = list(user_rows.values())
@@ -1442,6 +1450,7 @@ def _data_track_debug_payload() -> dict:
             "mode": mode,
             "reveal": reveal_key,
             "view": "debug",
+            "page": str(page or ""),
         },
         "options": _debug_filter_options(all_events_raw),
         "pagination": pagination,
@@ -2004,6 +2013,16 @@ def _render_data_track_debug_page(payload: dict) -> str:
             f"{html.escape(label)}</button>"
         )
 
+    def hidden_inputs(qs: str) -> str:
+        parts = []
+        for key, values in parse_qs(qs, keep_blank_values=False).items():
+            for value in values:
+                parts.append(
+                    f'<input type="hidden" name="{html.escape(key, quote=True)}" '
+                    f'value="{html.escape(value, quote=True)}">'
+                )
+        return "".join(parts)
+
     def event_anchor(ev: dict) -> str:
         return f"event-{_debug_event_key(ev)}"
 
@@ -2148,23 +2167,43 @@ def _render_data_track_debug_page(payload: dict) -> str:
     total = int(pagination.get("total") or 0)
     returned = int(pagination.get("returned") or 0)
     offset = int(pagination.get("offset") or 0)
+    page_size = int(pagination.get("limit") or filters.get("limit") or 100)
+    current_page = int(pagination.get("current_page") or 1)
+    total_pages = max(1, int(pagination.get("total_pages") or 1))
     start = offset + 1 if total and returned else 0
     end = min(offset + returned, total) if total and returned else 0
     pager_links = []
     prev_offset = pagination.get("prev_offset")
     next_offset = pagination.get("next_offset")
-    if prev_offset is not None:
+    if total_pages > 1:
         pager_links.append(
-            f"<a class='sort-button' href='{html.escape(_data_track_page_href(view='debug', mode=mode, offset=prev_offset, reveal=None), quote=True)}'>Prev</a>"
+            f"<a class='sort-button' href='{html.escape(_data_track_page_href(view='debug', mode=mode, offset=0, page=None, reveal=None), quote=True)}'>First</a>"
         )
-    if next_offset is not None:
+        if prev_offset is not None:
+            pager_links.append(
+                f"<a class='sort-button' href='{html.escape(_data_track_page_href(view='debug', mode=mode, offset=prev_offset, page=None, reveal=None), quote=True)}'>Prev</a>"
+            )
+        else:
+            pager_links.append("<span class='sort-button disabled'>Prev</span>")
+        if next_offset is not None:
+            pager_links.append(
+                f"<a class='sort-button' href='{html.escape(_data_track_page_href(view='debug', mode=mode, offset=next_offset, page=None, reveal=None), quote=True)}'>Next</a>"
+            )
+        else:
+            pager_links.append("<span class='sort-button disabled'>Next</span>")
+        last_offset = max(0, (total_pages - 1) * page_size)
         pager_links.append(
-            f"<a class='sort-button' href='{html.escape(_data_track_page_href(view='debug', mode=mode, offset=next_offset, reveal=None), quote=True)}'>Load more</a>"
+            f"<a class='sort-button' href='{html.escape(_data_track_page_href(view='debug', mode=mode, offset=last_offset, page=None, reveal=None), quote=True)}'>Last</a>"
         )
+    page_form_qs = _data_track_qs(view="debug", mode=mode, offset=None, page=None, reveal=None)
     pager_html = (
         "<div class='pager'>"
         f"<span class='muted'>Showing {start}-{end} of {total} {page_unit}. "
-        f"Page size {html.escape(str(pagination.get('limit') or filters.get('limit') or 100))}.</span>"
+        f"Page size {html.escape(str(page_size))}.</span>"
+        f"<form class='page-jump' method='get' action='/admin/data-track'>"
+        f"{hidden_inputs(page_form_qs)}"
+        f"<span>Page</span><input name='page' value='{html.escape(str(current_page), quote=True)}' inputmode='numeric'>"
+        f"<span>/ {html.escape(str(total_pages))}</span><button type='submit'>Go</button></form>"
         f"<div class='pager-links'>{''.join(pager_links)}</div>"
         "</div>"
     )
@@ -2212,6 +2251,8 @@ def _render_data_track_debug_page(payload: dict) -> str:
     .mode-left {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
     .pager {{ display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px; margin:12px 0; }}
     .pager-links {{ display:flex; flex-wrap:wrap; gap:8px; }}
+    .page-jump {{ display:flex; align-items:center; gap:6px; margin:0; color:var(--muted); }} .page-jump input {{ width:58px; padding:6px 7px; }}
+    .sort-button.disabled {{ color:#b5aaa2; background:#f6efe8; pointer-events:none; }}
     .sort-button,button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
     .mini-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:5px; padding:3px 7px; background:#fffdfa; color:var(--fg); font-size:12px; margin:4px 5px 0 0; cursor:pointer; }}
     .reveal-button {{ border-color:#d9b28c; color:#8a4a00; background:#fff8ed; }}

@@ -138,6 +138,8 @@ def test_debug_payload_paginates_filtered_events(monkeypatch):
         "returned": 2,
         "next_offset": 3,
         "prev_offset": 0,
+        "current_page": 1,
+        "total_pages": 3,
     }
     assert payload["summary"]["events_total"] == 5
     assert payload["summary"]["events_returned"] == 2
@@ -199,9 +201,38 @@ def test_debug_page_renders_load_more_when_paginated(monkeypatch):
     html = admin_core.page_html("view=debug&user_id=user_a&limit=2&offset=0")
 
     assert "Showing 1-2 of 3 events" in html
-    assert "Load more" in html
+    assert "Next" in html
     assert "offset=2" in html
     assert '<select name="limit">' in html
+
+
+def test_debug_page_renders_numbered_pagination_controls(monkeypatch):
+    with registry._users_lock:
+        registry._users[:] = [{"user_id": "user_a", "principal_id": "p_a"}]
+
+    blobs = {
+        ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
+        ("user_a", "v1_flow_trace"): {
+            "events": [
+                _event(100 + idx, "user_a", "agent.reply", trace_id=f"t-{idx}")
+                for idx in range(25)
+            ]
+        },
+    }
+    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+
+    html = admin_core.page_html("view=debug&user_id=user_a&limit=10&offset=10")
+
+    assert "Page" in html
+    assert "name='page'" in html
+    assert "value='2'" in html
+    assert "/ 3" in html
+    assert "First" in html
+    assert "Prev" in html
+    assert "Next" in html
+    assert "Last" in html
+    assert "offset=0" in html
+    assert "offset=20" in html
 
 
 def test_debug_reveal_and_timeline_links_reset_pagination(monkeypatch):
