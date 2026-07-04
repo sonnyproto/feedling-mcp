@@ -350,19 +350,19 @@ def memory_fetch_core(
     referenced_ids = {str(mid) for mid in items_by_id.keys() if str(mid or "").strip()}
     if referenced_ids:
         now = _now_iso()
-        changed = False
-        updated_moments: list[dict] = []
-        for moment in moments:
-            if isinstance(moment, dict) and str(moment.get("id") or "") in referenced_ids:
-                copy = dict(moment)
-                copy["last_referenced_at"] = now
-                copy["updated_at"] = now
-                updated_moments.append(copy)
-                changed = True
-            else:
-                updated_moments.append(moment)
-        if changed:
-            memory_service._save_moments(store, updated_moments)
+        if any(isinstance(m, dict) and str(m.get("id") or "") in referenced_ids for m in moments):
+            # Touch last_referenced_at with a re-read INSIDE memory_lock. This is
+            # a nominally read-only fetch, but the old full-list _save_moments
+            # reconciles deletes — on a stale snapshot it would drop a card added
+            # by a concurrent same-user write during the (up to 20s) enclave
+            # round-trip above. Re-read + touch + save closes that window.
+            with memory_service.mutation_lock(store):
+                fresh = memory_service._load_moments(store)
+                for m in fresh:
+                    if isinstance(m, dict) and str(m.get("id") or "") in referenced_ids:
+                        m["last_referenced_at"] = now
+                        m["updated_at"] = now
+                memory_service._save_moments(store, fresh)
     return {
         "items": [items_by_id[mid] for mid in ids if mid in items_by_id],
         "missing_ids": missing_ids,

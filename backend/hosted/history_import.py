@@ -2491,7 +2491,6 @@ def _moment_from_memory_card(store: UserStore, card: dict, envelope: dict) -> di
 
 
 def _append_import_memory_cards(store: UserStore, cards: list[dict]) -> list[dict]:
-    moments = memory_service._load_moments(store)
     created: list[dict] = []
     for card in _sort_memory_cards_newest_first(cards):
         summary = str(card.get("summary") or "").strip()[:500]
@@ -2512,9 +2511,13 @@ def _append_import_memory_cards(store: UserStore, cards: list[dict]) -> list[dic
             raise RuntimeError(f"memory_envelope_failed:{err}")
         envelope["occurred_at"] = str(card.get("occurred_at") or date.today().isoformat())
         envelope["source"] = "history_import"
-        moments.append(_moment_from_memory_card(store, card, envelope))
-        created.append(moments[-1])
-    memory_service._save_moments(store, moments)
+        created.append(_moment_from_memory_card(store, card, envelope))
+    # Re-read + extend + save under one memory_lock hold so a concurrent
+    # same-user write can't lost-update this bulk import (and vice-versa).
+    with memory_service.mutation_lock(store):
+        fresh = memory_service._load_moments(store)
+        fresh.extend(created)
+        memory_service._save_moments(store, fresh)
     if created:
         boot_gates._log_bootstrap_event(store, "history_import_memory_written", success=True)
     return created

@@ -345,6 +345,15 @@ def test_response_reply_marks_message_no_double_deliver(user, monkeypatch):
                 headers=_hk(api_key),
             )
             assert rr.status_code == 200
+            # a SECOND reply to the already-replied u1 is dropped with 409 — the
+            # reply-exclusivity guard prevents a duplicate reply + double model-key
+            # burn (e.g. a stale consumer finishing after the lease failed over).
+            rr2 = await c.post(
+                "/v1/chat/response",
+                json={"envelope": _env(uid, "a2"), "source": "chat", "reply_to_message_id": "u1"},
+                headers=_hk(api_key),
+            )
+            assert rr2.status_code == 409
             # a fresh consumer's claiming poll must NOT re-deliver the replied u1
             r2 = await c.get(
                 "/v1/chat/poll",

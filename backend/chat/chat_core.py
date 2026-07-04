@@ -438,6 +438,20 @@ def write_response(
         if push_body.strip():
             extra["push_body_preview"] = push_body.strip()[:240]
         extra["push_live_activity_requested"] = bool(payload.get("push_live_activity"))
+    reply_to_message_id = _reply_to_message_id(payload)
+    if reply_to_message_id:
+        _parent = _chat_message_by_id(store, reply_to_message_id)
+        if _parent is not None and (
+            _parent.get("reply_status") == "replied" or _parent.get("reply_message_id")
+        ):
+            # Reply-exclusivity guard (delivery exclusivity is the claim CAS's job).
+            # If this turn was ALREADY answered — e.g. THIS consumer's claim expired
+            # mid-turn (>CHAT_POLL_CLAIM_TTL_SEC), the lease failed over, and the new
+            # consumer already replied — don't append a duplicate reply and
+            # double-burn the user's model key. Drop it with 409. (Guarding only on
+            # already-replied, not claim ownership, so a legit reply that omits its
+            # consumer_id is never rejected.)
+            return {"error": "already_answered", "reply_status": "replied"}, 409
     msg = store.append_chat(
         "openclaw",
         source,
@@ -445,7 +459,6 @@ def write_response(
         content_type=content_type,
         extra=extra,
     )
-    reply_to_message_id = _reply_to_message_id(payload)
     if reply_to_message_id:
         store.update_chat_message_metadata(reply_to_message_id, {
             "reply_status": "replied",

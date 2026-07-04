@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from datetime import date, datetime
@@ -98,8 +99,22 @@ def _active_memory_moments(moments: list) -> list[dict]:
     return [m for m in moments if isinstance(m, dict) and not _memory_is_archived(m)]
 
 
+_FALLBACK_MUTATION_LOCK = threading.RLock()
+
+
+def mutation_lock(store):
+    """The store's reentrant memory_lock, held across a load→mutate→save so
+    concurrent same-user writes serialize and can't lost-update (a stale-snapshot
+    ``memory_replace_all`` would otherwise delete a concurrently-added card).
+
+    A real ``UserStore`` always has one; the process-wide fallback only covers
+    partial test doubles that mock ``_load_moments``/``_save_moments`` and never
+    reach the real DB reconcile."""
+    return getattr(store, "memory_lock", None) or _FALLBACK_MUTATION_LOCK
+
+
 def _save_moments(store: UserStore, moments: list):
-    with store.memory_lock:
+    with mutation_lock(store):
         db.memory_replace_all(store.user_id, moments)
 
 

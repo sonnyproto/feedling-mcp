@@ -55,16 +55,17 @@ async def proactive_jobs_poll(request: Request, auth: AuthResult = Depends(requi
             runtime_profile=runtime_profile,
         )
 
-    pending = await _check()
-    if pending:
-        return poll_core.build_response(jobs=pending, runtime_profile=runtime_profile, timed_out=False)
-
     waiter = registry.register(
         "proactive", store.user_id, per_user_max=settings.poller_max_per_user_proactive
     )
     if waiter is None:
         return poll_core.build_response(jobs=[], runtime_profile=runtime_profile, timed_out=True)
     try:
+        # Check AFTER registering: asyncio.Event.set() latches, so a job enqueued
+        # in the gap between check and park is not lost (see chat/routes_asgi poll).
+        pending = await _check()
+        if pending:
+            return poll_core.build_response(jobs=pending, runtime_profile=runtime_profile, timed_out=False)
         try:
             await asyncio.wait_for(waiter.event.wait(), timeout=timeout)
             notified = True
