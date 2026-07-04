@@ -351,6 +351,55 @@ def cmd_photo_read(args):
     _emit(out)
 
 
+def cmd_chat_image(args):
+    """Pull ONE past chat message's decrypted image by id, saved as a Read-able file.
+
+    Chat-history images are NOT reachable via ``photo-read`` (that command hits the
+    perception photo library, not the chat feed). The recent-chat transcript that
+    gets injected into a turn shows historical image messages only as an
+    ``[image] … io_cli chat-image --id <id>`` placeholder — the pixels are never in
+    the transcript. This command lazily fetches the pixels of a specific past chat
+    image WHEN the agent actually needs them, instead of eagerly decrypting every
+    history image on every turn.
+
+    Decrypt source is the enclave's ``GET /v1/chat/history`` (same source the
+    resident consumer uses). It presents a dstack-gateway TEE cert the stdlib
+    client does not verify, so the call is made insecure=True (mirrors the
+    consumer's verify=False)."""
+    enclave_url = _env("FEEDLING_ENCLAVE_URL")
+    auth = _auth_headers()
+    mid = (args.message_id or "").strip()
+    if not enclave_url or not auth:
+        _emit({"ok": False, "error": "missing FEEDLING_ENCLAVE_URL / auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+    if not mid:
+        _emit({"ok": False, "error": "chat-image needs --id <message_id> (from the [image] placeholder in the recent-chat transcript)"}, 2)
+    qs = urllib.parse.urlencode({"since": 0, "limit": args.limit})
+    status, body = _http_json("GET", f"{enclave_url}/v1/chat/history?{qs}", auth, insecure=True)
+    if status != 200:
+        _emit({"ok": False, "http_status": status, "message_id": mid, "error": body}, 1)
+    messages = (body.get("messages") or body.get("history") or []) if isinstance(body, dict) else []
+    msg = next((m for m in messages if isinstance(m, dict) and str(m.get("id") or "") == mid), None)
+    if not msg:
+        _emit({
+            "ok": False,
+            "message_id": mid,
+            "error": "message not found in recent history",
+            "hint": f"only the {args.limit} most recent messages are searched; raise --limit if the image is older",
+        }, 1)
+    if not msg.get("image_b64"):
+        _emit({
+            "ok": True,
+            "message_id": mid,
+            "role": msg.get("role"),
+            "content": msg.get("content"),
+            "note": "this message has no image (text-only turn)",
+        })
+    # Save pixels to a Read-able file rather than emitting base64 the vision model
+    # can't decode (see _materialize_decrypted_image).
+    out = _materialize_decrypted_image(f"chat_{mid}", msg)
+    _emit({"ok": True, "message_id": mid, **(out if isinstance(out, dict) else {"data": out})})
+
+
 def _identity_write_payload(self_introduction, signature):
     """Build the /v1/identity/actions body for a profile_patch. Pure (testable).
 
@@ -454,6 +503,11 @@ def main():
     pd.add_argument("--id", dest="photo_id", required=True, help="photo id (from photo-recent)")
     pd.add_argument("--include-image", dest="include_image", action="store_true", help="save decrypted photo to a file; returns image_file path to Read")
     pd.set_defaults(func=cmd_photo_read)
+
+    ci = sub.add_parser("chat-image", help="Pull one PAST chat message's image by id (saves a file to Read).")
+    ci.add_argument("--id", dest="message_id", required=True, help="chat message id (from the [image] placeholder in the transcript)")
+    ci.add_argument("--limit", type=int, default=20, help="how many recent messages to search for the id")
+    ci.set_defaults(func=cmd_chat_image)
 
     sw = sub.add_parser("schedule-wake", help="Ask to be woken at a later time (native self-wake).")
     sw.add_argument("--at", required=True, help="When to wake: ISO time (e.g. 2026-06-29T18:00) or a relative spec.")

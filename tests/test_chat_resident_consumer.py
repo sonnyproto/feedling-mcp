@@ -4256,3 +4256,27 @@ def test_wake_interval_independent_of_broadcast_state():
     # per-user value applies regardless of on/off/paused/unknown.
     for state in ("off", "on", "broadcasting", "paused", "unknown", ""):
         assert crc._proactive_tick_interval_for_broadcast_state(state, 3600) == 3600
+
+
+def test_context_text_image_message_advertises_chat_image_pull():
+    # Injected-history transcript can't carry image pixels (see summary), so an
+    # image turn must advertise the exact io_cli command that lazily pulls it,
+    # keyed by message id — otherwise the agent guesses (photo-read = wrong tool)
+    # or fabricates the picture.
+    text = crc._message_text_for_context(
+        {"id": "msg_abc", "role": "user", "content_type": "image", "content": ""}
+    )
+    assert "msg_abc" in text
+    assert "chat-image" in text
+
+
+def test_context_text_image_with_caption_keeps_caption_and_hint():
+    text = crc._message_text_for_context(
+        {"id": "m1", "role": "user", "content_type": "image", "content": "这是什么?"}
+    )
+    assert "这是什么?" in text          # the user's question is preserved
+    assert "chat-image --id m1" in text  # ...alongside the pull command
+
+
+def test_context_text_plain_text_message_unchanged():
+    assert crc._message_text_for_context({"content": "hello there"}) == "hello there"

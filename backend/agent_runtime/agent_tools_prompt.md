@@ -21,6 +21,7 @@ python <io_cli> screen-recent [--limit <n>]
 python <io_cli> screen-read [--frame-id <id>] [--include-image]
 python <io_cli> photo-recent [--limit <n>]
 python <io_cli> photo-read --id <photo_id> [--include-image]
+python <io_cli> chat-image --id <message_id>
 ```
 
 - Output is JSON on stdout (`{"ok": true, ...}` or `{"ok": false, "error": ...}`).
@@ -67,6 +68,12 @@ facts, or prior wording — fetch the card.
   Read tool on that `image_file` path to actually see the pixels**. Do not expect
   the JSON to contain the image itself. If a Read fails, say you couldn't open it;
   never describe an image you have not Read.
+- `chat-image --id <message_id>` pulls the pixels of a **past chat image** the
+  user sent earlier. The recent-chat transcript can't carry image pixels, so a
+  prior image turn shows up there only as an `[image] … io_cli chat-image --id
+  <id>` placeholder — run this command with that id, then Read the returned
+  `image_file`. This is ONLY for chat-history images; do **not** use `photo-read`
+  for them (that's the perception photo library, a different feed).
 
 ## Rules
 

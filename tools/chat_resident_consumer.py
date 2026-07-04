@@ -4080,10 +4080,21 @@ def _message_text_for_context(msg: dict) -> str:
     if not isinstance(text, str):
         text = str(text or "")
     text = " ".join(text.strip().split())
-    if not text:
-        ctype = str(msg.get("content_type") or "").lower()
-        if ctype == "image" or msg.get("image_b64"):
-            text = "[image]"
+    ctype = str(msg.get("content_type") or "").lower()
+    if ctype == "image" or msg.get("image_b64"):
+        # The injected transcript is TEXT-only — an image turn's pixels are never
+        # in it. Advertise the exact io_cli command that lazily pulls THIS image by
+        # id (and preserve any caption the user sent), so the agent fetches + Reads
+        # the real picture instead of guessing (photo-read = wrong tool: that's the
+        # perception photo library, not the chat feed) or fabricating its contents.
+        mid = str(msg.get("id") or msg.get("message_id") or "").strip()
+        label = text[:300] if text else "[image]"
+        if mid:
+            return (
+                f"{label} [image not shown here — run `io_cli chat-image --id {mid}`, "
+                "then Read the returned image_file to actually see it]"
+            )
+        return f"{label} [image not shown here — pixels are not in this transcript]"
     return text[:500]
 
 

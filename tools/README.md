@@ -398,6 +398,18 @@ If the decrypt source cannot provide image bytes, the consumer logs the
 failure and routes only the honest placeholder; it should not pretend to
 have seen the image.
 
+The above delivers the pixels of the image in the **current** turn. Images
+from **earlier** turns are a different case: the recent-chat transcript that
+gets injected for cross-turn continuity is text-only and cannot carry pixels,
+so a past image turn appears there as `[image] … io_cli chat-image --id <id>`.
+An agent that wants to look at that older picture runs
+`io_cli chat-image --id <message_id>`, which pulls just that one message's
+decrypted image from the enclave and writes it to a Read-able file (same
+`IMAGE_TEMP_DIR` + Read grant as `screen-read`/`photo-read --include-image`).
+This is lazy on purpose — history images are only decrypted when the agent
+actually asks. Do not point the agent at `photo-read` for chat images; that
+command serves the perception photo library, a separate feed.
+
 ### Re-auth checklist
 
 If you ran any of these on the iOS side:
