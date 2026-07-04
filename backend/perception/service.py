@@ -610,6 +610,11 @@ def _settings_v2_for_user(user_id: str):
     return DBProactiveSettingsStoreV2().load(user_id)
 
 
+def _proactive_activation_ready(user_id: str) -> bool:
+    from core import store as core_store  # lazy
+    return core_store.get_store(user_id).proactive_activation_ready()
+
+
 def _submit_wake_event_v2_compat(event) -> None:
     """Compatibility output: V2 differ event -> old proactive job queue.
 
@@ -623,6 +628,18 @@ def _submit_wake_event_v2_compat(event) -> None:
     settings = _settings_v2_for_user(event.user_id)
     decision = evaluate_wake_control_v2(event.source, manual=event.manual, settings=settings)
     now = float(event.created_at or _now())
+    if not event.manual and not _proactive_activation_ready(event.user_id):
+        store.append_event(event.user_id, {
+            "cap": "runtime_v2",
+            "type": "suppressed",
+            "reason": "activation_pending",
+            "source": event.source,
+            "trigger": event.trigger,
+            "change_digest": event.change_digest,
+            "origin_refs": list(event.origin_refs or ()),
+            "ts": now,
+        }, now)
+        return
     if not decision.accepted:
         store.append_event(event.user_id, {
             "cap": "runtime_v2",
@@ -657,6 +674,8 @@ def _fire_wake_event_v2(event) -> None:
         from core import util as core_util  # lazy
         from proactive import service as proactive_service  # lazy
         s = core_store.get_store(event.user_id)
+        if not event.manual and not s.proactive_activation_ready():
+            return
         job = {
             "job_id": core_util._new_public_id("pj"),
             "ts": float(event.created_at or _now()),
@@ -687,6 +706,12 @@ def _maybe_wake(user_id, cap_key, debounce, field, old, new_v, now) -> None:
     if block:
         store.append_event(user_id, {
             "cap": cap_key, "type": "suppressed", "reason": block,
+            "field": field, "old": old, "new": new_v, "ts": now,
+        }, now)
+        return
+    if not _proactive_activation_ready(user_id):
+        store.append_event(user_id, {
+            "cap": cap_key, "type": "suppressed", "reason": "activation_pending",
             "field": field, "old": old, "new": new_v, "ts": now,
         }, now)
         return
@@ -727,6 +752,8 @@ def _fire_wake(user_id: str, cap_key: str, hint: str, now: float) -> None:
         from core import util as core_util  # lazy
         from proactive import service as proactive_service  # lazy
         s = core_store.get_store(user_id)
+        if not s.proactive_activation_ready():
+            return
         job = {
             "job_id": core_util._new_public_id("pj"),
             "ts": now,

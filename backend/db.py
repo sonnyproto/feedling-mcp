@@ -613,6 +613,33 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
             for uid, status, count in rows:
                 ensure(out, uid).setdefault("proactive_extra", {}).setdefault("jobs_by_status", {})[status] = count
 
+            # Split proactive jobs by lane (heartbeat vs screen-share vs other).
+            # The persisted job doc carries job_kind / wake_kind / trigger; group
+            # by the first non-empty of those and let the caller bucket the raw
+            # kind strings (data_track._classify_proactive_kind).
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COALESCE(
+                         NULLIF(doc->>'job_kind', ''),
+                         NULLIF(doc->>'wake_kind', ''),
+                         NULLIF(doc->>'trigger', ''),
+                         'unknown'
+                       ) AS kind,
+                       COUNT(*)::int AS total,
+                       (COUNT(*) FILTER (
+                          WHERE doc->>'status' IN ('failed', 'skipped')))::int AS failed
+                FROM user_logs
+                WHERE user_id = ANY(%s) AND stream = 'proactive_jobs'
+                GROUP BY user_id, kind
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, kind, total, failed in rows:
+                pex = ensure(out, uid).setdefault("proactive_extra", {})
+                pex.setdefault("jobs_by_kind", {})[kind] = total
+                pex.setdefault("jobs_failed_by_kind", {})[kind] = failed
+
             rows = conn.execute(
                 """
                 SELECT user_id,
@@ -775,6 +802,59 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
         ]
     except Exception as e:
         log.error("[db] admin_data_track_dau failed: %s", e)
+        return []
+
+
+def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30,
+                                     tz: str = "Asia/Shanghai") -> list[dict]:
+    """Per-Beijing-day proactive-job aggregates for the ops trend view.
+
+    Answers "is the proactive success rate improving day over day", split into
+    the two runtime lanes (heartbeat vs screen-share). ``delivered`` = jobs that
+    reached posted/delivered; ``failed`` = failed/skipped. Success rate is
+    computed by the caller (delivered / non-pending)."""
+    day_limit = max(1, min(int(days or 30), 366))
+    since = float(since_epoch or 0.0)
+    screen_kinds = "('screen_watch','scene_change','screen_tick','broadcast_opened','heartbeat_broadcast_on')"
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                f"""
+                WITH jobs AS (
+                    SELECT
+                        to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
+                        COALESCE(NULLIF(doc->>'job_kind',''), NULLIF(doc->>'wake_kind',''),
+                                 NULLIF(doc->>'trigger',''), 'unknown') AS kind,
+                        COALESCE(doc->>'status','') AS status
+                    FROM user_logs
+                    WHERE stream = 'proactive_jobs'
+                      AND ts IS NOT NULL
+                      AND (%s = 0 OR ts >= %s)
+                )
+                SELECT day,
+                       COUNT(*)::int AS jobs,
+                       (COUNT(*) FILTER (WHERE status IN ('posted','delivered')))::int AS delivered,
+                       (COUNT(*) FILTER (WHERE status IN ('failed','skipped')))::int AS failed,
+                       (COUNT(*) FILTER (WHERE status = 'pending'))::int AS pending,
+                       (COUNT(*) FILTER (WHERE kind IN {screen_kinds}))::int AS screen,
+                       (COUNT(*) FILTER (WHERE kind LIKE 'heartbeat%%'
+                                          AND kind NOT IN {screen_kinds}))::int AS heartbeat
+                FROM jobs
+                GROUP BY day
+                ORDER BY day DESC
+                LIMIT %s
+                """,
+                (tz, since, since, day_limit),
+            ).fetchall()
+        return [
+            {
+                "day": r[0], "jobs": r[1], "delivered": r[2], "failed": r[3],
+                "pending": r[4], "screen": r[5], "heartbeat": r[6],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        log.error("[db] admin_data_track_proactive_daily failed: %s", e)
         return []
 
 

@@ -1,17 +1,23 @@
-# docker-compose.phala.runner.yaml — STANDALONE agent-runner CVM (multi-node Form B)
+# docker-compose.phala.runner.yaml — STANDALONE agent-runner CVM (test, Form B)
 #
-# A SEPARATE Phala CVM that runs ONLY agent-runner supervisors — no backend, no
-# enclave, no ingress. It scales the hosted agent-runtime horizontally off the
-# main CVM: if this CVM (or a runner here) dies, the main CVM's ingress/backend/
-# enclave are untouched, and the per-user Postgres lease lets the surviving
-# runners (here or on the main CVM) take over.
+# A SEPARATE Phala CVM that runs ONLY an agent-runner supervisor — no backend, no
+# enclave, no ingress. It scales the hosted agent-runtime off the main CVM: if this
+# CVM dies, the main CVM's ingress/backend/enclave are untouched, and the per-user
+# Postgres lease lets a surviving runner (here or on the main CVM) take over.
 #
-# Multi-node coordination needs NO per-runner index: each container's lease owner
-# is "<hostname>:<pid>" (distinct per container), the per-owner heartbeat table
-# (migration 0010) records each runner independently, and AGENT_MAX_CHILDREN
-# bounds how many users each takes so they split the host-all set. The backend's
-# wedge guard aggregates the heartbeats; a stale/empty table falls back to the
-# legacy key. (No static shard — runners all scan the full set and race-acquire.)
+# SINGLE runner per CVM (mirrors the prod runner compose). Earlier this file ran
+# TWO runners (agent-runner-0/1) with SEPARATE data volumes; because the per-user
+# chat checkpoint (poll cursor) lives in the volume's checkpoint.json and NOT in the
+# lease row, a lease that drifted from one runner to the other resumed from the
+# other volume's STALE checkpoint and wedged (poll claims a message the enclave
+# decrypt-history no longer returns → infinite retry, no progress). One runner + one
+# volume keeps a user's checkpoint in a single place, so lease drift can't stale it.
+# Test's user count is tiny; a single runner (AGENT_MAX_CHILDREN) is ample. Scale
+# back to multiple runners only alongside a shared/consolidated checkpoint.
+#
+# Lease coordination needs NO per-runner index: the lease owner is
+# "<hostname>:<pid>", the per-owner heartbeat table (migration 0010) records the
+# runner, and AGENT_MAX_CHILDREN bounds how many users it takes.
 #
 # ── How a runner CVM reaches the main CVM ──────────────────────────────────────
 #   FEEDLING_API_URL     → the main CVM backend via its PUBLIC ingress domain
@@ -42,8 +48,7 @@
 #     FEEDLING_HOST_ALL=1           mirror the backend
 #     FEEDLING_LITELLM_ENABLE=1     if hosting gemini/openrouter/openai_compatible
 #     FEEDLING_LITELLM_API_KEY      gateway bearer (per-runner LiteLLM child)
-#     AGENT_MAX_CHILDREN            per-runner capacity ceiling (sum across ALL
-#                                   runners, here + main CVM, must cover the user
+#     AGENT_MAX_CHILDREN            per-runner capacity ceiling (must cover the user
 #                                   count or some users go unserved)
 
 name: feedling-runner
@@ -63,49 +68,36 @@ x-agent-runner-env: &agent-runner-env
   FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
   FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
   FEEDLING_MIGRATE_ENABLE: "${FEEDLING_MIGRATE_ENABLE:-}"
-  # in-CVM LiteLLM gateway — each runner that hosts non-openai codex users runs
-  # its OWN proxy child on 127.0.0.1:<port>; codex on that runner connects locally.
+  # in-CVM LiteLLM gateway — a runner that hosts non-openai codex users runs its
+  # OWN proxy child on 127.0.0.1:<port>; codex on that runner connects locally.
   FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
   FEEDLING_LITELLM_PORT: "${FEEDLING_LITELLM_PORT:-4000}"
   FEEDLING_LITELLM_API_KEY: "${FEEDLING_LITELLM_API_KEY:-}"
-  # Genesis import worker: safe to run on multiple runners (claim is FOR UPDATE
-  # SKIP LOCKED). ON here because the main CVM no longer runs an agent-runner
-  # (hosting + genesis both moved to this runner CVM) — this is now the ONLY place
-  # genesis import jobs get drained. Both runners run it; SKIP LOCKED de-dupes.
+  # Genesis import worker: this runner is the only place genesis import jobs get
+  # drained (the main CVM no longer runs an agent-runner). Claim is FOR UPDATE
+  # SKIP LOCKED, so it stays correct if more runners are ever added back.
   FEEDLING_GENESIS_WORKER_ENABLED: "1"
   FEEDLING_GENESIS_WORKER_INTERVAL_SEC: "${FEEDLING_GENESIS_WORKER_INTERVAL_SEC:-10}"
   FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC: "${FEEDLING_GENESIS_RUNTIME_TOKEN_TTL_SEC:-7200}"
 
 services:
-  # Two runners per CVM to start. Distinct container_name → distinct hostname →
-  # distinct lease owner + heartbeat row, with no per-runner config. Each owns its
-  # OWN data volume: a corrupt per-user home on one runner can't affect the other,
-  # and (unlike same-CVM shared-volume) a cross-runner takeover re-materializes the
-  # home (cheap; the driver resume handle lives in the lease row, not the volume).
-  agent-runner-0:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:550431f   # CI pins the sha
-    container_name: agent-runner-0
+  # Single runner per CVM (mirrors prod). One data volume → a user's per-user home
+  # + chat checkpoint always live in one place, so a lease that re-acquires here
+  # resumes from a consistent cursor (no cross-runner stale-checkpoint wedge).
+  agent-runner:
+    image: ghcr.io/teleport-computer/feedling-agent-runner:f4527e3   # CI pins the sha
+    container_name: agent-runner
     command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
     restart: unless-stopped
     environment:
       <<: *agent-runner-env
-      AGENT_MAX_CHILDREN: "${AGENT_MAX_CHILDREN:-8}"
+      AGENT_MAX_CHILDREN: "${AGENT_MAX_CHILDREN:-16}"
     volumes:
-      - feedling_agent_runtime_r0:/agent-data
-
-  agent-runner-1:
-    image: ghcr.io/teleport-computer/feedling-agent-runner:550431f   # CI pins the sha
-    container_name: agent-runner-1
-    command: ["python", "-u", "backend/agent_runtime/supervisor.py"]
-    restart: unless-stopped
-    environment:
-      <<: *agent-runner-env
-      AGENT_MAX_CHILDREN: "${AGENT_MAX_CHILDREN:-8}"
-    volumes:
-      - feedling_agent_runtime_r1:/agent-data
+      - feedling_agent_runtime_runner:/agent-data
 
 volumes:
-  feedling_agent_runtime_r0:
-    name: feedling_agent_runtime_r0
-  feedling_agent_runtime_r1:
-    name: feedling_agent_runtime_r1
+  # Fresh volume name (was feedling_agent_runtime_r0/r1). A new name gives the
+  # single runner a clean /agent-data, dropping the stale per-user checkpoints that
+  # wedged under the old two-volume layout.
+  feedling_agent_runtime_runner:
+    name: feedling_agent_runtime_runner

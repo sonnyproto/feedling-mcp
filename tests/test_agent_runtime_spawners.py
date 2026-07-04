@@ -51,6 +51,10 @@ def test_consumer_env_uses_stream_json_for_deepseek_claude_thinking():
     assert "--output-format stream-json" in cmd
     assert "--include-partial-messages" in cmd
     assert "--effort high" in cmd
+    assert "--permission-mode acceptEdits" in cmd  # non-interactive image Read
+    # the thinking-claude command must ALSO grant Read on the image temp dir, or a
+    # thinking model (deepseek/sonnet-4) can't open chat images (Read denied under -p)
+    assert "Read(/agent-data/users/u_1/images/**)" in cmd
     assert env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
     assert env["ANTHROPIC_MODEL"] == "deepseek-v4-pro"
 
@@ -73,6 +77,10 @@ def test_consumer_env_uses_stream_json_for_native_anthropic_sonnet_thinking():
     assert "--output-format stream-json" in cmd
     assert "--include-partial-messages" in cmd
     assert "--effort high" in cmd
+    assert "--permission-mode acceptEdits" in cmd  # non-interactive image Read
+    # thinking-claude must grant Read on the image dir too (sonnet-4-5 is a thinking
+    # model → this branch → otherwise chat images are invisible: Read denied)
+    assert "Read(/agent-data/users/u_1/images/**)" in cmd
     assert "ANTHROPIC_BASE_URL" not in env
     assert env["ANTHROPIC_MODEL"] == "claude-sonnet-4-5"
 
@@ -256,6 +264,9 @@ def test_default_claude_cmd_grants_io_cli_tools_and_loads_prompt():
         user_id="u", home="/agent-data/users/u",
     )
     cmd = env["AGENT_CLI_CMD"]
+    # acceptEdits: without a non-interactive permission mode, claude -p denies its
+    # own allow-listed Read of the chat image (hallucinates "no permission").
+    assert "--permission-mode acceptEdits" in cmd
     # the io_cli verbs are pre-granted so `claude -p` can run them
     # unattended (no interactive permission prompt), scoped to that one CLI.
     assert "--allowed-tools" in cmd
@@ -309,6 +320,10 @@ def test_agent_home_files_seeds_prompt_and_claude_permission_allow():
     settings_path = "/agent-data/users/u/claude-home/settings.json"
     assert settings_path in files
     settings = json.loads(files[settings_path])
+    # defaultMode is REQUIRED: without it, claude -p in stream-json mode denies the
+    # allow-listed Read of the chat image ("I need permission to see the image").
+    # acceptEdits makes the pre-granted allowlist honored non-interactively.
+    assert settings["permissions"]["defaultMode"] == "acceptEdits"
     allow = settings["permissions"]["allow"]
     assert any("io_cli.py perception" in rule for rule in allow)
     assert any("io_cli.py memory-index" in rule for rule in allow)

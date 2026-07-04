@@ -33,6 +33,9 @@ def _proactive_state_doc(settings: dict) -> dict:
         "manual_user_state": settings.get("manual_user_state", settings.get("user_state", "default")),
         "ai_state": settings.get("ai_state", "present"),
         "broadcast_state": settings.get("broadcast_state", "unknown"),
+        "wake_interval_sec": core_store.normalize_proactive_wake_interval_sec(
+            settings.get("wake_interval_sec")
+        ),
         "updated_at": settings.get("updated_at", ""),
     }
 
@@ -65,6 +68,7 @@ def proactive_state():
             "ambient",
             "scheduled",
             "reminders_delivery",
+            "wake_interval_sec",
         )
         if key in payload
     })

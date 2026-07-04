@@ -58,7 +58,7 @@ Optional:
   PROACTIVE_TICK_INTERVAL_SEC
                         Broadcast-on/unknown tick interval in seconds (default: 300)
   PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC
-                        Broadcast-off tick interval in seconds (default: 1800)
+                        Broadcast-off tick interval in seconds (default: 7200)
   PROACTIVE_TICK_START_DELAY_SEC
                         Delay before the first automatic wake tick (default: 15)
   PROACTIVE_SCHEDULED_FIRE_ENABLED
@@ -230,8 +230,11 @@ PROACTIVE_TICK_INTERVAL_SEC = int(os.environ.get("PROACTIVE_TICK_INTERVAL_SEC", 
 PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC = int(
     os.environ.get("PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC", str(PROACTIVE_TICK_INTERVAL_SEC))
 )
+# Fallback heartbeat cadence when the backend tick decision carries no per-user
+# wake_interval_sec (legacy / rollout). Default aligned to the product default of
+# 2h (7200) set 2026-07-04, so no path silently reverts to the old 30min.
 PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC = int(
-    os.environ.get("PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", "1800")
+    os.environ.get("PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC", "7200")
 )
 PROACTIVE_TICK_START_DELAY_SEC = int(os.environ.get("PROACTIVE_TICK_START_DELAY_SEC", "15"))
 # Screen-watch lane — decoupled from the heavy heartbeat. While the user is
@@ -942,6 +945,27 @@ def _filter_messages_to_poll_ids(messages: list[dict], poll_messages: list[dict]
         m for m in messages
         if str(m.get("id") or m.get("message_id") or "").strip() in poll_ids
     ]
+
+
+# The chat cursor wedges when /v1/chat/poll keeps claiming message ids the enclave
+# decrypt-history never returns (an undecryptable row, or one sitting exactly at the
+# exclusive `since` boundary). We retry a bounded number of cycles — transient
+# decrypt hiccups self-heal — then skip PAST the claimed batch so one permanently
+# unreturnable message can't block every newer message forever.
+CHAT_POLL_WEDGE_SKIP_AFTER = int(os.environ.get("CHAT_POLL_WEDGE_SKIP_AFTER", "5"))
+_WEDGE_SKIP_EPSILON = 1e-3
+
+
+def _advance_past_unfetchable(last_ts: float, poll_messages: list[dict]) -> float:
+    """Next checkpoint that skips the poll-claimed rows the decrypt source won't
+    return. Jumps to the newest claimed ts; if that is not strictly past the cursor
+    (the stuck row sits at the boundary), nudge just beyond it so the next poll
+    excludes it."""
+    max_ts = max(
+        (float(m.get("ts", m.get("timestamp", 0)) or 0) for m in poll_messages),
+        default=last_ts,
+    )
+    return max_ts if max_ts > last_ts else last_ts + _WEDGE_SKIP_EPSILON
 
 
 def _mark_seen(key: str) -> bool:
@@ -3604,12 +3628,35 @@ def _proactive_tick_trigger_for_broadcast_state(broadcast_state: str) -> str:
     return "heartbeat_unknown"
 
 
-def _proactive_tick_interval_for_broadcast_state(broadcast_state: str) -> int:
+# Per-user "companionship frequency" (wake_interval_sec) clamp — mirrors the
+# backend hard floor/ceiling (backend/core/store.py): min 15min, max 12h.
+PROACTIVE_WAKE_INTERVAL_MIN_SEC = 900
+PROACTIVE_WAKE_INTERVAL_MAX_SEC = 43200
+
+
+def _proactive_tick_interval_for_broadcast_state(
+    broadcast_state: str, wake_interval_sec: Any = None
+) -> int:
     # Heartbeat is now DECOUPLED from screen sharing: broadcast no longer
     # accelerates the heavy presence heartbeat. Screen attention is handled by the
     # separate lightweight screen-watch lane (SCREEN_WATCH_INTERVAL_SEC). The
     # heartbeat keeps a single steady cadence regardless of broadcast_state.
     # (PROACTIVE_TICK_BROADCAST_ON_INTERVAL_SEC kept for back-compat / override.)
+    #
+    # Per-user cadence: the backend tick decision carries the user's chosen
+    # wake_interval_sec ("companionship frequency"). When present and numeric it
+    # wins, clamped defensively to [900, 43200] to mirror the backend guard. A
+    # missing or non-numeric value falls back to the env default.
+    if wake_interval_sec is not None:
+        try:
+            interval = int(wake_interval_sec)
+        except (TypeError, ValueError):
+            pass
+        else:
+            return max(
+                PROACTIVE_WAKE_INTERVAL_MIN_SEC,
+                min(PROACTIVE_WAKE_INTERVAL_MAX_SEC, interval),
+            )
     return max(60, PROACTIVE_TICK_BROADCAST_OFF_INTERVAL_SEC)
 
 
@@ -6311,6 +6358,11 @@ def run() -> None:
             log.warning("could not seed from history: %s", e)
 
     _save_checkpoint(last_ts)
+    # Wedge guard: consecutive poll cycles where the claimed ids never show up in
+    # decrypt history, keyed on the cursor they're stuck behind (see
+    # _advance_past_unfetchable). After CHAT_POLL_WEDGE_SKIP_AFTER we skip past them.
+    wedge_miss_ts: float | None = None
+    wedge_miss_count = 0
     last_job_ts = _load_proactive_checkpoint()
     proactive_enabled = PROACTIVE_POLL_ENABLED
     if proactive_enabled and last_job_ts == 0.0:
@@ -6412,7 +6464,9 @@ def run() -> None:
                         last_broadcast_state = str(
                             decision.get("broadcast_state") or last_broadcast_state or ""
                         ).strip().lower()
-                        next_interval = _proactive_tick_interval_for_broadcast_state(last_broadcast_state)
+                        next_interval = _proactive_tick_interval_for_broadcast_state(
+                            last_broadcast_state, decision.get("wake_interval_sec")
+                        )
                         log.info(
                             "proactive wake tick wake=%s reason=%s enqueued=%s frames=%d broadcast=%s next=%ds",
                             bool(decision.get("should_reach_out")),
@@ -6507,10 +6561,29 @@ def run() -> None:
                     continue
                 messages = _filter_messages_to_poll_ids(decrypted, poll_messages)
                 if not messages:
-                    log.warning(
-                        "poll returned claimed messages but decrypt history did not "
-                        "include those ids; keeping checkpoint for retry"
-                    )
+                    if wedge_miss_ts == last_ts:
+                        wedge_miss_count += 1
+                    else:
+                        wedge_miss_ts = last_ts
+                        wedge_miss_count = 1
+                    if wedge_miss_count >= CHAT_POLL_WEDGE_SKIP_AFTER:
+                        skip_ts = _advance_past_unfetchable(last_ts, poll_messages)
+                        log.error(
+                            "poll claimed %d message(s) absent from decrypt history "
+                            "for %d cycles; advancing cursor %.3f→%.3f to unwedge "
+                            "(undecryptable/boundary message skipped)",
+                            len(poll_messages), wedge_miss_count, last_ts, skip_ts,
+                        )
+                        last_ts = skip_ts
+                        _save_checkpoint(last_ts)
+                        wedge_miss_ts = None
+                        wedge_miss_count = 0
+                    else:
+                        log.warning(
+                            "poll returned claimed messages but decrypt history did "
+                            "not include those ids; keeping checkpoint for retry "
+                            "(%d/%d)", wedge_miss_count, CHAT_POLL_WEDGE_SKIP_AFTER,
+                        )
                     continue
             else:
                 # No decrypt source — fall through with poll content (will be

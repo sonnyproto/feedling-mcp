@@ -48,6 +48,25 @@ def _proactive_job_for_response(store: UserStore, job_id: str) -> dict | None:
     return None
 
 
+def _chat_message_by_id(store: UserStore, msg_id: str) -> dict | None:
+    msg_id = str(msg_id or "").strip()
+    if not msg_id:
+        return None
+    with store.chat_lock:
+        for msg in store.chat_messages:
+            if str(msg.get("id") or "") == msg_id:
+                return dict(msg)
+    return None
+
+
+def _maybe_mark_model_api_first_chat_ok(store: UserStore, reply_to_message_id: str) -> None:
+    user_msg = _chat_message_by_id(store, reply_to_message_id)
+    if not user_msg:
+        return
+    if str(user_msg.get("role") or "") == "user" and str(user_msg.get("source") or "") == "model_api":
+        store.mark_first_chat_ok()
+
+
 def _proactive_delivery_decision_v2(store: UserStore, payload: dict):
     from proactive.controls_v2 import evaluate_delivery_v2
 
@@ -397,6 +416,7 @@ def chat_response():
             "replied_by": chat_service._request_chat_consumer_id(),
             "replied_at": f"{time.time():.3f}",
         })
+        _maybe_mark_model_api_first_chat_ok(store, reply_to_message_id)
     delivery_fields: dict = {}
     visible_push_body = (push_body or alert_body).strip()
     # Any plaintext AI reply supplied by the caller enters the same app-state

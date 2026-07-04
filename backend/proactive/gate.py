@@ -13,6 +13,7 @@ from proactive import service
 from screen import frames as screen_frames
 
 SCREEN_WATCH_JOB_KIND = "screen_watch"
+ACTIVATION_PENDING_REASON = "activation_pending"
 
 
 def _clean_runtime_token(raw: object) -> str:
@@ -174,24 +175,30 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
         core_store.PROACTIVE_BROADCAST_STATES,
         _effective_broadcast_state(store, settings),
     )
+    wake_interval_sec = core_store.normalize_proactive_wake_interval_sec(
+        settings.get("wake_interval_sec")
+    )
     trigger = _proactive_trigger(payload, manual=manual, frames=selected_frames, explicit_trigger=explicit_trigger)
     if not job_kind:
         job_kind = _proactive_job_kind(payload, trigger=trigger)
 
-    wake_source = source_for_legacy_trigger_v2(trigger, manual=manual)
-    wake_control = evaluate_wake_control_v2(
-        wake_source,
-        manual=manual,
-        settings=resolve_settings_v2(settings),
-    )
-
-    block_reason = "" if wake_control.accepted else wake_control.reason
-    if not block_reason and not manual and not is_screen_watch:
-        block_reason = _proactive_v2_auto_wake_block_reason(
-            trigger,
-            broadcast_state=broadcast_state,
-            frame_ids=frame_ids,
+    activation_pending = not manual and not str(settings.get("first_chat_ok_at") or "").strip()
+    if activation_pending:
+        block_reason = ACTIVATION_PENDING_REASON
+    else:
+        wake_source = source_for_legacy_trigger_v2(trigger, manual=manual)
+        wake_control = evaluate_wake_control_v2(
+            wake_source,
+            manual=manual,
+            settings=resolve_settings_v2(settings),
         )
+        block_reason = "" if wake_control.accepted else wake_control.reason
+        if not block_reason and not manual and not is_screen_watch:
+            block_reason = _proactive_v2_auto_wake_block_reason(
+                trigger,
+                broadcast_state=broadcast_state,
+                frame_ids=frame_ids,
+            )
 
     current_app = str(payload.get("current_app") or "").strip()
     if not current_app:
@@ -234,6 +241,7 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
         "user_state": user_state,
         "ai_state": ai_state,
         "broadcast_state": broadcast_state,
+        "wake_interval_sec": wake_interval_sec,
         "semantic": {
             "reference": "agent_owned_v2",
             "llm_confidence": None,
@@ -249,6 +257,7 @@ def _build_proactive_v2_wake_decision(store: UserStore, payload: dict, api_key: 
             "decrypt_errors": [],
             "llm_called": False,
             "llm_error": "",
+            "activation_pending": activation_pending,
             "mechanical_block": block_reason,
             "memory_context": {
                 "identity_loaded": False,

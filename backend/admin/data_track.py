@@ -216,6 +216,16 @@ def _proactive_stats(store: UserStore) -> dict:
         ]
     decision_true = sum(1 for d in decisions if bool(d.get("should_reach_out")))
     status_counts = _count_rows(jobs, "status")
+    kind_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
+    fail_lanes = {"heartbeat": 0, "screen": 0, "other": 0}
+    for j in jobs:
+        if not isinstance(j, dict):
+            continue
+        raw_kind = j.get("job_kind") or j.get("wake_kind") or j.get("trigger") or ""
+        lane = _classify_proactive_kind(raw_kind)
+        kind_lanes[lane] += 1
+        if str(j.get("status") or "") in ("failed", "skipped"):
+            fail_lanes[lane] += 1
     live_status_counts = _count_rows(proactive_messages, "live_activity_status")
     alert_status_counts = _count_rows(proactive_messages, "alert_status")
     job_epochs = [core_util._to_epoch(j.get("ts") or j.get("created_at") or j.get("updated_at")) for j in jobs]
@@ -235,6 +245,11 @@ def _proactive_stats(store: UserStore) -> dict:
         "decision_false": max(0, len(decisions) - decision_true),
         "jobs": len(jobs),
         "jobs_by_status": status_counts,
+        "heartbeat_jobs": kind_lanes["heartbeat"],
+        "screen_jobs": kind_lanes["screen"],
+        "other_jobs": kind_lanes["other"],
+        "heartbeat_failed": fail_lanes["heartbeat"],
+        "screen_failed": fail_lanes["screen"],
         "pending_jobs": status_counts.get("pending", 0),
         "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
         "failed_jobs": failed,
@@ -405,10 +420,76 @@ def _data_track_chat_from_snapshot(snap: dict) -> dict:
     }
 
 
+_SCREEN_PROACTIVE_KINDS = frozenset({
+    "screen_watch", "scene_change", "screen_tick", "broadcast_opened",
+    "heartbeat_broadcast_on",
+})
+
+
+def _classify_proactive_kind(kind: str) -> str:
+    """Bucket a raw proactive job kind/trigger into the two product lanes the
+    current runtime has: ``heartbeat`` (the main self-initiated tick) vs
+    ``screen`` (screen-share / broadcast driven). Anything unrecognized falls
+    to ``other`` so the split never silently drops jobs."""
+    norm = str(kind or "").strip().lower()
+    if not norm or norm == "unknown":
+        return "other"
+    if norm in _SCREEN_PROACTIVE_KINDS:
+        return "screen"
+    # heartbeat, heartbeat_no_frame, heartbeat_unknown, heartbeat_broadcast_off …
+    if norm.startswith("heartbeat"):
+        return "heartbeat"
+    return "other"
+
+
+def _bucket_proactive_kinds(by_kind: dict) -> dict:
+    """{raw_kind: count} → {heartbeat, screen, other} lane totals."""
+    out = {"heartbeat": 0, "screen": 0, "other": 0}
+    for kind, count in (by_kind or {}).items():
+        out[_classify_proactive_kind(kind)] += int(count or 0)
+    return out
+
+
+_CONN_STALE_H = 6.0  # resident consumer considered offline after this many hours silent
+
+
+def _connection_health(route: str, access_modes: list, chat: dict) -> dict:
+    """Live-connection state per user from EXISTING signals (no new埋点):
+    resident → the consumer's poll heartbeat (access-mode ``last_seen_at``);
+    model_api → whether recent user messages are getting AI replies back;
+    official_import → n/a (import only, no live loop)."""
+    now = time.time()
+
+    def age_h(iso):
+        e = core_util._to_epoch(iso)
+        return None if not e else (now - e) / 3600.0
+
+    if route == "model_api":
+        lu = age_h(chat.get("last_user_at"))
+        la = age_h(chat.get("last_agent_at"))
+        agent_n = int(chat.get("model_api_agent_messages") or chat.get("agent_messages") or 0)
+        if lu is not None and lu <= 72 and (agent_n == 0 or (la is not None and la - lu > 24)):
+            return {"status": "stalled", "label": "有去无回", "last_seen_at": chat.get("last_agent_at") or "", "stale_h": lu}
+        return {"status": "ok", "label": "在线", "last_seen_at": chat.get("last_agent_at") or "", "stale_h": la}
+    if route == "official_import":
+        return {"status": "na", "label": "导入", "last_seen_at": "", "stale_h": None}
+    modes = {m.get("access_mode"): m for m in (access_modes or [])}
+    rm = modes.get("resident", {})
+    seen = rm.get("last_seen_at") or ""
+    sh = age_h(seen)
+    if rm.get("connected") and (sh is None or sh > _CONN_STALE_H):
+        return {"status": "offline", "label": "掉线", "last_seen_at": seen, "stale_h": sh}
+    if rm.get("connected"):
+        return {"status": "ok", "label": "在线", "last_seen_at": seen, "stale_h": sh}
+    return {"status": "idle", "label": "未连接", "last_seen_at": seen, "stale_h": sh}
+
+
 def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
     logs = dict(snap.get("logs") or {})
     extra = dict(snap.get("proactive_extra") or {})
     status_counts = _data_track_count_dict(extra.get("jobs_by_status"))
+    kind_lanes = _bucket_proactive_kinds(_data_track_count_dict(extra.get("jobs_by_kind")))
+    fail_lanes = _bucket_proactive_kinds(_data_track_count_dict(extra.get("jobs_failed_by_kind")))
     live_status_counts = _data_track_count_dict(extra.get("live_activity_status"))
     alert_status_counts = _data_track_count_dict(extra.get("alert_status"))
     decisions = int(extra.get("decisions") or logs.get("gate_decisions", {}).get("count") or 0)
@@ -432,6 +513,11 @@ def _data_track_proactive_from_snapshot(snap: dict, chat: dict) -> dict:
         "decision_false": max(0, decisions - decision_true),
         "jobs": int(logs.get("proactive_jobs", {}).get("count") or 0),
         "jobs_by_status": status_counts,
+        "heartbeat_jobs": kind_lanes["heartbeat"],
+        "screen_jobs": kind_lanes["screen"],
+        "other_jobs": kind_lanes["other"],
+        "heartbeat_failed": fail_lanes["heartbeat"],
+        "screen_failed": fail_lanes["screen"],
         "pending_jobs": status_counts.get("pending", 0),
         "posted_jobs": status_counts.get("posted", 0) + status_counts.get("delivered", 0),
         "failed_jobs": failed,
@@ -516,121 +602,63 @@ def _data_track_fast_validation(
     consumer_state: dict | None,
     bootstrap_events: dict,
 ) -> dict:
-    relationship_days = _data_track_relationship_days(identity, memory)
-    counts = memory.get("by_tab") or {}
-    # Genesis writes cards by dynamic *bucket*, not the retired
-    # story/about_me/ta_thinking tabs. The old per-tab floor check made every
-    # genesis user look stuck at "memory_garden" even while actively chatting
-    # (2026-07 data-track redo). The garden is satisfied once distillation
-    # produced ANY cards — mirror the authoritative validator
-    # (hosted/onboarding_validation: live_memory = memory_count > 0).
+    # Current-reality onboarding check (2026-07 redo). The old 7-step validator
+    # asserted removed MCP tools (feedling_identity_init / _chat_verify_loop /
+    # _chat_post_message) and retired story/about_me/ta_thinking memory tabs, so
+    # every genesis/host_all user looked permanently stuck. The live flow has
+    # exactly four ground-truth milestones — identity written, memory distilled,
+    # a live connection, and the first AI-visible message — evaluated the same
+    # way the authoritative hosted validator does (memory_count > 0, etc.).
     memory_total = int(memory.get("total") or 0)
     has_memories = memory_total > 0
-    is_genesis = (
-        str((identity or {}).get("relationship_anchor_source") or "") == "genesis_import"
-        or int(((memory.get("by_source") or {}).get("genesis_import")) or 0) > 0
-    )
     identity_written = identity is not None
-    relationship_evidence = str((identity or {}).get("relationship_anchor_evidence") or "").strip()
-    relationship_ok = bool(identity and identity.get("relationship_started_at") and relationship_evidence)
-
-    def step(step_id: str, label: str, passing: bool, required: str = "", **extra) -> dict:
-        out = {"id": step_id, "label": label, "passing": bool(passing), "required": "" if passing else required}
-        out.update(extra)
-        return out
 
     if route == "model_api":
-        history_ok = bool(history_import.get("has_job") and (
-            history_import.get("status") == "completed"
-            or history_import.get("chat_ready")
-            # Genesis done writes cards + identity + greeting before completing;
-            # having cards is the ground-truth proxy the snapshot always carries.
-            or (is_genesis and has_memories)
-        ))
-        memory_ok = history_ok and has_memories
-        hosted_chat_ok = bool(
+        # Hosted: "connection" = the backend actually produced a hosted reply.
+        connected = bool(
             chat.get("model_api_greetings")
             or (chat.get("model_api_user_messages") and chat.get("model_api_agent_messages"))
         )
-        steps = [
-            step("model_api_config", "Model API Config", bool(model_api_config), "Call /v1/model_api/setup."),
-            step(
-                "model_api_test",
-                "Model API Test",
-                bool(model_api_config and model_api_config.get("test_status") == "ok"),
-                "Call /v1/model_api/test until test_status is ok.",
-                test_status=(model_api_config or {}).get("test_status", ""),
-            ),
-            step(
-                "history_import",
-                "Onboarding Materials",
-                history_ok,
-                "Start onboarding with AI persona materials, user profile, memory summary, chat history, or confirmed fresh start.",
-                job_status=history_import.get("status", ""),
-                phase=history_import.get("phase", ""),
-                progress=history_import.get("progress", 0),
-                chat_ready=history_import.get("chat_ready", False),
-            ),
-            step(
-                "memory_garden",
-                "Memory Garden",
-                memory_ok,
-                "History import must write at least one Story card and one About-me card.",
-                counts={"story": counts.get("story", 0), "about_me": counts.get("about_me", 0), "ta_thinking": counts.get("ta_thinking", 0), "total": memory.get("total", 0)},
-            ),
-            step("identity_card", "Identity Card", identity_written, "History import must derive and write Identity Card."),
-            step("relationship_anchor", "Relationship Anchor", relationship_ok, "History import must include relationship_started_at or fresh_start=true."),
-            step("hosted_chat", "Hosted Chat", hosted_chat_ok, "Send one test message through /v1/model_api/chat/send."),
-        ]
-        next_step = next((s for s in steps if not s["passing"]), None)
-        return {
-            "passing": next_step is None,
-            "stage": "complete" if next_step is None else next_step["id"],
-            "route": "model_api",
-            "next_action": "" if next_step is None else next_step["required"],
-            "steps": steps,
-        }
+        agent_spoke = int(chat.get("model_api_agent_messages") or chat.get("model_api_greetings") or 0) > 0
+        conn_hint = "托管聊天尚未产生 AI 回复（多为 provider key 解密为空 / 网关未注册）。"
+        norm_route = "model_api"
+    elif route == "official_import":
+        # Import route has no live consumer; "connection" = the import landed
+        # both identity and memory.
+        connected = has_memories and identity_written
+        agent_spoke = int(chat.get("agent_messages") or 0) > 0
+        conn_hint = "官方导入尚未同时写入身份与记忆。"
+        norm_route = "official_import"
+    else:  # resident / self-host
+        consumer = consumer_state or {}
+        try:
+            age_sec = time.time() - float(consumer.get("last_poll_epoch") or 0)
+        except Exception:
+            age_sec = None
+        consumer_ok = (
+            bool(consumer.get("official"))
+            and age_sec is not None
+            and age_sec <= chat_consumer._CONSUMER_RECENT_SEC
+        )
+        connected = consumer_ok or bool(chat.get("user_messages") and chat.get("agent_messages"))
+        agent_spoke = int(chat.get("agent_messages") or 0) > 0
+        conn_hint = "常驻 consumer 未在轮询（resident 未上线或已掉线）。"
+        norm_route = "resident"
 
-    memory_ok = has_memories
-    if route == "official_import":
-        steps = [
-            step("memory_garden", "Memory Garden", memory_ok, "Memory import must write at least one card."),
-            step("identity_card", "Identity Card", identity_written, "Use the official app/tool client to import memory and identity."),
-            step("relationship_anchor", "Relationship Anchor", relationship_ok, "Set relationship anchor during import."),
-        ]
-        next_step = next((s for s in steps if not s["passing"]), None)
-        return {
-            "passing": next_step is None,
-            "stage": "import_ready" if next_step is None else next_step["id"],
-            "route": "official_import",
-            "next_action": "" if next_step is None else next_step["required"],
-            "steps": steps,
-        }
+    def step(step_id: str, label: str, passing: bool, required: str = "") -> dict:
+        return {"id": step_id, "label": label, "passing": bool(passing), "required": "" if passing else required}
 
-    consumer = consumer_state or {}
-    try:
-        age_sec = time.time() - float(consumer.get("last_poll_epoch") or 0)
-    except Exception:
-        age_sec = None
-    consumer_ok = bool(consumer.get("official")) and age_sec is not None and age_sec <= chat_consumer._CONSUMER_RECENT_SEC
-    bootstrap_types = bootstrap_events.get("by_type") or {}
-    chat_loop_ok = bool(bootstrap_types.get("chat_loop_verified")) or bool(chat.get("user_messages") and chat.get("agent_messages"))
-    first_greeting_ok = int(chat.get("agent_messages") or 0) > 0
-    real_exchange_ok = bool(chat.get("user_messages") and chat.get("agent_messages"))
     steps = [
-        step("memory_garden", "Memory Garden", memory_ok, "Distillation has not written any memory cards yet."),
-        step("identity_card", "Identity Card", identity_written, "Call feedling_identity_init after memory verification passes."),
-        step("relationship_anchor", "Relationship Anchor", relationship_ok, "Re-run identity init with relationship_anchor_evidence."),
-        step("resident_consumer", "Resident Consumer", consumer_ok, "Run the standard feedling-chat-resident / IO resident consumer."),
-        step("live_loop", "Live Connection", chat_loop_ok, "Call feedling_chat_verify_loop after resident consumer is polling."),
-        step("first_greeting", "First Greeting", first_greeting_ok, "Send first visible greeting via feedling_chat_post_message."),
-        step("real_chat_acceptance", "Real Chat Acceptance", real_exchange_ok, "Ask the user to send one ordinary IO Chat message and confirm a reply."),
+        step("identity", "身份 Identity", identity_written, "尚未写入 Identity Card。"),
+        step("memory", "记忆 Memory", has_memories, "蒸馏尚未写入任何记忆卡。"),
+        step("connection", "连接 Connection", connected, conn_hint),
+        step("first_message", "首消息 First Message", agent_spoke, "IO 尚未发出第一条可见消息。"),
     ]
     next_step = next((s for s in steps if not s["passing"]), None)
     return {
         "passing": next_step is None,
         "stage": "complete" if next_step is None else next_step["id"],
-        "route": "resident",
+        "route": norm_route,
         "next_action": "" if next_step is None else next_step["required"],
         "steps": steps,
     }
@@ -717,6 +745,7 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
         "chat": chat,
         "memory": memory,
         "proactive": proactive,
+        "connection": _connection_health(route, access_modes, chat),
         "push": _push_stats_from_user_entry(user_entry),
         "tracking": tracking,
         "bootstrap_events": bootstrap_events,
@@ -832,6 +861,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         "chat": chat,
         "memory": memory,
         "proactive": proactive,
+        "connection": _connection_health(route, access_modes, chat),
         "push": push,
         "tracking": tracking,
         "bootstrap_events": bootstrap_events,
@@ -864,7 +894,7 @@ def _data_track_request_filters() -> dict:
     if raw_dir not in {"asc", "desc"}:
         raw_dir = "desc"
     raw_view = (request.args.get("view") or "users").strip().lower()
-    if raw_view not in {"users", "dau"}:
+    if raw_view not in {"users", "dau", "proactive"}:
         raw_view = "users"
 
     def read_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -933,12 +963,11 @@ def _data_track_sort_rows(rows: list[dict], sort_key: str, direction: str) -> No
             )
         if sort_key == "memory":
             memory = row.get("memory") or {}
-            by_tab = memory.get("by_tab") or {}
+            # Retired story/about_me/ta_thinking tabs are always 0 under genesis;
+            # tie-break on real signal (change-log volume) instead.
             return (
                 intval(memory.get("total")),
-                intval(by_tab.get("story")),
-                intval(by_tab.get("about_me")),
-                intval(by_tab.get("ta_thinking")),
+                intval(memory.get("changes")),
             )
         if sort_key == "proactive":
             proactive = row.get("proactive") or {}
@@ -967,9 +996,11 @@ def _data_track_sort_rows(rows: list[dict], sort_key: str, direction: str) -> No
 
 def _data_track_payload(*, include_users: bool = True, include_detail_user: str = "") -> dict:
     filters = _data_track_request_filters()
+    # Read-only snapshot: do NOT normalize+persist here. load_users() already
+    # normalizes on boot and on every cross-worker reload, so an admin GET must
+    # not trigger a full-table rewrite (db.save_all_users) — that turned every
+    # dashboard refresh into an O(N) scan + write on the hot path (2026-07 perf).
     with registry._users_lock:
-        if registry._normalize_all_users():
-            registry._save_users()
         users = [dict(u) for u in registry._users if u.get("user_id")]
     users = _data_track_filter_users(users, filters)
     snapshot = db.admin_data_track_snapshot([str(u.get("user_id") or "") for u in users])
@@ -999,6 +1030,13 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     # what the stage validator says.
     now_epoch = time.time()
     fn_has_memory = fn_sent = fn_chatting = fn_active_3d = fn_active_1d = 0
+    # "human active" = a real user message landed recently. Distinct from
+    # active_1d/3d, which key off last_activity_at and therefore also fire on
+    # pure background work (heartbeat/proactive jobs, memory writes) — a churned
+    # user whose heartbeat still ticks looks "active" there but not here.
+    human_active_1d = human_active_3d = 0
+    activated = 0
+    conn_offline = conn_stalled = 0
     for row in rows:
         stage = row["onboarding"]["stage"]
         route = row["route"]
@@ -1015,6 +1053,18 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
             fn_has_memory += 1
         if int(row["chat"].get("user_messages") or 0) > 0:
             fn_sent += 1
+        # "Activated" = did anything real: has a memory card OR sent a message.
+        # Separates genuine humans from abandoned/duplicate registration rows.
+        is_activated = int(row["memory"].get("total") or 0) > 0 or int(row["chat"].get("user_messages") or 0) > 0
+        if is_activated:
+            activated += 1
+        # Connection health only meaningful for users who actually use it.
+        if is_activated:
+            cstatus = (row.get("connection") or {}).get("status")
+            if cstatus == "offline":
+                conn_offline += 1
+            elif cstatus == "stalled":
+                conn_stalled += 1
         if int(row["chat"].get("agent_messages") or 0) > 0:
             fn_chatting += 1
         act_epoch = core_util._to_epoch(row.get("last_activity_at"))
@@ -1022,9 +1072,32 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
             fn_active_3d += 1
         if act_epoch and (now_epoch - act_epoch) <= 86400:
             fn_active_1d += 1
+        human_epoch = core_util._to_epoch(row["chat"].get("last_user_at"))
+        if human_epoch and (now_epoch - human_epoch) <= 3 * 86400:
+            human_active_3d += 1
+        if human_epoch and (now_epoch - human_epoch) <= 86400:
+            human_active_1d += 1
+    # Duplicate registration: one real person (principal_id) can hold several
+    # user_id rows because re-onboarding never deletes the old row (only the
+    # explicit reset endpoint does). Count principals carrying >1 row and the
+    # number of surplus rows — this is most of the gap between 原始行 and 真人.
+    principal_rows: dict[str, int] = {}
+    for row in rows:
+        pid = str(row.get("principal_id") or "")
+        if pid:
+            principal_rows[pid] = principal_rows.get(pid, 0) + 1
+    dup_principals = sum(1 for c in principal_rows.values() if c > 1)
+    dup_surplus_rows = sum(c - 1 for c in principal_rows.values() if c > 1)
     summary = {
         "generated_at": datetime.now().isoformat(),
         "users_total": len(rows),
+        "activated_total": activated,
+        "human_active_1d": human_active_1d,
+        "human_active_3d": human_active_3d,
+        "conn_offline": conn_offline,
+        "conn_stalled": conn_stalled,
+        "dup_principals": dup_principals,
+        "dup_surplus_rows": dup_surplus_rows,
         "onboarding_completed": completed,
         "onboarding_incomplete": incomplete,
         "completion_rate": (completed / len(rows)) if rows else 0,
@@ -1116,6 +1189,55 @@ def _data_track_dau_payload() -> dict:
     }
 
 
+def _data_track_proactive_daily_payload() -> dict:
+    filters = _data_track_request_filters()
+    days = int(filters.get("days") or 30)
+    rows = db.admin_data_track_proactive_daily(
+        since_epoch=float(filters.get("since_epoch") or 0),
+        days=days,
+        tz="Asia/Shanghai",
+    )
+    out_rows = []
+    for r in rows:
+        jobs = int(r.get("jobs") or 0)
+        delivered = int(r.get("delivered") or 0)
+        failed = int(r.get("failed") or 0)
+        # success rate over RESOLVED jobs (exclude still-pending) — a fairer
+        # "did it work" denominator than raw jobs.
+        resolved = delivered + failed
+        out_rows.append({
+            **r,
+            "success_rate": (delivered / resolved) if resolved else 0.0,
+            "fail_rate": (failed / resolved) if resolved else 0.0,
+        })
+    tot_jobs = sum(int(r.get("jobs") or 0) for r in rows)
+    tot_deliv = sum(int(r.get("delivered") or 0) for r in rows)
+    tot_fail = sum(int(r.get("failed") or 0) for r in rows)
+    tot_resolved = tot_deliv + tot_fail
+    latest = out_rows[0] if out_rows else {}
+    summary = {
+        "generated_at": datetime.now().isoformat(),
+        "timezone": "Asia/Shanghai",
+        "days_returned": len(out_rows),
+        "latest_day": latest.get("day", ""),
+        "latest_success_rate": latest.get("success_rate", 0.0),
+        "total_jobs": tot_jobs,
+        "total_delivered": tot_deliv,
+        "total_failed": tot_fail,
+        "overall_success_rate": (tot_deliv / tot_resolved) if tot_resolved else 0.0,
+    }
+    return {
+        "summary": summary,
+        "filters": {"since": filters.get("since", ""), "days": days, "view": "proactive"},
+        "rows": out_rows,
+        "definition": {
+            "success_rate": "delivered / (delivered + failed); still-pending jobs excluded from the denominator.",
+            "lanes": "heartbeat = the main self-initiated tick; screen = screen-share / broadcast driven.",
+            "timezone": "Asia/Shanghai",
+        },
+    }
+
+
 def _format_duration(seconds) -> str:
     if seconds is None:
         return "n/a"
@@ -1158,8 +1280,26 @@ def _render_data_track_view_nav(active: str) -> str:
         "<div class='viewbar'>"
         f"{nav_item('users', 'Users')}"
         f"{nav_item('dau', 'DAU')}"
+        f"{nav_item('proactive', 'Proactive 日报')}"
         "</div>"
     )
+
+
+def _memory_source_split(by_source: dict) -> tuple[int, int]:
+    """(onboarding_written, live_written) from a memory by_source map. Under the
+    current runtime memory is written almost entirely at onboarding (genesis /
+    history import); the ``live`` bucket (background capture etc.) should be ~0,
+    which is exactly what this surfaces. Unknown source strings default to live
+    so a new write path can't hide inside the onboarding count."""
+    onb = live = 0
+    for src, count in (by_source or {}).items():
+        s = str(src or "").lower()
+        n = int(count or 0)
+        if "genesis" in s or "import" in s or "onboard" in s:
+            onb += n
+        else:
+            live += n
+    return onb, live
 
 
 def _render_data_track_page(payload: dict) -> str:
@@ -1208,30 +1348,46 @@ def _render_data_track_page(payload: dict) -> str:
         principal = str(access.get("principal_id") or row.get("principal_id") or "")
         principal_short = f"{principal[:12]}…" if len(principal) > 12 else principal
         connected_modes = ", ".join(access.get("connected_modes") or []) or "none"
+        onb_mem, live_mem = _memory_source_split(row["memory"].get("by_source"))
+        pro = row["proactive"]
+        conn = row.get("connection") or {}
+        conn_status = conn.get("status", "")
+        conn_cls = "warn" if conn_status in ("offline", "stalled") else ("ok" if conn_status == "ok" else "muted")
+        conn_age = conn.get("stale_h")
+        conn_sub = f"{conn_age:.0f}h" if isinstance(conn_age, (int, float)) else ""
         rows_html.append(
             "<tr>"
             f"<td><a href='{html.escape(user_url)}'>{html.escape(row['user_id'])}</a>"
             f"<br><span class='muted'>{html.escape(principal_short)} · keys {access.get('api_keys_count', 0)}</span></td>"
             f"<td>{html.escape(row['route'])}</td>"
-            f"<td>{html.escape(connected_modes)}</td>"
+            f"<td><span class='pill {conn_cls}'>{html.escape(conn.get('label', '—'))}</span>"
+            f"<br><span class='muted'>{html.escape(conn_sub)}</span></td>"
             f"<td><span class='pill {status_class}'>{html.escape(stage)}</span></td>"
             f"<td>{onboarding['steps_done']}/{onboarding['steps_total']}</td>"
-            f"<td>{html.escape(_format_duration(onboarding['stuck_for_sec']))}</td>"
             f"<td>{row['chat']['total']} <span class='muted'>u{row['chat']['user_messages']} / a{row['chat']['agent_messages']}</span></td>"
             f"<td>{row['memory']['total']} <span class='muted'>cards</span>"
-            f"<br><span class='muted'>cap {row['memory'].get('capture_actions_written', 0)} / edit {row['memory'].get('changes', 0)}</span></td>"
-            f"<td>{row['proactive']['proactive_messages']} <span class='muted'>jobs {row['proactive']['jobs']} / fail {row['proactive']['failed_jobs']}</span></td>"
+            f"<br><span class='muted'>onb {onb_mem} / live {live_mem}</span></td>"
+            f"<td>{pro['proactive_messages']} <span class='muted'>sent</span>"
+            f"<br><span class='muted'>心跳 {pro.get('heartbeat_jobs', 0)}(f{pro.get('heartbeat_failed', 0)}) / "
+            f"屏幕 {pro.get('screen_jobs', 0)}(f{pro.get('screen_failed', 0)})</span></td>"
             f"<td>{html.escape(row.get('last_activity_at') or '')}</td>"
             "</tr>"
         )
     fn = summary.get("activation_funnel", {})
     reg = max(1, int(fn.get("registered") or summary["users_total"] or 1))
     def _pct(n): return f"{(int(n or 0) / reg) * 100:.0f}%"
+    activated = int(summary.get("activated_total") or 0)
+    raw_rows = int(summary["users_total"])
+    off = int(summary.get("conn_offline") or 0)
+    stalled = int(summary.get("conn_stalled") or 0)
+    # 真人去重(principals_total)= 原始行 in prod (每次重装新 principal),故不再单列;
+    # 已激活才是"真正用起来的人"。
     metrics = "".join([
-        _render_metric("registered", summary["users_total"]),
-        _render_metric("chatting (真在聊)", f"{fn.get('chatting', 0)} · {_pct(fn.get('chatting'))}"),
-        _render_metric("active 3d", f"{fn.get('active_3d', 0)} · {_pct(fn.get('active_3d'))}"),
-        _render_metric("active 1d", fn.get("active_1d", 0)),
+        _render_metric("已激活 / 原始行", f"{activated} / {raw_rows}"),
+        _render_metric("真人活跃 1d/3d (人发消息)", f"{summary.get('human_active_1d', 0)} / {summary.get('human_active_3d', 0)}"),
+        _render_metric("系统活跃 1d/3d (含后台)", f"{fn.get('active_1d', 0)} / {fn.get('active_3d', 0)}"),
+        _render_metric("连接异常 掉线/有去无回", f"{off} / {stalled}"),
+        _render_metric("chatting (收到AI回复)", f"{fn.get('chatting', 0)} · {_pct(fn.get('chatting'))}"),
         _render_metric("onboarding done", summary["onboarding_completed"]),
         _render_metric("chat messages", summary["chat_messages_total"]),
         _render_metric("memories", summary["memory_total"]),
@@ -1308,7 +1464,7 @@ def _render_data_track_page(payload: dict) -> str:
 	  <div class="sortbar">{sort_controls}</div>
 	  {pager}
 	  <table id="users">
-    <thead><tr><th>User</th><th>Route</th><th>Access</th><th>Onboarding</th><th>Steps</th><th>Stuck</th><th>Chat</th><th>Memory</th><th>Proactive</th><th>Last activity</th></tr></thead>
+    <thead><tr><th>User</th><th>Route</th><th>连接</th><th>Onboarding</th><th>Steps</th><th>Stuck</th><th>Chat</th><th>Memory</th><th>Proactive 心跳/屏幕(fail)</th><th>Last activity</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='10' class='muted'>No users yet.</td></tr>"}</tbody>
   </table>
 </main>
@@ -1406,6 +1562,84 @@ def _render_data_track_dau_page(payload: dict) -> str:
 </html>"""
 
 
+def _render_proactive_daily_page(payload: dict) -> str:
+    summary = payload["summary"]
+    filters = payload.get("filters", {})
+    rows = payload.get("rows", [])
+    definition = payload.get("definition", {})
+    api_qs = _data_track_qs(view=None, q=None, limit=None, offset=None, sort=None, dir=None)
+    api_url = f"/v1/admin/data-track/proactive-daily?{api_qs}" if api_qs else "/v1/admin/data-track/proactive-daily"
+    rows_html = []
+    for row in rows:
+        sr = float(row.get("success_rate") or 0.0)
+        sr_cls = "ok" if sr >= 0.7 else ("warn" if sr >= 0.4 else "bad")
+        rows_html.append(
+            "<tr>"
+            f"<td>{html.escape(str(row.get('day') or ''))}</td>"
+            f"<td>{int(row.get('jobs') or 0)}</td>"
+            f"<td>{int(row.get('delivered') or 0)}</td>"
+            f"<td>{int(row.get('failed') or 0)}</td>"
+            f"<td>{int(row.get('pending') or 0)}</td>"
+            f"<td><b class='{sr_cls}'>{sr*100:.0f}%</b>"
+            f"<div class='fn-bar'><span class='{sr_cls}' style='width:{sr*100:.0f}%'></span></div></td>"
+            f"<td>{int(row.get('heartbeat') or 0)}</td>"
+            f"<td>{int(row.get('screen') or 0)}</td>"
+            "</tr>"
+        )
+    metrics = "".join([
+        _render_metric("整体成功率 (投递/已结)", f"{summary['overall_success_rate']*100:.0f}%"),
+        _render_metric("最近一天成功率", f"{summary['latest_success_rate']*100:.0f}%"),
+        _render_metric("最近一天", summary.get("latest_day") or "n/a"),
+        _render_metric("总 jobs", summary["total_jobs"]),
+        _render_metric("投递 / 失败", f"{summary['total_delivered']} / {summary['total_failed']}"),
+    ])
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Feedling Proactive 日报 · Data Track</title>
+  <style>
+    :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
+    body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+    main {{ max-width:1280px; margin:0 auto; padding:28px 24px 48px; }}
+    h1 {{ font-size:26px; margin:0 0 4px; }} h2 {{ font-size:16px; margin:28px 0 12px; }}
+    .muted {{ color:var(--muted); }} .ok {{ color:var(--ok); }} .warn {{ color:var(--warn); }} .bad {{ color:var(--bad); }}
+    .metrics {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:22px 0; }}
+    .metric {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
+    .metric-value {{ font-size:24px; font-weight:700; }}
+    .metric-label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }}
+    .fn-bar {{ height:6px; background:#eee3d9; border-radius:4px; margin:5px 0 0; overflow:hidden; width:120px; }}
+    .fn-bar span {{ display:block; height:100%; background:var(--accent); }}
+    .fn-bar span.ok {{ background:var(--ok); }} .fn-bar span.warn {{ background:var(--warn); }} .fn-bar span.bad {{ background:var(--bad); }}
+    .viewbar {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0 18px; }}
+    .toolbar {{ display:flex; gap:8px; margin:14px 0; }}
+    .sort-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
+    .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
+    table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
+    th,td {{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }}
+    th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }}
+    tr:last-child td {{ border-bottom:0; }} a {{ color:var(--accent); text-decoration:none; }}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Feedling Proactive 日报</h1>
+  <div class="muted">Generated {html.escape(summary["generated_at"])}. 时区 {html.escape(summary["timezone"])}. 最近 {html.escape(str(summary["days_returned"]))} 天。</div>
+  {_render_data_track_view_nav("proactive")}
+  <section class="metrics">{metrics}</section>
+  <h2>每日主动消息成功率(心跳 vs 屏幕)</h2>
+  <div class="muted">{html.escape(definition.get("success_rate") or "")} {html.escape(definition.get("lanes") or "")}</div>
+  <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
+  <table>
+    <thead><tr><th>北京日</th><th>Jobs</th><th>投递</th><th>失败</th><th>Pending</th><th>成功率</th><th>心跳</th><th>屏幕</th></tr></thead>
+    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='8' class='muted'>此区间无 proactive job。</td></tr>"}</tbody>
+  </table>
+</main>
+</body>
+</html>"""
+
+
 def _render_user_detail_page(user: dict) -> str:
     qs = _data_track_qs()
     back = f"/admin/data-track?{qs}" if qs else "/admin/data-track"
@@ -1466,6 +1700,12 @@ def admin_data_track_dau():
     return jsonify(_data_track_dau_payload())
 
 
+@bp.route("/v1/admin/data-track/proactive-daily", methods=["GET"])
+def admin_data_track_proactive_daily():
+    require_admin()
+    return jsonify(_data_track_proactive_daily_payload())
+
+
 @bp.route("/v1/admin/data-track/users/<user_id>", methods=["GET"])
 def admin_data_track_user(user_id: str):
     require_admin()
@@ -1479,8 +1719,11 @@ def admin_data_track_user(user_id: str):
 @bp.route("/admin/data-track", methods=["GET"])
 def admin_data_track_page():
     require_admin()
-    if (request.args.get("view") or "").strip().lower() == "dau":
+    view = (request.args.get("view") or "").strip().lower()
+    if view == "dau":
         return Response(_render_data_track_dau_page(_data_track_dau_payload()), mimetype="text/html")
+    if view == "proactive":
+        return Response(_render_proactive_daily_page(_data_track_proactive_daily_payload()), mimetype="text/html")
     return Response(_render_data_track_page(_data_track_payload(include_users=True)), mimetype="text/html")
 
 
