@@ -1,4 +1,5 @@
 from __future__ import annotations
+import threading
 
 import json
 import sys
@@ -59,10 +60,7 @@ class _CoreClient:
 
 
 def test_history_import_persists_v1_memory_body(monkeypatch):
-    store = types.SimpleNamespace(user_id="usr_import", memory_lock=types.SimpleNamespace(
-        __enter__=lambda self: self,
-        __exit__=lambda self, exc_type, exc, tb: None,
-    ))
+    store = types.SimpleNamespace(user_id="usr_import", memory_lock=threading.RLock())
     saved: list[dict] = []
     monkeypatch.setattr(history_import.memory_service, "_load_moments", lambda _store: [])
     monkeypatch.setattr(history_import.memory_service, "_save_moments", lambda _store, moments: saved.extend(moments))

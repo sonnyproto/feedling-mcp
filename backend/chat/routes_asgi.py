@@ -69,10 +69,6 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
             timed_out=timed_out,
         )
 
-    pending = await _check()
-    if pending:
-        return _response(pending, timed_out=False)
-
     waiter = registry.register(
         "chat", store.user_id, per_user_max=settings.poller_max_per_user_chat
     )
@@ -80,6 +76,15 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
         # Cap hit — shed to an immediate timed-out response; consumer re-polls.
         return _response([], timed_out=True)
     try:
+        # Check AFTER registering the waiter. asyncio.Event.set() latches, so a
+        # write that wakes in the gap between check and park is NOT lost: if it
+        # lands before this check we return its message; if it lands between the
+        # check and wait(), the event is already set and wait() returns at once,
+        # then the re-check below delivers it. (Checking before registering — the
+        # old order — forfeited that latch and could park for the full timeout.)
+        pending = await _check()
+        if pending:
+            return _response(pending, timed_out=False)
         try:
             await asyncio.wait_for(waiter.event.wait(), timeout=max(0.0, timeout))
             notified = True

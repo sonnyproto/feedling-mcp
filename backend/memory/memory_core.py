@@ -265,11 +265,12 @@ def get_moment(store, moment_id: str) -> tuple[dict, int]:
 def delete_moment(store, moment_id: str) -> tuple[dict, int]:
     if not moment_id:
         return {"error": "id required"}, 400
-    moments = memory_service._load_moments(store)
-    new_moments = [m for m in moments if m.get("id") != moment_id]
-    if len(new_moments) == len(moments):
-        return {"error": "not_found"}, 404
-    memory_service._save_moments(store, new_moments)
+    with memory_service.mutation_lock(store):
+        moments = memory_service._load_moments(store)
+        new_moments = [m for m in moments if m.get("id") != moment_id]
+        if len(new_moments) == len(moments):
+            return {"error": "not_found"}, 404
+        memory_service._save_moments(store, new_moments)
     print(f"[memory:{store.user_id}] deleted: {moment_id}")
     return {"status": "deleted"}, 200
 
@@ -369,8 +370,12 @@ def add(store, payload: dict) -> tuple[dict, int]:
         moment["K_enclave"] = envelope["K_enclave"]
     if anchor_ids:
         moment["anchor_memory_ids"] = list(anchor_ids)
-    moments.append(moment)
-    memory_service._save_moments(store, moments)
+    # Re-read + append + save under one memory_lock hold so a concurrent
+    # same-user write can't lost-update (the load above was for validation only).
+    with memory_service.mutation_lock(store):
+        moments = memory_service._load_moments(store)
+        moments.append(moment)
+        memory_service._save_moments(store, moments)
     boot_gates._log_bootstrap_event(store, "memory_moment_added_v1", success=True)
     print(f"[memory:{store.user_id}] added v1 type={mem_type} id={moment['id']} "
           f"visibility={envelope['visibility']} anchors={len(anchor_ids)}")
@@ -389,48 +394,51 @@ def retype(store, payload: dict) -> tuple[dict, int]:
             "allowed": list(memory_service.MEMORY_TYPES),
         }, 400
 
-    moments = memory_service._load_moments(store)
-    target_idx = None
-    for i, m in enumerate(moments):
-        if isinstance(m, dict) and m.get("id") == memory_id:
-            target_idx = i
-            break
-    if target_idx is None:
-        return {"error": "not_found"}, 404
+    # Hold memory_lock across load→modify→save so a concurrent same-user write
+    # can't lost-update (re-read happens inside the lock).
+    with memory_service.mutation_lock(store):
+        moments = memory_service._load_moments(store)
+        target_idx = None
+        for i, m in enumerate(moments):
+            if isinstance(m, dict) and m.get("id") == memory_id:
+                target_idx = i
+                break
+        if target_idx is None:
+            return {"error": "not_found"}, 404
 
-    target = moments[target_idx]
-    if target.get("owner_user_id") != store.user_id:
-        return {"error": "not_owned"}, 403
+        target = moments[target_idx]
+        if target.get("owner_user_id") != store.user_id:
+            return {"error": "not_owned"}, 403
 
-    anchor_ids = payload.get("anchor_memory_ids") or []
-    if new_type in ("insight", "reflection"):
-        minimum = 1 if new_type == "insight" else 2
-        if not isinstance(anchor_ids, list) or len(anchor_ids) < minimum:
-            return {
-                "error": f"{new_type}_requires_anchor",
-                "min_anchors": minimum,
-                "required": (
-                    f"Retyping into {new_type} requires ≥{minimum} anchor_memory_ids."
-                ),
-            }, 400
-        # Don't allow self-reference.
-        if memory_id in anchor_ids:
-            return {
-                "error": "anchor_self_reference",
-                "required": "A memory cannot anchor itself.",
-            }, 400
-        ok, err = memory_service._validate_anchor_ids(moments, anchor_ids, store.user_id)
-        if not ok:
-            return err, 400
-        target["anchor_memory_ids"] = list(anchor_ids)
-    else:
-        # Demoting away from insight/reflection drops anchors.
-        target.pop("anchor_memory_ids", None)
+        anchor_ids = payload.get("anchor_memory_ids") or []
+        if new_type in ("insight", "reflection"):
+            minimum = 1 if new_type == "insight" else 2
+            if not isinstance(anchor_ids, list) or len(anchor_ids) < minimum:
+                return {
+                    "error": f"{new_type}_requires_anchor",
+                    "min_anchors": minimum,
+                    "required": (
+                        f"Retyping into {new_type} requires ≥{minimum} anchor_memory_ids."
+                    ),
+                }, 400
+            # Don't allow self-reference.
+            if memory_id in anchor_ids:
+                return {
+                    "error": "anchor_self_reference",
+                    "required": "A memory cannot anchor itself.",
+                }, 400
+            ok, err = memory_service._validate_anchor_ids(moments, anchor_ids, store.user_id)
+            if not ok:
+                return err, 400
+            target["anchor_memory_ids"] = list(anchor_ids)
+        else:
+            # Demoting away from insight/reflection drops anchors.
+            target.pop("anchor_memory_ids", None)
 
-    target["type"] = new_type
-    target["retyped_at"] = datetime.now().isoformat()
-    moments[target_idx] = target
-    memory_service._save_moments(store, moments)
+        target["type"] = new_type
+        target["retyped_at"] = datetime.now().isoformat()
+        moments[target_idx] = target
+        memory_service._save_moments(store, moments)
     print(f"[memory:{store.user_id}] retyped id={memory_id} → {new_type} "
           f"anchors={len(anchor_ids)}")
     return {"status": "retyped", "moment": target}, 200

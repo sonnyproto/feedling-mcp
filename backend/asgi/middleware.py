@@ -111,3 +111,18 @@ def register_exception_handlers(app) -> None:
         if body is not None:
             return responses.json_error(exc.status_code, body)
         return responses.json_error(exc.status_code, {"detail": exc.detail})
+
+    # Degrade a psycopg pool exhaustion to a retryable 503 instead of a bare 500.
+    # The run_db thread limiter (FEEDLING_ASGI_DB_THREADS, default 64) admits more
+    # concurrent blocking calls than the psycopg pool has connections (db.py
+    # max_size=16), so a genuine request burst can hit the pool's acquire timeout.
+    # This is a graceful shed, not a fix for the sizing mismatch — tune the two to
+    # match for prod (mind RDS max_connections × workers).
+    try:
+        from psycopg_pool import PoolTimeout as _PoolTimeout
+    except Exception:  # pragma: no cover - psycopg_pool always present in deploy
+        _PoolTimeout = None
+    if _PoolTimeout is not None:
+        @app.exception_handler(_PoolTimeout)
+        async def _pool_timeout(request, exc):
+            return responses.json_error(503, {"error": "service_busy"})

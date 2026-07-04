@@ -118,7 +118,14 @@ class UserStore:
 
         # identity / memory locks
         self.identity_lock = threading.Lock()
-        self.memory_lock = threading.Lock()
+        # Reentrant: memory mutations hold this across load→mutate→save (see
+        # memory_service.mutate) so same-user concurrent writes can't lost-update,
+        # and _save_moments re-acquires it inside that hold. RLock makes the
+        # nested acquire a no-op instead of a deadlock. Plain Lock previously
+        # only guarded the final write, which under the ASGI threadpool (same-user
+        # requests now truly overlap) let a stale-snapshot save delete a
+        # concurrently-added moment.
+        self.memory_lock = threading.RLock()
         self.world_books: list[dict] = []
         self.world_books_lock = threading.Lock()
         self.consumer_state_lock = threading.Lock()

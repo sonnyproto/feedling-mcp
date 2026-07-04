@@ -31,6 +31,7 @@ from accounts.auth_core import AuthResult
 from asgi import http as asgi_http
 from asgi import threadpool
 from asgi.deps import require_auth
+from core import reqctx
 from hosted import chat_send_core
 
 router = APIRouter()
@@ -45,15 +46,22 @@ async def model_api_chat_send(request: Request, auth: AuthResult = Depends(requi
     api_key = auth_core.extract_api_key(request.headers, request.query_params)
     runtime_tok = "" if api_key else (auth_core.extract_runtime_token(request.headers) or "")
     payload = (await asgi_http.read_json_silent(request)) or {}
-    # The whole route body — including the blocking reply-wait inside handle_send —
-    # runs on the bounded threadpool (plan §5.2). Never call it on the event loop.
-    body, status = await threadpool.run_db(
-        chat_send_core.model_api_chat_send_core,
-        store,
-        api_key=api_key,
-        runtime_tok=runtime_tok,
-        payload=payload,
-    )
+    # Bind the neutral request context so deep context-builders reached on the
+    # worker thread (worldbook match in hosted.context, screen-frame decrypt in
+    # screen.frames/caption) can read X-Feedling-Runtime-Token off the proxy.
+    # run_db copies THIS context into the threadpool worker, so binding on the
+    # loop is sufficient. Without it a host-all user (api_key=None, runtime token
+    # only) silently loses worldbook + screen context — a Flask→ASGI regression
+    # (the old global flask.request always carried the header). Plan §5.2: the
+    # whole body incl. the blocking reply-wait runs on the threadpool, never the loop.
+    with reqctx.bind(query_string=request.url.query, headers=dict(request.headers)):
+        body, status = await threadpool.run_db(
+            chat_send_core.model_api_chat_send_core,
+            store,
+            api_key=api_key,
+            runtime_tok=runtime_tok,
+            payload=payload,
+        )
     return JSONResponse(body, status_code=status)
 
 

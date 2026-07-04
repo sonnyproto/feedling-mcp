@@ -358,6 +358,7 @@ def swap(store: UserStore, payload: dict) -> tuple[dict, int]:
     results: list[dict] = []
     memory_dirty = False
     moments = None
+    memory_swaps: list[tuple[str, dict]] = []
 
     for item in items:
         if not isinstance(item, dict):
@@ -398,10 +399,18 @@ def swap(store: UserStore, payload: dict) -> tuple[dict, int]:
             status = _swap_memory_inplace(moments, iid, env)
             if status == "ok":
                 memory_dirty = True
+                memory_swaps.append((iid, env))
             results.append({"type": "memory", "id": iid, "status": status})
 
-    if memory_dirty and moments is not None:
-        memory_service._save_moments(store, moments)
+    if memory_dirty:
+        # Re-apply the accepted envelope swaps onto a fresh snapshot under
+        # memory_lock so a concurrent same-user memory write isn't lost-updated
+        # by this save (the plain full-list replace reconciles deletes).
+        with memory_service.mutation_lock(store):
+            fresh = memory_service._load_moments(store)
+            for swap_id, swap_env in memory_swaps:
+                _swap_memory_inplace(fresh, swap_id, swap_env)
+            memory_service._save_moments(store, fresh)
 
     return {"results": results, "summary": _swap_summary(results)}, 200
 
@@ -471,7 +480,7 @@ def rewrap_to_current_key(
         item_id = str(moment.get("id") or "")
         results.append(_rewrap_record_result(summary, "memory", item_id, status, reason=reason))
         if env is not None:
-            memory_plans.append((idx, env))
+            memory_plans.append((item_id, env))
 
     with store.chat_lock:
         chat_msgs = list(store.chat_messages)
@@ -528,11 +537,18 @@ def rewrap_to_current_key(
         })
 
     if memory_plans:
-        for idx, env in memory_plans:
-            if 0 <= idx < len(moments) and isinstance(moments[idx], dict):
-                _apply_envelope_fields(moments[idx], env)
-                moments[idx]["rewrapped_at"] = now
-        memory_service._save_moments(store, moments)
+        # Re-read + apply-by-id + save under one memory_lock hold (find by stable
+        # id, not the pre-reload index) so a concurrent same-user memory write
+        # isn't lost-updated by this rewrap save.
+        with memory_service.mutation_lock(store):
+            fresh = memory_service._load_moments(store)
+            by_id = {m.get("id"): m for m in fresh if isinstance(m, dict)}
+            for plan_id, env in memory_plans:
+                target = by_id.get(plan_id)
+                if target is not None:
+                    _apply_envelope_fields(target, env)
+                    target["rewrapped_at"] = now
+            memory_service._save_moments(store, fresh)
 
     swapped_ids: set[str] = set()
     for item_id, env in chat_plans:
