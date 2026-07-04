@@ -3237,6 +3237,42 @@ def test_agent_turn_extracts_bare_visible_thinking_summary_fragment():
     assert "messages" not in turn.messages[0]
 
 
+def test_agent_turn_extracts_visible_thinking_summary_from_text_block():
+    raw = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "The user is asking a casual check-in.",
+                        },
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {
+                                    "thinking_summary": "判断用户是在随口问我在干嘛。",
+                                    "messages": ["没干嘛，就在这儿待着呢。"],
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    ],
+                },
+            }
+        ]
+    }
+
+    turn = crc._agent_turn_from_raw(raw)
+
+    assert turn.messages == ["没干嘛，就在这儿待着呢。"]
+    assert turn.thinking_summary == "判断用户是在随口问我在干嘛。"
+    assert turn.thinking_kind == "agent_summary"
+    assert "thinking_summary" not in turn.messages[0]
+    assert "messages" not in turn.messages[0]
+
+
 def test_ensure_visible_thinking_summary_fallback_for_plain_reply():
     turn = crc.AgentTurn(messages=["嘿，看见了。周六深夜还醒着，我陪你。"])
 

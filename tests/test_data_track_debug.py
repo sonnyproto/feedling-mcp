@@ -111,6 +111,40 @@ def test_debug_payload_treats_missing_trace_flag_as_enabled_by_default(monkeypat
     ]
 
 
+def test_debug_payload_paginates_filtered_events(monkeypatch):
+    with registry._users_lock:
+        registry._users[:] = [
+            {"user_id": "user_a", "principal_id": "p_a", "created_at": "2026-07-04T00:00:00Z"},
+        ]
+
+    events = [
+        _event(100 + idx, "user_a", "agent.reply", trace_id=f"t-{idx}", explain=f"event {idx}")
+        for idx in range(5)
+    ]
+    blobs = {
+        ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
+        ("user_a", "v1_flow_trace"): {"events": events},
+    }
+    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+
+    with bind("view=debug&limit=2&offset=1"):
+        payload = data_track._data_track_debug_payload()
+
+    assert [event["trace_id"] for event in payload["events"]] == ["t-3", "t-2"]
+    assert payload["pagination"] == {
+        "limit": 2,
+        "offset": 1,
+        "total": 5,
+        "returned": 2,
+        "next_offset": 3,
+        "prev_offset": 0,
+        "current_page": 1,
+        "total_pages": 3,
+    }
+    assert payload["summary"]["events_total"] == 5
+    assert payload["summary"]["events_returned"] == 2
+
+
 def test_debug_page_renders_nav_filters_and_redacts_plaintext_by_default(monkeypatch):
     with registry._users_lock:
         registry._users[:] = [{"user_id": "user_a", "principal_id": "p_a"}]
@@ -147,6 +181,100 @@ def test_debug_page_renders_nav_filters_and_redacts_plaintext_by_default(monkeyp
     assert "trace_id 时可直接定位" in html
     assert "#event-" in html
     assert "#turn-" in html
+
+
+def test_debug_page_renders_load_more_when_paginated(monkeypatch):
+    with registry._users_lock:
+        registry._users[:] = [{"user_id": "user_a", "principal_id": "p_a"}]
+
+    blobs = {
+        ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
+        ("user_a", "v1_flow_trace"): {
+            "events": [
+                _event(100 + idx, "user_a", "agent.reply", trace_id=f"t-{idx}")
+                for idx in range(3)
+            ]
+        },
+    }
+    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+
+    html = admin_core.page_html("view=debug&user_id=user_a&limit=2&offset=0")
+
+    assert "Showing 1-2 of 3 events" in html
+    assert "Next" in html
+    assert "offset=2" in html
+    assert '<select name="limit">' in html
+
+
+def test_debug_page_renders_numbered_pagination_controls(monkeypatch):
+    with registry._users_lock:
+        registry._users[:] = [{"user_id": "user_a", "principal_id": "p_a"}]
+
+    blobs = {
+        ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
+        ("user_a", "v1_flow_trace"): {
+            "events": [
+                _event(100 + idx, "user_a", "agent.reply", trace_id=f"t-{idx}")
+                for idx in range(25)
+            ]
+        },
+    }
+    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+
+    html = admin_core.page_html("view=debug&user_id=user_a&limit=10&offset=10")
+
+    assert "Page" in html
+    assert "name='page'" in html
+    assert "value='2'" in html
+    assert "/ 3" in html
+    assert "First" in html
+    assert "Prev" in html
+    assert "Next" in html
+    assert "Last" in html
+    assert "offset=0" in html
+    assert "offset=20" in html
+
+
+def test_debug_reveal_and_timeline_links_reset_pagination(monkeypatch):
+    with registry._users_lock:
+        registry._users[:] = [{"user_id": "user_a", "principal_id": "p_a"}]
+
+    events = [
+        _event(100 + idx, "user_a", "agent.reply", trace_id=f"t-{idx}")
+        for idx in range(3)
+    ]
+    target = events[1]
+    blobs = {
+        ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
+        ("user_a", "v1_flow_trace"): {"events": events},
+    }
+    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+
+    key = data_track._debug_event_key(target)
+    html = admin_core.page_html("view=debug&user_id=user_a&limit=1&offset=1")
+
+    assert f"reveal={key}" in html
+    assert f"reveal={key}#event-{key}" in html
+    assert f"offset=1&amp;reveal={key}" not in html
+    assert "mode=timeline" in html
+    assert "offset=0&amp;view=debug&amp;user_id=user_a&amp;mode=timeline&amp;trace_id=t-1" in html
+
+
+def test_debug_timeline_event_rows_have_event_anchors(monkeypatch):
+    with registry._users_lock:
+        registry._users[:] = [{"user_id": "user_a", "principal_id": "p_a"}]
+
+    event = _event(100, "user_a", "agent.reply", trace_id="t-reply")
+    blobs = {
+        ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
+        ("user_a", "v1_flow_trace"): {"events": [event]},
+    }
+    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+
+    key = data_track._debug_event_key(event)
+    html = admin_core.page_html("view=debug&mode=timeline&user_id=user_a")
+
+    assert f'id="event-{key}"' in html or f"id='event-{key}'" in html
 
 
 def test_debug_page_reveals_plaintext_for_one_event(monkeypatch):

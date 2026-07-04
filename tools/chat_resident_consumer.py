@@ -1821,7 +1821,14 @@ def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
     dst.actions.extend(src.actions)
     dst.messages.extend(src.messages)
     dst.tool_calls.extend(src.tool_calls)
-    if not dst.thinking_summary and src.thinking_summary:
+    prefer_src_thinking = bool(src.thinking_summary) and (
+        not dst.thinking_summary
+        or (
+            src.thinking_kind == "agent_summary"
+            and dst.thinking_kind == "provider_reasoning"
+        )
+    )
+    if prefer_src_thinking:
         dst.thinking_summary = src.thinking_summary
         dst.thinking_kind = src.thinking_kind
         dst.thinking_source = src.thinking_source
@@ -1842,9 +1849,7 @@ def _agent_turn_from_content_blocks(
         return turn
     for block in blocks:
         if isinstance(block, str):
-            clean = _sanitize_reply_text(block)
-            if clean:
-                turn.messages.append(clean)
+            _merge_agent_turn(turn, _agent_turn_from_obj(block))
             continue
         if not isinstance(block, dict):
             continue
@@ -1852,9 +1857,7 @@ def _agent_turn_from_content_blocks(
         if block_type == "text":
             text = block.get("text")
             if isinstance(text, str):
-                clean = _sanitize_reply_text(text)
-                if clean:
-                    turn.messages.append(clean)
+                _merge_agent_turn(turn, _agent_turn_from_obj(text))
             continue
         if block_type == "thinking" and not turn.thinking_summary:
             summary = block.get("thinking") or block.get("text")

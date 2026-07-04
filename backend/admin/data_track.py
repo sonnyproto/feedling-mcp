@@ -8,7 +8,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote
 
 from core.reqctx import request
 
@@ -46,7 +46,7 @@ def _data_track_qs(**updates) -> str:
     for key in (
         "admin_key", "since", "registered_since", "q", "limit", "offset", "sort",
         "dir", "view", "days", "user_id", "subsystem", "status", "trace_id",
-        "mode", "reveal",
+        "mode", "reveal", "page",
     ):
         value = request.args.get(key, "").strip()
         if value:
@@ -1334,6 +1334,14 @@ def _debug_filter_options(events: list[dict]) -> dict:
 
 def _data_track_debug_payload() -> dict:
     filters = _data_track_request_filters()
+    limit = int(filters.get("limit") or 100)
+    offset = int(filters.get("offset") or 0)
+    try:
+        page = int((request.args.get("page") or "").strip() or 0)
+    except (TypeError, ValueError):
+        page = 0
+    if page > 0:
+        offset = (page - 1) * limit
     user_filter = (request.args.get("user_id") or "").strip()
     subsystem_filter = (request.args.get("subsystem") or "").strip()
     status_filter = (request.args.get("status") or "").strip().lower()
@@ -1380,6 +1388,7 @@ def _data_track_debug_payload() -> dict:
             }
         all_events.extend(matching)
 
+    all_events = sorted(all_events, key=lambda e: float(e.get("ts") or 0), reverse=True)
     turns = _debug_trace_group_turns(all_events)
     if status_filter and status_filter != "all":
         turns = [t for t in turns if t.get("terminal_status") == status_filter]
@@ -1390,6 +1399,30 @@ def _data_track_debug_payload() -> dict:
         ]
         allowed_users = {t["user_id"] for t in turns}
         user_rows = {uid: row for uid, row in user_rows.items() if uid in allowed_users}
+
+    if mode == "timeline":
+        total = len(turns)
+        turns_out = turns[offset:offset + limit]
+        page_ids = {(t["user_id"], t["trace_id"]) for t in turns_out}
+        events_out = [
+            e for e in all_events
+            if (str(e.get("user_id") or ""), str(e.get("trace_id") or "ungrouped")) in page_ids
+        ]
+    else:
+        total = len(all_events)
+        events_out = all_events[offset:offset + limit]
+        page_ids = {(str(e.get("user_id") or ""), str(e.get("trace_id") or "ungrouped")) for e in events_out}
+        turns_out = [t for t in turns if (t["user_id"], t["trace_id"]) in page_ids]
+    pagination = {
+        "limit": limit,
+        "offset": offset,
+        "total": total,
+        "returned": len(turns_out) if mode == "timeline" else len(events_out),
+        "next_offset": offset + limit if offset + limit < total else None,
+        "prev_offset": max(0, offset - limit) if offset > 0 else None,
+        "current_page": (offset // limit) + 1 if limit else 1,
+        "total_pages": ((total + limit - 1) // limit) if limit else 1,
+    }
 
     users_out = list(user_rows.values())
     users_out.sort(key=lambda u: float(u.get("last_ts") or 0), reverse=True)
@@ -1402,6 +1435,8 @@ def _data_track_debug_payload() -> dict:
             "users_with_events": sum(1 for u in users_out if int(u.get("events") or 0) > 0),
             "events_total": len(all_events),
             "turns_total": len(turns),
+            "events_returned": len(events_out),
+            "turns_returned": len(turns_out),
             "stalled_turns": sum(1 for t in turns if t.get("terminal_status") == "stalled"),
             "error_turns": sum(1 for t in turns if t.get("terminal_status") == "error"),
         },
@@ -1415,11 +1450,13 @@ def _data_track_debug_payload() -> dict:
             "mode": mode,
             "reveal": reveal_key,
             "view": "debug",
+            "page": str(page or ""),
         },
         "options": _debug_filter_options(all_events_raw),
+        "pagination": pagination,
         "users": users_out,
-        "turns": turns,
-        "events": sorted(all_events, key=lambda e: float(e.get("ts") or 0), reverse=True),
+        "turns": turns_out,
+        "events": events_out,
     }
 
 
@@ -1949,6 +1986,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
     users = payload.get("users", [])
     turns = payload.get("turns", [])
     events = payload.get("events", [])
+    pagination = payload.get("pagination", {})
     mode = str(filters.get("mode") or "flat")
     reveal_key = str(filters.get("reveal") or "")
 
@@ -1959,7 +1997,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
         return "selected" if str(filters.get(name) or "") == value else ""
 
     def mode_href(next_mode: str) -> str:
-        return _data_track_page_href(view="debug", mode=next_mode)
+        return _data_track_page_href(view="debug", mode=next_mode, offset=0, reveal=None)
 
     def hint(text: str) -> str:
         return f"<span class='hint' title='{html.escape(text, quote=True)}'>?</span>"
@@ -1975,6 +2013,16 @@ def _render_data_track_debug_page(payload: dict) -> str:
             f"{html.escape(label)}</button>"
         )
 
+    def hidden_inputs(qs: str) -> str:
+        parts = []
+        for key, values in parse_qs(qs, keep_blank_values=False).items():
+            for value in values:
+                parts.append(
+                    f'<input type="hidden" name="{html.escape(key, quote=True)}" '
+                    f'value="{html.escape(value, quote=True)}">'
+                )
+        return "".join(parts)
+
     def event_anchor(ev: dict) -> str:
         return f"event-{_debug_event_key(ev)}"
 
@@ -1987,6 +2035,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
             mode=mode,
             user_id=ev.get("user_id") or "",
             trace_id=ev.get("trace_id") or "",
+            offset=0,
             reveal=_debug_event_key(ev),
         )
         return f"{href}#{event_anchor(ev)}"
@@ -1999,7 +2048,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
             copy_button("copy JSON", _debug_event_public_json(ev)),
         ]
         if include_open_turn:
-            href = _data_track_page_href(view="debug", mode="timeline", user_id=ev.get("user_id") or "", trace_id=ev.get("trace_id") or "")
+            href = _data_track_page_href(view="debug", mode="timeline", user_id=ev.get("user_id") or "", trace_id=ev.get("trace_id") or "", offset=0, reveal=None)
             href = f"{href}#{turn_anchor(str(ev.get('trace_id') or 'ungrouped'))}"
             buttons.append(f"<a class='mini-button' href='{html.escape(href, quote=True)}'>open turn</a>")
         buttons.append(
@@ -2028,7 +2077,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
 
     user_rows = []
     for row in users:
-        href = _data_track_page_href(view="debug", user_id=row["user_id"])
+        href = _data_track_page_href(view="debug", user_id=row["user_id"], offset=0, reveal=None)
         enabled_cls = "ok" if row.get("enabled") else "muted"
         user_rows.append(
             "<tr>"
@@ -2044,9 +2093,9 @@ def _render_data_track_debug_page(payload: dict) -> str:
     for ev in events:
         ev_status = str(ev.get("status") or "ok").lower()
         ev_cls = "bad" if ev_status in {"error", "failed"} else ("warn" if ev_status == "blocked" else "ok")
-        trace_href = _data_track_page_href(view="debug", mode="timeline", user_id=ev.get("user_id") or "", trace_id=ev.get("trace_id") or "")
+        trace_href = _data_track_page_href(view="debug", mode="timeline", user_id=ev.get("user_id") or "", trace_id=ev.get("trace_id") or "", offset=0, reveal=None)
         trace_href = f"{trace_href}#{turn_anchor(str(ev.get('trace_id') or 'ungrouped'))}"
-        user_href = _data_track_page_href(view="debug", mode=mode, user_id=ev.get("user_id") or "")
+        user_href = _data_track_page_href(view="debug", mode=mode, user_id=ev.get("user_id") or "", offset=0, reveal=None)
         flat_rows.append(
             f"<tr id='{html.escape(event_anchor(ev), quote=True)}'>"
             f"<td><span class='mono'>{html.escape(_debug_time(ev.get('ts')))}</span></td>"
@@ -2070,7 +2119,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
             ev_status = str(ev.get("status") or "")
             ev_cls = "bad" if ev_status in {"error", "failed"} else ("warn" if ev_status == "blocked" else "ok")
             rows_html.append(
-                "<div class='event-row'>"
+                f"<div class='event-row' id='{html.escape(event_anchor(ev), quote=True)}'>"
                 f"<div class='event-meta'><span class='mono'>{html.escape(_debug_time(ev.get('ts')))}</span>"
                 f"{module_badge(str(ev.get('subsystem') or ''))}"
                 f"<span class='mono'>{html.escape(str(ev.get('type') or ''))}</span>"
@@ -2100,6 +2149,11 @@ def _render_data_track_debug_page(payload: dict) -> str:
         subsystem_options.append(
             f'<option value="{html.escape(subsystem, quote=True)}" {is_selected("subsystem", subsystem)}>{html.escape(subsystem)}</option>'
         )
+    limit_options = []
+    current_limit = str(pagination.get("limit") or filters.get("limit") or 100)
+    for value in ("50", "100", "200", "500"):
+        selected = "selected" if current_limit == value else ""
+        limit_options.append(f'<option value="{value}" {selected}>{value}</option>')
 
     metrics = "".join([
         _render_metric("users with events", summary["users_with_events"]),
@@ -2108,6 +2162,51 @@ def _render_data_track_debug_page(payload: dict) -> str:
         _render_metric("stalled / error", f"{summary['stalled_turns']} / {summary['error_turns']}"),
     ])
     refresh_meta = "" if reveal_key else '<meta http-equiv="refresh" content="30">'
+
+    page_unit = "turns" if mode == "timeline" else "events"
+    total = int(pagination.get("total") or 0)
+    returned = int(pagination.get("returned") or 0)
+    offset = int(pagination.get("offset") or 0)
+    page_size = int(pagination.get("limit") or filters.get("limit") or 100)
+    current_page = int(pagination.get("current_page") or 1)
+    total_pages = max(1, int(pagination.get("total_pages") or 1))
+    start = offset + 1 if total and returned else 0
+    end = min(offset + returned, total) if total and returned else 0
+    pager_links = []
+    prev_offset = pagination.get("prev_offset")
+    next_offset = pagination.get("next_offset")
+    if total_pages > 1:
+        pager_links.append(
+            f"<a class='sort-button' href='{html.escape(_data_track_page_href(view='debug', mode=mode, offset=0, page=None, reveal=None), quote=True)}'>First</a>"
+        )
+        if prev_offset is not None:
+            pager_links.append(
+                f"<a class='sort-button' href='{html.escape(_data_track_page_href(view='debug', mode=mode, offset=prev_offset, page=None, reveal=None), quote=True)}'>Prev</a>"
+            )
+        else:
+            pager_links.append("<span class='sort-button disabled'>Prev</span>")
+        if next_offset is not None:
+            pager_links.append(
+                f"<a class='sort-button' href='{html.escape(_data_track_page_href(view='debug', mode=mode, offset=next_offset, page=None, reveal=None), quote=True)}'>Next</a>"
+            )
+        else:
+            pager_links.append("<span class='sort-button disabled'>Next</span>")
+        last_offset = max(0, (total_pages - 1) * page_size)
+        pager_links.append(
+            f"<a class='sort-button' href='{html.escape(_data_track_page_href(view='debug', mode=mode, offset=last_offset, page=None, reveal=None), quote=True)}'>Last</a>"
+        )
+    page_form_qs = _data_track_qs(view="debug", mode=mode, offset=None, page=None, reveal=None)
+    pager_html = (
+        "<div class='pager'>"
+        f"<span class='muted'>Showing {start}-{end} of {total} {page_unit}. "
+        f"Page size {html.escape(str(page_size))}.</span>"
+        f"<form class='page-jump' method='get' action='/admin/data-track'>"
+        f"{hidden_inputs(page_form_qs)}"
+        f"<span>Page</span><input name='page' value='{html.escape(str(current_page), quote=True)}' inputmode='numeric'>"
+        f"<span>/ {html.escape(str(total_pages))}</span><button type='submit'>Go</button></form>"
+        f"<div class='pager-links'>{''.join(pager_links)}</div>"
+        "</div>"
+    )
 
     flat_table = (
         "<table class='log-table'>"
@@ -2150,6 +2249,10 @@ def _render_data_track_debug_page(payload: dict) -> str:
     .modebar,.viewbar,.toolbar {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0 18px; }}
     .modebar {{ justify-content:space-between; background:#f4ece5; border:1px solid var(--line); border-radius:8px; padding:8px; }}
     .mode-left {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
+    .pager {{ display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px; margin:12px 0; }}
+    .pager-links {{ display:flex; flex-wrap:wrap; gap:8px; }}
+    .page-jump {{ display:flex; align-items:center; gap:6px; margin:0; color:var(--muted); }} .page-jump input {{ width:58px; padding:6px 7px; }}
+    .sort-button.disabled {{ color:#b5aaa2; background:#f6efe8; pointer-events:none; }}
     .sort-button,button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
     .mini-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:5px; padding:3px 7px; background:#fffdfa; color:var(--fg); font-size:12px; margin:4px 5px 0 0; cursor:pointer; }}
     .reveal-button {{ border-color:#d9b28c; color:#8a4a00; background:#fff8ed; }}
@@ -2192,6 +2295,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
     <div class="field"><label>User {hint('留空表示扫所有用户；填 user_id 时可查任意真实用户。')}</label><input name="user_id" placeholder="usr_..." value="{input_value('user_id')}"></div>
     <div class="field"><label>Trace {hint('一次聊天/任务的链路 id。已知 trace_id 时可直接定位。')}</label><input name="trace_id" placeholder="trace_id" value="{input_value('trace_id')}"></div>
     <div class="field"><label>Module {hint('按模块收窄：route=入口，context=上下文，agent=模型/回复，memory=记忆。')}</label><select name="subsystem">{''.join(subsystem_options)}</select></div>
+    <div class="field"><label>Page size {hint('每页渲染多少条。全局 debug 默认分页，避免一次打开全量日志。')}</label><select name="limit">{''.join(limit_options)}</select></div>
     <div class="field"><label>Status {hint('这里按整轮 turn 状态筛选：stalled 表示 start 后没有 done/error。')}</label><select name="status">
       <option value="" {is_selected("status", "")}>all status</option>
       <option value="ok" {is_selected("status", "ok")}>ok</option>
@@ -2209,7 +2313,9 @@ def _render_data_track_debug_page(payload: dict) -> str:
     <tbody>{''.join(user_rows) if user_rows else "<tr><td colspan='4' class='muted'>No debug events in the current filter.</td></tr>"}</tbody>
   </table>
   <h2>{'Flat logs' if mode == 'flat' else 'Turns'} {hint('Flat 是时间倒序事件流；Timeline 是按 trace_id 分组后的完整链路。')}</h2>
+  {pager_html}
   {flat_table if mode == 'flat' else timeline_view}
+  {pager_html}
 </main>
 <script>
   document.addEventListener('click', async (event) => {{
