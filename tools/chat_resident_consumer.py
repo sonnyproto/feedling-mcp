@@ -303,7 +303,10 @@ SCREEN_CONTEXT_INCLUDE_IMAGE = _env_bool("SCREEN_CONTEXT_INCLUDE_IMAGE", True)
 FOREGROUND_CHAT_CONTEXT_MODE = os.environ.get(
     "FEEDLING_FOREGROUND_CHAT_CONTEXT", "auto"
 ).strip().lower()
-FOREGROUND_CHAT_CONTEXT_LIMIT = int(os.environ.get("FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT", "8"))
+# 50 messages ≈ 25 full rounds; this default sits exactly at the clamp in
+# _recent_chat_context_for_foreground — raise both together or the extra is
+# silently dropped.
+FOREGROUND_CHAT_CONTEXT_LIMIT = int(os.environ.get("FEEDLING_FOREGROUND_CHAT_CONTEXT_LIMIT", "50"))
 FOREGROUND_CHAT_CONTEXT_HEADER = os.environ.get(
     "FEEDLING_FOREGROUND_CHAT_CONTEXT_HEADER",
     "[最近对话记录 — 仅供你保持连续；最后那条用户消息才是此刻要回应的]",

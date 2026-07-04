@@ -4158,6 +4158,30 @@ def test_foreground_message_prepends_recent_transcript(monkeypatch):
     assert out.index("今天北京天气") < out.index("那要穿外套吗")
 
 
+def test_foreground_transcript_default_keeps_50_prior_messages(monkeypatch):
+    # Default limit is 50 messages (~25 full rounds), sitting exactly at the
+    # clamp in _recent_chat_context_for_foreground — raising it further needs
+    # both the env default AND that cap changed together.
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
+    monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
+    now = time.time()
+    hist = [
+        {
+            "role": "user" if i % 2 else "agent",
+            "content": f"历史消息-{i:02d}",
+            "ts": now - (70 - i),
+        }
+        for i in range(1, 61)
+    ] + [{"role": "user", "content": "当前这句", "ts": now}]
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: list(hist))
+
+    out = crc._foreground_agent_message("当前这句", current_ts=now)
+
+    assert "历史消息-60" in out  # newest prior message injected
+    assert "历史消息-11" in out  # 50th-from-last prior message still included
+    assert "历史消息-10" not in out  # beyond the 50-message window
+
+
 def test_foreground_message_no_decrypt_source_returns_plain_content(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
