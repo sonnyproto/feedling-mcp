@@ -112,3 +112,31 @@ def test_debug_page_renders_nav_filters_and_plaintext_excerpt(monkeypatch):
     assert "agent.reply" in html
     assert "visible beta reply" in html
     assert "Filter debug logs" in html
+    assert "Flat logs" in html
+    assert "Timeline" in html
+    assert "<select name=\"subsystem\">" in html
+    assert "trace_id 时可直接定位" in html
+
+
+def test_debug_page_can_render_timeline_mode(monkeypatch):
+    with registry._users_lock:
+        registry._users[:] = [{"user_id": "user_a", "principal_id": "p_a"}]
+
+    blobs = {
+        ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
+        ("user_a", "v1_flow_trace"): {
+            "events": [
+                _event(100, "user_a", "route.chat.message", trace_id="t-reply"),
+                _event(101, "user_a", "agent.model.call.start", trace_id="t-reply"),
+                _event(102, "user_a", "agent.model.call.done", trace_id="t-reply", dur_ms=900),
+            ]
+        },
+    }
+    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+
+    html = admin_core.page_html("view=debug&mode=timeline&user_id=user_a")
+
+    assert "Turns" in html
+    assert "agent.model.call.start" in html
+    assert "agent.model.call.done" in html
+    assert "900ms" in html

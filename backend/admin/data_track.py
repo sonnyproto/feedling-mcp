@@ -44,6 +44,7 @@ def _data_track_qs(**updates) -> str:
     for key in (
         "admin_key", "since", "registered_since", "q", "limit", "offset", "sort",
         "dir", "view", "days", "user_id", "subsystem", "status", "trace_id",
+        "mode",
     ):
         value = request.args.get(key, "").strip()
         if value:
@@ -1247,12 +1248,31 @@ def _debug_trace_search_text(ev: dict) -> str:
     return " ".join(str(p or "") for p in parts).lower()
 
 
+def _debug_filter_options(events: list[dict]) -> dict:
+    """Build stable filter choices from the current ring-buffer sample."""
+    subsystems = sorted({str(e.get("subsystem") or "").strip() for e in events if str(e.get("subsystem") or "").strip()})
+    statuses = sorted({str(e.get("status") or "").strip().lower() for e in events if str(e.get("status") or "").strip()})
+    preferred_subsystems = ["route", "context", "agent", "memory", "debug_trace"]
+    ordered_subsystems = [s for s in preferred_subsystems if s in subsystems]
+    ordered_subsystems.extend([s for s in subsystems if s not in ordered_subsystems])
+    preferred_statuses = ["ok", "error", "failed", "blocked", "stalled"]
+    ordered_statuses = [s for s in preferred_statuses if s in statuses]
+    ordered_statuses.extend([s for s in statuses if s not in ordered_statuses])
+    return {
+        "subsystems": ordered_subsystems,
+        "statuses": ordered_statuses,
+    }
+
+
 def _data_track_debug_payload() -> dict:
     filters = _data_track_request_filters()
     user_filter = (request.args.get("user_id") or "").strip()
     subsystem_filter = (request.args.get("subsystem") or "").strip()
     status_filter = (request.args.get("status") or "").strip().lower()
     trace_filter = (request.args.get("trace_id") or "").strip()
+    mode = (request.args.get("mode") or "flat").strip().lower()
+    if mode not in {"flat", "timeline"}:
+        mode = "flat"
     q = str(filters.get("q") or "").strip().lower()
     since_epoch = float(filters.get("since_epoch") or 0)
 
@@ -1261,11 +1281,13 @@ def _data_track_debug_payload() -> dict:
     if user_filter:
         users = [u for u in users if str(u.get("user_id") or "") == user_filter]
 
+    all_events_raw: list[dict] = []
     all_events: list[dict] = []
     user_rows: dict[str, dict] = {}
     for user in users:
         uid = str(user.get("user_id") or "")
         enabled, events = _debug_trace_events_for_user(uid)
+        all_events_raw.extend(events)
         matching = []
         for ev in events:
             if since_epoch and float(ev.get("ts") or 0) < since_epoch:
@@ -1321,8 +1343,10 @@ def _data_track_debug_payload() -> dict:
             "subsystem": subsystem_filter,
             "status": status_filter,
             "trace_id": trace_filter,
+            "mode": mode,
             "view": "debug",
         },
+        "options": _debug_filter_options(all_events_raw),
         "users": users_out,
         "turns": turns,
         "events": sorted(all_events, key=lambda e: float(e.get("ts") or 0), reverse=True),
@@ -1851,11 +1875,39 @@ def _debug_time(ts) -> str:
 def _render_data_track_debug_page(payload: dict) -> str:
     summary = payload["summary"]
     filters = payload.get("filters", {})
+    options = payload.get("options", {})
     users = payload.get("users", [])
     turns = payload.get("turns", [])
+    events = payload.get("events", [])
+    mode = str(filters.get("mode") or "flat")
 
     def input_value(name: str) -> str:
         return html.escape(str(filters.get(name) or ""), quote=True)
+
+    def is_selected(name: str, value: str) -> str:
+        return "selected" if str(filters.get(name) or "") == value else ""
+
+    def mode_href(next_mode: str) -> str:
+        return _data_track_page_href(view="debug", mode=next_mode)
+
+    def hint(text: str) -> str:
+        return f"<span class='hint' title='{html.escape(text, quote=True)}'>?</span>"
+
+    def module_badge(value: str) -> str:
+        label = html.escape(value or "unknown")
+        return f"<span class='module module-{html.escape((value or 'unknown').replace('.', '-'))}'>{label}</span>"
+
+    def event_detail_block(ev: dict) -> str:
+        detail = _debug_json(ev.get("detail"))
+        excerpt = _debug_json(ev.get("content_excerpt"))
+        if not detail and not excerpt:
+            return ""
+        return (
+            "<details class='event-detail'><summary>detail / 明文</summary>"
+            f"{'<h4>detail</h4><pre>' + html.escape(detail) + '</pre>' if detail else ''}"
+            f"{'<h4>content_excerpt</h4><pre>' + html.escape(excerpt) + '</pre>' if excerpt else ''}"
+            "</details>"
+        )
 
     user_rows = []
     for row in users:
@@ -1871,6 +1923,25 @@ def _render_data_track_debug_page(payload: dict) -> str:
             "</tr>"
         )
 
+    flat_rows = []
+    for ev in events:
+        ev_status = str(ev.get("status") or "ok").lower()
+        ev_cls = "bad" if ev_status in {"error", "failed"} else ("warn" if ev_status == "blocked" else "ok")
+        trace_href = _data_track_page_href(view="debug", mode="timeline", user_id=ev.get("user_id") or "", trace_id=ev.get("trace_id") or "")
+        user_href = _data_track_page_href(view="debug", mode=mode, user_id=ev.get("user_id") or "")
+        flat_rows.append(
+            "<tr>"
+            f"<td><span class='mono'>{html.escape(_debug_time(ev.get('ts')))}</span></td>"
+            f"<td><a class='mono' href='{html.escape(user_href, quote=True)}'>{html.escape(str(ev.get('user_id') or ''))}</a></td>"
+            f"<td><a class='mono trace-link' href='{html.escape(trace_href, quote=True)}'>{html.escape(str(ev.get('trace_id') or 'ungrouped'))}</a></td>"
+            f"<td>{module_badge(str(ev.get('subsystem') or ''))}</td>"
+            f"<td><span class='mono'>{html.escape(str(ev.get('type') or ''))}</span></td>"
+            f"<td><span class='pill {ev_cls}'>{html.escape(ev_status)}</span></td>"
+            f"<td>{html.escape(_debug_ms(ev.get('dur_ms')))}</td>"
+            f"<td>{html.escape(str(ev.get('explain') or ev.get('summary') or ''))}{event_detail_block(ev)}</td>"
+            "</tr>"
+        )
+
     turn_cards = []
     for turn in turns:
         status = str(turn.get("terminal_status") or "ok")
@@ -1878,27 +1949,17 @@ def _render_data_track_debug_page(payload: dict) -> str:
         status_cls = "warn" if status in {"stalled", "blocked"} else ("bad" if status == "error" else "ok")
         rows_html = []
         for ev in turn.get("rows") or []:
-            detail = _debug_json(ev.get("detail"))
-            excerpt = _debug_json(ev.get("content_excerpt"))
-            detail_block = ""
-            if detail or excerpt:
-                detail_block = (
-                    "<details class='event-detail'><summary>detail / 明文</summary>"
-                    f"{'<h4>detail</h4><pre>' + html.escape(detail) + '</pre>' if detail else ''}"
-                    f"{'<h4>content_excerpt</h4><pre>' + html.escape(excerpt) + '</pre>' if excerpt else ''}"
-                    "</details>"
-                )
             ev_status = str(ev.get("status") or "")
             ev_cls = "bad" if ev_status in {"error", "failed"} else ("warn" if ev_status == "blocked" else "ok")
             rows_html.append(
                 "<div class='event-row'>"
                 f"<div class='event-meta'><span class='mono'>{html.escape(_debug_time(ev.get('ts')))}</span>"
-                f"<span class='pill'>{html.escape(str(ev.get('subsystem') or ''))}</span>"
+                f"{module_badge(str(ev.get('subsystem') or ''))}"
                 f"<span class='mono'>{html.escape(str(ev.get('type') or ''))}</span>"
                 f"<span class='pill {ev_cls}'>{html.escape(ev_status or 'ok')}</span>"
                 f"<span class='muted'>{html.escape(_debug_ms(ev.get('dur_ms')))}</span></div>"
                 f"<div>{html.escape(str(ev.get('explain') or ev.get('summary') or ''))}</div>"
-                f"{detail_block}"
+                f"{event_detail_block(ev)}"
                 "</div>"
             )
         stalled_note = (
@@ -1915,12 +1976,40 @@ def _render_data_track_debug_page(payload: dict) -> str:
             "</section>"
         )
 
+    subsystem_options = ['<option value="">all modules</option>']
+    for subsystem in options.get("subsystems") or ["route", "context", "agent", "memory", "debug_trace"]:
+        subsystem_options.append(
+            f'<option value="{html.escape(subsystem, quote=True)}" {is_selected("subsystem", subsystem)}>{html.escape(subsystem)}</option>'
+        )
+
     metrics = "".join([
         _render_metric("users with events", summary["users_with_events"]),
         _render_metric("events", summary["events_total"]),
         _render_metric("turns", summary["turns_total"]),
         _render_metric("stalled / error", f"{summary['stalled_turns']} / {summary['error_turns']}"),
     ])
+
+    flat_table = (
+        "<table class='log-table'>"
+        "<thead><tr>"
+        f"<th>Time {hint('事件发生时间。当前显示本机时区的时分秒，用来快速看先后顺序。')}</th>"
+        f"<th>User {hint('真实 user_id。点它会只看这个用户的 debug 事件。')}</th>"
+        f"<th>Trace {hint('一次聊天或一次任务链路的 trace_id。点它会切到 timeline 看完整步骤。')}</th>"
+        f"<th>Module {hint('事件来源模块：route 是入口，context 是上下文，agent 是模型调用/回复，memory 是记忆写入。')}</th>"
+        f"<th>Type {hint('具体事件类型，比如 agent.model.call.start/done 或 agent.reply。')}</th>"
+        f"<th>Status {hint('单条事件自己的状态；turn 顶部的 stalled/error 是整轮链路诊断结果。')}</th>"
+        f"<th>Cost {hint('这一步上报的耗时。不是每个事件都有。')}</th>"
+        f"<th>Explain / detail {hint('explain 是人读摘要；展开 detail / 明文 可以看 prompt、reply、tokens 等 excerpt。')}</th>"
+        "</tr></thead>"
+        "<tbody>"
+        + ("".join(flat_rows) if flat_rows else "<tr><td colspan='8' class='muted'>No events match the current filter.</td></tr>")
+        + "</tbody>"
+        "</table>"
+    )
+
+    timeline_view = (
+        "".join(turn_cards) if turn_cards else "<div class='muted'>No turns match the current filter.</div>"
+    )
 
     return f"""<!doctype html>
 <html>
@@ -1930,7 +2019,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
   <meta http-equiv="refresh" content="30">
   <title>Feedling Debug · Data Track</title>
   <style>
-    :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
+    :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; --ink:#263238; }}
     body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
     main {{ max-width:1280px; margin:0 auto; padding:28px 24px 48px; }}
     h1 {{ font-size:26px; margin:0 0 4px; }} h2 {{ font-size:16px; margin:28px 0 12px; }} h3 {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; font-size:15px; margin:0 0 10px; }}
@@ -1938,13 +2027,19 @@ def _render_data_track_debug_page(payload: dict) -> str:
     .metrics {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:22px 0; }}
     .metric,.turn {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
     .metric-value {{ font-size:24px; font-weight:700; }} .metric-label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }}
-    .viewbar,.toolbar {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0 18px; }}
+    .modebar,.viewbar,.toolbar {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0 18px; }}
+    .modebar {{ justify-content:space-between; background:#f4ece5; border:1px solid var(--line); border-radius:8px; padding:8px; }}
+    .mode-left {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
     .sort-button,button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
     .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
     input,select {{ border:1px solid var(--line); border-radius:6px; padding:8px 9px; background:white; color:var(--fg); }}
+    .field {{ display:flex; flex-direction:column; gap:4px; min-width:150px; }} .field label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }}
     table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
     th,td {{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }} th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }}
     .pill {{ display:inline-flex; border-radius:999px; padding:2px 8px; font-size:12px; background:#efe7df; color:var(--muted); }} .pill.ok,.ok {{ color:var(--ok); background:#e7f3ed; }} .pill.warn,.warn {{ color:var(--warn); background:#fff1db; }} .pill.bad,.bad {{ color:var(--bad); background:#fff1ed; }}
+    .hint {{ display:inline-flex; align-items:center; justify-content:center; width:16px; height:16px; border-radius:50%; margin-left:4px; background:#eadfd4; color:var(--muted); font-size:11px; font-weight:700; cursor:help; text-transform:none; letter-spacing:0; }}
+    .module {{ display:inline-flex; border-radius:5px; padding:2px 7px; font-size:12px; background:#edf0ef; color:var(--ink); }} .module-route {{ background:#e8f1ff; color:#24538a; }} .module-context {{ background:#edf7e8; color:#3b6b2d; }} .module-agent {{ background:#fff0e3; color:#9a4d00; }} .module-memory {{ background:#f0eaff; color:#5b3a91; }} .module-debug_trace {{ background:#eef0f2; color:#52616b; }}
+    .log-table td:nth-child(8) {{ min-width:280px; }} .trace-link {{ color:#6b3fb0; }}
     .turn {{ margin:10px 0; }} .event-row {{ border-top:1px solid var(--line); padding:9px 0; }} .event-row:first-of-type {{ border-top:0; }}
     .event-meta {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:4px; }} .event-detail summary {{ color:var(--accent); cursor:pointer; margin-top:5px; }}
     pre {{ white-space:pre-wrap; word-break:break-word; background:#fff7f0; border:1px solid var(--line); border-radius:6px; padding:10px; max-height:360px; overflow:auto; }}
@@ -1957,27 +2052,40 @@ def _render_data_track_debug_page(payload: dict) -> str:
   <div class="muted">Admin-only beta debug view. Reads existing per-user v1_flow_trace ring buffers; no instrumentation writes here. Generated {html.escape(summary["generated_at"])}.</div>
   {_render_data_track_view_nav("debug")}
   <section class="metrics">{metrics}</section>
-  <h2>Filter debug logs</h2>
+  <div class="modebar">
+    <div class="mode-left">
+      <a class="sort-button {'active' if mode == 'flat' else ''}" href="{html.escape(mode_href('flat'), quote=True)}">Flat logs</a>
+      <a class="sort-button {'active' if mode == 'timeline' else ''}" href="{html.escape(mode_href('timeline'), quote=True)}">Timeline</a>
+      <span class="muted">Flat 用来扫全局异常；Timeline 用来看一次聊天怎么走完。</span>
+    </div>
+    <span class="muted">{hint('页面每 30 秒自动刷新。所有数据来自已有 v1_flow_trace ring buffer，不会写新埋点。')} auto refresh</span>
+  </div>
+  <h2>Filter debug logs {hint('先按 user 或 status 收窄，再用 q 搜 prompt/reply/tokens/explain；点 trace 可进入单轮链路。')}</h2>
   <form class="toolbar" method="get" action="/admin/data-track">
     <input type="hidden" name="view" value="debug">
+    <input type="hidden" name="mode" value="{html.escape(mode, quote=True)}">
     <input name="admin_key" type="hidden" value="{html.escape(request.args.get('admin_key', ''), quote=True)}">
-    <input name="user_id" placeholder="user_id" value="{input_value('user_id')}">
-    <input name="trace_id" placeholder="trace_id" value="{input_value('trace_id')}">
-    <input name="subsystem" placeholder="module: agent / route / memory" value="{input_value('subsystem')}">
-    <select name="status">
-      {''.join(f'<option value="{s}" {"selected" if input_value("status") == s else ""}>{s or "all status"}</option>' for s in ["", "ok", "error", "blocked", "stalled"])}
-    </select>
-    <input name="since" placeholder="since ISO / epoch" value="{input_value('since')}">
-    <input name="q" placeholder="type / explain / detail / 明文" value="{input_value('q')}">
+    <div class="field"><label>User {hint('留空表示扫所有用户；填 user_id 时可查任意真实用户。')}</label><input name="user_id" placeholder="usr_..." value="{input_value('user_id')}"></div>
+    <div class="field"><label>Trace {hint('一次聊天/任务的链路 id。已知 trace_id 时可直接定位。')}</label><input name="trace_id" placeholder="trace_id" value="{input_value('trace_id')}"></div>
+    <div class="field"><label>Module {hint('按模块收窄：route=入口，context=上下文，agent=模型/回复，memory=记忆。')}</label><select name="subsystem">{''.join(subsystem_options)}</select></div>
+    <div class="field"><label>Status {hint('这里按整轮 turn 状态筛选：stalled 表示 start 后没有 done/error。')}</label><select name="status">
+      <option value="" {is_selected("status", "")}>all status</option>
+      <option value="ok" {is_selected("status", "ok")}>ok</option>
+      <option value="error" {is_selected("status", "error")}>error</option>
+      <option value="blocked" {is_selected("status", "blocked")}>blocked</option>
+      <option value="stalled" {is_selected("status", "stalled")}>stalled</option>
+    </select></div>
+    <div class="field"><label>Since {hint('支持 ISO 时间或 epoch；空着就是 ring buffer 里全部。')}</label><input name="since" placeholder="2026-07-04T00:00:00" value="{input_value('since')}"></div>
+    <div class="field"><label>Search {hint('会搜 type/explain/detail/content_excerpt，能查明文 excerpt。')}</label><input name="q" placeholder="prompt / reply / token / error" value="{input_value('q')}"></div>
     <button type="submit">Search</button>
   </form>
-  <h2>Users with debug events</h2>
+  <h2>Users with debug events {hint('当前筛选条件下，有 debug 事件或开启 trace 的用户。')}</h2>
   <table>
     <thead><tr><th>User</th><th>Events</th><th>Trace</th><th>Last event</th></tr></thead>
     <tbody>{''.join(user_rows) if user_rows else "<tr><td colspan='4' class='muted'>No debug events in the current filter.</td></tr>"}</tbody>
   </table>
-  <h2>Turns</h2>
-  {''.join(turn_cards) if turn_cards else "<div class='muted'>No turns match the current filter.</div>"}
+  <h2>{'Flat logs' if mode == 'flat' else 'Turns'} {hint('Flat 是时间倒序事件流；Timeline 是按 trace_id 分组后的完整链路。')}</h2>
+  {flat_table if mode == 'flat' else timeline_view}
 </main>
 </body>
 </html>"""
