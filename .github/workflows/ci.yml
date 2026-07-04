@@ -895,7 +895,6 @@ jobs:
       # §3 post-deploy canary (test). Inert until TEST_MAIN_ENCLAVE_URL is set.
       - name: Post-deploy canary round-trip (test)
         if: ${{ vars.TEST_MAIN_ENCLAVE_URL != '' }}
-        continue-on-error: true
         env:
           FEEDLING_API_URL:     ${{ vars.TEST_API_URL || 'https://test-api.feedling.app' }}
           FEEDLING_ENCLAVE_URL: ${{ vars.TEST_MAIN_ENCLAVE_URL }}
