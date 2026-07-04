@@ -55,6 +55,11 @@ _IO_CLI_VERBS = (
     # the prompt says it's available (prompt/allowlist consistency, cutover gate 5).
     "photo-recent",
     "photo-read",
+    # chat-image pulls a past chat image by id — advertised by the consumer's
+    # recent-chat placeholder AND documented in the prompt, so it MUST be granted
+    # here too, or claude's acceptEdits mode denies it ("requires approval") and the
+    # agent loops "waiting for permission approval" instead of showing the image.
+    "chat-image",
 )
 # Host-side resident sessions rotate at this many turns (vs the shared consumer
 # default of 40) so the persona file re-grounds voice more often within a long

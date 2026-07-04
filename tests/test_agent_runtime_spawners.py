@@ -289,6 +289,19 @@ def test_default_claude_cmd_grants_io_cli_tools_and_loads_prompt():
     assert cmd.endswith("-p {message}")
 
 
+def test_default_claude_cmd_grants_chat_image():
+    # chat-image is documented in agent_tools_prompt.md AND advertised by the
+    # consumer's history placeholder (`io_cli chat-image --id <id>`). Without it in
+    # the allowlist, claude's --allowed-tools blocks the call in the non-interactive
+    # acceptEdits mode ("This command requires approval") — the agent then loops and
+    # tells the user "waiting for permission approval" instead of showing the image.
+    # (Live regression on usr_6491814…: proactive turn ran chat-image, got denied.)
+    for entry in ({"api_key": "fk", "provider_key": "sk-ant"},
+                  {"api_key": "fk", "provider_key": "sk-ant", "model": "deepseek-reasoner"}):
+        env = spawners.consumer_env({}, entry, user_id="u", home="/agent-data/users/u")
+        assert "io_cli.py chat-image" in env["AGENT_CLI_CMD"], entry
+
+
 def test_default_claude_cmd_grants_image_read():
     env = spawners.consumer_env(
         {}, {"api_key": "fk", "provider_key": "sk-ant"},
