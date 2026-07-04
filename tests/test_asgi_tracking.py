@@ -30,10 +30,28 @@ from core import config as core_config  # noqa: E402
 from core import store as core_store  # noqa: E402
 from tracking import routes_asgi as tracking_routes_asgi  # noqa: E402
 
-# Register the tracking router onto the shared ASGI app once (idempotent guard —
-# asgi_app._ASGI_PACKAGES does not include tracking, and this slice cannot edit
-# that assembly file).
-if not any(getattr(r, "path", None) == "/v1/track/event" for r in asgi_app.app.routes):
+# Register the tracking router onto the shared ASGI app once (idempotent guard).
+# fastapi 0.139 / starlette 1.3 include_router is lazy: app.routes holds
+# ``_IncludedRouter`` proxies with no ``.path``, so the guard must walk through
+# ``original_router`` — a flat ``r.path`` scan never sees the already-assembled
+# route and silently double-registers.
+
+
+def _app_has_route(app, path: str) -> bool:
+    def walk(routes) -> bool:
+        for r in routes:
+            original = getattr(r, "original_router", None)
+            if original is not None:
+                if walk(original.routes):
+                    return True
+            elif getattr(r, "path", None) == path:
+                return True
+        return False
+
+    return walk(app.routes)
+
+
+if not _app_has_route(asgi_app.app, "/v1/track/event"):
     tracking_routes_asgi.register_asgi(asgi_app.app)
 
 

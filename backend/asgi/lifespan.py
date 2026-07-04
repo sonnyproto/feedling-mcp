@@ -95,6 +95,17 @@ async def lifespan(app):
 
     await threadpool.run_db(accounts_registry.load_users)
 
+    # (4b) Wire core.envelope's user-public-key lookup — mirrors app.py:412.
+    #      `core.envelope.get_user_public_key` ships as a RuntimeError stub so
+    #      core does not import accounts; the assembly layer must inject the real
+    #      lookup. Missing this, every server-side shared-envelope build in the
+    #      main-backend process (e.g. /v1/model_api/chat/send, genesis
+    #      persona_backfill via core.envelope._build_shared_envelope_for_store)
+    #      raises "get_user_public_key not wired by assembly layer" → 500.
+    from core import envelope as core_envelope
+
+    core_envelope.get_user_public_key = accounts_registry._get_user_public_key
+
     # (5) Cross-worker wake bus — always on (required for poll wakes). Its
     #     "users" handler keeps the registry fresh on later cross-process writes.
     _start_wake_bus()

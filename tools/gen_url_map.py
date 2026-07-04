@@ -30,6 +30,7 @@ Usage:
 If OUT_FILE is omitted the snapshot goes to stdout.
 """
 
+import copy
 import os
 import sys
 import uuid
@@ -79,6 +80,36 @@ def _route_owner(endpoint) -> str:
     return module.split(".", 1)[0]
 
 
+def _flatten_routes(routes, prefix=""):
+    """Depth-first expansion of the route table.
+
+    fastapi 0.139 / starlette 1.3 made ``include_router`` lazy: ``app.routes``
+    holds ``_IncludedRouter`` proxies (carrying ``original_router`` +
+    ``include_context``) instead of flattened ``Route`` objects, so a plain
+    isinstance walk saw ZERO routes and the drift snapshot went silently empty.
+    Recurse through both the lazy proxies (new) and plain routers (old) so the
+    snapshot works on either version.
+    """
+    from starlette.routing import BaseRoute, Router
+
+    for route in routes:
+        original = getattr(route, "original_router", None)
+        if original is not None:  # starlette 1.3 lazy include proxy
+            ctx = getattr(route, "include_context", None)
+            sub_prefix = prefix + (getattr(ctx, "prefix", "") or "")
+            yield from _flatten_routes(original.routes, sub_prefix)
+        elif isinstance(route, Router) and not isinstance(route, BaseRoute):
+            # Pre-1.3 nested bare Router/APIRouter (NOT a Mount — Mounts are
+            # BaseRoutes and stay pass-through so _iter_routes filters them).
+            yield from _flatten_routes(route.routes, prefix + (getattr(route, "prefix", "") or ""))
+        elif prefix and hasattr(route, "path"):
+            clone = copy.copy(route)
+            clone.path = prefix + route.path
+            yield clone
+        else:
+            yield route
+
+
 def _iter_routes(asgi_app_obj):
     from starlette.routing import Route, WebSocketRoute
 
@@ -86,7 +117,7 @@ def _iter_routes(asgi_app_obj):
         methods = sorted(getattr(route, "methods", None) or [])
         return (getattr(route, "path", ""), methods)
 
-    for route in sorted(asgi_app_obj.routes, key=sort_key):
+    for route in sorted(_flatten_routes(asgi_app_obj.routes), key=sort_key):
         endpoint = getattr(route, "endpoint", None)
         if isinstance(route, WebSocketRoute):
             yield {

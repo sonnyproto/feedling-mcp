@@ -38,6 +38,12 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 uvicorn-worker>=0.3
 anyio>=4
+# Required by Starlette for multipart/urlencoded form parsing (`await
+# request.form()` / UploadFile). Flask parsed forms natively, so this only
+# surfaced under ASGI: without it /v1/diagnostics/logs (iOS log upload),
+# /v1/onboarding/archive, and form-encoded /v1/proactive/decisions/{id}/review
+# raise "python-multipart library must be installed" → 500.
+python-multipart>=0.0.9
 
 # Phase 1 (enclave) deps — see backend/enclave_app.py
 PyNaCl>=1.5.0

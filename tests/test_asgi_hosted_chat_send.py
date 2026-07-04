@@ -40,8 +40,27 @@ from hosted import config_store as hosted_config_store  # noqa: E402
 
 # Mount the hosted send router onto the shared ASGI app if a sibling agent's
 # registration (asgi_app._ASGI_PACKAGES) has not already added it. Idempotent:
-# never double-registers the same path.
-if not any(getattr(r, "path", None) == "/v1/model_api/chat/send" for r in asgi_app.app.routes):
+# never double-registers the same path. fastapi 0.139 / starlette 1.3
+# include_router is lazy: app.routes holds ``_IncludedRouter`` proxies with no
+# ``.path``, so the guard must walk through ``original_router`` — a flat
+# ``r.path`` scan never sees the already-assembled route and double-registers.
+
+
+def _app_has_route(app, path: str) -> bool:
+    def walk(routes) -> bool:
+        for r in routes:
+            original = getattr(r, "original_router", None)
+            if original is not None:
+                if walk(original.routes):
+                    return True
+            elif getattr(r, "path", None) == path:
+                return True
+        return False
+
+    return walk(app.routes)
+
+
+if not _app_has_route(asgi_app.app, "/v1/model_api/chat/send"):
     chat_routes_asgi.register_asgi(asgi_app.app)
 
 

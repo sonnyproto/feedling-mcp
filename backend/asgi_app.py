@@ -27,6 +27,7 @@ from __future__ import annotations
 import importlib
 
 from fastapi import FastAPI
+from starlette.middleware.gzip import GZipMiddleware
 
 from asgi import health, middleware
 from asgi.lifespan import lifespan
@@ -63,6 +64,14 @@ _ASGI_PACKAGES = (
 # migrated routes — nothing outside the url_map ledger, which keeps the
 # post-cutover 404 monitoring (plan §15.1) meaningful.
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+
+# gzip when the client sends Accept-Encoding: gzip — the ASGI heir of Flask's
+# Compress(app). CVM egress is ~30-50 KB/s and large payloads (decrypt-with-image
+# shipped 470 KB of JSON) get a 3-5x latency win from compression. minimum_size
+# mirrors flask-compress's 500-byte default. Added BEFORE the access log so the
+# log middleware wraps it and records the final on-the-wire Content-Length /
+# Content-Encoding (starlette: last add_middleware = outermost).
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # Outermost: structured access log + ?key= redaction + cancelled-request lines.
 app.add_middleware(middleware.AccessLogMiddleware)
