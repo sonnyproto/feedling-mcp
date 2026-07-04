@@ -1,6 +1,7 @@
 """Admin data-track: per-user stats, DAU, HTML pages, store evict."""
 
 import json
+import hashlib
 import os
 import re
 import threading
@@ -44,7 +45,7 @@ def _data_track_qs(**updates) -> str:
     for key in (
         "admin_key", "since", "registered_since", "q", "limit", "offset", "sort",
         "dir", "view", "days", "user_id", "subsystem", "status", "trace_id",
-        "mode",
+        "mode", "reveal",
     ):
         value = request.args.get(key, "").strip()
         if value:
@@ -1248,6 +1249,65 @@ def _debug_trace_search_text(ev: dict) -> str:
     return " ".join(str(p or "") for p in parts).lower()
 
 
+def _debug_event_key(ev: dict) -> str:
+    try:
+        ts = f"{float(ev.get('ts') or 0):.6f}"
+    except (TypeError, ValueError):
+        ts = str(ev.get("ts") or "")
+    raw = "|".join([
+        str(ev.get("user_id") or ""),
+        str(ev.get("trace_id") or ""),
+        ts,
+        str(ev.get("type") or ""),
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _debug_redact_value(value, *, key: str = ""):
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        safe_string_keys = {"model", "provider", "subsystem", "type", "status", "route", "stage", "actor"}
+        if key in safe_string_keys:
+            return value
+        return f"<redacted string len={len(value)}>"
+    if isinstance(value, list):
+        return [_debug_redact_value(v) for v in value[:20]] + ([f"<redacted {len(value) - 20} more items>"] if len(value) > 20 else [])
+    if isinstance(value, dict):
+        return {str(k): _debug_redact_value(v, key=str(k)) for k, v in value.items()}
+    return f"<redacted {type(value).__name__}>"
+
+
+def _debug_content_summary(value) -> dict:
+    if not isinstance(value, dict):
+        return {"has_plaintext": bool(value), "shape": type(value).__name__}
+    out = {}
+    for key, item in value.items():
+        if isinstance(item, str):
+            out[str(key)] = {"redacted": True, "chars": len(item)}
+        elif isinstance(item, (list, dict)):
+            out[str(key)] = {"redacted": True, "shape": type(item).__name__, "items": len(item)}
+        else:
+            out[str(key)] = _debug_redact_value(item, key=str(key))
+    return out
+
+
+def _debug_event_public_json(ev: dict) -> dict:
+    return {
+        "ts": ev.get("ts"),
+        "user_id": ev.get("user_id"),
+        "trace_id": ev.get("trace_id"),
+        "subsystem": ev.get("subsystem"),
+        "type": ev.get("type"),
+        "status": ev.get("status"),
+        "dur_ms": ev.get("dur_ms"),
+        "summary": ev.get("summary"),
+        "explain": ev.get("explain"),
+        "detail": _debug_redact_value(ev.get("detail") or {}),
+        "content_excerpt": _debug_content_summary(ev.get("content_excerpt") or {}),
+    }
+
+
 def _debug_filter_options(events: list[dict]) -> dict:
     """Build stable filter choices from the current ring-buffer sample."""
     subsystems = sorted({str(e.get("subsystem") or "").strip() for e in events if str(e.get("subsystem") or "").strip()})
@@ -1270,6 +1330,7 @@ def _data_track_debug_payload() -> dict:
     subsystem_filter = (request.args.get("subsystem") or "").strip()
     status_filter = (request.args.get("status") or "").strip().lower()
     trace_filter = (request.args.get("trace_id") or "").strip()
+    reveal_key = (request.args.get("reveal") or "").strip()
     mode = (request.args.get("mode") or "flat").strip().lower()
     if mode not in {"flat", "timeline"}:
         mode = "flat"
@@ -1344,6 +1405,7 @@ def _data_track_debug_payload() -> dict:
             "status": status_filter,
             "trace_id": trace_filter,
             "mode": mode,
+            "reveal": reveal_key,
             "view": "debug",
         },
         "options": _debug_filter_options(all_events_raw),
@@ -1880,6 +1942,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
     turns = payload.get("turns", [])
     events = payload.get("events", [])
     mode = str(filters.get("mode") or "flat")
+    reveal_key = str(filters.get("reveal") or "")
 
     def input_value(name: str) -> str:
         return html.escape(str(filters.get(name) or ""), quote=True)
@@ -1897,13 +1960,51 @@ def _render_data_track_debug_page(payload: dict) -> str:
         label = html.escape(value or "unknown")
         return f"<span class='module module-{html.escape((value or 'unknown').replace('.', '-'))}'>{label}</span>"
 
-    def event_detail_block(ev: dict) -> str:
-        detail = _debug_json(ev.get("detail"))
-        excerpt = _debug_json(ev.get("content_excerpt"))
-        if not detail and not excerpt:
-            return ""
+    def copy_button(label: str, value) -> str:
+        raw = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
         return (
-            "<details class='event-detail'><summary>detail / 明文</summary>"
+            f"<button type='button' class='mini-button' data-copy='{html.escape(raw, quote=True)}'>"
+            f"{html.escape(label)}</button>"
+        )
+
+    def reveal_href(ev: dict) -> str:
+        return _data_track_page_href(
+            view="debug",
+            mode=mode,
+            user_id=ev.get("user_id") or "",
+            trace_id=ev.get("trace_id") or "",
+            reveal=_debug_event_key(ev),
+        )
+
+    def event_actions(ev: dict, *, include_open_turn: bool) -> str:
+        buttons = [
+            copy_button("copy user", ev.get("user_id") or ""),
+            copy_button("copy trace", ev.get("trace_id") or ""),
+            copy_button("copy type", ev.get("type") or ""),
+            copy_button("copy JSON", _debug_event_public_json(ev)),
+        ]
+        if include_open_turn:
+            href = _data_track_page_href(view="debug", mode="timeline", user_id=ev.get("user_id") or "", trace_id=ev.get("trace_id") or "")
+            buttons.append(f"<a class='mini-button' href='{html.escape(href, quote=True)}'>open turn</a>")
+        buttons.append(
+            f"<a class='mini-button reveal-button' data-reveal='1' href='{html.escape(reveal_href(ev), quote=True)}'>Reveal plaintext</a>"
+        )
+        return "<div class='actions'>" + "".join(buttons) + "</div>"
+
+    def event_detail_block(ev: dict) -> str:
+        revealed = bool(reveal_key and reveal_key == _debug_event_key(ev))
+        detail = _debug_json(ev.get("detail") if revealed else _debug_redact_value(ev.get("detail") or {}))
+        excerpt = _debug_json(ev.get("content_excerpt") if revealed else _debug_content_summary(ev.get("content_excerpt") or {}))
+        if not detail and not excerpt and not revealed:
+            return ""
+        label = "plaintext detail" if revealed else "redacted detail"
+        warning = (
+            "<div class='reveal-note'>Plaintext revealed for this event only. Avoid screenshots or sharing user content.</div>"
+            if revealed else
+            "<div class='redacted-note'>Plaintext is not rendered by default. Use Reveal plaintext for a single event when debugging needs it.</div>"
+        )
+        return (
+            f"<details class='event-detail' {'open' if revealed else ''}><summary>{label}</summary>{warning}"
             f"{'<h4>detail</h4><pre>' + html.escape(detail) + '</pre>' if detail else ''}"
             f"{'<h4>content_excerpt</h4><pre>' + html.escape(excerpt) + '</pre>' if excerpt else ''}"
             "</details>"
@@ -1938,7 +2039,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
             f"<td><span class='mono'>{html.escape(str(ev.get('type') or ''))}</span></td>"
             f"<td><span class='pill {ev_cls}'>{html.escape(ev_status)}</span></td>"
             f"<td>{html.escape(_debug_ms(ev.get('dur_ms')))}</td>"
-            f"<td>{html.escape(str(ev.get('explain') or ev.get('summary') or ''))}{event_detail_block(ev)}</td>"
+            f"<td>{html.escape(str(ev.get('explain') or ev.get('summary') or ''))}{event_actions(ev, include_open_turn=True)}{event_detail_block(ev)}</td>"
             "</tr>"
         )
 
@@ -1959,6 +2060,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
                 f"<span class='pill {ev_cls}'>{html.escape(ev_status or 'ok')}</span>"
                 f"<span class='muted'>{html.escape(_debug_ms(ev.get('dur_ms')))}</span></div>"
                 f"<div>{html.escape(str(ev.get('explain') or ev.get('summary') or ''))}</div>"
+                f"{event_actions(ev, include_open_turn=False)}"
                 f"{event_detail_block(ev)}"
                 "</div>"
             )
@@ -1988,6 +2090,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
         _render_metric("turns", summary["turns_total"]),
         _render_metric("stalled / error", f"{summary['stalled_turns']} / {summary['error_turns']}"),
     ])
+    refresh_meta = "" if reveal_key else '<meta http-equiv="refresh" content="30">'
 
     flat_table = (
         "<table class='log-table'>"
@@ -2016,7 +2119,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta http-equiv="refresh" content="30">
+  {refresh_meta}
   <title>Feedling Debug · Data Track</title>
   <style>
     :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; --ink:#263238; }}
@@ -2031,6 +2134,9 @@ def _render_data_track_debug_page(payload: dict) -> str:
     .modebar {{ justify-content:space-between; background:#f4ece5; border:1px solid var(--line); border-radius:8px; padding:8px; }}
     .mode-left {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
     .sort-button,button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
+    .mini-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:5px; padding:3px 7px; background:#fffdfa; color:var(--fg); font-size:12px; margin:4px 5px 0 0; cursor:pointer; }}
+    .reveal-button {{ border-color:#d9b28c; color:#8a4a00; background:#fff8ed; }}
+    .actions {{ display:flex; flex-wrap:wrap; gap:0; margin-top:5px; }}
     .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
     input,select {{ border:1px solid var(--line); border-radius:6px; padding:8px 9px; background:white; color:var(--fg); }}
     .field {{ display:flex; flex-direction:column; gap:4px; min-width:150px; }} .field label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }}
@@ -2043,6 +2149,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
     .turn {{ margin:10px 0; }} .event-row {{ border-top:1px solid var(--line); padding:9px 0; }} .event-row:first-of-type {{ border-top:0; }}
     .event-meta {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:4px; }} .event-detail summary {{ color:var(--accent); cursor:pointer; margin-top:5px; }}
     pre {{ white-space:pre-wrap; word-break:break-word; background:#fff7f0; border:1px solid var(--line); border-radius:6px; padding:10px; max-height:360px; overflow:auto; }}
+    .redacted-note,.reveal-note {{ border-radius:6px; padding:8px; margin:7px 0; }} .redacted-note {{ color:var(--muted); background:#f6efe8; border:1px solid var(--line); }} .reveal-note {{ color:#8a4a00; background:#fff8ed; border:1px solid #e8c59d; }}
     .stall {{ color:var(--warn); background:#fff8e8; border:1px solid #f0d7a5; border-radius:6px; padding:8px; margin-top:8px; }}
   </style>
 </head>
@@ -2087,6 +2194,29 @@ def _render_data_track_debug_page(payload: dict) -> str:
   <h2>{'Flat logs' if mode == 'flat' else 'Turns'} {hint('Flat 是时间倒序事件流；Timeline 是按 trace_id 分组后的完整链路。')}</h2>
   {flat_table if mode == 'flat' else timeline_view}
 </main>
+<script>
+  document.addEventListener('click', async (event) => {{
+    const copyTarget = event.target.closest('[data-copy]');
+    if (copyTarget) {{
+      event.preventDefault();
+      const value = copyTarget.getAttribute('data-copy') || '';
+      try {{
+        await navigator.clipboard.writeText(value);
+        const oldText = copyTarget.textContent;
+        copyTarget.textContent = 'copied';
+        setTimeout(() => {{ copyTarget.textContent = oldText; }}, 900);
+      }} catch (err) {{
+        window.prompt('Copy value', value);
+      }}
+      return;
+    }}
+    const revealTarget = event.target.closest('[data-reveal]');
+    if (revealTarget) {{
+      const ok = window.confirm('Reveal plaintext for this single debug event? This may expose private user content.');
+      if (!ok) event.preventDefault();
+    }}
+  }});
+</script>
 </body>
 </html>"""
 

@@ -85,7 +85,7 @@ def test_debug_payload_groups_multi_user_trace_and_marks_stalled(monkeypatch):
     assert turns["t-ok"]["total_dur_ms"] == 3000
 
 
-def test_debug_page_renders_nav_filters_and_plaintext_excerpt(monkeypatch):
+def test_debug_page_renders_nav_filters_and_redacts_plaintext_by_default(monkeypatch):
     with registry._users_lock:
         registry._users[:] = [{"user_id": "user_a", "principal_id": "p_a"}]
 
@@ -110,12 +110,42 @@ def test_debug_page_renders_nav_filters_and_plaintext_excerpt(monkeypatch):
     assert "Debug" in html
     assert "user_a" in html
     assert "agent.reply" in html
-    assert "visible beta reply" in html
+    assert "visible beta reply" not in html
+    assert "&quot;chars&quot;: 18" in html
+    assert "Reveal plaintext" in html
+    assert "copy trace" in html
     assert "Filter debug logs" in html
     assert "Flat logs" in html
     assert "Timeline" in html
     assert "<select name=\"subsystem\">" in html
     assert "trace_id 时可直接定位" in html
+
+
+def test_debug_page_reveals_plaintext_for_one_event(monkeypatch):
+    with registry._users_lock:
+        registry._users[:] = [{"user_id": "user_a", "principal_id": "p_a"}]
+
+    event = _event(
+        100,
+        "user_a",
+        "agent.reply",
+        trace_id="t-reply",
+        detail={"model": "deepseek", "prompt": "private prompt"},
+        content_excerpt={"reply": "visible beta reply"},
+    )
+    blobs = {
+        ("user_a", "v1_flow_trace_enabled"): {"enabled": True},
+        ("user_a", "v1_flow_trace"): {"events": [event]},
+    }
+    monkeypatch.setattr(data_track.db, "get_blob", lambda uid, kind: blobs.get((uid, kind)))
+
+    key = data_track._debug_event_key(event)
+    html = admin_core.page_html(f"view=debug&user_id=user_a&trace_id=t-reply&reveal={key}")
+
+    assert "visible beta reply" in html
+    assert "private prompt" in html
+    assert "Plaintext revealed for this event only" in html
+    assert 'http-equiv="refresh"' not in html
 
 
 def test_debug_page_can_render_timeline_mode(monkeypatch):
