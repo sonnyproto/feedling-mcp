@@ -40,6 +40,15 @@ def test_model_entry_openrouter_prefix():
     assert e["litellm_params"]["model"] == "openrouter/anthropic/claude-3.5-sonnet"
 
 
+def test_model_entry_openrouter_requests_visible_reasoning():
+    e = gw.build_model_entry(user_id="u", provider="openrouter", model="deepseek/deepseek-v4-flash")
+
+    assert e["litellm_params"]["extra_body"]["reasoning"] == {
+        "enabled": True,
+        "exclude": False,
+    }
+
+
 def test_model_entry_openai_compatible_carries_api_base():
     e = gw.build_model_entry(
         user_id="u", provider="openai_compatible", model="my-model",

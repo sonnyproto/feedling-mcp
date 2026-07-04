@@ -3238,6 +3238,31 @@ def test_agent_turn_extracts_provider_reasoning_metadata_from_nested_result():
     assert turn.thinking_native is True
 
 
+def test_agent_turn_extracts_openrouter_reasoning_details():
+    raw = json.dumps(
+        {
+            "reply": "这是最终回复。",
+            "reasoning_details": [
+                {"type": "reasoning.text", "text": "先判断用户在测 OpenRouter。"},
+                {"type": "summary", "summary": "再确认需要把推理摘要单独展示。"},
+            ],
+            "reasoning_source": "openrouter",
+            "reasoning_model": "deepseek/deepseek-v4-flash",
+            "reasoning_native": True,
+        },
+        ensure_ascii=False,
+    )
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["这是最终回复。"]
+    assert turn.thinking_summary == "先判断用户在测 OpenRouter。\n再确认需要把推理摘要单独展示。"
+    assert turn.thinking_kind == "provider_reasoning"
+    assert turn.thinking_source == "openrouter"
+    assert turn.thinking_model == "deepseek/deepseek-v4-flash"
+    assert turn.thinking_native is True
+
+
 def test_extract_cli_output_preserves_structured_multi_messages():
     raw = '{"messages":["第一条","第二条"]}'
 

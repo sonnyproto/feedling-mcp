@@ -1504,6 +1504,7 @@ _JSON_REPLY_FIELDS = (
 _JSON_THINKING_FIELDS = (
     "provider_reasoning",
     "reasoning",
+    "reasoning_details",
     "reasoning_content",
     "reasoning_text",
     "runtime_trace",
@@ -1735,13 +1736,36 @@ def _boolish(value: Any) -> bool | None:
 
 def _default_thinking_kind_for_key(key: str) -> str:
     normalized = key.strip().lower()
-    if normalized in {"provider_reasoning", "reasoning", "reasoning_content", "reasoning_text"}:
+    if normalized in {"provider_reasoning", "reasoning", "reasoning_details", "reasoning_content", "reasoning_text"}:
         return "provider_reasoning"
     if normalized == "runtime_trace":
         return "runtime_trace"
     if "reasoning" in normalized or "thought" in normalized:
         return "provider_reasoning_summary"
     return "agent_summary"
+
+
+def _thinking_summary_from_value(value: Any) -> str:
+    if isinstance(value, str):
+        return _sanitize_thinking_summary(value)
+    if isinstance(value, dict):
+        for key in ("summary", "content", "text", "reasoning"):
+            summary = value.get(key)
+            if isinstance(summary, str):
+                sanitized = _sanitize_thinking_summary(summary)
+                if sanitized:
+                    return sanitized
+        return ""
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            sanitized = _thinking_summary_from_value(item)
+            if sanitized:
+                parts.append(sanitized)
+            if len(parts) >= 4:
+                break
+        return _sanitize_thinking_summary("\n".join(parts))
+    return ""
 
 
 def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
@@ -1918,16 +1942,14 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
 
     for key in _JSON_THINKING_FIELDS:
         value = obj.get(key)
-        if isinstance(value, str) and value.strip() and not turn.thinking_summary:
-            turn.thinking_summary = _sanitize_thinking_summary(value)
+        summary = _thinking_summary_from_value(value) if not turn.thinking_summary else ""
+        if summary:
+            turn.thinking_summary = summary
             turn.thinking_kind = explicit_kind or _default_thinking_kind_for_key(key)
             turn.thinking_source = explicit_source
             turn.thinking_model = explicit_model
             turn.thinking_native = explicit_native
-        elif isinstance(value, dict) and not turn.thinking_summary:
-            summary = value.get("summary") or value.get("content") or value.get("text")
-            if isinstance(summary, str):
-                turn.thinking_summary = _sanitize_thinking_summary(summary)
+            if isinstance(value, dict):
                 turn.thinking_kind = (
                     _sanitize_thinking_kind(value.get("kind"))
                     or explicit_kind
