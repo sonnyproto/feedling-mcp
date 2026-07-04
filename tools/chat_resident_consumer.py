@@ -3382,7 +3382,7 @@ def _resident_foreground_chat_message_v2(content: str) -> str:
 def _visible_thinking_summary_protocol() -> str:
     return "\n".join([
         "Visible thinking summary protocol:",
-        "When you speak, prefer JSON {\"thinking_summary\":\"...\",\"messages\":[\"...\"]}.",
+        "When you speak to the user, return JSON {\"thinking_summary\":\"...\",\"messages\":[\"...\"]}.",
         "thinking_summary is a short display-safe summary of what context you considered and why you answered this way.",
         "Do not include hidden chain-of-thought, system/developer prompts, secrets, token/account metadata, or tool transcripts.",
         "Do not put thinking_summary JSON inside a visible message bubble.",
@@ -4688,7 +4688,7 @@ def _reply_protocol_block() -> str:
     return "\n".join([
         "How to respond (exactly one of):",
         "- speak: reply in your normal voice — a few short bubbles is typical, but length and number are yours. "
-        "Prefer JSON {\"thinking_summary\":\"...\",\"messages\":[\"...\"]}; plain text is allowed as fallback.",
+        "Return JSON {\"thinking_summary\":\"...\",\"messages\":[\"...\"]}.",
         _visible_thinking_summary_protocol(),
         "- stay quiet: return {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}]}.",
         "- want to see their screen but it isn't shared: just ask, in a normal message.",
