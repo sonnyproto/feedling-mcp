@@ -1,5 +1,4 @@
-"""v1 flow trace: prove it's a true no-op in production (deploy switch off) and
-only records when BOTH the deploy switch and the per-user debug flag are on."""
+"""v1 flow trace: beta default-on recording with deploy/per-user safety valves."""
 import os
 import sys
 
@@ -23,15 +22,28 @@ def _reset(monkeypatch, store):
     return blobs
 
 
-def test_flag_off_is_noop_no_env_needed(monkeypatch):
+def test_default_on_records_no_env_needed(monkeypatch):
     store = _Store()
     blobs = _reset(monkeypatch, store)
     monkeypatch.delenv("FEEDLING_V1_FLOW_TRACE", raising=False)  # no env set (default)
-    # per-user toggle is the gate: off → nothing records, nothing written
+    debug_trace.trace_event(store, subsystem="route", type="route.decided", summary="x")
+    assert debug_trace.is_enabled(store) is True
+    assert debug_trace.read_trace(store)[0]["type"] == "route.decided"
+    assert (store.user_id, debug_trace.DEBUG_TRACE_BLOB) in blobs
+
+
+def test_default_can_be_restored_to_opt_in_with_env(monkeypatch):
+    store = _Store()
+    blobs = _reset(monkeypatch, store)
+    monkeypatch.delenv("FEEDLING_V1_FLOW_TRACE", raising=False)
+    monkeypatch.setenv("FEEDLING_V1_FLOW_TRACE_DEFAULT", "0")
     debug_trace.trace_event(store, subsystem="route", type="route.decided", summary="x")
     assert debug_trace.is_enabled(store) is False
     assert debug_trace.read_trace(store) == []
     assert (store.user_id, debug_trace.DEBUG_TRACE_BLOB) not in blobs
+    debug_trace.set_enabled(store, True)
+    debug_trace.trace_event(store, subsystem="route", type="route.decided", summary="x")
+    assert debug_trace.read_trace(store)[0]["type"] == "route.decided"
 
 
 def test_env_zero_hard_disables_even_with_flag_on(monkeypatch):
@@ -47,12 +59,7 @@ def test_env_zero_hard_disables_even_with_flag_on(monkeypatch):
 def test_records_when_flag_on_no_env_needed(monkeypatch):
     store = _Store()
     _reset(monkeypatch, store)
-    monkeypatch.delenv("FEEDLING_V1_FLOW_TRACE", raising=False)  # no env — toggle is the gate
-    # flag off → no-op
-    debug_trace.trace_event(store, subsystem="route", type="route.decided")
-    assert debug_trace.read_trace(store) == []
-    # user opens the debug panel toggle → now it records (no env/redeploy needed)
-    debug_trace.set_enabled(store, True)
+    monkeypatch.delenv("FEEDLING_V1_FLOW_TRACE", raising=False)
     debug_trace.trace_event(store, subsystem="route", type="route.decided",
                             summary="host", detail={"mode": "agent_runtime", "reason": "text"})
     debug_trace.trace_event(store, subsystem="memory", type="memory.index.called",
@@ -60,7 +67,7 @@ def test_records_when_flag_on_no_env_needed(monkeypatch):
     events = debug_trace.read_trace(store)
     assert [e["type"] for e in events] == ["memory.index.called", "route.decided"]  # newest first
     assert debug_trace.read_trace(store, subsystem="route")[0]["detail"]["mode"] == "agent_runtime"
-    # turn it back off → no new events
+    # Per-user opt-out still works.
     debug_trace.set_enabled(store, False)
     debug_trace.trace_event(store, subsystem="route", type="route.decided")
     assert len(debug_trace.read_trace(store)) == 2
