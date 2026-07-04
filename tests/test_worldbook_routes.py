@@ -8,7 +8,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import app as appmod  # noqa: E402
-from worldbook import routes as worldbook_routes  # noqa: E402
+from worldbook import worldbook_core  # noqa: E402
 from core import config as core_config  # noqa: E402
 
 
@@ -115,7 +115,7 @@ def test_worldbook_upsert_rejects_over_cap_content_reported_by_enclave(client, m
 
     monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "http://enclave.test")
     monkeypatch.setattr(
-        worldbook_routes.worldbook_readside_core,
+        worldbook_core.worldbook_readside_core,
         "post_enclave_worldbook_match",
         fake_validate,
     )
@@ -139,7 +139,7 @@ def test_worldbook_upsert_rejects_when_enclave_cannot_validate_envelope(client, 
 
     monkeypatch.setenv("FEEDLING_ENCLAVE_URL", "http://enclave.test")
     monkeypatch.setattr(
-        worldbook_routes.worldbook_readside_core,
+        worldbook_core.worldbook_readside_core,
         "post_enclave_worldbook_match",
         fake_validate,
     )
@@ -172,7 +172,7 @@ def test_worldbook_match_calls_enclave_with_stored_envelopes(client, monkeypatch
         }
 
     monkeypatch.setattr(
-        worldbook_routes.worldbook_readside_core,
+        worldbook_core.worldbook_readside_core,
         "post_enclave_worldbook_match",
         fake_match,
     )

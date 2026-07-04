@@ -11,9 +11,9 @@ from __future__ import annotations
 import os
 
 import httpx
-from flask import has_request_context, request
 
 import db
+from core.reqctx import request
 from perception import store as perception_store
 
 _CACHE_KIND = "screen_caption"
@@ -25,12 +25,12 @@ def _enclave_auth_headers(api_key: str | None, runtime_token: str | None = None)
 
     host-all / zero-roster agents have no per-user api_key — their proactive screen
     captions are triggered by a request carrying X-Feedling-Runtime-Token. Pick it
-    up from the current request context when no explicit token/api_key is supplied,
-    so these reads stop returning api_key_unavailable. Returns None when no
-    credential is available (true non-request background callers behave as before).
+    up from the neutral request context (core.reqctx) when no explicit token/api_key
+    is supplied, so these reads stop returning api_key_unavailable. Returns None when
+    no credential is available (true non-request background callers behave as before).
     """
     rt = runtime_token
-    if not rt and has_request_context():
+    if not rt:
         rt = request.headers.get("X-Feedling-Runtime-Token", "").strip() or None
     if rt:
         return {"X-Feedling-Runtime-Token": rt}

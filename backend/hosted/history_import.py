@@ -16,7 +16,6 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 import httpx
-from flask import Blueprint, Response, jsonify, request, g
 
 import db
 from core import envelope as core_envelope
@@ -52,7 +51,6 @@ from model_api_runtime.tools import (
 from context_memory_selection import memory_relevance_details
 from content_encryption import build_envelope
 
-from accounts import auth
 from accounts import registry
 from bootstrap import gates as boot_gates
 from core import util as core_util
@@ -60,10 +58,10 @@ from identity import service as identity_service
 from memory import service as memory_service
 import provider_client
 from hosted import config_store as hosted_config_store
+from hosted import history_import_core
 from hosted import onboarding_validation as hosted_onboarding_validation
 
 
-bp = Blueprint("hosted_history_import", __name__)
 
 def _history_job_kind(job_id: str) -> str:
     """user_blobs kind for a single history-import job. One blob per job_id."""
@@ -3239,102 +3237,3 @@ def _start_history_import_job(
     thread.start()
     return True
 
-
-@bp.route("/v1/history_import/upload", methods=["POST"])
-def history_import_upload():
-    store = auth.require_user()
-    api_key = auth._extract_api_key()
-    payload = request.get_json(silent=True) or {}
-    input_hash = _history_import_payload_hash(payload)
-    client_job_id = _history_import_client_job_id(payload)
-    existing = _history_import_find_reusable_job(
-        store,
-        client_job_id=client_job_id,
-        input_hash=input_hash,
-    )
-    if existing:
-        if str(existing.get("status") or "") in {"queued", "processing"}:
-            _start_history_import_job(store, api_key, existing, payload)
-            return jsonify({"job": existing}), 202
-        return jsonify({"job": existing}), 200
-
-    job_id = f"hi_{uuid.uuid4().hex[:16]}"
-    job = {
-        "job_id": job_id,
-        "status": "queued",
-        "client_job_id": client_job_id,
-        "input_hash": input_hash,
-        "created_at": core_util._now_iso(),
-        "content_chars": len(str(payload.get("content") or "")),
-        "ai_persona_chars": len(str(
-            payload.get("ai_persona_content")
-            or payload.get("ai_persona")
-            or ""
-        )),
-        "character_chars": len(str(
-            payload.get("character_content")
-            or payload.get("character_card")
-            or ""
-        )),
-        "agent_prompt_chars": len(str(
-            payload.get("agent_prompt_content")
-            or payload.get("original_system_prompt_content")
-            or payload.get("system_prompt_content")
-            or payload.get("agent_prompt")
-            or payload.get("system_prompt")
-            or payload.get("original_system_prompt")
-            or ""
-        )),
-        "persona_chars": len(str(
-            payload.get("personal_profile_content")
-            or payload.get("persona_content")
-            or payload.get("persona")
-            or payload.get("profile_content")
-            or ""
-        )),
-        "memory_summary_chars": len(str(
-            payload.get("memory_summary_content")
-            or payload.get("memory_summary")
-            or payload.get("memory_sample_content")
-            or payload.get("memory_sample")
-            or ""
-        )),
-        "ai_persona_filename": str(payload.get("ai_persona_filename") or "")[:240],
-        "character_filename": str(
-            payload.get("character_filename")
-            or payload.get("character_card_filename")
-            or ""
-        )[:240],
-        "agent_prompt_filename": str(
-            payload.get("agent_prompt_filename")
-            or payload.get("original_system_prompt_filename")
-            or payload.get("system_prompt_filename")
-            or ""
-        )[:240],
-        "persona_filename": str(
-            payload.get("personal_profile_filename")
-            or payload.get("persona_filename")
-            or ""
-        )[:240],
-        "memory_summary_filename": str(
-            payload.get("memory_summary_filename")
-            or payload.get("memory_sample_filename")
-            or ""
-        )[:240],
-        "chat_ready": False,
-        "background_status": "not_started",
-        **_history_import_phase_fields("upload_received"),
-    }
-    _save_history_job(store, job)
-    _start_history_import_job(store, api_key, job, payload)
-    print(f"[history_import:{store.user_id}] job={job_id} queued async=1 client_job_id={client_job_id[:24]}")
-    return jsonify({"job": job}), 202
-
-
-@bp.route("/v1/history_import/status/<job_id>", methods=["GET"])
-def history_import_status(job_id):
-    store = auth.require_user()
-    data = db.get_blob(store.user_id, _history_job_kind(job_id))
-    if not data:
-        return jsonify({"error": "job_not_found"}), 404
-    return jsonify({"job": data})

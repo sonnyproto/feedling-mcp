@@ -6,10 +6,10 @@ import time
 import uuid
 
 import httpx
-from flask import has_request_context, request
 
 import db
 from core import store as core_store
+from core.reqctx import request
 from core.store import UserStore
 
 PROACTIVE_WAKE_FRAME_CANDIDATE_MAX = int(os.environ.get("FEEDLING_PROACTIVE_WAKE_FRAME_CANDIDATE_MAX", "60"))
@@ -26,7 +26,7 @@ def _enclave_auth_headers(api_key: str | None, runtime_token: str | None = None)
     (true non-request background callers behave exactly as before).
     """
     rt = runtime_token
-    if not rt and has_request_context():
+    if not rt:
         rt = request.headers.get("X-Feedling-Runtime-Token", "").strip() or None
     if rt:
         return {"X-Feedling-Runtime-Token": rt}
@@ -36,12 +36,11 @@ def _enclave_auth_headers(api_key: str | None, runtime_token: str | None = None)
 
 
 def _frame_url(store: UserStore, filename: str) -> str:
+    # Absolute frame URLs come from FEEDLING_PUBLIC_BASE_URL. There is no
+    # request-host fallback under ASGI (the old flask.request.host_url path had
+    # no context off the event loop and always yielded ""), so an unset base
+    # simply produces a root-relative URL.
     base = os.environ.get("FEEDLING_PUBLIC_BASE_URL", "").rstrip("/")
-    if not base:
-        try:
-            base = request.host_url.rstrip("/")
-        except RuntimeError:
-            base = ""
     return f"{base}/v1/screen/frames/{filename}?user={store.user_id}"
 
 

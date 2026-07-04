@@ -203,7 +203,9 @@ def _deliver_ai_message_push_if_background(
         "data": data or {},
         "visualState": visual_state or "reply",
     }
-    live_body = _json_body_from_response(live_activity.push_live_activity_hybrid_inner(store, push_payload))
+    # Neutral dict path (no Flask jsonify): this runs off the event loop in an
+    # ASGI worker thread with no Flask app context.
+    live_body = live_activity.push_live_activity_hybrid_dict(store, push_payload)
     fields["live_activity_status"] = live_body.get("status", "unknown")
     fields["live_activity_reason"] = live_body.get("reason", "")
     fields["live_activity_activity_id"] = live_body.get("activity_id", "")

@@ -9,8 +9,9 @@ import time
 from datetime import datetime
 
 import httpx
-from flask import request
 from urllib.parse import quote, urlencode
+
+from core.reqctx import request
 
 import db
 from core import util

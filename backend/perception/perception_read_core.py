@@ -1,0 +1,135 @@
+"""Framework-neutral Extended Perception route operations (ASGI-migration plan §5.3).
+
+A pure relocation of the Flask ``/v1/perception/*`` route bodies so both the Flask
+adapter (``perception.routes``) and the native FastAPI router
+(``perception.routes_asgi``) share one implementation and return byte-identical
+responses. No ``flask.request`` here — every function takes the already-resolved
+store, the already-parsed params (and, for ``/report``, the caller's api key) as
+explicit arguments, and delegates to ``perception.service`` (the business logic).
+
+E2E boundary (unchanged): perception signals/photos are v1 E2E envelopes. The
+server NEVER decrypts them in this process EXCEPT via the enclave.
+
+  - ``report`` writes encrypted perception. On the ingress-v2 path it may call the
+    ENCLAVE to decrypt sensitive signal envelopes inside the trusted boundary —
+    exactly as Flask did — forwarding the caller's ``api_key`` verbatim to
+    ``service.ingest_snapshot_v2`` (which owns the enclave decrypt call). No
+    plaintext is produced here; decryption happens inside the enclave.
+  - ``photo_evaluate`` stores the encrypted image envelope (ciphertext) as-is; it
+    performs NO decryption and makes NO enclave call.
+  - ``photo_content`` returns JSON metadata + a ``decrypt_path`` pointer to the
+    enclave's frame-decrypt endpoint; it performs NO decryption and makes NO
+    enclave call. Pixels are decrypted later, by the enclave, on that path.
+
+Every function returns ``(body, status)`` — a JSON-able dict and an HTTP status —
+so the two adapters render identical ``jsonify`` / ``JSONResponse`` bodies. The
+``snapshot`` read has no error branch, so it always returns status 200.
+
+All store / service / enclave work is blocking, so ASGI callers run these through
+``threadpool.run_db`` off the event loop (plan §5.2).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from . import service
+
+
+def report(store, payload: dict, *, api_key: str | None) -> tuple[dict, int]:
+    """Single multiplexed ingest. Mirrors the Flask ``/report`` body exactly.
+
+    Body may carry any of ``context_snapshot`` / ``items`` / ``config``; at least
+    one must be present (else 400). The per-user rollout flag selects the v2
+    ingress (which forwards ``api_key`` to the enclave for sensitive-signal
+    decrypt) vs the legacy path.
+    """
+    user_store = store
+    uid = user_store.user_id
+    use_ingress_v2 = service.perception_ingress_runtime_v2_enabled(user_store)
+    payload = payload or {}
+    results: dict = {}
+    provided = False
+    status = 200
+
+    cs = payload.get("context_snapshot")
+    if isinstance(cs, list) and cs:
+        provided = True
+        if use_ingress_v2:
+            results.update(service.ingest_snapshot_v2(
+                uid,
+                cs,
+                client_ts=payload.get("client_ts"),
+                api_key=api_key,
+            ))
+        else:
+            results.update(service.ingest_snapshot(uid, cs, client_ts=payload.get("client_ts")))
+
+    items = payload.get("items")
+    if isinstance(items, dict) and items:
+        provided = True
+        item_results: dict = {}
+        for kind, rows in items.items():
+            out, code = service.items_ingest(uid, str(kind), rows)
+            item_results[kind] = out
+            if code != 200:
+                status = 400  # surface rejected/malformed collection uploads, don't 200 them
+        results["items"] = item_results
+
+    config = payload.get("config")
+    if isinstance(config, dict) and config:
+        provided = True
+        results["config"] = service.set_config(uid, config)
+
+    if not provided:
+        return {"error": "non-empty context_snapshot / items / config required"}, 400
+    return {"results": results}, status
+
+
+def snapshot(store) -> tuple[dict, int]:
+    """Current authorized+fresh state for the agent. Always 200 (no error branch)."""
+    return service.snapshot(store.user_id), 200
+
+
+def photo_evaluate(store, payload: dict) -> tuple[dict, int]:
+    """Single-step photo ingest: metadata + (if usable) the encrypted image.
+
+    Stores ciphertext only; no decryption / no enclave call here.
+    """
+    p = payload or {}
+    return service.photo_evaluate(
+        store.user_id,
+        p.get("metadata") or {},
+        p.get("content_envelope"),
+        p.get("exif_gps"),
+        p.get("meta_envelope"),
+    )
+
+
+def photos_recent(store, limit_raw: Any) -> tuple[dict, int]:
+    limit = int(limit_raw if limit_raw is not None else 20)
+    return service.photos_recent(store.user_id, limit=limit)
+
+
+def photo_content(store, photo_id: str) -> tuple[dict, int]:
+    """Permission + status gate for one confirmed photo. Returns JSON metadata +
+    a ``decrypt_path`` to the enclave's frame-decrypt endpoint. No plaintext held
+    here — only the enclave decrypts pixels, on that path."""
+    return service.photo_content(store.user_id, photo_id)
+
+
+def items_recent(store, kind: str, limit_raw: Any) -> tuple[dict, int]:
+    limit = int(limit_raw if limit_raw is not None else 20)
+    return service.items_recent(store.user_id, kind, limit=limit)
+
+
+def app_open(store, query) -> tuple[dict, int]:
+    """Record one app-open event from the iOS Shortcut GET. ALL params (incl. the
+    api key, already consumed by auth) arrive in the query string. ``query`` is a
+    mapping with ``.get`` (Flask ``request.args`` / Starlette ``query_params``);
+    the fallback order (``app``/``bundle_id``, ``ts``/``client_ts``) is kept here
+    so both adapters extract identically."""
+    app = query.get("app") or query.get("bundle_id") or ""
+    category = query.get("category")
+    client_ts = query.get("ts") or query.get("client_ts")
+    return service.app_open(store.user_id, app, category=category, client_ts=client_ts)

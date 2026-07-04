@@ -72,7 +72,7 @@ def test_reset_aborts_when_archive_cleanup_fails_persistently(client, monkeypatc
     删除失败时重置必须 503 abort 且**不删账号**（此刻尚未删任何东西，状态一致、
     可安全重试），绝不能在报告成功的同时留下无从发现的明文孤儿（无 reaper 兜底）。"""
     uid, api_key = _register(client)
-    import content.routes as routes
+    import content.content_core as routes
     monkeypatch.setattr(routes, "_ARCHIVE_DELETE_BASE_DELAY", 0)  # 测试里不真 sleep
 
     def _boom(_u):
@@ -99,7 +99,7 @@ def test_reset_aborts_when_archive_cleanup_fails_persistently(client, monkeypatc
 def test_reset_retries_transient_archive_failure_then_succeeds(client, monkeypatch):
     """瞬时 R2 抖动应被有界重试抹平：前两次失败、第三次成功 → 归档删净、账号正常删除。"""
     uid, api_key = _register(client)
-    import content.routes as routes
+    import content.content_core as routes
     monkeypatch.setattr(routes, "_ARCHIVE_DELETE_BASE_DELAY", 0)
     attempts = {"n": 0}
 

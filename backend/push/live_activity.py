@@ -3,8 +3,6 @@
 import time
 import uuid
 
-from flask import jsonify
-
 from core.store import UserStore
 from push import apns
 from push import tokens as push_tokens
@@ -66,20 +64,20 @@ def _live_activity_top_app(payload: dict) -> str:
     return str(payload.get("topApp") or payload.get("top_app") or "")
 
 
-def push_live_activity_inner(store: UserStore, payload: dict):
+def push_live_activity_dict(store: UserStore, payload: dict) -> dict:
     activity_id = payload.get("activity_id")
     entry = push_tokens._select_token(store, push_tokens._is_live_activity_token, activity_id=activity_id, active_only=True)
     if not entry and activity_id:
         entry = push_tokens._select_token(store, push_tokens._is_live_activity_token, active_only=True)
     if not entry:
         print(f"[live-activity:{store.user_id}] no active token registered — logged: {payload}")
-        return jsonify({
+        return {
             "status": "logged",
             "activity_id": activity_id or f"la_{uuid.uuid4().hex[:8]}",
             "needs_refresh": True,
             "reason": "no_active_live_activity_token",
             "mode": "update",
-        })
+        }
 
     body = _live_activity_body(payload)
     top_app = _live_activity_top_app(payload)
@@ -89,12 +87,12 @@ def push_live_activity_inner(store: UserStore, payload: dict):
     suppress, reason = store.should_suppress_live_activity(message=body, top_app=top_app)
     if suppress:
         print(f"[live-activity:{store.user_id}] suppressed: {reason} body={body[:60]}")
-        return jsonify({
+        return {
             "status": "suppressed",
             "reason": reason,
             "activity_id": entry.get("activity_id"),
             "mode": "update",
-        })
+        }
 
     apns_payload = {
         "aps": {
@@ -136,7 +134,7 @@ def push_live_activity_inner(store: UserStore, payload: dict):
         response["errors"] = result.get("errors")
     if result.get("code") == 410 or apns._apns_token_should_expire(result):
         response["needs_refresh"] = True
-    return jsonify(response)
+    return response
 
 
 def push_live_activity_end_inner(store: UserStore, payload: dict | None = None) -> dict:
@@ -167,11 +165,11 @@ def push_live_activity_end_inner(store: UserStore, payload: dict | None = None) 
     return result
 
 
-def push_live_start_inner(store: UserStore, payload: dict, *, end_existing: bool = False):
+def push_live_start_dict(store: UserStore, payload: dict, *, end_existing: bool = False) -> dict:
     entry = push_tokens._select_token(store, push_tokens._is_push_to_start_token, active_only=True)
     if not entry:
         print(f"[live-start:{store.user_id}] no push_to_start token — logged: {payload}")
-        return jsonify({"status": "logged", "reason": "no_active_push_to_start_token", "mode": "start"})
+        return {"status": "logged", "reason": "no_active_push_to_start_token", "mode": "start"}
 
     title = (payload.get("title") or "").strip()
     body_text = _live_activity_body(payload)
@@ -231,39 +229,34 @@ def push_live_start_inner(store: UserStore, payload: dict, *, end_existing: bool
         response["end_status"] = end_result.get("status", "unknown")
         if end_result.get("reason"):
             response["end_reason"] = end_result.get("reason")
-    return jsonify(response)
+    return response
 
 
-def push_live_activity_hybrid_inner(store: UserStore, payload: dict):
+def push_live_activity_hybrid_dict(store: UserStore, payload: dict) -> dict:
+    """Framework-neutral hybrid start/update decision — returns a plain dict.
+
+    Shared by the Flask ``_inner`` wrapper and the AI-push delivery path
+    (``service._deliver_ai_message_push_if_background``), which runs off the
+    event loop in an ASGI worker thread with no Flask app context. Building the
+    body via the neutral ``*_dict`` helpers (not ``jsonify``) keeps it usable in
+    both worlds."""
     should_start, start_reason = store.should_start_live_activity()
     if should_start and push_tokens._select_token(store, push_tokens._is_push_to_start_token, active_only=True):
-        start_resp = push_live_start_inner(store, payload, end_existing=True)
-        try:
-            start_body = start_resp.get_json(silent=True) or {}
-        except Exception:
-            start_body = {}
+        start_body = push_live_start_dict(store, payload, end_existing=True)
         if start_body.get("status") == "delivered":
             start_body["mode"] = "start"
             start_body["start_reason"] = start_reason
-            return jsonify(start_body)
+            return start_body
 
         # If push-to-start is unavailable or rejected, fall back to the cheaper
         # update path so an already-visible activity can still refresh.
-        update_resp = push_live_activity_inner(store, payload)
-        try:
-            update_body = update_resp.get_json(silent=True) or {}
-        except Exception:
-            update_body = {}
+        update_body = push_live_activity_dict(store, payload)
         update_body["mode"] = "start_fallback_update"
         update_body["start_status"] = start_body.get("status", "unknown")
         update_body["start_reason"] = start_body.get("reason") or start_reason
-        return jsonify(update_body)
+        return update_body
 
-    update_resp = push_live_activity_inner(store, payload)
-    try:
-        update_body = update_resp.get_json(silent=True) or {}
-    except Exception:
-        update_body = {}
+    update_body = push_live_activity_dict(store, payload)
     update_body["mode"] = "update"
     update_body["start_reason"] = start_reason
-    return jsonify(update_body)
+    return update_body

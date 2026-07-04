@@ -8,14 +8,3 @@
     from onboarding_archive import register as register_onboarding_archive
     register_onboarding_archive(app)
 """
-
-from __future__ import annotations
-
-from .routes import bp
-
-__all__ = ["register"]
-
-
-def register(app) -> None:
-    """Mount the onboarding-archive blueprint (POST /v1/onboarding/archive)."""
-    app.register_blueprint(bp)

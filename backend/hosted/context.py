@@ -16,10 +16,10 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 import httpx
-from flask import Blueprint, Response, jsonify, request, g, has_request_context
 
 import db
 import debug_trace
+from core.reqctx import request
 from core import enclave as core_enclave
 from perception import snapshot_for_wake as _perception_wake_snapshot
 from core.store import UserStore
@@ -88,9 +88,7 @@ def _model_api_worldbook_context(
         and str(messages[-1].get("content") or "") == user_message
     ):
         messages.append({"role": "user", "content": user_message})
-    runtime_token = None
-    if has_request_context():
-        runtime_token = request.headers.get("X-Feedling-Runtime-Token", "").strip() or None
+    runtime_token = request.headers.get("X-Feedling-Runtime-Token", "").strip() or None
     try:
         result = worldbook_readside_core.post_enclave_worldbook_match(
             api_key,

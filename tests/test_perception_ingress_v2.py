@@ -497,8 +497,10 @@ def test_photo_added_wake_is_differ_event_with_digest_and_origin_refs(monkeypatc
 
 
 def test_device_event_route_only_runs_perception_ingress_when_flag_on(monkeypatch):
-    from flask import Flask
-    import proactive.routes as proactive_routes
+    # The Flask /v1/device/events route was deleted in the ASGI cutover; this
+    # exercises the framework-neutral core the route (and its ASGI counterpart)
+    # delegate to — proactive_core.device_events_append — directly.
+    from proactive import proactive_core
 
     class DeviceStore:
         user_id = "u_device"
@@ -515,32 +517,25 @@ def test_device_event_route_only_runs_perception_ingress_when_flag_on(monkeypatc
     fake_store = DeviceStore()
     calls = []
 
-    monkeypatch.setattr(proactive_routes.auth, "require_user", lambda: fake_store)
     monkeypatch.setattr(service, "ingest_device_event_v2", lambda uid, event: calls.append((uid, event)) or {
         "observations": 1,
         "wake_events": 1,
     })
 
-    app = Flask("device-route")
-    app.register_blueprint(proactive_routes.bp)
-    client = app.test_client()
-
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled", lambda user_or_store: False)
-    off = client.post("/v1/device/events", json={
+    off = proactive_core.device_events_append(fake_store, {
         "type": "screen_frame",
         "payload": {"safe_screen_phash": "hash_a", "broadcast_state": "on"},
     })
-    assert off.status_code == 200
-    assert "perception_v2" not in off.get_json()
+    assert "perception_v2" not in off
     assert calls == []
 
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled", lambda user_or_store: True)
-    on = client.post("/v1/device/events", json={
+    on = proactive_core.device_events_append(fake_store, {
         "type": "screen_frame",
         "payload": {"safe_screen_phash": "hash_b", "broadcast_state": "on"},
     })
-    assert on.status_code == 200
-    assert on.get_json()["perception_v2"] == {"observations": 1, "wake_events": 1}
+    assert on["perception_v2"] == {"observations": 1, "wake_events": 1}
     assert calls and calls[-1][0] == "u_device"
 
 

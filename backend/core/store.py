@@ -525,6 +525,7 @@ class UserStore:
             for ev in self.chat_waiters:
                 ev.set()
             self.chat_waiters.clear()
+        _fire_async_wake("chat", self.user_id)
 
     # ------- proactive presence -------
     def load_proactive_settings(self) -> dict:
@@ -787,6 +788,7 @@ class UserStore:
             for ev in self.proactive_job_waiters:
                 ev.set()
             self.proactive_job_waiters.clear()
+        _fire_async_wake("proactive", self.user_id)
 
 
 # Registry of per-user stores
@@ -803,11 +805,35 @@ _stores: dict[str, UserStore] = {}
 _stores_lock = threading.Lock()
 
 
+# Async long-poll wake hook (ASGI-migration plan §9.3 / §19.2). Injected by the
+# ASGI lifespan as `runtime.waiters.registry.wake`; None under legacy Flask (the
+# threading.Event waiters above are the only waiters then). Called from BOTH the
+# same-worker write path (notify_*_waiters, directly — NOT via the self-origin-
+# filtered wake bus, which is what closes the §19.2 gap) and the cross-worker
+# LISTEN path (_wake_store_waiters). The hook must be thread-safe.
+_async_wake_hook = None
+
+
+def set_async_wake_hook(fn) -> None:
+    global _async_wake_hook
+    _async_wake_hook = fn
+
+
+def _fire_async_wake(channel: str, user_id: str) -> None:
+    hook = _async_wake_hook
+    if hook is None:
+        return
+    try:
+        hook(channel, user_id)
+    except Exception:
+        pass
+
+
 def _wake_store_waiters(store: "UserStore") -> None:
     """Release threads parked on a store's long-poll waiters (chat / proactive)
     so they return promptly and re-evaluate against the refreshed state."""
     try:
-        store.notify_chat_waiters()
+        store.notify_chat_waiters()  # also fires the async "chat" hook
     except Exception:
         pass
     try:
@@ -816,6 +842,9 @@ def _wake_store_waiters(store: "UserStore") -> None:
                 ev.set()
     except Exception:
         pass
+    # notify_chat_waiters already fired the chat hook; the proactive branch above
+    # is inline (not the notify method) so fire the async proactive hook here.
+    _fire_async_wake("proactive", store.user_id)
 
 
 def _evict_store(user_id: str) -> bool:

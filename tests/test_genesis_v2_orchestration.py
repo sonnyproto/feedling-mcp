@@ -1,6 +1,6 @@
 """Genesis v2 Step 3b — the live job orchestration (foreground-fast wiring).
 
-Tests the control flow of routes._run_plaintext_genesis_v2 with the heavy
+Tests the control flow of plaintext._run_plaintext_genesis_v2 with the heavy
 collaborators (db / apply / background reduce) mocked: real DB e2e is run on test.
 What must hold:
   - greetable foreground -> apply+complete, then background skips ONLY the history core
@@ -16,7 +16,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 
 import db  # noqa: E402
-from genesis import foreground, foreground_identity, routes, service, worker  # noqa: E402
+from genesis import foreground, foreground_identity, plaintext, service, worker  # noqa: E402
 from hosted import history_import  # noqa: E402
 
 
@@ -68,17 +68,17 @@ def test_v2_foreground_completes_then_background_skips_only_history_core(monkeyp
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
     monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
     # the foreground-applied merge carries the core memory text -> threaded to background
-    monkeypatch.setattr(routes, "_plaintext_merge_reducer_outputs",
+    monkeypatch.setattr(plaintext, "_plaintext_merge_reducer_outputs",
                         lambda outs, **k: {"memories": [{"summary": "用户养了一只狗叫蛋子"}]})
     monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
                         lambda **k: ({"agent_name": "", "dimensions": []}, []))
     monkeypatch.setattr(service, "apply_reducer_output",
                         lambda *a, **k: calls.__setitem__("fg_applied", a[3]))
-    monkeypatch.setattr(routes, "_run_plaintext_background_enrichment",
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment",
                         lambda *a, **k: calls.update(bg_skip=k["skip_texts"], bg_family=k["skip_family"],
                                                      bg_known=k.get("known_memories")))
 
-    handled = routes._run_plaintext_genesis_v2(
+    handled = plaintext._run_plaintext_genesis_v2(
         _Store(), "key", "job1", runtime=object(), source_groups=_groups(), relationship_anchor=None)
 
     assert handled is True
@@ -97,7 +97,7 @@ def test_v2_returns_false_when_nothing_greetable(monkeypatch):
     monkeypatch.setattr(service, "apply_reducer_output",
                         lambda *a, **k: applied.__setitem__("n", applied["n"] + 1))
 
-    handled = routes._run_plaintext_genesis_v2(
+    handled = plaintext._run_plaintext_genesis_v2(
         _Store(), "key", "job1", runtime=object(), source_groups=_groups(), relationship_anchor=None)
 
     assert handled is False and applied["n"] == 0                # never greets/completes on nothing
@@ -107,16 +107,16 @@ def test_v2_background_failure_keeps_job_done(monkeypatch):
     last = {}
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: last.update(output=k.get("output")))
     monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
-    monkeypatch.setattr(routes, "_plaintext_merge_reducer_outputs", lambda outs, **k: {"merged": True})
+    monkeypatch.setattr(plaintext, "_plaintext_merge_reducer_outputs", lambda outs, **k: {"merged": True})
     monkeypatch.setattr(service, "apply_reducer_output", lambda *a, **k: None)
     monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
                         lambda **k: ({"agent_name": "", "dimensions": []}, []))
 
     def boom(*a, **k):
         raise RuntimeError("provider 402 out of credits")
-    monkeypatch.setattr(routes, "_run_plaintext_background_enrichment", boom)
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment", boom)
 
-    handled = routes._run_plaintext_genesis_v2(
+    handled = plaintext._run_plaintext_genesis_v2(
         _Store(), "key", "job1", runtime=object(), source_groups=_groups(), relationship_anchor=None)
 
     assert handled is True                                       # job NOT failed — already greetable
@@ -132,7 +132,7 @@ def test_v2_background_lexical_backstop_drops_near_identical(monkeypatch):
         {"summary": "用户养了一只比熊狗，叫蛋子。"},   # near-identical survivor -> backstop drops
         {"summary": "用户在杭州工作"},                # distinct -> keep
     ], "source_family": "history"})
-    monkeypatch.setattr(routes, "_plaintext_merge_reducer_outputs",
+    monkeypatch.setattr(plaintext, "_plaintext_merge_reducer_outputs",
                         lambda outs, **k: {"memories": outs[0]["memories"]} if outs else {"memories": []})
     monkeypatch.setattr(service, "apply_memory_outputs",
                         lambda store, api_key, merged: applied.update(memories=merged.get("memories")))
@@ -141,7 +141,7 @@ def test_v2_background_lexical_backstop_drops_near_identical(monkeypatch):
     monkeypatch.setattr(service, "write_persona_artifact", lambda *a, **k: ("", ""))
     monkeypatch.setattr(service, "write_voice_artifact", lambda *a, **k: ("", ""))
 
-    routes._run_plaintext_background_enrichment(
+    plaintext._run_plaintext_background_enrichment(
         _Store(), "key", "job1", runtime=object(),
         source_groups=[{"source_kind": "history_import", "source_family": "history", "chunk_texts": ["c"]}],
         relationship_anchor=None, skip_family="history", skip_texts=set(),
@@ -160,7 +160,7 @@ def test_v2_foreground_writes_identity_greeting_then_completes(monkeypatch):
     calls = {}
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
     monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
-    monkeypatch.setattr(routes, "_plaintext_merge_reducer_outputs",
+    monkeypatch.setattr(plaintext, "_plaintext_merge_reducer_outputs",
                         lambda outs, **k: {"memories": [{"summary": "用户养了一只狗叫蛋子"}]})
     monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
     monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
@@ -180,10 +180,10 @@ def test_v2_foreground_writes_identity_greeting_then_completes(monkeypatch):
                         lambda store, job, status=None: calls.__setitem__("completed", status))
     monkeypatch.setattr(service, "apply_reducer_output",
                         lambda *a, **k: calls.__setitem__("used_apply_reducer", True))
-    monkeypatch.setattr(routes, "_run_plaintext_background_enrichment",
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment",
                         lambda *a, **k: calls.__setitem__("bg_write_identity", k.get("write_identity")))
 
-    handled = routes._run_plaintext_genesis_v2(
+    handled = plaintext._run_plaintext_genesis_v2(
         _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
         relationship_anchor={"days_with_user": 144},
         analysis_messages=[{"role": "user", "content": "hi"}])
@@ -222,9 +222,9 @@ def test_v2_foreground_writes_full_memory_set_and_feeds_identity_and_greeting(mo
     monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting", lambda *a, **k: None)
     monkeypatch.setattr(db, "genesis_complete_job", lambda *a, **k: {"job_id": "job1", "status": "done"})
     monkeypatch.setattr(service, "write_genesis_state", lambda *a, **k: None)
-    monkeypatch.setattr(routes, "_run_plaintext_background_enrichment", lambda *a, **k: None)
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment", lambda *a, **k: None)
 
-    handled = routes._run_plaintext_genesis_v2(
+    handled = plaintext._run_plaintext_genesis_v2(
         _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
         relationship_anchor={"days_with_user": 144},
         analysis_messages=[{"role": "user", "content": "hi"}])
@@ -286,10 +286,10 @@ def test_v2_combined_flag_writes_voice_persona_before_completion(monkeypatch):
 
     monkeypatch.setattr(db, "genesis_complete_job", fake_complete)
     monkeypatch.setattr(service, "write_genesis_state", lambda *a, **k: None)
-    monkeypatch.setattr(routes, "_run_plaintext_background_enrichment",
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("combined path must not rely on background")))
 
-    handled = routes._run_plaintext_genesis_v2(
+    handled = plaintext._run_plaintext_genesis_v2(
         _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
         relationship_anchor={"days_with_user": 144},
         analysis_messages=[{"role": "user", "content": "hi"}])
@@ -341,9 +341,9 @@ def test_v2_foreground_full_fact_write_spans_all_source_groups(monkeypatch):
     monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting", lambda *a, **k: None)
     monkeypatch.setattr(db, "genesis_complete_job", lambda *a, **k: {"job_id": "job1", "status": "done"})
     monkeypatch.setattr(service, "write_genesis_state", lambda *a, **k: None)
-    monkeypatch.setattr(routes, "_run_plaintext_background_enrichment", lambda *a, **k: None)
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment", lambda *a, **k: None)
 
-    handled = routes._run_plaintext_genesis_v2(
+    handled = plaintext._run_plaintext_genesis_v2(
         _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
         relationship_anchor={"days_with_user": 144},
         analysis_messages=[{"role": "user", "content": "hi"}])
@@ -373,7 +373,7 @@ def test_v2_background_can_skip_fact_write_for_voice_persona_only(monkeypatch):
         }
 
     monkeypatch.setattr(worker, "build_reducer_output_from_texts", fake_build)
-    monkeypatch.setattr(routes, "_plaintext_merge_reducer_outputs",
+    monkeypatch.setattr(plaintext, "_plaintext_merge_reducer_outputs",
                         lambda outs, **k: {
                             "memories": [m for out in outs for m in out.get("memories", [])],
                             "persona": outs[0].get("persona", {}),
@@ -386,7 +386,7 @@ def test_v2_background_can_skip_fact_write_for_voice_persona_only(monkeypatch):
     monkeypatch.setattr(service, "write_persona_artifact", lambda *a, **k: calls.update(persona=True) or ("ref", "sha"))
     monkeypatch.setattr(service, "write_voice_artifact", lambda *a, **k: calls.update(voice=True) or ("vref", "vsha"))
 
-    routes._run_plaintext_background_enrichment(
+    plaintext._run_plaintext_background_enrichment(
         _Store(), "key", "job1", runtime=object(),
         source_groups=[{"source_kind": "history_import", "source_family": "history", "chunk_texts": ["c"]}],
         relationship_anchor=None, skip_family="history", skip_texts=set(),
@@ -413,7 +413,7 @@ def test_v2_foreground_provider_identity_failure_marks_job_failed(monkeypatch):
     monkeypatch.setattr(service, "apply_memory_outputs",
                         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must fail before writes")))
 
-    handled = routes._run_plaintext_genesis_v2(
+    handled = plaintext._run_plaintext_genesis_v2(
         _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
         relationship_anchor={"days_with_user": 1},
         analysis_messages=[{"role": "user", "content": "hi"}])
@@ -431,7 +431,7 @@ def test_v2_foreground_honors_explicit_relationship_date(monkeypatch):
     calls = {}
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
     monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
-    monkeypatch.setattr(routes, "_plaintext_merge_reducer_outputs", lambda outs, **k: {"memories": [{"summary": "x"}]})
+    monkeypatch.setattr(plaintext, "_plaintext_merge_reducer_outputs", lambda outs, **k: {"memories": [{"summary": "x"}]})
     monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
     monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
                         lambda **k: ({"agent_name": "小柒", "dimensions": [{"name": "温柔"}]}, []))
@@ -443,9 +443,9 @@ def test_v2_foreground_honors_explicit_relationship_date(monkeypatch):
     monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting", lambda *a, **k: None)
     monkeypatch.setattr(db, "genesis_complete_job", lambda *a, **k: {"job_id": "job1"})
     monkeypatch.setattr(service, "write_genesis_state", lambda *a, **k: None)
-    monkeypatch.setattr(routes, "_run_plaintext_background_enrichment", lambda *a, **k: None)
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment", lambda *a, **k: None)
 
-    routes._run_plaintext_genesis_v2(
+    plaintext._run_plaintext_genesis_v2(
         _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
         relationship_anchor={"days_with_user": 200, "relationship_started_at": "2024-06-01"},
         analysis_messages=[{"role": "user", "content": "hi"}])
@@ -461,7 +461,7 @@ def test_v2_foreground_falls_back_when_no_identity(monkeypatch):
     calls = {}
     monkeypatch.setattr(db, "genesis_set_job_status", lambda *a, **k: None)
     monkeypatch.setattr(worker, "build_foreground_output_from_texts", _greetable_fg)
-    monkeypatch.setattr(routes, "_plaintext_merge_reducer_outputs", lambda outs, **k: {"memories": []})
+    monkeypatch.setattr(plaintext, "_plaintext_merge_reducer_outputs", lambda outs, **k: {"memories": []})
     monkeypatch.setattr(history_import, "_import_language_for_store", lambda store, msgs: "zh")
     monkeypatch.setattr(foreground_identity, "derive_foreground_identity",
                         lambda **k: ({"agent_name": "", "dimensions": []}, []))
@@ -471,10 +471,10 @@ def test_v2_foreground_falls_back_when_no_identity(monkeypatch):
                         lambda *a, **k: ("", []))
     monkeypatch.setattr(history_import, "_append_model_api_onboarding_greeting",
                         lambda store, text: calls.__setitem__("greeting", text))
-    monkeypatch.setattr(routes, "_run_plaintext_background_enrichment",
+    monkeypatch.setattr(plaintext, "_run_plaintext_background_enrichment",
                         lambda *a, **k: calls.__setitem__("bg_write_identity", k.get("write_identity")))
 
-    routes._run_plaintext_genesis_v2(
+    plaintext._run_plaintext_genesis_v2(
         _Store(), "key", "job1", runtime=object(), source_groups=_groups(),
         relationship_anchor={"days_with_user": 1},
         analysis_messages=[{"role": "user", "content": "hi"}])
@@ -485,10 +485,10 @@ def test_v2_foreground_falls_back_when_no_identity(monkeypatch):
 
 
 def test_merged_has_identity_rule():
-    assert routes._merged_has_identity({"identity": {"agent_name": "小柒", "dimensions": []}})
-    assert routes._merged_has_identity({"identity": {"agent_name": "", "dimensions": [{"name": "温柔"}]}})
-    assert not routes._merged_has_identity({"identity": {"agent_name": "", "dimensions": []}})
-    assert not routes._merged_has_identity({"memories": []})
+    assert plaintext._merged_has_identity({"identity": {"agent_name": "小柒", "dimensions": []}})
+    assert plaintext._merged_has_identity({"identity": {"agent_name": "", "dimensions": [{"name": "温柔"}]}})
+    assert not plaintext._merged_has_identity({"identity": {"agent_name": "", "dimensions": []}})
+    assert not plaintext._merged_has_identity({"memories": []})
 
 
 def test_v2_background_derives_baseline_identity_from_persona(monkeypatch):
@@ -501,7 +501,7 @@ def test_v2_background_derives_baseline_identity_from_persona(monkeypatch):
         "persona": {"content": "你是小柒，温柔细心的陪伴者。"},
         "identity": {"agent_name": "", "dimensions": []},   # reduce produced NO identity
         "source_family": "history"})
-    monkeypatch.setattr(routes, "_plaintext_merge_reducer_outputs", lambda outs, **k: {
+    monkeypatch.setattr(plaintext, "_plaintext_merge_reducer_outputs", lambda outs, **k: {
         "memories": outs[0]["memories"], "persona": outs[0]["persona"],
         "identity": {"agent_name": "", "dimensions": []}})
     monkeypatch.setattr(worker, "derive_identity_from_persona", lambda **k: {
@@ -513,7 +513,7 @@ def test_v2_background_derives_baseline_identity_from_persona(monkeypatch):
     monkeypatch.setattr(service, "write_persona_artifact", lambda *a, **k: ("", ""))
     monkeypatch.setattr(service, "write_voice_artifact", lambda *a, **k: ("", ""))
 
-    routes._run_plaintext_background_enrichment(
+    plaintext._run_plaintext_background_enrichment(
         _Store(), "key", "job1", runtime=object(),
         source_groups=[{"source_kind": "history_import", "source_family": "history", "chunk_texts": ["c"]}],
         relationship_anchor=None, skip_family="history", skip_texts=set(), known_memories=[])

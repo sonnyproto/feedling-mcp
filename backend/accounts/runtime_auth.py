@@ -1,4 +1,4 @@
-"""Runtime-token authentication (Stage D).
+"""Runtime-token authentication (Stage D) — scope re-check helper.
 
 Lets a hosted consumer authenticate with a short-lived, user-scoped runtime
 token (minted by the trusted agent-runner supervisor) instead of the user's
@@ -7,63 +7,40 @@ credential. Verified against the shared HMAC secret
 ``FEEDLING_RUNTIME_TOKEN_SECRET``; the WHOLE feature is OFF unless that secret is
 set, so existing API-key callers are unaffected.
 
-The primitive lives in ``core.runtime_token`` (stdlib-only) so this — and the
-supervisor's minting side — can both use it without a dependency-direction
-violation.
+The framework-neutral logic (secret, token extraction, scope authorization)
+lives in ``accounts.auth_core`` so the ASGI routes share one source of truth
+(plan §7.1). The scoped ASGI routes enforce scope at the route boundary via
+``asgi.deps.require_scope``; ``authorize_scope`` here is the historical
+tool-executor-level re-check, now reading the resolved claims from the ASGI
+request context (``asgi.context``) instead of ``flask.g``.
 """
 
 from __future__ import annotations
 
-import os
+from accounts import auth_core
 
-from flask import abort, g, request
-
-from core import runtime_token
-
-RUNTIME_TOKEN_HEADER = "X-Feedling-Runtime-Token"
+RUNTIME_TOKEN_HEADER = auth_core.RUNTIME_TOKEN_HEADER
 
 
 def _secret() -> bytes | None:
-    s = (os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET") or "").strip()
-    return s.encode("utf-8") if s else None
+    return auth_core.runtime_secret()
 
 
 def is_enabled() -> bool:
-    return _secret() is not None
-
-
-def extract_runtime_token() -> str | None:
-    return (request.headers.get(RUNTIME_TOKEN_HEADER) or "").strip() or None
-
-
-def resolve_claims() -> dict | None:
-    """Verified claims when a runtime token is present AND the feature is enabled.
-
-    Returns None when no token is sent or the feature is disabled (caller falls
-    back to the API key). Raises ``core.runtime_token.TokenError`` when a token IS
-    present but invalid/expired, so the caller fails closed (401) instead of
-    silently falling back to another credential.
-    """
-    token = extract_runtime_token()
-    if not token:
-        return None
-    secret = _secret()
-    if secret is None:
-        return None  # feature disabled — ignore the header entirely
-    return runtime_token.verify(secret, token)
+    return auth_core.is_runtime_enabled()
 
 
 def authorize_scope(scope: str) -> None:
     """Enforce that a runtime-token request carries ``scope`` (slice 4).
 
     No-op for api-key auth (the long-term key is full-access) and when the
-    feature is off. Aborts 403 when the request authenticated with a runtime
-    token whose ``scope`` list does not include ``scope``. Routes call this right
-    after ``require_user`` with the scope they need (e.g. "memory", "identity")."""
-    claims = getattr(g, "runtime_token_claims", None)
-    if not claims:
-        return
-    try:
-        runtime_token.authorize(claims, user_id=getattr(g, "user_id", ""), scope=scope)
-    except runtime_token.TokenError:
-        abort(403)
+    feature is off. Aborts (raises ``auth_core.AuthError``) when the request
+    authenticated with a runtime token whose ``scope`` list does not include
+    ``scope``. Reads the resolved claims / user id from the ASGI request context
+    — the flask-free successor to the old ``flask.g`` read.
+    """
+    from asgi.context import current_runtime_claims, current_user_id
+
+    auth_core.authorize_scope(
+        current_runtime_claims.get(None), current_user_id.get("-"), scope
+    )

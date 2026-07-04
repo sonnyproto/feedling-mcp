@@ -1,10 +1,19 @@
-"""gunicorn server config — 生产 WSGI 启动钩子。
+"""gunicorn server config — 生产启动钩子（WSGI Flask 与 ASGI FastAPI 共用）。
 
-``on_starting`` 在 gunicorn master 进程启动时执行一次（worker fork 之前）。用于
-fail-fast：gateway-only codex 用户依赖 in-CVM LiteLLM gateway，未开则拒绝启动而非让
-请求在运行期 hang。校验放这里而非 app.py 模块 import 顶层——后者会让单测 ``import app``
-也触发校验。仅 backend gunicorn（app:app，注册了 chat_routes）需要；enclave_app 不路由
-chat send，不加载本 config。"""
+``on_starting`` 在 gunicorn master 进程启动时执行一次（worker fork 之前）。两件事：
+
+1. **fail-fast 托管校验**：gateway-only codex 用户依赖 in-CVM LiteLLM gateway，未开则
+   拒绝启动而非让请求在运行期 hang。放这里而非 app.py 模块 import 顶层——后者会让单测
+   ``import app`` 也触发校验。
+2. **DB migration 单点**（ASGI 迁移计划 §5.2/§8.1/§19.6）：``db.init_schema()``
+   （alembic ``upgrade head``）在 master、fork 之前跑一次。**ASGI 入口 ``asgi_app:app``
+   不 import app.py**，所以这是 FastAPI 下 schema 升级的唯一位置——漏掉 = 新镜像服务旧
+   schema（本计划最高危单点）。对 legacy Flask ``app:app`` 这一步幂等冗余（app.py import
+   时也跑），顺带消除"每 worker 各跑一次 alembic"的竞态。
+
+两种入口都用 ``--config gunicorn_conf.py``；``on_starting`` 是 master 钩子，与 worker
+class（sync 线程 / UvicornWorker）无关，换 worker class 后照样在 fork 前执行。enclave_app
+不路由 chat send、不加载本 config。"""
 
 import os
 
@@ -41,3 +50,9 @@ def on_starting(server):
         sys.path.insert(0, here)
     from hosted import agent_runtime_cutover
     agent_runtime_cutover.assert_hosting_ready()
+    # DB migration single-point (master, once, before fork). See module docstring:
+    # the ASGI entrypoint asgi_app:app does NOT import app.py, so this is the only
+    # place the schema is upgraded under FastAPI. Idempotent for the Flask path.
+    import db
+    db.init_schema()
+    print("[gunicorn] on_starting: hosting ready + schema init done", flush=True)

@@ -4,10 +4,9 @@ import sys
 import threading
 from pathlib import Path
 
-from flask import Flask
-
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+from core import reqctx  # noqa: E402
 from proactive import dashboard  # noqa: E402
 from proactive.observability_v2 import (  # noqa: E402
     METRIC_TURN_COMPLETED,
@@ -124,8 +123,7 @@ def test_dashboard_reads_v2_turn_action_tool_records_and_round3_labels(monkeypat
     assert snapshot["v2_health"]["wake_volume"] == 1
     assert snapshot["v2_health"]["turn_count"] == 1
 
-    app = Flask(__name__)
-    with app.test_request_context("/debug/proactive?lang=en&detail=1"):
+    with reqctx.bind(query_string="lang=en&detail=1"):
         html = dashboard._render_proactive_dashboard(snapshot)
 
     assert "Runtime V2 Wakes And Turns" in html
