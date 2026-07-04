@@ -24,6 +24,7 @@ it (verify=False). The backend API URL is verified normally.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import secrets
@@ -79,15 +80,19 @@ def _http(method: str, url: str, *, body: dict | None = None, api_key: str | Non
 
 
 def _box_seal(pt: bytes, recipient_pk: X25519PublicKey) -> bytes:
-    """HKDF-SHA256(info='feedling-box-seal-v1') + ChaChaPoly; ek_pub||ct||tag16.
-    Byte-for-byte matches iOS ContentEncryption.swift + backend content_encryption."""
+    """X25519 ECDH → HKDF-SHA256(salt=None, info='feedling-box-seal-v1') →
+    nonce = SHA256(ek_pub || recipient_pub)[:12] → ChaCha20-Poly1305.
+    Output ek_pub(32) || ct || tag(16). Byte-for-byte matches iOS BoxSeal.seal,
+    backend/content_encryption.box_seal, and the enclave's _box_seal_open_hkdf —
+    the enclave rejects any other scheme with 'box_seal tag invalid'."""
     ek = X25519PrivateKey.generate()
     ek_pub = ek.public_key().public_bytes(*_RAW)
     shared = ek.exchange(recipient_pk)
     recipient_raw = recipient_pk.public_bytes(*_RAW)
-    key = HKDF(algorithm=hashes.SHA256(), length=32, salt=ek_pub + recipient_raw,
+    key = HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
                info=b"feedling-box-seal-v1").derive(shared)
-    return ek_pub + ChaCha20Poly1305(key).encrypt(b"\x00" * 12, pt, None)
+    nonce = hashlib.sha256(ek_pub + recipient_raw).digest()[:12]
+    return ek_pub + ChaCha20Poly1305(key).encrypt(nonce, pt, None)
 
 
 def _fail(msg: str) -> "NoReturn":  # type: ignore[name-defined]

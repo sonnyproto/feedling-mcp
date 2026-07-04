@@ -237,6 +237,8 @@ jobs:
             cvm:
               - 'backend/**'
               - 'tools/chat_resident_consumer.py'
+              - 'tools/deploy_canary.py'
+              - 'deploy/attestation-gate.sh'
               - 'deploy/Dockerfile'
               - 'deploy/Dockerfile.agent-runner'
               - 'deploy/docker-compose.phala.yaml'
@@ -261,6 +263,8 @@ jobs:
             cvm:
               - 'backend/**'
               - 'tools/chat_resident_consumer.py'
+              - 'tools/deploy_canary.py'
+              - 'deploy/attestation-gate.sh'
               - 'deploy/Dockerfile'
               - 'deploy/Dockerfile.agent-runner'
               - 'deploy/docker-compose.phala.test.yaml'
