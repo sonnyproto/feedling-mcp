@@ -761,6 +761,38 @@ def _bootstrap_event_stats(store: UserStore, *, include_events: bool = False) ->
     return out
 
 
+def _runtime_summary(store: UserStore) -> dict:
+    """Non-secret hosting-runtime facts (detail view): which driver/provider/
+    transport serves this user. Closes the blind spot behind 'agent can't read
+    memory' — a codex-driven user whose Bash io_cli reads would break in-CVM
+    unless the default sandbox-bypass command is used, or a gateway-routed
+    provider. Metadata only — no api_key / base_url is read."""
+    out = {"provider": "", "model": "", "test_status": "",
+           "driver": "", "codex_transport": "", "cli_cmd_custom": False}
+    try:
+        from hosted import config_store as _cfg_store
+        cfg = _cfg_store._load_model_api_config(store) or {}
+    except Exception:
+        return out
+    provider = str(cfg.get("provider") or "")
+    out.update({
+        "provider": provider,
+        "model": str(cfg.get("model") or ""),
+        "test_status": str(cfg.get("test_status") or ""),
+        # A custom cli_cmd drops the default codex --dangerously-bypass command,
+        # which is what makes io_cli memory reads work in-CVM. True → suspicious.
+        "cli_cmd_custom": bool(str(cfg.get("cli_cmd") or "").strip()),
+    })
+    if provider:
+        try:
+            from hosted import agent_runtime_cutover as _cutover
+            out["driver"] = _cutover.driver_for_provider(provider)
+            out["codex_transport"] = _cutover.codex_transport(provider)
+        except Exception:
+            pass
+    return out
+
+
 def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) -> dict:
     user_id = str(user_entry.get("user_id") or "")
     store = core_store.get_store(user_id)
@@ -842,6 +874,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         "history_import": history_import,
     }
     if include_detail:
+        row["runtime"] = _runtime_summary(store)
         row["identity"] = {
             "written": identity is not None,
             "updated_at": identity_updated_at,
