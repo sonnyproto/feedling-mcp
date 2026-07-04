@@ -369,7 +369,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install phala CLI
-        run: npm install -g phala
+        run: npm install -g phala@1.1.19  # pinned (§8 supply-chain); bump deliberately
 
       # Deploy FIRST so we can read the live compose_hash back from dstack.
       # Pre-computing the hash from the local compose file doesn't work:
@@ -570,6 +570,41 @@ jobs:
           done
           exit "$publish_status"
 
+      # §2 incident guardrail: fail the deploy RED within minutes if the live
+      # enclave content pk ever diverges from the recorded baseline (a real KMS /
+      # OS / config key event), instead of a user reporting "decrypt failed" days
+      # later. DEFENSIVE: inert (skips, never fails) until BOTH repo vars are set —
+      #   PROD_MAIN_ENCLAVE_URL      = https://<prod-app-id>-5003s.dstack-pha-prod9.phala.network
+      #   ENCLAVE_CONTENT_PK_BASELINE = 2d642ec1f54719d8c6088e8cbaf394961cb804a533bd4d7366d48d1d543f5620
+      # A legitimate planned key change = update ENCLAVE_CONTENT_PK_BASELINE in the same PR.
+      - name: Post-deploy attestation gate
+        env:
+          ATTEST_BASE:  ${{ vars.PROD_MAIN_ENCLAVE_URL }}
+          BASELINE_PK:  ${{ vars.ENCLAVE_CONTENT_PK_BASELINE }}
+        run: ./deploy/attestation-gate.sh prod attestation-prod.json
+
+      - name: Upload attestation snapshot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: attestation-prod-${{ github.sha }}
+          path: attestation-prod.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # §3 post-deploy canary: register → whoami==attestation → seal → enclave
+      # decrypt → reset, proving the whole write/seal/decrypt loop on the live
+      # CVM. Inert until PROD_MAIN_ENCLAVE_URL is set (same gate as §2). The
+      # canary self-cleans its throwaway account (finally: /v1/account/reset).
+      - name: Post-deploy canary round-trip
+        if: ${{ vars.PROD_MAIN_ENCLAVE_URL != '' }}
+        env:
+          FEEDLING_API_URL:     ${{ vars.PROD_API_URL || 'https://api.feedling.app' }}
+          FEEDLING_ENCLAVE_URL: ${{ vars.PROD_MAIN_ENCLAVE_URL }}
+        run: |
+          python3 -m pip install --quiet cryptography
+          python3 tools/deploy_canary.py
+
       - name: Notify Lark deploy finished
         if: always()
         continue-on-error: true
@@ -720,7 +755,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install phala CLI
-        run: npm install -g phala
+        run: npm install -g phala@1.1.19  # pinned (§8 supply-chain); bump deliberately
 
       - name: Resolve CVM_ID
         id: cvmid
@@ -835,6 +870,34 @@ jobs:
           done
           exit "$publish_status"
 
+      # §2 attestation gate (test). Inert until BOTH repo vars are set:
+      #   TEST_MAIN_ENCLAVE_URL            = https://<test-app-id>-5003s.dstack-pha-prod9.phala.network
+      #   TEST_ENCLAVE_CONTENT_PK_BASELINE = <test enclave content pk, from a manual /attestation read>
+      - name: Post-deploy attestation gate (test)
+        env:
+          ATTEST_BASE:  ${{ vars.TEST_MAIN_ENCLAVE_URL }}
+          BASELINE_PK:  ${{ vars.TEST_ENCLAVE_CONTENT_PK_BASELINE }}
+        run: ./deploy/attestation-gate.sh test attestation-test.json
+
+      - name: Upload attestation snapshot (test)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: attestation-test-${{ github.sha }}
+          path: attestation-test.json
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # §3 post-deploy canary (test). Inert until TEST_MAIN_ENCLAVE_URL is set.
+      - name: Post-deploy canary round-trip (test)
+        if: ${{ vars.TEST_MAIN_ENCLAVE_URL != '' }}
+        env:
+          FEEDLING_API_URL:     ${{ vars.TEST_API_URL || 'https://test-api.feedling.app' }}
+          FEEDLING_ENCLAVE_URL: ${{ vars.TEST_MAIN_ENCLAVE_URL }}
+        run: |
+          python3 -m pip install --quiet cryptography
+          python3 tools/deploy_canary.py
+
   # =========================================================================
   # DEPLOY — standalone runner CVM (test, multi-node Form B)
   #
@@ -920,7 +983,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install phala CLI
-        run: npm install -g phala
+        run: npm install -g phala@1.1.19  # pinned (§8 supply-chain); bump deliberately
 
       - name: Resolve runner CVM_ID
         id: cvmid
@@ -1089,7 +1152,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install phala CLI
-        run: npm install -g phala
+        run: npm install -g phala@1.1.19  # pinned (§8 supply-chain); bump deliberately
 
       - name: Read prod runner CVM ids
         id: ids
