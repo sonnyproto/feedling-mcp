@@ -248,7 +248,7 @@ def test_process_messages_image_turn_calls_agent_with_payloads(tmp_path):
     msg = _make_image_msg(ts=9000.0, image_bytes=_JPEG_MAGIC, msg_id="img-proc-01")
     captured = {}
 
-    def fake_call(message, images=None, image_paths=None):
+    def fake_call(message, images=None, image_paths=None, trace_id=None, **kwargs):
         captured["message"] = message
         captured["images"] = images
         captured["image_paths"] = image_paths
@@ -279,7 +279,7 @@ def test_process_messages_image_turn_preserves_caption(tmp_path):
     msg["content"] = "what is wrong here?"  # enclave history 解出的 caption
     captured = {}
 
-    def fake_call(message, images=None, image_paths=None):
+    def fake_call(message, images=None, image_paths=None, trace_id=None, **kwargs):
         captured["message"] = message
         return {"messages": ["I see the image."]}
 
@@ -303,7 +303,7 @@ def test_process_messages_image_turn_no_caption_uses_placeholder(tmp_path):
     msg["content"] = ""  # 没有 caption
     captured = {}
 
-    def fake_call(message, images=None, image_paths=None):
+    def fake_call(message, images=None, image_paths=None, trace_id=None, **kwargs):
         captured["message"] = message
         return {"messages": ["I see the image."]}
 
