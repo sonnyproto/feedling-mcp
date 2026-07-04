@@ -9,6 +9,7 @@ for the once-per-master items). Reconciliation table (plan §8.1 / §3.3):
 |---------------------------------------------|----------------------------------------------|
 | `db.init_schema()` (alembic upgrade head)   | gunicorn_conf.on_starting (master, once)     |
 | `assert_hosting_ready()`                    | gunicorn_conf.on_starting (already present)  |
+| `accounts_registry.load_users()`            | this lifespan (always, per-worker registry)  |
 | anyio threadpool limiter (40-token trap)    | this lifespan (always)                       |
 | process-lifetime httpx.AsyncClient(s)       | this lifespan (always)                       |
 | async poll-waiter wake hook (§9.3/§19.2)    | this lifespan (always) — inject registry.wake|
@@ -81,10 +82,24 @@ async def lifespan(app):
 
     core_store.set_async_wake_hook(registry.wake)
 
-    # (4) Cross-worker wake bus — always on (required for poll wakes).
+    # (4) Initial account-registry load — mirrors app.py:190. WITHOUT this the
+    #     in-memory `_users` / `_key_to_user` start empty and never populate:
+    #     `_resolve_user` only reads the in-memory table (a cache miss does NOT
+    #     hit the DB), and the wake-bus "users" handler below only RELOADS on a
+    #     cross-process NOTIFY — neither performs the initial load. Result: every
+    #     api key resolves to None → 401 on every authenticated route → clients
+    #     stuck "loading". Runs per-worker (each worker owns its own registry) on
+    #     the threadpool because load_users() is sync DB I/O. init_schema() has
+    #     already run in gunicorn on_starting (master), so the tables exist.
+    from accounts import registry as accounts_registry
+
+    await threadpool.run_db(accounts_registry.load_users)
+
+    # (5) Cross-worker wake bus — always on (required for poll wakes). Its
+    #     "users" handler keeps the registry fresh on later cross-process writes.
     _start_wake_bus()
 
-    # (5) :9998 WS-leader election — gated (see module docstring).
+    # (6) :9998 WS-leader election — gated (see module docstring).
     if settings.start_background:
         _start_ws_leader()
 
