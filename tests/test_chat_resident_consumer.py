@@ -648,7 +648,10 @@ def test_user_message_containing_verify_marker_is_not_short_circuited():
         result_ts = crc._process_messages([msg])
 
     mock_agent.assert_called_once()
-    mock_post.assert_called_once_with("here's why")
+    mock_post.assert_called_once()
+    assert mock_post.call_args.args == ("here's why",)
+    assert mock_post.call_args.kwargs["thinking_summary"] == "参考了当前消息和最近对话上下文，整理成这次可见回复。"
+    assert mock_post.call_args.kwargs["thinking_source"] == "foreground_fallback"
     assert result_ts == pytest.approx(4545.0)
 
 
@@ -1695,6 +1698,11 @@ def test_process_proactive_wake_routes_through_agent_and_posts_metadata(monkeypa
         "source": crc.PROACTIVE_JOB_SOURCE,
         "gate_decision_id": "gd_1",
         "proactive_job_id": "pj_1",
+        "thinking_summary": "参考了当前消息和最近对话上下文，整理成这次可见回复。",
+        "thinking_kind": "agent_summary",
+        "thinking_source": "proactive_fallback",
+        "thinking_model": "",
+        "thinking_native": False,
     }
     assert any(s[:3] == ("pj_1", "realizing", "") for s in captured["statuses"])
     assert any(s[0] == "pj_1" and s[1] == "posted" for s in captured["statuses"])
@@ -3227,6 +3235,25 @@ def test_agent_turn_extracts_bare_visible_thinking_summary_fragment():
     assert turn.thinking_summary == "用户再次确认模型身份，直接给出真实答案"
     assert "thinking_summary" not in turn.messages[0]
     assert "messages" not in turn.messages[0]
+
+
+def test_ensure_visible_thinking_summary_fallback_for_plain_reply():
+    turn = crc.AgentTurn(messages=["嘿，看见了。周六深夜还醒着，我陪你。"])
+
+    out = crc._ensure_visible_thinking_summary(turn, source="foreground_fallback")
+
+    assert out.thinking_summary == "参考了当前消息和最近对话上下文，整理成这次可见回复。"
+    assert out.thinking_kind == "agent_summary"
+    assert out.thinking_source == "foreground_fallback"
+    assert out.thinking_native is False
+
+
+def test_ensure_visible_thinking_summary_does_not_touch_action_only_turn():
+    turn = crc.AgentTurn(actions=[{"type": "proactive.sleep", "reason": "不打扰"}])
+
+    out = crc._ensure_visible_thinking_summary(turn, source="proactive_fallback")
+
+    assert out.thinking_summary == ""
 
 
 def test_agent_turn_extracts_claude_stream_json_thinking_blocks():

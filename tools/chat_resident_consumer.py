@@ -1798,6 +1798,25 @@ def _thinking_summary_from_value(value: Any) -> str:
     return ""
 
 
+def _ensure_visible_thinking_summary(turn: AgentTurn, *, source: str) -> AgentTurn:
+    """Attach a conservative visible-summary fallback for user-facing replies.
+
+    Some runtimes spend reasoning tokens but do not expose a displayable
+    reasoning event or follow the JSON thinking protocol. The UI still expects a
+    collapsible summary, so provide a short, honest context summary without
+    inventing hidden chain-of-thought.
+    """
+    if turn.thinking_summary or not turn.messages:
+        return turn
+    turn.thinking_summary = _sanitize_thinking_summary(
+        "参考了当前消息和最近对话上下文，整理成这次可见回复。"
+    )
+    turn.thinking_kind = "agent_summary"
+    turn.thinking_source = _sanitize_thinking_meta(source, max_len=80) or "resident_fallback"
+    turn.thinking_native = False
+    return turn
+
+
 def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
     dst.actions.extend(src.actions)
     dst.messages.extend(src.messages)
@@ -5875,7 +5894,10 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
         _clear_provider_payment_cooldown()
 
-        turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
+        turn = _ensure_visible_thinking_summary(
+            _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES),
+            source="proactive_fallback",
+        )
         actions, replies = turn.actions, turn.messages
         if not replies:
             replies = _send_message_replies_from_actions(actions)
@@ -6442,7 +6464,10 @@ def _process_messages(messages: list) -> float:
                 latest = max(latest, ts)
                 continue
 
-        turn = _split_agent_turn(agent_result)
+        turn = _ensure_visible_thinking_summary(
+            _split_agent_turn(agent_result),
+            source="foreground_fallback",
+        )
         _reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
         _emit_debug_trace(
             "agent", "agent.reply", trace_id=trace_id,
