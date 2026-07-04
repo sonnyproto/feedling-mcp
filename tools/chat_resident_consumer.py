@@ -1667,6 +1667,33 @@ def _looks_like_json_text(text: str) -> bool:
     return bool(stripped) and stripped[0] in "[{"
 
 
+def _visible_reply_fragment_from_text(text: str) -> Any:
+    """Recover the display protocol when the model omits the outer braces.
+
+    Some providers follow the requested
+    {"thinking_summary":"...","messages":["..."]} shape only halfway and emit
+    a JSON object fragment like `"thinking_summary": "...", "messages": [...]`.
+    If we do not recover it here, the protocol text leaks as the visible chat
+    bubble. Keep this narrow: only the visible thinking protocol keys qualify.
+    """
+    stripped = (text or "").strip()
+    if not stripped or stripped[0] in "[{":
+        return None
+    if '"thinking_summary"' not in stripped or '"messages"' not in stripped:
+        return None
+    fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, re.IGNORECASE | re.DOTALL)
+    if fence:
+        stripped = fence.group(1).strip()
+    starts = [idx for key in ('"thinking_summary"', '"messages"') if (idx := stripped.find(key)) >= 0]
+    if not starts:
+        return None
+    fragment = stripped[min(starts):].strip().rstrip(",")
+    parsed = _safe_json_loads("{" + fragment + "}")
+    if isinstance(parsed, dict) and isinstance(parsed.get("messages"), list):
+        return parsed
+    return None
+
+
 def _sanitize_thinking_summary(text: str) -> str:
     """Keep only a short, display-safe reasoning summary.
 
@@ -1838,6 +1865,9 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         raw = obj.strip()
         if not raw:
             return turn
+        visible_fragment = _visible_reply_fragment_from_text(raw)
+        if visible_fragment is not None:
+            return _agent_turn_from_obj(visible_fragment)
         json_objects = _json_objects_from_cli_output(raw)
         if json_objects:
             for item in json_objects:

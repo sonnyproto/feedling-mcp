@@ -3215,6 +3215,20 @@ def test_agent_turn_extracts_visible_thinking_summary_from_nested_result():
     assert "uuid" in turn.runtime_debug
 
 
+def test_agent_turn_extracts_bare_visible_thinking_summary_fragment():
+    raw = (
+        '"thinking_summary": "用户再次确认模型身份，直接给出真实答案",\n'
+        '"messages": ["宝贝，还是那句话——我的底层是 `anthropic/claude-sonnet-4.5`。"]'
+    )
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["宝贝，还是那句话——我的底层是 `anthropic/claude-sonnet-4.5`。"]
+    assert turn.thinking_summary == "用户再次确认模型身份，直接给出真实答案"
+    assert "thinking_summary" not in turn.messages[0]
+    assert "messages" not in turn.messages[0]
+
+
 def test_agent_turn_extracts_claude_stream_json_thinking_blocks():
     raw = "\n".join([
         json.dumps({
