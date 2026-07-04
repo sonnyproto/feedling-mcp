@@ -41,7 +41,10 @@ def _onboarding_validation_payload(store):
 
 def _data_track_qs(**updates) -> str:
     params: dict[str, str] = {}
-    for key in ("admin_key", "since", "registered_since", "q", "limit", "offset", "sort", "dir", "view", "days"):
+    for key in (
+        "admin_key", "since", "registered_since", "q", "limit", "offset", "sort",
+        "dir", "view", "days", "user_id", "subsystem", "status", "trace_id",
+    ):
         value = request.args.get(key, "").strip()
         if value:
             params[key] = value
@@ -901,7 +904,7 @@ def _data_track_request_filters() -> dict:
     if raw_dir not in {"asc", "desc"}:
         raw_dir = "desc"
     raw_view = (request.args.get("view") or "users").strip().lower()
-    if raw_view not in {"users", "dau", "proactive"}:
+    if raw_view not in {"users", "dau", "proactive", "debug"}:
         raw_view = "users"
 
     def read_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -1151,6 +1154,181 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     return payload
 
 
+def _debug_trace_events_for_user(user_id: str) -> tuple[bool, list[dict]]:
+    enabled_raw = db.get_blob(user_id, "v1_flow_trace_enabled")
+    enabled = bool(enabled_raw.get("enabled")) if isinstance(enabled_raw, dict) else bool(enabled_raw)
+    raw = db.get_blob(user_id, "v1_flow_trace") or {}
+    events = raw.get("events") if isinstance(raw, dict) and isinstance(raw.get("events"), list) else []
+    out = []
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        ev = dict(e)
+        ev["user_id"] = user_id
+        try:
+            ev["ts"] = float(ev.get("ts") or 0)
+        except (TypeError, ValueError):
+            ev["ts"] = 0.0
+        out.append(ev)
+    return enabled, out
+
+
+def _debug_trace_stem(event_type: str) -> str:
+    typ = str(event_type or "")
+    for suffix in (".start", ".done", ".error"):
+        if typ.endswith(suffix):
+            return typ[:-len(suffix)]
+    return typ
+
+
+def _debug_trace_detect_stall(events: list[dict]) -> bool:
+    open_stems: set[str] = set()
+    for ev in sorted(events, key=lambda e: float(e.get("ts") or 0)):
+        typ = str(ev.get("type") or "")
+        stem = _debug_trace_stem(typ)
+        if typ.endswith(".start"):
+            open_stems.add(stem)
+        elif typ.endswith(".done") or typ.endswith(".error"):
+            open_stems.discard(stem)
+    return bool(open_stems)
+
+
+def _debug_trace_group_turns(events: list[dict]) -> list[dict]:
+    buckets: dict[tuple[str, str], list[dict]] = {}
+    for ev in events:
+        trace_id = str(ev.get("trace_id") or "ungrouped")
+        user_id = str(ev.get("user_id") or "")
+        buckets.setdefault((user_id, trace_id), []).append(ev)
+    turns = []
+    for (user_id, trace_id), rows in buckets.items():
+        ordered = sorted(rows, key=lambda e: float(e.get("ts") or 0))
+        stalled = _debug_trace_detect_stall(ordered)
+        any_error = any(str(e.get("status") or "") in {"error", "failed"} for e in ordered)
+        any_blocked = any(str(e.get("status") or "") == "blocked" for e in ordered)
+        terminal = "stalled" if stalled else ("error" if any_error else ("blocked" if any_blocked else "ok"))
+        total = 0.0
+        for ev in ordered:
+            try:
+                total += float(ev.get("dur_ms") or 0)
+            except (TypeError, ValueError):
+                continue
+        title = (
+            next((str(e.get("explain") or "") for e in ordered if str(e.get("explain") or "")), "")
+            or next((str(e.get("summary") or "") for e in ordered if str(e.get("summary") or "")), "")
+            or trace_id
+        )
+        turns.append({
+            "user_id": user_id,
+            "trace_id": trace_id,
+            "rows": ordered,
+            "title": title,
+            "first_ts": ordered[0].get("ts") if ordered else 0,
+            "last_ts": ordered[-1].get("ts") if ordered else 0,
+            "total_dur_ms": round(total, 1),
+            "terminal_status": terminal,
+            "is_stalled": stalled,
+        })
+    turns.sort(key=lambda t: float(t.get("last_ts") or 0), reverse=True)
+    return turns
+
+
+def _debug_trace_search_text(ev: dict) -> str:
+    parts = [
+        ev.get("user_id"),
+        ev.get("trace_id"),
+        ev.get("subsystem"),
+        ev.get("type"),
+        ev.get("status"),
+        ev.get("summary"),
+        ev.get("explain"),
+        ev.get("detail"),
+        ev.get("content_excerpt"),
+    ]
+    return " ".join(str(p or "") for p in parts).lower()
+
+
+def _data_track_debug_payload() -> dict:
+    filters = _data_track_request_filters()
+    user_filter = (request.args.get("user_id") or "").strip()
+    subsystem_filter = (request.args.get("subsystem") or "").strip()
+    status_filter = (request.args.get("status") or "").strip().lower()
+    trace_filter = (request.args.get("trace_id") or "").strip()
+    q = str(filters.get("q") or "").strip().lower()
+    since_epoch = float(filters.get("since_epoch") or 0)
+
+    with registry._users_lock:
+        users = [dict(u) for u in registry._users if u.get("user_id")]
+    if user_filter:
+        users = [u for u in users if str(u.get("user_id") or "") == user_filter]
+
+    all_events: list[dict] = []
+    user_rows: dict[str, dict] = {}
+    for user in users:
+        uid = str(user.get("user_id") or "")
+        enabled, events = _debug_trace_events_for_user(uid)
+        matching = []
+        for ev in events:
+            if since_epoch and float(ev.get("ts") or 0) < since_epoch:
+                continue
+            if subsystem_filter and str(ev.get("subsystem") or "") != subsystem_filter:
+                continue
+            if trace_filter and trace_filter not in str(ev.get("trace_id") or ""):
+                continue
+            if q and q not in _debug_trace_search_text(ev):
+                continue
+            matching.append(ev)
+        if matching or enabled:
+            latest = max((float(e.get("ts") or 0) for e in matching), default=0)
+            user_rows[uid] = {
+                "user_id": uid,
+                "principal_id": user.get("principal_id") or "",
+                "enabled": enabled,
+                "events": len(matching),
+                "last_ts": latest,
+                "last_at": core_util._epoch_to_iso(latest),
+            }
+        all_events.extend(matching)
+
+    turns = _debug_trace_group_turns(all_events)
+    if status_filter and status_filter != "all":
+        turns = [t for t in turns if t.get("terminal_status") == status_filter]
+        allowed = {(t["user_id"], t["trace_id"]) for t in turns}
+        all_events = [
+            e for e in all_events
+            if (str(e.get("user_id") or ""), str(e.get("trace_id") or "ungrouped")) in allowed
+        ]
+        allowed_users = {t["user_id"] for t in turns}
+        user_rows = {uid: row for uid, row in user_rows.items() if uid in allowed_users}
+
+    users_out = list(user_rows.values())
+    users_out.sort(key=lambda u: float(u.get("last_ts") or 0), reverse=True)
+    users_out = [u for u in users_out if not user_filter or u["user_id"] == user_filter]
+
+    return {
+        "summary": {
+            "generated_at": datetime.now().isoformat(),
+            "users_scanned": len(users),
+            "users_with_events": sum(1 for u in users_out if int(u.get("events") or 0) > 0),
+            "events_total": len(all_events),
+            "turns_total": len(turns),
+            "stalled_turns": sum(1 for t in turns if t.get("terminal_status") == "stalled"),
+            "error_turns": sum(1 for t in turns if t.get("terminal_status") == "error"),
+        },
+        "filters": {
+            "since": filters.get("since", ""),
+            "q": q,
+            "user_id": user_filter,
+            "subsystem": subsystem_filter,
+            "status": status_filter,
+            "trace_id": trace_filter,
+            "view": "debug",
+        },
+        "users": users_out,
+        "turns": turns,
+        "events": sorted(all_events, key=lambda e: float(e.get("ts") or 0), reverse=True),
+    }
+
+
 def _data_track_dau_payload() -> dict:
     filters = _data_track_request_filters()
     days = int(filters.get("days") or 30)
@@ -1288,6 +1466,7 @@ def _render_data_track_view_nav(active: str) -> str:
         f"{nav_item('users', 'Users')}"
         f"{nav_item('dau', 'DAU')}"
         f"{nav_item('proactive', 'Proactive 日报')}"
+        f"{nav_item('debug', 'Debug')}"
         "</div>"
     )
 
@@ -1642,6 +1821,163 @@ def _render_proactive_daily_page(payload: dict) -> str:
     <thead><tr><th>北京日</th><th>Jobs</th><th>投递</th><th>失败</th><th>Pending</th><th>成功率</th><th>心跳</th><th>屏幕</th></tr></thead>
     <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='8' class='muted'>此区间无 proactive job。</td></tr>"}</tbody>
   </table>
+</main>
+</body>
+</html>"""
+
+
+def _debug_json(obj) -> str:
+    if not obj:
+        return ""
+    return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
+def _debug_ms(ms) -> str:
+    try:
+        value = float(ms or 0)
+    except (TypeError, ValueError):
+        return ""
+    return f"{value:.0f}ms" if value else ""
+
+
+def _debug_time(ts) -> str:
+    try:
+        value = float(ts or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return datetime.fromtimestamp(value).strftime("%H:%M:%S") if value else "—"
+
+
+def _render_data_track_debug_page(payload: dict) -> str:
+    summary = payload["summary"]
+    filters = payload.get("filters", {})
+    users = payload.get("users", [])
+    turns = payload.get("turns", [])
+
+    def input_value(name: str) -> str:
+        return html.escape(str(filters.get(name) or ""), quote=True)
+
+    user_rows = []
+    for row in users:
+        href = _data_track_page_href(view="debug", user_id=row["user_id"])
+        enabled_cls = "ok" if row.get("enabled") else "muted"
+        user_rows.append(
+            "<tr>"
+            f"<td><a href='{html.escape(href, quote=True)}'>{html.escape(row['user_id'])}</a>"
+            f"<br><span class='muted'>{html.escape(str(row.get('principal_id') or ''))}</span></td>"
+            f"<td>{int(row.get('events') or 0)}</td>"
+            f"<td><span class='pill {enabled_cls}'>{'enabled' if row.get('enabled') else 'off'}</span></td>"
+            f"<td>{html.escape(str(row.get('last_at') or ''))}</td>"
+            "</tr>"
+        )
+
+    turn_cards = []
+    for turn in turns:
+        status = str(turn.get("terminal_status") or "ok")
+        mark = "⏳" if status == "stalled" else ("✗" if status == "error" else ("!" if status == "blocked" else "✓"))
+        status_cls = "warn" if status in {"stalled", "blocked"} else ("bad" if status == "error" else "ok")
+        rows_html = []
+        for ev in turn.get("rows") or []:
+            detail = _debug_json(ev.get("detail"))
+            excerpt = _debug_json(ev.get("content_excerpt"))
+            detail_block = ""
+            if detail or excerpt:
+                detail_block = (
+                    "<details class='event-detail'><summary>detail / 明文</summary>"
+                    f"{'<h4>detail</h4><pre>' + html.escape(detail) + '</pre>' if detail else ''}"
+                    f"{'<h4>content_excerpt</h4><pre>' + html.escape(excerpt) + '</pre>' if excerpt else ''}"
+                    "</details>"
+                )
+            ev_status = str(ev.get("status") or "")
+            ev_cls = "bad" if ev_status in {"error", "failed"} else ("warn" if ev_status == "blocked" else "ok")
+            rows_html.append(
+                "<div class='event-row'>"
+                f"<div class='event-meta'><span class='mono'>{html.escape(_debug_time(ev.get('ts')))}</span>"
+                f"<span class='pill'>{html.escape(str(ev.get('subsystem') or ''))}</span>"
+                f"<span class='mono'>{html.escape(str(ev.get('type') or ''))}</span>"
+                f"<span class='pill {ev_cls}'>{html.escape(ev_status or 'ok')}</span>"
+                f"<span class='muted'>{html.escape(_debug_ms(ev.get('dur_ms')))}</span></div>"
+                f"<div>{html.escape(str(ev.get('explain') or ev.get('summary') or ''))}</div>"
+                f"{detail_block}"
+                "</div>"
+            )
+        stalled_note = (
+            "<div class='stall'>⏳ 有步骤只 start 没 done/error，可能卡在模型返回或后续写回。</div>"
+            if turn.get("is_stalled") else ""
+        )
+        turn_cards.append(
+            "<section class='turn'>"
+            f"<h3><span>{mark}</span> <span>{html.escape(str(turn.get('title') or ''))}</span>"
+            f"<span class='pill {status_cls}'>{html.escape(status)}</span>"
+            f"<span class='muted mono'>{html.escape(str(turn.get('user_id') or ''))} · {html.escape(str(turn.get('trace_id') or ''))}</span>"
+            f"<span class='muted'>{html.escape(_debug_ms(turn.get('total_dur_ms')))}</span></h3>"
+            f"{''.join(rows_html)}{stalled_note}"
+            "</section>"
+        )
+
+    metrics = "".join([
+        _render_metric("users with events", summary["users_with_events"]),
+        _render_metric("events", summary["events_total"]),
+        _render_metric("turns", summary["turns_total"]),
+        _render_metric("stalled / error", f"{summary['stalled_turns']} / {summary['error_turns']}"),
+    ])
+
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="30">
+  <title>Feedling Debug · Data Track</title>
+  <style>
+    :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
+    body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+    main {{ max-width:1280px; margin:0 auto; padding:28px 24px 48px; }}
+    h1 {{ font-size:26px; margin:0 0 4px; }} h2 {{ font-size:16px; margin:28px 0 12px; }} h3 {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; font-size:15px; margin:0 0 10px; }}
+    a {{ color:var(--accent); text-decoration:none; }} .muted {{ color:var(--muted); }} .mono {{ font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }}
+    .metrics {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:22px 0; }}
+    .metric,.turn {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
+    .metric-value {{ font-size:24px; font-weight:700; }} .metric-label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }}
+    .viewbar,.toolbar {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:14px 0 18px; }}
+    .sort-button,button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
+    .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
+    input,select {{ border:1px solid var(--line); border-radius:6px; padding:8px 9px; background:white; color:var(--fg); }}
+    table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
+    th,td {{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }} th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }}
+    .pill {{ display:inline-flex; border-radius:999px; padding:2px 8px; font-size:12px; background:#efe7df; color:var(--muted); }} .pill.ok,.ok {{ color:var(--ok); background:#e7f3ed; }} .pill.warn,.warn {{ color:var(--warn); background:#fff1db; }} .pill.bad,.bad {{ color:var(--bad); background:#fff1ed; }}
+    .turn {{ margin:10px 0; }} .event-row {{ border-top:1px solid var(--line); padding:9px 0; }} .event-row:first-of-type {{ border-top:0; }}
+    .event-meta {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:4px; }} .event-detail summary {{ color:var(--accent); cursor:pointer; margin-top:5px; }}
+    pre {{ white-space:pre-wrap; word-break:break-word; background:#fff7f0; border:1px solid var(--line); border-radius:6px; padding:10px; max-height:360px; overflow:auto; }}
+    .stall {{ color:var(--warn); background:#fff8e8; border:1px solid #f0d7a5; border-radius:6px; padding:8px; margin-top:8px; }}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Feedling Debug Logs</h1>
+  <div class="muted">Admin-only beta debug view. Reads existing per-user v1_flow_trace ring buffers; no instrumentation writes here. Generated {html.escape(summary["generated_at"])}.</div>
+  {_render_data_track_view_nav("debug")}
+  <section class="metrics">{metrics}</section>
+  <h2>Filter debug logs</h2>
+  <form class="toolbar" method="get" action="/admin/data-track">
+    <input type="hidden" name="view" value="debug">
+    <input name="admin_key" type="hidden" value="{html.escape(request.args.get('admin_key', ''), quote=True)}">
+    <input name="user_id" placeholder="user_id" value="{input_value('user_id')}">
+    <input name="trace_id" placeholder="trace_id" value="{input_value('trace_id')}">
+    <input name="subsystem" placeholder="module: agent / route / memory" value="{input_value('subsystem')}">
+    <select name="status">
+      {''.join(f'<option value="{s}" {"selected" if input_value("status") == s else ""}>{s or "all status"}</option>' for s in ["", "ok", "error", "blocked", "stalled"])}
+    </select>
+    <input name="since" placeholder="since ISO / epoch" value="{input_value('since')}">
+    <input name="q" placeholder="type / explain / detail / 明文" value="{input_value('q')}">
+    <button type="submit">Search</button>
+  </form>
+  <h2>Users with debug events</h2>
+  <table>
+    <thead><tr><th>User</th><th>Events</th><th>Trace</th><th>Last event</th></tr></thead>
+    <tbody>{''.join(user_rows) if user_rows else "<tr><td colspan='4' class='muted'>No debug events in the current filter.</td></tr>"}</tbody>
+  </table>
+  <h2>Turns</h2>
+  {''.join(turn_cards) if turn_cards else "<div class='muted'>No turns match the current filter.</div>"}
 </main>
 </body>
 </html>"""

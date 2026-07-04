@@ -75,6 +75,13 @@ async def data_track_dau(request: Request):
     return JSONResponse(payload)
 
 
+@router.get("/v1/admin/data-track/debug")
+async def data_track_debug(request: Request):
+    _require_admin(request)
+    payload = await threadpool.run_db(admin_core.debug_payload, request.url.query)
+    return JSONResponse(payload)
+
+
 @router.get("/v1/admin/data-track/users/{user_id}")
 async def data_track_user(user_id: str, request: Request):
     _require_admin(request)

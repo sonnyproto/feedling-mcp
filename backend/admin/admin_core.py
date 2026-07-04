@@ -35,6 +35,11 @@ def dau_payload(query_string: str) -> dict:
         return data_track._data_track_dau_payload()
 
 
+def debug_payload(query_string: str) -> dict:
+    with bind(query_string):
+        return data_track._data_track_debug_payload()
+
+
 def user_payload(query_string: str, user_id: str) -> tuple[dict, int]:
     # Mirror admin_data_track_user: 404 -> {"error": "user_not_found"}.
     with registry._users_lock:
@@ -46,10 +51,15 @@ def user_payload(query_string: str, user_id: str) -> tuple[dict, int]:
 
 
 def page_html(query_string: str) -> str:
-    # Mirror admin_data_track_page's view dispatch (?view=dau -> DAU page).
+    # Mirror admin_data_track_page's view dispatch.
     with bind(query_string):
-        if (request.args.get("view") or "").strip().lower() == "dau":
+        view = (request.args.get("view") or "").strip().lower()
+        if view == "dau":
             return data_track._render_data_track_dau_page(data_track._data_track_dau_payload())
+        if view == "proactive":
+            return data_track._render_proactive_daily_page(data_track._data_track_proactive_daily_payload())
+        if view == "debug":
+            return data_track._render_data_track_debug_page(data_track._data_track_debug_payload())
         return data_track._render_data_track_page(data_track._data_track_payload(include_users=True))
 
 
