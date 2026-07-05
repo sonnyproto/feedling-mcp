@@ -324,6 +324,13 @@ def test_prepare_plaintext_import_builds_ordered_per_source_groups(monkeypatch):
 def test_plaintext_background_runner_distills_and_applies(monkeypatch):
     store = _store()
     calls: dict = {}
+    trace_events: list[dict] = []
+    monkeypatch.setattr(
+        plaintext,
+        "debug_trace",
+        type("_Trace", (), {"trace_event": staticmethod(lambda *_args, **kwargs: trace_events.append(kwargs))}),
+        raising=False,
+    )
 
     def fake_set_status(_user_id, _job_id, **kwargs):
         calls.setdefault("statuses", []).append(kwargs)
@@ -367,6 +374,25 @@ def test_plaintext_background_runner_distills_and_applies(monkeypatch):
     assert calls["build"]["source_kind"] == "history_import"
     assert calls["applied"]["memories"] == []
     assert calls["statuses"][-1]["processed_chunks"] == 1
+    assert [
+        event["type"]
+        for event in trace_events
+        if event["type"] in {
+            "genesis.plaintext.started",
+            "genesis.plaintext.runtime.loaded",
+            "genesis.plaintext.reducer_pass.started",
+            "genesis.plaintext.reducer_pass.done",
+            "genesis.plaintext.apply.started",
+            "genesis.plaintext.done",
+        }
+    ] == [
+        "genesis.plaintext.started",
+        "genesis.plaintext.runtime.loaded",
+        "genesis.plaintext.reducer_pass.started",
+        "genesis.plaintext.reducer_pass.done",
+        "genesis.plaintext.apply.started",
+        "genesis.plaintext.done",
+    ]
 
 
 def test_plaintext_background_runner_routes_sources_and_merges_with_firewall(monkeypatch):

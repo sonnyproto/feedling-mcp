@@ -738,9 +738,16 @@ def test_memory_summary_source_feeds_fact_write_material_without_maps(monkeypatc
 
 def test_tick_marks_failed_when_claimed_job_has_missing_chunks(monkeypatch):
     failures = []
+    trace_events = []
     monkeypatch.setattr(worker, "get_store", lambda user_id: types.SimpleNamespace(user_id=user_id))
     monkeypatch.setattr(worker.service, "write_genesis_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker.service, "mark_failed", lambda _store, job_id, error: failures.append((job_id, error)))
+    monkeypatch.setattr(
+        worker,
+        "debug_trace",
+        types.SimpleNamespace(trace_event=lambda *_args, **kwargs: trace_events.append(kwargs)),
+        raising=False,
+    )
     monkeypatch.setattr(
         worker.db,
         "genesis_claim_uploaded_jobs",
@@ -758,6 +765,7 @@ def test_tick_marks_failed_when_claimed_job_has_missing_chunks(monkeypatch):
     assert result["failed"] == 1
     assert failures[0][0] == "job_1"
     assert "missing_chunks:1" in failures[0][1]
+    assert any(event["type"] == "genesis.worker.failed" for event in trace_events)
 
 
 def test_tick_marks_failed_for_empty_import_without_provider_calls(monkeypatch):

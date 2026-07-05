@@ -18,6 +18,7 @@ from typing import Any, Callable
 import httpx
 
 import db
+import debug_trace
 import provider_client
 from core.store import get_store
 from genesis import checkpoint, foreground, prompts, service
@@ -67,6 +68,26 @@ TRUNCATION_STOP_REASONS = {
 
 class GenesisWorkerError(Exception):
     """Retryable/non-retryable worker failure surfaced into job.error."""
+
+
+def _trace_genesis(store, event_type: str, *, job_id: str = "", status: str = "ok",
+                   summary: str = "", detail: dict | None = None, dur_ms: float | None = None) -> None:
+    try:
+        debug_trace.trace_event(
+            store,
+            subsystem="genesis",
+            type=event_type,
+            actor="backend",
+            status=status,
+            job_id=job_id,
+            trace_id=job_id,
+            turn_id=job_id,
+            summary=summary,
+            detail=detail or {},
+            dur_ms=dur_ms,
+        )
+    except Exception:
+        pass
 
 
 def _env_int(name: str, default: int) -> int:
@@ -1180,11 +1201,22 @@ def _apply_reducer_output(api_url: str, runtime_token: str, job_id: str, output:
 
 
 def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_token: Callable) -> dict:
+    started_at = time.time()
     user_id = str(job.get("user_id") or "")
     job_id = str(job.get("job_id") or "")
     if not user_id or not job_id:
         raise GenesisWorkerError("invalid_claimed_job")
     store = get_store(user_id)
+    _trace_genesis(
+        store,
+        "genesis.worker.claimed",
+        job_id=job_id,
+        summary="genesis worker claimed job",
+        detail={
+            "source_kind": str(job.get("source_kind") or ""),
+            "total_chunks": int(job.get("total_chunks") or 0),
+        },
+    )
     service.write_genesis_state(store, {**job, "status": "processing"}, status="processing")
     total_chunks = int(job.get("total_chunks") or 0)
     if total_chunks <= 0:
@@ -1197,11 +1229,19 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
         raise GenesisWorkerError(f"chunk_count_mismatch:{len(chunks)}:{total_chunks}")
 
     token = _mint(mint_runtime_token, user_id)
+    _trace_genesis(store, "genesis.worker.token.minted", job_id=job_id, summary="runtime token minted")
     provider_key = _fetch_provider_key(api_url, enclave_url, token)
+    _trace_genesis(store, "genesis.worker.provider_key.loaded", job_id=job_id,
+                   summary="provider key loaded", detail={"has_provider_key": bool(provider_key)})
     runtime = _runtime_for_user(user_id, provider_key)
     chunk_texts = _decrypt_chunks(enclave_url, token, chunks)
+    _trace_genesis(store, "genesis.worker.chunks.decrypted", job_id=job_id,
+                   summary="encrypted chunks decrypted", detail={"chunk_count": len(chunk_texts)})
     existing_persona = _existing_persona_material(user_id, enclave_url, token)
     existing_voice = _existing_voice_workset(user_id, enclave_url, token)
+    reducer_started_at = time.time()
+    _trace_genesis(store, "genesis.worker.reducer.started", job_id=job_id,
+                   summary="worker reducer started", detail={"chunk_count": len(chunk_texts)})
     reducer_output = _build_reducer_output(
         user_id=user_id,
         job_id=job_id,
@@ -1211,7 +1251,28 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
         existing_persona=existing_persona,
         existing_voice=existing_voice,
     )
+    _trace_genesis(
+        store,
+        "genesis.worker.reducer.done",
+        job_id=job_id,
+        summary="worker reducer done",
+        detail={
+            "memory_count": len(reducer_output.get("memories") or []) if isinstance(reducer_output, dict) else 0,
+            "has_identity": bool(isinstance(reducer_output, dict) and reducer_output.get("identity")),
+            "has_persona": bool(isinstance(reducer_output, dict) and reducer_output.get("persona")),
+        },
+        dur_ms=(time.time() - reducer_started_at) * 1000,
+    )
+    _trace_genesis(store, "genesis.worker.apply.started", job_id=job_id, summary="worker apply started")
     applied = _apply_reducer_output(api_url, token, job_id, reducer_output)
+    _trace_genesis(
+        store,
+        "genesis.worker.done",
+        job_id=job_id,
+        summary="genesis worker job done",
+        detail={"chunks": len(chunks)},
+        dur_ms=(time.time() - started_at) * 1000,
+    )
     return {
         "user_id": user_id,
         "job_id": job_id,
@@ -1248,10 +1309,19 @@ def reap_stale_processing_jobs() -> list[dict]:
         job_id = str(job.get("job_id") or "")
         if not user_id or not job_id:
             continue
+        store = get_store(user_id)
         try:
-            service.write_genesis_state(get_store(user_id), job, status="failed")
+            service.write_genesis_state(store, job, status="failed")
         except Exception as e:  # noqa: BLE001
             print(f"[genesis:reaper] blob sync failed for {user_id}/{job_id}: {type(e).__name__}:{str(e)[:120]}")
+        _trace_genesis(
+            store,
+            "genesis.worker.stale_reaped",
+            job_id=job_id,
+            status="error",
+            summary="stale genesis processing job reaped",
+            detail={"error": error},
+        )
         reaped.append({"user_id": user_id, "job_id": job_id})
     return reaped
 
@@ -1288,6 +1358,14 @@ def tick(
             failed += 1
             if user_id and job_id:
                 store = get_store(user_id)
+                _trace_genesis(
+                    store,
+                    "genesis.worker.failed",
+                    job_id=job_id,
+                    status="error",
+                    summary="genesis worker job failed",
+                    detail={"reason": f"{type(e).__name__}:{str(e)[:180]}"},
+                )
                 service.mark_failed(store, job_id, f"worker_failed:{type(e).__name__}:{str(e)[:180]}")
             results.append({"user_id": user_id, "job_id": job_id, "status": "failed", "error": str(e)[:240]})
     end = time.time() if now is None else float(now())
