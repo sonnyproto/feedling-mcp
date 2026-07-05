@@ -1101,3 +1101,130 @@ def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
         timeout=30.0,
         require_reply=False,
     )
+
+
+# --- async variant (enclave ASGI migration) --------------------------------
+# 只有 openai-wire（openai 非 responses / openrouter / deepseek /
+# openai_compatible）有原生 async 实现——enclave caption 走 openrouter，这是
+# 唯一需要"45s 长等待只挂协程"的调用方。anthropic / gemini / openai-responses
+# 的编解码保持单实现（同步版），经 anyio 线程桥调用，避免双份 wire codec 漂移。
+# 同步 chat_completion 与异步版各用各的 httpx client，绝不混用（spec §4）。
+
+_shared_async_client: httpx.AsyncClient | None = None
+
+
+def _async_http_client() -> httpx.AsyncClient:
+    global _shared_async_client
+    if _shared_async_client is None or _shared_async_client.is_closed:
+        _shared_async_client = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_keepalive_connections=20,
+                max_connections=100,
+                keepalive_expiry=90.0,
+            ),
+        )
+    return _shared_async_client
+
+
+async def aclose_async_http_client() -> None:
+    global _shared_async_client
+    client, _shared_async_client = _shared_async_client, None
+    if client is not None and not client.is_closed:
+        await client.aclose()
+
+
+async def chat_completion_async(
+    config: ProviderConfig,
+    messages: list[dict[str, Any]],
+    *,
+    max_tokens: int = 700,
+    temperature: float = 0.7,
+    timeout: float = 60.0,
+    response_format: dict[str, Any] | None = None,
+    require_reply: bool = True,
+    include_reasoning: bool = False,
+) -> dict[str, Any]:
+    provider, model, base_url = validate_config(
+        config.provider, config.model, config.base_url
+    )
+    request_model, extra_body = _runtime_model(provider, model)
+    key = (config.api_key or "").strip()
+    if not key:
+        raise ProviderError("api_key required")
+
+    if provider in ("anthropic", "gemini") or (
+        provider == "openai" and _openai_uses_responses_for_reasoning(request_model)
+    ):
+        import anyio.to_thread
+        from functools import partial
+
+        return await anyio.to_thread.run_sync(partial(
+            chat_completion, config, messages,
+            max_tokens=max_tokens, temperature=temperature, timeout=timeout,
+            response_format=response_format, require_reply=require_reply,
+            include_reasoning=include_reasoning,
+        ))
+
+    # 以下为 _chat_completion_openai_compatible 的 async 镜像（含 openrouter
+    # reasoning 400/422 降级重试）。改同步版时必须同步改这里 —— 两处有同一个
+    # payload/降级契约。
+    payload: dict[str, Any] = {
+        "model": request_model,
+        "messages": messages,
+        "stream": False,
+        "temperature": temperature,
+        "max_tokens": max(1, min(int(max_tokens), 8192)),
+    }
+    if response_format:
+        payload["response_format"] = response_format
+    if extra_body:
+        payload.update(extra_body)
+    if include_reasoning and provider == "openrouter":
+        payload.setdefault("reasoning", {"enabled": True, "exclude": False})
+
+    async def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
+        try:
+            return await _async_http_client().post(
+                f"{base_url.rstrip('/')}/chat/completions",
+                headers=_headers(ProviderConfig(provider, request_model, key, base_url)),
+                json=request_payload,
+                timeout=timeout,
+            )
+        except httpx.HTTPError as e:
+            raise ProviderError(f"provider network error: {type(e).__name__}") from e
+
+    resp = await post_with_payload(payload)
+    try:
+        _raise_for_provider_status(resp)
+    except ProviderError:
+        if (include_reasoning and provider == "openrouter"
+                and resp.status_code in {400, 422} and "reasoning" in payload):
+            fallback_payload = dict(payload)
+            fallback_payload.pop("reasoning", None)
+            resp = await post_with_payload(fallback_payload)
+            _raise_for_provider_status(resp)
+        else:
+            raise
+
+    try:
+        body = resp.json()
+    except ValueError as e:
+        raise ProviderError("provider returned non-json response") from e
+    if not isinstance(body, dict):
+        raise ProviderError("provider returned non-object response")
+
+    return {
+        "reply": _extract_reply(body, required=require_reply),
+        "reasoning": _extract_openai_compatible_reasoning(body),
+        "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
+        "raw_id": body.get("id", ""),
+        "stop_reason": _extract_openai_compatible_stop_reason(body),
+        "provider": provider,
+        # NOTE: sync `_chat_completion_openai_compatible` is called by
+        # `chat_completion` with `model=request_model` (the runtime-mapped
+        # model actually sent on the wire — e.g. deepseek-chat ->
+        # deepseek-v4-flash, or an openrouter legacy alias), and its returned
+        # dict's "model" key is therefore that mapped value, not the
+        # caller-facing config.model. Mirror that exactly here.
+        "model": request_model,
+    }

@@ -445,7 +445,6 @@ def test_app_open_via_get_route(env, monkeypatch):
     """End-to-end: GET with everything (incl. key) in the URL query string."""
     import sys
     import types
-    from flask import Flask
 
     fake, _ = env
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
@@ -544,7 +543,6 @@ def test_report_endpoint_context_snapshot(env, monkeypatch):
     """End-to-end through the /report route with the context_snapshot body."""
     import sys
     import types
-    from flask import Flask
 
     fake, _ = env
 
@@ -564,7 +562,6 @@ def test_report_endpoint_context_snapshot(env, monkeypatch):
 def test_report_endpoint_context_snapshot_v2_flag_on(env, monkeypatch):
     """When the per-user rollout flag is on, /report dispatches to V2 ingress."""
     import types
-    from flask import Flask
 
     fake, _ = env
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
@@ -605,7 +602,6 @@ def test_snapshot_includes_recent_apps(env):
 def _report_client(env, monkeypatch, *, ingress_v2=False):
     import sys
     import types
-    from flask import Flask
     fake, _ = env
     monkeypatch.setattr(service, "perception_ingress_runtime_v2_enabled",
                         lambda user_or_store: ingress_v2)

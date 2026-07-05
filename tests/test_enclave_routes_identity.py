@@ -1,0 +1,80 @@
+# tests/test_enclave_routes_identity.py
+from __future__ import annotations
+
+import datetime as dt
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+
+import pytest  # noqa: E402
+
+from asgi_test_client import _AsgiTestClient  # noqa: E402
+from enclave import auth as enclave_auth  # noqa: E402
+from enclave import backend_client, envelope as envmod, keys  # noqa: E402
+from enclave import state as enclave_state  # noqa: E402
+from enclave.routes import build_app  # noqa: E402
+
+
+@pytest.fixture()
+def client(monkeypatch):
+    monkeypatch.setitem(enclave_state._state, "ready", True)
+    monkeypatch.setitem(enclave_state._state, "error", None)
+    enclave_auth.reset_cache()
+    return _AsgiTestClient(build_app())
+
+
+def _wire(monkeypatch, identity):
+    async def fake_backend_get(path, headers, params=None):
+        if path == "/v1/users/whoami":
+            return {"user_id": "usr_a"}
+        assert path == "/v1/identity/get"
+        return {"identity": identity}
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+    async def fake_sk():
+        return object()
+    monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+
+
+def test_identity_none_passthrough(client, monkeypatch):
+    _wire(monkeypatch, None)
+    r = client.get("/v1/identity/get", headers={"X-API-Key": "k"})
+    assert r.get_json() == {"identity": None, "user_id": "usr_a"}
+
+
+def test_identity_decrypt_with_live_days_anchor(client, monkeypatch):
+    anchor = (dt.date.today() - dt.timedelta(days=10)).isoformat()
+    _wire(monkeypatch, {"v": 1, "K_enclave": "x", "body_ct": "x", "nonce": "x",
+                        "owner_user_id": "usr_a",
+                        "relationship_started_at": anchor,
+                        "created_at": "c", "updated_at": "u"})
+    inner = json.dumps({"agent_name": "枫", "self_introduction": "hi",
+                        "dimensions": [], "days_with_user": 999}).encode()
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda e, u, s: inner)
+    r = client.get("/v1/identity/get", headers={"X-API-Key": "k"})
+    body = r.get_json()["identity"]
+    assert body["agent_name"] == "枫"
+    assert body["days_with_user"] == 10  # 服务端锚点覆盖信封内旧值
+    assert body["decrypt_status"] == "ok"
+
+
+def test_identity_local_only(client, monkeypatch):
+    _wire(monkeypatch, {"v": 1, "visibility": "local_only",
+                        "created_at": "c", "updated_at": "u"})
+    r = client.get("/v1/identity/get", headers={"X-API-Key": "k"})
+    body = r.get_json()["identity"]
+    assert body["decrypt_status"] == "local_only_agent_cannot_read"
+
+
+def test_identity_decrypt_error_shape(client, monkeypatch):
+    _wire(monkeypatch, {"v": 1, "K_enclave": "x", "body_ct": "x", "nonce": "x",
+                        "owner_user_id": "usr_a", "created_at": "c",
+                        "updated_at": "u"})
+    def boom(env, uid, sk):
+        raise envmod.DecryptFailure("bad tag")
+    monkeypatch.setattr(envmod, "decrypt_envelope", boom)
+    r = client.get("/v1/identity/get", headers={"X-API-Key": "k"})
+    body = r.get_json()
+    assert body["identity"]["decrypt_status"] == "error: bad tag"
+    assert body["decrypt_errors"] == [{"reason": "bad tag"}]
