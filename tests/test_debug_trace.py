@@ -1,6 +1,7 @@
 """v1 flow trace: beta default-on recording with deploy/per-user safety valves."""
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
 
@@ -81,6 +82,28 @@ def test_detail_is_size_bounded_metadata(monkeypatch):
     debug_trace.trace_event(store, subsystem="memory", type="t", detail={"big": "x" * 9999})
     ev = debug_trace.read_trace(store)[0]
     assert len(ev["detail"]["big"]) <= 200  # caller content can't bloat the buffer
+
+
+def test_trace_event_does_not_wait_for_slow_blob_storage(monkeypatch):
+    store = _Store()
+    monkeypatch.setattr(debug_trace, "is_enabled", lambda _store: True)
+    monkeypatch.setattr(debug_trace, "verbose_enabled", lambda _store: False)
+
+    def slow_get_blob(_uid, _kind):
+        time.sleep(0.2)
+        return {}
+
+    def slow_set_blob(_uid, _kind, _doc):
+        time.sleep(0.2)
+
+    monkeypatch.setattr(debug_trace.db, "get_blob", slow_get_blob)
+    monkeypatch.setattr(debug_trace.db, "set_blob", slow_set_blob)
+
+    started = time.monotonic()
+    debug_trace.trace_event(store, subsystem="route", type="route.decided")
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.05
 
 
 # --- M1: explain / content_excerpt / dur_ms + verbose gate + caps -----------
