@@ -9,9 +9,31 @@ import pytest
 
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import enclave_app  # noqa: E402
+from asgi_test_client import _AsgiTestClient  # noqa: E402
+from enclave import auth as enclave_auth  # noqa: E402
+from enclave import backend_client, keys, readside  # noqa: E402
+from enclave import state as enclave_state  # noqa: E402
+from enclave.routes import build_app  # noqa: E402
 from memory import memory_core  # noqa: E402
 from memory import service as memory_service  # noqa: E402
+
+
+def _enclave_client(monkeypatch, *, user_id="usr_readside"):
+    """Auth-wired ASGI client for the enclave's own memory readside routes
+    (/v1/memory/index, /v1/memory/fetch) — distinct from the _CoreClient
+    above, which hits the *backend*'s memory_core readside."""
+    monkeypatch.setitem(enclave_state._state, "ready", True)
+    monkeypatch.setitem(enclave_state._state, "error", None)
+    enclave_auth.reset_cache()
+
+    async def fake_backend_get(path, headers, params=None):
+        return {"user_id": user_id}
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+
+    async def fake_sk():
+        return object()
+    monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+    return _AsgiTestClient(build_app())
 
 
 # The Flask /v1/memory/* readside routes were deleted in the ASGI cutover. This
@@ -198,7 +220,7 @@ def test_memory_fetch_splits_missing_unavailable_and_preserves_order(client, mon
 
 
 def test_enclave_index_item_hides_content_body_field():
-    item = enclave_app._build_memory_index_item(
+    item = readside.build_memory_index_item(
         {
             "id": "mem_1",
             "status": "active",
@@ -232,14 +254,10 @@ def test_enclave_index_item_hides_content_body_field():
 
 
 def test_enclave_index_filters_sensitive_items_by_default(monkeypatch):
+    c = _enclave_client(monkeypatch)
     monkeypatch.setattr(
-        enclave_app,
-        "_memory_readside_auth_context",
-        lambda: ("key_readside", "usr_readside", object(), None),
-    )
-    monkeypatch.setattr(
-        enclave_app,
-        "_memory_readside_decrypt_items",
+        readside,
+        "decrypt_readside_items",
         lambda moments, authorized_user_id, content_sk, *, item_builder: (
             [
                 {"id": "plain", "summary": "Plain memory.", "is_sensitive": False},
@@ -249,12 +267,14 @@ def test_enclave_index_filters_sensitive_items_by_default(monkeypatch):
         ),
     )
 
-    with enclave_app.app.test_client() as c:
-        default_res = c.post("/v1/memory/index", json={"moments": [{"id": "plain"}, {"id": "sensitive"}]})
-        sensitive_res = c.post(
-            "/v1/memory/index",
-            json={"moments": [{"id": "plain"}, {"id": "sensitive"}], "include_sensitive": True},
-        )
+    default_res = c.post("/v1/memory/index",
+                         json={"moments": [{"id": "plain"}, {"id": "sensitive"}]},
+                         headers={"X-API-Key": "key_readside"})
+    sensitive_res = c.post(
+        "/v1/memory/index",
+        json={"moments": [{"id": "plain"}, {"id": "sensitive"}], "include_sensitive": True},
+        headers={"X-API-Key": "key_readside"},
+    )
 
     assert default_res.status_code == 200
     assert [item["id"] for item in default_res.get_json()["items"]] == ["plain"]
@@ -265,23 +285,18 @@ def test_enclave_index_filters_sensitive_items_by_default(monkeypatch):
 def test_enclave_index_and_fetch_honor_payload_limit_above_50(monkeypatch):
     monkeypatch.delenv("FEEDLING_MEMORY_READSIDE_LIMIT", raising=False)
     monkeypatch.delenv("FEEDLING_MEMORY_READSIDE_HARD_MAX", raising=False)
-    monkeypatch.setattr(
-        enclave_app,
-        "_memory_readside_auth_context",
-        lambda: ("key_readside", "usr_readside", object(), None),
-    )
+    c = _enclave_client(monkeypatch)
     captured_lengths = []
 
     def fake_decrypt(moments, authorized_user_id, content_sk, *, item_builder):
         captured_lengths.append(len(moments))
         return ([{"id": str(moment.get("id")), "summary": str(moment.get("id"))} for moment in moments], [])
 
-    monkeypatch.setattr(enclave_app, "_memory_readside_decrypt_items", fake_decrypt)
+    monkeypatch.setattr(readside, "decrypt_readside_items", fake_decrypt)
     payload = {"limit": 120, "moments": [{"id": f"mem_{idx:03d}"} for idx in range(130)]}
 
-    with enclave_app.app.test_client() as c:
-        index_res = c.post("/v1/memory/index", json=payload)
-        fetch_res = c.post("/v1/memory/fetch", json=payload)
+    index_res = c.post("/v1/memory/index", json=payload, headers={"X-API-Key": "key_readside"})
+    fetch_res = c.post("/v1/memory/fetch", json=payload, headers={"X-API-Key": "key_readside"})
 
     assert index_res.status_code == 200
     assert fetch_res.status_code == 200
@@ -290,22 +305,17 @@ def test_enclave_index_and_fetch_honor_payload_limit_above_50(monkeypatch):
 
 def test_enclave_limit_zero_uses_hard_max_instead_of_unbounded(monkeypatch):
     monkeypatch.setenv("FEEDLING_MEMORY_READSIDE_HARD_MAX", "7")
-    monkeypatch.setattr(
-        enclave_app,
-        "_memory_readside_auth_context",
-        lambda: ("key_readside", "usr_readside", object(), None),
-    )
+    c = _enclave_client(monkeypatch)
     captured_lengths = []
 
     def fake_decrypt(moments, authorized_user_id, content_sk, *, item_builder):
         captured_lengths.append(len(moments))
         return ([{"id": str(moment.get("id")), "summary": str(moment.get("id"))} for moment in moments], [])
 
-    monkeypatch.setattr(enclave_app, "_memory_readside_decrypt_items", fake_decrypt)
+    monkeypatch.setattr(readside, "decrypt_readside_items", fake_decrypt)
     payload = {"limit": 0, "moments": [{"id": f"mem_{idx:03d}"} for idx in range(20)]}
 
-    with enclave_app.app.test_client() as c:
-        res = c.post("/v1/memory/index", json=payload)
+    res = c.post("/v1/memory/index", json=payload, headers={"X-API-Key": "key_readside"})
 
     assert res.status_code == 200
     assert captured_lengths == [7]
@@ -314,28 +324,25 @@ def test_enclave_limit_zero_uses_hard_max_instead_of_unbounded(monkeypatch):
 def test_enclave_negative_env_limit_falls_back_to_default_not_full_open(monkeypatch):
     monkeypatch.setenv("FEEDLING_MEMORY_READSIDE_LIMIT", "-1")
     monkeypatch.delenv("FEEDLING_MEMORY_READSIDE_HARD_MAX", raising=False)
-    monkeypatch.setattr(
-        enclave_app,
-        "_memory_readside_auth_context",
-        lambda: ("key_readside", "usr_readside", object(), None),
-    )
+    c = _enclave_client(monkeypatch)
     captured_lengths = []
 
     def fake_decrypt(moments, authorized_user_id, content_sk, *, item_builder):
         captured_lengths.append(len(moments))
         return ([{"id": str(moment.get("id")), "summary": str(moment.get("id"))} for moment in moments], [])
 
-    monkeypatch.setattr(enclave_app, "_memory_readside_decrypt_items", fake_decrypt)
+    monkeypatch.setattr(readside, "decrypt_readside_items", fake_decrypt)
 
-    with enclave_app.app.test_client() as c:
-        res = c.post("/v1/memory/index", json={"moments": [{"id": f"mem_{idx:03d}"} for idx in range(70)]})
+    res = c.post("/v1/memory/index",
+                 json={"moments": [{"id": f"mem_{idx:03d}"} for idx in range(70)]},
+                 headers={"X-API-Key": "key_readside"})
 
     assert res.status_code == 200
     assert captured_lengths == [50]
 
 
 def test_enclave_fetch_item_returns_v1_full_card_without_sensitive_scope():
-    item = enclave_app._build_memory_fetch_item(
+    item = readside.build_memory_fetch_item(
         {"id": "mem_1", "status": "active", "salience": "high", "source": "chat"},
         {
             "summary": "She needs presence first.",

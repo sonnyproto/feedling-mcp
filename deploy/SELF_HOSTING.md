@@ -66,7 +66,7 @@ mkdir -p ~/feedling-data
 EOF
 ```
 
-**Verify:** `ssh <user>@<host> "~/feedling-venv/bin/python -c 'import flask, httpx, jwt, websockets, psycopg, psycopg_pool'"` exits 0.
+**Verify:** `ssh <user>@<host> "~/feedling-venv/bin/python -c 'import httpx, jwt, websockets, psycopg, psycopg_pool'"` exits 0.
 
 If you have an Apple `.p8` push key, scp it onto the VPS:
 

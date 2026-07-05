@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import importlib
 import json
 import sys
 from pathlib import Path
@@ -9,6 +8,12 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+
+from asgi_test_client import _AsgiTestClient  # noqa: E402
+from enclave import auth as enclave_auth  # noqa: E402
+from enclave import backend_client, envelope as envmod, keys  # noqa: E402
+from enclave import state as enclave_state  # noqa: E402
+from enclave.routes import build_app  # noqa: E402
 
 
 _FRAME_ID = "ab" * 8
@@ -18,29 +23,29 @@ _RAW_JPEG = b"\xff\xd8\xff\xe0raw-photo-pixels\xff\xd9"
 @pytest.fixture
 def enclave(monkeypatch):
     monkeypatch.setenv("FEEDLING_SCREEN_VLM_API_KEY", "sk-test")
-    mod = importlib.import_module("enclave_app")
-    monkeypatch.setitem(mod._state, "ready", True)
-    monkeypatch.setitem(mod._state, "error", None)
-    monkeypatch.setitem(mod.app.config, "TESTING", True)
-    monkeypatch.setattr(mod, "_extract_api_key", lambda: "user-key")
-    monkeypatch.setattr(mod, "_whoami_cached", lambda _key: {"user_id": "u1"})
-    monkeypatch.setattr(
-        mod,
-        "_flask_get",
-        lambda _path, _key: {"v": 1, "ts": 123.0, "id": _FRAME_ID},
-    )
-    monkeypatch.setattr(mod, "_get_or_derive_content_sk", lambda: object())
-    return mod
+    monkeypatch.setitem(enclave_state._state, "ready", True)
+    monkeypatch.setitem(enclave_state._state, "error", None)
+    enclave_auth.reset_cache()
+
+    async def fake_backend_get(path, headers, params=None):
+        if path == "/v1/users/whoami":
+            return {"user_id": "u1"}
+        assert path == f"/v1/screen/frames/{_FRAME_ID}/envelope"
+        return {"v": 1, "ts": 123.0, "id": _FRAME_ID}
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+
+    async def fake_sk():
+        return object()
+    monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+
+    return _AsgiTestClient(build_app())
 
 
 def test_raw_photo_decrypt_returns_pixels(enclave, monkeypatch):
-    monkeypatch.setattr(
-        enclave, "_decrypt_envelope", lambda _env, _uid, _sk: _RAW_JPEG
-    )
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda e, u, s: _RAW_JPEG)
 
-    response = enclave.app.test_client().get(
-        f"/v1/screen/frames/{_FRAME_ID}/decrypt"
-    )
+    response = enclave.get(f"/v1/screen/frames/{_FRAME_ID}/decrypt",
+                           headers={"X-API-Key": "user-key"})
     body = response.get_json()
 
     assert response.status_code == 200
@@ -53,18 +58,17 @@ def test_raw_photo_decrypt_returns_pixels(enclave, monkeypatch):
 
 def test_raw_photo_caption_sends_pixels_only_to_vlm(enclave, monkeypatch):
     captured = {}
-    monkeypatch.setattr(
-        enclave, "_decrypt_envelope", lambda _env, _uid, _sk: _RAW_JPEG
-    )
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda e, u, s: _RAW_JPEG)
 
-    def fake_chat(_config, messages, **_kwargs):
+    import provider_client
+
+    async def fake_chat(_config, messages, **_kwargs):
         captured["messages"] = messages
         return {"reply": "A test photo."}
 
-    monkeypatch.setattr(enclave.provider_client, "chat_completion", fake_chat)
-    response = enclave.app.test_client().get(
-        f"/v1/screen/frames/{_FRAME_ID}/caption"
-    )
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_chat)
+    response = enclave.get(f"/v1/screen/frames/{_FRAME_ID}/caption",
+                           headers={"X-API-Key": "user-key"})
     body = response.get_json()
 
     assert response.status_code == 200
@@ -78,16 +82,13 @@ def test_raw_photo_caption_sends_pixels_only_to_vlm(enclave, monkeypatch):
 
 
 def test_raw_photo_image_returns_original_bytes(enclave, monkeypatch):
-    monkeypatch.setattr(
-        enclave, "_decrypt_envelope", lambda _env, _uid, _sk: _RAW_JPEG
-    )
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda e, u, s: _RAW_JPEG)
 
-    response = enclave.app.test_client().get(
-        f"/v1/screen/frames/{_FRAME_ID}/image"
-    )
+    response = enclave.get(f"/v1/screen/frames/{_FRAME_ID}/image",
+                           headers={"X-API-Key": "user-key"})
 
     assert response.status_code == 200
-    assert response.content_type == "image/jpeg"
+    assert response.headers["content-type"] == "image/jpeg"
     assert response.data == _RAW_JPEG
 
 
@@ -101,14 +102,12 @@ def test_wrapped_screen_frame_decrypt_is_unchanged(enclave, monkeypatch):
         "h": 2556,
     }
     monkeypatch.setattr(
-        enclave,
-        "_decrypt_envelope",
-        lambda _env, _uid, _sk: json.dumps(wrapped).encode("utf-8"),
+        envmod, "decrypt_envelope",
+        lambda e, u, s: json.dumps(wrapped).encode("utf-8"),
     )
 
-    response = enclave.app.test_client().get(
-        f"/v1/screen/frames/{_FRAME_ID}/decrypt"
-    )
+    response = enclave.get(f"/v1/screen/frames/{_FRAME_ID}/decrypt",
+                           headers={"X-API-Key": "user-key"})
     body = response.get_json()
 
     assert response.status_code == 200
@@ -122,14 +121,12 @@ def test_wrapped_screen_frame_decrypt_is_unchanged(enclave, monkeypatch):
 
 def test_malformed_non_image_plaintext_still_fails_closed(enclave, monkeypatch):
     monkeypatch.setattr(
-        enclave,
-        "_decrypt_envelope",
-        lambda _env, _uid, _sk: b"not-json-and-not-an-image",
+        envmod, "decrypt_envelope",
+        lambda e, u, s: b"not-json-and-not-an-image",
     )
 
-    response = enclave.app.test_client().get(
-        f"/v1/screen/frames/{_FRAME_ID}/decrypt"
-    )
+    response = enclave.get(f"/v1/screen/frames/{_FRAME_ID}/decrypt",
+                           headers={"X-API-Key": "user-key"})
 
     assert response.status_code == 502
     assert response.get_json()["error"].startswith("plaintext_parse:")

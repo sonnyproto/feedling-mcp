@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-import enclave_app  # noqa: E402
+from enclave import readside  # noqa: E402
 from memory import actions as memory_actions  # noqa: E402
 from memory import service as memory_service  # noqa: E402
 
@@ -141,7 +141,7 @@ def test_backend_envelope_adapter_normalizes_only_plaintext_fields():
 
 
 def test_enclave_inner_adapter_maps_old_inner_to_v1_content_bucket_threads():
-    adapted = enclave_app._memory_inner_to_v1(
+    adapted = readside.memory_inner_to_v1(
         {
             "summary": "用户有只猫叫武松。",
             "description": "用户有只猫叫武松，是狸花猫。",

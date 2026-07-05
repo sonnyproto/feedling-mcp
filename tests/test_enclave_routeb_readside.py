@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -8,7 +9,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-import enclave_app  # noqa: E402
+from asgi_test_client import _AsgiTestClient  # noqa: E402
+from enclave import auth as enclave_auth  # noqa: E402
+from enclave import backend_client, keys, readside  # noqa: E402
+from enclave import state as enclave_state  # noqa: E402
+from enclave.routes import build_app  # noqa: E402
+from enclave.routes import chat as chat_route  # noqa: E402
 
 
 def _moment(mid: str, title: str, description: str, *, linked: str = "") -> dict:
@@ -24,6 +30,30 @@ def _moment(mid: str, title: str, description: str, *, linked: str = "") -> dict
         "context": "",
         "linked_dimension": linked,
     }
+
+
+def _moment_envelope(mid: str) -> dict:
+    """Envelope shape as returned by /v1/memory/list — the plaintext moment
+    content lives behind a faked envelope.decrypt_envelope, not here."""
+    return {
+        "id": mid,
+        "occurred_at": "2026-06-21T10:00:00",
+        "created_at": "2026-06-21T10:00:00",
+        "source": "test",
+        "v": 1,
+        "visibility": "shared",
+    }
+
+
+def _inner_json(title: str, description: str, *, linked: str = "") -> bytes:
+    return json.dumps({
+        "title": title,
+        "description": description,
+        "type": "fact",
+        "her_quote": "",
+        "context": "",
+        "linked_dimension": linked,
+    }).encode("utf-8")
 
 
 def test_routeb_readside_helper_selects_index_then_returns_old_context_shape():
@@ -42,7 +72,7 @@ def test_routeb_readside_helper_selects_index_then_returns_old_context_shape():
         ),
     ]
 
-    selected, trace = enclave_app._select_context_memories_via_readside(
+    selected, trace = readside.select_context_memories_via_readside(
         moments,
         "猫咪最近不吃饭，我有点担心",
     )
@@ -58,62 +88,77 @@ def test_routeb_readside_helper_selects_index_then_returns_old_context_shape():
 
 @pytest.fixture()
 def enclave_history_client(monkeypatch):
-    previous_ready = enclave_app._state.get("ready")
-    previous_error = enclave_app._state.get("error")
-    enclave_app._state["ready"] = True
-    enclave_app._state["error"] = None
-    monkeypatch.setattr(enclave_app, "_extract_api_key", lambda: "key_routeb")
-    monkeypatch.setattr(enclave_app, "_whoami_cached", lambda _key: {"user_id": "usr_routeb"})
-    monkeypatch.setattr(enclave_app, "_get_or_derive_content_sk", lambda: object())
+    monkeypatch.setitem(enclave_state._state, "ready", True)
+    monkeypatch.setitem(enclave_state._state, "error", None)
+    enclave_auth.reset_cache()
 
-    def fake_flask_get(path, api_key, params=None):
-        assert api_key == "key_routeb"
-        assert path == "/v1/chat/history"
+    from enclave import envelope as envmod
+
+    async def fake_backend_get(path, headers, params=None):
+        assert headers.get("X-API-Key") == "key_routeb"
+        if path == "/v1/users/whoami":
+            return {"user_id": "usr_routeb"}
+        if path == "/v1/chat/history":
+            return {
+                "messages": [
+                    {
+                        "id": "chat_1",
+                        "role": "user",
+                        "ts": 1,
+                        "v": 1,
+                        "visibility": "shared",
+                        "content_type": "text",
+                    }
+                ],
+                "total": 1,
+            }
+        assert path == "/v1/memory/list"
         return {
-            "messages": [
-                {
-                    "id": "chat_1",
-                    "role": "user",
-                    "ts": 1,
-                    "v": 1,
-                    "visibility": "shared",
-                    "content_type": "text",
-                }
-            ],
-            "total": 1,
+            "moments": [_moment_envelope("mem_cat"), _moment_envelope("mem_lark")],
+            "total": 2,
         }
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
 
-    monkeypatch.setattr(enclave_app, "_flask_get", fake_flask_get)
-    monkeypatch.setattr(enclave_app, "_decrypt_envelope", lambda _m, _uid, _sk: "猫咪最近不吃饭".encode("utf-8"))
-    monkeypatch.setattr(
-        enclave_app,
-        "_load_decrypted_moments",
-        lambda _api_key, _uid, _sk, limit=200: [
-            _moment("mem_cat", "猫咪照顾", "用户聊猫咪健康问题时，先需要被安抚，再给观察饮水和精神状态的建议。", linked="猫咪"),
-            _moment("mem_lark", "Lark 工作流", "用户希望 agent 帮忙读 Lark 群消息并整理重点。", linked="Lark"),
-        ],
-    )
-    enclave_app.app.config.update(TESTING=True)
-    with enclave_app.app.test_client() as client:
-        yield client
-    enclave_app._state["ready"] = previous_ready
-    enclave_app._state["error"] = previous_error
+    async def fake_sk():
+        return object()
+    monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+
+    def fake_decrypt_envelope(env, uid, sk):
+        eid = env.get("id")
+        if eid == "chat_1":
+            return "猫咪最近不吃饭".encode("utf-8")
+        if eid == "mem_cat":
+            return _inner_json("猫咪照顾",
+                               "用户聊猫咪健康问题时，先需要被安抚，再给观察饮水和精神状态的建议。",
+                               linked="猫咪")
+        if eid == "mem_lark":
+            return _inner_json("Lark 工作流",
+                               "用户希望 agent 帮忙读 Lark 群消息并整理重点。",
+                               linked="Lark")
+        raise AssertionError(f"unexpected envelope id {eid}")
+
+    monkeypatch.setattr(envmod, "decrypt_envelope", fake_decrypt_envelope)
+
+    return _AsgiTestClient(build_app())
 
 
 def test_routeb_flag_false_keeps_legacy_context_selection(enclave_history_client, monkeypatch):
     monkeypatch.delenv("MEMORY_READSIDE_FOR_MODEL_API", raising=False)
     monkeypatch.setattr(
-        enclave_app,
+        chat_route,
         "select_context_memories_with_trace",
         lambda moments, latest, mode="": ([{"id": "legacy", "title": "legacy"}], {"mode": "model_api"}),
     )
     monkeypatch.setattr(
-        enclave_app,
-        "_select_context_memories_via_readside",
+        readside,
+        "select_context_memories_via_readside",
         lambda *_args, **_kwargs: pytest.fail("readside should not run when flag is false"),
     )
 
-    res = enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1")
+    res = enclave_history_client.get(
+        "/v1/chat/history?context_mode=model_api&context_trace=1",
+        headers={"X-API-Key": "key_routeb"},
+    )
 
     assert res.status_code == 200
     body = res.get_json()
@@ -124,12 +169,15 @@ def test_routeb_flag_false_keeps_legacy_context_selection(enclave_history_client
 def test_routeb_flag_true_uses_readside_selection(enclave_history_client, monkeypatch):
     monkeypatch.setenv("MEMORY_READSIDE_FOR_MODEL_API", "true")
     monkeypatch.setattr(
-        enclave_app,
+        chat_route,
         "select_context_memories_with_trace",
         lambda *_args, **_kwargs: pytest.fail("legacy selector should not run when readside flag is true"),
     )
 
-    res = enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1")
+    res = enclave_history_client.get(
+        "/v1/chat/history?context_mode=model_api&context_trace=1",
+        headers={"X-API-Key": "key_routeb"},
+    )
 
     assert res.status_code == 200
     body = res.get_json()
@@ -141,27 +189,39 @@ def test_routeb_flag_true_uses_readside_selection(enclave_history_client, monkey
 def test_routeb_readside_uses_configurable_memory_limit(enclave_history_client, monkeypatch):
     captured_limits = []
 
-    def fake_load(api_key, uid, sk, limit=200):
-        captured_limits.append(limit)
-        return [
-            _moment("mem_cat", "猫咪照顾", "用户聊猫咪健康问题时，先需要被安抚。", linked="猫咪"),
-        ]
+    from enclave import envelope as envmod
 
-    monkeypatch.setattr(enclave_app, "_load_decrypted_moments", fake_load)
+    async def fake_backend_get(path, headers, params=None):
+        if path == "/v1/users/whoami":
+            return {"user_id": "usr_routeb"}
+        if path == "/v1/chat/history":
+            return {"messages": [], "total": 0}
+        assert path == "/v1/memory/list"
+        captured_limits.append(int(params["limit"]))
+        return {"moments": [_moment_envelope("mem_cat")], "total": 1}
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+    monkeypatch.setattr(
+        envmod, "decrypt_envelope",
+        lambda e, u, s: _inner_json("猫咪照顾", "用户聊猫咪健康问题时，先需要被安抚。", linked="猫咪"),
+    )
 
     monkeypatch.delenv("MEMORY_READSIDE_FOR_MODEL_API", raising=False)
-    enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1")
+    enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1",
+                              headers={"X-API-Key": "key_routeb"})
     assert captured_limits[-1] == 200
 
     monkeypatch.setenv("MEMORY_READSIDE_FOR_MODEL_API", "true")
     monkeypatch.delenv("MEMORY_READSIDE_MODEL_API_LIMIT", raising=False)
-    enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1")
+    enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1",
+                              headers={"X-API-Key": "key_routeb"})
     assert captured_limits[-1] == 50
 
     monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", "80")
-    enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1")
+    enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1",
+                              headers={"X-API-Key": "key_routeb"})
     assert captured_limits[-1] == 80
 
     monkeypatch.setenv("MEMORY_READSIDE_MODEL_API_LIMIT", "999")
-    enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1")
+    enclave_history_client.get("/v1/chat/history?context_mode=model_api&context_trace=1",
+                              headers={"X-API-Key": "key_routeb"})
     assert captured_limits[-1] == 200
