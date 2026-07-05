@@ -310,6 +310,76 @@ def _history_import_stats(store: UserStore) -> dict:
     }
 
 
+def _safe_genesis_metadata(raw: dict | None) -> dict:
+    metadata = raw if isinstance(raw, dict) else {}
+    allowed = {
+        "mode",
+        "ingest",
+        "history_tier",
+        "window_count",
+        "history_count",
+        "timeline_span_days",
+        "support_count",
+        "warning_count",
+        "content_bytes",
+    }
+    out: dict = {}
+    for key in allowed:
+        val = metadata.get(key)
+        if isinstance(val, (str, int, float, bool)) or val is None:
+            out[key] = val
+    return out
+
+
+def _safe_genesis_job(job: dict | None) -> dict:
+    raw = job if isinstance(job, dict) else {}
+    output = raw.get("output") if isinstance(raw.get("output"), dict) else {}
+    return {
+        "job_id": str(raw.get("job_id") or ""),
+        "status": str(raw.get("status") or ""),
+        "source_kind": str(raw.get("source_kind") or ""),
+        "total_chunks": int(raw.get("total_chunks") or 0),
+        "processed_chunks": int(raw.get("processed_chunks") or 0),
+        "total_bytes": int(raw.get("total_bytes") or 0),
+        "memory_action_count": int(raw.get("memory_action_count") or 0),
+        "identity_status": str(raw.get("identity_status") or ""),
+        "persona_ref_present": bool(str(raw.get("persona_ref") or "").strip()),
+        "error": str(raw.get("error") or "")[:240],
+        "created_at": str(raw.get("created_at") or ""),
+        "updated_at": str(raw.get("updated_at") or ""),
+        "completed_at": str(raw.get("completed_at") or ""),
+        "metadata": _safe_genesis_metadata(raw.get("metadata")),
+        "stage": str(output.get("stage") or "")[:80],
+    }
+
+
+def _genesis_stats(store: UserStore, *, include_jobs: bool = False) -> dict:
+    state = db.get_blob(store.user_id, "genesis_state")
+    state_doc = state if isinstance(state, dict) else {}
+    try:
+        jobs_raw = db.genesis_list_jobs(store.user_id, limit=5 if include_jobs else 1)
+    except Exception:
+        jobs_raw = []
+    jobs = [_safe_genesis_job(j) for j in jobs_raw if isinstance(j, dict)]
+    latest = jobs[0] if jobs else {}
+    return {
+        "has_state": bool(state_doc),
+        "status": str(state_doc.get("status") or latest.get("status") or ""),
+        "job_status": str(state_doc.get("job_status") or latest.get("status") or ""),
+        "job_id": str(state_doc.get("job_id") or latest.get("job_id") or ""),
+        "source_kind": str(state_doc.get("source_kind") or latest.get("source_kind") or ""),
+        "updated_at": str(state_doc.get("updated_at") or latest.get("updated_at") or ""),
+        "completed_at": str(state_doc.get("completed_at") or latest.get("completed_at") or ""),
+        "memory_action_count": int(state_doc.get("memory_action_count") or latest.get("memory_action_count") or 0),
+        "identity_status": str(state_doc.get("identity_status") or latest.get("identity_status") or ""),
+        "persona_ref_present": bool(str(state_doc.get("persona_ref") or "").strip() or latest.get("persona_ref_present")),
+        "error": str(state_doc.get("error") or latest.get("error") or "")[:240],
+        "job_count": len(jobs),
+        "latest_job": latest,
+        "jobs": jobs if include_jobs else [],
+    }
+
+
 def _data_track_iso(value) -> str:
     if isinstance(value, (int, float)):
         return core_util._epoch_to_iso(value)
@@ -826,6 +896,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
     tracking = _tracking_stats(store, include_events=include_detail)
     bootstrap_events = _bootstrap_event_stats(store, include_events=include_detail)
     history_import = _history_import_stats(store)
+    genesis = _genesis_stats(store, include_jobs=include_detail)
     identity = identity_service._load_identity(store)
     identity_updated_at = (identity or {}).get("updated_at", "")
     registered_at = str(user_entry.get("created_at") or "")
@@ -840,6 +911,8 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         identity_updated_at,
         history_import.get("updated_at"),
         history_import.get("completed_at"),
+        genesis.get("updated_at"),
+        genesis.get("completed_at"),
     )
     now = time.time()
     stage = validation.get("stage") or "unknown"
@@ -878,6 +951,7 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
         "tracking": tracking,
         "bootstrap_events": bootstrap_events,
         "history_import": history_import,
+        "genesis": genesis,
     }
     if include_detail:
         row["runtime"] = _runtime_summary(store)
@@ -1320,7 +1394,7 @@ def _debug_filter_options(events: list[dict]) -> dict:
     """Build stable filter choices from the current ring-buffer sample."""
     subsystems = sorted({str(e.get("subsystem") or "").strip() for e in events if str(e.get("subsystem") or "").strip()})
     statuses = sorted({str(e.get("status") or "").strip().lower() for e in events if str(e.get("status") or "").strip()})
-    preferred_subsystems = ["route", "context", "agent", "memory", "debug_trace"]
+    preferred_subsystems = ["route", "context", "agent", "memory", "genesis", "debug_trace"]
     ordered_subsystems = [s for s in preferred_subsystems if s in subsystems]
     ordered_subsystems.extend([s for s in subsystems if s not in ordered_subsystems])
     preferred_statuses = ["ok", "error", "failed", "blocked", "stalled"]
@@ -2145,7 +2219,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
         )
 
     subsystem_options = ['<option value="">all modules</option>']
-    for subsystem in options.get("subsystems") or ["route", "context", "agent", "memory", "debug_trace"]:
+    for subsystem in options.get("subsystems") or ["route", "context", "agent", "memory", "genesis", "debug_trace"]:
         subsystem_options.append(
             f'<option value="{html.escape(subsystem, quote=True)}" {is_selected("subsystem", subsystem)}>{html.escape(subsystem)}</option>'
         )
@@ -2264,7 +2338,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
     th,td {{ text-align:left; padding:10px 12px; border-bottom:1px solid var(--line); vertical-align:top; }} th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.06em; background:#f4ece5; }}
     .pill {{ display:inline-flex; border-radius:999px; padding:2px 8px; font-size:12px; background:#efe7df; color:var(--muted); }} .pill.ok,.ok {{ color:var(--ok); background:#e7f3ed; }} .pill.warn,.warn {{ color:var(--warn); background:#fff1db; }} .pill.bad,.bad {{ color:var(--bad); background:#fff1ed; }}
     .hint {{ display:inline-flex; align-items:center; justify-content:center; width:16px; height:16px; border-radius:50%; margin-left:4px; background:#eadfd4; color:var(--muted); font-size:11px; font-weight:700; cursor:help; text-transform:none; letter-spacing:0; }}
-    .module {{ display:inline-flex; border-radius:5px; padding:2px 7px; font-size:12px; background:#edf0ef; color:var(--ink); }} .module-route {{ background:#e8f1ff; color:#24538a; }} .module-context {{ background:#edf7e8; color:#3b6b2d; }} .module-agent {{ background:#fff0e3; color:#9a4d00; }} .module-memory {{ background:#f0eaff; color:#5b3a91; }} .module-debug_trace {{ background:#eef0f2; color:#52616b; }}
+    .module {{ display:inline-flex; border-radius:5px; padding:2px 7px; font-size:12px; background:#edf0ef; color:var(--ink); }} .module-route {{ background:#e8f1ff; color:#24538a; }} .module-context {{ background:#edf7e8; color:#3b6b2d; }} .module-agent {{ background:#fff0e3; color:#9a4d00; }} .module-memory {{ background:#f0eaff; color:#5b3a91; }} .module-genesis {{ background:#e8f6f4; color:#21625a; }} .module-debug_trace {{ background:#eef0f2; color:#52616b; }}
     .log-table td:nth-child(8) {{ min-width:280px; }} .trace-link {{ color:#6b3fb0; }}
     .turn {{ margin:10px 0; }} .event-row {{ border-top:1px solid var(--line); padding:9px 0; }} .event-row:first-of-type {{ border-top:0; }}
     .event-meta {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:4px; }} .event-detail summary {{ color:var(--accent); cursor:pointer; margin-top:5px; }}
@@ -2294,7 +2368,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
     <input name="admin_key" type="hidden" value="{html.escape(request.args.get('admin_key', ''), quote=True)}">
     <div class="field"><label>User {hint('留空表示扫所有用户；填 user_id 时可查任意真实用户。')}</label><input name="user_id" placeholder="usr_..." value="{input_value('user_id')}"></div>
     <div class="field"><label>Trace {hint('一次聊天/任务的链路 id。已知 trace_id 时可直接定位。')}</label><input name="trace_id" placeholder="trace_id" value="{input_value('trace_id')}"></div>
-    <div class="field"><label>Module {hint('按模块收窄：route=入口，context=上下文，agent=模型/回复，memory=记忆。')}</label><select name="subsystem">{''.join(subsystem_options)}</select></div>
+    <div class="field"><label>Module {hint('按模块收窄：route=入口，context=上下文，agent=模型/回复，memory=记忆，genesis=蒸馏/初始化。')}</label><select name="subsystem">{''.join(subsystem_options)}</select></div>
     <div class="field"><label>Page size {hint('每页渲染多少条。全局 debug 默认分页，避免一次打开全量日志。')}</label><select name="limit">{''.join(limit_options)}</select></div>
     <div class="field"><label>Status {hint('这里按整轮 turn 状态筛选：stalled 表示 start 后没有 done/error。')}</label><select name="status">
       <option value="" {is_selected("status", "")}>all status</option>
@@ -2378,6 +2452,7 @@ def _render_user_detail_page(user: dict) -> str:
     <div class="card"><div class="value">{html.escape(_format_duration(user['onboarding']['stuck_for_sec']))}</div><div class="label">stuck for</div></div>
     <div class="card"><div class="value">{user['chat']['total']}</div><div class="label">chat messages</div></div>
     <div class="card"><div class="value">{user['memory']['total']}</div><div class="label">memories</div></div>
+    <div class="card"><div class="value">{html.escape(user.get('genesis', {}).get('status') or 'none')}</div><div class="label">genesis distill</div></div>
     <div class="card"><div class="value">{user['proactive']['proactive_messages']}</div><div class="label">proactive writes</div></div>
   </section>
   <pre>{html.escape(safe_json)}</pre>
