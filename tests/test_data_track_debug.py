@@ -11,6 +11,11 @@ from admin import admin_core, data_track  # noqa: E402
 from core.reqctx import bind  # noqa: E402
 
 
+class _Store:
+    def __init__(self, user_id: str):
+        self.user_id = user_id
+
+
 def _event(ts: float, user_id: str, typ: str, *, trace_id: str, status: str = "ok", **extra) -> dict:
     return {
         "ts": ts,
@@ -28,6 +33,52 @@ def _event(ts: float, user_id: str, typ: str, *, trace_id: str, status: str = "o
         "detail": extra.get("detail", {}),
         "content_excerpt": extra.get("content_excerpt", {}),
     }
+
+
+def test_genesis_stats_surfaces_state_and_recent_jobs(monkeypatch):
+    state = {
+        "status": "processing",
+        "job_status": "processing",
+        "job_id": "gen_123",
+        "updated_at": "2026-07-05T12:00:00Z",
+        "memory_action_count": 0,
+        "identity_status": "",
+        "error": "",
+    }
+    jobs = [
+        {
+            "job_id": "gen_123",
+            "status": "processing",
+            "source_kind": "plaintext_multi_source",
+            "total_chunks": 3,
+            "processed_chunks": 1,
+            "total_bytes": 2048,
+            "memory_action_count": 0,
+            "identity_status": "",
+            "error": "",
+            "updated_at": "2026-07-05T12:00:00Z",
+            "metadata": {"mode": "onboarding", "history_count": 42, "window_count": 3},
+            "output": {"stage": "plaintext_queued"},
+        },
+        {
+            "job_id": "gen_old",
+            "status": "failed",
+            "source_kind": "history_import",
+            "error": "timeout",
+            "updated_at": "2026-07-05T11:00:00Z",
+            "metadata": {"mode": "onboarding"},
+        },
+    ]
+    monkeypatch.setattr(data_track.db, "get_blob", lambda _uid, kind: state if kind == "genesis_state" else None)
+    monkeypatch.setattr(data_track.db, "genesis_list_jobs", lambda _uid, limit=5: jobs[:limit])
+
+    stats = data_track._genesis_stats(_Store("user_a"), include_jobs=True)
+
+    assert stats["has_state"] is True
+    assert stats["status"] == "processing"
+    assert stats["job_count"] == 2
+    assert stats["latest_job"]["job_id"] == "gen_123"
+    assert stats["latest_job"]["metadata"]["history_count"] == 42
 
 
 def test_debug_payload_groups_multi_user_trace_and_marks_stalled(monkeypatch):

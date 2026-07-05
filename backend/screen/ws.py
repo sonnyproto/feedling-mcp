@@ -22,7 +22,7 @@ def _resolve_ws_user(websocket) -> tuple[str, str] | None:
     Reads ?key=... from the path, or "Bearer ..." from the Authorization
     header (whichever arrives first)."""
     # websockets lib v12+ uses websocket.request.path and .headers
-    path = getattr(websocket, "path", "") or ""
+    path = getattr(getattr(websocket, "request", None), "path", "") or ""
     key = None
     if "?" in path:
         try:

@@ -7,8 +7,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-import enclave_app  # noqa: E402
 import memory_readside_core as readside_core  # noqa: E402
+from enclave import readside  # noqa: E402
 
 
 def _moment(
@@ -141,7 +141,7 @@ def test_memory_score_applies_decay_from_last_referenced_at(monkeypatch):
 
 
 def test_enclave_index_and_fetch_use_v1_shape_without_content_in_index():
-    index_item = enclave_app._build_memory_index_item(
+    index_item = readside.build_memory_index_item(
         {
             "id": "mem_v1",
             "status": "active",
@@ -157,7 +157,7 @@ def test_enclave_index_and_fetch_use_v1_shape_without_content_in_index():
             "threads": ["武松", "猫"],
         },
     )
-    fetch_item = enclave_app._build_memory_fetch_item(
+    fetch_item = readside.build_memory_fetch_item(
         {"id": "mem_v1", "status": "active", "source": "chat"},
         {
             "summary": "用户有只猫叫武松。",

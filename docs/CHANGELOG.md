@@ -49,6 +49,64 @@
 
 ## 2026-07-04
 
+### [DONE] enclave Flask→FastAPI/asyncio 迁移，全仓 flask 依赖清零
+
+`backend/enclave_app.py`（2333 行 Flask 单文件，全仓最后一个 flask 使用方）
+迁移为模块化 `backend/enclave/` 包 + FastAPI/asyncio，16 个 task 完成
+（主 backend 的同类迁移已在 PR #44 合入，见 992d908；enclave 是收尾）。
+
+- **模块划分**：`config/keys/attestation/state/envelope/auth/backend_client/
+  readside/visual` + `routes/{health,envelope,memory,worldbook,chat,identity,
+  frames}` + `asgi_worker.py`（enclave 专用 UvicornWorker）+ `serving.py`（内嵌
+  gunicorn 组装、TLS PEM 材料化）；`enclave_app.py` 收缩成 ~30 行薄入口，
+  compose 命令 `python -u backend/enclave_app.py` 不变（compose_hash 不变）。
+- **混合并发模型**：11 条路由全 `async def`；enclave→backend 回环换成进程级
+  `httpx.AsyncClient`；解密批处理按请求整批下放 `anyio.to_thread.run_sync`
+  （libsodium/cryptography 释放 GIL，真并行，事件循环不被 CPU 工作阻塞）；
+  whoami 缓存的 singleflight 从 `threading.Lock` 改 per-key `asyncio.Future`；
+  `/v1/envelope/decrypt` 保持"每次实时解析、绝不走缓存"不变。
+- **手工 Range/ETag**：`/image` 路由手写替代 Flask `send_file(conditional=True)`
+  ——单区间 206 + `Content-Range`、非法区间 416、`ETag`/`If-None-Match` → 304，
+  是 dstack-gateway 每连接 ~1Mbps 限速下并行分块拉图的关键能力，专项测试覆盖。
+  flask-compress gzip 换成 Starlette `GZipMiddleware`（阈值对齐 500 字节）。
+- **`FEEDLING_ENCLAVE_THREADS` 语义变更**：从 gthread worker 线程数变为 anyio
+  解密线程池容量（CapacityLimiter），默认值仍是 32，环境变量名不变，compose
+  不用动。`FEEDLING_ENCLAVE_WORKERS`（prod=2）语义不变。
+- **两处有意行为偏差**（spec 明确标注，不是回归）：
+  1. `OPTIONS` 请求：Flask 自动 200 → 新栈 FastAPI 路由表行为，未注册的
+     OPTIONS 回 405 + `Allow`（`test_enclave_routes_health.py`）；
+  2. `/v1/envelope/decrypt` 非对象 body：旧代码曾 500 → 新代码归一为 400
+     （`envelope.py` 内联注释 "有意偏差 #2"）。
+  错误码/错误字符串（含两套并存拼法 `missing_api_key`/`missing api_key` 等）
+  逐字保留，未借机统一命名。
+- **依赖清零**：`backend/requirements.txt` 删除 `flask>=3.0.0` /
+  `flask-compress>=1.14` 两行及其头部说明段；`uv pip compile` 重新生成
+  `requirements.lock`，diff 只消失 flask 系传递闭包八个包（flask/
+  flask-compress/itsdangerous/blinker/jinja2/werkzeug/brotli/backports-zstd，
+  后两个是 flask-compress 的压缩算法依赖），无关依赖零变化。新增
+  `tests/test_no_flask_anywhere.py` 守卫（grep 全 backend 无 `import flask`
+  + 逐个 import 11 个 `enclave.*` 模块断言 `"flask" not in sys.modules`），
+  锁死"全仓无 flask"不变量。
+- **验证**：全量测试 2125 passed（较主迁移后基线 2037 净增 88，全部来自本次
+  新增的 enclave 单测），4 skipped，9 xfailed；已知非本次引入的 2 个失败
+  （`tests/test_data_track.py` 两个 fast-validation 断言，未改动过、与本次
+  迁移无关）与 `tests/test_api.py` 收集错误（需 `:5001` 活服务，非本次回归）
+  按既有基线原样保留，无新增失败。`docker-compose.memory-sandbox.yaml` 冒烟
+  通过：`up -d --build` 后 backend + enclave 均 healthy，`curl /healthz` →
+  `{"ok":true,"ready":true}`，`/attestation` 正常返回 quote/measurements，
+  enclave 日志确认跑在 `enclave.asgi_worker.EnclaveUvicornWorker` 上。
+- **test CVM 待验收**（不属于本次范围，spec §5/§8，由用户驱动上线后跑）：
+  TLS 钉扎三条硬验收——① `openssl s_client` 取实际 served leaf cert，
+  sha256(DER) 与 attestation 指纹比对必须相等；② iOS 审计卡实测通过；
+  ③ 最低 TLS 版本 ≥1.2（握手对 TLS1.1 必须失败）。理论上钉扎不破（同一份
+  PEM 材料化路径），但 uvicorn/gunicorn 构建 SSLContext 与现有自定义
+  `ssl_context` hook 的协商细节可能有出入，需真实 TDX 环境验证。另需在
+  test CVM 上过一遍 chat/memory/identity/frames e2e、Range 并行分块拉图、
+  runtime-token 与 api-key 双路径。
+- **影响文档**：`docs/superpowers/specs/2026-07-04-enclave-asgi-migration-design.md`
+  是本次设计的 spec 源文档。本条目工作树未 commit（worktree
+  `enclave-asgi-migration`，基于 test 分支），由用户在验收后提交。
+
 ### [DONE] 自定义陪伴频率 wake_interval_sec + 心跳激活门（三层，已 ship）
 
 两件事一起落地（Seven 主导）。**① 自定义陪伴频率**:用户在设置页选「陪伴频率」7 档

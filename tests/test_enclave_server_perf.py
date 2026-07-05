@@ -1,80 +1,71 @@
-"""Enclave server-side perf knobs:
+"""Enclave server-side perf knobs (ASGI era).
 
-A. The enclave→backend HTTP hop reuses ONE pooled keep-alive client instead of
-   opening a fresh ``httpx.Client`` per call (DNS+TCP+TLS on every whoami/fetch).
-C. The gunicorn worker count is env-driven (``FEEDLING_ENCLAVE_WORKERS``) so prod
-   (8 vCPU) can parallelize GIL-bound decrypts across processes; default 1 keeps
-   the historical single-worker cache-coherent behavior.
+The Flask-era pooled-httpx-client and gunicorn-worker-count knobs this file
+used to cover are superseded:
+  - the pooled enclave->backend client is now `enclave.backend_client`'s
+    async singleton (see test_enclave_backend_client.py's
+    test_aclose_resets_singleton / test_backend_get_roundtrip);
+  - the env-driven worker count is `enclave.config.enclave_worker_count()`
+    (see test_enclave_config.py's test_enclave_worker_count).
+
+What remains genuinely enclave-server-shaped is spec §4's concurrency
+invariant: decrypt batches must run in a thread (`anyio.to_thread`), not
+inline on the event loop, so a slow decrypt batch for one caller does not
+stall unrelated requests (e.g. /healthz) on the same worker.
 """
+
+from __future__ import annotations
 
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import enclave_app  # noqa: E402
 
 
-# ---- A: pooled enclave→backend client ----
+def test_healthz_responsive_during_slow_decrypt(monkeypatch):
+    """spec §7：大批量解密进行中 /healthz 仍及时响应（解密在 to_thread，
+    事件循环不被阻塞）。"""
+    import asyncio, time
+    import httpx
+    from enclave import auth, backend_client, keys, state
+    from enclave.routes import build_app, chat
 
+    monkeypatch.setitem(state._state, "ready", True)
+    monkeypatch.setitem(state._state, "error", None)
+    auth.reset_cache()
 
-def test_http_client_is_singleton():
-    assert enclave_app._http_client() is enclave_app._http_client()
+    async def fake_backend_get(path, headers, params=None):
+        if path == "/v1/users/whoami":
+            return {"user_id": "usr_a"}
+        if path == "/v1/chat/history":
+            return {"messages": [], "total": 0}
+        return {"moments": [], "total": 0}
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+    async def fake_sk():
+        return object()
+    monkeypatch.setattr(keys, "get_content_sk", fake_sk)
 
+    def slow_decrypt(messages, uid, sk):
+        time.sleep(1.0)  # 模拟重解密批（在 to_thread 里跑才不会卡 loop）
+        return [], []
+    monkeypatch.setattr(chat, "_decrypt_history_items", slow_decrypt)
 
-def test_flask_get_headers_reuses_pooled_client_no_per_call_client(monkeypatch):
-    class _FakeResp:
-        def raise_for_status(self):
-            pass
+    app = build_app()
 
-        def json(self):
-            return {"ok": True}
+    async def main():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport,
+                                     base_url="http://t") as c:
+            slow = asyncio.create_task(
+                c.get("/v1/chat/history", headers={"X-API-Key": "k"}))
+            await asyncio.sleep(0.1)  # 确保慢请求已进入解密阶段
+            t0 = time.monotonic()
+            h = await c.get("/healthz")
+            dt = time.monotonic() - t0
+            r = await slow
+            return h.status_code, dt, r.status_code
 
-    class _FakeClient:
-        def __init__(self):
-            self.gets = []
-
-        def get(self, url, params=None, headers=None):
-            self.gets.append(url)
-            return _FakeResp()
-
-    fake = _FakeClient()
-    monkeypatch.setattr(enclave_app, "_http_client", lambda: fake, raising=False)
-
-    def _boom(*a, **k):
-        raise AssertionError("must not open a per-call httpx.Client")
-
-    monkeypatch.setattr(enclave_app.httpx, "Client", _boom)
-
-    out1 = enclave_app._flask_get_headers("/v1/a", {"X-API-Key": "k"})
-    out2 = enclave_app._flask_get_headers("/v1/b", {"X-API-Key": "k"})
-    assert out1 == {"ok": True} and out2 == {"ok": True}
-    assert fake.gets == [f"{enclave_app.FLASK_URL}/v1/a", f"{enclave_app.FLASK_URL}/v1/b"]
-
-
-# ---- C: env-driven worker count ----
-
-
-def test_gunicorn_options_worker_count_from_env(monkeypatch):
-    monkeypatch.setenv("FEEDLING_ENCLAVE_WORKERS", "4")
-    assert enclave_app._gunicorn_options(None)["workers"] == 4
-
-
-def test_gunicorn_options_defaults_to_one_worker(monkeypatch):
-    monkeypatch.delenv("FEEDLING_ENCLAVE_WORKERS", raising=False)
-    assert enclave_app._gunicorn_options(None)["workers"] == 1
-
-
-def test_gunicorn_options_empty_or_blank_worker_env_defaults_to_one(monkeypatch):
-    # CI expands an unset GitHub var to "" → int("") would crash enclave boot.
-    monkeypatch.setenv("FEEDLING_ENCLAVE_WORKERS", "")
-    assert enclave_app._gunicorn_options(None)["workers"] == 1
-    monkeypatch.setenv("FEEDLING_ENCLAVE_WORKERS", "  ")
-    assert enclave_app._gunicorn_options(None)["workers"] == 1
-
-
-def test_gunicorn_options_preserves_thread_and_bind(monkeypatch):
-    monkeypatch.delenv("FEEDLING_ENCLAVE_WORKERS", raising=False)
-    opts = enclave_app._gunicorn_options(None)
-    assert opts["worker_class"] == "gthread"
-    assert opts["threads"] == enclave_app._ENCLAVE_THREADS
-    assert opts["bind"] == f"0.0.0.0:{enclave_app.ENCLAVE_PORT}"
+    h_status, dt, slow_status = asyncio.run(main())
+    assert h_status == 200
+    assert slow_status == 200
+    assert dt < 0.5, f"/healthz took {dt:.2f}s while decrypt batch was running"

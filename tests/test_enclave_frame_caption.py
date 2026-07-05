@@ -1,44 +1,61 @@
 import json
-import importlib
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
-import pytest
+import pytest  # noqa: E402
+
+import provider_client  # noqa: E402
+from asgi_test_client import _AsgiTestClient  # noqa: E402
+from enclave import auth as enclave_auth  # noqa: E402
+from enclave import backend_client, envelope as envmod, keys  # noqa: E402
+from enclave import state as enclave_state  # noqa: E402
+from enclave.routes import build_app  # noqa: E402
+
+_FRAME_ID = "abc123def4560000"
 
 
 @pytest.fixture
 def enclave(monkeypatch):
     monkeypatch.setenv("FEEDLING_SCREEN_VLM_API_KEY", "sk-test")
     monkeypatch.setenv("FEEDLING_SCREEN_VLM_MODEL", "qwen/qwen3-vl-8b-instruct")
-    mod = importlib.import_module("enclave_app")
-    mod._state["ready"] = True
-    monkeypatch.setattr(mod, "_extract_api_key", lambda: "user-key")
-    monkeypatch.setattr(mod, "_whoami_cached", lambda k: {"user_id": "u1"})
-    monkeypatch.setattr(mod, "_flask_get", lambda path, key: {"v": 1, "ts": 1.0})
-    monkeypatch.setattr(mod, "_get_or_derive_content_sk", lambda: object())
+    monkeypatch.setitem(enclave_state._state, "ready", True)
+    monkeypatch.setitem(enclave_state._state, "error", None)
+    enclave_auth.reset_cache()
+
+    async def fake_backend_get(path, headers, params=None):
+        if path == "/v1/users/whoami":
+            return {"user_id": "u1"}
+        assert path == f"/v1/screen/frames/{_FRAME_ID}/envelope"
+        return {"v": 1, "ts": 1.0}
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+
+    async def fake_sk():
+        return object()
+    monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+
     monkeypatch.setattr(
-        mod, "_decrypt_envelope",
+        envmod, "decrypt_envelope",
         lambda env, uid, sk: json.dumps(
             {"image": "ZmFrZQ==", "ocr_text": "Inbox (3)", "app": "Mail"}
         ).encode(),
     )
-    return mod
+    return _AsgiTestClient(build_app())
 
 
 def test_caption_returns_text_never_pixels(enclave, monkeypatch):
     captured = {}
 
-    def fake_chat(config, messages, **kw):
+    async def fake_chat(config, messages, **kw):
         captured["messages"] = messages
         captured["model"] = config.model
         return {"reply": "Mail inbox with 3 unread threads."}
 
-    monkeypatch.setattr(enclave.provider_client, "chat_completion", fake_chat)
-    client = enclave.app.test_client()
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_chat)
 
-    resp = client.get("/v1/screen/frames/abc123def4560000/caption")
+    resp = enclave.get(f"/v1/screen/frames/{_FRAME_ID}/caption",
+                       headers={"X-API-Key": "user-key"})
     body = resp.get_json()
 
     assert resp.status_code == 200
@@ -53,30 +70,32 @@ def test_caption_returns_text_never_pixels(enclave, monkeypatch):
 
 def test_caption_unconfigured_is_fail_closed(enclave, monkeypatch):
     monkeypatch.delenv("FEEDLING_SCREEN_VLM_API_KEY", raising=False)
-    resp = enclave.app.test_client().get("/v1/screen/frames/abc123def4560000/caption")
+    resp = enclave.get(f"/v1/screen/frames/{_FRAME_ID}/caption",
+                       headers={"X-API-Key": "user-key"})
     assert resp.status_code == 503
     assert resp.get_json()["error"] == "screen_caption_unconfigured"
 
 
 def test_caption_model_failure_is_fail_closed(enclave, monkeypatch):
-    def boom(config, messages, **kw):
-        raise enclave.provider_client.ProviderError("upstream 429")
+    async def boom(config, messages, **kw):
+        raise provider_client.ProviderError("upstream 429")
 
-    monkeypatch.setattr(enclave.provider_client, "chat_completion", boom)
-    resp = enclave.app.test_client().get("/v1/screen/frames/abc123def4560000/caption")
+    monkeypatch.setattr(provider_client, "chat_completion_async", boom)
+    resp = enclave.get(f"/v1/screen/frames/{_FRAME_ID}/caption",
+                       headers={"X-API-Key": "user-key"})
     assert resp.status_code == 502
     assert resp.get_json()["error"].startswith("screen_caption_failed")
     assert "image_b64" not in resp.get_json()
 
 
 def test_caption_full_mode_includes_ocr_not_pixels(enclave, monkeypatch):
-    def fake_chat(config, messages, **kw):
+    async def fake_chat(config, messages, **kw):
         return {"reply": "Mail app showing inbox with unread messages."}
 
-    monkeypatch.setattr(enclave.provider_client, "chat_completion", fake_chat)
-    client = enclave.app.test_client()
+    monkeypatch.setattr(provider_client, "chat_completion_async", fake_chat)
 
-    resp = client.get("/v1/screen/frames/abc123def4560000/caption?mode=full")
+    resp = enclave.get(f"/v1/screen/frames/{_FRAME_ID}/caption?mode=full",
+                       headers={"X-API-Key": "user-key"})
     body = resp.get_json()
 
     assert resp.status_code == 200

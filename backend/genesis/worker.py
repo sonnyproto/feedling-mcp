@@ -18,6 +18,7 @@ from typing import Any, Callable
 import httpx
 
 import db
+import debug_trace
 import provider_client
 from core.store import get_store
 from genesis import checkpoint, foreground, prompts, service
@@ -67,6 +68,53 @@ TRUNCATION_STOP_REASONS = {
 
 class GenesisWorkerError(Exception):
     """Retryable/non-retryable worker failure surfaced into job.error."""
+
+
+def _trace_genesis(store, event_type: str, *, job_id: str = "", status: str = "ok",
+                   summary: str = "", detail: dict | None = None, dur_ms: float | None = None) -> None:
+    try:
+        debug_trace.trace_event(
+            store,
+            subsystem="genesis",
+            type=event_type,
+            actor="backend",
+            status=status,
+            job_id=job_id,
+            trace_id=job_id,
+            turn_id=job_id,
+            summary=summary,
+            detail=detail or {},
+            dur_ms=dur_ms,
+        )
+    except Exception:
+        pass
+
+
+def _trace_enclave(store, event_type: str, *, job_id: str = "", status: str = "ok",
+                   purpose: str = "", path: str = "/v1/envelope/decrypt",
+                   summary: str = "", detail: dict | None = None,
+                   dur_ms: float | None = None) -> None:
+    try:
+        debug_trace.trace_event(
+            store,
+            subsystem="enclave",
+            type=event_type,
+            actor="backend",
+            status=status,
+            job_id=job_id,
+            trace_id=job_id,
+            turn_id=job_id,
+            summary=summary,
+            explain="Genesis worker called the enclave; only metadata is recorded.",
+            detail={
+                "purpose": purpose,
+                "path": path,
+                **(detail or {}),
+            },
+            dur_ms=dur_ms,
+        )
+    except Exception:
+        pass
 
 
 def _env_int(name: str, default: int) -> int:
@@ -262,7 +310,7 @@ def _memory_summary_name_only(doc: dict) -> dict:
     return clean
 
 
-def _fetch_provider_key(api_url: str, enclave_url: str, runtime_token: str) -> str:
+def _fetch_provider_key(api_url: str, enclave_url: str, runtime_token: str, *, store=None, job_id: str = "") -> str:
     try:
         resp = httpx.get(
             f"{api_url.rstrip('/')}/v1/model_api/key_envelope",
@@ -280,6 +328,8 @@ def _fetch_provider_key(api_url: str, enclave_url: str, runtime_token: str) -> s
         runtime_token,
         envelope,
         purpose="model_api_provider_key",
+        store=store,
+        job_id=job_id,
     ).decode("utf-8")
 
 
@@ -305,7 +355,23 @@ def _runtime_for_user(user_id: str, provider_key: str) -> provider_client.Provid
     )
 
 
-def _decrypt_envelope(enclave_url: str, runtime_token: str, envelope: dict, *, purpose: str) -> bytes:
+def _decrypt_envelope(
+    enclave_url: str,
+    runtime_token: str,
+    envelope: dict,
+    *,
+    purpose: str,
+    store=None,
+    job_id: str = "",
+) -> bytes:
+    started_at = time.time()
+    _trace_enclave(
+        store,
+        "enclave.call.start",
+        job_id=job_id,
+        purpose=purpose,
+        summary="enclave decrypt call started",
+    )
     try:
         resp = httpx.post(
             f"{enclave_url.rstrip('/')}/v1/envelope/decrypt",
@@ -317,28 +383,64 @@ def _decrypt_envelope(enclave_url: str, runtime_token: str, envelope: dict, *, p
         resp.raise_for_status()
         body = resp.json()
         plaintext_b64 = body.get("plaintext_b64") if isinstance(body, dict) else ""
-        return base64.b64decode(str(plaintext_b64 or ""), validate=True)
+        out = base64.b64decode(str(plaintext_b64 or ""), validate=True)
+        _trace_enclave(
+            store,
+            "enclave.call.done",
+            job_id=job_id,
+            purpose=purpose,
+            summary="enclave decrypt call done",
+            detail={"status_code": resp.status_code},
+            dur_ms=(time.time() - started_at) * 1000,
+        )
+        return out
     except Exception as e:  # noqa: BLE001
+        error_type = type(e).__name__
+        _trace_enclave(
+            store,
+            "enclave.call.timeout" if isinstance(e, httpx.TimeoutException) else "enclave.call.error",
+            job_id=job_id,
+            status="error",
+            purpose=purpose,
+            summary="enclave decrypt call failed",
+            detail={"error_class": error_type},
+            dur_ms=(time.time() - started_at) * 1000,
+        )
         raise GenesisWorkerError(f"{purpose}:decrypt_failed:{type(e).__name__}") from e
 
 
-def _decrypt_chunks(enclave_url: str, runtime_token: str, chunks: list[dict]) -> list[str]:
+def _decrypt_chunks(enclave_url: str, runtime_token: str, chunks: list[dict], *, store=None, job_id: str = "") -> list[str]:
     texts: list[str] = []
     for chunk in chunks:
         envelope = service.chunk_envelope_from_row(chunk)
-        raw = _decrypt_envelope(enclave_url, runtime_token, envelope, purpose="genesis_chunk")
+        raw = _decrypt_envelope(
+            enclave_url,
+            runtime_token,
+            envelope,
+            purpose="genesis_chunk",
+            store=store,
+            job_id=job_id,
+        )
         texts.append(raw.decode("utf-8"))
     return texts
 
 
-def _decrypt_blob_text(enclave_url: str, runtime_token: str, blob: dict, *, purpose: str) -> str:
+def _decrypt_blob_text(
+    enclave_url: str,
+    runtime_token: str,
+    blob: dict,
+    *,
+    purpose: str,
+    store=None,
+    job_id: str = "",
+) -> str:
     envelope = blob.get("content_envelope") if isinstance(blob.get("content_envelope"), dict) else {}
     if not envelope:
         return ""
-    return _decrypt_envelope(enclave_url, runtime_token, envelope, purpose=purpose).decode("utf-8")
+    return _decrypt_envelope(enclave_url, runtime_token, envelope, purpose=purpose, store=store, job_id=job_id).decode("utf-8")
 
 
-def _existing_persona_material(user_id: str, enclave_url: str, runtime_token: str) -> dict:
+def _existing_persona_material(user_id: str, enclave_url: str, runtime_token: str, *, store=None, job_id: str = "") -> dict:
     try:
         blob = db.get_blob(user_id, service.GENESIS_PERSONA_BLOB)
         if not isinstance(blob, dict):
@@ -349,7 +451,14 @@ def _existing_persona_material(user_id: str, enclave_url: str, runtime_token: st
             priority = 0
         if priority < 100:
             return {}
-        content = _decrypt_blob_text(enclave_url, runtime_token, blob, purpose="genesis_persona").strip()
+        content = _decrypt_blob_text(
+            enclave_url,
+            runtime_token,
+            blob,
+            purpose="genesis_persona",
+            store=store,
+            job_id=job_id,
+        ).strip()
         if not content:
             return {}
         return {
@@ -361,12 +470,19 @@ def _existing_persona_material(user_id: str, enclave_url: str, runtime_token: st
         return {}
 
 
-def _existing_voice_workset(user_id: str, enclave_url: str, runtime_token: str) -> dict:
+def _existing_voice_workset(user_id: str, enclave_url: str, runtime_token: str, *, store=None, job_id: str = "") -> dict:
     try:
         blob = db.get_blob(user_id, service.GENESIS_VOICE_BLOB)
         if not isinstance(blob, dict):
             return {}
-        raw = _decrypt_blob_text(enclave_url, runtime_token, blob, purpose="genesis_voice")
+        raw = _decrypt_blob_text(
+            enclave_url,
+            runtime_token,
+            blob,
+            purpose="genesis_voice",
+            store=store,
+            job_id=job_id,
+        )
         parsed = json.loads(raw)
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
@@ -1180,11 +1296,22 @@ def _apply_reducer_output(api_url: str, runtime_token: str, job_id: str, output:
 
 
 def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_token: Callable) -> dict:
+    started_at = time.time()
     user_id = str(job.get("user_id") or "")
     job_id = str(job.get("job_id") or "")
     if not user_id or not job_id:
         raise GenesisWorkerError("invalid_claimed_job")
     store = get_store(user_id)
+    _trace_genesis(
+        store,
+        "genesis.worker.claimed",
+        job_id=job_id,
+        summary="genesis worker claimed job",
+        detail={
+            "source_kind": str(job.get("source_kind") or ""),
+            "total_chunks": int(job.get("total_chunks") or 0),
+        },
+    )
     service.write_genesis_state(store, {**job, "status": "processing"}, status="processing")
     total_chunks = int(job.get("total_chunks") or 0)
     if total_chunks <= 0:
@@ -1197,11 +1324,19 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
         raise GenesisWorkerError(f"chunk_count_mismatch:{len(chunks)}:{total_chunks}")
 
     token = _mint(mint_runtime_token, user_id)
-    provider_key = _fetch_provider_key(api_url, enclave_url, token)
+    _trace_genesis(store, "genesis.worker.token.minted", job_id=job_id, summary="runtime token minted")
+    provider_key = _fetch_provider_key(api_url, enclave_url, token, store=store, job_id=job_id)
+    _trace_genesis(store, "genesis.worker.provider_key.loaded", job_id=job_id,
+                   summary="provider key loaded", detail={"has_provider_key": bool(provider_key)})
     runtime = _runtime_for_user(user_id, provider_key)
-    chunk_texts = _decrypt_chunks(enclave_url, token, chunks)
-    existing_persona = _existing_persona_material(user_id, enclave_url, token)
-    existing_voice = _existing_voice_workset(user_id, enclave_url, token)
+    chunk_texts = _decrypt_chunks(enclave_url, token, chunks, store=store, job_id=job_id)
+    _trace_genesis(store, "genesis.worker.chunks.decrypted", job_id=job_id,
+                   summary="encrypted chunks decrypted", detail={"chunk_count": len(chunk_texts)})
+    existing_persona = _existing_persona_material(user_id, enclave_url, token, store=store, job_id=job_id)
+    existing_voice = _existing_voice_workset(user_id, enclave_url, token, store=store, job_id=job_id)
+    reducer_started_at = time.time()
+    _trace_genesis(store, "genesis.worker.reducer.started", job_id=job_id,
+                   summary="worker reducer started", detail={"chunk_count": len(chunk_texts)})
     reducer_output = _build_reducer_output(
         user_id=user_id,
         job_id=job_id,
@@ -1211,7 +1346,28 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
         existing_persona=existing_persona,
         existing_voice=existing_voice,
     )
+    _trace_genesis(
+        store,
+        "genesis.worker.reducer.done",
+        job_id=job_id,
+        summary="worker reducer done",
+        detail={
+            "memory_count": len(reducer_output.get("memories") or []) if isinstance(reducer_output, dict) else 0,
+            "has_identity": bool(isinstance(reducer_output, dict) and reducer_output.get("identity")),
+            "has_persona": bool(isinstance(reducer_output, dict) and reducer_output.get("persona")),
+        },
+        dur_ms=(time.time() - reducer_started_at) * 1000,
+    )
+    _trace_genesis(store, "genesis.worker.apply.started", job_id=job_id, summary="worker apply started")
     applied = _apply_reducer_output(api_url, token, job_id, reducer_output)
+    _trace_genesis(
+        store,
+        "genesis.worker.done",
+        job_id=job_id,
+        summary="genesis worker job done",
+        detail={"chunks": len(chunks)},
+        dur_ms=(time.time() - started_at) * 1000,
+    )
     return {
         "user_id": user_id,
         "job_id": job_id,
@@ -1248,10 +1404,19 @@ def reap_stale_processing_jobs() -> list[dict]:
         job_id = str(job.get("job_id") or "")
         if not user_id or not job_id:
             continue
+        store = get_store(user_id)
         try:
-            service.write_genesis_state(get_store(user_id), job, status="failed")
+            service.write_genesis_state(store, job, status="failed")
         except Exception as e:  # noqa: BLE001
             print(f"[genesis:reaper] blob sync failed for {user_id}/{job_id}: {type(e).__name__}:{str(e)[:120]}")
+        _trace_genesis(
+            store,
+            "genesis.worker.stale_reaped",
+            job_id=job_id,
+            status="error",
+            summary="stale genesis processing job reaped",
+            detail={"error": error},
+        )
         reaped.append({"user_id": user_id, "job_id": job_id})
     return reaped
 
@@ -1288,6 +1453,14 @@ def tick(
             failed += 1
             if user_id and job_id:
                 store = get_store(user_id)
+                _trace_genesis(
+                    store,
+                    "genesis.worker.failed",
+                    job_id=job_id,
+                    status="error",
+                    summary="genesis worker job failed",
+                    detail={"reason": f"{type(e).__name__}:{str(e)[:180]}"},
+                )
                 service.mark_failed(store, job_id, f"worker_failed:{type(e).__name__}:{str(e)[:180]}")
             results.append({"user_id": user_id, "job_id": job_id, "status": "failed", "error": str(e)[:240]})
     end = time.time() if now is None else float(now())
