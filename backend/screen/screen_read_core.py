@@ -35,6 +35,7 @@ from typing import Any, Optional
 import httpx
 
 import db
+import debug_trace
 from screen import frames
 from screen import summary as summary_mod
 from semantic_analysis import analyze as _semantic_analysis
@@ -67,6 +68,37 @@ def enclave_forward_headers(*, api_key: str | None, runtime_token: str | None) -
     if runtime_token:
         return {"X-Feedling-Runtime-Token": runtime_token}
     return {"X-API-Key": api_key} if api_key else {}
+
+
+def _trace_enclave_proxy(
+    store,
+    event_type: str,
+    *,
+    path: str,
+    purpose: str,
+    status: str = "ok",
+    summary: str = "",
+    detail: dict | None = None,
+    dur_ms: float | None = None,
+) -> None:
+    try:
+        debug_trace.trace_event(
+            store,
+            subsystem="enclave",
+            type=event_type,
+            actor="backend",
+            status=status,
+            summary=summary,
+            explain="Screen route proxied a request to the enclave; only metadata is recorded.",
+            detail={
+                "path": path,
+                "purpose": purpose,
+                **(detail or {}),
+            },
+            dur_ms=dur_ms,
+        )
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -192,6 +224,15 @@ def frame_decrypt(
 
     headers = enclave_forward_headers(api_key=api_key, runtime_token=runtime_token)
     params = {"include_image": include_image}
+    path = f"/v1/screen/frames/{frame_id}/decrypt"
+    started_at = time.time()
+    _trace_enclave_proxy(
+        store,
+        "enclave.call.start",
+        path=path,
+        purpose="screen_frame_decrypt",
+        summary="screen frame enclave decrypt started",
+    )
     try:
         with httpx.Client(timeout=30, verify=False) as client:
             r = client.get(
@@ -199,12 +240,32 @@ def frame_decrypt(
                 headers=headers,
                 params=params,
             )
+        _trace_enclave_proxy(
+            store,
+            "enclave.call.done" if r.status_code < 400 else "enclave.call.error",
+            path=path,
+            purpose="screen_frame_decrypt",
+            status="ok" if r.status_code < 400 else "error",
+            summary="screen frame enclave decrypt returned",
+            detail={"status_code": r.status_code, "include_image": include_image},
+            dur_ms=(time.time() - started_at) * 1000,
+        )
         return ScreenResult(
             r.status_code,
             raw_body=r.content,
             media_type=r.headers.get("Content-Type", "application/json"),
         )
     except httpx.HTTPError as e:
+        _trace_enclave_proxy(
+            store,
+            "enclave.call.timeout" if isinstance(e, httpx.TimeoutException) else "enclave.call.error",
+            path=path,
+            purpose="screen_frame_decrypt",
+            status="error",
+            summary="screen frame enclave decrypt failed",
+            detail={"error_class": type(e).__name__},
+            dur_ms=(time.time() - started_at) * 1000,
+        )
         return ScreenResult(502, json_body={"error": f"enclave_error: {e}"})
 
 
@@ -226,6 +287,15 @@ def frame_image(
     fwd_headers = enclave_forward_headers(api_key=api_key, runtime_token=runtime_token)
     if range_header:
         fwd_headers["Range"] = range_header
+    path = f"/v1/screen/frames/{frame_id}/image"
+    started_at = time.time()
+    _trace_enclave_proxy(
+        store,
+        "enclave.call.start",
+        path=path,
+        purpose="screen_frame_image",
+        summary="screen frame enclave image started",
+    )
     try:
         with httpx.Client(timeout=30, verify=False) as client:
             r = client.get(
@@ -233,7 +303,27 @@ def frame_image(
                 headers=fwd_headers,
             )
     except httpx.HTTPError as e:
+        _trace_enclave_proxy(
+            store,
+            "enclave.call.timeout" if isinstance(e, httpx.TimeoutException) else "enclave.call.error",
+            path=path,
+            purpose="screen_frame_image",
+            status="error",
+            summary="screen frame enclave image failed",
+            detail={"error_class": type(e).__name__, "has_range": bool(range_header)},
+            dur_ms=(time.time() - started_at) * 1000,
+        )
         return ScreenResult(502, json_body={"error": f"enclave_error: {e}"})
+    _trace_enclave_proxy(
+        store,
+        "enclave.call.done" if r.status_code < 400 else "enclave.call.error",
+        path=path,
+        purpose="screen_frame_image",
+        status="ok" if r.status_code < 400 else "error",
+        summary="screen frame enclave image returned",
+        detail={"status_code": r.status_code, "has_range": bool(range_header)},
+        dur_ms=(time.time() - started_at) * 1000,
+    )
 
     resp_headers: dict = {}
     for h in ("Content-Type", "Content-Length", "Content-Range",

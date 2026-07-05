@@ -12,6 +12,48 @@ import time
 
 import httpx
 
+import debug_trace
+
+
+def _trace_store_from_user_id(user_id: str):
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return None
+    return type("_EnclaveTraceStore", (), {"user_id": user_id})()
+
+
+def _trace_enclave(
+    store,
+    event_type: str,
+    *,
+    purpose: str = "",
+    path: str = "",
+    status: str = "ok",
+    summary: str = "",
+    detail: dict | None = None,
+    dur_ms: float | None = None,
+) -> None:
+    if store is None:
+        return
+    try:
+        debug_trace.trace_event(
+            store,
+            subsystem="enclave",
+            type=event_type,
+            actor="backend",
+            status=status,
+            summary=summary,
+            explain="Backend called the enclave over HTTP; only metadata is recorded.",
+            detail={
+                "purpose": purpose,
+                "path": path,
+                **(detail or {}),
+            },
+            dur_ms=dur_ms,
+        )
+    except Exception:
+        pass
+
 
 def _enclave_get_json_for_gate(path: str, api_key: str | None, params: dict | None = None,
                                *, runtime_token: str = "") -> tuple[dict | None, str]:
@@ -100,21 +142,80 @@ def _decrypt_envelope_via_enclave(envelope: dict, api_key: str | None, *, purpos
     if not api_key and not runtime_token:
         raise RuntimeError("api_key_unavailable")
     headers = {"X-Feedling-Runtime-Token": runtime_token} if runtime_token else {"X-API-Key": api_key}
+    path = "/v1/envelope/decrypt"
+    store = _trace_store_from_user_id(str(envelope.get("owner_user_id") or envelope.get("user_id") or ""))
+    started_at = time.time()
+    _trace_enclave(
+        store,
+        "enclave.call.start",
+        purpose=purpose,
+        path=path,
+        summary="enclave decrypt call started",
+    )
     try:
         with httpx.Client(timeout=20, verify=False) as client:
             resp = client.post(
-                f"{enclave_url}/v1/envelope/decrypt",
+                f"{enclave_url}{path}",
                 headers=headers,
                 json={"envelope": envelope, "purpose": purpose},
             )
     except httpx.HTTPError as e:
+        _trace_enclave(
+            store,
+            "enclave.call.timeout" if isinstance(e, httpx.TimeoutException) else "enclave.call.error",
+            purpose=purpose,
+            path=path,
+            status="error",
+            summary="enclave decrypt call failed",
+            detail={"error_class": type(e).__name__},
+            dur_ms=(time.time() - started_at) * 1000,
+        )
         raise RuntimeError(f"enclave_error:{type(e).__name__}") from e
     if resp.status_code >= 400:
+        _trace_enclave(
+            store,
+            "enclave.call.error",
+            purpose=purpose,
+            path=path,
+            status="error",
+            summary="enclave decrypt call returned error",
+            detail={"status_code": resp.status_code},
+            dur_ms=(time.time() - started_at) * 1000,
+        )
         raise RuntimeError(f"enclave_http_{resp.status_code}:{resp.text[:180]}")
     body = resp.json()
     if not isinstance(body, dict) or not isinstance(body.get("plaintext_b64"), str):
+        _trace_enclave(
+            store,
+            "enclave.call.error",
+            purpose=purpose,
+            path=path,
+            status="error",
+            summary="enclave decrypt call returned invalid body",
+            dur_ms=(time.time() - started_at) * 1000,
+        )
         raise RuntimeError("enclave_invalid_decrypt_response")
     try:
-        return base64.b64decode(body["plaintext_b64"])
+        out = base64.b64decode(body["plaintext_b64"])
+        _trace_enclave(
+            store,
+            "enclave.call.done",
+            purpose=purpose,
+            path=path,
+            summary="enclave decrypt call done",
+            detail={"status_code": resp.status_code},
+            dur_ms=(time.time() - started_at) * 1000,
+        )
+        return out
     except Exception as e:
+        _trace_enclave(
+            store,
+            "enclave.call.error",
+            purpose=purpose,
+            path=path,
+            status="error",
+            summary="enclave decrypt plaintext decode failed",
+            detail={"error_class": type(e).__name__},
+            dur_ms=(time.time() - started_at) * 1000,
+        )
         raise RuntimeError(f"enclave_plaintext_decode:{type(e).__name__}") from e

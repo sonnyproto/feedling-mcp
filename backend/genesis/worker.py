@@ -90,6 +90,33 @@ def _trace_genesis(store, event_type: str, *, job_id: str = "", status: str = "o
         pass
 
 
+def _trace_enclave(store, event_type: str, *, job_id: str = "", status: str = "ok",
+                   purpose: str = "", path: str = "/v1/envelope/decrypt",
+                   summary: str = "", detail: dict | None = None,
+                   dur_ms: float | None = None) -> None:
+    try:
+        debug_trace.trace_event(
+            store,
+            subsystem="enclave",
+            type=event_type,
+            actor="backend",
+            status=status,
+            job_id=job_id,
+            trace_id=job_id,
+            turn_id=job_id,
+            summary=summary,
+            explain="Genesis worker called the enclave; only metadata is recorded.",
+            detail={
+                "purpose": purpose,
+                "path": path,
+                **(detail or {}),
+            },
+            dur_ms=dur_ms,
+        )
+    except Exception:
+        pass
+
+
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.environ.get(name, str(default)))
@@ -283,7 +310,7 @@ def _memory_summary_name_only(doc: dict) -> dict:
     return clean
 
 
-def _fetch_provider_key(api_url: str, enclave_url: str, runtime_token: str) -> str:
+def _fetch_provider_key(api_url: str, enclave_url: str, runtime_token: str, *, store=None, job_id: str = "") -> str:
     try:
         resp = httpx.get(
             f"{api_url.rstrip('/')}/v1/model_api/key_envelope",
@@ -301,6 +328,8 @@ def _fetch_provider_key(api_url: str, enclave_url: str, runtime_token: str) -> s
         runtime_token,
         envelope,
         purpose="model_api_provider_key",
+        store=store,
+        job_id=job_id,
     ).decode("utf-8")
 
 
@@ -326,7 +355,23 @@ def _runtime_for_user(user_id: str, provider_key: str) -> provider_client.Provid
     )
 
 
-def _decrypt_envelope(enclave_url: str, runtime_token: str, envelope: dict, *, purpose: str) -> bytes:
+def _decrypt_envelope(
+    enclave_url: str,
+    runtime_token: str,
+    envelope: dict,
+    *,
+    purpose: str,
+    store=None,
+    job_id: str = "",
+) -> bytes:
+    started_at = time.time()
+    _trace_enclave(
+        store,
+        "enclave.call.start",
+        job_id=job_id,
+        purpose=purpose,
+        summary="enclave decrypt call started",
+    )
     try:
         resp = httpx.post(
             f"{enclave_url.rstrip('/')}/v1/envelope/decrypt",
@@ -338,28 +383,64 @@ def _decrypt_envelope(enclave_url: str, runtime_token: str, envelope: dict, *, p
         resp.raise_for_status()
         body = resp.json()
         plaintext_b64 = body.get("plaintext_b64") if isinstance(body, dict) else ""
-        return base64.b64decode(str(plaintext_b64 or ""), validate=True)
+        out = base64.b64decode(str(plaintext_b64 or ""), validate=True)
+        _trace_enclave(
+            store,
+            "enclave.call.done",
+            job_id=job_id,
+            purpose=purpose,
+            summary="enclave decrypt call done",
+            detail={"status_code": resp.status_code},
+            dur_ms=(time.time() - started_at) * 1000,
+        )
+        return out
     except Exception as e:  # noqa: BLE001
+        error_type = type(e).__name__
+        _trace_enclave(
+            store,
+            "enclave.call.timeout" if isinstance(e, httpx.TimeoutException) else "enclave.call.error",
+            job_id=job_id,
+            status="error",
+            purpose=purpose,
+            summary="enclave decrypt call failed",
+            detail={"error_class": error_type},
+            dur_ms=(time.time() - started_at) * 1000,
+        )
         raise GenesisWorkerError(f"{purpose}:decrypt_failed:{type(e).__name__}") from e
 
 
-def _decrypt_chunks(enclave_url: str, runtime_token: str, chunks: list[dict]) -> list[str]:
+def _decrypt_chunks(enclave_url: str, runtime_token: str, chunks: list[dict], *, store=None, job_id: str = "") -> list[str]:
     texts: list[str] = []
     for chunk in chunks:
         envelope = service.chunk_envelope_from_row(chunk)
-        raw = _decrypt_envelope(enclave_url, runtime_token, envelope, purpose="genesis_chunk")
+        raw = _decrypt_envelope(
+            enclave_url,
+            runtime_token,
+            envelope,
+            purpose="genesis_chunk",
+            store=store,
+            job_id=job_id,
+        )
         texts.append(raw.decode("utf-8"))
     return texts
 
 
-def _decrypt_blob_text(enclave_url: str, runtime_token: str, blob: dict, *, purpose: str) -> str:
+def _decrypt_blob_text(
+    enclave_url: str,
+    runtime_token: str,
+    blob: dict,
+    *,
+    purpose: str,
+    store=None,
+    job_id: str = "",
+) -> str:
     envelope = blob.get("content_envelope") if isinstance(blob.get("content_envelope"), dict) else {}
     if not envelope:
         return ""
-    return _decrypt_envelope(enclave_url, runtime_token, envelope, purpose=purpose).decode("utf-8")
+    return _decrypt_envelope(enclave_url, runtime_token, envelope, purpose=purpose, store=store, job_id=job_id).decode("utf-8")
 
 
-def _existing_persona_material(user_id: str, enclave_url: str, runtime_token: str) -> dict:
+def _existing_persona_material(user_id: str, enclave_url: str, runtime_token: str, *, store=None, job_id: str = "") -> dict:
     try:
         blob = db.get_blob(user_id, service.GENESIS_PERSONA_BLOB)
         if not isinstance(blob, dict):
@@ -370,7 +451,14 @@ def _existing_persona_material(user_id: str, enclave_url: str, runtime_token: st
             priority = 0
         if priority < 100:
             return {}
-        content = _decrypt_blob_text(enclave_url, runtime_token, blob, purpose="genesis_persona").strip()
+        content = _decrypt_blob_text(
+            enclave_url,
+            runtime_token,
+            blob,
+            purpose="genesis_persona",
+            store=store,
+            job_id=job_id,
+        ).strip()
         if not content:
             return {}
         return {
@@ -382,12 +470,19 @@ def _existing_persona_material(user_id: str, enclave_url: str, runtime_token: st
         return {}
 
 
-def _existing_voice_workset(user_id: str, enclave_url: str, runtime_token: str) -> dict:
+def _existing_voice_workset(user_id: str, enclave_url: str, runtime_token: str, *, store=None, job_id: str = "") -> dict:
     try:
         blob = db.get_blob(user_id, service.GENESIS_VOICE_BLOB)
         if not isinstance(blob, dict):
             return {}
-        raw = _decrypt_blob_text(enclave_url, runtime_token, blob, purpose="genesis_voice")
+        raw = _decrypt_blob_text(
+            enclave_url,
+            runtime_token,
+            blob,
+            purpose="genesis_voice",
+            store=store,
+            job_id=job_id,
+        )
         parsed = json.loads(raw)
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
@@ -1230,15 +1325,15 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
 
     token = _mint(mint_runtime_token, user_id)
     _trace_genesis(store, "genesis.worker.token.minted", job_id=job_id, summary="runtime token minted")
-    provider_key = _fetch_provider_key(api_url, enclave_url, token)
+    provider_key = _fetch_provider_key(api_url, enclave_url, token, store=store, job_id=job_id)
     _trace_genesis(store, "genesis.worker.provider_key.loaded", job_id=job_id,
                    summary="provider key loaded", detail={"has_provider_key": bool(provider_key)})
     runtime = _runtime_for_user(user_id, provider_key)
-    chunk_texts = _decrypt_chunks(enclave_url, token, chunks)
+    chunk_texts = _decrypt_chunks(enclave_url, token, chunks, store=store, job_id=job_id)
     _trace_genesis(store, "genesis.worker.chunks.decrypted", job_id=job_id,
                    summary="encrypted chunks decrypted", detail={"chunk_count": len(chunk_texts)})
-    existing_persona = _existing_persona_material(user_id, enclave_url, token)
-    existing_voice = _existing_voice_workset(user_id, enclave_url, token)
+    existing_persona = _existing_persona_material(user_id, enclave_url, token, store=store, job_id=job_id)
+    existing_voice = _existing_voice_workset(user_id, enclave_url, token, store=store, job_id=job_id)
     reducer_started_at = time.time()
     _trace_genesis(store, "genesis.worker.reducer.started", job_id=job_id,
                    summary="worker reducer started", detail={"chunk_count": len(chunk_texts)})
