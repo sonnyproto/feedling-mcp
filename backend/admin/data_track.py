@@ -2539,13 +2539,15 @@ def _data_track_events_payload() -> dict:
         key = "distill_first" if row.get("distill") == "first" else "distill_second"
         add(key, row.get("route"), row.get("total"), row.get("success"), row.get("failed"))
     # reply is special: success = real replies / user messages; fallback rate tracked apart
-    reply = {"vps": {"user_msgs": 0, "real_replies": 0, "fallback_replies": 0},
-             "api": {"user_msgs": 0, "real_replies": 0, "fallback_replies": 0}}
+    reply = {"vps": {"user_msgs": 0, "real_replies": 0, "fallback_replies": 0, "median_latency": None},
+             "api": {"user_msgs": 0, "real_replies": 0, "fallback_replies": 0, "median_latency": None}}
     for row in raw.get("reply", []):
         b = reply[_events_route_bucket(row.get("route"))]
         b["user_msgs"] += int(row.get("user_msgs") or 0)
         b["real_replies"] += int(row.get("real_replies") or 0)
         b["fallback_replies"] += int(row.get("fallback_replies") or 0)
+        if row.get("median_latency") is not None:
+            b["median_latency"] = row["median_latency"]  # one row per route from db
     for bucket in ("vps", "api"):
         rb = reply[bucket]
         cats["reply"][bucket].update({
@@ -2553,6 +2555,7 @@ def _data_track_events_payload() -> dict:
             "failed": max(0, rb["user_msgs"] - rb["real_replies"]),
             "fallback": rb["fallback_replies"],
             "fallback_base": rb["real_replies"] + rb["fallback_replies"],
+            "median_latency": rb["median_latency"],
         })
     return {
         "generated_at": datetime.now().isoformat(),
@@ -2599,7 +2602,8 @@ def _render_events_page(payload: dict) -> str:
             fb = int(b.get("fallback") or 0)
             base = int(b.get("fallback_base") or 0)
             fb_pct = f"{(fb/base)*100:.0f}%" if base else "—"
-            extra = f"<br><span class='muted'>兜底 {fb_pct}</span>"
+            lat = _evt_dur({"median_dur": b.get("median_latency")})
+            extra = f"<br><span class='muted'>兜底 {fb_pct} · 延迟 {lat}</span>"
         else:
             extra = f"<br><span class='muted'>{_evt_dur(b)}</span>"
         return (f"<td><b class='{rate_cls}'>{rate}</b> <span class='muted'>·{total}</span>{extra}</td>")
@@ -2809,13 +2813,15 @@ def _render_event_users_page(payload: dict) -> str:
     for u in users:
         rate = f"{u['rate']*100:.0f}%"
         cls = "ok" if u["rate"] >= 0.8 else ("warn" if u["rate"] >= 0.5 else "bad")
+        d = u.get("median_dur")
+        dur_s = "—" if d is None else (f"{float(d):.1f}s" if float(d) < 60 else f"{float(d)/60:.1f}m")
         if is_reply:
             fb = int(u.get("fallback") or 0)
             base = int(u.get("fallback_base") or 0)
-            extra = f"兜底 {(fb/base)*100:.0f}%" if base else "兜底 —"
+            fb_pct = f"{(fb/base)*100:.0f}%" if base else "—"
+            extra = f"兜底 {fb_pct} · 延迟 {dur_s}"
         else:
-            d = u.get("median_dur")
-            extra = "—" if d is None else (f"{float(d):.1f}s" if float(d) < 60 else f"{float(d)/60:.1f}m")
+            extra = dur_s
         uhref = f"/admin/data-track/users/{quote(str(u['user_id']))}"
         rows.append(
             "<tr>"
@@ -2828,7 +2834,7 @@ def _render_event_users_page(payload: dict) -> str:
             "</tr>"
         )
     body = "".join(rows) if rows else "<tr><td colspan='6' class='muted'>此事件暂无用户数据。</td></tr>"
-    metric3 = "兜底率" if is_reply else "中位耗时"
+    metric3 = "兜底率·延迟" if is_reply else "中位耗时"
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{html.escape(label)} · 按用户 · Data Track</title>

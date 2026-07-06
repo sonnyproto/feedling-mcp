@@ -989,20 +989,32 @@ def admin_events_overview() -> dict:
         for r in rows
     ]
 
-    # 4) 回复消息: 真回复率 + 兜底率(foreground_fallback)
+    # 4) 回复消息: 真回复率 + 兜底率 + 回复延迟(中位)。real_replies 排除
+    #    agent_initiated_proactive(主动消息不是"对用户的回复")。latency = 每条真回复
+    #    与其前一条用户消息的时间差(窗口配对)。
     rows = _run("reply", f"""
-        {_EVENTS_ROUTES_CTE}
+        {_EVENTS_ROUTES_CTE}, paired AS (
+          SELECT c.user_id, c.ts, c.doc->>'role' AS role, COALESCE(c.doc->>'source','') AS src,
+            MAX(CASE WHEN c.doc->>'role'='user' AND COALESCE(c.doc->>'source','')<>'verify_ping' THEN c.ts END)
+              OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
+          FROM chat_messages c
+        )
         SELECT COALESCE(r.route,'resident') AS route,
-               (COUNT(*) FILTER (WHERE c.doc->>'role' = 'user'
-                    AND COALESCE(c.doc->>'source','') <> 'verify_ping'))::int AS user_msgs,
-               (COUNT(*) FILTER (WHERE c.doc->>'role' IN ('agent','openclaw')
-                    AND COALESCE(c.doc->>'source','') NOT IN ('foreground_fallback','proactive_fallback')))::int AS real_replies,
-               (COUNT(*) FILTER (WHERE c.doc->>'source' = 'foreground_fallback'))::int AS fallback_replies
-        FROM chat_messages c LEFT JOIN routes r ON r.user_id = c.user_id
+               (COUNT(*) FILTER (WHERE p.role='user' AND p.src<>'verify_ping'))::int AS user_msgs,
+               (COUNT(*) FILTER (WHERE p.role IN ('agent','openclaw')
+                    AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive')))::int AS real_replies,
+               (COUNT(*) FILTER (WHERE p.src='foreground_fallback'))::int AS fallback_replies,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY
+                 CASE WHEN p.role IN ('agent','openclaw')
+                      AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive')
+                      AND p.last_user_ts IS NOT NULL AND p.ts >= p.last_user_ts
+                      THEN p.ts - p.last_user_ts END) AS median_latency
+        FROM paired p LEFT JOIN routes r ON r.user_id = p.user_id
         GROUP BY route
     """)
     out["reply"] = [
-        {"route": r[0], "user_msgs": r[1], "real_replies": r[2], "fallback_replies": r[3]}
+        {"route": r[0], "user_msgs": r[1], "real_replies": r[2], "fallback_replies": r[3],
+         "median_latency": float(r[4]) if r[4] is not None else None}
         for r in rows
     ]
     return out
@@ -1097,21 +1109,32 @@ def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
 
     if cat == "reply":
         rows = _run(f"""
-            {_EVENTS_ROUTES_CTE}
-            SELECT c.user_id, COALESCE(r.route,'resident') AS route,
-                   (COUNT(*) FILTER (WHERE c.doc->>'role'='user' AND COALESCE(c.doc->>'source','')<>'verify_ping'))::int AS user_msgs,
-                   (COUNT(*) FILTER (WHERE c.doc->>'role' IN ('agent','openclaw') AND COALESCE(c.doc->>'source','') NOT IN ('foreground_fallback','proactive_fallback')))::int AS real_replies,
-                   (COUNT(*) FILTER (WHERE c.doc->>'source'='foreground_fallback'))::int AS fallback_replies,
-                   MAX(c.ts) AS last_ts
-            FROM chat_messages c LEFT JOIN routes r ON r.user_id = c.user_id
-            GROUP BY c.user_id, route
+            {_EVENTS_ROUTES_CTE}, paired AS (
+              SELECT c.user_id, c.ts, c.doc->>'role' AS role, COALESCE(c.doc->>'source','') AS src,
+                MAX(CASE WHEN c.doc->>'role'='user' AND COALESCE(c.doc->>'source','')<>'verify_ping' THEN c.ts END)
+                  OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
+              FROM chat_messages c
+            )
+            SELECT p.user_id, COALESCE(r.route,'resident') AS route,
+                   (COUNT(*) FILTER (WHERE p.role='user' AND p.src<>'verify_ping'))::int AS user_msgs,
+                   (COUNT(*) FILTER (WHERE p.role IN ('agent','openclaw') AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive')))::int AS real_replies,
+                   (COUNT(*) FILTER (WHERE p.src='foreground_fallback'))::int AS fallback_replies,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY
+                     CASE WHEN p.role IN ('agent','openclaw')
+                          AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive')
+                          AND p.last_user_ts IS NOT NULL AND p.ts >= p.last_user_ts
+                          THEN p.ts - p.last_user_ts END) AS median_latency,
+                   MAX(p.ts) AS last_ts
+            FROM paired p LEFT JOIN routes r ON r.user_id = p.user_id
+            GROUP BY p.user_id, route
         """)
         out = []
         for r in rows:
             um, real, fb = int(r[2] or 0), int(r[3] or 0), int(r[4] or 0)
             out.append({"user_id": r[0], "route": r[1], "total": um, "success": real,
                         "failed": max(0, um - real), "fallback": fb, "fallback_base": real + fb,
-                        "median_dur": None, "last_ts": float(r[5]) if r[5] is not None else None})
+                        "median_dur": float(r[5]) if r[5] is not None else None,
+                        "last_ts": float(r[6]) if r[6] is not None else None})
         return out
 
     return []
@@ -1123,7 +1146,9 @@ def admin_onboarding_funnel() -> list[dict]:
 
     Milestones (route-aware):
       t0 registered = users.created_at
-      t1 配置/上线   = API: model_api_setup_succeeded tracking event;
+      t1 配置/上线   = API: has an onboarding genesis job (⊇ t2 → monotonic;
+                      the client model_api_setup_succeeded event was too spotty —
+                      key-verification is tracked separately via admin_api_key_stats);
                       VPS: first chat/proactive activity (consumer online, 'B')
       t2 内容就绪    = API: onboarding-genesis job done; VPS: first memory card
       t3 首次真回复  = first non-fallback agent message ('A', both routes)
