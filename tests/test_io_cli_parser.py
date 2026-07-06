@@ -25,7 +25,6 @@ REAL_SUBCOMMANDS = {
     "photo-read",
     "photo-recent",
     "identity-write",
-    "add-memory",
 }
 
 
