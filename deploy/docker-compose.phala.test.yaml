@@ -130,7 +130,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:81ddc9b
+    image: ghcr.io/teleport-computer/feedling:e805c13
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
