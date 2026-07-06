@@ -987,6 +987,117 @@ def admin_events_overview() -> dict:
     return out
 
 
+def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
+    """Per-user breakdown for ONE event category (drill-down). Each row:
+    {user_id, route, total, success, failed, fallback?, median_dur, last_ts}.
+    Route-joined; the caller sorts worst-first + maps route→VPS/API."""
+    cat = str(category or "").strip()
+    lim = max(1, min(int(limit or 400), 1000))
+    dur_l = _JOB_DUR_SEC.replace("doc", "l.doc")
+
+    def _run(sql, params=()):
+        try:
+            with get_pool().connection() as conn:
+                return conn.execute(sql, params).fetchall()
+        except Exception as e:  # noqa: BLE001
+            log.error("[db] admin_events_by_user(%s) failed: %s", cat, e)
+            return []
+
+    def _job_rows(rows):
+        return [{"user_id": r[0], "route": r[1], "total": r[2], "success": r[3],
+                 "failed": r[4], "median_dur": float(r[5]) if r[5] is not None else None,
+                 "last_ts": float(r[6]) if r[6] is not None else None} for r in rows]
+
+    if cat in ("heartbeat", "trigger", "screen", "other"):
+        rows = _run(f"""
+            {_EVENTS_ROUTES_CTE}
+            SELECT j.user_id, COALESCE(r.route,'resident') AS route,
+                   COUNT(*)::int AS total,
+                   (COUNT(*) FILTER (WHERE j.status IN ('posted','delivered','completed')))::int AS success,
+                   (COUNT(*) FILTER (WHERE j.status IN ('failed','skipped')))::int AS failed,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY j.dur) AS median_dur,
+                   MAX(j.ts) AS last_ts
+            FROM (
+              SELECT l.user_id, l.ts, COALESCE(l.doc->>'status','') AS status, {dur_l} AS dur,
+                CASE
+                  WHEN k.kind IN ('screen_watch','screen_tick','broadcast_opened','heartbeat_broadcast_on') THEN 'screen'
+                  WHEN k.kind IN ('perception_event','scene_change','photo_added','arrived_at_anchor','location','unlock_after_absence','scheduled_wake') THEN 'trigger'
+                  WHEN k.kind = 'presence' OR left(k.kind,9) = 'heartbeat' THEN 'heartbeat'
+                  ELSE 'other'
+                END AS lane
+              FROM user_logs l,
+                LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),NULLIF(l.doc->>'wake_kind',''),NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
+              WHERE l.stream='proactive_jobs'
+                AND COALESCE(l.doc->>'job_kind','') NOT IN ('memory_capture','memory_dream','memory_migrate')
+            ) j LEFT JOIN routes r ON r.user_id = j.user_id
+            WHERE j.lane = %s
+            GROUP BY j.user_id, route
+            LIMIT {lim}
+        """, (cat,))
+        return _job_rows(rows)
+
+    if cat == "memory_org":
+        rows = _run(f"""
+            {_EVENTS_ROUTES_CTE}
+            SELECT m.uid AS user_id, COALESCE(r.route,'resident') AS route,
+                   COUNT(*)::int AS total,
+                   (COUNT(*) FILTER (WHERE m.status = 'completed'))::int AS success,
+                   (COUNT(*) FILTER (WHERE m.status IN ('failed','error','skipped')))::int AS failed,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY m.dur) AS median_dur,
+                   MAX(m.ts) AS last_ts
+            FROM (
+              SELECT user_id AS uid, ts, doc->>'status' AS status, {_JOB_DUR_SEC} AS dur
+              FROM user_logs WHERE stream='memory_capture_jobs'
+              UNION ALL
+              SELECT user_id AS uid, ts, doc->>'status' AS status, {_JOB_DUR_SEC} AS dur
+              FROM user_logs WHERE stream='proactive_jobs'
+                AND doc->>'job_kind' IN ('memory_capture','memory_dream','memory_migrate')
+            ) m LEFT JOIN routes r ON r.user_id = m.uid
+            GROUP BY m.uid, route
+            LIMIT {lim}
+        """)
+        return _job_rows(rows)
+
+    if cat in ("distill_first", "distill_second"):
+        cond = "= 'onboarding'" if cat == "distill_first" else "<> 'onboarding'"
+        rows = _run(f"""
+            {_EVENTS_ROUTES_CTE}
+            SELECT g.user_id, COALESCE(r.route,'resident') AS route,
+                   COUNT(*)::int AS total,
+                   (COUNT(*) FILTER (WHERE g.status IN ('done','completed')))::int AS success,
+                   (COUNT(*) FILTER (WHERE g.status IN ('error','failed')))::int AS failed,
+                   NULL::float AS median_dur,
+                   EXTRACT(EPOCH FROM MAX(g.updated_at)) AS last_ts
+            FROM genesis_import_jobs g LEFT JOIN routes r ON r.user_id = g.user_id
+            WHERE COALESCE(NULLIF(g.metadata->>'mode',''),'onboarding') {cond}
+            GROUP BY g.user_id, route
+            LIMIT {lim}
+        """)
+        return _job_rows(rows)
+
+    if cat == "reply":
+        rows = _run(f"""
+            {_EVENTS_ROUTES_CTE}
+            SELECT c.user_id, COALESCE(r.route,'resident') AS route,
+                   (COUNT(*) FILTER (WHERE c.doc->>'role'='user' AND COALESCE(c.doc->>'source','')<>'verify_ping'))::int AS user_msgs,
+                   (COUNT(*) FILTER (WHERE c.doc->>'role' IN ('agent','openclaw') AND COALESCE(c.doc->>'source','') NOT IN ('foreground_fallback','proactive_fallback')))::int AS real_replies,
+                   (COUNT(*) FILTER (WHERE c.doc->>'source'='foreground_fallback'))::int AS fallback_replies,
+                   MAX(c.ts) AS last_ts
+            FROM chat_messages c LEFT JOIN routes r ON r.user_id = c.user_id
+            GROUP BY c.user_id, route
+            LIMIT {lim}
+        """)
+        out = []
+        for r in rows:
+            um, real, fb = int(r[2] or 0), int(r[3] or 0), int(r[4] or 0)
+            out.append({"user_id": r[0], "route": r[1], "total": um, "success": real,
+                        "failed": max(0, um - real), "fallback": fb, "fallback_base": real + fb,
+                        "median_dur": None, "last_ts": float(r[5]) if r[5] is not None else None})
+        return out
+
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Per-user singleton blobs
 # ---------------------------------------------------------------------------

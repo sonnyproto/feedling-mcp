@@ -46,7 +46,7 @@ def _data_track_qs(**updates) -> str:
     for key in (
         "admin_key", "since", "registered_since", "q", "limit", "offset", "sort",
         "dir", "view", "days", "user_id", "subsystem", "status", "trace_id",
-        "mode", "reveal", "page",
+        "mode", "reveal", "page", "event",
     ):
         value = request.args.get(key, "").strip()
         if value:
@@ -2592,8 +2592,9 @@ def _render_events_page(payload: dict) -> str:
             rows.append(f"<tr><td>{html.escape(c['label'])}</td>"
                         "<td class='muted' colspan='2'>漏斗视图下一阶段接入</td></tr>")
             continue
+        drill = _data_track_page_href(view="events", event=c["key"], offset=0)
         rows.append(
-            f"<tr><td>{html.escape(c['label'])}</td>"
+            f"<tr><td><a href='{html.escape(drill, quote=True)}'>{html.escape(c['label'])}</a></td>"
             f"{cell(c['vps'], is_reply=is_reply)}{cell(c['api'], is_reply=is_reply)}</tr>"
         )
     body = "".join(rows)
@@ -2621,6 +2622,82 @@ def _render_events_page(payload: dict) -> str:
   <div class="muted">{html.escape(str(payload.get('note') or ''))}</div>
   <table>
     <thead><tr><th>事件</th><th>VPS(自托管)</th><th>API(托管)</th></tr></thead>
+    <tbody>{body}</tbody>
+  </table>
+</main></body></html>"""
+
+
+def _data_track_event_users_payload(category: str) -> dict:
+    label = dict(_EVENT_CATEGORIES).get(category, category)
+    is_reply = category == "reply"
+    users = []
+    for r in db.admin_events_by_user(category):
+        total = int(r.get("total") or 0)
+        if total <= 0:
+            continue
+        resolved = int(r.get("success") or 0) + int(r.get("failed") or 0)
+        rate = (int(r.get("success") or 0) / resolved) if resolved else 0.0
+        users.append({
+            "user_id": r.get("user_id"),
+            "route": "API" if str(r.get("route")) == "model_api" else "VPS",
+            "total": total, "success": int(r.get("success") or 0), "failed": int(r.get("failed") or 0),
+            "rate": rate, "fallback": r.get("fallback"), "fallback_base": r.get("fallback_base"),
+            "median_dur": r.get("median_dur"),
+            "last_at": core_util._epoch_to_iso(r.get("last_ts")) if r.get("last_ts") else "",
+        })
+    users.sort(key=lambda u: (u["rate"], -u["total"]))  # worst success-rate first
+    return {"generated_at": datetime.now().isoformat(), "category": category,
+            "label": label, "is_reply": is_reply, "users": users[:400]}
+
+
+def _render_event_users_page(payload: dict) -> str:
+    label = payload.get("label", "")
+    is_reply = payload.get("is_reply")
+    users = payload.get("users", [])
+    back = _data_track_page_href(view="events", event=None, offset=0)
+    rows = []
+    for u in users:
+        rate = f"{u['rate']*100:.0f}%"
+        cls = "ok" if u["rate"] >= 0.8 else ("warn" if u["rate"] >= 0.5 else "bad")
+        if is_reply:
+            fb = int(u.get("fallback") or 0)
+            base = int(u.get("fallback_base") or 0)
+            extra = f"兜底 {(fb/base)*100:.0f}%" if base else "兜底 —"
+        else:
+            d = u.get("median_dur")
+            extra = "—" if d is None else (f"{float(d):.1f}s" if float(d) < 60 else f"{float(d)/60:.1f}m")
+        uhref = f"/admin/data-track/users/{quote(str(u['user_id']))}"
+        rows.append(
+            "<tr>"
+            f"<td><a href='{html.escape(uhref, quote=True)}'>{html.escape(str(u['user_id']))}</a></td>"
+            f"<td>{html.escape(u['route'])}</td>"
+            f"<td><b class='{cls}'>{rate}</b></td>"
+            f"<td>{u['total']} <span class='muted'>·{u['success']}✓/{u['failed']}✗</span></td>"
+            f"<td>{html.escape(extra)}</td>"
+            f"<td class='muted'>{html.escape(str(u.get('last_at') or ''))}</td>"
+            "</tr>"
+        )
+    body = "".join(rows) if rows else "<tr><td colspan='6' class='muted'>此事件暂无用户数据。</td></tr>"
+    metric3 = "兜底率" if is_reply else "中位耗时"
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(label)} · 按用户 · Data Track</title>
+<style>
+  :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
+  body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+  main {{ max-width:1000px; margin:0 auto; padding:28px 24px 48px; }}
+  h1 {{ font-size:22px; margin:0 0 4px; }} .muted {{ color:var(--muted); }} .ok {{ color:var(--ok); }} .warn {{ color:var(--warn); }} .bad {{ color:var(--bad); }}
+  a {{ color:var(--accent); text-decoration:none; }}
+  table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
+  th,td {{ text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); }}
+  th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; background:#f4ece5; }}
+  tr:last-child td {{ border-bottom:0; }}
+</style></head><body><main>
+  <div><a href="{html.escape(back, quote=True)}">← 返回事件健康度</a></div>
+  <h1>{html.escape(label)} · 按用户（最差成功率在前）</h1>
+  <div class="muted">点用户 id 看单用户详情。Generated {html.escape(str(payload.get('generated_at') or ''))}.</div>
+  <table>
+    <thead><tr><th>用户</th><th>类型</th><th>成功率</th><th>次数(✓/✗)</th><th>{metric3}</th><th>最近一次</th></tr></thead>
     <tbody>{body}</tbody>
   </table>
 </main></body></html>"""
