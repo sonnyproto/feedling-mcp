@@ -1134,8 +1134,9 @@ def admin_onboarding_funnel() -> list[dict]:
                         CASE WHEN created_at ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
                              THEN EXTRACT(EPOCH FROM created_at::timestamptz) ELSE NULL END AS t0
                       FROM users),
-                setup AS (SELECT user_id, MIN(ts) AS t FROM user_logs
-                          WHERE stream='tracking_events' AND doc->>'type'='model_api_setup_succeeded'
+                gen_started AS (SELECT user_id, MIN(EXTRACT(EPOCH FROM updated_at)) AS t
+                          FROM genesis_import_jobs
+                          WHERE COALESCE(NULLIF(metadata->>'mode',''),'onboarding')='onboarding'
                           GROUP BY user_id),
                 firstact AS (SELECT user_id, MIN(ts) AS t FROM (
                              SELECT user_id, ts FROM chat_messages
@@ -1156,12 +1157,12 @@ def admin_onboarding_funnel() -> list[dict]:
                             AND COALESCE(doc->>'source','') NOT IN ('foreground_fallback','proactive_fallback')
                           GROUP BY user_id)
                 SELECT u.user_id, COALESCE(r.route,'resident') AS route, u.t0,
-                       CASE WHEN COALESCE(r.route,'resident')='model_api' THEN setup.t ELSE firstact.t END AS t1,
+                       CASE WHEN COALESCE(r.route,'resident')='model_api' THEN gen_started.t ELSE firstact.t END AS t1,
                        CASE WHEN COALESCE(r.route,'resident')='model_api' THEN gen.t ELSE mem.t END AS t2,
                        reply.t AS t3
                 FROM u
                 LEFT JOIN routes r ON r.user_id = u.user_id
-                LEFT JOIN setup ON setup.user_id = u.user_id
+                LEFT JOIN gen_started ON gen_started.user_id = u.user_id
                 LEFT JOIN firstact ON firstact.user_id = u.user_id
                 LEFT JOIN gen ON gen.user_id = u.user_id
                 LEFT JOIN mem ON mem.user_id = u.user_id
@@ -1174,6 +1175,27 @@ def admin_onboarding_funnel() -> list[dict]:
     except Exception as e:  # noqa: BLE001
         log.error("[db] admin_onboarding_funnel failed: %s", e)
         return []
+
+
+def admin_api_key_stats() -> dict:
+    """model_api users by API-key verification status, from the SERVER-SIDE
+    model_api config test_status (reliable) rather than the spotty client
+    model_api_setup_succeeded tracking event. passed = test_status 'ok';
+    stuck = has a model_api config but not yet 'ok'."""
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute("""
+                SELECT lower(COALESCE(NULLIF(doc->>'test_status',''),'(none)')) AS st, COUNT(*)::int
+                FROM user_blobs WHERE kind='model_api'
+                GROUP BY st
+            """).fetchall()
+        by = {r[0]: r[1] for r in rows}
+        total = sum(by.values())
+        passed = int(by.get("ok", 0))
+        return {"passed": passed, "stuck": total - passed, "total": total, "by_status": by}
+    except Exception as e:  # noqa: BLE001
+        log.error("[db] admin_api_key_stats failed: %s", e)
+        return {"passed": 0, "stuck": 0, "total": 0, "by_status": {}}
 
 
 # ---------------------------------------------------------------------------

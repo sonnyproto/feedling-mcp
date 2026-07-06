@@ -2710,12 +2710,27 @@ def _data_track_onboarding_funnel_payload() -> dict:
         "generated_at": datetime.now().isoformat(),
         "vps": route_funnel(buckets["vps"]),
         "api": route_funnel(buckets["api"]),
-        "note": "里程碑:注册→配置/上线(API=setup成功·VPS=consumer首连[B])→内容就绪(API=一次蒸馏完成·VPS=首条记忆)→首次真回复[A]。转化率=到达÷注册;耗时=各段中位。",
+        "api_key": db.admin_api_key_stats(),
+        "note": "里程碑:注册→配置/上线(API=开始入驻·有蒸馏job;VPS=consumer首活动[B])→内容就绪(API=一次蒸馏完成·VPS=首条记忆)→首次真回复[A]。转化率=到达÷注册;耗时=各段中位。API Key 验证单独统计(下)。",
     }
 
 
 def _render_onboarding_funnel_page(payload: dict) -> str:
     back = _data_track_page_href(view="events", event=None, offset=0)
+    ak = payload.get("api_key") or {}
+    ak_total = int(ak.get("total") or 0)
+    ak_passed = int(ak.get("passed") or 0)
+    ak_stuck = int(ak.get("stuck") or 0)
+    ak_pct = f"{(ak_passed/ak_total)*100:.0f}%" if ak_total else "—"
+    ak_cls = "ok" if (ak_total and ak_passed/ak_total >= 0.8) else ("warn" if ak_total else "muted")
+    apikey_html = (
+        "<section class='funnel-col' style='margin-top:16px'>"
+        "<h2>API Key 验证（服务端 test_status，非客户端埋点）</h2>"
+        f"<div class='fn-line'>通过率 <b class='{ak_cls}'>{ak_pct}</b> · "
+        f"通过 <b class='ok'>{ak_passed}</b> / 卡住 <b class='bad'>{ak_stuck}</b> / 共 {ak_total} 个配了 model_api 的用户</div>"
+        "<div class='muted' style='margin-top:4px'>「卡住」= 填了 provider/key 但 test_status 还不是 ok（key 没验通）。</div>"
+        "</section>"
+    )
 
     def col(title: str, f: dict) -> str:
         reg = int(f.get("registered") or 0)
@@ -2757,6 +2772,7 @@ def _render_onboarding_funnel_page(payload: dict) -> str:
   <h1>Onboarding 漏斗</h1>
   <div class="muted">{html.escape(str(payload.get('note') or ''))}</div>
   <div class="cols">{col('VPS（自托管）', payload.get('vps', {}))}{col('API（托管）', payload.get('api', {}))}</div>
+  {apikey_html}
   <div class="muted" style="margin-top:14px">Generated {html.escape(str(payload.get('generated_at') or ''))}.</div>
 </main></body></html>"""
 
