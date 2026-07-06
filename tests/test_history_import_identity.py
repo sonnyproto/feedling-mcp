@@ -79,6 +79,24 @@ def test_normalize_cleans_blank_list_items():
     assert out["do_not_say"] == ["老板", "boss"]
 
 
+def test_wrapped_chat_history_plaintext_parses_ios_markdown_export():
+    wrapped = (
+        "===== BEGIN CHAT HISTORY FILE: chat.md =====\n"
+        "[2026-06-01 09:00] Z: 阿樟，帮我看一下 onboarding。\n"
+        "[2026-06-01 09:01] 阿樟: 好，我先看材料再看 job。\n"
+        "===== END CHAT HISTORY FILE: chat.md ====="
+    )
+    warnings = []
+
+    messages = hi._parse_import_history_content(wrapped, "auto", warnings)
+
+    assert len(messages) == 2
+    assert messages[0]["source_filename"] == "chat.md"
+    assert all(m["source"] == "history_import" for m in messages)
+    assert all(m["ts"] is not None for m in messages)
+    assert "wrapped_json_parse_failed" not in " ".join(warnings)
+
+
 def test_normalize_keeps_sparse_evidenced_dimensions_without_padding():
     out = hi._normalize_identity_payload(
         _raw(
