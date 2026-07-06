@@ -300,6 +300,8 @@ jobs:
     concurrency:
       group: deploy-cvm
       cancel-in-progress: false
+    outputs:
+      cvm_id: ${{ steps.cvmid.outputs.cvm_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -612,81 +614,9 @@ jobs:
           python3 -m pip install --quiet cryptography
           python3 tools/deploy_canary.py
 
-      - name: Notify Lark deploy finished
-        if: always()
-        continue-on-error: true
-        env:
-          LARK_BOT_WEBHOOK: ${{ secrets.LARK_BOT_WEBHOOK }}
-          LARK_BOT_SECRET: ${{ secrets.LARK_BOT_SECRET }}
-          STATUS: ${{ job.status }}
-          CVM_ID: ${{ steps.cvmid.outputs.cvm_id }}
-          REPOSITORY: ${{ github.repository }}
-          REF_NAME: ${{ github.ref_name }}
-          ACTOR: ${{ github.actor }}
-          SERVER_URL: ${{ github.server_url }}
-          RUN_ID: ${{ github.run_id }}
-          SHA: ${{ github.sha }}
-        run: |
-          if [ -z "$LARK_BOT_WEBHOOK" ]; then
-            echo "LARK_BOT_WEBHOOK is not configured; skip Lark deploy-finish notification."
-            exit 0
-          fi
-
-          if [ "$STATUS" = "success" ]; then
-            PREFIX="[OK]"
-          elif [ "$STATUS" = "cancelled" ]; then
-            PREFIX="[CANCELLED]"
-          else
-            PREFIX="[FAIL]"
-          fi
-
-          RUN_URL="${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}"
-          COMMIT_URL="${SERVER_URL}/${REPOSITORY}/commit/${SHA}"
-          SHORT_SHA="${SHA:0:7}"
-          CONTENT=$(cat <<EOF
-          $PREFIX Feedling MCP deploy finished: $STATUS
-
-          repo: $REPOSITORY
-          branch: $REF_NAME
-          actor: $ACTOR
-          commit: $SHORT_SHA
-          cvm: $CVM_ID
-          stage: phala deploy + compose_hash publish
-
-          actions: $RUN_URL
-          commit: $COMMIT_URL
-          EOF
-          )
-
-          SIGN_TS=""
-          SIGN=""
-          if [ -n "$LARK_BOT_SECRET" ]; then
-            SIGN_TS=$(date +%s)
-            export SIGN_TS LARK_BOT_SECRET
-            SIGN=$(python3 - <<'PY'
-          import base64
-          import hashlib
-          import hmac
-          import os
-
-          string_to_sign = f"{os.environ['SIGN_TS']}\n{os.environ['LARK_BOT_SECRET']}".encode("utf-8")
-          print(base64.b64encode(hmac.new(string_to_sign, digestmod=hashlib.sha256).digest()).decode("utf-8"))
-          PY
-          )
-          fi
-
-          jq -n \
-            --arg content "$CONTENT" \
-            --arg timestamp "$SIGN_TS" \
-            --arg sign "$SIGN" \
-            'if $timestamp == "" then
-               {msg_type:"text", content:{text:$content}}
-             else
-               {timestamp:$timestamp, sign:$sign, msg_type:"text", content:{text:$content}}
-             end' \
-            | curl -fsS -X POST "$LARK_BOT_WEBHOOK" \
-                -H "Content-Type: application/json" \
-                --data-binary @-
+      # The "deploy finished" Lark notification is NOT sent here — the prod
+      # deploy isn't done until the runner CVM(s) redeploy. It lives in the
+      # notify-lark-prod-deploy job (needs: deploy-cvm + deploy-prod-runner-cvm).
 
   deploy-test-cvm:
     name: deploy CVM (test)
@@ -1254,3 +1184,98 @@ jobs:
             done
             [ "$publish_status" -eq 0 ] || { echo "::error::publish failed for $CVM_ID"; exit 1; }
           done
+
+  # =========================================================================
+  # NOTIFY — Lark "deploy finished", sent only after the WHOLE prod deploy
+  # (main CVM + runner CVM(s)) is done, not when the main CVM alone lands.
+  # always() + result checks so it still fires when either deploy job fails;
+  # gated on deploy-cvm having actually run so PR/test pushes stay silent.
+  # runner result 'skipped' counts as OK (the runner job is dormant unless
+  # DEPLOY_PROD_RUNNER_CVM == 'true').
+  # =========================================================================
+  notify-lark-prod-deploy:
+    name: notify Lark (prod deploy finished)
+    needs: [deploy-cvm, deploy-prod-runner-cvm]
+    if: ${{ always() && needs.deploy-cvm.result != 'skipped' }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Notify Lark deploy finished
+        continue-on-error: true
+        env:
+          LARK_BOT_WEBHOOK: ${{ secrets.LARK_BOT_WEBHOOK }}
+          LARK_BOT_SECRET: ${{ secrets.LARK_BOT_SECRET }}
+          MAIN_STATUS: ${{ needs.deploy-cvm.result }}
+          RUNNER_STATUS: ${{ needs.deploy-prod-runner-cvm.result }}
+          CVM_ID: ${{ needs.deploy-cvm.outputs.cvm_id }}
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          ACTOR: ${{ github.actor }}
+          SERVER_URL: ${{ github.server_url }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ -z "$LARK_BOT_WEBHOOK" ]; then
+            echo "LARK_BOT_WEBHOOK is not configured; skip Lark deploy-finish notification."
+            exit 0
+          fi
+
+          if [ "$MAIN_STATUS" = "success" ] && { [ "$RUNNER_STATUS" = "success" ] || [ "$RUNNER_STATUS" = "skipped" ]; }; then
+            STATUS="success"
+            PREFIX="[OK]"
+          elif [ "$MAIN_STATUS" = "cancelled" ] || [ "$RUNNER_STATUS" = "cancelled" ]; then
+            STATUS="cancelled"
+            PREFIX="[CANCELLED]"
+          else
+            STATUS="failure"
+            PREFIX="[FAIL]"
+          fi
+
+          RUN_URL="${SERVER_URL}/${REPOSITORY}/actions/runs/${RUN_ID}"
+          COMMIT_URL="${SERVER_URL}/${REPOSITORY}/commit/${SHA}"
+          SHORT_SHA="${SHA:0:7}"
+          CONTENT=$(cat <<EOF
+          $PREFIX Feedling MCP deploy finished: $STATUS
+
+          repo: $REPOSITORY
+          branch: $REF_NAME
+          actor: $ACTOR
+          commit: $SHORT_SHA
+          cvm: $CVM_ID
+          main CVM: $MAIN_STATUS
+          runner CVM: $RUNNER_STATUS
+          stage: main CVM + agent-runner CVM deploy
+
+          actions: $RUN_URL
+          commit: $COMMIT_URL
+          EOF
+          )
+
+          SIGN_TS=""
+          SIGN=""
+          if [ -n "$LARK_BOT_SECRET" ]; then
+            SIGN_TS=$(date +%s)
+            export SIGN_TS LARK_BOT_SECRET
+            SIGN=$(python3 - <<'PY'
+          import base64
+          import hashlib
+          import hmac
+          import os
+
+          string_to_sign = f"{os.environ['SIGN_TS']}\n{os.environ['LARK_BOT_SECRET']}".encode("utf-8")
+          print(base64.b64encode(hmac.new(string_to_sign, digestmod=hashlib.sha256).digest()).decode("utf-8"))
+          PY
+          )
+          fi
+
+          jq -n \
+            --arg content "$CONTENT" \
+            --arg timestamp "$SIGN_TS" \
+            --arg sign "$SIGN" \
+            'if $timestamp == "" then
+               {msg_type:"text", content:{text:$content}}
+             else
+               {timestamp:$timestamp, sign:$sign, msg_type:"text", content:{text:$content}}
+             end' \
+            | curl -fsS -X POST "$LARK_BOT_WEBHOOK" \
+                -H "Content-Type: application/json" \
+                --data-binary @-
