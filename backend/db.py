@@ -992,7 +992,9 @@ def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
     {user_id, route, total, success, failed, fallback?, median_dur, last_ts}.
     Route-joined; the caller sorts worst-first + maps route→VPS/API."""
     cat = str(category or "").strip()
-    lim = max(1, min(int(limit or 400), 1000))
+    # No SQL LIMIT: grouped rows = #users (bounded); the caller sorts worst-first
+    # then slices, so an early DB truncation can't hide the actual worst users.
+    _ = limit
     dur_l = _JOB_DUR_SEC.replace("doc", "l.doc")
 
     def _run(sql, params=()):
@@ -1032,7 +1034,6 @@ def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
             ) j LEFT JOIN routes r ON r.user_id = j.user_id
             WHERE j.lane = %s
             GROUP BY j.user_id, route
-            LIMIT {lim}
         """, (cat,))
         return _job_rows(rows)
 
@@ -1054,7 +1055,6 @@ def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
                 AND doc->>'job_kind' IN ('memory_capture','memory_dream','memory_migrate')
             ) m LEFT JOIN routes r ON r.user_id = m.uid
             GROUP BY m.uid, route
-            LIMIT {lim}
         """)
         return _job_rows(rows)
 
@@ -1071,7 +1071,6 @@ def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
             FROM genesis_import_jobs g LEFT JOIN routes r ON r.user_id = g.user_id
             WHERE COALESCE(NULLIF(g.metadata->>'mode',''),'onboarding') {cond}
             GROUP BY g.user_id, route
-            LIMIT {lim}
         """)
         return _job_rows(rows)
 
@@ -1085,7 +1084,6 @@ def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
                    MAX(c.ts) AS last_ts
             FROM chat_messages c LEFT JOIN routes r ON r.user_id = c.user_id
             GROUP BY c.user_id, route
-            LIMIT {lim}
         """)
         out = []
         for r in rows:
