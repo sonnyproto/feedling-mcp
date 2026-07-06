@@ -89,6 +89,68 @@
   零路由增删（139 vs 133 = 方法合并行拆分 +5、cutover 已删的 static -1、
   同期 WIP 新增 debug 路由 +2）；requirements.lock diff 仅 -pillow。
 
+### [DONE] enclave ASGI 迁移审查修复（5 个正确性回归 + 4 项清理）
+
+对 3687f98（enclave Flask→FastAPI）做多智能体行为等价性审查，确认并修复
+5 个并发模型/HTTP parity 回归（全部 TDD，先红后绿）：
+
+- **singleflight 失败广播**（`enclave/auth.py`）：leader 的瞬时失败/
+  CancelledError 不再扇出给全部同凭证等待者；等待者收哨兵后各自独立重试
+  （旧线程版 per-key 锁语义），CancelledError 不再逃出路由层变 500。
+- **CPU 重活离事件循环**：大 payload 的 `json.dumps`（chat/history、
+  frames/decrypt 的 ~470KB image_b64）经新 `routes/_json.py` 在线程池渲染；
+  gzip 中间件的 `gzip.compress` 同样 to_thread——防止图片重请求把
+  /healthz 队头阻塞成网关 502。
+- **回环连接池排队**（`enclave/backend_client.py`）：`Timeout(15, pool=None)`
+  ——池满排队等空位（旧 32 gthread 准入闸语义），不再 >100 并发时 15s 后
+  整批 PoolTimeout→502。
+- **Range parity**（`routes/frames.py`）：畸形 Range（如 `bytes=5--3`）按
+  RFC 7233 忽略回 200 全量，不再 416（byte-pos 按 1*DIGIT 显式校验）。
+- **HEAD parity**：/v1/chat/history、/v1/memory/list、/v1/identity/get 显式
+  挂 HEAD（FastAPI 不像 Flask 自动加），405→200。
+
+清理：`routes/_body.py` 改包装主 backend `asgi.http.read_json_silent`
+（收敛 +json 门槛漂移、继承 ClientDisconnect 修复）；新 `routes/_errors.py`
+收敛 15 处复制的 httpx→401/502 与 content_sk→503 映射块；provider_client
+的 openai-compat 编解码抽成 sync/async 共享纯函数（payload 构造/reasoning
+降级判定/响应解析单实现）；chat/history 的 memory/list 拉取与解密并行
+（省一次串行 RTT）；asgi_worker 的 uvicorn TLS monkeypatch 从 import 副作用
+收进 `EnclaveUvicornWorker.init_process`。
+
+测试：enclave 相关 192 全绿（含 20+ 新回归测试）；全量 2266 passed，
+6 个失败是 debug_trace/capture_trace 的 pre-existing 环境问题（测试库连接，
+与本批改动无 import 交集）。未提交未部署。
+
+### [DONE] 托管回合上游报错透出
+
+托管回合失败时不再只是静默重试/兜底回复——consumer 错误分类器
+（`classify_agent_error`）把失败归类到 error_class + 责任方（system /
+user_provider），然后：
+
+- 发一条 `role="system"` 聊天通知（前台必发；后台同 error_class 每
+  `SYSTEM_NOTICE_DEBOUNCE_SEC`（默认 6h）一条，任一成功回合清零）；
+- `POST /v1/model_api/runtime_error` 写设置页 `last_runtime_error`，
+  成功回合清空。
+- `SEND_FALLBACK_ON_AGENT_ERROR` 的 `FALLBACK_REPLY` 兜底文案保留，不冲突。
+- iOS 端渲染这条 system 通知是后续独立仓任务。
+- spec 见 `docs/superpowers/specs/2026-07-06-upstream-error-surfacing-design.md`。
+
+最终整体审查修了 3 条 Important + 1 条 Minor：
+- 去抖用 `dict.get(k, 0.0)` 配 `time.monotonic()`（自开机秒数）在
+  uptime < debounce 窗口时把「从未发过」误判成「刚发过」，导致 CVM
+  刚启动时首个后台通知被假抑制——改成 `get(k)` 为 `None` 时直接放行。
+- respawn 后新进程 `_runtime_error_reported` 从 `False` 起步，成功回合
+  永不触发清空请求，respawn 前留下的滞留错误永久卡在设置页——改成
+  每进程以 `True` 起步，首个成功回合无条件清一次（代价一次 HTTP）。
+- `_clean_messages_for_proactive_context` 没有 role 过滤，system 通知
+  会混入前台连续性上下文和 proactive 上下文，agent 把「⚠️ 额度不足」当成
+  自己说过的话——补上 role=="system" 过滤，写法对齐 `_capture_live_history`
+  的白名单方式。
+- CHANGELOG 记录格式微调（本条）。
+
+测试：`tests/test_consumer_error_classify.py` 新增去抖首发不假抑制、
+respawn 后成功回合清空、proactive 上下文过滤 system 通知三个用例。
+
 ### [DONE] Proactive 日报口径修复 + memory-maintenance 失败退避
 
 排查「日报成功率 3%」：真因不是投递管线坏，而是 memory-maintenance
@@ -101,16 +163,18 @@ pending（1200-1400/天），切换后被消费、坏钥用户变成大声失败
   成功率只算 wake lane，且 completed（醒了、正常决策、只是没发消息——
   sleep/纯动作）算成功：(delivered+completed)/(delivered+completed+failed)，
   口径衡量「系统是否健康」而非「醒了的里面有多少真正送达」（拍板
-  2026-07-06）；failed 只含 status='failed'；gate 拒绝的 skipped 单独计数；
-  maintenance 单独成列（表格新增 完成 / Skipped / 维护(失败) 列）；「心跳」列
-  分类器补上现网 kind `presence`（旧 SQL 只匹配 heartbeat*，恒 0）。
+  2026-07-06，新口径下 07-06 约 78%）；failed 只含 status='failed'；gate
+  拒绝的 skipped 单独计数；maintenance 单独成列（表格新增 完成 / Skipped /
+  维护(失败) 列）；「心跳」列分类器补上现网 kind `presence`（旧 SQL 只匹配
+  heartbeat*，恒 0；与并行 commit 1e30c39 对 db.py 的最小修复同源合一，
+  保留其 `admin_events_overview` 的 presence 修复）。
 - **失败退避**（`proactive/capture_jobs.py` 新增 `failure_backoff_sec`/
   `in_failure_backoff`，capture/dream/migrate 三条 lane 接入）：terminal=failed
   后同一窗口指数退避（base 600s × 2^(streak-1)，封顶 6h；
   `FEEDLING_MAINTENANCE_FAIL_BACKOFF_{BASE,MAX}_SEC` 可调），completed 重置
   streak，debug 面板 force 绕过；migrate 终态此前无人记录，补了
   `record_migrate_job_status` + `proactive_core.job_status` 接线。
-  Codex review 后修复：`job_status` 只在状态真正转变时才调 recorder——
+  Codex review 后加固：`job_status` 只在状态真正转变时才调 recorder——
   consumer 重复上报同一终态 failed 不再重复累 streak/无故翻倍退避。
 - 测试：`tests/test_proactive_daily_report.py`（SQL lane 拆分/payload/分类器/
   渲染）+ `tests/test_capture_failure_backoff.py`（三 lane 退避、翻倍、重置、

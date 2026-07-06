@@ -12,8 +12,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 import worldbook_readside_core
-from enclave import auth, envelope, keys
+from enclave import auth, envelope
 from enclave.routes._body import read_json_payload
+from enclave.routes._errors import content_sk_or_503
 
 router = APIRouter()
 
@@ -25,11 +26,9 @@ async def v1_worldbook_match(request: Request):
     if error is not None:
         body, status = error
         return JSONResponse(body, status_code=status)
-    try:
-        content_sk = await keys.get_content_sk()
-    except Exception as e:
-        return JSONResponse(
-            {"error": f"key_derivation_unavailable: {e}"}, status_code=503)
+    content_sk, err_response = await content_sk_or_503()
+    if err_response is not None:
+        return err_response
 
     payload = await read_json_payload(request)
     envelopes = payload.get("world_books")

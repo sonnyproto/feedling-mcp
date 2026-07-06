@@ -38,6 +38,59 @@ def _wire(monkeypatch, messages, moments=None):
     monkeypatch.setattr(keys, "get_content_sk", fake_sk)
 
 
+def test_memory_list_fetch_overlaps_history_decrypt(client, monkeypatch):
+    """/v1/memory/list 拉取不依赖 history 解密结果，async 化后应与解密并行
+    （旧同步 Flask 只能串行；串行让每个请求多付一次 backend RTT）。
+    测法：解密故意放慢，断言 memory/list 的回环在解密结束前就已发出。"""
+    import threading
+    import time as _time
+
+    order = []
+
+    async def fake_backend_get(path, headers, params=None):
+        if path == "/v1/users/whoami":
+            return {"user_id": "usr_a"}
+        if path == "/v1/chat/history":
+            return {"messages": [
+                {"id": "m1", "role": "user", "ts": 1.0, "v": 1, "source": "ios",
+                 "K_enclave": "x", "body_ct": "x", "nonce": "x",
+                 "owner_user_id": "usr_a"},
+            ], "total": 1}
+        if path == "/v1/memory/list":
+            order.append("memlist_fetch")
+            return {"moments": [], "total": 0}
+        raise AssertionError(path)
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+
+    async def fake_sk():
+        return object()
+    monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+
+    def slow_decrypt(e, u, s):
+        _time.sleep(0.2)  # 在 to_thread 里跑，不堵事件循环
+        order.append("decrypt_end")
+        return b"hello"
+    monkeypatch.setattr(envmod, "decrypt_envelope", slow_decrypt)
+
+    r = client.get("/v1/chat/history", headers={"X-API-Key": "k"})
+    assert r.status_code == 200
+    assert r.get_json()["messages"][0]["content"] == "hello"
+    assert "memlist_fetch" in order and "decrypt_end" in order
+    assert order.index("memlist_fetch") < order.index("decrypt_end"), \
+        f"memory/list 没有与解密并行: {order}"
+
+
+def test_history_head_supported(client, monkeypatch):
+    # Flask 给每个 GET 路由自动挂 HEAD；FastAPI 的 APIRoute 不会。HEAD 必须
+    # 返回与 GET 相同的状态/头、空 body（HeadBodyStripMiddleware 负责剥体），
+    # 而不是 405。
+    _wire(monkeypatch, [])
+    r = client.open("/v1/chat/history", method="HEAD",
+                    headers={"X-API-Key": "k"})
+    assert r.status_code == 200
+    assert r.data == b""
+
+
 def test_history_decrypts_text_messages(client, monkeypatch):
     _wire(monkeypatch, [
         {"id": "m1", "role": "user", "ts": 1.0, "v": 1, "source": "ios",

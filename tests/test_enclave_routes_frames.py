@@ -149,6 +149,17 @@ def test_image_multipart_range_falls_back_200(client, _wired):
     assert r.data == JPEG
 
 
+def test_image_malformed_range_ignored_200(client, _wired):
+    # RFC 7233：语法非法的 Range 头必须忽略、返回 200 全量（旧 Werkzeug
+    # send_file(conditional=True) 行为）。"bytes=5--3" 经 partition('-') 会把
+    # end 解析成 -3，修复前被当作不可满足区间 416。
+    for bad in ("bytes=5--3", "bytes=+0-99", "bytes=0-+9"):
+        r = client.get(f"/v1/screen/frames/{FRAME_ID}/image",
+                       headers={"X-API-Key": "k", "Range": bad})
+        assert r.status_code == 200, (bad, r.status_code)
+        assert r.data == JPEG
+
+
 def test_image_unsatisfiable_416(client, _wired):
     r = client.get(f"/v1/screen/frames/{FRAME_ID}/image",
                    headers={"X-API-Key": "k",

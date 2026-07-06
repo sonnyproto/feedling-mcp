@@ -38,6 +38,14 @@ def _v1_inner():
                        "threads": []}).encode()
 
 
+def test_memory_list_head_supported(client, _authed):
+    # Flask 自动挂 HEAD 的 parity（同 chat/history），405 即回归。
+    r = client.open("/v1/memory/list", method="HEAD",
+                    headers={"X-API-Key": "k"})
+    assert r.status_code == 200
+    assert r.data == b""
+
+
 def test_missing_key_space_spelling(client):
     r = client.post("/v1/memory/index", json={"moments": []})
     assert r.status_code == 401

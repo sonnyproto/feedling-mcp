@@ -37,6 +37,15 @@ def _wire(monkeypatch, identity):
     monkeypatch.setattr(keys, "get_content_sk", fake_sk)
 
 
+def test_identity_get_head_supported(client, monkeypatch):
+    # Flask 自动挂 HEAD 的 parity（同 chat/history），405 即回归。
+    _wire(monkeypatch, None)
+    r = client.open("/v1/identity/get", method="HEAD",
+                    headers={"X-API-Key": "k"})
+    assert r.status_code == 200
+    assert r.data == b""
+
+
 def test_identity_none_passthrough(client, monkeypatch):
     _wire(monkeypatch, None)
     r = client.get("/v1/identity/get", headers={"X-API-Key": "k"})

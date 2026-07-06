@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import gzip
 
+import anyio.to_thread
+
 # Mirrors flask-compress's default COMPRESS_MIMETYPES allowlist. Notably
 # excludes anything binary (image/*, application/octet-stream, ...).
 _COMPRESSIBLE_CONTENT_TYPES = frozenset({
@@ -116,7 +118,9 @@ async def _flush_response(start_message, body_chunks, send, minimum_size: int):
         await send({"type": "http.response.body", "body": body, "more_body": False})
         return
 
-    compressed = gzip.compress(body)
+    # 压缩离事件循环：/decrypt 的 ~470KB JSON 这类大 body 内联压缩会占住唯一
+    # 的事件循环几十 ms，并发下把 /healthz 等小请求堵成队头阻塞（spec §4 同因）。
+    compressed = await anyio.to_thread.run_sync(gzip.compress, body)
     new_headers = [
         (key, value) for key, value in headers
         if key not in (b"content-length", b"content-encoding", b"vary")

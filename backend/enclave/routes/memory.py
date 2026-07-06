@@ -7,13 +7,13 @@ from __future__ import annotations
 import json
 
 import anyio.to_thread
-import httpx
 from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from enclave import auth, backend_client, envelope, keys, readside, state
+from enclave import auth, backend_client, envelope, readside, state
 from enclave.routes._body import read_json_payload
+from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 
 router = APIRouter()
 
@@ -25,11 +25,9 @@ async def v1_memory_index(request: Request):
     if error is not None:
         body, status = error
         return JSONResponse(body, status_code=status)
-    try:
-        content_sk = await keys.get_content_sk()
-    except Exception as e:
-        return JSONResponse(
-            {"error": f"key_derivation_unavailable: {e}"}, status_code=503)
+    content_sk, err_response = await content_sk_or_503()
+    if err_response is not None:
+        return err_response
     payload = await read_json_payload(request)
     moments = payload.get("moments")
     if not isinstance(moments, list):
@@ -60,11 +58,9 @@ async def v1_memory_fetch(request: Request):
     if error is not None:
         body, status = error
         return JSONResponse(body, status_code=status)
-    try:
-        content_sk = await keys.get_content_sk()
-    except Exception as e:
-        return JSONResponse(
-            {"error": f"key_derivation_unavailable: {e}"}, status_code=503)
+    content_sk, err_response = await content_sk_or_503()
+    if err_response is not None:
+        return err_response
     payload = await read_json_payload(request)
     moments = payload.get("moments")
     if not isinstance(moments, list):
@@ -95,7 +91,8 @@ async def v1_memory_fetch(request: Request):
     })
 
 
-@router.get("/v1/memory/list")
+# HEAD 显式声明（同 frames.py）：Flask 自动给 GET 挂 HEAD，FastAPI 不会。
+@router.api_route("/v1/memory/list", methods=["GET", "HEAD"])
 async def v1_memory_list(request: Request):
     """Decrypt-and-serve memory garden for the authenticated user.
 
@@ -114,26 +111,15 @@ async def v1_memory_list(request: Request):
     params = {"limit": limit}
     if since:
         params["since"] = since
-    try:
-        listing = await backend_client.backend_get(
-            "/v1/memory/list", ctx.forward_headers, params=params)
-    except httpx.HTTPStatusError as e:
-        # whoami may have been cached, so a key revoked since then surfaces here;
-        # keep it a 401, not a generic 502.
-        if e.response.status_code == 401:
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return JSONResponse({"error": f"backend_error: {e}"}, status_code=502)
-    except httpx.HTTPError as e:
-        return JSONResponse({"error": f"backend_error: {e}"}, status_code=502)
+    listing, err_response = await backend_call_or_error(
+        backend_client.backend_get(
+            "/v1/memory/list", ctx.forward_headers, params=params))
+    if err_response is not None:
+        return err_response
 
-    try:
-        content_sk = await keys.get_content_sk()
-    except Exception as e:
-        # The only runtime dstack round-trip. A socket hiccup deriving the
-        # content key is a transient infra failure, not an enclave bug — return
-        # a retryable 503 rather than a bare 500 the consumer can't interpret.
-        return JSONResponse(
-            {"error": f"key_derivation_unavailable: {e}"}, status_code=503)
+    content_sk, err_response = await content_sk_or_503()
+    if err_response is not None:
+        return err_response
 
     def _work():
         decrypted = []

@@ -308,6 +308,101 @@ def test_openrouter_chat_completion_retries_without_reasoning_when_unsupported(m
     assert "reasoning" not in calls[1]["json"]
 
 
+# ---- openai-compat 共享编解码（sync/async 必须单实现，防漂移）----
+
+def test_build_openai_compat_payload_shape():
+    payload = pc._build_openai_compat_payload(
+        provider="openrouter", model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        temperature=0.2, max_tokens=99999,
+        response_format={"type": "json_object"},
+        extra_body={"x": 1}, include_reasoning=True)
+    assert payload["model"] == "m"
+    assert payload["stream"] is False
+    assert payload["temperature"] == 0.2
+    assert payload["max_tokens"] == 8192  # 上限封顶
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["x"] == 1
+    assert payload["reasoning"] == {"enabled": True, "exclude": False}
+
+    p2 = pc._build_openai_compat_payload(
+        provider="deepseek", model="m",
+        messages=[{"role": "user", "content": "hi"}],
+        temperature=0.2, max_tokens=10,
+        response_format=None, extra_body=None, include_reasoning=True)
+    assert "reasoning" not in p2  # reasoning 注入只对 openrouter
+    assert "response_format" not in p2
+
+
+def test_parse_openai_compat_body_result_shape():
+    resp = FakeResponse(200, {
+        "id": "chatcmpl-1",
+        "choices": [{"message": {"content": "hi there", "reasoning": "why"},
+                     "finish_reason": "stop"}],
+        "usage": {"total_tokens": 3},
+    })
+    out = pc._parse_openai_compat_body(
+        resp, provider="openrouter", model="m", require_reply=True)
+    assert out["reply"] == "hi there"
+    assert out["reasoning"] == "why"
+    assert out["usage"] == {"total_tokens": 3}
+    assert out["raw_id"] == "chatcmpl-1"
+    assert out["provider"] == "openrouter"
+    assert out["model"] == "m"
+
+    class NonJson:
+        status_code = 200
+        text = "x"
+
+        def json(self):
+            raise ValueError("nope")
+
+    with pytest.raises(pc.ProviderError):
+        pc._parse_openai_compat_body(
+            NonJson(), provider="openrouter", model="m", require_reply=False)
+    with pytest.raises(pc.ProviderError):
+        pc._parse_openai_compat_body(
+            FakeResponse(200, ["not-an-object"]),
+            provider="openrouter", model="m", require_reply=False)
+
+
+def test_async_openrouter_retries_without_reasoning_when_unsupported(monkeypatch):
+    """chat_completion_async 与同步版同一 payload/降级契约（openrouter reasoning
+    400/422 → 去掉 reasoning 重试一次）。共享编解码后由本测试与同步版测试共同钉住。"""
+    import asyncio
+
+    calls: list[dict] = []
+
+    class FakeAsyncClient:
+        is_closed = False
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "headers": headers or {}, "json": json or {}})
+            if len(calls) == 1:
+                return FakeResponse(422, {"error": {"message": "reasoning unsupported"}})
+            return FakeResponse(200, {
+                "id": "chatcmpl-test",
+                "choices": [{"message": {"content": "visible answer"}}],
+                "usage": {"total_tokens": 9},
+            })
+
+    monkeypatch.setattr(pc.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(pc, "_shared_async_client", None)
+
+    result = asyncio.run(pc.chat_completion_async(
+        pc.ProviderConfig("openrouter", "openai/gpt-4.1-mini", "sk-or-test"),
+        [{"role": "user", "content": "hello"}],
+        include_reasoning=True,
+    ))
+
+    assert result["reply"] == "visible answer"
+    assert calls[0]["json"]["reasoning"] == {"enabled": True, "exclude": False}
+    assert "reasoning" not in calls[1]["json"]
+
+
 def test_openai_reasoning_model_uses_responses_api_and_extracts_summary(monkeypatch):
     calls = _fake_client(
         monkeypatch,

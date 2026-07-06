@@ -43,6 +43,20 @@ def test_backend_get_raises_on_http_status(monkeypatch):
         asyncio.run(backend_client.backend_get("/v1/users/whoami", {}))
 
 
+def test_pool_exhaustion_queues_instead_of_pooltimeout(monkeypatch):
+    """突发 >max_connections 的并发回环必须排队等空位（旧 gthread 模型：32
+    线程既是并发上限也是隐式准入闸，多余请求排队变慢、最终全部成功），而不是
+    池满 15s 后集体抛 PoolTimeout（HTTPError 子类）→ 整批 502
+    backend_unreachable。修法：池获取不设超时（pool=None），准入上限由
+    uvicorn limit_concurrency 兜底；connect/read/write 仍 15s。"""
+    monkeypatch.setattr(backend_client, "_client", None)
+    t = backend_client.get_async_client().timeout
+    assert t.pool is None
+    assert t.connect == 15
+    assert t.read == 15
+    assert t.write == 15
+
+
 def test_aclose_resets_singleton(monkeypatch):
     client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
     monkeypatch.setattr(backend_client, "_client", client)

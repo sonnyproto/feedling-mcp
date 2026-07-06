@@ -69,10 +69,34 @@ def test_ssl_context_matches_uvicorn_call_conventions(tmp_path):
     assert ctx_pos.minimum_version == ssl.TLSVersion.TLSv1_2
 
 
-def test_uvicorn_create_ssl_context_is_patched():
+def test_import_does_not_patch_uvicorn_globally(monkeypatch):
+    """import enclave.asgi_worker 不得有进程级副作用：同进程里其他 uvicorn
+    使用方（pytest 全家、未来同进程嵌入部署）不能被静默换成 enclave 的
+    精简 TLS context。patch 只在 EnclaveUvicornWorker.init_process 里装。"""
+    import importlib
     import uvicorn.config
     from enclave import asgi_worker
+
+    sentinel = object()
+    monkeypatch.setattr(uvicorn.config, "create_ssl_context", sentinel)
+    importlib.reload(asgi_worker)
+    assert uvicorn.config.create_ssl_context is sentinel
+
+
+def test_worker_init_process_installs_ssl_patch(monkeypatch):
+    """enclave worker 进程启动时（init_process，fork 后子进程）才安装
+    create_ssl_context 替换，随后交还 UvicornWorker 正常启动。"""
+    import uvicorn.config
+    from enclave import asgi_worker
+
+    monkeypatch.setattr(uvicorn.config, "create_ssl_context", object())
+    called = {}
+    monkeypatch.setattr(asgi_worker.UvicornWorker, "init_process",
+                        lambda self: called.setdefault("super", True))
+    worker = object.__new__(asgi_worker.EnclaveUvicornWorker)
+    worker.init_process()
     assert uvicorn.config.create_ssl_context is asgi_worker._enclave_create_ssl_context
+    assert called.get("super") is True
 
 
 def test_gunicorn_options(monkeypatch, tmp_path):
