@@ -1001,8 +1001,9 @@ def admin_events_overview() -> dict:
         )
         SELECT COALESCE(r.route,'resident') AS route,
                (COUNT(*) FILTER (WHERE p.role='user' AND p.src<>'verify_ping'))::int AS user_msgs,
-               (COUNT(*) FILTER (WHERE p.role IN ('agent','openclaw')
-                    AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive')))::int AS real_replies,
+               (COUNT(DISTINCT p.last_user_ts) FILTER (WHERE p.role IN ('agent','openclaw')
+                    AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive')
+                    AND p.last_user_ts IS NOT NULL))::int AS real_replies,
                (COUNT(*) FILTER (WHERE p.src='foreground_fallback'))::int AS fallback_replies,
                percentile_cont(0.5) WITHIN GROUP (ORDER BY
                  CASE WHEN p.role IN ('agent','openclaw')
@@ -1117,7 +1118,7 @@ def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
             )
             SELECT p.user_id, COALESCE(r.route,'resident') AS route,
                    (COUNT(*) FILTER (WHERE p.role='user' AND p.src<>'verify_ping'))::int AS user_msgs,
-                   (COUNT(*) FILTER (WHERE p.role IN ('agent','openclaw') AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive')))::int AS real_replies,
+                   (COUNT(DISTINCT p.last_user_ts) FILTER (WHERE p.role IN ('agent','openclaw') AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive') AND p.last_user_ts IS NOT NULL))::int AS real_replies,
                    (COUNT(*) FILTER (WHERE p.src='foreground_fallback'))::int AS fallback_replies,
                    percentile_cont(0.5) WITHIN GROUP (ORDER BY
                      CASE WHEN p.role IN ('agent','openclaw')
