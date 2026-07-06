@@ -1111,7 +1111,10 @@ def admin_onboarding_funnel() -> list[dict]:
         with get_pool().connection() as conn:
             rows = conn.execute(f"""
                 {_EVENTS_ROUTES_CTE},
-                u AS (SELECT user_id, EXTRACT(EPOCH FROM created_at) AS t0 FROM users),
+                u AS (SELECT user_id,
+                        CASE WHEN created_at ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
+                             THEN EXTRACT(EPOCH FROM created_at::timestamptz) ELSE NULL END AS t0
+                      FROM users),
                 setup AS (SELECT user_id, MIN(ts) AS t FROM user_logs
                           WHERE stream='tracking_events' AND doc->>'type'='model_api_setup_succeeded'
                           GROUP BY user_id),
@@ -1124,9 +1127,10 @@ def admin_onboarding_funnel() -> list[dict]:
                         WHERE status IN ('done','completed')
                           AND COALESCE(NULLIF(metadata->>'mode',''),'onboarding')='onboarding'
                         GROUP BY user_id),
-                mem AS (SELECT user_id, MIN(EXTRACT(EPOCH FROM occurred_at::timestamptz)) AS t
+                mem AS (SELECT user_id,
+                        MIN(EXTRACT(EPOCH FROM (COALESCE(NULLIF(doc->>'created_at',''), occurred_at))::timestamptz)) AS t
                         FROM memory_moments
-                        WHERE occurred_at ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
+                        WHERE COALESCE(NULLIF(doc->>'created_at',''), occurred_at) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
                         GROUP BY user_id),
                 reply AS (SELECT user_id, MIN(ts) AS t FROM chat_messages
                           WHERE doc->>'role' IN ('agent','openclaw')
