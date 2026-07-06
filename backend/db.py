@@ -1096,6 +1096,63 @@ def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
     return []
 
 
+def admin_onboarding_funnel() -> list[dict]:
+    """Per-user onboarding milestone epochs for the funnel view. Each row:
+    {user_id, route, t0, t1, t2, t3} (epoch seconds; None = not reached).
+
+    Milestones (route-aware):
+      t0 registered = users.created_at
+      t1 配置/上线   = API: model_api_setup_succeeded tracking event;
+                      VPS: first chat/proactive activity (consumer online, 'B')
+      t2 内容就绪    = API: onboarding-genesis job done; VPS: first memory card
+      t3 首次真回复  = first non-fallback agent message ('A', both routes)
+    The caller aggregates conversion + median segment durations, split VPS/API."""
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(f"""
+                {_EVENTS_ROUTES_CTE},
+                u AS (SELECT user_id, EXTRACT(EPOCH FROM created_at) AS t0 FROM users),
+                setup AS (SELECT user_id, MIN(ts) AS t FROM user_logs
+                          WHERE stream='tracking_events' AND doc->>'type'='model_api_setup_succeeded'
+                          GROUP BY user_id),
+                firstact AS (SELECT user_id, MIN(ts) AS t FROM (
+                             SELECT user_id, ts FROM chat_messages
+                             UNION ALL SELECT user_id, ts FROM user_logs WHERE stream='proactive_jobs'
+                           ) a GROUP BY user_id),
+                gen AS (SELECT user_id, MIN(EXTRACT(EPOCH FROM updated_at)) AS t
+                        FROM genesis_import_jobs
+                        WHERE status IN ('done','completed')
+                          AND COALESCE(NULLIF(metadata->>'mode',''),'onboarding')='onboarding'
+                        GROUP BY user_id),
+                mem AS (SELECT user_id, MIN(EXTRACT(EPOCH FROM occurred_at::timestamptz)) AS t
+                        FROM memory_moments
+                        WHERE occurred_at ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
+                        GROUP BY user_id),
+                reply AS (SELECT user_id, MIN(ts) AS t FROM chat_messages
+                          WHERE doc->>'role' IN ('agent','openclaw')
+                            AND COALESCE(doc->>'source','') NOT IN ('foreground_fallback','proactive_fallback')
+                          GROUP BY user_id)
+                SELECT u.user_id, COALESCE(r.route,'resident') AS route, u.t0,
+                       CASE WHEN COALESCE(r.route,'resident')='model_api' THEN setup.t ELSE firstact.t END AS t1,
+                       CASE WHEN COALESCE(r.route,'resident')='model_api' THEN gen.t ELSE mem.t END AS t2,
+                       reply.t AS t3
+                FROM u
+                LEFT JOIN routes r ON r.user_id = u.user_id
+                LEFT JOIN setup ON setup.user_id = u.user_id
+                LEFT JOIN firstact ON firstact.user_id = u.user_id
+                LEFT JOIN gen ON gen.user_id = u.user_id
+                LEFT JOIN mem ON mem.user_id = u.user_id
+                LEFT JOIN reply ON reply.user_id = u.user_id
+            """).fetchall()
+        def f(v):
+            return float(v) if v is not None else None
+        return [{"user_id": r[0], "route": r[1], "t0": f(r[2]), "t1": f(r[3]),
+                 "t2": f(r[4]), "t3": f(r[5])} for r in rows]
+    except Exception as e:  # noqa: BLE001
+        log.error("[db] admin_onboarding_funnel failed: %s", e)
+        return []
+
+
 # ---------------------------------------------------------------------------
 # Per-user singleton blobs
 # ---------------------------------------------------------------------------

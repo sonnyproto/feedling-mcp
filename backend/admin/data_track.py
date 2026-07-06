@@ -2589,8 +2589,9 @@ def _render_events_page(payload: dict) -> str:
         is_reply = c["key"] == "reply"
         is_onb = c["key"] == "onboarding"
         if is_onb:
-            rows.append(f"<tr><td>{html.escape(c['label'])}</td>"
-                        "<td class='muted' colspan='2'>漏斗视图下一阶段接入</td></tr>")
+            onb_href = _data_track_page_href(view="events", event="onboarding", offset=0)
+            rows.append(f"<tr><td><a href='{html.escape(onb_href, quote=True)}'>{html.escape(c['label'])}</a></td>"
+                        f"<td colspan='2'><a href='{html.escape(onb_href, quote=True)}'>打开漏斗(VPS/API 转化率+耗时) →</a></td></tr>")
             continue
         drill = _data_track_page_href(view="events", event=c["key"], offset=0)
         rows.append(
@@ -2624,6 +2625,119 @@ def _render_events_page(payload: dict) -> str:
     <thead><tr><th>事件</th><th>VPS(自托管)</th><th>API(托管)</th></tr></thead>
     <tbody>{body}</tbody>
   </table>
+</main></body></html>"""
+
+
+_FUNNEL_MILESTONES = [("reg", "注册"), ("m1", "配置/上线"), ("m2", "内容就绪"), ("m3", "首次真回复")]
+_FUNNEL_SEGMENTS = [("s1", "注册 → 配置/上线"), ("s2", "配置 → 内容就绪"), ("s3", "内容 → 首回复")]
+
+
+def _funnel_median(vals: list):
+    xs = sorted(v for v in vals if v is not None)
+    if not xs:
+        return None
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def _funnel_dur(sec) -> str:
+    if sec is None:
+        return "—"
+    sec = float(sec)
+    if sec < 90:
+        return f"{sec:.0f}s"
+    if sec < 5400:
+        return f"{sec/60:.1f}m"
+    if sec < 172800:
+        return f"{sec/3600:.1f}h"
+    return f"{sec/86400:.1f}d"
+
+
+def _data_track_onboarding_funnel_payload() -> dict:
+    def blank():
+        return {"reg": 0, "m1": 0, "m2": 0, "m3": 0, "s1": [], "s2": [], "s3": [], "total": []}
+    buckets = {"vps": blank(), "api": blank()}
+    for r in db.admin_onboarding_funnel():
+        t0, t1, t2, t3 = r.get("t0"), r.get("t1"), r.get("t2"), r.get("t3")
+        if t0 is None:
+            continue
+        b = buckets["api" if str(r.get("route")) == "model_api" else "vps"]
+        b["reg"] += 1
+        if t1 is not None:
+            b["m1"] += 1
+        if t2 is not None:
+            b["m2"] += 1
+        if t3 is not None:
+            b["m3"] += 1
+        if t1 is not None and t1 >= t0:
+            b["s1"].append(t1 - t0)
+        if t1 is not None and t2 is not None and t2 >= t1:
+            b["s2"].append(t2 - t1)
+        if t2 is not None and t3 is not None and t3 >= t2:
+            b["s3"].append(t3 - t2)
+        if t3 is not None and t3 >= t0:
+            b["total"].append(t3 - t0)
+
+    def route_funnel(b):
+        reg = max(1, b["reg"])
+        return {
+            "registered": b["reg"],
+            "steps": [{"key": k, "label": lbl, "count": b[k], "pct": b[k] / reg} for k, lbl in _FUNNEL_MILESTONES],
+            "segments": [{"key": k, "label": lbl, "median": _funnel_median(b[k])} for k, lbl in _FUNNEL_SEGMENTS],
+            "total_median": _funnel_median(b["total"]),
+        }
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "vps": route_funnel(buckets["vps"]),
+        "api": route_funnel(buckets["api"]),
+        "note": "里程碑:注册→配置/上线(API=setup成功·VPS=consumer首连[B])→内容就绪(API=一次蒸馏完成·VPS=首条记忆)→首次真回复[A]。转化率=到达÷注册;耗时=各段中位。",
+    }
+
+
+def _render_onboarding_funnel_page(payload: dict) -> str:
+    back = _data_track_page_href(view="events", event=None, offset=0)
+
+    def col(title: str, f: dict) -> str:
+        reg = int(f.get("registered") or 0)
+        steps = f.get("steps", [])
+        seg = {s["key"]: s for s in f.get("segments", [])}
+        seg_order = ["", "s1", "s2", "s3"]
+        rows = []
+        for i, st in enumerate(steps):
+            pct = st["pct"] * 100
+            cls = "ok" if pct >= 70 else ("warn" if pct >= 40 else "bad")
+            segk = seg_order[i]
+            seg_html = f"<div class='seg'>↓ {html.escape(_funnel_dur(seg[segk]['median']))}</div>" if segk and segk in seg else ""
+            rows.append(
+                f"{seg_html}<div class='step'><div class='fn-bar'><span class='{cls}' style='width:{pct:.0f}%'></span></div>"
+                f"<div class='fn-line'><b>{html.escape(st['label'])}</b> <span class='{cls}'>{st['count']} · {pct:.0f}%</span></div></div>"
+            )
+        total = _funnel_dur(f.get("total_median"))
+        return (f"<section class='funnel-col'><h2>{html.escape(title)} · 注册 {reg}</h2>{''.join(rows)}"
+                f"<div class='total'>注册→首回复 中位:<b>{html.escape(total)}</b></div></section>")
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Onboarding 漏斗 · Data Track</title>
+<style>
+  :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
+  body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+  main {{ max-width:900px; margin:0 auto; padding:28px 24px 48px; }}
+  h1 {{ font-size:22px; margin:0 0 4px; }} h2 {{ font-size:15px; margin:0 0 14px; }}
+  a {{ color:var(--accent); text-decoration:none; }} .muted {{ color:var(--muted); }} .ok {{ color:var(--ok); }} .warn {{ color:var(--warn); }} .bad {{ color:var(--bad); }}
+  .cols {{ display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-top:16px; }}
+  .funnel-col {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; }}
+  .step {{ margin:0 0 4px; }} .fn-bar {{ height:8px; background:#eee3d9; border-radius:4px; overflow:hidden; }}
+  .fn-bar span {{ display:block; height:100%; background:var(--accent); }}
+  .fn-bar span.ok {{ background:var(--ok); }} .fn-bar span.warn {{ background:var(--warn); }} .fn-bar span.bad {{ background:var(--bad); }}
+  .fn-line {{ font-size:13px; margin:3px 0 0; }} .seg {{ color:var(--muted); font-size:12px; margin:6px 0 6px 4px; }}
+  .total {{ margin-top:14px; padding-top:10px; border-top:1px solid var(--line); font-size:13px; color:var(--muted); }}
+</style></head><body><main>
+  <div><a href="{html.escape(back, quote=True)}">← 返回事件健康度</a></div>
+  <h1>Onboarding 漏斗</h1>
+  <div class="muted">{html.escape(str(payload.get('note') or ''))}</div>
+  <div class="cols">{col('VPS（自托管）', payload.get('vps', {}))}{col('API（托管）', payload.get('api', {}))}</div>
+  <div class="muted" style="margin-top:14px">Generated {html.escape(str(payload.get('generated_at') or ''))}.</div>
 </main></body></html>"""
 
 
