@@ -133,12 +133,24 @@ def main() -> None:
         _fail(f"attested enclave_content_pk_hex looks wrong: {attested_pk!r}")
     print(f"[canary] attested enclave pk = {attested_pk[:16]}…")
 
-    # 2. register a throwaway user (fresh keypair → no orphan-backstop collision)
-    user_sk = X25519PrivateKey.generate()
-    user_pk = user_sk.public_key()
-    st, reg = _http_retry("POST", f"{API_URL}/v1/users/register",
-                    body={"public_key": _b64(user_pk.public_bytes(*_RAW)),
-                          "platform": "deploy-canary", "label": LABEL})
+    # 2. register a throwaway user. Register is NOT idempotent, so this cannot
+    # go through _http_retry: a transport failure can mean the request actually
+    # landed (run #723 — the response read timed out, and retrying the same key
+    # hit 409 account_exists_for_key). Each attempt therefore mints a FRESH
+    # keypair. An account created under an abandoned key is an unreachable
+    # empty shell (its api_key was in the lost response) — rare, empty, and
+    # covered by the orphan backstop.
+    for attempt in range(1, HTTP_TRIES + 1):
+        user_sk = X25519PrivateKey.generate()
+        user_pk = user_sk.public_key()
+        st, reg = _http("POST", f"{API_URL}/v1/users/register",
+                        body={"public_key": _b64(user_pk.public_bytes(*_RAW)),
+                              "platform": "deploy-canary", "label": LABEL})
+        if st not in _RETRYABLE or attempt == HTTP_TRIES:
+            break
+        print(f"[canary] POST {API_URL}/v1/users/register -> {st}: {reg.get('error')} "
+              f"(attempt {attempt}/{HTTP_TRIES}, retrying with a fresh key)")
+        time.sleep(2 ** attempt)
     if st != 201:
         _fail(f"register returned {st}: {reg.get('error')}")
     user_id, api_key = reg["user_id"], reg["api_key"]
