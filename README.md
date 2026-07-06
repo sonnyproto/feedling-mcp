@@ -158,7 +158,7 @@ commit is baked into the image and surfaced in
 
 ---
 
-## Status (as of 2026-05-21)
+## Status (as of 2026-07)
 
 See `docs/CHANGELOG.md` for the full landmark history. TL;DR of what's
 shipped:
@@ -166,12 +166,12 @@ shipped:
 **Shipped (Phases A–E + post-launch)**
 - [x] v0/SINGLE_USER strip — multi-tenant only; plaintext writes return 400
 - [x] iOS end-to-end: chat / memory / identity / nudges / agent replies all v1 envelopes
-- [x] Pure-CVM production stack live on Phala prod9: dstack-ingress + backend + MCP + enclave
+- [x] Pure-CVM production stack live on Phala prod9: dstack-ingress + backend + enclave (the MCP service shipped here was removed 2026-06-12)
 - [x] `api.feedling.app` routed through dstack-ingress inside the CVM
 - [x] Attestation port (5003) still terminates its own dstack-KMS-derived TLS for pinning
 - [x] On-chain `compose_hash` authorization via `FeedlingAppAuth` on Ethereum Sepolia
 - [x] iOS audit card and `tools/audit_live_cvm.py` cover prod9 ingress disclosure + enclave content-key trust
-- [x] CI: `backend/test_api.py` rewritten for envelope-only backend, green on GitHub Actions
+- [x] CI: `tests/test_api.py` rewritten for envelope-only backend, green on GitHub Actions
 - [x] CI deploys the Phala CVM from `deploy/docker-compose.phala.yaml` and publishes the live compose hash
 - [x] Prod user migrated to multi-tenant on current image; registration race and cross-tenant isolation regressions fixed
 - [x] Screen recording (Broadcast Extension) — encrypted frame ingest, agent reads via `decrypt_frame`
@@ -295,7 +295,7 @@ bash deploy/setup.sh [--install-caddy]
 
 Creates a venv under `~/feedling-venv`, installs deps, writes
 `~/feedling.env` (multi-tenant — no shared API key), and starts
-`feedling-backend` + `feedling-mcp` systemd units.
+`feedling-backend` + `feedling-chat-resident` systemd units.
 
 ### Logs
 
@@ -402,37 +402,13 @@ Handy filters (append to a `phala cvms logs ... -c feedling-enclave-backend-1` p
 All write endpoints that take content enforce v1 envelope shape and
 reject plaintext with `400 plaintext_write_rejected`.
 
-### MCP tools (23 total)
+### MCP tools (removed 2026-06-12)
 
-| Tool | Maps to |
-|------|---------|
-| `feedling_bootstrap` | POST /v1/bootstrap |
-| `feedling_identity_init` | POST /v1/identity/init (requires `days_with_user` — sets relationship anchor) |
-| `feedling_identity_get` | GET /v1/identity/get (decrypted via enclave proxy; `days_with_user` is server-computed live) |
-| `feedling_identity_replace` | POST /v1/identity/replace — full card rewrite, optionally re-anchors relationship |
-| `feedling_identity_set_relationship_days` | POST /v1/identity/relationship_anchor — calibrate relationship age, no envelope rewrite |
-| `feedling_identity_nudge` | in-CVM decrypt-mutate-rewrap → POST /v1/identity/replace (preserves anchor) |
-| `feedling_memory_add_moment` | POST /v1/memory/add (wraps to v1 inside CVM) |
-| `feedling_memory_list` | GET /v1/memory/list |
-| `feedling_memory_get` | GET /v1/memory/get |
-| `feedling_memory_delete` | DELETE /v1/memory/delete |
-| `feedling_memory_verify` | GET /v1/memory/verify |
-| `feedling_identity_verify` | GET /v1/identity/verify |
-| `feedling_chat_verify_loop` | POST /v1/chat/verify_loop |
-| `feedling_push_dynamic_island` | POST /v1/push/dynamic-island |
-| `feedling_push_live_activity` | POST /v1/push/live-activity |
-| `feedling_screen_latest_frame` | GET /v1/screen/frames/latest (metadata only) |
-| `feedling_screen_frames_list` | GET /v1/screen/frames (metadata only; encrypted) |
-| `feedling_screen_analyze` | GET /v1/screen/analyze |
-| `feedling_screen_summary` | GET /v1/screen/summary |
-| `feedling_screen_decrypt_frame` | GET /v1/screen/frames/<id>/decrypt — Image block + OCR for agent vision |
-| `feedling_chat_post_message` | wraps to v1 envelope → POST /v1/chat/response |
-| `feedling_chat_post_image` | wraps a base64 image as `content_type=image` → POST /v1/chat/response |
-| `feedling_chat_get_history` | GET /v1/chat/history |
-
-The `?key=<api_key>` on the SSE URL is captured by an ASGI
-middleware on the first GET and pinned to the MCP session — every
-subsequent tool call is routed as that user.
+The FastMCP SSE server and its `feedling_*` tool set (23 tools mapping
+onto the HTTP endpoints above) were removed on 2026-06-12; users now
+connect through the iOS app + agent-runner paths instead. For the
+historical tool table and the SSE `?key=` session-pinning details, see
+git history and `deploy/DEPLOYMENTS.md`.
 
 ---
 
@@ -510,25 +486,14 @@ The public iOS onboarding now starts by asking the user which route they need:
    Import is supported; reliable real-time IO Chat is not supported unless the
    user later chooses a live route.
 
-### Official-app / MCP import runtimes
+### Official-app / MCP import runtimes (removed 2026-06-12)
 
-Claude / ChatGPT / Gemini-style clients use the MCP one-liner from the iOS
-app's **Settings → Storage → Connection Details** or the Chat onboarding path:
-
-```
-claude mcp add feedling --transport sse "https://mcp.feedling.app/sse?key=<api_key>"
-```
-
-Self-hosted users derive the same shape using their own domain:
-
-```
-claude mcp add feedling --transport sse "https://mcp.<your-domain>/sse?key=<api_key>"
-```
-
-Direct MCP is enough for memory, identity, and tool calls when the product
-supports MCP/tools. It is not, by itself, an ongoing incoming-message loop.
-If the chat client cannot stay alive after the user closes the window/session,
-this route remains import-only until the user chooses a live route.
+The MCP import route — `claude mcp add feedling --transport sse
+"https://mcp.feedling.app/sse?key=<api_key>"` against the FastMCP SSE
+server — was removed on 2026-06-12 together with that server. Users of
+official apps are now served through the iOS app + agent-runner paths.
+The historical setup instructions live in git history and
+`deploy/DEPLOYMENTS.md`.
 
 ### Hermes / OpenClaw / machine-resident agents
 

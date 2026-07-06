@@ -47,7 +47,7 @@ backend/
 └── db.py · content_encryption.py · provider_client.py · enclave_app.py ·
     dstack_tls.py · hosted_runtime.py · semantic_analysis.py ·
     memory_readside_core.py · memory_index_selector.py ·
-    context_memory_selection.py · migrate_to_pg.py
+    context_memory_selection.py
                     ← 底层独立模块，保持无业务依赖
 ```
 

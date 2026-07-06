@@ -49,23 +49,30 @@ rollback；在下列 gate 全绿之前删 legacy 都是不安全的。
 
 | 文件 | 处置 | 原因 |
 |---|---|---|
-| `setup_routes.py` | **保留** | provider key 配置 `/v1/model_api/setup\|get\|test\|delete\|runtime\|memory/repair`；存 `api_key_envelope`（agent-runner 复用） |
+| `setup_routes.py`（现名 `setup_routes_asgi.py`，ASGI 迁移改名） | **保留** | provider key 配置 `/v1/model_api/setup\|get\|test\|delete\|runtime\|memory/repair`；存 `api_key_envelope`（agent-runner 复用） |
 | `config_store.py` | **保留(瘦身)** | model_api config 存储 + `agent_runtime_driver` flag + runtime profile 保留；`_load_runtime_provider_config`（服务端 inline 解密）退役后变死代码可删 |
 | `history_import.py` | **保留** | 聊天历史导入（onboarding），与 inline loop 无关 |
 | `onboarding_validation.py` | **保留** | onboarding 门禁，通用 |
 | `agent_runtime_cutover.py` | **保留** | 成为唯一路径 |
-| `chat_routes.py` | **改** | 删 `model_api_chat_send` 的 inline-agent body，端点保留为「投递 + cutover」 |
+| `chat_routes.py`（现名 `chat_routes_asgi.py`，核心逻辑在 `chat_send_core.py`） | **改** | 删 `model_api_chat_send` 的 inline-agent body，端点保留为「投递 + cutover」 |
 | `turn.py` | **删** | inline turn 解析 / pending 确认 / action trace |
 | `context.py` | **删** | inline LLM 的上下文拼装（agent-runner 用工具自取上下文） |
-| `wake_consumer.py` | **删** | legacy 后端内 proactive wake（P4 agent-runner wake 取代）；需在 app.py 解线 |
+| `wake_consumer.py` | **删 ✅ 已删** | legacy 后端内 proactive wake（P4 agent-runner wake 取代）；接线已随 app.py 一并移除 |
 | `model_api_runtime/` 整包 | **删(待解耦)** | 仅 inline 线使用；但 setup/config/history/onboarding 也 import 了它（多为 profile/contract message），删前要把这些保留文件对它的依赖摘干净 |
 
-### app.py 接线（删除时要动的装配点）
-- L55–L70 `from model_api_runtime.prompts/tools/wake import (...)`
-- L84–L92 `from hosted import chat_routes/config_store/context/.../turn/wake_consumer`
-- L325–L332 hosted wake consumer 的 COMPAT re-export
-- L371–L373 `core_wake_bus.register_handler("proactive", hosted_wake_consumer.try_consume_pending_for_user)`
-- hosted tick 的启动（`_maybe_start_hosted_wake_consumer` / `_run_hosted_tick_once`）
+### ~~app.py~~ 装配点（删除时要动）
+
+> **本段行号已失效**：`backend/app.py` 已整体删除（2026-07-06，ASGI 迁移收尾），
+> 装配层现为 `asgi_app.py` + `asgi/lifespan.py`。grep 实测（2026-07-07）现存的
+> hosted 装配点：
+> - `asgi_app.py` 路由模块清单里的 `hosted.setup_routes_asgi` /
+>   `hosted.chat_routes_asgi` / `hosted.history_import_asgi` /
+>   `hosted.onboarding_validation_asgi`；
+> - `asgi_app.py` 尾部的 assembly wiring（`hosted.onboarding_validation` 注入
+>   `admin/data_track`）。
+> - wake_consumer 的 wake-bus 接线、hosted tick、model_api_runtime 顶层 import
+>   均已随 app.py 消失（`asgi_app.py`/`asgi/` 零 `model_api_runtime`/
+>   `hosted_runtime` import）。
 
 ## 特性对等清单（删 legacy 前必须在 agent-runner 补齐）
 
@@ -379,19 +386,20 @@ legacy inline 线现在做、agent-runner **还没做**的：
 
 ## 删除清单（Stage F，精确）
 
-**删文件**：`hosted/turn.py`、`hosted/context.py`、`hosted/wake_consumer.py`、
-`model_api_runtime/`（待 Stage A 把 setup/config/history/onboarding 对它的依赖
-摘净后）。
+**删文件**：`hosted/turn.py`、`hosted/context.py`、~~`hosted/wake_consumer.py`~~
+（**已删**，随 ASGI 迁移收尾移除）、`model_api_runtime/`（待 Stage A 把
+setup/config/history/onboarding 对它的依赖摘净后）。
 
 **改文件**：
-- `hosted/chat_routes.py`：`model_api_chat_send` 只保留「投递用户消息 +
-  `agent_runtime_cutover.handle_send`」，删掉 provider 调用 / tool loop / 解析 /
-  pending / trace 那一大段；删对应 import。
+- `hosted/chat_routes_asgi.py`（+`chat_send_core.py`）：`model_api_chat_send`
+  只保留「投递用户消息 + `agent_runtime_cutover.handle_send`」，删掉 provider
+  调用 / tool loop / 解析 / pending / trace 那一大段；删对应 import。
 - `hosted/config_store.py`：删 `_load_runtime_provider_config` 等 inline 专用项；
   保留 config 存储 + flag + profile。
-- `app.py`：解上面列的接线（imports / wake_bus handler / tick / COMPAT 段）。
+- ~~`app.py`：解上面列的接线~~（**已了结**：app.py 已删，残余装配点见上
+  「装配点」段，以 `asgi_app.py` 为准）。
 
-**保留**：`setup_routes.py`、`config_store.py`(瘦身后)、`history_import.py`、
+**保留**：`setup_routes_asgi.py`、`config_store.py`(瘦身后)、`history_import.py`、
 `onboarding_validation.py`、`agent_runtime_cutover.py`。
 
 **路由集变更**（CONTRIBUTING §7 要求 PR 显式列出，url_map 是回归基线）：

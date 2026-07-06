@@ -1,6 +1,6 @@
 """Quantitative perception history — incremental daily aggregation (Tier 2).
 
-Field-agnostic by design (PERCEPTION_HISTORY_SPEC principle #2): each signal
+Field-agnostic by design (docs/PERCEPTION_HISTORY_SPEC, since removed — see git history; principle #2): each signal
 declares ONE *shape* in ``SHAPE``; a per-shape merge function folds new
 observations into the running daily doc. Adding a field flows through
 automatically (numeric fields are discovered from the values dict); adding a

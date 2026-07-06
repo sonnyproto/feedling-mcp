@@ -15,7 +15,6 @@
 ## 🚀 近期工作(在 `../superpowers/`)
 - [io_cli add-memory 实现计划](../superpowers/plans/2026-07-06-io-cli-add-memory.md) — VPS 侧 file→memory/identity 二次蒸馏
 - [io_cli add-memory · VPS 二次蒸馏设计](../superpowers/specs/2026-07-06-io-cli-add-memory-vps-distill-design.md)
-- [托管(model_api)用户记忆/上下文/时间问题 · bug 报告](../superpowers/specs/2026-07-04-hosted-memory-context-bugreport.md)
 
 ---
 

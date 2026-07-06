@@ -1,11 +1,11 @@
-# Feedling docker-compose — Flask backend + FastMCP SSE server.
+# Feedling docker-compose — ASGI backend (the FastMCP SSE server was removed 2026-06-12).
 #
 # Quick start:
 #   cp deploy/feedling.env.example deploy/.env     # edit the important bits
 #   docker compose -f deploy/docker-compose.yaml --env-file deploy/.env up -d --build
 #
 # Ports published:
-#   5001  — Flask HTTP API (iOS app + HTTP-skill agents)
+#   5001  — backend HTTP API (ASGI; iOS app + HTTP-skill agents)
 #   9998  — WebSocket frame ingest (iOS broadcast extension)
 #
 # Data persists under the named volume `feedling_data` (maps to /data in the
@@ -42,13 +42,15 @@
 #   FEEDLING_API_KEY                — BAKED empty. The backend never accepts
 #                                     unauthenticated requests; per-user
 #                                     api_keys come from POST /v1/users/register.
-#                                     If you want MCP to talk to the backend
-#                                     in dev without registering, set a shared
+#                                     If you want a dev client to talk to the
+#                                     backend without registering, set a shared
 #                                     key via your own override file and publish
 #                                     its compose_hash.
 #   FEEDLING_FLASK_URL              — BAKED to the compose-internal DNS name.
 #                                     Operator can't redirect to a snooping
-#                                     Flask.
+#                                     backend. (Legacy var name from the Flask
+#                                     era — the code still reads it; do not
+#                                     rename.)
 #   FEEDLING_DATA_DIR               — BAKED to /data; matches the named
 #                                     volume mount. Operator can't relocate.
 #   FEEDLING_WS_PORT                — BAKED to 9998; matches port publish.
@@ -84,7 +86,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     image: feedling-backend:dev
-    # gunicorn = production WSGI. -w N is now supported (the old -w 1 mandate is
+    # gunicorn (uvicorn ASGI worker) = production server. -w N is now supported (the old -w 1 mandate is
     # gone): the :9998 WS ingest is leader-elected so only one worker binds it
     # (core/leader.py), and long-poll waiters + per-user store caches stay
     # coherent across workers via the Postgres LISTEN/NOTIFY wake bus

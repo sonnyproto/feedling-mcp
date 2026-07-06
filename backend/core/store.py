@@ -830,8 +830,9 @@ class UserStore:
 
 
 # Registry of per-user stores
-# In-process per-user store cache. gunicorn runs a single worker, so this is
-# the one shared cache for the whole backend. A UserStore is a write-through
+# In-process per-user store cache, one per worker process: under gunicorn
+# -w N there are N independent copies, and cross-worker consistency relies on
+# wake-bus broadcasts driving eviction/reload. A UserStore is a write-through
 # cache over PostgreSQL (every mutation persists immediately), so dropping and
 # rebuilding from the DB is always safe. The TTL bounds staleness from
 # out-of-band DB writes (e.g. admin data surgery / the orphan-account recovery

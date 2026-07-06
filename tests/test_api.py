@@ -597,7 +597,7 @@ check("plaintext /v1/memory/add → 400", r.status_code == 400,
 
 # v1 envelope add — needs plaintext `occurred_at` alongside the envelope for
 # server-side ordering; the backend reads it off the envelope dict (see
-# app.py:memory_add).
+# backend/memory/memory_core.py `add`).
 mem_id = f"mom_{uuid.uuid4().hex[:12]}"
 env_mem = make_envelope(
     USER_ID,

@@ -46,7 +46,8 @@ What this exercises:
 Run:
     pytest tests/test_multi_tenant_isolation.py -v
 
-The fixture spawns a fresh Flask backend in a subprocess against a temp
+The fixture spawns a fresh ASGI backend (serve_dev.py, uvicorn) in a
+subprocess against a temp
 data dir, so the test is hermetic — it does NOT hit prod or the deployed
 CVM. CI uses the same pattern; see .github/workflows/ci.yml python-tests.
 """
@@ -81,7 +82,7 @@ TIMEOUT = 8                  # per-request HTTP timeout
 
 
 # ---------------------------------------------------------------------------
-# Fixture — spawn fresh Flask backend on a free port, against a temp dir
+# Fixture — spawn fresh ASGI backend (serve_dev.py) on a free port, against a temp dir
 # ---------------------------------------------------------------------------
 
 def _pick_free_port() -> int:
@@ -92,7 +93,7 @@ def _pick_free_port() -> int:
 
 @pytest.fixture(scope="module")
 def backend():
-    """Start a fresh Flask backend on a random local port with an isolated
+    """Start a fresh ASGI backend (serve_dev.py) on a random local port with an isolated
     data dir. Tear it down at the end of the module. Each test module thus
     gets a clean slate; no leakage from prior test runs."""
     port = _pick_free_port()
@@ -102,7 +103,7 @@ def backend():
         **os.environ,
         "FEEDLING_DATA_DIR": tmp_data,
         "FEEDLING_WS_PORT": str(ws_port),
-        # Force the Flask app to bind the picked port. The app reads
+        # Force the backend (serve_dev.py) to bind the picked port. It reads
         # FEEDLING_PORT in some branches; passing both is harmless.
         "FEEDLING_PORT": str(port),
         "PORT": str(port),
@@ -194,7 +195,7 @@ def _user_flow(base_url: str, slot_idx: int) -> dict:
     enforces this with `bootstrap_incomplete` 409s on identity_init /
     chat_response if prerequisites aren't satisfied — see
     tests/test_bootstrap_gates.py for the gate behavior, and
-    backend/app.py `_gate_bootstrap_for_*`.
+    backend/bootstrap/gates.py `_gate_bootstrap_for_*`.
     """
     user_id, api_key = _register(base_url)
     H = {"X-API-Key": api_key}

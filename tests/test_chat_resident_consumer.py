@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 # Stub out content_encryption only when the backend tree is unavailable. In the
-# full backend suite, app.py needs the real module; poisoning sys.modules here
+# full backend suite, the backend needs the real module; poisoning sys.modules here
 # makes later envelope tests import a fake build_envelope.
 try:
     import content_encryption  # noqa: F401

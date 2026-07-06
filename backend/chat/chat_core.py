@@ -171,7 +171,8 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
         #
         # The verify-loop PING itself (a user-role source="verify_ping" row) is
         # deliberately NOT filtered: the enclave decrypt proxy reuses this very
-        # route (enclave_app.py -> _flask_get("/v1/chat/history")) to deliver the
+        # route (enclave/routes/chat.py -> backend_client.backend_get(
+        # "/v1/chat/history")) to deliver the
         # ping to the resident consumer, which detects it by source. Dropping it
         # here would starve enclave-backed consumers and wedge verify_loop /
         # onboarding. The ping is short-lived (verify_loop always GC's it), so it

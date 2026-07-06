@@ -1,7 +1,8 @@
 """PostgreSQL persistence layer for the Feedling backend.
 
 This module replaces the previous local-file persistence (JSON / JSONL files
-under FEEDLING_DATA_DIR). The in-memory model in app.py is unchanged: per-user
+under FEEDLING_DATA_DIR). The in-memory model (core.store's per-user
+``UserStore`` cache plus accounts.registry) is unchanged: per-user
 ``UserStore`` instances still hold their state in memory behind their own
 ``threading.Lock``s — this module only swaps where that state is read from /
 written to.
@@ -447,7 +448,8 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
 
     This is deliberately SQL-aggregate based: admin dashboards must not pull
     full encrypted chat envelopes or memory bodies into Python just to count
-    them. The returned shape is consumed by app.py's data-track surface.
+    them. The returned shape is consumed by the data-track surface in
+    admin/data_track.py (routes wired in admin/routes_asgi.py).
     """
     ids = [str(uid) for uid in user_ids if uid]
     if not ids:
@@ -2407,7 +2409,8 @@ def log_prune_older_than(user_id: str, stream: str, cutoff_epoch: float) -> None
 
 def delete_user_data(user_id: str) -> None:
     """Redundant DB belt: per-user 行现由 delete_user 的 CASCADE 原子清净
-    (0011)。保留供 migrate_to_pg 等旧调用方；删账号主路径不再依赖它做 R2。"""
+    (0011)。仍被 content/content_core.py 的销号(account/reset)兜底路径调用；
+    删账号主路径不再依赖它做 R2。"""
     try:
         with get_pool().connection() as conn:
             with conn.transaction():

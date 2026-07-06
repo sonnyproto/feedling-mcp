@@ -475,7 +475,7 @@ flowchart LR
 - `backend/core/envelope.py`: 后端 shared envelope helper、public key decode、enclave pk fetch。
 - `backend/core/enclave.py`: 后端到 enclave 的 attestation / decrypt proxy。
 - `backend/enclave_app.py`: enclave key derive、envelope decrypt、agent-facing decrypt-and-serve。
-- `backend/content/routes.py`: public key update、content rewrap、content export。
+- `backend/content/routes_asgi.py` + `backend/content/content_core.py`: public key update、content rewrap、content export（路由薄层 + 核心逻辑）。
 - `backend/accounts/registry.py`: API key HMAC storage。
 - `backend/core/runtime_token.py`: short-lived runtime token primitive。
 

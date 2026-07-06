@@ -6,7 +6,7 @@ to the ``io-user-logs`` R2 bucket (plaintext; see ``storage.py`` for the privacy
 note); a light index row per upload lands in the Postgres ``client_diagnostics``
 log stream.
 
-Integration is two one-liners in app.py:
-    from diagnostics import register as register_diagnostics
-    register_diagnostics(app)
+Integration is one registry entry in asgi_app.py: ``diagnostics.routes_asgi``
+is listed in the domain-package table there, and its ``register_asgi(app)``
+wires the routes.
 """

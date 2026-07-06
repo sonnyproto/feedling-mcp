@@ -127,7 +127,7 @@ def seed_user(user_id: str, **doc) -> None:
     directly must call this first.
 
     Also mirrors the entry into the in-memory registry (``accounts.registry
-    ._users`` — the same list object ``app.py`` binds as ``_users``), since a
+    ._users`` — the registry's own in-memory truth), since a
     real ``/v1/users/register`` call populates both the DB row and the
     process-local registry. Callers that skip the registry half end up with a
     DB-only "ghost" user that ``registry._user_entry_snapshot()`` can't see —

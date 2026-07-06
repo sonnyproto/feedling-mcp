@@ -1,7 +1,7 @@
 """v1 envelope construction helpers shared by every write path.
 
 The user's content pubkey lives in the accounts registry, which sits
-ABOVE core in the dependency stack — the assembly layer (app.py) injects
+ABOVE core in the dependency stack — the assembly layer (asgi/lifespan.py) injects
 ``get_user_public_key`` at startup instead of core importing accounts.
 """
 

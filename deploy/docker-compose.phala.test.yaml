@@ -2,7 +2,7 @@
 #
 # VPS is gone. This compose is the whole production stack:
 #   - dstack-ingress: TLS termination for api.feedling.app
-#   - backend:       Flask (HTTP+WS) — sole source of truth for user data
+#   - backend:       ASGI (HTTP+WS) — sole source of truth for user data
 #   - enclave:       decrypt proxy + /attestation (own TLS on :5003,
 #                    reachable via dstack-gateway `-5003s.` passthrough)
 #
@@ -87,7 +87,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:3e78d50
+    image: ghcr.io/teleport-computer/feedling:e805c13
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -114,7 +114,7 @@ services:
       retries: 20
       start_period: 120s
 
-  # --- Flask backend — the ONLY backend. ---
+  # --- ASGI backend — the ONLY backend. ---
   # Serves plain HTTP on :5001 (TLS terminated by ingress for
   # api.feedling.app). Also runs the WebSocket ingest on :9998 for the
   # iOS broadcast extension; that port is exposed via dstack-gateway
@@ -125,13 +125,13 @@ services:
   # migration completed (server_config.migration_done is set on the RDS, all
   # users/data are present). It is intentionally NOT here because a `restart:no`
   # container that exits can leave dstack's stack status stuck in updating/
-  # starting. To re-run a migration in future, run migrate_to_pg.py manually
-  # (e.g. via a temporary one-shot deploy) — the marker makes it a safe no-op
-  # unless invoked with --force.
+  # starting. The migrate_to_pg.py script itself was deleted 2026-07 (recover
+  # it from git history if a re-migration is ever needed) — the marker makes it
+  # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:3e78d50
-    # gunicorn = production WSGI (the Werkzeug dev server stalls on large
+    image: ghcr.io/teleport-computer/feedling:81ddc9b
+    # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
     # the historical single-worker behavior. -w N is code-supported (leader-elected

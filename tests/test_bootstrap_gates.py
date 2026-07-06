@@ -5,18 +5,20 @@ Covers two failure modes that hit prod 2026-05-13..15:
 
 1. /v1/bootstrap/status counted agent messages by role=="agent" but
    /v1/chat/response writes role="openclaw" → agent_messages_count
-   stuck at 0 even with chat traffic. Fix at backend/app.py:2362,
-   :2394 (accept both roles). Tested below in
-   test_bootstrap_status_counts_openclaw_role.
+   stuck at 0 even with chat traffic. Fixed in the original app.py
+   (since deleted); the counting now lives in
+   backend/bootstrap/status_core.py (accept both roles). Tested below
+   in test_bootstrap_status_counts_openclaw_role.
 
 2. Agent runtimes (OpenClaw specifically) skipping Pass 1-3 + Step 5
    and going straight to chat_post — server would happily accept the
    writes even though the agent had hallucinated bootstrap completion.
-   Fix at backend/app.py: /v1/identity/init and /v1/chat/response now
+   Fixed in the original app.py (since deleted); the gates now live in
+   backend/bootstrap/gates.py: /v1/identity/init and /v1/chat/response
    return 409 bootstrap_incomplete unless prerequisites are satisfied.
    Tested below.
 
-The fixture spawns a fresh Flask backend in a subprocess against a temp
+The fixture spawns a fresh ASGI backend (serve_dev.py) in a subprocess against a temp
 data dir, identical to test_multi_tenant_isolation.py. Hermetic — does
 not touch prod.
 """
