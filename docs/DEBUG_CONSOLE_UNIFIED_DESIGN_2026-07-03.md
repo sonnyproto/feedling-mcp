@@ -1,6 +1,6 @@
 # io 统一 Debug 面板（DebugConsole）设计方案 · v2（定稿）
 
-> 2026-07-03 · CC 起草 → hx review 收紧 → 定稿 · 状态：待进 writing-plans
+> 2026-07-03 · CC 起草 → hx review 收紧 → 定稿 · 状态：**M1 已 ship**（backbone/emit 端点/trace_id glue 均已落地，见 `diagnostics/routes_asgi.py`、`chat/chat_core.py`）；**M2/M3 为待做 roadmap**。文中 `*/routes.py` 行号为 ASGI 迁移前旧位置。
 > 跨仓：`feedling-mcp`（后端 backbone + 埋点）· `feedling-mcp-ios`（面板 UI）
 >
 > **v2 相对 v1 的收紧（hx review）**：① 不往 ring blob 硬塞大段明文，改"可读内容快照 + excerpt"；
@@ -23,8 +23,8 @@
 
 | 系统 | 位置 | 用途 | 处置 |
 |---|---|---|---|
-| **flow trace** | `backend/debug_trace.py` + `diagnostics/routes.py`(`/v1/debug/trace`) | per-user 环形缓冲、双门控、**仅 metadata** | **升级为唯一 backbone** |
-| **diagnostics 上传** | `backend/diagnostics/routes.py` + iOS `DiagnosticLog` | iOS 把 `diagnostics.log` 整文件传 R2，admin 拉 | **保留不动**（崩溃日志留证，用途不同） |
+| **flow trace** | `backend/debug_trace.py` + `diagnostics/routes_asgi.py`(`/v1/debug/trace`，body 在 `diagnostics_core.py`) | per-user 环形缓冲、双门控、**仅 metadata** | **升级为唯一 backbone** |
+| **diagnostics 上传** | `backend/diagnostics/routes_asgi.py` + iOS `DiagnosticLog` | iOS 把 `diagnostics.log` 整文件传 R2，admin 拉 | **保留不动**（崩溃日志留证，用途不同） |
 | **proactive 指标** | `backend/proactive/observability_v2.py`（`MetricEventV2`） | proactive runtime eval 指标流 | **保留**；M2 再薄桥接进面板 |
 
 现状埋点极稀（~16 处）：读侧(`memory_readside`/`index_selector`/`context_memory_selection`)、agent turn 内部、genesis worker 几乎零覆盖。
@@ -83,7 +83,7 @@
 ### 4.2 `trace_id` 分组规则
 
 - **主聊天链**：`trace_id = 用户消息 id`（client envelope `id`，`store.append_chat` 落库为 `msg["id"]`）。天然贯穿全链，各埋点统一填它。
-- **VPS resident 路径必须补 glue**：consumer 读消息拿 `msg["id"]`、回写 reply 传 `reply_to_message_id`（`tools/chat_resident_consumer.py`），但当前 `/v1/chat/response` 的 trace_event（`backend/chat/routes.py:418`，及 286 的 gated 分支）**没写 trace_id** → 分组会断。**修法：这两处显式 `trace_id = reply_to_message_id or msg["id"]`**（`reply_to_message_id` 在 `chat/routes.py:375` 已可得）。
+- **VPS resident 路径必须补 glue**【已修，M1 落地】：consumer 读消息拿 `msg["id"]`、回写 reply 传 `reply_to_message_id`（`tools/chat_resident_consumer.py`）。`/v1/chat/response` 的 trace_event 现在在 `backend/chat/chat_core.py`（含 gated 分支 `trace_response_gated`），两处均已显式 `trace_id = reply_to_message_id or msg["id"]`。
 - **后台链**（genesis worker、定时 capture、proactive）：`trace_id = job_id`。
 - **面板分组**：客户端按 `trace_id` 折叠成 turn 卡片，卡内按 `ts` 升序；无 trace_id 归 "ungrouped"。
 
@@ -123,7 +123,7 @@
 
 ### 5.1 M1 埋到哪 / 不埋到哪（降噪 vs LLM 可见）
 
-**真实 live 路径**：iOS 存消息 → `tools/chat_resident_consumer.py`（每用户一进程，跑 CVM）poll 到 → subprocess 调 `claude`/`codex exec` CLI 出回复 → POST `/v1/chat/response`。所以模型调用发生在 **consumer 的 CLI subprocess 边界**，不在后端 Flask。
+**真实 live 路径**：iOS 存消息 → `tools/chat_resident_consumer.py`（每用户一进程，跑 CVM）poll 到 → subprocess 调 `claude`/`codex exec` CLI 出回复 → POST `/v1/chat/response`。所以模型调用发生在 **consumer 的 CLI subprocess 边界**，不在后端（FastAPI/ASGI）。
 
 **M1 埋**：consumer 的 **CLI subprocess 边界一处**(`agent.model.call.start/done/error`，复用现成 `_log_cli_turn_timing`/`_codex_turn_metrics` 的 duration/tokens，带 prompt/输出 excerpt + 挂起可见) + consumer 的 `context.build`(附加屏幕/history) + 后端边界(`route.chat.message`/`reply.stored`/`memory.capture.*`)。这正好回答"LLM 输入输出是什么、卡没卡"，是第一痛点。
 
@@ -167,10 +167,10 @@
    - 新增 `_safe_content_excerpt()`（每字段 ~1KB、每 event ≤4KB 截断，截断打标）。
    - verbose 模式 `_MAX_EVENTS` 降到 150–200（可按 `verbose_enabled` 动态取）。
    - **不做服务端分组**——`read_trace` 保持返回扁平 events + `limit` + 单 subsystem 兼容。
-2. **新增 emit 端点 `POST /v1/debug/trace/event`**（`backend/diagnostics/routes.py`）：`require_user`(复用 FEEDLING_API_KEY) + 门控 + best-effort，收 consumer 推来的一条事件（body = subsystem/type/status/summary/explain/detail/content_excerpt/trace_id/turn_id/dur_ms），内部转调 `debug_trace.trace_event`。**这是 live 路径的关键**：consumer 是 HTTP-only、无 DB，只能靠这个端点上报。
-3. **`backend/chat/routes.py`**：`chat.response`(418) 与 gated(286) 两处补 `trace_id = reply_to_message_id or msg["id"]`（glue）。
+2. **新增 emit 端点 `POST /v1/debug/trace/event`**（现已落地：`backend/diagnostics/routes_asgi.py` + `diagnostics_core.emit_trace_event_payload`）：`require_user`(复用 FEEDLING_API_KEY) + 门控 + best-effort，收 consumer 推来的一条事件（body = subsystem/type/status/summary/explain/detail/content_excerpt/trace_id/turn_id/dur_ms），内部转调 `debug_trace.trace_event`。**这是 live 路径的关键**：consumer 是 HTTP-only、无 DB，只能靠这个端点上报。
+3. **`backend/chat/chat_core.py`**（原 `chat/routes.py`，ASGI 迁移后逻辑在 chat_core）：`chat.response` 与 gated（`trace_response_gated`）两处补 `trace_id = reply_to_message_id or msg["id"]`（glue）——**已落地**。
 4. **M1 埋点分布（真实 live 路径 = resident consumer 驱动 claude/codex CLI）**：
-   - **后端可见的边界**（backend 直接 `trace_event`）：`chat/routes.py` 的 `route.chat.message`(生成/带 trace_id) + `route.chat.response`(reply.stored)；memory capture（`memory/service.py`/`actions.py` 或 consumer 的 capture job，取实际触发处）`memory.capture.queued/done/error`。
+   - **后端可见的边界**（backend 直接 `trace_event`）：`chat/chat_core.py` 的 `route.chat.message`(生成/带 trace_id) + `route.chat.response`(reply.stored)；memory capture（`memory/service.py`/`actions.py` 或 consumer 的 capture job，取实际触发处）`memory.capture.queued/done/error`。
    - **consumer 端**（`tools/chat_resident_consumer.py`，经 emit 端点上报）：`context.build`(附加的屏幕上下文/注入 history，`_screen_context_for_message` 一带) + **`agent.model.call.start/done/error`**（CLI subprocess 边界，**复用现成的 `_log_cli_turn_timing` + `_codex_turn_metrics`** 拿 duration/tokens/steps；start 带 prompt excerpt，done 带 reply excerpt + dur_ms/tokens，只有 start 无 done = 挂起）。trace_id = poll 到的用户消息 id。
    - **降级不做**：`hosted/turn.py` / `hosted/context.py` 是退役中的 hosted model_api 路（`/v1/model_api/chat/send`），**M1 不埋**；仅当 test 上确有用户仍走 hosted 才后补。
 5. **`/v1/debug/trace` 返回体**：回显 `verbose` 标志位（面板提示 excerpt 是否生效）。

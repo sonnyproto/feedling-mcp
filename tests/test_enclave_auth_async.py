@@ -125,6 +125,93 @@ def test_error_flight_not_cached(monkeypatch):
     assert len(calls) == 2  # 失败不落缓存，下次重试
 
 
+def test_singleflight_leader_failure_waiters_retry_independently(monkeypatch):
+    """领跑者的一次瞬时失败不得广播给全部等待者（旧线程版语义：waiter 在
+    per-key 锁上排队，leader 失败后各自重查缓存、各自独立回环重试，首个成功者
+    回填缓存供其余 waiter 复用）。修复前：fut.set_exception 把一次 ConnectError
+    扇出给全部 N-1 个 waiter → 整批 502。"""
+    calls = []
+    req = httpx.Request("GET", "http://b/v1/users/whoami")
+
+    async def flaky_backend_get(path, headers, params=None):
+        calls.append(path)
+        await asyncio.sleep(0.05)
+        if len(calls) == 1:  # 仅领跑者那一次失败
+            raise httpx.ConnectError("transient", request=req)
+        return {"user_id": "usr_1"}
+
+    monkeypatch.setattr(backend_client, "backend_get", flaky_backend_get)
+    ctx = auth.AuthContext(api_key="k1", runtime_token="")
+
+    async def main():
+        return await asyncio.gather(
+            *[auth.whoami_cached(ctx) for _ in range(10)], return_exceptions=True)
+
+    results = asyncio.run(main())
+    failures = [r for r in results if isinstance(r, BaseException)]
+    successes = [r for r in results if r == {"user_id": "usr_1"}]
+    assert len(failures) == 1  # 只有领跑者自己拿到那次瞬时错误
+    assert isinstance(failures[0], httpx.ConnectError)
+    assert len(successes) == 9  # 等待者各自重试成功
+    assert len(calls) == 2  # leader 1 次失败 + 首个重试者 1 次成功回填缓存
+
+
+def test_singleflight_leader_cancelled_waiters_not_cancelled(monkeypatch):
+    """领跑者任务被取消（如 worker 关闭中断某个请求）时，等待者不得收到
+    CancelledError（它会逃出路由层只捕 httpx 的 except 变成 500）——等待者
+    应各自重试并成功。"""
+    calls = []
+
+    async def slow_then_fast(path, headers, params=None):
+        calls.append(path)
+        if len(calls) == 1:
+            await asyncio.sleep(10)  # 领跑者：慢到足以被取消
+        return {"user_id": "usr_1"}
+
+    monkeypatch.setattr(backend_client, "backend_get", slow_then_fast)
+    ctx = auth.AuthContext(api_key="k1", runtime_token="")
+
+    async def main():
+        leader = asyncio.create_task(auth.whoami_cached(ctx))
+        await asyncio.sleep(0.01)  # 让 leader 注册 inflight
+        waiters = [asyncio.create_task(auth.whoami_cached(ctx)) for _ in range(3)]
+        await asyncio.sleep(0.01)  # 让 waiters 挂到 inflight 上
+        leader.cancel()
+        results = await asyncio.gather(*waiters, return_exceptions=True)
+        with pytest.raises(asyncio.CancelledError):
+            await leader
+        return results
+
+    results = asyncio.run(main())
+    assert all(r == {"user_id": "usr_1"} for r in results), results
+
+
+def test_singleflight_waiter_own_cancellation_still_works(monkeypatch):
+    """等待者自身被取消必须立刻取消（shield 语义保留），且不影响领跑者。"""
+    calls = []
+    _patch_backend(monkeypatch, calls, delay=0.2)
+    ctx = auth.AuthContext(api_key="k1", runtime_token="")
+
+    async def main():
+        leader = asyncio.create_task(auth.whoami_cached(ctx))
+        await asyncio.sleep(0.01)
+        waiter = asyncio.create_task(auth.whoami_cached(ctx))
+        await asyncio.sleep(0.01)
+        waiter.cancel()
+        waiter_res: BaseException | dict
+        try:
+            waiter_res = await waiter
+        except asyncio.CancelledError as e:
+            waiter_res = e
+        leader_res = await leader
+        return waiter_res, leader_res
+
+    waiter_res, leader_res = asyncio.run(main())
+    assert isinstance(waiter_res, asyncio.CancelledError)
+    assert leader_res == {"user_id": "usr_1"}
+    assert len(calls) == 1
+
+
 def test_resolve_read_caller_error_strings(monkeypatch):
     from enclave import state
     monkeypatch.setitem(state._state, "ready", True)

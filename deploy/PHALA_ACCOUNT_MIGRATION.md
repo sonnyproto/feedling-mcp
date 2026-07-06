@@ -47,7 +47,7 @@ iOS 重发版，重活）。
 
 | 资产 | 绑定在什么上 | 换 Phala 账号会变吗 | 证据 |
 |---|---|---|---|
-| `enclave_content_pk`（数据加密密钥） | `(kms_root, app_id, path="feedling-content-v1")` | **不变**（前提：同 app_id + 同 prod9 集群） | `backend/enclave_app.py:143-177`；DEPLOYMENTS.md 各 Phase 表的 *Enclave content pk* 行（8+ 次 compose 升级密钥不变），现役基线见 *Production CVM (prod9, current)* 表 = `2d642ec1…` |
+| `enclave_content_pk`（数据加密密钥） | `(kms_root, app_id, path="feedling-content-v1")` | **不变**（前提：同 app_id + 同 prod9 集群） | `backend/enclave/keys.py`；DEPLOYMENTS.md 各 Phase 表的 *Enclave content pk* 行（8+ 次 compose 升级密钥不变），现役基线见 *Production CVM (prod9, current)* 表 = `2d642ec1…` |
 | `app_id` | 链上 AppAuth 合约地址 | **不变**（前提：复用现有合约） | dstack-tutorial `03-keys-and-replication/deploy_replica.py:62` |
 | 密钥释放授权 | `FeedlingAppAuth.isAppAllowed(composeHash)`，**只查 compose_hash 白名单、不绑 device** | 不受账号影响 | `contracts/src/FeedlingAppAuth.sol:145-146` |
 | AppAuth owner（能加 compose_hash） | `ETH_DEPLOYER_KEY` 私钥 `0xa0eBcd26…` | 不受账号影响（你们持有该私钥） | DEPLOYMENTS.md:78 |
@@ -195,9 +195,9 @@ iOS 重发版，重活）。
 1. **新建 app_id**：新账号 `phala deploy`（不带 `--cvm-id`，或 `phala cvms create`）→
    自动铸新 app_id + 新 AppAuth；记录新 app_id / 新合约 / 新 deploy_tx。
 2. **数据重加密**（关键难点，**现有代码缺工具**，需新建）：
-   - 现有 `GET /v1/content/export`（`backend/content/routes.py:479-552`）导出的是**密文**，
+   - 现有 `GET /v1/content/export`（`backend/content/routes_asgi.py` + `content_core.py`）导出的是**密文**，
      不直接可用。
-   - 现有 `POST /v1/content/rewrap-to-current-key`（`:322-458`）只换 `K_user`、**不换 `K_enclave`**。
+   - 现有 `POST /v1/content/rewrap-to-current-key`（同上两个文件）只换 `K_user`、**不换 `K_enclave`**。
    - 现实可行做法（任选）：
      - **(a) 旧 CVM 在线 → 客户端中转**：iOS 用本地 `content_sk` 解 export 的密文 →
        拉新 CVM `/attestation` 拿新 `enclave_content_pk` → 用新 pk 重新 `build_envelope`

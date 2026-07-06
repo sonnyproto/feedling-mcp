@@ -89,7 +89,7 @@ def _purge_onboarding_archives_with_retry(user_id: str) -> Exception | None:
 
 
 # --------------------------------------------------------------------------- #
-# Encrypted-content counters (shared with app.py via the facade re-export)
+# Encrypted-content counters
 # --------------------------------------------------------------------------- #
 
 def _has_encrypted_content_record(item: dict | None) -> bool:

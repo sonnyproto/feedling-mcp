@@ -15,12 +15,14 @@ from pathlib import Path
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
-import app as appmod  # noqa: E402
 import provider_client  # noqa: E402
+from accounts import registry as accounts_registry  # noqa: E402
+from asgi_test_client import make_client  # noqa: E402
 from bootstrap import gates as boot_gates  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import enclave as core_enclave  # noqa: E402
 from core import envelope as core_envelope  # noqa: E402
+from core import store as core_store  # noqa: E402
 from hosted import agent_runtime_cutover  # noqa: E402
 from hosted import config_store as hosted_config_store  # noqa: E402
 
@@ -32,10 +34,10 @@ def _b64(raw: bytes) -> str:
 @pytest.fixture()
 def client(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
-    appmod._users[:] = []
-    appmod._key_to_user.clear()
-    appmod._stores.clear()
-    appmod._save_users()
+    accounts_registry._users[:] = []
+    accounts_registry._key_to_user.clear()
+    core_store._stores.clear()
+    accounts_registry._save_users()
     monkeypatch.setattr(
         core_enclave,
         "_get_enclave_info",
@@ -44,8 +46,7 @@ def client(tmp_path, monkeypatch):
     # Default: a live supervisor so the wedge guard lets sends through. Tests that
     # exercise the guard's 503 path re-monkeypatch this to return not-live.
     monkeypatch.setattr(agent_runtime_cutover, "check_supervisor_live", lambda **kw: (True, ""))
-    appmod.app.config.update(TESTING=True)
-    with appmod.app.test_client() as c:
+    with make_client() as c:
         yield c
 
 
@@ -112,7 +113,8 @@ def _setup_openrouter(client, api_key: str, monkeypatch) -> None:
     assert res.status_code == 200, res.get_data(as_text=True)
 
 
-def test_chat_response_marks_first_model_api_success_once(client, monkeypatch):
+@pytest.mark.parametrize("source", ["chat", "model_api"])
+def test_chat_response_marks_first_user_success_once_for_real_chat_sources(client, monkeypatch, source):
     user_id, api_key = _register(client)
     monkeypatch.setattr(
         boot_gates,
@@ -120,44 +122,66 @@ def test_chat_response_marks_first_model_api_success_once(client, monkeypatch):
         lambda store, allow_verify_reply=False: None,
     )
 
-    store = appmod.get_store(user_id)
+    store = core_store.get_store(user_id)
     assert store.proactive_activation_ready() is False
 
-    chat_user = store.append_chat("user", "chat", _chat_envelope(user_id, "ordinary-user-1"))
-    ordinary = client.post(
-        "/v1/chat/response",
-        json={"envelope": _chat_envelope(user_id, "ordinary-assistant-1"), "reply_to_message_id": chat_user["id"]},
-        headers=_headers(api_key),
-    )
-    assert ordinary.status_code == 200, ordinary.get_data(as_text=True)
-    assert store.proactive_activation_ready() is False
-
-    model_user = store.append_chat("user", "model_api", _chat_envelope(user_id, "model-user-1"))
+    bad_user = store.append_chat("user", source, _chat_envelope(user_id, f"{source}-bad-user-1"))
     bad = client.post(
         "/v1/chat/response",
-        json={"reply_to_message_id": model_user["id"]},
+        json={"reply_to_message_id": bad_user["id"]},
         headers=_headers(api_key),
     )
     assert bad.status_code == 400
     assert store.proactive_activation_ready() is False
 
+    user_msg = store.append_chat("user", source, _chat_envelope(user_id, f"{source}-user-1"))
     first = client.post(
         "/v1/chat/response",
-        json={"envelope": _chat_envelope(user_id, "model-assistant-1"), "reply_to_message_id": model_user["id"]},
+        json={
+            "envelope": _chat_envelope(user_id, f"{source}-assistant-1"),
+            "reply_to_message_id": user_msg["id"],
+        },
         headers=_headers(api_key),
     )
     assert first.status_code == 200, first.get_data(as_text=True)
     first_chat_ok_at = store.first_chat_ok_at()
     assert first_chat_ok_at
 
-    second_user = store.append_chat("user", "model_api", _chat_envelope(user_id, "model-user-2"))
+    second_user = store.append_chat("user", source, _chat_envelope(user_id, f"{source}-user-2"))
     second = client.post(
         "/v1/chat/response",
-        json={"envelope": _chat_envelope(user_id, "model-assistant-2"), "reply_to_message_id": second_user["id"]},
+        json={
+            "envelope": _chat_envelope(user_id, f"{source}-assistant-2"),
+            "reply_to_message_id": second_user["id"],
+        },
         headers=_headers(api_key),
     )
     assert second.status_code == 200, second.get_data(as_text=True)
     assert store.first_chat_ok_at() == first_chat_ok_at
+
+
+def test_chat_response_does_not_mark_first_chat_ok_for_verify_ping(client, monkeypatch):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(
+        boot_gates,
+        "_gate_bootstrap_for_chat",
+        lambda store, allow_verify_reply=False: None,
+    )
+
+    store = core_store.get_store(user_id)
+    ping_user = store.append_chat("user", "verify_ping", _chat_envelope(user_id, "verify-ping-user-1"))
+
+    reply = client.post(
+        "/v1/chat/response",
+        json={
+            "envelope": _chat_envelope(user_id, "verify-ping-assistant-1"),
+            "reply_to_message_id": ping_user["id"],
+        },
+        headers=_headers(api_key),
+    )
+
+    assert reply.status_code == 200, reply.get_data(as_text=True)
+    assert store.proactive_activation_ready() is False
 
 
 def test_send_configured_routes_to_agent_runner(client, monkeypatch):
@@ -301,7 +325,7 @@ def test_send_503_when_supervisor_not_live(client, monkeypatch):
     assert body["reason"].startswith("stale_supervisor_heartbeat")
     assert calls == [], "supervisor down 时不应路由到 handle_send"
     # 守卫早于 append_chat，store 里不应有任何用户消息（无孤儿 turn）
-    store = appmod._stores.get(user_id)
+    store = core_store._stores.get(user_id)
     if store:
         user_msgs = [m for m in store.chat_messages if m.get("role") == "user"]
         assert user_msgs == [], f"守卫触发后 store 不应有用户消息，实际: {user_msgs}"

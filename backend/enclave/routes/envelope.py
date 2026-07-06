@@ -10,13 +10,13 @@ from __future__ import annotations
 import base64
 
 import anyio.to_thread
-import httpx
 from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from enclave import auth, envelope, keys, state
+from enclave import auth, envelope, state
 from enclave.routes._body import read_json_payload
+from enclave.routes._errors import backend_call_or_error, content_sk_or_503
 
 router = APIRouter()
 
@@ -31,14 +31,9 @@ async def v1_envelope_decrypt(request: Request):
     if ctx.missing:
         return JSONResponse({"error": "missing_api_key"}, status_code=401)
 
-    try:
-        whoami = await auth.whoami_live(ctx)
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 401:
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return JSONResponse({"error": f"backend_error: {e}"}, status_code=502)
-    except httpx.HTTPError as e:
-        return JSONResponse({"error": f"backend_error: {e}"}, status_code=502)
+    whoami, err_response = await backend_call_or_error(auth.whoami_live(ctx))
+    if err_response is not None:
+        return err_response
 
     authorized_user_id = whoami.get("user_id", "")
     if not authorized_user_id:
@@ -52,11 +47,9 @@ async def v1_envelope_decrypt(request: Request):
     if not isinstance(env, dict):
         return JSONResponse({"error": "envelope required"}, status_code=400)
 
-    try:
-        content_sk = await keys.get_content_sk()
-    except Exception as e:
-        return JSONResponse(
-            {"error": f"key_derivation_unavailable: {e}"}, status_code=503)
+    content_sk, err_response = await content_sk_or_503()
+    if err_response is not None:
+        return err_response
 
     try:
         plaintext = await anyio.to_thread.run_sync(

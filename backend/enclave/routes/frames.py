@@ -23,7 +23,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 import provider_client
-from enclave import auth, backend_client, config, envelope, keys, state, visual
+from enclave import auth, backend_client, config, envelope, state, visual
+from enclave.routes._errors import backend_call_or_error, content_sk_or_503
+from enclave.routes._json import json_response_offthread
 
 router = APIRouter()
 
@@ -54,16 +56,20 @@ def _conditional_image_response(request: Request, image_bytes: bytes,
         spec_part = range_header[len("bytes="):].strip()
         start_s, _, end_s = spec_part.partition("-")
         start = end = None
-        try:
-            if start_s == "" and end_s:          # 后缀式 bytes=-N
-                n = int(end_s)
-                if n >= 1:
-                    start, end = max(0, total - n), total - 1
-            elif start_s:
-                start = int(start_s)
-                end = int(end_s) if end_s else total - 1
-        except ValueError:
-            start = None                          # 畸形 Range → 忽略（RFC 7233）
+
+        def _is_byte_pos(s: str) -> bool:
+            # RFC 7233 byte-pos = 1*DIGIT。不能用裸 int()：它还吃 "+5"/"-3"
+            # （partition 把 "5--3" 切成 end="-3"），畸形头必须忽略走 200
+            # 全量（Werkzeug conditional=True 同行为），不是 416。
+            return bool(s) and s.isascii() and s.isdigit()
+
+        if start_s == "" and _is_byte_pos(end_s):  # 后缀式 bytes=-N
+            n = int(end_s)
+            if n >= 1:
+                start, end = max(0, total - n), total - 1
+        elif _is_byte_pos(start_s) and (end_s == "" or _is_byte_pos(end_s)):
+            start = int(start_s)
+            end = int(end_s) if end_s else total - 1
         if start is not None:
             if start >= total or end < start:
                 return Response(status_code=416, headers={
@@ -83,20 +89,10 @@ async def _fetch_frame_envelope(frame_id: str, ctx: auth.AuthContext):
     Returns (env, None) or (None, JSONResponse) — caller returns the response
     directly when the second element is not None.
     """
-    try:
-        env = await backend_client.backend_get(
-            f"/v1/screen/frames/{frame_id}/envelope", ctx.forward_headers)
-    except httpx.HTTPStatusError as e:
-        # whoami may have been cached, so a key revoked since then surfaces here;
-        # keep it a 401, not a generic 502.
-        if e.response.status_code == 401:
-            return None, JSONResponse({"error": "unauthorized"}, status_code=401)
-        if e.response.status_code == 404:
-            return None, JSONResponse({"error": "frame not found"}, status_code=404)
-        return None, JSONResponse({"error": f"backend_error: {e}"}, status_code=502)
-    except httpx.HTTPError as e:
-        return None, JSONResponse({"error": f"backend_error: {e}"}, status_code=502)
-    return env, None
+    return await backend_call_or_error(
+        backend_client.backend_get(
+            f"/v1/screen/frames/{frame_id}/envelope", ctx.forward_headers),
+        not_found_error="frame not found")
 
 
 @router.api_route("/v1/screen/frames/{frame_id}/decrypt", methods=["GET", "HEAD"])
@@ -126,14 +122,9 @@ async def v1_frame_decrypt(frame_id: str, request: Request):
         return err_response
 
     include_image = request.query_params.get("include_image", "true").lower() != "false"
-    try:
-        content_sk = await keys.get_content_sk()
-    except Exception as e:
-        # The only runtime dstack round-trip. A socket hiccup deriving the
-        # content key is a transient infra failure, not an enclave bug — return
-        # a retryable 503 rather than a bare 500 the consumer can't interpret.
-        return JSONResponse(
-            {"error": f"key_derivation_unavailable: {e}"}, status_code=503)
+    content_sk, err_response = await content_sk_or_503()
+    if err_response is not None:
+        return err_response
 
     try:
         # Frames are 100KB+ — decrypt off the event loop (spec §4).
@@ -167,7 +158,8 @@ async def v1_frame_decrypt(frame_id: str, request: Request):
     else:
         result["image_b64"] = None
         result["image_bytes_omitted"] = True
-    return JSONResponse(result)
+    # ~470KB image_b64 的 json.dumps 离事件循环（同 chat/history）
+    return await json_response_offthread(result)
 
 
 @router.api_route("/v1/screen/frames/{frame_id}/caption", methods=["GET", "HEAD"])
@@ -204,11 +196,9 @@ async def v1_frame_caption(frame_id: str, request: Request):
     if err_response is not None:
         return err_response
 
-    try:
-        content_sk = await keys.get_content_sk()
-    except Exception as e:
-        return JSONResponse(
-            {"error": f"key_derivation_unavailable: {e}"}, status_code=503)
+    content_sk, err_response = await content_sk_or_503()
+    if err_response is not None:
+        return err_response
 
     try:
         plaintext = await anyio.to_thread.run_sync(
@@ -295,14 +285,9 @@ async def v1_frame_image(frame_id: str, request: Request):
     if err_response is not None:
         return err_response
 
-    try:
-        content_sk = await keys.get_content_sk()
-    except Exception as e:
-        # The only runtime dstack round-trip. A socket hiccup deriving the
-        # content key is a transient infra failure, not an enclave bug — return
-        # a retryable 503 rather than a bare 500 the consumer can't interpret.
-        return JSONResponse(
-            {"error": f"key_derivation_unavailable: {e}"}, status_code=503)
+    content_sk, err_response = await content_sk_or_503()
+    if err_response is not None:
+        return err_response
 
     try:
         plaintext = await anyio.to_thread.run_sync(

@@ -7,6 +7,11 @@
 Round 3 的感知→wake 方案以 `docs/PROACTIVE_PERCEPTION_SPEC_V2.md` 为准；
 本文只保留 HTTP 接入细节，后端实现在 `backend/perception/`。
 
+> **注**：信号集此后已扩展（截至 2026-07 为 19 个信号 + `unsupported`，含
+> weather / reminders / health_* 等，见 `backend/perception/ios_contract_v2.py`
+> 的 `EXPECTED_REPORT_KEYS_V2` 与 CHANGELOG）。本文 §3 的表只覆盖早期核心信号，
+> 未逐一重写；口径以代码 / CHANGELOG 为准。
+
 ---
 
 ## 0. 通用约定
@@ -85,7 +90,7 @@ Round 3 的感知→wake 方案以 `docs/PROACTIVE_PERCEPTION_SPEC_V2.md` 为准
 （等价于一个 key→value）。**照片不走这里**（见 §5）。
 
 每项三字段：
-- `key`：信号名（§3 的 8 个 key；也接受别名 `location`/`motion`/`now_playing`/`calendar`）
+- `key`：信号名（见 §3 及文首注的全量 key；也接受别名 `location`/`motion`/`now_playing`/`calendar`）
 - `data`：**字符串**——JSON（如 `"{\"state\":\"walking\"}"`）或 `"null"`（无数据/未授权）
 - `message`：人类可读说明（会存下来；`data` 为 `null` 时尤其有用，给 agent 解释原因）
 
@@ -133,10 +138,10 @@ Round 3 的感知→wake 方案以 `docs/PROACTIVE_PERCEPTION_SPEC_V2.md` 为准
 
 ---
 
-## 3. 8 个 key 及其 data 内容
+## 3. 各 key 及其 data 内容（早期核心信号，全量见文首注）
 
 `data` 是**字符串化的 JSON**（或字面量 `"null"`），后端二次 `json.loads`。字段名
-snake_case。下表是每个 key 的 data 结构与后端处理（与 `perception-report-fields.md` 对齐）。
+snake_case。下表是每个 key 的 data 结构与后端处理。
 
 | key | `data` 的 JSON 内容（关键字段） | 后端处理 / snapshot 产出 |
 |---|---|---|

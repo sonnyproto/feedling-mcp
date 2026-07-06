@@ -31,8 +31,9 @@ from identity import service as identity_service
 
 
 
-# Injected by the assembly layer — these live with the hosted/onboarding
-# validation code that has not been extracted from app.py yet.
+# Injected by the assembly layer (asgi_app.py) — the real implementations live
+# in hosted/onboarding_validation.py; admin sits below hosted, so the stub is
+# declared here and assembly wires it.
 def _latest_history_import_job(store):
     return None
 
@@ -46,7 +47,7 @@ def _data_track_qs(**updates) -> str:
     for key in (
         "admin_key", "since", "registered_since", "q", "limit", "offset", "sort",
         "dir", "view", "days", "user_id", "subsystem", "status", "trace_id",
-        "mode", "reveal", "page",
+        "mode", "reveal", "page", "event",
     ):
         value = request.args.get(key, "").strip()
         if value:
@@ -486,8 +487,9 @@ def _classify_proactive_kind(kind: str) -> str:
         return "other"
     if norm in _SCREEN_PROACTIVE_KINDS:
         return "screen"
-    # heartbeat, heartbeat_no_frame, heartbeat_unknown, heartbeat_broadcast_off …
-    if norm.startswith("heartbeat"):
+    # 现网自发 tick 的 kind 是 presence；heartbeat* 为历史 kind
+    # (heartbeat, heartbeat_no_frame, heartbeat_unknown, heartbeat_broadcast_off …)。
+    if norm == "presence" or norm.startswith("heartbeat"):
         return "heartbeat"
     return "other"
 
@@ -981,7 +983,7 @@ def _data_track_request_filters() -> dict:
     if raw_dir not in {"asc", "desc"}:
         raw_dir = "desc"
     raw_view = (request.args.get("view") or "users").strip().lower()
-    if raw_view not in {"users", "dau", "proactive", "debug"}:
+    if raw_view not in {"users", "dau", "proactive", "debug", "events"}:
         raw_view = "users"
 
     def read_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -1421,8 +1423,14 @@ def _data_track_debug_payload() -> dict:
     status_filter = (request.args.get("status") or "").strip().lower()
     trace_filter = (request.args.get("trace_id") or "").strip()
     reveal_key = (request.args.get("reveal") or "").strip()
-    mode = (request.args.get("mode") or "flat").strip().lower()
-    if mode not in {"flat", "timeline"}:
+    # Default to the readable per-turn timeline when drilling into one user (or a
+    # single trace); the flat event table stays the default for the firehose view.
+    raw_mode = (request.args.get("mode") or "").strip().lower()
+    if raw_mode in {"flat", "timeline"}:
+        mode = raw_mode
+    elif user_filter or trace_filter:
+        mode = "timeline"
+    else:
         mode = "flat"
     q = str(filters.get("q") or "").strip().lower()
     since_epoch = float(filters.get("since_epoch") or 0)
@@ -1591,19 +1599,25 @@ def _data_track_proactive_daily_payload() -> dict:
     for r in rows:
         jobs = int(r.get("jobs") or 0)
         delivered = int(r.get("delivered") or 0)
+        completed = int(r.get("completed") or 0)
         failed = int(r.get("failed") or 0)
         # success rate over RESOLVED jobs (exclude still-pending) — a fairer
-        # "did it work" denominator than raw jobs.
-        resolved = delivered + failed
+        # "did it work" denominator than raw jobs. completed（sleep/纯动作，
+        # 醒了但决定不说话）算成功：口径衡量「系统是否健康」。
+        ok = delivered + completed
+        resolved = ok + failed
         out_rows.append({
             **r,
-            "success_rate": (delivered / resolved) if resolved else 0.0,
+            "success_rate": (ok / resolved) if resolved else 0.0,
             "fail_rate": (failed / resolved) if resolved else 0.0,
         })
     tot_jobs = sum(int(r.get("jobs") or 0) for r in rows)
     tot_deliv = sum(int(r.get("delivered") or 0) for r in rows)
+    tot_completed = sum(int(r.get("completed") or 0) for r in rows)
     tot_fail = sum(int(r.get("failed") or 0) for r in rows)
-    tot_resolved = tot_deliv + tot_fail
+    tot_maint = sum(int(r.get("maintenance") or 0) for r in rows)
+    tot_maint_fail = sum(int(r.get("maintenance_failed") or 0) for r in rows)
+    tot_resolved = tot_deliv + tot_completed + tot_fail
     latest = out_rows[0] if out_rows else {}
     summary = {
         "generated_at": datetime.now().isoformat(),
@@ -1613,16 +1627,24 @@ def _data_track_proactive_daily_payload() -> dict:
         "latest_success_rate": latest.get("success_rate", 0.0),
         "total_jobs": tot_jobs,
         "total_delivered": tot_deliv,
+        "total_completed": tot_completed,
         "total_failed": tot_fail,
-        "overall_success_rate": (tot_deliv / tot_resolved) if tot_resolved else 0.0,
+        "total_maintenance": tot_maint,
+        "total_maintenance_failed": tot_maint_fail,
+        "overall_success_rate": ((tot_deliv + tot_completed) / tot_resolved) if tot_resolved else 0.0,
     }
     return {
         "summary": summary,
         "filters": {"since": filters.get("since", ""), "days": days, "view": "proactive"},
         "rows": out_rows,
         "definition": {
-            "success_rate": "delivered / (delivered + failed); still-pending jobs excluded from the denominator.",
-            "lanes": "heartbeat = the main self-initiated tick; screen = screen-share / broadcast driven.",
+            "success_rate": "wake-lane only: (delivered + completed) / (delivered + completed + failed). "
+                            "completed = woke, decided, just didn't post (sleep / action-only) — counts as success. "
+                            "memory-maintenance jobs, gate-skipped wakes and still-pending "
+                            "jobs are all excluded from the denominator.",
+            "lanes": "heartbeat = the main self-initiated tick (kind=presence); "
+                     "screen = screen-share / broadcast driven; "
+                     "maintenance = memory capture/dream/migrate (never user-facing).",
             "timezone": "Asia/Shanghai",
         },
     }
@@ -1671,6 +1693,7 @@ def _render_data_track_view_nav(active: str) -> str:
         f"{nav_item('users', 'Users')}"
         f"{nav_item('dau', 'DAU')}"
         f"{nav_item('proactive', 'Proactive 日报')}"
+        f"{nav_item('events', '事件健康度')}"
         f"{nav_item('debug', 'Debug')}"
         "</div>"
     )
@@ -1969,20 +1992,24 @@ def _render_proactive_daily_page(payload: dict) -> str:
             f"<td>{html.escape(str(row.get('day') or ''))}</td>"
             f"<td>{int(row.get('jobs') or 0)}</td>"
             f"<td>{int(row.get('delivered') or 0)}</td>"
+            f"<td>{int(row.get('completed') or 0)}</td>"
             f"<td>{int(row.get('failed') or 0)}</td>"
+            f"<td>{int(row.get('skipped') or 0)}</td>"
             f"<td>{int(row.get('pending') or 0)}</td>"
             f"<td><b class='{sr_cls}'>{sr*100:.0f}%</b>"
             f"<div class='fn-bar'><span class='{sr_cls}' style='width:{sr*100:.0f}%'></span></div></td>"
+            f"<td>{int(row.get('maintenance') or 0)}(f{int(row.get('maintenance_failed') or 0)})</td>"
             f"<td>{int(row.get('heartbeat') or 0)}</td>"
             f"<td>{int(row.get('screen') or 0)}</td>"
             "</tr>"
         )
     metrics = "".join([
-        _render_metric("整体成功率 (投递/已结)", f"{summary['overall_success_rate']*100:.0f}%"),
+        _render_metric("整体成功率 (wake 投递+完成/已结)", f"{summary['overall_success_rate']*100:.0f}%"),
         _render_metric("最近一天成功率", f"{summary['latest_success_rate']*100:.0f}%"),
         _render_metric("最近一天", summary.get("latest_day") or "n/a"),
         _render_metric("总 jobs", summary["total_jobs"]),
-        _render_metric("投递 / 失败", f"{summary['total_delivered']} / {summary['total_failed']}"),
+        _render_metric("投递+完成 / 失败", f"{summary['total_delivered']}+{summary.get('total_completed', 0)} / {summary['total_failed']}"),
+        _render_metric("维护 / 失败", f"{summary.get('total_maintenance', 0)} / {summary.get('total_maintenance_failed', 0)}"),
     ])
     return f"""<!doctype html>
 <html>
@@ -2019,12 +2046,12 @@ def _render_proactive_daily_page(payload: dict) -> str:
   <div class="muted">Generated {html.escape(summary["generated_at"])}. 时区 {html.escape(summary["timezone"])}. 最近 {html.escape(str(summary["days_returned"]))} 天。</div>
   {_render_data_track_view_nav("proactive")}
   <section class="metrics">{metrics}</section>
-  <h2>每日主动消息成功率(心跳 vs 屏幕)</h2>
+  <h2>每日主动消息成功率(仅 wake lane)</h2>
   <div class="muted">{html.escape(definition.get("success_rate") or "")} {html.escape(definition.get("lanes") or "")}</div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
   <table>
-    <thead><tr><th>北京日</th><th>Jobs</th><th>投递</th><th>失败</th><th>Pending</th><th>成功率</th><th>心跳</th><th>屏幕</th></tr></thead>
-    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='8' class='muted'>此区间无 proactive job。</td></tr>"}</tbody>
+    <thead><tr><th>北京日</th><th>Jobs</th><th>投递</th><th>完成</th><th>失败</th><th>Skipped</th><th>Pending</th><th>成功率</th><th>维护(失败)</th><th>心跳</th><th>屏幕</th></tr></thead>
+    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='11' class='muted'>此区间无 proactive job。</td></tr>"}</tbody>
   </table>
 </main>
 </body>
@@ -2051,6 +2078,46 @@ def _debug_time(ts) -> str:
     except (TypeError, ValueError):
         value = 0
     return datetime.fromtimestamp(value).strftime("%H:%M:%S") if value else "—"
+
+
+# type → (icon, 友好中文步骤名). Makes a turn read as a narrative instead of
+# raw event-type strings. Unknown types fall back to a subsystem-based label.
+_DEBUG_STEP_LABELS = {
+    "route.decided": ("🧭", "路由决策"),
+    "context.build": ("📎", "组装上下文"),
+    "agent.model.call.start": ("🧠", "调用模型 · 开始"),
+    "agent.model.call.done": ("🧠", "调用模型 · 完成"),
+    "agent.tool.call": ("🔧", "调用工具"),
+    "agent.reasoning": ("💭", "思考 / reasoning"),
+    "agent.reply": ("💬", "AI 回复"),
+    "chat.response": ("📤", "写入回复"),
+    "chat.poll.delivered": ("✅", "投递到客户端"),
+    "enclave.call.start": ("🔐", "飞地调用 · 开始"),
+    "enclave.call.done": ("🔐", "飞地调用 · 完成"),
+    "memory.capture.queued": ("🧩", "记忆抓取 · 入队"),
+    "memory.capture.done": ("🧩", "记忆抓取 · 完成"),
+}
+_DEBUG_SUBSYSTEM_FALLBACK = {
+    "route": ("🧭", "路由"), "context": ("📎", "上下文"), "agent": ("🤖", "Agent"),
+    "memory": ("🧩", "记忆"), "genesis": ("🌱", "入驻蒸馏"), "enclave": ("🔐", "飞地"),
+    "chat": ("💬", "聊天"), "debug_trace": ("🔎", "trace"),
+}
+
+
+def _debug_friendly_step(ev: dict) -> tuple[str, str]:
+    typ = str(ev.get("type") or "")
+    # tool-call carries the tool name in detail.tool → surface it (before the map,
+    # which only has the generic "调用工具" label).
+    if typ == "agent.tool.call":
+        tool = str((ev.get("detail") or {}).get("tool") or "")
+        return ("🔧", f"调用工具 · {tool}" if tool else "调用工具")
+    if typ in _DEBUG_STEP_LABELS:
+        return _DEBUG_STEP_LABELS[typ]
+    icon, base = _DEBUG_SUBSYSTEM_FALLBACK.get(str(ev.get("subsystem") or ""), ("•", ""))
+    # for an unknown type, show the last dotted segment as a hint, e.g. foo.bar.baz→baz
+    tail = typ.split(".")[-1] if typ else ""
+    label = f"{base} · {tail}" if base and tail else (base or tail or "事件")
+    return (icon, label)
 
 
 def _render_data_track_debug_page(payload: dict) -> str:
@@ -2192,14 +2259,16 @@ def _render_data_track_debug_page(payload: dict) -> str:
         for ev in turn.get("rows") or []:
             ev_status = str(ev.get("status") or "")
             ev_cls = "bad" if ev_status in {"error", "failed"} else ("warn" if ev_status == "blocked" else "ok")
+            icon, step_label = _debug_friendly_step(ev)
             rows_html.append(
                 f"<div class='event-row' id='{html.escape(event_anchor(ev), quote=True)}'>"
-                f"<div class='event-meta'><span class='mono'>{html.escape(_debug_time(ev.get('ts')))}</span>"
-                f"{module_badge(str(ev.get('subsystem') or ''))}"
-                f"<span class='mono'>{html.escape(str(ev.get('type') or ''))}</span>"
+                f"<div class='step-head'><span class='step-icon'>{icon}</span>"
+                f"<span class='step-label'>{html.escape(step_label)}</span>"
                 f"<span class='pill {ev_cls}'>{html.escape(ev_status or 'ok')}</span>"
-                f"<span class='muted'>{html.escape(_debug_ms(ev.get('dur_ms')))}</span></div>"
-                f"<div>{html.escape(str(ev.get('explain') or ev.get('summary') or ''))}</div>"
+                f"<span class='muted mono step-time'>{html.escape(_debug_time(ev.get('ts')))}</span>"
+                f"<span class='muted'>{html.escape(_debug_ms(ev.get('dur_ms')))}</span>"
+                f"<span class='muted mono step-rawtype'>{html.escape(str(ev.get('type') or ''))}</span></div>"
+                f"<div class='step-explain'>{html.escape(str(ev.get('explain') or ev.get('summary') or ''))}</div>"
                 f"{event_actions(ev, include_open_turn=False)}"
                 f"{event_detail_block(ev)}"
                 "</div>"
@@ -2331,6 +2400,12 @@ def _render_data_track_debug_page(payload: dict) -> str:
     .mini-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:5px; padding:3px 7px; background:#fffdfa; color:var(--fg); font-size:12px; margin:4px 5px 0 0; cursor:pointer; }}
     .reveal-button {{ border-color:#d9b28c; color:#8a4a00; background:#fff8ed; }}
     .actions {{ display:flex; flex-wrap:wrap; gap:0; margin-top:5px; }}
+    .event-row {{ border-left:3px solid var(--line); padding:8px 0 8px 12px; margin:2px 0; }}
+    .step-head {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
+    .step-icon {{ font-size:15px; }}
+    .step-label {{ font-weight:600; font-size:14px; }}
+    .step-time {{ font-size:12px; }} .step-rawtype {{ font-size:11px; color:#b5aaa2; }}
+    .step-explain {{ color:var(--ink); margin:3px 0 0; font-size:13px; }}
     .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
     input,select {{ border:1px solid var(--line); border-radius:6px; padding:8px 9px; background:white; color:var(--fg); }}
     .field {{ display:flex; flex-direction:column; gap:4px; min-width:150px; }} .field label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }}
@@ -2416,6 +2491,372 @@ def _render_data_track_debug_page(payload: dict) -> str:
 </script>
 </body>
 </html>"""
+
+
+def _events_route_bucket(route) -> str:
+    """VPS/API split: model_api → API; resident/official_import/other → VPS."""
+    return "api" if str(route or "") == "model_api" else "vps"
+
+
+# Ordered category catalog for the event-health board.
+_EVENT_CATEGORIES = [
+    ("onboarding", "Onboarding（漏斗）"),
+    ("distill_first", "一次蒸馏"),
+    ("distill_second", "二次蒸馏"),
+    ("memory_org", "主动记忆整理"),
+    ("reply", "回复消息"),
+    ("heartbeat", "心跳"),
+    ("trigger", "主动触发"),
+    ("screen", "屏幕共享"),
+    ("other", "其他"),
+]
+
+
+def _data_track_events_payload() -> dict:
+    raw = db.admin_events_overview()
+
+    def blank():
+        return {"vps": _blank_evt_stat(), "api": _blank_evt_stat()}
+
+    cats = {key: {"label": label, **blank()} for key, label in _EVENT_CATEGORIES}
+
+    def add(key, route, total=0, success=0, failed=0, pending=0, median=None):
+        b = cats[key][_events_route_bucket(route)]
+        b["total"] += int(total or 0)
+        b["success"] += int(success or 0)
+        b["failed"] += int(failed or 0)
+        b["pending"] += int(pending or 0)
+        if median is not None:
+            b["median_dur"] = median  # db already medians per (route, category)
+
+    lane_key = {"heartbeat": "heartbeat", "trigger": "trigger", "screen": "screen", "other": "other"}
+    for row in raw.get("proactive", []):
+        add(lane_key.get(row.get("lane"), "other"), row.get("route"),
+            row.get("total"), row.get("success"), row.get("failed"), row.get("pending"), row.get("median_dur"))
+    for row in raw.get("capture", []):
+        add("memory_org", row.get("route"), row.get("total"), row.get("success"), row.get("failed"), 0, row.get("median_dur"))
+    for row in raw.get("genesis", []):
+        key = "distill_first" if row.get("distill") == "first" else "distill_second"
+        add(key, row.get("route"), row.get("total"), row.get("success"), row.get("failed"))
+    # reply is special: success = real replies / user messages; fallback rate tracked apart
+    reply = {"vps": {"user_msgs": 0, "real_replies": 0, "fallback_replies": 0, "median_latency": None},
+             "api": {"user_msgs": 0, "real_replies": 0, "fallback_replies": 0, "median_latency": None}}
+    for row in raw.get("reply", []):
+        b = reply[_events_route_bucket(row.get("route"))]
+        b["user_msgs"] += int(row.get("user_msgs") or 0)
+        b["real_replies"] += int(row.get("real_replies") or 0)
+        b["fallback_replies"] += int(row.get("fallback_replies") or 0)
+        if row.get("median_latency") is not None:
+            b["median_latency"] = row["median_latency"]  # one row per route from db
+    for bucket in ("vps", "api"):
+        rb = reply[bucket]
+        cats["reply"][bucket].update({
+            "total": rb["user_msgs"], "success": rb["real_replies"],
+            "failed": max(0, rb["user_msgs"] - rb["real_replies"]),
+            "fallback": rb["fallback_replies"],
+            "fallback_base": rb["real_replies"] + rb["fallback_replies"],
+            "median_latency": rb["median_latency"],
+        })
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "categories": [{"key": k, **cats[k]} for k, _ in _EVENT_CATEGORIES],
+        "note": "Onboarding 漏斗 + 回复延迟为下一阶段；本页先给 成功率/次数/中位耗时(job类)/兜底率，VPS·API 分列。",
+    }
+
+
+def _blank_evt_stat() -> dict:
+    return {"total": 0, "success": 0, "failed": 0, "pending": 0, "median_dur": None}
+
+
+def _evt_rate(b: dict) -> str:
+    resolved = int(b.get("success") or 0) + int(b.get("failed") or 0)
+    if resolved <= 0:
+        return "—"
+    return f"{(b['success'] / resolved) * 100:.0f}%"
+
+
+def _evt_dur(b: dict) -> str:
+    d = b.get("median_dur")
+    if d is None:
+        return "—"
+    d = float(d)
+    return f"{d:.1f}s" if d < 60 else f"{d/60:.1f}m"
+
+
+def _render_events_page(payload: dict) -> str:
+    cats = payload.get("categories", [])
+
+    def cell(b: dict, *, is_reply: bool) -> str:
+        total = int(b.get("total") or 0)
+        if total <= 0:
+            return "<td class='muted'>—</td>"
+        rate = _evt_rate(b)
+        rate_cls = ""
+        try:
+            rv = int(rate.rstrip("%"))
+            rate_cls = "ok" if rv >= 80 else ("warn" if rv >= 50 else "bad")
+        except ValueError:
+            rate_cls = ""
+        extra = ""
+        if is_reply:
+            fb = int(b.get("fallback") or 0)
+            base = int(b.get("fallback_base") or 0)
+            fb_pct = f"{(fb/base)*100:.0f}%" if base else "—"
+            lat = _evt_dur({"median_dur": b.get("median_latency")})
+            extra = f"<br><span class='muted'>兜底 {fb_pct} · 延迟 {lat}</span>"
+        else:
+            extra = f"<br><span class='muted'>{_evt_dur(b)}</span>"
+        return (f"<td><b class='{rate_cls}'>{rate}</b> <span class='muted'>·{total}</span>{extra}</td>")
+
+    rows = []
+    for c in cats:
+        is_reply = c["key"] == "reply"
+        is_onb = c["key"] == "onboarding"
+        if is_onb:
+            onb_href = _data_track_page_href(view="events", event="onboarding", offset=0)
+            rows.append(f"<tr><td><a href='{html.escape(onb_href, quote=True)}'>{html.escape(c['label'])}</a></td>"
+                        f"<td colspan='2'><a href='{html.escape(onb_href, quote=True)}'>打开漏斗(VPS/API 转化率+耗时) →</a></td></tr>")
+            continue
+        drill = _data_track_page_href(view="events", event=c["key"], offset=0)
+        rows.append(
+            f"<tr><td><a href='{html.escape(drill, quote=True)}'>{html.escape(c['label'])}</a></td>"
+            f"{cell(c['vps'], is_reply=is_reply)}{cell(c['api'], is_reply=is_reply)}</tr>"
+        )
+    body = "".join(rows)
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Feedling 事件健康度 · Data Track</title>
+<style>
+  :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
+  body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+  main {{ max-width:920px; margin:0 auto; padding:28px 24px 48px; }}
+  h1 {{ font-size:24px; margin:0 0 4px; }} h2 {{ font-size:15px; margin:24px 0 10px; }}
+  .muted {{ color:var(--muted); }} .ok {{ color:var(--ok); }} .warn {{ color:var(--warn); }} .bad {{ color:var(--bad); }}
+  .viewbar {{ display:flex; flex-wrap:wrap; gap:8px; margin:14px 0 18px; }}
+  .sort-button {{ display:inline-flex; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
+  .sort-button.active {{ border-color:var(--accent); color:var(--accent); background:#fff1ed; }}
+  a {{ color:var(--accent); text-decoration:none; }}
+  table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
+  th,td {{ text-align:left; padding:11px 14px; border-bottom:1px solid var(--line); vertical-align:top; }}
+  th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; background:#f4ece5; }}
+  tr:last-child td {{ border-bottom:0; }} b {{ font-size:15px; }}
+</style></head><body><main>
+  <h1>事件健康度</h1>
+  <div class="muted">每格 = 成功率 · 次数 / 中位耗时(job类)或兜底率(回复)。VPS=resident 自托管,API=model_api 托管。Generated {html.escape(str(payload.get('generated_at') or ''))}.</div>
+  {_render_data_track_view_nav("events")}
+  <div class="muted">{html.escape(str(payload.get('note') or ''))}</div>
+  <table>
+    <thead><tr><th>事件</th><th>VPS(自托管)</th><th>API(托管)</th></tr></thead>
+    <tbody>{body}</tbody>
+  </table>
+</main></body></html>"""
+
+
+_FUNNEL_MILESTONES = [("reg", "注册"), ("m1", "配置/上线"), ("m2", "内容就绪"), ("m3", "首次真回复")]
+_FUNNEL_SEGMENTS = [("s1", "注册 → 配置/上线"), ("s2", "配置 → 内容就绪"), ("s3", "内容 → 首回复")]
+
+
+def _funnel_median(vals: list):
+    xs = sorted(v for v in vals if v is not None)
+    if not xs:
+        return None
+    n = len(xs)
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def _funnel_dur(sec) -> str:
+    if sec is None:
+        return "—"
+    sec = float(sec)
+    if sec < 90:
+        return f"{sec:.0f}s"
+    if sec < 5400:
+        return f"{sec/60:.1f}m"
+    if sec < 172800:
+        return f"{sec/3600:.1f}h"
+    return f"{sec/86400:.1f}d"
+
+
+def _data_track_onboarding_funnel_payload() -> dict:
+    def blank():
+        return {"reg": 0, "m1": 0, "m2": 0, "m3": 0, "s1": [], "s2": [], "s3": [], "total": []}
+    buckets = {"vps": blank(), "api": blank()}
+    for r in db.admin_onboarding_funnel():
+        t0, t1, t2, t3 = r.get("t0"), r.get("t1"), r.get("t2"), r.get("t3")
+        if t0 is None:
+            continue
+        b = buckets["api" if str(r.get("route")) == "model_api" else "vps"]
+        b["reg"] += 1
+        if t1 is not None:
+            b["m1"] += 1
+        if t2 is not None:
+            b["m2"] += 1
+        if t3 is not None:
+            b["m3"] += 1
+        if t1 is not None and t1 >= t0:
+            b["s1"].append(t1 - t0)
+        if t1 is not None and t2 is not None and t2 >= t1:
+            b["s2"].append(t2 - t1)
+        if t2 is not None and t3 is not None and t3 >= t2:
+            b["s3"].append(t3 - t2)
+        if t3 is not None and t3 >= t0:
+            b["total"].append(t3 - t0)
+
+    def route_funnel(b):
+        reg = max(1, b["reg"])
+        return {
+            "registered": b["reg"],
+            "steps": [{"key": k, "label": lbl, "count": b[k], "pct": b[k] / reg} for k, lbl in _FUNNEL_MILESTONES],
+            "segments": [{"key": k, "label": lbl, "median": _funnel_median(b[k])} for k, lbl in _FUNNEL_SEGMENTS],
+            "total_median": _funnel_median(b["total"]),
+        }
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "vps": route_funnel(buckets["vps"]),
+        "api": route_funnel(buckets["api"]),
+        "api_key": db.admin_api_key_stats(),
+        "note": "里程碑:注册→配置/上线(API=开始入驻·有蒸馏job;VPS=consumer首活动[B])→内容就绪(API=一次蒸馏完成·VPS=首条记忆)→首次真回复[A]。转化率=到达÷注册;耗时=各段中位。API Key 验证单独统计(下)。",
+    }
+
+
+def _render_onboarding_funnel_page(payload: dict) -> str:
+    back = _data_track_page_href(view="events", event=None, offset=0)
+    ak = payload.get("api_key") or {}
+    ak_total = int(ak.get("total") or 0)
+    ak_passed = int(ak.get("passed") or 0)
+    ak_stuck = int(ak.get("stuck") or 0)
+    ak_pct = f"{(ak_passed/ak_total)*100:.0f}%" if ak_total else "—"
+    ak_cls = "ok" if (ak_total and ak_passed/ak_total >= 0.8) else ("warn" if ak_total else "muted")
+    apikey_html = (
+        "<section class='funnel-col' style='margin-top:16px'>"
+        "<h2>API Key 验证（服务端 test_status，非客户端埋点）</h2>"
+        f"<div class='fn-line'>通过率 <b class='{ak_cls}'>{ak_pct}</b> · "
+        f"通过 <b class='ok'>{ak_passed}</b> / 卡住 <b class='bad'>{ak_stuck}</b> / 共 {ak_total} 个配了 model_api 的用户</div>"
+        "<div class='muted' style='margin-top:4px'>「卡住」= 填了 provider/key 但 test_status 还不是 ok（key 没验通）。</div>"
+        "</section>"
+    )
+
+    def col(title: str, f: dict) -> str:
+        reg = int(f.get("registered") or 0)
+        steps = f.get("steps", [])
+        seg = {s["key"]: s for s in f.get("segments", [])}
+        seg_order = ["", "s1", "s2", "s3"]
+        rows = []
+        for i, st in enumerate(steps):
+            pct = st["pct"] * 100
+            cls = "ok" if pct >= 70 else ("warn" if pct >= 40 else "bad")
+            segk = seg_order[i]
+            seg_html = f"<div class='seg'>↓ {html.escape(_funnel_dur(seg[segk]['median']))}</div>" if segk and segk in seg else ""
+            rows.append(
+                f"{seg_html}<div class='step'><div class='fn-bar'><span class='{cls}' style='width:{pct:.0f}%'></span></div>"
+                f"<div class='fn-line'><b>{html.escape(st['label'])}</b> <span class='{cls}'>{st['count']} · {pct:.0f}%</span></div></div>"
+            )
+        total = _funnel_dur(f.get("total_median"))
+        return (f"<section class='funnel-col'><h2>{html.escape(title)} · 注册 {reg}</h2>{''.join(rows)}"
+                f"<div class='total'>注册→首回复 中位:<b>{html.escape(total)}</b></div></section>")
+
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Onboarding 漏斗 · Data Track</title>
+<style>
+  :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
+  body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+  main {{ max-width:900px; margin:0 auto; padding:28px 24px 48px; }}
+  h1 {{ font-size:22px; margin:0 0 4px; }} h2 {{ font-size:15px; margin:0 0 14px; }}
+  a {{ color:var(--accent); text-decoration:none; }} .muted {{ color:var(--muted); }} .ok {{ color:var(--ok); }} .warn {{ color:var(--warn); }} .bad {{ color:var(--bad); }}
+  .cols {{ display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-top:16px; }}
+  .funnel-col {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; }}
+  .step {{ margin:0 0 4px; }} .fn-bar {{ height:8px; background:#eee3d9; border-radius:4px; overflow:hidden; }}
+  .fn-bar span {{ display:block; height:100%; background:var(--accent); }}
+  .fn-bar span.ok {{ background:var(--ok); }} .fn-bar span.warn {{ background:var(--warn); }} .fn-bar span.bad {{ background:var(--bad); }}
+  .fn-line {{ font-size:13px; margin:3px 0 0; }} .seg {{ color:var(--muted); font-size:12px; margin:6px 0 6px 4px; }}
+  .total {{ margin-top:14px; padding-top:10px; border-top:1px solid var(--line); font-size:13px; color:var(--muted); }}
+</style></head><body><main>
+  <div><a href="{html.escape(back, quote=True)}">← 返回事件健康度</a></div>
+  <h1>Onboarding 漏斗</h1>
+  <div class="muted">{html.escape(str(payload.get('note') or ''))}</div>
+  <div class="cols">{col('VPS（自托管）', payload.get('vps', {}))}{col('API（托管）', payload.get('api', {}))}</div>
+  {apikey_html}
+  <div class="muted" style="margin-top:14px">Generated {html.escape(str(payload.get('generated_at') or ''))}.</div>
+</main></body></html>"""
+
+
+def _data_track_event_users_payload(category: str) -> dict:
+    label = dict(_EVENT_CATEGORIES).get(category, category)
+    is_reply = category == "reply"
+    users = []
+    for r in db.admin_events_by_user(category):
+        total = int(r.get("total") or 0)
+        if total <= 0:
+            continue
+        resolved = int(r.get("success") or 0) + int(r.get("failed") or 0)
+        rate = (int(r.get("success") or 0) / resolved) if resolved else 0.0
+        users.append({
+            "user_id": r.get("user_id"),
+            "route": "API" if str(r.get("route")) == "model_api" else "VPS",
+            "total": total, "success": int(r.get("success") or 0), "failed": int(r.get("failed") or 0),
+            "rate": rate, "fallback": r.get("fallback"), "fallback_base": r.get("fallback_base"),
+            "median_dur": r.get("median_dur"),
+            "last_at": core_util._epoch_to_iso(r.get("last_ts")) if r.get("last_ts") else "",
+        })
+    users.sort(key=lambda u: (u["rate"], -u["total"]))  # worst success-rate first
+    return {"generated_at": datetime.now().isoformat(), "category": category,
+            "label": label, "is_reply": is_reply, "users": users[:400]}
+
+
+def _render_event_users_page(payload: dict) -> str:
+    label = payload.get("label", "")
+    is_reply = payload.get("is_reply")
+    users = payload.get("users", [])
+    back = _data_track_page_href(view="events", event=None, offset=0)
+    rows = []
+    for u in users:
+        rate = f"{u['rate']*100:.0f}%"
+        cls = "ok" if u["rate"] >= 0.8 else ("warn" if u["rate"] >= 0.5 else "bad")
+        d = u.get("median_dur")
+        dur_s = "—" if d is None else (f"{float(d):.1f}s" if float(d) < 60 else f"{float(d)/60:.1f}m")
+        if is_reply:
+            fb = int(u.get("fallback") or 0)
+            base = int(u.get("fallback_base") or 0)
+            fb_pct = f"{(fb/base)*100:.0f}%" if base else "—"
+            extra = f"兜底 {fb_pct} · 延迟 {dur_s}"
+        else:
+            extra = dur_s
+        uhref = f"/admin/data-track/users/{quote(str(u['user_id']))}"
+        rows.append(
+            "<tr>"
+            f"<td><a href='{html.escape(uhref, quote=True)}'>{html.escape(str(u['user_id']))}</a></td>"
+            f"<td>{html.escape(u['route'])}</td>"
+            f"<td><b class='{cls}'>{rate}</b></td>"
+            f"<td>{u['total']} <span class='muted'>·{u['success']}✓/{u['failed']}✗</span></td>"
+            f"<td>{html.escape(extra)}</td>"
+            f"<td class='muted'>{html.escape(str(u.get('last_at') or ''))}</td>"
+            "</tr>"
+        )
+    body = "".join(rows) if rows else "<tr><td colspan='6' class='muted'>此事件暂无用户数据。</td></tr>"
+    metric3 = "兜底率·延迟" if is_reply else "中位耗时"
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(label)} · 按用户 · Data Track</title>
+<style>
+  :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; --ok:#1d7a4d; --warn:#a05a00; --bad:#b7352b; }}
+  body {{ margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+  main {{ max-width:1000px; margin:0 auto; padding:28px 24px 48px; }}
+  h1 {{ font-size:22px; margin:0 0 4px; }} .muted {{ color:var(--muted); }} .ok {{ color:var(--ok); }} .warn {{ color:var(--warn); }} .bad {{ color:var(--bad); }}
+  a {{ color:var(--accent); text-decoration:none; }}
+  table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); border-radius:8px; overflow:hidden; }}
+  th,td {{ text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); }}
+  th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; background:#f4ece5; }}
+  tr:last-child td {{ border-bottom:0; }}
+</style></head><body><main>
+  <div><a href="{html.escape(back, quote=True)}">← 返回事件健康度</a></div>
+  <h1>{html.escape(label)} · 按用户（最差成功率在前）</h1>
+  <div class="muted">点用户 id 看单用户详情。Generated {html.escape(str(payload.get('generated_at') or ''))}.</div>
+  <table>
+    <thead><tr><th>用户</th><th>类型</th><th>成功率</th><th>次数(✓/✗)</th><th>{metric3}</th><th>最近一次</th></tr></thead>
+    <tbody>{body}</tbody>
+  </table>
+</main></body></html>"""
 
 
 def _render_user_detail_page(user: dict) -> str:

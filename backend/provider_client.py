@@ -764,6 +764,71 @@ def _chat_completion_openai_responses(
     }
 
 
+# openai-compat 的 wire 编解码是 sync（_chat_completion_openai_compatible）与
+# async（chat_completion_async）共用的单实现：payload 构造、openrouter reasoning
+# 400/422 降级判定、响应解析都在下面三个纯函数里，两个调用方只各自保留
+# httpx sync/async 的 transport 差异。改契约改这里，两边自动同步。
+
+def _build_openai_compat_payload(
+    *,
+    provider: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    temperature: float,
+    max_tokens: int,
+    response_format: dict[str, Any] | None,
+    extra_body: dict[str, Any] | None,
+    include_reasoning: bool,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "temperature": temperature,
+        "max_tokens": max(1, min(int(max_tokens), 8192)),
+    }
+    if response_format:
+        payload["response_format"] = response_format
+    if extra_body:
+        payload.update(extra_body)
+    if include_reasoning and provider == "openrouter":
+        payload.setdefault("reasoning", {"enabled": True, "exclude": False})
+    return payload
+
+
+def _reasoning_fallback_payload(
+    payload: dict[str, Any], resp, *, provider: str, include_reasoning: bool,
+) -> dict[str, Any] | None:
+    """openrouter 对不支持 reasoning 的模型回 400/422：去掉 reasoning 重试一次。
+    不适用时返回 None（调用方原样 raise）。"""
+    if (include_reasoning and provider == "openrouter"
+            and resp.status_code in {400, 422} and "reasoning" in payload):
+        fallback = dict(payload)
+        fallback.pop("reasoning", None)
+        return fallback
+    return None
+
+
+def _parse_openai_compat_body(
+    resp, *, provider: str, model: str, require_reply: bool,
+) -> dict[str, Any]:
+    try:
+        body = resp.json()
+    except ValueError as e:
+        raise ProviderError("provider returned non-json response") from e
+    if not isinstance(body, dict):
+        raise ProviderError("provider returned non-object response")
+    return {
+        "reply": _extract_reply(body, required=require_reply),
+        "reasoning": _extract_openai_compatible_reasoning(body),
+        "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
+        "raw_id": body.get("id", ""),
+        "stop_reason": _extract_openai_compatible_stop_reason(body),
+        "provider": provider,
+        "model": model,
+    }
+
+
 def _chat_completion_openai_compatible(
     *,
     provider: str,
@@ -779,19 +844,11 @@ def _chat_completion_openai_compatible(
     require_reply: bool = True,
     include_reasoning: bool = False,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "stream": False,
-        "temperature": temperature,
-        "max_tokens": max(1, min(int(max_tokens), 8192)),
-    }
-    if response_format:
-        payload["response_format"] = response_format
-    if extra_body:
-        payload.update(extra_body)
-    if include_reasoning and provider == "openrouter":
-        payload.setdefault("reasoning", {"enabled": True, "exclude": False})
+    payload = _build_openai_compat_payload(
+        provider=provider, model=model, messages=messages,
+        temperature=temperature, max_tokens=max_tokens,
+        response_format=response_format, extra_body=extra_body,
+        include_reasoning=include_reasoning)
 
     def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
         try:
@@ -808,30 +865,15 @@ def _chat_completion_openai_compatible(
     try:
         _raise_for_provider_status(resp)
     except ProviderError:
-        if include_reasoning and provider == "openrouter" and resp.status_code in {400, 422} and "reasoning" in payload:
-            fallback_payload = dict(payload)
-            fallback_payload.pop("reasoning", None)
-            resp = post_with_payload(fallback_payload)
-            _raise_for_provider_status(resp)
-        else:
+        fallback_payload = _reasoning_fallback_payload(
+            payload, resp, provider=provider, include_reasoning=include_reasoning)
+        if fallback_payload is None:
             raise
+        resp = post_with_payload(fallback_payload)
+        _raise_for_provider_status(resp)
 
-    try:
-        body = resp.json()
-    except ValueError as e:
-        raise ProviderError("provider returned non-json response") from e
-    if not isinstance(body, dict):
-        raise ProviderError("provider returned non-object response")
-
-    return {
-        "reply": _extract_reply(body, required=require_reply),
-        "reasoning": _extract_openai_compatible_reasoning(body),
-        "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
-        "raw_id": body.get("id", ""),
-        "stop_reason": _extract_openai_compatible_stop_reason(body),
-        "provider": provider,
-        "model": model,
-    }
+    return _parse_openai_compat_body(
+        resp, provider=provider, model=model, require_reply=require_reply)
 
 
 def _chat_completion_anthropic(
@@ -1165,22 +1207,17 @@ async def chat_completion_async(
             include_reasoning=include_reasoning,
         ))
 
-    # 以下为 _chat_completion_openai_compatible 的 async 镜像（含 openrouter
-    # reasoning 400/422 降级重试）。改同步版时必须同步改这里 —— 两处有同一个
-    # payload/降级契约。
-    payload: dict[str, Any] = {
-        "model": request_model,
-        "messages": messages,
-        "stream": False,
-        "temperature": temperature,
-        "max_tokens": max(1, min(int(max_tokens), 8192)),
-    }
-    if response_format:
-        payload["response_format"] = response_format
-    if extra_body:
-        payload.update(extra_body)
-    if include_reasoning and provider == "openrouter":
-        payload.setdefault("reasoning", {"enabled": True, "exclude": False})
+    # openai-compat 编解码与同步版共享单实现（_build/_reasoning_fallback/
+    # _parse 三个纯函数），这里只保留 async transport。
+    # NOTE: model 传 request_model（runtime 映射后真正上 wire 的模型，如
+    # deepseek-chat -> deepseek-v4-flash）——与同步 chat_completion 调
+    # _chat_completion_openai_compatible 时的取值一致，返回 dict 的 "model"
+    # 因此是映射值而非 config.model。
+    payload = _build_openai_compat_payload(
+        provider=provider, model=request_model, messages=messages,
+        temperature=temperature, max_tokens=max_tokens,
+        response_format=response_format, extra_body=extra_body,
+        include_reasoning=include_reasoning)
 
     async def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
         try:
@@ -1197,34 +1234,12 @@ async def chat_completion_async(
     try:
         _raise_for_provider_status(resp)
     except ProviderError:
-        if (include_reasoning and provider == "openrouter"
-                and resp.status_code in {400, 422} and "reasoning" in payload):
-            fallback_payload = dict(payload)
-            fallback_payload.pop("reasoning", None)
-            resp = await post_with_payload(fallback_payload)
-            _raise_for_provider_status(resp)
-        else:
+        fallback_payload = _reasoning_fallback_payload(
+            payload, resp, provider=provider, include_reasoning=include_reasoning)
+        if fallback_payload is None:
             raise
+        resp = await post_with_payload(fallback_payload)
+        _raise_for_provider_status(resp)
 
-    try:
-        body = resp.json()
-    except ValueError as e:
-        raise ProviderError("provider returned non-json response") from e
-    if not isinstance(body, dict):
-        raise ProviderError("provider returned non-object response")
-
-    return {
-        "reply": _extract_reply(body, required=require_reply),
-        "reasoning": _extract_openai_compatible_reasoning(body),
-        "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
-        "raw_id": body.get("id", ""),
-        "stop_reason": _extract_openai_compatible_stop_reason(body),
-        "provider": provider,
-        # NOTE: sync `_chat_completion_openai_compatible` is called by
-        # `chat_completion` with `model=request_model` (the runtime-mapped
-        # model actually sent on the wire — e.g. deepseek-chat ->
-        # deepseek-v4-flash, or an openrouter legacy alias), and its returned
-        # dict's "model" key is therefore that mapped value, not the
-        # caller-facing config.model. Mirror that exactly here.
-        "model": request_model,
-    }
+    return _parse_openai_compat_body(
+        resp, provider=provider, model=request_model, require_reply=require_reply)

@@ -1,6 +1,7 @@
 """Cheap context fields for every agent wake.
 
-app.py splices snapshot_for_wake(user_id) into the per-turn context_payload so
+hosted/context.py splices snapshot_for_wake(user_id) into the per-turn
+context_payload so
 the agent always has the user's coarse current state (place_label, motion,
 battery, user_state, etc.) without spending a tool call. Unauthorized/stale
 fields are null — the agent treats null as "not permitted, don't infer."

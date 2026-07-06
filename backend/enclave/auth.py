@@ -66,6 +66,9 @@ def local_user_id_from_token(runtime_token: str) -> str | None:
 WHOAMI_CACHE_TTL = 30.0
 _whoami_cache: dict[str, tuple[float, dict]] = {}
 _whoami_inflight: dict[str, asyncio.Future] = {}
+# 领跑者失败时喂给等待者的哨兵：等待者见到它就回到循环头各自重试，
+# 而不是收到领跑者的异常（旧线程版：leader 失败不连坐 waiter）。
+_FLIGHT_FAILED = object()
 
 
 def reset_cache() -> None:
@@ -109,10 +112,20 @@ async def whoami_cached(ctx: AuthContext) -> dict:
     # 不会把 loop 引用留过一次 flight。
     loop = asyncio.get_running_loop()
     key = (loop, h)
-    inflight = _whoami_inflight.get(key)
-    if inflight is not None:
-        # shield：等待者被取消不连坐领跑者的 flight
-        return await asyncio.shield(inflight)
+    while True:
+        inflight = _whoami_inflight.get(key)
+        if inflight is None:
+            break  # 无人在飞 → 竞选为领跑者
+        # shield：等待者被取消不连坐领跑者的 flight。领跑者失败时 future 携带
+        # 哨兵而非异常，所以这里的 CancelledError 只可能是等待者自身被取消。
+        outcome = await asyncio.shield(inflight)
+        if outcome is not _FLIGHT_FAILED:
+            return outcome
+        # 领跑者倒下 → 重查缓存后各自重试（旧线程版 waiter 在 per-key 锁上
+        # 排队醒来的语义：串行地一个个重试，首个成功者回填缓存供其余复用）
+        hit = _whoami_cache.get(h)
+        if hit is not None and time.monotonic() - hit[0] < WHOAMI_CACHE_TTL:
+            return hit[1]
 
     fut: asyncio.Future = loop.create_future()
     _whoami_inflight[key] = fut
@@ -125,9 +138,11 @@ async def whoami_cached(ctx: AuthContext) -> dict:
             _prune_whoami_cache(now)
         fut.set_result(whoami)
         return whoami
-    except BaseException as e:  # 含 CancelledError：领跑者倒下要放行等待者
-        fut.set_exception(e)
-        fut.exception()  # 标记已取，无等待者时不在 GC 期刷警告
+    except BaseException:  # 含 CancelledError：领跑者倒下要放行等待者
+        # 异常只留给领跑者自己；等待者收哨兵后各自独立重试。直接广播异常会把
+        # 一次瞬时错误整批扇出（history import 同凭证并发全 502），且
+        # CancelledError 会逃出路由层只捕 httpx 的 except 变成 500。
+        fut.set_result(_FLIGHT_FAILED)
         raise
     finally:
         if _whoami_inflight.get(key) is fut:

@@ -1,6 +1,6 @@
 """quantitative perception history: perception_daily rollup table
 
-Tier 2 of PERCEPTION_HISTORY_SPEC — one structured summary-stats doc per
+Tier 2 of the perception-history spec (docs/PERCEPTION_HISTORY_SPEC, since removed — see git history) — one structured summary-stats doc per
 (user, device-local date, signal). The incremental daily aggregation
 (backend/perception/history.py) folds each report into the day's row so the
 agent can finally sense change-vs-baseline ("RHR up ~14% vs your 30d median")

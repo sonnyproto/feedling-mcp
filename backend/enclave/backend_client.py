@@ -20,7 +20,12 @@ def get_async_client() -> httpx.AsyncClient:
     global _client
     if _client is None or _client.is_closed:
         _client = httpx.AsyncClient(
-            timeout=15,
+            # pool=None：池满时排队等空位而不是 15s 后抛 PoolTimeout。旧
+            # gthread 模型 32 线程既是并发上限也是隐式准入闸（多余请求排队
+            # 不报错）；ASGI 后准入闸是 limit_concurrency=2048，若池获取带
+            # 超时，>100 并发的突发（history import fan-out 等）会整批 502
+            # backend_unreachable。排队上限由 limit_concurrency 兜底。
+            timeout=httpx.Timeout(15, pool=None),
             limits=httpx.Limits(
                 max_keepalive_connections=20,
                 max_connections=100,

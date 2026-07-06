@@ -17,7 +17,7 @@ tokens defined at the bottom of `DESIGN.md`.
 1. `docs/CHANGELOG.md` — landmark diffs from recent sessions; this is
    the source of truth for "what shipped, when, why."
 2. `CONTRIBUTING.md` — backend code-organization rules (where new code
-   goes, dependency direction, app.py is assembly-only). Read before
+   goes, dependency direction, asgi_app.py is assembly-only). Read before
    writing ANY backend code; PRs are reviewed against it.
 3. `DESIGN.md` — if doing any UI work.
 4. `deploy/DEPLOYMENTS.md` — if doing any enclave/CVM/on-chain work.
@@ -63,7 +63,7 @@ needed for doc updates).
 
 When iterating on agent behavior (e.g. tightening the bootstrap rules)
 that is also documented in skill.md, update **both**:
-1. The relevant code in this repo (mcp_server.py / app.py / etc.)
+1. The relevant code in this repo (asgi_app.py / the relevant *_core.py / etc.)
 2. `skill.md` in the io-onboarding repo
 
 If the user says "update the skill" without specifying, they mean the

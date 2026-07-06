@@ -10,7 +10,8 @@ local long-poll waiters and refreshes that user's cached store in place.
 Layering (see CONTRIBUTING §2): ``db.py`` owns the SQL primitives
 (``pg_notify`` / ``listen_connection``) and stays business-free; this module
 (core) owns the payload + dispatch. Targets core may not import upward (e.g. the
-accounts registry reload) are wired in via ``register_handler`` from app.py.
+accounts registry reload) are wired in via ``register_handler`` from
+asgi/lifespan.py.
 
 No storm: the listener only acts on notifies whose origin worker is *not* us, so
 the ``_evict_store`` it triggers (which itself wakes local waiters) never feeds
@@ -45,8 +46,8 @@ WORKER_ID = uuid.uuid4().hex
 _STORE_CHANNELS = frozenset({"chat", "proactive", "frames", "blob"})
 
 # Extra per-channel handlers injected by the assembly layer for targets core may
-# not import upward (channel -> [fn(user_id)]). E.g. app.py wires the accounts
-# registry reload onto the "users" channel.
+# not import upward (channel -> [fn(user_id)]). E.g. asgi/lifespan.py wires the
+# accounts registry reload onto the "users" channel.
 _extra_handlers: dict[str, list[Callable[[str], None]]] = {}
 
 _RECONNECT_DELAY_SEC = 5.0
@@ -60,7 +61,7 @@ def _enabled() -> bool:
 
 def register_handler(channel: str, fn: Callable[[str], None]) -> None:
     """Wire an extra handler for ``channel`` (called with the notify's user_id).
-    Used by app.py to attach upward targets the core layer can't import."""
+    Used by asgi/lifespan.py to attach upward targets the core layer can't import."""
     _extra_handlers.setdefault(channel, []).append(fn)
 
 
@@ -125,7 +126,8 @@ def _listen_loop() -> None:
 
 def start_listener() -> None:
     """Start this worker's wake-bus listener (one daemon thread per worker).
-    Idempotent. Called from the app.py assembly section, like screen_ws.start."""
+    Idempotent. Called from asgi/lifespan.py at startup (which also wires
+    screen_ws.start via the WS leader election)."""
     global _listener_started
     if not _enabled():
         return

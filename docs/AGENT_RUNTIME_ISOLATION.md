@@ -44,15 +44,17 @@ isolation where the threat model demands it.
 2. **Volume lifecycle.** Create/reuse `feedling-agent-vol-<uid>`; decide GC on
    long-idle users.
 3. **Docker socket exposure.** The supervisor needs the Docker socket to spawn
-   containers. Do **not** give it to the Flask backend (plan non-goal). Scope it
+   containers. Do **not** give it to the backend (plan non-goal). Scope it
    to the agent-runner service only, and review the TDX/Phala implications of a
    docker-in-CVM or sibling-container model before enabling in prod.
 4. **Image + secret delivery.** Per-user containers run
-   `consumer_main.py` (single user), not a nested supervisor. Provider keys and
-   the runtime token flow via env reference from the supervisor's environment.
+   `tools/chat_resident_consumer.py` (single user; see
+   `agent_runtime/spawners.py:build_container_argv`), not a nested supervisor.
+   Provider keys and the runtime token flow via env reference from the
+   supervisor's environment.
 
 ## Non-goals (unchanged from the plan)
 
 - Not the default: most users run the `process` strategy.
-- The Flask backend never gets the Docker socket.
+- The backend never gets the Docker socket.
 - No long-term provider keys on disk in either strategy.

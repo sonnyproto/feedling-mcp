@@ -366,9 +366,16 @@ agent 用 JSON 应答：`{"messages":["…"]}`（说话）或
 平台只递话；这条路里用户给的只是一个裸模型接口，**人格、记忆、规则
 全靠平台每轮重新"装进"提示词**。所以这条路的核心就是提示词工程。
 
+> **现状标注（2026-07）**：本节描述的是 legacy inline 托管路
+> （`hosted_runtime.py` + `model_api_runtime/`），**现已不是主路、仅作
+> fallback**。托管聊天主路是 agent-runner（`backend/agent_runtime/`，
+> 每用户一个 claude/codex driver 的 CLI agent 进程），见
+> `docs/HOSTED_MODEL_API_RETIREMENT_ROADMAP.zh.md`。以下内容勿当现行
+> 主路读。
+
 ### 3.1 一条消息的完整旅程（逐步）
 
-入口：iOS `POST /v1/model_api/chat/send`（`backend/app.py`）。
+入口：iOS `POST /v1/model_api/chat/send`（`backend/hosted/chat_routes_asgi.py`）。
 
 1. **验证与立即加密**：校验消息（≤12,000 字符）、解析可选图片；用户
    消息**先封信封落库**（`_build_shared_envelope_for_store()`），明文

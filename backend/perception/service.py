@@ -11,8 +11,9 @@ All the generic machinery driven by catalog.py:
     only when the V2 ingress rollout flag is enabled.
   - generic collection ingest/read kept for legacy Tier 2 health clients.
 
-No business logic lives in app.py. The only app.py coupling is a lazy import in
-_fire_wake_event_v2() to enqueue a compatibility proactive job during cutover.
+No business logic lives in the assembly layer. The only upward coupling is a
+lazy import in _fire_wake_event_v2() (core.store / proactive.service) to
+enqueue a compatibility proactive job during cutover.
 """
 from __future__ import annotations
 
@@ -565,7 +566,7 @@ def _app_proactive_settings(user_id: str) -> dict:
 
 def _wake_block_reason(user_id: str) -> str:
     """Mechanical gate for AUTOMATIC perception wakes, mirroring the tick
-    path's enabled/dnd/away suppression (app.py
+    path's enabled/dnd/away suppression (proactive/gate.py
     _build_proactive_v2_wake_decision). Perception wakes are all automatic —
     manual summons go through the tick path — so there is no manual bypass.
     Away is honored from EITHER source: the app proactive settings (iOS
@@ -626,7 +627,12 @@ def _submit_wake_event_v2_compat(event) -> None:
     from proactive.controls_v2 import evaluate_wake_control_v2  # lazy
 
     settings = _settings_v2_for_user(event.user_id)
-    decision = evaluate_wake_control_v2(event.source, manual=event.manual, settings=settings)
+    decision = evaluate_wake_control_v2(
+        event.source,
+        trigger=event.trigger,
+        manual=event.manual,
+        settings=settings,
+    )
     now = float(event.created_at or _now())
     if not event.manual and not _proactive_activation_ready(event.user_id):
         store.append_event(event.user_id, {

@@ -436,8 +436,10 @@ def _parse_wrapped_history_content(content: str, warnings: list[str]) -> tuple[b
             try:
                 parsed = _parse_json_history(body)
             except Exception as e:
-                warnings.append(f"wrapped_json_parse_failed:{filename[:120]}:{type(e).__name__}")
-                continue
+                parsed = _parse_plaintext_history(body)
+                if not parsed:
+                    warnings.append(f"wrapped_json_parse_failed:{filename[:120]}:{type(e).__name__}")
+                    continue
         else:
             parsed = _parse_plaintext_history(body)
         for msg in parsed:
@@ -3236,4 +3238,3 @@ def _start_history_import_job(
     )
     thread.start()
     return True
-

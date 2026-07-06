@@ -6,10 +6,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 
 import anyio.to_thread
-import httpx
 from fastapi import APIRouter
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -18,7 +18,9 @@ from context_memory_selection import (
     select_context_memories,
     select_context_memories_with_trace,
 )
-from enclave import auth, backend_client, envelope, keys, readside, state
+from enclave import auth, backend_client, envelope, readside, state
+from enclave.routes._errors import backend_call_or_error, content_sk_or_503
+from enclave.routes._json import json_response_offthread
 
 router = APIRouter()
 
@@ -150,7 +152,9 @@ def _build_context_memories(moments, decrypted, query_args):
     return context_memories, context_memory_trace
 
 
-@router.get("/v1/chat/history")
+# HEAD 显式声明（同 frames.py）：Flask 自动给 GET 挂 HEAD，FastAPI 不会；
+# 体由外层 HeadBodyStripMiddleware 剥掉。
+@router.api_route("/v1/chat/history", methods=["GET", "HEAD"])
 async def v1_chat_history(request: Request):
     ctx = auth.extract_auth(request)
     user_id, error = await auth.resolve_read_caller(ctx)
@@ -160,38 +164,28 @@ async def v1_chat_history(request: Request):
 
     since = request.query_params.get("since", "0")
     limit = request.query_params.get("limit", "200")
-    try:
-        hist = await backend_client.backend_get(
+    hist, err_response = await backend_call_or_error(
+        backend_client.backend_get(
             "/v1/chat/history", ctx.forward_headers,
-            params={"since": since, "limit": limit})
-    except httpx.HTTPStatusError as e:
-        # whoami may have been cached, so a key revoked since then surfaces here;
-        # keep it a 401, not a generic 502.
-        if e.response.status_code == 401:
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-        return JSONResponse({"error": f"backend_error: {e}"}, status_code=502)
-    except httpx.HTTPError as e:
-        return JSONResponse({"error": f"backend_error: {e}"}, status_code=502)
+            params={"since": since, "limit": limit}))
+    if err_response is not None:
+        return err_response
 
     # Reconstruct content_sk here — we cached only the pubkey on boot, the
     # privkey is always in-memory under state but we didn't store it.
-    try:
-        content_sk = await keys.get_content_sk()
-    except Exception as e:
-        # The only runtime dstack round-trip. A socket hiccup deriving the
-        # content key is a transient infra failure, not an enclave bug — return
-        # a retryable 503 rather than a bare 500 the consumer can't interpret.
-        return JSONResponse(
-            {"error": f"key_derivation_unavailable: {e}"}, status_code=503)
-
-    decrypted, errors = await anyio.to_thread.run_sync(
-        _decrypt_history_items, hist.get("messages", []), user_id, content_sk)
+    content_sk, err_response = await content_sk_or_503()
+    if err_response is not None:
+        return err_response
 
     # Attach context_memories — up to 8 plaintext memory cards selected
     # for this conversation moment. Best-effort: if anything fails, return
-    # the chat response without them rather than 500-ing (旧 L1548-1587).
+    # the chat response without them rather than 500-ing (旧 L1548-1587)。
+    # /v1/memory/list 拉取不依赖 history 解密结果，在解密进 to_thread 之前
+    # 先发起，与解密并行——省掉旧同步实现每请求串行多付的一次 backend RTT。
     context_memories: list = []
     context_memory_trace: dict | None = None
+    listing_task: asyncio.Task | None = None
+    query_args: dict | None = None
     try:
         context_mode = str(
             request.query_params.get("context_mode")
@@ -212,10 +206,6 @@ async def v1_chat_history(request: Request):
         memory_limit = (
             readside.memory_readside_model_api_limit() if use_readside else 200
         )
-        listing = await backend_client.backend_get(
-            "/v1/memory/list", ctx.forward_headers,
-            params={"limit": str(memory_limit)})
-        moments = listing.get("moments", []) or []
         query_args = {
             "context_mode": context_mode,
             "want_trace": want_trace,
@@ -223,11 +213,29 @@ async def v1_chat_history(request: Request):
             "authorized_user_id": user_id,
             "content_sk": content_sk,
         }
-        context_memories, context_memory_trace = await anyio.to_thread.run_sync(
-            _build_context_memories, moments, decrypted, query_args)
+        listing_task = asyncio.create_task(backend_client.backend_get(
+            "/v1/memory/list", ctx.forward_headers,
+            params={"limit": str(memory_limit)}))
     except Exception as e:
         print(f"[chat/history:{user_id}] context_memories failed: {e}")
-        context_memories, context_memory_trace = [], None
+
+    try:
+        decrypted, errors = await anyio.to_thread.run_sync(
+            _decrypt_history_items, hist.get("messages", []), user_id, content_sk)
+    except BaseException:
+        if listing_task is not None:
+            listing_task.cancel()  # 解密意外失败时不留孤儿任务
+        raise
+
+    if listing_task is not None:
+        try:
+            listing = await listing_task
+            moments = listing.get("moments", []) or []
+            context_memories, context_memory_trace = await anyio.to_thread.run_sync(
+                _build_context_memories, moments, decrypted, query_args)
+        except Exception as e:
+            print(f"[chat/history:{user_id}] context_memories failed: {e}")
+            context_memories, context_memory_trace = [], None
 
     payload = {
         "user_id": user_id,
@@ -238,4 +246,5 @@ async def v1_chat_history(request: Request):
     }
     if context_memory_trace is not None:
         payload["context_memory_trace"] = context_memory_trace
-    return JSONResponse(payload)
+    # 图片聊天史 payload 可达数 MB（image_b64）——json.dumps 离事件循环
+    return await json_response_offthread(payload)

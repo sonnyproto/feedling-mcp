@@ -51,7 +51,7 @@ Before you start:
 ssh <user>@<host> "git clone https://github.com/teleport-computer/feedling-mcp ~/feedling-mcp"
 ```
 
-**Verify:** `ssh <user>@<host> "ls ~/feedling-mcp/backend/app.py"` prints the path.
+**Verify:** `ssh <user>@<host> "ls ~/feedling-mcp/backend/asgi_app.py"` prints the path.
 
 ---
 
@@ -209,7 +209,7 @@ Ask the user to:
 2. Send a chat message in the app. Watch
    `~/feedling-data/<user_id>/chat.json` grow.
 3. Wait for the agent to reply through the resident consumer or a verified
-   always-on MCP runtime. The reply should appear in iOS within ~30 seconds.
+   always-on agent runtime. The reply should appear in iOS within ~30 seconds.
 
 If the reply never arrives, see **Troubleshooting** below.
 
@@ -219,8 +219,8 @@ If the reply never arrives, see **Troubleshooting** below.
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| iOS chat sends but never gets reply | No agent is connected — neither MCP nor chat-resident is running | Run `python tools/check_chat_pipeline.py` against your URL; it will tell you which layer is missing |
-| 401 `user_not_found` (cloud users will see this too) | User just ran Delete Account & Reset; agent is pinned to the dead key | iOS Settings → Storage → copy new MCP String → re-import into the agent runtime |
+| iOS chat sends but never gets reply | No agent is connected — no agent runtime / chat-resident is running | Run `python tools/check_chat_pipeline.py` against your URL; it will tell you which layer is missing |
+| 401 `user_not_found` (cloud users will see this too) | User just ran Delete Account & Reset; agent is pinned to the dead key | iOS Settings → Storage → copy the new connection string → re-import into the agent runtime |
 | Live Activity never updates | `.p8` key missing or `APNS_SANDBOX=False` on a TestFlight build | Place `AuthKey_<KEY_ID>.p8` in `~/feedling-data/`; flip `APNS_SANDBOX` for App Store builds |
 | Frames not arriving via WebSocket | Port 9998 blocked or WS auth failing | Open port 9998 in the VPS firewall; the broadcast extension forwards the api_key as a Bearer token |
 | `chat-resident` logs "no plaintext content" for every user message | `FEEDLING_ENCLAVE_URL` is not configured | Set it in `~/feedling-chat-resident.env`. See `tools/README.md`. |

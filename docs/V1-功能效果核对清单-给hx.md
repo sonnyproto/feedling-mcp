@@ -1,11 +1,12 @@
 # V1 功能 · 预期效果核对清单(给 hx,除迁移)
 
-> 按 **v1 功能本身**组织(跟 Codex 那份 `V1_TEST_FOR_CODEX.md` 一一对应)。
+> 按 **v1 功能本身**组织(原与 Codex 那份 `V1_TEST_FOR_CODEX.md` 一一对应;该文件已删,历史在 git log 里)。
 > 每条:**【功能】这功能该干什么 → 【怎么触发】→【✅预期效果/成功标准】→【❌坏了长这样】**。
 > 这不是"点哪个按钮",是"这个 v1 功能跑出来对不对"。老卡迁移单独一份、最后核。
 
 > 📊 **客观验证(别只凭感觉)**:DebugTool 里开 **"v1 flow trace"** 开关 → 走流程 → 进 **"查看 v1 flow trace"** 面板,看有没有出现下面带 📊 的事件 = 链路客观跑过。
 > **开关就是闸,翻开即用,不用改任何后端 env / 不用重新部署。**(只有当 prod 被 `FEEDLING_V1_FLOW_TRACE=0` 硬关时面板才提示。)当前 M0 只埋了 **route / genesis / memory** 三组,voice/proactive 等暂时还是行为观测(后续补埋)。
+> (更新:M1 debug console 已 ship,埋点已比 M0 更全;以 app 内 debug console 实际展示为准。)
 
 ---
 
