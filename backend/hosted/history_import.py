@@ -70,6 +70,7 @@ def _history_job_kind(job_id: str) -> str:
 
 
 HISTORY_IMPORT_STALE_SEC = int(os.environ.get("FEEDLING_HISTORY_IMPORT_STALE_SEC", str(30 * 60)))
+GENESIS_PROVIDER_DERIVE_TIMEOUT_SEC = 120.0
 _HISTORY_IMPORT_PHASES = {
     "upload_received": (5, "Upload received"),
     "parsing_materials": (15, "Reading materials"),
@@ -2711,7 +2712,7 @@ def _derive_identity_with_provider(
         f"\n\nMemory cards:\n{memory_sample}\n\nTranscript sample:\n{transcript}"
     )
     try:
-        result = provider_client.chat_completion(
+        result = provider_client.reliable_chat_completion(
             provider,
             [
                 {"role": "system", "content": "You write concise, grounded Feedling identity JSON."},
@@ -2719,7 +2720,7 @@ def _derive_identity_with_provider(
             ],
             max_tokens=1800,
             temperature=0.3,
-            timeout=45.0,
+            timeout=GENESIS_PROVIDER_DERIVE_TIMEOUT_SEC,
         )
         identity = _normalize_identity_payload(core_util._json_from_model_text(result["reply"]), memory_cards, days, language)
         if not has_ai_persona and not has_assistant_history and not has_ai_memory:
@@ -2832,7 +2833,7 @@ def _generate_model_api_onboarding_greeting(
         + _transcript_sample(messages, max_chars=8000)
     )
     try:
-        result = provider_client.chat_completion(
+        result = provider_client.reliable_chat_completion(
             provider,
             [
                 {"role": "system", "content": "You are the user's IO companion writing one natural first message."},
@@ -2840,7 +2841,7 @@ def _generate_model_api_onboarding_greeting(
             ],
             max_tokens=320,
             temperature=0.7,
-            timeout=45.0,
+            timeout=GENESIS_PROVIDER_DERIVE_TIMEOUT_SEC,
         )
     except Exception as e:
         warnings.append(f"provider_onboarding_greeting_failed:{type(e).__name__}:{str(e)[:160]}")
