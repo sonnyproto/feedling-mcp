@@ -6345,6 +6345,30 @@ def _process_resident_jobs(jobs: list) -> float:
     )
 
 
+def _quoted_memory_context(msg: dict) -> str:
+    """Render user-selected memories (Garden「talk in chat」) as an explicit
+    context block so the agent reliably sees the memory the user referenced —
+    no dependency on the agent choosing to look it up. The enclave attaches the
+    decrypted cards under ``quoted_memories``; returns "" when there are none.
+    Shared by hosted and VPS resident replies (same consumer)."""
+    quoted = msg.get("quoted_memories")
+    if not isinstance(quoted, list) or not quoted:
+        return ""
+    lines: list[str] = []
+    for card in quoted:
+        if not isinstance(card, dict):
+            continue
+        text = str(card.get("text") or card.get("title") or "").strip()
+        if not text:
+            continue
+        mtype = str(card.get("type") or "").strip()
+        prefix = f"[{mtype}] " if mtype else ""
+        lines.append(f"- {prefix}{text}")
+    if not lines:
+        return ""
+    return "The user is referring to this memory from their Garden:\n" + "\n".join(lines)
+
+
 def _process_messages(messages: list) -> float:
     """Process a batch of messages, return the highest timestamp seen."""
     latest = 0.0
@@ -6486,6 +6510,18 @@ def _process_messages(messages: list) -> float:
         worldbook_text = _worldbook_context_for_foreground(content)
         if worldbook_text:
             content = f"World book context:\n{worldbook_text}\n\n{content}"
+
+        # Inject any memory the user explicitly referenced for this turn
+        # (Garden「talk in chat」). The enclave already expanded the id into the
+        # decrypted card on this message, so the agent sees the full memory text
+        # without a lookup round-trip. Sits right above the user's message.
+        quoted_text = _quoted_memory_context(msg)
+        if quoted_text:
+            content = f"{quoted_text}\n\n{content}"
+            log.info(
+                "attached %d quoted memor(ies) to agent message ts=%.3f",
+                len(msg.get("quoted_memories") or []), ts,
+            )
 
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
