@@ -1585,6 +1585,73 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
     return out
 
 
+def genesis_resident_heartbeat(user_id: str, job_id: str, *, consumer_id: str) -> bool:
+    """Renew a resident job's lease. Only the owning consumer (claimed it, still
+    processing) may heartbeat — this is what keeps genesis_reap_stale_resident_jobs
+    from re-queueing a job whose consumer is alive and grinding. Returns True if renewed."""
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE genesis_import_jobs SET
+                resident_heartbeat_at = now(),
+                updated_at = now()
+            WHERE user_id = %s AND job_id = %s
+              AND status = 'processing' AND resident_consumer_id = %s
+            """,
+            (user_id, job_id, consumer_id),
+        )
+        return cur.rowcount > 0
+
+
+def genesis_reap_stale_resident_jobs(
+    older_than_sec: int, *, max_attempts: int, error: str, limit: int = 50
+) -> list[dict]:
+    """Recover resident jobs whose consumer died mid-distill (processing, resident-owned,
+    heartbeat older than the lease). Under the attempt cap → re-queue to awaiting_resident
+    (another consumer re-claims, resident_attempts keeps accumulating across re-queues);
+    at/over the cap → fail. Atomic (FOR UPDATE SKIP LOCKED) so a live consumer that just
+    heartbeated is not touched. Returns the rows changed so the caller can sync state."""
+    safe_sec = max(60, int(older_than_sec or 0))
+    safe_limit = max(1, min(int(limit or 1), 200))
+    safe_max = max(1, int(max_attempts or 1))
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            WITH picked AS (
+                SELECT user_id, job_id
+                FROM genesis_import_jobs
+                WHERE status = 'processing'
+                  AND resident_consumer_id <> ''
+                  AND resident_heartbeat_at < now() - make_interval(secs => %s)
+                ORDER BY resident_heartbeat_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE genesis_import_jobs AS j SET
+                status = CASE WHEN j.resident_attempts < %s THEN 'awaiting_resident' ELSE 'failed' END,
+                error = CASE WHEN j.resident_attempts < %s THEN '' ELSE %s END,
+                resident_consumer_id = '',
+                resident_claimed_at = NULL,
+                resident_heartbeat_at = NULL,
+                updated_at = now()
+            FROM picked
+            WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
+            RETURNING j.*
+            """,
+            (safe_sec, safe_limit, safe_max, safe_max, error[:1000]),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        out.append(item)
+    return out
+
+
 def genesis_put_chunk(
     user_id: str,
     job_id: str,
