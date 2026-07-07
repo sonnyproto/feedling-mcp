@@ -86,24 +86,37 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
     contract (P5) and MUST be reconciled with the client sealer + verified on a real enclave
     e2e (red line) before merge — the DB/size/job logic here is what's unit-verified.
     """
-    ciphertext_b64 = str(payload.get("ciphertext_b64") or "")
-    ciphertext_sha256 = str(payload.get("ciphertext_sha256") or "")
-    aad = payload.get("aad")
+    env = payload.get("envelope")
     mode_hint = str(payload.get("mode") or "").strip().lower()
-    if not ciphertext_b64 or not ciphertext_sha256 or not isinstance(aad, dict):
+    if not isinstance(env, dict):
         return _bad("sealed_envelope_incomplete", 400)
+    # Reuse the proven v1 content-envelope wire shape (the SAME one memory.add / identity /
+    # the genesis chunk path already use, so the enclave decrypts it unchanged): body_ct +
+    # the key/metadata fields (nonce / K_user / K_enclave / owner_user_id / visibility / id).
+    required = ["body_ct", "nonce", "K_user", "owner_user_id", "visibility"]
+    missing = [k for k in required if not env.get(k)]
+    if str(env.get("visibility") or "") == "shared" and not env.get("K_enclave"):
+        missing.append("K_enclave")
+    if missing:
+        return _bad("sealed_envelope_incomplete", 400, missing=missing)
+    if str(env.get("owner_user_id") or "") != store.user_id:
+        # defense in depth (like identity.init / memory.add) — reject a mismatched owner.
+        return _bad("envelope_owner_mismatch", 403)
     try:
-        encrypted_body = base64.b64decode(ciphertext_b64, validate=True)
+        encrypted_body = base64.b64decode(str(env.get("body_ct") or ""), validate=True)
     except Exception:
-        return _bad("ciphertext_b64_invalid", 400)
+        return _bad("body_ct_invalid", 400)
     max_bytes = resident_distill_max_bytes()
     if len(encrypted_body) > max_bytes:
         return _bad("material_too_large", 413, max_bytes=max_bytes, got_bytes=len(encrypted_body))
 
     client_job_id = history_import._history_import_client_job_id(payload)
     job_id = "genesis_" + hashlib.sha256(
-        f"{store.user_id}:{client_job_id}:{ciphertext_sha256}".encode("utf-8")
+        f"{store.user_id}:{client_job_id}:{env.get('id') or ''}".encode("utf-8")
     ).hexdigest()[:16]
+    # aad carries everything except the ciphertext, so /pending can rebuild the full envelope.
+    aad = {k: v for k, v in env.items() if k != "body_ct"}
+    ciphertext_sha256 = hashlib.sha256(encrypted_body).hexdigest()
 
     created = db.genesis_create_job(store.user_id, {
         "job_id": job_id,
@@ -120,7 +133,7 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
             store.user_id, job_id,
             seq=0, byte_start=0, byte_end=len(encrypted_body),
             ciphertext_sha256=ciphertext_sha256,
-            content_sha256=str(payload.get("content_sha256") or ""),
+            content_sha256="",
             aad=aad, encrypted_body=encrypted_body,
         )
     return {"job": {"job_id": job_id, "status": "processing"}}, 200
@@ -142,12 +155,11 @@ def resident_pending(store, *, consumer_id: str) -> tuple[dict, int]:
         if chunks:
             c = chunks[0]
             body = c.get("encrypted_body") or b""
-            sealed = {
-                "ciphertext_b64": base64.b64encode(body).decode("ascii"),
-                "ciphertext_sha256": c.get("ciphertext_sha256"),
-                "content_sha256": c.get("content_sha256"),
-                "aad": c.get("aad"),
-            }
+            # Rebuild the full v1 envelope (aad holds all fields except body_ct) so the
+            # consumer can POST {"envelope": ...} straight to the enclave /v1/envelope/decrypt.
+            env = dict(c.get("aad") or {})
+            env["body_ct"] = base64.b64encode(body).decode("ascii")
+            sealed = {"envelope": env}
         meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
         jobs.append({
             "job_id": job["job_id"],

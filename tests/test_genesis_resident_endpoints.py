@@ -21,19 +21,24 @@ def _ns(uid):
     return types.SimpleNamespace(user_id=uid)
 
 
-def _sealed_body(ct: bytes, *, client_job_id="cj", mode="add_memory"):
+def _sealed_body(uid: str, ct: bytes, *, client_job_id="cj", mode="add_memory"):
+    # Full v1 content-envelope wire shape (ContentEncryption.Envelope.jsonBody).
     return {
         "format": "sealed_v1", "client_job_id": client_job_id, "mode": mode,
-        "ciphertext_b64": base64.b64encode(ct).decode("ascii"),
-        "ciphertext_sha256": hashlib.sha256(ct).hexdigest(),
-        "content_sha256": hashlib.sha256(ct).hexdigest(),
-        "aad": {"owner_user_id": "u", "v": 1, "item_id": "it"},
+        "envelope": {
+            "v": 1, "id": hashlib.sha256(ct).hexdigest()[:16],
+            "body_ct": base64.b64encode(ct).decode("ascii"),
+            "nonce": base64.b64encode(b"nonce").decode(),
+            "K_user": base64.b64encode(b"ku").decode(),
+            "K_enclave": base64.b64encode(b"ke").decode(),
+            "owner_user_id": uid, "visibility": "shared", "enclave_pk_fpr": "fpr",
+        },
     }
 
 
 def _upload(uid, ct=b"material", **kw):
     seed_user(uid)
-    body, st = genesis_core._resident_sealed_import(_ns(uid), _sealed_body(ct, **kw))
+    body, st = genesis_core._resident_sealed_import(_ns(uid), _sealed_body(uid, ct, **kw))
     assert st == 200
     return body["job"]["job_id"]
 
@@ -47,7 +52,9 @@ def test_pending_claims_and_returns_sealed(monkeypatch):
     mine = [j for j in body["jobs"] if j["job_id"] == jid]
     assert len(mine) == 1
     assert mine[0]["mode"] == "add_memory"
-    assert mine[0]["sealed"]["ciphertext_b64"] == base64.b64encode(b"hello-sealed-material").decode()
+    env = mine[0]["sealed"]["envelope"]
+    assert env["body_ct"] == base64.b64encode(b"hello-sealed-material").decode()
+    assert env["K_user"] and env["nonce"] and env["owner_user_id"] == uid   # keys rebuilt for decrypt
     assert db.genesis_get_job(uid, jid)["status"] == "processing"     # claimed
 
 

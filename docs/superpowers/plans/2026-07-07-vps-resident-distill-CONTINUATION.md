@@ -36,9 +36,12 @@ users` (migration 0012), so tests must `from conftest import seed_user; seed_use
 - ✅ **DONE (`6dd038e`)** — Resident upload branch `_resident_sealed_import` (replaces the 501): size-check →
   store ciphertext via `genesis_put_chunk` (seq 0) → `genesis_create_job(status="awaiting_resident")` → return
   `{job:{status:"processing"}}`. Idempotent. Size limit `resident_distill_max_bytes()` /
-  `FEEDLING_RESIDENT_DISTILL_MAX_BYTES` (default 512KiB, on stored ciphertext). 4 DB tests. **Upload↔claim loop
-  wired.** ⚠️ the sealed-envelope field shape (`ciphertext_b64`/`ciphertext_sha256`/`aad`) is provisional — reconcile
-  with the iOS sealer (P5) + verify on real enclave e2e before merge.
+  `FEEDLING_RESIDENT_DISTILL_MAX_BYTES` (default 512KiB, on decoded `body_ct`). 5 tests. **Upload↔claim loop
+  wired.** ✅ **RECONCILED** — the sealed body now carries the **full v1 content-envelope** (`{format:"sealed_v1",
+  client_job_id, mode, envelope:{v,id,body_ct,nonce,K_user,K_enclave,owner_user_id,visibility,enclave_pk_fpr}}`),
+  the SAME `ContentEncryption.Envelope.jsonBody()` shape memory.add/identity/chunk already use → the enclave decrypts
+  it unchanged. Backend stores `body_ct`→`encrypted_body`, the rest→`aad`; `/pending` rebuilds `{"envelope":{...}}`.
+  Owner-mismatch (403) + incomplete-envelope (400) guarded. (Real enclave AEAD decrypt still = real-VPS e2e.)
 - ✅ **DONE (`899b8e9`)** — Resident endpoints on `genesis/routes_asgi.py`, **per-user auth** (`require_auth` — the
   consumer authenticates as its own user, same as chat poll; claim scoped to that user, no host-all needed):
   - `GET /v1/genesis/resident/pending?consumer_id=` → `genesis_core.resident_pending` (claim + return sealed material).
@@ -65,9 +68,10 @@ users` (migration 0012), so tests must `from conftest import seed_user; seed_use
 ### P4 (feedling-mcp/tools/chat_resident_consumer.py) — resident consumer plumbing
 Add a resident-distill poll cycle (alongside the chat poll). Concrete contract (backend is built + verified):
 - `GET {API}/v1/genesis/resident/pending?consumer_id=<stable-id>` (user's api key/runtime token) →
-  `{jobs:[{job_id, mode, sealed:{ciphertext_b64, ciphertext_sha256, content_sha256, aad}}]}`.
-- For each job: base64-decode `ciphertext_b64` → **decrypt via `FEEDLING_ENCLAVE_URL`** (the same decrypt the consumer
-  already does for chat/memory) → write plaintext to a temp file → invoke the agent: "absorb `<path>` (mode=<mode>)".
+  `{jobs:[{job_id, mode, sealed:{envelope:{v,id,body_ct,nonce,K_user,K_enclave,owner_user_id,visibility,enclave_pk_fpr}}}]}`.
+- For each job: **POST `{"envelope": sealed["envelope"]}` to `FEEDLING_ENCLAVE_URL` `/v1/envelope/decrypt`** (the SAME
+  decrypt the consumer already does for chat/memory — the envelope is the identical v1 shape) → write plaintext to a
+  temp file → invoke the agent: "absorb `<path>` (mode=<mode>)".
   Agent distills per skill and writes `memory.add` / `identity.replace` (for identity, pass
   `source=genesis_resident_distill`, `job_id`, `reason`). During a long distill call
   `POST /v1/genesis/resident/{job_id}/heartbeat {consumer_id}`.
@@ -79,10 +83,10 @@ Add a resident-distill poll cycle (alongside the chat poll). Concrete contract (
 ### P5 (feedling-mcp-ios) — client seal + upload (needs Xcode/device)
 - self-hosted branch of the 3 MaterialSheets (`GardenMaterialSheet`/`IdentityMaterialSheet`/`ChatEmptyStateView`):
   when `storageMode == .selfHosted`, instead of `uploadGenesisPlaintext` (plaintext), **seal the material** (reuse
-  `sealForCurrentUser` / the `genesisPutChunk` envelope path, `FeedlingAPI.swift:1265/3047`) and POST a `sealed_v1` body:
-  `{format:"sealed_v1", client_job_id, mode, ciphertext_b64, ciphertext_sha256, content_sha256, aad}` to
-  `/v1/genesis/imports/plaintext`. **Upload-time size check** (~512KiB, self-hosted only). Cloud/worker path stays
-  plaintext (unchanged). ⚠️ reconcile the `aad` binding + `ciphertext` framing with the enclave decrypt (real e2e).
+  `sealForCurrentUser(plaintext:itemID:)` → `.jsonBody()`, `FeedlingAPI.swift:1309`) and POST a `sealed_v1` body:
+  `{format:"sealed_v1", client_job_id, mode, envelope:{...the full ContentEncryption.Envelope.jsonBody envelope dict...}}`
+  to `/v1/genesis/imports/plaintext`. **Upload-time size check** (~512KiB, self-hosted only). Cloud/worker path stays
+  plaintext (unchanged). ✅ envelope shape is now the proven v1 wire format the backend + enclave already accept.
 
 ### P6 (io-onboarding) — resident skill
 - entry-B (chat-handed file): memory md → light capture + `memory.add` (Dream reconciles); identity md → **incremental
