@@ -1482,6 +1482,57 @@ def genesis_claim_uploaded_jobs(*, limit: int = 1) -> list[dict]:
     return out
 
 
+def genesis_claim_resident_jobs(*, consumer_id: str, limit: int = 1) -> list[dict]:
+    """Atomically claim ``awaiting_resident`` genesis jobs for a resident consumer.
+
+    The VPS resident-distill path: the material is sealed client-side and stored,
+    the job sits in ``awaiting_resident`` (which the CVM worker's ``uploaded`` claim
+    never touches), and the resident consumer claims it here to distill locally.
+    Mirrors ``genesis_claim_uploaded_jobs`` (FOR UPDATE SKIP LOCKED so multiple
+    consumers can poll without double-processing), moving awaiting_resident ->
+    processing and stamping the claiming consumer + a fresh heartbeat + attempt count
+    (so a dead consumer's job can be reaped / re-queued instead of wedging forever).
+    """
+    safe_limit = max(1, min(int(limit or 1), 16))
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            cur = conn.execute(
+                """
+                WITH picked AS (
+                    SELECT user_id, job_id
+                    FROM genesis_import_jobs
+                    WHERE status = 'awaiting_resident'
+                    ORDER BY finalized_at ASC NULLS LAST, updated_at ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE genesis_import_jobs AS j SET
+                    status = 'processing',
+                    error = '',
+                    resident_consumer_id = %s,
+                    resident_claimed_at = now(),
+                    resident_heartbeat_at = now(),
+                    resident_attempts = j.resident_attempts + 1,
+                    output = jsonb_build_object('stage', 'resident_claimed'),
+                    updated_at = now()
+                FROM picked
+                WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
+                RETURNING j.*
+                """,
+                (safe_limit, consumer_id),
+            )
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        out.append(item)
+    return out
+
+
 def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit: int = 50) -> list[dict]:
     """Atomically fail genesis jobs wedged in 'processing' past a staleness cutoff.
 
