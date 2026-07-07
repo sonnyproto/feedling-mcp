@@ -118,6 +118,23 @@ async def chat_message(request: Request, auth: AuthResult = Depends(require_auth
     return JSONResponse(body, status_code=status)
 
 
+def _allow_verify_reply_with_fresh_pending_check(store) -> bool:
+    """Check pending verify ping, reloading once before a negative decision.
+
+    In multi-worker deployments, verify_loop inserts a synthetic ping in one
+    worker and the resident consumer may answer through another before
+    LISTEN/NOTIFY has evicted that second worker's cached store. The fast path
+    stays cache-only; the negative path reloads once so we do not reject a valid
+    verify reply based on stale chat_messages.
+    """
+    if boot_gates._reply_is_for_pending_verify_ping(store):
+        return True
+    if boot_gates._chat_loop_verified_by_server(store):
+        return False
+    store.reload()
+    return boot_gates._reply_is_for_pending_verify_ping(store)
+
+
 @router.post("/v1/chat/response")
 async def chat_response(request: Request, auth: AuthResult = Depends(require_auth)):
     store = auth.store
@@ -127,7 +144,7 @@ async def chat_response(request: Request, auth: AuthResult = Depends(require_aut
     consumer_info = chat_consumer._consumer_headers_from_map(request.headers, remote_addr)
     consumer_id = chat_service._parse_consumer_id(request.headers, request.query_params)
     allow_verify_reply = await threadpool.run_db(
-        boot_gates._reply_is_for_pending_verify_ping, store
+        _allow_verify_reply_with_fresh_pending_check, store
     )
     gated = await threadpool.run_db(chat_core.gate_response_dict, store, allow_verify_reply)
     if gated is not None:
