@@ -1709,6 +1709,20 @@ def _looks_like_json_text(text: str) -> bool:
     return bool(stripped) and stripped[0] in "[{"
 
 
+def _markdown_fenced_json_body(text: str) -> str:
+    stripped = (text or "").strip()
+    match = re.match(r"^```(?P<lang>[a-zA-Z0-9_-]*)\s*(?P<body>.*?)\s*```$", stripped, re.DOTALL)
+    if not match:
+        return ""
+    lang = (match.group("lang") or "").strip().lower()
+    body = (match.group("body") or "").strip()
+    if lang and lang != "json":
+        return ""
+    if not _looks_like_json_text(body):
+        return ""
+    return body
+
+
 def _visible_reply_fragment_from_text(text: str) -> Any:
     """Recover the display protocol when the model omits the outer braces.
 
@@ -2161,6 +2175,10 @@ def _json_objects_from_cli_output(raw: str) -> list[Any]:
     raw = raw.strip()
     if not raw:
         return []
+
+    fenced = _markdown_fenced_json_body(raw)
+    if fenced:
+        raw = fenced
 
     try:
         return [json.loads(raw)]
