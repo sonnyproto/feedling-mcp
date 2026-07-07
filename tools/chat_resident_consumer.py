@@ -6646,10 +6646,11 @@ def _process_messages(messages: list) -> float:
 
 
 # ── Resident genesis-distill lane ───────────────────────────────────────────
-# Self-hosted counterpart to the CLOUD genesis worker. The app seals the uploaded
-# material (v1 content-envelope) and the backend — running in resident distill mode
-# (FEEDLING_GENESIS_DISTILL_MODE=resident) — only stores the ciphertext. THIS local
-# agent claims the job, decrypts via the enclave, distills, and writes the result.
+# Self-hosted counterpart to the CLOUD genesis worker. The self-hosted app/agent seals
+# the uploaded material (v1 content-envelope) client-side; the backend routes any SEALED
+# body to this lane (by body type — no global switch) and only stores the ciphertext.
+# THIS local agent claims the job, decrypts via the enclave, distills, and writes the
+# result. (Cloud users upload plaintext → the server-side worker; the two coexist.)
 #
 # CRYPTO contract (verified against the backend — do not conflate the two lanes):
 #   • memory.add   → this consumer seals the card CLIENT-side (it holds the keys,
@@ -6658,8 +6659,9 @@ def _process_messages(messages: list) -> float:
 #   • identity.replace → this consumer sends PLAINTEXT + source/job_id/reason; the
 #                    SERVER builds the envelope (the P3 gate rejects a client envelope).
 #
-# Off unless FEEDLING_GENESIS_RESIDENT_ENABLED=1.
-GENESIS_RESIDENT_ENABLED = _env_bool("FEEDLING_GENESIS_RESIDENT_ENABLED", False)
+# Every consumer IS a self-hosted resident agent, so this defaults ON; set
+# FEEDLING_GENESIS_RESIDENT_ENABLED=0 to opt out. A 404 also self-disables it.
+GENESIS_RESIDENT_ENABLED = _env_bool("FEEDLING_GENESIS_RESIDENT_ENABLED", True)
 # Stable per-user claim id (survives restarts; same shape as the chat checkpoint key).
 _RESIDENT_CONSUMER_ID = f"resident-distill-{CHECKPOINT_API_KEY_FINGERPRINT}"
 

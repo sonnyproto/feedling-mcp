@@ -48,17 +48,12 @@ def _bad(error: str, status: int = 400, **extra) -> tuple[dict, int]:
     return {"error": error, **extra}, status
 
 
-def genesis_distill_mode() -> str:
-    """Deploy-level distill mode. ``resident`` = a self-hosted VPS whose own local
-    agent does the distillation (material sealed client-side, agent claims + distills);
-    anything else (default) = ``worker`` = the current server-side genesis worker.
-    Garbage → worker (safe default): a cloud box must never fall into resident."""
-    return "resident" if str(os.environ.get("FEEDLING_GENESIS_DISTILL_MODE", "")).strip().lower() == "resident" else "worker"
-
-
 def _is_sealed_body(payload: dict) -> bool:
-    """A resident-mode upload is a client-sealed envelope, tagged ``format: sealed_v1``
-    (NOT the legacy plaintext body). Explicit tag so worker/resident bodies never blur."""
+    """A self-hosted upload is a client-sealed envelope, tagged ``format: sealed_v1``
+    (NOT the legacy plaintext body). This tag is the ROUTING signal: sealed → resident
+    lane (the user's own local agent distills), plaintext → server-side worker. The two
+    lanes coexist on one backend; no global mode switch, and the body type makes it
+    impossible to feed ciphertext to the worker as plaintext (or vice versa)."""
     return isinstance(payload, dict) and str(payload.get("format") or "").strip().lower() == "sealed_v1"
 
 
@@ -464,15 +459,12 @@ def plaintext_import(
     if not isinstance(payload, dict):
         return _bad("json_object_required", 400)
 
-    # Distill-mode bidirectional hard validation (safety edge): worker must never
-    # ingest a client-sealed body, resident must never ingest a legacy plaintext body.
-    mode = genesis_distill_mode()
-    sealed = _is_sealed_body(payload)
-    if mode == "worker" and sealed:
-        return _bad("sealed_body_rejected_in_worker_mode", 400)
-    if mode == "resident" and not sealed:
-        return _bad("plaintext_body_rejected_in_resident_mode", 400)
-    if mode == "resident" and sealed:
+    # Route by body type, not a global switch. A SEALED body (self-hosted app encrypted it
+    # client-side so the server never sees plaintext) → resident lane, where the user's own
+    # local agent claims + distills. A PLAINTEXT body (cloud app) → the server-side worker
+    # below. Both lanes coexist on the same backend, so cloud and self-hosted users each get
+    # the right path with no per-deployment configuration.
+    if _is_sealed_body(payload):
         return _resident_sealed_import(store, payload)
 
     input_hash = history_import._history_import_payload_hash(payload)
