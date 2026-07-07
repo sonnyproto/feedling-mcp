@@ -113,6 +113,7 @@ if not _provisioned:
         "test_worldbook_readside_core.py",
         "test_asgi_app_import_guard.py",
         "test_asgi_waiters.py",
+        "test_quoted_memory_context.py",
     }
     collect_ignore = sorted(
         f

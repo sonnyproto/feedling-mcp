@@ -937,6 +937,35 @@ def _load_decrypted_moments(
     return out
 
 
+def _attach_quoted_memories(decrypted: list[dict], moments: list[dict]) -> None:
+    """Expand user-selected memory ids (Garden「talk in chat」) into decrypted
+    cards on their own message, so the resident consumer can inject them into
+    the agent's context. Mutates `decrypted` in place; best-effort. The raw id
+    list is removed from each entry so it never leaks in the response.
+    """
+    by_id = {str(mom.get("id") or ""): mom for mom in moments if mom.get("id")}
+    for entry in decrypted:
+        raw = entry.pop("quoted_memory_ids", None)
+        if not raw:
+            continue
+        cards: list[dict] = []
+        for mid in [i.strip() for i in str(raw).split(",") if i.strip()][:8]:
+            mom = by_id.get(mid)
+            if not mom:
+                continue
+            title = str(mom.get("title") or "").strip()
+            desc = str(mom.get("description") or "").strip()
+            text = "\n".join(part for part in (title, desc) if part)
+            cards.append({
+                "id": mid,
+                "type": str(mom.get("type") or "").strip(),
+                "title": title,
+                "text": text or title,
+            })
+        if cards:
+            entry["quoted_memories"] = cards
+
+
 def _env_flag_enabled(name: str, default: str = "false") -> bool:
     return str(os.environ.get(name, default) or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
@@ -1502,6 +1531,11 @@ def v1_chat_history():
                 "visibility": m.get("visibility", "shared"),
                 "decrypt_status": "ok",
             }
+            # Carry user-selected memory references (Garden「talk in chat」)
+            # forward; expanded into decrypted cards below once moments load.
+            qmids = m.get("quoted_memory_ids")
+            if isinstance(qmids, str) and qmids.strip():
+                entry["quoted_memory_ids"] = qmids.strip()
             if ctype == "image":
                 # Image plaintext is raw image bytes (JPEG/PNG/WebP) — surface
                 # as base64 so JSON callers (vision-capable agents, iOS clients
@@ -1585,6 +1619,19 @@ def v1_chat_history():
             context_memories = select_context_memories(moments, latest_user_text, mode=context_mode)
     except Exception as e:
         print(f"[chat/history:{authorized_user_id}] context_memories failed: {e}")
+
+    # Expand user-selected memory references (Garden「talk in chat」) into
+    # decrypted cards on their message. Separate best-effort pass — never blocks
+    # the response and does not perturb context_memories selection above. Uses a
+    # generous window so a referenced-but-older memory is still found.
+    try:
+        if any(m.get("quoted_memory_ids") for m in decrypted):
+            quoted_moments = _load_decrypted_moments(
+                api_key, authorized_user_id, content_sk, limit=200
+            )
+            _attach_quoted_memories(decrypted, quoted_moments)
+    except Exception as e:
+        print(f"[chat/history:{authorized_user_id}] quoted_memories failed: {e}")
 
     payload = {
         "user_id": authorized_user_id,

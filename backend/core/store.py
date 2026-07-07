@@ -396,6 +396,10 @@ class UserStore:
                 "app_presence_phase",
                 "app_presence_age_sec",
                 "model_api_kind",
+                # Comma-joined memory ids the user explicitly referenced for
+                # this turn (Garden「talk in chat」). Plaintext ids only; the
+                # enclave expands them into decrypted memory context on read.
+                "quoted_memory_ids",
                 "image_mime",
                 "caption_v",
                 "caption_id",

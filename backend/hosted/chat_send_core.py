@@ -115,6 +115,18 @@ def model_api_chat_send_core(
             extra.update(chat_service._chat_caption_extra_from_envelope(caption_env))
         else:
             print(f"[model_api:{store.user_id}] caption_envelope_failed detail={caption_err}")
+    # Carry user-selected memory references (Garden「talk in chat」) onto the
+    # turn so the enclave can expand them into the agent's context. Only ids are
+    # stored (plaintext, non-sensitive); the enclave decrypts the memory body
+    # itself on read. Covers both hosted and VPS resident replies — they share
+    # the same consumer + enclave history path.
+    quoted_memory_ids = [
+        str(ref.get("id") or "").strip()
+        for ref in context_refs
+        if ref.get("type") == "memory" and str(ref.get("id") or "").strip()
+    ]
+    if quoted_memory_ids:
+        extra["quoted_memory_ids"] = ",".join(quoted_memory_ids[:8])
     user_row = store.append_chat(
         "user",
         "model_api",
