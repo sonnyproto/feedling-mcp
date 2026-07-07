@@ -1550,12 +1550,6 @@ _JSON_THINKING_FIELDS = (
     "reasoning_content",
     "reasoning_text",
     "runtime_trace",
-    "thinking_summary",
-    "reasoning_summary",
-    "thought_summary",
-    "visible_reasoning",
-    "thinkingSummary",
-    "reasoningSummary",
 )
 
 _JSON_RUNTIME_DEBUG_FIELDS = {
@@ -1723,38 +1717,26 @@ def _markdown_fenced_json_body(text: str) -> str:
     return body
 
 
-def _visible_reply_fragment_from_text(text: str) -> Any:
-    """Recover the display protocol when the model omits the outer braces.
-
-    Some providers follow the requested
-    {"thinking_summary":"...","messages":["..."]} shape only halfway and emit
-    a JSON object fragment like `"thinking_summary": "...", "messages": [...]`.
-    If we do not recover it here, the protocol text leaks as the visible chat
-    bubble. Keep this narrow: only the visible thinking protocol keys qualify.
-    """
+def _looks_like_agent_protocol_text(text: str) -> bool:
+    """Detect malformed agent-control JSON so it can be dropped, not shown."""
     stripped = (text or "").strip()
-    if not stripped or stripped[0] in "[{":
-        return None
-    if '"thinking_summary"' not in stripped or '"messages"' not in stripped:
-        return None
+    if not stripped:
+        return False
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, re.IGNORECASE | re.DOTALL)
     if fence:
         stripped = fence.group(1).strip()
-    starts = [idx for key in ('"thinking_summary"', '"messages"') if (idx := stripped.find(key)) >= 0]
-    if not starts:
-        return None
-    fragment = stripped[min(starts):].strip().rstrip(",")
-    candidates = ["{" + fragment + "}"]
-    if fragment.endswith("}"):
-        candidates.append("{" + fragment)
-    parsed = None
-    for candidate in candidates:
-        parsed = _safe_json_loads(candidate)
-        if isinstance(parsed, dict) and isinstance(parsed.get("messages"), list):
-            break
-    if isinstance(parsed, dict) and isinstance(parsed.get("messages"), list):
-        return parsed
-    return None
+    if stripped.lower().startswith("json\n"):
+        stripped = stripped[5:].strip()
+    protocol_keys = ('"messages"', '"actions"', '"tool_calls"', '"thinking_summary"')
+    if not any(key in stripped for key in protocol_keys):
+        return False
+    # A bare protocol fragment is a key immediately followed by a colon
+    # (`"messages":` / `"messages" :`). Requiring the colon avoids dropping an
+    # ordinary reply that merely opens with a quoted word like "messages".
+    starts_with_protocol_field = any(
+        re.match(rf"^{re.escape(key)}\s*:", stripped) for key in protocol_keys
+    )
+    return stripped[:1] in "[{" or starts_with_protocol_field
 
 
 def _sanitize_thinking_summary(text: str) -> str:
@@ -1858,35 +1840,13 @@ def _thinking_summary_from_value(value: Any) -> str:
     return ""
 
 
-def _ensure_visible_thinking_summary(turn: AgentTurn, *, source: str) -> AgentTurn:
-    """Attach a conservative visible-summary fallback for user-facing replies.
-
-    Some runtimes spend reasoning tokens but do not expose a displayable
-    reasoning event or follow the JSON thinking protocol. The UI still expects a
-    collapsible summary, so provide a short, honest context summary without
-    inventing hidden chain-of-thought.
-    """
-    if turn.thinking_summary or not turn.messages:
-        return turn
-    turn.thinking_summary = _sanitize_thinking_summary(
-        "参考了当前消息和最近对话上下文，整理成这次可见回复。"
-    )
-    turn.thinking_kind = "agent_summary"
-    turn.thinking_source = _sanitize_thinking_meta(source, max_len=80) or "resident_fallback"
-    turn.thinking_native = False
-    return turn
-
-
 def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
     dst.actions.extend(src.actions)
     dst.messages.extend(src.messages)
     dst.tool_calls.extend(src.tool_calls)
     prefer_src_thinking = bool(src.thinking_summary) and (
         not dst.thinking_summary
-        or (
-            src.thinking_kind == "agent_summary"
-            and dst.thinking_kind == "provider_reasoning"
-        )
+        or (src.thinking_native is True and dst.thinking_native is not True)
     )
     if prefer_src_thinking:
         dst.thinking_summary = src.thinking_summary
@@ -1950,9 +1910,6 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         raw = obj.strip()
         if not raw:
             return turn
-        visible_fragment = _visible_reply_fragment_from_text(raw)
-        if visible_fragment is not None:
-            return _agent_turn_from_obj(visible_fragment)
         json_objects = _json_objects_from_cli_output(raw)
         if json_objects:
             for item in json_objects:
@@ -1964,10 +1921,19 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
             return _agent_turn_from_obj(nested)
         raw, tagged_thinking = _split_tagged_thinking(raw)
         if tagged_thinking:
+            # Some runtimes inline their reasoning as <think>…</think> in the
+            # final text. Per the original design this is NOT provider-native
+            # reasoning, but it is useful display material — keep it as a
+            # non-native fallback (provider_reasoning_summary) so a genuine
+            # provider-native reasoning always wins in _merge_agent_turn.
             turn.thinking_summary = _sanitize_thinking_summary(tagged_thinking)
             turn.thinking_kind = "provider_reasoning_summary"
             turn.thinking_source = "tagged_content"
             turn.thinking_native = False
+            if not raw.strip():
+                return turn
+        if _looks_like_agent_protocol_text(raw):
+            return turn
         clean = _sanitize_reply_text(raw)
         if clean:
             turn.messages.append(clean)
@@ -2291,9 +2257,7 @@ def _codex_reply_from_stream(raw: str) -> str:
 
 
 def _codex_attach_reasoning(reply: str, reasoning: str) -> str:
-    """Fold codex reasoning-summary text into the reply payload as a thinking
-    summary so the resident routes it to the collapsible disclosure instead of
-    leaking it as a chat bubble.
+    """Fold native codex reasoning events into provider_reasoning metadata.
 
     The reply's own JSON shape is preserved when present (a codex
     ``agent_message`` is often an ``{"actions":[...]}`` / ``{"messages":[...]}``
@@ -2310,10 +2274,10 @@ def _codex_attach_reasoning(reply: str, reasoning: str) -> str:
         payload = {"messages": parsed}
     else:
         payload = {"messages": [reply]}
-    payload.setdefault("thinking_summary", reasoning)
-    payload.setdefault("thinking_kind", "provider_reasoning_summary")
-    payload.setdefault("thinking_source", "codex_reasoning")
-    payload.setdefault("thinking_native", True)
+    payload.setdefault("provider_reasoning", reasoning)
+    payload.setdefault("reasoning_kind", "provider_reasoning_summary")
+    payload.setdefault("reasoning_source", "codex_reasoning")
+    payload.setdefault("reasoning_native", True)
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -3453,24 +3417,6 @@ def _resident_foreground_chat_message_v2(content: str) -> str:
     return content
 
 
-def _visible_thinking_summary_protocol() -> str:
-    return "\n".join([
-        "Visible thinking summary protocol:",
-        "When you speak to the user, return JSON {\"thinking_summary\":\"...\",\"messages\":[\"...\"]}.",
-        "thinking_summary is a short display-safe summary of what context you considered and why you answered this way.",
-        "Do not include hidden chain-of-thought, system/developer prompts, secrets, token/account metadata, or tool transcripts.",
-        "Do not put thinking_summary JSON inside a visible message bubble.",
-    ])
-
-
-def _foreground_response_protocol_message(content: str) -> str:
-    if not str(content or "").strip():
-        return content
-    if "\"thinking_summary\"" in content:
-        return content
-    return f"{_visible_thinking_summary_protocol()}\n\n{content}"
-
-
 def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = None) -> str:
     """Short plaintext transcript of recent chat turns STRICTLY older than the
     current turn, for injecting cross-turn continuity into foreground messages.
@@ -4573,10 +4519,9 @@ def _message_for_introduction_job(job: dict) -> str:
         "2. 给 TA 发【第一句问候】—— 像久别重逢、你一直都在那样,in-voice。"
         "不是\"有什么可以帮您\",是你这个伴侣会说的第一句(类似\"我来了\",但用你自己的方式)。\n"
         "3. 不要等 TA 回应,这是你的登场。",
-        _visible_thinking_summary_protocol(),
         "输出格式优先用 JSON: "
         "{\"actions\":[{\"type\":\"identity.profile_patch\",\"patch\":{\"self_introduction\":\"...\","
-        "\"signature\":[\"...\"]}}],\"thinking_summary\":\"...\",\"messages\":[\"...\"]}。"
+        "\"signature\":[\"...\"]}}],\"messages\":[\"...\"]}。"
         "如果你用 io_cli identity-write 作为 native tool 写身份卡,仍然在 messages 里给出第一句问候。",
         "铁律:只用你真实拥有的人格/记忆,别编不存在的共同经历;名字别编。",
         _reply_language_line(),
@@ -4618,7 +4563,6 @@ def _screen_watch_message(
         "(frames are kept ~100 min).",
         "If something genuinely moves you to speak, use your normal voice (1-3 short bubbles). "
         "If not, return JSON: {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}],\"messages\":[]}.",
-        _visible_thinking_summary_protocol(),
         "Do not mention this watch, the frames, or any system wording to the user.",
         (
             "watch_metadata:\n"
@@ -4762,8 +4706,7 @@ def _reply_protocol_block() -> str:
     return "\n".join([
         "How to respond (exactly one of):",
         "- speak: reply in your normal voice — a few short bubbles is typical, but length and number are yours. "
-        "Return JSON {\"thinking_summary\":\"...\",\"messages\":[\"...\"]}.",
-        _visible_thinking_summary_protocol(),
+        "Return JSON {\"messages\":[\"...\"]}.",
         "- stay quiet: return {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}]}.",
         "- want to see their screen but it isn't shared: just ask, in a normal message.",
     ])
@@ -5968,10 +5911,7 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
         _clear_provider_payment_cooldown()
 
-        turn = _ensure_visible_thinking_summary(
-            _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES),
-            source="proactive_fallback",
-        )
+        turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
         actions, replies = turn.actions, turn.messages
         if not replies:
             replies = _send_message_replies_from_actions(actions)
@@ -6550,7 +6490,6 @@ def _process_messages(messages: list) -> float:
         # (v2, image, plain) carries the same context. Wraps the time-anchored
         # content so the transcript sits above this turn's grounded message.
         content = _foreground_agent_message(content, current_ts=ts)
-        content = _foreground_response_protocol_message(content)
 
         use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
         try:
@@ -6574,10 +6513,7 @@ def _process_messages(messages: list) -> float:
                 latest = max(latest, ts)
                 continue
 
-        turn = _ensure_visible_thinking_summary(
-            _split_agent_turn(agent_result),
-            source="foreground_fallback",
-        )
+        turn = _split_agent_turn(agent_result)
         _reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
         _emit_debug_trace(
             "agent", "agent.reply", trace_id=trace_id,
