@@ -93,6 +93,21 @@ def test_attach_title_only_memory_uses_title_as_text():
     assert card["type"] == ""
 
 
+def test_attach_v1_memory_falls_back_to_summary_content():
+    # v1 memories keep their text in summary/content with title/description
+    # empty — the enclave must still produce non-empty text (regression: the
+    # card had empty text so the consumer skipped it and the agent saw nothing).
+    decrypted = [{"id": "u1", "role": "user", "quoted_memory_ids": "m1"}]
+    cards = [{
+        "id": "m1", "title": "", "description": "",
+        "summary": "用户有一只比熊犬，名叫崽崽。", "content": "", "type": "fact",
+    }]
+    enclave_chat._attach_quoted_memories(decrypted, cards)
+    card = decrypted[0]["quoted_memories"][0]
+    assert card["text"] == "用户有一只比熊犬，名叫崽崽。"
+    assert card["title"] == "用户有一只比熊犬，名叫崽崽。"
+
+
 def test_attach_noop_without_ids():
     decrypted = [{"id": "u1", "role": "user", "content": "hi"}]
     enclave_chat._attach_quoted_memories(decrypted, [{"id": "m", "title": "t"}])

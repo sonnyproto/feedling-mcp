@@ -132,12 +132,17 @@ def _attach_quoted_memories(decrypted: list[dict], cards: list[dict]) -> None:
                 continue
             title = str(card.get("title") or "").strip()
             desc = str(card.get("description") or "").strip()
-            text = "\n".join(part for part in (title, desc) if part)
+            summary = str(card.get("summary") or "").strip()
+            content = str(card.get("content") or "").strip()
+            # Prefer title+description; fall back to v1 summary/content, which is
+            # where many memories actually keep their text (title/description
+            # empty). Mirrors the iOS displayTitle fallback so both ends agree.
+            text = "\n".join(part for part in (title, desc) if part) or summary or content
             quoted.append({
                 "id": mid,
                 "type": str(card.get("type") or "").strip(),
-                "title": title,
-                "text": text or title,
+                "title": title or summary or content,
+                "text": text,
             })
         if quoted:
             entry["quoted_memories"] = quoted
