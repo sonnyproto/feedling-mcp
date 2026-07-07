@@ -6659,9 +6659,11 @@ def _process_messages(messages: list) -> float:
 #   • identity.replace → this consumer sends PLAINTEXT + source/job_id/reason; the
 #                    SERVER builds the envelope (the P3 gate rejects a client envelope).
 #
-# Every consumer IS a self-hosted resident agent, so this defaults ON; set
-# FEEDLING_GENESIS_RESIDENT_ENABLED=0 to opt out. A 404 also self-disables it.
-GENESIS_RESIDENT_ENABLED = _env_bool("FEEDLING_GENESIS_RESIDENT_ENABLED", True)
+# Default OFF. The hosted agent-runtime spawns THIS SAME consumer per cloud user
+# (agent_runtime/spawners.py), and cloud genesis goes through the server-side worker,
+# NOT this lane — so a hosted consumer must never poll it. Only a real self-hosted VPS
+# opts in with FEEDLING_GENESIS_RESIDENT_ENABLED=1. A 404 also self-disables it.
+GENESIS_RESIDENT_ENABLED = _env_bool("FEEDLING_GENESIS_RESIDENT_ENABLED", False)
 # Stable per-user claim id (survives restarts; same shape as the chat checkpoint key).
 _RESIDENT_CONSUMER_ID = f"resident-distill-{CHECKPOINT_API_KEY_FINGERPRINT}"
 
