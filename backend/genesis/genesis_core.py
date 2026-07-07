@@ -29,6 +29,7 @@ dependency injection rather than importing the Flask module.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -59,6 +60,70 @@ def _is_sealed_body(payload: dict) -> bool:
     """A resident-mode upload is a client-sealed envelope, tagged ``format: sealed_v1``
     (NOT the legacy plaintext body). Explicit tag so worker/resident bodies never blur."""
     return isinstance(payload, dict) and str(payload.get("format") or "").strip().lower() == "sealed_v1"
+
+
+def resident_distill_max_bytes() -> int:
+    """Max sealed-material size (bytes) accepted in resident mode. Guards the local
+    agent's distill cost (no server-side downsampling on this path) + transport. The
+    cloud/worker path has NO logical cap (server downsamples). Configurable; default 512 KiB.
+    Measured on the ciphertext the server actually stores (server-verifiable, un-fakeable)."""
+    try:
+        v = int(os.environ.get("FEEDLING_RESIDENT_DISTILL_MAX_BYTES", "") or 0)
+    except (TypeError, ValueError):
+        v = 0
+    return v if v > 0 else 512 * 1024
+
+
+def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
+    """Resident-mode ingest: the material is a client-sealed envelope (the server never
+    sees plaintext). Store the ciphertext + create an ``awaiting_resident`` job for the
+    resident consumer to claim, decrypt (via the enclave), and distill locally.
+
+    The app-facing job status is ``processing`` (the ``awaiting_resident``/claim detail
+    stays internal). Idempotent: the same material re-uploaded maps to the same job_id.
+
+    NOTE: the sealed-envelope field names + AAD binding below are the iOS<->backend crypto
+    contract (P5) and MUST be reconciled with the client sealer + verified on a real enclave
+    e2e (red line) before merge — the DB/size/job logic here is what's unit-verified.
+    """
+    ciphertext_b64 = str(payload.get("ciphertext_b64") or "")
+    ciphertext_sha256 = str(payload.get("ciphertext_sha256") or "")
+    aad = payload.get("aad")
+    mode_hint = str(payload.get("mode") or "").strip().lower()
+    if not ciphertext_b64 or not ciphertext_sha256 or not isinstance(aad, dict):
+        return _bad("sealed_envelope_incomplete", 400)
+    try:
+        encrypted_body = base64.b64decode(ciphertext_b64, validate=True)
+    except Exception:
+        return _bad("ciphertext_b64_invalid", 400)
+    max_bytes = resident_distill_max_bytes()
+    if len(encrypted_body) > max_bytes:
+        return _bad("material_too_large", 413, max_bytes=max_bytes, got_bytes=len(encrypted_body))
+
+    client_job_id = history_import._history_import_client_job_id(payload)
+    job_id = "genesis_" + hashlib.sha256(
+        f"{store.user_id}:{client_job_id}:{ciphertext_sha256}".encode("utf-8")
+    ).hexdigest()[:16]
+
+    created = db.genesis_create_job(store.user_id, {
+        "job_id": job_id,
+        "status": "awaiting_resident",
+        "source_kind": mode_hint or "resident",
+        "total_chunks": 1,
+        "total_bytes": len(encrypted_body),
+        "privacy_mode": "resident_sealed",
+        "metadata": {"mode": mode_hint, "client_job_id": client_job_id, "ingest": "resident_sealed"},
+    })
+    # created is None on ON CONFLICT DO NOTHING (idempotent re-upload) — chunk already stored.
+    if created is not None:
+        db.genesis_put_chunk(
+            store.user_id, job_id,
+            seq=0, byte_start=0, byte_end=len(encrypted_body),
+            ciphertext_sha256=ciphertext_sha256,
+            content_sha256=str(payload.get("content_sha256") or ""),
+            aad=aad, encrypted_body=encrypted_body,
+        )
+    return {"job": {"job_id": job_id, "status": "processing"}}, 200
 
 
 def _valid_job_id(job_id: str) -> bool:
@@ -331,9 +396,7 @@ def plaintext_import(
     if mode == "resident" and not sealed:
         return _bad("plaintext_body_rejected_in_resident_mode", 400)
     if mode == "resident" and sealed:
-        # P2 wires the resident path (persist ciphertext + claimable job). Until then,
-        # fail loudly rather than silently drop a sealed upload.
-        return _bad("resident_distill_not_available", 501)
+        return _resident_sealed_import(store, payload)
 
     input_hash = history_import._history_import_payload_hash(payload)
     client_job_id = history_import._history_import_client_job_id(payload)

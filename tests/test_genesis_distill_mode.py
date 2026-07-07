@@ -69,11 +69,13 @@ def test_resident_rejects_plaintext(monkeypatch):
     assert body["error"] == "plaintext_body_rejected_in_resident_mode"
 
 
-def test_resident_sealed_501_until_p2(monkeypatch):
+def test_resident_sealed_reaches_upload_branch(monkeypatch):
+    # Gating must PASS a sealed body in resident mode → it reaches _resident_sealed_import,
+    # which then validates the envelope itself (here: incomplete → 400, not a gating error).
     monkeypatch.setenv("FEEDLING_GENESIS_DISTILL_MODE", "resident")
-    body, status = _call({"format": "sealed_v1", "sealed_envelope": {}})
-    assert status == 501
-    assert body["error"] == "resident_distill_not_available"
+    body, status = _call({"format": "sealed_v1"})
+    assert status == 400
+    assert body["error"] == "sealed_envelope_incomplete"
 
 
 def test_worker_plaintext_proceeds_past_gating(monkeypatch):
