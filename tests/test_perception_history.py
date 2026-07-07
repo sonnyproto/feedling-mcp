@@ -1,7 +1,7 @@
 """Unit tests for the field-agnostic quantitative history aggregator.
 
 Pure functions — no DB. Covers each shape + the key property that NEW fields
-flow through with zero code change (PERCEPTION_HISTORY_SPEC principle #2)."""
+flow through with zero code change (docs/PERCEPTION_HISTORY_SPEC, since removed — see git history; principle #2)."""
 from perception import history
 
 

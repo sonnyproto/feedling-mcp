@@ -51,7 +51,7 @@ shared
 
 - 不在第一阶段做复杂动态调度器。
 - 不让 backend 直连某个 runner RPC。
-- 不把 Docker socket 暴露给 Flask backend。
+- 不把 Docker socket 暴露给 backend。
 - 不默认启用 per-user Docker container；默认仍是一用户一 child process。
 - 不为了扩容牺牲 provider key 的 JIT decrypt / 不落盘约束。
 
@@ -60,7 +60,7 @@ shared
 现有代码已经具备这些基础：
 
 - `deploy/docker-compose.phala.yaml` 中已有独立 `agent-runner` service。
-- `backend/hosted/chat_routes.py` 的 `/v1/model_api/chat/send` 已收敛为：
+- `backend/hosted/chat_routes_asgi.py` 的 `/v1/model_api/chat/send` 已收敛为：
   校验 provider / runner heartbeat，写入用户消息，然后等待 runner 回复或返回
   `processing`。
 - `backend/agent_runtime/leases.py` 已用 `agent_runtime_instances` 做 per-user
@@ -101,7 +101,7 @@ shared
 - `tools/chat_resident_consumer.py`
   - memory capture / dream / migrate 使用 `call_agent(..., raw_text=True)`，绕过
     chat-bubble sanitizer，避免漂亮 JSON 被清洗后解析失败。
-- `backend/proactive/routes.py`
+- `backend/proactive/routes_asgi.py`
   - memory maintenance jobs 和 introduction 一样按 pending status 恢复，绕过首次
     consumer watermark，避免 agent-runner 首次启动前创建的 capture/dream/migrate job
     永久 pending。

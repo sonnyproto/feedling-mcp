@@ -1,8 +1,8 @@
 """Multi-tenant user registry: accounts, api keys, access bindings.
 
-``_users`` / ``_key_to_user`` are the in-memory truth shared with app.py via
-re-export — mutate them in place, never rebind. Persistence is PostgreSQL
-(db.save_all_users / db.upsert_user).
+``_users`` / ``_key_to_user`` are the in-memory truth — mutate them in place,
+never rebind (tests and the wake-bus reload rely on the objects' identity).
+Persistence is PostgreSQL (db.save_all_users / db.upsert_user).
 """
 
 import hashlib
@@ -232,8 +232,9 @@ def _rebuild_key_cache() -> None:
 
 def load_users():
     """(Re)load the registry from PostgreSQL IN PLACE — ``_users`` keeps its
-    object identity because app.py re-exports it and tests clear it via
-    ``appmod._users[:] = []``; rebinding would silently fork the registry.
+    object identity because tests operate on ``accounts.registry._users``
+    directly (see tests/conftest.py: ``registry._users[:] = []`` /
+    ``registry._users.append``); rebinding would silently fork the registry.
 
     Holds ``_users_lock`` for the whole reload: under -w N this also runs on the
     wake-bus listener thread (the ``users`` channel handler), concurrently with

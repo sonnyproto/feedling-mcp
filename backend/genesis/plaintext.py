@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import threading
+import time
 from datetime import date
 from typing import Any
 
 import db
+import debug_trace
 from accounts import runtime_auth
 from core import enclave as core_enclave
-from genesis import dedup, foreground, foreground_identity, genesis_core, service, worker
+from genesis import dedup, foreground, foreground_identity, genesis_core, lightweight_identity, service, worker
 from hosted import config_store as hosted_config_store
 from hosted import history_import
 from identity import service as identity_service
@@ -37,6 +40,26 @@ _PLAINTEXT_SUPPORT_SOURCE_FAMILIES = {
     history_import._MEMORY_SUMMARY_SOURCE,
 }
 _PLAINTEXT_MODES = {"onboarding", "add_memory", "update_identity"}
+
+
+def _trace_genesis(store, event_type: str, *, job_id: str = "", status: str = "ok",
+                   summary: str = "", detail: dict | None = None, dur_ms: float | None = None) -> None:
+    try:
+        debug_trace.trace_event(
+            store,
+            subsystem="genesis",
+            type=event_type,
+            actor="backend",
+            status=status,
+            job_id=job_id,
+            trace_id=job_id,
+            turn_id=job_id,
+            summary=summary,
+            detail=detail or {},
+            dur_ms=dur_ms,
+        )
+    except Exception:
+        pass
 
 
 def _plaintext_fresh_start_message() -> dict:
@@ -127,6 +150,29 @@ def _plaintext_source_groups(analysis_messages: list[dict], *, window_limit: int
             "message_count": len(messages),
         })
     return groups
+
+
+def _foreground_history_cap() -> int:
+    try:
+        return max(1, int(os.environ.get("FEEDLING_GENESIS_FG_HISTORY_CAP", "8")))
+    except (TypeError, ValueError):
+        return 8
+
+
+def _cap_foreground_history_chunks(source_groups: list[dict]) -> list[dict]:
+    """前台用:只对 history 桶采样到 cap(_select_evenly);其它桶(人物卡/档案/长期记忆)全读。
+    被砍的 history 块由后台补全,不影响身份(名字来自人物卡,全读)。"""
+    cap = _foreground_history_cap()
+    out: list[dict] = []
+    for g in source_groups:
+        if str(g.get("source_family") or "") == "history":
+            chunks = list(g.get("chunk_texts") or [])
+            if len(chunks) > cap:
+                chunks = history_import._select_evenly(chunks, cap)
+            out.append({**g, "chunk_texts": chunks})
+        else:
+            out.append(g)
+    return out
 
 
 def _plaintext_timeline_span_days(messages: list[dict]) -> int:
@@ -575,12 +621,19 @@ def _run_plaintext_genesis_v2(
     Returns True when it handled the job. Returns False only when there's nothing to work
     with (no core), so the caller runs the v1 full path instead.
     """
+    # Foreground only: cap the history bucket to a small, evenly-sampled window so large
+    # imports stay fast (support buckets — ai_persona/user_profile/memory_summary — are
+    # never sampled here, since identity/name lives in the character card). `source_groups`
+    # itself is left untouched — background enrichment below still consumes the full,
+    # un-sampled groups so the dropped history chunks get fully processed there.
+    fg_source_groups = _cap_foreground_history_chunks(source_groups)
+
     # primary group: prefer the real chat history (best greeting signal), else the first
     fg_group = next(
-        (g for g in source_groups if str(g.get("source_family") or "") == "history"),
-        source_groups[0],
+        (g for g in fg_source_groups if str(g.get("source_family") or "") == "history"),
+        fg_source_groups[0],
     )
-    fg_idx = source_groups.index(fg_group) + 1
+    fg_idx = fg_source_groups.index(fg_group) + 1
     fg_kind = str(fg_group.get("source_kind") or history_import._HISTORY_SOURCE)
     fg_family = str(fg_group.get("source_family") or worker._source_family(fg_kind))
 
@@ -593,7 +646,7 @@ def _run_plaintext_genesis_v2(
     primary_reduce: dict | None = None
     voice_candidates: list[dict] = []
     persona_material_parts: list[str] = []
-    for idx, group in enumerate(source_groups, start=1):
+    for idx, group in enumerate(fg_source_groups, start=1):
         group_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
         group_family = str(group.get("source_family") or worker._source_family(group_kind))
         group_chunks = [str(t) for t in (group.get("chunk_texts") or []) if str(t or "").strip()]
@@ -616,6 +669,8 @@ def _run_plaintext_genesis_v2(
     if not foreground_reduces:
         return False
     primary_reduce = primary_reduce or foreground_reduces[0]
+    hw_total = int(primary_reduce.get("history_windows_total") or 0)
+    hw_failed = int(primary_reduce.get("history_windows_failed") or 0)
     all_fact_candidates: list[dict] = []
     for reduce in foreground_reduces:
         candidates = reduce.get("all_fact_candidates") or reduce.get("core_fact_candidates") or []
@@ -667,9 +722,38 @@ def _run_plaintext_genesis_v2(
         days_with_user=days, language=language,
     )
     provider_failure = _provider_identity_failure(id_warnings)
-    if provider_failure:
-        service.mark_failed(store, job_id, f"foreground_identity_failed:{provider_failure}")
-        return True
+    if provider_failure or not foreground_identity.has_identity_signal(identity_payload):
+        # Non-LLM lightweight fallback: try to salvage a name from the uploaded
+        # character card / profile text (never calls the LLM). Covers the common
+        # real failure mode (provider hiccup) that used to hard-fail the job.
+        support_texts = [str(m.get("content") or "") for m in msgs
+                         if history_import._is_import_support_message(m)]
+        lite = lightweight_identity.derive_from_support(
+            support_texts, days_with_user=days, language=language)
+        if lightweight_identity.has_signal(lite):
+            identity_payload = lite
+        else:
+            # fresh_start detection: the synthetic fresh_start message
+            # (_plaintext_fresh_start_message) is itself classified as a "support"
+            # message by _is_import_support_message (fresh_start is in
+            # _IMPORT_SUPPORT_SOURCES), so a plain "no support texts" check would
+            # misclassify a real fresh_start upload as "has content". Instead,
+            # match the sentinel source_family directly: fresh_start iff every
+            # message in msgs is the fresh_start marker (or there are no messages
+            # at all).
+            is_fresh_start = all(
+                history_import._import_source_family(
+                    str(m.get("source") or m.get("source_family") or "")
+                ) == history_import._FRESH_START_SOURCE
+                for m in msgs
+            )
+            if is_fresh_start:
+                pass  # truly empty upload -> nameless done is allowed
+            else:
+                # real content but couldn't derive/salvage an identity -> failed,
+                # let the user retry instead of silently completing nameless.
+                service.mark_failed(store, job_id, "onboarding_no_identity:provider_unstable")
+                return True
     identity_first = bool(msgs) and foreground_identity.has_identity_signal(identity_payload)
     persona_ref = ""
     persona_sha = ""
@@ -696,7 +780,12 @@ def _run_plaintext_genesis_v2(
             language=language,
         )
         completed = db.genesis_complete_job(
-            store.user_id, job_id, output={"stage": "genesis_v2_foreground_ready"},
+            store.user_id, job_id,
+            output={
+                "stage": "genesis_v2_foreground_ready",
+                "history_windows_total": hw_total,
+                "history_windows_failed": hw_failed,
+            },
             memory_action_count=mem_count, identity_status="initialized",
             persona_ref=persona_ref, persona_sha256=persona_sha,
         )
@@ -1010,6 +1099,16 @@ def _run_plaintext_genesis_job(
     analysis_messages: list[dict] | None = None,
 ) -> None:
     active_key = (store.user_id, job_id)
+    started_at = time.time()
+    group_count = len(source_groups) if isinstance(source_groups, list) else 0
+    chunk_count = len(chunk_texts or [])
+    _trace_genesis(
+        store,
+        "genesis.plaintext.started",
+        job_id=job_id,
+        summary="plaintext genesis job started",
+        detail={"mode": mode, "source_kind": source_kind, "source_groups": group_count, "chunk_count": chunk_count},
+    )
     try:
         if source_groups is None:
             source_groups = [{
@@ -1038,8 +1137,16 @@ def _run_plaintext_genesis_job(
         if isinstance(runtime, tuple):
             _, err = runtime
             raise RuntimeError(json.dumps(err, ensure_ascii=False))
+        _trace_genesis(
+            store,
+            "genesis.plaintext.runtime.loaded",
+            job_id=job_id,
+            summary="runtime config loaded",
+            detail={"mode": mode},
+        )
 
         if mode == "add_memory":
+            _trace_genesis(store, "genesis.plaintext.add_memory.started", job_id=job_id, summary="add memory job started")
             _run_plaintext_add_memory_job(
                 store,
                 api_key,
@@ -1047,8 +1154,12 @@ def _run_plaintext_genesis_job(
                 runtime=runtime,
                 source_groups=source_groups,
             )
+            _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="add memory job done",
+                           detail={"mode": mode}, dur_ms=(time.time() - started_at) * 1000)
             return
         if mode == "update_identity":
+            _trace_genesis(store, "genesis.plaintext.update_identity.started", job_id=job_id,
+                           summary="update identity job started")
             _run_plaintext_update_identity_job(
                 store,
                 api_key,
@@ -1056,6 +1167,8 @@ def _run_plaintext_genesis_job(
                 runtime=runtime,
                 analysis_messages=analysis_messages,
             )
+            _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="update identity job done",
+                           detail={"mode": mode}, dur_ms=(time.time() - started_at) * 1000)
             return
 
         # Genesis v2 (FEEDLING_GENESIS_V2_ENABLED): foreground-fast — greet on 3-5 core
@@ -1066,6 +1179,8 @@ def _run_plaintext_genesis_job(
             runtime=runtime, source_groups=source_groups, relationship_anchor=relationship_anchor,
             analysis_messages=analysis_messages,
         ):
+            _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="genesis v2 job handled",
+                           detail={"mode": mode, "genesis_v2": True}, dur_ms=(time.time() - started_at) * 1000)
             return
 
         reducer_outputs: list[dict] = []
@@ -1090,6 +1205,19 @@ def _run_plaintext_genesis_job(
                 },
                 processed_chunks=processed_chunks,
             )
+            pass_started_at = time.time()
+            _trace_genesis(
+                store,
+                "genesis.plaintext.reducer_pass.started",
+                job_id=job_id,
+                summary="source reducer pass started",
+                detail={
+                    "source_family": group_source_family,
+                    "source_pass": idx,
+                    "source_pass_total": len(source_groups),
+                    "chunk_count": len(group_chunk_texts),
+                },
+            )
             output = worker.build_reducer_output_from_texts(
                 user_id=store.user_id,
                 job_id=job_id,
@@ -1099,6 +1227,21 @@ def _run_plaintext_genesis_job(
                 source_kind=group_source_kind,
                 existing_persona=existing_persona,
                 existing_voice=existing_voice,
+            )
+            _trace_genesis(
+                store,
+                "genesis.plaintext.reducer_pass.done",
+                job_id=job_id,
+                summary="source reducer pass done",
+                detail={
+                    "source_family": group_source_family,
+                    "source_pass": idx,
+                    "source_pass_total": len(source_groups),
+                    "memory_count": len(output.get("memories") or []) if isinstance(output, dict) else 0,
+                    "has_identity": bool(isinstance(output, dict) and output.get("identity")),
+                    "has_persona": bool(isinstance(output, dict) and output.get("persona")),
+                },
+                dur_ms=(time.time() - pass_started_at) * 1000,
             )
             reducer_outputs.append(output)
             processed_chunks += len(group_chunk_texts)
@@ -1120,8 +1263,37 @@ def _run_plaintext_genesis_job(
             output={"stage": "plaintext_reducer_done"},
             processed_chunks=sum(len(group.get("chunk_texts") or []) for group in source_groups),
         )
+        _trace_genesis(
+            store,
+            "genesis.plaintext.apply.started",
+            job_id=job_id,
+            summary="apply merged reducer output",
+            detail={
+                "source_groups": len(source_groups),
+                "memory_count": len(reducer_output.get("memories") or []) if isinstance(reducer_output, dict) else 0,
+                "has_identity": bool(isinstance(reducer_output, dict) and reducer_output.get("identity")),
+                "has_persona": bool(isinstance(reducer_output, dict) and reducer_output.get("persona")),
+            },
+        )
         service.apply_reducer_output(store, api_key, job_id, reducer_output)
+        _trace_genesis(
+            store,
+            "genesis.plaintext.done",
+            job_id=job_id,
+            summary="plaintext genesis job done",
+            detail={"mode": mode, "source_groups": len(source_groups)},
+            dur_ms=(time.time() - started_at) * 1000,
+        )
     except Exception as e:  # noqa: BLE001
+        _trace_genesis(
+            store,
+            "genesis.plaintext.failed",
+            job_id=job_id,
+            status="error",
+            summary="plaintext genesis job failed",
+            detail={"mode": mode, "reason": f"{type(e).__name__}:{str(e)[:180]}"},
+            dur_ms=(time.time() - started_at) * 1000,
+        )
         service.mark_failed(store, job_id, f"plaintext_import_failed:{type(e).__name__}:{str(e)[:220]}")
     finally:
         with _PLAINTEXT_ACTIVE_LOCK:

@@ -1,5 +1,9 @@
 # Agent Runtime 计划：Claude Agent SDK / Codex
 
+> **【设计存档】** 本文的 P0–P3 已实现为 `backend/agent_runtime/`
+> （supervisor / spawners / leases / litellm_gateway），本文保留作设计
+> 存档；现状以 `docs/CHANGELOG.md` 与代码为准。
+
 日期：2026-06-24
 
 本文描述 Feedling 如何为 API 用户运行一个真正的 hosted agent loop，同时让
@@ -46,7 +50,7 @@ Phala CVM
 - 不给 hosted agent 直接访问 backend 数据库或 enclave 的权限。
 - 不让多个用户共享同一个 Claude/Codex home 目录。
 - 不把长期 provider key 写进 env 文件、runtime 目录或日志。
-- 不把 Docker socket 暴露给 Flask backend。
+- 不把 Docker socket 暴露给 backend。
 
 ## Runtime 拓扑
 
@@ -167,7 +171,7 @@ while running:
 ```
 
 consumer 应通过 backend HTTP API 调用 Feedling，不要 import backend 全局对象。
-这样 runner worker 不依赖 Flask request state。
+这样 runner worker 不依赖 backend 的 request state。
 
 ## 工具层
 

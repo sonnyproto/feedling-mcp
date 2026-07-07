@@ -82,7 +82,7 @@ def _elect_loop(name: str, start_fn) -> None:
 def run_singleton(name: str, start_fn) -> None:
     """Run ``start_fn`` on exactly one worker. Spawns a daemon election thread;
     the winner calls ``start_fn`` once and holds the lock, losers wait and take
-    over if the winner dies. Call from the app.py assembly section."""
+    over if the winner dies. Call from the asgi/lifespan.py assembly section."""
     threading.Thread(
         target=_elect_loop, args=(name, start_fn), daemon=True, name=f"leader-{name}"
     ).start()

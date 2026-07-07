@@ -176,8 +176,9 @@ Set one of:
 
 - **`FEEDLING_ENCLAVE_URL`** (recommended) — direct HTTPS to the
   enclave's decrypt proxy.
-- **`FEEDLING_MCP_URL`** (fallback) — calls `feedling_chat_get_history`
-  on the MCP server. Requires `FEEDLING_MCP_TRANSPORT=streamable-http`.
+- **`FEEDLING_MCP_URL`** (legacy — no longer usable) — used to fall back
+  to `feedling_chat_get_history` on the MCP server. The MCP server was
+  removed on 2026-06-12, so this path is dead; use `FEEDLING_ENCLAVE_URL`.
 
 Without either, the daemon logs `"no plaintext content"` for every
 incoming message and never replies. You'd see this as: iOS app shows

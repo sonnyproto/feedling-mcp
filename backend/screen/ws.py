@@ -22,7 +22,7 @@ def _resolve_ws_user(websocket) -> tuple[str, str] | None:
     Reads ?key=... from the path, or "Bearer ..." from the Authorization
     header (whichever arrives first)."""
     # websockets lib v12+ uses websocket.request.path and .headers
-    path = getattr(websocket, "path", "") or ""
+    path = getattr(getattr(websocket, "request", None), "path", "") or ""
     key = None
     if "?" in path:
         try:
@@ -103,6 +103,7 @@ def _run_ws_server():
 
 
 def start():
-    """Spawn the WS ingest thread. Called by the assembly layer (app.py) at
-    the same point in import order where the thread used to auto-start."""
+    """Spawn the WS ingest thread. Called by the assembly layer via
+    core.leader.run_singleton("ws", ...) in asgi/lifespan.py, so exactly one
+    worker binds the port."""
     threading.Thread(target=_run_ws_server, daemon=True).start()

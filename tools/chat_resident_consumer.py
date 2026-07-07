@@ -928,6 +928,45 @@ def _msg_key(msg: dict) -> str:
     return f"{ts}:{msg.get('role', '')}"
 
 
+_DECRYPT_SINCE_EPSILON = 0.001
+
+
+def _poll_decrypt_since(last_ts: float, poll_messages: list[dict]) -> float:
+    """Decrypt-history window for this poll batch.
+
+    Normally the cursor. But the server's lost-turn redelivery backstop can
+    hand back a message whose ts is BEHIND the cursor (its turn was lost to a
+    respawn); fetching plaintext with since=last_ts would never include it,
+    _filter_messages_to_poll_ids would come back empty, and the wedge-skip
+    path would burn the claim. Pull the window back to just before the oldest
+    message in the batch so every claimed message is fetchable.
+    """
+    since = last_ts
+    for m in poll_messages:
+        if not isinstance(m, dict):
+            continue
+        try:
+            pts = float(m.get("ts", m.get("timestamp", 0)) or 0)
+        except (TypeError, ValueError):
+            continue
+        if pts and pts - _DECRYPT_SINCE_EPSILON < since:
+            since = pts - _DECRYPT_SINCE_EPSILON
+    return since
+
+
+def _poll_decrypt_limit(decrypt_since: float, last_ts: float, poll_messages: list[dict]) -> int:
+    """Decrypt-history fetch size for this poll batch.
+
+    A pulled-back window (redelivered messages) spans more history than the
+    usual tail, and EVERY claimed message must fit in one fetch: a truncated
+    fetch drops claimed messages, and a redelivery claim can't be retried until
+    its TTL expires. Sized to the batch (interleaved openclaw replies roughly
+    double the row count) with a floor of 50."""
+    if decrypt_since >= last_ts:
+        return 20
+    return max(50, 2 * len(poll_messages) + 20)
+
+
 def _filter_messages_to_poll_ids(messages: list[dict], poll_messages: list[dict]) -> list[dict]:
     """Keep only decrypted rows that this poll cycle actually claimed.
 
@@ -1691,7 +1730,14 @@ def _visible_reply_fragment_from_text(text: str) -> Any:
     if not starts:
         return None
     fragment = stripped[min(starts):].strip().rstrip(",")
-    parsed = _safe_json_loads("{" + fragment + "}")
+    candidates = ["{" + fragment + "}"]
+    if fragment.endswith("}"):
+        candidates.append("{" + fragment)
+    parsed = None
+    for candidate in candidates:
+        parsed = _safe_json_loads(candidate)
+        if isinstance(parsed, dict) and isinstance(parsed.get("messages"), list):
+            break
     if isinstance(parsed, dict) and isinstance(parsed.get("messages"), list):
         return parsed
     return None
@@ -1821,7 +1867,14 @@ def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
     dst.actions.extend(src.actions)
     dst.messages.extend(src.messages)
     dst.tool_calls.extend(src.tool_calls)
-    if not dst.thinking_summary and src.thinking_summary:
+    prefer_src_thinking = bool(src.thinking_summary) and (
+        not dst.thinking_summary
+        or (
+            src.thinking_kind == "agent_summary"
+            and dst.thinking_kind == "provider_reasoning"
+        )
+    )
+    if prefer_src_thinking:
         dst.thinking_summary = src.thinking_summary
         dst.thinking_kind = src.thinking_kind
         dst.thinking_source = src.thinking_source
@@ -1842,9 +1895,7 @@ def _agent_turn_from_content_blocks(
         return turn
     for block in blocks:
         if isinstance(block, str):
-            clean = _sanitize_reply_text(block)
-            if clean:
-                turn.messages.append(clean)
+            _merge_agent_turn(turn, _agent_turn_from_obj(block))
             continue
         if not isinstance(block, dict):
             continue
@@ -1852,9 +1903,7 @@ def _agent_turn_from_content_blocks(
         if block_type == "text":
             text = block.get("text")
             if isinstance(text, str):
-                clean = _sanitize_reply_text(text)
-                if clean:
-                    turn.messages.append(clean)
+                _merge_agent_turn(turn, _agent_turn_from_obj(text))
             continue
         if block_type == "thinking" and not turn.thinking_summary:
             summary = block.get("thinking") or block.get("text")
@@ -3155,8 +3204,15 @@ def call_agent_cli(
                       summary="cli turn start",
                       explain="模型调用发起（" + ("codex" if _is_codex_cmd(cmd) else "claude") + "）",
                       content_excerpt={"prompt_head": (message or "")[:1000]})
+    child_env = os.environ.copy()
+    if trace_id:
+        child_env["FEEDLING_TRACE_ID"] = trace_id
+        child_env["FEEDLING_DEBUG_TRACE_ID"] = trace_id
+    else:
+        child_env.pop("FEEDLING_TRACE_ID", None)
+        child_env.pop("FEEDLING_DEBUG_TRACE_ID", None)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=child_env)
     except subprocess.TimeoutExpired:
         _emit_debug_trace("agent", "agent.model.call.error", status="error", trace_id=trace_id,
                           dur_ms=(time.monotonic() - _turn_t0) * 1000,
@@ -6801,7 +6857,11 @@ def run() -> None:
             # poll is used only as a trigger — its content fields are "" for
             # v1 encrypted envelopes. Fetch actual plaintext from a decrypt source.
             if FEEDLING_ENCLAVE_URL:
-                decrypted = get_decrypted_history(since=last_ts, limit=20)
+                decrypt_since = _poll_decrypt_since(last_ts, poll_messages)
+                decrypted = get_decrypted_history(
+                    since=decrypt_since,
+                    limit=_poll_decrypt_limit(decrypt_since, last_ts, poll_messages),
+                )
                 if decrypted is None:
                     # All configured sources failed — skip this cycle, keep checkpoint.
                     log.warning(

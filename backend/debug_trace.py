@@ -1,4 +1,4 @@
-"""v1 flow trace — gated per-user observability ring buffer (M0).
+"""v1 flow trace — per-user observability ring buffer (M0).
 
 Turns "I feel like the flow ran" into "I did X, the panel shows event Y, so the
 path objectively ran." Covers host(agent_runtime) + vps(resident consumer) +
@@ -6,14 +6,17 @@ genesis/memory/identity/perception/proactive because the events are recorded
 where the flow actually happens (backend turn internals + incoming tool calls +
 the resident consumer).
 
-PRIVACY: the panel is a flow indicator, NOT a plaintext log. Callers must pass
-METADATA ONLY in `detail` — ids, counts, route reasons, status, source_kind,
-persona_version hash. Never raw memory content / transcript / persona text. The
-whole thing is a no-op unless the per-user flag is on (off by default).
+PRIVACY: `detail` should stay metadata-oriented. Plaintext snippets belong in
+`content_excerpt`, which is capped and can be stripped deploy-wide with
+FEEDLING_DEBUG_VERBOSE=0. During beta, trace recording is default-on for every
+user so admin can inspect real failures; FEEDLING_V1_FLOW_TRACE=0 remains the
+deploy-wide kill switch, and a per-user flag can still opt a user out.
 """
 from __future__ import annotations
 
 import os
+import queue
+import threading
 import time
 from typing import Any
 
@@ -26,13 +29,21 @@ _MAX_EVENTS_VERBOSE = 200
 _EXCERPT_FIELD_MAX = 2048
 _EXCERPT_EVENT_MAX = 8192
 _TRUNC_MARK = "…(truncated)"
-_TTL_SEC = 24 * 3600
+_TTL_SEC = 48 * 3600  # beta debug retention: enough to inspect yesterday's reports
 _FLAG_CACHE_TTL = 30.0
+_QUEUE_MAX = 5000
+_FLUSH_BATCH_MAX = 100
+_FLUSH_WAIT_SEC = 0.25
 
 # subsystem ∈ memory|genesis|identity|route|voice|perception|proactive|fallback|account
 # actor     ∈ host_agent_runtime|vps_resident|backend|ios
 
 _flag_cache: dict[str, tuple[bool, float]] = {}
+_event_queue: "queue.Queue[tuple[str, dict[str, Any]]]" = queue.Queue(maxsize=_QUEUE_MAX)
+_worker_lock = threading.Lock()
+_worker_started = False
+_dropped_lock = threading.Lock()
+_dropped_by_uid: dict[str, int] = {}
 
 
 def _hard_disabled() -> bool:
@@ -43,9 +54,23 @@ def _hard_disabled() -> bool:
 
 
 def _deploy_enabled() -> bool:
-    """Deploy-level allowed unless hard-disabled. (The per-user toggle still gates
-    actual recording; a normal prod user who never opens DebugTool stays off.)"""
+    """Deploy-level allowed unless hard-disabled."""
     return not _hard_disabled()
+
+
+def _default_enabled() -> bool:
+    """Beta default: record flow traces for all users unless explicitly disabled.
+
+    FEEDLING_V1_FLOW_TRACE_DEFAULT=0 is a softer rollout valve than the hard
+    deploy kill switch: it restores old opt-in behavior while leaving explicit
+    per-user enables working.
+    """
+    return os.environ.get("FEEDLING_V1_FLOW_TRACE_DEFAULT", "").strip().lower() not in (
+        "0",
+        "false",
+        "off",
+        "no",
+    )
 
 
 def is_enabled(store) -> bool:
@@ -58,8 +83,13 @@ def is_enabled(store) -> bool:
     cached = _flag_cache.get(uid)
     if cached and cached[1] > now:
         return cached[0]
-    flag = db.get_blob(uid, DEBUG_TRACE_FLAG_BLOB) or {}
-    enabled = bool(flag.get("enabled")) if isinstance(flag, dict) else bool(flag)
+    flag = db.get_blob(uid, DEBUG_TRACE_FLAG_BLOB)
+    if isinstance(flag, dict) and "enabled" in flag:
+        enabled = bool(flag.get("enabled"))
+    elif flag is None:
+        enabled = _default_enabled()
+    else:
+        enabled = bool(flag)
     _flag_cache[uid] = (enabled, now + _FLAG_CACHE_TTL)
     return enabled
 
@@ -101,6 +131,150 @@ def _safe_content_excerpt(d: dict[str, Any] | None) -> dict[str, Any]:
     return out
 
 
+def _enabled_fast(store) -> bool:
+    """Hot-path gate for trace_event.
+
+    This intentionally avoids DB reads. Per-user toggles are reflected through
+    the short in-process flag cache when known; otherwise beta default-on/off is
+    decided from env. A stale opt-out may allow an event to enter the queue, but
+    the background flusher re-checks the real gate before writing.
+    """
+    if _hard_disabled():
+        return False
+    uid = getattr(store, "user_id", "") or ""
+    if not uid:
+        return False
+    now = time.time()
+    cached = _flag_cache.get(uid)
+    if cached and cached[1] > now:
+        return cached[0]
+    return _default_enabled()
+
+
+def _record_drop(uid: str, count: int = 1) -> None:
+    if not uid:
+        return
+    with _dropped_lock:
+        _dropped_by_uid[uid] = _dropped_by_uid.get(uid, 0) + max(1, int(count or 1))
+
+
+def _take_dropped(uid: str) -> int:
+    if not uid:
+        return 0
+    with _dropped_lock:
+        return int(_dropped_by_uid.pop(uid, 0) or 0)
+
+
+def _append_events(uid: str, new_events: list[dict[str, Any]]) -> None:
+    if not uid or not new_events:
+        return
+    try:
+        store = type("_TraceStore", (), {"user_id": uid})()
+        if not is_enabled(store):
+            return
+        now = time.time()
+        verbose = verbose_enabled(store)
+        dropped = _take_dropped(uid)
+        if dropped:
+            new_events = [{
+                "ts": now,
+                "subsystem": "debug_trace",
+                "type": "debug_trace.dropped",
+                "actor": "backend",
+                "status": "warn",
+                "summary": f"dropped {dropped} debug trace events",
+                "explain": "Debug trace queue was full; events were dropped so product flow stayed non-blocking.",
+                "trace_id": "",
+                "turn_id": "",
+                "job_id": "",
+                "detail": {"dropped": dropped},
+            }] + new_events
+        buf = db.get_blob(uid, DEBUG_TRACE_BLOB)
+        events = buf.get("events") if isinstance(buf, dict) and isinstance(buf.get("events"), list) else []
+        events.extend(new_events)
+        cutoff = now - _TTL_SEC
+        cap = _MAX_EVENTS_VERBOSE if verbose else _MAX_EVENTS
+        events = [e for e in events if float(e.get("ts") or 0) >= cutoff][-cap:]
+        db.set_blob(uid, DEBUG_TRACE_BLOB, {"v": 1, "events": events})
+    except Exception:
+        _record_drop(uid, len(new_events))
+
+
+def _flush_batch(batch: list[tuple[str, dict[str, Any]]]) -> None:
+    by_uid: dict[str, list[dict[str, Any]]] = {}
+    for uid, event in batch:
+        by_uid.setdefault(uid, []).append(event)
+    for uid, events in by_uid.items():
+        _append_events(uid, events)
+
+
+def _worker_loop() -> None:
+    while True:
+        try:
+            item = _event_queue.get()
+            batch = [item]
+            deadline = time.monotonic() + _FLUSH_WAIT_SEC
+            while len(batch) < _FLUSH_BATCH_MAX:
+                timeout = max(0.0, deadline - time.monotonic())
+                if timeout <= 0:
+                    break
+                try:
+                    batch.append(_event_queue.get(timeout=timeout))
+                except queue.Empty:
+                    break
+            _flush_batch(batch)
+        except Exception:
+            pass
+
+
+def _ensure_worker_started() -> None:
+    global _worker_started
+    if _worker_started:
+        return
+    with _worker_lock:
+        if _worker_started:
+            return
+        threading.Thread(target=_worker_loop, name="debug-trace-flush", daemon=True).start()
+        _worker_started = True
+
+
+def _enqueue(uid: str, event: dict[str, Any]) -> None:
+    _ensure_worker_started()
+    try:
+        _event_queue.put_nowait((uid, event))
+    except queue.Full:
+        _record_drop(uid)
+
+
+def _flush_pending_for_user(uid: str, *, timeout: float = 0.5) -> None:
+    """Best-effort debug-read helper: drain queued events for one user.
+
+    This may touch DB, so only callers on debug/admin read paths should use it.
+    The product write path (`trace_event`) never waits for this.
+    """
+    if not uid:
+        return
+    deadline = time.monotonic() + max(0.0, timeout)
+    mine: list[dict[str, Any]] = []
+    others: list[tuple[str, dict[str, Any]]] = []
+    while time.monotonic() < deadline:
+        try:
+            item_uid, event = _event_queue.get_nowait()
+        except queue.Empty:
+            break
+        if item_uid == uid:
+            mine.append(event)
+        else:
+            others.append((item_uid, event))
+    for item in others:
+        try:
+            _event_queue.put_nowait(item)
+        except queue.Full:
+            _record_drop(item[0])
+    if mine:
+        _append_events(uid, mine)
+
+
 def trace_event(
     store,
     *,
@@ -121,13 +295,13 @@ def trace_event(
 
     Best-effort: never raises (debug must not break the request path)."""
     try:
-        if not is_enabled(store):
+        if not _enabled_fast(store):
             return
         uid = getattr(store, "user_id", "") or ""
         if not uid:
             return
         now = time.time()
-        verbose = verbose_enabled(store)
+        verbose = os.environ.get("FEEDLING_DEBUG_VERBOSE", "").strip().lower() not in ("0", "false", "off", "no")
         event = {
             "ts": now,
             "subsystem": str(subsystem or "")[:40],
@@ -148,14 +322,7 @@ def trace_event(
                 pass
         if verbose and content_excerpt:
             event["content_excerpt"] = _safe_content_excerpt(content_excerpt)
-        buf = db.get_blob(uid, DEBUG_TRACE_BLOB)
-        events = buf.get("events") if isinstance(buf, dict) and isinstance(buf.get("events"), list) else []
-        events.append(event)
-        # drop TTL-expired + cap to the most recent cap (ring shrinks in verbose mode)
-        cutoff = now - _TTL_SEC
-        cap = _MAX_EVENTS_VERBOSE if verbose else _MAX_EVENTS
-        events = [e for e in events if float(e.get("ts") or 0) >= cutoff][-cap:]
-        db.set_blob(uid, DEBUG_TRACE_BLOB, {"v": 1, "events": events})
+        _enqueue(uid, event)
     except Exception:
         pass  # observability must never break the actual flow
 
@@ -164,6 +331,7 @@ def read_trace(store, *, limit: int = 200, subsystem: str = "") -> list[dict]:
     uid = getattr(store, "user_id", "") or ""
     if not uid:
         return []
+    _flush_pending_for_user(uid)
     buf = db.get_blob(uid, DEBUG_TRACE_BLOB) or {}
     events = buf.get("events") if isinstance(buf, dict) and isinstance(buf.get("events"), list) else []
     if subsystem:

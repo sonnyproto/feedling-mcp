@@ -764,6 +764,71 @@ def _chat_completion_openai_responses(
     }
 
 
+# openai-compat 的 wire 编解码是 sync（_chat_completion_openai_compatible）与
+# async（chat_completion_async）共用的单实现：payload 构造、openrouter reasoning
+# 400/422 降级判定、响应解析都在下面三个纯函数里，两个调用方只各自保留
+# httpx sync/async 的 transport 差异。改契约改这里，两边自动同步。
+
+def _build_openai_compat_payload(
+    *,
+    provider: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    temperature: float,
+    max_tokens: int,
+    response_format: dict[str, Any] | None,
+    extra_body: dict[str, Any] | None,
+    include_reasoning: bool,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "temperature": temperature,
+        "max_tokens": max(1, min(int(max_tokens), 8192)),
+    }
+    if response_format:
+        payload["response_format"] = response_format
+    if extra_body:
+        payload.update(extra_body)
+    if include_reasoning and provider == "openrouter":
+        payload.setdefault("reasoning", {"enabled": True, "exclude": False})
+    return payload
+
+
+def _reasoning_fallback_payload(
+    payload: dict[str, Any], resp, *, provider: str, include_reasoning: bool,
+) -> dict[str, Any] | None:
+    """openrouter 对不支持 reasoning 的模型回 400/422：去掉 reasoning 重试一次。
+    不适用时返回 None（调用方原样 raise）。"""
+    if (include_reasoning and provider == "openrouter"
+            and resp.status_code in {400, 422} and "reasoning" in payload):
+        fallback = dict(payload)
+        fallback.pop("reasoning", None)
+        return fallback
+    return None
+
+
+def _parse_openai_compat_body(
+    resp, *, provider: str, model: str, require_reply: bool,
+) -> dict[str, Any]:
+    try:
+        body = resp.json()
+    except ValueError as e:
+        raise ProviderError("provider returned non-json response") from e
+    if not isinstance(body, dict):
+        raise ProviderError("provider returned non-object response")
+    return {
+        "reply": _extract_reply(body, required=require_reply),
+        "reasoning": _extract_openai_compatible_reasoning(body),
+        "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
+        "raw_id": body.get("id", ""),
+        "stop_reason": _extract_openai_compatible_stop_reason(body),
+        "provider": provider,
+        "model": model,
+    }
+
+
 def _chat_completion_openai_compatible(
     *,
     provider: str,
@@ -779,19 +844,11 @@ def _chat_completion_openai_compatible(
     require_reply: bool = True,
     include_reasoning: bool = False,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "stream": False,
-        "temperature": temperature,
-        "max_tokens": max(1, min(int(max_tokens), 8192)),
-    }
-    if response_format:
-        payload["response_format"] = response_format
-    if extra_body:
-        payload.update(extra_body)
-    if include_reasoning and provider == "openrouter":
-        payload.setdefault("reasoning", {"enabled": True, "exclude": False})
+    payload = _build_openai_compat_payload(
+        provider=provider, model=model, messages=messages,
+        temperature=temperature, max_tokens=max_tokens,
+        response_format=response_format, extra_body=extra_body,
+        include_reasoning=include_reasoning)
 
     def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
         try:
@@ -808,30 +865,15 @@ def _chat_completion_openai_compatible(
     try:
         _raise_for_provider_status(resp)
     except ProviderError:
-        if include_reasoning and provider == "openrouter" and resp.status_code in {400, 422} and "reasoning" in payload:
-            fallback_payload = dict(payload)
-            fallback_payload.pop("reasoning", None)
-            resp = post_with_payload(fallback_payload)
-            _raise_for_provider_status(resp)
-        else:
+        fallback_payload = _reasoning_fallback_payload(
+            payload, resp, provider=provider, include_reasoning=include_reasoning)
+        if fallback_payload is None:
             raise
+        resp = post_with_payload(fallback_payload)
+        _raise_for_provider_status(resp)
 
-    try:
-        body = resp.json()
-    except ValueError as e:
-        raise ProviderError("provider returned non-json response") from e
-    if not isinstance(body, dict):
-        raise ProviderError("provider returned non-object response")
-
-    return {
-        "reply": _extract_reply(body, required=require_reply),
-        "reasoning": _extract_openai_compatible_reasoning(body),
-        "usage": body.get("usage") if isinstance(body.get("usage"), dict) else {},
-        "raw_id": body.get("id", ""),
-        "stop_reason": _extract_openai_compatible_stop_reason(body),
-        "provider": provider,
-        "model": model,
-    }
+    return _parse_openai_compat_body(
+        resp, provider=provider, model=model, require_reply=require_reply)
 
 
 def _chat_completion_anthropic(
@@ -1101,3 +1143,103 @@ def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
         timeout=30.0,
         require_reply=False,
     )
+
+
+# --- async variant (enclave ASGI migration) --------------------------------
+# 只有 openai-wire（openai 非 responses / openrouter / deepseek /
+# openai_compatible）有原生 async 实现——enclave caption 走 openrouter，这是
+# 唯一需要"45s 长等待只挂协程"的调用方。anthropic / gemini / openai-responses
+# 的编解码保持单实现（同步版），经 anyio 线程桥调用，避免双份 wire codec 漂移。
+# 同步 chat_completion 与异步版各用各的 httpx client，绝不混用（spec §4）。
+
+_shared_async_client: httpx.AsyncClient | None = None
+
+
+def _async_http_client() -> httpx.AsyncClient:
+    global _shared_async_client
+    if _shared_async_client is None or _shared_async_client.is_closed:
+        _shared_async_client = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_keepalive_connections=20,
+                max_connections=100,
+                keepalive_expiry=90.0,
+            ),
+        )
+    return _shared_async_client
+
+
+async def aclose_async_http_client() -> None:
+    global _shared_async_client
+    client, _shared_async_client = _shared_async_client, None
+    if client is not None and not client.is_closed:
+        await client.aclose()
+
+
+async def chat_completion_async(
+    config: ProviderConfig,
+    messages: list[dict[str, Any]],
+    *,
+    max_tokens: int = 700,
+    temperature: float = 0.7,
+    timeout: float = 60.0,
+    response_format: dict[str, Any] | None = None,
+    require_reply: bool = True,
+    include_reasoning: bool = False,
+) -> dict[str, Any]:
+    provider, model, base_url = validate_config(
+        config.provider, config.model, config.base_url
+    )
+    request_model, extra_body = _runtime_model(provider, model)
+    key = (config.api_key or "").strip()
+    if not key:
+        raise ProviderError("api_key required")
+
+    if provider in ("anthropic", "gemini") or (
+        provider == "openai" and _openai_uses_responses_for_reasoning(request_model)
+    ):
+        import anyio.to_thread
+        from functools import partial
+
+        return await anyio.to_thread.run_sync(partial(
+            chat_completion, config, messages,
+            max_tokens=max_tokens, temperature=temperature, timeout=timeout,
+            response_format=response_format, require_reply=require_reply,
+            include_reasoning=include_reasoning,
+        ))
+
+    # openai-compat 编解码与同步版共享单实现（_build/_reasoning_fallback/
+    # _parse 三个纯函数），这里只保留 async transport。
+    # NOTE: model 传 request_model（runtime 映射后真正上 wire 的模型，如
+    # deepseek-chat -> deepseek-v4-flash）——与同步 chat_completion 调
+    # _chat_completion_openai_compatible 时的取值一致，返回 dict 的 "model"
+    # 因此是映射值而非 config.model。
+    payload = _build_openai_compat_payload(
+        provider=provider, model=request_model, messages=messages,
+        temperature=temperature, max_tokens=max_tokens,
+        response_format=response_format, extra_body=extra_body,
+        include_reasoning=include_reasoning)
+
+    async def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
+        try:
+            return await _async_http_client().post(
+                f"{base_url.rstrip('/')}/chat/completions",
+                headers=_headers(ProviderConfig(provider, request_model, key, base_url)),
+                json=request_payload,
+                timeout=timeout,
+            )
+        except httpx.HTTPError as e:
+            raise ProviderError(f"provider network error: {type(e).__name__}") from e
+
+    resp = await post_with_payload(payload)
+    try:
+        _raise_for_provider_status(resp)
+    except ProviderError:
+        fallback_payload = _reasoning_fallback_payload(
+            payload, resp, provider=provider, include_reasoning=include_reasoning)
+        if fallback_payload is None:
+            raise
+        resp = await post_with_payload(fallback_payload)
+        _raise_for_provider_status(resp)
+
+    return _parse_openai_compat_body(
+        resp, provider=provider, model=request_model, require_reply=require_reply)

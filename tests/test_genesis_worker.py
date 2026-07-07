@@ -738,9 +738,16 @@ def test_memory_summary_source_feeds_fact_write_material_without_maps(monkeypatc
 
 def test_tick_marks_failed_when_claimed_job_has_missing_chunks(monkeypatch):
     failures = []
+    trace_events = []
     monkeypatch.setattr(worker, "get_store", lambda user_id: types.SimpleNamespace(user_id=user_id))
     monkeypatch.setattr(worker.service, "write_genesis_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(worker.service, "mark_failed", lambda _store, job_id, error: failures.append((job_id, error)))
+    monkeypatch.setattr(
+        worker,
+        "debug_trace",
+        types.SimpleNamespace(trace_event=lambda *_args, **kwargs: trace_events.append(kwargs)),
+        raising=False,
+    )
     monkeypatch.setattr(
         worker.db,
         "genesis_claim_uploaded_jobs",
@@ -758,6 +765,7 @@ def test_tick_marks_failed_when_claimed_job_has_missing_chunks(monkeypatch):
     assert result["failed"] == 1
     assert failures[0][0] == "job_1"
     assert "missing_chunks:1" in failures[0][1]
+    assert any(event["type"] == "genesis.worker.failed" for event in trace_events)
 
 
 def test_tick_marks_failed_for_empty_import_without_provider_calls(monkeypatch):
@@ -900,3 +908,55 @@ def test_reap_stale_blob_sync_failure_still_counts_job_reaped(monkeypatch):
 
     assert synced == ["job_b"]
     assert {r["job_id"] for r in reaped} == {"job_a", "job_b"}
+
+
+class _FakeLLM:
+    def __init__(self, seq):
+        self.seq = list(seq)
+        self.calls = 0
+
+    def complete(self, *a, **k):
+        item = self.seq[self.calls]
+        self.calls += 1
+        if isinstance(item, Exception):
+            raise item
+        return type("R", (), {"text": item, "usage": None})()
+
+
+def test_retry_empty_raises_transient_immediately_no_outer_retry(monkeypatch):
+    # 1st call ReadTimeout (transient) -> raises immediately, no outer retry.
+    # The inner reliable_chat_completion already exhausted its own transient
+    # retries (3x with backoff); looping again here would just double the stall.
+    llm = _FakeLLM([provider_client.ProviderError("provider network error: ReadTimeout"),
+                    '{"fact_candidates":[{"about":"user","summary":"x"}]}'])
+    with pytest.raises(provider_client.ProviderError):
+        worker._complete_json_retry_empty(
+            llm, user_id="u", job_id="j", task_id="fact-map-0",
+            runtime=object(), messages=[{"role": "user", "content": "x"}],
+            max_tokens=100, idempotency_key="k", is_empty=worker._combined_map_empty, max_attempts=3)
+    assert llm.calls == 1
+
+
+def test_retry_empty_does_not_retry_provider_config(monkeypatch):
+    # 402 provider_config -> raises immediately, no retry.
+    llm = _FakeLLM([provider_client.ProviderError("insufficient credit", status_code=402),
+                    '{"fact_candidates":[]}'])
+    with pytest.raises(provider_client.ProviderError):
+        worker._complete_json_retry_empty(
+            llm, user_id="u", job_id="j", task_id="fact-map-0",
+            runtime=object(), messages=[{"role": "user", "content": "x"}],
+            max_tokens=100, idempotency_key="k", is_empty=worker._combined_map_empty, max_attempts=3)
+    assert llm.calls == 1
+
+
+def test_retry_empty_still_retries_empty_result(monkeypatch):
+    # 1st call returns empty-but-valid payload -> 2nd call returns usable JSON.
+    # The empty-reply retry is the outer loop's original purpose and must be preserved.
+    llm = _FakeLLM(['{"fact_candidates":[]}',
+                    '{"fact_candidates":[{"about":"user","summary":"x"}]}'])
+    out = worker._complete_json_retry_empty(
+        llm, user_id="u", job_id="j", task_id="fact-map-0",
+        runtime=object(), messages=[{"role": "user", "content": "x"}],
+        max_tokens=100, idempotency_key="k", is_empty=worker._combined_map_empty, max_attempts=3)
+    assert out["fact_candidates"][0]["summary"] == "x"
+    assert llm.calls == 2

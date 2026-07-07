@@ -29,7 +29,9 @@
 (consumer 现在就是 `httpx verify=False` + X-API-Key;CLI 照搬即可跑通)。
 
 ## 2. 后端 MVP 合同(Codex 做) — perception 读
-新增一个 agent-facing 读端点(建议 `GET /v1/agent/perception`,或复用 `/v1/proactive/tool/execute`):
+新增一个 agent-facing 读端点(建议 `GET /v1/agent/perception`,或复用 `/v1/proactive/tool/execute`
+——注:`/v1/proactive/tool/execute` 已于 2026-06-26 删除;io_cli 实际走的是 `GET /v1/agent/perception`
+及其 `/trend`、`/history` 子端点):
 - 入参:`?signals=now,location,weather,motion,calendar,steps,sleep,workout,vitals`(或单个 verb)。
 - 出参:`{"ok":true,"signals":{"<name>":{...coarse fields...}}}`;字段沿用 catalog outputs
   (weather=condition/temperature_bucket/is_daylight;location=place_label/wifi_label/country;

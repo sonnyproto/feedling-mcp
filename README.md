@@ -13,8 +13,8 @@ Agent 是大脑，Feedling 是身体。
 > the 31 `feedling_*` tools) was removed. Historical mentions below are kept
 > only where they describe past milestones.
 
-1. **Flask HTTP backend** (`backend/app.py`) — iOS, resident-consumer, and proactive APIs
-3. **Production CVM stack** (`deploy/docker-compose.phala.yaml`) — dstack-ingress + Flask + enclave services running inside one Phala TDX CVM
+1. **HTTP backend** (FastAPI/ASGI, `backend/asgi_app.py`) — iOS, resident-consumer, and proactive APIs
+3. **Production CVM stack** (`deploy/docker-compose.phala.yaml`) — dstack-ingress + backend + enclave services running inside one Phala TDX CVM
 4. **Enclave app** (`backend/enclave_app.py`) — owns the content private key, serves `/attestation` on its own pinnable TLS port, and runs the decrypt proxy
 5. **iOS app** — now lives in the companion repo <https://github.com/teleport-computer/feedling-mcp-ios>. It owns Chat · Identity · Garden · Settings, Live Activity / Dynamic Island, Broadcast Extension for screen capture, and the live audit card.
 6. **Skill** — the agent's bootstrap + behavior spec. Lives in a separate public repo so it can be hot-updated without an iOS rebuild: <https://github.com/teleport-computer/io-onboarding>. Current onboarding splits users into three routes: own server / resident consumer, model API key, and official app import.
@@ -23,7 +23,7 @@ Agent 是大脑，Feedling 是身体。
 
 ```
 feedling-mcp-v1/
-├── backend/        ← Flask (5001) + enclave_app (5003)
+├── backend/        ← ASGI backend (5001) + enclave_app (5003)
 ├── deploy/         ← docker-compose.yaml (local/self-host)
 │                     + docker-compose.phala.yaml (production CVM)
 │                     + Caddyfile/systemd/setup.sh for self-hosting
@@ -158,7 +158,7 @@ commit is baked into the image and surfaced in
 
 ---
 
-## Status (as of 2026-05-21)
+## Status (as of 2026-07)
 
 See `docs/CHANGELOG.md` for the full landmark history. TL;DR of what's
 shipped:
@@ -166,12 +166,12 @@ shipped:
 **Shipped (Phases A–E + post-launch)**
 - [x] v0/SINGLE_USER strip — multi-tenant only; plaintext writes return 400
 - [x] iOS end-to-end: chat / memory / identity / nudges / agent replies all v1 envelopes
-- [x] Pure-CVM production stack live on Phala prod9: dstack-ingress + backend + MCP + enclave
+- [x] Pure-CVM production stack live on Phala prod9: dstack-ingress + backend + enclave (the MCP service shipped here was removed 2026-06-12)
 - [x] `api.feedling.app` routed through dstack-ingress inside the CVM
 - [x] Attestation port (5003) still terminates its own dstack-KMS-derived TLS for pinning
 - [x] On-chain `compose_hash` authorization via `FeedlingAppAuth` on Ethereum Sepolia
 - [x] iOS audit card and `tools/audit_live_cvm.py` cover prod9 ingress disclosure + enclave content-key trust
-- [x] CI: `backend/test_api.py` rewritten for envelope-only backend, green on GitHub Actions
+- [x] CI: `tests/test_api.py` rewritten for envelope-only backend, green on GitHub Actions
 - [x] CI deploys the Phala CVM from `deploy/docker-compose.phala.yaml` and publishes the live compose hash
 - [x] Prod user migrated to multi-tenant on current image; registration race and cross-tenant isolation regressions fixed
 - [x] Screen recording (Broadcast Extension) — encrypted frame ingest, agent reads via `decrypt_frame`
@@ -195,15 +195,15 @@ shipped:
 ## Architecture
 
 ```
-Official app / MCP import             Hermes / OpenClaw / Mac / server
-clients                               agents via feedling-chat-resident
+Official app clients                  Hermes / OpenClaw / Mac / server
+                                      agents via feedling-chat-resident
         │                                      │
-        │ MCP SSE (import/tools)               │ poll + HTTP/CLI agent entry
+        │ HTTPS (iOS API)                      │ poll + HTTP/CLI agent entry
         ▼                                      ▼
 ┌────────────────────────────────────────────────────────────────┐
 │                    Phala prod9 TDX CVM                         │
 │  dstack-ingress (443, LE TLS)                                  │
-│      └── api.feedling.app ──► backend (Flask API, WS, 5001)    │
+│      └── api.feedling.app ──► backend (ASGI API, WS, 5001)    │
 │                                      │                         │
 │                                      ▼                         │
 │                              enclave_app (5003)                │
@@ -232,14 +232,14 @@ clients                               agents via feedling-chat-resident
 | Process | File | Port | Purpose |
 |---------|------|------|---------|
 | dstack-ingress | `deploy/docker-compose.phala.yaml` | 443 | Production TLS for `api.feedling.app` inside the CVM |
-| Flask backend | `backend/app.py` | 5001 | iOS + agent HTTP API, envelope storage |
+| ASGI backend | `backend/asgi_app.py` | 5001 | iOS + agent HTTP API, envelope storage (FastAPI, gunicorn + UvicornWorker) |
 | Enclave app | `backend/enclave_app.py` | 5003 | TDX CVM: `/attestation`, own pinnable TLS, decrypt proxy |
 
 Production is CVM-only. `deploy/docker-compose.phala.yaml` runs
-`ingress`, `backend`, `mcp`, and `enclave` together inside the Phala
+`ingress`, `backend`, and `enclave` together inside the Phala
 prod9 TDX CVM; that file's live `compose_hash` is what the on-chain
-contract authorizes. `api.feedling.app` and `mcp.feedling.app` are
-plain HTTP upstreams behind `dstack-ingress`. The `enclave` service
+contract authorizes. `api.feedling.app` is a
+plain HTTP upstream behind `dstack-ingress`. The `enclave` service
 keeps its own TLS on `:5003` and is reached through the dstack-gateway
 `-5003s.` passthrough so iOS can pin its cert fingerprint against
 REPORT_DATA.
@@ -295,7 +295,7 @@ bash deploy/setup.sh [--install-caddy]
 
 Creates a venv under `~/feedling-venv`, installs deps, writes
 `~/feedling.env` (multi-tenant — no shared API key), and starts
-`feedling-backend` + `feedling-mcp` systemd units.
+`feedling-backend` + `feedling-chat-resident` systemd units.
 
 ### Logs
 
@@ -308,7 +308,7 @@ HTTP, so they look empty of useful detail. To read a specific service, pass
 `-c <container>`:
 
 ```bash
-# backend (Flask API + the [req] access log below). -f follows, -t adds timestamps.
+# backend (ASGI API + the [req] access log below). -f follows, -t adds timestamps.
 phala cvms logs feedling-enclave-v2 -c feedling-enclave-backend-1 --tail 200 -t
 ```
 
@@ -318,14 +318,13 @@ something the CLI lists (`phala cvms` has no `ps`/`exec`). The live containers:
 
 | service | `-c` name |
 |---------|-----------|
-| backend (Flask API) | `feedling-enclave-backend-1` |
-| mcp (FastMCP SSE) | `feedling-enclave-mcp-1` |
+| backend (ASGI API) | `feedling-enclave-backend-1` |
 | enclave (attestation + decrypt) | `feedling-enclave-enclave-1` |
 | ingress (HAProxy — the default when `-c` is omitted) | `feedling-enclave-ingress-1` |
 
-**Per-request access log.** The backend runs under gunicorn in production, which
-does not reproduce Flask's old dev-server access line, so the backend emits its
-own structured line per request:
+**Per-request access log.** The backend runs under gunicorn (UvicornWorker) in
+production, which has no built-in per-request access line here, so the backend
+emits its own structured line per request:
 
 ```
 [req] uid=usr_xxx GET /v1/chat/history?limit=40 status=200 bytes=960515 enc=br dur_ms=37
@@ -403,37 +402,13 @@ Handy filters (append to a `phala cvms logs ... -c feedling-enclave-backend-1` p
 All write endpoints that take content enforce v1 envelope shape and
 reject plaintext with `400 plaintext_write_rejected`.
 
-### MCP tools (23 total)
+### MCP tools (removed 2026-06-12)
 
-| Tool | Maps to |
-|------|---------|
-| `feedling_bootstrap` | POST /v1/bootstrap |
-| `feedling_identity_init` | POST /v1/identity/init (requires `days_with_user` — sets relationship anchor) |
-| `feedling_identity_get` | GET /v1/identity/get (decrypted via enclave proxy; `days_with_user` is server-computed live) |
-| `feedling_identity_replace` | POST /v1/identity/replace — full card rewrite, optionally re-anchors relationship |
-| `feedling_identity_set_relationship_days` | POST /v1/identity/relationship_anchor — calibrate relationship age, no envelope rewrite |
-| `feedling_identity_nudge` | in-CVM decrypt-mutate-rewrap → POST /v1/identity/replace (preserves anchor) |
-| `feedling_memory_add_moment` | POST /v1/memory/add (wraps to v1 inside CVM) |
-| `feedling_memory_list` | GET /v1/memory/list |
-| `feedling_memory_get` | GET /v1/memory/get |
-| `feedling_memory_delete` | DELETE /v1/memory/delete |
-| `feedling_memory_verify` | GET /v1/memory/verify |
-| `feedling_identity_verify` | GET /v1/identity/verify |
-| `feedling_chat_verify_loop` | POST /v1/chat/verify_loop |
-| `feedling_push_dynamic_island` | POST /v1/push/dynamic-island |
-| `feedling_push_live_activity` | POST /v1/push/live-activity |
-| `feedling_screen_latest_frame` | GET /v1/screen/frames/latest (metadata only) |
-| `feedling_screen_frames_list` | GET /v1/screen/frames (metadata only; encrypted) |
-| `feedling_screen_analyze` | GET /v1/screen/analyze |
-| `feedling_screen_summary` | GET /v1/screen/summary |
-| `feedling_screen_decrypt_frame` | GET /v1/screen/frames/<id>/decrypt — Image block + OCR for agent vision |
-| `feedling_chat_post_message` | wraps to v1 envelope → POST /v1/chat/response |
-| `feedling_chat_post_image` | wraps a base64 image as `content_type=image` → POST /v1/chat/response |
-| `feedling_chat_get_history` | GET /v1/chat/history |
-
-The `?key=<api_key>` on the SSE URL is captured by an ASGI
-middleware on the first GET and pinned to the MCP session — every
-subsequent tool call is routed as that user.
+The FastMCP SSE server and its `feedling_*` tool set (23 tools mapping
+onto the HTTP endpoints above) were removed on 2026-06-12; users now
+connect through the iOS app + agent-runner paths instead. For the
+historical tool table and the SSE `?key=` session-pinning details, see
+git history and `deploy/DEPLOYMENTS.md`.
 
 ---
 
@@ -511,25 +486,14 @@ The public iOS onboarding now starts by asking the user which route they need:
    Import is supported; reliable real-time IO Chat is not supported unless the
    user later chooses a live route.
 
-### Official-app / MCP import runtimes
+### Official-app / MCP import runtimes (removed 2026-06-12)
 
-Claude / ChatGPT / Gemini-style clients use the MCP one-liner from the iOS
-app's **Settings → Storage → Connection Details** or the Chat onboarding path:
-
-```
-claude mcp add feedling --transport sse "https://mcp.feedling.app/sse?key=<api_key>"
-```
-
-Self-hosted users derive the same shape using their own domain:
-
-```
-claude mcp add feedling --transport sse "https://mcp.<your-domain>/sse?key=<api_key>"
-```
-
-Direct MCP is enough for memory, identity, and tool calls when the product
-supports MCP/tools. It is not, by itself, an ongoing incoming-message loop.
-If the chat client cannot stay alive after the user closes the window/session,
-this route remains import-only until the user chooses a live route.
+The MCP import route — `claude mcp add feedling --transport sse
+"https://mcp.feedling.app/sse?key=<api_key>"` against the FastMCP SSE
+server — was removed on 2026-06-12 together with that server. Users of
+official apps are now served through the iOS app + agent-runner paths.
+The historical setup instructions live in git history and
+`deploy/DEPLOYMENTS.md`.
 
 ### Hermes / OpenClaw / machine-resident agents
 
@@ -599,8 +563,7 @@ Caddy, DNS, iOS pointing at your URL+key).
 | `FEEDLING_CVM_APP_ID` | `9798850e096d770293c67305c6cfdceed68c1d28` (production iOS default) |
 | `FEEDLING_CVM_GATEWAY_DOMAIN` | `dstack-pha-prod9.phala.network` |
 | Public API domain | `api.feedling.app` via dstack-ingress |
-| Public MCP domain | `mcp.feedling.app` via dstack-ingress |
-| Flask port | `5001` |
+| Backend port | `5001` |
 | Enclave port | `5003` (in CVM only) |
 | WebSocket port | `9998` (`wss://<app_id>-9998.<gateway>/ingest` in production) |
 | App Group | `group.com.feedling.mcp` |

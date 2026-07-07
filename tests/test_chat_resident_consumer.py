@@ -38,7 +38,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
 # Stub out content_encryption only when the backend tree is unavailable. In the
-# full backend suite, app.py needs the real module; poisoning sys.modules here
+# full backend suite, the backend needs the real module; poisoning sys.modules here
 # makes later envelope tests import a fake build_envelope.
 try:
     import content_encryption  # noqa: F401
@@ -3233,6 +3233,63 @@ def test_agent_turn_extracts_bare_visible_thinking_summary_fragment():
 
     assert turn.messages == ["宝贝，还是那句话——我的底层是 `anthropic/claude-sonnet-4.5`。"]
     assert turn.thinking_summary == "用户再次确认模型身份，直接给出真实答案"
+    assert "thinking_summary" not in turn.messages[0]
+    assert "messages" not in turn.messages[0]
+
+
+def test_agent_turn_extracts_bare_visible_thinking_summary_fragment_with_trailing_brace():
+    raw = (
+        '"thinking_summary": "注意到57秒前关于模型身份的回答有误，决定简短纠正",\n'
+        '"messages": [\n'
+        '"啧，刚才说错了。",\n'
+        '"我是 anthropic/claude-sonnet-4.5，不是 gpt 那个。"\n'
+        ']\n'
+        '}'
+    )
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == [
+        "啧，刚才说错了。",
+        "我是 anthropic/claude-sonnet-4.5，不是 gpt 那个。",
+    ]
+    assert turn.thinking_summary == "注意到57秒前关于模型身份的回答有误，决定简短纠正"
+    assert all("thinking_summary" not in message for message in turn.messages)
+    assert all('"messages"' not in message for message in turn.messages)
+
+
+def test_agent_turn_extracts_visible_thinking_summary_from_text_block():
+    raw = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "The user is asking a casual check-in.",
+                        },
+                        {
+                            "type": "text",
+                            "text": json.dumps(
+                                {
+                                    "thinking_summary": "判断用户是在随口问我在干嘛。",
+                                    "messages": ["没干嘛，就在这儿待着呢。"],
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    ],
+                },
+            }
+        ]
+    }
+
+    turn = crc._agent_turn_from_raw(raw)
+
+    assert turn.messages == ["没干嘛，就在这儿待着呢。"]
+    assert turn.thinking_summary == "判断用户是在随口问我在干嘛。"
+    assert turn.thinking_kind == "agent_summary"
     assert "thinking_summary" not in turn.messages[0]
     assert "messages" not in turn.messages[0]
 

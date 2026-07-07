@@ -60,6 +60,13 @@ def page_html(query_string: str) -> str:
             return data_track._render_proactive_daily_page(data_track._data_track_proactive_daily_payload())
         if view == "debug":
             return data_track._render_data_track_debug_page(data_track._data_track_debug_payload())
+        if view == "events":
+            event = (request.args.get("event") or "").strip()
+            if event == "onboarding":
+                return data_track._render_onboarding_funnel_page(data_track._data_track_onboarding_funnel_payload())
+            if event:
+                return data_track._render_event_users_page(data_track._data_track_event_users_payload(event))
+            return data_track._render_events_page(data_track._data_track_events_payload())
         return data_track._render_data_track_page(data_track._data_track_payload(include_users=True))
 
 

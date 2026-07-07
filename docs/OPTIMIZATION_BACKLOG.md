@@ -17,6 +17,8 @@
 
 ### #1 单 worker 天花板 ⬜ P0 · 改动大
 
+（下文为历史分析，多 worker 已 ship+deploy，见顶部推荐启动顺序的注记。）
+
 - **现状**：生产是 `gunicorn -w 1 --threads 32`
   （`deploy/docker-compose.phala.yaml:154`）。不是随手写的——进程内
   `UserStore` 缓存和 `threading.Event` 长轮询 waiter 都要求全后端共享
@@ -39,7 +41,7 @@
   `_gunicorn_options`/`_enclave_worker_count` @ `backend/enclave_app.py`；
   `FEEDLING_ENCLAVE_WORKERS` compose 默认 2 × 每 worker 32 线程，保留自签 TLS）。
   → **enclave 早已不是「单线程 Werkzeug」**。真正残余瓶颈是 backend 线程饱和 +
-  内存墙，见 `docs/superpowers/specs/2026-07-02-backend-longpoll-concurrency-investigation.md`。
+  内存墙，见 2026-07-02 longpoll 并发调查稿（`2026-07-02-backend-longpoll-concurrency-investigation.md`，已删，见 git 历史）。
 
 ### #3 enclave→backend 回环鉴权耦合 ⬜ P2 · 中等
 
@@ -70,10 +72,10 @@
   proactive/identity/memory/bootstrap/chat/tracking/admin/content/hosted/
   mcpsrv），app.py 降至 ~900 行装配层；url_map 零 diff、部署入口零改动。
   详见 CHANGELOG 2026-06-12。
-- **遗留**：app.py 的迁移期 COMPAT re-export 段（含 hosted 兜底回灌循环）
-  待收敛为白名单（`app`、`get_store`、`UserStore`、`require_user`、`_users`、
-  `_key_to_user`、`_stores`、`_save_users`、`_register_user`、`db`）——
-  独立小 PR，删除前 `grep -rn "appmod\.|app\._" tests/ tools/ backend/` 终核。
+- **遗留**：~~app.py 的迁移期 COMPAT re-export 段待收敛为白名单~~ ——
+  **已了结**：`backend/app.py` 已随 ASGI 迁移收尾整体删除（2026-07-06，
+  装配层现为 `asgi_app.py` + `asgi/lifespan.py`），COMPAT re-export 段
+  随之消失，原 grep 终核命令已失效。
 
 ## 三、安全 / 信任链
 

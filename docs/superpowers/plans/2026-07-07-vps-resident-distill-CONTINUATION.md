@@ -1,0 +1,96 @@
+# VPS resident distill — continuation / handoff (2026-07-07)
+
+Spec: `docs/superpowers/specs/2026-07-07-vps-resident-distill-design.md` (v3, Codex-reviewed).
+Branch: `feat/vps-resident-distill` (off `origin/test`).
+
+## Done + verified (this session)
+
+| commit | what | tests |
+|---|---|---|
+| `5662a12` | design spec v3 | — |
+| `df61df2` | **P1** distill-mode gating + `sealed_v1` schema + bidirectional hard validation (`genesis_core.py`) | 9 unit + 17 plaintext-route regression |
+| `5e4de78` | **P2 DB** resident atomic claim + migration `0013` (`awaiting_resident` status, claim cols) | 3 DB |
+| `7ba3ccf` | **P2 DB** resident lease: heartbeat (owner-only) + stale reap (re-queue under cap / fail at cap) | 4 DB |
+
+Resident **job-lifecycle DB layer is complete + verified**: `db.genesis_claim_resident_jobs`,
+`db.genesis_resident_heartbeat`, `db.genesis_reap_stale_resident_jobs` (all `FOR UPDATE SKIP LOCKED`,
+mirror the CVM worker functions). Worker `uploaded` claim and resident `awaiting_resident` claim never collide.
+
+## Env runbook (how to run backend tests here)
+
+```bash
+# Postgres (conftest expects postgres:test@127.0.0.1:55432)
+docker run -d --name feedling-test-pg -e POSTGRES_PASSWORD=test -p 55432:5432 postgres:16
+# backend venv (already built this session at scratchpad/backend-venv):
+python3 -m venv <venv> && <venv>/bin/pip install -r backend/requirements.txt pytest pytest-asyncio requests
+# run (schema = alembic upgrade head via conftest.init_schema; users need seed_user() for the FK):
+<venv>/bin/python -m pytest tests/test_genesis_resident_claim.py tests/test_genesis_resident_lease.py -q -p no:cacheprovider
+```
+Notes: Python 3.14 + psycopg_pool prints a benign `PythonFinalizationError` at interpreter exit in
+*combined* runs — run files individually to confirm pass counts. FK: `genesis_import_jobs.user_id →
+users` (migration 0012), so tests must `from conftest import seed_user; seed_user(uid)` before creating a job.
+
+## Remaining (in order; env ready)
+
+### P2-request-layer (backend)
+- ✅ **DONE (`6dd038e`)** — Resident upload branch `_resident_sealed_import` (replaces the 501): size-check →
+  store ciphertext via `genesis_put_chunk` (seq 0) → `genesis_create_job(status="awaiting_resident")` → return
+  `{job:{status:"processing"}}`. Idempotent. Size limit `resident_distill_max_bytes()` /
+  `FEEDLING_RESIDENT_DISTILL_MAX_BYTES` (default 512KiB, on stored ciphertext). 4 DB tests. **Upload↔claim loop
+  wired.** ⚠️ the sealed-envelope field shape (`ciphertext_b64`/`ciphertext_sha256`/`aad`) is provisional — reconcile
+  with the iOS sealer (P5) + verify on real enclave e2e before merge.
+- ✅ **DONE (`899b8e9`)** — Resident endpoints on `genesis/routes_asgi.py`, **per-user auth** (`require_auth` — the
+  consumer authenticates as its own user, same as chat poll; claim scoped to that user, no host-all needed):
+  - `GET /v1/genesis/resident/pending?consumer_id=` → `genesis_core.resident_pending` (claim + return sealed material).
+  - `POST /v1/genesis/resident/{job_id}/heartbeat` → `genesis_core.resident_heartbeat` (owner-only).
+  - `POST /v1/genesis/resident/{job_id}/complete` → `genesis_core.resident_complete` (done + `genesis_delete_chunks`).
+  5 core tests + asgi-genesis (32) regression. **Full server-side loop verified: upload→pending→complete/heartbeat.**
+- **TODO (minor)** — app-facing `job.status` map: `GET /v1/genesis/imports/{id}` (`get_import_status`) should map
+  `awaiting_resident`→`processing` so the app never sees the internal status between upload and claim.
+- **TODO** — wire a reaper tick calling `genesis_reap_stale_resident_jobs(1800, max_attempts=3, ...)` into the
+  supervisor loop that already calls `genesis_reap_stale_processing_jobs`.
+
+### P3 (backend) — `identity.replace` server-build action ✅ DONE (`<this commit>`)
+- `_identity_replace_action` in `backend/identity/actions.py`, in the supported list + dispatch.
+- Reuses `genesis.service.replace_identity_preserving_anchor` (server builds the shared envelope, agent sends
+  plaintext, anchor preserved). Agent never builds an envelope.
+- HIGH-RISK gating: payload must NOT carry `envelope`; requires `source=genesis_resident_distill` + `job_id` + `reason`,
+  and `db.genesis_get_job(user, job_id)` must be a live resident job (status=processing, resident_consumer_id set).
+- 5 tests. **⚠️ Implication for P6 skill (below): this gate means identity.replace is ONLY usable from the app-upload
+  path (which has a resident job). The chat-handed-file path (entry B) has NO job → it must use
+  `identity.profile_patch`/`identity.dimension_nudge` (incremental), NOT replace.**
+
+## Remaining — NOT verifiable in this env (need real runtimes)
+
+### P4 (feedling-mcp/tools/chat_resident_consumer.py) — resident consumer plumbing
+Add a resident-distill poll cycle (alongside the chat poll). Concrete contract (backend is built + verified):
+- `GET {API}/v1/genesis/resident/pending?consumer_id=<stable-id>` (user's api key/runtime token) →
+  `{jobs:[{job_id, mode, sealed:{ciphertext_b64, ciphertext_sha256, content_sha256, aad}}]}`.
+- For each job: base64-decode `ciphertext_b64` → **decrypt via `FEEDLING_ENCLAVE_URL`** (the same decrypt the consumer
+  already does for chat/memory) → write plaintext to a temp file → invoke the agent: "absorb `<path>` (mode=<mode>)".
+  Agent distills per skill and writes `memory.add` / `identity.replace` (for identity, pass
+  `source=genesis_resident_distill`, `job_id`, `reason`). During a long distill call
+  `POST /v1/genesis/resident/{job_id}/heartbeat {consumer_id}`.
+- On finish: `POST /v1/genesis/resident/{job_id}/complete {memory_action_count, identity_status}` → backend marks done +
+  deletes the stored ciphertext. Delete the temp file.
+- **Bypass** the existing `_capture_build_envelope` local-envelope lane (`chat_resident_consumer.py:5280`) — write
+  plaintext actions only (server builds envelopes), per the crypto invariant.
+
+### P5 (feedling-mcp-ios) — client seal + upload (needs Xcode/device)
+- self-hosted branch of the 3 MaterialSheets (`GardenMaterialSheet`/`IdentityMaterialSheet`/`ChatEmptyStateView`):
+  when `storageMode == .selfHosted`, instead of `uploadGenesisPlaintext` (plaintext), **seal the material** (reuse
+  `sealForCurrentUser` / the `genesisPutChunk` envelope path, `FeedlingAPI.swift:1265/3047`) and POST a `sealed_v1` body:
+  `{format:"sealed_v1", client_job_id, mode, ciphertext_b64, ciphertext_sha256, content_sha256, aad}` to
+  `/v1/genesis/imports/plaintext`. **Upload-time size check** (~512KiB, self-hosted only). Cloud/worker path stays
+  plaintext (unchanged). ⚠️ reconcile the `aad` binding + `ciphertext` framing with the enclave decrypt (real e2e).
+
+### P6 (io-onboarding) — resident skill
+- entry-B (chat-handed file): memory md → light capture + `memory.add` (Dream reconciles); identity md → **incremental
+  `identity.profile_patch`/`dimension_nudge`, NOT replace** (entry B has no genesis job, so identity.replace's gate
+  rejects it — and incremental is the right semantics for a casual hand-off anyway).
+- The app-upload path (entry A) does the full replace, but that's driven by the consumer (P4), not the chat skill.
+
+### E2E — real VPS deploy (red line: verify AEAD/enclave real decrypt).
+
+## Cleanup
+- Postgres container `feedling-test-pg` may still be running: `docker rm -f feedling-test-pg`.

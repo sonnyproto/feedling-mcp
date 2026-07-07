@@ -1,7 +1,8 @@
 """PostgreSQL persistence layer for the Feedling backend.
 
 This module replaces the previous local-file persistence (JSON / JSONL files
-under FEEDLING_DATA_DIR). The in-memory model in app.py is unchanged: per-user
+under FEEDLING_DATA_DIR). The in-memory model (core.store's per-user
+``UserStore`` cache plus accounts.registry) is unchanged: per-user
 ``UserStore`` instances still hold their state in memory behind their own
 ``threading.Lock``s — this module only swaps where that state is read from /
 written to.
@@ -447,7 +448,8 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
 
     This is deliberately SQL-aggregate based: admin dashboards must not pull
     full encrypted chat envelopes or memory bodies into Python just to count
-    them. The returned shape is consumed by app.py's data-track surface.
+    them. The returned shape is consumed by the data-track surface in
+    admin/data_track.py (routes wired in admin/routes_asgi.py).
     """
     ids = [str(uid) for uid in user_ids if uid]
     if not ids:
@@ -809,13 +811,20 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
                                      tz: str = "Asia/Shanghai") -> list[dict]:
     """Per-Beijing-day proactive-job aggregates for the ops trend view.
 
-    Answers "is the proactive success rate improving day over day", split into
-    the two runtime lanes (heartbeat vs screen-share). ``delivered`` = jobs that
-    reached posted/delivered; ``failed`` = failed/skipped. Success rate is
-    computed by the caller (delivered / non-pending)."""
+    Answers "is the proactive success rate improving day over day". 只有面向
+    用户的 wake lane 进成功率口径：``delivered``/``failed``/``skipped``/
+    ``pending`` 均不含 memory-maintenance（capture/dream/migrate）jobs——那些
+    永远不产生 delivered，坏一个用户的 key 就能无限灌 failed（2026-07-05
+    prod：40 用户的重试风暴把整体成功率打到 3%）。maintenance 单独成列。
+    ``failed`` 只含 status='failed'；gate 拒绝的 ``skipped``（用户关 ambient）
+    是产品行为不是失败，单独计数。``completed``（醒了、正常决策、只是没发
+    消息——sleep/纯动作）算成功：口径衡量「系统是否健康」，不是「醒了的里面
+    有多少真正送达」。成功率由调用方算
+    （(delivered+completed) / (delivered+completed+failed)）。"""
     day_limit = max(1, min(int(days or 30), 366))
     since = float(since_epoch or 0.0)
     screen_kinds = "('screen_watch','scene_change','screen_tick','broadcast_opened','heartbeat_broadcast_on')"
+    maintenance_kinds = "('memory_capture','memory_dream','memory_migrate')"
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
@@ -833,11 +842,22 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
                 )
                 SELECT day,
                        COUNT(*)::int AS jobs,
-                       (COUNT(*) FILTER (WHERE status IN ('posted','delivered')))::int AS delivered,
-                       (COUNT(*) FILTER (WHERE status IN ('failed','skipped')))::int AS failed,
-                       (COUNT(*) FILTER (WHERE status = 'pending'))::int AS pending,
+                       (COUNT(*) FILTER (WHERE kind NOT IN {maintenance_kinds}
+                                          AND status IN ('posted','delivered')))::int AS delivered,
+                       (COUNT(*) FILTER (WHERE kind NOT IN {maintenance_kinds}
+                                          AND status = 'completed'))::int AS completed,
+                       (COUNT(*) FILTER (WHERE kind NOT IN {maintenance_kinds}
+                                          AND status = 'failed'))::int AS failed,
+                       (COUNT(*) FILTER (WHERE kind NOT IN {maintenance_kinds}
+                                          AND status = 'skipped'))::int AS skipped,
+                       (COUNT(*) FILTER (WHERE kind NOT IN {maintenance_kinds}
+                                          AND status = 'pending'))::int AS pending,
+                       (COUNT(*) FILTER (WHERE kind IN {maintenance_kinds}))::int AS maintenance,
+                       (COUNT(*) FILTER (WHERE kind IN {maintenance_kinds}
+                                          AND status IN ('failed','skipped')))::int AS maintenance_failed,
                        (COUNT(*) FILTER (WHERE kind IN {screen_kinds}))::int AS screen,
-                       (COUNT(*) FILTER (WHERE kind LIKE 'heartbeat%%'
+                       -- 自发 tick：现网 kind 是 'presence'，heartbeat* 为历史 kind
+                       (COUNT(*) FILTER (WHERE (kind = 'presence' OR kind LIKE 'heartbeat%%')
                                           AND kind NOT IN {screen_kinds}))::int AS heartbeat
                 FROM jobs
                 GROUP BY day
@@ -848,14 +868,362 @@ def admin_data_track_proactive_daily(*, since_epoch: float = 0.0, days: int = 30
             ).fetchall()
         return [
             {
-                "day": r[0], "jobs": r[1], "delivered": r[2], "failed": r[3],
-                "pending": r[4], "screen": r[5], "heartbeat": r[6],
+                "day": r[0], "jobs": r[1], "delivered": r[2], "completed": r[3],
+                "failed": r[4], "skipped": r[5], "pending": r[6], "maintenance": r[7],
+                "maintenance_failed": r[8], "screen": r[9], "heartbeat": r[10],
             }
             for r in rows
         ]
     except Exception as e:
         log.error("[db] admin_data_track_proactive_daily failed: %s", e)
         return []
+
+
+# Route split for the event-health view: model_api → "API", everything else
+# (resident / official_import / unknown) folds to "VPS" on the caller side.
+_EVENTS_ROUTES_CTE = (
+    "WITH routes AS (SELECT user_id, "
+    "lower(COALESCE(NULLIF(doc->>'route',''),'resident')) AS route "
+    "FROM user_blobs WHERE kind = 'onboarding_route')"
+)
+# EXTRACT epoch from terminal_at - created_at, guarded to ISO-ish strings so
+# malformed values degrade to NULL instead of aborting the whole aggregate.
+_JOB_DUR_SEC = (
+    "CASE WHEN COALESCE(doc->>'completed_at',doc->>'posted_at',doc->>'failed_at') "
+    "~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' "
+    "AND doc->>'created_at' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' "
+    "THEN EXTRACT(EPOCH FROM ((COALESCE(doc->>'completed_at',doc->>'posted_at',doc->>'failed_at'))::timestamptz "
+    "- (doc->>'created_at')::timestamptz)) ELSE NULL END"
+)
+
+
+def admin_events_overview() -> dict:
+    """Fleet-wide event-health aggregates for the `view=events` board, split by
+    route (VPS/resident vs API/model_api). Each sub-query is independently
+    guarded so one failure degrades to an empty slice, not the whole board.
+
+    Returns {proactive:[...], capture:[...], genesis:[...], reply:[...]} where each
+    row carries route + the event dimension + counts + median duration (seconds)."""
+    out = {"proactive": [], "capture": [], "genesis": [], "reply": []}
+
+    def _run(key, sql):
+        try:
+            with get_pool().connection() as conn:
+                rows = conn.execute(sql).fetchall()
+            return rows
+        except Exception as e:  # noqa: BLE001
+            log.error("[db] admin_events_overview.%s failed: %s", key, e)
+            return []
+
+    # 1) Proactive lanes: 心跳 / 主动触发(感知+定时) / 屏幕 / 其他
+    rows = _run("proactive", f"""
+        {_EVENTS_ROUTES_CTE}
+        SELECT COALESCE(r.route,'resident') AS route, j.lane,
+               COUNT(*)::int AS total,
+               (COUNT(*) FILTER (WHERE j.status IN ('posted','delivered','completed')))::int AS success,
+               (COUNT(*) FILTER (WHERE j.status IN ('failed','skipped')))::int AS failed,
+               (COUNT(*) FILTER (WHERE j.status = 'pending'))::int AS pending,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY j.dur) AS median_dur
+        FROM (
+          SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur,
+            CASE
+              WHEN k.kind IN ('screen_watch','screen_tick','broadcast_opened','heartbeat_broadcast_on') THEN 'screen'
+              WHEN k.kind IN ('perception_event','scene_change','photo_added','arrived_at_anchor','location','unlock_after_absence','scheduled_wake') THEN 'trigger'
+              WHEN k.kind = 'presence' OR left(k.kind, 9) = 'heartbeat' THEN 'heartbeat'
+              ELSE 'other'
+            END AS lane
+          FROM user_logs l,
+            LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),NULLIF(l.doc->>'wake_kind',''),NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
+          WHERE l.stream = 'proactive_jobs'
+            AND COALESCE(l.doc->>'job_kind','') NOT IN ('memory_capture','memory_dream','memory_migrate')
+        ) j LEFT JOIN routes r ON r.user_id = j.user_id
+        GROUP BY route, j.lane
+    """)
+    out["proactive"] = [
+        {"route": r[0], "lane": r[1], "total": r[2], "success": r[3], "failed": r[4],
+         "pending": r[5], "median_dur": float(r[6]) if r[6] is not None else None}
+        for r in rows
+    ]
+
+    # 2) 主动记忆整理(category-level so the median is valid across dream+capture):
+    #    memory_dream(做梦) + memory_capture(自写) + memory_migrate 合一。
+    rows = _run("capture", f"""
+        {_EVENTS_ROUTES_CTE}
+        SELECT COALESCE(r.route,'resident') AS route,
+               COUNT(*)::int AS total,
+               (COUNT(*) FILTER (WHERE m.status = 'completed'))::int AS success,
+               (COUNT(*) FILTER (WHERE m.status IN ('failed','error','skipped')))::int AS failed,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY m.dur) AS median_dur
+        FROM (
+          SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur
+          FROM user_logs l
+          WHERE l.stream = 'memory_capture_jobs'
+          UNION ALL
+          SELECT l.user_id, COALESCE(l.doc->>'status','') AS status, {_JOB_DUR_SEC.replace('doc','l.doc')} AS dur
+          FROM user_logs l
+          WHERE l.stream = 'proactive_jobs'
+            AND COALESCE(l.doc->>'job_kind','') IN ('memory_capture','memory_dream','memory_migrate')
+        ) m LEFT JOIN routes r ON r.user_id = m.user_id
+        GROUP BY route
+    """)
+    out["capture"] = [
+        {"route": r[0], "total": r[1], "success": r[2], "failed": r[3],
+         "median_dur": float(r[4]) if r[4] is not None else None}
+        for r in rows
+    ]
+
+    # 3) 蒸馏: genesis job — mode=onboarding → 一次(first); add_memory/update_identity → 二次(second)
+    rows = _run("genesis", f"""
+        {_EVENTS_ROUTES_CTE}
+        SELECT COALESCE(r.route,'resident') AS route,
+               CASE WHEN COALESCE(NULLIF(g.metadata->>'mode',''),'onboarding') = 'onboarding'
+                    THEN 'first' ELSE 'second' END AS distill,
+               COUNT(*)::int AS total,
+               (COUNT(*) FILTER (WHERE g.status IN ('done','completed')))::int AS success,
+               (COUNT(*) FILTER (WHERE g.status IN ('error','failed')))::int AS failed
+        FROM genesis_import_jobs g LEFT JOIN routes r ON r.user_id = g.user_id
+        GROUP BY route, distill
+    """)
+    out["genesis"] = [
+        {"route": r[0], "distill": r[1], "total": r[2], "success": r[3], "failed": r[4]}
+        for r in rows
+    ]
+
+    # 4) 回复消息: 真回复率 + 兜底率 + 回复延迟(中位)。real_replies 排除
+    #    agent_initiated_proactive(主动消息不是"对用户的回复")。latency = 每条真回复
+    #    与其前一条用户消息的时间差(窗口配对)。
+    rows = _run("reply", f"""
+        {_EVENTS_ROUTES_CTE}, paired AS (
+          SELECT c.user_id, c.ts, c.doc->>'role' AS role, COALESCE(c.doc->>'source','') AS src,
+            MAX(CASE WHEN c.doc->>'role'='user' AND COALESCE(c.doc->>'source','')<>'verify_ping' THEN c.ts END)
+              OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
+          FROM chat_messages c
+        )
+        SELECT COALESCE(r.route,'resident') AS route,
+               (COUNT(*) FILTER (WHERE p.role='user' AND p.src<>'verify_ping'))::int AS user_msgs,
+               (COUNT(DISTINCT p.last_user_ts) FILTER (WHERE p.role IN ('agent','openclaw')
+                    AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive')
+                    AND p.last_user_ts IS NOT NULL))::int AS real_replies,
+               (COUNT(*) FILTER (WHERE p.src='foreground_fallback'))::int AS fallback_replies,
+               percentile_cont(0.5) WITHIN GROUP (ORDER BY
+                 CASE WHEN p.role IN ('agent','openclaw')
+                      AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive')
+                      AND p.last_user_ts IS NOT NULL AND p.ts >= p.last_user_ts
+                      THEN p.ts - p.last_user_ts END) AS median_latency
+        FROM paired p LEFT JOIN routes r ON r.user_id = p.user_id
+        GROUP BY route
+    """)
+    out["reply"] = [
+        {"route": r[0], "user_msgs": r[1], "real_replies": r[2], "fallback_replies": r[3],
+         "median_latency": float(r[4]) if r[4] is not None else None}
+        for r in rows
+    ]
+    return out
+
+
+def admin_events_by_user(category: str, *, limit: int = 400) -> list[dict]:
+    """Per-user breakdown for ONE event category (drill-down). Each row:
+    {user_id, route, total, success, failed, fallback?, median_dur, last_ts}.
+    Route-joined; the caller sorts worst-first + maps route→VPS/API."""
+    cat = str(category or "").strip()
+    # No SQL LIMIT: grouped rows = #users (bounded); the caller sorts worst-first
+    # then slices, so an early DB truncation can't hide the actual worst users.
+    _ = limit
+    dur_l = _JOB_DUR_SEC.replace("doc", "l.doc")
+
+    def _run(sql, params=()):
+        try:
+            with get_pool().connection() as conn:
+                return conn.execute(sql, params).fetchall()
+        except Exception as e:  # noqa: BLE001
+            log.error("[db] admin_events_by_user(%s) failed: %s", cat, e)
+            return []
+
+    def _job_rows(rows):
+        return [{"user_id": r[0], "route": r[1], "total": r[2], "success": r[3],
+                 "failed": r[4], "median_dur": float(r[5]) if r[5] is not None else None,
+                 "last_ts": float(r[6]) if r[6] is not None else None} for r in rows]
+
+    if cat in ("heartbeat", "trigger", "screen", "other"):
+        rows = _run(f"""
+            {_EVENTS_ROUTES_CTE}
+            SELECT j.user_id, COALESCE(r.route,'resident') AS route,
+                   COUNT(*)::int AS total,
+                   (COUNT(*) FILTER (WHERE j.status IN ('posted','delivered','completed')))::int AS success,
+                   (COUNT(*) FILTER (WHERE j.status IN ('failed','skipped')))::int AS failed,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY j.dur) AS median_dur,
+                   MAX(j.ts) AS last_ts
+            FROM (
+              SELECT l.user_id, l.ts, COALESCE(l.doc->>'status','') AS status, {dur_l} AS dur,
+                CASE
+                  WHEN k.kind IN ('screen_watch','screen_tick','broadcast_opened','heartbeat_broadcast_on') THEN 'screen'
+                  WHEN k.kind IN ('perception_event','scene_change','photo_added','arrived_at_anchor','location','unlock_after_absence','scheduled_wake') THEN 'trigger'
+                  WHEN k.kind = 'presence' OR left(k.kind,9) = 'heartbeat' THEN 'heartbeat'
+                  ELSE 'other'
+                END AS lane
+              FROM user_logs l,
+                LATERAL (SELECT COALESCE(NULLIF(l.doc->>'job_kind',''),NULLIF(l.doc->>'wake_kind',''),NULLIF(l.doc->>'trigger',''),'unknown') AS kind) k
+              WHERE l.stream='proactive_jobs'
+                AND COALESCE(l.doc->>'job_kind','') NOT IN ('memory_capture','memory_dream','memory_migrate')
+            ) j LEFT JOIN routes r ON r.user_id = j.user_id
+            WHERE j.lane = %s
+            GROUP BY j.user_id, route
+        """, (cat,))
+        return _job_rows(rows)
+
+    if cat == "memory_org":
+        rows = _run(f"""
+            {_EVENTS_ROUTES_CTE}
+            SELECT m.uid AS user_id, COALESCE(r.route,'resident') AS route,
+                   COUNT(*)::int AS total,
+                   (COUNT(*) FILTER (WHERE m.status = 'completed'))::int AS success,
+                   (COUNT(*) FILTER (WHERE m.status IN ('failed','error','skipped')))::int AS failed,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY m.dur) AS median_dur,
+                   MAX(m.ts) AS last_ts
+            FROM (
+              SELECT user_id AS uid, ts, doc->>'status' AS status, {_JOB_DUR_SEC} AS dur
+              FROM user_logs WHERE stream='memory_capture_jobs'
+              UNION ALL
+              SELECT user_id AS uid, ts, doc->>'status' AS status, {_JOB_DUR_SEC} AS dur
+              FROM user_logs WHERE stream='proactive_jobs'
+                AND doc->>'job_kind' IN ('memory_capture','memory_dream','memory_migrate')
+            ) m LEFT JOIN routes r ON r.user_id = m.uid
+            GROUP BY m.uid, route
+        """)
+        return _job_rows(rows)
+
+    if cat in ("distill_first", "distill_second"):
+        cond = "= 'onboarding'" if cat == "distill_first" else "<> 'onboarding'"
+        rows = _run(f"""
+            {_EVENTS_ROUTES_CTE}
+            SELECT g.user_id, COALESCE(r.route,'resident') AS route,
+                   COUNT(*)::int AS total,
+                   (COUNT(*) FILTER (WHERE g.status IN ('done','completed')))::int AS success,
+                   (COUNT(*) FILTER (WHERE g.status IN ('error','failed')))::int AS failed,
+                   NULL::float AS median_dur,
+                   EXTRACT(EPOCH FROM MAX(g.updated_at)) AS last_ts
+            FROM genesis_import_jobs g LEFT JOIN routes r ON r.user_id = g.user_id
+            WHERE COALESCE(NULLIF(g.metadata->>'mode',''),'onboarding') {cond}
+            GROUP BY g.user_id, route
+        """)
+        return _job_rows(rows)
+
+    if cat == "reply":
+        rows = _run(f"""
+            {_EVENTS_ROUTES_CTE}, paired AS (
+              SELECT c.user_id, c.ts, c.doc->>'role' AS role, COALESCE(c.doc->>'source','') AS src,
+                MAX(CASE WHEN c.doc->>'role'='user' AND COALESCE(c.doc->>'source','')<>'verify_ping' THEN c.ts END)
+                  OVER (PARTITION BY c.user_id ORDER BY c.ts ROWS UNBOUNDED PRECEDING) AS last_user_ts
+              FROM chat_messages c
+            )
+            SELECT p.user_id, COALESCE(r.route,'resident') AS route,
+                   (COUNT(*) FILTER (WHERE p.role='user' AND p.src<>'verify_ping'))::int AS user_msgs,
+                   (COUNT(DISTINCT p.last_user_ts) FILTER (WHERE p.role IN ('agent','openclaw') AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive') AND p.last_user_ts IS NOT NULL))::int AS real_replies,
+                   (COUNT(*) FILTER (WHERE p.src='foreground_fallback'))::int AS fallback_replies,
+                   percentile_cont(0.5) WITHIN GROUP (ORDER BY
+                     CASE WHEN p.role IN ('agent','openclaw')
+                          AND p.src NOT IN ('foreground_fallback','proactive_fallback','agent_initiated_proactive')
+                          AND p.last_user_ts IS NOT NULL AND p.ts >= p.last_user_ts
+                          THEN p.ts - p.last_user_ts END) AS median_latency,
+                   MAX(p.ts) AS last_ts
+            FROM paired p LEFT JOIN routes r ON r.user_id = p.user_id
+            GROUP BY p.user_id, route
+        """)
+        out = []
+        for r in rows:
+            um, real, fb = int(r[2] or 0), int(r[3] or 0), int(r[4] or 0)
+            out.append({"user_id": r[0], "route": r[1], "total": um, "success": real,
+                        "failed": max(0, um - real), "fallback": fb, "fallback_base": real + fb,
+                        "median_dur": float(r[5]) if r[5] is not None else None,
+                        "last_ts": float(r[6]) if r[6] is not None else None})
+        return out
+
+    return []
+
+
+def admin_onboarding_funnel() -> list[dict]:
+    """Per-user onboarding milestone epochs for the funnel view. Each row:
+    {user_id, route, t0, t1, t2, t3} (epoch seconds; None = not reached).
+
+    Milestones (route-aware):
+      t0 registered = users.created_at
+      t1 配置/上线   = API: has an onboarding genesis job (⊇ t2 → monotonic;
+                      the client model_api_setup_succeeded event was too spotty —
+                      key-verification is tracked separately via admin_api_key_stats);
+                      VPS: first chat/proactive activity (consumer online, 'B')
+      t2 内容就绪    = API: onboarding-genesis job done; VPS: first memory card
+      t3 首次真回复  = first non-fallback agent message ('A', both routes)
+    The caller aggregates conversion + median segment durations, split VPS/API."""
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(f"""
+                {_EVENTS_ROUTES_CTE},
+                u AS (SELECT user_id,
+                        CASE WHEN created_at ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
+                             THEN EXTRACT(EPOCH FROM created_at::timestamptz) ELSE NULL END AS t0
+                      FROM users),
+                gen_started AS (SELECT user_id, MIN(EXTRACT(EPOCH FROM updated_at)) AS t
+                          FROM genesis_import_jobs
+                          WHERE COALESCE(NULLIF(metadata->>'mode',''),'onboarding')='onboarding'
+                          GROUP BY user_id),
+                firstact AS (SELECT user_id, MIN(ts) AS t FROM (
+                             SELECT user_id, ts FROM chat_messages
+                             UNION ALL SELECT user_id, ts FROM user_logs WHERE stream='proactive_jobs'
+                           ) a GROUP BY user_id),
+                gen AS (SELECT user_id, MIN(EXTRACT(EPOCH FROM updated_at)) AS t
+                        FROM genesis_import_jobs
+                        WHERE status IN ('done','completed')
+                          AND COALESCE(NULLIF(metadata->>'mode',''),'onboarding')='onboarding'
+                        GROUP BY user_id),
+                mem AS (SELECT user_id,
+                        MIN(EXTRACT(EPOCH FROM (COALESCE(NULLIF(doc->>'created_at',''), occurred_at))::timestamptz)) AS t
+                        FROM memory_moments
+                        WHERE COALESCE(NULLIF(doc->>'created_at',''), occurred_at) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
+                        GROUP BY user_id),
+                reply AS (SELECT user_id, MIN(ts) AS t FROM chat_messages
+                          WHERE doc->>'role' IN ('agent','openclaw')
+                            AND COALESCE(doc->>'source','') NOT IN ('foreground_fallback','proactive_fallback')
+                          GROUP BY user_id)
+                SELECT u.user_id, COALESCE(r.route,'resident') AS route, u.t0,
+                       CASE WHEN COALESCE(r.route,'resident')='model_api' THEN gen_started.t ELSE firstact.t END AS t1,
+                       CASE WHEN COALESCE(r.route,'resident')='model_api' THEN gen.t ELSE mem.t END AS t2,
+                       reply.t AS t3
+                FROM u
+                LEFT JOIN routes r ON r.user_id = u.user_id
+                LEFT JOIN gen_started ON gen_started.user_id = u.user_id
+                LEFT JOIN firstact ON firstact.user_id = u.user_id
+                LEFT JOIN gen ON gen.user_id = u.user_id
+                LEFT JOIN mem ON mem.user_id = u.user_id
+                LEFT JOIN reply ON reply.user_id = u.user_id
+            """).fetchall()
+        def f(v):
+            return float(v) if v is not None else None
+        return [{"user_id": r[0], "route": r[1], "t0": f(r[2]), "t1": f(r[3]),
+                 "t2": f(r[4]), "t3": f(r[5])} for r in rows]
+    except Exception as e:  # noqa: BLE001
+        log.error("[db] admin_onboarding_funnel failed: %s", e)
+        return []
+
+
+def admin_api_key_stats() -> dict:
+    """model_api users by API-key verification status, from the SERVER-SIDE
+    model_api config test_status (reliable) rather than the spotty client
+    model_api_setup_succeeded tracking event. passed = test_status 'ok';
+    stuck = has a model_api config but not yet 'ok'."""
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute("""
+                SELECT lower(COALESCE(NULLIF(doc->>'test_status',''),'(none)')) AS st, COUNT(*)::int
+                FROM user_blobs WHERE kind='model_api'
+                GROUP BY st
+            """).fetchall()
+        by = {r[0]: r[1] for r in rows}
+        total = sum(by.values())
+        passed = int(by.get("ok", 0))
+        return {"passed": passed, "stuck": total - passed, "total": total, "by_status": by}
+    except Exception as e:  # noqa: BLE001
+        log.error("[db] admin_api_key_stats failed: %s", e)
+        return {"passed": 0, "stuck": 0, "total": 0, "by_status": {}}
 
 
 # ---------------------------------------------------------------------------
@@ -1114,6 +1482,62 @@ def genesis_claim_uploaded_jobs(*, limit: int = 1) -> list[dict]:
     return out
 
 
+def genesis_claim_resident_jobs(user_id: str, *, consumer_id: str, limit: int = 1) -> list[dict]:
+    """Atomically claim ``awaiting_resident`` genesis jobs for a resident consumer.
+
+    Scoped to a single ``user_id`` — the resident consumer authenticates as its own
+    user (same per-user credential it uses for chat poll), so it only ever claims that
+    user's jobs, never another user's. Mirrors ``genesis_claim_uploaded_jobs`` (FOR
+    UPDATE SKIP LOCKED so a user's multiple consumer processes can't double-process),
+    moving awaiting_resident -> processing and stamping the claiming consumer + a fresh
+    heartbeat + attempt count (so a dead consumer's job can be reaped / re-queued).
+    """
+    cid = str(consumer_id or "").strip()
+    if not cid:
+        # An empty consumer_id would move the job to processing with a blank owner —
+        # invisible to genesis_reap_stale_resident_jobs (resident_consumer_id <> '') and
+        # thus unrecoverable. Refuse rather than wedge it.
+        raise ValueError("consumer_id_required")
+    safe_limit = max(1, min(int(limit or 1), 16))
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            cur = conn.execute(
+                """
+                WITH picked AS (
+                    SELECT user_id, job_id
+                    FROM genesis_import_jobs
+                    WHERE user_id = %s AND status = 'awaiting_resident'
+                    ORDER BY finalized_at ASC NULLS LAST, updated_at ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE genesis_import_jobs AS j SET
+                    status = 'processing',
+                    error = '',
+                    resident_consumer_id = %s,
+                    resident_claimed_at = now(),
+                    resident_heartbeat_at = now(),
+                    resident_attempts = j.resident_attempts + 1,
+                    output = jsonb_build_object('stage', 'resident_claimed'),
+                    updated_at = now()
+                FROM picked
+                WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
+                RETURNING j.*
+                """,
+                (user_id, safe_limit, cid),
+            )
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        out.append(item)
+    return out
+
+
 def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit: int = 50) -> list[dict]:
     """Atomically fail genesis jobs wedged in 'processing' past a staleness cutoff.
 
@@ -1139,6 +1563,7 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
                 SELECT user_id, job_id
                 FROM genesis_import_jobs
                 WHERE status = 'processing'
+                  AND COALESCE(resident_consumer_id, '') = ''
                   AND updated_at < now() - make_interval(secs => %s)
                 ORDER BY updated_at ASC
                 LIMIT %s
@@ -1153,6 +1578,73 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
             RETURNING j.*
             """,
             (safe_sec, safe_limit, error[:1000]),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        out.append(item)
+    return out
+
+
+def genesis_resident_heartbeat(user_id: str, job_id: str, *, consumer_id: str) -> bool:
+    """Renew a resident job's lease. Only the owning consumer (claimed it, still
+    processing) may heartbeat — this is what keeps genesis_reap_stale_resident_jobs
+    from re-queueing a job whose consumer is alive and grinding. Returns True if renewed."""
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE genesis_import_jobs SET
+                resident_heartbeat_at = now(),
+                updated_at = now()
+            WHERE user_id = %s AND job_id = %s
+              AND status = 'processing' AND resident_consumer_id = %s
+            """,
+            (user_id, job_id, consumer_id),
+        )
+        return cur.rowcount > 0
+
+
+def genesis_reap_stale_resident_jobs(
+    older_than_sec: int, *, max_attempts: int, error: str, limit: int = 50
+) -> list[dict]:
+    """Recover resident jobs whose consumer died mid-distill (processing, resident-owned,
+    heartbeat older than the lease). Under the attempt cap → re-queue to awaiting_resident
+    (another consumer re-claims, resident_attempts keeps accumulating across re-queues);
+    at/over the cap → fail. Atomic (FOR UPDATE SKIP LOCKED) so a live consumer that just
+    heartbeated is not touched. Returns the rows changed so the caller can sync state."""
+    safe_sec = max(60, int(older_than_sec or 0))
+    safe_limit = max(1, min(int(limit or 1), 200))
+    safe_max = max(1, int(max_attempts or 1))
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            WITH picked AS (
+                SELECT user_id, job_id
+                FROM genesis_import_jobs
+                WHERE status = 'processing'
+                  AND resident_consumer_id <> ''
+                  AND resident_heartbeat_at < now() - make_interval(secs => %s)
+                ORDER BY resident_heartbeat_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE genesis_import_jobs AS j SET
+                status = CASE WHEN j.resident_attempts < %s THEN 'awaiting_resident' ELSE 'failed' END,
+                error = CASE WHEN j.resident_attempts < %s THEN '' ELSE %s END,
+                resident_consumer_id = '',
+                resident_claimed_at = NULL,
+                resident_heartbeat_at = NULL,
+                updated_at = now()
+            FROM picked
+            WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
+            RETURNING j.*
+            """,
+            (safe_sec, safe_limit, safe_max, safe_max, error[:1000]),
         )
         rows = cur.fetchall()
         cols = [d[0] for d in cur.description]
@@ -1284,6 +1776,18 @@ def genesis_list_chunks(user_id: str, job_id: str) -> list[dict]:
                 item[key] = value.isoformat()
         out.append(item)
     return out
+
+
+def genesis_delete_chunks(user_id: str, job_id: str) -> int:
+    """Delete a job's stored (encrypted) chunks. Used after a resident distill completes:
+    the sealed material is ephemeral — consumed once the local agent has distilled it,
+    so the server keeps no leftover ciphertext. Returns the number of chunks deleted."""
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "DELETE FROM genesis_import_chunks WHERE user_id = %s AND job_id = %s",
+            (user_id, job_id),
+        )
+        return cur.rowcount
 
 
 def genesis_mark_finalized(user_id: str, job_id: str) -> dict | None:
@@ -1487,14 +1991,45 @@ def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None
 
 
 def chat_try_claim_reply(
-    user_id: str, msg_id: str, consumer_id: str, now: float, fields: dict
+    user_id: str, msg_id: str, consumer_id: str, now: float, fields: dict,
+    *, redelivery: bool = False,
 ) -> dict | None:
     """Atomically claim a chat reply for ``consumer_id`` — the cross-worker-safe
     replacement for read-cache-then-write. The claim succeeds iff the row is
     currently unclaimed, already ours, or the prior claim has expired (the SQL
     WHERE mirrors chat.service._chat_message_claimable). Returns the merged doc
     on success, or None if the row is missing or another consumer/worker holds
-    an unexpired claim — so two workers polling the same reply can't both win."""
+    an unexpired claim — so two workers polling the same reply can't both win.
+
+    ``redelivery=True`` (the lost-turn backstop, chat.service) hardens the CAS
+    against the caller's stale per-worker cache with two extra conditions the
+    fresh-delivery path must NOT have:
+    - rejects OUR OWN unexpired claim (no idempotent self-refresh): re-handing
+      an in-flight redelivered turn to its claimer would run a duplicate
+      provider turn. A fresh delivery keeps the self-refresh so a poll retry of
+      a just-claimed message doesn't error.
+    - rejects the claim when ANY newer visible user message is already replied
+      (the superseded-tail rule, decided HERE at claim time): the cache-side
+      _redelivery_floor pre-filter can miss it because parent reply_status
+      metadata updates are not broadcast across workers, and a late reply to a
+      conversation that already moved on would land out of order. Synthetic
+      verify_ping probes are not conversation and never supersede."""
+    same_consumer_sql = "" if redelivery else "OR doc->>'reply_claimed_by' = %s "
+    unanswered_tail_sql = (
+        "  AND NOT EXISTS ("
+        "    SELECT 1 FROM chat_messages n "
+        "    WHERE n.user_id = chat_messages.user_id "
+        "      AND n.ts > chat_messages.ts "
+        "      AND n.doc->>'role' = 'user' "
+        "      AND COALESCE(n.doc->>'source','') <> 'verify_ping' "
+        "      AND ((n.doc->>'reply_status') = 'replied' "
+        "           OR COALESCE(n.doc->>'reply_message_id','') <> '')"
+        "  ) "
+    ) if redelivery else ""
+    params: list = [Jsonb(fields), user_id, msg_id]
+    if not redelivery:
+        params.append(consumer_id)
+    params.append(now)
     try:
         with get_pool().connection() as conn:
             row = conn.execute(
@@ -1506,12 +2041,13 @@ def chat_try_claim_reply(
                 # this worker last refreshed. Mirrors _chat_message_claimable.
                 "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
                 "  AND COALESCE(doc->>'reply_message_id','') = '' "
+                f"{unanswered_tail_sql}"
                 "  AND ("
                 "    COALESCE(doc->>'reply_claimed_by','') = '' "
-                "    OR doc->>'reply_claimed_by' = %s "
+                f"    {same_consumer_sql}"
                 "    OR COALESCE(NULLIF(doc->>'reply_claim_expires_at','')::float8, 0) <= %s"
                 ") RETURNING doc",
-                (Jsonb(fields), user_id, msg_id, consumer_id, now),
+                tuple(params),
             ).fetchone()
         return row[0] if row is not None else None
     except Exception as e:
@@ -2035,7 +2571,8 @@ def log_prune_older_than(user_id: str, stream: str, cutoff_epoch: float) -> None
 
 def delete_user_data(user_id: str) -> None:
     """Redundant DB belt: per-user 行现由 delete_user 的 CASCADE 原子清净
-    (0011)。保留供 migrate_to_pg 等旧调用方；删账号主路径不再依赖它做 R2。"""
+    (0011)。仍被 content/content_core.py 的销号(account/reset)兜底路径调用；
+    删账号主路径不再依赖它做 R2。"""
     try:
         with get_pool().connection() as conn:
             with conn.transaction():

@@ -47,7 +47,239 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-06
+
+### [DONE] 仓库清理：陈旧文档删除 + ASGI 迁移收尾（§13.2/13.3 执行完毕）
+
+四轮探查 + 分批执行的大扫除。三块：
+
+- **文档**：删 34 份陈旧文档——docs/ 顶层 6 份与 docs/memory/ 逐字节重复的旧
+  副本、`docs/generated/` 快照、18 份已 ship 的一次性时点文档（V1 测试系列、
+  WAKE_INTERVAL、AFULL_PLAN、BACKEND_ASGI_ROUTE_MATRIX 等）、docs/superpowers/
+  已落地的 plans/specs 10 份（含 backend-asgi-migration-plan，其 §13 剩余项本次
+  执行完毕）。恢复 2 份仍被 `IO-v1-下一期-TODO.md` 未勾选事项引用的 V1 清单。
+  所有被删文件的悬空引用已清（指向 git 历史）。长期文档同步去 Flask 时代描述：
+  README / PROJECT_OVERVIEW / CONTENT_ENCRYPTION_INTERACTION_CURRENT / MEMORY /
+  AUDIT / DEPLOYMENTS / SELF_HOSTING / CONTRIBUTING（MEMORY.md 头部加了
+  「行号基于拆分前单体」的显著提示；DEPLOYMENTS 现状表去掉已下线的 MCP 行）。
+- **死代码**：删 `tools/worldbook_e2e.py`（零引用）、
+  `deploy/docker-compose.asgi-parallel.yaml`（迁移期 :5005 工装，cutover 已完成）、
+  `backend/proactive/eval_v2.py`（+其 2 个测试；observability_v2 的 4 个生产覆盖
+  保留）、`bootstrap/gates.py` 的 DEPRECATED `_gate_required_for_missing_tabs`、
+  requirements 里的 Pillow（全仓无 import PIL；lock 已用 uv 重生成）。
+- **ASGI 迁移收尾（migration plan §13.2/§13.3/§16）**：61 个测试文件从
+  `import app as appmod` 重写为直接驱动领域包 + `asgi_test_client.make_client()`
+  （新增 conftest `backend_env`/`client` fixture；make_client 镜像 lifespan 的
+  wake-hook 与 envelope 接线）；子进程/CI 入口 `python backend/app.py` →
+  新 `backend/serve_dev.py`（5 处 + ci.yml）；**删除 `backend/app.py`**（803 行
+  facade + 符号回灌循环）、`hosted/setup_routes.py`（13 行空壳）、
+  `hosted/chat_routes.py`（Flask 时代 native tool loop，生产零引用，连带
+  test_hosted_memory_tool_loop.py 与 2 处测试引用；AUTOSEED_SCRUB_FLAGS 的
+  字符串条目保留——那是存量档案清洗清单，与代码无关）。
+  守护换代：test_asgi_app_import_guard →
+  `tests/test_no_app_py_regression.py`（app.py 不得重生 + 测试不得再 import 旧
+  facade，覆盖 `import backend.app` 变体）。
+- **⚠️ 生产行为变化（有意，修 cutover 遗留 bug）**：app.py:756-762 的 3 处装配
+  注入（`push_live_activity.load_identity`、admin data-track 的
+  `_latest_history_import_job`/`_onboarding_validation_payload`）在 ASGI 切换时
+  漏接，生产上 Live Activity identity 与 admin 数据面板一直是 stub 空值；现已
+  接进 `asgi_app.py` 末尾装配段。上线后这两处从空值变有值属修复生效。
+- 验证：全量 pytest 对基线零新增失败（5 个 pre-existing 失败与本次无关）；
+  `import app` 全形态 grep 归零；路由面与 07-03 快照逐条 diff 对账——本次清理
+  零路由增删（139 vs 133 = 方法合并行拆分 +5、cutover 已删的 static -1、
+  同期 WIP 新增 debug 路由 +2）；requirements.lock diff 仅 -pillow。
+
+### [DONE] enclave ASGI 迁移审查修复（5 个正确性回归 + 4 项清理）
+
+对 3687f98（enclave Flask→FastAPI）做多智能体行为等价性审查，确认并修复
+5 个并发模型/HTTP parity 回归（全部 TDD，先红后绿）：
+
+- **singleflight 失败广播**（`enclave/auth.py`）：leader 的瞬时失败/
+  CancelledError 不再扇出给全部同凭证等待者；等待者收哨兵后各自独立重试
+  （旧线程版 per-key 锁语义），CancelledError 不再逃出路由层变 500。
+- **CPU 重活离事件循环**：大 payload 的 `json.dumps`（chat/history、
+  frames/decrypt 的 ~470KB image_b64）经新 `routes/_json.py` 在线程池渲染；
+  gzip 中间件的 `gzip.compress` 同样 to_thread——防止图片重请求把
+  /healthz 队头阻塞成网关 502。
+- **回环连接池排队**（`enclave/backend_client.py`）：`Timeout(15, pool=None)`
+  ——池满排队等空位（旧 32 gthread 准入闸语义），不再 >100 并发时 15s 后
+  整批 PoolTimeout→502。
+- **Range parity**（`routes/frames.py`）：畸形 Range（如 `bytes=5--3`）按
+  RFC 7233 忽略回 200 全量，不再 416（byte-pos 按 1*DIGIT 显式校验）。
+- **HEAD parity**：/v1/chat/history、/v1/memory/list、/v1/identity/get 显式
+  挂 HEAD（FastAPI 不像 Flask 自动加），405→200。
+
+清理：`routes/_body.py` 改包装主 backend `asgi.http.read_json_silent`
+（收敛 +json 门槛漂移、继承 ClientDisconnect 修复）；新 `routes/_errors.py`
+收敛 15 处复制的 httpx→401/502 与 content_sk→503 映射块；provider_client
+的 openai-compat 编解码抽成 sync/async 共享纯函数（payload 构造/reasoning
+降级判定/响应解析单实现）；chat/history 的 memory/list 拉取与解密并行
+（省一次串行 RTT）；asgi_worker 的 uvicorn TLS monkeypatch 从 import 副作用
+收进 `EnclaveUvicornWorker.init_process`。
+
+测试：enclave 相关 192 全绿（含 20+ 新回归测试）；全量 2266 passed，
+6 个失败是 debug_trace/capture_trace 的 pre-existing 环境问题（测试库连接，
+与本批改动无 import 交集）。未提交未部署。
+
+### [DONE] 托管回合上游报错透出
+
+托管回合失败时不再只是静默重试/兜底回复——consumer 错误分类器
+（`classify_agent_error`）把失败归类到 error_class + 责任方（system /
+user_provider），然后：
+
+- 发一条 `role="system"` 聊天通知（前台必发；后台同 error_class 每
+  `SYSTEM_NOTICE_DEBOUNCE_SEC`（默认 6h）一条，任一成功回合清零）；
+- `POST /v1/model_api/runtime_error` 写设置页 `last_runtime_error`，
+  成功回合清空。
+- `SEND_FALLBACK_ON_AGENT_ERROR` 的 `FALLBACK_REPLY` 兜底文案保留，不冲突。
+- iOS 端渲染这条 system 通知是后续独立仓任务。
+- spec 见 `docs/superpowers/specs/2026-07-06-upstream-error-surfacing-design.md`。
+
+最终整体审查修了 3 条 Important + 1 条 Minor：
+- 去抖用 `dict.get(k, 0.0)` 配 `time.monotonic()`（自开机秒数）在
+  uptime < debounce 窗口时把「从未发过」误判成「刚发过」，导致 CVM
+  刚启动时首个后台通知被假抑制——改成 `get(k)` 为 `None` 时直接放行。
+- respawn 后新进程 `_runtime_error_reported` 从 `False` 起步，成功回合
+  永不触发清空请求，respawn 前留下的滞留错误永久卡在设置页——改成
+  每进程以 `True` 起步，首个成功回合无条件清一次（代价一次 HTTP）。
+- `_clean_messages_for_proactive_context` 没有 role 过滤，system 通知
+  会混入前台连续性上下文和 proactive 上下文，agent 把「⚠️ 额度不足」当成
+  自己说过的话——补上 role=="system" 过滤，写法对齐 `_capture_live_history`
+  的白名单方式。
+- CHANGELOG 记录格式微调（本条）。
+
+测试：`tests/test_consumer_error_classify.py` 新增去抖首发不假抑制、
+respawn 后成功回合清空、proactive 上下文过滤 system 通知三个用例。
+
+### [DONE] Proactive 日报口径修复 + memory-maintenance 失败退避
+
+排查「日报成功率 3%」：真因不是投递管线坏，而是 memory-maintenance
+（capture/dream/migrate）jobs 在坏钥用户身上无退避重试（prod 实测 ~75s 一次、
+40 用户 2 天 7412 条 failed），灌满日报的 failed 分母；真实 wake lane 成功率
+~55%。爆发点 = 7/5 单 runner 接管 102 用户：此前这些用户的 job 静默积压在
+pending（1200-1400/天），切换后被消费、坏钥用户变成大声失败。
+
+- **日报口径**（`db.admin_data_track_proactive_daily` + `admin/data_track.py`）：
+  成功率只算 wake lane，且 completed（醒了、正常决策、只是没发消息——
+  sleep/纯动作）算成功：(delivered+completed)/(delivered+completed+failed)，
+  口径衡量「系统是否健康」而非「醒了的里面有多少真正送达」（拍板
+  2026-07-06，新口径下 07-06 约 78%）；failed 只含 status='failed'；gate
+  拒绝的 skipped 单独计数；maintenance 单独成列（表格新增 完成 / Skipped /
+  维护(失败) 列）；「心跳」列分类器补上现网 kind `presence`（旧 SQL 只匹配
+  heartbeat*，恒 0；与并行 commit 1e30c39 对 db.py 的最小修复同源合一，
+  保留其 `admin_events_overview` 的 presence 修复）。
+- **失败退避**（`proactive/capture_jobs.py` 新增 `failure_backoff_sec`/
+  `in_failure_backoff`，capture/dream/migrate 三条 lane 接入）：terminal=failed
+  后同一窗口指数退避（base 600s × 2^(streak-1)，封顶 6h；
+  `FEEDLING_MAINTENANCE_FAIL_BACKOFF_{BASE,MAX}_SEC` 可调），completed 重置
+  streak，debug 面板 force 绕过；migrate 终态此前无人记录，补了
+  `record_migrate_job_status` + `proactive_core.job_status` 接线。
+  Codex review 后加固：`job_status` 只在状态真正转变时才调 recorder——
+  consumer 重复上报同一终态 failed 不再重复累 streak/无故翻倍退避。
+- 测试：`tests/test_proactive_daily_report.py`（SQL lane 拆分/payload/分类器/
+  渲染）+ `tests/test_capture_failure_backoff.py`（三 lane 退避、翻倍、重置、
+  force 绕过、route 接线）。`test_memory_capture_trace.py::
+  test_enqueue_duplicate_capture_key_does_not_emit_queued_event` 在本改动前
+  已失败（pre-existing，与本次无关）。
+- 未做（后续方向）：坏钥用户的 provider 级熔断（连续 401/403/余额不足时
+  暂停 maintenance lane）。
+
 ## 2026-07-04
+
+### [DONE] enclave Flask→FastAPI/asyncio 迁移，全仓 flask 依赖清零
+
+`backend/enclave_app.py`（2333 行 Flask 单文件，全仓最后一个 flask 使用方）
+迁移为模块化 `backend/enclave/` 包 + FastAPI/asyncio，16 个 task 完成
+（主 backend 的同类迁移已在 PR #44 合入，见 992d908；enclave 是收尾）。
+
+- **模块划分**：`config/keys/attestation/state/envelope/auth/backend_client/
+  readside/visual` + `routes/{health,envelope,memory,worldbook,chat,identity,
+  frames}` + `asgi_worker.py`（enclave 专用 UvicornWorker）+ `serving.py`（内嵌
+  gunicorn 组装、TLS PEM 材料化）；`enclave_app.py` 收缩成 ~30 行薄入口，
+  compose 命令 `python -u backend/enclave_app.py` 不变（compose_hash 不变）。
+- **混合并发模型**：11 条路由全 `async def`；enclave→backend 回环换成进程级
+  `httpx.AsyncClient`；解密批处理按请求整批下放 `anyio.to_thread.run_sync`
+  （libsodium/cryptography 释放 GIL，真并行，事件循环不被 CPU 工作阻塞）；
+  whoami 缓存的 singleflight 从 `threading.Lock` 改 per-key `asyncio.Future`；
+  `/v1/envelope/decrypt` 保持"每次实时解析、绝不走缓存"不变。
+- **手工 Range/ETag**：`/image` 路由手写替代 Flask `send_file(conditional=True)`
+  ——单区间 206 + `Content-Range`、非法区间 416、`ETag`/`If-None-Match` → 304，
+  是 dstack-gateway 每连接 ~1Mbps 限速下并行分块拉图的关键能力，专项测试覆盖。
+  flask-compress gzip 换成 Starlette `GZipMiddleware`（阈值对齐 500 字节）。
+- **`FEEDLING_ENCLAVE_THREADS` 语义变更**：从 gthread worker 线程数变为 anyio
+  解密线程池容量（CapacityLimiter），默认值仍是 32，环境变量名不变，compose
+  不用动。`FEEDLING_ENCLAVE_WORKERS`（prod=2）语义不变。
+- **两处有意行为偏差**（spec 明确标注，不是回归）：
+  1. `OPTIONS` 请求：Flask 自动 200 → 新栈 FastAPI 路由表行为，未注册的
+     OPTIONS 回 405 + `Allow`（`test_enclave_routes_health.py`）；
+  2. `/v1/envelope/decrypt` 非对象 body：旧代码曾 500 → 新代码归一为 400
+     （`envelope.py` 内联注释 "有意偏差 #2"）。
+  错误码/错误字符串（含两套并存拼法 `missing_api_key`/`missing api_key` 等）
+  逐字保留，未借机统一命名。
+- **依赖清零**：`backend/requirements.txt` 删除 `flask>=3.0.0` /
+  `flask-compress>=1.14` 两行及其头部说明段；`uv pip compile` 重新生成
+  `requirements.lock`，diff 只消失 flask 系传递闭包八个包（flask/
+  flask-compress/itsdangerous/blinker/jinja2/werkzeug/brotli/backports-zstd，
+  后两个是 flask-compress 的压缩算法依赖），无关依赖零变化。新增
+  `tests/test_no_flask_anywhere.py` 守卫（grep 全 backend 无 `import flask`
+  + 逐个 import 11 个 `enclave.*` 模块断言 `"flask" not in sys.modules`），
+  锁死"全仓无 flask"不变量。
+- **验证**：全量测试 2125 passed（较主迁移后基线 2037 净增 88，全部来自本次
+  新增的 enclave 单测），4 skipped，9 xfailed；已知非本次引入的 2 个失败
+  （`tests/test_data_track.py` 两个 fast-validation 断言，未改动过、与本次
+  迁移无关）与 `tests/test_api.py` 收集错误（需 `:5001` 活服务，非本次回归）
+  按既有基线原样保留，无新增失败。`docker-compose.memory-sandbox.yaml` 冒烟
+  通过：`up -d --build` 后 backend + enclave 均 healthy，`curl /healthz` →
+  `{"ok":true,"ready":true}`，`/attestation` 正常返回 quote/measurements，
+  enclave 日志确认跑在 `enclave.asgi_worker.EnclaveUvicornWorker` 上。
+- **test CVM 待验收**（不属于本次范围，spec §5/§8，由用户驱动上线后跑）：
+  TLS 钉扎三条硬验收——① `openssl s_client` 取实际 served leaf cert，
+  sha256(DER) 与 attestation 指纹比对必须相等；② iOS 审计卡实测通过；
+  ③ 最低 TLS 版本 ≥1.2（握手对 TLS1.1 必须失败）。理论上钉扎不破（同一份
+  PEM 材料化路径），但 uvicorn/gunicorn 构建 SSLContext 与现有自定义
+  `ssl_context` hook 的协商细节可能有出入，需真实 TDX 环境验证。另需在
+  test CVM 上过一遍 chat/memory/identity/frames e2e、Range 并行分块拉图、
+  runtime-token 与 api-key 双路径。
+- **影响文档**：`docs/superpowers/specs/2026-07-04-enclave-asgi-migration-design.md`
+  是本次设计的 spec 源文档。本条目工作树未 commit（worktree
+  `enclave-asgi-migration`，基于 test 分支），由用户在验收后提交。
+
+### [DONE] 丢回合重投递兜底：consumer respawn 窗口不再永久丢用户消息（未 commit / 未部署）
+
+- **背景**：prod ASGI 切换当日全量巡检发现 3 条 model_api 用户消息永久无回复。根因不在
+  HTTP 层：supervisor 一检测到 config changed（model_api/setup、driver、preferences 写入都算）
+  就 signal 15 respawn consumer，而 consumer 重启后游标从 checkpoint/最新历史 ts 播种，
+  `since` 严格大于 ⇒ 重启前落库、未回复的消息被永久跳过——claim CAS 机制再也看不到它。
+- **修**（server 为主）：`chat/service._pending_chat_messages_for_poll` 加重投递兜底——
+  `ts <= since` 的 user 消息在同时满足「未回复 + claim 空/过期 + 在
+  `FEEDLING_CHAT_REDELIVERY_WINDOW_SEC`（默认 3600s，0=关）窗口内 + 在未回复尾巴上
+  （其后没有已回复的可见 user 消息，见 `_redelivery_floor`；verify_ping 不算对话也不重投）」
+  时仍可投递。**backstop claim 走 DB CAS 严格模式** `db.chat_try_claim_reply(redelivery=True)`——
+  两轮 Codex review 抓出的多 worker 缓存问题都封在这一条 SQL 里：① 拒绝**任何**未过期
+  claim（含自己的；不同于正常路径的幂等自刷新）——防止把进行中的重投回合再发给它的
+  claimer 跑重复回合；② `NOT EXISTS` 在 claim 时刻权威判定 supersede 尾巴——父消息
+  reply_status 元数据更新不跨 worker 广播，缓存侧 `_redelivery_floor` 可能漏掉「更新的
+  消息已被回复」，没有这条乱序迟到回复仍可能发生。缓存侧检查降级为快速预过滤
+  （prod 跑 4 worker，缓存不可信）。重试节奏 = claim TTL：`CHAT_POLL_CLAIM_TTL_SEC`
+  默认 120→600——重投递生效后 claim 过期意味着重复回合（双烧 provider，409 只挡双落库），
+  TTL 必须盖过最长正常回合。
+- **批量恢复走滚动**（第三轮 Codex review）：per-poll 重投预算
+  `FEEDLING_CHAT_REDELIVERY_BATCH_MAX`（默认 5）——consumer 逐条跑回合（30-90s/条），
+  不设预算的话大批 claim 的尾部会在处理到之前过期（重复回合）+ 超出解密拉取量；
+  超预算的消息**不 claim**、下次 poll 立即接上（滚动恢复，不是等 TTL）。预算只管
+  backstop，`ts > since` 的活对话永不受限。
+- **配套**（consumer 两处）：`tools/chat_resident_consumer.py` 解密窗口改
+  `_poll_decrypt_since(last_ts, poll_messages)`——重投的消息 ts 在游标之前，原
+  `since=last_ts` 取不到明文会走 wedge-skip 白烧 claim；现在窗口拉回到批次最旧消息之前，
+  且拉取量 `_poll_decrypt_limit` 按批次放大（2×批次+20，下限 50）保证整批可解密。
+- 测试：`tests/test_chat_poll_redelivery.py`（16 项，含 supersede/窗口/TTL/排序/陈旧缓存
+  ×2/预算滚动×2 语义）+ `tests/test_consumer_decrypt_since.py`（6 项）；全量回归通过。
+- CI 适配：`tests/test_api.py` 长轮询超时用例原本留着未回复的用户消息（第 3/5/6 节的
+  openclaw 回复不带 `reply_to_message_id`）——兜底生效后这些消息被立即重投、poll 不再
+  park（CI #687 三红）。改为真实 consumer 行为（回复都挂 reply_to），本地按 CI 同款
+  方式起服务全量验证通过。
+- 部署注意：backend 镜像 + runner 镜像都要更新（consumer 走自身 self-update 亦可）；
+  乱序回复不可能出现——重投只发生在「其后无任何已回复消息」的尾巴上。
 
 ### [DONE] 自定义陪伴频率 wake_interval_sec + 心跳激活门（三层，已 ship）
 

@@ -4,7 +4,7 @@ Covers the two ends of the backend path that carries a user-selected memory
 into the agent's reply context (id persisted on the turn → enclave expands it
 into a decrypted card → resident consumer injects it as a context block):
 
-    - enclave_app._attach_quoted_memories   (expand id → card on the message)
+    - enclave_chat._attach_quoted_memories   (expand id → card on the message)
     - chat_resident_consumer._quoted_memory_context  (format card for the agent)
 
 Both are pure (no DB / no network), so this module is in conftest's _PURE_UNIT
@@ -42,12 +42,12 @@ except ModuleNotFoundError:
     _fake_enc.build_envelope = lambda **kw: {"v": 1, "stub": True}
     sys.modules.setdefault("content_encryption", _fake_enc)
 
-import enclave_app  # noqa: E402
+from enclave.routes import chat as enclave_chat  # noqa: E402
 import tools.chat_resident_consumer as crc  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
-# enclave_app._attach_quoted_memories
+# enclave_chat._attach_quoted_memories
 # ---------------------------------------------------------------------------
 
 def test_attach_expands_id_into_card():
@@ -62,7 +62,7 @@ def test_attach_expands_id_into_card():
         {"id": "mom_other", "title": "别的", "description": "", "type": "moment"},
     ]
 
-    enclave_app._attach_quoted_memories(decrypted, moments)
+    enclave_chat._attach_quoted_memories(decrypted, moments)
 
     user = decrypted[0]
     # Raw id list is stripped so it never leaks in the response.
@@ -79,7 +79,7 @@ def test_attach_expands_id_into_card():
 
 def test_attach_unknown_id_is_skipped_not_errored():
     decrypted = [{"id": "u1", "role": "user", "quoted_memory_ids": "missing"}]
-    enclave_app._attach_quoted_memories(decrypted, [])
+    enclave_chat._attach_quoted_memories(decrypted, [])
     assert "quoted_memory_ids" not in decrypted[0]
     assert "quoted_memories" not in decrypted[0]
 
@@ -87,7 +87,7 @@ def test_attach_unknown_id_is_skipped_not_errored():
 def test_attach_title_only_memory_uses_title_as_text():
     decrypted = [{"id": "u1", "role": "user", "quoted_memory_ids": "m1"}]
     moments = [{"id": "m1", "title": "只有标题", "description": "", "type": ""}]
-    enclave_app._attach_quoted_memories(decrypted, moments)
+    enclave_chat._attach_quoted_memories(decrypted, moments)
     card = decrypted[0]["quoted_memories"][0]
     assert card["text"] == "只有标题"
     assert card["type"] == ""
@@ -95,7 +95,7 @@ def test_attach_title_only_memory_uses_title_as_text():
 
 def test_attach_noop_without_ids():
     decrypted = [{"id": "u1", "role": "user", "content": "hi"}]
-    enclave_app._attach_quoted_memories(decrypted, [{"id": "m", "title": "t"}])
+    enclave_chat._attach_quoted_memories(decrypted, [{"id": "m", "title": "t"}])
     assert decrypted == [{"id": "u1", "role": "user", "content": "hi"}]
 
 
@@ -105,7 +105,7 @@ def test_attach_multiple_ids_preserve_order():
         {"id": "b", "title": "B", "description": "", "type": "fact"},
         {"id": "a", "title": "A", "description": "", "type": "fact"},
     ]
-    enclave_app._attach_quoted_memories(decrypted, moments)
+    enclave_chat._attach_quoted_memories(decrypted, moments)
     ids = [c["id"] for c in decrypted[0]["quoted_memories"]]
     assert ids == ["a", "b"]
 

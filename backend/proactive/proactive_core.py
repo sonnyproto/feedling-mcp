@@ -51,6 +51,12 @@ def _proactive_state_doc(settings: dict) -> dict:
         "wake_interval_sec": core_store.normalize_proactive_wake_interval_sec(
             settings.get("wake_interval_sec")
         ),
+        "dream_enabled": bool(settings.get("dream_enabled", True)),
+        "capture_enabled": bool(settings.get("capture_enabled", True)),
+        "screen_watch_enabled": bool(settings.get("screen_watch_enabled", True)),
+        "photo_wake_enabled": bool(settings.get("photo_wake_enabled", True)),
+        "arrival_wake_enabled": bool(settings.get("arrival_wake_enabled", True)),
+        "unlock_wake_enabled": bool(settings.get("unlock_wake_enabled", True)),
         "updated_at": settings.get("updated_at", ""),
     }
 
@@ -81,6 +87,12 @@ def state_save(store, payload: dict) -> dict:
             "scheduled",
             "reminders_delivery",
             "wake_interval_sec",
+            "dream_enabled",
+            "capture_enabled",
+            "screen_watch_enabled",
+            "photo_wake_enabled",
+            "arrival_wake_enabled",
+            "unlock_wake_enabled",
         )
         if key in payload
     })
@@ -391,21 +403,20 @@ def job_status(store, job_id, payload: dict):
             "job": current,
             "expected_consumer_id": current_consumer,
         }, 409
+    prev_status = str((current or {}).get("status") or "").strip().lower()
     job = store.update_proactive_job(job_id, patch)
     if job is None:
         return {"error": "job_not_found"}, 404
-    if capture_jobs.is_memory_capture_job(job):
-        capture_scheduler.record_capture_job_status(
-            store,
-            job,
-            status=str(patch.get("status") or payload.get("status") or ""),
-        )
-    if capture_jobs.is_memory_dream_job(job):
-        dream_scheduler.record_dream_job_status(
-            store,
-            job,
-            status=str(patch.get("status") or payload.get("status") or ""),
-        )
+    new_status = str(patch.get("status") or payload.get("status") or "").strip().lower()
+    # 同状态的重复终态上报（consumer 重试/重放）不再触发 recorder——否则失败
+    # streak 会被同一次失败重复累计、退避被无故翻倍。
+    if new_status and new_status != prev_status:
+        if capture_jobs.is_memory_capture_job(job):
+            capture_scheduler.record_capture_job_status(store, job, status=new_status)
+        if capture_jobs.is_memory_dream_job(job):
+            dream_scheduler.record_dream_job_status(store, job, status=new_status)
+        if capture_jobs.is_memory_migrate_job(job):
+            capture_scheduler.record_migrate_job_status(store, job, status=new_status)
     return {"job": job}, 200
 
 
