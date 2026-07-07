@@ -72,13 +72,20 @@ Add a resident-distill poll cycle (alongside the chat poll). Concrete contract (
 - For each job: **POST `{"envelope": sealed["envelope"]}` to `FEEDLING_ENCLAVE_URL` `/v1/envelope/decrypt`** (the SAME
   decrypt the consumer already does for chat/memory — the envelope is the identical v1 shape) → write plaintext to a
   temp file → invoke the agent: "absorb `<path>` (mode=<mode>)".
-  Agent distills per skill and writes `memory.add` / `identity.replace` (for identity, pass
-  `source=genesis_resident_distill`, `job_id`, `reason`). During a long distill call
+  Agent distills per skill and returns memory cards + an optional identity payload. During a long distill call
   `POST /v1/genesis/resident/{job_id}/heartbeat {consumer_id}`.
 - On finish: `POST /v1/genesis/resident/{job_id}/complete {memory_action_count, identity_status}` → backend marks done +
   deletes the stored ciphertext. Delete the temp file.
-- **Bypass** the existing `_capture_build_envelope` local-envelope lane (`chat_resident_consumer.py:5280`) — write
-  plaintext actions only (server builds envelopes), per the crypto invariant.
+- **⚠️ CORRECTED crypto contract (verified against the backend, the earlier "send plaintext, bypass
+  `_capture_build_envelope`" note was WRONG):** the write path is SPLIT:
+  - **memory.add → the consumer builds the v1 envelope CLIENT-side** (reuse `_capture_build_envelope`,
+    `chat_resident_consumer.py:5280`) and POSTs it via `execute_memory_actions` → `/v1/memory/actions`, which HARD-requires
+    an envelope (`backend/memory/memory_core.py:287` "envelope required — v1 encryption is mandatory"). The agent returns
+    cards (no keys); the consumer seals them, exactly like the capture lane. There is NO server-plaintext memory lane.
+  - **identity.replace → the consumer sends PLAINTEXT** `{"type":"identity.replace","source":"genesis_resident_distill",
+    "job_id":...,"reason":...,"identity":{...}}` via `execute_identity_actions` → `/v1/identity/actions`; the SERVER builds
+    the envelope (`_identity_replace_action` REJECTS a client `envelope`, 400). This is the only server-build lane.
+  - So: memory = client-seal (has keys, like capture); identity = server-build (P3 gate). Don't conflate the two.
 
 ### P5 (feedling-mcp-ios) — client seal + upload (needs Xcode/device)
 - self-hosted branch of the 3 MaterialSheets (`GardenMaterialSheet`/`IdentityMaterialSheet`/`ChatEmptyStateView`):
