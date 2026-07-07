@@ -6645,6 +6645,201 @@ def _process_messages(messages: list) -> float:
     return latest
 
 
+# ── Resident genesis-distill lane ───────────────────────────────────────────
+# Self-hosted counterpart to the CLOUD genesis worker. The app seals the uploaded
+# material (v1 content-envelope) and the backend — running in resident distill mode
+# (FEEDLING_GENESIS_DISTILL_MODE=resident) — only stores the ciphertext. THIS local
+# agent claims the job, decrypts via the enclave, distills, and writes the result.
+#
+# CRYPTO contract (verified against the backend — do not conflate the two lanes):
+#   • memory.add   → this consumer seals the card CLIENT-side (it holds the keys,
+#                    exactly like the capture lane) because /v1/memory/actions
+#                    HARD-requires an envelope.
+#   • identity.replace → this consumer sends PLAINTEXT + source/job_id/reason; the
+#                    SERVER builds the envelope (the P3 gate rejects a client envelope).
+#
+# Off unless FEEDLING_GENESIS_RESIDENT_ENABLED=1.
+GENESIS_RESIDENT_ENABLED = _env_bool("FEEDLING_GENESIS_RESIDENT_ENABLED", False)
+# Stable per-user claim id (survives restarts; same shape as the chat checkpoint key).
+_RESIDENT_CONSUMER_ID = f"resident-distill-{CHECKPOINT_API_KEY_FINGERPRINT}"
+
+
+def genesis_resident_pending() -> list[dict]:
+    resp = httpx.get(
+        f"{FEEDLING_API_URL}/v1/genesis/resident/pending",
+        params={"consumer_id": _RESIDENT_CONSUMER_ID},
+        headers=_HEADERS,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    return (body.get("jobs") or []) if isinstance(body, dict) else []
+
+
+def genesis_resident_heartbeat(job_id: str) -> None:
+    try:
+        httpx.post(
+            f"{FEEDLING_API_URL}/v1/genesis/resident/{job_id}/heartbeat",
+            json={"consumer_id": _RESIDENT_CONSUMER_ID},
+            headers=_HEADERS,
+            timeout=15,
+        )
+    except Exception as e:  # heartbeat is best-effort; the lease reaper is the backstop
+        log.debug("resident distill heartbeat failed job=%s: %s", job_id, e)
+
+
+def genesis_resident_complete(job_id: str, *, memory_action_count: int, identity_status: str) -> None:
+    resp = httpx.post(
+        f"{FEEDLING_API_URL}/v1/genesis/resident/{job_id}/complete",
+        json={"memory_action_count": memory_action_count, "identity_status": identity_status},
+        headers=_HEADERS,
+        timeout=20,
+    )
+    resp.raise_for_status()
+
+
+def _decrypt_sealed_material(env: dict) -> bytes:
+    """POST the sealed v1 envelope to the enclave and return the plaintext bytes.
+
+    Same decrypt the consumer already uses for chat/memory — the envelope is the
+    identical v1 shape, so no new crypto path is introduced."""
+    if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
+        raise RuntimeError("enclave_not_configured")
+    resp = _ENCLAVE_CLIENT.post(
+        f"{FEEDLING_ENCLAVE_URL}/v1/envelope/decrypt",
+        json={"envelope": env},
+        headers=_HEADERS,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    b64 = str(body.get("plaintext_b64") or "")
+    if not b64:
+        raise RuntimeError("enclave_returned_no_plaintext")
+    return base64.b64decode(b64)
+
+
+# NOTE: the distill PROMPT is intentionally a minimal default — it belongs to the
+# resident skill (owned by Seven) and is expected to be refined there. It asks for a
+# single JSON object; the memory-card fields mirror the capture card shape so
+# _capture_build_envelope consumes them unchanged.
+def _build_distill_prompt(mode: str, document: str) -> str:
+    wants_identity = mode in {"update_identity", "onboarding"}
+    identity_line = (
+        '  "identity": {"agent_name": str, "self_introduction": str, '
+        '"dimensions": [{"name": str, "value": 0-100}]} | null,\n'
+        if wants_identity else '  "identity": null,\n'
+    )
+    return (
+        "You are distilling a document the user uploaded into their own memory/identity.\n"
+        f"Distill mode: {mode or 'add_memory'}.\n"
+        "Read the material below and return ONE JSON object, nothing else:\n"
+        "{\n"
+        '  "memory_cards": [{"summary": str, "content": str, "bucket": str, "threads": [str]}],\n'
+        f"{identity_line}"
+        "}\n"
+        "Keep only durable, worth-remembering facts. Empty memory_cards is valid.\n"
+        "--- MATERIAL ---\n"
+        f"{document}\n"
+        "--- END MATERIAL ---\n"
+    )
+
+
+def _parse_distill_output(text: str) -> tuple[list[dict], dict | None]:
+    """Extract the first JSON object from the agent reply → (memory_cards, identity)."""
+    raw = str(text or "").strip()
+    if not raw:
+        return [], None
+    # Strip a ```json fence if present, then take the outermost {...}.
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return [], None
+    try:
+        obj = json.loads(raw[start:end + 1])
+    except Exception:
+        return [], None
+    if not isinstance(obj, dict):
+        return [], None
+    cards = [c for c in (obj.get("memory_cards") or []) if isinstance(c, dict)]
+    identity = obj.get("identity") if isinstance(obj.get("identity"), dict) else None
+    return cards, identity
+
+
+def _process_resident_distill_once() -> None:
+    """Claim + realize any pending resident-distill jobs for this user."""
+    from datetime import datetime, timezone as _tzmod
+    jobs = genesis_resident_pending()
+    for job in jobs:
+        job_id = str(job.get("job_id") or "").strip()
+        mode = str(job.get("mode") or "").strip().lower()
+        sealed = job.get("sealed") if isinstance(job.get("sealed"), dict) else {}
+        env = sealed.get("envelope") if isinstance(sealed.get("envelope"), dict) else None
+        if not job_id or not env:
+            log.warning("resident distill: skipping malformed job %r", job_id)
+            continue
+        tmp_path: Path | None = None
+        try:
+            plaintext = _decrypt_sealed_material(env)
+            genesis_resident_heartbeat(job_id)  # claimed + decrypted; distill can be slow
+            IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+            tmp_path = IMAGE_TEMP_DIR / f"genesis_distill_{job_id}.md"
+            tmp_path.write_bytes(plaintext)
+            document = plaintext.decode("utf-8", errors="replace")
+
+            reply = _capture_agent_reply_text(
+                call_agent(_build_distill_prompt(mode, document), raw_text=True, trace_id=job_id)
+            )
+            genesis_resident_heartbeat(job_id)
+            cards, identity_payload = _parse_distill_output(reply)
+
+            # memory.add — consumer seals client-side (has the keys), exactly like capture.
+            occurred_at = datetime.now(_tzmod.utc).isoformat()
+            memory_actions: list[dict] = []
+            for card in cards:
+                envelope = _capture_build_envelope(
+                    card, occurred_at=occurred_at, source="genesis_resident_distill"
+                )
+                memory_actions.append({
+                    "type": "memory.add",
+                    "envelope": envelope,
+                    "reason": "Distilled from material the user uploaded.",
+                    "capture_mode": "genesis_resident_distill",
+                    "source_chat_message_ids": [],
+                })
+            if memory_actions:
+                execute_memory_actions(memory_actions)
+
+            # identity.replace — plaintext; the SERVER builds the envelope (P3 gate).
+            identity_status = "skipped"
+            if identity_payload and mode in {"update_identity", "onboarding"}:
+                execute_identity_actions([{
+                    "type": "identity.replace",
+                    "source": "genesis_resident_distill",
+                    "job_id": job_id,
+                    "reason": "Distilled identity from material the user uploaded.",
+                    "identity": identity_payload,
+                }])
+                identity_status = "replaced"
+
+            genesis_resident_complete(
+                job_id, memory_action_count=len(memory_actions), identity_status=identity_status
+            )
+            log.info(
+                "resident distill done job=%s mode=%s cards=%d identity=%s",
+                job_id, mode, len(memory_actions), identity_status,
+            )
+        except Exception as e:
+            # Leave the job unclaimed-progress: the backend stale reaper re-queues it
+            # under the attempt cap (or fails it), so a transient error never wedges.
+            log.error("resident distill failed job=%s: %s", job_id, e)
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+
+
 def run() -> None:
     # Hard auth check before entering the poll loop.
     # A missing user_id or public_key means every encrypted reply will fail;
@@ -6698,6 +6893,7 @@ def run() -> None:
     wedge_miss_count = 0
     last_job_ts = _load_proactive_checkpoint()
     proactive_enabled = PROACTIVE_POLL_ENABLED
+    resident_distill_enabled = GENESIS_RESIDENT_ENABLED
     if proactive_enabled and last_job_ts == 0.0:
         # Start from "now" on first boot so historical hidden jobs are not
         # replayed after an operator installs the consumer.
@@ -6858,6 +7054,21 @@ def run() -> None:
                         )
                     else:
                         raise
+
+            if resident_distill_enabled:
+                try:
+                    _process_resident_distill_once()
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        resident_distill_enabled = False
+                        log.warning(
+                            "resident-distill endpoint not available on this backend; "
+                            "disabling resident distill polling for this process"
+                        )
+                    else:
+                        log.warning("resident distill poll failed: HTTP %d", e.response.status_code)
+                except Exception as e:
+                    log.warning("resident distill poll failed: %s", e)
 
             result = poll_chat(last_ts)
             consecutive_errors = 0

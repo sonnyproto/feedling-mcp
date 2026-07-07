@@ -65,8 +65,12 @@ users` (migration 0012), so tests must `from conftest import seed_user; seed_use
 
 ## Remaining — NOT verifiable in this env (need real runtimes)
 
-### P4 (feedling-mcp/tools/chat_resident_consumer.py) — resident consumer plumbing
-Add a resident-distill poll cycle (alongside the chat poll). Concrete contract (backend is built + verified):
+### P4 (feedling-mcp/tools/chat_resident_consumer.py) — resident consumer plumbing ✅ DONE (`<this commit>`)
+`_process_resident_distill_once()` + `genesis_resident_pending/heartbeat/complete` + `_decrypt_sealed_material`,
+wired into `run()` behind `FEEDLING_GENESIS_RESIDENT_ENABLED` (default off; 404 self-disables). Pure helpers
+(`_parse_distill_output`, `_build_distill_prompt`) unit-verified here; the decrypt/agent/write loop needs the real
+VPS e2e. The distill PROMPT is a MINIMAL default (belongs to the resident skill / Seven — refine there). Concrete
+contract (backend is built + verified):
 - `GET {API}/v1/genesis/resident/pending?consumer_id=<stable-id>` (user's api key/runtime token) →
   `{jobs:[{job_id, mode, sealed:{envelope:{v,id,body_ct,nonce,K_user,K_enclave,owner_user_id,visibility,enclave_pk_fpr}}}]}`.
 - For each job: **POST `{"envelope": sealed["envelope"]}` to `FEEDLING_ENCLAVE_URL` `/v1/envelope/decrypt`** (the SAME
