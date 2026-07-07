@@ -50,29 +50,45 @@ users` (migration 0012), so tests must `from conftest import seed_user; seed_use
 - **TODO** — wire a reaper tick calling `genesis_reap_stale_resident_jobs(1800, max_attempts=3, ...)` into the
   supervisor loop that already calls `genesis_reap_stale_processing_jobs`.
 
-### P3 (backend) — `identity.replace` server-build action
-- New action in `backend/identity/actions.py` (`_identity_replace_action`), added to the supported-action list.
-- Reuse/extract `service.replace_identity_preserving_anchor` (`genesis/service.py:786`) semantics: accept **plaintext**
-  full identity + runtime token → server builds the shared envelope (`core_envelope._build_shared_envelope_for_store`,
-  as `profile_patch` does) → replace, preserve anchor. **Agent never builds an envelope.**
-- **HIGH-RISK gating (Codex P1)**: require `source="genesis_resident_distill"` + `job_id` + `reason`; backend validates
-  the job belongs to the caller and is resident `claimed/running`. Payload **must not** carry an envelope (test this).
+### P3 (backend) — `identity.replace` server-build action ✅ DONE (`<this commit>`)
+- `_identity_replace_action` in `backend/identity/actions.py`, in the supported list + dispatch.
+- Reuses `genesis.service.replace_identity_preserving_anchor` (server builds the shared envelope, agent sends
+  plaintext, anchor preserved). Agent never builds an envelope.
+- HIGH-RISK gating: payload must NOT carry `envelope`; requires `source=genesis_resident_distill` + `job_id` + `reason`,
+  and `db.genesis_get_job(user, job_id)` must be a live resident job (status=processing, resident_consumer_id set).
+- 5 tests. **⚠️ Implication for P6 skill (below): this gate means identity.replace is ONLY usable from the app-upload
+  path (which has a resident job). The chat-handed-file path (entry B) has NO job → it must use
+  `identity.profile_patch`/`identity.dimension_nudge` (incremental), NOT replace.**
 
-### P4 (feedling-mcp/tools) — resident consumer plumbing
-- In `chat_resident_consumer.py`: poll `GET /resident/pending` → decrypt the sealed material (enclave) → write to a
-  local temp file → hand the **path** to the agent ("absorb <path>") → agent distills per skill (memory.add /
-  identity.replace) → `POST /complete` → delete temp file. Heartbeat during long distills.
-- **Bypass** the existing `_capture_build_envelope` local-envelope lane (`chat_resident_consumer.py:5280`) — resident
-  distill writes plaintext actions only (Codex P2).
+## Remaining — NOT verifiable in this env (need real runtimes)
 
-### P5 (feedling-mcp-ios) — sub-agent candidate (unverifiable here)
-- self-hosted branch of the three MaterialSheets: seal the material client-side (reuse `sealForCurrentUser` /
-  `genesisPutChunk` envelope path, `FeedlingAPI.swift:1265/3047`) + `format:"sealed_v1"` body + upload-time size check.
-  Worker/cloud body stays plaintext (`uploadGenesisPlaintext` unchanged).
+### P4 (feedling-mcp/tools/chat_resident_consumer.py) — resident consumer plumbing
+Add a resident-distill poll cycle (alongside the chat poll). Concrete contract (backend is built + verified):
+- `GET {API}/v1/genesis/resident/pending?consumer_id=<stable-id>` (user's api key/runtime token) →
+  `{jobs:[{job_id, mode, sealed:{ciphertext_b64, ciphertext_sha256, content_sha256, aad}}]}`.
+- For each job: base64-decode `ciphertext_b64` → **decrypt via `FEEDLING_ENCLAVE_URL`** (the same decrypt the consumer
+  already does for chat/memory) → write plaintext to a temp file → invoke the agent: "absorb `<path>` (mode=<mode>)".
+  Agent distills per skill and writes `memory.add` / `identity.replace` (for identity, pass
+  `source=genesis_resident_distill`, `job_id`, `reason`). During a long distill call
+  `POST /v1/genesis/resident/{job_id}/heartbeat {consumer_id}`.
+- On finish: `POST /v1/genesis/resident/{job_id}/complete {memory_action_count, identity_status}` → backend marks done +
+  deletes the stored ciphertext. Delete the temp file.
+- **Bypass** the existing `_capture_build_envelope` local-envelope lane (`chat_resident_consumer.py:5280`) — write
+  plaintext actions only (server builds envelopes), per the crypto invariant.
 
-### P6 (io-onboarding) — sub-agent candidate (docs)
-- resident skill entry-B: identity md → local derive → **replace via `identity.replace`** (once P3 lands);
-  memory md → light capture + Dream. (Skill already mostly aligned; finalize identity=replace wording.)
+### P5 (feedling-mcp-ios) — client seal + upload (needs Xcode/device)
+- self-hosted branch of the 3 MaterialSheets (`GardenMaterialSheet`/`IdentityMaterialSheet`/`ChatEmptyStateView`):
+  when `storageMode == .selfHosted`, instead of `uploadGenesisPlaintext` (plaintext), **seal the material** (reuse
+  `sealForCurrentUser` / the `genesisPutChunk` envelope path, `FeedlingAPI.swift:1265/3047`) and POST a `sealed_v1` body:
+  `{format:"sealed_v1", client_job_id, mode, ciphertext_b64, ciphertext_sha256, content_sha256, aad}` to
+  `/v1/genesis/imports/plaintext`. **Upload-time size check** (~512KiB, self-hosted only). Cloud/worker path stays
+  plaintext (unchanged). ⚠️ reconcile the `aad` binding + `ciphertext` framing with the enclave decrypt (real e2e).
+
+### P6 (io-onboarding) — resident skill
+- entry-B (chat-handed file): memory md → light capture + `memory.add` (Dream reconciles); identity md → **incremental
+  `identity.profile_patch`/`dimension_nudge`, NOT replace** (entry B has no genesis job, so identity.replace's gate
+  rejects it — and incremental is the right semantics for a casual hand-off anyway).
+- The app-upload path (entry A) does the full replace, but that's driven by the consumer (P4), not the chat skill.
 
 ### E2E — real VPS deploy (red line: verify AEAD/enclave real decrypt).
 
