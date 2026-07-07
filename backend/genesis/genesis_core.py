@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from typing import Any
 
@@ -44,6 +45,20 @@ _JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
 
 def _bad(error: str, status: int = 400, **extra) -> tuple[dict, int]:
     return {"error": error, **extra}, status
+
+
+def genesis_distill_mode() -> str:
+    """Deploy-level distill mode. ``resident`` = a self-hosted VPS whose own local
+    agent does the distillation (material sealed client-side, agent claims + distills);
+    anything else (default) = ``worker`` = the current server-side genesis worker.
+    Garbage → worker (safe default): a cloud box must never fall into resident."""
+    return "resident" if str(os.environ.get("FEEDLING_GENESIS_DISTILL_MODE", "")).strip().lower() == "resident" else "worker"
+
+
+def _is_sealed_body(payload: dict) -> bool:
+    """A resident-mode upload is a client-sealed envelope, tagged ``format: sealed_v1``
+    (NOT the legacy plaintext body). Explicit tag so worker/resident bodies never blur."""
+    return isinstance(payload, dict) and str(payload.get("format") or "").strip().lower() == "sealed_v1"
 
 
 def _valid_job_id(job_id: str) -> bool:
@@ -306,6 +321,19 @@ def plaintext_import(
     that patch ``routes._start_plaintext_genesis_job`` keep working."""
     if not isinstance(payload, dict):
         return _bad("json_object_required", 400)
+
+    # Distill-mode bidirectional hard validation (safety edge): worker must never
+    # ingest a client-sealed body, resident must never ingest a legacy plaintext body.
+    mode = genesis_distill_mode()
+    sealed = _is_sealed_body(payload)
+    if mode == "worker" and sealed:
+        return _bad("sealed_body_rejected_in_worker_mode", 400)
+    if mode == "resident" and not sealed:
+        return _bad("plaintext_body_rejected_in_resident_mode", 400)
+    if mode == "resident" and sealed:
+        # P2 wires the resident path (persist ciphertext + claimable job). Until then,
+        # fail loudly rather than silently drop a sealed upload.
+        return _bad("resident_distill_not_available", 501)
 
     input_hash = history_import._history_import_payload_hash(payload)
     client_job_id = history_import._history_import_client_job_id(payload)
