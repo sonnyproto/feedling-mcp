@@ -126,6 +126,67 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
     return {"job": {"job_id": job_id, "status": "processing"}}, 200
 
 
+def resident_pending(store, *, consumer_id: str) -> tuple[dict, int]:
+    """Resident consumer polls for its user's sealed distill jobs. Atomically claims this
+    user's ``awaiting_resident`` jobs and returns them WITH the sealed material (ciphertext
+    + aad) for the consumer to decrypt via the enclave and distill locally. Per-user: uses
+    the same credential the consumer already uses for chat poll — never another user's jobs."""
+    cid = str(consumer_id or "").strip()
+    if not cid:
+        return _bad("consumer_id_required", 400)
+    claimed = db.genesis_claim_resident_jobs(store.user_id, consumer_id=cid, limit=4)
+    jobs: list[dict] = []
+    for job in claimed:
+        chunks = db.genesis_list_chunks(store.user_id, job["job_id"])
+        sealed = None
+        if chunks:
+            c = chunks[0]
+            body = c.get("encrypted_body") or b""
+            sealed = {
+                "ciphertext_b64": base64.b64encode(body).decode("ascii"),
+                "ciphertext_sha256": c.get("ciphertext_sha256"),
+                "content_sha256": c.get("content_sha256"),
+                "aad": c.get("aad"),
+            }
+        meta = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+        jobs.append({
+            "job_id": job["job_id"],
+            "mode": (meta.get("mode") or "") or job.get("source_kind") or "",
+            "sealed": sealed,
+        })
+    return {"jobs": jobs}, 200
+
+
+def resident_complete(store, job_id: str, payload: dict) -> tuple[dict, int]:
+    """Consumer reports a resident distill job finished (agent distilled + wrote memory /
+    identity locally). Marks the job done + **deletes the stored sealed material** (ephemeral —
+    consumed). ``memory_action_count`` / ``identity_status`` are informational for the app poll."""
+    if not isinstance(payload, dict):
+        return _bad("json_object_required", 400)
+    job = db.genesis_get_job(store.user_id, job_id)
+    if not job:
+        return _bad("job_not_found", 404)
+    mac = int(payload.get("memory_action_count") or 0)
+    db.genesis_complete_job(
+        store.user_id, job_id,
+        output={"stage": "resident_distill_done"},
+        memory_action_count=mac,
+        identity_status=str(payload.get("identity_status") or ""),
+        persona_ref="", persona_sha256="",
+    )
+    db.genesis_delete_chunks(store.user_id, job_id)
+    return {"job": {"job_id": job_id, "status": "done", "memory_action_count": mac}}, 200
+
+
+def resident_heartbeat(store, job_id: str, *, consumer_id: str) -> tuple[dict, int]:
+    """Consumer renews the lease on a job it's actively distilling. Owner-only (must be the
+    consumer that claimed it, still processing) — keeps the stale reaper from re-queueing it."""
+    ok = db.genesis_resident_heartbeat(store.user_id, job_id, consumer_id=str(consumer_id or "").strip())
+    if not ok:
+        return _bad("heartbeat_rejected", 409)  # not the owner, or job no longer processing
+    return {"ok": True, "job_id": job_id}, 200
+
+
 def _valid_job_id(job_id: str) -> bool:
     return bool(_JOB_ID_RE.match(str(job_id or "")))
 

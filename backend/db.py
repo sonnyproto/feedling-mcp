@@ -1482,16 +1482,15 @@ def genesis_claim_uploaded_jobs(*, limit: int = 1) -> list[dict]:
     return out
 
 
-def genesis_claim_resident_jobs(*, consumer_id: str, limit: int = 1) -> list[dict]:
+def genesis_claim_resident_jobs(user_id: str, *, consumer_id: str, limit: int = 1) -> list[dict]:
     """Atomically claim ``awaiting_resident`` genesis jobs for a resident consumer.
 
-    The VPS resident-distill path: the material is sealed client-side and stored,
-    the job sits in ``awaiting_resident`` (which the CVM worker's ``uploaded`` claim
-    never touches), and the resident consumer claims it here to distill locally.
-    Mirrors ``genesis_claim_uploaded_jobs`` (FOR UPDATE SKIP LOCKED so multiple
-    consumers can poll without double-processing), moving awaiting_resident ->
-    processing and stamping the claiming consumer + a fresh heartbeat + attempt count
-    (so a dead consumer's job can be reaped / re-queued instead of wedging forever).
+    Scoped to a single ``user_id`` — the resident consumer authenticates as its own
+    user (same per-user credential it uses for chat poll), so it only ever claims that
+    user's jobs, never another user's. Mirrors ``genesis_claim_uploaded_jobs`` (FOR
+    UPDATE SKIP LOCKED so a user's multiple consumer processes can't double-process),
+    moving awaiting_resident -> processing and stamping the claiming consumer + a fresh
+    heartbeat + attempt count (so a dead consumer's job can be reaped / re-queued).
     """
     cid = str(consumer_id or "").strip()
     if not cid:
@@ -1507,7 +1506,7 @@ def genesis_claim_resident_jobs(*, consumer_id: str, limit: int = 1) -> list[dic
                 WITH picked AS (
                     SELECT user_id, job_id
                     FROM genesis_import_jobs
-                    WHERE status = 'awaiting_resident'
+                    WHERE user_id = %s AND status = 'awaiting_resident'
                     ORDER BY finalized_at ASC NULLS LAST, updated_at ASC
                     LIMIT %s
                     FOR UPDATE SKIP LOCKED
@@ -1525,7 +1524,7 @@ def genesis_claim_resident_jobs(*, consumer_id: str, limit: int = 1) -> list[dic
                 WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
                 RETURNING j.*
                 """,
-                (safe_limit, cid),
+                (user_id, safe_limit, cid),
             )
             rows = cur.fetchall()
             cols = [d[0] for d in cur.description]
@@ -1777,6 +1776,18 @@ def genesis_list_chunks(user_id: str, job_id: str) -> list[dict]:
                 item[key] = value.isoformat()
         out.append(item)
     return out
+
+
+def genesis_delete_chunks(user_id: str, job_id: str) -> int:
+    """Delete a job's stored (encrypted) chunks. Used after a resident distill completes:
+    the sealed material is ephemeral — consumed once the local agent has distilled it,
+    so the server keeps no leftover ciphertext. Returns the number of chunks deleted."""
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "DELETE FROM genesis_import_chunks WHERE user_id = %s AND job_id = %s",
+            (user_id, job_id),
+        )
+        return cur.rowcount
 
 
 def genesis_mark_finalized(user_id: str, job_id: str) -> dict | None:

@@ -21,7 +21,7 @@ def _backdate(user_id, job_id, *, heartbeat_ago_sec, attempts):
 def _claim_one(user_id, job_id, consumer):
     seed_user(user_id)
     db.genesis_create_job(user_id, {"job_id": job_id, "status": "awaiting_resident"})
-    got = db.genesis_claim_resident_jobs(consumer_id=consumer, limit=64)
+    got = db.genesis_claim_resident_jobs(user_id, consumer_id=consumer, limit=64)
     assert [j for j in got if j["user_id"] == user_id and j["job_id"] == job_id]
 
 

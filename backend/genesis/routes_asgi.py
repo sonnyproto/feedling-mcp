@@ -159,5 +159,42 @@ async def genesis_import_status(
     return JSONResponse(body, status_code=status)
 
 
+@router.get("/v1/genesis/resident/pending")
+async def genesis_resident_pending(request: Request, auth: AuthResult = Depends(require_auth)):
+    # Per-user: the resident consumer authenticates as its own user (same credential it uses
+    # for chat poll) and only ever claims that user's awaiting_resident jobs.
+    body, status = await threadpool.run_db(
+        genesis_core.resident_pending,
+        auth.store,
+        consumer_id=request.query_params.get("consumer_id") or "",
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/genesis/resident/{job_id}/heartbeat")
+async def genesis_resident_heartbeat(
+    job_id: str, request: Request, auth: AuthResult = Depends(require_auth)
+):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    body, status = await threadpool.run_db(
+        genesis_core.resident_heartbeat,
+        auth.store,
+        job_id,
+        consumer_id=str(payload.get("consumer_id") or ""),
+    )
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/genesis/resident/{job_id}/complete")
+async def genesis_resident_complete(
+    job_id: str, request: Request, auth: AuthResult = Depends(require_auth)
+):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    body, status = await threadpool.run_db(
+        genesis_core.resident_complete, auth.store, job_id, payload
+    )
+    return JSONResponse(body, status_code=status)
+
+
 def register_asgi(app) -> None:
     app.include_router(router)

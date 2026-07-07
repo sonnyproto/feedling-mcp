@@ -19,9 +19,9 @@ def test_resident_claim_rejects_empty_consumer_id():
     # An empty consumer_id would create a resident-owned processing job that the
     # resident reaper (filters resident_consumer_id <> '') can never see → wedged.
     with pytest.raises(ValueError, match="consumer_id_required"):
-        db.genesis_claim_resident_jobs(consumer_id="")
+        db.genesis_claim_resident_jobs("u", consumer_id="")
     with pytest.raises(ValueError, match="consumer_id_required"):
-        db.genesis_claim_resident_jobs(consumer_id="   ")
+        db.genesis_claim_resident_jobs("u", consumer_id="   ")
 
 
 def test_claim_resident_job_stamps_and_is_single_shot():
@@ -29,7 +29,7 @@ def test_claim_resident_job_stamps_and_is_single_shot():
     seed_user(uid)
     db.genesis_create_job(uid, {"job_id": jid, "status": "awaiting_resident"})
 
-    claimed = db.genesis_claim_resident_jobs(consumer_id="cons-A", limit=32)
+    claimed = db.genesis_claim_resident_jobs(uid, consumer_id="cons-A", limit=32)
     mine = [j for j in claimed if j["user_id"] == uid and j["job_id"] == jid]
     assert len(mine) == 1
     j = mine[0]
@@ -40,7 +40,7 @@ def test_claim_resident_job_stamps_and_is_single_shot():
     assert j["resident_heartbeat_at"]
 
     # Already processing → a second claim (even by another consumer) can't re-take it.
-    again = db.genesis_claim_resident_jobs(consumer_id="cons-B", limit=32)
+    again = db.genesis_claim_resident_jobs(uid, consumer_id="cons-B", limit=32)
     assert not [k for k in again if k["user_id"] == uid and k["job_id"] == jid]
 
 
@@ -49,7 +49,7 @@ def test_resident_claim_ignores_worker_uploaded_jobs():
     uid, jid = "usr_rc_up", "job_rc_up_1"
     seed_user(uid)
     db.genesis_create_job(uid, {"job_id": jid, "status": "uploaded"})
-    claimed = db.genesis_claim_resident_jobs(consumer_id="cons-X", limit=32)
+    claimed = db.genesis_claim_resident_jobs(uid, consumer_id="cons-X", limit=32)
     assert not [j for j in claimed if j["user_id"] == uid and j["job_id"] == jid]
     # ...and the job is untouched (still uploaded).
     assert db.genesis_get_job(uid, jid)["status"] == "uploaded"
