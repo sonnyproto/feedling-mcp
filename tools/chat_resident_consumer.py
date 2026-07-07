@@ -6474,11 +6474,27 @@ def _process_messages(messages: list) -> float:
         # decrypted card on this message, so the agent sees the full memory text
         # without a lookup round-trip. Sits right above the user's message.
         quoted_text = _quoted_memory_context(msg)
+        # Diagnostic breadcrumb: localizes where Garden「talk in chat」breaks.
+        #   present>0  → enclave attached quoted_memories (② ok) → should inject
+        #   has_ids but present==0 → ② did not expand id into a card (enclave side)
+        #   neither → the reference never reached this message (① / transport)
+        _quoted_present = len(msg.get("quoted_memories") or [])
+        _quoted_has_ids = bool(str(msg.get("quoted_memory_ids") or "").strip())
+        _emit_debug_trace(
+            "context", "context.quoted_memory", trace_id=trace_id,
+            summary=f"quoted present={_quoted_present} injected={bool(quoted_text)}",
+            explain=(
+                "注入了引用记忆" if quoted_text
+                else ("有 quoted_memory_ids 但 enclave 未展开成 quoted_memories"
+                      if _quoted_has_ids else "本轮消息未携带任何引用记忆")
+            ),
+            detail={"present": _quoted_present, "has_ids": _quoted_has_ids, "injected": bool(quoted_text)},
+        )
         if quoted_text:
             content = f"{quoted_text}\n\n{content}"
             log.info(
                 "attached %d quoted memor(ies) to agent message ts=%.3f",
-                len(msg.get("quoted_memories") or []), ts,
+                _quoted_present, ts,
             )
 
         # Ground every foreground turn in the real current time (+ gap since last
