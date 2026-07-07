@@ -39,16 +39,16 @@ users` (migration 0012), so tests must `from conftest import seed_user; seed_use
   `FEEDLING_RESIDENT_DISTILL_MAX_BYTES` (default 512KiB, on stored ciphertext). 4 DB tests. **Upload↔claim loop
   wired.** ⚠️ the sealed-envelope field shape (`ciphertext_b64`/`ciphertext_sha256`/`aad`) is provisional — reconcile
   with the iOS sealer (P5) + verify on real enclave e2e before merge.
-- **TODO — Resident-facing endpoints** (new router or add to `genesis/routes_asgi.py`), consumer-auth (runtime token):
-  - `GET /v1/genesis/resident/pending` → `genesis_claim_resident_jobs(consumer_id=...)` (returns claimed jobs + a
-    fetch handle for the sealed material).
-  - `POST /v1/genesis/resident/{job_id}/heartbeat` → `genesis_resident_heartbeat`.
-  - `POST /v1/genesis/resident/{job_id}/complete` → `genesis_complete_job(...)` + delete the stored material.
-  - material fetch: reuse `genesis_list_chunks` (the consumer decrypts via `FEEDLING_ENCLAVE_URL`).
-- **app-facing `job.status`**: only `processing/done/failed` (the resident `awaiting_resident/claimed` detail stays
-  internal; `fetchGenesisJob` maps unknown→processing but Garden has an active-status whitelist — keep it to the 3).
-- A background reaper tick calling `genesis_reap_stale_resident_jobs(1800, max_attempts=3, ...)` (wire into the
-  existing supervisor/reaper loop that already calls `genesis_reap_stale_processing_jobs`).
+- ✅ **DONE (`899b8e9`)** — Resident endpoints on `genesis/routes_asgi.py`, **per-user auth** (`require_auth` — the
+  consumer authenticates as its own user, same as chat poll; claim scoped to that user, no host-all needed):
+  - `GET /v1/genesis/resident/pending?consumer_id=` → `genesis_core.resident_pending` (claim + return sealed material).
+  - `POST /v1/genesis/resident/{job_id}/heartbeat` → `genesis_core.resident_heartbeat` (owner-only).
+  - `POST /v1/genesis/resident/{job_id}/complete` → `genesis_core.resident_complete` (done + `genesis_delete_chunks`).
+  5 core tests + asgi-genesis (32) regression. **Full server-side loop verified: upload→pending→complete/heartbeat.**
+- **TODO (minor)** — app-facing `job.status` map: `GET /v1/genesis/imports/{id}` (`get_import_status`) should map
+  `awaiting_resident`→`processing` so the app never sees the internal status between upload and claim.
+- **TODO** — wire a reaper tick calling `genesis_reap_stale_resident_jobs(1800, max_attempts=3, ...)` into the
+  supervisor loop that already calls `genesis_reap_stale_processing_jobs`.
 
 ### P3 (backend) — `identity.replace` server-build action
 - New action in `backend/identity/actions.py` (`_identity_replace_action`), added to the supported-action list.
