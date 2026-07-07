@@ -30,19 +30,16 @@ Notes: Python 3.14 + psycopg_pool prints a benign `PythonFinalizationError` at i
 *combined* runs — run files individually to confirm pass counts. FK: `genesis_import_jobs.user_id →
 users` (migration 0012), so tests must `from conftest import seed_user; seed_user(uid)` before creating a job.
 
-## Remaining (in order; env ready for P2-rest/P3)
+## Remaining (in order; env ready)
 
-### P2-request-layer (backend) — replace the P1 `501` placeholder
-- **Resident upload branch** in `genesis_core.plaintext_import`: when `mode==resident and sealed`, instead of
-  `501`: size-check → **store the sealed envelope** (reuse `db.genesis_put_chunk`, single seq=0 chunk — it already
-  stores encrypted chunk envelopes) → `db.genesis_create_job(status="awaiting_resident")` **with `finalized_at`
-  set at create time** (so the claim ordering `finalized_at ASC` works). **Do NOT call `db.genesis_mark_finalized`**
-  — it flips status→`uploaded` (the worker lane!) and only accepts `created/uploading/uploaded/failed`, not
-  `awaiting_resident`. If a separate finalize step is wanted, add a resident-specific helper that only sets
-  `finalized_at`/`updated_at` and keeps `status='awaiting_resident'`. → return `{job:{job_id, status:"processing"}}`.
-- **Size limit** `FEEDLING_RESIDENT_DISTILL_MAX_BYTES` (default 512KiB; env helper like `genesis_distill_mode`):
-  measure the sealed body bytes; over → `413 material_too_large`. **Resident-only** (cloud path untouched).
-- **Resident-facing endpoints** (new router or add to `genesis/routes_asgi.py`), consumer-auth (runtime token):
+### P2-request-layer (backend)
+- ✅ **DONE (`6dd038e`)** — Resident upload branch `_resident_sealed_import` (replaces the 501): size-check →
+  store ciphertext via `genesis_put_chunk` (seq 0) → `genesis_create_job(status="awaiting_resident")` → return
+  `{job:{status:"processing"}}`. Idempotent. Size limit `resident_distill_max_bytes()` /
+  `FEEDLING_RESIDENT_DISTILL_MAX_BYTES` (default 512KiB, on stored ciphertext). 4 DB tests. **Upload↔claim loop
+  wired.** ⚠️ the sealed-envelope field shape (`ciphertext_b64`/`ciphertext_sha256`/`aad`) is provisional — reconcile
+  with the iOS sealer (P5) + verify on real enclave e2e before merge.
+- **TODO — Resident-facing endpoints** (new router or add to `genesis/routes_asgi.py`), consumer-auth (runtime token):
   - `GET /v1/genesis/resident/pending` → `genesis_claim_resident_jobs(consumer_id=...)` (returns claimed jobs + a
     fetch handle for the sealed material).
   - `POST /v1/genesis/resident/{job_id}/heartbeat` → `genesis_resident_heartbeat`.
