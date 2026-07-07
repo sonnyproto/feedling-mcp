@@ -1493,6 +1493,12 @@ def genesis_claim_resident_jobs(*, consumer_id: str, limit: int = 1) -> list[dic
     processing and stamping the claiming consumer + a fresh heartbeat + attempt count
     (so a dead consumer's job can be reaped / re-queued instead of wedging forever).
     """
+    cid = str(consumer_id or "").strip()
+    if not cid:
+        # An empty consumer_id would move the job to processing with a blank owner —
+        # invisible to genesis_reap_stale_resident_jobs (resident_consumer_id <> '') and
+        # thus unrecoverable. Refuse rather than wedge it.
+        raise ValueError("consumer_id_required")
     safe_limit = max(1, min(int(limit or 1), 16))
     with get_pool().connection() as conn:
         with conn.transaction():
@@ -1519,7 +1525,7 @@ def genesis_claim_resident_jobs(*, consumer_id: str, limit: int = 1) -> list[dic
                 WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
                 RETURNING j.*
                 """,
-                (safe_limit, consumer_id),
+                (safe_limit, cid),
             )
             rows = cur.fetchall()
             cols = [d[0] for d in cur.description]
@@ -1558,6 +1564,7 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
                 SELECT user_id, job_id
                 FROM genesis_import_jobs
                 WHERE status = 'processing'
+                  AND COALESCE(resident_consumer_id, '') = ''
                   AND updated_at < now() - make_interval(secs => %s)
                 ORDER BY updated_at ASC
                 LIMIT %s

@@ -9,8 +9,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 sys.path.insert(0, str(Path(__file__).parent))
 
+import pytest  # noqa: E402
+
 import db  # noqa: E402
 from conftest import seed_user  # noqa: E402
+
+
+def test_resident_claim_rejects_empty_consumer_id():
+    # An empty consumer_id would create a resident-owned processing job that the
+    # resident reaper (filters resident_consumer_id <> '') can never see → wedged.
+    with pytest.raises(ValueError, match="consumer_id_required"):
+        db.genesis_claim_resident_jobs(consumer_id="")
+    with pytest.raises(ValueError, match="consumer_id_required"):
+        db.genesis_claim_resident_jobs(consumer_id="   ")
 
 
 def test_claim_resident_job_stamps_and_is_single_shot():

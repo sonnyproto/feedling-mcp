@@ -35,8 +35,11 @@ users` (migration 0012), so tests must `from conftest import seed_user; seed_use
 ### P2-request-layer (backend) — replace the P1 `501` placeholder
 - **Resident upload branch** in `genesis_core.plaintext_import`: when `mode==resident and sealed`, instead of
   `501`: size-check → **store the sealed envelope** (reuse `db.genesis_put_chunk`, single seq=0 chunk — it already
-  stores encrypted chunk envelopes) → `db.genesis_create_job(status="awaiting_resident")` → `db.genesis_mark_finalized`
-  (set `finalized_at` so the claim ordering works) → return `{job:{job_id, status:"processing"}}` shape iOS expects.
+  stores encrypted chunk envelopes) → `db.genesis_create_job(status="awaiting_resident")` **with `finalized_at`
+  set at create time** (so the claim ordering `finalized_at ASC` works). **Do NOT call `db.genesis_mark_finalized`**
+  — it flips status→`uploaded` (the worker lane!) and only accepts `created/uploading/uploaded/failed`, not
+  `awaiting_resident`. If a separate finalize step is wanted, add a resident-specific helper that only sets
+  `finalized_at`/`updated_at` and keeps `status='awaiting_resident'`. → return `{job:{job_id, status:"processing"}}`.
 - **Size limit** `FEEDLING_RESIDENT_DISTILL_MAX_BYTES` (default 512KiB; env helper like `genesis_distill_mode`):
   measure the sealed body bytes; over → `413 material_too_large`. **Resident-only** (cloud path untouched).
 - **Resident-facing endpoints** (new router or add to `genesis/routes_asgi.py`), consumer-auth (runtime token):
