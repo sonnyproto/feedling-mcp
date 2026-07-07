@@ -289,6 +289,10 @@ def get_import_status(store, job_id: str, *, include_missing_raw) -> tuple[dict,
     job = db.genesis_get_job(store.user_id, job_id)
     if not job:
         return _bad("genesis_job_not_found", 404)
+    # The app should see a continuous processing->done arc; hide the internal
+    # `awaiting_resident` claim status that sits between upload and the resident claim.
+    if str(job.get("status") or "") == "awaiting_resident":
+        job = {**job, "status": "processing"}
     include_missing = str(include_missing_raw or "").lower() in {"1", "true", "yes"}
     extra: dict[str, Any] = {
         "state": db.get_blob(store.user_id, service.GENESIS_STATE_BLOB),

@@ -82,6 +82,17 @@ def test_resident_upload_enforces_size_limit(monkeypatch):
     assert status == 413 and body["error"] == "material_too_large" and body["max_bytes"] == 16
 
 
+def test_status_hides_awaiting_resident_as_processing(monkeypatch):
+    monkeypatch.delenv("FEEDLING_RESIDENT_DISTILL_MAX_BYTES", raising=False)
+    uid = "usr_res_status"
+    seed_user(uid)
+    body, _ = _import(uid, _sealed_body(uid, b"m"))
+    jid = body["job"]["job_id"]
+    assert db.genesis_get_job(uid, jid)["status"] == "awaiting_resident"      # internal truth
+    out, st = genesis_core.get_import_status(_ns(uid), jid, include_missing_raw=None)
+    assert st == 200 and out["job"]["status"] == "processing"                 # app-facing arc
+
+
 def test_resident_upload_is_idempotent(monkeypatch):
     monkeypatch.delenv("FEEDLING_RESIDENT_DISTILL_MAX_BYTES", raising=False)
     uid = "usr_res_up_idem"
