@@ -157,7 +157,8 @@ def _memory_validate_write(
         minimum = 1 if mem_type == "insight" else 2
         if not isinstance(anchor_ids, list) or len(anchor_ids) < minimum:
             return False, {
-                "error": f"{mem_type}_requires_anchor",
+                "error": "anchor_required",
+                "detail": {"mem_type": mem_type},
                 "min_anchors": minimum,
                 "required": f"{mem_type} requires ≥{minimum} anchor_memory_ids.",
             }

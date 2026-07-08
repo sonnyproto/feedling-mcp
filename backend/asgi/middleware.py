@@ -17,13 +17,16 @@ Three hard parity/security requirements from the Flask ``after_request`` (§5.9)
 
 from __future__ import annotations
 
+import logging
 import time
 from urllib.parse import parse_qsl, urlencode
 
 from accounts import auth_core
+from asgi import context as asgi_context
 from asgi import responses
 from asgi.context import current_user_id
 from asgi.settings import settings
+from fastapi.exceptions import RequestValidationError
 from starlette.requests import ClientDisconnect
 from starlette.responses import Response
 
@@ -31,6 +34,8 @@ try:  # Starlette re-exports the same class; import defensively.
     from starlette.exceptions import HTTPException as StarletteHTTPException
 except Exception:  # pragma: no cover
     from fastapi import HTTPException as StarletteHTTPException  # type: ignore
+
+log = logging.getLogger("feedling.asgi")
 
 
 def _display_path(scope) -> str:
@@ -61,6 +66,9 @@ class AccessLogMiddleware:
             await self.app(scope, receive, send)
             return
 
+        req_id = asgi_context.new_request_id()
+        asgi_context.current_request_id.set(req_id)
+
         start = time.monotonic()
         info = {"status": 0, "bytes": "?", "enc": "-"}
 
@@ -73,6 +81,10 @@ class AccessLogMiddleware:
                         info["bytes"] = value.decode("latin-1")
                     elif kl == "content-encoding":
                         info["enc"] = value.decode("latin-1")
+                hdrs = list(message.get("headers") or [])
+                if not any(k.lower() == b"x-request-id" for k, _ in hdrs):
+                    hdrs.append((b"x-request-id", req_id.encode("ascii")))
+                message["headers"] = hdrs
             await send(message)
 
         method = scope.get("method", "-")
@@ -82,7 +94,8 @@ class AccessLogMiddleware:
             dur_ms = int((time.monotonic() - start) * 1000)
             print(
                 f"[req] uid={current_user_id.get()} {method} {disp} "
-                f"status={status_field} bytes={info['bytes']} enc={info['enc']} dur_ms={dur_ms}",
+                f"status={status_field} bytes={info['bytes']} enc={info['enc']} dur_ms={dur_ms} "
+                f"rid={req_id}",
                 flush=True,
             )
 
@@ -124,6 +137,28 @@ def register_exception_handlers(app) -> None:
         if body is not None:
             return responses.json_error(exc.status_code, body)
         return responses.json_error(exc.status_code, {"detail": exc.detail})
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(request, exc: RequestValidationError):
+        # FastAPI 默认 422 {"detail":[...]}——重塑进统一信封，消灭双形状
+        # （FRONTEND_ERROR_CONTRACT.md §三：invalid_payload）。
+        detail = [
+            {"loc": ".".join(str(p) for p in e.get("loc", ())),
+             "msg": str(e.get("msg", ""))}
+            for e in exc.errors()[:10]
+        ]
+        return responses.api_error(400, "invalid_payload", detail=detail)
+
+    @app.exception_handler(Exception)
+    async def _unhandled(request, exc: Exception):
+        # 兜底 500：统一信封 + request_id，traceback 只进服务端日志（同 id 对账）。
+        # AccessLogMiddleware 未启用（access_log=False / healthz）时现场补生成。
+        rid = asgi_context.current_request_id.get() or asgi_context.new_request_id()
+        log.exception("[%s] unhandled exception on %s %s",
+                      rid, request.method, request.url.path)
+        resp = responses.api_error(500, "internal_error", request_id=rid)
+        resp.headers["x-request-id"] = rid
+        return resp
 
     # Degrade a psycopg pool exhaustion to a retryable 503 instead of a bare 500.
     # The run_db thread limiter (FEEDLING_ASGI_DB_THREADS, default 64) admits more

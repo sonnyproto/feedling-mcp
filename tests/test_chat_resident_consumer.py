@@ -874,7 +874,10 @@ def test_empty_content_no_decrypt_source_no_reply_no_fallback(monkeypatch):
 
 
 def test_agent_failure_posts_visible_fallback_by_default(monkeypatch):
-    """Agent backend failure must not silently drop a user turn."""
+    """Agent backend failure must not silently drop a user turn: the visible
+    fallback reply is still posted, and (new behavior) a separate system
+    notice carrying the technical reason is posted alongside it via
+    ``_notify_agent_turn_failure``."""
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
@@ -885,14 +888,84 @@ def test_agent_failure_posts_visible_fallback_by_default(monkeypatch):
             {"id": "agent-failure-1", "role": "user", "content": "msg1", "ts": 100.0}
         ])
 
-    mock_post.assert_called_once()
-    assert mock_post.call_args.args[0] == crc.FALLBACK_REPLY
-    assert mock_post.call_args.kwargs["reply_to_message_id"] == "agent-failure-1"
+    fallback_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") != "system"]
+    notice_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") == "system"]
+
+    # Original contract, unweakened: the user-visible fallback must still go out.
+    assert len(fallback_calls) == 1
+    assert fallback_calls[0].args[0] == crc.FALLBACK_REPLY
+    assert fallback_calls[0].kwargs["reply_to_message_id"] == "agent-failure-1"
+
+    # New contract: a suppressed-push system notice with the technical reason.
+    assert len(notice_calls) == 1
+    assert notice_calls[0].kwargs["notice_kind"] == "upstream_error"
+    assert notice_calls[0].kwargs["suppress_push"] is True
+    assert "agent down" in notice_calls[0].args[0]
+
+    assert mock_post.call_count == 2
     assert result_ts == pytest.approx(100.0)
 
 
+def test_no_error_notice_when_fallback_rejected_already_answered(monkeypatch):
+    """Failover 去重（Codex review）：claim 过期后另一家已回复，本家兜底被
+    already_answered 409 拒 → system 错误通知也必须一并压掉，不许出现
+    重复的技术错误气泡。通知只跟随被服务端接受的那次回复。"""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
+    monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: True)
+    crc._reset_system_notice_state()
+    calls = []
+
+    def fake_post(reply, **kw):
+        calls.append((reply, kw))
+        if kw.get("role") == "system":
+            return {}
+        return {"error": "already_answered", "reply_status": "replied"}
+
+    with patch.object(crc, "call_agent", side_effect=RuntimeError("agent down")), \
+         patch.object(crc, "post_reply", side_effect=fake_post):
+        crc._process_messages([
+            {"id": "agent-failure-409-1", "role": "user", "content": "msg1", "ts": 100.0}
+        ])
+
+    # 兜底尝试发出但被拒；system 通知绝不能跟着发出去。
+    assert [kw.get("role") for _, kw in calls] == [None]
+
+
+def test_agent_failure_reported_even_with_fallback_disabled(monkeypatch):
+    """SEND_FALLBACK_ON_AGENT_ERROR=false 只关兜底话术，不关错误透出（Codex
+    review）：前台失败仍要发 system 通知 + 上报设置页 runtime_error，只是
+    没有 FALLBACK_REPLY、该回合照旧静默跳过。"""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", False)
+    reported = []
+    monkeypatch.setattr(crc, "_report_runtime_error",
+                        lambda *a, **kw: reported.append(a) or True)
+    crc._reset_system_notice_state()
+
+    with patch.object(crc, "call_agent", side_effect=RuntimeError("agent down")), \
+         patch.object(crc, "post_reply") as mock_post:
+        crc._process_messages([
+            {"id": "agent-failure-nofb-1", "role": "user", "content": "msg1", "ts": 100.0}
+        ])
+
+    # 没有兜底话术……
+    fallback_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") != "system"]
+    assert fallback_calls == []
+    # ……但 system 通知和设置页上报都要发。
+    notice_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") == "system"]
+    assert len(notice_calls) == 1
+    assert "agent down" in notice_calls[0].args[0]
+    assert len(reported) == 1
+
+
 def test_agent_failure_fallback_is_not_cooldown_suppressed(monkeypatch):
-    """Each failed user turn receives visible feedback instead of a silent cooldown drop."""
+    """Each failed user turn receives visible feedback instead of a silent cooldown
+    drop, and (new behavior) each also gets its own system notice — foreground
+    notices bypass the background debounce, so two failed turns yield two of
+    each kind of post_reply call, not one."""
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
@@ -904,8 +977,18 @@ def test_agent_failure_fallback_is_not_cooldown_suppressed(monkeypatch):
             {"id": "agent-failure-3", "role": "user", "content": "msg2", "ts": 102.0},
         ])
 
-    assert mock_post.call_count == 2
-    assert [call.args[0] for call in mock_post.call_args_list] == [crc.FALLBACK_REPLY, crc.FALLBACK_REPLY]
+    fallback_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") != "system"]
+    notice_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") == "system"]
+
+    assert [c.args[0] for c in fallback_calls] == [crc.FALLBACK_REPLY, crc.FALLBACK_REPLY]
+
+    assert len(notice_calls) == 2
+    for c in notice_calls:
+        assert c.kwargs["notice_kind"] == "upstream_error"
+        assert c.kwargs["suppress_push"] is True
+        assert "agent down" in c.args[0]
+
+    assert mock_post.call_count == 4
 
 
 def test_sanitize_reply_text_strips_leaks_and_duplicates():

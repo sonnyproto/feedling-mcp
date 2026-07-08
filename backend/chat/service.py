@@ -303,6 +303,10 @@ def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
     elif role == "user":
         item["sender"] = "user"
         item["is_from_openclaw"] = False
+    elif role == "system":
+        # 老版 iOS 的 sender 解码不能见到未知值；新版按 role=="system" 渲染
+        item["sender"] = "assistant"
+        item["is_from_openclaw"] = False
     return item
 
 

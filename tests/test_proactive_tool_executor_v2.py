@@ -397,7 +397,8 @@ def test_memory_write_tool_returns_agent_readable_validation_errors(monkeypatch)
     ))
 
     assert missing_anchor.ok is False
-    assert missing_anchor.error_code == "insight_requires_anchor"
+    assert missing_anchor.error_code == "anchor_required"
+    assert missing_anchor.result["results"][0]["detail"] == {"mem_type": "insight"}
     assert "required" in missing_anchor.result["results"][0]
     assert wrong_type.ok is False
     assert wrong_type.error_code == "type_invalid"

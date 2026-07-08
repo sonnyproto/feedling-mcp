@@ -24,6 +24,8 @@ from genesis import dedup, foreground, foreground_identity, genesis_core, lightw
 from hosted import config_store as hosted_config_store
 from hosted import history_import
 from identity import service as identity_service
+from notices import catalog
+from notices import core as notices_core
 
 _SECONDS_PER_DAY = 24 * 60 * 60
 _PLAINTEXT_ACTIVE_LOCK = threading.Lock()
@@ -791,6 +793,10 @@ def _run_plaintext_genesis_v2(
         )
         if completed:
             service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
+            # foreground identity-first completion bypasses service.apply_reducer_output
+            # (which resolves genesis notices for the other completion paths) -> resolve
+            # here too so a prior failure notice doesn't linger past a successful retry.
+            notices_core.resolve(store, "genesis:")
     else:
         # edge: foreground couldn't derive an identity -> current backstop (complete on
         # core + let the background fill identity via init_identity/persona baseline).
@@ -919,6 +925,13 @@ def _run_plaintext_background_enrichment(
     db.genesis_set_job_status(
         store.user_id, job_id, status=service.DONE_JOB_STATUS, output={"stage": "genesis_v2_done"},
     )
+    # NOTE: deliberately no notices_core.resolve() here. This function is a pure
+    # continuation after the job already completed (foreground already ran either
+    # the identity-first path, which resolves at :799, or service.apply_reducer_output
+    # at :813, which resolves at its own start and may then emit a fresh
+    # "genesis:{job_id}:partial" notice for dropped cards). apply_memory_outputs
+    # (used above) never emits notices itself, so resolving again here would only
+    # ever clobber that just-emitted partial — never resolve anything new.
 
 
 def _append_plaintext_onboarding_greeting(
@@ -963,6 +976,12 @@ def _run_plaintext_add_memory_job(
     runtime,
     source_groups: list[dict],
 ) -> None:
+    # this add_memory job path bypasses service.apply_reducer_output (which resolves
+    # genesis notices for the reducer-driven completion path) -> resolve here too, at
+    # the *start* of the run (matching the fix in apply_reducer_output: resolving
+    # stale notices before any new emit, not after, so a partial notice emitted later
+    # in this same run isn't immediately clobbered by its own dedupe-key prefix match).
+    notices_core.resolve(store, "genesis:")
     fact_candidates: list[dict] = []
     first_output: dict = {}
     # A: long-term-memory archive uploads (source_family=memory_summary) → keep_all (write the
@@ -1011,7 +1030,18 @@ def _run_plaintext_add_memory_job(
         keep_all=keep_all_job,
     )
     merged = _plaintext_merge_reducer_outputs([{**first_output, **memory_output}], relationship_anchor={})
+    raw_items = merged.get("memories")
+    if raw_items is None:
+        raw_items = merged.get("facts")
+    raw_count = len(raw_items) if isinstance(raw_items, list) else 0
     mem_count, _results = service.apply_memory_outputs(store, api_key, merged)
+    dropped = raw_count - mem_count
+    if dropped > 0:
+        notices_core.emit(store, source="genesis", error_class="genesis_partial",
+                           blame="system", severity="warning",
+                           user_text=catalog.user_text_for("genesis_partial"),
+                           detail=f"dropped {dropped} card(s)",
+                           dedupe_key=f"genesis:{job_id}:partial")
     completed = db.genesis_complete_job(
         store.user_id,
         job_id,
@@ -1094,6 +1124,14 @@ def _run_plaintext_update_identity_job(
     )
     if completed:
         service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
+        # this update_identity path never goes through service.apply_reducer_output
+        # (which resolves genesis notices on the other completion paths) -> resolve
+        # here too, so a prior genesis_failed notice from an earlier failed attempt
+        # doesn't linger past a successful retry. Safe: this function never emits a
+        # "genesis:...:partial" notice of its own (identity-only, not memory), and
+        # every mark_failed exit above returns immediately, so this branch and the
+        # failure branches are mutually exclusive within a single run.
+        notices_core.resolve(store, "genesis:")
 
 
 def _run_plaintext_genesis_job(

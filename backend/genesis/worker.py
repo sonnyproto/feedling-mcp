@@ -1416,6 +1416,12 @@ def _process_job(job: dict, *, api_url: str, enclave_url: str, mint_runtime_toke
         detail={"chunks": len(chunks)},
         dur_ms=(time.time() - started_at) * 1000,
     )
+    # _apply_reducer_output already POSTs to the backend's apply route, which runs
+    # service.apply_reducer_output server-side; that function resolves genesis
+    # notices at its own *start* (before it may emit a fresh "...:partial" notice).
+    # Resolving again here, after the HTTP round-trip has returned, would clobber
+    # that just-emitted partial notice (dedupe_key "genesis:{job_id}:partial" also
+    # matches the "genesis:" prefix) — so this worker-side call must NOT resolve.
     return {
         "user_id": user_id,
         "job_id": job_id,

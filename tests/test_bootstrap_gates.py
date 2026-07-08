@@ -1209,7 +1209,9 @@ def test_memory_retype_into_insight_requires_anchor(backend):
         timeout=TIMEOUT,
     )
     assert r.status_code == 400
-    assert r.json()["error"] == "insight_requires_anchor"
+    body = r.json()
+    assert body["error"] == "anchor_required"
+    assert body["detail"] == {"mem_type": "insight"}
 
 
 def test_memory_retype_self_reference_rejected(backend):

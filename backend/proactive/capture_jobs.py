@@ -61,6 +61,28 @@ def in_failure_backoff(streak: int, last_failed_at: float, now_ts: float) -> boo
     return streak > 0 and last > 0.0 and (now_ts - last) < failure_backoff_sec(streak)
 
 
+_BACKOFF_NOTICE_STREAK = 3   # 前两次退避噪音价值低，第 3 次才打扰用户
+
+
+def notify_backoff(store, *, lane: str, status: str, streak: int) -> None:
+    """三条 maintenance lane（capture/migrate/dream）共用的退避通知钩子。
+
+    streak>=3 的失败 emit warning（occurrences 天然吸收后续 +1，不刷屏）；
+    completed 恢复 resolve（同 lane 精确 dedupe_key，不跨 lane 清）。两支
+    互斥（if/elif）——同一次调用绝不会既 emit 又把刚发的 resolve 掉。绝不
+    影响原 streak/状态流程（notices.emit/resolve 内部已自吞异常）。"""
+    from notices import core as notices
+    from notices import catalog
+    if status == "completed":
+        notices.resolve(store, f"memory_backoff:{lane}")
+    elif status == "failed" and int(streak or 0) >= _BACKOFF_NOTICE_STREAK:
+        notices.emit(store, source="memory", error_class="memory_backoff",
+                     blame=catalog.blame_for("memory_backoff"), severity="warning",
+                     user_text=f"记忆整理（{lane}）连续失败 {streak} 次，正在退避重试。",
+                     detail=f"lane={lane} streak={streak}",
+                     dedupe_key=f"memory_backoff:{lane}")
+
+
 def is_memory_capture_job(job: Mapping[str, Any] | None) -> bool:
     if not isinstance(job, Mapping):
         return False

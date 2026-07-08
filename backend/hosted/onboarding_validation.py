@@ -344,6 +344,7 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
             "label": "Model API Test",
             "passing": bool(config and config.get("test_status") == "ok"),
             "test_status": (config or {}).get("test_status", ""),
+            "last_test_error": (config or {}).get("last_test_error", ""),
             "required": "Call /v1/model_api/test until test_status is ok." if not (config and config.get("test_status") == "ok") else "",
         },
         {

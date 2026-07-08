@@ -322,4 +322,7 @@ def record_dream_job_status(store, job: Mapping[str, Any], *, status: str, now: 
         # skipped 是调度器主动暂缓、不算失败；只有真失败累计退避 streak。
         state["dream_fail_streak"] = int(state.get("dream_fail_streak") or 0) + 1
         state["last_dream_failed_at"] = now_ts
-    return save_dream_state(store, state, now=now_ts)
+    state = save_dream_state(store, state, now=now_ts)
+    capture_jobs.notify_backoff(store, lane="dream", status=status_text,
+                                streak=int(state.get("dream_fail_streak") or 0))
+    return state
