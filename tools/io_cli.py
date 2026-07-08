@@ -524,6 +524,59 @@ def cmd_identity_write(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+def _memory_write_payload(*, summary, content, bucket, threads, importance, pulse, mem_type, source):
+    """Build the /v1/memory/actions body for a single plaintext memory.add. Pure (testable).
+
+    Plaintext action — the SERVER builds & encrypts the envelope (same path running capture
+    uses), so no client crypto. Returns None when there's nothing to write. This is the
+    on-demand counterpart to the consumer's automatic capture: the agent, having locally
+    distilled a fact from a handed-in file, pushes ONE finished card."""
+    summary = str(summary or "").strip()
+    content = str(content or "").strip()
+    if not summary and not content:
+        return None
+    memory = {
+        "type": (mem_type or "fact").strip().lower(),
+        "summary": summary or content[:180],
+        "title": summary or content[:180],
+        "content": content or summary,
+        "description": content or summary,
+        "source": (source or "resident_absorb").strip()[:80],
+    }
+    if bucket:
+        memory["bucket"] = str(bucket).strip()
+    if threads:
+        memory["threads"] = [str(t).strip() for t in threads if str(t or "").strip()]
+    if importance is not None:
+        memory["importance"] = float(importance)
+    if pulse is not None:
+        memory["pulse"] = float(pulse)
+    return {"actions": [{
+        "type": "memory.add",
+        "memory": memory,
+        "reason": "Absorbed from a file/text the user handed me.",
+    }]}
+
+
+def cmd_memory_write(args):
+    """Write ONE memory card the agent already distilled locally (handed-in file → fact).
+
+    POST /v1/memory/actions (memory.add, plaintext — the server encrypts). This is the
+    on-demand write path for the resident agent; the consumer's running capture is the
+    automatic one. Both hit the same endpoint."""
+    api_url, auth = _require_backend()
+    payload = _memory_write_payload(
+        summary=args.summary, content=args.content, bucket=args.bucket, threads=args.threads,
+        importance=args.importance, pulse=args.pulse, mem_type=args.type, source=args.source,
+    )
+    if payload is None:
+        _emit({"ok": False, "error": "nothing_to_write: need --summary and/or --content"}, 2)
+    status, body = _http_json("POST", f"{api_url}/v1/memory/actions", auth, payload=payload)
+    if status in (200, 201):
+        _emit({"ok": True, **(body if isinstance(body, dict) else {"result": body})})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
 def cmd_phase2(args):
     # send / sleep / schedule-wake / cancel-wake are NOT pull tools in the native
     # model — the agent emits them as output actions (JSON messages/actions) which
@@ -618,6 +671,18 @@ def main():
     iw.add_argument("--signature", action="append", default=[],
                     help="repeatable short string(s) for the signature")
     iw.set_defaults(func=cmd_identity_write)
+
+    mw = sub.add_parser("memory-write",
+                        help="Write ONE memory card you distilled locally (plaintext; server encrypts).")
+    mw.add_argument("--summary", default=None, help="one-line summary (index)")
+    mw.add_argument("--content", default=None, help="card body (记忆/上下文/使用提示)")
+    mw.add_argument("--bucket", default=None, help="single main bucket (reuse existing via memory-index)")
+    mw.add_argument("--threads", action="append", default=[], help="repeatable cross-cutting thread(s)")
+    mw.add_argument("--importance", type=float, default=None, help="0-1")
+    mw.add_argument("--pulse", type=float, default=None, help="0-1")
+    mw.add_argument("--type", default="fact", help="fact|event|quote|moment")
+    mw.add_argument("--source", default="resident_absorb")
+    mw.set_defaults(func=cmd_memory_write)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")
