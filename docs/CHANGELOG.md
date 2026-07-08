@@ -47,6 +47,43 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-08
+
+### [DONE] 通知设施 Phase B（backend/notices/ 包 + GET /v1/notices）
+
+- 新 `backend/notices/` 包（emit / resolve / list_notices）：系统错误的可回溯
+  通知面，明文存储于既有 `user_logs` 表的 `user_notices` stream（不建新表），
+  `item_key=dedupe_key` 做 upsert 去重；`emit`/`resolve` 绝不抛出（观测性设施
+  不得拖垮主流程）；`list_notices` 读侧额外按 `dedupe_key` 去重保留最新一条，
+  兑现契约「同 key 始终只有一条」，同时自愈 emit 读-改非原子 / DB 瞬时读失败
+  可能留下的重复未 resolved 行。
+- 新增 `GET /v1/notices` 快照读端点。
+- B4 场景字段已接线：provider `public_config.last_test_error` + onboarding
+  `model_api_test` step 的 `last_test_error`。
+- 范围：Task 1-3 完成；B3（chat 扇出门控）延后到
+  `feat/upstream-error-surfacing` 合入 main 之后再做。
+- 状态：**未部署、未 commit**（worktree `feedling-mcp-error-contract`，分支
+  `feat/error-contract`）。全分支终审已过（结论：可合并）。
+
+### [DONE] 统一错误信封 Phase A（api_error() helper + request_id 链路）
+
+- 新 `api_error()` helper（`backend/asgi/responses.py`）统一拼装
+  `{"error", "blame", "detail", "request_id"?}` 信封；`request_id` 生成/透传
+  链路打通：中间件生成 → 响应头 `X-Request-Id` 回带 → 日志 `rid` 字段 →
+  `internal_error`（500 兜底）body 必带同一个 id（其余 5xx 尽力而为，见
+  `docs/FRONTEND_ERROR_CONTRACT.md` §三）。
+- `RequestValidationError` 统一重塑成 400 `invalid_payload`（`detail` 带
+  `[{loc,msg}]`，替换掉裸 FastAPI 校验报文）。
+- 6 处自由文本错误收敛成 slug + detail（chat_core.py×3、memory_core.py×2、
+  actions.py×1）。
+- 新增 `docs/API_ERRORS.md`（全量 slug 契约表）+ 守卫测试锁关键 slug 不漂移；
+  `CONTRIBUTING.md` 新增 §7「错误返回纪律」（原 §7 不变量顺延为 §8、原 §8 PR
+  自查清单顺延为 §9）。
+- 状态：**未部署、未 commit**（worktree
+  `feedling-mcp-error-contract`，分支 `feat/error-contract`）。全分支终审
+  已过（结论：可合并），本条同时记录终审后的一批文档级修订（措辞/slug 名/
+  交叉引用号，不改后端代码、不改测试断言语义）。
+
 ## 2026-07-06
 
 ### [DONE] 仓库清理：陈旧文档删除 + ASGI 迁移收尾（§13.2/13.3 执行完毕）
@@ -834,7 +871,7 @@ CLI 工具，消灭"把 agent 当裸模型返 JSON"的双路。
   worker 跑）；重复创建用 `db.try_stamp_hosted_tick` 原子心跳槽 CAS 防住；
   `try_consume_pending_for_user` 作 `proactive` 通道 handler 跨 worker 即时认领。
 - **compose**：三个 compose `-w 1` → `-w 2`（先小、可灰度再提 N），注释更新；
-  改 compose 字面量会改 `compose_hash`，**部署需重新上链**（CONTRIBUTING §7 /
+  改 compose 字面量会改 `compose_hash`，**部署需重新上链**（CONTRIBUTING §8 /
   DEPLOYMENTS.md）。每 worker 约 +17 个 DB 连接（池 16 + listener 1），调大 `-w`
   前核对库 `max_connections`。
 - **验证**：本地 `gunicorn -w 2` 端到端——注册落一个 worker 后 whoami 40/40 全 200

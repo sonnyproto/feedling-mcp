@@ -53,6 +53,7 @@ _ASGI_PACKAGES = (
     "hosted.chat_routes_asgi",
     "hosted.history_import_asgi",
     "hosted.onboarding_validation_asgi",
+    "notices.routes_asgi",
 )
 
 # Disable the auto OpenAPI/docs routes so the ASGI route surface is exactly the
