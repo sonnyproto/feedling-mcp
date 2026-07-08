@@ -56,9 +56,32 @@ def _post(path, *, headers=None, json=None):
     return asyncio.run(go())
 
 
+def _get(path, *, headers=None):
+    async def go():
+        transport = httpx.ASGITransport(app=asgi_app.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            r = await c.get(path, headers=headers or {})
+            return r.status_code, r.json()
+    return asyncio.run(go())
+
+
 def _runtime_profile(user_id):
     store = core_store.get_store(user_id)
     return config_store._ensure_model_api_runtime_profile(store) or {}
+
+
+def test_runtime_status_surfaces_error_class(user):
+    """读侧 GET /v1/model_api/runtime 必须回带 last_runtime_error_class——
+    iOS 设置页/SceneErrorCopy 靠它做结构化分类（契约 §六）；只回 error 文本
+    会逼客户端从自由文本猜 slug。"""
+    uid, key = user
+    _post("/v1/model_api/runtime_error",
+          headers={"X-API-Key": key},
+          json={"error": "403 预扣费额度失败", "error_class": "quota_insufficient"})
+    status, body = _get("/v1/model_api/runtime", headers={"X-API-Key": key})
+    assert status == 200, body
+    assert body["last_runtime_error"] == "403 预扣费额度失败"
+    assert body["last_runtime_error_class"] == "quota_insufficient"
 
 
 def test_report_and_clear_runtime_error(user):
