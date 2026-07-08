@@ -113,6 +113,10 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
     aad = {k: v for k, v in env.items() if k != "body_ct"}
     ciphertext_sha256 = hashlib.sha256(encrypted_body).hexdigest()
 
+    # material_kind lets the resident consumer pick the extraction口径 deterministically from
+    # the app entry (long-term-memory archive → keep_all, chat log → selective) — the sealed
+    # blob has no source_family the way the cloud plaintext path does.
+    material_kind = str(payload.get("material_kind") or "").strip().lower()
     created = db.genesis_create_job(store.user_id, {
         "job_id": job_id,
         "status": "awaiting_resident",
@@ -120,7 +124,8 @@ def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
         "total_chunks": 1,
         "total_bytes": len(encrypted_body),
         "privacy_mode": "resident_sealed",
-        "metadata": {"mode": mode_hint, "client_job_id": client_job_id, "ingest": "resident_sealed"},
+        "metadata": {"mode": mode_hint, "material_kind": material_kind,
+                     "client_job_id": client_job_id, "ingest": "resident_sealed"},
     })
     # created is None on ON CONFLICT DO NOTHING (idempotent re-upload) — chunk already stored.
     if created is not None:
@@ -159,6 +164,7 @@ def resident_pending(store, *, consumer_id: str) -> tuple[dict, int]:
         jobs.append({
             "job_id": job["job_id"],
             "mode": (meta.get("mode") or "") or job.get("source_kind") or "",
+            "material_kind": str(meta.get("material_kind") or ""),
             "sealed": sealed,
         })
     return {"jobs": jobs}, 200

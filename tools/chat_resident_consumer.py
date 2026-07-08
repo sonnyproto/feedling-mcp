@@ -6711,11 +6711,14 @@ def _window_document(text: str, *, max_chars: int = 18000, overlap_lines: int = 
     return windows or ([text] if text.strip() else [])
 
 
-def _resident_extract_memories(document: str, job_id: str) -> list[dict]:
+def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = False) -> list[dict]:
     """Reuse the CLOUD genesis memory engine on the VPS: window → fact_map (per window) →
     fact_write, driven by the local agent (persist_output=False = no backend DB). Returns
     cloud-shaped memory dicts {type,bucket,threads,summary,content,importance,pulse} — the
-    SAME code + prompts cloud's add_memory path uses, so the two stay in lockstep."""
+    SAME code + prompts cloud's add_memory path uses, so the two stay in lockstep.
+
+    keep_all (A): long-term-memory archive uploads keep facts thoroughly; chat logs stay
+    selective. The app entry passes material_kind → we translate it to keep_all here."""
     from genesis import worker as genesis_worker  # lazy: heavy import only when a job runs
     from genesis.llm_client import GenesisLLMClient
     import provider_client
@@ -6726,7 +6729,7 @@ def _resident_extract_memories(document: str, job_id: str) -> list[dict]:
     for idx, window in enumerate(_window_document(document), start=1):
         out = genesis_worker.build_foreground_output_from_texts(
             user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:map:{idx}",
-            runtime=runtime, chunk_texts=[window], write_core=False, llm=llm,
+            runtime=runtime, chunk_texts=[window], write_core=False, llm=llm, keep_all=keep_all,
         )
         candidates.extend([c for c in (out.get("all_fact_candidates") or []) if isinstance(c, dict)])
         genesis_resident_heartbeat(job_id)  # each window is one agent call — keep the lease alive
@@ -6734,7 +6737,7 @@ def _resident_extract_memories(document: str, job_id: str) -> list[dict]:
         return []
     mem_out = genesis_worker.build_memory_output_from_fact_candidates(
         user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:write",
-        runtime=runtime, fact_candidates=candidates, llm=llm,
+        runtime=runtime, fact_candidates=candidates, llm=llm, keep_all=keep_all,
     )
     return [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
 
@@ -6770,6 +6773,7 @@ def _process_resident_distill_once() -> None:
     for job in jobs:
         job_id = str(job.get("job_id") or "").strip()
         mode = str(job.get("mode") or "").strip().lower()
+        material_kind = str(job.get("material_kind") or "").strip().lower()
         sealed = job.get("sealed") if isinstance(job.get("sealed"), dict) else {}
         env = sealed.get("envelope") if isinstance(sealed.get("envelope"), dict) else None
         if not job_id or not env:
@@ -6794,7 +6798,9 @@ def _process_resident_distill_once() -> None:
                     }])
                     identity_status = "replaced"
             else:  # add_memory / onboarding → cloud memory engine
-                memories = _resident_extract_memories(document, job_id)
+                # long-term-memory archive → keep_all (thorough); chat log → selective.
+                keep_all = material_kind == "memory_summary"
+                memories = _resident_extract_memories(document, job_id, keep_all=keep_all)
                 occurred_at = datetime.now(_tzmod.utc).isoformat()
                 actions: list[dict] = []
                 for card in memories:
