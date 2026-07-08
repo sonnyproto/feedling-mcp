@@ -965,12 +965,17 @@ def _run_plaintext_add_memory_job(
 ) -> None:
     fact_candidates: list[dict] = []
     first_output: dict = {}
+    # A: long-term-memory archive uploads (source_family=memory_summary) → keep_all (write the
+    # user's curated facts thoroughly). Chat-history uploads keep the normal selective behavior.
+    keep_all_job = False
     for idx, group in enumerate(source_groups, start=1):
         group_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
         group_family = str(group.get("source_family") or worker._source_family(group_kind))
         group_chunks = [str(text) for text in (group.get("chunk_texts") or []) if str(text or "").strip()]
         if not group_chunks:
             continue
+        keep_all = group_family == "memory_summary"
+        keep_all_job = keep_all_job or keep_all
         db.genesis_set_job_status(
             store.user_id,
             job_id,
@@ -990,6 +995,7 @@ def _run_plaintext_add_memory_job(
             chunk_texts=group_chunks,
             source_kind=group_kind,
             write_core=False,
+            keep_all=keep_all,
         )
         if not first_output:
             first_output = output
@@ -1002,6 +1008,7 @@ def _run_plaintext_add_memory_job(
         key_prefix=f"{job_id}:add_memory:fact_write",
         runtime=runtime,
         fact_candidates=fact_candidates,
+        keep_all=keep_all_job,
     )
     merged = _plaintext_merge_reducer_outputs([{**first_output, **memory_output}], relationship_anchor={})
     mem_count, _results = service.apply_memory_outputs(store, api_key, merged)

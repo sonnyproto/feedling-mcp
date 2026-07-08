@@ -169,9 +169,23 @@ def persona_build_messages(persona_material: str, behavior_notes: list[str], exe
     ]
 
 
-def fact_map_messages(chunk_text: str) -> list[dict[str, str]]:
+# ── DRAFT(措辞待 Seven 定稿):"尽量收"追加指令,仅长期记忆档案(source_family=memory_summary)
+# 二次上传时启用。见 docs/genesis-distill-panorama.md §9 / Seven 校准第 2 点。行为需真机 e2e。
+FACT_MAP_KEEP_ALL_SUFFIX = """
+
+★ 本块是用户【手动整理好的长期记忆档案】,不是聊天记录:其中每条陈述基本都是用户特意要长期留存的事实。
+尽量【完整保留】每一条事实候选,不要用"闲聊/一次性/不够 durable"去过滤——除非是空行、标题或明显无意义的重复。宁多勿漏。"""
+
+FACT_WRITE_KEEP_ALL_SUFFIX = """
+
+★ 素材是用户整理好的长期档案:把候选里的事实【尽量都写成卡】,不要为了"少而精"丢弃条目。
+仍然按 known_memories 去重、仍然归好 bucket/threads,但不要因"不够重要"而跳过用户特意整理的条目。"""
+
+
+def fact_map_messages(chunk_text: str, *, keep_all: bool = False) -> list[dict[str, str]]:
+    system = FACT_MAP_PROMPT + (FACT_MAP_KEEP_ALL_SUFFIX if keep_all else "") + _STRICT_JSON_SUFFIX
     return [
-        {"role": "system", "content": FACT_MAP_PROMPT + _STRICT_JSON_SUFFIX},
+        {"role": "system", "content": system},
         {"role": "user", "content": str(chunk_text or "")},
     ]
 
@@ -183,9 +197,10 @@ def combined_map_messages(chunk_text: str) -> list[dict[str, str]]:
     ]
 
 
-def fact_write_messages(fact_digest: list[dict], persona_material: str = "", memory_summary: str = "", known_memories: list[str] | None = None) -> list[dict[str, str]]:
+def fact_write_messages(fact_digest: list[dict], persona_material: str = "", memory_summary: str = "", known_memories: list[str] | None = None, *, keep_all: bool = False) -> list[dict[str, str]]:
+    system = FACT_WRITE_PROMPT + (FACT_WRITE_KEEP_ALL_SUFFIX if keep_all else "") + _STRICT_JSON_SUFFIX
     return [
-        {"role": "system", "content": FACT_WRITE_PROMPT + _STRICT_JSON_SUFFIX},
+        {"role": "system", "content": system},
         {
             "role": "user",
             "content": _json({

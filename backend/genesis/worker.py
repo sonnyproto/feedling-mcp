@@ -696,6 +696,7 @@ def _fact_write(
     persona_material: str = "",
     memory_summary: str = "",
     known_memories: list[str] | None = None,
+    keep_all: bool = False,
 ) -> dict:
     if not fact_candidates and not persona_material and not memory_summary:
         return {"memories": [], "identity": {"agent_name": "", "dimensions": []}}
@@ -709,7 +710,7 @@ def _fact_write(
             job_id=job_id,
             task_id=f"fact-write-{idx}",
             runtime=runtime,
-            messages=prompts.fact_write_messages(batch, persona_material, memory_summary, known_memories),
+            messages=prompts.fact_write_messages(batch, persona_material, memory_summary, known_memories, keep_all=keep_all),
             max_tokens=4000,
             idempotency_key=f"{idempotency_prefix}:fact_write:{idx}",
             is_empty=_fact_write_output_empty,
@@ -1008,12 +1009,16 @@ def build_memory_output_from_fact_candidates(
     fact_candidates: list[dict],
     known_memories: list[str] | None = None,
     llm: GenesisLLMClient | None = None,
+    keep_all: bool = False,
 ) -> dict:
     """Run the Genesis fact_write step directly for already-mapped candidates.
 
     Foreground v2 already has all fact candidates after fact_map. This helper lets
     the route write the full memory set once, without re-mapping the transcript or
     waiting for voice/persona.
+
+    keep_all (A): long-term-memory archive uploads — write the facts thoroughly rather
+    than filter for brevity. Default False keeps the normal (chat/onboarding) behavior.
     """
     llm = llm or GenesisLLMClient()
     return _fact_write(
@@ -1024,6 +1029,7 @@ def build_memory_output_from_fact_candidates(
         runtime=runtime,
         fact_candidates=[item for item in fact_candidates if isinstance(item, dict)],
         known_memories=known_memories,
+        keep_all=keep_all,
     )
 
 
@@ -1200,6 +1206,7 @@ def build_foreground_output_from_texts(
     llm: GenesisLLMClient | None = None,
     write_core: bool = True,
     include_voice_candidates: bool = False,
+    keep_all: bool = False,
 ) -> dict:
     """Genesis v2 FOREGROUND — the light "open the door" pass (Codex flow).
 
@@ -1248,7 +1255,7 @@ def build_foreground_output_from_texts(
                     job_id=job_id,
                     task_id=f"fact-map-{idx}",
                     runtime=runtime,
-                    messages=prompts.fact_map_messages(_source_tagged_fact_text(source_family, text)),
+                    messages=prompts.fact_map_messages(_source_tagged_fact_text(source_family, text), keep_all=keep_all),
                     max_tokens=1800,
                     idempotency_key=f"{shared_prefix}:fact_map:{idx}",   # SAME key as background -> cache shared
                     is_empty=_fact_map_output_empty,
