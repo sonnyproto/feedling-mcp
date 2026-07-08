@@ -1025,6 +1025,7 @@ def _run_plaintext_update_identity_job(
     *,
     runtime,
     analysis_messages: list[dict] | None,
+    relationship_anchor: dict | None = None,
 ) -> None:
     if not identity_service._load_identity(store):
         service.mark_failed(store, job_id, "identity_not_initialized")
@@ -1064,7 +1065,9 @@ def _run_plaintext_update_identity_job(
     except Exception as e:  # noqa: BLE001
         service.mark_failed(store, job_id, f"persona_rebuild_failed:{type(e).__name__}:{str(e)[:160]}")
         return
-    status = service.replace_identity_preserving_anchor(store, {"identity": identity_payload})
+    status = service.replace_identity_preserving_anchor(
+        store, {"identity": identity_payload, "relationship_anchor": relationship_anchor or {}}
+    )
     if status != "updated":
         service.mark_failed(store, job_id, status)
         return
@@ -1166,6 +1169,7 @@ def _run_plaintext_genesis_job(
                 job_id,
                 runtime=runtime,
                 analysis_messages=analysis_messages,
+                relationship_anchor=relationship_anchor,
             )
             _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="update identity job done",
                            detail={"mode": mode}, dur_ms=(time.time() - started_at) * 1000)

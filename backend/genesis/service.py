@@ -6,7 +6,7 @@ import base64
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import datetime, date
 from typing import Any
 
 import db
@@ -783,12 +783,43 @@ def init_identity_if_absent(
     return "updated" if existing else "initialized"
 
 
+def _relationship_anchor_fields_for_replace(existing: dict, output: dict) -> dict:
+    """B2: choose the relationship anchor for an identity replace.
+
+    Default = PRESERVE the existing anchor (an omitted/empty upload must never wipe or
+    reset relationship history). ONLY overwrite when the upload carries an EXPLICIT,
+    valid relationship time — a real ISO date PLUS non-empty evidence — so a vague
+    model-derived phrase can't silently reset the anchor (Seven's legality guard)."""
+    anchor = output.get("relationship_anchor") if isinstance(output.get("relationship_anchor"), dict) else {}
+    started = str(anchor.get("relationship_started_at") or "").strip()
+    evidence = str(anchor.get("relationship_anchor_evidence") or "").strip()
+    valid_date = False
+    if started:
+        try:
+            date.fromisoformat(started)
+            valid_date = True
+        except ValueError:
+            valid_date = False
+    if valid_date and evidence:
+        return {
+            "relationship_started_at": started,
+            "relationship_anchor_source": str(anchor.get("relationship_anchor_source") or "upload").strip() or "upload",
+            "relationship_anchor_evidence": evidence,
+        }
+    return {
+        "relationship_started_at": existing.get("relationship_started_at", ""),
+        "relationship_anchor_source": existing.get("relationship_anchor_source", ""),
+        "relationship_anchor_evidence": existing.get("relationship_anchor_evidence", ""),
+    }
+
+
 def replace_identity_preserving_anchor(store: UserStore, output: dict) -> str:
     """Replace identity content for explicit update_identity imports.
 
-    Product meaning: the user is redefining the companion's identity card. This
-    must NOT recompute relationship_started_at/days/evidence; those are history
-    anchors, not editable persona content.
+    Product meaning: the user is redefining the companion's identity card. The
+    relationship anchor (relationship_started_at/source/evidence) is PRESERVED by
+    default and only overwritten when the upload carries an explicit, valid
+    relationship time — see ``_relationship_anchor_fields_for_replace`` (B2).
     """
     existing = identity_service._load_identity(store)
     if not existing:
@@ -818,9 +849,7 @@ def replace_identity_preserving_anchor(store: UserStore, output: dict) -> str:
         "owner_user_id": envelope["owner_user_id"],
         "created_at": existing.get("created_at") or now,
         "updated_at": now,
-        "relationship_started_at": existing.get("relationship_started_at", ""),
-        "relationship_anchor_source": existing.get("relationship_anchor_source", ""),
-        "relationship_anchor_evidence": existing.get("relationship_anchor_evidence", ""),
+        **_relationship_anchor_fields_for_replace(existing, output),
         "identity_agent_name_present": bool(payload.get("agent_name")),
         "identity_dimension_count": len(payload.get("dimensions") or []),
     }
