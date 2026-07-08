@@ -17,6 +17,8 @@ from core import util as core_util
 from core.store import UserStore
 from identity import service as identity_service
 from memory import actions as memory_actions
+from notices import catalog
+from notices import core as notices
 
 GENESIS_STATE_BLOB = "genesis_state"
 GENESIS_PERSONA_BLOB = "genesis_persona"
@@ -355,6 +357,13 @@ def mark_failed(store: UserStore, job_id: str, error: str) -> dict | None:
     job = db.genesis_set_job_status(store.user_id, job_id, status=FAILED_JOB_STATUS, error=error)
     if job:
         write_genesis_state(store, job, status=FAILED_JOB_STATUS)
+    # emit unconditionally: only needs store + job_id + error, not the job row
+    # (a race where the job row is already gone shouldn't silence the notice).
+    ec = catalog.classify_upstream(error) or "genesis_failed"
+    notices.emit(store, source="genesis", error_class=ec,
+                 blame=catalog.blame_for(ec), severity="error",
+                 user_text=catalog.user_text_for(ec), detail=error,
+                 dedupe_key=f"genesis:{job_id}")
     return job
 
 
@@ -925,7 +934,31 @@ def apply_reducer_output(
     output["job_id"] = job_id
     db.genesis_set_job_status(store.user_id, job_id, status="processing", output={"stage": "apply_outputs"})
     write_genesis_state(store, {**job, "status": "processing"})
+    # this run is starting -> clear any stale failure/partial notice for this
+    # user's genesis flow *before* we emit any new ones below, so a partial
+    # notice emitted later in this same call doesn't get resolved by its own
+    # run (notices emitted with dedupe_key="genesis:{job_id}:partial" also
+    # match the "genesis:" prefix used here).
+    notices.resolve(store, "genesis:")
     memory_count, memory_results = apply_memory_outputs(store, api_key, output)
+    # apply_memory_outputs has no job_id in its signature (many other call sites
+    # depend on its (count, results) 2-tuple return, incl. direct unpack in
+    # tests/test_genesis_service.py — widening it would ripple through those).
+    # This caller DOES have job_id, so the dropped-card count is derived here
+    # instead: raw input count minus what actually landed (covers both the
+    # ValueError-skipped malformed items inside apply_memory_outputs AND any
+    # non-dict items it silently continues past).
+    raw_items = output.get("memories")
+    if raw_items is None:
+        raw_items = output.get("facts")
+    raw_count = len(raw_items) if isinstance(raw_items, list) else 0
+    dropped = raw_count - memory_count
+    if dropped > 0:
+        notices.emit(store, source="genesis", error_class="genesis_partial",
+                     blame="system", severity="warning",
+                     user_text=catalog.user_text_for("genesis_partial"),
+                     detail=f"dropped {dropped} card(s)",
+                     dedupe_key=f"genesis:{job_id}:partial")
     identity_status = init_identity_if_absent(store, output, api_key, runtime_token)
     persona_ref, persona_sha = write_persona_artifact(store, job_id, output)
     voice_ref, voice_sha = write_voice_artifact(store, job_id, output)

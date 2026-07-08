@@ -260,3 +260,36 @@ enclave 报错通常会重新包一层自己的 slug（如 `model_api_key_decryp
 | `screen_caption_unconfigured` | 503 | — | |
 | `backend_error` | 502 | system | `_errors.py::backend_call_or_error` 兜底；实际 body 是 `backend_error: <httpx 异常文本>`（历史写法，非规范 slug+detail 分离） |
 | `key_derivation_unavailable` | 503 | system | `_errors.py::content_sk_or_503` 兜底；实际 body 是 `key_derivation_unavailable: <异常文本>`，同上历史写法 |
+
+---
+
+## 通知中心 error_class（`GET /v1/notices`，非 HTTP slug）
+
+> 本节与上面所有表格是**两套完全不同的命名空间**——上面的 slug 是 HTTP
+> `{"error": "<slug>"}` 顶层字段值；这里列的是 `GET /v1/notices` 返回条目里
+> `error_class` 字段的取值，对应 `backend/notices/catalog.py` 的
+> `_CATALOG`，只用于通知中心展示话术，从不出现在 HTTP 错误响应体里。
+> `blame` 语义同 `docs/FRONTEND_ERROR_CONTRACT.md` §二三分类；`severity`
+> 取值 `error`/`warning`，决定通知中心 UI 展示优先级（`warning` 语气弱化，
+> 不打扰用户）。「状态码」列在本节恒为 `—`（notice 不走 HTTP 状态码，此列
+> 仅为复用上面表格的行格式/守卫测试）。
+>
+> `quota_insufficient` / `auth_invalid` / `model_not_found` /
+> `rate_limited` / `upstream_unavailable` / `turn_timeout` /
+> `reply_parse_failed` / `unknown` 8 类是 Phase B/B3 既有的 chat 上游类
+> （`tools/chat_resident_consumer.py` `_ERROR_CLASS_RULES` 同源），未在本次
+> 新增，不重复列。下表只列 **Phase C（2026-07-08）新增的 11 类**。
+
+| error_class | 状态码 | blame | severity | 触发场景 |
+|---|---|---|---|---|
+| `provider_incompatible` | — | user_provider | error | chat：agent-runner 把上游「不支持某参数/工具」类错误分类上报（`classify_upstream`/`_ERROR_CLASS_RULES` 命中） |
+| `context_overflow` | — | user_provider | error | chat：这轮对话超出模型上下文窗口 |
+| `content_filtered` | — | provider_transient | error | chat：回复被上游内容策略拦截 |
+| `genesis_failed` | — | system | error | genesis：蒸馏 job 整体失败（`service.mark_failed`；先过 `classify_upstream` 分类，未命中时兜底到本类） |
+| `genesis_partial` | — | system | warning | genesis：蒸馏跑完但有记忆卡片被丢弃（`apply_reducer_output` / `plaintext.py` 直传路径统计 dropped>0） |
+| `import_failed` | — | system | error | history_import：聊天记录导入失败 |
+| `import_stale` | — | system | error | history_import：导入 job 卡在 queued/processing 超过阈值，判定超时失败 |
+| `memory_backoff` | — | system | warning | memory：capture/migrate/dream 三条 lane 之一连续失败 streak ≥ 3（`_BACKOFF_NOTICE_STREAK`），已进自动退避 |
+| `runner_spawn_failed` | — | system | error | runner：supervisor 拉起用户子进程失败 |
+| `runner_key_decrypt_failed` | — | system | error | runner：provider key 解密失败，子进程无法拉起 |
+| `runner_degraded` | — | system | warning | runner：runtime-token 刷新失败但子进程仍存活，能力部分受限（token 刷新恢复才会 resolve，spawn 成功不清） |

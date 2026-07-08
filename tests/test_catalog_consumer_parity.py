@@ -70,3 +70,36 @@ def test_catalog_blame_matches_consumer_blame_for_every_class():
         assert catalog.blame_for(ec) == blame, (
             f"blame mismatch for {ec}: catalog={catalog.blame_for(ec)!r} "
             f"consumer={blame!r}")
+
+
+def test_classify_upstream_mirrors_consumer_on_samples():
+    """catalog.classify_upstream 是 backend 侧的 consumer 分类器正则副本；
+    用代表串锁两者对同一文本给出同一 error_class（防两份正则漂移）。"""
+    from notices import catalog
+    from tools.chat_resident_consumer import classify_agent_error
+    samples = [
+        "insufficient_quota: your credit balance is too low",
+        "401 invalid x-api-key",
+        "429 too many requests",
+        "503 overloaded, please retry",
+        "400 unsupported parameter 'tool_choice'",
+        "maximum context length exceeded",
+        "blocked by content policy",
+    ]
+    for s in samples:
+        assert catalog.classify_upstream(s) == classify_agent_error(RuntimeError(s)).error_class, s
+
+
+def test_upstream_rule_patterns_match_consumer_rule_patterns():
+    """结构锁（样本串锁不住的漂移）：catalog._UPSTREAM_RULES 与 consumer
+    ._ERROR_CLASS_RULES 逐 error_class 比对正则 pattern 字符串 + 次序，而不是
+    只测几个样本串是否命中一致——consumer 改了正则、catalog 副本漏改，只要
+    两边都还命中现有样本串，test_classify_upstream_mirrors_consumer_on_samples
+    测不出来，这个测试能。turn_timeout/reply_parse_failed 是 consumer 独有的
+    硬编码分支（不在 _ERROR_CLASS_RULES 元组里），catalog 有意不收，排除。"""
+    excluded = {"turn_timeout", "reply_parse_failed"}
+    consumer_rules = [(k, pat.pattern) for k, _b, _t, pat in crc._ERROR_CLASS_RULES if k not in excluded]
+    catalog_rules = [(k, pat.pattern) for k, pat in catalog._UPSTREAM_RULES if k not in excluded]
+    assert catalog_rules == consumer_rules, (
+        f"catalog._UPSTREAM_RULES 与 consumer._ERROR_CLASS_RULES 的正则或次序不一致:\n"
+        f"catalog={catalog_rules}\nconsumer={consumer_rules}")

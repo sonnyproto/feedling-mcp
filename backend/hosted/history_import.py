@@ -60,6 +60,8 @@ import provider_client
 from hosted import config_store as hosted_config_store
 from hosted import history_import_core
 from hosted import onboarding_validation as hosted_onboarding_validation
+from notices import core as notices
+from notices import catalog
 
 
 
@@ -192,6 +194,11 @@ def _history_import_find_reusable_job(
                 "error": "RuntimeError:stale_history_import_job",
             })
             _update_history_job_phase(store, job, "failed", status="failed")
+            notices.emit(store, source="history_import", error_class="import_stale",
+                         blame="system", severity="error",
+                         user_text=catalog.user_text_for("import_stale"),
+                         detail="stale_history_import_job",
+                         dedupe_key=f"history_import:{job.get('job_id')}")
             continue
         return job
     return None
@@ -3181,6 +3188,7 @@ def _process_history_import_sync(
         "onboarding_greeting_message_id": (greeting_row or {}).get("id", ""),
         "warnings": warnings,
     })
+    notices.resolve(store, "history_import:")
     return _update_history_job_phase(store, job, "completed", status="completed")
 
 
@@ -3212,6 +3220,11 @@ def _run_history_import_job(
             "error": f"{type(e).__name__}:{str(e)[:500]}",
         })
         _update_history_job_phase(store, job, "failed", status="failed")
+        notices.emit(store, source="history_import", error_class="import_failed",
+                     blame="system", severity="error",
+                     user_text=catalog.user_text_for("import_failed"),
+                     detail=f"{type(e).__name__}:{str(e)[:200]}",
+                     dedupe_key=f"history_import:{job_id}")
         print(f"[history_import:{store.user_id}] job={job_id} failed={type(e).__name__}:{str(e)[:220]}")
     finally:
         with _history_import_active_lock:

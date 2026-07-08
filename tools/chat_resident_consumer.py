@@ -389,6 +389,17 @@ _ERROR_CLASS_RULES = (
     ("model_not_found", "user_provider",
      "模型名不可用，请检查设置里的模型名。",
      re.compile(r"invalid model name|model_not_found|no such model", re.I)),
+    ("provider_incompatible", "user_provider",
+     "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。",
+     re.compile(r"unknown variant|not supported|unsupported (parameter|tool)"
+                r"|invalid_request_error.*tool", re.I)),
+    ("context_overflow", "user_provider",
+     "这次对话太长超出了模型上限，可精简后再试。",
+     re.compile(r"context.{0,20}(length|window)|maximum context"
+                r"|too many tokens|prompt is too long", re.I)),
+    ("content_filtered", "provider_transient",
+     "这次回复被模型的内容策略拦下了，换个说法再试。",
+     re.compile(r"content_filter|content policy|safety|blocked by", re.I)),
     ("rate_limited", "provider_transient",
      "你的 API 服务限流了，稍等几分钟再试。",
      re.compile(r"\b429\b|too many requests|rate.?limit", re.I)),
@@ -399,7 +410,7 @@ _ERROR_CLASS_RULES = (
 )
 
 # 机读全集导出，供 backend/notices/catalog.py 的一致性测试比对（spec Phase B /
-# B3）：_ERROR_CLASS_RULES 里的 5 类 + classify_agent_error 硬编码分支里的
+# B3）：_ERROR_CLASS_RULES 里的 8 类 + classify_agent_error 硬编码分支里的
 # turn_timeout / reply_parse_failed / model_not_found（裸 404+model）/ unknown。
 # 只是把已有分类逻辑的 error_class 取值收成集合，不改分类逻辑本身。
 CONSUMER_ERROR_CLASSES = frozenset(

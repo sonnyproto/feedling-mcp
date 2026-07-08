@@ -49,6 +49,56 @@
 
 ## 2026-07-08
 
+### [DONE] 通知设施 Phase C（四个生产者接入 + consumer 分类器扩容）
+
+- **C1 genesis**：`backend/genesis/service.py::mark_failed`（蒸馏 job 整体
+  失败）先过 `catalog.classify_upstream(error)` 分类，未命中时兜底
+  `genesis_failed`；`apply_reducer_output` 统计记忆卡片丢弃数
+  （dropped>0）时 emit `genesis_partial`（warning），`backend/genesis/plaintext.py`
+  直传路径同样接线。两个 dedupe_key（`genesis:{job_id}` /
+  `genesis:{job_id}:partial`）共享 `genesis:` 前缀，新一轮 run 开始时统一
+  resolve 掉上一轮的失败/部分通知。
+- **C2 history_import**：`backend/hosted/history_import.py` 导入失败落
+  `import_failed`；job 卡在 queued/processing 超过阈值时的 stale 判定落
+  `import_stale`（均 error）。
+- **C3 memory**：`backend/proactive/capture_jobs.py` 新增退避统计入口，
+  capture/migrate/dream 三条 lane（`capture_scheduler.py` /
+  `dream_scheduler.py` 共用同一入口）在 streak ≥ 3
+  （`_BACKOFF_NOTICE_STREAK`，前两次退避噪音价值低不打扰）时 emit
+  `memory_backoff`（warning），lane 恢复 completed 时按 `memory_backoff:{lane}`
+  精确 resolve，不跨 lane 清。
+- **C4 runner/supervisor**：`backend/agent_runtime/supervisor.py` 新增
+  per-(user_id, error_class) 60s 去抖（`RUNNER_NOTICE_MIN_INTERVAL_SEC`，
+  默认 60s）+ never-raise 的 `_emit_runner_notice`/`_resolve_runner_notice`。
+  子进程拉起失败接 `runner_spawn_failed`；provider key 解密失败接
+  `runner_key_decrypt_failed`；runtime-token 刷新失败但进程仍存活接
+  `runner_degraded`（warning，唯一能 resolve 它的路径是 token 刷新恢复，
+  spawn 成功不清）。顺带补了 tick 里两处此前裸奔（无 try/except）的
+  spawn_fn 调用点，避免单用户异常连坐同批用户。
+- **消费者分类器扩容**：`backend/notices/catalog.py` 新增
+  `provider_incompatible`/`context_overflow`/`content_filtered` 3 类 chat
+  上游分类（与 `tools/chat_resident_consumer.py` 的 `_ERROR_CLASS_RULES` 同源，
+  `tests/test_catalog_consumer_parity.py` 锁一致）；新增
+  `catalog.classify_upstream()` 给 genesis 等 backend-only 生产者复用同一套
+  上游错误文本分类规则，未命中返回空串，由调用方兜底到各自专属
+  error_class。
+- **文档**：`docs/API_ERRORS.md` 新增「通知中心 error_class」一节，登记
+  上述 11 个新类的 blame/severity/触发场景——明确标注这是 `GET /v1/notices`
+  的 error_class 命名空间，与上面的 HTTP `{"error": slug}` 契约表不是一回事。
+- **部署注意**：C4 改的 `backend/agent_runtime/supervisor.py` 跑在 **runner
+  镜像**里（不是 backend 镜像）；本条改动涉及 `notices.emit`/`catalog` 的新
+  接口，**backend 与 runner 必须同批部署**，否则旧 backend 镜像里没有对应
+  接口会炸。
+- 全量基线：Phase C 前 2370 passed / 5 pre-existing failed → Phase C 后
+  `pytest tests/ -q --ignore=tests/test_api.py --ignore=tests/e2e_model_api_test.py`
+  跑出 **2398 passed / 4 skipped / 9 xfailed / 5 failed**（净新增 28 个通过
+  测试）；5 个失败逐一核对与 Phase C 前完全同一批（`test_chat_route_debug_trace.py`
+  ×3 + `test_debug_trace_event_route.py::test_emit_event_records` +
+  `test_memory_capture_trace.py::test_enqueue_duplicate_capture_key_does_not_emit_queued_event`），
+  未引入新回归。
+- 状态：**未部署、未 commit**（worktree `feedling-mcp-error-contract`，分支
+  `feat/error-contract`）。
+
 ### [DONE] 通知设施 Phase B（backend/notices/ 包 + GET /v1/notices）
 
 - 新 `backend/notices/` 包（emit / resolve / list_notices）：系统错误的可回溯

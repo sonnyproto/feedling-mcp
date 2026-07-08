@@ -40,6 +40,7 @@ import db
 from genesis import service
 from hosted import history_import
 from identity import service as identity_service
+from notices import core as notices
 
 _JOB_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
 
@@ -182,6 +183,9 @@ def resident_complete(store, job_id: str, payload: dict) -> tuple[dict, int]:
         persona_ref="", persona_sha256="",
     )
     db.genesis_delete_chunks(store.user_id, job_id)
+    # 兑现 spec 无条件规则「任一 job done → resolve」：resident 蒸馏完成也清该用户
+    # 的历史 genesis 失败通知（本函数不 emit partial，无自清风险）。
+    notices.resolve(store, "genesis:")
     return {"job": {"job_id": job_id, "status": "done", "memory_action_count": mac}}, 200
 
 

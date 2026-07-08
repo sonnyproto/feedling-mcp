@@ -21,6 +21,7 @@ for k, v in _ENV_DEFAULTS.items():
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "tools"))
 
 try:
     import content_encryption  # noqa: F401
@@ -260,3 +261,21 @@ def test_parse_failed_marker_consumed_not_dangling():
     assert crc._consume_reply_parse_failed() is True
     assert crc._turn_reply_parse_failed is False
     assert crc._consume_reply_parse_failed() is False
+
+
+def test_provider_incompatible_classified():
+    from chat_resident_consumer import classify_agent_error
+    n = classify_agent_error(RuntimeError("400 invalid_request_error: unsupported tool 'x'"))
+    assert n.error_class == "provider_incompatible" and n.blame == "user_provider"
+
+
+def test_context_overflow_classified():
+    from chat_resident_consumer import classify_agent_error
+    n = classify_agent_error(RuntimeError("prompt is too long: 210000 tokens > maximum context length"))
+    assert n.error_class == "context_overflow" and n.blame == "user_provider"
+
+
+def test_content_filtered_classified():
+    from chat_resident_consumer import classify_agent_error
+    n = classify_agent_error(RuntimeError("response was blocked by content_filter policy"))
+    assert n.error_class == "content_filtered" and n.blame == "provider_transient"
