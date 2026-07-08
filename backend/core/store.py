@@ -382,6 +382,7 @@ class UserStore:
             for key in (
                 "gate_decision_id",
                 "proactive_job_id",
+                "notice_kind",
                 "alert_preview",
                 "push_body_preview",
                 "push_live_activity_requested",

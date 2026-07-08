@@ -87,6 +87,7 @@ Optional:
 """
 
 import base64
+from collections import namedtuple
 from dataclasses import dataclass, field
 import hashlib
 import inspect
@@ -367,6 +368,141 @@ def _note_provider_payment_failure() -> None:
 def _clear_provider_payment_cooldown() -> None:
     global _provider_payment_cooldown_until
     _provider_payment_cooldown_until = 0.0
+
+# --- agent turn error classification (spec: docs/superpowers/specs/
+# 2026-07-06-upstream-error-surfacing-design.md) ---------------------------
+# error_class → 用户话术；blame 决定话术能不能给行动指引：
+#   user_provider      → 可以让用户去充值/改 key/改模型名
+#   provider_transient → 上游临时问题，等它自己恢复
+#   system             → 我们的问题，绝不能引导用户改配置（会误导，见 dded 案例）
+AgentErrorNotice = namedtuple("AgentErrorNotice", "error_class blame user_text detail")
+
+_ERROR_CLASS_RULES = (
+    # 次序即优先级：quota 必须先于 auth/rate（403+「额度」语义是余额不是权限）
+    ("quota_insufficient", "user_provider",
+     "你的 API 服务额度不足，充值后再发消息即可恢复。",
+     re.compile(r"余额|额度|insufficient_quota|credit balance|requires more credits"
+                r"|payment required|\b402\b|quota", re.I)),
+    ("auth_invalid", "user_provider",
+     "API Key 无效或已过期，请到设置里重新保存。",
+     re.compile(r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b", re.I)),
+    ("model_not_found", "user_provider",
+     "模型名不可用，请检查设置里的模型名。",
+     re.compile(r"invalid model name|model_not_found|no such model", re.I)),
+    ("rate_limited", "provider_transient",
+     "你的 API 服务限流了，稍等几分钟再试。",
+     re.compile(r"\b429\b|too many requests|rate.?limit", re.I)),
+    ("upstream_unavailable", "provider_transient",
+     "你的模型服务暂时不可用，稍后会自动恢复。",
+     re.compile(r"\b5\d{2}\b|overloaded|timed? ?out|connection (refused|reset|error)"
+                r"|unreachable|stream disconnected", re.I)),
+)
+
+
+def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
+    """三层错误来源（claude/codex CLI 经 _cli_error_detail、stderr 兜底）已汇聚成
+    异常文本；这里只做只读分类，永不抛出。"""
+    detail = str(exc)[:200]
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return AgentErrorNotice("turn_timeout", "system",
+                                "这轮回复超时了，稍后再试。", detail)
+    text = str(exc)
+    if "no usable reply" in text:
+        return AgentErrorNotice("reply_parse_failed", "system",
+                                "系统处理回复时出了问题，我们会尽快排查。", detail)
+    lowered = text.lower()
+    # 404 需与 model 同现才算模型错（裸 404 归 upstream_unavailable 太粗、归 auth 又错）
+    if re.search(r"\b404\b", text) and "model" in lowered:
+        return AgentErrorNotice("model_not_found", "user_provider",
+                                "模型名不可用，请检查设置里的模型名。", detail)
+    for klass, blame, user_text, pat in _ERROR_CLASS_RULES:
+        if pat.search(text):
+            return AgentErrorNotice(klass, blame, user_text, detail)
+    return AgentErrorNotice("unknown", "system", "连接模型服务时出了问题。", detail)
+
+
+def _system_notice_body(notice: AgentErrorNotice) -> str:
+    return f"⚠️ {notice.user_text}\n详情: {notice.detail}"
+
+
+# system 通知去抖：前台必发；后台同 error_class 每 SYSTEM_NOTICE_DEBOUNCE_SEC 一条，
+# 任一成功回合清零（恢复后再坏要重新提醒）。进程内存态即可——respawn 顶多多发一条。
+SYSTEM_NOTICE_DEBOUNCE_SEC = float(os.environ.get("SYSTEM_NOTICE_DEBOUNCE_SEC", "21600"))
+_system_notice_last_sent: dict[str, float] = {}
+# 每进程首个成功回合无条件清一次设置页错误（代价一次 HTTP），覆盖 respawn 前留下的滞留错误：
+# respawn 后新进程从 False 起步则永远不会触发清空，导致用户修好配置后 last_runtime_error 仍滞留。
+_runtime_error_reported = True
+
+# 组件2：call_agent 清洗为空时（SEND_FALLBACK_ON_AGENT_ERROR=true）不抛异常，
+# 靠这个模块级标记让前台调用方知道本轮其实失败了，要补发 reply_parse_failed 通知。
+# 每次成功读取（前台 else 分支）后立即清零。
+_turn_reply_parse_failed = False
+
+
+def _consume_reply_parse_failed() -> bool:
+    """读取并清零清洗失败标记。call_agent 是多车道共享的，标记只对"刚刚这一次
+    调用"有意义——谁调用谁消费，绝不许悬挂到别的车道/回合（审查发现的串扰源）。"""
+    global _turn_reply_parse_failed
+    was = _turn_reply_parse_failed
+    _turn_reply_parse_failed = False
+    return was
+
+
+def _reset_system_notice_state() -> None:
+    _system_notice_last_sent.clear()
+
+
+def _report_runtime_error(error: str, error_class: str = "") -> bool:
+    """腿②：设置页 last_runtime_error。失败只 log（观测性不影响回合）。
+
+    只有请求真正落到服务端（2xx，或 404=无 profile 可清）才更新
+    ``_runtime_error_reported``——传输失败/5xx 时保留原标记，让下一个成功
+    回合重试清空，否则设置页会一直挂着过期错误直到下次失败或 respawn。"""
+    global _runtime_error_reported
+    try:
+        resp = httpx.post(
+            f"{FEEDLING_API_URL}/v1/model_api/runtime_error",
+            json={"error": (error or "")[:300], "error_class": (error_class or "")[:64]},
+            headers=_HEADERS, timeout=10,
+        )
+        if resp.status_code != 404:
+            resp.raise_for_status()
+        _runtime_error_reported = bool(error)
+        return True
+    except Exception as e:
+        log.warning("runtime_error report failed (non-fatal): %s", e)
+        return False
+
+
+def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
+    """腿①+②：分类 → 上报设置页 → （前台必发/后台去抖）聊天 system 通知。
+
+    永不抛出：通知是回合失败的旁路，绝不能让它把失败变得更糟。"""
+    try:
+        notice = classify_agent_error(exc)
+        _report_runtime_error(notice.detail, notice.error_class)
+        last = _system_notice_last_sent.get(notice.error_class)
+        if not foreground and last is not None and (time.monotonic() - last) < SYSTEM_NOTICE_DEBOUNCE_SEC:
+            return
+        post_reply(
+            _system_notice_body(notice),
+            role="system", notice_kind="upstream_error", suppress_push=True,
+        )
+        _system_notice_last_sent[notice.error_class] = time.monotonic()
+    except Exception:
+        log.exception("system notice emit failed (non-fatal)")
+
+
+def _note_agent_turn_success() -> None:
+    """成功回合：重置去抖 + 清空设置页错误（仅当本进程报过错，省一次 HTTP）。
+
+    标记翻转在 _report_runtime_error 内部、且仅在清空真正送达时发生——
+    这里不再无条件翻 False（Codex P2：清空 POST 失败会让过期错误滞留且
+    永不重试）。清空失败 → 标记保留 → 下个成功回合自动重试。"""
+    _reset_system_notice_state()
+    if _runtime_error_reported:
+        _report_runtime_error("", "")
+
 
 # Prompt routed only when an agent entry cannot receive a native image object.
 # The consumer still extracts decrypted image bytes and passes them through
@@ -3403,6 +3539,8 @@ def call_agent(
             log.debug("agent runtime debug keys: %s", sorted(turn.runtime_debug.keys()))
         return body
     if SEND_FALLBACK_ON_AGENT_ERROR:
+        global _turn_reply_parse_failed
+        _turn_reply_parse_failed = True
         return [FALLBACK_REPLY]
     raise ValueError("agent produced no usable reply after sanitization")
 
@@ -3988,6 +4126,8 @@ def post_reply(
     thinking_source: str = "",
     thinking_model: str = "",
     thinking_native: bool | None = None,
+    role: str = "",
+    notice_kind: str = "",
 ) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
 
@@ -4053,6 +4193,10 @@ def post_reply(
                 body["thinking_model"] = model_label
             if thinking_native is not None:
                 body["thinking_native"] = bool(thinking_native)
+        if role:
+            body["role"] = role
+        if notice_kind:
+            body["notice_kind"] = notice_kind
         if reply_to_message_id:
             body["reply_to_message_id"] = reply_to_message_id
         if gate_decision_id:
@@ -4091,6 +4235,8 @@ def post_reply(
             "thinking_source": _sanitize_thinking_meta(thinking_source, max_len=80),
             "thinking_model": _sanitize_thinking_meta(thinking_model, max_len=96),
             "thinking_native": thinking_native,
+            "role": role,
+            "notice_kind": notice_kind,
         },
         headers=_HEADERS, timeout=15,
     )
@@ -4226,6 +4372,11 @@ def _clean_messages_for_proactive_context(history: list[dict] | None) -> list[di
     cleaned: list[dict] = []
     for msg in history or []:
         if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip().lower()
+        if role == "system":
+            # system 通知（如上游报错提醒）不是 agent 自己说过的话，混进前台/proactive
+            # 上下文会被误认成历史发言（审查发现的串扰源）。
             continue
         text = _message_text_for_context(msg)
         if not text or "__VERIFY_PING__" in text:
@@ -5365,6 +5516,7 @@ def _process_capture_jobs(jobs: list) -> float:
         except Exception as e:
             reason = f"capture_agent_call_failed:{type(e).__name__}"
             log.error("capture agent call failed id=%s: %s", job_id, e)
+            _notify_agent_turn_failure(e, foreground=False)
             update_proactive_job_status(
                 job_id,
                 "failed",
@@ -5378,6 +5530,7 @@ def _process_capture_jobs(jobs: list) -> float:
                 },
             )
             continue
+        _note_agent_turn_success()
         cards, err = parse_capture_cards(reply_text)
         if err:
             update_proactive_job_status(
@@ -5697,6 +5850,7 @@ def _process_dream_jobs(jobs: list) -> float:
         except Exception as e:
             reason = f"dream_agent_call_failed:{type(e).__name__}"
             log.error("dream agent call failed id=%s: %s", job_id, e)
+            _notify_agent_turn_failure(e, foreground=False)
             update_proactive_job_status(
                 job_id,
                 "failed",
@@ -5710,6 +5864,7 @@ def _process_dream_jobs(jobs: list) -> float:
                 },
             )
             continue
+        _note_agent_turn_success()
         consolidations, questions, err = parse_dream_consolidations(reply_text)
         if err:
             update_proactive_job_status(
@@ -5905,11 +6060,20 @@ def _process_proactive_jobs(jobs: list) -> float:
                 update_proactive_job_status(
                     job_id, "failed", f"provider_payment_required: {e}"
                 )
+                _notify_agent_turn_failure(e, foreground=False)
                 continue
             log.error("proactive agent call failed; not posting fallback: %s", e)
             update_proactive_job_status(job_id, "failed", f"agent_call_failed: {e}")
+            _notify_agent_turn_failure(e, foreground=False)
             continue
         _clear_provider_payment_cooldown()
+        if _consume_reply_parse_failed():
+            _notify_agent_turn_failure(
+                ValueError("agent produced no usable reply after sanitization"),
+                foreground=False,
+            )
+        else:
+            _note_agent_turn_success()
 
         turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
         actions, replies = turn.actions, turn.messages
@@ -6376,6 +6540,11 @@ def _process_messages(messages: list) -> float:
             def _run_verify_probe() -> None:
                 try:
                     probe["result"] = call_agent(VERIFY_PROBE_MESSAGE)
+                    # Probe has its own success semantics and never posts a
+                    # user-visible notice; discard the marker so it can't leak
+                    # into the next foreground/proactive turn (see
+                    # _consume_reply_parse_failed).
+                    _consume_reply_parse_failed()
                 except ValueError as exc:        # no usable reply after sanitization
                     probe["no_usable_reply"] = str(exc)
                 except Exception as exc:         # timeout / transport / runtime
@@ -6508,7 +6677,17 @@ def _process_messages(messages: list) -> float:
         content = _foreground_agent_message(content, current_ts=ts)
 
         use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
+        # 本回合失败时待发的 system 通知。不在失败当场发，而是等下面的回复写入被
+        # 服务端接受（posted_any）后再发（Codex review）：claim 过期 failover 时另
+        # 一个 consumer 已回复，本家的兜底会被 already_answered 409 拒——通知若先
+        # 发就成了重复错误气泡。让通知与回复共享同一份排他性。
+        pending_failure_notice: BaseException | None = None
         try:
+            # Discard any parse-failed marker left dangling by another lane
+            # (proactive / verify_probe) running earlier in this single-threaded
+            # loop, so the `else` branch below only ever observes a flag that
+            # belongs to *this* call_agent invocation.
+            _consume_reply_parse_failed()
             if use_runtime_v2:
                 agent_result = call_agent(_resident_foreground_chat_message_v2(content), trace_id=trace_id)
             elif image_payloads or image_paths:
@@ -6522,12 +6701,25 @@ def _process_messages(messages: list) -> float:
                 agent_result = call_agent(content, trace_id=trace_id)
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
+            # 上报/system 通知与兜底话术解耦（Codex review）：SEND_FALLBACK_ON_AGENT_ERROR
+            # 只管发不发 FALLBACK_REPLY，错误透出（设置页 + system 通知）两种配置下都要发。
             if SEND_FALLBACK_ON_AGENT_ERROR:
                 agent_result = [FALLBACK_REPLY]
+                pending_failure_notice = e
             else:
+                # 关兜底时没有回复写入可挂排他性，当场通知（此配置下 failover 双
+                # 通知是边角，接受）。
+                _notify_agent_turn_failure(e, foreground=True)
                 log.warning("agent error fallback disabled by env; this user turn will not get a visible reply")
                 latest = max(latest, ts)
                 continue
+        else:
+            if _consume_reply_parse_failed():
+                pending_failure_notice = ValueError(
+                    "agent produced no usable reply after sanitization"
+                )
+            else:
+                _note_agent_turn_success()
 
         turn = _split_agent_turn(agent_result)
         _reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
@@ -6590,7 +6782,12 @@ def _process_messages(messages: list) -> float:
             # Keep checkpoint behind this message. The server-side claim lease
             # will expire, allowing this or another responder to retry instead
             # of permanently dropping a user turn after a transient write error.
+            # pending_failure_notice 随之丢弃：本家的回复没被接受（含 already_
+            # answered 409 failover），错误通知由真正被接受的那次尝试来发。
             continue
+
+        if pending_failure_notice is not None and posted_any:
+            _notify_agent_turn_failure(pending_failure_notice, foreground=True)
 
         latest = max(latest, ts)
 

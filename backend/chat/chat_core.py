@@ -422,6 +422,14 @@ def write_response(
     # user-visible message.
     if source not in {"chat", "live_activity", "heartbeat", "verify_ping", proactive_service.PROACTIVE_JOB_SOURCE}:
         return {"error": "invalid source"}, 400
+    # role: 消费者可声明 "system"（技术通知气泡，spec 2026-07-06-upstream-error-
+    # surfacing）。白名单外一律落 openclaw——新增 role 前先过 spec 的 role 审计表。
+    role = str(payload.get("role") or "openclaw").strip()
+    if role not in ("openclaw", "system"):
+        role = "openclaw"
+    notice_kind = ""
+    if role == "system":
+        notice_kind = str(payload.get("notice_kind") or "")[:64]
     # Gate the hidden "verify_ping" source to an actual pending probe. Because
     # source="verify_ping" rows are scrubbed from the visible transcript, an
     # ordinary reply that (mis)used this source would silently vanish while still
@@ -438,6 +446,8 @@ def write_response(
         "proactive_job_id": str(payload.get("proactive_job_id") or ""),
         **thinking_extra,
     }
+    if notice_kind:
+        extra["notice_kind"] = notice_kind
     if source == proactive_service.PROACTIVE_JOB_SOURCE:
         preview = (alert_body or push_body).strip()
         if preview:
@@ -446,7 +456,7 @@ def write_response(
             extra["push_body_preview"] = push_body.strip()[:240]
         extra["push_live_activity_requested"] = bool(payload.get("push_live_activity"))
     reply_to_message_id = _reply_to_message_id(payload)
-    if reply_to_message_id:
+    if reply_to_message_id and role != "system":
         _parent = _chat_message_by_id(store, reply_to_message_id)
         if _parent is not None and (
             _parent.get("reply_status") == "replied" or _parent.get("reply_message_id")
@@ -460,13 +470,13 @@ def write_response(
             # consumer_id is never rejected.)
             return {"error": "already_answered", "reply_status": "replied"}, 409
     msg = store.append_chat(
-        "openclaw",
+        role,
         source,
         envelope,
         content_type=content_type,
         extra=extra,
     )
-    if reply_to_message_id:
+    if reply_to_message_id and role != "system":
         store.update_chat_message_metadata(reply_to_message_id, {
             "reply_status": "replied",
             "reply_message_id": str(msg.get("id") or ""),

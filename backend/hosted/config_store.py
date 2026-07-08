@@ -204,6 +204,21 @@ def _patch_model_api_runtime_profile(store: UserStore, patch: dict) -> dict | No
     return _save_model_api_runtime_profile(store, merged)
 
 
+def record_runtime_error(store: UserStore, *, error: str, error_class: str = "") -> tuple[dict, int]:
+    """agent-runner consumer 上报（或清空）最近一次回合失败原因。
+
+    读侧是 setup_core 的 last_runtime_error（iOS 设置页）。legacy inline 路径经
+    action-trace 写同一字段；本函数是 agent-runner 路径的对等写侧（spec
+    2026-07-06-upstream-error-surfacing 腿②）。"""
+    patch = {
+        "last_runtime_error": str(error or "")[:300],
+        "last_runtime_error_class": str(error_class or "")[:64],
+    }
+    if _patch_model_api_runtime_profile(store, patch) is None:
+        return {"error": "model_api_runtime_profile_missing"}, 404
+    return {"ok": True}, 200
+
+
 def _append_model_api_action_trace(store: UserStore, entry: dict) -> dict:
     record = {
         "trace_id": entry.get("trace_id") or f"mat_{uuid.uuid4().hex[:16]}",
