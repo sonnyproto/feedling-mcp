@@ -59,15 +59,21 @@ def _is_sealed_body(payload: dict) -> bool:
 
 
 def resident_distill_max_bytes() -> int:
-    """Max sealed-material size (bytes) accepted in resident mode. Guards the local
-    agent's distill cost (no server-side downsampling on this path) + transport. The
-    cloud/worker path has NO logical cap (server downsamples). Configurable; default 512 KiB.
+    """Max sealed-material size (bytes) accepted in resident mode. Distill cost is NOT the
+    reason for the cap — the consumer chunks the decrypted document (``_window_document``)
+    exactly like the cloud worker chunks server-side, so it processes any size on the user's
+    own machine. The cap guards the ONE-SHOT sealed envelope: the whole document is a single
+    AEAD ciphertext that must fit through one HTTP POST + one enclave ``/v1/envelope/decrypt``
+    + one DB blob, and it can't be split without breaking the AAD (unlike the cloud plaintext
+    path, which downsamples/chunks server-side). Configurable via
+    FEEDLING_RESIDENT_DISTILL_MAX_BYTES; default 8 MiB — well above any real chat-log /
+    memory-archive / persona, well under the single-POST + single-decrypt ceiling.
     Measured on the ciphertext the server actually stores (server-verifiable, un-fakeable)."""
     try:
         v = int(os.environ.get("FEEDLING_RESIDENT_DISTILL_MAX_BYTES", "") or 0)
     except (TypeError, ValueError):
         v = 0
-    return v if v > 0 else 512 * 1024
+    return v if v > 0 else 8 * 1024 * 1024
 
 
 def _resident_sealed_import(store, payload: dict) -> tuple[dict, int]:
