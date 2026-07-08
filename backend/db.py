@@ -1482,6 +1482,62 @@ def genesis_claim_uploaded_jobs(*, limit: int = 1) -> list[dict]:
     return out
 
 
+def genesis_claim_resident_jobs(user_id: str, *, consumer_id: str, limit: int = 1) -> list[dict]:
+    """Atomically claim ``awaiting_resident`` genesis jobs for a resident consumer.
+
+    Scoped to a single ``user_id`` — the resident consumer authenticates as its own
+    user (same per-user credential it uses for chat poll), so it only ever claims that
+    user's jobs, never another user's. Mirrors ``genesis_claim_uploaded_jobs`` (FOR
+    UPDATE SKIP LOCKED so a user's multiple consumer processes can't double-process),
+    moving awaiting_resident -> processing and stamping the claiming consumer + a fresh
+    heartbeat + attempt count (so a dead consumer's job can be reaped / re-queued).
+    """
+    cid = str(consumer_id or "").strip()
+    if not cid:
+        # An empty consumer_id would move the job to processing with a blank owner —
+        # invisible to genesis_reap_stale_resident_jobs (resident_consumer_id <> '') and
+        # thus unrecoverable. Refuse rather than wedge it.
+        raise ValueError("consumer_id_required")
+    safe_limit = max(1, min(int(limit or 1), 16))
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            cur = conn.execute(
+                """
+                WITH picked AS (
+                    SELECT user_id, job_id
+                    FROM genesis_import_jobs
+                    WHERE user_id = %s AND status = 'awaiting_resident'
+                    ORDER BY finalized_at ASC NULLS LAST, updated_at ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE genesis_import_jobs AS j SET
+                    status = 'processing',
+                    error = '',
+                    resident_consumer_id = %s,
+                    resident_claimed_at = now(),
+                    resident_heartbeat_at = now(),
+                    resident_attempts = j.resident_attempts + 1,
+                    output = jsonb_build_object('stage', 'resident_claimed'),
+                    updated_at = now()
+                FROM picked
+                WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
+                RETURNING j.*
+                """,
+                (user_id, safe_limit, cid),
+            )
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        out.append(item)
+    return out
+
+
 def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit: int = 50) -> list[dict]:
     """Atomically fail genesis jobs wedged in 'processing' past a staleness cutoff.
 
@@ -1507,6 +1563,7 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
                 SELECT user_id, job_id
                 FROM genesis_import_jobs
                 WHERE status = 'processing'
+                  AND COALESCE(resident_consumer_id, '') = ''
                   AND updated_at < now() - make_interval(secs => %s)
                 ORDER BY updated_at ASC
                 LIMIT %s
@@ -1521,6 +1578,73 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
             RETURNING j.*
             """,
             (safe_sec, safe_limit, error[:1000]),
+        )
+        rows = cur.fetchall()
+        cols = [d[0] for d in cur.description]
+    out: list[dict] = []
+    for row in rows:
+        item = dict(zip(cols, row))
+        for key, value in list(item.items()):
+            if hasattr(value, "isoformat"):
+                item[key] = value.isoformat()
+        out.append(item)
+    return out
+
+
+def genesis_resident_heartbeat(user_id: str, job_id: str, *, consumer_id: str) -> bool:
+    """Renew a resident job's lease. Only the owning consumer (claimed it, still
+    processing) may heartbeat — this is what keeps genesis_reap_stale_resident_jobs
+    from re-queueing a job whose consumer is alive and grinding. Returns True if renewed."""
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            UPDATE genesis_import_jobs SET
+                resident_heartbeat_at = now(),
+                updated_at = now()
+            WHERE user_id = %s AND job_id = %s
+              AND status = 'processing' AND resident_consumer_id = %s
+            """,
+            (user_id, job_id, consumer_id),
+        )
+        return cur.rowcount > 0
+
+
+def genesis_reap_stale_resident_jobs(
+    older_than_sec: int, *, max_attempts: int, error: str, limit: int = 50
+) -> list[dict]:
+    """Recover resident jobs whose consumer died mid-distill (processing, resident-owned,
+    heartbeat older than the lease). Under the attempt cap → re-queue to awaiting_resident
+    (another consumer re-claims, resident_attempts keeps accumulating across re-queues);
+    at/over the cap → fail. Atomic (FOR UPDATE SKIP LOCKED) so a live consumer that just
+    heartbeated is not touched. Returns the rows changed so the caller can sync state."""
+    safe_sec = max(60, int(older_than_sec or 0))
+    safe_limit = max(1, min(int(limit or 1), 200))
+    safe_max = max(1, int(max_attempts or 1))
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            """
+            WITH picked AS (
+                SELECT user_id, job_id
+                FROM genesis_import_jobs
+                WHERE status = 'processing'
+                  AND resident_consumer_id <> ''
+                  AND resident_heartbeat_at < now() - make_interval(secs => %s)
+                ORDER BY resident_heartbeat_at ASC
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE genesis_import_jobs AS j SET
+                status = CASE WHEN j.resident_attempts < %s THEN 'awaiting_resident' ELSE 'failed' END,
+                error = CASE WHEN j.resident_attempts < %s THEN '' ELSE %s END,
+                resident_consumer_id = '',
+                resident_claimed_at = NULL,
+                resident_heartbeat_at = NULL,
+                updated_at = now()
+            FROM picked
+            WHERE j.user_id = picked.user_id AND j.job_id = picked.job_id
+            RETURNING j.*
+            """,
+            (safe_sec, safe_limit, safe_max, safe_max, error[:1000]),
         )
         rows = cur.fetchall()
         cols = [d[0] for d in cur.description]
@@ -1652,6 +1776,18 @@ def genesis_list_chunks(user_id: str, job_id: str) -> list[dict]:
                 item[key] = value.isoformat()
         out.append(item)
     return out
+
+
+def genesis_delete_chunks(user_id: str, job_id: str) -> int:
+    """Delete a job's stored (encrypted) chunks. Used after a resident distill completes:
+    the sealed material is ephemeral — consumed once the local agent has distilled it,
+    so the server keeps no leftover ciphertext. Returns the number of chunks deleted."""
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "DELETE FROM genesis_import_chunks WHERE user_id = %s AND job_id = %s",
+            (user_id, job_id),
+        )
+        return cur.rowcount
 
 
 def genesis_mark_finalized(user_id: str, job_id: str) -> dict | None:

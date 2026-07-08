@@ -57,9 +57,18 @@ if str(_BACKEND_DIR) not in sys.path:
 
 import db
 from core import runtime_token
+from core.store import get_store
 from agent_runtime import leases, litellm_gateway, spawners
+from notices import core as notices
+from notices import catalog
 
 log = logging.getLogger("feedling.agent_runtime.supervisor")
+
+# runner error_class -> its notice dedupe-key suffix (module-level so
+# _emit_runner_notice and _resolve_runner_notice share one mapping — DRY).
+_RUNNER_NOTICE_SUFFIX = {"runner_spawn_failed": "spawn_failed",
+                         "runner_key_decrypt_failed": "key_decrypt_failed",
+                         "runner_degraded": "degraded"}
 
 INTRODUCTION_JOB_KIND = "introduction"
 INTRODUCTION_TRIGGER = "post_spawn_genesis"
@@ -117,6 +126,14 @@ class Supervisor:
         # (spawn/reap/respawn) and the dedicated renew thread (renew_live).
         # Reentrant so a method already holding it can call another that takes it.
         self._lock = threading.RLock()
+        # runner notices (spec Phase C / C4): per-(user_id, error_class) minimum
+        # write interval so a supervisor retrying every ~15s doesn't hit the DB
+        # every tick for a still-failing user. Separate (non-reentrant) lock from
+        # self._lock — _resolve_one runs concurrently in a ThreadPoolExecutor and
+        # must never block on/be blocked by the children-dict lock.
+        self._notice_debounce: dict[tuple, float] = {}
+        self._notice_lock = threading.Lock()
+        self._notice_min_interval = float(os.environ.get("RUNNER_NOTICE_MIN_INTERVAL_SEC", "60"))
 
     def _write_token(self, user_id: str, home: str) -> None:
         if self.token_writer is None:
@@ -125,6 +142,67 @@ class Supervisor:
             self.token_writer(user_id, home)
         except Exception as e:  # noqa: BLE001 — a token-refresh failure must not crash the tick
             log.warning("runtime-token refresh failed for %s: %s", user_id, e)
+            self._emit_runner_notice(user_id, "runner_degraded",
+                                     f"token refresh failed: {e}", severity="warning")
+            return
+        # Token write succeeded: if we'd previously reported degraded for this
+        # user, clear it now (token recovery is the only thing that should
+        # resolve runner_degraded — spawn success must NOT, see
+        # _resolve_runner_notice). Guarded on the debounce dict so a healthy
+        # user (no pending degraded record) never triggers a DB round-trip
+        # here every tick.
+        with self._notice_lock:
+            had_degraded = (user_id, "runner_degraded") in self._notice_debounce
+        if had_degraded:
+            self._resolve_runner_notice(user_id, "runner_degraded")
+
+    def _emit_runner_notice(self, user_id: str, error_class: str, detail: str,
+                            *, severity: str = "error") -> None:
+        """runner 通知：per-(user,error_class) 最小写间隔（默认 60s，
+        RUNNER_NOTICE_MIN_INTERVAL_SEC）+ never-raise. supervisor tick 每
+        ~15s 一轮重试同一失败用户，去抖避免每 tick 都打一次 DB（emit 的 upsert
+        只吸收 occurrences，但仍是一次 DB 往返）。线程安全：_resolve_one 跑在
+        ThreadPoolExecutor 里，去抖字典的读写全程持 self._notice_lock。"""
+        try:
+            now = time.monotonic()
+            key = (user_id, error_class)
+            with self._notice_lock:
+                last = self._notice_debounce.get(key, 0.0)
+                if now - last < self._notice_min_interval:
+                    return
+                self._notice_debounce[key] = now
+            store = get_store(user_id)
+            suffix = _RUNNER_NOTICE_SUFFIX.get(error_class, error_class)
+            notices.emit(store, source="runner", error_class=error_class,
+                         blame=catalog.blame_for(error_class), severity=severity,
+                         user_text=catalog.user_text_for(error_class),
+                         detail=str(detail)[:200], dedupe_key=f"runner:{suffix}")
+        except Exception:
+            log.warning("runner notice emit failed (swallowed)", exc_info=True)
+
+    def _resolve_runner_notice(self, user_id: str, *error_classes: str) -> None:
+        """Clear the runner notice(s) for the given specific ``error_classes``
+        (and their debounce state, so a fresh failure right after a recovery is
+        reported immediately rather than waiting out the old debounce window).
+        Never raises.
+
+        Resolves by EXACT error_class, never by the wide ``runner:`` prefix —
+        deliberately: a successful spawn only proves the spawn+decrypt path is
+        healthy, so it clears ``runner_spawn_failed``/``runner_key_decrypt_failed``
+        but must NOT clear ``runner_degraded`` (token-refresh health is an
+        independent concern, cleared only by ``_write_token`` succeeding).
+        Precise-key resolve is safe here because none of the three suffixes is a
+        prefix of another."""
+        try:
+            with self._notice_lock:            # 恢复时清去抖，允许下次故障立即再报
+                for ec in error_classes:
+                    self._notice_debounce.pop((user_id, ec), None)
+            store = get_store(user_id)
+            for ec in error_classes:
+                suffix = _RUNNER_NOTICE_SUFFIX.get(ec, ec)
+                notices.resolve(store, f"runner:{suffix}")
+        except Exception:
+            log.warning("runner notice resolve failed (swallowed)", exc_info=True)
 
     def _home(self, user_id: str) -> str:
         return f"{self.data_root}/users/{user_id}"
@@ -202,15 +280,37 @@ class Supervisor:
                     # renewing for the replacement pid — leaving the new consumer
                     # lease-less and reaped next tick. Holding the lock across the swap
                     # keeps renew_live's `is child` check observing the new child.
+                    # Per-user try/except: a respawn failure here must not propagate
+                    # up through tick() and abort the whole roster loop (that would
+                    # strand every OTHER still-healthy user this tick, including
+                    # ones already renewed above). The old child is already killed;
+                    # on failure we deliberately leave its (now-dead) entry in
+                    # self.children so the normal "tracked but dead -> reap" path
+                    # picks it up and retries as a fresh spawn next tick.
+                    spawn_ok = False
                     with self._lock:
                         self.kill_fn(child["pid"])
-                        pid = self.spawn_fn(entry, user_id, home)
-                        self._write_token(user_id, home)
-                        leases.renew(user_id, self.owner, ttl=self.lease_ttl, pid=pid,
-                                     status="running", driver=entry.get("driver"),
-                                     now=self._now())
-                        self.children[user_id] = {"pid": pid, "entry": entry, "home": home}
-                    self._enqueue_introduction(user_id, entry)
+                        try:
+                            pid = self.spawn_fn(entry, user_id, home)
+                        except Exception as e:  # noqa: BLE001
+                            detail = f"{type(e).__name__}:{e}"
+                            leases.mark_error(user_id, self.owner, f"spawn_failed:{detail}")
+                            log.exception("respawn failed for %s", user_id)
+                        else:
+                            spawn_ok = True
+                            self._write_token(user_id, home)
+                            leases.renew(user_id, self.owner, ttl=self.lease_ttl, pid=pid,
+                                         status="running", driver=entry.get("driver"),
+                                         now=self._now())
+                            self.children[user_id] = {"pid": pid, "entry": entry, "home": home}
+                    if spawn_ok:
+                        # respawn ok -> clear spawn/decrypt notices only; NOT degraded
+                        # (token health is independent — see _write_token).
+                        self._resolve_runner_notice(user_id, "runner_spawn_failed",
+                                                    "runner_key_decrypt_failed")
+                        self._enqueue_introduction(user_id, entry)
+                    else:
+                        self._emit_runner_notice(user_id, "runner_spawn_failed", detail)
                 else:
                     self._write_token(user_id, child["home"])  # refresh short-lived token
                 continue
@@ -262,13 +362,29 @@ class Supervisor:
                 log.warning("pre-spawn reconcile failed; spawning anyway: %s", e)
 
         for user_id, entry, home in newly_acquired:
-            pid = self.spawn_fn(entry, user_id, home)
+            # Per-user try/except: this loop already fanned out N acquired leases
+            # this tick — one user's spawn_fn raising (e.g. a fork/exec failure)
+            # must not abort the loop and strand the REST of this batch with an
+            # acquired-but-never-spawned lease. Failure marks the lease 'error'
+            # (surfaced to the user via a runner notice) and moves on; the lease
+            # is retried as a fresh acquisition next tick once it's reaped.
+            try:
+                pid = self.spawn_fn(entry, user_id, home)
+            except Exception as e:  # noqa: BLE001
+                detail = f"{type(e).__name__}:{e}"
+                leases.mark_error(user_id, self.owner, f"spawn_failed:{detail}")
+                self._emit_runner_notice(user_id, "runner_spawn_failed", detail)
+                log.exception("spawn failed for %s", user_id)
+                continue   # skip this user only — no cascading failure for the rest of the batch
             self._write_token(user_id, home)  # initial short-lived token for the child
             leases.renew(user_id, self.owner, ttl=self.lease_ttl, pid=pid,
                          status="running", now=self._now())
             with self._lock:
                 self.children[user_id] = {"pid": pid, "entry": entry, "home": home}
             log.info("spawned resident consumer for %s (pid=%s, home=%s)", user_id, pid, home)
+            # successful spawn -> clear spawn/decrypt notices only; NOT degraded
+            # (token health is independent — see _write_token).
+            self._resolve_runner_notice(user_id, "runner_spawn_failed", "runner_key_decrypt_failed")
             self._enqueue_introduction(user_id, entry)
 
     def renew_live(self) -> None:
@@ -514,13 +630,20 @@ def _fetch_key_envelope(api_url: str, api_key: str = "", *, runtime_token: str =
         return None
 
 
-def _resolve_roster(roster: list[dict]) -> list[dict]:
+def _resolve_roster(roster: list[dict],
+                    *, key_decrypt_failures: list[tuple[str, str]] | None = None) -> list[dict]:
     """Fill each entry's ``user_id`` (whoami) and resolve its provider key.
 
     Precedence: an explicit roster ``provider_key`` (dev) > a roster-supplied
     ``provider_key_envelope`` > self-fetching the user's own envelope from the
     backend (Stage B). The envelope is enclave-decrypted JIT; plaintext is handed
-    to the child via env and never persisted."""
+    to the child via env and never persisted.
+
+    ``key_decrypt_failures`` (optional, module-level free function — this runs
+    once at boot BEFORE any ``Supervisor`` exists, so it cannot emit a
+    ``self._emit_runner_notice`` notice directly) collects (user_id, detail) for
+    every entry whose envelope decrypt came back empty; the caller emits them
+    once the ``Supervisor`` is constructed."""
     api_url = os.environ.get("FEEDLING_API_URL", "http://localhost:5001")
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "")
     resolved = []
@@ -538,6 +661,8 @@ def _resolve_roster(roster: list[dict]) -> list[dict]:
                 key = _decrypt_provider_key(enclave_url, entry["api_key"], env)
                 if key:
                     out["provider_key"] = key
+                elif key_decrypt_failures is not None:
+                    key_decrypt_failures.append((user_id, "envelope decrypt returned empty"))
             out.pop("provider_key_envelope", None)
         resolved.append(out)
     return resolved
@@ -590,14 +715,21 @@ _RESOLVE_CONCURRENCY_DEFAULT = 8
 
 
 def _resolve_one(uid: str, info: dict, *, mint_token, api_url: str, enclave_url: str,
-                 cache: dict, refetch_sec: float, clock: float) -> dict | None:
+                 cache: dict, refetch_sec: float, clock: float, notify=None) -> dict | None:
     """Resolve a single discovered user into a credential-bearing entry.
 
     Isolated so a single user's mint/fetch/decrypt hang or failure (a banned
     gateway upstream, an enclave blip) returns None and is skipped, never
     aborting the rest of the pass. The HTTP calls carry their own timeouts
     (fetch 10s, decrypt 20s). Safe to run concurrently across users: each call
-    only touches its own ``cache[uid]`` slot."""
+    only touches its own ``cache[uid]`` slot.
+
+    ``notify`` (optional ``(user_id, detail) -> None``) is called when an
+    envelope decrypt attempt comes back empty — this is a module-level free
+    function (runs inside a ThreadPoolExecutor, no ``Supervisor`` self), so the
+    caller wires in ``Supervisor._emit_runner_notice`` bound to a fixed
+    ``runner_key_decrypt_failed`` error_class. Never called merely because no
+    envelope was available (that's "not configured yet", not a failure)."""
     try:
         tok = mint_token(uid)
         cached = cache.get(uid)
@@ -630,10 +762,16 @@ def _resolve_one(uid: str, info: dict, *, mint_token, api_url: str, enclave_url:
                     slot = cache.setdefault(uid, {})
                     slot["sig"] = sig
                     slot["provider_key"] = decrypted
-                elif cached:
-                    # Decrypt failed (transient) on a changed envelope — keep the last
-                    # good key so a healthy consumer isn't respawned keyless this tick.
-                    provider_key = cached.get("provider_key", "")
+                else:
+                    if notify is not None:
+                        try:
+                            notify(uid, "envelope decrypt returned empty")
+                        except Exception:  # noqa: BLE001 — notify must never break resolution
+                            log.warning("key-decrypt-failed notify raised for %s", uid, exc_info=True)
+                    if cached:
+                        # Decrypt failed (transient) on a changed envelope — keep the last
+                        # good key so a healthy consumer isn't respawned keyless this tick.
+                        provider_key = cached.get("provider_key", "")
         elif cached:
             # Envelope unavailable (transient) — fall back to the last good key
             # rather than dropping it (which _spawn_identity reads as a config change).
@@ -657,7 +795,7 @@ def _resolve_one(uid: str, info: dict, *, mint_token, api_url: str, enclave_url:
 
 
 def _resolve_discovered(enabled: dict, *, mint_token, api_url: str, enclave_url: str,
-                        cache: dict, now=None) -> list[dict]:
+                        cache: dict, now=None, notify=None) -> list[dict]:
     """Stage D zero-roster: build credential-bearing entries for DB-discovered
     users WITHOUT any api_key. For each user_id the supervisor mints a short-lived
     runtime token, self-fetches the provider-key envelope and enclave-decrypts it
@@ -666,7 +804,10 @@ def _resolve_discovered(enabled: dict, *, mint_token, api_url: str, enclave_url:
     carry no api_key — the consumer authenticates with the token file the
     supervisor writes per tick. Users are resolved concurrently across a bounded
     pool so a cold cache (fresh supervisor) doesn't serialize into a multi-minute
-    lap."""
+    lap.
+
+    ``notify`` is forwarded to ``_resolve_one`` (see its docstring) — a
+    ``runner_key_decrypt_failed`` hook, called from worker threads."""
     clock = (now or time.time)()
     refetch_sec = float(os.environ.get("AGENT_ENVELOPE_REFETCH_SEC", _ENVELOPE_REFETCH_DEFAULT_SEC))
     workers = max(1, int(os.environ.get("AGENT_RESOLVE_CONCURRENCY", _RESOLVE_CONCURRENCY_DEFAULT)))
@@ -678,7 +819,7 @@ def _resolve_discovered(enabled: dict, *, mint_token, api_url: str, enclave_url:
         uid, info = pair
         return _resolve_one(uid, info, mint_token=mint_token, api_url=api_url,
                             enclave_url=enclave_url, cache=cache,
-                            refetch_sec=refetch_sec, clock=clock)
+                            refetch_sec=refetch_sec, clock=clock, notify=notify)
 
     if workers == 1 or len(items) == 1:
         results = [_one(p) for p in items]
@@ -1119,7 +1260,11 @@ def main() -> int:
     # Credentials resolved once (whoami + envelope decrypt are network calls). The
     # backend-enabled intersection + gateway wiring re-run each tick off this base,
     # so enabling/disabling a user (or the gateway) takes effect without a redeploy.
-    base_roster = _resolve_roster(_load_roster())
+    # This runs before ``sup`` exists, so decrypt failures are collected here and
+    # emitted as runner_key_decrypt_failed notices once the Supervisor is built below.
+    base_roster_key_decrypt_failures: list[tuple[str, str]] = []
+    base_roster = _resolve_roster(_load_roster(),
+                                  key_decrypt_failures=base_roster_key_decrypt_failures)
     if not base_roster and not autodiscover and not host_all:
         log.warning("no roster and autodiscover off — supervisor will idle "
                     "(set AGENT_RUNTIME_USERS or AGENT_RUNTIME_AUTODISCOVER=1)")
@@ -1175,6 +1320,8 @@ def main() -> int:
     )
     log.info("supervisor up — owner=%s base_users=%d autodiscover=%s host_all=%s gateway=%s ttl=%.0fs max_children=%d",
              owner, len(base_roster), autodiscover, host_all_active, gateway_enabled, lease_ttl, max_children)
+    for _uid, _detail in base_roster_key_decrypt_failures:
+        sup._emit_runner_notice(_uid, "runner_key_decrypt_failed", _detail)
 
     # Genesis CVM worker — runs in its own daemon thread (never inline in the tick
     # loop). Default OFF; activates only when FEEDLING_GENESIS_WORKER_ENABLED is set
@@ -1251,7 +1398,9 @@ def main() -> int:
                     enabled = _discover_enabled(include_gateway=gateway_enabled)
                     discovered = _resolve_discovered(
                         enabled, mint_token=mint_token, api_url=api_url,
-                        enclave_url=enclave_url, cache=cred_cache)
+                        enclave_url=enclave_url, cache=cred_cache,
+                        notify=lambda uid, detail: sup._emit_runner_notice(
+                            uid, "runner_key_decrypt_failed", detail))
                 roster, gateways = _effective_roster(
                     base_roster, autodiscover=autodiscover, gateway_enabled=gateway_enabled,
                     host_all_discovered=discovered)

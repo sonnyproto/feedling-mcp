@@ -78,11 +78,16 @@ def _messages_hash(messages: list[dict[str, Any]]) -> str:
 class GenesisLLMClient:
     """Thin, idempotent wrapper around provider_client.chat_completion."""
 
-    def __init__(self, completion_fn: CompletionFn | None = None):
+    def __init__(self, completion_fn: CompletionFn | None = None, *, persist_output: bool = True):
         # Genesis v2 Step 1: drive every genesis LLM call through the retry wrapper
         # so a single cheap-relay blip (timeout / 429 / 5xx / empty) no longer kills
         # the whole import. provider_config failures (402 / bad key) are NOT retried.
         self._completion_fn = completion_fn or provider_client.reliable_chat_completion
+        # persist_output=True (default, cloud CVM): record each call's metadata + heartbeat
+        # the job in Postgres. The VPS resident consumer reuses this SAME extraction engine
+        # (chunk → fact_map → fact_write) with a local-agent completion_fn but has NO backend
+        # DB, so it constructs the client with persist_output=False to skip both DB touches.
+        self._persist_output = persist_output
 
     def complete(
         self,
@@ -136,17 +141,18 @@ class GenesisLLMClient:
             "stop_reason": stop_reason,
             "usage": usage,
         }
-        db.genesis_upsert_output(user_id, job_id, output_type, doc=doc, status="done", ref=output_type)
-        # Heartbeat the job after every LLM call. Every genesis LLM call funnels
-        # through here, so this bumps updated_at across the whole reducer — map,
-        # reduce, and the early-return source families alike — letting the stale
-        # reaper tell a live long import from a worker that died mid-run, with no
-        # per-call-site wiring to forget. Best-effort: a heartbeat blip is harmless
-        # (the next call re-touches) and must never fail the LLM call.
-        try:
-            db.genesis_touch_job(user_id, job_id)
-        except Exception:  # noqa: BLE001
-            pass
+        if self._persist_output:
+            db.genesis_upsert_output(user_id, job_id, output_type, doc=doc, status="done", ref=output_type)
+            # Heartbeat the job after every LLM call. Every genesis LLM call funnels
+            # through here, so this bumps updated_at across the whole reducer — map,
+            # reduce, and the early-return source families alike — letting the stale
+            # reaper tell a live long import from a worker that died mid-run, with no
+            # per-call-site wiring to forget. Best-effort: a heartbeat blip is harmless
+            # (the next call re-touches) and must never fail the LLM call.
+            try:
+                db.genesis_touch_job(user_id, job_id)
+            except Exception:  # noqa: BLE001
+                pass
         return GenesisLLMResult(
             text=text,
             usage=usage,

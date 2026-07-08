@@ -402,7 +402,7 @@ setup/config/history/onboarding 对它的依赖摘净后）。
 **保留**：`setup_routes_asgi.py`、`config_store.py`(瘦身后)、`history_import.py`、
 `onboarding_validation.py`、`agent_runtime_cutover.py`。
 
-**路由集变更**（CONTRIBUTING §7 要求 PR 显式列出，url_map 是回归基线）：
+**路由集变更**（CONTRIBUTING §8 要求 PR 显式列出，url_map 是回归基线）：
 - 改：`POST /v1/model_api/chat/send`（语义变投递+202，不再同步 reply）。
 - 不变：`/v1/model_api/setup|get|test|delete|runtime|memory/repair`。
 - 新增（Stage B，已上）：`POST /v1/model_api/driver`（hosted 启用/停用开关,body

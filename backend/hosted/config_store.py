@@ -55,6 +55,8 @@ from content_encryption import build_envelope
 
 from core import util as core_util
 import provider_client
+from notices import core as notices_core
+from notices import catalog as notices_catalog
 
 
 def _load_model_api_config(store: UserStore) -> dict | None:
@@ -202,6 +204,33 @@ def _patch_model_api_runtime_profile(store: UserStore, patch: dict) -> dict | No
     merged = dict(profile)
     merged.update({k: v for k, v in patch.items() if v is not None})
     return _save_model_api_runtime_profile(store, merged)
+
+
+def record_runtime_error(store: UserStore, *, error: str, error_class: str = "") -> tuple[dict, int]:
+    """agent-runner consumer 上报（或清空）最近一次回合失败原因。
+
+    读侧是 setup_core 的 last_runtime_error（iOS 设置页）。legacy inline 路径经
+    action-trace 写同一字段；本函数是 agent-runner 路径的对等写侧（spec
+    2026-07-06-upstream-error-surfacing 腿②）。"""
+    patch = {
+        "last_runtime_error": str(error or "")[:300],
+        "last_runtime_error_class": str(error_class or "")[:64],
+    }
+    if _patch_model_api_runtime_profile(store, patch) is None:
+        return {"error": "model_api_runtime_profile_missing"}, 404
+    try:
+        if error:
+            ec = error_class or "unknown"
+            notices_core.emit(
+                store, source="chat", error_class=ec,
+                blame=notices_catalog.blame_for(ec), severity="error",
+                user_text=notices_catalog.user_text_for(ec),
+                detail=error, dedupe_key=f"chat:{ec}")
+        else:
+            notices_core.resolve(store, "chat:")
+    except Exception:
+        pass   # 扇出绝不影响 record_runtime_error 主职责（emit/resolve 本身已 never-raise，这是双保险）
+    return {"ok": True}, 200
 
 
 def _append_model_api_action_trace(store: UserStore, entry: dict) -> dict:

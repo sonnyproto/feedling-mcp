@@ -296,7 +296,7 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
         return {"error": "envelope required"}, 400
     missing = [f for f in _ENVELOPE_REQUIRED if not envelope.get(f)]
     if missing:
-        return {"error": f"envelope missing fields: {missing}"}, 400
+        return {"error": "envelope_missing_fields", "detail": missing}, 400
     if envelope["visibility"] not in ("shared", "local_only"):
         return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
     if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
@@ -342,15 +342,21 @@ def trace_response_gated(store: UserStore, payload: dict, allow_verify_reply: bo
     )
 
 
-def gate_response_dict(store: UserStore, allow_verify_reply: bool):
+def gate_response_dict(store: UserStore, allow_verify_reply: bool, is_verify_reply: bool = False):
     """Bridge to the shared bootstrap gate.
 
     ``boot_gates._gate_bootstrap_for_chat`` returns a framework-neutral
     ``(body_dict, status)`` — or ``None`` when the call may proceed — so no flask
     application context is needed. Looked up on ``boot_gates`` at call time so test
     monkeypatches of ``_gate_bootstrap_for_chat`` are honored.
+
+    ``is_verify_reply`` (the current POST carries source="verify_ping") keeps the
+    hidden liveness probe on the forcing path even after the user has spoken —
+    only genuine user-facing replies bypass the needs_identity gate (A'').
     """
-    gated = boot_gates._gate_bootstrap_for_chat(store, allow_verify_reply=allow_verify_reply)
+    gated = boot_gates._gate_bootstrap_for_chat(
+        store, allow_verify_reply=allow_verify_reply, is_verify_reply=is_verify_reply
+    )
     if gated is None:
         return None
     body, status = gated
@@ -380,7 +386,7 @@ def write_response(
         return {"error": "envelope required"}, 400
     missing = [f for f in _ENVELOPE_REQUIRED if not envelope.get(f)]
     if missing:
-        return {"error": f"envelope missing fields: {missing}"}, 400
+        return {"error": "envelope_missing_fields", "detail": missing}, 400
     if envelope["visibility"] not in ("shared", "local_only"):
         return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
     if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
@@ -395,7 +401,7 @@ def write_response(
             return {"error": "thinking_envelope must be an object"}, 400
         missing = [f for f in _ENVELOPE_REQUIRED if not thinking_envelope.get(f)]
         if missing:
-            return {"error": f"thinking_envelope missing fields: {missing}"}, 400
+            return {"error": "thinking_envelope_missing_fields", "detail": missing}, 400
         if thinking_envelope["visibility"] not in ("shared", "local_only"):
             return {"error": "thinking_envelope.visibility must be 'shared' or 'local_only'"}, 400
         if thinking_envelope["visibility"] == "shared" and not thinking_envelope.get("K_enclave"):
@@ -422,6 +428,14 @@ def write_response(
     # user-visible message.
     if source not in {"chat", "live_activity", "heartbeat", "verify_ping", proactive_service.PROACTIVE_JOB_SOURCE}:
         return {"error": "invalid source"}, 400
+    # role: 消费者可声明 "system"（技术通知气泡，spec 2026-07-06-upstream-error-
+    # surfacing）。白名单外一律落 openclaw——新增 role 前先过 spec 的 role 审计表。
+    role = str(payload.get("role") or "openclaw").strip()
+    if role not in ("openclaw", "system"):
+        role = "openclaw"
+    notice_kind = ""
+    if role == "system":
+        notice_kind = str(payload.get("notice_kind") or "")[:64]
     # Gate the hidden "verify_ping" source to an actual pending probe. Because
     # source="verify_ping" rows are scrubbed from the visible transcript, an
     # ordinary reply that (mis)used this source would silently vanish while still
@@ -438,6 +452,8 @@ def write_response(
         "proactive_job_id": str(payload.get("proactive_job_id") or ""),
         **thinking_extra,
     }
+    if notice_kind:
+        extra["notice_kind"] = notice_kind
     if source == proactive_service.PROACTIVE_JOB_SOURCE:
         preview = (alert_body or push_body).strip()
         if preview:
@@ -446,7 +462,7 @@ def write_response(
             extra["push_body_preview"] = push_body.strip()[:240]
         extra["push_live_activity_requested"] = bool(payload.get("push_live_activity"))
     reply_to_message_id = _reply_to_message_id(payload)
-    if reply_to_message_id:
+    if reply_to_message_id and role != "system":
         _parent = _chat_message_by_id(store, reply_to_message_id)
         if _parent is not None and (
             _parent.get("reply_status") == "replied" or _parent.get("reply_message_id")
@@ -460,13 +476,13 @@ def write_response(
             # consumer_id is never rejected.)
             return {"error": "already_answered", "reply_status": "replied"}, 409
     msg = store.append_chat(
-        "openclaw",
+        role,
         source,
         envelope,
         content_type=content_type,
         extra=extra,
     )
-    if reply_to_message_id:
+    if reply_to_message_id and role != "system":
         store.update_chat_message_metadata(reply_to_message_id, {
             "reply_status": "replied",
             "reply_message_id": str(msg.get("id") or ""),

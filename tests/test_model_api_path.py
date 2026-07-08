@@ -1213,6 +1213,34 @@ def test_onboarding_greeting_for_unknown_name_asks_for_name(monkeypatch):
     assert "你想怎么叫我" in text
 
 
+def test_onboarding_greeting_uses_reliable_provider_call_with_extended_timeout(monkeypatch):
+    captured = {}
+
+    def raw_chat_completion(*args, **kwargs):
+        raise AssertionError("onboarding greeting should use reliable_chat_completion")
+
+    def fake_reliable_chat_completion(cfg, messages, **kwargs):
+        captured["kwargs"] = kwargs
+        return {"reply": "I have a first memory ready. What would you like to call me?", "usage": {}}
+
+    monkeypatch.setattr(provider_client, "chat_completion", raw_chat_completion)
+    monkeypatch.setattr(provider_client, "reliable_chat_completion", fake_reliable_chat_completion)
+
+    text, warnings = history_import._generate_model_api_onboarding_greeting(
+        provider_client.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
+        [{"role": "user", "content": "This is prior chat.", "source": "history_import"}],
+        [],
+        {"agent_name": "", "self_introduction": ""},
+        10,
+        "en",
+    )
+
+    assert warnings == []
+    assert text.startswith("I have a first memory ready")
+    assert captured["kwargs"]["max_tokens"] == 320
+    assert captured["kwargs"]["timeout"] == history_import.GENESIS_PROVIDER_DERIVE_TIMEOUT_SEC == 120.0
+
+
 def test_support_material_sections_split_character_and_personal_profile():
     payload = {
         "persona_filename": "combined.md",
@@ -1359,6 +1387,44 @@ def test_identity_without_ai_source_does_not_use_user_profile_as_companion(monke
     assert identity["agent_name"] == ""
     assert "Seven" not in identity["self_introduction"]
     assert "identity_guard_no_ai_source_used_generic_identity" in warnings
+
+
+def test_identity_deriver_uses_reliable_provider_call_with_extended_timeout(monkeypatch):
+    captured = {}
+
+    def raw_chat_completion(*args, **kwargs):
+        raise AssertionError("identity derivation should use reliable_chat_completion")
+
+    def fake_reliable_chat_completion(cfg, messages, **kwargs):
+        captured["kwargs"] = kwargs
+        return {
+            "reply": json.dumps({
+                "agent_name": "Mira",
+                "self_introduction": "I remember the small details and speak directly.",
+                "category": "Steady companion",
+                "signature": ["Keeps context", "Speaks plainly"],
+                "dimensions": [
+                    {"name": "Steady", "value": 82, "description": "The persona says Mira stays steady."}
+                ],
+            }),
+            "usage": {},
+        }
+
+    monkeypatch.setattr(provider_client, "chat_completion", raw_chat_completion)
+    monkeypatch.setattr(provider_client, "reliable_chat_completion", fake_reliable_chat_completion)
+
+    identity, warnings = history_import._derive_identity_with_provider(
+        provider_client.ProviderConfig("openai", "gpt-4.1-mini", "sk-test"),
+        [{"role": "user", "content": "AI persona: IO is steady and direct.", "source": "ai_persona_import"}],
+        [],
+        3,
+        "en",
+    )
+
+    assert warnings == []
+    assert identity["agent_name"] == "Mira"
+    assert captured["kwargs"]["max_tokens"] == 1800
+    assert captured["kwargs"]["timeout"] == history_import.GENESIS_PROVIDER_DERIVE_TIMEOUT_SEC == 120.0
 
 
 def test_support_materials_extract_chatgpt_memories_json_without_raw_artifacts():

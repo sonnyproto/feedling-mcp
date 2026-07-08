@@ -48,6 +48,26 @@ def _norm_provider(provider: str) -> str:
     return (provider or "").strip().lower().replace("-", "_")
 
 
+# Reasoning (provider "thinking") switch for gateway backends.
+# ``FEEDLING_AGENT_REASONING_EFFORT`` sets the effort ("high"/"medium"/"low");
+# "off"/"none"/"" disables reasoning entirely (no extra_body sent, i.e. the
+# pre-reasoning behaviour). Default is "off" while the end-to-end thinking path
+# is not yet verified — flip to "medium" (env or per-user) to enable. Note this
+# switch only governs whether reasoning is REQUESTED; it has nothing to do with
+# leak safety, which the consumer guarantees regardless.
+# Per-user override arrives via the roster entry's ``reasoning_effort`` so iOS
+# can later expose a per-account reasoning toggle without touching this code.
+_DEFAULT_REASONING_EFFORT = (os.environ.get("FEEDLING_AGENT_REASONING_EFFORT", "off") or "").strip().lower()
+_REASONING_OFF = {"", "off", "none", "no", "false", "0", "disabled"}
+
+
+def _resolve_reasoning_effort(entry_effort: str | None = None) -> str:
+    """Effective reasoning effort: per-user override wins, else the global
+    default. Returns "" when reasoning is disabled (no reasoning requested)."""
+    effort = (str(entry_effort or "").strip().lower()) or _DEFAULT_REASONING_EFFORT
+    return "" if effort in _REASONING_OFF else effort
+
+
 def gateway_model_id(user_id: str) -> str:
     """The LiteLLM ``model_name`` for this user — what codex requests (its
     config.toml ``model``). LiteLLM maps it to the real upstream model+key."""
@@ -70,7 +90,7 @@ def litellm_model_string(provider: str, model: str) -> str:
 
 def build_model_entry(
     *, user_id: str, provider: str, model: str, base_url: str = "",
-    supports_responses: bool = False,
+    supports_responses: bool = False, reasoning_effort: str | None = None,
 ) -> dict:
     """One LiteLLM ``model_list`` entry routing ``gw-<uid>`` to the real provider,
     keyed by an env reference (never the plaintext upstream key).
@@ -88,16 +108,20 @@ def build_model_entry(
     }
     normalized_provider = _norm_provider(provider)
     if normalized_provider == "openrouter":
-        # OpenRouter only returns provider reasoning when the request explicitly
-        # asks for it and does not exclude it from the response. Codex already
-        # asks for reasoning summaries on its side; this makes the gateway's
-        # upstream chat call carry the OpenRouter-native body shape too.
-        params["extra_body"] = {
-            "reasoning": {
-                "enabled": True,
-                "exclude": False,
-            },
-        }
+        # OpenRouter returns provider reasoning only when the request asks for it
+        # WITH a budget. ``enabled: true`` alone yields NO reasoning for
+        # Anthropic-family models (verified against openrouter) — an ``effort``
+        # (or token budget) is required. Gated by the reasoning switch (default
+        # "high"); "off" sends no reasoning. Non-reasoning models ignore it
+        # gracefully (no error), so this is safe across the openrouter model set.
+        effort = _resolve_reasoning_effort(reasoning_effort)
+        if effort:
+            params["extra_body"] = {
+                "reasoning": {
+                    "effort": effort,
+                    "exclude": False,
+                },
+            }
     if normalized_provider == "openai_compatible":
         # Codex speaks the OpenAI Responses wire (POST /v1/responses) ONLY. LiteLLM
         # treats provider=openai as natively Responses-capable (utils.get_provider_
@@ -129,6 +153,7 @@ def build_config(entries: list[dict]) -> dict:
                 user_id=e["user_id"], provider=e["provider"],
                 model=e.get("model") or "", base_url=e.get("base_url") or "",
                 supports_responses=bool(e.get("supports_responses", False)),
+                reasoning_effort=e.get("reasoning_effort"),
             )
             for e in entries
         ],

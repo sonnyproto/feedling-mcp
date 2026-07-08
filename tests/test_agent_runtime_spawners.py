@@ -33,6 +33,29 @@ def test_consumer_env_drives_resident_in_cli_mode_for_claude():
     assert env["PATH"] == "/bin" and env["FEEDLING_API_URL"] == "http://b:5001"  # base preserved
 
 
+def test_consumer_env_sets_tz_china_default_when_user_timezone_unknown():
+    # Hosted agent process tree must not inherit the CVM's UTC clock: an unknown
+    # user tz falls back to the China default so CN users don't perceive time 8h
+    # off. (u_no_tz is unregistered -> _get_user_timezone None -> default.)
+    env = spawners.consumer_env(
+        {"PATH": "/bin", "FEEDLING_API_URL": "http://b:5001"},
+        {"api_key": "fk", "provider_key": "sk-ant"},
+        user_id="u_no_tz", home="/agent-data/users/u_no_tz",
+    )
+    assert env["TZ"] == "Asia/Shanghai"
+
+
+def test_consumer_env_sets_tz_from_user_first_class_timezone(monkeypatch):
+    from accounts import registry
+    monkeypatch.setattr(registry, "_get_user_timezone", lambda uid: "America/New_York")
+    env = spawners.consumer_env(
+        {"PATH": "/bin", "FEEDLING_API_URL": "http://b:5001"},
+        {"api_key": "fk", "provider_key": "sk-ant"},
+        user_id="u_ny", home="/agent-data/users/u_ny",
+    )
+    assert env["TZ"] == "America/New_York"
+
+
 def test_consumer_env_uses_stream_json_for_deepseek_claude_thinking():
     env = spawners.consumer_env(
         {"PATH": "/bin"},
@@ -197,6 +220,10 @@ def test_build_container_argv_isolates_per_user():
     img = "ghcr.io/x/feedling-agent-runner:dev"
     assert img in argv
     assert argv.index(img) < argv.index("python")
+    # per-user ambient timezone passed by env reference, so the container clock
+    # isn't UTC (consumer_env sets TZ; the container whitelist must forward it)
+    assert "TZ" in argv
+    assert argv[argv.index("TZ") - 1] == "-e"
 
 
 def test_process_spawner_reaps_exited_child_not_zombie():

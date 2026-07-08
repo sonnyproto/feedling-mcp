@@ -375,7 +375,10 @@ def record_migrate_job_status(store, job: Mapping[str, Any], *, status: str, now
         state["last_migrate_failed_at"] = now_ts
     else:
         return state
-    return save_capture_state(store, state, now=now_ts)
+    state = save_capture_state(store, state, now=now_ts)
+    capture_jobs.notify_backoff(store, lane="migrate", status=status_text,
+                                streak=int(state.get("migrate_fail_streak") or 0))
+    return state
 
 
 def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now: float | None = None) -> dict[str, Any]:
@@ -407,6 +410,8 @@ def record_capture_job_status(store, job: Mapping[str, Any], *, status: str, now
         state["capture_fail_streak"] = int(state.get("capture_fail_streak") or 0) + 1
         state["last_capture_failed_at"] = now_ts
     state = save_capture_state(store, state, now=now_ts)
+    capture_jobs.notify_backoff(store, lane="capture", status=status_text,
+                                streak=int(state.get("capture_fail_streak") or 0))
     result = refresh_capture_state_from_chat(store, now=now_ts)
 
     import debug_trace  # local import avoids load-order cycle

@@ -47,6 +47,93 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-08
+
+### [DONE] 通知设施 Phase C（四个生产者接入 + consumer 分类器扩容）
+
+- **C1 genesis**：`backend/genesis/service.py::mark_failed`（蒸馏 job 整体
+  失败）先过 `catalog.classify_upstream(error)` 分类，未命中时兜底
+  `genesis_failed`；`apply_reducer_output` 统计记忆卡片丢弃数
+  （dropped>0）时 emit `genesis_partial`（warning），`backend/genesis/plaintext.py`
+  直传路径同样接线。两个 dedupe_key（`genesis:{job_id}` /
+  `genesis:{job_id}:partial`）共享 `genesis:` 前缀，新一轮 run 开始时统一
+  resolve 掉上一轮的失败/部分通知。
+- **C2 history_import**：`backend/hosted/history_import.py` 导入失败落
+  `import_failed`；job 卡在 queued/processing 超过阈值时的 stale 判定落
+  `import_stale`（均 error）。
+- **C3 memory**：`backend/proactive/capture_jobs.py` 新增退避统计入口，
+  capture/migrate/dream 三条 lane（`capture_scheduler.py` /
+  `dream_scheduler.py` 共用同一入口）在 streak ≥ 3
+  （`_BACKOFF_NOTICE_STREAK`，前两次退避噪音价值低不打扰）时 emit
+  `memory_backoff`（warning），lane 恢复 completed 时按 `memory_backoff:{lane}`
+  精确 resolve，不跨 lane 清。
+- **C4 runner/supervisor**：`backend/agent_runtime/supervisor.py` 新增
+  per-(user_id, error_class) 60s 去抖（`RUNNER_NOTICE_MIN_INTERVAL_SEC`，
+  默认 60s）+ never-raise 的 `_emit_runner_notice`/`_resolve_runner_notice`。
+  子进程拉起失败接 `runner_spawn_failed`；provider key 解密失败接
+  `runner_key_decrypt_failed`；runtime-token 刷新失败但进程仍存活接
+  `runner_degraded`（warning，唯一能 resolve 它的路径是 token 刷新恢复，
+  spawn 成功不清）。顺带补了 tick 里两处此前裸奔（无 try/except）的
+  spawn_fn 调用点，避免单用户异常连坐同批用户。
+- **消费者分类器扩容**：`backend/notices/catalog.py` 新增
+  `provider_incompatible`/`context_overflow`/`content_filtered` 3 类 chat
+  上游分类（与 `tools/chat_resident_consumer.py` 的 `_ERROR_CLASS_RULES` 同源，
+  `tests/test_catalog_consumer_parity.py` 锁一致）；新增
+  `catalog.classify_upstream()` 给 genesis 等 backend-only 生产者复用同一套
+  上游错误文本分类规则，未命中返回空串，由调用方兜底到各自专属
+  error_class。
+- **文档**：`docs/API_ERRORS.md` 新增「通知中心 error_class」一节，登记
+  上述 11 个新类的 blame/severity/触发场景——明确标注这是 `GET /v1/notices`
+  的 error_class 命名空间，与上面的 HTTP `{"error": slug}` 契约表不是一回事。
+- **部署注意**：C4 改的 `backend/agent_runtime/supervisor.py` 跑在 **runner
+  镜像**里（不是 backend 镜像）；本条改动涉及 `notices.emit`/`catalog` 的新
+  接口，**backend 与 runner 必须同批部署**，否则旧 backend 镜像里没有对应
+  接口会炸。
+- 全量基线：Phase C 前 2370 passed / 5 pre-existing failed → Phase C 后
+  `pytest tests/ -q --ignore=tests/test_api.py --ignore=tests/e2e_model_api_test.py`
+  跑出 **2398 passed / 4 skipped / 9 xfailed / 5 failed**（净新增 28 个通过
+  测试）；5 个失败逐一核对与 Phase C 前完全同一批（`test_chat_route_debug_trace.py`
+  ×3 + `test_debug_trace_event_route.py::test_emit_event_records` +
+  `test_memory_capture_trace.py::test_enqueue_duplicate_capture_key_does_not_emit_queued_event`），
+  未引入新回归。
+- 状态：**未部署、未 commit**（worktree `feedling-mcp-error-contract`，分支
+  `feat/error-contract`）。
+
+### [DONE] 通知设施 Phase B（backend/notices/ 包 + GET /v1/notices）
+
+- 新 `backend/notices/` 包（emit / resolve / list_notices）：系统错误的可回溯
+  通知面，明文存储于既有 `user_logs` 表的 `user_notices` stream（不建新表），
+  `item_key=dedupe_key` 做 upsert 去重；`emit`/`resolve` 绝不抛出（观测性设施
+  不得拖垮主流程）；`list_notices` 读侧额外按 `dedupe_key` 去重保留最新一条，
+  兑现契约「同 key 始终只有一条」，同时自愈 emit 读-改非原子 / DB 瞬时读失败
+  可能留下的重复未 resolved 行。
+- 新增 `GET /v1/notices` 快照读端点。
+- B4 场景字段已接线：provider `public_config.last_test_error` + onboarding
+  `model_api_test` step 的 `last_test_error`。
+- 范围：Task 1-3 完成；B3（chat 扇出门控）延后到
+  `feat/upstream-error-surfacing` 合入 main 之后再做。
+- 状态：**未部署、未 commit**（worktree `feedling-mcp-error-contract`，分支
+  `feat/error-contract`）。全分支终审已过（结论：可合并）。
+
+### [DONE] 统一错误信封 Phase A（api_error() helper + request_id 链路）
+
+- 新 `api_error()` helper（`backend/asgi/responses.py`）统一拼装
+  `{"error", "blame", "detail", "request_id"?}` 信封；`request_id` 生成/透传
+  链路打通：中间件生成 → 响应头 `X-Request-Id` 回带 → 日志 `rid` 字段 →
+  `internal_error`（500 兜底）body 必带同一个 id（其余 5xx 尽力而为，见
+  `docs/FRONTEND_ERROR_CONTRACT.md` §三）。
+- `RequestValidationError` 统一重塑成 400 `invalid_payload`（`detail` 带
+  `[{loc,msg}]`，替换掉裸 FastAPI 校验报文）。
+- 6 处自由文本错误收敛成 slug + detail（chat_core.py×3、memory_core.py×2、
+  actions.py×1）。
+- 新增 `docs/API_ERRORS.md`（全量 slug 契约表）+ 守卫测试锁关键 slug 不漂移；
+  `CONTRIBUTING.md` 新增 §7「错误返回纪律」（原 §7 不变量顺延为 §8、原 §8 PR
+  自查清单顺延为 §9）。
+- 状态：**未部署、未 commit**（worktree
+  `feedling-mcp-error-contract`，分支 `feat/error-contract`）。全分支终审
+  已过（结论：可合并），本条同时记录终审后的一批文档级修订（措辞/slug 名/
+  交叉引用号，不改后端代码、不改测试断言语义）。
+
 ## 2026-07-06
 
 ### [DONE] 仓库清理：陈旧文档删除 + ASGI 迁移收尾（§13.2/13.3 执行完毕）
@@ -834,7 +921,7 @@ CLI 工具，消灭"把 agent 当裸模型返 JSON"的双路。
   worker 跑）；重复创建用 `db.try_stamp_hosted_tick` 原子心跳槽 CAS 防住；
   `try_consume_pending_for_user` 作 `proactive` 通道 handler 跨 worker 即时认领。
 - **compose**：三个 compose `-w 1` → `-w 2`（先小、可灰度再提 N），注释更新；
-  改 compose 字面量会改 `compose_hash`，**部署需重新上链**（CONTRIBUTING §7 /
+  改 compose 字面量会改 `compose_hash`，**部署需重新上链**（CONTRIBUTING §8 /
   DEPLOYMENTS.md）。每 worker 约 +17 个 DB 连接（池 16 + listener 1），调大 `-w`
   前核对库 `max_connections`。
 - **验证**：本地 `gunicorn -w 2` 端到端——注册落一个 worker 后 whoami 40/40 全 200

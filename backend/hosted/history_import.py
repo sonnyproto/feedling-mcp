@@ -60,6 +60,8 @@ import provider_client
 from hosted import config_store as hosted_config_store
 from hosted import history_import_core
 from hosted import onboarding_validation as hosted_onboarding_validation
+from notices import core as notices
+from notices import catalog
 
 
 
@@ -70,6 +72,7 @@ def _history_job_kind(job_id: str) -> str:
 
 
 HISTORY_IMPORT_STALE_SEC = int(os.environ.get("FEEDLING_HISTORY_IMPORT_STALE_SEC", str(30 * 60)))
+GENESIS_PROVIDER_DERIVE_TIMEOUT_SEC = 120.0
 _HISTORY_IMPORT_PHASES = {
     "upload_received": (5, "Upload received"),
     "parsing_materials": (15, "Reading materials"),
@@ -191,6 +194,11 @@ def _history_import_find_reusable_job(
                 "error": "RuntimeError:stale_history_import_job",
             })
             _update_history_job_phase(store, job, "failed", status="failed")
+            notices.emit(store, source="history_import", error_class="import_stale",
+                         blame="system", severity="error",
+                         user_text=catalog.user_text_for("import_stale"),
+                         detail="stale_history_import_job",
+                         dedupe_key=f"history_import:{job.get('job_id')}")
             continue
         return job
     return None
@@ -2660,12 +2668,30 @@ def _normalize_identity_payload(raw, memories: list[dict], days: int, language: 
     return payload
 
 
+# ── DRAFT(措辞待 Seven 定稿):二次上传"部分补全"——当传入 existing_identity 时,派生是对
+# 【已有卡 + 新材料】的合并(新材料没提到的字段保留旧卡),而不是从零重派生(否则部分上传会把没
+# 提到的字段派成空/瞎补)。默认 None = 与 onboarding 逐字一致。英文,匹配本 prompt 的语言。
+# 行为需真机 e2e。见 docs/genesis-distill-panorama.md §9 / Seven 校准第 3 点。
+_IDENTITY_UPDATE_MERGE_TEMPLATE = (
+    "\n\nThis is an UPDATE to an EXISTING identity card, not a fresh derivation.\n"
+    "Existing card:\n{existing_identity_json}\n"
+    "Merge rules:\n"
+    "- For fields the new material ADDRESSES, use the new values (latest wins). On a SERIOUS "
+    "conflict, the new material wins — the user uploaded it to change the card.\n"
+    "- For fields the new material does NOT address, KEEP the existing card's values unchanged — "
+    "do not blank them and do not invent replacements.\n"
+    "- Keep the result COHERENT: if a trait / dimension changes, update self_introduction / "
+    "tone_style to match, so no stale description from the old card survives."
+)
+
+
 def _derive_identity_with_provider(
     provider: provider_client.ProviderConfig,
     messages: list[dict],
     memory_cards: list[dict],
     days: int,
     language: str = "en",
+    existing_identity: dict | None = None,
 ) -> tuple[dict, list[str]]:
     warnings: list[str] = []
     memory_sample = json.dumps(memory_cards[:40], ensure_ascii=False)
@@ -2710,8 +2736,12 @@ def _derive_identity_with_provider(
         f"days_with_user is {days}.\n\nSource stats:\n{json.dumps(source_stats, ensure_ascii=False)}"
         f"\n\nMemory cards:\n{memory_sample}\n\nTranscript sample:\n{transcript}"
     )
+    if isinstance(existing_identity, dict) and existing_identity:
+        prompt += _IDENTITY_UPDATE_MERGE_TEMPLATE.format(
+            existing_identity_json=json.dumps(existing_identity, ensure_ascii=False),
+        )
     try:
-        result = provider_client.chat_completion(
+        result = provider_client.reliable_chat_completion(
             provider,
             [
                 {"role": "system", "content": "You write concise, grounded Feedling identity JSON."},
@@ -2719,7 +2749,7 @@ def _derive_identity_with_provider(
             ],
             max_tokens=1800,
             temperature=0.3,
-            timeout=45.0,
+            timeout=GENESIS_PROVIDER_DERIVE_TIMEOUT_SEC,
         )
         identity = _normalize_identity_payload(core_util._json_from_model_text(result["reply"]), memory_cards, days, language)
         if not has_ai_persona and not has_assistant_history and not has_ai_memory:
@@ -2832,7 +2862,7 @@ def _generate_model_api_onboarding_greeting(
         + _transcript_sample(messages, max_chars=8000)
     )
     try:
-        result = provider_client.chat_completion(
+        result = provider_client.reliable_chat_completion(
             provider,
             [
                 {"role": "system", "content": "You are the user's IO companion writing one natural first message."},
@@ -2840,7 +2870,7 @@ def _generate_model_api_onboarding_greeting(
             ],
             max_tokens=320,
             temperature=0.7,
-            timeout=45.0,
+            timeout=GENESIS_PROVIDER_DERIVE_TIMEOUT_SEC,
         )
     except Exception as e:
         warnings.append(f"provider_onboarding_greeting_failed:{type(e).__name__}:{str(e)[:160]}")
@@ -3180,6 +3210,7 @@ def _process_history_import_sync(
         "onboarding_greeting_message_id": (greeting_row or {}).get("id", ""),
         "warnings": warnings,
     })
+    notices.resolve(store, "history_import:")
     return _update_history_job_phase(store, job, "completed", status="completed")
 
 
@@ -3211,6 +3242,11 @@ def _run_history_import_job(
             "error": f"{type(e).__name__}:{str(e)[:500]}",
         })
         _update_history_job_phase(store, job, "failed", status="failed")
+        notices.emit(store, source="history_import", error_class="import_failed",
+                     blame="system", severity="error",
+                     user_text=catalog.user_text_for("import_failed"),
+                     detail=f"{type(e).__name__}:{str(e)[:200]}",
+                     dedupe_key=f"history_import:{job_id}")
         print(f"[history_import:{store.user_id}] job={job_id} failed={type(e).__name__}:{str(e)[:220]}")
     finally:
         with _history_import_active_lock:

@@ -171,7 +171,7 @@ def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monk
     assert mock_post.call_args.kwargs["reply_to_message_id"] == "user-msg-v2"
 
 
-def test_process_messages_prompt_requests_visible_thinking_summary(monkeypatch):
+def test_process_messages_prompt_does_not_request_custom_thinking_summary(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     msg = {"id": "user-msg-thinking", "role": "user", "content": "刚才怎么没思考过程？", "ts": 1112.5}
@@ -186,10 +186,9 @@ def test_process_messages_prompt_requests_visible_thinking_summary(monkeypatch):
         result_ts = crc._process_messages([msg])
 
     assert result_ts == pytest.approx(1112.5)
-    assert '"thinking_summary"' in captured["message"]
-    assert '"messages"' in captured["message"]
-    assert "display-safe" in captured["message"]
-    assert "hidden chain-of-thought" in captured["message"]
+    assert '"thinking_summary"' not in captured["message"]
+    assert "display-safe" not in captured["message"]
+    assert "hidden chain-of-thought" not in captured["message"]
 
 
 def test_process_messages_v2_drops_needs_background_without_ack(monkeypatch):
@@ -650,8 +649,8 @@ def test_user_message_containing_verify_marker_is_not_short_circuited():
     mock_agent.assert_called_once()
     mock_post.assert_called_once()
     assert mock_post.call_args.args == ("here's why",)
-    assert mock_post.call_args.kwargs["thinking_summary"] == "参考了当前消息和最近对话上下文，整理成这次可见回复。"
-    assert mock_post.call_args.kwargs["thinking_source"] == "foreground_fallback"
+    assert "thinking_summary" not in mock_post.call_args.kwargs
+    assert "thinking_source" not in mock_post.call_args.kwargs
     assert result_ts == pytest.approx(4545.0)
 
 
@@ -875,7 +874,10 @@ def test_empty_content_no_decrypt_source_no_reply_no_fallback(monkeypatch):
 
 
 def test_agent_failure_posts_visible_fallback_by_default(monkeypatch):
-    """Agent backend failure must not silently drop a user turn."""
+    """Agent backend failure must not silently drop a user turn: the visible
+    fallback reply is still posted, and (new behavior) a separate system
+    notice carrying the technical reason is posted alongside it via
+    ``_notify_agent_turn_failure``."""
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
@@ -886,14 +888,84 @@ def test_agent_failure_posts_visible_fallback_by_default(monkeypatch):
             {"id": "agent-failure-1", "role": "user", "content": "msg1", "ts": 100.0}
         ])
 
-    mock_post.assert_called_once()
-    assert mock_post.call_args.args[0] == crc.FALLBACK_REPLY
-    assert mock_post.call_args.kwargs["reply_to_message_id"] == "agent-failure-1"
+    fallback_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") != "system"]
+    notice_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") == "system"]
+
+    # Original contract, unweakened: the user-visible fallback must still go out.
+    assert len(fallback_calls) == 1
+    assert fallback_calls[0].args[0] == crc.FALLBACK_REPLY
+    assert fallback_calls[0].kwargs["reply_to_message_id"] == "agent-failure-1"
+
+    # New contract: a suppressed-push system notice with the technical reason.
+    assert len(notice_calls) == 1
+    assert notice_calls[0].kwargs["notice_kind"] == "upstream_error"
+    assert notice_calls[0].kwargs["suppress_push"] is True
+    assert "agent down" in notice_calls[0].args[0]
+
+    assert mock_post.call_count == 2
     assert result_ts == pytest.approx(100.0)
 
 
+def test_no_error_notice_when_fallback_rejected_already_answered(monkeypatch):
+    """Failover 去重（Codex review）：claim 过期后另一家已回复，本家兜底被
+    already_answered 409 拒 → system 错误通知也必须一并压掉，不许出现
+    重复的技术错误气泡。通知只跟随被服务端接受的那次回复。"""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
+    monkeypatch.setattr(crc, "_report_runtime_error", lambda *a, **kw: True)
+    crc._reset_system_notice_state()
+    calls = []
+
+    def fake_post(reply, **kw):
+        calls.append((reply, kw))
+        if kw.get("role") == "system":
+            return {}
+        return {"error": "already_answered", "reply_status": "replied"}
+
+    with patch.object(crc, "call_agent", side_effect=RuntimeError("agent down")), \
+         patch.object(crc, "post_reply", side_effect=fake_post):
+        crc._process_messages([
+            {"id": "agent-failure-409-1", "role": "user", "content": "msg1", "ts": 100.0}
+        ])
+
+    # 兜底尝试发出但被拒；system 通知绝不能跟着发出去。
+    assert [kw.get("role") for _, kw in calls] == [None]
+
+
+def test_agent_failure_reported_even_with_fallback_disabled(monkeypatch):
+    """SEND_FALLBACK_ON_AGENT_ERROR=false 只关兜底话术，不关错误透出（Codex
+    review）：前台失败仍要发 system 通知 + 上报设置页 runtime_error，只是
+    没有 FALLBACK_REPLY、该回合照旧静默跳过。"""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", False)
+    reported = []
+    monkeypatch.setattr(crc, "_report_runtime_error",
+                        lambda *a, **kw: reported.append(a) or True)
+    crc._reset_system_notice_state()
+
+    with patch.object(crc, "call_agent", side_effect=RuntimeError("agent down")), \
+         patch.object(crc, "post_reply") as mock_post:
+        crc._process_messages([
+            {"id": "agent-failure-nofb-1", "role": "user", "content": "msg1", "ts": 100.0}
+        ])
+
+    # 没有兜底话术……
+    fallback_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") != "system"]
+    assert fallback_calls == []
+    # ……但 system 通知和设置页上报都要发。
+    notice_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") == "system"]
+    assert len(notice_calls) == 1
+    assert "agent down" in notice_calls[0].args[0]
+    assert len(reported) == 1
+
+
 def test_agent_failure_fallback_is_not_cooldown_suppressed(monkeypatch):
-    """Each failed user turn receives visible feedback instead of a silent cooldown drop."""
+    """Each failed user turn receives visible feedback instead of a silent cooldown
+    drop, and (new behavior) each also gets its own system notice — foreground
+    notices bypass the background debounce, so two failed turns yield two of
+    each kind of post_reply call, not one."""
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
@@ -905,8 +977,18 @@ def test_agent_failure_fallback_is_not_cooldown_suppressed(monkeypatch):
             {"id": "agent-failure-3", "role": "user", "content": "msg2", "ts": 102.0},
         ])
 
-    assert mock_post.call_count == 2
-    assert [call.args[0] for call in mock_post.call_args_list] == [crc.FALLBACK_REPLY, crc.FALLBACK_REPLY]
+    fallback_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") != "system"]
+    notice_calls = [c for c in mock_post.call_args_list if c.kwargs.get("role") == "system"]
+
+    assert [c.args[0] for c in fallback_calls] == [crc.FALLBACK_REPLY, crc.FALLBACK_REPLY]
+
+    assert len(notice_calls) == 2
+    for c in notice_calls:
+        assert c.kwargs["notice_kind"] == "upstream_error"
+        assert c.kwargs["suppress_push"] is True
+        assert "agent down" in c.args[0]
+
+    assert mock_post.call_count == 4
 
 
 def test_sanitize_reply_text_strips_leaks_and_duplicates():
@@ -1002,6 +1084,7 @@ def test_agent_turn_splits_tagged_thinking_from_cli_text():
 
     assert turn.messages == ["这是最终回复。"]
     assert turn.thinking_summary == "比较了用户最新问题和已有上下文。"
+    # Inlined <think> is display material, not provider-native reasoning.
     assert turn.thinking_kind == "provider_reasoning_summary"
     assert turn.thinking_source == "tagged_content"
     assert turn.thinking_native is False
@@ -1017,6 +1100,8 @@ def test_agent_turn_splits_reasoning_and_thought_tags_from_cli_text():
     assert turn.messages == ["好，我在。"]
     assert turn.thinking_summary == "先查记忆。\n再组织语气。"
     assert turn.thinking_kind == "provider_reasoning_summary"
+    assert turn.thinking_source == "tagged_content"
+    assert turn.thinking_native is False
 
 
 def test_extract_cli_output_prefers_structured_json_reply():
@@ -1698,11 +1783,6 @@ def test_process_proactive_wake_routes_through_agent_and_posts_metadata(monkeypa
         "source": crc.PROACTIVE_JOB_SOURCE,
         "gate_decision_id": "gd_1",
         "proactive_job_id": "pj_1",
-        "thinking_summary": "参考了当前消息和最近对话上下文，整理成这次可见回复。",
-        "thinking_kind": "agent_summary",
-        "thinking_source": "proactive_fallback",
-        "thinking_model": "",
-        "thinking_native": False,
     }
     assert any(s[:3] == ("pj_1", "realizing", "") for s in captured["statuses"])
     assert any(s[0] == "pj_1" and s[1] == "posted" for s in captured["statuses"])
@@ -2348,9 +2428,9 @@ def test_process_proactive_v2_wake_routes_without_gate_judgment(monkeypatch):
     assert "presence check" in captured["message"].lower()
     assert "presence check" in captured["message"]
     assert "equally valid" in captured["message"]
-    assert '"thinking_summary"' in captured["message"]
-    assert "display-safe" in captured["message"]
-    assert "hidden chain-of-thought" in captured["message"]
+    assert '"thinking_summary"' not in captured["message"]
+    assert "display-safe" not in captured["message"]
+    assert "hidden chain-of-thought" not in captured["message"]
     assert "Feedling Gate decided" not in captured["message"]
     assert "possible_connections" not in captured["message"]
     assert "wake_kind:" in captured["message"]
@@ -2416,8 +2496,6 @@ def test_process_proactive_malformed_json_reason_does_not_post(monkeypatch):
         "call_agent",
         lambda message, images=None, image_paths=None: {
             "messages": ['"reason":"用户一小时没回，该说的已经说了，继续给空间"\\n}\\n]\\n}'],
-            "thinking_summary": "判断这是一次主动唤醒，但不适合继续追问。",
-            "thinking_kind": "provider_reasoning_summary",
         },
     )
     monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_bad"})
@@ -2447,6 +2525,93 @@ def test_process_proactive_malformed_json_reason_does_not_post(monkeypatch):
     assert completed[-1][3]["extra"]["wake_result"] == "sleep"
 
 
+def test_process_proactive_malformed_speak_json_does_not_post_raw_protocol(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"statuses": [], "posted": []}
+
+    monkeypatch.setattr(
+        crc,
+        "call_agent",
+        lambda message, images=None, image_paths=None: (
+            '"messages": ["这句如果解析失败，不能把 JSON 协议原样发出去"]'
+        ),
+    )
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_leak"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: ({}, [], {}))
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_bad_speak_json",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 125.55,
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(125.55)
+    assert captured["posted"] == []
+    failed = [s for s in captured["statuses"] if s[1] == "failed"]
+    assert failed
+    assert failed[-1][2] == "empty_agent_reply"
+
+
+def test_process_proactive_fenced_sleep_action_does_not_post(monkeypatch):
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    captured = {"statuses": [], "posted": []}
+
+    monkeypatch.setattr(
+        crc,
+        "call_agent",
+        lambda message, images=None, image_paths=None: (
+            "```json\n"
+            "{\n"
+            '  "actions": [\n'
+            "    {\n"
+            '      "type": "proactive.sleep",\n'
+            '      "reason": "broadcast off, 53min since last check, empty signal board, likely focused or away"\n'
+            "    }\n"
+            "  ]\n"
+            "}\n"
+            "```"
+        ),
+    )
+    monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_leak"})
+    monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
+    monkeypatch.setattr(
+        crc,
+        "update_proactive_job_status",
+        lambda job_id, status, reason="", **kwargs: captured["statuses"].append((job_id, status, reason, kwargs)),
+    )
+    monkeypatch.setattr(crc, "_screen_context_for_frame_ids", lambda frame_ids: ("", [], []))
+    monkeypatch.setattr(crc, "recent_chat_context_for_proactive", lambda limit=None: "")
+    monkeypatch.setattr(crc, "_proactive_perception_digest", lambda: ({}, [], {}))
+
+    job = {
+        "schema_version": 2,
+        "job_id": "pj_fenced_sleep",
+        "source": crc.PROACTIVE_JOB_SOURCE,
+        "ts": 125.6,
+    }
+
+    assert crc._process_proactive_jobs([job]) == pytest.approx(125.6)
+    assert captured["posted"] == []
+    completed = [s for s in captured["statuses"] if s[1] == "completed"]
+    assert completed
+    assert completed[-1][2] == "broadcast off, 53min since last check, empty signal board, likely focused or away"
+    assert completed[-1][3]["extra"]["agent_action"] == "sleep"
+    assert completed[-1][3]["extra"]["wake_result"] == "sleep"
+
+
 def test_process_proactive_reason_only_result_marks_sleep_without_post(monkeypatch):
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
@@ -2458,8 +2623,6 @@ def test_process_proactive_reason_only_result_marks_sleep_without_post(monkeypat
         "call_agent",
         lambda message, images=None, image_paths=None: {
             "reason": "用户刚才没有继续互动，保持安静",
-            "thinking_summary": "主动唤醒评估后决定不继续打扰。",
-            "thinking_kind": "provider_reasoning_summary",
         },
     )
     monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_reason"})
@@ -2581,9 +2744,9 @@ def test_message_for_introduction_job_uses_post_respawn_prompt():
     message = crc._message_for_introduction_job({"job_kind": "introduction"})
 
     assert "首次登场" in message
-    assert '"thinking_summary"' in message
-    assert "display-safe" in message
-    assert "hidden chain-of-thought" in message
+    assert '"thinking_summary"' not in message
+    assert "display-safe" not in message
+    assert "hidden chain-of-thought" not in message
     assert "identity.profile_patch" in message
     assert "self_introduction" in message
     assert "signature" in message
@@ -2591,16 +2754,16 @@ def test_message_for_introduction_job_uses_post_respawn_prompt():
     assert "别编不存在的共同经历" in message
 
 
-def test_screen_watch_message_requests_visible_thinking_summary():
+def test_screen_watch_message_does_not_request_custom_thinking_summary():
     message = crc._screen_watch_message(
         {"trigger": "screen_watch", "job_kind": "screen_watch", "broadcast_state": "on"},
         screen_text="screen_context: 用户在看聊天记录",
         chat_context=crc.ProactiveChatContext(text=""),
     )
 
-    assert '"thinking_summary"' in message
-    assert "display-safe" in message
-    assert "hidden chain-of-thought" in message
+    assert '"thinking_summary"' not in message
+    assert "display-safe" not in message
+    assert "hidden chain-of-thought" not in message
     assert "screen_context: 用户在看聊天记录" in message
 
 
@@ -3199,7 +3362,7 @@ def test_agent_turn_classifies_runtime_json_without_leaking_debug():
     assert "permission_denials" not in turn.messages[0]
 
 
-def test_agent_turn_extracts_visible_thinking_summary_from_nested_result():
+def test_agent_turn_ignores_custom_thinking_summary_from_nested_result():
     raw = json.dumps(
         {
             "type": "result",
@@ -3219,11 +3382,11 @@ def test_agent_turn_extracts_visible_thinking_summary_from_nested_result():
     turn = crc._split_agent_turn(raw)
 
     assert turn.messages == ["我只显示最终回复。"]
-    assert turn.thinking_summary == "参考了最近对话。\n整理了可见上下文。"
+    assert turn.thinking_summary == ""
     assert "uuid" in turn.runtime_debug
 
 
-def test_agent_turn_extracts_bare_visible_thinking_summary_fragment():
+def test_agent_turn_drops_bare_custom_thinking_summary_fragment():
     raw = (
         '"thinking_summary": "用户再次确认模型身份，直接给出真实答案",\n'
         '"messages": ["宝贝，还是那句话——我的底层是 `anthropic/claude-sonnet-4.5`。"]'
@@ -3231,13 +3394,11 @@ def test_agent_turn_extracts_bare_visible_thinking_summary_fragment():
 
     turn = crc._split_agent_turn(raw)
 
-    assert turn.messages == ["宝贝，还是那句话——我的底层是 `anthropic/claude-sonnet-4.5`。"]
-    assert turn.thinking_summary == "用户再次确认模型身份，直接给出真实答案"
-    assert "thinking_summary" not in turn.messages[0]
-    assert "messages" not in turn.messages[0]
+    assert turn.messages == []
+    assert turn.thinking_summary == ""
 
 
-def test_agent_turn_extracts_bare_visible_thinking_summary_fragment_with_trailing_brace():
+def test_agent_turn_drops_bare_custom_thinking_summary_fragment_with_trailing_brace():
     raw = (
         '"thinking_summary": "注意到57秒前关于模型身份的回答有误，决定简短纠正",\n'
         '"messages": [\n'
@@ -3249,16 +3410,30 @@ def test_agent_turn_extracts_bare_visible_thinking_summary_fragment_with_trailin
 
     turn = crc._split_agent_turn(raw)
 
-    assert turn.messages == [
-        "啧，刚才说错了。",
-        "我是 anthropic/claude-sonnet-4.5，不是 gpt 那个。",
-    ]
-    assert turn.thinking_summary == "注意到57秒前关于模型身份的回答有误，决定简短纠正"
-    assert all("thinking_summary" not in message for message in turn.messages)
-    assert all('"messages"' not in message for message in turn.messages)
+    assert turn.messages == []
+    assert turn.thinking_summary == ""
 
 
-def test_agent_turn_extracts_visible_thinking_summary_from_text_block():
+def test_agent_turn_keeps_prose_reply_opening_with_quoted_protocol_word():
+    # An ordinary reply that merely opens with a quoted word like "messages"
+    # must NOT be mistaken for a protocol fragment and dropped.
+    raw = '"messages" 这个词在这里是普通散文，不是 JSON 协议。'
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ['"messages" 这个词在这里是普通散文，不是 JSON 协议。']
+
+
+def test_agent_turn_drops_bare_messages_protocol_fragment_with_space_before_colon():
+    # A real protocol fragment (key + colon, even with a space) is still dropped.
+    raw = '"messages" : ["晚安啦，早点睡。"]'
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == []
+
+
+def test_agent_turn_extracts_native_thinking_from_content_block_and_messages_from_text_block():
     raw = {
         "choices": [
             {
@@ -3288,29 +3463,11 @@ def test_agent_turn_extracts_visible_thinking_summary_from_text_block():
     turn = crc._agent_turn_from_raw(raw)
 
     assert turn.messages == ["没干嘛，就在这儿待着呢。"]
-    assert turn.thinking_summary == "判断用户是在随口问我在干嘛。"
-    assert turn.thinking_kind == "agent_summary"
+    assert turn.thinking_summary == "The user is asking a casual check-in."
+    assert turn.thinking_kind == "provider_reasoning"
+    assert turn.thinking_native is True
     assert "thinking_summary" not in turn.messages[0]
     assert "messages" not in turn.messages[0]
-
-
-def test_ensure_visible_thinking_summary_fallback_for_plain_reply():
-    turn = crc.AgentTurn(messages=["嘿，看见了。周六深夜还醒着，我陪你。"])
-
-    out = crc._ensure_visible_thinking_summary(turn, source="foreground_fallback")
-
-    assert out.thinking_summary == "参考了当前消息和最近对话上下文，整理成这次可见回复。"
-    assert out.thinking_kind == "agent_summary"
-    assert out.thinking_source == "foreground_fallback"
-    assert out.thinking_native is False
-
-
-def test_ensure_visible_thinking_summary_does_not_touch_action_only_turn():
-    turn = crc.AgentTurn(actions=[{"type": "proactive.sleep", "reason": "不打扰"}])
-
-    out = crc._ensure_visible_thinking_summary(turn, source="proactive_fallback")
-
-    assert out.thinking_summary == ""
 
 
 def test_agent_turn_extracts_claude_stream_json_thinking_blocks():
@@ -3425,7 +3582,8 @@ def test_message_for_proactive_job_instructs_multi_bubble_without_gate_context()
     )
 
     assert "a few short bubbles" in message
-    assert '{"thinking_summary":"...","messages":["..."]}' in message
+    assert '{"messages":["..."]}' in message
+    assert "thinking_summary" not in message
     assert "recent_chat_context" in message
     assert "possible_connections" not in message
     assert "Feedling Gate decided" not in message
@@ -3730,7 +3888,7 @@ def test_call_agent_cli_codex_extracts_agent_message_not_handshake(monkeypatch):
 def test_call_agent_http_openai_preserves_reasoning_content(monkeypatch):
     """DeepSeek/OpenAI-compatible reasoning can arrive on message.reasoning_content.
     The HTTP adapter must keep the structured body so _process_messages can post
-    it as thinking_summary instead of collapsing the turn to a plain reply.
+    it through the internal thinking channel instead of collapsing the turn to a plain reply.
     """
     monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://agent.local/v1/chat/completions")
     monkeypatch.setattr(crc, "AGENT_HTTP_PROTOCOL", "openai")
@@ -3851,7 +4009,7 @@ def test_call_agent_cli_codex_0142_routes_reasoning_to_thinking_not_bubble(monke
 
 def test_call_agent_cli_codex_actions_reply_preserved_with_reasoning(monkeypatch):
     """A codex agent_message that is itself an actions JSON keeps its actions
-    while reasoning is folded into the thinking summary (no bubble leak)."""
+    while native reasoning is folded into the internal thinking channel (no bubble leak)."""
     monkeypatch.setattr(
         crc,
         "AGENT_CLI_CMD",

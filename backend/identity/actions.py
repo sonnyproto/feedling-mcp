@@ -365,6 +365,69 @@ def _identity_relationship_days_set(store: UserStore, action: dict) -> tuple[dic
     }, [effect], 200
 
 
+def _replace_relationship_anchor(action: dict) -> dict:
+    """B2: build a relationship anchor from an identity.replace action ONLY when it carries
+    an explicit relationship time (translating days_with_user → an ISO start date). The
+    service layer applies the legality guard (valid date + evidence); an empty dict here
+    means 'preserve the existing anchor'."""
+    evidence = str(action.get("relationship_anchor_evidence") or "").strip()
+    started = str(action.get("relationship_started_at") or "").strip()
+    if not started:
+        days = action.get("days_with_user")
+        if isinstance(days, bool) or not isinstance(days, int) or days < 0:
+            return {}
+        from datetime import date, timedelta
+        started = (date.today() - timedelta(days=days)).isoformat()
+    if not started or not evidence:
+        return {}
+    return {
+        "relationship_started_at": started,
+        "relationship_anchor_source": "genesis_resident_distill",
+        "relationship_anchor_evidence": evidence,
+    }
+
+
+def _identity_replace_action(
+    store: UserStore, api_key: str | None, action: dict, *, runtime_token: str = ""
+) -> tuple[dict, list[dict], int]:
+    """Full-card identity replace, server-build (reuses genesis
+    ``replace_identity_preserving_anchor`` — server builds the shared envelope, agent sends
+    plaintext). Used by the VPS resident-distill path when the agent locally re-derives
+    identity from a persona doc. The relationship anchor is preserved unless the action
+    carries an explicit relationship time (B2, see ``_replace_relationship_anchor``).
+
+    HIGH-RISK (full overwrite) — gated so it is NOT a normal agent action (Codex P1):
+      * server-build only: payload must NOT carry an `envelope`;
+      * must run inside a resident-distill job context: `source=genesis_resident_distill`
+        + `job_id` + `reason`, and that job must belong to the caller and be a live resident
+        job (status=processing, resident_consumer_id set).
+    """
+    if action.get("envelope") is not None:
+        return {"status": "error", "error": "envelope_not_allowed", "action": "identity.replace"}, [], 400
+    source = str(action.get("source") or "").strip()
+    job_id = str(action.get("job_id") or "").strip()
+    reason = str(action.get("reason") or "").strip()
+    if source != "genesis_resident_distill" or not job_id or not reason:
+        return {"status": "error", "error": "identity_replace_requires_resident_distill_context",
+                "action": "identity.replace"}, [], 403
+    import db  # lazy — avoid import cycle
+    job = db.genesis_get_job(store.user_id, job_id)
+    if not job or job.get("status") != "processing" or not str(job.get("resident_consumer_id") or "").strip():
+        return {"status": "error", "error": "not_a_live_resident_distill_job",
+                "action": "identity.replace"}, [], 403
+    identity_payload = action.get("identity")
+    if not isinstance(identity_payload, dict) or not identity_payload:
+        return {"status": "error", "error": "identity_required", "action": "identity.replace"}, [], 400
+    from genesis import service as genesis_service  # lazy — avoid import cycle
+    result = genesis_service.replace_identity_preserving_anchor(
+        store, {"identity": identity_payload, "relationship_anchor": _replace_relationship_anchor(action)}
+    )
+    if result != "updated":
+        status = 409 if result in ("identity_not_initialized", "identity_update_empty", "not_provided") else 400
+        return {"status": "error", "error": result, "action": "identity.replace"}, [], status
+    return {"status": "ok", "action": "identity.replace", "job_id": job_id}, [], 200
+
+
 def _execute_identity_action(
     store: UserStore,
     api_key: str | None,
@@ -381,6 +444,8 @@ def _execute_identity_action(
         return _identity_dimension_nudge(store, api_key, action, runtime_token=runtime_token)
     if action_type == "identity.relationship_days_set":
         return _identity_relationship_days_set(store, action)
+    if action_type == "identity.replace":
+        return _identity_replace_action(store, api_key, action, runtime_token=runtime_token)
     return {
         "status": "error",
         "error": "unsupported_identity_action",
@@ -389,6 +454,7 @@ def _execute_identity_action(
             "identity.profile_patch",
             "identity.dimension_nudge",
             "identity.relationship_days_set",
+            "identity.replace",
         ],
     }, [], 400
 

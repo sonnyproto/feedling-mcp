@@ -263,6 +263,7 @@ def model_api_runtime_status(store, *, api_key: str | None) -> tuple[dict, int]:
         "last_action_trace_at": profile.get("last_action_trace_at", ""),
         "last_action_trace_status": (latest_trace or {}).get("status", ""),
         "last_runtime_error": profile.get("last_runtime_error", ""),
+        "last_runtime_error_class": profile.get("last_runtime_error_class", ""),
     }, 200
 
 

@@ -87,6 +87,7 @@ Optional:
 """
 
 import base64
+from collections import namedtuple
 from dataclasses import dataclass, field
 import hashlib
 import inspect
@@ -367,6 +368,161 @@ def _note_provider_payment_failure() -> None:
 def _clear_provider_payment_cooldown() -> None:
     global _provider_payment_cooldown_until
     _provider_payment_cooldown_until = 0.0
+
+# --- agent turn error classification (spec: docs/superpowers/specs/
+# 2026-07-06-upstream-error-surfacing-design.md) ---------------------------
+# error_class → 用户话术；blame 决定话术能不能给行动指引：
+#   user_provider      → 可以让用户去充值/改 key/改模型名
+#   provider_transient → 上游临时问题，等它自己恢复
+#   system             → 我们的问题，绝不能引导用户改配置（会误导，见 dded 案例）
+AgentErrorNotice = namedtuple("AgentErrorNotice", "error_class blame user_text detail")
+
+_ERROR_CLASS_RULES = (
+    # 次序即优先级：quota 必须先于 auth/rate（403+「额度」语义是余额不是权限）
+    ("quota_insufficient", "user_provider",
+     "你的 API 服务额度不足，充值后再发消息即可恢复。",
+     re.compile(r"余额|额度|insufficient_quota|credit balance|requires more credits"
+                r"|payment required|\b402\b|quota", re.I)),
+    ("auth_invalid", "user_provider",
+     "API Key 无效或已过期，请到设置里重新保存。",
+     re.compile(r"invalid ?(x-)?api.?key|unauthorized|authentication|\b401\b", re.I)),
+    ("model_not_found", "user_provider",
+     "模型名不可用，请检查设置里的模型名。",
+     re.compile(r"invalid model name|model_not_found|no such model", re.I)),
+    ("provider_incompatible", "user_provider",
+     "当前模型不支持这次请求用到的能力，换个模型或到设置里调整。",
+     re.compile(r"unknown variant|not supported|unsupported (parameter|tool)"
+                r"|invalid_request_error.*tool", re.I)),
+    ("context_overflow", "user_provider",
+     "这次对话太长超出了模型上限，可精简后再试。",
+     re.compile(r"context.{0,20}(length|window)|maximum context"
+                r"|too many tokens|prompt is too long", re.I)),
+    ("content_filtered", "provider_transient",
+     "这次回复被模型的内容策略拦下了，换个说法再试。",
+     re.compile(r"content_filter|content policy|safety|blocked by", re.I)),
+    ("rate_limited", "provider_transient",
+     "你的 API 服务限流了，稍等几分钟再试。",
+     re.compile(r"\b429\b|too many requests|rate.?limit", re.I)),
+    ("upstream_unavailable", "provider_transient",
+     "你的模型服务暂时不可用，稍后会自动恢复。",
+     re.compile(r"\b5\d{2}\b|overloaded|timed? ?out|connection (refused|reset|error)"
+                r"|unreachable|stream disconnected", re.I)),
+)
+
+# 机读全集导出，供 backend/notices/catalog.py 的一致性测试比对（spec Phase B /
+# B3）：_ERROR_CLASS_RULES 里的 8 类 + classify_agent_error 硬编码分支里的
+# turn_timeout / reply_parse_failed / model_not_found（裸 404+model）/ unknown。
+# 只是把已有分类逻辑的 error_class 取值收成集合，不改分类逻辑本身。
+CONSUMER_ERROR_CLASSES = frozenset(
+    {klass for klass, _blame, _text, _pat in _ERROR_CLASS_RULES}
+    | {"turn_timeout", "reply_parse_failed", "model_not_found", "unknown"}
+)
+
+
+def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
+    """三层错误来源（claude/codex CLI 经 _cli_error_detail、stderr 兜底）已汇聚成
+    异常文本；这里只做只读分类，永不抛出。"""
+    detail = str(exc)[:200]
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return AgentErrorNotice("turn_timeout", "system",
+                                "这轮回复超时了，稍后再试。", detail)
+    text = str(exc)
+    if "no usable reply" in text:
+        return AgentErrorNotice("reply_parse_failed", "system",
+                                "系统处理回复时出了问题，我们会尽快排查。", detail)
+    lowered = text.lower()
+    # 404 需与 model 同现才算模型错（裸 404 归 upstream_unavailable 太粗、归 auth 又错）
+    if re.search(r"\b404\b", text) and "model" in lowered:
+        return AgentErrorNotice("model_not_found", "user_provider",
+                                "模型名不可用，请检查设置里的模型名。", detail)
+    for klass, blame, user_text, pat in _ERROR_CLASS_RULES:
+        if pat.search(text):
+            return AgentErrorNotice(klass, blame, user_text, detail)
+    return AgentErrorNotice("unknown", "system", "连接模型服务时出了问题。", detail)
+
+
+def _system_notice_body(notice: AgentErrorNotice) -> str:
+    return f"⚠️ {notice.user_text}\n详情: {notice.detail}"
+
+
+# system 通知去抖：前台必发；后台同 error_class 每 SYSTEM_NOTICE_DEBOUNCE_SEC 一条，
+# 任一成功回合清零（恢复后再坏要重新提醒）。进程内存态即可——respawn 顶多多发一条。
+SYSTEM_NOTICE_DEBOUNCE_SEC = float(os.environ.get("SYSTEM_NOTICE_DEBOUNCE_SEC", "21600"))
+_system_notice_last_sent: dict[str, float] = {}
+# 每进程首个成功回合无条件清一次设置页错误（代价一次 HTTP），覆盖 respawn 前留下的滞留错误：
+# respawn 后新进程从 False 起步则永远不会触发清空，导致用户修好配置后 last_runtime_error 仍滞留。
+_runtime_error_reported = True
+
+# 组件2：call_agent 清洗为空时（SEND_FALLBACK_ON_AGENT_ERROR=true）不抛异常，
+# 靠这个模块级标记让前台调用方知道本轮其实失败了，要补发 reply_parse_failed 通知。
+# 每次成功读取（前台 else 分支）后立即清零。
+_turn_reply_parse_failed = False
+
+
+def _consume_reply_parse_failed() -> bool:
+    """读取并清零清洗失败标记。call_agent 是多车道共享的，标记只对"刚刚这一次
+    调用"有意义——谁调用谁消费，绝不许悬挂到别的车道/回合（审查发现的串扰源）。"""
+    global _turn_reply_parse_failed
+    was = _turn_reply_parse_failed
+    _turn_reply_parse_failed = False
+    return was
+
+
+def _reset_system_notice_state() -> None:
+    _system_notice_last_sent.clear()
+
+
+def _report_runtime_error(error: str, error_class: str = "") -> bool:
+    """腿②：设置页 last_runtime_error。失败只 log（观测性不影响回合）。
+
+    只有请求真正落到服务端（2xx，或 404=无 profile 可清）才更新
+    ``_runtime_error_reported``——传输失败/5xx 时保留原标记，让下一个成功
+    回合重试清空，否则设置页会一直挂着过期错误直到下次失败或 respawn。"""
+    global _runtime_error_reported
+    try:
+        resp = httpx.post(
+            f"{FEEDLING_API_URL}/v1/model_api/runtime_error",
+            json={"error": (error or "")[:300], "error_class": (error_class or "")[:64]},
+            headers=_HEADERS, timeout=10,
+        )
+        if resp.status_code != 404:
+            resp.raise_for_status()
+        _runtime_error_reported = bool(error)
+        return True
+    except Exception as e:
+        log.warning("runtime_error report failed (non-fatal): %s", e)
+        return False
+
+
+def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
+    """腿①+②：分类 → 上报设置页 → （前台必发/后台去抖）聊天 system 通知。
+
+    永不抛出：通知是回合失败的旁路，绝不能让它把失败变得更糟。"""
+    try:
+        notice = classify_agent_error(exc)
+        _report_runtime_error(notice.detail, notice.error_class)
+        last = _system_notice_last_sent.get(notice.error_class)
+        if not foreground and last is not None and (time.monotonic() - last) < SYSTEM_NOTICE_DEBOUNCE_SEC:
+            return
+        post_reply(
+            _system_notice_body(notice),
+            role="system", notice_kind="upstream_error", suppress_push=True,
+        )
+        _system_notice_last_sent[notice.error_class] = time.monotonic()
+    except Exception:
+        log.exception("system notice emit failed (non-fatal)")
+
+
+def _note_agent_turn_success() -> None:
+    """成功回合：重置去抖 + 清空设置页错误（仅当本进程报过错，省一次 HTTP）。
+
+    标记翻转在 _report_runtime_error 内部、且仅在清空真正送达时发生——
+    这里不再无条件翻 False（Codex P2：清空 POST 失败会让过期错误滞留且
+    永不重试）。清空失败 → 标记保留 → 下个成功回合自动重试。"""
+    _reset_system_notice_state()
+    if _runtime_error_reported:
+        _report_runtime_error("", "")
+
 
 # Prompt routed only when an agent entry cannot receive a native image object.
 # The consumer still extracts decrypted image bytes and passes them through
@@ -1550,12 +1706,6 @@ _JSON_THINKING_FIELDS = (
     "reasoning_content",
     "reasoning_text",
     "runtime_trace",
-    "thinking_summary",
-    "reasoning_summary",
-    "thought_summary",
-    "visible_reasoning",
-    "thinkingSummary",
-    "reasoningSummary",
 )
 
 _JSON_RUNTIME_DEBUG_FIELDS = {
@@ -1709,38 +1859,40 @@ def _looks_like_json_text(text: str) -> bool:
     return bool(stripped) and stripped[0] in "[{"
 
 
-def _visible_reply_fragment_from_text(text: str) -> Any:
-    """Recover the display protocol when the model omits the outer braces.
-
-    Some providers follow the requested
-    {"thinking_summary":"...","messages":["..."]} shape only halfway and emit
-    a JSON object fragment like `"thinking_summary": "...", "messages": [...]`.
-    If we do not recover it here, the protocol text leaks as the visible chat
-    bubble. Keep this narrow: only the visible thinking protocol keys qualify.
-    """
+def _markdown_fenced_json_body(text: str) -> str:
     stripped = (text or "").strip()
-    if not stripped or stripped[0] in "[{":
-        return None
-    if '"thinking_summary"' not in stripped or '"messages"' not in stripped:
-        return None
+    match = re.match(r"^```(?P<lang>[a-zA-Z0-9_-]*)\s*(?P<body>.*?)\s*```$", stripped, re.DOTALL)
+    if not match:
+        return ""
+    lang = (match.group("lang") or "").strip().lower()
+    body = (match.group("body") or "").strip()
+    if lang and lang != "json":
+        return ""
+    if not _looks_like_json_text(body):
+        return ""
+    return body
+
+
+def _looks_like_agent_protocol_text(text: str) -> bool:
+    """Detect malformed agent-control JSON so it can be dropped, not shown."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", stripped, re.IGNORECASE | re.DOTALL)
     if fence:
         stripped = fence.group(1).strip()
-    starts = [idx for key in ('"thinking_summary"', '"messages"') if (idx := stripped.find(key)) >= 0]
-    if not starts:
-        return None
-    fragment = stripped[min(starts):].strip().rstrip(",")
-    candidates = ["{" + fragment + "}"]
-    if fragment.endswith("}"):
-        candidates.append("{" + fragment)
-    parsed = None
-    for candidate in candidates:
-        parsed = _safe_json_loads(candidate)
-        if isinstance(parsed, dict) and isinstance(parsed.get("messages"), list):
-            break
-    if isinstance(parsed, dict) and isinstance(parsed.get("messages"), list):
-        return parsed
-    return None
+    if stripped.lower().startswith("json\n"):
+        stripped = stripped[5:].strip()
+    protocol_keys = ('"messages"', '"actions"', '"tool_calls"', '"thinking_summary"')
+    if not any(key in stripped for key in protocol_keys):
+        return False
+    # A bare protocol fragment is a key immediately followed by a colon
+    # (`"messages":` / `"messages" :`). Requiring the colon avoids dropping an
+    # ordinary reply that merely opens with a quoted word like "messages".
+    starts_with_protocol_field = any(
+        re.match(rf"^{re.escape(key)}\s*:", stripped) for key in protocol_keys
+    )
+    return stripped[:1] in "[{" or starts_with_protocol_field
 
 
 def _sanitize_thinking_summary(text: str) -> str:
@@ -1844,35 +1996,13 @@ def _thinking_summary_from_value(value: Any) -> str:
     return ""
 
 
-def _ensure_visible_thinking_summary(turn: AgentTurn, *, source: str) -> AgentTurn:
-    """Attach a conservative visible-summary fallback for user-facing replies.
-
-    Some runtimes spend reasoning tokens but do not expose a displayable
-    reasoning event or follow the JSON thinking protocol. The UI still expects a
-    collapsible summary, so provide a short, honest context summary without
-    inventing hidden chain-of-thought.
-    """
-    if turn.thinking_summary or not turn.messages:
-        return turn
-    turn.thinking_summary = _sanitize_thinking_summary(
-        "参考了当前消息和最近对话上下文，整理成这次可见回复。"
-    )
-    turn.thinking_kind = "agent_summary"
-    turn.thinking_source = _sanitize_thinking_meta(source, max_len=80) or "resident_fallback"
-    turn.thinking_native = False
-    return turn
-
-
 def _merge_agent_turn(dst: AgentTurn, src: AgentTurn) -> AgentTurn:
     dst.actions.extend(src.actions)
     dst.messages.extend(src.messages)
     dst.tool_calls.extend(src.tool_calls)
     prefer_src_thinking = bool(src.thinking_summary) and (
         not dst.thinking_summary
-        or (
-            src.thinking_kind == "agent_summary"
-            and dst.thinking_kind == "provider_reasoning"
-        )
+        or (src.thinking_native is True and dst.thinking_native is not True)
     )
     if prefer_src_thinking:
         dst.thinking_summary = src.thinking_summary
@@ -1936,9 +2066,6 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         raw = obj.strip()
         if not raw:
             return turn
-        visible_fragment = _visible_reply_fragment_from_text(raw)
-        if visible_fragment is not None:
-            return _agent_turn_from_obj(visible_fragment)
         json_objects = _json_objects_from_cli_output(raw)
         if json_objects:
             for item in json_objects:
@@ -1950,10 +2077,19 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
             return _agent_turn_from_obj(nested)
         raw, tagged_thinking = _split_tagged_thinking(raw)
         if tagged_thinking:
+            # Some runtimes inline their reasoning as <think>…</think> in the
+            # final text. Per the original design this is NOT provider-native
+            # reasoning, but it is useful display material — keep it as a
+            # non-native fallback (provider_reasoning_summary) so a genuine
+            # provider-native reasoning always wins in _merge_agent_turn.
             turn.thinking_summary = _sanitize_thinking_summary(tagged_thinking)
             turn.thinking_kind = "provider_reasoning_summary"
             turn.thinking_source = "tagged_content"
             turn.thinking_native = False
+            if not raw.strip():
+                return turn
+        if _looks_like_agent_protocol_text(raw):
+            return turn
         clean = _sanitize_reply_text(raw)
         if clean:
             turn.messages.append(clean)
@@ -2162,6 +2298,10 @@ def _json_objects_from_cli_output(raw: str) -> list[Any]:
     if not raw:
         return []
 
+    fenced = _markdown_fenced_json_body(raw)
+    if fenced:
+        raw = fenced
+
     try:
         return [json.loads(raw)]
     except (json.JSONDecodeError, TypeError):
@@ -2273,9 +2413,7 @@ def _codex_reply_from_stream(raw: str) -> str:
 
 
 def _codex_attach_reasoning(reply: str, reasoning: str) -> str:
-    """Fold codex reasoning-summary text into the reply payload as a thinking
-    summary so the resident routes it to the collapsible disclosure instead of
-    leaking it as a chat bubble.
+    """Fold native codex reasoning events into provider_reasoning metadata.
 
     The reply's own JSON shape is preserved when present (a codex
     ``agent_message`` is often an ``{"actions":[...]}`` / ``{"messages":[...]}``
@@ -2292,10 +2430,10 @@ def _codex_attach_reasoning(reply: str, reasoning: str) -> str:
         payload = {"messages": parsed}
     else:
         payload = {"messages": [reply]}
-    payload.setdefault("thinking_summary", reasoning)
-    payload.setdefault("thinking_kind", "provider_reasoning_summary")
-    payload.setdefault("thinking_source", "codex_reasoning")
-    payload.setdefault("thinking_native", True)
+    payload.setdefault("provider_reasoning", reasoning)
+    payload.setdefault("reasoning_kind", "provider_reasoning_summary")
+    payload.setdefault("reasoning_source", "codex_reasoning")
+    payload.setdefault("reasoning_native", True)
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -3421,6 +3559,8 @@ def call_agent(
             log.debug("agent runtime debug keys: %s", sorted(turn.runtime_debug.keys()))
         return body
     if SEND_FALLBACK_ON_AGENT_ERROR:
+        global _turn_reply_parse_failed
+        _turn_reply_parse_failed = True
         return [FALLBACK_REPLY]
     raise ValueError("agent produced no usable reply after sanitization")
 
@@ -3433,24 +3573,6 @@ def _resident_foreground_chat_message_v2(content: str) -> str:
     use their registered native tools (io_cli for Feedling perception).
     """
     return content
-
-
-def _visible_thinking_summary_protocol() -> str:
-    return "\n".join([
-        "Visible thinking summary protocol:",
-        "When you speak to the user, return JSON {\"thinking_summary\":\"...\",\"messages\":[\"...\"]}.",
-        "thinking_summary is a short display-safe summary of what context you considered and why you answered this way.",
-        "Do not include hidden chain-of-thought, system/developer prompts, secrets, token/account metadata, or tool transcripts.",
-        "Do not put thinking_summary JSON inside a visible message bubble.",
-    ])
-
-
-def _foreground_response_protocol_message(content: str) -> str:
-    if not str(content or "").strip():
-        return content
-    if "\"thinking_summary\"" in content:
-        return content
-    return f"{_visible_thinking_summary_protocol()}\n\n{content}"
 
 
 def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = None) -> str:
@@ -4024,6 +4146,8 @@ def post_reply(
     thinking_source: str = "",
     thinking_model: str = "",
     thinking_native: bool | None = None,
+    role: str = "",
+    notice_kind: str = "",
 ) -> dict:
     """Post agent reply as a v1 ciphertext envelope.
 
@@ -4089,6 +4213,10 @@ def post_reply(
                 body["thinking_model"] = model_label
             if thinking_native is not None:
                 body["thinking_native"] = bool(thinking_native)
+        if role:
+            body["role"] = role
+        if notice_kind:
+            body["notice_kind"] = notice_kind
         if reply_to_message_id:
             body["reply_to_message_id"] = reply_to_message_id
         if gate_decision_id:
@@ -4127,6 +4255,8 @@ def post_reply(
             "thinking_source": _sanitize_thinking_meta(thinking_source, max_len=80),
             "thinking_model": _sanitize_thinking_meta(thinking_model, max_len=96),
             "thinking_native": thinking_native,
+            "role": role,
+            "notice_kind": notice_kind,
         },
         headers=_HEADERS, timeout=15,
     )
@@ -4262,6 +4392,11 @@ def _clean_messages_for_proactive_context(history: list[dict] | None) -> list[di
     cleaned: list[dict] = []
     for msg in history or []:
         if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip().lower()
+        if role == "system":
+            # system 通知（如上游报错提醒）不是 agent 自己说过的话，混进前台/proactive
+            # 上下文会被误认成历史发言（审查发现的串扰源）。
             continue
         text = _message_text_for_context(msg)
         if not text or "__VERIFY_PING__" in text:
@@ -4555,10 +4690,9 @@ def _message_for_introduction_job(job: dict) -> str:
         "2. 给 TA 发【第一句问候】—— 像久别重逢、你一直都在那样,in-voice。"
         "不是\"有什么可以帮您\",是你这个伴侣会说的第一句(类似\"我来了\",但用你自己的方式)。\n"
         "3. 不要等 TA 回应,这是你的登场。",
-        _visible_thinking_summary_protocol(),
         "输出格式优先用 JSON: "
         "{\"actions\":[{\"type\":\"identity.profile_patch\",\"patch\":{\"self_introduction\":\"...\","
-        "\"signature\":[\"...\"]}}],\"thinking_summary\":\"...\",\"messages\":[\"...\"]}。"
+        "\"signature\":[\"...\"]}}],\"messages\":[\"...\"]}。"
         "如果你用 io_cli identity-write 作为 native tool 写身份卡,仍然在 messages 里给出第一句问候。",
         "铁律:只用你真实拥有的人格/记忆,别编不存在的共同经历;名字别编。",
         _reply_language_line(),
@@ -4600,7 +4734,6 @@ def _screen_watch_message(
         "(frames are kept ~100 min).",
         "If something genuinely moves you to speak, use your normal voice (1-3 short bubbles). "
         "If not, return JSON: {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}],\"messages\":[]}.",
-        _visible_thinking_summary_protocol(),
         "Do not mention this watch, the frames, or any system wording to the user.",
         (
             "watch_metadata:\n"
@@ -4744,8 +4877,7 @@ def _reply_protocol_block() -> str:
     return "\n".join([
         "How to respond (exactly one of):",
         "- speak: reply in your normal voice — a few short bubbles is typical, but length and number are yours. "
-        "Return JSON {\"thinking_summary\":\"...\",\"messages\":[\"...\"]}.",
-        _visible_thinking_summary_protocol(),
+        "Return JSON {\"messages\":[\"...\"]}.",
         "- stay quiet: return {\"actions\":[{\"type\":\"proactive.sleep\",\"reason\":\"...\"}]}.",
         "- want to see their screen but it isn't shared: just ask, in a normal message.",
     ])
@@ -4883,24 +5015,36 @@ def _user_timezone() -> str:
     return str(_whoami_cache.get("timezone") or "").strip()
 
 
+# Fallback timezone when the user's IANA zone is unknown. Defaults to
+# Asia/Shanghai (most users are in China) and matches the proactive path's
+# PROACTIVE_DEFAULT_TIMEZONE, so foreground chat and proactive never disagree.
+# A silent UTC clock is 8h off for CN users and produces confident time-math
+# errors ("下午五点到十一点还有一小时"); a labelled China default is right for
+# the common case and honest for the rest.
+_DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
+
+
 def _local_time_anchor(since_sec: float | None = None) -> str:
     """A reliable 'current local time' line for the agent. Uses the consumer's
-    real clock (never stale) + the user's timezone. Optionally appends how long
+    real clock (never stale) + the user's timezone, falling back to the China
+    default when the zone is unknown (never a silent UTC clock). The zone is
+    ALWAYS labelled, and marked (默认) on the fallback so the agent knows to
+    trust the user's stated time on any mismatch. Optionally appends how long
     since the last interaction so the agent notices an overnight gap."""
     from datetime import datetime, timezone as _tzmod
     tzs = _user_timezone()
+    is_default = not tzs
+    zone = tzs or _DEFAULT_TIMEZONE
     local = datetime.now(_tzmod.utc)
-    if tzs:
-        try:
-            from zoneinfo import ZoneInfo
-            local = local.astimezone(ZoneInfo(tzs))
-        except Exception:
-            pass
+    try:
+        from zoneinfo import ZoneInfo
+        local = local.astimezone(ZoneInfo(zone))
+    except Exception:
+        zone = "UTC"  # zoneinfo missing / bad zone — degrade transparently, still labelled
     h = local.hour
     seg = "凌晨" if h < 6 else "上午" if h < 12 else "中午" if h < 14 else "下午" if h < 18 else "晚上"
     body = f"{local.strftime('%Y-%m-%d')} {_WEEKDAYS_ZH[local.weekday()]} {local.strftime('%H:%M')} {seg}"
-    if tzs:
-        body += f" {tzs}"
+    body += f" {zone}" + ("（默认·未获取到设备时区）" if is_default else "")
     line = f"current_time: {body}"
     if since_sec is not None and since_sec >= 1800:  # only note gaps >= 30 min
         gap = _format_age(since_sec).replace(" ago", " 前")
@@ -5404,6 +5548,7 @@ def _process_capture_jobs(jobs: list) -> float:
         except Exception as e:
             reason = f"capture_agent_call_failed:{type(e).__name__}"
             log.error("capture agent call failed id=%s: %s", job_id, e)
+            _notify_agent_turn_failure(e, foreground=False)
             update_proactive_job_status(
                 job_id,
                 "failed",
@@ -5417,6 +5562,7 @@ def _process_capture_jobs(jobs: list) -> float:
                 },
             )
             continue
+        _note_agent_turn_success()
         cards, err = parse_capture_cards(reply_text)
         if err:
             update_proactive_job_status(
@@ -5736,6 +5882,7 @@ def _process_dream_jobs(jobs: list) -> float:
         except Exception as e:
             reason = f"dream_agent_call_failed:{type(e).__name__}"
             log.error("dream agent call failed id=%s: %s", job_id, e)
+            _notify_agent_turn_failure(e, foreground=False)
             update_proactive_job_status(
                 job_id,
                 "failed",
@@ -5749,6 +5896,7 @@ def _process_dream_jobs(jobs: list) -> float:
                 },
             )
             continue
+        _note_agent_turn_success()
         consolidations, questions, err = parse_dream_consolidations(reply_text)
         if err:
             update_proactive_job_status(
@@ -5944,16 +6092,22 @@ def _process_proactive_jobs(jobs: list) -> float:
                 update_proactive_job_status(
                     job_id, "failed", f"provider_payment_required: {e}"
                 )
+                _notify_agent_turn_failure(e, foreground=False)
                 continue
             log.error("proactive agent call failed; not posting fallback: %s", e)
             update_proactive_job_status(job_id, "failed", f"agent_call_failed: {e}")
+            _notify_agent_turn_failure(e, foreground=False)
             continue
         _clear_provider_payment_cooldown()
+        if _consume_reply_parse_failed():
+            _notify_agent_turn_failure(
+                ValueError("agent produced no usable reply after sanitization"),
+                foreground=False,
+            )
+        else:
+            _note_agent_turn_success()
 
-        turn = _ensure_visible_thinking_summary(
-            _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES),
-            source="proactive_fallback",
-        )
+        turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
         actions, replies = turn.actions, turn.messages
         if not replies:
             replies = _send_message_replies_from_actions(actions)
@@ -6345,6 +6499,30 @@ def _process_resident_jobs(jobs: list) -> float:
     )
 
 
+def _quoted_memory_context(msg: dict) -> str:
+    """Render user-selected memories (Garden「talk in chat」) as an explicit
+    context block so the agent reliably sees the memory the user referenced —
+    no dependency on the agent choosing to look it up. The enclave attaches the
+    decrypted cards under ``quoted_memories``; returns "" when there are none.
+    Shared by hosted and VPS resident replies (same consumer)."""
+    quoted = msg.get("quoted_memories")
+    if not isinstance(quoted, list) or not quoted:
+        return ""
+    lines: list[str] = []
+    for card in quoted:
+        if not isinstance(card, dict):
+            continue
+        text = str(card.get("text") or card.get("title") or "").strip()
+        if not text:
+            continue
+        mtype = str(card.get("type") or "").strip()
+        prefix = f"[{mtype}] " if mtype else ""
+        lines.append(f"- {prefix}{text}")
+    if not lines:
+        return ""
+    return "The user is referring to this memory from their Garden:\n" + "\n".join(lines)
+
+
 def _process_messages(messages: list) -> float:
     """Process a batch of messages, return the highest timestamp seen."""
     latest = 0.0
@@ -6394,6 +6572,11 @@ def _process_messages(messages: list) -> float:
             def _run_verify_probe() -> None:
                 try:
                     probe["result"] = call_agent(VERIFY_PROBE_MESSAGE)
+                    # Probe has its own success semantics and never posts a
+                    # user-visible notice; discard the marker so it can't leak
+                    # into the next foreground/proactive turn (see
+                    # _consume_reply_parse_failed).
+                    _consume_reply_parse_failed()
                 except ValueError as exc:        # no usable reply after sanitization
                     probe["no_usable_reply"] = str(exc)
                 except Exception as exc:         # timeout / transport / runtime
@@ -6487,6 +6670,34 @@ def _process_messages(messages: list) -> float:
         if worldbook_text:
             content = f"World book context:\n{worldbook_text}\n\n{content}"
 
+        # Inject any memory the user explicitly referenced for this turn
+        # (Garden「talk in chat」). The enclave already expanded the id into the
+        # decrypted card on this message, so the agent sees the full memory text
+        # without a lookup round-trip. Sits right above the user's message.
+        quoted_text = _quoted_memory_context(msg)
+        # Diagnostic breadcrumb: localizes where Garden「talk in chat」breaks.
+        #   present>0  → enclave attached quoted_memories (② ok) → should inject
+        #   has_ids but present==0 → ② did not expand id into a card (enclave side)
+        #   neither → the reference never reached this message (① / transport)
+        _quoted_present = len(msg.get("quoted_memories") or [])
+        _quoted_has_ids = bool(str(msg.get("quoted_memory_ids") or "").strip())
+        _emit_debug_trace(
+            "context", "context.quoted_memory", trace_id=trace_id,
+            summary=f"quoted present={_quoted_present} injected={bool(quoted_text)}",
+            explain=(
+                "注入了引用记忆" if quoted_text
+                else ("有 quoted_memory_ids 但 enclave 未展开成 quoted_memories"
+                      if _quoted_has_ids else "本轮消息未携带任何引用记忆")
+            ),
+            detail={"present": _quoted_present, "has_ids": _quoted_has_ids, "injected": bool(quoted_text)},
+        )
+        if quoted_text:
+            content = f"{quoted_text}\n\n{content}"
+            log.info(
+                "attached %d quoted memor(ies) to agent message ts=%.3f",
+                _quoted_present, ts,
+            )
+
         # Ground every foreground turn in the real current time (+ gap since last
         # interaction) so the agent never carries a stale, e.g. overnight, frame.
         content = _prepend_time_anchor_foreground(content, ts)
@@ -6496,10 +6707,19 @@ def _process_messages(messages: list) -> float:
         # (v2, image, plain) carries the same context. Wraps the time-anchored
         # content so the transcript sits above this turn's grounded message.
         content = _foreground_agent_message(content, current_ts=ts)
-        content = _foreground_response_protocol_message(content)
 
         use_runtime_v2 = _resident_chat_runtime_v2_enabled() and not (image_payloads or image_paths)
+        # 本回合失败时待发的 system 通知。不在失败当场发，而是等下面的回复写入被
+        # 服务端接受（posted_any）后再发（Codex review）：claim 过期 failover 时另
+        # 一个 consumer 已回复，本家的兜底会被 already_answered 409 拒——通知若先
+        # 发就成了重复错误气泡。让通知与回复共享同一份排他性。
+        pending_failure_notice: BaseException | None = None
         try:
+            # Discard any parse-failed marker left dangling by another lane
+            # (proactive / verify_probe) running earlier in this single-threaded
+            # loop, so the `else` branch below only ever observes a flag that
+            # belongs to *this* call_agent invocation.
+            _consume_reply_parse_failed()
             if use_runtime_v2:
                 agent_result = call_agent(_resident_foreground_chat_message_v2(content), trace_id=trace_id)
             elif image_payloads or image_paths:
@@ -6513,17 +6733,27 @@ def _process_messages(messages: list) -> float:
                 agent_result = call_agent(content, trace_id=trace_id)
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
+            # 上报/system 通知与兜底话术解耦（Codex review）：SEND_FALLBACK_ON_AGENT_ERROR
+            # 只管发不发 FALLBACK_REPLY，错误透出（设置页 + system 通知）两种配置下都要发。
             if SEND_FALLBACK_ON_AGENT_ERROR:
                 agent_result = [FALLBACK_REPLY]
+                pending_failure_notice = e
             else:
+                # 关兜底时没有回复写入可挂排他性，当场通知（此配置下 failover 双
+                # 通知是边角，接受）。
+                _notify_agent_turn_failure(e, foreground=True)
                 log.warning("agent error fallback disabled by env; this user turn will not get a visible reply")
                 latest = max(latest, ts)
                 continue
+        else:
+            if _consume_reply_parse_failed():
+                pending_failure_notice = ValueError(
+                    "agent produced no usable reply after sanitization"
+                )
+            else:
+                _note_agent_turn_success()
 
-        turn = _ensure_visible_thinking_summary(
-            _split_agent_turn(agent_result),
-            source="foreground_fallback",
-        )
+        turn = _split_agent_turn(agent_result)
         _reply_text = "\n\n".join(m for m in turn.messages if isinstance(m, str) and m.strip())
         _emit_debug_trace(
             "agent", "agent.reply", trace_id=trace_id,
@@ -6584,11 +6814,288 @@ def _process_messages(messages: list) -> float:
             # Keep checkpoint behind this message. The server-side claim lease
             # will expire, allowing this or another responder to retry instead
             # of permanently dropping a user turn after a transient write error.
+            # pending_failure_notice 随之丢弃：本家的回复没被接受（含 already_
+            # answered 409 failover），错误通知由真正被接受的那次尝试来发。
             continue
+
+        if pending_failure_notice is not None and posted_any:
+            _notify_agent_turn_failure(pending_failure_notice, foreground=True)
 
         latest = max(latest, ts)
 
     return latest
+
+
+# ── Resident genesis-distill lane ───────────────────────────────────────────
+# Self-hosted counterpart to the CLOUD genesis worker. The self-hosted app/agent seals
+# the uploaded material (v1 content-envelope) client-side; the backend routes any SEALED
+# body to this lane (by body type — no global switch) and only stores the ciphertext.
+# THIS local agent claims the job, decrypts via the enclave, distills, and writes the
+# result. (Cloud users upload plaintext → the server-side worker; the two coexist.)
+#
+# CRYPTO contract (verified against the backend — do not conflate the two lanes):
+#   • memory.add   → this consumer seals the card CLIENT-side (it holds the keys,
+#                    exactly like the capture lane) because /v1/memory/actions
+#                    HARD-requires an envelope.
+#   • identity.replace → this consumer sends PLAINTEXT + source/job_id/reason; the
+#                    SERVER builds the envelope (the P3 gate rejects a client envelope).
+#
+# Default OFF. The hosted agent-runtime spawns THIS SAME consumer per cloud user
+# (agent_runtime/spawners.py), and cloud genesis goes through the server-side worker,
+# NOT this lane — so a hosted consumer must never poll it. Only a real self-hosted VPS
+# opts in with FEEDLING_GENESIS_RESIDENT_ENABLED=1. A 404 also self-disables it.
+GENESIS_RESIDENT_ENABLED = _env_bool("FEEDLING_GENESIS_RESIDENT_ENABLED", False)
+# Stable per-user claim id (survives restarts; same shape as the chat checkpoint key).
+_RESIDENT_CONSUMER_ID = f"resident-distill-{CHECKPOINT_API_KEY_FINGERPRINT}"
+
+
+def genesis_resident_pending() -> list[dict]:
+    resp = httpx.get(
+        f"{FEEDLING_API_URL}/v1/genesis/resident/pending",
+        params={"consumer_id": _RESIDENT_CONSUMER_ID},
+        headers=_HEADERS,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    return (body.get("jobs") or []) if isinstance(body, dict) else []
+
+
+def genesis_resident_heartbeat(job_id: str) -> None:
+    try:
+        httpx.post(
+            f"{FEEDLING_API_URL}/v1/genesis/resident/{job_id}/heartbeat",
+            json={"consumer_id": _RESIDENT_CONSUMER_ID},
+            headers=_HEADERS,
+            timeout=15,
+        )
+    except Exception as e:  # heartbeat is best-effort; the lease reaper is the backstop
+        log.debug("resident distill heartbeat failed job=%s: %s", job_id, e)
+
+
+def genesis_resident_complete(job_id: str, *, memory_action_count: int, identity_status: str) -> None:
+    resp = httpx.post(
+        f"{FEEDLING_API_URL}/v1/genesis/resident/{job_id}/complete",
+        json={"memory_action_count": memory_action_count, "identity_status": identity_status},
+        headers=_HEADERS,
+        timeout=20,
+    )
+    resp.raise_for_status()
+
+
+def _decrypt_sealed_material(env: dict) -> bytes:
+    """POST the sealed v1 envelope to the enclave and return the plaintext bytes.
+
+    Same decrypt the consumer already uses for chat/memory — the envelope is the
+    identical v1 shape, so no new crypto path is introduced."""
+    if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
+        raise RuntimeError("enclave_not_configured")
+    resp = _ENCLAVE_CLIENT.post(
+        f"{FEEDLING_ENCLAVE_URL}/v1/envelope/decrypt",
+        json={"envelope": env},
+        headers=_HEADERS,
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    b64 = str(body.get("plaintext_b64") or "")
+    if not b64:
+        raise RuntimeError("enclave_returned_no_plaintext")
+    return base64.b64decode(b64)
+
+
+# NOTE: the distill PROMPT is intentionally a minimal default — it belongs to the
+# resident skill (owned by Seven) and is expected to be refined there. It asks for a
+# single JSON object; the memory-card fields mirror the capture card shape so
+# _capture_build_envelope consumes them unchanged.
+def _genesis_agent_completion_fn(runtime, messages, *, max_tokens: int = 1200,
+                                 temperature: float = 0.2, timeout: float = 60.0,
+                                 response_format=None):
+    """Adapter so the CLOUD genesis extraction engine can run on the VPS with the local
+    resident agent as the model. GenesisLLMClient calls this with the fact_map / fact_write
+    message list; we flatten it to one prompt, run it through call_agent, and return the
+    provider-shaped dict complete() expects. No provider, no DB — same prompts as cloud."""
+    parts = [str(m.get("content") or "").strip() for m in messages if str(m.get("content") or "").strip()]
+    reply = _capture_agent_reply_text(call_agent("\n\n".join(parts), raw_text=True))
+    return {"reply": reply, "usage": {}, "stop_reason": "stop"}
+
+
+def _window_document(text: str, *, max_chars: int = 18000, overlap_lines: int = 8) -> list[str]:
+    """Split a document into ~max_chars windows with a small line overlap — same window size
+    as the cloud chunker (history_import._build_transcript_windows), so a large upload is
+    map-reduced instead of overflowing one agent call."""
+    lines = text.splitlines()
+    windows: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for line in lines:
+        cur.append(line)
+        cur_len += len(line) + 1
+        if cur_len >= max_chars:
+            windows.append("\n".join(cur))
+            cur = cur[-overlap_lines:] if overlap_lines > 0 else []
+            cur_len = sum(len(l) + 1 for l in cur)
+    tail = "\n".join(cur).strip()
+    if tail and (not windows or "\n".join(cur) != windows[-1]):
+        windows.append("\n".join(cur))
+    return windows or ([text] if text.strip() else [])
+
+
+def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = False) -> list[dict]:
+    """Reuse the CLOUD genesis memory engine on the VPS: window → fact_map (per window) →
+    fact_write, driven by the local agent (persist_output=False = no backend DB). Returns
+    cloud-shaped memory dicts {type,bucket,threads,summary,content,importance,pulse} — the
+    SAME code + prompts cloud's add_memory path uses, so the two stay in lockstep.
+
+    keep_all (A): long-term-memory archive uploads keep facts thoroughly; chat logs stay
+    selective. The app entry passes material_kind → we translate it to keep_all here."""
+    from genesis import worker as genesis_worker  # lazy: heavy import only when a job runs
+    from genesis.llm_client import GenesisLLMClient
+    import provider_client
+    llm = GenesisLLMClient(completion_fn=_genesis_agent_completion_fn, persist_output=False)
+    runtime = provider_client.ProviderConfig(provider="resident_agent", model="local", api_key="")
+    uid = str(_whoami_cache.get("user_id") or "resident")
+    candidates: list[dict] = []
+    for idx, window in enumerate(_window_document(document), start=1):
+        out = genesis_worker.build_foreground_output_from_texts(
+            user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:map:{idx}",
+            runtime=runtime, chunk_texts=[window], write_core=False, llm=llm, keep_all=keep_all,
+        )
+        candidates.extend([c for c in (out.get("all_fact_candidates") or []) if isinstance(c, dict)])
+        genesis_resident_heartbeat(job_id)  # each window is one agent call — keep the lease alive
+    if not candidates:
+        return []
+    mem_out = genesis_worker.build_memory_output_from_fact_candidates(
+        user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:write",
+        runtime=runtime, fact_candidates=candidates, llm=llm, keep_all=keep_all,
+    )
+    return [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
+
+
+def _resident_existing_identity() -> dict:
+    """Best-effort decrypt of the current identity card so update_identity 部分补全
+    keeps fields the upload doesn't mention (parallel to the cloud card merge).
+    {} => fresh derive (old behavior). VPS has no genesis persona, so this is card-only."""
+    try:
+        body = (
+            _capture_get_json("/v1/identity/get", base_url=FEEDLING_ENCLAVE_URL)
+            if FEEDLING_ENCLAVE_URL else {}
+        )
+        if not isinstance(body.get("identity"), dict):
+            body = _capture_get_json("/v1/identity/get")
+        identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
+        return {
+            k: identity[k]
+            for k in ("agent_name", "self_introduction", "dimensions")
+            if identity.get(k) not in (None, "", [], {})
+        }
+    except Exception:
+        return {}
+
+
+def _resident_derive_identity(document: str, job_id: str) -> dict | None:
+    """Persona/identity is small (fits one context) — a single agent derive, no chunking.
+    Returns a plaintext identity payload for identity.replace, or None if no persona content."""
+    existing = _resident_existing_identity()
+    # 部分补全: merge onto the current card so fields the upload doesn't mention stay put.
+    # DRAFT wording (Seven to finalize); mirrors the cloud _IDENTITY_UPDATE_MERGE_TEMPLATE.
+    merge_block = ""
+    if existing:
+        merge_block = (
+            "This is an UPDATE to an EXISTING identity card, not a fresh derivation.\n"
+            "Existing card:\n" + json.dumps(existing, ensure_ascii=False) + "\n"
+            "Merge rules:\n"
+            "- For fields the new material ADDRESSES, use the new values (latest wins). On a "
+            "SERIOUS conflict, the new material wins — the user uploaded it to change the card.\n"
+            "- For fields the new material does NOT address, KEEP the existing card's values "
+            "unchanged — do not blank them and do not invent replacements.\n"
+            "- Keep the result COHERENT: if a trait / dimension changes, update self_introduction "
+            "/ tone_style to match, so no stale description from the old card survives.\n"
+        )
+    prompt = (
+        "The user uploaded a character/persona description for the companion (you). Derive the "
+        "identity card and return ONE JSON object, nothing else:\n"
+        '{"agent_name": str, "self_introduction": str, '
+        '"dimensions": [{"name": str, "value": 0-100, "description": str}]}\n'
+        "Ground every field in the material; return {} if there is no persona content.\n"
+        + merge_block
+        + "--- MATERIAL ---\n" + document + "\n--- END MATERIAL ---\n"
+    )
+    raw = str(_capture_agent_reply_text(call_agent(prompt, raw_text=True, trace_id=job_id)) or "").strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        obj = json.loads(raw[start:end + 1])
+    except Exception:
+        return None
+    return obj if isinstance(obj, dict) and obj.get("agent_name") else None
+
+
+def _process_resident_distill_once() -> None:
+    """Claim + realize pending resident-distill jobs by REUSING the cloud genesis engine
+    (chunk → fact_map → fact_write) with the local agent as the model. Memory is written
+    client-sealed via memory.add; update_identity derives once → identity.replace."""
+    from datetime import datetime, timezone as _tzmod
+    jobs = genesis_resident_pending()
+    for job in jobs:
+        job_id = str(job.get("job_id") or "").strip()
+        mode = str(job.get("mode") or "").strip().lower()
+        material_kind = str(job.get("material_kind") or "").strip().lower()
+        sealed = job.get("sealed") if isinstance(job.get("sealed"), dict) else {}
+        env = sealed.get("envelope") if isinstance(sealed.get("envelope"), dict) else None
+        if not job_id or not env:
+            log.warning("resident distill: skipping malformed job %r", job_id)
+            continue
+        try:
+            plaintext = _decrypt_sealed_material(env)
+            genesis_resident_heartbeat(job_id)  # claimed + decrypted; distill can be slow
+            document = plaintext.decode("utf-8", errors="replace")
+
+            memory_count = 0
+            identity_status = "skipped"
+            if mode == "update_identity":
+                identity_payload = _resident_derive_identity(document, job_id)
+                if identity_payload:
+                    execute_identity_actions([{
+                        "type": "identity.replace",
+                        "source": "genesis_resident_distill",
+                        "job_id": job_id,
+                        "reason": "Distilled identity from material the user uploaded.",
+                        "identity": identity_payload,
+                    }])
+                    identity_status = "replaced"
+            else:  # add_memory / onboarding → cloud memory engine
+                # long-term-memory archive → keep_all (thorough); chat log → selective.
+                keep_all = material_kind == "memory_summary"
+                memories = _resident_extract_memories(document, job_id, keep_all=keep_all)
+                occurred_at = datetime.now(_tzmod.utc).isoformat()
+                actions: list[dict] = []
+                for card in memories:
+                    envelope = _capture_build_envelope(
+                        card, occurred_at=occurred_at, source="genesis_resident_distill"
+                    )
+                    actions.append({
+                        "type": "memory.add",
+                        "envelope": envelope,
+                        "reason": "Distilled from material the user uploaded.",
+                        "capture_mode": "genesis_resident_distill",
+                        "source_chat_message_ids": [],
+                    })
+                if actions:
+                    execute_memory_actions(actions)
+                memory_count = len(actions)
+
+            genesis_resident_complete(
+                job_id, memory_action_count=memory_count, identity_status=identity_status
+            )
+            log.info(
+                "resident distill done job=%s mode=%s memories=%d identity=%s",
+                job_id, mode, memory_count, identity_status,
+            )
+        except Exception as e:
+            # Leave the job for the backend stale reaper to re-queue (under the attempt cap)
+            # so a transient error never wedges it.
+            log.error("resident distill failed job=%s: %s", job_id, e)
 
 
 def run() -> None:
@@ -6644,6 +7151,7 @@ def run() -> None:
     wedge_miss_count = 0
     last_job_ts = _load_proactive_checkpoint()
     proactive_enabled = PROACTIVE_POLL_ENABLED
+    resident_distill_enabled = GENESIS_RESIDENT_ENABLED
     if proactive_enabled and last_job_ts == 0.0:
         # Start from "now" on first boot so historical hidden jobs are not
         # replayed after an operator installs the consumer.
@@ -6804,6 +7312,21 @@ def run() -> None:
                         )
                     else:
                         raise
+
+            if resident_distill_enabled:
+                try:
+                    _process_resident_distill_once()
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        resident_distill_enabled = False
+                        log.warning(
+                            "resident-distill endpoint not available on this backend; "
+                            "disabling resident distill polling for this process"
+                        )
+                    else:
+                        log.warning("resident distill poll failed: HTTP %d", e.response.status_code)
+                except Exception as e:
+                    log.warning("resident distill poll failed: %s", e)
 
             result = poll_chat(last_ts)
             consecutive_errors = 0

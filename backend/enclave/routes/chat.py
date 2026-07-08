@@ -63,6 +63,11 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
                 "visibility": m.get("visibility", "shared"),
                 "decrypt_status": "ok",
             }
+            # Carry user-selected memory references (Garden「talk in chat」)
+            # forward; expanded into decrypted cards in _build_context_memories.
+            qmids = m.get("quoted_memory_ids")
+            if isinstance(qmids, str) and qmids.strip():
+                entry["quoted_memory_ids"] = qmids.strip()
             if ctype == "image":
                 # Image plaintext is raw image bytes (JPEG/PNG/WebP) — surface
                 # as base64 so JSON callers (vision-capable agents, iOS clients
@@ -109,6 +114,40 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
     return decrypted, errors
 
 
+def _attach_quoted_memories(decrypted: list[dict], cards: list[dict]) -> None:
+    """Expand user-selected memory ids (Garden「talk in chat」) into decrypted
+    cards on their own message, so the resident consumer can inject them into
+    the agent's context. Mutates `decrypted` in place; best-effort. The raw id
+    list is removed from each entry so it never leaks in the response.
+    """
+    by_id = {str(c.get("id") or ""): c for c in cards if c.get("id")}
+    for entry in decrypted:
+        raw = entry.pop("quoted_memory_ids", None)
+        if not raw:
+            continue
+        quoted: list[dict] = []
+        for mid in [i.strip() for i in str(raw).split(",") if i.strip()][:8]:
+            card = by_id.get(mid)
+            if not card:
+                continue
+            title = str(card.get("title") or "").strip()
+            desc = str(card.get("description") or "").strip()
+            summary = str(card.get("summary") or "").strip()
+            content = str(card.get("content") or "").strip()
+            # Prefer title+description; fall back to v1 summary/content, which is
+            # where many memories actually keep their text (title/description
+            # empty). Mirrors the iOS displayTitle fallback so both ends agree.
+            text = "\n".join(part for part in (title, desc) if part) or summary or content
+            quoted.append({
+                "id": mid,
+                "type": str(card.get("type") or "").strip(),
+                "title": title or summary or content,
+                "text": text,
+            })
+        if quoted:
+            entry["quoted_memories"] = quoted
+
+
 def _build_context_memories(moments, decrypted, query_args):
     """纯同步 context_memories 选择（在 to_thread 里跑）。函数体 = 旧
     L1554-1585 逐字：latest_user_text 从 decrypted 提取，context_mode/
@@ -131,6 +170,11 @@ def _build_context_memories(moments, decrypted, query_args):
 
     cards = readside.moments_to_cards(
         moments, query_args["authorized_user_id"], query_args["content_sk"])
+
+    # Expand any user-selected memory references (Garden「talk in chat」) onto
+    # their message using the already-decrypted cards. Best-effort side pass;
+    # does not affect the context_memories selection below.
+    _attach_quoted_memories(decrypted, cards)
 
     if use_readside:
         context_memories, context_memory_trace = readside.select_context_memories_via_readside(

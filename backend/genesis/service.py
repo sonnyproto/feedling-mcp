@@ -6,7 +6,7 @@ import base64
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import datetime, date
 from typing import Any
 
 import db
@@ -17,6 +17,8 @@ from core import util as core_util
 from core.store import UserStore
 from identity import service as identity_service
 from memory import actions as memory_actions
+from notices import catalog
+from notices import core as notices
 
 GENESIS_STATE_BLOB = "genesis_state"
 GENESIS_PERSONA_BLOB = "genesis_persona"
@@ -355,6 +357,13 @@ def mark_failed(store: UserStore, job_id: str, error: str) -> dict | None:
     job = db.genesis_set_job_status(store.user_id, job_id, status=FAILED_JOB_STATUS, error=error)
     if job:
         write_genesis_state(store, job, status=FAILED_JOB_STATUS)
+    # emit unconditionally: only needs store + job_id + error, not the job row
+    # (a race where the job row is already gone shouldn't silence the notice).
+    ec = catalog.classify_upstream(error) or "genesis_failed"
+    notices.emit(store, source="genesis", error_class=ec,
+                 blame=catalog.blame_for(ec), severity="error",
+                 user_text=catalog.user_text_for(ec), detail=error,
+                 dedupe_key=f"genesis:{job_id}")
     return job
 
 
@@ -783,12 +792,43 @@ def init_identity_if_absent(
     return "updated" if existing else "initialized"
 
 
+def _relationship_anchor_fields_for_replace(existing: dict, output: dict) -> dict:
+    """B2: choose the relationship anchor for an identity replace.
+
+    Default = PRESERVE the existing anchor (an omitted/empty upload must never wipe or
+    reset relationship history). ONLY overwrite when the upload carries an EXPLICIT,
+    valid relationship time — a real ISO date PLUS non-empty evidence — so a vague
+    model-derived phrase can't silently reset the anchor (Seven's legality guard)."""
+    anchor = output.get("relationship_anchor") if isinstance(output.get("relationship_anchor"), dict) else {}
+    started = str(anchor.get("relationship_started_at") or "").strip()
+    evidence = str(anchor.get("relationship_anchor_evidence") or "").strip()
+    valid_date = False
+    if started:
+        try:
+            date.fromisoformat(started)
+            valid_date = True
+        except ValueError:
+            valid_date = False
+    if valid_date and evidence:
+        return {
+            "relationship_started_at": started,
+            "relationship_anchor_source": str(anchor.get("relationship_anchor_source") or "upload").strip() or "upload",
+            "relationship_anchor_evidence": evidence,
+        }
+    return {
+        "relationship_started_at": existing.get("relationship_started_at", ""),
+        "relationship_anchor_source": existing.get("relationship_anchor_source", ""),
+        "relationship_anchor_evidence": existing.get("relationship_anchor_evidence", ""),
+    }
+
+
 def replace_identity_preserving_anchor(store: UserStore, output: dict) -> str:
     """Replace identity content for explicit update_identity imports.
 
-    Product meaning: the user is redefining the companion's identity card. This
-    must NOT recompute relationship_started_at/days/evidence; those are history
-    anchors, not editable persona content.
+    Product meaning: the user is redefining the companion's identity card. The
+    relationship anchor (relationship_started_at/source/evidence) is PRESERVED by
+    default and only overwritten when the upload carries an explicit, valid
+    relationship time — see ``_relationship_anchor_fields_for_replace`` (B2).
     """
     existing = identity_service._load_identity(store)
     if not existing:
@@ -818,9 +858,7 @@ def replace_identity_preserving_anchor(store: UserStore, output: dict) -> str:
         "owner_user_id": envelope["owner_user_id"],
         "created_at": existing.get("created_at") or now,
         "updated_at": now,
-        "relationship_started_at": existing.get("relationship_started_at", ""),
-        "relationship_anchor_source": existing.get("relationship_anchor_source", ""),
-        "relationship_anchor_evidence": existing.get("relationship_anchor_evidence", ""),
+        **_relationship_anchor_fields_for_replace(existing, output),
         "identity_agent_name_present": bool(payload.get("agent_name")),
         "identity_dimension_count": len(payload.get("dimensions") or []),
     }
@@ -925,7 +963,31 @@ def apply_reducer_output(
     output["job_id"] = job_id
     db.genesis_set_job_status(store.user_id, job_id, status="processing", output={"stage": "apply_outputs"})
     write_genesis_state(store, {**job, "status": "processing"})
+    # this run is starting -> clear any stale failure/partial notice for this
+    # user's genesis flow *before* we emit any new ones below, so a partial
+    # notice emitted later in this same call doesn't get resolved by its own
+    # run (notices emitted with dedupe_key="genesis:{job_id}:partial" also
+    # match the "genesis:" prefix used here).
+    notices.resolve(store, "genesis:")
     memory_count, memory_results = apply_memory_outputs(store, api_key, output)
+    # apply_memory_outputs has no job_id in its signature (many other call sites
+    # depend on its (count, results) 2-tuple return, incl. direct unpack in
+    # tests/test_genesis_service.py — widening it would ripple through those).
+    # This caller DOES have job_id, so the dropped-card count is derived here
+    # instead: raw input count minus what actually landed (covers both the
+    # ValueError-skipped malformed items inside apply_memory_outputs AND any
+    # non-dict items it silently continues past).
+    raw_items = output.get("memories")
+    if raw_items is None:
+        raw_items = output.get("facts")
+    raw_count = len(raw_items) if isinstance(raw_items, list) else 0
+    dropped = raw_count - memory_count
+    if dropped > 0:
+        notices.emit(store, source="genesis", error_class="genesis_partial",
+                     blame="system", severity="warning",
+                     user_text=catalog.user_text_for("genesis_partial"),
+                     detail=f"dropped {dropped} card(s)",
+                     dedupe_key=f"genesis:{job_id}:partial")
     identity_status = init_identity_if_absent(store, output, api_key, runtime_token)
     persona_ref, persona_sha = write_persona_artifact(store, job_id, output)
     voice_ref, voice_sha = write_voice_artifact(store, job_id, output)

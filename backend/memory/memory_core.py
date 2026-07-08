@@ -289,7 +289,7 @@ def add(store, payload: dict) -> tuple[dict, int]:
     required = ["body_ct", "nonce", "K_user", "visibility", "owner_user_id"]
     missing = [f for f in required if not envelope.get(f)]
     if missing:
-        return {"error": f"envelope missing fields: {missing}"}, 400
+        return {"error": "envelope_missing_fields", "detail": missing}, 400
     if envelope["visibility"] not in ("shared", "local_only"):
         return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
     if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
@@ -415,7 +415,8 @@ def retype(store, payload: dict) -> tuple[dict, int]:
             minimum = 1 if new_type == "insight" else 2
             if not isinstance(anchor_ids, list) or len(anchor_ids) < minimum:
                 return {
-                    "error": f"{new_type}_requires_anchor",
+                    "error": "anchor_required",
+                    "detail": {"mem_type": new_type},
                     "min_anchors": minimum,
                     "required": (
                         f"Retyping into {new_type} requires ≥{minimum} anchor_memory_ids."

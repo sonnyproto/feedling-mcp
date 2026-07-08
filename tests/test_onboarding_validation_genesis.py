@@ -76,7 +76,8 @@ def test_model_api_validate_uses_processing_genesis_job_for_onboarding_steps(mon
     assert steps["history_import"]["job_status"] == "processing"
     assert steps["history_import"]["messages_parsed"] == 120
     assert steps["history_import"]["timeline_span_days"] == 9
-    assert steps["memory_garden"]["passing"] is False
+    assert steps["memory_garden"]["passing"] is True
+    assert steps["memory_garden"]["required"] == ""
     assert steps["identity_card"]["passing"] is False
     assert steps["relationship_anchor"]["passing"] is False
     assert steps["hosted_chat"]["passing"] is False

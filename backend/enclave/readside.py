@@ -370,6 +370,11 @@ def moments_to_cards(moments: list, authorized_user_id: str, content_sk) -> list
             "id": m.get("id"),
             "title": inner.get("title"),
             "description": inner.get("description"),
+            # v1 memories keep their real text in summary/content with
+            # title/description empty; surface them so consumers (e.g. the
+            # Garden「talk in chat」quote expansion) can render actual text.
+            "summary": inner.get("summary"),
+            "content": inner.get("content"),
             "type": inner.get("type"),
             "source": m.get("source"),
             "occurred_at": m.get("occurred_at"),

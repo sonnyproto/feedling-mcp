@@ -177,7 +177,18 @@ result = chat_completion(runtime, messages)
 
 ---
 
-## 7. 不变量（动之前先到群里喊一声）
+## 7. 错误返回纪律
+
+- 路由/core 的错误返回必须用稳定 slug：`{"error": "<snake_case_slug>", ...}`，
+  禁止自由文本（如 f-string 拼接的句子）——动态内容放 `detail` 字段。
+- 新增 slug 必须同 PR 登记进 `docs/API_ERRORS.md`（有测试守卫锁关键 slug）。
+- slug 一经发布即冻结；语义变更走新增新 slug。
+- 用户可见的话术不在后端维护（iOS 按 slug 本地映射）；`blame` 枚举见
+  `backend/asgi/responses.py::VALID_BLAME`。
+
+---
+
+## 8. 不变量（动之前先到群里喊一声）
 
 - gunicorn 入口 `"asgi_app:app"`（`-k asgi.worker.FeedlingUvicornWorker`）+
   `--chdir backend`。**已支持 `-w N`**（多 worker）：
@@ -196,7 +207,7 @@ result = chat_completion(runtime, messages)
 
 ---
 
-## 8. PR 自查清单
+## 9. PR 自查清单
 
 ```
 [ ] asgi_app.py 的 diff 只有装配/注入变化（理想情况是零 diff）

@@ -216,6 +216,7 @@ def public_config(config: dict) -> dict:
         "last_test_at": str(config.get("last_test_at") or ""),
         "created_at": str(config.get("created_at") or ""),
         "updated_at": str(config.get("updated_at") or ""),
+        "last_test_error": str(config.get("last_test_error") or ""),
     }
 
 

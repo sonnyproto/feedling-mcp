@@ -2261,6 +2261,7 @@ def test_proactive_chat_response_records_push_delivery_results(tmp_path, monkeyp
             "registered_at": "2026-05-24T00:00:00",
         },
     ]
+    store._save_tokens()  # persist so the response path's store.reload() keeps them
 
     client = make_client()
     headers = {"X-API-Key": api_key}
@@ -2408,6 +2409,7 @@ def test_ai_chat_response_pushes_when_app_background(tmp_path, monkeypatch):
             "registered_at": "2026-06-01T00:00:01",
         },
     ]
+    store._save_tokens()  # persist so the response path's store.reload() keeps them
     store.append_device_event(proactive_service._make_device_event("ios", "app_presence", {
         "scene_phase": "background",
         "is_foreground": False,
@@ -2652,6 +2654,7 @@ def test_proactive_chat_response_uses_push_to_start_when_start_window_open(tmp_p
             "registered_at": "2026-05-24T00:00:02",
         },
     ]
+    store._save_tokens()  # persist so the response path's store.reload() keeps them
 
     client = make_client()
     headers = {"X-API-Key": api_key}
@@ -2744,6 +2747,7 @@ def test_proactive_chat_response_uses_update_during_start_cooldown(tmp_path, mon
             "registered_at": "2026-05-24T00:00:02",
         },
     ]
+    store._save_tokens()  # persist so the response path's store.reload() keeps them
     store.live_activity_state["last_start_epoch"] = time.time()
 
     client = make_client()

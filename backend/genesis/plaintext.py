@@ -24,6 +24,8 @@ from genesis import dedup, foreground, foreground_identity, genesis_core, lightw
 from hosted import config_store as hosted_config_store
 from hosted import history_import
 from identity import service as identity_service
+from notices import catalog
+from notices import core as notices_core
 
 _SECONDS_PER_DAY = 24 * 60 * 60
 _PLAINTEXT_ACTIVE_LOCK = threading.Lock()
@@ -564,6 +566,38 @@ def _plaintext_existing_voice_workset_for_update(store, api_key: str | None) -> 
         return {}
 
 
+def _plaintext_existing_identity_for_update(store, api_key: str | None) -> dict:
+    """Decrypt the current identity card so update_identity can 部分补全 (merge:
+    keep fields the new material doesn't address). Best-effort — on any failure
+    return {} so the job falls back to the old fresh-derive behavior."""
+    try:
+        blob = identity_service._load_identity(store)
+        if not isinstance(blob, dict) or not blob.get("body_ct"):
+            return {}
+        raw = core_enclave._decrypt_envelope_via_enclave(blob, api_key, purpose="identity_update_merge")
+        parsed = json.loads(raw.decode("utf-8"))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _plaintext_existing_persona_for_update(store, api_key: str | None) -> str:
+    """Decrypt the current genesis persona so update_identity can merge (旧 persona
+    + 新材料) instead of rebuilding from the new material alone. Best-effort — on
+    any failure return "" so persona falls back to the old rebuild behavior."""
+    try:
+        blob = db.get_blob(store.user_id, service.GENESIS_PERSONA_BLOB)
+        if not isinstance(blob, dict):
+            return ""
+        envelope = blob.get("content_envelope")
+        if not isinstance(envelope, dict):
+            return ""
+        raw = core_enclave._decrypt_envelope_via_enclave(envelope, api_key, purpose="genesis_persona")
+        return raw.decode("utf-8")
+    except Exception:
+        return ""
+
+
 def _merged_has_identity(merged: dict) -> bool:
     """True when the reduce output carries a usable Identity Card (a name or any
     dimension). Mirrors service._identity_payload_from_output's emptiness rule."""
@@ -791,6 +825,10 @@ def _run_plaintext_genesis_v2(
         )
         if completed:
             service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
+            # foreground identity-first completion bypasses service.apply_reducer_output
+            # (which resolves genesis notices for the other completion paths) -> resolve
+            # here too so a prior failure notice doesn't linger past a successful retry.
+            notices_core.resolve(store, "genesis:")
     else:
         # edge: foreground couldn't derive an identity -> current backstop (complete on
         # core + let the background fill identity via init_identity/persona baseline).
@@ -919,6 +957,13 @@ def _run_plaintext_background_enrichment(
     db.genesis_set_job_status(
         store.user_id, job_id, status=service.DONE_JOB_STATUS, output={"stage": "genesis_v2_done"},
     )
+    # NOTE: deliberately no notices_core.resolve() here. This function is a pure
+    # continuation after the job already completed (foreground already ran either
+    # the identity-first path, which resolves at :799, or service.apply_reducer_output
+    # at :813, which resolves at its own start and may then emit a fresh
+    # "genesis:{job_id}:partial" notice for dropped cards). apply_memory_outputs
+    # (used above) never emits notices itself, so resolving again here would only
+    # ever clobber that just-emitted partial — never resolve anything new.
 
 
 def _append_plaintext_onboarding_greeting(
@@ -963,14 +1008,25 @@ def _run_plaintext_add_memory_job(
     runtime,
     source_groups: list[dict],
 ) -> None:
+    # this add_memory job path bypasses service.apply_reducer_output (which resolves
+    # genesis notices for the reducer-driven completion path) -> resolve here too, at
+    # the *start* of the run (matching the fix in apply_reducer_output: resolving
+    # stale notices before any new emit, not after, so a partial notice emitted later
+    # in this same run isn't immediately clobbered by its own dedupe-key prefix match).
+    notices_core.resolve(store, "genesis:")
     fact_candidates: list[dict] = []
     first_output: dict = {}
+    # A: long-term-memory archive uploads (source_family=memory_summary) → keep_all (write the
+    # user's curated facts thoroughly). Chat-history uploads keep the normal selective behavior.
+    keep_all_job = False
     for idx, group in enumerate(source_groups, start=1):
         group_kind = str(group.get("source_kind") or history_import._HISTORY_SOURCE)
         group_family = str(group.get("source_family") or worker._source_family(group_kind))
         group_chunks = [str(text) for text in (group.get("chunk_texts") or []) if str(text or "").strip()]
         if not group_chunks:
             continue
+        keep_all = group_family == "memory_summary"
+        keep_all_job = keep_all_job or keep_all
         db.genesis_set_job_status(
             store.user_id,
             job_id,
@@ -990,6 +1046,7 @@ def _run_plaintext_add_memory_job(
             chunk_texts=group_chunks,
             source_kind=group_kind,
             write_core=False,
+            keep_all=keep_all,
         )
         if not first_output:
             first_output = output
@@ -1002,9 +1059,21 @@ def _run_plaintext_add_memory_job(
         key_prefix=f"{job_id}:add_memory:fact_write",
         runtime=runtime,
         fact_candidates=fact_candidates,
+        keep_all=keep_all_job,
     )
     merged = _plaintext_merge_reducer_outputs([{**first_output, **memory_output}], relationship_anchor={})
+    raw_items = merged.get("memories")
+    if raw_items is None:
+        raw_items = merged.get("facts")
+    raw_count = len(raw_items) if isinstance(raw_items, list) else 0
     mem_count, _results = service.apply_memory_outputs(store, api_key, merged)
+    dropped = raw_count - mem_count
+    if dropped > 0:
+        notices_core.emit(store, source="genesis", error_class="genesis_partial",
+                           blame="system", severity="warning",
+                           user_text=catalog.user_text_for("genesis_partial"),
+                           detail=f"dropped {dropped} card(s)",
+                           dedupe_key=f"genesis:{job_id}:partial")
     completed = db.genesis_complete_job(
         store.user_id,
         job_id,
@@ -1025,18 +1094,23 @@ def _run_plaintext_update_identity_job(
     *,
     runtime,
     analysis_messages: list[dict] | None,
+    relationship_anchor: dict | None = None,
 ) -> None:
     if not identity_service._load_identity(store):
         service.mark_failed(store, job_id, "identity_not_initialized")
         return
     msgs = analysis_messages if isinstance(analysis_messages, list) else []
     language = history_import._import_language_for_store(store, msgs)
+    # 部分补全:merge onto the current card so fields the upload doesn't mention are
+    # kept (not re-derived to empty). Best-effort decrypt; {} => old fresh-derive.
+    existing_identity = _plaintext_existing_identity_for_update(store, api_key)
     identity_payload, warnings = history_import._derive_identity_with_provider(
         runtime,
         msgs,
         [],
         0,
         language,
+        existing_identity=existing_identity,
     )
     provider_failure = _provider_identity_failure(warnings)
     if provider_failure:
@@ -1050,6 +1124,7 @@ def _run_plaintext_update_identity_job(
         service.mark_failed(store, job_id, "persona_material_required")
         return
     voice_workset = _plaintext_existing_voice_workset_for_update(store, api_key)
+    existing_persona = _plaintext_existing_persona_for_update(store, api_key)
     try:
         persona_output = worker.build_persona_output_from_material(
             user_id=store.user_id,
@@ -1060,11 +1135,14 @@ def _run_plaintext_update_identity_job(
             voice_workset=voice_workset,
             source_kind="identity_update",
             source_family="ai_persona",
+            existing_persona=existing_persona,
         )
     except Exception as e:  # noqa: BLE001
         service.mark_failed(store, job_id, f"persona_rebuild_failed:{type(e).__name__}:{str(e)[:160]}")
         return
-    status = service.replace_identity_preserving_anchor(store, {"identity": identity_payload})
+    status = service.replace_identity_preserving_anchor(
+        store, {"identity": identity_payload, "relationship_anchor": relationship_anchor or {}}
+    )
     if status != "updated":
         service.mark_failed(store, job_id, status)
         return
@@ -1084,6 +1162,14 @@ def _run_plaintext_update_identity_job(
     )
     if completed:
         service.write_genesis_state(store, completed, status=service.DONE_JOB_STATUS)
+        # this update_identity path never goes through service.apply_reducer_output
+        # (which resolves genesis notices on the other completion paths) -> resolve
+        # here too, so a prior genesis_failed notice from an earlier failed attempt
+        # doesn't linger past a successful retry. Safe: this function never emits a
+        # "genesis:...:partial" notice of its own (identity-only, not memory), and
+        # every mark_failed exit above returns immediately, so this branch and the
+        # failure branches are mutually exclusive within a single run.
+        notices_core.resolve(store, "genesis:")
 
 
 def _run_plaintext_genesis_job(
@@ -1166,6 +1252,7 @@ def _run_plaintext_genesis_job(
                 job_id,
                 runtime=runtime,
                 analysis_messages=analysis_messages,
+                relationship_anchor=relationship_anchor,
             )
             _trace_genesis(store, "genesis.plaintext.done", job_id=job_id, summary="update identity job done",
                            detail={"mode": mode}, dur_ms=(time.time() - started_at) * 1000)

@@ -119,7 +119,7 @@ def test_chat_response_marks_first_user_success_once_for_real_chat_sources(clien
     monkeypatch.setattr(
         boot_gates,
         "_gate_bootstrap_for_chat",
-        lambda store, allow_verify_reply=False: None,
+        lambda store, allow_verify_reply=False, is_verify_reply=False: None,
     )
 
     store = core_store.get_store(user_id)
@@ -165,7 +165,7 @@ def test_chat_response_does_not_mark_first_chat_ok_for_verify_ping(client, monke
     monkeypatch.setattr(
         boot_gates,
         "_gate_bootstrap_for_chat",
-        lambda store, allow_verify_reply=False: None,
+        lambda store, allow_verify_reply=False, is_verify_reply=False: None,
     )
 
     store = core_store.get_store(user_id)

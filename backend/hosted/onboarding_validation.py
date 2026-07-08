@@ -201,13 +201,14 @@ def _model_api_steps_with_genesis(
     # being gated on the single job `done`, which made them all flip at once. The
     # identity-first foreground writes memories -> identity -> relationship -> greeting in
     # sequence, so these light up one by one as the user watches.
-    # memory/chat have no pure-live signal in every harness, so they pass on `done` too
-    # (backward-compatible) OR their live artifact (incremental before done).
+    # Memory Garden is informational in A': zero cards is a valid onboarding state.
+    # Keep this aligned with the base model_api/resident/official validators so the
+    # iOS checklist does not briefly show Memory Garden as done and then regress to
+    # waiting when the genesis overlay refreshes.
     # NOTE (Codex): hosted_chat leaning on `done` is only sound because the foreground-ready
     # contract writes the greeting BEFORE done (genesis v2 _run_plaintext_genesis_v2:
     # identity + greeting + core, THEN genesis_complete_job). If `done` ever fires without a
     # greeting again, this mis-lights hosted_chat — keep that invariant.
-    live_memory = done or int(bootstrap_st.get("memory_count") or 0) > 0
     hosted_chat_ok = done or _model_api_hosted_chat_verified(store)
     history_windows_total = _int_value(metadata.get("history_windows_total") or output.get("history_windows_total") or 0)
     history_windows_failed = _int_value(metadata.get("history_windows_failed") or output.get("history_windows_failed") or 0)
@@ -258,7 +259,7 @@ def _model_api_steps_with_genesis(
     memory_step = {
         "id": "memory_garden",
         "label": "Memory Garden",
-        "passing": live_memory,
+        "passing": True,
         "blocking": False,
         "memory_count": bootstrap_st["memory_count"],
         "counts": bootstrap_st["counts"],
@@ -266,7 +267,7 @@ def _model_api_steps_with_genesis(
         "missing_tabs": bootstrap_st["missing_tabs"],
         "genesis": True,
         "memory_action_count": memory_action_count,
-        "required": "" if live_memory else "Wait for Genesis to write Memory Garden cards.",
+        "required": "",
     }
     identity_step = {
         "id": "identity_card",
@@ -343,6 +344,7 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
             "label": "Model API Test",
             "passing": bool(config and config.get("test_status") == "ok"),
             "test_status": (config or {}).get("test_status", ""),
+            "last_test_error": (config or {}).get("last_test_error", ""),
             "required": "Call /v1/model_api/test until test_status is ok." if not (config and config.get("test_status") == "ok") else "",
         },
         {
@@ -611,4 +613,3 @@ def _onboarding_validation_payload(store: UserStore) -> dict:
         "steps": steps,
         "skill_url": boot_gates._SKILL_URL,
     }
-
