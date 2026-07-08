@@ -5015,24 +5015,36 @@ def _user_timezone() -> str:
     return str(_whoami_cache.get("timezone") or "").strip()
 
 
+# Fallback timezone when the user's IANA zone is unknown. Defaults to
+# Asia/Shanghai (most users are in China) and matches the proactive path's
+# PROACTIVE_DEFAULT_TIMEZONE, so foreground chat and proactive never disagree.
+# A silent UTC clock is 8h off for CN users and produces confident time-math
+# errors ("下午五点到十一点还有一小时"); a labelled China default is right for
+# the common case and honest for the rest.
+_DEFAULT_TIMEZONE = os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
+
+
 def _local_time_anchor(since_sec: float | None = None) -> str:
     """A reliable 'current local time' line for the agent. Uses the consumer's
-    real clock (never stale) + the user's timezone. Optionally appends how long
+    real clock (never stale) + the user's timezone, falling back to the China
+    default when the zone is unknown (never a silent UTC clock). The zone is
+    ALWAYS labelled, and marked (默认) on the fallback so the agent knows to
+    trust the user's stated time on any mismatch. Optionally appends how long
     since the last interaction so the agent notices an overnight gap."""
     from datetime import datetime, timezone as _tzmod
     tzs = _user_timezone()
+    is_default = not tzs
+    zone = tzs or _DEFAULT_TIMEZONE
     local = datetime.now(_tzmod.utc)
-    if tzs:
-        try:
-            from zoneinfo import ZoneInfo
-            local = local.astimezone(ZoneInfo(tzs))
-        except Exception:
-            pass
+    try:
+        from zoneinfo import ZoneInfo
+        local = local.astimezone(ZoneInfo(zone))
+    except Exception:
+        zone = "UTC"  # zoneinfo missing / bad zone — degrade transparently, still labelled
     h = local.hour
     seg = "凌晨" if h < 6 else "上午" if h < 12 else "中午" if h < 14 else "下午" if h < 18 else "晚上"
     body = f"{local.strftime('%Y-%m-%d')} {_WEEKDAYS_ZH[local.weekday()]} {local.strftime('%H:%M')} {seg}"
-    if tzs:
-        body += f" {tzs}"
+    body += f" {zone}" + ("（默认·未获取到设备时区）" if is_default else "")
     line = f"current_time: {body}"
     if since_sec is not None and since_sec >= 1800:  # only note gaps >= 30 min
         gap = _format_age(since_sec).replace(" ago", " 前")

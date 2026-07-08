@@ -552,6 +552,20 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     env.setdefault("AGENT_SESSION_MAX_TURNS", _HOST_SESSION_MAX_TURNS)
     env["IMAGE_TEMP_DIR"] = f"{home}/images"
     env["CONSUMER_ID"] = f"agent-runner:{user_id}"
+    # Ambient timezone for the hosted agent process tree (this consumer + the CLI
+    # it spawns). Without it the process inherits the CVM's UTC clock, so the CLI
+    # agent's OWN sense of "today / now" (e.g. a date line the runtime injects) is
+    # 8h off for CN users even when the current_time anchor is correct — hosted
+    # users perceive time in UTC while VPS agents (running on the user's own
+    # machine) don't. Best-effort: the user's first-class IANA zone, else the
+    # China default (matches _local_time_anchor / PROACTIVE_DEFAULT_TIMEZONE). The
+    # per-turn current_time anchor stays authoritative; this only aligns ambient.
+    try:
+        from accounts import registry as _registry
+        _user_tz = _registry._get_user_timezone(user_id)
+    except Exception:
+        _user_tz = None
+    env["TZ"] = _user_tz or os.environ.get("FEEDLING_DEFAULT_TIMEZONE", "Asia/Shanghai").strip() or "Asia/Shanghai"
     # Stage D: the consumer reads its short-lived runtime token from this file
     # (refreshed by the supervisor). Absent/empty → it falls back to the api key.
     env["FEEDLING_RUNTIME_TOKEN_FILE"] = runtime_token_path(home)
@@ -695,6 +709,10 @@ _CONSUMER_ENV_KEYS = (
     "IMAGE_TEMP_DIR", "CONSUMER_ID", "FEEDLING_RUNTIME_TOKEN_FILE",
     "ANTHROPIC_API_KEY", "CODEX_API_KEY", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
     "FEEDLING_LITELLM_BASE_URL", "FEEDLING_LITELLM_API_KEY",
+    # Per-user ambient timezone so the containerized agent's clock isn't the
+    # container's default UTC (the process-spawn path sets it in consumer_env;
+    # without this the container strategy would silently drop it).
+    "TZ",
 )
 
 
