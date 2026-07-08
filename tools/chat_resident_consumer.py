@@ -6678,51 +6678,93 @@ def _decrypt_sealed_material(env: dict) -> bytes:
 # resident skill (owned by Seven) and is expected to be refined there. It asks for a
 # single JSON object; the memory-card fields mirror the capture card shape so
 # _capture_build_envelope consumes them unchanged.
-def _build_distill_prompt(mode: str, document: str) -> str:
-    wants_identity = mode in {"update_identity", "onboarding"}
-    identity_line = (
-        '  "identity": {"agent_name": str, "self_introduction": str, '
-        '"dimensions": [{"name": str, "value": 0-100}]} | null,\n'
-        if wants_identity else '  "identity": null,\n'
-    )
-    return (
-        "You are distilling a document the user uploaded into their own memory/identity.\n"
-        f"Distill mode: {mode or 'add_memory'}.\n"
-        "Read the material below and return ONE JSON object, nothing else:\n"
-        "{\n"
-        '  "memory_cards": [{"summary": str, "content": str, "bucket": str, "threads": [str]}],\n'
-        f"{identity_line}"
-        "}\n"
-        "Keep only durable, worth-remembering facts. Empty memory_cards is valid.\n"
-        "--- MATERIAL ---\n"
-        f"{document}\n"
-        "--- END MATERIAL ---\n"
-    )
+def _genesis_agent_completion_fn(runtime, messages, *, max_tokens: int = 1200,
+                                 temperature: float = 0.2, timeout: float = 60.0,
+                                 response_format=None):
+    """Adapter so the CLOUD genesis extraction engine can run on the VPS with the local
+    resident agent as the model. GenesisLLMClient calls this with the fact_map / fact_write
+    message list; we flatten it to one prompt, run it through call_agent, and return the
+    provider-shaped dict complete() expects. No provider, no DB — same prompts as cloud."""
+    parts = [str(m.get("content") or "").strip() for m in messages if str(m.get("content") or "").strip()]
+    reply = _capture_agent_reply_text(call_agent("\n\n".join(parts), raw_text=True))
+    return {"reply": reply, "usage": {}, "stop_reason": "stop"}
 
 
-def _parse_distill_output(text: str) -> tuple[list[dict], dict | None]:
-    """Extract the first JSON object from the agent reply → (memory_cards, identity)."""
-    raw = str(text or "").strip()
-    if not raw:
-        return [], None
-    # Strip a ```json fence if present, then take the outermost {...}.
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return [], None
+def _window_document(text: str, *, max_chars: int = 18000, overlap_lines: int = 8) -> list[str]:
+    """Split a document into ~max_chars windows with a small line overlap — same window size
+    as the cloud chunker (history_import._build_transcript_windows), so a large upload is
+    map-reduced instead of overflowing one agent call."""
+    lines = text.splitlines()
+    windows: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for line in lines:
+        cur.append(line)
+        cur_len += len(line) + 1
+        if cur_len >= max_chars:
+            windows.append("\n".join(cur))
+            cur = cur[-overlap_lines:] if overlap_lines > 0 else []
+            cur_len = sum(len(l) + 1 for l in cur)
+    tail = "\n".join(cur).strip()
+    if tail and (not windows or "\n".join(cur) != windows[-1]):
+        windows.append("\n".join(cur))
+    return windows or ([text] if text.strip() else [])
+
+
+def _resident_extract_memories(document: str, job_id: str) -> list[dict]:
+    """Reuse the CLOUD genesis memory engine on the VPS: window → fact_map (per window) →
+    fact_write, driven by the local agent (persist_output=False = no backend DB). Returns
+    cloud-shaped memory dicts {type,bucket,threads,summary,content,importance,pulse} — the
+    SAME code + prompts cloud's add_memory path uses, so the two stay in lockstep."""
+    from genesis import worker as genesis_worker  # lazy: heavy import only when a job runs
+    from genesis.llm_client import GenesisLLMClient
+    import provider_client
+    llm = GenesisLLMClient(completion_fn=_genesis_agent_completion_fn, persist_output=False)
+    runtime = provider_client.ProviderConfig(provider="resident_agent", model="local", api_key="")
+    uid = str(_whoami_cache.get("user_id") or "resident")
+    candidates: list[dict] = []
+    for idx, window in enumerate(_window_document(document), start=1):
+        out = genesis_worker.build_foreground_output_from_texts(
+            user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:map:{idx}",
+            runtime=runtime, chunk_texts=[window], write_core=False, llm=llm,
+        )
+        candidates.extend([c for c in (out.get("all_fact_candidates") or []) if isinstance(c, dict)])
+        genesis_resident_heartbeat(job_id)  # each window is one agent call — keep the lease alive
+    if not candidates:
+        return []
+    mem_out = genesis_worker.build_memory_output_from_fact_candidates(
+        user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:write",
+        runtime=runtime, fact_candidates=candidates, llm=llm,
+    )
+    return [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
+
+
+def _resident_derive_identity(document: str, job_id: str) -> dict | None:
+    """Persona/identity is small (fits one context) — a single agent derive, no chunking.
+    Returns a plaintext identity payload for identity.replace, or None if no persona content."""
+    prompt = (
+        "The user uploaded a character/persona description for the companion (you). Derive the "
+        "identity card and return ONE JSON object, nothing else:\n"
+        '{"agent_name": str, "self_introduction": str, '
+        '"dimensions": [{"name": str, "value": 0-100, "description": str}]}\n'
+        "Ground every field in the material; return {} if there is no persona content.\n"
+        "--- MATERIAL ---\n" + document + "\n--- END MATERIAL ---\n"
+    )
+    raw = str(_capture_agent_reply_text(call_agent(prompt, raw_text=True, trace_id=job_id)) or "").strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end <= start:
+        return None
     try:
         obj = json.loads(raw[start:end + 1])
     except Exception:
-        return [], None
-    if not isinstance(obj, dict):
-        return [], None
-    cards = [c for c in (obj.get("memory_cards") or []) if isinstance(c, dict)]
-    identity = obj.get("identity") if isinstance(obj.get("identity"), dict) else None
-    return cards, identity
+        return None
+    return obj if isinstance(obj, dict) and obj.get("agent_name") else None
 
 
 def _process_resident_distill_once() -> None:
-    """Claim + realize any pending resident-distill jobs for this user."""
+    """Claim + realize pending resident-distill jobs by REUSING the cloud genesis engine
+    (chunk → fact_map → fact_write) with the local agent as the model. Memory is written
+    client-sealed via memory.add; update_identity derives once → identity.replace."""
     from datetime import datetime, timezone as _tzmod
     jobs = genesis_resident_pending()
     for job in jobs:
@@ -6733,67 +6775,54 @@ def _process_resident_distill_once() -> None:
         if not job_id or not env:
             log.warning("resident distill: skipping malformed job %r", job_id)
             continue
-        tmp_path: Path | None = None
         try:
             plaintext = _decrypt_sealed_material(env)
             genesis_resident_heartbeat(job_id)  # claimed + decrypted; distill can be slow
-            IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
-            tmp_path = IMAGE_TEMP_DIR / f"genesis_distill_{job_id}.md"
-            tmp_path.write_bytes(plaintext)
             document = plaintext.decode("utf-8", errors="replace")
 
-            reply = _capture_agent_reply_text(
-                call_agent(_build_distill_prompt(mode, document), raw_text=True, trace_id=job_id)
-            )
-            genesis_resident_heartbeat(job_id)
-            cards, identity_payload = _parse_distill_output(reply)
-
-            # memory.add — consumer seals client-side (has the keys), exactly like capture.
-            occurred_at = datetime.now(_tzmod.utc).isoformat()
-            memory_actions: list[dict] = []
-            for card in cards:
-                envelope = _capture_build_envelope(
-                    card, occurred_at=occurred_at, source="genesis_resident_distill"
-                )
-                memory_actions.append({
-                    "type": "memory.add",
-                    "envelope": envelope,
-                    "reason": "Distilled from material the user uploaded.",
-                    "capture_mode": "genesis_resident_distill",
-                    "source_chat_message_ids": [],
-                })
-            if memory_actions:
-                execute_memory_actions(memory_actions)
-
-            # identity.replace — plaintext; the SERVER builds the envelope (P3 gate).
+            memory_count = 0
             identity_status = "skipped"
-            if identity_payload and mode in {"update_identity", "onboarding"}:
-                execute_identity_actions([{
-                    "type": "identity.replace",
-                    "source": "genesis_resident_distill",
-                    "job_id": job_id,
-                    "reason": "Distilled identity from material the user uploaded.",
-                    "identity": identity_payload,
-                }])
-                identity_status = "replaced"
+            if mode == "update_identity":
+                identity_payload = _resident_derive_identity(document, job_id)
+                if identity_payload:
+                    execute_identity_actions([{
+                        "type": "identity.replace",
+                        "source": "genesis_resident_distill",
+                        "job_id": job_id,
+                        "reason": "Distilled identity from material the user uploaded.",
+                        "identity": identity_payload,
+                    }])
+                    identity_status = "replaced"
+            else:  # add_memory / onboarding → cloud memory engine
+                memories = _resident_extract_memories(document, job_id)
+                occurred_at = datetime.now(_tzmod.utc).isoformat()
+                actions: list[dict] = []
+                for card in memories:
+                    envelope = _capture_build_envelope(
+                        card, occurred_at=occurred_at, source="genesis_resident_distill"
+                    )
+                    actions.append({
+                        "type": "memory.add",
+                        "envelope": envelope,
+                        "reason": "Distilled from material the user uploaded.",
+                        "capture_mode": "genesis_resident_distill",
+                        "source_chat_message_ids": [],
+                    })
+                if actions:
+                    execute_memory_actions(actions)
+                memory_count = len(actions)
 
             genesis_resident_complete(
-                job_id, memory_action_count=len(memory_actions), identity_status=identity_status
+                job_id, memory_action_count=memory_count, identity_status=identity_status
             )
             log.info(
-                "resident distill done job=%s mode=%s cards=%d identity=%s",
-                job_id, mode, len(memory_actions), identity_status,
+                "resident distill done job=%s mode=%s memories=%d identity=%s",
+                job_id, mode, memory_count, identity_status,
             )
         except Exception as e:
-            # Leave the job unclaimed-progress: the backend stale reaper re-queues it
-            # under the attempt cap (or fails it), so a transient error never wedges.
+            # Leave the job for the backend stale reaper to re-queue (under the attempt cap)
+            # so a transient error never wedges it.
             log.error("resident distill failed job=%s: %s", job_id, e)
-        finally:
-            if tmp_path is not None:
-                try:
-                    tmp_path.unlink()
-                except Exception:
-                    pass
 
 
 def run() -> None:
