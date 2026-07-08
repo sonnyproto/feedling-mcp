@@ -296,7 +296,7 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
         return {"error": "envelope required"}, 400
     missing = [f for f in _ENVELOPE_REQUIRED if not envelope.get(f)]
     if missing:
-        return {"error": f"envelope missing fields: {missing}"}, 400
+        return {"error": "envelope_missing_fields", "detail": missing}, 400
     if envelope["visibility"] not in ("shared", "local_only"):
         return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
     if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
@@ -380,7 +380,7 @@ def write_response(
         return {"error": "envelope required"}, 400
     missing = [f for f in _ENVELOPE_REQUIRED if not envelope.get(f)]
     if missing:
-        return {"error": f"envelope missing fields: {missing}"}, 400
+        return {"error": "envelope_missing_fields", "detail": missing}, 400
     if envelope["visibility"] not in ("shared", "local_only"):
         return {"error": "envelope.visibility must be 'shared' or 'local_only'"}, 400
     if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
@@ -395,7 +395,7 @@ def write_response(
             return {"error": "thinking_envelope must be an object"}, 400
         missing = [f for f in _ENVELOPE_REQUIRED if not thinking_envelope.get(f)]
         if missing:
-            return {"error": f"thinking_envelope missing fields: {missing}"}, 400
+            return {"error": "thinking_envelope_missing_fields", "detail": missing}, 400
         if thinking_envelope["visibility"] not in ("shared", "local_only"):
             return {"error": "thinking_envelope.visibility must be 'shared' or 'local_only'"}, 400
         if thinking_envelope["visibility"] == "shared" and not thinking_envelope.get("K_enclave"):

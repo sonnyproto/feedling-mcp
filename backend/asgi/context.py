@@ -22,3 +22,16 @@ current_user_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 current_runtime_claims: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "current_runtime_claims", default=None
 )
+
+# 请求级 request id：AccessLogMiddleware 在请求入口生成并放这里 + 回带
+# X-Request-Id 响应头；错误处理器（asgi/middleware.py 的 500 兜底）从这里取，
+# 让「用户报障给的 id」「错误响应体」「访问日志行」三者天然同 id 对账
+# （spec 2026-07-07-unified-error-surfacing A2）。
+current_request_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_request_id", default=""
+)
+
+
+def new_request_id() -> str:
+    import uuid
+    return "req_" + uuid.uuid4().hex[:8]
