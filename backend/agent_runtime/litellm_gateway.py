@@ -49,14 +49,15 @@ def _norm_provider(provider: str) -> str:
 
 
 # Reasoning (provider "thinking") switch for gateway backends.
-# ``FEEDLING_AGENT_REASONING_EFFORT`` sets the default effort ("high"/"medium"/
-# "low"); "off"/"none"/"" disables reasoning entirely (no extra_body sent, i.e.
-# the pre-reasoning behaviour). Default "medium" — reasoning ON, but balanced for
-# a companion chat (responsiveness + cost) rather than heavy problem-solving;
-# "high" noticeably slows reasoning-heavy models (opus/r1) for little chat gain.
+# ``FEEDLING_AGENT_REASONING_EFFORT`` sets the effort ("high"/"medium"/"low");
+# "off"/"none"/"" disables reasoning entirely (no extra_body sent, i.e. the
+# pre-reasoning behaviour). Default is "off" while the end-to-end thinking path
+# is not yet verified — flip to "medium" (env or per-user) to enable. Note this
+# switch only governs whether reasoning is REQUESTED; it has nothing to do with
+# leak safety, which the consumer guarantees regardless.
 # Per-user override arrives via the roster entry's ``reasoning_effort`` so iOS
 # can later expose a per-account reasoning toggle without touching this code.
-_DEFAULT_REASONING_EFFORT = (os.environ.get("FEEDLING_AGENT_REASONING_EFFORT", "medium") or "").strip().lower()
+_DEFAULT_REASONING_EFFORT = (os.environ.get("FEEDLING_AGENT_REASONING_EFFORT", "off") or "").strip().lower()
 _REASONING_OFF = {"", "off", "none", "no", "false", "0", "disabled"}
 
 

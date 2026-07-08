@@ -40,11 +40,20 @@ def test_model_entry_openrouter_prefix():
     assert e["litellm_params"]["model"] == "openrouter/anthropic/claude-3.5-sonnet"
 
 
-def test_model_entry_openrouter_requests_reasoning_with_effort_by_default():
-    # `enabled: true` alone yields no reasoning for Anthropic-family models on
-    # openrouter — an effort budget is required. Default effort is "medium".
+def test_model_entry_openrouter_no_reasoning_by_default():
+    # Reasoning is OFF by default (end-to-end path not yet verified); the gateway
+    # sends no reasoning extra_body until explicitly enabled via env/per-user.
     e = gw.build_model_entry(user_id="u", provider="openrouter", model="deepseek/deepseek-v4-flash")
 
+    assert "extra_body" not in e["litellm_params"]
+
+
+def test_model_entry_openrouter_uses_effort_not_enabled_when_on():
+    # When enabled, OpenRouter needs an effort budget — `enabled: true` alone
+    # yields no reasoning for Anthropic-family models.
+    e = gw.build_model_entry(
+        user_id="u", provider="openrouter", model="m", reasoning_effort="medium",
+    )
     assert e["litellm_params"]["extra_body"]["reasoning"] == {
         "effort": "medium",
         "exclude": False,
