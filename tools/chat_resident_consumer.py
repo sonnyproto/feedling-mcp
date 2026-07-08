@@ -398,6 +398,15 @@ _ERROR_CLASS_RULES = (
                 r"|unreachable|stream disconnected", re.I)),
 )
 
+# 机读全集导出，供 backend/notices/catalog.py 的一致性测试比对（spec Phase B /
+# B3）：_ERROR_CLASS_RULES 里的 5 类 + classify_agent_error 硬编码分支里的
+# turn_timeout / reply_parse_failed / model_not_found（裸 404+model）/ unknown。
+# 只是把已有分类逻辑的 error_class 取值收成集合，不改分类逻辑本身。
+CONSUMER_ERROR_CLASSES = frozenset(
+    {klass for klass, _blame, _text, _pat in _ERROR_CLASS_RULES}
+    | {"turn_timeout", "reply_parse_failed", "model_not_found", "unknown"}
+)
+
 
 def classify_agent_error(exc: BaseException) -> AgentErrorNotice:
     """三层错误来源（claude/codex CLI 经 _cli_error_detail、stderr 兜底）已汇聚成

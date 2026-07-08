@@ -55,6 +55,8 @@ from content_encryption import build_envelope
 
 from core import util as core_util
 import provider_client
+from notices import core as notices_core
+from notices import catalog as notices_catalog
 
 
 def _load_model_api_config(store: UserStore) -> dict | None:
@@ -216,6 +218,18 @@ def record_runtime_error(store: UserStore, *, error: str, error_class: str = "")
     }
     if _patch_model_api_runtime_profile(store, patch) is None:
         return {"error": "model_api_runtime_profile_missing"}, 404
+    try:
+        if error:
+            ec = error_class or "unknown"
+            notices_core.emit(
+                store, source="chat", error_class=ec,
+                blame=notices_catalog.blame_for(ec), severity="error",
+                user_text=notices_catalog.user_text_for(ec),
+                detail=error, dedupe_key=f"chat:{ec}")
+        else:
+            notices_core.resolve(store, "chat:")
+    except Exception:
+        pass   # 扇出绝不影响 record_runtime_error 主职责（emit/resolve 本身已 never-raise，这是双保险）
     return {"ok": True}, 200
 
 
