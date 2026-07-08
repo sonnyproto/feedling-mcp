@@ -566,6 +566,38 @@ def _plaintext_existing_voice_workset_for_update(store, api_key: str | None) -> 
         return {}
 
 
+def _plaintext_existing_identity_for_update(store, api_key: str | None) -> dict:
+    """Decrypt the current identity card so update_identity can 部分补全 (merge:
+    keep fields the new material doesn't address). Best-effort — on any failure
+    return {} so the job falls back to the old fresh-derive behavior."""
+    try:
+        blob = identity_service._load_identity(store)
+        if not isinstance(blob, dict) or not blob.get("body_ct"):
+            return {}
+        raw = core_enclave._decrypt_envelope_via_enclave(blob, api_key, purpose="identity_update_merge")
+        parsed = json.loads(raw.decode("utf-8"))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _plaintext_existing_persona_for_update(store, api_key: str | None) -> str:
+    """Decrypt the current genesis persona so update_identity can merge (旧 persona
+    + 新材料) instead of rebuilding from the new material alone. Best-effort — on
+    any failure return "" so persona falls back to the old rebuild behavior."""
+    try:
+        blob = db.get_blob(store.user_id, service.GENESIS_PERSONA_BLOB)
+        if not isinstance(blob, dict):
+            return ""
+        envelope = blob.get("content_envelope")
+        if not isinstance(envelope, dict):
+            return ""
+        raw = core_enclave._decrypt_envelope_via_enclave(envelope, api_key, purpose="genesis_persona")
+        return raw.decode("utf-8")
+    except Exception:
+        return ""
+
+
 def _merged_has_identity(merged: dict) -> bool:
     """True when the reduce output carries a usable Identity Card (a name or any
     dimension). Mirrors service._identity_payload_from_output's emptiness rule."""
@@ -1069,12 +1101,16 @@ def _run_plaintext_update_identity_job(
         return
     msgs = analysis_messages if isinstance(analysis_messages, list) else []
     language = history_import._import_language_for_store(store, msgs)
+    # 部分补全:merge onto the current card so fields the upload doesn't mention are
+    # kept (not re-derived to empty). Best-effort decrypt; {} => old fresh-derive.
+    existing_identity = _plaintext_existing_identity_for_update(store, api_key)
     identity_payload, warnings = history_import._derive_identity_with_provider(
         runtime,
         msgs,
         [],
         0,
         language,
+        existing_identity=existing_identity,
     )
     provider_failure = _provider_identity_failure(warnings)
     if provider_failure:
@@ -1088,6 +1124,7 @@ def _run_plaintext_update_identity_job(
         service.mark_failed(store, job_id, "persona_material_required")
         return
     voice_workset = _plaintext_existing_voice_workset_for_update(store, api_key)
+    existing_persona = _plaintext_existing_persona_for_update(store, api_key)
     try:
         persona_output = worker.build_persona_output_from_material(
             user_id=store.user_id,
@@ -1098,6 +1135,7 @@ def _run_plaintext_update_identity_job(
             voice_workset=voice_workset,
             source_kind="identity_update",
             source_family="ai_persona",
+            existing_persona=existing_persona,
         )
     except Exception as e:  # noqa: BLE001
         service.mark_failed(store, job_id, f"persona_rebuild_failed:{type(e).__name__}:{str(e)[:160]}")

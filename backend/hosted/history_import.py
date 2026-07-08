@@ -2668,12 +2668,30 @@ def _normalize_identity_payload(raw, memories: list[dict], days: int, language: 
     return payload
 
 
+# ── DRAFT(措辞待 Seven 定稿):二次上传"部分补全"——当传入 existing_identity 时,派生是对
+# 【已有卡 + 新材料】的合并(新材料没提到的字段保留旧卡),而不是从零重派生(否则部分上传会把没
+# 提到的字段派成空/瞎补)。默认 None = 与 onboarding 逐字一致。英文,匹配本 prompt 的语言。
+# 行为需真机 e2e。见 docs/genesis-distill-panorama.md §9 / Seven 校准第 3 点。
+_IDENTITY_UPDATE_MERGE_TEMPLATE = (
+    "\n\nThis is an UPDATE to an EXISTING identity card, not a fresh derivation.\n"
+    "Existing card:\n{existing_identity_json}\n"
+    "Merge rules:\n"
+    "- For fields the new material ADDRESSES, use the new values (latest wins). On a SERIOUS "
+    "conflict, the new material wins — the user uploaded it to change the card.\n"
+    "- For fields the new material does NOT address, KEEP the existing card's values unchanged — "
+    "do not blank them and do not invent replacements.\n"
+    "- Keep the result COHERENT: if a trait / dimension changes, update self_introduction / "
+    "tone_style to match, so no stale description from the old card survives."
+)
+
+
 def _derive_identity_with_provider(
     provider: provider_client.ProviderConfig,
     messages: list[dict],
     memory_cards: list[dict],
     days: int,
     language: str = "en",
+    existing_identity: dict | None = None,
 ) -> tuple[dict, list[str]]:
     warnings: list[str] = []
     memory_sample = json.dumps(memory_cards[:40], ensure_ascii=False)
@@ -2718,6 +2736,10 @@ def _derive_identity_with_provider(
         f"days_with_user is {days}.\n\nSource stats:\n{json.dumps(source_stats, ensure_ascii=False)}"
         f"\n\nMemory cards:\n{memory_sample}\n\nTranscript sample:\n{transcript}"
     )
+    if isinstance(existing_identity, dict) and existing_identity:
+        prompt += _IDENTITY_UPDATE_MERGE_TEMPLATE.format(
+            existing_identity_json=json.dumps(existing_identity, ensure_ascii=False),
+        )
     try:
         result = provider_client.reliable_chat_completion(
             provider,

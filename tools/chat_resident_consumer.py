@@ -6971,16 +6971,54 @@ def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = F
     return [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
 
 
+def _resident_existing_identity() -> dict:
+    """Best-effort decrypt of the current identity card so update_identity 部分补全
+    keeps fields the upload doesn't mention (parallel to the cloud card merge).
+    {} => fresh derive (old behavior). VPS has no genesis persona, so this is card-only."""
+    try:
+        body = (
+            _capture_get_json("/v1/identity/get", base_url=FEEDLING_ENCLAVE_URL)
+            if FEEDLING_ENCLAVE_URL else {}
+        )
+        if not isinstance(body.get("identity"), dict):
+            body = _capture_get_json("/v1/identity/get")
+        identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
+        return {
+            k: identity[k]
+            for k in ("agent_name", "self_introduction", "dimensions")
+            if identity.get(k) not in (None, "", [], {})
+        }
+    except Exception:
+        return {}
+
+
 def _resident_derive_identity(document: str, job_id: str) -> dict | None:
     """Persona/identity is small (fits one context) — a single agent derive, no chunking.
     Returns a plaintext identity payload for identity.replace, or None if no persona content."""
+    existing = _resident_existing_identity()
+    # 部分补全: merge onto the current card so fields the upload doesn't mention stay put.
+    # DRAFT wording (Seven to finalize); mirrors the cloud _IDENTITY_UPDATE_MERGE_TEMPLATE.
+    merge_block = ""
+    if existing:
+        merge_block = (
+            "This is an UPDATE to an EXISTING identity card, not a fresh derivation.\n"
+            "Existing card:\n" + json.dumps(existing, ensure_ascii=False) + "\n"
+            "Merge rules:\n"
+            "- For fields the new material ADDRESSES, use the new values (latest wins). On a "
+            "SERIOUS conflict, the new material wins — the user uploaded it to change the card.\n"
+            "- For fields the new material does NOT address, KEEP the existing card's values "
+            "unchanged — do not blank them and do not invent replacements.\n"
+            "- Keep the result COHERENT: if a trait / dimension changes, update self_introduction "
+            "/ tone_style to match, so no stale description from the old card survives.\n"
+        )
     prompt = (
         "The user uploaded a character/persona description for the companion (you). Derive the "
         "identity card and return ONE JSON object, nothing else:\n"
         '{"agent_name": str, "self_introduction": str, '
         '"dimensions": [{"name": str, "value": 0-100, "description": str}]}\n'
         "Ground every field in the material; return {} if there is no persona content.\n"
-        "--- MATERIAL ---\n" + document + "\n--- END MATERIAL ---\n"
+        + merge_block
+        + "--- MATERIAL ---\n" + document + "\n--- END MATERIAL ---\n"
     )
     raw = str(_capture_agent_reply_text(call_agent(prompt, raw_text=True, trace_id=job_id)) or "").strip()
     start, end = raw.find("{"), raw.rfind("}")

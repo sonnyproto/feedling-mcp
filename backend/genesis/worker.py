@@ -1106,6 +1106,7 @@ def build_persona_output_from_material(
     voice_workset: dict | None = None,
     source_kind: str = "identity_update",
     source_family: str = "ai_persona",
+    existing_persona: str = "",
     llm: GenesisLLMClient | None = None,
 ) -> dict:
     """Build a persona artifact from explicit role-card material.
@@ -1113,6 +1114,11 @@ def build_persona_output_from_material(
     Used by update_identity: the agent's spawned persona is generated from the
     uploaded role card, not from the normalized Identity Card. Existing voice
     workset is reused when present so name/persona updates do not rewrite voice.
+
+    When ``existing_persona`` is passed (二次上传部分补全), the build merges the old
+    persona with the new material (keep what the new material doesn't address)
+    instead of rebuilding from the new material alone — parallel to the identity-
+    card merge so card and persona stay consistent. Default "" = byte-identical.
     """
     llm = llm or GenesisLLMClient()
     prefix = _idempotency_prefix(job_id, key_prefix)
@@ -1128,7 +1134,12 @@ def build_persona_output_from_material(
         job_id=job_id,
         task_id="persona-build",
         runtime=runtime,
-        messages=prompts.persona_build_messages(str(persona_material or "").strip(), behavior_notes, founding),
+        messages=prompts.persona_build_messages(
+            str(persona_material or "").strip(),
+            behavior_notes,
+            founding,
+            existing_persona=str(existing_persona or "").strip(),
+        ),
         max_tokens=4000,
         idempotency_key=f"{prefix}:persona_build",
     )

@@ -492,6 +492,30 @@ def cmd_chat_image(args):
     _emit({"ok": True, "message_id": mid, **(out if isinstance(out, dict) else {"data": out})})
 
 
+def cmd_identity_read(args):
+    """Read the CURRENT identity card (decrypted) so a rewrite builds ON it, not over it.
+
+    Call this BEFORE writing/re-deriving identity from material a user hands you:
+    keep the fields the new material doesn't address (部分补全), only change what it
+    does. Decrypt source is the enclave's ``GET /v1/identity/get`` (TEE cert the
+    stdlib client doesn't verify → insecure=True, mirrors chat-image), falling back
+    to the backend when no enclave is configured."""
+    auth = _auth_headers()
+    if not auth:
+        _emit({"ok": False, "error": "missing auth (FEEDLING_API_KEY or runtime token) in env"}, 2)
+    enclave_url = _env("FEEDLING_ENCLAVE_URL")
+    status, body = -1, {}
+    if enclave_url:
+        status, body = _http_json("GET", f"{enclave_url.rstrip('/')}/v1/identity/get", auth, insecure=True)
+    if status != 200 or not (isinstance(body, dict) and isinstance(body.get("identity"), dict)):
+        api_url = _env("FEEDLING_API_URL")
+        if api_url:
+            status, body = _http_json("GET", f"{api_url.rstrip('/')}/v1/identity/get", auth)
+    if status == 200 and isinstance(body, dict):
+        _emit({"ok": True, **body})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
 def _identity_write_payload(self_introduction, signature):
     """Build the /v1/identity/actions body for a profile_patch. Pure (testable).
 
@@ -664,6 +688,10 @@ def main():
     cw.add_argument("--wake-id", dest="wake_id", required=True, help="The scheduled wake/timer id to cancel.")
     cw.add_argument("--reason", default="", help="Why (optional).")
     cw.set_defaults(func=cmd_cancel_wake)
+
+    ir = sub.add_parser("identity-read",
+                        help="Read the CURRENT identity card (decrypted) — call before rewriting so you build on it (部分补全).")
+    ir.set_defaults(func=cmd_identity_read)
 
     iw = sub.add_parser("identity-write",
                         help="Patch the agent's identity card (self_introduction / signature).")
