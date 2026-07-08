@@ -40,13 +40,41 @@ def test_model_entry_openrouter_prefix():
     assert e["litellm_params"]["model"] == "openrouter/anthropic/claude-3.5-sonnet"
 
 
-def test_model_entry_openrouter_requests_visible_reasoning():
+def test_model_entry_openrouter_requests_reasoning_with_effort_by_default():
+    # `enabled: true` alone yields no reasoning for Anthropic-family models on
+    # openrouter — an effort budget is required. Default effort is "medium".
     e = gw.build_model_entry(user_id="u", provider="openrouter", model="deepseek/deepseek-v4-flash")
 
     assert e["litellm_params"]["extra_body"]["reasoning"] == {
-        "enabled": True,
+        "effort": "medium",
         "exclude": False,
     }
+
+
+def test_model_entry_openrouter_per_user_effort_override():
+    # Per-user override (future iOS reasoning toggle) wins over the default.
+    e = gw.build_model_entry(
+        user_id="u", provider="openrouter", model="m", reasoning_effort="medium",
+    )
+    assert e["litellm_params"]["extra_body"]["reasoning"]["effort"] == "medium"
+
+
+def test_model_entry_openrouter_reasoning_off_sends_no_reasoning():
+    # A per-user "off" disables reasoning entirely (no extra_body sent).
+    e = gw.build_model_entry(
+        user_id="u", provider="openrouter", model="m", reasoning_effort="off",
+    )
+    assert "extra_body" not in e["litellm_params"]
+
+
+def test_build_config_threads_per_user_reasoning_effort():
+    cfg = gw.build_config([
+        {"user_id": "u1", "provider": "openrouter", "model": "m", "reasoning_effort": "low"},
+        {"user_id": "u2", "provider": "openrouter", "model": "m", "reasoning_effort": "off"},
+    ])
+    entries = {e["model_name"]: e["litellm_params"] for e in cfg["model_list"]}
+    assert entries["gw-u1"]["extra_body"]["reasoning"]["effort"] == "low"
+    assert "extra_body" not in entries["gw-u2"]
 
 
 def test_model_entry_openai_compatible_carries_api_base():
