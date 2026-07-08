@@ -105,7 +105,7 @@ def test_resident_chat_response_emits_route_trace(client, monkeypatch):
     monkeypatch.setattr(
         boot_gates,
         "_gate_bootstrap_for_chat",
-        lambda store, allow_verify_reply=False: None,
+        lambda store, allow_verify_reply=False, is_verify_reply=False: None,
     )
     user_id, api_key = _register(client)
     _enable_trace(client, api_key)
@@ -131,7 +131,7 @@ def test_resident_chat_response_emits_route_trace(client, monkeypatch):
 
 
 def test_resident_chat_response_gate_emits_route_trace(client, monkeypatch):
-    def fake_gate(_store, *, allow_verify_reply=False):
+    def fake_gate(_store, *, allow_verify_reply=False, is_verify_reply=False):
         return {"error": "bootstrap_incomplete"}, 409
 
     monkeypatch.setattr(boot_gates, "_gate_bootstrap_for_chat", fake_gate)

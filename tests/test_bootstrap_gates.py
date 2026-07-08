@@ -458,6 +458,56 @@ def test_chat_response_blocked_when_memory_ok_but_no_identity(backend):
     assert body["identity_written"] is False
 
 
+def test_chat_response_allowed_when_user_has_spoken_without_identity(backend):
+    """A'' (2026-07): a user who is ALREADY talking must not be hard-blocked
+    just because the agent hasn't written the identity card yet. Once a genuine
+    user message exists, /v1/chat/response is delivered (200) even at
+    stage=needs_identity — this is the endless "typing…" bug from prod
+    usr_e326d5cc. The UNPROMPTED path (no user message yet) still 409s: see
+    test_chat_response_blocked_when_no_identity, which stays green."""
+    user_id, api_key = _register(backend["base_url"])
+    # User reaches out first (append_chat stamps role="user" source="chat"),
+    # skipping / ignoring onboarding.
+    env = _stub_envelope(user_id, "user-said-hi-before-identity")
+    msg = requests.post(
+        f"{backend['base_url']}/v1/chat/message",
+        json={"envelope": env},
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert msg.status_code == 200, msg.text
+    # The agent's reply now flows despite no identity card being written.
+    r = _chat_response(backend["base_url"], user_id, api_key)
+    assert r.status_code == 200, f"reply should be delivered, got {r.status_code}: {r.text}"
+    assert "id" in r.json()
+
+
+def test_chat_response_verify_ping_stays_gated_pre_identity(backend):
+    """A'' tightening: the softening is for genuine user-facing replies only. A
+    verify-ping reply (source="verify_ping", the hidden liveness probe of
+    feedling_chat_verify_loop) still 409s pre-identity even after the user has
+    spoken — so the forcing function to write identity before the loop is
+    'verified' survives."""
+    user_id, api_key = _register(backend["base_url"])
+    env = _stub_envelope(user_id, "user-said-hi")
+    msg = requests.post(
+        f"{backend['base_url']}/v1/chat/message",
+        json={"envelope": env},
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert msg.status_code == 200, msg.text
+    reply = _stub_envelope(user_id, "verify-reply")
+    r = requests.post(
+        f"{backend['base_url']}/v1/chat/response",
+        json={"envelope": reply, "source": "verify_ping", "alert_body": "hi"},
+        headers={"X-API-Key": api_key},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 409, f"verify reply should stay gated, got {r.status_code}: {r.text}"
+    assert r.json()["stage"] == "needs_identity"
+
+
 def test_chat_response_allowed_after_full_bootstrap_and_live_connection(backend):
     """Story floor + About me floor + identity_init + live connection → chat_response 200."""
     user_id, api_key = _register(backend["base_url"])
