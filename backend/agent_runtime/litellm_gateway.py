@@ -123,6 +123,25 @@ def build_model_entry(
                 },
             }
     if normalized_provider == "openai_compatible":
+        # codex `exec` always ships a `web_search` tool and offers no switch to
+        # suppress it (checked on codex-cli 0.142.4: `[tools] web_search = false`,
+        # `-c tools.web_search=false` and `--disable web_search_request` all leave
+        # it on the wire). The responses→chat bridge below lifts that tool out of
+        # `tools` into a top-level `web_search_options` carrying an empty
+        # `user_location`; relays re-materialize it as Anthropic's
+        # `web_search_20250305` and the upstream 400s on the empty location
+        # (`tools.8.web_search_20250305.user_location: At least one field must be
+        # specified.`), killing the turn before the model runs.
+        #
+        # `drop_params` alone cannot fix this: it only strips params the provider
+        # does NOT support, and `web_search_options` IS an openai param. Only
+        # `additional_drop_params` removes it — and it must ride HERE, in
+        # litellm_params: `get_optional_params` reads it from the per-call kwargs
+        # (which the proxy fills from this dict) and never falls back to the
+        # `litellm_settings` global. Dropping it leaves the `function` tools
+        # (io_cli via `exec_command`) untouched; the agent loses web search, which
+        # has never once succeeded on these relays.
+        params["additional_drop_params"] = ["web_search_options"]
         # Codex speaks the OpenAI Responses wire (POST /v1/responses) ONLY. LiteLLM
         # treats provider=openai as natively Responses-capable (utils.get_provider_
         # responses_api_config → OpenAIResponsesAPIConfig) and passes /v1/responses
