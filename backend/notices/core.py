@@ -24,7 +24,7 @@ NOTICES_STREAM = "user_notices"
 NOTICES_MAX = 200
 RESOLVED_WINDOW_SEC = 7 * 86400
 
-VALID_SOURCES = ("genesis", "history_import", "memory", "runner", "chat")
+VALID_SOURCES = ("genesis", "history_import", "memory", "runner", "chat", "model_api")
 VALID_BLAME = ("user_provider", "provider_transient", "system")
 VALID_SEVERITY = ("error", "warning")
 

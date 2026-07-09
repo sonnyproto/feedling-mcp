@@ -126,7 +126,7 @@ GET /v1/notices?include_resolved=<bool, 默认 true>
   "notices": [
     {
       "notice_id":   "ntc_9f2c…",
-      "source":      "genesis",          // 哪个子系统：genesis|history_import|memory|runner|chat
+      "source":      "genesis",          // 哪个子系统：genesis|history_import|memory|runner|chat|model_api
       "error_class": "quota_insufficient",
       "blame":       "user_provider",
       "severity":    "error",            // error=红/问题态, warning=黄/降级
@@ -171,6 +171,7 @@ GET /v1/notices?include_resolved=<bool, 默认 true>
 | `memory` | `memory_backoff` | 记忆整理连续失败进入退避 | 设置页 provider 区 |
 | `runner` | `runner_spawn_failed` / `runner_key_decrypt_failed` | AI 进程起不来（用户表现为「永远没回复」） | 设置页 |
 | `runner` | `runner_degraded`（warning） | AI 在跑但部分能力受损 | 设置页 |
+| `model_api` | `responses_unsupported`（warning，blame=user_provider） | openai_compatible 中转不支持 `/v1/responses`，codex 工具循环被桥接 mangle→记忆/工具静默不可靠（回合仍 rc=0，AI 嘴上说调工具却从不真调）。**setup 探测时发**，非回合失败时 | 设置页 |
 | `chat` | 上游类全套（§五的列表） | 对话回合失败（与 system 气泡同源双写） | 聊天 |
 
 ---
