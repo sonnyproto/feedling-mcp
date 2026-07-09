@@ -128,7 +128,39 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     hosted_config_store._ensure_model_api_runtime_profile(store, config, touch=True)
     accounts_onboarding._save_onboarding_route(store, "model_api")
     print(f"[model_api:{store.user_id}] setup provider={provider} model={model}")
-    return {"status": "configured", "config": hosted_config_store._public_model_api_config(config)}, 200
+
+    # openai_compatible 中转不实现 /v1/responses → LiteLLM 强制 chat-completions
+    # 桥接 → mangle codex 工具循环 → 记忆/工具静默不可靠(rc=0 但工具从不真调,
+    # 无限"我再试一次")。配置期就能预知,双写:
+    #   ① setup 响应带 warnings → 设置页保存后当场显示(不必等通知中心页)
+    #   ② 通知中心 emit → 持久化,通知中心页/其它端也能看到
+    # 换到支持 /v1/responses 的中转(或非 openai_compatible provider)时 resolve。
+    warnings: list[dict] = []
+    try:
+        from notices import core as notices_core
+        from notices import catalog as notices_catalog
+        _ec = "responses_unsupported"
+        if provider == "openai_compatible" and not supports_responses:
+            _blame = notices_catalog.blame_for(_ec)
+            _text = notices_catalog.user_text_for(_ec)
+            warnings.append({
+                "error_class": _ec, "blame": _blame,
+                "severity": "warning", "user_text": _text,
+            })
+            notices_core.emit(
+                store, source="model_api", error_class=_ec,
+                blame=_blame, severity="warning", user_text=_text,
+                detail=f"probe /v1/responses -> supported=False (base_url={base_url})",
+                dedupe_key=f"model_api:{_ec}")
+        else:
+            notices_core.resolve(store, f"model_api:{_ec}")
+    except Exception:
+        pass  # 扇出绝不影响 setup 主职责(emit/resolve 本身已 never-raise,这是双保险)
+
+    resp = {"status": "configured", "config": hosted_config_store._public_model_api_config(config)}
+    if warnings:
+        resp["warnings"] = warnings
+    return resp, 200
 
 
 def model_api_get(store) -> tuple[dict, int]:
@@ -203,6 +235,13 @@ def model_api_test(store, *, api_key: str | None) -> tuple[dict, int]:
 def model_api_delete(store) -> tuple[dict, int]:
     deleted = db.delete_blob(store.user_id, "model_api")
     db.delete_blob(store.user_id, hosted_config_store.MODEL_API_RUNTIME_BLOB)
+    # 配置没了,任何 config 期发出的 model_api 警告(如 responses_unsupported)也随之
+    # 作废——否则 /v1/notices 会为一个已不存在的 provider 一直显示活跃警告。
+    try:
+        from notices import core as notices_core
+        notices_core.resolve(store, "model_api:")
+    except Exception:
+        pass  # 扇出绝不影响 delete 主职责
     print(f"[model_api:{store.user_id}] deleted={deleted}")
     return {"deleted": deleted}, 200
 

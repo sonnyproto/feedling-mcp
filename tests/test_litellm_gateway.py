@@ -177,6 +177,34 @@ def test_build_config_preserves_reasoning_params_and_sets_master_key_env():
     assert [m["model_name"] for m in cfg["model_list"]] == ["gw-u1"]
 
 
+def test_openai_compatible_entry_drops_web_search_options_per_model():
+    """codex `exec` always ships a `web_search` tool and offers no switch to turn
+    it off (checked on codex-cli 0.142.4: `[tools] web_search = false`,
+    `-c tools.web_search=false` and `--disable web_search_request` all leave it on
+    the wire). The responses→chat bridge lifts that tool out of `tools` into a
+    top-level `web_search_options` with an empty `user_location`; relays then
+    re-materialize it as Anthropic's `web_search_20250305` and the upstream 400s
+    (`tools.8.web_search_20250305.user_location: At least one field must be
+    specified.`), killing the turn before the model runs.
+
+    The drop MUST live in litellm_params, not litellm_settings: verified against
+    litellm 1.89.4 that `get_optional_params` reads `additional_drop_params` from
+    the per-call kwargs only and never falls back to the module global, so a
+    `litellm_settings` entry is a silent no-op."""
+    entry = gw.build_model_entry(
+        user_id="u1", provider="openai_compatible", model="claude-sonnet-4-6",
+        base_url="https://relay/v1")
+    assert entry["litellm_params"]["additional_drop_params"] == ["web_search_options"]
+
+
+def test_web_search_drop_is_scoped_to_openai_compatible():
+    """Other gateway providers keep web search: only the openai_compatible relays
+    have been observed 400ing on it."""
+    for provider in ("openrouter", "gemini"):
+        entry = gw.build_model_entry(user_id="u1", provider=provider, model="m")
+        assert "additional_drop_params" not in entry["litellm_params"], provider
+
+
 def test_build_config_never_inlines_upstream_keys():
     # the on-disk config must not contain any plaintext provider key
     cfg = gw.build_config([

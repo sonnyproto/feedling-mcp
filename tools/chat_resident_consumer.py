@@ -3364,6 +3364,21 @@ def call_agent_cli(
     _wall_ms = int((time.monotonic() - _turn_t0) * 1000)
     _log_cli_turn_timing(cmd, result, _wall_ms)
     _m = _cli_turn_metrics(cmd, result, _wall_ms)
+    _excerpt = {"reply_head": (result.stdout or "")[:1000],
+                "stderr_head": (result.stderr or "")[:500]}
+    if result.returncode != 0:
+        # `reply_head` almost never contains the cause. codex opens every stream
+        # with a `thread.started` plus two harmless notices (deprecated
+        # `[features].collab`, missing model metadata for the `gw-<uid>` alias)
+        # that eat ~500 of the 1000 bytes; the failing `error` event lands past
+        # the cap. Every failure therefore *looks* identical in the trace no
+        # matter what killed it — a `web_search` 400 and an upstream 403 both
+        # truncate to the same two notices, and both have been misdiagnosed as a
+        # "collab crash". `_cli_error_detail` already pulls the last top-level
+        # error event for the RuntimeError below (the notices are nested under
+        # `item.completed` and never match), so surface the same string here.
+        _excerpt = {"error_detail": _cli_error_detail(result.stdout or "", result.stderr or ""),
+                    **_excerpt}
     _emit_debug_trace(
         "agent", "agent.model.call.done" if result.returncode == 0 else "agent.model.call.error",
         status="ok" if result.returncode == 0 else "error", trace_id=trace_id, dur_ms=_wall_ms,
@@ -3373,8 +3388,7 @@ def call_agent_cli(
                  if result.returncode == 0 else f"模型调用失败 rc={result.returncode}"),
         detail={k: _m[k] for k in ("driver", "rc", "agent_ms", "api_ms", "num_turns",
                                    "steps", "input_tokens", "output_tokens")},
-        content_excerpt={"reply_head": (result.stdout or "")[:1000],
-                         "stderr_head": (result.stderr or "")[:500]},
+        content_excerpt=_excerpt,
     )
 
     raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")

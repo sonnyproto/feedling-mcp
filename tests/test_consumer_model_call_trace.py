@@ -183,3 +183,78 @@ def test_call_agent_http_accepts_trace_id_without_error(monkeypatch):
 
     result = crc.call_agent("hello", trace_id="trace-http")
     assert result is not None
+
+
+def test_error_event_carries_error_detail_beyond_the_reply_head_cap(monkeypatch):
+    """`reply_head` is capped at 1000 bytes and codex spends the first ~500 of
+    them on two harmless notices (deprecated `[features].collab`, missing model
+    metadata for the `gw-<uid>` alias) emitted before it ever contacts the model.
+    What remains of the cap goes to retry chatter, so the FINAL error event — the
+    one naming the cause — is cut off. Read from the top, every failure looks like
+    the same two notices no matter what killed the turn; a `web_search` 400 and an
+    upstream 403 have both been misdiagnosed as a "collab crash" this way.
+
+    `_cli_error_detail` already extracts that final event for the RuntimeError
+    below (the notices are nested under `item.completed`, so they never match a
+    top-level `type == "error"`). Surface the same string on the trace event."""
+    reconnect = ('{"type":"error","message":"Reconnecting... %d/5 (unexpected status 403 '
+                 'Forbidden: litellm.APIError: APIError: OpenAIException - upstream rejected '
+                 'the request for model gw-usr_deadbeefcafe0123)"}')
+    stdout = "\n".join([
+        '{"type":"thread.started","thread_id":"019f4716-e30b-7371-874b-b490e8ea29d3"}',
+        '{"type":"item.completed","item":{"id":"item_0","type":"error","message":'
+        '"`[features].collab` is deprecated. Use `[features].multi_agent` instead. '
+        '(Enable it with `--enable multi_agent` or `[features].multi_agent` in '
+        'config.toml. See https://developers.openai.com/codex/config-basic for details.)"}}',
+        '{"type":"item.completed","item":{"id":"item_1","type":"error","message":'
+        '"Model metadata for `gw-usr_deadbeefcafe0123` not found. Defaulting to fallback '
+        'metadata; this can degrade performance and cause issues."}}',
+        '{"type":"turn.started"}',
+        *[reconnect % i for i in range(1, 6)],
+        '{"type":"error","message":"BALANCE_EXHAUSTED 预扣费额度失败, 用户剩余额度: ¥0.129786"}',
+        '{"type":"turn.failed","error":{"message":"upstream 403"}}',
+    ])
+    assert len(stdout) > 1000, "fixture must overflow the reply_head cap"
+
+    result = subprocess.CompletedProcess(
+        args=["codex"], returncode=1, stdout=stdout, stderr="Reading additional input from stdin...\n",
+    )
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec "{message}"')
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["codex", "exec", message])
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+
+    calls, fake_emit = _recorder()
+    monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
+
+    with pytest.raises(RuntimeError):
+        crc.call_agent_cli("hi", trace_id="trace-403")
+
+    excerpt = calls[1]["content_excerpt"]
+
+    # the excerpt opens on the notices, and the final error is past the cap
+    assert "collab" in excerpt["reply_head"][:500]
+    assert "BALANCE_EXHAUSTED" not in excerpt["reply_head"]
+
+    # ...but the event now names the cause, in full, uncontaminated by the notices
+    assert "BALANCE_EXHAUSTED" in excerpt["error_detail"]
+    assert "¥0.129786" in excerpt["error_detail"]
+    assert "collab" not in excerpt["error_detail"]
+
+
+def test_error_detail_absent_on_successful_turns(monkeypatch):
+    """rc=0 has no error to surface; `_cli_error_detail` would fall back to a raw
+    stdout snippet, which is noise on the `.done` event."""
+    result = subprocess.CompletedProcess(
+        args=["codex"], returncode=0, stdout='{"type":"agent_message","message":"hi"}', stderr="",
+    )
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec "{message}"')
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["codex", "exec", message])
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+
+    calls, fake_emit = _recorder()
+    monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
+    crc.call_agent_cli("hi", trace_id="trace-ok")
+
+    done = calls[1]
+    assert done["type"] == "agent.model.call.done"
+    assert "error_detail" not in (done["content_excerpt"] or {})

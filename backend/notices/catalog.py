@@ -41,6 +41,11 @@ ERROR_CLASSES = frozenset({
     "runner_spawn_failed",
     "runner_key_decrypt_failed",
     "runner_degraded",
+    # model_api config-time warning — same rationale as above. Emitted at setup
+    # when an openai_compatible relay does not implement /v1/responses: LiteLLM
+    # then force-bridges responses→chat-completions, which mangles codex's tool
+    # loop so memory/tool calls silently go unreliable (turn still rc=0).
+    "responses_unsupported",
 })
 
 # error_class -> (blame, user_text)
@@ -84,6 +89,9 @@ _CATALOG: dict[str, tuple[str, str]] = {
         "system", "你的 AI 助手暂时无法启动（密钥读取失败），我们正在处理。"),
     "runner_degraded": (
         "system", "你的 AI 助手部分能力暂时受限，正在自动恢复。"),
+    "responses_unsupported": (
+        "user_provider", "你选的中转不支持 Responses 协议，AI 的记忆和工具调用可能不稳定。"
+        "建议换一个支持 /v1/responses 的中转，或改用 Claude 类模型。"),
 }
 
 _FALLBACK_BLAME = "system"
