@@ -1794,6 +1794,124 @@ def test_chat_history_hides_verify_reply_but_keeps_ping(client):
     assert body["total"] == 2, body
 
 
+def test_chat_history_hides_stale_verify_ping(client):
+    """A verify PING that outlived its verify_loop (GC skipped by a mid-run
+    SIGTERM) must NOT linger in the visible feed as a '__VERIFY_PING__:...'
+    bubble. Fresh pings stay (enclave consumer needs them); stale ones drop."""
+    import time
+    import uuid
+
+    from chat import chat_core
+    from core import store as core_store
+
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+
+    def _env(body: str) -> dict:
+        return {
+            "v": 1, "id": uuid.uuid4().hex, "body_ct": _b64(body.encode("utf-8")),
+            "nonce": _b64(b"\x00" * 12), "K_user": _b64(b"\x00" * 32),
+            "visibility": "local_only", "owner_user_id": user_id,
+        }
+
+    real = store.append_chat("user", "chat", _env("hello"))
+    fresh = store.append_chat("user", "verify_ping", _env("__VERIFY_PING__:fresh"))
+    stale = store.append_chat("user", "verify_ping", _env("__VERIFY_PING__:stale"))
+    # Backdate the stale ping past the visible TTL (verify_loop long dead).
+    stale["ts"] = time.time() - (chat_core.VERIFY_PING_VISIBLE_TTL_SEC + 60)
+
+    res = client.get("/v1/chat/history?limit=50", headers=_headers(api_key))
+    assert res.status_code == 200, res.get_data(as_text=True)
+    ids = [m.get("id") for m in res.get_json()["messages"]]
+
+    assert real["id"] in ids
+    assert fresh["id"] in ids, "a FRESH ping must still reach enclave-backed consumers"
+    assert stale["id"] not in ids, f"stale verify_ping leaked into history: {ids}"
+
+
+def test_message_body_refuses_verify_ping(client):
+    """Fetching a verify_ping row by id must 404 — it is never legitimate user
+    content, so a leaked ping id can't be re-fetched out-of-band."""
+    import uuid
+
+    from core import store as core_store
+
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+    ping = store.append_chat("user", "verify_ping", {
+        "v": 1, "id": uuid.uuid4().hex, "body_ct": _b64(b"__VERIFY_PING__:x"),
+        "nonce": _b64(b"\x00" * 12), "K_user": _b64(b"\x00" * 32),
+        "visibility": "local_only", "owner_user_id": user_id,
+    })
+    res = client.get(f"/v1/chat/messages/{ping['id']}/body", headers=_headers(api_key))
+    assert res.status_code == 404, res.get_data(as_text=True)
+
+
+def test_export_excludes_verify_ping(client):
+    """Data export must not carry synthetic verify-loop rows."""
+    import uuid
+
+    from content import content_core
+    from core import store as core_store
+
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+
+    def _env(body: str) -> dict:
+        return {
+            "v": 1, "id": uuid.uuid4().hex, "body_ct": _b64(body.encode()),
+            "nonce": _b64(b"\x00" * 12), "K_user": _b64(b"\x00" * 32),
+            "visibility": "local_only", "owner_user_id": user_id,
+        }
+
+    real = store.append_chat("user", "chat", _env("hello"))
+    ping = store.append_chat("user", "verify_ping", _env("__VERIFY_PING__:x"))
+    reply = store.append_chat("openclaw", "verify_ping", _env("__verify_ack__"))
+
+    import json as _json
+    result = content_core.export_data(store)
+    export = _json.loads(result.raw_body)
+    ids = {m.get("id") for m in export.get("chat", [])}
+    assert real["id"] in ids
+    assert ping["id"] not in ids, "verify_ping PING leaked into export"
+    assert reply["id"] not in ids, "verify_ping REPLY leaked into export"
+
+
+def test_verify_ping_reply_never_delivers_push(client):
+    """Defense-in-depth: a verify_ping reply must not deliver push / Live Activity
+    even if the caller supplies a body (the consumer already sends suppress_push).
+
+    write_response returns only {id, ts, v}, so we observe the real safety
+    property by mocking the delivery function and asserting it is never called."""
+    import uuid
+    from unittest.mock import patch
+
+    from chat import chat_core
+    from core import store as core_store
+    from push import service as push_service
+
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+    payload = {
+        "envelope": {
+            "v": 1, "id": uuid.uuid4().hex, "body_ct": _b64(b"__verify_ack__"),
+            "nonce": _b64(b"\x00" * 12), "K_user": _b64(b"\x00" * 32),
+            "visibility": "local_only", "owner_user_id": user_id,
+        },
+        "source": "verify_ping",
+        "push_body": "should never surface",
+        "push_live_activity": True,
+    }
+    with patch.object(
+        push_service, "_deliver_ai_message_push_if_background", return_value={}
+    ) as deliver:
+        body, status = chat_core.write_response(
+            store, payload, consumer_id="c", consumer_info={}, allow_verify_reply=True,
+        )
+    assert status in (200, 201), body
+    deliver.assert_not_called()
+
+
 def _verify_reply_envelope(user_id: str) -> dict:
     import uuid
 

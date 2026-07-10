@@ -721,7 +721,10 @@ def export_data(store: UserStore) -> ExportResult:
     Ciphertext is returned verbatim — iOS decrypts client-side using the user's
     content_sk from Keychain. No decryption happens server-side.
     """
-    hist = store.chat_messages
+    # Synthetic verify-loop liveness rows are internal probes, not the user's
+    # conversation — exclude them from the data export (belt-and-suspenders with
+    # the visible-history scrub).
+    hist = [m for m in store.chat_messages if m.get("source") != "verify_ping"]
     moments = memory_service._load_moments(store)
     identity = identity_service._load_identity(store)
 
