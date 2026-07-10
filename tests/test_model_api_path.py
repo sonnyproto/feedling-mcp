@@ -1707,6 +1707,66 @@ def test_message_body_refuses_verify_ping(client):
     assert res.status_code == 404, res.get_data(as_text=True)
 
 
+def test_export_excludes_verify_ping(client):
+    """Data export must not carry synthetic verify-loop rows."""
+    import uuid
+
+    from content import content_core
+    from core import store as core_store
+
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+
+    def _env(body: str) -> dict:
+        return {
+            "v": 1, "id": uuid.uuid4().hex, "body_ct": _b64(body.encode()),
+            "nonce": _b64(b"\x00" * 12), "K_user": _b64(b"\x00" * 32),
+            "visibility": "local_only", "owner_user_id": user_id,
+        }
+
+    real = store.append_chat("user", "chat", _env("hello"))
+    ping = store.append_chat("user", "verify_ping", _env("__VERIFY_PING__:x"))
+    reply = store.append_chat("openclaw", "verify_ping", _env("__verify_ack__"))
+
+    import json as _json
+    result = content_core.export_data(store)
+    export = _json.loads(result.raw_body)
+    ids = {m.get("id") for m in export.get("chat", [])}
+    assert real["id"] in ids
+    assert ping["id"] not in ids, "verify_ping PING leaked into export"
+    assert reply["id"] not in ids, "verify_ping REPLY leaked into export"
+
+
+def test_verify_ping_reply_never_delivers_push(client):
+    """Defense-in-depth: a verify_ping reply must not deliver push / Live Activity
+    even if the caller supplies a body (the consumer already sends suppress_push)."""
+    import uuid
+
+    from chat import chat_core
+    from core import store as core_store
+
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+    body, status = chat_core.write_response(
+        store,
+        {
+            "envelope": {
+                "v": 1, "id": uuid.uuid4().hex, "body_ct": _b64(b"__verify_ack__"),
+                "nonce": _b64(b"\x00" * 12), "K_user": _b64(b"\x00" * 32),
+                "visibility": "local_only", "owner_user_id": user_id,
+            },
+            "source": "verify_ping",
+            "push_body": "should never surface",
+            "push_live_activity": True,
+        },
+        consumer_id="c", consumer_info={}, allow_verify_reply=True,
+    )
+    assert status in (200, 201), body
+    # The push block is skipped entirely for verify_ping, so no delivery fields.
+    for k in ("push_decision", "alert_status", "live_activity_status"):
+        assert not body.get(k), (k, body.get(k))
+
+
 def _verify_reply_envelope(user_id: str) -> dict:
     import uuid
 

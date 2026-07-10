@@ -514,10 +514,17 @@ def write_response(
         _maybe_mark_first_chat_ok(store, reply_to_message_id)
     delivery_fields: dict = {}
     visible_push_body = (push_body or alert_body).strip()
+    # Defense-in-depth: a synthetic verify-loop liveness reply must NEVER surface
+    # as a push / Live Activity, no matter what the caller passed. The resident
+    # consumer already sends suppress_push=True, so this changes nothing today —
+    # it just closes the gap if a future caller regression posts source=verify_ping
+    # with a body.
+    if source == "verify_ping":
+        visible_push_body = ""
     # Any plaintext AI reply supplied by the caller enters the same app-state
     # policy: background/unknown app state gets Live Activity + APNs alert;
     # foreground app state records a suppression instead of interrupting.
-    if visible_push_body or payload.get("push_live_activity"):
+    if source != "verify_ping" and (visible_push_body or payload.get("push_live_activity")):
         delivery = None
         if source == proactive_service.PROACTIVE_JOB_SOURCE:
             delivery = _proactive_delivery_decision_v2(store, payload)
