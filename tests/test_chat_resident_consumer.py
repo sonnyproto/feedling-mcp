@@ -3752,6 +3752,70 @@ def test_agent_turn_extracts_claude_stream_json_thinking_blocks():
     assert turn.thinking_native is True
 
 
+def test_agent_turn_extracts_claude_stream_json_thinking_deltas_without_final_block():
+    raw = "\n".join([
+        json.dumps({
+            "type": "stream_event",
+            "event": {
+                "type": "message_start",
+                "message": {"model": "claude-sonnet-4-5-20250929"},
+            },
+        }),
+        json.dumps({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+            },
+        }),
+        json.dumps({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "First thought. "},
+            },
+        }),
+        json.dumps({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "Second thought."},
+            },
+        }),
+        json.dumps({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "最终答案。"},
+            },
+        }),
+        # Some Claude CLI/provider combinations expose final text but omit the
+        # final assistant thinking content block. The delta aggregator must still
+        # preserve the provider-native thinking disclosure.
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "claude-sonnet-4-5-20250929",
+                "content": [{"type": "text", "text": "最终答案。"}],
+            },
+        }),
+    ])
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["最终答案。"]
+    assert turn.thinking_summary == "First thought. Second thought."
+    assert turn.thinking_kind == "provider_reasoning"
+    assert turn.thinking_source == "anthropic_thinking"
+    assert turn.thinking_model == "claude-sonnet-4-5-20250929"
+    assert turn.thinking_native is True
+
+
 def test_agent_turn_extracts_provider_reasoning_metadata_from_nested_result():
     raw = json.dumps(
         {

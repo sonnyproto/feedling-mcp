@@ -2001,6 +2001,51 @@ def _openclaw_payload_texts(obj: Any) -> list[str]:
     return texts
 
 
+def _agent_turn_from_stream_json_events(objects: list[Any]) -> AgentTurn:
+    """Aggregate Claude stream-json deltas as a fallback.
+
+    Claude normally emits a final ``assistant`` object whose content list includes
+    the thinking block; the generic object parser handles that. Some CLI/provider
+    combinations only expose thinking through ``stream_event`` deltas, so collect
+    those here before the per-object parser drops transport events.
+    """
+    turn = AgentTurn()
+    thinking_parts: list[str] = []
+    text_parts: list[str] = []
+    model = ""
+
+    for obj in objects:
+        if not isinstance(obj, dict) or obj.get("type") != "stream_event":
+            continue
+        event = obj.get("event")
+        if not isinstance(event, dict):
+            continue
+        msg = event.get("message")
+        if isinstance(msg, dict) and not model:
+            model = _sanitize_thinking_meta(msg.get("model"), max_len=96)
+        delta = event.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        delta_type = str(delta.get("type") or "").strip().lower()
+        if delta_type == "thinking_delta" and isinstance(delta.get("thinking"), str):
+            thinking_parts.append(delta["thinking"])
+        elif delta_type == "text_delta" and isinstance(delta.get("text"), str):
+            text_parts.append(delta["text"])
+
+    thinking = _sanitize_thinking_summary("".join(thinking_parts))
+    if thinking:
+        turn.thinking_summary = thinking
+        turn.thinking_kind = "provider_reasoning"
+        turn.thinking_source = "anthropic_thinking"
+        turn.thinking_model = model
+        turn.thinking_native = True
+
+    text = "".join(text_parts).strip()
+    if text:
+        _merge_agent_turn(turn, _agent_turn_from_obj(text))
+    return turn
+
+
 def _reply_from_json_obj(obj: Any) -> str:
     """Extract the final answer from a structured agent response object."""
     if isinstance(obj, str):
@@ -2308,6 +2353,15 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         if json_objects:
             for item in json_objects:
                 _merge_agent_turn(turn, _agent_turn_from_obj(item))
+            stream_turn = _agent_turn_from_stream_json_events(json_objects)
+            if stream_turn.thinking_summary and not turn.thinking_summary:
+                turn.thinking_summary = stream_turn.thinking_summary
+                turn.thinking_kind = stream_turn.thinking_kind
+                turn.thinking_source = stream_turn.thinking_source
+                turn.thinking_model = stream_turn.thinking_model
+                turn.thinking_native = stream_turn.thinking_native
+            if stream_turn.messages and not turn.messages:
+                turn.messages = stream_turn.messages
             if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
                 return _dedupe_agent_turn_messages(turn)
         nested = _safe_json_loads(raw) if _looks_like_json_text(raw) else None
