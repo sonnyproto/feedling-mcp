@@ -251,6 +251,43 @@ def test_create_route_with_activate_true_switches_active(
     assert db.model_api_active_route(uid)["model"] == "claude-haiku-4-5"
 
 
+# ── orphan-credential cleanup on a failed route_upsert (Fix 2) ──
+
+def test_create_route_upsert_failure_cleans_up_credential_created_this_request(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave, monkeypatch):
+    """api_key branch: credential_create succeeds, then route_upsert fails (DB
+    hiccup) → the credential this request just minted must not be left behind
+    holding a real encrypted key the user can neither see nor delete."""
+    uid = registered_user["user_id"]
+    headers = {"X-API-Key": registered_user["api_key"]}
+    monkeypatch.setattr(db, "model_api_route_upsert", lambda *a, **k: None)
+
+    resp = client.post("/v1/model_api/routes", headers=headers, json={
+        "provider": "anthropic", "model": "claude-haiku-4-5", "api_key": "sk-ant-orphan"})
+    assert resp.status_code == 500, resp.get_data(as_text=True)
+    assert resp.get_json()["error"] == "model_api_route_write_failed"
+    assert db.model_api_credentials_list(uid) == []
+
+
+def test_create_route_upsert_failure_keeps_reused_credential(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave, monkeypatch):
+    """credential_id (reuse) branch: only what THIS request created gets
+    cleaned up. A credential that existed before this request — and that other
+    routes may still reference — must survive a failed route_upsert."""
+    uid = registered_user["user_id"]
+    headers = _setup_one(client, registered_user)
+    cid = db.model_api_credentials_list(uid)[0]["id"]
+    monkeypatch.setattr(db, "model_api_route_upsert", lambda *a, **k: None)
+
+    resp = client.post("/v1/model_api/routes", headers=headers, json={
+        "provider": "anthropic", "model": "claude-haiku-4-5", "credential_id": cid})
+    assert resp.status_code == 500, resp.get_data(as_text=True)
+    assert resp.get_json()["error"] == "model_api_route_write_failed"
+    creds = db.model_api_credentials_list(uid)
+    assert len(creds) == 1
+    assert creds[0]["id"] == cid
+
+
 # ─────────────────────────── activate ───────────────────────────
 
 def test_activate_untested_route_runs_test_and_switches(
@@ -360,6 +397,125 @@ def test_route_test_unknown_route_404(client, registered_user, fake_provider,
     assert resp.get_json()["error"] == "route_not_found"
 
 
+# ── /routes/{id}/test on the ACTIVE route: takeover on failure (Fix 1) ──
+#
+# Symmetric with DELETE /routes/{id}: testing the active route and having it
+# fail must not strand it — is_active + test_status='failed' would drop the
+# user out of db.list_agent_runtime_enabled_users(), and the supervisor kills
+# a consumer that never self-heals.
+
+def test_route_test_active_route_failure_takes_over_to_other_ok_route(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave, monkeypatch):
+    uid = registered_user["user_id"]
+    headers = _setup_one(client, registered_user)
+    cid = db.model_api_credentials_list(uid)[0]["id"]
+    r2 = db.model_api_route_upsert(uid, cid, "claude-haiku-4-5", None)
+    db.model_api_route_mark_test(uid, r2, status="ok")
+    r1 = db.model_api_active_route(uid)["id"]
+
+    def _boom(cfg):
+        raise provider_client.ProviderError("provider_http_429", status_code=429)
+    monkeypatch.setattr(provider_client, "test_provider_key", _boom)
+
+    resp = client.post(f"/v1/model_api/routes/{r1}/test", headers=headers)
+    assert resp.status_code == 400, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["error"] == "provider_test_failed"
+    assert body["status_code"] == 429
+    assert body["active_route_id"] == r2
+
+    r1_row = db.model_api_route_get(uid, r1)
+    assert r1_row["test_status"] == "failed"
+    assert r1_row["is_active"] is False
+    assert db.model_api_active_route(uid)["id"] == r2
+
+    roster = {u["user_id"] for u in db.list_agent_runtime_enabled_users()}
+    assert uid in roster
+
+
+def test_route_test_active_route_failure_no_candidate_leaves_none_active(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave, monkeypatch):
+    """Only route → no autoselect candidate. active_route_id: null is the
+    correct (legal) response, not a 500 — the user just has no working config
+    anymore and drops out of the roster."""
+    uid = registered_user["user_id"]
+    headers = _setup_one(client, registered_user)
+    r1 = db.model_api_active_route(uid)["id"]
+
+    def _boom(cfg):
+        raise provider_client.ProviderError("provider_http_429", status_code=429)
+    monkeypatch.setattr(provider_client, "test_provider_key", _boom)
+
+    resp = client.post(f"/v1/model_api/routes/{r1}/test", headers=headers)
+    assert resp.status_code == 400, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["active_route_id"] is None
+
+    assert db.model_api_active_route(uid) is None
+    roster = {u["user_id"] for u in db.list_agent_runtime_enabled_users()}
+    assert uid not in roster
+
+
+def test_route_test_non_active_route_failure_does_not_touch_active(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave, monkeypatch):
+    """Regression guard: the takeover must only fire for the active route —
+    testing a non-active route that fails must leave the active route alone
+    and must NOT add active_route_id to the body."""
+    uid = registered_user["user_id"]
+    headers = _setup_one(client, registered_user)
+    cid = db.model_api_credentials_list(uid)[0]["id"]
+    r2 = db.model_api_route_upsert(uid, cid, "claude-haiku-4-5", None)
+    active = db.model_api_active_route(uid)["id"]
+
+    def _boom(cfg):
+        raise provider_client.ProviderError("provider_http_429", status_code=429)
+    monkeypatch.setattr(provider_client, "test_provider_key", _boom)
+
+    resp = client.post(f"/v1/model_api/routes/{r2}/test", headers=headers)
+    assert resp.status_code == 400, resp.get_data(as_text=True)
+    assert "active_route_id" not in resp.get_json()
+
+    assert db.model_api_active_route(uid)["id"] == active
+    assert db.model_api_route_get(uid, r2)["is_active"] is False
+
+
+def test_route_test_active_route_deactivate_write_failure_no_double_active(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave, monkeypatch):
+    """Codex finding: model_api_route_deactivate's bool return was discarded.
+    Simulate the DB-hiccup path — deactivate() returns False WITHOUT actually
+    clearing is_active (leaves r1 still active), exactly like a swallowed
+    write exception would. Naively autoselecting anyway would try to make r2
+    active too and collide with model_api_routes_one_active, so the fix must
+    re-read reality and skip autoselect when a route is still active — and it
+    must report the TRUE active route id (still r1), not silently lie."""
+    uid = registered_user["user_id"]
+    headers = _setup_one(client, registered_user)
+    cid = db.model_api_credentials_list(uid)[0]["id"]
+    r2 = db.model_api_route_upsert(uid, cid, "claude-haiku-4-5", None)
+    db.model_api_route_mark_test(uid, r2, status="ok")
+    r1 = db.model_api_active_route(uid)["id"]
+
+    monkeypatch.setattr(db, "model_api_route_deactivate", lambda *a, **k: False)
+
+    def _boom(cfg):
+        raise provider_client.ProviderError("provider_http_429", status_code=429)
+    monkeypatch.setattr(provider_client, "test_provider_key", _boom)
+
+    resp = client.post(f"/v1/model_api/routes/{r1}/test", headers=headers)
+    assert resp.status_code == 400, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert body["active_route_id"] == r1
+    assert "api_key_envelope" not in body
+
+    # Invariant: never two active routes, even though the patched deactivate()
+    # never actually flipped is_active. r1 is still (truthfully) active.
+    rows = db.model_api_routes_list(uid)
+    active_rows = [r for r in rows if r["is_active"]]
+    assert len(active_rows) == 1
+    assert active_rows[0]["id"] == r1
+    assert db.model_api_route_get(uid, r2)["is_active"] is False
+
+
 # ─────────────────────────── DELETE /routes/{id} ───────────────────────────
 
 def test_delete_active_route_autoselects_latest_ok(
@@ -409,6 +565,68 @@ def test_delete_non_active_route_keeps_current_active(
     resp = client.delete(f"/v1/model_api/routes/{r2}", headers=headers)
     assert resp.status_code == 200
     assert resp.get_json()["active_route_id"] == active
+
+
+# ─────────────────────────── GET /credentials ───────────────────────────
+
+def test_get_credentials_lists_route_count(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave):
+    uid = registered_user["user_id"]
+    headers = _setup_one(client, registered_user)
+    cid = db.model_api_credentials_list(uid)[0]["id"]
+    db.model_api_route_upsert(uid, cid, "claude-haiku-4-5", None)
+
+    resp = client.get("/v1/model_api/credentials", headers=headers)
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert len(body["credentials"]) == 1
+    cred = body["credentials"][0]
+    assert cred["id"] == cid
+    assert cred["route_count"] == 2
+    for key in ("id", "provider", "label", "base_url", "api_key_hint",
+                "supports_responses", "route_count"):
+        assert key in cred, key
+
+
+def test_get_credentials_includes_credential_with_zero_routes(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave):
+    """A credential whose last route was deleted must still appear (with
+    route_count == 0) — otherwise it's invisible (no id iOS can surface) and
+    thus never deletable, so its key sits in the DB forever."""
+    uid = registered_user["user_id"]
+    headers = _setup_one(client, registered_user)
+    active = db.model_api_active_route(uid)["id"]
+    del_resp = client.delete(f"/v1/model_api/routes/{active}", headers=headers)
+    assert del_resp.status_code == 200
+
+    resp = client.get("/v1/model_api/credentials", headers=headers)
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert len(body["credentials"]) == 1
+    assert body["credentials"][0]["route_count"] == 0
+
+
+def test_get_credentials_never_leaks_envelope(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave):
+    uid = registered_user["user_id"]
+    headers = _setup_one(client, registered_user)
+    client.post("/v1/model_api/routes", headers=headers, json={
+        "provider": "anthropic", "model": "claude-haiku-4-5", "api_key": "sk-ant-second"})
+
+    resp = client.get("/v1/model_api/credentials", headers=headers)
+    assert resp.status_code == 200, resp.get_data(as_text=True)
+    body = resp.get_json()
+    assert len(body["credentials"]) == 2
+    for cred in body["credentials"]:
+        assert "api_key_envelope" not in cred
+
+
+def test_get_credentials_empty_when_none_configured(
+        client, registered_user, fake_provider, fake_envelope, fake_enclave):
+    headers = {"X-API-Key": registered_user["api_key"]}
+    resp = client.get("/v1/model_api/credentials", headers=headers)
+    assert resp.status_code == 200
+    assert resp.get_json()["credentials"] == []
 
 
 # ─────────────────────────── PATCH /credentials/{id} ───────────────────────────

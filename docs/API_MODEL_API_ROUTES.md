@@ -2,7 +2,7 @@
 
 对应 iOS PR [feedling-mcp-ios#76](https://github.com/teleport-computer/feedling-mcp-ios/pull/76)（`codex/model-api-profiles-debug`）。
 
-后端已把「用户的 model API 配置」从单条 JSON blob 换成两张表，并暴露 7 条新端点。本文档描述**实际实现**的契约（逐字取自 `backend/hosted/setup_core.py` / `setup_routes_asgi.py` / `backend/db.py`），并给出 iOS 侧的映射与改动清单。
+后端已把「用户的 model API 配置」从单条 JSON blob 换成两张表，并暴露 8 条新端点。本文档描述**实际实现**的契约（逐字取自 `backend/hosted/setup_core.py` / `setup_routes_asgi.py` / `backend/db.py`），并给出 iOS 侧的映射与改动清单。
 
 认证：所有端点走 `X-API-Key`（或 `Authorization: Bearer`，或旧版 `?key=`）。
 
@@ -120,9 +120,31 @@
 
 结果回写该 route 的 `test_status` / `last_test_at` / `last_test_error`。
 
-> ⚠️ **当心**：如果测的是当前 **active** 的 route 且失败了，它会被标成 `failed` 但仍然是 `is_active` —— 于是用户掉出 roster、consumer 被杀，而且**不会自动接管**别的 ok route。App 侧建议在这种情况下提示用户，或者干脆不允许对 active route 手动测活。（后端是否该自动接管，待产品决策。）
+**测的是当前 active route 且失败了：与 `DELETE /routes/{id}` 对称，后端会自动接管**。
+该 route 被标成 `test_status = "failed"` 并同时被清掉 `is_active`（不再悬空），然后
+自动接管 `updated_at` 最新的那条 `test_status = "ok"` 的另一条 route（同
+`DELETE /routes/{id}` 的接管规则）。400 响应体里带上新的 `active_route_id`：
 
-失败：404 `route_not_found` / 400 `provider_test_failed`。
+```json
+{ "error": "provider_test_failed", "detail": "…", "status_code": 429, "active_route_id": "8b2d…" }
+```
+
+没有候选时 `active_route_id` 为 `null`——此时用户没有生效配置，托管 agent 会停，这是
+合法结果而不是错误。**测的若不是 active route**，失败只回写 `test_status`，不触发
+接管，响应体里也不会出现 `active_route_id` 键。
+
+> 罕见的 DB 写瞬时失败：接管前会重新读一次真实的 active route，而不是盲信清 flag
+> 那步的返回值。如果清 flag 没落库，这条失败的 route 仍是 `is_active=TRUE`，此时
+> 不会 autoselect（避免撞 unique index），`active_route_id` 会如实回这条仍然生效
+> 的失败 route 的 id——不是新接管的那条。这种情况下客户端应视为「本次没接管成
+> 功」，可重试测试或稍后再查一次 `GET /routes`。
+
+> 为什么要这样：agent-runner 的 roster 只收 `is_active AND test_status = 'ok'` 的
+> 用户。如果失败的 active route 保持 `is_active=TRUE`，用户会在下一个 tick 从
+> roster 消失、supervisor 杀掉 consumer 且**不会自愈**——仅仅因为用户主动点了一次
+> 「测试连接」、上游恰好一次瞬时 429/超时。
+
+失败：404 `route_not_found` / 400 `provider_test_failed`（可能带 `active_route_id`，见上）。
 
 ### `DELETE /v1/model_api/routes/{route_id}` —— 删除 route
 
@@ -133,6 +155,37 @@
 删的若是 active route，后端**自动接管** `updated_at` 最新的那条 `test_status = "ok"` 的 route，新 id 在 `active_route_id` 里返回。没有候选时返回 `null`（此时用户没有生效配置，托管 agent 会停）。
 
 失败：404 `route_not_found`。
+
+### `GET /v1/model_api/credentials` —— 列出全部凭据
+
+```json
+{
+  "credentials": [
+    {
+      "id": "a71e…",
+      "provider": "anthropic",
+      "label": "Anthropic Key A",
+      "base_url": "",
+      "api_key_hint": "sk-a…451",
+      "supports_responses": false,
+      "route_count": 2
+    }
+  ]
+}
+```
+
+列出该用户**全部** credential，不只是被某条 route 引用的那些——`route_count`
+统计有多少条 route 引用它，可以是 `0`。
+
+这是必需的：iOS 此前只能靠对 `GET /routes` 的 `credential_id` 去重来拼凑凭据
+列表，一把 route_count 为 0 的凭据（例如用户删掉了它最后一条 route）就永远不
+出现在那份列表里——拿不到它的 id，`DELETE /credentials/{id}` 也就永远调不到它，
+密文会一直留在库里。这个端点独立于 routes 表查询，让这类凭据也可见、可删。
+
+**响应中绝不含 `api_key_envelope`**，与 `GET /routes` 同样的保证。
+
+**删除一条 route 不会自动删掉它的凭据**——用户可能想留着这把 key 以后复用。有了
+这个端点，那把没有 route 引用的凭据就可见、可通过 `DELETE /credentials/{id}` 手动删掉了。
 
 ### `PATCH /v1/model_api/credentials/{credential_id}` —— 改名 / 换 key
 

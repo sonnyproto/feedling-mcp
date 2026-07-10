@@ -619,6 +619,29 @@ def model_api_routes_get(store) -> tuple[dict, int]:
     return {"active_route_id": active, "routes": routes}, 200
 
 
+def model_api_credentials_get(store) -> tuple[dict, int]:
+    """列出全部 credential（不只是被某条 route 引用的那些）。
+
+    iOS 此前只能靠对 GET /routes 的 credential_id 去重来拼凑凭据列表——一把凭据
+    如果零 route 引用（例如用户删掉了它最后一条 route），就永远不出现在那份列表
+    里，于是拿不到它的 id，DELETE /credentials/{id} 也就永远调不到它，密文会一直
+    留在库里。这个端点直接查 credentials 表，独立于 routes 是否引用它。
+
+    ``route_count`` 从 ``db.model_api_routes_list`` 在 Python 侧数出来，不新开
+    SQL 查询。``db.model_api_credentials_list`` 本就不选 api_key_envelope 那一列
+    （SQL 层面就没取），密文绝不会出现在这里。"""
+    creds = db.model_api_credentials_list(store.user_id)
+    routes = db.model_api_routes_list(store.user_id)
+    counts: dict[str, int] = {}
+    for r in routes:
+        counts[r["credential_id"]] = counts.get(r["credential_id"], 0) + 1
+    return {
+        "credentials": [
+            {**cred, "route_count": counts.get(cred["id"], 0)} for cred in creds
+        ]
+    }, 200
+
+
 def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) -> tuple[dict, int]:
     provider = str(payload.get("provider") or "")
     model = str(payload.get("model") or "")
@@ -652,6 +675,10 @@ def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) 
     except provider_client.ProviderError as e:
         return {"error": str(e)}, 400
 
+    # Tracks whether THIS request minted a new credential row (vs. reusing one via
+    # credential_id) — only what we created here gets cleaned up on a later failure;
+    # a reused credential must survive regardless of what happens next.
+    created_credential_here = cred is None
     if cred is not None:
         credential_id = cred["id"]
     else:
@@ -692,6 +719,14 @@ def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) 
     route_id = db.model_api_route_upsert(
         store.user_id, credential_id, model, reasoning_effort)
     if not route_id:
+        # Don't strand the credential this request just minted: it holds a real
+        # encrypted provider key the user can never see (no route to surface it
+        # via GET /routes) or delete (DELETE /credentials/{id} needs an id they
+        # don't have) — a permanent orphan. A credential reused via credential_id
+        # is untouched: it existed before this request and other routes may still
+        # reference it.
+        if created_credential_here:
+            db.model_api_credential_delete(store.user_id, credential_id)
         return {"error": "model_api_route_write_failed"}, 500
 
     if activate:
@@ -730,11 +765,46 @@ def model_api_route_activate(store, route_id: str, *, caller_api_key: str | None
 
 
 def model_api_route_test(store, route_id: str, *, api_key: str | None) -> tuple[dict, int]:
+    """与 ``DELETE /routes/{id}`` 对称：测的若是当前 active route 且失败了，不能
+    让它悬空——它仍 ``is_active=TRUE``（``_test_route_or_error`` 只翻 test_status，
+    从不碰 is_active），而 roster 只收 ``is_active AND test_status='ok'``，用户会
+    立刻从 roster 消失、consumer 被杀且不自愈。一次用户主动点的「测试连接」不该
+    有这种副作用，尤其是上游只是一次瞬时 429/超时。
+
+    陷阱：``model_api_autoselect_active`` 只挑 ``NOT is_active`` 的候选——对着仍
+    active 的这条失败 route 直接 autoselect 会试图让第二行也变 active，撞
+    ``model_api_routes_one_active`` partial unique index。必须先
+    ``model_api_route_deactivate`` 腾位，再 autoselect。"""
     route = db.model_api_route_get(store.user_id, route_id)
     if not route:
         return {"error": "route_not_found"}, 404
+    was_active = route["is_active"]
     err = _test_route_or_error(store, route, api_key)
     if err is not None:
+        if was_active:
+            db.model_api_route_deactivate(store.user_id, route_id)
+            # deactivate()'s bool return is deliberately NOT trusted here: a False
+            # is ambiguous between (a) a swallowed DB write failure — route is
+            # STILL is_active=TRUE — and (b) a concurrent request already
+            # deactivated it — route is already NOT active. The two demand
+            # opposite responses, and the bool alone can't tell them apart. So
+            # re-read reality instead of branching on the return value:
+            # autoselect_active only considers NOT-active candidates, and if a
+            # route is still active it would try to make a second row active and
+            # collide with model_api_routes_one_active, silently returning None
+            # and leaving the user stranded on the failed-active route — the
+            # exact state this takeover exists to avoid.
+            still_active = db.model_api_active_route(store.user_id)
+            if still_active is None:
+                # None is a legal outcome here too (no other 'ok' route left) —
+                # it means the user now has no working config, not a write
+                # failure to 500 on.
+                err[0]["active_route_id"] = db.model_api_autoselect_active(store.user_id)
+            else:
+                # Deactivation didn't land (DB hiccup) — report the id only.
+                # model_api_active_route() also carries api_key_envelope
+                # ciphertext; never let that dict itself reach the response.
+                err[0]["active_route_id"] = still_active["id"]
         return err
     return {"status": "ok", "route": db.model_api_route_get(store.user_id, route_id)}, 200
 

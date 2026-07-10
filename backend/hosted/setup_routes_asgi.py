@@ -152,6 +152,12 @@ async def model_api_route_remove(route_id: str, auth: AuthResult = Depends(requi
     return JSONResponse(body, status_code=status)
 
 
+@router.get("/v1/model_api/credentials")
+async def model_api_credentials_get(auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(setup_core.model_api_credentials_get, auth.store)
+    return JSONResponse(body, status_code=status)
+
+
 @router.patch("/v1/model_api/credentials/{credential_id}")
 async def model_api_credential_patch(credential_id: str, request: Request,
                                      auth: AuthResult = Depends(require_auth)):

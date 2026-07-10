@@ -2709,6 +2709,25 @@ def model_api_route_mark_runtime_error(user_id: str, *, error: str, error_class:
         return False
 
 
+def model_api_route_deactivate(user_id: str, route_id: str) -> bool:
+    """清掉某条 route 的 is_active（不接管）。供 test 失败后先腾位再 autoselect。
+
+    ``model_api_autoselect_active`` 只考虑 ``NOT is_active`` 的候选——对着一条仍
+    ``is_active=TRUE`` 的行调它会撞 ``model_api_routes_one_active`` partial unique
+    index（试图让第二行也变 active）。调用方必须先用这个函数腾位，再 autoselect。"""
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                "UPDATE model_api_routes SET is_active = FALSE, updated_at = now() "
+                "WHERE user_id = %s AND id = %s AND is_active",
+                (user_id, route_id),
+            )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error("[db] model_api_route_deactivate(%s,%s) failed: %s", user_id, route_id, e)
+        return False
+
+
 def model_api_autoselect_active(user_id: str) -> str | None:
     """删掉 active route 之后重新选主：挑 updated_at 最新的 ok route。
     没有候选则返回 None（该用户从 roster 消失，consumer 会停）。"""
