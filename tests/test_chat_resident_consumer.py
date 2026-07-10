@@ -3816,6 +3816,94 @@ def test_agent_turn_extracts_claude_stream_json_thinking_deltas_without_final_bl
     assert turn.thinking_native is True
 
 
+# ---------------------------------------------------------------------------
+# Claude tool turns emit a "let me check…" preamble text block BEFORE the
+# tool_use and the real answer LATER. The generic extractor collected BOTH as
+# separate bubbles; the foreground reply-exclusivity guard (chat_core: one reply
+# per user message) accepts only one, so the preamble consumed the slot and the
+# real answer 409'd — the user saw "let me check…" and nothing else (the deepwiki
+# symptom, live on the test CVM 2026-07-10). _claude_turn_from_stream takes ONLY
+# the terminal result-event text as the deliverable.
+# ---------------------------------------------------------------------------
+
+def test_claude_turn_from_stream_drops_pretool_preamble_keeps_final():
+    raw = "\n".join([
+        json.dumps({"type": "system", "subtype": "init", "session_id": "s1"}),
+        json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "让我用 deepwiki 查查~"}]}}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "mcp__deepwiki__ask_question", "input": {}}]}}),
+        json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": "..."}]}}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "impl in ReactFiberHooks.js"}]}}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "找到啦~ 在 ReactFiberHooks.js"}]}}),
+        json.dumps({"type": "result", "subtype": "success",
+                    "result": "找到啦~ 在 ReactFiberHooks.js", "num_turns": 3}),
+    ])
+    reply, reasoning = crc._claude_turn_from_stream(raw)
+    assert reply == "找到啦~ 在 ReactFiberHooks.js"
+    assert "让我用 deepwiki" not in reply  # preamble must never survive
+    assert reasoning == "impl in ReactFiberHooks.js"
+
+
+def test_claude_turn_from_stream_reasoning_falls_back_to_thinking_deltas():
+    # --include-partial-messages combos that stream thinking as deltas and omit
+    # the complete thinking block still surface native reasoning.
+    raw = "\n".join([
+        json.dumps({"type": "stream_event", "event": {"type": "content_block_delta",
+                    "delta": {"type": "thinking_delta", "thinking": "First. "}}}),
+        json.dumps({"type": "stream_event", "event": {"type": "content_block_delta",
+                    "delta": {"type": "thinking_delta", "thinking": "Second."}}}),
+        json.dumps({"type": "result", "subtype": "success", "result": "答案。"}),
+    ])
+    reply, reasoning = crc._claude_turn_from_stream(raw)
+    assert reply == "答案。"
+    assert reasoning == "First. Second."
+
+
+def test_claude_turn_from_stream_empty_when_no_success_result():
+    # error / handshake-only → "" so call_agent_cli falls back, never leaks.
+    raw = json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "partial"}]}})
+    assert crc._claude_turn_from_stream(raw) == ("", "")
+
+
+def test_call_agent_cli_claude_tool_turn_delivers_only_final_answer(monkeypatch):
+    """End-to-end: a claude tool turn yields ONE bubble (the answer), the pre-tool
+    preamble is gone, and native thinking rides the disclosure — so the foreground
+    one-reply guard never 409s the real answer."""
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD",
+                        "claude -p --output-format stream-json --include-partial-messages {message}")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+
+    class _R:
+        returncode = 0
+        stdout = "\n".join([
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "让我用 deepwiki 查查~"}]}}),
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "mcp__deepwiki__ask_question", "input": {}}]}}),
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "impl in ReactFiberHooks.js"}]}}),
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "找到啦~ 在 ReactFiberHooks.js"}]}}),
+            json.dumps({"type": "result", "subtype": "success",
+                        "result": "找到啦~ 在 ReactFiberHooks.js"}),
+        ])
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    raw = crc.call_agent_cli("查 useEffect")
+    turn = crc._agent_turn_from_raw(raw)
+    assert turn.messages == ["找到啦~ 在 ReactFiberHooks.js"]  # exactly one bubble, the answer
+    assert all("让我用 deepwiki" not in m for m in turn.messages)  # no preamble bubble
+    assert turn.thinking_summary  # native thinking preserved
+
+
 def test_agent_turn_extracts_provider_reasoning_metadata_from_nested_result():
     raw = json.dumps(
         {

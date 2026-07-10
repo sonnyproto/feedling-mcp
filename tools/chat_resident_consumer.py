@@ -2978,6 +2978,64 @@ def _codex_reply_from_stream(raw: str) -> str:
     return _codex_turn_from_stream(raw)[0]
 
 
+def _claude_turn_from_stream(raw: str) -> tuple[str, str]:
+    """Split a ``claude -p --output-format stream-json`` event stream into
+    (reply, reasoning_summary).
+
+    Claude Code streams JSONL: ``stream_event`` deltas (we run with
+    ``--include-partial-messages``), any number of complete ``{"type":
+    "assistant","message":{"content":[...]}}`` objects, then a terminal
+    ``{"type":"result","subtype":"success","result":<final answer>}``.
+
+    When the turn calls a tool, Claude emits a *preamble* text block ("let me
+    check…") in an assistant object BEFORE the ``tool_use`` and the real answer
+    in a LATER object. The generic extractor (`_agent_turn_from_raw`) collected
+    BOTH as separate chat bubbles — but the foreground reply-exclusivity guard
+    (chat_core: one reply per user message, to avoid double-burning the user's
+    model key) accepts only ONE, so the preamble consumed the slot and the real
+    answer 409'd (the user saw "let me check…" and nothing else — the deepwiki
+    symptom on the test CVM).
+
+    The terminal ``result`` field carries ONLY the final answer, never the
+    pre-tool preamble, so it is the single authoritative reply. Native reasoning
+    is collected from complete ``thinking`` blocks and, as a fallback for
+    provider combinations that only stream it, from ``thinking_delta`` events.
+    Empty reply means no terminal success result (error / handshake-only), so
+    the caller falls back to the generic extractor without leaking.
+    """
+    reply = ""
+    thinking_blocks: list[str] = []
+    thinking_deltas: list[str] = []
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict):
+            continue
+        etype = str(obj.get("type") or "").strip()
+        if etype == "assistant":
+            message = obj.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if str(block.get("type") or "").strip() == "thinking":
+                        t = block.get("thinking") or block.get("text")
+                        if isinstance(t, str) and t.strip():
+                            thinking_blocks.append(t.strip())
+        elif etype == "stream_event":
+            event = obj.get("event")
+            delta = event.get("delta") if isinstance(event, dict) else None
+            if isinstance(delta, dict) and str(delta.get("type") or "").strip().lower() == "thinking_delta":
+                td = delta.get("thinking")
+                if isinstance(td, str):
+                    thinking_deltas.append(td)
+        elif etype == "result" and str(obj.get("subtype") or "").strip() == "success":
+            r = obj.get("result")
+            if isinstance(r, str) and r.strip():
+                reply = r.strip()
+    reasoning = "\n\n".join(thinking_blocks) or "".join(thinking_deltas).strip()
+    return reply, reasoning
+
+
 def _attach_provider_reasoning(
     reply: str,
     reasoning: str,
@@ -4116,6 +4174,25 @@ def call_agent_cli(
                 kind="provider_reasoning",
                 native=True,
             )
+    if _is_claude_code_cmd(cmd):
+        # The terminal result-event text is the ONLY deliverable: a pre-tool
+        # "let me check…" preamble in an earlier assistant object must never
+        # become its own bubble. The old generic path (`return raw`) let
+        # `_agent_turn_from_raw` collect preamble AND answer as two bubbles; the
+        # foreground one-reply guard then 409'd the real answer. Native reasoning
+        # rides the thinking disclosure. Empty reply (no success result) falls
+        # through to the generic extractor below.
+        claude_reply, claude_reasoning = _claude_turn_from_stream(raw)
+        if claude_reply:
+            if claude_reasoning and not raw_text:
+                return _attach_provider_reasoning(
+                    claude_reply,
+                    claude_reasoning,
+                    source="anthropic_thinking",
+                    kind="provider_reasoning",
+                    native=True,
+                )
+            return claude_reply
     turn = _agent_turn_from_raw(raw)
     if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
         return raw
