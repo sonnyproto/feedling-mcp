@@ -25,6 +25,29 @@ from enclave.routes._json import json_response_offthread
 router = APIRouter()
 
 
+def _decrypt_caption(m, authorized_user_id, content_sk, errors):
+    """Decrypt the optional caption envelope (user text sent alongside an
+    image/file). Returns the caption string, or "" when absent/failed."""
+    cap_ct = m.get("caption_body_ct")
+    if not cap_ct:
+        return ""
+    cap_env = {
+        "id": m.get("caption_id") or m.get("id"),
+        "v": int(m.get("caption_v", m.get("v", 1)) or m.get("v", 1)),
+        "body_ct": cap_ct,
+        "nonce": m.get("caption_nonce"),
+        "K_enclave": m.get("caption_K_enclave"),
+        "owner_user_id": m.get("caption_owner_user_id") or m.get("owner_user_id"),
+    }
+    try:
+        return envelope.decrypt_envelope(
+            cap_env, authorized_user_id, content_sk
+        ).decode("utf-8", errors="replace")
+    except Exception as e:
+        errors.append({"id": m.get("id"), "reason": f"caption_decrypt: {e}"})
+        return ""
+
+
 def _decrypt_history_items(messages, authorized_user_id, content_sk):
     """纯同步批解密（在 to_thread 里跑）。函数体 = 旧 L1471-1546 逐字，
     唯一改动：_decrypt_envelope → envelope.decrypt_envelope、
@@ -75,25 +98,18 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
                 # If a caption envelope is present (user sent text alongside the
                 # image), decrypt it and fill content so the agent sees the
                 # user's actual question rather than an empty string.
-                entry["content"] = ""
-                cap_ct = m.get("caption_body_ct")
-                if cap_ct:
-                    cap_env = {
-                        "id": m.get("caption_id") or m.get("id"),
-                        "v": int(m.get("caption_v", v) or v),
-                        "body_ct": cap_ct,
-                        "nonce": m.get("caption_nonce"),
-                        "K_enclave": m.get("caption_K_enclave"),
-                        "owner_user_id": m.get("caption_owner_user_id") or m.get("owner_user_id"),
-                    }
-                    try:
-                        entry["content"] = envelope.decrypt_envelope(
-                            cap_env, authorized_user_id, content_sk
-                        ).decode("utf-8", errors="replace")
-                    except Exception as e:
-                        errors.append({"id": m.get("id"), "reason": f"caption_decrypt: {e}"})
+                entry["content"] = _decrypt_caption(m, authorized_user_id, content_sk, errors)
                 entry["image_b64"] = base64.b64encode(plaintext).decode("ascii")
                 entry["image_mime"] = m.get("image_mime") or "image/jpeg"
+            elif ctype == "file":
+                # File plaintext is the raw file bytes — surface as base64 so the
+                # resident consumer can land it on disk / inline it. Caption
+                # (user text alongside the file) decrypts into content, mirroring
+                # the image branch.
+                entry["content"] = _decrypt_caption(m, authorized_user_id, content_sk, errors)
+                entry["file_b64"] = base64.b64encode(plaintext).decode("ascii")
+                entry["file_mime"] = m.get("file_mime") or "application/octet-stream"
+                entry["file_name"] = m.get("file_name") or "file"
             else:
                 entry["content"] = plaintext.decode("utf-8", errors="replace")
             decrypted.append(entry)

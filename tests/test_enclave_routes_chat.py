@@ -152,6 +152,39 @@ def test_image_message_with_caption(client, monkeypatch):
     assert m["content"] == "what is this?"
 
 
+def test_file_message_with_caption(client, monkeypatch):
+    _wire(monkeypatch, [
+        {"id": "f1", "role": "user", "ts": 1.0, "v": 1, "content_type": "file",
+         "K_enclave": "x", "body_ct": "x", "nonce": "x", "owner_user_id": "usr_a",
+         "file_mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+         "file_name": "报告.docx",
+         "caption_body_ct": "y", "caption_nonce": "y", "caption_K_enclave": "y"},
+    ])
+    raw = b"raw doc bytes"
+    def fake_decrypt(env, uid, sk):
+        return b"summarize this?" if env.get("body_ct") == "y" else raw
+    monkeypatch.setattr(envmod, "decrypt_envelope", fake_decrypt)
+    m = client.get("/v1/chat/history", headers={"X-API-Key": "k"}).get_json()["messages"][0]
+    import base64 as _b64
+    assert _b64.b64decode(m["file_b64"]) == raw
+    assert m["file_mime"].endswith("wordprocessingml.document")
+    assert m["file_name"] == "报告.docx"
+    assert m["content"] == "summarize this?"
+
+
+def test_file_message_without_caption(client, monkeypatch):
+    _wire(monkeypatch, [
+        {"id": "f2", "role": "user", "ts": 1.0, "v": 1, "content_type": "file",
+         "K_enclave": "x", "body_ct": "x", "nonce": "x", "owner_user_id": "usr_a",
+         "file_mime": "text/markdown", "file_name": "notes.md"},
+    ])
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda e,u,s: b"# notes\n")
+    m = client.get("/v1/chat/history", headers={"X-API-Key": "k"}).get_json()["messages"][0]
+    import base64 as _b64
+    assert _b64.b64decode(m["file_b64"]) == b"# notes\n"
+    assert m["content"] == ""
+
+
 def test_context_memories_best_effort_on_failure(client, monkeypatch):
     _wire(monkeypatch, [])
     from enclave import readside
