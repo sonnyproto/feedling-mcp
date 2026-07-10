@@ -146,7 +146,7 @@ def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monk
     msg = {"id": "user-msg-v2", "role": "user", "content": "天气怎么样？", "ts": 1112.0}
     captured = {}
 
-    def fake_call(message, images=None, image_paths=None, trace_id=""):
+    def fake_call(message, images=None, image_paths=None, trace_id="", lane="background"):
         captured["message"] = message
         return {"messages": ["外面下雨。"]}
 
@@ -177,7 +177,7 @@ def test_process_messages_prompt_does_not_request_custom_thinking_summary(monkey
     msg = {"id": "user-msg-thinking", "role": "user", "content": "刚才怎么没思考过程？", "ts": 1112.5}
     captured = {}
 
-    def fake_call(message, images=None, image_paths=None, trace_id=""):
+    def fake_call(message, images=None, image_paths=None, trace_id="", lane="background"):
         captured["message"] = message
         return {"messages": ["我查一下。"]}
 
@@ -1029,6 +1029,36 @@ Tell me what you want to work on next."""
     assert cleaned == "Hello Seven — I see your message now.\nTell me what you want to work on next."
 
 
+def test_post_reply_strips_self_authored_protocol_before_http_post(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"id": "reply_1"}
+
+        def raise_for_status(self):
+            pass
+
+    def _fake_post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", False)
+    monkeypatch.setattr(crc.httpx, "post", _fake_post)
+    raw = (
+        f"{crc._SELF_AUTHORED_THINKING_OPEN}\n先想。\n"
+        f"{crc._SELF_AUTHORED_THINKING_CLOSE}\n{crc._SELF_AUTHORED_REPLY_OPEN}\n"
+        f"只发正文。\n{crc._SELF_AUTHORED_REPLY_CLOSE}"
+    )
+
+    assert crc.post_reply(raw) == {"id": "reply_1"}
+    assert captured["json"]["content"] == "只发正文。"
+    assert captured["json"]["alert_body"] == "只发正文。"
+    _assert_no_self_authored_protocol(captured["json"]["content"])
+
+
 def test_sanitize_reply_text_drops_unlabeled_english_meta_before_cjk_answer():
     raw = """specific tool is required for this factual question, so I can rely on my memory
 or general knowledge up to 2024. I remember Philip Daian as an Ethereum researcher
@@ -1102,6 +1132,135 @@ def test_agent_turn_splits_reasoning_and_thought_tags_from_cli_text():
     assert turn.thinking_kind == "provider_reasoning_summary"
     assert turn.thinking_source == "tagged_content"
     assert turn.thinking_native is False
+
+
+def _assert_no_self_authored_protocol(text: str):
+    upper = str(text or "").upper()
+    assert "FEEDLING_THINKING" not in upper
+    assert "FEEDLING_REPLY" not in upper
+
+
+def test_agent_turn_splits_self_authored_thinking_protocol():
+    raw = f"""{crc._SELF_AUTHORED_THINKING_OPEN}
+比较了用户最新问题和最近上下文。
+{crc._SELF_AUTHORED_THINKING_CLOSE}
+{crc._SELF_AUTHORED_REPLY_OPEN}
+这是最终回复。
+{crc._SELF_AUTHORED_REPLY_CLOSE}"""
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["这是最终回复。"]
+    assert turn.thinking_summary == "比较了用户最新问题和最近上下文。"
+    assert turn.thinking_kind == "provider_reasoning_summary"
+    assert turn.thinking_source == "self_authored_v2"
+    assert turn.thinking_native is False
+    _assert_no_self_authored_protocol(turn.messages[0])
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_reply", "expected_thinking"),
+    [
+        (
+            "[FEEDLING_THINKING_V2]\n先判断用户意图。\n[/FEEDLING_THINKING_V2]\n"
+            "[FEEDLING_REPLY_V2]\n变体 marker 也能解析。\n[/FEEDLING_REPLY_V2]",
+            "变体 marker 也能解析。",
+            "先判断用户意图。",
+        ),
+        (
+            f"{crc._SELF_AUTHORED_THINKING_OPEN}\n先整理上下文。\n"
+            f"{crc._SELF_AUTHORED_THINKING_CLOSE}\n{crc._SELF_AUTHORED_REPLY_OPEN}\n"
+            "缺 reply close 也保留正文。",
+            "缺 reply close 也保留正文。",
+            "先整理上下文。",
+        ),
+        (
+            f"{crc._SELF_AUTHORED_THINKING_OPEN}\n半截 thinking close。\n"
+            f"{crc._SELF_AUTHORED_REPLY_OPEN}\n靠 reply marker 恢复正文。",
+            "靠 reply marker 恢复正文。",
+            "半截 thinking close。",
+        ),
+        (
+            f"{crc._SELF_AUTHORED_THINKING_OPEN}\n先想。\n"
+            f"{crc._SELF_AUTHORED_REPLY_OPEN}\n嵌套假正文。\n"
+            f"{crc._SELF_AUTHORED_THINKING_CLOSE}\n{crc._SELF_AUTHORED_REPLY_OPEN}\n"
+            f"真正正文。\n{crc._SELF_AUTHORED_REPLY_CLOSE}",
+            "真正正文。",
+            "先想。\n嵌套假正文。",
+        ),
+        (
+            f"可见前缀。\n{crc._SELF_AUTHORED_THINKING_OPEN}\n"
+            "没有 close 也没有 reply，后半段必须丢。",
+            "可见前缀。",
+            "",
+        ),
+        (
+            "<<FEEDLING_THINKING_V2\n半截 marker。\n<<FEEDLING_REPLY_V2\n最终正文。",
+            "最终正文。",
+            "半截 marker。",
+        ),
+        (
+            "FEEDLING_THINKING_V2\n裸 marker thinking。\n/FEEDLING_THINKING_V2\n"
+            "FEEDLING_REPLY_V2\n裸 marker 正文。\n/FEEDLING_REPLY_V2",
+            "裸 marker 正文。",
+            "裸 marker thinking。",
+        ),
+    ],
+)
+def test_agent_turn_self_authored_protocol_malformed_inputs_do_not_leak(
+    raw, expected_reply, expected_thinking
+):
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == [expected_reply]
+    if expected_thinking:
+        assert turn.thinking_summary == expected_thinking
+        assert turn.thinking_source == "self_authored_v2"
+        assert turn.thinking_native is False
+    else:
+        assert turn.thinking_summary == ""
+    _assert_no_self_authored_protocol(turn.messages[0])
+
+
+def test_agent_turn_native_reasoning_wins_over_self_authored_protocol():
+    raw = {
+        "reply": f"{crc._SELF_AUTHORED_THINKING_OPEN}\n自产摘要。\n"
+        f"{crc._SELF_AUTHORED_THINKING_CLOSE}\n{crc._SELF_AUTHORED_REPLY_OPEN}\n"
+        f"最终回复。\n{crc._SELF_AUTHORED_REPLY_CLOSE}",
+        "reasoning_content": "原生 reasoning 摘要。",
+        "reasoning_source": "openrouter",
+    }
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["最终回复。"]
+    assert turn.thinking_summary == "原生 reasoning 摘要。"
+    assert turn.thinking_source == "openrouter"
+    assert turn.thinking_native is True
+    _assert_no_self_authored_protocol(turn.messages[0])
+
+
+def test_self_authored_thinking_prompt_is_default_off_and_skips_raw_text(monkeypatch):
+    captured = {}
+
+    def _fake_http(message, images=None, raw_text=False):
+        captured["message"] = message
+        return "ok"
+
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "call_agent_http", _fake_http)
+
+    monkeypatch.setattr(crc, "SELF_AUTHORED_THINKING_FALLBACK", False)
+    assert crc.call_agent("hi")["messages"] == ["ok"]
+    assert "FEEDLING_THINKING" not in captured["message"]
+
+    monkeypatch.setattr(crc, "SELF_AUTHORED_THINKING_FALLBACK", True)
+    crc.call_agent("hi")
+    assert "FEEDLING_THINKING_V2" in captured["message"]
+
+    captured.clear()
+    assert crc.call_agent("hi", raw_text=True) == "ok"
+    assert captured["message"] == "hi"
 
 
 def test_extract_cli_output_prefers_structured_json_reply():
@@ -1342,6 +1501,89 @@ def test_prepare_hermes_cli_first_turn_removes_continue(monkeypatch):
     assert "--resume" not in cmd
 
 
+def _setup_hermes_session_cli(monkeypatch, tmp_path, *, session_id: str, session_doc: str | None):
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_hermes", "user_pk": None, "enclave_pk": None})
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "feedling_{user_id}.json"))
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        'hermes chat -Q --source tool --max-turns 60 -q "{message}"',
+    )
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    hermes_home = tmp_path / "hermes_home"
+    sessions = hermes_home / "sessions"
+    sessions.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    if session_doc is not None:
+        (sessions / f"session_{session_id}.json").write_text(session_doc, encoding="utf-8")
+
+    class _R:
+        returncode = 0
+        stdout = f"在。\nsession_id: {session_id}\n"
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+
+def test_call_agent_cli_hermes_reads_native_reasoning_from_session_json(monkeypatch, tmp_path):
+    session_doc = json.dumps({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "older", "reasoning": "older reasoning"},
+            {
+                "role": "assistant",
+                "content": "在。",
+                "reasoning": "**Checking token validity**\nI'm checking the current session before replying.",
+                "codex_reasoning_items": [{"type": "reasoning", "encrypted_content": "gAAAA"}],
+            },
+        ],
+    })
+    _setup_hermes_session_cli(monkeypatch, tmp_path, session_id="sess_reasoning", session_doc=session_doc)
+
+    raw = crc.call_agent_cli("hi")
+    turn = crc._agent_turn_from_raw(raw)
+
+    assert turn.messages == ["在。"]
+    assert "current session before replying" in turn.thinking_summary
+    assert "older reasoning" not in turn.thinking_summary
+    assert turn.thinking_kind == "provider_reasoning"
+    assert turn.thinking_source == "hermes_session_json"
+    assert turn.thinking_native is True
+
+
+@pytest.mark.parametrize("session_doc", [
+    json.dumps({"messages": [{"role": "assistant", "content": "在。", "reasoning": None}]}),
+    None,
+    "{not valid json",
+])
+def test_call_agent_cli_hermes_skips_missing_bad_or_null_reasoning(monkeypatch, tmp_path, session_doc):
+    _setup_hermes_session_cli(monkeypatch, tmp_path, session_id="sess_skip", session_doc=session_doc)
+
+    raw = crc.call_agent_cli("hi")
+    turn = crc._agent_turn_from_raw(raw)
+
+    assert turn.messages == ["在。"]
+    assert turn.thinking_summary == ""
+
+
+def test_hermes_session_reasoning_skips_oversized_file(monkeypatch, tmp_path):
+    session_id = "sess_big"
+    hermes_home = tmp_path / "hermes_home"
+    sessions = hermes_home / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / f"session_{session_id}.json").write_text(
+        json.dumps({"messages": [{"role": "assistant", "reasoning": "too large"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(crc, "HERMES_SESSION_REASONING_MAX_BYTES", 8)
+
+    assert crc._hermes_session_reasoning(session_id) == ""
+
+
 def test_prepare_claude_cli_first_turn_forces_print_json_and_strips_continue(monkeypatch):
     monkeypatch.setattr(
         crc,
@@ -1533,7 +1775,7 @@ def test_cli_nonzero_exit_fails_even_with_stdout(monkeypatch):
         stderr = "bad command"
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError, match="cli agent exited 2"):
@@ -1550,7 +1792,7 @@ def test_cli_failure_surfaces_claude_json_error_from_stdout(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p {message}')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["claude", "-p", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["claude", "-p", message])
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError) as ei:
@@ -1572,7 +1814,7 @@ def test_cli_failure_surfaces_codex_stream_error_from_stdout(monkeypatch):
         stderr = "Reading additional input from stdin..."
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec --json {message}')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["codex", "exec", "--json", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["codex", "exec", "--json", message])
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError) as ei:
@@ -3510,6 +3752,70 @@ def test_agent_turn_extracts_claude_stream_json_thinking_blocks():
     assert turn.thinking_native is True
 
 
+def test_agent_turn_extracts_claude_stream_json_thinking_deltas_without_final_block():
+    raw = "\n".join([
+        json.dumps({
+            "type": "stream_event",
+            "event": {
+                "type": "message_start",
+                "message": {"model": "claude-sonnet-4-5-20250929"},
+            },
+        }),
+        json.dumps({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+            },
+        }),
+        json.dumps({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "First thought. "},
+            },
+        }),
+        json.dumps({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "Second thought."},
+            },
+        }),
+        json.dumps({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "最终答案。"},
+            },
+        }),
+        # Some Claude CLI/provider combinations expose final text but omit the
+        # final assistant thinking content block. The delta aggregator must still
+        # preserve the provider-native thinking disclosure.
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "claude-sonnet-4-5-20250929",
+                "content": [{"type": "text", "text": "最终答案。"}],
+            },
+        }),
+    ])
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["最终答案。"]
+    assert turn.thinking_summary == "First thought. Second thought."
+    assert turn.thinking_kind == "provider_reasoning"
+    assert turn.thinking_source == "anthropic_thinking"
+    assert turn.thinking_model == "claude-sonnet-4-5-20250929"
+    assert turn.thinking_native is True
+
+
 def test_agent_turn_extracts_provider_reasoning_metadata_from_nested_result():
     raw = json.dumps(
         {
@@ -3851,7 +4157,7 @@ def test_cli_tool_only_output_preserves_tool_calls(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     result = crc.call_agent_cli("hi")

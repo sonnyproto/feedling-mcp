@@ -60,10 +60,10 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
             claim=claim,
         )
 
-    def _response(messages, timed_out):
+    def _response(messages, timed_out, ctx):
         return chat_poll_core.build_response(
             messages=messages,
-            context=context,
+            context=ctx,
             consumer_id=consumer_id,
             claim=claim,
             timed_out=timed_out,
@@ -74,7 +74,7 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
     )
     if waiter is None:
         # Cap hit — shed to an immediate timed-out response; consumer re-polls.
-        return _response([], timed_out=True)
+        return _response([], timed_out=True, ctx=context)
     try:
         # Check AFTER registering the waiter. asyncio.Event.set() latches, so a
         # write that wakes in the gap between check and park is NOT lost: if it
@@ -84,7 +84,9 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
         # old order — forfeited that latch and could park for the full timeout.)
         pending = await _check()
         if pending:
-            return _response(pending, timed_out=False)
+            # Immediate delivery before parking: the pre-park context is still
+            # the freshest snapshot, so reuse it (no extra DB read).
+            return _response(pending, timed_out=False, ctx=context)
         try:
             await asyncio.wait_for(waiter.event.wait(), timeout=max(0.0, timeout))
             notified = True
@@ -95,9 +97,13 @@ async def chat_poll(request: Request, auth: AuthResult = Depends(require_auth)):
         # a waiter (plan §14.6).
         registry.unregister(waiter)
 
+    # Refresh the context after the wait: config changes that landed while we
+    # were parked (a moved user_mcp fingerprint etc.) must be reflected in this
+    # response rather than the stale pre-park snapshot.
+    fresh = await threadpool.run_db(chat_poll_core.poll_context, store)
     if notified:
-        return _response(await _check(), timed_out=False)
-    return _response([], timed_out=True)
+        return _response(await _check(), timed_out=False, ctx=fresh)
+    return _response([], timed_out=True, ctx=fresh)
 
 
 # --------------------------------------------------------------------------- #

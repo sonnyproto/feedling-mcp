@@ -76,8 +76,9 @@ def test_pending_messages_no_claim_leaves_it_pending(store):
 
 def test_poll_context_shape(store):
     ctx = chat_poll_core.poll_context(store)
-    assert set(ctx) == {"runtime_v2", "client_release"}
+    assert set(ctx) == {"runtime_v2", "client_release", "user_mcp"}
     assert "expected_consumer_commit" in ctx["client_release"]
+    assert ctx["user_mcp"] == {"fingerprint": ""}
 
 
 def test_build_response_contract(store):
@@ -85,10 +86,13 @@ def test_build_response_contract(store):
     resp = chat_poll_core.build_response(
         messages=[{"id": "m"}], context=ctx, consumer_id="c-A", claim=True, timed_out=False
     )
-    assert set(resp) == {"messages", "runtime_v2", "client_release", "timed_out", "consumer_id", "claimed"}
+    assert set(resp) == {
+        "messages", "runtime_v2", "client_release", "user_mcp", "timed_out", "consumer_id", "claimed",
+    }
     assert resp["messages"] == [{"id": "m"}]
     assert resp["consumer_id"] == "c-A"
     assert resp["claimed"] is True
     assert resp["timed_out"] is False
     assert resp["runtime_v2"] == ctx["runtime_v2"]
     assert resp["client_release"] == ctx["client_release"]
+    assert resp["user_mcp"] == ctx["user_mcp"]

@@ -130,17 +130,17 @@ def _codex_gateway_config(*, base_url: str, model: str) -> str:
         'wire_api = "responses"',
         'env_key = "CODEX_API_KEY"',
         "",
-        # codex ≥0.142 declares its multi-agent (collab) tools as a
+        # codex >=0.142 declares its multi-agent tools as a
         # `{"type": "namespace"}` tool group on EVERY Responses request — an
         # OpenAI-only wire extension. Non-OpenAI upstreams reject the whole
         # request on the unknown tool type (xAI via openrouter: 422 "unknown
         # variant 'namespace', expected one of 'function', 'web_search'"), so
-        # every turn dies before the model runs. Disable collab for gateway
+        # every turn dies before the model runs. Disable multi-agent for gateway
         # users; the remaining tools are plain `function` + `web_search`,
         # which the gateway upstreams parse. (Verified on codex-cli 0.142.5:
-        # with `collab = false` the namespace group is gone from the wire.)
+        # with `multi_agent = false` the namespace group is gone from the wire.)
         "[features]",
-        "collab = false",
+        "multi_agent = false",
     ]
     return "\n".join(lines) + "\n"
 
@@ -311,6 +311,7 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
             "codex exec --skip-git-repo-check --json "
             "-c model_reasoning_effort=medium "
             "-c model_reasoning_summary=auto "
+            "{mcp} "
             "--dangerously-bypass-approvals-and-sandbox {message}"
         )
     grant = ",".join(_claude_allow_rules(io_cli, home))
@@ -318,7 +319,7 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
     return (
         f"claude {_CLAUDE_PERMISSION_FLAG} {_attach_dirs_add_dir(home)} "
         f"--allowed-tools '{grant}' "
-        f"--append-system-prompt-file {prompt_file} -p {{message}}"
+        f"--append-system-prompt-file {prompt_file} {{mcp}} -p {{message}}"
     )
 
 
@@ -345,7 +346,7 @@ def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
         f"claude {_CLAUDE_PERMISSION_FLAG} {_attach_dirs_add_dir(home)} --verbose "
         f"--output-format stream-json --include-partial-messages --effort high "
         f"--allowed-tools '{grant}' "
-        f"--append-system-prompt-file {prompt_file} -p {{message}}"
+        f"--append-system-prompt-file {prompt_file} {{mcp}} -p {{message}}"
     )
 
 
@@ -361,6 +362,14 @@ def _claude_cli_should_stream_thinking(entry: dict) -> bool:
         or "claude-sonnet-4" in model
         or "claude-opus-4" in model
     )
+
+
+def _entry_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
 
 
 def agent_home_files(
@@ -583,6 +592,9 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     # /tmp/feedling_chat_files, outside the workspace, and claude's Read is denied.
     env["FILE_TEMP_DIR"] = f"{home}/files"
     env["CONSUMER_ID"] = f"agent-runner:{user_id}"
+    env["FEEDLING_SELF_AUTHORED_THINKING_FALLBACK"] = (
+        "1" if _entry_bool(entry.get("thinking_fallback")) else "0"
+    )
     # Ambient timezone for the hosted agent process tree (this consumer + the CLI
     # it spawns). Without it the process inherits the CVM's UTC clock, so the CLI
     # agent's OWN sense of "today / now" (e.g. a date line the runtime injects) is

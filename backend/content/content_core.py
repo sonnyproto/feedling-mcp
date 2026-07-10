@@ -138,26 +138,35 @@ def _swap_summary(results: list) -> dict:
     return summary
 
 
-def _swap_chat(store: "UserStore", msg_id: str, env: dict) -> str:
+def _swap_chat(
+    store: "UserStore",
+    msg_id: str,
+    env: dict | None,
+    sub_envs: dict[str, dict] | None = None,
+) -> str:
+    """``env=None`` 表示主信封已是当前钥,只写回 ``sub_envs`` 里的子信封。"""
     with store.chat_lock:
         for msg in store.chat_messages:
             if msg.get("id") != msg_id:
                 continue
-            msg["v"] = int(env.get("v", 1))
-            msg["body_ct"] = env["body_ct"]
-            msg["nonce"] = env["nonce"]
-            msg["K_user"] = env["K_user"]
-            if env.get("K_enclave"):
-                msg["K_enclave"] = env["K_enclave"]
-            else:
-                msg.pop("K_enclave", None)
-            msg["enclave_pk_fpr"] = env.get("enclave_pk_fpr", "")
-            if env.get("content_pk_fpr"):
-                msg["content_pk_fpr"] = env["content_pk_fpr"]
-            else:
-                msg.pop("content_pk_fpr", None)
-            msg["visibility"] = env["visibility"]
-            msg["owner_user_id"] = env["owner_user_id"]
+            if env is not None:
+                msg["v"] = int(env.get("v", 1))
+                msg["body_ct"] = env["body_ct"]
+                msg["nonce"] = env["nonce"]
+                msg["K_user"] = env["K_user"]
+                if env.get("K_enclave"):
+                    msg["K_enclave"] = env["K_enclave"]
+                else:
+                    msg.pop("K_enclave", None)
+                msg["enclave_pk_fpr"] = env.get("enclave_pk_fpr", "")
+                if env.get("content_pk_fpr"):
+                    msg["content_pk_fpr"] = env["content_pk_fpr"]
+                else:
+                    msg.pop("content_pk_fpr", None)
+                msg["visibility"] = env["visibility"]
+                msg["owner_user_id"] = env["owner_user_id"]
+            for prefix, sub_env in (sub_envs or {}).items():
+                _apply_sub_envelope_fields(msg, prefix, sub_env)
             # Full-row replace: the K_enclave key may have been removed, which a
             # JSONB shallow-merge can't express, so we overwrite the whole doc.
             db.chat_append(store.user_id, msg_id, msg["ts"], msg, core_store.MAX_CHAT_MESSAGES)
@@ -249,6 +258,80 @@ def _apply_envelope_fields(record: dict, env: dict) -> None:
         record.pop("content_pk_fpr", None)
     record["visibility"] = env["visibility"]
     record["owner_user_id"] = env["owner_user_id"]
+
+
+# 一条 chat 记录可以挂两个独立信封:agent 的思维链、图片的说明文字。它们各自带
+# id/v/owner_user_id,iOS 正是用这三元组重算 AAD(ChatMessage.swift,`thinking_id ?? id`),
+# 所以重封时必须原样保留,否则设备再也算不出匹配的 AAD。
+_SUB_ENVELOPE_PREFIXES = ("thinking", "caption")
+
+
+def _extract_sub_envelope(record: dict, prefix: str) -> dict | None:
+    """把 ``<prefix>_*`` 字段还原成一个标准信封,好走与主信封同一套重封逻辑。"""
+    if not record.get(f"{prefix}_K_user") or not record.get(f"{prefix}_body_ct"):
+        return None
+    return {
+        "v": int(record.get(f"{prefix}_v") or 1),
+        # iOS 在 <prefix>_id 缺失时回落到记录自身的 id;AAD 要跟着一起回落。
+        "id": str(record.get(f"{prefix}_id") or record.get("id") or ""),
+        "body_ct": record.get(f"{prefix}_body_ct"),
+        "nonce": record.get(f"{prefix}_nonce"),
+        "K_user": record.get(f"{prefix}_K_user"),
+        "K_enclave": record.get(f"{prefix}_K_enclave"),
+        "visibility": record.get(f"{prefix}_visibility") or "shared",
+        "owner_user_id": record.get(f"{prefix}_owner_user_id") or record.get("owner_user_id"),
+        "content_pk_fpr": record.get(f"{prefix}_content_pk_fpr"),
+    }
+
+
+def _apply_sub_envelope_fields(record: dict, prefix: str, env: dict) -> None:
+    """写回重封后的子信封。只碰自己的前缀字段,不像主信封那样 pop 缺失的键。"""
+    record[f"{prefix}_v"] = int(env.get("v", 1))
+    record[f"{prefix}_id"] = env["id"]
+    record[f"{prefix}_body_ct"] = env["body_ct"]
+    record[f"{prefix}_nonce"] = env["nonce"]
+    record[f"{prefix}_K_user"] = env["K_user"]
+    if env.get("K_enclave"):
+        record[f"{prefix}_K_enclave"] = env["K_enclave"]
+    record[f"{prefix}_visibility"] = env["visibility"]
+    record[f"{prefix}_owner_user_id"] = env["owner_user_id"]
+    record[f"{prefix}_content_pk_fpr"] = env.get("content_pk_fpr", "")
+
+
+def _build_rewrapped_sub_envelopes(
+    store: UserStore,
+    record: dict,
+    *,
+    api_key: str | None,
+    user_pk: bytes,
+    enclave_pk: bytes,
+    kind: str,
+    current_fpr: str = "",
+) -> list[tuple[str, dict | None, str, str]]:
+    """重封该记录下的每个子信封,逐个返回 ``(prefix, env, status, reason)``。
+
+    每个子信封独立计入 summary:主信封重封成功、思维链失败时,前者仍是真实进展
+    (``_swap_chat`` 已经把它落库了),后者只是一条待重试的 error。把两者压成一个
+    status 会让 ``made_progress`` 误判成 False,于是 public_key 永远推不上去。
+
+    local_only / 无 K_enclave 的子信封 enclave 打不开,原样留下(而不是丢弃)。
+    """
+    out: list[tuple[str, dict | None, str, str]] = []
+    for prefix in _SUB_ENVELOPE_PREFIXES:
+        sub = _extract_sub_envelope(record, prefix)
+        if sub is None:
+            continue
+        env, status, reason = _build_rewrapped_envelope(
+            store,
+            sub,
+            api_key=api_key,
+            user_pk=user_pk,
+            enclave_pk=enclave_pk,
+            kind=f"{kind}_{prefix}",
+            current_fpr=current_fpr,
+        )
+        out.append((prefix, env, status, reason))
+    return out
 
 
 def _build_rewrapped_envelope(
@@ -446,7 +529,7 @@ def rewrap_to_current_key(
     results: list[dict] = []
     identity_plan: dict | None = None
     memory_plans: list[tuple[int, dict]] = []
-    chat_plans: list[tuple[str, dict]] = []
+    chat_plans: list[tuple[str, dict | None, dict[str, dict]]] = []
 
     identity = identity_service._load_identity(store)
     if identity is not None:
@@ -498,8 +581,28 @@ def rewrap_to_current_key(
         )
         item_id = str(msg.get("id") or "")
         results.append(_rewrap_record_result(summary, "chat", item_id, status, reason=reason))
-        if env is not None:
-            chat_plans.append((item_id, env))
+        # 子信封独立于主信封:主体可能早已重封到当前钥,思维链却还封在旧钥上。
+        # 因此既不能因为主信封 skipped_already_current 就整条跳过,也不能让子信封
+        # 的失败盖掉主信封的成功 —— 各记各的账。
+        sub_envs: dict[str, dict] = {}
+        for prefix, sub_env, sub_status, sub_reason in _build_rewrapped_sub_envelopes(
+            store,
+            msg,
+            api_key=api_key,
+            user_pk=user_pk,
+            enclave_pk=enclave_pk,
+            kind="chat",
+            current_fpr=current_fpr,
+        ):
+            results.append(
+                _rewrap_record_result(
+                    summary, "chat", f"{item_id}#{prefix}", sub_status, reason=sub_reason
+                )
+            )
+            if sub_env is not None:
+                sub_envs[prefix] = sub_env
+        if env is not None or sub_envs:
+            chat_plans.append((item_id, env, sub_envs))
 
     response = {
         "status": "dry_run" if dry_run else "ok",
@@ -551,9 +654,9 @@ def rewrap_to_current_key(
             memory_service._save_moments(store, fresh)
 
     swapped_ids: set[str] = set()
-    for item_id, env in chat_plans:
+    for item_id, env, sub_envs in chat_plans:
         # _swap_chat 自行把交换后的信封字段写回 DB。
-        if _swap_chat(store, item_id, env) == "ok":
+        if _swap_chat(store, item_id, env, sub_envs) == "ok":
             swapped_ids.add(item_id)
     if swapped_ids:
         with store.chat_lock:

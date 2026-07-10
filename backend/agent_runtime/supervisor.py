@@ -677,7 +677,9 @@ def _discover_enabled(include_gateway: bool = False) -> dict[str, dict]:
     isn't there."""
     return {u["user_id"]: {"driver": u["driver"], "provider": u.get("provider", ""),
                            "model": u.get("model", ""), "base_url": u.get("base_url", ""),
-                           "supports_responses": bool(u.get("supports_responses", False))}
+                           "supports_responses": bool(u.get("supports_responses", False)),
+                           "reasoning_effort": u.get("reasoning_effort", ""),
+                           "thinking_fallback": bool(u.get("thinking_fallback", False))}
             for u in db.list_agent_runtime_enabled_users(include_gateway=include_gateway)}
 
 
@@ -696,7 +698,9 @@ def _apply_discovery(roster: list[dict], enabled: dict[str, dict]) -> list[dict]
                         "provider": info.get("provider", ""),
                         "model": info.get("model", ""),
                         "base_url": info.get("base_url", ""),
-                        "supports_responses": bool(info.get("supports_responses", False))})
+                        "supports_responses": bool(info.get("supports_responses", False)),
+                        "reasoning_effort": info.get("reasoning_effort", ""),
+                        "thinking_fallback": bool(info.get("thinking_fallback", False))})
     return out
 
 
@@ -779,7 +783,9 @@ def _resolve_one(uid: str, info: dict, *, mint_token, api_url: str, enclave_url:
 
         entry = {"user_id": uid, "driver": info["driver"], "provider": info.get("provider", ""),
                  "model": info.get("model", ""), "base_url": info.get("base_url", ""),
-                 "supports_responses": bool(info.get("supports_responses", False))}
+                 "supports_responses": bool(info.get("supports_responses", False)),
+                 "reasoning_effort": info.get("reasoning_effort", ""),
+                 "thinking_fallback": bool(info.get("thinking_fallback", False))}
         if provider_key:
             entry["provider_key"] = provider_key
         # Carry the freshly-minted runtime token so ProcessSpawner.spawn can decrypt
@@ -999,6 +1005,7 @@ def _spawn_identity(entry: dict) -> tuple:
         entry.get("provider") or "",
         entry.get("model") or "",
         entry.get("base_url") or "",
+        bool(entry.get("thinking_fallback", False)),
         # gateway 用户 ``model`` 是稳定的 gw-<uid> 别名；真实上游模型放在 identity_model，
         # 纳入签名使切换上游模型时 respawn 并重新落盘身份块。
         entry.get("identity_model") or "",
@@ -1020,6 +1027,7 @@ def _gateway_entries(roster: list[dict]) -> list[dict]:
                 "model": e.get("model") or "",
                 "base_url": e.get("base_url") or "",
                 "supports_responses": bool(e.get("supports_responses", False)),
+                "reasoning_effort": e.get("reasoning_effort") or "",
                 "provider_key": e.get("provider_key") or "",
             })
     return out

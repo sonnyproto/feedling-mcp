@@ -366,6 +366,25 @@ def test_parse_openai_compat_body_result_shape():
             provider="openrouter", model="m", require_reply=False)
 
 
+def test_parse_deepseek_body_extracts_reasoning_content():
+    resp = FakeResponse(200, {
+        "id": "chatcmpl-deepseek",
+        "choices": [{"message": {
+            "content": "visible answer",
+            "reasoning_content": "deepseek reasoning summary",
+        }}],
+        "usage": {"total_tokens": 11},
+    })
+
+    out = pc._parse_openai_compat_body(
+        resp, provider="deepseek", model="deepseek-reasoner", require_reply=True)
+
+    assert out["reply"] == "visible answer"
+    assert out["reasoning"] == "deepseek reasoning summary"
+    assert out["usage"] == {"total_tokens": 11}
+    assert out["provider"] == "deepseek"
+
+
 def test_async_openrouter_retries_without_reasoning_when_unsupported(monkeypatch):
     """chat_completion_async 与同步版同一 payload/降级契约（openrouter reasoning
     400/422 → 去掉 reasoning 重试一次）。共享编解码后由本测试与同步版测试共同钉住。"""

@@ -611,6 +611,16 @@ def test_gateway_entries_carry_supports_responses_for_bridge_choice():
     assert gw["bridge"]["supports_responses"] is False
 
 
+def test_gateway_entries_carry_reasoning_effort_for_whitelist_rollout():
+    roster = [
+        {"user_id": "openrouter_user", "driver": "codex", "provider": "openrouter",
+         "model": "anthropic/claude-sonnet-4.6", "provider_key": "k",
+         "reasoning_effort": "medium"},
+    ]
+    gw = supervisor_mod._gateway_entries(roster)
+    assert gw[0]["reasoning_effort"] == "medium"
+
+
 def test_drop_gateway_users_filters_when_gateway_disabled():
     # With the gateway off, codex-gateway users must NOT be spawned (no proxy to
     # reach) — they're dropped so enabling hosted for them stays inert, not broken.
@@ -1197,6 +1207,13 @@ def test_spawn_identity_changes_when_base_url_changes():
     a = {"api_key": "k", "driver": "claude", "provider": "anthropic",
          "model": "claude-3.5-sonnet", "base_url": ""}
     b = dict(a, base_url="https://relay.example/anthropic")
+    assert supervisor_mod._spawn_identity(a) != supervisor_mod._spawn_identity(b)
+
+
+def test_spawn_identity_changes_when_thinking_fallback_changes():
+    a = {"api_key": "k", "driver": "codex", "provider": "openrouter",
+         "model": "gw-u1", "thinking_fallback": False}
+    b = dict(a, thinking_fallback=True)
     assert supervisor_mod._spawn_identity(a) != supervisor_mod._spawn_identity(b)
 
 

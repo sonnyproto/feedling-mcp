@@ -33,6 +33,24 @@ def test_consumer_env_drives_resident_in_cli_mode_for_claude():
     assert env["PATH"] == "/bin" and env["FEEDLING_API_URL"] == "http://b:5001"  # base preserved
 
 
+def test_consumer_env_threads_self_authored_thinking_fallback_per_user():
+    disabled = spawners.consumer_env(
+        {"FEEDLING_SELF_AUTHORED_THINKING_FALLBACK": "1"},
+        {"api_key": "fk", "provider_key": "sk-ant"},
+        user_id="u_off",
+        home="/agent-data/users/u_off",
+    )
+    enabled = spawners.consumer_env(
+        {},
+        {"api_key": "fk", "provider_key": "sk-ant", "thinking_fallback": True},
+        user_id="u_on",
+        home="/agent-data/users/u_on",
+    )
+
+    assert disabled["FEEDLING_SELF_AUTHORED_THINKING_FALLBACK"] == "0"
+    assert enabled["FEEDLING_SELF_AUTHORED_THINKING_FALLBACK"] == "1"
+
+
 def test_consumer_env_sets_tz_china_default_when_user_timezone_unknown():
     # Hosted agent process tree must not inherit the CVM's UTC clock: an unknown
     # user tz falls back to the China default so CN users don't perceive time 8h
@@ -181,6 +199,20 @@ def test_default_codex_cmd_requests_reasoning_summary_events():
     cmd = env["AGENT_CLI_CMD"]
     assert "-c model_reasoning_effort=medium" in cmd
     assert "-c model_reasoning_summary=auto" in cmd
+
+
+def test_default_cli_cmds_carry_mcp_placeholder():
+    # The resident consumer's `_render_cli_template` (Task 6) replaces `{mcp}`
+    # per turn: claude chat turns → `--mcp-config <file>`, codex non-chat turns
+    # → `-c mcp_servers={}` (clearing config.toml's [mcp_servers]), and the
+    # opposite turn kind → empty string. That only works if the default
+    # templates carry the `{mcp}` token in a position a CLI flag can occupy.
+    codex = spawners._default_cli_cmd("codex", "/h")
+    claude = spawners._default_cli_cmd("claude", "/h")
+    thinking = spawners._default_thinking_claude_cmd("/h")
+    assert "{mcp}" in codex and codex.index("{mcp}") < codex.index("{message}")
+    assert "{mcp}" in claude and claude.index("{mcp}") < claude.index("-p {message}")
+    assert "{mcp}" in thinking
 
 
 def test_consumer_env_tolerates_missing_api_key_for_zero_roster():
@@ -563,20 +595,21 @@ def test_agent_home_files_codex_gateway_writes_responses_config():
     assert "/h/codex-home/AGENTS.md" in files
 
 
-def test_agent_home_files_codex_gateway_disables_collab_tools():
+def test_agent_home_files_codex_gateway_disables_multi_agent_tools():
     # codex 0.142 declares its multi-agent tools as a `{"type": "namespace"}` tool
     # group on EVERY Responses request — an OpenAI-only wire extension. Non-OpenAI
     # upstreams behind the gateway reject the whole request on it (xAI: 422
     # "unknown variant 'namespace', expected one of 'function', 'web_search'"),
     # so every turn dies before the model runs. Gateway config must turn the
-    # collab feature off; native OpenAI keeps it (no config.toml written there).
+    # multi-agent feature off; native OpenAI keeps it (no config.toml written there).
     files = spawners.agent_home_files(
         "/h", driver="codex", provider="openrouter", codex_transport="gateway",
         gateway_base_url="http://127.0.0.1:4000/v1", model="gw-x",
     )
     cfg = files["/h/codex-home/config.toml"]
     assert "[features]" in cfg
-    assert "collab = false" in cfg
+    assert "multi_agent = false" in cfg
+    assert "collab = false" not in cfg
 
 
 def test_agent_home_files_codex_native_omits_gateway_config():
