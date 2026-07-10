@@ -222,6 +222,14 @@ CHECKPOINT_FILE = Path(
         f"/tmp/feedling_chat_checkpoint_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
     )
 )
+# Materialized user-MCP config target. Scoped by the same api-key fingerprint as
+# the checkpoint so two accounts on one host never share a file. This single file
+# is BOTH the claude ``--mcp-config`` target AND the documented generic
+# ``user-mcp.json`` for VPS agents (io-onboarding skill).
+USER_MCP_FILE = os.environ.get(
+    "USER_MCP_FILE",
+    f"/tmp/feedling_user_mcp_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
+)
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 RESIDENT_CHAT_RUNTIME_V2_FLAG = "resident_chat_runtime_v2_enabled"
 PROACTIVE_POLL_ENABLED = _env_bool("PROACTIVE_POLL_ENABLED", True)
@@ -757,6 +765,11 @@ def _runtime_repo_files() -> set[str]:
     files.update(
         {
             "tools/io_cli.py",
+            # Imported lazily inside _materialize_user_mcp, so it may not yet be
+            # in sys.modules when a release-diff check runs; register it
+            # explicitly so a user_mcp materialization change still triggers a
+            # self-update on self-hosted residents.
+            "tools/user_mcp_materialize.py",
             "tools/chat_resident_requirements.txt",
             "backend/requirements.txt",
         }
@@ -3130,7 +3143,12 @@ def _has_claude_output_format(cmd: list[str]) -> bool:
     return "--output-format" in cmd
 
 
-def _render_cli_template(message: str, sid: str, image_paths: list[str] | None = None) -> list[str]:
+def _render_cli_template(
+    message: str,
+    sid: str,
+    image_paths: list[str] | None = None,
+    lane: str = "background",
+) -> list[str]:
     image_paths = image_paths or []
     msg_token = "__FEEDLING_MESSAGE__"
     sid_token = "__FEEDLING_SESSION_ID__"
@@ -3138,6 +3156,10 @@ def _render_cli_template(message: str, sid: str, image_paths: list[str] | None =
     image_paths_token = "__FEEDLING_IMAGE_PATHS__"
     template = (
         AGENT_CLI_CMD
+        # Pre-split substitution: value is a controlled path / fixed literal, so
+        # it tokenizes cleanly (``--mcp-config <path>`` → two args) and an empty
+        # value collapses the placeholder to whitespace shlex drops.
+        .replace("{mcp}", _user_mcp_cli_value(AGENT_CLI_CMD, lane))
         .replace("{message}", msg_token)
         .replace("{session_id}", sid_token)
         .replace("{image_path}", image_path_token)
@@ -3156,7 +3178,11 @@ def _render_cli_template(message: str, sid: str, image_paths: list[str] | None =
     ]
 
 
-def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> list[str]:
+def _prepare_cli_command(
+    message: str,
+    image_paths: list[str] | None = None,
+    lane: str = "background",
+) -> list[str]:
     sid = _load_agent_session_id()
     template_has_image_slot = "{image_path" in AGENT_CLI_CMD
     # codex gets pixels natively via injected --image= flags (_inject_codex_images);
@@ -3168,7 +3194,7 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
     rendered_message = message
     if image_paths and not template_has_image_slot and not codex_native_images:
         rendered_message = _message_for_agent(message, image_paths)
-    cmd = _render_cli_template(rendered_message, sid, image_paths=image_paths)
+    cmd = _render_cli_template(rendered_message, sid, image_paths=image_paths, lane=lane)
     cmd, sid = _ensure_explicit_cli_session_id(cmd, sid)
 
     if _is_hermes_chat_cmd(cmd):
@@ -3330,11 +3356,12 @@ def call_agent_cli(
     image_paths: list[str] | None = None,
     raw_text: bool = False,
     trace_id: str = "",
+    lane: str = "background",
 ) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
 
-    cmd = _prepare_cli_command(message, image_paths=image_paths)
+    cmd = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     _turn_t0 = time.monotonic()
@@ -3534,13 +3561,17 @@ def call_agent(
     image_paths: list[str] | None = None,
     raw_text: bool = False,
     trace_id: str = "",
+    lane: str = "background",
 ) -> Any:
     if AGENT_MODE == "http":
         # http path metrics/timing are out of scope for this event pair (cli-only);
         # trace_id is accepted here for a uniform call signature but unused.
+        # lane gates MCP injection, which only exists on the cli path — unused here.
         raw = call_agent_http(message, images=images, raw_text=raw_text)
     elif AGENT_MODE == "cli":
-        raw = call_agent_cli(message, image_paths=image_paths, raw_text=raw_text, trace_id=trace_id)
+        raw = call_agent_cli(
+            message, image_paths=image_paths, raw_text=raw_text,
+            trace_id=trace_id, lane=lane)
     else:
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
@@ -3882,6 +3913,7 @@ def poll_chat(since: float) -> dict:
     body = resp.json()
     if isinstance(body, dict):
         _update_chat_runtime_v2_profile(body.get("runtime_v2"))
+        _update_user_mcp_advertised(body.get("user_mcp"))
     return body
 
 
@@ -3895,6 +3927,152 @@ def _resident_chat_runtime_v2_enabled() -> bool:
         return bool(_chat_runtime_v2_profile.get(RESIDENT_CHAT_RUNTIME_V2_FLAG))
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# User-configured MCP servers (spec 2026-07-08-user-mcp-servers)
+#
+# The poll response advertises only a fingerprint of the user's MCP config.
+# When it moves, we pull sealed envelopes (GET /v1/mcp/envelopes), decrypt each
+# through the enclave, and re-materialize the agent's on-disk MCP config via the
+# pure helpers in tools/user_mcp_materialize.py. Chat turns then inject the
+# runtime-appropriate ``{mcp}`` value; background/proactive turns do not (claude)
+# or hard-gate to an empty server set (codex).
+# ---------------------------------------------------------------------------
+
+_user_mcp_advertised: dict = {}      # last poll-advertised {"fingerprint": ...}
+_user_mcp_applied: dict = {"fingerprint": None, "servers": []}  # materialized state
+
+
+def _update_user_mcp_advertised(payload) -> None:
+    global _user_mcp_advertised
+    if isinstance(payload, dict):
+        _user_mcp_advertised = payload
+
+
+def _fetch_user_mcp_envelopes() -> dict:
+    resp = httpx.get(
+        f"{FEEDLING_API_URL}/v1/mcp/envelopes", headers=_HEADERS, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _decrypt_envelope(envelope: dict) -> bytes:
+    """Decrypt a caller-owned v1 envelope through the enclave. Same crypto path
+    the consumer already uses for chat/memory — no new trust surface. Auth rides
+    the shared ``_HEADERS`` (runtime-token or api-key, kept fresh by
+    ``_refresh_auth_header``)."""
+    if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
+        raise RuntimeError("enclave_unavailable")
+    resp = _ENCLAVE_CLIENT.post(
+        f"{FEEDLING_ENCLAVE_URL}/v1/envelope/decrypt",
+        headers=_HEADERS,
+        json={"envelope": envelope, "purpose": "mcp_server_config"},
+    )
+    resp.raise_for_status()
+    return base64.b64decode(resp.json()["plaintext_b64"])
+
+
+def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
+    """Write the decrypted server list to disk in every shape a runtime might
+    read. Bare import (not ``from tools import ...``) because at runtime the
+    consumer is launched as ``python tools/chat_resident_consumer.py`` with
+    ``tools/`` on sys.path[0], and the sibling module lives right next to us.
+
+    ``managed_names`` scopes the settings.json allow-rule prune to server
+    names this feature actually owns (current + previously-applied), so it
+    never deletes ``mcp__<other>__*`` rules the user configured some other
+    way."""
+    import user_mcp_materialize as _m  # noqa: PLC0415 — lazy: sibling on tools/ path
+    # generic file — claude --mcp-config target AND the documented VPS user-mcp.json
+    Path(USER_MCP_FILE).parent.mkdir(parents=True, exist_ok=True)
+    Path(USER_MCP_FILE).write_text(_m.claude_mcp_json(servers))
+    os.chmod(USER_MCP_FILE, 0o600)
+    claude_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    if claude_dir and Path(claude_dir).is_dir():
+        settings_path = Path(claude_dir) / "settings.json"
+        existing = settings_path.read_text() if settings_path.exists() else None
+        settings_path.write_text(
+            _m.merge_settings_allow(
+                existing, _m.claude_allow_rules(servers), managed_names))
+    codex_home = os.environ.get("CODEX_HOME", "")
+    if codex_home and Path(codex_home).is_dir():
+        config_path = Path(codex_home) / "config.toml"
+        existing = config_path.read_text() if config_path.exists() else None
+        merged = _m.codex_config_merged(existing, servers)
+        if merged.strip():
+            config_path.write_text(merged)
+            os.chmod(config_path, 0o600)  # holds plaintext MCP headers/token
+        elif config_path.exists():
+            config_path.unlink()
+
+
+def _maybe_apply_user_mcp() -> None:
+    """Re-materialize agent MCP config when the poll-advertised fingerprint moved.
+    Failures log and retry on a later poll — never block chat."""
+    global _user_mcp_applied
+    target = str(_user_mcp_advertised.get("fingerprint") or "")
+    if target == (_user_mcp_applied.get("fingerprint") or ""):
+        return
+    try:
+        servers: list[dict] = []
+        if target:
+            payload = _fetch_user_mcp_envelopes()
+            target = str(payload.get("fingerprint") or "")
+            for srv in payload.get("servers") or []:
+                secret = json.loads(_decrypt_envelope(srv["config_envelope"]))
+                servers.append({
+                    "name": srv["name"], "enabled": bool(srv.get("enabled")),
+                    "url": secret["url"], "headers": secret.get("headers") or {},
+                })
+        # Union of the previously-applied and newly-advertised server names:
+        # anything just removed still needs its old allow rule pruned, while
+        # anything outside this union (someone else's mcp__*__ rule) is left
+        # alone. Read the OLD _user_mcp_applied before it's overwritten below.
+        prev_names = {s.get("name") for s in _user_mcp_applied.get("servers") or []}
+        new_names = {s.get("name") for s in servers}
+        managed_names = {n for n in (prev_names | new_names) if n}
+        _materialize_user_mcp(servers, managed_names)
+        _user_mcp_applied = {"fingerprint": target, "servers": servers}
+        names = [s["name"] for s in servers if s["enabled"]]
+        log.info("[user_mcp] applied fingerprint=%s servers=%s",
+                 target or "(empty)", names)
+    except Exception as e:  # noqa: BLE001 — config refresh must never wedge chat
+        log.warning("[user_mcp] apply failed (will retry next poll): %s: %s",
+                    type(e).__name__, e)
+
+
+def _user_mcp_cli_value(template: str, lane: str) -> str:
+    """Resolve the ``{mcp}`` placeholder for one CLI turn.
+
+    - No ``{mcp}`` slot in the template, or no enabled server → empty.
+    - claude → ``--mcp-config <file>`` ONLY on the chat lane (foreground turns
+      may call user MCP tools; background/proactive turns must not).
+    - codex  → per-server ``-c mcp_servers.<name>.enabled=false`` overrides ONLY
+      on non-chat lanes. codex has no way to enable a subset per-turn, so its
+      user MCP servers are configured in config.toml (available on chat turns)
+      and explicitly turned off on background turns. NOTE: ``-c mcp_servers={}``
+      does NOT work — codex deep-merges ``-c`` overrides onto the config, and an
+      empty parent table is a no-op that leaves each ``[mcp_servers.<name>]``
+      enabled. Only an explicit ``enabled=false`` per server disables it.
+    Values contain only controlled characters (a filesystem path, or fixed
+    literals plus ``_SAFE_NAME``-constrained server names), so pre-split
+    substitution into the template is shlex-safe."""
+    if "{mcp}" not in template:
+        return ""
+    enabled_servers = [
+        s for s in _user_mcp_applied.get("servers") or [] if s.get("enabled")
+    ]
+    if not enabled_servers:
+        return ""
+    if _cli_template_is_codex():
+        if lane == "chat":
+            return ""
+        names = sorted(str(s.get("name") or "") for s in enabled_servers)
+        return " ".join(
+            f"-c mcp_servers.{name}.enabled=false" for name in names if name
+        )
+    return f"--mcp-config {USER_MCP_FILE}" if lane == "chat" else ""
 
 
 def poll_proactive_jobs(since: float) -> dict:
@@ -6735,16 +6913,19 @@ def _process_messages(messages: list) -> float:
             # belongs to *this* call_agent invocation.
             _consume_reply_parse_failed()
             if use_runtime_v2:
-                agent_result = call_agent(_resident_foreground_chat_message_v2(content), trace_id=trace_id)
+                agent_result = call_agent(
+                    _resident_foreground_chat_message_v2(content),
+                    trace_id=trace_id, lane="chat")
             elif image_payloads or image_paths:
                 agent_result = call_agent(
                     content,
                     images=image_payloads,
                     image_paths=image_paths,
                     trace_id=trace_id,
+                    lane="chat",
                 )
             else:
-                agent_result = call_agent(content, trace_id=trace_id)
+                agent_result = call_agent(content, trace_id=trace_id, lane="chat")
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
             # 上报/system 通知与兜底话术解耦（Codex review）：SEND_FALLBACK_ON_AGENT_ERROR
@@ -7344,6 +7525,14 @@ def run() -> None:
 
             result = poll_chat(last_ts)
             consecutive_errors = 0
+
+            # Materialize any advertised user-MCP config change on EVERY poll
+            # (idle or carrying messages), not just when a message arrives —
+            # otherwise a config change advertised during an idle stretch
+            # (e.g. a server disabled/removed) sits stale until the next chat
+            # turn. No-op when the fingerprint hasn't moved (best-effort;
+            # failures log and retry on a later poll).
+            _maybe_apply_user_mcp()
 
             if result.get("timed_out"):
                 # Idle moment: safe to swap to the backend's commit and re-exec

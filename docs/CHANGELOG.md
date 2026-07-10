@@ -47,6 +47,36 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-09
+
+### [DONE] 用户 MCP 服务器（user_mcp）—— 配置分发模型
+
+- iOS 设置页新增「远程 HTTP MCP server」配置（`name` + `url` + 自定义请求头），
+  整体（url+headers）经 `core/envelope.py` 的共享信封路径加密落库，服务器不留
+  明文；`name`/`enabled`/host hint/header 名（不含值）留明文供列表展示。write-only：
+  iOS 不能读回明文，编辑即整体重传。
+- 新增端点：`GET/POST /v1/mcp/servers`（列表/新增）、
+  `PATCH/DELETE /v1/mcp/servers/{name}`（改/删）、
+  `POST /v1/mcp/servers/{name}/test`（后端直接探测一次，SSRF 防护，不代理调用）、
+  `GET /v1/mcp/envelopes`（consumer 拉信封解密用）。
+- 下发复用现有 poll 通道：`backend/chat/poll_core.py` 的 `poll_context` 在
+  `runtime_v2`/`client_release` 之外新增 user_mcp 配置 fingerprint 广告，托管和
+  自跑 consumer 走同一份 `tools/chat_resident_consumer.py`，都靠长轮询
+  `GET /v1/chat/poll` 感知变更，无需新通道。
+- consumer 侧：fingerprint 变化 → 拉 `/v1/mcp/envelopes` → enclave 解密 →
+  物化成 claude/codex 的原生 MCP 配置（claude 用 `.mcp.json`/`--mcp-config`，
+  codex 0.142 用 `config.toml` 的 `[mcp_servers.<name>]`）。**仅聊天回合**可用，
+  proactive/后台回合绝不可用——避免静默消耗用户第三方 API 额度。codex 后台回合
+  对每个 enabled server 显式下发 `-c mcp_servers.<name>.enabled=false` 覆盖关闭
+  （codex 对 `-c` 是深合并：`-c mcp_servers={}` 空父表是 no-op，无法禁用，只有
+  逐 server `enabled=false` 才真生效）。
+  自跑（VPS）agent 走标准化 `USER_MCP_FILE`（`{"mcpServers": {...}}`），只保证
+  配置送达、生效 best-effort。
+- 后端不做 MCP 代理层：只负责配置的加密存储、探测（`/test`）和下发广告，实际
+  MCP 调用完全发生在 agent runtime 侧（claude/codex 原生 / 自跑 agent 自行加载）。
+- 架构决策记录见 `docs/superpowers/specs/2026-07-08-user-mcp-servers-design.md`
+  （v1「后端代理统一 MCP client」方案已废弃，改为本条的「配置分发」v2）。
+
 ## 2026-07-08
 
 ### [DONE] 通知设施 Phase C（四个生产者接入 + consumer 分类器扩容）
