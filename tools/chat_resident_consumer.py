@@ -996,6 +996,8 @@ log.info(
     "Starting resident consumer — mode=%s api_url=%s decrypt_sources=%s key=%s",
     AGENT_MODE, FEEDLING_API_URL, _decrypt_sources, _mask(FEEDLING_API_KEY),
 )
+if AGENT_CLI_CMD:
+    log.info("resident agent cli cmd=%s", AGENT_CLI_CMD)
 
 # ---------------------------------------------------------------------------
 # Checkpoint (persist last processed message timestamp)
@@ -4011,6 +4013,24 @@ def call_agent_cli(
     _wall_ms = int((time.monotonic() - _turn_t0) * 1000)
     _log_cli_turn_timing(cmd, result, _wall_ms)
     _m = _cli_turn_metrics(cmd, result, _wall_ms)
+    _trace_turn = AgentTurn()
+    if result.returncode == 0:
+        try:
+            _trace_turn = _agent_turn_from_raw(result.stdout or "")
+        except Exception as e:  # noqa: BLE001 — observability must never affect a turn
+            log.debug("thinking trace parse failed: %s", e)
+    _stdout_had_thinking_marker = (
+        '"type":"thinking"' in (result.stdout or "")
+        or '"type": "thinking"' in (result.stdout or "")
+        or "thinking_delta" in (result.stdout or "")
+    )
+    if (
+        result.returncode == 0
+        and _m["driver"] == "claude"
+        and _stdout_had_thinking_marker
+        and not _trace_turn.thinking_summary
+    ):
+        log.warning("claude stdout had thinking markers but parser yielded none")
     _excerpt = {"reply_head": (result.stdout or "")[:1000],
                 "stderr_head": (result.stderr or "")[:500]}
     if result.returncode != 0:
@@ -4033,8 +4053,13 @@ def call_agent_cli(
         explain=(f"模型返回（{_m['driver']}，{_wall_ms}ms" +
                  (f"，{_m['num_turns']} 轮" if _m.get('num_turns') else "") + "）"
                  if result.returncode == 0 else f"模型调用失败 rc={result.returncode}"),
-        detail={k: _m[k] for k in ("driver", "rc", "agent_ms", "api_ms", "num_turns",
-                                   "steps", "input_tokens", "output_tokens")},
+        detail={
+            **{k: _m[k] for k in ("driver", "rc", "agent_ms", "api_ms", "num_turns",
+                                  "steps", "input_tokens", "output_tokens")},
+            "thinking_present": bool(_trace_turn.thinking_summary),
+            "thinking_source": _trace_turn.thinking_source or "",
+            "thinking_len": len(_trace_turn.thinking_summary or ""),
+        },
         content_excerpt=_excerpt,
     )
 
