@@ -18,8 +18,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 import asgi_app  # noqa: E402
 from asgi_test_client import make_client  # noqa: E402
-from core import store as core_store  # noqa: E402
-from hosted import config_store  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -35,15 +33,13 @@ def user(backend_env):
     assert res.status_code == 201, res.get_data(as_text=True)
     body = res.get_json()
     uid, key = body["user_id"], body["api_key"]
-    # record_runtime_error patches the model_api_runtime profile, which only
-    # exists once model_api is configured (see _ensure_model_api_runtime_profile:
-    # it bails to None when _load_model_api_config(store) is empty). Registering
-    # a bare user does not configure model_api, so seed a minimal config here —
-    # otherwise the route 404s with model_api_runtime_profile_missing before the
-    # semantics under test (truncation / clearing) ever run.
-    store = core_store.get_store(uid)
-    config_store._save_model_api_config(store, {"provider": "anthropic", "model": "claude-3-5-sonnet-latest"})
-    config_store._ensure_model_api_runtime_profile(store)
+    # record_runtime_error now writes the ACTIVE ROUTE row (post multi-profile
+    # migration); GET /v1/model_api/runtime reads last_runtime_error(_class) off the
+    # same route. Registering a bare user configures nothing, so seed an active route
+    # here — otherwise runtime_error 404s with model_api_runtime_profile_missing
+    # before the semantics under test (truncation / clearing) ever run.
+    from conftest import configure_model_api_route
+    configure_model_api_route(uid, provider="anthropic", model="claude-3-5-sonnet-latest")
     return uid, key
 
 
@@ -66,8 +62,10 @@ def _get(path, *, headers=None):
 
 
 def _runtime_profile(user_id):
-    store = core_store.get_store(user_id)
-    return config_store._ensure_model_api_runtime_profile(store) or {}
+    # record_runtime_error now stores last_runtime_error(_class) on the active route,
+    # not the runtime profile blob — read it there.
+    import db
+    return db.model_api_active_route(user_id) or {}
 
 
 def test_runtime_status_surfaces_error_class(user):

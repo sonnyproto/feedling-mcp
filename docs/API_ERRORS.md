@@ -63,11 +63,18 @@
 | `model_api_config_invalid` | 400 | user_provider | | ✅ |
 | `model_api_key_decrypt_failed` | 400 | system | | ✅ |
 | `model_api_key_envelope_missing` | 400/404 | user_provider | 同 model_api_not_configured 的两条路径 | ✅ |
+| `model_api_credential_write_failed` | 500 | system | 写 model_api_credentials 失败（DB 异常被 db.py 吞成 None） | |
+| `model_api_route_write_failed` | 500 | system | 写/激活 model_api_routes 失败（DB 异常，或 route 被并发删除） | |
+| `invalid_thinking_fallback` | 400 | user_provider | `thinking_fallback` 不是 true/false（`_normalize_thinking_fallback`） | ✅ |
 | `provider_not_configured` | 409 | user_provider | | ✅ |
 | `provider_not_hostable` | 409 | user_provider | | ✅ |
 | `hosting_runtime_unavailable` | 503 | system | 托管 supervisor 未起来（detail.reason） | ✅ |
 | `provider_test_failed` | 400 | user_provider | 保存/测试 key 时上游拒绝（detail 带 status_code） | |
 | `cannot_encrypt_provider_key` | 409 | — | 缺 content public key 或 enclave attestation 不可达 | |
+| `route_not_found` | 404 | user_provider | 指定的 route id 不属于该用户或已删除 | |
+| `credential_not_found` | 404 | user_provider | 指定的 credential id 不属于该用户或已删除 | |
+| `api_key_or_credential_id_required` | 400 | user_provider | POST /routes 必须且只能给 api_key 与 credential_id 之一 | |
+| `nothing_to_update` | 400 | — | PATCH /credentials 两者（label/api_key）都不给 | |
 
 ## 聊天
 

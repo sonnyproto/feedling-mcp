@@ -211,7 +211,9 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     assert get_res.status_code == 200
     assert "api_key_envelope" not in get_res.get_json()["config"]
 
-    config_text = json.dumps(db.get_blob(user_id, "model_api") or {})
+    cred_id = db.model_api_credentials_list(user_id)[0]["id"]
+    stored = db.model_api_credential_get(user_id, cred_id)
+    config_text = json.dumps(stored)
     assert raw_provider_key not in config_text
     assert "api_key_envelope" in config_text
 
@@ -251,8 +253,8 @@ def test_model_api_setup_stores_responses_support_for_openai_compatible(client, 
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
     assert probed == ["https://relay.host/v1"]  # probed exactly the relay
-    stored = db.get_blob(user_id, "model_api")
-    assert stored["supports_responses"] is True
+    route = db.model_api_active_route(user_id)
+    assert route["supports_responses"] is True
 
 
 def test_model_api_setup_does_not_probe_non_openai_compatible(client, monkeypatch):
@@ -272,8 +274,8 @@ def test_model_api_setup_does_not_probe_non_openai_compatible(client, monkeypatc
         headers=_headers(api_key),
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
-    stored = db.get_blob(user_id, "model_api")
-    assert stored.get("supports_responses", False) is False
+    route = db.model_api_active_route(user_id)
+    assert route["supports_responses"] is False
 
 
 def test_model_api_setup_persists_reasoning_effort_and_gateway_uses_budget(client, monkeypatch):
@@ -293,8 +295,8 @@ def test_model_api_setup_persists_reasoning_effort_and_gateway_uses_budget(clien
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
     assert setup.get_json()["config"]["reasoning_effort"] == "medium"
-    stored = db.get_blob(user_id, "model_api")
-    assert stored["reasoning_effort"] == "medium"
+    route = db.model_api_active_route(user_id)
+    assert route["reasoning_effort"] == "medium"
 
     rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(include_gateway=True)}
     row = rows[user_id]
@@ -323,11 +325,76 @@ def test_model_api_setup_persists_thinking_fallback_for_resident_consumer(client
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
     assert setup.get_json()["config"]["thinking_fallback"] is True
-    stored = db.get_blob(user_id, "model_api")
-    assert stored["thinking_fallback"] is True
+    # Config lives in the routes/credentials tables now (was a model_api blob).
+    route = db.model_api_active_route(user_id)
+    assert route["thinking_fallback"] is True
 
     rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(include_gateway=True)}
     assert rows[user_id]["thinking_fallback"] is True
+
+
+def test_model_api_setup_thinking_fallback_unset_defaults_false_in_roster(client, monkeypatch):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(provider_client, "test_provider_key",
+                        lambda cfg: {"reply": "ok", "usage": {}})
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.6",
+            "api_key": "sk-or",
+        },
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+    assert "thinking_fallback" not in setup.get_json()["config"]
+    route = db.model_api_active_route(user_id)
+    assert route["thinking_fallback"] is None
+
+    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(include_gateway=True)}
+    assert rows[user_id]["thinking_fallback"] is False
+
+
+def test_model_api_get_includes_thinking_fallback_when_set(client, monkeypatch):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(provider_client, "test_provider_key",
+                        lambda cfg: {"reply": "ok", "usage": {}})
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.6",
+            "api_key": "sk-or",
+            "thinking_fallback": False,
+        },
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    get_res = client.get("/v1/model_api/get", headers=_headers(api_key))
+    assert get_res.status_code == 200
+    assert get_res.get_json()["config"]["thinking_fallback"] is False
+
+
+def test_model_api_get_omits_thinking_fallback_when_unset(client, monkeypatch):
+    _user_id, api_key = _register(client)
+    monkeypatch.setattr(provider_client, "test_provider_key",
+                        lambda cfg: {"reply": "ok", "usage": {}})
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.6",
+            "api_key": "sk-or",
+        },
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+
+    get_res = client.get("/v1/model_api/get", headers=_headers(api_key))
+    assert get_res.status_code == 200
+    assert "thinking_fallback" not in get_res.get_json()["config"]
 
 
 def test_model_api_setup_rejects_invalid_thinking_fallback(client, monkeypatch):
@@ -888,7 +955,9 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     )
     assert any(row["source"] == "model_api" and row["role"] == "user" for row in rows)
     assert all("body_ct" in row for row in rows if row["source"] == "model_api")
-    assert "sk-test-secret" not in json.dumps(db.get_blob(user_id, "model_api") or {})
+    cred_id = db.model_api_credentials_list(user_id)[0]["id"]
+    stored_cred = db.model_api_credential_get(user_id, cred_id)
+    assert "sk-test-secret" not in json.dumps(stored_cred)
 
 def test_model_api_context_summary_parsing_drops_generic_runtime_fallback():
     reply, summary = hosted_turn._model_api_parse_turn_reply(
