@@ -137,6 +137,33 @@ def _plaintext_for_trace(payload: dict, envelope: dict) -> str:
 # GET /v1/chat/history
 # --------------------------------------------------------------------------- #
 
+# A verify-loop PING is delivered to the enclave-backed resident consumer via
+# /v1/chat/history while it is FRESH (the consumer detects it by source). Once
+# older than this it is a dead probe — verify_loop capped its own wait at ≤60s
+# and then GC's the ping, so anything past this window is a leaked row whose GC
+# was skipped (e.g. a mid-run SIGTERM). Hiding stale pings makes a leaked
+# `__VERIFY_PING__:...` self-heal out of the visible transcript without starving
+# a live consumer of a fresh ping. 2× the 60s verify cap gives clock-skew margin.
+VERIFY_PING_VISIBLE_TTL_SEC = 120.0
+
+
+def _hide_verify_ping_from_feed(m: dict, now: float) -> bool:
+    """Whether a ``source='verify_ping'`` row must be hidden from the visible
+    (iOS-facing) chat feed. The synthetic liveness REPLY (agent/openclaw) is
+    always hidden. The PING (user-role) is kept only while fresh (see
+    ``VERIFY_PING_VISIBLE_TTL_SEC``), so a fresh ping still reaches enclave-backed
+    consumers but a stale/leaked one drops out of the transcript."""
+    if m.get("source") != "verify_ping":
+        return False
+    if m.get("role") in ("agent", "openclaw"):
+        return True
+    try:
+        ts = float(m.get("ts") or 0)
+    except (TypeError, ValueError):
+        ts = 0.0
+    return (now - ts) > VERIFY_PING_VISIBLE_TTL_SEC
+
+
 def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tuple[dict, int]:
     try:
         limit = int(query.get("limit", 200))
@@ -161,28 +188,21 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
         query.get("include_image_body", query.get("include_image_bodies", "true"))
     ).lower() not in {"0", "false", "no", "off"}
 
+    now = time.time()
     with store.chat_lock:
-        # Hide the synthetic verify-loop liveness REPLY (an agent/openclaw row
-        # stamped source="verify_ping") from the visible transcript. verify_loop
-        # GC's it once it completes, but the probe now runs a real, sometimes-slow
-        # agent call that can outlast verify_loop's timeout — a reply landing
-        # after the GC window would otherwise leak as a stray visible message
-        # (e.g. "__verify_ack__"). Filtering it here makes that timing-proof.
-        #
-        # The verify-loop PING itself (a user-role source="verify_ping" row) is
-        # deliberately NOT filtered: the enclave decrypt proxy reuses this very
-        # route (enclave/routes/chat.py -> backend_client.backend_get(
-        # "/v1/chat/history")) to deliver the
-        # ping to the resident consumer, which detects it by source. Dropping it
-        # here would starve enclave-backed consumers and wedge verify_loop /
-        # onboarding. The ping is short-lived (verify_loop always GC's it), so it
-        # does not persist in the feed the way a missed reply would.
+        # Scrub verify-loop liveness rows from the visible transcript:
+        #   - the REPLY (agent/openclaw) is always hidden — a reply that outlives
+        #     verify_loop's GC window would otherwise leak as a stray "__verify_ack__".
+        #   - the PING (user-role) is KEPT WHILE FRESH: the enclave decrypt proxy
+        #     reuses this very route (enclave/routes/chat.py -> backend_client
+        #     .backend_get("/v1/chat/history")) to deliver the ping to the resident
+        #     consumer, which detects it by source. It is hidden ONLY once stale
+        #     (see _hide_verify_ping_from_feed), so a ping whose verify_loop GC was
+        #     skipped (mid-run SIGTERM) self-heals out of the feed instead of
+        #     lingering as a visible "__VERIFY_PING__:..." bubble.
         all_msgs = [
             m for m in store.chat_messages
-            if not (
-                m.get("source") == "verify_ping"
-                and m.get("role") in ("agent", "openclaw")
-            )
+            if not _hide_verify_ping_from_feed(m, now)
         ]
         total = len(all_msgs)
 
@@ -275,7 +295,9 @@ def clear_history(store: UserStore, payload: dict) -> tuple[dict, int]:
 def message_body(store: UserStore, message_id: str) -> tuple[dict, int]:
     with store.chat_lock:
         msg = next((m for m in store.chat_messages if str(m.get("id") or "") == str(message_id)), None)
-    if not msg:
+    # A verify-loop synthetic row is never a legitimate single-body fetch target;
+    # refuse it here too so a leaked ping id can't be re-fetched out-of-band.
+    if not msg or msg.get("source") == "verify_ping":
         return {"error": "message_not_found"}, 404
     return {"message": chat_service._chat_history_item(msg, include_image_body=True)}, 200
 

@@ -1654,6 +1654,59 @@ def test_chat_history_hides_verify_reply_but_keeps_ping(client):
     assert body["total"] == 2, body
 
 
+def test_chat_history_hides_stale_verify_ping(client):
+    """A verify PING that outlived its verify_loop (GC skipped by a mid-run
+    SIGTERM) must NOT linger in the visible feed as a '__VERIFY_PING__:...'
+    bubble. Fresh pings stay (enclave consumer needs them); stale ones drop."""
+    import time
+    import uuid
+
+    from chat import chat_core
+    from core import store as core_store
+
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+
+    def _env(body: str) -> dict:
+        return {
+            "v": 1, "id": uuid.uuid4().hex, "body_ct": _b64(body.encode("utf-8")),
+            "nonce": _b64(b"\x00" * 12), "K_user": _b64(b"\x00" * 32),
+            "visibility": "local_only", "owner_user_id": user_id,
+        }
+
+    real = store.append_chat("user", "chat", _env("hello"))
+    fresh = store.append_chat("user", "verify_ping", _env("__VERIFY_PING__:fresh"))
+    stale = store.append_chat("user", "verify_ping", _env("__VERIFY_PING__:stale"))
+    # Backdate the stale ping past the visible TTL (verify_loop long dead).
+    stale["ts"] = time.time() - (chat_core.VERIFY_PING_VISIBLE_TTL_SEC + 60)
+
+    res = client.get("/v1/chat/history?limit=50", headers=_headers(api_key))
+    assert res.status_code == 200, res.get_data(as_text=True)
+    ids = [m.get("id") for m in res.get_json()["messages"]]
+
+    assert real["id"] in ids
+    assert fresh["id"] in ids, "a FRESH ping must still reach enclave-backed consumers"
+    assert stale["id"] not in ids, f"stale verify_ping leaked into history: {ids}"
+
+
+def test_message_body_refuses_verify_ping(client):
+    """Fetching a verify_ping row by id must 404 — it is never legitimate user
+    content, so a leaked ping id can't be re-fetched out-of-band."""
+    import uuid
+
+    from core import store as core_store
+
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+    ping = store.append_chat("user", "verify_ping", {
+        "v": 1, "id": uuid.uuid4().hex, "body_ct": _b64(b"__VERIFY_PING__:x"),
+        "nonce": _b64(b"\x00" * 12), "K_user": _b64(b"\x00" * 32),
+        "visibility": "local_only", "owner_user_id": user_id,
+    })
+    res = client.get(f"/v1/chat/messages/{ping['id']}/body", headers=_headers(api_key))
+    assert res.status_code == 404, res.get_data(as_text=True)
+
+
 def _verify_reply_envelope(user_id: str) -> dict:
     import uuid
 
