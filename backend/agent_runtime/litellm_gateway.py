@@ -249,8 +249,8 @@ def upstream_env(entries: list[dict]) -> dict[str, str]:
 
 def config_signature(entries: list[dict]) -> str:
     """A stable hash of the gateway-user ROUTING set (user_id/provider/model/
-    base_url) — NOT the secret keys. The supervisor restarts LiteLLM only when
-    this changes, so key rotation alone doesn't bounce the proxy."""
+    base_url/reasoning) — NOT the secret keys. The supervisor restarts LiteLLM
+    only when this changes, so key rotation alone doesn't bounce the proxy."""
     norm = sorted(
         (
             {
@@ -259,6 +259,7 @@ def config_signature(entries: list[dict]) -> str:
                 "model": e.get("model") or "",
                 "base_url": e.get("base_url") or "",
                 "supports_responses": bool(e.get("supports_responses", False)),
+                "reasoning_effort": e.get("reasoning_effort") or "",
             }
             for e in entries
         ),

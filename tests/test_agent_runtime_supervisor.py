@@ -611,6 +611,16 @@ def test_gateway_entries_carry_supports_responses_for_bridge_choice():
     assert gw["bridge"]["supports_responses"] is False
 
 
+def test_gateway_entries_carry_reasoning_effort_for_whitelist_rollout():
+    roster = [
+        {"user_id": "openrouter_user", "driver": "codex", "provider": "openrouter",
+         "model": "anthropic/claude-sonnet-4.6", "provider_key": "k",
+         "reasoning_effort": "medium"},
+    ]
+    gw = supervisor_mod._gateway_entries(roster)
+    assert gw[0]["reasoning_effort"] == "medium"
+
+
 def test_drop_gateway_users_filters_when_gateway_disabled():
     # With the gateway off, codex-gateway users must NOT be spawned (no proxy to
     # reach) — they're dropped so enabling hosted for them stays inert, not broken.

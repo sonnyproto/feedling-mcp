@@ -26,6 +26,7 @@ from core import store as core_store  # noqa: E402
 from hosted import agent_runtime_cutover  # noqa: E402
 from hosted import history_import  # noqa: E402
 from identity import service as identity_service  # noqa: E402
+from agent_runtime import litellm_gateway  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -273,6 +274,100 @@ def test_model_api_setup_does_not_probe_non_openai_compatible(client, monkeypatc
     assert setup.status_code == 200, setup.get_data(as_text=True)
     stored = db.get_blob(user_id, "model_api")
     assert stored.get("supports_responses", False) is False
+
+
+def test_model_api_setup_persists_reasoning_effort_and_gateway_uses_budget(client, monkeypatch):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(provider_client, "test_provider_key",
+                        lambda cfg: {"reply": "ok", "usage": {}})
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.6",
+            "api_key": "sk-or",
+            "reasoning_effort": "medium",
+        },
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+    assert setup.get_json()["config"]["reasoning_effort"] == "medium"
+    stored = db.get_blob(user_id, "model_api")
+    assert stored["reasoning_effort"] == "medium"
+
+    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(include_gateway=True)}
+    row = rows[user_id]
+    assert row["reasoning_effort"] == "medium"
+    entry = litellm_gateway.build_model_entry(
+        user_id=user_id, provider=row["provider"], model=row["model"],
+        reasoning_effort=row["reasoning_effort"],
+    )
+    assert entry["litellm_params"]["extra_body"]["reasoning"] == {"max_tokens": 2048}
+
+
+def test_model_api_setup_reasoning_effort_off_and_default_disable_gateway_reasoning(client, monkeypatch):
+    user_off, key_off = _register(client)
+    user_default, key_default = _register(client)
+    monkeypatch.setattr(provider_client, "test_provider_key",
+                        lambda cfg: {"reply": "ok", "usage": {}})
+
+    off = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.6",
+            "api_key": "sk-or",
+            "reasoning_effort": "off",
+        },
+        headers=_headers(key_off),
+    )
+    assert off.status_code == 200, off.get_data(as_text=True)
+    default = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.6",
+            "api_key": "sk-or",
+        },
+        headers=_headers(key_default),
+    )
+    assert default.status_code == 200, default.get_data(as_text=True)
+
+    stored_off = db.get_blob(user_off, "model_api")
+    stored_default = db.get_blob(user_default, "model_api")
+    assert stored_off["reasoning_effort"] == "off"
+    assert "reasoning_effort" not in stored_default
+
+    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(include_gateway=True)}
+    for uid in (user_off, user_default):
+        row = rows[uid]
+        entry = litellm_gateway.build_model_entry(
+            user_id=uid, provider=row["provider"], model=row["model"],
+            reasoning_effort=row["reasoning_effort"],
+        )
+        assert "extra_body" not in entry["litellm_params"]
+
+
+def test_model_api_setup_rejects_invalid_reasoning_effort(client, monkeypatch):
+    _user_id, api_key = _register(client)
+
+    def provider_test_must_not_run(cfg):
+        raise AssertionError("invalid reasoning_effort should fail before provider probe")
+
+    monkeypatch.setattr(provider_client, "test_provider_key", provider_test_must_not_run)
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.6",
+            "api_key": "sk-or",
+            "reasoning_effort": "mediumish",
+        },
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 400
+    assert setup.get_json()["error"] == "invalid_reasoning_effort"
 
 
 def test_setup_warns_when_relay_lacks_responses(client, monkeypatch):

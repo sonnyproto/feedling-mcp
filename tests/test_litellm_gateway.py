@@ -180,6 +180,13 @@ def test_config_signature_changes_with_supports_responses():
     assert sig_bridge != sig_native
 
 
+def test_config_signature_changes_with_reasoning_effort():
+    base = {"user_id": "u", "provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"}
+    sig_default = gw.config_signature([base])
+    sig_medium = gw.config_signature([{**base, "reasoning_effort": "medium"}])
+    assert sig_default != sig_medium
+
+
 def test_build_config_preserves_reasoning_params_and_sets_master_key_env():
     cfg = gw.build_config([
         {"user_id": "u1", "provider": "gemini", "model": "gemini-2.0-flash"},

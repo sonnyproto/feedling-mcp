@@ -84,6 +84,8 @@ def _public_model_api_config(config: dict | None) -> dict:
     safe = public_provider_config(config)
     safe["configured"] = True
     safe["privacy_mode"] = "tdx_cvm_backend_runtime_option_a"
+    if config.get("reasoning_effort") is not None:
+        safe["reasoning_effort"] = str(config.get("reasoning_effort") or "")
     return safe
 
 
