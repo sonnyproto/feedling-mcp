@@ -36,6 +36,8 @@
 | `not_found` | 404 | — | 通用资源不存在 | ✅ |
 | `not_owned` | 403 | — | 资源不属于调用者 | ✅ |
 | `invalid_image` | 400 | — | 图片校验失败 | ✅ |
+| `unsupported_file_type` | 400 | — | 聊天文件上传：文件类型不支持（heic/.doc/.xls/二进制）；detail 说明类型，hint 建议格式 | ✅ |
+| `invalid_file` | 400 | — | 聊天文件上传：file_b64 缺失/空/非法 base64 | ✅ |
 
 ## 认证 / 账号
 

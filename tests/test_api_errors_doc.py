@@ -17,6 +17,7 @@ MUST_HAVE = {
     "thinking_envelope_missing_fields", "anchor_required",
     "unauthorized", "forbidden", "service_busy", "not_found",
     "model_api_key_decrypt_failed", "already_answered",
+    "unsupported_file_type", "invalid_file",
 }
 
 
