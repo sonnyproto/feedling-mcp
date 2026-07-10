@@ -60,27 +60,6 @@ def _normalize_reasoning_effort(value) -> str | None:
     raise ValueError("reasoning_effort must be off, low, medium, high, or a positive integer")
 
 
-def _normalize_thinking_fallback(value) -> bool | None:
-    """Per-user self-authored thinking fallback switch.
-
-    ``None`` means the field was absent/blank and should not be persisted; the
-    hosted consumer defaults this fallback off unless the user config explicitly
-    enables it.
-    """
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    raw = str(value).strip().lower()
-    if not raw:
-        return None
-    if raw in {"1", "true", "yes", "y", "on", "enabled"}:
-        return True
-    if raw in {"0", "false", "no", "n", "off", "disabled"}:
-        return False
-    raise ValueError("thinking_fallback must be true/false")
-
-
 def _public_route(route: dict | None) -> dict:
     """active route → GET /v1/model_api/get 的扁平投影（与旧 blob 投影同形）。
 
@@ -105,8 +84,6 @@ def _public_route(route: dict | None) -> dict:
     }
     if route.get("reasoning_effort"):
         safe["reasoning_effort"] = route["reasoning_effort"]
-    if route.get("thinking_fallback") is not None:
-        safe["thinking_fallback"] = route["thinking_fallback"]
     return safe
 
 
@@ -183,10 +160,6 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     except ValueError as e:
         return {"error": "invalid_reasoning_effort", "detail": str(e)}, 400
     try:
-        thinking_fallback = _normalize_thinking_fallback(payload.get("thinking_fallback"))
-    except ValueError as e:
-        return {"error": "invalid_thinking_fallback", "detail": str(e)}, 400
-    try:
         provider, model, base_url = provider_client.validate_config(provider, model, base_url)
     except provider_client.ProviderError as e:
         return {"error": str(e)}, 400
@@ -260,8 +233,7 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
             return {"error": "model_api_credential_write_failed"}, 500
 
     route_id = db.model_api_route_upsert(
-        store.user_id, credential_id, model, reasoning_effort,
-        thinking_fallback=thinking_fallback)
+        store.user_id, credential_id, model, reasoning_effort)
     if not route_id:
         return {"error": "model_api_route_write_failed"}, 500
     # mark_test / activate can each report False — either a DB hiccup (db.py swallows
@@ -658,10 +630,6 @@ def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) 
         reasoning_effort = _normalize_reasoning_effort(payload.get("reasoning_effort"))
     except ValueError as e:
         return {"error": "invalid_reasoning_effort", "detail": str(e)}, 400
-    try:
-        thinking_fallback = _normalize_thinking_fallback(payload.get("thinking_fallback"))
-    except ValueError as e:
-        return {"error": "invalid_thinking_fallback", "detail": str(e)}, 400
     if bool(raw_key) == bool(credential_id):
         return {"error": "api_key_or_credential_id_required",
                 "detail": "supply exactly one of api_key / credential_id"}, 400
@@ -722,8 +690,7 @@ def model_api_route_create(store, payload: dict, *, caller_api_key: str | None) 
             return {"error": "model_api_credential_write_failed"}, 500
 
     route_id = db.model_api_route_upsert(
-        store.user_id, credential_id, model, reasoning_effort,
-        thinking_fallback=thinking_fallback)
+        store.user_id, credential_id, model, reasoning_effort)
     if not route_id:
         return {"error": "model_api_route_write_failed"}, 500
 

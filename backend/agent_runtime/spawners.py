@@ -592,9 +592,6 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     # /tmp/feedling_chat_files, outside the workspace, and claude's Read is denied.
     env["FILE_TEMP_DIR"] = f"{home}/files"
     env["CONSUMER_ID"] = f"agent-runner:{user_id}"
-    env["FEEDLING_SELF_AUTHORED_THINKING_FALLBACK"] = (
-        "1" if _entry_bool(entry.get("thinking_fallback")) else "0"
-    )
     # Ambient timezone for the hosted agent process tree (this consumer + the CLI
     # it spawns). Without it the process inherits the CVM's UTC clock, so the CLI
     # agent's OWN sense of "today / now" (e.g. a date line the runtime injects) is

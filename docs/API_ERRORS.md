@@ -65,7 +65,6 @@
 | `model_api_key_envelope_missing` | 400/404 | user_provider | 同 model_api_not_configured 的两条路径 | ✅ |
 | `model_api_credential_write_failed` | 500 | system | 写 model_api_credentials 失败（DB 异常被 db.py 吞成 None） | |
 | `model_api_route_write_failed` | 500 | system | 写/激活 model_api_routes 失败（DB 异常，或 route 被并发删除） | |
-| `invalid_thinking_fallback` | 400 | user_provider | `thinking_fallback` 不是 true/false（`_normalize_thinking_fallback`） | ✅ |
 | `provider_not_configured` | 409 | user_provider | | ✅ |
 | `provider_not_hostable` | 409 | user_provider | | ✅ |
 | `hosting_runtime_unavailable` | 503 | system | 托管 supervisor 未起来（detail.reason） | ✅ |

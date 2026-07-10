@@ -1267,7 +1267,7 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict
     (gemini/openrouter/openai_compatible → codex via LiteLLM gateway) 仅当
     ``include_gateway`` 时返回（gateway 关时不发现，避免 spawn 到不存在的 proxy）。
     Returns [{"user_id","driver","provider","model","base_url","supports_responses",
-    "reasoning_effort","thinking_fallback"}]
+    "reasoning_effort"}]
     sorted by user_id (``supports_responses`` is the openai_compatible relay's
     /v1/responses capability, set at setup; selects native passthrough vs the
     LiteLLM chat-completions bridge)。"""
@@ -1289,8 +1289,7 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict
                   r.model AS model,
                   c.base_url AS base_url,
                   c.supports_responses AS supports_responses,
-                  COALESCE(r.reasoning_effort, '') AS reasoning_effort,
-                  COALESCE(r.thinking_fallback, FALSE) AS thinking_fallback
+                  COALESCE(r.reasoning_effort, '') AS reasoning_effort
                 FROM model_api_routes r
                 JOIN model_api_credentials c ON c.id = r.credential_id
                 WHERE r.is_active
@@ -1303,9 +1302,8 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict
         return [{"user_id": uid, "driver": driver, "provider": provider,
                  "model": model, "base_url": base_url,
                  "supports_responses": bool(supports_responses),
-                 "reasoning_effort": reasoning_effort,
-                 "thinking_fallback": bool(thinking_fallback)}
-                for uid, driver, provider, model, base_url, supports_responses, reasoning_effort, thinking_fallback in rows]
+                 "reasoning_effort": reasoning_effort}
+                for uid, driver, provider, model, base_url, supports_responses, reasoning_effort in rows]
     except Exception as e:
         log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
         return []
@@ -2404,8 +2402,7 @@ _ROUTE_COLUMNS = """
     COALESCE(to_char(r.last_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
     r.last_test_error, r.last_runtime_error, r.last_runtime_error_class,
     COALESCE(to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
-    COALESCE(to_char(r.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
-    r.thinking_fallback
+    COALESCE(to_char(r.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '')
 """
 
 
@@ -2418,7 +2415,6 @@ def _route_row_to_dict(row: tuple) -> dict:
         "last_test_error": row[12], "last_runtime_error": row[13],
         "last_runtime_error_class": row[14],
         "created_at": row[15], "updated_at": row[16],
-        "thinking_fallback": row[17] if row[17] is None else bool(row[17]),
     }
 
 
@@ -2589,20 +2585,18 @@ def model_api_active_route(user_id: str) -> dict | None:
 
 
 def model_api_route_upsert(user_id: str, credential_id: str, model: str,
-                           reasoning_effort: str | None,
-                           thinking_fallback: bool | None = None) -> str | None:
+                           reasoning_effort: str | None) -> str | None:
     """按 (credential_id, model) upsert。跨用户引用会被复合外键拒绝 → 返回 None。"""
     try:
         with get_pool().connection() as conn:
             row = conn.execute(
                 "INSERT INTO model_api_routes "
-                "  (id, user_id, credential_id, model, reasoning_effort, thinking_fallback) "
-                "VALUES (gen_random_uuid(), %s, %s, %s, %s, %s) "
+                "  (id, user_id, credential_id, model, reasoning_effort) "
+                "VALUES (gen_random_uuid(), %s, %s, %s, %s) "
                 "ON CONFLICT (credential_id, model) DO UPDATE SET "
-                "  reasoning_effort = EXCLUDED.reasoning_effort, "
-                "  thinking_fallback = EXCLUDED.thinking_fallback, updated_at = now() "
+                "  reasoning_effort = EXCLUDED.reasoning_effort, updated_at = now() "
                 "RETURNING id::text",
-                (user_id, credential_id, model, reasoning_effort, thinking_fallback),
+                (user_id, credential_id, model, reasoning_effort),
             ).fetchone()
         return row[0] if row else None
     except Exception as e:

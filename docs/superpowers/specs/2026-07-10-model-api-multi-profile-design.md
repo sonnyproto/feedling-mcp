@@ -87,26 +87,6 @@ CREATE UNIQUE INDEX model_api_routes_uniq
 `test_status` 取值：`untested` | `ok` | `failed`。
 `reasoning_effort` 为 NULL 表示继承全局 env 默认（`FEEDLING_AGENT_REASONING_EFFORT`，默认 `off`）；取值沿用 `setup_core._normalize_reasoning_effort`（`off` / `low` / `medium` / `high` / 正整数字符串）。
 
-### `thinking_fallback` 也归 route（rebase 期间并入）
-
-本分支开发期间，`test` 上合入了 `18dda5b feat(consumer): add self-authored thinking fallback` —— 一个 per-user 开关，写在旧 blob 的 `doc->>'thinking_fallback'`，经 roster 传到 `spawners.py` 的 `FEEDLING_SELF_AUTHORED_THINKING_FALLBACK` env var，控制「模型不产出原生 thinking 时，让 consumer 自己编一段」。它也进了 `supervisor._spawn_identity`，所以改动会触发 respawn。
-
-换基时把它下沉到 `model_api_routes.thinking_fallback BOOLEAN`（nullable），与 `reasoning_effort` 并列。**理由**：能否产出原生 thinking 是 **model** 的属性而非用户的属性 —— Claude Sonnet 有原生 thinking 不需要 fallback，gpt-4.1-mini 没有则需要。多 route 下用户应当能分别设置，切 route 时自动生效各自的值。
-
-三态语义（NULL / true / false）在三个消费点各自取舍：
-
-| 位置 | 取值 | 理由 |
-|---|---|---|
-| roster SQL | `COALESCE(r.thinking_fallback, FALSE)` | consumer 的 env var 只认 `"1"`/`"0"`，未设置即关 |
-| `db._route_row_to_dict` | 保留 `None` | 下游要能区分「没设过」与「显式设成 false」 |
-| `GET /v1/model_api/get` | 仅在非 `None` 时出现 | 保持迁移前 `_public_model_api_config` 的响应契约 |
-
-迁移回填用 `CASE WHEN b.doc ? 'thinking_fallback' THEN (b.doc->>'thinking_fallback')::boolean ELSE NULL END`，把老用户的 per-user 值原样给他唯一那条 active route，升级瞬间行为不变。
-
-`POST /setup` 与 `POST /routes` 都接受该字段，共用 `_normalize_thinking_fallback` 与 `invalid_thinking_fallback`（400）slug。
-
-⚠️ **`config_store._load_model_api_config` 的投影必须带上它。** 该投影喂着 5 个既有读者（`chat_send`、`onboarding_validation`、`admin/data_track`、`screen_flag_v2`、`perception/service`）；漏掉这个键，它们会静默读到 `None` 而不报错。
-
 **`routes.user_id` 是刻意的冗余**：partial unique index `(user_id) WHERE is_active` 需要它，且能让 users 的 CASCADE 直接挂上。
 
 **复合外键 `(user_id, credential_id) → (user_id, id)`** 让数据库保证「route 不可能引用另一个用户的 credential」。跨用户串号只靠代码把关迟早出事。

@@ -18,7 +18,7 @@
 | `model_api_routes` 一行 | `ModelAPIRouteProfile` |
 
 - **credential** = 一把 provider API key（含 provider、label、base_url、密文信封、hint）
-- **route** = 一个 (credential × model) 组合，带 `is_active` / `test_status` / `reasoning_effort` / `thinking_fallback`
+- **route** = 一个 (credential × model) 组合，带 `is_active` / `test_status` / `reasoning_effort`
 
 **同一个 provider 可以存多把 key**（个人的、团队的），这正是 `credentialList` 那个「选已有凭据」UI 的用武之地。数据库层没有 `(user_id, provider, base_url)` 唯一索引。
 
@@ -44,7 +44,6 @@
       "base_url": "",
       "supports_responses": false,
       "reasoning_effort": "high",       // "" 表示未设置
-      "thinking_fallback": null,        // null / true / false 三态
       "is_active": true,
       "test_status": "ok",              // untested | ok | failed
       "last_test_at": "2026-07-10T08:12:03Z",   // "" 表示从未测过
@@ -74,7 +73,6 @@
   "base_url": "",               // 仅 openai_compatible 需要
   "label": "Anthropic Key A",   // 仅新建凭据时用；默认取 provider 名
   "reasoning_effort": "off",    // off | low | medium | high | 正整数字符串
-  "thinking_fallback": true,    // true/false；缺省不持久化
   "activate": true              // 建完立刻激活（走同步测活）
 }
 ```
@@ -92,7 +90,6 @@
 | `credential_id` 不存在 | 404 | `credential_not_found` |
 | 无法建信封（缺 content pubkey / enclave 不可达） | 409 | `cannot_encrypt_provider_key` |
 | `reasoning_effort` 非法 | 400 | `invalid_reasoning_effort` |
-| `thinking_fallback` 非 true/false | 400 | `invalid_thinking_fallback` |
 
 ### `POST /v1/model_api/routes/{route_id}/activate` —— 切换生效
 
@@ -177,10 +174,10 @@
               "base_url": "", "api_key_hint": "sk-a…451", "test_status": "ok",
               "last_test_at": "…", "last_test_error": "", "created_at": "…",
               "updated_at": "…", "privacy_mode": "tdx_cvm_backend_runtime_option_a",
-              "reasoning_effort": "high", "thinking_fallback": true } }
+              "reasoning_effort": "high" } }
 ```
 
-`reasoning_effort` / `thinking_fallback` **仅在设置过时出现**。无 active route 时 `config` 是 `{"configured": false}`。
+`reasoning_effort` **仅在设置过时出现**。无 active route 时 `config` 是 `{"configured": false}`。
 
 `POST /test`、`POST /driver`、`DELETE /delete`、`GET /runtime`、`GET /key_envelope` 契约同样不变。
 
@@ -235,20 +232,7 @@
 | `credential_not_found` | 404 | credential id 同上 |
 | `api_key_or_credential_id_required` | 400 | `POST /routes` 的 `api_key` / `credential_id` 必须且只能给一个 |
 | `nothing_to_update` | 400 | `PATCH /credentials` 两个字段都没给 |
-| `invalid_thinking_fallback` | 400 | `thinking_fallback` 不是 true/false |
 | `model_api_credential_write_failed` | 500 | DB 写失败（罕见） |
 | `model_api_route_write_failed` | 500 | DB 写失败，或 route 被并发删除 |
 
 已有的 `provider_test_failed`（400，带 `status_code`）、`cannot_encrypt_provider_key`（409）、`invalid_reasoning_effort`（400）语义不变。
-
----
-
-## 行为变化提醒
-
-**`thinking_fallback` 从 per-user 变成了 per-route。**
-
-它原本是一个全局开关（存在旧 blob 顶层），现在跟着 route 走。理由是「模型能不能产出原生 thinking」是 model 的属性 —— Claude Sonnet 有原生 thinking 不需要 fallback，gpt-4.1-mini 没有则需要。
-
-所以用户切换 route 时，这个开关会跟着变。迁移把每个老用户的原值原样给了他那条唯一的 active route，**升级瞬间行为不变**。
-
-App 侧若要暴露这个开关，应该放在「每条 route 的设置」里而不是全局设置里。目前 sheet 还没有这个字段，`POST /setup` 和 `POST /routes` 都接受它。

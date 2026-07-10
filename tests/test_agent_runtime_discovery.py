@@ -37,7 +37,7 @@ def test_apply_discovery_filters_roster_to_enabled_and_sets_driver_and_provider(
     enabled = {"u1": {"driver": "claude", "provider": "anthropic", "model": "claude-x", "base_url": ""},
                "u2": {"driver": "codex", "provider": "openai_compatible", "model": "qwen",
                       "base_url": "https://my.host/v1", "supports_responses": True,
-                      "reasoning_effort": "medium", "thinking_fallback": True}}
+                      "reasoning_effort": "medium"}}
     out = supervisor_mod._apply_discovery(roster, enabled)
     by_uid = {e["user_id"]: e for e in out}
     assert set(by_uid) == {"u1", "u2"}            # u3 dropped (not enabled)
@@ -48,7 +48,6 @@ def test_apply_discovery_filters_roster_to_enabled_and_sets_driver_and_provider(
     assert by_uid["u2"]["base_url"] == "https://my.host/v1"  # custom endpoint preserved
     assert by_uid["u2"]["supports_responses"] is True  # /responses capability stamped for transport
     assert by_uid["u2"]["reasoning_effort"] == "medium"  # per-user gateway reasoning switch
-    assert by_uid["u2"]["thinking_fallback"] is True
     assert by_uid["u1"]["api_key"] == "k1"        # credential preserved
 
 
@@ -75,8 +74,7 @@ def _clean_blobs():
 
 def _seed_model_api(user_id: str, *, provider: str, test_status: str,
                     enabled: bool | None = None, agent_runtime_driver: str | None = None,
-                    model: str = "x", base_url: str = "", reasoning_effort: str = "",
-                    thinking_fallback: bool = False):
+                    model: str = "x", base_url: str = "", reasoning_effort: str = ""):
     # `enabled` / `agent_runtime_driver` 保留在签名里只为了不动调用方——两者从来
     # 不是 discovery 的 gate（旧 blob SQL 也没读过 doc->>'agent_runtime_driver'，
     # 见 test_list_enabled_users_ignores_explicit_opt_out_flag 的注释），新表更
@@ -87,8 +85,7 @@ def _seed_model_api(user_id: str, *, provider: str, test_status: str,
         api_key_envelope=_ENV, api_key_hint="sk-x...000", supports_responses=False,
     )
     rid = db.model_api_route_upsert(
-        user_id, cid, model, reasoning_effort or None,
-        thinking_fallback=thinking_fallback if thinking_fallback else None)
+        user_id, cid, model, reasoning_effort or None)
     if test_status:
         db.model_api_route_mark_test(user_id, rid, status=test_status)
     db.model_api_route_activate(user_id, rid)
@@ -100,7 +97,7 @@ def _seed_all(_clean_blobs):
     _seed_model_api("openai_on", provider="openai", test_status="ok", enabled=True)
     _seed_model_api("gemini_on", provider="gemini", test_status="ok", enabled=True, model="gemini-2.0-flash")  # codex via gateway
     _seed_model_api("openrouter_on", provider="openrouter", test_status="ok", enabled=True,
-                    reasoning_effort="medium", thinking_fallback=True)  # codex via gateway
+                    reasoning_effort="medium")  # codex via gateway
     _seed_model_api("compat_on", provider="openai_compatible", test_status="ok", enabled=True,
                     base_url="https://my.host/v1")  # codex via gateway
     _seed_model_api("anthropic_off", provider="anthropic", test_status="ok", enabled=False)  # not enabled
@@ -143,8 +140,6 @@ def test_list_enabled_users_includes_gateway_when_enabled(_clean_blobs):
     assert rows["gemini_on"]["model"] == "gemini-2.0-flash"
     assert rows["openai_on"]["provider"] == "openai"
     assert rows["openrouter_on"]["reasoning_effort"] == "medium"
-    assert rows["openrouter_on"]["thinking_fallback"] is True
-    assert rows["compat_on"]["thinking_fallback"] is False
     # openai_compatible's custom endpoint must survive into LiteLLM's api_base
     assert rows["compat_on"]["base_url"] == "https://my.host/v1"
 

@@ -1258,13 +1258,6 @@ def test_spawn_identity_changes_when_base_url_changes():
     assert supervisor_mod._spawn_identity(a) != supervisor_mod._spawn_identity(b)
 
 
-def test_spawn_identity_changes_when_thinking_fallback_changes():
-    a = {"api_key": "k", "driver": "codex", "provider": "openrouter",
-         "model": "gw-u1", "thinking_fallback": False}
-    b = dict(a, thinking_fallback=True)
-    assert supervisor_mod._spawn_identity(a) != supervisor_mod._spawn_identity(b)
-
-
 def test_spawn_identity_changes_when_identity_model_changes():
     # gateway 用户 model 是稳定的 gw-<uid> 别名；切换真实上游模型须触发 respawn 重落身份块
     a = {"driver": "codex", "provider": "gemini", "model": "gw-u1",

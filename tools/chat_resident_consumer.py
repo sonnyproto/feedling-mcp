@@ -74,10 +74,6 @@ Optional:
                         Default true. Agent failures post a visible, bounded
                         failure reply instead of silently dropping the turn.
   FALLBACK_REPLY        Optional user-visible fallback text
-  FEEDLING_SELF_AUTHORED_THINKING_FALLBACK
-                        Default false. Per-user gray switch for providers that
-                        strip native reasoning; asks the model for a display-safe
-                        thinking protocol and strips it before posting.
   AGENT_SESSION_MAX_TURNS / AGENT_SESSION_MAX_BYTES
                         Bound resident-owned CLI/HTTP sessions. When either
                         limit is reached, the next turn starts a fresh session.
@@ -305,7 +301,6 @@ AGENT_SESSION_MAX_TURNS = int(os.environ.get("AGENT_SESSION_MAX_TURNS", "40"))
 AGENT_SESSION_MAX_BYTES = int(os.environ.get("AGENT_SESSION_MAX_BYTES", "250000"))
 AGENT_SESSION_ROTATE_PREFIX = os.environ.get("AGENT_SESSION_ROTATE_PREFIX", "feedling-io")
 HERMES_SESSION_REASONING_MAX_BYTES = int(os.environ.get("HERMES_SESSION_REASONING_MAX_BYTES", "2000000"))
-SELF_AUTHORED_THINKING_FALLBACK = _env_bool("FEEDLING_SELF_AUTHORED_THINKING_FALLBACK", False)
 IMAGE_TEMP_DIR = Path(os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_images"))
 SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "on_mention").strip().lower()
 SCREEN_CONTEXT_MAX_AGE_SEC = int(os.environ.get("SCREEN_CONTEXT_MAX_AGE_SEC", "300"))
@@ -1821,203 +1816,12 @@ _REASONING_LINE_RE = re.compile(
 )
 
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
-_SELF_AUTHORED_THINKING_OPEN = "<<FEEDLING_THINKING_V2>>"
-_SELF_AUTHORED_THINKING_CLOSE = "<</FEEDLING_THINKING_V2>>"
-_SELF_AUTHORED_REPLY_OPEN = "<<FEEDLING_REPLY_V2>>"
-_SELF_AUTHORED_REPLY_CLOSE = "<</FEEDLING_REPLY_V2>>"
-_SELF_AUTHORED_MARKER_TOKEN_RE = re.compile(
-    r"(?P<bracket><{1,2}|\[{1,2})?\s*"
-    r"(?P<closing>/)?\s*"
-    r"feedling_(?P<kind>thinking|reply)(?:_v2)?\s*"
-    r"(?P<end>>{1,2}|\]{1,2})?",
-    re.IGNORECASE,
-)
-_SELF_AUTHORED_MARKER_FRAGMENT_RE = re.compile(
-    r"(?:(?:<{1,2}|\[{1,2})\s*/?\s*)?"
-    r"feedling_(?:thinking|reply)(?:_v2)?"
-    r"(?:\s*(?:>{1,2}|\]{1,2}))?",
-    re.IGNORECASE,
-)
 _TAGGED_THINKING_RE = re.compile(
     r"<\s*(?P<tag>think|thinking|reasoning|thought)\s*>\s*"
     r"(?P<body>.*?)"
     r"\s*<\s*/\s*(?P=tag)\s*>",
     re.IGNORECASE | re.DOTALL,
 )
-
-
-def _self_authored_thinking_prompt_enabled(raw_text: bool) -> bool:
-    return bool(SELF_AUTHORED_THINKING_FALLBACK and not raw_text)
-
-
-def _with_self_authored_thinking_protocol(message: str) -> str:
-    """Ask stripped providers for a display-safe thinking segment plus reply."""
-    if not isinstance(message, str):
-        message = str(message or "")
-    instruction = (
-        "[Feedling self-authored thinking fallback]\n"
-        "For this turn, your provider may not expose native reasoning metadata. "
-        "Return exactly the protocol below, then stop. The thinking block is a "
-        "brief user-visible reasoning summary, not private chain-of-thought: max "
-        "4 short lines, no system/developer text, no credentials, no token usage, "
-        "no tool transcript.\n"
-        f"{_SELF_AUTHORED_THINKING_OPEN}\n"
-        "brief display-safe reasoning summary\n"
-        f"{_SELF_AUTHORED_THINKING_CLOSE}\n"
-        f"{_SELF_AUTHORED_REPLY_OPEN}\n"
-        "your normal reply to the user; if you need to return JSON actions or "
-        "tool_calls, put that JSON inside this reply block only\n"
-        f"{_SELF_AUTHORED_REPLY_CLOSE}\n"
-        "[End Feedling fallback protocol]\n\n"
-        "[User message]\n"
-    )
-    return instruction + message
-
-
-def _self_authored_protocol_fragment_present(text: str) -> bool:
-    return bool(_SELF_AUTHORED_MARKER_FRAGMENT_RE.search(str(text or "")))
-
-
-def _self_authored_marker_tokens(text: str) -> list[dict[str, Any]]:
-    tokens: list[dict[str, Any]] = []
-    for match in _SELF_AUTHORED_MARKER_TOKEN_RE.finditer(str(text or "")):
-        tokens.append(
-            {
-                "start": match.start(),
-                "end": match.end(),
-                "kind": (match.group("kind") or "").lower(),
-                "closing": bool(match.group("closing")),
-            }
-        )
-    return tokens
-
-
-def _first_self_authored_marker(
-    tokens: list[dict[str, Any]],
-    *,
-    kind: str,
-    closing: bool,
-    after: int = 0,
-) -> dict[str, Any] | None:
-    for token in tokens:
-        if token["end"] <= after:
-            continue
-        if token["kind"] == kind and token["closing"] is closing:
-            return token
-    return None
-
-
-def _remove_self_authored_protocol_fragments(text: str) -> str:
-    """Remove protocol markers/fragments while preserving adjacent reply text."""
-    out: list[str] = []
-    for raw_ln in str(text or "").splitlines():
-        if not _self_authored_protocol_fragment_present(raw_ln):
-            out.append(raw_ln)
-            continue
-        cleaned = _SELF_AUTHORED_MARKER_FRAGMENT_RE.sub("", raw_ln).strip()
-        if cleaned:
-            out.append(cleaned)
-    return "\n".join(out)
-
-
-def _split_self_authored_thinking_v2(text: str) -> tuple[str, str]:
-    """Split the opt-in self-authored thinking protocol from visible text.
-
-    The model may emit malformed markers. This parser is deliberately
-    conservative: a dangling thinking opener drops the rest unless a reply
-    marker gives us a clean boundary; reply markers can be half-open and still
-    recover the final answer.
-    """
-    raw = str(text or "")
-    tokens = _self_authored_marker_tokens(raw)
-    if not tokens:
-        return raw, ""
-
-    visible_parts: list[str] = []
-    thinking = ""
-    thinking_open = _first_self_authored_marker(
-        tokens, kind="thinking", closing=False
-    )
-    reply_open = _first_self_authored_marker(tokens, kind="reply", closing=False)
-
-    if thinking_open:
-        visible_parts.append(raw[: thinking_open["start"]])
-        thinking_close = _first_self_authored_marker(
-            tokens,
-            kind="thinking",
-            closing=True,
-            after=thinking_open["end"],
-        )
-        if thinking_close:
-            thinking = raw[thinking_open["end"] : thinking_close["start"]]
-            reply_open = _first_self_authored_marker(
-                tokens,
-                kind="reply",
-                closing=False,
-                after=thinking_close["end"],
-            )
-            if reply_open:
-                reply_close = _first_self_authored_marker(
-                    tokens,
-                    kind="reply",
-                    closing=True,
-                    after=reply_open["end"],
-                )
-                visible_parts.append(
-                    raw[reply_open["end"] : reply_close["start"] if reply_close else len(raw)]
-                )
-            else:
-                visible_parts.append(raw[thinking_close["end"] :])
-        else:
-            reply_open = _first_self_authored_marker(
-                tokens,
-                kind="reply",
-                closing=False,
-                after=thinking_open["end"],
-            )
-            if reply_open:
-                thinking = raw[thinking_open["end"] : reply_open["start"]]
-                reply_close = _first_self_authored_marker(
-                    tokens,
-                    kind="reply",
-                    closing=True,
-                    after=reply_open["end"],
-                )
-                visible_parts.append(
-                    raw[reply_open["end"] : reply_close["start"] if reply_close else len(raw)]
-                )
-            # Dangling thinking with no reply boundary: keep only the prefix.
-    elif reply_open:
-        visible_parts.append(raw[: reply_open["start"]])
-        reply_close = _first_self_authored_marker(
-            tokens,
-            kind="reply",
-            closing=True,
-            after=reply_open["end"],
-        )
-        visible_parts.append(
-            raw[reply_open["end"] : reply_close["start"] if reply_close else len(raw)]
-        )
-
-    visible = "\n".join(part for part in visible_parts if part is not None)
-    visible = _remove_self_authored_protocol_fragments(visible)
-    thinking = _remove_self_authored_protocol_fragments(thinking)
-    visible = re.sub(r"\n{3,}", "\n\n", visible).strip()
-    thinking = re.sub(r"\n{3,}", "\n\n", thinking).strip()
-    return visible, thinking
-
-
-def _strip_self_authored_protocol_from_reply(text: str) -> str:
-    if not isinstance(text, str):
-        return ""
-    visible, _thinking = _split_self_authored_thinking_v2(text)
-    visible = _remove_self_authored_protocol_fragments(visible)
-    if _self_authored_protocol_fragment_present(visible):
-        visible = "\n".join(
-            ln for ln in visible.splitlines()
-            if not _self_authored_protocol_fragment_present(ln)
-        )
-    return re.sub(r"\n{3,}", "\n\n", visible).strip()
 
 
 def _split_tagged_thinking(text: str) -> tuple[str, str]:
@@ -2406,10 +2210,6 @@ def _sanitize_thinking_summary(text: str) -> str:
         ln = raw_ln.strip()
         if not ln or blocked.search(ln):
             continue
-        if _self_authored_protocol_fragment_present(ln):
-            ln = _remove_self_authored_protocol_fragments(ln).strip()
-            if not ln:
-                continue
         if _NOISE_LINE_RE.match(ln) or _REASONING_LINE_RE.match(ln):
             continue
         ln = re.sub(r"^[`#>*\-\s]+", "", ln).strip()
@@ -2558,23 +2358,6 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         raw = obj.strip()
         if not raw:
             return turn
-        if (
-            _self_authored_protocol_fragment_present(raw)
-            and raw[:1] not in "[{"
-        ):
-            raw, self_authored_thinking = _split_self_authored_thinking_v2(raw)
-            if self_authored_thinking:
-                turn.thinking_summary = _sanitize_thinking_summary(self_authored_thinking)
-                turn.thinking_kind = "provider_reasoning_summary"
-                turn.thinking_source = "self_authored_v2"
-                turn.thinking_native = False
-            if raw.strip() and _looks_like_json_text(raw):
-                nested = _safe_json_loads(raw)
-                if isinstance(nested, (dict, list)):
-                    _merge_agent_turn(turn, _agent_turn_from_obj(nested))
-                    return _dedupe_agent_turn_messages(turn)
-            if not raw.strip():
-                return turn
         json_objects = _json_objects_from_cli_output(raw)
         if json_objects:
             for item in json_objects:
@@ -2593,19 +2376,6 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         nested = _safe_json_loads(raw) if _looks_like_json_text(raw) else None
         if isinstance(nested, (dict, list)):
             return _agent_turn_from_obj(nested)
-        raw, self_authored_thinking = _split_self_authored_thinking_v2(raw)
-        if self_authored_thinking:
-            turn.thinking_summary = _sanitize_thinking_summary(self_authored_thinking)
-            turn.thinking_kind = "provider_reasoning_summary"
-            turn.thinking_source = "self_authored_v2"
-            turn.thinking_native = False
-            if raw.strip() and _looks_like_json_text(raw):
-                nested = _safe_json_loads(raw)
-                if isinstance(nested, (dict, list)):
-                    _merge_agent_turn(turn, _agent_turn_from_obj(nested))
-                    return _dedupe_agent_turn_messages(turn)
-            if not raw.strip():
-                return turn
         raw, tagged_thinking = _split_tagged_thinking(raw)
         if tagged_thinking:
             # Some runtimes inline their reasoning as <think>…</think> in the
@@ -3101,7 +2871,6 @@ def _extract_text_from_cli_output(raw: str) -> str:
         if text:
             return text
 
-    raw = _strip_self_authored_protocol_from_reply(raw)
     raw, _tagged_thinking = _split_tagged_thinking(raw)
     raw = _strip_reasoning_sections(raw)
     clean = [ln.rstrip() for ln in raw.splitlines() if not _NOISE_LINE_RE.match(ln)]
@@ -4209,7 +3978,7 @@ def _sanitize_reply_text(text: str) -> str:
     if not isinstance(text, str):
         return ""
 
-    text = _strip_self_authored_protocol_from_reply(text.replace("\r\n", "\n"))
+    text = text.replace("\r\n", "\n")
     text = text.strip()
     if not text:
         return ""
@@ -4299,19 +4068,14 @@ def call_agent(
     trace_id: str = "",
     lane: str = "background",
 ) -> Any:
-    agent_message = (
-        _with_self_authored_thinking_protocol(message)
-        if _self_authored_thinking_prompt_enabled(raw_text)
-        else message
-    )
     if AGENT_MODE == "http":
         # http path metrics/timing are out of scope for this event pair (cli-only);
         # trace_id is accepted here for a uniform call signature but unused.
         # lane gates MCP injection, which only exists on the cli path — unused here.
-        raw = call_agent_http(agent_message, images=images, raw_text=raw_text)
+        raw = call_agent_http(message, images=images, raw_text=raw_text)
     elif AGENT_MODE == "cli":
         raw = call_agent_cli(
-            agent_message, image_paths=image_paths, raw_text=raw_text,
+            message, image_paths=image_paths, raw_text=raw_text,
             trace_id=trace_id, lane=lane)
     else:
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
@@ -5099,14 +4863,6 @@ def post_reply(
     wrong in the log instead.
     """
     url = f"{FEEDLING_API_URL}/v1/chat/response"
-    safe_content = _strip_self_authored_protocol_from_reply(content)
-    if not safe_content:
-        log.warning("reply dropped after self-authored thinking protocol sanitize")
-        return {"error": "empty_after_protocol_sanitize"}
-    if safe_content != content:
-        log.warning("stripped self-authored thinking protocol remnants before reply POST")
-        content = safe_content
-
     if _ENCRYPTION_AVAILABLE and not _refresh_whoami_for_encrypted_reply():
         log.error("whoami refresh failed before encrypted reply and no cached keys are available; skipping write")
         return {"error": "whoami_refresh_failed"}

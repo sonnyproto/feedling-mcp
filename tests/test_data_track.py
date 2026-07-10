@@ -421,10 +421,9 @@ def test_detail_payload_runtime_includes_reasoning_effort(client):
     from conftest import configure_model_api_route
     configure_model_api_route(
         user_id, provider="openrouter", model="anthropic/claude-sonnet-4.6",
-        reasoning_effort="medium", thinking_fallback=True, test_status="ok")
+        reasoning_effort="medium", test_status="ok")
     user_entry = next(u for u in registry._users if u["user_id"] == user_id)
 
     row = data_track._build_data_track_user(user_entry, include_detail=True)
 
     assert row["runtime"]["reasoning_effort"] == "medium"
-    assert row["runtime"]["thinking_fallback"] is True

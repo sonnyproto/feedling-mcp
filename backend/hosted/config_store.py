@@ -90,8 +90,6 @@ def _load_model_api_config(store: UserStore) -> dict | None:
     }
     if route.get("reasoning_effort"):
         config["reasoning_effort"] = route["reasoning_effort"]
-    if route.get("thinking_fallback") is not None:
-        config["thinking_fallback"] = route["thinking_fallback"]
     return config
 
 
@@ -113,8 +111,6 @@ def _public_model_api_config(config: dict | None) -> dict:
     safe["privacy_mode"] = "tdx_cvm_backend_runtime_option_a"
     if config.get("reasoning_effort") is not None:
         safe["reasoning_effort"] = str(config.get("reasoning_effort") or "")
-    if config.get("thinking_fallback") is not None:
-        safe["thinking_fallback"] = bool(config.get("thinking_fallback"))
     return safe
 
 

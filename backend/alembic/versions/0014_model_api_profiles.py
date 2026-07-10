@@ -39,7 +39,6 @@ CREATE TABLE IF NOT EXISTS model_api_routes (
     credential_id            UUID NOT NULL,
     model                    TEXT NOT NULL,
     reasoning_effort         TEXT,
-    thinking_fallback        BOOLEAN,
     is_active                BOOLEAN NOT NULL DEFAULT FALSE,
     test_status              TEXT NOT NULL DEFAULT 'untested',
     last_test_at             TIMESTAMPTZ,
@@ -95,16 +94,13 @@ WHERE b.kind = 'model_api'
       );
 
 INSERT INTO model_api_routes
-    (id, user_id, credential_id, model, reasoning_effort, thinking_fallback, is_active,
+    (id, user_id, credential_id, model, reasoning_effort, is_active,
      test_status, last_test_at)
 SELECT gen_random_uuid(),
        c.user_id,
        c.id,
        COALESCE(b.doc->>'model', ''),
        NULLIF(COALESCE(b.doc->>'reasoning_effort', ''), ''),
-       CASE WHEN b.doc ? 'thinking_fallback'
-            THEN (b.doc->>'thinking_fallback')::boolean
-            ELSE NULL END,
        TRUE,
        COALESCE(NULLIF(b.doc->>'test_status', ''), 'untested'),
        -- 源值是 naive UTC ISO 串（core/util._now_iso() 产出），显式按 UTC 解释，
