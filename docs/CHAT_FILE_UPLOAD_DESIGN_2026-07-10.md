@@ -68,7 +68,7 @@ iOS payload → hosted/turn.py:_model_api_image_payload（校验）
 - **服务端看不到明文** → 一切内容解析（docx/xlsx 抽取、嗅探后的落盘决策）都在
   consumer/agent 侧。服务端只做入口校验（cloud 路由收到的是明文 payload 才能校验；
   VPS 路由信封不透明，只能校验 content_type 和 extra 元数据，类型拒绝靠 iOS 客户端
-  在加密前自行执行同一套白名单——前端 follow-up）。
+  在加密前自行执行同一套白名单——见"能力契约"节）。
 - consumer 是 host/VPS **同一份** `chat_resident_consumer.py`，改一处两边都有；
   但 **VPS resident-runtime 的 consumer 是手动 pin commit 部署的，上线要 bump**。
 - enclave 解密史是 hosted 和 VPS resident 共用路径，`enclave/routes/chat.py` 改一次全覆盖。
