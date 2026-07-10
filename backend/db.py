@@ -1941,28 +1941,47 @@ def genesis_complete_job(
 
 
 def chat_load(user_id: str) -> list[dict]:
+    """Load the user's chat ring. R2-offloaded file rows are returned as SLIM
+    POINTERS (``body_key`` + ``body_ct_len``, no ``body_ct``) — the heavy
+    ciphertext is fetched lazily only at the read exits that actually deliver a
+    body (``hydrate_chat_file_body``), so a bulk/metadata-only load never
+    downloads every historical file. Mirrors how large image bodies are omitted
+    from the visible feed and lazily re-fetched per message."""
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
                 "SELECT doc FROM chat_messages WHERE user_id = %s ORDER BY seq ASC",
                 (user_id,),
             ).fetchall()
-        docs = [r[0] for r in rows]
+        return [r[0] for r in rows]
     except Exception as e:
         log.error("[db] chat_load(%s) failed: %s", user_id, e)
         return []
-    # Reconstitute any R2-offloaded file bodies so callers see a normal inline
-    # file message (body_ct present, no pointer). A missing/failed fetch leaves
-    # body_ct absent rather than crashing the read — the enclave then surfaces a
-    # per-item decrypt error for that one message instead of the whole feed.
-    if object_storage.chat_files_enabled():
-        for doc in docs:
-            if isinstance(doc, dict) and doc.get("body_key") and doc.get("body_ct") is None:
-                body = object_storage.get_chat_file_body(user_id, str(doc.get("id") or ""))
-                if body is not None:
-                    doc["body_ct"] = body
-                    doc.pop("body_key", None)
-    return docs
+
+
+def _is_chat_file_pointer(doc) -> bool:
+    return isinstance(doc, dict) and bool(doc.get("body_key")) and doc.get("body_ct") is None
+
+
+def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
+    """Return a doc guaranteed to carry ``body_ct``. If ``doc`` is an R2 pointer
+    (``body_key`` set, ``body_ct`` absent) the ciphertext is fetched from R2 and
+    inlined into a COPY (the stored/cached row stays slim). Non-pointers and, when
+    R2 is unconfigured, everything are returned unchanged. A missing/failed fetch
+    returns the doc as-is (``body_ct`` still absent) so the enclave surfaces a
+    per-item decrypt error for that one message rather than crashing the read.
+
+    Call this ONLY at exits that actually deliver a body (poll delivery, a
+    history page that includes the body, single message-body fetch) — never in
+    bulk load — so a leaked/large file is fetched once, on demand."""
+    if not _is_chat_file_pointer(doc) or not object_storage.chat_files_enabled():
+        return doc
+    body = object_storage.get_chat_file_body(user_id, str(doc.get("id") or ""))
+    if body is None:
+        return doc
+    out = {k: v for k, v in doc.items() if k != "body_key"}
+    out["body_ct"] = body
+    return out
 
 
 def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int) -> None:
@@ -2008,14 +2027,23 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
         if offload:
             # 2) upload OUTSIDE the txn; on failure the inline row stays readable.
             try:
+                body_ct_len = len(doc["body_ct"])
                 object_storage.put_chat_file_body(user_id, msg_id, doc["body_ct"])
-                # 3) object exists → flip the row to the pointer shape (last step).
-                slim = {k: v for k, v in doc.items() if k != "body_ct"}
-                slim["body_key"] = object_storage.chat_file_key(user_id, msg_id)
+                # 3) object exists → flip the row to the pointer shape as the last
+                #    durable step. ATOMIC on the CURRENT row (not a stale snapshot):
+                #    drop only body_ct and add the pointer keys, so any reply/claim
+                #    metadata another worker merged into `doc` during the upload is
+                #    preserved. The `? 'body_ct'` guard makes it a no-op if the row
+                #    was already flipped (idempotent, avoids a double-flip race).
+                pointer = {
+                    "body_key": object_storage.chat_file_key(user_id, msg_id),
+                    "body_ct_len": body_ct_len,
+                }
                 with get_pool().connection() as conn:
                     conn.execute(
-                        "UPDATE chat_messages SET doc = %s WHERE user_id = %s AND msg_id = %s",
-                        (Jsonb(slim), user_id, msg_id),
+                        "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
+                        "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
+                        (Jsonb(pointer), user_id, msg_id),
                     )
             except Exception as e:  # noqa: BLE001
                 log.error("[db] chat_append(%s,%s) R2 offload failed, left inline: %s",
@@ -2104,7 +2132,11 @@ def chat_try_claim_reply(
                 ") RETURNING doc",
                 tuple(params),
             ).fetchone()
-        return row[0] if row is not None else None
+        if row is None:
+            return None
+        # This is a delivery exit — the resident consumer decrypts the returned
+        # doc, so an R2-offloaded file must arrive with body_ct inlined.
+        return hydrate_chat_file_body(user_id, row[0])
     except Exception as e:
         log.error("[db] chat_try_claim_reply(%s,%s) failed: %s", user_id, msg_id, e)
         return None

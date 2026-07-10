@@ -184,10 +184,13 @@ def _is_not_found(e) -> bool:
 # --------------------------------------------------------------------------- #
 # Chat file bodies — heavy content_type="file" ciphertext offloaded off the
 # chat_messages row, mirroring the frame offload above. Its own bucket so it
-# never collides with frames or the WAL-G backup bucket. Until R2_CHAT_FILES_
-# BUCKET (+ the R2_* creds) are configured, ``chat_files_enabled()`` is False and
-# db.chat_append/chat_load keep the full body inline in Postgres, exactly as
-# before — this feature is a no-op until the bucket is provisioned.
+# never collides with frames or the WAL-G backup bucket. Target bucket is
+# ``io-user-attachments`` (reuses the existing R2_* credentials — no new key
+# needed); set ``R2_CHAT_FILES_BUCKET=io-user-attachments`` to enable. Until that
+# env is set, ``chat_files_enabled()`` is False and db.chat_append/chat_load keep
+# the full body inline in Postgres, exactly as before — a no-op until enabled.
+# No default is baked in on purpose: enabling is an explicit, one-way switch
+# (once pointer rows exist, removing the env makes those files unreadable).
 # --------------------------------------------------------------------------- #
 
 _CHAT_KEY_PREFIX = "chatfiles"
