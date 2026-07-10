@@ -44,20 +44,29 @@ iOS payload → hosted/turn.py:_model_api_image_payload（校验）
 现状备注：image 白名单目前是 jpeg/jpg/png/webp（`turn.py:1755`），但 iOS 发图路径在
 客户端统一转码 JPEG（≤400KB）再发，后端实际只见过 jpeg——heic 相册照片一直是 iOS 转的。
 
-## 大小上限
+## 大小上限（硬约束：服务端绝不二次打回）
 
-后端 `MODEL_API_MAX_FILE_BYTES = 10_000_000`（10MB），超了 413。
+**铁律**：服务端上限必须 **≥ 客户端上限**。用户看得见的唯一那道闸是 iOS 界面；
+一旦"iOS 收下了、上传完服务端又嫌大打回"，用户完全懵——绝不允许出现。
 
-理由：iOS PR 72 放了 25MB，但 25MB → b64 后 ~33MB JSON body，还要封信封、进库、
-每次 enclave 解密史全量吐回（image 侧已有"图片史 payload 可达数 MB"的抱怨注释），
-25MB 会放大十倍。10MB 覆盖绝大多数文档。413 detail 带 `max_bytes`，客户端提示语
-如何对齐归 iOS 侧设计（本次不动 iOS）。
+iOS 全 app 统一卡 `25 * 1024 * 1024` = **26,214,400 字节（25 MiB）**
+（`ChatEmptyStateView.swift` 等多处，PR 72 "smaller than 25 MB" 同款）。本次不动 iOS。
+
+→ 后端 `MODEL_API_MAX_FILE_BYTES = 26_214_400`（25 MiB，精确对齐 iOS）。
+iOS 在 ≥ 该阈值就已拦下，故任何被 iOS 放行的文件在服务端必然通过，413 实际不会因
+"iOS 放过的文件"触发；413 只兜底非 iOS 客户端 / 未来客户端。detail 带 `max_bytes`，
+供客户端读取而非硬编码——将来任一端调整上限，**只能是客户端 ≤ 服务端**，永不反过来。
+
+payload 膨胀顾虑（25MB → b64 ~33MB body + 每次 enclave 史回吐）真实存在，但这与
+image 是同一老问题，正确解法是照 image 现有的 `include_image_body` 开关——历史回吐时
+**省略文件体**（`chat_core.py` 已有 `include_image_body`/`body_omitted` 机制，file 复用），
+而不是用更小的上限去卡用户、制造上一段禁止的坏体验。
 
 ## 改动点清单
 
 | 文件 | 改动 |
 |---|---|
-| `backend/hosted/turn.py` | 新增 `_model_api_file_payload()`：类型判定（图片转 image / 白名单 / 嗅探）、b64 校验、10MB 上限、文件名清洗（照 consumer 现有 `[^A-Za-z0-9_.-]` 思路，防路径穿越）。image mime 白名单加 gif |
+| `backend/hosted/turn.py` | 新增 `_model_api_file_payload()`：类型判定（图片转 image / 白名单 / 嗅探）、b64 校验、25 MiB 上限（对齐 iOS）、文件名清洗（照 consumer 现有 `[^A-Za-z0-9_.-]` 思路，防路径穿越）。image mime 白名单加 gif |
 | `backend/hosted/chat_send_core.py` | file 分支：bytes 封信封，`file_mime`/`file_name` 存明文 extra（拍板：文件名明文，同 image_mime 档，iOS 历史列表不解密也能显示气泡），`content_type="file"`；随附文字走现有 caption 信封机制；image/* 直接转 `content_type=image` |
 | `backend/chat/chat_core.py:305,395` | content_type 白名单加 `"file"`；**VPS 路由 append_chat 要把 payload 里的 `file_name`/`file_mime` 收进 extra**（现在该路径不传 extra，image 没此需求但 file 有） |
 | `backend/enclave/routes/chat.py` | `ctype=="file"` 分支：吐 `file_b64` + `file_mime` + `file_name`（照 image 分支，含 caption） |
@@ -148,8 +157,9 @@ HTTP 入口模板（内联）：
   - `unsupported_file_type` + `hint`：heic（建议客户端转码 jpeg）、`.doc`/`.xls`
     （建议另存新格式）、其他二进制。
   - `invalid_file`：b64 无效 / 空文件。
-- 413：超 `MODEL_API_MAX_FILE_BYTES`（10MB），detail 带 `max_bytes`
-  （客户端当前 25MB 提示与此不一致，由 iOS 侧设计自行对齐）。
+- 413：超 `MODEL_API_MAX_FILE_BYTES`（25 MiB = 26,214,400，对齐 iOS 现有上限），
+  detail 带 `max_bytes`。因服务端上限 ≥ 客户端上限，被 iOS 放行的文件不会触发此 413
+  （见"大小上限"节铁律）。
 
 **VPS 路由 `POST /v1/chat/send`（客户端封信封）：**
 
