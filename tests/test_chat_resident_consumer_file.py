@@ -150,6 +150,21 @@ def test_prepare_pdf_http_inline_declines(tmp_path, monkeypatch):
     assert prep.http_fallback_note and "PDF" in prep.http_fallback_note
 
 
+def test_prepare_docx_empty_extraction_no_false_claim(tmp_path, monkeypatch):
+    from tools import chat_resident_consumer as c
+    monkeypatch.setattr(c, "FILE_TEMP_DIR", tmp_path)
+    import base64
+    # valid docx zip whose document.xml has no <w:t> text → extracts to ""
+    empty_docx = _make_docx([])
+    msg = {"id": "de", "content_type": "file", "file_name": "empty.docx",
+           "file_mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+           "file_b64": base64.b64encode(empty_docx).decode()}
+    prep = c._prepare_file_for_agent(msg)
+    assert prep.extracted is False
+    assert "抽取" not in prep.cli_instruction
+    assert prep.inline_text is None
+
+
 def test_prepare_xlsx_failure_no_false_extraction_claim(tmp_path, monkeypatch):
     from tools import chat_resident_consumer as c
     monkeypatch.setattr(c, "FILE_TEMP_DIR", tmp_path)

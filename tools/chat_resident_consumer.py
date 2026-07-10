@@ -1344,7 +1344,6 @@ def _image_file_paths_from_payloads(prefix: str, payloads: list[dict[str, str]])
 _XLSX_MAX_SHEETS = 5
 _XLSX_MAX_ROWS = 2000
 FILE_TEMP_DIR = Path(os.environ.get("FILE_TEMP_DIR", "/tmp/feedling_chat_files"))
-FILE_PLACEHOLDER = "User sent a file."
 
 
 def _strip_ns(tag: str) -> str:
@@ -1497,11 +1496,11 @@ def _prepare_file_for_agent(msg: dict) -> "FilePrep":
 
     if ext == "docx":
         text = _extract_docx_text(data)
-        if text is not None:
+        if text and text.strip():
             inline_text, extracted = text, True
             local_path = _land_file(key, name + ".txt", text.encode("utf-8")) or None
         else:
-            # extraction failed — land original; agent will Read-and-honestly-fail
+            # extraction failed OR produced no text — do NOT claim extraction; land original
             local_path = _land_file(key, name, data) or None
     elif ext == "xlsx":
         text, truncated = _extract_xlsx_text(data)
