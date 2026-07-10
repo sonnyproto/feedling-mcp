@@ -48,8 +48,10 @@ Memory write guidance:
 - Do not write greetings, jokes, one-off task instructions, unconfirmed guesses, roleplay hypotheticals, or the assistant's own inference.
 - Use memory.add for new durable events/facts.
 - Use memory.supersede when the user corrects or replaces an older memory; do not patch old cards in place.
-- Pick one bucket and 1-4 reusable threads. Prefer existing bucket/thread names when provided; converge on the common buckets ("""
-+ _COMMON_BUCKETS_EN + """) and only mint a specific new bucket (Mom / the house) when none fit. Keep buckets in the user's language — never let 工作 and Work coexist.
+- Pick one bucket and 1-4 reusable threads. Prefer existing bucket/thread names when provided; converge on the common buckets and only mint a specific new bucket (Mom / 妈妈 / the house) when none fit.
+- The bucket name MUST be ONE word in the memory's OWN language: a Chinese memory uses a Chinese bucket (from: """
++ _COMMON_BUCKETS_ZH + """); an English memory uses an English bucket (from: """
++ _COMMON_BUCKETS_EN + """). NEVER write a bilingual slash pair like 「健康/Health」or 「宠物/Pets」, and never let 工作 and Work coexist as two buckets.
 - importance means future usefulness for understanding the user. pulse means emotional activation when remembered.
 - content must use three Markdown sections: 记忆 / 上下文 / 使用提示.
 - Do not claim "saved" or "remembered" before the backend write actually succeeds.
