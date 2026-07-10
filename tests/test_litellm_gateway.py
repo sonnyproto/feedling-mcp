@@ -55,30 +55,35 @@ def test_model_entry_openrouter_non_anthropic_uses_effort_when_on():
     )
     assert e["litellm_params"]["extra_body"]["reasoning"] == {
         "effort": "medium",
-        "exclude": False,
     }
 
 
-def test_model_entry_openrouter_anthropic_uses_reasoning_token_budget():
-    # 2026-07-10 OpenRouter e2e: Anthropic-family models silently return empty
-    # reasoning for effort, but emit reasoning when given a token budget.
+def test_model_entry_openrouter_anthropic_uses_effort_on_responses_wire():
+    # codex speaks the Responses wire and OpenRouter serves it natively; the
+    # Responses `reasoning` object takes {effort}, and a chat-wire {max_tokens}
+    # budget is silently ignored there (probed 2026-07-11 against /responses:
+    # effort -> reasoning_tokens>0, max_tokens -> 0). So Anthropic-family models
+    # emit effort too, same as every other OpenRouter family.
     e = gw.build_model_entry(
         user_id="u", provider="openrouter", model="anthropic/claude-sonnet-4.6",
         reasoning_effort="medium",
     )
     assert e["litellm_params"]["extra_body"]["reasoning"] == {
-        "max_tokens": 2048,
+        "effort": "medium",
     }
-    assert "effort" not in e["litellm_params"]["extra_body"]["reasoning"]
+    assert "max_tokens" not in e["litellm_params"]["extra_body"]["reasoning"]
 
 
-def test_model_entry_openrouter_anthropic_caps_numeric_reasoning_budget():
+def test_model_entry_openrouter_non_enum_effort_falls_back_to_medium():
+    # The Responses `reasoning.effort` only accepts low/medium/high; a legacy
+    # numeric value (or anything else) falls back to medium rather than emitting
+    # an invalid effort the wire would reject.
     e = gw.build_model_entry(
         user_id="u", provider="openrouter", model="anthropic/claude-sonnet-4.6",
         reasoning_effort="9999",
     )
     assert e["litellm_params"]["extra_body"]["reasoning"] == {
-        "max_tokens": 4096,
+        "effort": "medium",
     }
 
 
@@ -104,7 +109,7 @@ def test_build_config_threads_per_user_reasoning_effort():
         {"user_id": "u2", "provider": "openrouter", "model": "m", "reasoning_effort": "off"},
     ])
     entries = {e["model_name"]: e["litellm_params"] for e in cfg["model_list"]}
-    assert entries["gw-u1"]["extra_body"]["reasoning"]["max_tokens"] == 1024
+    assert entries["gw-u1"]["extra_body"]["reasoning"]["effort"] == "low"
     assert "extra_body" not in entries["gw-u2"]
 
 

@@ -59,12 +59,10 @@ def _norm_provider(provider: str) -> str:
 # can later expose a per-account reasoning toggle without touching this code.
 _DEFAULT_REASONING_EFFORT = (os.environ.get("FEEDLING_AGENT_REASONING_EFFORT", "off") or "").strip().lower()
 _REASONING_OFF = {"", "off", "none", "no", "false", "0", "disabled"}
-_OPENROUTER_ANTHROPIC_REASONING_BUDGET = {
-    "low": 1024,
-    "medium": 2048,
-    "high": 4096,
-}
-_OPENROUTER_DEFAULT_RESPONSE_MAX_TOKENS = 8192
+# The Responses `reasoning.effort` enum. codex speaks the Responses wire and
+# OpenRouter serves it natively, so effort is the only reasoning shape that
+# reaches the upstream (see _openrouter_reasoning_request).
+_OPENROUTER_REASONING_EFFORTS = ("low", "medium", "high")
 
 
 def _resolve_reasoning_effort(entry_effort: str | None = None) -> str:
@@ -74,34 +72,20 @@ def _resolve_reasoning_effort(entry_effort: str | None = None) -> str:
     return "" if effort in _REASONING_OFF else effort
 
 
-def _openrouter_uses_reasoning_budget(model: str) -> bool:
-    """OpenRouter Anthropic-family models require token-budget reasoning."""
-    m = (model or "").strip().lower()
-    if m.startswith("openrouter/"):
-        m = m.removeprefix("openrouter/")
-    return m.startswith("anthropic/")
+def _openrouter_reasoning_request(effort: str) -> dict:
+    """OpenRouter reasoning params for the Responses wire.
 
-
-def _reasoning_budget_for_effort(
-    effort: str,
-    *,
-    response_max_tokens: int = _OPENROUTER_DEFAULT_RESPONSE_MAX_TOKENS,
-) -> int:
-    """Map Feedling effort names to OpenRouter Anthropic reasoning token budgets."""
-    normalized = (effort or "").strip().lower()
-    if normalized.isdigit():
-        budget = max(1, int(normalized))
-    else:
-        budget = _OPENROUTER_ANTHROPIC_REASONING_BUDGET.get(
-            normalized, _OPENROUTER_ANTHROPIC_REASONING_BUDGET["medium"])
-    response_cap = max(1, int(response_max_tokens) // 2)
-    return min(budget, response_cap)
-
-
-def _openrouter_reasoning_request(model: str, effort: str) -> dict:
-    if _openrouter_uses_reasoning_budget(model):
-        return {"max_tokens": _reasoning_budget_for_effort(effort)}
-    return {"effort": effort, "exclude": False}
+    codex only ever speaks the OpenAI Responses wire, and OpenRouter serves it
+    NATIVELY (OpenRouterResponsesAPIConfig, litellm 1.89.4) — not via the
+    responses->chat bridge. The Responses ``reasoning`` object only accepts
+    {effort, summary}; a chat-wire {max_tokens} budget is silently dropped there
+    (probed 2026-07-11 against /responses: effort -> 17 reasoning_tokens with a
+    real chain, max_tokens -> 0). So emit effort for ALL OpenRouter families,
+    Anthropic included. low/medium/high are the valid Responses effort values;
+    anything else (incl. legacy numeric budgets) falls back to medium.
+    """
+    normalized = effort if effort in _OPENROUTER_REASONING_EFFORTS else "medium"
+    return {"effort": normalized}
 
 
 def gateway_model_id(user_id: str) -> str:
@@ -144,17 +128,16 @@ def build_model_entry(
     }
     normalized_provider = _norm_provider(provider)
     if normalized_provider == "openrouter":
-        # OpenRouter returns provider reasoning only when the request asks for it.
-        # Re-tested 2026-07-10: Anthropic-family models silently return an empty
-        # `message.reasoning` for `{"effort": "medium"}` and only emit reasoning
-        # for a token budget (`{"max_tokens": 1024}` in the probe), while GLM
-        # still emits reasoning with effort. Keep the per-user switch default-off;
-        # when enabled, map Anthropic-family effort levels to token budgets and
-        # leave the other OpenRouter model families on effort.
+        # OpenRouter serves the Responses API natively and codex speaks Responses
+        # only, so the request never hits the responses->chat bridge. The
+        # Responses `reasoning` object takes {effort} — the chat-wire {max_tokens}
+        # budget is silently ignored there (probed 2026-07-11 against /responses:
+        # effort -> reasoning_tokens>0, max_tokens -> 0). So emit effort for every
+        # OpenRouter family, Anthropic included. Default-off per-user.
         effort = _resolve_reasoning_effort(reasoning_effort)
         if effort:
             params["extra_body"] = {
-                "reasoning": _openrouter_reasoning_request(model, effort),
+                "reasoning": _openrouter_reasoning_request(effort),
             }
     if normalized_provider == "openai_compatible":
         # codex `exec` always ships a `web_search` tool and offers no switch to

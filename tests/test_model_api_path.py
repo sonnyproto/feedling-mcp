@@ -278,7 +278,7 @@ def test_model_api_setup_does_not_probe_non_openai_compatible(client, monkeypatc
     assert route["supports_responses"] is False
 
 
-def test_model_api_setup_persists_reasoning_effort_and_gateway_uses_budget(client, monkeypatch):
+def test_model_api_setup_persists_reasoning_effort_and_gateway_uses_effort(client, monkeypatch):
     user_id, api_key = _register(client)
     monkeypatch.setattr(provider_client, "test_provider_key",
                         lambda cfg: {"reply": "ok", "usage": {}})
@@ -305,7 +305,7 @@ def test_model_api_setup_persists_reasoning_effort_and_gateway_uses_budget(clien
         user_id=user_id, provider=row["provider"], model=row["model"],
         reasoning_effort=row["reasoning_effort"],
     )
-    assert entry["litellm_params"]["extra_body"]["reasoning"] == {"max_tokens": 2048}
+    assert entry["litellm_params"]["extra_body"]["reasoning"] == {"effort": "medium"}
 
 
 def test_model_api_setup_reasoning_effort_off_and_default_disable_gateway_reasoning(client, monkeypatch):
