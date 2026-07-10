@@ -130,17 +130,17 @@ def _codex_gateway_config(*, base_url: str, model: str) -> str:
         'wire_api = "responses"',
         'env_key = "CODEX_API_KEY"',
         "",
-        # codex ≥0.142 declares its multi-agent (collab) tools as a
+        # codex >=0.142 declares its multi-agent tools as a
         # `{"type": "namespace"}` tool group on EVERY Responses request — an
         # OpenAI-only wire extension. Non-OpenAI upstreams reject the whole
         # request on the unknown tool type (xAI via openrouter: 422 "unknown
         # variant 'namespace', expected one of 'function', 'web_search'"), so
-        # every turn dies before the model runs. Disable collab for gateway
+        # every turn dies before the model runs. Disable multi-agent for gateway
         # users; the remaining tools are plain `function` + `web_search`,
         # which the gateway upstreams parse. (Verified on codex-cli 0.142.5:
-        # with `collab = false` the namespace group is gone from the wire.)
+        # with `multi_agent = false` the namespace group is gone from the wire.)
         "[features]",
-        "collab = false",
+        "multi_agent = false",
     ]
     return "\n".join(lines) + "\n"
 

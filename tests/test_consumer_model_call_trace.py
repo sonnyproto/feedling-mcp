@@ -220,7 +220,7 @@ def test_error_event_carries_error_detail_beyond_the_reply_head_cap(monkeypatch)
         args=["codex"], returncode=1, stdout=stdout, stderr="Reading additional input from stdin...\n",
     )
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["codex", "exec", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["codex", "exec", message])
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()
@@ -241,6 +241,30 @@ def test_error_event_carries_error_detail_beyond_the_reply_head_cap(monkeypatch)
     assert "collab" not in excerpt["error_detail"]
 
 
+def test_error_event_extracts_nested_codex_turn_failed_detail(monkeypatch):
+    stdout = "\n".join([
+        '{"type":"thread.started","thread_id":"t"}',
+        '{"type":"item.completed","item":{"type":"error","message":"`[features].collab` is deprecated."}}',
+        '{"type":"turn.failed","error":{"message":"Invalid tool use format: web_search_options must be omitted"}}',
+    ])
+    result = subprocess.CompletedProcess(
+        args=["codex"], returncode=1, stdout=stdout, stderr="",
+    )
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec "{message}"')
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["codex", "exec", message])
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
+
+    calls, fake_emit = _recorder()
+    monkeypatch.setattr(crc, "_emit_debug_trace", fake_emit)
+
+    with pytest.raises(RuntimeError):
+        crc.call_agent_cli("hi", trace_id="trace-nested")
+
+    excerpt = calls[1]["content_excerpt"]
+    assert excerpt["error_detail"] == "Invalid tool use format: web_search_options must be omitted"
+    assert "collab" not in excerpt["error_detail"]
+
+
 def test_error_detail_absent_on_successful_turns(monkeypatch):
     """rc=0 has no error to surface; `_cli_error_detail` would fall back to a raw
     stdout snippet, which is noise on the `.done` event."""
@@ -248,7 +272,7 @@ def test_error_detail_absent_on_successful_turns(monkeypatch):
         args=["codex"], returncode=0, stdout='{"type":"agent_message","message":"hi"}', stderr="",
     )
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["codex", "exec", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["codex", "exec", message])
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: result)
 
     calls, fake_emit = _recorder()

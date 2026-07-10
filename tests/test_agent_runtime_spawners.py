@@ -561,20 +561,21 @@ def test_agent_home_files_codex_gateway_writes_responses_config():
     assert "/h/codex-home/AGENTS.md" in files
 
 
-def test_agent_home_files_codex_gateway_disables_collab_tools():
+def test_agent_home_files_codex_gateway_disables_multi_agent_tools():
     # codex 0.142 declares its multi-agent tools as a `{"type": "namespace"}` tool
     # group on EVERY Responses request — an OpenAI-only wire extension. Non-OpenAI
     # upstreams behind the gateway reject the whole request on it (xAI: 422
     # "unknown variant 'namespace', expected one of 'function', 'web_search'"),
     # so every turn dies before the model runs. Gateway config must turn the
-    # collab feature off; native OpenAI keeps it (no config.toml written there).
+    # multi-agent feature off; native OpenAI keeps it (no config.toml written there).
     files = spawners.agent_home_files(
         "/h", driver="codex", provider="openrouter", codex_transport="gateway",
         gateway_base_url="http://127.0.0.1:4000/v1", model="gw-x",
     )
     cfg = files["/h/codex-home/config.toml"]
     assert "[features]" in cfg
-    assert "collab = false" in cfg
+    assert "multi_agent = false" in cfg
+    assert "collab = false" not in cfg
 
 
 def test_agent_home_files_codex_native_omits_gateway_config():

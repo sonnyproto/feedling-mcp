@@ -2338,19 +2338,46 @@ def _cli_error_detail(stdout: str, stderr: str) -> str:
     Both CLIs report API failures on STDOUT while stderr is often empty or just a
     warning: claude ``--output-format json`` emits a result object
     (``is_error`` + ``result`` text + ``api_error_status``); codex ``--json`` emits
-    ``error`` events (``message``). Surface that so ``cli agent exited`` is
-    actionable instead of blank. Falls back to stderr, then a stdout snippet.
+    ``error`` events (``message``), ``turn.failed.error.message``, or nested
+    error items. Surface that so ``cli agent exited`` is actionable instead of
+    blank. Falls back to stderr, then a stdout snippet.
     """
+    def _codex_error_message(obj: Any) -> tuple[int, str]:
+        if not isinstance(obj, dict):
+            return 0, ""
+        if obj.get("type") == "error" and isinstance(obj.get("message"), str):
+            return 3, obj["message"]
+
+        err = obj.get("error")
+        if isinstance(err, str) and err.strip():
+            return 2, err
+        if isinstance(err, dict):
+            for key in ("message", "detail", "error", "description"):
+                value = err.get(key)
+                if isinstance(value, str) and value.strip():
+                    return 2, value
+
+        item = obj.get("item")
+        if isinstance(item, dict) and item.get("type") == "error":
+            for key in ("message", "text", "content", "error"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return 1, value
+        return 0, ""
+
     claude_err = ""
     codex_err = ""
+    codex_err_priority = 0
     for obj in _json_objects_from_cli_output(stdout or ""):
         if not isinstance(obj, dict):
             continue
         if not claude_err and obj.get("is_error") and isinstance(obj.get("result"), str):
             status = obj.get("api_error_status")
             claude_err = obj["result"] + (f" (api_status={status})" if status else "")
-        if obj.get("type") == "error" and isinstance(obj.get("message"), str):
-            codex_err = obj["message"]   # keep the last error event (the final one)
+        priority, msg = _codex_error_message(obj)
+        if msg and priority >= codex_err_priority:
+            codex_err = msg   # keep the last error event (the final one)
+            codex_err_priority = priority
     detail = claude_err or codex_err
     if detail:
         return detail[:300]

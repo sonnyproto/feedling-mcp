@@ -112,7 +112,7 @@ def build_model_entry(
         # WITH a budget. ``enabled: true`` alone yields NO reasoning for
         # Anthropic-family models (verified against openrouter) — an ``effort``
         # (or token budget) is required. Gated by the reasoning switch (default
-        # "high"); "off" sends no reasoning. Non-reasoning models ignore it
+        # "off"); "off" sends no reasoning. Non-reasoning models ignore it
         # gracefully (no error), so this is safe across the openrouter model set.
         effort = _resolve_reasoning_effort(reasoning_effort)
         if effort:
