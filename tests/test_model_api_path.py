@@ -1739,32 +1739,37 @@ def test_export_excludes_verify_ping(client):
 
 def test_verify_ping_reply_never_delivers_push(client):
     """Defense-in-depth: a verify_ping reply must not deliver push / Live Activity
-    even if the caller supplies a body (the consumer already sends suppress_push)."""
+    even if the caller supplies a body (the consumer already sends suppress_push).
+
+    write_response returns only {id, ts, v}, so we observe the real safety
+    property by mocking the delivery function and asserting it is never called."""
     import uuid
+    from unittest.mock import patch
 
     from chat import chat_core
     from core import store as core_store
+    from push import service as push_service
 
     user_id, api_key = _register(client)
     store = core_store.get_store(user_id)
-    body, status = chat_core.write_response(
-        store,
-        {
-            "envelope": {
-                "v": 1, "id": uuid.uuid4().hex, "body_ct": _b64(b"__verify_ack__"),
-                "nonce": _b64(b"\x00" * 12), "K_user": _b64(b"\x00" * 32),
-                "visibility": "local_only", "owner_user_id": user_id,
-            },
-            "source": "verify_ping",
-            "push_body": "should never surface",
-            "push_live_activity": True,
+    payload = {
+        "envelope": {
+            "v": 1, "id": uuid.uuid4().hex, "body_ct": _b64(b"__verify_ack__"),
+            "nonce": _b64(b"\x00" * 12), "K_user": _b64(b"\x00" * 32),
+            "visibility": "local_only", "owner_user_id": user_id,
         },
-        consumer_id="c", consumer_info={}, allow_verify_reply=True,
-    )
+        "source": "verify_ping",
+        "push_body": "should never surface",
+        "push_live_activity": True,
+    }
+    with patch.object(
+        push_service, "_deliver_ai_message_push_if_background", return_value={}
+    ) as deliver:
+        body, status = chat_core.write_response(
+            store, payload, consumer_id="c", consumer_info={}, allow_verify_reply=True,
+        )
     assert status in (200, 201), body
-    # The push block is skipped entirely for verify_ping, so no delivery fields.
-    for k in ("push_decision", "alert_status", "live_activity_status"):
-        assert not body.get(k), (k, body.get(k))
+    deliver.assert_not_called()
 
 
 def _verify_reply_envelope(user_id: str) -> dict:
