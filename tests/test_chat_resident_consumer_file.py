@@ -106,3 +106,45 @@ def test_friendly_file_type():
     from tools import chat_resident_consumer as c
     assert "Word" in c._friendly_file_type("a.docx", "")
     assert "PDF" in c._friendly_file_type("a.pdf", "application/pdf")
+
+
+def test_prepare_text_file_lands_and_names_original(tmp_path, monkeypatch):
+    from tools import chat_resident_consumer as c
+    monkeypatch.setattr(c, "FILE_TEMP_DIR", tmp_path)
+    import base64
+    msg = {"id": "m1", "content_type": "file", "file_name": "笔记.md",
+           "file_mime": "text/markdown",
+           "file_b64": base64.b64encode(b"# hi\n").decode()}
+    prep = c._prepare_file_for_agent(msg)
+    assert prep.original_name == "笔记.md"
+    assert prep.local_path is not None and prep.local_path.endswith(".md")
+    # instruction names the original file
+    assert "笔记.md" in prep.cli_instruction
+
+
+def test_prepare_docx_declares_extraction(tmp_path, monkeypatch):
+    from tools import chat_resident_consumer as c
+    monkeypatch.setattr(c, "FILE_TEMP_DIR", tmp_path)
+    import base64
+    docx = _make_docx(["Body para"])
+    msg = {"id": "m2", "content_type": "file", "file_name": "报告.docx",
+           "file_mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+           "file_b64": base64.b64encode(docx).decode()}
+    prep = c._prepare_file_for_agent(msg)
+    assert prep.extracted is True
+    assert prep.inline_text and "Body para" in prep.inline_text
+    assert "抽取" in prep.cli_instruction  # declares system extracted to text
+    assert prep.local_path is not None and prep.local_path.endswith(".txt")
+
+
+def test_prepare_pdf_http_inline_declines(tmp_path, monkeypatch):
+    from tools import chat_resident_consumer as c
+    monkeypatch.setattr(c, "FILE_TEMP_DIR", tmp_path)
+    import base64
+    msg = {"id": "m3", "content_type": "file", "file_name": "a.pdf",
+           "file_mime": "application/pdf",
+           "file_b64": base64.b64encode(b"%PDF-1.4 ...").decode()}
+    prep = c._prepare_file_for_agent(msg)
+    # PDF cannot be inlined for a tool-less HTTP agent
+    assert prep.inline_text is None
+    assert prep.http_fallback_note and "PDF" in prep.http_fallback_note

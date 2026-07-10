@@ -1433,6 +1433,132 @@ def _friendly_file_type(name: str, mime: str) -> str:
     }.get(ext, "文件")
 
 
+FILE_INLINE_MAX_CHARS = int(os.environ.get("FILE_INLINE_MAX_CHARS", "30000"))
+
+
+@dataclass
+class FilePrep:
+    original_name: str
+    friendly_type: str
+    local_path: str | None          # landed bytes (CLI Read path) — text for docx/xlsx, original otherwise
+    inline_text: str | None         # extracted/sniffed text for HTTP inlining
+    extracted: bool                 # True if we converted (docx/xlsx)
+    truncated: bool
+    truncation_note: str
+    http_fallback_note: str | None  # set when there is nothing to inline (PDF)
+    cli_instruction: str
+    http_block: str
+
+
+def _decode_file_b64(value) -> bytes | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return base64.b64decode(value, validate=True)
+    except Exception as e:
+        log.warning("file_b64 decode failed: %s", e)
+        return None
+
+
+def _human_size(n: int) -> str:
+    return f"{n/1024:.0f} KB" if n < 1024 * 1024 else f"{n/1024/1024:.1f} MB"
+
+
+def _land_file(msg_key: str, name: str, data: bytes) -> str:
+    FILE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else "bin"
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{msg_key}_{name}")[:120] or "file"
+    if not safe.lower().endswith(f".{ext}"):
+        safe = f"{safe}.{ext}"
+    path = FILE_TEMP_DIR / safe
+    try:
+        path.write_bytes(data)
+    except Exception as e:
+        log.warning("failed to write file temp %s: %s", path, e)
+        return ""
+    return str(path)
+
+
+def _prepare_file_for_agent(msg: dict) -> "FilePrep":
+    name = str(msg.get("file_name") or "file")
+    mime = str(msg.get("file_mime") or "").lower()
+    ftype = _friendly_file_type(name, mime)
+    data = _decode_file_b64(msg.get("file_b64")) or b""
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(msg.get("id") or "file"))[:96] or "file"
+    size = _human_size(len(data))
+
+    inline_text: str | None = None
+    extracted = False
+    truncated = False
+    truncation_note = ""
+    local_path: str | None = None
+    http_fallback_note: str | None = None
+
+    if ext == "docx":
+        text = _extract_docx_text(data)
+        if text is not None:
+            inline_text, extracted = text, True
+            local_path = _land_file(key, name + ".txt", text.encode("utf-8")) or None
+        else:
+            # extraction failed — land original; agent will Read-and-honestly-fail
+            local_path = _land_file(key, name, data) or None
+    elif ext == "xlsx":
+        text, truncated = _extract_xlsx_text(data)
+        inline_text, extracted = text, True
+        if truncated:
+            truncation_note = "（表格内容已截断，仅含前若干表/行）"
+        local_path = _land_file(key, name + ".txt", text.encode("utf-8")) or None
+    elif ext == "pdf":
+        # binary — CLI Reads PDF natively; HTTP (tool-less) cannot inline it
+        local_path = _land_file(key, name, data) or None
+        http_fallback_note = "此 connector 暂不支持读取 PDF。"
+    else:
+        # sniffed text / source: land original AND inline
+        try:
+            inline_text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            inline_text = None
+        local_path = _land_file(key, name, data) or None
+
+    if inline_text and len(inline_text) > FILE_INLINE_MAX_CHARS:
+        inline_text = inline_text[:FILE_INLINE_MAX_CHARS]
+        truncated = True
+        truncation_note = f"（内容在 {FILE_INLINE_MAX_CHARS} 字符处截断）"
+
+    extract_clause = "（已由系统抽取为纯文本，原始格式/图片未保留）" if extracted else ""
+    cli_instruction = (
+        f"用户在 IO Chat 发来一个文件：\n"
+        f"- 文件名：{name}\n"
+        f"- 类型：{ftype}{extract_clause}\n"
+        f"- 大小：{size}\n"
+        + (f"- 本地路径：{local_path}\n" if local_path else "")
+        + "用 Read 工具读上面这个精确路径后再回复。读不到就直说，"
+        "不要假装读过、不要编造文件内容。"
+        + (f"\n{truncation_note}" if truncation_note else "")
+    )
+    if inline_text is not None:
+        http_block = (
+            f"[用户发来文件「{name}」（{ftype}，{size}），以下是"
+            f"{'抽取的纯文本内容，原始格式未保留' if extracted else '文件内容'}"
+            f"{('，' + truncation_note) if truncation_note else ''}：]\n"
+            f"<<<\n{inline_text}\n>>>\n"
+            "[文件内容结束。请基于以上内容回复用户。]"
+        )
+    else:
+        http_block = (
+            f"[用户发来文件「{name}」（{ftype}，{size}）。"
+            f"{http_fallback_note or '该文件无法在当前连接内读取。'}]"
+        )
+
+    return FilePrep(
+        original_name=name, friendly_type=ftype, local_path=local_path,
+        inline_text=inline_text, extracted=extracted, truncated=truncated,
+        truncation_note=truncation_note, http_fallback_note=http_fallback_note,
+        cli_instruction=cli_instruction, http_block=http_block,
+    )
+
+
 def _message_for_agent(content: str, image_paths: list[str] | None = None) -> str:
     image_paths = image_paths or []
     if not image_paths:
@@ -6745,6 +6871,12 @@ def _process_messages(messages: list) -> float:
             # otherwise the agent gets the attachment but loses the actual prompt.
             if not content:
                 content = IMAGE_PLACEHOLDER
+        elif content_type == "file":
+            log.info("file message [ts=%.3f] — preparing file context for agent", ts)
+            prep = _prepare_file_for_agent(msg)
+            caption = content  # decrypted caption text, or ""
+            block = prep.http_block if AGENT_MODE == "http" else prep.cli_instruction
+            content = f"{caption}\n\n{block}".strip() if caption else block
         elif not content:
             # Genuinely empty text — decrypt source missing or failed.
             # Never send a fallback for content we cannot read.
