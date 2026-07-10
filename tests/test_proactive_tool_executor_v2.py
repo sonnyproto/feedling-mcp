@@ -248,6 +248,24 @@ def test_send_message_without_output_adapter_fails_explicitly():
     assert result.error_code == "send_message_adapter_missing"
 
 
+def test_send_message_drops_internal_protocol_fragments_before_adapter():
+    sent = []
+    executor = ToolExecutorV2(
+        adapters=_adapters(send_message=lambda user_id, text, args: sent.append((user_id, text, dict(args))) or {"message_id": "m1"})
+    )
+
+    reason = executor.execute(ToolCallV2("send_message", user_id="u1", args={"text": "reason: user may be resting"}))
+    brace = executor.execute(ToolCallV2("send_message", user_id="u1", args={"text": "}"}))
+
+    assert reason.ok is False
+    assert reason.outcome == "unavailable"
+    assert reason.error_code == "send_message_text_required"
+    assert brace.ok is False
+    assert brace.outcome == "unavailable"
+    assert brace.error_code == "send_message_text_required"
+    assert sent == []
+
+
 def test_unavailable_tools_are_not_masked_by_budget_handoff():
     executor = ToolExecutorV2(adapters=_adapters(), budget=ToolBudgetV2(slow_inline_limit=0))
 

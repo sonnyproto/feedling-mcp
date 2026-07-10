@@ -71,6 +71,57 @@ def test_agent_protocol_parses_messages_actions_and_background_request():
     assert parsed.background_request == {"tool": "memory.fetch", "ids": ["m1"]}
 
 
+def test_agent_protocol_malformed_or_internal_fragments_sleep_invisibly():
+    raws = [
+        "}",
+        "reason: 'user may be resting; do not disturb'",
+        '{"messages": ["hello"]',
+        json.dumps({"messages": ["}"]}),
+        json.dumps({"messages": ["reason: user may be resting"]}),
+        json.dumps({"actions": [{"type": "send_message", "text": "reason: user may be resting"}]}),
+        json.dumps({"actions": [{"type": "send_message", "text": "{\"cards\": []}"}]}),
+    ]
+
+    for raw in raws:
+        parsed = parse_agent_response_v2(raw)
+
+        assert parsed.messages == (), raw
+        assert parsed.actions == ({"type": "sleep", "reason": "invalid_protocol"},), raw
+
+
+def test_agent_protocol_non_message_structures_stay_invisible():
+    parsed = parse_agent_response_v2(json.dumps({"cards": []}))
+
+    assert parsed.messages == ()
+    assert parsed.actions == ({"type": "sleep", "reason": "not_now"},)
+
+
+def test_turn_runner_malformed_visible_fragments_persist_only_sleep():
+    spine = RuntimeSpineV2(merge_window_sec=0.0)
+    store = FakeTurnStoreV2()
+    spine.submit(
+        WakeEventV2(
+            user_id="u1",
+            source="perception_event",
+            trigger="sleep_detected",
+            created_at=11.0,
+        )
+    )
+    runner = TurnRunnerV2(
+        spine,
+        turn_store=store,
+        run_agent=lambda _context: {"messages": ["}", "reason: user may be resting"]},
+    )
+
+    result = runner.run_ready_turn("u1", now=11.0)
+
+    assert result.status == "completed"
+    assert result.outcome.messages == ()
+    assert result.outcome.actions == ({"type": "sleep", "reason": "invalid_protocol"},)
+    assert store.completed[0]["outcome"].messages == ()
+    assert store.recorded_actions[0]["actions"] == [{"type": "sleep", "reason": "invalid_protocol"}]
+
+
 def test_user_message_and_proactive_wake_use_same_runner_context_protocol():
     spine = RuntimeSpineV2(merge_window_sec=0.0)
     seen = []
