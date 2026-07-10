@@ -853,6 +853,7 @@ def account_reset(
     # 归档不在此列：它在删账号之前就已清理并在失败时 abort(见上)。
     for label, fn in (
         ("frames-r2", lambda: db.delete_user_frames(user_id)),
+        ("chat-files-r2", lambda: db.delete_user_chat_files(user_id)),
         ("db-belt", lambda: db.delete_user_data(user_id)),
     ):
         try:

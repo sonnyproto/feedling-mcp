@@ -1947,18 +1947,47 @@ def chat_load(user_id: str) -> list[dict]:
                 "SELECT doc FROM chat_messages WHERE user_id = %s ORDER BY seq ASC",
                 (user_id,),
             ).fetchall()
-        return [r[0] for r in rows]
+        docs = [r[0] for r in rows]
     except Exception as e:
         log.error("[db] chat_load(%s) failed: %s", user_id, e)
         return []
+    # Reconstitute any R2-offloaded file bodies so callers see a normal inline
+    # file message (body_ct present, no pointer). A missing/failed fetch leaves
+    # body_ct absent rather than crashing the read — the enclave then surfaces a
+    # per-item decrypt error for that one message instead of the whole feed.
+    if object_storage.chat_files_enabled():
+        for doc in docs:
+            if isinstance(doc, dict) and doc.get("body_key") and doc.get("body_ct") is None:
+                body = object_storage.get_chat_file_body(user_id, str(doc.get("id") or ""))
+                if body is not None:
+                    doc["body_ct"] = body
+                    doc.pop("body_key", None)
+    return docs
 
 
 def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int) -> None:
     """Insert one chat message then trim to the newest ``max_messages`` rows,
-    mirroring the in-memory ring buffer. Idempotent on msg_id."""
+    mirroring the in-memory ring buffer. Idempotent on msg_id.
+
+    A heavy ``content_type="file"`` body_ct is offloaded to R2 when configured
+    (``object_storage.chat_files_enabled()``); the row then keeps only the
+    envelope metadata plus a ``body_key`` pointer, and ``chat_load`` reconstitutes
+    ``body_ct`` from R2 transparently. Falls back to inline storage when R2 is
+    unconfigured OR the upload fails. Crash-safe, same ordering as frame_upsert:
+    the row is written inline (readable, no pointer) BEFORE the object exists and
+    flipped to the pointer shape only AFTER the upload succeeds — a crash never
+    leaves a pointer to a missing object."""
+    offload = (
+        object_storage.chat_files_enabled()
+        and isinstance(doc, dict)
+        and doc.get("content_type") == "file"
+        and doc.get("body_ct") is not None
+    )
+    trimmed_docs: list = []
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
+                # 1) inline first — message readable, references no R2 object yet.
                 conn.execute(
                     "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
                     "VALUES (%s, %s, %s, %s) "
@@ -1966,15 +1995,36 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
                     (user_id, msg_id, ts, Jsonb(doc)),
                 )
                 if max_messages and max_messages > 0:
-                    conn.execute(
+                    rows = conn.execute(
                         "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
                         "  SELECT MIN(seq) FROM ("
                         "    SELECT seq FROM chat_messages WHERE user_id = %s "
                         "    ORDER BY seq DESC LIMIT %s"
                         "  ) t"
-                        ")",
+                        ") RETURNING doc",
                         (user_id, user_id, max_messages),
+                    ).fetchall()
+                    trimmed_docs = [r[0] for r in rows]
+        if offload:
+            # 2) upload OUTSIDE the txn; on failure the inline row stays readable.
+            try:
+                object_storage.put_chat_file_body(user_id, msg_id, doc["body_ct"])
+                # 3) object exists → flip the row to the pointer shape (last step).
+                slim = {k: v for k, v in doc.items() if k != "body_ct"}
+                slim["body_key"] = object_storage.chat_file_key(user_id, msg_id)
+                with get_pool().connection() as conn:
+                    conn.execute(
+                        "UPDATE chat_messages SET doc = %s WHERE user_id = %s AND msg_id = %s",
+                        (Jsonb(slim), user_id, msg_id),
                     )
+            except Exception as e:  # noqa: BLE001
+                log.error("[db] chat_append(%s,%s) R2 offload failed, left inline: %s",
+                          user_id, msg_id, e)
+        # Best-effort: drop R2 objects for any offloaded file rows just trimmed.
+        if trimmed_docs and object_storage.chat_files_enabled():
+            for d in trimmed_docs:
+                if isinstance(d, dict) and d.get("body_key") and d.get("content_type") == "file":
+                    object_storage.delete_chat_file_body(user_id, str(d.get("id") or ""))
     except Exception as e:
         log.error("[db] chat_append(%s,%s) failed: %s", user_id, msg_id, e)
 
@@ -2063,11 +2113,22 @@ def chat_try_claim_reply(
 def chat_delete(user_id: str, msg_id: str) -> bool:
     try:
         with get_pool().connection() as conn:
-            cur = conn.execute(
-                "DELETE FROM chat_messages WHERE user_id = %s AND msg_id = %s",
+            row = conn.execute(
+                "DELETE FROM chat_messages WHERE user_id = %s AND msg_id = %s RETURNING doc",
                 (user_id, msg_id),
-            )
-        return cur.rowcount > 0
+            ).fetchone()
+        if row is None:
+            return False
+        # Drop the offloaded R2 body if this was a file message.
+        doc = row[0]
+        if (
+            object_storage.chat_files_enabled()
+            and isinstance(doc, dict)
+            and doc.get("body_key")
+            and doc.get("content_type") == "file"
+        ):
+            object_storage.delete_chat_file_body(user_id, str(doc.get("id") or msg_id))
+        return True
     except Exception as e:
         log.error("[db] chat_delete(%s,%s) failed: %s", user_id, msg_id, e)
         return False
@@ -2082,6 +2143,10 @@ def chat_clear(user_id: str) -> int | None:
                 "DELETE FROM chat_messages WHERE user_id = %s",
                 (user_id,),
             )
+        # Prefix-delete every offloaded chat-file body for this user (cheap no-op
+        # when R2 is unconfigured or the user never sent a file).
+        if object_storage.chat_files_enabled():
+            object_storage.delete_user_chat_files(user_id)
         return cur.rowcount
     except Exception as e:
         log.error("[db] chat_clear(%s) failed: %s", user_id, e)
@@ -2605,3 +2670,10 @@ def delete_user_frames(user_id: str) -> None:
     使 DB 删除保持原子、R2 失败非致命。"""
     if object_storage.enabled():
         object_storage.delete_user_frames(user_id)
+
+
+def delete_user_chat_files(user_id: str) -> None:
+    """Best-effort R2 chat-file body cleanup (no DB rows — the chat_messages
+    CASCADE already dropped the pointer rows). Mirrors delete_user_frames."""
+    if object_storage.chat_files_enabled():
+        object_storage.delete_user_chat_files(user_id)
