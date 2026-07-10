@@ -1342,6 +1342,89 @@ def test_prepare_hermes_cli_first_turn_removes_continue(monkeypatch):
     assert "--resume" not in cmd
 
 
+def _setup_hermes_session_cli(monkeypatch, tmp_path, *, session_id: str, session_doc: str | None):
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_hermes", "user_pk": None, "enclave_pk": None})
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "feedling_{user_id}.json"))
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        'hermes chat -Q --source tool --max-turns 60 -q "{message}"',
+    )
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    hermes_home = tmp_path / "hermes_home"
+    sessions = hermes_home / "sessions"
+    sessions.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    if session_doc is not None:
+        (sessions / f"session_{session_id}.json").write_text(session_doc, encoding="utf-8")
+
+    class _R:
+        returncode = 0
+        stdout = f"在。\nsession_id: {session_id}\n"
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+
+def test_call_agent_cli_hermes_reads_native_reasoning_from_session_json(monkeypatch, tmp_path):
+    session_doc = json.dumps({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "older", "reasoning": "older reasoning"},
+            {
+                "role": "assistant",
+                "content": "在。",
+                "reasoning": "**Checking token validity**\nI'm checking the current session before replying.",
+                "codex_reasoning_items": [{"type": "reasoning", "encrypted_content": "gAAAA"}],
+            },
+        ],
+    })
+    _setup_hermes_session_cli(monkeypatch, tmp_path, session_id="sess_reasoning", session_doc=session_doc)
+
+    raw = crc.call_agent_cli("hi")
+    turn = crc._agent_turn_from_raw(raw)
+
+    assert turn.messages == ["在。"]
+    assert "current session before replying" in turn.thinking_summary
+    assert "older reasoning" not in turn.thinking_summary
+    assert turn.thinking_kind == "provider_reasoning"
+    assert turn.thinking_source == "hermes_session_json"
+    assert turn.thinking_native is True
+
+
+@pytest.mark.parametrize("session_doc", [
+    json.dumps({"messages": [{"role": "assistant", "content": "在。", "reasoning": None}]}),
+    None,
+    "{not valid json",
+])
+def test_call_agent_cli_hermes_skips_missing_bad_or_null_reasoning(monkeypatch, tmp_path, session_doc):
+    _setup_hermes_session_cli(monkeypatch, tmp_path, session_id="sess_skip", session_doc=session_doc)
+
+    raw = crc.call_agent_cli("hi")
+    turn = crc._agent_turn_from_raw(raw)
+
+    assert turn.messages == ["在。"]
+    assert turn.thinking_summary == ""
+
+
+def test_hermes_session_reasoning_skips_oversized_file(monkeypatch, tmp_path):
+    session_id = "sess_big"
+    hermes_home = tmp_path / "hermes_home"
+    sessions = hermes_home / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / f"session_{session_id}.json").write_text(
+        json.dumps({"messages": [{"role": "assistant", "reasoning": "too large"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(crc, "HERMES_SESSION_REASONING_MAX_BYTES", 8)
+
+    assert crc._hermes_session_reasoning(session_id) == ""
+
+
 def test_prepare_claude_cli_first_turn_forces_print_json_and_strips_continue(monkeypatch):
     monkeypatch.setattr(
         crc,

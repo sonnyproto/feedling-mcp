@@ -297,6 +297,7 @@ AGENT_SESSION_FILE_TEMPLATE = os.environ.get(
 AGENT_SESSION_MAX_TURNS = int(os.environ.get("AGENT_SESSION_MAX_TURNS", "40"))
 AGENT_SESSION_MAX_BYTES = int(os.environ.get("AGENT_SESSION_MAX_BYTES", "250000"))
 AGENT_SESSION_ROTATE_PREFIX = os.environ.get("AGENT_SESSION_ROTATE_PREFIX", "feedling-io")
+HERMES_SESSION_REASONING_MAX_BYTES = int(os.environ.get("HERMES_SESSION_REASONING_MAX_BYTES", "2000000"))
 IMAGE_TEMP_DIR = Path(os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_images"))
 SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "on_mention").strip().lower()
 SCREEN_CONTEXT_MAX_AGE_SEC = int(os.environ.get("SCREEN_CONTEXT_MAX_AGE_SEC", "300"))
@@ -2452,13 +2453,22 @@ def _codex_reply_from_stream(raw: str) -> str:
     return _codex_turn_from_stream(raw)[0]
 
 
-def _codex_attach_reasoning(reply: str, reasoning: str) -> str:
-    """Fold native codex reasoning events into provider_reasoning metadata.
+def _attach_provider_reasoning(
+    reply: str,
+    reasoning: str,
+    *,
+    source: str,
+    kind: str = "provider_reasoning",
+    native: bool = True,
+) -> str:
+    """Fold native provider reasoning into the structured thinking channel.
 
     The reply's own JSON shape is preserved when present (a codex
     ``agent_message`` is often an ``{"actions":[...]}`` / ``{"messages":[...]}``
     object), so this never double-wraps actions into a bubble.
     """
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        return reply
     parsed: Any = None
     try:
         parsed = json.loads(reply)
@@ -2471,10 +2481,21 @@ def _codex_attach_reasoning(reply: str, reasoning: str) -> str:
     else:
         payload = {"messages": [reply]}
     payload.setdefault("provider_reasoning", reasoning)
-    payload.setdefault("reasoning_kind", "provider_reasoning_summary")
-    payload.setdefault("reasoning_source", "codex_reasoning")
-    payload.setdefault("reasoning_native", True)
+    payload.setdefault("reasoning_kind", kind)
+    payload.setdefault("reasoning_source", source)
+    payload.setdefault("reasoning_native", native)
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _codex_attach_reasoning(reply: str, reasoning: str) -> str:
+    """Fold native codex reasoning events into provider_reasoning metadata."""
+    return _attach_provider_reasoning(
+        reply,
+        reasoning,
+        source="codex_reasoning",
+        kind="provider_reasoning_summary",
+        native=True,
+    )
 
 
 def _extract_text_from_cli_output(raw: str) -> str:
@@ -2871,6 +2892,54 @@ def _session_id_from_obj(obj: Any) -> str:
             sid = _session_id_from_obj(item)
             if sid:
                 return sid
+    return ""
+
+
+def _hermes_session_json_path(session_id: str) -> Path | None:
+    sid = (session_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{1,200}", sid):
+        return None
+    home = os.environ.get("HERMES_HOME", "").strip()
+    if not home:
+        return None
+    return Path(home) / "sessions" / f"session_{sid}.json"
+
+
+def _hermes_session_reasoning(session_id: str) -> str:
+    """Read native Hermes reasoning from the resident-owned session JSON.
+
+    Hermes `chat -Q` prints only the final answer, but hermes-agent v0.8.0 writes
+    assistant `reasoning` into `$HERMES_HOME/sessions/session_<id>.json`. This is
+    best-effort and intentionally silent: missing files, bad JSON, oversized
+    files, absent fields, or `reasoning: null` must never affect the reply path.
+    """
+    path = _hermes_session_json_path(session_id)
+    if path is None:
+        return ""
+    try:
+        if not path.is_file():
+            return ""
+        size = path.stat().st_size
+        if size < 0 or size > HERMES_SESSION_REASONING_MAX_BYTES:
+            return ""
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or message.get("type") or "").strip().lower()
+        if role and role not in {"assistant", "agent", "model", "openclaw"}:
+            continue
+        if not role and "reasoning" not in message:
+            continue
+        reasoning = message.get("reasoning")
+        return reasoning.strip() if isinstance(reasoning, str) and reasoning.strip() else ""
     return ""
 
 
@@ -3485,6 +3554,19 @@ def call_agent_cli(
         text = _extract_text_from_cli_output(raw)
         if text.strip():
             return text
+    hermes_reasoning = ""
+    if _is_hermes_chat_cmd(cmd) and observed_sid:
+        hermes_reasoning = _hermes_session_reasoning(observed_sid)
+    if hermes_reasoning:
+        text = _extract_text_from_cli_output(raw)
+        if text.strip():
+            return _attach_provider_reasoning(
+                text,
+                hermes_reasoning,
+                source="hermes_session_json",
+                kind="provider_reasoning",
+                native=True,
+            )
     turn = _agent_turn_from_raw(raw)
     if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
         return raw
