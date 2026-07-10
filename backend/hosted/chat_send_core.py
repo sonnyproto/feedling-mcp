@@ -49,8 +49,22 @@ def model_api_chat_send_core(
         return {"error": "invalid_image", "detail": image_err}, 400
     image_b64 = base64.b64encode(image_bytes).decode("ascii") if image_bytes else ""
     has_image = image_bytes is not None
+    file_parse, file_err = hosted_turn._model_api_file_payload(payload)
+    if file_err:
+        return file_err  # (body, status) already shaped
+    # An image sent through the file picker re-pipes into the image path so it
+    # gets vision — reuse the exact image envelope/append below.
+    if file_parse is not None and file_parse["kind"] == "image":
+        image_bytes = file_parse["bytes"]
+        image_mime = file_parse["mime"]
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        has_image = True
+        file_parse = None
+    has_file = file_parse is not None
     message = str(payload.get("message") or payload.get("content") or "").strip()
-    message_for_context = message or ("User sent an image." if has_image else "")
+    message_for_context = message or (
+        "User sent an image." if has_image else ("User sent a file." if has_file else "")
+    )
     context_refs = hosted_context._context_refs_from_payload(payload)
     if not message_for_context:
         return {"error": "message required"}, 400
@@ -69,7 +83,12 @@ def model_api_chat_send_core(
         return err, 400
     hosted_config_store._ensure_model_api_runtime_profile(store, hosted_config_store._load_model_api_config(store), touch=True)
 
-    user_plaintext = image_bytes if image_bytes is not None else message.encode("utf-8")
+    if has_image:
+        user_plaintext = image_bytes
+    elif has_file:
+        user_plaintext = file_parse["bytes"]
+    else:
+        user_plaintext = message.encode("utf-8")
     user_env, env_err = core_envelope._build_shared_envelope_for_store(store, user_plaintext)
     if user_env is None:
         return {"error": "user_message_envelope_failed", "detail": env_err}, 409
@@ -114,6 +133,17 @@ def model_api_chat_send_core(
             extra.update(chat_service._chat_caption_extra_from_envelope(caption_env))
         else:
             print(f"[model_api:{store.user_id}] caption_envelope_failed detail={caption_err}")
+    if has_file:
+        extra["file_name"] = file_parse["name"]
+        extra["file_mime"] = file_parse["mime"]
+        if message:
+            cap_env, cap_err = core_envelope._build_shared_envelope_for_store(
+                store, message.encode("utf-8")
+            )
+            if cap_env:
+                extra.update(chat_service._chat_caption_extra_from_envelope(cap_env))
+            else:
+                print(f"[model_api:{store.user_id}] file caption_envelope_failed detail={cap_err}")
     # Carry user-selected memory references (Garden「talk in chat」) onto the
     # turn so the enclave can expand them into the agent's context. Only ids are
     # stored (plaintext, non-sensitive); the enclave decrypts the memory body
@@ -130,7 +160,7 @@ def model_api_chat_send_core(
         "user",
         "model_api",
         user_env,
-        content_type="image" if has_image else "text",
+        content_type="image" if has_image else ("file" if has_file else "text"),
         extra=extra or None,
     )
     store.notify_chat_waiters()
@@ -140,7 +170,7 @@ def model_api_chat_send_core(
     debug_trace.trace_event(
         store, subsystem="route", type="route.decided", actor="host_agent_runtime",
         turn_id=_turn_id, summary="agent_runtime",
-        detail={"mode": "agent_runtime", "has_image": bool(has_image)},
+        detail={"mode": "agent_runtime", "has_image": bool(has_image), "has_file": bool(has_file)},
     )
     body, status = agent_runtime_cutover.handle_send(store, user_row, driver)
     return body, status

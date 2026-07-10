@@ -356,6 +356,74 @@ def test_non_json_content_type_dropped_parity(env):
     assert f_body == a_body == {"error": "message required"}
 
 
+# --------------------------------------------------------------------------- #
+# File turns (chat file upload) — file envelope + image-repipe + rejection
+# --------------------------------------------------------------------------- #
+
+def test_send_file_stores_file_turn(env):
+    monkeypatch = env
+    uid, api_key = _register()
+    _setup_openrouter(api_key, monkeypatch)
+    monkeypatch.setattr(agent_runtime_cutover, "wait_for_reply", lambda *a, **k: None)
+
+    body = {
+        "content_type": "file",
+        "file_name": "notes.md",
+        "file_mime": "text/markdown",
+        "file_b64": _b64(b"# Title\nbody\n"),
+        "message": "read this",
+    }
+    status, resp_body = _asgi_post("/v1/model_api/chat/send", body, {"X-API-Key": api_key})
+    assert status == 202, resp_body
+
+    store = core_store._stores.get(uid)
+    user_rows = [m for m in store.chat_messages if m.get("role") == "user"]
+    last = user_rows[-1]
+    assert last["content_type"] == "file"
+    assert last["file_name"] == "notes.md"
+    assert last["file_mime"] == "text/markdown"
+
+
+def test_send_image_file_repipes_as_image(env):
+    monkeypatch = env
+    uid, api_key = _register()
+    _setup_openrouter(api_key, monkeypatch)
+    monkeypatch.setattr(agent_runtime_cutover, "wait_for_reply", lambda *a, **k: None)
+
+    body = {
+        "content_type": "file",
+        "file_name": "pic.png",
+        "file_mime": "image/png",
+        "file_b64": _b64(b"\x89PNG\r\n\x1a\n"),
+    }
+    status, resp_body = _asgi_post("/v1/model_api/chat/send", body, {"X-API-Key": api_key})
+    assert status == 202, resp_body
+
+    store = core_store._stores.get(uid)
+    user_rows = [m for m in store.chat_messages if m.get("role") == "user"]
+    last = user_rows[-1]
+    assert last["content_type"] == "image"
+
+
+def test_send_unsupported_file_400(env):
+    monkeypatch = env
+    uid, api_key = _register()
+    _setup_openrouter(api_key, monkeypatch)
+    monkeypatch.setattr(agent_runtime_cutover, "wait_for_reply", lambda *a, **k: None)
+
+    before = _user_msg_count(uid)
+    body = {
+        "content_type": "file",
+        "file_name": "x.bin",
+        "file_mime": "",
+        "file_b64": _b64(b"\x00\x01\x02bin"),
+    }
+    status, resp_body = _asgi_post("/v1/model_api/chat/send", body, {"X-API-Key": api_key})
+    assert status == 400
+    assert resp_body["error"] == "unsupported_file_type"
+    assert _user_msg_count(uid) == before  # rejected before append → no orphan
+
+
 def test_bad_api_key_is_fixed_401(env):
     _register()
     status, body = _asgi_post("/v1/model_api/chat/send", {"message": "x"}, {"X-API-Key": "nope"})
