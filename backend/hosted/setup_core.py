@@ -60,6 +60,27 @@ def _normalize_reasoning_effort(value) -> str | None:
     raise ValueError("reasoning_effort must be off, low, medium, high, or a positive integer")
 
 
+def _normalize_thinking_fallback(value) -> bool | None:
+    """Per-user self-authored thinking fallback switch.
+
+    ``None`` means the field was absent/blank and should not be persisted; the
+    hosted consumer defaults this fallback off unless the user config explicitly
+    enables it.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    raw = str(value).strip().lower()
+    if not raw:
+        return None
+    if raw in {"1", "true", "yes", "y", "on", "enabled"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off", "disabled"}:
+        return False
+    raise ValueError("thinking_fallback must be true/false")
+
+
 def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tuple[dict, int]:
     provider = str(payload.get("provider") or "")
     model = str(payload.get("model") or "")
@@ -69,6 +90,10 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
         reasoning_effort = _normalize_reasoning_effort(payload.get("reasoning_effort"))
     except ValueError as e:
         return {"error": "invalid_reasoning_effort", "detail": str(e)}, 400
+    try:
+        thinking_fallback = _normalize_thinking_fallback(payload.get("thinking_fallback"))
+    except ValueError as e:
+        return {"error": "invalid_thinking_fallback", "detail": str(e)}, 400
     try:
         provider, model, base_url = provider_client.validate_config(provider, model, base_url)
     except provider_client.ProviderError as e:
@@ -156,6 +181,8 @@ def model_api_setup(store, payload: dict, *, caller_api_key: str | None) -> tupl
     }
     if reasoning_effort is not None:
         config_doc["reasoning_effort"] = reasoning_effort
+    if thinking_fallback is not None:
+        config_doc["thinking_fallback"] = thinking_fallback
     config = hosted_config_store._save_model_api_config(store, config_doc)
     hosted_config_store._ensure_model_api_runtime_profile(store, config, touch=True)
     accounts_onboarding._save_onboarding_route(store, "model_api")

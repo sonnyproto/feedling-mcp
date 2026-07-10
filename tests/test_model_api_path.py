@@ -306,6 +306,51 @@ def test_model_api_setup_persists_reasoning_effort_and_gateway_uses_budget(clien
     assert entry["litellm_params"]["extra_body"]["reasoning"] == {"max_tokens": 2048}
 
 
+def test_model_api_setup_persists_thinking_fallback_for_resident_consumer(client, monkeypatch):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(provider_client, "test_provider_key",
+                        lambda cfg: {"reply": "ok", "usage": {}})
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.6",
+            "api_key": "sk-or",
+            "thinking_fallback": True,
+        },
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+    assert setup.get_json()["config"]["thinking_fallback"] is True
+    stored = db.get_blob(user_id, "model_api")
+    assert stored["thinking_fallback"] is True
+
+    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(include_gateway=True)}
+    assert rows[user_id]["thinking_fallback"] is True
+
+
+def test_model_api_setup_rejects_invalid_thinking_fallback(client, monkeypatch):
+    _user_id, api_key = _register(client)
+
+    def provider_test_must_not_run(cfg):
+        raise AssertionError("invalid thinking_fallback should fail before provider probe")
+
+    monkeypatch.setattr(provider_client, "test_provider_key", provider_test_must_not_run)
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.6",
+            "api_key": "sk-or",
+            "thinking_fallback": "sometimes",
+        },
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 400
+    assert setup.get_json()["error"] == "invalid_thinking_fallback"
+
+
 def test_model_api_setup_reasoning_effort_off_and_default_disable_gateway_reasoning(client, monkeypatch):
     user_off, key_off = _register(client)
     user_default, key_default = _register(client)

@@ -33,6 +33,24 @@ def test_consumer_env_drives_resident_in_cli_mode_for_claude():
     assert env["PATH"] == "/bin" and env["FEEDLING_API_URL"] == "http://b:5001"  # base preserved
 
 
+def test_consumer_env_threads_self_authored_thinking_fallback_per_user():
+    disabled = spawners.consumer_env(
+        {"FEEDLING_SELF_AUTHORED_THINKING_FALLBACK": "1"},
+        {"api_key": "fk", "provider_key": "sk-ant"},
+        user_id="u_off",
+        home="/agent-data/users/u_off",
+    )
+    enabled = spawners.consumer_env(
+        {},
+        {"api_key": "fk", "provider_key": "sk-ant", "thinking_fallback": True},
+        user_id="u_on",
+        home="/agent-data/users/u_on",
+    )
+
+    assert disabled["FEEDLING_SELF_AUTHORED_THINKING_FALLBACK"] == "0"
+    assert enabled["FEEDLING_SELF_AUTHORED_THINKING_FALLBACK"] == "1"
+
+
 def test_consumer_env_sets_tz_china_default_when_user_timezone_unknown():
     # Hosted agent process tree must not inherit the CVM's UTC clock: an unknown
     # user tz falls back to the China default so CN users don't perceive time 8h

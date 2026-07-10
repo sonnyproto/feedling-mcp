@@ -422,9 +422,11 @@ def test_detail_payload_runtime_includes_reasoning_effort(client):
         "model": "anthropic/claude-sonnet-4.6",
         "test_status": "ok",
         "reasoning_effort": "medium",
+        "thinking_fallback": True,
     })
     user_entry = next(u for u in registry._users if u["user_id"] == user_id)
 
     row = data_track._build_data_track_user(user_entry, include_detail=True)
 
     assert row["runtime"]["reasoning_effort"] == "medium"
+    assert row["runtime"]["thinking_fallback"] is True

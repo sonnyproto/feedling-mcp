@@ -340,6 +340,14 @@ def _claude_cli_should_stream_thinking(entry: dict) -> bool:
     )
 
 
+def _entry_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
 def agent_home_files(
     home: str,
     *,
@@ -553,6 +561,9 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     env.setdefault("AGENT_SESSION_MAX_TURNS", _HOST_SESSION_MAX_TURNS)
     env["IMAGE_TEMP_DIR"] = f"{home}/images"
     env["CONSUMER_ID"] = f"agent-runner:{user_id}"
+    env["FEEDLING_SELF_AUTHORED_THINKING_FALLBACK"] = (
+        "1" if _entry_bool(entry.get("thinking_fallback")) else "0"
+    )
     # Ambient timezone for the hosted agent process tree (this consumer + the CLI
     # it spawns). Without it the process inherits the CVM's UTC clock, so the CLI
     # agent's OWN sense of "today / now" (e.g. a date line the runtime injects) is

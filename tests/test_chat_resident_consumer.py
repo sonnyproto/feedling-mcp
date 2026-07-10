@@ -1029,6 +1029,36 @@ Tell me what you want to work on next."""
     assert cleaned == "Hello Seven — I see your message now.\nTell me what you want to work on next."
 
 
+def test_post_reply_strips_self_authored_protocol_before_http_post(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"id": "reply_1"}
+
+        def raise_for_status(self):
+            pass
+
+    def _fake_post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return _Resp()
+
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", False)
+    monkeypatch.setattr(crc.httpx, "post", _fake_post)
+    raw = (
+        f"{crc._SELF_AUTHORED_THINKING_OPEN}\n先想。\n"
+        f"{crc._SELF_AUTHORED_THINKING_CLOSE}\n{crc._SELF_AUTHORED_REPLY_OPEN}\n"
+        f"只发正文。\n{crc._SELF_AUTHORED_REPLY_CLOSE}"
+    )
+
+    assert crc.post_reply(raw) == {"id": "reply_1"}
+    assert captured["json"]["content"] == "只发正文。"
+    assert captured["json"]["alert_body"] == "只发正文。"
+    _assert_no_self_authored_protocol(captured["json"]["content"])
+
+
 def test_sanitize_reply_text_drops_unlabeled_english_meta_before_cjk_answer():
     raw = """specific tool is required for this factual question, so I can rely on my memory
 or general knowledge up to 2024. I remember Philip Daian as an Ethereum researcher
@@ -1102,6 +1132,135 @@ def test_agent_turn_splits_reasoning_and_thought_tags_from_cli_text():
     assert turn.thinking_kind == "provider_reasoning_summary"
     assert turn.thinking_source == "tagged_content"
     assert turn.thinking_native is False
+
+
+def _assert_no_self_authored_protocol(text: str):
+    upper = str(text or "").upper()
+    assert "FEEDLING_THINKING" not in upper
+    assert "FEEDLING_REPLY" not in upper
+
+
+def test_agent_turn_splits_self_authored_thinking_protocol():
+    raw = f"""{crc._SELF_AUTHORED_THINKING_OPEN}
+比较了用户最新问题和最近上下文。
+{crc._SELF_AUTHORED_THINKING_CLOSE}
+{crc._SELF_AUTHORED_REPLY_OPEN}
+这是最终回复。
+{crc._SELF_AUTHORED_REPLY_CLOSE}"""
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["这是最终回复。"]
+    assert turn.thinking_summary == "比较了用户最新问题和最近上下文。"
+    assert turn.thinking_kind == "provider_reasoning_summary"
+    assert turn.thinking_source == "self_authored_v2"
+    assert turn.thinking_native is False
+    _assert_no_self_authored_protocol(turn.messages[0])
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected_reply", "expected_thinking"),
+    [
+        (
+            "[FEEDLING_THINKING_V2]\n先判断用户意图。\n[/FEEDLING_THINKING_V2]\n"
+            "[FEEDLING_REPLY_V2]\n变体 marker 也能解析。\n[/FEEDLING_REPLY_V2]",
+            "变体 marker 也能解析。",
+            "先判断用户意图。",
+        ),
+        (
+            f"{crc._SELF_AUTHORED_THINKING_OPEN}\n先整理上下文。\n"
+            f"{crc._SELF_AUTHORED_THINKING_CLOSE}\n{crc._SELF_AUTHORED_REPLY_OPEN}\n"
+            "缺 reply close 也保留正文。",
+            "缺 reply close 也保留正文。",
+            "先整理上下文。",
+        ),
+        (
+            f"{crc._SELF_AUTHORED_THINKING_OPEN}\n半截 thinking close。\n"
+            f"{crc._SELF_AUTHORED_REPLY_OPEN}\n靠 reply marker 恢复正文。",
+            "靠 reply marker 恢复正文。",
+            "半截 thinking close。",
+        ),
+        (
+            f"{crc._SELF_AUTHORED_THINKING_OPEN}\n先想。\n"
+            f"{crc._SELF_AUTHORED_REPLY_OPEN}\n嵌套假正文。\n"
+            f"{crc._SELF_AUTHORED_THINKING_CLOSE}\n{crc._SELF_AUTHORED_REPLY_OPEN}\n"
+            f"真正正文。\n{crc._SELF_AUTHORED_REPLY_CLOSE}",
+            "真正正文。",
+            "先想。\n嵌套假正文。",
+        ),
+        (
+            f"可见前缀。\n{crc._SELF_AUTHORED_THINKING_OPEN}\n"
+            "没有 close 也没有 reply，后半段必须丢。",
+            "可见前缀。",
+            "",
+        ),
+        (
+            "<<FEEDLING_THINKING_V2\n半截 marker。\n<<FEEDLING_REPLY_V2\n最终正文。",
+            "最终正文。",
+            "半截 marker。",
+        ),
+        (
+            "FEEDLING_THINKING_V2\n裸 marker thinking。\n/FEEDLING_THINKING_V2\n"
+            "FEEDLING_REPLY_V2\n裸 marker 正文。\n/FEEDLING_REPLY_V2",
+            "裸 marker 正文。",
+            "裸 marker thinking。",
+        ),
+    ],
+)
+def test_agent_turn_self_authored_protocol_malformed_inputs_do_not_leak(
+    raw, expected_reply, expected_thinking
+):
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == [expected_reply]
+    if expected_thinking:
+        assert turn.thinking_summary == expected_thinking
+        assert turn.thinking_source == "self_authored_v2"
+        assert turn.thinking_native is False
+    else:
+        assert turn.thinking_summary == ""
+    _assert_no_self_authored_protocol(turn.messages[0])
+
+
+def test_agent_turn_native_reasoning_wins_over_self_authored_protocol():
+    raw = {
+        "reply": f"{crc._SELF_AUTHORED_THINKING_OPEN}\n自产摘要。\n"
+        f"{crc._SELF_AUTHORED_THINKING_CLOSE}\n{crc._SELF_AUTHORED_REPLY_OPEN}\n"
+        f"最终回复。\n{crc._SELF_AUTHORED_REPLY_CLOSE}",
+        "reasoning_content": "原生 reasoning 摘要。",
+        "reasoning_source": "openrouter",
+    }
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["最终回复。"]
+    assert turn.thinking_summary == "原生 reasoning 摘要。"
+    assert turn.thinking_source == "openrouter"
+    assert turn.thinking_native is True
+    _assert_no_self_authored_protocol(turn.messages[0])
+
+
+def test_self_authored_thinking_prompt_is_default_off_and_skips_raw_text(monkeypatch):
+    captured = {}
+
+    def _fake_http(message, images=None, raw_text=False):
+        captured["message"] = message
+        return "ok"
+
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "call_agent_http", _fake_http)
+
+    monkeypatch.setattr(crc, "SELF_AUTHORED_THINKING_FALLBACK", False)
+    assert crc.call_agent("hi")["messages"] == ["ok"]
+    assert "FEEDLING_THINKING" not in captured["message"]
+
+    monkeypatch.setattr(crc, "SELF_AUTHORED_THINKING_FALLBACK", True)
+    crc.call_agent("hi")
+    assert "FEEDLING_THINKING_V2" in captured["message"]
+
+    captured.clear()
+    assert crc.call_agent("hi", raw_text=True) == "ok"
+    assert captured["message"] == "hi"
 
 
 def test_extract_cli_output_prefers_structured_json_reply():
