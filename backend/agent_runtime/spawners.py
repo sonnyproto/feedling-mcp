@@ -367,14 +367,6 @@ def _claude_cli_should_stream_thinking(entry: dict) -> bool:
     )
 
 
-def _entry_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-    return bool(value)
-
-
 def agent_home_files(
     home: str,
     *,
