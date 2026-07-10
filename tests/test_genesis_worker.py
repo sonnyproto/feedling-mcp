@@ -69,16 +69,20 @@ def _install_success_harness(monkeypatch, *, source_kind: str, chunk_texts: list
     )
     monkeypatch.setattr(worker.db, "genesis_missing_chunk_seqs", lambda *_args: [])
     monkeypatch.setattr(worker.db, "genesis_list_chunks", lambda *_args: chunks)
+    # Post model-api-multi-profile migration, _runtime_for_user reads the active
+    # route (db.model_api_active_route), not the legacy user_blobs(kind='model_api')
+    # snapshot — get_blob("model_api") is no longer consulted at all.
     monkeypatch.setattr(
         worker.db,
-        "get_blob",
-        lambda _user_id, kind: {
+        "model_api_active_route",
+        lambda _user_id: {
             "provider": "openai",
             "model": "gpt-test",
             "base_url": "https://api.openai.com/v1",
             "test_status": "ok",
-        } if kind == "model_api" else blobs.get(kind),
+        },
     )
+    monkeypatch.setattr(worker.db, "get_blob", lambda _user_id, kind: blobs.get(kind))
     monkeypatch.setattr(worker.httpx, "get", lambda *_args, **_kwargs: _Resp({"api_key_envelope": {"id": "provider-key"}}))
 
     def fake_post(url, *, headers=None, json=None, **_kwargs):
@@ -165,16 +169,18 @@ def test_tick_claims_decrypts_all_chunks_and_posts_distilled_output(monkeypatch)
     )
     monkeypatch.setattr(worker.db, "genesis_missing_chunk_seqs", lambda *_args: [])
     monkeypatch.setattr(worker.db, "genesis_list_chunks", lambda *_args: [_chunk(0), _chunk(1)])
+    # See _install_success_harness: _runtime_for_user reads the active route now.
     monkeypatch.setattr(
         worker.db,
-        "get_blob",
-        lambda _user_id, kind: {
+        "model_api_active_route",
+        lambda _user_id: {
             "provider": "openai",
             "model": "gpt-test",
             "base_url": "https://api.openai.com/v1",
             "test_status": "ok",
-        } if kind == "model_api" else None,
+        },
     )
+    monkeypatch.setattr(worker.db, "get_blob", lambda _user_id, kind: None)
     monkeypatch.setattr(
         worker.httpx,
         "get",
@@ -960,3 +966,59 @@ def test_retry_empty_still_retries_empty_result(monkeypatch):
         max_tokens=100, idempotency_key="k", is_empty=worker._combined_map_empty, max_attempts=3)
     assert out["fact_candidates"][0]["summary"] == "x"
     assert llm.calls == 2
+
+
+# --- Issue 1: _runtime_for_user must read the active route, not the retired
+# user_blobs(kind='model_api') snapshot. POST /v1/model_api/setup stopped
+# writing that blob after the model-api-multi-profile migration (alembic 0014),
+# so every post-migration user hit model_api_not_configured here until fixed.
+# These use the real Postgres-backed db module (not worker.db monkeypatches)
+# to exercise the actual credentials/routes tables end to end. ---
+
+import uuid as _uuid  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).parent))
+import db  # noqa: E402
+from conftest import seed_user, configure_model_api_route  # noqa: E402
+
+
+def _genesis_uid() -> str:
+    return f"usr_{_uuid.uuid4().hex[:16]}"
+
+
+def test_runtime_for_user_uses_active_route_no_blob(backend_env):
+    uid = _genesis_uid()
+    seed_user(uid)
+    # Sanity: no legacy blob at all — proves the fix doesn't fall back to it.
+    assert db.get_blob(uid, "model_api") is None
+
+    configure_model_api_route(
+        uid, provider="openai", model="gpt-test",
+        base_url="https://api.openai.com/v1", test_status="ok", activate=True)
+
+    cfg = worker._runtime_for_user(uid, "sk-plain-key")
+    assert isinstance(cfg, provider_client.ProviderConfig)
+    assert cfg.provider == "openai"
+    assert cfg.model == "gpt-test"
+    assert cfg.base_url == "https://api.openai.com/v1"
+    assert cfg.api_key == "sk-plain-key"
+
+
+def test_runtime_for_user_rejects_untested_active_route(backend_env):
+    uid = _genesis_uid()
+    seed_user(uid)
+    configure_model_api_route(
+        uid, provider="openai", model="gpt-test", test_status="failed", activate=True)
+
+    with pytest.raises(worker.GenesisWorkerError) as exc:
+        worker._runtime_for_user(uid, "sk-plain-key")
+    assert str(exc.value) == "model_api_not_tested:failed"
+
+
+def test_runtime_for_user_raises_without_active_route(backend_env):
+    uid = _genesis_uid()
+    seed_user(uid)
+
+    with pytest.raises(worker.GenesisWorkerError) as exc:
+        worker._runtime_for_user(uid, "sk-plain-key")
+    assert str(exc.value) == "model_api_not_configured"

@@ -57,6 +57,7 @@ if str(_BACKEND_DIR) not in sys.path:
 
 import db
 from core import runtime_token
+from core import wake_bus
 from core.store import get_store
 from agent_runtime import leases, litellm_gateway, spawners
 from notices import core as notices
@@ -290,6 +291,23 @@ class Supervisor:
                     spawn_ok = False
                     with self._lock:
                         self.kill_fn(child["pid"])
+                        # kill_fn is synchronous (ProcessSpawner.kill: terminate→
+                        # wait, escalate SIGKILL→wait; _signal_kill: poll-to-exit
+                        # then SIGKILL) — the old consumer is dead here. NOW it's
+                        # safe to release any in-flight reply claim it held: no
+                        # live holder remains to double-run the turn
+                        # (chat/service.py:66-70's double-provider-burn risk).
+                        # This lets the fresh consumer pick the message up on its
+                        # next poll instead of waiting out CHAT_POLL_CLAIM_TTL_SEC
+                        # (600s) for the lost-turn redelivery backstop. Best-effort:
+                        # chat_expire_reply_claims already swallow-and-logs; the
+                        # notify is wrapped so a broadcast hiccup can't abort the
+                        # respawn (its real job is kill→spawn→swap).
+                        try:
+                            if db.chat_expire_reply_claims(user_id):
+                                wake_bus.notify("chat", user_id)
+                        except Exception:  # noqa: BLE001
+                            log.exception("claim release/notify failed for %s", user_id)
                         try:
                             pid = self.spawn_fn(entry, user_id, home)
                         except Exception as e:  # noqa: BLE001

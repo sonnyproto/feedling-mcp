@@ -84,6 +84,12 @@ def _seed_all_per_user_tables(user_id: str) -> None:
             "VALUES (%s, 'wb1', '2026-07-03T00:00:00', '{}'::jsonb)",
             (user_id,),
         )
+    cid = db.model_api_credential_create(
+        user_id, provider="anthropic", base_url="", label="k",
+        api_key_envelope={"v": 1, "body_ct": "ct", "nonce": "n"},
+        api_key_hint="sk-x...000", supports_responses=False,
+    )
+    db.model_api_route_upsert(user_id, cid, "claude-sonnet-4-5", None)
 
 
 _PER_USER_TABLES = (
@@ -94,6 +100,8 @@ _PER_USER_TABLES = (
     "genesis_import_chunks",
     "genesis_import_outputs",
     "world_book_entries",
+    "model_api_credentials",
+    "model_api_routes",
 )
 
 
@@ -188,14 +196,17 @@ def test_reset_stops_hosted_agent(client):
     uid, api_key = _register(client)
 
     # 该用户配了一个能 fit 的 provider 且 test_status=ok → 会被托管发现
+    # (roster 数据源已从 user_blobs(kind='model_api') 改为
+    # model_api_routes JOIN model_api_credentials，见 Task 3)
+    cid = _db.model_api_credential_create(
+        uid, provider="anthropic", base_url="", label="k",
+        api_key_envelope={"v": 1, "body_ct": "ct", "nonce": "n"},
+        api_key_hint="sk-x...000", supports_responses=False,
+    )
+    rid = _db.model_api_route_upsert(uid, cid, "claude-x", None)
+    _db.model_api_route_mark_test(uid, rid, status="ok")
+    _db.model_api_route_activate(uid, rid)
     with _db.get_pool().connection() as conn:
-        conn.execute(
-            "INSERT INTO user_blobs (user_id, kind, doc) "
-            "VALUES (%s, 'model_api', %s) "
-            "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc",
-            (uid, _db.Jsonb({"provider": "anthropic", "model": "claude-x",
-                             "test_status": "ok"})),
-        )
         conn.execute(
             "INSERT INTO agent_runtime_instances (user_id, driver, status, runtime_home) "
             "VALUES (%s, 'claude', 'running', '/tmp/rt')",

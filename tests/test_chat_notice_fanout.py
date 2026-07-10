@@ -22,11 +22,11 @@ def _uid():
 
 def _seed_model_api(uid):
     seed_user(uid)
-    store = core_store.get_store(uid)
-    config_store._save_model_api_config(
-        store, {"provider": "anthropic", "model": "claude-3-5-sonnet-latest"})
-    config_store._ensure_model_api_runtime_profile(store)
-    return store
+    # record_runtime_error writes the active route row now, so seed one (was a
+    # config_store._save_model_api_config blob before the multi-profile migration).
+    from conftest import configure_model_api_route
+    configure_model_api_route(uid, provider="anthropic", model="claude-3-5-sonnet-latest")
+    return core_store.get_store(uid)
 
 
 def test_error_fans_out_to_notice():
