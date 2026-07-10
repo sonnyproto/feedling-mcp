@@ -1,0 +1,109 @@
+# 聊天文件上传（后端支持）设计 v1 — 2026-07-10
+
+对接 iOS PR feedling-mcp-ios#72（已 merge）：客户端已按
+`content_type=file` + `file_name` + `file_mime` + `file_byte_count` + `file_b64`
+发送文件消息，后端目前在 `chat_core` 被 `content_type must be 'text' or 'image'` 拒掉。
+本设计补齐后端这一半。
+
+## Scope
+
+- **只做"当轮可读"**：文件 = 一条 user turn，agent 当场读内容回复。
+  与 image 现有行为完全对齐（PR 72 契约注释同款："seal the bytes as one user turn"）。
+- 不做文件库 / 后续重新下载 / 文件内容进 capture 记忆管线。
+
+## 架构原则：完全复制 image 管线
+
+文件 bytes 原样过管道，**服务端永远不解析内容**（VPS 客户端加密路由因此天然兼容）；
+consumer 解密后按 agent 能力适配。不新建管线，只在 image 的每个环节旁边加 `file` 分支。
+
+Image 现有链路（file 逐段照抄）：
+
+```
+iOS payload → hosted/turn.py:_model_api_image_payload（校验）
+→ hosted/chat_send_core.py（bytes 封信封，mime 存明文 extra，caption 单独封信封）
+→ append_chat(content_type="image") → 唤醒 consumer
+→ enclave/routes/chat.py（ctype=="image" 分支吐 image_b64/image_mime，caption 解出填 content）
+→ tools/chat_resident_consumer.py（落盘 /tmp/feedling_chat_images/，按 agent 入口适配：
+   CLI=精确 Read 指令；OpenAI-compat HTTP=multimodal block；不支持=诚实降级话术）
+```
+
+## 类型策略（v1 最终版）
+
+判定以**扩展名 + 内容嗅探**为准（MIME 由 iOS 猜测、不可信，仅作参考）。
+
+| 组 | 判定 | 处理 |
+|---|---|---|
+| 图片 jpg/png/webp/**gif** | image/* mime 或扩展名 | **转入现有 image 管线**（`content_type=image`，享受视觉）；image mime 白名单加 `gif`（Claude 视觉原生支持 jpeg/png/gif/webp 四种） |
+| 图片 heic | — | 400 明确提示。**iOS 转码 jpeg 后再发**（照现有发图路径的转码套路，前端 follow-up 给 Liko）；任何模型都不直读 heic，后端转码要加 pillow-heif 依赖，不值 |
+| PDF | `.pdf` | 落盘原文件，Claude CLI Read 原生支持（分页读） |
+| Word | `.docx` | consumer 用 `zipfile`（标准库，零新依赖）抽 `word/document.xml` 纯文本 → 落 `.txt`；抽失败落原文件 + 诚实降级 |
+| Excel | `.xlsx` | consumer 用 `zipfile` 抽 `xl/sharedStrings.xml` + `xl/worksheets/sheet*.xml` → 拼 TSV 落 `.txt`；**截断保护**：只抽前 5 张表、每表前 2000 行，截断时文末注明"已截断，共 X 行" |
+| 纯文本（md/txt/csv/json/一切源码/配置） | **内容嗅探**：UTF-8 可解码 + 无 NUL 字节 | 落盘原文件名，agent Read 直读。不维护扩展名清单——一条规则覆盖全部源码，且天然挡住可执行/压缩包等二进制 |
+| 拒绝 | `.doc` `.xls`（OLE 老二进制）、嗅探不过的其他二进制 | 400 + 机器可读 detail（提示另存为 .docx/.xlsx）；iOS 已有 `chat.attachment.error` 弹窗兜话术 |
+
+现状备注：image 白名单目前是 jpeg/jpg/png/webp（`turn.py:1755`），但 iOS 发图路径在
+客户端统一转码 JPEG（≤400KB）再发，后端实际只见过 jpeg——heic 相册照片一直是 iOS 转的。
+
+## 大小上限
+
+后端 `MODEL_API_MAX_FILE_BYTES = 10_000_000`（10MB），超了 413。
+
+理由：iOS PR 72 放了 25MB，但 25MB → b64 后 ~33MB JSON body，还要封信封、进库、
+每次 enclave 解密史全量吐回（image 侧已有"图片史 payload 可达数 MB"的抱怨注释），
+25MB 会放大十倍。10MB 覆盖绝大多数文档。**iOS 侧 25MB 提示语要跟着改**（前端
+follow-up，不阻塞后端）。
+
+## 改动点清单
+
+| 文件 | 改动 |
+|---|---|
+| `backend/hosted/turn.py` | 新增 `_model_api_file_payload()`：类型判定（图片转 image / 白名单 / 嗅探）、b64 校验、10MB 上限、文件名清洗（照 consumer 现有 `[^A-Za-z0-9_.-]` 思路，防路径穿越）。image mime 白名单加 gif |
+| `backend/hosted/chat_send_core.py` | file 分支：bytes 封信封，`file_mime`/`file_name` 存明文 extra（拍板：文件名明文，同 image_mime 档，iOS 历史列表不解密也能显示气泡），`content_type="file"`；随附文字走现有 caption 信封机制；image/* 直接转 `content_type=image` |
+| `backend/chat/chat_core.py:305,395` | content_type 白名单加 `"file"`；**VPS 路由 append_chat 要把 payload 里的 `file_name`/`file_mime` 收进 extra**（现在该路径不传 extra，image 没此需求但 file 有） |
+| `backend/enclave/routes/chat.py` | `ctype=="file"` 分支：吐 `file_b64` + `file_mime` + `file_name`（照 image 分支，含 caption） |
+| `tools/chat_resident_consumer.py` | `_file_paths_for_msg()`：落盘 `/tmp/feedling_chat_files/`（**保留原扩展名**，Read 靠扩展名识别 PDF；顺手修 image 落盘 webp 被存成 `.jpg` 的扩展名瑕疵）；docx/xlsx 抽文本；CLI 给精确 Read 指令（照抄 image 那段防编造措辞）；无文字时 placeholder "User sent a file."；HTTP 入口见下节 |
+
+## VPS 兼容（硬约束）
+
+- **服务端看不到明文** → 一切内容解析（docx/xlsx 抽取、嗅探后的落盘决策）都在
+  consumer/agent 侧。服务端只做入口校验（cloud 路由收到的是明文 payload 才能校验；
+  VPS 路由信封不透明，只能校验 content_type 和 extra 元数据，类型拒绝靠 iOS 客户端
+  在加密前自行执行同一套白名单——前端 follow-up）。
+- consumer 是 host/VPS **同一份** `chat_resident_consumer.py`，改一处两边都有；
+  但 **VPS resident-runtime 的 consumer 是手动 pin commit 部署的，上线要 bump**。
+- enclave 解密史是 hosted 和 VPS resident 共用路径，`enclave/routes/chat.py` 改一次全覆盖。
+- agent 沙箱禁网（codex 路径）不影响本功能：文件已落本地盘，Read 是本地读。
+- 碰信封 → 按红线，上 test 后必须**真实部署 e2e**（md + pdf + docx + xlsx + 图片文件各发一个，agent 回复能引用内容），本地 fake-decrypt 只验流程。
+
+## 低智模型兼容（硬约束）
+
+- **OpenAI-compat HTTP 入口**（deepseek 等，无文件系统无工具）：
+  - 纯文本 / docx / xlsx 抽出的文本 → **直接内联进 prompt**，
+    设 `FILE_INLINE_MAX_CHARS`（默认 ~30k 字符）截断 + 文末注明，防小上下文模型爆窗。
+  - PDF 无法内联 → 诚实降级一行："此 connector 暂不支持读 PDF"（照视觉降级话术）。
+  - 图片文件走 image 管线原有逻辑（multimodal block / 视觉降级）。
+- **CLI 入口 + 弱模型**：指令必须死简单、确定性——这正是 docx/xlsx 选"consumer 抽好
+  文本落 .txt"而不是"agent 自己 Bash unzip 现场发挥"的原因（image 管线既定哲学：
+  consumer 适配 payload，agent 不即兴；且 HTTP 入口根本没有 Bash）。
+  Read 指令照抄 image 的防编造措辞：读这个精确路径 / 读不到就明说 / 不许假装读过。
+- 每轮单文件（iOS 本来就一次发一个），不给弱模型多文件组合任务。
+
+## 错误处理
+
+- 类型不在白名单 / 超 10MB / b64 无效 → 400/413 + 机器可读 detail，iOS 弹窗。
+- docx/xlsx 抽取失败 → 不报错（内容已收下），落原文件，agent 按降级话术明说读不了。
+- 信封/解密失败 → 走 image 现有 per-item error 路径，不动。
+
+## 测试
+
+- 单测照 `test_chat_resident_consumer_image.py` / `test_asgi_hosted_chat_send.py`
+  克隆 file 版：docx/xlsx 抽取（含截断）、嗅探（UTF-8 过 / NUL 拒）、白名单拒绝、
+  大小 413、文件名清洗、HTTP 内联截断、image/* 转管线。
+- flow trace：`route.decided` detail 加 `has_file`（对齐 `has_image`）。
+- 真实部署 e2e 见 VPS 节。
+
+## 前端 follow-ups（给 Liko，不阻塞后端）
+
+1. heic 在客户端转码 jpeg 后再发（照发图路径现成套路）。
+2. 25MB 上限提示语改 10MB。
+3. VPS 加密路由：加密前在客户端执行同一套类型白名单；payload 带 `file_name`/`file_mime` 明文字段。
