@@ -302,9 +302,21 @@ def write_message(store: UserStore, payload: dict) -> tuple[dict, int]:
     if envelope["visibility"] == "shared" and not envelope.get("K_enclave"):
         return {"error": "envelope with visibility=shared requires K_enclave"}, 400
     content_type = payload.get("content_type", "text")
-    if content_type not in ("text", "image"):
-        return {"error": "content_type must be 'text' or 'image'"}, 400
-    msg = store.append_chat("user", "chat", envelope, content_type=content_type)
+    if content_type not in ("text", "image", "file"):
+        return {"error": "content_type must be 'text', 'image', or 'file'"}, 400
+    file_extra: dict = {}
+    if content_type == "file":
+        fname = str(payload.get("file_name") or "").strip()
+        fmime = str(payload.get("file_mime") or "").strip()
+        if fname:
+            file_extra["file_name"] = fname[:120]
+        if fmime:
+            file_extra["file_mime"] = fmime[:120]
+    msg = store.append_chat(
+        "user", "chat", envelope,
+        content_type=content_type,
+        extra=file_extra or None,
+    )
     store.notify_chat_waiters()
     debug_trace.trace_event(
         store,
