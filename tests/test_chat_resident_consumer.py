@@ -146,7 +146,7 @@ def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monk
     msg = {"id": "user-msg-v2", "role": "user", "content": "天气怎么样？", "ts": 1112.0}
     captured = {}
 
-    def fake_call(message, images=None, image_paths=None, trace_id=""):
+    def fake_call(message, images=None, image_paths=None, trace_id="", lane="background"):
         captured["message"] = message
         return {"messages": ["外面下雨。"]}
 
@@ -177,7 +177,7 @@ def test_process_messages_prompt_does_not_request_custom_thinking_summary(monkey
     msg = {"id": "user-msg-thinking", "role": "user", "content": "刚才怎么没思考过程？", "ts": 1112.5}
     captured = {}
 
-    def fake_call(message, images=None, image_paths=None, trace_id=""):
+    def fake_call(message, images=None, image_paths=None, trace_id="", lane="background"):
         captured["message"] = message
         return {"messages": ["我查一下。"]}
 
@@ -1104,6 +1104,39 @@ def test_agent_turn_splits_reasoning_and_thought_tags_from_cli_text():
     assert turn.thinking_native is False
 
 
+def test_agent_turn_native_reasoning_wins_over_tagged_content():
+    raw = {
+        "reply": "<think>内联摘要。</think>\n最终回复。",
+        "reasoning_content": "原生 reasoning 摘要。",
+        "reasoning_source": "openrouter",
+    }
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["最终回复。"]
+    assert turn.thinking_summary == "原生 reasoning 摘要。"
+    assert turn.thinking_source == "openrouter"
+    assert turn.thinking_native is True
+
+
+def test_call_agent_passes_message_without_thinking_protocol(monkeypatch):
+    captured = {}
+
+    def _fake_http(message, images=None, raw_text=False):
+        captured["message"] = message
+        return "ok"
+
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "call_agent_http", _fake_http)
+
+    assert crc.call_agent("hi")["messages"] == ["ok"]
+    assert captured["message"] == "hi"
+
+    captured.clear()
+    assert crc.call_agent("hi", raw_text=True) == "ok"
+    assert captured["message"] == "hi"
+
+
 def test_extract_cli_output_prefers_structured_json_reply():
     raw = json.dumps(
         {
@@ -1342,6 +1375,89 @@ def test_prepare_hermes_cli_first_turn_removes_continue(monkeypatch):
     assert "--resume" not in cmd
 
 
+def _setup_hermes_session_cli(monkeypatch, tmp_path, *, session_id: str, session_doc: str | None):
+    crc._agent_session_id_cache.clear()
+    crc._agent_session_meta_cache.clear()
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_hermes", "user_pk": None, "enclave_pk": None})
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "feedling_{user_id}.json"))
+    monkeypatch.setattr(
+        crc,
+        "AGENT_CLI_CMD",
+        'hermes chat -Q --source tool --max-turns 60 -q "{message}"',
+    )
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    hermes_home = tmp_path / "hermes_home"
+    sessions = hermes_home / "sessions"
+    sessions.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    if session_doc is not None:
+        (sessions / f"session_{session_id}.json").write_text(session_doc, encoding="utf-8")
+
+    class _R:
+        returncode = 0
+        stdout = f"在。\nsession_id: {session_id}\n"
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+
+def test_call_agent_cli_hermes_reads_native_reasoning_from_session_json(monkeypatch, tmp_path):
+    session_doc = json.dumps({
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "older", "reasoning": "older reasoning"},
+            {
+                "role": "assistant",
+                "content": "在。",
+                "reasoning": "**Checking token validity**\nI'm checking the current session before replying.",
+                "codex_reasoning_items": [{"type": "reasoning", "encrypted_content": "gAAAA"}],
+            },
+        ],
+    })
+    _setup_hermes_session_cli(monkeypatch, tmp_path, session_id="sess_reasoning", session_doc=session_doc)
+
+    raw = crc.call_agent_cli("hi")
+    turn = crc._agent_turn_from_raw(raw)
+
+    assert turn.messages == ["在。"]
+    assert "current session before replying" in turn.thinking_summary
+    assert "older reasoning" not in turn.thinking_summary
+    assert turn.thinking_kind == "provider_reasoning"
+    assert turn.thinking_source == "hermes_session_json"
+    assert turn.thinking_native is True
+
+
+@pytest.mark.parametrize("session_doc", [
+    json.dumps({"messages": [{"role": "assistant", "content": "在。", "reasoning": None}]}),
+    None,
+    "{not valid json",
+])
+def test_call_agent_cli_hermes_skips_missing_bad_or_null_reasoning(monkeypatch, tmp_path, session_doc):
+    _setup_hermes_session_cli(monkeypatch, tmp_path, session_id="sess_skip", session_doc=session_doc)
+
+    raw = crc.call_agent_cli("hi")
+    turn = crc._agent_turn_from_raw(raw)
+
+    assert turn.messages == ["在。"]
+    assert turn.thinking_summary == ""
+
+
+def test_hermes_session_reasoning_skips_oversized_file(monkeypatch, tmp_path):
+    session_id = "sess_big"
+    hermes_home = tmp_path / "hermes_home"
+    sessions = hermes_home / "sessions"
+    sessions.mkdir(parents=True)
+    (sessions / f"session_{session_id}.json").write_text(
+        json.dumps({"messages": [{"role": "assistant", "reasoning": "too large"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(crc, "HERMES_SESSION_REASONING_MAX_BYTES", 8)
+
+    assert crc._hermes_session_reasoning(session_id) == ""
+
+
 def test_prepare_claude_cli_first_turn_forces_print_json_and_strips_continue(monkeypatch):
     monkeypatch.setattr(
         crc,
@@ -1533,7 +1649,7 @@ def test_cli_nonzero_exit_fails_even_with_stdout(monkeypatch):
         stderr = "bad command"
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError, match="cli agent exited 2"):
@@ -1550,7 +1666,7 @@ def test_cli_failure_surfaces_claude_json_error_from_stdout(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p {message}')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["claude", "-p", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["claude", "-p", message])
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError) as ei:
@@ -1572,7 +1688,7 @@ def test_cli_failure_surfaces_codex_stream_error_from_stdout(monkeypatch):
         stderr = "Reading additional input from stdin..."
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec --json {message}')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["codex", "exec", "--json", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["codex", "exec", "--json", message])
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError) as ei:
@@ -3510,6 +3626,158 @@ def test_agent_turn_extracts_claude_stream_json_thinking_blocks():
     assert turn.thinking_native is True
 
 
+def test_agent_turn_extracts_claude_stream_json_thinking_deltas_without_final_block():
+    raw = "\n".join([
+        json.dumps({
+            "type": "stream_event",
+            "event": {
+                "type": "message_start",
+                "message": {"model": "claude-sonnet-4-5-20250929"},
+            },
+        }),
+        json.dumps({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+            },
+        }),
+        json.dumps({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "First thought. "},
+            },
+        }),
+        json.dumps({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": "Second thought."},
+            },
+        }),
+        json.dumps({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "text_delta", "text": "最终答案。"},
+            },
+        }),
+        # Some Claude CLI/provider combinations expose final text but omit the
+        # final assistant thinking content block. The delta aggregator must still
+        # preserve the provider-native thinking disclosure.
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "claude-sonnet-4-5-20250929",
+                "content": [{"type": "text", "text": "最终答案。"}],
+            },
+        }),
+    ])
+
+    turn = crc._split_agent_turn(raw)
+
+    assert turn.messages == ["最终答案。"]
+    assert turn.thinking_summary == "First thought. Second thought."
+    assert turn.thinking_kind == "provider_reasoning"
+    assert turn.thinking_source == "anthropic_thinking"
+    assert turn.thinking_model == "claude-sonnet-4-5-20250929"
+    assert turn.thinking_native is True
+
+
+# ---------------------------------------------------------------------------
+# Claude tool turns emit a "let me check…" preamble text block BEFORE the
+# tool_use and the real answer LATER. The generic extractor collected BOTH as
+# separate bubbles; the foreground reply-exclusivity guard (chat_core: one reply
+# per user message) accepts only one, so the preamble consumed the slot and the
+# real answer 409'd — the user saw "let me check…" and nothing else (the deepwiki
+# symptom, live on the test CVM 2026-07-10). _claude_turn_from_stream takes ONLY
+# the terminal result-event text as the deliverable.
+# ---------------------------------------------------------------------------
+
+def test_claude_turn_from_stream_drops_pretool_preamble_keeps_final():
+    raw = "\n".join([
+        json.dumps({"type": "system", "subtype": "init", "session_id": "s1"}),
+        json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "让我用 deepwiki 查查~"}]}}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "mcp__deepwiki__ask_question", "input": {}}]}}),
+        json.dumps({"type": "user", "message": {"content": [
+            {"type": "tool_result", "content": "..."}]}}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "impl in ReactFiberHooks.js"}]}}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "找到啦~ 在 ReactFiberHooks.js"}]}}),
+        json.dumps({"type": "result", "subtype": "success",
+                    "result": "找到啦~ 在 ReactFiberHooks.js", "num_turns": 3}),
+    ])
+    reply, reasoning = crc._claude_turn_from_stream(raw)
+    assert reply == "找到啦~ 在 ReactFiberHooks.js"
+    assert "让我用 deepwiki" not in reply  # preamble must never survive
+    assert reasoning == "impl in ReactFiberHooks.js"
+
+
+def test_claude_turn_from_stream_reasoning_falls_back_to_thinking_deltas():
+    # --include-partial-messages combos that stream thinking as deltas and omit
+    # the complete thinking block still surface native reasoning.
+    raw = "\n".join([
+        json.dumps({"type": "stream_event", "event": {"type": "content_block_delta",
+                    "delta": {"type": "thinking_delta", "thinking": "First. "}}}),
+        json.dumps({"type": "stream_event", "event": {"type": "content_block_delta",
+                    "delta": {"type": "thinking_delta", "thinking": "Second."}}}),
+        json.dumps({"type": "result", "subtype": "success", "result": "答案。"}),
+    ])
+    reply, reasoning = crc._claude_turn_from_stream(raw)
+    assert reply == "答案。"
+    assert reasoning == "First. Second."
+
+
+def test_claude_turn_from_stream_empty_when_no_success_result():
+    # error / handshake-only → "" so call_agent_cli falls back, never leaks.
+    raw = json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "text", "text": "partial"}]}})
+    assert crc._claude_turn_from_stream(raw) == ("", "")
+
+
+def test_call_agent_cli_claude_tool_turn_delivers_only_final_answer(monkeypatch):
+    """End-to-end: a claude tool turn yields ONE bubble (the answer), the pre-tool
+    preamble is gone, and native thinking rides the disclosure — so the foreground
+    one-reply guard never 409s the real answer."""
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD",
+                        "claude -p --output-format stream-json --include-partial-messages {message}")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+
+    class _R:
+        returncode = 0
+        stdout = "\n".join([
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "让我用 deepwiki 查查~"}]}}),
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "mcp__deepwiki__ask_question", "input": {}}]}}),
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "thinking", "thinking": "impl in ReactFiberHooks.js"}]}}),
+            json.dumps({"type": "assistant", "message": {"content": [
+                {"type": "text", "text": "找到啦~ 在 ReactFiberHooks.js"}]}}),
+            json.dumps({"type": "result", "subtype": "success",
+                        "result": "找到啦~ 在 ReactFiberHooks.js"}),
+        ])
+        stderr = ""
+
+    monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _R())
+
+    raw = crc.call_agent_cli("查 useEffect")
+    turn = crc._agent_turn_from_raw(raw)
+    assert turn.messages == ["找到啦~ 在 ReactFiberHooks.js"]  # exactly one bubble, the answer
+    assert all("让我用 deepwiki" not in m for m in turn.messages)  # no preamble bubble
+    assert turn.thinking_summary  # native thinking preserved
+
+
 def test_agent_turn_extracts_provider_reasoning_metadata_from_nested_result():
     raw = json.dumps(
         {
@@ -3851,7 +4119,7 @@ def test_cli_tool_only_output_preserves_tool_calls(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     result = crc.call_agent_cli("hi")

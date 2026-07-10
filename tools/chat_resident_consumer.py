@@ -91,6 +91,7 @@ from collections import namedtuple
 from dataclasses import dataclass, field
 import hashlib
 import inspect
+import io
 import json
 import logging
 import os
@@ -103,6 +104,8 @@ import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as _ET
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -222,6 +225,14 @@ CHECKPOINT_FILE = Path(
         f"/tmp/feedling_chat_checkpoint_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
     )
 )
+# Materialized user-MCP config target. Scoped by the same api-key fingerprint as
+# the checkpoint so two accounts on one host never share a file. This single file
+# is BOTH the claude ``--mcp-config`` target AND the documented generic
+# ``user-mcp.json`` for VPS agents (io-onboarding skill).
+USER_MCP_FILE = os.environ.get(
+    "USER_MCP_FILE",
+    f"/tmp/feedling_user_mcp_{CHECKPOINT_API_KEY_FINGERPRINT}.json",
+)
 PROACTIVE_JOB_SOURCE = "agent_initiated_proactive"
 RESIDENT_CHAT_RUNTIME_V2_FLAG = "resident_chat_runtime_v2_enabled"
 PROACTIVE_POLL_ENABLED = _env_bool("PROACTIVE_POLL_ENABLED", True)
@@ -289,6 +300,7 @@ AGENT_SESSION_FILE_TEMPLATE = os.environ.get(
 AGENT_SESSION_MAX_TURNS = int(os.environ.get("AGENT_SESSION_MAX_TURNS", "40"))
 AGENT_SESSION_MAX_BYTES = int(os.environ.get("AGENT_SESSION_MAX_BYTES", "250000"))
 AGENT_SESSION_ROTATE_PREFIX = os.environ.get("AGENT_SESSION_ROTATE_PREFIX", "feedling-io")
+HERMES_SESSION_REASONING_MAX_BYTES = int(os.environ.get("HERMES_SESSION_REASONING_MAX_BYTES", "2000000"))
 IMAGE_TEMP_DIR = Path(os.environ.get("IMAGE_TEMP_DIR", "/tmp/feedling_chat_images"))
 SCREEN_CONTEXT_MODE = os.environ.get("SCREEN_CONTEXT_MODE", "on_mention").strip().lower()
 SCREEN_CONTEXT_MAX_AGE_SEC = int(os.environ.get("SCREEN_CONTEXT_MAX_AGE_SEC", "300"))
@@ -757,6 +769,11 @@ def _runtime_repo_files() -> set[str]:
     files.update(
         {
             "tools/io_cli.py",
+            # Imported lazily inside _materialize_user_mcp, so it may not yet be
+            # in sys.modules when a release-diff check runs; register it
+            # explicitly so a user_mcp materialization change still triggers a
+            # self-update on self-hosted residents.
+            "tools/user_mcp_materialize.py",
             "tools/chat_resident_requirements.txt",
             "backend/requirements.txt",
         }
@@ -974,6 +991,8 @@ log.info(
     "Starting resident consumer — mode=%s api_url=%s decrypt_sources=%s key=%s",
     AGENT_MODE, FEEDLING_API_URL, _decrypt_sources, _mask(FEEDLING_API_KEY),
 )
+if AGENT_CLI_CMD:
+    log.info("resident agent cli cmd=%s", AGENT_CLI_CMD)
 
 # ---------------------------------------------------------------------------
 # Checkpoint (persist last processed message timestamp)
@@ -1336,6 +1355,227 @@ def _image_file_paths_from_payloads(prefix: str, payloads: list[dict[str, str]])
         except Exception as e:
             log.warning("failed to write image temp file %s: %s", path, e)
     return paths
+
+
+_XLSX_MAX_SHEETS = 5
+_XLSX_MAX_ROWS = 2000
+FILE_TEMP_DIR = Path(os.environ.get("FILE_TEMP_DIR", "/tmp/feedling_chat_files"))
+
+
+def _strip_ns(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _extract_docx_text(data: bytes) -> str | None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            xml = z.read("word/document.xml")
+    except Exception as e:
+        log.warning("docx extract failed: %s", e)
+        return None
+    try:
+        root = _ET.fromstring(xml)
+    except Exception as e:
+        log.warning("docx xml parse failed: %s", e)
+        return None
+    paras = []
+    for p in root.iter():
+        if _strip_ns(p.tag) != "p":
+            continue
+        texts = [t.text or "" for t in p.iter() if _strip_ns(t.tag) == "t"]
+        line = "".join(texts).strip()
+        if line:
+            paras.append(line)
+    return "\n".join(paras)
+
+
+def _extract_xlsx_text(data: bytes) -> tuple[str, bool]:
+    truncated = False
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in z.namelist():
+                sroot = _ET.fromstring(z.read("xl/sharedStrings.xml"))
+                for si in sroot:
+                    if _strip_ns(si.tag) != "si":
+                        continue
+                    shared.append("".join(t.text or "" for t in si.iter()
+                                          if _strip_ns(t.tag) == "t"))
+            sheet_names = sorted(n for n in z.namelist()
+                                 if n.startswith("xl/worksheets/sheet") and n.endswith(".xml"))
+            if len(sheet_names) > _XLSX_MAX_SHEETS:
+                sheet_names = sheet_names[:_XLSX_MAX_SHEETS]
+                truncated = True
+            out_lines: list[str] = []
+            for sn in sheet_names:
+                root = _ET.fromstring(z.read(sn))
+                rows = [r for r in root.iter() if _strip_ns(r.tag) == "row"]
+                if len(rows) > _XLSX_MAX_ROWS:
+                    rows = rows[:_XLSX_MAX_ROWS]
+                    truncated = True
+                for r in rows:
+                    cells = []
+                    for c in r:
+                        if _strip_ns(c.tag) != "c":
+                            continue
+                        t = c.get("t")
+                        val = ""
+                        if t == "s":  # shared-string index
+                            v = c.find("{*}v")
+                            if v is not None and v.text and v.text.isdigit():
+                                idx = int(v.text)
+                                val = shared[idx] if 0 <= idx < len(shared) else ""
+                        elif t == "inlineStr":
+                            val = "".join(x.text or "" for x in c.iter()
+                                          if _strip_ns(x.tag) == "t")
+                        else:
+                            v = c.find("{*}v")
+                            val = (v.text or "") if v is not None else ""
+                        cells.append(val)
+                    out_lines.append("\t".join(cells))
+            return "\n".join(out_lines), truncated
+    except Exception as e:
+        log.warning("xlsx extract failed: %s", e)
+        return "", False
+
+
+def _friendly_file_type(name: str, mime: str) -> str:
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    return {
+        "pdf": "PDF 文档", "docx": "Word 文档", "xlsx": "Excel 表格",
+        "md": "Markdown 文件", "csv": "CSV 表格", "json": "JSON 文件",
+        "txt": "文本文件",
+    }.get(ext, "文件")
+
+
+FILE_INLINE_MAX_CHARS = int(os.environ.get("FILE_INLINE_MAX_CHARS", "30000"))
+
+
+@dataclass
+class FilePrep:
+    original_name: str
+    friendly_type: str
+    local_path: str | None          # landed bytes (CLI Read path) — text for docx/xlsx, original otherwise
+    inline_text: str | None         # extracted/sniffed text for HTTP inlining
+    extracted: bool                 # True if we converted (docx/xlsx)
+    truncated: bool
+    truncation_note: str
+    http_fallback_note: str | None  # set when there is nothing to inline (PDF)
+    cli_instruction: str
+    http_block: str
+
+
+def _decode_file_b64(value) -> bytes | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return base64.b64decode(value, validate=True)
+    except Exception as e:
+        log.warning("file_b64 decode failed: %s", e)
+        return None
+
+
+def _human_size(n: int) -> str:
+    return f"{n/1024:.0f} KB" if n < 1024 * 1024 else f"{n/1024/1024:.1f} MB"
+
+
+def _land_file(msg_key: str, name: str, data: bytes) -> str:
+    try:
+        FILE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else "bin"
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{msg_key}_{name}")[:120] or "file"
+        if not safe.lower().endswith(f".{ext}"):
+            safe = f"{safe}.{ext}"
+        path = FILE_TEMP_DIR / safe
+        path.write_bytes(data)
+    except Exception as e:
+        log.warning("failed to write file temp for %s: %s", name, e)
+        return ""
+    return str(path)
+
+
+def _prepare_file_for_agent(msg: dict) -> "FilePrep":
+    name = str(msg.get("file_name") or "file")
+    mime = str(msg.get("file_mime") or "").lower()
+    ftype = _friendly_file_type(name, mime)
+    data = _decode_file_b64(msg.get("file_b64")) or b""
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(msg.get("id") or "file"))[:96] or "file"
+    size = _human_size(len(data))
+
+    inline_text: str | None = None
+    extracted = False
+    truncated = False
+    truncation_note = ""
+    local_path: str | None = None
+    http_fallback_note: str | None = None
+
+    if ext == "docx":
+        text = _extract_docx_text(data)
+        if text and text.strip():
+            inline_text, extracted = text, True
+            local_path = _land_file(key, name + ".txt", text.encode("utf-8")) or None
+        else:
+            # extraction failed OR produced no text — do NOT claim extraction; land original
+            local_path = _land_file(key, name, data) or None
+    elif ext == "xlsx":
+        text, truncated = _extract_xlsx_text(data)
+        if text.strip():
+            inline_text, extracted = text, True
+            if truncated:
+                truncation_note = "（表格内容已截断，仅含前若干表/行）"
+            local_path = _land_file(key, name + ".txt", text.encode("utf-8")) or None
+        else:
+            # extraction failed or empty — do NOT claim extraction; land original
+            local_path = _land_file(key, name, data) or None
+    elif ext == "pdf":
+        # binary — CLI Reads PDF natively; HTTP (tool-less) cannot inline it
+        local_path = _land_file(key, name, data) or None
+        http_fallback_note = "此 connector 暂不支持读取 PDF。"
+    else:
+        # sniffed text / source: land original AND inline
+        try:
+            inline_text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            inline_text = None
+        local_path = _land_file(key, name, data) or None
+
+    if inline_text and len(inline_text) > FILE_INLINE_MAX_CHARS:
+        inline_text = inline_text[:FILE_INLINE_MAX_CHARS]
+        truncated = True
+        truncation_note = f"（内容在 {FILE_INLINE_MAX_CHARS} 字符处截断）"
+
+    extract_clause = "（已由系统抽取为纯文本，原始格式/图片未保留）" if extracted else ""
+    cli_instruction = (
+        f"用户在 IO Chat 发来一个文件：\n"
+        f"- 文件名：{name}\n"
+        f"- 类型：{ftype}{extract_clause}\n"
+        f"- 大小：{size}\n"
+        + (f"- 本地路径：{local_path}\n" if local_path else "")
+        + "用 Read 工具读上面这个精确路径后再回复。读不到就直说，"
+        "不要假装读过、不要编造文件内容。"
+        + (f"\n{truncation_note}" if truncation_note else "")
+    )
+    if inline_text is not None:
+        http_block = (
+            f"[用户发来文件「{name}」（{ftype}，{size}），以下是"
+            f"{'抽取的纯文本内容，原始格式未保留' if extracted else '文件内容'}"
+            f"{('，' + truncation_note) if truncation_note else ''}：]\n"
+            f"<<<\n{inline_text}\n>>>\n"
+            "[文件内容结束。请基于以上内容回复用户。]"
+        )
+    else:
+        http_block = (
+            f"[用户发来文件「{name}」（{ftype}，{size}）。"
+            f"{http_fallback_note or '该文件无法在当前连接内读取。'}]"
+        )
+
+    return FilePrep(
+        original_name=name, friendly_type=ftype, local_path=local_path,
+        inline_text=inline_text, extracted=extracted, truncated=truncated,
+        truncation_note=truncation_note, http_fallback_note=http_fallback_note,
+        cli_instruction=cli_instruction, http_block=http_block,
+    )
 
 
 def _message_for_agent(content: str, image_paths: list[str] | None = None) -> str:
@@ -1707,6 +1947,13 @@ _JSON_THINKING_FIELDS = (
     "reasoning_text",
     "runtime_trace",
 )
+_JSON_PROVIDER_NATIVE_THINKING_FIELDS = {
+    "provider_reasoning",
+    "reasoning",
+    "reasoning_details",
+    "reasoning_content",
+    "reasoning_text",
+}
 
 _JSON_RUNTIME_DEBUG_FIELDS = {
     "cache_creation",
@@ -1782,6 +2029,51 @@ def _openclaw_payload_texts(obj: Any) -> list[str]:
             if isinstance(text, str) and text.strip():
                 texts.append(text.strip())
     return texts
+
+
+def _agent_turn_from_stream_json_events(objects: list[Any]) -> AgentTurn:
+    """Aggregate Claude stream-json deltas as a fallback.
+
+    Claude normally emits a final ``assistant`` object whose content list includes
+    the thinking block; the generic object parser handles that. Some CLI/provider
+    combinations only expose thinking through ``stream_event`` deltas, so collect
+    those here before the per-object parser drops transport events.
+    """
+    turn = AgentTurn()
+    thinking_parts: list[str] = []
+    text_parts: list[str] = []
+    model = ""
+
+    for obj in objects:
+        if not isinstance(obj, dict) or obj.get("type") != "stream_event":
+            continue
+        event = obj.get("event")
+        if not isinstance(event, dict):
+            continue
+        msg = event.get("message")
+        if isinstance(msg, dict) and not model:
+            model = _sanitize_thinking_meta(msg.get("model"), max_len=96)
+        delta = event.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        delta_type = str(delta.get("type") or "").strip().lower()
+        if delta_type == "thinking_delta" and isinstance(delta.get("thinking"), str):
+            thinking_parts.append(delta["thinking"])
+        elif delta_type == "text_delta" and isinstance(delta.get("text"), str):
+            text_parts.append(delta["text"])
+
+    thinking = _sanitize_thinking_summary("".join(thinking_parts))
+    if thinking:
+        turn.thinking_summary = thinking
+        turn.thinking_kind = "provider_reasoning"
+        turn.thinking_source = "anthropic_thinking"
+        turn.thinking_model = model
+        turn.thinking_native = True
+
+    text = "".join(text_parts).strip()
+    if text:
+        _merge_agent_turn(turn, _agent_turn_from_obj(text))
+    return turn
 
 
 def _reply_from_json_obj(obj: Any) -> str:
@@ -2070,6 +2362,15 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
         if json_objects:
             for item in json_objects:
                 _merge_agent_turn(turn, _agent_turn_from_obj(item))
+            stream_turn = _agent_turn_from_stream_json_events(json_objects)
+            if stream_turn.thinking_summary and not turn.thinking_summary:
+                turn.thinking_summary = stream_turn.thinking_summary
+                turn.thinking_kind = stream_turn.thinking_kind
+                turn.thinking_source = stream_turn.thinking_source
+                turn.thinking_model = stream_turn.thinking_model
+                turn.thinking_native = stream_turn.thinking_native
+            if stream_turn.messages and not turn.messages:
+                turn.messages = stream_turn.messages
             if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
                 return _dedupe_agent_turn_messages(turn)
         nested = _safe_json_loads(raw) if _looks_like_json_text(raw) else None
@@ -2185,7 +2486,11 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
             turn.thinking_kind = explicit_kind or _default_thinking_kind_for_key(key)
             turn.thinking_source = explicit_source
             turn.thinking_model = explicit_model
-            turn.thinking_native = explicit_native
+            turn.thinking_native = (
+                explicit_native
+                if explicit_native is not None
+                else (True if key in _JSON_PROVIDER_NATIVE_THINKING_FIELDS else None)
+            )
             if isinstance(value, dict):
                 turn.thinking_kind = (
                     _sanitize_thinking_kind(value.get("kind"))
@@ -2202,7 +2507,11 @@ def _agent_turn_from_obj(obj: Any) -> AgentTurn:
                 )
                 turn.thinking_native = _boolish(value.get("native"))
                 if turn.thinking_native is None:
-                    turn.thinking_native = explicit_native
+                    turn.thinking_native = (
+                        explicit_native
+                        if explicit_native is not None
+                        else (True if key in _JSON_PROVIDER_NATIVE_THINKING_FIELDS else None)
+                    )
 
     messages = obj.get("messages")
     if isinstance(messages, list):
@@ -2325,19 +2634,46 @@ def _cli_error_detail(stdout: str, stderr: str) -> str:
     Both CLIs report API failures on STDOUT while stderr is often empty or just a
     warning: claude ``--output-format json`` emits a result object
     (``is_error`` + ``result`` text + ``api_error_status``); codex ``--json`` emits
-    ``error`` events (``message``). Surface that so ``cli agent exited`` is
-    actionable instead of blank. Falls back to stderr, then a stdout snippet.
+    ``error`` events (``message``), ``turn.failed.error.message``, or nested
+    error items. Surface that so ``cli agent exited`` is actionable instead of
+    blank. Falls back to stderr, then a stdout snippet.
     """
+    def _codex_error_message(obj: Any) -> tuple[int, str]:
+        if not isinstance(obj, dict):
+            return 0, ""
+        if obj.get("type") == "error" and isinstance(obj.get("message"), str):
+            return 3, obj["message"]
+
+        err = obj.get("error")
+        if isinstance(err, str) and err.strip():
+            return 2, err
+        if isinstance(err, dict):
+            for key in ("message", "detail", "error", "description"):
+                value = err.get(key)
+                if isinstance(value, str) and value.strip():
+                    return 2, value
+
+        item = obj.get("item")
+        if isinstance(item, dict) and item.get("type") == "error":
+            for key in ("message", "text", "content", "error"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    return 1, value
+        return 0, ""
+
     claude_err = ""
     codex_err = ""
+    codex_err_priority = 0
     for obj in _json_objects_from_cli_output(stdout or ""):
         if not isinstance(obj, dict):
             continue
         if not claude_err and obj.get("is_error") and isinstance(obj.get("result"), str):
             status = obj.get("api_error_status")
             claude_err = obj["result"] + (f" (api_status={status})" if status else "")
-        if obj.get("type") == "error" and isinstance(obj.get("message"), str):
-            codex_err = obj["message"]   # keep the last error event (the final one)
+        priority, msg = _codex_error_message(obj)
+        if msg and priority >= codex_err_priority:
+            codex_err = msg   # keep the last error event (the final one)
+            codex_err_priority = priority
     detail = claude_err or codex_err
     if detail:
         return detail[:300]
@@ -2412,13 +2748,80 @@ def _codex_reply_from_stream(raw: str) -> str:
     return _codex_turn_from_stream(raw)[0]
 
 
-def _codex_attach_reasoning(reply: str, reasoning: str) -> str:
-    """Fold native codex reasoning events into provider_reasoning metadata.
+def _claude_turn_from_stream(raw: str) -> tuple[str, str]:
+    """Split a ``claude -p --output-format stream-json`` event stream into
+    (reply, reasoning_summary).
+
+    Claude Code streams JSONL: ``stream_event`` deltas (we run with
+    ``--include-partial-messages``), any number of complete ``{"type":
+    "assistant","message":{"content":[...]}}`` objects, then a terminal
+    ``{"type":"result","subtype":"success","result":<final answer>}``.
+
+    When the turn calls a tool, Claude emits a *preamble* text block ("let me
+    check…") in an assistant object BEFORE the ``tool_use`` and the real answer
+    in a LATER object. The generic extractor (`_agent_turn_from_raw`) collected
+    BOTH as separate chat bubbles — but the foreground reply-exclusivity guard
+    (chat_core: one reply per user message, to avoid double-burning the user's
+    model key) accepts only ONE, so the preamble consumed the slot and the real
+    answer 409'd (the user saw "let me check…" and nothing else — the deepwiki
+    symptom on the test CVM).
+
+    The terminal ``result`` field carries ONLY the final answer, never the
+    pre-tool preamble, so it is the single authoritative reply. Native reasoning
+    is collected from complete ``thinking`` blocks and, as a fallback for
+    provider combinations that only stream it, from ``thinking_delta`` events.
+    Empty reply means no terminal success result (error / handshake-only), so
+    the caller falls back to the generic extractor without leaking.
+    """
+    reply = ""
+    thinking_blocks: list[str] = []
+    thinking_deltas: list[str] = []
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict):
+            continue
+        etype = str(obj.get("type") or "").strip()
+        if etype == "assistant":
+            message = obj.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if str(block.get("type") or "").strip() == "thinking":
+                        t = block.get("thinking") or block.get("text")
+                        if isinstance(t, str) and t.strip():
+                            thinking_blocks.append(t.strip())
+        elif etype == "stream_event":
+            event = obj.get("event")
+            delta = event.get("delta") if isinstance(event, dict) else None
+            if isinstance(delta, dict) and str(delta.get("type") or "").strip().lower() == "thinking_delta":
+                td = delta.get("thinking")
+                if isinstance(td, str):
+                    thinking_deltas.append(td)
+        elif etype == "result" and str(obj.get("subtype") or "").strip() == "success":
+            r = obj.get("result")
+            if isinstance(r, str) and r.strip():
+                reply = r.strip()
+    reasoning = "\n\n".join(thinking_blocks) or "".join(thinking_deltas).strip()
+    return reply, reasoning
+
+
+def _attach_provider_reasoning(
+    reply: str,
+    reasoning: str,
+    *,
+    source: str,
+    kind: str = "provider_reasoning",
+    native: bool = True,
+) -> str:
+    """Fold native provider reasoning into the structured thinking channel.
 
     The reply's own JSON shape is preserved when present (a codex
     ``agent_message`` is often an ``{"actions":[...]}`` / ``{"messages":[...]}``
     object), so this never double-wraps actions into a bubble.
     """
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        return reply
     parsed: Any = None
     try:
         parsed = json.loads(reply)
@@ -2431,10 +2834,21 @@ def _codex_attach_reasoning(reply: str, reasoning: str) -> str:
     else:
         payload = {"messages": [reply]}
     payload.setdefault("provider_reasoning", reasoning)
-    payload.setdefault("reasoning_kind", "provider_reasoning_summary")
-    payload.setdefault("reasoning_source", "codex_reasoning")
-    payload.setdefault("reasoning_native", True)
+    payload.setdefault("reasoning_kind", kind)
+    payload.setdefault("reasoning_source", source)
+    payload.setdefault("reasoning_native", native)
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _codex_attach_reasoning(reply: str, reasoning: str) -> str:
+    """Fold native codex reasoning events into provider_reasoning metadata."""
+    return _attach_provider_reasoning(
+        reply,
+        reasoning,
+        source="codex_reasoning",
+        kind="provider_reasoning_summary",
+        native=True,
+    )
 
 
 def _extract_text_from_cli_output(raw: str) -> str:
@@ -2834,6 +3248,54 @@ def _session_id_from_obj(obj: Any) -> str:
     return ""
 
 
+def _hermes_session_json_path(session_id: str) -> Path | None:
+    sid = (session_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{1,200}", sid):
+        return None
+    home = os.environ.get("HERMES_HOME", "").strip()
+    if not home:
+        return None
+    return Path(home) / "sessions" / f"session_{sid}.json"
+
+
+def _hermes_session_reasoning(session_id: str) -> str:
+    """Read native Hermes reasoning from the resident-owned session JSON.
+
+    Hermes `chat -Q` prints only the final answer, but hermes-agent v0.8.0 writes
+    assistant `reasoning` into `$HERMES_HOME/sessions/session_<id>.json`. This is
+    best-effort and intentionally silent: missing files, bad JSON, oversized
+    files, absent fields, or `reasoning: null` must never affect the reply path.
+    """
+    path = _hermes_session_json_path(session_id)
+    if path is None:
+        return ""
+    try:
+        if not path.is_file():
+            return ""
+        size = path.stat().st_size
+        if size < 0 or size > HERMES_SESSION_REASONING_MAX_BYTES:
+            return ""
+        body = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or message.get("type") or "").strip().lower()
+        if role and role not in {"assistant", "agent", "model", "openclaw"}:
+            continue
+        if not role and "reasoning" not in message:
+            continue
+        reasoning = message.get("reasoning")
+        return reasoning.strip() if isinstance(reasoning, str) and reasoning.strip() else ""
+    return ""
+
+
 def _resolve_cli_executable(cmd: list[str]) -> list[str]:
     if not cmd:
         return cmd
@@ -3130,7 +3592,12 @@ def _has_claude_output_format(cmd: list[str]) -> bool:
     return "--output-format" in cmd
 
 
-def _render_cli_template(message: str, sid: str, image_paths: list[str] | None = None) -> list[str]:
+def _render_cli_template(
+    message: str,
+    sid: str,
+    image_paths: list[str] | None = None,
+    lane: str = "background",
+) -> list[str]:
     image_paths = image_paths or []
     msg_token = "__FEEDLING_MESSAGE__"
     sid_token = "__FEEDLING_SESSION_ID__"
@@ -3138,6 +3605,10 @@ def _render_cli_template(message: str, sid: str, image_paths: list[str] | None =
     image_paths_token = "__FEEDLING_IMAGE_PATHS__"
     template = (
         AGENT_CLI_CMD
+        # Pre-split substitution: value is a controlled path / fixed literal, so
+        # it tokenizes cleanly (``--mcp-config <path>`` → two args) and an empty
+        # value collapses the placeholder to whitespace shlex drops.
+        .replace("{mcp}", _user_mcp_cli_value(AGENT_CLI_CMD, lane))
         .replace("{message}", msg_token)
         .replace("{session_id}", sid_token)
         .replace("{image_path}", image_path_token)
@@ -3156,7 +3627,11 @@ def _render_cli_template(message: str, sid: str, image_paths: list[str] | None =
     ]
 
 
-def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> list[str]:
+def _prepare_cli_command(
+    message: str,
+    image_paths: list[str] | None = None,
+    lane: str = "background",
+) -> list[str]:
     sid = _load_agent_session_id()
     template_has_image_slot = "{image_path" in AGENT_CLI_CMD
     # codex gets pixels natively via injected --image= flags (_inject_codex_images);
@@ -3168,7 +3643,7 @@ def _prepare_cli_command(message: str, image_paths: list[str] | None = None) -> 
     rendered_message = message
     if image_paths and not template_has_image_slot and not codex_native_images:
         rendered_message = _message_for_agent(message, image_paths)
-    cmd = _render_cli_template(rendered_message, sid, image_paths=image_paths)
+    cmd = _render_cli_template(rendered_message, sid, image_paths=image_paths, lane=lane)
     cmd, sid = _ensure_explicit_cli_session_id(cmd, sid)
 
     if _is_hermes_chat_cmd(cmd):
@@ -3330,11 +3805,12 @@ def call_agent_cli(
     image_paths: list[str] | None = None,
     raw_text: bool = False,
     trace_id: str = "",
+    lane: str = "background",
 ) -> Any:
     if not AGENT_CLI_CMD:
         raise ValueError("AGENT_CLI_CMD is not set for cli mode")
 
-    cmd = _prepare_cli_command(message, image_paths=image_paths)
+    cmd = _prepare_cli_command(message, image_paths=image_paths, lane=lane)
     command_sid = _cli_flag_value(cmd, "--session-id")
     log.debug("running cli agent: %s", cmd)
     _turn_t0 = time.monotonic()
@@ -3364,6 +3840,24 @@ def call_agent_cli(
     _wall_ms = int((time.monotonic() - _turn_t0) * 1000)
     _log_cli_turn_timing(cmd, result, _wall_ms)
     _m = _cli_turn_metrics(cmd, result, _wall_ms)
+    _trace_turn = AgentTurn()
+    if result.returncode == 0:
+        try:
+            _trace_turn = _agent_turn_from_raw(result.stdout or "")
+        except Exception as e:  # noqa: BLE001 — observability must never affect a turn
+            log.debug("thinking trace parse failed: %s", e)
+    _stdout_had_thinking_marker = (
+        '"type":"thinking"' in (result.stdout or "")
+        or '"type": "thinking"' in (result.stdout or "")
+        or "thinking_delta" in (result.stdout or "")
+    )
+    if (
+        result.returncode == 0
+        and _m["driver"] == "claude"
+        and _stdout_had_thinking_marker
+        and not _trace_turn.thinking_summary
+    ):
+        log.warning("claude stdout had thinking markers but parser yielded none")
     _excerpt = {"reply_head": (result.stdout or "")[:1000],
                 "stderr_head": (result.stderr or "")[:500]}
     if result.returncode != 0:
@@ -3386,8 +3880,13 @@ def call_agent_cli(
         explain=(f"模型返回（{_m['driver']}，{_wall_ms}ms" +
                  (f"，{_m['num_turns']} 轮" if _m.get('num_turns') else "") + "）"
                  if result.returncode == 0 else f"模型调用失败 rc={result.returncode}"),
-        detail={k: _m[k] for k in ("driver", "rc", "agent_ms", "api_ms", "num_turns",
-                                   "steps", "input_tokens", "output_tokens")},
+        detail={
+            **{k: _m[k] for k in ("driver", "rc", "agent_ms", "api_ms", "num_turns",
+                                  "steps", "input_tokens", "output_tokens")},
+            "thinking_present": bool(_trace_turn.thinking_summary),
+            "thinking_source": _trace_turn.thinking_source or "",
+            "thinking_len": len(_trace_turn.thinking_summary or ""),
+        },
         content_excerpt=_excerpt,
     )
 
@@ -3431,6 +3930,38 @@ def call_agent_cli(
         text = _extract_text_from_cli_output(raw)
         if text.strip():
             return text
+    hermes_reasoning = ""
+    if _is_hermes_chat_cmd(cmd) and observed_sid:
+        hermes_reasoning = _hermes_session_reasoning(observed_sid)
+    if hermes_reasoning:
+        text = _extract_text_from_cli_output(raw)
+        if text.strip():
+            return _attach_provider_reasoning(
+                text,
+                hermes_reasoning,
+                source="hermes_session_json",
+                kind="provider_reasoning",
+                native=True,
+            )
+    if _is_claude_code_cmd(cmd):
+        # The terminal result-event text is the ONLY deliverable: a pre-tool
+        # "let me check…" preamble in an earlier assistant object must never
+        # become its own bubble. The old generic path (`return raw`) let
+        # `_agent_turn_from_raw` collect preamble AND answer as two bubbles; the
+        # foreground one-reply guard then 409'd the real answer. Native reasoning
+        # rides the thinking disclosure. Empty reply (no success result) falls
+        # through to the generic extractor below.
+        claude_reply, claude_reasoning = _claude_turn_from_stream(raw)
+        if claude_reply:
+            if claude_reasoning and not raw_text:
+                return _attach_provider_reasoning(
+                    claude_reply,
+                    claude_reasoning,
+                    source="anthropic_thinking",
+                    kind="provider_reasoning",
+                    native=True,
+                )
+            return claude_reply
     turn = _agent_turn_from_raw(raw)
     if turn.messages or turn.actions or turn.thinking_summary or turn.tool_calls:
         return raw
@@ -3447,7 +3978,8 @@ def _sanitize_reply_text(text: str) -> str:
     if not isinstance(text, str):
         return ""
 
-    text = text.replace("\r\n", "\n").strip()
+    text = text.replace("\r\n", "\n")
+    text = text.strip()
     if not text:
         return ""
 
@@ -3534,13 +4066,17 @@ def call_agent(
     image_paths: list[str] | None = None,
     raw_text: bool = False,
     trace_id: str = "",
+    lane: str = "background",
 ) -> Any:
     if AGENT_MODE == "http":
         # http path metrics/timing are out of scope for this event pair (cli-only);
         # trace_id is accepted here for a uniform call signature but unused.
+        # lane gates MCP injection, which only exists on the cli path — unused here.
         raw = call_agent_http(message, images=images, raw_text=raw_text)
     elif AGENT_MODE == "cli":
-        raw = call_agent_cli(message, image_paths=image_paths, raw_text=raw_text, trace_id=trace_id)
+        raw = call_agent_cli(
+            message, image_paths=image_paths, raw_text=raw_text,
+            trace_id=trace_id, lane=lane)
     else:
         raise ValueError(f"unknown AGENT_MODE: {AGENT_MODE!r}")
 
@@ -3882,6 +4418,7 @@ def poll_chat(since: float) -> dict:
     body = resp.json()
     if isinstance(body, dict):
         _update_chat_runtime_v2_profile(body.get("runtime_v2"))
+        _update_user_mcp_advertised(body.get("user_mcp"))
     return body
 
 
@@ -3895,6 +4432,152 @@ def _resident_chat_runtime_v2_enabled() -> bool:
         return bool(_chat_runtime_v2_profile.get(RESIDENT_CHAT_RUNTIME_V2_FLAG))
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# User-configured MCP servers (spec 2026-07-08-user-mcp-servers)
+#
+# The poll response advertises only a fingerprint of the user's MCP config.
+# When it moves, we pull sealed envelopes (GET /v1/mcp/envelopes), decrypt each
+# through the enclave, and re-materialize the agent's on-disk MCP config via the
+# pure helpers in tools/user_mcp_materialize.py. Chat turns then inject the
+# runtime-appropriate ``{mcp}`` value; background/proactive turns do not (claude)
+# or hard-gate to an empty server set (codex).
+# ---------------------------------------------------------------------------
+
+_user_mcp_advertised: dict = {}      # last poll-advertised {"fingerprint": ...}
+_user_mcp_applied: dict = {"fingerprint": None, "servers": []}  # materialized state
+
+
+def _update_user_mcp_advertised(payload) -> None:
+    global _user_mcp_advertised
+    if isinstance(payload, dict):
+        _user_mcp_advertised = payload
+
+
+def _fetch_user_mcp_envelopes() -> dict:
+    resp = httpx.get(
+        f"{FEEDLING_API_URL}/v1/mcp/envelopes", headers=_HEADERS, timeout=20)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _decrypt_envelope(envelope: dict) -> bytes:
+    """Decrypt a caller-owned v1 envelope through the enclave. Same crypto path
+    the consumer already uses for chat/memory — no new trust surface. Auth rides
+    the shared ``_HEADERS`` (runtime-token or api-key, kept fresh by
+    ``_refresh_auth_header``)."""
+    if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
+        raise RuntimeError("enclave_unavailable")
+    resp = _ENCLAVE_CLIENT.post(
+        f"{FEEDLING_ENCLAVE_URL}/v1/envelope/decrypt",
+        headers=_HEADERS,
+        json={"envelope": envelope, "purpose": "mcp_server_config"},
+    )
+    resp.raise_for_status()
+    return base64.b64decode(resp.json()["plaintext_b64"])
+
+
+def _materialize_user_mcp(servers: list[dict], managed_names) -> None:
+    """Write the decrypted server list to disk in every shape a runtime might
+    read. Bare import (not ``from tools import ...``) because at runtime the
+    consumer is launched as ``python tools/chat_resident_consumer.py`` with
+    ``tools/`` on sys.path[0], and the sibling module lives right next to us.
+
+    ``managed_names`` scopes the settings.json allow-rule prune to server
+    names this feature actually owns (current + previously-applied), so it
+    never deletes ``mcp__<other>__*`` rules the user configured some other
+    way."""
+    import user_mcp_materialize as _m  # noqa: PLC0415 — lazy: sibling on tools/ path
+    # generic file — claude --mcp-config target AND the documented VPS user-mcp.json
+    Path(USER_MCP_FILE).parent.mkdir(parents=True, exist_ok=True)
+    Path(USER_MCP_FILE).write_text(_m.claude_mcp_json(servers))
+    os.chmod(USER_MCP_FILE, 0o600)
+    claude_dir = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    if claude_dir and Path(claude_dir).is_dir():
+        settings_path = Path(claude_dir) / "settings.json"
+        existing = settings_path.read_text() if settings_path.exists() else None
+        settings_path.write_text(
+            _m.merge_settings_allow(
+                existing, _m.claude_allow_rules(servers), managed_names))
+    codex_home = os.environ.get("CODEX_HOME", "")
+    if codex_home and Path(codex_home).is_dir():
+        config_path = Path(codex_home) / "config.toml"
+        existing = config_path.read_text() if config_path.exists() else None
+        merged = _m.codex_config_merged(existing, servers)
+        if merged.strip():
+            config_path.write_text(merged)
+            os.chmod(config_path, 0o600)  # holds plaintext MCP headers/token
+        elif config_path.exists():
+            config_path.unlink()
+
+
+def _maybe_apply_user_mcp() -> None:
+    """Re-materialize agent MCP config when the poll-advertised fingerprint moved.
+    Failures log and retry on a later poll — never block chat."""
+    global _user_mcp_applied
+    target = str(_user_mcp_advertised.get("fingerprint") or "")
+    if target == (_user_mcp_applied.get("fingerprint") or ""):
+        return
+    try:
+        servers: list[dict] = []
+        if target:
+            payload = _fetch_user_mcp_envelopes()
+            target = str(payload.get("fingerprint") or "")
+            for srv in payload.get("servers") or []:
+                secret = json.loads(_decrypt_envelope(srv["config_envelope"]))
+                servers.append({
+                    "name": srv["name"], "enabled": bool(srv.get("enabled")),
+                    "url": secret["url"], "headers": secret.get("headers") or {},
+                })
+        # Union of the previously-applied and newly-advertised server names:
+        # anything just removed still needs its old allow rule pruned, while
+        # anything outside this union (someone else's mcp__*__ rule) is left
+        # alone. Read the OLD _user_mcp_applied before it's overwritten below.
+        prev_names = {s.get("name") for s in _user_mcp_applied.get("servers") or []}
+        new_names = {s.get("name") for s in servers}
+        managed_names = {n for n in (prev_names | new_names) if n}
+        _materialize_user_mcp(servers, managed_names)
+        _user_mcp_applied = {"fingerprint": target, "servers": servers}
+        names = [s["name"] for s in servers if s["enabled"]]
+        log.info("[user_mcp] applied fingerprint=%s servers=%s",
+                 target or "(empty)", names)
+    except Exception as e:  # noqa: BLE001 — config refresh must never wedge chat
+        log.warning("[user_mcp] apply failed (will retry next poll): %s: %s",
+                    type(e).__name__, e)
+
+
+def _user_mcp_cli_value(template: str, lane: str) -> str:
+    """Resolve the ``{mcp}`` placeholder for one CLI turn.
+
+    - No ``{mcp}`` slot in the template, or no enabled server → empty.
+    - claude → ``--mcp-config <file>`` ONLY on the chat lane (foreground turns
+      may call user MCP tools; background/proactive turns must not).
+    - codex  → per-server ``-c mcp_servers.<name>.enabled=false`` overrides ONLY
+      on non-chat lanes. codex has no way to enable a subset per-turn, so its
+      user MCP servers are configured in config.toml (available on chat turns)
+      and explicitly turned off on background turns. NOTE: ``-c mcp_servers={}``
+      does NOT work — codex deep-merges ``-c`` overrides onto the config, and an
+      empty parent table is a no-op that leaves each ``[mcp_servers.<name>]``
+      enabled. Only an explicit ``enabled=false`` per server disables it.
+    Values contain only controlled characters (a filesystem path, or fixed
+    literals plus ``_SAFE_NAME``-constrained server names), so pre-split
+    substitution into the template is shlex-safe."""
+    if "{mcp}" not in template:
+        return ""
+    enabled_servers = [
+        s for s in _user_mcp_applied.get("servers") or [] if s.get("enabled")
+    ]
+    if not enabled_servers:
+        return ""
+    if _cli_template_is_codex():
+        if lane == "chat":
+            return ""
+        names = sorted(str(s.get("name") or "") for s in enabled_servers)
+        return " ".join(
+            f"-c mcp_servers.{name}.enabled=false" for name in names if name
+        )
+    return f"--mcp-config {USER_MCP_FILE}" if lane == "chat" else ""
 
 
 def poll_proactive_jobs(since: float) -> dict:
@@ -4180,7 +4863,6 @@ def post_reply(
     wrong in the log instead.
     """
     url = f"{FEEDLING_API_URL}/v1/chat/response"
-
     if _ENCRYPTION_AVAILABLE and not _refresh_whoami_for_encrypted_reply():
         log.error("whoami refresh failed before encrypted reply and no cached keys are available; skipping write")
         return {"error": "whoami_refresh_failed"}
@@ -6650,6 +7332,12 @@ def _process_messages(messages: list) -> float:
             # otherwise the agent gets the attachment but loses the actual prompt.
             if not content:
                 content = IMAGE_PLACEHOLDER
+        elif content_type == "file":
+            log.info("file message [ts=%.3f] — preparing file context for agent", ts)
+            prep = _prepare_file_for_agent(msg)
+            caption = content  # decrypted caption text, or ""
+            block = prep.http_block if AGENT_MODE == "http" else prep.cli_instruction
+            content = f"{caption}\n\n{block}".strip() if caption else block
         elif not content:
             # Genuinely empty text — decrypt source missing or failed.
             # Never send a fallback for content we cannot read.
@@ -6735,16 +7423,19 @@ def _process_messages(messages: list) -> float:
             # belongs to *this* call_agent invocation.
             _consume_reply_parse_failed()
             if use_runtime_v2:
-                agent_result = call_agent(_resident_foreground_chat_message_v2(content), trace_id=trace_id)
+                agent_result = call_agent(
+                    _resident_foreground_chat_message_v2(content),
+                    trace_id=trace_id, lane="chat")
             elif image_payloads or image_paths:
                 agent_result = call_agent(
                     content,
                     images=image_payloads,
                     image_paths=image_paths,
                     trace_id=trace_id,
+                    lane="chat",
                 )
             else:
-                agent_result = call_agent(content, trace_id=trace_id)
+                agent_result = call_agent(content, trace_id=trace_id, lane="chat")
         except Exception as e:
             log.error("agent call failed; posting user-visible fallback: %s", e)
             # 上报/system 通知与兜底话术解耦（Codex review）：SEND_FALLBACK_ON_AGENT_ERROR
@@ -7344,6 +8035,14 @@ def run() -> None:
 
             result = poll_chat(last_ts)
             consecutive_errors = 0
+
+            # Materialize any advertised user-MCP config change on EVERY poll
+            # (idle or carrying messages), not just when a message arrives —
+            # otherwise a config change advertised during an idle stretch
+            # (e.g. a server disabled/removed) sits stale until the next chat
+            # turn. No-op when the fingerprint hasn't moved (best-effort;
+            # failures log and retry on a later poll).
+            _maybe_apply_user_mcp()
 
             if result.get("timed_out"):
                 # Idle moment: safe to swap to the backend's commit and re-exec

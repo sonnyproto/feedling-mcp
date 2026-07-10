@@ -846,7 +846,8 @@ def _runtime_summary(store: UserStore) -> dict:
     unless the default sandbox-bypass command is used, or a gateway-routed
     provider. Metadata only — no api_key / base_url is read."""
     out = {"provider": "", "model": "", "test_status": "",
-           "driver": "", "codex_transport": "", "cli_cmd_custom": False}
+           "driver": "", "codex_transport": "", "cli_cmd_custom": False,
+           "reasoning_effort": ""}
     try:
         from hosted import config_store as _cfg_store
         cfg = _cfg_store._load_model_api_config(store) or {}
@@ -857,6 +858,7 @@ def _runtime_summary(store: UserStore) -> dict:
         "provider": provider,
         "model": str(cfg.get("model") or ""),
         "test_status": str(cfg.get("test_status") or ""),
+        "reasoning_effort": str(cfg.get("reasoning_effort") or ""),
         # A custom cli_cmd drops the default codex --dangerously-bypass command,
         # which is what makes io_cli memory reads work in-CVM. True → suspicious.
         "cli_cmd_custom": bool(str(cfg.get("cli_cmd") or "").strip()),

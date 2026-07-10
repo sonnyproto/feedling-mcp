@@ -286,6 +286,8 @@ def build_memory_index_item(envelope: dict, inner: dict) -> dict:
         "pulse": float(envelope.get("pulse") or 0.3),
         "status": memory_readside_status(envelope, inner),
         "occurred_at": memory_readside_text(envelope.get("occurred_at"), 80),
+        "created_at": memory_readside_text(envelope.get("created_at"), 80),
+        "updated_at": memory_readside_text(envelope.get("updated_at"), 80),
         "last_referenced_at": memory_readside_text(envelope.get("last_referenced_at"), 80),
         "is_sensitive": memory_readside_is_sensitive(envelope, adapted),
         "score": float(envelope.get("score") or 0),
@@ -305,6 +307,8 @@ def build_memory_fetch_item(envelope: dict, inner: dict) -> dict:
         "status": memory_readside_status(envelope, inner),
         "source": memory_readside_text(envelope.get("source"), 160),
         "occurred_at": memory_readside_text(envelope.get("occurred_at"), 80),
+        "created_at": memory_readside_text(envelope.get("created_at"), 80),
+        "updated_at": memory_readside_text(envelope.get("updated_at"), 80),
         "last_referenced_at": memory_readside_text(envelope.get("last_referenced_at"), 80),
         "is_sensitive": memory_readside_is_sensitive(envelope, adapted),
     }

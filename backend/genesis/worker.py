@@ -334,7 +334,15 @@ def _fetch_provider_key(api_url: str, enclave_url: str, runtime_token: str, *, s
 
 
 def _runtime_for_user(user_id: str, provider_key: str) -> provider_client.ProviderConfig:
-    config = db.get_blob(user_id, "model_api")
+    # Post model-api-multi-profile migration (0014), the active config lives in
+    # model_api_routes JOIN model_api_credentials, not the legacy user_blobs
+    # (kind='model_api') snapshot — POST /v1/model_api/setup stopped writing that
+    # blob, so every post-migration user would otherwise hit model_api_not_configured
+    # here. db.model_api_active_route() returns a dict with the same provider/model/
+    # base_url/test_status key names the rest of this function already expects.
+    # It also carries api_key_envelope (ciphertext) — never touch/log that; the
+    # decrypted key arrives separately as provider_key.
+    config = db.model_api_active_route(user_id)
     if not isinstance(config, dict):
         raise GenesisWorkerError("model_api_not_configured")
     if config.get("test_status") != "ok":

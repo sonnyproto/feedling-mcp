@@ -97,6 +97,7 @@ if not _provisioned:
         "test_provider_client.py",
         "test_history_import_identity.py",
         "test_model_api_prompts.py",
+        "test_model_api_file_payload.py",
         "test_onboarding_validation_genesis.py",
         "test_enclave_frame_caption.py",
         "test_enclave_visual_plaintext.py",
@@ -113,6 +114,9 @@ if not _provisioned:
         "test_no_app_py_regression.py",
         "test_asgi_waiters.py",
         "test_quoted_memory_context.py",
+        "test_chat_resident_consumer_file.py",
+        "test_user_mcp_probe.py",
+        "test_user_mcp_materialize.py",
     }
     collect_ignore = sorted(
         f
@@ -144,6 +148,42 @@ def seed_user(user_id: str, **doc) -> None:
     with registry._users_lock:
         if not any(u.get("user_id") == user_id for u in registry._users):
             registry._users.append(entry)
+
+
+_DEFAULT_MODEL_API_ENVELOPE = {"v": 1, "body_ct": "ct", "nonce": "n"}
+
+
+def configure_model_api_route(user_id: str, *, provider: str = "anthropic",
+                              model: str = "claude-3-5-sonnet-latest",
+                              base_url: str = "", envelope=None,
+                              api_key_hint: str = "sk-a...451",
+                              supports_responses: bool = False,
+                              reasoning_effort=None,
+                              test_status: str = "ok",
+                              activate: bool = True):
+    """Test-only: configure a user's model_api via the new credentials + routes
+    tables (post model-api-multi-profile migration), mirroring what
+    POST /v1/model_api/setup now persists. Replaces the old
+    ``config_store._save_model_api_config`` / ``db.set_blob(uid, 'model_api', ...)``
+    fixtures, which no longer feed the read side (``_load_model_api_config`` and the
+    setup endpoints now read the active route). Returns ``(credential_id, route_id)``.
+
+    ``envelope`` defaults to a small ciphertext-shaped dict; pass an explicit dict to
+    control what GET /v1/model_api/key_envelope returns."""
+    import db
+
+    credential_id = db.model_api_credential_create(
+        user_id, provider=provider, base_url=base_url,
+        label=provider.replace("_", " ").title(),
+        api_key_envelope=envelope if isinstance(envelope, dict) else _DEFAULT_MODEL_API_ENVELOPE,
+        api_key_hint=api_key_hint, supports_responses=supports_responses)
+    route_id = db.model_api_route_upsert(
+        user_id, credential_id, model, reasoning_effort)
+    if test_status:
+        db.model_api_route_mark_test(user_id, route_id, status=test_status)
+    if activate:
+        db.model_api_route_activate(user_id, route_id)
+    return credential_id, route_id
 
 
 def pytest_report_header(config):

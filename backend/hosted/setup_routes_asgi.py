@@ -112,6 +112,71 @@ async def model_api_memory_repair(request: Request, auth: AuthResult = Depends(r
     return JSONResponse(body, status_code=status)
 
 
+@router.get("/v1/model_api/routes")
+async def model_api_routes_get(auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(setup_core.model_api_routes_get, auth.store)
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/model_api/routes")
+async def model_api_route_create(request: Request, auth: AuthResult = Depends(require_auth)):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.model_api_route_create, auth.store, payload, caller_api_key=caller_api_key)
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/model_api/routes/{route_id}/activate")
+async def model_api_route_activate(route_id: str, request: Request,
+                                   auth: AuthResult = Depends(require_auth)):
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.model_api_route_activate, auth.store, route_id, caller_api_key=caller_api_key)
+    return JSONResponse(body, status_code=status)
+
+
+@router.post("/v1/model_api/routes/{route_id}/test")
+async def model_api_route_test(route_id: str, request: Request,
+                               auth: AuthResult = Depends(require_auth)):
+    api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.model_api_route_test, auth.store, route_id, api_key=api_key)
+    return JSONResponse(body, status_code=status)
+
+
+@router.delete("/v1/model_api/routes/{route_id}")
+async def model_api_route_remove(route_id: str, auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(
+        setup_core.model_api_route_remove, auth.store, route_id)
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/model_api/credentials")
+async def model_api_credentials_get(auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(setup_core.model_api_credentials_get, auth.store)
+    return JSONResponse(body, status_code=status)
+
+
+@router.patch("/v1/model_api/credentials/{credential_id}")
+async def model_api_credential_patch(credential_id: str, request: Request,
+                                     auth: AuthResult = Depends(require_auth)):
+    payload = (await asgi_http.read_json_silent(request)) or {}
+    caller_api_key = auth_core.extract_api_key(request.headers, request.query_params)
+    body, status = await threadpool.run_db(
+        setup_core.model_api_credential_patch, auth.store, credential_id, payload,
+        caller_api_key=caller_api_key)
+    return JSONResponse(body, status_code=status)
+
+
+@router.delete("/v1/model_api/credentials/{credential_id}")
+async def model_api_credential_remove(credential_id: str,
+                                      auth: AuthResult = Depends(require_auth)):
+    body, status = await threadpool.run_db(
+        setup_core.model_api_credential_remove, auth.store, credential_id)
+    return JSONResponse(body, status_code=status)
+
+
 @router.get("/v1/state/receipts")
 async def state_receipts(request: Request, auth: AuthResult = Depends(require_auth)):
     body, status = await threadpool.run_db(

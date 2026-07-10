@@ -64,17 +64,29 @@ def _headers(api_key: str) -> dict[str, str]:
 _FAKE_ENVELOPE = {"v": 1, "ct": "Zm9v", "item_id": "model_api_key_abc"}
 
 
-def _seed_config(user_id: str, **extra) -> dict:
-    store = core_store.get_store(user_id)
-    config = {
-        "provider": "anthropic",
-        "model": "claude-3",
-        "api_key_hint": "sk-…abc",
-        "api_key_envelope": _FAKE_ENVELOPE,
-        "test_status": "ok",
-        **extra,
-    }
-    return hosted_config_store._save_model_api_config(store, config)
+def _seed_config(user_id: str, **extra):
+    """Configure model_api via the new credentials + routes tables (post
+    multi-profile migration), mirroring POST /v1/model_api/setup. Was a
+    ``config_store._save_model_api_config`` blob before the migration; the driver /
+    key_envelope endpoints and ``_load_model_api_config`` now read the active route."""
+    from conftest import configure_model_api_route
+
+    provider = extra.get("provider", "anthropic")
+    model = extra.get("model", "claude-3")
+    envelope = extra.get("api_key_envelope", _FAKE_ENVELOPE)
+    credential_id, _route_id = configure_model_api_route(
+        user_id, provider=provider, model=model,
+        envelope=_FAKE_ENVELOPE if envelope is None else envelope,
+        api_key_hint="sk-…abc", test_status="ok")
+    if envelope is None:
+        # test_get_key_envelope_404_when_no_envelope: JSONB is NOT NULL, so null out
+        # the column directly to reproduce "no envelope → 404" under the new schema.
+        import db
+        with db.get_pool().connection() as conn:
+            conn.execute(
+                "UPDATE model_api_credentials SET api_key_envelope = 'null'::jsonb "
+                "WHERE id = %s", (credential_id,))
+    return core_store.get_store(user_id)
 
 
 # ---- POST /v1/model_api/driver ----

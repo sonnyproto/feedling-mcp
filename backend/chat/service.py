@@ -275,8 +275,12 @@ def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
     item.setdefault("content", "")
 
     content_type = item.get("content_type", "text")
-    body_ct = item.get("body_ct") or ""
-    body_ct_len = len(body_ct)
+    # A file body may live in R2 (pointer: body_key set, body_ct absent). Use the
+    # length stored on the pointer so the omit path can report it without a fetch;
+    # only hydrate from R2 on the INCLUDE path below (never for an omitted body),
+    # so an iOS list load (include_image_body=false) never pulls file ciphertext.
+    is_pointer = bool(item.get("body_key")) and item.get("body_ct") is None
+    body_ct_len = int(item.get("body_ct_len") or 0) if is_pointer else len(item.get("body_ct") or "")
     should_omit_body = False
     body_omitted_reason = ""
     if content_type == "image" and not include_image_body:
@@ -290,11 +294,18 @@ def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
         item["body_ct_len"] = body_ct_len
         item["body_omitted"] = True
         item["body_omitted_reason"] = body_omitted_reason
-        for key in ("body_ct", "nonce", "K_user", "K_enclave"):
+        for key in ("body_ct", "nonce", "K_user", "K_enclave", "body_key"):
             item.pop(key, None)
-    elif content_type == "image" or body_ct_len > CHAT_HISTORY_INLINE_BODY_CT_MAX:
-        item["body_ct_len"] = body_ct_len
-        item["body_omitted"] = False
+    else:
+        # Body is being delivered — if it lives in R2, fetch it now. This is the
+        # per-page read exit (bounded by the history limit), NOT the full ring, so
+        # a bulk/metadata-only load never downloads every historical file.
+        if is_pointer:
+            item = dict(db.hydrate_chat_file_body(str(item.get("owner_user_id") or ""), item))
+            item.setdefault("content", "")
+        if content_type == "image" or body_ct_len > CHAT_HISTORY_INLINE_BODY_CT_MAX:
+            item["body_ct_len"] = body_ct_len
+            item["body_omitted"] = False
 
     role = item.get("role")
     if role == "openclaw":
@@ -414,7 +425,10 @@ def _pending_chat_messages_for_poll(
             if not _chat_message_claimable(msg, consumer_id, now):
                 continue
             if not claim:
-                claimed.append(dict(msg))  # read-only peek, no lock taken
+                # read-only peek — hydrate an R2-offloaded file body so the
+                # delivered message carries its ciphertext (claim path below gets
+                # this via chat_try_claim_reply).
+                claimed.append(db.hydrate_chat_file_body(store.user_id, dict(msg)))
                 if ts <= since:
                     redelivered += 1
                 continue

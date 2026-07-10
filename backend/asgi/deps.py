@@ -53,3 +53,20 @@ def require_scope(scope: str):
         return auth
 
     return _dep
+
+
+async def require_api_key(auth: AuthResult = Depends(require_auth)) -> AuthResult:
+    """Restrict a route to long-term api-key callers only (reject runtime tokens).
+
+    Management endpoints (e.g. the user-MCP server config surface) are the iOS
+    control plane: only a human holding the long-term Feedling api key may change
+    config. A hosted consumer authenticates with a short-lived runtime token
+    (``runtime_token_claims`` set) and has no business mutating config — it is a
+    read-only信封 consumer — so it is refused here with 403.
+
+    Unlike ``require_scope`` this is a hard api-key gate: no scope on a runtime
+    token can satisfy it.
+    """
+    if auth.runtime_token_claims is not None:
+        raise auth_core.AuthError(403, "forbidden", "api_key_required")
+    return auth

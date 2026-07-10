@@ -87,7 +87,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:9b25954
+    image: ghcr.io/teleport-computer/feedling:4588254
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -130,7 +130,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:9b25954
+    image: ghcr.io/teleport-computer/feedling:4588254
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -181,6 +181,12 @@ services:
       R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
       R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
       R2_FRAMES_BUCKET: "${R2_FRAMES_BUCKET:-}"
+      # Dedicated bucket for heavy chat FILE ciphertext (content_type=file),
+      # offloaded off the chat_messages row. Non-secret name defaults on; it
+      # activates whenever the R2 credentials above are present. The R2 token
+      # MUST also be scoped to this bucket (else PUT 403 → graceful inline
+      # Postgres fallback, exactly like today).
+      R2_CHAT_FILES_BUCKET: "${R2_CHAT_FILES_BUCKET:-io-user-attachments}"
       # Dedicated bucket for client diagnostic logs (backend/diagnostics/),
       # separate from frames. Bucket name is non-secret so it defaults on; it
       # activates whenever the R2 credentials above are present. The R2 token

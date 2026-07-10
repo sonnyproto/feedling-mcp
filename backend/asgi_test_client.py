@@ -7,7 +7,7 @@ test-client API (the suite was written against it pre-migration); no Flask is
 involved anywhere here.
 
 Supported surface (measured against the suite):
-  - methods: ``get`` / ``post`` / ``put`` / ``delete`` / ``open``
+  - methods: ``get`` / ``post`` / ``put`` / ``patch`` / ``delete`` / ``open``
   - request kwargs: ``headers=`` , ``json=`` , ``data=`` (raw bytes/str, form dict,
     or Flask-style multipart ``{"file": (fileobj|bytes, filename[, ctype]), ...}``),
     ``content_type=`` , and ``environ_overrides=`` (accepted + ignored — the one
@@ -137,6 +137,9 @@ class _AsgiTestClient:
 
     def put(self, path, **kw):
         return self._request("PUT", path, **kw)
+
+    def patch(self, path, **kw):
+        return self._request("PATCH", path, **kw)
 
     def delete(self, path, **kw):
         return self._request("DELETE", path, **kw)

@@ -26,6 +26,15 @@ ACTION_TYPES_V2 = {
     "needs_background",
 }
 
+_PROTOCOL_FRAGMENT_RE = re.compile(r"^\s*[{}\[\],]+\s*$")
+_PROTOCOL_FIELD_LINE_RE = re.compile(
+    r"^\s*[\"']?(?:"
+    r"reason|type|action|actions|messages|message|text|tool_calls|cards|"
+    r"needs_background|background_request|request"
+    r")[\"']?\s*[:：]",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class AgentTurnResponseV2:
@@ -40,6 +49,39 @@ def _clean_text(value: Any, limit: int) -> str:
     text = str(value or "").strip()
     if len(text) > limit:
         return text[:limit]
+    return text
+
+
+def _looks_like_protocol_fragment(text: str) -> bool:
+    stripped = str(text or "").strip()
+    if not stripped:
+        return False
+    if _PROTOCOL_FRAGMENT_RE.fullmatch(stripped):
+        return True
+    if _PROTOCOL_FIELD_LINE_RE.match(stripped):
+        return True
+    if stripped[:1] in "{[":
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            return True
+        return isinstance(parsed, (Mapping, list))
+    return False
+
+
+def sanitize_visible_message_text_v2(value: Any) -> str:
+    """Return safe proactive visible text, or "" for protocol/internal debris.
+
+    Weak models sometimes leak malformed protocol fragments like a lone ``}`` or
+    ``reason: ...`` into fields that the runtime would otherwise treat as
+    user-visible text. Proactive delivery is fail-closed: only explicit,
+    natural-language ``send_message.text`` survives this check.
+    """
+    if not isinstance(value, str):
+        return ""
+    text = _clean_text(value, MAX_MESSAGE_CHARS_V2)
+    if not text or _looks_like_protocol_fragment(text):
+        return ""
     return text
 
 
@@ -79,7 +121,7 @@ def _coerce_action(raw: Any) -> tuple[dict[str, Any] | None, str | None, Mapping
         return None, None, None
 
     if action_type == "send_message":
-        text = _clean_text(raw.get("text") or raw.get("message"), MAX_MESSAGE_CHARS_V2)
+        text = sanitize_visible_message_text_v2(raw.get("text") or raw.get("message"))
         if not text:
             return None, None, None
         return {"type": "send_message", "text": text}, text, None
@@ -146,13 +188,16 @@ def parse_agent_response_v2(raw: Any) -> AgentTurnResponseV2:
 
     messages: list[str] = []
     actions: list[dict[str, Any]] = []
+    dropped_visible_text = False
 
     raw_messages = payload.get("messages") if isinstance(payload.get("messages"), Sequence) else []
     if isinstance(raw_messages, (str, bytes, bytearray)):
         raw_messages = []
     for item in raw_messages:
-        text = _clean_text(item, MAX_MESSAGE_CHARS_V2)
+        text = sanitize_visible_message_text_v2(item)
         if not text:
+            if _clean_text(item, MAX_MESSAGE_CHARS_V2):
+                dropped_visible_text = True
             continue
         messages.append(text)
         actions.append({"type": "send_message", "text": text})
@@ -168,6 +213,12 @@ def parse_agent_response_v2(raw: Any) -> AgentTurnResponseV2:
     if isinstance(raw_actions, (str, bytes, bytearray)):
         raw_actions = []
     for item in raw_actions:
+        if isinstance(item, Mapping):
+            action_type = str(item.get("type") or item.get("action") or "").strip()
+            if action_type == "send_message":
+                raw_text = item.get("text") or item.get("message")
+                if _clean_text(raw_text, MAX_MESSAGE_CHARS_V2) and not sanitize_visible_message_text_v2(raw_text):
+                    dropped_visible_text = True
         action, message_text, request = _coerce_action(item)
         if action is None:
             continue
@@ -196,7 +247,8 @@ def parse_agent_response_v2(raw: Any) -> AgentTurnResponseV2:
         actions.append({"type": "needs_background", "request": dict(background_request or {})})
 
     if not actions and not needs_background:
-        actions.append({"type": "sleep", "reason": "not_now"})
+        reason = "invalid_protocol" if dropped_visible_text else "not_now"
+        actions.append({"type": "sleep", "reason": reason})
 
     return AgentTurnResponseV2(
         messages=tuple(messages),

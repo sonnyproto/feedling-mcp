@@ -1258,14 +1258,16 @@ def set_blob(user_id: str, kind: str, doc) -> None:
 
 
 def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict]:
-    """配了能 fit 的 provider 且 test_status='ok' 的用户都纳入托管（与
-    hosted/agent_runtime_cutover.resolve_driver 一致——不再有 per-user
-    ``agent_runtime_driver`` 开关；kill switch 改用删 config 或改 test_status）。
+    """有 active route 且该 route test_status='ok'、其 credential 的 provider 能
+    fit 的用户都纳入托管（与 hosted/agent_runtime_cutover.resolve_driver 一致——
+    不再有 per-user ``agent_runtime_driver`` 开关；kill switch 改用删/换 active
+    route 或改 test_status）。
     AGENT 由 provider 派生（保持 CASE 与 cutover.driver_for_provider 同步）：
     anthropic/deepseek → claude；openai → codex (native)。gateway-only provider
     (gemini/openrouter/openai_compatible → codex via LiteLLM gateway) 仅当
     ``include_gateway`` 时返回（gateway 关时不发现，避免 spawn 到不存在的 proxy）。
-    Returns [{"user_id","driver","provider","model","base_url","supports_responses"}]
+    Returns [{"user_id","driver","provider","model","base_url","supports_responses",
+    "reasoning_effort"}]
     sorted by user_id (``supports_responses`` is the openai_compatible relay's
     /v1/responses capability, set at setup; selects native passthrough vs the
     LiteLLM chat-completions bridge)。"""
@@ -1276,29 +1278,32 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict
         with get_pool().connection() as conn:
             rows = conn.execute(
                 """
-                SELECT user_id,
-                  CASE LOWER(COALESCE(doc->>'provider', ''))
+                SELECT r.user_id,
+                  CASE LOWER(c.provider)
                     WHEN 'anthropic' THEN 'claude'
                     WHEN 'claude'    THEN 'claude'
                     WHEN 'deepseek'  THEN 'claude'
                     ELSE 'codex'
                   END AS driver,
-                  LOWER(COALESCE(doc->>'provider', '')) AS provider,
-                  COALESCE(doc->>'model', '') AS model,
-                  COALESCE(doc->>'base_url', '') AS base_url,
-                  COALESCE(doc->>'supports_responses', '') AS supports_responses
-                FROM user_blobs
-                WHERE kind = 'model_api'
-                  AND COALESCE(doc->>'test_status', '') = 'ok'
-                  AND LOWER(COALESCE(doc->>'provider', '')) = ANY(%s)
-                ORDER BY user_id
+                  LOWER(c.provider) AS provider,
+                  r.model AS model,
+                  c.base_url AS base_url,
+                  c.supports_responses AS supports_responses,
+                  COALESCE(r.reasoning_effort, '') AS reasoning_effort
+                FROM model_api_routes r
+                JOIN model_api_credentials c ON c.id = r.credential_id
+                WHERE r.is_active
+                  AND r.test_status = 'ok'
+                  AND LOWER(c.provider) = ANY(%s)
+                ORDER BY r.user_id
                 """,
                 (providers,),
             ).fetchall()
         return [{"user_id": uid, "driver": driver, "provider": provider,
                  "model": model, "base_url": base_url,
-                 "supports_responses": supports_responses == "true"}
-                for uid, driver, provider, model, base_url, supports_responses in rows]
+                 "supports_responses": bool(supports_responses),
+                 "reasoning_effort": reasoning_effort}
+                for uid, driver, provider, model, base_url, supports_responses, reasoning_effort in rows]
     except Exception as e:
         log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
         return []
@@ -1936,6 +1941,12 @@ def genesis_complete_job(
 
 
 def chat_load(user_id: str) -> list[dict]:
+    """Load the user's chat ring. R2-offloaded file rows are returned as SLIM
+    POINTERS (``body_key`` + ``body_ct_len``, no ``body_ct``) — the heavy
+    ciphertext is fetched lazily only at the read exits that actually deliver a
+    body (``hydrate_chat_file_body``), so a bulk/metadata-only load never
+    downloads every historical file. Mirrors how large image bodies are omitted
+    from the visible feed and lazily re-fetched per message."""
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
@@ -1948,12 +1959,54 @@ def chat_load(user_id: str) -> list[dict]:
         return []
 
 
+def _is_chat_file_pointer(doc) -> bool:
+    return isinstance(doc, dict) and bool(doc.get("body_key")) and doc.get("body_ct") is None
+
+
+def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
+    """Return a doc guaranteed to carry ``body_ct``. If ``doc`` is an R2 pointer
+    (``body_key`` set, ``body_ct`` absent) the ciphertext is fetched from R2 and
+    inlined into a COPY (the stored/cached row stays slim). Non-pointers and, when
+    R2 is unconfigured, everything are returned unchanged. A missing/failed fetch
+    returns the doc as-is (``body_ct`` still absent) so the enclave surfaces a
+    per-item decrypt error for that one message rather than crashing the read.
+
+    Call this ONLY at exits that actually deliver a body (poll delivery, a
+    history page that includes the body, single message-body fetch) — never in
+    bulk load — so a leaked/large file is fetched once, on demand."""
+    if not _is_chat_file_pointer(doc) or not object_storage.chat_files_enabled():
+        return doc
+    body = object_storage.get_chat_file_body(user_id, str(doc.get("id") or ""))
+    if body is None:
+        return doc
+    out = {k: v for k, v in doc.items() if k != "body_key"}
+    out["body_ct"] = body
+    return out
+
+
 def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: int) -> None:
     """Insert one chat message then trim to the newest ``max_messages`` rows,
-    mirroring the in-memory ring buffer. Idempotent on msg_id."""
+    mirroring the in-memory ring buffer. Idempotent on msg_id.
+
+    A heavy ``content_type="file"`` body_ct is offloaded to R2 when configured
+    (``object_storage.chat_files_enabled()``); the row then keeps only the
+    envelope metadata plus a ``body_key`` pointer, and ``chat_load`` reconstitutes
+    ``body_ct`` from R2 transparently. Falls back to inline storage when R2 is
+    unconfigured OR the upload fails. Crash-safe, same ordering as frame_upsert:
+    the row is written inline (readable, no pointer) BEFORE the object exists and
+    flipped to the pointer shape only AFTER the upload succeeds — a crash never
+    leaves a pointer to a missing object."""
+    offload = (
+        object_storage.chat_files_enabled()
+        and isinstance(doc, dict)
+        and doc.get("content_type") == "file"
+        and doc.get("body_ct") is not None
+    )
+    trimmed_docs: list = []
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
+                # 1) inline first — message readable, references no R2 object yet.
                 conn.execute(
                     "INSERT INTO chat_messages (user_id, msg_id, ts, doc) "
                     "VALUES (%s, %s, %s, %s) "
@@ -1961,15 +2014,45 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
                     (user_id, msg_id, ts, Jsonb(doc)),
                 )
                 if max_messages and max_messages > 0:
-                    conn.execute(
+                    rows = conn.execute(
                         "DELETE FROM chat_messages WHERE user_id = %s AND seq < ("
                         "  SELECT MIN(seq) FROM ("
                         "    SELECT seq FROM chat_messages WHERE user_id = %s "
                         "    ORDER BY seq DESC LIMIT %s"
                         "  ) t"
-                        ")",
+                        ") RETURNING doc",
                         (user_id, user_id, max_messages),
+                    ).fetchall()
+                    trimmed_docs = [r[0] for r in rows]
+        if offload:
+            # 2) upload OUTSIDE the txn; on failure the inline row stays readable.
+            try:
+                body_ct_len = len(doc["body_ct"])
+                object_storage.put_chat_file_body(user_id, msg_id, doc["body_ct"])
+                # 3) object exists → flip the row to the pointer shape as the last
+                #    durable step. ATOMIC on the CURRENT row (not a stale snapshot):
+                #    drop only body_ct and add the pointer keys, so any reply/claim
+                #    metadata another worker merged into `doc` during the upload is
+                #    preserved. The `? 'body_ct'` guard makes it a no-op if the row
+                #    was already flipped (idempotent, avoids a double-flip race).
+                pointer = {
+                    "body_key": object_storage.chat_file_key(user_id, msg_id),
+                    "body_ct_len": body_ct_len,
+                }
+                with get_pool().connection() as conn:
+                    conn.execute(
+                        "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
+                        "WHERE user_id = %s AND msg_id = %s AND doc ? 'body_ct'",
+                        (Jsonb(pointer), user_id, msg_id),
                     )
+            except Exception as e:  # noqa: BLE001
+                log.error("[db] chat_append(%s,%s) R2 offload failed, left inline: %s",
+                          user_id, msg_id, e)
+        # Best-effort: drop R2 objects for any offloaded file rows just trimmed.
+        if trimmed_docs and object_storage.chat_files_enabled():
+            for d in trimmed_docs:
+                if isinstance(d, dict) and d.get("body_key") and d.get("content_type") == "file":
+                    object_storage.delete_chat_file_body(user_id, str(d.get("id") or ""))
     except Exception as e:
         log.error("[db] chat_append(%s,%s) failed: %s", user_id, msg_id, e)
 
@@ -2049,20 +2132,61 @@ def chat_try_claim_reply(
                 ") RETURNING doc",
                 tuple(params),
             ).fetchone()
-        return row[0] if row is not None else None
+        if row is None:
+            return None
+        # This is a delivery exit — the resident consumer decrypts the returned
+        # doc, so an R2-offloaded file must arrive with body_ct inlined.
+        return hydrate_chat_file_body(user_id, row[0])
     except Exception as e:
         log.error("[db] chat_try_claim_reply(%s,%s) failed: %s", user_id, msg_id, e)
         return None
 
 
-def chat_delete(user_id: str, msg_id: str) -> bool:
+def chat_expire_reply_claims(user_id: str) -> int:
+    """释放该用户所有「已 claim 但尚未回复」的 chat 行的 claim。
+
+    切 active route 会 respawn consumer（supervisor._spawn_identity 变了）。被 kill 的
+    旧 consumer 持有的 claim 否则要等 CHAT_POLL_CLAIM_TTL_SEC（默认 600s）才过期，
+    lost-turn redelivery backstop 才会重投那条消息。主动清空让新 consumer 立刻接手。
+
+    WHERE 条件与 chat_try_claim_reply 的 CAS 对齐：只碰未回复（reply_status 不是
+    replied 且 reply_message_id 为空）且当前确实被 claim 住的行。"""
     try:
         with get_pool().connection() as conn:
             cur = conn.execute(
-                "DELETE FROM chat_messages WHERE user_id = %s AND msg_id = %s",
-                (user_id, msg_id),
+                "UPDATE chat_messages "
+                "SET doc = doc || '{\"reply_claimed_by\":\"\",\"reply_claim_expires_at\":\"\"}'::jsonb "
+                "WHERE user_id = %s "
+                "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+                "  AND COALESCE(doc->>'reply_message_id','') = '' "
+                "  AND COALESCE(doc->>'reply_claimed_by','') <> ''",
+                (user_id,),
             )
-        return cur.rowcount > 0
+            return cur.rowcount
+    except Exception as e:
+        log.error("[db] chat_expire_reply_claims(%s) failed: %s", user_id, e)
+        return 0
+
+
+def chat_delete(user_id: str, msg_id: str) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "DELETE FROM chat_messages WHERE user_id = %s AND msg_id = %s RETURNING doc",
+                (user_id, msg_id),
+            ).fetchone()
+        if row is None:
+            return False
+        # Drop the offloaded R2 body if this was a file message.
+        doc = row[0]
+        if (
+            object_storage.chat_files_enabled()
+            and isinstance(doc, dict)
+            and doc.get("body_key")
+            and doc.get("content_type") == "file"
+        ):
+            object_storage.delete_chat_file_body(user_id, str(doc.get("id") or msg_id))
+        return True
     except Exception as e:
         log.error("[db] chat_delete(%s,%s) failed: %s", user_id, msg_id, e)
         return False
@@ -2077,6 +2201,10 @@ def chat_clear(user_id: str) -> int | None:
                 "DELETE FROM chat_messages WHERE user_id = %s",
                 (user_id,),
             )
+        # Prefix-delete every offloaded chat-file body for this user (cheap no-op
+        # when R2 is unconfigured or the user never sent a file).
+        if object_storage.chat_files_enabled():
+            object_storage.delete_user_chat_files(user_id)
         return cur.rowcount
     except Exception as e:
         log.error("[db] chat_clear(%s) failed: %s", user_id, e)
@@ -2255,6 +2383,369 @@ def world_book_replace_all(user_id: str, entries: list[dict]) -> None:
                     )
     except Exception as e:
         log.error("[db] world_book_replace_all(%s) failed: %s", user_id, e)
+
+
+# ─────────────────────────── model_api credentials / routes ───────────────────
+#
+# 取代单条 user_blobs(kind='model_api')。credentials 一把 key 一行（envelope 密文），
+# routes 是 (credential, model) 组合。`model_api_routes_one_active` 这个 partial
+# unique index 让「每用户恰一条 active」由 DB 强制，而不是靠调用方自觉。
+#
+# ⚠️ ``model_api_routes_list`` 刻意 **不返回** api_key_envelope——它直接喂给
+# GET /v1/model_api/routes 的响应体。只有 ``model_api_active_route`` 带 envelope，
+# 供 config_store 走 enclave 解密。别在 list 里加回来。
+
+_ROUTE_COLUMNS = """
+    r.id::text, r.credential_id::text, c.provider, r.model, c.label,
+    c.api_key_hint, c.base_url, c.supports_responses,
+    COALESCE(r.reasoning_effort, ''), r.is_active, r.test_status,
+    COALESCE(to_char(r.last_test_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
+    r.last_test_error, r.last_runtime_error, r.last_runtime_error_class,
+    COALESCE(to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
+    COALESCE(to_char(r.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '')
+"""
+
+
+def _route_row_to_dict(row: tuple) -> dict:
+    return {
+        "id": row[0], "credential_id": row[1], "provider": row[2], "model": row[3],
+        "credential_label": row[4], "api_key_hint": row[5], "base_url": row[6],
+        "supports_responses": bool(row[7]), "reasoning_effort": row[8],
+        "is_active": bool(row[9]), "test_status": row[10], "last_test_at": row[11],
+        "last_test_error": row[12], "last_runtime_error": row[13],
+        "last_runtime_error_class": row[14],
+        "created_at": row[15], "updated_at": row[16],
+    }
+
+
+def model_api_credentials_list(user_id: str) -> list[dict]:
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                "SELECT id::text, provider, label, base_url, api_key_hint, "
+                "       supports_responses "
+                "FROM model_api_credentials WHERE user_id = %s ORDER BY created_at, id",
+                (user_id,),
+            ).fetchall()
+        return [{"id": r[0], "provider": r[1], "label": r[2], "base_url": r[3],
+                 "api_key_hint": r[4], "supports_responses": bool(r[5])} for r in rows]
+    except Exception as e:
+        log.error("[db] model_api_credentials_list(%s) failed: %s", user_id, e)
+        return []
+
+
+def model_api_credential_get(user_id: str, credential_id: str) -> dict | None:
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "SELECT id::text, provider, label, base_url, api_key_hint, "
+                "       supports_responses, api_key_envelope "
+                "FROM model_api_credentials WHERE user_id = %s AND id = %s",
+                (user_id, credential_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {"id": row[0], "provider": row[1], "label": row[2], "base_url": row[3],
+                "api_key_hint": row[4], "supports_responses": bool(row[5]),
+                "api_key_envelope": row[6]}
+    except Exception as e:
+        log.error("[db] model_api_credential_get(%s,%s) failed: %s", user_id, credential_id, e)
+        return None
+
+
+def model_api_credential_create(user_id: str, *, provider: str, base_url: str,
+                                label: str, api_key_envelope: dict,
+                                api_key_hint: str, supports_responses: bool) -> str | None:
+    """总是新建一条 credential，返回其 id。
+
+    同一 (user_id, provider, base_url) 下允许多条 —— 用户可以为同一个 provider
+    存多把 key（个人的 / 团队的）。setup 的幂等不靠唯一索引，而是在 setup_core 里
+    锚定 active route 的 credential 决定「更新」还是「新建」。
+    """
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "INSERT INTO model_api_credentials "
+                "  (id, user_id, provider, label, base_url, api_key_envelope, "
+                "   api_key_hint, supports_responses) "
+                "VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s) "
+                "RETURNING id::text",
+                (user_id, provider, label, base_url, Jsonb(api_key_envelope),
+                 api_key_hint, supports_responses),
+            ).fetchone()
+        return row[0] if row else None
+    except Exception as e:
+        log.error("[db] model_api_credential_create(%s,%s) failed: %s", user_id, provider, e)
+        return None
+
+
+def model_api_credential_update(user_id: str, credential_id: str, *,
+                               label: str | None = None,
+                               api_key_envelope: dict | None = None,
+                               api_key_hint: str | None = None,
+                               supports_responses: bool | None = None) -> bool:
+    sets, params = [], []
+    if label is not None:
+        sets.append("label = %s")
+        params.append(label)
+    if api_key_envelope is not None:
+        sets.append("api_key_envelope = %s")
+        params.append(Jsonb(api_key_envelope))
+    if api_key_hint is not None:
+        sets.append("api_key_hint = %s")
+        params.append(api_key_hint)
+    if supports_responses is not None:
+        sets.append("supports_responses = %s")
+        params.append(supports_responses)
+    if not sets:
+        return False
+    sets.append("updated_at = now()")
+    params += [user_id, credential_id]
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                f"UPDATE model_api_credentials SET {', '.join(sets)} "
+                "WHERE user_id = %s AND id = %s",
+                tuple(params),
+            )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error("[db] model_api_credential_update(%s,%s) failed: %s", user_id, credential_id, e)
+        return False
+
+
+def model_api_credential_delete(user_id: str, credential_id: str) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM model_api_credentials WHERE user_id = %s AND id = %s",
+                (user_id, credential_id),
+            )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error("[db] model_api_credential_delete(%s,%s) failed: %s", user_id, credential_id, e)
+        return False
+
+
+def model_api_routes_list(user_id: str) -> list[dict]:
+    """不含 api_key_envelope——直接喂给 GET /v1/model_api/routes 的响应。"""
+    try:
+        with get_pool().connection() as conn:
+            rows = conn.execute(
+                f"SELECT {_ROUTE_COLUMNS} "
+                "FROM model_api_routes r "
+                "JOIN model_api_credentials c ON c.id = r.credential_id "
+                "WHERE r.user_id = %s ORDER BY r.created_at, r.id",
+                (user_id,),
+            ).fetchall()
+        return [_route_row_to_dict(r) for r in rows]
+    except Exception as e:
+        log.error("[db] model_api_routes_list(%s) failed: %s", user_id, e)
+        return []
+
+
+def model_api_route_get(user_id: str, route_id: str) -> dict | None:
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                f"SELECT {_ROUTE_COLUMNS} "
+                "FROM model_api_routes r "
+                "JOIN model_api_credentials c ON c.id = r.credential_id "
+                "WHERE r.user_id = %s AND r.id = %s",
+                (user_id, route_id),
+            ).fetchone()
+        return _route_row_to_dict(row) if row else None
+    except Exception as e:
+        log.error("[db] model_api_route_get(%s,%s) failed: %s", user_id, route_id, e)
+        return None
+
+
+def model_api_active_route(user_id: str) -> dict | None:
+    """带 api_key_envelope —— 供 config_store 走 enclave 解密。"""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                f"SELECT {_ROUTE_COLUMNS}, c.api_key_envelope "
+                "FROM model_api_routes r "
+                "JOIN model_api_credentials c ON c.id = r.credential_id "
+                "WHERE r.user_id = %s AND r.is_active",
+                (user_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        out = _route_row_to_dict(row)
+        # envelope is appended AFTER _ROUTE_COLUMNS, so read it by tail index — this
+        # stays correct if _ROUTE_COLUMNS ever grows again (it just did: created_at/
+        # updated_at), unlike a hardcoded positional index.
+        out["api_key_envelope"] = row[-1]
+        return out
+    except Exception as e:
+        log.error("[db] model_api_active_route(%s) failed: %s", user_id, e)
+        return None
+
+
+def model_api_route_upsert(user_id: str, credential_id: str, model: str,
+                           reasoning_effort: str | None) -> str | None:
+    """按 (credential_id, model) upsert。跨用户引用会被复合外键拒绝 → 返回 None。"""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "INSERT INTO model_api_routes "
+                "  (id, user_id, credential_id, model, reasoning_effort) "
+                "VALUES (gen_random_uuid(), %s, %s, %s, %s) "
+                "ON CONFLICT (credential_id, model) DO UPDATE SET "
+                "  reasoning_effort = EXCLUDED.reasoning_effort, updated_at = now() "
+                "RETURNING id::text",
+                (user_id, credential_id, model, reasoning_effort),
+            ).fetchone()
+        return row[0] if row else None
+    except Exception as e:
+        log.error("[db] model_api_route_upsert(%s,%s,%s) failed: %s",
+                  user_id, credential_id, model, e)
+        return None
+
+
+def model_api_route_delete(user_id: str, route_id: str) -> bool:
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                "DELETE FROM model_api_routes WHERE user_id = %s AND id = %s",
+                (user_id, route_id),
+            )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error("[db] model_api_route_delete(%s,%s) failed: %s", user_id, route_id, e)
+        return False
+
+
+def model_api_route_activate(user_id: str, route_id: str) -> bool:
+    """切换 active route。两条 UPDATE 语句包在一个事务里，等价于原子切换。
+
+    NOTE: 最初按 plan 写成单条 ``SET is_active = (id = %s) WHERE ... (is_active
+    OR id = %s)``，理论上「唯一索引在语句末检查」——但这对 Postgres 的非
+    DEFERRABLE partial unique index 不成立：同一条 UPDATE 语句内，多行的索引维护
+    是逐行进行的，不保证按插入顺序处理；只要目标行先于旧 active 行被处理，就会在
+    行内瞬间出现两条 is_active=true，直接撞 ``model_api_routes_one_active`` 报
+    duplicate key。已用最小复现验证（先 activate(r1) 触发一次行迁移改变物理顺序，
+    再 activate(r2) 必现），因此改为显式事务内两条语句：先把「非目标的当前 active
+    行」置 false，再把目标行置 true。这在同一事务内对旧 active 行加了行锁，并发
+    activate 会在该行上排队序列化，正确性等价于「单语句」的设计意图，且已被
+    test_activate_leaves_exactly_one_active 覆盖住。
+
+    先在事务内 ``SELECT ... FOR UPDATE`` 确认目标 route 存在且属于该用户：不存在
+    就直接返回 False、**绝不做任何写入**。否则第一条「清 active」的 UPDATE 会在
+    route_id 不存在/属于别人时把用户当前的 active route 误清掉——那会让他从
+    ``list_agent_runtime_enabled_users`` 的 roster 消失、supervisor 杀掉 consumer
+    且不自愈，客户端发一个陈旧 route_id 就能把自己的托管 agent 打停。``FOR UPDATE``
+    顺便锁住目标行，对并发也有好处。route_id 非法 UUID 字面量时 psycopg cast 抛异常，
+    被外层 except 接住返回 False——也是我们要的。"""
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                target = conn.execute(
+                    "SELECT 1 FROM model_api_routes WHERE user_id = %s AND id = %s FOR UPDATE",
+                    (user_id, route_id),
+                ).fetchone()
+                if target is None:
+                    return False          # 目标不存在/不属于该用户 —— 绝不能有副作用
+                conn.execute(
+                    "UPDATE model_api_routes SET is_active = FALSE, updated_at = now() "
+                    "WHERE user_id = %s AND is_active AND id != %s",
+                    (user_id, route_id),
+                )
+                cur = conn.execute(
+                    "UPDATE model_api_routes SET is_active = TRUE, updated_at = now() "
+                    "WHERE user_id = %s AND id = %s",
+                    (user_id, route_id),
+                )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error("[db] model_api_route_activate(%s,%s) failed: %s", user_id, route_id, e)
+        return False
+
+
+def model_api_route_mark_test(user_id: str, route_id: str, *, status: str, error: str = "") -> bool:
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                "UPDATE model_api_routes SET test_status = %s, last_test_error = %s, "
+                "       last_test_at = now(), updated_at = now() "
+                "WHERE user_id = %s AND id = %s",
+                (status, str(error or "")[:300], user_id, route_id),
+            )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error("[db] model_api_route_mark_test(%s,%s) failed: %s", user_id, route_id, e)
+        return False
+
+
+def model_api_route_mark_runtime_error(user_id: str, *, error: str, error_class: str | None) -> bool:
+    """写 active route 行。传空串即清空（agent-runner 回合成功时调用）。
+
+    ``error_class=None`` 时只更新 ``last_runtime_error`` 列，不动
+    ``last_runtime_error_class`` —— 供 legacy inline action-trace 路径调用：那条
+    路径从不知道 error 的 class（只有 agent-runner 的 record_runtime_error 会算
+    出 class），传 None 保留 record_runtime_error 已经写入的 class 不被清空，
+    等价于旧 user_blobs 时代 _patch_model_api_runtime_profile 按 key 合并、从不
+    覆盖它没提到的字段的行为。"""
+    try:
+        with get_pool().connection() as conn:
+            if error_class is None:
+                cur = conn.execute(
+                    "UPDATE model_api_routes SET last_runtime_error = %s, updated_at = now() "
+                    "WHERE user_id = %s AND is_active",
+                    (str(error or "")[:300], user_id),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE model_api_routes SET last_runtime_error = %s, "
+                    "       last_runtime_error_class = %s, updated_at = now() "
+                    "WHERE user_id = %s AND is_active",
+                    (str(error or "")[:300], str(error_class or "")[:64], user_id),
+                )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error("[db] model_api_route_mark_runtime_error(%s) failed: %s", user_id, e)
+        return False
+
+
+def model_api_route_deactivate(user_id: str, route_id: str) -> bool:
+    """清掉某条 route 的 is_active（不接管）。供 test 失败后先腾位再 autoselect。
+
+    ``model_api_autoselect_active`` 只考虑 ``NOT is_active`` 的候选——对着一条仍
+    ``is_active=TRUE`` 的行调它会撞 ``model_api_routes_one_active`` partial unique
+    index（试图让第二行也变 active）。调用方必须先用这个函数腾位，再 autoselect。"""
+    try:
+        with get_pool().connection() as conn:
+            cur = conn.execute(
+                "UPDATE model_api_routes SET is_active = FALSE, updated_at = now() "
+                "WHERE user_id = %s AND id = %s AND is_active",
+                (user_id, route_id),
+            )
+        return cur.rowcount > 0
+    except Exception as e:
+        log.error("[db] model_api_route_deactivate(%s,%s) failed: %s", user_id, route_id, e)
+        return False
+
+
+def model_api_autoselect_active(user_id: str) -> str | None:
+    """删掉 active route 之后重新选主：挑 updated_at 最新的 ok route。
+    没有候选则返回 None（该用户从 roster 消失，consumer 会停）。"""
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(
+                "UPDATE model_api_routes SET is_active = TRUE, updated_at = now() "
+                "WHERE id = ("
+                "  SELECT id FROM model_api_routes "
+                "  WHERE user_id = %s AND test_status = 'ok' AND NOT is_active "
+                "  ORDER BY updated_at DESC, id LIMIT 1"
+                ") RETURNING id::text",
+                (user_id,),
+            ).fetchone()
+        return row[0] if row else None
+    except Exception as e:
+        log.error("[db] model_api_autoselect_active(%s) failed: %s", user_id, e)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -2589,6 +3080,8 @@ def delete_user_data(user_id: str) -> None:
                     "genesis_import_chunks",
                     "genesis_import_outputs",
                     "genesis_import_jobs",
+                    "model_api_routes",
+                    "model_api_credentials",
                 ):
                     conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
     except Exception as e:
@@ -2600,3 +3093,10 @@ def delete_user_frames(user_id: str) -> None:
     使 DB 删除保持原子、R2 失败非致命。"""
     if object_storage.enabled():
         object_storage.delete_user_frames(user_id)
+
+
+def delete_user_chat_files(user_id: str) -> None:
+    """Best-effort R2 chat-file body cleanup (no DB rows — the chat_messages
+    CASCADE already dropped the pointer rows). Mirrors delete_user_frames."""
+    if object_storage.chat_files_enabled():
+        object_storage.delete_user_chat_files(user_id)

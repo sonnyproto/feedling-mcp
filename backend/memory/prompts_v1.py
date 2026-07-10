@@ -41,6 +41,33 @@ _COMMON_BUCKETS_EN = " / ".join(en for _zh, en in COMMON_BUCKETS_V1)
 # the bucket name instead of picking one side.
 _COMMON_BUCKETS_ZH = "、".join(zh for zh, _en in COMMON_BUCKETS_V1)
 
+# Deterministic bucket-language backstop. The model still mislabels a Chinese memory
+# with an English common bucket (~1/3 of the time — e.g. "Pets" for 用户十年前养过一只狗),
+# despite the guidance. Since the common buckets are a fixed zh<->en pair map, we can
+# map a wrong-language COMMON bucket back to the card's own language IN CODE — a backstop
+# that catches EVERY write path (genesis / capture / agent inline / io_cli all funnel
+# through _memory_inner_from_action) regardless of prompt drift, and is unit-testable
+# without a real model. Custom buckets (妈妈 / the house) pass through unchanged.
+_BUCKET_EN_TO_ZH = {en: zh for zh, en in COMMON_BUCKETS_V1}
+_BUCKET_ZH_TO_EN = {zh: en for zh, en in COMMON_BUCKETS_V1}
+
+
+def _text_is_chinese(text: str) -> bool:
+    """A card counts as Chinese if its text carries any CJK ideograph."""
+    return any("一" <= ch <= "鿿" for ch in (text or ""))
+
+
+def normalize_bucket_language(bucket: str, text: str) -> str:
+    """Map a COMMON bucket that's in the wrong language vs the card's content to the
+    card's own language via the fixed zh<->en pair map. Custom/unknown buckets pass
+    through unchanged. Deterministic — the code backstop behind the bucket prompts."""
+    b = (bucket or "").strip()
+    if not b:
+        return b
+    if _text_is_chinese(text):
+        return _BUCKET_EN_TO_ZH.get(b, b)
+    return _BUCKET_ZH_TO_EN.get(b, b)
+
 
 MEMORY_WRITE_GUIDANCE_V1 = ("""
 Memory write guidance:
@@ -48,8 +75,10 @@ Memory write guidance:
 - Do not write greetings, jokes, one-off task instructions, unconfirmed guesses, roleplay hypotheticals, or the assistant's own inference.
 - Use memory.add for new durable events/facts.
 - Use memory.supersede when the user corrects or replaces an older memory; do not patch old cards in place.
-- Pick one bucket and 1-4 reusable threads. Prefer existing bucket/thread names when provided; converge on the common buckets ("""
-+ _COMMON_BUCKETS_EN + """) and only mint a specific new bucket (Mom / the house) when none fit. Keep buckets in the user's language — never let 工作 and Work coexist.
+- Pick one bucket and 1-4 reusable threads. Prefer existing bucket/thread names when provided; converge on the common buckets and only mint a specific new bucket (Mom / 妈妈 / the house) when none fit.
+- The bucket name MUST be ONE word in the memory's OWN language: a Chinese memory uses a Chinese bucket (from: """
++ _COMMON_BUCKETS_ZH + """); an English memory uses an English bucket (from: """
++ _COMMON_BUCKETS_EN + """). NEVER write a bilingual slash pair like 「健康/Health」or 「宠物/Pets」, and never let 工作 and Work coexist as two buckets.
 - importance means future usefulness for understanding the user. pulse means emotional activation when remembered.
 - content must use three Markdown sections: 记忆 / 上下文 / 使用提示.
 - Do not claim "saved" or "remembered" before the backend write actually succeeds.

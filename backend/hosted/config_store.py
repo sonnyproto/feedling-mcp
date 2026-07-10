@@ -60,12 +60,37 @@ from notices import catalog as notices_catalog
 
 
 def _load_model_api_config(store: UserStore) -> dict | None:
-    data = db.get_blob(store.user_id, "model_api")
-    if not data:
+    """The user's active model_api config, projected to the legacy blob shape.
+
+    Post model-api-multi-profile migration the config lives in
+    ``model_api_routes`` + ``model_api_credentials`` (one active route per user,
+    see alembic 0014). This projection lets every existing reader — driver
+    resolution (chat_send/setup), onboarding validate, perception/screen rollout
+    flags, runtime status, admin data-track — keep consuming the same dict shape
+    without each learning the new tables. The frozen ``user_blobs(kind='model_api')``
+    snapshot is a rollback artifact only and is deliberately no longer read here.
+
+    ``api_key_envelope`` is intentionally NOT projected: the only path that needs
+    the ciphertext (enclave decrypt) reads it straight off ``load_active_route``,
+    so keeping it out of this shape shrinks the accidental-serialization surface.
+    """
+    route = db.model_api_active_route(store.user_id)
+    if not route:
         return None
-    if data.get("route") != "model_api":
-        data["route"] = "model_api"
-    return data
+    config = {
+        "route": "model_api",
+        "provider": route["provider"],
+        "model": route["model"],
+        "base_url": route["base_url"],
+        "api_key_hint": route["api_key_hint"],
+        "supports_responses": route["supports_responses"],
+        "test_status": route["test_status"],
+        "last_test_at": route["last_test_at"],
+        "last_test_error": route["last_test_error"],
+    }
+    if route.get("reasoning_effort"):
+        config["reasoning_effort"] = route["reasoning_effort"]
+    return config
 
 
 def _save_model_api_config(store: UserStore, config: dict) -> dict:
@@ -84,6 +109,8 @@ def _public_model_api_config(config: dict | None) -> dict:
     safe = public_provider_config(config)
     safe["configured"] = True
     safe["privacy_mode"] = "tdx_cvm_backend_runtime_option_a"
+    if config.get("reasoning_effort") is not None:
+        safe["reasoning_effort"] = str(config.get("reasoning_effort") or "")
     return safe
 
 
@@ -209,14 +236,12 @@ def _patch_model_api_runtime_profile(store: UserStore, patch: dict) -> dict | No
 def record_runtime_error(store: UserStore, *, error: str, error_class: str = "") -> tuple[dict, int]:
     """agent-runner consumer 上报（或清空）最近一次回合失败原因。
 
-    读侧是 setup_core 的 last_runtime_error（iOS 设置页）。legacy inline 路径经
-    action-trace 写同一字段；本函数是 agent-runner 路径的对等写侧（spec
-    2026-07-06-upstream-error-surfacing 腿②）。"""
-    patch = {
-        "last_runtime_error": str(error or "")[:300],
-        "last_runtime_error_class": str(error_class or "")[:64],
-    }
-    if _patch_model_api_runtime_profile(store, patch) is None:
+    写 active route 行（``model_api_routes.last_runtime_error*``）。读侧是 setup_core 的
+    last_runtime_error（iOS 设置页，也已切到读 route）与 GET /v1/model_api/routes。
+    legacy inline 路径经 action-trace 写同一字段；本函数是 agent-runner 路径的对等写侧
+    （spec 2026-07-06-upstream-error-surfacing 腿②）。"""
+    if not db.model_api_route_mark_runtime_error(
+            store.user_id, error=error, error_class=error_class):
         return {"error": "model_api_runtime_profile_missing"}, 404
     try:
         if error:
@@ -265,11 +290,26 @@ def _append_model_api_action_trace(store: UserStore, entry: dict) -> dict:
         "last_action_trace_id": record["trace_id"],
         "last_action_trace_at": record["created_at"],
     }
+    runtime_error = None
     if record["status"] == "ok":
-        patch["last_runtime_error"] = ""
+        runtime_error = ""
     elif record.get("error"):
-        patch["last_runtime_error"] = str(record.get("error"))[:300]
+        runtime_error = str(record.get("error"))[:300]
+    if runtime_error is not None:
+        patch["last_runtime_error"] = runtime_error
     _patch_model_api_runtime_profile(store, patch)
+    if runtime_error is not None:
+        # GET /v1/model_api/runtime (and /routes) now read last_runtime_error off
+        # the active route row (record_runtime_error's write side), not this blob —
+        # write there too so the legacy inline action-trace path's errors actually
+        # surface. error_class=None preserves whatever class the agent-runner path
+        # (record_runtime_error) already wrote: this path never computes a class.
+        # model_api_route_mark_runtime_error swallows its own exceptions and
+        # returns False when there's no active route — best-effort, same tolerance
+        # _patch_model_api_runtime_profile above already has (returns None when the
+        # runtime blob can't be seeded).
+        db.model_api_route_mark_runtime_error(
+            store.user_id, error=runtime_error, error_class=None)
     return record
 
 
@@ -282,11 +322,19 @@ def _patch_model_api_action_trace(store: UserStore, trace_id: str, patch: dict) 
         "last_action_trace_id": trace_id,
         "last_action_trace_at": core_util._now_iso(),
     }
+    runtime_error = None
     if patch.get("status") in {"completed", "skipped", "ok"}:
-        profile_patch["last_runtime_error"] = ""
+        runtime_error = ""
     elif patch.get("error"):
-        profile_patch["last_runtime_error"] = str(patch.get("error"))[:300]
+        runtime_error = str(patch.get("error"))[:300]
+    if runtime_error is not None:
+        profile_patch["last_runtime_error"] = runtime_error
     _patch_model_api_runtime_profile(store, profile_patch)
+    if runtime_error is not None:
+        # See _append_model_api_action_trace above: writer/reader parity fix —
+        # error_class=None preserves the agent-runner path's class.
+        db.model_api_route_mark_runtime_error(
+            store.user_id, error=runtime_error, error_class=None)
     return record
 
 
@@ -306,13 +354,21 @@ def _provider_config_from_plain(config: dict, api_key: str) -> provider_client.P
     return provider_client.ProviderConfig(provider=provider, model=model, api_key=api_key, base_url=base_url)
 
 
+def load_active_route(store: UserStore) -> dict | None:
+    """当前生效的 route（含其 credential 的 api_key_envelope）。
+
+    这是 hosted 线读 model_api 配置的唯一入口。返回形状见 db.model_api_active_route。
+    """
+    return db.model_api_active_route(store.user_id)
+
+
 def _load_runtime_provider_config(store: UserStore, api_key: str | None, *, runtime_token: str = "") -> provider_client.ProviderConfig | tuple[None, dict]:
-    config = _load_model_api_config(store)
-    if not config:
+    route = load_active_route(store)
+    if not route:
         return None, {"error": "model_api_not_configured"}
-    if config.get("test_status") != "ok":
-        return None, {"error": "model_api_not_tested", "test_status": config.get("test_status", "")}
-    envelope = config.get("api_key_envelope")
+    if route.get("test_status") != "ok":
+        return None, {"error": "model_api_not_tested", "test_status": route.get("test_status", "")}
+    envelope = route.get("api_key_envelope")
     if not isinstance(envelope, dict):
         return None, {"error": "model_api_key_envelope_missing"}
     # A hosted (host-all) turn authenticates with a runtime token, not the
@@ -330,6 +386,6 @@ def _load_runtime_provider_config(store: UserStore, api_key: str | None, *, runt
     except Exception as e:
         return None, {"error": "model_api_key_decrypt_failed", "detail": str(e)[:220]}
     try:
-        return _provider_config_from_plain(config, provider_key)
+        return _provider_config_from_plain(route, provider_key)
     except provider_client.ProviderError as e:
         return None, {"error": "model_api_config_invalid", "detail": str(e)}

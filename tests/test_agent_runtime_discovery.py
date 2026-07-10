@@ -36,7 +36,8 @@ def test_apply_discovery_filters_roster_to_enabled_and_sets_driver_and_provider(
     # user can be wired native-vs-gateway at spawn).
     enabled = {"u1": {"driver": "claude", "provider": "anthropic", "model": "claude-x", "base_url": ""},
                "u2": {"driver": "codex", "provider": "openai_compatible", "model": "qwen",
-                      "base_url": "https://my.host/v1", "supports_responses": True}}
+                      "base_url": "https://my.host/v1", "supports_responses": True,
+                      "reasoning_effort": "medium"}}
     out = supervisor_mod._apply_discovery(roster, enabled)
     by_uid = {e["user_id"]: e for e in out}
     assert set(by_uid) == {"u1", "u2"}            # u3 dropped (not enabled)
@@ -46,6 +47,7 @@ def test_apply_discovery_filters_roster_to_enabled_and_sets_driver_and_provider(
     assert by_uid["u2"]["model"] == "qwen"        # model stamped for gateway routing
     assert by_uid["u2"]["base_url"] == "https://my.host/v1"  # custom endpoint preserved
     assert by_uid["u2"]["supports_responses"] is True  # /responses capability stamped for transport
+    assert by_uid["u2"]["reasoning_effort"] == "medium"  # per-user gateway reasoning switch
     assert by_uid["u1"]["api_key"] == "k1"        # credential preserved
 
 
@@ -57,24 +59,36 @@ def test_apply_discovery_empty_enabled_drops_all():
 # ---- DB query: list_agent_runtime_enabled_users ----
 
 
+_ENV = {"v": 1, "body_ct": "ct", "nonce": "n"}
+
+
 @pytest.fixture()
 def _clean_blobs():
+    # model_api_routes / model_api_credentials 取代了 user_blobs(kind='model_api')
+    # 作为 roster 的数据源（Task 3）；三张表一起清空，保持本文件一直依赖的
+    # 「每个测试都是干净全局状态」的精确 set-equality 断言成立。
     with db.get_pool().connection() as conn:
-        conn.execute("TRUNCATE user_blobs")
+        conn.execute("TRUNCATE model_api_routes, model_api_credentials, user_blobs")
     yield
 
 
 def _seed_model_api(user_id: str, *, provider: str, test_status: str,
                     enabled: bool | None = None, agent_runtime_driver: str | None = None,
-                    model: str = "x", base_url: str = ""):
+                    model: str = "x", base_url: str = "", reasoning_effort: str = ""):
+    # `enabled` / `agent_runtime_driver` 保留在签名里只为了不动调用方——两者从来
+    # 不是 discovery 的 gate（旧 blob SQL 也没读过 doc->>'agent_runtime_driver'，
+    # 见 test_list_enabled_users_ignores_explicit_opt_out_flag 的注释），新表更
+    # 没有对应列，这里原样忽略。真正决定是否入 roster 的是 is_active + test_status。
     seed_user(user_id)
-    doc: dict = {"provider": provider, "model": model, "test_status": test_status,
-                 "base_url": base_url}
-    if agent_runtime_driver is not None:
-        doc["agent_runtime_driver"] = agent_runtime_driver
-    elif enabled is not None:
-        doc["agent_runtime_driver"] = "auto" if enabled else "legacy"
-    db.set_blob(user_id, "model_api", doc)
+    cid = db.model_api_credential_create(
+        user_id, provider=provider, base_url=base_url, label=f"{provider} key",
+        api_key_envelope=_ENV, api_key_hint="sk-x...000", supports_responses=False,
+    )
+    rid = db.model_api_route_upsert(
+        user_id, cid, model, reasoning_effort or None)
+    if test_status:
+        db.model_api_route_mark_test(user_id, rid, status=test_status)
+    db.model_api_route_activate(user_id, rid)
 
 
 def _seed_all(_clean_blobs):
@@ -82,7 +96,8 @@ def _seed_all(_clean_blobs):
     _seed_model_api("deepseek_on", provider="deepseek", test_status="ok", enabled=True)
     _seed_model_api("openai_on", provider="openai", test_status="ok", enabled=True)
     _seed_model_api("gemini_on", provider="gemini", test_status="ok", enabled=True, model="gemini-2.0-flash")  # codex via gateway
-    _seed_model_api("openrouter_on", provider="openrouter", test_status="ok", enabled=True)  # codex via gateway
+    _seed_model_api("openrouter_on", provider="openrouter", test_status="ok", enabled=True,
+                    reasoning_effort="medium")  # codex via gateway
     _seed_model_api("compat_on", provider="openai_compatible", test_status="ok", enabled=True,
                     base_url="https://my.host/v1")  # codex via gateway
     _seed_model_api("anthropic_off", provider="anthropic", test_status="ok", enabled=False)  # not enabled
@@ -124,6 +139,7 @@ def test_list_enabled_users_includes_gateway_when_enabled(_clean_blobs):
     assert rows["gemini_on"]["provider"] == "gemini"
     assert rows["gemini_on"]["model"] == "gemini-2.0-flash"
     assert rows["openai_on"]["provider"] == "openai"
+    assert rows["openrouter_on"]["reasoning_effort"] == "medium"
     # openai_compatible's custom endpoint must survive into LiteLLM's api_base
     assert rows["compat_on"]["base_url"] == "https://my.host/v1"
 

@@ -179,3 +179,94 @@ def _is_not_found(e) -> bool:
         if code in ("NoSuchKey", "NoSuchBucket", "404"):
             return True
     return e.__class__.__name__ in ("NoSuchKey", "404")
+
+
+# --------------------------------------------------------------------------- #
+# Chat file bodies — heavy content_type="file" ciphertext offloaded off the
+# chat_messages row, mirroring the frame offload above. Its own bucket so it
+# never collides with frames or the WAL-G backup bucket. Target bucket is
+# ``io-user-attachments`` (reuses the existing R2_* credentials — no new key
+# needed); set ``R2_CHAT_FILES_BUCKET=io-user-attachments`` to enable. Until that
+# env is set, ``chat_files_enabled()`` is False and db.chat_append/chat_load keep
+# the full body inline in Postgres, exactly as before — a no-op until enabled.
+# No default is baked in on purpose: enabling is an explicit, one-way switch
+# (once pointer rows exist, removing the env makes those files unreadable).
+# --------------------------------------------------------------------------- #
+
+_CHAT_KEY_PREFIX = "chatfiles"
+
+
+def _chat_files_bucket() -> str:
+    return os.environ.get("R2_CHAT_FILES_BUCKET", "").strip()
+
+
+def chat_files_enabled() -> bool:
+    """True only when R2 credentials + the chat-files bucket are all present."""
+    return bool(_endpoint() and _access_key() and _secret_key() and _chat_files_bucket())
+
+
+def chat_file_key(user_id: str, msg_id: str) -> str:
+    return f"{_CHAT_KEY_PREFIX}/{user_id}/{msg_id}"
+
+
+def put_chat_file_body(user_id: str, msg_id: str, body_ct_b64: str) -> str:
+    """Upload the decoded ciphertext bytes; return the R2 object key.
+
+    Raises on failure so the caller (db.chat_append) can fall back to inline
+    ``doc`` storage rather than persist a pointer to a missing object."""
+    key = chat_file_key(user_id, msg_id)
+    raw = base64.b64decode(body_ct_b64)
+    _client().put_object(
+        Bucket=_chat_files_bucket(),
+        Key=key,
+        Body=raw,
+        ContentType="application/octet-stream",
+    )
+    return key
+
+
+def get_chat_file_body(user_id: str, msg_id: str) -> str | None:
+    """Fetch the object and re-encode to the original base64 ``body_ct``.
+
+    Returns None if the object is missing or the fetch fails (the caller then
+    surfaces an absent body rather than crashing the chat read path)."""
+    key = chat_file_key(user_id, msg_id)
+    try:
+        resp = _client().get_object(Bucket=_chat_files_bucket(), Key=key)
+    except Exception as e:  # noqa: BLE001
+        if _is_not_found(e):
+            return None
+        log.error("[r2] get_chat_file_body(%s) failed: %s", key, e)
+        return None
+    raw = resp["Body"].read()
+    return base64.b64encode(raw).decode("ascii")
+
+
+def delete_chat_file_body(user_id: str, msg_id: str) -> None:
+    key = chat_file_key(user_id, msg_id)
+    try:
+        _client().delete_object(Bucket=_chat_files_bucket(), Key=key)
+    except Exception as e:  # noqa: BLE001
+        log.error("[r2] delete_chat_file_body(%s) failed: %s", key, e)
+
+
+def delete_user_chat_files(user_id: str) -> None:
+    """Delete every object under ``chatfiles/<user_id>/`` (account reset/clear)."""
+    prefix = f"{_CHAT_KEY_PREFIX}/{user_id}/"
+    try:
+        client = _client()
+        bucket = _chat_files_bucket()
+        token = None
+        while True:
+            kwargs = {"Bucket": bucket, "Prefix": prefix}
+            if token:
+                kwargs["ContinuationToken"] = token
+            resp = client.list_objects_v2(**kwargs)
+            objs = [{"Key": c["Key"]} for c in resp.get("Contents", [])]
+            if objs:
+                client.delete_objects(Bucket=bucket, Delete={"Objects": objs})
+            if not resp.get("IsTruncated"):
+                break
+            token = resp.get("NextContinuationToken")
+    except Exception as e:  # noqa: BLE001
+        log.error("[r2] delete_user_chat_files(%s) failed: %s", user_id, e)

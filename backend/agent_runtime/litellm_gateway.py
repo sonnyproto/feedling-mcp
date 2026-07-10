@@ -59,6 +59,10 @@ def _norm_provider(provider: str) -> str:
 # can later expose a per-account reasoning toggle without touching this code.
 _DEFAULT_REASONING_EFFORT = (os.environ.get("FEEDLING_AGENT_REASONING_EFFORT", "off") or "").strip().lower()
 _REASONING_OFF = {"", "off", "none", "no", "false", "0", "disabled"}
+# The Responses `reasoning.effort` enum. codex speaks the Responses wire and
+# OpenRouter serves it natively, so effort is the only reasoning shape that
+# reaches the upstream (see _openrouter_reasoning_request).
+_OPENROUTER_REASONING_EFFORTS = ("low", "medium", "high")
 
 
 def _resolve_reasoning_effort(entry_effort: str | None = None) -> str:
@@ -66,6 +70,22 @@ def _resolve_reasoning_effort(entry_effort: str | None = None) -> str:
     default. Returns "" when reasoning is disabled (no reasoning requested)."""
     effort = (str(entry_effort or "").strip().lower()) or _DEFAULT_REASONING_EFFORT
     return "" if effort in _REASONING_OFF else effort
+
+
+def _openrouter_reasoning_request(effort: str) -> dict:
+    """OpenRouter reasoning params for the Responses wire.
+
+    codex only ever speaks the OpenAI Responses wire, and OpenRouter serves it
+    NATIVELY (OpenRouterResponsesAPIConfig, litellm 1.89.4) — not via the
+    responses->chat bridge. The Responses ``reasoning`` object only accepts
+    {effort, summary}; a chat-wire {max_tokens} budget is silently dropped there
+    (probed 2026-07-11 against /responses: effort -> 17 reasoning_tokens with a
+    real chain, max_tokens -> 0). So emit effort for ALL OpenRouter families,
+    Anthropic included. low/medium/high are the valid Responses effort values;
+    anything else (incl. legacy numeric budgets) falls back to medium.
+    """
+    normalized = effort if effort in _OPENROUTER_REASONING_EFFORTS else "medium"
+    return {"effort": normalized}
 
 
 def gateway_model_id(user_id: str) -> str:
@@ -108,19 +128,16 @@ def build_model_entry(
     }
     normalized_provider = _norm_provider(provider)
     if normalized_provider == "openrouter":
-        # OpenRouter returns provider reasoning only when the request asks for it
-        # WITH a budget. ``enabled: true`` alone yields NO reasoning for
-        # Anthropic-family models (verified against openrouter) — an ``effort``
-        # (or token budget) is required. Gated by the reasoning switch (default
-        # "high"); "off" sends no reasoning. Non-reasoning models ignore it
-        # gracefully (no error), so this is safe across the openrouter model set.
+        # OpenRouter serves the Responses API natively and codex speaks Responses
+        # only, so the request never hits the responses->chat bridge. The
+        # Responses `reasoning` object takes {effort} — the chat-wire {max_tokens}
+        # budget is silently ignored there (probed 2026-07-11 against /responses:
+        # effort -> reasoning_tokens>0, max_tokens -> 0). So emit effort for every
+        # OpenRouter family, Anthropic included. Default-off per-user.
         effort = _resolve_reasoning_effort(reasoning_effort)
         if effort:
             params["extra_body"] = {
-                "reasoning": {
-                    "effort": effort,
-                    "exclude": False,
-                },
+                "reasoning": _openrouter_reasoning_request(effort),
             }
     if normalized_provider == "openai_compatible":
         # codex `exec` always ships a `web_search` tool and offers no switch to
@@ -215,8 +232,8 @@ def upstream_env(entries: list[dict]) -> dict[str, str]:
 
 def config_signature(entries: list[dict]) -> str:
     """A stable hash of the gateway-user ROUTING set (user_id/provider/model/
-    base_url) — NOT the secret keys. The supervisor restarts LiteLLM only when
-    this changes, so key rotation alone doesn't bounce the proxy."""
+    base_url/reasoning) — NOT the secret keys. The supervisor restarts LiteLLM
+    only when this changes, so key rotation alone doesn't bounce the proxy."""
     norm = sorted(
         (
             {
@@ -225,6 +242,7 @@ def config_signature(entries: list[dict]) -> str:
                 "model": e.get("model") or "",
                 "base_url": e.get("base_url") or "",
                 "supports_responses": bool(e.get("supports_responses", False)),
+                "reasoning_effort": e.get("reasoning_effort") or "",
             }
             for e in entries
         ),

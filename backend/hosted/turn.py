@@ -1746,14 +1746,100 @@ def _model_api_maybe_run_memory_capture(
 
 MODEL_API_MAX_IMAGE_BYTES = 2_000_000
 
+MODEL_API_MAX_FILE_BYTES = 26_214_400  # 25 MiB — MUST be >= iOS client cap (ChatEmptyStateView 25*1024*1024)
+
+_IMAGE_EXTS = {"jpg", "jpeg", "png", "webp", "gif"}
+_DOC_EXTS = {"pdf", "docx", "xlsx"}
+_DEFAULT_DOC_MIME = {
+    "pdf": "application/pdf",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+
+def _file_ext(name: str) -> str:
+    _, _, ext = name.rpartition(".")
+    return ext.lower() if "." in name else ""
+
+
+def _display_file_name(raw: str) -> str:
+    # Keep the user-facing name (incl. CJK); strip path components + control
+    # chars only. The fs-safe ASCII clean happens later in the consumer when it
+    # builds an on-disk path — do NOT ascii-ize here or 《离职协议.docx》 → ___.docx.
+    base = raw.replace("\\", "/").rsplit("/", 1)[-1]
+    base = "".join(ch for ch in base if ch.isprintable() and ch not in ('\n', '\r', '\t'))
+    base = base.strip().strip(".") or "file"
+    return base[:120]
+
+
+def _normalize_image_mime(mime: str, ext: str) -> str | None:
+    m = mime.lower()
+    if m in ("image/jpeg", "image/jpg"):
+        return "image/jpeg"
+    if m in ("image/png", "image/webp", "image/gif"):
+        return m
+    by_ext = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+              "webp": "image/webp", "gif": "image/gif"}
+    return by_ext.get(ext)  # None for heic and anything unsupported
+
+
+def _looks_like_text(data: bytes) -> bool:
+    if b"\x00" in data:
+        return False
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def _model_api_file_payload(payload: dict) -> tuple[dict | None, tuple[dict, int] | None]:
+    raw = str(payload.get("file_b64") or "").strip()
+    if not raw:
+        return None, None
+    if raw.startswith("data:"):
+        _, _, raw = raw.partition(",")
+        raw = raw.strip()
+    try:
+        data = base64.b64decode(raw, validate=True)
+    except Exception:
+        return None, ({"error": "invalid_file", "detail": "file_b64 must be valid base64"}, 400)
+    if not data:
+        return None, ({"error": "invalid_file", "detail": "file_b64 must not be empty"}, 400)
+    if len(data) > MODEL_API_MAX_FILE_BYTES:
+        return None, ({"error": "payload_too_large", "detail": "file too large",
+                       "max_bytes": MODEL_API_MAX_FILE_BYTES}, 413)
+    name = _display_file_name(str(payload.get("file_name") or "").strip())
+    mime = str(payload.get("file_mime") or "").strip().lower()
+    ext = _file_ext(name)
+
+    if mime.startswith("image/") or ext in _IMAGE_EXTS:
+        img_mime = _normalize_image_mime(mime, ext)
+        if img_mime is None:
+            return None, ({"error": "unsupported_file_type",
+                           "detail": f"image type not supported: {mime or ext or 'unknown'}",
+                           "hint": "convert to jpeg/png/webp/gif before sending"}, 400)
+        return {"kind": "image", "bytes": data, "mime": img_mime, "name": name}, None
+
+    if ext in _DOC_EXTS:
+        return {"kind": "file", "bytes": data,
+                "mime": mime or _DEFAULT_DOC_MIME[ext], "name": name}, None
+
+    if _looks_like_text(data):
+        return {"kind": "file", "bytes": data, "mime": mime or "text/plain", "name": name}, None
+
+    return None, ({"error": "unsupported_file_type",
+                   "detail": f"file type not supported: {ext or mime or 'binary'}",
+                   "hint": "supported: pdf, docx, xlsx, images, or utf-8 text/source files"}, 400)
+
 
 def _model_api_image_payload(payload: dict) -> tuple[bytes | None, str, str | None]:
     raw = str(payload.get("image_b64") or payload.get("image_base64") or "").strip()
     if not raw:
         return None, "", None
     mime = str(payload.get("image_mime") or "image/jpeg").strip() or "image/jpeg"
-    if not re.match(r"^image/(jpeg|jpg|png|webp)$", mime, re.I):
-        return None, "", "image_mime must be image/jpeg, image/png, or image/webp"
+    if not re.match(r"^image/(jpeg|jpg|png|webp|gif)$", mime, re.I):
+        return None, "", "image_mime must be image/jpeg, image/png, image/webp, or image/gif"
     if raw.startswith("data:"):
         head, _, rest = raw.partition(",")
         raw = rest.strip()

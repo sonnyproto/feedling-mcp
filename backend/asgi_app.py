@@ -50,6 +50,7 @@ _ASGI_PACKAGES = (
     "genesis.routes_asgi",
     "onboarding_archive.routes_asgi",
     "hosted.setup_routes_asgi",
+    "hosted.mcp_routes_asgi",
     "hosted.chat_routes_asgi",
     "hosted.history_import_asgi",
     "hosted.onboarding_validation_asgi",

@@ -18,6 +18,7 @@ from core import envelope as core_envelope
 from core import util as core_util
 from identity import service as identity_service
 from memory import service as memory_service
+from memory.prompts_v1 import normalize_bucket_language
 
 def _memory_action_text(value, max_chars: int) -> str:
     text = str(value or "").strip()
@@ -134,10 +135,17 @@ def _memory_inner_from_action(data: dict) -> dict:
     if not threads:
         linked = _memory_action_list(data.get("linked_dimension"), max_items=1, max_chars=80)
         threads.extend(linked)
+    content = _memory_content_from_action(data, summary)
+    bucket = _memory_action_text(data.get("bucket") or _memory_default_bucket(data.get("type")), 80)
+    # Backstop: the model still labels a Chinese card with an English common bucket (and
+    # vice versa) despite the guidance. Map it back to the card's own language here — the
+    # single chokepoint every write path funnels through — so no path can leak an
+    # off-language common bucket. Custom buckets pass through unchanged.
+    bucket = normalize_bucket_language(bucket, f"{summary}\n{content}")
     return {
         "summary": summary,
-        "content": _memory_content_from_action(data, summary),
-        "bucket": _memory_action_text(data.get("bucket") or _memory_default_bucket(data.get("type")), 80),
+        "content": content,
+        "bucket": bucket,
         "threads": threads,
     }
 

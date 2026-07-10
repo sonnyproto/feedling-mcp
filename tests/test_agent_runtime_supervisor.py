@@ -340,6 +340,46 @@ def test_tick_no_respawn_when_config_unchanged():
     assert len(procs.spawned) == 1
 
 
+def test_respawn_releases_inflight_claim_after_kill_before_spawn(monkeypatch):
+    # Task 8 core guarantee: on a config-changed respawn the old consumer's
+    # in-flight reply claim is released — but ONLY after kill_fn confirms the
+    # old consumer is dead and BEFORE the replacement is spawned. Ordering is
+    # the whole point: releasing before the kill would let a poll re-hand the
+    # message while the old consumer is still burning provider quota on it
+    # (chat/service.py:66-70's double-provider-burn window).
+    events: list[str] = []
+
+    class OrderedProcs(FakeProcTable):
+        def spawn(self, entry, user_id, home):
+            events.append("spawn")
+            return super().spawn(entry, user_id, home)
+
+        def kill(self, pid):
+            events.append("kill")
+            return super().kill(pid)
+
+    def _fake_release(user_id):
+        events.append("release")
+        return 1  # non-zero → notify should fire
+
+    monkeypatch.setattr(supervisor_mod.db, "chat_expire_reply_claims", _fake_release)
+    monkeypatch.setattr(supervisor_mod.wake_bus, "notify",
+                        lambda channel, uid="": events.append(f"notify:{channel}"))
+
+    _roster("u_1")  # seed the users row so acquire's FK is satisfied
+    procs = OrderedProcs()
+    sup = _sup(procs)
+    sup.tick([{"user_id": "u_1", "api_key": "k", "driver": "claude", "provider": "anthropic"}])
+    assert sup.children.get("u_1"), "initial spawn should have tracked a child"
+    events.clear()  # drop the initial spawn; we only care about the respawn tick
+
+    sup.tick([{"user_id": "u_1", "api_key": "k", "driver": "codex", "provider": "openai"}])
+
+    assert "release" in events, events
+    assert events.index("kill") < events.index("release") < events.index("spawn"), events
+    assert events.index("release") < events.index("notify:chat"), events
+
+
 def test_tick_gateway_upstream_key_rotation_does_not_respawn_consumer():
     # For a gateway user the upstream provider_key goes to LiteLLM, NOT the consumer
     # env — rotating it must not bounce the (heavy) consumer process.
@@ -611,6 +651,16 @@ def test_gateway_entries_carry_supports_responses_for_bridge_choice():
     assert gw["bridge"]["supports_responses"] is False
 
 
+def test_gateway_entries_carry_reasoning_effort_for_whitelist_rollout():
+    roster = [
+        {"user_id": "openrouter_user", "driver": "codex", "provider": "openrouter",
+         "model": "anthropic/claude-sonnet-4.6", "provider_key": "k",
+         "reasoning_effort": "medium"},
+    ]
+    gw = supervisor_mod._gateway_entries(roster)
+    assert gw[0]["reasoning_effort"] == "medium"
+
+
 def test_drop_gateway_users_filters_when_gateway_disabled():
     # With the gateway off, codex-gateway users must NOT be spawned (no proxy to
     # reach) — they're dropped so enabling hosted for them stays inert, not broken.
@@ -868,13 +918,17 @@ def test_autoverify_triggers_once_then_marks_done():
         calls.append(headers)
         return True   # passing
 
-    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
-                                     state=state, post_verify=post_verify, now=lambda: 100.0)
-    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
-                                     state=state, post_verify=post_verify, now=lambda: 100.0)
+    passed = supervisor_mod._maybe_autoverify(
+        "u1", mint_token=lambda u: "t", api_url="a",
+        state=state, post_verify=post_verify, now=lambda: 100.0)
+    skipped = supervisor_mod._maybe_autoverify(
+        "u1", mint_token=lambda u: "t", api_url="a",
+        state=state, post_verify=post_verify, now=lambda: 100.0)
     assert len(calls) == 1                          # second call skipped (done)
     assert calls[0] == {"X-Feedling-Runtime-Token": "t"}
     assert state["u1"]["done"] is True
+    assert passed is True
+    assert skipped is False
 
 
 def test_autoverify_backs_off_after_failure():
@@ -889,12 +943,16 @@ def test_autoverify_backs_off_after_failure():
         return False   # never passes
 
     now = lambda: clock["t"]
-    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
-                                     state=state, post_verify=post_verify, now=now)
+    passed = supervisor_mod._maybe_autoverify(
+        "u1", mint_token=lambda u: "t", api_url="a",
+        state=state, post_verify=post_verify, now=now)
     assert len(calls) == 1                          # first probe at t=0
-    supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
-                                     state=state, post_verify=post_verify, now=now)
+    skipped = supervisor_mod._maybe_autoverify(
+        "u1", mint_token=lambda u: "t", api_url="a",
+        state=state, post_verify=post_verify, now=now)
     assert len(calls) == 1                          # immediate retry suppressed (backoff)
+    assert passed is False
+    assert skipped is False
     clock["t"] = 10_000.0
     supervisor_mod._maybe_autoverify("u1", mint_token=lambda u: "t", api_url="a",
                                      state=state, post_verify=post_verify, now=now)

@@ -13,6 +13,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import db
 from perception.agent_fields import project_signal
+from proactive.agent_protocol_v2 import sanitize_visible_message_text_v2
 from proactive.tool_catalog_v2 import FAST, SLOW, CostClass, ToolCatalogV2, default_tool_catalog_v2
 
 TOOL_TRACE_STREAM_V2 = "proactive_tool_traces_v2"
@@ -368,7 +369,8 @@ class ToolExecutorV2:
         if call.name == "send_message":
             if not self.adapters.send_message:
                 return ("send_message_adapter_missing", "send_message requires a hosted/resident output adapter")
-            if not str(args.get("text") or "").strip():
+            text = sanitize_visible_message_text_v2(args.get("text"))
+            if not text:
                 return ("send_message_text_required", "send_message requires non-empty text")
         if call.name == "screen.read" and not self.adapters.screen_read:
             return ("screen_adapter_missing", "screen.read requires a screen runtime adapter")
@@ -419,7 +421,7 @@ class ToolExecutorV2:
         if call.name in MEMORY_WRITE_TOOL_NAMES_V2:
             return self._execute_memory_action_tool(call, args)
         if call.name == "send_message":
-            text = str(args.get("text") or "").strip()
+            text = sanitize_visible_message_text_v2(args.get("text"))
             assert self.adapters.send_message is not None
             return dict(self.adapters.send_message(call.user_id, text, args))
         if call.name == "sleep":

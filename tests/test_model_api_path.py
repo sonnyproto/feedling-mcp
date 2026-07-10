@@ -26,6 +26,7 @@ from core import store as core_store  # noqa: E402
 from hosted import agent_runtime_cutover  # noqa: E402
 from hosted import history_import  # noqa: E402
 from identity import service as identity_service  # noqa: E402
+from agent_runtime import litellm_gateway  # noqa: E402
 
 
 def _b64(raw: bytes) -> str:
@@ -210,7 +211,9 @@ def test_model_api_setup_encrypts_and_redacts(client, monkeypatch):
     assert get_res.status_code == 200
     assert "api_key_envelope" not in get_res.get_json()["config"]
 
-    config_text = json.dumps(db.get_blob(user_id, "model_api") or {})
+    cred_id = db.model_api_credentials_list(user_id)[0]["id"]
+    stored = db.model_api_credential_get(user_id, cred_id)
+    config_text = json.dumps(stored)
     assert raw_provider_key not in config_text
     assert "api_key_envelope" in config_text
 
@@ -250,8 +253,8 @@ def test_model_api_setup_stores_responses_support_for_openai_compatible(client, 
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
     assert probed == ["https://relay.host/v1"]  # probed exactly the relay
-    stored = db.get_blob(user_id, "model_api")
-    assert stored["supports_responses"] is True
+    route = db.model_api_active_route(user_id)
+    assert route["supports_responses"] is True
 
 
 def test_model_api_setup_does_not_probe_non_openai_compatible(client, monkeypatch):
@@ -271,8 +274,102 @@ def test_model_api_setup_does_not_probe_non_openai_compatible(client, monkeypatc
         headers=_headers(api_key),
     )
     assert setup.status_code == 200, setup.get_data(as_text=True)
-    stored = db.get_blob(user_id, "model_api")
-    assert stored.get("supports_responses", False) is False
+    route = db.model_api_active_route(user_id)
+    assert route["supports_responses"] is False
+
+
+def test_model_api_setup_persists_reasoning_effort_and_gateway_uses_effort(client, monkeypatch):
+    user_id, api_key = _register(client)
+    monkeypatch.setattr(provider_client, "test_provider_key",
+                        lambda cfg: {"reply": "ok", "usage": {}})
+
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.6",
+            "api_key": "sk-or",
+            "reasoning_effort": "medium",
+        },
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 200, setup.get_data(as_text=True)
+    assert setup.get_json()["config"]["reasoning_effort"] == "medium"
+    route = db.model_api_active_route(user_id)
+    assert route["reasoning_effort"] == "medium"
+
+    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(include_gateway=True)}
+    row = rows[user_id]
+    assert row["reasoning_effort"] == "medium"
+    entry = litellm_gateway.build_model_entry(
+        user_id=user_id, provider=row["provider"], model=row["model"],
+        reasoning_effort=row["reasoning_effort"],
+    )
+    assert entry["litellm_params"]["extra_body"]["reasoning"] == {"effort": "medium"}
+
+
+def test_model_api_setup_reasoning_effort_off_and_default_disable_gateway_reasoning(client, monkeypatch):
+    user_off, key_off = _register(client)
+    user_default, key_default = _register(client)
+    monkeypatch.setattr(provider_client, "test_provider_key",
+                        lambda cfg: {"reply": "ok", "usage": {}})
+
+    off = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.6",
+            "api_key": "sk-or",
+            "reasoning_effort": "off",
+        },
+        headers=_headers(key_off),
+    )
+    assert off.status_code == 200, off.get_data(as_text=True)
+    default = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.6",
+            "api_key": "sk-or",
+        },
+        headers=_headers(key_default),
+    )
+    assert default.status_code == 200, default.get_data(as_text=True)
+
+    stored_off = db.get_blob(user_off, "model_api")
+    stored_default = db.get_blob(user_default, "model_api")
+    assert stored_off["reasoning_effort"] == "off"
+    assert "reasoning_effort" not in stored_default
+
+    rows = {u["user_id"]: u for u in db.list_agent_runtime_enabled_users(include_gateway=True)}
+    for uid in (user_off, user_default):
+        row = rows[uid]
+        entry = litellm_gateway.build_model_entry(
+            user_id=uid, provider=row["provider"], model=row["model"],
+            reasoning_effort=row["reasoning_effort"],
+        )
+        assert "extra_body" not in entry["litellm_params"]
+
+
+def test_model_api_setup_rejects_invalid_reasoning_effort(client, monkeypatch):
+    _user_id, api_key = _register(client)
+
+    def provider_test_must_not_run(cfg):
+        raise AssertionError("invalid reasoning_effort should fail before provider probe")
+
+    monkeypatch.setattr(provider_client, "test_provider_key", provider_test_must_not_run)
+    setup = client.post(
+        "/v1/model_api/setup",
+        json={
+            "provider": "openrouter",
+            "model": "anthropic/claude-sonnet-4.6",
+            "api_key": "sk-or",
+            "reasoning_effort": "mediumish",
+        },
+        headers=_headers(api_key),
+    )
+    assert setup.status_code == 400
+    assert setup.get_json()["error"] == "invalid_reasoning_effort"
 
 
 def test_setup_warns_when_relay_lacks_responses(client, monkeypatch):
@@ -748,7 +845,9 @@ def test_history_import_and_hosted_chat_complete_model_api_path(client, monkeypa
     )
     assert any(row["source"] == "model_api" and row["role"] == "user" for row in rows)
     assert all("body_ct" in row for row in rows if row["source"] == "model_api")
-    assert "sk-test-secret" not in json.dumps(db.get_blob(user_id, "model_api") or {})
+    cred_id = db.model_api_credentials_list(user_id)[0]["id"]
+    stored_cred = db.model_api_credential_get(user_id, cred_id)
+    assert "sk-test-secret" not in json.dumps(stored_cred)
 
 def test_model_api_context_summary_parsing_drops_generic_runtime_fallback():
     reply, summary = hosted_turn._model_api_parse_turn_reply(
@@ -1652,6 +1751,124 @@ def test_chat_history_hides_verify_reply_but_keeps_ping(client):
     assert real["id"] in ids, "the real user message must still appear"
     # total reflects the visible feed: real + ping (reply filtered out)
     assert body["total"] == 2, body
+
+
+def test_chat_history_hides_stale_verify_ping(client):
+    """A verify PING that outlived its verify_loop (GC skipped by a mid-run
+    SIGTERM) must NOT linger in the visible feed as a '__VERIFY_PING__:...'
+    bubble. Fresh pings stay (enclave consumer needs them); stale ones drop."""
+    import time
+    import uuid
+
+    from chat import chat_core
+    from core import store as core_store
+
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+
+    def _env(body: str) -> dict:
+        return {
+            "v": 1, "id": uuid.uuid4().hex, "body_ct": _b64(body.encode("utf-8")),
+            "nonce": _b64(b"\x00" * 12), "K_user": _b64(b"\x00" * 32),
+            "visibility": "local_only", "owner_user_id": user_id,
+        }
+
+    real = store.append_chat("user", "chat", _env("hello"))
+    fresh = store.append_chat("user", "verify_ping", _env("__VERIFY_PING__:fresh"))
+    stale = store.append_chat("user", "verify_ping", _env("__VERIFY_PING__:stale"))
+    # Backdate the stale ping past the visible TTL (verify_loop long dead).
+    stale["ts"] = time.time() - (chat_core.VERIFY_PING_VISIBLE_TTL_SEC + 60)
+
+    res = client.get("/v1/chat/history?limit=50", headers=_headers(api_key))
+    assert res.status_code == 200, res.get_data(as_text=True)
+    ids = [m.get("id") for m in res.get_json()["messages"]]
+
+    assert real["id"] in ids
+    assert fresh["id"] in ids, "a FRESH ping must still reach enclave-backed consumers"
+    assert stale["id"] not in ids, f"stale verify_ping leaked into history: {ids}"
+
+
+def test_message_body_refuses_verify_ping(client):
+    """Fetching a verify_ping row by id must 404 — it is never legitimate user
+    content, so a leaked ping id can't be re-fetched out-of-band."""
+    import uuid
+
+    from core import store as core_store
+
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+    ping = store.append_chat("user", "verify_ping", {
+        "v": 1, "id": uuid.uuid4().hex, "body_ct": _b64(b"__VERIFY_PING__:x"),
+        "nonce": _b64(b"\x00" * 12), "K_user": _b64(b"\x00" * 32),
+        "visibility": "local_only", "owner_user_id": user_id,
+    })
+    res = client.get(f"/v1/chat/messages/{ping['id']}/body", headers=_headers(api_key))
+    assert res.status_code == 404, res.get_data(as_text=True)
+
+
+def test_export_excludes_verify_ping(client):
+    """Data export must not carry synthetic verify-loop rows."""
+    import uuid
+
+    from content import content_core
+    from core import store as core_store
+
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+
+    def _env(body: str) -> dict:
+        return {
+            "v": 1, "id": uuid.uuid4().hex, "body_ct": _b64(body.encode()),
+            "nonce": _b64(b"\x00" * 12), "K_user": _b64(b"\x00" * 32),
+            "visibility": "local_only", "owner_user_id": user_id,
+        }
+
+    real = store.append_chat("user", "chat", _env("hello"))
+    ping = store.append_chat("user", "verify_ping", _env("__VERIFY_PING__:x"))
+    reply = store.append_chat("openclaw", "verify_ping", _env("__verify_ack__"))
+
+    import json as _json
+    result = content_core.export_data(store)
+    export = _json.loads(result.raw_body)
+    ids = {m.get("id") for m in export.get("chat", [])}
+    assert real["id"] in ids
+    assert ping["id"] not in ids, "verify_ping PING leaked into export"
+    assert reply["id"] not in ids, "verify_ping REPLY leaked into export"
+
+
+def test_verify_ping_reply_never_delivers_push(client):
+    """Defense-in-depth: a verify_ping reply must not deliver push / Live Activity
+    even if the caller supplies a body (the consumer already sends suppress_push).
+
+    write_response returns only {id, ts, v}, so we observe the real safety
+    property by mocking the delivery function and asserting it is never called."""
+    import uuid
+    from unittest.mock import patch
+
+    from chat import chat_core
+    from core import store as core_store
+    from push import service as push_service
+
+    user_id, api_key = _register(client)
+    store = core_store.get_store(user_id)
+    payload = {
+        "envelope": {
+            "v": 1, "id": uuid.uuid4().hex, "body_ct": _b64(b"__verify_ack__"),
+            "nonce": _b64(b"\x00" * 12), "K_user": _b64(b"\x00" * 32),
+            "visibility": "local_only", "owner_user_id": user_id,
+        },
+        "source": "verify_ping",
+        "push_body": "should never surface",
+        "push_live_activity": True,
+    }
+    with patch.object(
+        push_service, "_deliver_ai_message_push_if_background", return_value={}
+    ) as deliver:
+        body, status = chat_core.write_response(
+            store, payload, consumer_id="c", consumer_info={}, allow_verify_reply=True,
+        )
+    assert status in (200, 201), body
+    deliver.assert_not_called()
 
 
 def _verify_reply_envelope(user_id: str) -> dict:

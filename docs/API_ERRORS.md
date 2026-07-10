@@ -36,6 +36,8 @@
 | `not_found` | 404 | — | 通用资源不存在 | ✅ |
 | `not_owned` | 403 | — | 资源不属于调用者 | ✅ |
 | `invalid_image` | 400 | — | 图片校验失败 | ✅ |
+| `unsupported_file_type` | 400 | — | 聊天文件上传：文件类型不支持（heic/.doc/.xls/二进制）；detail 说明类型，hint 建议格式 | ✅ |
+| `invalid_file` | 400 | — | 聊天文件上传：file_b64 缺失/空/非法 base64 | ✅ |
 
 ## 认证 / 账号
 
@@ -61,11 +63,17 @@
 | `model_api_config_invalid` | 400 | user_provider | | ✅ |
 | `model_api_key_decrypt_failed` | 400 | system | | ✅ |
 | `model_api_key_envelope_missing` | 400/404 | user_provider | 同 model_api_not_configured 的两条路径 | ✅ |
+| `model_api_credential_write_failed` | 500 | system | 写 model_api_credentials 失败（DB 异常被 db.py 吞成 None） | |
+| `model_api_route_write_failed` | 500 | system | 写/激活 model_api_routes 失败（DB 异常，或 route 被并发删除） | |
 | `provider_not_configured` | 409 | user_provider | | ✅ |
 | `provider_not_hostable` | 409 | user_provider | | ✅ |
 | `hosting_runtime_unavailable` | 503 | system | 托管 supervisor 未起来（detail.reason） | ✅ |
 | `provider_test_failed` | 400 | user_provider | 保存/测试 key 时上游拒绝（detail 带 status_code） | |
 | `cannot_encrypt_provider_key` | 409 | — | 缺 content public key 或 enclave attestation 不可达 | |
+| `route_not_found` | 404 | user_provider | 指定的 route id 不属于该用户或已删除 | |
+| `credential_not_found` | 404 | user_provider | 指定的 credential id 不属于该用户或已删除 | |
+| `api_key_or_credential_id_required` | 400 | user_provider | POST /routes 必须且只能给 api_key 与 credential_id 之一 | |
+| `nothing_to_update` | 400 | — | PATCH /credentials 两者（label/api_key）都不给 | |
 
 ## 聊天
 

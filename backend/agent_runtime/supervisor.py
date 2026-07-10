@@ -57,6 +57,7 @@ if str(_BACKEND_DIR) not in sys.path:
 
 import db
 from core import runtime_token
+from core import wake_bus
 from core.store import get_store
 from agent_runtime import leases, litellm_gateway, spawners
 from notices import core as notices
@@ -290,6 +291,23 @@ class Supervisor:
                     spawn_ok = False
                     with self._lock:
                         self.kill_fn(child["pid"])
+                        # kill_fn is synchronous (ProcessSpawner.kill: terminate→
+                        # wait, escalate SIGKILL→wait; _signal_kill: poll-to-exit
+                        # then SIGKILL) — the old consumer is dead here. NOW it's
+                        # safe to release any in-flight reply claim it held: no
+                        # live holder remains to double-run the turn
+                        # (chat/service.py:66-70's double-provider-burn risk).
+                        # This lets the fresh consumer pick the message up on its
+                        # next poll instead of waiting out CHAT_POLL_CLAIM_TTL_SEC
+                        # (600s) for the lost-turn redelivery backstop. Best-effort:
+                        # chat_expire_reply_claims already swallow-and-logs; the
+                        # notify is wrapped so a broadcast hiccup can't abort the
+                        # respawn (its real job is kill→spawn→swap).
+                        try:
+                            if db.chat_expire_reply_claims(user_id):
+                                wake_bus.notify("chat", user_id)
+                        except Exception:  # noqa: BLE001
+                            log.exception("claim release/notify failed for %s", user_id)
                         try:
                             pid = self.spawn_fn(entry, user_id, home)
                         except Exception as e:  # noqa: BLE001
@@ -677,7 +695,8 @@ def _discover_enabled(include_gateway: bool = False) -> dict[str, dict]:
     isn't there."""
     return {u["user_id"]: {"driver": u["driver"], "provider": u.get("provider", ""),
                            "model": u.get("model", ""), "base_url": u.get("base_url", ""),
-                           "supports_responses": bool(u.get("supports_responses", False))}
+                           "supports_responses": bool(u.get("supports_responses", False)),
+                           "reasoning_effort": u.get("reasoning_effort", "")}
             for u in db.list_agent_runtime_enabled_users(include_gateway=include_gateway)}
 
 
@@ -696,7 +715,8 @@ def _apply_discovery(roster: list[dict], enabled: dict[str, dict]) -> list[dict]
                         "provider": info.get("provider", ""),
                         "model": info.get("model", ""),
                         "base_url": info.get("base_url", ""),
-                        "supports_responses": bool(info.get("supports_responses", False))})
+                        "supports_responses": bool(info.get("supports_responses", False)),
+                        "reasoning_effort": info.get("reasoning_effort", "")})
     return out
 
 
@@ -779,7 +799,8 @@ def _resolve_one(uid: str, info: dict, *, mint_token, api_url: str, enclave_url:
 
         entry = {"user_id": uid, "driver": info["driver"], "provider": info.get("provider", ""),
                  "model": info.get("model", ""), "base_url": info.get("base_url", ""),
-                 "supports_responses": bool(info.get("supports_responses", False))}
+                 "supports_responses": bool(info.get("supports_responses", False)),
+                 "reasoning_effort": info.get("reasoning_effort", "")}
         if provider_key:
             entry["provider_key"] = provider_key
         # Carry the freshly-minted runtime token so ProcessSpawner.spawn can decrypt
@@ -854,23 +875,24 @@ _AUTOVERIFY_BACKOFF = [0.0, 30.0, 120.0, 600.0, 1800.0]
 
 
 def _maybe_autoverify(user_id: str, *, mint_token, api_url: str, state: dict,
-                      post_verify=_post_verify_loop, now=time.time) -> None:
+                      post_verify=_post_verify_loop, now=time.time) -> bool:
     """Open the bootstrap gate for a freshly-hosted user by running verify_loop.
     ``state`` (user_id -> {"done", "fails", "next"}) makes it idempotent AND backed
     off: a passed user is marked ``done`` and never re-probed; a failed attempt
     schedules the next try with increasing backoff instead of every tick."""
     s = state.get(user_id)
     if s is not None and s.get("done"):
-        return
+        return False
     t = now()
     if s is not None and t < s.get("next", 0.0):
-        return                                  # within the backoff window
+        return False                            # within the backoff window
     if post_verify(api_url, _auth_headers(runtime_token=mint_token(user_id))):
         state[user_id] = {"done": True}
-        return
+        return True
     fails = (s.get("fails", 0) if s else 0) + 1
     delay = _AUTOVERIFY_BACKOFF[min(fails, len(_AUTOVERIFY_BACKOFF) - 1)]
     state[user_id] = {"done": False, "fails": fails, "next": t + delay}
+    return False
 
 
 # A host user is blocked from spawning only while an import genesis is actively
@@ -1020,6 +1042,7 @@ def _gateway_entries(roster: list[dict]) -> list[dict]:
                 "model": e.get("model") or "",
                 "base_url": e.get("base_url") or "",
                 "supports_responses": bool(e.get("supports_responses", False)),
+                "reasoning_effort": e.get("reasoning_effort") or "",
                 "provider_key": e.get("provider_key") or "",
             })
     return out
@@ -1452,8 +1475,19 @@ def main() -> int:
 
                         def _autoverify(uid=uid):
                             try:
-                                _maybe_autoverify(uid, mint_token=mint_token, api_url=api_url,
-                                                  state=autoverify_state)
+                                passed = _maybe_autoverify(
+                                    uid, mint_token=mint_token, api_url=api_url,
+                                    state=autoverify_state)
+                                if passed:
+                                    with sup._lock:
+                                        child = sup.children.get(uid)
+                                        entry = dict(child["entry"]) if child else None
+                                    if entry is not None:
+                                        # Spawn-time introduction can be skipped before
+                                        # verify_loop marks first_chat_ok_at. Retry once
+                                        # right after the gate opens, using a fresh token.
+                                        entry["runtime_token"] = mint_token(uid)
+                                        sup._enqueue_introduction(uid, entry)
                             finally:
                                 autoverify_inflight.discard(uid)
 

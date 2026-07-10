@@ -48,15 +48,42 @@ def test_model_entry_openrouter_no_reasoning_by_default():
     assert "extra_body" not in e["litellm_params"]
 
 
-def test_model_entry_openrouter_uses_effort_not_enabled_when_on():
-    # When enabled, OpenRouter needs an effort budget — `enabled: true` alone
-    # yields no reasoning for Anthropic-family models.
+def test_model_entry_openrouter_non_anthropic_uses_effort_when_on():
+    # Non-Anthropic OpenRouter model families still emit reasoning with effort.
     e = gw.build_model_entry(
-        user_id="u", provider="openrouter", model="m", reasoning_effort="medium",
+        user_id="u", provider="openrouter", model="z-ai/glm-5.2", reasoning_effort="medium",
     )
     assert e["litellm_params"]["extra_body"]["reasoning"] == {
         "effort": "medium",
-        "exclude": False,
+    }
+
+
+def test_model_entry_openrouter_anthropic_uses_effort_on_responses_wire():
+    # codex speaks the Responses wire and OpenRouter serves it natively; the
+    # Responses `reasoning` object takes {effort}, and a chat-wire {max_tokens}
+    # budget is silently ignored there (probed 2026-07-11 against /responses:
+    # effort -> reasoning_tokens>0, max_tokens -> 0). So Anthropic-family models
+    # emit effort too, same as every other OpenRouter family.
+    e = gw.build_model_entry(
+        user_id="u", provider="openrouter", model="anthropic/claude-sonnet-4.6",
+        reasoning_effort="medium",
+    )
+    assert e["litellm_params"]["extra_body"]["reasoning"] == {
+        "effort": "medium",
+    }
+    assert "max_tokens" not in e["litellm_params"]["extra_body"]["reasoning"]
+
+
+def test_model_entry_openrouter_non_enum_effort_falls_back_to_medium():
+    # The Responses `reasoning.effort` only accepts low/medium/high; a legacy
+    # numeric value (or anything else) falls back to medium rather than emitting
+    # an invalid effort the wire would reject.
+    e = gw.build_model_entry(
+        user_id="u", provider="openrouter", model="anthropic/claude-sonnet-4.6",
+        reasoning_effort="9999",
+    )
+    assert e["litellm_params"]["extra_body"]["reasoning"] == {
+        "effort": "medium",
     }
 
 
@@ -78,7 +105,7 @@ def test_model_entry_openrouter_reasoning_off_sends_no_reasoning():
 
 def test_build_config_threads_per_user_reasoning_effort():
     cfg = gw.build_config([
-        {"user_id": "u1", "provider": "openrouter", "model": "m", "reasoning_effort": "low"},
+        {"user_id": "u1", "provider": "openrouter", "model": "anthropic/claude-sonnet-4.6", "reasoning_effort": "low"},
         {"user_id": "u2", "provider": "openrouter", "model": "m", "reasoning_effort": "off"},
     ])
     entries = {e["model_name"]: e["litellm_params"] for e in cfg["model_list"]}
@@ -156,6 +183,13 @@ def test_config_signature_changes_with_supports_responses():
     sig_bridge = gw.config_signature([{**base, "supports_responses": False}])
     sig_native = gw.config_signature([{**base, "supports_responses": True}])
     assert sig_bridge != sig_native
+
+
+def test_config_signature_changes_with_reasoning_effort():
+    base = {"user_id": "u", "provider": "openrouter", "model": "anthropic/claude-sonnet-4.6"}
+    sig_default = gw.config_signature([base])
+    sig_medium = gw.config_signature([{**base, "reasoning_effort": "medium"}])
+    assert sig_default != sig_medium
 
 
 def test_build_config_preserves_reasoning_params_and_sets_master_key_env():

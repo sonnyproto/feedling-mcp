@@ -173,14 +173,29 @@ def test_default_codex_cmd_bypasses_bwrap_sandbox():
 def test_default_codex_cmd_requests_reasoning_summary_events():
     # Codex only surfaces reasoning to the resident consumer if the CLI is asked
     # to run with reasoning enabled. The consumer already parses agent_reasoning
-    # / reasoning events into the thinking disclosure.
+    # / reasoning events into the thinking disclosure. OpenAI native summaries
+    # are best-effort; detailed improves the hit rate but does not guarantee one.
     env = spawners.consumer_env(
         {}, {"api_key": "fk", "provider_key": "sk-oai", "driver": "codex"},
         user_id="u_1", home="/h",
     )
     cmd = env["AGENT_CLI_CMD"]
     assert "-c model_reasoning_effort=medium" in cmd
-    assert "-c model_reasoning_summary=auto" in cmd
+    assert "-c model_reasoning_summary=detailed" in cmd
+
+
+def test_default_cli_cmds_carry_mcp_placeholder():
+    # The resident consumer's `_render_cli_template` (Task 6) replaces `{mcp}`
+    # per turn: claude chat turns → `--mcp-config <file>`, codex non-chat turns
+    # → `-c mcp_servers={}` (clearing config.toml's [mcp_servers]), and the
+    # opposite turn kind → empty string. That only works if the default
+    # templates carry the `{mcp}` token in a position a CLI flag can occupy.
+    codex = spawners._default_cli_cmd("codex", "/h")
+    claude = spawners._default_cli_cmd("claude", "/h")
+    thinking = spawners._default_thinking_claude_cmd("/h")
+    assert "{mcp}" in codex and codex.index("{mcp}") < codex.index("{message}")
+    assert "{mcp}" in claude and claude.index("{mcp}") < claude.index("-p {message}")
+    assert "{mcp}" in thinking
 
 
 def test_consumer_env_tolerates_missing_api_key_for_zero_roster():
@@ -342,6 +357,22 @@ def test_default_claude_cmd_grants_image_read():
     assert "Read(//agent-data/users/u/images/" in cmd
     # …and the dir is added to claude's trusted workspace (out-of-cwd read boundary).
     assert "--add-dir /agent-data/users/u/images" in cmd
+
+
+def test_default_claude_cmd_grants_file_read():
+    # Chat file uploads (pdf/docx/xlsx/text) are decrypted/extracted to
+    # {home}/files and their path is injected into the prompt. Without Read on that
+    # dir + --add-dir, claude -p denies the read and the agent reports the file as
+    # "0 KB / permission not granted" (same failure class as the image path).
+    env = spawners.consumer_env(
+        {}, {"api_key": "fk", "provider_key": "sk-ant"},
+        user_id="u", home="/agent-data/users/u",
+    )
+    cmd = env["AGENT_CLI_CMD"]
+    assert "Read(//agent-data/users/u/files/" in cmd
+    assert "--add-dir /agent-data/users/u/files" in cmd
+    # …and the consumer is told to land files there (matches the grant).
+    assert env["FILE_TEMP_DIR"] == "/agent-data/users/u/files"
 
 
 def test_default_claude_cmd_substitutes_io_cli_path_in_prompt():
@@ -547,20 +578,21 @@ def test_agent_home_files_codex_gateway_writes_responses_config():
     assert "/h/codex-home/AGENTS.md" in files
 
 
-def test_agent_home_files_codex_gateway_disables_collab_tools():
+def test_agent_home_files_codex_gateway_disables_multi_agent_tools():
     # codex 0.142 declares its multi-agent tools as a `{"type": "namespace"}` tool
     # group on EVERY Responses request — an OpenAI-only wire extension. Non-OpenAI
     # upstreams behind the gateway reject the whole request on it (xAI: 422
     # "unknown variant 'namespace', expected one of 'function', 'web_search'"),
     # so every turn dies before the model runs. Gateway config must turn the
-    # collab feature off; native OpenAI keeps it (no config.toml written there).
+    # multi-agent feature off; native OpenAI keeps it (no config.toml written there).
     files = spawners.agent_home_files(
         "/h", driver="codex", provider="openrouter", codex_transport="gateway",
         gateway_base_url="http://127.0.0.1:4000/v1", model="gw-x",
     )
     cfg = files["/h/codex-home/config.toml"]
     assert "[features]" in cfg
-    assert "collab = false" in cfg
+    assert "multi_agent = false" in cfg
+    assert "collab = false" not in cfg
 
 
 def test_agent_home_files_codex_native_omits_gateway_config():
@@ -617,6 +649,8 @@ def test_materialize_home_creates_image_dir_for_claude(tmp_path):
     home = str(tmp_path / "u")
     spawners.materialize_home(home, driver="claude", provider="anthropic")
     assert (tmp_path / "u" / "images").is_dir()
+    # Same for the chat-file dir the claude command --add-dir's every turn.
+    assert (tmp_path / "u" / "files").is_dir()
 
 
 # ---- Stage D slice 3a: runtime-token file delivery ----
