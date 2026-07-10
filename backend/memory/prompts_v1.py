@@ -41,6 +41,33 @@ _COMMON_BUCKETS_EN = " / ".join(en for _zh, en in COMMON_BUCKETS_V1)
 # the bucket name instead of picking one side.
 _COMMON_BUCKETS_ZH = "、".join(zh for zh, _en in COMMON_BUCKETS_V1)
 
+# Deterministic bucket-language backstop. The model still mislabels a Chinese memory
+# with an English common bucket (~1/3 of the time — e.g. "Pets" for 用户十年前养过一只狗),
+# despite the guidance. Since the common buckets are a fixed zh<->en pair map, we can
+# map a wrong-language COMMON bucket back to the card's own language IN CODE — a backstop
+# that catches EVERY write path (genesis / capture / agent inline / io_cli all funnel
+# through _memory_inner_from_action) regardless of prompt drift, and is unit-testable
+# without a real model. Custom buckets (妈妈 / the house) pass through unchanged.
+_BUCKET_EN_TO_ZH = {en: zh for zh, en in COMMON_BUCKETS_V1}
+_BUCKET_ZH_TO_EN = {zh: en for zh, en in COMMON_BUCKETS_V1}
+
+
+def _text_is_chinese(text: str) -> bool:
+    """A card counts as Chinese if its text carries any CJK ideograph."""
+    return any("一" <= ch <= "鿿" for ch in (text or ""))
+
+
+def normalize_bucket_language(bucket: str, text: str) -> str:
+    """Map a COMMON bucket that's in the wrong language vs the card's content to the
+    card's own language via the fixed zh<->en pair map. Custom/unknown buckets pass
+    through unchanged. Deterministic — the code backstop behind the bucket prompts."""
+    b = (bucket or "").strip()
+    if not b:
+        return b
+    if _text_is_chinese(text):
+        return _BUCKET_EN_TO_ZH.get(b, b)
+    return _BUCKET_ZH_TO_EN.get(b, b)
+
 
 MEMORY_WRITE_GUIDANCE_V1 = ("""
 Memory write guidance:
