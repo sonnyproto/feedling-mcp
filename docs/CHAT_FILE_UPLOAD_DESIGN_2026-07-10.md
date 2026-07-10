@@ -34,7 +34,7 @@ iOS payload → hosted/turn.py:_model_api_image_payload（校验）
 | 组 | 判定 | 处理 |
 |---|---|---|
 | 图片 jpg/png/webp/**gif** | image/* mime 或扩展名 | **转入现有 image 管线**（`content_type=image`，享受视觉）；image mime 白名单加 `gif`（Claude 视觉原生支持 jpeg/png/gif/webp 四种） |
-| 图片 heic | — | 400 明确提示。**iOS 转码 jpeg 后再发**（照现有发图路径的转码套路，前端 follow-up 给 Liko）；任何模型都不直读 heic，后端转码要加 pillow-heif 依赖，不值 |
+| 图片 heic | — | 400 + `hint: 转码 jpeg 后再发`。任何模型都不直读 heic，后端转码要加 pillow-heif 依赖，不值；客户端如何转码归 iOS 侧设计（见"能力契约"节） |
 | PDF | `.pdf` | 落盘原文件，Claude CLI Read 原生支持（分页读） |
 | Word | `.docx` | consumer 用 `zipfile`（标准库，零新依赖）抽 `word/document.xml` 纯文本 → 落 `.txt`；抽失败落原文件 + 诚实降级 |
 | Excel | `.xlsx` | consumer 用 `zipfile` 抽 `xl/sharedStrings.xml` + `xl/worksheets/sheet*.xml` → 拼 TSV 落 `.txt`；**截断保护**：只抽前 5 张表、每表前 2000 行，截断时文末注明"已截断，共 X 行" |
@@ -50,8 +50,8 @@ iOS payload → hosted/turn.py:_model_api_image_payload（校验）
 
 理由：iOS PR 72 放了 25MB，但 25MB → b64 后 ~33MB JSON body，还要封信封、进库、
 每次 enclave 解密史全量吐回（image 侧已有"图片史 payload 可达数 MB"的抱怨注释），
-25MB 会放大十倍。10MB 覆盖绝大多数文档。**iOS 侧 25MB 提示语要跟着改**（前端
-follow-up，不阻塞后端）。
+25MB 会放大十倍。10MB 覆盖绝大多数文档。413 detail 带 `max_bytes`，客户端提示语
+如何对齐归 iOS 侧设计（本次不动 iOS）。
 
 ## 改动点清单
 
@@ -133,8 +133,27 @@ HTTP 入口模板（内联）：
 - flow trace：`route.decided` detail 加 `has_file`（对齐 `has_image`）。
 - 真实部署 e2e 见 VPS 节。
 
-## 前端 follow-ups（给 Liko，不阻塞后端）
+## 对客户端暴露的能力契约（iOS 端本次不动，之后专门设计对接）
 
-1. heic 在客户端转码 jpeg 后再发（照发图路径现成套路）。
-2. 25MB 上限提示语改 10MB。
-3. VPS 加密路由：加密前在客户端执行同一套类型白名单；payload 带 `file_name`/`file_mime` 明文字段。
+后端只负责把能力和边界暴露清楚；客户端如何消费（转码、提示语、预检）归 iOS 侧
+未来的专门设计，本次不派活、不改 iOS 代码。
+
+**Cloud 路由 `POST /v1/model_api/chat/send`：**
+
+- 入参：`content_type=file` + `file_name` + `file_mime` + `file_byte_count` + `file_b64`
+  （PR ios#72 已发的形状，原样接受）+ 可选 `message`（caption）。
+- 接受类型：图片 jpeg/png/webp/gif（转入 image 管线）、`.pdf`、`.docx`、`.xlsx`、
+  任何 UTF-8 纯文本（源码/md/csv/json…）。
+- 拒绝（400，机器可读 detail）：
+  - `unsupported_file_type` + `hint`：heic（建议客户端转码 jpeg）、`.doc`/`.xls`
+    （建议另存新格式）、其他二进制。
+  - `invalid_file`：b64 无效 / 空文件。
+- 413：超 `MODEL_API_MAX_FILE_BYTES`（10MB），detail 带 `max_bytes`
+  （客户端当前 25MB 提示与此不一致，由 iOS 侧设计自行对齐）。
+
+**VPS 路由 `POST /v1/chat/send`（客户端封信封）：**
+
+- `content_type=file` 放行；信封明文 = 文件原始 bytes。
+- payload 顶层带明文元数据 `file_name`/`file_mime`（同 image_mime 档），后端收进 extra。
+- 服务端看不见内容 → 类型/大小预检只能在客户端加密前做，规则同上表；
+  后端对信封不透明体不做内容校验（漏网的二进制由 consumer 侧嗅探兜底降级，不报错）。
