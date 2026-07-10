@@ -59,6 +59,12 @@ def _norm_provider(provider: str) -> str:
 # can later expose a per-account reasoning toggle without touching this code.
 _DEFAULT_REASONING_EFFORT = (os.environ.get("FEEDLING_AGENT_REASONING_EFFORT", "off") or "").strip().lower()
 _REASONING_OFF = {"", "off", "none", "no", "false", "0", "disabled"}
+_OPENROUTER_ANTHROPIC_REASONING_BUDGET = {
+    "low": 1024,
+    "medium": 2048,
+    "high": 4096,
+}
+_OPENROUTER_DEFAULT_RESPONSE_MAX_TOKENS = 8192
 
 
 def _resolve_reasoning_effort(entry_effort: str | None = None) -> str:
@@ -66,6 +72,36 @@ def _resolve_reasoning_effort(entry_effort: str | None = None) -> str:
     default. Returns "" when reasoning is disabled (no reasoning requested)."""
     effort = (str(entry_effort or "").strip().lower()) or _DEFAULT_REASONING_EFFORT
     return "" if effort in _REASONING_OFF else effort
+
+
+def _openrouter_uses_reasoning_budget(model: str) -> bool:
+    """OpenRouter Anthropic-family models require token-budget reasoning."""
+    m = (model or "").strip().lower()
+    if m.startswith("openrouter/"):
+        m = m.removeprefix("openrouter/")
+    return m.startswith("anthropic/")
+
+
+def _reasoning_budget_for_effort(
+    effort: str,
+    *,
+    response_max_tokens: int = _OPENROUTER_DEFAULT_RESPONSE_MAX_TOKENS,
+) -> int:
+    """Map Feedling effort names to OpenRouter Anthropic reasoning token budgets."""
+    normalized = (effort or "").strip().lower()
+    if normalized.isdigit():
+        budget = max(1, int(normalized))
+    else:
+        budget = _OPENROUTER_ANTHROPIC_REASONING_BUDGET.get(
+            normalized, _OPENROUTER_ANTHROPIC_REASONING_BUDGET["medium"])
+    response_cap = max(1, int(response_max_tokens) // 2)
+    return min(budget, response_cap)
+
+
+def _openrouter_reasoning_request(model: str, effort: str) -> dict:
+    if _openrouter_uses_reasoning_budget(model):
+        return {"max_tokens": _reasoning_budget_for_effort(effort)}
+    return {"effort": effort, "exclude": False}
 
 
 def gateway_model_id(user_id: str) -> str:
@@ -108,19 +144,17 @@ def build_model_entry(
     }
     normalized_provider = _norm_provider(provider)
     if normalized_provider == "openrouter":
-        # OpenRouter returns provider reasoning only when the request asks for it
-        # WITH a budget. ``enabled: true`` alone yields NO reasoning for
-        # Anthropic-family models (verified against openrouter) — an ``effort``
-        # (or token budget) is required. Gated by the reasoning switch (default
-        # "off"); "off" sends no reasoning. Non-reasoning models ignore it
-        # gracefully (no error), so this is safe across the openrouter model set.
+        # OpenRouter returns provider reasoning only when the request asks for it.
+        # Re-tested 2026-07-10: Anthropic-family models silently return an empty
+        # `message.reasoning` for `{"effort": "medium"}` and only emit reasoning
+        # for a token budget (`{"max_tokens": 1024}` in the probe), while GLM
+        # still emits reasoning with effort. Keep the per-user switch default-off;
+        # when enabled, map Anthropic-family effort levels to token budgets and
+        # leave the other OpenRouter model families on effort.
         effort = _resolve_reasoning_effort(reasoning_effort)
         if effort:
             params["extra_body"] = {
-                "reasoning": {
-                    "effort": effort,
-                    "exclude": False,
-                },
+                "reasoning": _openrouter_reasoning_request(model, effort),
             }
     if normalized_provider == "openai_compatible":
         # codex `exec` always ships a `web_search` tool and offers no switch to

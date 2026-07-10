@@ -48,15 +48,37 @@ def test_model_entry_openrouter_no_reasoning_by_default():
     assert "extra_body" not in e["litellm_params"]
 
 
-def test_model_entry_openrouter_uses_effort_not_enabled_when_on():
-    # When enabled, OpenRouter needs an effort budget — `enabled: true` alone
-    # yields no reasoning for Anthropic-family models.
+def test_model_entry_openrouter_non_anthropic_uses_effort_when_on():
+    # Non-Anthropic OpenRouter model families still emit reasoning with effort.
     e = gw.build_model_entry(
-        user_id="u", provider="openrouter", model="m", reasoning_effort="medium",
+        user_id="u", provider="openrouter", model="z-ai/glm-5.2", reasoning_effort="medium",
     )
     assert e["litellm_params"]["extra_body"]["reasoning"] == {
         "effort": "medium",
         "exclude": False,
+    }
+
+
+def test_model_entry_openrouter_anthropic_uses_reasoning_token_budget():
+    # 2026-07-10 OpenRouter e2e: Anthropic-family models silently return empty
+    # reasoning for effort, but emit reasoning when given a token budget.
+    e = gw.build_model_entry(
+        user_id="u", provider="openrouter", model="anthropic/claude-sonnet-4.6",
+        reasoning_effort="medium",
+    )
+    assert e["litellm_params"]["extra_body"]["reasoning"] == {
+        "max_tokens": 2048,
+    }
+    assert "effort" not in e["litellm_params"]["extra_body"]["reasoning"]
+
+
+def test_model_entry_openrouter_anthropic_caps_numeric_reasoning_budget():
+    e = gw.build_model_entry(
+        user_id="u", provider="openrouter", model="anthropic/claude-sonnet-4.6",
+        reasoning_effort="9999",
+    )
+    assert e["litellm_params"]["extra_body"]["reasoning"] == {
+        "max_tokens": 4096,
     }
 
 
@@ -78,11 +100,11 @@ def test_model_entry_openrouter_reasoning_off_sends_no_reasoning():
 
 def test_build_config_threads_per_user_reasoning_effort():
     cfg = gw.build_config([
-        {"user_id": "u1", "provider": "openrouter", "model": "m", "reasoning_effort": "low"},
+        {"user_id": "u1", "provider": "openrouter", "model": "anthropic/claude-sonnet-4.6", "reasoning_effort": "low"},
         {"user_id": "u2", "provider": "openrouter", "model": "m", "reasoning_effort": "off"},
     ])
     entries = {e["model_name"]: e["litellm_params"] for e in cfg["model_list"]}
-    assert entries["gw-u1"]["extra_body"]["reasoning"]["effort"] == "low"
+    assert entries["gw-u1"]["extra_body"]["reasoning"]["max_tokens"] == 1024
     assert "extra_body" not in entries["gw-u2"]
 
 
