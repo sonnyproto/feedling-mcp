@@ -344,6 +344,22 @@ def test_default_claude_cmd_grants_image_read():
     assert "--add-dir /agent-data/users/u/images" in cmd
 
 
+def test_default_claude_cmd_grants_file_read():
+    # Chat file uploads (pdf/docx/xlsx/text) are decrypted/extracted to
+    # {home}/files and their path is injected into the prompt. Without Read on that
+    # dir + --add-dir, claude -p denies the read and the agent reports the file as
+    # "0 KB / permission not granted" (same failure class as the image path).
+    env = spawners.consumer_env(
+        {}, {"api_key": "fk", "provider_key": "sk-ant"},
+        user_id="u", home="/agent-data/users/u",
+    )
+    cmd = env["AGENT_CLI_CMD"]
+    assert "Read(//agent-data/users/u/files/" in cmd
+    assert "--add-dir /agent-data/users/u/files" in cmd
+    # …and the consumer is told to land files there (matches the grant).
+    assert env["FILE_TEMP_DIR"] == "/agent-data/users/u/files"
+
+
 def test_default_claude_cmd_substitutes_io_cli_path_in_prompt():
     # The system prompt template ships literal `<io_cli>` placeholders. They MUST be
     # substituted with the real io_cli path, or the model can't know where io_cli is
@@ -617,6 +633,8 @@ def test_materialize_home_creates_image_dir_for_claude(tmp_path):
     home = str(tmp_path / "u")
     spawners.materialize_home(home, driver="claude", provider="anthropic")
     assert (tmp_path / "u" / "images").is_dir()
+    # Same for the chat-file dir the claude command --add-dir's every turn.
+    assert (tmp_path / "u" / "files").is_dir()
 
 
 # ---- Stage D slice 3a: runtime-token file delivery ----

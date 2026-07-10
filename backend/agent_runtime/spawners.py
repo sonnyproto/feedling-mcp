@@ -169,9 +169,25 @@ def _image_read_allow_rule(home: str) -> str:
     return f"Read(//{home.strip('/')}/images/**)"
 
 
+def _file_read_allow_rule(home: str) -> str:
+    """Claude Read allow-rule for the decrypted chat-file temp dir (FILE_TEMP_DIR).
+
+    Chat file uploads (pdf/docx/xlsx/text) are decrypted/extracted to
+    ``{home}/files/*`` and their path is injected into the prompt; same mechanics
+    and the SAME double-slash requirement as ``_image_read_allow_rule`` — a single
+    leading slash anchors at the cwd and the read is DENIED under ``-p`` (the agent
+    then reports "0 KB / permission not granted" for a file it never opened)."""
+    return f"Read(//{home.strip('/')}/files/**)"
+
+
 def _claude_allow_rules(io_cli: str, home: str) -> list[str]:
-    """Full claude --allowed-tools / settings allowlist: io_cli verbs + image Read."""
-    return [*_io_cli_allow_rules(io_cli), _image_read_allow_rule(home)]
+    """Full claude --allowed-tools / settings allowlist: io_cli verbs + image Read
+    + file Read."""
+    return [
+        *_io_cli_allow_rules(io_cli),
+        _image_read_allow_rule(home),
+        _file_read_allow_rule(home),
+    ]
 
 
 def _image_dir_add_dir(home: str) -> str:
@@ -183,6 +199,14 @@ def _image_dir_add_dir(home: str) -> str:
     prompt. ``materialize_home`` pre-creates the dir so this target always exists
     (claude warns/errors on a missing --add-dir path)."""
     return f"--add-dir {home}/images"
+
+
+def _attach_dirs_add_dir(home: str) -> str:
+    """`--add-dir` flags for BOTH the image and file temp dirs (both live outside
+    the agent's cwd and need the workspace-trust boundary extended). Mirrors
+    ``_image_dir_add_dir``; ``materialize_home`` pre-creates both so the flags are
+    always valid."""
+    return f"--add-dir {home}/images --add-dir {home}/files"
 
 
 # claude (Anthropic-wire) providers that are NOT anthropic itself: they expose an
@@ -292,7 +316,7 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
     grant = ",".join(_claude_allow_rules(io_cli, home))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
     return (
-        f"claude {_CLAUDE_PERMISSION_FLAG} {_image_dir_add_dir(home)} "
+        f"claude {_CLAUDE_PERMISSION_FLAG} {_attach_dirs_add_dir(home)} "
         f"--allowed-tools '{grant}' "
         f"--append-system-prompt-file {prompt_file} -p {{message}}"
     )
@@ -318,7 +342,7 @@ def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
     grant = ",".join(_claude_allow_rules(io_cli, home))
     prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
     return (
-        f"claude {_CLAUDE_PERMISSION_FLAG} {_image_dir_add_dir(home)} --verbose "
+        f"claude {_CLAUDE_PERMISSION_FLAG} {_attach_dirs_add_dir(home)} --verbose "
         f"--output-format stream-json --include-partial-messages --effort high "
         f"--allowed-tools '{grant}' "
         f"--append-system-prompt-file {prompt_file} -p {{message}}"
@@ -471,6 +495,9 @@ def materialize_home(
     # (before any image) would --add-dir a missing path. Claude warns/errors on that;
     # creating it here keeps every turn's --add-dir valid. Cheap + idempotent.
     Path(f"{home}/images").mkdir(parents=True, exist_ok=True)
+    # Same for the decrypted chat-file dir (FILE_TEMP_DIR = {home}/files): the claude
+    # command passes `--add-dir {home}/files` every turn, so the target must exist.
+    Path(f"{home}/files").mkdir(parents=True, exist_ok=True)
 
 
 def _persona_from_blob(blob, decrypt_fn) -> str:
@@ -551,6 +578,10 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     # Operator env (base_env) wins if it already set the cap.
     env.setdefault("AGENT_SESSION_MAX_TURNS", _HOST_SESSION_MAX_TURNS)
     env["IMAGE_TEMP_DIR"] = f"{home}/images"
+    # Land decrypted chat files inside the agent's trusted home (matches the
+    # --add-dir {home}/files grant); without this the consumer defaults to
+    # /tmp/feedling_chat_files, outside the workspace, and claude's Read is denied.
+    env["FILE_TEMP_DIR"] = f"{home}/files"
     env["CONSUMER_ID"] = f"agent-runner:{user_id}"
     # Ambient timezone for the hosted agent process tree (this consumer + the CLI
     # it spawns). Without it the process inherits the CVM's UTC clock, so the CLI
@@ -706,7 +737,7 @@ class ProcessSpawner:
 _CONSUMER_ENV_KEYS = (
     "FEEDLING_API_KEY", "FEEDLING_API_URL", "FEEDLING_ENCLAVE_URL",
     "AGENT_MODE", "AGENT_CLI_CMD", "CHECKPOINT_FILE", "AGENT_SESSION_FILE",
-    "IMAGE_TEMP_DIR", "CONSUMER_ID", "FEEDLING_RUNTIME_TOKEN_FILE",
+    "IMAGE_TEMP_DIR", "FILE_TEMP_DIR", "CONSUMER_ID", "FEEDLING_RUNTIME_TOKEN_FILE",
     "ANTHROPIC_API_KEY", "CODEX_API_KEY", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
     "FEEDLING_LITELLM_BASE_URL", "FEEDLING_LITELLM_API_KEY",
     # Per-user ambient timezone so the containerized agent's clock isn't the
