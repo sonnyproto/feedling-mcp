@@ -1465,16 +1465,16 @@ def _human_size(n: int) -> str:
 
 
 def _land_file(msg_key: str, name: str, data: bytes) -> str:
-    FILE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
-    ext = name.rsplit(".", 1)[-1].lower() if "." in name else "bin"
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{msg_key}_{name}")[:120] or "file"
-    if not safe.lower().endswith(f".{ext}"):
-        safe = f"{safe}.{ext}"
-    path = FILE_TEMP_DIR / safe
     try:
+        FILE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else "bin"
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{msg_key}_{name}")[:120] or "file"
+        if not safe.lower().endswith(f".{ext}"):
+            safe = f"{safe}.{ext}"
+        path = FILE_TEMP_DIR / safe
         path.write_bytes(data)
     except Exception as e:
-        log.warning("failed to write file temp %s: %s", path, e)
+        log.warning("failed to write file temp for %s: %s", name, e)
         return ""
     return str(path)
 
@@ -1505,10 +1505,14 @@ def _prepare_file_for_agent(msg: dict) -> "FilePrep":
             local_path = _land_file(key, name, data) or None
     elif ext == "xlsx":
         text, truncated = _extract_xlsx_text(data)
-        inline_text, extracted = text, True
-        if truncated:
-            truncation_note = "（表格内容已截断，仅含前若干表/行）"
-        local_path = _land_file(key, name + ".txt", text.encode("utf-8")) or None
+        if text.strip():
+            inline_text, extracted = text, True
+            if truncated:
+                truncation_note = "（表格内容已截断，仅含前若干表/行）"
+            local_path = _land_file(key, name + ".txt", text.encode("utf-8")) or None
+        else:
+            # extraction failed or empty — do NOT claim extraction; land original
+            local_path = _land_file(key, name, data) or None
     elif ext == "pdf":
         # binary — CLI Reads PDF natively; HTTP (tool-less) cannot inline it
         local_path = _land_file(key, name, data) or None
