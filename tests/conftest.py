@@ -114,6 +114,7 @@ if not _provisioned:
         "test_no_app_py_regression.py",
         "test_asgi_waiters.py",
         "test_quoted_memory_context.py",
+        "test_chat_resident_consumer_file.py",
     }
     collect_ignore = sorted(
         f

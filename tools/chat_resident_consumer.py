@@ -91,6 +91,7 @@ from collections import namedtuple
 from dataclasses import dataclass, field
 import hashlib
 import inspect
+import io
 import json
 import logging
 import os
@@ -103,6 +104,8 @@ import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as _ET
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -1336,6 +1339,98 @@ def _image_file_paths_from_payloads(prefix: str, payloads: list[dict[str, str]])
         except Exception as e:
             log.warning("failed to write image temp file %s: %s", path, e)
     return paths
+
+
+_XLSX_MAX_SHEETS = 5
+_XLSX_MAX_ROWS = 2000
+FILE_TEMP_DIR = Path(os.environ.get("FILE_TEMP_DIR", "/tmp/feedling_chat_files"))
+FILE_PLACEHOLDER = "User sent a file."
+
+
+def _strip_ns(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _extract_docx_text(data: bytes) -> str | None:
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            xml = z.read("word/document.xml")
+    except Exception as e:
+        log.warning("docx extract failed: %s", e)
+        return None
+    try:
+        root = _ET.fromstring(xml)
+    except Exception as e:
+        log.warning("docx xml parse failed: %s", e)
+        return None
+    paras = []
+    for p in root.iter():
+        if _strip_ns(p.tag) != "p":
+            continue
+        texts = [t.text or "" for t in p.iter() if _strip_ns(t.tag) == "t"]
+        line = "".join(texts).strip()
+        if line:
+            paras.append(line)
+    return "\n".join(paras)
+
+
+def _extract_xlsx_text(data: bytes) -> tuple[str, bool]:
+    truncated = False
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in z.namelist():
+                sroot = _ET.fromstring(z.read("xl/sharedStrings.xml"))
+                for si in sroot:
+                    if _strip_ns(si.tag) != "si":
+                        continue
+                    shared.append("".join(t.text or "" for t in si.iter()
+                                          if _strip_ns(t.tag) == "t"))
+            sheet_names = sorted(n for n in z.namelist()
+                                 if n.startswith("xl/worksheets/sheet") and n.endswith(".xml"))
+            if len(sheet_names) > _XLSX_MAX_SHEETS:
+                sheet_names = sheet_names[:_XLSX_MAX_SHEETS]
+                truncated = True
+            out_lines: list[str] = []
+            for sn in sheet_names:
+                root = _ET.fromstring(z.read(sn))
+                rows = [r for r in root.iter() if _strip_ns(r.tag) == "row"]
+                if len(rows) > _XLSX_MAX_ROWS:
+                    rows = rows[:_XLSX_MAX_ROWS]
+                    truncated = True
+                for r in rows:
+                    cells = []
+                    for c in r:
+                        if _strip_ns(c.tag) != "c":
+                            continue
+                        t = c.get("t")
+                        val = ""
+                        if t == "s":  # shared-string index
+                            v = c.find("{*}v")
+                            if v is not None and v.text and v.text.isdigit():
+                                idx = int(v.text)
+                                val = shared[idx] if 0 <= idx < len(shared) else ""
+                        elif t == "inlineStr":
+                            val = "".join(x.text or "" for x in c.iter()
+                                          if _strip_ns(x.tag) == "t")
+                        else:
+                            v = c.find("{*}v")
+                            val = (v.text or "") if v is not None else ""
+                        cells.append(val)
+                    out_lines.append("\t".join(cells))
+            return "\n".join(out_lines), truncated
+    except Exception as e:
+        log.warning("xlsx extract failed: %s", e)
+        return "", False
+
+
+def _friendly_file_type(name: str, mime: str) -> str:
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    return {
+        "pdf": "PDF 文档", "docx": "Word 文档", "xlsx": "Excel 表格",
+        "md": "Markdown 文件", "csv": "CSV 表格", "json": "JSON 文件",
+        "txt": "文本文件",
+    }.get(ext, "文件")
 
 
 def _message_for_agent(content: str, image_paths: list[str] | None = None) -> str:
