@@ -60,7 +60,7 @@ def _recorder():
 
 def test_call_agent_cli_emits_start_then_done(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
 
     result = subprocess.CompletedProcess(
         args=["mycli", "ask", "hi"], returncode=0,
@@ -91,7 +91,7 @@ def test_call_agent_cli_emits_start_then_done(monkeypatch):
 
 def test_call_agent_cli_sets_trace_id_env_for_io_cli(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
 
     result = subprocess.CompletedProcess(
         args=["mycli", "ask", "hi"], returncode=0,
@@ -116,7 +116,7 @@ def test_call_agent_cli_sets_trace_id_env_for_io_cli(monkeypatch):
 
 def test_call_agent_cli_emits_error_on_nonzero_rc(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
 
     result = subprocess.CompletedProcess(
         args=["mycli", "ask", "hi"], returncode=1, stdout="", stderr="boom",
@@ -139,7 +139,7 @@ def test_call_agent_cli_emits_error_on_nonzero_rc(monkeypatch):
 
 def test_call_agent_cli_emits_error_on_timeout_and_reraises(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
 
     def _raise_timeout(*a, **kw):
         raise subprocess.TimeoutExpired(cmd=["mycli", "ask", "hi"], timeout=120)
@@ -165,7 +165,7 @@ def test_call_agent_threads_trace_id_to_cli(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_MODE", "cli")
     seen = {}
 
-    def _fake_cli(message, image_paths=None, raw_text=False, trace_id=""):
+    def _fake_cli(message, image_paths=None, raw_text=False, trace_id="", lane="background"):
         seen["trace_id"] = trace_id
         return "ok reply"
 

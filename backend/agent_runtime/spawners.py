@@ -287,6 +287,7 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
             "codex exec --skip-git-repo-check --json "
             "-c model_reasoning_effort=medium "
             "-c model_reasoning_summary=auto "
+            "{mcp} "
             "--dangerously-bypass-approvals-and-sandbox {message}"
         )
     grant = ",".join(_claude_allow_rules(io_cli, home))
@@ -294,7 +295,7 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
     return (
         f"claude {_CLAUDE_PERMISSION_FLAG} {_image_dir_add_dir(home)} "
         f"--allowed-tools '{grant}' "
-        f"--append-system-prompt-file {prompt_file} -p {{message}}"
+        f"--append-system-prompt-file {prompt_file} {{mcp}} -p {{message}}"
     )
 
 
@@ -321,7 +322,7 @@ def _default_thinking_claude_cmd(home: str, io_cli: str = _IO_CLI) -> str:
         f"claude {_CLAUDE_PERMISSION_FLAG} {_image_dir_add_dir(home)} --verbose "
         f"--output-format stream-json --include-partial-messages --effort high "
         f"--allowed-tools '{grant}' "
-        f"--append-system-prompt-file {prompt_file} -p {{message}}"
+        f"--append-system-prompt-file {prompt_file} {{mcp}} -p {{message}}"
     )
 
 

@@ -27,10 +27,12 @@ def poll_context(store: UserStore) -> dict:
     to. Neither depends on whether there is pending chat.
     """
     from proactive import resident_runtime_v2  # lazy: chat poll must not own proactive startup
+    from hosted import mcp_core  # lazy: chat poll must not own hosted startup
 
     return {
         "runtime_v2": resident_runtime_v2.resident_runtime_v2_public_profile(store),
         "client_release": {"expected_consumer_commit": chat_consumer.expected_consumer_commit()},
+        "user_mcp": {"fingerprint": mcp_core.fingerprint_for_store(store)},
     }
 
 
@@ -72,6 +74,7 @@ def build_response(
         "messages": messages,
         "runtime_v2": context["runtime_v2"],
         "client_release": context["client_release"],
+        "user_mcp": context["user_mcp"],
         "timed_out": timed_out,
         "consumer_id": consumer_id,
         "claimed": claim,

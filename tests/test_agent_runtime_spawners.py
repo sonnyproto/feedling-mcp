@@ -183,6 +183,20 @@ def test_default_codex_cmd_requests_reasoning_summary_events():
     assert "-c model_reasoning_summary=auto" in cmd
 
 
+def test_default_cli_cmds_carry_mcp_placeholder():
+    # The resident consumer's `_render_cli_template` (Task 6) replaces `{mcp}`
+    # per turn: claude chat turns → `--mcp-config <file>`, codex non-chat turns
+    # → `-c mcp_servers={}` (clearing config.toml's [mcp_servers]), and the
+    # opposite turn kind → empty string. That only works if the default
+    # templates carry the `{mcp}` token in a position a CLI flag can occupy.
+    codex = spawners._default_cli_cmd("codex", "/h")
+    claude = spawners._default_cli_cmd("claude", "/h")
+    thinking = spawners._default_thinking_claude_cmd("/h")
+    assert "{mcp}" in codex and codex.index("{mcp}") < codex.index("{message}")
+    assert "{mcp}" in claude and claude.index("{mcp}") < claude.index("-p {message}")
+    assert "{mcp}" in thinking
+
+
 def test_consumer_env_tolerates_missing_api_key_for_zero_roster():
     # Stage D host-all: a discovered entry has NO api_key (the consumer auths with
     # the runtime-token file). consumer_env must not KeyError on it.

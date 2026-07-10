@@ -146,7 +146,7 @@ def test_process_messages_runtime_v2_uses_native_agent_without_tools_prompt(monk
     msg = {"id": "user-msg-v2", "role": "user", "content": "天气怎么样？", "ts": 1112.0}
     captured = {}
 
-    def fake_call(message, images=None, image_paths=None, trace_id=""):
+    def fake_call(message, images=None, image_paths=None, trace_id="", lane="background"):
         captured["message"] = message
         return {"messages": ["外面下雨。"]}
 
@@ -177,7 +177,7 @@ def test_process_messages_prompt_does_not_request_custom_thinking_summary(monkey
     msg = {"id": "user-msg-thinking", "role": "user", "content": "刚才怎么没思考过程？", "ts": 1112.5}
     captured = {}
 
-    def fake_call(message, images=None, image_paths=None, trace_id=""):
+    def fake_call(message, images=None, image_paths=None, trace_id="", lane="background"):
         captured["message"] = message
         return {"messages": ["我查一下。"]}
 
@@ -1533,7 +1533,7 @@ def test_cli_nonzero_exit_fails_even_with_stdout(monkeypatch):
         stderr = "bad command"
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError, match="cli agent exited 2"):
@@ -1550,7 +1550,7 @@ def test_cli_failure_surfaces_claude_json_error_from_stdout(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'claude -p {message}')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["claude", "-p", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["claude", "-p", message])
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError) as ei:
@@ -1572,7 +1572,7 @@ def test_cli_failure_surfaces_codex_stream_error_from_stdout(monkeypatch):
         stderr = "Reading additional input from stdin..."
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'codex exec --json {message}')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["codex", "exec", "--json", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["codex", "exec", "--json", message])
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     with pytest.raises(RuntimeError) as ei:
@@ -3851,7 +3851,7 @@ def test_cli_tool_only_output_preserves_tool_calls(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", 'mycli ask "{message}"')
-    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None: ["mycli", "ask", message])
+    monkeypatch.setattr(crc, "_prepare_cli_command", lambda message, image_paths=None, lane="background": ["mycli", "ask", message])
     monkeypatch.setattr(crc.subprocess, "run", lambda *a, **kw: _Result())
 
     result = crc.call_agent_cli("hi")
