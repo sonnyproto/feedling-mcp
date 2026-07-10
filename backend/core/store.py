@@ -347,13 +347,14 @@ class UserStore:
         message id so the AEAD additional-data the client baked in
         (owner||v||id) stays verifiable by the enclave on read-back.
 
-        `content_type` is plaintext metadata: "text" (default) or "image".
-        Used by clients/enclave to render the decrypted bytes correctly —
-        the envelope itself only carries opaque bytes; the type tag tells
-        the renderer to show a string vs decode JPEG.
+        `content_type` is plaintext metadata: "text" (default), "image", or
+        "file". Used by clients/enclave to render the decrypted bytes
+        correctly — the envelope itself only carries opaque bytes; the type
+        tag tells the renderer to show a string, decode JPEG, or offer a
+        file download (with `file_name`/`file_mime` extras, see below).
         """
         msg_id = envelope.get("id") if isinstance(envelope.get("id"), str) and envelope["id"] else uuid.uuid4().hex
-        ct = content_type if content_type in ("text", "image") else "text"
+        ct = content_type if content_type in ("text", "image", "file") else "text"
 
         msg: dict = {
             "id": msg_id,
@@ -402,6 +403,8 @@ class UserStore:
                 # enclave expands them into decrypted memory context on read.
                 "quoted_memory_ids",
                 "image_mime",
+                "file_name",
+                "file_mime",
                 "caption_v",
                 "caption_id",
                 "caption_body_ct",
