@@ -306,11 +306,14 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI) -> str:
         #
         # model_reasoning_* is verified against codex-cli 0.142.5 with
         # --strict-config. The resident consumer already routes codex reasoning
-        # events into thinking_summary; this asks the CLI to emit them.
+        # events into thinking_summary; this asks the CLI to emit them. OpenAI
+        # native only exposes best-effort summaries, not raw reasoning, so
+        # `detailed` improves the chance of seeing a summary but cannot guarantee
+        # one for every turn.
         return (
             "codex exec --skip-git-repo-check --json "
             "-c model_reasoning_effort=medium "
-            "-c model_reasoning_summary=auto "
+            "-c model_reasoning_summary=detailed "
             "{mcp} "
             "--dangerously-bypass-approvals-and-sandbox {message}"
         )

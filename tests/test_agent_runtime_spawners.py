@@ -173,14 +173,15 @@ def test_default_codex_cmd_bypasses_bwrap_sandbox():
 def test_default_codex_cmd_requests_reasoning_summary_events():
     # Codex only surfaces reasoning to the resident consumer if the CLI is asked
     # to run with reasoning enabled. The consumer already parses agent_reasoning
-    # / reasoning events into the thinking disclosure.
+    # / reasoning events into the thinking disclosure. OpenAI native summaries
+    # are best-effort; detailed improves the hit rate but does not guarantee one.
     env = spawners.consumer_env(
         {}, {"api_key": "fk", "provider_key": "sk-oai", "driver": "codex"},
         user_id="u_1", home="/h",
     )
     cmd = env["AGENT_CLI_CMD"]
     assert "-c model_reasoning_effort=medium" in cmd
-    assert "-c model_reasoning_summary=auto" in cmd
+    assert "-c model_reasoning_summary=detailed" in cmd
 
 
 def test_default_cli_cmds_carry_mcp_placeholder():
