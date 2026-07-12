@@ -66,10 +66,11 @@ def test_dimension_nudge_range_only():
 
 
 def test_service_runtime_labels_are_card_policy_source():
-    import pytest
-    # Skip gracefully if service cannot be imported (e.g., no Postgres).
-    identity_service = pytest.importorskip("identity.service")
+    from identity import service as identity_service
     assert identity_service._IDENTITY_RUNTIME_LABELS is card_policy.RUNTIME_LABELS
     # 既有判定不回归
     assert "claude" in identity_service._IDENTITY_RUNTIME_LABELS
     assert "hermes" in identity_service._IDENTITY_RUNTIME_LABELS
+    # 之前被误删的 12 个 label 不回归(google/bard/deepseek 等错误被判定为合法名字)
+    for label in ("google", "bard", "deepseek", "agent", "io", "feedling"):
+        assert label in card_policy.RUNTIME_LABELS

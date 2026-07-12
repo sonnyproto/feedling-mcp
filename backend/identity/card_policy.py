@@ -14,10 +14,12 @@ from __future__ import annotations
 
 # Single source of truth. backend/identity/service.py imports this.
 RUNTIME_LABELS: frozenset[str] = frozenset({
-    "hermes", "claude", "claude code", "claude desktop", "claude-code",
-    "claude-desktop", "claude.ai", "anthropic", "openclaw", "open-claw",
-    "open claw", "cursor", "chatgpt", "chat-gpt", "gpt", "gpt-4", "gpt-4o",
-    "gpt-5", "openai", "openrouter", "gemini", "assistant", "ai", "bot",
+    "io", "feedling", "p0", "p-zero",
+    "hermes", "claude", "claude code", "claude desktop", "claude-code", "claude-desktop",
+    "claude.ai", "anthropic", "openclaw", "open-claw", "open claw", "cursor",
+    "chatgpt", "chat-gpt", "gpt", "gpt-4", "gpt-4o", "gpt-5", "openai", "openrouter",
+    "gemini", "google ai", "google", "bard", "deepseek", "minimax", "copilot", "github copilot",
+    "agent", "assistant", "ai", "bot",
 })
 
 MAX_DIMENSIONS = 12  # sanity cap, NOT a floor
