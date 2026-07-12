@@ -63,3 +63,13 @@ def test_dimension_nudge_range_only():
     assert card_policy.validate_dimension_nudge("锐利", 70) == (True, "")
     assert card_policy.validate_dimension_nudge("锐利", 150) == (False, "dimension_value_out_of_range")
     assert card_policy.validate_dimension_nudge("", 50) == (False, "dimension_name_empty")
+
+
+def test_service_runtime_labels_are_card_policy_source():
+    import pytest
+    # Skip gracefully if service cannot be imported (e.g., no Postgres).
+    identity_service = pytest.importorskip("identity.service")
+    assert identity_service._IDENTITY_RUNTIME_LABELS is card_policy.RUNTIME_LABELS
+    # 既有判定不回归
+    assert "claude" in identity_service._IDENTITY_RUNTIME_LABELS
+    assert "hermes" in identity_service._IDENTITY_RUNTIME_LABELS
