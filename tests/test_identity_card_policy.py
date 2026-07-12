@@ -35,3 +35,31 @@ def test_dimensions_structure_rejects_bad_shape():
          {"name": "A", "value": 60, "description": "y"}]) == (False, "dimension_name_duplicate")
     assert card_policy.validate_dimensions_structure(
         [{"name": "a", "value": True, "description": "x"}]) == (False, "dimension_value_not_number")
+
+
+def test_full_card_structure_only_lenient():
+    ok_card = {"agent_name": "阿锐", "self_introduction": "hi",
+               "dimensions": [{"name": "锐利", "value": 90, "description": "x"}]}
+    assert card_policy.validate_full_identity_card(ok_card) == (True, "")
+    # 稀疏(1 维)在契约 B 下合法
+    assert card_policy.validate_full_identity_card(
+        {"agent_name": "阿锐", "dimensions": []}) == (True, "")
+    assert card_policy.validate_full_identity_card(
+        {"agent_name": "", "dimensions": []}) == (False, "agent_name_empty")
+    assert card_policy.validate_full_identity_card(
+        {"agent_name": "Claude", "dimensions": []}) == (False, "agent_name_is_runtime_label")
+
+
+def test_profile_patch_only_checks_present_fields():
+    # 只改名字:旧卡维度稀疏也不该因此被拒
+    assert card_policy.validate_profile_patch({"agent_name": "阿锐"}) == (True, "")
+    assert card_policy.validate_profile_patch({"tone_style": "sharp"}) == (True, "")
+    assert card_policy.validate_profile_patch({"agent_name": "gpt"}) == (False, "agent_name_is_runtime_label")
+    assert card_policy.validate_profile_patch(
+        {"dimensions": [{"name": "a", "value": 150, "description": "x"}]}) == (False, "dimension_value_out_of_range")
+
+
+def test_dimension_nudge_range_only():
+    assert card_policy.validate_dimension_nudge("锐利", 70) == (True, "")
+    assert card_policy.validate_dimension_nudge("锐利", 150) == (False, "dimension_value_out_of_range")
+    assert card_policy.validate_dimension_nudge("", 50) == (False, "dimension_name_empty")

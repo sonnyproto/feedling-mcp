@@ -51,3 +51,41 @@ def validate_dimensions_structure(dims) -> tuple[bool, str]:
         if value < _VALUE_MIN or value > _VALUE_MAX:
             return (False, "dimension_value_out_of_range")
     return _OK
+
+
+def validate_full_identity_card(card: dict) -> tuple[bool, str]:
+    """init / full replace. Structure only (contract B — no count/spread floor)."""
+    if not isinstance(card, dict):
+        return (False, "identity_must_be_object")
+    name = str(card.get("agent_name") or "").strip()
+    if not name:
+        return (False, "agent_name_empty")
+    if is_runtime_label(name):
+        return (False, "agent_name_is_runtime_label")
+    return validate_dimensions_structure(card.get("dimensions", []))
+
+
+def validate_profile_patch(patch: dict) -> tuple[bool, str]:
+    """Only validate fields PRESENT in the patch — never judge the whole card,
+    so a name change is not rejected because the old card is sparse."""
+    if not isinstance(patch, dict):
+        return (False, "patch_must_be_object")
+    if "agent_name" in patch:
+        name = str(patch.get("agent_name") or "").strip()
+        if not name:
+            return (False, "agent_name_empty")
+        if is_runtime_label(name):
+            return (False, "agent_name_is_runtime_label")
+    if "dimensions" in patch:
+        return validate_dimensions_structure(patch.get("dimensions"))
+    return _OK
+
+
+def validate_dimension_nudge(target_name: str, new_value) -> tuple[bool, str]:
+    if not str(target_name or "").strip():
+        return (False, "dimension_name_empty")
+    if isinstance(new_value, bool) or not isinstance(new_value, (int, float)):
+        return (False, "dimension_value_not_number")
+    if new_value < _VALUE_MIN or new_value > _VALUE_MAX:
+        return (False, "dimension_value_out_of_range")
+    return _OK
