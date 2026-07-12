@@ -68,6 +68,19 @@ def _plain_identity() -> dict:
     }
 
 
+def _plain_identity_sparse() -> dict:
+    # Contract B (card_policy): a 2-dimension card is a legal shape. A rename
+    # patch must not be rejected just because the existing card is sparse.
+    return {
+        "agent_name": "bro",
+        "self_introduction": "I keep the real thread with you.",
+        "dimensions": [
+            {"name": "Signal sensitivity", "value": 92, "description": "Notices subtle shifts."},
+            {"name": "Context retention", "value": 88, "description": "Keeps prior context."},
+        ],
+    }
+
+
 def _seed_identity(user_id: str) -> None:
     db.set_blob(user_id, "identity", {
         "v": 1,
@@ -839,6 +852,99 @@ def test_identity_profile_patch_writes_custom_persona_prompt(client, monkeypatch
     assert body["status"] == "ok"
     assert "custom_persona_prompt" in body["effects"][0]["fields"]
     assert captured_plaintexts[-1]["custom_persona_prompt"] == directive
+
+
+def test_identity_profile_patch_rename_allowed_on_sparse_card(client, monkeypatch):
+    # Task 5: profile_patch now goes through card_policy.validate_profile_patch,
+    # which only checks fields PRESENT in the patch — a name-only rename must not
+    # be rejected because the existing card only has 2 dimensions (contract B).
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    captured_plaintexts: list = []
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity_sparse()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder(captured_plaintexts))
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={
+            "actions": [{
+                "type": "identity.profile_patch",
+                "patch": {"agent_name": "阿锐"},
+                "reason": "User asked for a displayed name change.",
+            }],
+        },
+    )
+
+    assert res.status_code == 200, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["status"] == "ok"
+    assert captured_plaintexts[-1]["agent_name"] == "阿锐"
+
+
+def test_identity_profile_patch_rejects_runtime_label(client, monkeypatch):
+    # Task 5: a runtime label ("hermes") in agent_name must be rejected with the
+    # card_policy-shared error code, not a bespoke inline one.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={
+            "actions": [{
+                "type": "identity.profile_patch",
+                "patch": {"agent_name": "hermes"},
+                "reason": "test",
+            }],
+        },
+    )
+
+    assert res.status_code == 400, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["error"] == "agent_name_is_runtime_label"
+
+
+def test_identity_dimension_nudge_rejects_out_of_range(client, monkeypatch):
+    # Task 5: dimension_nudge now goes through card_policy.validate_dimension_nudge
+    # — a delta that would push the value out of [0, 100] is rejected explicitly
+    # instead of being silently clamped to the boundary.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+
+    monkeypatch.setattr(
+        core_enclave,
+        "_enclave_get_json_for_gate",
+        lambda path, key, params=None: ({"identity": _plain_identity()}, "") if path == "/v1/identity/get" else ({}, ""),
+    )
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={
+            "actions": [{
+                "type": "identity.dimension_nudge",
+                "dimension": "Signal sensitivity",  # value 92 in _plain_identity()
+                "delta": 50,
+                "reason": "test",
+            }],
+        },
+    )
+
+    assert res.status_code == 400, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["error"] == "dimension_value_out_of_range"
 
 
 def test_proactive_settings_wake_directive_validation(client):
