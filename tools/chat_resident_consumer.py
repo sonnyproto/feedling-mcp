@@ -3527,6 +3527,28 @@ def _inject_codex_images(cmd: list[str], image_paths: list[str]) -> list[str]:
     return [*cmd[:insert_at], *flags, *cmd[insert_at:]]
 
 
+def _cli_template_is_pi() -> bool:
+    """True when AGENT_CLI_CMD drives ``pi`` (so we attach images as @refs)."""
+    return _is_pi_cmd(_cli_cmd_tokens())
+
+
+def _inject_pi_images(cmd: list[str], image_paths: list[str]) -> list[str]:
+    """Attach decrypted image files to a ``pi`` command as native vision input.
+
+    pi reads ``@<path>`` positional args at the CLI layer — its file-processor
+    sniffs the mime from file CONTENT and feeds real ``ImageContent`` to the model
+    (vision), unlike the text file-path the model can't actually see. This is pi's
+    analogue of codex's ``--image=``. The user message rides STDIN (not argv), so
+    the ``@`` refs simply append to the end; each is self-delimiting and argv is a
+    list, so paths with spaces survive. The "already wired" guard checks the
+    TEMPLATE (``_cli_cmd_tokens``), not the rendered cmd — a user message starting
+    with ``@`` must never be mistaken for an operator-provided file ref.
+    """
+    if not image_paths or any(t.startswith("@") for t in _cli_cmd_tokens()):
+        return cmd
+    return [*cmd, *[f"@{path}" for path in image_paths]]
+
+
 def _cli_flag_value(cmd: list[str], flag: str) -> str:
     try:
         idx = cmd.index(flag)
@@ -3758,8 +3780,13 @@ def _prepare_cli_command(
     codex_native_images = (
         bool(image_paths) and not template_has_image_slot and _cli_template_is_codex()
     )
+    # pi likewise gets pixels natively via injected @<path> refs (_inject_pi_images).
+    pi_native_images = (
+        bool(image_paths) and not template_has_image_slot and _cli_template_is_pi()
+    )
     rendered_message = message
-    if image_paths and not template_has_image_slot and not codex_native_images:
+    if (image_paths and not template_has_image_slot
+            and not codex_native_images and not pi_native_images):
         rendered_message = _message_for_agent(message, image_paths)
     cmd = _render_cli_template(rendered_message, sid, image_paths=image_paths, lane=lane)
     cmd, sid = _ensure_explicit_cli_session_id(cmd, sid)
@@ -3804,9 +3831,31 @@ def _prepare_cli_command(
             and not _message_has_injected_history(message)
         ):
             cmd = [cmd[0], "--resume", sid, *cmd[1:]]
+    elif _is_pi_cmd(cmd):
+        # pi 续接只用 --session-id（"create if missing" 语义，resident 自己生成
+        # 的 bounded id 在 _ensure_explicit_cli_session_id 已绑定/持久化）。
+        cmd, removed_continue = _strip_cli_flags(cmd, {"--continue", "-c"})
+        if removed_continue:
+            log.warning(
+                "removed pi --continue from AGENT_CLI_CMD; resident "
+                "continuity uses the bounded --session-id"
+            )
+        if "--mode" not in cmd:
+            cmd = [cmd[0], "--mode", "json", *cmd[1:]]
+        if "--session-id" not in cmd and not _has_cli_resume(cmd):
+            # 操作员覆盖的 cli_cmd 没带占位符时兜底注入 resident 自有会话（默认
+            # 模板总带占位符，由 _ensure_explicit_cli_session_id 处理）。fresh home
+            # 首轮 sid 为空 —— 须现场生成并持久化，否则 pi 每轮开新会话、且事件流无
+            # 可抠 session_id（call_agent_cli 信命令行 sid），续接会永久丢失。
+            if not sid:
+                sid = _new_agent_session_id()
+                _save_agent_session_id(sid)
+            cmd = [cmd[0], "--session-id", sid, *cmd[1:]]
 
     if codex_native_images:
         cmd = _inject_codex_images(cmd, image_paths or [])
+    if pi_native_images:
+        cmd = _inject_pi_images(cmd, image_paths or [])
 
     return _resolve_cli_executable(cmd)
 
@@ -3956,8 +4005,16 @@ def call_agent_cli(
     else:
         child_env.pop("FEEDLING_TRACE_ID", None)
         child_env.pop("FEEDLING_DEBUG_TRACE_ID", None)
+    # pi arg-parses every positional (a message starting with @/-/-- would be eaten
+    # as a file ref / flag), so the managed pi template omits {message} and we feed
+    # the message via STDIN instead — safe for arbitrary user text. An operator
+    # template that kept {message} in argv gets an empty stdin so pi never blocks
+    # reading it. Non-pi drivers are unchanged (message stays in argv).
+    _run_kwargs: dict = {"capture_output": True, "text": True, "timeout": 120, "env": child_env}
+    if _is_pi_cmd(cmd):
+        _run_kwargs["input"] = message if "{message}" not in AGENT_CLI_CMD else ""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=child_env)
+        result = subprocess.run(cmd, **_run_kwargs)
     except subprocess.TimeoutExpired:
         _emit_debug_trace("agent", "agent.model.call.error", status="error", trace_id=trace_id,
                           dur_ms=(time.monotonic() - _turn_t0) * 1000,

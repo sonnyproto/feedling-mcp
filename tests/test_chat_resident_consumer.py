@@ -4431,6 +4431,132 @@ def test_pi_intermediate_events_are_non_final():
         assert etype in crc._JSON_NON_FINAL_EVENTS
 
 
+def test_prepare_pi_command_generates_session_id_and_keeps_mode_json(monkeypatch, tmp_path):
+    # Managed pi template has NO {message} — the message rides STDIN, so it never
+    # appears in argv (a @/-/-- message would otherwise be arg-parsed by pi).
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD",
+        "pi --mode json -t bash --append-system-prompt /h/agent-tools-prompt.md "
+        "--model feedling/qwen-max --session-id {session_id}")
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
+
+    cmd = crc._prepare_cli_command("hello")
+    sid = crc._cli_flag_value(cmd, "--session-id")
+    assert sid                                   # 空 sid → 现场生成并绑定
+    assert sid == crc._load_agent_session_id()   # 已持久化，下一轮复用
+    assert cmd[:3] == ["pi", "--mode", "json"]
+    assert "hello" not in cmd                    # 消息走 stdin，不进 argv
+
+    cmd2 = crc._prepare_cli_command("second")
+    assert crc._cli_flag_value(cmd2, "--session-id") == sid   # 续接同一会话
+
+
+def test_prepare_pi_command_strips_continue_and_adds_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi -c --session-id {session_id}")
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
+
+    cmd = crc._prepare_cli_command("hello")
+    assert "-c" not in cmd and "--continue" not in cmd   # 续接只靠 --session-id
+    assert "--mode" in cmd and crc._cli_flag_value(cmd, "--mode") == "json"
+    assert "hello" not in cmd                            # 消息走 stdin
+
+
+def test_prepare_pi_command_generates_session_when_override_lacks_placeholder(monkeypatch, tmp_path):
+    # 操作员覆盖 cli_cmd 且没带 --session-id 占位符 + fresh home(sid 空)：pi 分支须
+    # 现场生成 resident 自有 bounded sid 并持久化，否则每轮新会话、续接永久丢失。
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json -t bash")
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
+
+    cmd = crc._prepare_cli_command("hello")
+    sid = crc._cli_flag_value(cmd, "--session-id")
+    assert sid                                    # 现场生成注入
+    assert sid == crc._load_agent_session_id()    # 已持久化
+    cmd2 = crc._prepare_cli_command("second")
+    assert crc._cli_flag_value(cmd2, "--session-id") == sid   # 续接同一会话
+
+
+def test_prepare_cli_injects_pi_image_refs(monkeypatch, tmp_path):
+    # pi reads @<path> positional args as NATIVE vision (file-processor sniffs the
+    # mime and feeds real ImageContent); the managed pi template has no image slot,
+    # so the resident must attach decrypted images as @refs — else the model only
+    # ever sees a text file-path it can't visually process.
+    img1 = str(tmp_path / "a.jpg")
+    img2 = str(tmp_path / "b.jpg")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD",
+        "pi --mode json -t bash --session-id {session_id}")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sid-1")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("look", image_paths=[img1, img2])
+    assert f"@{img1}" in cmd and f"@{img2}" in cmd
+    # @refs append to the END of argv (message rides STDIN, not argv)
+    assert cmd[-2:] == [f"@{img1}", f"@{img2}"]
+    assert "look" not in cmd                              # message via stdin
+    assert "Decrypted image file(s)" not in " ".join(cmd)
+
+
+def test_prepare_cli_pi_image_ref_appends_and_message_via_stdin(monkeypatch, tmp_path):
+    img = str(tmp_path / "a.jpg")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id}")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sid-1")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("hello there", image_paths=[img])
+    # @ref is the trailing positional; the message is NOT in argv (goes via stdin)
+    assert cmd[-1] == f"@{img}"
+    assert "hello there" not in cmd
+
+
+def test_prepare_cli_pi_respects_operator_image_slot(monkeypatch, tmp_path):
+    # An operator template that already carries {image_path} owns image handling;
+    # the resident must not double-inject @refs on top of it.
+    img = str(tmp_path / "a.jpg")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD",
+        "pi --mode json --session-id {session_id} {image_path} {message}")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sid-1")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("look", image_paths=[img])
+    assert img in cmd                 # template's own slot filled with the path
+    assert f"@{img}" not in cmd       # no @-injection on top
+
+
+def test_call_agent_cli_pi_feeds_message_via_stdin_not_argv(monkeypatch, tmp_path):
+    # THE robustness fix: a user message starting with @ / - / -- must never reach
+    # pi's argv (pi arg-parses every positional → would eat it as a file ref / flag
+    # and drop or break the turn). It rides STDIN instead.
+    raw = _pi_stream_lines(
+        _PI_HEADER,
+        {"type": "message_end", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "ok"}]}},
+    )
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(cmd, 0, stdout=raw, stderr="")
+
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD",
+        "pi --mode json -t bash --session-id {session_id}")   # managed default: no {message}
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
+
+    msg = "@someone -look at this"
+    out = crc.call_agent_cli(msg)
+    assert out == "ok"                              # reply parsed fine
+    assert captured["input"] == msg                 # message fed via stdin
+    assert msg not in captured["cmd"]               # NEVER in argv
+    assert not any(t.startswith("@") for t in captured["cmd"])  # no @ from the message
+
+
 def test_agent_turn_skips_codex_reasoning_event_as_non_final():
     """Defense in depth: even if a raw codex reasoning event reaches the generic
     extractor, it must not be emitted as a chat bubble."""
