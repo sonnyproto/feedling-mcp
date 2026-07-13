@@ -36,6 +36,7 @@ from core import store as core_store  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 
 ADMIN_TOKEN = "admin-test-token"
+ADMIN_PASSWORD = "admin-test-password"
 _pk_counter = itertools.count(1)
 
 
@@ -55,6 +56,8 @@ _ASGI = _build_asgi_app()
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(core_config, "FEEDLING_DIR", tmp_path)
     monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", ADMIN_TOKEN)
+    monkeypatch.setenv("FEEDLING_ADMIN_PASSWORD", ADMIN_PASSWORD)
+    monkeypatch.setenv("FEEDLING_RUNTIME_TOKEN_SECRET", "runtime-session-test-secret")
     registry._users[:] = []
     registry._key_to_user.clear()
     core_store._stores.clear()
@@ -316,3 +319,118 @@ def test_unconfigured_is_503_parity(env, monkeypatch):
     a = _asgi_json("GET", "/v1/admin/data-track/summary", headers=_admin())
     assert f == a
     assert a == (503, {"error": "service_unavailable", "detail": "admin token is not configured"})
+
+
+# --------------------------------------------------------------------------- #
+# password login + signed admin session cookie
+# --------------------------------------------------------------------------- #
+
+def test_admin_login_page_is_public(env):
+    response = _asgi("GET", "/admin/login?next=/admin/data-track%3Fview%3Ddau")
+    assert response.status_code == 200
+    assert 'action="/admin/login"' in response.text
+    assert 'name="next" value="/admin/data-track?view=dau"' in response.text
+
+
+def test_admin_login_sets_signed_secure_cookie_and_cookie_authenticates(env):
+    response = _asgi(
+        "POST",
+        "/admin/login",
+        data={"password": ADMIN_PASSWORD, "next": "/admin/data-track"},
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/admin/data-track"
+    cookie_header = response.headers["set-cookie"]
+    assert "admin_session=" in cookie_header
+    assert "Max-Age=604800" in cookie_header
+    assert "HttpOnly" in cookie_header
+    assert "Secure" in cookie_header
+    assert "SameSite=lax" in cookie_header
+    cookie_value = response.cookies["admin_session"]
+    assert ADMIN_PASSWORD not in cookie_value
+    assert ADMIN_TOKEN not in cookie_value
+
+    protected = _asgi_json(
+        "GET",
+        "/v1/admin/data-track/summary",
+        headers={"Cookie": f"admin_session={cookie_value}"},
+    )
+    assert protected[0] == 200
+
+
+@pytest.mark.parametrize("supplied", ["wrong", ""])
+def test_admin_login_rejects_bad_password_with_same_page(env, supplied):
+    response = _asgi(
+        "POST",
+        "/admin/login",
+        data={"password": supplied, "next": "/admin/data-track"},
+    )
+    assert response.status_code == 401
+    assert "密码不对，再试一次。" in response.text
+    assert "admin_session=" not in response.headers.get("set-cookie", "")
+
+
+def test_admin_login_without_password_config_is_generic_401(env, monkeypatch):
+    monkeypatch.delenv("FEEDLING_ADMIN_PASSWORD")
+    response = _asgi("POST", "/admin/login", data={"password": ADMIN_PASSWORD})
+    assert response.status_code == 401
+    assert "密码不对，再试一次。" in response.text
+
+
+def test_admin_session_rejects_tampering_and_expiry(env):
+    valid = admin_asgi._sign_admin_session(expires_at=2_000_000_000)
+    expired = admin_asgi._sign_admin_session(expires_at=1)
+    assert valid is not None
+    assert admin_asgi._valid_admin_session(valid, now=1_900_000_000) is True
+    assert admin_asgi._valid_admin_session(valid + "x", now=1_900_000_000) is False
+    assert admin_asgi._valid_admin_session(expired, now=2) is False
+
+    response = _asgi_json(
+        "GET",
+        "/v1/admin/data-track/summary",
+        headers={"Cookie": f"admin_session={valid}x"},
+    )
+    assert response == (401, {"error": "unauthorized"})
+
+
+def test_admin_session_uses_token_fallback_and_rejects_secret_rotation(env, monkeypatch):
+    monkeypatch.delenv("FEEDLING_RUNTIME_TOKEN_SECRET")
+    session = admin_asgi._sign_admin_session(expires_at=2_000_000_000)
+    assert session is not None
+    assert admin_asgi._valid_admin_session(session, now=1_900_000_000) is True
+
+    monkeypatch.setenv("FEEDLING_ADMIN_TOKEN", "rotated-admin-token")
+    assert admin_asgi._valid_admin_session(session, now=1_900_000_000) is False
+
+
+@pytest.mark.parametrize(
+    "headers,path",
+    [
+        ({"X-Admin-Token": ADMIN_TOKEN}, "/v1/admin/data-track/summary"),
+        ({"Authorization": f"Bearer {ADMIN_TOKEN}"}, "/v1/admin/data-track/summary"),
+        ({}, f"/v1/admin/data-track/summary?admin_key={ADMIN_TOKEN}"),
+    ],
+)
+def test_legacy_admin_token_channels_remain_supported(env, headers, path):
+    assert _asgi_json("GET", path, headers=headers)[0] == 200
+
+
+def test_admin_login_rejects_external_next_and_logout_clears_cookie(env):
+    login = _asgi(
+        "POST",
+        "/admin/login",
+        data={"password": ADMIN_PASSWORD, "next": "https://example.com/steal"},
+    )
+    assert login.status_code == 303
+    assert login.headers["location"] == "/admin/data-track"
+
+    logout = _asgi("GET", "/admin/logout")
+    assert logout.status_code == 303
+    assert logout.headers["location"] == "/admin/login"
+    cookie_header = logout.headers["set-cookie"]
+    assert "admin_session=" in cookie_header
+    assert "Max-Age=0" in cookie_header
+    assert "HttpOnly" in cookie_header
+    assert "Secure" in cookie_header
+    assert "SameSite=lax" in cookie_header

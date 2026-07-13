@@ -276,6 +276,52 @@ def test_log_append_read_trim_prune():
     assert [r["event"] for r in db.log_read_all(uid, "device_events")] == [8, 9]
 
 
+def test_admin_data_track_snapshot_aggregates_app_sessions():
+    active_uid = _uid()
+    empty_uid = _uid()
+    seed_user(active_uid)
+    seed_user(empty_uid)
+
+    db.log_append(
+        active_uid,
+        "tracking_events",
+        {"type": "app_session_end", "payload": {"duration_sec": 45}},
+        ts=100.0,
+    )
+    db.log_append(
+        active_uid,
+        "tracking_events",
+        {"type": "app_session_end", "payload": {"duration_sec": 75}},
+        ts=200.0,
+    )
+    # Malformed duration still counts as a session but contributes no time.
+    db.log_append(
+        active_uid,
+        "tracking_events",
+        {"type": "app_session_end", "payload": {"duration_sec": "bad"}},
+        ts=300.0,
+    )
+    db.log_append(
+        active_uid,
+        "tracking_events",
+        {"type": "app_open", "payload": {"duration_sec": 999}},
+        ts=400.0,
+    )
+
+    snapshot = db.admin_data_track_snapshot([active_uid, empty_uid])
+
+    assert snapshot[active_uid]["app_usage"] == {
+        "foreground_sec": 120,
+        "sessions": 3,
+        "last_at": 300.0,
+    }
+    assert snapshot[empty_uid]["app_usage"] == {
+        "foreground_sec": 0,
+        "sessions": 0,
+        "last_at": None,
+    }
+
+
 def test_log_patch_item_only_if_status():
     uid = _uid()
     seed_user(uid)

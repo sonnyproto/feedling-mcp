@@ -143,7 +143,9 @@ compose_hash — flipping them on later needs **no on-chain re-auth**.
 
 CI secrets/vars (test job; `TEST_`-prefixed): `secrets.TEST_AGENT_RUNTIME_USERS`,
 `vars.TEST_AGENT_RUNTIME_AUTODISCOVER`, `secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET`,
-`vars.TEST_FEEDLING_HOST_ALL`. Prod job uses the un-prefixed names.
+`secrets.TEST_FEEDLING_ADMIN_PASSWORD`, `vars.TEST_FEEDLING_HOST_ALL`. Prod job
+uses the un-prefixed names. The admin password is injected only into the main
+test backend CVM; the separate agent-runner does not need it.
 
 **Zero-touch host-all rollout order (`FEEDLING_HOST_ALL`):**
 1. First set `TEST_FEEDLING_RUNTIME_TOKEN_SECRET` (generate a random secret) so

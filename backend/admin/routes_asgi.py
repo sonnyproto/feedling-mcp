@@ -1,7 +1,8 @@
 """Native ASGI admin data-track routes (ASGI-migration plan §5.3).
 
-Mirrors the Flask ``admin.data_track`` blueprint — admin-token gated
-(``FEEDLING_ADMIN_TOKEN``), NOT user auth. Two routes render HTML pages
+Mirrors the Flask ``admin.data_track`` blueprint. Protected routes accept the
+legacy ``FEEDLING_ADMIN_TOKEN`` channels or a signed password-login session;
+neither mechanism is user auth. Two routes render HTML pages
 (``GET /admin/data-track`` + ``GET /admin/data-track/users/{user_id}``); the
 five ``/v1/admin/...`` routes return JSON. The admin check replicates
 ``admin.data_track.require_admin`` as an ``HTTPException`` so the registered
@@ -18,11 +19,14 @@ so the output is byte-for-byte the Flask output. All of that is blocking sync
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import os
+import time
+from urllib.parse import parse_qs
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 
 from admin import admin_core
 from admin import tee_replication as admin_tee_replication
@@ -30,6 +34,56 @@ from asgi import threadpool
 from asgi.http import read_json_silent
 
 router = APIRouter()
+
+_ADMIN_SESSION_COOKIE = "admin_session"
+_ADMIN_SESSION_MAX_AGE = 7 * 24 * 60 * 60
+
+
+def _admin_session_secret() -> bytes | None:
+    raw = (
+        os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").strip()
+        or os.environ.get("FEEDLING_ADMIN_TOKEN", "").strip()
+    )
+    if not raw:
+        return None
+    return hmac.new(
+        raw.encode("utf-8"), b"feedling-admin-session-v1", hashlib.sha256
+    ).digest()
+
+
+def _sign_admin_session(*, expires_at: int | None = None) -> str | None:
+    secret = _admin_session_secret()
+    if secret is None:
+        return None
+    expiry = int(expires_at if expires_at is not None else time.time() + _ADMIN_SESSION_MAX_AGE)
+    payload = f"v1.{expiry}"
+    signature = hmac.new(secret, payload.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{payload}.{signature}"
+
+
+def _valid_admin_session(value: str, *, now: float | None = None) -> bool:
+    secret = _admin_session_secret()
+    if secret is None:
+        return False
+    try:
+        version, expiry_text, supplied_signature = str(value or "").split(".", 2)
+        expiry = int(expiry_text)
+    except (TypeError, ValueError):
+        return False
+    if version != "v1" or expiry <= int(time.time() if now is None else now):
+        return False
+    payload = f"{version}.{expiry}"
+    expected_signature = hmac.new(
+        secret, payload.encode("ascii"), hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(supplied_signature, expected_signature)
+
+
+def _safe_admin_next(value: str) -> str:
+    candidate = str(value or "").strip()
+    if candidate.startswith("/admin/") and not candidate.startswith("//"):
+        return candidate
+    return "/admin/data-track"
 
 
 def _extract_admin_token(request: Request) -> str:
@@ -47,12 +101,61 @@ def _require_admin(request: Request) -> None:
     # Mirror admin.data_track.require_admin: 503 when unconfigured, 401 on
     # missing/mismatched token. The exception handler maps these to the same
     # fixed bodies Flask's errorhandler(401/503) returns.
+    if _valid_admin_session(request.cookies.get(_ADMIN_SESSION_COOKIE, "")):
+        return
     configured = os.environ.get("FEEDLING_ADMIN_TOKEN", "").strip()
     if not configured:
         raise HTTPException(status_code=503)
     supplied = _extract_admin_token(request)
     if not supplied or not hmac.compare_digest(supplied, configured):
         raise HTTPException(status_code=401)
+
+
+@router.get("/admin/login")
+async def admin_login_page(request: Request):
+    next_url = _safe_admin_next(request.query_params.get("next") or "")
+    html = admin_core.login_page(
+        error=bool(request.query_params.get("error")), next_url=next_url
+    )
+    return HTMLResponse(html)
+
+
+@router.post("/admin/login")
+async def admin_login(request: Request):
+    raw_form = (await request.body()).decode("utf-8", errors="replace")
+    form = parse_qs(raw_form, keep_blank_values=True)
+    supplied = str((form.get("password") or [""])[0])
+    next_url = _safe_admin_next(str((form.get("next") or [""])[0]))
+    configured = os.environ.get("FEEDLING_ADMIN_PASSWORD", "")
+    valid_password = bool(configured) and hmac.compare_digest(supplied, configured)
+    session = _sign_admin_session() if valid_password else None
+    if session is None:
+        return HTMLResponse(admin_core.login_page(error=True, next_url=next_url), status_code=401)
+
+    response = RedirectResponse(next_url, status_code=303)
+    response.set_cookie(
+        key=_ADMIN_SESSION_COOKIE,
+        value=session,
+        max_age=_ADMIN_SESSION_MAX_AGE,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
+    return response
+
+
+@router.get("/admin/logout")
+async def admin_logout():
+    response = RedirectResponse("/admin/login", status_code=303)
+    response.delete_cookie(
+        key=_ADMIN_SESSION_COOKIE,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="lax",
+    )
+    return response
 
 
 @router.get("/v1/admin/data-track/summary")

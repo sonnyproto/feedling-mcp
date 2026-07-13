@@ -495,7 +495,10 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
     def ensure(out: dict[str, dict], uid: str) -> dict:
         return out.setdefault(uid, {})
 
-    out: dict[str, dict] = {uid: {} for uid in ids}
+    out: dict[str, dict] = {
+        uid: {"app_usage": {"foreground_sec": 0, "sessions": 0, "last_at": None}}
+        for uid in ids
+    }
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
@@ -618,6 +621,33 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                 ensure(out, uid).setdefault("logs", {})[stream] = {
                     "count": count,
                     "last_ts": max_ts,
+                }
+
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COALESCE(SUM(
+                         CASE
+                           WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
+                           THEN (doc->'payload'->>'duration_sec')::bigint
+                           ELSE 0
+                         END
+                       ), 0)::bigint AS foreground_sec,
+                       COUNT(*)::int AS sessions,
+                       MAX(ts) AS last_at
+                FROM user_logs
+                WHERE user_id = ANY(%s)
+                  AND stream = 'tracking_events'
+                  AND doc->>'type' = 'app_session_end'
+                GROUP BY user_id
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, foreground_sec, sessions, last_at in rows:
+                ensure(out, uid)["app_usage"] = {
+                    "foreground_sec": int(foreground_sec or 0),
+                    "sessions": int(sessions or 0),
+                    "last_at": last_at,
                 }
 
             rows = conn.execute(

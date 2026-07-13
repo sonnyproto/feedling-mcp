@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from urllib.parse import parse_qs, quote
 
@@ -395,6 +396,39 @@ def _data_track_count_dict(raw: dict | None) -> dict:
         except Exception:
             out[str(key or "unknown")] = 0
     return out
+
+
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _data_track_app_usage_from_snapshot(snap: dict) -> dict:
+    """Per-user app usage from db snapshot's ``app_usage`` (iOS app_session_end
+    aggregation). ``last_at`` is a server ingest epoch; keep it raw for the
+    Shanghai-day DAU roll-up and also expose an ISO string for display."""
+    au = dict(snap.get("app_usage") or {})
+    try:
+        last_epoch = float(au.get("last_at") or 0) or 0.0
+    except (TypeError, ValueError):
+        last_epoch = 0.0
+    return {
+        "foreground_sec": int(au.get("foreground_sec") or 0),
+        "sessions": int(au.get("sessions") or 0),
+        "last_at_epoch": last_epoch,
+        "last_at": _data_track_iso(last_epoch) if last_epoch else "",
+    }
+
+
+def _epoch_is_today_shanghai(epoch: float, now_epoch: float) -> bool:
+    """True when ``epoch`` falls on the same Asia/Shanghai calendar day as
+    ``now_epoch``. Explicit ZoneInfo — never the host's local TZ."""
+    if not epoch:
+        return False
+    try:
+        d1 = datetime.fromtimestamp(float(epoch), _SHANGHAI_TZ).date()
+        d2 = datetime.fromtimestamp(float(now_epoch), _SHANGHAI_TZ).date()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return False
+    return d1 == d2
 
 
 def _data_track_days_since(value) -> int | None:
@@ -800,6 +834,7 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
         "connection": _connection_health(route, access_modes, chat),
         "push": _push_stats_from_user_entry(user_entry),
         "tracking": tracking,
+        "app_usage": _data_track_app_usage_from_snapshot(snap),
         "bootstrap_events": bootstrap_events,
         "history_import": history_import,
     }
@@ -1128,6 +1163,9 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     human_active_1d = human_active_3d = 0
     activated = 0
     conn_offline = conn_stalled = 0
+    # App usage-duration roll-up (iOS app_session_end). foreground-kill undercount
+    # is expected (see analytics-app-session-end.md); this is a slight lower bound.
+    au_fg_total = au_sessions_total = au_users_active = au_dau_today = 0
     for row in rows:
         stage = row["onboarding"]["stage"]
         route = row["route"]
@@ -1168,6 +1206,14 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
             human_active_3d += 1
         if human_epoch and (now_epoch - human_epoch) <= 86400:
             human_active_1d += 1
+        au = row.get("app_usage") or {}
+        au_sess = int(au.get("sessions") or 0)
+        au_fg_total += int(au.get("foreground_sec") or 0)
+        au_sessions_total += au_sess
+        if au_sess >= 1:
+            au_users_active += 1
+            if _epoch_is_today_shanghai(au.get("last_at_epoch") or 0, now_epoch):
+                au_dau_today += 1
     # Duplicate registration: one real person (principal_id) can hold several
     # user_id rows because re-onboarding never deletes the old row (only the
     # explicit reset endpoint does). Count principals carrying >1 row and the
@@ -1210,6 +1256,13 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         "proactive_jobs_total": proactive_jobs,
         "proactive_messages_total": proactive_messages,
         "proactive_failed_total": proactive_failed,
+        "app_usage": {
+            "foreground_sec_total": au_fg_total,
+            "sessions_total": au_sessions_total,
+            "avg_session_sec": (au_fg_total / au_sessions_total) if au_sessions_total else 0,
+            "users_active": au_users_active,
+            "dau_today": au_dau_today,
+        },
     }
     payload = {
         "summary": summary,
@@ -1679,6 +1732,64 @@ def _render_metric(label: str, value) -> str:
     )
 
 
+def _fmt_duration_sec(value) -> str:
+    """Seconds -> compact human duration (e.g. 137 -> '2m17s', 5400 -> '1h30m').
+    None / non-numeric -> '—' (unknown), distinct from a real 0 -> '0s'."""
+    if value is None:
+        return "—"
+    try:
+        s = int(round(float(value)))
+    except (TypeError, ValueError):
+        return "—"
+    if s <= 0:
+        return "0s"
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h{m}m" if m else f"{h}h"
+    if m:
+        return f"{m}m{sec}s" if sec else f"{m}m"
+    return f"{sec}s"
+
+
+def _render_admin_login_page(error: bool = False, next_url: str = "/admin/data-track") -> str:
+    """Password-gate login page for the admin dashboard. Posts to /admin/login,
+    which validates FEEDLING_ADMIN_PASSWORD and sets the signed admin_session
+    cookie (see admin.routes_asgi). Styled to match the data-track dashboard."""
+    err_html = (
+        "<div class='err'>密码不对，再试一次。</div>" if error else ""
+    )
+    safe_next = html.escape(next_url or "/admin/data-track", quote=True)
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Feedling Data Track · 登录</title>
+  <style>
+    :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; }}
+    body {{ margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; display:flex; min-height:100vh; align-items:center; justify-content:center; }}
+    .box {{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:28px 26px; width:320px; box-shadow:0 2px 14px rgba(0,0,0,.05); }}
+    h1 {{ font-size:19px; margin:0 0 4px; }}
+    .sub {{ color:var(--muted); font-size:13px; margin:0 0 18px; }}
+    input[type=password] {{ width:100%; box-sizing:border-box; padding:11px 12px; font-size:15px; border:1px solid var(--line); border-radius:8px; background:#fff; }}
+    button {{ width:100%; margin-top:12px; padding:11px; font-size:15px; font-weight:600; color:#fff; background:var(--accent); border:0; border-radius:8px; cursor:pointer; }}
+    .err {{ color:var(--accent); font-size:13px; margin-bottom:10px; }}
+  </style>
+</head>
+<body>
+  <form class="box" method="post" action="/admin/login">
+    <h1>Feedling Data Track</h1>
+    <p class="sub">团队内部面板 · 输入密码进入</p>
+    {err_html}
+    <input type="hidden" name="next" value="{safe_next}">
+    <input type="password" name="password" placeholder="密码" autofocus autocomplete="current-password">
+    <button type="submit">进入</button>
+  </form>
+</body>
+</html>"""
+
+
 def _data_track_page_href(**updates) -> str:
     qs_inner = _data_track_qs(**updates)
     return f"/admin/data-track?{qs_inner}" if qs_inner else "/admin/data-track"
@@ -1796,22 +1907,24 @@ def _render_data_track_page(payload: dict) -> str:
     raw_rows = int(summary["users_total"])
     off = int(summary.get("conn_offline") or 0)
     stalled = int(summary.get("conn_stalled") or 0)
-    # 真人去重(principals_total)= 原始行 in prod (每次重装新 principal),故不再单列;
-    # 已激活才是"真正用起来的人"。
+    # 头条用「激活用户」(真正用起来的人),不用「注册」——注册行含重装/换机产生的孤儿号,
+    # 每次静默重注册都新建一行且旧行不删,所以不是人数。principals_total 在 prod 恒等于
+    # 注册行(每次重装新密钥=新 principal),去重无意义,不再展示。
     metrics = "".join([
-        _render_metric("已激活 / 原始行", f"{activated} / {raw_rows}"),
-        _render_metric("真人活跃 1d/3d (人发消息)", f"{summary.get('human_active_1d', 0)} / {summary.get('human_active_3d', 0)}"),
-        _render_metric("系统活跃 1d/3d (含后台)", f"{fn.get('active_1d', 0)} / {fn.get('active_3d', 0)}"),
+        _render_metric("激活用户（真正用起来的人）", activated),
+        _render_metric("累计注册行（含重装孤儿·非人数）", raw_rows),
+        _render_metric("真人活跃 1d/3d（有人发消息）", f"{summary.get('human_active_1d', 0)} / {summary.get('human_active_3d', 0)}"),
+        _render_metric("系统活跃 1d/3d（含后台任务）", f"{fn.get('active_1d', 0)} / {fn.get('active_3d', 0)}"),
         _render_metric("连接异常 掉线/有去无回", f"{off} / {stalled}"),
-        _render_metric("chatting (收到AI回复)", f"{fn.get('chatting', 0)} · {_pct(fn.get('chatting'))}"),
-        _render_metric("onboarding done", summary["onboarding_completed"]),
-        _render_metric("chat messages", summary["chat_messages_total"]),
-        _render_metric("memories", summary["memory_total"]),
-        _render_metric("proactive jobs", summary["proactive_jobs_total"]),
+        _render_metric("在聊（收到过AI回复）", f"{fn.get('chatting', 0)} · {_pct(fn.get('chatting'))}"),
+        _render_metric("onboarding 完成", summary["onboarding_completed"]),
+        _render_metric("聊天消息总数", summary["chat_messages_total"]),
+        _render_metric("记忆总数", summary["memory_total"]),
+        _render_metric("主动任务数", summary["proactive_jobs_total"]),
     ])
     # Ground-truth activation funnel (behaviour-based, not stage-label-based).
     funnel_steps = [
-        ("registered", "注册"),
+        ("registered", "注册行（含重装孤儿·非人数）"),
         ("has_memory", "有记忆"),
         ("sent_first_message", "发过消息"),
         ("chatting", "收到AI回复(真在聊)"),
@@ -1828,6 +1941,25 @@ def _render_data_track_page(payload: dict) -> str:
         "<h2>Activation funnel（真实使用漏斗 · 基于行为,不看 stage 标签）</h2>"
         f"<section class='funnel'>{funnel_html}</section>"
     )
+    # App 使用时长(iOS app_session_end 事件聚合 · summary['app_usage'] 由 db 层填充)。
+    au = summary.get("app_usage") or {}
+    if au.get("sessions_total"):
+        usage_metrics = "".join([
+            _render_metric("总前台时长", _fmt_duration_sec(au.get("foreground_sec_total"))),
+            _render_metric("会话数（结束事件）", au.get("sessions_total", 0)),
+            _render_metric("平均单次时长", _fmt_duration_sec(au.get("avg_session_sec"))),
+            _render_metric("有使用时长的用户", au.get("users_active", 0)),
+            _render_metric("今日活跃（按会话）", au.get("dau_today", 0)),
+        ])
+        app_usage_section = (
+            "<h2>App 使用时长（iOS 前台时间 · 前台被杀会漏报，略偏低估）</h2>"
+            f"<section class='metrics'>{usage_metrics}</section>"
+        )
+    else:
+        app_usage_section = (
+            "<h2>App 使用时长</h2>"
+            "<div class='muted'>暂无 app_session_end 事件（iOS 上报后此处出现聚合）。</div>"
+        )
     return f"""<!doctype html>
 <html>
 <head>
@@ -1851,6 +1983,7 @@ def _render_data_track_page(payload: dict) -> str:
     .fn-bar {{ height:6px; background:#eee3d9; border-radius:4px; margin:6px 0; overflow:hidden; }}
     .fn-bar span {{ display:block; height:100%; background:var(--accent); }}
     .fn-label {{ color:var(--muted); font-size:12px; }}
+    .note-box {{ background:#fff8ef; border:1px solid #e8d8be; border-radius:8px; padding:12px 14px; margin:16px 0 4px; font-size:13px; line-height:1.6; color:#5a4d3c; }}
 	    .toolbar {{ display:flex; gap:10px; align-items:center; margin:18px 0; }}
 	    .viewbar,.sortbar,.pager {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 18px; }}
 	    .sort-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
@@ -1872,9 +2005,17 @@ def _render_data_track_page(payload: dict) -> str:
 	  <h1>Feedling Beta Data Track</h1>
 	  <div class="muted">Generated {html.escape(summary["generated_at"])}. Metadata only; encrypted content is not read or rendered.</div>
 	  <div class="muted">Showing {html.escape(str(pagination.get("returned", len(users))))} of {html.escape(str(pagination.get("total", summary["users_total"])))} filtered users. Since {html.escape(str(filters.get("since") or "all time"))}.</div>
+	  <div class="note-box">
+	    <b>怎么读这些数：</b>
+	    「<b>激活用户</b>」= 写过记忆或发过消息的人，<b>最接近真实用户数</b>。
+	    「<b>累计注册行</b>」= 装过 app、生成过密钥的账户行累计；同一个人重装 / 换机 / 抹机后
+	    app 会静默注册一个新号、旧号变孤儿不删，所以它<b>不是人数</b>、会远大于发出的邀请/邮件数。
+	    删除账户是硬删（行直接消失），因此没有、也无法有「已删除账户数」这个指标。
+	  </div>
 	  {_render_data_track_view_nav("users")}
 		  <section class="metrics">{metrics}</section>
 		  {funnel_section}
+		  {app_usage_section}
 	  <h2>Beta users</h2>
 	  <div class="toolbar"><input id="q" placeholder="Filter user, route, stage"></div>
 	  <div class="sortbar">{sort_controls}</div>
