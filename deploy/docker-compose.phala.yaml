@@ -194,6 +194,18 @@ services:
       # compose synthesis / build never aborts on an unset var; the backend
       # still fails fast at startup (db.py) if it ends up empty at runtime.
       DATABASE_URL: "${DATABASE_URL:-}"
+      # TEE 明文影子库（feedling-io-db-prod，独立 pg CVM）。best-effort 双写：
+      # db.py 写主库后镜像到这里，tee_shadow.mirror 永不 raise、失败只计数，绝不
+      # 拖垮主路径。两个都为空 = 双写 OFF（mirror.enabled() 需 FEEDLING_TEE_DUAL_WRITE=1
+      # 且 TEE_DATABASE_URL 非空）。DSN 用 app 角色（无 DDL）、sslnegotiation=direct、
+      # sslmode=require（与 test 一致，无 CA 分发故非 verify-full；两端同在 Phala prod9
+      # 内网，连接仍 TLS 加密，日后加 CA 分发再升 verify-full）。与 DATABASE_URL 同为
+      # 加密 env 注入、不烧 compose_hash。
+      # ⚠️ 开启后后台调度器会全量回填（reconcile 明文表 + 经 prod enclave 解密复制
+      # 密文表）——首次回填量大、打 prod enclave，建议先以 FEEDLING_TEE_DUAL_WRITE 空
+      # 部署确认健康，再挑低峰翻开（改 PROD_FEEDLING_TEE_DUAL_WRITE + 重部署）。
+      TEE_DATABASE_URL: "${TEE_DATABASE_URL:-}"
+      FEEDLING_TEE_DUAL_WRITE: "${FEEDLING_TEE_DUAL_WRITE:-}"
       # Cloudflare R2 (S3-compatible) offload for the heavy frame ciphertext
       # (backend/object_storage.py). Injected via `phala deploy -e R2_*=...`
       # (encrypted env channel). Empty default = feature OFF (body_ct stays
