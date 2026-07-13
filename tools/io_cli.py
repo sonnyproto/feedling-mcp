@@ -731,6 +731,73 @@ def cmd_memory_patch(args):
     if status in (200, 201):
         _emit({"ok": True, **(body if isinstance(body, dict) else {"result": body})})
     _emit({"ok": False, "http_status": status, "error": body}, 1)
+def cmd_onboarding_validate(args):
+    """Server-computed onboarding acceptance snapshot. GET /v1/onboarding/validate.
+
+    Always 200 on the backend (an artifact-based readout, never a hard error), so
+    ``ok`` here just tracks the HTTP round-trip; the real signal is the body's
+    ``next_action`` (and whatever other fields the payload carries), surfaced
+    verbatim so the caller can decide what onboarding step is still pending."""
+    api_url, auth = _require_backend()
+    status, body = _http_json("GET", f"{api_url}/v1/onboarding/validate", auth)
+    _emit({"ok": status == 200, "http_status": status,
+           **(body if isinstance(body, dict) else {})}, 0 if status == 200 else 1)
+
+
+def cmd_chat_verify_loop(args):
+    """Liveness probe for the resident-consumer reply pipeline. POST /v1/chat/verify_loop.
+
+    The backend posts a hidden synthetic ping and blocks (up to --timeout, capped
+    at 60s server-side) waiting for an agent-role reply; the response's
+    ``passing`` bool is the real signal (``loop_alive`` mirrors it). Both ping and
+    any matching reply are scrubbed from the visible transcript regardless of
+    outcome, so this never pollutes IO Chat."""
+    api_url, auth = _require_backend()
+    status, body = _http_json("POST", f"{api_url}/v1/chat/verify_loop", auth,
+                               payload={}, timeout=40)
+    _emit({"ok": bool(isinstance(body, dict) and body.get("passing")), "http_status": status,
+           **(body if isinstance(body, dict) else {})}, 0 if status == 200 else 1)
+
+
+def _greet_payload(message):
+    """Build the /v1/chat/response body for an agent-authored greeting. Pure (testable).
+
+    Endpoint choice: POST /v1/chat/response, not /v1/chat/message — chat_core.py
+    is explicit that /v1/chat/message is the USER's send path (write_message,
+    ``role="user"``) while /v1/chat/response is the AGENT's reply path
+    (write_response, ``role="openclaw"`` by default) — see routes_asgi.py:120 vs
+    :144. A greeting is agent-authored, so it belongs on /v1/chat/response.
+
+    Payload field: ``content``, matching the plaintext-body naming already used
+    elsewhere in this codebase for the same concept (tools/chat_resident_
+    consumer.py's post_reply() plaintext-fallback branch to this same endpoint,
+    and hosted/chat_send_core.py's ``payload.get("message") or payload.get(
+    "content")``). NOTE: as of this writing chat_core.write_response has no
+    plaintext bypass for the reply body — unlike /v1/identity/actions and
+    /v1/memory/actions, it hard-requires a real client-built ``envelope``
+    (chat_core.py:419-421) with no equivalent server-side "plaintext in, server
+    encrypts" contract. So a real v1/encrypted backend will 400 with
+    ``{"error": "envelope required"}`` on this call today; io_cli deliberately
+    does not attempt to build a real ChaCha20Poly1305 envelope client-side (that
+    needs the non-stdlib ``cryptography`` package, this file's own client-key
+    material, and the enclave/user pubkeys — the full pipeline already lives in
+    chat_resident_consumer.py, not this thin CLI). This verb stays a thin,
+    honest pass-through: it sends the plaintext field and surfaces whatever the
+    backend actually returns, so a future server-side plaintext-accept path
+    (mirroring memory.add) starts working here for free."""
+    message = str(message or "").strip()
+    return {"content": message} if message else None
+
+
+def cmd_chat_greet(args):
+    """Post an agent-authored greeting. POST /v1/chat/response. See _greet_payload."""
+    api_url, auth = _require_backend()
+    payload = _greet_payload(args.message)
+    if payload is None:
+        _emit({"ok": False, "error": "empty_message: need --message"}, 2)
+    status, body = _http_json("POST", f"{api_url}/v1/chat/response", auth, payload=payload)
+    _emit({"ok": status in (200, 201), "http_status": status,
+           **(body if isinstance(body, dict) else {})}, 0 if status in (200, 201) else 1)
 
 
 def cmd_phase2(args):
@@ -872,6 +939,17 @@ def main():
     mp.add_argument("--source", default="resident_patch")
     mp.add_argument("--reason", default=None, help="why (optional, audit trail)")
     mp.set_defaults(func=cmd_memory_patch)
+    ov = sub.add_parser("onboarding-validate",
+                        help="Server-computed onboarding acceptance snapshot (next_action etc.).")
+    ov.set_defaults(func=cmd_onboarding_validate)
+
+    cvl = sub.add_parser("chat-verify-loop",
+                         help="Liveness probe: ping the resident-consumer reply pipeline and wait for a reply.")
+    cvl.set_defaults(func=cmd_chat_verify_loop)
+
+    cg = sub.add_parser("chat-greet", help="Post an agent-authored greeting (POST /v1/chat/response).")
+    cg.add_argument("--message", default="", help="greeting text (required)")
+    cg.set_defaults(func=cmd_chat_greet)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")
