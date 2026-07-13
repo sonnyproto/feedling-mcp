@@ -455,7 +455,7 @@ def test_enclave_history_used_when_configured(monkeypatch):
     _process_messages receives actual content (not the empty poll payload)."""
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://127.0.0.1:5003")
     decrypted = [_make_msg(role="user", content="decrypted hello", ts=2000.0)]
-    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: decrypted)
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20, include_image_body=True: decrypted)
 
     with patch.object(crc, "call_agent", return_value="hi back") as mock_agent, \
          patch.object(crc, "post_reply"):
@@ -844,7 +844,7 @@ def test_empty_content_decrypt_source_available_replies(monkeypatch):
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://127.0.0.1:5003")
     monkeypatch.setattr(
         crc, "get_decrypted_history",
-        lambda since, limit=20: [decrypted_msg],
+        lambda since, limit=20, include_image_body=True: [decrypted_msg],
     )
 
     with patch.object(crc, "call_agent", return_value="sunny") as mock_agent, \
@@ -2044,7 +2044,7 @@ def _install_capture_job_harness(monkeypatch, agent_reply):
     monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
     monkeypatch.setattr(crc, "update_proactive_job_status", _status)
     monkeypatch.setattr(crc, "_process_proactive_jobs", _proactive_handler)
-    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: history)
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20, include_image_body=True: history)
     monkeypatch.setattr(crc, "_capture_memory_terms_context", lambda: ("buckets: work", "threads: meeting"))
     monkeypatch.setattr(
         crc,
@@ -2161,7 +2161,7 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
     monkeypatch.setattr(crc, "update_proactive_job_status", _status)
     monkeypatch.setattr(crc, "_process_proactive_jobs", _proactive_handler)
     monkeypatch.setattr(crc, "_capture_post_json", _post_json)
-    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: history)
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20, include_image_body=True: history)
     monkeypatch.setattr(
         crc,
         "_capture_identity_context",
@@ -4014,7 +4014,7 @@ def test_recent_chat_context_defaults_to_twenty_messages(monkeypatch):
     captured = {}
     now = 1780939000.0
 
-    def _history(since, limit):
+    def _history(since, limit, include_image_body=True):
         captured["limit"] = limit
         return [
             {"role": "user", "content": f"用户消息 {idx}", "ts": now - ((24 - idx) * 60)}
@@ -4039,7 +4039,7 @@ def test_recent_chat_context_defaults_to_twenty_messages(monkeypatch):
 def test_recent_chat_context_stale_falls_back_to_two_timestamped_messages(monkeypatch):
     now = 1780939000.0
 
-    def _history(since, limit):
+    def _history(since, limit, include_image_body=True):
         return [
             {"role": "user", "content": f"旧消息 {idx}", "ts": now - 28800 - ((4 - idx) * 60)}
             for idx in range(5)
@@ -4965,7 +4965,7 @@ def test_foreground_message_prepends_recent_transcript(monkeypatch):
         {"role": "agent", "content": "晴，十八度", "ts": now - 118},
         {"role": "user", "content": "那要穿外套吗", "ts": now},  # current turn
     ]
-    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: list(hist))
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20, include_image_body=True: list(hist))
 
     out = crc._foreground_agent_message("那要穿外套吗", current_ts=now)
 
@@ -4992,7 +4992,7 @@ def test_foreground_transcript_default_keeps_50_prior_messages(monkeypatch):
         }
         for i in range(1, 61)
     ] + [{"role": "user", "content": "当前这句", "ts": now}]
-    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: list(hist))
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20, include_image_body=True: list(hist))
 
     out = crc._foreground_agent_message("当前这句", current_ts=now)
 
@@ -5004,7 +5004,7 @@ def test_foreground_transcript_default_keeps_50_prior_messages(monkeypatch):
 def test_foreground_message_no_decrypt_source_returns_plain_content(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
-    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: None)
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20, include_image_body=True: None)
     assert crc._foreground_agent_message("你好", current_ts=time.time()) == "你好"
 
 
@@ -5015,7 +5015,7 @@ def test_foreground_message_first_turn_has_no_prior_returns_plain(monkeypatch):
     # history holds only the current message — nothing strictly older
     monkeypatch.setattr(
         crc, "get_decrypted_history",
-        lambda since, limit=20: [{"role": "user", "content": "第一句", "ts": now}],
+        lambda since, limit=20, include_image_body=True: [{"role": "user", "content": "第一句", "ts": now}],
     )
     assert crc._foreground_agent_message("第一句", current_ts=now) == "第一句"
 
@@ -5025,7 +5025,7 @@ def test_foreground_message_skipped_for_pi_returns_plain(monkeypatch):
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
     monkeypatch.setattr(
         crc, "get_decrypted_history",
-        lambda since, limit=20: [{"role": "user", "content": "早", "ts": 1.0}],
+        lambda since, limit=20, include_image_body=True: [{"role": "user", "content": "早", "ts": 1.0}],
     )
     assert crc._foreground_agent_message("hi", current_ts=9.0) == "hi"
 

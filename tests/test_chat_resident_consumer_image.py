@@ -315,3 +315,244 @@ def test_process_messages_image_turn_no_caption_uses_placeholder(tmp_path):
     assert crc.IMAGE_PLACEHOLDER in captured.get("message", ""), (
         f"无 caption 时应含占位符，实际 {captured.get('message')!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Bounded image transport (B)
+#
+# History used to come back with EVERY image body in the window inlined. Five
+# stuck 1.4MB photos meant a 4.4MB response; the CVM egress cut it off mid-body
+# ("peer closed connection ... received 196608, expected 4433378"), the resident
+# skipped the whole cycle, the cursor never advanced — so the next window held
+# the same five images, forever. Pixels now arrive one message at a time.
+# ---------------------------------------------------------------------------
+
+
+class _FakeResp:
+    def __init__(self, payload, status=200):
+        self._payload = payload
+        self.status_code = status
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        return None
+
+
+def test_history_fetch_can_opt_out_of_image_bodies(monkeypatch):
+    """include_image_body=false must reach the enclave — otherwise the caller is
+    forced to take every image body in the window."""
+    seen = {}
+
+    class _Client:
+        def get(self, url, params=None, headers=None):
+            seen["url"] = url
+            seen["params"] = params or {}
+            return _FakeResp({"messages": []})
+
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "http://enclave")
+    monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", _Client())
+
+    crc.get_decrypted_history(since=1.0, limit=20, include_image_body=False)
+
+    assert seen["params"]["include_image_body"] == "false"
+    assert seen["url"].endswith("/v1/chat/history")
+
+
+def test_history_fetch_includes_bodies_by_default(monkeypatch):
+    seen = {}
+
+    class _Client:
+        def get(self, url, params=None, headers=None):
+            seen["params"] = params or {}
+            return _FakeResp({"messages": []})
+
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "http://enclave")
+    monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", _Client())
+
+    crc.get_decrypted_history(since=1.0, limit=20)
+
+    assert "include_image_body" not in seen["params"]
+
+
+def test_hydrate_pulls_each_omitted_body_by_id(monkeypatch):
+    """One request per omitted body — a response can never exceed one image."""
+    calls = []
+
+    def fake_fetch(message_id):
+        calls.append(message_id)
+        return {
+            "id": message_id,
+            "role": "user",
+            "ts": 1.0,
+            "content_type": "image",
+            "content": "what is wrong here?",
+            "image_b64": base64.b64encode(_JPEG_MAGIC).decode("ascii"),
+            "image_mime": "image/jpeg",
+        }
+
+    monkeypatch.setattr(crc, "_fetch_message_body_from_enclave", fake_fetch)
+
+    out = crc._hydrate_omitted_bodies([
+        {"id": "t1", "role": "user", "ts": 0.5, "content_type": "text",
+         "content": "hi"},
+        {"id": "i1", "role": "user", "ts": 1.0, "content_type": "image",
+         "content": "what is wrong here?", "body_omitted": True,
+         "image_omitted": True, "image_mime": "image/jpeg"},
+    ])
+
+    assert calls == ["i1"]                      # text row never fetched
+    assert out[0]["content"] == "hi"
+    assert crc._image_payloads_from_msg(out[1])  # pixels landed
+    assert not out[1].get("body_omitted")
+    assert not out[1].get("image_omitted")
+    assert out[1]["content"] == "what is wrong here?"
+
+
+def test_hydrate_failure_degrades_one_turn_not_the_cursor(monkeypatch):
+    """A body that will not come back must leave the OTHER messages intact and
+    the row still processable — the image branch routes its honest
+    image-unavailable prompt. This is what keeps a bad body from wedging the
+    cursor the way the batched window did."""
+    monkeypatch.setattr(crc, "_fetch_message_body_from_enclave", lambda mid: None)
+
+    out = crc._hydrate_omitted_bodies([
+        {"id": "i1", "role": "user", "ts": 1.0, "content_type": "image",
+         "content": "look", "body_omitted": True, "image_omitted": True},
+        {"id": "t2", "role": "user", "ts": 2.0, "content_type": "text",
+         "content": "still here"},
+    ])
+
+    assert len(out) == 2
+    assert out[1]["content"] == "still here"        # unaffected
+    assert out[0]["content"] == "look"              # caption survived
+    assert crc._image_payloads_from_msg(out[0]) == []   # no pixels → honest prompt
+
+
+def test_fetch_message_body_calls_the_enclave_single_body_route(monkeypatch):
+    """Exercises the real function (not a stub) so a missing import or a bad URL
+    can't hide behind a monkeypatched fetch."""
+    seen = {}
+
+    class _Client:
+        def get(self, url, headers=None):
+            seen["url"] = url
+            return _FakeResp({"message": {"id": "i 1", "image_b64": "AAAA"}})
+
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "http://enclave")
+    monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", _Client())
+
+    msg = crc._fetch_message_body_from_enclave("i 1")
+
+    assert msg == {"id": "i 1", "image_b64": "AAAA"}
+    # id is percent-encoded into the path — a space must not split the URL
+    assert seen["url"] == "http://enclave/v1/chat/messages/i%201/body"
+
+
+def test_fetch_message_body_returns_none_on_transport_error(monkeypatch):
+    class _Client:
+        def get(self, url, headers=None):
+            raise RuntimeError("peer closed connection")
+
+    monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "http://enclave")
+    monkeypatch.setattr(crc, "_ENCLAVE_CLIENT", _Client())
+
+    assert crc._fetch_message_body_from_enclave("i1") is None
+
+
+# ---------------------------------------------------------------------------
+# Codex P2: include_image_body=false omits ANY body over
+# CHAT_HISTORY_INLINE_BODY_CT_MAX — not just images. A large TEXT message whose
+# per-message body fetch fails would arrive content-less, fall into the
+# "genuinely empty text" branch, get skipped, and advance the cursor — silently
+# dropping the user's turn for good. Images have an honest-unavailable path;
+# text needs one too.
+# ---------------------------------------------------------------------------
+
+
+def test_hydrate_marks_failed_body_as_unavailable(monkeypatch):
+    monkeypatch.setattr(crc, "_fetch_message_body_from_enclave", lambda mid: None)
+
+    out = crc._hydrate_omitted_bodies([
+        {"id": "t1", "role": "user", "ts": 1.0, "content_type": "text",
+         "body_omitted": True, "body_omitted_reason": "large_body_ct"},
+    ])
+
+    assert out[0]["body_unavailable"] is True
+
+
+def test_large_text_turn_with_unfetchable_body_still_replies(tmp_path):
+    """The turn must NOT be silently skipped: a dropped user message is
+    unrecoverable, while an honest 'I couldn't read that' reply is not."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    msg = {
+        "id": "txt-big-01", "role": "user", "ts": 9500.0, "content_type": "text",
+        "content": "",                 # body never arrived
+        "body_omitted": True, "body_omitted_reason": "large_body_ct",
+        "body_unavailable": True,
+    }
+    captured = {}
+
+    def fake_call(message, images=None, image_paths=None, trace_id=None, **kwargs):
+        captured["message"] = message
+        return {"messages": ["Sorry — I couldn't read that message."]}
+
+    with patch.object(crc, "call_agent", side_effect=fake_call), \
+         patch.object(crc, "post_reply", return_value={"id": "r-1"}) as mock_post:
+        result_ts = crc._process_messages([msg])
+
+    assert mock_post.called, "an unreadable-but-known message must still get a reply"
+    assert captured.get("message"), "agent must be told the body is unavailable"
+    assert result_ts == pytest.approx(9500.0)
+
+
+def test_genuinely_empty_text_is_still_skipped(tmp_path):
+    """The pre-existing contract holds: a message with no plaintext and no
+    body_unavailable marker (no decrypt source at all) is still skipped — we do
+    not invent a reply for content we never asked for."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    msg = {"id": "txt-empty-01", "role": "user", "ts": 9600.0,
+           "content_type": "text", "content": ""}
+
+    with patch.object(crc, "call_agent") as mock_agent, \
+         patch.object(crc, "post_reply") as mock_post:
+        crc._process_messages([msg])
+
+    assert not mock_agent.called
+    assert not mock_post.called
+
+
+def test_file_turn_with_unfetchable_body_does_not_land_an_empty_file(tmp_path):
+    """Same exposure as the text case, quieter: _prepare_file_for_agent decodes a
+    missing file_b64 to b"" and would hand the agent a 0-byte document to describe.
+    Say the bytes didn't arrive instead."""
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+
+    msg = {
+        "id": "file-gone-01", "role": "user", "ts": 9700.0, "content_type": "file",
+        "content": "看看这个报告", "file_name": "report.docx",
+        "file_mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "body_omitted": True, "body_unavailable": True,
+    }
+    captured = {}
+
+    def fake_call(message, images=None, image_paths=None, trace_id=None, **kwargs):
+        captured["message"] = message
+        return {"messages": ["That file didn't come through."]}
+
+    with patch.object(crc, "FILE_TEMP_DIR", tmp_path), \
+         patch.object(crc, "_prepare_file_for_agent") as mock_prep, \
+         patch.object(crc, "call_agent", side_effect=fake_call), \
+         patch.object(crc, "post_reply", return_value={"id": "r-f"}) as mock_post:
+        crc._process_messages([msg])
+
+    assert not mock_prep.called, "must not prepare a file whose bytes never arrived"
+    assert mock_post.called
+    assert "看看这个报告" in captured["message"]           # caption preserved
+    assert crc.BODY_UNAVAILABLE_PLACEHOLDER in captured["message"]

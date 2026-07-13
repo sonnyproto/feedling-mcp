@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from urllib.parse import quote
 
 import anyio.to_thread
 from fastapi import APIRouter
@@ -72,6 +73,44 @@ def _decrypt_history_items(messages, authorized_user_id, content_sk):
                 "visibility": "local_only",
                 "decrypt_status": "local_only_agent_cannot_read",
             })
+            continue
+
+        if m.get("body_omitted"):
+            # The caller asked for the transcript without the heavy bodies
+            # (include_image_body=false). There is no body_ct to decrypt, so this
+            # is an opt-out, NOT a decrypt failure — it must never land in
+            # decrypt_errors. The caption envelope survives body omission, so the
+            # user's actual question is still readable; the pixels are fetched one
+            # message at a time via GET /v1/chat/messages/<id>/body.
+            entry = {
+                "id": m["id"],
+                "role": m["role"],
+                "ts": m["ts"],
+                "source": m.get("source"),
+                "content_type": ctype,
+                "v": v,
+                "visibility": m.get("visibility", "shared"),
+                "decrypt_status": "ok",
+                "body_omitted": True,
+            }
+            reason = m.get("body_omitted_reason")
+            if reason:
+                entry["body_omitted_reason"] = reason
+            if ctype == "image":
+                entry["content"] = _decrypt_caption(m, authorized_user_id, content_sk, errors)
+                entry["image_omitted"] = True
+                entry["image_mime"] = m.get("image_mime") or "image/jpeg"
+            elif ctype == "file":
+                entry["content"] = _decrypt_caption(m, authorized_user_id, content_sk, errors)
+                entry["file_omitted"] = True
+                entry["file_mime"] = m.get("file_mime") or "application/octet-stream"
+                entry["file_name"] = m.get("file_name") or "file"
+            else:
+                entry["content"] = None
+            qmids = m.get("quoted_memory_ids")
+            if isinstance(qmids, str) and qmids.strip():
+                entry["quoted_memory_ids"] = qmids.strip()
+            decrypted.append(entry)
             continue
 
         try:
@@ -224,10 +263,19 @@ async def v1_chat_history(request: Request):
 
     since = request.query_params.get("since", "0")
     limit = request.query_params.get("limit", "200")
+    params = {"since": since, "limit": limit}
+    # Forward the body opt-out. Dropping it (the old behaviour) forced every
+    # caller to take the image bodies: a window holding a handful of 1.4MB photos
+    # serialized to a multi-MB response that the CVM egress truncated mid-body,
+    # and the resident then skipped the whole cycle — so the cursor never moved
+    # and the next window was guaranteed to contain the same images again.
+    include_image_body = request.query_params.get(
+        "include_image_body", request.query_params.get("include_image_bodies"))
+    if include_image_body is not None:
+        params["include_image_body"] = include_image_body
     hist, err_response = await backend_call_or_error(
         backend_client.backend_get(
-            "/v1/chat/history", ctx.forward_headers,
-            params={"since": since, "limit": limit}))
+            "/v1/chat/history", ctx.forward_headers, params=params))
     if err_response is not None:
         return err_response
 
@@ -308,3 +356,49 @@ async def v1_chat_history(request: Request):
         payload["context_memory_trace"] = context_memory_trace
     # 图片聊天史 payload 可达数 MB（image_b64）——json.dumps 离事件循环
     return await json_response_offthread(payload)
+
+
+@router.api_route("/v1/chat/messages/{message_id}/body", methods=["GET", "HEAD"])
+async def v1_chat_message_body(message_id: str, request: Request):
+    """Decrypt ONE message body — the bounded counterpart to /v1/chat/history.
+
+    History with include_image_body=false gives the resident the text transcript
+    at a few KB; it then pulls pixels through here, one message per request, so a
+    single response can never exceed one image (the ingest cap is 2MB). Batching
+    the bodies back into the window is what let a wedged transcript grow without
+    bound: five stuck images meant a 4.4MB response, the CVM egress cut it off
+    mid-body, the resident skipped the cycle, the cursor stalled, and the window
+    kept the same images forever. One image per request cannot wedge — a body that
+    fails to arrive degrades that one turn (the resident routes its honest
+    image-unavailable prompt) while every other message still advances.
+    """
+    ctx = auth.extract_auth(request)
+    user_id, error = await auth.resolve_read_caller(ctx)
+    if error is not None:
+        body, status = error
+        return JSONResponse(body, status_code=status)
+
+    resp, err_response = await backend_call_or_error(
+        backend_client.backend_get(
+            f"/v1/chat/messages/{quote(message_id, safe='')}/body",
+            ctx.forward_headers),
+        not_found_error="message_not_found")
+    if err_response is not None:
+        return err_response
+
+    content_sk, err_response = await content_sk_or_503()
+    if err_response is not None:
+        return err_response
+
+    msg = (resp or {}).get("message")
+    if not isinstance(msg, dict):
+        return JSONResponse({"error": "message_not_found"}, status_code=404)
+
+    # Reuse the batch decryptor on a one-item list: identical per-item semantics
+    # (caption handling, image/file branches, per-item DecryptFailure downgrade)
+    # with no second copy of the envelope logic to keep in sync.
+    decrypted, errors = await anyio.to_thread.run_sync(
+        _decrypt_history_items, [msg], user_id, content_sk)
+
+    return await json_response_offthread(
+        {"message": decrypted[0], "decrypt_errors": errors})

@@ -194,3 +194,124 @@ def test_context_memories_best_effort_on_failure(client, monkeypatch):
     r = client.get("/v1/chat/history", headers={"X-API-Key": "k"})
     assert r.status_code == 200  # context_memories 失败绝不 500
     assert r.get_json()["context_memories"] == []
+
+
+# --------------------------------------------------------------------------- #
+# Oversized-history containment (B): the resident must be able to pull the text
+# transcript WITHOUT every image body riding along. A window holding five 1.4MB
+# images serialized to a 4.4MB response that the CVM egress truncated mid-body
+# ("peer closed connection ... received 196608, expected 4433378") — the resident
+# then skipped the whole cycle, the cursor never advanced, and the next window
+# was guaranteed to contain the same images again. Pixels now come back one
+# message at a time via /v1/chat/messages/<id>/body.
+# --------------------------------------------------------------------------- #
+
+
+def test_history_forwards_include_image_body_to_backend(client, monkeypatch):
+    """The enclave used to forward only since/limit, silently dropping
+    include_image_body — so callers could not opt out of the image bodies."""
+    seen: dict = {}
+
+    async def fake_backend_get(path, headers, params=None):
+        if path == "/v1/users/whoami":
+            return {"user_id": "usr_a"}
+        if path == "/v1/chat/history":
+            seen["params"] = params or {}
+            return {"messages": [], "total": 0}
+        if path == "/v1/memory/list":
+            return {"moments": [], "total": 0}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+
+    async def fake_sk():
+        return object()
+    monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+
+    r = client.get(
+        "/v1/chat/history?since=5&limit=20&include_image_body=false",
+        headers={"X-API-Key": "k"},
+    )
+    assert r.status_code == 200
+    assert seen["params"]["include_image_body"] == "false"
+    assert seen["params"]["since"] == "5"
+    assert seen["params"]["limit"] == "20"
+
+
+def test_omitted_image_body_degrades_without_a_decrypt_error(client, monkeypatch):
+    """A body-omitted image row has no body_ct. It must NOT be reported as a
+    decrypt failure — the caption still decrypts, so the agent keeps the user's
+    actual question and just learns the pixels are fetched separately."""
+    _wire(monkeypatch, [
+        {"id": "i1", "role": "user", "ts": 1.0, "v": 1, "content_type": "image",
+         "body_omitted": True, "body_omitted_reason": "image_body", "body_ct_len": 1425288,
+         "caption_body_ct": "c", "caption_nonce": "cn", "caption_K_enclave": "ck",
+         "owner_user_id": "usr_a", "image_mime": "image/jpeg"},
+    ])
+    monkeypatch.setattr(envmod, "decrypt_envelope", lambda e, u, s: b"what is wrong here?")
+
+    body = client.get("/v1/chat/history", headers={"X-API-Key": "k"}).get_json()
+    m = body["messages"][0]
+
+    assert m["decrypt_status"] == "ok"
+    assert m["image_omitted"] is True
+    assert "image_b64" not in m
+    assert m["content"] == "what is wrong here?"   # caption survived the omission
+    assert m["content_type"] == "image"
+    assert body["decrypt_errors"] == []            # not a failure — an opt-out
+
+
+def test_message_body_route_decrypts_one_image(client, monkeypatch):
+    """Single-message body fetch: bounded payload (one image), so a wedged
+    window can never form."""
+    async def fake_backend_get(path, headers, params=None):
+        if path == "/v1/users/whoami":
+            return {"user_id": "usr_a"}
+        if path == "/v1/chat/messages/i1/body":
+            return {"message": {
+                "id": "i1", "role": "user", "ts": 1.0, "v": 1, "content_type": "image",
+                "body_ct": "BODY", "nonce": "n", "K_enclave": "k",
+                "owner_user_id": "usr_a", "image_mime": "image/png",
+                "caption_body_ct": "CAP", "caption_nonce": "cn", "caption_K_enclave": "ck",
+            }}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+
+    async def fake_sk():
+        return object()
+    monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+
+    def fake_decrypt(env, uid, sk):
+        return b"CAPTION-TEXT" if env.get("body_ct") == "CAP" else b"\x89PNG-RAW-BYTES"
+    monkeypatch.setattr(envmod, "decrypt_envelope", fake_decrypt)
+
+    r = client.get("/v1/chat/messages/i1/body", headers={"X-API-Key": "k"})
+    assert r.status_code == 200
+    m = r.get_json()["message"]
+    assert base64.b64decode(m["image_b64"]) == b"\x89PNG-RAW-BYTES"
+    assert m["image_mime"] == "image/png"
+    assert m["content"] == "CAPTION-TEXT"
+    assert m["decrypt_status"] == "ok"
+
+
+def test_message_body_route_propagates_backend_404(client, monkeypatch):
+    import httpx
+
+    async def fake_backend_get(path, headers, params=None):
+        if path == "/v1/users/whoami":
+            return {"user_id": "usr_a"}
+        if path == "/v1/chat/messages/nope/body":
+            req = httpx.Request("GET", "http://backend/v1/chat/messages/nope/body")
+            raise httpx.HTTPStatusError(
+                "404", request=req, response=httpx.Response(404, request=req))
+        raise AssertionError(path)
+
+    monkeypatch.setattr(backend_client, "backend_get", fake_backend_get)
+
+    async def fake_sk():
+        return object()
+    monkeypatch.setattr(keys, "get_content_sk", fake_sk)
+
+    r = client.get("/v1/chat/messages/nope/body", headers={"X-API-Key": "k"})
+    assert r.status_code == 404

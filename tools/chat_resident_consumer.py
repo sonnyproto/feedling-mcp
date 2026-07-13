@@ -104,6 +104,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import xml.etree.ElementTree as _ET
 import zipfile
 from pathlib import Path
@@ -560,6 +561,16 @@ IMAGE_PLACEHOLDER = os.environ.get(
     "[The user sent an image in IO Chat. Inspect the attached/local image "
     "before replying. If your current runtime cannot open the image, say "
     "plainly that this connector has not enabled image vision yet.]",
+)
+
+# An oversized body is omitted from the transcript and fetched per-message; when
+# that fetch fails we still know the message exists. Say so — dropping the turn
+# to stay silent would lose it permanently.
+BODY_UNAVAILABLE_PLACEHOLDER = os.environ.get(
+    "BODY_UNAVAILABLE_PLACEHOLDER",
+    "[The user sent a message in IO Chat, but its content could not be "
+    "retrieved this time. Tell the user plainly that their message did not "
+    "come through and ask them to send it again — do not guess what it said.]",
 )
 
 _SCREEN_CONTEXT_TRIGGER_RE = re.compile(
@@ -1256,17 +1267,29 @@ def _filter_since(msgs: list, since: float) -> list:
     return [m for m in msgs if float(m.get("ts", m.get("timestamp", 0)) or 0) > since]
 
 
-def _fetch_from_enclave(since: float, limit: int) -> list[dict] | None:
+def _fetch_from_enclave(
+    since: float, limit: int, include_image_body: bool = True
+) -> list[dict] | None:
     """Direct HTTP to the enclave decrypt proxy.
 
     Returns list (possibly empty) on success, None on error or not configured.
+
+    ``include_image_body=False`` keeps the transcript to a few KB no matter how
+    many photos sit in the window; bodies are then pulled one message at a time
+    through ``_fetch_message_body_from_enclave``. Inlining them here is what let
+    a wedged window grow without bound — five stuck 1.4MB photos serialized to a
+    4.4MB response, the CVM egress truncated it mid-body, and every retry rebuilt
+    the same oversized window.
     """
     if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
         return None
+    params: dict = {"limit": limit, "since": since}
+    if not include_image_body:
+        params["include_image_body"] = "false"
     try:
         resp = _ENCLAVE_CLIENT.get(
             f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
-            params={"limit": limit, "since": since},
+            params=params,
             headers=_HEADERS,
         )
         resp.raise_for_status()
@@ -1320,7 +1343,9 @@ def _verify_decrypt_sources() -> bool:
     return any_ok
 
 
-def get_decrypted_history(since: float, limit: int = 20) -> list[dict] | None:
+def get_decrypted_history(
+    since: float, limit: int = 20, include_image_body: bool = True
+) -> list[dict] | None:
     """Try all configured decrypt sources in priority order.
 
     Returns:
@@ -1329,12 +1354,83 @@ def get_decrypted_history(since: float, limit: int = 20) -> list[dict] | None:
       None  — no source configured, or all configured sources failed.
     """
     if FEEDLING_ENCLAVE_URL:
-        result = _fetch_from_enclave(since, limit)
+        result = _fetch_from_enclave(since, limit, include_image_body=include_image_body)
         if result is not None:
             return result
         log.warning("enclave source failed")
 
     return None  # no configured source succeeded
+
+
+def _fetch_message_body_from_enclave(message_id: str) -> dict | None:
+    """Decrypt ONE message body via the enclave. Returns None on any failure.
+
+    Bounded by construction: a response carries at most one image (the ingest cap
+    is 2MB), so no accumulation of unanswered photos can ever make this request
+    too big to complete.
+    """
+    if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
+        return None
+    try:
+        resp = _ENCLAVE_CLIENT.get(
+            f"{FEEDLING_ENCLAVE_URL}/v1/chat/messages/"
+            f"{urllib.parse.quote(str(message_id), safe='')}/body",
+            headers=_HEADERS,
+        )
+        resp.raise_for_status()
+        msg = (resp.json() or {}).get("message")
+        return msg if isinstance(msg, dict) else None
+    except httpx.HTTPStatusError as e:
+        body = (e.response.text or "").strip().replace("\n", " ")[:300]
+        log.warning(
+            "enclave message-body fetch failed [id=%s]: HTTP %d — %s",
+            message_id, e.response.status_code, body or "(empty body)",
+        )
+        return None
+    except Exception as e:
+        log.warning("enclave message-body fetch failed [id=%s]: %s", message_id, e)
+        return None
+
+
+def _hydrate_omitted_bodies(messages: list[dict]) -> list[dict]:
+    """Pull the body for each row whose history entry omitted it.
+
+    Call this AFTER filtering to the ids this cycle actually claimed, so the only
+    bodies fetched are the ones a turn is about to consume.
+
+    A body that fails to arrive leaves its row untouched: the image/file branch
+    then routes its honest "I can't read this" prompt, the turn still replies, and
+    the cursor still advances. That containment is the point — under the old
+    batched window one unfetchable photo stalled the cursor, which guaranteed the
+    next window contained that same photo again.
+    """
+    out: list[dict] = []
+    for m in messages:
+        if not isinstance(m, dict) or not m.get("body_omitted"):
+            out.append(m)
+            continue
+        mid = str(m.get("id") or m.get("message_id") or "").strip()
+        if not mid:
+            out.append(m)
+            continue
+        full = _fetch_message_body_from_enclave(mid)
+        if full is None:
+            log.warning(
+                "message body unavailable [id=%s type=%s] — turn degrades to the "
+                "body-unavailable prompt", mid, m.get("content_type", "text"),
+            )
+            # Mark it. Without this the row is indistinguishable from a message
+            # that has no plaintext at all, and _process_messages would skip it
+            # AND advance the cursor — silently destroying the user's turn. The
+            # omission applies to any oversized body, not only images, so plain
+            # text lands here too.
+            out.append({**m, "body_unavailable": True})
+            continue
+        merged = {**m, **full}
+        for k in ("body_omitted", "body_omitted_reason", "image_omitted", "file_omitted"):
+            merged.pop(k, None)
+        out.append(merged)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -4406,7 +4502,10 @@ def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = No
     limit = max(1, min(limit if limit is not None else FOREGROUND_CHAT_CONTEXT_LIMIT, 50))
     fetch_limit = max(limit + 4, 20)
     try:
-        history = get_decrypted_history(since=0, limit=fetch_limit)
+        # Text transcript only: image rows render as a placeholder here (_chat_line),
+        # so the bodies were decrypted, base64'd across the wire and thrown away —
+        # on EVERY foreground turn.
+        history = get_decrypted_history(since=0, limit=fetch_limit, include_image_body=False)
     except Exception as e:  # noqa: BLE001 — continuity is best-effort, never fatal
         log.warning("foreground chat context fetch failed: %s", e)
         return ""
@@ -5431,7 +5530,8 @@ def recent_chat_context_for_proactive(limit: int | None = None) -> ProactiveChat
     limit = max(1, min(limit if limit is not None else PROACTIVE_RECENT_CHAT_LIMIT, 50))
     fetch_limit = max(limit, min(max(1, PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT), 200))
     try:
-        history = get_decrypted_history(since=0, limit=fetch_limit)
+        # Text only — image rows become a placeholder in the rendered context.
+        history = get_decrypted_history(since=0, limit=fetch_limit, include_image_body=False)
     except Exception as e:
         log.warning("recent chat context fetch failed: %s", e)
         return ProactiveChatContext(freshness="unavailable")
@@ -6321,7 +6421,8 @@ def _capture_window_messages(job: dict) -> list[dict]:
     except (TypeError, ValueError):
         window_count = 0
     limit = max(20, CAPTURE_HISTORY_LIMIT)
-    history = get_decrypted_history(since=0, limit=limit)
+    # Text only — capture reads the transcript, never the pixels.
+    history = get_decrypted_history(since=0, limit=limit, include_image_body=False)
     live = _capture_live_history(history)
     if not live:
         return []
@@ -6729,7 +6830,12 @@ def _dream_cards_context() -> tuple[str, dict[str, dict]]:
 
 def _dream_recent_conversations_context() -> str:
     try:
-        history = get_decrypted_history(since=0, limit=max(1, min(DREAM_RECENT_CHAT_LIMIT, 240)))
+        # Text only — dream summarizes conversations, not images.
+        history = get_decrypted_history(
+            since=0,
+            limit=max(1, min(DREAM_RECENT_CHAT_LIMIT, 240)),
+            include_image_body=False,
+        )
     except Exception as e:
         log.warning("dream recent conversation fetch failed: %s", e)
         return "（这几天没有可读对话）"
@@ -7611,12 +7717,37 @@ def _process_messages(messages: list) -> float:
             # otherwise the agent gets the attachment but loses the actual prompt.
             if not content:
                 content = IMAGE_PLACEHOLDER
+        elif content_type == "file" and msg.get("body_unavailable"):
+            # _prepare_file_for_agent decodes a missing file_b64 to b"" and would
+            # land a 0-byte document — the agent would then dutifully describe an
+            # empty file. Be explicit that the bytes never arrived.
+            log.warning(
+                "file message [ts=%.3f] body unavailable after per-message fetch "
+                "— routing honest body-unavailable prompt", ts,
+            )
+            caption = content  # decrypted caption text, or ""
+            content = (
+                f"{caption}\n\n{BODY_UNAVAILABLE_PLACEHOLDER}".strip()
+                if caption else BODY_UNAVAILABLE_PLACEHOLDER
+            )
         elif content_type == "file":
             log.info("file message [ts=%.3f] — preparing file context for agent", ts)
             prep = _prepare_file_for_agent(msg)
             caption = content  # decrypted caption text, or ""
             block = prep.http_block if AGENT_MODE == "http" else prep.cli_instruction
             content = f"{caption}\n\n{block}".strip() if caption else block
+        elif msg.get("body_unavailable"):
+            # We KNOW this message exists and we know why we can't read it: history
+            # omitted the oversized body and the per-message fetch failed. Skipping
+            # it would advance the cursor and destroy the turn permanently — the one
+            # outcome we can never take back. Hand the agent an honest note instead,
+            # the same way an image whose pixels didn't arrive is handled: the user
+            # gets told, and can resend.
+            log.warning(
+                "text message [ts=%.3f] body unavailable after per-message fetch "
+                "— routing honest body-unavailable prompt", ts,
+            )
+            content = BODY_UNAVAILABLE_PLACEHOLDER
         elif not content:
             # Genuinely empty text — decrypt source missing or failed.
             # Never send a fallback for content we cannot read.
@@ -8337,9 +8468,15 @@ def run() -> None:
             # v1 encrypted envelopes. Fetch actual plaintext from a decrypt source.
             if FEEDLING_ENCLAVE_URL:
                 decrypt_since = _poll_decrypt_since(last_ts, poll_messages)
+                # Text only. The window spans every message since the cursor, and an
+                # unanswered photo holds the cursor still — so inlining bodies here
+                # made the response grow with each stuck image until the CVM egress
+                # truncated it mid-body, which stalled the cursor further. Bodies are
+                # pulled per-message below, for the claimed rows only.
                 decrypted = get_decrypted_history(
                     since=decrypt_since,
                     limit=_poll_decrypt_limit(decrypt_since, last_ts, poll_messages),
+                    include_image_body=False,
                 )
                 if decrypted is None:
                     # All configured sources failed — skip this cycle, keep checkpoint.
@@ -8383,6 +8520,12 @@ def run() -> None:
                             "(%d/%d)", wedge_miss_count, CHAT_POLL_WEDGE_SKIP_AFTER,
                         )
                     continue
+                # Pixels/bytes for the claimed rows only — one request each, so the
+                # payload is bounded by a single message no matter how many photos
+                # are backed up in the window. A body that won't come back leaves
+                # its row body-less: that turn degrades to the honest
+                # "can't read this" prompt and still replies, so the cursor moves.
+                messages = _hydrate_omitted_bodies(messages)
             else:
                 # No decrypt source — fall through with poll content (will be
                 # empty for v1 encrypted messages, skipped in _process_messages).
