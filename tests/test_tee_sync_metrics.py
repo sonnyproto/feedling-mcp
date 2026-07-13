@@ -118,3 +118,32 @@ def test_sync_tick_persists_one_row(backend_env, monkeypatch):
     # full report 里保留了各阶段明细,供 drill-down
     assert "reconcile" in row["report"] and "replicate" in row["report"]
     assert "verify" in row["report"] and "health" in row["report"]
+
+
+def test_sync_tick_records_whole_table_replicate_failure(backend_env, monkeypatch):
+    """整表 replicate 抛异常(如 TEE 连接掉线)必须计入 replicate_table_failures +
+    进 report.replicate_failed,而不是从面板上凭空消失(0016 补的漏报盲区)。"""
+    from admin import tee_replication as tr
+    from admin import tee_sync_scheduler as sched
+
+    def fake_run_action(*, action, table=None, dry_run=True, confirm=None, **kw):
+        if action == "reconcile":
+            return {"tables": []}
+        if action == "replicate":
+            if table == "chat_messages":
+                raise RuntimeError("the connection is lost")  # 整表挂,像线上那样
+            return {"copied": 1, "pending": 0, "errors": 0, "skipped": 0,
+                    "watermark_ts": 0.0, "watermark_id": "x"}
+        return {"ok": True, "mismatches": [], "tables": {}}
+
+    monkeypatch.setattr(tr, "run_action", fake_run_action)
+
+    before_ids = {r["id"] for r in db.recent_tee_sync_runs(limit=500)}
+    sched._sync_tick(do_reconcile=True)
+    new = [r for r in db.recent_tee_sync_runs(limit=500) if r["id"] not in before_ids]
+    assert len(new) == 1
+    row = new[0]
+    assert row["replicate_table_failures"] == 1          # chat_messages 整表挂被计数
+    assert row["replicate_copied"] == len(sched._CIPHERTEXT_TABLES) - 1  # 其余 4 张各 1
+    assert row["report"]["replicate_failed"]["chat_messages"] == "the connection is lost"
+    assert "chat_messages" not in (row["report"].get("replicate") or {})  # 挂的表不在成功明细里

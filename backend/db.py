@@ -482,6 +482,7 @@ _TEE_SYNC_RUN_COLS = (
     "did_reconcile", "reconcile_ok", "verify_ran", "verify_ok",
     "unconverged_tables", "unconverged_users", "requeue_backlog",
     "replicate_copied", "replicate_pending", "replicate_errors", "replicate_skipped",
+    "replicate_table_failures",
     "reconcile_copied", "reconcile_pruned", "reconcile_skipped",
     "mirror_failures", "tee_healthy", "tee_probe_ms", "duration_ms",
 )

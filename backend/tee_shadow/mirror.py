@@ -50,6 +50,11 @@ def _pool_int(env: str, default: int) -> int:
 def _pool_min() -> int:
     # 热连接数。保持得多一些,突发时更少现场做网关 direct-TLS 冷握手(那条慢链路正是
     # 当年把 pool_timeout 放宽到 15s 的理由)。
+    #
+    # 但热连接越多、经 Phala 网关闲置越久,越容易被网关静默掐断(2026-07-14:min 从
+    # 2 提到 8 后,失败从"couldn't get a connection"变成"SSL unexpected eof",chat/
+    # memory 整表挂)。所以这 8 条热连接必须靠下面的 max_lifetime 主动回收 + keepalive
+    # 保活,否则 min 越大陈连接暴露面越大。
     return _pool_int("FEEDLING_TEE_POOL_MIN", 8)
 
 
@@ -72,6 +77,18 @@ def _pool_max() -> int:
     return _pool_int("FEEDLING_TEE_POOL_MAX", 32)
 
 
+def _pool_max_lifetime() -> float:
+    # 单条连接的最长存活(秒)后强制回收重建。TEE 走 Phala 网关的 direct-TLS,连接
+    # 空闲/存活久了会被网关静默掐断,下次大写(chat 行最大)撞到死连接 → "SSL error:
+    # unexpected eof" / "connection is lost"(2026-07-14 test 实测,chat/memory 整表挂)。
+    # 主动在网关掐断前回收,配合下面的 keepalive,把陈连接概率压到最低;残余由
+    # replicator 的换连接重试兜底。默认 180s,可配。min_size(8)越大,这条越重要。
+    try:
+        return max(30.0, float(os.environ.get("FEEDLING_TEE_POOL_MAX_LIFETIME", "180") or 180))
+    except (TypeError, ValueError):
+        return 180.0
+
+
 def get_tee_pool():
     global _pool
     if _pool is None:
@@ -84,9 +101,15 @@ def get_tee_pool():
                     max_size=_pool_max(),
                     timeout=_pool_timeout(),
                     max_idle=300,
+                    # 主动回收陈连接(见 _pool_max_lifetime):min_size 的热连接不受
+                    # max_idle 约束,只有 max_lifetime 能把它们在被网关掐断前换掉。
+                    max_lifetime=_pool_max_lifetime(),
                     # connect_timeout:单条连接的建立上限(libpq 参数),防止一次
                     # 网关握手无限期挂住占着 pool 的补给名额。
-                    kwargs={"autocommit": True, "connect_timeout": 10},
+                    # keepalives:让内核每 30s 发 TCP 探活,尽量别让网关按空闲掐断。
+                    kwargs={"autocommit": True, "connect_timeout": 10,
+                            "keepalives": 1, "keepalives_idle": 30,
+                            "keepalives_interval": 10, "keepalives_count": 3},
                     open=True,
                 )
     return _pool
