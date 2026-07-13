@@ -68,3 +68,32 @@ def test_replace_in_supported_list_on_unknown_action():
     r, _e, st = _run(_ns("u3"), {"type": "identity.bogus"})
     assert st == 400
     assert "identity.replace" in r["supported"]
+
+
+def test_replace_rejects_runtime_label_agent_name():
+    # Task 5: full-card replace now goes through card_policy.validate_full_identity_card
+    # — a runtime-label agent_name must be rejected before it ever reaches
+    # genesis_service.replace_identity_preserving_anchor.
+    uid = "usr_idrep_runtime_label"
+    jid = _live_resident_job(uid)
+    bad_identity = {"agent_name": "Claude", "self_introduction": "hi",
+                     "dimensions": [{"name": "warmth", "value": 60}]}
+    r, _e, st = _run(_ns(uid), {"type": "identity.replace", "source": "genesis_resident_distill",
+                                "job_id": jid, "reason": "redefine persona", "identity": bad_identity})
+    assert st == 400 and r["error"] == "agent_name_is_runtime_label"
+
+
+def test_replace_accepts_sparse_two_dimension_card_and_reaches_replace():
+    # Contract B: a sparse (2-dimension) card is a legal shape and must NOT be
+    # rejected by card_policy. Proven the same way as
+    # test_replace_valid_context_passes_gate_and_reaches_replace: the user has no
+    # initialized identity yet, so a card that clears card_policy still reaches
+    # replace_identity_preserving_anchor and fails there with identity_not_initialized
+    # (409) — a card_policy rejection would instead surface as 400.
+    uid = "usr_idrep_sparse_ok"
+    jid = _live_resident_job(uid)
+    sparse_identity = {"agent_name": "Nyx", "dimensions": [
+        {"name": "warmth", "value": 60}, {"name": "wit", "value": 40}]}
+    r, _e, st = _run(_ns(uid), {"type": "identity.replace", "source": "genesis_resident_distill",
+                                "job_id": jid, "reason": "redefine persona", "identity": sparse_identity})
+    assert st == 409 and r["error"] == "identity_not_initialized"

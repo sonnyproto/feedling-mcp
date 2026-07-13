@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
-from datetime import datetime
 import json
 import logging
 import os
@@ -60,6 +59,13 @@ from core import runtime_token
 from core import wake_bus
 from core.store import get_store
 from agent_runtime import leases, spawners
+# One-shot introduction machinery is shared with chat.chat_core so BOTH the
+# supervisor recovery path AND the resident chat_loop_verified fast-path enqueue
+# through ONE atomic entry (no parallel field / second state machine).
+from agent_runtime.introduction import (
+    _has_active_introduction_job,
+    enqueue_introduction_once,
+)
 from notices import core as notices
 from notices import catalog
 
@@ -92,10 +98,6 @@ _RUNNER_NOTICE_SUFFIX = {"runner_spawn_failed": "spawn_failed",
                          "runner_key_decrypt_failed": "key_decrypt_failed",
                          "runner_degraded": "degraded"}
 
-INTRODUCTION_JOB_KIND = "introduction"
-INTRODUCTION_TRIGGER = "post_spawn_genesis"
-INTRODUCTION_INTENT_LABEL = "post_respawn_introduction"
-_INTRODUCTION_ACTIVE_STATUSES = {"pending", "claimed", "realizing"}
 # `_fetch_identity_plain_for_intro` returns identity=None for several reasons.
 # Only these two mean the card GENUINELY does not exist yet (a fresh / no-card
 # user) -> safe to introduce without a card. The rest (enclave_url_missing,
@@ -584,53 +586,6 @@ def _fetch_identity_plain_for_intro(entry: dict, *, api_url: str, enclave_url: s
     return identity, ""
 
 
-def _has_active_introduction_job(store) -> bool:
-    try:
-        jobs = store.list_proactive_jobs(since_epoch=0, limit=0)
-    except Exception as e:  # noqa: BLE001
-        log.warning("introduction active-job scan failed for %s: %s", getattr(store, "user_id", ""), e)
-        return True
-    for job in jobs or []:
-        if str((job or {}).get("job_kind") or "").strip() != INTRODUCTION_JOB_KIND:
-            continue
-        status = str((job or {}).get("status") or "pending").strip()
-        if status in _INTRODUCTION_ACTIVE_STATUSES:
-            return True
-    return False
-
-
-def _build_introduction_job(*, now: float) -> dict:
-    from core import util
-    job_id = util._new_public_id("pj")
-    return {
-        "job_id": job_id,
-        "schema_version": 2,
-        "ts": float(now),
-        "created_at": datetime.fromtimestamp(float(now)).isoformat(),
-        "wake_id": job_id,
-        "source": "agent_initiated_proactive",
-        "status": "pending",
-        "intent_label": INTRODUCTION_INTENT_LABEL,
-        "context_hint": "",
-        "connections": [],
-        "connection": {},
-        "frame_ids": [],
-        "device_event_ids": [],
-        "current_app": "",
-        "trigger": INTRODUCTION_TRIGGER,
-        "job_kind": INTRODUCTION_JOB_KIND,
-        "manual": False,
-        "forced": False,
-        "user_state": "",
-        "ai_state": "",
-        "broadcast_state": "",
-        "wake_kind": "introduction",
-        "screen_context_available": False,
-        "agent_action": "",
-        "agent_action_status": "",
-    }
-
-
 def _enqueue_introduction_job_if_needed(
     user_id: str,
     entry: dict,
@@ -689,14 +644,10 @@ def _enqueue_introduction_job_if_needed(
     # Reachable when: (a) readable card that still needs an intro, or (b) identity
     # is None for a genuine no-card reason. Both enqueue exactly one introduction.
     clock = now() if callable(now) else float(now)
-    job = store.append_proactive_job(_build_introduction_job(now=clock))
-    if job:
-        # Optimistic one-shot: mark at enqueue. The intro is best-effort; if the
-        # job later fails to realize, the user still gets ongoing proactive
-        # messages (the gate no longer blocks them). Re-introducing on every
-        # spawn would be worse than a rare missed first-touch.
-        store.mark_introduced()
-    return job
+    # Enqueue through the SHARED atomic entry (claim-first + rollback-on-failure)
+    # so this recovery path and the resident chat_loop_verified fast-path in
+    # chat.chat_core can never double-send the one-shot introduction.
+    return enqueue_introduction_once(store, now=clock)
 
 
 def _fetch_key_envelope(api_url: str, api_key: str = "", *, runtime_token: str = "") -> dict | None:

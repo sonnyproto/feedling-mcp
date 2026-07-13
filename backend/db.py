@@ -1498,6 +1498,89 @@ def try_stamp_hosted_tick(user_id: str, doc: dict, now: float, interval_sec: flo
     return won
 
 
+def claim_and_enqueue_introduction(
+    user_id: str,
+    settings_doc: dict,
+    job: dict,
+    *,
+    at_iso: str,
+    ts: float | None = None,
+    item_key: str | None = None,
+) -> dict | None:
+    """Cross-process exactly-once: claim the one-shot ``introduced_at`` marker
+    (user_blobs/proactive_settings) AND append the introduction job
+    (user_logs/proactive_jobs) in a SINGLE PostgreSQL transaction.
+
+    Why a transaction, not a per-process lock (Codex P1): backend workers and
+    the standalone runner do NOT share a Python lock, so two processes could
+    each read an empty marker and both enqueue. Here the guarded UPSERT is the
+    atomic gate — only the process whose ``jsonb_set`` actually flips the empty
+    marker gets a ``RETURNING`` row; everyone else loses. And because the job
+    INSERT is in the same transaction, a job-write failure rolls the marker back
+    automatically — the marker can never persist without a stored job, and there
+    is no ``unclaim`` step that could erase another caller's success.
+
+    ``settings_doc`` seeds the row ONLY when it does not yet exist (fresh user);
+    when the row exists the marker is merged in via ``jsonb_set`` so peer fields
+    (e.g. ``first_chat_ok_at``) are preserved. Returns ``{"job", "seq"}`` iff
+    THIS caller won and the job persisted, else ``None`` (already introduced,
+    lost the race, or a DB failure that rolled back)."""
+    # ON CONFLICT merges the marker into the EXISTING doc (jsonb_set) and also
+    # refreshes updated_at/version like every other proactive_settings mutation,
+    # WITHOUT clobbering peer fields (first_chat_ok_at, switches, timezone…).
+    claim_sql = (
+        "INSERT INTO user_blobs (user_id, kind, doc) "
+        "VALUES (%s, 'proactive_settings', %s) "
+        "ON CONFLICT (user_id, kind) DO UPDATE "
+        "  SET doc = jsonb_set(user_blobs.doc, '{introduced_at}', to_jsonb(%s::text), true) "
+        "            || jsonb_build_object('updated_at', %s::text, 'version', 2) "
+        "  WHERE COALESCE(user_blobs.doc->>'introduced_at', '') = '' "
+        "RETURNING doc"
+    )
+    job_sql = (
+        "INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
+        "VALUES (%s, 'proactive_jobs', %s, %s, %s) RETURNING seq"
+    )
+    claimed_doc = None
+    seq = None
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                row = conn.execute(claim_sql, (user_id, Jsonb(settings_doc), at_iso, at_iso)).fetchone()
+                if row is not None:
+                    claimed_doc = row[0]
+                    seq = conn.execute(job_sql, (user_id, ts, item_key, Jsonb(job))).fetchone()[0]
+    except Exception as e:
+        log.error("[db] claim_and_enqueue_introduction(%s) failed: %s", user_id, e)
+        return None
+    if claimed_doc is None or seq is None:
+        return None
+    # Committed on the primary — mirror BOTH rows into the TEE shadow as ONE
+    # transaction (they are a single logical write). The blob merges the marker
+    # (jsonb_set + updated_at/version) rather than overwriting the whole doc, so
+    # a late-arriving introduction mirror can't briefly clobber peer fields the
+    # reconciler already advanced on the shadow; the job seq is pinned so the
+    # shadow keeps the row identity every seq-ordered read relies on.
+    from tee_shadow import mirror
+    mirror.execute_many([
+        (
+            "INSERT INTO user_blobs (user_id, kind, doc) "
+            "VALUES (%s, 'proactive_settings', %s) "
+            "ON CONFLICT (user_id, kind) DO UPDATE "
+            "  SET doc = jsonb_set(user_blobs.doc, '{introduced_at}', to_jsonb(%s::text), true) "
+            "            || jsonb_build_object('updated_at', %s::text, 'version', 2)",
+            (user_id, Jsonb(claimed_doc), at_iso, at_iso),
+        ),
+        (
+            "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
+            "OVERRIDING SYSTEM VALUE VALUES (%s, 'proactive_jobs', %s, %s, %s, %s) "
+            "ON CONFLICT (user_id, stream, seq) DO NOTHING",
+            (user_id, seq, ts, item_key, Jsonb(job)),
+        ),
+    ])
+    return {"job": job, "seq": seq}
+
+
 def delete_blob(user_id: str, kind: str) -> bool:
     sql = "DELETE FROM user_blobs WHERE user_id = %s AND kind = %s"
     try:

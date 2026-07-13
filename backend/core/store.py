@@ -738,6 +738,37 @@ class UserStore:
             db.set_blob(self.user_id, "proactive_settings", cur)
         return cur
 
+    def claim_and_enqueue_introduction(self, job: dict) -> dict | None:
+        """Cross-process exactly-once enqueue of the one-shot introduction.
+
+        The durable ``introduced_at`` marker and the proactive job are written
+        in ONE PostgreSQL transaction (db.claim_and_enqueue_introduction), so
+        two processes that don't share a Python lock (backend workers + the
+        standalone runner) cannot both enqueue, and a job-write failure rolls the
+        marker back automatically — the marker never persists without a job.
+
+        Returns the ``job`` iff THIS caller won the claim and it persisted, else
+        ``None`` (already introduced, lost the race, or a DB failure rolled it
+        back). Post-commit side effects (trim + waiter/worker wake) mirror
+        ``append_proactive_job``."""
+        with self.proactive_lock:
+            settings = dict(self.load_proactive_settings())
+        at_iso = datetime.now().isoformat()
+        settings["introduced_at"] = at_iso
+        settings["version"] = 2
+        settings["updated_at"] = at_iso
+        result = db.claim_and_enqueue_introduction(
+            self.user_id, settings, job, at_iso=at_iso,
+            ts=self._entry_epoch(job),
+            item_key=(str(job.get("job_id") or "") or None),
+        )
+        if result is None:
+            return None
+        db.log_trim(self.user_id, "proactive_jobs", PROACTIVE_JOB_MAX)
+        self.notify_proactive_job_waiters()
+        wake_bus.notify("proactive", self.user_id)
+        return job
+
     # ------- append-only logs (PostgreSQL-backed; see db.user_logs) -------
     @staticmethod
     def _entry_epoch(entry: dict) -> float | None:

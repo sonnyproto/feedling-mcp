@@ -66,6 +66,39 @@ _GENESIS_TERMINAL_STATUSES = {"done", "failed"}
 _GENESIS_BACKFILL_SOURCE_KIND = "companion_persona_backfill"
 
 
+def _memory_floor_fields(bootstrap_st: dict) -> dict:
+    """Non-blocking consistency signal for the Memory Garden step.
+
+    The Garden is NOT an onboarding gate (memory_below_floor never flips
+    ``passing`` and never blocks — 优先 onboarding 成功率). But a long
+    relationship carrying only a handful of cards under-represents the history:
+    the earlier failure was a 37-day relationship finishing onboarding with 2
+    cards because nothing surfaced the day-scaled floor to the agent. These
+    fields make that visible so the agent distills more REAL cards when it
+    genuinely has the history — never to fabricate to hit a number.
+    """
+    count = int(bootstrap_st.get("memory_count") or 0)
+    floor = int((bootstrap_st.get("floors") or {}).get("total")
+                or bootstrap_st.get("memory_floor") or 0)
+    below = bool(floor and count < floor)
+    hint = ""
+    if below:
+        hint = (
+            f"Only {count} memory card(s) written — below the ~{floor} expected "
+            "for this relationship's age. Memory is NOT a gate (onboarding can "
+            "still complete), but a garden this thin under-represents a long "
+            "relationship. If you genuinely have this history, distill more REAL "
+            "cards now (reuse existing buckets/threads, 落卡 baseline, one card "
+            "per event). NEVER fabricate to hit the number — thin-but-true beats "
+            "padded."
+        )
+    return {
+        "memory_floor": floor,
+        "memory_below_floor": below,
+        "hint": hint,
+    }
+
+
 def _visible_agent_message_count(store) -> int:
     with store.chat_lock:
         chat_msgs = list(store.chat_messages)
@@ -395,6 +428,7 @@ def _model_api_onboarding_validation_payload(store: UserStore) -> dict:
             "floors": bootstrap_st["floors"],
             "missing_tabs": bootstrap_st["missing_tabs"],
             "required": "",
+            **_memory_floor_fields(bootstrap_st),
         },
         {
             "id": "identity_card",
@@ -464,6 +498,7 @@ def _official_import_onboarding_validation_payload(store: UserStore) -> dict:
             "floors": bootstrap_st["floors"],
             "missing_tabs": bootstrap_st["missing_tabs"],
             "required": "",
+            **_memory_floor_fields(bootstrap_st),
         },
         {
             "id": "identity_card",
@@ -527,6 +562,7 @@ def _onboarding_validation_payload(store: UserStore) -> dict:
             "floors": bootstrap_st["floors"],
             "missing_tabs": bootstrap_st["missing_tabs"],
             "required": "",
+            **_memory_floor_fields(bootstrap_st),
         },
         {
             "id": "identity_card",

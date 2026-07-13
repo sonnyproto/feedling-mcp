@@ -87,6 +87,10 @@ def init_identity(store, payload: dict) -> tuple[dict, int]:
     if identity_plain is not None:
         if not isinstance(identity_plain, dict):
             return {"error": "identity must be object"}, 400
+        from identity import card_policy
+        ok, err = card_policy.validate_full_identity_card(identity_plain)
+        if not ok:
+            return {"error": err}, 400
         inner = identity_actions_mod._identity_payload_from_plain(identity_plain)
         built, build_err = core_envelope._build_shared_envelope_for_store(
             store,

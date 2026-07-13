@@ -12,6 +12,7 @@ import db
 from core.store import UserStore
 
 from memory import service as memory_service
+from identity.card_policy import RUNTIME_LABELS as _IDENTITY_RUNTIME_LABELS
 
 def _load_identity(store: UserStore) -> dict | None:
     try:
@@ -143,15 +144,6 @@ def _live_days_with_user(identity: dict, store: UserStore | None = None) -> int:
         return 0
     return max(0, (datetime.now().date() - anchor_date).days)
 
-
-_IDENTITY_RUNTIME_LABELS = {
-    "io", "feedling", "p0", "p-zero",
-    "hermes", "claude", "claude code", "claude desktop", "claude-code", "claude-desktop",
-    "claude.ai", "anthropic", "openclaw", "open-claw", "open claw", "cursor",
-    "chatgpt", "chat-gpt", "gpt", "gpt-4", "gpt-4o", "gpt-5", "openai", "openrouter",
-    "gemini", "google ai", "google", "bard", "deepseek", "minimax", "copilot", "github copilot",
-    "agent", "assistant", "ai", "bot",
-}
 
 _IDENTITY_PROFILE_STRING_FIELDS = (
     "agent_name",

@@ -34,6 +34,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend"))
+try:
+    from identity import card_policy as _card_policy  # single source, pure stdlib
+except Exception:
+    _card_policy = None
+
 FAST_SIGNALS = ("now", "location", "weather", "motion", "calendar")
 SLOW_SIGNALS = (
     "steps", "sleep", "workout", "vitals",
@@ -548,6 +554,60 @@ def cmd_identity_write(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+_FRESH_START_EVIDENCE = "user-confirmed fresh start"
+
+
+def _identity_init_payload(*, agent_name, self_introduction, dimensions,
+                           days_with_user, anchor, fresh_start):
+    """Build the /v1/identity/init body. Sanitize the card (clamp/dedup/truncate)
+    so structure is valid; fresh_start fills days=0 + standard anchor evidence."""
+    card = {
+        "agent_name": str(agent_name or ""),
+        "self_introduction": str(self_introduction or ""),
+        "dimensions": dimensions if isinstance(dimensions, list) else [],
+    }
+    if _card_policy is not None:
+        card = _card_policy.sanitize_identity_card(card)
+    if fresh_start:
+        days = 0
+        anchor = _FRESH_START_EVIDENCE
+    else:
+        days = int(days_with_user) if days_with_user is not None else None
+    return {"identity": card, "days_with_user": days,
+            "relationship_anchor_evidence": anchor or ""}
+
+
+def cmd_identity_init(args):
+    """Create the agent's identity card (POST /v1/identity/init).
+
+    Local pre-check only catches the STRONG checks sanitize can't fix (runtime-label
+    name, missing days/anchor) — everything else (out-of-range values, dupes,
+    unnamed dims) is auto-corrected by sanitize before this even runs. Contract:
+    走 io_cli 尽量不失败、多拿内容."""
+    api_url, auth = _require_backend()
+    dims = json.loads(args.dimensions) if args.dimensions else []
+    body = _identity_init_payload(
+        agent_name=args.agent_name, self_introduction=args.self_introduction,
+        dimensions=dims, days_with_user=args.days_with_user,
+        anchor=args.relationship_anchor_evidence, fresh_start=args.fresh_start)
+    # 强校验本地预检:只在 sanitize 修不了的 4 条上提示(runtime 名字 / days 缺锚点)
+    if _card_policy is not None:
+        ok, err = _card_policy.validate_full_identity_card(body["identity"])
+        if not ok:
+            _emit({"ok": False, "error": err,
+                   "hint": "非空名字不能是 runtime 标签(Claude 等);其余结构已自动修正"}, 2)
+    if body["days_with_user"] is None:
+        _emit({"ok": False, "error": "days_with_user_required",
+               "hint": "给 --days-with-user + --relationship-anchor-evidence,或用 --fresh-start"}, 2)
+    if not args.fresh_start and len(body["relationship_anchor_evidence"]) < 8:
+        _emit({"ok": False, "error": "relationship_anchor_evidence_required",
+               "hint": "给 --relationship-anchor-evidence(≥8字符)或用 --fresh-start"}, 2)
+    status, resp = _http_json("POST", f"{api_url}/v1/identity/init", auth, payload=body)
+    if status in (200, 201):
+        _emit({"ok": True, **(resp if isinstance(resp, dict) else {"result": resp})})
+    _emit({"ok": False, "http_status": status, "error": resp}, 1)
+
+
 def _memory_write_payload(*, summary, content, bucket, threads, importance, pulse, mem_type, source):
     """Build the /v1/memory/actions body for a single plaintext memory.add. Pure (testable).
 
@@ -674,6 +734,125 @@ def cmd_memory_patch(args):
     if status in (200, 201):
         _emit({"ok": True, **(body if isinstance(body, dict) else {"result": body})})
     _emit({"ok": False, "http_status": status, "error": body}, 1)
+def cmd_onboarding_validate(args):
+    """Server-computed onboarding acceptance snapshot. GET /v1/onboarding/validate.
+
+    Always 200 on the backend (an artifact-based readout, never a hard error), so
+    ``ok`` here just tracks the HTTP round-trip; the real signal is the body's
+    ``next_action`` (and whatever other fields the payload carries), surfaced
+    verbatim so the caller can decide what onboarding step is still pending."""
+    api_url, auth = _require_backend()
+    status, body = _http_json("GET", f"{api_url}/v1/onboarding/validate", auth)
+    _emit({"ok": status == 200, "http_status": status,
+           **(body if isinstance(body, dict) else {})}, 0 if status == 200 else 1)
+
+
+def cmd_chat_verify_loop(args):
+    """Liveness probe for the resident-consumer reply pipeline. POST /v1/chat/verify_loop.
+
+    The backend posts a hidden synthetic ping and blocks waiting for an
+    agent-role reply (client request timeout hardcoded to 40s below); the
+    response's ``passing`` bool is the real signal (``loop_alive`` mirrors it).
+    Both ping and any matching reply are scrubbed from the visible transcript
+    regardless of outcome, so this never pollutes IO Chat."""
+    api_url, auth = _require_backend()
+    status, body = _http_json("POST", f"{api_url}/v1/chat/verify_loop", auth,
+                               payload={}, timeout=40)
+    _emit({"ok": bool(isinstance(body, dict) and body.get("passing")), "http_status": status,
+           **(body if isinstance(body, dict) else {})}, 0 if status == 200 else 1)
+
+
+def _next_onboarding_step(status):
+    """Pure: derive the current onboarding step + the next io_cli command from a
+    ``/v1/bootstrap/status`` snapshot. identity -> live_loop -> greet -> complete.
+
+    The greet step's ``chat-greet`` io_cli verb does not exist (posting a chat
+    message needs client-side crypto, so it goes through the resident consumer,
+    not io_cli) — ``next_cmd`` for that step is a plain instruction, not a
+    runnable io_cli command.
+    """
+    s = status if isinstance(status, dict) else {}
+    if not s.get("identity_written"):
+        return {"step": "identity", "done": False,
+                "next_cmd": "io_cli identity-init --agent-name <name> --dimensions <json> --fresh-start"}
+    if not s.get("chat_loop_verified"):
+        return {"step": "live_loop", "done": False, "next_cmd": "io_cli chat-verify-loop"}
+    if int(s.get("agent_messages_count") or 0) < 1:
+        return {"step": "greet", "done": False,
+                "next_cmd": "send your greeting now (the resident consumer delivers it; no io_cli verb for this)"}
+    return {"step": "complete", "done": True, "next_cmd": ""}
+
+
+def cmd_onboard(args):
+    """Next-step onboarding guide. GET /v1/bootstrap/status -> _next_onboarding_step."""
+    api_url, auth = _require_backend()
+    status, body = _http_json("GET", f"{api_url}/v1/bootstrap/status", auth)
+    nxt = _next_onboarding_step(body if isinstance(body, dict) else {})
+    _emit({"ok": status == 200, "http_status": status, "status": body, **nxt},
+          0 if status == 200 else 1)
+
+
+def _onboard_start_payload():
+    """Pure: the /v1/track/event body for the onboard-start signal.
+
+    The backend reads ``event_type`` (falling back to ``type``), not ``event``
+    — using the wrong key silently records the event as type="unknown"."""
+    return {"event_type": "resident_onboarding_started"}
+
+
+def cmd_onboard_start(args):
+    """Signal onboarding began (idempotent-ish). POST /v1/track/event."""
+    api_url, auth = _require_backend()
+    status, body = _http_json("POST", f"{api_url}/v1/track/event", auth,
+                               payload=_onboard_start_payload())
+    _emit({"ok": status in (200, 201), "http_status": status}, 0 if status in (200, 201) else 1)
+
+
+def _doctor_summary(checks):
+    """Pure: fold a {check_name: bool} map into {ok, checks, failed[]}."""
+    failed = [k for k, v in (checks or {}).items() if not v]
+    return {"ok": not failed, "checks": checks, "failed": failed}
+
+
+def cmd_doctor(args):
+    """Five-probe environment health check, read-only. GET/POST against api/enclave.
+
+    Purpose: surface environment failures early (sandbox no-net, bad key, enclave
+    down) rather than let onboarding fail opaquely deep in a later step. Every
+    probe is a pure read (no chat message sent, no card written).
+
+    Fresh-account judgment (no identity/memory/chat yet): checked against the
+    actual handlers — GET /v1/identity/get (backend identity_core.get_identity,
+    and its enclave decrypt-and-serve proxy) both return 200 with
+    ``identity: None`` when nothing has been written yet, never 404; POST
+    /v1/memory/index returns 200 with an empty items list on a fresh account;
+    GET /v1/chat/history returns 200 with an empty list. So a plain 2xx check
+    already treats "reachable but nothing there yet" as a pass — no fresh-account
+    special-casing needed. A genuine connection failure / 401 / 5xx is what
+    fails a check.
+    """
+    auth = _auth_headers()
+    api_url = _env("FEEDLING_API_URL")
+    enclave_url = _env("FEEDLING_ENCLAVE_URL")
+
+    def _ok(method, url, insecure=False, payload=None):
+        try:
+            s, _ = _http_json(method, url, auth, payload=payload, insecure=insecure, timeout=10)
+            return 200 <= s < 300
+        except Exception:
+            return False
+
+    checks = {
+        "api": bool(api_url) and _ok("GET", f"{api_url.rstrip('/')}/v1/users/whoami"),
+        "enclave": bool(enclave_url) and _ok("GET", f"{enclave_url.rstrip('/')}/v1/identity/get", insecure=True),
+        "identity": bool(api_url) and _ok("GET", f"{api_url.rstrip('/')}/v1/identity/get"),
+        # /v1/memory/index is POST-only (a readside query, not a mutation) — a
+        # GET here would 405 every time, always failing the check.
+        "memory": bool(api_url) and _ok("POST", f"{api_url.rstrip('/')}/v1/memory/index", payload={"limit": 1}),
+        "chat": bool(api_url) and _ok("GET", f"{api_url.rstrip('/')}/v1/chat/history?limit=1"),
+    }
+    out = _doctor_summary(checks)
+    _emit(out, 0 if out["ok"] else 1)
 
 
 def cmd_phase2(args):
@@ -775,6 +954,15 @@ def main():
                     help="repeatable short string(s) for the signature")
     iw.set_defaults(func=cmd_identity_write)
 
+    ii = sub.add_parser("identity-init", help="Create the identity card (sanitizes + fresh-start).")
+    ii.add_argument("--agent-name", default="")
+    ii.add_argument("--self-introduction", default="")
+    ii.add_argument("--dimensions", default="", help="JSON list of {name,value,description}")
+    ii.add_argument("--days-with-user", type=int, default=None)
+    ii.add_argument("--relationship-anchor-evidence", default="")
+    ii.add_argument("--fresh-start", action="store_true", help="days=0 + standard anchor")
+    ii.set_defaults(func=cmd_identity_init)
+
     mw = sub.add_parser("memory-write",
                         help="Write ONE memory card you distilled locally (plaintext; server encrypts).")
     mw.add_argument("--summary", default=None, help="one-line summary (index)")
@@ -806,6 +994,25 @@ def main():
     mp.add_argument("--source", default="resident_patch")
     mp.add_argument("--reason", default=None, help="why (optional, audit trail)")
     mp.set_defaults(func=cmd_memory_patch)
+    ov = sub.add_parser("onboarding-validate",
+                        help="Server-computed onboarding acceptance snapshot (next_action etc.).")
+    ov.set_defaults(func=cmd_onboarding_validate)
+
+    cvl = sub.add_parser("chat-verify-loop",
+                         help="Liveness probe: ping the resident-consumer reply pipeline and wait for a reply.")
+    cvl.set_defaults(func=cmd_chat_verify_loop)
+
+    ob = sub.add_parser("onboard",
+                        help="Next-step onboarding guide (bootstrap status + what to run next).")
+    ob.set_defaults(func=cmd_onboard)
+
+    obs = sub.add_parser("onboard-start",
+                         help="Signal that onboarding has started (track event).")
+    obs.set_defaults(func=cmd_onboard_start)
+
+    dr = sub.add_parser("doctor",
+                        help="Five-probe environment health check (api/enclave/identity/memory/chat, read-only).")
+    dr.set_defaults(func=cmd_doctor)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")
