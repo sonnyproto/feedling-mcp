@@ -759,47 +759,6 @@ def cmd_chat_verify_loop(args):
            **(body if isinstance(body, dict) else {})}, 0 if status == 200 else 1)
 
 
-def _greet_payload(message):
-    """Build the /v1/chat/response body for an agent-authored greeting. Pure (testable).
-
-    Endpoint choice: POST /v1/chat/response, not /v1/chat/message — chat_core.py
-    is explicit that /v1/chat/message is the USER's send path (write_message,
-    ``role="user"``) while /v1/chat/response is the AGENT's reply path
-    (write_response, ``role="openclaw"`` by default) — see routes_asgi.py:120 vs
-    :144. A greeting is agent-authored, so it belongs on /v1/chat/response.
-
-    Payload field: ``content``, matching the plaintext-body naming already used
-    elsewhere in this codebase for the same concept (tools/chat_resident_
-    consumer.py's post_reply() plaintext-fallback branch to this same endpoint,
-    and hosted/chat_send_core.py's ``payload.get("message") or payload.get(
-    "content")``). NOTE: as of this writing chat_core.write_response has no
-    plaintext bypass for the reply body — unlike /v1/identity/actions and
-    /v1/memory/actions, it hard-requires a real client-built ``envelope``
-    (chat_core.py:419-421) with no equivalent server-side "plaintext in, server
-    encrypts" contract. So a real v1/encrypted backend will 400 with
-    ``{"error": "envelope required"}`` on this call today; io_cli deliberately
-    does not attempt to build a real ChaCha20Poly1305 envelope client-side (that
-    needs the non-stdlib ``cryptography`` package, this file's own client-key
-    material, and the enclave/user pubkeys — the full pipeline already lives in
-    chat_resident_consumer.py, not this thin CLI). This verb stays a thin,
-    honest pass-through: it sends the plaintext field and surfaces whatever the
-    backend actually returns, so a future server-side plaintext-accept path
-    (mirroring memory.add) starts working here for free."""
-    message = str(message or "").strip()
-    return {"content": message} if message else None
-
-
-def cmd_chat_greet(args):
-    """Post an agent-authored greeting. POST /v1/chat/response. See _greet_payload."""
-    api_url, auth = _require_backend()
-    payload = _greet_payload(args.message)
-    if payload is None:
-        _emit({"ok": False, "error": "empty_message: need --message"}, 2)
-    status, body = _http_json("POST", f"{api_url}/v1/chat/response", auth, payload=payload)
-    _emit({"ok": status in (200, 201), "http_status": status,
-           **(body if isinstance(body, dict) else {})}, 0 if status in (200, 201) else 1)
-
-
 def cmd_phase2(args):
     # send / sleep / schedule-wake / cancel-wake are NOT pull tools in the native
     # model — the agent emits them as output actions (JSON messages/actions) which
@@ -946,10 +905,6 @@ def main():
     cvl = sub.add_parser("chat-verify-loop",
                          help="Liveness probe: ping the resident-consumer reply pipeline and wait for a reply.")
     cvl.set_defaults(func=cmd_chat_verify_loop)
-
-    cg = sub.add_parser("chat-greet", help="Post an agent-authored greeting (POST /v1/chat/response).")
-    cg.add_argument("--message", default="", help="greeting text (required)")
-    cg.set_defaults(func=cmd_chat_greet)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")
