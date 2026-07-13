@@ -115,3 +115,10 @@ def test_sanitize_leaves_name_untouched():
     # 空名/runtime 名字 sanitize 不动(名字是强校验/引导层的事,不在这瞎编)
     assert card_policy.sanitize_identity_card({"agent_name": "", "dimensions": []})["agent_name"] == ""
     assert card_policy.sanitize_identity_card({"agent_name": "Claude", "dimensions": []})["agent_name"] == "Claude"
+
+
+def test_sanitize_normalizes_non_list_dimensions_to_empty_list():
+    # dimensions 不是 list(None/缺失/错类型)也必须归一成 [],让结果永远过结构校验
+    assert card_policy.sanitize_identity_card({"dimensions": None})["dimensions"] == []
+    assert card_policy.sanitize_identity_card({"dimensions": "nope"})["dimensions"] == []
+    assert card_policy.sanitize_identity_card({})["dimensions"] == []

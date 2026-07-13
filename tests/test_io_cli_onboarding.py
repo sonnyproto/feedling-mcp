@@ -38,3 +38,10 @@ def test_doctor_summary_all_pass():
                             "memory": True, "chat_write": True})
     assert out["ok"] is True
     assert out["failed"] == []
+
+
+def test_onboard_start_payload_uses_event_type():
+    # Backend reads payload.get("event_type") or payload.get("type") — a plain
+    # "event" key silently records type="unknown".
+    from io_cli import _onboard_start_payload
+    assert _onboard_start_payload() == {"event_type": "resident_onboarding_started"}

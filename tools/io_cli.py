@@ -599,6 +599,9 @@ def cmd_identity_init(args):
     if body["days_with_user"] is None:
         _emit({"ok": False, "error": "days_with_user_required",
                "hint": "给 --days-with-user + --relationship-anchor-evidence,或用 --fresh-start"}, 2)
+    if not args.fresh_start and len(body["relationship_anchor_evidence"]) < 8:
+        _emit({"ok": False, "error": "relationship_anchor_evidence_required",
+               "hint": "给 --relationship-anchor-evidence(≥8字符)或用 --fresh-start"}, 2)
     status, resp = _http_json("POST", f"{api_url}/v1/identity/init", auth, payload=body)
     if status in (200, 201):
         _emit({"ok": True, **(resp if isinstance(resp, dict) else {"result": resp})})
@@ -747,11 +750,11 @@ def cmd_onboarding_validate(args):
 def cmd_chat_verify_loop(args):
     """Liveness probe for the resident-consumer reply pipeline. POST /v1/chat/verify_loop.
 
-    The backend posts a hidden synthetic ping and blocks (up to --timeout, capped
-    at 60s server-side) waiting for an agent-role reply; the response's
-    ``passing`` bool is the real signal (``loop_alive`` mirrors it). Both ping and
-    any matching reply are scrubbed from the visible transcript regardless of
-    outcome, so this never pollutes IO Chat."""
+    The backend posts a hidden synthetic ping and blocks waiting for an
+    agent-role reply (client request timeout hardcoded to 40s below); the
+    response's ``passing`` bool is the real signal (``loop_alive`` mirrors it).
+    Both ping and any matching reply are scrubbed from the visible transcript
+    regardless of outcome, so this never pollutes IO Chat."""
     api_url, auth = _require_backend()
     status, body = _http_json("POST", f"{api_url}/v1/chat/verify_loop", auth,
                                payload={}, timeout=40)
@@ -789,11 +792,19 @@ def cmd_onboard(args):
           0 if status == 200 else 1)
 
 
+def _onboard_start_payload():
+    """Pure: the /v1/track/event body for the onboard-start signal.
+
+    The backend reads ``event_type`` (falling back to ``type``), not ``event``
+    — using the wrong key silently records the event as type="unknown"."""
+    return {"event_type": "resident_onboarding_started"}
+
+
 def cmd_onboard_start(args):
     """Signal onboarding began (idempotent-ish). POST /v1/track/event."""
     api_url, auth = _require_backend()
     status, body = _http_json("POST", f"{api_url}/v1/track/event", auth,
-                               payload={"event": "resident_onboarding_started"})
+                               payload=_onboard_start_payload())
     _emit({"ok": status in (200, 201), "http_status": status}, 0 if status in (200, 201) else 1)
 
 
@@ -838,7 +849,7 @@ def cmd_doctor(args):
         # /v1/memory/index is POST-only (a readside query, not a mutation) — a
         # GET here would 405 every time, always failing the check.
         "memory": bool(api_url) and _ok("POST", f"{api_url.rstrip('/')}/v1/memory/index", payload={"limit": 1}),
-        "chat_write": bool(api_url) and _ok("GET", f"{api_url.rstrip('/')}/v1/chat/history?limit=1"),
+        "chat": bool(api_url) and _ok("GET", f"{api_url.rstrip('/')}/v1/chat/history?limit=1"),
     }
     out = _doctor_summary(checks)
     _emit(out, 0 if out["ok"] else 1)

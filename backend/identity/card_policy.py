@@ -96,10 +96,12 @@ def validate_dimension_nudge(target_name: str, new_value) -> tuple[bool, str]:
 
 
 def sanitize_identity_card(card: dict) -> dict:
-    """Best-effort clean so the card PASSES structure validation WITHOUT losing
-    usable content (contract: capture more, don't reject fuzzy issues).
+    """Best-effort clean so the card ALWAYS PASSES structure validation WITHOUT
+    losing usable content (contract: capture more, don't reject fuzzy issues).
     Clamp values to [0,100]; drop non-dict / non-number-valued / unnamed dims;
     drop duplicate dimension names (keep first); truncate to MAX_DIMENSIONS.
+    A non-list ``dimensions`` (missing/None/wrong type) normalizes to ``[]``
+    rather than being left as-is, so the output is never structurally invalid.
     Does NOT touch agent_name — empty is allowed and a runtime-label name is a
     STRONG check the caller handles; we never invent a name here."""
     if not isinstance(card, dict):
@@ -126,4 +128,6 @@ def sanitize_identity_card(card: dict) -> dict:
             if len(cleaned) >= MAX_DIMENSIONS:
                 break
         out["dimensions"] = cleaned
+    else:
+        out["dimensions"] = []
     return out
