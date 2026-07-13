@@ -25,6 +25,8 @@ REAL_SUBCOMMANDS = {
     "photo-read",
     "photo-recent",
     "identity-write",
+    "memory-delete",
+    "memory-patch",
 }
 
 
@@ -57,3 +59,43 @@ def test_photo_read_reaches_handler_not_argparse_crash():
     assert "conflicting subparser" not in r.stderr
     payload = json.loads(r.stdout.strip().splitlines()[-1])
     assert payload.get("ok") is False
+
+
+def test_memory_delete_reaches_handler_not_argparse_crash():
+    r = _run("memory-delete", "--id", "abc")
+    assert "conflicting subparser" not in r.stderr
+    payload = json.loads(r.stdout.strip().splitlines()[-1])
+    assert payload.get("ok") is False
+
+
+def test_memory_patch_reaches_handler_not_argparse_crash():
+    r = _run("memory-patch", "--id", "abc", "--summary", "corrected")
+    assert "conflicting subparser" not in r.stderr
+    payload = json.loads(r.stdout.strip().splitlines()[-1])
+    assert payload.get("ok") is False
+
+
+def test_memory_patch_payload_builds_supersede_of_the_given_id():
+    payload = io_cli._memory_patch_payload(
+        memory_id="mem_1", summary="dog is actually a cat", content="",
+        bucket=None, threads=[], importance=None, pulse=None,
+        mem_type="fact", source="resident_patch", reason="user correction",
+    )
+    action = payload["actions"][0]
+    assert action["type"] == "memory.supersede"
+    assert action["supersedes"] == "mem_1"
+    assert action["memory"]["summary"] == "dog is actually a cat"
+    assert action["reason"] == "user correction"
+
+
+def test_memory_patch_payload_is_none_without_id_or_content():
+    # no id -> nothing to patch
+    assert io_cli._memory_patch_payload(
+        memory_id="", summary="x", content="", bucket=None, threads=[],
+        importance=None, pulse=None, mem_type="fact", source="s", reason="r",
+    ) is None
+    # id but no new content -> nothing to write
+    assert io_cli._memory_patch_payload(
+        memory_id="mem_1", summary="", content="", bucket=None, threads=[],
+        importance=None, pulse=None, mem_type="fact", source="s", reason="r",
+    ) is None

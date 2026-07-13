@@ -138,13 +138,23 @@ def test_context_formats_block_with_type_prefix():
     assert out.startswith("The user is referring to this memory from their Garden:")
     assert "[fact] 养了一只叫蛋子的狗" in out
     assert "柯基，两岁" in out
+    # id is surfaced so the agent can patch/delete the quoted card directly
+    assert "(id=mom_dog)" in out
+    assert "memory_patch" in out and "memory_delete" in out
 
 
 def test_context_untyped_card_has_no_prefix():
     msg = {"quoted_memories": [{"id": "m", "type": "", "title": "t", "text": "hello"}]}
     out = crc._quoted_memory_context(msg)
-    assert "- hello" in out
+    assert "- (id=m) hello" in out
     assert "[]" not in out
+
+
+def test_context_card_without_id_omits_id_tag():
+    msg = {"quoted_memories": [{"type": "fact", "text": "hello"}]}
+    out = crc._quoted_memory_context(msg)
+    assert "- [fact] hello" in out
+    assert "(id=" not in out
 
 
 def test_context_empty_returns_blank():

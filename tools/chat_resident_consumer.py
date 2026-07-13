@@ -5611,12 +5611,17 @@ def _native_reachout_tool_instructions() -> str:
     return "\n".join([
         "native_tool_access:",
         "- You have native Feedling tools for the user's real context — perception (now/location/weather/motion/"
-        "calendar/health/…), memory (index/fetch), screen (recent/read), photo (recent/read). Use them when more "
-        "facts genuinely help.",
+        "calendar/health/…), memory (index/fetch/write/patch/delete), screen (recent/read), photo (recent/read). Use "
+        "them when more facts genuinely help.",
+        "- Memory is yours to keep accurate: memory_write adds a new card, memory_patch corrects an existing card by "
+        "id (supersede), memory_delete removes one by id (hard delete). When the user asks you to change or delete a "
+        "memory — including one they quoted into the chat — DO it via these tools (get the id from memory_index or the "
+        "quoted card's id), don't just say you did.",
         "- You also have native tools to manage your own future wakes: schedule_wake (ask to be woken at a later time) "
         "and cancel_wake.",
         "- CLI runtimes call all of these via io_cli: perception, perception-trend, perception-history, memory-index, "
-        "memory-fetch, screen-recent, screen-read, photo-recent, photo-read, schedule-wake, cancel-wake.",
+        "memory-fetch, memory-write, memory-patch, memory-delete, screen-recent, screen-read, photo-recent, "
+        "photo-read, schedule-wake, cancel-wake.",
     ])
 
 
@@ -7226,10 +7231,17 @@ def _quoted_memory_context(msg: dict) -> str:
             continue
         mtype = str(card.get("type") or "").strip()
         prefix = f"[{mtype}] " if mtype else ""
-        lines.append(f"- {prefix}{text}")
+        mid = str(card.get("id") or "").strip()
+        id_tag = f"(id={mid}) " if mid else ""
+        lines.append(f"- {id_tag}{prefix}{text}")
     if not lines:
         return ""
-    return "The user is referring to this memory from their Garden:\n" + "\n".join(lines)
+    return (
+        "The user is referring to this memory from their Garden:\n"
+        + "\n".join(lines)
+        + "\nIf they ask you to correct or delete it, act on it directly with memory_patch / "
+        "memory_delete using the id shown above."
+    )
 
 
 def _process_messages(messages: list) -> float:

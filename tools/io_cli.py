@@ -601,6 +601,81 @@ def cmd_memory_write(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+def _memory_patch_payload(*, memory_id, summary, content, bucket, threads, importance, pulse, mem_type, source, reason):
+    """Build the /v1/memory/actions body for a single plaintext memory.supersede. Pure (testable).
+
+    「Patch」an existing card by superseding it with a NEW plaintext card — the SERVER
+    builds & encrypts the envelope (same path memory.add uses) and inherits bucket/threads/
+    importance/pulse from the old card when omitted here. Returns None when there's no new
+    content to write (nothing to patch)."""
+    memory_id = str(memory_id or "").strip()
+    if not memory_id:
+        return None
+    summary = str(summary or "").strip()
+    content = str(content or "").strip()
+    if not summary and not content:
+        return None
+    memory = {
+        "type": (mem_type or "fact").strip().lower(),
+        "summary": summary or content[:180],
+        "title": summary or content[:180],
+        "content": content or summary,
+        "description": content or summary,
+        "source": (source or "resident_patch").strip()[:80],
+    }
+    if bucket:
+        memory["bucket"] = str(bucket).strip()
+    if threads:
+        memory["threads"] = [str(t).strip() for t in threads if str(t or "").strip()]
+    if importance is not None:
+        memory["importance"] = float(importance)
+    if pulse is not None:
+        memory["pulse"] = float(pulse)
+    return {"actions": [{
+        "type": "memory.supersede",
+        "supersedes": memory_id,
+        "memory": memory,
+        "reason": (str(reason or "").strip() or "Memory corrected/updated from chat."),
+    }]}
+
+
+def cmd_memory_delete(args):
+    """Delete ONE memory card by id (hard delete — same as the user tapping delete in Garden).
+
+    POST /v1/memory/actions (memory.delete). The card is removed from the user's garden."""
+    api_url, auth = _require_backend()
+    memory_id = str(args.id or "").strip()
+    if not memory_id:
+        _emit({"ok": False, "error": "memory-delete needs --id <memory_id>"}, 2)
+    action = {"type": "memory.delete", "id": memory_id}
+    if args.reason:
+        action["reason"] = str(args.reason).strip()[:500]
+    status, body = _http_json("POST", f"{api_url}/v1/memory/actions", auth, payload={"actions": [action]})
+    if status in (200, 201):
+        _emit({"ok": True, **(body if isinstance(body, dict) else {"result": body})})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
+def cmd_memory_patch(args):
+    """Modify ONE existing memory card by superseding it with corrected content.
+
+    POST /v1/memory/actions (memory.supersede, plaintext — the server encrypts). The old card
+    is retired and a new card takes its place; bucket/threads/importance/pulse inherit from the
+    old card unless overridden here. This is the on-demand 'correct a card in chat' path."""
+    api_url, auth = _require_backend()
+    payload = _memory_patch_payload(
+        memory_id=args.id, summary=args.summary, content=args.content, bucket=args.bucket,
+        threads=args.threads, importance=args.importance, pulse=args.pulse,
+        mem_type=args.type, source=args.source, reason=args.reason,
+    )
+    if payload is None:
+        _emit({"ok": False, "error": "nothing_to_patch: need --id and at least one of --summary/--content"}, 2)
+    status, body = _http_json("POST", f"{api_url}/v1/memory/actions", auth, payload=payload)
+    if status in (200, 201):
+        _emit({"ok": True, **(body if isinstance(body, dict) else {"result": body})})
+    _emit({"ok": False, "http_status": status, "error": body}, 1)
+
+
 def cmd_phase2(args):
     # send / sleep / schedule-wake / cancel-wake are NOT pull tools in the native
     # model — the agent emits them as output actions (JSON messages/actions) which
@@ -711,6 +786,26 @@ def main():
     mw.add_argument("--type", default="fact", help="fact|event|quote|moment")
     mw.add_argument("--source", default="resident_absorb")
     mw.set_defaults(func=cmd_memory_write)
+
+    md = sub.add_parser("memory-delete",
+                        help="Delete ONE memory card by id (hard delete, like Garden's delete).")
+    md.add_argument("--id", required=True, help="memory_id (from memory-index)")
+    md.add_argument("--reason", default=None, help="why (optional, audit trail)")
+    md.set_defaults(func=cmd_memory_delete)
+
+    mp = sub.add_parser("memory-patch",
+                        help="Modify ONE card by id (supersede w/ corrected content; server encrypts).")
+    mp.add_argument("--id", required=True, help="memory_id to correct (from memory-index)")
+    mp.add_argument("--summary", default=None, help="new one-line summary (index)")
+    mp.add_argument("--content", default=None, help="new card body (记忆/上下文/使用提示)")
+    mp.add_argument("--bucket", default=None, help="override bucket (else inherits old card's)")
+    mp.add_argument("--threads", action="append", default=[], help="override thread(s) (else inherits)")
+    mp.add_argument("--importance", type=float, default=None, help="0-1 (else inherits)")
+    mp.add_argument("--pulse", type=float, default=None, help="0-1 (else inherits)")
+    mp.add_argument("--type", default="fact", help="fact|event|quote|moment")
+    mp.add_argument("--source", default="resident_patch")
+    mp.add_argument("--reason", default=None, help="why (optional, audit trail)")
+    mp.set_defaults(func=cmd_memory_patch)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")
