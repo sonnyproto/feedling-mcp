@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
-from datetime import datetime
 import json
 import logging
 import os
@@ -59,11 +58,39 @@ import db
 from core import runtime_token
 from core import wake_bus
 from core.store import get_store
-from agent_runtime import leases, litellm_gateway, spawners
+from agent_runtime import leases, spawners
+# One-shot introduction machinery is shared with chat.chat_core so BOTH the
+# supervisor recovery path AND the resident chat_loop_verified fast-path enqueue
+# through ONE atomic entry (no parallel field / second state machine).
+from agent_runtime.introduction import (
+    _has_active_introduction_job,
+    enqueue_introduction_once,
+)
 from notices import core as notices
 from notices import catalog
 
 log = logging.getLogger("feedling.agent_runtime.supervisor")
+
+# Pooled HTTP clients. httpx's module-level verb helpers (httpx.get/httpx.post)
+# build a throwaway Client per call, so every tick paid a fresh TCP+TLS handshake
+# — pure waste for a long-lived supervisor that hits the same two hosts forever.
+#
+# Two clients because ``verify`` is a client-level setting, not a per-request one:
+# the enclave serves a self-signed cert (verification off), the backend gets normal
+# verification. ``keepalive_expiry`` stays BELOW the backend's keepalive
+# (backend/gunicorn_conf.py = 75s) so WE retire an idle socket first — reusing one
+# the server has already closed is the stale-connection race that fix was about.
+#
+# Constructing a Client opens no socket, so the pool is empty at import; a gunicorn
+# worker forked after this module loads still builds its own connections.
+# max_connections is httpx's own default (100) spelled out: passing a bare Limits()
+# would silently drop it to None (unbounded). The roster fan-out is 8 wide
+# (AGENT_RESOLVE_CONCURRENCY), so the cap is a guardrail, never a queue.
+_POOL_LIMITS = httpx.Limits(
+    max_connections=100, max_keepalive_connections=20, keepalive_expiry=60.0
+)
+_HTTP = httpx.Client(timeout=20, limits=_POOL_LIMITS)
+_ENCLAVE_HTTP = httpx.Client(timeout=20, limits=_POOL_LIMITS, verify=False)
 
 # runner error_class -> its notice dedupe-key suffix (module-level so
 # _emit_runner_notice and _resolve_runner_notice share one mapping — DRY).
@@ -71,10 +98,13 @@ _RUNNER_NOTICE_SUFFIX = {"runner_spawn_failed": "spawn_failed",
                          "runner_key_decrypt_failed": "key_decrypt_failed",
                          "runner_degraded": "degraded"}
 
-INTRODUCTION_JOB_KIND = "introduction"
-INTRODUCTION_TRIGGER = "post_spawn_genesis"
-INTRODUCTION_INTENT_LABEL = "post_respawn_introduction"
-_INTRODUCTION_ACTIVE_STATUSES = {"pending", "claimed", "realizing"}
+# `_fetch_identity_plain_for_intro` returns identity=None for several reasons.
+# Only these two mean the card GENUINELY does not exist yet (a fresh / no-card
+# user) -> safe to introduce without a card. The rest (enclave_url_missing,
+# auth_missing, identity_fetch_failed:*) are transient/config failures: defer,
+# do NOT mark introduced, and retry on a later spawn so an existing profile can
+# still be read and correctly skipped/introduced. (identity-card-never-gates)
+_NO_CARD_INTRO_REASONS = frozenset({"identity_not_found", "identity_not_initialized"})
 
 
 def parse_roster(raw) -> list[dict]:
@@ -233,9 +263,9 @@ class Supervisor:
 
         ``pre_spawn(new_user_ids)`` (optional) is invoked ONCE after all of this
         tick's new leases are acquired but BEFORE any new consumer is spawned, so a
-        side-channel a consumer needs at startup (e.g. its LiteLLM ``gw-<uid>``
-        gateway route) can be configured first. It is best-effort — a failure logs
-        and the spawns still proceed."""
+        side-channel a consumer needs at startup (the in-CVM LiteLLM gateway route
+        this used to configure is retired) can be configured first. It is
+        best-effort — a failure logs and the spawns still proceed."""
         # Reap children whose user is no longer in the (re-derived) roster — e.g.
         # a user who disabled hosting. Kill + release so disable takes effect this
         # tick rather than lingering until lease expiry.
@@ -363,16 +393,16 @@ class Supervisor:
                                   runtime_home=home, lease_owner=self.owner,
                                   ttl=self.lease_ttl, now=self._now()):
                 continue  # another supervisor holds a live lease
-            # Acquired — defer the spawn so the gateway route can be configured for
-            # the whole batch first (route-before-spawn; avoids a queued first turn
-            # hitting a missing gw-<uid> route).
+            # Acquired — defer the spawn so any pre-spawn side-channel can be
+            # configured for the whole batch first (the in-CVM LiteLLM gateway
+            # route this used to serve is retired).
             spawned_this_tick += 1
             newly_acquired.append((user_id, entry, home))
 
-        # Configure any side-channel the new consumers need at startup (gateway
-        # routes) for the now-owned batch BEFORE starting them. Lease-scoped: only
-        # users we just acquired this tick. Best-effort — a blip must not strand
-        # the spawn; the post-tick reconcile still converges.
+        # Configure any side-channel the new consumers need at startup for the
+        # now-owned batch BEFORE starting them. Lease-scoped: only users we just
+        # acquired this tick. Best-effort — a blip must not strand the spawn; the
+        # post-tick reconcile still converges.
         if newly_acquired and pre_spawn is not None:
             try:
                 pre_spawn([uid for uid, _, _ in newly_acquired])
@@ -475,7 +505,7 @@ def _load_roster() -> list[dict]:
 def _whoami(api_url: str, api_key: str) -> str:
     """Resolve a roster entry's user_id (lease key) via /v1/users/whoami."""
     try:
-        resp = httpx.get(f"{api_url.rstrip('/')}/v1/users/whoami",
+        resp = _HTTP.get(f"{api_url.rstrip('/')}/v1/users/whoami",
                          headers={"X-API-Key": api_key}, timeout=10)
         resp.raise_for_status()
         return str(resp.json().get("user_id") or "")
@@ -500,10 +530,10 @@ def _decrypt_provider_key(enclave_url: str, api_key: str = "", envelope: dict | 
     model_api config scheme). Plaintext is handed to the child via env. Auth is
     the api_key, or a runtime token (Stage D zero-roster) when provided."""
     try:
-        resp = httpx.post(f"{enclave_url.rstrip('/')}/v1/envelope/decrypt",
-                          headers=_auth_headers(api_key=api_key, runtime_token=runtime_token),
-                          json={"envelope": envelope, "purpose": "model_api_provider_key"},
-                          timeout=20, verify=False)
+        resp = _ENCLAVE_HTTP.post(f"{enclave_url.rstrip('/')}/v1/envelope/decrypt",
+                                  headers=_auth_headers(api_key=api_key, runtime_token=runtime_token),
+                                  json={"envelope": envelope, "purpose": "model_api_provider_key"},
+                                  timeout=20)
         resp.raise_for_status()
         return base64.b64decode(resp.json()["plaintext_b64"]).decode("utf-8")
     except Exception as e:  # noqa: BLE001
@@ -539,11 +569,10 @@ def _fetch_identity_plain_for_intro(entry: dict, *, api_url: str, enclave_url: s
     if not headers:
         return None, "auth_missing"
     try:
-        resp = httpx.get(
+        resp = _ENCLAVE_HTTP.get(
             f"{enclave_url.rstrip('/')}/v1/identity/get",
             headers=headers,
             timeout=10,
-            verify=False,
         )
         if resp.status_code == 404:
             return None, "identity_not_found"
@@ -557,53 +586,6 @@ def _fetch_identity_plain_for_intro(entry: dict, *, api_url: str, enclave_url: s
     return identity, ""
 
 
-def _has_active_introduction_job(store) -> bool:
-    try:
-        jobs = store.list_proactive_jobs(since_epoch=0, limit=0)
-    except Exception as e:  # noqa: BLE001
-        log.warning("introduction active-job scan failed for %s: %s", getattr(store, "user_id", ""), e)
-        return True
-    for job in jobs or []:
-        if str((job or {}).get("job_kind") or "").strip() != INTRODUCTION_JOB_KIND:
-            continue
-        status = str((job or {}).get("status") or "pending").strip()
-        if status in _INTRODUCTION_ACTIVE_STATUSES:
-            return True
-    return False
-
-
-def _build_introduction_job(*, now: float) -> dict:
-    from core import util
-    job_id = util._new_public_id("pj")
-    return {
-        "job_id": job_id,
-        "schema_version": 2,
-        "ts": float(now),
-        "created_at": datetime.fromtimestamp(float(now)).isoformat(),
-        "wake_id": job_id,
-        "source": "agent_initiated_proactive",
-        "status": "pending",
-        "intent_label": INTRODUCTION_INTENT_LABEL,
-        "context_hint": "",
-        "connections": [],
-        "connection": {},
-        "frame_ids": [],
-        "device_event_ids": [],
-        "current_app": "",
-        "trigger": INTRODUCTION_TRIGGER,
-        "job_kind": INTRODUCTION_JOB_KIND,
-        "manual": False,
-        "forced": False,
-        "user_state": "",
-        "ai_state": "",
-        "broadcast_state": "",
-        "wake_kind": "introduction",
-        "screen_context_available": False,
-        "agent_action": "",
-        "agent_action_status": "",
-    }
-
-
 def _enqueue_introduction_job_if_needed(
     user_id: str,
     entry: dict,
@@ -613,21 +595,59 @@ def _enqueue_introduction_job_if_needed(
     now=time.time,
     get_store_fn=None,
 ) -> dict | None:
-    identity, reason = _fetch_identity_plain_for_intro(entry, api_url=api_url, enclave_url=enclave_url)
-    if not _needs_introduction_identity(identity):
-        if reason:
-            log.debug("introduction skipped for %s: %s", user_id, reason)
-        return None
+    """Enqueue the agent's one-shot post-spawn self-introduction.
+
+    identity-card-never-gates (2026-07): the introduction is gated ONLY on the
+    unified activation signal (``proactive_activation_ready`` == the user reached
+    the app / first chat ok). The identity card's existence or content is NOT a
+    precondition — a no-card / empty-card / fresh-start user still gets one
+    introduction. Dedup is durable via ``store.introduction_done()`` (card-
+    independent) plus the in-flight ``_has_active_introduction_job`` guard.
+    """
     if get_store_fn is None:
         from core.store import get_store
         get_store_fn = get_store
     store = get_store_fn(user_id)
+    # Unified signal — the ONLY precondition. No identity dependency.
     if not store.proactive_activation_ready():
+        return None
+    # Already introduced (durable marker) or one already in flight.
+    if store.introduction_done():
         return None
     if _has_active_introduction_job(store):
         return None
+    # Back-compat: a legacy card may already carry a ``self_introduction`` written
+    # before this marker existed. Only when the card is READABLE and already
+    # introduced do we record the marker and skip — a transient decrypt failure
+    # must not be mistaken for "already introduced" (it would suppress a real
+    # intro forever).
+    identity, reason = _fetch_identity_plain_for_intro(entry, api_url=api_url, enclave_url=enclave_url)
+    if isinstance(identity, dict):
+        status = str(identity.get("decrypt_status") or "").strip()
+        decrypt_ok = (not status) or status == "ok"
+        if not decrypt_ok:
+            # transient decrypt failure -> retry on a later spawn, don't mark
+            log.debug("introduction deferred for %s: identity decrypt %s", user_id, status)
+            return None
+        if not _needs_introduction_identity(identity):
+            # card present and already self-introduced -> record + skip fast next time
+            store.mark_introduced()
+            return None
+        # readable card, not yet introduced -> fall through to enqueue
+    elif reason not in _NO_CARD_INTRO_REASONS:
+        # identity is None for a TRANSIENT/config reason (enclave_url_missing,
+        # auth_missing, identity_fetch_failed:*) — NOT a genuine no-card user.
+        # Defer without marking so we can read a real profile next spawn; treating
+        # a one-off enclave/HTTP hiccup as "no card" would permanently mis-intro.
+        log.debug("introduction deferred for %s: identity fetch %s", user_id, reason)
+        return None
+    # Reachable when: (a) readable card that still needs an intro, or (b) identity
+    # is None for a genuine no-card reason. Both enqueue exactly one introduction.
     clock = now() if callable(now) else float(now)
-    return store.append_proactive_job(_build_introduction_job(now=clock))
+    # Enqueue through the SHARED atomic entry (claim-first + rollback-on-failure)
+    # so this recovery path and the resident chat_loop_verified fast-path in
+    # chat.chat_core can never double-send the one-shot introduction.
+    return enqueue_introduction_once(store, now=clock)
 
 
 def _fetch_key_envelope(api_url: str, api_key: str = "", *, runtime_token: str = "") -> dict | None:
@@ -636,7 +656,7 @@ def _fetch_key_envelope(api_url: str, api_key: str = "", *, runtime_token: str =
     api_keys (or, Stage D, nothing — a runtime token authenticates instead).
     Returns the envelope dict, or None if unconfigured/unreachable."""
     try:
-        resp = httpx.get(f"{api_url.rstrip('/')}/v1/model_api/key_envelope",
+        resp = _HTTP.get(f"{api_url.rstrip('/')}/v1/model_api/key_envelope",
                          headers=_auth_headers(api_key=api_key, runtime_token=runtime_token), timeout=10)
         if resp.status_code == 404:
             return None
@@ -686,18 +706,18 @@ def _resolve_roster(roster: list[dict],
     return resolved
 
 
-def _discover_enabled(include_gateway: bool = False) -> dict[str, dict]:
+def _discover_enabled() -> dict[str, dict]:
     """Map ``user_id -> {"driver", "provider", "model", "base_url"}`` for users
     whose ``model_api`` config is test_ok and uses a fit provider (Stage C+).
     No per-user flag required — aligned with hosted/agent_runtime_cutover.resolve_driver.
-    ``include_gateway`` mirrors whether the LiteLLM gateway is running — when off,
-    gateway-only providers are excluded so they aren't spawned against a proxy that
-    isn't there."""
+    Unconditional: the LiteLLM gateway is retired, so every fit provider (including
+    gemini/openrouter/openai_compatible, discovered as the pi driver) is discovered
+    every time — no include_gateway/include_pi flags."""
     return {u["user_id"]: {"driver": u["driver"], "provider": u.get("provider", ""),
                            "model": u.get("model", ""), "base_url": u.get("base_url", ""),
                            "supports_responses": bool(u.get("supports_responses", False)),
                            "reasoning_effort": u.get("reasoning_effort", "")}
-            for u in db.list_agent_runtime_enabled_users(include_gateway=include_gateway)}
+            for u in db.list_agent_runtime_enabled_users()}
 
 
 def _apply_discovery(roster: list[dict], enabled: dict[str, dict]) -> list[dict]:
@@ -857,7 +877,7 @@ def _post_verify_loop(api_url: str, headers: dict) -> bool:
     flips the user's ``chat_loop_verified`` and opens the bootstrap gate. Returns
     whether the verify passed (an agent reply landed)."""
     try:
-        resp = httpx.post(f"{api_url.rstrip('/')}/v1/chat/verify_loop",
+        resp = _HTTP.post(f"{api_url.rstrip('/')}/v1/chat/verify_loop",
                           headers=headers, json={"timeout_sec": 30}, timeout=40)
         resp.raise_for_status()
         return bool(resp.json().get("passing"))
@@ -867,10 +887,10 @@ def _post_verify_loop(api_url: str, headers: dict) -> bool:
 
 
 # Backoff (seconds) between verify_loop attempts, indexed by consecutive failure
-# count (capped at the last entry). A user that cannot pass yet — e.g. still at
-# `needs_identity`, where the verify reply is gate-rejected — must NOT be re-probed
-# every tick; this spaces retries out so a genuinely-advancing user still gets
-# verified soon while a stuck one generates little traffic.
+# count (capped at the last entry). A user that cannot pass yet — e.g. a resident
+# whose consumer isn't live so the verify reply hits the `needs_live_connection`
+# gate — must NOT be re-probed every tick; this spaces retries out so a genuinely-
+# advancing user still gets verified soon while a stuck one generates little traffic.
 _AUTOVERIFY_BACKOFF = [0.0, 30.0, 120.0, 600.0, 1800.0]
 
 
@@ -996,7 +1016,7 @@ def _run_lazy_persona_backfill(roster: list[dict], *, secret_raw: str, owner: st
             # Short timeout so a stuck backend can't wedge the tick (worst case =
             # cap × timeout); the endpoint is normally fast. Backgrounding is a later
             # hardening if this proves too tight under load.
-            resp = httpx.post(f"{api_url.rstrip('/')}/v1/genesis/persona_backfill",
+            resp = _HTTP.post(f"{api_url.rstrip('/')}/v1/genesis/persona_backfill",
                               headers={"X-Feedling-Runtime-Token": token}, timeout=5)
             log.info("persona backfill %s → http=%s %s", uid, resp.status_code, resp.text[:120])
         except Exception as e:  # noqa: BLE001
@@ -1007,13 +1027,14 @@ def _run_lazy_persona_backfill(roster: list[dict], *, secret_raw: str, owner: st
 def _spawn_identity(entry: dict) -> tuple:
     """The spawn-determining fields of a roster entry — when any changes, the
     running consumer's env/home is stale and it must be respawned. Mirrors what
-    ``spawners.consumer_env`` / ``agent_home_files`` consume. The upstream
-    ``provider_key`` is EXCLUDED for gateway users (it goes to LiteLLM, not the
-    consumer env), so rotating it doesn't bounce the consumer. ``persona_version``
+    ``spawners.consumer_env`` / ``agent_home_files`` consume. ``persona_version``
     (genesis_persona digest) IS included so a voice backfill/Dream re-seeds the
-    persona prompt via a natural respawn (gate 4 C)."""
+    persona prompt via a natural respawn (gate 4 C). ``base_url`` and
+    ``reasoning_effort`` ARE included: both reach the consumer ONLY via a
+    spawn-time home file (pi ``models.json``, or claude's ANTHROPIC_BASE_URL), so
+    changing either with everything else unchanged must respawn — else the
+    consumer keeps hitting the old endpoint / stale reasoning setting."""
     driver = (entry.get("driver") or "claude").strip().lower()
-    gateway = spawners._codex_transport(entry) == "gateway"
     return (
         entry.get("api_key") or "",
         driver,
@@ -1021,96 +1042,25 @@ def _spawn_identity(entry: dict) -> tuple:
         entry.get("provider") or "",
         entry.get("model") or "",
         entry.get("base_url") or "",
-        # gateway 用户 ``model`` 是稳定的 gw-<uid> 别名；真实上游模型放在 identity_model，
-        # 纳入签名使切换上游模型时 respawn 并重新落盘身份块。
+        entry.get("reasoning_effort") or "",
+        # LiteLLM gateway 已退役：``model`` 现在原生透传，不再有 gw-<uid> 别名/网关
+        # 间接层。``identity_model`` 目前恒为空，但保留字段/签名位以防未来复用。
         entry.get("identity_model") or "",
-        "" if gateway else (entry.get("provider_key") or ""),
+        entry.get("provider_key") or "",
         entry.get("persona_version") or "",
     )
 
 
-def _gateway_entries(roster: list[dict]) -> list[dict]:
-    """Codex users that must be bridged through the in-CVM LiteLLM gateway
-    (gemini/openrouter/openai_compatible). Each carries the REAL upstream
-    provider/model/key for building the per-user LiteLLM routing."""
-    out = []
-    for e in roster:
-        if spawners._codex_transport(e) == "gateway":
-            out.append({
-                "user_id": e["user_id"],
-                "provider": e.get("provider", ""),
-                "model": e.get("model") or "",
-                "base_url": e.get("base_url") or "",
-                "supports_responses": bool(e.get("supports_responses", False)),
-                "reasoning_effort": e.get("reasoning_effort") or "",
-                "provider_key": e.get("provider_key") or "",
-            })
-    return out
-
-
-def _owned_gateway_entries(gateway_entries: list[dict], owned) -> list[dict]:
-    """Scope the gateway routing entries to ONLY users this runner currently holds
-    a lease/child for, so a user owned by another runner never enters this runner's
-    LiteLLM config (multi-node: provider keys don't fan out to every runner).
-
-    ``owned`` is the set of owned user_ids (or the children mapping, whose keys are
-    those ids). Callers should pass a SNAPSHOT taken under ``Supervisor._lock`` —
-    the renew thread mutates the live children dict concurrently.
-
-    Each entry's key is taken AS-IS from ``gateway_entries`` (built from the freshly
-    resolved roster this tick), NOT from the stored child entry — so an upstream
-    key rotation reaches LiteLLM on the next tick even though it deliberately does
-    not respawn the consumer (``_spawn_identity`` excludes the gateway key)."""
-    owned_ids = set(owned)
-    return [g for g in gateway_entries if g.get("user_id") in owned_ids]
-
-
-def _drop_gateway_users(roster: list[dict]) -> list[dict]:
-    """Remove codex users that would need the LiteLLM gateway — used when the
-    gateway is DISABLED. Without a running proxy, spawning them as gateway codex
-    yields a config pointing at nothing (and usually no gateway key), so they must
-    be dropped rather than half-spawned. Native (openai) + claude users stay."""
-    kept = [e for e in roster if spawners._codex_transport(e) != "gateway"]
-    dropped = [e.get("user_id") for e in roster if spawners._codex_transport(e) == "gateway"]
-    if dropped:
-        log.warning("litellm gateway disabled — dropping %d gateway codex user(s): %s",
-                    len(dropped), dropped)
-    return kept
-
-
-def _wire_gateway_models(roster: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Return (roster, gateway_entries). Gateway codex entries are rewritten so
-    codex REQUESTS the ``gw-<uid>`` model (which LiteLLM maps to the real upstream
-    model+key); the returned gateway_entries retain the real model for building
-    the LiteLLM config. Non-gateway entries pass through unchanged."""
-    gateways = _gateway_entries(roster)
-    if not gateways:
-        return roster, []
-    gateway_uids = {g["user_id"] for g in gateways}
-    # ``model`` becomes the internal ``gw-<uid>`` alias codex requests; ``identity_model``
-    # keeps the REAL upstream model so the identity-honesty prompt names it, not the alias.
-    wired = [
-        {**e, "model": litellm_gateway.gateway_model_id(e["user_id"]),
-         "identity_model": e.get("model") or ""}
-        if e.get("user_id") in gateway_uids and spawners._codex_transport(e) == "gateway"
-        else e
-        for e in roster
-    ]
-    return wired, gateways
-
-
 def _effective_roster(base_roster: list[dict], *, autodiscover: bool,
-                      gateway_enabled: bool,
-                      host_all_discovered: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
-    """Compute the roster to actually run this tick + the gateway routing entries.
+                      host_all_discovered: list[dict] | None = None) -> list[dict]:
+    """Compute the roster to actually run this tick.
 
-    ``base_roster`` carries credentials (resolved once at boot). Each tick we:
+    ``base_roster`` carries credentials (resolved once at boot). Each tick we
     optionally intersect it with the backend-enabled set (autodiscover — the
-    gradual-migration control plane); drop gateway-only codex users when the
-    gateway is off (no proxy to reach); and when the gateway is on, rewrite those
-    users' requested model to ``gw-<uid>`` (returning the real models as gateway
-    entries for the LiteLLM config). An empty result is fine — the supervisor
-    idles rather than exiting.
+    gradual-migration control plane). The LiteLLM gateway is retired, so there is
+    no gateway filtering or requested-model rewrite — every entry keeps its real
+    provider/model as-is. An empty result is fine — the supervisor idles rather
+    than exiting.
 
     ``host_all_discovered`` (Stage D host-all) supplies pre-credentialed entries
     resolved from the DB via runtime token — they BECOME the roster (no api_key
@@ -1121,15 +1071,11 @@ def _effective_roster(base_roster: list[dict], *, autodiscover: bool,
         for e in base_roster:
             if e.get("user_id"):
                 by_uid[e["user_id"]] = e        # dev override wins
-        roster = list(by_uid.values())
-    elif autodiscover:
-        enabled = _discover_enabled(include_gateway=gateway_enabled)
-        roster = _apply_discovery(base_roster, enabled)
-    else:
-        roster = base_roster
-    if not gateway_enabled:
-        return _drop_gateway_users(roster), []
-    return _wire_gateway_models(roster)
+        return list(by_uid.values())
+    if autodiscover:
+        enabled = _discover_enabled()
+        return _apply_discovery(base_roster, enabled)
+    return base_roster
 
 
 _GENESIS_TICK_DEFAULT_SEC = 30
@@ -1167,30 +1113,34 @@ def _genesis_worker_loop(*, api_url, enclave_url, mint_genesis, interval, stop_e
         stop_event.wait(interval)
 
 
-def _supervisor_heartbeat_payload(owner: str, *, host_all: bool, gateway: bool, ts: float) -> dict:
-    """Global heartbeat the backend's wedge guard reads. ``host_all``/``gateway``
-    let the backend detect the cross-service config divergence (supervisor up but
-    not actually hosting / gateway off) that its own startup check can't see."""
+def _supervisor_heartbeat_payload(owner: str, *, host_all: bool,
+                                  pi: bool, ts: float) -> dict:
+    """Global heartbeat the backend's wedge guard reads. ``host_all``/``pi`` let
+    the backend detect the cross-service config divergence (supervisor up but
+    not actually hosting / pi driver off) that its own startup check can't see —
+    the backend requires ``pi`` before routing a pi-driven send, else a
+    runner-pi-off config would park those sends in ``processing`` forever. The
+    in-CVM LiteLLM gateway is retired — no ``gateway`` key anymore."""
     return {"ts": float(ts), "owner": str(owner),
-            "host_all": bool(host_all), "gateway": bool(gateway)}
+            "host_all": bool(host_all), "pi": bool(pi)}
 
 
 def _supervisor_instance_payload(owner: str, *, host: str | None, host_all: bool,
-                                 gateway: bool, active_children: int, max_children: int,
+                                 pi: bool, active_children: int, max_children: int,
                                  shard_index: int, shard_count: int, version: str | None,
                                  ts: float) -> dict:
     """Rich per-owner heartbeat row (migration 0009). Beyond the legacy payload's
-    host_all/gateway, it carries this runner's live capacity (active vs max
-    children) and shard config, so multiple runners report independently and the
-    backend can aggregate without one clobbering another."""
+    host_all/pi, it carries this runner's live capacity (active vs max children)
+    and shard config, so multiple runners report independently and the backend
+    can aggregate without one clobbering another."""
     return {"ts": float(ts), "owner": str(owner), "host": host,
-            "host_all": bool(host_all), "gateway": bool(gateway),
+            "host_all": bool(host_all), "pi": bool(pi),
             "active_children": int(active_children), "max_children": int(max_children),
             "shard_index": int(shard_index), "shard_count": int(shard_count),
             "version": version}
 
 
-def _heartbeat_loop(*, owner: str, host_all: bool, gateway: bool,
+def _heartbeat_loop(*, owner: str, host_all: bool, pi: bool,
                     interval: float, stop_event, instance_payload_fn=None,
                     prune_max_age_sec: float | None = None) -> None:
     """Write the supervisor heartbeat on a fixed cadence from a dedicated thread,
@@ -1222,7 +1172,7 @@ def _heartbeat_loop(*, owner: str, host_all: bool, gateway: bool,
                     log.warning("supervisor instance heartbeat prune failed: %s", e)
         try:
             db.set_supervisor_heartbeat(_supervisor_heartbeat_payload(
-                owner, host_all=host_all, gateway=gateway, ts=ts))
+                owner, host_all=host_all, pi=pi, ts=ts))
         except Exception as e:  # noqa: BLE001
             log.warning("supervisor heartbeat write failed: %s", e)
         stop_event.wait(interval)
@@ -1270,7 +1220,14 @@ def main() -> int:
     data_root = os.environ.get("AGENT_DATA_ROOT", "/agent-data")
     isolation = os.environ.get("AGENT_RUNTIME_ISOLATION", "process").strip().lower()
 
-    gateway_enabled = os.environ.get("FEEDLING_LITELLM_ENABLE", "").strip().lower() in ("1", "true", "yes")
+    # The pi driver (gemini/openrouter/openai_compatible, direct relay, no
+    # gateway) is unconditional now — FEEDLING_PI_DRIVER_ENABLE no longer gates
+    # discovery/roster (hosted.agent_runtime_cutover.driver_for_provider derives
+    # pi unconditionally; db.list_agent_runtime_enabled_users takes no flag).
+    # This constant still feeds the heartbeat's ``pi`` capability bit for
+    # require_pi cross-service drift checks (chat_send_core / evaluate_
+    # supervisor_heartbeat).
+    pi_enabled = True
     autodiscover = os.environ.get("AGENT_RUNTIME_AUTODISCOVER", "").strip().lower() in ("1", "true", "yes")
     # Stage D host-all: every configured user is hosted with NO api_key roster —
     # the supervisor mints a runtime token per DB-discovered user and resolves the
@@ -1281,8 +1238,8 @@ def main() -> int:
     enclave_url = os.environ.get("FEEDLING_ENCLAVE_URL", "")
 
     # Credentials resolved once (whoami + envelope decrypt are network calls). The
-    # backend-enabled intersection + gateway wiring re-run each tick off this base,
-    # so enabling/disabling a user (or the gateway) takes effect without a redeploy.
+    # backend-enabled intersection re-runs each tick off this base, so
+    # enabling/disabling a user takes effect without a redeploy.
     # This runs before ``sup`` exists, so decrypt failures are collected here and
     # emitted as runner_key_decrypt_failed notices once the Supervisor is built below.
     base_roster_key_decrypt_failures: list[tuple[str, str]] = []
@@ -1315,18 +1272,6 @@ def main() -> int:
 
         token_writer = _mint_and_write
 
-    # in-CVM LiteLLM gateway (codex non-openai providers). Off by default: only
-    # when FEEDLING_LITELLM_ENABLE is set do we run a LiteLLM proxy that holds the
-    # gateway users' upstream keys (in the proxy's env, never on disk) and rewrite
-    # those users to the gw-<uid> model. Codex reaches it at 127.0.0.1:<port>.
-    gateway_mgr = None
-    if gateway_enabled:
-        port = int(os.environ.get("FEEDLING_LITELLM_PORT", "4000"))
-        cfg_path = os.environ.get("FEEDLING_LITELLM_CONFIG", f"{data_root}/litellm.yaml")
-        os.environ.setdefault("FEEDLING_LITELLM_BASE_URL", f"http://127.0.0.1:{port}/v1")
-        gateway_mgr = litellm_gateway.GatewayManager(config_path=cfg_path, port=port)
-        log.info("litellm gateway enabled — config=%s port=%d", cfg_path, port)
-
     if host_all and mint_token is None:
         log.warning("FEEDLING_HOST_ALL set but FEEDLING_RUNTIME_TOKEN_SECRET is not — "
                     "host-all is inert (no token to authenticate zero-roster users)")
@@ -1341,8 +1286,8 @@ def main() -> int:
         token_writer=token_writer, max_spawns_per_tick=max_spawns_per_tick,
         max_children=max_children,
     )
-    log.info("supervisor up — owner=%s base_users=%d autodiscover=%s host_all=%s gateway=%s ttl=%.0fs max_children=%d",
-             owner, len(base_roster), autodiscover, host_all_active, gateway_enabled, lease_ttl, max_children)
+    log.info("supervisor up — owner=%s base_users=%d autodiscover=%s host_all=%s ttl=%.0fs max_children=%d",
+             owner, len(base_roster), autodiscover, host_all_active, lease_ttl, max_children)
     for _uid, _detail in base_roster_key_decrypt_failures:
         sup._emit_runner_notice(_uid, "runner_key_decrypt_failed", _detail)
 
@@ -1387,14 +1332,15 @@ def main() -> int:
             active = len(sup.children)
         return _supervisor_instance_payload(
             owner, host=socket.gethostname(), host_all=host_all_active,
-            gateway=gateway_enabled, active_children=active,
+            pi=pi_enabled, active_children=active,
             max_children=sup.max_children, shard_index=0, shard_count=1,
             version=None, ts=ts)
 
     threading.Thread(
         target=_heartbeat_loop, daemon=True,
         kwargs={"owner": owner, "host_all": host_all_active,
-                "gateway": gateway_enabled, "interval": min(interval, 15.0),
+                "pi": pi_enabled,
+                "interval": min(interval, 15.0),
                 "stop_event": hb_stop, "instance_payload_fn": _instance_payload,
                 # Drop rows from dead runners (each restart is a new hostname:pid
                 # owner). Generous so a briefly-paused runner isn't pruned mid-life.
@@ -1415,17 +1361,21 @@ def main() -> int:
         while True:
             try:
                 # Re-derive the live roster each tick so enabling/disabling a user
-                # (or the gateway) takes effect without restarting the supervisor.
+                # takes effect without restarting the supervisor.
                 discovered = None
                 if host_all_active:
-                    enabled = _discover_enabled(include_gateway=gateway_enabled)
+                    enabled = _discover_enabled()
                     discovered = _resolve_discovered(
                         enabled, mint_token=mint_token, api_url=api_url,
                         enclave_url=enclave_url, cache=cred_cache,
                         notify=lambda uid, detail: sup._emit_runner_notice(
                             uid, "runner_key_decrypt_failed", detail))
-                roster, gateways = _effective_roster(
-                    base_roster, autodiscover=autodiscover, gateway_enabled=gateway_enabled,
+                # The in-CVM LiteLLM gateway is retired, so there is no gateway
+                # filtering left — every fit-provider entry (autodiscovered or
+                # dev roster) is spawned as-is (see
+                # hosted.agent_runtime_cutover.driver_for_provider).
+                roster = _effective_roster(
+                    base_roster, autodiscover=autodiscover,
                     host_all_discovered=discovered)
                 # Tag each entry with the genesis_persona digest (unified point: covers
                 # base + discovered). _spawn_identity includes it, so when a voice
@@ -1434,26 +1384,7 @@ def main() -> int:
                 # gate 4 C. No kill, no in-place prompt rewrite.
                 for _entry in roster:
                     _entry["persona_version"] = _persona_version(_entry.get("user_id", ""))
-                # Lease-scoped gateway, race-free across spawn: configure the
-                # gw-<uid> routes for users acquired THIS tick BEFORE their consumers
-                # start (pre_spawn), then converge AFTER tick to drop routes for
-                # users that left/were reaped. Both passes only ever include users
-                # this runner owns, so another runner's key never enters our config
-                # (multi-node key isolation). ``gateways`` carries this tick's
-                # freshly-resolved upstream keys, so a key rotation still reaches
-                # LiteLLM even though it deliberately doesn't respawn the consumer.
-                # owned ids are snapshotted under the lock — the renew thread mutates
-                # sup.children concurrently (iterating it live could raise
-                # "dictionary changed size during iteration" and abort the tick).
-                def _reconcile_gateway(extra_ids=()):
-                    if gateway_mgr is None:
-                        return
-                    with sup._lock:
-                        owned_ids = set(sup.children) | set(extra_ids)
-                    gateway_mgr.reconcile(_owned_gateway_entries(gateways, owned_ids))
-
-                sup.tick(roster, pre_spawn=_reconcile_gateway)
-                _reconcile_gateway()
+                sup.tick(roster)
                 # Gate 4 B-3: after the spawn reconcile, top up voice for no-blob users
                 # (bounded + cooldown'd so it never blocks the tick). Off by default.
                 if _lazy_persona_backfill_enabled():
@@ -1503,8 +1434,6 @@ def main() -> int:
         renew_stop.set()
         genesis_stop.set()
         sup.shutdown()
-        if gateway_mgr is not None:
-            gateway_mgr.shutdown()
 
 
 if __name__ == "__main__":

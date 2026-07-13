@@ -11,6 +11,7 @@ re-runnable without a fresh DB.
 """
 
 import base64
+from datetime import datetime
 import os
 import sys
 import uuid
@@ -32,6 +33,10 @@ db.init_schema()
 
 def _uid() -> str:
     return f"usr_{uuid.uuid4().hex[:16]}"
+
+
+def _epoch(iso: str) -> float:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
 
 
 def test_healthcheck():
@@ -276,6 +281,130 @@ def test_log_append_read_trim_prune():
     assert [r["event"] for r in db.log_read_all(uid, "device_events")] == [8, 9]
 
 
+def test_admin_data_track_snapshot_aggregates_app_sessions():
+    active_uid = _uid()
+    empty_uid = _uid()
+    seed_user(active_uid)
+    seed_user(empty_uid)
+
+    db.log_append(
+        active_uid,
+        "tracking_events",
+        {"type": "app_session_end", "payload": {"duration_sec": 45}},
+        ts=100.0,
+    )
+    db.log_append(
+        active_uid,
+        "tracking_events",
+        {"type": "app_session_end", "payload": {"duration_sec": 75}},
+        ts=200.0,
+    )
+    # Malformed duration still counts as a session but contributes no time.
+    db.log_append(
+        active_uid,
+        "tracking_events",
+        {"type": "app_session_end", "payload": {"duration_sec": "bad"}},
+        ts=300.0,
+    )
+    db.log_append(
+        active_uid,
+        "tracking_events",
+        {"type": "app_open", "payload": {"duration_sec": 999}},
+        ts=400.0,
+    )
+
+    snapshot = db.admin_data_track_snapshot([active_uid, empty_uid])
+
+    assert snapshot[active_uid]["app_usage"] == {
+        "foreground_sec": 120,
+        "sessions": 3,
+        "last_at": 300.0,
+    }
+    assert snapshot[empty_uid]["app_usage"] == {
+        "foreground_sec": 0,
+        "sessions": 0,
+        "last_at": None,
+    }
+
+
+def test_admin_data_track_dau_aggregates_app_sessions_by_beijing_day():
+    user_a = _uid()
+    user_b = _uid()
+    chat_only = _uid()
+    for uid in (user_a, user_b, chat_only):
+        seed_user(uid)
+
+    since = _epoch("2030-06-01T17:00:00Z")
+    day2_a = _epoch("2030-06-01T18:00:00Z")  # 2030-06-02 Beijing
+    day2_b = _epoch("2030-06-01T18:10:00Z")
+    day2_c = _epoch("2030-06-01T18:20:00Z")
+    day3_bad = _epoch("2030-06-02T16:30:00Z")  # 2030-06-03 Beijing
+    day4_chat = _epoch("2030-06-03T17:00:00Z")  # 2030-06-04 Beijing
+
+    # Same Beijing day: three sessions across two users, avg = (60+180+120)/3.
+    for uid, ts, duration in (
+        (user_a, day2_a, 60),
+        (user_a, day2_b, 180),
+        (user_b, day2_c, 120),
+    ):
+        db.log_append(
+            uid,
+            "tracking_events",
+            {"type": "app_session_end", "payload": {"duration_sec": duration}},
+            ts=ts,
+        )
+    # Non-session tracking events still count for DAU but not usage duration.
+    db.log_append(
+        user_a,
+        "tracking_events",
+        {"type": "app_open", "payload": {"duration_sec": 999}},
+        ts=day2_c + 10,
+    )
+    # Malformed duration follows the per-user snapshot contract: session yes, 0s.
+    db.log_append(
+        user_b,
+        "tracking_events",
+        {"type": "app_session_end", "payload": {"duration_sec": "bad"}},
+        ts=day3_bad,
+    )
+    # Same Beijing day as day2, but before the caller's since bound.
+    db.log_append(
+        user_b,
+        "tracking_events",
+        {"type": "app_session_end", "payload": {"duration_sec": 1000}},
+        ts=_epoch("2030-06-01T16:50:00Z"),
+    )
+    # A chat-only active day should carry zeroed usage fields.
+    db.chat_append(
+        chat_only,
+        f"dau_chat_only_{chat_only}",
+        day4_chat,
+        {"id": f"dau_chat_only_{chat_only}", "role": "user", "source": "chat"},
+        max_messages=0,
+    )
+
+    rows = db.admin_data_track_dau(since_epoch=since, days=10, tz="Asia/Shanghai")
+    by_day = {row["day"]: row for row in rows}
+
+    assert by_day["2030-06-02"]["avg_session_sec"] == 120.0
+    assert by_day["2030-06-02"]["foreground_sec"] == 360
+    assert by_day["2030-06-02"]["session_count"] == 3
+    assert by_day["2030-06-02"]["session_dau"] == 2
+    assert by_day["2030-06-02"]["tracking_events"] == 4
+
+    assert by_day["2030-06-03"]["avg_session_sec"] == 0.0
+    assert by_day["2030-06-03"]["foreground_sec"] == 0
+    assert by_day["2030-06-03"]["session_count"] == 1
+    assert by_day["2030-06-03"]["session_dau"] == 1
+
+    assert by_day["2030-06-04"]["dau"] == 1
+    assert by_day["2030-06-04"]["chat_dau"] == 1
+    assert by_day["2030-06-04"]["avg_session_sec"] == 0.0
+    assert by_day["2030-06-04"]["foreground_sec"] == 0
+    assert by_day["2030-06-04"]["session_count"] == 0
+    assert by_day["2030-06-04"]["session_dau"] == 0
+
+
 def test_log_patch_item_only_if_status():
     uid = _uid()
     seed_user(uid)
@@ -340,6 +469,30 @@ def test_supervisor_instance_heartbeat_roundtrip():
     assert r["shard_index"] == 0 and r["shard_count"] == 1
     # ``ts`` is the row's updated_at as an epoch float so the guard can age-check it.
     assert isinstance(r["ts"], float) and r["ts"] > 0
+
+
+def test_supervisor_instance_heartbeat_roundtrips_the_pi_capability_bit():
+    """``pi`` MUST survive the write→read roundtrip.
+
+    Unlike host_all/gateway, ``pi`` has no dedicated column — the supervisor only
+    ever puts it in the JSONB ``payload``. The reader long SELECTed the promoted
+    columns but not ``payload``, so ``pi`` silently vanished and every row came
+    back WITHOUT the key. ``evaluate_supervisor_heartbeat`` then read
+    ``hb.get("pi")`` → None → falsy → ``supervisor_pi_disabled``, so
+    ``/v1/model_api/chat/send`` returned 503 for EVERY pi-driver user (i.e. every
+    deepseek/gemini/openrouter/openai_compatible account) whenever a fresh
+    instance row existed — the healthier the runner, the harder it 503'd, since a
+    fresh row also suppressed the legacy-heartbeat fallback that still carried pi.
+    Observed live on test 2026-07-13 (gated events, live_reason=supervisor_pi_disabled)."""
+    owner = _owner()
+    db.set_supervisor_instance_heartbeat(owner, _hb_payload(owner, pi=True))
+    row = next(r for r in db.list_supervisor_instance_heartbeats() if r["owner"] == owner)
+    assert row["pi"] is True
+
+    owner_off = _owner()
+    db.set_supervisor_instance_heartbeat(owner_off, _hb_payload(owner_off, pi=False))
+    row_off = next(r for r in db.list_supervisor_instance_heartbeats() if r["owner"] == owner_off)
+    assert row_off["pi"] is False
 
 
 def test_supervisor_instance_heartbeats_do_not_clobber_across_owners():

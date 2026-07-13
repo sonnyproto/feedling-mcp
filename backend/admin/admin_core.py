@@ -70,6 +70,10 @@ def page_html(query_string: str) -> str:
         return data_track._render_data_track_page(data_track._data_track_payload(include_users=True))
 
 
+def login_page(*, error: bool = False, next_url: str = "/admin/data-track") -> str:
+    return data_track._render_admin_login_page(error=error, next_url=next_url)
+
+
 def user_page(query_string: str, user_id: str) -> tuple[str, str, int]:
     # Mirror admin_data_track_user_page. Returns (kind, body, status):
     # ("text", "user not found", 404) or ("html", <page>, 200).

@@ -6,7 +6,8 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from urllib.parse import parse_qs, quote
 
@@ -395,6 +396,83 @@ def _data_track_count_dict(raw: dict | None) -> dict:
         except Exception:
             out[str(key or "unknown")] = 0
     return out
+
+
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _bj_iso(value) -> str:
+    """Display a UTC epoch or UTC-ISO string in Beijing time (UTC+8).
+    Display-only — storage and the JSON API stay UTC. Empty in -> empty out."""
+    if value is None or value == "" or value == 0:
+        return ""
+    if isinstance(value, (int, float)):
+        epoch = float(value)
+    else:
+        s = str(value).strip()
+        try:
+            epoch = float(s)
+        except ValueError:
+            try:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)  # stored ISO is UTC
+                epoch = dt.timestamp()
+            except ValueError:
+                return str(value)
+    if not epoch:
+        return ""
+    # fail-soft: a NaN / out-of-range epoch must never 500 the whole admin page.
+    try:
+        return datetime.fromtimestamp(epoch, _SHANGHAI_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, OverflowError, OSError):
+        return str(value)
+
+
+_ISO_DT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+
+
+def _bj_deep(obj):
+    """Recursively convert every ISO-8601 datetime STRING in a payload clone to
+    Beijing (UTC+8) for HTML display. Display-only — the JSON API is unchanged.
+    Non-timestamp strings and all other types pass through untouched."""
+    if isinstance(obj, str):
+        return _bj_iso(obj) if _ISO_DT_RE.match(obj) else obj
+    if isinstance(obj, dict):
+        return {k: _bj_deep(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_bj_deep(v) for v in obj]
+    return obj
+
+
+def _data_track_app_usage_from_snapshot(snap: dict) -> dict:
+    """Per-user app usage from db snapshot's ``app_usage`` (iOS app_session_end
+    aggregation). ``last_at`` is a server ingest epoch; keep it raw for the
+    Shanghai-day DAU roll-up and also expose an ISO string for display."""
+    au = dict(snap.get("app_usage") or {})
+    try:
+        last_epoch = float(au.get("last_at") or 0) or 0.0
+    except (TypeError, ValueError):
+        last_epoch = 0.0
+    return {
+        "foreground_sec": int(au.get("foreground_sec") or 0),
+        "sessions": int(au.get("sessions") or 0),
+        "last_at_epoch": last_epoch,
+        "last_at": _data_track_iso(last_epoch) if last_epoch else "",
+    }
+
+
+def _epoch_is_today_shanghai(epoch: float, now_epoch: float) -> bool:
+    """True when ``epoch`` falls on the same Asia/Shanghai calendar day as
+    ``now_epoch``. Explicit ZoneInfo — never the host's local TZ."""
+    if not epoch:
+        return False
+    try:
+        d1 = datetime.fromtimestamp(float(epoch), _SHANGHAI_TZ).date()
+        d2 = datetime.fromtimestamp(float(now_epoch), _SHANGHAI_TZ).date()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return False
+    return d1 == d2
 
 
 def _data_track_days_since(value) -> int | None:
@@ -800,6 +878,7 @@ def _build_data_track_user_fast(user_entry: dict, snap: dict) -> dict:
         "connection": _connection_health(route, access_modes, chat),
         "push": _push_stats_from_user_entry(user_entry),
         "tracking": tracking,
+        "app_usage": _data_track_app_usage_from_snapshot(snap),
         "bootstrap_events": bootstrap_events,
         "history_import": history_import,
     }
@@ -1128,6 +1207,9 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
     human_active_1d = human_active_3d = 0
     activated = 0
     conn_offline = conn_stalled = 0
+    # App usage-duration roll-up (iOS app_session_end). foreground-kill undercount
+    # is expected (see analytics-app-session-end.md); this is a slight lower bound.
+    au_fg_total = au_sessions_total = au_users_active = au_dau_today = 0
     for row in rows:
         stage = row["onboarding"]["stage"]
         route = row["route"]
@@ -1168,6 +1250,14 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
             human_active_3d += 1
         if human_epoch and (now_epoch - human_epoch) <= 86400:
             human_active_1d += 1
+        au = row.get("app_usage") or {}
+        au_sess = int(au.get("sessions") or 0)
+        au_fg_total += int(au.get("foreground_sec") or 0)
+        au_sessions_total += au_sess
+        if au_sess >= 1:
+            au_users_active += 1
+            if _epoch_is_today_shanghai(au.get("last_at_epoch") or 0, now_epoch):
+                au_dau_today += 1
     # Duplicate registration: one real person (principal_id) can hold several
     # user_id rows because re-onboarding never deletes the old row (only the
     # explicit reset endpoint does). Count principals carrying >1 row and the
@@ -1210,6 +1300,13 @@ def _data_track_payload(*, include_users: bool = True, include_detail_user: str 
         "proactive_jobs_total": proactive_jobs,
         "proactive_messages_total": proactive_messages,
         "proactive_failed_total": proactive_failed,
+        "app_usage": {
+            "foreground_sec_total": au_fg_total,
+            "sessions_total": au_sessions_total,
+            "avg_session_sec": (au_fg_total / au_sessions_total) if au_sessions_total else 0,
+            "users_active": au_users_active,
+            "dau_today": au_dau_today,
+        },
     }
     payload = {
         "summary": summary,
@@ -1679,6 +1776,64 @@ def _render_metric(label: str, value) -> str:
     )
 
 
+def _fmt_duration_sec(value) -> str:
+    """Seconds -> compact human duration (e.g. 137 -> '2m17s', 5400 -> '1h30m').
+    None / non-numeric -> '—' (unknown), distinct from a real 0 -> '0s'."""
+    if value is None:
+        return "—"
+    try:
+        s = int(round(float(value)))
+    except (TypeError, ValueError):
+        return "—"
+    if s <= 0:
+        return "0s"
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h:
+        return f"{h}h{m}m" if m else f"{h}h"
+    if m:
+        return f"{m}m{sec}s" if sec else f"{m}m"
+    return f"{sec}s"
+
+
+def _render_admin_login_page(error: bool = False, next_url: str = "/admin/data-track") -> str:
+    """Password-gate login page for the admin dashboard. Posts to /admin/login,
+    which validates FEEDLING_ADMIN_PASSWORD and sets the signed admin_session
+    cookie (see admin.routes_asgi). Styled to match the data-track dashboard."""
+    err_html = (
+        "<div class='err'>密码不对，再试一次。</div>" if error else ""
+    )
+    safe_next = html.escape(next_url or "/admin/data-track", quote=True)
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Feedling Data Track · 登录</title>
+  <style>
+    :root {{ color-scheme: light; --fg:#191613; --muted:#736963; --line:#e6ddd5; --bg:#fbf8f4; --card:#fffdfa; --accent:#b7352b; }}
+    body {{ margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; display:flex; min-height:100vh; align-items:center; justify-content:center; }}
+    .box {{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:28px 26px; width:320px; box-shadow:0 2px 14px rgba(0,0,0,.05); }}
+    h1 {{ font-size:19px; margin:0 0 4px; }}
+    .sub {{ color:var(--muted); font-size:13px; margin:0 0 18px; }}
+    input[type=password] {{ width:100%; box-sizing:border-box; padding:11px 12px; font-size:15px; border:1px solid var(--line); border-radius:8px; background:#fff; }}
+    button {{ width:100%; margin-top:12px; padding:11px; font-size:15px; font-weight:600; color:#fff; background:var(--accent); border:0; border-radius:8px; cursor:pointer; }}
+    .err {{ color:var(--accent); font-size:13px; margin-bottom:10px; }}
+  </style>
+</head>
+<body>
+  <form class="box" method="post" action="/admin/login">
+    <h1>Feedling Data Track</h1>
+    <p class="sub">团队内部面板 · 输入密码进入</p>
+    {err_html}
+    <input type="hidden" name="next" value="{safe_next}">
+    <input type="password" name="password" placeholder="密码" autofocus autocomplete="current-password">
+    <button type="submit">进入</button>
+  </form>
+</body>
+</html>"""
+
+
 def _data_track_page_href(**updates) -> str:
     qs_inner = _data_track_qs(**updates)
     return f"/admin/data-track?{qs_inner}" if qs_inner else "/admin/data-track"
@@ -1786,7 +1941,7 @@ def _render_data_track_page(payload: dict) -> str:
             f"<td>{pro['proactive_messages']} <span class='muted'>sent</span>"
             f"<br><span class='muted'>心跳 {pro.get('heartbeat_jobs', 0)}(f{pro.get('heartbeat_failed', 0)}) / "
             f"屏幕 {pro.get('screen_jobs', 0)}(f{pro.get('screen_failed', 0)})</span></td>"
-            f"<td>{html.escape(row.get('last_activity_at') or '')}</td>"
+            f"<td>{html.escape(_bj_iso(row.get('last_activity_at')))}</td>"
             "</tr>"
         )
     fn = summary.get("activation_funnel", {})
@@ -1796,22 +1951,24 @@ def _render_data_track_page(payload: dict) -> str:
     raw_rows = int(summary["users_total"])
     off = int(summary.get("conn_offline") or 0)
     stalled = int(summary.get("conn_stalled") or 0)
-    # 真人去重(principals_total)= 原始行 in prod (每次重装新 principal),故不再单列;
-    # 已激活才是"真正用起来的人"。
+    # 头条用「激活用户」(真正用起来的人),不用「注册」——注册行含重装/换机产生的孤儿号,
+    # 每次静默重注册都新建一行且旧行不删,所以不是人数。principals_total 在 prod 恒等于
+    # 注册行(每次重装新密钥=新 principal),去重无意义,不再展示。
     metrics = "".join([
-        _render_metric("已激活 / 原始行", f"{activated} / {raw_rows}"),
-        _render_metric("真人活跃 1d/3d (人发消息)", f"{summary.get('human_active_1d', 0)} / {summary.get('human_active_3d', 0)}"),
-        _render_metric("系统活跃 1d/3d (含后台)", f"{fn.get('active_1d', 0)} / {fn.get('active_3d', 0)}"),
+        _render_metric("激活用户（真正用起来的人）", activated),
+        _render_metric("累计注册行（含重装孤儿·非人数）", raw_rows),
+        _render_metric("真人活跃 1d/3d（有人发消息）", f"{summary.get('human_active_1d', 0)} / {summary.get('human_active_3d', 0)}"),
+        _render_metric("系统活跃 1d/3d（含后台任务）", f"{fn.get('active_1d', 0)} / {fn.get('active_3d', 0)}"),
         _render_metric("连接异常 掉线/有去无回", f"{off} / {stalled}"),
-        _render_metric("chatting (收到AI回复)", f"{fn.get('chatting', 0)} · {_pct(fn.get('chatting'))}"),
-        _render_metric("onboarding done", summary["onboarding_completed"]),
-        _render_metric("chat messages", summary["chat_messages_total"]),
-        _render_metric("memories", summary["memory_total"]),
-        _render_metric("proactive jobs", summary["proactive_jobs_total"]),
+        _render_metric("在聊（收到过AI回复）", f"{fn.get('chatting', 0)} · {_pct(fn.get('chatting'))}"),
+        _render_metric("onboarding 完成", summary["onboarding_completed"]),
+        _render_metric("聊天消息总数", summary["chat_messages_total"]),
+        _render_metric("记忆总数", summary["memory_total"]),
+        _render_metric("主动任务数", summary["proactive_jobs_total"]),
     ])
     # Ground-truth activation funnel (behaviour-based, not stage-label-based).
     funnel_steps = [
-        ("registered", "注册"),
+        ("registered", "注册行（含重装孤儿·非人数）"),
         ("has_memory", "有记忆"),
         ("sent_first_message", "发过消息"),
         ("chatting", "收到AI回复(真在聊)"),
@@ -1828,6 +1985,25 @@ def _render_data_track_page(payload: dict) -> str:
         "<h2>Activation funnel（真实使用漏斗 · 基于行为,不看 stage 标签）</h2>"
         f"<section class='funnel'>{funnel_html}</section>"
     )
+    # App 使用时长(iOS app_session_end 事件聚合 · summary['app_usage'] 由 db 层填充)。
+    au = summary.get("app_usage") or {}
+    if au.get("sessions_total"):
+        usage_metrics = "".join([
+            _render_metric("总前台时长", _fmt_duration_sec(au.get("foreground_sec_total"))),
+            _render_metric("会话数（结束事件）", au.get("sessions_total", 0)),
+            _render_metric("平均单次时长", _fmt_duration_sec(au.get("avg_session_sec"))),
+            _render_metric("有使用时长的用户", au.get("users_active", 0)),
+            _render_metric("今日活跃（按会话）", au.get("dau_today", 0)),
+        ])
+        app_usage_section = (
+            "<h2>App 使用时长（iOS 前台时间 · 前台被杀会漏报，略偏低估）</h2>"
+            f"<section class='metrics'>{usage_metrics}</section>"
+        )
+    else:
+        app_usage_section = (
+            "<h2>App 使用时长</h2>"
+            "<div class='muted'>暂无 app_session_end 事件（iOS 上报后此处出现聚合）。</div>"
+        )
     return f"""<!doctype html>
 <html>
 <head>
@@ -1851,6 +2027,7 @@ def _render_data_track_page(payload: dict) -> str:
     .fn-bar {{ height:6px; background:#eee3d9; border-radius:4px; margin:6px 0; overflow:hidden; }}
     .fn-bar span {{ display:block; height:100%; background:var(--accent); }}
     .fn-label {{ color:var(--muted); font-size:12px; }}
+    .note-box {{ background:#fff8ef; border:1px solid #e8d8be; border-radius:8px; padding:12px 14px; margin:16px 0 4px; font-size:13px; line-height:1.6; color:#5a4d3c; }}
 	    .toolbar {{ display:flex; gap:10px; align-items:center; margin:18px 0; }}
 	    .viewbar,.sortbar,.pager {{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:10px 0 18px; }}
 	    .sort-button {{ display:inline-flex; align-items:center; border:1px solid var(--line); border-radius:6px; padding:7px 10px; background:var(--card); color:var(--fg); font-size:13px; }}
@@ -1870,11 +2047,19 @@ def _render_data_track_page(payload: dict) -> str:
 <body>
 <main>
 	  <h1>Feedling Beta Data Track</h1>
-	  <div class="muted">Generated {html.escape(summary["generated_at"])}. Metadata only; encrypted content is not read or rendered.</div>
+	  <div class="muted">Generated {html.escape(_bj_iso(summary["generated_at"]))}. Metadata only; encrypted content is not read or rendered.</div>
 	  <div class="muted">Showing {html.escape(str(pagination.get("returned", len(users))))} of {html.escape(str(pagination.get("total", summary["users_total"])))} filtered users. Since {html.escape(str(filters.get("since") or "all time"))}.</div>
+	  <div class="note-box">
+	    <b>怎么读这些数：</b>
+	    「<b>激活用户</b>」= 写过记忆或发过消息的人，<b>最接近真实用户数</b>。
+	    「<b>累计注册行</b>」= 装过 app、生成过密钥的账户行累计；同一个人重装 / 换机 / 抹机后
+	    app 会静默注册一个新号、旧号变孤儿不删，所以它<b>不是人数</b>、会远大于发出的邀请/邮件数。
+	    删除账户是硬删（行直接消失），因此没有、也无法有「已删除账户数」这个指标。
+	  </div>
 	  {_render_data_track_view_nav("users")}
 		  <section class="metrics">{metrics}</section>
 		  {funnel_section}
+		  {app_usage_section}
 	  <h2>Beta users</h2>
 	  <div class="toolbar"><input id="q" placeholder="Filter user, route, stage"></div>
 	  <div class="sortbar">{sort_controls}</div>
@@ -1915,7 +2100,10 @@ def _render_data_track_dau_page(payload: dict) -> str:
             f"<td>{int(row.get('active_events') or 0)}</td>"
             f"<td>{int(row.get('user_messages') or 0)}</td>"
             f"<td>{int(row.get('tracking_events') or 0)}</td>"
-            f"<td>{html.escape(str(row.get('last_at') or ''))}</td>"
+            f"<td>{int(row.get('session_dau') or 0)}</td>"
+            f"<td><b>{_fmt_duration_sec(row.get('avg_session_sec'))}</b></td>"
+            f"<td>{int(row.get('session_count') or 0)}</td>"
+            f"<td>{html.escape(_bj_iso(row.get('last_at')))}</td>"
             "</tr>"
         )
     metrics = "".join([
@@ -1962,16 +2150,17 @@ def _render_data_track_dau_page(payload: dict) -> str:
 <body>
 <main>
   <h1>Feedling Beta Data Track</h1>
-  <div class="muted">Generated {html.escape(summary["generated_at"])}. DAU timezone: {html.escape(summary["timezone"])}.</div>
+  <div class="muted">Generated {html.escape(_bj_iso(summary["generated_at"]))}. DAU timezone: {html.escape(summary["timezone"])}.</div>
   <div class="muted">Showing {html.escape(str(summary["days_returned"]))} active days. Since {html.escape(str(filters.get("since") or "all time"))}; days limit {html.escape(str(filters.get("days") or 30))}.</div>
   {_render_data_track_view_nav("dau")}
   <section class="metrics">{metrics}</section>
   <h2>Daily Active Users</h2>
   <div class="muted">{html.escape(definition.get("dau") or "")} {html.escape(definition.get("excluded") or "")}</div>
+  <div class="muted">使用DAU=当天有 app 使用时长上报的用户数；平均使用时长=当天所有会话的平均前台时长；会话数=当天 app_session_end 事件数。前台被杀会漏报，略偏低估。均按北京日。</div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
   <table>
-    <thead><tr><th>Beijing day</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>Last active</th></tr></thead>
-    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='8' class='muted'>No DAU activity in this range.</td></tr>"}</tbody>
+    <thead><tr><th>Beijing day</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>使用DAU</th><th>平均使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
+    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='11' class='muted'>No DAU activity in this range.</td></tr>"}</tbody>
   </table>
 </main>
 </body>
@@ -2045,7 +2234,7 @@ def _render_proactive_daily_page(payload: dict) -> str:
 <body>
 <main>
   <h1>Feedling Proactive 日报</h1>
-  <div class="muted">Generated {html.escape(summary["generated_at"])}. 时区 {html.escape(summary["timezone"])}. 最近 {html.escape(str(summary["days_returned"]))} 天。</div>
+  <div class="muted">Generated {html.escape(_bj_iso(summary["generated_at"]))}. 时区 {html.escape(summary["timezone"])}. 最近 {html.escape(str(summary["days_returned"]))} 天。</div>
   {_render_data_track_view_nav("proactive")}
   <section class="metrics">{metrics}</section>
   <h2>每日主动消息成功率(仅 wake lane)</h2>
@@ -2075,11 +2264,18 @@ def _debug_ms(ms) -> str:
 
 
 def _debug_time(ts) -> str:
+    # Beijing time (UTC+8) for display; storage stays UTC. Include the date so a
+    # firehose event can be placed on a day, not just an hour.
     try:
         value = float(ts or 0)
     except (TypeError, ValueError):
         value = 0
-    return datetime.fromtimestamp(value).strftime("%H:%M:%S") if value else "—"
+    if not value:
+        return "—"
+    try:
+        return datetime.fromtimestamp(value, _SHANGHAI_TZ).strftime("%m-%d %H:%M:%S")
+    except (ValueError, OverflowError, OSError):
+        return "—"
 
 
 # type → (icon, 友好中文步骤名). Makes a turn read as a narrative instead of
@@ -2228,7 +2424,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
             f"<br><span class='muted'>{html.escape(str(row.get('principal_id') or ''))}</span></td>"
             f"<td>{int(row.get('events') or 0)}</td>"
             f"<td><span class='pill {enabled_cls}'>{'enabled' if row.get('enabled') else 'off'}</span></td>"
-            f"<td>{html.escape(str(row.get('last_at') or ''))}</td>"
+            f"<td>{html.escape(_bj_iso(row.get('last_at')))}</td>"
             "</tr>"
         )
 
@@ -2356,7 +2552,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
     flat_table = (
         "<table class='log-table'>"
         "<thead><tr>"
-        f"<th>Time {hint('事件发生时间。当前显示本机时区的时分秒，用来快速看先后顺序。')}</th>"
+        f"<th>Time {hint('事件发生时间，北京时间(UTC+8)，格式 月-日 时:分:秒。列表默认最新在最上方。')}</th>"
         f"<th>User {hint('真实 user_id。点它会只看这个用户的 debug 事件。')}</th>"
         f"<th>Trace {hint('一次聊天或一次任务链路的 trace_id。点它会切到 timeline 看完整步骤。')}</th>"
         f"<th>Module {hint('事件来源模块：route 是入口，context 是上下文，agent 是模型调用/回复，memory 是记忆写入。')}</th>"
@@ -2427,7 +2623,7 @@ def _render_data_track_debug_page(payload: dict) -> str:
 <body>
 <main>
   <h1>Feedling Debug Logs</h1>
-  <div class="muted">Admin-only beta debug view. Reads existing per-user v1_flow_trace ring buffers; no instrumentation writes here. Generated {html.escape(summary["generated_at"])}.</div>
+  <div class="muted">Admin-only beta debug view. Reads existing per-user v1_flow_trace ring buffers; no instrumentation writes here. Generated {html.escape(_bj_iso(summary["generated_at"]))}.</div>
   {_render_data_track_view_nav("debug")}
   <section class="metrics">{metrics}</section>
   <div class="modebar">
@@ -2512,6 +2708,20 @@ _EVENT_CATEGORIES = [
     ("screen", "屏幕共享"),
     ("other", "其他"),
 ]
+
+# Plain-language: what each row actually is. Shown under every event label so the
+# page is self-explanatory (no tribal knowledge needed to read it).
+_EVENT_DESCRIPTIONS = {
+    "onboarding": "从注册 → 配置上线 → 内容就绪 → 第一次收到真回复的转化漏斗。点开看各段转化率+耗时。",
+    "distill_first": "首次蒸馏：onboarding 时 AI 把上传材料/初始对话提炼成身份卡+记忆（genesis job，mode=onboarding）。VPS 和 API 都有。",
+    "distill_second": "增量蒸馏：onboarding 之后 AI 追加记忆或改写身份卡（genesis 的 add_memory / update_identity，含用户从 IO 手动改身份卡）。",
+    "memory_org": "AI 主动整理/沉淀记忆的 capture 任务。",
+    "reply": "用户发消息后 AI 是否真的回上了。成功率=真回复÷用户消息数；下面一行=兜底回复占比·回复延迟中位。",
+    "heartbeat": "陪伴心跳：空闲时按间隔唤醒 AI，判断要不要主动说话。",
+    "trigger": "事件触发的主动：到达/解锁/照片等场景唤醒 AI。",
+    "screen": "屏幕观察类的主动任务。",
+    "other": "其他/未归类的主动任务。",
+}
 
 
 def _data_track_events_payload() -> dict:
@@ -2607,8 +2817,12 @@ def _render_events_page(payload: dict) -> str:
             lat = _evt_dur({"median_dur": b.get("median_latency")})
             extra = f"<br><span class='muted'>兜底 {fb_pct} · 延迟 {lat}</span>"
         else:
-            extra = f"<br><span class='muted'>{_evt_dur(b)}</span>"
-        return (f"<td><b class='{rate_cls}'>{rate}</b> <span class='muted'>·{total}</span>{extra}</td>")
+            extra = f"<br><span class='muted'>中位耗时 {_evt_dur(b)}</span>"
+        return (f"<td><b class='{rate_cls}'>{rate}</b> <span class='muted'>成功率 · {total} 次</span>{extra}</td>")
+
+    def _desc(key: str) -> str:
+        d = _EVENT_DESCRIPTIONS.get(key, "")
+        return f"<div class='evt-desc'>{html.escape(d)}</div>" if d else ""
 
     rows = []
     for c in cats:
@@ -2616,12 +2830,12 @@ def _render_events_page(payload: dict) -> str:
         is_onb = c["key"] == "onboarding"
         if is_onb:
             onb_href = _data_track_page_href(view="events", event="onboarding", offset=0)
-            rows.append(f"<tr><td><a href='{html.escape(onb_href, quote=True)}'>{html.escape(c['label'])}</a></td>"
+            rows.append(f"<tr><td><a href='{html.escape(onb_href, quote=True)}'>{html.escape(c['label'])}</a>{_desc(c['key'])}</td>"
                         f"<td colspan='2'><a href='{html.escape(onb_href, quote=True)}'>打开漏斗(VPS/API 转化率+耗时) →</a></td></tr>")
             continue
         drill = _data_track_page_href(view="events", event=c["key"], offset=0)
         rows.append(
-            f"<tr><td><a href='{html.escape(drill, quote=True)}'>{html.escape(c['label'])}</a></td>"
+            f"<tr><td><a href='{html.escape(drill, quote=True)}'>{html.escape(c['label'])}</a>{_desc(c['key'])}</td>"
             f"{cell(c['vps'], is_reply=is_reply)}{cell(c['api'], is_reply=is_reply)}</tr>"
         )
     body = "".join(rows)
@@ -2642,11 +2856,19 @@ def _render_events_page(payload: dict) -> str:
   th,td {{ text-align:left; padding:11px 14px; border-bottom:1px solid var(--line); vertical-align:top; }}
   th {{ font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.05em; background:#f4ece5; }}
   tr:last-child td {{ border-bottom:0; }} b {{ font-size:15px; }}
+  .evt-desc {{ font-size:12px; color:var(--muted); line-height:1.5; margin-top:3px; max-width:520px; font-weight:400; text-transform:none; letter-spacing:0; }}
+  .note-box {{ background:#fff8ef; border:1px solid #e8d8be; border-radius:8px; padding:12px 14px; margin:14px 0; font-size:13px; line-height:1.65; color:#5a4d3c; }}
 </style></head><body><main>
   <h1>事件健康度</h1>
-  <div class="muted">每格 = 成功率 · 次数 / 中位耗时(job类)或兜底率(回复)。VPS=resident 自托管,API=model_api 托管。Generated {html.escape(str(payload.get('generated_at') or ''))}.</div>
+  <div class="muted">VPS=resident 自托管；API=model_api 托管。Generated {html.escape(_bj_iso(payload.get('generated_at')))}.</div>
   {_render_data_track_view_nav("events")}
-  <div class="muted">{html.escape(str(payload.get('note') or ''))}</div>
+  <div class="note-box">
+    <b>每一格怎么读：</b>
+    <b>成功率</b> = 完成 ÷（完成 + 失败）（回复类 = 真回复 ÷ 用户消息数，越高越健康）；
+    <b>· N 次</b> = 这类事件/任务在统计窗口内的总条数（不是百分比！）；
+    <b>中位耗时</b> = 任务从开始到结束的中位时长（一次/二次蒸馏暂未上报耗时，显示 —）；
+    回复类第二行 = <b>兜底回复占比 · 回复延迟中位</b>。每行下方灰字说明这个事件到底是什么。
+  </div>
   <table>
     <thead><tr><th>事件</th><th>VPS(自托管)</th><th>API(托管)</th></tr></thead>
     <tbody>{body}</tbody>
@@ -2717,7 +2939,7 @@ def _data_track_onboarding_funnel_payload() -> dict:
         "vps": route_funnel(buckets["vps"]),
         "api": route_funnel(buckets["api"]),
         "api_key": db.admin_api_key_stats(),
-        "note": "里程碑:注册→配置/上线(API=开始入驻·有蒸馏job;VPS=consumer首活动[B])→内容就绪(API=一次蒸馏完成·VPS=首条记忆)→首次真回复[A]。转化率=到达÷注册;耗时=各段中位。API Key 验证单独统计(下)。",
+        "note": "里程碑:注册→配置/上线(API=开始入驻·有蒸馏job;VPS=consumer首活动[B])→内容就绪(API=一次蒸馏完成·VPS=首条记忆)→首次真回复[A]。转化率=到达÷注册(恒≤100%);「↓ 时间」=该段耗时中位。里程碑是相互独立的信号,所以「首次真回复」可能比「内容就绪」还多(用户没写记忆卡就先收到了回复),后段不严格单调。样本太少时段耗时显示「—」(test 环境用户少常见,prod 有数据)。API Key 验证单独统计(下)。",
     }
 
 
@@ -2779,7 +3001,7 @@ def _render_onboarding_funnel_page(payload: dict) -> str:
   <div class="muted">{html.escape(str(payload.get('note') or ''))}</div>
   <div class="cols">{col('VPS（自托管）', payload.get('vps', {}))}{col('API（托管）', payload.get('api', {}))}</div>
   {apikey_html}
-  <div class="muted" style="margin-top:14px">Generated {html.escape(str(payload.get('generated_at') or ''))}.</div>
+  <div class="muted" style="margin-top:14px">Generated {html.escape(_bj_iso(payload.get('generated_at')))}.</div>
 </main></body></html>"""
 
 
@@ -2832,7 +3054,7 @@ def _render_event_users_page(payload: dict) -> str:
             f"<td><b class='{cls}'>{rate}</b></td>"
             f"<td>{u['total']} <span class='muted'>·{u['success']}✓/{u['failed']}✗</span></td>"
             f"<td>{html.escape(extra)}</td>"
-            f"<td class='muted'>{html.escape(str(u.get('last_at') or ''))}</td>"
+            f"<td class='muted'>{html.escape(_bj_iso(u.get('last_at')))}</td>"
             "</tr>"
         )
     body = "".join(rows) if rows else "<tr><td colspan='6' class='muted'>此事件暂无用户数据。</td></tr>"
@@ -2853,7 +3075,7 @@ def _render_event_users_page(payload: dict) -> str:
 </style></head><body><main>
   <div><a href="{html.escape(back, quote=True)}">← 返回事件健康度</a></div>
   <h1>{html.escape(label)} · 按用户（最差成功率在前）</h1>
-  <div class="muted">点用户 id 看单用户详情。Generated {html.escape(str(payload.get('generated_at') or ''))}.</div>
+  <div class="muted">点用户 id 看单用户详情。Generated {html.escape(_bj_iso(payload.get('generated_at')))}.</div>
   <table>
     <thead><tr><th>用户</th><th>类型</th><th>成功率</th><th>次数(✓/✗)</th><th>{metric3}</th><th>最近一次</th></tr></thead>
     <tbody>{body}</tbody>
@@ -2864,7 +3086,7 @@ def _render_event_users_page(payload: dict) -> str:
 def _render_user_detail_page(user: dict) -> str:
     qs = _data_track_qs()
     back = f"/admin/data-track?{qs}" if qs else "/admin/data-track"
-    safe_json = json.dumps(user, ensure_ascii=False, indent=2)
+    safe_json = json.dumps(_bj_deep(user), ensure_ascii=False, indent=2)
     return f"""<!doctype html>
 <html>
 <head>
@@ -2898,6 +3120,7 @@ def _render_user_detail_page(user: dict) -> str:
     <div class="card"><div class="value">{html.escape(user.get('genesis', {}).get('status') or 'none')}</div><div class="label">genesis distill</div></div>
     <div class="card"><div class="value">{user['proactive']['proactive_messages']}</div><div class="label">proactive writes</div></div>
   </section>
+  <div class="muted" style="margin-top:14px">以下所有时间已转北京时间(UTC+8) · 原始存储为 UTC。</div>
   <pre>{html.escape(safe_json)}</pre>
 </main>
 </body>

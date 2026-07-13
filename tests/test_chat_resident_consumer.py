@@ -9,6 +9,7 @@ import importlib
 import base64
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -367,7 +368,7 @@ def test_post_reply_retries_whoami_refresh_before_encrypted_write(monkeypatch):
     monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRIES", 3)
     monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRY_DELAY_SEC", 0)
     monkeypatch.setattr(crc, "_build_envelope", lambda **kw: {"owner": kw["owner_user_id"]})
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     body = crc.post_reply("hello")
 
@@ -411,7 +412,7 @@ def test_post_reply_uses_cached_whoami_keys_when_refresh_fails(monkeypatch):
     monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRIES", 2)
     monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRY_DELAY_SEC", 0)
     monkeypatch.setattr(crc, "_build_envelope", _build)
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     body = crc.post_reply("hello from cache")
 
@@ -433,7 +434,7 @@ def test_post_reply_skips_when_whoami_refresh_fails_without_cache(monkeypatch):
     monkeypatch.setattr(crc, "_load_whoami", lambda: False)
     monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRIES", 2)
     monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRY_DELAY_SEC", 0)
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     body = crc.post_reply("lost")
 
@@ -454,7 +455,7 @@ def test_enclave_history_used_when_configured(monkeypatch):
     _process_messages receives actual content (not the empty poll payload)."""
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://127.0.0.1:5003")
     decrypted = [_make_msg(role="user", content="decrypted hello", ts=2000.0)]
-    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: decrypted)
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20, include_image_body=True: decrypted)
 
     with patch.object(crc, "call_agent", return_value="hi back") as mock_agent, \
          patch.object(crc, "post_reply"):
@@ -616,7 +617,7 @@ def test_post_reply_suppress_push_omits_alert_and_push_fields(monkeypatch):
         {"user_id": "usr_abc", "user_pk": b"\x01" * 32, "enclave_pk": None},
     )
     monkeypatch.setattr(crc, "_build_envelope", lambda **kw: {"stub": "env"})
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     crc.post_reply(crc.VERIFY_PING_REPLY, suppress_push=True)
     body = captured["json"]
@@ -843,7 +844,7 @@ def test_empty_content_decrypt_source_available_replies(monkeypatch):
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://127.0.0.1:5003")
     monkeypatch.setattr(
         crc, "get_decrypted_history",
-        lambda since, limit=20: [decrypted_msg],
+        lambda since, limit=20, include_image_body=True: [decrypted_msg],
     )
 
     with patch.object(crc, "call_agent", return_value="sunny") as mock_agent, \
@@ -961,14 +962,16 @@ def test_agent_failure_reported_even_with_fallback_disabled(monkeypatch):
     assert len(reported) == 1
 
 
-def test_agent_failure_fallback_is_not_cooldown_suppressed(monkeypatch):
-    """Each failed user turn receives visible feedback instead of a silent cooldown
-    drop, and (new behavior) each also gets its own system notice — foreground
-    notices bypass the background debounce, so two failed turns yield two of
-    each kind of post_reply call, not one."""
+def test_agent_failure_fallback_posts_every_turn_banner_windowed(monkeypatch):
+    """Each failed user turn still receives its visible in-chat fallback (never a
+    silent drop), but the system error banner is rate-limited (Seven 2026-07-11):
+    same-class foreground failures inside FOREGROUND_NOTICE_WINDOW_SEC post only
+    ONE banner — a user chatting through a bad patch must not get a banner per
+    message. So two failed turns = two fallbacks + one banner."""
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
     monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
+    crc._reset_system_notice_state()
 
     with patch.object(crc, "call_agent", side_effect=RuntimeError("agent down")), \
          patch.object(crc, "post_reply") as mock_post:
@@ -982,13 +985,13 @@ def test_agent_failure_fallback_is_not_cooldown_suppressed(monkeypatch):
 
     assert [c.args[0] for c in fallback_calls] == [crc.FALLBACK_REPLY, crc.FALLBACK_REPLY]
 
-    assert len(notice_calls) == 2
-    for c in notice_calls:
-        assert c.kwargs["notice_kind"] == "upstream_error"
-        assert c.kwargs["suppress_push"] is True
-        assert "agent down" in c.args[0]
+    assert len(notice_calls) == 1
+    c = notice_calls[0]
+    assert c.kwargs["notice_kind"] == "upstream_error"
+    assert c.kwargs["suppress_push"] is True
+    assert "agent down" in c.args[0]
 
-    assert mock_post.call_count == 4
+    assert mock_post.call_count == 3
 
 
 def test_sanitize_reply_text_strips_leaks_and_duplicates():
@@ -1117,6 +1120,73 @@ def test_agent_turn_native_reasoning_wins_over_tagged_content():
     assert turn.thinking_summary == "原生 reasoning 摘要。"
     assert turn.thinking_source == "openrouter"
     assert turn.thinking_native is True
+
+
+def _pi_stream_with_thinking(reply: str, thinking: str) -> str:
+    """A pi `--mode json` stream carrying one assistant message_end whose content
+    holds a native thinking block plus the reply text."""
+    return "\n".join(json.dumps(o, ensure_ascii=False) for o in [
+        {"type": "session", "id": "s1"},
+        {"type": "message_end", "message": {"role": "user",
+                                            "content": [{"type": "text", "text": "在吗"}]}},
+        {"type": "message_end", "message": {
+            "role": "assistant",
+            "usage": {"input": 10, "output": 5},
+            "content": [{"type": "thinking", "thinking": thinking},
+                        {"type": "text", "text": reply}],
+        }},
+    ])
+
+
+def test_call_agent_body_round_trips_thinking_back_through_split(monkeypatch):
+    """The turn is parsed TWICE: call_agent parses the CLI output into an AgentTurn
+    and re-emits it as a body dict, which the chat/proactive lanes then run through
+    _split_agent_turn again. The body must be written in a dialect the second parse
+    accepts — otherwise the thinking silently dies in the round-trip. Asserted on
+    the real call_agent output rather than a hand-built dict, so the guard survives
+    a rename of whatever key the body happens to use."""
+    raw = crc._attach_provider_reasoning(
+        "在的，怎么了？", "用户在打招呼，简短回应即可。",
+        source="pi_thinking", kind="provider_reasoning_summary", native=True,
+    )
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(crc, "call_agent_cli", lambda *a, **k: raw)
+
+    body = crc.call_agent("在吗", lane="chat")
+    turn = crc._split_agent_turn(body)
+
+    assert turn.messages == ["在的，怎么了？"]
+    assert turn.thinking_summary == "用户在打招呼，简短回应即可。"
+    assert turn.thinking_kind == "provider_reasoning_summary"
+    assert turn.thinking_source == "pi_thinking"
+    assert turn.thinking_native is True
+
+
+def test_pi_native_thinking_reaches_post_reply_end_to_end(monkeypatch):
+    """Whole delivery chain, from a real pi event stream down to post_reply: the
+    thinking must land in post_reply's kwargs, because post_reply is what builds
+    the thinking_envelope that /v1/chat/history hands the app. Before the body-key
+    fix the model produced thinking (trace said thinking_present=true) yet every
+    delivered message carried no thinking_* field at all."""
+    stream = _pi_stream_with_thinking("在的，怎么了？", "用户在打招呼，简短回应即可。")
+    reply, thinking = crc._pi_turn_from_stream(stream)
+    assert thinking, "pi's own parser must still extract the thinking block"
+    raw = crc._attach_provider_reasoning(
+        reply, thinking, source="pi_thinking",
+        kind="provider_reasoning_summary", native=True,
+    )
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(crc, "call_agent_cli", lambda *a, **k: raw)
+
+    msg = _make_msg(role="user", content="在吗", ts=5000.0)
+    with patch.object(crc, "post_reply") as mock_post:
+        crc._process_messages([msg])
+
+    kwargs = mock_post.call_args.kwargs
+    assert kwargs["thinking_summary"] == "用户在打招呼，简短回应即可。"
+    assert kwargs["thinking_kind"] == "provider_reasoning_summary"
+    assert kwargs["thinking_source"] == "pi_thinking"
+    assert kwargs["thinking_native"] is True
 
 
 def test_call_agent_passes_message_without_thinking_protocol(monkeypatch):
@@ -1724,7 +1794,7 @@ def test_openai_http_protocol_uses_session_headers(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_abc", "user_pk": None, "enclave_pk": None})
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_old")
     monkeypatch.setattr(crc, "_save_agent_session_id", lambda sid: saved.append(sid))
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     assert crc.call_agent_http("hi") == "real reply"
     assert captured["json"]["messages"] == [{"role": "user", "content": "hi"}]
@@ -1783,7 +1853,7 @@ def test_memory_lane_raw_text_survives_chat_sanitizer(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_abc", "user_pk": None, "enclave_pk": None})
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_save_agent_session_id", lambda sid: None)
-    monkeypatch.setattr(crc.httpx, "post", lambda url, json=None, headers=None, timeout=None: _Resp())
+    monkeypatch.setattr(crc._HTTP, "post", lambda url, json=None, headers=None, timeout=None: _Resp())
 
     # raw_text path: the literal model output reaches the dream parser intact.
     raw = crc._capture_agent_reply_text(crc.call_agent("dream prompt", raw_text=True))
@@ -1818,7 +1888,7 @@ def test_openai_http_protocol_sends_multimodal_image_block(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://127.0.0.1:8642/v1/chat/completions")
     monkeypatch.setattr(crc, "AGENT_HTTP_PROTOCOL", "openai")
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     image = {"data_url": "data:image/jpeg;base64,abcd", "data": "abcd", "mime_type": "image/jpeg"}
 
@@ -1974,7 +2044,7 @@ def _install_capture_job_harness(monkeypatch, agent_reply):
     monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
     monkeypatch.setattr(crc, "update_proactive_job_status", _status)
     monkeypatch.setattr(crc, "_process_proactive_jobs", _proactive_handler)
-    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: history)
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20, include_image_body=True: history)
     monkeypatch.setattr(crc, "_capture_memory_terms_context", lambda: ("buckets: work", "threads: meeting"))
     monkeypatch.setattr(
         crc,
@@ -2091,7 +2161,7 @@ def _install_dream_job_harness(monkeypatch, agent_reply):
     monkeypatch.setattr(crc, "update_proactive_job_status", _status)
     monkeypatch.setattr(crc, "_process_proactive_jobs", _proactive_handler)
     monkeypatch.setattr(crc, "_capture_post_json", _post_json)
-    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: history)
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20, include_image_body=True: history)
     monkeypatch.setattr(
         crc,
         "_capture_identity_context",
@@ -2119,6 +2189,14 @@ def _dream_final_status(captured):
 
 
 def test_capture_get_json_disables_tls_verification_for_enclave_only(monkeypatch):
+    """TLS verification is off for the enclave (self-signed cert) and ON for
+    everything else. That used to be a per-request ``verify=`` kwarg; pooled
+    clients can only carry it at the client level, so the property is now
+    expressed as "which client gets picked" — assert BOTH halves of it, since a
+    routing bug here would silently stop verifying the backend's certificate.
+    """
+    import ssl
+
     calls = []
 
     class _Resp:
@@ -2128,21 +2206,30 @@ def test_capture_get_json_disables_tls_verification_for_enclave_only(monkeypatch
         def json(self):
             return {"ok": True}
 
-    def _get(url, **kwargs):
-        calls.append((url, kwargs))
-        return _Resp()
-
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enclave.local")
     monkeypatch.setattr(crc, "FEEDLING_API_URL", "https://backend.local")
-    monkeypatch.setattr(crc.httpx, "get", _get)
+
+    enclave_client = crc._client_for("https://enclave.local")
+    backend_client = crc._client_for("https://backend.local")
+
+    # The two clients differ in TLS posture — this is the property being guarded.
+    assert enclave_client is not backend_client
+    assert backend_client is crc._HTTP
+    assert enclave_client._transport._pool._ssl_context.verify_mode == ssl.CERT_NONE
+    assert backend_client._transport._pool._ssl_context.verify_mode == ssl.CERT_REQUIRED
+
+    # ...and each request is routed to the right one of them.
+    for client, tag in ((enclave_client, "enclave"), (backend_client, "backend")):
+        monkeypatch.setattr(
+            client, "get",
+            lambda url, _tag=tag, **kw: calls.append((_tag, url)) or _Resp(),
+        )
 
     assert crc._capture_get_json("/v1/identity/get", base_url="https://enclave.local") == {"ok": True}
-    assert calls[-1][0] == "https://enclave.local/v1/identity/get"
-    assert calls[-1][1]["verify"] is False
+    assert calls[-1] == ("enclave", "https://enclave.local/v1/identity/get")
 
     assert crc._capture_get_json("/v1/memory/buckets") == {"ok": True}
-    assert calls[-1][0] == "https://backend.local/v1/memory/buckets"
-    assert calls[-1][1]["verify"] is True
+    assert calls[-1] == ("backend", "https://backend.local/v1/memory/buckets")
 
 
 def test_capture_json_helpers_refresh_runtime_token_before_each_request(monkeypatch, tmp_path):
@@ -2169,8 +2256,8 @@ def test_capture_json_helpers_refresh_runtime_token_before_each_request(monkeypa
     monkeypatch.setattr(crc, "_runtime_token_exp", lambda token: time.time() + 60)
     monkeypatch.setitem(crc._HEADERS, "X-API-Key", "stale-api-key")
     crc._HEADERS.pop("X-Feedling-Runtime-Token", None)
-    monkeypatch.setattr(crc.httpx, "get", _get)
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "get", _get)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     assert crc._capture_get_json("/v1/memory/buckets") == {"ok": True}
     assert crc._capture_post_json("/v1/memory/legacy_batch", payload={"batch_size": 8}) == {"ok": True}
@@ -3131,7 +3218,7 @@ def test_proactive_perception_digest_uses_agent_perception_routes_not_v2_tool(mo
             },
         })
 
-    monkeypatch.setattr(crc.httpx, "get", _get)
+    monkeypatch.setattr(crc._HTTP, "get", _get)
 
     presence, change, domains = crc._proactive_perception_digest()
 
@@ -3297,7 +3384,7 @@ def test_post_screen_watch_tick_posts_kind_and_frames(monkeypatch):
         captured["body"] = json
         return _R({"enqueued": True, "job": {"job_id": "pj_sw"}})
 
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
     out = crc.post_screen_watch_tick("on", [{"id": "f1"}, {"id": "f2"}])
     assert out.get("enqueued") is True
     assert captured["url"].endswith("/v1/proactive/tick")
@@ -3406,7 +3493,7 @@ def test_load_whoami_clears_cached_timezone_when_omitted(monkeypatch):
         "public_key": base64.b64encode(b"\x11" * 32).decode(),
         "enclave_content_public_key_hex": "22" * 32,
     }
-    monkeypatch.setattr(crc.httpx, "get", lambda *a, **k: _FakeWhoamiResp(body))
+    monkeypatch.setattr(crc._HTTP, "get", lambda *a, **k: _FakeWhoamiResp(body))
     assert crc._load_whoami() is True
     assert crc._whoami_cache["timezone"] == ""
 
@@ -3420,7 +3507,7 @@ def test_load_whoami_keeps_cached_timezone_on_fetch_failure(monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("net down")
 
-    monkeypatch.setattr(crc.httpx, "get", _boom)
+    monkeypatch.setattr(crc._HTTP, "get", _boom)
     assert crc._load_whoami() is False
     assert crc._whoami_cache["timezone"] == "Asia/Shanghai"
 
@@ -3876,7 +3963,7 @@ def test_photo_added_wake_surfaces_pullable_photo_hint(monkeypatch):
                 ]
             }
 
-    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+    monkeypatch.setattr(crc._HTTP, "get", lambda *a, **kw: _Resp())
 
     job = {"schema_version": 2, "trigger": "photo_added", "wake_kind": "perception"}
     message = crc._message_for_proactive_job(
@@ -3897,7 +3984,7 @@ def test_non_photo_wake_has_no_photo_hint(monkeypatch):
     def _boom(*a, **kw):  # must not even be called for a non-photo wake
         raise AssertionError("photos endpoint should not be hit on a non-photo wake")
 
-    monkeypatch.setattr(crc.httpx, "get", _boom)
+    monkeypatch.setattr(crc._HTTP, "get", _boom)
 
     job = {"schema_version": 2, "trigger": "wake", "wake_kind": "perception"}
     message = crc._message_for_proactive_job(
@@ -3917,7 +4004,7 @@ def test_photo_hint_screenshot_framing(monkeypatch):
                 ]
             }
 
-    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+    monkeypatch.setattr(crc._HTTP, "get", lambda *a, **kw: _Resp())
     hint = crc._new_photo_hint({"trigger": "photo_added"})
     assert "a screenshot" in hint
     assert "ph_shot" in hint
@@ -3927,7 +4014,7 @@ def test_recent_chat_context_defaults_to_twenty_messages(monkeypatch):
     captured = {}
     now = 1780939000.0
 
-    def _history(since, limit):
+    def _history(since, limit, include_image_body=True):
         captured["limit"] = limit
         return [
             {"role": "user", "content": f"用户消息 {idx}", "ts": now - ((24 - idx) * 60)}
@@ -3952,7 +4039,7 @@ def test_recent_chat_context_defaults_to_twenty_messages(monkeypatch):
 def test_recent_chat_context_stale_falls_back_to_two_timestamped_messages(monkeypatch):
     now = 1780939000.0
 
-    def _history(since, limit):
+    def _history(since, limit, include_image_body=True):
         return [
             {"role": "user", "content": f"旧消息 {idx}", "ts": now - 28800 - ((4 - idx) * 60)}
             for idx in range(5)
@@ -4007,7 +4094,7 @@ def test_fire_scheduled_wakes_posts_backend_endpoint(monkeypatch):
         captured["timeout"] = timeout
         return _Resp()
 
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     body = crc.fire_scheduled_wakes()
 
@@ -4035,7 +4122,7 @@ def test_fire_capture_tick_posts_backend_endpoint(monkeypatch):
         captured["timeout"] = timeout
         return _Resp()
 
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     body = crc.fire_capture_tick()
 
@@ -4077,7 +4164,7 @@ def test_post_proactive_reply_triggers_alert_and_live_activity(monkeypatch):
         lambda **kwargs: {"v": 1, "id": "env_1", "visibility": kwargs["visibility"]},
     )
     monkeypatch.setattr(crc, "_load_whoami", lambda: True)
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     crc.post_reply(
         "我看到了这个时机。",
@@ -4182,7 +4269,7 @@ def test_call_agent_http_openai_preserves_reasoning_content(monkeypatch):
                 }],
             }
 
-    monkeypatch.setattr(crc.httpx, "post", lambda *a, **kw: _Resp())
+    monkeypatch.setattr(crc._HTTP, "post", lambda *a, **kw: _Resp())
 
     result = crc.call_agent_http("hi")
     turn = crc._split_agent_turn(result)
@@ -4332,6 +4419,228 @@ def test_call_agent_cli_codex_raw_text_lane_returns_literal_reply(monkeypatch):
     assert out == cards_json
 
 
+# ---------------------------------------------------------------------------
+# pi driver: `pi --mode json` JSONL event stream parse / thinking / errors.
+# pi separates thinking from text at the event level (each completed assistant
+# message is its own `message_end`) and, unlike codex/claude, exits 0 EVEN ON
+# API ERRORS — the error rides the final message_end's stopReason/errorMessage
+# and pi echoes the user prompt as its own message_start/message_end. So
+# `_pi_turn_from_stream` is pi's ONLY valid reply source.
+# ---------------------------------------------------------------------------
+
+
+def _pi_stream_lines(*events) -> str:
+    return "\n".join(json.dumps(e) for e in events)
+
+
+_PI_HEADER = {"type": "session", "version": 3, "id": "abc123", "cwd": "/h"}
+
+
+def test_call_agent_cli_pi_folds_thinking_and_prefers_command_sid(monkeypatch, tmp_path):
+    raw = _pi_stream_lines(
+        _PI_HEADER,
+        {"type": "message_end", "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "内部推理"},
+            {"type": "text", "text": "答复正文"}]}},
+    )
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id} {message}")
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
+    monkeypatch.setattr(crc, "_prepare_cli_command",
+                        lambda message, image_paths=None, lane="background": ["pi", "--mode", "json",
+                                                           "--session-id", "sid-cmd-1", message])
+    monkeypatch.setattr(crc.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout=raw, stderr=""))
+    crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
+
+    out = crc.call_agent_cli("hi")
+    payload = json.loads(out)
+    assert payload["messages"] == ["答复正文"]
+    assert payload["provider_reasoning"] == "内部推理"
+    assert payload["reasoning_source"] == "pi_thinking"
+    assert payload["reasoning_native"] is True
+    # session ownership follows the command line (pi's event stream carries no
+    # extractable session_id field to scrape).
+    assert crc._load_agent_session_id() == "sid-cmd-1"
+
+
+def test_call_agent_cli_pi_error_turn_does_not_echo_user_message(monkeypatch, tmp_path):
+    # Real pi 0.80.3 behaviour: on an API error pi exits 0, rides the error on the
+    # final assistant message_end, AND echoes the user prompt as its own
+    # message_start/message_end. The pi branch must surface the error, NOT fall
+    # through to the generic extractor (which would return the echoed "say hi").
+    raw = _pi_stream_lines(
+        {"type": "session", "version": 3, "id": "smoke-1"},
+        {"type": "message_end", "message": {"role": "user",
+            "content": [{"type": "text", "text": "say hi"}]}},
+        {"type": "message_end", "message": {"role": "assistant", "content": [],
+            "stopReason": "error", "errorMessage": "401: Incorrect API key provided"}},
+        {"type": "agent_end", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "say hi"}]},
+            {"role": "assistant", "content": [], "stopReason": "error",
+             "errorMessage": "401: Incorrect API key provided"}]},
+    )
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id} {message}")
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
+    monkeypatch.setattr(crc, "_prepare_cli_command",
+                        lambda message, image_paths=None, lane="background": ["pi", "--mode", "json",
+                                                           "--session-id", "smoke-1", message])
+    monkeypatch.setattr(crc.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout=raw, stderr=""))
+    crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
+
+    with pytest.raises(RuntimeError) as ei:
+        crc.call_agent_cli("say hi")
+    assert "401" in str(ei.value)          # surfaced the real error
+    assert "say hi" not in str(ei.value).replace("produced no reply", "")  # not the echo
+
+
+def test_cli_failure_surfaces_pi_error_message():
+    raw = _pi_stream_lines(
+        _PI_HEADER,
+        {"type": "message_end", "message": {"role": "assistant", "content": [],
+                                            "stopReason": "error",
+                                            "errorMessage": "401 invalid key"}},
+    )
+    assert "401 invalid key" in crc._cli_error_detail(raw, "")
+
+
+def test_pi_intermediate_events_are_non_final():
+    for etype in ("message_start", "message_update", "turn_start", "turn_end",
+                  "agent_start", "agent_end", "session",
+                  "tool_execution_start", "tool_execution_update", "tool_execution_end",
+                  "thinking_start", "thinking_delta", "thinking_end",
+                  "text_start", "text_delta", "text_end",
+                  "queue_update", "compaction_start", "compaction_end",
+                  "auto_retry_start", "auto_retry_end", "extension_error"):
+        assert etype in crc._JSON_NON_FINAL_EVENTS
+
+
+def test_prepare_pi_command_generates_session_id_and_keeps_mode_json(monkeypatch, tmp_path):
+    # Managed pi template has NO {message} — the message rides STDIN, so it never
+    # appears in argv (a @/-/-- message would otherwise be arg-parsed by pi).
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD",
+        "pi --mode json -t bash --append-system-prompt /h/agent-tools-prompt.md "
+        "--model feedling/qwen-max --session-id {session_id}")
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
+
+    cmd = crc._prepare_cli_command("hello")
+    sid = crc._cli_flag_value(cmd, "--session-id")
+    assert sid                                   # 空 sid → 现场生成并绑定
+    assert sid == crc._load_agent_session_id()   # 已持久化，下一轮复用
+    assert cmd[:3] == ["pi", "--mode", "json"]
+    assert "hello" not in cmd                    # 消息走 stdin，不进 argv
+
+    cmd2 = crc._prepare_cli_command("second")
+    assert crc._cli_flag_value(cmd2, "--session-id") == sid   # 续接同一会话
+
+
+def test_prepare_pi_command_strips_continue_and_adds_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi -c --session-id {session_id}")
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
+
+    cmd = crc._prepare_cli_command("hello")
+    assert "-c" not in cmd and "--continue" not in cmd   # 续接只靠 --session-id
+    assert "--mode" in cmd and crc._cli_flag_value(cmd, "--mode") == "json"
+    assert "hello" not in cmd                            # 消息走 stdin
+
+
+def test_prepare_pi_command_generates_session_when_override_lacks_placeholder(monkeypatch, tmp_path):
+    # 操作员覆盖 cli_cmd 且没带 --session-id 占位符 + fresh home(sid 空)：pi 分支须
+    # 现场生成 resident 自有 bounded sid 并持久化，否则每轮新会话、续接永久丢失。
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json -t bash")
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
+
+    cmd = crc._prepare_cli_command("hello")
+    sid = crc._cli_flag_value(cmd, "--session-id")
+    assert sid                                    # 现场生成注入
+    assert sid == crc._load_agent_session_id()    # 已持久化
+    cmd2 = crc._prepare_cli_command("second")
+    assert crc._cli_flag_value(cmd2, "--session-id") == sid   # 续接同一会话
+
+
+def test_prepare_cli_injects_pi_image_refs(monkeypatch, tmp_path):
+    # pi reads @<path> positional args as NATIVE vision (file-processor sniffs the
+    # mime and feeds real ImageContent); the managed pi template has no image slot,
+    # so the resident must attach decrypted images as @refs — else the model only
+    # ever sees a text file-path it can't visually process.
+    img1 = str(tmp_path / "a.jpg")
+    img2 = str(tmp_path / "b.jpg")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD",
+        "pi --mode json -t bash --session-id {session_id}")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sid-1")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("look", image_paths=[img1, img2])
+    assert f"@{img1}" in cmd and f"@{img2}" in cmd
+    # @refs append to the END of argv (message rides STDIN, not argv)
+    assert cmd[-2:] == [f"@{img1}", f"@{img2}"]
+    assert "look" not in cmd                              # message via stdin
+    assert "Decrypted image file(s)" not in " ".join(cmd)
+
+
+def test_prepare_cli_pi_image_ref_appends_and_message_via_stdin(monkeypatch, tmp_path):
+    img = str(tmp_path / "a.jpg")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD", "pi --mode json --session-id {session_id}")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sid-1")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("hello there", image_paths=[img])
+    # @ref is the trailing positional; the message is NOT in argv (goes via stdin)
+    assert cmd[-1] == f"@{img}"
+    assert "hello there" not in cmd
+
+
+def test_prepare_cli_pi_respects_operator_image_slot(monkeypatch, tmp_path):
+    # An operator template that already carries {image_path} owns image handling;
+    # the resident must not double-inject @refs on top of it.
+    img = str(tmp_path / "a.jpg")
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD",
+        "pi --mode json --session-id {session_id} {image_path} {message}")
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sid-1")
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+
+    cmd = crc._prepare_cli_command("look", image_paths=[img])
+    assert img in cmd                 # template's own slot filled with the path
+    assert f"@{img}" not in cmd       # no @-injection on top
+
+
+def test_call_agent_cli_pi_feeds_message_via_stdin_not_argv(monkeypatch, tmp_path):
+    # THE robustness fix: a user message starting with @ / - / -- must never reach
+    # pi's argv (pi arg-parses every positional → would eat it as a file ref / flag
+    # and drop or break the turn). It rides STDIN instead.
+    raw = _pi_stream_lines(
+        _PI_HEADER,
+        {"type": "message_end", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "ok"}]}},
+    )
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["input"] = kwargs.get("input")
+        return subprocess.CompletedProcess(cmd, 0, stdout=raw, stderr="")
+
+    monkeypatch.setattr(crc, "AGENT_CLI_CMD",
+        "pi --mode json -t bash --session-id {session_id}")   # managed default: no {message}
+    monkeypatch.setattr(crc, "AGENT_SESSION_FILE_TEMPLATE", str(tmp_path / "sess-{user_id}.txt"))
+    monkeypatch.setattr(crc, "_resolve_cli_executable", lambda cmd: cmd)
+    monkeypatch.setattr(crc.subprocess, "run", fake_run)
+    crc._agent_session_id_cache.clear(); crc._agent_session_meta_cache.clear()
+
+    msg = "@someone -look at this"
+    out = crc.call_agent_cli(msg)
+    assert out == "ok"                              # reply parsed fine
+    assert captured["input"] == msg                 # message fed via stdin
+    assert msg not in captured["cmd"]               # NEVER in argv
+    assert not any(t.startswith("@") for t in captured["cmd"])  # no @ from the message
+
+
 def test_agent_turn_skips_codex_reasoning_event_as_non_final():
     """Defense in depth: even if a raw codex reasoning event reaches the generic
     extractor, it must not be emitted as a chat bubble."""
@@ -4364,7 +4673,7 @@ def test_openai_http_tool_only_response_preserved(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_abc"})
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_save_agent_session_id", lambda sid: None)
-    monkeypatch.setattr(crc.httpx, "post", lambda *a, **kw: _Resp())
+    monkeypatch.setattr(crc._HTTP, "post", lambda *a, **kw: _Resp())
 
     result = crc.call_agent_http("hi")
     turn = crc._agent_turn_from_raw(result)
@@ -4488,7 +4797,7 @@ def test_load_whoami_caches_archive_language(monkeypatch):
             }
 
     monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "", "user_pk": None, "enclave_pk": None, "archive_language": ""})
-    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+    monkeypatch.setattr(crc._HTTP, "get", lambda *a, **kw: _Resp())
 
     assert crc._load_whoami() is True
     assert crc._whoami_cache["archive_language"] == "en"
@@ -4507,7 +4816,7 @@ def test_load_whoami_defaults_archive_language_to_empty_when_absent(monkeypatch)
             }
 
     monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "", "user_pk": None, "enclave_pk": None, "archive_language": "stale"})
-    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+    monkeypatch.setattr(crc._HTTP, "get", lambda *a, **kw: _Resp())
 
     assert crc._load_whoami() is True
     assert crc._whoami_cache["archive_language"] == ""
@@ -4656,7 +4965,7 @@ def test_foreground_message_prepends_recent_transcript(monkeypatch):
         {"role": "agent", "content": "晴，十八度", "ts": now - 118},
         {"role": "user", "content": "那要穿外套吗", "ts": now},  # current turn
     ]
-    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: list(hist))
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20, include_image_body=True: list(hist))
 
     out = crc._foreground_agent_message("那要穿外套吗", current_ts=now)
 
@@ -4683,7 +4992,7 @@ def test_foreground_transcript_default_keeps_50_prior_messages(monkeypatch):
         }
         for i in range(1, 61)
     ] + [{"role": "user", "content": "当前这句", "ts": now}]
-    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: list(hist))
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20, include_image_body=True: list(hist))
 
     out = crc._foreground_agent_message("当前这句", current_ts=now)
 
@@ -4695,7 +5004,7 @@ def test_foreground_transcript_default_keeps_50_prior_messages(monkeypatch):
 def test_foreground_message_no_decrypt_source_returns_plain_content(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_CLI_CMD", _CODEX_CLI)
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
-    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20: None)
+    monkeypatch.setattr(crc, "get_decrypted_history", lambda since, limit=20, include_image_body=True: None)
     assert crc._foreground_agent_message("你好", current_ts=time.time()) == "你好"
 
 
@@ -4706,7 +5015,7 @@ def test_foreground_message_first_turn_has_no_prior_returns_plain(monkeypatch):
     # history holds only the current message — nothing strictly older
     monkeypatch.setattr(
         crc, "get_decrypted_history",
-        lambda since, limit=20: [{"role": "user", "content": "第一句", "ts": now}],
+        lambda since, limit=20, include_image_body=True: [{"role": "user", "content": "第一句", "ts": now}],
     )
     assert crc._foreground_agent_message("第一句", current_ts=now) == "第一句"
 
@@ -4716,7 +5025,7 @@ def test_foreground_message_skipped_for_pi_returns_plain(monkeypatch):
     monkeypatch.setattr(crc, "FOREGROUND_CHAT_CONTEXT_MODE", "auto")
     monkeypatch.setattr(
         crc, "get_decrypted_history",
-        lambda since, limit=20: [{"role": "user", "content": "早", "ts": 1.0}],
+        lambda since, limit=20, include_image_body=True: [{"role": "user", "content": "早", "ts": 1.0}],
     )
     assert crc._foreground_agent_message("hi", current_ts=9.0) == "hi"
 

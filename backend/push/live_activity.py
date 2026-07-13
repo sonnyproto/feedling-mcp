@@ -165,10 +165,16 @@ def push_live_activity_end_inner(store: UserStore, payload: dict | None = None) 
     return result
 
 
-def push_live_start_dict(store: UserStore, payload: dict, *, end_existing: bool = False) -> dict:
+def push_live_start_dict(
+    store: UserStore,
+    payload: dict,
+    *,
+    end_existing: bool = False,
+    allow_existing_restart: bool = False,
+) -> dict:
     existing_live_entry = push_tokens._select_token(store, push_tokens._is_live_activity_token, active_only=True)
     update_result = None
-    if existing_live_entry and not payload.get("force_start"):
+    if existing_live_entry and not (allow_existing_restart or payload.get("force_start")):
         update_result = push_live_activity_dict(store, payload)
         update_result["mode"] = "update_existing"
         update_result["start_reason"] = "active_live_activity_token_present"
@@ -262,7 +268,7 @@ def push_live_activity_hybrid_dict(store: UserStore, payload: dict) -> dict:
     both worlds."""
     should_start, start_reason = store.should_start_live_activity()
     if should_start and push_tokens._select_token(store, push_tokens._is_push_to_start_token, active_only=True):
-        start_body = push_live_start_dict(store, payload, end_existing=True)
+        start_body = push_live_start_dict(store, payload, end_existing=True, allow_existing_restart=True)
         if start_body.get("status") == "delivered":
             start_body["mode"] = "start"
             start_body["start_reason"] = start_reason

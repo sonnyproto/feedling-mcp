@@ -169,83 +169,204 @@ def test_tick_enqueues_introduction_after_spawn(monkeypatch):
     assert enqueued[0][2]["enclave_url"] is not None
 
 
+class _IntroStore:
+    """Fake store for the introduction enqueue path. Tracks the card-independent
+    ``introduced_at`` marker (identity-card-never-gates, 2026-07)."""
+
+    user_id = "u_1"
+
+    def __init__(self, activated=False):
+        self.jobs = []
+        self.activated = activated
+        self._introduced_at = ""
+
+    def proactive_activation_ready(self):
+        return self.activated
+
+    def introduction_done(self):
+        return bool(self._introduced_at)
+
+    def mark_introduced(self, *, at_iso=None):
+        if not self._introduced_at:
+            self._introduced_at = at_iso or "2026-07-12T00:00:00"
+        return {"introduced_at": self._introduced_at}
+
+    def claim_and_enqueue_introduction(self, job):
+        # Models the single-transaction contract of
+        # core.store.UserStore.claim_and_enqueue_introduction: won -> marker set
+        # + job stored + returns job; lost -> None, marker unchanged.
+        if self._introduced_at:
+            return None
+        self._introduced_at = "2026-07-12T00:00:00"
+        self.jobs.append(job)
+        return job
+
+    def list_proactive_jobs(self, since_epoch=0, limit=0):
+        return list(self.jobs)
+
+    def append_proactive_job(self, job):
+        self.jobs.append(job)
+        return job
+
+
+def _enqueue_intro(store, *, now):
+    return supervisor_mod._enqueue_introduction_job_if_needed(
+        "u_1",
+        {"api_key": "k"},
+        api_url="http://backend",
+        enclave_url="https://enclave",
+        now=now,
+        get_store_fn=lambda _uid: store,
+    )
+
+
 def test_enqueue_introduction_job_when_profile_fields_empty(monkeypatch):
-    class IntroStore:
-        user_id = "u_1"
-
-        def __init__(self):
-            self.jobs = []
-            self.activated = False
-
-        def proactive_activation_ready(self):
-            return self.activated
-
-        def list_proactive_jobs(self, since_epoch=0, limit=0):
-            return list(self.jobs)
-
-        def append_proactive_job(self, job):
-            self.jobs.append(job)
-            return job
-
-    store = IntroStore()
+    store = _IntroStore(activated=False)
     monkeypatch.setattr(
         supervisor_mod,
         "_fetch_identity_plain_for_intro",
         lambda entry, **kwargs: ({"decrypt_status": "ok", "self_introduction": "", "signature": []}, ""),
     )
 
-    pending = supervisor_mod._enqueue_introduction_job_if_needed(
-        "u_1",
-        {"api_key": "k"},
-        api_url="http://backend",
-        enclave_url="https://enclave",
-        now=lambda: T0 - 1,
-        get_store_fn=lambda _uid: store,
-    )
-    store.activated = True
-    job = supervisor_mod._enqueue_introduction_job_if_needed(
-        "u_1",
-        {"api_key": "k"},
-        api_url="http://backend",
-        enclave_url="https://enclave",
-        now=lambda: T0,
-        get_store_fn=lambda _uid: store,
-    )
-    duplicate = supervisor_mod._enqueue_introduction_job_if_needed(
-        "u_1",
-        {"api_key": "k"},
-        api_url="http://backend",
-        enclave_url="https://enclave",
-        now=lambda: T0 + 1,
-        get_store_fn=lambda _uid: store,
-    )
-
+    # Not activated -> gated on the unified signal, nothing enqueued or marked.
+    pending = _enqueue_intro(store, now=lambda: T0 - 1)
     assert pending is None
+    assert store.jobs == []
+    assert store.introduction_done() is False
+
+    store.activated = True
+    job = _enqueue_intro(store, now=lambda: T0)
+    duplicate = _enqueue_intro(store, now=lambda: T0 + 1)
+
     assert store.jobs == [job]
     assert job["job_kind"] == "introduction"
     assert job["trigger"] == "post_spawn_genesis"
     assert job["source"] == "agent_initiated_proactive"
     assert job["status"] == "pending"
+    # Marked at enqueue -> the duplicate short-circuits on introduction_done.
+    assert store.introduction_done() is True
     assert duplicate is None
     assert len(store.jobs) == 1
 
 
-def test_enqueue_introduction_skips_existing_profile(monkeypatch):
+def test_enqueue_introduction_no_card_still_introduces_once(monkeypatch):
+    # The core new behavior: a user with NO identity card (identity_not_found)
+    # still gets exactly one introduction — the card is no longer a precondition.
+    store = _IntroStore(activated=True)
     monkeypatch.setattr(
         supervisor_mod,
         "_fetch_identity_plain_for_intro",
-        lambda entry, **kwargs: ({"decrypt_status": "ok", "self_introduction": "I am here.", "signature": []}, ""),
+        lambda entry, **kwargs: (None, "identity_not_found"),
     )
 
-    job = supervisor_mod._enqueue_introduction_job_if_needed(
-        "u_1",
-        {"api_key": "k"},
-        api_url="http://backend",
-        enclave_url="https://enclave",
-        get_store_fn=lambda _uid: (_ for _ in ()).throw(AssertionError("store should not be read")),
+    job = _enqueue_intro(store, now=lambda: T0)
+    duplicate = _enqueue_intro(store, now=lambda: T0 + 1)
+
+    assert job is not None
+    assert job["job_kind"] == "introduction"
+    assert store.introduction_done() is True
+    assert duplicate is None
+    assert len(store.jobs) == 1
+
+
+def test_enqueue_introduction_defers_on_transient_fetch_failure(monkeypatch):
+    # identity is None but the reason is a TRANSIENT enclave/HTTP failure, NOT a
+    # genuine no-card. Must defer (no job, no marker) so a later spawn can read a
+    # real profile — never permanently mis-intro on a one-off hiccup.
+    store = _IntroStore(activated=True)
+    fetch_result = {"value": (None, "identity_fetch_failed:ReadTimeout")}
+    monkeypatch.setattr(
+        supervisor_mod,
+        "_fetch_identity_plain_for_intro",
+        lambda entry, **kwargs: fetch_result["value"],
     )
 
+    deferred = _enqueue_intro(store, now=lambda: T0)
+    assert deferred is None
+    assert store.jobs == []
+    assert store.introduction_done() is False
+
+    # enclave recovers, card genuinely absent -> now proceed to intro.
+    fetch_result["value"] = (None, "identity_not_found")
+    job = _enqueue_intro(store, now=lambda: T0 + 1)
+    assert job is not None
+    assert store.introduction_done() is True
+    assert len(store.jobs) == 1
+
+
+def test_enqueue_introduction_defers_on_config_failure(monkeypatch):
+    # enclave_url_missing / auth_missing are config failures, also deferred.
+    store = _IntroStore(activated=True)
+    monkeypatch.setattr(
+        supervisor_mod,
+        "_fetch_identity_plain_for_intro",
+        lambda entry, **kwargs: (None, "enclave_url_missing"),
+    )
+    assert _enqueue_intro(store, now=lambda: T0) is None
+    assert store.jobs == []
+    assert store.introduction_done() is False
+
+
+def test_enqueue_introduction_defers_on_transient_decrypt_failure(monkeypatch):
+    # A decrypt failure is transient — it must NOT be marked introduced (that
+    # would suppress a real intro forever). It retries once the card decrypts.
+    store = _IntroStore(activated=True)
+    fetch_result = {"value": ({"decrypt_status": "failed"}, "")}
+    monkeypatch.setattr(
+        supervisor_mod,
+        "_fetch_identity_plain_for_intro",
+        lambda entry, **kwargs: fetch_result["value"],
+    )
+
+    deferred = _enqueue_intro(store, now=lambda: T0)
+    assert deferred is None
+    assert store.jobs == []
+    assert store.introduction_done() is False
+
+    # Card now decrypts with empty profile -> enqueue proceeds.
+    fetch_result["value"] = ({"decrypt_status": "ok", "self_introduction": "", "signature": []}, "")
+    job = _enqueue_intro(store, now=lambda: T0 + 1)
+    assert job is not None
+    assert store.introduction_done() is True
+    assert len(store.jobs) == 1
+
+
+def test_enqueue_introduction_skips_existing_profile(monkeypatch):
+    # A legacy card that already carries a self_introduction: no new job, but the
+    # durable marker IS recorded so future spawns skip without an enclave fetch.
+    store = _IntroStore(activated=True)
+    fetch_calls = {"n": 0}
+
+    def _fetch(entry, **kwargs):
+        fetch_calls["n"] += 1
+        return ({"decrypt_status": "ok", "self_introduction": "I am here.", "signature": []}, "")
+
+    monkeypatch.setattr(supervisor_mod, "_fetch_identity_plain_for_intro", _fetch)
+
+    job = _enqueue_intro(store, now=lambda: T0)
     assert job is None
+    assert store.jobs == []
+    assert store.introduction_done() is True
+    assert fetch_calls["n"] == 1
+
+    # Second spawn: short-circuits on introduction_done, no further enclave read.
+    again = _enqueue_intro(store, now=lambda: T0 + 1)
+    assert again is None
+    assert fetch_calls["n"] == 1
+
+
+def test_enqueue_introduction_not_ready_never_fetches_identity(monkeypatch):
+    # Store read happens first now; an un-activated user must not trigger an
+    # enclave identity fetch at all.
+    store = _IntroStore(activated=False)
+
+    def _fetch(entry, **kwargs):
+        raise AssertionError("identity should not be fetched before activation")
+
+    monkeypatch.setattr(supervisor_mod, "_fetch_identity_plain_for_intro", _fetch)
+
+    assert _enqueue_intro(store, now=lambda: T0) is None
+    assert store.introduction_done() is False
 
 
 def test_tick_is_idempotent_for_live_children():
@@ -283,7 +404,7 @@ def test_dead_child_is_reaped_and_respawned():
 
 
 def test_tick_reaps_child_no_longer_in_roster():
-    # The live roster is re-derived each tick (autodiscover / gateway toggles), so a
+    # The live roster is re-derived each tick (autodiscover toggles), so a
     # user who gets disabled drops out. Their consumer must be killed + lease
     # released this tick, not left orphaned until lease expiry.
     procs = FakeProcTable()
@@ -300,8 +421,8 @@ def test_tick_reaps_child_no_longer_in_roster():
 
 def test_tick_respawns_alive_child_when_config_changes():
     # Per-tick re-derivation can change a live user's driver/provider/model (e.g.
-    # autodiscover flips them, or native→gateway). The running consumer's env/home
-    # is then stale → it must be restarted, not just heartbeated.
+    # autodiscover flips them). The running consumer's env/home is then stale →
+    # it must be restarted, not just heartbeated.
     procs = FakeProcTable()
     sup = _sup(procs)
     sup.tick([{"user_id": "u_1", "api_key": "k", "driver": "claude", "provider": "anthropic"}])
@@ -380,17 +501,20 @@ def test_respawn_releases_inflight_claim_after_kill_before_spawn(monkeypatch):
     assert events.index("release") < events.index("notify:chat"), events
 
 
-def test_tick_gateway_upstream_key_rotation_does_not_respawn_consumer():
-    # For a gateway user the upstream provider_key goes to LiteLLM, NOT the consumer
-    # env — rotating it must not bounce the (heavy) consumer process.
+def test_tick_provider_key_rotation_respawns_consumer():
+    # LiteLLM gateway retired: the real upstream provider_key now reaches the
+    # consumer directly (no more LiteLLM-only indirection excluded from
+    # _spawn_identity) — rotating it must bounce the consumer so it picks up
+    # the new key.
+    _roster("u_1")  # seed the users row so acquire's FK is satisfied
     procs = FakeProcTable()
     sup = _sup(procs)
-    e = {"user_id": "u_1", "api_key": "k", "driver": "codex", "provider": "gemini",
-         "model": "gw-u_1", "provider_key": "k1"}
+    e = {"user_id": "u_1", "api_key": "k", "driver": "codex", "provider": "openai",
+         "provider_key": "k1"}
     sup.tick([dict(e)])
     sup.tick([{**e, "provider_key": "rotated"}])
-    assert procs.killed == []
-    assert len(procs.spawned) == 1
+    assert len(procs.killed) == 1
+    assert len(procs.spawned) == 2
 
 
 def test_heartbeat_advances_lease_expiry():
@@ -618,85 +742,15 @@ def test_no_token_writer_is_a_noop():
     assert procs.spawned == [({"user_id": "u1", "api_key": "key-u1"}, "u1", "/agent-data/users/u1")]
 
 
-# ---- codex gateway wiring (LiteLLM) ----
-
-
-def test_gateway_entries_selects_only_codex_gateway_users():
-    roster = [
-        {"user_id": "a", "driver": "claude", "provider": "anthropic", "provider_key": "ka"},
-        {"user_id": "b", "driver": "codex", "provider": "openai", "provider_key": "kb"},   # native
-        {"user_id": "c", "driver": "codex", "provider": "openai_compatible", "model": "g",
-         "base_url": "https://my.host/v1", "provider_key": "kc"},
-    ]
-    gw = supervisor_mod._gateway_entries(roster)
-    assert [e["user_id"] for e in gw] == ["c"]
-    assert gw[0]["provider"] == "openai_compatible"
-    assert gw[0]["model"] == "g"
-    assert gw[0]["base_url"] == "https://my.host/v1"  # custom endpoint → LiteLLM api_base
-    assert gw[0]["provider_key"] == "kc"  # upstream key carried for LiteLLM env
-
-
-def test_gateway_entries_carry_supports_responses_for_bridge_choice():
-    # supports_responses must reach the gateway entry so build_config can pick
-    # native passthrough (relay has /responses) vs the chat-completions bridge.
-    roster = [
-        {"user_id": "native", "driver": "codex", "provider": "openai_compatible",
-         "model": "gpt-5.4", "base_url": "https://a/v1", "provider_key": "k",
-         "supports_responses": True},
-        {"user_id": "bridge", "driver": "codex", "provider": "openai_compatible",
-         "model": "m", "base_url": "https://b/v1", "provider_key": "k"},  # absent → False
-    ]
-    gw = {e["user_id"]: e for e in supervisor_mod._gateway_entries(roster)}
-    assert gw["native"]["supports_responses"] is True
-    assert gw["bridge"]["supports_responses"] is False
-
-
-def test_gateway_entries_carry_reasoning_effort_for_whitelist_rollout():
-    roster = [
-        {"user_id": "openrouter_user", "driver": "codex", "provider": "openrouter",
-         "model": "anthropic/claude-sonnet-4.6", "provider_key": "k",
-         "reasoning_effort": "medium"},
-    ]
-    gw = supervisor_mod._gateway_entries(roster)
-    assert gw[0]["reasoning_effort"] == "medium"
-
-
-def test_drop_gateway_users_filters_when_gateway_disabled():
-    # With the gateway off, codex-gateway users must NOT be spawned (no proxy to
-    # reach) — they're dropped so enabling hosted for them stays inert, not broken.
-    roster = [
-        {"user_id": "a", "driver": "claude", "provider": "anthropic"},
-        {"user_id": "b", "driver": "codex", "provider": "openai"},          # native — kept
-        {"user_id": "c", "driver": "codex", "provider": "gemini", "model": "g"},  # gateway — dropped
-    ]
-    kept = supervisor_mod._drop_gateway_users(roster)
-    assert [e["user_id"] for e in kept] == ["a", "b"]
-
-
-def test_effective_roster_autodiscover_off_gateway_off_drops_gateway_users():
-    base = [
-        {"user_id": "a", "driver": "claude", "provider": "anthropic", "api_key": "k"},
-        {"user_id": "c", "driver": "codex", "provider": "gemini", "model": "g", "api_key": "k", "provider_key": "pk"},
-    ]
-    roster, gateways = supervisor_mod._effective_roster(base, autodiscover=False, gateway_enabled=False)
-    assert [e["user_id"] for e in roster] == ["a"]   # gemini gateway user dropped
-    assert gateways == []
-
-
-def test_effective_roster_gateway_on_wires_models():
-    base = [{"user_id": "c", "driver": "codex", "provider": "gemini",
-             "model": "gemini-2.0-flash", "api_key": "k", "provider_key": "pk"}]
-    roster, gateways = supervisor_mod._effective_roster(base, autodiscover=False, gateway_enabled=True)
-    assert {e["user_id"]: e["model"] for e in roster} == {"c": "gw-c"}   # codex requests gw-id
-    assert gateways and gateways[0]["model"] == "gemini-2.0-flash"        # real model → LiteLLM
+# ---- _effective_roster (LiteLLM gateway retired: no gateway filtering left) ----
 
 
 def test_effective_roster_autodiscover_intersects_enabled(monkeypatch):
     base = [{"user_id": "a", "api_key": "k1"}, {"user_id": "b", "api_key": "k2"}]
     monkeypatch.setattr(supervisor_mod, "_discover_enabled",
-                        lambda include_gateway: {"a": {"driver": "claude", "provider": "anthropic",
-                                                       "model": "x", "base_url": ""}})
-    roster, gateways = supervisor_mod._effective_roster(base, autodiscover=True, gateway_enabled=False)
+                        lambda: {"a": {"driver": "claude", "provider": "anthropic",
+                                      "model": "x", "base_url": ""}})
+    roster = supervisor_mod._effective_roster(base, autodiscover=True)
     assert [e["user_id"] for e in roster] == ["a"]   # b not backend-enabled → excluded
     assert roster[0]["driver"] == "claude"
 
@@ -704,37 +758,23 @@ def test_effective_roster_autodiscover_intersects_enabled(monkeypatch):
 def test_effective_roster_empty_is_tolerated_not_fatal(monkeypatch):
     # A live agent-runner must idle (not exit/crashloop) when no user is enabled yet
     # — discovery returns nothing → empty effective roster, no exception.
-    monkeypatch.setattr(supervisor_mod, "_discover_enabled", lambda include_gateway: {})
-    roster, gateways = supervisor_mod._effective_roster([], autodiscover=True, gateway_enabled=False)
-    assert roster == [] and gateways == []
+    monkeypatch.setattr(supervisor_mod, "_discover_enabled", lambda: {})
+    roster = supervisor_mod._effective_roster([], autodiscover=True)
+    assert roster == []
 
 
-def test_wire_gateway_models_swaps_requested_model_to_gw_id():
-    roster = [
-        {"user_id": "c", "driver": "codex", "provider": "gemini", "model": "gemini-2.0-flash", "provider_key": "kc"},
-        {"user_id": "b", "driver": "codex", "provider": "openai", "model": "gpt-4o", "provider_key": "kb"},
+def test_effective_roster_no_autodiscover_passes_base_roster_through():
+    # LiteLLM gateway retired: with autodiscover off, every fit-provider entry
+    # (including codex against gemini/openrouter/openai_compatible) passes through
+    # as-is — no gateway filtering or requested-model rewrite.
+    base = [
+        {"user_id": "a", "driver": "claude", "provider": "anthropic", "api_key": "k"},
+        {"user_id": "c", "driver": "codex", "provider": "gemini", "model": "gemini-2.0-flash",
+         "api_key": "k", "provider_key": "pk"},
     ]
-    wired, gateways = supervisor_mod._wire_gateway_models(roster)
-    by = {e["user_id"]: e for e in wired}
-    # the gateway user's codex now REQUESTS the gw-<uid> model (LiteLLM maps it)
-    assert by["c"]["model"] == "gw-c"
-    # native openai user's model is untouched
-    assert by["b"]["model"] == "gpt-4o"
-    # but the LiteLLM routing keeps the user's REAL upstream model
-    assert gateways[0]["user_id"] == "c"
-    assert gateways[0]["model"] == "gemini-2.0-flash"
-    # the wired gateway entry also keeps the real model in identity_model so the
-    # identity-honesty prompt names it, not the gw-<uid> alias (Codex P2)
-    assert by["c"]["identity_model"] == "gemini-2.0-flash"
-    # native openai user is untouched — no identity_model rewrite
-    assert "identity_model" not in by["b"]
-
-
-def test_wire_gateway_models_noop_without_gateway_users():
-    roster = [{"user_id": "b", "driver": "codex", "provider": "openai", "model": "gpt-4o"}]
-    wired, gateways = supervisor_mod._wire_gateway_models(roster)
-    assert gateways == []
-    assert wired == roster
+    roster = supervisor_mod._effective_roster(base, autodiscover=False)
+    assert [e["user_id"] for e in roster] == ["a", "c"]
+    assert {e["user_id"]: e.get("model") for e in roster}["c"] == "gemini-2.0-flash"
 
 
 def test_resolve_roster_prefers_existing_secret_over_self_fetch(monkeypatch):
@@ -835,8 +875,8 @@ def test_effective_roster_host_all_uses_discovered_entries():
     # roster (no api_key roster needed); base_roster only overrides by user_id.
     discovered = [{"user_id": "u1", "driver": "claude", "provider": "anthropic",
                    "model": "m", "base_url": "", "provider_key": "sk"}]
-    roster, gateways = supervisor_mod._effective_roster(
-        [], autodiscover=False, gateway_enabled=False, host_all_discovered=discovered)
+    roster = supervisor_mod._effective_roster(
+        [], autodiscover=False, host_all_discovered=discovered)
     assert [e["user_id"] for e in roster] == ["u1"]
     assert roster[0]["provider_key"] == "sk" and "api_key" not in roster[0]
 
@@ -846,25 +886,31 @@ def test_effective_roster_host_all_base_roster_overrides_by_user_id():
     # same user — lets an operator pin a specific credential locally.
     discovered = [{"user_id": "u1", "driver": "claude", "provider": "anthropic", "provider_key": "sk-disc"}]
     base = [{"user_id": "u1", "api_key": "k", "driver": "claude", "provider": "anthropic", "provider_key": "sk-dev"}]
-    roster, _ = supervisor_mod._effective_roster(
-        base, autodiscover=False, gateway_enabled=False, host_all_discovered=discovered)
+    roster = supervisor_mod._effective_roster(
+        base, autodiscover=False, host_all_discovered=discovered)
     assert len(roster) == 1 and roster[0]["provider_key"] == "sk-dev"
 
 
-# ---- P1: _discover_enabled threads include_gateway to DB (host_all removed) ----
+# ---- _discover_enabled calls db.list_agent_runtime_enabled_users with no args
+# (LiteLLM gateway retired — discovery is unconditional, no include_gateway/
+# include_pi flags to thread through) ----
 
 
-def test_discover_enabled_threads_include_gateway_to_db(monkeypatch):
-    # host_all parameter removed; _discover_enabled now only passes include_gateway
-    captured = {}
+def test_discover_enabled_no_include_gateway_param():
+    import inspect
+    assert "include_gateway" not in inspect.signature(supervisor_mod._discover_enabled).parameters
 
-    def fake_list(include_gateway=False):
-        captured["include_gateway"] = include_gateway
+
+def test_discover_enabled_calls_db_with_no_args(monkeypatch):
+    captured = {"called": False}
+
+    def fake_list():
+        captured["called"] = True
         return []
 
     monkeypatch.setattr(supervisor_mod.db, "list_agent_runtime_enabled_users", fake_list)
-    supervisor_mod._discover_enabled(include_gateway=True)
-    assert captured == {"include_gateway": True}
+    supervisor_mod._discover_enabled()
+    assert captured["called"] is True
 
 
 # ---- Codex P2: preserve a cached provider key across transient credential failures ----
@@ -932,7 +978,7 @@ def test_autoverify_triggers_once_then_marks_done():
 
 
 def test_autoverify_backs_off_after_failure():
-    # A user that can't pass yet (e.g. still at needs_identity) must NOT be re-probed
+    # A user that cannot pass the current bootstrap gate must NOT be re-probed
     # every tick — back off so we don't generate avoidable verify traffic.
     calls = []
     state = {}
@@ -988,11 +1034,16 @@ def test_autoverify_stops_probing_once_it_passes_after_failures():
 
 
 def test_supervisor_heartbeat_payload_shape():
-    """每 tick 写入 server_config 的全局心跳载荷：ts + owner + host_all + gateway。
+    """每 tick 写入 server_config 的全局心跳载荷：ts + owner + host_all + pi。
     backend 的 wedge 守卫据此判断 supervisor 是否在托管。"""
     p = supervisor_mod._supervisor_heartbeat_payload(
-        "host:7", host_all=True, gateway=False, ts=123.5)
-    assert p == {"ts": 123.5, "owner": "host:7", "host_all": True, "gateway": False}
+        "host:7", host_all=True, pi=False, ts=123.5)
+    assert p == {"ts": 123.5, "owner": "host:7", "host_all": True, "pi": False}
+
+
+def test_heartbeat_payload_has_pi_not_gateway():
+    p = supervisor_mod._supervisor_heartbeat_payload("o", host_all=True, pi=True, ts=1.0)
+    assert p["pi"] is True and "gateway" not in p
 
 
 def test_heartbeat_loop_writes_on_cadence_until_stopped(monkeypatch):
@@ -1006,7 +1057,7 @@ def test_heartbeat_loop_writes_on_cadence_until_stopped(monkeypatch):
                         lambda payload: writes.append(payload))
     stop = threading.Event()
     t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
-        owner="host:1", host_all=True, gateway=True, interval=0.01, stop_event=stop))
+        owner="host:1", host_all=True, pi=True, interval=0.01, stop_event=stop))
     t.start()
     time.sleep(0.05)
     stop.set()
@@ -1016,7 +1067,8 @@ def test_heartbeat_loop_writes_on_cadence_until_stopped(monkeypatch):
     assert len(writes) >= 1                   # 持续写心跳（不依赖任何 tick 完成）
     assert writes[0]["owner"] == "host:1"
     assert writes[0]["host_all"] is True
-    assert writes[0]["gateway"] is True
+    assert writes[0]["pi"] is True
+    assert "gateway" not in writes[0]
     assert "ts" in writes[0]
 
 
@@ -1034,7 +1086,7 @@ def test_heartbeat_loop_survives_write_errors(monkeypatch):
     monkeypatch.setattr(supervisor_mod.db, "set_supervisor_heartbeat", flaky)
     stop = threading.Event()
     t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
-        owner="o", host_all=False, gateway=False, interval=0.01, stop_event=stop))
+        owner="o", host_all=False, pi=False, interval=0.01, stop_event=stop))
     t.start()
     time.sleep(0.05)
     stop.set()
@@ -1050,12 +1102,12 @@ def test_heartbeat_loop_survives_write_errors(monkeypatch):
 
 def test_supervisor_instance_payload_shape():
     p = supervisor_mod._supervisor_instance_payload(
-        "host:7", host="host", host_all=True, gateway=False,
+        "host:7", host="host", host_all=True, pi=False,
         active_children=3, max_children=4, shard_index=1, shard_count=2,
         version="abc", ts=123.5)
     assert p == {
         "ts": 123.5, "owner": "host:7", "host": "host", "host_all": True,
-        "gateway": False, "active_children": 3, "max_children": 4,
+        "pi": False, "active_children": 3, "max_children": 4,
         "shard_index": 1, "shard_count": 2, "version": "abc",
     }
 
@@ -1070,9 +1122,9 @@ def test_heartbeat_loop_writes_per_owner_instance_row(monkeypatch):
                         lambda owner, payload: inst_writes.append((owner, payload)))
     stop = threading.Event()
     t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
-        owner="host:1", host_all=True, gateway=True, interval=0.01, stop_event=stop,
+        owner="host:1", host_all=True, pi=True, interval=0.01, stop_event=stop,
         instance_payload_fn=lambda ts: supervisor_mod._supervisor_instance_payload(
-            "host:1", host="host", host_all=True, gateway=True, active_children=2,
+            "host:1", host="host", host_all=True, pi=True, active_children=2,
             max_children=4, shard_index=0, shard_count=1, version=None, ts=ts)))
     t.start()
     time.sleep(0.05)
@@ -1084,7 +1136,7 @@ def test_heartbeat_loop_writes_per_owner_instance_row(monkeypatch):
     owner, payload = inst_writes[0]
     assert owner == "host:1"
     assert payload["active_children"] == 2 and payload["max_children"] == 4
-    assert payload["host_all"] is True and payload["gateway"] is True
+    assert payload["host_all"] is True and "gateway" not in payload
     assert "ts" in payload
 
 
@@ -1102,7 +1154,7 @@ def test_heartbeat_loop_instance_write_error_does_not_kill_loop(monkeypatch):
     monkeypatch.setattr(supervisor_mod.db, "set_supervisor_instance_heartbeat", boom)
     stop = threading.Event()
     t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
-        owner="o", host_all=True, gateway=True, interval=0.01, stop_event=stop,
+        owner="o", host_all=True, pi=True, interval=0.01, stop_event=stop,
         instance_payload_fn=lambda ts: {"owner": "o", "ts": ts}))
     t.start()
     time.sleep(0.05)
@@ -1125,7 +1177,7 @@ def test_heartbeat_loop_prunes_dead_instance_rows(monkeypatch):
                         lambda max_age: prunes.append(max_age))
     stop = threading.Event()
     t = threading.Thread(target=supervisor_mod._heartbeat_loop, kwargs=dict(
-        owner="o", host_all=True, gateway=True, interval=0.01, stop_event=stop,
+        owner="o", host_all=True, pi=True, interval=0.01, stop_event=stop,
         instance_payload_fn=lambda ts: {"owner": "o", "ts": ts},
         prune_max_age_sec=3600.0))
     t.start()
@@ -1190,22 +1242,6 @@ def test_tick_does_not_acquire_beyond_max_children():
 
 # ---- PR B: lease-scoped gateway (owned-children filter) ----
 
-def test_owned_gateway_entries_scopes_to_owned_children_with_fresh_key():
-    # LiteLLM config includes ONLY gateway users this runner owns a child for, and
-    # the key comes from the freshly-resolved entry (so a rotation reaches LiteLLM
-    # without a respawn) — NOT from a stale stored child entry.
-    gw_all = [
-        {"user_id": "u1", "provider": "gemini", "model": "gemini-pro", "base_url": "", "provider_key": "fresh-u1"},
-        {"user_id": "u2", "provider": "openrouter", "model": "x", "base_url": "", "provider_key": "fresh-u2"},
-    ]
-    children = {"u1": {"entry": {"user_id": "u1", "provider_key": "stale-u1"}}}
-    owned = supervisor_mod._owned_gateway_entries(gw_all, children)
-    assert len(owned) == 1
-    assert owned[0]["user_id"] == "u1"
-    assert owned[0]["provider_key"] == "fresh-u1"   # fresh roster key, not stale child
-    assert owned[0]["model"] == "gemini-pro"
-
-
 def test_tick_pre_spawn_runs_before_new_consumers_start():
     # The gateway route for a newly-acquired user must be configured BEFORE its
     # consumer process starts, so a queued first turn can't hit a missing route.
@@ -1238,17 +1274,6 @@ def test_tick_pre_spawn_not_called_without_new_acquisitions():
     calls = []
     sup.tick(_roster("u1"), pre_spawn=lambda ids: calls.append(list(ids)))
     assert calls == []                      # u1 already live → nothing acquired
-
-
-def test_owned_gateway_entries_accepts_id_set_snapshot():
-    # main() passes a locked SET snapshot of owned ids (not the live children dict)
-    # to avoid "dict changed size during iteration" vs the renew thread.
-    gw_all = [
-        {"user_id": "u1", "provider": "gemini", "model": "m1", "provider_key": "k1"},
-        {"user_id": "u2", "provider": "openrouter", "model": "m2", "provider_key": "k2"},
-    ]
-    owned = supervisor_mod._owned_gateway_entries(gw_all, {"u2"})
-    assert [g["user_id"] for g in owned] == ["u2"]
 
 
 def test_spawn_identity_changes_when_base_url_changes():

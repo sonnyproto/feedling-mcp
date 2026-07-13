@@ -97,6 +97,14 @@ services:
     # listener); mind the database's max_connections when raising -w.
     command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-w", "2", "-k", "asgi.worker.FeedlingUvicornWorker", "--timeout", "120", "-b", "0.0.0.0:5001", "asgi_app:app"]
     restart: unless-stopped
+    # One fd per live client connection — keep-alive connections now idle for 75s
+    # (backend/gunicorn_conf.py), so online apps park pooled sockets here instead
+    # of reconnecting per request. Docker defaults the soft limit to 1024 and
+    # gunicorn does not raise it on its own.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       # --- BAKED: security-relevant, audited by iOS ---
       FEEDLING_API_KEY: ""
@@ -118,8 +126,7 @@ services:
       FEEDLING_PUBLIC_BASE_URL: "${FEEDLING_PUBLIC_BASE_URL:-}"
       FEEDLING_PUSH_COOLDOWN_SEC: "${FEEDLING_PUSH_COOLDOWN_SEC:-300}"
       FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC: "${FEEDLING_LIVE_ACTIVITY_DEDUPE_SEC:-900}"
-      # --- 托管三件套（缺一即启动失败 fail-fast）---
-      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
+      # --- 托管两件套（缺一即启动失败 fail-fast）---
       FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
     ports:

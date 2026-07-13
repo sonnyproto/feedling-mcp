@@ -127,6 +127,34 @@ def _maybe_mark_first_chat_ok(store: UserStore, reply_to_message_id: str) -> Non
         store.mark_first_chat_ok()
 
 
+def _maybe_enqueue_resident_introduction(store) -> None:
+    """Trigger the resident one-shot greeting on a verified chat loop.
+
+    Called from ``verify_loop`` when a synthetic ping got an agent reply
+    (``chat_loop_verified``). This is what breaks the fresh-resident deadlock:
+    the greeting is enqueued HERE, NOT on ``first_chat_ok_at`` — a brand-new
+    resident user cannot send a real message until the greeting opens Chat, and
+    the verify ping deliberately does not count as their First message.
+
+    ONLY the resident route triggers here (model-API / official-app greetings
+    come from their own paths). The supervisor spawn/autoverify path stays a
+    recovery fallback; BOTH route through the SAME atomic enqueue-once
+    (``store.claim_and_enqueue_introduction``) so a user who later has a real
+    conversation never gets a second introduction. Best-effort: a failed enqueue
+    must never fail the verify response — the DB transaction rolls itself back."""
+    try:
+        from accounts import onboarding as accounts_onboarding
+        from agent_runtime import introduction as agent_introduction
+        if accounts_onboarding._load_onboarding_route(store) != "resident":
+            return
+        agent_introduction.enqueue_introduction_once(store, now=time.time())
+    except Exception as exc:  # noqa: BLE001
+        import logging
+        logging.getLogger("feedling.chat_core").warning(
+            "chat_loop_verified introduction enqueue failed for %s: %s",
+            getattr(store, "user_id", ""), exc)
+
+
 def _plaintext_for_trace(payload: dict, envelope: dict) -> str:
     """Best-effort plaintext for the debug excerpt ONLY. The server never
     decrypts; use a client-provided preview if present, else empty."""
@@ -376,7 +404,7 @@ def trace_response_gated(store: UserStore, payload: dict, allow_verify_reply: bo
     )
 
 
-def gate_response_dict(store: UserStore, allow_verify_reply: bool, is_verify_reply: bool = False):
+def gate_response_dict(store: UserStore, allow_verify_reply: bool):
     """Bridge to the shared bootstrap gate.
 
     ``boot_gates._gate_bootstrap_for_chat`` returns a framework-neutral
@@ -384,12 +412,11 @@ def gate_response_dict(store: UserStore, allow_verify_reply: bool, is_verify_rep
     application context is needed. Looked up on ``boot_gates`` at call time so test
     monkeypatches of ``_gate_bootstrap_for_chat`` are honored.
 
-    ``is_verify_reply`` (the current POST carries source="verify_ping") keeps the
-    hidden liveness probe on the forcing path even after the user has spoken —
-    only genuine user-facing replies bypass the needs_identity gate (A'').
+    Identity Card presence/content is not part of this gate. The remaining VPS
+    checks prove that a resident consumer and live chat loop are available.
     """
     gated = boot_gates._gate_bootstrap_for_chat(
-        store, allow_verify_reply=allow_verify_reply, is_verify_reply=is_verify_reply
+        store, allow_verify_reply=allow_verify_reply
     )
     if gated is None:
         return None
@@ -645,6 +672,7 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
 
     if found_reply:
         boot_gates._log_bootstrap_event(store, "chat_loop_verified", success=True)
+        _maybe_enqueue_resident_introduction(store)
 
     # Cleanup: remove synthetic ping from history regardless of outcome. If a
     # reply landed, also remove the matching agent response. The verify exchange

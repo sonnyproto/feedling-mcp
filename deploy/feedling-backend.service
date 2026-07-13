@@ -8,6 +8,10 @@ User=ubuntu
 WorkingDirectory=/home/ubuntu/feedling-mcp/backend
 EnvironmentFile=/home/ubuntu/feedling.env
 ExecStart=/home/ubuntu/feedling-venv/bin/gunicorn --config gunicorn_conf.py -w 1 -k asgi.worker.FeedlingUvicornWorker --timeout 120 -b 0.0.0.0:5001 asgi_app:app
+# One fd per live client connection — keep-alive connections now idle for 75s
+# (gunicorn_conf.py), so online apps park pooled sockets here instead of
+# reconnecting per request. gunicorn does not raise the limit on its own.
+LimitNOFILE=65536
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

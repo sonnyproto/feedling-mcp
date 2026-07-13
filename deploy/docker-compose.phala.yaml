@@ -159,6 +159,16 @@ services:
     # 1 listener + 1 election), so N×18 must stay under the RDS max_connections.
     command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-k", "asgi.worker.FeedlingUvicornWorker", "--timeout", "120", "-b", "0.0.0.0:5001", "asgi_app:app"]
     restart: unless-stopped
+    # One fd per live client connection. Now that keep-alive connections survive
+    # 75s idle (backend/gunicorn_conf.py) instead of 2s, each online app parks a
+    # few pooled sockets here rather than reconnecting per request — so the
+    # steady-state fd count is (online apps x pool size), not (in-flight requests).
+    # Docker's default soft limit is 1024, which gunicorn does not raise on its
+    # own; the container's hard limit is 524288, so lifting this is free headroom.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       FEEDLING_API_KEY: ""
       FEEDLING_ADMIN_TOKEN: "${FEEDLING_ADMIN_TOKEN:-}"
@@ -184,6 +194,18 @@ services:
       # compose synthesis / build never aborts on an unset var; the backend
       # still fails fast at startup (db.py) if it ends up empty at runtime.
       DATABASE_URL: "${DATABASE_URL:-}"
+      # TEE 明文影子库（feedling-io-db-prod，独立 pg CVM）。best-effort 双写：
+      # db.py 写主库后镜像到这里，tee_shadow.mirror 永不 raise、失败只计数，绝不
+      # 拖垮主路径。两个都为空 = 双写 OFF（mirror.enabled() 需 FEEDLING_TEE_DUAL_WRITE=1
+      # 且 TEE_DATABASE_URL 非空）。DSN 用 app 角色（无 DDL）、sslnegotiation=direct、
+      # sslmode=require（与 test 一致，无 CA 分发故非 verify-full；两端同在 Phala prod9
+      # 内网，连接仍 TLS 加密，日后加 CA 分发再升 verify-full）。与 DATABASE_URL 同为
+      # 加密 env 注入、不烧 compose_hash。
+      # ⚠️ 开启后后台调度器会全量回填（reconcile 明文表 + 经 prod enclave 解密复制
+      # 密文表）——首次回填量大、打 prod enclave，建议先以 FEEDLING_TEE_DUAL_WRITE 空
+      # 部署确认健康，再挑低峰翻开（改 PROD_FEEDLING_TEE_DUAL_WRITE + 重部署）。
+      TEE_DATABASE_URL: "${TEE_DATABASE_URL:-}"
+      FEEDLING_TEE_DUAL_WRITE: "${FEEDLING_TEE_DUAL_WRITE:-}"
       # Cloudflare R2 (S3-compatible) offload for the heavy frame ciphertext
       # (backend/object_storage.py). Injected via `phala deploy -e R2_*=...`
       # (encrypted env channel). Empty default = feature OFF (body_ct stays
@@ -238,17 +260,6 @@ services:
       # background. Validated on test; flip to "false" to revert to the v1
       # one-shot path. Read in worker.genesis_v2_enabled().
       FEEDLING_GENESIS_V2_ENABLED: "true"
-      # Mirrors the agent-runner's FEEDLING_LITELLM_ENABLE (see
-      # docker-compose.agent-runner.yaml). The hosted cutover decision lives in
-      # the backend, so it needs the same flag: gateway-only providers (gemini/
-      # openrouter/openai_compatible) stay on the legacy inline path until the
-      # in-CVM LiteLLM gateway is actually running — otherwise their sends wedge
-      # in `processing` (no consumer is spawned). Keep this in sync with the
-      # Defaults to "true": the cutover boot gate (assert_hosting_ready) refuses
-      # to start the backend without it, even for pure-native fleets. Still
-      # interpolation-driven so a GitHub var can override; unset/empty → true.
-      # Mirror the agent-runner's value.
-      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-true}"
       # Host-all: every configured user is served by the agent-runner. The send
       # routing here must agree with the supervisor's host_all discovery. Defaults
       # to "true": the cutover routes all fit-provider users to agent-runner with
@@ -287,8 +298,8 @@ services:
   # runtime now runs on a DEDICATED runner CVM
   # (deploy/docker-compose.phala.prod.runner.yaml). This CVM runs only ingress +
   # enclave + backend. The backend env above intentionally still mirrors the
-  # runner's FEEDLING_HOST_ALL / FEEDLING_LITELLM_ENABLE / FEEDLING_RUNTIME_TOKEN_
-  # SECRET so the hosted-cutover gate stays satisfied and the runner CVM shares
+  # runner's FEEDLING_HOST_ALL / FEEDLING_RUNTIME_TOKEN_SECRET so the
+  # hosted-cutover gate stays satisfied and the runner CVM shares
   # the same token auth. Scale hosting by adding runner CVMs, not by re-adding
   # this service (that would put key-bearing hosting back on the enclave CVM).
 

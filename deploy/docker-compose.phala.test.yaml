@@ -87,7 +87,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: ghcr.io/teleport-computer/feedling:4588254
+    image: ghcr.io/teleport-computer/feedling:2f03c51
     command: ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -95,6 +95,22 @@ services:
       FEEDLING_DATA_DIR: "/data"
       FEEDLING_ENCLAVE_TLS: "true"
       FEEDLING_FLASK_URL: "http://backend:5001"
+      # Stage-D runtime token secret — lets the enclave verify a caller's runtime
+      # token LOCALLY (core/runtime_token.py) in whoami_live / whoami_cached,
+      # SKIPPING the reentrant backend /v1/users/whoami round-trip. MUST match the
+      # backend's (line ~257) + the runner's secret; CI injects the same
+      # TEST_FEEDLING_RUNTIME_TOKEN_SECRET into all three. Empty = falls back to
+      # the round-trip (old behavior, no regression).
+      #
+      # This line was MISSING on test while prod had it (compose drift), and the
+      # backend already had it here — so only the enclave fell back. Every
+      # envelope/decrypt then hit backend /v1/users/whoami, a path that is
+      # deliberately UNCACHED (auth.py: whoami_live, so a revoked key dies at
+      # once). Measured on test 2026-07-13: 891 whoami in 6.5min (2.2/s, vs 31
+      # chat/poll) saturating the single-worker backend, which was itself blocked
+      # awaiting the very decrypt that triggered them → decrypt p95 19.6s /
+      # max 47.7s → 34s chat replies of which pi was only 3.1s.
+      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       MEMORY_READSIDE_FOR_MODEL_API: "true"
       # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
       # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
@@ -130,7 +146,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:4588254
+    image: ghcr.io/teleport-computer/feedling:2f03c51
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -143,9 +159,22 @@ services:
     # 1 listener + 1 election); test RDS t4g-micro max_connections=79 → N=2 safe.
     command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-k", "asgi.worker.FeedlingUvicornWorker", "--timeout", "120", "-b", "0.0.0.0:5001", "asgi_app:app"]
     restart: unless-stopped
+    # One fd per live client connection. Now that keep-alive connections survive
+    # 75s idle (backend/gunicorn_conf.py) instead of 2s, each online app parks a
+    # few pooled sockets here rather than reconnecting per request — so the
+    # steady-state fd count is (online apps x pool size), not (in-flight requests).
+    # Docker's default soft limit is 1024, which gunicorn does not raise on its
+    # own; the container's hard limit is 524288, so lifting this is free headroom.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       FEEDLING_API_KEY: ""
       FEEDLING_ADMIN_TOKEN: "${FEEDLING_ADMIN_TOKEN:-}"
+      # Password login for the admin data-track page. Inject only through the
+      # encrypted deploy env channel; the legacy admin-token routes stay valid.
+      FEEDLING_ADMIN_PASSWORD: "${FEEDLING_ADMIN_PASSWORD:-}"
       FEEDLING_DATA_DIR: "/data"
       FEEDLING_WS_PORT: "9998"
       # ASGI backend: start the per-worker background services (the :9998 WS
@@ -171,6 +200,15 @@ services:
       # compose synthesis / build never aborts on an unset var; the backend
       # still fails fast at startup (db.py) if it ends up empty at runtime.
       DATABASE_URL: "${DATABASE_URL:-}"
+      # TEE 明文影子库（feedling-io-db-test，独立 pg CVM）。best-effort 双写：
+      # db.py 写主库后镜像到这里，tee_shadow.mirror 永不 raise、失败只计数，绝不
+      # 拖垮主路径。两个都为空 = 双写 OFF（mirror.enabled() 需 FEEDLING_TEE_DUAL_WRITE=1
+      # 且 TEE_DATABASE_URL 非空）。DSN 用 app 角色（无 DDL）、sslnegotiation=direct、
+      # sslmode=require（当前无 CA 分发故非 verify-full；两端同在 Phala prod9 内网，
+      # 连接仍 TLS 加密，日后加 CA 分发再升 verify-full）。与 DATABASE_URL 同为加密
+      # env 注入、不烧 compose_hash。
+      TEE_DATABASE_URL: "${TEE_DATABASE_URL:-}"
+      FEEDLING_TEE_DUAL_WRITE: "${FEEDLING_TEE_DUAL_WRITE:-}"
       # Cloudflare R2 (S3-compatible) offload for the heavy frame ciphertext
       # (backend/object_storage.py). Injected via `phala deploy -e R2_*=...`
       # (encrypted env channel). Empty default = feature OFF (body_ct stays
@@ -222,11 +260,6 @@ services:
       # worker.genesis_combined_map_enabled(). Flip off to revert to the exact old
       # split-map path (hard rollback). On test for real-device quality comparison.
       FEEDLING_GENESIS_COMBINED_MAP: "true"
-      # Mirrors the agent-runner's flag: the hosted cutover decision lives in the
-      # backend, so it needs the same value — gateway-only providers stay legacy
-      # (inline) until the in-CVM LiteLLM gateway is actually on. Encrypted env,
-      # NOT baked into compose_hash; default empty = off.
-      FEEDLING_LITELLM_ENABLE: "${FEEDLING_LITELLM_ENABLE:-}"
       # Host-all: every configured user is served by the agent-runner (the send
       # routing must agree with the supervisor's host_all discovery). Empty = off
       # (per-user flag still required). Mirror the agent-runner's value.

@@ -104,6 +104,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import xml.etree.ElementTree as _ET
 import zipfile
 from pathlib import Path
@@ -392,7 +393,7 @@ AgentErrorNotice = namedtuple("AgentErrorNotice", "error_class blame user_text d
 _ERROR_CLASS_RULES = (
     # 次序即优先级：quota 必须先于 auth/rate（403+「额度」语义是余额不是权限）
     ("quota_insufficient", "user_provider",
-     "你的 API 服务额度不足，充值后再发消息即可恢复。",
+     "模型服务额度不足，充值后再发消息即可恢复。",
      re.compile(r"余额|额度|insufficient_quota|credit balance|requires more credits"
                 r"|payment required|\b402\b|quota", re.I)),
     ("auth_invalid", "user_provider",
@@ -413,7 +414,7 @@ _ERROR_CLASS_RULES = (
      "这次回复被模型的内容策略拦下了，换个说法再试。",
      re.compile(r"content_filter|content policy|safety|blocked by", re.I)),
     ("rate_limited", "provider_transient",
-     "你的 API 服务限流了，稍等几分钟再试。",
+     "模型服务限流了，稍等几分钟再试。",
      re.compile(r"\b429\b|too many requests|rate.?limit", re.I)),
     ("upstream_unavailable", "provider_transient",
      "你的模型服务暂时不可用，稍后会自动恢复。",
@@ -457,9 +458,16 @@ def _system_notice_body(notice: AgentErrorNotice) -> str:
     return f"⚠️ {notice.user_text}\n详情: {notice.detail}"
 
 
-# system 通知去抖：前台必发；后台同 error_class 每 SYSTEM_NOTICE_DEBOUNCE_SEC 一条，
-# 任一成功回合清零（恢复后再坏要重新提醒）。进程内存态即可——respawn 顶多多发一条。
-SYSTEM_NOTICE_DEBOUNCE_SEC = float(os.environ.get("SYSTEM_NOTICE_DEBOUNCE_SEC", "21600"))
+# 聊天流失败横幅节流（Seven 定稿 2026-07-11）：
+# - 后台车道（心跳/主动/capture/dream）一律不进聊天流——用户无法据此行动，天天聊天
+#   的人会被自己根本看不见的后台车道刷屏；可观测性走设置页/admin 腿
+#   （_report_runtime_error）+ debug 日志。
+# - 前台（用户刚发的消息最终没拿到真实回复）才弹，且限流：可行动类
+#   （blame=user_provider，如额度/key/模型名）按 error_class 各一个窗口；瞬时/系统类
+#   合并进同一个 "_transient" 桶——同一波上游抖动打出多个 error_class 也只弹第一条。
+# - 固定窗口（默认 3h），不因成功回合清零——否则上游一抖一恢复（fail→ok→fail）时
+#   每次"恢复后再坏"都重新弹，越抖越刷屏。进程内存态即可——respawn 顶多多发一条。
+FOREGROUND_NOTICE_WINDOW_SEC = float(os.environ.get("FOREGROUND_NOTICE_WINDOW_SEC", "10800"))
 _system_notice_last_sent: dict[str, float] = {}
 # 每进程首个成功回合无条件清一次设置页错误（代价一次 HTTP），覆盖 respawn 前留下的滞留错误：
 # respawn 后新进程从 False 起步则永远不会触发清空，导致用户修好配置后 last_runtime_error 仍滞留。
@@ -492,7 +500,7 @@ def _report_runtime_error(error: str, error_class: str = "") -> bool:
     回合重试清空，否则设置页会一直挂着过期错误直到下次失败或 respawn。"""
     global _runtime_error_reported
     try:
-        resp = httpx.post(
+        resp = _HTTP.post(
             f"{FEEDLING_API_URL}/v1/model_api/runtime_error",
             json={"error": (error or "")[:300], "error_class": (error_class or "")[:64]},
             headers=_HEADERS, timeout=10,
@@ -507,31 +515,37 @@ def _report_runtime_error(error: str, error_class: str = "") -> bool:
 
 
 def _notify_agent_turn_failure(exc: BaseException, *, foreground: bool) -> None:
-    """腿①+②：分类 → 上报设置页 → （前台必发/后台去抖）聊天 system 通知。
+    """腿①+②：分类 → 上报设置页/admin；仅前台失败（限流后）才发聊天 system 横幅。
 
-    永不抛出：通知是回合失败的旁路，绝不能让它把失败变得更糟。"""
+    后台车道失败不进聊天流（Seven 2026-07-11）——观测走 _report_runtime_error
+    + debug 日志。永不抛出：通知是回合失败的旁路，绝不能让它把失败变得更糟。"""
     try:
         notice = classify_agent_error(exc)
         _report_runtime_error(notice.detail, notice.error_class)
-        last = _system_notice_last_sent.get(notice.error_class)
-        if not foreground and last is not None and (time.monotonic() - last) < SYSTEM_NOTICE_DEBOUNCE_SEC:
+        if not foreground:
+            return
+        # 可行动类按 error_class 分桶；瞬时/系统类共享一个桶（同波合并）。
+        key = notice.error_class if notice.blame == "user_provider" else "_transient"
+        last = _system_notice_last_sent.get(key)
+        if last is not None and (time.monotonic() - last) < FOREGROUND_NOTICE_WINDOW_SEC:
             return
         post_reply(
             _system_notice_body(notice),
             role="system", notice_kind="upstream_error", suppress_push=True,
         )
-        _system_notice_last_sent[notice.error_class] = time.monotonic()
+        _system_notice_last_sent[key] = time.monotonic()
     except Exception:
         log.exception("system notice emit failed (non-fatal)")
 
 
 def _note_agent_turn_success() -> None:
-    """成功回合：重置去抖 + 清空设置页错误（仅当本进程报过错，省一次 HTTP）。
+    """成功回合：清空设置页错误（仅当本进程报过错，省一次 HTTP）。
 
+    不再清横幅限流窗口——固定窗口（见 FOREGROUND_NOTICE_WINDOW_SEC）：上游
+    一抖一恢复时若每次成功都清零，每次"恢复后再坏"都会重新弹横幅。
     标记翻转在 _report_runtime_error 内部、且仅在清空真正送达时发生——
     这里不再无条件翻 False（Codex P2：清空 POST 失败会让过期错误滞留且
     永不重试）。清空失败 → 标记保留 → 下个成功回合自动重试。"""
-    _reset_system_notice_state()
     if _runtime_error_reported:
         _report_runtime_error("", "")
 
@@ -547,6 +561,16 @@ IMAGE_PLACEHOLDER = os.environ.get(
     "[The user sent an image in IO Chat. Inspect the attached/local image "
     "before replying. If your current runtime cannot open the image, say "
     "plainly that this connector has not enabled image vision yet.]",
+)
+
+# An oversized body is omitted from the transcript and fetched per-message; when
+# that fetch fails we still know the message exists. Say so — dropping the turn
+# to stay silent would lose it permanently.
+BODY_UNAVAILABLE_PLACEHOLDER = os.environ.get(
+    "BODY_UNAVAILABLE_PLACEHOLDER",
+    "[The user sent a message in IO Chat, but its content could not be "
+    "retrieved this time. Tell the user plainly that their message did not "
+    "come through and ask them to send it again — do not guess what it said.]",
 )
 
 _SCREEN_CONTEXT_TRIGGER_RE = re.compile(
@@ -593,7 +617,7 @@ def _post_debug_trace_event(payload: dict) -> None:
     """Actual network call for a debug-trace event. Runs on a background
     thread (see `_emit_debug_trace`) — never raises, short timeout."""
     try:
-        httpx.post(
+        _HTTP.post(
             f"{FEEDLING_API_URL}/v1/debug/trace/event",
             json=payload,
             headers=_HEADERS, timeout=2,
@@ -629,7 +653,7 @@ def _refresh_debug_trace_enabled() -> None:
     caches False so we don't keep hammering an unhappy backend every turn."""
     enabled = False
     try:
-        resp = httpx.get(
+        resp = _HTTP.get(
             f"{FEEDLING_API_URL}/v1/debug/trace",
             params={"limit": 1},
             headers=_HEADERS, timeout=2,
@@ -983,6 +1007,45 @@ _ENCLAVE_CLIENT: httpx.Client | None = (
     httpx.Client(timeout=20, verify=False) if FEEDLING_ENCLAVE_URL else None
 )
 
+# Pooled client for everything that is NOT the enclave — the backend API and the
+# local agent. httpx's module-level verb helpers build a
+# throwaway Client per call, so a consumer that polls the backend every few
+# seconds for its whole life paid a full TCP+TLS handshake on EVERY request
+# (measured against test-api: 5203ms/req unpooled vs 973ms/req pooled).
+#
+# ``keepalive_expiry`` must stay BELOW the server's keepalive
+# (backend/gunicorn_conf.py = 75s): the side that retires an idle socket first
+# must be us, not the server — reusing a socket the server has already closed is
+# exactly the stale-connection race that keepalive fix was about, and there is no
+# reason to import it into the client.
+# max_connections is httpx's own default (100) spelled out: passing a bare Limits()
+# would silently drop it to None (unbounded). This process serves one user and runs
+# a handful of threads, so the cap is a guardrail, never a queue.
+_HTTP = httpx.Client(
+    timeout=20,
+    limits=httpx.Limits(
+        max_connections=100, max_keepalive_connections=20, keepalive_expiry=60.0
+    ),
+)
+
+
+def _client_for(root: str) -> httpx.Client:
+    """Pick the client by target: the enclave serves a self-signed cert and needs
+    verification off, everything else needs it on. Call sites used to pass
+    ``verify=`` per request, which a pooled Client cannot honour (``verify`` is a
+    client-level setting, not a per-request one).
+
+    The enclave client is built on demand rather than read from the import-time
+    global, so the decision tracks the CURRENT ``FEEDLING_ENCLAVE_URL`` exactly as
+    the old per-request ``verify=`` expression did.
+    """
+    global _ENCLAVE_CLIENT
+    if FEEDLING_ENCLAVE_URL and root.rstrip("/") == FEEDLING_ENCLAVE_URL.rstrip("/"):
+        if _ENCLAVE_CLIENT is None:
+            _ENCLAVE_CLIENT = httpx.Client(timeout=20, verify=False)
+        return _ENCLAVE_CLIENT
+    return _HTTP
+
 _decrypt_sources = (
     f"enclave={FEEDLING_ENCLAVE_URL}" if FEEDLING_ENCLAVE_URL else ""
 ).strip() or "NONE — replies will not work for v1 encrypted messages"
@@ -1204,17 +1267,29 @@ def _filter_since(msgs: list, since: float) -> list:
     return [m for m in msgs if float(m.get("ts", m.get("timestamp", 0)) or 0) > since]
 
 
-def _fetch_from_enclave(since: float, limit: int) -> list[dict] | None:
+def _fetch_from_enclave(
+    since: float, limit: int, include_image_body: bool = True
+) -> list[dict] | None:
     """Direct HTTP to the enclave decrypt proxy.
 
     Returns list (possibly empty) on success, None on error or not configured.
+
+    ``include_image_body=False`` keeps the transcript to a few KB no matter how
+    many photos sit in the window; bodies are then pulled one message at a time
+    through ``_fetch_message_body_from_enclave``. Inlining them here is what let
+    a wedged window grow without bound — five stuck 1.4MB photos serialized to a
+    4.4MB response, the CVM egress truncated it mid-body, and every retry rebuilt
+    the same oversized window.
     """
     if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
         return None
+    params: dict = {"limit": limit, "since": since}
+    if not include_image_body:
+        params["include_image_body"] = "false"
     try:
         resp = _ENCLAVE_CLIENT.get(
             f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
-            params={"limit": limit, "since": since},
+            params=params,
             headers=_HEADERS,
         )
         resp.raise_for_status()
@@ -1249,7 +1324,7 @@ def _verify_decrypt_sources() -> bool:
 
     if FEEDLING_ENCLAVE_URL:
         try:
-            client = _ENCLAVE_CLIENT or httpx
+            client = _client_for(FEEDLING_ENCLAVE_URL)
             resp = client.get(
                 f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
                 params={"limit": 1},
@@ -1268,7 +1343,9 @@ def _verify_decrypt_sources() -> bool:
     return any_ok
 
 
-def get_decrypted_history(since: float, limit: int = 20) -> list[dict] | None:
+def get_decrypted_history(
+    since: float, limit: int = 20, include_image_body: bool = True
+) -> list[dict] | None:
     """Try all configured decrypt sources in priority order.
 
     Returns:
@@ -1277,12 +1354,83 @@ def get_decrypted_history(since: float, limit: int = 20) -> list[dict] | None:
       None  — no source configured, or all configured sources failed.
     """
     if FEEDLING_ENCLAVE_URL:
-        result = _fetch_from_enclave(since, limit)
+        result = _fetch_from_enclave(since, limit, include_image_body=include_image_body)
         if result is not None:
             return result
         log.warning("enclave source failed")
 
     return None  # no configured source succeeded
+
+
+def _fetch_message_body_from_enclave(message_id: str) -> dict | None:
+    """Decrypt ONE message body via the enclave. Returns None on any failure.
+
+    Bounded by construction: a response carries at most one image (the ingest cap
+    is 2MB), so no accumulation of unanswered photos can ever make this request
+    too big to complete.
+    """
+    if not FEEDLING_ENCLAVE_URL or _ENCLAVE_CLIENT is None:
+        return None
+    try:
+        resp = _ENCLAVE_CLIENT.get(
+            f"{FEEDLING_ENCLAVE_URL}/v1/chat/messages/"
+            f"{urllib.parse.quote(str(message_id), safe='')}/body",
+            headers=_HEADERS,
+        )
+        resp.raise_for_status()
+        msg = (resp.json() or {}).get("message")
+        return msg if isinstance(msg, dict) else None
+    except httpx.HTTPStatusError as e:
+        body = (e.response.text or "").strip().replace("\n", " ")[:300]
+        log.warning(
+            "enclave message-body fetch failed [id=%s]: HTTP %d — %s",
+            message_id, e.response.status_code, body or "(empty body)",
+        )
+        return None
+    except Exception as e:
+        log.warning("enclave message-body fetch failed [id=%s]: %s", message_id, e)
+        return None
+
+
+def _hydrate_omitted_bodies(messages: list[dict]) -> list[dict]:
+    """Pull the body for each row whose history entry omitted it.
+
+    Call this AFTER filtering to the ids this cycle actually claimed, so the only
+    bodies fetched are the ones a turn is about to consume.
+
+    A body that fails to arrive leaves its row untouched: the image/file branch
+    then routes its honest "I can't read this" prompt, the turn still replies, and
+    the cursor still advances. That containment is the point — under the old
+    batched window one unfetchable photo stalled the cursor, which guaranteed the
+    next window contained that same photo again.
+    """
+    out: list[dict] = []
+    for m in messages:
+        if not isinstance(m, dict) or not m.get("body_omitted"):
+            out.append(m)
+            continue
+        mid = str(m.get("id") or m.get("message_id") or "").strip()
+        if not mid:
+            out.append(m)
+            continue
+        full = _fetch_message_body_from_enclave(mid)
+        if full is None:
+            log.warning(
+                "message body unavailable [id=%s type=%s] — turn degrades to the "
+                "body-unavailable prompt", mid, m.get("content_type", "text"),
+            )
+            # Mark it. Without this the row is indistinguishable from a message
+            # that has no plaintext at all, and _process_messages would skip it
+            # AND advance the cursor — silently destroying the user's turn. The
+            # omission applies to any oversized body, not only images, so plain
+            # text lands here too.
+            out.append({**m, "body_unavailable": True})
+            continue
+        merged = {**m, **full}
+        for k in ("body_omitted", "body_omitted_reason", "image_omitted", "file_omitted"):
+            merged.pop(k, None)
+        out.append(merged)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1622,7 +1770,7 @@ def _fetch_screen_json(path: str) -> dict | None:
     last_error: Exception | None = None
     for attempt in range(3):
         try:
-            resp = httpx.get(f"{FEEDLING_API_URL}{path}", headers=_HEADERS, timeout=20)
+            resp = _HTTP.get(f"{FEEDLING_API_URL}{path}", headers=_HEADERS, timeout=20)
             if resp.status_code == 404:
                 return None
             resp.raise_for_status()
@@ -1710,7 +1858,7 @@ def _worldbook_context_for_foreground(content: str) -> str:
     if not text:
         return ""
     try:
-        resp = httpx.post(
+        resp = _HTTP.post(
             f"{FEEDLING_API_URL}/v1/worldbook/match",
             headers=_HEADERS,
             json={"message": text},
@@ -1983,26 +2131,48 @@ _JSON_RUNTIME_DEBUG_FIELDS = {
 }
 
 _JSON_NON_FINAL_EVENTS = {
+    "agent_end",       # pi: carries the FULL message history — must never be
     "agent_message_delta",
     "agent_reasoning",
     "agent_reasoning_delta",
     "agent_reasoning_section_break",
+    "agent_start",
+    "auto_retry_end",
+    "auto_retry_start",
+    "compaction_end",
+    "compaction_start",
     "debug",
     "delta",
+    "extension_error",
     "log",
+    "message_start",   # pi: NOT message_end — that's pi's final event, parsed
+    "message_update",  #   by _pi_turn_from_stream.
     "progress",
+    "queue_update",
     "reasoning",
     "reasoning_delta",
+    "session",         # pi session header (first line)
     "status",
     "stderr",
     "stdout",
     "system",
+    "text_delta",
+    "text_end",
+    "text_start",
     "thinking",
+    "thinking_delta",
+    "thinking_end",
+    "thinking_start",
     "thought",
     "tool",
     "tool_call",
+    "tool_execution_end",
+    "tool_execution_start",
+    "tool_execution_update",
     "tool_result",
     "trace",
+    "turn_end",
+    "turn_start",
 }
 
 
@@ -2635,8 +2805,9 @@ def _cli_error_detail(stdout: str, stderr: str) -> str:
     warning: claude ``--output-format json`` emits a result object
     (``is_error`` + ``result`` text + ``api_error_status``); codex ``--json`` emits
     ``error`` events (``message``), ``turn.failed.error.message``, or nested
-    error items. Surface that so ``cli agent exited`` is actionable instead of
-    blank. Falls back to stderr, then a stdout snippet.
+    error items; pi reports it on the final ``message_end`` (``stopReason=error``
+    + ``errorMessage``). Surface that so ``cli agent exited`` is actionable
+    instead of blank. Falls back to stderr, then a stdout snippet.
     """
     def _codex_error_message(obj: Any) -> tuple[int, str]:
         if not isinstance(obj, dict):
@@ -2664,6 +2835,7 @@ def _cli_error_detail(stdout: str, stderr: str) -> str:
     claude_err = ""
     codex_err = ""
     codex_err_priority = 0
+    pi_err = ""
     for obj in _json_objects_from_cli_output(stdout or ""):
         if not isinstance(obj, dict):
             continue
@@ -2674,7 +2846,13 @@ def _cli_error_detail(stdout: str, stderr: str) -> str:
         if msg and priority >= codex_err_priority:
             codex_err = msg   # keep the last error event (the final one)
             codex_err_priority = priority
-    detail = claude_err or codex_err
+        # pi surfaces API errors on the final message_end: stopReason=error + errorMessage.
+        if obj.get("type") == "message_end":
+            msg = obj.get("message")
+            if (isinstance(msg, dict) and msg.get("stopReason") == "error"
+                    and isinstance(msg.get("errorMessage"), str) and msg["errorMessage"].strip()):
+                pi_err = msg["errorMessage"].strip()   # keep the last error turn
+    detail = claude_err or codex_err or pi_err
     if detail:
         return detail[:300]
     if (stderr or "").strip():
@@ -2851,6 +3029,77 @@ def _codex_attach_reasoning(reply: str, reasoning: str) -> str:
     )
 
 
+def _pi_turn_from_stream(raw: str) -> tuple[str, str]:
+    """Split a ``pi --mode json`` JSONL event stream into (reply, thinking).
+
+    pi separates thinking from text at the event level: each completed assistant
+    message arrives as ``{"type":"message_end","message":{"role":"assistant",
+    "content":[{"type":"text",...}|{"type":"thinking",...}|toolCall]}}``. The
+    reply is the LAST assistant message carrying text (intermediate messages are
+    tool-call steps); thinking blocks are collected across the whole turn and
+    returned SEPARATELY so the caller folds them into the collapsible disclosure
+    — never a chat bubble. Both empty means an error/handshake-only turn so the
+    caller can fall back without leaking.
+    """
+    reply = ""
+    thinking: list[str] = []
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict) or str(obj.get("type") or "").strip() != "message_end":
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict) or str(msg.get("role") or "") != "assistant":
+            continue
+        texts: list[str] = []
+        for block in msg.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    texts.append(text.strip())
+            elif block.get("type") == "thinking":
+                thought = block.get("thinking")
+                if isinstance(thought, str) and thought.strip():
+                    thinking.append(thought.strip())
+        if texts:
+            reply = "\n\n".join(texts)   # keep the LAST text-bearing message
+    return reply, "\n\n".join(thinking)
+
+
+def _pi_turn_metrics(raw: str) -> dict:
+    """Best-effort {steps, input_tokens, output_tokens, cost_usd} from a pi JSONL
+    stream. Every completed assistant message carries ``usage`` (input/output
+    token counts) and ``usage.cost.total`` (USD) — summed across the turn's
+    messages. Never raises."""
+    steps = 0
+    in_tok = out_tok = 0
+    cost = 0.0
+    for obj in _json_objects_from_cli_output(raw):
+        if not isinstance(obj, dict) or str(obj.get("type") or "") != "message_end":
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict) or str(msg.get("role") or "") != "assistant":
+            continue
+        steps += 1
+        usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+        for key in ("input", "output"):
+            try:
+                val = int(usage.get(key) or 0)
+            except (TypeError, ValueError):
+                val = 0
+            if key == "input":
+                in_tok += val
+            else:
+                out_tok += val
+        cost_obj = usage.get("cost") if isinstance(usage.get("cost"), dict) else {}
+        try:
+            cost += float(cost_obj.get("total") or 0.0)
+        except (TypeError, ValueError):
+            pass
+    return {"steps": steps, "input_tokens": in_tok, "output_tokens": out_tok,
+            "cost_usd": round(cost, 6)}
+
+
 def _extract_text_from_cli_output(raw: str) -> str:
     """Best-effort extraction from raw CLI stdout.
 
@@ -2983,7 +3232,7 @@ def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = 
     payload = {"message": message}
     if images:
         payload["images"] = images
-    resp = httpx.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=60)
+    resp = _HTTP.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=60)
     resp.raise_for_status()
     _remember_http_session(
         resp,
@@ -3030,7 +3279,7 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
         "messages": [{"role": "user", "content": content}],
         "stream": False,
     }
-    resp = httpx.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=120)
+    resp = _HTTP.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=120)
     resp.raise_for_status()
     _remember_http_session(
         resp,
@@ -3346,6 +3595,10 @@ def _is_codex_cmd(cmd: list[str]) -> bool:
     return bool(cmd) and Path(cmd[0]).name == "codex"
 
 
+def _is_pi_cmd(cmd: list[str]) -> bool:
+    return bool(cmd) and Path(cmd[0]).name == "pi"
+
+
 def _cli_cmd_tokens() -> list[str]:
     """Tokenize the raw AGENT_CLI_CMD template for driver detection.
 
@@ -3407,6 +3660,28 @@ def _inject_codex_images(cmd: list[str], image_paths: list[str]) -> list[str]:
         insert_at = 1
     flags = [f"--image={path}" for path in image_paths]
     return [*cmd[:insert_at], *flags, *cmd[insert_at:]]
+
+
+def _cli_template_is_pi() -> bool:
+    """True when AGENT_CLI_CMD drives ``pi`` (so we attach images as @refs)."""
+    return _is_pi_cmd(_cli_cmd_tokens())
+
+
+def _inject_pi_images(cmd: list[str], image_paths: list[str]) -> list[str]:
+    """Attach decrypted image files to a ``pi`` command as native vision input.
+
+    pi reads ``@<path>`` positional args at the CLI layer — its file-processor
+    sniffs the mime from file CONTENT and feeds real ``ImageContent`` to the model
+    (vision), unlike the text file-path the model can't actually see. This is pi's
+    analogue of codex's ``--image=``. The user message rides STDIN (not argv), so
+    the ``@`` refs simply append to the end; each is self-delimiting and argv is a
+    list, so paths with spaces survive. The "already wired" guard checks the
+    TEMPLATE (``_cli_cmd_tokens``), not the rendered cmd — a user message starting
+    with ``@`` must never be mistaken for an operator-provided file ref.
+    """
+    if not image_paths or any(t.startswith("@") for t in _cli_cmd_tokens()):
+        return cmd
+    return [*cmd, *[f"@{path}" for path in image_paths]]
 
 
 def _cli_flag_value(cmd: list[str], flag: str) -> str:
@@ -3640,8 +3915,13 @@ def _prepare_cli_command(
     codex_native_images = (
         bool(image_paths) and not template_has_image_slot and _cli_template_is_codex()
     )
+    # pi likewise gets pixels natively via injected @<path> refs (_inject_pi_images).
+    pi_native_images = (
+        bool(image_paths) and not template_has_image_slot and _cli_template_is_pi()
+    )
     rendered_message = message
-    if image_paths and not template_has_image_slot and not codex_native_images:
+    if (image_paths and not template_has_image_slot
+            and not codex_native_images and not pi_native_images):
         rendered_message = _message_for_agent(message, image_paths)
     cmd = _render_cli_template(rendered_message, sid, image_paths=image_paths, lane=lane)
     cmd, sid = _ensure_explicit_cli_session_id(cmd, sid)
@@ -3686,9 +3966,31 @@ def _prepare_cli_command(
             and not _message_has_injected_history(message)
         ):
             cmd = [cmd[0], "--resume", sid, *cmd[1:]]
+    elif _is_pi_cmd(cmd):
+        # pi 续接只用 --session-id（"create if missing" 语义，resident 自己生成
+        # 的 bounded id 在 _ensure_explicit_cli_session_id 已绑定/持久化）。
+        cmd, removed_continue = _strip_cli_flags(cmd, {"--continue", "-c"})
+        if removed_continue:
+            log.warning(
+                "removed pi --continue from AGENT_CLI_CMD; resident "
+                "continuity uses the bounded --session-id"
+            )
+        if "--mode" not in cmd:
+            cmd = [cmd[0], "--mode", "json", *cmd[1:]]
+        if "--session-id" not in cmd and not _has_cli_resume(cmd):
+            # 操作员覆盖的 cli_cmd 没带占位符时兜底注入 resident 自有会话（默认
+            # 模板总带占位符，由 _ensure_explicit_cli_session_id 处理）。fresh home
+            # 首轮 sid 为空 —— 须现场生成并持久化，否则 pi 每轮开新会话、且事件流无
+            # 可抠 session_id（call_agent_cli 信命令行 sid），续接会永久丢失。
+            if not sid:
+                sid = _new_agent_session_id()
+                _save_agent_session_id(sid)
+            cmd = [cmd[0], "--session-id", sid, *cmd[1:]]
 
     if codex_native_images:
         cmd = _inject_codex_images(cmd, image_paths or [])
+    if pi_native_images:
+        cmd = _inject_pi_images(cmd, image_paths or [])
 
     return _resolve_cli_executable(cmd)
 
@@ -3739,12 +4041,16 @@ def _cli_turn_metrics(cmd: list[str], result: "subprocess.CompletedProcess", wal
     ``driver, rc, wall_ms, agent_ms, api_ms, num_turns, steps, input_tokens,
     output_tokens, out_chars``. Fields the driver doesn't report stay ``None``.
     """
-    m = {"driver": "codex" if _is_codex_cmd(cmd) else "claude", "rc": result.returncode,
+    m = {"driver": "pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude"),
+         "rc": result.returncode,
          "wall_ms": wall_ms, "agent_ms": None, "api_ms": None, "num_turns": None,
-         "steps": None, "input_tokens": None, "output_tokens": None,
+         "steps": None, "input_tokens": None, "output_tokens": None, "cost_usd": None,
          "out_chars": len(result.stdout or "")}
     try:
-        if m["driver"] == "codex":
+        if m["driver"] == "pi":
+            # pi carries per-message usage + USD cost — richer than codex's estimate.
+            m.update(_pi_turn_metrics(result.stdout or ""))
+        elif m["driver"] == "codex":
             m.update(_codex_turn_metrics(result.stdout or ""))
         else:
             for obj in _json_objects_from_cli_output(result.stdout or ""):
@@ -3776,6 +4082,15 @@ def _log_cli_turn_timing(cmd: list[str], result: "subprocess.CompletedProcess", 
     logged so blank fields aren't mistaken for missing claude data.
     """
     m = _cli_turn_metrics(cmd, result, wall_ms)
+
+    if m["driver"] == "pi":
+        log.info(
+            "[turn-timing] driver=pi rc=%s wall_ms=%d steps=%s in_tokens=%s "
+            "out_tokens=%s cost_usd=%s out_chars=%d",
+            m["rc"], m["wall_ms"], m.get("steps"), m.get("input_tokens"),
+            m.get("output_tokens"), m.get("cost_usd"), m["out_chars"],
+        )
+        return
 
     if m["driver"] == "codex":
         log.info(
@@ -3816,7 +4131,7 @@ def call_agent_cli(
     _turn_t0 = time.monotonic()
     _emit_debug_trace("agent", "agent.model.call.start", trace_id=trace_id,
                       summary="cli turn start",
-                      explain="模型调用发起（" + ("codex" if _is_codex_cmd(cmd) else "claude") + "）",
+                      explain="模型调用发起（" + ("pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude")) + "）",
                       content_excerpt={"prompt_head": (message or "")[:1000]})
     child_env = os.environ.copy()
     if trace_id:
@@ -3825,15 +4140,23 @@ def call_agent_cli(
     else:
         child_env.pop("FEEDLING_TRACE_ID", None)
         child_env.pop("FEEDLING_DEBUG_TRACE_ID", None)
+    # pi arg-parses every positional (a message starting with @/-/-- would be eaten
+    # as a file ref / flag), so the managed pi template omits {message} and we feed
+    # the message via STDIN instead — safe for arbitrary user text. An operator
+    # template that kept {message} in argv gets an empty stdin so pi never blocks
+    # reading it. Non-pi drivers are unchanged (message stays in argv).
+    _run_kwargs: dict = {"capture_output": True, "text": True, "timeout": 120, "env": child_env}
+    if _is_pi_cmd(cmd):
+        _run_kwargs["input"] = message if "{message}" not in AGENT_CLI_CMD else ""
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=child_env)
+        result = subprocess.run(cmd, **_run_kwargs)
     except subprocess.TimeoutExpired:
         _emit_debug_trace("agent", "agent.model.call.error", status="error", trace_id=trace_id,
                           dur_ms=(time.monotonic() - _turn_t0) * 1000,
                           summary="cli turn timeout", explain="模型调用超时（120s 上限）— 卡在模型这一步")
         log.warning(
             "[turn-timing] driver=%s rc=timeout wall_ms=%d (hit 120s subprocess cap)",
-            "codex" if _is_codex_cmd(cmd) else "claude",
+            "pi" if _is_pi_cmd(cmd) else ("codex" if _is_codex_cmd(cmd) else "claude"),
             int((time.monotonic() - _turn_t0) * 1000),
         )
         raise
@@ -3891,7 +4214,13 @@ def call_agent_cli(
     )
 
     raw_transport = (result.stdout or "") + "\n" + (result.stderr or "")
-    observed_sid = _extract_session_id(raw_transport) or command_sid
+    if _is_pi_cmd(cmd):
+        # pi's session id is resident-owned (--session-id, created on first use);
+        # pi events carry no session_id field to scrape, and stream scraping could
+        # latch a wrong value from tool output — trust the command.
+        observed_sid = command_sid or _extract_session_id(raw_transport)
+    else:
+        observed_sid = _extract_session_id(raw_transport) or command_sid
     if observed_sid:
         _save_agent_session_id(observed_sid)
         _record_agent_session_turn(
@@ -3903,6 +4232,36 @@ def call_agent_cli(
     if result.returncode != 0:
         raise RuntimeError(
             f"cli agent exited {result.returncode}: "
+            f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
+        )
+
+    # pi `--mode json` streams JSONL events; the assistant's text and its
+    # thinking blocks live in dedicated `message_end` events, NOT in any field
+    # the generic extractor recognizes. Pull both from the stream before falling
+    # through (else the consumer would leak pi's internal handshake noise).
+    if _is_pi_cmd(cmd):
+        pi_reply, pi_thinking = _pi_turn_from_stream(result.stdout)
+        if pi_reply:
+            # Same lane discipline as codex: background memory lanes (raw_text)
+            # get the bare reply; only foreground chat folds thinking into the
+            # collapsible disclosure (pi separates thinking at the event layer,
+            # so there is no codex-0.142-style leak risk here).
+            if pi_thinking and not raw_text:
+                return _attach_provider_reasoning(
+                    pi_reply, pi_thinking,
+                    source="pi_thinking",
+                    kind="provider_reasoning_summary",
+                    native=True,
+                )
+            return pi_reply
+        # No assistant text: pi exits 0 EVEN ON API ERRORS (the error rides on the
+        # final message_end's stopReason/errorMessage), and pi ECHOES the user
+        # prompt as its own message_start/message_end. So _pi_turn_from_stream is
+        # pi's ONLY valid reply source — falling through to the generic extractor
+        # would return the user's own echoed message as the reply. Surface the
+        # error instead (verified against real pi 0.80.3 output, 2026-07-02).
+        raise RuntimeError(
+            "pi agent produced no reply: "
             f"{_cli_error_detail(result.stdout or '', result.stderr or '')}"
         )
 
@@ -4095,16 +4454,24 @@ def call_agent(
         }
         if turn.tool_calls:
             body["tool_calls"] = turn.tool_calls
+        # This body is parsed a SECOND time downstream (_split_agent_turn in the
+        # chat/proactive lanes), so it must speak the same dialect the reader
+        # accepts. Emit the provider_reasoning family — the keys this turn was
+        # parsed FROM — never `thinking_summary`: that key is deliberately NOT in
+        # _JSON_THINKING_FIELDS because a model can forge it in its own reply JSON
+        # (see test_agent_turn_ignores_custom_thinking_summary_from_nested_result),
+        # so a body keyed that way reads back as empty and the thinking is lost
+        # between the model and post_reply's thinking_envelope.
         if turn.thinking_summary:
-            body["thinking_summary"] = turn.thinking_summary
+            body["provider_reasoning"] = turn.thinking_summary
         if turn.thinking_kind:
-            body["thinking_kind"] = turn.thinking_kind
+            body["reasoning_kind"] = turn.thinking_kind
         if turn.thinking_source:
-            body["thinking_source"] = turn.thinking_source
+            body["reasoning_source"] = turn.thinking_source
         if turn.thinking_model:
-            body["thinking_model"] = turn.thinking_model
+            body["reasoning_model"] = turn.thinking_model
         if turn.thinking_native is not None:
-            body["thinking_native"] = bool(turn.thinking_native)
+            body["reasoning_native"] = bool(turn.thinking_native)
         if turn.runtime_debug:
             log.debug("agent runtime debug keys: %s", sorted(turn.runtime_debug.keys()))
         return body
@@ -4135,7 +4502,10 @@ def _recent_chat_context_for_foreground(before_ts: float, limit: int | None = No
     limit = max(1, min(limit if limit is not None else FOREGROUND_CHAT_CONTEXT_LIMIT, 50))
     fetch_limit = max(limit + 4, 20)
     try:
-        history = get_decrypted_history(since=0, limit=fetch_limit)
+        # Text transcript only: image rows render as a placeholder here (_chat_line),
+        # so the bodies were decrypted, base64'd across the wire and thrown away —
+        # on EVERY foreground turn.
+        history = get_decrypted_history(since=0, limit=fetch_limit, include_image_body=False)
     except Exception as e:  # noqa: BLE001 — continuity is best-effort, never fatal
         log.warning("foreground chat context fetch failed: %s", e)
         return ""
@@ -4194,7 +4564,7 @@ _whoami_cache_loaded_at: float = 0.0
 def execute_identity_actions(actions: list[dict]) -> dict:
     if not actions:
         return {"status": "ok", "results": [], "effects": []}
-    resp = httpx.post(
+    resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/identity/actions",
         json={"actions": actions},
         headers=_HEADERS,
@@ -4211,7 +4581,7 @@ def execute_identity_actions(actions: list[dict]) -> dict:
 def execute_memory_actions(actions: list[dict]) -> dict:
     if not actions:
         return {"status": "ok", "results": [], "effects": []}
-    resp = httpx.post(
+    resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/memory/actions",
         json={"actions": actions},
         headers=_HEADERS,
@@ -4281,7 +4651,7 @@ def _load_whoami() -> bool:
     local_only), but shared-visibility envelopes require it.
     """
     try:
-        resp = httpx.get(
+        resp = _HTTP.get(
             f"{FEEDLING_API_URL}/v1/users/whoami", headers=_HEADERS, timeout=10
         )
         resp.raise_for_status()
@@ -4413,7 +4783,7 @@ def _refresh_whoami_for_encrypted_reply() -> bool:
 def poll_chat(since: float) -> dict:
     url = f"{FEEDLING_API_URL}/v1/chat/poll"
     params = {"since": since, "timeout": POLL_TIMEOUT}
-    resp = httpx.get(url, params=params, headers=_HEADERS, timeout=POLL_TIMEOUT + 10)
+    resp = _HTTP.get(url, params=params, headers=_HEADERS, timeout=POLL_TIMEOUT + 10)
     resp.raise_for_status()
     body = resp.json()
     if isinstance(body, dict):
@@ -4456,7 +4826,7 @@ def _update_user_mcp_advertised(payload) -> None:
 
 
 def _fetch_user_mcp_envelopes() -> dict:
-    resp = httpx.get(
+    resp = _HTTP.get(
         f"{FEEDLING_API_URL}/v1/mcp/envelopes", headers=_HEADERS, timeout=20)
     resp.raise_for_status()
     return resp.json()
@@ -4584,7 +4954,7 @@ def poll_proactive_jobs(since: float) -> dict:
     url = f"{FEEDLING_API_URL}/v1/proactive/jobs/poll"
     timeout = max(0, PROACTIVE_POLL_TIMEOUT)
     params = {"since": since, "timeout": timeout}
-    resp = httpx.get(url, params=params, headers=_HEADERS, timeout=timeout + 10)
+    resp = _HTTP.get(url, params=params, headers=_HEADERS, timeout=timeout + 10)
     resp.raise_for_status()
     body = resp.json()
     if isinstance(body, dict):
@@ -4642,13 +5012,13 @@ def _proactive_tick_interval_for_broadcast_state(
 
 def post_proactive_tick(payload: dict[str, Any] | None = None) -> dict:
     url = f"{FEEDLING_API_URL}/v1/proactive/tick"
-    resp = httpx.post(url, json=payload or {}, headers=_HEADERS, timeout=30)
+    resp = _HTTP.post(url, json=payload or {}, headers=_HEADERS, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
 def fire_scheduled_wakes() -> dict:
-    resp = httpx.post(
+    resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/proactive/scheduled/fire",
         json={},
         headers=_HEADERS,
@@ -4697,7 +5067,7 @@ def post_screen_watch_tick(broadcast_state: str, frames: list[dict]) -> dict:
 
 
 def fire_capture_tick() -> dict:
-    resp = httpx.post(
+    resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/capture/tick",
         json={},
         headers=_HEADERS,
@@ -4712,7 +5082,7 @@ def claim_proactive_job(job_id: str) -> bool:
     if not job_id:
         return False
     url = f"{FEEDLING_API_URL}/v1/proactive/jobs/{job_id}/claim"
-    resp = httpx.post(
+    resp = _HTTP.post(
         url,
         json={"consumer_id": CONSUMER_ID},
         headers=_HEADERS,
@@ -4741,7 +5111,7 @@ def update_proactive_job_status(
         }
         if isinstance(extra, dict):
             body.update(extra)
-        resp = httpx.post(
+        resp = _HTTP.post(
             url,
             json=body,
             headers=_HEADERS,
@@ -4757,7 +5127,7 @@ def update_proactive_state(**patch: Any) -> None:
     if not clean:
         return
     try:
-        resp = httpx.post(
+        resp = _HTTP.post(
             f"{FEEDLING_API_URL}/v1/proactive/state",
             json=clean,
             headers=_HEADERS,
@@ -4819,7 +5189,7 @@ def execute_scheduled_wake_actions(actions: list[dict], job: dict) -> dict:
         "wake_ids": _job_wake_ids(job),
         "origin_refs": _job_origin_refs(job),
     }
-    resp = httpx.post(
+    resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/proactive/scheduled/actions",
         json=body,
         headers=_HEADERS,
@@ -4927,7 +5297,7 @@ def post_reply(
                 "gate_decision_id": gate_decision_id,
                 "proactive_job_id": proactive_job_id,
             }
-        resp = httpx.post(url, json=body, headers=_HEADERS, timeout=15)
+        resp = _HTTP.post(url, json=body, headers=_HEADERS, timeout=15)
         return _handle_post_reply_response(resp)
 
     # Encryption unavailable — plaintext path (will 400 on v1 backends).
@@ -4935,7 +5305,7 @@ def post_reply(
         "ENCRYPTION UNAVAILABLE — posting plaintext will fail on v1 backends. "
         "Ensure content_encryption.py is importable and whoami succeeded."
     )
-    resp = httpx.post(
+    resp = _HTTP.post(
         url,
         json={
             "content": content,
@@ -4991,7 +5361,7 @@ def _handle_post_reply_response(resp) -> dict:
 
 def get_latest_ts() -> float:
     url = f"{FEEDLING_API_URL}/v1/chat/history"
-    resp = httpx.get(url, params={"limit": 1}, headers=_HEADERS, timeout=10)
+    resp = _HTTP.get(url, params={"limit": 1}, headers=_HEADERS, timeout=10)
     resp.raise_for_status()
     data = resp.json()
     messages = data.get("messages") or data.get("history") or []
@@ -5160,7 +5530,8 @@ def recent_chat_context_for_proactive(limit: int | None = None) -> ProactiveChat
     limit = max(1, min(limit if limit is not None else PROACTIVE_RECENT_CHAT_LIMIT, 50))
     fetch_limit = max(limit, min(max(1, PROACTIVE_CHAT_CONTEXT_LOOKBACK_LIMIT), 200))
     try:
-        history = get_decrypted_history(since=0, limit=fetch_limit)
+        # Text only — image rows become a placeholder in the rendered context.
+        history = get_decrypted_history(since=0, limit=fetch_limit, include_image_body=False)
     except Exception as e:
         log.warning("recent chat context fetch failed: %s", e)
         return ProactiveChatContext(freshness="unavailable")
@@ -5472,7 +5843,7 @@ def _new_photo_hint(job: dict) -> str:
     if not _is_photo_added_job(job):
         return ""
     try:
-        resp = httpx.get(
+        resp = _HTTP.get(
             f"{FEEDLING_API_URL}/v1/perception/photos",
             headers=_HEADERS,
             params={"limit": 1},
@@ -5598,12 +5969,17 @@ def _native_reachout_tool_instructions() -> str:
     return "\n".join([
         "native_tool_access:",
         "- You have native Feedling tools for the user's real context — perception (now/location/weather/motion/"
-        "calendar/health/…), memory (index/fetch), screen (recent/read), photo (recent/read). Use them when more "
-        "facts genuinely help.",
+        "calendar/health/…), memory (index/fetch/write/patch/delete), screen (recent/read), photo (recent/read). Use "
+        "them when more facts genuinely help.",
+        "- Memory is yours to keep accurate: memory_write adds a new card, memory_patch corrects an existing card by "
+        "id (supersede), memory_delete removes one by id (hard delete). When the user asks you to change or delete a "
+        "memory — including one they quoted into the chat — DO it via these tools (get the id from memory_index or the "
+        "quoted card's id), don't just say you did.",
         "- You also have native tools to manage your own future wakes: schedule_wake (ask to be woken at a later time) "
         "and cancel_wake.",
         "- CLI runtimes call all of these via io_cli: perception, perception-trend, perception-history, memory-index, "
-        "memory-fetch, screen-recent, screen-read, photo-recent, photo-read, schedule-wake, cancel-wake.",
+        "memory-fetch, memory-write, memory-patch, memory-delete, screen-recent, screen-read, photo-recent, "
+        "photo-read, schedule-wake, cancel-wake.",
     ])
 
 
@@ -5656,7 +6032,7 @@ def _is_memory_dream_job(job: dict) -> bool:
 def _resident_perception_trend(signal: str, field: str) -> dict:
     """Best-effort GET of one signal's rolling baseline/delta (Tier 2 history)."""
     try:
-        resp = httpx.get(
+        resp = _HTTP.get(
             f"{FEEDLING_API_URL}/v1/agent/perception/trend",
             headers=_HEADERS,
             params={"signal": signal, "field": field, "days": 30},
@@ -5677,7 +6053,7 @@ def _resident_perception_now() -> dict:
     retired simulated resident tool bridge.
     """
     try:
-        resp = httpx.get(
+        resp = _HTTP.get(
             f"{FEEDLING_API_URL}/v1/agent/perception",
             headers=_HEADERS,
             params={"signals": "now"},
@@ -5773,7 +6149,7 @@ def _resident_perception_digest_board() -> tuple[list, dict]:
     Degrades to ([], {}) if the endpoint is unavailable. The agent can still
     drill into any signal on demand via the perception_trend/history tools."""
     try:
-        resp = httpx.get(
+        resp = _HTTP.get(
             f"{FEEDLING_API_URL}/v1/agent/perception/digest",
             headers=_HEADERS,
             params={"days": 30},
@@ -5878,14 +6254,12 @@ def _capture_get_json(
 ) -> dict:
     _refresh_auth_header()
     root = (base_url or FEEDLING_API_URL).rstrip("/")
-    verify_tls = not (FEEDLING_ENCLAVE_URL and root == FEEDLING_ENCLAVE_URL)
     try:
-        resp = httpx.get(
+        resp = _client_for(root).get(
             f"{root}{path}",
             params=params or {},
             headers=_HEADERS,
             timeout=timeout,
-            verify=verify_tls,
         )
         resp.raise_for_status()
         body = resp.json()
@@ -5904,14 +6278,12 @@ def _capture_post_json(
 ) -> dict:
     _refresh_auth_header()
     root = (base_url or FEEDLING_API_URL).rstrip("/")
-    verify_tls = not (FEEDLING_ENCLAVE_URL and root == FEEDLING_ENCLAVE_URL)
     try:
-        resp = httpx.post(
+        resp = _client_for(root).post(
             f"{root}{path}",
             json=payload or {},
             headers=_HEADERS,
             timeout=timeout,
-            verify=verify_tls,
         )
         resp.raise_for_status()
         body = resp.json()
@@ -6049,7 +6421,8 @@ def _capture_window_messages(job: dict) -> list[dict]:
     except (TypeError, ValueError):
         window_count = 0
     limit = max(20, CAPTURE_HISTORY_LIMIT)
-    history = get_decrypted_history(since=0, limit=limit)
+    # Text only — capture reads the transcript, never the pixels.
+    history = get_decrypted_history(since=0, limit=limit, include_image_body=False)
     live = _capture_live_history(history)
     if not live:
         return []
@@ -6457,7 +6830,12 @@ def _dream_cards_context() -> tuple[str, dict[str, dict]]:
 
 def _dream_recent_conversations_context() -> str:
     try:
-        history = get_decrypted_history(since=0, limit=max(1, min(DREAM_RECENT_CHAT_LIMIT, 240)))
+        # Text only — dream summarizes conversations, not images.
+        history = get_decrypted_history(
+            since=0,
+            limit=max(1, min(DREAM_RECENT_CHAT_LIMIT, 240)),
+            include_image_body=False,
+        )
     except Exception as e:
         log.warning("dream recent conversation fetch failed: %s", e)
         return "（这几天没有可读对话）"
@@ -7213,10 +7591,17 @@ def _quoted_memory_context(msg: dict) -> str:
             continue
         mtype = str(card.get("type") or "").strip()
         prefix = f"[{mtype}] " if mtype else ""
-        lines.append(f"- {prefix}{text}")
+        mid = str(card.get("id") or "").strip()
+        id_tag = f"(id={mid}) " if mid else ""
+        lines.append(f"- {id_tag}{prefix}{text}")
     if not lines:
         return ""
-    return "The user is referring to this memory from their Garden:\n" + "\n".join(lines)
+    return (
+        "The user is referring to this memory from their Garden:\n"
+        + "\n".join(lines)
+        + "\nIf they ask you to correct or delete it, act on it directly with memory_patch / "
+        "memory_delete using the id shown above."
+    )
 
 
 def _process_messages(messages: list) -> float:
@@ -7332,12 +7717,37 @@ def _process_messages(messages: list) -> float:
             # otherwise the agent gets the attachment but loses the actual prompt.
             if not content:
                 content = IMAGE_PLACEHOLDER
+        elif content_type == "file" and msg.get("body_unavailable"):
+            # _prepare_file_for_agent decodes a missing file_b64 to b"" and would
+            # land a 0-byte document — the agent would then dutifully describe an
+            # empty file. Be explicit that the bytes never arrived.
+            log.warning(
+                "file message [ts=%.3f] body unavailable after per-message fetch "
+                "— routing honest body-unavailable prompt", ts,
+            )
+            caption = content  # decrypted caption text, or ""
+            content = (
+                f"{caption}\n\n{BODY_UNAVAILABLE_PLACEHOLDER}".strip()
+                if caption else BODY_UNAVAILABLE_PLACEHOLDER
+            )
         elif content_type == "file":
             log.info("file message [ts=%.3f] — preparing file context for agent", ts)
             prep = _prepare_file_for_agent(msg)
             caption = content  # decrypted caption text, or ""
             block = prep.http_block if AGENT_MODE == "http" else prep.cli_instruction
             content = f"{caption}\n\n{block}".strip() if caption else block
+        elif msg.get("body_unavailable"):
+            # We KNOW this message exists and we know why we can't read it: history
+            # omitted the oversized body and the per-message fetch failed. Skipping
+            # it would advance the cursor and destroy the turn permanently — the one
+            # outcome we can never take back. Hand the agent an honest note instead,
+            # the same way an image whose pixels didn't arrive is handled: the user
+            # gets told, and can resend.
+            log.warning(
+                "text message [ts=%.3f] body unavailable after per-message fetch "
+                "— routing honest body-unavailable prompt", ts,
+            )
+            content = BODY_UNAVAILABLE_PLACEHOLDER
         elif not content:
             # Genuinely empty text — decrypt source missing or failed.
             # Never send a fallback for content we cannot read.
@@ -7555,7 +7965,7 @@ _RESIDENT_CONSUMER_ID = f"resident-distill-{CHECKPOINT_API_KEY_FINGERPRINT}"
 
 
 def genesis_resident_pending() -> list[dict]:
-    resp = httpx.get(
+    resp = _HTTP.get(
         f"{FEEDLING_API_URL}/v1/genesis/resident/pending",
         params={"consumer_id": _RESIDENT_CONSUMER_ID},
         headers=_HEADERS,
@@ -7568,7 +7978,7 @@ def genesis_resident_pending() -> list[dict]:
 
 def genesis_resident_heartbeat(job_id: str) -> None:
     try:
-        httpx.post(
+        _HTTP.post(
             f"{FEEDLING_API_URL}/v1/genesis/resident/{job_id}/heartbeat",
             json={"consumer_id": _RESIDENT_CONSUMER_ID},
             headers=_HEADERS,
@@ -7579,7 +7989,7 @@ def genesis_resident_heartbeat(job_id: str) -> None:
 
 
 def genesis_resident_complete(job_id: str, *, memory_action_count: int, identity_status: str) -> None:
-    resp = httpx.post(
+    resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/genesis/resident/{job_id}/complete",
         json={"memory_action_count": memory_action_count, "identity_status": identity_status},
         headers=_HEADERS,
@@ -8058,9 +8468,15 @@ def run() -> None:
             # v1 encrypted envelopes. Fetch actual plaintext from a decrypt source.
             if FEEDLING_ENCLAVE_URL:
                 decrypt_since = _poll_decrypt_since(last_ts, poll_messages)
+                # Text only. The window spans every message since the cursor, and an
+                # unanswered photo holds the cursor still — so inlining bodies here
+                # made the response grow with each stuck image until the CVM egress
+                # truncated it mid-body, which stalled the cursor further. Bodies are
+                # pulled per-message below, for the claimed rows only.
                 decrypted = get_decrypted_history(
                     since=decrypt_since,
                     limit=_poll_decrypt_limit(decrypt_since, last_ts, poll_messages),
+                    include_image_body=False,
                 )
                 if decrypted is None:
                     # All configured sources failed — skip this cycle, keep checkpoint.
@@ -8104,6 +8520,12 @@ def run() -> None:
                             "(%d/%d)", wedge_miss_count, CHAT_POLL_WEDGE_SKIP_AFTER,
                         )
                     continue
+                # Pixels/bytes for the claimed rows only — one request each, so the
+                # payload is bounded by a single message no matter how many photos
+                # are backed up in the window. A body that won't come back leaves
+                # its row body-less: that turn degrades to the honest
+                # "can't read this" prompt and still replies, so the cursor moves.
+                messages = _hydrate_omitted_bodies(messages)
             else:
                 # No decrypt source — fall through with poll content (will be
                 # empty for v1 encrypted messages, skipped in _process_messages).

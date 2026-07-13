@@ -291,7 +291,9 @@ def _per_tab_floors_for_days(days: int) -> dict:
 
 
 def _memory_floor_for_days(days: int) -> int:
-    """Total memory floor used by the bootstrap gate. Backwards-compatible
-    name; preserved for callers that don't care about per-tab breakdown.
+    """Days-scaled memory-count floor (TOTAL only; v2 has no tabs). NOT a
+    gate — used as a consistency signal: a long relationship should have a
+    proportional number of memory cards. See _per_tab_floors_for_days for
+    history (was a hard onboarding gate, now decoupled from gating).
     """
-    return _per_tab_floors_for_days(days)["total"]
+    return int(_per_tab_floors_for_days(days).get("total", 0))

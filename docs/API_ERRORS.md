@@ -127,7 +127,13 @@
 | `dimension_not_found` | 404 | — | | |
 | `delta_required` | 400 | — | | |
 | `agent_name_empty` | 400 | — | | |
-| `agent_name_too_generic` | 400 | — | | |
+| `agent_name_is_runtime_label` | 400 | — | 名字撞 card_policy.RUNTIME_LABELS（原 `agent_name_too_generic`，已统一） | |
+| `dimension_value_out_of_range` | 400 | — | dimension_nudge / patch dimensions / replace 三处共用（card_policy） | |
+| `dimension_value_not_number` | 400 | — | 同上 | |
+| `dimensions_must_be_list` | 400 | — | 同上 | |
+| `too_many_dimensions` | 400 | — | 同上 | |
+| `dimension_name_duplicate` | 400 | — | 同上 | |
+| `dimension_name_empty` | 400 | — | dimension_nudge target 名为空 / patch dimensions 校验共用（card_policy） | |
 | `self_introduction_empty` | 400 | — | | |
 | `signature_must_be_list` | 400 | — | identity.profile_patch 的 list 字段校验（同族还有 boundaries/do_not_say/stable_definitions） | |
 | `boundaries_must_be_list` | 400 | — | 同上 | |

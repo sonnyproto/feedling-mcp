@@ -569,6 +569,13 @@ class UserStore:
             "arrival_wake_enabled": True,
             "unlock_wake_enabled": True,
             "first_chat_ok_at": "",
+            # Durable "agent has done its first proactive self-introduction"
+            # marker, INDEPENDENT of the identity card (identity-card-never-gates,
+            # 2026-07). A no-card / empty-card user has no `self_introduction`
+            # field to write, so the intro's one-shot dedup can't live in the card
+            # — it lives here. Set once the introduction job is enqueued; see
+            # agent_runtime.supervisor._enqueue_introduction_job_if_needed.
+            "introduced_at": "",
             "updated_at": datetime.now().isoformat(),
         }
         try:
@@ -709,6 +716,58 @@ class UserStore:
             cur["updated_at"] = datetime.now().isoformat()
             db.set_blob(self.user_id, "proactive_settings", cur)
         return cur
+
+    def introduced_at(self) -> str:
+        settings = self.load_proactive_settings()
+        return str(settings.get("introduced_at") or "").strip()
+
+    def introduction_done(self) -> bool:
+        """True once the agent's first proactive self-introduction has been
+        enqueued for this user. Card-independent (see `introduced_at` default)
+        so no-card / empty-card users get exactly one introduction."""
+        return bool(self.introduced_at())
+
+    def mark_introduced(self, *, at_iso: str | None = None) -> dict:
+        with self.proactive_lock:
+            cur = self.load_proactive_settings()
+            if str(cur.get("introduced_at") or "").strip():
+                return cur
+            cur["introduced_at"] = str(at_iso or datetime.now().isoformat())
+            cur["version"] = 2
+            cur["updated_at"] = datetime.now().isoformat()
+            db.set_blob(self.user_id, "proactive_settings", cur)
+        return cur
+
+    def claim_and_enqueue_introduction(self, job: dict) -> dict | None:
+        """Cross-process exactly-once enqueue of the one-shot introduction.
+
+        The durable ``introduced_at`` marker and the proactive job are written
+        in ONE PostgreSQL transaction (db.claim_and_enqueue_introduction), so
+        two processes that don't share a Python lock (backend workers + the
+        standalone runner) cannot both enqueue, and a job-write failure rolls the
+        marker back automatically — the marker never persists without a job.
+
+        Returns the ``job`` iff THIS caller won the claim and it persisted, else
+        ``None`` (already introduced, lost the race, or a DB failure rolled it
+        back). Post-commit side effects (trim + waiter/worker wake) mirror
+        ``append_proactive_job``."""
+        with self.proactive_lock:
+            settings = dict(self.load_proactive_settings())
+        at_iso = datetime.now().isoformat()
+        settings["introduced_at"] = at_iso
+        settings["version"] = 2
+        settings["updated_at"] = at_iso
+        result = db.claim_and_enqueue_introduction(
+            self.user_id, settings, job, at_iso=at_iso,
+            ts=self._entry_epoch(job),
+            item_key=(str(job.get("job_id") or "") or None),
+        )
+        if result is None:
+            return None
+        db.log_trim(self.user_id, "proactive_jobs", PROACTIVE_JOB_MAX)
+        self.notify_proactive_job_waiters()
+        wake_bus.notify("proactive", self.user_id)
+        return job
 
     # ------- append-only logs (PostgreSQL-backed; see db.user_logs) -------
     @staticmethod

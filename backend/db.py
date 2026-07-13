@@ -171,28 +171,51 @@ def set_config_if_absent(key: str, value: bytes) -> bytes:
     """Insert (key, value) only if the key is absent, then return the stored
     value. This makes pepper bootstrap race-safe across concurrent workers:
     the first writer wins and everyone reads back the same pepper.
+
+    The TEE mirror must carry the value RDS actually ended up with, not the
+    candidate this call happened to propose: when the key already exists in
+    RDS (the primary INSERT is a no-op) but the TEE row is absent/stale
+    (dual-write was off during the original bootstrap, or a prior racer's
+    candidate landed there), mirroring ``value`` would fork the shadow
+    secret away from the primary. So we mirror the RDS-adopted value, using
+    an upsert on the TEE side to correct any stale/divergent row.
     """
+    sql = ("INSERT INTO server_config (key, value) VALUES (%s, %s) "
+           "ON CONFLICT (key) DO NOTHING RETURNING value")
     with get_pool().connection() as conn:
         with conn.transaction():
-            conn.execute(
-                "INSERT INTO server_config (key, value) VALUES (%s, %s) "
-                "ON CONFLICT (key) DO NOTHING",
-                (key, value),
-            )
-            row = conn.execute(
+            inserted = conn.execute(sql, (key, value)).fetchone()
+            row = inserted or conn.execute(
                 "SELECT value FROM server_config WHERE key = %s", (key,)
             ).fetchone()
-    return bytes(row[0])
+    adopted_value = bytes(row[0])
+    from tee_shadow import mirror
+    if inserted is not None:
+        # Our candidate was adopted by RDS — mirror it as-is (current SQL/shape).
+        mirror.execute(
+            "INSERT INTO server_config (key, value) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO NOTHING",
+            (key, value),
+        )
+    else:
+        # Key already existed in RDS — mirror the value RDS actually has, and
+        # upsert so any stale/divergent TEE value gets corrected.
+        mirror.execute(
+            "INSERT INTO server_config (key, value) VALUES (%s, %s) "
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            (key, adopted_value),
+        )
+    return adopted_value
 
 
 def set_config(key: str, value: bytes) -> None:
     """Unconditional upsert. Used by the migration script."""
+    sql = ("INSERT INTO server_config (key, value) VALUES (%s, %s) "
+           "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
     with get_pool().connection() as conn:
-        conn.execute(
-            "INSERT INTO server_config (key, value) VALUES (%s, %s) "
-            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            (key, value),
-        )
+        conn.execute(sql, (key, value))
+    from tee_shadow import mirror
+    mirror.execute(sql, (key, value))
 
 
 # The agent-runner supervisor heartbeats here each tick; the backend's
@@ -242,31 +265,34 @@ def set_supervisor_instance_heartbeat(owner: str, payload: dict) -> None:
             return int(payload.get(key, default))
         except (TypeError, ValueError):
             return default
+    sql = (
+        "INSERT INTO agent_runtime_supervisor_heartbeats "
+        "(owner, host, shard_index, shard_count, max_children, active_children, "
+        " host_all, gateway, version, payload, updated_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now()) "
+        "ON CONFLICT (owner) DO UPDATE SET "
+        "  host = EXCLUDED.host, shard_index = EXCLUDED.shard_index, "
+        "  shard_count = EXCLUDED.shard_count, max_children = EXCLUDED.max_children, "
+        "  active_children = EXCLUDED.active_children, host_all = EXCLUDED.host_all, "
+        "  gateway = EXCLUDED.gateway, version = EXCLUDED.version, "
+        "  payload = EXCLUDED.payload, updated_at = now()"
+    )
+    params = (
+        str(owner),
+        payload.get("host"),
+        _i("shard_index", 0),
+        _i("shard_count", 1),
+        _i("max_children", 0),
+        _i("active_children", 0),
+        bool(payload.get("host_all")),
+        bool(payload.get("gateway")),
+        payload.get("version"),
+        json.dumps(payload),
+    )
     with get_pool().connection() as conn:
-        conn.execute(
-            "INSERT INTO agent_runtime_supervisor_heartbeats "
-            "(owner, host, shard_index, shard_count, max_children, active_children, "
-            " host_all, gateway, version, payload, updated_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now()) "
-            "ON CONFLICT (owner) DO UPDATE SET "
-            "  host = EXCLUDED.host, shard_index = EXCLUDED.shard_index, "
-            "  shard_count = EXCLUDED.shard_count, max_children = EXCLUDED.max_children, "
-            "  active_children = EXCLUDED.active_children, host_all = EXCLUDED.host_all, "
-            "  gateway = EXCLUDED.gateway, version = EXCLUDED.version, "
-            "  payload = EXCLUDED.payload, updated_at = now()",
-            (
-                str(owner),
-                payload.get("host"),
-                _i("shard_index", 0),
-                _i("shard_count", 1),
-                _i("max_children", 0),
-                _i("active_children", 0),
-                bool(payload.get("host_all")),
-                bool(payload.get("gateway")),
-                payload.get("version"),
-                json.dumps(payload),
-            ),
-        )
+        conn.execute(sql, params)
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
 
 
 def list_supervisor_instance_heartbeats() -> list[dict]:
@@ -278,16 +304,23 @@ def list_supervisor_instance_heartbeats() -> list[dict]:
         rows = conn.execute(
             "SELECT owner, host, shard_index, shard_count, max_children, "
             "       active_children, host_all, gateway, version, "
-            "       extract(epoch FROM updated_at) AS ts "
+            "       extract(epoch FROM updated_at) AS ts, payload "
             "FROM agent_runtime_supervisor_heartbeats"
         ).fetchall()
     out = []
     for r in rows:
+        # ``pi`` has no promoted column (unlike host_all/gateway) — the supervisor
+        # only writes it into ``payload``. It MUST be read back out, or the wedge
+        # guard's ``hb.get("pi")`` is None → falsy → supervisor_pi_disabled → every
+        # pi-driver send 503s. See test_supervisor_instance_heartbeat_roundtrips_
+        # the_pi_capability_bit.
+        payload = r[10] if isinstance(r[10], dict) else {}
         out.append({
             "owner": r[0], "host": r[1], "shard_index": r[2], "shard_count": r[3],
             "max_children": r[4], "active_children": r[5],
             "host_all": bool(r[6]), "gateway": bool(r[7]), "version": r[8],
             "ts": float(r[9]),
+            "pi": bool(payload.get("pi")),
         })
     return out
 
@@ -295,12 +328,13 @@ def list_supervisor_instance_heartbeats() -> list[dict]:
 def prune_supervisor_instance_heartbeats(max_age_sec: float) -> None:
     """Delete heartbeat rows older than ``max_age_sec`` (dead runners that never
     released). Best-effort housekeeping so the table doesn't accrete forever."""
+    sql = ("DELETE FROM agent_runtime_supervisor_heartbeats "
+           "WHERE updated_at < now() - make_interval(secs => %s)")
+    params = (float(max_age_sec),)
     with get_pool().connection() as conn:
-        conn.execute(
-            "DELETE FROM agent_runtime_supervisor_heartbeats "
-            "WHERE updated_at < now() - make_interval(secs => %s)",
-            (float(max_age_sec),),
-        )
+        conn.execute(sql, params)
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
 
 
 # ---------------------------------------------------------------------------
@@ -321,15 +355,16 @@ def get_global_blob(key: str):
 
 
 def set_global_blob(key: str, doc) -> None:
+    sql = ("INSERT INTO global_blobs (key, doc) VALUES (%s, %s) "
+           "ON CONFLICT (key) DO UPDATE SET doc = EXCLUDED.doc")
     try:
         with get_pool().connection() as conn:
-            conn.execute(
-                "INSERT INTO global_blobs (key, doc) VALUES (%s, %s) "
-                "ON CONFLICT (key) DO UPDATE SET doc = EXCLUDED.doc",
-                (key, Jsonb(doc)),
-            )
+            conn.execute(sql, (key, Jsonb(doc)))
     except Exception as e:
         log.error("[db] set_global_blob(%s) failed: %s", key, e)
+        return
+    from tee_shadow import mirror
+    mirror.execute(sql, (key, Jsonb(doc)))
 
 
 # ---------------------------------------------------------------------------
@@ -353,23 +388,24 @@ def load_all_users() -> list[dict]:
 def insert_user(entry: dict) -> None:
     """Insert one user document. ON CONFLICT DO NOTHING so the migration is
     idempotent and a re-registration race can't duplicate a user_id."""
+    sql = ("INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s) "
+           "ON CONFLICT (user_id) DO NOTHING")
+    params = (entry["user_id"], entry.get("created_at"), Jsonb(entry))
     with get_pool().connection() as conn:
-        conn.execute(
-            "INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s) "
-            "ON CONFLICT (user_id) DO NOTHING",
-            (entry["user_id"], entry.get("created_at"), Jsonb(entry)),
-        )
+        conn.execute(sql, params)
+    from tee_shadow import mirror
+    mirror.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
 
 
 def upsert_user(entry: dict) -> None:
     """Insert-or-update one user document from the in-memory user dict (the
     source of truth after the caller mutates it under _users_lock)."""
+    sql = ("INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s) "
+           "ON CONFLICT (user_id) DO UPDATE SET created_at = EXCLUDED.created_at, doc = EXCLUDED.doc")
     with get_pool().connection() as conn:
-        conn.execute(
-            "INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s) "
-            "ON CONFLICT (user_id) DO UPDATE SET created_at = EXCLUDED.created_at, doc = EXCLUDED.doc",
-            (entry["user_id"], entry.get("created_at"), Jsonb(entry)),
-        )
+        conn.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
+    from tee_shadow import mirror
+    mirror.execute(sql, (entry["user_id"], entry.get("created_at"), Jsonb(entry)))
 
 
 def save_all_users(users: list[dict]) -> None:
@@ -390,36 +426,116 @@ def save_all_users(users: list[dict]) -> None:
     single-user edits go through ``registry.persist_user`` → ``db.upsert_user``
     (per-row, non-destructive); the remaining callers here read-then-rewrite their
     own full snapshot or run pre-fork at startup."""
+    upsert_sql = ("INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s) "
+                  "ON CONFLICT (user_id) DO UPDATE SET "
+                  "created_at = EXCLUDED.created_at, doc = EXCLUDED.doc")
+    mirror_group: list[tuple[str, tuple]] = []
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
                 keep_ids = [str(e.get("user_id")) for e in users if e.get("user_id")]
                 # Remove only genuinely-absent users (empty snapshot ⇒ remove all).
                 if keep_ids:
-                    conn.execute(
-                        "DELETE FROM users WHERE NOT (user_id = ANY(%s))", (keep_ids,)
-                    )
+                    delete_sql, delete_params = (
+                        "DELETE FROM users WHERE NOT (user_id = ANY(%s))", (keep_ids,))
                 else:
-                    conn.execute("DELETE FROM users")
+                    delete_sql, delete_params = ("DELETE FROM users", ())
+                conn.execute(delete_sql, delete_params)
+                mirror_group.append((delete_sql, delete_params))
                 for entry in users:
                     uid = entry.get("user_id")
                     if not uid:
                         continue
                     # Upsert (not plain INSERT): kept rows still exist, so a plain
                     # INSERT would hit the users PK. Upsert leaves child rows intact.
-                    conn.execute(
-                        "INSERT INTO users (user_id, created_at, doc) VALUES (%s, %s, %s) "
-                        "ON CONFLICT (user_id) DO UPDATE SET "
-                        "created_at = EXCLUDED.created_at, doc = EXCLUDED.doc",
-                        (uid, entry.get("created_at"), Jsonb(entry)),
-                    )
+                    params = (uid, entry.get("created_at"), Jsonb(entry))
+                    conn.execute(upsert_sql, params)
+                    mirror_group.append((upsert_sql, params))
     except Exception as e:
         log.error("[db] save_all_users failed: %s", e)
+        return
+    from tee_shadow import mirror
+    mirror.execute_many(mirror_group)
 
 
 def delete_user(user_id: str) -> None:
+    sql = "DELETE FROM users WHERE user_id = %s"
     with get_pool().connection() as conn:
-        conn.execute("DELETE FROM users WHERE user_id = %s", (user_id,))
+        conn.execute(sql, (user_id,))
+    from tee_shadow import mirror
+    mirror.execute(sql, (user_id,))
+
+
+# ---------------------------------------------------------------------------
+# TEE shadow sync-run history (observability — migration 0015).
+#
+# The in-process auto-sync scheduler appends one row per tick so convergence /
+# replication lag / dual-write failures / TEE liveness can be watched over the
+# soak window (the cut-read go/no-go signal). Kept in RDS, not the TEE db, so a
+# row is recordable even when the shadow is unreachable. See
+# backend/admin/tee_sync_scheduler.py for the producer.
+# ---------------------------------------------------------------------------
+
+# Flattened metric columns written verbatim from the scheduler's summary dict;
+# ``mirror_failures_delta`` and ``report`` are handled separately in the INSERT.
+_TEE_SYNC_RUN_COLS = (
+    "did_reconcile", "reconcile_ok", "verify_ran", "verify_ok",
+    "unconverged_tables", "unconverged_users", "requeue_backlog",
+    "replicate_copied", "replicate_pending", "replicate_errors", "replicate_skipped",
+    "replicate_table_failures",
+    "reconcile_copied", "reconcile_pruned", "reconcile_skipped",
+    "mirror_failures", "tee_healthy", "tee_probe_ms", "duration_ms",
+)
+
+
+def record_tee_sync_run(summary: dict) -> None:
+    """Append one row to ``tee_sync_runs``. Best-effort: recording a metric must
+    never break the sync loop, so any failure is swallowed+logged (matching the
+    shadow-era discipline everywhere else in the pipeline).
+
+    ``mirror_failures`` is a cumulative in-process counter that zeroes on
+    restart; ``mirror_failures_delta`` is computed here against the previous
+    persisted row and clamped to >=0 (a negative delta means a restart happened,
+    so the current value IS the count since restart)."""
+    try:
+        report_json = json.dumps(summary.get("report") or {}, default=str, ensure_ascii=False)
+        vals = [summary.get(c) for c in _TEE_SYNC_RUN_COLS]
+        cols = ", ".join(_TEE_SYNC_RUN_COLS)
+        ph = ", ".join(["%s"] * len(_TEE_SYNC_RUN_COLS))
+        with get_pool().connection() as conn:
+            last = conn.execute(
+                "SELECT mirror_failures FROM tee_sync_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            cur = int(summary.get("mirror_failures") or 0)
+            delta = cur - int(last[0]) if last else cur
+            if delta < 0:
+                delta = cur
+            conn.execute(
+                f"INSERT INTO tee_sync_runs ({cols}, mirror_failures_delta, report) "
+                f"VALUES ({ph}, %s, %s::jsonb)",
+                (*vals, delta, report_json),
+            )
+    except Exception as e:  # noqa: BLE001 — metrics must not break the loop
+        log.error("[db] record_tee_sync_run failed: %s", e)
+
+
+def recent_tee_sync_runs(limit: int = 50) -> list[dict]:
+    """Most-recent TEE sync summaries, newest first (observability endpoint).
+    ``ran_at`` is ISO-8601; ``report`` is the parsed JSONB detail dict."""
+    cols = ("id", "ran_at") + _TEE_SYNC_RUN_COLS + ("mirror_failures_delta", "report")
+    sel = ", ".join(cols)
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"SELECT {sel} FROM tee_sync_runs ORDER BY id DESC LIMIT %s", (limit,)
+        ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        d = dict(zip(cols, r))
+        ran = d.get("ran_at")
+        if ran is not None and hasattr(ran, "isoformat"):
+            d["ran_at"] = ran.isoformat()
+        out.append(d)
+    return out
 
 
 def user_exists(user_id: str) -> bool:
@@ -458,7 +574,10 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
     def ensure(out: dict[str, dict], uid: str) -> dict:
         return out.setdefault(uid, {})
 
-    out: dict[str, dict] = {uid: {} for uid in ids}
+    out: dict[str, dict] = {
+        uid: {"app_usage": {"foreground_sec": 0, "sessions": 0, "last_at": None}}
+        for uid in ids
+    }
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
@@ -581,6 +700,33 @@ def admin_data_track_snapshot(user_ids: list[str]) -> dict[str, dict]:
                 ensure(out, uid).setdefault("logs", {})[stream] = {
                     "count": count,
                     "last_ts": max_ts,
+                }
+
+            rows = conn.execute(
+                """
+                SELECT user_id,
+                       COALESCE(SUM(
+                         CASE
+                           WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
+                           THEN (doc->'payload'->>'duration_sec')::bigint
+                           ELSE 0
+                         END
+                       ), 0)::bigint AS foreground_sec,
+                       COUNT(*)::int AS sessions,
+                       MAX(ts) AS last_at
+                FROM user_logs
+                WHERE user_id = ANY(%s)
+                  AND stream = 'tracking_events'
+                  AND doc->>'type' = 'app_session_end'
+                GROUP BY user_id
+                """,
+                (ids,),
+            ).fetchall()
+            for uid, foreground_sec, sessions, last_at in rows:
+                ensure(out, uid)["app_usage"] = {
+                    "foreground_sec": int(foreground_sec or 0),
+                    "sessions": int(sessions or 0),
+                    "last_at": last_at,
                 }
 
             rows = conn.execute(
@@ -766,6 +912,21 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                       AND ts IS NOT NULL
                       AND (%s = 0 OR ts >= %s)
                 ),
+                usage_events AS (
+                    SELECT
+                        user_id,
+                        ts,
+                        CASE
+                          WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
+                          THEN (doc->'payload'->>'duration_sec')::bigint
+                          ELSE 0
+                        END AS duration_sec
+                    FROM user_logs
+                    WHERE stream = 'tracking_events'
+                      AND doc->>'type' = 'app_session_end'
+                      AND ts IS NOT NULL
+                      AND (%s = 0 OR ts >= %s)
+                ),
                 daily AS (
                     SELECT
                         to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
@@ -779,14 +940,29 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                         MAX(ts) AS last_ts
                     FROM active
                     GROUP BY day
+                ),
+                usage_daily AS (
+                    SELECT
+                        to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
+                        COALESCE(AVG(duration_sec), 0)::double precision AS avg_session_sec,
+                        COALESCE(SUM(duration_sec), 0)::bigint AS foreground_sec,
+                        COUNT(*)::int AS session_count,
+                        COUNT(DISTINCT user_id)::int AS session_dau
+                    FROM usage_events
+                    GROUP BY day
                 )
-                SELECT day, dau, chat_dau, tracking_dau, active_events,
-                       user_messages, tracking_events, first_ts, last_ts
-                FROM daily
-                ORDER BY day DESC
+                SELECT d.day, d.dau, d.chat_dau, d.tracking_dau, d.active_events,
+                       d.user_messages, d.tracking_events, d.first_ts, d.last_ts,
+                       COALESCE(u.avg_session_sec, 0)::double precision AS avg_session_sec,
+                       COALESCE(u.foreground_sec, 0)::bigint AS foreground_sec,
+                       COALESCE(u.session_count, 0)::int AS session_count,
+                       COALESCE(u.session_dau, 0)::int AS session_dau
+                FROM daily d
+                LEFT JOIN usage_daily u ON u.day = d.day
+                ORDER BY d.day DESC
                 LIMIT %s
                 """,
-                (since, since, since, since, tz, day_limit),
+                (since, since, since, since, since, since, tz, tz, day_limit),
             ).fetchall()
         return [
             {
@@ -799,6 +975,10 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                 "tracking_events": row[6],
                 "first_ts": row[7],
                 "last_ts": row[8],
+                "avg_session_sec": float(row[9] or 0),
+                "foreground_sec": int(row[10] or 0),
+                "session_count": int(row[11] or 0),
+                "session_dau": int(row[12] or 0),
             }
             for row in rows
         ]
@@ -1246,34 +1426,51 @@ def get_blob(user_id: str, kind: str):
 
 
 def set_blob(user_id: str, kind: str, doc) -> None:
+    sql = ("INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
+           "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc")
     try:
         with get_pool().connection() as conn:
-            conn.execute(
-                "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, %s, %s) "
-                "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc",
-                (user_id, kind, Jsonb(doc)),
-            )
+            conn.execute(sql, (user_id, kind, Jsonb(doc)))
     except Exception as e:
         log.error("[db] set_blob(%s,%s) failed: %s", user_id, kind, e)
+        return
+    from tee_shadow import mirror
+    # identity 归 tee_replicator 明文化管辖：RDS 里是 E2E 密文信封、TEE 里是
+    # replicator 落的明文版本。这里若把密文信封原样镜像进 TEE user_blobs，就会
+    # 盖掉那份明文（密文绝不能盖明文）。identity 的原地 UPDATE 传播改走 requeue
+    # lane（见 identity/service._save_identity）。
+    #
+    # consumer_state 是全系统最热的写：每一次 /v1/chat/poll 都记一条 consumer 事件
+    # （chat/consumer._record_consumer_event → _save_consumer_state → 本函数），N 个
+    # 常驻 consumer 长轮询就是每轮 N 次写。把它镜像出去会打满 max_size=4 的 TEE 池
+    # （direct-TLS 过网关），于是每个主写都要先在池上等满 pool_timeout 才 fail-open
+    # ——2026-07-13 test 实测：13 分钟 18 次 pool timeout，poll/写端点被拖到秒级
+    # （perception/report 23.7s、track/event 13.4s）。而它只是 runner 侧运维状态
+    # （上次 poll 时间 / consumer id），不是用户数据，TEE 影子没有任何理由持有它。
+    #
+    # 两处辖区必须同步：reconciler._SCOPE_WHERE["user_blobs"] 同样排除这两个 kind，
+    # 否则 reconciler 会把镜像端故意不写的行又 copy 回 TEE、并在两侧计数里要求它存在。
+    # 其余 kind（如 model_api provider-key 信封）有意原样镜像（凭据保持加密）。
+    if kind not in ("identity", "consumer_state"):
+        mirror.execute(sql, (user_id, kind, Jsonb(doc)))
 
 
-def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict]:
+def list_agent_runtime_enabled_users() -> list[dict]:
     """有 active route 且该 route test_status='ok'、其 credential 的 provider 能
     fit 的用户都纳入托管（与 hosted/agent_runtime_cutover.resolve_driver 一致——
     不再有 per-user ``agent_runtime_driver`` 开关；kill switch 改用删/换 active
-    route 或改 test_status）。
+    route 或改 test_status）。发现无条件进行——没有 gateway proxy 要避让，所有
+    fit provider 都直连（pi 走 openai-completions wire，不经 LiteLLM 网关）。
     AGENT 由 provider 派生（保持 CASE 与 cutover.driver_for_provider 同步）：
-    anthropic/deepseek → claude；openai → codex (native)。gateway-only provider
-    (gemini/openrouter/openai_compatible → codex via LiteLLM gateway) 仅当
-    ``include_gateway`` 时返回（gateway 关时不发现，避免 spawn 到不存在的 proxy）。
+    anthropic → claude；openai → codex (native)；其余 fit provider
+    （deepseek/gemini/openrouter/openai_compatible）→ pi。
     Returns [{"user_id","driver","provider","model","base_url","supports_responses",
     "reasoning_effort"}]
     sorted by user_id (``supports_responses`` is the openai_compatible relay's
     /v1/responses capability, set at setup; selects native passthrough vs the
     LiteLLM chat-completions bridge)。"""
-    providers = ["anthropic", "claude", "deepseek", "openai"]
-    if include_gateway:
-        providers += ["gemini", "openrouter", "openai_compatible"]
+    providers = ["anthropic", "claude", "deepseek", "openai",
+                 "gemini", "openrouter", "openai_compatible"]
     try:
         with get_pool().connection() as conn:
             rows = conn.execute(
@@ -1282,8 +1479,8 @@ def list_agent_runtime_enabled_users(include_gateway: bool = False) -> list[dict
                   CASE LOWER(c.provider)
                     WHEN 'anthropic' THEN 'claude'
                     WHEN 'claude'    THEN 'claude'
-                    WHEN 'deepseek'  THEN 'claude'
-                    ELSE 'codex'
+                    WHEN 'openai'    THEN 'codex'
+                    ELSE 'pi'
                   END AS driver,
                   LOWER(c.provider) AS provider,
                   r.model AS model,
@@ -1318,33 +1515,131 @@ def try_stamp_hosted_tick(user_id: str, doc: dict, now: float, interval_sec: flo
     the user's plaintext key can't each create a heartbeat in the same interval
     (the per-job consume path is separately deduped by the job-status CAS in
     log_patch_item). ``doc`` must carry a numeric ``ts`` field."""
+    sql = ("INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, 'hosted_tick', %s) "
+           "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc "
+           "WHERE COALESCE((user_blobs.doc->>'ts')::float8, 0) <= %s "
+           "RETURNING doc")
     try:
         threshold = now - interval_sec
         with get_pool().connection() as conn:
-            row = conn.execute(
-                "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, 'hosted_tick', %s) "
-                "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc "
-                "WHERE COALESCE((user_blobs.doc->>'ts')::float8, 0) <= %s "
-                "RETURNING doc",
-                (user_id, Jsonb(doc), threshold),
-            ).fetchone()
-        return row is not None
+            row = conn.execute(sql, (user_id, Jsonb(doc), threshold)).fetchone()
     except Exception as e:
         log.error("[db] try_stamp_hosted_tick(%s) failed: %s", user_id, e)
         return False
+    won = row is not None
+    if won:
+        from tee_shadow import mirror
+        mirror.execute(sql, (user_id, Jsonb(doc), threshold))
+    return won
+
+
+def claim_and_enqueue_introduction(
+    user_id: str,
+    settings_doc: dict,
+    job: dict,
+    *,
+    at_iso: str,
+    ts: float | None = None,
+    item_key: str | None = None,
+) -> dict | None:
+    """Cross-process exactly-once: claim the one-shot ``introduced_at`` marker
+    (user_blobs/proactive_settings) AND append the introduction job
+    (user_logs/proactive_jobs) in a SINGLE PostgreSQL transaction.
+
+    Why a transaction, not a per-process lock (Codex P1): backend workers and
+    the standalone runner do NOT share a Python lock, so two processes could
+    each read an empty marker and both enqueue. Here the guarded UPSERT is the
+    atomic gate — only the process whose ``jsonb_set`` actually flips the empty
+    marker gets a ``RETURNING`` row; everyone else loses. And because the job
+    INSERT is in the same transaction, a job-write failure rolls the marker back
+    automatically — the marker can never persist without a stored job, and there
+    is no ``unclaim`` step that could erase another caller's success.
+
+    ``settings_doc`` seeds the row ONLY when it does not yet exist (fresh user);
+    when the row exists the marker is merged in via ``jsonb_set`` so peer fields
+    (e.g. ``first_chat_ok_at``) are preserved. Returns ``{"job", "seq"}`` iff
+    THIS caller won and the job persisted, else ``None`` (already introduced,
+    lost the race, or a DB failure that rolled back)."""
+    # ON CONFLICT merges the marker into the EXISTING doc (jsonb_set) and also
+    # refreshes updated_at/version like every other proactive_settings mutation,
+    # WITHOUT clobbering peer fields (first_chat_ok_at, switches, timezone…).
+    claim_sql = (
+        "INSERT INTO user_blobs (user_id, kind, doc) "
+        "VALUES (%s, 'proactive_settings', %s) "
+        "ON CONFLICT (user_id, kind) DO UPDATE "
+        "  SET doc = jsonb_set(user_blobs.doc, '{introduced_at}', to_jsonb(%s::text), true) "
+        "            || jsonb_build_object('updated_at', %s::text, 'version', 2) "
+        "  WHERE COALESCE(user_blobs.doc->>'introduced_at', '') = '' "
+        "RETURNING doc"
+    )
+    job_sql = (
+        "INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
+        "VALUES (%s, 'proactive_jobs', %s, %s, %s) RETURNING seq"
+    )
+    claimed_doc = None
+    seq = None
+    try:
+        with get_pool().connection() as conn:
+            with conn.transaction():
+                row = conn.execute(claim_sql, (user_id, Jsonb(settings_doc), at_iso, at_iso)).fetchone()
+                if row is not None:
+                    claimed_doc = row[0]
+                    seq = conn.execute(job_sql, (user_id, ts, item_key, Jsonb(job))).fetchone()[0]
+    except Exception as e:
+        log.error("[db] claim_and_enqueue_introduction(%s) failed: %s", user_id, e)
+        return None
+    if claimed_doc is None or seq is None:
+        return None
+    # Committed on the primary — mirror BOTH rows into the TEE shadow as ONE
+    # transaction (they are a single logical write). The blob merges the marker
+    # (jsonb_set + updated_at/version) rather than overwriting the whole doc, so
+    # a late-arriving introduction mirror can't briefly clobber peer fields the
+    # reconciler already advanced on the shadow; the job seq is pinned so the
+    # shadow keeps the row identity every seq-ordered read relies on.
+    from tee_shadow import mirror
+    mirror.execute_many([
+        (
+            "INSERT INTO user_blobs (user_id, kind, doc) "
+            "VALUES (%s, 'proactive_settings', %s) "
+            "ON CONFLICT (user_id, kind) DO UPDATE "
+            "  SET doc = jsonb_set(user_blobs.doc, '{introduced_at}', to_jsonb(%s::text), true) "
+            "            || jsonb_build_object('updated_at', %s::text, 'version', 2)",
+            (user_id, Jsonb(claimed_doc), at_iso, at_iso),
+        ),
+        (
+            "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
+            "OVERRIDING SYSTEM VALUE VALUES (%s, 'proactive_jobs', %s, %s, %s, %s) "
+            "ON CONFLICT (user_id, stream, seq) DO NOTHING",
+            (user_id, seq, ts, item_key, Jsonb(job)),
+        ),
+    ])
+    return {"job": job, "seq": seq}
 
 
 def delete_blob(user_id: str, kind: str) -> bool:
+    sql = "DELETE FROM user_blobs WHERE user_id = %s AND kind = %s"
     try:
         with get_pool().connection() as conn:
-            cur = conn.execute(
-                "DELETE FROM user_blobs WHERE user_id = %s AND kind = %s",
-                (user_id, kind),
-            )
-        return cur.rowcount > 0
+            cur = conn.execute(sql, (user_id, kind))
     except Exception as e:
         log.error("[db] delete_blob(%s,%s) failed: %s", user_id, kind, e)
         return False
+    from tee_shadow import mirror
+    # Deletes are plaintext-safe even for kind='identity': removing the RDS
+    # ciphertext blob means the user's identity is gone, so dropping the TEE
+    # plaintext row is exactly right (unlike set_blob, which would clobber the
+    # replicator's plaintext with ciphertext — see set_blob's identity guard).
+    mirror.execute(sql, (user_id, kind))
+    if kind == "identity":
+        # Drop any requeue/terminal pending marker for this user's identity
+        # row too — worker._TABLES["identity"] is keyed by user_id alone (one
+        # row/user, no per-item id column), so a stale pending row here would
+        # otherwise outlive the RDS blob it was tracking and permanently
+        # unbalance verify's rds == tee + pending equation.
+        mirror.execute(
+            "DELETE FROM tee_pending_device_migration "
+            "WHERE user_id = %s AND table_name = 'identity'", (user_id,))
+    return cur.rowcount > 0
 
 
 def list_blobs(user_id: str, kind_prefix: str) -> list[dict]:
@@ -1380,30 +1675,34 @@ def _genesis_row(cur, row) -> dict | None:
 
 
 def genesis_create_job(user_id: str, job: dict) -> dict | None:
+    sql = (
+        """
+        INSERT INTO genesis_import_jobs
+            (user_id, job_id, status, source_kind, file_manifest_hash,
+             total_chunks, total_bytes, privacy_mode, metadata, output,
+             updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, '{}'::jsonb, now())
+        ON CONFLICT (user_id, job_id) DO NOTHING
+        RETURNING *
+        """
+    )
+    params = (
+        user_id,
+        job["job_id"],
+        job.get("status", "created"),
+        job.get("source_kind", "unknown"),
+        job.get("file_manifest_hash", ""),
+        int(job.get("total_chunks") or 0),
+        int(job.get("total_bytes") or 0),
+        job.get("privacy_mode", ""),
+        Jsonb(job.get("metadata") or {}),
+    )
     with get_pool().connection() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO genesis_import_jobs
-                (user_id, job_id, status, source_kind, file_manifest_hash,
-                 total_chunks, total_bytes, privacy_mode, metadata, output,
-                 updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, '{}'::jsonb, now())
-            ON CONFLICT (user_id, job_id) DO NOTHING
-            RETURNING *
-            """,
-            (
-                user_id,
-                job["job_id"],
-                job.get("status", "created"),
-                job.get("source_kind", "unknown"),
-                job.get("file_manifest_hash", ""),
-                int(job.get("total_chunks") or 0),
-                int(job.get("total_bytes") or 0),
-                job.get("privacy_mode", ""),
-                Jsonb(job.get("metadata") or {}),
-            ),
-        )
-        return _genesis_row(cur, cur.fetchone())
+        cur = conn.execute(sql, params)
+        result = _genesis_row(cur, cur.fetchone())
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
+    return result
 
 
 def genesis_get_job(user_id: str, job_id: str) -> dict | None:
@@ -1484,6 +1783,20 @@ def genesis_claim_uploaded_jobs(*, limit: int = 1) -> list[dict]:
             if hasattr(value, "isoformat"):
                 item[key] = value.isoformat()
         out.append(item)
+    if out:
+        # NOTE: re-running the SKIP LOCKED "picked" query against TEE could pick
+        # a different set of 'uploaded' rows than the primary just claimed (TEE's
+        # status snapshot can lag). Pin the mirror to the EXACT (user_id, job_id)
+        # pairs the primary actually claimed instead — deterministic, no drift.
+        placeholders = ", ".join(["(%s, %s)"] * len(out))
+        mirror_sql = (
+            "UPDATE genesis_import_jobs SET status = 'processing', error = '', "
+            "output = jsonb_build_object('stage', 'worker_claimed'), updated_at = now() "
+            f"WHERE (user_id, job_id) IN ({placeholders})"
+        )
+        mirror_params = tuple(v for item in out for v in (item["user_id"], item["job_id"]))
+        from tee_shadow import mirror
+        mirror.execute(mirror_sql, mirror_params)
     return out
 
 
@@ -1593,6 +1906,18 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
             if hasattr(value, "isoformat"):
                 item[key] = value.isoformat()
         out.append(item)
+    if out:
+        # Same rationale as genesis_claim_uploaded_jobs: pin the mirror to the
+        # exact rows the primary reaped rather than re-picking independently.
+        placeholders = ", ".join(["(%s, %s)"] * len(out))
+        mirror_sql = (
+            "UPDATE genesis_import_jobs SET status = 'failed', error = %s, updated_at = now() "
+            f"WHERE (user_id, job_id) IN ({placeholders})"
+        )
+        mirror_params = (error[:1000],) + tuple(
+            v for item in out for v in (item["user_id"], item["job_id"]))
+        from tee_shadow import mirror
+        mirror.execute(mirror_sql, mirror_params)
     return out
 
 
@@ -1796,20 +2121,24 @@ def genesis_delete_chunks(user_id: str, job_id: str) -> int:
 
 
 def genesis_mark_finalized(user_id: str, job_id: str) -> dict | None:
+    sql = (
+        """
+        UPDATE genesis_import_jobs SET
+            status = 'uploaded',
+            finalized_at = COALESCE(finalized_at, now()),
+            updated_at = now()
+        WHERE user_id = %s AND job_id = %s
+          AND status IN ('created', 'uploading', 'uploaded', 'failed')
+        RETURNING *
+        """
+    )
+    params = (user_id, job_id)
     with get_pool().connection() as conn:
-        cur = conn.execute(
-            """
-            UPDATE genesis_import_jobs SET
-                status = 'uploaded',
-                finalized_at = COALESCE(finalized_at, now()),
-                updated_at = now()
-            WHERE user_id = %s AND job_id = %s
-              AND status IN ('created', 'uploading', 'uploaded', 'failed')
-            RETURNING *
-            """,
-            (user_id, job_id),
-        )
-        return _genesis_row(cur, cur.fetchone())
+        cur = conn.execute(sql, params)
+        result = _genesis_row(cur, cur.fetchone())
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
+    return result
 
 
 def genesis_set_job_status(
@@ -1821,42 +2150,56 @@ def genesis_set_job_status(
     output: dict | None = None,
     processed_chunks: int | None = None,
 ) -> dict | None:
+    sql = (
+        """
+        UPDATE genesis_import_jobs SET
+            status = %s,
+            error = %s,
+            output = COALESCE(%s::jsonb, output),
+            processed_chunks = COALESCE(%s, processed_chunks),
+            updated_at = now()
+        WHERE user_id = %s AND job_id = %s
+        RETURNING *
+        """
+    )
+    params = (
+        status,
+        error[:1000],
+        Jsonb(output) if output is not None else None,
+        processed_chunks,
+        user_id,
+        job_id,
+    )
     with get_pool().connection() as conn:
-        cur = conn.execute(
-            """
-            UPDATE genesis_import_jobs SET
-                status = %s,
-                error = %s,
-                output = COALESCE(%s::jsonb, output),
-                processed_chunks = COALESCE(%s, processed_chunks),
-                updated_at = now()
-            WHERE user_id = %s AND job_id = %s
-            RETURNING *
-            """,
-            (
-                status,
-                error[:1000],
-                Jsonb(output) if output is not None else None,
-                processed_chunks,
-                user_id,
-                job_id,
-            ),
-        )
-        return _genesis_row(cur, cur.fetchone())
+        cur = conn.execute(sql, params)
+        result = _genesis_row(cur, cur.fetchone())
+    from tee_shadow import mirror
+    mirror.execute(sql, (
+        status,
+        error[:1000],
+        Jsonb(output) if output is not None else None,
+        processed_chunks,
+        user_id,
+        job_id,
+    ))
+    return result
 
 
 def genesis_touch_job(user_id: str, job_id: str) -> None:
     """Heartbeat: bump updated_at for a processing genesis job so the stale
     reaper can tell a live long import from a worker that died mid-run. No-op
     unless the job is currently 'processing'."""
+    sql = (
+        """
+        UPDATE genesis_import_jobs SET updated_at = now()
+        WHERE user_id = %s AND job_id = %s AND status = 'processing'
+        """
+    )
+    params = (user_id, job_id)
     with get_pool().connection() as conn:
-        conn.execute(
-            """
-            UPDATE genesis_import_jobs SET updated_at = now()
-            WHERE user_id = %s AND job_id = %s AND status = 'processing'
-            """,
-            (user_id, job_id),
-        )
+        conn.execute(sql, params)
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
 
 
 def genesis_upsert_output(
@@ -1868,22 +2211,25 @@ def genesis_upsert_output(
     status: str,
     ref: str = "",
 ) -> dict | None:
+    sql = (
+        """
+        INSERT INTO genesis_import_outputs
+            (user_id, job_id, output_type, ref, status, doc, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, now())
+        ON CONFLICT (user_id, job_id, output_type) DO UPDATE SET
+            ref = EXCLUDED.ref,
+            status = EXCLUDED.status,
+            doc = EXCLUDED.doc,
+            updated_at = now()
+        RETURNING *
+        """
+    )
     with get_pool().connection() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO genesis_import_outputs
-                (user_id, job_id, output_type, ref, status, doc, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, now())
-            ON CONFLICT (user_id, job_id, output_type) DO UPDATE SET
-                ref = EXCLUDED.ref,
-                status = EXCLUDED.status,
-                doc = EXCLUDED.doc,
-                updated_at = now()
-            RETURNING *
-            """,
-            (user_id, job_id, output_type, ref, status, Jsonb(doc)),
-        )
-        return _genesis_row(cur, cur.fetchone())
+        cur = conn.execute(sql, (user_id, job_id, output_type, ref, status, Jsonb(doc)))
+        result = _genesis_row(cur, cur.fetchone())
+    from tee_shadow import mirror
+    mirror.execute(sql, (user_id, job_id, output_type, ref, status, Jsonb(doc)))
+    return result
 
 
 def genesis_get_output(user_id: str, job_id: str, output_type: str) -> dict | None:
@@ -1906,33 +2252,34 @@ def genesis_complete_job(
     persona_ref: str,
     persona_sha256: str,
 ) -> dict | None:
+    sql = (
+        """
+        UPDATE genesis_import_jobs SET
+            status = 'done',
+            output = %s,
+            memory_action_count = %s,
+            identity_status = %s,
+            persona_ref = %s,
+            persona_sha256 = %s,
+            completed_at = COALESCE(completed_at, now()),
+            updated_at = now(),
+            error = ''
+        WHERE user_id = %s AND job_id = %s
+        RETURNING *
+        """
+    )
     with get_pool().connection() as conn:
-        cur = conn.execute(
-            """
-            UPDATE genesis_import_jobs SET
-                status = 'done',
-                output = %s,
-                memory_action_count = %s,
-                identity_status = %s,
-                persona_ref = %s,
-                persona_sha256 = %s,
-                completed_at = COALESCE(completed_at, now()),
-                updated_at = now(),
-                error = ''
-            WHERE user_id = %s AND job_id = %s
-            RETURNING *
-            """,
-            (
-                Jsonb(output),
-                int(memory_action_count),
-                identity_status[:120],
-                persona_ref[:240],
-                persona_sha256[:80],
-                user_id,
-                job_id,
-            ),
-        )
-        return _genesis_row(cur, cur.fetchone())
+        cur = conn.execute(sql, (
+            Jsonb(output), int(memory_action_count), identity_status[:120],
+            persona_ref[:240], persona_sha256[:80], user_id, job_id,
+        ))
+        result = _genesis_row(cur, cur.fetchone())
+    from tee_shadow import mirror
+    mirror.execute(sql, (
+        Jsonb(output), int(memory_action_count), identity_status[:120],
+        persona_ref[:240], persona_sha256[:80], user_id, job_id,
+    ))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2003,6 +2350,7 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
         and doc.get("body_ct") is not None
     )
     trimmed_docs: list = []
+    trimmed_ids: list[str] = []
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
@@ -2020,10 +2368,11 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
                         "    SELECT seq FROM chat_messages WHERE user_id = %s "
                         "    ORDER BY seq DESC LIMIT %s"
                         "  ) t"
-                        ") RETURNING doc",
+                        ") RETURNING msg_id, doc",
                         (user_id, user_id, max_messages),
                     ).fetchall()
-                    trimmed_docs = [r[0] for r in rows]
+                    trimmed_ids = [r[0] for r in rows]
+                    trimmed_docs = [r[1] for r in rows]
         if offload:
             # 2) upload OUTSIDE the txn; on failure the inline row stays readable.
             try:
@@ -2055,22 +2404,41 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
                     object_storage.delete_chat_file_body(user_id, str(d.get("id") or ""))
     except Exception as e:
         log.error("[db] chat_append(%s,%s) failed: %s", user_id, msg_id, e)
+        return
+    if trimmed_ids:
+        # Primary trim committed → pin the mirror DELETE to the EXACT rows
+        # evicted from RDS (same "pin to actual eviction" pattern as
+        # frame_prune_to, rather than re-deriving "newest max_messages"
+        # independently against TEE's own row set/order). Also drop any
+        # tee_pending_device_migration markers those rows may carry (e.g. a
+        # requeue/visibility_local_only marker from a swap shortly before
+        # eviction) — otherwise a trimmed-away row's pending marker survives
+        # forever with no RDS row left to justify it, permanently unbalancing
+        # verify's rds == tee + pending equation (a false "missing row").
+        from tee_shadow import mirror
+        mirror.execute_many([
+            ("DELETE FROM chat_messages WHERE user_id = %s AND msg_id = ANY(%s)",
+             (user_id, trimmed_ids)),
+            ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+             "AND table_name = 'chat_messages' AND item_id = ANY(%s)",
+             (user_id, trimmed_ids)),
+        ])
 
 
 def chat_update_metadata(user_id: str, msg_id: str, fields: dict) -> dict | None:
     """Shallow-merge ``fields`` into the stored message doc. Returns the merged
     doc, or None if the message was not found."""
+    sql = ("UPDATE chat_messages SET doc = doc || %s WHERE user_id = %s AND msg_id = %s "
+           "RETURNING doc")
     try:
         with get_pool().connection() as conn:
-            row = conn.execute(
-                "UPDATE chat_messages SET doc = doc || %s WHERE user_id = %s AND msg_id = %s "
-                "RETURNING doc",
-                (Jsonb(fields), user_id, msg_id),
-            ).fetchone()
-        return row[0] if row is not None else None
+            row = conn.execute(sql, (Jsonb(fields), user_id, msg_id)).fetchone()
     except Exception as e:
         log.error("[db] chat_update_metadata(%s,%s) failed: %s", user_id, msg_id, e)
         return None
+    from tee_shadow import mirror
+    mirror.execute(sql, (Jsonb(fields), user_id, msg_id))
+    return row[0] if row is not None else None
 
 
 def chat_try_claim_reply(
@@ -2113,33 +2481,37 @@ def chat_try_claim_reply(
     if not redelivery:
         params.append(consumer_id)
     params.append(now)
+    sql = (
+        "UPDATE chat_messages SET doc = doc || %s "
+        "WHERE user_id = %s AND msg_id = %s "
+        # Reject already-replied rows in the DB itself, not just via the
+        # caller's (possibly stale) cache pre-gate: another worker may
+        # have posted the reply (reply_status/reply_message_id) after
+        # this worker last refreshed. Mirrors _chat_message_claimable.
+        "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+        "  AND COALESCE(doc->>'reply_message_id','') = '' "
+        f"{unanswered_tail_sql}"
+        "  AND ("
+        "    COALESCE(doc->>'reply_claimed_by','') = '' "
+        f"    {same_consumer_sql}"
+        "    OR COALESCE(NULLIF(doc->>'reply_claim_expires_at','')::float8, 0) <= %s"
+        ") RETURNING doc"
+    )
     try:
         with get_pool().connection() as conn:
-            row = conn.execute(
-                "UPDATE chat_messages SET doc = doc || %s "
-                "WHERE user_id = %s AND msg_id = %s "
-                # Reject already-replied rows in the DB itself, not just via the
-                # caller's (possibly stale) cache pre-gate: another worker may
-                # have posted the reply (reply_status/reply_message_id) after
-                # this worker last refreshed. Mirrors _chat_message_claimable.
-                "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
-                "  AND COALESCE(doc->>'reply_message_id','') = '' "
-                f"{unanswered_tail_sql}"
-                "  AND ("
-                "    COALESCE(doc->>'reply_claimed_by','') = '' "
-                f"    {same_consumer_sql}"
-                "    OR COALESCE(NULLIF(doc->>'reply_claim_expires_at','')::float8, 0) <= %s"
-                ") RETURNING doc",
-                tuple(params),
-            ).fetchone()
-        if row is None:
-            return None
-        # This is a delivery exit — the resident consumer decrypts the returned
-        # doc, so an R2-offloaded file must arrive with body_ct inlined.
-        return hydrate_chat_file_body(user_id, row[0])
+            row = conn.execute(sql, tuple(params)).fetchone()
     except Exception as e:
         log.error("[db] chat_try_claim_reply(%s,%s) failed: %s", user_id, msg_id, e)
         return None
+    if row is None:
+        return None
+    # Only mirror the claim itself (a real state transition) — not a
+    # rejected/no-op attempt, per the brief's "claim 状态字段更新" scope.
+    from tee_shadow import mirror
+    mirror.execute(sql, tuple(params))
+    # This is a delivery exit — the resident consumer decrypts the returned
+    # doc, so an R2-offloaded file must arrive with body_ct inlined.
+    return hydrate_chat_file_body(user_id, row[0])
 
 
 def chat_expire_reply_claims(user_id: str) -> int:
@@ -2151,64 +2523,79 @@ def chat_expire_reply_claims(user_id: str) -> int:
 
     WHERE 条件与 chat_try_claim_reply 的 CAS 对齐：只碰未回复（reply_status 不是
     replied 且 reply_message_id 为空）且当前确实被 claim 住的行。"""
+    sql = (
+        "UPDATE chat_messages "
+        "SET doc = doc || '{\"reply_claimed_by\":\"\",\"reply_claim_expires_at\":\"\"}'::jsonb "
+        "WHERE user_id = %s "
+        "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
+        "  AND COALESCE(doc->>'reply_message_id','') = '' "
+        "  AND COALESCE(doc->>'reply_claimed_by','') <> ''"
+    )
     try:
         with get_pool().connection() as conn:
-            cur = conn.execute(
-                "UPDATE chat_messages "
-                "SET doc = doc || '{\"reply_claimed_by\":\"\",\"reply_claim_expires_at\":\"\"}'::jsonb "
-                "WHERE user_id = %s "
-                "  AND (doc->>'reply_status') IS DISTINCT FROM 'replied' "
-                "  AND COALESCE(doc->>'reply_message_id','') = '' "
-                "  AND COALESCE(doc->>'reply_claimed_by','') <> ''",
-                (user_id,),
-            )
-            return cur.rowcount
+            cur = conn.execute(sql, (user_id,))
     except Exception as e:
         log.error("[db] chat_expire_reply_claims(%s) failed: %s", user_id, e)
         return 0
+    if cur.rowcount:
+        # 与 chat_try_claim_reply 的 claim mirror 对称：claim 的释放同样是
+        # claim 状态字段更新，不镜像会让 TEE 侧残留已失效的 claim 字段。
+        from tee_shadow import mirror
+        mirror.execute(sql, (user_id,))
+    return cur.rowcount
 
 
 def chat_delete(user_id: str, msg_id: str) -> bool:
+    sql = "DELETE FROM chat_messages WHERE user_id = %s AND msg_id = %s"
     try:
         with get_pool().connection() as conn:
-            row = conn.execute(
-                "DELETE FROM chat_messages WHERE user_id = %s AND msg_id = %s RETURNING doc",
-                (user_id, msg_id),
-            ).fetchone()
-        if row is None:
-            return False
-        # Drop the offloaded R2 body if this was a file message.
-        doc = row[0]
-        if (
-            object_storage.chat_files_enabled()
-            and isinstance(doc, dict)
-            and doc.get("body_key")
-            and doc.get("content_type") == "file"
-        ):
-            object_storage.delete_chat_file_body(user_id, str(doc.get("id") or msg_id))
-        return True
+            row = conn.execute(sql + " RETURNING doc", (user_id, msg_id)).fetchone()
     except Exception as e:
         log.error("[db] chat_delete(%s,%s) failed: %s", user_id, msg_id, e)
         return False
+    # Mirror unconditionally (idempotent DELETE): even a not-found primary delete
+    # may self-heal a TEE row left behind by an earlier missed mirror write.
+    from tee_shadow import mirror
+    mirror.execute_many([
+        (sql, (user_id, msg_id)),
+        ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+         "AND table_name = 'chat_messages' AND item_id = %s", (user_id, msg_id)),
+    ])
+    if row is None:
+        return False
+    # Drop the offloaded R2 body if this was a file message.
+    doc = row[0]
+    if (
+        object_storage.chat_files_enabled()
+        and isinstance(doc, dict)
+        and doc.get("body_key")
+        and doc.get("content_type") == "file"
+    ):
+        object_storage.delete_chat_file_body(user_id, str(doc.get("id") or msg_id))
+    return True
 
 
 def chat_clear(user_id: str) -> int | None:
     """Delete every chat row for one user. Returns deleted row count, or None
     if the database operation failed."""
+    sql = "DELETE FROM chat_messages WHERE user_id = %s"
     try:
         with get_pool().connection() as conn:
-            cur = conn.execute(
-                "DELETE FROM chat_messages WHERE user_id = %s",
-                (user_id,),
-            )
+            cur = conn.execute(sql, (user_id,))
         # Prefix-delete every offloaded chat-file body for this user (cheap no-op
         # when R2 is unconfigured or the user never sent a file).
         if object_storage.chat_files_enabled():
             object_storage.delete_user_chat_files(user_id)
-        return cur.rowcount
     except Exception as e:
         log.error("[db] chat_clear(%s) failed: %s", user_id, e)
         return None
+    from tee_shadow import mirror
+    mirror.execute_many([
+        (sql, (user_id,)),
+        ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+         "AND table_name = 'chat_messages'", (user_id,)),
+    ])
+    return cur.rowcount
 
 
 # ---------------------------------------------------------------------------
@@ -2242,23 +2629,34 @@ def memory_upsert(user_id: str, moment_id: str, occurred_at: str, doc: dict) -> 
                 "occurred_at = EXCLUDED.occurred_at, doc = EXCLUDED.doc",
                 (user_id, moment_id, occurred_at or "", Jsonb(doc)),
             )
-        return True
     except Exception as e:
         log.error("[db] memory_upsert(%s,%s) failed: %s", user_id, moment_id, e)
         return False
+    # Primary committed. This is a same-PK in-place rewrite (insert-or-edit),
+    # which the append-only replicator cursor never revisits once the PK has
+    # been seen (or, for a back-dated occurred_at, may never even reach in
+    # forward scan order) — same requeue-lane pattern as memory_replace_all's
+    # survivors. Best-effort: mirror swallows failures.
+    from tee_shadow import mirror
+    mirror.mark_pending(user_id, "memory_moments", moment_id, "requeue")
+    return True
 
 
 def memory_delete(user_id: str, moment_id: str) -> bool:
+    sql = "DELETE FROM memory_moments WHERE user_id = %s AND moment_id = %s"
     try:
         with get_pool().connection() as conn:
-            cur = conn.execute(
-                "DELETE FROM memory_moments WHERE user_id = %s AND moment_id = %s",
-                (user_id, moment_id),
-            )
-        return cur.rowcount > 0
+            cur = conn.execute(sql, (user_id, moment_id))
     except Exception as e:
         log.error("[db] memory_delete(%s,%s) failed: %s", user_id, moment_id, e)
         return False
+    from tee_shadow import mirror
+    mirror.execute_many([
+        (sql, (user_id, moment_id)),
+        ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+         "AND table_name = 'memory_moments' AND item_id = %s", (user_id, moment_id)),
+    ])
+    return cur.rowcount > 0
 
 
 def memory_replace_all(user_id: str, moments: list[dict]) -> None:
@@ -2267,6 +2665,8 @@ def memory_replace_all(user_id: str, moments: list[dict]) -> None:
     that were removed are deleted and only rows whose doc changed are upserted,
     so a single-card edit no longer rewrites the user's entire garden. Used
     where the old code did load-list / mutate / save-whole-list."""
+    removed_ids: list[str] = []
+    survivor_ids: list[str] = []
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
@@ -2280,7 +2680,9 @@ def memory_replace_all(user_id: str, moments: list[dict]) -> None:
                 # DELETE-then-INSERT/ON CONFLICT behavior; drop id-less dicts.
                 new = {str(m["id"]): m for m in moments if m.get("id")}
 
-                for mid in existing.keys() - new.keys():
+                removed_ids = list(existing.keys() - new.keys())
+                survivor_ids = list(new.keys())
+                for mid in removed_ids:
                     conn.execute(
                         "DELETE FROM memory_moments WHERE user_id = %s AND moment_id = %s",
                         (user_id, mid),
@@ -2304,6 +2706,29 @@ def memory_replace_all(user_id: str, moments: list[dict]) -> None:
                     )
     except Exception as e:
         log.error("[db] memory_replace_all(%s) failed: %s", user_id, e)
+        return
+    # Primary committed → propagate to the TEE shadow (best-effort). memory rows
+    # are ciphertext→plaintext REPLICATED (not dual-written), and an in-place
+    # edit keeps the same (occurred_at, moment_id) PK while a back-dated insert
+    # lands BEHIND the append-only cursor — the replicator never revisits either.
+    # So: mirror the pinned DELETEs for removed ids (same pattern as
+    # frame_prune_to) + enqueue every survivor on the requeue lane. memory sets
+    # are small (tens), so requeue-all-survivors is acceptable churn (brief §C3).
+    from tee_shadow import mirror
+    if removed_ids:
+        # Same "pin to actual eviction + clear its pending marker" pattern used
+        # throughout: a removed moment may itself carry a stale pending row
+        # (e.g. it was mid-requeue), which would otherwise outlive the now-gone
+        # RDS row and permanently unbalance verify's rds == tee + pending count.
+        mirror.execute_many([
+            ("DELETE FROM memory_moments WHERE user_id = %s AND moment_id = ANY(%s)",
+             (user_id, removed_ids)),
+            ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+             "AND table_name = 'memory_moments' AND item_id = ANY(%s)",
+             (user_id, removed_ids)),
+        ])
+    for mid in survivor_ids:
+        mirror.mark_pending(user_id, "memory_moments", mid, "requeue")
 
 
 # ---------------------------------------------------------------------------
@@ -2335,26 +2760,40 @@ def world_book_upsert(user_id: str, entry_id: str, updated_at: str, doc: dict) -
                 "updated_at = EXCLUDED.updated_at, doc = EXCLUDED.doc",
                 (user_id, entry_id, updated_at or "", Jsonb(doc)),
             )
-        return True
     except Exception as e:
         log.error("[db] world_book_upsert(%s,%s) failed: %s", user_id, entry_id, e)
         return False
+    # Same same-PK in-place-rewrite reasoning as memory_upsert above — requeue
+    # so the next replicator pass re-derives the TEE plaintext. Best-effort:
+    # mirror swallows failures.
+    from tee_shadow import mirror
+    mirror.mark_pending(user_id, "world_book_entries", entry_id, "requeue")
+    return True
 
 
 def world_book_delete(user_id: str, entry_id: str) -> bool:
+    sql = "DELETE FROM world_book_entries WHERE user_id = %s AND entry_id = %s"
     try:
         with get_pool().connection() as conn:
-            cur = conn.execute(
-                "DELETE FROM world_book_entries WHERE user_id = %s AND entry_id = %s",
-                (user_id, entry_id),
-            )
-        return cur.rowcount > 0
+            cur = conn.execute(sql, (user_id, entry_id))
     except Exception as e:
         log.error("[db] world_book_delete(%s,%s) failed: %s", user_id, entry_id, e)
         return False
+    from tee_shadow import mirror
+    mirror.execute_many([
+        (sql, (user_id, entry_id)),
+        ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+         "AND table_name = 'world_book_entries' AND item_id = %s", (user_id, entry_id)),
+    ])
+    return cur.rowcount > 0
 
 
 def world_book_replace_all(user_id: str, entries: list[dict]) -> None:
+    # NOTE: currently has no callers (grep-confirmed); the TEE-propagation fix
+    # below is applied for symmetry with memory_replace_all (cheap + correct) so
+    # it can't silently reintroduce the C3 defect if a caller is added later.
+    removed_ids: list[str] = []
+    survivor_ids: list[str] = []
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
@@ -2364,7 +2803,9 @@ def world_book_replace_all(user_id: str, entries: list[dict]) -> None:
                 ).fetchall()
                 existing = {r[0]: (r[1], r[2]) for r in rows}
                 new = {str(e["id"]): e for e in entries if e.get("id")}
-                for entry_id in existing.keys() - new.keys():
+                removed_ids = list(existing.keys() - new.keys())
+                survivor_ids = list(new.keys())
+                for entry_id in removed_ids:
                     conn.execute(
                         "DELETE FROM world_book_entries WHERE user_id = %s AND entry_id = %s",
                         (user_id, entry_id),
@@ -2383,6 +2824,20 @@ def world_book_replace_all(user_id: str, entries: list[dict]) -> None:
                     )
     except Exception as e:
         log.error("[db] world_book_replace_all(%s) failed: %s", user_id, e)
+        return
+    # Same disease/cure as memory_replace_all (world_book is also ciphertext→
+    # plaintext replicated with an in-place-editable (updated_at, entry_id) PK).
+    from tee_shadow import mirror
+    if removed_ids:
+        mirror.execute_many([
+            ("DELETE FROM world_book_entries WHERE user_id = %s AND entry_id = ANY(%s)",
+             (user_id, removed_ids)),
+            ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+             "AND table_name = 'world_book_entries' AND item_id = ANY(%s)",
+             (user_id, removed_ids)),
+        ])
+    for entry_id in survivor_ids:
+        mirror.mark_pending(user_id, "world_book_entries", entry_id, "requeue")
 
 
 # ─────────────────────────── model_api credentials / routes ───────────────────
@@ -2872,8 +3327,21 @@ def frame_delete(user_id: str, frame_id: str) -> None:
         # place; deleting it now would corrupt later reads of the still-present row.
         log.error("[db] frame_delete(%s,%s) failed: %s", user_id, frame_id, e)
         return
+    # TEE's shadow table is `frames` (different columns; same user_id/frame_id
+    # PK) — see backend/alembic_tee/versions/0001_tee_baseline.py. pending_table
+    # for frames is "frame_envelopes" (worker._TABLES / verify._CIPHERTEXT_TABLES
+    # key), not "frames".
+    from tee_shadow import mirror
+    mirror.execute_many([
+        ("DELETE FROM frames WHERE user_id = %s AND frame_id = %s", (user_id, frame_id)),
+        ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+         "AND table_name = 'frame_envelopes' AND item_id = %s", (user_id, frame_id)),
+    ])
     if object_storage.enabled():
         object_storage.delete_frame_body(user_id, frame_id)
+        # Also reap the TEE storage-layer re-encrypted body (frames-tee/) so a
+        # single-frame delete doesn't orphan it (best-effort, same style).
+        object_storage.delete_frame_tee_body(user_id, frame_id)
 
 
 def frame_list_meta(user_id: str) -> list[dict]:
@@ -2927,9 +3395,25 @@ def frame_prune_to(user_id: str, max_frames: int) -> list[str]:
                         "DELETE FROM frame_envelopes WHERE user_id = %s AND frame_id = ANY(%s)",
                         (user_id, evicted),
                     )
+        if evicted:
+            # Pin the mirror delete to the EXACT ids evicted from RDS (rather
+            # than re-deriving "newest max_frames" independently against TEE's
+            # `frames` table, which could have a different row set/order).
+            # Also clear any pending marker those ids carry (pending_table is
+            # "frame_envelopes", not "frames" — see frame_delete).
+            from tee_shadow import mirror
+            mirror.execute_many([
+                ("DELETE FROM frames WHERE user_id = %s AND frame_id = ANY(%s)",
+                 (user_id, evicted)),
+                ("DELETE FROM tee_pending_device_migration WHERE user_id = %s "
+                 "AND table_name = 'frame_envelopes' AND item_id = ANY(%s)",
+                 (user_id, evicted)),
+            ])
         if evicted and object_storage.enabled():
             for fid in evicted:
                 object_storage.delete_frame_body(user_id, fid)
+                # Reap the TEE storage-layer re-encrypted body too (frames-tee/).
+                object_storage.delete_frame_tee_body(user_id, fid)
         return evicted
     except Exception as e:
         log.error("[db] frame_prune_to(%s) failed: %s", user_id, e)
@@ -2943,15 +3427,29 @@ def frame_prune_to(user_id: str, max_frames: int) -> list[str]:
 
 def log_append(user_id: str, stream: str, doc: dict,
                ts: float | None = None, item_key: str | None = None) -> None:
+    sql = ("INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
+           "VALUES (%s, %s, %s, %s, %s) RETURNING seq")
     try:
         with get_pool().connection() as conn:
-            conn.execute(
-                "INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
-                "VALUES (%s, %s, %s, %s, %s)",
-                (user_id, stream, ts, item_key, Jsonb(doc)),
-            )
+            row = conn.execute(sql, (user_id, stream, ts, item_key, Jsonb(doc))).fetchone()
     except Exception as e:
         log.error("[db] log_append(%s,%s) failed: %s", user_id, stream, e)
+        return
+    if row is None:
+        return
+    # Mirror with the PRIMARY-assigned seq pinned explicitly (OVERRIDING SYSTEM
+    # VALUE): user_logs.seq is GENERATED ALWAYS AS IDENTITY, so a plain INSERT
+    # on the TEE side would mint its own, independent seq and break the
+    # cross-db row-identity invariant every seq-ordered read path relies on.
+    # ON CONFLICT DO NOTHING makes a reconciler replay of this same row
+    # (same PK (user_id, stream, seq)) idempotent rather than erroring.
+    from tee_shadow import mirror
+    mirror_sql = (
+        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
+        "OVERRIDING SYSTEM VALUE VALUES (%s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (user_id, stream, seq) DO NOTHING"
+    )
+    mirror.execute(mirror_sql, (user_id, stream, row[0], ts, item_key, Jsonb(doc)))
 
 
 def log_read(user_id: str, stream: str, limit: int = 100, since_epoch: float = 0.0) -> list[dict]:
@@ -2989,25 +3487,34 @@ def log_patch_item(user_id: str, stream: str, item_key: str, patch: dict,
     """Shallow-merge ``patch`` into the newest log row matching ``item_key``.
     When ``only_if_status`` is set, the update only applies if the row's current
     ``doc->>'status'`` equals it (returns None otherwise). Returns merged doc."""
+    params: list = [Jsonb(patch), user_id, stream, user_id, stream, item_key]
+    guard = ""
+    if only_if_status is not None:
+        guard = " AND doc->>'status' = %s"
+        params.append(only_if_status)
+    sql = (
+        "UPDATE user_logs SET doc = doc || %s "
+        "WHERE user_id = %s AND stream = %s AND seq = ("
+        "  SELECT seq FROM user_logs WHERE user_id = %s AND stream = %s AND item_key = %s "
+        "  ORDER BY seq DESC LIMIT 1"
+        ")" + guard + " RETURNING doc"
+    )
     try:
-        params: list = [Jsonb(patch), user_id, stream, user_id, stream, item_key]
-        guard = ""
-        if only_if_status is not None:
-            guard = " AND doc->>'status' = %s"
-            params.append(only_if_status)
-        sql = (
-            "UPDATE user_logs SET doc = doc || %s "
-            "WHERE user_id = %s AND stream = %s AND seq = ("
-            "  SELECT seq FROM user_logs WHERE user_id = %s AND stream = %s AND item_key = %s "
-            "  ORDER BY seq DESC LIMIT 1"
-            ")" + guard + " RETURNING doc"
-        )
         with get_pool().connection() as conn:
             row = conn.execute(sql, tuple(params)).fetchone()
-        return row[0] if row is not None else None
     except Exception as e:
         log.error("[db] log_patch_item(%s,%s,%s) failed: %s", user_id, stream, item_key, e)
         return None
+    if row is not None:
+        # Only mirror when the primary's guard (only_if_status) actually
+        # matched a row — a rejected/no-op guarded update must not be
+        # replayed against TEE (same convention as chat_try_claim_reply /
+        # scheduled_wake claim_due). A missed real update is caught by the
+        # reconciler; mirroring a rejection would forge a transition that
+        # never happened on the primary.
+        from tee_shadow import mirror
+        mirror.execute(sql, tuple(params))
+    return row[0] if row is not None else None
 
 
 def log_trim(user_id: str, stream: str, max_rows: int,
@@ -3022,37 +3529,42 @@ def log_trim(user_id: str, stream: str, max_rows: int,
     computed over all rows; only the *deletion* is status-restricted."""
     if not max_rows or max_rows <= 0:
         return
+    sql = (
+        "DELETE FROM user_logs WHERE user_id = %s AND stream = %s AND seq < ("
+        "  SELECT MIN(seq) FROM ("
+        "    SELECT seq FROM user_logs WHERE user_id = %s AND stream = %s "
+        "    ORDER BY seq DESC LIMIT %s"
+        "  ) t"
+        ")"
+    )
+    params: list = [user_id, stream, user_id, stream, max_rows]
+    if only_statuses:
+        sql += " AND doc->>'status' = ANY(%s)"
+        params.append(list(only_statuses))
     try:
-        sql = (
-            "DELETE FROM user_logs WHERE user_id = %s AND stream = %s AND seq < ("
-            "  SELECT MIN(seq) FROM ("
-            "    SELECT seq FROM user_logs WHERE user_id = %s AND stream = %s "
-            "    ORDER BY seq DESC LIMIT %s"
-            "  ) t"
-            ")"
-        )
-        params: list = [user_id, stream, user_id, stream, max_rows]
-        if only_statuses:
-            sql += " AND doc->>'status' = ANY(%s)"
-            params.append(list(only_statuses))
         with get_pool().connection() as conn:
             conn.execute(sql, params)
     except Exception as e:
         log.error("[db] log_trim(%s,%s) failed: %s", user_id, stream, e)
+        return
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
 
 
 def log_prune_older_than(user_id: str, stream: str, cutoff_epoch: float) -> None:
     """Delete rows whose ts is older than the cutoff. Rows with NULL ts are
     kept (those streams don't carry an epoch ts)."""
+    sql = ("DELETE FROM user_logs WHERE user_id = %s AND stream = %s "
+           "AND ts IS NOT NULL AND ts < %s")
+    params = (user_id, stream, cutoff_epoch)
     try:
         with get_pool().connection() as conn:
-            conn.execute(
-                "DELETE FROM user_logs WHERE user_id = %s AND stream = %s "
-                "AND ts IS NOT NULL AND ts < %s",
-                (user_id, stream, cutoff_epoch),
-            )
+            conn.execute(sql, params)
     except Exception as e:
         log.error("[db] log_prune_older_than(%s,%s) failed: %s", user_id, stream, e)
+        return
+    from tee_shadow import mirror
+    mirror.execute(sql, params)
 
 
 # ---------------------------------------------------------------------------
@@ -3064,28 +3576,49 @@ def delete_user_data(user_id: str) -> None:
     """Redundant DB belt: per-user 行现由 delete_user 的 CASCADE 原子清净
     (0011)。仍被 content/content_core.py 的销号(account/reset)兜底路径调用；
     删账号主路径不再依赖它做 R2。"""
+    tables = (
+        "chat_messages",
+        "memory_moments",
+        "world_book_entries",
+        "frame_envelopes",
+        "user_logs",
+        "user_blobs",
+        "perception_items",
+        "perception_daily",
+        "agent_runtime_instances",
+        "genesis_import_chunks",
+        "genesis_import_outputs",
+        "genesis_import_jobs",
+        "model_api_routes",
+        "model_api_credentials",
+    )
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
-                for table in (
-                    "chat_messages",
-                    "memory_moments",
-                    "world_book_entries",
-                    "frame_envelopes",
-                    "user_logs",
-                    "user_blobs",
-                    "perception_items",
-                    "perception_daily",
-                    "agent_runtime_instances",
-                    "genesis_import_chunks",
-                    "genesis_import_outputs",
-                    "genesis_import_jobs",
-                    "model_api_routes",
-                    "model_api_credentials",
-                ):
+                for table in tables:
                     conn.execute(f"DELETE FROM {table} WHERE user_id = %s", (user_id,))
     except Exception as e:
         log.error("[db] delete_user_data(%s) failed: %s", user_id, e)
+        return
+    # TEE: frame_envelopes -> frames (different shape, same PK). Skipped from the
+    # mirror group: genesis_import_chunks (staging data, never replicated — see
+    # 0001_tee_baseline.py) and the model_api_* tables (0014 multi-profile,
+    # added upstream after the TEE 19-table baseline; not replicated).
+    tee_table_for = {"frame_envelopes": "frames"}
+    _no_tee_tables = {"genesis_import_chunks", "model_api_routes", "model_api_credentials"}
+    mirror_group = [
+        (f"DELETE FROM {tee_table_for.get(table, table)} WHERE user_id = %s", (user_id,))
+        for table in tables
+        if table not in _no_tee_tables
+    ]
+    # Full-user wipe → no RDS row of ANY table survives for this user, so no
+    # tee_pending_device_migration row should either (regardless of table_name
+    # or reason) — clear the whole per-user pending set in one shot rather than
+    # re-deriving it table-by-table.
+    mirror_group.append(
+        ("DELETE FROM tee_pending_device_migration WHERE user_id = %s", (user_id,)))
+    from tee_shadow import mirror
+    mirror.execute_many(mirror_group)
 
 
 def delete_user_frames(user_id: str) -> None:

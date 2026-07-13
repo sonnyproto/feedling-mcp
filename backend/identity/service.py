@@ -12,6 +12,7 @@ import db
 from core.store import UserStore
 
 from memory import service as memory_service
+from identity.card_policy import RUNTIME_LABELS as _IDENTITY_RUNTIME_LABELS
 
 def _load_identity(store: UserStore) -> dict | None:
     try:
@@ -26,6 +27,13 @@ def _load_identity(store: UserStore) -> dict | None:
 def _save_identity(store: UserStore, data: dict):
     with store.identity_lock:
         db.set_blob(store.user_id, "identity", data)
+    # identity 密文信封由 tee_replicator 明文化管辖（db.set_blob 不镜像 identity）。
+    # 一次原地 identity UPDATE 保持同一 user_blobs PK，游标式 replicator 永不回头，
+    # 故把它放上 requeue lane：下一趟 worker identity pass 会重新解密落 TEE 明文。
+    # 影子期尽力而为（写失败吞掉）。item_id 用常量 "identity"，与
+    # tee_replicator.worker 的 identity _Table（unpack 写死 item_id="identity"）对齐。
+    from tee_shadow import mirror
+    mirror.mark_pending(store.user_id, "identity", "identity", "requeue")
 
 
 # Identity change audit log
@@ -136,15 +144,6 @@ def _live_days_with_user(identity: dict, store: UserStore | None = None) -> int:
         return 0
     return max(0, (datetime.now().date() - anchor_date).days)
 
-
-_IDENTITY_RUNTIME_LABELS = {
-    "io", "feedling", "p0", "p-zero",
-    "hermes", "claude", "claude code", "claude desktop", "claude-code", "claude-desktop",
-    "claude.ai", "anthropic", "openclaw", "open-claw", "open claw", "cursor",
-    "chatgpt", "chat-gpt", "gpt", "gpt-4", "gpt-4o", "gpt-5", "openai", "openrouter",
-    "gemini", "google ai", "google", "bard", "deepseek", "minimax", "copilot", "github copilot",
-    "agent", "assistant", "ai", "bot",
-}
 
 _IDENTITY_PROFILE_STRING_FIELDS = (
     "agent_name",

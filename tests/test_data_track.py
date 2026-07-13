@@ -397,6 +397,156 @@ def test_fast_validation_genesis_user_is_complete_despite_empty_tabs():
     assert mg["passing"] is True  # cards exist -> garden satisfied (bucket-agnostic)
 
 
+# App usage-duration rendering (app_session_end aggregation surfaced in the overview).
+def test_fmt_duration_sec_compact_human_readable():
+    assert _dt._fmt_duration_sec(0) == "0s"
+    assert _dt._fmt_duration_sec(45) == "45s"
+    assert _dt._fmt_duration_sec(137) == "2m17s"
+    assert _dt._fmt_duration_sec(120) == "2m"
+    assert _dt._fmt_duration_sec(5400) == "1h30m"
+    assert _dt._fmt_duration_sec(3600) == "1h"
+    assert _dt._fmt_duration_sec(None) == "—"
+    assert _dt._fmt_duration_sec("nope") == "—"
+    # rounds and never negative
+    assert _dt._fmt_duration_sec(59.6) == "1m"
+
+
+def test_beijing_time_display_helpers():
+    # Display-only Beijing (UTC+8) conversion; storage stays UTC. Inputs are an
+    # epoch or an explicit-UTC value so the assertion is host-timezone-independent.
+    import calendar
+    utc_midnight = calendar.timegm((2026, 7, 13, 0, 0, 0, 0, 0, 0))  # 2026-07-13 00:00:00 UTC
+    # epoch -> Beijing wall clock is 08:00 the same day
+    assert _dt._debug_time(utc_midnight) == "07-13 08:00:00"
+    assert _dt._bj_iso(utc_midnight) == "2026-07-13 08:00:00"
+    # a stored (naive) UTC ISO string is treated as UTC, then shifted +8
+    assert _dt._bj_iso("2026-07-13T00:00:00") == "2026-07-13 08:00:00"
+    assert _dt._bj_iso("2026-07-12T20:30:00") == "2026-07-13 04:30:00"  # crosses the day
+    # empties stay empty; zero epoch is the "no time" sentinel
+    assert _dt._bj_iso("") == ""
+    assert _dt._bj_iso(None) == ""
+    assert _dt._debug_time(0) == "—"
+    # fail-soft: a wildly out-of-range epoch must not raise (would 500 the page)
+    assert isinstance(_dt._bj_iso(10 ** 30), str)
+    assert _dt._debug_time(10 ** 30) == "—"
+
+
+def test_bj_deep_converts_only_iso_datetime_strings():
+    # The user-detail <pre> JSON clone shows every timestamp in Beijing; non-time
+    # strings and other types are untouched. Display-only — JSON API stays UTC.
+    src = {
+        "user_id": "usr_x",
+        "registered_at": "2026-07-13T00:00:00",          # -> +8
+        "route": "model_api",                             # not a time
+        "nested": {"last_activity_at": "2026-07-12T20:30:00.500000"},  # crosses day
+        "list": ["2026-07-13T00:00:00", "not-a-time", 42],
+        "count": 7,
+    }
+    out = _dt._bj_deep(src)
+    assert out["registered_at"] == "2026-07-13 08:00:00"
+    assert out["route"] == "model_api"
+    assert out["nested"]["last_activity_at"] == "2026-07-13 04:30:00"
+    assert out["list"][0] == "2026-07-13 08:00:00"
+    assert out["list"][1] == "not-a-time"
+    assert out["list"][2] == 42
+    assert out["count"] == 7
+    # source dict is not mutated (clone semantics)
+    assert src["registered_at"] == "2026-07-13T00:00:00"
+
+
+def _post_session_end(client, api_key: str, duration_sec: int) -> None:
+    res = client.post(
+        "/v1/track/event",
+        headers=_headers(api_key),
+        json={
+            "type": "app_session_end",
+            "source": "ios",
+            "platform": "ios",
+            "route": "model_api",
+            "app_version": "1.4.0",
+            "build": "312",
+            "payload": {"duration_sec": duration_sec},
+        },
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+
+
+def test_admin_data_track_app_usage_rollup(client):
+    # No app_session_end events yet -> app_usage present but zeroed.
+    u1, k1 = _register(client)
+    empty = client.get("/v1/admin/data-track/users", headers=_admin_headers()).get_json()
+    au0 = empty["summary"]["app_usage"]
+    assert au0 == {
+        "foreground_sec_total": 0, "sessions_total": 0,
+        "avg_session_sec": 0, "users_active": 0, "dau_today": 0,
+    }
+
+    # Two sessions for u1 (137 + 63 = 200s), one for u2 (100s).
+    _post_session_end(client, k1, 137)
+    _post_session_end(client, k1, 63)
+    u2, k2 = _register(client)
+    _post_session_end(client, k2, 100)
+
+    body = client.get("/v1/admin/data-track/users", headers=_admin_headers()).get_json()
+    au = body["summary"]["app_usage"]
+    assert au["foreground_sec_total"] == 300
+    assert au["sessions_total"] == 3
+    assert au["avg_session_sec"] == 100
+    assert au["users_active"] == 2        # both users had >=1 session
+    assert au["dau_today"] == 2           # events ingested "now" -> today in Shanghai
+
+    # Per-user app_usage contract: active users carry their totals; a fresh
+    # user with no app_session_end events defaults to zeros.
+    rows = {r["user_id"]: r for r in body["users"]}
+    assert rows[u1]["app_usage"]["sessions"] == 2
+    assert rows[u1]["app_usage"]["foreground_sec"] == 200
+    assert rows[u1]["app_usage"]["last_at"]  # non-empty iso
+    assert rows[u2]["app_usage"]["sessions"] == 1
+    u_none, _ = _register(client)
+    rows2 = {
+        r["user_id"]: r
+        for r in client.get("/v1/admin/data-track/users", headers=_admin_headers()).get_json()["users"]
+    }
+    assert rows2[u_none]["app_usage"] == {
+        "foreground_sec": 0, "sessions": 0, "last_at_epoch": 0.0, "last_at": "",
+    }
+
+
+def test_admin_data_track_page_uses_plain_language(client):
+    # The overview HTML leads with 激活用户, de-emphasizes 注册, explains both,
+    # and renders the App-usage section — no more "已激活 / 原始行" jargon.
+    _register(client)
+    page = client.get("/admin/data-track", headers=_admin_headers()).get_data(as_text=True)
+    assert "激活用户（真正用起来的人）" in page
+    assert "累计注册行（含重装孤儿·非人数）" in page
+    assert "怎么读这些数" in page          # the explainer note-box
+    assert "没有、也无法有「已删除账户数」" in page
+    assert "App 使用时长" in page
+    assert "已激活 / 原始行" not in page    # old jargon gone
+
+
+def test_admin_data_track_app_usage_dau_is_shanghai_day(client, monkeypatch):
+    # now = 2030-06-01T16:30Z == Asia/Shanghai 2030-06-02 00:30 (just past midnight).
+    # A session at 16:10Z is Shanghai 06-02 00:10 (today); 15:50Z is 06-01 23:50
+    # (yesterday) — dau_today must count only the Shanghai-today one.
+    now = _epoch("2030-06-01T16:30:00Z")
+    monkeypatch.setattr(_dt.time, "time", lambda: now)
+
+    u_today, _ = _register(client)
+    u_yesterday, _ = _register(client)
+    for uid, ts_iso, dur in [
+        (u_today, "2030-06-01T16:10:00Z", 40),
+        (u_yesterday, "2030-06-01T15:50:00Z", 50),
+    ]:
+        ev = {"type": "app_session_end", "payload": {"duration_sec": dur}, "ts": _epoch(ts_iso)}
+        db.log_append(uid, "tracking_events", ev, ts=_epoch(ts_iso))
+
+    au = client.get("/v1/admin/data-track/users", headers=_admin_headers()).get_json()["summary"]["app_usage"]
+    assert au["sessions_total"] == 2
+    assert au["users_active"] == 2
+    assert au["dau_today"] == 1  # only the Shanghai-today session, not the day-boundary one
+
+
 def test_fast_validation_no_memories_still_blocks_memory_garden():
     v = _dt._data_track_fast_validation(
         route="model_api",

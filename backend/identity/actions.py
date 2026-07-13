@@ -118,6 +118,11 @@ def _identity_profile_patch(
     if not patch:
         return {"status": "error", "error": "patch_required", "action": "identity.profile_patch"}, [], 400
 
+    from identity import card_policy
+    ok, err = card_policy.validate_profile_patch(patch)
+    if not ok:
+        return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 400
+
     plain, err = _identity_plain_for_action(store, api_key, runtime_token=runtime_token)
     if plain is None:
         return {"status": "error", "error": err, "action": "identity.profile_patch"}, [], 409
@@ -132,7 +137,10 @@ def _identity_profile_patch(
         if not new_name:
             return {"status": "error", "error": "agent_name_empty", "action": "identity.profile_patch"}, [], 400
         if new_name.lower() in identity_service._IDENTITY_RUNTIME_LABELS:
-            return {"status": "error", "error": "agent_name_too_generic", "action": "identity.profile_patch"}, [], 400
+            # Same error code as card_policy.validate_profile_patch (raw pre-check above) —
+            # unify so punctuation-wrapped runtime labels ("`hermes`") that slip past the raw
+            # pre-check still fail with the identical code once normalized here.
+            return {"status": "error", "error": "agent_name_is_runtime_label", "action": "identity.profile_patch"}, [], 400
         old_name = str(payload.get("agent_name") or "")
         if new_name != old_name:
             payload["agent_name"] = new_name
@@ -268,7 +276,11 @@ def _identity_dimension_nudge(
         old_value = int(matched.get("value", 0))
     except Exception:
         old_value = 0
-    new_value = max(0, min(100, old_value + delta))
+    new_value = old_value + delta
+    from identity import card_policy
+    ok, err = card_policy.validate_dimension_nudge(dimension_name, new_value)
+    if not ok:
+        return {"status": "error", "error": err, "action": "identity.dimension_nudge"}, [], 400
     if new_value == old_value:
         return {
             "status": "ok",
@@ -418,6 +430,10 @@ def _identity_replace_action(
     identity_payload = action.get("identity")
     if not isinstance(identity_payload, dict) or not identity_payload:
         return {"status": "error", "error": "identity_required", "action": "identity.replace"}, [], 400
+    from identity import card_policy
+    ok, err = card_policy.validate_full_identity_card(identity_payload)
+    if not ok:
+        return {"status": "error", "error": err, "action": "identity.replace"}, [], 400
     from genesis import service as genesis_service  # lazy — avoid import cycle
     result = genesis_service.replace_identity_preserving_anchor(
         store, {"identity": identity_payload, "relationship_anchor": _replace_relationship_anchor(action)}
