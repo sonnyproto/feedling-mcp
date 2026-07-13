@@ -5,6 +5,8 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 
+from backend import content_encryption
+from backend.enclave import envelope as backend_envelope
 from tools.provider_smoke import crypto
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "backend"))
@@ -49,6 +51,24 @@ def test_box_seal_open_roundtrip():
     sealed = crypto.box_seal(secret, pk)
     assert sealed[:32] != secret  # has ephemeral pubkey prefix
     assert crypto.box_open(sealed, sk, pk) == secret
+
+
+def test_backend_box_seal_opens_in_smoke_client():
+    sk, pk = crypto.generate_keypair()
+    secret = b"backend-to-smoke-wire-contract"
+
+    sealed = content_encryption.box_seal(secret, pk)
+
+    assert crypto.box_open(sealed, sk, pk) == secret
+
+
+def test_smoke_box_seal_opens_in_backend():
+    sk, pk = crypto.generate_keypair()
+    secret = b"smoke-to-backend-wire-contract"
+
+    sealed = crypto.box_seal(secret, pk)
+
+    assert backend_envelope.box_seal_open_hkdf(sealed, sk) == secret
 
 
 def test_decrypt_reply_matches_enclave_wire_format():

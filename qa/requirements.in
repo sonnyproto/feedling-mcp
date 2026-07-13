@@ -1,0 +1,6 @@
+# Runtime dependencies for provisioning, live crypto helpers, and the release gate.
+certifi==2026.2.25
+cryptography==46.0.7
+jsonschema==4.26.0
+PyNaCl==1.6.2
+pytest==8.4.2

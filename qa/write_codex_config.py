@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+"""Write isolated Codex configs for six independent qualification workers.
+
+Codex 0.144.3 applies a named ``$CODEX_HOME/<name>.config.toml`` profile only
+when that profile is selected on a top-level invocation with ``-p``.  It does
+not reliably apply a custom child-agent permission profile.  This module
+therefore writes one top-level profile per locked API-key profile and no
+``[agents]`` configuration at all.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import stat
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Mapping, Sequence
+
+try:
+    from qa.orchestration_contract import PROFILE_AGENT_TYPES
+except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
+    from orchestration_contract import PROFILE_AGENT_TYPES
+
+
+SUPERVISOR_PERMISSION_PROFILE = "feedling-e2e-supervisor"
+PROFILE_NAME = SUPERVISOR_PERMISSION_PROFILE  # Stable public constant.
+_DNS_NAME = re.compile(
+    r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z"
+)
+_MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+_AMBIENT_READ_ROOTS = tuple(
+    dict.fromkeys(Path(value).resolve() for value in ("/tmp", "/var/tmp", "/dev/shm"))
+)
+_COMMON_ENV = (
+    "HOME",
+    "PATH",
+    "LANG",
+    "TMPDIR",
+    "PYTHONDONTWRITEBYTECODE",
+    "PYTHONPATH",
+    "QA_SOURCE_ROOT",
+    "QA_RUN_ID",
+    "QA_EXPECTED_DEPLOYMENT_SHA",
+    "QA_EXPECTED_RUNTIME",
+    "QA_FEEDLING_BASE_URL",
+)
+
+
+class CodexConfigError(RuntimeError):
+    """A fixed error for an unsafe permission-profile input."""
+
+
+@dataclass(frozen=True)
+class CodexConfigBundle:
+    main: str
+    profiles: Mapping[Path, str]
+
+
+def worker_permission_profile(profile_id: str) -> str:
+    return f"feedling-e2e-{profile_id}"
+
+
+def _directory(path: Path, name: str) -> Path:
+    if not path.is_absolute() or path.is_symlink():
+        raise CodexConfigError(f"{name} must be an absolute non-symlink directory")
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise CodexConfigError(f"{name} is missing") from None
+    if not stat.S_ISDIR(metadata.st_mode) or resolved == Path(resolved.anchor):
+        raise CodexConfigError(f"{name} must be a non-root directory")
+    if metadata.st_uid != os.geteuid():
+        raise CodexConfigError(f"{name} must be owned by the current user")
+    return resolved
+
+
+def _private_directory(path: Path, name: str, *, empty: bool = False) -> Path:
+    resolved = _directory(path, name)
+    metadata = path.lstat()
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise CodexConfigError(f"{name} must be owner-only")
+    if empty:
+        try:
+            if any(path.iterdir()):
+                raise CodexConfigError(f"{name} must be empty")
+        except CodexConfigError:
+            raise
+        except OSError:
+            raise CodexConfigError(f"{name} is unreadable") from None
+    return resolved
+
+
+def _future_file(path: Path, name: str, *, private_parent: bool = False) -> Path:
+    if not path.is_absolute() or path.is_symlink() or not path.name:
+        raise CodexConfigError(f"{name} must be an absolute non-symlink path")
+    parent = (
+        _private_directory(path.parent, f"{name} parent")
+        if private_parent
+        else _directory(path.parent, f"{name} parent")
+    )
+    candidate = parent / path.name
+    if candidate.exists():
+        try:
+            metadata = candidate.lstat()
+        except OSError:
+            raise CodexConfigError(f"{name} is unsafe") from None
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise CodexConfigError(f"{name} is unsafe")
+    return candidate
+
+
+def _contains(parent: Path, child: Path) -> bool:
+    return child == parent or parent in child.parents
+
+
+def _reject_ambient_readable(paths: Sequence[Path]) -> None:
+    # Codex 0.144.3's ``:minimal`` permission grants system temporary roots.
+    # A more-specific ``deny`` does not subtract that ambient grant, so private
+    # and explicitly denied data must never be placed beneath those roots.
+    if any(
+        candidate == ambient or ambient in candidate.parents
+        for candidate in paths
+        for ambient in _AMBIENT_READ_ROOTS
+    ):
+        raise CodexConfigError("denied run data is beneath an ambient readable root")
+
+
+def _quoted(value: str) -> str:
+    # JSON strings are valid TOML basic strings and safely quote paths.
+    return json.dumps(value, ensure_ascii=True)
+
+
+def _permission_header(profile: str, description: str) -> list[str]:
+    key = _quoted(profile)
+    return [
+        f"[permissions.{key}]",
+        f"description = {_quoted(description)}",
+        "",
+        f"[permissions.{key}.filesystem]",
+    ]
+
+
+def _network_lines(profile: str, host: str) -> list[str]:
+    key = _quoted(profile)
+    return [
+        "",
+        f"[permissions.{key}.network]",
+        "enabled = true",
+        'mode = "full"',
+        "enable_socks5 = false",
+        "enable_socks5_udp = false",
+        "allow_upstream_proxy = false",
+        "dangerously_allow_non_loopback_proxy = false",
+        "dangerously_allow_all_unix_sockets = false",
+        "allow_local_binding = false",
+        "",
+        f"[permissions.{key}.network.domains]",
+        f'{_quoted(host)} = "allow"',
+        "",
+    ]
+
+
+def _shell_policy(
+    home: Path,
+    temporary: Path,
+    *,
+    work: Path,
+    manifest: Path | None,
+    profile_id: str | None,
+    agent_type: str | None,
+    artifact_root: Path | None,
+    aggregation_input_root: Path | None,
+    orchestration_receipt: Path | None,
+) -> list[str]:
+    include = list(_COMMON_ENV)
+    fixed = {
+        "HOME": str(home),
+        "TMPDIR": str(temporary),
+        "QA_WORK_ROOT": str(work),
+    }
+    include.append("QA_WORK_ROOT")
+    if manifest is not None:
+        include.extend(
+            (
+                "QA_PRIVATE_MANIFEST",
+                "QA_PROFILE_ID",
+                "QA_AGENT_TYPE",
+                "QA_ARTIFACT_DIR",
+            )
+        )
+        fixed.update(
+            {
+                "QA_PRIVATE_MANIFEST": str(manifest),
+                "QA_PROFILE_ID": str(profile_id),
+                "QA_AGENT_TYPE": str(agent_type),
+                "QA_ARTIFACT_DIR": str(artifact_root),
+            }
+        )
+    if aggregation_input_root is not None:
+        include.extend(("QA_AGGREGATION_INPUT_ROOT", "QA_ORCHESTRATION_RECEIPT"))
+        fixed["QA_AGGREGATION_INPUT_ROOT"] = str(aggregation_input_root)
+        fixed["QA_ORCHESTRATION_RECEIPT"] = str(orchestration_receipt)
+    lines = [
+        "[shell_environment_policy]",
+        'inherit = "all"',
+        "ignore_default_excludes = false",
+        "experimental_use_profile = false",
+        "include_only = [",
+    ]
+    lines.extend(f"  {_quoted(name)}," for name in include)
+    lines.extend(("]", "", "[shell_environment_policy.set]"))
+    lines.extend(f"{name} = {_quoted(value)}" for name, value in fixed.items())
+    lines.append("")
+    return lines
+
+
+def _base_settings(profile: str, codex_model: str) -> list[str]:
+    return [
+        f"default_permissions = {_quoted(profile)}",
+        f"model = {_quoted(codex_model)}",
+        'approval_policy = "never"',
+        'web_search = "disabled"',
+        'cli_auth_credentials_store = "file"',
+        "check_for_update_on_startup = false",
+        "allow_login_shell = false",
+        "",
+    ]
+
+
+def _feature_lines() -> list[str]:
+    return [
+        "[features]",
+        "apps = false",
+        "auth_elicitation = false",
+        "browser_use = false",
+        "browser_use_external = false",
+        "browser_use_full_cdp_access = false",
+        "code_mode = false",
+        "code_mode_host = false",
+        "computer_use = false",
+        "hooks = false",
+        "image_generation = false",
+        "in_app_browser = false",
+        "plugins = false",
+        "remote_plugin = false",
+        "shell_snapshot = false",
+        "skill_mcp_dependency_install = false",
+        "standalone_web_search = false",
+        "tool_suggest = false",
+        "workspace_dependencies = false",
+        "multi_agent = false",
+        "network_proxy = true",
+        "",
+    ]
+
+
+def _profile_config(
+    *,
+    profile_id: str,
+    agent_type: str,
+    manifest: Path,
+    home: Path,
+    temporary: Path,
+    work: Path,
+    artifact_root: Path,
+    codex_model: str,
+) -> str:
+    lines = _base_settings(worker_permission_profile(profile_id), codex_model)
+    lines.insert(
+        2,
+        "developer_instructions = "
+        + _quoted(
+            "Run only the assigned Feedling qualification profile. Read the "
+            "one-row QA_PRIVATE_MANIFEST and never seek another profile, the "
+            "full provisioning manifest, public artifacts, or provider/admin secrets."
+        ),
+    )
+    lines.extend(
+        _shell_policy(
+            home,
+            temporary,
+            work=work,
+            manifest=manifest,
+            profile_id=profile_id,
+            agent_type=agent_type,
+            artifact_root=artifact_root,
+            aggregation_input_root=None,
+            orchestration_receipt=None,
+        )
+    )
+    return "\n".join(lines)
+
+
+def build_config_bundle(
+    *,
+    output: Path,
+    source_root: Path,
+    artifact_root: Path,
+    full_manifest: Path,
+    profile_manifest_dir: Path,
+    supervisor_home: Path,
+    supervisor_tmp: Path,
+    supervisor_work: Path,
+    worker_root: Path,
+    worker_output_root: Path,
+    aggregation_input_root: Path,
+    orchestration_receipt: Path,
+    codex_model: str,
+    allowed_host: str,
+    runtime_read_roots: Sequence[Path] = (),
+) -> CodexConfigBundle:
+    codex_home = _private_directory(output.parent, "CODEX_HOME")
+    destination = _future_file(output, "Codex config", private_parent=True)
+    source = _directory(source_root, "source root")
+    artifacts = _directory(artifact_root, "artifact root")
+    manifests = _private_directory(
+        profile_manifest_dir, "profile manifest directory", empty=True
+    )
+    provisioning = _future_file(
+        full_manifest, "full provisioning manifest", private_parent=True
+    )
+    root_home = _private_directory(supervisor_home, "supervisor home")
+    root_tmp = _private_directory(supervisor_tmp, "supervisor temp")
+    root_work = _private_directory(supervisor_work, "supervisor work")
+    workers = _private_directory(worker_root, "worker root")
+    worker_outputs = _private_directory(
+        worker_output_root, "worker output root", empty=True
+    )
+    aggregation_inputs = _private_directory(
+        aggregation_input_root, "aggregation input root", empty=True
+    )
+    receipt = _future_file(
+        orchestration_receipt, "orchestration receipt", private_parent=True
+    )
+    runtimes = tuple(
+        dict.fromkeys(
+            _directory(path, "runtime read root") for path in runtime_read_roots
+        )
+    )
+
+    if destination.parent != codex_home:
+        raise CodexConfigError("Codex config must be directly beneath CODEX_HOME")
+    if not _contains(source, artifacts):
+        raise CodexConfigError("artifact root must be inside the source checkout")
+    top_level_private = (
+        codex_home,
+        manifests,
+        root_home,
+        root_tmp,
+        root_work,
+        workers,
+        worker_outputs,
+        aggregation_inputs,
+    )
+    if any(_contains(source, private) for private in top_level_private):
+        raise CodexConfigError("private run data must be outside the source checkout")
+    if any(
+        _contains(left, right) or _contains(right, left)
+        for index, left in enumerate(top_level_private)
+        for right in top_level_private[index + 1 :]
+    ):
+        raise CodexConfigError("private Codex roots must be disjoint")
+    if _contains(source, provisioning) or any(
+        _contains(private, provisioning) for private in top_level_private
+    ):
+        raise CodexConfigError("full provisioning manifest path is not isolated")
+    if (
+        receipt == provisioning
+        or _contains(source, receipt)
+        or any(_contains(private, receipt) for private in top_level_private)
+    ):
+        raise CodexConfigError("orchestration receipt path is not isolated")
+    _reject_ambient_readable((*top_level_private, artifacts, provisioning, receipt))
+    if any(
+        _contains(private, runtime) or _contains(runtime, private)
+        for runtime in runtimes
+        for private in top_level_private
+    ):
+        raise CodexConfigError("runtime read roots must not expose private run data")
+
+    host = allowed_host.strip().lower().rstrip(".")
+    if host != allowed_host or not _DNS_NAME.fullmatch(host):
+        raise CodexConfigError("allowed host must be one normalized DNS name")
+    if not isinstance(codex_model, str) or not _MODEL_NAME.fullmatch(codex_model):
+        raise CodexConfigError("Codex model must be one normalized model ID")
+
+    worker_paths: dict[str, tuple[Path, Path, Path]] = {}
+    manifest_paths: dict[str, Path] = {}
+    profile_configs: dict[Path, str] = {}
+    for profile_id, agent_type in PROFILE_AGENT_TYPES:
+        manifest = _future_file(
+            manifests / f"{profile_id}.json",
+            f"future {profile_id} manifest",
+            private_parent=True,
+        )
+        profile_root = _private_directory(
+            workers / agent_type, f"{profile_id} worker directory"
+        )
+        home = _private_directory(profile_root / "home", f"{profile_id} home")
+        temporary = _private_directory(profile_root / "tmp", f"{profile_id} temp")
+        work = _private_directory(profile_root / "work", f"{profile_id} work")
+        if any(
+            _contains(left, right) or _contains(right, left)
+            for index, left in enumerate((home, temporary, work))
+            for right in (home, temporary, work)[index + 1 :]
+        ):
+            raise CodexConfigError(f"{profile_id} worker roots must be disjoint")
+        worker_paths[agent_type] = (home, temporary, work)
+        manifest_paths[profile_id] = manifest
+        profile_path = codex_home / f"{agent_type}.config.toml"
+        profile_configs[profile_path] = _profile_config(
+            profile_id=profile_id,
+            agent_type=agent_type,
+            manifest=manifest,
+            home=home,
+            temporary=temporary,
+            work=work,
+            artifact_root=artifacts,
+            codex_model=codex_model,
+        )
+
+    lines = _base_settings(SUPERVISOR_PERMISSION_PROFILE, codex_model)
+    lines.extend(
+        _shell_policy(
+            root_home,
+            root_tmp,
+            work=root_work,
+            manifest=None,
+            profile_id=None,
+            agent_type=None,
+            artifact_root=None,
+            aggregation_input_root=aggregation_inputs,
+            orchestration_receipt=receipt,
+        )
+    )
+    lines.extend(_feature_lines())
+    lines.extend(
+        _permission_header(
+            SUPERVISOR_PERMISSION_PROFILE,
+            "Feedling aggregation supervisor without provisioning credentials",
+        )
+    )
+    supervisor_filesystem = (
+        (":minimal", "read"),
+        (str(source), "read"),
+        (str(artifacts), "deny"),
+        (str(provisioning), "deny"),
+        (str(manifests), "deny"),
+        (str(workers), "deny"),
+        (str(worker_outputs), "deny"),
+        (str(aggregation_inputs), "read"),
+        (str(receipt), "read"),
+        (str(root_home), "write"),
+        (str(root_tmp), "write"),
+        (str(root_work), "write"),
+        *((str(runtime), "read") for runtime in runtimes),
+    )
+    lines.extend(
+        f"{_quoted(path)} = {_quoted(access)}" for path, access in supervisor_filesystem
+    )
+    lines.extend(_network_lines(SUPERVISOR_PERMISSION_PROFILE, host))
+
+    for profile_id, agent_type in PROFILE_AGENT_TYPES:
+        permission = worker_permission_profile(profile_id)
+        own_home, own_tmp, own_work = worker_paths[agent_type]
+        lines.extend(
+            _permission_header(permission, f"Isolated Feedling worker for {profile_id}")
+        )
+        filesystem: list[tuple[str, str]] = [
+            (":minimal", "read"),
+            (str(source), "read"),
+            (str(artifacts), "deny"),
+            (str(provisioning), "deny"),
+            (str(manifest_paths[profile_id]), "read"),
+            (str(worker_outputs), "deny"),
+            (str(aggregation_inputs), "deny"),
+            (str(receipt), "deny"),
+            (str(own_home), "write"),
+            (str(own_tmp), "write"),
+            (str(own_work), "write"),
+        ]
+        filesystem.extend(
+            (str(manifest), "deny")
+            for other_profile, manifest in manifest_paths.items()
+            if other_profile != profile_id
+        )
+        filesystem.extend(
+            (str(workers / other_agent), "deny")
+            for _, other_agent in PROFILE_AGENT_TYPES
+            if other_agent != agent_type
+        )
+        filesystem.extend((str(runtime), "read") for runtime in runtimes)
+        lines.extend(
+            f"{_quoted(path)} = {_quoted(access)}" for path, access in filesystem
+        )
+        lines.extend(_network_lines(permission, host))
+
+    return CodexConfigBundle(main="\n".join(lines), profiles=profile_configs)
+
+
+def write_config(output: Path, content: str) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(output, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        raise CodexConfigError("unable to create run-scoped Codex config") from None
+    try:
+        metadata = output.lstat()
+    except OSError:
+        raise CodexConfigError("run-scoped Codex config is unavailable") from None
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_nlink != 1
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        raise CodexConfigError("run-scoped Codex config permissions are unsafe")
+
+
+def write_bundle(output: Path, bundle: CodexConfigBundle) -> None:
+    created: list[Path] = []
+    try:
+        for profile_path, content in bundle.profiles.items():
+            write_config(profile_path, content)
+            created.append(profile_path)
+        write_config(output, bundle.main)
+        created.append(output)
+    except Exception:
+        for path in created:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Write isolated independent-process Codex E2E permissions"
+    )
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--source-root", type=Path, required=True)
+    parser.add_argument("--artifact-root", type=Path, required=True)
+    parser.add_argument("--full-manifest", type=Path, required=True)
+    parser.add_argument("--profile-manifest-dir", type=Path, required=True)
+    parser.add_argument("--supervisor-home", type=Path, required=True)
+    parser.add_argument("--supervisor-tmp", type=Path, required=True)
+    parser.add_argument("--supervisor-work", type=Path, required=True)
+    parser.add_argument("--worker-root", type=Path, required=True)
+    parser.add_argument("--worker-output-root", type=Path, required=True)
+    parser.add_argument("--aggregation-input-root", type=Path, required=True)
+    parser.add_argument("--orchestration-receipt", type=Path, required=True)
+    parser.add_argument("--codex-model", required=True)
+    parser.add_argument("--allowed-host", required=True)
+    parser.add_argument(
+        "--runtime-read-root",
+        type=Path,
+        action="append",
+        default=[],
+        help="Additional trusted interpreter/dependency root (repeatable)",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        bundle = build_config_bundle(
+            output=args.output,
+            source_root=args.source_root,
+            artifact_root=args.artifact_root,
+            full_manifest=args.full_manifest,
+            profile_manifest_dir=args.profile_manifest_dir,
+            supervisor_home=args.supervisor_home,
+            supervisor_tmp=args.supervisor_tmp,
+            supervisor_work=args.supervisor_work,
+            worker_root=args.worker_root,
+            worker_output_root=args.worker_output_root,
+            aggregation_input_root=args.aggregation_input_root,
+            orchestration_receipt=args.orchestration_receipt,
+            codex_model=args.codex_model,
+            allowed_host=args.allowed_host,
+            runtime_read_roots=args.runtime_read_root,
+        )
+        write_bundle(args.output, bundle)
+    except CodexConfigError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    except Exception:
+        print(
+            "ERROR: Codex permission setup encountered an internal error",
+            file=sys.stderr,
+        )
+        return 1
+    print("isolated top-level Codex qualification profiles installed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

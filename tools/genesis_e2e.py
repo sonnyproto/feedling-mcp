@@ -14,6 +14,17 @@ flag FEEDLING_GENESIS_WORKER_ENABLED=1). Crypto matches content_encryption.build
                    --transcript transcript.txt [--enclave-pk-hex <hex> | --attestation-url <U>] \
                    [--source-kind history] [--chunk-size 12000]
   verify:  python3 tools/genesis_e2e.py verify  --api-url <U> --api-key <K> --job-id <J>
+  qualify an already-provisioned profile (preferred for release qualification):
+           python3 tools/genesis_e2e.py distill-existing-session --api-url <U> \
+             --session-manifest <private-manifest.json> --profile-id <profile> \
+             --fixture qa/fixtures/persona-import-v1.json \
+             --private-evidence </private/tmp/evidence.json> --artifact-dir <QA_ARTIFACT_DIR>
+           # Codex reads evidence, writes a bounded hash-bound judgment, then:
+           python3 tools/genesis_e2e.py distill-existing-session-finalize \
+             --fixture qa/fixtures/persona-import-v1.json \
+             --private-evidence </private/tmp/evidence.json> \
+             --semantic-judgment </private/tmp/judgment.json> \
+             --artifact-dir <QA_ARTIFACT_DIR>
 """
 from __future__ import annotations
 
@@ -21,9 +32,13 @@ import argparse
 import base64
 import hashlib
 import json
+import os
 import re
+import stat
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -38,6 +53,19 @@ except Exception as e:  # noqa: BLE001
     sys.exit(2)
 
 
+class _RejectRedirects(urllib.request.HTTPRedirectHandler):
+    """Never forward a Feedling API key to a redirected destination."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            "Feedling API redirect rejected",
+            headers,
+            fp,
+        )
+
+
 def _http(method, url, api_key, *, json_body=None, timeout=60, retries=8):
     """Single request with retry on transient read/connection errors (IncompleteRead,
     URLError, socket timeout). HTTPError (a real status) is returned immediately, never
@@ -48,17 +76,28 @@ def _http(method, url, api_key, *, json_body=None, timeout=60, retries=8):
     throwaway test user."""
     import http.client
     import socket
+
     data = json.dumps(json_body).encode("utf-8") if json_body is not None else None
     last_exc = None
+    opener = urllib.request.build_opener(_RejectRedirects())
     for attempt in range(retries):
-        req = urllib.request.Request(url, data=data, method=method,
-                                     headers={"X-API-Key": api_key, "Content-Type": "application/json"})
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method=method,
+            headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+        )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with opener.open(req, timeout=timeout) as resp:
                 return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
         except urllib.error.HTTPError as e:
             return e.code, {"error": e.read().decode("utf-8", "replace")[:400]}
-        except (http.client.IncompleteRead, urllib.error.URLError, socket.timeout, ConnectionError) as e:
+        except (
+            http.client.IncompleteRead,
+            urllib.error.URLError,
+            socket.timeout,
+            ConnectionError,
+        ) as e:
             last_exc = e
             time.sleep(min(2.0 * (attempt + 1), 12.0))
     raise SystemExit(f"{method} {url} failed after {retries} attempts: {last_exc}")
@@ -77,7 +116,7 @@ def _enclave_pk_bytes(args) -> bytes:
 
 
 def _chunks(text: str, size: int) -> list[str]:
-    return [text[i:i + size] for i in range(0, len(text), max(1, size))] or [""]
+    return [text[i : i + size] for i in range(0, len(text), max(1, size))] or [""]
 
 
 def _provision_user(args) -> tuple[str, str, bytes, bytes]:
@@ -86,6 +125,7 @@ def _provision_user(args) -> tuple[str, str, bytes, bytes]:
     Returns (api_key, user_id, enclave_pk_bytes, user_pk_bytes). Provider key comes
     from the env (GENESIS_E2E_PROVIDER_API_KEY), never persisted to disk."""
     import os
+
     base = args.api_url.rstrip("/")
     api_key = user_id = ""
     # Content public key must be base64 of the raw 32-byte X25519 pk (core/envelope.py
@@ -98,7 +138,12 @@ def _provision_user(args) -> tuple[str, str, bytes, bytes]:
         sk = PrivateKey.generate()
         args._user_sk = bytes(sk)  # raw X25519 private key, kept for acceptance decrypt
         user_pk_b64 = base64.b64encode(bytes(sk.public_key)).decode("ascii")
-        s, b = _http("POST", f"{base}/v1/users/register", "", json_body={"public_key": user_pk_b64})
+        s, b = _http(
+            "POST",
+            f"{base}/v1/users/register",
+            "",
+            json_body={"public_key": user_pk_b64},
+        )
         if s == 409:
             continue  # key collided via a retried POST whose first response was lost
         if s >= 400:
@@ -113,10 +158,20 @@ def _provision_user(args) -> tuple[str, str, bytes, bytes]:
     if not getattr(args, "skip_setup", False):
         provider_key = os.environ.get("GENESIS_E2E_PROVIDER_API_KEY", "").strip()
         if not provider_key:
-            raise SystemExit("GENESIS_E2E_PROVIDER_API_KEY env required (worker LLM key); or use --skip-setup for a plumbing dry-run")
-        s, b = _http("POST", f"{base}/v1/model_api/setup", api_key, json_body={
-            "provider": args.provider, "model": args.model,
-            "base_url": args.base_url, "api_key": provider_key})
+            raise SystemExit(
+                "GENESIS_E2E_PROVIDER_API_KEY env required (worker LLM key); or use --skip-setup for a plumbing dry-run"
+            )
+        s, b = _http(
+            "POST",
+            f"{base}/v1/model_api/setup",
+            api_key,
+            json_body={
+                "provider": args.provider,
+                "model": args.model,
+                "base_url": args.base_url,
+                "api_key": provider_key,
+            },
+        )
         if s >= 400 or b.get("test_status") not in ("ok", None):
             raise SystemExit(f"model_api/setup failed {s}: {b}")
     s, b = _http("GET", f"{base}/v1/users/whoami", api_key)
@@ -131,38 +186,91 @@ def _provision_user(args) -> tuple[str, str, bytes, bytes]:
 def cmd_upload(args):
     if args.register:
         args.api_key, args.user_id, enclave_pk, user_pk = _provision_user(args)
-        print(json.dumps({"provisioned": True, "user_id": args.user_id, "api_key": args.api_key}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {"provisioned": True, "user_id": args.user_id, "api_key": args.api_key},
+                ensure_ascii=False,
+            )
+        )
     else:
         enclave_pk = _enclave_pk_bytes(args)
-        user_pk = bytes(PrivateKey.generate().public_key)  # throwaway: worker decrypts via K_enclave
+        user_pk = bytes(
+            PrivateKey.generate().public_key
+        )  # throwaway: worker decrypts via K_enclave
     parts = _chunks(Path(args.transcript).read_text(encoding="utf-8"), args.chunk_size)
 
-    status, body = _http("POST", f"{args.api_url.rstrip('/')}/v1/genesis/imports", args.api_key,
-                         json_body={"source_kind": args.source_kind, "total_chunks": len(parts)})
+    status, body = _http(
+        "POST",
+        f"{args.api_url.rstrip('/')}/v1/genesis/imports",
+        args.api_key,
+        json_body={"source_kind": args.source_kind, "total_chunks": len(parts)},
+    )
     if status >= 400:
-        print(json.dumps({"ok": False, "step": "create", "status": status, "body": body})); return 1
+        print(
+            json.dumps({"ok": False, "step": "create", "status": status, "body": body})
+        )
+        return 1
     job_id = body.get("job_id") or body.get("job", {}).get("job_id")
     if not job_id:
-        print(json.dumps({"ok": False, "step": "create", "error": "no job_id", "body": body})); return 1
+        print(
+            json.dumps(
+                {"ok": False, "step": "create", "error": "no job_id", "body": body}
+            )
+        )
+        return 1
 
     for seq, part in enumerate(parts):
-        env = build_envelope(plaintext=part.encode("utf-8"), owner_user_id=args.user_id,
-                             user_pk_bytes=user_pk, enclave_pk_bytes=enclave_pk, visibility="shared")
+        env = build_envelope(
+            plaintext=part.encode("utf-8"),
+            owner_user_id=args.user_id,
+            user_pk_bytes=user_pk,
+            enclave_pk_bytes=enclave_pk,
+            visibility="shared",
+        )
         body_ct = env["body_ct"]
         cct_sha = hashlib.sha256(base64.b64decode(body_ct)).hexdigest()
-        s, b = _http("PUT", f"{args.api_url.rstrip('/')}/v1/genesis/imports/{job_id}/chunks/{seq}",
-                     args.api_key, json_body={"envelope": env, "ciphertext_sha256": cct_sha,
-                                              "byte_start": 0, "byte_end": len(part.encode("utf-8"))})
+        s, b = _http(
+            "PUT",
+            f"{args.api_url.rstrip('/')}/v1/genesis/imports/{job_id}/chunks/{seq}",
+            args.api_key,
+            json_body={
+                "envelope": env,
+                "ciphertext_sha256": cct_sha,
+                "byte_start": 0,
+                "byte_end": len(part.encode("utf-8")),
+            },
+        )
         if s >= 400:
-            print(json.dumps({"ok": False, "step": f"chunk:{seq}", "status": s, "body": b})); return 1
+            print(
+                json.dumps(
+                    {"ok": False, "step": f"chunk:{seq}", "status": s, "body": b}
+                )
+            )
+            return 1
 
-    s, b = _http("POST", f"{args.api_url.rstrip('/')}/v1/genesis/imports/{job_id}/finalize", args.api_key)
-    print(json.dumps({"ok": s < 400, "step": "finalize", "status": s, "job_id": job_id, "body": b}, ensure_ascii=False))
+    s, b = _http(
+        "POST",
+        f"{args.api_url.rstrip('/')}/v1/genesis/imports/{job_id}/finalize",
+        args.api_key,
+    )
+    print(
+        json.dumps(
+            {
+                "ok": s < 400,
+                "step": "finalize",
+                "status": s,
+                "job_id": job_id,
+                "body": b,
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0 if s < 400 else 1
 
 
 def cmd_verify(args):
     url = f"{args.api_url.rstrip('/')}/v1/genesis/imports/{args.job_id}"
+
     def _state_of(b: dict) -> str:
         # GET /v1/genesis/imports/<id> returns `state` as a dict blob {status,...},
         # not a string. Read state.status first, then fall back to top-level/job.status
@@ -170,7 +278,10 @@ def cmd_verify(args):
         st = b.get("state")
         if isinstance(st, dict):
             return str(st.get("status") or "").lower()
-        return str(st or b.get("status") or b.get("job", {}).get("status") or "").lower()
+        return str(
+            st or b.get("status") or b.get("job", {}).get("status") or ""
+        ).lower()
+
     deadline = time.time() + args.timeout
     last = {}
     while time.time() < deadline:
@@ -188,9 +299,15 @@ def cmd_verify(args):
     # and on privacy_copy text ("...imported plaintext"), so it's dropped to the
     # two keys that would only show up if real content leaked.
     blob = json.dumps(last, ensure_ascii=False).lower()
-    needles = [n.strip().lower() for n in str(getattr(args, "privacy_needle", "") or "").split(",") if n.strip()]
+    needles = [
+        n.strip().lower()
+        for n in str(getattr(args, "privacy_needle", "") or "").split(",")
+        if n.strip()
+    ]
     out["privacy_leak"] = [n for n in needles if n in blob]
-    out["status_payload_raw_keys"] = [k for k in ("transcript", "raw_text") if k in blob]
+    out["status_payload_raw_keys"] = [
+        k for k in ("transcript", "raw_text") if k in blob
+    ]
     out["ok"] = (state == "done") and not out["privacy_leak"]
     print(json.dumps(out, ensure_ascii=False))
     return 0 if out["ok"] else 1
@@ -202,24 +319,51 @@ def cmd_upload_plaintext(args):
     No client-side sealing/chunking. Then poll with `verify --job-id`."""
     if args.register:
         args.api_key, args.user_id, _enclave_pk, _user_pk = _provision_user(args)
-        print(json.dumps({"provisioned": True, "user_id": args.user_id, "api_key": args.api_key}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {"provisioned": True, "user_id": args.user_id, "api_key": args.api_key},
+                ensure_ascii=False,
+            )
+        )
     content = Path(args.transcript).read_text(encoding="utf-8")
     payload = {
         "format": "auto",
         "content": content,
         "fresh_start": False,
-        "client_job_id": args.client_job_id or ("e2e_" + hashlib.sha256(content.encode("utf-8")).hexdigest()[:40]),
+        "client_job_id": args.client_job_id
+        or ("e2e_" + hashlib.sha256(content.encode("utf-8")).hexdigest()[:40]),
     }
     if args.ai_persona:
-        payload["ai_persona_content"] = Path(args.ai_persona).read_text(encoding="utf-8")
+        payload["ai_persona_content"] = Path(args.ai_persona).read_text(
+            encoding="utf-8"
+        )
     if args.personal_profile:
-        payload["personal_profile_content"] = Path(args.personal_profile).read_text(encoding="utf-8")
+        payload["personal_profile_content"] = Path(args.personal_profile).read_text(
+            encoding="utf-8"
+        )
     if args.memory_summary:
-        payload["memory_summary_content"] = Path(args.memory_summary).read_text(encoding="utf-8")
-    s, b = _http("POST", f"{args.api_url.rstrip('/')}/v1/genesis/imports/plaintext", args.api_key, json_body=payload)
+        payload["memory_summary_content"] = Path(args.memory_summary).read_text(
+            encoding="utf-8"
+        )
+    s, b = _http(
+        "POST",
+        f"{args.api_url.rstrip('/')}/v1/genesis/imports/plaintext",
+        args.api_key,
+        json_body=payload,
+    )
     job_id = (b.get("job") or {}).get("job_id") or b.get("job_id")
-    print(json.dumps({"ok": s < 400 and bool(job_id), "step": "plaintext_upload", "status": s,
-                      "job_id": job_id, "body": b}, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "ok": s < 400 and bool(job_id),
+                "step": "plaintext_upload",
+                "status": s,
+                "job_id": job_id,
+                "body": b,
+            },
+            ensure_ascii=False,
+        )
+    )
     return 0 if (s < 400 and job_id) else 1
 
 
@@ -227,16 +371,24 @@ def _box_seal_open(sealed: bytes, sk_raw: bytes) -> bytes:
     """Reverse of content_encryption.box_seal: X25519 ECDH(sk, ek_pub) ->
     HKDF-SHA256(info='feedling-box-seal-v1') -> nonce=SHA256(ek_pub||rcp_pub)[:12]
     -> ChaCha20-Poly1305 decrypt. `sealed` = ek_pub(32) || ct || tag(16)."""
-    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (
+        X25519PrivateKey,
+        X25519PublicKey,
+    )
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     from cryptography.hazmat.primitives.hashes import SHA256
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
     from cryptography.hazmat.primitives import serialization
+
     ek_pub, ct = sealed[:32], sealed[32:]
     sk = X25519PrivateKey.from_private_bytes(sk_raw)
-    rcp_pub = sk.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    rcp_pub = sk.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw
+    )
     shared = sk.exchange(X25519PublicKey.from_public_bytes(ek_pub))
-    k_wrap = HKDF(algorithm=SHA256(), length=32, salt=None, info=b"feedling-box-seal-v1").derive(shared)
+    k_wrap = HKDF(
+        algorithm=SHA256(), length=32, salt=None, info=b"feedling-box-seal-v1"
+    ).derive(shared)
     nonce = hashlib.sha256(ek_pub + rcp_pub).digest()[:12]
     return ChaCha20Poly1305(k_wrap).decrypt(nonce, ct, None)
 
@@ -245,15 +397,67 @@ def _decrypt_envelope_user(env: dict, sk_raw: bytes) -> str:
     """Decrypt a shared envelope's body with the user's content private key.
     AAD = owner_user_id|v|id (must match content_encryption.build_envelope)."""
     from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
+
     K = _box_seal_open(base64.b64decode(env["K_user"]), sk_raw)
     aad = f"{env['owner_user_id']}|{env.get('v', 1)}|{env['id']}".encode("utf-8")
-    pt = ChaCha20Poly1305(K).decrypt(base64.b64decode(env["nonce"]), base64.b64decode(env["body_ct"]), aad)
+    pt = ChaCha20Poly1305(K).decrypt(
+        base64.b64decode(env["nonce"]), base64.b64decode(env["body_ct"]), aad
+    )
     return pt.decode("utf-8", "replace")
 
 
 def _norm_text(value: object) -> str:
     text = str(value or "").lower()
     return re.sub(r"[\s，。、“”‘’：:；;,.!?！？\-_/\\|()（）\[\]{}<>《》]+", "", text)
+
+
+_ENGLISH_NEGATION_RE = re.compile(
+    r"\b(?:no|never|cannot|can't|cant|won't|wont|isn't|isnt|aren't|arent|"
+    r"wasn't|wasnt|weren't|werent|doesn't|doesnt|don't|dont|didn't|didnt|"
+    r"hasn't|hasnt|haven't|havent|hadn't|hadnt|false|incorrect|wrong)\b|"
+    r"\bnot\s+(?!only\b|just\b)",
+    re.IGNORECASE,
+)
+_CHINESE_NEGATION_RE = re.compile(r"(?:并非|绝非|从不|不是|没有|不(?!仅|只)|没|未|无)")
+_SEMANTIC_REVIEW_SURFACES = ["identity", "persona", "memories"]
+_AGENT_CHAT_ROLES = {"agent", "assistant", "openclaw"}
+_SEMANTIC_JUDGMENT_BOOL_KEYS = (
+    "persona_identity_consistent",
+    "ground_truth_facts_supported",
+    "contradictions_absent",
+)
+
+
+def _contains_explicit_negation(value: object) -> bool:
+    text = str(value or "")
+    return bool(_ENGLISH_NEGATION_RE.search(text) or _CHINESE_NEGATION_RE.search(text))
+
+
+def _value_explicitly_negated(observed: object, expected: object) -> bool:
+    """Catch direct negation without pretending to perform semantic review."""
+    text = str(observed or "").casefold()
+    term = str(expected or "").strip().casefold()
+    if not text or not term:
+        return False
+    escaped = re.escape(term).replace(r"\ ", r"[\s_-]+")
+    english = re.compile(
+        rf"(?:\b(?:no|never)\b|\bnot\b(?![\s_-]+(?:only|just)\b)|"
+        rf"\b(?:is|are|was|were|do|does|did)\s+n['’]?t\b)"
+        rf"[\s_-]*"
+        rf"(?:the\s+)?{escaped}\b",
+        re.IGNORECASE,
+    )
+    chinese = re.compile(rf"(?:并非|绝非|不是|不叫|不属于|没有|无)\s*{escaped}")
+    return bool(english.search(text) or chinese.search(text))
+
+
+def _value_lexically_supported(observed: object, expected: object) -> bool:
+    expected_norm = _norm_text(expected)
+    return bool(
+        expected_norm
+        and expected_norm in _norm_text(observed)
+        and not _value_explicitly_negated(observed, expected)
+    )
 
 
 def _memory_text(memory: dict) -> str:
@@ -290,16 +494,79 @@ def _fact_matched(fact: dict, memory_text: str) -> bool:
     keywords = [k for k in keywords if k]
     if not keywords:
         return False
-    return all(k in normalized_memory for k in keywords)
+    return all(k in normalized_memory for k in keywords) and not _fact_contradicted(
+        fact, memory_text
+    )
+
+
+def _fact_contradicted(fact: dict, memory_text: str) -> bool:
+    """Flag explicit negation in a clause containing every locked fact keyword."""
+    expected_text = str(fact.get("text") or "")
+    if _contains_explicit_negation(expected_text):
+        return False
+    keywords = [_norm_text(k) for k in _fact_keywords(fact)]
+    keywords = [keyword for keyword in keywords if keyword]
+    if not keywords:
+        return False
+    clauses = re.split(r"[\n\r.!?！？。；;]+", str(memory_text or ""))
+    return any(
+        all(keyword in _norm_text(clause) for keyword in keywords)
+        and _contains_explicit_negation(clause)
+        for clause in clauses
+        if clause.strip()
+    )
+
+
+def _semantic_judgment_summary(
+    judgment: object,
+    expected_fact_ids: list[str],
+    evidence_sha256: str,
+) -> dict:
+    """Return bounded evidence that the qualification agent made the semantic call."""
+    required_keys = {
+        "schema_version",
+        "judge",
+        "evidence_sha256",
+        "reviewed_surfaces",
+        "reviewed_fact_ids",
+        *_SEMANTIC_JUDGMENT_BOOL_KEYS,
+    }
+    provided = (
+        isinstance(judgment, dict)
+        and set(judgment) == required_keys
+        and judgment.get("schema_version") == 1
+        and judgment.get("judge") == "qualification_agent"
+        and bool(re.fullmatch(r"[0-9a-f]{64}", evidence_sha256))
+        and judgment.get("evidence_sha256") == evidence_sha256
+        and judgment.get("reviewed_surfaces") == _SEMANTIC_REVIEW_SURFACES
+        and judgment.get("reviewed_fact_ids") == expected_fact_ids
+        and all(type(judgment.get(key)) is bool for key in _SEMANTIC_JUDGMENT_BOOL_KEYS)
+    )
+    return {
+        "required": True,
+        "provided": bool(provided),
+        "judge": "qualification_agent" if provided else None,
+        "evidence_sha256": evidence_sha256 if provided else None,
+        "reviewed_surfaces": list(_SEMANTIC_REVIEW_SURFACES) if provided else [],
+        "reviewed_fact_ids": list(expected_fact_ids) if provided else [],
+        **{
+            key: judgment[key] if provided else None
+            for key in _SEMANTIC_JUDGMENT_BOOL_KEYS
+        },
+    }
 
 
 def _dimension_matches(identity_dims: list, expected_dims: list) -> bool:
     if not expected_dims:
         return bool(identity_dims)
     blob = _norm_text(json.dumps(identity_dims, ensure_ascii=False))
+    rendered = json.dumps(identity_dims, ensure_ascii=False)
     for dim in expected_dims:
-        name = _norm_text(dim.get("name") if isinstance(dim, dict) else dim)
+        raw_name = dim.get("name") if isinstance(dim, dict) else dim
+        name = _norm_text(raw_name)
         if name and name not in blob:
+            return False
+        if raw_name and _value_explicitly_negated(rendered, raw_name):
             return False
     return True
 
@@ -313,10 +580,39 @@ def _duplicate_pairs(memories: list[dict]) -> list[dict]:
             continue
         mid = str(memory.get("id") or f"memory_{idx}")
         if text in seen:
-            pairs.append({"left_id": seen[text], "right_id": mid, "reason": "normalized_text"})
+            pairs.append(
+                {"left_id": seen[text], "right_id": mid, "reason": "normalized_text"}
+            )
         else:
             seen[text] = mid
     return pairs
+
+
+def _privacy_forbidden_values(fixture: dict) -> list[str]:
+    privacy = fixture.get("privacy") if isinstance(fixture.get("privacy"), dict) else {}
+    values = privacy.get("forbidden_in_agent_identity_or_persona") or []
+    if not isinstance(values, list):
+        return []
+    return [str(value).strip() for value in values if str(value).strip()]
+
+
+def _privacy_surface_has_forbidden(surface: object, forbidden: list[str]) -> bool:
+    """Return a boolean leak signal without returning or logging matched content."""
+    if isinstance(surface, str):
+        rendered = surface
+    else:
+        rendered = json.dumps(surface, ensure_ascii=False, sort_keys=True, default=str)
+    folded = rendered.casefold()
+    normalized = _norm_text(rendered)
+    for value in forbidden:
+        if not value:
+            continue
+        normalized_value = _norm_text(value)
+        if value.casefold() in folded or (
+            normalized_value and normalized_value in normalized
+        ):
+            return True
+    return False
 
 
 def evaluate_distill_acceptance(
@@ -330,15 +626,35 @@ def evaluate_distill_acceptance(
     voice_text: str,
     greeting_messages: list[dict],
     job: dict,
+    semantic_judgment: dict | None = None,
+    evidence_sha256: str = "",
 ) -> dict:
-    expected_persona = fixture.get("persona") if isinstance(fixture.get("persona"), dict) else {}
-    relationship = fixture.get("relationship") if isinstance(fixture.get("relationship"), dict) else {}
-    ground_truth = fixture.get("ground_truth") if isinstance(fixture.get("ground_truth"), dict) else {}
-    expected_facts = [f for f in (ground_truth.get("facts") or []) if isinstance(f, dict)]
+    expected_persona = (
+        fixture.get("persona") if isinstance(fixture.get("persona"), dict) else {}
+    )
+    relationship = (
+        fixture.get("relationship")
+        if isinstance(fixture.get("relationship"), dict)
+        else {}
+    )
+    ground_truth = (
+        fixture.get("ground_truth")
+        if isinstance(fixture.get("ground_truth"), dict)
+        else {}
+    )
+    expected_facts = [
+        f for f in (ground_truth.get("facts") or []) if isinstance(f, dict)
+    ]
     expected_name = str(expected_persona.get("agent_name") or "").strip()
     expected_category = str(expected_persona.get("category") or "").strip()
-    expected_dims = [d for d in (expected_persona.get("dimensions") or []) if isinstance(d, dict)]
+    expected_dims = [
+        d for d in (expected_persona.get("dimensions") or []) if isinstance(d, dict)
+    ]
     expected_days = relationship.get("expected_days_with_user")
+    expected_fact_ids = [str(fact.get("id") or "") for fact in expected_facts]
+    semantic = _semantic_judgment_summary(
+        semantic_judgment, expected_fact_ids, evidence_sha256
+    )
 
     memory_rows = [
         {
@@ -351,25 +667,37 @@ def evaluate_distill_acceptance(
     ]
     recalled: list[dict] = []
     missed: list[dict] = []
+    contradicted: list[dict] = []
     matched_memory_ids: set[str] = set()
     for fact in expected_facts:
+        contradiction_matches = [
+            row for row in memory_rows if _fact_contradicted(fact, row["text"])
+        ]
+        if contradiction_matches:
+            contradicted.append(
+                {
+                    "id": str(fact.get("id") or ""),
+                    "matched_memory_ids": [row["id"] for row in contradiction_matches],
+                }
+            )
         matches = [row for row in memory_rows if _fact_matched(fact, row["text"])]
         if matches:
-            recalled.append({
-                "id": str(fact.get("id") or ""),
-                "text": str(fact.get("text") or ""),
-                "matched_memory_ids": [m["id"] for m in matches],
-            })
+            recalled.append(
+                {
+                    "id": str(fact.get("id") or ""),
+                    "matched_memory_ids": [m["id"] for m in matches],
+                }
+            )
             matched_memory_ids.update(m["id"] for m in matches)
         else:
-            missed.append({
-                "id": str(fact.get("id") or ""),
-                "text": str(fact.get("text") or ""),
-                "keywords": _fact_keywords(fact),
-            })
+            missed.append(
+                {
+                    "id": str(fact.get("id") or ""),
+                }
+            )
 
     false_positives = [
-        {"id": row["id"], "text": row["text"]}
+        {"id": row["id"]}
         for row in memory_rows
         if row["id"] not in matched_memory_ids and row["text"]
     ]
@@ -380,7 +708,11 @@ def evaluate_distill_acceptance(
     agent_name = str(identity.get("agent_name") or "").strip()
     category = str(identity.get("category") or "").strip()
     self_intro = str(identity.get("self_introduction") or "").strip()
-    dims = identity.get("dimensions") if isinstance(identity.get("dimensions"), list) else []
+    dims = (
+        identity.get("dimensions")
+        if isinstance(identity.get("dimensions"), list)
+        else []
+    )
     days = identity_meta.get("days_with_user")
     if not isinstance(days, int):
         try:
@@ -389,32 +721,82 @@ def evaluate_distill_acceptance(
             days = None
     greeting_ok = any(
         str(m.get("content") or m.get("text") or "").strip()
-        and str(m.get("role") or "").lower() not in {"", "user"}
+        and str(m.get("role") or "").lower() in _AGENT_CHAT_ROLES
         for m in greeting_messages
         if isinstance(m, dict)
     )
-    voice_ok = bool(str(voice_text or "").strip() or job.get("voice_ref") or job.get("voice_sha256"))
+    voice_ok = bool(
+        str(voice_text or "").strip() or job.get("voice_ref") or job.get("voice_sha256")
+    )
+
+    forbidden = _privacy_forbidden_values(fixture)
+    # Keep self-introduction as its own surface so a failure says where the leak
+    # occurred.  The identity surface intentionally excludes that field to avoid
+    # double-counting the same occurrence.
+    identity_without_intro = dict(identity)
+    identity_without_intro.pop("self_introduction", None)
+    privacy_violating_surfaces = [
+        surface_name
+        for surface_name, surface_value in (
+            ("identity", identity_without_intro),
+            ("persona", persona_text),
+            ("self_introduction", self_intro),
+        )
+        if _privacy_surface_has_forbidden(surface_value, forbidden)
+    ]
 
     checks = {
-        "identity_agent_name": bool(agent_name) and (not expected_name or expected_name in agent_name),
-        "identity_category": bool(category) and (not expected_category or expected_category in category),
-        "identity_dimensions": bool(dims) and all(
+        "identity_agent_name": bool(agent_name)
+        and (
+            not expected_name or _value_lexically_supported(agent_name, expected_name)
+        ),
+        "identity_category": bool(category)
+        and (
+            not expected_category
+            or _value_lexically_supported(category, expected_category)
+        ),
+        "identity_dimensions": bool(dims)
+        and all(
             isinstance(d, dict) and str(d.get("description") or "").strip()
             for d in dims
-        ) and _dimension_matches(dims, expected_dims),
-        "identity_self_introduction": bool(self_intro) and all(
-            _norm_text(k) in _norm_text(self_intro)
+        )
+        and _dimension_matches(dims, expected_dims),
+        "identity_self_introduction": bool(self_intro)
+        and all(
+            _value_lexically_supported(self_intro, k)
             for k in expected_persona.get("self_introduction_keywords", [])
             if str(k).strip()
         ),
         "memory_count_reasonable": memory_count >= min(1, total),
         "ground_truth_recall": len(missed) == 0,
+        "no_explicit_contradictions": len(contradicted) == 0,
         "no_duplicate_memories": len(duplicates) == 0,
-        "relationship_days": (days == expected_days) if isinstance(expected_days, int) else isinstance(days, int),
+        "relationship_days": (
+            (days == expected_days)
+            if isinstance(expected_days, int)
+            else isinstance(days, int)
+        ),
         "greeting_non_empty": greeting_ok,
-        "persona_non_empty": bool(str(persona_text or "").strip() or job.get("persona_ref") or job.get("persona_sha256")),
+        "persona_non_empty": bool(
+            str(persona_text or "").strip()
+            or job.get("persona_ref")
+            or job.get("persona_sha256")
+        ),
         "voice_non_empty": voice_ok,
         "validate_passing": bool(validate.get("passing")),
+        "privacy_identity_clear": "identity" not in privacy_violating_surfaces,
+        "privacy_persona_clear": "persona" not in privacy_violating_surfaces,
+        "privacy_self_introduction_clear": "self_introduction"
+        not in privacy_violating_surfaces,
+        "semantic_persona_identity_consistent": bool(
+            semantic["provided"] and semantic["persona_identity_consistent"]
+        ),
+        "semantic_ground_truth_facts_supported": bool(
+            semantic["provided"] and semantic["ground_truth_facts_supported"]
+        ),
+        "semantic_contradictions_absent": bool(
+            semantic["provided"] and semantic["contradictions_absent"]
+        ),
     }
     metrics = {
         "ground_truth_total": total,
@@ -424,9 +806,12 @@ def evaluate_distill_acceptance(
         "miss_rate": (len(missed) / total) if total else 0.0,
         "memory_count": memory_count,
         "false_positive_count": len(false_positives),
-        "false_positive_rate": (len(false_positives) / memory_count) if memory_count else 0.0,
+        "false_positive_rate": (
+            (len(false_positives) / memory_count) if memory_count else 0.0
+        ),
         "duplicate_pair_count": len(duplicates),
         "duplicate_rate": (len(duplicates) / memory_count) if memory_count else 0.0,
+        "explicit_contradiction_count": len(contradicted),
     }
     hard_ok = all(checks.values())
     # False positives are reported but not a hard fail by default: the model may extract
@@ -438,11 +823,26 @@ def evaluate_distill_acceptance(
         "checks": checks,
         "recalled_facts": recalled,
         "missed_facts": missed,
+        "contradicted_facts": contradicted,
         "false_positives": false_positives,
         "duplicates": duplicates,
-        "identity": identity,
-        "identity_meta": identity_meta,
-        "validate": validate,
+        "semantic_judgment": semantic,
+        # Never echo identity, persona, self-introduction, memory text, or the
+        # forbidden fixture values in a report.  CI only needs bounded signals;
+        # the intelligent qualification agent may inspect plaintext in memory.
+        "privacy": {
+            "forbidden_value_count": len(forbidden),
+            "violation_count": len(privacy_violating_surfaces),
+            "violating_surfaces": privacy_violating_surfaces,
+        },
+        "identity_summary": {
+            "agent_name_present": bool(agent_name),
+            "category_present": bool(category),
+            "dimension_count": len(dims),
+            "self_introduction_present": bool(self_intro),
+            "relationship_days_present": isinstance(days, int),
+        },
+        "validate_summary": {"passing": bool(validate.get("passing"))},
     }
 
 
@@ -471,24 +871,36 @@ def render_distill_acceptance_report(report: dict) -> str:
     for key, value in checks.items():
         lines.append(f"- {key}：{'PASS' if value else 'FAIL'}")
     lines.extend(["", "## 漏抽"])
-    missed = report.get("missed_facts") if isinstance(report.get("missed_facts"), list) else []
+    missed = (
+        report.get("missed_facts")
+        if isinstance(report.get("missed_facts"), list)
+        else []
+    )
     if missed:
         for item in missed:
-            lines.append(f"- 漏抽：{item.get('id', '')}｜{item.get('text', '')}")
+            lines.append(f"- 漏抽：{item.get('id', '')}")
     else:
         lines.append("- 无")
     lines.extend(["", "## 误报"])
-    false_positives = report.get("false_positives") if isinstance(report.get("false_positives"), list) else []
+    false_positives = (
+        report.get("false_positives")
+        if isinstance(report.get("false_positives"), list)
+        else []
+    )
     if false_positives:
         for item in false_positives:
-            lines.append(f"- 误报：{item.get('id', '')}｜{item.get('text', '')}")
+            lines.append(f"- 误报：{item.get('id', '')}")
     else:
         lines.append("- 无")
     lines.extend(["", "## 重复"])
-    duplicates = report.get("duplicates") if isinstance(report.get("duplicates"), list) else []
+    duplicates = (
+        report.get("duplicates") if isinstance(report.get("duplicates"), list) else []
+    )
     if duplicates:
         for item in duplicates:
-            lines.append(f"- 重复：{item.get('left_id', '')} ↔ {item.get('right_id', '')}｜{item.get('reason', '')}")
+            lines.append(
+                f"- 重复：{item.get('left_id', '')} ↔ {item.get('right_id', '')}｜{item.get('reason', '')}"
+            )
     else:
         lines.append("- 无")
     return "\n".join(lines) + "\n"
@@ -501,33 +913,955 @@ def _load_fixture(path: str) -> dict:
     return data
 
 
-def _decrypt_memory_rows(rows: list, sk_raw: bytes) -> list[dict]:
+def _decrypt_memory_rows(
+    rows: list,
+    sk_raw: bytes,
+    expected_owner_user_id: str = "",
+) -> list[dict]:
     out: list[dict] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
-        item = dict(row)
-        if item.get("body_ct") and not (item.get("title") or item.get("description")):
+        item = {"id": str(row.get("id") or "")} if expected_owner_user_id else dict(row)
+        if row.get("body_ct"):
+            if expected_owner_user_id:
+                _require_envelope_owner(
+                    row,
+                    expected_owner_user_id,
+                    stage="memory",
+                    code="memory_owner_mismatch",
+                )
             try:
-                inner = json.loads(_decrypt_envelope_user(item, sk_raw))
+                inner = json.loads(_decrypt_envelope_user(row, sk_raw))
                 if isinstance(inner, dict):
                     item.update(inner)
                     item["inner"] = inner
-            except Exception as e:  # noqa: BLE001
-                item["decrypt_error"] = str(e)[:160]
+                else:
+                    item["decrypt_error"] = "memory_plaintext_not_object"
+            except ExistingSessionDistillError:
+                raise
+            except Exception:  # noqa: BLE001
+                item["decrypt_error"] = "memory_decrypt_failed"
+        elif expected_owner_user_id:
+            item["decrypt_error"] = "memory_ciphertext_missing"
         out.append(item)
     return out
 
 
+class ExistingSessionDistillError(RuntimeError):
+    """A bounded, secret-free failure from an existing-session distill run."""
+
+    def __init__(self, stage: str, code: str, http_status: int | None = None):
+        self.stage = stage
+        self.code = code
+        self.http_status = http_status
+        suffix = f" (http_status={http_status})" if isinstance(http_status, int) else ""
+        super().__init__(f"{stage}: {code}{suffix}")
+
+    def as_result(self) -> dict:
+        result = {"ok": False, "stage": self.stage, "code": self.code}
+        if isinstance(self.http_status, int):
+            result["http_status"] = self.http_status
+        return result
+
+
+def _require_envelope_owner(
+    envelope: dict,
+    expected_user_id: str,
+    *,
+    stage: str,
+    code: str,
+) -> None:
+    if str(envelope.get("owner_user_id") or "") != expected_user_id:
+        raise ExistingSessionDistillError(stage, code)
+
+
+def _canonical_json_bytes(value: object) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _sha256_hex(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _secure_file_flags(base_flags: int) -> int:
+    flags = base_flags
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    return flags
+
+
+def _read_owner_only_file(path_value: str, *, stage: str, code_prefix: str) -> bytes:
+    path = Path(path_value)
+    try:
+        before = path.lstat()
+    except OSError:
+        raise ExistingSessionDistillError(stage, f"{code_prefix}_unreadable") from None
+    if not stat.S_ISREG(before.st_mode):
+        raise ExistingSessionDistillError(stage, f"{code_prefix}_not_regular")
+    try:
+        fd = os.open(path, _secure_file_flags(os.O_RDONLY))
+    except OSError:
+        raise ExistingSessionDistillError(stage, f"{code_prefix}_unreadable") from None
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            before.st_dev,
+            before.st_ino,
+        ):
+            raise ExistingSessionDistillError(stage, f"{code_prefix}_not_regular")
+        if opened.st_uid != os.geteuid():
+            raise ExistingSessionDistillError(stage, f"{code_prefix}_owner_mismatch")
+        if stat.S_IMODE(opened.st_mode) != 0o600:
+            raise ExistingSessionDistillError(
+                stage, f"{code_prefix}_permissions_invalid"
+            )
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            return handle.read()
+    except ExistingSessionDistillError:
+        raise
+    except OSError:
+        raise ExistingSessionDistillError(stage, f"{code_prefix}_unreadable") from None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _require_private_path_outside_artifacts(
+    path_value: str,
+    artifact_dir: str,
+    *,
+    stage: str = "capture",
+    code_prefix: str = "private_evidence",
+) -> Path:
+    destination = Path(path_value)
+    if not destination.is_absolute() or not str(artifact_dir or "").strip():
+        raise ExistingSessionDistillError(stage, f"{code_prefix}_path_invalid")
+    artifact_root = Path(artifact_dir).resolve(strict=False)
+    resolved_destination = destination.resolve(strict=False)
+    try:
+        inside_artifacts = os.path.commonpath(
+            [str(resolved_destination), str(artifact_root)]
+        ) == str(artifact_root)
+    except ValueError:
+        inside_artifacts = False
+    if inside_artifacts:
+        raise ExistingSessionDistillError(stage, f"{code_prefix}_inside_artifacts")
+    return destination
+
+
+def _write_private_report(path_value: str, artifact_dir: str, content: str) -> None:
+    """Create an owner-only sanitized helper report outside public artifacts."""
+    destination = _require_private_path_outside_artifacts(
+        path_value,
+        artifact_dir,
+        stage="report",
+        code_prefix="report",
+    )
+    if not destination.parent.is_dir():
+        raise ExistingSessionDistillError("report", "report_parent_missing")
+
+    flags = _secure_file_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    try:
+        fd = os.open(destination, flags, 0o600)
+    except OSError:
+        raise ExistingSessionDistillError("report", "report_create_failed") from None
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError:
+        raise ExistingSessionDistillError("report", "report_write_failed") from None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _write_private_evidence(
+    path_value: str,
+    artifact_dir: str,
+    evidence: dict,
+) -> str:
+    destination = _require_private_path_outside_artifacts(path_value, artifact_dir)
+    if not destination.parent.is_dir():
+        raise ExistingSessionDistillError("capture", "private_evidence_parent_missing")
+
+    raw = _canonical_json_bytes(evidence)
+    flags = _secure_file_flags(os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    try:
+        fd = os.open(destination, flags, 0o600)
+    except OSError:
+        raise ExistingSessionDistillError(
+            "capture", "private_evidence_create_failed"
+        ) from None
+    wrote = False
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            fd = -1
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        wrote = True
+    except OSError:
+        raise ExistingSessionDistillError(
+            "capture", "private_evidence_write_failed"
+        ) from None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if not wrote:
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+    return _sha256_hex(raw)
+
+
+def _delete_private_evidence(path_value: str) -> None:
+    try:
+        current = os.lstat(path_value)
+        if stat.S_ISDIR(current.st_mode):
+            return
+        os.unlink(path_value)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Finalization remains fail closed if cleanup cannot be proven.
+        raise ExistingSessionDistillError(
+            "cleanup", "private_evidence_delete_failed"
+        ) from None
+
+
+def _decrypt_chat_history(
+    messages: object,
+    sk_raw: bytes,
+    expected_user_id: str,
+) -> tuple[list[dict], int, int]:
+    """Decrypt opaque live history and discard any untrusted plaintext decoys."""
+    if not isinstance(messages, list):
+        return [], 1, 0
+    decrypted: list[dict] = []
+    decrypt_errors = 0
+    decrypted_agent_messages = 0
+    for raw in messages:
+        if not isinstance(raw, dict):
+            decrypt_errors += 1
+            continue
+        role = str(raw.get("role") or "").lower()
+        item = {"role": role}
+        if raw.get("body_ct"):
+            _require_envelope_owner(
+                raw,
+                expected_user_id,
+                stage="chat",
+                code="chat_owner_mismatch",
+            )
+            try:
+                item["content"] = _decrypt_envelope_user(raw, sk_raw)
+                if role in _AGENT_CHAT_ROLES:
+                    decrypted_agent_messages += 1
+            except Exception:  # noqa: BLE001
+                item["content"] = ""
+                item["decrypt_error"] = "chat_decrypt_failed"
+                decrypt_errors += 1
+        else:
+            # Qualification must prove the user-visible greeting came from the
+            # encrypted history record, never from a server-supplied plaintext
+            # convenience/decoy field.
+            item["content"] = ""
+            if role in _AGENT_CHAT_ROLES:
+                item["decrypt_error"] = "chat_ciphertext_missing"
+                decrypt_errors += 1
+        decrypted.append(item)
+    return decrypted, decrypt_errors, decrypted_agent_messages
+
+
+_QUALIFICATION_JOB_ID_RE = re.compile(r"^genesis_[0-9a-f]{16}$")
+
+
+def _require_success_status(status: int, stage: str, rejection_code: str) -> None:
+    if 300 <= status < 400:
+        raise ExistingSessionDistillError(stage, "redirect_rejected", status)
+    if not 200 <= status < 300:
+        raise ExistingSessionDistillError(stage, rejection_code, status)
+
+
+def _qualification_base_url(raw: str) -> str:
+    parsed = urllib.parse.urlsplit(str(raw or "").strip())
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ExistingSessionDistillError("target", "unsafe_target") from None
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "test-api.feedling.app"
+        or port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ExistingSessionDistillError("target", "unsafe_target")
+    return "https://test-api.feedling.app"
+
+
+def _existing_session_request(
+    request_fn,
+    method: str,
+    url: str,
+    api_key: str,
+    stage: str,
+    **kwargs,
+):
+    """Normalize transport failures without reflecting response bodies/exceptions."""
+    try:
+        response = request_fn(method, url, api_key, **kwargs)
+    except (Exception, SystemExit):  # noqa: BLE001
+        raise ExistingSessionDistillError(stage, "request_failed") from None
+    if (
+        not isinstance(response, tuple)
+        or len(response) != 2
+        or not isinstance(response[0], int)
+        or not isinstance(response[1], dict)
+    ):
+        raise ExistingSessionDistillError(stage, "response_invalid")
+    return response
+
+
+def _build_existing_session_payload(fixture: dict, client_job_id: str) -> dict:
+    materials = (
+        fixture.get("materials") if isinstance(fixture.get("materials"), dict) else {}
+    )
+    relationship = (
+        fixture.get("relationship")
+        if isinstance(fixture.get("relationship"), dict)
+        else {}
+    )
+    payload = {
+        "format": str(materials.get("format") or "auto"),
+        "content": str(materials.get("chat_history") or ""),
+        "fresh_start": False,
+        "client_job_id": client_job_id,
+    }
+    if relationship.get("relationship_started_at"):
+        payload["relationship_started_at"] = str(
+            relationship["relationship_started_at"]
+        )
+    for src_key, payload_key in (
+        ("ai_persona", "ai_persona_content"),
+        ("personal_profile", "personal_profile_content"),
+        ("memory_summary", "memory_summary_content"),
+    ):
+        value = materials.get(src_key)
+        if value:
+            payload[payload_key] = str(value)
+    return payload
+
+
+def _job_view(body: dict) -> dict:
+    """Normalize current and older import-status response shapes."""
+    merged: dict = {}
+    state = body.get("state") if isinstance(body, dict) else None
+    if isinstance(state, dict):
+        merged.update(state)
+    job = body.get("job") if isinstance(body, dict) else None
+    if isinstance(job, dict):
+        merged.update(job)
+    if isinstance(body, dict):
+        for key in (
+            "job_id",
+            "status",
+            "persona_ref",
+            "persona_sha256",
+            "voice_ref",
+            "voice_sha256",
+        ):
+            if key in body and key not in merged:
+                merged[key] = body[key]
+    return merged
+
+
+def capture_existing_session_distill_evidence(
+    *,
+    api_url: str,
+    api_key: str,
+    user_id: str,
+    content_private_key: bytes,
+    fixture: dict,
+    private_evidence_path: str,
+    artifact_dir: str,
+    timeout: float = 900,
+    poll: float = 10,
+    intro_timeout: float = 180,
+    memory_limit: int = 100,
+    client_job_id: str = "",
+    request_fn=None,
+) -> dict:
+    """Run persona import once and capture exact decrypted surfaces for Codex.
+
+    The private evidence file is owner-only and must live outside the public
+    artifact tree. The returned receipt is content-free and safe to log.
+    """
+    if not str(api_key or "").strip():
+        raise ExistingSessionDistillError("session", "api_key_missing")
+    if not str(user_id or "").strip():
+        raise ExistingSessionDistillError("session", "user_id_missing")
+    if not isinstance(content_private_key, bytes) or len(content_private_key) != 32:
+        raise ExistingSessionDistillError("session", "content_private_key_invalid")
+    if not isinstance(fixture, dict):
+        raise ExistingSessionDistillError("fixture", "fixture_invalid")
+
+    materials = (
+        fixture.get("materials") if isinstance(fixture.get("materials"), dict) else {}
+    )
+    if any(
+        not str(materials.get(key) or "").strip()
+        for key in ("chat_history", "ai_persona", "personal_profile", "memory_summary")
+    ):
+        raise ExistingSessionDistillError("fixture", "four_materials_required")
+    ground_truth = (
+        fixture.get("ground_truth")
+        if isinstance(fixture.get("ground_truth"), dict)
+        else {}
+    )
+    if not isinstance(ground_truth.get("facts"), list) or not ground_truth["facts"]:
+        raise ExistingSessionDistillError("fixture", "ground_truth_required")
+    if not _privacy_forbidden_values(fixture):
+        raise ExistingSessionDistillError("fixture", "privacy_contract_required")
+    try:
+        bounded_memory_limit = int(memory_limit)
+    except (TypeError, ValueError):
+        raise ExistingSessionDistillError("fixture", "memory_limit_invalid") from None
+    if not 1 <= bounded_memory_limit <= 500:
+        raise ExistingSessionDistillError("fixture", "memory_limit_invalid")
+
+    request = request_fn or _http
+    base = _qualification_base_url(api_url)
+    job_token = client_job_id or ("qa_existing_distill_" + os.urandom(8).hex())
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{8,96}", job_token):
+        raise ExistingSessionDistillError("fixture", "client_job_id_invalid")
+    payload = _build_existing_session_payload(fixture, job_token)
+    status, body = _existing_session_request(
+        request,
+        "POST",
+        f"{base}/v1/genesis/imports/plaintext",
+        api_key,
+        "upload",
+        json_body=payload,
+    )
+    _require_success_status(status, "upload", "upload_rejected")
+    upload_job = body.get("job") if isinstance(body.get("job"), dict) else {}
+    job_id = str(upload_job.get("job_id") or body.get("job_id") or "")
+    if not _QUALIFICATION_JOB_ID_RE.fullmatch(job_id):
+        raise ExistingSessionDistillError("upload", "job_id_invalid", status)
+
+    deadline = time.time() + max(0.0, timeout)
+    job_body: dict = {}
+    job: dict = {"job_id": job_id}
+    while time.time() <= deadline:
+        job_status, candidate = _existing_session_request(
+            request,
+            "GET",
+            f"{base}/v1/genesis/imports/{job_id}",
+            api_key,
+            "poll",
+        )
+        _require_success_status(job_status, "poll", "job_status_rejected")
+        job_body = candidate if isinstance(candidate, dict) else {}
+        job = _job_view(job_body)
+        job["job_id"] = job_id
+        terminal = str(job.get("status") or "").lower()
+        if terminal in ("done", "failed"):
+            break
+        time.sleep(max(0.0, poll))
+    terminal = str(job.get("status") or "").lower()
+    if terminal == "failed":
+        raise ExistingSessionDistillError("distill", "job_failed")
+    if terminal != "done":
+        raise ExistingSessionDistillError("distill", "job_timeout")
+
+    identity_plain: dict = {}
+    identity_meta: dict = {}
+    identity_decrypted = False
+    chat: dict = {}
+    decrypted_chat_messages: list[dict] = []
+    chat_decrypt_error_count = 0
+    decrypted_agent_message_count = 0
+    intro_deadline = time.time() + max(0.0, intro_timeout)
+    while time.time() <= intro_deadline:
+        identity_status, identity_body = _existing_session_request(
+            request, "GET", f"{base}/v1/identity/get", api_key, "identity"
+        )
+        if 300 <= identity_status < 400:
+            raise ExistingSessionDistillError(
+                "identity", "redirect_rejected", identity_status
+            )
+        if identity_status not in (200, 404, 409):
+            raise ExistingSessionDistillError(
+                "identity", "identity_rejected", identity_status
+            )
+        if identity_status < 400 and isinstance(identity_body, dict):
+            identity_payload = identity_body.get("identity") or {}
+            identity_meta = (
+                dict(identity_payload) if isinstance(identity_payload, dict) else {}
+            )
+            if isinstance(identity_payload, dict) and identity_payload.get("body_ct"):
+                _require_envelope_owner(
+                    identity_payload,
+                    user_id,
+                    stage="identity",
+                    code="identity_owner_mismatch",
+                )
+                try:
+                    decoded = json.loads(
+                        _decrypt_envelope_user(identity_payload, content_private_key)
+                    )
+                    identity_plain = decoded if isinstance(decoded, dict) else {}
+                    identity_decrypted = isinstance(decoded, dict)
+                except Exception:  # noqa: BLE001
+                    identity_plain = {}
+            elif isinstance(identity_payload, dict):
+                identity_plain = identity_payload
+
+        chat_status, chat_body = _existing_session_request(
+            request, "GET", f"{base}/v1/chat/history?limit=20", api_key, "chat"
+        )
+        if 300 <= chat_status < 400:
+            raise ExistingSessionDistillError("chat", "redirect_rejected", chat_status)
+        if chat_status not in (200, 404, 409):
+            raise ExistingSessionDistillError("chat", "chat_rejected", chat_status)
+        chat = chat_body if chat_status < 400 and isinstance(chat_body, dict) else {}
+        (
+            decrypted_chat_messages,
+            chat_decrypt_error_count,
+            decrypted_agent_message_count,
+        ) = _decrypt_chat_history(
+            chat.get("messages") or [], content_private_key, user_id
+        )
+        greeting_ok = any(
+            str(message.get("content") or message.get("text") or "").strip()
+            and str(message.get("role") or "").lower() in _AGENT_CHAT_ROLES
+            for message in decrypted_chat_messages
+            if isinstance(message, dict)
+        )
+        if str(identity_plain.get("self_introduction") or "").strip() and greeting_ok:
+            break
+        time.sleep(max(0.0, poll))
+
+    memory_status, memory_body = _existing_session_request(
+        request,
+        "GET",
+        f"{base}/v1/memory/list?limit={bounded_memory_limit}",
+        api_key,
+        "memory",
+    )
+    _require_success_status(memory_status, "memory", "memory_rejected")
+    memories = _decrypt_memory_rows(
+        (
+            (memory_body.get("moments") or [])
+            if memory_status < 400 and isinstance(memory_body, dict)
+            else []
+        ),
+        content_private_key,
+        user_id,
+    )
+    memory_decrypt_error_count = sum(
+        1
+        for memory in memories
+        if isinstance(memory, dict) and memory.get("decrypt_error")
+    )
+    validate_status, validate_body = _existing_session_request(
+        request, "GET", f"{base}/v1/onboarding/validate", api_key, "validate"
+    )
+    _require_success_status(validate_status, "validate", "validate_rejected")
+    validate = (
+        validate_body
+        if validate_status < 400 and isinstance(validate_body, dict)
+        else {}
+    )
+
+    persona_text = ""
+    persona_decrypted = False
+    persona = (
+        job_body.get("persona") if isinstance(job_body.get("persona"), dict) else {}
+    )
+    persona_env = (
+        persona.get("content_envelope")
+        if isinstance(persona.get("content_envelope"), dict)
+        else {}
+    )
+    if persona_env:
+        _require_envelope_owner(
+            persona_env,
+            user_id,
+            stage="persona",
+            code="persona_owner_mismatch",
+        )
+        try:
+            persona_text = _decrypt_envelope_user(persona_env, content_private_key)
+            persona_decrypted = True
+        except Exception:  # noqa: BLE001
+            persona_text = ""
+
+    capture_checks = {
+        "identity_envelope_decrypted": identity_decrypted,
+        "persona_envelope_decrypted": persona_decrypted,
+        "memory_envelopes_decrypted": memory_decrypt_error_count == 0,
+        "chat_envelopes_decrypted": (
+            chat_decrypt_error_count == 0 and decrypted_agent_message_count > 0
+        ),
+    }
+    transport = {
+        "used_existing_session": True,
+        "created_user": False,
+        "configured_provider": False,
+        "job_status": terminal,
+        "upload_http_status": status,
+        "memory_http_status": memory_status,
+        "validate_http_status": validate_status,
+        "memory_decrypt_error_count": memory_decrypt_error_count,
+        "chat_decrypt_error_count": chat_decrypt_error_count,
+        "decrypted_agent_message_count": decrypted_agent_message_count,
+    }
+    ground_truth = (
+        fixture.get("ground_truth")
+        if isinstance(fixture.get("ground_truth"), dict)
+        else {}
+    )
+    expected_fact_ids = [
+        str(fact.get("id") or "")
+        for fact in (ground_truth.get("facts") or [])
+        if isinstance(fact, dict)
+    ]
+    fixture_sha256 = _sha256_hex(_canonical_json_bytes(fixture))
+    private_evidence = {
+        "schema_version": 1,
+        "fixture_sha256": fixture_sha256,
+        "expected_fact_ids": expected_fact_ids,
+        "identity": identity_plain,
+        "identity_meta": {"days_with_user": identity_meta.get("days_with_user")},
+        "persona_text": persona_text,
+        "memories": memories,
+        "greeting_messages": decrypted_chat_messages,
+        "validate": validate,
+        "voice_text": "",
+        "job": job,
+        "capture_checks": capture_checks,
+        "transport": transport,
+    }
+    evidence_sha256 = _write_private_evidence(
+        private_evidence_path, artifact_dir, private_evidence
+    )
+    return {
+        "ok": True,
+        "phase": "CAPTURED",
+        "evidence_sha256": evidence_sha256,
+        "fixture_sha256": fixture_sha256,
+        "expected_fact_ids": expected_fact_ids,
+        "job_id": job_id,
+        "capture_checks": capture_checks,
+        "transport": transport,
+    }
+
+
+_PRIVATE_EVIDENCE_KEYS = {
+    "schema_version",
+    "fixture_sha256",
+    "expected_fact_ids",
+    "identity",
+    "identity_meta",
+    "persona_text",
+    "memories",
+    "greeting_messages",
+    "validate",
+    "voice_text",
+    "job",
+    "capture_checks",
+    "transport",
+}
+
+
+def _decode_private_evidence(raw: bytes, fixture: dict) -> dict:
+    try:
+        evidence = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ExistingSessionDistillError(
+            "finalize", "private_evidence_invalid"
+        ) from None
+    ground_truth = (
+        fixture.get("ground_truth")
+        if isinstance(fixture.get("ground_truth"), dict)
+        else {}
+    )
+    expected_fact_ids = [
+        str(fact.get("id") or "")
+        for fact in (ground_truth.get("facts") or [])
+        if isinstance(fact, dict)
+    ]
+    fixture_sha256 = _sha256_hex(_canonical_json_bytes(fixture))
+    valid = (
+        isinstance(evidence, dict)
+        and set(evidence) == _PRIVATE_EVIDENCE_KEYS
+        and evidence.get("schema_version") == 1
+        and evidence.get("fixture_sha256") == fixture_sha256
+        and evidence.get("expected_fact_ids") == expected_fact_ids
+        and isinstance(evidence.get("identity"), dict)
+        and isinstance(evidence.get("identity_meta"), dict)
+        and isinstance(evidence.get("persona_text"), str)
+        and isinstance(evidence.get("memories"), list)
+        and isinstance(evidence.get("greeting_messages"), list)
+        and isinstance(evidence.get("validate"), dict)
+        and isinstance(evidence.get("voice_text"), str)
+        and isinstance(evidence.get("job"), dict)
+        and isinstance(evidence.get("capture_checks"), dict)
+        and set(evidence["capture_checks"])
+        == {
+            "identity_envelope_decrypted",
+            "persona_envelope_decrypted",
+            "memory_envelopes_decrypted",
+            "chat_envelopes_decrypted",
+        }
+        and all(type(value) is bool for value in evidence["capture_checks"].values())
+        and isinstance(evidence.get("transport"), dict)
+    )
+    if not valid:
+        raise ExistingSessionDistillError(
+            "finalize", "private_evidence_contract_invalid"
+        )
+    return evidence
+
+
+def finalize_existing_session_distill_acceptance(
+    *,
+    private_evidence_path: str,
+    semantic_judgment_path: str,
+    fixture: dict,
+    artifact_dir: str,
+) -> dict:
+    """Bind an agent judgment to captured plaintext, sanitize, then destroy it."""
+    _require_private_path_outside_artifacts(private_evidence_path, artifact_dir)
+    try:
+        raw_evidence = _read_owner_only_file(
+            private_evidence_path,
+            stage="finalize",
+            code_prefix="private_evidence",
+        )
+        evidence_sha256 = _sha256_hex(raw_evidence)
+        evidence = _decode_private_evidence(raw_evidence, fixture)
+
+        raw_judgment = _read_owner_only_file(
+            semantic_judgment_path,
+            stage="semantic",
+            code_prefix="semantic_judgment",
+        )
+        try:
+            judgment = json.loads(raw_judgment.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ExistingSessionDistillError(
+                "semantic", "semantic_judgment_invalid"
+            ) from None
+        if not isinstance(judgment, dict):
+            raise ExistingSessionDistillError("semantic", "semantic_judgment_invalid")
+        if judgment.get("evidence_sha256") != evidence_sha256:
+            raise ExistingSessionDistillError(
+                "semantic", "semantic_judgment_evidence_hash_mismatch"
+            )
+        semantic = _semantic_judgment_summary(
+            judgment,
+            evidence["expected_fact_ids"],
+            evidence_sha256,
+        )
+        if not semantic["provided"]:
+            raise ExistingSessionDistillError(
+                "semantic", "semantic_judgment_contract_invalid"
+            )
+
+        report = evaluate_distill_acceptance(
+            fixture,
+            identity=evidence["identity"],
+            identity_meta=evidence["identity_meta"],
+            memories=evidence["memories"],
+            validate=evidence["validate"],
+            persona_text=evidence["persona_text"],
+            voice_text=evidence["voice_text"],
+            greeting_messages=evidence["greeting_messages"],
+            job=evidence["job"],
+            semantic_judgment=judgment,
+            evidence_sha256=evidence_sha256,
+        )
+        report["checks"].update(evidence["capture_checks"])
+        report["ok"] = all(report["checks"].values())
+        report["transport"] = evidence["transport"]
+        report["evidence"] = {
+            "sha256": evidence_sha256,
+            "semantic_judgment_bound": True,
+            "private_evidence_deleted": True,
+        }
+        return report
+    finally:
+        _delete_private_evidence(private_evidence_path)
+
+
+def _load_manifest_session(
+    manifest_path: str, profile_id: str
+) -> tuple[str, str, bytes]:
+    path = Path(manifest_path)
+    try:
+        before = path.lstat()
+    except OSError:
+        raise ExistingSessionDistillError("session", "manifest_unreadable") from None
+    if not stat.S_ISREG(before.st_mode):
+        raise ExistingSessionDistillError("session", "manifest_not_regular")
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        raise ExistingSessionDistillError("session", "manifest_unreadable") from None
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            before.st_dev,
+            before.st_ino,
+        ):
+            raise ExistingSessionDistillError("session", "manifest_not_regular")
+        if opened.st_uid != os.geteuid():
+            raise ExistingSessionDistillError("session", "manifest_owner_mismatch")
+        if stat.S_IMODE(opened.st_mode) != 0o600:
+            raise ExistingSessionDistillError("session", "manifest_permissions_invalid")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            raw_manifest = handle.read()
+    except ExistingSessionDistillError:
+        raise
+    except OSError:
+        raise ExistingSessionDistillError("session", "manifest_unreadable") from None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    try:
+        manifest = json.loads(raw_manifest)
+    except json.JSONDecodeError:
+        raise ExistingSessionDistillError("session", "manifest_unreadable") from None
+    profiles = manifest.get("profiles") if isinstance(manifest, dict) else None
+    if not isinstance(profiles, list):
+        raise ExistingSessionDistillError("session", "manifest_invalid")
+    matches = [
+        entry
+        for entry in profiles
+        if isinstance(entry, dict) and str(entry.get("profile_id") or "") == profile_id
+    ]
+    if len(matches) != 1:
+        raise ExistingSessionDistillError("session", "profile_session_not_unique")
+    entry = matches[0]
+    try:
+        private_key = base64.b64decode(
+            str(entry.get("secret_key_b64") or ""), validate=True
+        )
+    except Exception:
+        raise ExistingSessionDistillError(
+            "session", "content_private_key_invalid"
+        ) from None
+    if len(private_key) != 32:
+        raise ExistingSessionDistillError("session", "content_private_key_invalid")
+    return str(entry.get("api_key") or ""), str(entry.get("user_id") or ""), private_key
+
+
+def cmd_distill_existing_session(args):
+    """Capture phase: run the import once and write owner-only review evidence."""
+    try:
+        api_key, user_id, private_key = _load_manifest_session(
+            args.session_manifest, args.profile_id
+        )
+        receipt = capture_existing_session_distill_evidence(
+            api_url=args.api_url,
+            api_key=api_key,
+            user_id=user_id,
+            content_private_key=private_key,
+            fixture=_load_fixture(args.fixture),
+            private_evidence_path=args.private_evidence,
+            artifact_dir=args.artifact_dir,
+            timeout=args.timeout,
+            poll=args.poll,
+            intro_timeout=args.intro_timeout,
+            memory_limit=args.memory_limit,
+            client_job_id=args.client_job_id,
+        )
+    except ExistingSessionDistillError as exc:
+        print(json.dumps(exc.as_result(), ensure_ascii=False, sort_keys=True))
+        return 1
+    print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+def cmd_distill_existing_session_finalize(args):
+    """Finalize phase: validate the hash-bound judgment and destroy plaintext."""
+    try:
+        report = finalize_existing_session_distill_acceptance(
+            private_evidence_path=args.private_evidence,
+            semantic_judgment_path=args.semantic_judgment,
+            fixture=_load_fixture(args.fixture),
+            artifact_dir=args.artifact_dir,
+        )
+    except ExistingSessionDistillError as exc:
+        print(json.dumps(exc.as_result(), ensure_ascii=False, sort_keys=True))
+        return 1
+    rendered = render_distill_acceptance_report(report)
+    try:
+        if args.report:
+            _write_private_report(
+                args.report,
+                args.artifact_dir,
+                rendered
+                + "\n```json\n"
+                + json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True)
+                + "\n```\n",
+            )
+    except ExistingSessionDistillError as exc:
+        print(json.dumps(exc.as_result(), ensure_ascii=False, sort_keys=True))
+        return 1
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True))
+    return 0 if report.get("ok") else 1
+
+
 def cmd_distill_acceptance(args):
     import os
+
     base = args.api_url.rstrip("/")
     fixture = _load_fixture(args.fixture)
-    materials = fixture.get("materials") if isinstance(fixture.get("materials"), dict) else {}
-    relationship = fixture.get("relationship") if isinstance(fixture.get("relationship"), dict) else {}
+    materials = (
+        fixture.get("materials") if isinstance(fixture.get("materials"), dict) else {}
+    )
+    relationship = (
+        fixture.get("relationship")
+        if isinstance(fixture.get("relationship"), dict)
+        else {}
+    )
     args.api_key, args.user_id, _enclave_pk, _user_pk = _provision_user(args)
     sk_raw = args._user_sk
-    print(json.dumps({"provisioned": True, "user_id": args.user_id}, ensure_ascii=False))
+    print(
+        json.dumps({"provisioned": True, "user_id": args.user_id}, ensure_ascii=False)
+    )
 
     payload = {
         "format": str(materials.get("format") or "auto"),
@@ -536,7 +1870,9 @@ def cmd_distill_acceptance(args):
         "client_job_id": "distill_accept_" + os.urandom(8).hex(),
     }
     if relationship.get("relationship_started_at"):
-        payload["relationship_started_at"] = str(relationship["relationship_started_at"])
+        payload["relationship_started_at"] = str(
+            relationship["relationship_started_at"]
+        )
     for src_key, payload_key in (
         ("ai_persona", "ai_persona_content"),
         ("personal_profile", "personal_profile_content"),
@@ -546,10 +1882,17 @@ def cmd_distill_acceptance(args):
         if value:
             payload[payload_key] = str(value)
 
-    s, b = _http("POST", f"{base}/v1/genesis/imports/plaintext", args.api_key, json_body=payload)
+    s, b = _http(
+        "POST", f"{base}/v1/genesis/imports/plaintext", args.api_key, json_body=payload
+    )
     job_id = (b.get("job") or {}).get("job_id") or b.get("job_id")
     if s >= 400 or not job_id:
-        print(json.dumps({"ok": False, "step": "upload", "status": s, "body": b}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {"ok": False, "step": "upload", "status": s, "body": b},
+                ensure_ascii=False,
+            )
+        )
         return 1
     print(json.dumps({"upload": "ok", "job_id": job_id}, ensure_ascii=False))
 
@@ -558,7 +1901,9 @@ def cmd_distill_acceptance(args):
     job: dict = {}
     while time.time() < deadline:
         try:
-            _s, job_body = _http("GET", f"{base}/v1/genesis/imports/{job_id}", args.api_key)
+            _s, job_body = _http(
+                "GET", f"{base}/v1/genesis/imports/{job_id}", args.api_key
+            )
         except SystemExit:
             time.sleep(args.poll)
             continue
@@ -567,7 +1912,12 @@ def cmd_distill_acceptance(args):
             break
         time.sleep(args.poll)
     if str(job.get("status") or "").lower() != "done":
-        print(json.dumps({"ok": False, "step": "distill", "job_id": job_id, "job": job}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {"ok": False, "step": "distill", "job_id": job_id, "job": job},
+                ensure_ascii=False,
+            )
+        )
         return 1
 
     identity_plain: dict = {}
@@ -577,9 +1927,13 @@ def cmd_distill_acceptance(args):
     while time.time() < intro_deadline:
         _s, identity_body = _http("GET", f"{base}/v1/identity/get", args.api_key)
         identity_payload = identity_body.get("identity") or {}
-        identity_meta = dict(identity_payload) if isinstance(identity_payload, dict) else {}
+        identity_meta = (
+            dict(identity_payload) if isinstance(identity_payload, dict) else {}
+        )
         if isinstance(identity_payload, dict) and identity_payload.get("body_ct"):
-            identity_plain = json.loads(_decrypt_envelope_user(identity_payload, sk_raw))
+            identity_plain = json.loads(
+                _decrypt_envelope_user(identity_payload, sk_raw)
+            )
         elif isinstance(identity_payload, dict):
             identity_plain = identity_payload
         _s, chat = _http("GET", f"{base}/v1/chat/history?limit=20", args.api_key)
@@ -593,7 +1947,9 @@ def cmd_distill_acceptance(args):
             break
         time.sleep(args.poll)
 
-    _s, memory_body = _http("GET", f"{base}/v1/memory/list?limit={args.memory_limit}", args.api_key)
+    _s, memory_body = _http(
+        "GET", f"{base}/v1/memory/list?limit={args.memory_limit}", args.api_key
+    )
     memories = _decrypt_memory_rows(memory_body.get("moments") or [], sk_raw)
     _s, validate = _http("GET", f"{base}/v1/onboarding/validate", args.api_key)
 
@@ -618,7 +1974,13 @@ def cmd_distill_acceptance(args):
     rendered = render_distill_acceptance_report(report)
     if args.report:
         Path(args.report).parent.mkdir(parents=True, exist_ok=True)
-        Path(args.report).write_text(rendered + "\n```json\n" + json.dumps(report, ensure_ascii=False, indent=2) + "\n```\n", encoding="utf-8")
+        Path(args.report).write_text(
+            rendered
+            + "\n```json\n"
+            + json.dumps(report, ensure_ascii=False, indent=2)
+            + "\n```\n",
+            encoding="utf-8",
+        )
     print(rendered)
     print(json.dumps(report, ensure_ascii=False))
     if not getattr(args, "no_cleanup", False):
@@ -637,10 +1999,13 @@ def cmd_acceptance(args):
     description), days_with_user > 0, the user_profile needle NEVER leaks into
     identity/persona (firewall), memories written."""
     import os
+
     base = args.api_url.rstrip("/")
     args.api_key, args.user_id, _enclave_pk, _user_pk = _provision_user(args)
     sk_raw = args._user_sk
-    print(json.dumps({"provisioned": True, "user_id": args.user_id}, ensure_ascii=False))
+    print(
+        json.dumps({"provisioned": True, "user_id": args.user_id}, ensure_ascii=False)
+    )
 
     payload = {
         "format": "auto",
@@ -650,15 +2015,29 @@ def cmd_acceptance(args):
         "client_job_id": "accept_" + os.urandom(8).hex(),
     }
     if args.ai_persona:
-        payload["ai_persona_content"] = Path(args.ai_persona).read_text(encoding="utf-8")
+        payload["ai_persona_content"] = Path(args.ai_persona).read_text(
+            encoding="utf-8"
+        )
     if args.personal_profile:
-        payload["personal_profile_content"] = Path(args.personal_profile).read_text(encoding="utf-8")
+        payload["personal_profile_content"] = Path(args.personal_profile).read_text(
+            encoding="utf-8"
+        )
     if args.memory_summary:
-        payload["memory_summary_content"] = Path(args.memory_summary).read_text(encoding="utf-8")
-    s, b = _http("POST", f"{base}/v1/genesis/imports/plaintext", args.api_key, json_body=payload)
+        payload["memory_summary_content"] = Path(args.memory_summary).read_text(
+            encoding="utf-8"
+        )
+    s, b = _http(
+        "POST", f"{base}/v1/genesis/imports/plaintext", args.api_key, json_body=payload
+    )
     job_id = (b.get("job") or {}).get("job_id") or b.get("job_id")
     if s >= 400 or not job_id:
-        print(json.dumps({"ok": False, "step": "upload", "status": s, "body": b}, ensure_ascii=False)); return 1
+        print(
+            json.dumps(
+                {"ok": False, "step": "upload", "status": s, "body": b},
+                ensure_ascii=False,
+            )
+        )
+        return 1
     print(json.dumps({"upload": "ok", "job_id": job_id}, ensure_ascii=False))
 
     deadline = time.time() + args.timeout
@@ -667,21 +2046,38 @@ def cmd_acceptance(args):
         try:
             _s, jb = _http("GET", f"{base}/v1/genesis/imports/{job_id}", args.api_key)
         except SystemExit:
-            time.sleep(args.poll); continue  # flaky proxy — keep polling, don't abort the run
+            time.sleep(args.poll)
+            continue  # flaky proxy — keep polling, don't abort the run
         job = jb.get("job") or {}
         if str(job.get("status") or "").lower() in ("done", "failed"):
             break
         time.sleep(args.poll)
     if str(job.get("status")) != "done":
-        print(json.dumps({"ok": False, "step": "distill", "status": job.get("status"),
-                          "error": job.get("error")}, ensure_ascii=False)); return 1
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "step": "distill",
+                    "status": job.get("status"),
+                    "error": job.get("error"),
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 1
 
     _s, idy = _http("GET", f"{base}/v1/identity/get", args.api_key)
     ident = idy.get("identity") or {}
     try:
         identity_body = json.loads(_decrypt_envelope_user(ident, sk_raw))
     except Exception as e:  # noqa: BLE001
-        print(json.dumps({"ok": False, "step": "identity_decrypt", "error": str(e)}, ensure_ascii=False)); return 1
+        print(
+            json.dumps(
+                {"ok": False, "step": "identity_decrypt", "error": str(e)},
+                ensure_ascii=False,
+            )
+        )
+        return 1
     persona_text = ""
     persona_env = (jb.get("persona") or {}).get("content_envelope") or {}
     try:
@@ -691,16 +2087,26 @@ def cmd_acceptance(args):
         persona_text = f"<persona decrypt failed: {e}>"
 
     agent_name = str(identity_body.get("agent_name") or "")
-    dims = identity_body.get("dimensions") if isinstance(identity_body.get("dimensions"), list) else []
+    dims = (
+        identity_body.get("dimensions")
+        if isinstance(identity_body.get("dimensions"), list)
+        else []
+    )
     days = ident.get("days_with_user")
     category = str(identity_body.get("category") or "")
     needle = args.firewall_needle
     identity_blob = json.dumps(identity_body, ensure_ascii=False)
     checks = {
         "agent_name_present": bool(agent_name.strip()),
-        "agent_name_expected": (args.expect_name in agent_name) if args.expect_name else None,
+        "agent_name_expected": (
+            (args.expect_name in agent_name) if args.expect_name else None
+        ),
         "dimensions_present": len(dims) >= 1,
-        "dimensions_have_descriptions": bool(dims) and all(isinstance(d, dict) and str(d.get("description") or "").strip() for d in dims),
+        "dimensions_have_descriptions": bool(dims)
+        and all(
+            isinstance(d, dict) and str(d.get("description") or "").strip()
+            for d in dims
+        ),
         # Home 「性格」 tile = identity.category. With dims present it must be non-empty
         # (A: LLM-distilled; B: deterministic top-2-dim fallback). Empty renders as "—".
         "category_present_when_dims": (bool(category.strip()) if dims else None),
@@ -718,16 +2124,21 @@ def cmd_acceptance(args):
         while time.time() < intro_deadline:
             try:
                 _s, idy2 = _http("GET", f"{base}/v1/identity/get", args.api_key)
-                ib2 = json.loads(_decrypt_envelope_user(idy2.get("identity") or {}, sk_raw))
+                ib2 = json.loads(
+                    _decrypt_envelope_user(idy2.get("identity") or {}, sk_raw)
+                )
                 intro_self = str(ib2.get("self_introduction") or "")
             except SystemExit:
-                time.sleep(args.poll); continue  # flaky proxy — keep polling
+                time.sleep(args.poll)
+                continue  # flaky proxy — keep polling
             except Exception:  # noqa: BLE001
                 pass
             try:
                 _s, ch = _http("GET", f"{base}/v1/chat/history?limit=12", args.api_key)
-                greeting = any(str(m.get("role") or "").lower() not in ("", "user")
-                               for m in (ch.get("messages") or []))
+                greeting = any(
+                    str(m.get("role") or "").lower() not in ("", "user")
+                    for m in (ch.get("messages") or [])
+                )
             except SystemExit:
                 pass  # flaky proxy — retry next iteration
             if intro_self.strip() and greeting:
@@ -739,8 +2150,15 @@ def cmd_acceptance(args):
     failed = [k for k, v in checks.items() if v is False]
     out = {
         "agent_name": agent_name,
-        "dimensions": [{"name": d.get("name"), "value": d.get("value"), "has_desc": bool(d.get("description"))}
-                       for d in dims if isinstance(d, dict)],
+        "dimensions": [
+            {
+                "name": d.get("name"),
+                "value": d.get("value"),
+                "has_desc": bool(d.get("description")),
+            }
+            for d in dims
+            if isinstance(d, dict)
+        ],
         "self_introduction": str(identity_body.get("self_introduction") or "")[:60],
         "category": category,
         "days_with_user": days,
@@ -763,22 +2181,48 @@ def cmd_acceptance(args):
 
 
 def main():
-    p = argparse.ArgumentParser(prog="genesis_e2e", description="Genesis e2e harness (test CVM).")
+    p = argparse.ArgumentParser(
+        prog="genesis_e2e", description="Genesis e2e harness (test CVM)."
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    up = sub.add_parser("upload", help="(optionally register a user, then) seal+upload chunks + finalize")
+    up = sub.add_parser(
+        "upload",
+        help="(optionally register a user, then) seal+upload chunks + finalize",
+    )
     up.add_argument("--api-url", required=True)
-    up.add_argument("--register", action="store_true",
-                    help="self-provision a throwaway user (register + model_api/setup + whoami); "
-                         "provider key from GENESIS_E2E_PROVIDER_API_KEY env")
-    up.add_argument("--provider", default="", help="with --register: model provider (e.g. anthropic/openai)")
+    up.add_argument(
+        "--register",
+        action="store_true",
+        help="self-provision a throwaway user (register + model_api/setup + whoami); "
+        "provider key from GENESIS_E2E_PROVIDER_API_KEY env",
+    )
+    up.add_argument(
+        "--provider",
+        default="",
+        help="with --register: model provider (e.g. anthropic/openai)",
+    )
     up.add_argument("--model", default="", help="with --register: model id")
-    up.add_argument("--base-url", default="", help="with --register: optional provider base_url")
-    up.add_argument("--api-key", default="", help="existing user api_key (omit with --register)")
-    up.add_argument("--user-id", default="", help="owner_user_id (omit with --register)")
-    up.add_argument("--transcript", required=True, help="path to a plaintext test transcript")
-    up.add_argument("--enclave-pk-hex", default="", help="enclave content pubkey hex (non-register; else fetch attestation)")
-    up.add_argument("--attestation-url", default="", help="defaults to <api-url>/attestation")
+    up.add_argument(
+        "--base-url", default="", help="with --register: optional provider base_url"
+    )
+    up.add_argument(
+        "--api-key", default="", help="existing user api_key (omit with --register)"
+    )
+    up.add_argument(
+        "--user-id", default="", help="owner_user_id (omit with --register)"
+    )
+    up.add_argument(
+        "--transcript", required=True, help="path to a plaintext test transcript"
+    )
+    up.add_argument(
+        "--enclave-pk-hex",
+        default="",
+        help="enclave content pubkey hex (non-register; else fetch attestation)",
+    )
+    up.add_argument(
+        "--attestation-url", default="", help="defaults to <api-url>/attestation"
+    )
     up.add_argument("--source-kind", default="history")
     up.add_argument("--chunk-size", type=int, default=12000)
     up.set_defaults(func=cmd_upload)
@@ -789,30 +2233,46 @@ def main():
     vf.add_argument("--job-id", required=True)
     vf.add_argument("--timeout", type=float, default=600)
     vf.add_argument("--poll", type=float, default=10)
-    vf.add_argument("--privacy-needle", default="",
-                    help="comma-separated distinctive transcript fragments that MUST NOT "
-                         "appear in the status payload (real leak check, e.g. '蛋子,西湖')")
+    vf.add_argument(
+        "--privacy-needle",
+        default="",
+        help="comma-separated distinctive transcript fragments that MUST NOT "
+        "appear in the status payload (real leak check, e.g. '蛋子,西湖')",
+    )
     vf.set_defaults(func=cmd_verify)
 
-    upp = sub.add_parser("upload-plaintext",
-                         help="one-shot plaintext genesis ingest (POST /v1/genesis/imports/plaintext); then `verify`")
+    upp = sub.add_parser(
+        "upload-plaintext",
+        help="one-shot plaintext genesis ingest (POST /v1/genesis/imports/plaintext); then `verify`",
+    )
     upp.add_argument("--api-url", required=True)
-    upp.add_argument("--register", action="store_true",
-                     help="self-provision a throwaway user (register + model_api/setup + whoami)")
+    upp.add_argument(
+        "--register",
+        action="store_true",
+        help="self-provision a throwaway user (register + model_api/setup + whoami)",
+    )
     upp.add_argument("--provider", default="")
     upp.add_argument("--model", default="")
     upp.add_argument("--base-url", default="")
     upp.add_argument("--api-key", default="")
     upp.add_argument("--user-id", default="")
     upp.add_argument("--transcript", required=True, help="plaintext history file")
-    upp.add_argument("--ai-persona", default="", help="optional ai_persona/character file")
-    upp.add_argument("--personal-profile", default="", help="optional personal_profile file")
-    upp.add_argument("--memory-summary", default="", help="optional memory_summary/support file")
+    upp.add_argument(
+        "--ai-persona", default="", help="optional ai_persona/character file"
+    )
+    upp.add_argument(
+        "--personal-profile", default="", help="optional personal_profile file"
+    )
+    upp.add_argument(
+        "--memory-summary", default="", help="optional memory_summary/support file"
+    )
     upp.add_argument("--client-job-id", default="")
     upp.set_defaults(func=cmd_upload_plaintext)
 
-    ac = sub.add_parser("acceptance",
-                        help="per-source identity acceptance: 4 materials -> done -> decrypt identity -> assert")
+    ac = sub.add_parser(
+        "acceptance",
+        help="per-source identity acceptance: 4 materials -> done -> decrypt identity -> assert",
+    )
     ac.add_argument("--api-url", required=True)
     ac.add_argument("--register", action="store_true", default=True)
     ac.add_argument("--provider", default="anthropic")
@@ -822,39 +2282,127 @@ def main():
     ac.add_argument("--ai-persona", default="", help="角色卡 (ideally with a name)")
     ac.add_argument("--personal-profile", default="", help="个人档案")
     ac.add_argument("--memory-summary", default="", help="长期记忆")
-    ac.add_argument("--relationship-started-at", default="", help="YYYY-MM-DD (tests days_with_user)")
-    ac.add_argument("--expect-name", default="", help="assert agent_name contains this (e.g. 小满)")
-    ac.add_argument("--firewall-needle", default="",
-                    help="user_profile string that must NOT leak into identity/persona (e.g. 赵铁柱)")
+    ac.add_argument(
+        "--relationship-started-at",
+        default="",
+        help="YYYY-MM-DD (tests days_with_user)",
+    )
+    ac.add_argument(
+        "--expect-name", default="", help="assert agent_name contains this (e.g. 小满)"
+    )
+    ac.add_argument(
+        "--firewall-needle",
+        default="",
+        help="user_profile string that must NOT leak into identity/persona (e.g. 赵铁柱)",
+    )
     ac.add_argument("--timeout", type=float, default=900)
     ac.add_argument("--poll", type=float, default=10)
-    ac.add_argument("--check-introduction", action="store_true",
-                    help="§六 7.D: after genesis done, wait for the spawned agent to write "
-                         "self_introduction + post a first greeting (needs agent-runner host-all)")
-    ac.add_argument("--intro-timeout", type=float, default=180,
-                    help="seconds to wait for the 7.D introduction (default 180)")
-    ac.add_argument("--no-cleanup", action="store_true",
-                    help="keep the throwaway's model_api (default: DELETE it after the run "
-                         "so it stops polluting host-all autodiscover)")
+    ac.add_argument(
+        "--check-introduction",
+        action="store_true",
+        help="§六 7.D: after genesis done, wait for the spawned agent to write "
+        "self_introduction + post a first greeting (needs agent-runner host-all)",
+    )
+    ac.add_argument(
+        "--intro-timeout",
+        type=float,
+        default=180,
+        help="seconds to wait for the 7.D introduction (default 180)",
+    )
+    ac.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        help="keep the throwaway's model_api (default: DELETE it after the run "
+        "so it stops polluting host-all autodiscover)",
+    )
     ac.set_defaults(func=cmd_acceptance)
 
-    da = sub.add_parser("distill-acceptance",
-                        help="live plaintext genesis distillation acceptance with ground-truth fact scoring")
+    da = sub.add_parser(
+        "distill-acceptance",
+        help="live plaintext genesis distillation acceptance with ground-truth fact scoring",
+    )
     da.add_argument("--api-url", required=True)
     da.add_argument("--provider", default="anthropic")
     da.add_argument("--model", default="claude-haiku-4-5-20251001")
     da.add_argument("--base-url", default="")
-    da.add_argument("--fixture", required=True,
-                    help="JSON fixture with materials, persona expectations, relationship, and ground_truth facts")
+    da.add_argument(
+        "--fixture",
+        required=True,
+        help="JSON fixture with materials, persona expectations, relationship, and ground_truth facts",
+    )
     da.add_argument("--timeout", type=float, default=900)
     da.add_argument("--poll", type=float, default=10)
-    da.add_argument("--intro-timeout", type=float, default=180,
-                    help="seconds to wait after job done for self_introduction + greeting")
+    da.add_argument(
+        "--intro-timeout",
+        type=float,
+        default=180,
+        help="seconds to wait after job done for self_introduction + greeting",
+    )
     da.add_argument("--memory-limit", type=int, default=100)
     da.add_argument("--report", default="", help="optional markdown report path")
-    da.add_argument("--no-cleanup", action="store_true",
-                    help="keep the throwaway's model_api after the run")
+    da.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        help="keep the throwaway's model_api after the run",
+    )
     da.set_defaults(func=cmd_distill_acceptance)
+
+    existing = sub.add_parser(
+        "distill-existing-session",
+        help="run distillation acceptance on one already-provisioned manifest profile",
+    )
+    existing.add_argument("--api-url", required=True)
+    existing.add_argument(
+        "--session-manifest",
+        required=True,
+        help="0600 qualification manifest; credentials are never printed",
+    )
+    existing.add_argument("--profile-id", required=True)
+    existing.add_argument(
+        "--fixture",
+        required=True,
+        help="JSON fixture with four materials and locked acceptance expectations",
+    )
+    existing.add_argument(
+        "--private-evidence",
+        required=True,
+        help=(
+            "absolute owner-only capture path outside QA_ARTIFACT_DIR; Codex reads it once"
+        ),
+    )
+    existing.add_argument(
+        "--artifact-dir",
+        required=True,
+        help="public QA_ARTIFACT_DIR, used to forbid plaintext capture beneath it",
+    )
+    existing.add_argument("--timeout", type=float, default=900)
+    existing.add_argument("--poll", type=float, default=10)
+    existing.add_argument("--intro-timeout", type=float, default=180)
+    existing.add_argument("--memory-limit", type=int, default=100)
+    existing.add_argument("--client-job-id", default="")
+    existing.set_defaults(func=cmd_distill_existing_session)
+
+    finalize = sub.add_parser(
+        "distill-existing-session-finalize",
+        help="bind Codex judgment to captured evidence, sanitize, and delete plaintext",
+    )
+    finalize.add_argument("--fixture", required=True)
+    finalize.add_argument("--private-evidence", required=True)
+    finalize.add_argument("--artifact-dir", required=True)
+    finalize.add_argument(
+        "--semantic-judgment",
+        required=True,
+        help="owner-only bounded JSON whose evidence_sha256 matches the capture",
+    )
+    finalize.add_argument(
+        "--report",
+        default="",
+        help=(
+            "optional owner-only sanitized markdown path outside QA_ARTIFACT_DIR; "
+            "use private QA_WORK_ROOT or TMPDIR"
+        ),
+    )
+    finalize.set_defaults(func=cmd_distill_existing_session_finalize)
 
     args = p.parse_args()
     sys.exit(args.func(args))

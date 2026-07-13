@@ -1,4 +1,4 @@
-"""Headless mirror of the iOS/enclave content crypto (no Secure Enclave needed).
+"""Headless mirror of the iOS/backend content crypto (no enclave needed).
 
 AUTHORITATIVE SOURCE: ``backend/content_encryption.py`` (which is itself kept in
 lockstep with ContentEncryption.swift and the enclave's ``_box_seal_open_hkdf``).
@@ -12,6 +12,7 @@ box_seal:
   → ChaCha20-Poly1305, no AAD.  wire = ek_pub(32) || ct || tag(16).
 body: ChaCha20-Poly1305 IETF (12-byte nonce), AAD = f"{owner}|{v}|{id}".
 """
+
 import base64
 import hashlib
 
@@ -59,21 +60,38 @@ def _wrap_nonce(ek_pub: bytes, recipient_pk_raw: bytes) -> bytes:
 
 
 def box_seal(pt: bytes, recipient_pk_raw: bytes) -> bytes:
+    if len(recipient_pk_raw) != 32:
+        raise ValueError(
+            f"recipient pubkey must be 32 bytes, got {len(recipient_pk_raw)}"
+        )
     recipient_pk = X25519PublicKey.from_public_bytes(recipient_pk_raw)
     ek = X25519PrivateKey.generate()
     ek_pub = ek.public_key().public_bytes(_RAW, _RAWPUB)
     key = _wrap_key(ek.exchange(recipient_pk))
-    ct = ChaCha20Poly1305(key).encrypt(_wrap_nonce(ek_pub, recipient_pk_raw), pt, None)
+    nonce = _wrap_nonce(ek_pub, recipient_pk_raw)
+    ct = ChaCha20Poly1305(key).encrypt(nonce, pt, None)
     return ek_pub + ct
 
 
 def box_open(blob: bytes, sk_raw: bytes, recipient_pk_raw: bytes) -> bytes:
+    if len(blob) < 48:
+        raise ValueError(f"box_seal blob too short: {len(blob)}")
+    if len(sk_raw) != 32:
+        raise ValueError(f"recipient private key must be 32 bytes, got {len(sk_raw)}")
+    if len(recipient_pk_raw) != 32:
+        raise ValueError(
+            f"recipient pubkey must be 32 bytes, got {len(recipient_pk_raw)}"
+        )
     sk = X25519PrivateKey.from_private_bytes(sk_raw)
+    actual_pk_raw = sk.public_key().public_bytes(_RAW, _RAWPUB)
+    if actual_pk_raw != recipient_pk_raw:
+        raise ValueError("recipient public key does not match private key")
     ek_pub = blob[:32]
     ct = blob[32:]
     shared = sk.exchange(X25519PublicKey.from_public_bytes(ek_pub))
     key = _wrap_key(shared)
-    return ChaCha20Poly1305(key).decrypt(_wrap_nonce(ek_pub, recipient_pk_raw), ct, None)
+    nonce = _wrap_nonce(ek_pub, recipient_pk_raw)
+    return ChaCha20Poly1305(key).decrypt(nonce, ct, None)
 
 
 def decrypt_reply(env: dict, sk_raw: bytes, pk_raw: bytes) -> str:

@@ -16,7 +16,11 @@ permissions:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    concurrency: pg-deploy-${{ github.event.inputs.environment }}   # 与 app 部署不同组
+    concurrency:
+      # Only the test database shares the qualification lock. Production keeps
+      # its original environment-specific deployment group.
+      group: ${{ github.event.inputs.environment == 'test' && 'feedling-test-environment' || format('pg-deploy-{0}', github.event.inputs.environment) }}
+      cancel-in-progress: false
     steps:
       - name: Typo guard
         env:

@@ -1,0 +1,409 @@
+{
+  "version": 1,
+  "suite_id": "feedling-api-key-runtime-v2-p0",
+  "scope": "api_key_only",
+  "target": {
+    "environment": "test",
+    "base_url_env": "QA_FEEDLING_BASE_URL",
+    "expected_deployment_sha_env": "QA_EXPECTED_DEPLOYMENT_SHA",
+    "expected_runtime": "db_action_v2",
+    "runtime_admin_token_env": "QA_TEST_ADMIN_TOKEN"
+  },
+  "execution": {
+    "required_profile_count": 6,
+    "supervisor_count": 1,
+    "profile_worker_assignment_count": 6,
+    "allow_profile_skip": false,
+    "max_profile_concurrency": 3,
+    "max_attempts_per_scenario": 2,
+    "profile_timeout_seconds": 2400,
+    "chat_reply_timeout_seconds": 120,
+    "distillation_timeout_seconds": 900
+  },
+  "profiles": [
+    {
+      "id": "official-deepseek",
+      "route_family": "official",
+      "model_family": "deepseek",
+      "provider": "deepseek",
+      "provider_key_env": "QA_DEEPSEEK_API_KEY",
+      "model_env": "QA_DEEPSEEK_MODEL",
+      "allowed_model_regex": "^deepseek-[a-z0-9][a-z0-9._-]*$",
+      "reasoning_effort": "medium",
+      "reasoning_expected": true
+    },
+    {
+      "id": "official-anthropic",
+      "route_family": "official",
+      "model_family": "claude",
+      "provider": "anthropic",
+      "provider_key_env": "QA_ANTHROPIC_API_KEY",
+      "model_env": "QA_ANTHROPIC_MODEL",
+      "allowed_model_regex": "^claude-[a-z0-9][a-z0-9._-]*$",
+      "reasoning_effort": "medium",
+      "reasoning_expected": true
+    },
+    {
+      "id": "official-openai",
+      "route_family": "official",
+      "model_family": "openai",
+      "provider": "openai",
+      "provider_key_env": "QA_OPENAI_PROVIDER_API_KEY",
+      "model_env": "QA_OPENAI_MODEL",
+      "allowed_model_regex": "^(?:gpt-[a-z0-9][a-z0-9._-]*|o[1-9][a-z0-9._-]*)$",
+      "reasoning_effort": "medium",
+      "reasoning_expected": true
+    },
+    {
+      "id": "openrouter-claude",
+      "route_family": "openrouter",
+      "model_family": "claude",
+      "provider": "openrouter",
+      "provider_key_env": "QA_OPENROUTER_API_KEY",
+      "model_env": "QA_OPENROUTER_CLAUDE_MODEL",
+      "allowed_model_regex": "^anthropic/claude-[a-z0-9][a-z0-9._:-]*$",
+      "reasoning_effort": "medium",
+      "reasoning_expected": true
+    },
+    {
+      "id": "openrouter-openai",
+      "route_family": "openrouter",
+      "model_family": "openai",
+      "provider": "openrouter",
+      "provider_key_env": "QA_OPENROUTER_API_KEY",
+      "model_env": "QA_OPENROUTER_OPENAI_MODEL",
+      "allowed_model_regex": "^openai/(?:gpt-[a-z0-9][a-z0-9._:-]*|o[a-z0-9._:-]*)$",
+      "reasoning_effort": "medium",
+      "reasoning_expected": true
+    },
+    {
+      "id": "openrouter-glm",
+      "route_family": "openrouter",
+      "model_family": "glm",
+      "provider": "openrouter",
+      "provider_key_env": "QA_OPENROUTER_API_KEY",
+      "model_env": "QA_OPENROUTER_GLM_MODEL",
+      "allowed_model_regex": "^(?:z-ai|thudm)/glm-[a-z0-9][a-z0-9._:-]*$",
+      "reasoning_effort": "medium",
+      "reasoning_expected": true
+    }
+  ],
+  "required_scenarios": [
+    "P0-01",
+    "P0-02",
+    "P0-03",
+    "P0-04",
+    "P0-05",
+    "P0-06",
+    "P0-07",
+    "P0-08",
+    "P0-09",
+    "P0-10",
+    "P0-11",
+    "P0-12",
+    "P0-13"
+  ],
+  "scenario_contracts": {
+    "P0-01": {
+      "required_assertions": [
+        "target_is_test",
+        "deployment_identity_confirmed",
+        "provisioning_receipts_confirmed",
+        "agent_environment_sanitized",
+        "contract_inputs_readable",
+        "credentials_omitted"
+      ],
+      "required_evidence_codes": [
+        "TARGET_TEST_CONFIRMED",
+        "DEPLOYMENT_IDENTITY_CONFIRMED",
+        "BACKEND_SHA_MATCHED",
+        "WORKER_SHA_MATCHED",
+        "PROVISIONING_RECEIPTS_CONFIRMED",
+        "AGENT_ENVIRONMENT_SANITIZED",
+        "CONTRACT_INPUTS_READABLE",
+        "CREDENTIAL_OMITTED"
+      ],
+      "minimum_id_counts": {
+        "request_ids": 0,
+        "turn_ids": 0,
+        "trace_ids": 0
+      },
+      "required_turn_count": 0
+    },
+    "P0-02": {
+      "required_assertions": [
+        "synthetic_account_is_fresh",
+        "whoami_matches",
+        "trace_cleared"
+      ],
+      "required_evidence_codes": [
+        "SYNTHETIC_ACCOUNT_FRESH",
+        "WHOAMI_MATCHED",
+        "TRACE_CLEARED"
+      ],
+      "minimum_id_counts": {
+        "request_ids": 1,
+        "turn_ids": 0,
+        "trace_ids": 0
+      },
+      "required_turn_count": 0
+    },
+    "P0-03": {
+      "required_assertions": [
+        "invalid_key_rejected",
+        "invalid_key_not_echoed",
+        "hosted_chat_not_started"
+      ],
+      "required_evidence_codes": [
+        "INVALID_KEY_REJECTED",
+        "INVALID_KEY_NOT_ECHOED",
+        "HOSTED_CHAT_NOT_STARTED"
+      ],
+      "minimum_id_counts": {
+        "request_ids": 1,
+        "turn_ids": 0,
+        "trace_ids": 0
+      },
+      "required_turn_count": 0
+    },
+    "P0-04": {
+      "required_assertions": [
+        "valid_key_accepted",
+        "provider_config_matches",
+        "credential_omitted"
+      ],
+      "required_evidence_codes": [
+        "VALID_KEY_ACCEPTED",
+        "PROVIDER_CONFIG_MATCHED",
+        "CREDENTIAL_OMITTED"
+      ],
+      "minimum_id_counts": {
+        "request_ids": 1,
+        "turn_ids": 0,
+        "trace_ids": 0
+      },
+      "required_turn_count": 0
+    },
+    "P0-05": {
+      "required_assertions": [
+        "runtime_v2_readback_matches",
+        "deployment_identity_confirmed",
+        "worker_ready",
+        "backend_sha_matches",
+        "worker_sha_matches"
+      ],
+      "required_evidence_codes": [
+        "RUNTIME_V2_READBACK_MATCHED",
+        "DEPLOYMENT_IDENTITY_CONFIRMED",
+        "WORKER_READY",
+        "BACKEND_SHA_MATCHED",
+        "WORKER_SHA_MATCHED"
+      ],
+      "minimum_id_counts": {
+        "request_ids": 1,
+        "turn_ids": 0,
+        "trace_ids": 0
+      },
+      "required_turn_count": 0
+    },
+    "P0-06": {
+      "required_assertions": [
+        "persona_import_done",
+        "persona_acceptance_passed",
+        "privacy_canary_absent"
+      ],
+      "required_evidence_codes": [
+        "PERSONA_IMPORT_DONE",
+        "PERSONA_ACCEPTANCE_PASSED",
+        "PRIVACY_CANARY_ABSENT"
+      ],
+      "minimum_id_counts": {
+        "request_ids": 1,
+        "turn_ids": 0,
+        "trace_ids": 0
+      },
+      "required_turn_count": 0
+    },
+    "P0-07": {
+      "required_assertions": [
+        "driver_enabled",
+        "chat_loop_verified",
+        "runtime_v2_readback_matches",
+        "no_orphan_turn"
+      ],
+      "required_evidence_codes": [
+        "DRIVER_ENABLED",
+        "CHAT_LOOP_VERIFIED",
+        "RUNTIME_V2_READBACK_MATCHED",
+        "NO_ORPHAN_TURN"
+      ],
+      "minimum_id_counts": {
+        "request_ids": 1,
+        "turn_ids": 0,
+        "trace_ids": 0
+      },
+      "required_turn_count": 0
+    },
+    "P0-08": {
+      "required_assertions": [
+        "async_ack_received",
+        "exact_reply_correlated",
+        "nonce_echo_confirmed",
+        "fallback_absent",
+        "latency_recorded"
+      ],
+      "required_evidence_codes": [
+        "ASYNC_ACK_RECEIVED",
+        "EXACT_REPLY_CORRELATED",
+        "NONCE_ECHO_CONFIRMED",
+        "LATENCY_ATTRIBUTED"
+      ],
+      "minimum_id_counts": {
+        "request_ids": 1,
+        "turn_ids": 1,
+        "trace_ids": 1
+      },
+      "required_turn_count": 1
+    },
+    "P0-09": {
+      "required_assertions": [
+        "ten_turns_ordered",
+        "exact_replies_correlated",
+        "memory_recall_confirmed",
+        "no_orphan_turn"
+      ],
+      "required_evidence_codes": [
+        "TEN_TURNS_ORDERED",
+        "EXACT_REPLY_CORRELATED",
+        "MEMORY_RECALL_CONFIRMED",
+        "NO_ORPHAN_TURN"
+      ],
+      "minimum_id_counts": {
+        "request_ids": 10,
+        "turn_ids": 10,
+        "trace_ids": 10
+      },
+      "required_turn_count": 10
+    },
+    "P0-10": {
+      "required_assertions": [
+        "imported_memory_recalled",
+        "persona_consistency_confirmed",
+        "contradictory_facts_absent"
+      ],
+      "required_evidence_codes": [
+        "MEMORY_RECALL_CONFIRMED",
+        "PERSONA_CONSISTENCY_CONFIRMED",
+        "EXACT_REPLY_CORRELATED"
+      ],
+      "minimum_id_counts": {
+        "request_ids": 2,
+        "turn_ids": 2,
+        "trace_ids": 2
+      },
+      "required_turn_count": 2
+    },
+    "P0-11": {
+      "required_assertions": [
+        "agent_identity_confirmed",
+        "model_route_confirmed",
+        "provider_config_matches",
+        "trace_route_correlated"
+      ],
+      "required_evidence_codes": [
+        "AGENT_IDENTITY_CONFIRMED",
+        "MODEL_ROUTE_CONFIRMED",
+        "PROVIDER_CONFIG_MATCHED",
+        "TRACE_CORRELATION_CONFIRMED"
+      ],
+      "minimum_id_counts": {
+        "request_ids": 1,
+        "turn_ids": 1,
+        "trace_ids": 1
+      },
+      "required_turn_count": 1
+    },
+    "P0-12": {
+      "required_assertions": [
+        "objective_answer_correct",
+        "reasoning_capability_enabled",
+        "reasoning_requested_effort_medium",
+        "reasoning_configured_effort_medium",
+        "reasoning_effective_effort_medium",
+        "reasoning_event_observed",
+        "reasoning_metadata_present",
+        "reasoning_tokens_present",
+        "user_disclosure_present",
+        "raw_private_reasoning_omitted"
+      ],
+      "required_evidence_codes": [
+        "REASONING_CAPABILITY_CONFIRMED",
+        "REASONING_EFFORT_CONFIRMED",
+        "REASONING_EVENT_CONFIRMED",
+        "REASONING_METADATA_CONFIRMED",
+        "REASONING_TOKENS_CONFIRMED",
+        "DISCLOSURE_PRESENT",
+        "EXACT_REPLY_CORRELATED"
+      ],
+      "minimum_id_counts": {
+        "request_ids": 1,
+        "turn_ids": 1,
+        "trace_ids": 1
+      },
+      "required_turn_count": 1
+    },
+    "P0-13": {
+      "required_assertions": [
+        "trace_stages_complete",
+        "trace_correlation_confirmed",
+        "latency_attributed",
+        "cleanup_confirmed"
+      ],
+      "required_evidence_codes": [
+        "TRACE_CORRELATION_CONFIRMED",
+        "LATENCY_ATTRIBUTED",
+        "CLEANUP_CONFIRMED"
+      ],
+      "minimum_id_counts": {
+        "request_ids": 1,
+        "turn_ids": 15,
+        "trace_ids": 15
+      },
+      "required_turn_count": 0
+    }
+  },
+  "trace_latency_contract": {
+    "required_stages": [
+      "routing",
+      "queue",
+      "provider",
+      "persistence",
+      "delivery"
+    ],
+    "pass_requires_numeric_stage_latency": true,
+    "pass_requires_per_turn_stage_latency": true,
+    "pass_requires_all_turns_correlated": true,
+    "profile_summary_percentile_method": "nearest_rank"
+  },
+  "reasoning_contract": {
+    "capability_enabled_required_when_expected": true,
+    "requested_effort_required_when_expected": "medium",
+    "configured_effort_required_when_expected": "medium",
+    "effective_effort_required_when_expected": "medium",
+    "positive_reasoning_event_count_required_when_expected": true,
+    "provider_metadata_required_when_expected": true,
+    "provider_token_metadata_required_when_expected": true,
+    "user_visible_disclosure_required_when_expected": true,
+    "raw_private_chain_of_thought_forbidden": true
+  },
+  "artifact_contract": {
+    "schema": "qa/schemas/run-result.schema.json",
+    "required": [
+      "run-result.json",
+      "matrix.md",
+      "latency.csv",
+      "junit.xml",
+      "profiles"
+    ]
+  }
+}

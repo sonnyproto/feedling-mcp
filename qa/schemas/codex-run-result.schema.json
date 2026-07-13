@@ -1,0 +1,1447 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "suite_id",
+    "run_id",
+    "started_at",
+    "finished_at",
+    "target",
+    "overall_status",
+    "profiles_expected",
+    "profiles_completed",
+    "orchestration",
+    "profiles",
+    "summary",
+    "artifacts",
+    "redaction"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "enum": [
+        "1.0"
+      ]
+    },
+    "suite_id": {
+      "type": "string",
+      "enum": [
+        "feedling-api-key-runtime-v2-p0"
+      ]
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "finished_at": {
+      "type": "string"
+    },
+    "target": {
+      "$ref": "#/$defs/target"
+    },
+    "overall_status": {
+      "$ref": "#/$defs/status"
+    },
+    "profiles_expected": {
+      "type": "integer",
+      "enum": [
+        6
+      ]
+    },
+    "profiles_completed": {
+      "type": "integer"
+    },
+    "orchestration": {
+      "$ref": "#/$defs/orchestration"
+    },
+    "profiles": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/profileResult"
+      }
+    },
+    "summary": {
+      "$ref": "#/$defs/summary"
+    },
+    "artifacts": {
+      "$ref": "#/$defs/artifacts"
+    },
+    "redaction": {
+      "$ref": "#/$defs/redaction"
+    }
+  },
+  "$defs": {
+    "status": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "PRODUCT_FAIL",
+        "BLOCKED_CREDENTIAL",
+        "BLOCKED_EVIDENCE",
+        "BLOCKED_DEPLOYMENT",
+        "AGENT_ERROR",
+        "SECURITY_FAIL"
+      ]
+    },
+    "safeLabel": {
+      "type": "string"
+    },
+    "nullableSafeLabel": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/safeLabel"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullableSha": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "nullableNonnegativeNumber": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "stageLatency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "routing",
+        "queue",
+        "provider",
+        "persistence",
+        "delivery"
+      ],
+      "properties": {
+        "routing": {
+          "$ref": "#/$defs/nullableNonnegativeNumber"
+        },
+        "queue": {
+          "$ref": "#/$defs/nullableNonnegativeNumber"
+        },
+        "provider": {
+          "$ref": "#/$defs/nullableNonnegativeNumber"
+        },
+        "persistence": {
+          "$ref": "#/$defs/nullableNonnegativeNumber"
+        },
+        "delivery": {
+          "$ref": "#/$defs/nullableNonnegativeNumber"
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "environment",
+        "base_url",
+        "expected_deployment_sha",
+        "observed_backend_sha",
+        "observed_worker_sha",
+        "expected_runtime"
+      ],
+      "properties": {
+        "environment": {
+          "type": "string",
+          "enum": [
+            "test"
+          ]
+        },
+        "base_url": {
+          "type": "string",
+          "enum": [
+            "https://test-api.feedling.app"
+          ]
+        },
+        "expected_deployment_sha": {
+          "type": "string"
+        },
+        "observed_backend_sha": {
+          "$ref": "#/$defs/nullableSha"
+        },
+        "observed_worker_sha": {
+          "$ref": "#/$defs/nullableSha"
+        },
+        "expected_runtime": {
+          "type": "string",
+          "enum": [
+            "db_action_v2"
+          ]
+        }
+      }
+    },
+    "orchestration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "supervisor_count",
+        "max_configured_profile_concurrency",
+        "max_observed_profile_concurrency",
+        "profile_worker_assignments"
+      ],
+      "properties": {
+        "supervisor_count": {
+          "type": "integer",
+          "enum": [
+            1
+          ]
+        },
+        "max_configured_profile_concurrency": {
+          "type": "integer",
+          "enum": [
+            3
+          ]
+        },
+        "max_observed_profile_concurrency": {
+          "type": "integer"
+        },
+        "profile_worker_assignments": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/profileWorkerAssignment"
+          }
+        }
+      }
+    },
+    "profileWorkerAssignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_id",
+        "worker_id"
+      ],
+      "properties": {
+        "profile_id": {
+          "type": "string",
+          "enum": [
+            "official-deepseek",
+            "official-anthropic",
+            "official-openai",
+            "openrouter-claude",
+            "openrouter-openai",
+            "openrouter-glm"
+          ]
+        },
+        "worker_id": {
+          "$ref": "#/$defs/safeLabel"
+        }
+      }
+    },
+    "profileResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_id",
+        "route_family",
+        "model_family",
+        "provider",
+        "model",
+        "reasoning_effort",
+        "user_id",
+        "expected_runtime",
+        "observed_runtime",
+        "status",
+        "scenarios",
+        "turns",
+        "latency",
+        "reasoning",
+        "trace",
+        "cleanup",
+        "diagnostic_codes",
+        "redaction"
+      ],
+      "properties": {
+        "profile_id": {
+          "type": "string",
+          "enum": [
+            "official-deepseek",
+            "official-anthropic",
+            "official-openai",
+            "openrouter-claude",
+            "openrouter-openai",
+            "openrouter-glm"
+          ]
+        },
+        "route_family": {
+          "type": "string",
+          "enum": [
+            "official",
+            "openrouter"
+          ]
+        },
+        "model_family": {
+          "type": "string",
+          "enum": [
+            "deepseek",
+            "claude",
+            "openai",
+            "glm"
+          ]
+        },
+        "provider": {
+          "type": "string",
+          "enum": [
+            "deepseek",
+            "anthropic",
+            "openai",
+            "openrouter"
+          ]
+        },
+        "model": {
+          "$ref": "#/$defs/safeLabel"
+        },
+        "reasoning_effort": {
+          "type": "string",
+          "enum": [
+            "medium"
+          ]
+        },
+        "user_id": {
+          "$ref": "#/$defs/nullableSafeLabel"
+        },
+        "expected_runtime": {
+          "type": "string",
+          "enum": [
+            "db_action_v2"
+          ]
+        },
+        "observed_runtime": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "db_action_v2",
+            "resident_cli",
+            null
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "scenarios": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/scenarioResult"
+          }
+        },
+        "turns": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/turnResult"
+          }
+        },
+        "latency": {
+          "$ref": "#/$defs/latencySummary"
+        },
+        "reasoning": {
+          "$ref": "#/$defs/reasoningEvidence"
+        },
+        "trace": {
+          "$ref": "#/$defs/traceEvidence"
+        },
+        "cleanup": {
+          "$ref": "#/$defs/cleanup"
+        },
+        "diagnostic_codes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/diagnosticCode"
+          }
+        },
+        "redaction": {
+          "$ref": "#/$defs/redaction"
+        }
+      }
+    },
+    "scenarioResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario_id",
+        "status",
+        "started_at",
+        "finished_at",
+        "attempts",
+        "attempt_results",
+        "assertions",
+        "evidence_codes",
+        "request_ids",
+        "turn_ids",
+        "trace_ids",
+        "persona_finalizer",
+        "failure"
+      ],
+      "properties": {
+        "scenario_id": {
+          "type": "string",
+          "enum": [
+            "P0-01",
+            "P0-02",
+            "P0-03",
+            "P0-04",
+            "P0-05",
+            "P0-06",
+            "P0-07",
+            "P0-08",
+            "P0-09",
+            "P0-10",
+            "P0-11",
+            "P0-12",
+            "P0-13"
+          ]
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "started_at": {
+          "type": "string"
+        },
+        "finished_at": {
+          "type": "string"
+        },
+        "attempts": {
+          "type": "integer"
+        },
+        "attempt_results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/attemptResult"
+          }
+        },
+        "assertions": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "target_is_test",
+                "deployment_identity_confirmed",
+                "provisioning_receipts_confirmed",
+                "agent_environment_sanitized",
+                "contract_inputs_readable",
+                "credentials_omitted"
+              ],
+              "properties": {
+                "target_is_test": {
+                  "type": "boolean"
+                },
+                "deployment_identity_confirmed": {
+                  "type": "boolean"
+                },
+                "provisioning_receipts_confirmed": {
+                  "type": "boolean"
+                },
+                "agent_environment_sanitized": {
+                  "type": "boolean"
+                },
+                "contract_inputs_readable": {
+                  "type": "boolean"
+                },
+                "credentials_omitted": {
+                  "type": "boolean"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "synthetic_account_is_fresh",
+                "whoami_matches",
+                "trace_cleared"
+              ],
+              "properties": {
+                "synthetic_account_is_fresh": {
+                  "type": "boolean"
+                },
+                "whoami_matches": {
+                  "type": "boolean"
+                },
+                "trace_cleared": {
+                  "type": "boolean"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "invalid_key_rejected",
+                "invalid_key_not_echoed",
+                "hosted_chat_not_started"
+              ],
+              "properties": {
+                "invalid_key_rejected": {
+                  "type": "boolean"
+                },
+                "invalid_key_not_echoed": {
+                  "type": "boolean"
+                },
+                "hosted_chat_not_started": {
+                  "type": "boolean"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "valid_key_accepted",
+                "provider_config_matches",
+                "credential_omitted"
+              ],
+              "properties": {
+                "valid_key_accepted": {
+                  "type": "boolean"
+                },
+                "provider_config_matches": {
+                  "type": "boolean"
+                },
+                "credential_omitted": {
+                  "type": "boolean"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "runtime_v2_readback_matches",
+                "deployment_identity_confirmed",
+                "worker_ready",
+                "backend_sha_matches",
+                "worker_sha_matches"
+              ],
+              "properties": {
+                "runtime_v2_readback_matches": {
+                  "type": "boolean"
+                },
+                "deployment_identity_confirmed": {
+                  "type": "boolean"
+                },
+                "worker_ready": {
+                  "type": "boolean"
+                },
+                "backend_sha_matches": {
+                  "type": "boolean"
+                },
+                "worker_sha_matches": {
+                  "type": "boolean"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "persona_import_done",
+                "persona_acceptance_passed",
+                "privacy_canary_absent"
+              ],
+              "properties": {
+                "persona_import_done": {
+                  "type": "boolean"
+                },
+                "persona_acceptance_passed": {
+                  "type": "boolean"
+                },
+                "privacy_canary_absent": {
+                  "type": "boolean"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "driver_enabled",
+                "chat_loop_verified",
+                "runtime_v2_readback_matches",
+                "no_orphan_turn"
+              ],
+              "properties": {
+                "driver_enabled": {
+                  "type": "boolean"
+                },
+                "chat_loop_verified": {
+                  "type": "boolean"
+                },
+                "runtime_v2_readback_matches": {
+                  "type": "boolean"
+                },
+                "no_orphan_turn": {
+                  "type": "boolean"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "async_ack_received",
+                "exact_reply_correlated",
+                "nonce_echo_confirmed",
+                "fallback_absent",
+                "latency_recorded"
+              ],
+              "properties": {
+                "async_ack_received": {
+                  "type": "boolean"
+                },
+                "exact_reply_correlated": {
+                  "type": "boolean"
+                },
+                "nonce_echo_confirmed": {
+                  "type": "boolean"
+                },
+                "fallback_absent": {
+                  "type": "boolean"
+                },
+                "latency_recorded": {
+                  "type": "boolean"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "ten_turns_ordered",
+                "exact_replies_correlated",
+                "memory_recall_confirmed",
+                "no_orphan_turn"
+              ],
+              "properties": {
+                "ten_turns_ordered": {
+                  "type": "boolean"
+                },
+                "exact_replies_correlated": {
+                  "type": "boolean"
+                },
+                "memory_recall_confirmed": {
+                  "type": "boolean"
+                },
+                "no_orphan_turn": {
+                  "type": "boolean"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "imported_memory_recalled",
+                "persona_consistency_confirmed",
+                "contradictory_facts_absent"
+              ],
+              "properties": {
+                "imported_memory_recalled": {
+                  "type": "boolean"
+                },
+                "persona_consistency_confirmed": {
+                  "type": "boolean"
+                },
+                "contradictory_facts_absent": {
+                  "type": "boolean"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "agent_identity_confirmed",
+                "model_route_confirmed",
+                "provider_config_matches",
+                "trace_route_correlated"
+              ],
+              "properties": {
+                "agent_identity_confirmed": {
+                  "type": "boolean"
+                },
+                "model_route_confirmed": {
+                  "type": "boolean"
+                },
+                "provider_config_matches": {
+                  "type": "boolean"
+                },
+                "trace_route_correlated": {
+                  "type": "boolean"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "objective_answer_correct",
+                "reasoning_capability_enabled",
+                "reasoning_requested_effort_medium",
+                "reasoning_configured_effort_medium",
+                "reasoning_effective_effort_medium",
+                "reasoning_event_observed",
+                "reasoning_metadata_present",
+                "reasoning_tokens_present",
+                "user_disclosure_present",
+                "raw_private_reasoning_omitted"
+              ],
+              "properties": {
+                "objective_answer_correct": {
+                  "type": "boolean"
+                },
+                "reasoning_capability_enabled": {
+                  "type": "boolean"
+                },
+                "reasoning_requested_effort_medium": {
+                  "type": "boolean"
+                },
+                "reasoning_configured_effort_medium": {
+                  "type": "boolean"
+                },
+                "reasoning_effective_effort_medium": {
+                  "type": "boolean"
+                },
+                "reasoning_event_observed": {
+                  "type": "boolean"
+                },
+                "reasoning_metadata_present": {
+                  "type": "boolean"
+                },
+                "reasoning_tokens_present": {
+                  "type": "boolean"
+                },
+                "user_disclosure_present": {
+                  "type": "boolean"
+                },
+                "raw_private_reasoning_omitted": {
+                  "type": "boolean"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "trace_stages_complete",
+                "trace_correlation_confirmed",
+                "latency_attributed",
+                "cleanup_confirmed"
+              ],
+              "properties": {
+                "trace_stages_complete": {
+                  "type": "boolean"
+                },
+                "trace_correlation_confirmed": {
+                  "type": "boolean"
+                },
+                "latency_attributed": {
+                  "type": "boolean"
+                },
+                "cleanup_confirmed": {
+                  "type": "boolean"
+                }
+              }
+            }
+          ]
+        },
+        "evidence_codes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/evidenceCode"
+          }
+        },
+        "request_ids": {
+          "$ref": "#/$defs/idList"
+        },
+        "turn_ids": {
+          "$ref": "#/$defs/idList"
+        },
+        "trace_ids": {
+          "$ref": "#/$defs/idList"
+        },
+        "persona_finalizer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/personaFinalizerEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "failure": {
+          "$ref": "#/$defs/failure"
+        }
+      }
+    },
+    "attemptResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempt",
+        "status",
+        "failure"
+      ],
+      "properties": {
+        "attempt": {
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "failure": {
+          "$ref": "#/$defs/failure"
+        }
+      }
+    },
+    "turnResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario_id",
+        "turn_index",
+        "request_id",
+        "turn_id",
+        "trace_id",
+        "ack_latency_ms",
+        "reply_latency_ms",
+        "stage_latency_ms",
+        "reply_count",
+        "content_assertion_passed",
+        "fallback_detected",
+        "duplicate_detected",
+        "out_of_order_detected"
+      ],
+      "properties": {
+        "scenario_id": {
+          "type": "string"
+        },
+        "turn_index": {
+          "type": "integer"
+        },
+        "request_id": {
+          "$ref": "#/$defs/safeLabel"
+        },
+        "turn_id": {
+          "$ref": "#/$defs/nullableSafeLabel"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/nullableSafeLabel"
+        },
+        "ack_latency_ms": {
+          "$ref": "#/$defs/nullableNonnegativeNumber"
+        },
+        "reply_latency_ms": {
+          "$ref": "#/$defs/nullableNonnegativeNumber"
+        },
+        "stage_latency_ms": {
+          "$ref": "#/$defs/stageLatency"
+        },
+        "reply_count": {
+          "type": "integer"
+        },
+        "content_assertion_passed": {
+          "type": "boolean"
+        },
+        "fallback_detected": {
+          "type": "boolean"
+        },
+        "duplicate_detected": {
+          "type": "boolean"
+        },
+        "out_of_order_detected": {
+          "type": "boolean"
+        }
+      }
+    },
+    "latencySummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sample_count",
+        "ack_p50_ms",
+        "reply_p50_ms",
+        "reply_p95_ms",
+        "stage_p50_ms",
+        "missing_stages"
+      ],
+      "properties": {
+        "sample_count": {
+          "type": "integer"
+        },
+        "ack_p50_ms": {
+          "$ref": "#/$defs/nullableNonnegativeNumber"
+        },
+        "reply_p50_ms": {
+          "$ref": "#/$defs/nullableNonnegativeNumber"
+        },
+        "reply_p95_ms": {
+          "$ref": "#/$defs/nullableNonnegativeNumber"
+        },
+        "stage_p50_ms": {
+          "$ref": "#/$defs/stageLatency"
+        },
+        "missing_stages": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "routing",
+              "queue",
+              "provider",
+              "persistence",
+              "delivery"
+            ]
+          }
+        }
+      }
+    },
+    "reasoningEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "expected",
+        "capability_enabled",
+        "requested_effort",
+        "configured_effort",
+        "effective_effort",
+        "reasoning_event_count",
+        "metadata_present",
+        "token_metadata_present",
+        "user_visible_disclosure_present",
+        "request_id",
+        "turn_id",
+        "trace_id",
+        "kind",
+        "source",
+        "model",
+        "reasoning_token_count",
+        "disclosure_length",
+        "raw_private_reasoning_stored"
+      ],
+      "properties": {
+        "expected": {
+          "type": "boolean"
+        },
+        "capability_enabled": {
+          "type": "boolean"
+        },
+        "requested_effort": {
+          "type": "string",
+          "enum": [
+            "off",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "unsupported",
+            "unknown"
+          ]
+        },
+        "configured_effort": {
+          "type": "string",
+          "enum": [
+            "off",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "unsupported",
+            "unknown"
+          ]
+        },
+        "effective_effort": {
+          "type": "string",
+          "enum": [
+            "off",
+            "minimal",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "unsupported",
+            "unknown"
+          ]
+        },
+        "reasoning_event_count": {
+          "type": "integer"
+        },
+        "metadata_present": {
+          "type": "boolean"
+        },
+        "token_metadata_present": {
+          "type": "boolean"
+        },
+        "user_visible_disclosure_present": {
+          "type": "boolean"
+        },
+        "request_id": {
+          "$ref": "#/$defs/safeLabel"
+        },
+        "turn_id": {
+          "$ref": "#/$defs/safeLabel"
+        },
+        "trace_id": {
+          "$ref": "#/$defs/safeLabel"
+        },
+        "kind": {
+          "$ref": "#/$defs/nullableSafeLabel"
+        },
+        "source": {
+          "$ref": "#/$defs/nullableSafeLabel"
+        },
+        "model": {
+          "$ref": "#/$defs/nullableSafeLabel"
+        },
+        "reasoning_token_count": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "disclosure_length": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "raw_private_reasoning_stored": {
+          "type": "boolean"
+        }
+      }
+    },
+    "personaFinalizerEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fixture_id",
+        "evidence_sha256",
+        "request_id",
+        "job_id",
+        "semantic_judgment_bound",
+        "finalizer_ok",
+        "private_evidence_deleted",
+        "privacy_violation_count"
+      ],
+      "properties": {
+        "fixture_id": {
+          "type": "string",
+          "enum": [
+            "persona-import-v1"
+          ]
+        },
+        "evidence_sha256": {
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "#/$defs/safeLabel"
+        },
+        "job_id": {
+          "$ref": "#/$defs/safeLabel"
+        },
+        "semantic_judgment_bound": {
+          "type": "boolean",
+          "enum": [
+            true
+          ]
+        },
+        "finalizer_ok": {
+          "type": "boolean",
+          "enum": [
+            true
+          ]
+        },
+        "private_evidence_deleted": {
+          "type": "boolean",
+          "enum": [
+            true
+          ]
+        },
+        "privacy_violation_count": {
+          "type": "integer",
+          "enum": [
+            0
+          ]
+        }
+      }
+    },
+    "traceEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "deploy_enabled",
+        "correlated_event_count",
+        "observed_event_types",
+        "missing_required_event_types",
+        "raw_trace_stored"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "deploy_enabled": {
+          "type": "boolean"
+        },
+        "correlated_event_count": {
+          "type": "integer"
+        },
+        "observed_event_types": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "routing",
+              "queue",
+              "provider",
+              "persistence",
+              "delivery"
+            ]
+          }
+        },
+        "missing_required_event_types": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "routing",
+              "queue",
+              "provider",
+              "persistence",
+              "delivery"
+            ]
+          }
+        },
+        "raw_trace_stored": {
+          "type": "boolean",
+          "enum": [
+            false
+          ]
+        }
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempted",
+        "provider_config_deleted",
+        "account_reset",
+        "old_credential_rejected",
+        "status"
+      ],
+      "properties": {
+        "attempted": {
+          "type": "boolean"
+        },
+        "provider_config_deleted": {
+          "type": "boolean"
+        },
+        "account_reset": {
+          "type": "boolean"
+        },
+        "old_credential_rejected": {
+          "type": "boolean"
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        }
+      }
+    },
+    "failure": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "category",
+            "stage_code",
+            "failure_code",
+            "reproducible"
+          ],
+          "properties": {
+            "category": {
+              "$ref": "#/$defs/status"
+            },
+            "stage_code": {
+              "$ref": "#/$defs/failureStageCode"
+            },
+            "failure_code": {
+              "$ref": "#/$defs/failureCode"
+            },
+            "reproducible": {
+              "type": "boolean"
+            }
+          }
+        }
+      ]
+    },
+    "idList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/safeLabel"
+      }
+    },
+    "evidenceCode": {
+      "type": "string",
+      "enum": [
+        "AGENT_ENVIRONMENT_SANITIZED",
+        "AGENT_IDENTITY_CONFIRMED",
+        "ASSERTIONS_CONFIRMED",
+        "ASYNC_ACK_RECEIVED",
+        "BACKEND_SHA_MATCHED",
+        "CHAT_LOOP_VERIFIED",
+        "CLEANUP_CONFIRMED",
+        "CONTRACT_INPUTS_READABLE",
+        "CREDENTIAL_OMITTED",
+        "DEPLOYMENT_IDENTITY_CONFIRMED",
+        "DISCLOSURE_PRESENT",
+        "DRIVER_ENABLED",
+        "EXACT_REPLY_CORRELATED",
+        "HOSTED_CHAT_NOT_STARTED",
+        "INVALID_KEY_NOT_ECHOED",
+        "INVALID_KEY_REJECTED",
+        "LATENCY_ATTRIBUTED",
+        "MEMORY_RECALL_CONFIRMED",
+        "MODEL_ROUTE_CONFIRMED",
+        "NO_ORPHAN_TURN",
+        "NONCE_ECHO_CONFIRMED",
+        "PERSONA_ACCEPTANCE_PASSED",
+        "PERSONA_CONSISTENCY_CONFIRMED",
+        "PERSONA_IMPORT_DONE",
+        "PRIVACY_CANARY_ABSENT",
+        "PROVIDER_CONFIG_MATCHED",
+        "PROVISIONING_RECEIPTS_CONFIRMED",
+        "REASONING_CAPABILITY_CONFIRMED",
+        "REASONING_EFFORT_CONFIRMED",
+        "REASONING_EVENT_CONFIRMED",
+        "REASONING_METADATA_CONFIRMED",
+        "REASONING_TOKENS_CONFIRMED",
+        "RETRY_OBSERVATION_RECORDED",
+        "RUNTIME_V2_READBACK_MATCHED",
+        "SYNTHETIC_ACCOUNT_FRESH",
+        "TARGET_TEST_CONFIRMED",
+        "TEN_TURNS_ORDERED",
+        "TRACE_CLEARED",
+        "TRACE_CORRELATION_CONFIRMED",
+        "VALID_KEY_ACCEPTED",
+        "WHOAMI_MATCHED",
+        "WORKER_READY",
+        "WORKER_SHA_MATCHED"
+      ]
+    },
+    "diagnosticCode": {
+      "type": "string",
+      "enum": [
+        "AGENT_EXECUTION_ERROR",
+        "CLEANUP_FALLBACK_USED",
+        "CREDENTIAL_RECEIPT_MISSING",
+        "DEPLOYMENT_IDENTITY_UNAVAILABLE",
+        "PROMPT_INJECTION_SIGNAL",
+        "RETRY_USED",
+        "STAGE_TIMING_UNAVAILABLE",
+        "TRACE_PARTIAL",
+        "TRANSIENT_PROVIDER_ERROR",
+        "TRANSIENT_TRANSPORT_ERROR"
+      ]
+    },
+    "failureStageCode": {
+      "type": "string",
+      "enum": [
+        "ACTIVATION",
+        "BASIC_CHAT",
+        "CLEANUP",
+        "IDENTITY",
+        "INVALID_KEY_VALIDATION",
+        "MEMORY_PERSONA",
+        "ONBOARDING",
+        "PERSONA_IMPORT",
+        "PREFLIGHT",
+        "PROVISIONER",
+        "REASONING",
+        "RELIABILITY_CHAT",
+        "RUNTIME_SELECTION",
+        "SUPERVISOR",
+        "TRACE_LATENCY_CLEANUP",
+        "VALID_KEY_RECOVERY"
+      ]
+    },
+    "failureCode": {
+      "type": "string",
+      "enum": [
+        "AGENT_CRASHED",
+        "CHAT_LOOP_FAILED",
+        "CHAT_TIMEOUT",
+        "CLEANUP_FAILED",
+        "CONTENT_ASSERTION_FAILED",
+        "CREDENTIAL_SETUP_FAILED",
+        "DEPLOYMENT_IDENTITY_MISMATCH",
+        "DISCLOSURE_MISSING",
+        "DRIVER_ACTIVATION_FAILED",
+        "DUPLICATE_REPLY",
+        "FALLBACK_REPLY",
+        "IDENTITY_MISMATCH",
+        "INVALID_KEY_LEAKED",
+        "INVALID_KEY_NOT_REJECTED",
+        "LATENCY_EVIDENCE_MISSING",
+        "MALFORMED_EVIDENCE",
+        "MEMORY_RECALL_FAILED",
+        "MISSING_REPLY",
+        "MODEL_ROUTE_MISMATCH",
+        "ONBOARDING_FAILED",
+        "OUT_OF_ORDER_REPLY",
+        "PERSONA_ACCEPTANCE_FAILED",
+        "PERSONA_DRIFT",
+        "PERSONA_IMPORT_FAILED",
+        "PRECONDITION_MISSING",
+        "PROMPT_INJECTION_DETECTED",
+        "REASONING_EFFORT_CLAMPED",
+        "REASONING_METADATA_MISSING",
+        "REASONING_TOKENS_MISSING",
+        "REDACTION_ASSERTION_FAILED",
+        "RUNTIME_MISMATCH",
+        "TRACE_INCOMPLETE",
+        "TRACE_UNAVAILABLE",
+        "UNCLASSIFIED_PRODUCT_FAILURE",
+        "UNSAFE_TARGET",
+        "VALID_KEY_REJECTED",
+        "WORKER_UNREADY"
+      ]
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pass",
+        "product_fail",
+        "blocked_credential",
+        "blocked_evidence",
+        "blocked_deployment",
+        "agent_error",
+        "security_fail"
+      ],
+      "properties": {
+        "pass": {
+          "type": "integer"
+        },
+        "product_fail": {
+          "type": "integer"
+        },
+        "blocked_credential": {
+          "type": "integer"
+        },
+        "blocked_evidence": {
+          "type": "integer"
+        },
+        "blocked_deployment": {
+          "type": "integer"
+        },
+        "agent_error": {
+          "type": "integer"
+        },
+        "security_fail": {
+          "type": "integer"
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run_result",
+        "matrix_markdown",
+        "latency_csv",
+        "junit_xml",
+        "profiles_directory"
+      ],
+      "properties": {
+        "run_result": {
+          "type": "string",
+          "enum": [
+            "run-result.json"
+          ]
+        },
+        "matrix_markdown": {
+          "type": "string",
+          "enum": [
+            "matrix.md"
+          ]
+        },
+        "latency_csv": {
+          "type": "string",
+          "enum": [
+            "latency.csv"
+          ]
+        },
+        "junit_xml": {
+          "type": "string",
+          "enum": [
+            "junit.xml"
+          ]
+        },
+        "profiles_directory": {
+          "type": "string",
+          "enum": [
+            "profiles"
+          ]
+        }
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "provider_keys_omitted",
+        "feedling_api_keys_omitted",
+        "content_private_keys_omitted",
+        "raw_chat_omitted",
+        "raw_trace_omitted",
+        "raw_reasoning_omitted",
+        "synthetic_users_only",
+        "prompt_injection_detected"
+      ],
+      "properties": {
+        "provider_keys_omitted": {
+          "type": "boolean"
+        },
+        "feedling_api_keys_omitted": {
+          "type": "boolean"
+        },
+        "content_private_keys_omitted": {
+          "type": "boolean"
+        },
+        "raw_chat_omitted": {
+          "type": "boolean"
+        },
+        "raw_trace_omitted": {
+          "type": "boolean"
+        },
+        "raw_reasoning_omitted": {
+          "type": "boolean"
+        },
+        "synthetic_users_only": {
+          "type": "boolean"
+        },
+        "prompt_injection_detected": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

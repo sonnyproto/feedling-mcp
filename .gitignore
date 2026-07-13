@@ -38,5 +38,8 @@ ios/vendor/dcap-qvl/target/
 buildServer.json
 deploy/backups/
 
+# Agent-driven release qualification output (may contain synthetic account metadata).
+/qualification-artifacts/
+
 # Local dev virtualenv (created for running the test suite)
 .venv/
