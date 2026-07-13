@@ -74,3 +74,14 @@ def test_service_runtime_labels_are_card_policy_source():
     # 之前被误删的 12 个 label 不回归(google/bard/deepseek 等错误被判定为合法名字)
     for label in ("google", "bard", "deepseek", "agent", "io", "feedling"):
         assert label in card_policy.RUNTIME_LABELS
+
+
+def test_dimensions_structure_rejects_too_many_and_non_dict():
+    thirteen = [{"name": f"d{i}", "value": 50, "description": "x"} for i in range(13)]
+    assert card_policy.validate_dimensions_structure(thirteen) == (False, "too_many_dimensions")
+    assert card_policy.validate_dimensions_structure(["not-a-dict"]) == (False, "dimension_must_be_object")
+
+
+def test_runtime_labels_full_set_locked():
+    # locks the full 36-label set so a future accidental drop is caught
+    assert len(card_policy.RUNTIME_LABELS) == 36
