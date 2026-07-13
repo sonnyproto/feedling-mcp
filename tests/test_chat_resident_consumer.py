@@ -368,7 +368,7 @@ def test_post_reply_retries_whoami_refresh_before_encrypted_write(monkeypatch):
     monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRIES", 3)
     monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRY_DELAY_SEC", 0)
     monkeypatch.setattr(crc, "_build_envelope", lambda **kw: {"owner": kw["owner_user_id"]})
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     body = crc.post_reply("hello")
 
@@ -412,7 +412,7 @@ def test_post_reply_uses_cached_whoami_keys_when_refresh_fails(monkeypatch):
     monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRIES", 2)
     monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRY_DELAY_SEC", 0)
     monkeypatch.setattr(crc, "_build_envelope", _build)
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     body = crc.post_reply("hello from cache")
 
@@ -434,7 +434,7 @@ def test_post_reply_skips_when_whoami_refresh_fails_without_cache(monkeypatch):
     monkeypatch.setattr(crc, "_load_whoami", lambda: False)
     monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRIES", 2)
     monkeypatch.setattr(crc, "WHOAMI_REFRESH_RETRY_DELAY_SEC", 0)
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     body = crc.post_reply("lost")
 
@@ -617,7 +617,7 @@ def test_post_reply_suppress_push_omits_alert_and_push_fields(monkeypatch):
         {"user_id": "usr_abc", "user_pk": b"\x01" * 32, "enclave_pk": None},
     )
     monkeypatch.setattr(crc, "_build_envelope", lambda **kw: {"stub": "env"})
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     crc.post_reply(crc.VERIFY_PING_REPLY, suppress_push=True)
     body = captured["json"]
@@ -1727,7 +1727,7 @@ def test_openai_http_protocol_uses_session_headers(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_abc", "user_pk": None, "enclave_pk": None})
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "sess_old")
     monkeypatch.setattr(crc, "_save_agent_session_id", lambda sid: saved.append(sid))
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     assert crc.call_agent_http("hi") == "real reply"
     assert captured["json"]["messages"] == [{"role": "user", "content": "hi"}]
@@ -1786,7 +1786,7 @@ def test_memory_lane_raw_text_survives_chat_sanitizer(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_abc", "user_pk": None, "enclave_pk": None})
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_save_agent_session_id", lambda sid: None)
-    monkeypatch.setattr(crc.httpx, "post", lambda url, json=None, headers=None, timeout=None: _Resp())
+    monkeypatch.setattr(crc._HTTP, "post", lambda url, json=None, headers=None, timeout=None: _Resp())
 
     # raw_text path: the literal model output reaches the dream parser intact.
     raw = crc._capture_agent_reply_text(crc.call_agent("dream prompt", raw_text=True))
@@ -1821,7 +1821,7 @@ def test_openai_http_protocol_sends_multimodal_image_block(monkeypatch):
     monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://127.0.0.1:8642/v1/chat/completions")
     monkeypatch.setattr(crc, "AGENT_HTTP_PROTOCOL", "openai")
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     image = {"data_url": "data:image/jpeg;base64,abcd", "data": "abcd", "mime_type": "image/jpeg"}
 
@@ -2122,6 +2122,14 @@ def _dream_final_status(captured):
 
 
 def test_capture_get_json_disables_tls_verification_for_enclave_only(monkeypatch):
+    """TLS verification is off for the enclave (self-signed cert) and ON for
+    everything else. That used to be a per-request ``verify=`` kwarg; pooled
+    clients can only carry it at the client level, so the property is now
+    expressed as "which client gets picked" — assert BOTH halves of it, since a
+    routing bug here would silently stop verifying the backend's certificate.
+    """
+    import ssl
+
     calls = []
 
     class _Resp:
@@ -2131,21 +2139,30 @@ def test_capture_get_json_disables_tls_verification_for_enclave_only(monkeypatch
         def json(self):
             return {"ok": True}
 
-    def _get(url, **kwargs):
-        calls.append((url, kwargs))
-        return _Resp()
-
     monkeypatch.setattr(crc, "FEEDLING_ENCLAVE_URL", "https://enclave.local")
     monkeypatch.setattr(crc, "FEEDLING_API_URL", "https://backend.local")
-    monkeypatch.setattr(crc.httpx, "get", _get)
+
+    enclave_client = crc._client_for("https://enclave.local")
+    backend_client = crc._client_for("https://backend.local")
+
+    # The two clients differ in TLS posture — this is the property being guarded.
+    assert enclave_client is not backend_client
+    assert backend_client is crc._HTTP
+    assert enclave_client._transport._pool._ssl_context.verify_mode == ssl.CERT_NONE
+    assert backend_client._transport._pool._ssl_context.verify_mode == ssl.CERT_REQUIRED
+
+    # ...and each request is routed to the right one of them.
+    for client, tag in ((enclave_client, "enclave"), (backend_client, "backend")):
+        monkeypatch.setattr(
+            client, "get",
+            lambda url, _tag=tag, **kw: calls.append((_tag, url)) or _Resp(),
+        )
 
     assert crc._capture_get_json("/v1/identity/get", base_url="https://enclave.local") == {"ok": True}
-    assert calls[-1][0] == "https://enclave.local/v1/identity/get"
-    assert calls[-1][1]["verify"] is False
+    assert calls[-1] == ("enclave", "https://enclave.local/v1/identity/get")
 
     assert crc._capture_get_json("/v1/memory/buckets") == {"ok": True}
-    assert calls[-1][0] == "https://backend.local/v1/memory/buckets"
-    assert calls[-1][1]["verify"] is True
+    assert calls[-1] == ("backend", "https://backend.local/v1/memory/buckets")
 
 
 def test_capture_json_helpers_refresh_runtime_token_before_each_request(monkeypatch, tmp_path):
@@ -2172,8 +2189,8 @@ def test_capture_json_helpers_refresh_runtime_token_before_each_request(monkeypa
     monkeypatch.setattr(crc, "_runtime_token_exp", lambda token: time.time() + 60)
     monkeypatch.setitem(crc._HEADERS, "X-API-Key", "stale-api-key")
     crc._HEADERS.pop("X-Feedling-Runtime-Token", None)
-    monkeypatch.setattr(crc.httpx, "get", _get)
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "get", _get)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     assert crc._capture_get_json("/v1/memory/buckets") == {"ok": True}
     assert crc._capture_post_json("/v1/memory/legacy_batch", payload={"batch_size": 8}) == {"ok": True}
@@ -3134,7 +3151,7 @@ def test_proactive_perception_digest_uses_agent_perception_routes_not_v2_tool(mo
             },
         })
 
-    monkeypatch.setattr(crc.httpx, "get", _get)
+    monkeypatch.setattr(crc._HTTP, "get", _get)
 
     presence, change, domains = crc._proactive_perception_digest()
 
@@ -3300,7 +3317,7 @@ def test_post_screen_watch_tick_posts_kind_and_frames(monkeypatch):
         captured["body"] = json
         return _R({"enqueued": True, "job": {"job_id": "pj_sw"}})
 
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
     out = crc.post_screen_watch_tick("on", [{"id": "f1"}, {"id": "f2"}])
     assert out.get("enqueued") is True
     assert captured["url"].endswith("/v1/proactive/tick")
@@ -3409,7 +3426,7 @@ def test_load_whoami_clears_cached_timezone_when_omitted(monkeypatch):
         "public_key": base64.b64encode(b"\x11" * 32).decode(),
         "enclave_content_public_key_hex": "22" * 32,
     }
-    monkeypatch.setattr(crc.httpx, "get", lambda *a, **k: _FakeWhoamiResp(body))
+    monkeypatch.setattr(crc._HTTP, "get", lambda *a, **k: _FakeWhoamiResp(body))
     assert crc._load_whoami() is True
     assert crc._whoami_cache["timezone"] == ""
 
@@ -3423,7 +3440,7 @@ def test_load_whoami_keeps_cached_timezone_on_fetch_failure(monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("net down")
 
-    monkeypatch.setattr(crc.httpx, "get", _boom)
+    monkeypatch.setattr(crc._HTTP, "get", _boom)
     assert crc._load_whoami() is False
     assert crc._whoami_cache["timezone"] == "Asia/Shanghai"
 
@@ -3879,7 +3896,7 @@ def test_photo_added_wake_surfaces_pullable_photo_hint(monkeypatch):
                 ]
             }
 
-    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+    monkeypatch.setattr(crc._HTTP, "get", lambda *a, **kw: _Resp())
 
     job = {"schema_version": 2, "trigger": "photo_added", "wake_kind": "perception"}
     message = crc._message_for_proactive_job(
@@ -3900,7 +3917,7 @@ def test_non_photo_wake_has_no_photo_hint(monkeypatch):
     def _boom(*a, **kw):  # must not even be called for a non-photo wake
         raise AssertionError("photos endpoint should not be hit on a non-photo wake")
 
-    monkeypatch.setattr(crc.httpx, "get", _boom)
+    monkeypatch.setattr(crc._HTTP, "get", _boom)
 
     job = {"schema_version": 2, "trigger": "wake", "wake_kind": "perception"}
     message = crc._message_for_proactive_job(
@@ -3920,7 +3937,7 @@ def test_photo_hint_screenshot_framing(monkeypatch):
                 ]
             }
 
-    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+    monkeypatch.setattr(crc._HTTP, "get", lambda *a, **kw: _Resp())
     hint = crc._new_photo_hint({"trigger": "photo_added"})
     assert "a screenshot" in hint
     assert "ph_shot" in hint
@@ -4010,7 +4027,7 @@ def test_fire_scheduled_wakes_posts_backend_endpoint(monkeypatch):
         captured["timeout"] = timeout
         return _Resp()
 
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     body = crc.fire_scheduled_wakes()
 
@@ -4038,7 +4055,7 @@ def test_fire_capture_tick_posts_backend_endpoint(monkeypatch):
         captured["timeout"] = timeout
         return _Resp()
 
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     body = crc.fire_capture_tick()
 
@@ -4080,7 +4097,7 @@ def test_post_proactive_reply_triggers_alert_and_live_activity(monkeypatch):
         lambda **kwargs: {"v": 1, "id": "env_1", "visibility": kwargs["visibility"]},
     )
     monkeypatch.setattr(crc, "_load_whoami", lambda: True)
-    monkeypatch.setattr(crc.httpx, "post", _post)
+    monkeypatch.setattr(crc._HTTP, "post", _post)
 
     crc.post_reply(
         "我看到了这个时机。",
@@ -4185,7 +4202,7 @@ def test_call_agent_http_openai_preserves_reasoning_content(monkeypatch):
                 }],
             }
 
-    monkeypatch.setattr(crc.httpx, "post", lambda *a, **kw: _Resp())
+    monkeypatch.setattr(crc._HTTP, "post", lambda *a, **kw: _Resp())
 
     result = crc.call_agent_http("hi")
     turn = crc._split_agent_turn(result)
@@ -4589,7 +4606,7 @@ def test_openai_http_tool_only_response_preserved(monkeypatch):
     monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_abc"})
     monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
     monkeypatch.setattr(crc, "_save_agent_session_id", lambda sid: None)
-    monkeypatch.setattr(crc.httpx, "post", lambda *a, **kw: _Resp())
+    monkeypatch.setattr(crc._HTTP, "post", lambda *a, **kw: _Resp())
 
     result = crc.call_agent_http("hi")
     turn = crc._agent_turn_from_raw(result)
@@ -4713,7 +4730,7 @@ def test_load_whoami_caches_archive_language(monkeypatch):
             }
 
     monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "", "user_pk": None, "enclave_pk": None, "archive_language": ""})
-    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+    monkeypatch.setattr(crc._HTTP, "get", lambda *a, **kw: _Resp())
 
     assert crc._load_whoami() is True
     assert crc._whoami_cache["archive_language"] == "en"
@@ -4732,7 +4749,7 @@ def test_load_whoami_defaults_archive_language_to_empty_when_absent(monkeypatch)
             }
 
     monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "", "user_pk": None, "enclave_pk": None, "archive_language": "stale"})
-    monkeypatch.setattr(crc.httpx, "get", lambda *a, **kw: _Resp())
+    monkeypatch.setattr(crc._HTTP, "get", lambda *a, **kw: _Resp())
 
     assert crc._load_whoami() is True
     assert crc._whoami_cache["archive_language"] == ""

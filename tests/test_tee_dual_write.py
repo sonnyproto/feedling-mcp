@@ -132,6 +132,46 @@ def test_proactive_store_v2_log_patch_dual_writes(backend_env, monkeypatch):
     assert rows == [("drained",)]
 
 
+def test_consumer_state_blob_is_not_mirrored(backend_env, monkeypatch):
+    """``consumer_state`` MUST NOT dual-write to TEE.
+
+    It is the single hottest write in the system: EVERY /v1/chat/poll records a
+    consumer event (chat/consumer._record_consumer_event → _save_consumer_state →
+    set_blob), so N long-polling consumers drive N writes per poll cycle. The TEE
+    pool is max_size=4 over a direct-TLS gateway link, so mirroring it saturated
+    the pool and every主 write then blocked for the full pool timeout before the
+    mirror fail-open swallowed the error — observed live on test 2026-07-13:
+    18 "couldn't get a connection after 15.00 sec" in 13 min, with poll/write
+    endpoints stalling for seconds (perception/report 23.7s, track/event 13.4s).
+
+    It is also pure runner-side operational state (last poll ts / consumer id),
+    NOT user data, so the TEE shadow has no reason to carry it. Excluded from the
+    reconciler's user_blobs scope too, so verify stays balanced (same convention
+    as 'identity' — see reconciler._SCOPE_WHERE)."""
+    monkeypatch.setenv("FEEDLING_TEE_DUAL_WRITE", "1")
+    seed_user("usr_cs1")
+
+    from tee_shadow import mirror
+    mirrored: list[str] = []
+    monkeypatch.setattr(mirror, "execute", lambda sql, params=(): mirrored.append(sql))
+
+    db.set_blob("usr_cs1", "consumer_state", {"last_poll": 1.0})
+    assert mirrored == [], "consumer_state must never reach the TEE mirror"
+
+    # a normal blob kind still mirrors (no over-broad exclusion)
+    db.set_blob("usr_cs1", "model_api", {"provider": "openrouter"})
+    assert len(mirrored) == 1 and "user_blobs" in mirrored[0]
+
+
+def test_reconciler_scope_excludes_consumer_state(backend_env):
+    """The reconciler's user_blobs scope must exclude consumer_state, or it would
+    keep copying into TEE what the mirror deliberately no longer writes (and count
+    it on both sides), reintroducing the very load the exclusion removes."""
+    from tee_shadow import reconciler
+    scope = reconciler._SCOPE_WHERE["user_blobs"]
+    assert "identity" in scope and "consumer_state" in scope
+
+
 def test_log_patch_item_only_mirrors_on_primary_hit(backend_env, monkeypatch):
     # Fix 2 (P2): guarded patches must only mirror when the primary's
     # only_if_status guard actually matched a row. A rejected/no-op attempt

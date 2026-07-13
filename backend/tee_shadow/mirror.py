@@ -21,14 +21,22 @@ def enabled() -> bool:
 
 
 def _pool_timeout() -> float:
-    # 拿连接的等待上限。direct-TLS 走 Phala 网关,新连接的 TLS 握手在并发下可能
-    # >5s;旧的硬编码 5s 会在 TEE 完全健康时也 PoolTimeout。默认放宽到 15s 且可配。
-    # 注意权衡:TEE 真宕机时双写会最多阻塞这么久才 fail-open(mirror 吞掉),故靠
-    # 下面 min_size 保持连接热、让热路径几乎不触发新建连接来抵消这个尾延迟。
+    # 拿连接的等待上限。影子写是 best-effort(失败被吞、reconciler 后续补齐),所以
+    # 它绝不能把用户请求扣在这里——这个上限就是每次主写在 TEE 不可用时白等的时间。
+    #
+    # 曾放宽到 15s(16320c2),理由是网关 direct-TLS 冷握手可能 >5s,并假设 min_size=2
+    # 的热连接让这条尾延迟"很少真正命中"。2026-07-13 test 实测推翻了该假设:13 分钟
+    # 内 18 次 "couldn't get a connection after 15.00 sec"——瓶颈不是冷握手而是池容量
+    # (max_size=4),因为当时每次 /v1/chat/poll 都驱动一次 consumer_state 影子写。
+    # 那个热源已被摘除(db.set_blob 不再镜像 consumer_state),这里再把上限收回 2s 作为
+    # 第二道闸:即使池再被打满,主请求最多让路 2s 而不是 15s。
+    #
+    # 代价(有意接受):冷握手 >2s 时该次影子写会失败而不是阻塞请求——对一个 reconciler
+    # 本就会收敛的影子库,这是正确的取舍。
     try:
-        return max(1.0, float(os.environ.get("FEEDLING_TEE_POOL_TIMEOUT", "15") or 15))
+        return max(1.0, float(os.environ.get("FEEDLING_TEE_POOL_TIMEOUT", "2") or 2))
     except (TypeError, ValueError):
-        return 15.0
+        return 2.0
 
 
 def get_tee_pool():

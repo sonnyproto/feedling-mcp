@@ -65,6 +65,27 @@ from notices import catalog
 
 log = logging.getLogger("feedling.agent_runtime.supervisor")
 
+# Pooled HTTP clients. httpx's module-level verb helpers (httpx.get/httpx.post)
+# build a throwaway Client per call, so every tick paid a fresh TCP+TLS handshake
+# — pure waste for a long-lived supervisor that hits the same two hosts forever.
+#
+# Two clients because ``verify`` is a client-level setting, not a per-request one:
+# the enclave serves a self-signed cert (verification off), the backend gets normal
+# verification. ``keepalive_expiry`` stays BELOW the backend's keepalive
+# (backend/gunicorn_conf.py = 75s) so WE retire an idle socket first — reusing one
+# the server has already closed is the stale-connection race that fix was about.
+#
+# Constructing a Client opens no socket, so the pool is empty at import; a gunicorn
+# worker forked after this module loads still builds its own connections.
+# max_connections is httpx's own default (100) spelled out: passing a bare Limits()
+# would silently drop it to None (unbounded). The roster fan-out is 8 wide
+# (AGENT_RESOLVE_CONCURRENCY), so the cap is a guardrail, never a queue.
+_POOL_LIMITS = httpx.Limits(
+    max_connections=100, max_keepalive_connections=20, keepalive_expiry=60.0
+)
+_HTTP = httpx.Client(timeout=20, limits=_POOL_LIMITS)
+_ENCLAVE_HTTP = httpx.Client(timeout=20, limits=_POOL_LIMITS, verify=False)
+
 # runner error_class -> its notice dedupe-key suffix (module-level so
 # _emit_runner_notice and _resolve_runner_notice share one mapping — DRY).
 _RUNNER_NOTICE_SUFFIX = {"runner_spawn_failed": "spawn_failed",
@@ -482,7 +503,7 @@ def _load_roster() -> list[dict]:
 def _whoami(api_url: str, api_key: str) -> str:
     """Resolve a roster entry's user_id (lease key) via /v1/users/whoami."""
     try:
-        resp = httpx.get(f"{api_url.rstrip('/')}/v1/users/whoami",
+        resp = _HTTP.get(f"{api_url.rstrip('/')}/v1/users/whoami",
                          headers={"X-API-Key": api_key}, timeout=10)
         resp.raise_for_status()
         return str(resp.json().get("user_id") or "")
@@ -507,10 +528,10 @@ def _decrypt_provider_key(enclave_url: str, api_key: str = "", envelope: dict | 
     model_api config scheme). Plaintext is handed to the child via env. Auth is
     the api_key, or a runtime token (Stage D zero-roster) when provided."""
     try:
-        resp = httpx.post(f"{enclave_url.rstrip('/')}/v1/envelope/decrypt",
-                          headers=_auth_headers(api_key=api_key, runtime_token=runtime_token),
-                          json={"envelope": envelope, "purpose": "model_api_provider_key"},
-                          timeout=20, verify=False)
+        resp = _ENCLAVE_HTTP.post(f"{enclave_url.rstrip('/')}/v1/envelope/decrypt",
+                                  headers=_auth_headers(api_key=api_key, runtime_token=runtime_token),
+                                  json={"envelope": envelope, "purpose": "model_api_provider_key"},
+                                  timeout=20)
         resp.raise_for_status()
         return base64.b64decode(resp.json()["plaintext_b64"]).decode("utf-8")
     except Exception as e:  # noqa: BLE001
@@ -546,11 +567,10 @@ def _fetch_identity_plain_for_intro(entry: dict, *, api_url: str, enclave_url: s
     if not headers:
         return None, "auth_missing"
     try:
-        resp = httpx.get(
+        resp = _ENCLAVE_HTTP.get(
             f"{enclave_url.rstrip('/')}/v1/identity/get",
             headers=headers,
             timeout=10,
-            verify=False,
         )
         if resp.status_code == 404:
             return None, "identity_not_found"
@@ -685,7 +705,7 @@ def _fetch_key_envelope(api_url: str, api_key: str = "", *, runtime_token: str =
     api_keys (or, Stage D, nothing — a runtime token authenticates instead).
     Returns the envelope dict, or None if unconfigured/unreachable."""
     try:
-        resp = httpx.get(f"{api_url.rstrip('/')}/v1/model_api/key_envelope",
+        resp = _HTTP.get(f"{api_url.rstrip('/')}/v1/model_api/key_envelope",
                          headers=_auth_headers(api_key=api_key, runtime_token=runtime_token), timeout=10)
         if resp.status_code == 404:
             return None
@@ -906,7 +926,7 @@ def _post_verify_loop(api_url: str, headers: dict) -> bool:
     flips the user's ``chat_loop_verified`` and opens the bootstrap gate. Returns
     whether the verify passed (an agent reply landed)."""
     try:
-        resp = httpx.post(f"{api_url.rstrip('/')}/v1/chat/verify_loop",
+        resp = _HTTP.post(f"{api_url.rstrip('/')}/v1/chat/verify_loop",
                           headers=headers, json={"timeout_sec": 30}, timeout=40)
         resp.raise_for_status()
         return bool(resp.json().get("passing"))
@@ -1045,7 +1065,7 @@ def _run_lazy_persona_backfill(roster: list[dict], *, secret_raw: str, owner: st
             # Short timeout so a stuck backend can't wedge the tick (worst case =
             # cap × timeout); the endpoint is normally fast. Backgrounding is a later
             # hardening if this proves too tight under load.
-            resp = httpx.post(f"{api_url.rstrip('/')}/v1/genesis/persona_backfill",
+            resp = _HTTP.post(f"{api_url.rstrip('/')}/v1/genesis/persona_backfill",
                               headers={"X-Feedling-Runtime-Token": token}, timeout=5)
             log.info("persona backfill %s → http=%s %s", uid, resp.status_code, resp.text[:120])
         except Exception as e:  # noqa: BLE001

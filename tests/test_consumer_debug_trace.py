@@ -117,7 +117,7 @@ def test_cli_turn_metrics_never_raises_on_garbage_stdout():
 # ---------------------------------------------------------------------------
 
 def test_post_debug_trace_event_swallows_errors():
-    with patch.object(crc.httpx, "post", side_effect=RuntimeError("boom")):
+    with patch.object(crc._HTTP, "post", side_effect=RuntimeError("boom")):
         assert crc._post_debug_trace_event({"event": {}}) is None
 
 
@@ -137,7 +137,7 @@ def test_post_debug_trace_event_posts_expected_payload():
         "turn_id": "t-1", "actor": "vps_resident", "dur_ms": 12.5,
     }}
 
-    with patch.object(crc.httpx, "post", side_effect=_fake_post):
+    with patch.object(crc._HTTP, "post", side_effect=_fake_post):
         crc._post_debug_trace_event(payload)
 
     assert captured["url"] == f"{crc.FEEDLING_API_URL}/v1/debug/trace/event"
@@ -322,7 +322,7 @@ def test_emit_debug_trace_stale_unknown_probes_and_posts_when_enabled():
         post_calls.append(payload)
         done.set()
 
-    with patch.object(crc.httpx, "get", side_effect=_fake_get), \
+    with patch.object(crc._HTTP, "get", side_effect=_fake_get), \
          patch.object(crc, "_post_debug_trace_event", side_effect=_fake_post_event):
         crc._emit_debug_trace("agent", "x")
         assert done.wait(timeout=2), "background thread did not complete within timeout"
@@ -336,7 +336,7 @@ def test_refresh_debug_trace_enabled_caches_false_on_get_failure():
     """Any failure talking to the backend (network error, bad JSON, non-2xx)
     must be swallowed and cache False (fail-closed) — never raise."""
     crc._DBG_TRACE_ENABLED = {"val": None, "exp": 0.0}
-    with patch.object(crc.httpx, "get", side_effect=RuntimeError("boom")):
+    with patch.object(crc._HTTP, "get", side_effect=RuntimeError("boom")):
         crc._refresh_debug_trace_enabled()  # must not raise
 
     assert crc._DBG_TRACE_ENABLED["val"] is False
@@ -352,7 +352,7 @@ def test_refresh_debug_trace_enabled_caches_true_when_both_flags_set():
         resp.json = lambda: {"enabled": True, "deploy_enabled": True}
         return resp
 
-    with patch.object(crc.httpx, "get", side_effect=_fake_get):
+    with patch.object(crc._HTTP, "get", side_effect=_fake_get):
         crc._refresh_debug_trace_enabled()
 
     assert crc._DBG_TRACE_ENABLED["val"] is True
@@ -369,7 +369,7 @@ def test_refresh_debug_trace_enabled_false_when_deploy_disabled():
         resp.json = lambda: {"enabled": True, "deploy_enabled": False}
         return resp
 
-    with patch.object(crc.httpx, "get", side_effect=_fake_get):
+    with patch.object(crc._HTTP, "get", side_effect=_fake_get):
         crc._refresh_debug_trace_enabled()
 
     assert crc._DBG_TRACE_ENABLED["val"] is False

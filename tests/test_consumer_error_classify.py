@@ -236,7 +236,7 @@ def test_note_success_clears_reported_flag_after_respawn(monkeypatch):
     # 发生在 _report_runtime_error 内部且仅在请求送达时。
     calls = []
     monkeypatch.setattr(
-        crc.httpx, "post",
+        crc._HTTP, "post",
         lambda url, **kw: calls.append(kw.get("json")) or _FakeResp(200))
     crc._runtime_error_reported = True
     crc._note_agent_turn_success()
@@ -258,7 +258,7 @@ def test_clear_failure_keeps_flag_and_retries_next_success(monkeypatch):
             raise r
         return r
 
-    monkeypatch.setattr(crc.httpx, "post", fake_post)
+    monkeypatch.setattr(crc._HTTP, "post", fake_post)
     crc._runtime_error_reported = True
     crc._note_agent_turn_success()   # 传输失败
     assert crc._runtime_error_reported is True
@@ -273,7 +273,7 @@ def test_clear_failure_keeps_flag_and_retries_next_success(monkeypatch):
 def test_report_404_counts_as_settled(monkeypatch):
     # 404=用户无 model_api profile，无可清内容——视为已了结，别让每个成功回合
     # 都对着 404 重试。
-    monkeypatch.setattr(crc.httpx, "post", lambda url, **kw: _FakeResp(404))
+    monkeypatch.setattr(crc._HTTP, "post", lambda url, **kw: _FakeResp(404))
     crc._runtime_error_reported = True
     crc._note_agent_turn_success()
     assert crc._runtime_error_reported is False

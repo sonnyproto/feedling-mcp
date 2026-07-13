@@ -304,16 +304,23 @@ def list_supervisor_instance_heartbeats() -> list[dict]:
         rows = conn.execute(
             "SELECT owner, host, shard_index, shard_count, max_children, "
             "       active_children, host_all, gateway, version, "
-            "       extract(epoch FROM updated_at) AS ts "
+            "       extract(epoch FROM updated_at) AS ts, payload "
             "FROM agent_runtime_supervisor_heartbeats"
         ).fetchall()
     out = []
     for r in rows:
+        # ``pi`` has no promoted column (unlike host_all/gateway) — the supervisor
+        # only writes it into ``payload``. It MUST be read back out, or the wedge
+        # guard's ``hb.get("pi")`` is None → falsy → supervisor_pi_disabled → every
+        # pi-driver send 503s. See test_supervisor_instance_heartbeat_roundtrips_
+        # the_pi_capability_bit.
+        payload = r[10] if isinstance(r[10], dict) else {}
         out.append({
             "owner": r[0], "host": r[1], "shard_index": r[2], "shard_count": r[3],
             "max_children": r[4], "active_children": r[5],
             "host_all": bool(r[6]), "gateway": bool(r[7]), "version": r[8],
             "ts": float(r[9]),
+            "pi": bool(payload.get("pi")),
         })
     return out
 
@@ -1324,11 +1331,21 @@ def set_blob(user_id: str, kind: str, doc) -> None:
     from tee_shadow import mirror
     # identity 归 tee_replicator 明文化管辖：RDS 里是 E2E 密文信封、TEE 里是
     # replicator 落的明文版本。这里若把密文信封原样镜像进 TEE user_blobs，就会
-    # 盖掉那份明文（密文绝不能盖明文）。与 reconciler._SCOPE_WHERE 的
-    # "kind <> 'identity'" 同一辖区裁定（见该文件的注释）。identity 的原地
-    # UPDATE 传播改走 requeue lane（见 identity/service._save_identity）。
+    # 盖掉那份明文（密文绝不能盖明文）。identity 的原地 UPDATE 传播改走 requeue
+    # lane（见 identity/service._save_identity）。
+    #
+    # consumer_state 是全系统最热的写：每一次 /v1/chat/poll 都记一条 consumer 事件
+    # （chat/consumer._record_consumer_event → _save_consumer_state → 本函数），N 个
+    # 常驻 consumer 长轮询就是每轮 N 次写。把它镜像出去会打满 max_size=4 的 TEE 池
+    # （direct-TLS 过网关），于是每个主写都要先在池上等满 pool_timeout 才 fail-open
+    # ——2026-07-13 test 实测：13 分钟 18 次 pool timeout，poll/写端点被拖到秒级
+    # （perception/report 23.7s、track/event 13.4s）。而它只是 runner 侧运维状态
+    # （上次 poll 时间 / consumer id），不是用户数据，TEE 影子没有任何理由持有它。
+    #
+    # 两处辖区必须同步：reconciler._SCOPE_WHERE["user_blobs"] 同样排除这两个 kind，
+    # 否则 reconciler 会把镜像端故意不写的行又 copy 回 TEE、并在两侧计数里要求它存在。
     # 其余 kind（如 model_api provider-key 信封）有意原样镜像（凭据保持加密）。
-    if kind != "identity":
+    if kind not in ("identity", "consumer_state"):
         mirror.execute(sql, (user_id, kind, Jsonb(doc)))
 
 

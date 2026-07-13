@@ -52,10 +52,18 @@ def test_mirror_execute_many_atomic_and_counts_failure(monkeypatch):
 
 
 def test_pool_timeout_env_configurable(monkeypatch):
+    """Default is 2s: the shadow write is best-effort (failures are swallowed and
+    the reconciler backfills), so it must never hold a user-facing request hostage.
+    The old 15s was chosen assuming min_size=2 kept the pool warm enough that the
+    tail "rarely hits" — live test 2026-07-13 disproved that (18 pool timeouts in
+    13 min), because the pool is max_size=4 while every poll drove a mirror write.
+    A cold gateway handshake can exceed 2s, so a burst may now fail its mirror
+    write instead of stalling the request — the correct trade for a shadow that
+    the reconciler converges anyway."""
     from tee_shadow import mirror
     monkeypatch.delenv("FEEDLING_TEE_POOL_TIMEOUT", raising=False)
-    assert mirror._pool_timeout() == 15.0  # default widened from the old hardcoded 5s
+    assert mirror._pool_timeout() == 2.0
     monkeypatch.setenv("FEEDLING_TEE_POOL_TIMEOUT", "30")
     assert mirror._pool_timeout() == 30.0
     monkeypatch.setenv("FEEDLING_TEE_POOL_TIMEOUT", "garbage")
-    assert mirror._pool_timeout() == 15.0  # bad value falls back to default
+    assert mirror._pool_timeout() == 2.0  # bad value falls back to default

@@ -388,6 +388,30 @@ def test_supervisor_instance_heartbeat_roundtrip():
     assert isinstance(r["ts"], float) and r["ts"] > 0
 
 
+def test_supervisor_instance_heartbeat_roundtrips_the_pi_capability_bit():
+    """``pi`` MUST survive the write→read roundtrip.
+
+    Unlike host_all/gateway, ``pi`` has no dedicated column — the supervisor only
+    ever puts it in the JSONB ``payload``. The reader long SELECTed the promoted
+    columns but not ``payload``, so ``pi`` silently vanished and every row came
+    back WITHOUT the key. ``evaluate_supervisor_heartbeat`` then read
+    ``hb.get("pi")`` → None → falsy → ``supervisor_pi_disabled``, so
+    ``/v1/model_api/chat/send`` returned 503 for EVERY pi-driver user (i.e. every
+    deepseek/gemini/openrouter/openai_compatible account) whenever a fresh
+    instance row existed — the healthier the runner, the harder it 503'd, since a
+    fresh row also suppressed the legacy-heartbeat fallback that still carried pi.
+    Observed live on test 2026-07-13 (gated events, live_reason=supervisor_pi_disabled)."""
+    owner = _owner()
+    db.set_supervisor_instance_heartbeat(owner, _hb_payload(owner, pi=True))
+    row = next(r for r in db.list_supervisor_instance_heartbeats() if r["owner"] == owner)
+    assert row["pi"] is True
+
+    owner_off = _owner()
+    db.set_supervisor_instance_heartbeat(owner_off, _hb_payload(owner_off, pi=False))
+    row_off = next(r for r in db.list_supervisor_instance_heartbeats() if r["owner"] == owner_off)
+    assert row_off["pi"] is False
+
+
 def test_supervisor_instance_heartbeats_do_not_clobber_across_owners():
     a, b = _owner(), _owner()
     db.set_supervisor_instance_heartbeat(a, _hb_payload(a, host="A", active_children=1))
