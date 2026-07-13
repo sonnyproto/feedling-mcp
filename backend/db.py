@@ -1454,11 +1454,15 @@ def claim_and_enqueue_introduction(
     (e.g. ``first_chat_ok_at``) are preserved. Returns ``{"job", "seq"}`` iff
     THIS caller won and the job persisted, else ``None`` (already introduced,
     lost the race, or a DB failure that rolled back)."""
+    # ON CONFLICT merges the marker into the EXISTING doc (jsonb_set) and also
+    # refreshes updated_at/version like every other proactive_settings mutation,
+    # WITHOUT clobbering peer fields (first_chat_ok_at, switches, timezone…).
     claim_sql = (
         "INSERT INTO user_blobs (user_id, kind, doc) "
         "VALUES (%s, 'proactive_settings', %s) "
         "ON CONFLICT (user_id, kind) DO UPDATE "
         "  SET doc = jsonb_set(user_blobs.doc, '{introduced_at}', to_jsonb(%s::text), true) "
+        "            || jsonb_build_object('updated_at', %s::text, 'version', 2) "
         "  WHERE COALESCE(user_blobs.doc->>'introduced_at', '') = '' "
         "RETURNING doc"
     )
@@ -1471,7 +1475,7 @@ def claim_and_enqueue_introduction(
     try:
         with get_pool().connection() as conn:
             with conn.transaction():
-                row = conn.execute(claim_sql, (user_id, Jsonb(settings_doc), at_iso)).fetchone()
+                row = conn.execute(claim_sql, (user_id, Jsonb(settings_doc), at_iso, at_iso)).fetchone()
                 if row is not None:
                     claimed_doc = row[0]
                     seq = conn.execute(job_sql, (user_id, ts, item_key, Jsonb(job))).fetchone()[0]
@@ -1480,21 +1484,29 @@ def claim_and_enqueue_introduction(
         return None
     if claimed_doc is None or seq is None:
         return None
-    # Committed on the primary — mirror both rows into the TEE shadow. The blob
-    # is plaintext (safe to mirror as-is); the job seq is pinned so the shadow
-    # keeps the same row identity every seq-ordered read relies on.
+    # Committed on the primary — mirror BOTH rows into the TEE shadow as ONE
+    # transaction (they are a single logical write). The blob merges the marker
+    # (jsonb_set + updated_at/version) rather than overwriting the whole doc, so
+    # a late-arriving introduction mirror can't briefly clobber peer fields the
+    # reconciler already advanced on the shadow; the job seq is pinned so the
+    # shadow keeps the row identity every seq-ordered read relies on.
     from tee_shadow import mirror
-    mirror.execute(
-        "INSERT INTO user_blobs (user_id, kind, doc) VALUES (%s, 'proactive_settings', %s) "
-        "ON CONFLICT (user_id, kind) DO UPDATE SET doc = EXCLUDED.doc",
-        (user_id, Jsonb(claimed_doc)),
-    )
-    mirror.execute(
-        "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
-        "OVERRIDING SYSTEM VALUE VALUES (%s, 'proactive_jobs', %s, %s, %s, %s) "
-        "ON CONFLICT (user_id, stream, seq) DO NOTHING",
-        (user_id, seq, ts, item_key, Jsonb(job)),
-    )
+    mirror.execute_many([
+        (
+            "INSERT INTO user_blobs (user_id, kind, doc) "
+            "VALUES (%s, 'proactive_settings', %s) "
+            "ON CONFLICT (user_id, kind) DO UPDATE "
+            "  SET doc = jsonb_set(user_blobs.doc, '{introduced_at}', to_jsonb(%s::text), true) "
+            "            || jsonb_build_object('updated_at', %s::text, 'version', 2)",
+            (user_id, Jsonb(claimed_doc), at_iso, at_iso),
+        ),
+        (
+            "INSERT INTO user_logs (user_id, stream, seq, ts, item_key, doc) "
+            "OVERRIDING SYSTEM VALUE VALUES (%s, 'proactive_jobs', %s, %s, %s, %s) "
+            "ON CONFLICT (user_id, stream, seq) DO NOTHING",
+            (user_id, seq, ts, item_key, Jsonb(job)),
+        ),
+    ])
     return {"job": job, "seq": seq}
 
 

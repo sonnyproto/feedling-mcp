@@ -4,10 +4,12 @@ written in ONE PostgreSQL transaction, so a second claim can never mint a
 second job and the marker merge preserves peer fields.
 """
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
+import db  # noqa: E402
 from core import store as core_store  # noqa: E402
 from chat import chat_core  # noqa: E402
 from agent_runtime import introduction  # noqa: E402
@@ -80,3 +82,43 @@ def test_model_api_verify_helper_does_not_enqueue(monkeypatch):
 
     assert s.introduction_done() is False
     assert _intro_jobs(s) == []
+
+
+def test_concurrent_claims_yield_exactly_one_job():
+    # TRUE concurrency (two threads / two pooled connections racing the guarded
+    # UPSERT), not sequential calls: exactly one wins and exactly one job lands.
+    uid = "usr_intro_atomic_concurrent"
+    seed_user(uid)
+    s = core_store.get_store(uid)
+
+    def _claim(i):
+        return s.claim_and_enqueue_introduction(_job(1000.0 + i))
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        results = list(ex.map(_claim, range(2)))
+
+    winners = [r for r in results if r is not None]
+    assert len(winners) == 1
+    assert s.introduction_done() is True
+    assert len(_intro_jobs(s)) == 1
+
+
+def test_job_insert_failure_rolls_back_marker():
+    # Force the SECOND statement (job INSERT) to fail INSIDE the transaction by
+    # handing it a non-JSON-serializable value, and assert the whole thing rolled
+    # back: no marker, no job (Codex: model the real rollback, not FakeStore).
+    uid = "usr_intro_atomic_rollback"
+    seed_user(uid)
+    s = core_store.get_store(uid)
+    settings = dict(s.load_proactive_settings())
+    at_iso = "2026-07-14T00:00:00"
+    settings["introduced_at"] = at_iso
+    bad_job = {"job_id": "pj_bad", "job_kind": "introduction", "bad": {1, 2, 3}}  # set -> not JSON
+
+    result = db.claim_and_enqueue_introduction(
+        uid, settings, bad_job, at_iso=at_iso, ts=1.0, item_key="pj_bad")
+
+    assert result is None
+    fresh = core_store.get_store(uid)
+    assert fresh.introduction_done() is False   # marker rolled back with the failed job
+    assert _intro_jobs(fresh) == []
