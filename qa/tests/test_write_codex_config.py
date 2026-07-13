@@ -71,7 +71,7 @@ def _paths(tmp_path: Path) -> dict[str, Path | str | list[Path]]:
     }
 
 
-def test_bundle_isolates_six_top_level_profiles_and_aggregation(tmp_path):
+def test_bundle_isolates_eight_top_level_profiles_and_aggregation(tmp_path):
     values = _paths(tmp_path)
     bundle = writer.build_config_bundle(**values)
     document = tomllib.loads(bundle.main)
@@ -103,7 +103,7 @@ def test_bundle_isolates_six_top_level_profiles_and_aggregation(tmp_path):
         not in document["shell_environment_policy"]["include_only"]
     )
 
-    assert len(bundle.profiles) == 6
+    assert len(bundle.profiles) == len(PROFILE_AGENT_TYPES) == 8
     manifests = Path(values["profile_manifest_dir"])
     worker_root = Path(values["worker_root"])
     permissions = document["permissions"]

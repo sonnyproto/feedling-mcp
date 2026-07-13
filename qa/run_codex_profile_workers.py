@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Launch exactly six isolated top-level Codex qualification processes.
+"""Launch exactly eight isolated top-level Codex qualification processes.
 
 The launcher is intentionally deterministic and not intelligent.  Intelligence
 lives inside each selected headless Codex profile.  The launcher owns process
@@ -701,8 +701,9 @@ def launch(
             invocation_failed=failed,
         )
 
-    # Two fixed batches guarantee at most three simultaneous processes.  Every
-    # locked profile is attempted exactly once even when an earlier worker fails.
+    # Three fixed batches (3+3+2) guarantee at most three simultaneous processes.
+    # Every locked profile is attempted exactly once even when an earlier worker
+    # fails.
     with ThreadPoolExecutor(max_workers=MAX_CONFIGURED_CONCURRENCY) as executor:
         for offset in range(0, len(specs), MAX_CONFIGURED_CONCURRENCY):
             batch = specs[offset : offset + MAX_CONFIGURED_CONCURRENCY]
@@ -790,7 +791,7 @@ def launch(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run six isolated headless Codex API-key qualification workers"
+        description="Run eight isolated headless Codex API-key qualification workers"
     )
     parser.add_argument("--codex-bin", type=Path, required=True)
     parser.add_argument("--codex-home", type=Path, required=True)
@@ -841,7 +842,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     finally:
         os.umask(previous_umask)
-    print("six independent Codex qualification workers completed")
+    print("eight independent Codex qualification workers completed")
     return 0
 
 

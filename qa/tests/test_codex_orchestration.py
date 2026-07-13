@@ -122,13 +122,18 @@ def _successful_runner(
     extra_file: bool = False,
 ) -> launcher.ProcessRunner:
     lock = threading.Lock()
-    barrier = threading.Barrier(3)
+    cap = verifier.MAX_CONFIGURED_CONCURRENCY
+    barriers = {
+        offset // cap: threading.Barrier(min(cap, len(PROFILE_AGENT_TYPES) - offset))
+        for offset in range(0, len(PROFILE_AGENT_TYPES), cap)
+    }
 
     def run(spec: launcher.WorkerSpec, timeout: int) -> int:
         assert timeout == 600
         with lock:
             captured.append(spec)
             index = PROFILE_AGENT_TYPES.index((spec.profile_id, spec.agent_type))
+        barrier = barriers[index // cap]
         barrier.wait(timeout=5)
         schema = json.loads(spec.schema_path.read_text())
         result = _instance(schema, schema["$defs"])
@@ -180,6 +185,16 @@ def _launch(paths: dict[str, Any], runner: launcher.ProcessRunner) -> dict[str, 
 def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
     tmp_path, monkeypatch
 ):
+    assert PROFILE_AGENT_TYPES == (
+        ("official-deepseek", "profile_official_deepseek"),
+        ("official-anthropic", "profile_official_anthropic"),
+        ("official-openai", "profile_official_openai"),
+        ("official-gemini", "profile_official_gemini"),
+        ("openrouter-claude", "profile_openrouter_claude"),
+        ("openrouter-openai", "profile_openrouter_openai"),
+        ("openrouter-glm", "profile_openrouter_glm"),
+        ("relay-kongbeiqie", "profile_relay_kongbeiqie"),
+    )
     paths = _setup(tmp_path)
     for name in (
         "QA_TEST_ADMIN_TOKEN",
@@ -188,6 +203,11 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
         "QA_ANTHROPIC_API_KEY",
         "QA_OPENAI_PROVIDER_API_KEY",
         "QA_OPENROUTER_API_KEY",
+        "QA_GEMINI_API_KEY",
+        "QA_KONGBEIQIE_API_KEY",
+        "QA_GEMINI_MODEL",
+        "QA_KONGBEIQIE_MODEL",
+        "QA_KONGBEIQIE_BASE_URL",
         "QA_CODEX_AUTH_JSON_B64",
     ):
         monkeypatch.setenv(name, "must-not-cross-boundary")
@@ -195,13 +215,15 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
     receipt = _launch(paths, _successful_runner(captured))
 
     assert receipt["schema_version"] == 2
-    assert receipt["launch_attempts"] == 6
+    assert receipt["launch_attempts"] == len(PROFILE_AGENT_TYPES)
     assert receipt["max_configured_profile_concurrency"] == 3
     assert receipt["max_observed_profile_concurrency"] == 3
     assert [
         (row["profile_id"], row["agent_type"]) for row in receipt["workers"]
     ] == list(PROFILE_AGENT_TYPES)
-    assert len({row["thread_id"] for row in receipt["workers"]}) == 6
+    assert len({row["thread_id"] for row in receipt["workers"]}) == len(
+        PROFILE_AGENT_TYPES
+    )
     assert [row["permission_profile"] for row in receipt["workers"]] == [
         f"feedling-e2e-{profile_id}" for profile_id, _ in PROFILE_AGENT_TYPES
     ]
@@ -211,7 +233,7 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
     assert {path.name for path in paths["aggregation"].iterdir()} == {
         f"{profile_id}.json" for profile_id, _ in PROFILE_AGENT_TYPES
     }
-    assert len(captured) == 6
+    assert len(captured) == len(PROFILE_AGENT_TYPES)
     for spec in captured:
         assert spec.command[1:6] == (
             "exec",
@@ -238,12 +260,17 @@ def test_launcher_runs_exact_matrix_at_peak_three_without_secrets(
                 "QA_ANTHROPIC_API_KEY",
                 "QA_OPENAI_PROVIDER_API_KEY",
                 "QA_OPENROUTER_API_KEY",
+                "QA_GEMINI_API_KEY",
+                "QA_KONGBEIQIE_API_KEY",
+                "QA_GEMINI_MODEL",
+                "QA_KONGBEIQIE_MODEL",
+                "QA_KONGBEIQIE_BASE_URL",
                 "QA_CODEX_AUTH_JSON_B64",
             )
         )
 
 
-def test_nonzero_exit_attempts_all_six_once_and_writes_no_receipt(tmp_path):
+def test_nonzero_exit_attempts_all_eight_once_and_writes_no_receipt(tmp_path):
     paths = _setup(tmp_path)
     captured: list[launcher.WorkerSpec] = []
     successful = _successful_runner(captured)
@@ -254,8 +281,8 @@ def test_nonzero_exit_attempts_all_six_once_and_writes_no_receipt(tmp_path):
 
     with pytest.raises(launcher.WorkerLaunchError, match="workers failed"):
         _launch(paths, runner)
-    assert len(captured) == 6
-    assert len({spec.profile_id for spec in captured}) == 6
+    assert len(captured) == len(PROFILE_AGENT_TYPES)
+    assert len({spec.profile_id for spec in captured}) == len(PROFILE_AGENT_TYPES)
     assert not paths["receipt"].exists()
     assert list(paths["aggregation"].iterdir()) == []
 
@@ -289,7 +316,7 @@ def test_launcher_fails_closed_on_invalid_worker_evidence(tmp_path, runner_kwarg
     captured: list[launcher.WorkerSpec] = []
     with pytest.raises(launcher.WorkerLaunchError):
         _launch(paths, _successful_runner(captured, **runner_kwargs))
-    assert len(captured) == 6
+    assert len(captured) == len(PROFILE_AGENT_TYPES)
     assert not paths["receipt"].exists()
 
 

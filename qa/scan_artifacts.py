@@ -25,14 +25,18 @@ SECRET_ENV_NAMES = (
     "QA_ANTHROPIC_API_KEY",
     "QA_OPENAI_PROVIDER_API_KEY",
     "QA_OPENROUTER_API_KEY",
+    "QA_GEMINI_API_KEY",
+    "QA_KONGBEIQIE_API_KEY",
 )
 PROFILE_IDS = (
     "official-deepseek",
     "official-anthropic",
     "official-openai",
+    "official-gemini",
     "openrouter-claude",
     "openrouter-openai",
     "openrouter-glm",
+    "relay-kongbeiqie",
 )
 EXPECTED_PUBLIC_FILES = {
     "run-result.json",
@@ -146,7 +150,7 @@ def _secret_values(
         add(codex_auth["tokens"][field])
 
     profiles = manifest["profiles"]
-    if len(profiles) != 6:
+    if len(profiles) != len(PROFILE_IDS):
         raise ArtifactScanError("private manifest profile set is incomplete")
     for profile in profiles:
         if not isinstance(profile, dict):

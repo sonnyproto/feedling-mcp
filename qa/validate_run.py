@@ -73,25 +73,44 @@ _PROFILE_METADATA = {
     "official-deepseek": ("official", "deepseek", "deepseek"),
     "official-anthropic": ("official", "claude", "anthropic"),
     "official-openai": ("official", "openai", "openai"),
+    "official-gemini": ("official", "gemini", "gemini"),
     "openrouter-claude": ("openrouter", "claude", "openrouter"),
     "openrouter-openai": ("openrouter", "openai", "openrouter"),
     "openrouter-glm": ("openrouter", "glm", "openrouter"),
+    "relay-kongbeiqie": ("relay", "claude", "openai_compatible"),
 }
 _PROFILE_SECRET_AND_MODEL_ENVS = {
     "official-deepseek": ("QA_DEEPSEEK_API_KEY", "QA_DEEPSEEK_MODEL"),
     "official-anthropic": ("QA_ANTHROPIC_API_KEY", "QA_ANTHROPIC_MODEL"),
     "official-openai": ("QA_OPENAI_PROVIDER_API_KEY", "QA_OPENAI_MODEL"),
+    "official-gemini": ("QA_GEMINI_API_KEY", "QA_GEMINI_MODEL"),
     "openrouter-claude": ("QA_OPENROUTER_API_KEY", "QA_OPENROUTER_CLAUDE_MODEL"),
     "openrouter-openai": ("QA_OPENROUTER_API_KEY", "QA_OPENROUTER_OPENAI_MODEL"),
     "openrouter-glm": ("QA_OPENROUTER_API_KEY", "QA_OPENROUTER_GLM_MODEL"),
+    "relay-kongbeiqie": ("QA_KONGBEIQIE_API_KEY", "QA_KONGBEIQIE_MODEL"),
 }
 _PROFILE_ALLOWED_MODEL_REGEXES = {
     "official-deepseek": r"^deepseek-[a-z0-9][a-z0-9._-]*$",
     "official-anthropic": r"^claude-[a-z0-9][a-z0-9._-]*$",
     "official-openai": r"^(?:gpt-[a-z0-9][a-z0-9._-]*|o[1-9][a-z0-9._-]*)$",
+    "official-gemini": r"^gemini-2\.5-[a-z0-9][a-z0-9._-]*$",
     "openrouter-claude": r"^anthropic/claude-[a-z0-9][a-z0-9._:-]*$",
     "openrouter-openai": (r"^openai/(?:gpt-[a-z0-9][a-z0-9._:-]*|o[a-z0-9._:-]*)$"),
     "openrouter-glm": r"^(?:z-ai|thudm)/glm-[a-z0-9][a-z0-9._:-]*$",
+    "relay-kongbeiqie": (r"^(?:\[[^\r\n\]|`]{1,32}\])?claude-[a-z0-9][a-z0-9._-]*$"),
+}
+_PROFILE_CONFIGURED_BASE_URLS = {
+    "official-deepseek": "https://api.deepseek.com",
+    "official-anthropic": "https://api.anthropic.com/v1",
+    "official-openai": "https://api.openai.com/v1",
+    "official-gemini": "https://generativelanguage.googleapis.com/v1beta",
+    "openrouter-claude": "https://openrouter.ai/api/v1",
+    "openrouter-openai": "https://openrouter.ai/api/v1",
+    "openrouter-glm": "https://openrouter.ai/api/v1",
+    "relay-kongbeiqie": "https://xn--vduyey89e.com/v1",
+}
+_RELAY_BASE_URL_ENVS = {
+    "relay-kongbeiqie": "QA_KONGBEIQIE_BASE_URL",
 }
 _SCENARIO_CONTRACTS: dict[str, dict[str, Any]] = {
     "P0-01": {
@@ -318,9 +337,9 @@ _TRACE_LATENCY_CONTRACT = {
     "profile_summary_percentile_method": "nearest_rank",
 }
 _EXECUTION_CONTRACT = {
-    "required_profile_count": 6,
+    "required_profile_count": 8,
     "supervisor_count": 1,
-    "profile_worker_assignment_count": 6,
+    "profile_worker_assignment_count": 8,
     "allow_profile_skip": False,
     "max_profile_concurrency": 3,
     "max_attempts_per_scenario": 2,
@@ -510,7 +529,7 @@ def _validate_coverage(coverage: Any, expected_runtime: str) -> list[str]:
         LOCKED_PROFILE_IDS
     ):
         errors.append(
-            "coverage lock does not contain the exact six profiles "
+            "coverage lock does not contain the exact eight profiles "
             f"(missing={_fixed_missing(LOCKED_PROFILE_IDS, profile_set)})"
         )
     if "" in profile_set or _duplicates(profile_ids):
@@ -521,19 +540,23 @@ def _validate_coverage(coverage: Any, expected_runtime: str) -> list[str]:
     for profile_id in LOCKED_PROFILE_IDS:
         route_family, model_family, provider = _PROFILE_METADATA[profile_id]
         provider_key_env, model_env = _PROFILE_SECRET_AND_MODEL_ENVS[profile_id]
-        expected_profiles.append(
-            {
-                "id": profile_id,
-                "route_family": route_family,
-                "model_family": model_family,
-                "provider": provider,
-                "provider_key_env": provider_key_env,
-                "model_env": model_env,
-                "allowed_model_regex": _PROFILE_ALLOWED_MODEL_REGEXES[profile_id],
-                "reasoning_effort": "medium",
-                "reasoning_expected": True,
-            }
-        )
+        expected_profile = {
+            "id": profile_id,
+            "route_family": route_family,
+            "model_family": model_family,
+            "provider": provider,
+            "provider_key_env": provider_key_env,
+            "model_env": model_env,
+            "allowed_model_regex": _PROFILE_ALLOWED_MODEL_REGEXES[profile_id],
+            "reasoning_effort": "medium",
+            "reasoning_expected": True,
+        }
+        if profile_id in _RELAY_BASE_URL_ENVS:
+            expected_profile.update(
+                base_url_env=_RELAY_BASE_URL_ENVS[profile_id],
+                allowed_base_url=_PROFILE_CONFIGURED_BASE_URLS[profile_id],
+            )
+        expected_profiles.append(expected_profile)
     if profiles != expected_profiles:
         errors.append("coverage lock profile definitions do not match the release gate")
     if any(
@@ -718,7 +741,7 @@ def _validate_orchestration_receipt(
 
     workers = receipt.get("workers")
     if not isinstance(workers, list) or len(workers) != len(PROFILE_AGENT_TYPES):
-        return errors + ["trusted orchestration receipt does not cover six workers"]
+        return errors + ["trusted orchestration receipt does not cover eight workers"]
     expected_pairs = list(PROFILE_AGENT_TYPES)
     trusted_assignments: list[dict[str, str]] = []
     trusted_profile_hashes: list[str | None] = [None] * len(PROFILE_AGENT_TYPES)
@@ -1023,9 +1046,9 @@ def _validate_result_semantics(
     if result.get("overall_status") != PASS:
         errors.append("overall status is not PASS")
     if result.get("profiles_expected") != len(LOCKED_PROFILE_IDS):
-        errors.append("profiles_expected is not six")
+        errors.append("profiles_expected is not eight")
     if result.get("profiles_completed") != len(LOCKED_PROFILE_IDS):
-        errors.append("profiles_completed is not six")
+        errors.append("profiles_completed is not eight")
     errors.extend(_validate_orchestration(result.get("orchestration")))
 
     target = result.get("target")
@@ -1049,7 +1072,7 @@ def _validate_result_semantics(
         LOCKED_PROFILE_IDS
     ):
         errors.append(
-            "result does not contain the exact six profiles "
+            "result does not contain the exact eight profiles "
             f"(missing={_fixed_missing(LOCKED_PROFILE_IDS, profile_set)})"
         )
     if "" in profile_set or _duplicates(profile_ids):
@@ -1440,7 +1463,7 @@ def _validate_result_semantics(
         errors.append("result summary is missing")
     else:
         if summary.get("pass") != len(LOCKED_PROFILE_IDS):
-            errors.append("summary PASS count is not six")
+            errors.append("summary PASS count is not eight")
         if any(summary.get(field) != 0 for field in _NONPASS_SUMMARY_FIELDS):
             errors.append("summary contains a non-PASS count")
 
@@ -1587,6 +1610,7 @@ def _validate_provisioning_manifest(
             continue
         route_family, _model_family, provider = _PROFILE_METADATA[profile_id]
         model = entry.get("configured_model")
+        configured_base_url = entry.get("configured_base_url")
         user_id = entry.get("user_id")
         expected_label = f"agent-e2e-{run_id}-{profile_id}"
         invalid_receipt = entry.get("invalid_key_receipt")
@@ -1598,6 +1622,7 @@ def _validate_provisioning_manifest(
             or not isinstance(model, str)
             or not model
             or re.fullmatch(_PROFILE_ALLOWED_MODEL_REGEXES[profile_id], model) is None
+            or configured_base_url != _PROFILE_CONFIGURED_BASE_URLS[profile_id]
             or entry.get("reasoning_effort") != "medium"
             or entry.get("provision_status") != "ready"
             or entry.get("provision_failure_code") != "NONE"
@@ -1624,6 +1649,7 @@ def _validate_provisioning_manifest(
                 "status": "configured",
                 "provider": provider,
                 "model": model,
+                "base_url": configured_base_url,
                 "reasoning_effort": "medium",
             }
         ):

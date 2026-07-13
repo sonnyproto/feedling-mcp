@@ -7,9 +7,11 @@ PROFILE_AGENT_TYPES: tuple[tuple[str, str], ...] = (
     ("official-deepseek", "profile_official_deepseek"),
     ("official-anthropic", "profile_official_anthropic"),
     ("official-openai", "profile_official_openai"),
+    ("official-gemini", "profile_official_gemini"),
     ("openrouter-claude", "profile_openrouter_claude"),
     ("openrouter-openai", "profile_openrouter_openai"),
     ("openrouter-glm", "profile_openrouter_glm"),
+    ("relay-kongbeiqie", "profile_relay_kongbeiqie"),
 )
 
 PROFILE_IDS = tuple(profile_id for profile_id, _ in PROFILE_AGENT_TYPES)

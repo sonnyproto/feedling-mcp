@@ -10,9 +10,9 @@
     "runtime_admin_token_env": "QA_TEST_ADMIN_TOKEN"
   },
   "execution": {
-    "required_profile_count": 6,
+    "required_profile_count": 8,
     "supervisor_count": 1,
-    "profile_worker_assignment_count": 6,
+    "profile_worker_assignment_count": 8,
     "allow_profile_skip": false,
     "max_profile_concurrency": 3,
     "max_attempts_per_scenario": 2,
@@ -55,6 +55,17 @@
       "reasoning_expected": true
     },
     {
+      "id": "official-gemini",
+      "route_family": "official",
+      "model_family": "gemini",
+      "provider": "gemini",
+      "provider_key_env": "QA_GEMINI_API_KEY",
+      "model_env": "QA_GEMINI_MODEL",
+      "allowed_model_regex": "^gemini-2\\.5-[a-z0-9][a-z0-9._-]*$",
+      "reasoning_effort": "medium",
+      "reasoning_expected": true
+    },
+    {
       "id": "openrouter-claude",
       "route_family": "openrouter",
       "model_family": "claude",
@@ -84,6 +95,19 @@
       "provider_key_env": "QA_OPENROUTER_API_KEY",
       "model_env": "QA_OPENROUTER_GLM_MODEL",
       "allowed_model_regex": "^(?:z-ai|thudm)/glm-[a-z0-9][a-z0-9._:-]*$",
+      "reasoning_effort": "medium",
+      "reasoning_expected": true
+    },
+    {
+      "id": "relay-kongbeiqie",
+      "route_family": "relay",
+      "model_family": "claude",
+      "provider": "openai_compatible",
+      "provider_key_env": "QA_KONGBEIQIE_API_KEY",
+      "model_env": "QA_KONGBEIQIE_MODEL",
+      "allowed_model_regex": "^(?:\\[[^\\r\\n\\]|`]{1,32}\\])?claude-[a-z0-9][a-z0-9._-]*$",
+      "base_url_env": "QA_KONGBEIQIE_BASE_URL",
+      "allowed_base_url": "https://xn--vduyey89e.com/v1",
       "reasoning_effort": "medium",
       "reasoning_expected": true
     }

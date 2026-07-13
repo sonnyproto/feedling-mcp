@@ -73,7 +73,10 @@ fields exactly, preserve `P0-01` through `P0-13` order, and include one numbered
 
 - Audit the provisioner's valid-key setup receipt on the same account.
 - Verify the public/masked configuration after setup without requesting or
-  reading the provider credential.
+  reading the provider credential. For `relay-kongbeiqie`, require provider
+  `openai_compatible` and exact equality between the private manifest's
+  `configured_base_url` and `valid_key_receipt.base_url`; never copy that endpoint
+  into a public result or diagnostic.
 
 **Pass**
 

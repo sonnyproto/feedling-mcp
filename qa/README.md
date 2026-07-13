@@ -14,24 +14,25 @@ The workflow is deliberately split across explicit trust zones:
    homogeneous live-worker builds, and trusted pre/post candidate-SHA receipts
    outside the public artifact directory.
 2. `provision_profiles.py` is a deterministic credential boundary. It creates
-   six fresh synthetic accounts, proves invalid-key rejection and valid-key
+   eight fresh synthetic accounts, proves invalid-key rejection and valid-key
    recovery without accepting echoed credentials, enables user-scoped trace
    access, requires a server-side synthetic-account TTL/reaper before the first
    registration, and uses the test admin token to set and read back
    `db_action_v2`. A present-but-expired provider key becomes a fixed-code
    blocked row while provisioning continues through the other profiles, so a
-   failed credential still produces a complete six-row diagnostic matrix.
-3. The provisioner output is deterministically split into six owner-only
-   one-row manifests. `run_codex_profile_workers.py` launches exactly six
-   independent top-level `codex exec` processes in two fixed batches of at most
-   three. Each selected Codex profile exposes only its matching row and isolated
-   home/temp/work roots; no process receives provider or admin credentials.
+   failed credential still produces a complete eight-row diagnostic matrix.
+3. The provisioner output is deterministically split into eight owner-only
+   one-row manifests. `run_codex_profile_workers.py` launches exactly eight
+   independent top-level `codex exec` processes in three fixed batches (3+3+2),
+   with at most three running concurrently. Each selected Codex profile exposes
+   only its matching row and isolated home/temp/work roots; no process receives
+   provider or admin credentials.
 4. Every profile agent returns one structured `profileResult`. Trusted launcher
    code validates it against a profile-locked Structured Outputs schema, binds
    its hash and root Codex thread ID into an owner-only lifecycle receipt, keeps
    raw events/stderr quarantined, and copies only the validated JSON into a
    separate aggregation-input directory.
-5. A separate headless Codex qualification supervisor reads only those six
+5. A separate headless Codex qualification supervisor reads only those eight
    validated profile results and the trusted receipt. It preserves each profile
    judgment, computes the run summary and orchestration projection, and returns
    the canonical JSON final message against
@@ -46,7 +47,7 @@ The workflow is deliberately split across explicit trust zones:
    exact profile/scenario order, scenario-specific assertions/evidence/IDs,
    preserved retry observations, per-turn five-stage trace and numeric latency
    evidence, and nearest-rank p50/p95 summaries recomputed from those turns,
-   one supervisor plus exactly six uniquely assigned independent profile
+   one supervisor plus exactly eight uniquely assigned independent profile
    workers with no more than three observed concurrently, exact agreement with
    the trusted process/thread/hash receipt, Runtime V2 identity, unchanged trusted
    pre/post deployment receipts, exact binding to the owner-only read-only
@@ -65,9 +66,11 @@ The locked matrix is:
 - official DeepSeek
 - official Anthropic/Claude
 - official OpenAI/ChatGPT
+- official Google Gemini
 - OpenRouter Claude
 - OpenRouter OpenAI/ChatGPT
 - OpenRouter GLM
+- Kongbeiqie OpenAI-compatible relay
 
 Every profile runs `P0-01` through `P0-13`, including fresh onboarding, key
 validation, four-part persona import/distillation, basic and ten-turn chat,
@@ -81,7 +84,7 @@ semantic judgment tied to the capture SHA-256; deterministic finalization checks
 the hash and judgment contracts, emits only sanitized evidence, and deletes the
 plaintext on every exit path.
 
-All six profiles lock reasoning effort to `medium`. A provider default, omitted
+All eight profiles lock reasoning effort to `medium`. A provider default, omitted
 setting, or disabled reasoning cannot produce a release PASS.
 
 P0-12 also guards the failure chain recorded in
@@ -166,6 +169,8 @@ the Environment restriction. Add these environment **secrets**:
 - `QA_ANTHROPIC_API_KEY`
 - `QA_OPENAI_PROVIDER_API_KEY`
 - `QA_OPENROUTER_API_KEY`
+- `QA_GEMINI_API_KEY`
+- `QA_KONGBEIQIE_API_KEY`
 
 Add these non-secret environment **variables** with explicit, reasoning-capable
 model IDs that the deployed candidate supports. Each selection must return the
@@ -177,13 +182,16 @@ coverage:
 - `QA_DEEPSEEK_MODEL`
 - `QA_ANTHROPIC_MODEL`
 - `QA_OPENAI_MODEL`
+- `QA_GEMINI_MODEL`
 - `QA_OPENROUTER_CLAUDE_MODEL`
 - `QA_OPENROUTER_OPENAI_MODEL`
 - `QA_OPENROUTER_GLM_MODEL`
+- `QA_KONGBEIQIE_MODEL`
+- `QA_KONGBEIQIE_BASE_URL` (the normalized HTTPS OpenAI-compatible endpoint)
 
 `QA_CODEX_AUTH_JSON_B64` is the base64 encoding of a complete `auth.json` from a
 **dedicated QA ChatGPT account**. This deliberately includes refreshable OAuth
-credentials so a three-hour qualification run can use the account's subscription
+credentials so a four-hour qualification job can use the account's subscription
 without a manual login on every ephemeral runner. It is a high-value, long-lived
 secret: never use a founder/engineer account, never paste it into a workflow
 input, require Environment approval, and revoke/rotate the QA account session on
@@ -227,7 +235,7 @@ The aggregation supervisor has no manifest or raw-output access and runs with
 network proxying disabled. Before provisioning, the workflow verifies OAuth,
 strict profile selection, no configured MCP server, filesystem boundaries,
 allowed test-API egress, and denied external/raw-IP bypasses. After provisioning,
-it probes all six exact mode-`0600` rows for own-read/other-deny isolation.
+it probes all eight exact mode-`0600` rows for own-read/other-deny isolation.
 
 Keep an independent runner/VPC egress policy as a second boundary: the Codex
 parent needs OpenAI/ChatGPT service access, while model-driven subprocesses should
@@ -279,8 +287,8 @@ created. Public files must never contain provider keys, Feedling account keys,
 private content keys, raw chat, raw traces, raw private reasoning, or free-form
 evidence/failure text.
 
-The seven summary fields count the exact terminal statuses of the six profiles
-and must sum to six. The gate is green only when all six profiles and all
+The seven summary fields count the exact terminal statuses of the eight profiles
+and must sum to eight. The gate is green only when all eight profiles and all
 thirteen scenarios per profile are present in order and PASS with their locked
 assertions, evidence codes, required IDs, and preserved attempt history; Runtime
 V2 and unchanged pre/post candidate identity are proven; all chat turns have the

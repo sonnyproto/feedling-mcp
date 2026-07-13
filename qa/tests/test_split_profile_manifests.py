@@ -37,7 +37,7 @@ def _manifest(tmp_path: Path) -> Path:
     return path
 
 
-def test_splitter_creates_exact_six_owner_only_one_row_manifests(tmp_path):
+def test_splitter_creates_exact_eight_owner_only_one_row_manifests(tmp_path):
     manifest = _manifest(tmp_path)
     output = _private_dir(manifest.parent / "profiles")
 

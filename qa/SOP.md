@@ -10,7 +10,7 @@ The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are requirements.
 ## 1. Fixed contract
 
 - Load `qa/coverage-lock.json` before doing anything else.
-- Execute exactly the six locked profiles and `P0-01` through `P0-13` for every
+- Execute exactly the eight locked profiles and `P0-01` through `P0-13` for every
   profile. A required profile or scenario MUST NOT be skipped.
 - The system under test MUST be the deployed test endpoint named by
   `QA_FEEDLING_BASE_URL` and the expected deployment named by
@@ -45,8 +45,9 @@ profile. Missing coverage is never a successful `SKIP`.
 
 The launcher is not intelligent. It MUST:
 
-1. Start exactly six independent top-level `codex exec` processes, one selected
-   profile per locked matrix row, in two fixed batches of no more than three.
+1. Start exactly eight independent top-level `codex exec` processes, one selected
+   profile per locked matrix row, in three fixed batches (3+3+2) of no more than
+   three.
    Native Codex subagent roles are not used because pinned Codex 0.144.3 does
    not reliably preserve their permission-profile isolation.
 2. Build each process environment from an explicit allowlist. Provider/admin
@@ -109,7 +110,7 @@ artifacts, add a new test runner, or edit the repository during qualification.
 If the manifest has `provision_status: blocked`, the agent MUST preserve its fixed
 `provision_failure_code`, classify the profile and affected scenarios with the
 appropriate schema-valid blocked status, avoid pretending that unavailable live
-actions ran, and still perform safe cleanup. A blocked row remains one of the six
+actions ran, and still perform safe cleanup. A blocked row remains one of the eight
 required results and can never release PASS.
 
 The agent MUST return one complete structured profile result. It may adapt a
@@ -119,10 +120,10 @@ checkpoint files or launch another agent.
 
 ### Qualification supervisor
 
-After all six profile processes complete, a separate intelligent headless Codex
+After all eight profile processes complete, a separate intelligent headless Codex
 process aggregates them. It MUST:
 
-1. Read only the six schema-validated canonical profile JSONs and the trusted
+1. Read only the eight schema-validated canonical profile JSONs and the trusted
    lifecycle receipt. It MUST NOT read a provisioning manifest, credential, raw
    worker event/stderr stream, or agent scratch root, and it runs without product
    network access.
@@ -130,7 +131,7 @@ process aggregates them. It MUST:
    retry observations, persona-finalizer evidence, COT/reasoning evidence, trace
    correlation, latency, and cleanup results.
 3. Verify the exact profile/scenario sets, project the receipt's worker IDs and
-   peak concurrency, compute the seven terminal-status counts (summing to six),
+   peak concurrency, compute the seven terminal-status counts (summing to eight),
    and choose overall status without converting blocked or failed evidence into
    PASS.
 4. Return only the complete schema-valid canonical run JSON. The Codex parent
@@ -366,9 +367,9 @@ before the supervisor returns so these are the only public files after rendering
 
 The overall result is `PASS` only when:
 
-- all six exact profile IDs occur once;
+- all eight exact profile IDs occur once;
 - the seven summary fields equal the counts of their corresponding profile
-  terminal statuses and sum to six;
+  terminal statuses and sum to eight;
 - all thirteen exact scenario IDs occur once for every profile;
 - all scenario and profile statuses are `PASS`;
 - observed runtime is `db_action_v2` for every profile;

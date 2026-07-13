@@ -17,9 +17,11 @@ VALID_MODELS = {
     "official-deepseek": "deepseek-v4-flash",
     "official-anthropic": "claude-sonnet-4-5",
     "official-openai": "gpt-5.4",
+    "official-gemini": "gemini-2.5-flash",
     "openrouter-claude": "anthropic/claude-sonnet-4.5",
     "openrouter-openai": "openai/gpt-4.1-mini",
     "openrouter-glm": "z-ai/glm-4.5-air:free",
+    "relay-kongbeiqie": "[特价纯血]claude-opus-4-6",
 }
 
 
@@ -109,18 +111,7 @@ def _profile_turns(profile_index: int) -> list[dict]:
 
 
 def _profile(profile_id: str, index: int) -> dict:
-    if profile_id == "official-deepseek":
-        route_family, model_family, provider = "official", "deepseek", "deepseek"
-    elif profile_id == "official-anthropic":
-        route_family, model_family, provider = "official", "claude", "anthropic"
-    elif profile_id == "official-openai":
-        route_family, model_family, provider = "official", "openai", "openai"
-    elif profile_id == "openrouter-claude":
-        route_family, model_family, provider = "openrouter", "claude", "openrouter"
-    elif profile_id == "openrouter-openai":
-        route_family, model_family, provider = "openrouter", "openai", "openrouter"
-    else:
-        route_family, model_family, provider = "openrouter", "glm", "openrouter"
+    route_family, model_family, provider = gate._PROFILE_METADATA[profile_id]
     turns = _profile_turns(index)
     return {
         "profile_id": profile_id,
@@ -201,8 +192,8 @@ def _valid_result() -> dict:
             "expected_runtime": "db_action_v2",
         },
         "overall_status": "PASS",
-        "profiles_expected": 6,
-        "profiles_completed": 6,
+        "profiles_expected": 8,
+        "profiles_completed": 8,
         "orchestration": {
             "supervisor_count": 1,
             "max_configured_profile_concurrency": 3,
@@ -220,7 +211,7 @@ def _valid_result() -> dict:
             for index, profile_id in enumerate(gate.LOCKED_PROFILE_IDS)
         ],
         "summary": {
-            "pass": 6,
+            "pass": 8,
             "product_fail": 0,
             "blocked_credential": 0,
             "blocked_evidence": 0,
@@ -300,6 +291,7 @@ def _write_provisioning_manifest(tmp_path: Path) -> Path:
                 "provider": profile["provider"],
                 "route_family": profile["route_family"],
                 "configured_model": profile["model"],
+                "configured_base_url": gate._PROFILE_CONFIGURED_BASE_URLS[profile_id],
                 "reasoning_effort": "medium",
                 "provision_status": "ready",
                 "provision_failure_code": "NONE",
@@ -322,6 +314,7 @@ def _write_provisioning_manifest(tmp_path: Path) -> Path:
                     "status": "configured",
                     "provider": profile["provider"],
                     "model": profile["model"],
+                    "base_url": gate._PROFILE_CONFIGURED_BASE_URLS[profile_id],
                     "reasoning_effort": "medium",
                 },
                 "runtime_mode_set_verified": True,
@@ -377,7 +370,7 @@ def _write_orchestration_receipt(
         "launcher_id": "run-10000000",
         "max_configured_profile_concurrency": 3,
         "max_observed_profile_concurrency": peak,
-        "launch_attempts": 6,
+        "launch_attempts": 8,
         "workers": workers,
     }
     receipt.update(updates)
@@ -420,6 +413,31 @@ def _validate(
 
 def test_valid_release_artifacts_pass(tmp_path):
     assert _validate(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    "model",
+    (
+        "[relay]\nclaude-opus-4-6",
+        "claude-opus-4-6\x7f",
+        "claude-opus-4-6\x85",
+        "claude-opus-4-6\u2028injected",
+        "claude-opus-4-6\u202eabc",
+        "claude-opus-4-6|injected",
+        "claude-opus-4-6`injected",
+        "[relay|injected]claude-opus-4-6",
+        "[relay`injected]claude-opus-4-6",
+    ),
+)
+def test_relay_model_label_rejects_controls_and_artifact_delimiters(tmp_path, model):
+    result = _valid_result()
+    relay = result["profiles"][-1]
+    relay["model"] = model
+    relay["reasoning"]["model"] = model
+
+    errors = _validate(tmp_path, result)
+
+    assert any("JSON Schema at $.profiles[7].model" in error for error in errors)
 
 
 def test_result_target_must_be_the_exact_test_origin(tmp_path):
@@ -941,7 +959,7 @@ def test_reasoning_effort_must_be_medium(tmp_path):
         ),
     ],
 )
-def test_orchestration_proves_six_workers_and_concurrency_cap(
+def test_orchestration_proves_eight_workers_and_concurrency_cap(
     tmp_path, mutate, expected
 ):
     result = _valid_result()
@@ -1045,7 +1063,7 @@ def test_duplicate_profile_id_and_missing_locked_profile_fail(tmp_path):
     result = _valid_result()
     result["profiles"][-1]["profile_id"] = result["profiles"][0]["profile_id"]
     errors = _validate(tmp_path, result)
-    assert any("exact six profiles" in error for error in errors)
+    assert any("exact eight profiles" in error for error in errors)
     assert any("duplicate profile IDs" in error for error in errors)
 
 
@@ -1303,6 +1321,26 @@ def test_trusted_provisioning_manifest_rejects_swapped_openrouter_model_families
     )
     assert (
         "profile openrouter-openai trusted provisioning receipt is incomplete" in errors
+    )
+
+
+@pytest.mark.parametrize("tamper_receipt", (False, True))
+def test_trusted_provisioning_manifest_binds_kongbeiqie_base_url(
+    tmp_path, tamper_receipt
+):
+    result = _valid_result()
+    manifest = json.loads(_write_provisioning_manifest(tmp_path).read_text())
+    relay = next(
+        row for row in manifest["profiles"] if row["profile_id"] == "relay-kongbeiqie"
+    )
+    field = relay["valid_key_receipt"] if tamper_receipt else relay
+    key = "base_url" if tamper_receipt else "configured_base_url"
+    field[key] = "https://attacker.example/v1"
+
+    errors = gate._validate_provisioning_manifest(manifest, result, "db_action_v2")
+
+    assert (
+        "profile relay-kongbeiqie trusted provisioning receipt is incomplete" in errors
     )
 
 

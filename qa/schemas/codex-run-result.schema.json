@@ -48,7 +48,7 @@
     "profiles_expected": {
       "type": "integer",
       "enum": [
-        6
+        8
       ]
     },
     "profiles_completed": {
@@ -93,6 +93,19 @@
       "anyOf": [
         {
           "$ref": "#/$defs/safeLabel"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "modelLabel": {
+      "type": "string"
+    },
+    "nullableModelLabel": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/modelLabel"
         },
         {
           "type": "null"
@@ -227,9 +240,11 @@
             "official-deepseek",
             "official-anthropic",
             "official-openai",
+            "official-gemini",
             "openrouter-claude",
             "openrouter-openai",
-            "openrouter-glm"
+            "openrouter-glm",
+            "relay-kongbeiqie"
           ]
         },
         "worker_id": {
@@ -267,16 +282,19 @@
             "official-deepseek",
             "official-anthropic",
             "official-openai",
+            "official-gemini",
             "openrouter-claude",
             "openrouter-openai",
-            "openrouter-glm"
+            "openrouter-glm",
+            "relay-kongbeiqie"
           ]
         },
         "route_family": {
           "type": "string",
           "enum": [
             "official",
-            "openrouter"
+            "openrouter",
+            "relay"
           ]
         },
         "model_family": {
@@ -285,6 +303,7 @@
             "deepseek",
             "claude",
             "openai",
+            "gemini",
             "glm"
           ]
         },
@@ -294,11 +313,13 @@
             "deepseek",
             "anthropic",
             "openai",
-            "openrouter"
+            "gemini",
+            "openrouter",
+            "openai_compatible"
           ]
         },
         "model": {
-          "$ref": "#/$defs/safeLabel"
+          "$ref": "#/$defs/modelLabel"
         },
         "reasoning_effort": {
           "type": "string",
@@ -1004,7 +1025,7 @@
           "$ref": "#/$defs/nullableSafeLabel"
         },
         "model": {
-          "$ref": "#/$defs/nullableSafeLabel"
+          "$ref": "#/$defs/nullableModelLabel"
         },
         "reasoning_token_count": {
           "type": [

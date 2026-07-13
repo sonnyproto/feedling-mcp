@@ -50,7 +50,7 @@ def _write_inputs(tmp_path: Path) -> tuple[Path, Path, Path, Path, dict[str, str
             "api_key": f"feedling-sensitive-account-{index}",
             "secret_key_b64": base64.b64encode(bytes([index + 1]) * 32).decode(),
         }
-        for index in range(6)
+        for index in range(len(scanner.PROFILE_IDS))
     ]
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps({"profiles": profiles}), encoding="utf-8")
@@ -89,6 +89,18 @@ def test_exact_secret_material_fails_without_returning_value(tmp_path, source):
     else:
         secret = doc["profiles"][0]["secret_key_b64"]
     (artifacts / "matrix.md").write_text(f"leak={secret}", encoding="utf-8")
+
+    findings = scanner.scan_artifacts(artifacts, manifest, codex_auth, fixture, env=env)
+
+    assert findings == ["public artifact contains exact credential material"]
+    assert secret not in "\n".join(findings)
+
+
+@pytest.mark.parametrize("secret_name", ("QA_GEMINI_API_KEY", "QA_KONGBEIQIE_API_KEY"))
+def test_new_profile_provider_secrets_are_scanned(tmp_path, secret_name):
+    artifacts, manifest, codex_auth, fixture, env = _write_inputs(tmp_path)
+    secret = env[secret_name]
+    (artifacts / "matrix.md").write_text(secret, encoding="utf-8")
 
     findings = scanner.scan_artifacts(artifacts, manifest, codex_auth, fixture, env=env)
 

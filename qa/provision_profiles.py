@@ -17,6 +17,7 @@ import ssl
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -34,6 +35,7 @@ from tools.provider_smoke.client import Session, SmokeClient  # noqa: E402
 
 
 ALLOWED_BASE_URL = "https://test-api.feedling.app"
+ALLOWED_KONGBEIQIE_BASE_URL = "https://xn--vduyey89e.com/v1"
 EXPECTED_RUNTIME_MODE = "db_action_v2"
 EXPECTED_REASONING_EFFORT = "medium"
 INVALID_PROVIDER_KEY = "feedling-e2e-intentionally-invalid"
@@ -88,6 +90,9 @@ class ProfileSpec:
     credential_env: str
     model_env: str
     allowed_model_regex: str
+    expected_configured_base_url: str
+    base_url_env: str = ""
+    allowed_base_url: str = ""
 
 
 PROFILE_SPECS: dict[str, ProfileSpec] = {
@@ -98,6 +103,7 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         credential_env="QA_DEEPSEEK_API_KEY",
         model_env="QA_DEEPSEEK_MODEL",
         allowed_model_regex=r"^deepseek-[a-z0-9][a-z0-9._-]*$",
+        expected_configured_base_url="https://api.deepseek.com",
     ),
     "official-anthropic": ProfileSpec(
         provider="anthropic",
@@ -106,6 +112,7 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         credential_env="QA_ANTHROPIC_API_KEY",
         model_env="QA_ANTHROPIC_MODEL",
         allowed_model_regex=r"^claude-[a-z0-9][a-z0-9._-]*$",
+        expected_configured_base_url="https://api.anthropic.com/v1",
     ),
     "official-openai": ProfileSpec(
         provider="openai",
@@ -114,6 +121,18 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         credential_env="QA_OPENAI_PROVIDER_API_KEY",
         model_env="QA_OPENAI_MODEL",
         allowed_model_regex=r"^(?:gpt-[a-z0-9][a-z0-9._-]*|o[1-9][a-z0-9._-]*)$",
+        expected_configured_base_url="https://api.openai.com/v1",
+    ),
+    "official-gemini": ProfileSpec(
+        provider="gemini",
+        route_family="official",
+        model_family="gemini",
+        credential_env="QA_GEMINI_API_KEY",
+        model_env="QA_GEMINI_MODEL",
+        allowed_model_regex=r"^gemini-2\.5-[a-z0-9][a-z0-9._-]*$",
+        expected_configured_base_url=(
+            "https://generativelanguage.googleapis.com/v1beta"
+        ),
     ),
     "openrouter-claude": ProfileSpec(
         provider="openrouter",
@@ -122,6 +141,7 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         credential_env="QA_OPENROUTER_API_KEY",
         model_env="QA_OPENROUTER_CLAUDE_MODEL",
         allowed_model_regex=r"^anthropic/claude-[a-z0-9][a-z0-9._:-]*$",
+        expected_configured_base_url="https://openrouter.ai/api/v1",
     ),
     "openrouter-openai": ProfileSpec(
         provider="openrouter",
@@ -130,6 +150,7 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         credential_env="QA_OPENROUTER_API_KEY",
         model_env="QA_OPENROUTER_OPENAI_MODEL",
         allowed_model_regex=r"^openai/(?:gpt-[a-z0-9][a-z0-9._:-]*|o[a-z0-9._:-]*)$",
+        expected_configured_base_url="https://openrouter.ai/api/v1",
     ),
     "openrouter-glm": ProfileSpec(
         provider="openrouter",
@@ -138,6 +159,20 @@ PROFILE_SPECS: dict[str, ProfileSpec] = {
         credential_env="QA_OPENROUTER_API_KEY",
         model_env="QA_OPENROUTER_GLM_MODEL",
         allowed_model_regex=r"^(?:z-ai|thudm)/glm-[a-z0-9][a-z0-9._:-]*$",
+        expected_configured_base_url="https://openrouter.ai/api/v1",
+    ),
+    "relay-kongbeiqie": ProfileSpec(
+        provider="openai_compatible",
+        route_family="relay",
+        model_family="claude",
+        credential_env="QA_KONGBEIQIE_API_KEY",
+        model_env="QA_KONGBEIQIE_MODEL",
+        allowed_model_regex=(
+            r"^(?:\[[^\r\n\]|`]{1,32}\])?" r"claude-[a-z0-9][a-z0-9._-]*$"
+        ),
+        expected_configured_base_url=ALLOWED_KONGBEIQIE_BASE_URL,
+        base_url_env="QA_KONGBEIQIE_BASE_URL",
+        allowed_base_url=ALLOWED_KONGBEIQIE_BASE_URL,
     ),
 }
 
@@ -263,6 +298,16 @@ def _load_coverage(path: Path) -> list[dict[str, Any]]:
             raise ProvisionError(
                 f"model constraint mismatch for coverage profile: {profile_id}"
             )
+        base_url_env = str(profile.get("base_url_env") or "").strip()
+        if base_url_env != spec.base_url_env:
+            raise ProvisionError(
+                f"base URL environment mismatch for coverage profile: {profile_id}"
+            )
+        allowed_base_url = str(profile.get("allowed_base_url") or "").strip()
+        if allowed_base_url != spec.allowed_base_url:
+            raise ProvisionError(
+                f"base URL constraint mismatch for coverage profile: {profile_id}"
+            )
         ordered.append(profile)
     return ordered
 
@@ -275,15 +320,62 @@ def _model_for(
         raise ProvisionError(
             f"model environment mismatch for profile: {profile['profile_id']}"
         )
-    model = str(env.get(spec.model_env) or "").strip()
+    raw_model = str(env.get(spec.model_env) or "")
+    if any(
+        unicodedata.category(character).startswith("C")
+        or unicodedata.category(character) in {"Zl", "Zp"}
+        for character in raw_model
+    ):
+        raise ProvisionError(
+            f"model configuration does not match the locked family for profile: "
+            f"{profile['profile_id']}"
+        )
+    model = raw_model.strip()
     if not model:
         raise ProvisionError(f"missing required model configuration: {spec.model_env}")
-    if re.fullmatch(spec.allowed_model_regex, model) is None:
+    if len(model) > 160 or re.fullmatch(spec.allowed_model_regex, model) is None:
         raise ProvisionError(
             f"model configuration does not match the locked family for profile: "
             f"{profile['profile_id']}"
         )
     return model
+
+
+def _provider_base_url_for(
+    profile: Mapping[str, Any], spec: ProfileSpec, env: Mapping[str, str]
+) -> str:
+    """Return the locked request URL for a custom relay, or empty for defaults."""
+    profile_id = str(profile.get("profile_id") or "unknown")
+    if not spec.base_url_env:
+        return ""
+    value = _required_env(env, spec.base_url_env)
+    if value != spec.allowed_base_url:
+        raise ProvisionError(
+            f"provider base URL does not match the locked endpoint for profile: "
+            f"{profile_id}"
+        )
+    parsed = urllib.parse.urlsplit(value)
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ProvisionError(
+            f"provider base URL does not match the locked endpoint for profile: "
+            f"{profile_id}"
+        ) from None
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or port not in (None, 443)
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ProvisionError(
+            f"provider base URL does not match the locked endpoint for profile: "
+            f"{profile_id}"
+        )
+    return spec.allowed_base_url
 
 
 def _reasoning_effort_for(profile: Mapping[str, Any]) -> str:
@@ -391,6 +483,7 @@ def _manifest_entry(
     profile: Mapping[str, Any],
     spec: ProfileSpec,
     model: str,
+    configured_base_url: str,
     reasoning_effort: str,
     session: Session,
     label: str,
@@ -401,6 +494,7 @@ def _manifest_entry(
         "provider": spec.provider,
         "route_family": spec.route_family,
         "configured_model": model,
+        "configured_base_url": configured_base_url,
         "reasoning_effort": reasoning_effort,
         "user_id": session.user_id,
         "api_key": session.api_key,
@@ -482,6 +576,7 @@ def _check_invalid_key(
     session: Session,
     spec: ProfileSpec,
     model: str,
+    provider_base_url: str,
     reasoning_effort: str,
     entry: dict[str, Any],
 ) -> None:
@@ -490,7 +585,7 @@ def _check_invalid_key(
             session,
             spec.provider,
             model,
-            "",
+            provider_base_url,
             INVALID_PROVIDER_KEY,
             reasoning_effort=reasoning_effort,
         )
@@ -522,6 +617,8 @@ def _configure_valid_key(
     session: Session,
     spec: ProfileSpec,
     model: str,
+    provider_base_url: str,
+    expected_configured_base_url: str,
     reasoning_effort: str,
     provider_key: str,
     entry: dict[str, Any],
@@ -531,7 +628,7 @@ def _configure_valid_key(
             session,
             spec.provider,
             model,
-            "",
+            provider_base_url,
             provider_key,
             reasoning_effort=reasoning_effort,
         )
@@ -552,6 +649,7 @@ def _configure_valid_key(
         or not isinstance(configured, Mapping)
         or configured.get("provider") != spec.provider
         or configured.get("model") != model
+        or configured.get("base_url") != expected_configured_base_url
         or configured.get("reasoning_effort") != reasoning_effort
     ):
         raise _ProfileProvisionFailure("VALID_KEY_ROUTE_MISMATCH")
@@ -560,6 +658,7 @@ def _configure_valid_key(
         "status": "configured",
         "provider": configured["provider"],
         "model": configured["model"],
+        "base_url": configured["base_url"],
         "reasoning_effort": configured["reasoning_effort"],
     }
 
@@ -636,6 +735,13 @@ def _complete_diagnostic_manifest(manifest: Mapping[str, Any]) -> bool:
     if ids != list(PROFILE_SPECS):
         return False
     for row in profiles:
+        profile_id = str(row.get("profile_id") or "")
+        spec = PROFILE_SPECS.get(profile_id)
+        if (
+            spec is None
+            or row.get("configured_base_url") != spec.expected_configured_base_url
+        ):
+            return False
         status = row.get("provision_status")
         failure_code = row.get("provision_failure_code")
         if status == PROVISION_STATUS_READY:
@@ -788,6 +894,12 @@ def provision(
         profile_id: _required_env(active_env, spec.credential_env)
         for profile_id, spec in PROFILE_SPECS.items()
     }
+    provider_base_urls = {
+        str(profile["profile_id"]): _provider_base_url_for(
+            profile, PROFILE_SPECS[str(profile["profile_id"])], active_env
+        )
+        for profile in profiles
+    }
     reasoning_efforts = {
         str(profile["profile_id"]): _reasoning_effort_for(profile)
         for profile in profiles
@@ -815,6 +927,8 @@ def provision(
             spec = PROFILE_SPECS[profile_id]
             provider_key = provider_keys[profile_id]
             model = models[profile_id]
+            provider_base_url = provider_base_urls[profile_id]
+            expected_configured_base_url = spec.expected_configured_base_url
             reasoning_effort = reasoning_efforts[profile_id]
             label = f"{SYNTHETIC_LABEL_PREFIX}{run_id}-{profile_id}"
 
@@ -826,7 +940,13 @@ def provision(
                 ) from None
             try:
                 entry = _manifest_entry(
-                    profile, spec, model, reasoning_effort, session, label
+                    profile,
+                    spec,
+                    model,
+                    expected_configured_base_url,
+                    reasoning_effort,
+                    session,
+                    label,
                 )
             except Exception:
                 _reset_one(
@@ -848,7 +968,13 @@ def provision(
                 _check_fresh_account(active_client, session, entry)
                 _atomic_write_manifest(manifest_path, manifest)
                 _check_invalid_key(
-                    active_client, session, spec, model, reasoning_effort, entry
+                    active_client,
+                    session,
+                    spec,
+                    model,
+                    provider_base_url,
+                    reasoning_effort,
+                    entry,
                 )
                 _atomic_write_manifest(manifest_path, manifest)
                 _configure_valid_key(
@@ -856,6 +982,8 @@ def provision(
                     session,
                     spec,
                     model,
+                    provider_base_url,
+                    expected_configured_base_url,
                     reasoning_effort,
                     provider_key,
                     entry,

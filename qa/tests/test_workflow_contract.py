@@ -26,7 +26,7 @@ def test_workflow_is_manual_only_and_uses_protected_ephemeral_runner():
     assert "needs: validate-dispatch" in WORKFLOW
     assert "environment: feedling-e2e-test" in WORKFLOW
     assert "runs-on: [self-hosted, linux, x64, feedling-e2e]" in WORKFLOW
-    assert "timeout-minutes: 180" in WORKFLOW
+    assert "timeout-minutes: 240" in WORKFLOW
     assert "group: feedling-test-environment" in WORKFLOW
     assert "persist-credentials: false" in WORKFLOW
     assert "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5" in WORKFLOW
@@ -39,7 +39,7 @@ def test_workflow_is_manual_only_and_uses_protected_ephemeral_runner():
 def test_codex_preflight_installs_oauth_and_real_top_level_profile_config():
     preflight = _step(
         "Install and verify isolated headless Codex runtime",
-        "Provision six isolated API-key profiles",
+        "Provision eight isolated API-key profiles",
     )
     assert "qa/install_codex_auth.py" in preflight
     assert "qa/write_codex_config.py" in preflight
@@ -71,11 +71,11 @@ def test_codex_preflight_installs_oauth_and_real_top_level_profile_config():
 
 def test_provider_admin_and_oauth_secrets_have_fixed_trust_boundaries():
     provision = _step(
-        "Provision six isolated API-key profiles",
+        "Provision eight isolated API-key profiles",
         "Split credentials into isolated one-profile manifests",
     )
     workers = _step(
-        "Run six independent headless Codex profile agents",
+        "Run eight independent headless Codex profile agents",
         "Verify independent Codex worker lifecycle and canonical inputs",
     )
     supervisor = _step(
@@ -91,6 +91,8 @@ def test_provider_admin_and_oauth_secrets_have_fixed_trust_boundaries():
         "QA_ANTHROPIC_API_KEY",
         "QA_OPENAI_PROVIDER_API_KEY",
         "QA_OPENROUTER_API_KEY",
+        "QA_GEMINI_API_KEY",
+        "QA_KONGBEIQIE_API_KEY",
     ):
         assert f"secrets.{secret_name}" in provision
         assert f"secrets.{secret_name}" in scan
@@ -104,16 +106,24 @@ def test_provider_admin_and_oauth_secrets_have_fixed_trust_boundaries():
     assert "QA_CODEX_AUTH_JSON_B64" not in workers
     assert "QA_CODEX_AUTH_JSON_B64" not in supervisor
     assert "env -i" in supervisor
+    for variable_name in (
+        "QA_GEMINI_MODEL",
+        "QA_KONGBEIQIE_MODEL",
+        "QA_KONGBEIQIE_BASE_URL",
+    ):
+        assert f"vars.{variable_name}" in provision
+        assert variable_name not in workers
+        assert variable_name not in supervisor
 
 
-def test_manifest_isolation_is_probed_for_all_six_profiles():
+def test_manifest_isolation_is_probed_for_all_eight_profiles():
     split = _step(
         "Split credentials into isolated one-profile manifests",
         "Verify every profile manifest permission boundary",
     )
     isolation = _step(
         "Verify every profile manifest permission boundary",
-        "Run six independent headless Codex profile agents",
+        "Run eight independent headless Codex profile agents",
     )
     assert "qa/split_profile_manifests.py" in split
     assert "profiles=(" in isolation
@@ -128,11 +138,23 @@ def test_manifest_isolation_is_probed_for_all_six_profiles():
     assert "QA_AGGREGATION_INPUT_ROOT" in isolation
     assert "QA_ORCHESTRATION_RECEIPT" in isolation
     assert "source-write-must-fail" in isolation
+    for profile_id, agent_type in (
+        ("official-deepseek", "profile_official_deepseek"),
+        ("official-anthropic", "profile_official_anthropic"),
+        ("official-openai", "profile_official_openai"),
+        ("official-gemini", "profile_official_gemini"),
+        ("openrouter-claude", "profile_openrouter_claude"),
+        ("openrouter-openai", "profile_openrouter_openai"),
+        ("openrouter-glm", "profile_openrouter_glm"),
+        ("relay-kongbeiqie", "profile_relay_kongbeiqie"),
+    ):
+        assert f"            {profile_id}\n" in isolation
+        assert f"            {agent_type}\n" in isolation
 
 
 def test_deterministic_launcher_runs_exact_independent_profile_matrix():
     workers = _step(
-        "Run six independent headless Codex profile agents",
+        "Run eight independent headless Codex profile agents",
         "Verify independent Codex worker lifecycle and canonical inputs",
     )
     assert "qa/run_codex_profile_workers.py" in workers
@@ -144,7 +166,7 @@ def test_deterministic_launcher_runs_exact_independent_profile_matrix():
     assert "qa/schemas/codex-run-result.schema.json" in workers
     assert '--receipt "$QA_ORCHESTRATION_RECEIPT"' in workers
     assert "--timeout-seconds 2400" in workers
-    assert "timeout-minutes: 100" in workers
+    assert "timeout-minutes: 140" in workers
     assert "spawn_agent" not in workers
     assert "followup_task" not in workers
     assert "hook" not in workers.lower()
@@ -153,7 +175,7 @@ def test_deterministic_launcher_runs_exact_independent_profile_matrix():
 def test_real_codex_preflight_binds_the_locked_permission_profile():
     preflight = _step(
         "Install and verify isolated headless Codex runtime",
-        "Provision six isolated API-key profiles",
+        "Provision eight isolated API-key profiles",
     )
     assert "-p profile_official_deepseek" in preflight
     assert "-c 'default_permissions=\"feedling-e2e-official-deepseek\"'" in preflight
@@ -192,12 +214,18 @@ def test_aggregator_preserves_semantic_and_cot_evidence_and_writes_privately():
         "QA_ANTHROPIC_API_KEY",
         "QA_OPENAI_PROVIDER_API_KEY",
         "QA_OPENROUTER_API_KEY",
+        "QA_GEMINI_API_KEY",
+        "QA_KONGBEIQIE_API_KEY",
     ):
         assert secret_name not in supervisor
     assert "persona" in supervisor
     assert "reasoning/COT evidence" in supervisor
     assert "trace correlation" in supervisor
-    assert "Copy all six profile objects exactly" in supervisor
+    assert "Copy all eight profile objects exactly" in supervisor
+    assert "three fixed" in supervisor
+    assert "batches (3+3+2)" in supervisor
+    assert "profiles_expected and profiles_completed are both 8" in supervisor
+    assert "must sum to eight" in supervisor
     assert "summary counts" in supervisor
     assert "--strict-config" in supervisor
     assert (
@@ -266,6 +294,8 @@ def test_secret_scan_includes_credentials_oauth_and_persona_privacy_fixture():
         "QA_ANTHROPIC_API_KEY",
         "QA_OPENAI_PROVIDER_API_KEY",
         "QA_OPENROUTER_API_KEY",
+        "QA_GEMINI_API_KEY",
+        "QA_KONGBEIQIE_API_KEY",
         "QA_CODEX_AUTH_JSON_B64",
     ):
         assert f"secrets.{secret_name}" in scan

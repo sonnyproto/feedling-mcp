@@ -48,20 +48,20 @@
       "$ref": "#/$defs/status"
     },
     "profiles_expected": {
-      "const": 6
+      "const": 8
     },
     "profiles_completed": {
       "type": "integer",
       "minimum": 0,
-      "maximum": 6
+      "maximum": 8
     },
     "orchestration": {
       "$ref": "#/$defs/orchestration"
     },
     "profiles": {
       "type": "array",
-      "minItems": 6,
-      "maxItems": 6,
+      "minItems": 8,
+      "maxItems": 8,
       "items": {
         "$ref": "#/$defs/profileResult"
       }
@@ -99,6 +99,22 @@
       "oneOf": [
         {
           "$ref": "#/$defs/safeLabel"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "modelLabel": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[^\\u0000-\\u001F\\u007F-\\u009F\\u200B-\\u200F\\u2028-\\u202E\\u2060-\\u206F\\uFEFF|`]+$"
+    },
+    "nullableModelLabel": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/modelLabel"
         },
         {
           "type": "null"
@@ -205,8 +221,8 @@
         },
         "profile_worker_assignments": {
           "type": "array",
-          "minItems": 6,
-          "maxItems": 6,
+          "minItems": 8,
+          "maxItems": 8,
           "items": {
             "$ref": "#/$defs/profileWorkerAssignment"
           }
@@ -227,9 +243,11 @@
             "official-deepseek",
             "official-anthropic",
             "official-openai",
+            "official-gemini",
             "openrouter-claude",
             "openrouter-openai",
-            "openrouter-glm"
+            "openrouter-glm",
+            "relay-kongbeiqie"
           ]
         },
         "worker_id": {
@@ -267,16 +285,19 @@
             "official-deepseek",
             "official-anthropic",
             "official-openai",
+            "official-gemini",
             "openrouter-claude",
             "openrouter-openai",
-            "openrouter-glm"
+            "openrouter-glm",
+            "relay-kongbeiqie"
           ]
         },
         "route_family": {
           "type": "string",
           "enum": [
             "official",
-            "openrouter"
+            "openrouter",
+            "relay"
           ]
         },
         "model_family": {
@@ -285,6 +306,7 @@
             "deepseek",
             "claude",
             "openai",
+            "gemini",
             "glm"
           ]
         },
@@ -294,11 +316,13 @@
             "deepseek",
             "anthropic",
             "openai",
-            "openrouter"
+            "gemini",
+            "openrouter",
+            "openai_compatible"
           ]
         },
         "model": {
-          "$ref": "#/$defs/safeLabel"
+          "$ref": "#/$defs/modelLabel"
         },
         "reasoning_effort": {
           "const": "medium"
@@ -769,7 +793,7 @@
           "$ref": "#/$defs/nullableSafeLabel"
         },
         "model": {
-          "$ref": "#/$defs/nullableSafeLabel"
+          "$ref": "#/$defs/nullableModelLabel"
         },
         "reasoning_token_count": {
           "type": [
@@ -1096,37 +1120,37 @@
         "pass": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 6
+          "maximum": 8
         },
         "product_fail": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 6
+          "maximum": 8
         },
         "blocked_credential": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 6
+          "maximum": 8
         },
         "blocked_evidence": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 6
+          "maximum": 8
         },
         "blocked_deployment": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 6
+          "maximum": 8
         },
         "agent_error": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 6
+          "maximum": 8
         },
         "security_fail": {
           "type": "integer",
           "minimum": 0,
-          "maximum": 6
+          "maximum": 8
         }
       }
     },

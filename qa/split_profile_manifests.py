@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Split the private provisioning manifest into six isolated one-row files."""
+"""Split the private provisioning manifest into eight isolated one-row files."""
 
 from __future__ import annotations
 
@@ -138,7 +138,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    print("six isolated profile manifests created")
+    print("eight isolated profile manifests created")
     return 0
 
 

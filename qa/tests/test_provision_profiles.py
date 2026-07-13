@@ -17,9 +17,11 @@ VALID_MODELS = {
     "official-deepseek": "deepseek-v4-flash",
     "official-anthropic": "claude-sonnet-4-5",
     "official-openai": "gpt-5.4",
+    "official-gemini": "gemini-2.5-flash",
     "openrouter-claude": "anthropic/claude-sonnet-4.5",
     "openrouter-openai": "openai/gpt-4.1-mini",
     "openrouter-glm": "z-ai/glm-4.5-air:free",
+    "relay-kongbeiqie": "[特价纯血]claude-opus-4-6",
 }
 
 
@@ -32,6 +34,14 @@ PROFILE_ROWS = [
         "credential_slot": spec.credential_env,
         "model_env": spec.model_env,
         "allowed_model_regex": spec.allowed_model_regex,
+        **(
+            {
+                "base_url_env": spec.base_url_env,
+                "allowed_base_url": spec.allowed_base_url,
+            }
+            if spec.base_url_env
+            else {}
+        ),
         "reasoning_expected": True,
         "reasoning_effort": provisioner.EXPECTED_REASONING_EFFORT,
     }
@@ -52,7 +62,10 @@ def _env() -> dict[str, str]:
         "QA_DEEPSEEK_API_KEY": "deepseek-sensitive-value",
         "QA_ANTHROPIC_API_KEY": "anthropic-sensitive-value",
         "QA_OPENAI_PROVIDER_API_KEY": "openai-sensitive-value",
+        "QA_GEMINI_API_KEY": "gemini-sensitive-value",
         "QA_OPENROUTER_API_KEY": "openrouter-sensitive-value",
+        "QA_KONGBEIQIE_API_KEY": "kongbeiqie-sensitive-value",
+        "QA_KONGBEIQIE_BASE_URL": provisioner.ALLOWED_KONGBEIQIE_BASE_URL,
         "QA_RUN_ID": "unit/42",
     }
     for profile_id, spec in provisioner.PROFILE_SPECS.items():
@@ -63,7 +76,7 @@ def _env() -> dict[str, str]:
 class FakeSmokeClient:
     def __init__(self):
         self.registered: list[tuple[str, Session]] = []
-        self.setup_calls: list[tuple[str, str, str, str | None]] = []
+        self.setup_calls: list[tuple[str, str, str, str, str, str | None]] = []
         self.trace_calls: list[str] = []
         self.reset_calls: list[tuple[str, dict]] = []
         self.accept_invalid = False
@@ -94,21 +107,36 @@ class FakeSmokeClient:
     def setup(
         self, session, provider, model, base_url, api_key, *, reasoning_effort=None
     ):
-        self.setup_calls.append((session.user_id, provider, api_key, reasoning_effort))
-        assert base_url == ""
+        self.setup_calls.append(
+            (session.user_id, provider, model, base_url, api_key, reasoning_effort)
+        )
         if self.fail_valid_for == session.user_id:
             raise SmokeError("setup", f"provider echoed secret={api_key}")
         return {
             "provider": provider,
             "model": model,
+            "base_url": self._configured_base_url(provider, base_url),
             "reasoning_effort": reasoning_effort,
         }
+
+    @staticmethod
+    def _configured_base_url(provider: str, requested_base_url: str) -> str:
+        if requested_base_url:
+            return requested_base_url.rstrip("/")
+        return {
+            "deepseek": "https://api.deepseek.com",
+            "anthropic": "https://api.anthropic.com/v1",
+            "openai": "https://api.openai.com/v1",
+            "gemini": "https://generativelanguage.googleapis.com/v1beta",
+            "openrouter": "https://openrouter.ai/api/v1",
+        }[provider]
 
     def setup_raw(
         self, session, provider, model, base_url, api_key, *, reasoning_effort=None
     ):
-        self.setup_calls.append((session.user_id, provider, api_key, reasoning_effort))
-        assert base_url == ""
+        self.setup_calls.append(
+            (session.user_id, provider, model, base_url, api_key, reasoning_effort)
+        )
         if api_key != provisioner.INVALID_PROVIDER_KEY:
             if self.fail_valid_for == session.user_id:
                 raise SmokeError("setup", f"provider echoed secret={api_key}")
@@ -121,6 +149,7 @@ class FakeSmokeClient:
             config = {
                 "provider": provider,
                 "model": model,
+                "base_url": self._configured_base_url(provider, base_url),
                 "reasoning_effort": reasoning_effort,
             }
             if self.echo_valid_secret:
@@ -209,17 +238,27 @@ def test_provision_creates_all_profiles_without_persisting_provider_secrets(tmp_
         coverage, manifest_path, env=env, client=smoke, admin_client=admin
     )
 
-    assert len(result["profiles"]) == len(provisioner.PROFILE_SPECS) == 6
-    assert len(smoke.registered) == 6
-    assert len(smoke.setup_calls) == 12
-    assert len(smoke.trace_calls) == 6
-    assert len(admin.calls) == 13
+    assert len(result["profiles"]) == len(provisioner.PROFILE_SPECS) == 8
+    assert len(smoke.registered) == 8
+    assert len(smoke.setup_calls) == 16
+    assert len(smoke.trace_calls) == 8
+    assert len(admin.calls) == 17
     assert admin.calls[0] == ("GET", provisioner.SYNTHETIC_REAPER_PATH, None)
     for index in range(0, len(smoke.setup_calls), 2):
-        assert smoke.setup_calls[index][2] == provisioner.INVALID_PROVIDER_KEY
-        assert smoke.setup_calls[index + 1][2] != provisioner.INVALID_PROVIDER_KEY
-        assert smoke.setup_calls[index][3] == provisioner.EXPECTED_REASONING_EFFORT
-        assert smoke.setup_calls[index + 1][3] == provisioner.EXPECTED_REASONING_EFFORT
+        assert smoke.setup_calls[index][4] == provisioner.INVALID_PROVIDER_KEY
+        assert smoke.setup_calls[index + 1][4] != provisioner.INVALID_PROVIDER_KEY
+        assert smoke.setup_calls[index][5] == provisioner.EXPECTED_REASONING_EFFORT
+        assert smoke.setup_calls[index + 1][5] == provisioner.EXPECTED_REASONING_EFFORT
+    for call in smoke.setup_calls:
+        profile_id = next(
+            row["profile_id"] for row in result["profiles"] if row["user_id"] == call[0]
+        )
+        expected_request_base_url = (
+            provisioner.ALLOWED_KONGBEIQIE_BASE_URL
+            if profile_id == "relay-kongbeiqie"
+            else ""
+        )
+        assert call[3] == expected_request_base_url
     assert all(row["invalid_key_rejected"] for row in result["profiles"])
     assert all(row["valid_key_configured"] for row in result["profiles"])
     assert all(row["registration_verified"] for row in result["profiles"])
@@ -251,7 +290,9 @@ def test_provision_creates_all_profiles_without_persisting_provider_secrets(tmp_
         provisioner.PROFILE_SPECS
     )
     for profile in persisted["profiles"]:
+        spec = provisioner.PROFILE_SPECS[profile["profile_id"]]
         assert profile["configured_model"] == VALID_MODELS[profile["profile_id"]]
+        assert profile["configured_base_url"] == spec.expected_configured_base_url
         assert profile["invalid_key_receipt"] == {
             "http_status": 400,
             "error": "provider_test_failed",
@@ -261,8 +302,39 @@ def test_provision_creates_all_profiles_without_persisting_provider_secrets(tmp_
             "status": "configured",
             "provider": profile["provider"],
             "model": profile["configured_model"],
+            "base_url": spec.expected_configured_base_url,
             "reasoning_effort": provisioner.EXPECTED_REASONING_EFFORT,
         }
+
+
+def test_invalid_and_valid_setup_calls_use_profile_locked_base_urls(tmp_path):
+    smoke = FakeSmokeClient()
+    result = provisioner.provision(
+        _write_coverage(tmp_path),
+        tmp_path / "manifest.json",
+        env=_env(),
+        client=smoke,
+        admin_client=FakeAdminClient(),
+    )
+    profile_by_user = {row["user_id"]: row for row in result["profiles"]}
+
+    for index in range(0, len(smoke.setup_calls), 2):
+        invalid_call = smoke.setup_calls[index]
+        valid_call = smoke.setup_calls[index + 1]
+        assert invalid_call[0] == valid_call[0]
+        profile = profile_by_user[invalid_call[0]]
+        expected_request_base_url = (
+            provisioner.ALLOWED_KONGBEIQIE_BASE_URL
+            if profile["profile_id"] == "relay-kongbeiqie"
+            else ""
+        )
+        assert invalid_call[3] == expected_request_base_url
+        assert valid_call[3] == expected_request_base_url
+        assert profile["configured_base_url"] == (
+            provisioner.PROFILE_SPECS[
+                profile["profile_id"]
+            ].expected_configured_base_url
+        )
 
 
 @pytest.mark.parametrize(
@@ -378,6 +450,60 @@ def test_all_static_credentials_are_validated_before_reaper_or_registration(tmp_
     assert admin.calls == []
 
 
+def test_missing_relay_base_url_fails_before_external_state(tmp_path):
+    env = _env()
+    del env["QA_KONGBEIQIE_BASE_URL"]
+    smoke = FakeSmokeClient()
+    admin = FakeAdminClient()
+
+    with pytest.raises(
+        provisioner.ProvisionError,
+        match="missing required environment variable: QA_KONGBEIQIE_BASE_URL",
+    ):
+        provisioner.provision(
+            _write_coverage(tmp_path),
+            tmp_path / "manifest.json",
+            env=env,
+            client=smoke,
+            admin_client=admin,
+        )
+
+    assert smoke.registered == []
+    assert admin.calls == []
+
+
+@pytest.mark.parametrize(
+    "unapproved_url",
+    [
+        "http://xn--vduyey89e.com/v1",
+        "https://relay.example/v1",
+        f"{provisioner.ALLOWED_KONGBEIQIE_BASE_URL}/",
+        "https://user@xn--vduyey89e.com/v1",
+        "https://xn--vduyey89e.com/v1?forward=https://attacker.example",
+    ],
+)
+def test_unapproved_relay_base_url_is_rejected_without_echo_or_external_state(
+    tmp_path, unapproved_url
+):
+    env = _env()
+    env["QA_KONGBEIQIE_BASE_URL"] = unapproved_url
+    smoke = FakeSmokeClient()
+    admin = FakeAdminClient()
+
+    with pytest.raises(provisioner.ProvisionError, match="locked endpoint") as caught:
+        provisioner.provision(
+            _write_coverage(tmp_path),
+            tmp_path / "manifest.json",
+            env=env,
+            client=smoke,
+            admin_client=admin,
+        )
+
+    assert unapproved_url not in str(caught.value)
+    assert smoke.registered == []
+    assert admin.calls == []
+
+
 def test_repository_coverage_lock_matches_provisioner_contract():
     coverage = Path(__file__).resolve().parents[1] / "coverage-lock.json"
     profiles = provisioner._load_coverage(coverage)
@@ -389,6 +515,22 @@ def test_repository_coverage_lock_matches_provisioner_contract():
         assert profile["model_family"] == spec.model_family
         assert profile["model_env"] == spec.model_env
         assert profile["allowed_model_regex"] == spec.allowed_model_regex
+        assert str(profile.get("base_url_env") or "") == spec.base_url_env
+        assert str(profile.get("allowed_base_url") or "") == spec.allowed_base_url
+
+
+@pytest.mark.parametrize("field", ["base_url_env", "allowed_base_url"])
+def test_coverage_cannot_redirect_relay_key(tmp_path, field):
+    rows = [dict(row) for row in PROFILE_ROWS]
+    relay = next(row for row in rows if row["profile_id"] == "relay-kongbeiqie")
+    relay[field] = (
+        "QA_ATTACKER_URL" if field == "base_url_env" else "https://attacker.example/v1"
+    )
+
+    with pytest.raises(provisioner.ProvisionError, match="base URL") as caught:
+        provisioner._load_coverage(_write_coverage(tmp_path, rows))
+
+    assert "attacker.example" not in str(caught.value)
 
 
 @pytest.mark.parametrize("profile_id", list(provisioner.PROFILE_SPECS))
@@ -427,12 +569,16 @@ def test_coverage_model_route_fields_are_hard_locked(tmp_path, field, value, err
         ("official-openai", "gpt-5.4"),
         ("official-openai", "o1"),
         ("official-openai", "o3-mini"),
+        ("official-gemini", "gemini-2.5-flash"),
+        ("official-gemini", "gemini-2.5-pro"),
         ("openrouter-claude", "anthropic/claude-sonnet-4.5"),
         ("openrouter-openai", "openai/gpt-4.1-mini"),
         ("openrouter-openai", "openai/o3-mini"),
         ("openrouter-openai", "openai/o-series-preview"),
         ("openrouter-glm", "z-ai/glm-4.5-air:free"),
         ("openrouter-glm", "thudm/glm-4-32b"),
+        ("relay-kongbeiqie", "claude-sonnet-4-6"),
+        ("relay-kongbeiqie", "[特价纯血]claude-opus-4-6"),
     ],
 )
 def test_locked_model_families_accept_realistic_ids(profile_id, model):
@@ -448,12 +594,38 @@ def test_locked_model_families_accept_realistic_ids(profile_id, model):
         ("official-deepseek", "claude-sonnet-4-5"),
         ("official-anthropic", "deepseek-chat"),
         ("official-openai", "anthropic/claude-sonnet-4.5"),
+        ("official-gemini", "gemini-2.0-flash"),
+        ("official-gemini", "gemini-3.0-pro"),
         ("openrouter-claude", "openai/gpt-4.1-mini"),
         ("openrouter-openai", "z-ai/glm-4.5-air:free"),
         ("openrouter-glm", "anthropic/claude-sonnet-4.5"),
+        ("relay-kongbeiqie", "openai/gpt-5.4"),
+        ("relay-kongbeiqie", "[too-long-label-123456789012345678]claude-opus-4-6"),
     ],
 )
 def test_wrong_model_family_is_rejected_with_sanitized_error(profile_id, bad_model):
+    spec = provisioner.PROFILE_SPECS[profile_id]
+    profile = next(row for row in PROFILE_ROWS if row["profile_id"] == profile_id)
+
+    with pytest.raises(provisioner.ProvisionError, match="locked family") as caught:
+        provisioner._model_for(profile, spec, {spec.model_env: bad_model})
+
+    assert bad_model not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "bad_model",
+    [
+        "[line\nbreak]claude-opus-4-6",
+        "[tab\tlabel]claude-opus-4-6",
+        "[bidi\u202elabel]claude-opus-4-6",
+        "[line\u2028break]claude-opus-4-6",
+        "[pipe|label]claude-opus-4-6",
+        "[back`tick]claude-opus-4-6",
+    ],
+)
+def test_relay_model_rejects_controls_and_newlines_without_echo(bad_model):
+    profile_id = "relay-kongbeiqie"
     spec = provisioner.PROFILE_SPECS[profile_id]
     profile = next(row for row in PROFILE_ROWS if row["profile_id"] == profile_id)
 
@@ -543,7 +715,7 @@ def test_invalid_key_acceptance_blocks_profiles_without_collapsing_matrix(tmp_pa
         admin_client=FakeAdminClient(),
     )
 
-    assert len(smoke.registered) == 6
+    assert len(smoke.registered) == 8
     assert [row["profile_id"] for row in result["profiles"]] == list(
         provisioner.PROFILE_SPECS
     )
@@ -612,7 +784,7 @@ def test_expired_first_provider_key_does_not_abort_remaining_profiles(tmp_path):
 
     rows = result["profiles"]
     assert [row["profile_id"] for row in rows] == list(provisioner.PROFILE_SPECS)
-    assert len(smoke.registered) == 6
+    assert len(smoke.registered) == 8
     assert rows[0]["provision_status"] == provisioner.PROVISION_STATUS_BLOCKED
     assert rows[0]["provision_failure_code"] == "VALID_KEY_REJECTED"
     assert rows[0]["api_key"] == "feedling-account-key-0"
@@ -939,8 +1111,8 @@ def test_provision_cli_succeeds_for_complete_matrix_with_blocked_profile(
     assert captured.err == ""
     assert output == {
         "ok": True,
-        "profile_count": 6,
-        "ready_profile_count": 5,
+        "profile_count": 8,
+        "ready_profile_count": 7,
         "blocked_profile_count": 1,
         "blocked_profile_ids": ["official-deepseek"],
         "manifest": str(manifest),

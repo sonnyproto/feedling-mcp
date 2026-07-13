@@ -32,11 +32,11 @@ jobs:
           fi
 
   qualify-api-key-runtime-v2:
-    name: qualify six API-key profiles
+    name: qualify eight API-key profiles
     needs: validate-dispatch
     environment: feedling-e2e-test
     runs-on: [self-hosted, linux, x64, feedling-e2e]
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Check out exact workflow revision
@@ -101,9 +101,11 @@ jobs:
             profile_official_deepseek \
             profile_official_anthropic \
             profile_official_openai \
+            profile_official_gemini \
             profile_openrouter_claude \
             profile_openrouter_openai \
-            profile_openrouter_glm
+            profile_openrouter_glm \
+            profile_relay_kongbeiqie
           do
             mkdir -m 700 "${worker_root}/${agent_type}"
             mkdir -m 700 \
@@ -379,7 +381,7 @@ jobs:
 
       # This is the only setup step that receives provider credentials. No
       # provider or admin credential is ever passed to a Codex process.
-      - name: Provision six isolated API-key profiles
+      - name: Provision eight isolated API-key profiles
         id: provision
         env:
           QA_FEEDLING_BASE_URL: https://test-api.feedling.app
@@ -389,12 +391,17 @@ jobs:
           QA_ANTHROPIC_API_KEY: ${{ secrets.QA_ANTHROPIC_API_KEY }}
           QA_OPENAI_PROVIDER_API_KEY: ${{ secrets.QA_OPENAI_PROVIDER_API_KEY }}
           QA_OPENROUTER_API_KEY: ${{ secrets.QA_OPENROUTER_API_KEY }}
+          QA_GEMINI_API_KEY: ${{ secrets.QA_GEMINI_API_KEY }}
+          QA_KONGBEIQIE_API_KEY: ${{ secrets.QA_KONGBEIQIE_API_KEY }}
           QA_DEEPSEEK_MODEL: ${{ vars.QA_DEEPSEEK_MODEL }}
           QA_ANTHROPIC_MODEL: ${{ vars.QA_ANTHROPIC_MODEL }}
           QA_OPENAI_MODEL: ${{ vars.QA_OPENAI_MODEL }}
+          QA_GEMINI_MODEL: ${{ vars.QA_GEMINI_MODEL }}
           QA_OPENROUTER_CLAUDE_MODEL: ${{ vars.QA_OPENROUTER_CLAUDE_MODEL }}
           QA_OPENROUTER_OPENAI_MODEL: ${{ vars.QA_OPENROUTER_OPENAI_MODEL }}
           QA_OPENROUTER_GLM_MODEL: ${{ vars.QA_OPENROUTER_GLM_MODEL }}
+          QA_KONGBEIQIE_MODEL: ${{ vars.QA_KONGBEIQIE_MODEL }}
+          QA_KONGBEIQIE_BASE_URL: ${{ vars.QA_KONGBEIQIE_BASE_URL }}
         run: |
           set -euo pipefail
           umask 077
@@ -432,17 +439,21 @@ jobs:
             official-deepseek
             official-anthropic
             official-openai
+            official-gemini
             openrouter-claude
             openrouter-openai
             openrouter-glm
+            relay-kongbeiqie
           )
           agent_types=(
             profile_official_deepseek
             profile_official_anthropic
             profile_official_openai
+            profile_official_gemini
             profile_openrouter_claude
             profile_openrouter_openai
             profile_openrouter_glm
+            profile_relay_kongbeiqie
           )
           for index in "${!profiles[@]}"; do
             profile_id="${profiles[$index]}"
@@ -509,10 +520,10 @@ jobs:
                 "${denied_paths[@]}"
           done
 
-      - name: Run six independent headless Codex profile agents
+      - name: Run eight independent headless Codex profile agents
         id: profile_workers
         if: steps.manifest_isolation.outcome == 'success'
-        timeout-minutes: 100
+        timeout-minutes: 140
         env:
           QA_CODEX_HOME: ${{ steps.context.outputs.codex_home }}
           QA_ARTIFACT_DIR: ${{ steps.context.outputs.artifact_dir }}
@@ -594,14 +605,15 @@ jobs:
           Read and obey ${GITHUB_WORKSPACE}/qa/SOP.md,
           ${GITHUB_WORKSPACE}/qa/coverage-lock.json, and
           ${GITHUB_WORKSPACE}/qa/scenarios/api-key-journey.md. Trusted code has
-          already run exactly six independent profile agents with a concurrency
-          cap of three. Read only the six schema-validated profile JSON files in
+          already run exactly eight independent profile agents in three fixed
+          batches (3+3+2), with a concurrency cap of three. Read only the eight
+          schema-validated profile JSON files in
           ${QA_AGGREGATION_INPUT_ROOT} and the trusted lifecycle receipt at
           ${QA_ORCHESTRATION_RECEIPT}. Never read raw worker events/stderr,
           provisioning manifests, credentials, or public artifacts; never run
           another product probe or launch another agent.
 
-          Copy all six profile objects exactly, in locked matrix order. Do not
+          Copy all eight profile objects exactly, in locked matrix order. Do not
           weaken or rewrite any failed assertion, retry observation, persona
           finalizer receipt or qualification-agent semantic judgment,
           reasoning/COT evidence, trace correlation, per-turn five-stage latency,
@@ -614,8 +626,8 @@ jobs:
 
           Set supervisor_count=1, configured concurrency=3, observed concurrency
           and each profile/worker assignment exactly from the trusted receipt.
-          profiles_expected and profiles_completed are both 6. Compute the seven
-          summary counts from the exact profile statuses; they must sum to six.
+          profiles_expected and profiles_completed are both 8. Compute the seven
+          summary counts from the exact profile statuses; they must sum to eight.
           Compute overall_status from those statuses without turning a blocked
           or failed profile into PASS. Use the earliest scenario start and latest
           scenario finish as run timestamps. Use only the schema-fixed artifact
@@ -703,6 +715,8 @@ jobs:
           QA_ANTHROPIC_API_KEY: ${{ secrets.QA_ANTHROPIC_API_KEY }}
           QA_OPENAI_PROVIDER_API_KEY: ${{ secrets.QA_OPENAI_PROVIDER_API_KEY }}
           QA_OPENROUTER_API_KEY: ${{ secrets.QA_OPENROUTER_API_KEY }}
+          QA_GEMINI_API_KEY: ${{ secrets.QA_GEMINI_API_KEY }}
+          QA_KONGBEIQIE_API_KEY: ${{ secrets.QA_KONGBEIQIE_API_KEY }}
           QA_CODEX_AUTH_JSON_B64: ${{ secrets.QA_CODEX_AUTH_JSON_B64 }}
         run: |
           set -euo pipefail
