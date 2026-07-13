@@ -51,7 +51,12 @@ def _sub_envelope(doc: dict, prefix: str) -> dict | None:
 
 
 def _decrypt_body(decrypt, env: dict, purpose: str) -> str:
-    return decrypt(_envelope_subset(env), purpose=purpose).decode("utf-8", "replace")
+    text = decrypt(_envelope_subset(env), purpose=purpose).decode("utf-8", "replace")
+    # PostgreSQL text/JSONB 禁止存 NUL(0x00):存 text 报「cannot contain NUL」，
+    # 存 JSONB(Jsonb 序列化成 )报「unsupported Unicode escape sequence」。
+    # NUL 在聊天/记忆正文里没有语义(decode 的 "replace" 只管非法 UTF-8，而 NUL 是
+    # 合法 UTF-8 会残留)，直接剥掉，其余字符原样保留。
+    return text.replace("\x00", "")
 
 
 def plaintext_chat_doc(doc: dict, decrypt) -> dict:

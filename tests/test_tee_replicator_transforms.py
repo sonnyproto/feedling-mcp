@@ -90,3 +90,18 @@ def test_memory_and_world_book_single_envelope():
     out2 = transforms.plaintext_world_book_doc(wb, _decrypt_stub)
     assert out2["body"] == "PT:FFF"
     _assert_no_crypto_leak(out2)
+
+
+def test_decrypted_body_strips_nul_bytes():
+    # Decrypted plaintext with a NUL (0x00) — PostgreSQL text/JSONB can't store it.
+    # The transform must strip NUL so the row is persistable; other chars survive.
+    def decrypt_with_nul(envelope, purpose):
+        return "hello\x00world\x00".encode()
+
+    doc = {"id": "m1", "role": "user", "ts": 1.0, "source": "chat",
+           "content_type": "text", "visibility": "shared", "owner_user_id": "u",
+           "v": 1, "body_ct": "x", "nonce": "n", "K_user": "k", "K_enclave": "ke",
+           "enclave_pk_fpr": "f"}
+    out = transforms.plaintext_chat_doc(doc, decrypt_with_nul)
+    assert out["body"] == "helloworld"
+    assert "\x00" not in out["body"]
