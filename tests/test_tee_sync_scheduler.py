@@ -35,28 +35,48 @@ def test_replicate_tick_hits_every_ciphertext_table(calls):
     assert not any(c[0] in ("reconcile", "verify") for c in calls)
 
 
-def test_reconcile_tick_adds_reconcile_then_verify(calls):
+def test_reconcile_runs_before_replicate_then_verify(calls):
+    # Order is load-bearing: reconcile backfills the plaintext `users` parent
+    # BEFORE any ciphertext child replicate, or the children FK-fail.
     sched._sync_tick(do_reconcile=True)
     actions = [c[0] for c in calls]
-    assert actions == ["replicate"] * 5 + ["reconcile", "verify"]
-    # reconcile carries confirm=MIGRATE; verify is read-only (no confirm needed)
+    assert actions == ["reconcile"] + ["replicate"] * 5 + ["verify"]
     reconcile = next(c for c in calls if c[0] == "reconcile")
     verify = next(c for c in calls if c[0] == "verify")
     assert reconcile[3] == "MIGRATE"
     assert verify[2] is False  # dry_run=False, verify is confirm-exempt
 
 
-def test_already_running_aborts_the_whole_tick(monkeypatch):
+def test_reconcile_failure_does_not_block_replicate(monkeypatch):
+    # A reconcile error must be swallowed and replicate still attempted (the
+    # loop degrades, never dies).
+    calls = []
+
+    def fake(*, action, table=None, dry_run=True, confirm=None, **kw):
+        calls.append(action)
+        if action == "reconcile":
+            raise RuntimeError("reconcile boom")
+        return {"ok": True}
+
+    monkeypatch.setattr(tr, "run_action", fake)
+    sched._sync_tick(do_reconcile=True)
+    assert calls[0] == "reconcile"
+    assert calls.count("replicate") == 5
+
+
+def test_already_running_aborts_replicate_phase(monkeypatch):
     calls = []
 
     def fake(*, action, table=None, **kw):
         calls.append((action, table))
+        if action == "reconcile":
+            return {"tables": []}
         raise tr.AlreadyRunning()
 
     monkeypatch.setattr(tr, "run_action", fake)
     sched._sync_tick(do_reconcile=True)
-    # first replicate raises AlreadyRunning → return immediately, no further calls
-    assert calls == [("replicate", "chat_messages")]
+    # reconcile ran; first replicate raises AlreadyRunning → return before the rest
+    assert calls == [("reconcile", None), ("replicate", "chat_messages")]
 
 
 def test_unconfigured_aborts_silently(monkeypatch):
@@ -64,11 +84,13 @@ def test_unconfigured_aborts_silently(monkeypatch):
 
     def fake(*, action, table=None, **kw):
         calls.append(action)
+        if action == "reconcile":
+            return {"tables": []}
         raise tr.Unconfigured()
 
     monkeypatch.setattr(tr, "run_action", fake)
     sched._sync_tick(do_reconcile=True)
-    assert calls == ["replicate"]  # stopped on first Unconfigured
+    assert calls == ["reconcile", "replicate"]  # stopped on first replicate Unconfigured
 
 
 def test_one_table_error_does_not_stop_the_pass(monkeypatch):

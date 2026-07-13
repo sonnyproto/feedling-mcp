@@ -38,6 +38,9 @@ _CIPHERTEXT_TABLES = (
     "frame_envelopes",
 )
 
+# 首个 tick 的启动延迟（秒）：短于常规间隔，让父表回填尽快发生（见 _loop）。
+_FIRST_DELAY = 30.0
+
 
 def _interval() -> float:
     try:
@@ -56,9 +59,30 @@ def _reconcile_interval() -> float:
 def _sync_tick(*, do_reconcile: bool) -> None:
     """一轮同步。复用 ``tee_replication.run_action``（校验 + 单-run 锁 + confirm 门）。
     ``AlreadyRunning`` = 有手动 run 持锁 → 本 tick 跳过；``Unconfigured`` = TEE 未接 →
-    跳过；其余单表错误只 log、继续下一张表。"""
+    跳过；其余单表错误只 log、继续下一张表。
+
+    顺序铁律：**reconcile 必须在 replicate 之前**。密文子表（chat/memory/identity/
+    world_book/frames）都有指向 ``users`` 的外键；父表没先回填，子表 replicate 会
+    ``violates foreign key`` 全灭。所以先 reconcile 灌明文父表（users 等），再 replicate
+    密文子表。（reconcile 走 direct-TLS 网关批量拷贝，大表可能数分钟，但本循环在专用
+    后台线程、不碰请求路径。）"""
     from admin import tee_replication as tr
 
+    # (1) reconcile 明文表在前 —— 回填/修复父表，子表才有 FK 父行。
+    if do_reconcile:
+        try:
+            rep = tr.run_action(action="reconcile", dry_run=False, confirm="MIGRATE")
+            tbls = rep.get("tables") or []
+            copied = sum(t.get("copied", 0) for t in tbls if isinstance(t, dict))
+            unconv = [t.get("table") for t in tbls
+                      if isinstance(t, dict) and t.get("rds_rows") != t.get("tee_rows")]
+            log.info("[tee-sync] reconcile done: copied=%s unconverged=%s", copied, unconv or "none")
+        except (tr.AlreadyRunning, tr.Unconfigured):
+            return
+        except Exception as e:  # noqa: BLE001
+            log.warning("[tee-sync] reconcile 失败: %s", e)
+
+    # (2) replicate 密文子表在后 —— 父表已在，不再 FK 失败。
     for table in _CIPHERTEXT_TABLES:
         try:
             rep = tr.run_action(action="replicate", table=table, dry_run=False, confirm="MIGRATE")
@@ -73,27 +97,25 @@ def _sync_tick(*, do_reconcile: bool) -> None:
         except Exception as e:  # noqa: BLE001
             log.warning("[tee-sync] replicate %s 失败: %s", table, e)
 
-    if not do_reconcile:
-        return
-    try:
-        tr.run_action(action="reconcile", dry_run=False, confirm="MIGRATE")
-    except (tr.AlreadyRunning, tr.Unconfigured):
-        return
-    except Exception as e:  # noqa: BLE001
-        log.warning("[tee-sync] reconcile 失败: %s", e)
-    try:
-        rep = tr.run_action(action="verify", dry_run=False)
-        log.info("[tee-sync] verify ok=%s", rep.get("ok"))
-    except Exception as e:  # noqa: BLE001
-        log.warning("[tee-sync] verify 失败: %s", e)
+    # (3) verify 观测（只读）。
+    if do_reconcile:
+        try:
+            rep = tr.run_action(action="verify", dry_run=False)
+            log.info("[tee-sync] verify ok=%s", rep.get("ok"))
+        except Exception as e:  # noqa: BLE001
+            log.warning("[tee-sync] verify 失败: %s", e)
 
 
 def _loop() -> None:
     # monotonic()，起点非 0 → 首个 tick 的 (now - 0) 必然 >= 间隔 → 首轮就 reconcile
-    # （初始回填明文表 + 游标从头搬密文）。
+    # （初始回填明文父表 + 游标从头搬密文）。
     last_reconcile = 0.0
+    first = True
     while True:
-        time.sleep(_interval())
+        # 首个 tick 只等一小会儿就跑 —— 尽快把明文父表回填上，缩短「父表未回填 →
+        # 子表双写 FK 失败」的启动窗口；之后按整间隔。
+        time.sleep(_FIRST_DELAY if first else _interval())
+        first = False
         if not mirror.enabled():
             continue
         now = time.monotonic()
