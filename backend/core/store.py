@@ -738,38 +738,36 @@ class UserStore:
             db.set_blob(self.user_id, "proactive_settings", cur)
         return cur
 
-    def claim_introduction(self, *, at_iso: str | None = None) -> bool:
-        """Atomic one-shot claim on the SAME durable ``introduced_at`` marker as
-        ``mark_introduced`` (no parallel field). Returns True iff THIS caller set
-        the marker (won the claim), False if it was already set. Paired with
-        ``unclaim_introduction`` so a failed follow-up job append can roll the
-        marker back — the two together give enqueue-once without ever leaving an
-        "introduced" marker with no job (agent_runtime.introduction.enqueue_introduction_once).
+    def claim_and_enqueue_introduction(self, job: dict) -> dict | None:
+        """Cross-process exactly-once enqueue of the one-shot introduction.
 
-        Serialized by the per-process ``proactive_lock`` (same guarantee as
-        ``mark_introduced``). A strict cross-worker atomic would need the marker
-        and the proactive job written in one DB transaction; the shared
-        enqueue-once entry plus the ``introduction_done`` / active-job guards keep
-        the residual race window tiny."""
-        with self.proactive_lock:
-            cur = self.load_proactive_settings()
-            if str(cur.get("introduced_at") or "").strip():
-                return False
-            cur["introduced_at"] = str(at_iso or datetime.now().isoformat())
-            cur["version"] = 2
-            cur["updated_at"] = datetime.now().isoformat()
-            db.set_blob(self.user_id, "proactive_settings", cur)
-        return True
+        The durable ``introduced_at`` marker and the proactive job are written
+        in ONE PostgreSQL transaction (db.claim_and_enqueue_introduction), so
+        two processes that don't share a Python lock (backend workers + the
+        standalone runner) cannot both enqueue, and a job-write failure rolls the
+        marker back automatically — the marker never persists without a job.
 
-    def unclaim_introduction(self) -> None:
-        """Roll back a ``claim_introduction`` when the follow-up job append
-        failed, so a failed enqueue never persists a permanent "introduced"
-        marker with no introduction job behind it."""
+        Returns the ``job`` iff THIS caller won the claim and it persisted, else
+        ``None`` (already introduced, lost the race, or a DB failure rolled it
+        back). Post-commit side effects (trim + waiter/worker wake) mirror
+        ``append_proactive_job``."""
         with self.proactive_lock:
-            cur = self.load_proactive_settings()
-            cur["introduced_at"] = ""
-            cur["updated_at"] = datetime.now().isoformat()
-            db.set_blob(self.user_id, "proactive_settings", cur)
+            settings = dict(self.load_proactive_settings())
+        at_iso = datetime.now().isoformat()
+        settings["introduced_at"] = at_iso
+        settings["version"] = 2
+        settings["updated_at"] = at_iso
+        result = db.claim_and_enqueue_introduction(
+            self.user_id, settings, job, at_iso=at_iso,
+            ts=self._entry_epoch(job),
+            item_key=(str(job.get("job_id") or "") or None),
+        )
+        if result is None:
+            return None
+        db.log_trim(self.user_id, "proactive_jobs", PROACTIVE_JOB_MAX)
+        self.notify_proactive_job_waiters()
+        wake_bus.notify("proactive", self.user_id)
+        return job
 
     # ------- append-only logs (PostgreSQL-backed; see db.user_logs) -------
     @staticmethod

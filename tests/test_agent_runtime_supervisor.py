@@ -191,16 +191,15 @@ class _IntroStore:
             self._introduced_at = at_iso or "2026-07-12T00:00:00"
         return {"introduced_at": self._introduced_at}
 
-    def claim_introduction(self, *, at_iso=None):
-        # Atomic one-shot claim on the SAME marker as mark_introduced (returns
-        # whether THIS caller won). Mirrors core.store.UserStore.claim_introduction.
+    def claim_and_enqueue_introduction(self, job):
+        # Models the single-transaction contract of
+        # core.store.UserStore.claim_and_enqueue_introduction: won -> marker set
+        # + job stored + returns job; lost -> None, marker unchanged.
         if self._introduced_at:
-            return False
-        self._introduced_at = at_iso or "2026-07-12T00:00:00"
-        return True
-
-    def unclaim_introduction(self):
-        self._introduced_at = ""
+            return None
+        self._introduced_at = "2026-07-12T00:00:00"
+        self.jobs.append(job)
+        return job
 
     def list_proactive_jobs(self, since_epoch=0, limit=0):
         return list(self.jobs)

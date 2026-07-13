@@ -127,6 +127,34 @@ def _maybe_mark_first_chat_ok(store: UserStore, reply_to_message_id: str) -> Non
         store.mark_first_chat_ok()
 
 
+def _maybe_enqueue_resident_introduction(store) -> None:
+    """Trigger the resident one-shot greeting on a verified chat loop.
+
+    Called from ``verify_loop`` when a synthetic ping got an agent reply
+    (``chat_loop_verified``). This is what breaks the fresh-resident deadlock:
+    the greeting is enqueued HERE, NOT on ``first_chat_ok_at`` — a brand-new
+    resident user cannot send a real message until the greeting opens Chat, and
+    the verify ping deliberately does not count as their First message.
+
+    ONLY the resident route triggers here (model-API / official-app greetings
+    come from their own paths). The supervisor spawn/autoverify path stays a
+    recovery fallback; BOTH route through the SAME atomic enqueue-once
+    (``store.claim_and_enqueue_introduction``) so a user who later has a real
+    conversation never gets a second introduction. Best-effort: a failed enqueue
+    must never fail the verify response — the DB transaction rolls itself back."""
+    try:
+        from accounts import onboarding as accounts_onboarding
+        from agent_runtime import introduction as agent_introduction
+        if accounts_onboarding._load_onboarding_route(store) != "resident":
+            return
+        agent_introduction.enqueue_introduction_once(store, now=time.time())
+    except Exception as exc:  # noqa: BLE001
+        import logging
+        logging.getLogger("feedling.chat_core").warning(
+            "chat_loop_verified introduction enqueue failed for %s: %s",
+            getattr(store, "user_id", ""), exc)
+
+
 def _plaintext_for_trace(payload: dict, envelope: dict) -> str:
     """Best-effort plaintext for the debug excerpt ONLY. The server never
     decrypts; use a client-provided preview if present, else empty."""
@@ -644,26 +672,7 @@ def verify_loop(store: UserStore, payload: dict) -> tuple[dict, int]:
 
     if found_reply:
         boot_gates._log_bootstrap_event(store, "chat_loop_verified", success=True)
-        # Resident onboarding's one-shot greeting is triggered HERE — on the
-        # verified chat loop, NOT on first_chat_ok_at. A fresh resident user
-        # cannot send a real message until the greeting opens Chat, and
-        # verify_loop deliberately does NOT count as the user's First message,
-        # so gating the greeting on first_chat_ok_at deadlocks it forever. This
-        # is the fresh-resident fix. The supervisor spawn/autoverify path stays a
-        # recovery fallback, and BOTH route through the SAME atomic enqueue-once,
-        # so a user who later has a real conversation never gets a second
-        # introduction. Best-effort: a failed enqueue must not fail the verify
-        # response (claim rollback lives inside enqueue_introduction_once).
-        try:
-            from accounts import onboarding as _accounts_onboarding
-            from agent_runtime import introduction as _agent_introduction
-            if _accounts_onboarding._load_onboarding_route(store) == "resident":
-                _agent_introduction.enqueue_introduction_once(store, now=time.time())
-        except Exception as _intro_exc:  # noqa: BLE001
-            import logging
-            logging.getLogger("feedling.chat_core").warning(
-                "chat_loop_verified introduction enqueue failed for %s: %s",
-                getattr(store, "user_id", ""), _intro_exc)
+        _maybe_enqueue_resident_introduction(store)
 
     # Cleanup: remove synthetic ping from history regardless of outcome. If a
     # reply landed, also remove the matching agent response. The verify exchange

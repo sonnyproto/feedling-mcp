@@ -80,17 +80,18 @@ def _has_active_introduction_job(store) -> bool:
 
 
 def enqueue_introduction_once(store, *, now=None) -> dict | None:
-    """Enqueue EXACTLY ONE introduction job, atomically, for this user.
+    """Enqueue EXACTLY ONE introduction job for this user.
 
     Trigger-agnostic: the CALLER decides *when* (supervisor: a recovered
-    activation; chat_core: ``chat_loop_verified``). Dedup + the one-shot claim
-    live here so the two triggers can never double-send.
+    activation; chat_core: ``chat_loop_verified``). Exactly-once across both
+    triggers AND across processes is enforced authoritatively by the SINGLE DB
+    transaction in ``store.claim_and_enqueue_introduction`` (guarded marker
+    UPSERT + job INSERT together — see Codex P1); a lost race or a rolled-back
+    job write simply returns ``None`` and leaves no orphan marker.
 
-    Order matters (see Codex P1): claim the durable ``introduced_at`` marker
-    FIRST via ``store.claim_introduction()`` (atomic won/lost), THEN append the
-    job. If the append raises or returns falsy, roll the marker back with
-    ``store.unclaim_introduction()`` so a failed enqueue never leaves a
-    permanent "introduced" marker with no job behind it.
+    The two checks below are only cheap, non-authoritative fast-path skips so we
+    don't build a job or hit the DB when the user is already, visibly done. Two
+    callers that both pass them still yield exactly one job.
 
     Returns the enqueued job dict, or ``None`` when nothing was enqueued
     (already introduced, one already in flight, or this caller lost the claim).
@@ -99,17 +100,5 @@ def enqueue_introduction_once(store, *, now=None) -> dict | None:
         return None
     if _has_active_introduction_job(store):
         return None
-    if not store.claim_introduction():
-        # Another path (the sibling trigger, or a concurrent spawn) won the
-        # one-shot claim — do not append a duplicate.
-        return None
     clock = (now() if callable(now) else float(now)) if now is not None else time.time()
-    try:
-        job = store.append_proactive_job(_build_introduction_job(now=clock))
-    except Exception:
-        store.unclaim_introduction()
-        raise
-    if not job:
-        store.unclaim_introduction()
-        return None
-    return job
+    return store.claim_and_enqueue_introduction(_build_introduction_job(now=clock))
