@@ -264,6 +264,55 @@ def test_live_start_no_token_parity(asgi_app_obj, user):
     assert ab == fb == {"status": "logged", "reason": "no_active_push_to_start_token", "mode": "start"}
 
 
+def test_live_start_updates_existing_activity_instead_of_duplicate_start(asgi_app_obj, user, monkeypatch):
+    uid, api_key = user
+    _register(api_key, {"type": "push_to_start", "token": "ptstok123456"})
+    _register(api_key, {"type": "live-activity", "token": "latok123456", "activity_id": "la_test"})
+    monkeypatch.setattr(UserStore, "should_suppress_live_activity", lambda self, message, top_app: (False, "ok"))
+    monkeypatch.setattr(apns, "_send_apns_to_active_tokens", lambda *a, **k: {"status": "delivered"})
+    monkeypatch.setattr(
+        apns,
+        "_send_apns",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not send push-to-start when an activity token exists")),
+    )
+
+    payload = {"activity_id": "la_test", "title": "hi", "body": "hello"}
+    fs, fb = _flask_post("/v1/push/live-start", payload, {"X-API-Key": api_key})
+    as_, ab = _asgi_post(asgi_app_obj, "/v1/push/live-start", payload, {"X-API-Key": api_key})
+    assert fs == as_ == 200
+    assert ab == fb == {
+        "status": "delivered",
+        "activity_id": "la_test",
+        "mode": "update_existing",
+        "start_reason": "active_live_activity_token_present",
+    }
+
+
+def test_live_start_falls_back_to_start_after_stale_activity_token(asgi_app_obj, user, monkeypatch):
+    uid, api_key = user
+    _register(api_key, {"type": "push_to_start", "token": "ptstok123456"})
+    _register(api_key, {"type": "live-activity", "token": "latok123456", "activity_id": "la_test"})
+    monkeypatch.setattr(UserStore, "should_suppress_live_activity", lambda self, message, top_app: (False, "ok"))
+    monkeypatch.setattr(
+        apns,
+        "_send_apns_to_active_tokens",
+        lambda *a, **k: {"status": "error", "code": 410, "reason": "Unregistered"},
+    )
+    monkeypatch.setattr(apns, "_send_apns", lambda *a, **k: {"status": "delivered"})
+
+    payload = {"activity_id": "la_test", "title": "hi", "body": "hello"}
+    fs, fb = _flask_post("/v1/push/live-start", payload, {"X-API-Key": api_key})
+    as_, ab = _asgi_post(asgi_app_obj, "/v1/push/live-start", payload, {"X-API-Key": api_key})
+    assert fs == as_ == 200
+    assert ab == fb == {
+        "status": "delivered",
+        "mode": "start_after_update_refresh",
+        "update_status": "error",
+        "update_reason": "Unregistered",
+        "update_error_code": 410,
+    }
+
+
 def test_live_start_requires_auth(asgi_app_obj, user):
     fs, _fb = _flask_post("/v1/push/live-start", {"body": "x"})
     as_, ab = _asgi_post(asgi_app_obj, "/v1/push/live-start", {"body": "x"})

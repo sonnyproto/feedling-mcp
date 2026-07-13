@@ -166,8 +166,21 @@ def push_live_activity_end_inner(store: UserStore, payload: dict | None = None) 
 
 
 def push_live_start_dict(store: UserStore, payload: dict, *, end_existing: bool = False) -> dict:
+    existing_live_entry = push_tokens._select_token(store, push_tokens._is_live_activity_token, active_only=True)
+    update_result = None
+    if existing_live_entry and not payload.get("force_start"):
+        update_result = push_live_activity_dict(store, payload)
+        update_result["mode"] = "update_existing"
+        update_result["start_reason"] = "active_live_activity_token_present"
+        if not (update_result.get("needs_refresh") or update_result.get("error_code") == 410):
+            return update_result
+
     entry = push_tokens._select_token(store, push_tokens._is_push_to_start_token, active_only=True)
     if not entry:
+        if update_result:
+            update_result["start_status"] = "logged"
+            update_result["start_reason"] = update_result.get("reason") or "no_active_push_to_start_token"
+            return update_result
         print(f"[live-start:{store.user_id}] no push_to_start token — logged: {payload}")
         return {"status": "logged", "reason": "no_active_push_to_start_token", "mode": "start"}
 
@@ -184,7 +197,7 @@ def push_live_start_dict(store: UserStore, payload: dict, *, end_existing: bool 
         or "ScreenActivityAttributes"
     )
     end_result = None
-    if end_existing and push_tokens._select_token(store, push_tokens._is_live_activity_token, active_only=True):
+    if end_existing and existing_live_entry and not update_result:
         end_result = push_live_activity_end_inner(store, payload)
 
     apns_payload = {
@@ -219,6 +232,13 @@ def push_live_start_dict(store: UserStore, payload: dict, *, end_existing: bool 
 
     print(f"[live-start:{store.user_id}] {result}")
     response = {"status": result.get("status", "error"), "mode": "start"}
+    if update_result:
+        response["mode"] = "start_after_update_refresh"
+        response["update_status"] = update_result.get("status", "unknown")
+        if update_result.get("reason"):
+            response["update_reason"] = update_result.get("reason")
+        if update_result.get("error_code") is not None:
+            response["update_error_code"] = update_result.get("error_code")
     if result.get("code") is not None:
         response["error_code"] = result.get("code")
     if result.get("reason"):
