@@ -1122,6 +1122,73 @@ def test_agent_turn_native_reasoning_wins_over_tagged_content():
     assert turn.thinking_native is True
 
 
+def _pi_stream_with_thinking(reply: str, thinking: str) -> str:
+    """A pi `--mode json` stream carrying one assistant message_end whose content
+    holds a native thinking block plus the reply text."""
+    return "\n".join(json.dumps(o, ensure_ascii=False) for o in [
+        {"type": "session", "id": "s1"},
+        {"type": "message_end", "message": {"role": "user",
+                                            "content": [{"type": "text", "text": "在吗"}]}},
+        {"type": "message_end", "message": {
+            "role": "assistant",
+            "usage": {"input": 10, "output": 5},
+            "content": [{"type": "thinking", "thinking": thinking},
+                        {"type": "text", "text": reply}],
+        }},
+    ])
+
+
+def test_call_agent_body_round_trips_thinking_back_through_split(monkeypatch):
+    """The turn is parsed TWICE: call_agent parses the CLI output into an AgentTurn
+    and re-emits it as a body dict, which the chat/proactive lanes then run through
+    _split_agent_turn again. The body must be written in a dialect the second parse
+    accepts — otherwise the thinking silently dies in the round-trip. Asserted on
+    the real call_agent output rather than a hand-built dict, so the guard survives
+    a rename of whatever key the body happens to use."""
+    raw = crc._attach_provider_reasoning(
+        "在的，怎么了？", "用户在打招呼，简短回应即可。",
+        source="pi_thinking", kind="provider_reasoning_summary", native=True,
+    )
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(crc, "call_agent_cli", lambda *a, **k: raw)
+
+    body = crc.call_agent("在吗", lane="chat")
+    turn = crc._split_agent_turn(body)
+
+    assert turn.messages == ["在的，怎么了？"]
+    assert turn.thinking_summary == "用户在打招呼，简短回应即可。"
+    assert turn.thinking_kind == "provider_reasoning_summary"
+    assert turn.thinking_source == "pi_thinking"
+    assert turn.thinking_native is True
+
+
+def test_pi_native_thinking_reaches_post_reply_end_to_end(monkeypatch):
+    """Whole delivery chain, from a real pi event stream down to post_reply: the
+    thinking must land in post_reply's kwargs, because post_reply is what builds
+    the thinking_envelope that /v1/chat/history hands the app. Before the body-key
+    fix the model produced thinking (trace said thinking_present=true) yet every
+    delivered message carried no thinking_* field at all."""
+    stream = _pi_stream_with_thinking("在的，怎么了？", "用户在打招呼，简短回应即可。")
+    reply, thinking = crc._pi_turn_from_stream(stream)
+    assert thinking, "pi's own parser must still extract the thinking block"
+    raw = crc._attach_provider_reasoning(
+        reply, thinking, source="pi_thinking",
+        kind="provider_reasoning_summary", native=True,
+    )
+    monkeypatch.setattr(crc, "AGENT_MODE", "cli")
+    monkeypatch.setattr(crc, "call_agent_cli", lambda *a, **k: raw)
+
+    msg = _make_msg(role="user", content="在吗", ts=5000.0)
+    with patch.object(crc, "post_reply") as mock_post:
+        crc._process_messages([msg])
+
+    kwargs = mock_post.call_args.kwargs
+    assert kwargs["thinking_summary"] == "用户在打招呼，简短回应即可。"
+    assert kwargs["thinking_kind"] == "provider_reasoning_summary"
+    assert kwargs["thinking_source"] == "pi_thinking"
+    assert kwargs["thinking_native"] is True
+
+
 def test_call_agent_passes_message_without_thinking_protocol(monkeypatch):
     captured = {}
 
