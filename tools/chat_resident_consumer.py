@@ -4145,6 +4145,21 @@ def call_agent_cli(
     # through (else the consumer would leak pi's internal handshake noise).
     if _is_pi_cmd(cmd):
         pi_reply, pi_thinking = _pi_turn_from_stream(result.stdout)
+        # TEMP DEBUG [PI-THINK-DBG] — pi 思维链丢失排查. 只记结构统计, 无用户内容. 删除见同标记.
+        try:
+            _dbg_mends = [o for o in _json_objects_from_cli_output(result.stdout or "")
+                          if isinstance(o, dict) and o.get("type") == "message_end"]
+            _dbg_blocks = sum(
+                1 for o in _dbg_mends for b in ((o.get("message") or {}).get("content") or [])
+                if isinstance(b, dict) and b.get("type") == "thinking" and (b.get("thinking") or "").strip())
+            _dbg_reason = sum(
+                int(((o.get("message") or {}).get("usage") or {}).get("reasoning") or 0) for o in _dbg_mends)
+            log.warning(
+                "[PI-THINK-DBG] reply_len=%d thinking_len=%d raw_text=%s msg_ends=%d nonempty_think_blocks=%d reasoning_tokens=%d",
+                len(pi_reply or ""), len(pi_thinking or ""), raw_text,
+                len(_dbg_mends), _dbg_blocks, _dbg_reason)
+        except Exception as _dbg_e:  # noqa: BLE001
+            log.warning("[PI-THINK-DBG] stats failed: %s", _dbg_e)
         if pi_reply:
             # Same lane discipline as codex: background memory lanes (raw_text)
             # get the bare reply; only foreground chat folds thinking into the
