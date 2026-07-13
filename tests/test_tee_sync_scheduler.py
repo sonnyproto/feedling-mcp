@@ -122,3 +122,21 @@ def test_start_spawns_a_daemon_thread(monkeypatch):
     monkeypatch.setattr(sched.threading, "Thread", FakeThread)
     sched.start()
     assert started == {"daemon": True, "name": "tee-sync", "started": True}
+
+
+def test_sync_tick_returns_reconcile_success(calls):
+    # Reconcile succeeds → True (caller may hold off next reconcile).
+    assert sched._sync_tick(do_reconcile=True) is True
+    # No reconcile due → True (no retry pressure).
+    assert sched._sync_tick(do_reconcile=False) is True
+
+
+def test_failed_reconcile_returns_false_for_soon_retry(monkeypatch):
+    def fake(*, action, table=None, **kw):
+        if action == "reconcile":
+            raise RuntimeError("SSL eof")
+        return {"ok": True}
+
+    monkeypatch.setattr(tr, "run_action", fake)
+    # reconcile failed → False so _loop won't advance last_reconcile (retries next tick).
+    assert sched._sync_tick(do_reconcile=True) is False
