@@ -191,6 +191,17 @@ class _IntroStore:
             self._introduced_at = at_iso or "2026-07-12T00:00:00"
         return {"introduced_at": self._introduced_at}
 
+    def claim_introduction(self, *, at_iso=None):
+        # Atomic one-shot claim on the SAME marker as mark_introduced (returns
+        # whether THIS caller won). Mirrors core.store.UserStore.claim_introduction.
+        if self._introduced_at:
+            return False
+        self._introduced_at = at_iso or "2026-07-12T00:00:00"
+        return True
+
+    def unclaim_introduction(self):
+        self._introduced_at = ""
+
     def list_proactive_jobs(self, since_epoch=0, limit=0):
         return list(self.jobs)
 

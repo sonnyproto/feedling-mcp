@@ -738,6 +738,39 @@ class UserStore:
             db.set_blob(self.user_id, "proactive_settings", cur)
         return cur
 
+    def claim_introduction(self, *, at_iso: str | None = None) -> bool:
+        """Atomic one-shot claim on the SAME durable ``introduced_at`` marker as
+        ``mark_introduced`` (no parallel field). Returns True iff THIS caller set
+        the marker (won the claim), False if it was already set. Paired with
+        ``unclaim_introduction`` so a failed follow-up job append can roll the
+        marker back — the two together give enqueue-once without ever leaving an
+        "introduced" marker with no job (agent_runtime.introduction.enqueue_introduction_once).
+
+        Serialized by the per-process ``proactive_lock`` (same guarantee as
+        ``mark_introduced``). A strict cross-worker atomic would need the marker
+        and the proactive job written in one DB transaction; the shared
+        enqueue-once entry plus the ``introduction_done`` / active-job guards keep
+        the residual race window tiny."""
+        with self.proactive_lock:
+            cur = self.load_proactive_settings()
+            if str(cur.get("introduced_at") or "").strip():
+                return False
+            cur["introduced_at"] = str(at_iso or datetime.now().isoformat())
+            cur["version"] = 2
+            cur["updated_at"] = datetime.now().isoformat()
+            db.set_blob(self.user_id, "proactive_settings", cur)
+        return True
+
+    def unclaim_introduction(self) -> None:
+        """Roll back a ``claim_introduction`` when the follow-up job append
+        failed, so a failed enqueue never persists a permanent "introduced"
+        marker with no introduction job behind it."""
+        with self.proactive_lock:
+            cur = self.load_proactive_settings()
+            cur["introduced_at"] = ""
+            cur["updated_at"] = datetime.now().isoformat()
+            db.set_blob(self.user_id, "proactive_settings", cur)
+
     # ------- append-only logs (PostgreSQL-backed; see db.user_logs) -------
     @staticmethod
     def _entry_epoch(entry: dict) -> float | None:
