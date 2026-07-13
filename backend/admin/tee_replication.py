@@ -151,8 +151,12 @@ def _run_verify(*, sample_rate: float | None) -> dict:
 
 
 def status_payload() -> dict:
-    """Read-only snapshot: replication cursors, pending-migration counts,
-    mirror failure counter, dual-write flag, and whether a run is in flight."""
+    """Read-only snapshot for the observability endpoint: replication cursors,
+    pending-migration counts, mirror failure counter, dual-write flag, whether a
+    run is in flight, a live TEE health probe, and the most-recent persisted
+    sync-run summaries (convergence / lag / failures over time — the cut-read
+    soak signal). ``recent_runs`` is best-effort: a missing history table (not
+    yet migrated) degrades to an empty list rather than failing the whole call."""
     _require_tee_configured()
     with mirror.get_tee_pool().connection() as conn:
         cursor_rows = conn.execute(
@@ -175,6 +179,12 @@ def status_payload() -> dict:
     ]
     pending_by_table = {row[0]: row[1] for row in pending_rows}
 
+    try:
+        import db
+        recent_runs = db.recent_tee_sync_runs(limit=20)
+    except Exception:  # noqa: BLE001 — history table optional; never fail status
+        recent_runs = []
+
     return {
         "cursors": cursors,
         "pending_count": sum(pending_by_table.values()),
@@ -182,4 +192,7 @@ def status_payload() -> dict:
         "mirror_failures": mirror.failure_count(),
         "dual_write_enabled": mirror.enabled(),
         "running": _run_lock.locked(),
+        "health": mirror.probe(),
+        "latest_run": recent_runs[0] if recent_runs else None,
+        "recent_runs": recent_runs,
     }

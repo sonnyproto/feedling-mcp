@@ -466,6 +466,77 @@ def delete_user(user_id: str) -> None:
     mirror.execute(sql, (user_id,))
 
 
+# ---------------------------------------------------------------------------
+# TEE shadow sync-run history (observability — migration 0015).
+#
+# The in-process auto-sync scheduler appends one row per tick so convergence /
+# replication lag / dual-write failures / TEE liveness can be watched over the
+# soak window (the cut-read go/no-go signal). Kept in RDS, not the TEE db, so a
+# row is recordable even when the shadow is unreachable. See
+# backend/admin/tee_sync_scheduler.py for the producer.
+# ---------------------------------------------------------------------------
+
+# Flattened metric columns written verbatim from the scheduler's summary dict;
+# ``mirror_failures_delta`` and ``report`` are handled separately in the INSERT.
+_TEE_SYNC_RUN_COLS = (
+    "did_reconcile", "reconcile_ok", "verify_ran", "verify_ok",
+    "unconverged_tables", "unconverged_users", "requeue_backlog",
+    "replicate_copied", "replicate_pending", "replicate_errors", "replicate_skipped",
+    "reconcile_copied", "reconcile_pruned", "reconcile_skipped",
+    "mirror_failures", "tee_healthy", "tee_probe_ms", "duration_ms",
+)
+
+
+def record_tee_sync_run(summary: dict) -> None:
+    """Append one row to ``tee_sync_runs``. Best-effort: recording a metric must
+    never break the sync loop, so any failure is swallowed+logged (matching the
+    shadow-era discipline everywhere else in the pipeline).
+
+    ``mirror_failures`` is a cumulative in-process counter that zeroes on
+    restart; ``mirror_failures_delta`` is computed here against the previous
+    persisted row and clamped to >=0 (a negative delta means a restart happened,
+    so the current value IS the count since restart)."""
+    try:
+        report_json = json.dumps(summary.get("report") or {}, default=str, ensure_ascii=False)
+        vals = [summary.get(c) for c in _TEE_SYNC_RUN_COLS]
+        cols = ", ".join(_TEE_SYNC_RUN_COLS)
+        ph = ", ".join(["%s"] * len(_TEE_SYNC_RUN_COLS))
+        with get_pool().connection() as conn:
+            last = conn.execute(
+                "SELECT mirror_failures FROM tee_sync_runs ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            cur = int(summary.get("mirror_failures") or 0)
+            delta = cur - int(last[0]) if last else cur
+            if delta < 0:
+                delta = cur
+            conn.execute(
+                f"INSERT INTO tee_sync_runs ({cols}, mirror_failures_delta, report) "
+                f"VALUES ({ph}, %s, %s::jsonb)",
+                (*vals, delta, report_json),
+            )
+    except Exception as e:  # noqa: BLE001 — metrics must not break the loop
+        log.error("[db] record_tee_sync_run failed: %s", e)
+
+
+def recent_tee_sync_runs(limit: int = 50) -> list[dict]:
+    """Most-recent TEE sync summaries, newest first (observability endpoint).
+    ``ran_at`` is ISO-8601; ``report`` is the parsed JSONB detail dict."""
+    cols = ("id", "ran_at") + _TEE_SYNC_RUN_COLS + ("mirror_failures_delta", "report")
+    sel = ", ".join(cols)
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            f"SELECT {sel} FROM tee_sync_runs ORDER BY id DESC LIMIT %s", (limit,)
+        ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        d = dict(zip(cols, r))
+        ran = d.get("ran_at")
+        if ran is not None and hasattr(ran, "isoformat"):
+            d["ran_at"] = ran.isoformat()
+        out.append(d)
+    return out
+
+
 def user_exists(user_id: str) -> bool:
     """Authoritative membership check against the users table. The push path uses
     it to close the sub-second window where another worker committed a delete but
