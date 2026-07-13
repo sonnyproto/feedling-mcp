@@ -95,6 +95,22 @@ services:
       FEEDLING_DATA_DIR: "/data"
       FEEDLING_ENCLAVE_TLS: "true"
       FEEDLING_FLASK_URL: "http://backend:5001"
+      # Stage-D runtime token secret — lets the enclave verify a caller's runtime
+      # token LOCALLY (core/runtime_token.py) in whoami_live / whoami_cached,
+      # SKIPPING the reentrant backend /v1/users/whoami round-trip. MUST match the
+      # backend's (line ~257) + the runner's secret; CI injects the same
+      # TEST_FEEDLING_RUNTIME_TOKEN_SECRET into all three. Empty = falls back to
+      # the round-trip (old behavior, no regression).
+      #
+      # This line was MISSING on test while prod had it (compose drift), and the
+      # backend already had it here — so only the enclave fell back. Every
+      # envelope/decrypt then hit backend /v1/users/whoami, a path that is
+      # deliberately UNCACHED (auth.py: whoami_live, so a revoked key dies at
+      # once). Measured on test 2026-07-13: 891 whoami in 6.5min (2.2/s, vs 31
+      # chat/poll) saturating the single-worker backend, which was itself blocked
+      # awaiting the very decrypt that triggered them → decrypt p95 19.6s /
+      # max 47.7s → 34s chat replies of which pi was only 3.1s.
+      FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       MEMORY_READSIDE_FOR_MODEL_API: "true"
       # NOTE: intentionally NOT setting DSTACK_SIMULATOR_ENDPOINT.
       # dstack-sdk treats "is this env var PRESENT?" as "use simulator"
@@ -143,6 +159,16 @@ services:
     # 1 listener + 1 election); test RDS t4g-micro max_connections=79 → N=2 safe.
     command: ["gunicorn", "--chdir", "backend", "--config", "backend/gunicorn_conf.py", "-k", "asgi.worker.FeedlingUvicornWorker", "--timeout", "120", "-b", "0.0.0.0:5001", "asgi_app:app"]
     restart: unless-stopped
+    # One fd per live client connection. Now that keep-alive connections survive
+    # 75s idle (backend/gunicorn_conf.py) instead of 2s, each online app parks a
+    # few pooled sockets here rather than reconnecting per request — so the
+    # steady-state fd count is (online apps x pool size), not (in-flight requests).
+    # Docker's default soft limit is 1024, which gunicorn does not raise on its
+    # own; the container's hard limit is 524288, so lifting this is free headroom.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       FEEDLING_API_KEY: ""
       FEEDLING_ADMIN_TOKEN: "${FEEDLING_ADMIN_TOKEN:-}"

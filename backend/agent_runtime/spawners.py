@@ -176,6 +176,10 @@ _PI_PROVIDER_ID = "feedling"
 
 # openrouter is a fixed public endpoint, not a user-supplied base_url.
 _PI_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
+# Fallback only — a gemini credential always persists this same default (see
+# provider_client._DEFAULT_BASE_URLS). pi REQUIRES baseUrl on every custom
+# provider, so an empty one must never reach models.json (see _pi_models_json).
+_PI_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 # Thinking level applied when a route leaves reasoning_effort UNSET (null/empty).
 # pi's model schema is `reasoning: boolean` (verified against pi-ai 0.80.3
@@ -217,12 +221,14 @@ def _pi_models_json(*, base_url: str, model: str, provider: str,
     gemini/openrouter now go straight to their native wire instead of through
     an in-CVM chat-bridge):
 
-    - ``gemini`` → pi's native ``google-generative-ai`` api. STILL needs a
-      ``baseUrl`` (pi rejects a custom model with "baseUrl is required" and
-      fails to load the WHOLE models.json otherwise — verified via ``pi
-      --list-models``); uses the relay ``base_url`` or the google AI Studio
-      default. No ``compat`` block (that's openai-completions-specific;
-      reasoning rides the model entry directly).
+    - ``gemini`` → pi's native ``google-generative-ai`` api against the
+      credential's persisted endpoint (``_PI_GEMINI_BASE`` as a fallback). No
+      ``compat`` block (that IS openai-completions-specific) — but ``baseUrl``
+      is NOT: pi requires it on EVERY custom provider, and a provider missing it
+      voids the whole models.json ("No models available"), so the turn dies with
+      `Model "feedling/<id>" not found` (rc=1) before any request goes out. This
+      branch shipped without one and gemini turns failed 100%; see
+      ``test_pi_models_gemini_always_has_base_url``.
     - ``deepseek`` → pi's native ``anthropic-messages`` api against
       ``<base_url or https://api.deepseek.com>/anthropic``; no ``compat``
       block (that's openai-completions-specific) and the model entry is
@@ -280,7 +286,7 @@ def _pi_models_json(*, base_url: str, model: str, provider: str,
             "name": "Feedling relay",
             # pi requires baseUrl on any custom model or the whole models.json
             # fails to load; relay base_url, else google AI Studio's default.
-            "baseUrl": (base_url or "https://generativelanguage.googleapis.com/v1beta").strip().rstrip("/"),
+            "baseUrl": (base_url or _PI_GEMINI_BASE).strip().rstrip("/"),
             "api": "google-generative-ai",
             "apiKey": "$PI_PROVIDER_API_KEY",
             "models": [model_entry],

@@ -885,6 +885,25 @@ def test_pi_models_gemini():
     assert p["models"][0]["input"] == ["text", "image"]
 
 
+def test_pi_models_gemini_always_has_base_url():
+    """pi REJECTS a custom provider without ``baseUrl`` — regardless of api type —
+    and a rejected provider voids the WHOLE models.json ("No models available"),
+    so the turn dies with `Model "feedling/<id>" not found` (rc=1) before any
+    request is made. Verified in-CVM against pi 0.80.3 (`--list-models`) and
+    stated outright in pi's own docs/models.md: "The baseUrl is required when
+    adding custom models to the google-generative-ai API type." A credential
+    always carries the persisted default, but fall back anyway so an empty
+    base_url can never resurrect the void-config failure."""
+    p = _prov("gemini", model="gemini-2.0-flash", base_url="")
+    assert p["baseUrl"] == "https://generativelanguage.googleapis.com/v1beta"
+
+
+def test_pi_models_gemini_custom_base():
+    p = _prov("gemini", model="gemini-2.0-flash",
+              base_url="https://gw.example.com/v1beta/")
+    assert p["baseUrl"] == "https://gw.example.com/v1beta"
+
+
 def test_pi_models_openrouter_headers_and_base():
     p = _prov("openrouter", model="x", base_url="")
     assert p["api"] == "openai-completions"

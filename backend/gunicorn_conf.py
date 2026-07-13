@@ -36,6 +36,22 @@ def _worker_count() -> int:
 workers = _worker_count()
 
 
+# Idle timeout for keep-alive connections. gunicorn's default is 2s and
+# uvicorn_worker maps this straight onto uvicorn's ``timeout_keep_alive``.
+# At 2s the server closes an idle connection while still omitting
+# ``Connection: close``, so a pooling client (iOS URLSession) reuses a socket
+# the server has already FIN'd — the request dies in transit as
+# NSURLErrorNetworkConnectionLost, which the app renders as "网络连接失败".
+# That is why the first tap after idling in a form (e.g. the model-API key
+# sheet, where picking a provider + model + pasting the key takes far longer
+# than 2s) failed and the second one worked. The server's idle timeout must
+# outlive the client's pool-reuse window, so use the nginx-style 75s.
+# Sizing note: idle connections count toward uvicorn's ``limit_concurrency``
+# (2048, see asgi/worker.py) and haproxy's ``maxconn`` (4096) — at current
+# user counts that is not close.
+keepalive = 75
+
+
 def on_starting(server):
     # on_starting 跑在 gunicorn master 进程、worker fork 之前。--chdir backend 或
     # WorkingDirectory=backend 的 path 注入时序不保证在此时完成，故自插 backend 目录
