@@ -59,10 +59,12 @@ def validate_full_identity_card(card: dict) -> tuple[bool, str]:
     """init / full replace. Structure only (contract B — no count/spread floor)."""
     if not isinstance(card, dict):
         return (False, "identity_must_be_object")
+    # agent_name MAY be empty here: contract B / 优先 onboarding 成功率 — do NOT
+    # block onboarding on a missing name. The agent should supply a default name
+    # (Batch 1 guardrail), but that is guidance, not a gate. A NON-empty name
+    # still cannot be a runtime label (e.g. "Claude").
     name = str(card.get("agent_name") or "").strip()
-    if not name:
-        return (False, "agent_name_empty")
-    if is_runtime_label(name):
+    if name and is_runtime_label(name):
         return (False, "agent_name_is_runtime_label")
     return validate_dimensions_structure(card.get("dimensions", []))
 

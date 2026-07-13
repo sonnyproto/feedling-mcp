@@ -99,6 +99,20 @@ def test_init_accepts_sparse_two_dimensions(client, monkeypatch):
     assert resp.status_code == 201  # 契约 B:稀疏合法
 
 
+def test_init_accepts_empty_agent_name(client, monkeypatch):
+    # hx 定 0712:优先 onboarding 成功率 —— 空名字不该卡住建卡(名字可后补)
+    _user_id, api_key = _register(client)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder([]))
+    body = {
+        "identity": {"agent_name": "",
+                     "dimensions": [{"name": "锐利", "value": 90, "description": "x"}]},
+        "days_with_user": 3,
+        "relationship_anchor_evidence": ANCHOR,
+    }
+    resp = client.post("/v1/identity/init", headers=_headers(api_key), json=body)
+    assert resp.status_code == 201
+
+
 def test_init_rejects_out_of_range_dimension_value(client, monkeypatch):
     _user_id, api_key = _register(client)
     monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder([]))

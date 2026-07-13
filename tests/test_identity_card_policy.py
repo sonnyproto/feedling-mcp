@@ -44,8 +44,10 @@ def test_full_card_structure_only_lenient():
     # 稀疏(1 维)在契约 B 下合法
     assert card_policy.validate_full_identity_card(
         {"agent_name": "阿锐", "dimensions": []}) == (True, "")
+    # 空名字放行(hx 定 0712:优先 onboarding 成功率,名字可后补;不为缺名字卡住 onboarding)
     assert card_policy.validate_full_identity_card(
-        {"agent_name": "", "dimensions": []}) == (False, "agent_name_empty")
+        {"agent_name": "", "dimensions": []}) == (True, "")
+    # 但非空名字仍不能是 runtime label
     assert card_policy.validate_full_identity_card(
         {"agent_name": "Claude", "dimensions": []}) == (False, "agent_name_is_runtime_label")
 
