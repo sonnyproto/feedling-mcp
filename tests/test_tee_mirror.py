@@ -51,6 +51,32 @@ def test_mirror_execute_many_atomic_and_counts_failure(monkeypatch):
     assert _tee("SELECT count(*) FROM server_config WHERE key='k5'")[0][0] == 0
 
 
+def test_pool_sizing_defaults(monkeypatch):
+    """Pool size is the ONLY thing that limited the shadow write path.
+
+    Measured on the live TEE PG (2026-07-13): max_connections=200 with just 11 in
+    use — and exactly 4 of them held by the app user, i.e. the pool was pegged at
+    its own max_size=4 while Postgres had ~190 free slots. Every mirror failure was
+    "couldn't get a connection" (zero SSL/link errors, TEE CVM healthy), so the
+    constraint was self-inflicted, not the DB or the gateway.
+
+    The ceiling is set by WORKERS × max_size, because the pool is per-worker. TEE PG
+    allows 200 (3 reserved) and non-app roles (owner/replicator/monitoring) hold ~7:
+      - 32 → 1 worker: 32; even at 4 workers (what prod runs): 128, leaving ~70 free.
+      - 64 → 4 workers: 256 > 200. Would wedge the DB. So 32 is the "as large as
+        safely possible" answer, not an arbitrary bump.
+    Memory is not the constraint: work_mem=4MB → 128MB worst case at 32 (TEE CVM has
+    3.2GB free, PG currently uses 142MB). min_size=8 keeps enough warm to avoid the
+    cold gateway TLS handshake that motivated the old 15s timeout."""
+    from tee_shadow import mirror
+    monkeypatch.delenv("FEEDLING_TEE_POOL_MIN", raising=False)
+    monkeypatch.delenv("FEEDLING_TEE_POOL_MAX", raising=False)
+    assert mirror._pool_min() == 8
+    assert mirror._pool_max() == 32
+    monkeypatch.setenv("FEEDLING_TEE_POOL_MAX", "64")
+    assert mirror._pool_max() == 64
+
+
 def test_pool_timeout_env_configurable(monkeypatch):
     """Default is 2s: the shadow write is best-effort (failures are swallowed and
     the reconciler backfills), so it must never hold a user-facing request hostage.

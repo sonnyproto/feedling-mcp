@@ -40,6 +40,38 @@ def _pool_timeout() -> float:
         return 2.0
 
 
+def _pool_int(env: str, default: int) -> int:
+    try:
+        return max(1, int(os.environ.get(env, "") or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _pool_min() -> int:
+    # 热连接数。保持得多一些,突发时更少现场做网关 direct-TLS 冷握手(那条慢链路正是
+    # 当年把 pool_timeout 放宽到 15s 的理由)。
+    return _pool_int("FEEDLING_TEE_POOL_MIN", 8)
+
+
+def _pool_max() -> int:
+    # 影子写并发上限——2026-07-13 实测这是整条影子链路上唯一的约束:TEE PG
+    # max_connections=200 而当时只用了 11 条,其中 app 用户恰好 4 条 = 池被自己的
+    # max_size=4 顶死;41 次镜像失败全是 "couldn't get a connection",零 SSL/链路错误,
+    # TEE CVM healthy。即瓶颈是我们自己设的上限,不是 DB、也不是网关。
+    #
+    # 定 32 的依据是 WORKERS × max_size(池是 per-worker 的),不是拍脑袋:
+    #   TEE PG 200 上限(3 条 superuser 保留),owner/replicator/monitoring 等非 app
+    #   角色常驻约 7 条。
+    #   - 32 → 单 worker 32;即便日后跟 prod 一样开 4 worker 也才 128,尚余约 70。
+    #   - 64 → 4 worker 就是 256 > 200,会把 TEE PG 打满。
+    # 故 32 是「在安全前提下尽量大」的取值。内存不是约束:work_mem=4MB → 32 条最坏
+    # 约 128MB,而 TEE CVM 尚有 3.2GB 空闲(PG 当前仅用 142MB)。
+    #
+    # 注意:prod 目前不跑双写(compose 无 TEE_DATABASE_URL/FEEDLING_TEE_DUAL_WRITE,
+    # enabled() 为假 → 整条镜像是 no-op),所以这里的默认值当前只作用于 test。
+    return _pool_int("FEEDLING_TEE_POOL_MAX", 32)
+
+
 def get_tee_pool():
     global _pool
     if _pool is None:
@@ -48,10 +80,8 @@ def get_tee_pool():
                 from psycopg_pool import ConnectionPool
                 _pool = ConnectionPool(
                     os.environ["TEE_DATABASE_URL"],
-                    # min_size=2:保持 2 条热连接,热路径(双写)几乎不必现场做网关
-                    # TLS 握手 → 规避那条慢链路,pool_timeout 尾延迟很少真正命中。
-                    min_size=int(os.environ.get("FEEDLING_TEE_POOL_MIN", "2")),
-                    max_size=int(os.environ.get("FEEDLING_TEE_POOL_MAX", "4")),
+                    min_size=_pool_min(),
+                    max_size=_pool_max(),
                     timeout=_pool_timeout(),
                     max_idle=300,
                     # connect_timeout:单条连接的建立上限(libpq 参数),防止一次
