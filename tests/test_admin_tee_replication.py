@@ -237,6 +237,9 @@ def test_status_shape(client, monkeypatch):
     assert set(body.keys()) == {
         "cursors", "pending_count", "pending_by_table",
         "mirror_failures", "dual_write_enabled", "running",
+        # observability additions (migration 0015): live health probe + persisted
+        # sync-run history for the cut-read soak decision.
+        "health", "latest_run", "recent_runs",
     }
     assert isinstance(body["cursors"], list)
     assert isinstance(body["pending_count"], int)
@@ -244,6 +247,8 @@ def test_status_shape(client, monkeypatch):
     assert isinstance(body["mirror_failures"], int)
     assert isinstance(body["dual_write_enabled"], bool)
     assert body["running"] is False
+    assert isinstance(body["health"], dict) and "ok" in body["health"]
+    assert isinstance(body["recent_runs"], list)
 
 
 def test_status_without_admin_token_is_401(client, monkeypatch):

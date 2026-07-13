@@ -1,7 +1,10 @@
 """In-process TEE auto-sync scheduler (admin.tee_sync_scheduler).
 
 Drives the same tee_replication.run_action a manual run would; these tests stub
-run_action and assert the per-tick call sequence + skip semantics. No DB.
+run_action and assert the per-tick call sequence + skip semantics. (A completed
+tick now also records one tee_sync_runs metrics row + probes TEE health — a
+best-effort side effect covered by test_tee_sync_metrics.py; it is harmless
+here and not asserted on.)
 """
 import sys
 from pathlib import Path

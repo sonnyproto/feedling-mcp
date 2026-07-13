@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 
 log = logging.getLogger("feedling.tee_shadow")
 _pool = None
@@ -63,6 +64,24 @@ def get_tee_pool():
 
 def failure_count() -> int:
     return _failures
+
+
+def probe() -> dict:
+    """TEE 影子库健康探活（``SELECT 1`` + 往返延迟）。绝不抛：TEE 未接/连不上都
+    返回 ``ok=False`` + 简短 error,给可观测端点当结构化 health 字段用（否则连不上
+    会一路 500/503,拿不到"TEE 不可达"这个本身就是信号的数据点）。
+
+    走 ``get_tee_pool()`` 的既有池（受 ``_pool_timeout`` 上限约束),所以探活也享受
+    2s 短超时——TEE 卡住时探活自己不会把调用方拖住。"""
+    if not os.environ.get("TEE_DATABASE_URL"):
+        return {"ok": False, "latency_ms": None, "error": "unconfigured"}
+    t0 = time.monotonic()
+    try:
+        with get_tee_pool().connection() as conn:
+            conn.execute("SELECT 1")
+        return {"ok": True, "latency_ms": round((time.monotonic() - t0) * 1000, 1), "error": None}
+    except Exception as exc:  # noqa: BLE001 — 探活绝不上抛
+        return {"ok": False, "latency_ms": None, "error": str(exc)[:200]}
 
 
 def _record_failure(exc: Exception, sql: str) -> None:
