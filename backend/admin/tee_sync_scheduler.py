@@ -47,7 +47,8 @@ _FIRST_DELAY = 30.0
 _LOG_KEYS = (
     "did_reconcile", "reconcile_ok", "verify_ok", "unconverged_tables",
     "unconverged_users", "requeue_backlog", "replicate_copied", "replicate_pending",
-    "replicate_errors", "replicate_skipped", "reconcile_copied", "reconcile_pruned",
+    "replicate_errors", "replicate_skipped", "replicate_table_failures",
+    "reconcile_copied", "reconcile_pruned",
     "reconcile_skipped", "mirror_failures", "tee_healthy",
     "tee_probe_ms", "duration_ms",
 )
@@ -64,7 +65,8 @@ def _blank_summary(do_reconcile: bool) -> dict:
         "reconcile_ok": None, "verify_ran": False, "verify_ok": None,
         "unconverged_tables": None, "unconverged_users": None, "requeue_backlog": None,
         "replicate_copied": 0, "replicate_pending": 0, "replicate_errors": 0,
-        "replicate_skipped": 0, "reconcile_copied": 0, "reconcile_pruned": 0,
+        "replicate_skipped": 0, "replicate_table_failures": 0,
+        "reconcile_copied": 0, "reconcile_pruned": 0,
         "reconcile_skipped": 0, "mirror_failures": 0,
         "tee_healthy": False, "tee_probe_ms": None, "duration_ms": None,
         "report": {},
@@ -149,6 +151,11 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
         except tr.Unconfigured:
             return reconcile_ok
         except Exception as e:  # noqa: BLE001
+            # 整表 replicate 抛错(常见:TEE direct-TLS 连接掉线 "unexpected eof" /
+            # "connection is lost")。别只 log——记进 summary,否则这张整表失败会从
+            # report 和 replicate_errors(只统计成功 run 的逐行错)里双双消失。
+            summary["replicate_table_failures"] += 1
+            summary["report"].setdefault("replicate_failed", {})[table] = str(e)[:200]
             log.warning("[tee-sync] replicate %s 失败: %s", table, e)
 
     # (3) verify 对账 —— reconcile 成功才有意义;这是收敛度的量测来源。

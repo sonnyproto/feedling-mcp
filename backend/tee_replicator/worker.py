@@ -23,7 +23,10 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+import os
+
 import db
+import psycopg
 from psycopg.types.json import Jsonb
 from tee_shadow import mirror
 
@@ -550,6 +553,70 @@ def _write_pending_and_cursor(dst, cfg, table, pend_rows, adv_ts, adv_id) -> Non
     dst.execute(_CURSOR_UPSERT, (table, adv_ts, adv_id))
 
 
+def _batch_conn_retries() -> int:
+    try:
+        return max(1, int(os.environ.get("FEEDLING_TEE_REPLICATE_CONN_RETRIES", "3") or 3))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _conn_lost(dst, exc: Exception) -> bool:
+    """连接级故障判定:连接已断(broken/closed)或 psycopg OperationalError。
+    与「毒行」(明文含 NUL 等,连接仍活、抛 DataError)区分——前者换连接重试有意义,
+    后者只能逐行跳过。"""
+    if getattr(dst, "broken", False) or getattr(dst, "closed", False):
+        return True
+    return isinstance(exc, psycopg.OperationalError)
+
+
+def _flush_batch(cfg, table, writes, pend_rows, adv_ts, adv_id) -> int:
+    """整批写 upsert + pending 标记 + 游标推进,返回本批跳过的毒行数。
+
+    两类失败分开处理(2026-07-14 test 根因:direct-TLS 连接经 Phala 网关掉线,
+    ``SSL error: unexpected eof`` / ``the connection is lost``,让 chat/memory 整表挂):
+      - **连接断**:换一条新连接重试整批(有界 ``_batch_conn_retries`` 次 + 小退避)。
+        整批未提交、游标未推进,重试在健康连接上应整批成功。全部重试仍连不上 → 抛,
+        由 ``run_table`` 让整表本 tick 失败、游标不动、下 tick 再来(不丢不重)。
+      - **活连接上批失败**(疑似毒行):逐行 savepoint 跳过存不了的行(计 skipped),
+        其余照写、pending/游标照常推进——毒行不拖垮整表(原有语义,保留)。
+    """
+    attempts = _batch_conn_retries()
+    for attempt in range(1, attempts + 1):
+        try:
+            with mirror.get_tee_pool().connection() as dst:
+                try:
+                    with dst.transaction():
+                        for args in writes:
+                            dst.execute(cfg.upsert_sql, args)
+                        _write_pending_and_cursor(dst, cfg, table, pend_rows, adv_ts, adv_id)
+                    return 0
+                except Exception as batch_exc:  # noqa: BLE001
+                    if _conn_lost(dst, batch_exc):
+                        raise  # 冒到外层 → 换连接重试整批
+                    # 活连接、批失败 → 疑似毒行,逐行跳。
+                    log.warning("[tee-replicate] %s 批量写失败,降级逐行: %s",
+                                table, str(batch_exc)[:80])
+                    skipped = 0
+                    with dst.transaction():
+                        for args in writes:
+                            try:
+                                with dst.transaction():
+                                    dst.execute(cfg.upsert_sql, args)
+                            except Exception as row_exc:  # noqa: BLE001
+                                skipped += 1
+                                log.warning("[tee-replicate] %s 跳过存不了的毒行: %s",
+                                            table, str(row_exc)[:80])
+                        _write_pending_and_cursor(dst, cfg, table, pend_rows, adv_ts, adv_id)
+                    return skipped
+        except Exception as conn_exc:  # noqa: BLE001 — 连接级故障:换连接重试
+            if attempt >= attempts:
+                raise
+            log.warning("[tee-replicate] %s 连接掉线,换连接重试 %d/%d: %s",
+                        table, attempt, attempts, str(conn_exc)[:80])
+            _sleep(0.5 * attempt)
+    return 0
+
+
 def run_table(table: str, *, qps: float = 2.0, dry_run: bool = False,
               limit: int | None = None) -> dict:
     """把 RDS ``table`` 的密文增量解密复制进 TEE 明文库。
@@ -612,32 +679,10 @@ def run_table(table: str, *, qps: float = 2.0, dry_run: bool = False,
                     adv_ts, adv_id = _encode_cursor(cfg, sort_val, item_id)
 
             if not dry_run:
-                # 整批写 + pending + 游标推进单事务：写失败则整批回滚、游标不动 → 下次重跑。
-                # 但若某行是「毒行」——transform 通过了、落库却失败(解密出的明文含 NUL 或
-                # 其它 PostgreSQL 不接受的内容)——整批回滚 + 游标卡在它前面 = 那张表永久
-                # 卡死(每趟都撞同一行)。故落库失败时降级:逐行用 savepoint 写、存不了的
-                # 行跳过(计 skipped)、其余照写,pending 与游标照常推进,让毒行不能拖垮整表。
-                with mirror.get_tee_pool().connection() as dst:
-                    try:
-                        with dst.transaction():
-                            for args in writes:
-                                dst.execute(cfg.upsert_sql, args)
-                            _write_pending_and_cursor(dst, cfg, table, pend_rows,
-                                                      adv_ts, adv_id)
-                    except Exception as batch_exc:  # noqa: BLE001 — 降级逐行跳过毒行
-                        log.warning("[tee-replicate] %s 批量写失败,降级逐行: %s",
-                                    table, str(batch_exc)[:80])
-                        with dst.transaction():
-                            for args in writes:
-                                try:
-                                    with dst.transaction():
-                                        dst.execute(cfg.upsert_sql, args)
-                                except Exception as row_exc:  # noqa: BLE001
-                                    skipped += 1
-                                    log.warning("[tee-replicate] %s 跳过存不了的毒行: %s",
-                                                table, str(row_exc)[:80])
-                            _write_pending_and_cursor(dst, cfg, table, pend_rows,
-                                                      adv_ts, adv_id)
+                # 整批写 + pending + 游标推进单事务(见 _flush_batch)。两类失败分开:
+                # 连接断 → 换连接重试整批;活连接批失败(毒行) → 逐行 savepoint 跳过,
+                # 让毒行不拖垮整表。返回本批跳过的毒行数。
+                skipped += _flush_batch(cfg, table, writes, pend_rows, adv_ts, adv_id)
 
             wm_ts, wm_id = adv_ts, adv_id
             if remaining is not None:
