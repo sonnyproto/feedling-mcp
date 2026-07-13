@@ -911,6 +911,21 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                       AND ts IS NOT NULL
                       AND (%s = 0 OR ts >= %s)
                 ),
+                usage_events AS (
+                    SELECT
+                        user_id,
+                        ts,
+                        CASE
+                          WHEN doc->'payload'->>'duration_sec' ~ '^[0-9]{1,10}$'
+                          THEN (doc->'payload'->>'duration_sec')::bigint
+                          ELSE 0
+                        END AS duration_sec
+                    FROM user_logs
+                    WHERE stream = 'tracking_events'
+                      AND doc->>'type' = 'app_session_end'
+                      AND ts IS NOT NULL
+                      AND (%s = 0 OR ts >= %s)
+                ),
                 daily AS (
                     SELECT
                         to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
@@ -924,14 +939,29 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                         MAX(ts) AS last_ts
                     FROM active
                     GROUP BY day
+                ),
+                usage_daily AS (
+                    SELECT
+                        to_char(timezone(%s, to_timestamp(ts)), 'YYYY-MM-DD') AS day,
+                        COALESCE(AVG(duration_sec), 0)::double precision AS avg_session_sec,
+                        COALESCE(SUM(duration_sec), 0)::bigint AS foreground_sec,
+                        COUNT(*)::int AS session_count,
+                        COUNT(DISTINCT user_id)::int AS session_dau
+                    FROM usage_events
+                    GROUP BY day
                 )
-                SELECT day, dau, chat_dau, tracking_dau, active_events,
-                       user_messages, tracking_events, first_ts, last_ts
-                FROM daily
-                ORDER BY day DESC
+                SELECT d.day, d.dau, d.chat_dau, d.tracking_dau, d.active_events,
+                       d.user_messages, d.tracking_events, d.first_ts, d.last_ts,
+                       COALESCE(u.avg_session_sec, 0)::double precision AS avg_session_sec,
+                       COALESCE(u.foreground_sec, 0)::bigint AS foreground_sec,
+                       COALESCE(u.session_count, 0)::int AS session_count,
+                       COALESCE(u.session_dau, 0)::int AS session_dau
+                FROM daily d
+                LEFT JOIN usage_daily u ON u.day = d.day
+                ORDER BY d.day DESC
                 LIMIT %s
                 """,
-                (since, since, since, since, tz, day_limit),
+                (since, since, since, since, since, since, tz, tz, day_limit),
             ).fetchall()
         return [
             {
@@ -944,6 +974,10 @@ def admin_data_track_dau(*, since_epoch: float = 0.0, days: int = 30, tz: str = 
                 "tracking_events": row[6],
                 "first_ts": row[7],
                 "last_ts": row[8],
+                "avg_session_sec": float(row[9] or 0),
+                "foreground_sec": int(row[10] or 0),
+                "session_count": int(row[11] or 0),
+                "session_dau": int(row[12] or 0),
             }
             for row in rows
         ]

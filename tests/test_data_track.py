@@ -411,6 +411,49 @@ def test_fmt_duration_sec_compact_human_readable():
     assert _dt._fmt_duration_sec(59.6) == "1m"
 
 
+def test_beijing_time_display_helpers():
+    # Display-only Beijing (UTC+8) conversion; storage stays UTC. Inputs are an
+    # epoch or an explicit-UTC value so the assertion is host-timezone-independent.
+    import calendar
+    utc_midnight = calendar.timegm((2026, 7, 13, 0, 0, 0, 0, 0, 0))  # 2026-07-13 00:00:00 UTC
+    # epoch -> Beijing wall clock is 08:00 the same day
+    assert _dt._debug_time(utc_midnight) == "07-13 08:00:00"
+    assert _dt._bj_iso(utc_midnight) == "2026-07-13 08:00:00"
+    # a stored (naive) UTC ISO string is treated as UTC, then shifted +8
+    assert _dt._bj_iso("2026-07-13T00:00:00") == "2026-07-13 08:00:00"
+    assert _dt._bj_iso("2026-07-12T20:30:00") == "2026-07-13 04:30:00"  # crosses the day
+    # empties stay empty; zero epoch is the "no time" sentinel
+    assert _dt._bj_iso("") == ""
+    assert _dt._bj_iso(None) == ""
+    assert _dt._debug_time(0) == "—"
+    # fail-soft: a wildly out-of-range epoch must not raise (would 500 the page)
+    assert isinstance(_dt._bj_iso(10 ** 30), str)
+    assert _dt._debug_time(10 ** 30) == "—"
+
+
+def test_bj_deep_converts_only_iso_datetime_strings():
+    # The user-detail <pre> JSON clone shows every timestamp in Beijing; non-time
+    # strings and other types are untouched. Display-only — JSON API stays UTC.
+    src = {
+        "user_id": "usr_x",
+        "registered_at": "2026-07-13T00:00:00",          # -> +8
+        "route": "model_api",                             # not a time
+        "nested": {"last_activity_at": "2026-07-12T20:30:00.500000"},  # crosses day
+        "list": ["2026-07-13T00:00:00", "not-a-time", 42],
+        "count": 7,
+    }
+    out = _dt._bj_deep(src)
+    assert out["registered_at"] == "2026-07-13 08:00:00"
+    assert out["route"] == "model_api"
+    assert out["nested"]["last_activity_at"] == "2026-07-13 04:30:00"
+    assert out["list"][0] == "2026-07-13 08:00:00"
+    assert out["list"][1] == "not-a-time"
+    assert out["list"][2] == 42
+    assert out["count"] == 7
+    # source dict is not mutated (clone semantics)
+    assert src["registered_at"] == "2026-07-13T00:00:00"
+
+
 def _post_session_end(client, api_key: str, duration_sec: int) -> None:
     res = client.post(
         "/v1/track/event",
