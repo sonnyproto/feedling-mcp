@@ -75,7 +75,8 @@ the child so it isn't mistaken for alive).
 **Reasoning effort:** forwarded natively by the pi relay (no gateway intermediary). Provider support:
 - `anthropic` (claude): native
 - `openai` (codex): native Responses wire
-- `gemini`, `openrouter`, `openai_compatible`, `deepseek` (pi): native relay forward (placeholder `_PI_MODEL_REASONING_KEY` awaits pre-spike on `pre`)
+- `gemini`, `openrouter`, `openai_compatible` (pi): the model entry sets `reasoning: true` (pi's thinking switch — verified against pi-ai 0.80.3 `pi --list-models`; the earlier `reasoningEffort` field was ignored) and the resident passes the level via `--thinking <level>`. openrouter pins `compat.thinkingFormat="openrouter"`. Gated on the route's `reasoning_effort`; null stays off (`_PI_REASONING_DEFAULT`).
+- `deepseek` (pi): text-only, no reasoning (Anthropic-wire passthrough unverified).
 
 ## Tests
 

@@ -177,10 +177,16 @@ _PI_PROVIDER_ID = "feedling"
 # openrouter is a fixed public endpoint, not a user-supplied base_url.
 _PI_OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 
-# pi models.json model-entry field carrying the reasoning effort; NATIVE (no
-# gateway). Exact field verified in the §7.1 pre-spike on pre — change here if
-# the spike shows a different name.
-_PI_MODEL_REASONING_KEY = "reasoningEffort"
+# Thinking level applied when a route leaves reasoning_effort UNSET (null/empty).
+# pi's model schema is `reasoning: boolean` (verified against pi-ai 0.80.3
+# types.d.ts:573 + `pi --list-models` probe); an unknown `reasoningEffort` field
+# is silently ignored → model.reasoning=false → pi clamps the default medium
+# thinking level to off → no thinking events. So thinking is gated on
+# model.reasoning=true, driven by ``_pi_effort(route.reasoning_effort)``.
+# Product decision: unset routes default thinking ON at medium (better replies;
+# BYOK users spend their own key). An EXPLICIT off/none still disables — the
+# default only fills the null. Set to "" to make unset routes default-off.
+_PI_REASONING_DEFAULT = "medium"
 
 
 def _norm_effort(e: str) -> str:
@@ -193,6 +199,16 @@ def _norm_effort(e: str) -> str:
     return e if e in {"low", "medium", "high"} else "medium"
 
 
+def _pi_effort(reasoning_effort: str) -> str:
+    """Resolve a route's ``reasoning_effort`` to pi's thinking level, applying the
+    unset-default. Distinguishes UNSET (null/empty → ``_PI_REASONING_DEFAULT``)
+    from an EXPLICIT ``off``/``none`` (user turned thinking off → stays off, the
+    default is NOT applied). low/medium/high pass through; other garbage → medium."""
+    if (reasoning_effort or "").strip().lower() in {"off", "none"}:
+        return ""
+    return _norm_effort(reasoning_effort) or _norm_effort(_PI_REASONING_DEFAULT)
+
+
 def _pi_models_json(*, base_url: str, model: str, provider: str,
                      reasoning_effort: str = "") -> str:
     """pi ``models.json`` registering the user's relay as a custom provider.
@@ -201,8 +217,12 @@ def _pi_models_json(*, base_url: str, model: str, provider: str,
     gemini/openrouter now go straight to their native wire instead of through
     an in-CVM chat-bridge):
 
-    - ``gemini`` → pi's native ``google-generative-ai`` api; no ``baseUrl``/
-      ``compat`` (those are openai-completions-specific).
+    - ``gemini`` → pi's native ``google-generative-ai`` api. STILL needs a
+      ``baseUrl`` (pi rejects a custom model with "baseUrl is required" and
+      fails to load the WHOLE models.json otherwise — verified via ``pi
+      --list-models``); uses the relay ``base_url`` or the google AI Studio
+      default. No ``compat`` block (that's openai-completions-specific;
+      reasoning rides the model entry directly).
     - ``deepseek`` → pi's native ``anthropic-messages`` api against
       ``<base_url or https://api.deepseek.com>/anthropic``; no ``compat``
       block (that's openai-completions-specific) and the model entry is
@@ -223,16 +243,21 @@ def _pi_models_json(*, base_url: str, model: str, provider: str,
     (resolve-config-value), so the real relay key stays in the consumer
     process env and never lands on disk, for every branch.
 
-    NATIVE reasoning forwarding (no gateway, spec §4.3): ``reasoning_effort``
-    (the route's low/medium/high; off/""=disabled) is normalized by
-    ``_norm_effort`` and, when non-empty, forwarded on pi's own wire —
-    ``compat.supportsReasoningEffort`` + a ``_PI_MODEL_REASONING_KEY`` field on
-    the model entry for the openai-completions branches (openrouter,
-    openai_compatible), and directly on the model entry for gemini (no
-    ``compat`` block on that api). deepseek stays text-only/no-reasoning
-    (conservative — its Anthropic-wire wasn't verified against reasoning
-    passthrough). Each branch builds its OWN model_entry dict (never a shared
-    mutable one) so the reasoning key can't leak across providers.
+    NATIVE reasoning forwarding (no gateway, spec §4.3): pi gates thinking on
+    the model entry's ``reasoning: boolean`` (pi-ai 0.80.3 schema — NOT a
+    ``reasoningEffort`` field, which pi ignores). ``_norm_effort`` maps the
+    route's low/medium/high (off/null via ``_PI_REASONING_DEFAULT``) to pi's
+    scale; a non-empty effort sets ``reasoning: true`` on the entry so pi's
+    default thinking level is no longer clamped to off. The resident then passes
+    the exact level via the CLI ``--thinking <level>`` flag (see
+    ``_default_cli_cmd``) so the route's choice is honored, not just "on". The
+    openai-completions branches (openrouter, openai_compatible) also carry
+    ``compat.supportsReasoningEffort``; openrouter pins
+    ``compat.thinkingFormat="openrouter"`` (its ``reasoning: {effort}`` wire).
+    deepseek stays text-only/no-reasoning (conservative — its Anthropic-wire
+    wasn't verified against reasoning passthrough). Each branch builds its OWN
+    model_entry dict (never a shared mutable one) so the reasoning flag can't
+    leak across providers.
 
     ``input: ["text", "image"]`` declares the model's accepted modalities: pi
     only sends attached images as real vision content when the model's ``input``
@@ -244,16 +269,18 @@ def _pi_models_json(*, base_url: str, model: str, provider: str,
     gpt-5.x, gemini, claude); a rare text-only relay will error an image turn
     rather than silently drop it — the honest failure."""
     p = (provider or "").strip().lower()
-    eff = _norm_effort(reasoning_effort)
+    eff = _pi_effort(reasoning_effort)
     if p == "gemini":
         model_entry = {
             "id": (model or "").strip() or "default",
             "input": ["text", "image"],
+            "reasoning": bool(eff),
         }
-        if eff:
-            model_entry[_PI_MODEL_REASONING_KEY] = eff
         prov = {
             "name": "Feedling relay",
+            # pi requires baseUrl on any custom model or the whole models.json
+            # fails to load; relay base_url, else google AI Studio's default.
+            "baseUrl": (base_url or "https://generativelanguage.googleapis.com/v1beta").strip().rstrip("/"),
             "api": "google-generative-ai",
             "apiKey": "$PI_PROVIDER_API_KEY",
             "models": [model_entry],
@@ -272,12 +299,14 @@ def _pi_models_json(*, base_url: str, model: str, provider: str,
         model_entry = {
             "id": (model or "").strip() or "default",
             "input": ["text", "image"],
+            "reasoning": bool(eff),
         }
-        if eff:
-            model_entry[_PI_MODEL_REASONING_KEY] = eff
         compat = {
             "supportsDeveloperRole": False,
             "supportsReasoningEffort": bool(eff),
+            # openrouter's reasoning wire is `reasoning: {effort}`; pin it rather
+            # than rely on pi's URL auto-detect.
+            "thinkingFormat": "openrouter",
         }
         prov = {
             "name": "Feedling relay",
@@ -295,9 +324,8 @@ def _pi_models_json(*, base_url: str, model: str, provider: str,
         model_entry = {
             "id": (model or "").strip() or "default",
             "input": ["text", "image"],
+            "reasoning": bool(eff),
         }
-        if eff:
-            model_entry[_PI_MODEL_REASONING_KEY] = eff
         compat = {
             "supportsDeveloperRole": False,
             "supportsReasoningEffort": bool(eff),
@@ -369,14 +397,16 @@ def _identity_override_block(provider: str, model: str, base_url: str) -> str:
     )
 
 
-def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str = "") -> str:
+def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str = "",
+                     reasoning_effort: str = "") -> str:
     """Default cli command per driver (resident substitutes ``{message}`` /
     ``{session_id}``).
 
     For claude we pre-grant the io_cli verbs (so an unattended
     ``claude -p`` runs them without an interactive permission prompt) and append
-    the how-to as a system prompt from the per-user home. ``model`` is only used
-    by the pi driver (claude reads it from env, codex from config.toml).
+    the how-to as a system prompt from the per-user home. ``model`` /
+    ``reasoning_effort`` are only used by the pi driver (claude reads model from
+    env, codex from config.toml).
     Operators can override the whole thing per roster entry via ``cli_cmd``.
     """
     if driver == "pi":
@@ -394,11 +424,18 @@ def _default_cli_cmd(driver: str, home: str, io_cli: str = _IO_CLI, model: str =
         #   with @/-/-- would otherwise be eaten as a file ref / flag — so keeping
         #   it out of argv makes arbitrary user text safe. Images still ride argv as
         #   native @<path> refs (_inject_pi_images).
+        # --thinking <level>: honor the route's reasoning_effort. Setting the model
+        #   entry's reasoning:true (models.json) enables the capability; pi's default
+        #   level is medium, so this flag is only needed to pin a DIFFERENT level
+        #   (low/high) — but we always pass it when enabled so the route's exact
+        #   choice is authoritative, not pi's default.
         prompt_file = f"{home}/{_AGENT_PROMPT_BASENAME}"
         model_part = f"--model {_PI_PROVIDER_ID}/{model} " if model else ""
+        eff = _pi_effort(reasoning_effort)
+        thinking_part = f"--thinking {eff} " if eff else ""
         return (
             f"pi --mode json -t bash --append-system-prompt {prompt_file} "
-            f"{model_part}"
+            f"{model_part}{thinking_part}"
             "--session-id {session_id}"
         )
     if driver == "codex":
@@ -689,7 +726,9 @@ def consumer_env(base_env: dict, entry: dict, *, user_id: str, home: str) -> dic
     if not cli_cmd and driver == "claude" and _claude_cli_should_stream_thinking(entry):
         cli_cmd = _default_thinking_claude_cmd(home)
     env["AGENT_CLI_CMD"] = cli_cmd or _default_cli_cmd(
-        driver, home, model=str(entry.get("model") or "") if driver == "pi" else "")
+        driver, home,
+        model=str(entry.get("model") or "") if driver == "pi" else "",
+        reasoning_effort=str(entry.get("reasoning_effort") or "") if driver == "pi" else "")
     # Per-user isolation: separate checkpoint, agent session, image temp dir, and
     # a per-user agent home (Claude/Codex) so nothing is shared across users.
     env["CHECKPOINT_FILE"] = f"{home}/checkpoint.json"

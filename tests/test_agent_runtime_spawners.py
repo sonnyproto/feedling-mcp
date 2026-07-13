@@ -5,9 +5,13 @@ docker argv. The live process/docker spawn is integration. Pure-unit (no PG).
 """
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "backend"))
 
@@ -724,9 +728,95 @@ def test_pi_home_writes_models_json():
     prov = doc["providers"]["feedling"]
     assert prov["api"] == "openai-completions"
     assert prov["compat"]["supportsReasoningEffort"] is True   # reasoning threaded through
+    assert prov["compat"]["thinkingFormat"] == "openrouter"    # openrouter reasoning wire
+    # pi's real thinking switch is the model entry's `reasoning` boolean, NOT the
+    # (ignored) `reasoningEffort` field that shipped in b2022da.
+    assert prov["models"][0]["reasoning"] is True
+    assert "reasoningEffort" not in prov["models"][0]
     # pi gets no claude/codex home files
     assert "/h/claude-home/settings.json" not in files
     assert "/h/codex-home/AGENTS.md" not in files
+
+
+def test_pi_models_json_reasoning_default_on_null_off_when_explicit():
+    # Unset (null) reasoning_effort defaults thinking ON (_PI_REASONING_DEFAULT=medium);
+    # an EXPLICIT off disables it (the default fills null only). No dead reasoningEffort.
+    on = json.loads(spawners._pi_models_json(
+        base_url="https://relay.x/v1", model="x", provider="openrouter", reasoning_effort=""))
+    m_on = on["providers"]["feedling"]["models"][0]
+    assert m_on["reasoning"] is True
+    assert "reasoningEffort" not in m_on
+    assert on["providers"]["feedling"]["compat"]["supportsReasoningEffort"] is True
+
+    off = json.loads(spawners._pi_models_json(
+        base_url="https://relay.x/v1", model="x", provider="openrouter", reasoning_effort="off"))
+    m_off = off["providers"]["feedling"]["models"][0]
+    assert m_off["reasoning"] is False
+    assert off["providers"]["feedling"]["compat"]["supportsReasoningEffort"] is False
+
+
+def test_pi_gemini_models_json_has_baseurl():
+    # pi REJECTS a custom model with no baseUrl ("baseUrl is required") and fails to
+    # load the WHOLE models.json — so the gemini branch must always emit one.
+    doc = json.loads(spawners._pi_models_json(
+        base_url="https://relay.x/v1", model="g", provider="gemini", reasoning_effort="medium"))
+    prov = doc["providers"]["feedling"]
+    assert prov["api"] == "google-generative-ai"
+    assert prov["baseUrl"] == "https://relay.x/v1"          # relay base_url used
+    assert prov["models"][0]["reasoning"] is True
+    # empty base_url falls back to google's default rather than emitting no baseUrl
+    doc2 = json.loads(spawners._pi_models_json(
+        base_url="", model="g", provider="gemini", reasoning_effort=""))
+    assert doc2["providers"]["feedling"]["baseUrl"].startswith("https://generativelanguage.googleapis.com")
+
+
+def test_pi_default_cli_cmd_threads_thinking_level():
+    # The route's reasoning_effort reaches pi as --thinking <level> so the exact
+    # level (not just "on") is honored. Unset defaults to medium; explicit off omits.
+    cmd_hi = spawners._default_cli_cmd("pi", "/h", model="m", reasoning_effort="high")
+    assert "--thinking high" in cmd_hi
+    cmd_lo = spawners._default_cli_cmd("pi", "/h", model="m", reasoning_effort="low")
+    assert "--thinking low" in cmd_lo
+    cmd_null = spawners._default_cli_cmd("pi", "/h", model="m", reasoning_effort="")
+    assert "--thinking medium" in cmd_null       # unset → default-on medium
+    cmd_off = spawners._default_cli_cmd("pi", "/h", model="m", reasoning_effort="off")
+    assert "--thinking" not in cmd_off           # explicit off → no flag
+
+
+@pytest.mark.skipif(shutil.which("pi") is None,
+                    reason="pi CLI not installed (real-pi integration test)")
+def test_pi_models_json_loads_and_enables_reasoning_in_real_pi(tmp_path):
+    """Feed spawner-generated models.json to the REAL pi CLI and assert pi
+    recognizes the model's reasoning capability.
+
+    This is the regression line the reasoningEffort bug slipped through: a
+    hand-built JSONL fixture only exercises the resident's parser, never whether
+    pi actually treats the model as thinking-capable. ``pi --list-models`` prints
+    a ``thinking`` column = ``model.reasoning ? "yes" : "no"``, so it verifies the
+    whole models.json → pi model-registry path (including that pi LOADS the file
+    at all — the gemini missing-baseUrl bug failed the whole file silently)."""
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    env = {**os.environ, "PI_CODING_AGENT_DIR": str(agent_dir),
+           "PI_PROVIDER_API_KEY": "sk-test", "PI_OFFLINE": "1"}
+
+    def thinking_col(provider: str, effort: str) -> str:
+        (agent_dir / "models.json").write_text(spawners._pi_models_json(
+            base_url="https://relay.example/v1", model="m", provider=provider,
+            reasoning_effort=effort))
+        out = subprocess.run(["pi", "--list-models", "feedling"],
+                             capture_output=True, text=True, env=env, timeout=60).stdout
+        rows = [ln.split() for ln in out.splitlines() if ln.startswith("feedling")]
+        assert rows, f"pi failed to load models.json for {provider}/{effort!r}: {out!r}"
+        # columns: provider model context max-out thinking images
+        return rows[0][-2]
+
+    assert thinking_col("openrouter", "high") == "yes"        # explicit level enabled
+    assert thinking_col("openrouter", "") == "yes"            # null → default-on (medium)
+    assert thinking_col("openrouter", "off") == "no"          # explicit off disables
+    assert thinking_col("openai_compatible", "medium") == "yes"
+    assert thinking_col("gemini", "medium") == "yes"          # LOADS (baseUrl present)
+    assert thinking_col("deepseek", "") == "no"               # text-only, no reasoning
 
 
 def test_pi_consumer_env_sets_provider_key():
@@ -783,8 +873,10 @@ def _prov(provider, *, model, base_url, reasoning_effort=""):
     return doc["providers"][spawners._PI_PROVIDER_ID]
 
 
-def _model_reasoning_effort(p):
-    return p["models"][0].get(spawners._PI_MODEL_REASONING_KEY, "")
+def _model_reasoning(p):
+    # pi's real thinking switch is the model entry's `reasoning` boolean (the exact
+    # level rides the CLI --thinking flag, not models.json).
+    return p["models"][0].get("reasoning", False)
 
 
 def test_pi_models_gemini():
@@ -823,24 +915,31 @@ def test_pi_models_deepseek_custom_base():
 def test_pi_openrouter_forwards_reasoning_effort():
     p = _prov("openrouter", model="x", base_url="", reasoning_effort="high")
     assert p["compat"]["supportsReasoningEffort"] is True
-    assert _model_reasoning_effort(p) == "high"
+    assert p["compat"]["thinkingFormat"] == "openrouter"
+    assert _model_reasoning(p) is True
 
 
 def test_pi_openrouter_off_omits_reasoning():
     p = _prov("openrouter", model="x", base_url="", reasoning_effort="off")
     assert p["compat"]["supportsReasoningEffort"] is False
-    assert _model_reasoning_effort(p) == ""
+    assert _model_reasoning(p) is False
 
 
 def test_pi_openrouter_bad_effort_normalized_to_medium():
+    # Garbage effort normalizes to medium: enables reasoning on the model AND pins
+    # the CLI to --thinking medium (the level itself now rides the flag, not json).
     p = _prov("openrouter", model="x", base_url="", reasoning_effort="ultra")
-    assert _model_reasoning_effort(p) == "medium"
+    assert _model_reasoning(p) is True
+    assert "--thinking medium" in spawners._default_cli_cmd(
+        "pi", "/h", model="x", reasoning_effort="ultra")
 
 
-def test_pi_openai_compatible_reasoning_only_when_set():
-    assert _prov("openai_compatible", model="q", base_url="https://m/v1")["compat"]["supportsReasoningEffort"] is False
+def test_pi_openai_compatible_reasoning_default_on_off_when_explicit():
+    # null (unset) defaults ON; explicit off disables; an explicit level passes through.
+    assert _model_reasoning(_prov("openai_compatible", model="q", base_url="https://m/v1")) is True
+    assert _model_reasoning(_prov("openai_compatible", model="q", base_url="https://m/v1", reasoning_effort="off")) is False
     p = _prov("openai_compatible", model="q", base_url="https://m/v1", reasoning_effort="low")
-    assert p["compat"]["supportsReasoningEffort"] is True and _model_reasoning_effort(p) == "low"
+    assert p["compat"]["supportsReasoningEffort"] is True and _model_reasoning(p) is True
 
 
 def test_claude_anthropic_base_url_empty_for_all():
