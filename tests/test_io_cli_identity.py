@@ -28,3 +28,14 @@ def test_identity_write_payload_partial_fields():
 
 def test_identity_write_payload_empty_is_none():
     assert io_cli._identity_write_payload(None, []) is None
+
+
+def test_identity_init_payload_fresh_start_and_sanitize():
+    from io_cli import _identity_init_payload
+    body = _identity_init_payload(
+        agent_name="阿锐", self_introduction="hi",
+        dimensions=[{"name": "锐利", "value": 150, "description": "x"}],
+        days_with_user=None, anchor=None, fresh_start=True)
+    assert body["days_with_user"] == 0
+    assert len(body["relationship_anchor_evidence"]) >= 8  # fresh-start 标准证据
+    assert body["identity"]["dimensions"][0]["value"] == 100  # sanitize 夹过

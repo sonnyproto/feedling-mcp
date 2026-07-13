@@ -34,6 +34,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "backend"))
+try:
+    from identity import card_policy as _card_policy  # single source, pure stdlib
+except Exception:
+    _card_policy = None
+
 FAST_SIGNALS = ("now", "location", "weather", "motion", "calendar")
 SLOW_SIGNALS = (
     "steps", "sleep", "workout", "vitals",
@@ -548,6 +554,57 @@ def cmd_identity_write(args):
     _emit({"ok": False, "http_status": status, "error": body}, 1)
 
 
+_FRESH_START_EVIDENCE = "user-confirmed fresh start"
+
+
+def _identity_init_payload(*, agent_name, self_introduction, dimensions,
+                           days_with_user, anchor, fresh_start):
+    """Build the /v1/identity/init body. Sanitize the card (clamp/dedup/truncate)
+    so structure is valid; fresh_start fills days=0 + standard anchor evidence."""
+    card = {
+        "agent_name": str(agent_name or ""),
+        "self_introduction": str(self_introduction or ""),
+        "dimensions": dimensions if isinstance(dimensions, list) else [],
+    }
+    if _card_policy is not None:
+        card = _card_policy.sanitize_identity_card(card)
+    if fresh_start:
+        days = 0
+        anchor = _FRESH_START_EVIDENCE
+    else:
+        days = int(days_with_user) if days_with_user is not None else None
+    return {"identity": card, "days_with_user": days,
+            "relationship_anchor_evidence": anchor or ""}
+
+
+def cmd_identity_init(args):
+    """Create the agent's identity card (POST /v1/identity/init).
+
+    Local pre-check only catches the STRONG checks sanitize can't fix (runtime-label
+    name, missing days/anchor) — everything else (out-of-range values, dupes,
+    unnamed dims) is auto-corrected by sanitize before this even runs. Contract:
+    走 io_cli 尽量不失败、多拿内容."""
+    api_url, auth = _require_backend()
+    dims = json.loads(args.dimensions) if args.dimensions else []
+    body = _identity_init_payload(
+        agent_name=args.agent_name, self_introduction=args.self_introduction,
+        dimensions=dims, days_with_user=args.days_with_user,
+        anchor=args.relationship_anchor_evidence, fresh_start=args.fresh_start)
+    # 强校验本地预检:只在 sanitize 修不了的 4 条上提示(runtime 名字 / days 缺锚点)
+    if _card_policy is not None:
+        ok, err = _card_policy.validate_full_identity_card(body["identity"])
+        if not ok:
+            _emit({"ok": False, "error": err,
+                   "hint": "非空名字不能是 runtime 标签(Claude 等);其余结构已自动修正"}, 2)
+    if body["days_with_user"] is None:
+        _emit({"ok": False, "error": "days_with_user_required",
+               "hint": "给 --days-with-user + --relationship-anchor-evidence,或用 --fresh-start"}, 2)
+    status, resp = _http_json("POST", f"{api_url}/v1/identity/init", auth, payload=body)
+    if status in (200, 201):
+        _emit({"ok": True, **(resp if isinstance(resp, dict) else {"result": resp})})
+    _emit({"ok": False, "http_status": status, "error": resp}, 1)
+
+
 def _memory_write_payload(*, summary, content, bucket, threads, importance, pulse, mem_type, source):
     """Build the /v1/memory/actions body for a single plaintext memory.add. Pure (testable).
 
@@ -774,6 +831,15 @@ def main():
     iw.add_argument("--signature", action="append", default=[],
                     help="repeatable short string(s) for the signature")
     iw.set_defaults(func=cmd_identity_write)
+
+    ii = sub.add_parser("identity-init", help="Create the identity card (sanitizes + fresh-start).")
+    ii.add_argument("--agent-name", default="")
+    ii.add_argument("--self-introduction", default="")
+    ii.add_argument("--dimensions", default="", help="JSON list of {name,value,description}")
+    ii.add_argument("--days-with-user", type=int, default=None)
+    ii.add_argument("--relationship-anchor-evidence", default="")
+    ii.add_argument("--fresh-start", action="store_true", help="days=0 + standard anchor")
+    ii.set_defaults(func=cmd_identity_init)
 
     mw = sub.add_parser("memory-write",
                         help="Write ONE memory card you distilled locally (plaintext; server encrypts).")
