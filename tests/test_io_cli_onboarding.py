@@ -22,3 +22,19 @@ def test_next_step_from_bootstrap():
     assert "greet" in _next_onboarding_step(s2)["next_cmd"]
     s3 = {"identity_written": True, "chat_loop_verified": True, "agent_messages_count": 1}
     assert _next_onboarding_step(s3)["done"] is True
+
+
+def test_doctor_summary_lists_failures():
+    from io_cli import _doctor_summary
+    out = _doctor_summary({"api": True, "enclave": False, "identity": True,
+                            "memory": True, "chat_write": False})
+    assert out["ok"] is False
+    assert set(out["failed"]) == {"enclave", "chat_write"}
+
+
+def test_doctor_summary_all_pass():
+    from io_cli import _doctor_summary
+    out = _doctor_summary({"api": True, "enclave": True, "identity": True,
+                            "memory": True, "chat_write": True})
+    assert out["ok"] is True
+    assert out["failed"] == []

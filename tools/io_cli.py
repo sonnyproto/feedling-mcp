@@ -797,6 +797,53 @@ def cmd_onboard_start(args):
     _emit({"ok": status in (200, 201), "http_status": status}, 0 if status in (200, 201) else 1)
 
 
+def _doctor_summary(checks):
+    """Pure: fold a {check_name: bool} map into {ok, checks, failed[]}."""
+    failed = [k for k, v in (checks or {}).items() if not v]
+    return {"ok": not failed, "checks": checks, "failed": failed}
+
+
+def cmd_doctor(args):
+    """Five-probe environment health check, read-only. GET/POST against api/enclave.
+
+    Purpose: surface environment failures early (sandbox no-net, bad key, enclave
+    down) rather than let onboarding fail opaquely deep in a later step. Every
+    probe is a pure read (no chat message sent, no card written).
+
+    Fresh-account judgment (no identity/memory/chat yet): checked against the
+    actual handlers — GET /v1/identity/get (backend identity_core.get_identity,
+    and its enclave decrypt-and-serve proxy) both return 200 with
+    ``identity: None`` when nothing has been written yet, never 404; POST
+    /v1/memory/index returns 200 with an empty items list on a fresh account;
+    GET /v1/chat/history returns 200 with an empty list. So a plain 2xx check
+    already treats "reachable but nothing there yet" as a pass — no fresh-account
+    special-casing needed. A genuine connection failure / 401 / 5xx is what
+    fails a check.
+    """
+    auth = _auth_headers()
+    api_url = _env("FEEDLING_API_URL")
+    enclave_url = _env("FEEDLING_ENCLAVE_URL")
+
+    def _ok(method, url, insecure=False, payload=None):
+        try:
+            s, _ = _http_json(method, url, auth, payload=payload, insecure=insecure, timeout=10)
+            return 200 <= s < 300
+        except Exception:
+            return False
+
+    checks = {
+        "api": bool(api_url) and _ok("GET", f"{api_url.rstrip('/')}/v1/users/whoami"),
+        "enclave": bool(enclave_url) and _ok("GET", f"{enclave_url.rstrip('/')}/v1/identity/get", insecure=True),
+        "identity": bool(api_url) and _ok("GET", f"{api_url.rstrip('/')}/v1/identity/get"),
+        # /v1/memory/index is POST-only (a readside query, not a mutation) — a
+        # GET here would 405 every time, always failing the check.
+        "memory": bool(api_url) and _ok("POST", f"{api_url.rstrip('/')}/v1/memory/index", payload={"limit": 1}),
+        "chat_write": bool(api_url) and _ok("GET", f"{api_url.rstrip('/')}/v1/chat/history?limit=1"),
+    }
+    out = _doctor_summary(checks)
+    _emit(out, 0 if out["ok"] else 1)
+
+
 def cmd_phase2(args):
     # send / sleep / schedule-wake / cancel-wake are NOT pull tools in the native
     # model — the agent emits them as output actions (JSON messages/actions) which
@@ -951,6 +998,10 @@ def main():
     obs = sub.add_parser("onboard-start",
                          help="Signal that onboarding has started (track event).")
     obs.set_defaults(func=cmd_onboard_start)
+
+    dr = sub.add_parser("doctor",
+                        help="Five-probe environment health check (api/enclave/identity/memory/chat, read-only).")
+    dr.set_defaults(func=cmd_doctor)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")
