@@ -759,6 +759,44 @@ def cmd_chat_verify_loop(args):
            **(body if isinstance(body, dict) else {})}, 0 if status == 200 else 1)
 
 
+def _next_onboarding_step(status):
+    """Pure: derive the current onboarding step + the next io_cli command from a
+    ``/v1/bootstrap/status`` snapshot. identity -> live_loop -> greet -> complete.
+
+    The greet step's ``chat-greet`` io_cli verb does not exist (posting a chat
+    message needs client-side crypto, so it goes through the resident consumer,
+    not io_cli) — ``next_cmd`` for that step is a plain instruction, not a
+    runnable io_cli command.
+    """
+    s = status if isinstance(status, dict) else {}
+    if not s.get("identity_written"):
+        return {"step": "identity", "done": False,
+                "next_cmd": "io_cli identity-init --agent-name <name> --dimensions <json> --fresh-start"}
+    if not s.get("chat_loop_verified"):
+        return {"step": "live_loop", "done": False, "next_cmd": "io_cli chat-verify-loop"}
+    if int(s.get("agent_messages_count") or 0) < 1:
+        return {"step": "greet", "done": False,
+                "next_cmd": "send your greeting now (the resident consumer delivers it; no io_cli verb for this)"}
+    return {"step": "complete", "done": True, "next_cmd": ""}
+
+
+def cmd_onboard(args):
+    """Next-step onboarding guide. GET /v1/bootstrap/status -> _next_onboarding_step."""
+    api_url, auth = _require_backend()
+    status, body = _http_json("GET", f"{api_url}/v1/bootstrap/status", auth)
+    nxt = _next_onboarding_step(body if isinstance(body, dict) else {})
+    _emit({"ok": status == 200, "http_status": status, "status": body, **nxt},
+          0 if status == 200 else 1)
+
+
+def cmd_onboard_start(args):
+    """Signal onboarding began (idempotent-ish). POST /v1/track/event."""
+    api_url, auth = _require_backend()
+    status, body = _http_json("POST", f"{api_url}/v1/track/event", auth,
+                               payload={"event": "resident_onboarding_started"})
+    _emit({"ok": status in (200, 201), "http_status": status}, 0 if status in (200, 201) else 1)
+
+
 def cmd_phase2(args):
     # send / sleep / schedule-wake / cancel-wake are NOT pull tools in the native
     # model — the agent emits them as output actions (JSON messages/actions) which
@@ -905,6 +943,14 @@ def main():
     cvl = sub.add_parser("chat-verify-loop",
                          help="Liveness probe: ping the resident-consumer reply pipeline and wait for a reply.")
     cvl.set_defaults(func=cmd_chat_verify_loop)
+
+    ob = sub.add_parser("onboard",
+                        help="Next-step onboarding guide (bootstrap status + what to run next).")
+    ob.set_defaults(func=cmd_onboard)
+
+    obs = sub.add_parser("onboard-start",
+                         help="Signal that onboarding has started (track event).")
+    obs.set_defaults(func=cmd_onboard_start)
 
     for verb in PHASE2_VERBS:
         sp = sub.add_parser(verb, help="(phase 2 — not implemented yet)")
