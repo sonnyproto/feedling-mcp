@@ -374,3 +374,38 @@ def test_offloaded_file_row_hydration_failure_freezes_cursor(backend_env, monkey
     cur = _tee("SELECT watermark_id FROM tee_replication_cursors WHERE table_name='chat_messages'")
     assert cur[0][0] == "a"
     assert _tee("SELECT count(*) FROM chat_messages WHERE user_id=%s AND msg_id='c'", (uid,))[0][0] == 1
+
+
+def test_poison_row_skipped_not_wedging_table(backend_env, monkeypatch):
+    """一行落库失败(明文含 PG 存不了的内容,如 scrub 漏掉的 NUL)不能拖垮整表:
+    批量写失败要降级逐行、跳过毒行、其余照写、游标推进过它。"""
+    import dataclasses
+    from tee_replicator import transforms
+    _reset_cursor("chat_messages")
+    uid = f"usr_{uuid.uuid4().hex[:8]}"
+    _seed(uid)
+    _insert_chat(uid, "good1", 10.0, "AAA")
+    _insert_chat(uid, "poison", 20.0, "BAD")
+    _insert_chat(uid, "good2", 30.0, "CCC")
+
+    orig = transforms.plaintext_chat_doc
+
+    def poisoning(doc, decrypt):
+        out = orig(doc, decrypt)
+        if doc.get("id") == "poison":
+            out["body"] = "x\x00y"  # NUL survives into stored doc → PG rejects on write
+        return out
+
+    poisoned = dataclasses.replace(worker._TABLES["chat_messages"], transform=poisoning)
+    monkeypatch.setitem(worker._TABLES, "chat_messages", poisoned)
+
+    report = worker.run_table("chat_messages", qps=1000)
+
+    assert report["skipped"] >= 1
+    # good rows landed despite the poison row in the same batch
+    got = {r[0] for r in _tee("SELECT msg_id FROM chat_messages WHERE user_id=%s", (uid,))}
+    assert {"good1", "good2"} <= got
+    assert "poison" not in got
+    # cursor advanced past the poison row (last row 'good2') → table not wedged
+    cur = _tee("SELECT watermark_id FROM tee_replication_cursors WHERE table_name='chat_messages'")
+    assert cur[0][0] == "good2"

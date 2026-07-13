@@ -72,10 +72,17 @@ TABLES: dict[str, tuple[tuple[str, ...], str]] = {
 #
 # user_blobs 排除 kind='identity'：identity 归 tee_replicator 明文化——RDS 里
 # 是密文信封、TEE 里是 replicator 落的明文版本，密文绝不能盖明文；TEE 侧的
-# 明文 identity 行也不能被当 orphan prune 掉。其余 kind（如 model_api 的
-# provider-key 信封）有意原样镜像（credential 保持加密）。
+# 明文 identity 行也不能被当 orphan prune 掉。
+#
+# 排除 kind='consumer_state'：db.set_blob 有意不镜像它（它是每次 /v1/chat/poll 都写
+# 一次的最热写，且只是 runner 侧运维状态、不是用户数据——见该函数注释）。辖区必须与
+# 镜像端一致：否则 reconciler 会把镜像端故意不写的行 copy 回 TEE、并在两侧计数中要求
+# 它存在，等于把刚摘掉的负载又装回去。已在 TEE 里的历史 consumer_state 行会被 prune
+# 收敛掉（辖区外 = orphan），这是期望行为。
+#
+# 其余 kind（如 model_api 的 provider-key 信封）有意原样镜像（credential 保持加密）。
 _SCOPE_WHERE: dict[str, str] = {
-    "user_blobs": "kind <> 'identity'",
+    "user_blobs": "kind NOT IN ('identity', 'consumer_state')",
 }
 
 # 有 GENERATED ALWAYS AS IDENTITY 列的表 → 该 IDENTITY 列名。普通 INSERT 不能

@@ -535,6 +535,21 @@ def _consume_requeue(cfg: _Table, table: str) -> tuple[int, int, int]:
 _SEQ_TABLES: dict[str, str] = {"chat_messages": "seq"}
 
 
+def _write_pending_and_cursor(dst, cfg, table, pend_rows, adv_ts, adv_id) -> None:
+    """把 PendingDeviceMigration 标记 + 游标推进写进当前(调用方开的)事务。
+
+    pend_rows 是 (user_id, item_id, reason) 三元组。PDM 是终态(local_only /
+    无 K_enclave):若同 PK 之前已被复制成 TEE 明文(如 requeue 原地改写后新密文
+    不可解),那残留明文是隐私泄漏,须删——与终态 pending 标记同事务删,使 verify
+    的 rds == tee + pending 保持平衡。按 PK 幂等 DELETE:没复制过就是 no-op。"""
+    for uid, iid, reason in pend_rows:
+        if cfg.requeue_delete_tee_sql is not None:
+            key = (uid,) if cfg.requeue_by_user_only else (uid, iid)
+            dst.execute(cfg.requeue_delete_tee_sql, key)
+        dst.execute(_PENDING_UPSERT, (uid, table, iid, reason))
+    dst.execute(_CURSOR_UPSERT, (table, adv_ts, adv_id))
+
+
 def run_table(table: str, *, qps: float = 2.0, dry_run: bool = False,
               limit: int | None = None) -> dict:
     """把 RDS ``table`` 的密文增量解密复制进 TEE 明文库。
@@ -548,7 +563,7 @@ def run_table(table: str, *, qps: float = 2.0, dry_run: bool = False,
     """
     cfg = _TABLES[table]
     wm_ts, wm_id = _read_cursor(table)
-    copied = pending = errors = 0
+    copied = pending = errors = skipped = 0
     # Requeue lane first (non-dry-run): drain same-PK in-place rewrites the
     # append-only cursor can't see. Independent of the cursor — its failures
     # never freeze it.
@@ -597,30 +612,32 @@ def run_table(table: str, *, qps: float = 2.0, dry_run: bool = False,
                     adv_ts, adv_id = _encode_cursor(cfg, sort_val, item_id)
 
             if not dry_run:
-                # 整批写 + 游标推进单事务：写失败则整批回滚、游标不动 → 下次重跑。
+                # 整批写 + pending + 游标推进单事务：写失败则整批回滚、游标不动 → 下次重跑。
+                # 但若某行是「毒行」——transform 通过了、落库却失败(解密出的明文含 NUL 或
+                # 其它 PostgreSQL 不接受的内容)——整批回滚 + 游标卡在它前面 = 那张表永久
+                # 卡死(每趟都撞同一行)。故落库失败时降级:逐行用 savepoint 写、存不了的
+                # 行跳过(计 skipped)、其余照写,pending 与游标照常推进,让毒行不能拖垮整表。
                 with mirror.get_tee_pool().connection() as dst:
-                    with dst.transaction():
-                        for args in writes:
-                            dst.execute(cfg.upsert_sql, args)
-                        for uid, iid, reason in pend_rows:
-                            # PendingDeviceMigration is a terminal state
-                            # (local_only / no-K_enclave). If an earlier pass
-                            # already replicated this same PK to TEE before
-                            # the row was rewritten (e.g. a requeue-lane
-                            # in-place edit whose new ciphertext is now
-                            # undecryptable), that stale plaintext is a
-                            # privacy leak and must go — delete it in the
-                            # same transaction as the terminal pending marker
-                            # so verify's rds == tee + pending stays balanced.
-                            # Idempotent DELETE by PK: no-op if the row was
-                            # never copied (the common case — most PDM rows
-                            # are local_only from creation and never touch
-                            # TEE in the first place).
-                            if cfg.requeue_delete_tee_sql is not None:
-                                key = (uid,) if cfg.requeue_by_user_only else (uid, iid)
-                                dst.execute(cfg.requeue_delete_tee_sql, key)
-                            dst.execute(_PENDING_UPSERT, (uid, table, iid, reason))
-                        dst.execute(_CURSOR_UPSERT, (table, adv_ts, adv_id))
+                    try:
+                        with dst.transaction():
+                            for args in writes:
+                                dst.execute(cfg.upsert_sql, args)
+                            _write_pending_and_cursor(dst, cfg, table, pend_rows,
+                                                      adv_ts, adv_id)
+                    except Exception as batch_exc:  # noqa: BLE001 — 降级逐行跳过毒行
+                        log.warning("[tee-replicate] %s 批量写失败,降级逐行: %s",
+                                    table, str(batch_exc)[:80])
+                        with dst.transaction():
+                            for args in writes:
+                                try:
+                                    with dst.transaction():
+                                        dst.execute(cfg.upsert_sql, args)
+                                except Exception as row_exc:  # noqa: BLE001
+                                    skipped += 1
+                                    log.warning("[tee-replicate] %s 跳过存不了的毒行: %s",
+                                                table, str(row_exc)[:80])
+                            _write_pending_and_cursor(dst, cfg, table, pend_rows,
+                                                      adv_ts, adv_id)
 
             wm_ts, wm_id = adv_ts, adv_id
             if remaining is not None:
@@ -648,6 +665,6 @@ def run_table(table: str, *, qps: float = 2.0, dry_run: bool = False,
                     (table, seq_col))
 
     report = {"table": table, "copied": copied, "pending": pending, "errors": errors,
-              "watermark_ts": wm_ts, "watermark_id": wm_id}
+              "skipped": skipped, "watermark_ts": wm_ts, "watermark_id": wm_id}
     log.info("[tee-replicate] %s", report)
     return report

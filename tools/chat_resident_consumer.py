@@ -499,7 +499,7 @@ def _report_runtime_error(error: str, error_class: str = "") -> bool:
     回合重试清空，否则设置页会一直挂着过期错误直到下次失败或 respawn。"""
     global _runtime_error_reported
     try:
-        resp = httpx.post(
+        resp = _HTTP.post(
             f"{FEEDLING_API_URL}/v1/model_api/runtime_error",
             json={"error": (error or "")[:300], "error_class": (error_class or "")[:64]},
             headers=_HEADERS, timeout=10,
@@ -606,7 +606,7 @@ def _post_debug_trace_event(payload: dict) -> None:
     """Actual network call for a debug-trace event. Runs on a background
     thread (see `_emit_debug_trace`) — never raises, short timeout."""
     try:
-        httpx.post(
+        _HTTP.post(
             f"{FEEDLING_API_URL}/v1/debug/trace/event",
             json=payload,
             headers=_HEADERS, timeout=2,
@@ -642,7 +642,7 @@ def _refresh_debug_trace_enabled() -> None:
     caches False so we don't keep hammering an unhappy backend every turn."""
     enabled = False
     try:
-        resp = httpx.get(
+        resp = _HTTP.get(
             f"{FEEDLING_API_URL}/v1/debug/trace",
             params={"limit": 1},
             headers=_HEADERS, timeout=2,
@@ -996,6 +996,45 @@ _ENCLAVE_CLIENT: httpx.Client | None = (
     httpx.Client(timeout=20, verify=False) if FEEDLING_ENCLAVE_URL else None
 )
 
+# Pooled client for everything that is NOT the enclave — the backend API and the
+# local agent. httpx's module-level verb helpers build a
+# throwaway Client per call, so a consumer that polls the backend every few
+# seconds for its whole life paid a full TCP+TLS handshake on EVERY request
+# (measured against test-api: 5203ms/req unpooled vs 973ms/req pooled).
+#
+# ``keepalive_expiry`` must stay BELOW the server's keepalive
+# (backend/gunicorn_conf.py = 75s): the side that retires an idle socket first
+# must be us, not the server — reusing a socket the server has already closed is
+# exactly the stale-connection race that keepalive fix was about, and there is no
+# reason to import it into the client.
+# max_connections is httpx's own default (100) spelled out: passing a bare Limits()
+# would silently drop it to None (unbounded). This process serves one user and runs
+# a handful of threads, so the cap is a guardrail, never a queue.
+_HTTP = httpx.Client(
+    timeout=20,
+    limits=httpx.Limits(
+        max_connections=100, max_keepalive_connections=20, keepalive_expiry=60.0
+    ),
+)
+
+
+def _client_for(root: str) -> httpx.Client:
+    """Pick the client by target: the enclave serves a self-signed cert and needs
+    verification off, everything else needs it on. Call sites used to pass
+    ``verify=`` per request, which a pooled Client cannot honour (``verify`` is a
+    client-level setting, not a per-request one).
+
+    The enclave client is built on demand rather than read from the import-time
+    global, so the decision tracks the CURRENT ``FEEDLING_ENCLAVE_URL`` exactly as
+    the old per-request ``verify=`` expression did.
+    """
+    global _ENCLAVE_CLIENT
+    if FEEDLING_ENCLAVE_URL and root.rstrip("/") == FEEDLING_ENCLAVE_URL.rstrip("/"):
+        if _ENCLAVE_CLIENT is None:
+            _ENCLAVE_CLIENT = httpx.Client(timeout=20, verify=False)
+        return _ENCLAVE_CLIENT
+    return _HTTP
+
 _decrypt_sources = (
     f"enclave={FEEDLING_ENCLAVE_URL}" if FEEDLING_ENCLAVE_URL else ""
 ).strip() or "NONE — replies will not work for v1 encrypted messages"
@@ -1262,7 +1301,7 @@ def _verify_decrypt_sources() -> bool:
 
     if FEEDLING_ENCLAVE_URL:
         try:
-            client = _ENCLAVE_CLIENT or httpx
+            client = _client_for(FEEDLING_ENCLAVE_URL)
             resp = client.get(
                 f"{FEEDLING_ENCLAVE_URL}/v1/chat/history",
                 params={"limit": 1},
@@ -1635,7 +1674,7 @@ def _fetch_screen_json(path: str) -> dict | None:
     last_error: Exception | None = None
     for attempt in range(3):
         try:
-            resp = httpx.get(f"{FEEDLING_API_URL}{path}", headers=_HEADERS, timeout=20)
+            resp = _HTTP.get(f"{FEEDLING_API_URL}{path}", headers=_HEADERS, timeout=20)
             if resp.status_code == 404:
                 return None
             resp.raise_for_status()
@@ -1723,7 +1762,7 @@ def _worldbook_context_for_foreground(content: str) -> str:
     if not text:
         return ""
     try:
-        resp = httpx.post(
+        resp = _HTTP.post(
             f"{FEEDLING_API_URL}/v1/worldbook/match",
             headers=_HEADERS,
             json={"message": text},
@@ -3097,7 +3136,7 @@ def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = 
     payload = {"message": message}
     if images:
         payload["images"] = images
-    resp = httpx.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=60)
+    resp = _HTTP.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=60)
     resp.raise_for_status()
     _remember_http_session(
         resp,
@@ -3144,7 +3183,7 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
         "messages": [{"role": "user", "content": content}],
         "stream": False,
     }
-    resp = httpx.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=120)
+    resp = _HTTP.post(AGENT_HTTP_URL, json=payload, headers=headers, timeout=120)
     resp.raise_for_status()
     _remember_http_session(
         resp,
@@ -4106,6 +4145,21 @@ def call_agent_cli(
     # through (else the consumer would leak pi's internal handshake noise).
     if _is_pi_cmd(cmd):
         pi_reply, pi_thinking = _pi_turn_from_stream(result.stdout)
+        # TEMP DEBUG [PI-THINK-DBG] — pi 思维链丢失排查. 只记结构统计, 无用户内容. 删除见同标记.
+        try:
+            _dbg_mends = [o for o in _json_objects_from_cli_output(result.stdout or "")
+                          if isinstance(o, dict) and o.get("type") == "message_end"]
+            _dbg_blocks = sum(
+                1 for o in _dbg_mends for b in ((o.get("message") or {}).get("content") or [])
+                if isinstance(b, dict) and b.get("type") == "thinking" and (b.get("thinking") or "").strip())
+            _dbg_reason = sum(
+                int(((o.get("message") or {}).get("usage") or {}).get("reasoning") or 0) for o in _dbg_mends)
+            log.warning(
+                "[PI-THINK-DBG] reply_len=%d thinking_len=%d raw_text=%s msg_ends=%d nonempty_think_blocks=%d reasoning_tokens=%d",
+                len(pi_reply or ""), len(pi_thinking or ""), raw_text,
+                len(_dbg_mends), _dbg_blocks, _dbg_reason)
+        except Exception as _dbg_e:  # noqa: BLE001
+            log.warning("[PI-THINK-DBG] stats failed: %s", _dbg_e)
         if pi_reply:
             # Same lane discipline as codex: background memory lanes (raw_text)
             # get the bare reply; only foreground chat folds thinking into the
@@ -4418,7 +4472,7 @@ _whoami_cache_loaded_at: float = 0.0
 def execute_identity_actions(actions: list[dict]) -> dict:
     if not actions:
         return {"status": "ok", "results": [], "effects": []}
-    resp = httpx.post(
+    resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/identity/actions",
         json={"actions": actions},
         headers=_HEADERS,
@@ -4435,7 +4489,7 @@ def execute_identity_actions(actions: list[dict]) -> dict:
 def execute_memory_actions(actions: list[dict]) -> dict:
     if not actions:
         return {"status": "ok", "results": [], "effects": []}
-    resp = httpx.post(
+    resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/memory/actions",
         json={"actions": actions},
         headers=_HEADERS,
@@ -4505,7 +4559,7 @@ def _load_whoami() -> bool:
     local_only), but shared-visibility envelopes require it.
     """
     try:
-        resp = httpx.get(
+        resp = _HTTP.get(
             f"{FEEDLING_API_URL}/v1/users/whoami", headers=_HEADERS, timeout=10
         )
         resp.raise_for_status()
@@ -4637,7 +4691,7 @@ def _refresh_whoami_for_encrypted_reply() -> bool:
 def poll_chat(since: float) -> dict:
     url = f"{FEEDLING_API_URL}/v1/chat/poll"
     params = {"since": since, "timeout": POLL_TIMEOUT}
-    resp = httpx.get(url, params=params, headers=_HEADERS, timeout=POLL_TIMEOUT + 10)
+    resp = _HTTP.get(url, params=params, headers=_HEADERS, timeout=POLL_TIMEOUT + 10)
     resp.raise_for_status()
     body = resp.json()
     if isinstance(body, dict):
@@ -4680,7 +4734,7 @@ def _update_user_mcp_advertised(payload) -> None:
 
 
 def _fetch_user_mcp_envelopes() -> dict:
-    resp = httpx.get(
+    resp = _HTTP.get(
         f"{FEEDLING_API_URL}/v1/mcp/envelopes", headers=_HEADERS, timeout=20)
     resp.raise_for_status()
     return resp.json()
@@ -4808,7 +4862,7 @@ def poll_proactive_jobs(since: float) -> dict:
     url = f"{FEEDLING_API_URL}/v1/proactive/jobs/poll"
     timeout = max(0, PROACTIVE_POLL_TIMEOUT)
     params = {"since": since, "timeout": timeout}
-    resp = httpx.get(url, params=params, headers=_HEADERS, timeout=timeout + 10)
+    resp = _HTTP.get(url, params=params, headers=_HEADERS, timeout=timeout + 10)
     resp.raise_for_status()
     body = resp.json()
     if isinstance(body, dict):
@@ -4866,13 +4920,13 @@ def _proactive_tick_interval_for_broadcast_state(
 
 def post_proactive_tick(payload: dict[str, Any] | None = None) -> dict:
     url = f"{FEEDLING_API_URL}/v1/proactive/tick"
-    resp = httpx.post(url, json=payload or {}, headers=_HEADERS, timeout=30)
+    resp = _HTTP.post(url, json=payload or {}, headers=_HEADERS, timeout=30)
     resp.raise_for_status()
     return resp.json()
 
 
 def fire_scheduled_wakes() -> dict:
-    resp = httpx.post(
+    resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/proactive/scheduled/fire",
         json={},
         headers=_HEADERS,
@@ -4921,7 +4975,7 @@ def post_screen_watch_tick(broadcast_state: str, frames: list[dict]) -> dict:
 
 
 def fire_capture_tick() -> dict:
-    resp = httpx.post(
+    resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/capture/tick",
         json={},
         headers=_HEADERS,
@@ -4936,7 +4990,7 @@ def claim_proactive_job(job_id: str) -> bool:
     if not job_id:
         return False
     url = f"{FEEDLING_API_URL}/v1/proactive/jobs/{job_id}/claim"
-    resp = httpx.post(
+    resp = _HTTP.post(
         url,
         json={"consumer_id": CONSUMER_ID},
         headers=_HEADERS,
@@ -4965,7 +5019,7 @@ def update_proactive_job_status(
         }
         if isinstance(extra, dict):
             body.update(extra)
-        resp = httpx.post(
+        resp = _HTTP.post(
             url,
             json=body,
             headers=_HEADERS,
@@ -4981,7 +5035,7 @@ def update_proactive_state(**patch: Any) -> None:
     if not clean:
         return
     try:
-        resp = httpx.post(
+        resp = _HTTP.post(
             f"{FEEDLING_API_URL}/v1/proactive/state",
             json=clean,
             headers=_HEADERS,
@@ -5043,7 +5097,7 @@ def execute_scheduled_wake_actions(actions: list[dict], job: dict) -> dict:
         "wake_ids": _job_wake_ids(job),
         "origin_refs": _job_origin_refs(job),
     }
-    resp = httpx.post(
+    resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/proactive/scheduled/actions",
         json=body,
         headers=_HEADERS,
@@ -5151,7 +5205,7 @@ def post_reply(
                 "gate_decision_id": gate_decision_id,
                 "proactive_job_id": proactive_job_id,
             }
-        resp = httpx.post(url, json=body, headers=_HEADERS, timeout=15)
+        resp = _HTTP.post(url, json=body, headers=_HEADERS, timeout=15)
         return _handle_post_reply_response(resp)
 
     # Encryption unavailable — plaintext path (will 400 on v1 backends).
@@ -5159,7 +5213,7 @@ def post_reply(
         "ENCRYPTION UNAVAILABLE — posting plaintext will fail on v1 backends. "
         "Ensure content_encryption.py is importable and whoami succeeded."
     )
-    resp = httpx.post(
+    resp = _HTTP.post(
         url,
         json={
             "content": content,
@@ -5215,7 +5269,7 @@ def _handle_post_reply_response(resp) -> dict:
 
 def get_latest_ts() -> float:
     url = f"{FEEDLING_API_URL}/v1/chat/history"
-    resp = httpx.get(url, params={"limit": 1}, headers=_HEADERS, timeout=10)
+    resp = _HTTP.get(url, params={"limit": 1}, headers=_HEADERS, timeout=10)
     resp.raise_for_status()
     data = resp.json()
     messages = data.get("messages") or data.get("history") or []
@@ -5696,7 +5750,7 @@ def _new_photo_hint(job: dict) -> str:
     if not _is_photo_added_job(job):
         return ""
     try:
-        resp = httpx.get(
+        resp = _HTTP.get(
             f"{FEEDLING_API_URL}/v1/perception/photos",
             headers=_HEADERS,
             params={"limit": 1},
@@ -5885,7 +5939,7 @@ def _is_memory_dream_job(job: dict) -> bool:
 def _resident_perception_trend(signal: str, field: str) -> dict:
     """Best-effort GET of one signal's rolling baseline/delta (Tier 2 history)."""
     try:
-        resp = httpx.get(
+        resp = _HTTP.get(
             f"{FEEDLING_API_URL}/v1/agent/perception/trend",
             headers=_HEADERS,
             params={"signal": signal, "field": field, "days": 30},
@@ -5906,7 +5960,7 @@ def _resident_perception_now() -> dict:
     retired simulated resident tool bridge.
     """
     try:
-        resp = httpx.get(
+        resp = _HTTP.get(
             f"{FEEDLING_API_URL}/v1/agent/perception",
             headers=_HEADERS,
             params={"signals": "now"},
@@ -6002,7 +6056,7 @@ def _resident_perception_digest_board() -> tuple[list, dict]:
     Degrades to ([], {}) if the endpoint is unavailable. The agent can still
     drill into any signal on demand via the perception_trend/history tools."""
     try:
-        resp = httpx.get(
+        resp = _HTTP.get(
             f"{FEEDLING_API_URL}/v1/agent/perception/digest",
             headers=_HEADERS,
             params={"days": 30},
@@ -6107,14 +6161,12 @@ def _capture_get_json(
 ) -> dict:
     _refresh_auth_header()
     root = (base_url or FEEDLING_API_URL).rstrip("/")
-    verify_tls = not (FEEDLING_ENCLAVE_URL and root == FEEDLING_ENCLAVE_URL)
     try:
-        resp = httpx.get(
+        resp = _client_for(root).get(
             f"{root}{path}",
             params=params or {},
             headers=_HEADERS,
             timeout=timeout,
-            verify=verify_tls,
         )
         resp.raise_for_status()
         body = resp.json()
@@ -6133,14 +6185,12 @@ def _capture_post_json(
 ) -> dict:
     _refresh_auth_header()
     root = (base_url or FEEDLING_API_URL).rstrip("/")
-    verify_tls = not (FEEDLING_ENCLAVE_URL and root == FEEDLING_ENCLAVE_URL)
     try:
-        resp = httpx.post(
+        resp = _client_for(root).post(
             f"{root}{path}",
             json=payload or {},
             headers=_HEADERS,
             timeout=timeout,
-            verify=verify_tls,
         )
         resp.raise_for_status()
         body = resp.json()
@@ -7791,7 +7841,7 @@ _RESIDENT_CONSUMER_ID = f"resident-distill-{CHECKPOINT_API_KEY_FINGERPRINT}"
 
 
 def genesis_resident_pending() -> list[dict]:
-    resp = httpx.get(
+    resp = _HTTP.get(
         f"{FEEDLING_API_URL}/v1/genesis/resident/pending",
         params={"consumer_id": _RESIDENT_CONSUMER_ID},
         headers=_HEADERS,
@@ -7804,7 +7854,7 @@ def genesis_resident_pending() -> list[dict]:
 
 def genesis_resident_heartbeat(job_id: str) -> None:
     try:
-        httpx.post(
+        _HTTP.post(
             f"{FEEDLING_API_URL}/v1/genesis/resident/{job_id}/heartbeat",
             json={"consumer_id": _RESIDENT_CONSUMER_ID},
             headers=_HEADERS,
@@ -7815,7 +7865,7 @@ def genesis_resident_heartbeat(job_id: str) -> None:
 
 
 def genesis_resident_complete(job_id: str, *, memory_action_count: int, identity_status: str) -> None:
-    resp = httpx.post(
+    resp = _HTTP.post(
         f"{FEEDLING_API_URL}/v1/genesis/resident/{job_id}/complete",
         json={"memory_action_count": memory_action_count, "identity_status": identity_status},
         headers=_HEADERS,
