@@ -93,3 +93,37 @@ def validate_dimension_nudge(target_name: str, new_value) -> tuple[bool, str]:
     if new_value < _VALUE_MIN or new_value > _VALUE_MAX:
         return (False, "dimension_value_out_of_range")
     return _OK
+
+
+def sanitize_identity_card(card: dict) -> dict:
+    """Best-effort clean so the card PASSES structure validation WITHOUT losing
+    usable content (contract: capture more, don't reject fuzzy issues).
+    Clamp values to [0,100]; drop non-dict / non-number-valued / unnamed dims;
+    drop duplicate dimension names (keep first); truncate to MAX_DIMENSIONS.
+    Does NOT touch agent_name — empty is allowed and a runtime-label name is a
+    STRONG check the caller handles; we never invent a name here."""
+    if not isinstance(card, dict):
+        return card
+    out = dict(card)
+    dims = card.get("dimensions")
+    if isinstance(dims, list):
+        cleaned: list = []
+        seen: set[str] = set()
+        for d in dims:
+            if not isinstance(d, dict):
+                continue
+            name = str(d.get("name") or "").strip()
+            if not name or name.lower() in seen:
+                continue
+            v = d.get("value")
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                continue
+            nd = dict(d)
+            nd["name"] = name
+            nd["value"] = max(_VALUE_MIN, min(_VALUE_MAX, v))
+            seen.add(name.lower())
+            cleaned.append(nd)
+            if len(cleaned) >= MAX_DIMENSIONS:
+                break
+        out["dimensions"] = cleaned
+    return out

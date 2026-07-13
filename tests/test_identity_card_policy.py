@@ -87,3 +87,31 @@ def test_dimensions_structure_rejects_too_many_and_non_dict():
 def test_runtime_labels_full_set_locked():
     # locks the full 36-label set so a future accidental drop is caught
     assert len(card_policy.RUNTIME_LABELS) == 36
+
+
+def test_sanitize_clamps_dedups_truncates_drops():
+    dirty = {"agent_name": "阿锐", "dimensions": [
+        {"name": "锐利", "value": 150, "description": "x"},   # 越界 → 夹到 100
+        {"name": "锐利", "value": 30, "description": "dup"},   # 重名 → 丢
+        {"name": "温情", "value": -5, "description": "y"},     # 越界 → 夹到 0
+        {"name": "坏", "value": "hi", "description": "z"},      # 非数字 → 丢
+        "not-a-dict",                                           # 非 dict → 丢
+    ]}
+    out = card_policy.sanitize_identity_card(dirty)
+    dims = out["dimensions"]
+    assert [d["name"] for d in dims] == ["锐利", "温情"]
+    assert dims[0]["value"] == 100 and dims[1]["value"] == 0
+    # sanitize 后必然通过强校验(结构)
+    assert card_policy.validate_dimensions_structure(dims) == (True, "")
+
+
+def test_sanitize_truncates_to_max():
+    many = {"agent_name": "阿锐", "dimensions": [
+        {"name": f"d{i}", "value": 50, "description": "x"} for i in range(20)]}
+    assert len(card_policy.sanitize_identity_card(many)["dimensions"]) == card_policy.MAX_DIMENSIONS
+
+
+def test_sanitize_leaves_name_untouched():
+    # 空名/runtime 名字 sanitize 不动(名字是强校验/引导层的事,不在这瞎编)
+    assert card_policy.sanitize_identity_card({"agent_name": "", "dimensions": []})["agent_name"] == ""
+    assert card_policy.sanitize_identity_card({"agent_name": "Claude", "dimensions": []})["agent_name"] == "Claude"
