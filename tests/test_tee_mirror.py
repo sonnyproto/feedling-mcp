@@ -49,3 +49,13 @@ def test_mirror_execute_many_atomic_and_counts_failure(monkeypatch):
     ])
     assert mirror.failure_count() == before + 1
     assert _tee("SELECT count(*) FROM server_config WHERE key='k5'")[0][0] == 0
+
+
+def test_pool_timeout_env_configurable(monkeypatch):
+    from tee_shadow import mirror
+    monkeypatch.delenv("FEEDLING_TEE_POOL_TIMEOUT", raising=False)
+    assert mirror._pool_timeout() == 15.0  # default widened from the old hardcoded 5s
+    monkeypatch.setenv("FEEDLING_TEE_POOL_TIMEOUT", "30")
+    assert mirror._pool_timeout() == 30.0
+    monkeypatch.setenv("FEEDLING_TEE_POOL_TIMEOUT", "garbage")
+    assert mirror._pool_timeout() == 15.0  # bad value falls back to default

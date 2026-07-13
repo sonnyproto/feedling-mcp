@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 
 import db
+from psycopg import errors as pg_errors
 from psycopg.types.json import Jsonb
 from tee_shadow import mirror
 
@@ -128,6 +129,7 @@ def reconcile_table(table: str, *, prune: bool = True) -> dict:
         # transaction wrapper under autocommit — plain LIMIT/keyset avoids
         # that entirely and handles composite pks via row-value comparison.
         last: tuple | None = None
+        skipped = 0
         while True:
             if last is None:
                 rows = src.execute(select_page, (BATCH,)).fetchall()
@@ -136,11 +138,26 @@ def reconcile_table(table: str, *, prune: bool = True) -> dict:
             if not rows:
                 break
             rds_rows += len(rows)
-            with dst.transaction():
+            try:
+                with dst.transaction():
+                    for row in rows:
+                        dst.execute(upsert, _wrap_jsonb(row))
+                copied += len(rows)
+            except pg_errors.ForeignKeyViolation:
+                # 并发账号删除(CASCADE)会让本批个别子行的 parent(users)在 TEE 里
+                # 已消失 —— reconciler 逐表读快照、非单事务,故读到瞬时跨表不一致。
+                # 严格外键拒绝整批。降级逐行:好行照写,孤儿行跳过(它们在 RDS 也
+                # 会被 CASCADE 删,下一趟 prune 收敛)。绝不因此让整个 reconcile 崩。
                 for row in rows:
-                    dst.execute(upsert, _wrap_jsonb(row))
-            copied += len(rows)
+                    try:
+                        with dst.transaction():
+                            dst.execute(upsert, _wrap_jsonb(row))
+                        copied += 1
+                    except pg_errors.ForeignKeyViolation:
+                        skipped += 1
             last = tuple(rows[-1][i] for i in pk_idx)
+        if skipped:
+            log.warning("[reconcile] %s: 跳过 %d 条孤儿行(parent 并发删除)", table, skipped)
 
         if prune:
             pk_cols = ", ".join(pk)
@@ -171,7 +188,7 @@ def reconcile_table(table: str, *, prune: bool = True) -> dict:
             f"SELECT count(*) FROM {table}{scope_where}").fetchone()[0]
 
     report = {"table": table, "copied": copied, "pruned": pruned,
-              "rds_rows": rds_rows, "tee_rows": tee_rows}
+              "skipped": skipped, "rds_rows": rds_rows, "tee_rows": tee_rows}
     log.info("[reconcile] %s", report)
     return report
 

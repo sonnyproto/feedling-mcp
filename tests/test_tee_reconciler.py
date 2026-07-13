@@ -135,3 +135,24 @@ def test_converges_after_simulated_mirror_outage(backend_env, monkeypatch):
     report = reconciler.reconcile_table("users")
     assert _tee("SELECT count(*) FROM users WHERE user_id='usr_rc3'")[0][0] == 1
     assert report["rds_rows"] == report["tee_rows"]
+
+
+def test_reconcile_skips_orphan_child_rows_without_aborting(backend_env):
+    """并发账号删除会留下「RDS 有子行、TEE 无 parent」的瞬时孤儿。reconcile 必须
+    逐行跳过孤儿、继续,而不是整表(乃至整个 reconcile_all)崩在 FK 违反上。"""
+    db.upsert_user({"user_id": "usr_ok", "api_key_hash": "h"})
+    db.upsert_user({"user_id": "usr_orphan", "api_key_hash": "h"})
+    with db.get_pool().connection() as c:
+        c.execute(
+            "INSERT INTO user_blobs (user_id, kind, doc) VALUES "
+            "('usr_ok','misc','{\"x\":1}'::jsonb), "
+            "('usr_orphan','misc','{\"x\":2}'::jsonb)"
+        )
+    # TEE 只放 usr_ok 的 parent —— usr_orphan 的 blob 会 FK 失败被跳过。
+    with psycopg.connect(os.environ["TEE_DATABASE_URL"], autocommit=True) as c:
+        c.execute("INSERT INTO users (user_id, doc) VALUES ('usr_ok','{}'::jsonb) "
+                  "ON CONFLICT (user_id) DO NOTHING")
+    report = reconciler.reconcile_table("user_blobs", prune=False)  # 不炸
+    assert report["skipped"] >= 1
+    assert _tee("SELECT count(*) FROM user_blobs WHERE user_id='usr_ok'")[0][0] == 1
+    assert _tee("SELECT count(*) FROM user_blobs WHERE user_id='usr_orphan'")[0][0] == 0

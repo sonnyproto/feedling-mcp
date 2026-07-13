@@ -20,6 +20,17 @@ def enabled() -> bool:
         os.environ.get("TEE_DATABASE_URL"))
 
 
+def _pool_timeout() -> float:
+    # 拿连接的等待上限。direct-TLS 走 Phala 网关,新连接的 TLS 握手在并发下可能
+    # >5s;旧的硬编码 5s 会在 TEE 完全健康时也 PoolTimeout。默认放宽到 15s 且可配。
+    # 注意权衡:TEE 真宕机时双写会最多阻塞这么久才 fail-open(mirror 吞掉),故靠
+    # 下面 min_size 保持连接热、让热路径几乎不触发新建连接来抵消这个尾延迟。
+    try:
+        return max(1.0, float(os.environ.get("FEEDLING_TEE_POOL_TIMEOUT", "15") or 15))
+    except (TypeError, ValueError):
+        return 15.0
+
+
 def get_tee_pool():
     global _pool
     if _pool is None:
@@ -28,11 +39,15 @@ def get_tee_pool():
                 from psycopg_pool import ConnectionPool
                 _pool = ConnectionPool(
                     os.environ["TEE_DATABASE_URL"],
-                    min_size=1,
+                    # min_size=2:保持 2 条热连接,热路径(双写)几乎不必现场做网关
+                    # TLS 握手 → 规避那条慢链路,pool_timeout 尾延迟很少真正命中。
+                    min_size=int(os.environ.get("FEEDLING_TEE_POOL_MIN", "2")),
                     max_size=int(os.environ.get("FEEDLING_TEE_POOL_MAX", "4")),
-                    timeout=5,
+                    timeout=_pool_timeout(),
                     max_idle=300,
-                    kwargs={"autocommit": True},
+                    # connect_timeout:单条连接的建立上限(libpq 参数),防止一次
+                    # 网关握手无限期挂住占着 pool 的补给名额。
+                    kwargs={"autocommit": True, "connect_timeout": 10},
                     open=True,
                 )
     return _pool
