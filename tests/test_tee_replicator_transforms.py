@@ -92,16 +92,22 @@ def test_memory_and_world_book_single_envelope():
     _assert_no_crypto_leak(out2)
 
 
-def test_decrypted_body_strips_nul_bytes():
-    # Decrypted plaintext with a NUL (0x00) — PostgreSQL text/JSONB can't store it.
-    # The transform must strip NUL so the row is persistable; other chars survive.
+def test_nul_stripped_from_body_and_carried_metadata():
+    # PostgreSQL text/JSONB can't store NUL (0x00). It appears BOTH in the
+    # decrypted body AND in client-carried metadata fields (which _strip_envelope
+    # passes through). The transform must scrub the whole output doc, not just body.
     def decrypt_with_nul(envelope, purpose):
-        return "hello\x00world\x00".encode()
+        return "hello\x00world".encode()
 
     doc = {"id": "m1", "role": "user", "ts": 1.0, "source": "chat",
            "content_type": "text", "visibility": "shared", "owner_user_id": "u",
+           # a plaintext metadata field carrying a NUL (not the encrypted body)
+           "client_tag": "ta\x00g", "nested": {"note": "a\x00b"},
            "v": 1, "body_ct": "x", "nonce": "n", "K_user": "k", "K_enclave": "ke",
            "enclave_pk_fpr": "f"}
     out = transforms.plaintext_chat_doc(doc, decrypt_with_nul)
     assert out["body"] == "helloworld"
-    assert "\x00" not in out["body"]
+    assert out["client_tag"] == "tag"          # metadata scrubbed
+    assert out["nested"]["note"] == "ab"       # nested scrubbed
+    import json
+    assert "\x00" not in json.dumps(out)       # nothing NUL anywhere in the doc

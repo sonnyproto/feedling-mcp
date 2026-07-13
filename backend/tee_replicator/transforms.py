@@ -51,12 +51,22 @@ def _sub_envelope(doc: dict, prefix: str) -> dict | None:
 
 
 def _decrypt_body(decrypt, env: dict, purpose: str) -> str:
-    text = decrypt(_envelope_subset(env), purpose=purpose).decode("utf-8", "replace")
-    # PostgreSQL text/JSONB 禁止存 NUL(0x00):存 text 报「cannot contain NUL」，
-    # 存 JSONB(Jsonb 序列化成 )报「unsupported Unicode escape sequence」。
-    # NUL 在聊天/记忆正文里没有语义(decode 的 "replace" 只管非法 UTF-8，而 NUL 是
-    # 合法 UTF-8 会残留)，直接剥掉，其余字符原样保留。
-    return text.replace("\x00", "")
+    return decrypt(_envelope_subset(env), purpose=purpose).decode("utf-8", "replace")
+
+
+def _scrub_nul(obj):
+    """递归剥掉一切字符串里的 NUL(0x00)——PostgreSQL text/JSONB 存不了它:存 text
+    报 "cannot contain NUL",存 JSONB 时它被转义成 backslash-u-0000 报 "unsupported
+    Unicode escape sequence"。NUL 不止出现在解密出的 body,也可能在客户端带来的元数据
+    字段里(_strip_envelope 原样保留),所以对整个输出 doc(键和值、嵌套 dict/list)统一
+    清一遍,而不是只清 body。NUL 在正文/元数据里无语义,剥掉、其余字符原样保留。"""
+    if isinstance(obj, str):
+        return obj.replace("\x00", "")
+    if isinstance(obj, dict):
+        return {_scrub_nul(k): _scrub_nul(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_scrub_nul(v) for v in obj]
+    return obj
 
 
 def plaintext_chat_doc(doc: dict, decrypt) -> dict:
@@ -79,7 +89,7 @@ def plaintext_chat_doc(doc: dict, decrypt) -> dict:
         meta["body"] = _decrypt_body(decrypt, sub, f"tee_replicate:chat_{key}:{msg_id}")
         meta.setdefault("visibility", out.get("visibility", "shared"))
         out[key] = meta
-    return out
+    return _scrub_nul(out)
 
 
 def _plaintext_single(doc: dict, decrypt, purpose_prefix: str) -> dict:
@@ -87,7 +97,7 @@ def _plaintext_single(doc: dict, decrypt, purpose_prefix: str) -> dict:
         raise PendingDeviceMigration(str(doc.get("id", "")))
     out = _strip_envelope(doc)
     out["body"] = _decrypt_body(decrypt, doc, f"{purpose_prefix}:{doc.get('id', '')}")
-    return out
+    return _scrub_nul(out)
 
 
 def plaintext_memory_doc(doc: dict, decrypt) -> dict:
