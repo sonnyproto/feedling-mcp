@@ -8,6 +8,7 @@ contracts/broadcast/
 
 # Local env files
 .env
+.env.test
 deploy/.env
 contracts/.env
 
