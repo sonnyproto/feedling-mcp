@@ -16,6 +16,16 @@ from admin import tee_sync_scheduler as sched  # noqa: E402
 from admin import tee_replication as tr  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _clear_table_backoff():
+    """`sched._table_backoff` 是模块级状态（生产上 worker 级正确；测试间必须归零）。
+    别的测试文件（如 test_tee_sync_metrics 走过失败路径的 _sync_tick）留下的退避
+    条目会让这里的「每 tick 全表 replicate」断言看到被跳过的表——反之亦然。"""
+    sched._table_backoff.clear()
+    yield
+    sched._table_backoff.clear()
+
+
 @pytest.fixture
 def calls(monkeypatch):
     recorded = []
@@ -156,3 +166,69 @@ def test_first_tick_always_reconciles_regardless_of_monotonic(monkeypatch):
     assert sched._should_reconcile(1000.0, 1000.0 + 86399) is False
     # 到间隔:重跑
     assert sched._should_reconcile(1000.0, 1000.0 + 86400) is True
+
+
+# --------------------------------------------------------------------------- #
+# per-table 失败退避：整表 replicate 连败时指数退避，不再每 tick 无退避地重拉
+# 重解密同一段卡住的行（2026-07-14 prod 实测：两张 text-cursor 表连败让名义 300s
+# 的 tick 连轴转成 13-87 分钟，成为 backend 内存/CPU churn 主源之一）。
+# --------------------------------------------------------------------------- #
+
+def _fail_table_fake(recorded, failing_table):
+    def fake(*, action, table=None, dry_run=True, confirm=None, **kw):
+        recorded.append((action, table))
+        if action == "replicate" and table == failing_table:
+            raise RuntimeError("text fields cannot contain NUL")
+        return {"ok": True, "copied": 0, "pending": 0, "errors": 0}
+    return fake
+
+
+def test_failing_table_skipped_while_backing_off(monkeypatch):
+    recorded: list = []
+    monkeypatch.setattr(tr, "run_action", _fail_table_fake(recorded, "memory_moments"))
+
+    sched._sync_tick(do_reconcile=False)          # 第一败
+    recorded.clear()
+    sched._sync_tick(do_reconcile=False)          # 紧接着的下一 tick
+    tables = [t for a, t in recorded if a == "replicate"]
+    assert "memory_moments" not in tables          # 退避中 → 跳过
+    assert "chat_messages" in tables               # 其他表不受影响
+
+
+def test_backoff_expires_then_retries(monkeypatch):
+    recorded: list = []
+    monkeypatch.setattr(tr, "run_action", _fail_table_fake(recorded, "memory_moments"))
+
+    sched._sync_tick(do_reconcile=False)
+    # 手动把退避窗口拨到已过期
+    fails, _retry_at = sched._table_backoff["memory_moments"]
+    sched._table_backoff["memory_moments"] = (fails, 0.0)
+    recorded.clear()
+    sched._sync_tick(do_reconcile=False)
+    assert ("replicate", "memory_moments") in recorded  # 窗口过了 → 重试
+
+
+def test_backoff_resets_on_success(monkeypatch):
+    recorded: list = []
+    fail_once = {"n": 0}
+
+    def fake(*, action, table=None, dry_run=True, confirm=None, **kw):
+        recorded.append((action, table))
+        if action == "replicate" and table == "memory_moments" and fail_once["n"] == 0:
+            fail_once["n"] = 1
+            raise RuntimeError("transient")
+        return {"ok": True, "copied": 0, "pending": 0, "errors": 0}
+
+    monkeypatch.setattr(tr, "run_action", fake)
+    sched._sync_tick(do_reconcile=False)                      # 败一次 → 进退避
+    sched._table_backoff["memory_moments"] = (1, 0.0)         # 窗口拨到过期
+    sched._sync_tick(do_reconcile=False)                      # 重试成功
+    assert "memory_moments" not in sched._table_backoff        # 成功 → 清零
+
+
+def test_backoff_delay_doubles_and_caps(monkeypatch):
+    monkeypatch.setenv("FEEDLING_TEE_SYNC_INTERVAL_SEC", "300")
+    assert sched._backoff_delay(1) == 300.0
+    assert sched._backoff_delay(2) == 600.0
+    assert sched._backoff_delay(3) == 1200.0
+    assert sched._backoff_delay(10) == sched._BACKOFF_CAP_SEC

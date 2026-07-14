@@ -80,6 +80,19 @@ def _interval() -> float:
         return 300.0
 
 
+# per-table 整表失败退避。没有它，一张慢性失败的表（2026-07-14 prod 实测：text-cursor
+# 分隔符 NUL 让 memory_moments/world_book_entries 每 tick 必败）会被每 tick 无退避地
+# 全量重跑——重拉 + 重解密（enclave HTTP）同一段卡住的行，把名义 300s 的 tick 拖成
+# 13-87 分钟连轴转，成为 backend 内存/CPU churn 的主源之一。连败按 2^n 指数退避、
+# 封顶 _BACKOFF_CAP_SEC；成功一次即清零。仅内存态：worker 重启 = 立即重试，正确。
+_BACKOFF_CAP_SEC = 3600.0
+_table_backoff: dict[str, tuple[int, float]] = {}  # table -> (连败次数, monotonic 重试时点)
+
+
+def _backoff_delay(fails: int) -> float:
+    return min(_interval() * (2 ** max(0, fails - 1)), _BACKOFF_CAP_SEC)
+
+
 def _reconcile_interval() -> float:
     try:
         return max(300.0, float(os.environ.get("FEEDLING_TEE_RECONCILE_INTERVAL_SEC", "86400") or 86400))
@@ -132,8 +145,15 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
 
     # (2) replicate 密文子表在后 —— 父表已在，不再 FK 失败。
     for table in _CIPHERTEXT_TABLES:
+        fails, retry_at = _table_backoff.get(table, (0, 0.0))
+        if retry_at > time.monotonic():
+            # 连败退避中 → 本 tick 跳过这张表（其余表照常），到点自动恢复重试。
+            summary["report"].setdefault("replicate_backoff", []).append(table)
+            log.info("[tee-sync] replicate %s 退避中(连败%d) — 跳过本 tick", table, fails)
+            continue
         try:
             rep = tr.run_action(action="replicate", table=table, dry_run=False, confirm="MIGRATE")
+            _table_backoff.pop(table, None)  # 整表成功 → 退避清零
             summary["replicate_copied"] += rep.get("copied") or 0
             summary["replicate_pending"] += rep.get("pending") or 0
             summary["replicate_errors"] += rep.get("errors") or 0
@@ -156,7 +176,10 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
             # report 和 replicate_errors(只统计成功 run 的逐行错)里双双消失。
             summary["replicate_table_failures"] += 1
             summary["report"].setdefault("replicate_failed", {})[table] = str(e)[:200]
-            log.warning("[tee-sync] replicate %s 失败: %s", table, e)
+            fails += 1
+            _table_backoff[table] = (fails, time.monotonic() + _backoff_delay(fails))
+            log.warning("[tee-sync] replicate %s 失败(连败%d, 退避%.0fs): %s",
+                        table, fails, _backoff_delay(fails), e)
 
     # (3) verify 对账 —— reconcile 成功才有意义;这是收敛度的量测来源。
     if do_reconcile and reconcile_ok:
