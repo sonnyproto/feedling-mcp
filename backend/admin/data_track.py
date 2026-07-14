@@ -1038,6 +1038,31 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
     }
     if include_detail:
         row["runtime"] = _runtime_summary(store)
+        _ps = store.load_proactive_settings()
+        row["perception_permissions"] = {
+            # what the device reports it granted (free-form; keys are app-defined,
+            # e.g. photos / screen / location / health / motion / calendar / audio)
+            "permission_states": dict(_ps.get("permission_states") or {}),
+            # per-user autonomy switches (all default on)
+            "switches": {
+                "ambient_陪伴": bool(_ps.get("enabled", True)),
+                "dnd_勿扰": bool(_ps.get("dnd", False)),
+                "scheduled_定时": bool(_ps.get("scheduled", True)),
+                "dream_做梦": bool(_ps.get("dream_enabled", True)),
+                "capture_记忆整理": bool(_ps.get("capture_enabled", True)),
+                "screen_watch_屏幕观察": bool(_ps.get("screen_watch_enabled", True)),
+                "photo_wake_照片唤醒": bool(_ps.get("photo_wake_enabled", True)),
+                "arrival_wake_到达唤醒": bool(_ps.get("arrival_wake_enabled", True)),
+                "unlock_wake_解锁唤醒": bool(_ps.get("unlock_wake_enabled", True)),
+            },
+            # User-authored natural language is private content. Data-track may
+            # expose whether it is configured, never the directive itself.
+            "wake_directive_configured": bool(str(_ps.get("wake_directive") or "").strip()),
+            "wake_interval_sec": int(_ps.get("wake_interval_sec") or 0),
+            "user_state": _ps.get("user_state"),
+            "ai_state": _ps.get("ai_state"),
+            "broadcast_state": _ps.get("broadcast_state"),
+        }
         row["identity"] = {
             "written": identity is not None,
             "updated_at": identity_updated_at,
@@ -1644,6 +1669,7 @@ def _data_track_debug_payload() -> dict:
 def _data_track_dau_payload() -> dict:
     filters = _data_track_request_filters()
     days = int(filters.get("days") or 30)
+    snapshot = db.admin_dau_snapshot_bounds()
     rows = db.admin_data_track_dau(
         since_epoch=float(filters.get("since_epoch") or 0),
         days=days,
@@ -1662,6 +1688,9 @@ def _data_track_dau_payload() -> dict:
         "user_messages": sum(int(row.get("user_messages") or 0) for row in rows),
         "tracking_events": sum(int(row.get("tracking_events") or 0) for row in rows),
         "active_events": sum(int(row.get("active_events") or 0) for row in rows),
+        "snapshot_first_day": snapshot.get("first_day", ""),
+        "snapshot_last_day": snapshot.get("last_day", ""),
+        "snapshot_days": int(snapshot.get("days") or 0),
     }
     return {
         "summary": summary,
@@ -2089,12 +2118,23 @@ def _render_data_track_dau_page(payload: dict) -> str:
     definition = payload.get("definition", {})
     api_qs = _data_track_qs(view=None, q=None, limit=None, offset=None, sort=None, dir=None)
     api_url = f"/v1/admin/data-track/dau?{api_qs}" if api_qs else "/v1/admin/data-track/dau"
+    _snap_first = str(summary.get("snapshot_first_day") or "")
+    _cutover_html = (
+        f"首个冻结日是 <b>{html.escape(_snap_first)}</b>。状态列以当天实际标记为准："
+        "<b>已冻结</b>的数据不再变化；<b>今天</b>仍是实时数据，日结束后自动冻结。"
+        f"<b>{html.escape(_snap_first)} 之前</b>的日期仍是实时重算，会随删号下降、偏少、仅供参考。"
+        if _snap_first else
+        "每日快照即将生效；生效后当天真实数据会冻结、不再随删号变化。"
+    )
     rows_html = []
     for row in rows:
         rows_html.append(
             "<tr>"
             f"<td>{html.escape(str(row.get('day') or ''))}</td>"
-            f"<td>{int(row.get('dau') or 0)}</td>"
+            + ("<td><span style='color:#1d7a4d;font-size:12px'>🔒 已冻结</span></td>"
+               if row.get("frozen")
+               else "<td><span style='color:#a05a00;font-size:12px'>⏱ 实时</span></td>")
+            + f"<td>{int(row.get('dau') or 0)}</td>"
             f"<td>{int(row.get('chat_dau') or 0)}</td>"
             f"<td>{int(row.get('tracking_dau') or 0)}</td>"
             f"<td>{int(row.get('active_events') or 0)}</td>"
@@ -2155,12 +2195,17 @@ def _render_data_track_dau_page(payload: dict) -> str:
   {_render_data_track_view_nav("dau")}
   <section class="metrics">{metrics}</section>
   <h2>Daily Active Users</h2>
+  <div style="background:#fff8ef;border:1px solid #e8d8be;border-radius:8px;padding:12px 14px;margin:10px 0;font-size:13px;line-height:1.7;color:#5a4d3c">
+    <b>⚠️ 历史数据偏少 · 已知问题</b><br>
+    实时重算的历史数据，是<b>每次打开页面时从当前还存在的数据算</b>的，没有冻结快照。用户<b>删除/重置账户后其消息会被级联删除</b>，会<b>追溯性地</b>减少他活跃过的每一天——所以那些天的 DAU 会随时间下降、<b>偏少、仅供参考</b>。<br>
+    {_cutover_html}
+  </div>
   <div class="muted">{html.escape(definition.get("dau") or "")} {html.escape(definition.get("excluded") or "")}</div>
   <div class="muted">使用DAU=当天有 app 使用时长上报的用户数；平均使用时长=当天所有会话的平均前台时长；会话数=当天 app_session_end 事件数。前台被杀会漏报，略偏低估。均按北京日。</div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
   <table>
-    <thead><tr><th>Beijing day</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>使用DAU</th><th>平均使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
-    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='11' class='muted'>No DAU activity in this range.</td></tr>"}</tbody>
+    <thead><tr><th>Beijing day</th><th>状态</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>使用DAU</th><th>平均使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
+    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='12' class='muted'>No DAU activity in this range.</td></tr>"}</tbody>
   </table>
 </main>
 </body>
@@ -3083,6 +3128,48 @@ def _render_event_users_page(payload: dict) -> str:
 </main></body></html>"""
 
 
+def _render_perception_permissions(user: dict) -> str:
+    """Readable 感知授权 & 主动开关 block for the user detail page — so 'can't use
+    album/screen' can be answered on sight (granted vs not vs unknown)."""
+    pp = user.get("perception_permissions")
+    if not isinstance(pp, dict):
+        return ""
+
+    def _perm_pill(label, state):
+        s = str(state).strip().lower()
+        if s in ("authorized", "granted", "true", "on", "1", "yes", "allowed", "full", "limited"):
+            cls, txt = "ppok", ("已授权" if s != "limited" else "部分授权")
+        elif s in ("denied", "restricted", "false", "off", "0", "no", "blocked"):
+            cls, txt = "ppbad", "未授权"
+        else:
+            cls, txt = "ppmuted", (str(state) or "未知")
+        return f"<span class='pp-item'>{html.escape(str(label))} <b class='{cls}'>{html.escape(txt)}</b></span>"
+
+    perm = pp.get("permission_states") if isinstance(pp.get("permission_states"), dict) else {}
+    perm_html = (
+        "".join(_perm_pill(k, v) for k, v in perm.items())
+        or "<span class='ppmuted'>permission_states 为空——设备没上报任何感知授权（可能未授权，也可能这版 app 没上报此字段）</span>"
+    )
+    sw = pp.get("switches") if isinstance(pp.get("switches"), dict) else {}
+    sw_html = "".join(
+        f"<span class='pp-item'>{html.escape(str(k))} <b class='{'ppok' if v else 'ppmuted'}'>{'开' if v else '关'}</b></span>"
+        for k, v in sw.items()
+    )
+    directive_configured = bool(pp.get("wake_directive_configured"))
+    directive_html = (
+        "<div class='ppmuted' style='margin-top:6px'>"
+        f"自定义 wake 指令：{'已配置' if directive_configured else '未配置'}"
+        f" · 间隔：{html.escape(str(pp.get('wake_interval_sec') or 0))} 秒"
+        "</div>"
+    )
+    return (
+        "<h2 style='font-size:15px;margin:22px 0 6px'>感知授权 &amp; 主动开关</h2>"
+        "<div class='ppmuted' style='font-size:12px;margin-bottom:6px'>感知授权=设备上报的各感知权限（相册/屏幕/位置/健康…）；开关=用户自己的主动/自主开关。</div>"
+        f"<div class='pp-box'><b>感知授权</b><br>{perm_html}</div>"
+        f"<div class='pp-box'><b>主动开关</b><br>{sw_html}{directive_html}</div>"
+    )
+
+
 def _render_user_detail_page(user: dict) -> str:
     qs = _data_track_qs()
     back = f"/admin/data-track?{qs}" if qs else "/admin/data-track"
@@ -3105,6 +3192,9 @@ def _render_user_detail_page(user: dict) -> str:
     .value {{ font-size:22px; font-weight:700; }}
     .label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }}
     pre {{ white-space:pre-wrap; word-break:break-word; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:14px; }}
+    .pp-box {{ background:var(--card); border:1px solid var(--line); border-radius:8px; padding:12px 14px; margin:8px 0; font-size:13px; line-height:2; }}
+    .pp-item {{ display:inline-block; margin:0 14px 4px 0; }}
+    .ppok {{ color:#1d7a4d; }} .ppbad {{ color:#b7352b; }} .ppmuted {{ color:var(--muted); }}
   </style>
 </head>
 <body>
@@ -3120,6 +3210,7 @@ def _render_user_detail_page(user: dict) -> str:
     <div class="card"><div class="value">{html.escape(user.get('genesis', {}).get('status') or 'none')}</div><div class="label">genesis distill</div></div>
     <div class="card"><div class="value">{user['proactive']['proactive_messages']}</div><div class="label">proactive writes</div></div>
   </section>
+  {_render_perception_permissions(user)}
   <div class="muted" style="margin-top:14px">以下所有时间已转北京时间(UTC+8) · 原始存储为 UTC。</div>
   <pre>{html.escape(safe_json)}</pre>
 </main>

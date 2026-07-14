@@ -1011,3 +1011,48 @@ def test_claude_anthropic_base_url_empty_for_all():
     assert spawners._claude_anthropic_base_url({"provider": "anthropic"}) == ""
     assert spawners._claude_anthropic_base_url(
         {"provider": "deepseek", "base_url": "https://api.deepseek.com"}) == ""
+
+
+# Reseller/relay marketing tags in the model id pollute the agent's self-reference.
+# Sanitize them out of the IDENTITY string only (routing keeps the raw name).
+def test_sanitize_model_name_strips_reseller_tags_for_identity():
+    s = spawners._sanitize_model_name_for_identity
+    assert s("[Kiro] claude-opus-4-6 [不补]") == "claude-opus-4-6"
+    assert s("[特价纯血]claude-sonnet-4-6") == "claude-sonnet-4-6"
+    assert s("[特特价次kiro]claude-opus-4-6-thinking") == "claude-opus-4-6-thinking"
+    assert s("【促销】gpt-4o-mini") == "gpt-4o-mini"
+    # clean ids untouched (incl. openrouter provider/model slash form + dots)
+    assert s("deepseek-v4-flash") == "deepseek-v4-flash"
+    assert s("anthropic/claude-opus-4.6") == "anthropic/claude-opus-4.6"
+    # all-tags -> empty so the identity block falls back to provider, not a tag
+    assert s("[全是标签]") == ""
+    assert s("") == ""
+
+
+def test_identity_block_uses_sanitized_model_name():
+    block = spawners._identity_override_block(
+        "openai_compatible", "[Kiro] claude-opus-4-6 [不补]", "https://relay.example/v1")
+    assert "claude-opus-4-6" in block
+    assert "[不补]" not in block          # the marketing tag never reaches self-reference
+    assert "[Kiro]" not in block
+
+
+def test_identity_block_all_tags_falls_back_to_provider():
+    block = spawners._identity_override_block(
+        "openai_compatible", "[全是标签]", "https://relay.example/v1")
+    assert "`openai_compatible`" in block
+    assert "[全是标签]" not in block
+
+
+def test_identity_sanitization_does_not_change_pi_routing_model():
+    raw_model = "[Kiro] claude-opus-4-6 [不补]"
+    files = spawners.agent_home_files(
+        "/h", driver="pi", provider="openai_compatible",
+        base_url="https://relay.example/v1", model=raw_model)
+    prompt = files["/h/agent-tools-prompt.md"]
+    models = json.loads(files["/h/pi-home/agent/models.json"])
+
+    assert "`claude-opus-4-6`" in prompt
+    assert "[Kiro]" not in prompt
+    assert "[不补]" not in prompt
+    assert models["providers"]["feedling"]["models"][0]["id"] == raw_model

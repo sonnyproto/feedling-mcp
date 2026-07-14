@@ -310,6 +310,44 @@ def _memory_summary_name_only(doc: dict) -> dict:
     return clean
 
 
+def _memory_card_text(memory: dict) -> str:
+    if not isinstance(memory, dict):
+        return ""
+    for key in ("summary", "content", "title", "description"):
+        value = str(memory.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _dedupe_recheck_memories(
+    memories: list[dict],
+    *,
+    written_memories: list[dict] | None = None,
+    known_memories: list[str] | None = None,
+) -> list[dict]:
+    seen: set[str] = set()
+    for item in written_memories or []:
+        norm = checkpoint.normalize_fact_text(_memory_card_text(item))
+        if norm:
+            seen.add(norm)
+    for item in known_memories or []:
+        norm = checkpoint.normalize_fact_text(str(item or ""))
+        if norm:
+            seen.add(norm)
+
+    out: list[dict] = []
+    for item in memories or []:
+        if not isinstance(item, dict):
+            continue
+        norm = checkpoint.normalize_fact_text(_memory_card_text(item))
+        if not norm or norm in seen:
+            continue
+        seen.add(norm)
+        out.append(item)
+    return out
+
+
 def _fetch_provider_key(api_url: str, enclave_url: str, runtime_token: str, *, store=None, job_id: str = "") -> str:
     try:
         resp = httpx.get(
@@ -1045,6 +1083,57 @@ def build_memory_output_from_fact_candidates(
         floor_note=floor_note,
         terms_note=terms_note,
     )
+
+
+def build_memory_recheck_from_material(
+    *,
+    user_id: str,
+    job_id: str,
+    key_prefix: str | None = None,
+    runtime: provider_client.ProviderConfig,
+    material: str,
+    written_memories: list[dict] | None = None,
+    known_memories: list[str] | None = None,
+    llm: GenesisLLMClient | None = None,
+) -> dict:
+    """VPS resident-only second pass: ask whether fact_write missed real memories.
+
+    This helper is intentionally not called by the hosted/cloud Genesis flow. The
+    resident consumer can call it after ``build_memory_output_from_fact_candidates``
+    with the original plaintext material plus the just-written cards, then append
+    the returned ``memories`` if any. Empty is a valid "nothing missed" result.
+    """
+    if not str(material or "").strip():
+        return {"memories": []}
+    llm = llm or GenesisLLMClient()
+    written = [item for item in (written_memories or []) if isinstance(item, dict)]
+    idempotency_prefix = _idempotency_prefix(job_id, key_prefix)
+    output = _complete_json(
+        llm,
+        user_id=user_id,
+        job_id=job_id,
+        task_id="memory-recheck",
+        runtime=runtime,
+        messages=prompts.memory_recheck_messages(
+            material,
+            written,
+            known_memories=[
+                *(known_memories or []),
+                *[_memory_card_text(item) for item in written],
+            ],
+        ),
+        max_tokens=3000,
+        idempotency_key=f"{idempotency_prefix}:memory_recheck",
+        temperature=0.0,
+    )
+    raw_memories = output.get("memories") if isinstance(output.get("memories"), list) else []
+    return {
+        "memories": _dedupe_recheck_memories(
+            raw_memories,
+            written_memories=written,
+            known_memories=known_memories,
+        )
+    }
 
 
 def build_voice_persona_output_from_candidates(

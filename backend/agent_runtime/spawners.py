@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -420,14 +421,26 @@ def _is_official_identity(provider: str, base_url: str) -> bool:
     return bu == provider_client.default_base_url(p).strip().rstrip("/")
 
 
+# Reseller/relay marketing tags can wrap the real model id in brackets, e.g.
+# ``[Kiro] claude-opus-4-6 [不补]``. Strip them from self-reference only: relays
+# may route and bill on the exact raw model string.
+_IDENTITY_TAG_RE = re.compile(r"(?:\[[^\]]*\]|【[^】]*】)")
+
+
+def _sanitize_model_name_for_identity(raw: str) -> str:
+    s = str(raw or "")
+    return re.sub(r"\s+", " ", _IDENTITY_TAG_RE.sub(" ", s)).strip()
+
+
 def _identity_override_block(provider: str, model: str, base_url: str) -> str:
     """追加系统提示顶部的身份改写块，或官方时返回 ""。
 
     自称内容源为配置的 model id（空则回退 provider 名，再回退通用串）。刻意与
-    persona 人设解耦：只压「什么模型 / 什么 AI」类元问题，不动「你是谁」的角色扮演。"""
+    persona 人设解耦：只压「什么模型 / 什么 AI」类元问题，不动「你是谁」的角色扮演。
+    model id 里的中转站营销标签([...]/【...】)会被清洗，只留真实模型 id 用于自称。"""
     if _is_official_identity(provider, base_url):
         return ""
-    name = (model or "").strip() or (provider or "").strip() or "a third-party model"
+    name = _sanitize_model_name_for_identity(model) or (provider or "").strip() or "a third-party model"
     return (
         "## 你的真实身份\n"
         f"你的底层大模型是 `{name}`。运行你的命令行外壳可能自称 Claude Code / Codex，"

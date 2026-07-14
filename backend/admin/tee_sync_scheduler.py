@@ -26,6 +26,7 @@ import os
 import threading
 import time
 
+import db
 from tee_shadow import mirror
 
 log = logging.getLogger("feedling.tee_sync")
@@ -211,7 +212,6 @@ def _sync_tick(*, do_reconcile: bool) -> bool:
     summary["duration_ms"] = round((time.monotonic() - t0) * 1000, 1)
     summary["report"]["health"] = health
     try:
-        import db
         db.record_tee_sync_run(summary)
     except Exception as e:  # noqa: BLE001 — 落库失败不影响同步/循环
         log.warning("[tee-sync] 指标落库失败: %s", e)
@@ -231,9 +231,29 @@ def _should_reconcile(last_reconcile: float | None, now: float) -> bool:
     return last_reconcile is None or (now - last_reconcile) >= _reconcile_interval()
 
 
+def _restore_last_reconcile() -> float | None:
+    """从 tee_sync_runs 恢复「上次成功 reconcile」的时点（换算到本进程 monotonic 轴）。
+
+    last_reconcile 不能只活在内存里：gunicorn max_requests 回收 leader worker 后，
+    新 leader 若从 None 起步就重做 reconcile-first——完整 reconcile 要数十分钟，
+    worker 寿命一短它就永远跑不完（2026-07-14 test 实测：部署后 2h leader 反复换手、
+    tee_sync_runs 零新行）。从 DB 恢复后，只有真到 reconcile 间隔才重跑；真正的
+    首次基线（库里没有任何成功 reconcile）仍然 reconcile-first。DB 读失败兜底回
+    None = 现状语义。"""
+    try:
+        age = db.last_tee_reconcile_age_sec()
+        if age is None:
+            return None
+        return time.monotonic() - age
+    except Exception as e:  # noqa: BLE001 — 恢复失败不阻断循环
+        log.warning("[tee-sync] last_reconcile 恢复失败(退回 reconcile-first): %s", e)
+        return None
+
+
 def _loop() -> None:
-    # last_reconcile=None → 首个成功 tick 必 reconcile 建立基线（见 _should_reconcile）。
-    last_reconcile: float | None = None
+    # 先从 DB 恢复上次成功 reconcile 时点（见 _restore_last_reconcile）；库里从没
+    # 成功过 → None → 首个成功 tick 必 reconcile 建立基线（见 _should_reconcile）。
+    last_reconcile: float | None = _restore_last_reconcile()
     first = True
     while True:
         # 首个 tick 只等一小会儿就跑 —— 尽快把明文父表回填上，缩短「父表未回填 →
