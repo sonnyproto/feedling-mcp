@@ -1589,6 +1589,58 @@ def reap_stale_processing_jobs() -> list[dict]:
     return reaped
 
 
+def _resident_stale_sec() -> int:
+    # Consumer heartbeats on every agent call (claim/decrypt, per window, per
+    # recheck), so the worst honest gap is one long LLM call (minutes). 15min
+    # default clears that comfortably while unwedging dead claims same-day.
+    return max(300, _env_int("FEEDLING_GENESIS_RESIDENT_STALE_SEC", 900))
+
+
+def _resident_max_attempts() -> int:
+    return max(1, _env_int("FEEDLING_GENESIS_RESIDENT_MAX_ATTEMPTS", 3))
+
+
+def reap_stale_resident_jobs() -> list[dict]:
+    """Recover resident-claimed distill jobs whose consumer died mid-run.
+
+    The cloud reaper above explicitly EXCLUDES resident-owned rows
+    (resident_consumer_id <> ''), and until 2026-07-14 nothing called the
+    resident variant — so a transient failure right after claim wedged the job
+    in 'processing' forever (live-e2e-confirmed). Under the attempt cap the row
+    goes back to 'awaiting_resident' (any consumer re-claims it); at/over the
+    cap it fails, and we sync the genesis_state blob so the app poll shows the
+    failure instead of an eternal spinner.
+    """
+    stale_sec = _resident_stale_sec()
+    error = f"resident_stale_timeout:{stale_sec}s"
+    reaped: list[dict] = []
+    for job in db.genesis_reap_stale_resident_jobs(
+        stale_sec, max_attempts=_resident_max_attempts(), error=error,
+    ):
+        user_id = str(job.get("user_id") or "")
+        job_id = str(job.get("job_id") or "")
+        if not user_id or not job_id:
+            continue
+        status = str(job.get("status") or "")
+        store = get_store(user_id)
+        if status == "failed":
+            try:
+                service.write_genesis_state(store, job, status="failed")
+            except Exception as e:  # noqa: BLE001
+                print(f"[genesis:reaper] blob sync failed for {user_id}/{job_id}: {type(e).__name__}:{str(e)[:120]}")
+        _trace_genesis(
+            store,
+            "genesis.worker.resident_stale_reaped",
+            job_id=job_id,
+            status="error" if status == "failed" else "ok",
+            summary=("stale resident distill job failed (attempt cap)"
+                     if status == "failed" else "stale resident distill job requeued"),
+            detail={"error": error, "status": status},
+        )
+        reaped.append({"user_id": user_id, "job_id": job_id, "status": status})
+    return reaped
+
+
 def tick(
     *,
     api_url: str,
