@@ -92,6 +92,14 @@ def _save_identity_action_payload(
         "owner_user_id": envelope["owner_user_id"],
         "created_at": existing.get("created_at") or now,
         "updated_at": now,
+        # replaced_at is the P5 concurrency baseline: it is stamped ONLY by
+        # full-card writes (identity.init / identity.replace). Partial
+        # mutations (profile_patch / dimension_nudge, both routed through
+        # this helper) must carry it forward untouched, not drop it — this
+        # dict is an explicit field list, not a copy of `existing`, so it
+        # must be listed here or the raw blob overwrite in _save_identity
+        # would silently erase it.
+        "replaced_at": existing.get("replaced_at", ""),
         "relationship_started_at": existing.get("relationship_started_at", ""),
         "relationship_anchor_source": existing.get("relationship_anchor_source", ""),
         "relationship_anchor_evidence": existing.get("relationship_anchor_evidence", ""),

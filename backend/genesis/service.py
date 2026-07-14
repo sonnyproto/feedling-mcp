@@ -858,6 +858,7 @@ def replace_identity_preserving_anchor(store: UserStore, output: dict) -> str:
         "owner_user_id": envelope["owner_user_id"],
         "created_at": existing.get("created_at") or now,
         "updated_at": now,
+        "replaced_at": now,
         **_relationship_anchor_fields_for_replace(existing, output),
         "identity_agent_name_present": bool(payload.get("agent_name")),
         "identity_dimension_count": len(payload.get("dimensions") or []),
