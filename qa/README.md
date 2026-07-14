@@ -19,6 +19,20 @@ There are two targets:
 
 The protected workflow is deliberately split across explicit trust zones:
 
+- Any collaborator with repository write access may press **Run workflow** on
+  `ci.yml` at protected `main`; there is no per-run Environment reviewer. The
+  controller and all secret-bearing harness code are fixed to the immutable
+  `main` SHA selected when the run starts.
+- A GitHub-hosted resolver checks out `test` without QA Environment, provider,
+  admin, or OAuth secrets and derives the currently deployed backend SHA from
+  the serialized compose image pin. The resolved SHA is data passed into
+  qualification, never code executed by the secret-bearing runner.
+- Only the ephemeral evaluator job enters `feedling-e2e-test`. It checks out
+  the immutable controller SHA from `main`, receives the Environment secrets,
+  and verifies the live backend against the resolver's expected SHA before
+  provisioning any account or using any provider key. The reusable workflow is
+  called without `secrets: inherit`.
+
 1. `verify_deployment.py` uses the test admin credential before Codex starts and
    again after the agent finishes. Every mode requires the image-baked source SHA
    to equal the SHA injected by the serialized test deployment. Strict V2 mode
@@ -275,7 +289,7 @@ the **test** backend's admin routes. Its value must match that deployment's
 `FEEDLING_ADMIN_TOKEN`. This is not issued by Feedling: the operator chooses one
 strong random value, for example with `openssl rand -hex 32`, and stores it only
 in secret managers. Every qualification mode uses it only to read the protected
-test build identity before Codex or provisioning begins. Protected release
+test build identity before Codex or provisioning begins. Protected self-service
 qualification also uses it for the test-account reaper and cleanup; strict V2
 mode additionally uses it to call:
 
@@ -322,7 +336,7 @@ test remains the existing test deployment.
 
 The headless test driver is separate infrastructure. This design requires one
 single-job ephemeral GitHub Actions runner VM with the `feedling-e2e` label. It
-holds the dedicated QA Codex OAuth bundle only for that job and is destroyed
+holds the configured Codex OAuth bundle only for that job and is destroyed
 afterward; it does not host Feedling or replace a Runtime V2 worker. The test app
 deploy, test runner deploy, test Postgres deploy, and qualification workflow
 share the `feedling-test-environment` concurrency lock. Pre/post build receipts
@@ -331,11 +345,15 @@ still catch a deployment made outside those workflows.
 ## One-time GitHub setup
 
 Create a protected GitHub Environment named `feedling-e2e-test`. Configure its
-deployment branch policy to allow only the protected `test` branch, and require
-reviewers before the job can access the environment. The workflow also has a
-`refs/heads/test` dispatch guard, which explicitly fails a workflow selected from
-any other ref; that in-repository guard is defense in depth and does not replace
-the Environment restriction. Add these environment **secrets**:
+deployment branch policy to allow only protected `main`. Do **not** configure a
+required reviewer: every collaborator with repository write access is meant to
+be able to run this evaluation without waiting for a particular person. The
+security boundary is protected `main`, not human approval on every run: changes
+to the controller/harness must pass the repository's normal protected-branch
+review, while a workflow dispatch can only use an already trusted immutable
+`main` revision. The workflow also rejects any controller ref other than
+`refs/heads/main`; that in-repository guard is defense in depth and does not
+replace the Environment branch restriction. Add these environment **secrets**:
 
 - `QA_CODEX_AUTH_JSON_B64`
 - `QA_TEST_ADMIN_TOKEN`
@@ -345,6 +363,14 @@ the Environment restriction. Add these environment **secrets**:
 - `QA_OPENROUTER_API_KEY`
 - `QA_GEMINI_API_KEY`
 - `QA_KONGBEIQIE_API_KEY`
+
+Protect `test` as well as `main`: human code changes must arrive through the
+normal reviewed path, force-push and deletion must be blocked, and only the
+existing deployment automation may bypass protection for its serialized image-
+pin commit. This is not a per-run approval. It is required because the deployed
+backend necessarily receives the direct provider keys during exact BYOK tests.
+Use dedicated QA-provider keys with the lowest practical balance, spend/rate
+limits, and no production privileges; never use founder or production keys.
 
 Add these non-secret environment **variables** with explicit, reasoning-capable
 model IDs that the deployed candidate supports. Each selection must return the
@@ -363,13 +389,16 @@ coverage:
 - `QA_KONGBEIQIE_MODEL`
 - `QA_KONGBEIQIE_BASE_URL` (the normalized HTTPS OpenAI-compatible endpoint)
 
-`QA_CODEX_AUTH_JSON_B64` is the base64 encoding of a complete `auth.json` from a
-**dedicated QA ChatGPT account**. This deliberately includes refreshable OAuth
-credentials so a four-hour qualification job can use the account's subscription
-without a manual login on every ephemeral runner. It is a high-value, long-lived
-secret: never use a founder/engineer account, never paste it into a workflow
-input, require Environment approval, and revoke/rotate the QA account session on
-a schedule or immediately after suspected exposure. `codex login
+`QA_CODEX_AUTH_JSON_B64` is the base64 encoding of a complete ChatGPT
+`auth.json`. The initial version may use an operator's regular ChatGPT account;
+a dedicated QA account remains the preferable long-term choice because this
+bundle contains refreshable OAuth credentials. Never paste the bundle into a
+workflow input or expose it to application-under-test code. Routine successful
+runs do **not** require the operator to use ChatGPT's **Log out all devices**:
+the run-scoped copy is deleted with the ephemeral VM. Use account-wide logout
+only as incident response when exposure is suspected or the copied session must
+be forcibly revoked; doing so may also require the operator to sign back in on
+their normal devices. `codex login
 --with-access-token` is not a substitute for this bundle in the pinned CLI: that
 flag accepts Codex PAT/agent-identity credentials, not an ordinary ChatGPT OAuth
 access token.
@@ -401,7 +430,7 @@ with `-p <profile>`; its top-level `default_permissions` binding is checked by
 strict config and real sandbox probes. Raw sessions, events, OAuth material, and
 stderr remain private and disappear with the single-job runner.
 
-The dedicated QA OAuth bundle is inside the trusted Codex-process boundary. Its
+The configured OAuth bundle is inside the trusted Codex-process boundary. Its
 path is excluded from model-controlled shell environments and prompts, but the
 suite does not pretend that Codex's own home can be sandboxed away from the
 Codex process that must refresh it. Provider and admin keys remain wholly
@@ -422,6 +451,25 @@ Keep an independent runner/VPC egress policy as a second boundary: the Codex
 parent needs OpenAI/ChatGPT service access, while model-driven subprocesses should
 reach only `test-api.feedling.app`. Prompt rules and artifact scanning are not
 credential-isolation controls.
+
+### Scope of self-service branch testing
+
+The implemented self-service path evaluates the backend that is **already
+deployed to the shared protected `test` environment**. It does not yet build an
+arbitrary feature branch, create a per-SHA preview deployment, or broker provider
+requests for untrusted candidate code. To evaluate a code change today, deploy
+that change through the normal protected `test` process, then dispatch the
+trusted `main` controller. The artifact identifies the exact compose-pinned and
+live-reported deployment SHA that was evaluated.
+
+Do not attach these raw provider/admin keys to a workflow that checks out or
+executes an arbitrary candidate branch. The current keys are acceptable only
+for this protected deployed-test topology: untrusted branch code never runs on
+the evaluator, and the secret-bearing harness always comes from protected
+`main`. True "evaluate any branch" support needs a separate preview-deployment
+and credential-broker design (for example, short-lived scoped credentials or a
+trusted provider proxy) before it can preserve the same boundary. That preview
+and broker layer is explicitly not implemented by this version.
 
 ## Before a live run
 
@@ -446,33 +494,32 @@ For the strict Hosted Runtime V2 GitHub release run, the deployed candidate must
 - observable backend and worker build identity that can be matched to the
   candidate commit.
 
-Trigger **CI** manually at ref `test` while the standalone E2E workflow exists
-only on `test`:
+Trigger **CI** manually at protected `main`. Any collaborator with repository
+write access may do this; no Environment reviewer needs to be online:
 
 ```bash
-gh workflow run ci.yml --ref test
+gh workflow run ci.yml --ref main -f runtime_target=deployed_current
 ```
 
-GitHub only accepts a direct `workflow_dispatch` for workflow files that also
-exist on the repository's default branch. The long-lived CI workflow already
-does, so its manual-only `api-key-e2e-manual` job calls the exact reusable E2E
-workflow from the selected `test` commit. Once the called workflow owns the
-shared `feedling-test-environment` lock, it refreshes `origin/test`, reads the
-backend image tag pinned in `deploy/docker-compose.phala.test.yaml`, and resolves
-that short tag to a full Git commit. This binds the gate to the deployed image,
-not to a later `deploy(test): bump ... [skip ci]` branch-head commit or an
-operator-entered SHA. The run fails closed if the compose file has mixed tags,
-the tag does not resolve inside current `test` history, or the protected live
-backend reports a different full SHA.
+The manual-only `api-key-e2e-manual` job calls the reusable E2E workflow from
+that selected immutable `main` revision and does not inherit caller secrets. A
+separate GitHub-hosted job, outside `feedling-e2e-test`, checks out `test`
+without QA Environment secrets, reads the backend image tag pinned in
+`deploy/docker-compose.phala.test.yaml`, and resolves the short tag to a full Git
+commit. The secret-bearing evaluator then checks out only the trusted `main`
+harness and receives that resolved commit as expected-deployment metadata. This
+binds the result to the deployed image, not to a later
+`deploy(test): bump ... [skip ci]` branch-head commit or an operator-entered
+SHA. The run fails closed if the compose file has mixed tags, the tag does not
+resolve inside current `test` history, or the protected live backend reports a
+different full SHA.
 
-Once `api-key-e2e.yml` also exists on the default branch, it can be dispatched
-directly from ref `test`; there is deliberately no free-form deployment-SHA
-input. Use
-`runtime_target=deployed_current` for today's runtime and reserve
-`hosted_resident` for the future strict Runtime V2 proof. Any other selected ref
-fails before the protected Environment or its secrets are reached. Manual mode
-is intentional for the first stabilization phase; there is no push, schedule,
-or deployment trigger yet.
+There is deliberately no free-form deployment-SHA or candidate-branch input.
+Use `runtime_target=deployed_current` for today's runtime and reserve
+`hosted_resident` for the future strict Runtime V2 proof. Any controller ref
+other than protected `main` fails before the Environment or its secrets are
+reached. Manual mode is intentional for the first stabilization phase; there is
+no push, schedule, or deployment trigger yet.
 
 The baseline target requires authoritative backend image identity plus the
 currently deployed API-key/user contracts. The optional strict Runtime V2 target
@@ -486,7 +533,7 @@ ephemeral so its copied OAuth bundle is destroyed after the job, and the backend
 still needs a server-side TTL/reaper for `agent-e2e-*` synthetic accounts so an
 abruptly lost runner cannot strand test users indefinitely.
 
-## Artifacts and release rule
+## Artifacts and qualification result
 
 `QA_ARTIFACT_DIR` is already the unique run directory. Codex returns only the
 authoritative result JSON; the trusted publisher installs `run-result.json`, and
@@ -516,3 +563,7 @@ is clean. The eight always-required memory checks must pass, and the two migrati
 checks must satisfy the locked migration policy. A blocked prerequisite is
 useful evidence, but it is never a release
 PASS.
+
+A green result is evidence about that exact deployed test snapshot. It does not
+approve or merge a release automatically; the team may use it as an on-demand
+evaluation signal for the change currently deployed to `test`.

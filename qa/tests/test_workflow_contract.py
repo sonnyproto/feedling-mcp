@@ -23,8 +23,8 @@ def test_workflow_is_manual_only_and_uses_protected_ephemeral_runner():
     assert "schedule:" not in trigger
     assert "  deployment:" not in trigger
     assert "validate-dispatch:" in WORKFLOW
-    assert 'if [ "$DISPATCH_REF" != "refs/heads/test" ]' in WORKFLOW
-    assert "needs: validate-dispatch" in WORKFLOW
+    assert 'if [ "$DISPATCH_REF" != "refs/heads/main" ]' in WORKFLOW
+    assert "needs: [validate-dispatch, resolve-test-deployment]" in WORKFLOW
     assert "environment: feedling-e2e-test" in WORKFLOW
     assert "runs-on: [self-hosted, linux, x64, feedling-e2e]" in WORKFLOW
     assert "timeout-minutes: 240" in WORKFLOW
@@ -37,10 +37,20 @@ def test_workflow_is_manual_only_and_uses_protected_ephemeral_runner():
     )
 
 
-def test_deployment_target_is_not_operator_supplied_and_resolves_under_lock():
+def test_deployment_target_is_metadata_and_controller_code_is_immutable():
     trigger = WORKFLOW[WORKFLOW.index("on:\n") : WORKFLOW.index("permissions:\n")]
-    resolver = _step(
-        "Resolve current serialized test deployment target",
+    resolver = WORKFLOW[
+        WORKFLOW.index("  resolve-test-deployment:\n") : WORKFLOW.index(
+            "  qualify-api-key-runtime:\n"
+        )
+    ]
+    qualify = WORKFLOW[WORKFLOW.index("  qualify-api-key-runtime:\n") :]
+    checkout = _step(
+        "Check out immutable trusted controller revision",
+        "Verify immutable trusted controller checkout",
+    )
+    controller_check = _step(
+        "Verify immutable trusted controller checkout",
         "Set up Python",
     )
     context = _step(
@@ -48,16 +58,29 @@ def test_deployment_target_is_not_operator_supplied_and_resolves_under_lock():
         "Verify deployed endpoint and selected runtime target before qualification",
     )
 
-    assert "expected_deployment_sha:" not in trigger
+    assert "expected_deployment_sha" not in trigger
     assert "group: feedling-test-environment" in WORKFLOW
-    assert "ref: test" in WORKFLOW
-    assert "fetch-depth: 0" in WORKFLOW
-    assert 'git show "origin/test:deploy/docker-compose.phala.test.yaml"' in resolver
-    assert 'git rev-parse --verify "origin/test^{commit}"' in resolver
+    assert "ref: ${{ github.sha }}" in checkout
+    assert "fetch-depth: 1" in checkout
+    assert "persist-credentials: false" in checkout
+    assert "inputs.expected_deployment_sha" not in WORKFLOW
+    assert 'checked_out_sha="$(git rev-parse --verify HEAD)"' in controller_check
+    assert 'if [ "$checked_out_sha" != "$CONTROLLER_SHA" ]' in controller_check
+    assert "runs-on: ubuntu-24.04" in resolver
+    assert "environment:" not in resolver
+    assert "self-hosted" not in resolver
+    assert "secrets." not in resolver
+    assert "ref: test" in resolver
+    assert "Resolve current serialized test deployment target" in resolver
     assert 'if [ "${#images[@]}" -ne 2 ]' in resolver
     assert "git merge-base --is-ancestor" in resolver
-    assert "steps.deployment_target.outputs.sha" in context
-    assert "inputs.expected_deployment_sha" not in WORKFLOW
+    assert "ref: test" not in qualify
+    assert "needs: [validate-dispatch, resolve-test-deployment]" in qualify
+    assert (
+        "EXPECTED_DEPLOYMENT_SHA: ${{ needs.resolve-test-deployment.outputs.sha }}"
+        in context
+    )
+    assert 'echo "expected_sha=$EXPECTED_DEPLOYMENT_SHA"' in context
 
 
 def test_codex_preflight_installs_oauth_and_real_top_level_profile_config():
@@ -81,6 +104,7 @@ def test_codex_preflight_installs_oauth_and_real_top_level_profile_config():
     assert "persistent Codex auth is forbidden" in preflight
     assert "must run as an unprivileged user" in preflight
     assert "secrets.QA_CODEX_AUTH_JSON_B64" in preflight
+    assert '"$QA_CODEX_HOME/auth.json"' in preflight
     assert "vars.QA_CODEX_MODEL" in preflight
     assert "unset QA_CODEX_AUTH_JSON_B64" in preflight
     assert "mcp list --json" in preflight

@@ -33,36 +33,57 @@ def test_deterministic_qualification_contracts_gate_test_and_production_deploys(
     assert "qa-contract-tests" in production_deploy.split("steps:", 1)[0]
 
 
-def test_existing_default_branch_ci_dispatches_exact_test_ref_e2e_workflow():
+def test_existing_default_branch_ci_dispatches_trusted_e2e_without_inheriting_secrets():
     manual_job = _job("api-key-e2e-manual", "forge-test")
 
     assert "resolve-test-deployment-sha:" not in CI
     assert "github.event_name == 'workflow_dispatch'" in manual_job
-    assert "github.ref == 'refs/heads/test'" in manual_job
+    assert "github.ref == 'refs/heads/main'" in manual_job
     assert "uses: ./.github/workflows/api-key-e2e.yml" in manual_job
-    assert "expected_deployment_sha:" not in manual_job
-    assert "runtime_target: deployed_current" in manual_job
-    assert "secrets: inherit" in manual_job
+    assert "expected_deployment_sha" not in manual_job
+    assert "runtime_target: ${{ inputs.runtime_target }}" in manual_job
+    assert "secrets: inherit" not in manual_job
+    assert "secrets:" not in manual_job
     assert "workflow_call:" in E2E
     assert "group: ci-${{ github.event_name }}-${{ github.ref }}" in CI
     assert "cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}" in CI
 
 
-def test_e2e_resolves_current_compose_pin_inside_the_environment_lock():
-    trigger = E2E[E2E.index("on:\n") : E2E.index("permissions:\n")]
+def test_no_repository_workflow_implicitly_inherits_every_available_secret():
+    for path in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
+        assert "secrets: inherit" not in path.read_text(encoding="utf-8"), path
 
-    assert "expected_deployment_sha:" not in trigger
+
+def test_e2e_pins_secret_bearing_code_and_treats_deployment_sha_as_metadata():
+    trigger = E2E[E2E.index("on:\n") : E2E.index("permissions:\n")]
+    resolver = E2E[
+        E2E.index("  resolve-test-deployment:\n") : E2E.index(
+            "  qualify-api-key-runtime:\n"
+        )
+    ]
+    qualify = E2E[E2E.index("  qualify-api-key-runtime:\n") :]
+
+    assert "expected_deployment_sha" not in trigger
     assert "group: feedling-test-environment" in E2E
-    assert "ref: test" in E2E
-    assert "fetch-depth: 0" in E2E
-    assert "Resolve current serialized test deployment target" in E2E
-    assert 'git show "origin/test:deploy/docker-compose.phala.test.yaml"' in E2E
-    assert 'if [ "${#images[@]}" -ne 2 ]' in E2E
-    assert "GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}" in E2E
-    assert '[[ ! "$tag" =~ ^[a-f0-9]{7,64}$ ]]' in E2E
-    assert 'git rev-parse --verify "origin/test^{commit}"' in E2E
-    assert "git merge-base --is-ancestor" in E2E
-    assert "steps.deployment_target.outputs.sha" in E2E
+    assert 'if [ "$DISPATCH_REF" != "refs/heads/main" ]' in E2E
+    assert "runs-on: ubuntu-24.04" in resolver
+    assert "environment:" not in resolver
+    assert "self-hosted" not in resolver
+    assert "secrets." not in resolver
+    assert "ref: test" in resolver
+    assert "Resolve current serialized test deployment target" in resolver
+    assert 'if [ "${#images[@]}" -ne 2 ]' in resolver
+    assert "git merge-base --is-ancestor" in resolver
+    assert "needs: [validate-dispatch, resolve-test-deployment]" in qualify
+    assert "ref: ${{ github.sha }}" in qualify
+    assert "fetch-depth: 1" in qualify
+    assert 'checked_out_sha="$(git rev-parse --verify HEAD)"' in qualify
+    assert 'if [ "$checked_out_sha" != "$CONTROLLER_SHA" ]' in qualify
+    assert (
+        "EXPECTED_DEPLOYMENT_SHA: ${{ needs.resolve-test-deployment.outputs.sha }}"
+        in qualify
+    )
+    assert 'echo "expected_sha=$EXPECTED_DEPLOYMENT_SHA"' in qualify
 
 
 def test_backend_qualification_regressions_run_with_postgres_dependencies():

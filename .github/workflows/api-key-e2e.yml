@@ -1,4 +1,4 @@
-name: Agentic API-key qualification (manual)
+name: Agentic API-key qualification (self-service)
 
 on:
   workflow_dispatch:
@@ -11,8 +11,8 @@ on:
         options:
           - deployed_current
           - hosted_resident
-  # CI already exists on the default branch and can invoke this exact
-  # test-branch revision even before this standalone file lands there.
+  # The default-branch controller can invoke the same trusted revision without
+  # forwarding repository or organization secrets from the caller.
   workflow_call:
     inputs:
       runtime_target:
@@ -29,34 +29,41 @@ concurrency:
 
 jobs:
   validate-dispatch:
-    name: require the test branch
+    name: validate trusted default-branch controller
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Reject qualification from any non-test ref
+      - name: Reject qualification from any untrusted controller ref
         env:
+          CONTROLLER_SHA: ${{ github.sha }}
           DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          if [ "$DISPATCH_REF" != "refs/heads/test" ]; then
-            echo "::error::qualification must be dispatched from refs/heads/test; got $DISPATCH_REF"
+          if [ "$DISPATCH_REPOSITORY" != "teleport-computer/feedling-mcp" ]; then
+            echo "::error::qualification controller repository is not trusted"
+            exit 1
+          fi
+          if [ "$DISPATCH_REF" != "refs/heads/main" ]; then
+            echo "::error::qualification must be dispatched from protected refs/heads/main; got $DISPATCH_REF"
+            exit 1
+          fi
+          if [[ ! "$CONTROLLER_SHA" =~ ^[a-f0-9]{40}$ ]]; then
+            echo "::error::controller revision must be an immutable full Git SHA"
             exit 1
           fi
 
-  qualify-api-key-runtime:
-    name: qualify eight API-key profiles
+  resolve-test-deployment:
+    name: resolve deployed test SHA without secrets
     needs: validate-dispatch
-    environment: feedling-e2e-test
-    runs-on: [self-hosted, linux, x64, feedling-e2e]
-    timeout-minutes: 240
-
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.deployment_target.outputs.sha }}
     steps:
-      - name: Check out current serialized test revision
+      - name: Check out deployed test metadata without secrets
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          # Resolve the current test branch only after this workflow owns the
-          # shared environment lock. A dispatch queued behind a deployment may
-          # otherwise retain the compose pin from before that deployment.
           ref: test
           fetch-depth: 0
           persist-credentials: false
@@ -67,9 +74,7 @@ jobs:
           GITHUB_REPOSITORY_OWNER: ${{ github.repository_owner }}
         run: |
           set -euo pipefail
-          compose_file="$(mktemp)"
-          trap 'rm -f "$compose_file"' EXIT
-          git show "origin/test:deploy/docker-compose.phala.test.yaml" > "$compose_file"
+          compose_file="deploy/docker-compose.phala.test.yaml"
 
           mapfile -t images < <(
             awk '$1 == "image:" && $2 ~ /^ghcr\.io\/.*\/feedling:/ { print $2 }' \
@@ -102,8 +107,8 @@ jobs:
           fi
 
           full_sha="$(git rev-parse --verify "${tags[0]}^{commit}")"
-          test_head="$(git rev-parse --verify "origin/test^{commit}")"
-          if [[ ! "$full_sha" =~ ^([a-f0-9]{40}|[a-f0-9]{64})$ ]]; then
+          test_head="$(git rev-parse --verify "HEAD^{commit}")"
+          if [[ ! "$full_sha" =~ ^[a-f0-9]{40}$ ]]; then
             echo "::error::test compose image tag did not resolve to a full Git SHA"
             exit 1
           fi
@@ -112,6 +117,35 @@ jobs:
             exit 1
           fi
           echo "sha=$full_sha" >> "$GITHUB_OUTPUT"
+
+  qualify-api-key-runtime:
+    name: qualify eight API-key profiles
+    needs: [validate-dispatch, resolve-test-deployment]
+    environment: feedling-e2e-test
+    runs-on: [self-hosted, linux, x64, feedling-e2e]
+    timeout-minutes: 240
+
+    steps:
+      - name: Check out immutable trusted controller revision
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # Candidate/deployed code is metadata only. Secret-bearing steps run
+          # exclusively from the immutable controller revision that GitHub
+          # selected before the dispatch started.
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify immutable trusted controller checkout
+        env:
+          CONTROLLER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          checked_out_sha="$(git rev-parse --verify HEAD)"
+          if [ "$checked_out_sha" != "$CONTROLLER_SHA" ]; then
+            echo "::error::controller checkout moved: expected $CONTROLLER_SHA, got $checked_out_sha"
+            exit 1
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
@@ -129,7 +163,7 @@ jobs:
       - name: Prepare isolated run directories
         id: context
         env:
-          TRUSTED_DEPLOYMENT_SHA: ${{ steps.deployment_target.outputs.sha }}
+          EXPECTED_DEPLOYMENT_SHA: ${{ needs.resolve-test-deployment.outputs.sha }}
         run: |
           set -euo pipefail
 
@@ -201,7 +235,7 @@ jobs:
             echo "pre_deployment_receipt=$pre_deployment_receipt"
             echo "post_deployment_receipt=$post_deployment_receipt"
             echo "artifact_dir=$artifact_dir"
-            echo "expected_sha=$TRUSTED_DEPLOYMENT_SHA"
+            echo "expected_sha=$EXPECTED_DEPLOYMENT_SHA"
           } >> "$GITHUB_OUTPUT"
 
       - name: Verify deployed endpoint and selected runtime target before qualification
@@ -339,11 +373,11 @@ jobs:
                 rm -f "$2"
                 printf "work\n" > "$3"
                 rm -f "$3"
-                for denied in "$4" "$5" "$6" "$7" "$8" "$9"; do
+                for denied in "$4" "$5" "$6" "$7" "$8" "$9" "${10}"; do
                   test ! -r "$denied"
                 done
-                if printf "forbidden\n" > "${10}" 2>/dev/null; then
-                  rm -f "${10}"
+                if printf "forbidden\n" > "${11}" 2>/dev/null; then
+                  rm -f "${11}"
                   exit 1
                 fi
               ' sh \
@@ -356,6 +390,7 @@ jobs:
               "$QA_ORCHESTRATION_RECEIPT" \
               "$QA_SUPERVISOR_HOME" \
               "$QA_MEMORY_MANIFEST" \
+              "$QA_CODEX_HOME/auth.json" \
               "$QA_ARTIFACT_DIR/.sandbox-write-must-fail"
 
           env -i \

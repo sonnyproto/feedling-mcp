@@ -6,6 +6,15 @@ on:
   pull_request:
     branches: [main, test]
   workflow_dispatch:
+    inputs:
+      runtime_target:
+        description: Runtime contract expected from the deployed test endpoint
+        required: true
+        type: choice
+        default: deployed_current
+        options:
+          - deployed_current
+          - hosted_resident
 
 # Cancel in-progress runs on the same ref — latest push wins.
 concurrency:
@@ -16,16 +25,16 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
-  # This workflow already exists on the default branch. Dispatching it at ref
-  # `test` can therefore invoke the exact reusable E2E workflow from that test
-  # commit before the standalone E2E file itself lands on the default branch.
+  # Everyone with repository write access can dispatch this job. The controller
+  # and secret-bearing harness always come from protected main; deployed test
+  # code is resolved separately as metadata and is never executed on the
+  # evaluator runner.
   api-key-e2e-manual:
-    name: agentic API-key E2E (manual test-ref dispatch only)
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test'
+    name: agentic API-key E2E (self-service trusted controller)
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     uses: ./.github/workflows/api-key-e2e.yml
     with:
-      runtime_target: deployed_current
-    secrets: inherit
+      runtime_target: ${{ inputs.runtime_target }}
 
   # -------------------------------------------------------------------------
   # Solidity — FeedlingAppAuth contract tests
