@@ -709,6 +709,32 @@ def test_runtime_call_retries_without_temperature_on_temperature_400(monkeypatch
     assert "temperature" not in calls[1]["json"]    # retry dropped it
 
 
+def test_anthropic_runtime_call_retries_without_temperature_on_temperature_400(monkeypatch):
+    """The anthropic wire needs the same downgrade as the openai-compat one.
+
+    Verified against the live Anthropic API: claude-sonnet-5 and claude-opus-4-8 BOTH
+    reject `temperature` with 400 "`temperature` is deprecated for this model." (haiku-4-5
+    still accepts it). Anthropic is a first-class provider (driver=claude), so without this
+    a user can configure sonnet-5, pass setup, and then have genesis distillation — which
+    passes temperature=0.0/0.1 for deterministic extraction — 400 on every call."""
+    calls = _fake_client_then_ok(
+        monkeypatch,
+        400, {"type": "error", "error": {"type": "invalid_request_error",
+                                         "message": "`temperature` is deprecated for this model."}},
+        {"id": "msg_1", "content": [{"type": "text", "text": "ok"}],
+         "usage": {"input_tokens": 3, "output_tokens": 1}},
+    )
+    out = pc.chat_completion(
+        pc.ProviderConfig("anthropic", "claude-sonnet-5", "sk-ant-x"),
+        [{"role": "user", "content": "hi"}],
+        temperature=0.1,
+    )
+    assert out["reply"] == "ok"
+    assert len(calls) == 2
+    assert calls[0]["json"]["temperature"] == 0.1   # first attempt kept determinism
+    assert "temperature" not in calls[1]["json"]    # retry dropped it
+
+
 def test_provider_key_probe_sends_no_temperature(monkeypatch):
     # Regression: setup's live probe used to hard-code temperature=0.0, so configuring
     # a temperature-deprecating model (claude-sonnet-5 on an openai_compatible relay)

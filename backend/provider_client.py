@@ -938,21 +938,33 @@ def _chat_completion_anthropic(
     if system:
         payload["system"] = system
 
-    try:
-        resp = _http_client().post(
-            f"{base_url.rstrip('/')}/messages",
-            headers={
-                "x-api-key": key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=timeout,
-        )
-    except httpx.HTTPError as e:
-        raise ProviderError(f"provider network error: {type(e).__name__}") from e
+    def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
+        try:
+            return _http_client().post(
+                f"{base_url.rstrip('/')}/messages",
+                headers={
+                    "x-api-key": key,
+                    "anthropic-version": "2023-06-01",
+                    "Content-Type": "application/json",
+                },
+                json=request_payload,
+                timeout=timeout,
+            )
+        except httpx.HTTPError as e:
+            raise ProviderError(f"provider network error: {type(e).__name__}") from e
 
-    _raise_for_provider_status(resp)
+    resp = post_with_payload(payload)
+    try:
+        _raise_for_provider_status(resp)
+    except ProviderError:
+        # Same temperature downgrade as the openai-compat wire — Anthropic's own API
+        # rejects `temperature` on the Claude 5 generation (verified live: sonnet-5 and
+        # opus-4-8 both 400, haiku-4-5 still accepts it).
+        fallback_payload = _temperature_fallback_payload(payload, resp)
+        if fallback_payload is None:
+            raise
+        resp = post_with_payload(fallback_payload)
+        _raise_for_provider_status(resp)
 
     try:
         body = resp.json()
