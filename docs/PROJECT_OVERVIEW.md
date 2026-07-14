@@ -443,16 +443,15 @@ Alembic 出现之前就已建表的生产 RDS 上。
 优先 onboarding 成功率，质量靠后续二次蒸馏补，不靠卡数量堵门）。v2 没有
 tab 概念，`below_floor` 的三个 per-tab key 仅为响应形状兼容保留、恒为
 `False`。真正还在起作用的信号是按"关系天数"分档的总量参考曲线
-（`memory_service._memory_floor_for_days`，2026-07-14 由 hx 重新校准，
-刚认识时曲线为 0，无 day-0 焦虑）：
+（`memory_service._memory_floor_for_days`，2026-07-14 Seven 校准；
+纯引导、永不 gate）：
 
 | 关系时长 | 总量参考 floor |
 |---------|---------------|
-| ≥6 个月 | 50 |
-| ≥3 个月 | 30 |
-| ≥1 个月 | 15 |
-| ≥7 天 | 5 |
-| <7 天 | 0 |
+| ≥6 个月 | 30 |
+| ≥1 个月 | 12 |
+| ≥2 天 | 5 |
+| <2 天 | 2 |
 
 低于这条曲线时，响应带 `memory_floor` / `memory_below_floor` 两个平铺
 字段，`suggestions` 最多给一条引导语（"参考下限约 N 张……绝不编造凑数"），

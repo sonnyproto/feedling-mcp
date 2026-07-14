@@ -695,7 +695,7 @@ def test_memory_verify_empty_user(backend):
 def test_memory_verify_guidance_only_below_floor(backend):
     """Batch 4 A5: /v1/memory/verify is guidance-only, never a gate. A
     relationship ≥30 days old with only 2 cards is below the days-scaled
-    reference floor (30-89d tier floor = 15, see
+    reference floor (≥30d tier floor = 12 (Seven calibration), see
     memory_service._per_tab_floors_for_days) — this must surface as
     memory_below_floor=True + exactly one guidance suggestion, but must
     NEVER flip passing and must NEVER mention the retired 409 gate."""
