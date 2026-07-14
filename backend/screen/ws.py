@@ -75,6 +75,16 @@ async def _ws_handler(websocket):
     print(f"[ws] client connected user={user_id} peer={websocket.remote_address}")
     try:
         async for message in websocket:
+            # 连接握手时鉴权一次不够：账号删除（users 行 CASCADE 删净）/ key 吊销后
+            # 这条已建立的广播扩展 WS 还活着、每 ~10s 继续推帧——每帧对已不存在的
+            # 用户写库（set_blob 撞 FK 被吞）、仍广播 store 变更，让其余 worker 反复
+            # evict/reload 幽灵 store（2026-07-14 prod 实测 usr_25ce… 53 次/10min）。
+            # _resolve_user 是内存 hash→uid 查表（账号删除的 users 广播已把 key 摘
+            # 除），每帧重验几乎零成本；失效即 4401 关闭，扩展重连会在握手处被拒。
+            if registry._resolve_user(ws_key) != user_id:
+                print(f"[ws:{user_id}] key no longer valid (account deleted / key revoked) — closing")
+                await websocket.close(code=4401, reason="unauthorized")
+                return
             try:
                 data = json.loads(message)
                 if data.get("type") == "frame":
