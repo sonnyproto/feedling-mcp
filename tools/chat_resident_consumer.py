@@ -8055,6 +8055,24 @@ def _window_document(text: str, *, max_chars: int = 18000, overlap_lines: int = 
     return windows or ([text] if text.strip() else [])
 
 
+def _resident_floor_note() -> str:
+    """f(days) 蒸馏目标(机制 A,非闸门):花园低于天数下限时给 fact_write 一句
+    非编造引导 —— 素材真实支持的事实尽量都写,绝不编造凑数。取不到状态返空(零影响)。"""
+    try:
+        st = _capture_get_json("/v1/bootstrap/status")
+        floor = int(st.get("memory_floor") or 0)
+        count = int(st.get("memories_count") or 0)
+        if floor > 0 and count < floor:
+            return (
+                f"这段关系的记忆花园目前只有 {count} 张卡,按相处天数的参考下限约 {floor} 张。"
+                "素材【真实支持】的持久事实尽量都写成卡,别为精简丢掉真事实;"
+                "仍按 known_memories 去重;【绝不编造】凑数——宁缺毋滥。"
+            )
+    except Exception:
+        pass
+    return ""
+
+
 def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = False) -> list[dict]:
     """Reuse the CLOUD genesis memory engine on the VPS: window → fact_map (per window) →
     fact_write, driven by the local agent (persist_output=False = no backend DB). Returns
@@ -8082,6 +8100,7 @@ def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = F
     mem_out = genesis_worker.build_memory_output_from_fact_candidates(
         user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:write",
         runtime=runtime, fact_candidates=candidates, llm=llm, keep_all=keep_all,
+        floor_note=_resident_floor_note(),
     )
     return [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
 

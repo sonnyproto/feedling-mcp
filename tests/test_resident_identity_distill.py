@@ -72,3 +72,24 @@ def test_existing_identity_flows_into_merge_prompt(monkeypatch):
     crc._resident_derive_identity("材料", "job5")
     assert "EXISTING identity card" in calls["prompts"][0]
     assert "老c" in calls["prompts"][0]
+
+
+def test_floor_note_below_floor(monkeypatch):
+    monkeypatch.setattr(crc, "_capture_get_json",
+                        lambda path, **kw: {"memory_floor": 38, "memories_count": 2})
+    note = crc._resident_floor_note()
+    assert "2" in note and "38" in note
+    assert "绝不编造" in note
+
+
+def test_floor_note_empty_at_or_above_floor(monkeypatch):
+    monkeypatch.setattr(crc, "_capture_get_json",
+                        lambda path, **kw: {"memory_floor": 38, "memories_count": 40})
+    assert crc._resident_floor_note() == ""
+
+
+def test_floor_note_empty_on_error(monkeypatch):
+    def boom(path, **kw):
+        raise RuntimeError("api down")
+    monkeypatch.setattr(crc, "_capture_get_json", boom)
+    assert crc._resident_floor_note() == ""
