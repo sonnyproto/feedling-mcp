@@ -775,7 +775,7 @@ def _build_openai_compat_payload(
     provider: str,
     model: str,
     messages: list[dict[str, Any]],
-    temperature: float,
+    temperature: float | None,
     max_tokens: int,
     response_format: dict[str, Any] | None,
     extra_body: dict[str, Any] | None,
@@ -785,9 +785,14 @@ def _build_openai_compat_payload(
         "model": model,
         "messages": messages,
         "stream": False,
-        "temperature": temperature,
         "max_tokens": max(1, min(int(max_tokens), 8192)),
     }
+    # temperature is OPTIONAL on this wire: the Claude 5 / GPT-5 generation rejects
+    # it outright ("`temperature` is deprecated for this model" → 400). Relays pool
+    # several upstream channels per model id, so only some requests hit a rejecting
+    # one — the failure looks intermittent. Pass None to omit it entirely.
+    if temperature is not None:
+        payload["temperature"] = temperature
     if response_format:
         payload["response_format"] = response_format
     if extra_body:
@@ -808,6 +813,29 @@ def _reasoning_fallback_payload(
         fallback.pop("reasoning", None)
         return fallback
     return None
+
+
+def _temperature_fallback_payload(payload: dict[str, Any], resp) -> dict[str, Any] | None:
+    """Claude 5 / GPT-5 一代弃用 temperature，带上就 400（"`temperature` is deprecated
+    for this model."）：去掉 temperature 重试一次。不适用时返回 None（调用方原样 raise）。
+
+    为什么是降级重试、而不是干脆不发 temperature：运行时调用方是**故意**传低温的
+    （genesis 蒸馏 / legacy turn 传 0.0~0.1 换确定性，好让结构化抽取的 JSON 稳定解析），
+    全局不发会让这些输出变随机。所以保持默认发送，只在 provider 明确因它报错时才摘掉。
+
+    只在报错文本确实提到 temperature 时降级 —— 否则一个坏 key / 坏模型的 400 会被静默
+    重试成另一个 payload，把真正的错误盖掉。"""
+    if resp.status_code not in {400, 422} or "temperature" not in payload:
+        return None
+    try:
+        detail = (resp.text or "")
+    except Exception:  # noqa: BLE001 — 拿不到 body 就不猜，原样 raise
+        return None
+    if "temperature" not in detail.lower():
+        return None
+    fallback = dict(payload)
+    fallback.pop("temperature", None)
+    return fallback
 
 
 def _parse_openai_compat_body(
@@ -838,7 +866,7 @@ def _chat_completion_openai_compatible(
     key: str,
     messages: list[dict[str, Any]],
     max_tokens: int,
-    temperature: float,
+    temperature: float | None,
     timeout: float,
     response_format: dict[str, Any] | None,
     extra_body: dict[str, Any] | None = None,
@@ -866,8 +894,11 @@ def _chat_completion_openai_compatible(
     try:
         _raise_for_provider_status(resp)
     except ProviderError:
-        fallback_payload = _reasoning_fallback_payload(
-            payload, resp, provider=provider, include_reasoning=include_reasoning)
+        fallback_payload = (
+            _reasoning_fallback_payload(
+                payload, resp, provider=provider, include_reasoning=include_reasoning)
+            or _temperature_fallback_payload(payload, resp)
+        )
         if fallback_payload is None:
             raise
         resp = post_with_payload(fallback_payload)
@@ -884,7 +915,7 @@ def _chat_completion_anthropic(
     key: str,
     messages: list[dict[str, Any]],
     max_tokens: int,
-    temperature: float,
+    temperature: float | None,
     timeout: float,
     response_format: dict[str, Any] | None,
     require_reply: bool = True,
@@ -902,7 +933,7 @@ def _chat_completion_anthropic(
     }
     if include_reasoning and _anthropic_supports_thinking(model) and capped_max_tokens >= 1536:
         payload["thinking"] = {"type": "enabled", "budget_tokens": min(1024, capped_max_tokens - 512)}
-    else:
+    elif temperature is not None:
         payload["temperature"] = temperature
     if system:
         payload["system"] = system
@@ -948,7 +979,7 @@ def _chat_completion_gemini(
     key: str,
     messages: list[dict[str, Any]],
     max_tokens: int,
-    temperature: float,
+    temperature: float | None,
     timeout: float,
     response_format: dict[str, Any] | None,
     require_reply: bool = True,
@@ -956,9 +987,10 @@ def _chat_completion_gemini(
 ) -> dict[str, Any]:
     system, contents = _split_system_messages_gemini(messages)
     generation_config: dict[str, Any] = {
-        "temperature": temperature,
         "maxOutputTokens": max(1, min(int(max_tokens), 8192)),
     }
+    if temperature is not None:
+        generation_config["temperature"] = temperature
     if response_format and response_format.get("type") in {"json_object", "json_schema"}:
         generation_config["responseMimeType"] = "application/json"
     if include_reasoning and "2.5" in model:
@@ -1016,7 +1048,7 @@ def chat_completion(
     messages: list[dict[str, Any]],
     *,
     max_tokens: int = 700,
-    temperature: float = 0.7,
+    temperature: float | None = 0.7,
     timeout: float = 60.0,
     response_format: dict[str, Any] | None = None,
     require_reply: bool = True,
@@ -1140,7 +1172,13 @@ def test_provider_key(config: ProviderConfig) -> dict[str, Any]:
             {"role": "user", "content": "Say ok."},
         ],
         max_tokens=256,
-        temperature=0.0,
+        # No temperature: the Claude 5 / GPT-5 generation rejects it outright
+        # ("`temperature` is deprecated for this model" → 400), and the probe has no
+        # need for it — we only care that the key/model/billing work. Sending it made
+        # setup fail intermittently (measured 2/6 on claude-sonnet-5 via a relay,
+        # since only some upstream channels behind a model id reject it), which read
+        # to the user as "sometimes I can add this model, sometimes I can't".
+        temperature=None,
         timeout=30.0,
         require_reply=False,
     )
@@ -1181,7 +1219,7 @@ async def chat_completion_async(
     messages: list[dict[str, Any]],
     *,
     max_tokens: int = 700,
-    temperature: float = 0.7,
+    temperature: float | None = 0.7,
     timeout: float = 60.0,
     response_format: dict[str, Any] | None = None,
     require_reply: bool = True,
@@ -1235,8 +1273,11 @@ async def chat_completion_async(
     try:
         _raise_for_provider_status(resp)
     except ProviderError:
-        fallback_payload = _reasoning_fallback_payload(
-            payload, resp, provider=provider, include_reasoning=include_reasoning)
+        fallback_payload = (
+            _reasoning_fallback_payload(
+                payload, resp, provider=provider, include_reasoning=include_reasoning)
+            or _temperature_fallback_payload(payload, resp)
+        )
         if fallback_payload is None:
             raise
         resp = await post_with_payload(fallback_payload)

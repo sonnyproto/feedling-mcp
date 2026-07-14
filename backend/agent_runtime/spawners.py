@@ -192,6 +192,34 @@ _PI_GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 # default only fills the null. Set to "" to make unset routes default-off.
 _PI_REASONING_DEFAULT = "medium"
 
+# Cap on a pi turn's OUTPUT tokens. Must be pinned on every model entry: omit it and
+# pi fills its own default of 16384 (model-registry: `maxTokens: modelDef.maxTokens
+# ?? 16384`), and pi exposes no --max-tokens flag, so the model entry is the only
+# lever. 16384 is hostile to BYOK users on a budget — relays PRE-AUTHORIZE against
+# the requested max_tokens, so a small balance or a capped OpenRouter key is refused
+# before a single token is spent ("You requested up to 16384 tokens, but can only
+# afford 1698" → the turn dies with no reply).
+#
+# ⚠️ Do NOT lower this alone. pi reserves a thinking budget per level (medium = 8192)
+# and clamps it with `if (maxTokens <= thinkingBudget) thinkingBudget = maxTokens - 1024`
+# — so a value at or below the budget silently collapses thinking to 1024 tokens.
+# Since we ship thinking ON at medium (_PI_REASONING_DEFAULT), the default must clear
+# 8192. 12288 = 8192 thinking + 4096 reply; replies measure in the tens of tokens, so
+# 4096 is ample. Lowering further is a deliberate trade — set FEEDLING_PI_MAX_TOKENS
+# and lower the thinking level with it.
+_PI_MAX_TOKENS_DEFAULT = 12288
+
+
+def _pi_max_tokens() -> int:
+    raw = os.environ.get("FEEDLING_PI_MAX_TOKENS", "").strip()
+    if not raw:
+        return _PI_MAX_TOKENS_DEFAULT
+    try:
+        value = int(raw)
+    except ValueError:
+        return _PI_MAX_TOKENS_DEFAULT
+    return value if value > 0 else _PI_MAX_TOKENS_DEFAULT
+
 
 def _norm_effort(e: str) -> str:
     """Normalize a route's ``reasoning_effort`` to pi's tri-level scale, or ""
@@ -344,6 +372,12 @@ def _pi_models_json(*, base_url: str, model: str, provider: str,
             "compat": compat,
             "models": [model_entry],
         }
+    # Pin maxTokens on every entry, at the one seam all four branches pass through —
+    # a branch that forgot it would silently inherit pi's 16384 default and 402 any
+    # budget-capped relay key. Assigning a scalar per-dict keeps each branch's entry
+    # independent (no shared mutable state, same as the reasoning flag above).
+    for entry in prov["models"]:
+        entry["maxTokens"] = _pi_max_tokens()
     doc = {"providers": {_PI_PROVIDER_ID: prov}}
     return json.dumps(doc, indent=2) + "\n"
 

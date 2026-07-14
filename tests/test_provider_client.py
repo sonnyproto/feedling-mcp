@@ -635,6 +635,93 @@ def test_setup_self_test_still_fails_on_http_error(monkeypatch):
     assert ei.value.status_code == 429
 
 
+def test_openai_compat_payload_omits_temperature_when_none():
+    # `temperature` must be OMITTABLE, not merely settable: Claude 5 / GPT-5 class
+    # models reject it outright ("`temperature` is deprecated for this model" → 400).
+    payload = pc._build_openai_compat_payload(
+        provider="openai_compatible", model="claude-sonnet-5",
+        messages=[{"role": "user", "content": "hi"}],
+        temperature=None, max_tokens=256,
+        response_format=None, extra_body=None, include_reasoning=False)
+    assert "temperature" not in payload
+
+
+def test_temperature_fallback_drops_temperature_on_a_temperature_400():
+    """Runtime calls (genesis distill, legacy turn) legitimately pass temperature to get
+    determinism, so we can't just stop sending it. Instead mirror the existing reasoning
+    downgrade: when the provider 400s *about temperature*, retry once without it."""
+    payload = {"model": "claude-sonnet-5", "temperature": 0.1, "messages": []}
+    resp = FakeResponse(400, {"error": {"message": "`temperature` is deprecated for this model."}})
+    out = pc._temperature_fallback_payload(payload, resp)
+    assert out is not None and "temperature" not in out
+    assert out["model"] == "claude-sonnet-5"  # everything else preserved
+    assert "temperature" in payload  # caller's dict not mutated
+
+
+def test_temperature_fallback_ignores_unrelated_400s():
+    """Only downgrade when the 400 is actually ABOUT temperature — otherwise a bad-key or
+    bad-model 400 would silently get retried with a different payload and mask the real error."""
+    payload = {"model": "m", "temperature": 0.1, "messages": []}
+    assert pc._temperature_fallback_payload(
+        payload, FakeResponse(400, {"error": {"message": "invalid model"}})) is None
+    # and never on a payload that has no temperature to drop
+    assert pc._temperature_fallback_payload(
+        {"model": "m"}, FakeResponse(400, {"error": {"message": "temperature bad"}})) is None
+
+
+def _fake_client_then_ok(monkeypatch, first_status: int, first_body: dict, ok_body: dict) -> list[dict]:
+    """First POST returns `first_status`, every later POST succeeds. Records each payload."""
+    calls: list[dict] = []
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def post(self, url: str, *, headers=None, json=None, timeout=None):
+            calls.append({"url": url, "headers": headers or {}, "json": json or {}})
+            if len(calls) == 1:
+                return FakeResponse(first_status, first_body)
+            return FakeResponse(200, ok_body)
+
+    monkeypatch.setattr(pc.httpx, "Client", FakeClient)
+    monkeypatch.setattr(pc, "_shared_client", None)
+    return calls
+
+
+def test_runtime_call_retries_without_temperature_on_temperature_400(monkeypatch):
+    """End-to-end: a real chat turn against a temperature-deprecating model must still
+    succeed. Without this, setup accepts the model but every genesis-distill / legacy turn
+    400s — the user can add a model that is unusable in practice."""
+    calls = _fake_client_then_ok(
+        monkeypatch,
+        400, {"error": {"message": "`temperature` is deprecated for this model."}},
+        {"choices": [{"message": {"content": "ok"}}]},
+    )
+    out = pc.chat_completion(
+        pc.ProviderConfig("openai_compatible", "claude-sonnet-5", "sk-x",
+                          base_url="https://relay.example/v1"),
+        [{"role": "user", "content": "hi"}],
+        temperature=0.1,
+    )
+    assert out["reply"] == "ok"
+    assert len(calls) == 2
+    assert calls[0]["json"]["temperature"] == 0.1   # first attempt kept determinism
+    assert "temperature" not in calls[1]["json"]    # retry dropped it
+
+
+def test_provider_key_probe_sends_no_temperature(monkeypatch):
+    # Regression: setup's live probe used to hard-code temperature=0.0, so configuring
+    # a temperature-deprecating model (claude-sonnet-5 on an openai_compatible relay)
+    # 400'd and the user simply could not add that model. Measured 2/6 failure rate
+    # against a real relay, since only some upstream channels in the pool reject it.
+    calls = _fake_client(monkeypatch, {"choices": [{"message": {"content": "ok"}}]})
+    pc.test_provider_key(
+        pc.ProviderConfig("openai_compatible", "claude-sonnet-5", "sk-x",
+                          base_url="https://relay.example/v1")
+    )
+    assert "temperature" not in calls[0]["json"]
+
+
 # A 2xx whose body is NOT a valid provider success shape (e.g. a gateway that
 # answers 200 with `{}` or `{"error": ...}`) must still be rejected even on the
 # lenient self-test path — otherwise setup "succeeds" but chat/send later fails
