@@ -229,6 +229,10 @@ def test_admin_data_track_dau_counts_user_activity_by_beijing_day(client):
     body = res.get_json()
     by_day = {row["day"]: row for row in body["rows"]}
     assert body["definition"]["timezone"] == "Asia/Shanghai"
+    assert body["summary"]["snapshot_first_day"] == ""
+    assert body["summary"]["snapshot_last_day"] == ""
+    assert body["summary"]["snapshot_days"] == 0
+    assert all(row["frozen"] is False for row in body["rows"])
     assert by_day["2030-06-03"]["dau"] == 1
     assert by_day["2030-06-03"]["chat_dau"] == 1
     assert by_day["2030-06-03"]["tracking_dau"] == 0
@@ -429,6 +433,33 @@ def test_beijing_time_display_helpers():
     # fail-soft: a wildly out-of-range epoch must not raise (would 500 the page)
     assert isinstance(_dt._bj_iso(10 ** 30), str)
     assert _dt._debug_time(10 ** 30) == "—"
+
+
+def test_dau_page_marks_frozen_vs_live_and_cutover_note():
+    # Each day shows 🔒已冻结 (snapshot, immutable) or ⏱实时 (live, can shrink on
+    # deletion); the history note names the snapshot cutover day.
+    summary = {
+        "latest_dau": 2, "latest_day": "2026-07-14", "max_dau": 5, "avg_dau": 3.5,
+        "user_messages": 10, "tracking_events": 20, "days_returned": 2,
+        "timezone": "Asia/Shanghai", "generated_at": "2026-07-14T00:00:00",
+        "snapshot_first_day": "2026-07-13", "snapshot_last_day": "2026-07-13", "snapshot_days": 1,
+    }
+    rows = [
+        {"day": "2026-07-14", "frozen": False, "dau": 2, "chat_dau": 1, "tracking_dau": 2,
+         "active_events": 3, "user_messages": 4, "tracking_events": 5, "session_dau": 1,
+         "avg_session_sec": 60, "session_count": 3, "last_at": "2026-07-14T00:00:00"},
+        {"day": "2026-07-13", "frozen": True, "dau": 5, "chat_dau": 3, "tracking_dau": 5,
+         "active_events": 9, "user_messages": 6, "tracking_events": 7, "session_dau": 2,
+         "avg_session_sec": 90, "session_count": 8, "last_at": "2026-07-13T10:00:00"},
+    ]
+    out = _dt._render_data_track_dau_page(
+        {"summary": summary, "filters": {}, "definition": {"dau": "", "excluded": ""}, "rows": rows}
+    )
+    assert "🔒 已冻结" in out          # the frozen day
+    assert "⏱ 实时" in out            # today (live)
+    assert "首个冻结日是 <b>2026-07-13</b>" in out  # cutover named in the note
+    assert "<b>今天</b>仍是实时数据" in out
+    assert "<th>状态</th>" in out       # status column present
 
 
 def test_bj_deep_converts_only_iso_datetime_strings():

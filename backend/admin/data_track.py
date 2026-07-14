@@ -1644,6 +1644,7 @@ def _data_track_debug_payload() -> dict:
 def _data_track_dau_payload() -> dict:
     filters = _data_track_request_filters()
     days = int(filters.get("days") or 30)
+    snapshot = db.admin_dau_snapshot_bounds()
     rows = db.admin_data_track_dau(
         since_epoch=float(filters.get("since_epoch") or 0),
         days=days,
@@ -1662,6 +1663,9 @@ def _data_track_dau_payload() -> dict:
         "user_messages": sum(int(row.get("user_messages") or 0) for row in rows),
         "tracking_events": sum(int(row.get("tracking_events") or 0) for row in rows),
         "active_events": sum(int(row.get("active_events") or 0) for row in rows),
+        "snapshot_first_day": snapshot.get("first_day", ""),
+        "snapshot_last_day": snapshot.get("last_day", ""),
+        "snapshot_days": int(snapshot.get("days") or 0),
     }
     return {
         "summary": summary,
@@ -2089,12 +2093,23 @@ def _render_data_track_dau_page(payload: dict) -> str:
     definition = payload.get("definition", {})
     api_qs = _data_track_qs(view=None, q=None, limit=None, offset=None, sort=None, dir=None)
     api_url = f"/v1/admin/data-track/dau?{api_qs}" if api_qs else "/v1/admin/data-track/dau"
+    _snap_first = str(summary.get("snapshot_first_day") or "")
+    _cutover_html = (
+        f"首个冻结日是 <b>{html.escape(_snap_first)}</b>。状态列以当天实际标记为准："
+        "<b>已冻结</b>的数据不再变化；<b>今天</b>仍是实时数据，日结束后自动冻结。"
+        f"<b>{html.escape(_snap_first)} 之前</b>的日期仍是实时重算，会随删号下降、偏少、仅供参考。"
+        if _snap_first else
+        "每日快照即将生效；生效后当天真实数据会冻结、不再随删号变化。"
+    )
     rows_html = []
     for row in rows:
         rows_html.append(
             "<tr>"
             f"<td>{html.escape(str(row.get('day') or ''))}</td>"
-            f"<td>{int(row.get('dau') or 0)}</td>"
+            + ("<td><span style='color:#1d7a4d;font-size:12px'>🔒 已冻结</span></td>"
+               if row.get("frozen")
+               else "<td><span style='color:#a05a00;font-size:12px'>⏱ 实时</span></td>")
+            + f"<td>{int(row.get('dau') or 0)}</td>"
             f"<td>{int(row.get('chat_dau') or 0)}</td>"
             f"<td>{int(row.get('tracking_dau') or 0)}</td>"
             f"<td>{int(row.get('active_events') or 0)}</td>"
@@ -2157,15 +2172,15 @@ def _render_data_track_dau_page(payload: dict) -> str:
   <h2>Daily Active Users</h2>
   <div style="background:#fff8ef;border:1px solid #e8d8be;border-radius:8px;padding:12px 14px;margin:10px 0;font-size:13px;line-height:1.7;color:#5a4d3c">
     <b>⚠️ 历史数据偏少 · 已知问题</b><br>
-    每日快照上线之前的历史数据，是<b>每次打开页面时从当前还存在的数据实时重算</b>的，没有冻结快照。用户<b>删除/重置账户后其消息会被级联删除</b>，会<b>追溯性地</b>减少他活跃过的每一天——所以过去某天的 DAU 会随时间下降、<b>看起来偏少、不完全可靠，仅供参考</b>。<br>
-    从每日快照功能上线之后的日期起，当天真实数据会<b>冻结</b>、不再变化、准确。
+    实时重算的历史数据，是<b>每次打开页面时从当前还存在的数据算</b>的，没有冻结快照。用户<b>删除/重置账户后其消息会被级联删除</b>，会<b>追溯性地</b>减少他活跃过的每一天——所以那些天的 DAU 会随时间下降、<b>偏少、仅供参考</b>。<br>
+    {_cutover_html}
   </div>
   <div class="muted">{html.escape(definition.get("dau") or "")} {html.escape(definition.get("excluded") or "")}</div>
   <div class="muted">使用DAU=当天有 app 使用时长上报的用户数；平均使用时长=当天所有会话的平均前台时长；会话数=当天 app_session_end 事件数。前台被杀会漏报，略偏低估。均按北京日。</div>
   <div class="toolbar"><a class="sort-button" href="{html.escape(api_url, quote=True)}">JSON</a></div>
   <table>
-    <thead><tr><th>Beijing day</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>使用DAU</th><th>平均使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
-    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='11' class='muted'>No DAU activity in this range.</td></tr>"}</tbody>
+    <thead><tr><th>Beijing day</th><th>状态</th><th>DAU</th><th>Chat DAU</th><th>Tracking DAU</th><th>Active events</th><th>User messages</th><th>Tracking events</th><th>使用DAU</th><th>平均使用时长</th><th>会话数</th><th>Last active</th></tr></thead>
+    <tbody>{''.join(rows_html) if rows_html else "<tr><td colspan='12' class='muted'>No DAU activity in this range.</td></tr>"}</tbody>
   </table>
 </main>
 </body>
