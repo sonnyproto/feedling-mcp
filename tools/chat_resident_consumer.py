@@ -8098,9 +8098,10 @@ def _resident_existing_identity() -> dict:
         if not isinstance(body.get("identity"), dict):
             body = _capture_get_json("/v1/identity/get")
         identity = body.get("identity") if isinstance(body.get("identity"), dict) else {}
+        from identity import distill_prompt_v1 as _dp
         return {
             k: identity[k]
-            for k in ("agent_name", "self_introduction", "dimensions")
+            for k in _dp.RESIDENT_IDENTITY_FIELDS
             if identity.get(k) not in (None, "", [], {})
         }
     except Exception:
@@ -8109,41 +8110,22 @@ def _resident_existing_identity() -> dict:
 
 def _resident_derive_identity(document: str, job_id: str) -> dict | None:
     """Persona/identity is small (fits one context) — a single agent derive, no chunking.
+    Prompt + parse 来自共享模板 identity/distill_prompt_v1(Batch 2 A1):全量人格字段、
+    card_policy 清洗、坏 JSON 重试一次(guardrail 7:报错到 setup log,不静默吞)。
     Returns a plaintext identity payload for identity.replace, or None if no persona content."""
+    from identity import distill_prompt_v1 as _dp
     existing = _resident_existing_identity()
-    # 部分补全: merge onto the current card so fields the upload doesn't mention stay put.
-    # DRAFT wording (Seven to finalize); mirrors the cloud _IDENTITY_UPDATE_MERGE_TEMPLATE.
-    merge_block = ""
-    if existing:
-        merge_block = (
-            "This is an UPDATE to an EXISTING identity card, not a fresh derivation.\n"
-            "Existing card:\n" + json.dumps(existing, ensure_ascii=False) + "\n"
-            "Merge rules:\n"
-            "- For fields the new material ADDRESSES, use the new values (latest wins). On a "
-            "SERIOUS conflict, the new material wins — the user uploaded it to change the card.\n"
-            "- For fields the new material does NOT address, KEEP the existing card's values "
-            "unchanged — do not blank them and do not invent replacements.\n"
-            "- Keep the result COHERENT: if a trait / dimension changes, update self_introduction "
-            "/ tone_style to match, so no stale description from the old card survives.\n"
-        )
-    prompt = (
-        "The user uploaded a character/persona description for the companion (you). Derive the "
-        "identity card and return ONE JSON object, nothing else:\n"
-        '{"agent_name": str, "self_introduction": str, '
-        '"dimensions": [{"name": str, "value": 0-100, "description": str}]}\n'
-        "Ground every field in the material; return {} if there is no persona content.\n"
-        + merge_block
-        + "--- MATERIAL ---\n" + document + "\n--- END MATERIAL ---\n"
-    )
-    raw = str(_capture_agent_reply_text(call_agent(prompt, raw_text=True, trace_id=job_id)) or "").strip()
-    start, end = raw.find("{"), raw.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        obj = json.loads(raw[start:end + 1])
-    except Exception:
-        return None
-    return obj if isinstance(obj, dict) and obj.get("agent_name") else None
+    prompt = _dp.build_resident_identity_prompt(document, existing_identity=existing or None)
+    for attempt in (1, 2):
+        raw = str(_capture_agent_reply_text(call_agent(prompt, raw_text=True, trace_id=job_id)) or "").strip()
+        payload = _dp.parse_identity_payload(raw)
+        if payload is not None:
+            return payload
+        log.warning("resident identity distill: unparseable output (attempt %d/2) job=%s head=%r",
+                    attempt, job_id, raw[:120])
+        prompt = prompt + "\nReturn ONLY the JSON object — no prose, no code fences."
+    log.error("resident identity distill failed after retry job=%s — skipping identity update", job_id)
+    return None
 
 
 def _process_resident_distill_once() -> None:
