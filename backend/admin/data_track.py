@@ -1055,7 +1055,9 @@ def _build_data_track_user(user_entry: dict, *, include_detail: bool = False) ->
                 "arrival_wake_到达唤醒": bool(_ps.get("arrival_wake_enabled", True)),
                 "unlock_wake_解锁唤醒": bool(_ps.get("unlock_wake_enabled", True)),
             },
-            "wake_directive": str(_ps.get("wake_directive") or ""),
+            # User-authored natural language is private content. Data-track may
+            # expose whether it is configured, never the directive itself.
+            "wake_directive_configured": bool(str(_ps.get("wake_directive") or "").strip()),
             "wake_interval_sec": int(_ps.get("wake_interval_sec") or 0),
             "user_state": _ps.get("user_state"),
             "ai_state": _ps.get("ai_state"),
@@ -3153,8 +3155,13 @@ def _render_perception_permissions(user: dict) -> str:
         f"<span class='pp-item'>{html.escape(str(k))} <b class='{'ppok' if v else 'ppmuted'}'>{'开' if v else '关'}</b></span>"
         for k, v in sw.items()
     )
-    directive = str(pp.get("wake_directive") or "").strip()
-    directive_html = f"<div class='ppmuted' style='margin-top:6px'>wake 指令：{html.escape(directive)}</div>" if directive else ""
+    directive_configured = bool(pp.get("wake_directive_configured"))
+    directive_html = (
+        "<div class='ppmuted' style='margin-top:6px'>"
+        f"自定义 wake 指令：{'已配置' if directive_configured else '未配置'}"
+        f" · 间隔：{html.escape(str(pp.get('wake_interval_sec') or 0))} 秒"
+        "</div>"
+    )
     return (
         "<h2 style='font-size:15px;margin:22px 0 6px'>感知授权 &amp; 主动开关</h2>"
         "<div class='ppmuted' style='font-size:12px;margin-bottom:6px'>感知授权=设备上报的各感知权限（相册/屏幕/位置/健康…）；开关=用户自己的主动/自主开关。</div>"
