@@ -26,6 +26,26 @@ def _bool(name: str, default: bool) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _origins(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """Read a comma-separated list of exact browser origins.
+
+    An explicitly empty value disables browser CORS.  A trailing slash is
+    ignored because the HTTP Origin header never includes one.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+
+    origins: list[str] = []
+    for value in raw.split(","):
+        origin = value.strip().rstrip("/")
+        if origin == "*":
+            raise ValueError(f"{name} must contain exact origins; wildcard '*' is not allowed")
+        if origin and origin not in origins:
+            origins.append(origin)
+    return tuple(origins)
+
+
 @dataclass(frozen=True)
 class Settings:
     # Bounded sync->thread bridge for sync DB / blocking calls. anyio's default
@@ -42,6 +62,15 @@ class Settings:
 
     # Structured ASGI access log (plan §5.9). On by default.
     access_log: bool = _bool("FEEDLING_ASGI_ACCESS_LOG", True)
+
+    # Browser clients are denied cross-origin access unless their exact origin
+    # appears here.  This enables the public documentation playground without
+    # weakening API-key/runtime-token authentication or allowing arbitrary
+    # websites to read API responses.
+    cors_allowed_origins: tuple[str, ...] = _origins(
+        "FEEDLING_CORS_ALLOWED_ORIGINS",
+        ("https://docs.feedling.app",),
+    )
 
     # Async long-poll waiter caps (plan §5.4 / §9). Global ceiling + per-user
     # per-channel ceiling bound the failure domain: over the cap a poll sheds to

@@ -6,8 +6,8 @@ onboarding/route — asserting for each:
 
   * body + status parity vs the Flask oracle (both delegate to
     ``accounts.accounts_core``), on the deterministic paths;
-  * the EXACT per-route auth: access-modes / onboarding / preferences require an
-    authenticated user (fixed-body 401 like Flask's ``auth.require_user()``),
+  * the EXACT per-route auth: link-token creation requires an API key;
+    access-modes / onboarding / preferences require an authenticated user,
     while register / recover(challenge+verify) / claim-token are PUBLIC /
     PRE-AUTH and must succeed with NO credential on both backends;
   * the register orphan-lineage backstop (a re-register of a known content

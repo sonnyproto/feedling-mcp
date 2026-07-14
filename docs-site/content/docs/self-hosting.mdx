@@ -1,0 +1,225 @@
+---
+title: Self-hosting
+description: Experimental operator guide for running Feedling components on infrastructure you control.
+---
+
+Self-hosting is an experimental, operator-managed path. The repository contains
+images, Compose references, and service units, but it does not currently provide
+a supported one-command production stack or an SLA. Treat this page as a
+deployment review checklist, not a claim that a generic VPS matches Feedling's
+managed confidential-compute environment.
+
+Read [architecture and trust boundaries](/docs/architecture) first for the
+logical component, data-flow, and encryption model used by this guide.
+
+## Choose the trust model first
+
+The HTTP backend is multi-user and API-key scoped. That is not the same as strong
+tenant isolation for code execution.
+
+| Deployment | Appropriate use | Security boundary |
+| --- | --- | --- |
+| Local development | One developer with test data | Processes on one trusted host |
+| Single-operator self-host | One person, family, or organization that trusts the host operator and connected agents | Host/VM boundary plus application authorization |
+| Public multi-tenant service | Unrelated users and untrusted prompts | Requires an independent isolation design and security review; the reference self-host stack does not provide this by default |
+
+The reference agent runner's local-development mode uses per-user child
+processes on the same host. Those processes can inherit host environment and do
+not constitute a strong adversarial tenant boundary. Do not put unrelated users'
+untrusted agent workloads on one runner and call the result isolated. Use a
+separately reviewed container, microVM, or confidential-VM boundary with
+per-tenant secrets and storage, or keep the deployment single-tenant.
+
+On a generic VPS, the local enclave service is software/process separation. It
+does not provide Intel TDX attestation or protection from the machine operator.
+Envelope encryption still protects backups and accidental storage exposure, but
+the host operator controls the processes that can request decryption.
+
+## Component map
+
+A functional deployment can include:
+
+| Component | Required for | Notes |
+| --- | --- | --- |
+| TLS reverse proxy | Any Internet-facing API | Terminate HTTPS and forward only intended ports. |
+| ASGI backend | All API operations | Runs FastAPI under gunicorn/Uvicorn worker; public HTTP default is port 5001. |
+| PostgreSQL | All persistent user state | `DATABASE_URL` is mandatory; there is no current file-persistence fallback. |
+| Enclave service | Encrypted read-side and decrypt workflows | Local mode is not hardware-attested. Keep its private port off the public Internet except for a deliberately designed attestation path. |
+| Agent supervisor and runner | Hosted `/v1/model_api/chat/send` | Must share runtime-token configuration with the backend and publish a live supervisor heartbeat. |
+| Resident consumer | Independent agent Chat | Alternative to hosted Chat; polls and posts encrypted replies. |
+| WebSocket ingest | Screen/broadcast ingestion | The ASGI background service binds the configured ingest port, normally 9998. |
+| APNs credentials | Apple push and Live Activity | Optional; Chat storage works without push delivery. |
+| Object storage configuration | Large frames, chat files, and onboarding archives where enabled | Inventory and back up this data separately from PostgreSQL. |
+
+A backend that returns `/healthz` can still be unable to decrypt Memory, process
+hosted Chat, or persist data. Build readiness from component checks rather than
+using `/healthz` alone.
+
+## Deployment profiles
+
+### API and ciphertext storage only
+
+Run the backend, PostgreSQL, TLS, and optional WebSocket ingest. Account and
+ciphertext storage routes can work, but enclave-backed reads and hosted Chat are
+not complete. Use this only for development or a deliberately limited product.
+
+### Single-operator functional stack
+
+Add a local enclave service and either:
+
+- an independent resident consumer connected to an agent entry point; or
+- the supervisor and runner required by hosted model API routes.
+
+This profile can exercise end-to-end workflows but is not equivalent to a
+hardware-attested deployment. Prefer one trusted tenant per host.
+
+### Managed-production parity
+
+Parity requires more than starting the same Python modules: confidential-VM
+attestation, measured images/configuration, enclave key lifecycle, separated
+runner capacity, secret distribution, database TLS, object-store policy,
+monitoring, backups, incident response, and tested restore/rollback. The public
+repository does not currently offer this profile as a supported turnkey
+self-hosting product.
+
+## Configuration inventory
+
+Review the current source at the exact commit you deploy. At minimum, account for
+these settings:
+
+| Setting | Requirement |
+| --- | --- |
+| `DATABASE_URL` | Required. Use a dedicated PostgreSQL role and database. External connections must use TLS, such as `sslmode=require`, and should verify the server certificate where the environment supports it. |
+| `FEEDLING_HOST_ALL` | Current production entry points fail fast unless hosted discovery is enabled. Set consistently with the supervisor design you deploy. |
+| `FEEDLING_RUNTIME_TOKEN_SECRET` | Required by the current hosted topology. Generate a high-entropy secret, supply it to the backend and supervisor through a secret manager, and never bake it into an image. |
+| `FEEDLING_ENCLAVE_URL` | Required for enclave-backed Memory, screen, worldbook, and decrypt operations. Use a private authenticated network path. |
+| `FEEDLING_ASGI_BACKGROUND` | Enable on the real backend instance if it owns the wake bus and screen WebSocket listener. Do not enable competing development instances against the same ports without understanding leader election. |
+| `FEEDLING_PUBLIC_BASE_URL` | Set to the externally reachable HTTPS base URL. |
+| `FEEDLING_CORS_ALLOWED_ORIGINS` | Comma-separated exact browser origins. Leave empty if no browser client needs direct API access. Never use `*`. |
+| `FEEDLING_DATA_DIR` | Non-database local material such as push keys and residual object files. Protect and back it up according to enabled features. |
+| APNs variables | Optional and secret. Required only for Apple push/Live Activity. |
+
+Worker count must be sized against PostgreSQL connection capacity. Each backend
+worker owns a pool plus listener/election connections; increasing workers without
+raising the database limit can turn an apparent capacity improvement into an
+outage.
+
+## Use the repository deployment files as references
+
+Pin a commit or immutable image digest. Review these files together:
+
+- [Backend Dockerfile](https://github.com/teleport-computer/feedling-mcp/blob/main/deploy/Dockerfile)
+- [Host Compose reference](https://github.com/teleport-computer/feedling-mcp/blob/main/deploy/docker-compose.yaml)
+- [Local runner overlay](https://github.com/teleport-computer/feedling-mcp/blob/main/deploy/docker-compose.agent-runner.yaml)
+- [Environment example](https://github.com/teleport-computer/feedling-mcp/blob/main/deploy/feedling.env.example)
+- [Database migrations](https://github.com/teleport-computer/feedling-mcp/tree/main/backend/alembic)
+
+The host Compose file starts the backend, not the entire functional topology.
+The runner overlay expects an enclave service that the host Compose file does
+not define. The current backend entry point also enforces hosted-runtime
+prerequisites. Therefore, copying the example environment and running one
+Compose command is not a complete or production-ready deployment.
+
+Before starting anything, render and review the merged configuration:
+
+```bash
+docker compose \
+  -f deploy/docker-compose.yaml \
+  -f deploy/docker-compose.agent-runner.yaml \
+  --env-file deploy/.env \
+  config
+```
+
+The rendered output can contain resolved secret values. Do not paste it into
+tickets or CI logs.
+
+## Bring-up sequence
+
+1. Provision PostgreSQL, create a least-privilege application role, enforce TLS
+   when traffic leaves the host, and record a tested backup/restore procedure.
+2. Provision the persistent data and optional object-storage locations with
+   ownership matching the non-root container user.
+3. Generate runtime-token, enclave, TLS, provider, and push secrets in a secret
+   manager. Keep tenant/provider credentials out of the runner's global
+   environment where possible.
+4. Build or pull images pinned to a reviewed commit/digest. Do not deploy a
+   mutable `latest` tag.
+5. Start PostgreSQL connectivity and the enclave path before the backend. The
+   gunicorn startup hook applies Alembic migrations and fails if required hosted
+   configuration is missing.
+6. Start the backend, then the supervisor/runner or resident consumer. Verify
+   that the supervisor heartbeat is fresh before testing hosted Chat.
+7. Put the API behind HTTPS. Expose 443 publicly; expose the screen WebSocket
+   port only if the client requires it and its authentication path has been
+   reviewed. Keep PostgreSQL, runner control, and internal enclave ports private.
+8. Register a test account with a real generated content public key and store the
+   returned API key in a credential manager.
+9. Exercise the readiness checks below with non-production test data.
+
+## Readiness checks
+
+`GET /healthz` is only the first check. A deployment should not receive user
+traffic until all enabled capabilities pass:
+
+- Backend process responds over the public TLS hostname.
+- An authenticated `/v1/users/whoami` succeeds.
+- A write followed by a read proves PostgreSQL persistence, then still succeeds
+  after a backend restart.
+- The enclave reports expected key/attestation information for the chosen trust
+  model and completes a test envelope decrypt.
+- Memory `index` and `fetch` complete instead of returning
+  `enclave_unavailable`.
+- Hosted Chat has a fresh supervisor heartbeat and a test turn produces an
+  encrypted assistant response; or the resident consumer polls and responds.
+- Screen WebSocket ingest works if enabled.
+- Push delivery works if APNs is configured; otherwise the operator has
+  explicitly accepted that push is disabled.
+- Backup restore has been tested in a separate environment, not merely scheduled.
+
+Use synthetic accounts for probes. A health check must not mutate or decrypt a
+real user's data.
+
+## Backups and key lifecycle
+
+Back up PostgreSQL and every enabled object store as one recovery set. Database
+snapshots without large ciphertext objects can restore references that no longer
+resolve. Protect the content/enclave key material separately: losing it can make
+otherwise healthy ciphertext permanently unreadable, while leaking it changes
+the privacy impact of a database backup.
+
+Document recovery point and recovery time targets for your deployment; Feedling
+does not supply them for self-hosted systems. Test restores after schema and key
+changes. Encrypt backup media, restrict restore credentials, and audit access.
+
+The public API has no individual API-key revocation endpoint. See [API key
+lifecycle](/docs/api-keys#rotation-and-revocation-status) before deciding how an
+operator will respond to a leaked client credential.
+
+## Upgrade and rollback
+
+- Read the [public changelog](/docs/changelog) and repository migration notes.
+- Back up the database and object storage before applying a new image.
+- Review Alembic migrations for forward and rollback implications; do not assume
+  every data migration is automatically reversible.
+- Stage the exact image and configuration against a restored copy of production
+  data with credentials disabled or replaced.
+- Keep the prior image and configuration, but do not roll application code back
+  across an incompatible database migration without an explicit plan.
+- Re-run every enabled readiness check after upgrade and restore drills.
+
+## Minimum security checklist
+
+- Run containers as non-root and keep the Docker socket out of application
+  containers.
+- Use exact CORS origins, HTTPS, security headers at the proxy, and request-body
+  limits at both proxy and application boundaries.
+- Redact API keys, runtime tokens, provider keys, link tokens, and recovery
+  answers from logs and traces.
+- Separate database, enclave, runner, and backup credentials; rotate them through
+  a secret manager.
+- Do not expose admin/debug routes or internal ports through the public proxy.
+- Monitor authentication failures, `5xx`, database pool exhaustion, stale
+  supervisor heartbeats, enclave failures, queue age, disk use, and backup age.
+- Keep unrelated tenant code and secrets out of a shared process runner.
+- Commission an isolation and abuse review before offering the deployment to
+  untrusted public users.

@@ -1,0 +1,496 @@
+---
+title: Memory workflow
+description: Store encrypted memory cards, inspect the index, and fetch selected content.
+---
+
+Memory separates ciphertext storage from enclave-authorized read projections.
+
+| Operation | Returns |
+| --- | --- |
+| `POST /v1/memory/add` | The stored v1 encrypted record. |
+| `GET /v1/memory/list` | Raw encrypted records for client synchronization. |
+| `POST /v1/memory/index` | Lightweight decrypted summaries for discovery. |
+| `POST /v1/memory/fetch` | Full decrypted content for selected IDs. |
+
+`local_only` records can be stored and synchronized, but the enclave has no
+wrapped key for them, so they are unavailable from `index` and `fetch`.
+
+## 1. Build and store a card
+
+The card's meaningful text is an encrypted JSON object. A typical plaintext
+before encryption is:
+
+```json
+{
+  "summary": "The user prefers a quiet start to the morning.",
+  "content": "Coffee after 08:30, no meetings in the first half hour.",
+  "bucket": "preferences",
+  "threads": ["morning-routine", "work-style"],
+  "is_sensitive": false
+}
+```
+
+Do not send this plaintext object to `/v1/memory/add`. Encrypt its serialized
+bytes and send the resulting envelope. Ordering and classification metadata is
+intentionally visible outside the ciphertext.
+
+```http
+POST /v1/memory/add HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: YOUR_FEEDLING_API_KEY
+
+{
+  "envelope": {
+    "v": 1,
+    "id": "mom_7f20d39af321",
+    "body_ct": "BASE64_CIPHERTEXT",
+    "nonce": "BASE64_NONCE",
+    "K_user": "BASE64_KEY_WRAPPED_TO_USER",
+    "K_enclave": "BASE64_KEY_WRAPPED_TO_ENCLAVE",
+    "enclave_pk_fpr": "ENCLAVE_PUBLIC_KEY_FINGERPRINT",
+    "visibility": "shared",
+    "owner_user_id": "usr_0123456789abcdef",
+    "type": "fact",
+    "occurred_at": "2026-07-13T12:30:00Z",
+    "source": "live_conversation"
+  }
+}
+```
+
+`type` is required and must be one of `moment`, `quote`, `fact`, `event`,
+`insight`, or `reflection`. An `insight` must include at least one existing
+`anchor_memory_ids` value in the envelope; a `reflection` needs at least two.
+The authenticated user must own every anchor. Reflection creation also has an
+endpoint-specific relationship-age cap and can return `429`; that response is
+not a generic service-wide rate limit.
+
+```http
+HTTP/1.1 201 Created
+Content-Type: application/json
+
+{
+  "status": "created",
+  "moment": {
+    "v": 1,
+    "id": "mom_7f20d39af321",
+    "type": "fact",
+    "occurred_at": "2026-07-13T12:30:00Z",
+    "created_at": "2026-07-13T12:31:02.125000",
+    "source": "live_conversation",
+    "body_ct": "BASE64_CIPHERTEXT",
+    "nonce": "BASE64_NONCE",
+    "K_user": "BASE64_KEY_WRAPPED_TO_USER",
+    "K_enclave": "BASE64_KEY_WRAPPED_TO_ENCLAVE",
+    "enclave_pk_fpr": "ENCLAVE_PUBLIC_KEY_FINGERPRINT",
+    "visibility": "shared",
+    "owner_user_id": "usr_0123456789abcdef"
+  },
+  "v": 1
+}
+```
+
+The server can generate `moment.id` if it is absent, but a stable unique
+client-generated ID is easier to reconcile after an ambiguous network failure.
+It is not an idempotency guarantee: posting the same payload again can append
+another record, and clients must not rely on the ID to deduplicate requests.
+
+## 2. Discover cards with the lightweight index
+
+`index` sends authorized candidates to the enclave and returns summaries rather
+than complete content.
+
+```http
+POST /v1/memory/index HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: YOUR_FEEDLING_API_KEY
+
+{
+  "limit": 100,
+  "ambient": false,
+  "ambient_top_n": 20,
+  "bucket": "preferences",
+  "thread": "morning-routine",
+  "include_sensitive": false
+}
+```
+
+`bucket` is an exact match; `thread` must be present in the card's thread list.
+`ambient_top_n` applies when `ambient` is true. A missing or zero `limit` asks
+for the full lightweight index up to a deployment safety cap; inspect the
+response's effective `limit` and `truncated` values.
+
+```json
+{
+  "items": [
+    {
+      "id": "mom_7f20d39af321",
+      "summary": "The user prefers a quiet start to the morning.",
+      "bucket": "preferences",
+      "threads": ["morning-routine", "work-style"],
+      "importance": 0.5,
+      "pulse": 0.3,
+      "status": "active",
+      "occurred_at": "2026-07-13T12:30:00Z",
+      "created_at": "2026-07-13T12:31:02.125000",
+      "updated_at": "",
+      "last_referenced_at": "",
+      "is_sensitive": false,
+      "score": 0.5
+    }
+  ],
+  "limit": 100,
+  "truncated": false,
+  "user_card_count": 1
+}
+```
+
+The body currently accepts a `query` field for compatibility, but it is not used
+to perform semantic or lexical filtering. Do not present `/v1/memory/index` as a
+search endpoint. Select from the returned index in your client or agent.
+
+## 3. Fetch selected content
+
+Pass the IDs selected from the index. Results preserve the requested ID order.
+
+```http
+POST /v1/memory/fetch HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: YOUR_FEEDLING_API_KEY
+
+{
+  "ids": ["mom_7f20d39af321", "mom_missing"],
+  "limit": 20,
+  "include_archived": false,
+  "include_superseded": false
+}
+```
+
+```json
+{
+  "items": [
+    {
+      "id": "mom_7f20d39af321",
+      "summary": "The user prefers a quiet start to the morning.",
+      "content": "Coffee after 08:30, no meetings in the first half hour.",
+      "bucket": "preferences",
+      "threads": ["morning-routine", "work-style"],
+      "importance": 0.5,
+      "pulse": 0.3,
+      "status": "active",
+      "source": "live_conversation",
+      "occurred_at": "2026-07-13T12:30:00Z",
+      "created_at": "2026-07-13T12:31:02.125000",
+      "updated_at": "",
+      "last_referenced_at": "",
+      "is_sensitive": false
+    }
+  ],
+  "missing_ids": ["mom_missing"],
+  "unavailable_ids": []
+}
+```
+
+`missing_ids` are not owned by the user or do not exist. `unavailable_ids` are
+known records that cannot be returned under some archive, supersession, or
+encryption rules. These arrays do **not** currently exhaust every requested ID
+that was not returned: an enclave-blocked sensitive ID can be absent from
+`items`, `missing_ids`, and `unavailable_ids` at the same time. Compare requested
+IDs with returned item IDs and treat any unaccounted-for ID as not available.
+
+The public fetch path does not currently honor an `include_sensitive` request
+field. Do not send it or assume sensitive content will be returned merely
+because it was requested.
+
+## 4. Apply a batch of memory actions
+
+After selecting with `index` and reading the necessary cards with `fetch`, use
+`POST /v1/memory/actions` for an ordered write batch. The public action types are
+`memory.add`, `memory.supersede`, `memory.retype`, and `memory.delete`. Submit
+between 1 and 20 actions. The implementation processes only the first 20, so a
+client must reject an oversized batch before sending it.
+
+This example adds one encrypted card, retypes an existing card, supersedes an
+outdated card with a new encrypted card, and deletes a fourth card:
+
+```http
+POST /v1/memory/actions HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: YOUR_FEEDLING_API_KEY
+
+{
+  "actions": [
+    {
+      "type": "memory.add",
+      "reason": "The user stated a durable preference.",
+      "source_chat_message_ids": ["msg_user_123"],
+      "envelope": {
+        "v": 1,
+        "id": "mom_new_preference",
+        "body_ct": "BASE64_CIPHERTEXT",
+        "nonce": "BASE64_NONCE",
+        "K_user": "BASE64_KEY_WRAPPED_TO_USER",
+        "K_enclave": "BASE64_KEY_WRAPPED_TO_ENCLAVE",
+        "enclave_pk_fpr": "ENCLAVE_PUBLIC_KEY_FINGERPRINT",
+        "visibility": "shared",
+        "owner_user_id": "usr_0123456789abcdef",
+        "type": "fact",
+        "occurred_at": "2026-07-13T12:30:00Z",
+        "source": "live_conversation"
+      }
+    },
+    {
+      "type": "memory.retype",
+      "id": "mom_existing_event",
+      "new_type": "event",
+      "anchor_memory_ids": [],
+      "reason": "This describes something that happened, not a stable fact."
+    },
+    {
+      "type": "memory.supersede",
+      "supersedes": ["mom_old_city"],
+      "reason": "The user's city changed.",
+      "source_chat_message_ids": ["msg_user_123"],
+      "envelope": {
+        "v": 1,
+        "id": "mom_current_city",
+        "body_ct": "BASE64_CIPHERTEXT",
+        "nonce": "BASE64_NONCE",
+        "K_user": "BASE64_KEY_WRAPPED_TO_USER",
+        "K_enclave": "BASE64_KEY_WRAPPED_TO_ENCLAVE",
+        "enclave_pk_fpr": "ENCLAVE_PUBLIC_KEY_FINGERPRINT",
+        "visibility": "shared",
+        "owner_user_id": "usr_0123456789abcdef",
+        "type": "fact",
+        "occurred_at": "2026-07-13T12:30:00Z",
+        "source": "live_conversation"
+      }
+    },
+    {
+      "type": "memory.delete",
+      "id": "mom_remove_me",
+      "reason": "The user asked to remove this card.",
+      "source_chat_message_ids": ["msg_user_123"]
+    }
+  ]
+}
+```
+
+A successful batch returns HTTP `200`; the per-action result records the create
+or update details, and `effects` is the flattened change summary:
+
+```json
+{
+  "status": "ok",
+  "results": [
+    {
+      "status": "ok",
+      "action": "memory.add",
+      "memory": {
+        "id": "mom_new_preference",
+        "type": "fact",
+        "occurred_at": "2026-07-13T12:30:00Z",
+        "status": "active"
+      },
+      "change": {
+        "id": "0123456789abcdef",
+        "ts": "2026-07-13T12:31:02.125000",
+        "action": "insert",
+        "memory_id": "mom_new_preference",
+        "type": "fact",
+        "reason": "The user stated a durable preference.",
+        "capture_mode": "",
+        "source_chat_message_ids": ["msg_user_123"],
+        "anchor_memory_ids": []
+      }
+    },
+    {
+      "status": "ok",
+      "action": "memory.retype",
+      "changed_fields": ["type", "anchor_memory_ids"],
+      "memory": {
+        "id": "mom_existing_event",
+        "type": "event"
+      },
+      "change": {
+        "id": "123456789abcdef0",
+        "ts": "2026-07-13T12:31:02.250000",
+        "action": "retype",
+        "memory_id": "mom_existing_event",
+        "old_type": "fact",
+        "new_type": "event",
+        "fields": ["type", "anchor_memory_ids"],
+        "reason": "This describes something that happened, not a stable fact.",
+        "anchor_memory_ids": []
+      }
+    },
+    {
+      "status": "ok",
+      "action": "memory.supersede",
+      "memory": {
+        "id": "mom_current_city",
+        "type": "fact",
+        "occurred_at": "2026-07-13T12:30:00Z",
+        "status": "active"
+      },
+      "superseded": {
+        "id": "mom_old_city",
+        "status": "superseded",
+        "superseded_by": "mom_current_city"
+      },
+      "superseded_ids": ["mom_old_city"],
+      "change": {
+        "id": "23456789abcdef01",
+        "ts": "2026-07-13T12:31:02.375000",
+        "action": "supersede",
+        "memory_id": "mom_current_city",
+        "type": "fact",
+        "reason": "The user's city changed.",
+        "capture_mode": "",
+        "source_chat_message_ids": ["msg_user_123"],
+        "anchor_memory_ids": [],
+        "supersedes": ["mom_old_city"]
+      }
+    },
+    {
+      "status": "ok",
+      "action": "memory.delete",
+      "memory": {
+        "id": "mom_remove_me"
+      },
+      "change": {
+        "id": "3456789abcdef012",
+        "ts": "2026-07-13T12:31:02.500000",
+        "action": "delete",
+        "memory_id": "mom_remove_me",
+        "type": "fact",
+        "reason": "The user asked to remove this card.",
+        "source_chat_message_ids": ["msg_user_123"]
+      }
+    }
+  ],
+  "effects": [
+    {
+      "type": "memory_added",
+      "action": "memory.add",
+      "memory_id": "mom_new_preference",
+      "fields": ["created"]
+    },
+    {
+      "type": "memory_updated",
+      "action": "memory.retype",
+      "memory_id": "mom_existing_event",
+      "fields": ["type", "anchor_memory_ids"]
+    },
+    {
+      "type": "memory_superseded",
+      "action": "memory.supersede",
+      "memory_id": "mom_current_city",
+      "supersedes": "mom_old_city",
+      "superseded_ids": ["mom_old_city"],
+      "fields": ["created", "status", "supersedes", "superseded_by"]
+    },
+    {
+      "type": "memory_deleted",
+      "action": "memory.delete",
+      "memory_id": "mom_remove_me",
+      "fields": ["deleted"]
+    }
+  ]
+}
+```
+
+The batch is ordered but not transactional. Execution stops on the first failed
+action and returns that action's HTTP status. Earlier results and effects remain
+committed; they are included in the error response and are not rolled back.
+Split independent writes when partial completion would be hard to reconcile.
+
+There is no `Idempotency-Key` support. In particular, retrying a batch after an
+ambiguous response can repeat `memory.add` and can attempt later actions against
+already changed state. Read `index` or `fetch`, reconcile stable memory IDs, and
+construct a new batch instead of replaying the original blindly.
+
+`memory.upgrade` exists for controlled legacy migration, but it is not part of
+the public Memory workflow and should not be emitted by ordinary clients.
+
+## Synchronize encrypted records
+
+Use the list endpoint when the client needs raw envelopes rather than an enclave
+projection:
+
+```http
+GET /v1/memory/list?limit=50&since=2026-07-01T00%3A00%3A00Z&include_archived=false HTTP/1.1
+Host: api.feedling.app
+X-API-Key: YOUR_FEEDLING_API_KEY
+```
+
+```json
+{
+  "moments": [
+    {
+      "v": 1,
+      "id": "mom_7f20d39af321",
+      "type": "fact",
+      "occurred_at": "2026-07-13T12:30:00Z",
+      "created_at": "2026-07-13T12:31:02.125000",
+      "source": "live_conversation",
+      "body_ct": "BASE64_CIPHERTEXT",
+      "nonce": "BASE64_NONCE",
+      "K_user": "BASE64_WRAPPED_KEY",
+      "K_enclave": "BASE64_WRAPPED_KEY",
+      "visibility": "shared",
+      "owner_user_id": "usr_0123456789abcdef"
+    }
+  ],
+  "total": 1
+}
+```
+
+`since` is compared with the ISO-8601 `occurred_at` metadata. Results are newest
+first, `limit` is capped at 200, and `total` is the number matching the filters
+before the page slice. This endpoint does not expose a universal cursor token;
+see [pagination rules](/docs/reliability#pagination).
+
+## Retype an existing card
+
+Retyping changes plaintext classification metadata without changing the
+encrypted body. Anchors are required when changing to `insight` or `reflection`.
+
+```http
+POST /v1/memory/retype HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: YOUR_FEEDLING_API_KEY
+
+{
+  "id": "mom_7f20d39af321",
+  "type": "insight",
+  "anchor_memory_ids": ["mom_0123456789ab"]
+}
+```
+
+```json
+{
+  "status": "retyped",
+  "moment": {
+    "v": 1,
+    "id": "mom_7f20d39af321",
+    "type": "insight",
+    "occurred_at": "2026-07-13T12:30:00Z",
+    "created_at": "2026-07-13T12:31:02.125000",
+    "source": "live_conversation",
+    "body_ct": "BASE64_CIPHERTEXT",
+    "nonce": "BASE64_NONCE",
+    "K_user": "BASE64_KEY_WRAPPED_TO_USER",
+    "K_enclave": "BASE64_KEY_WRAPPED_TO_ENCLAVE",
+    "enclave_pk_fpr": "ENCLAVE_PUBLIC_KEY_FINGERPRINT",
+    "visibility": "shared",
+    "owner_user_id": "usr_0123456789abcdef",
+    "anchor_memory_ids": ["mom_0123456789ab"],
+    "retyped_at": "2026-07-13T13:00:00.000000"
+  }
+}
+```
