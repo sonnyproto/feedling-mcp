@@ -643,7 +643,10 @@ def _successful_runner(
             captured.append(spec)
             index = PROFILE_AGENT_TYPES.index((spec.profile_id, spec.agent_type))
         barrier = barriers[index // cap]
-        barrier.wait(timeout=5)
+        # Nested fake-worker threads can take more than five seconds to be
+        # scheduled on a loaded GitHub runner.  Keep this finite so a real
+        # launcher concurrency regression still fails instead of hanging.
+        barrier.wait(timeout=30)
         schema = json.loads(spec.schema_path.read_text())
         result = _instance(schema, schema["$defs"])
         if invalid_result and index == 0:
