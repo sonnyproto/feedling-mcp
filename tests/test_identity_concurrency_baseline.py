@@ -375,6 +375,85 @@ def test_relationship_anchor_route_does_not_change_replaced_at(client):
 
 
 # --------------------------------------------------------------------------- #
+# Task 5: identity.replace optimistic concurrency (base_identity_replaced_at)
+# --------------------------------------------------------------------------- #
+
+def _replace_action(job_id: str, *, agent_name: str = "Nyx", base_identity_replaced_at=None) -> dict:
+    action = {
+        "type": "identity.replace",
+        "source": "genesis_resident_distill",
+        "job_id": job_id,
+        "reason": "resident redefined persona from local distill",
+        "identity": _plain_identity(agent_name=agent_name),
+    }
+    if base_identity_replaced_at is not None:
+        action["base_identity_replaced_at"] = base_identity_replaced_at
+    return action
+
+
+def test_replace_action_with_matching_baseline_succeeds(client, monkeypatch):
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder([]))
+
+    job_id = "job_baseline_match"
+    db.genesis_create_job(user_id, {"job_id": job_id, "status": "awaiting_resident"})
+    db.genesis_claim_resident_jobs(user_id, consumer_id="cons-test")
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [_replace_action(job_id, base_identity_replaced_at=_SEEDED_REPLACED_AT)]},
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+    saved = db.get_blob(user_id, "identity")
+    assert saved["replaced_at"] != _SEEDED_REPLACED_AT
+
+
+def test_replace_action_with_stale_baseline_returns_409(client, monkeypatch):
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder([]))
+
+    job_id = "job_baseline_stale"
+    db.genesis_create_job(user_id, {"job_id": job_id, "status": "awaiting_resident"})
+    db.genesis_claim_resident_jobs(user_id, consumer_id="cons-test")
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [_replace_action(job_id, base_identity_replaced_at="2020-01-01T00:00:00")]},
+    )
+    assert res.status_code == 409, res.get_data(as_text=True)
+    body = res.get_json()
+    assert body["results"][0]["error"] == "identity_base_stale"
+    # rejected — the card must NOT have been touched.
+    saved = db.get_blob(user_id, "identity")
+    assert saved["replaced_at"] == _SEEDED_REPLACED_AT
+
+
+def test_replace_action_without_baseline_skips_check(client, monkeypatch):
+    # Back-compat: every existing caller (and this action itself, when it omits the field)
+    # must not be gated by a check it never opted into.
+    user_id, api_key = _register(client)
+    _seed_identity(user_id)
+    monkeypatch.setattr(core_envelope, "_build_shared_envelope_for_store", _fake_envelope_builder([]))
+
+    job_id = "job_baseline_absent"
+    db.genesis_create_job(user_id, {"job_id": job_id, "status": "awaiting_resident"})
+    db.genesis_claim_resident_jobs(user_id, consumer_id="cons-test")
+
+    res = client.post(
+        "/v1/identity/actions",
+        headers=_headers(api_key),
+        json={"actions": [_replace_action(job_id)]},  # no base_identity_replaced_at key at all
+    )
+    assert res.status_code == 200, res.get_data(as_text=True)
+    saved = db.get_blob(user_id, "identity")
+    assert saved["replaced_at"] != _SEEDED_REPLACED_AT
+
+
+# --------------------------------------------------------------------------- #
 # back-compat: a legacy identity with no replaced_at at all must not KeyError
 # --------------------------------------------------------------------------- #
 
