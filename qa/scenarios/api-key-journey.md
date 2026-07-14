@@ -1,4 +1,4 @@
-# API-Key Runtime V2 P0 Journey
+# API-Key Deployed-Runtime P0 Journey
 
 Run every scenario below, in order, for every profile in
 `qa/coverage-lock.json`. The same fresh synthetic account and content keypair are
@@ -42,22 +42,22 @@ without reviewing the decrypted evidence surfaces.
 **Act**
 
 - Confirm the base URL is the designated test endpoint, never production.
-- Confirm the expected deployment SHA and the provisioner's private manifest are
+- Confirm the candidate SHA and the provisioner's private manifest are
   present. Verify that this profile has sanitized successful receipts for
   registration, invalid-key rejection, valid-key recovery, trace enablement, and
-  Runtime V2 readback. Provider and admin secrets MUST NOT be present in the
+  authenticated runtime readback. Provider and admin secrets MUST NOT be present in the
   agent environment.
 - Confirm all five contract files are readable and JSON inputs parse.
 
 **Pass**
 
-- Target is test, the deployed candidate can be identified, and every required
+- Target is test, the deployed endpoint is reachable, and every required
   prerequisite for this profile is present.
 
 **Classify**
 
 - Missing or failed provisioner receipt: `BLOCKED_CREDENTIAL`.
-- Wrong or unverifiable candidate deployment: `BLOCKED_DEPLOYMENT`.
+- Unreachable or incompatible test deployment: `BLOCKED_DEPLOYMENT`.
 - Production/unsafe target: `SECURITY_FAIL`.
 
 ## P0-02 — Fresh model-API account onboarding
@@ -104,19 +104,21 @@ without reviewing the decrypted evidence surfaces.
   invalid attempt does not poison recovery; no response or artifact contains the
   credential.
 
-## P0-05 — Runtime V2 selection and independent verification
+## P0-05 — Deployed-runtime discovery and readiness
 
 **Act**
 
-- Audit the provisioner's authenticated runtime readback receipt for
-  `hosted_resident` Runtime V2.
-- Capture candidate backend and worker identity when exposed.
+- Audit the provisioner's authenticated, user-scoped runtime readback receipt.
+- Record the observed runtime mode and version without treating the backend's
+  legacy version label as proof that the new Hosted Runtime V2 architecture is deployed.
+- When `QA_EXPECTED_RUNTIME=hosted_resident`, additionally require mode
+  `hosted_resident`, runtime version `2`, and the trusted parent-owned V2
+  deployment receipts.
 
 **Pass**
 
-- Expected and observed runtime both equal `hosted_resident`; deployment identity
-  matches the expected candidate; the V2 worker pool reports live/readiness
-  evidence.
+- The account is configured, runtime status is readable, and the observed mode
+  and version are recorded. In strict V2 mode, all additional V2 requirements match.
 
 ## P0-06 — Persona-file import and distillation
 
@@ -168,8 +170,9 @@ without reviewing the decrypted evidence surfaces.
 
 **Pass**
 
-- The selected driver is returned, verification reaches `passing=true`, Runtime
-  V2 remains selected, and no orphan user turn is created during verification.
+- The selected driver is returned, verification reaches `passing=true`, the
+  observed runtime remains configured, and no orphan user turn is created
+  during verification.
 
 ## P0-08 — Basic chat and acknowledgement latency
 
@@ -228,7 +231,7 @@ without reviewing the decrypted evidence surfaces.
 
 - Companion identity matches the imported persona; provider/model family does not
   contradict the configured profile; authoritative trace/config identifies the
-  exact provider, model, and Runtime V2 path. A plausible reply alone is not
+  exact provider, model, and observed deployed-runtime path. A plausible reply alone is not
   sufficient route evidence.
 
 ## P0-12 — Reasoning metadata and user-visible disclosure

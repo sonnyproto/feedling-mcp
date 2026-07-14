@@ -59,7 +59,7 @@ def test_agent_error_profile_replaces_unsafe_optional_labels():
             "profile_id": "official-gemini",
             "configured_model": "unsafe model\nsecret",
             "user_id": "unsafe user id",
-            "runtime_mode": "unexpected-runtime",
+            "runtime_mode": "unexpected runtime\n",
             "trace_enabled": False,
         },
         profile_id="official-gemini",

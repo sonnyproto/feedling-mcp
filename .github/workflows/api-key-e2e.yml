@@ -4,9 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       expected_deployment_sha:
-        description: Full backend/worker Git SHA deployed to the Feedling test environment
+        description: Full Git SHA intended to be deployed to the Feedling test environment
         required: true
         type: string
+      runtime_target:
+        description: Test the current deployed runtime or require strict Hosted Runtime V2 proof
+        required: true
+        type: choice
+        default: deployed_current
+        options:
+          - deployed_current
+          - hosted_resident
 
 permissions:
   contents: read
@@ -31,7 +39,7 @@ jobs:
             exit 1
           fi
 
-  qualify-api-key-runtime-v2:
+  qualify-api-key-runtime:
     name: qualify eight API-key profiles
     needs: validate-dispatch
     environment: feedling-e2e-test
@@ -135,17 +143,19 @@ jobs:
             echo "expected_sha=${INPUT_EXPECTED_SHA,,}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Verify deployed backend and worker build identity before qualification
+      - name: Verify deployed endpoint and selected runtime target before qualification
         id: deployment_pre
         env:
           QA_FEEDLING_BASE_URL: https://test-api.feedling.app
           QA_TEST_ADMIN_TOKEN: ${{ secrets.QA_TEST_ADMIN_TOKEN }}
           QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
+          QA_EXPECTED_RUNTIME: ${{ inputs.runtime_target }}
         run: |
           set -euo pipefail
           umask 077
           python qa/verify_deployment.py \
             --expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA" \
+            --expected-runtime "$QA_EXPECTED_RUNTIME" \
             --receipt "${{ steps.context.outputs.pre_deployment_receipt }}"
 
       - name: Install and verify isolated headless Codex runtime
@@ -429,12 +439,18 @@ jobs:
           QA_OPENROUTER_GLM_MODEL: ${{ vars.QA_OPENROUTER_GLM_MODEL }}
           QA_KONGBEIQIE_MODEL: ${{ vars.QA_KONGBEIQIE_MODEL }}
           QA_KONGBEIQIE_BASE_URL: ${{ vars.QA_KONGBEIQIE_BASE_URL }}
+          QA_EXPECTED_RUNTIME: ${{ inputs.runtime_target }}
         run: |
           set -euo pipefail
           umask 077
+          runtime_flag="--baseline-runtime"
+          if [ "$QA_EXPECTED_RUNTIME" = "hosted_resident" ]; then
+            runtime_flag="--require-runtime-v2"
+          fi
           python qa/provision_profiles.py provision \
             --coverage qa/coverage-lock.json \
-            --manifest "${{ steps.context.outputs.manifest }}"
+            --manifest "${{ steps.context.outputs.manifest }}" \
+            "$runtime_flag"
 
       - name: Split credentials into isolated one-profile manifests
         id: split_manifests
@@ -562,6 +578,7 @@ jobs:
           QA_ORCHESTRATION_RECEIPT: ${{ steps.context.outputs.orchestration_receipt }}
           QA_RUN_ID: ${{ steps.context.outputs.run_id }}
           QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
+          QA_EXPECTED_RUNTIME: ${{ inputs.runtime_target }}
         run: |
           set -euo pipefail
           umask 077
@@ -579,6 +596,7 @@ jobs:
             --run-id "$QA_RUN_ID" \
             --base-url https://test-api.feedling.app \
             --expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA" \
+            --expected-runtime "$QA_EXPECTED_RUNTIME" \
             --worker-python "$(python -c 'import pathlib, sys; print(pathlib.Path(sys.executable).resolve())')" \
             --timeout-seconds 2400
 
@@ -592,18 +610,20 @@ jobs:
             --worker-output-root "${{ steps.context.outputs.worker_output_root }}" \
             --aggregation-input-root "${{ steps.context.outputs.aggregation_input_root }}"
 
-      - name: Verify deployment identity remained stable after profile testing
+      - name: Verify deployed endpoint and selected runtime target after profile testing
         id: deployment_post
         if: steps.orchestration.outcome == 'success'
         env:
           QA_FEEDLING_BASE_URL: https://test-api.feedling.app
           QA_TEST_ADMIN_TOKEN: ${{ secrets.QA_TEST_ADMIN_TOKEN }}
           QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
+          QA_EXPECTED_RUNTIME: ${{ inputs.runtime_target }}
         run: |
           set -euo pipefail
           umask 077
           python qa/verify_deployment.py \
             --expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA" \
+            --expected-runtime "$QA_EXPECTED_RUNTIME" \
             --receipt "${{ steps.context.outputs.post_deployment_receipt }}"
 
       - name: Run intelligent Codex qualification aggregator
@@ -622,6 +642,7 @@ jobs:
           QA_PRIVATE_RESULT: ${{ steps.context.outputs.private_result }}
           QA_RUN_ID: ${{ steps.context.outputs.run_id }}
           QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
+          QA_EXPECTED_RUNTIME: ${{ inputs.runtime_target }}
         run: |
           set -euo pipefail
           umask 077
@@ -647,11 +668,15 @@ jobs:
           finalizer receipt or qualification-agent semantic judgment,
           reasoning/COT evidence, trace correlation, per-turn five-stage latency,
           or cleanup result. Build the canonical run object for run
-          ${QA_RUN_ID}. Trusted pre/post deployment checks proved that backend
-          and every live worker remained at SHA ${QA_EXPECTED_DEPLOYMENT_SHA};
-          set expected and observed backend/worker SHA to that exact value,
-          environment test, base URL https://test-api.feedling.app, and runtime
-          hosted_resident.
+          ${QA_RUN_ID}. Set environment test, base URL
+          https://test-api.feedling.app, expected deployment SHA
+          ${QA_EXPECTED_DEPLOYMENT_SHA}, and expected runtime
+          ${QA_EXPECTED_RUNTIME}. When expected runtime is hosted_resident,
+          trusted pre/post checks proved that backend and every live worker
+          remained at the expected SHA, so set both observed SHA fields to that
+          value. When expected runtime is deployed_current, trusted checks prove
+          endpoint liveness but do not expose build identity, so set both
+          observed SHA fields to null; never invent them.
 
           Set supervisor_count=1, configured concurrency=3, observed concurrency
           and each profile/worker assignment exactly from the trusted receipt.
@@ -677,7 +702,7 @@ jobs:
             QA_AGGREGATION_INPUT_ROOT="$QA_AGGREGATION_INPUT_ROOT" \
             QA_ORCHESTRATION_RECEIPT="$QA_ORCHESTRATION_RECEIPT" \
             QA_EXPECTED_DEPLOYMENT_SHA="$QA_EXPECTED_DEPLOYMENT_SHA" \
-            QA_EXPECTED_RUNTIME="hosted_resident" \
+            QA_EXPECTED_RUNTIME="$QA_EXPECTED_RUNTIME" \
             QA_FEEDLING_BASE_URL="https://test-api.feedling.app" \
             "$CODEX_BIN" exec \
               --ignore-rules \
@@ -719,6 +744,7 @@ jobs:
         env:
           QA_ARTIFACT_DIR: ${{ steps.context.outputs.artifact_dir }}
           QA_EXPECTED_DEPLOYMENT_SHA: ${{ steps.context.outputs.expected_sha }}
+          QA_EXPECTED_RUNTIME: ${{ inputs.runtime_target }}
         run: |
           set -euo pipefail
           python qa/validate_run.py \
@@ -730,7 +756,7 @@ jobs:
             --orchestration-receipt "${{ steps.context.outputs.orchestration_receipt }}" \
             --deployment-receipt "${{ steps.context.outputs.pre_deployment_receipt }}" \
             --post-deployment-receipt "${{ steps.context.outputs.post_deployment_receipt }}" \
-            --expected-runtime hosted_resident \
+            --expected-runtime "$QA_EXPECTED_RUNTIME" \
             --expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA"
 
       - name: Scan public artifacts for secrets and raw evidence

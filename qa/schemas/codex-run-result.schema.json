@@ -27,7 +27,7 @@
     "suite_id": {
       "type": "string",
       "enum": [
-        "feedling-api-key-runtime-v2-p0"
+        "feedling-api-key-p0"
       ]
     },
     "run_id": {
@@ -188,6 +188,7 @@
         "expected_runtime": {
           "type": "string",
           "enum": [
+            "deployed_current",
             "hosted_resident"
           ]
         }
@@ -265,6 +266,7 @@
         "user_id",
         "expected_runtime",
         "observed_runtime",
+        "observed_runtime_version",
         "status",
         "scenarios",
         "turns",
@@ -333,18 +335,17 @@
         "expected_runtime": {
           "type": "string",
           "enum": [
+            "deployed_current",
             "hosted_resident"
           ]
         },
         "observed_runtime": {
+          "$ref": "#/$defs/nullableSafeLabel"
+        },
+        "observed_runtime_version": {
           "type": [
-            "string",
+            "integer",
             "null"
-          ],
-          "enum": [
-            "hosted_resident",
-            "resident_cli",
-            null
           ]
         },
         "status": {
@@ -447,7 +448,7 @@
               "additionalProperties": false,
               "required": [
                 "target_is_test",
-                "deployment_identity_confirmed",
+                "deployed_endpoint_reachable",
                 "provisioning_receipts_confirmed",
                 "agent_environment_sanitized",
                 "contract_inputs_readable",
@@ -457,7 +458,7 @@
                 "target_is_test": {
                   "type": "boolean"
                 },
-                "deployment_identity_confirmed": {
+                "deployed_endpoint_reachable": {
                   "type": "boolean"
                 },
                 "provisioning_receipts_confirmed": {
@@ -538,26 +539,18 @@
               "type": "object",
               "additionalProperties": false,
               "required": [
-                "runtime_v2_readback_matches",
-                "deployment_identity_confirmed",
-                "worker_ready",
-                "backend_sha_matches",
-                "worker_sha_matches"
+                "runtime_status_readback_succeeds",
+                "runtime_configured",
+                "runtime_metadata_recorded"
               ],
               "properties": {
-                "runtime_v2_readback_matches": {
+                "runtime_status_readback_succeeds": {
                   "type": "boolean"
                 },
-                "deployment_identity_confirmed": {
+                "runtime_configured": {
                   "type": "boolean"
                 },
-                "worker_ready": {
-                  "type": "boolean"
-                },
-                "backend_sha_matches": {
-                  "type": "boolean"
-                },
-                "worker_sha_matches": {
+                "runtime_metadata_recorded": {
                   "type": "boolean"
                 }
               }
@@ -588,7 +581,7 @@
               "required": [
                 "driver_enabled",
                 "chat_loop_verified",
-                "runtime_v2_readback_matches",
+                "runtime_status_readback_succeeds",
                 "no_orphan_turn"
               ],
               "properties": {
@@ -598,7 +591,7 @@
                 "chat_loop_verified": {
                   "type": "boolean"
                 },
-                "runtime_v2_readback_matches": {
+                "runtime_status_readback_succeeds": {
                   "type": "boolean"
                 },
                 "no_orphan_turn": {
@@ -1231,7 +1224,7 @@
         "CLEANUP_CONFIRMED",
         "CONTRACT_INPUTS_READABLE",
         "CREDENTIAL_OMITTED",
-        "DEPLOYMENT_IDENTITY_CONFIRMED",
+        "DEPLOYED_ENDPOINT_REACHABLE",
         "DISCLOSURE_PRESENT",
         "DRIVER_ENABLED",
         "EXACT_REPLY_CORRELATED",
@@ -1255,7 +1248,9 @@
         "REASONING_METADATA_CONFIRMED",
         "REASONING_TOKENS_CONFIRMED",
         "RETRY_OBSERVATION_RECORDED",
-        "RUNTIME_V2_READBACK_MATCHED",
+        "RUNTIME_CONFIGURED",
+        "RUNTIME_METADATA_RECORDED",
+        "RUNTIME_STATUS_READBACK_SUCCEEDED",
         "SYNTHETIC_ACCOUNT_FRESH",
         "TARGET_TEST_CONFIRMED",
         "TEN_TURNS_ORDERED",

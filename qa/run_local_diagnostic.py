@@ -48,7 +48,8 @@ except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
 
 
 LOCKED_BASE_URL = "https://test-api.feedling.app"
-DIAGNOSTIC_RUNTIME = "hosted_resident"
+BASELINE_RUNTIME = provision_profiles.BASELINE_RUNTIME_REQUIREMENT
+RUNTIME_V2_RUNTIME = provision_profiles.RUNTIME_V2_REQUIREMENT
 DEFAULT_CODEX_MODEL = "gpt-5.4"
 DEFAULT_PROVIDER_MODELS = {
     "official-deepseek": "deepseek-v4-flash",
@@ -352,6 +353,7 @@ class DiagnosticOptions:
     codex_bin: Path
     worker_python: Path | None = None
     worker_runtime_roots: tuple[Path, ...] = ()
+    runtime_requirement: str = BASELINE_RUNTIME
 
 
 @dataclass(frozen=True)
@@ -1670,17 +1672,36 @@ def _split_selected_manifest(
 
 
 def _validate_diagnostic_manifest(
-    manifest: Mapping[str, Any], profile_ids: Sequence[str]
+    manifest: Mapping[str, Any],
+    profile_ids: Sequence[str],
+    runtime_requirement: str,
 ) -> None:
     rows = manifest.get("profiles")
+    runtime_rows_valid = isinstance(rows, list) and all(
+        isinstance(row, Mapping)
+        and row.get("runtime_mode_readback_verified") is True
+        and isinstance(row.get("runtime_mode"), str)
+        and bool(row.get("runtime_mode"))
+        and type(row.get("runtime_version")) is int
+        and row.get("runtime_version", 0) >= 1
+        and (
+            runtime_requirement != RUNTIME_V2_RUNTIME
+            or (
+                row.get("runtime_mode") == RUNTIME_V2_RUNTIME
+                and row.get("runtime_version") == 2
+            )
+        )
+        for row in rows
+    )
     if (
         manifest.get("qualification_mode") != "diagnostic"
-        or manifest.get("runtime_mode") != DIAGNOSTIC_RUNTIME
-        or manifest.get("runtime_version") != 2
+        or manifest.get("runtime_mode") != runtime_requirement
+        or manifest.get("runtime_requirement") != runtime_requirement
         or manifest.get("selected_profile_ids") != list(profile_ids)
         or not isinstance(rows, list)
         or [row.get("profile_id") for row in rows if isinstance(row, dict)]
         != list(profile_ids)
+        or not runtime_rows_valid
     ):
         raise LocalDiagnosticError(
             "provisioner returned an invalid diagnostic manifest"
@@ -1725,6 +1746,7 @@ def _provision_diagnostic(
         env=env,
         diagnostic=True,
         profile_ids=options.profile_ids,
+        runtime_requirement=options.runtime_requirement,
     )
 
 
@@ -1753,7 +1775,7 @@ def _launch_diagnostic(
         timeout_seconds=2400,
         diagnostic=True,
         profile_ids=options.profile_ids,
-        expected_runtime=DIAGNOSTIC_RUNTIME,
+        expected_runtime=options.runtime_requirement,
         worker_python=worker_python,
     )
 
@@ -1950,6 +1972,8 @@ def execute(
         )
     if not _CODEX_MODEL_RE.fullmatch(options.codex_model):
         raise LocalDiagnosticError("Codex model must be one normalized model ID")
+    if options.runtime_requirement not in {BASELINE_RUNTIME, RUNTIME_V2_RUNTIME}:
+        raise LocalDiagnosticError("runtime requirement is invalid")
     selected = _selected_profiles(options.profile_ids)
     if selected != options.profile_ids:
         options = replace(options, profile_ids=selected)
@@ -1960,6 +1984,7 @@ def execute(
     summary: dict[str, Any] = {
         "schema_version": 1,
         "qualification_mode": "diagnostic",
+        "runtime_requirement": options.runtime_requirement,
         "release_qualified": False,
         "run_id": run_id,
         "target": "test",
@@ -2040,7 +2065,9 @@ def execute(
             summary["status"] = "PREFLIGHT_PASS"
         else:
             manifest = _provision_diagnostic(dependencies, options, paths, active_env)
-            _validate_diagnostic_manifest(manifest, options.profile_ids)
+            _validate_diagnostic_manifest(
+                manifest, options.profile_ids, options.runtime_requirement
+            )
             for row in manifest.get("profiles", []):
                 if isinstance(row, Mapping):
                     secret_values.extend(
@@ -2209,6 +2236,7 @@ def execute(
         safe_summary = {
             "schema_version": 1,
             "qualification_mode": "diagnostic",
+            "runtime_requirement": options.runtime_requirement,
             "release_qualified": False,
             "run_id": run_id,
             "target": "test",
@@ -2270,6 +2298,14 @@ def _parser() -> argparse.ArgumentParser:
         help="run one locked profile (repeatable); omitted means all profiles",
     )
     parser.add_argument("--preflight-only", action="store_true")
+    parser.add_argument(
+        "--require-runtime-v2",
+        action="store_true",
+        help=(
+            "add strict hosted_resident/version-2 runtime assertions; default "
+            "tests the currently deployed runtime and records its identity"
+        ),
+    )
     return parser
 
 
@@ -2287,6 +2323,9 @@ def _options(args: argparse.Namespace) -> DiagnosticOptions:
         private_base=Path.home() / ".codex" / "feedling-e2e-runs",
         codex_bin=_resolve_trusted_codex_binary(args.codex_bin),
         worker_python=args.worker_python,
+        runtime_requirement=(
+            RUNTIME_V2_RUNTIME if args.require_runtime_v2 else BASELINE_RUNTIME
+        ),
     )
 
 

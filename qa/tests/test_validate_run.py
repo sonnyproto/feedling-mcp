@@ -123,6 +123,7 @@ def _profile(profile_id: str, index: int) -> dict:
         "user_id": f"synthetic-user-{index}",
         "expected_runtime": "hosted_resident",
         "observed_runtime": "hosted_resident",
+        "observed_runtime_version": 2,
         "status": "PASS",
         "scenarios": [
             _scenario(item, index, turns) for item in gate.LOCKED_SCENARIO_IDS
@@ -179,7 +180,7 @@ def _profile(profile_id: str, index: int) -> dict:
 def _valid_result() -> dict:
     return {
         "schema_version": "1.0",
-        "suite_id": "feedling-api-key-runtime-v2-p0",
+        "suite_id": "feedling-api-key-p0",
         "run_id": "unit-run-0001",
         "started_at": STAMP,
         "finished_at": STAMP,
@@ -252,10 +253,13 @@ def _write_receipt(
         "schema_version": 1,
         "environment": "test",
         "base_url": "https://test-api.feedling.app",
+        "expected_runtime": "hosted_resident",
         "expected_deployment_sha": SHA,
         "observed_backend_sha": SHA,
         "observed_worker_sha": SHA,
         "live_worker_count": 2,
+        "liveness_verified": True,
+        "deployment_identity_verified": True,
         "verified_at": (
             "2026-07-13T12:01:00Z"
             if filename.startswith("post-")
@@ -301,6 +305,13 @@ def _write_provisioning_manifest(tmp_path: Path) -> Path:
                 "public_key_b64": "cHJpdmF0ZS1wdWJsaWMta2V5",
                 "trace_enabled": True,
                 "runtime_mode": "hosted_resident",
+                "runtime_version": 2,
+                "runtime_mode_set_required": True,
+                "runtime_readback_receipt": {
+                    "configured": True,
+                    "runtime_mode": "hosted_resident",
+                    "runtime_version": 2,
+                },
                 "registration_verified": True,
                 "fresh_state_verified": True,
                 "invalid_key_rejected": True,
@@ -416,6 +427,72 @@ def _validate(
 
 def test_valid_release_artifacts_pass(tmp_path):
     assert _validate(tmp_path) == []
+
+
+def test_baseline_release_accepts_observed_runtime_without_v2_identity(tmp_path):
+    result = _valid_result()
+    result["target"].update(
+        expected_runtime="deployed_current",
+        observed_backend_sha=None,
+        observed_worker_sha=None,
+    )
+    for profile in result["profiles"]:
+        profile.update(
+            expected_runtime="deployed_current",
+            observed_runtime="future_runtime_mode",
+            observed_runtime_version=1,
+        )
+    artifacts, result_path = _write_run(tmp_path, result)
+
+    manifest_path = _write_provisioning_manifest(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    manifest["runtime_mode"] = "deployed_current"
+    for row in manifest["profiles"]:
+        row.update(
+            runtime_mode="future_runtime_mode",
+            runtime_version=1,
+            runtime_mode_set_required=False,
+            runtime_mode_set_verified=False,
+            runtime_readback_receipt={
+                "configured": True,
+                "runtime_mode": "future_runtime_mode",
+                "runtime_version": 1,
+            },
+        )
+    manifest_path.write_text(json.dumps(manifest))
+    manifest_path.chmod(0o600)
+
+    baseline_receipt = {
+        "expected_runtime": "deployed_current",
+        "observed_backend_sha": None,
+        "observed_worker_sha": None,
+        "live_worker_count": None,
+        "liveness_verified": True,
+        "deployment_identity_verified": False,
+    }
+    pre_receipt = _write_receipt(tmp_path, **baseline_receipt)
+    post_receipt = _write_receipt(
+        tmp_path, "post-deployment-receipt.json", **baseline_receipt
+    )
+
+    errors = gate.validate_release(
+        coverage_path=Path(__file__).resolve().parents[1] / "coverage-lock.json",
+        schema_path=(
+            Path(__file__).resolve().parents[1]
+            / "schemas"
+            / "run-result.schema.json"
+        ),
+        result_path=result_path,
+        artifacts_path=artifacts,
+        provisioning_manifest_path=manifest_path,
+        orchestration_receipt_path=_write_orchestration_receipt(tmp_path, result),
+        deployment_receipt_path=pre_receipt,
+        post_deployment_receipt_path=post_receipt,
+        expected_runtime="deployed_current",
+        expected_sha=SHA,
+    )
+
+    assert errors == []
 
 
 @pytest.mark.parametrize(

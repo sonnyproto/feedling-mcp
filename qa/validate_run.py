@@ -39,6 +39,7 @@ REQUIRED_TRACE_STAGES = (
     "persistence",
     "delivery",
 )
+BASELINE_RUNTIME = "deployed_current"
 EXPECTED_RUNTIME = "hosted_resident"
 PASS = "PASS"
 PERSONA_FIXTURE_ID = "persona-import-v1"
@@ -116,7 +117,7 @@ _SCENARIO_CONTRACTS: dict[str, dict[str, Any]] = {
     "P0-01": {
         "required_assertions": [
             "target_is_test",
-            "deployment_identity_confirmed",
+            "deployed_endpoint_reachable",
             "provisioning_receipts_confirmed",
             "agent_environment_sanitized",
             "contract_inputs_readable",
@@ -124,9 +125,7 @@ _SCENARIO_CONTRACTS: dict[str, dict[str, Any]] = {
         ],
         "required_evidence_codes": [
             "TARGET_TEST_CONFIRMED",
-            "DEPLOYMENT_IDENTITY_CONFIRMED",
-            "BACKEND_SHA_MATCHED",
-            "WORKER_SHA_MATCHED",
+            "DEPLOYED_ENDPOINT_REACHABLE",
             "PROVISIONING_RECEIPTS_CONFIRMED",
             "AGENT_ENVIRONMENT_SANITIZED",
             "CONTRACT_INPUTS_READABLE",
@@ -179,18 +178,14 @@ _SCENARIO_CONTRACTS: dict[str, dict[str, Any]] = {
     },
     "P0-05": {
         "required_assertions": [
-            "runtime_v2_readback_matches",
-            "deployment_identity_confirmed",
-            "worker_ready",
-            "backend_sha_matches",
-            "worker_sha_matches",
+            "runtime_status_readback_succeeds",
+            "runtime_configured",
+            "runtime_metadata_recorded",
         ],
         "required_evidence_codes": [
-            "RUNTIME_V2_READBACK_MATCHED",
-            "DEPLOYMENT_IDENTITY_CONFIRMED",
-            "WORKER_READY",
-            "BACKEND_SHA_MATCHED",
-            "WORKER_SHA_MATCHED",
+            "RUNTIME_STATUS_READBACK_SUCCEEDED",
+            "RUNTIME_CONFIGURED",
+            "RUNTIME_METADATA_RECORDED",
         ],
         "minimum_id_counts": {"request_ids": 1, "turn_ids": 0, "trace_ids": 0},
         "required_turn_count": 0,
@@ -213,13 +208,13 @@ _SCENARIO_CONTRACTS: dict[str, dict[str, Any]] = {
         "required_assertions": [
             "driver_enabled",
             "chat_loop_verified",
-            "runtime_v2_readback_matches",
+            "runtime_status_readback_succeeds",
             "no_orphan_turn",
         ],
         "required_evidence_codes": [
             "DRIVER_ENABLED",
             "CHAT_LOOP_VERIFIED",
-            "RUNTIME_V2_READBACK_MATCHED",
+            "RUNTIME_STATUS_READBACK_SUCCEEDED",
             "NO_ORPHAN_TURN",
         ],
         "minimum_id_counts": {"request_ids": 1, "turn_ids": 0, "trace_ids": 0},
@@ -515,7 +510,7 @@ def _validate_coverage(coverage: Any, expected_runtime: str) -> list[str]:
         errors.append("coverage lock top-level fields do not match the release gate")
     if (
         coverage.get("version") != 1
-        or coverage.get("suite_id") != "feedling-api-key-runtime-v2-p0"
+        or coverage.get("suite_id") != "feedling-api-key-p0"
         or coverage.get("scope") != "api_key_only"
     ):
         errors.append("coverage lock identity does not match the release gate")
@@ -604,8 +599,8 @@ def _validate_coverage(coverage: Any, expected_runtime: str) -> list[str]:
         errors.append("coverage lock artifact contract does not match the release gate")
 
     target = coverage.get("target")
-    if target != {**_COVERAGE_TARGET, "expected_runtime": expected_runtime}:
-        errors.append("coverage runtime does not match the expected Runtime V2 mode")
+    if target != {**_COVERAGE_TARGET, "expected_runtime": BASELINE_RUNTIME}:
+        errors.append("coverage target does not describe the baseline deployed runtime")
     execution = coverage.get("execution")
     if execution != _EXECUTION_CONTRACT:
         errors.append(
@@ -1072,10 +1067,16 @@ def _validate_result_semantics(
         errors.append("result target runtime does not match the release gate")
     if str(target.get("expected_deployment_sha") or "").lower() != expected_sha.lower():
         errors.append("result expected deployment SHA does not match the release gate")
-    if str(target.get("observed_backend_sha") or "").lower() != expected_sha.lower():
-        errors.append("observed backend SHA does not match the expected deployment")
-    if str(target.get("observed_worker_sha") or "").lower() != expected_sha.lower():
-        errors.append("observed worker SHA does not match the expected deployment")
+    if expected_runtime == EXPECTED_RUNTIME:
+        if str(target.get("observed_backend_sha") or "").lower() != expected_sha.lower():
+            errors.append("observed backend SHA does not match the expected deployment")
+        if str(target.get("observed_worker_sha") or "").lower() != expected_sha.lower():
+            errors.append("observed worker SHA does not match the expected deployment")
+    elif (
+        target.get("observed_backend_sha") is not None
+        or target.get("observed_worker_sha") is not None
+    ):
+        errors.append("baseline result must not invent deployment build identity")
 
     profiles = result.get("profiles")
     if not isinstance(profiles, list):
@@ -1121,8 +1122,22 @@ def _validate_result_semantics(
             )
         if profile.get("expected_runtime") != expected_runtime:
             errors.append(f"profile {profile_id} expected runtime does not match")
-        if profile.get("observed_runtime") != expected_runtime:
-            errors.append(f"profile {profile_id} did not observe Runtime V2")
+        observed_runtime = profile.get("observed_runtime")
+        observed_version = profile.get("observed_runtime_version")
+        if expected_runtime == EXPECTED_RUNTIME:
+            if observed_runtime != expected_runtime:
+                errors.append(f"profile {profile_id} did not observe Runtime V2")
+            if observed_version != 2:
+                errors.append(
+                    f"profile {profile_id} did not observe Runtime V2 version"
+                )
+        elif (
+            not isinstance(observed_runtime, str)
+            or not observed_runtime
+            or type(observed_version) is not int
+            or observed_version < 1
+        ):
+            errors.append(f"profile {profile_id} has no deployed runtime readback")
         if profile.get("reasoning_effort") != "medium":
             errors.append(
                 f"profile {profile_id} did not prove medium reasoning was enabled"
@@ -1629,6 +1644,36 @@ def _validate_provisioning_manifest(
         expected_label = f"agent-e2e-{run_id}-{profile_id}"
         invalid_receipt = entry.get("invalid_key_receipt")
         valid_receipt = entry.get("valid_key_receipt")
+        runtime_mode = entry.get("runtime_mode")
+        runtime_version = entry.get("runtime_version")
+        runtime_receipt = entry.get("runtime_readback_receipt")
+        runtime_readback_valid = (
+            entry.get("runtime_mode_readback_verified") is True
+            and isinstance(runtime_mode, str)
+            and bool(runtime_mode)
+            and type(runtime_version) is int
+            and runtime_version >= 1
+            and runtime_receipt
+            == {
+                "configured": True,
+                "runtime_mode": runtime_mode,
+                "runtime_version": runtime_version,
+            }
+        )
+        if expected_runtime == EXPECTED_RUNTIME:
+            runtime_contract_valid = (
+                entry.get("runtime_mode_set_required") is True
+                and entry.get("runtime_mode_set_verified") is True
+                and runtime_mode == EXPECTED_RUNTIME
+                and runtime_version == 2
+                and runtime_readback_valid
+            )
+        else:
+            runtime_contract_valid = (
+                entry.get("runtime_mode_set_required") is False
+                and entry.get("runtime_mode_set_verified") is False
+                and runtime_readback_valid
+            )
         if (
             entry.get("label") != expected_label
             or entry.get("provider") != provider
@@ -1651,9 +1696,7 @@ def _validate_provisioning_manifest(
             or entry.get("invalid_key_rejected") is not True
             or entry.get("valid_key_configured") is not True
             or entry.get("trace_enabled") is not True
-            or entry.get("runtime_mode_set_verified") is not True
-            or entry.get("runtime_mode_readback_verified") is not True
-            or entry.get("runtime_mode") != expected_runtime
+            or not runtime_contract_valid
             or not isinstance(invalid_receipt, dict)
             or invalid_receipt.get("http_status") != 400
             or invalid_receipt.get("error") != "provider_test_failed"
@@ -1688,7 +1731,11 @@ def _validate_provisioning_manifest(
 
 
 def _validate_deployment_receipt(
-    receipt: Any, result: Mapping[str, Any], expected_sha: str, phase: str
+    receipt: Any,
+    result: Mapping[str, Any],
+    expected_sha: str,
+    expected_runtime: str,
+    phase: str,
 ) -> list[str]:
     errors: list[str] = []
     label = f"{phase}-run trusted deployment receipt"
@@ -1700,24 +1747,36 @@ def _validate_deployment_receipt(
     if (
         receipt.get("environment") != "test"
         or receipt.get("base_url") != "https://test-api.feedling.app"
+        or receipt.get("expected_runtime") != expected_runtime
+        or receipt.get("liveness_verified") is not True
     ):
         errors.append(f"{label} target is not the test environment")
     receipt_expected = str(receipt.get("expected_deployment_sha") or "").lower()
     backend_sha = str(receipt.get("observed_backend_sha") or "").lower()
     worker_sha = str(receipt.get("observed_worker_sha") or "").lower()
-    if (
-        receipt_expected != expected
-        or backend_sha != expected
-        or worker_sha != expected
-    ):
+    if receipt_expected != expected:
         errors.append(f"{label} does not match the candidate")
     live_worker_count = receipt.get("live_worker_count")
-    if (
-        not isinstance(live_worker_count, int)
-        or isinstance(live_worker_count, bool)
-        or live_worker_count < 1
+    if expected_runtime == EXPECTED_RUNTIME:
+        if (
+            backend_sha != expected
+            or worker_sha != expected
+            or receipt.get("deployment_identity_verified") is not True
+        ):
+            errors.append(f"{label} does not match the candidate")
+        if (
+            not isinstance(live_worker_count, int)
+            or isinstance(live_worker_count, bool)
+            or live_worker_count < 1
+        ):
+            errors.append(f"{label} has no live V2 worker")
+    elif (
+        receipt.get("observed_backend_sha") is not None
+        or receipt.get("observed_worker_sha") is not None
+        or live_worker_count is not None
+        or receipt.get("deployment_identity_verified") is not False
     ):
-        errors.append(f"{label} has no live V2 worker")
+        errors.append(f"{label} invents unavailable baseline deployment identity")
     target = result.get("target")
     if isinstance(target, dict) and (
         str(target.get("observed_backend_sha") or "").lower() != backend_sha
@@ -1747,9 +1806,12 @@ def _validate_deployment_receipt_pair(
     identity_fields = (
         "environment",
         "base_url",
+        "expected_runtime",
         "expected_deployment_sha",
         "observed_backend_sha",
         "observed_worker_sha",
+        "liveness_verified",
+        "deployment_identity_verified",
     )
     errors: list[str] = []
     if any(
@@ -1788,8 +1850,8 @@ def validate_release(
     expected_sha: str,
 ) -> list[str]:
     """Return sanitized release-gate errors; an empty list means PASS."""
-    if expected_runtime != EXPECTED_RUNTIME:
-        return ["expected runtime must be hosted_resident"]
+    if expected_runtime not in {BASELINE_RUNTIME, EXPECTED_RUNTIME}:
+        return ["expected runtime is invalid"]
     if not _SHA_RE.fullmatch(str(expected_sha or "")):
         return ["expected deployment SHA is malformed"]
 
@@ -1816,10 +1878,14 @@ def validate_release(
     errors.extend(schema_issues)
     if not schema_issues and isinstance(result, dict):
         errors.extend(
-            _validate_deployment_receipt(pre_receipt, result, expected_sha, "pre")
+            _validate_deployment_receipt(
+                pre_receipt, result, expected_sha, expected_runtime, "pre"
+            )
         )
         errors.extend(
-            _validate_deployment_receipt(post_receipt, result, expected_sha, "post")
+            _validate_deployment_receipt(
+                post_receipt, result, expected_sha, expected_runtime, "post"
+            )
         )
         errors.extend(
             _validate_deployment_receipt_pair(pre_receipt, post_receipt, result)
@@ -1850,7 +1916,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--deployment-receipt", type=Path, required=True)
     parser.add_argument("--post-deployment-receipt", type=Path, required=True)
     parser.add_argument(
-        "--expected-runtime", choices=(EXPECTED_RUNTIME,), default=EXPECTED_RUNTIME
+        "--expected-runtime",
+        choices=(BASELINE_RUNTIME, EXPECTED_RUNTIME),
+        default=BASELINE_RUNTIME,
     )
     parser.add_argument("--expected-sha", required=True)
     return parser

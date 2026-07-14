@@ -275,6 +275,19 @@ def test_cli_wires_explicit_codex_binary_into_trusted_resolver(
 
     assert observed == [requested]
     assert options.codex_bin == native
+    assert options.runtime_requirement == "deployed_current"
+
+
+def test_cli_runtime_v2_requirement_is_opt_in(tmp_path, monkeypatch):
+    native = tmp_path / "verified-native-codex"
+    monkeypatch.setattr(
+        local, "_resolve_trusted_codex_binary", lambda _explicit: native
+    )
+    args = local._parser().parse_args(
+        ["--candidate-sha", "a" * 40, "--require-runtime-v2"]
+    )
+
+    assert local._options(args).runtime_requirement == "hosted_resident"
 
 
 def test_env_loader_requires_owner_only_mode_and_never_echoes_value(tmp_path):
@@ -1136,25 +1149,35 @@ def test_selected_profile_run_provisions_launches_copies_result_and_cleans(tmp_p
     options = local._resolve_runtime_options(_options(tmp_path, preflight_only=False))
     calls: list[str] = []
 
-    def provision(_coverage, manifest_path, *, env, diagnostic, profile_ids):
+    def provision(
+        _coverage,
+        manifest_path,
+        *,
+        env,
+        diagnostic,
+        profile_ids,
+        runtime_requirement,
+    ):
         calls.append("provision")
         assert "source-snapshot" in _coverage.parts
         assert options.source_root not in _coverage.parents
         assert _coverage.read_text() == "{}\n"
         assert diagnostic is True
         assert profile_ids == ("official-gemini",)
+        assert runtime_requirement == "deployed_current"
         assert env["QA_GEMINI_API_KEY"] == "gemini-sensitive-value"
         manifest = {
             "schema_version": 1,
             "qualification_mode": "diagnostic",
             "selected_profile_ids": ["official-gemini"],
-            "runtime_mode": "hosted_resident",
-            "runtime_version": 2,
+            "runtime_mode": "deployed_current",
+            "runtime_requirement": "deployed_current",
             "profiles": [
                 {
                     "profile_id": "official-gemini",
                     "runtime_mode": "hosted_resident",
                     "runtime_version": 2,
+                    "runtime_mode_readback_verified": True,
                 }
             ],
         }
@@ -1165,7 +1188,7 @@ def test_selected_profile_run_provisions_launches_copies_result_and_cleans(tmp_p
         calls.append("launch")
         assert kwargs["diagnostic"] is True
         assert kwargs["profile_ids"] == ("official-gemini",)
-        assert kwargs["expected_runtime"] == "hosted_resident"
+        assert kwargs["expected_runtime"] == "deployed_current"
         isolated = json.loads(
             (kwargs["profile_manifest_dir"] / "official-gemini.json").read_text()
         )
@@ -1177,6 +1200,7 @@ def test_selected_profile_run_provisions_launches_copies_result_and_cleans(tmp_p
                 "profile_id": "official-gemini",
                 "status": "PASS",
                 "observed_runtime": "hosted_resident",
+                "observed_runtime_version": 2,
                 "scenarios": [
                     {"scenario_id": f"P0-{index:02d}", "status": "PASS"}
                     for index in range(1, 14)
@@ -1321,21 +1345,31 @@ def test_nonpassing_worker_retains_only_credential_scrubbed_debug_evidence(tmp_p
     synthetic_api_key = "synthetic-user-api-key-for-debug-test"
     content_key = "synthetic-content-key-for-debug-test"
 
-    def provision(_coverage, manifest_path, *, env, diagnostic, profile_ids):
+    def provision(
+        _coverage,
+        manifest_path,
+        *,
+        env,
+        diagnostic,
+        profile_ids,
+        runtime_requirement,
+    ):
         assert diagnostic is True
         assert profile_ids == ("official-gemini",)
+        assert runtime_requirement == "deployed_current"
         manifest = {
             "schema_version": 1,
             "qualification_mode": "diagnostic",
             "selected_profile_ids": ["official-gemini"],
-            "runtime_mode": "hosted_resident",
-            "runtime_version": 2,
+            "runtime_mode": "deployed_current",
+            "runtime_requirement": "deployed_current",
             "profiles": [
                 {
                     "profile_id": "official-gemini",
                     "configured_model": "gemini-2.5-flash",
                     "runtime_mode": "hosted_resident",
                     "runtime_version": 2,
+                    "runtime_mode_readback_verified": True,
                     "trace_enabled": True,
                     "user_id": "synthetic-debug-user",
                     "api_key": synthetic_api_key,

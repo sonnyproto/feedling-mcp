@@ -30,7 +30,7 @@ _PROFILE_METADATA: dict[str, tuple[str, str, str]] = {
 }
 _TRACE_STAGES = ("routing", "queue", "provider", "persistence", "delivery")
 _SAFE_USER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
-_ALLOWED_OBSERVED_RUNTIMES = frozenset(("hosted_resident", "resident_cli"))
+_ALLOWED_RUNTIME_REQUIREMENTS = frozenset(("deployed_current", "hosted_resident"))
 
 
 def _safe_model(value: Any) -> str:
@@ -49,6 +49,12 @@ def _safe_user_id(value: Any) -> str | None:
     return None
 
 
+def _safe_runtime(value: Any) -> str | None:
+    if isinstance(value, str) and _SAFE_USER_ID_RE.fullmatch(value):
+        return value
+    return None
+
+
 def agent_error_profile(
     manifest_profile: Mapping[str, Any],
     *,
@@ -60,12 +66,17 @@ def agent_error_profile(
     metadata = _PROFILE_METADATA.get(profile_id)
     if metadata is None or manifest_profile.get("profile_id") != profile_id:
         raise DiagnosticResultError("diagnostic fallback profile is invalid")
-    if expected_runtime != "hosted_resident":
+    if expected_runtime not in _ALLOWED_RUNTIME_REQUIREMENTS:
         raise DiagnosticResultError("diagnostic fallback runtime is invalid")
 
     route_family, model_family, provider = metadata
-    runtime = manifest_profile.get("runtime_mode")
-    observed_runtime = runtime if runtime in _ALLOWED_OBSERVED_RUNTIMES else None
+    observed_runtime = _safe_runtime(manifest_profile.get("runtime_mode"))
+    runtime_version = manifest_profile.get("runtime_version")
+    observed_runtime_version = (
+        runtime_version
+        if type(runtime_version) is int and runtime_version >= 1
+        else None
+    )
     trace_enabled = manifest_profile.get("trace_enabled") is True
 
     return {
@@ -78,6 +89,7 @@ def agent_error_profile(
         "user_id": _safe_user_id(manifest_profile.get("user_id")),
         "expected_runtime": expected_runtime,
         "observed_runtime": observed_runtime,
+        "observed_runtime_version": observed_runtime_version,
         "status": "AGENT_ERROR",
         "scenarios": [],
         "turns": [],

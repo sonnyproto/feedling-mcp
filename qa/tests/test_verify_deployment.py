@@ -43,6 +43,27 @@ def test_trusted_receipt_requires_matching_backend_and_workers(tmp_path):
     assert stat.S_IMODE(receipt_path.stat().st_mode) == 0o400
 
 
+def test_baseline_receipt_proves_liveness_without_inventing_build_identity(tmp_path):
+    receipt_path = tmp_path / "deployment.json"
+    fake = FakeAdmin(payload={"ok": True, "mode": "multi_tenant"})
+
+    receipt = deployment.verify_deployment(
+        SHA,
+        receipt_path,
+        env=ENV,
+        admin_client=fake,
+        expected_runtime=deployment.BASELINE_RUNTIME,
+    )
+
+    assert fake.calls == [("GET", "/healthz", None)]
+    assert receipt["expected_runtime"] == "deployed_current"
+    assert receipt["liveness_verified"] is True
+    assert receipt["deployment_identity_verified"] is False
+    assert receipt["observed_backend_sha"] is None
+    assert receipt["observed_worker_sha"] is None
+    assert receipt["live_worker_count"] is None
+
+
 @pytest.mark.parametrize(
     ("payload", "message"),
     [

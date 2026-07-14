@@ -1,12 +1,12 @@
 {
   "version": 1,
-  "suite_id": "feedling-api-key-runtime-v2-p0",
+  "suite_id": "feedling-api-key-p0",
   "scope": "api_key_only",
   "target": {
     "environment": "test",
     "base_url_env": "QA_FEEDLING_BASE_URL",
     "expected_deployment_sha_env": "QA_EXPECTED_DEPLOYMENT_SHA",
-    "expected_runtime": "hosted_resident",
+    "expected_runtime": "deployed_current",
     "runtime_admin_token_env": "QA_TEST_ADMIN_TOKEN"
   },
   "execution": {
@@ -131,7 +131,7 @@
     "P0-01": {
       "required_assertions": [
         "target_is_test",
-        "deployment_identity_confirmed",
+        "deployed_endpoint_reachable",
         "provisioning_receipts_confirmed",
         "agent_environment_sanitized",
         "contract_inputs_readable",
@@ -139,9 +139,7 @@
       ],
       "required_evidence_codes": [
         "TARGET_TEST_CONFIRMED",
-        "DEPLOYMENT_IDENTITY_CONFIRMED",
-        "BACKEND_SHA_MATCHED",
-        "WORKER_SHA_MATCHED",
+        "DEPLOYED_ENDPOINT_REACHABLE",
         "PROVISIONING_RECEIPTS_CONFIRMED",
         "AGENT_ENVIRONMENT_SANITIZED",
         "CONTRACT_INPUTS_READABLE",
@@ -210,18 +208,14 @@
     },
     "P0-05": {
       "required_assertions": [
-        "runtime_v2_readback_matches",
-        "deployment_identity_confirmed",
-        "worker_ready",
-        "backend_sha_matches",
-        "worker_sha_matches"
+        "runtime_status_readback_succeeds",
+        "runtime_configured",
+        "runtime_metadata_recorded"
       ],
       "required_evidence_codes": [
-        "RUNTIME_V2_READBACK_MATCHED",
-        "DEPLOYMENT_IDENTITY_CONFIRMED",
-        "WORKER_READY",
-        "BACKEND_SHA_MATCHED",
-        "WORKER_SHA_MATCHED"
+        "RUNTIME_STATUS_READBACK_SUCCEEDED",
+        "RUNTIME_CONFIGURED",
+        "RUNTIME_METADATA_RECORDED"
       ],
       "minimum_id_counts": {
         "request_ids": 1,
@@ -252,13 +246,13 @@
       "required_assertions": [
         "driver_enabled",
         "chat_loop_verified",
-        "runtime_v2_readback_matches",
+        "runtime_status_readback_succeeds",
         "no_orphan_turn"
       ],
       "required_evidence_codes": [
         "DRIVER_ENABLED",
         "CHAT_LOOP_VERIFIED",
-        "RUNTIME_V2_READBACK_MATCHED",
+        "RUNTIME_STATUS_READBACK_SUCCEEDED",
         "NO_ORPHAN_TURN"
       ],
       "minimum_id_counts": {

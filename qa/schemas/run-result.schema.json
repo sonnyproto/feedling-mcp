@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://feedling.app/schemas/agent-e2e/run-result-v1.json",
-  "title": "Feedling API-Key Runtime V2 Qualification Result",
+  "title": "Feedling API-Key Deployed-Runtime Qualification Result",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -25,7 +25,7 @@
       "const": "1.0"
     },
     "suite_id": {
-      "const": "feedling-api-key-runtime-v2-p0"
+      "const": "feedling-api-key-p0"
     },
     "run_id": {
       "type": "string",
@@ -194,7 +194,11 @@
           "$ref": "#/$defs/nullableSha"
         },
         "expected_runtime": {
-          "const": "hosted_resident"
+          "type": "string",
+          "enum": [
+            "deployed_current",
+            "hosted_resident"
+          ]
         }
       }
     },
@@ -268,6 +272,7 @@
         "user_id",
         "expected_runtime",
         "observed_runtime",
+        "observed_runtime_version",
         "status",
         "scenarios",
         "turns",
@@ -331,18 +336,21 @@
           "$ref": "#/$defs/nullableSafeLabel"
         },
         "expected_runtime": {
-          "const": "hosted_resident"
+          "type": "string",
+          "enum": [
+            "deployed_current",
+            "hosted_resident"
+          ]
         },
         "observed_runtime": {
+          "$ref": "#/$defs/nullableSafeLabel"
+        },
+        "observed_runtime_version": {
           "type": [
-            "string",
+            "integer",
             "null"
           ],
-          "enum": [
-            "hosted_resident",
-            "resident_cli",
-            null
-          ]
+          "minimum": 1
         },
         "status": {
           "$ref": "#/$defs/status"
@@ -990,7 +998,7 @@
         "CLEANUP_CONFIRMED",
         "CONTRACT_INPUTS_READABLE",
         "CREDENTIAL_OMITTED",
-        "DEPLOYMENT_IDENTITY_CONFIRMED",
+        "DEPLOYED_ENDPOINT_REACHABLE",
         "DISCLOSURE_PRESENT",
         "DRIVER_ENABLED",
         "EXACT_REPLY_CORRELATED",
@@ -1014,7 +1022,9 @@
         "REASONING_METADATA_CONFIRMED",
         "REASONING_TOKENS_CONFIRMED",
         "RETRY_OBSERVATION_RECORDED",
-        "RUNTIME_V2_READBACK_MATCHED",
+        "RUNTIME_CONFIGURED",
+        "RUNTIME_METADATA_RECORDED",
+        "RUNTIME_STATUS_READBACK_SUCCEEDED",
         "SYNTHETIC_ACCOUNT_FRESH",
         "TARGET_TEST_CONFIRMED",
         "TEN_TURNS_ORDERED",

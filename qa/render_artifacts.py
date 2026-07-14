@@ -142,7 +142,7 @@ def _render_matrix(
 ) -> str:
     target = result["target"]
     lines = [
-        "# Feedling API-key Runtime V2 qualification",
+        "# Feedling API-key deployed-runtime qualification",
         "",
         f"- Run ID: `{result['run_id']}`",
         f"- Overall status: `{result['overall_status']}`",
@@ -303,7 +303,7 @@ def _render_junit(profiles: Sequence[Mapping[str, Any]]) -> str:
     suites = ElementTree.Element(
         "testsuites",
         {
-            "name": "feedling-api-key-runtime-v2-p0",
+            "name": "feedling-api-key-p0",
             "tests": str(total_tests),
             "failures": str(failures),
             "errors": str(errors),

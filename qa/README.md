@@ -1,24 +1,35 @@
 # Agent-driven API-key qualification
 
-This directory contains the first release-qualification slice for Feedling's
-deployed Runtime V2. It intentionally covers API-key users only. VPS/OAuth,
+This directory contains the first deployed-runtime qualification slice for
+Feedling API-key users. It intentionally covers API-key users only. VPS/OAuth,
 iOS UI automation, and customer-incident replay remain separate follow-up
 workstreams.
 
 ## What runs
 
-The workflow is deliberately split across explicit trust zones:
+There are two targets:
 
-1. `verify_deployment.py` uses the test admin credential before Codex starts and
-   again after the agent finishes to require one unchanged backend build,
-   homogeneous live-worker builds, and trusted pre/post candidate-SHA receipts
-   outside the public artifact directory.
+- **baseline** (the local driver's default) tests the runtime currently deployed
+  on `test-api.feedling.app`, records its reported mode/version, and does not
+  claim that a legacy `runtime_version: 2` label proves the new Hosted Runtime V2 architecture;
+- **strict Hosted Runtime V2** is an opt-in target of the protected GitHub
+  workflow and additionally requires admin mode selection, homogeneous
+  worker/backend build identity, and V2 receipts.
+
+The protected workflow is deliberately split across explicit trust zones:
+
+1. `verify_deployment.py` checks endpoint liveness before Codex starts and again
+   after the agent finishes. In strict V2 mode it also uses the test admin
+   credential to require one unchanged backend build, homogeneous live-worker
+   builds, and trusted pre/post candidate-SHA receipts outside the public
+   artifact directory.
 2. `provision_profiles.py` is a deterministic credential boundary. It creates
    eight fresh synthetic accounts, proves invalid-key rejection and valid-key
    recovery without accepting echoed credentials, enables user-scoped trace
    access, requires a server-side synthetic-account TTL/reaper before the first
-   registration, and uses the test admin token to set and read back
-   `hosted_resident` Runtime V2. A present-but-expired provider key becomes a fixed-code
+   registration, and reads the configured runtime through the user API. In
+   strict V2 mode it also uses the test admin token to set and independently
+   verify `hosted_resident`. A present-but-expired provider key becomes a fixed-code
    blocked row while provisioning continues through the other profiles, so a
    failed credential still produces a complete eight-row diagnostic matrix.
 3. The provisioner output is deterministically split into eight owner-only
@@ -57,8 +68,8 @@ The workflow is deliberately split across explicit trust zones:
    evidence, and nearest-rank p50/p95 summaries recomputed from those turns,
    one supervisor plus exactly eight uniquely assigned independent profile
    workers with no more than three observed concurrently, exact agreement with
-   the trusted process/thread/hash receipt, Runtime V2 identity, unchanged trusted
-   pre/post deployment receipts, exact binding to the owner-only read-only
+   the trusted process/thread/hash receipt, unchanged trusted pre/post liveness
+   receipts, strict Runtime V2 identity when selected, exact binding to the owner-only read-only
    provisioning manifest, PASS statuses, and required artifact paths.
 8. The workflow always resets every synthetic account and uploads only the
    public artifact directory after cleanup succeeds and an exact secret scan.
@@ -89,6 +100,10 @@ Codex workers run on the operator's machine and use the existing ChatGPT OAuth
 session in `~/.codex/auth.json`. Provider keys remain confined to the
 deterministic provisioner and are never placed in a Codex prompt or worker
 environment.
+
+The default is baseline qualification: it accepts any configured runtime status,
+records the observed mode/version, and runs the full user-behavior journey. Add
+`--require-runtime-v2` only after the new Hosted Runtime V2 candidate is deployed.
 
 Before copying that OAuth bundle, the local driver treats PATH only as a package
 locator, derives the native binary from the pinned official npm layout, and
@@ -134,6 +149,9 @@ live Gemini canary. Repeat `--profile` to select a bounded subset, or omit it to
 run the locked eight-profile matrix. The candidate SHA is the source commit
 actually deployed by the test manifest, not automatically the tip of the Git
 branch.
+
+For the future strict runtime candidate, append `--require-runtime-v2` to the
+same command.
 
 Local output is written under `qualification-artifacts/<run-id>/`. The sanitized
 source snapshot, manifests, and copied OAuth material stay under a run-scoped
@@ -227,7 +245,9 @@ their own virtual environments or install dependencies during qualification.
 the **test** backend's admin routes. Its value must match that deployment's
 `FEEDLING_ADMIN_TOKEN`. This is not issued by Feedling: the operator chooses one
 strong random value, for example with `openssl rand -hex 32`, and stores it only
-in secret managers. Deterministic QA tools use it only to call:
+in secret managers. The baseline local diagnostic does not use it. Protected
+release qualification uses it for the test-account reaper and cleanup; strict
+V2 mode additionally uses it to call:
 
 - `POST /v1/admin/hosted-runtime-mode`, to select `hosted_resident` for a newly
   created synthetic user; and
@@ -265,8 +285,8 @@ will intentionally fail closed.
 ## Test backend and runner infrastructure
 
 “Test backend” means the existing non-production deployment behind
-`https://test-api.feedling.app`, including its backend, database, Runtime V2
-workers, and queues. If that environment is already isolated from production,
+`https://test-api.feedling.app`, including its backend, database, and whichever
+runtime workers and queues are currently deployed. If that environment is already isolated from production,
 you do **not** need another Feedling VPS just for this suite. The system under
 test remains the existing test deployment.
 
@@ -375,7 +395,11 @@ credential-isolation controls.
 
 ## Before a live run
 
-The deployed `https://test-api.feedling.app` candidate must provide:
+For a baseline local run, the deployed endpoint needs the existing API-key
+onboarding, chat, persona, trace, and authenticated runtime-status contracts.
+This path does not wait for the new Hosted Runtime V2 feature branch.
+
+For the strict Hosted Runtime V2 GitHub release run, the deployed candidate must additionally provide:
 
 - the Runtime V2 admin set/readback routes;
 - the admin-gated V2 metrics contract with `backend_sha`, `worker_shas`, and a
@@ -387,11 +411,13 @@ The deployed `https://test-api.feedling.app` candidate must provide:
 - observable backend and worker build identity that can be matched to the
   candidate commit.
 
-Trigger **API-key Runtime V2 qualification** manually from the protected `test`
-branch in GitHub Actions and enter the full deployed candidate commit SHA. Any
-other selected ref explicitly fails before the protected Environment or its
-secrets are reached. Manual mode is intentional for the first stabilization
-phase; there is no push, schedule, or deployment trigger yet.
+Trigger **API-key deployed-runtime qualification** manually from the protected
+`test` branch in GitHub Actions and enter the full intended deployment commit
+SHA. Leave `runtime_target=deployed_current` to test today's deployed runtime;
+select `hosted_resident` only for the strict future-V2 proof. Any other selected
+ref explicitly fails before the protected Environment or its secrets are
+reached. Manual mode is intentional for the first stabilization phase; there is
+no push, schedule, or deployment trigger yet.
 
 Do not launch a live run until the deployment contract below exists. The current
 Runtime V2 implementation does not yet expose the raw backend/worker build SHA
@@ -421,8 +447,9 @@ evidence/failure text.
 The seven summary fields count the exact terminal statuses of the eight profiles
 and must sum to eight. The gate is green only when all eight profiles and all
 thirteen scenarios per profile are present in order and PASS with their locked
-assertions, evidence codes, required IDs, and preserved attempt history; Runtime
-V2 and unchanged pre/post candidate identity are proven; all chat turns have the
+assertions, evidence codes, required IDs, and preserved attempt history; pre/post
+endpoint liveness is proven, with strict V2 and candidate identity required only
+when that target is selected; all chat turns have the
 five required trace stages and numeric per-turn stage timing; cleanup succeeds;
 each worker has a completed qualification-tool event and a valid, passing,
 result-bound P0-12 receipt; each agent-driven scenario P0-02 through P0-11 has

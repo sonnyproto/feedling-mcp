@@ -85,8 +85,8 @@ except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
 
 PINNED_CODEX_VERSION = "codex-cli 0.144.3"
 LOCKED_BASE_URL = "https://test-api.feedling.app"
+BASELINE_RUNTIME = "deployed_current"
 LOCKED_RUNTIME = "hosted_resident"
-DIAGNOSTIC_RUNTIME = LOCKED_RUNTIME
 _SAFE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _MAX_SCHEMA_BYTES = 8 * 1024 * 1024
@@ -114,11 +114,15 @@ _DIAGNOSTIC_FALLBACK_COT_INVALID = "COT_RECEIPT_INVALID"
 _DIAGNOSTIC_COT_BINDING_MISMATCH = "COT_RESULT_BINDING_MISMATCH"
 _PROFILE_PROMPT = """\
 You are one independent intelligent qualification agent in the Feedling API-key
-runtime-v2 P0 suite. Read $QA_SOURCE_ROOT/qa/SOP.md,
+P0 suite. Read $QA_SOURCE_ROOT/qa/SOP.md,
 $QA_SOURCE_ROOT/qa/coverage-lock.json, and
 $QA_SOURCE_ROOT/qa/scenarios/api-key-journey.md before acting. QA_PRIVATE_MANIFEST is an
 owner-only one-row manifest for exactly your assigned profile. Test only that
 profile against QA_FEEDLING_BASE_URL and execute all locked scenarios in order.
+Copy QA_EXPECTED_RUNTIME exactly into `expected_runtime`. Copy the authenticated
+manifest readback into `observed_runtime` and `observed_runtime_version`; never
+turn a `deployed_current` requirement into `hosted_resident` merely because the
+backend reports its legacy runtime label that way.
 Your first response action MUST be a shell command execution, not a plan or a
 final JSON response. Run exactly:
 sed -n '1,999p' "$QA_SOURCE_ROOT/qa/SOP.md"
@@ -575,7 +579,9 @@ def _referenced_definitions(
 
 
 def build_profile_schema(
-    authoring: Mapping[str, Any], profile_id: str
+    authoring: Mapping[str, Any],
+    profile_id: str,
+    expected_runtime: str = LOCKED_RUNTIME,
 ) -> dict[str, Any]:
     definitions = authoring.get("$defs")
     if not isinstance(definitions, dict):
@@ -585,6 +591,10 @@ def build_profile_schema(
         root["properties"]["profile_id"] = {
             "type": "string",
             "enum": [profile_id],
+        }
+        root["properties"]["expected_runtime"] = {
+            "type": "string",
+            "enum": [expected_runtime],
         }
     except (KeyError, TypeError):
         raise WorkerLaunchError("profileResult schema is invalid") from None
@@ -807,7 +817,9 @@ def _prepare_specs(
         cot_receipt_path = output_dir / "cot-delivery-receipt.json"
         cot_request_path = work / ".cot-probe-request"
         cot_facts_path = work / "cot-delivery-facts.json"
-        profile_schema = build_profile_schema(authoring_schema, profile_id)
+        profile_schema = build_profile_schema(
+            authoring_schema, profile_id, expected_runtime
+        )
         _create_private_file(
             schema_path,
             (
@@ -1197,7 +1209,8 @@ def launch(
     else:
         assignments = PROFILE_AGENT_TYPES
 
-    if expected_runtime != (DIAGNOSTIC_RUNTIME if diagnostic else LOCKED_RUNTIME):
+    allowed_runtime_requirements = {BASELINE_RUNTIME, LOCKED_RUNTIME}
+    if expected_runtime not in allowed_runtime_requirements:
         raise WorkerLaunchError("worker runtime expectation is invalid")
 
     if (

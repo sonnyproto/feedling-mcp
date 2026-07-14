@@ -353,8 +353,8 @@ def test_adminless_diagnostic_subset_uses_user_runtime_readback(tmp_path):
     assert admin.calls == []
     assert result["qualification_mode"] == "diagnostic"
     assert result["selected_profile_ids"] == ["official-gemini"]
-    assert result["runtime_mode"] == "hosted_resident"
-    assert result["runtime_version"] == 2
+    assert result["runtime_mode"] == "deployed_current"
+    assert result["runtime_requirement"] == "deployed_current"
     assert result["synthetic_account_reaper"] == {
         "required": False,
         "verified": False,
@@ -378,12 +378,37 @@ def test_adminless_diagnostic_subset_uses_user_runtime_readback(tmp_path):
     assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
 
 
+def test_baseline_diagnostic_records_non_v2_runtime_without_selecting_it(tmp_path):
+    env = _env()
+    env.pop("QA_TEST_ADMIN_TOKEN")
+    smoke = FakeSmokeClient()
+    smoke.runtime_mode = "resident_cli"
+    smoke.runtime_version = 1
+
+    result = provisioner.provision(
+        _write_coverage(tmp_path),
+        tmp_path / "diagnostic.json",
+        env=env,
+        client=smoke,
+        diagnostic=True,
+        profile_ids=["official-gemini"],
+    )
+
+    profile = result["profiles"][0]
+    assert result["runtime_requirement"] == "deployed_current"
+    assert profile["runtime_mode"] == "resident_cli"
+    assert profile["runtime_version"] == 1
+    assert profile["runtime_mode_set_verified"] is False
+    assert profile["runtime_mode_readback_verified"] is True
+    assert profile["provision_status"] == provisioner.PROVISION_STATUS_READY
+
+
 @pytest.mark.parametrize(
     "runtime_field,runtime_value",
     [
         ("runtime_configured", False),
-        ("runtime_mode", "db_action_v2"),
-        ("runtime_version", 1),
+        ("runtime_mode", ""),
+        ("runtime_version", 0),
         ("runtime_version", 2.0),
     ],
 )
@@ -408,6 +433,33 @@ def test_adminless_diagnostic_blocks_runtime_readback_mismatch(
     assert profile["provision_status"] == provisioner.PROVISION_STATUS_BLOCKED
     assert profile["provision_failure_code"] == "RUNTIME_MODE_VERIFICATION_FAILED"
     assert profile["runtime_mode_readback_verified"] is False
+
+
+@pytest.mark.parametrize(
+    "runtime_field,runtime_value",
+    [("runtime_mode", "resident_cli"), ("runtime_version", 1)],
+)
+def test_adminless_strict_v2_blocks_non_v2_runtime(
+    tmp_path, runtime_field, runtime_value
+):
+    env = _env()
+    env.pop("QA_TEST_ADMIN_TOKEN")
+    smoke = FakeSmokeClient()
+    setattr(smoke, runtime_field, runtime_value)
+
+    result = provisioner.provision(
+        _write_coverage(tmp_path),
+        tmp_path / "diagnostic.json",
+        env=env,
+        client=smoke,
+        diagnostic=True,
+        profile_ids=["official-gemini"],
+        runtime_requirement=provisioner.RUNTIME_V2_REQUIREMENT,
+    )
+
+    profile = result["profiles"][0]
+    assert profile["provision_status"] == provisioner.PROVISION_STATUS_BLOCKED
+    assert profile["provision_failure_code"] == "RUNTIME_MODE_VERIFICATION_FAILED"
 
 
 def test_profile_subset_is_rejected_outside_diagnostic_mode(tmp_path):
@@ -1036,8 +1088,8 @@ def test_manifest_is_checkpointed_after_each_successful_profile_stage(
         admin_client=FakeAdminClient(),
     )
 
-    assert len(snapshots) == 7 * len(provisioner.PROFILE_SPECS)
-    first_profile_stages = [snapshot["profiles"][0] for snapshot in snapshots[:7]]
+    assert len(snapshots) == 8 * len(provisioner.PROFILE_SPECS)
+    first_profile_stages = [snapshot["profiles"][0] for snapshot in snapshots[:8]]
     assert first_profile_stages[0]["provision_failure_code"] == (
         provisioner.PROVISION_FAILURE_INCOMPLETE
     )
@@ -1047,7 +1099,12 @@ def test_manifest_is_checkpointed_after_each_successful_profile_stage(
     assert first_profile_stages[4]["trace_enabled"] is True
     assert first_profile_stages[5]["runtime_mode_set_verified"] is True
     assert first_profile_stages[6]["runtime_mode_readback_verified"] is True
-    assert first_profile_stages[6]["provision_status"] == (
+    assert first_profile_stages[7]["runtime_readback_receipt"] == {
+        "configured": True,
+        "runtime_mode": "hosted_resident",
+        "runtime_version": 2,
+    }
+    assert first_profile_stages[7]["provision_status"] == (
         provisioner.PROVISION_STATUS_READY
     )
 
@@ -1298,13 +1355,14 @@ def test_provision_cli_succeeds_for_complete_matrix_with_blocked_profile(
     env = _env()
     original_provision = provisioner.provision
 
-    def injected_provision(coverage_path, manifest_path):
+    def injected_provision(coverage_path, manifest_path, **kwargs):
         return original_provision(
             coverage_path,
             manifest_path,
             env=env,
             client=smoke,
             admin_client=FakeAdminClient(),
+            runtime_requirement=kwargs.get("runtime_requirement"),
         )
 
     monkeypatch.setattr(provisioner, "provision", injected_provision)
@@ -1415,13 +1473,14 @@ def test_provision_cli_is_nonzero_when_registration_prevents_complete_manifest(
     env = _env()
     original_provision = provisioner.provision
 
-    def injected_provision(coverage_path, manifest_path):
+    def injected_provision(coverage_path, manifest_path, **kwargs):
         return original_provision(
             coverage_path,
             manifest_path,
             env=env,
             client=smoke,
             admin_client=FakeAdminClient(),
+            runtime_requirement=kwargs.get("runtime_requirement"),
         )
 
     monkeypatch.setattr(provisioner, "provision", injected_provision)

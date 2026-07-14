@@ -1,7 +1,7 @@
-# Feedling API-Key Runtime V2 Qualification SOP
+# Feedling API-Key Deployed-Runtime Qualification SOP
 
 This file is the normative instruction set for an agent-driven, live end-to-end
-qualification of Feedling's deployed **test** environment. V1 deliberately covers
+qualification of Feedling's deployed **test** environment. This first slice deliberately covers
 API-key users only. VPS, OAuth subscription, iOS UI, and production-user testing
 are outside this SOP.
 
@@ -15,8 +15,10 @@ The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are requirements.
 - The system under test MUST be the deployed test endpoint named by
   `QA_FEEDLING_BASE_URL` and the expected deployment named by
   `QA_EXPECTED_DEPLOYMENT_SHA`.
-- Each synthetic account MUST independently read back `hosted_resident` with
-  runtime version `2` before chat begins.
+- Each synthetic account MUST independently read its authenticated runtime
+  status before chat begins. `QA_EXPECTED_RUNTIME=deployed_current` records the
+  runtime actually deployed without requiring the future Hosted Runtime V2
+  architecture. `QA_EXPECTED_RUNTIME=hosted_resident` is the opt-in strict V2 gate.
 - Use one freshly provisioned synthetic account per profile. Never use a
   customer account.
 - Provider keys and the test admin token are consumed only by the deterministic
@@ -200,8 +202,10 @@ Provider credentials are provisioner-only secrets, not agent context.
   real key. A hash or prefix of a key is still forbidden evidence.
 - The provisioner uses a generated, clearly fake value for invalid-key testing.
   The supervisor audits the sanitized receipt; it does not repeat setup.
-- The provisioner uses the test admin token only for switching the synthetic
-  account to Runtime V2 and reading that mode back.
+- The baseline diagnostic does not use an admin token to select a runtime. The
+  strict V2 release path may use the test admin token only for selecting the
+  synthetic account's runtime, reading it back, deployment identity, reaper,
+  and cleanup controls.
 - Feedling user API keys and content private keys are in-memory session material.
   They MUST NOT appear in artifacts.
 - The supervisor shell MUST use `feedling-e2e-supervisor`, and each worker MUST
@@ -221,21 +225,28 @@ schema-approved fixed evidence/diagnostic/failure codes, safe identifiers,
 booleans, counts, durations, and approved metadata. Never place an observed
 response fragment inside an identifier or code field.
 
-## 4. Runtime V2 proof
+## 4. Runtime discovery and optional V2 proof
 
-Before enabling hosted chat, the worker MUST:
+Before enabling hosted chat, every worker MUST:
 
-1. Audit the provisioner's authenticated runtime readback receipt for
-   `hosted_resident` with runtime version `2`.
-2. Independently correlate later chat/trace evidence with Runtime V2 when the
+1. Audit the provisioner's authenticated user-scoped runtime readback receipt.
+2. Record the runtime requirement, observed runtime mode, and observed runtime
+   version in the profile result.
+3. Correlate later chat/trace evidence with the observed runtime path when the
    deployed trace exposes that evidence.
-3. Record expected and observed runtime in the canonical profile result.
-4. Correlate later chat evidence with Runtime V2 worker/queue trace evidence when
-   the deployed trace supports it.
 
-An inability to set or verify the mode is `BLOCKED_DEPLOYMENT` (or
-`BLOCKED_CREDENTIAL` when the test admin credential is absent). It can never pass
-as an implicit resident-runtime test.
+When `QA_EXPECTED_RUNTIME=hosted_resident`, the strict V2 path additionally MUST:
+
+1. Require observed mode `hosted_resident` with runtime version `2`.
+2. Require trusted pre/post deployment receipts proving the expected backend
+   and homogeneous live-worker build.
+3. Correlate chat evidence with V2 worker/queue trace evidence when supported.
+
+An unreadable or unconfigured runtime is `BLOCKED_DEPLOYMENT`. In strict V2 mode,
+an inability to select or verify V2 is `BLOCKED_DEPLOYMENT` (or
+`BLOCKED_CREDENTIAL` when the test admin credential is absent). A backend's
+legacy `runtime_version: 2` label alone is never proof that the new Hosted
+Runtime V2 architecture is deployed.
 
 ## 5. Scenario execution and bounded diagnosis
 
@@ -274,7 +285,8 @@ Classification order:
 1. Secret disclosure, prompt-injection compliance, customer-data contact, or an
    unsafe target: `SECURITY_FAIL`.
 2. Missing provider/model/admin credential: `BLOCKED_CREDENTIAL`.
-3. Wrong deployment, Runtime V2 unavailable, or incompatible deployed contract:
+3. Unreachable deployment, unreadable runtime, strict V2 unavailable when required,
+   or incompatible deployed contract:
    `BLOCKED_DEPLOYMENT`.
 4. Required trace/reasoning/runtime evidence unavailable despite successful user
    behavior: `BLOCKED_EVIDENCE`.
@@ -433,8 +445,10 @@ The overall result is `PASS` only when:
   terminal statuses and sum to eight;
 - all thirteen exact scenario IDs occur once for every profile;
 - all scenario and profile statuses are `PASS`;
-- observed runtime is `hosted_resident` for every profile;
-- expected and observed deployment identity agree;
+- the observed runtime is present for every profile and, in the strict V2 release
+  path, equals `hosted_resident` with the required V2 receipt evidence;
+- pre/post endpoint liveness agrees and, in strict V2 mode, expected and
+  observed deployment identity agree;
 - every synthetic account is cleaned up;
 - every profile worker has at least one completed qualification-tool execution;
 - every private P0-12 receipt validates, matches its profile result, and proves

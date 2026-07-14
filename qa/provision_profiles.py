@@ -36,9 +36,14 @@ from tools.provider_smoke.client import Session, SmokeClient  # noqa: E402
 
 ALLOWED_BASE_URL = "https://test-api.feedling.app"
 ALLOWED_KONGBEIQIE_BASE_URL = "https://xn--vduyey89e.com/v1"
-EXPECTED_RUNTIME_MODE = "hosted_resident"
-DIAGNOSTIC_RUNTIME_MODE = EXPECTED_RUNTIME_MODE
-DIAGNOSTIC_RUNTIME_VERSION = 2
+BASELINE_RUNTIME_REQUIREMENT = "deployed_current"
+RUNTIME_V2_REQUIREMENT = "hosted_resident"
+EXPECTED_RUNTIME_MODE = RUNTIME_V2_REQUIREMENT
+RUNTIME_V2_VERSION = 2
+# Backward-compatible names for existing fixtures and strict-V2 callers. They
+# describe the observed legacy API label, not the default diagnostic requirement.
+DIAGNOSTIC_RUNTIME_MODE = RUNTIME_V2_REQUIREMENT
+DIAGNOSTIC_RUNTIME_VERSION = RUNTIME_V2_VERSION
 QUALIFICATION_MODE_DIAGNOSTIC = "diagnostic"
 EXPECTED_REASONING_EFFORT = "medium"
 INVALID_PROVIDER_KEY = "feedling-e2e-intentionally-invalid"
@@ -526,6 +531,7 @@ def _manifest_entry(
     label: str,
     *,
     diagnostic: bool = False,
+    runtime_requirement: str = RUNTIME_V2_REQUIREMENT,
 ) -> dict[str, Any]:
     entry = {
         "profile_id": profile["profile_id"],
@@ -541,6 +547,11 @@ def _manifest_entry(
         "public_key_b64": base64.b64encode(session.pk).decode("ascii"),
         "trace_enabled": False,
         "runtime_mode": "",
+        "runtime_version": 0,
+        "runtime_mode_set_required": (
+            not diagnostic and runtime_requirement == RUNTIME_V2_REQUIREMENT
+        ),
+        "runtime_readback_receipt": None,
         "registration_verified": False,
         "fresh_state_verified": False,
         "invalid_key_rejected": False,
@@ -556,9 +567,6 @@ def _manifest_entry(
         entry.update(
             {
                 "qualification_mode": QUALIFICATION_MODE_DIAGNOSTIC,
-                "runtime_version": 0,
-                "runtime_mode_set_required": False,
-                "runtime_readback_receipt": None,
             }
         )
     return entry
@@ -775,27 +783,41 @@ def _verify_runtime_mode(
 
 
 def _verify_diagnostic_runtime(
-    client: SmokeClient, session: Session, entry: dict[str, Any]
+    client: SmokeClient,
+    session: Session,
+    entry: dict[str, Any],
+    *,
+    runtime_requirement: str,
 ) -> None:
     try:
         body = client.runtime_status(session)
     except Exception:
         raise _ProfileProvisionFailure("RUNTIME_MODE_VERIFICATION_FAILED") from None
-    if (
+    runtime_mode = body.get("runtime_mode") if isinstance(body, Mapping) else None
+    runtime_version = (
+        body.get("runtime_version") if isinstance(body, Mapping) else None
+    )
+    generic_readback_invalid = (
         not isinstance(body, Mapping)
         or body.get("configured") is not True
-        or body.get("runtime_mode") != DIAGNOSTIC_RUNTIME_MODE
-        or type(body.get("runtime_version")) is not int
-        or body.get("runtime_version") != DIAGNOSTIC_RUNTIME_VERSION
-    ):
+        or not isinstance(runtime_mode, str)
+        or not runtime_mode
+        or type(runtime_version) is not int
+        or runtime_version < 1
+    )
+    runtime_v2_mismatch = runtime_requirement == RUNTIME_V2_REQUIREMENT and (
+        runtime_mode != RUNTIME_V2_REQUIREMENT
+        or runtime_version != RUNTIME_V2_VERSION
+    )
+    if generic_readback_invalid or runtime_v2_mismatch:
         raise _ProfileProvisionFailure("RUNTIME_MODE_VERIFICATION_FAILED")
-    entry["runtime_mode"] = DIAGNOSTIC_RUNTIME_MODE
-    entry["runtime_version"] = DIAGNOSTIC_RUNTIME_VERSION
+    entry["runtime_mode"] = runtime_mode
+    entry["runtime_version"] = runtime_version
     entry["runtime_mode_readback_verified"] = True
     entry["runtime_readback_receipt"] = {
         "configured": True,
-        "runtime_mode": DIAGNOSTIC_RUNTIME_MODE,
-        "runtime_version": DIAGNOSTIC_RUNTIME_VERSION,
+        "runtime_mode": runtime_mode,
+        "runtime_version": runtime_version,
     }
 
 
@@ -814,8 +836,8 @@ def _complete_diagnostic_manifest(manifest: Mapping[str, Any]) -> bool:
             or any(not isinstance(profile_id, str) for profile_id in selected)
             or selected
             != [profile_id for profile_id in PROFILE_SPECS if profile_id in selected]
-            or manifest.get("runtime_mode") != DIAGNOSTIC_RUNTIME_MODE
-            or manifest.get("runtime_version") != DIAGNOSTIC_RUNTIME_VERSION
+            or manifest.get("runtime_requirement")
+            not in {BASELINE_RUNTIME_REQUIREMENT, RUNTIME_V2_REQUIREMENT}
         ):
             return False
         expected_ids = selected
@@ -966,9 +988,15 @@ def provision(
     admin_client: AdminClient | None = None,
     diagnostic: bool = False,
     profile_ids: Sequence[str] | None = None,
+    runtime_requirement: str | None = None,
 ) -> dict[str, Any]:
     """Create the locked matrix, isolating operational failures by profile."""
     active_env = os.environ if env is None else env
+    requirement = runtime_requirement or (
+        BASELINE_RUNTIME_REQUIREMENT if diagnostic else RUNTIME_V2_REQUIREMENT
+    )
+    if requirement not in {BASELINE_RUNTIME_REQUIREMENT, RUNTIME_V2_REQUIREMENT}:
+        raise ProvisionError("runtime requirement is invalid")
     base_url = validate_base_url(_required_env(active_env, "QA_FEEDLING_BASE_URL"))
     admin_token = "" if diagnostic else _required_env(active_env, "QA_TEST_ADMIN_TOKEN")
     profiles = _select_profiles(
@@ -1022,9 +1050,7 @@ def provision(
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "generated_at": _utc_now(),
         "base_url": base_url,
-        "runtime_mode": (
-            DIAGNOSTIC_RUNTIME_MODE if diagnostic else EXPECTED_RUNTIME_MODE
-        ),
+        "runtime_mode": requirement,
         "synthetic_account_reaper": reaper_receipt,
         "profiles": [],
     }
@@ -1032,7 +1058,7 @@ def provision(
         manifest.update(
             {
                 "qualification_mode": QUALIFICATION_MODE_DIAGNOSTIC,
-                "runtime_version": DIAGNOSTIC_RUNTIME_VERSION,
+                "runtime_requirement": requirement,
                 "selected_profile_ids": [
                     str(profile["profile_id"]) for profile in profiles
                 ],
@@ -1066,6 +1092,7 @@ def provision(
                     session,
                     label,
                     diagnostic=diagnostic,
+                    runtime_requirement=requirement,
                 )
             except Exception:
                 _reset_one(
@@ -1110,9 +1137,7 @@ def provision(
                 _atomic_write_manifest(manifest_path, manifest)
                 _enable_trace(active_client, session, entry)
                 _atomic_write_manifest(manifest_path, manifest)
-                if diagnostic:
-                    _verify_diagnostic_runtime(active_client, session, entry)
-                else:
+                if not diagnostic and requirement == RUNTIME_V2_REQUIREMENT:
                     if active_admin is None:  # pragma: no cover - defensive type guard
                         raise ProvisionError(
                             "strict provisioning requires admin client"
@@ -1120,6 +1145,13 @@ def provision(
                     _set_runtime_mode(active_admin, session, entry)
                     _atomic_write_manifest(manifest_path, manifest)
                     _verify_runtime_mode(active_admin, session, entry)
+                    _atomic_write_manifest(manifest_path, manifest)
+                _verify_diagnostic_runtime(
+                    active_client,
+                    session,
+                    entry,
+                    runtime_requirement=requirement,
+                )
                 entry["provision_status"] = PROVISION_STATUS_READY
                 entry["provision_failure_code"] = PROVISION_FAILURE_NONE
                 _atomic_write_manifest(manifest_path, manifest)
@@ -1173,6 +1205,16 @@ def _parser() -> argparse.ArgumentParser:
         dest="profile_ids",
         help="locked profile id to provision (repeatable; diagnostic mode only)",
     )
+    create.add_argument(
+        "--require-runtime-v2",
+        action="store_true",
+        help="require hosted_resident runtime version 2 instead of baseline readback",
+    )
+    create.add_argument(
+        "--baseline-runtime",
+        action="store_true",
+        help="qualify the currently deployed runtime without selecting Runtime V2",
+    )
     remove = commands.add_parser(
         "cleanup", help="reset all accounts in a private manifest"
     )
@@ -1184,17 +1226,29 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "provision":
+            if args.require_runtime_v2 and args.baseline_runtime:
+                raise ProvisionError("runtime requirement flags are mutually exclusive")
+            requirement = (
+                BASELINE_RUNTIME_REQUIREMENT
+                if args.baseline_runtime or (args.diagnostic and not args.require_runtime_v2)
+                else RUNTIME_V2_REQUIREMENT
+            )
             if args.diagnostic:
                 result = provision(
                     args.coverage,
                     args.manifest,
                     diagnostic=True,
                     profile_ids=args.profile_ids,
+                    runtime_requirement=requirement,
                 )
             else:
                 if args.profile_ids is not None:
                     raise ProvisionError("profile subsets require diagnostic mode")
-                result = provision(args.coverage, args.manifest)
+                result = provision(
+                    args.coverage,
+                    args.manifest,
+                    runtime_requirement=requirement,
+                )
             if not _complete_diagnostic_manifest(result):
                 raise ProvisionError(
                     "provisioning did not produce a complete diagnostic manifest"

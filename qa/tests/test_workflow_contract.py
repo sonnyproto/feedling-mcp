@@ -195,7 +195,7 @@ def test_real_codex_preflight_binds_the_locked_permission_profile():
 def test_raw_worker_output_is_verified_but_not_exposed_to_aggregator():
     orchestration = _step(
         "Verify independent Codex worker lifecycle and canonical inputs",
-        "Verify deployment identity remained stable after profile testing",
+        "Verify deployed endpoint and selected runtime target after profile testing",
     )
     supervisor = _step(
         "Run intelligent Codex qualification aggregator",
@@ -247,13 +247,13 @@ def test_aggregator_preserves_semantic_and_cot_evidence_and_writes_privately():
     assert "run-result.json" not in supervisor
 
 
-def test_deployment_identity_is_checked_before_and_after_live_profile_agents():
+def test_selected_runtime_target_is_checked_before_and_after_live_profile_agents():
     deployment_pre = _step(
-        "Verify deployed backend and worker build identity before qualification",
+        "Verify deployed endpoint and selected runtime target before qualification",
         "Install and verify isolated headless Codex runtime",
     )
     deployment_post = _step(
-        "Verify deployment identity remained stable after profile testing",
+        "Verify deployed endpoint and selected runtime target after profile testing",
         "Run intelligent Codex qualification aggregator",
     )
     validate = _step(
@@ -268,6 +268,46 @@ def test_deployment_identity_is_checked_before_and_after_live_profile_agents():
     assert "--deployment-receipt" in validate
     assert "--post-deployment-receipt" in validate
     assert "--orchestration-receipt" in validate
+
+
+def test_manual_dispatch_defaults_to_current_runtime_and_preserves_strict_v2_option():
+    trigger = WORKFLOW[WORKFLOW.index("on:\n") : WORKFLOW.index("permissions:\n")]
+    assert "runtime_target:" in trigger
+    assert "default: deployed_current" in trigger
+    assert "- deployed_current" in trigger
+    assert "- hosted_resident" in trigger
+
+    deployment_pre = _step(
+        "Verify deployed endpoint and selected runtime target before qualification",
+        "Install and verify isolated headless Codex runtime",
+    )
+    provision = _step(
+        "Provision eight isolated API-key profiles",
+        "Split credentials into isolated one-profile manifests",
+    )
+    workers = _step(
+        "Run eight independent headless Codex profile agents",
+        "Verify independent Codex worker lifecycle and canonical inputs",
+    )
+    deployment_post = _step(
+        "Verify deployed endpoint and selected runtime target after profile testing",
+        "Run intelligent Codex qualification aggregator",
+    )
+    validate = _step(
+        "Validate complete release result",
+        "Scan public artifacts for secrets and raw evidence",
+    )
+
+    for step in (deployment_pre, provision, workers, deployment_post, validate):
+        assert "QA_EXPECTED_RUNTIME: ${{ inputs.runtime_target }}" in step
+    for deployment in (deployment_pre, deployment_post):
+        assert '--expected-runtime "$QA_EXPECTED_RUNTIME"' in deployment
+    assert 'runtime_flag="--baseline-runtime"' in provision
+    assert 'if [ "$QA_EXPECTED_RUNTIME" = "hosted_resident" ]' in provision
+    assert 'runtime_flag="--require-runtime-v2"' in provision
+    assert '"$runtime_flag"' in provision
+    assert '--expected-runtime "$QA_EXPECTED_RUNTIME"' in workers
+    assert '--expected-runtime "$QA_EXPECTED_RUNTIME"' in validate
 
 
 def test_agent_result_is_published_and_rendered_only_by_trusted_code():

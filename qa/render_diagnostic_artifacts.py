@@ -74,7 +74,9 @@ def _observed_runtime(profile: Mapping[str, Any] | None) -> str:
         "hosted_resident",
         "resident_cli",
     ):
-        return str(profile["observed_runtime"])
+        version = profile.get("observed_runtime_version")
+        suffix = f"@v{version}" if type(version) is int and version >= 1 else "@v?"
+        return f"{profile['observed_runtime']}{suffix}"
     return "UNVERIFIED"
 
 
