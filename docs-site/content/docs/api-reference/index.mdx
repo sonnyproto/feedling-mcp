@@ -10,7 +10,11 @@ of the production FastAPI application.
 - Production `/docs`, `/redoc`, and `/openapi.json` remain disabled.
 - End-user requests normally use `X-API-Key`; hosted runtimes use scoped tokens in
   `X-Feedling-Runtime-Token`.
-- The static site shows executable code samples, but the browser playground is
-  disabled until the API explicitly allows the documentation origin through CORS.
+- The browser playground sends requests directly to the selected Production or
+  Staging server. Protected endpoints still require a valid credential.
+- Browser access is restricted to the documentation site's exact origin; CORS
+  does not bypass API-key or runtime-token authorization.
+- Check the selected server before pressing **Send**. Requests sent to Production
+  operate on the authenticated account's live data.
 
 Browse **Endpoints** in the sidebar to inspect routes grouped by domain.

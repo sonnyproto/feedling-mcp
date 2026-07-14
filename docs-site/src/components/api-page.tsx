@@ -3,10 +3,10 @@
 import { createOpenAPIPage } from 'fumadocs-openapi/ui';
 
 export const OpenAPIPage = createOpenAPIPage({
-  // The docs are exported as a static site and the API does not currently
-  // expose browser CORS headers. Code samples remain available; an interactive
-  // playground can be enabled once docs.feedling.app is allow-listed.
+  // The browser calls the selected API server directly. The backend permits
+  // only the documentation site's exact origin and still authenticates every
+  // protected request normally.
   playground: {
-    enabled: false,
+    enabled: true,
   },
 });
