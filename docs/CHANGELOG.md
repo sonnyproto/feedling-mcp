@@ -47,6 +47,35 @@
 
 ## 记录正文（最新的在上面）
 
+## 2026-07-14
+
+### [DONE] backend 内存增长根因修复（arena 膨胀 + 三个 churn 源）
+
+- **根因**（prod 实测取证）：backend worker RSS 无界增长（12h 到 2-3GB/worker）
+  的本体是 glibc per-thread malloc arena 膨胀——每 worker ~60 个 64MiB arena 近乎
+  全驻留、占 RSS 80%+，高水位只涨不还；不是 Python 对象泄漏。churn 饲料 =
+  请求处理分配（40 线程池线程）+ 三个可修的放大器（下条）。
+- **修复四件套**（全部 TDD，测试先行）：
+  1. `accounts/registry.py` `_set_user_timezone`：值未变直接 return——此前 iOS
+     app-presence 每 ~1min/设备重报同一时区，每次都触发 users 行 upsert + TEE
+     mirror + 跨 worker 广播 → **4 个 worker 各 63 次/min 整表重载 556 用户**
+     （pg_stat 实测 +75 全表扫/min）。对照实验证明重载 churn 本身不涨内存
+     （单监听线程完美复用），但 DB/CPU/锁是真浪费。
+  2. `admin/tee_sync_scheduler.py`：per-table 整表失败指数退避（2^n × interval，
+     封顶 1h，成功清零）——此前 text-cursor 分隔符 NUL bug（07-14 已另修，
+     `4ef7cd4`）让 memory_moments/world_book_entries 每 tick 必败重跑，把名义
+     300s 的 tick 拖成 13-87 分钟连轴转（重拉 + enclave 重解密同一批 ~800 行）。
+  3. `gunicorn_conf.py` + 两份 phala compose：`max_requests=2000/jitter=500/
+     graceful_timeout=120`（worker 定期回收 = arena 归零的唯一可靠手段；graceful
+     必须盖过 30s 长轮询）+ `MALLOC_ARENA_MAX=4`（arena 数量封顶）。
+  4. `screen/ws.py`：帧 ingest 循环内每帧重验 key——账号删除后已建立的广播扩展
+     WS 继续推帧，对不存在的用户反复写库撞 FK + 广播幽灵 store 重载（prod 实测
+     usr_25ce… 53 次/10min）；key 失效即 4401 关闭。
+- 排查全记录见 memory：backend-memory-growth-root-cause /
+  tee-sync-nul-byte-stuck-loop / timezone-noop-persist-reload-storm。
+- 止血提醒：prod 部署本批前，晚间活跃期 backend 容器仍需手动 `docker restart`
+  （available < 1000M 即 OOM killer 红线）。
+
 ## 2026-07-13
 
 ### [DONE] pi driver consolidation on the multi-profile schema
