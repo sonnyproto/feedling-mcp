@@ -8056,17 +8056,25 @@ def _window_document(text: str, *, max_chars: int = 18000, overlap_lines: int = 
 
 
 def _resident_floor_note() -> str:
-    """f(days) 蒸馏目标(机制 A,非闸门):花园低于天数下限时给 fact_write 一句
-    非编造引导 —— 素材真实支持的事实尽量都写,绝不编造凑数。取不到状态返空(零影响)。"""
+    """f(days) 蒸馏目标(机制 A,非闸门):数量由素材密度决定,下限只兜底防漏写,
+    期望值给个宽范围当参考。两层——先满足下限,再尽量接近期望上限;素材薄就少写、
+    绝不编造。后端暴露 memory_aspiration 就用真值,否则按下限估一个宽上限。
+    取不到状态返空(零影响)。"""
     try:
         st = _capture_get_json("/v1/bootstrap/status")
         floor = int(st.get("memory_floor") or 0)
         count = int(st.get("memories_count") or 0)
-        if floor > 0 and count < floor:
+        asp = int(st.get("memory_aspiration") or 0)
+        if asp <= floor:  # 后端未暴露期望值 → 按下限估一个宽上限(≈2.3×)
+            asp = max(floor + 2, round(floor * 2.3))
+        # 只要还没到期望上限就给引导(鼓励在下限之上继续挖真实记忆)。
+        if floor > 0 and count < asp:
             return (
-                f"这段关系的记忆花园目前只有 {count} 张卡,按相处天数的参考下限约 {floor} 张。"
-                "素材【真实支持】的持久事实尽量都写成卡,别为精简丢掉真事实;"
-                "仍按 known_memories 去重;【绝不编造】凑数——宁缺毋滥。"
+                f"花园现有 {count} 张卡。真正该有多少,取决于这些素材里有多少【真实、有价值】"
+                f"的持久事实——把它们尽量都写全,别为精简丢真事实。参考:这段关系正常大概在 "
+                f"{floor}–{asp} 张之间;【先满足下限 {floor} 张】,再尽量接近上限。素材薄就少写、"
+                f"【宁缺毋滥、绝不编造】;但若你只找到远低于 {floor} 张,多半是漏了,回去再挖。"
+                f"仍按 known_memories 去重。"
             )
     except Exception:
         pass
@@ -8102,7 +8110,19 @@ def _resident_extract_memories(document: str, job_id: str, *, keep_all: bool = F
         runtime=runtime, fact_candidates=candidates, llm=llm, keep_all=keep_all,
         floor_note=_resident_floor_note(),
     )
-    return [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
+    memories = [m for m in (mem_out.get("memories") or []) if isinstance(m, dict)]
+    # 收口二次 pass(仅 VPS resident):把原始素材 + 刚写的卡再给 agent,只补真实遗漏、
+    # 按 known_memories 去重、绝不编造。空素材/无遗漏都返回 {"memories":[]}(零副作用)。
+    try:
+        recheck = genesis_worker.build_memory_recheck_from_material(
+            user_id=uid, job_id=job_id, key_prefix=f"{job_id}:resident:recheck",
+            runtime=runtime, material=document, written_memories=memories, llm=llm,
+        )
+        genesis_resident_heartbeat(job_id)  # recheck is one more agent call — keep the lease alive
+        memories.extend([m for m in (recheck.get("memories") or []) if isinstance(m, dict)])
+    except Exception:
+        log.exception("resident memory recheck failed (non-fatal; keeping first-pass memories)")
+    return memories
 
 
 def _resident_existing_identity() -> dict:
