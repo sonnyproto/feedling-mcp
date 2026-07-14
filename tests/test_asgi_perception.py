@@ -19,9 +19,9 @@ E2E focus:
   - ``/photo/<id>/content`` returns JSON metadata + a ``decrypt_path`` pointer to
     the enclave frame-decrypt endpoint — NOT bytes, and NO in-process decrypt.
 
-The perception routes gate on ``auth.require_user()`` only (no
-``authorize_scope``), so there is no scope-failure (403) case; auth failure is
-the 401 path.
+Perception reads accept either authenticated credential. ``/report`` is
+API-key-only because sensitive-signal ingestion cannot forward runtime-token
+credentials through the current enclave adapter.
 """
 
 from __future__ import annotations

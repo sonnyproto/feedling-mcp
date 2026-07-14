@@ -1,0 +1,389 @@
+---
+title: Perception workflow
+description: Report current context, read the freshness-gated snapshot, and upload encrypted photos.
+---
+
+Perception accepts sparse device context. A report can contain one or more of
+`context_snapshot`, `items`, or `config`; at least one must be non-empty.
+
+Use `X-API-Key` for `POST /v1/perception/report`, especially when a report
+contains encrypted sensitive signals. The generic authentication layer can
+recognize a runtime token on this route, but a runtime-token-only call does not
+currently provide the API-key material used by the sensitive-signal decrypt
+adapter. An `accepted` status in that case is not proof that the decrypted value
+was written. Until that path is changed, treat sensitive report ingestion as
+API-key-only.
+
+## 1. Report non-sensitive operation context
+
+For operation signals, `data` is a JSON-encoded string, not a nested JSON value.
+Use the literal string `"null"`, an empty string, or JSON `null` when a signal is
+authorized but unavailable. `client_ts` is Unix time in seconds and applies to
+the report; a timestamp too far in the future is clamped to server time.
+
+```http
+POST /v1/perception/report HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: YOUR_FEEDLING_API_KEY
+
+{
+  "client_ts": 1783978500.125,
+  "context_snapshot": [
+    {
+      "key": "time",
+      "data": "{\"local_time\":\"2026-07-13T14:15:00-04:00\",\"timezone\":\"America/New_York\",\"locale\":\"en-US\"}",
+      "message": "device clock"
+    },
+    {
+      "key": "battery",
+      "data": "{\"level\":0.72,\"charging\":false}",
+      "message": "battery snapshot"
+    },
+    {
+      "key": "focus",
+      "data": "{\"authorization_status\":\"authorized\",\"focused\":true}",
+      "message": "focus presence"
+    }
+  ]
+}
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "results": {
+    "time": "accepted",
+    "battery": "accepted",
+    "focus": "accepted"
+  }
+}
+```
+
+An older observation can return `stale_ignored`. Other per-signal values include
+`unavailable`, `ignored`, `unknown_signal`, and validation-specific errors. A
+`200` report means the request was processed; inspect every signal result rather
+than treating all entries as stored.
+
+## 2. Report an encrypted sensitive signal
+
+Sensitive keys such as `location_signal`, `motion_state`, calendar, playback,
+weather, reminders, and health signals must use an envelope. Plaintext `data`
+for one of these keys is classified as `invalid_plaintext_sensitive_signal`.
+`changed` must be a JSON boolean.
+
+The encrypted plaintext uses a `values` wrapper:
+
+```json
+{
+  "values": {
+    "place_hint": "home",
+    "wifi_anchor_id": "anchor_7d7f"
+  },
+  "message": "coarse location context"
+}
+```
+
+After encrypting that object, send:
+
+```http
+POST /v1/perception/report HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: YOUR_FEEDLING_API_KEY
+
+{
+  "client_ts": 1783978500.125,
+  "context_snapshot": [
+    {
+      "key": "location_signal",
+      "changed": true,
+      "envelope": {
+        "v": 1,
+        "id": "perception_location_123",
+        "body_ct": "BASE64_CIPHERTEXT",
+        "nonce": "BASE64_NONCE",
+        "K_user": "BASE64_KEY_WRAPPED_TO_USER",
+        "K_enclave": "BASE64_KEY_WRAPPED_TO_ENCLAVE",
+        "enclave_pk_fpr": "ENCLAVE_PUBLIC_KEY_FINGERPRINT",
+        "visibility": "shared",
+        "owner_user_id": "usr_0123456789abcdef"
+      },
+      "message": "encrypted location signal"
+    }
+  ]
+}
+```
+
+```json
+{
+  "results": {
+    "location_signal": "accepted"
+  }
+}
+```
+
+The response confirms classification and processing, not that a proactive wake
+was emitted. Wake policy, user settings, activation state, freshness ordering,
+and debounce can suppress downstream notification independently.
+
+## 3. Read the current snapshot
+
+```http
+GET /v1/perception/snapshot HTTP/1.1
+Host: api.feedling.app
+X-API-Key: YOUR_FEEDLING_API_KEY
+```
+
+```json
+{
+  "local_time": "2026-07-13T14:15:00-04:00",
+  "timezone": "America/New_York",
+  "locale": "en-US",
+  "battery_level": 0.72,
+  "charging": false,
+  "broadcast_state": null,
+  "broadcast_active": null,
+  "place_label": "home",
+  "wifi_label": null,
+  "country": null,
+  "locality": null,
+  "wifi_anchor_id": "anchor_7d7f",
+  "motion_state": null,
+  "calendar_next_event": null,
+  "calendar_events": null,
+  "calendar_events_truncated": null,
+  "now_playing": null,
+  "focus_authorization_status": "authorized",
+  "in_focus": true,
+  "app_name": null,
+  "app_category": null,
+  "user_state": "default",
+  "recent_apps": []
+}
+```
+
+Snapshot values are freshness-gated by signal-specific TTLs. `null` means the
+value is unavailable, unauthorized, or stale; clients must not infer which one
+without a separate user-controlled permission state. New context fields can be
+added, so decoders should ignore unknown keys.
+
+## Collection items
+
+The `items` branch accepts collection uploads for `workout`, `sleep`, and
+`vitals`. Each collection value is an array.
+
+```http
+POST /v1/perception/report HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: YOUR_FEEDLING_API_KEY
+
+{
+  "items": {
+    "sleep": [
+      {
+        "item_id": "sleep_2026_07_13",
+        "ts": 1783951200,
+        "doc": {
+          "asleep_minutes": 425,
+          "deep_minutes": 72
+        },
+        "expires_at": 1786543200
+      }
+    ]
+  }
+}
+```
+
+```json
+{
+  "results": {
+    "items": {
+      "sleep": {
+        "written": 1
+      }
+    }
+  }
+}
+```
+
+Photos are deliberately not accepted through `items`; use the dedicated
+encrypted photo flow below.
+
+The collection branch is a legacy compatibility surface and stores each `doc`
+as provided rather than as a v1 encrypted envelope. Do not upload raw health or
+other sensitive content through it unless that storage exposure is acceptable
+for your threat model. New sensitive-signal integrations should use encrypted
+`context_snapshot` envelopes.
+
+## App-open shortcut
+
+`GET /v1/perception/app_open` is a compatibility endpoint with a write side
+effect. This is an important exception to the usual assumption that GET is
+read-only.
+
+```http
+GET /v1/perception/app_open?app=Notes&category=productivity&ts=1783978500.125 HTTP/1.1
+Host: api.feedling.app
+X-API-Key: YOUR_FEEDLING_API_KEY
+```
+
+```json
+{
+  "status": "ok",
+  "app": "Notes",
+  "category": "productivity",
+  "ts": 1783978500.125
+}
+```
+
+Do not retry it blindly after an ambiguous timeout; a retry can append a second
+usage event.
+
+## Encrypted photo flow
+
+Photo pixels must be encrypted before upload. The main API stores ciphertext and
+metadata; it does not decode the image.
+
+```http
+POST /v1/perception/photo/evaluate HTTP/1.1
+Host: api.feedling.app
+Content-Type: application/json
+X-API-Key: YOUR_FEEDLING_API_KEY
+
+{
+  "metadata": {
+    "has_faces": false,
+    "face_count": 0,
+    "scene_hint": "food",
+    "scene_confidence": 0.93,
+    "time_of_day": "evening",
+    "is_burst": false,
+    "is_indoor": true,
+    "has_text_block": false,
+    "is_screenshot": false
+  },
+  "content_envelope": {
+    "v": 1,
+    "id": "photo_01J2PHOTO123",
+    "body_ct": "BASE64_IMAGE_CIPHERTEXT",
+    "nonce": "BASE64_NONCE",
+    "K_user": "BASE64_KEY_WRAPPED_TO_USER",
+    "K_enclave": "BASE64_KEY_WRAPPED_TO_ENCLAVE",
+    "enclave_pk_fpr": "ENCLAVE_PUBLIC_KEY_FINGERPRINT",
+    "visibility": "shared",
+    "owner_user_id": "usr_0123456789abcdef"
+  },
+  "meta_envelope": {
+    "v": 1,
+    "id": "photo_meta_01J2PHOTO123",
+    "body_ct": "BASE64_PRIVATE_METADATA_CIPHERTEXT",
+    "nonce": "BASE64_NONCE",
+    "K_user": "BASE64_KEY_WRAPPED_TO_USER",
+    "K_enclave": "BASE64_KEY_WRAPPED_TO_ENCLAVE",
+    "visibility": "shared",
+    "owner_user_id": "usr_0123456789abcdef"
+  }
+}
+```
+
+```json
+{
+  "photo_id": "photo_01J2PHOTO123",
+  "metadata": {
+    "has_faces": false,
+    "face_count": 0,
+    "scene_hint": "food",
+    "scene_confidence": 0.93,
+    "time_of_day": "evening",
+    "is_burst": false,
+    "is_indoor": true,
+    "has_text_block": false,
+    "is_screenshot": false,
+    "place_label": null
+  },
+  "usable": true,
+  "sensitive": false,
+  "status": "stored"
+}
+```
+
+`scene_hint` and `is_screenshot` influence the returned `sensitive` metadata;
+they are not a storage-denial gate. The request parser still accepts
+`exif_gps` for legacy compatibility, but new clients should not upload raw EXIF
+coordinates. If location context is needed, use the encrypted sensitive-signal
+flow instead.
+
+List confirmed photo metadata:
+
+```http
+GET /v1/perception/photos?limit=20 HTTP/1.1
+Host: api.feedling.app
+X-API-Key: YOUR_FEEDLING_API_KEY
+```
+
+```json
+{
+  "photos": [
+    {
+      "photo_id": "photo_01J2PHOTO123",
+      "metadata": {
+        "has_faces": false,
+        "face_count": 0,
+        "scene_hint": "food",
+        "scene_confidence": 0.93,
+        "time_of_day": "evening",
+        "is_burst": false,
+        "is_indoor": true,
+        "has_text_block": false,
+        "is_screenshot": false,
+        "place_label": null
+      }
+    }
+  ]
+}
+```
+
+Fetch the pointer required for authorized decryption:
+
+```http
+GET /v1/perception/photo/photo_01J2PHOTO123/content HTTP/1.1
+Host: api.feedling.app
+X-API-Key: YOUR_FEEDLING_API_KEY
+```
+
+```json
+{
+  "photo_id": "photo_01J2PHOTO123",
+  "frame_id": "photo_01J2PHOTO123",
+  "metadata": {
+    "has_faces": false,
+    "face_count": 0,
+    "scene_hint": "food",
+    "scene_confidence": 0.93,
+    "time_of_day": "evening",
+    "is_burst": false,
+    "is_indoor": true,
+    "has_text_block": false,
+    "is_screenshot": false,
+    "place_label": null
+  },
+  "decrypt_path": "/v1/screen/frames/photo_01J2PHOTO123/decrypt",
+  "meta_envelope": {
+    "v": 1,
+    "id": "photo_meta_01J2PHOTO123",
+    "body_ct": "BASE64_PRIVATE_METADATA_CIPHERTEXT",
+    "nonce": "BASE64_NONCE",
+    "K_user": "BASE64_KEY_WRAPPED_TO_USER",
+    "K_enclave": "BASE64_KEY_WRAPPED_TO_ENCLAVE",
+    "visibility": "shared",
+    "owner_user_id": "usr_0123456789abcdef"
+  }
+}
+```
+
+The `decrypt_path` is user-scoped and must be called with an authorized
+credential. It is not a public object URL.

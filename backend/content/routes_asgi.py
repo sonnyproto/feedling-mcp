@@ -8,9 +8,9 @@ delegates to the framework-neutral ``content.content_core`` so the response
 bodies/bytes are byte-identical to Flask's. ``/healthz`` is intentionally NOT
 here — it is already served by ``asgi/health.py``.
 
-Auth/scope: the Flask routes gate on ``auth.require_user()`` only — none call
-``runtime_auth.authorize_scope(...)`` — so there is deliberately NO
-``require_scope`` here; adding one would diverge from the Flask surface.
+Auth/scope: ordinary content routes accept either authenticated credential.
+``account/reset`` is API-key-only because a short-lived hosted runtime must not
+be able to delete the account or invalidate every long-lived credential.
 
 E2E boundary: chat / memory / identity / frame ``content`` fields are v1 E2E
 envelopes, never decrypted server-side. ``export`` returns the stored ciphertext
@@ -37,7 +37,7 @@ from fastapi.responses import JSONResponse, Response
 from accounts import auth_core
 from accounts.auth_core import AuthResult
 from asgi import threadpool
-from asgi.deps import require_auth
+from asgi.deps import require_api_key, require_auth
 from asgi import http as asgi_http
 from content import content_core
 
@@ -83,7 +83,7 @@ async def content_export(auth: AuthResult = Depends(require_auth)):
 
 
 @router.post("/v1/account/reset")
-async def account_reset(request: Request, auth: AuthResult = Depends(require_auth)):
+async def account_reset(request: Request, auth: AuthResult = Depends(require_api_key)):
     payload = (await asgi_http.read_json_silent(request)) or {}
     body, status = await threadpool.run_db(
         content_core.account_reset,

@@ -22,10 +22,12 @@ from __future__ import annotations
 import importlib
 
 from fastapi import FastAPI
+from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
 from asgi import health, middleware
 from asgi.lifespan import lifespan
+from asgi.settings import settings
 
 # Domain packages exposing register_asgi(app), the ASGI counterpart of app.py's
 # pkg.register(app). Added as each package's routes_asgi.py lands (plan §5.3).
@@ -69,6 +71,42 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
 # log middleware wraps it and records the final on-the-wire Content-Length /
 # Content-Encoding (starlette: last add_middleware = outermost).
 app.add_middleware(GZipMiddleware, minimum_size=500)
+
+# Permit the public documentation playground to call the API directly from a
+# browser.  Origins and request headers are deliberately explicit: CORS is a
+# browser access policy, not a substitute for the existing per-route auth.
+if settings.cors_allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(settings.cors_allowed_origins),
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "If-None-Match",
+            "Range",
+            "X-API-Key",
+            "X-Byte-End",
+            "X-Byte-Start",
+            "X-Ciphertext-SHA256",
+            "X-Content-SHA256",
+            "X-Envelope-Meta",
+            "X-Feedling-Consumer",
+            "X-Feedling-Consumer-Commit",
+            "X-Feedling-Consumer-Id",
+            "X-Feedling-Consumer-Version",
+            "X-Feedling-Runtime-Token",
+        ],
+        expose_headers=[
+            "Accept-Ranges",
+            "Content-Disposition",
+            "Content-Range",
+            "ETag",
+            "X-Request-Id",
+        ],
+        max_age=600,
+    )
 
 # Outermost: structured access log + ?key= redaction + cancelled-request lines.
 app.add_middleware(middleware.AccessLogMiddleware)
