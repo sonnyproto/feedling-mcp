@@ -243,18 +243,27 @@ def _is_not_found(e) -> bool:
 
 
 # --------------------------------------------------------------------------- #
-# Chat file bodies — heavy content_type="file" ciphertext offloaded off the
-# chat_messages row, mirroring the frame offload above. Its own bucket so it
-# never collides with frames or the WAL-G backup bucket. Target bucket is
-# ``io-user-attachments`` (reuses the existing R2_* credentials — no new key
-# needed); set ``R2_CHAT_FILES_BUCKET=io-user-attachments`` to enable. Until that
-# env is set, ``chat_files_enabled()`` is False and db.chat_append/chat_load keep
-# the full body inline in Postgres, exactly as before — a no-op until enabled.
-# No default is baked in on purpose: enabling is an explicit, one-way switch
-# (once pointer rows exist, removing the env makes those files unreadable).
+# Chat message bodies — heavy ciphertext offloaded off the chat_messages row,
+# mirroring the frame offload above. Its own bucket so it never collides with
+# frames or the WAL-G backup bucket. Target bucket is ``io-user-attachments``
+# (reuses the existing R2_* credentials — no new key needed); set
+# ``R2_CHAT_FILES_BUCKET=io-user-attachments`` to enable. Until that env is set,
+# ``chat_files_enabled()`` is False and db.chat_append/chat_load keep the full
+# body inline in Postgres, exactly as before — a no-op until enabled. No default
+# is baked in on purpose: enabling is an explicit, one-way switch (once pointer
+# rows exist, removing the env makes those bodies unreadable).
+#
+# Two prefixes, one bucket: images are separated from files so they can carry
+# their own lifecycle rule / usage accounting (they dwarf files in both count and
+# bytes). The prefix is chosen ONCE, at write time, and the resulting key is
+# persisted on the row as ``body_key``. Reads and deletes take that key verbatim
+# and never recompute it — so the layout can change again without stranding a
+# single historical object.
 # --------------------------------------------------------------------------- #
 
 _CHAT_KEY_PREFIX = "chatfiles"
+_CHAT_IMAGE_KEY_PREFIX = "chatimages"
+_CHAT_KEY_PREFIXES = (_CHAT_KEY_PREFIX, _CHAT_IMAGE_KEY_PREFIX)
 
 
 def _chat_files_bucket() -> str:
@@ -266,16 +275,19 @@ def chat_files_enabled() -> bool:
     return bool(_endpoint() and _access_key() and _secret_key() and _chat_files_bucket())
 
 
-def chat_file_key(user_id: str, msg_id: str) -> str:
-    return f"{_CHAT_KEY_PREFIX}/{user_id}/{msg_id}"
+def chat_body_key(user_id: str, msg_id: str, content_type: str = "file") -> str:
+    """The R2 key a body of this content_type is written under. Write-side only —
+    readers/deleters use the ``body_key`` stored on the row."""
+    prefix = _CHAT_IMAGE_KEY_PREFIX if content_type == "image" else _CHAT_KEY_PREFIX
+    return f"{prefix}/{user_id}/{msg_id}"
 
 
-def put_chat_file_body(user_id: str, msg_id: str, body_ct_b64: str) -> str:
-    """Upload the decoded ciphertext bytes; return the R2 object key.
+def put_chat_body(user_id: str, msg_id: str, body_ct_b64: str, content_type: str = "file") -> str:
+    """Upload the decoded ciphertext bytes; return the R2 object key to persist.
 
     Raises on failure so the caller (db.chat_append) can fall back to inline
     ``doc`` storage rather than persist a pointer to a missing object."""
-    key = chat_file_key(user_id, msg_id)
+    key = chat_body_key(user_id, msg_id, content_type)
     raw = base64.b64decode(body_ct_b64)
     _client().put_object(
         Bucket=_chat_files_bucket(),
@@ -286,49 +298,75 @@ def put_chat_file_body(user_id: str, msg_id: str, body_ct_b64: str) -> str:
     return key
 
 
-def get_chat_file_body(user_id: str, msg_id: str) -> str | None:
-    """Fetch the object and re-encode to the original base64 ``body_ct``.
+def chat_key_owned_by(key: str, user_id: str) -> bool:
+    """True only when ``key`` is one this user's own rows could have written, i.e.
+    it sits under an allowed prefix AND that prefix's owner segment is ``user_id``.
 
-    Returns None if the object is missing or the fetch fails (the caller then
-    surfaces an absent body rather than crashing the chat read path)."""
-    key = chat_file_key(user_id, msg_id)
+    Taking the key from the row (rather than recomputing it) is what lets an older
+    key layout still resolve — but it also means the key is now DATA, and data can
+    be wrong: a bad migration, a manual repair, or a polluted row could carry
+    another user's key, and a verbatim fetch would then hand this user someone
+    else's ciphertext (and a verbatim delete would destroy someone else's object).
+    Both stay inside the owner's own prefix. Enforced here, at the only door to the
+    bucket, so no caller can forget it."""
+    if not key or not user_id:
+        return False
+    return any(key.startswith(f"{p}/{user_id}/") for p in _CHAT_KEY_PREFIXES)
+
+
+def get_chat_body(key: str, user_id: str) -> str | None:
+    """Fetch the object at ``key`` (the row's ``body_key``, owned by ``user_id``)
+    and re-encode to the original base64 ``body_ct``.
+
+    Returns None if the key isn't this user's, the object is missing, or the fetch
+    fails (the caller then surfaces an absent body rather than crashing the read)."""
+    if not chat_key_owned_by(key, user_id):
+        if key:
+            log.error("[r2] get_chat_body refused foreign key %s for user %s", key, user_id)
+        return None
     try:
         resp = _client().get_object(Bucket=_chat_files_bucket(), Key=key)
     except Exception as e:  # noqa: BLE001
         if _is_not_found(e):
             return None
-        log.error("[r2] get_chat_file_body(%s) failed: %s", key, e)
+        log.error("[r2] get_chat_body(%s) failed: %s", key, e)
         return None
     raw = resp["Body"].read()
     return base64.b64encode(raw).decode("ascii")
 
 
-def delete_chat_file_body(user_id: str, msg_id: str) -> None:
-    key = chat_file_key(user_id, msg_id)
+def delete_chat_body(key: str, user_id: str) -> None:
+    """Delete the object at ``key`` (the row's ``body_key``, owned by ``user_id``)."""
+    if not chat_key_owned_by(key, user_id):
+        if key:
+            log.error("[r2] delete_chat_body refused foreign key %s for user %s", key, user_id)
+        return
     try:
         _client().delete_object(Bucket=_chat_files_bucket(), Key=key)
     except Exception as e:  # noqa: BLE001
-        log.error("[r2] delete_chat_file_body(%s) failed: %s", key, e)
+        log.error("[r2] delete_chat_body(%s) failed: %s", key, e)
 
 
 def delete_user_chat_files(user_id: str) -> None:
-    """Delete every object under ``chatfiles/<user_id>/`` (account reset/clear)."""
-    prefix = f"{_CHAT_KEY_PREFIX}/{user_id}/"
+    """Delete every chat body this user owns — BOTH prefixes (account reset/clear).
+    Missing either one would strand ciphertext for a deleted account."""
     try:
         client = _client()
         bucket = _chat_files_bucket()
-        token = None
-        while True:
-            kwargs = {"Bucket": bucket, "Prefix": prefix}
-            if token:
-                kwargs["ContinuationToken"] = token
-            resp = client.list_objects_v2(**kwargs)
-            objs = [{"Key": c["Key"]} for c in resp.get("Contents", [])]
-            if objs:
-                client.delete_objects(Bucket=bucket, Delete={"Objects": objs})
-            if not resp.get("IsTruncated"):
-                break
-            token = resp.get("NextContinuationToken")
+        for prefix_root in _CHAT_KEY_PREFIXES:
+            prefix = f"{prefix_root}/{user_id}/"
+            token = None
+            while True:
+                kwargs = {"Bucket": bucket, "Prefix": prefix}
+                if token:
+                    kwargs["ContinuationToken"] = token
+                resp = client.list_objects_v2(**kwargs)
+                objs = [{"Key": c["Key"]} for c in resp.get("Contents", [])]
+                if objs:
+                    client.delete_objects(Bucket=bucket, Delete={"Objects": objs})
+                if not resp.get("IsTruncated"):
+                    break
+                token = resp.get("NextContinuationToken")
     except Exception as e:  # noqa: BLE001
         log.error("[r2] delete_user_chat_files(%s) failed: %s", user_id, e)
 

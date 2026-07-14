@@ -2306,6 +2306,14 @@ def chat_load(user_id: str) -> list[dict]:
         return []
 
 
+# Content types whose body_ct is heavy enough to live in R2 rather than inline in
+# the chat_messages row. Images join files here: a single photo's ciphertext runs
+# 1-2MB, which TOASTs the row and is then carried through every WAL record, WAL-G
+# backup, and TEE mirror/re-encrypt pass. The read side is content-type agnostic
+# (a pointer is anything with body_key), so adding a type here is write-side only.
+_R2_OFFLOAD_CONTENT_TYPES = ("file", "image")
+
+
 def _is_chat_file_pointer(doc) -> bool:
     return isinstance(doc, dict) and bool(doc.get("body_key")) and doc.get("body_ct") is None
 
@@ -2320,10 +2328,14 @@ def hydrate_chat_file_body(user_id: str, doc: dict) -> dict:
 
     Call this ONLY at exits that actually deliver a body (poll delivery, a
     history page that includes the body, single message-body fetch) — never in
-    bulk load — so a leaked/large file is fetched once, on demand."""
+    bulk load — so a leaked/large file is fetched once, on demand.
+
+    The fetch uses the row's OWN ``body_key`` rather than recomputing one, so a
+    row written under an older key layout still resolves. The key is data, though,
+    so object_storage refuses one that isn't under this user's own prefix."""
     if not _is_chat_file_pointer(doc) or not object_storage.chat_files_enabled():
         return doc
-    body = object_storage.get_chat_file_body(user_id, str(doc.get("id") or ""))
+    body = object_storage.get_chat_body(str(doc.get("body_key") or ""), user_id)
     if body is None:
         return doc
     out = {k: v for k, v in doc.items() if k != "body_key"}
@@ -2335,18 +2347,18 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
     """Insert one chat message then trim to the newest ``max_messages`` rows,
     mirroring the in-memory ring buffer. Idempotent on msg_id.
 
-    A heavy ``content_type="file"`` body_ct is offloaded to R2 when configured
-    (``object_storage.chat_files_enabled()``); the row then keeps only the
-    envelope metadata plus a ``body_key`` pointer, and ``chat_load`` reconstitutes
-    ``body_ct`` from R2 transparently. Falls back to inline storage when R2 is
-    unconfigured OR the upload fails. Crash-safe, same ordering as frame_upsert:
-    the row is written inline (readable, no pointer) BEFORE the object exists and
-    flipped to the pointer shape only AFTER the upload succeeds — a crash never
-    leaves a pointer to a missing object."""
+    A heavy body_ct (``_R2_OFFLOAD_CONTENT_TYPES``: file, image) is offloaded to
+    R2 when configured (``object_storage.chat_files_enabled()``); the row then
+    keeps only the envelope metadata plus a ``body_key`` pointer, and
+    ``chat_load`` reconstitutes ``body_ct`` from R2 transparently. Falls back to
+    inline storage when R2 is unconfigured OR the upload fails. Crash-safe, same
+    ordering as frame_upsert: the row is written inline (readable, no pointer)
+    BEFORE the object exists and flipped to the pointer shape only AFTER the
+    upload succeeds — a crash never leaves a pointer to a missing object."""
     offload = (
         object_storage.chat_files_enabled()
         and isinstance(doc, dict)
-        and doc.get("content_type") == "file"
+        and doc.get("content_type") in _R2_OFFLOAD_CONTENT_TYPES
         and doc.get("body_ct") is not None
     )
     trimmed_docs: list = []
@@ -2377,17 +2389,18 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
             # 2) upload OUTSIDE the txn; on failure the inline row stays readable.
             try:
                 body_ct_len = len(doc["body_ct"])
-                object_storage.put_chat_file_body(user_id, msg_id, doc["body_ct"])
+                # The key comes back from the upload rather than being recomputed —
+                # the row can then never point somewhere the object isn't.
+                key = object_storage.put_chat_body(
+                    user_id, msg_id, doc["body_ct"], str(doc.get("content_type") or "file")
+                )
                 # 3) object exists → flip the row to the pointer shape as the last
                 #    durable step. ATOMIC on the CURRENT row (not a stale snapshot):
                 #    drop only body_ct and add the pointer keys, so any reply/claim
                 #    metadata another worker merged into `doc` during the upload is
                 #    preserved. The `? 'body_ct'` guard makes it a no-op if the row
                 #    was already flipped (idempotent, avoids a double-flip race).
-                pointer = {
-                    "body_key": object_storage.chat_file_key(user_id, msg_id),
-                    "body_ct_len": body_ct_len,
-                }
+                pointer = {"body_key": key, "body_ct_len": body_ct_len}
                 with get_pool().connection() as conn:
                     conn.execute(
                         "UPDATE chat_messages SET doc = (doc - 'body_ct') || %s "
@@ -2397,11 +2410,13 @@ def chat_append(user_id: str, msg_id: str, ts: float, doc: dict, max_messages: i
             except Exception as e:  # noqa: BLE001
                 log.error("[db] chat_append(%s,%s) R2 offload failed, left inline: %s",
                           user_id, msg_id, e)
-        # Best-effort: drop R2 objects for any offloaded file rows just trimmed.
+        # Best-effort: drop R2 objects for any offloaded rows just trimmed. Driven by
+        # the row's own body_key (not content_type, not a recomputed key) — a pointer
+        # row always has exactly one object to reclaim, whatever type/layout wrote it.
         if trimmed_docs and object_storage.chat_files_enabled():
             for d in trimmed_docs:
-                if isinstance(d, dict) and d.get("body_key") and d.get("content_type") == "file":
-                    object_storage.delete_chat_file_body(user_id, str(d.get("id") or ""))
+                if isinstance(d, dict) and d.get("body_key"):
+                    object_storage.delete_chat_body(str(d["body_key"]), user_id)
     except Exception as e:
         log.error("[db] chat_append(%s,%s) failed: %s", user_id, msg_id, e)
         return
@@ -2563,15 +2578,15 @@ def chat_delete(user_id: str, msg_id: str) -> bool:
     ])
     if row is None:
         return False
-    # Drop the offloaded R2 body if this was a file message.
+    # Drop the offloaded R2 body if this row was a pointer. Driven by the row's own
+    # body_key — see the trim path in chat_append.
     doc = row[0]
     if (
         object_storage.chat_files_enabled()
         and isinstance(doc, dict)
         and doc.get("body_key")
-        and doc.get("content_type") == "file"
     ):
-        object_storage.delete_chat_file_body(user_id, str(doc.get("id") or msg_id))
+        object_storage.delete_chat_body(str(doc["body_key"]), user_id)
     return True
 
 

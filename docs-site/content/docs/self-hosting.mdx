@@ -97,6 +97,7 @@ these settings:
 | `FEEDLING_PUBLIC_BASE_URL` | Set to the externally reachable HTTPS base URL. |
 | `FEEDLING_CORS_ALLOWED_ORIGINS` | Comma-separated exact browser origins. Leave empty if no browser client needs direct API access. Never use `*`. |
 | `FEEDLING_DATA_DIR` | Non-database local material such as push keys and residual object files. Protect and back it up according to enabled features. |
+| Object-storage variables | Optional, and a one-way switch once used. When configured, heavy ciphertext—screen frames, and Chat image and file bodies—is stored as objects and the database row keeps only a pointer. Leaving them unset keeps every body inline in PostgreSQL. Turning them off, repointing them, or scoping the credential too narrowly **after** pointer rows exist makes those bodies unreadable: the row no longer carries the ciphertext. Treat the store as part of the primary data set, not as a cache. |
 | APNs variables | Optional and secret. Required only for Apple push/Live Activity. |
 
 Worker count must be sized against PostgreSQL connection capacity. Each backend

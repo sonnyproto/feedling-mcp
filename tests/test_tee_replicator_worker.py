@@ -327,8 +327,8 @@ def test_offloaded_file_row_hydrated_from_r2_then_replicated(backend_env, monkey
     _insert_chat_file_pointer(uid, "filemsg", 20.0)
 
     monkeypatch.setattr(object_storage, "chat_files_enabled", lambda: True)
-    monkeypatch.setattr(object_storage, "get_chat_file_body",
-                        lambda u, m: "FILECT" if (u, m) == (uid, "filemsg") else None)
+    monkeypatch.setattr(object_storage, "get_chat_body",
+                        lambda key, u: "FILECT" if key == f"chatfiles/{uid}/filemsg" else None)
 
     report = worker.run_table("chat_messages", qps=1000)
 
@@ -356,7 +356,7 @@ def test_offloaded_file_row_hydration_failure_freezes_cursor(backend_env, monkey
     _insert_chat(uid, "c", 30.0, "CCC")
 
     monkeypatch.setattr(object_storage, "chat_files_enabled", lambda: True)
-    monkeypatch.setattr(object_storage, "get_chat_file_body", lambda u, m: None)
+    monkeypatch.setattr(object_storage, "get_chat_body", lambda key, u: None)
 
     def _strict(_user_id):
         def decrypt(envelope, purpose):

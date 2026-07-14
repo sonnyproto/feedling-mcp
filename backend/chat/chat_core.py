@@ -252,6 +252,9 @@ def history(store: UserStore, *, query, user_agent: str, remote_addr: str) -> tu
         has_more_newer = False
         page_mode = "latest"
 
+    # Pull this page's R2-offloaded bodies concurrently before rendering; without
+    # it each one costs a serial round-trip inside _chat_history_item.
+    msgs = chat_service.hydrate_history_page(msgs, include_image_body=include_image_body)
     out = [chat_service._chat_history_item(m, include_image_body=include_image_body) for m in msgs]
     omitted_bodies = sum(1 for m in out if m.get("body_omitted"))
     omitted_image_bodies = sum(

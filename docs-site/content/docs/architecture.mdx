@@ -98,6 +98,14 @@ offloaded to object storage without giving that store the content key. The
 authenticated screen WebSocket is an ingest path only—Chat uses HTTP send,
 history, and long polling.
 
+Heavy Chat bodies—image and file ciphertext—can be offloaded the same way. The
+message row keeps its envelope metadata plus a pointer, and the ciphertext is
+re-fetched from object storage only at the exits that actually deliver a body.
+The object store receives ciphertext and never receives the content key, so this
+does not move the decrypt boundary. It does make the object store part of the
+read path: a body that is unreachable there degrades that one message rather
+than the conversation.
+
 The [Perception workflow](/docs/workflows/perception) identifies the encrypted,
 plaintext, and legacy compatibility branches. Clients should choose the
 encrypted branch for new sensitive integrations rather than assuming every

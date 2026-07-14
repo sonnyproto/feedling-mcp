@@ -5,6 +5,7 @@ import os
 import re
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 
 import db
@@ -63,6 +64,9 @@ def _sanitize_provider_reasoning_text(text: str) -> str:
 
 
 CHAT_HISTORY_INLINE_BODY_CT_MAX = int(os.environ.get("FEEDLING_CHAT_HISTORY_INLINE_BODY_CT_MAX", "262144"))
+# Fan-out for the per-page R2 body pre-fetch (hydrate_history_page). Bounded so a
+# page of images can't open an unbounded number of sockets from a request thread.
+_HISTORY_HYDRATE_MAX_WORKERS = int(os.environ.get("FEEDLING_CHAT_HISTORY_HYDRATE_WORKERS", "8"))
 # With the lost-turn redelivery backstop live, an expired claim means a second
 # agent turn for the same message (double provider burn — the already-answered
 # 409 only blocks the double APPEND), so the TTL must sit above the longest
@@ -266,6 +270,65 @@ def _chat_plaintext_thinking_extra_for_store(store: UserStore, payload: dict) ->
     return extra
 
 
+def _is_r2_pointer(m: dict) -> bool:
+    """A row whose heavy body_ct lives in R2 (see db._is_chat_file_pointer)."""
+    return bool(m.get("body_key")) and m.get("body_ct") is None
+
+
+def _body_omit_decision(m: dict, *, include_image_body: bool) -> tuple[bool, str, int]:
+    """(omit?, reason, body_ct_len) for one message. Shared by the page pre-fetch
+    and the item renderer so the two can never disagree about which bodies this
+    page delivers. A pointer's length is read off the row (``body_ct_len``), so
+    the omit path can report a size without fetching from R2."""
+    is_pointer = _is_r2_pointer(m)
+    body_ct_len = int(m.get("body_ct_len") or 0) if is_pointer else len(m.get("body_ct") or "")
+    if not include_image_body:
+        if m.get("content_type", "text") == "image":
+            return True, "image_body", body_ct_len
+        if body_ct_len > CHAT_HISTORY_INLINE_BODY_CT_MAX:
+            return True, "large_body_ct", body_ct_len
+    return False, "", body_ct_len
+
+
+def hydrate_history_page(msgs: list[dict], *, include_image_body: bool) -> list[dict]:
+    """Pre-fetch — CONCURRENTLY — the R2 bodies this page will actually deliver.
+
+    Images live in R2 alongside files, so a page carrying N of them would
+    otherwise cost N SERIAL round-trips (~50-200ms each) inside the request, all
+    from ``_chat_history_item``'s lazy hydrate. Bodies this page omits are never
+    fetched. The lazy hydrate stays in place as the correctness backstop: it
+    no-ops on a doc this pre-fetch already filled, and still covers a row that
+    failed here (or any caller that skips this function)."""
+    targets = [
+        i for i, m in enumerate(msgs)
+        if _is_r2_pointer(m)
+        and not _body_omit_decision(m, include_image_body=include_image_body)[0]
+    ]
+    if len(targets) < 2:
+        return msgs  # 0 or 1 body → the serial lazy path is already optimal
+
+    out = list(msgs)
+    workers = min(len(targets), _HISTORY_HYDRATE_MAX_WORKERS)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(
+                db.hydrate_chat_file_body,
+                str(msgs[i].get("owner_user_id") or ""),
+                dict(msgs[i]),
+            ): i
+            for i in targets
+        }
+        for fut in as_completed(futures):
+            i = futures[fut]
+            try:
+                out[i] = fut.result()
+            except Exception as e:  # noqa: BLE001
+                # Leave the pointer in place — the lazy hydrate downstream retries
+                # it serially, and a genuinely absent body degrades that one item.
+                print(f"[chat/history] r2_prefetch_failed id={msgs[i].get('id')} err={e}")
+    return out
+
+
 def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
     item = dict(m)
     # iOS ChatMessage.content is non-optional. v1 envelope messages are
@@ -275,20 +338,10 @@ def _chat_history_item(m: dict, *, include_image_body: bool = True) -> dict:
     item.setdefault("content", "")
 
     content_type = item.get("content_type", "text")
-    # A file body may live in R2 (pointer: body_key set, body_ct absent). Use the
-    # length stored on the pointer so the omit path can report it without a fetch;
-    # only hydrate from R2 on the INCLUDE path below (never for an omitted body),
-    # so an iOS list load (include_image_body=false) never pulls file ciphertext.
-    is_pointer = bool(item.get("body_key")) and item.get("body_ct") is None
-    body_ct_len = int(item.get("body_ct_len") or 0) if is_pointer else len(item.get("body_ct") or "")
-    should_omit_body = False
-    body_omitted_reason = ""
-    if content_type == "image" and not include_image_body:
-        should_omit_body = True
-        body_omitted_reason = "image_body"
-    elif body_ct_len > CHAT_HISTORY_INLINE_BODY_CT_MAX and not include_image_body:
-        should_omit_body = True
-        body_omitted_reason = "large_body_ct"
+    is_pointer = _is_r2_pointer(item)
+    should_omit_body, body_omitted_reason, body_ct_len = _body_omit_decision(
+        item, include_image_body=include_image_body
+    )
 
     if should_omit_body:
         item["body_ct_len"] = body_ct_len

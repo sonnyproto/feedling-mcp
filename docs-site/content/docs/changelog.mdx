@@ -36,6 +36,23 @@ themselves add a backend endpoint or change production request handling.
   selection.
 - Add getting-started, authentication, and error-handling guides.
 
+### Storage and deployment
+
+- Heavy Chat **image** bodies are now offloaded to object storage alongside file
+  bodies, under a separate `chatimages/` key prefix so image retention and usage
+  can be governed on their own. The message row keeps envelope metadata plus a
+  pointer; the ciphertext is re-fetched only at the exits that deliver a body.
+  The request and response shapes are unchanged.
+- Operator impact: the chat object-storage bucket now backs image bodies too.
+  Disabling it, repointing it, or scoping its credential too narrowly **after**
+  pointer rows exist makes those image bodies unreadable, not just file bodies.
+  It is part of the primary data set and must be backed up with the database.
+- Image bodies written before this change remain inline in the database and keep
+  working. An offline backfill moves them; it is idempotent and safe to re-run.
+- Object reads and deletes are constrained to the requesting account's own key
+  prefix, so a malformed or hand-repaired pointer cannot reach another account's
+  ciphertext.
+
 ### Security
 
 - Browser API access is limited to the documentation site's exact configured
