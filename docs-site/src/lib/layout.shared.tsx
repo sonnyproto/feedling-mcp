@@ -1,37 +1,29 @@
 import type { BaseLayoutProps } from 'fumadocs-ui/layouts/shared';
 import { appName, gitConfig } from './shared';
 
-const logo = (
-  <svg
-    aria-label={appName}
-    className="size-5"
-    role="img"
-    viewBox="0 0 180 180"
-  >
-    <circle
-      cx="90"
-      cy="90"
-      fill="url(#feedling-icon-gradient)"
-      r="89"
-      stroke="var(--color-fd-primary)"
-      strokeWidth="1"
-    />
-    <defs>
-      <linearGradient id="feedling-icon-gradient" gradientTransform="rotate(45)">
-        <stop offset="45%" stopColor="var(--color-fd-background)" />
-        <stop offset="100%" stopColor="var(--color-fd-primary)" />
-      </linearGradient>
-    </defs>
-  </svg>
-);
+function FeedlingLogo() {
+  return (
+    <svg aria-hidden="true" className="size-5" focusable="false" viewBox="0 0 180 180">
+      <circle
+        cx="90"
+        cy="90"
+        fill="var(--color-fd-primary)"
+        r="89"
+        stroke="var(--color-fd-primary)"
+        strokeWidth="1"
+      />
+      <circle cx="65" cy="65" fill="var(--color-fd-background)" opacity="0.72" r="38" />
+    </svg>
+  );
+}
 
 export function baseOptions(): BaseLayoutProps {
   return {
     nav: {
       title: (
         <>
-          {logo}
-          <span className="font-medium max-md:hidden">{appName}</span>
+          <FeedlingLogo />
+          <span className="font-medium max-md:sr-only">{appName}</span>
         </>
       ),
     },

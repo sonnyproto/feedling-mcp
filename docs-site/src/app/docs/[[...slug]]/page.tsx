@@ -21,8 +21,9 @@ export default async function Page(props: PageProps<'/docs/[[...slug]]'>) {
 
   if (page.type === 'openapi') {
     return (
-      <DocsPage full>
-        <h1 className="text-[1.75em] font-semibold">{page.data.title}</h1>
+      <DocsPage toc={page.data.toc} full>
+        <DocsTitle>{page.data.title}</DocsTitle>
+        <DocsDescription>{page.data.description}</DocsDescription>
         <DocsBody>
           <OpenAPIPage {...page.data.getOpenAPIPageProps()} />
         </DocsBody>
