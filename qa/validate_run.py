@@ -39,7 +39,7 @@ REQUIRED_TRACE_STAGES = (
     "persistence",
     "delivery",
 )
-EXPECTED_RUNTIME = "db_action_v2"
+EXPECTED_RUNTIME = "hosted_resident"
 PASS = "PASS"
 PERSONA_FIXTURE_ID = "persona-import-v1"
 _SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
@@ -724,7 +724,7 @@ def _validate_orchestration_receipt(
     }:
         return ["trusted orchestration receipt shape is invalid"]
     errors: list[str] = []
-    if receipt.get("schema_version") != 2:
+    if receipt.get("schema_version") != 3:
         errors.append("trusted orchestration receipt schema is unsupported")
     launcher_id = receipt.get("launcher_id")
     if not isinstance(launcher_id, str) or not _SAFE_PATH_TOKEN_RE.fullmatch(
@@ -760,6 +760,9 @@ def _validate_orchestration_receipt(
             "stopped_at",
             "profile_result_sha256",
             "exec_events_sha256",
+            "cot_receipt_sha256",
+            "cot_delivery_status",
+            "cot_failure_code",
         }:
             errors.append("trusted orchestration receipt worker shape is invalid")
             continue
@@ -788,13 +791,24 @@ def _validate_orchestration_receipt(
         stopped = _parse_timestamp(row.get("stopped_at"))
         if started is None or stopped is None or stopped < started:
             errors.append("trusted orchestration receipt timestamps are invalid")
-        for field in ("profile_result_sha256", "exec_events_sha256"):
+        for field in (
+            "profile_result_sha256",
+            "exec_events_sha256",
+            "cot_receipt_sha256",
+        ):
             digest = row.get(field)
             if not isinstance(digest, str) or not _EVIDENCE_SHA256_RE.fullmatch(digest):
                 errors.append(
                     "trusted orchestration receipt content binding is invalid"
                 )
                 break
+        if (
+            row.get("cot_delivery_status") != "PASS"
+            or row.get("cot_failure_code") != "NONE"
+        ):
+            errors.append(
+                "trusted orchestration receipt COT lifecycle is invalid"
+            )
         profile_digest = row.get("profile_result_sha256")
         if isinstance(profile_digest, str) and _EVIDENCE_SHA256_RE.fullmatch(
             profile_digest
@@ -1775,7 +1789,7 @@ def validate_release(
 ) -> list[str]:
     """Return sanitized release-gate errors; an empty list means PASS."""
     if expected_runtime != EXPECTED_RUNTIME:
-        return ["expected runtime must be db_action_v2"]
+        return ["expected runtime must be hosted_resident"]
     if not _SHA_RE.fullmatch(str(expected_sha or "")):
         return ["expected deployment SHA is malformed"]
 

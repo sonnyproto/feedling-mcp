@@ -6,7 +6,7 @@
     "environment": "test",
     "base_url_env": "QA_FEEDLING_BASE_URL",
     "expected_deployment_sha_env": "QA_EXPECTED_DEPLOYMENT_SHA",
-    "expected_runtime": "db_action_v2",
+    "expected_runtime": "hosted_resident",
     "runtime_admin_token_env": "QA_TEST_ADMIN_TOKEN"
   },
   "execution": {

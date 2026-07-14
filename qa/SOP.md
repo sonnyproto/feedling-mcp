@@ -15,8 +15,8 @@ The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are requirements.
 - The system under test MUST be the deployed test endpoint named by
   `QA_FEEDLING_BASE_URL` and the expected deployment named by
   `QA_EXPECTED_DEPLOYMENT_SHA`.
-- Each synthetic account MUST be switched to, and independently verified as,
-  `db_action_v2` before chat begins.
+- Each synthetic account MUST independently read back `hosted_resident` with
+  runtime version `2` before chat begins.
 - Use one freshly provisioned synthetic account per profile. Never use a
   customer account.
 - Provider keys and the test admin token are consumed only by the deterministic
@@ -57,11 +57,43 @@ The launcher is not intelligent. It MUST:
    resume, send a follow-up turn, substitute a generic role, or omit a profile.
 4. Capture raw Codex JSON events and stderr only under a private,
    supervisor-denied quarantine root.
-5. Validate each final profile JSON against the profile-locked Structured
-   Outputs schema, bind its SHA-256 and root Codex thread ID into an owner-only
-   receipt, and copy only that validated JSON to a separate aggregation-input
-   root.
-6. Record exact start/stop timestamps, process exit code, attempt number, thread
+5. Require the trusted Codex event stream to contain a completed, scenario-bound
+   `command_execution` for every agent-driven live scenario P0-02 through
+   P0-11. The command must begin with the exact
+   `QA_SCENARIO_ID=P0-XX ` assignment; one command proves at most one scenario.
+   P0-01 provisioner/deployment evidence, the parent-owned P0-12 probe, and
+   P0-13 cleanup remain independently deterministic. Missing all tool use is
+   `AGENT_TOOL_USE_MISSING`; missing scenario-bound commands is
+   `AGENT_SCENARIO_TOOL_USE_MISSING`; either is a hard release failure.
+   P0-06 specifically requires exactly three ordered, successful,
+   phase-specific marker commands: `QA_SCENARIO_PHASE=CAPTURE`, `REVIEW`, then
+   `FINALIZE`. Use the exact commands embedded in the profile-agent prompt.
+   Capture and finalize directly invoke the checked-in Genesis tool; review
+   directly reads `$QA_WORK_ROOT/p0-06-private-evidence.json` in a separate
+   Codex tool call and aborts if the fixed judgment path already exists. The
+   semantic judgment has the fixed path
+   `$QA_WORK_ROOT/p0-06-semantic-judgment.json` and is written only after the
+   REVIEW output. A nonzero command, generic or extra marker,
+   duplicate/out-of-order phase, or worker-authored script that pre-fills an
+   all-true judgment before the evidence-review result is not semantic
+   qualification evidence.
+6. When each profile reaches P0-12, consume its fixed request marker, execute
+   `qa/cot_delivery_probe.py` in the trusted launcher process, and write the
+   authoritative receipt beneath the supervisor-owned worker-output root that
+   the profile permission explicitly denies. Publish only a sanitized facts
+   copy to the agent work root. Validate each final profile JSON against the
+   profile-locked Structured Outputs schema. Securely validate the private
+   P0-12 receipt and require its
+   request, turn, trace, counts, reasoning metadata, disclosure length, and
+   observable assertions to match the profile result. Missing, malformed,
+   failed, or mismatched COT evidence cannot be replaced by agent prose.
+7. Bind the validated result SHA-256, root Codex thread ID, event hash, and COT
+   receipt hash into an owner-only lifecycle receipt, and copy only validated
+   JSON to a separate aggregation-input root. A validated COT `FAIL` or
+   `UNVERIFIED` receipt remains preserved in this lifecycle evidence so the
+   final deterministic release gate can reject it; only missing, malformed, or
+   result-mismatched COT evidence aborts lifecycle construction.
+8. Record exact start/stop timestamps, process exit code, attempt number, thread
    and optional session ID, result/event hashes, and observed peak concurrency.
    The deterministic release gate rejects extra, missing, duplicate, retried,
    failed, reordered, or hash-mismatched workers.
@@ -81,14 +113,16 @@ exact two-phase existing-session flow:
 
 1. Run `distill-existing-session` (or
    `capture_existing_session_distill_evidence(...)`) with its one-row
-   `QA_PRIVATE_MANIFEST`, a private evidence path beneath its isolated
-   `TMPDIR`, and `QA_ARTIFACT_DIR` as the denied public-artifact boundary. The
-   agent may pass that boundary path to the helper but cannot read or write the
-   directory itself. This imports once, decrypts the live surfaces, writes a
-   `0600` private evidence file outside public artifacts, and returns its
-   SHA-256.
+   `QA_PRIVATE_MANIFEST`, the fixed private evidence path
+   `$QA_WORK_ROOT/p0-06-private-evidence.json`, and `QA_ARTIFACT_DIR` as the
+   denied public-artifact boundary. The agent may pass that boundary path to
+   the helper but cannot read or write the directory itself. This imports once,
+   decrypts the live surfaces, writes a `0600` private evidence file outside
+   public artifacts, and returns its SHA-256.
 2. Read that evidence, make the bounded semantic decisions, and write an exact
-   owner-mode `0600` judgment whose `evidence_sha256` equals the capture hash.
+   owner-mode `0600` judgment to
+   `$QA_WORK_ROOT/p0-06-semantic-judgment.json` whose `evidence_sha256` equals
+   the capture hash.
 3. Run `distill-existing-session-finalize` (or
    `finalize_existing_session_distill_acceptance(...)`) with those two paths.
    The deterministic finalizer verifies the hash/fixture/judgment contracts,
@@ -117,6 +151,14 @@ The agent MUST return one complete structured profile result. It may adapt a
 bounded diagnostic probe within that profile, inspect correlated traces, and
 make semantic persona/memory/reasoning judgments. It MUST NOT create public
 checkpoint files or launch another agent.
+
+The profile Codex process is the trusted semantic judge. Deterministic checks
+prove ordered successful evidence access, fixed-path judgment absence at the
+P0-06 REVIEW boundary, capture-hash/finalizer binding, and result contracts;
+they do not cryptographically prove the model's internal reasoning. A
+deliberately deceptive judge that prepares an alternate prefill and copies it
+after REVIEW is outside this trust model and would require a second independent
+judge or a different architecture.
 
 ### Qualification supervisor
 
@@ -183,8 +225,8 @@ response fragment inside an identifier or code field.
 
 Before enabling hosted chat, the worker MUST:
 
-1. Audit the provisioner's sanitized set/readback receipts for
-   `db_action_v2`.
+1. Audit the provisioner's authenticated runtime readback receipt for
+   `hosted_resident` with runtime version `2`.
 2. Independently correlate later chat/trace evidence with Runtime V2 when the
    deployed trace exposes that evidence.
 3. Record expected and observed runtime in the canonical profile result.
@@ -271,6 +313,25 @@ private chain-of-thought. For a locked profile with `reasoning_expected: true`:
   zero so diagnostic artifacts remain renderable. The deterministic release
   gate still requires the healthy values above for PASS; agents MUST NOT coerce
   observed failures into success-shaped evidence.
+- P0-12 MUST be driven exactly once by the deterministic launcher through
+  `qa/cot_delivery_probe.py`. The profile writes only the fixed
+  `$QA_WORK_ROOT/.cot-probe-request` marker and waits for the parent-authored
+  `$QA_WORK_ROOT/cot-delivery-facts.json` sanitized copy. The authoritative
+  receipt is written under the worker-output root, which the profile's
+  filesystem permission denies. The probe binds
+  `agent.model.call.done(trace_id=U) -> agent.reply(trace_id=U) ->
+  chat.response(trace_id=U, msg_id=R) -> history reply R`, then checks the
+  separately encrypted thinking envelope for that exact reply. The agent MUST
+  preserve a probe exit status `2` and its receipt as failure/unverified
+  evidence and MUST NOT hide it by sending another reasoning turn.
+- Workers MUST NOT invoke the probe. The launcher invokes it with the trusted
+  qualification Python after the deterministic preflight verifies that exact
+  interpreter inside the real worker permission profile before provisioning.
+- The trusted launcher validates and hashes the authoritative private COT
+  receipt. The profile
+  result's P0-12 request, turn, and trace IDs and bounded reasoning projection
+  MUST agree with that receipt. Raw reply, disclosure text, ciphertext, and raw
+  trace remain forbidden.
 
 Missing required reasoning evidence is a product failure when the trace proves it
 was dropped by Feedling; it is `BLOCKED_EVIDENCE` when the deployed system cannot
@@ -372,14 +433,46 @@ The overall result is `PASS` only when:
   terminal statuses and sum to eight;
 - all thirteen exact scenario IDs occur once for every profile;
 - all scenario and profile statuses are `PASS`;
-- observed runtime is `db_action_v2` for every profile;
+- observed runtime is `hosted_resident` for every profile;
 - expected and observed deployment identity agree;
 - every synthetic account is cleaned up;
+- every profile worker has at least one completed qualification-tool execution;
+- every private P0-12 receipt validates, matches its profile result, and proves
+  passing reasoning delivery;
 - every required artifact exists and validates; and
 - all redaction/security assertions pass.
 
 Any other result uses the highest-severity non-pass status found. Never report a
 green release gate from partial coverage.
+
+For the local adminless diagnostic only, `QA_QUALIFICATION_MODE=diagnostic`
+moves account reset out of the agent and into the deterministic parent. The
+profile must not call `/v1/account/reset`; it records cleanup as deferred and
+cannot release-pass. This prevents an already-deleted account from becoming an
+unverifiable `401` when the adminless parent performs its mandatory cleanup.
+
+The deterministic parent MUST NOT grant a local worker read access to the live
+source checkout. It MUST create an owner-only source snapshot, exclude every
+repo tree except `qa/`, `tools/provider_smoke/`, `tools/genesis_e2e.py`, and
+`backend/content_encryption.py`, and then exclude every `.env*` path plus the
+exact dotenv/OAuth sources, dependency caches, and qualification artifacts
+inside that allowlist. It MUST reject unsafe links or files and scan copied
+source and every public/private retained artifact against every provider or
+admin credential loaded from the dotenv, including unselected profile keys.
+Model IDs and base URLs are not secret needles. Workers read only the sanitized
+snapshot, so a repository-local `.env.test` remains usable without becoming
+model-readable.
+
+When that local worker does not pass, the deterministic parent retains only a
+bounded, owner-only debug quarantine. It copies worker outputs, worker scratch,
+and Codex session evidence; rejects unsafe files and files containing known
+credentials (including encoded or JSON-fragmented forms); never copies the
+provisioning/profile manifests; records a non-release debug manifest; and deletes
+the original run after account cleanup. If account cleanup itself fails, the
+original private run MUST be reduced to exactly one `0600` provisioning manifest
+inside its `0700` directory. The source snapshot, copied OAuth, worker/raw/auth
+material, profile manifests, and every other private path MUST be deleted.
+Neither retention path may be uploaded as a public artifact.
 
 ## 10. Explicitly out of scope for V1
 

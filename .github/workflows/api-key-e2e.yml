@@ -194,12 +194,11 @@ jobs:
             exit 1
           fi
 
-          printf '%s' "$QA_CODEX_AUTH_JSON_B64" | \
-            python qa/install_codex_auth.py --codex-home "$QA_CODEX_HOME"
-          unset QA_CODEX_AUTH_JSON_B64
-
+          # Validate the setup-python runtime boundary before decoding any
+          # long-lived OAuth material or provisioning a synthetic account.
           python_prefix="$(python -c 'import pathlib, sys; print(pathlib.Path(sys.prefix).resolve())')"
           python_base_prefix="$(python -c 'import pathlib, sys; print(pathlib.Path(sys.base_prefix).resolve())')"
+          python_executable="$(python -c 'import pathlib, sys; print(pathlib.Path(sys.executable).resolve())')"
           python qa/write_codex_config.py \
             --output "$QA_CODEX_HOME/config.toml" \
             --source-root "$GITHUB_WORKSPACE" \
@@ -215,8 +214,14 @@ jobs:
             --orchestration-receipt "$QA_ORCHESTRATION_RECEIPT" \
             --codex-model "$QA_CODEX_MODEL" \
             --allowed-host test-api.feedling.app \
+            --worker-python "$python_executable" \
+            --qualification-mode release \
             --runtime-read-root "$python_prefix" \
             --runtime-read-root "$python_base_prefix"
+
+          printf '%s' "$QA_CODEX_AUTH_JSON_B64" | \
+            python qa/install_codex_auth.py --codex-home "$QA_CODEX_HOME"
+          unset QA_CODEX_AUTH_JSON_B64
 
           env -i \
             HOME="$QA_SUPERVISOR_HOME" \
@@ -253,7 +258,8 @@ jobs:
             CODEX_HOME="$QA_CODEX_HOME" \
             LANG="C.UTF-8" \
             TMPDIR="$worker_tmp" \
-            "$codex_bin" sandbox -P feedling-e2e-official-deepseek \
+            "$codex_bin" sandbox -p profile_official_deepseek \
+              -P feedling-e2e-official-deepseek \
               --include-managed-config -C "$worker_work" -- \
               /bin/sh -eu -c '
                 test -r "$1"
@@ -285,7 +291,8 @@ jobs:
             CODEX_HOME="$QA_CODEX_HOME" \
             LANG="C.UTF-8" \
             TMPDIR="$worker_tmp" \
-            "$codex_bin" sandbox -P feedling-e2e-official-deepseek \
+            "$codex_bin" sandbox -p profile_official_deepseek \
+              -P feedling-e2e-official-deepseek \
               --include-managed-config -C "$worker_work" -- \
               /bin/sh -eu -c '
                 curl --silent --show-error --proto "=https" --max-redirs 0 \
@@ -302,6 +309,26 @@ jobs:
                   exit 1
                 fi
               '
+
+          # Prove the fixed interpreter survives the named profile's real shell
+          # policy and can import the deterministic COT probe before any account
+          # or provider credential is created.
+          env -i \
+            HOME="${QA_WORKER_ROOT}/profile_official_deepseek/home" \
+            PATH="$PATH" \
+            CODEX_HOME="$QA_CODEX_HOME" \
+            LANG="C.UTF-8" \
+            TMPDIR="$worker_tmp" \
+            "$codex_bin" sandbox -p profile_official_deepseek \
+              -P feedling-e2e-official-deepseek \
+              --include-managed-config -C "$worker_work" -- \
+              /bin/sh -eu -c '
+                test "$QA_PYTHON_BIN" = "$1"
+                test "$QA_QUALIFICATION_MODE" = "release"
+                exec "$QA_PYTHON_BIN" -I -B "$2" --help
+              ' feedling-worker-runtime-preflight \
+              "$python_executable" \
+              "$GITHUB_WORKSPACE/qa/cot_delivery_probe.py"
 
           # One real top-level profile run proves OAuth, strict config, profile
           # selection, and Structured Outputs before provider keys are touched.
@@ -481,7 +508,8 @@ jobs:
               CODEX_HOME="$QA_CODEX_HOME" \
               LANG="C.UTF-8" \
               TMPDIR="$own_tmp" \
-              "$CODEX_BIN" sandbox -P "feedling-e2e-${profile_id}" \
+              "$CODEX_BIN" sandbox -p "$agent_type" \
+                -P "feedling-e2e-${profile_id}" \
                 --include-managed-config -C "$own_work" -- \
                 /bin/sh -eu -c '
                   own="$1"
@@ -551,6 +579,7 @@ jobs:
             --run-id "$QA_RUN_ID" \
             --base-url https://test-api.feedling.app \
             --expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA" \
+            --worker-python "$(python -c 'import pathlib, sys; print(pathlib.Path(sys.executable).resolve())')" \
             --timeout-seconds 2400
 
       - name: Verify independent Codex worker lifecycle and canonical inputs
@@ -622,7 +651,7 @@ jobs:
           and every live worker remained at SHA ${QA_EXPECTED_DEPLOYMENT_SHA};
           set expected and observed backend/worker SHA to that exact value,
           environment test, base URL https://test-api.feedling.app, and runtime
-          db_action_v2.
+          hosted_resident.
 
           Set supervisor_count=1, configured concurrency=3, observed concurrency
           and each profile/worker assignment exactly from the trusted receipt.
@@ -648,7 +677,7 @@ jobs:
             QA_AGGREGATION_INPUT_ROOT="$QA_AGGREGATION_INPUT_ROOT" \
             QA_ORCHESTRATION_RECEIPT="$QA_ORCHESTRATION_RECEIPT" \
             QA_EXPECTED_DEPLOYMENT_SHA="$QA_EXPECTED_DEPLOYMENT_SHA" \
-            QA_EXPECTED_RUNTIME="db_action_v2" \
+            QA_EXPECTED_RUNTIME="hosted_resident" \
             QA_FEEDLING_BASE_URL="https://test-api.feedling.app" \
             "$CODEX_BIN" exec \
               --ignore-rules \
@@ -701,7 +730,7 @@ jobs:
             --orchestration-receipt "${{ steps.context.outputs.orchestration_receipt }}" \
             --deployment-receipt "${{ steps.context.outputs.pre_deployment_receipt }}" \
             --post-deployment-receipt "${{ steps.context.outputs.post_deployment_receipt }}" \
-            --expected-runtime db_action_v2 \
+            --expected-runtime hosted_resident \
             --expected-sha "$QA_EXPECTED_DEPLOYMENT_SHA"
 
       - name: Scan public artifacts for secrets and raw evidence

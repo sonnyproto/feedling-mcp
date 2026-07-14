@@ -188,7 +188,7 @@
         "expected_runtime": {
           "type": "string",
           "enum": [
-            "db_action_v2"
+            "hosted_resident"
           ]
         }
       }
@@ -333,7 +333,7 @@
         "expected_runtime": {
           "type": "string",
           "enum": [
-            "db_action_v2"
+            "hosted_resident"
           ]
         },
         "observed_runtime": {
@@ -342,7 +342,7 @@
             "null"
           ],
           "enum": [
-            "db_action_v2",
+            "hosted_resident",
             "resident_cli",
             null
           ]

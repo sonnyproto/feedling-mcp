@@ -43,11 +43,16 @@ def test_codex_preflight_installs_oauth_and_real_top_level_profile_config():
     )
     assert "qa/install_codex_auth.py" in preflight
     assert "qa/write_codex_config.py" in preflight
+    assert preflight.index("qa/write_codex_config.py") < preflight.index(
+        "qa/install_codex_auth.py"
+    )
     assert "--full-manifest" in preflight
     assert "--worker-output-root" in preflight
     assert "--aggregation-input-root" in preflight
     assert "--orchestration-receipt" in preflight
     assert "--runtime-read-root" in preflight
+    assert '--worker-python "$python_executable"' in preflight
+    assert "--qualification-mode release" in preflight
     assert "codex-cli 0.144.3" in preflight
     assert "persistent Codex auth is forbidden" in preflight
     assert "must run as an unprivileged user" in preflight
@@ -55,7 +60,11 @@ def test_codex_preflight_installs_oauth_and_real_top_level_profile_config():
     assert "vars.QA_CODEX_MODEL" in preflight
     assert "unset QA_CODEX_AUTH_JSON_B64" in preflight
     assert "mcp list --json" in preflight
-    assert "sandbox -P feedling-e2e-official-deepseek" in preflight
+    assert "sandbox -p profile_official_deepseek" in preflight
+    assert "-P feedling-e2e-official-deepseek" in preflight
+    assert 'test "$QA_PYTHON_BIN" = "$1"' in preflight
+    assert 'test "$QA_QUALIFICATION_MODE" = "release"' in preflight
+    assert 'exec "$QA_PYTHON_BIN" -I -B "$2" --help' in preflight
     assert "https://test-api.feedling.app/" in preflight
     assert "https://example.com/" in preflight
     assert "https://1.1.1.1/" in preflight
@@ -129,7 +138,8 @@ def test_manifest_isolation_is_probed_for_all_eight_profiles():
     assert "profiles=(" in isolation
     assert "agent_types=(" in isolation
     assert 'own_manifest="${QA_PROFILE_MANIFEST_DIR}/${profile_id}.json"' in isolation
-    assert 'sandbox -P "feedling-e2e-${profile_id}"' in isolation
+    assert 'sandbox -p "$agent_type"' in isolation
+    assert '-P "feedling-e2e-${profile_id}"' in isolation
     assert "stat -c" in isolation
     assert "os.O_WRONLY | os.O_APPEND" in isolation
     assert "denied_paths=(" in isolation
@@ -165,6 +175,7 @@ def test_deterministic_launcher_runs_exact_independent_profile_matrix():
     assert '--aggregation-input-root "$QA_AGGREGATION_INPUT_ROOT"' in workers
     assert "qa/schemas/codex-run-result.schema.json" in workers
     assert '--receipt "$QA_ORCHESTRATION_RECEIPT"' in workers
+    assert "--worker-python" in workers
     assert "--timeout-seconds 2400" in workers
     assert "timeout-minutes: 140" in workers
     assert "spawn_agent" not in workers

@@ -18,7 +18,7 @@ The workflow is deliberately split across explicit trust zones:
    recovery without accepting echoed credentials, enables user-scoped trace
    access, requires a server-side synthetic-account TTL/reaper before the first
    registration, and uses the test admin token to set and read back
-   `db_action_v2`. A present-but-expired provider key becomes a fixed-code
+   `hosted_resident` Runtime V2. A present-but-expired provider key becomes a fixed-code
    blocked row while provisioning continues through the other profiles, so a
    failed credential still produces a complete eight-row diagnostic matrix.
 3. The provisioner output is deterministically split into eight owner-only
@@ -28,10 +28,18 @@ The workflow is deliberately split across explicit trust zones:
    only its matching row and isolated home/temp/work roots; no process receives
    provider or admin credentials.
 4. Every profile agent returns one structured `profileResult`. Trusted launcher
-   code validates it against a profile-locked Structured Outputs schema, binds
-   its hash and root Codex thread ID into an owner-only lifecycle receipt, keeps
-   raw events/stderr quarantined, and copies only the validated JSON into a
-   separate aggregation-input directory.
+   code requires a completed command beginning with the exact
+   `QA_SCENARIO_ID=P0-XX` marker for every agent-driven scenario P0-02 through
+   P0-11 (with separate P0-06 capture, evidence-review, and finalization tool
+   calls), validates the result against a profile-locked Structured Outputs
+   schema, validates and binds the private P0-12 receipt to the result's exact
+   request/turn/trace IDs and bounded reasoning fields, and binds the result
+   hash, event hash, COT receipt hash, and root Codex thread ID into an
+   owner-only lifecycle receipt. Raw command text and events/stderr stay
+   quarantined; only validated JSON enters the separate aggregation-input
+   directory. A structurally valid COT product failure is preserved in the
+   receipt and artifacts for the deterministic final gate to reject rather than
+   being erased by an early launcher exception.
 5. A separate headless Codex qualification supervisor reads only those eight
    validated profile results and the trusted receipt. It preserves each profile
    judgment, computes the run summary and orchestration projection, and returns
@@ -72,6 +80,98 @@ The locked matrix is:
 - OpenRouter GLM
 - Kongbeiqie OpenAI-compatible relay
 
+## Run the currently deployed test build locally
+
+`run_local_diagnostic.py` is the operator path for testing the existing
+`https://test-api.feedling.app` deployment without changing the `test` branch,
+deploying another Feedling backend, or provisioning a special VPS. The headless
+Codex workers run on the operator's machine and use the existing ChatGPT OAuth
+session in `~/.codex/auth.json`. Provider keys remain confined to the
+deterministic provisioner and are never placed in a Codex prompt or worker
+environment.
+
+Before copying that OAuth bundle, the local driver treats PATH only as a package
+locator, derives the native binary from the pinned official npm layout, and
+verifies the exact platform package file set, ownership/modes, version, and
+whole-tree digest. It invokes the verified native binary rather than the PATH
+wrapper and rejects an installation beneath the checkout, run-private roots,
+OAuth directory, public artifacts, or system temporary directory. The first
+local operator slice pins Codex `0.144.3` on macOS arm64; `--codex-bin` can name
+that installation's npm wrapper or native binary explicitly, but cannot bypass
+the provenance check.
+
+The dotenv file must be an owner-only regular file:
+
+```sh
+chmod 600 /absolute/path/.env.test
+```
+
+A repository-local `.env.test` is supported, but the live checkout is never a
+Codex read root. Before configuring the workers, the deterministic parent makes
+an owner-only source snapshot containing only `qa/`, `tools/provider_smoke/`,
+`tools/genesis_e2e.py`, and `backend/content_encryption.py`. Within that
+allowlist it excludes `.env*`, dependency caches, prior qualification artifacts,
+and the exact dotenv and OAuth source paths. It also rejects any copied source
+file containing any provider or admin credential loaded from the dotenv,
+including credentials for profiles omitted from a subset run. Workers receive
+read access only to that sanitized snapshot.
+
+First prove that the pinned Codex CLI, copied OAuth session, model selection,
+isolated config, and one real headless `codex exec` invocation work. This step
+does not create Feedling users or call provider endpoints:
+
+```sh
+python3 qa/run_local_diagnostic.py \
+  --env-file /absolute/path/.env.test \
+  --candidate-sha <full-deployed-source-sha> \
+  --codex-model gpt-5.4 \
+  --profile official-gemini \
+  --preflight-only
+```
+
+Then remove `--preflight-only` to create one fresh synthetic account and run the
+live Gemini canary. Repeat `--profile` to select a bounded subset, or omit it to
+run the locked eight-profile matrix. The candidate SHA is the source commit
+actually deployed by the test manifest, not automatically the tip of the Git
+branch.
+
+Local output is written under `qualification-artifacts/<run-id>/`. The sanitized
+source snapshot, manifests, and copied OAuth material stay under a run-scoped
+owner-only directory. After verified account cleanup, a passing run removes that
+directory. A non-passing worker run first copies a bounded,
+credential-scanned subset of raw
+worker events, stderr, scratch files, and Codex session evidence to the owner-only
+`~/.codex/feedling-e2e-debug/<run-id>/` quarantine, explicitly excluding the
+provisioning manifests and any file containing known provider, synthetic-user,
+content, or OAuth credentials; it then removes the original private run. The
+summary records only `private_debug_retained` and its run ID. If account cleanup
+fails, the private run directory is reduced to exactly the owner-only original
+provisioning manifest required for cleanup retry. The source snapshot, copied
+OAuth, worker outputs, raw events, profile manifests, and every other private
+file are deleted, and `private_cleanup_retry_retained` is true.
+If private finalization itself fails, the run fails closed and attempts to
+remove the entire original private root instead of retaining partially scrubbed
+manifests or raw evidence. If rendering or the public secret scan fails, every
+would-be public artifact is quarantined by deleting the artifact directory and
+rebuilding it with only a fixed, sanitized `SECURITY_FAIL` summary.
+
+The public diagnostic summary and matrix always say
+`release_qualified: false`: this path proves deployed end-user behavior and
+captures partial evidence, but it cannot substitute for protected deployment
+SHA, server-side reaper, and full-matrix release attestations.
+`DIAGNOSTIC_PASS` additionally requires every selected profile's trusted COT
+receipt to prove the correct final answer, one correlated reasoning event,
+reasoning metadata, and a delivered user-visible disclosure. A profile agent
+cannot override a missing, failed, or mismatched receipt with a PASS judgment.
+When an otherwise valid receipt disagrees with the agent-authored projection,
+the matrix reports the gate failure (`COT_RESULT_BINDING_MISMATCH`) separately
+from the receipt's trusted observation status/code, so the underlying product
+failure is not hidden by an agent reporting mistake.
+The summary also records the exact harness Git HEAD, dirty state, whole-harness
+source digest, worker-source digest, and exact copied worker-snapshot digest;
+the run aborts before Codex if the snapshot bytes differ from the measured
+source bytes.
+
 Every profile runs `P0-01` through `P0-13`, including fresh onboarding, key
 validation, four-part persona import/distillation, basic and ten-turn chat,
 memory/persona consistency, model identity, reasoning disclosure, latency
@@ -83,6 +183,15 @@ owner-mode `0600` temp file. That profile agent reads it and writes a bounded
 semantic judgment tied to the capture SHA-256; deterministic finalization checks
 the hash and judgment contracts, emits only sanitized evidence, and deletes the
 plaintext on every exit path.
+
+Codex is intentionally the semantic-judgment trust boundary, not an adversarial
+program being cryptographically proved to have "thought." Deterministic code
+proves ordered successful evidence access, rejects a fixed-path persona judgment
+that already exists at REVIEW, binds the reviewed capture hash through the
+Genesis finalizer, and validates the resulting schema/evidence. It cannot prove
+the model's internal reasoning or defeat a deliberately deceptive judge that
+manufactures an alternate prefill and copies it later; that would require a
+second independent judge or a different trust model.
 
 All eight profiles lock reasoning effort to `medium`. A provider default, omitted
 setting, or disabled reasoning cannot produce a release PASS.
@@ -96,6 +205,21 @@ reasoning/thinking event count, token metadata, and a nonempty user-visible
 summary/disclosure. `reasoning:false`, an effective `off` clamp, or zero events
 fails even if setup echoed the requested effort. The suite never requests or
 stores a model's hidden private chain-of-thought.
+At P0-12 the worker writes a fixed request marker, and the trusted launcher runs
+`cot_delivery_probe.py` once. The authoritative private receipt lives in that
+profile's directory beneath the worker-output root, which the profile's
+permission denies; the worker receives only a sanitized facts copy in its work
+root. The receipt binds
+the exact model-call trace, parsed-agent trace, stored reply ID, and decryptable
+thinking envelope; the launcher validates and hashes that receipt before the
+profile can be accepted as agent-authored diagnostic evidence. Missing provider
+reasoning-token accounting remains explicitly unverified instead of being
+invented from ordinary input/output token counts.
+The launcher resolves one owner-controlled, crypto-capable Python executable,
+fixes it as `QA_PYTHON_BIN` in every worker profile, grants only its narrow
+runtime roots, and proves `"$QA_PYTHON_BIN" -I -B` can load the probe inside the
+real sandbox before any synthetic account is provisioned. Workers may not build
+their own virtual environments or install dependencies during qualification.
 
 ## `QA_TEST_ADMIN_TOKEN`
 
@@ -105,7 +229,7 @@ the **test** backend's admin routes. Its value must match that deployment's
 strong random value, for example with `openssl rand -hex 32`, and stores it only
 in secret managers. Deterministic QA tools use it only to call:
 
-- `POST /v1/admin/hosted-runtime-mode`, to select `db_action_v2` for a newly
+- `POST /v1/admin/hosted-runtime-mode`, to select `hosted_resident` for a newly
   created synthetic user; and
 - `GET /v1/admin/hosted-runtime-mode`, to independently read the selection
   back;
@@ -211,6 +335,13 @@ Register a single-job ephemeral self-hosted runner with the labels `self-hosted`
 Codex Linux bubblewrap sandbox, run as a non-root account, and MUST NOT have
 `$HOME/.codex/auth.json` or another persistent ChatGPT login. Destroy the runner
 VM after every job; deleting the work directory alone is not sufficient.
+`actions/setup-python` must install Python 3.12 into a narrow tool-cache runtime
+owned by that same runner account: `sys.prefix`, `sys.base_prefix`, the runtime
+`bin` directory, and the resolved executable must be owner-controlled and not
+group/world writable, and the executable must resolve directly beneath a
+runtime `bin`. A root-owned system Python or broad `/usr` prefix is unsupported.
+The workflow validates this boundary before decoding the QA OAuth bundle or
+provisioning synthetic accounts, so a misconfigured runner fails safely.
 
 The runner VM is ephemeral, and the workflow creates a fresh owner-only
 `CODEX_HOME` for every run. Pinned Codex 0.144.3 does not reliably apply a
@@ -249,7 +380,7 @@ The deployed `https://test-api.feedling.app` candidate must provide:
 - the Runtime V2 admin set/readback routes;
 - the admin-gated V2 metrics contract with `backend_sha`, `worker_shas`, and a
   positive live-worker count matching the candidate SHA;
-- `db_action_v2` workers and queues;
+- `hosted_resident` Runtime V2 workers and queues;
 - deploy-enabled, user-scoped traces; and
 - the admin-gated synthetic-account reaper status contract, backed by a real
   server-side TTL/janitor for `agent-e2e-` labels; and
@@ -293,5 +424,8 @@ thirteen scenarios per profile are present in order and PASS with their locked
 assertions, evidence codes, required IDs, and preserved attempt history; Runtime
 V2 and unchanged pre/post candidate identity are proven; all chat turns have the
 five required trace stages and numeric per-turn stage timing; cleanup succeeds;
-required files exist; and the redaction scan is clean. A blocked prerequisite is
-useful evidence, but it is never a release PASS.
+each worker has a completed qualification-tool event and a valid, passing,
+result-bound P0-12 receipt; each agent-driven scenario P0-02 through P0-11 has
+its own completed command marker; required files exist; and the redaction scan
+is clean. A blocked prerequisite is useful evidence, but it is never a release
+PASS.

@@ -80,6 +80,56 @@ def _directory(path: Path, name: str) -> Path:
     return resolved
 
 
+def _runtime_directory(path: Path) -> Path:
+    """Return one narrow, owner-controlled interpreter runtime root."""
+
+    resolved = _directory(path, "runtime read root")
+    metadata = resolved.stat()
+    home = Path.home().resolve()
+    codex_private = (home / ".codex").resolve()
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise CodexConfigError("runtime read root must not be group/world writable")
+    if _contains(resolved, home) or _contains(codex_private, resolved):
+        raise CodexConfigError("runtime read root is too broad or private")
+    return resolved
+
+
+def _worker_executable(path: Path, runtimes: Sequence[Path]) -> Path:
+    """Bind the worker interpreter to a validated runtime ``bin`` directory."""
+
+    if not path.is_absolute():
+        raise CodexConfigError("worker Python must be an absolute path")
+    try:
+        executable = path.resolve(strict=True)
+        metadata = executable.stat()
+    except (OSError, RuntimeError):
+        raise CodexConfigError("worker Python is unavailable") from None
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or not os.access(executable, os.X_OK)
+    ):
+        raise CodexConfigError("worker Python must be an owner-controlled executable")
+    matching_runtime = next(
+        (runtime for runtime in runtimes if executable.parent == runtime / "bin"),
+        None,
+    )
+    if matching_runtime is None:
+        raise CodexConfigError("worker Python must be directly beneath a runtime bin")
+    try:
+        bin_metadata = executable.parent.stat()
+    except OSError:
+        raise CodexConfigError("worker Python runtime bin is unavailable") from None
+    if (
+        not stat.S_ISDIR(bin_metadata.st_mode)
+        or bin_metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(bin_metadata.st_mode) & 0o022
+    ):
+        raise CodexConfigError("worker Python runtime bin must be owner-controlled")
+    return executable
+
+
 def _private_directory(path: Path, name: str, *, empty: bool = False) -> Path:
     resolved = _directory(path, name)
     metadata = path.lstat()
@@ -182,6 +232,8 @@ def _shell_policy(
     artifact_root: Path | None,
     aggregation_input_root: Path | None,
     orchestration_receipt: Path | None,
+    worker_python: Path | None,
+    qualification_mode: str | None,
 ) -> list[str]:
     include = list(_COMMON_ENV)
     fixed = {
@@ -191,12 +243,16 @@ def _shell_policy(
     }
     include.append("QA_WORK_ROOT")
     if manifest is not None:
+        if worker_python is None or qualification_mode not in {"release", "diagnostic"}:
+            raise CodexConfigError("worker shell runtime is missing")
         include.extend(
             (
                 "QA_PRIVATE_MANIFEST",
                 "QA_PROFILE_ID",
                 "QA_AGENT_TYPE",
                 "QA_ARTIFACT_DIR",
+                "QA_PYTHON_BIN",
+                "QA_QUALIFICATION_MODE",
             )
         )
         fixed.update(
@@ -205,6 +261,8 @@ def _shell_policy(
                 "QA_PROFILE_ID": str(profile_id),
                 "QA_AGENT_TYPE": str(agent_type),
                 "QA_ARTIFACT_DIR": str(artifact_root),
+                "QA_PYTHON_BIN": str(worker_python),
+                "QA_QUALIFICATION_MODE": qualification_mode,
             }
         )
     if aggregation_input_root is not None:
@@ -275,6 +333,8 @@ def _profile_config(
     work: Path,
     artifact_root: Path,
     codex_model: str,
+    worker_python: Path,
+    qualification_mode: str,
 ) -> str:
     lines = _base_settings(worker_permission_profile(profile_id), codex_model)
     lines.insert(
@@ -297,6 +357,8 @@ def _profile_config(
             artifact_root=artifact_root,
             aggregation_input_root=None,
             orchestration_receipt=None,
+            worker_python=worker_python,
+            qualification_mode=qualification_mode,
         )
     )
     return "\n".join(lines)
@@ -318,6 +380,8 @@ def build_config_bundle(
     orchestration_receipt: Path,
     codex_model: str,
     allowed_host: str,
+    worker_python: Path,
+    qualification_mode: str = "release",
     runtime_read_roots: Sequence[Path] = (),
 ) -> CodexConfigBundle:
     codex_home = _private_directory(output.parent, "CODEX_HOME")
@@ -344,14 +408,14 @@ def build_config_bundle(
         orchestration_receipt, "orchestration receipt", private_parent=True
     )
     runtimes = tuple(
-        dict.fromkeys(
-            _directory(path, "runtime read root") for path in runtime_read_roots
-        )
+        dict.fromkeys(_runtime_directory(path) for path in runtime_read_roots)
     )
 
+    if qualification_mode not in {"release", "diagnostic"}:
+        raise CodexConfigError("qualification mode is invalid")
     if destination.parent != codex_home:
         raise CodexConfigError("Codex config must be directly beneath CODEX_HOME")
-    if not _contains(source, artifacts):
+    if qualification_mode == "release" and not _contains(source, artifacts):
         raise CodexConfigError("artifact root must be inside the source checkout")
     top_level_private = (
         codex_home,
@@ -371,6 +435,11 @@ def build_config_bundle(
         for right in top_level_private[index + 1 :]
     ):
         raise CodexConfigError("private Codex roots must be disjoint")
+    if any(
+        _contains(artifacts, private) or _contains(private, artifacts)
+        for private in top_level_private
+    ):
+        raise CodexConfigError("artifact root must be isolated from private run data")
     if _contains(source, provisioning) or any(
         _contains(private, provisioning) for private in top_level_private
     ):
@@ -388,13 +457,19 @@ def build_config_bundle(
         for private in top_level_private
     ):
         raise CodexConfigError("runtime read roots must not expose private run data")
+    if any(
+        _contains(runtime, protected) or _contains(protected, runtime)
+        for runtime in runtimes
+        for protected in (source, artifacts, provisioning, receipt)
+    ):
+        raise CodexConfigError("runtime read roots must be isolated from run data")
+    worker_executable = _worker_executable(worker_python, runtimes)
 
     host = allowed_host.strip().lower().rstrip(".")
     if host != allowed_host or not _DNS_NAME.fullmatch(host):
         raise CodexConfigError("allowed host must be one normalized DNS name")
     if not isinstance(codex_model, str) or not _MODEL_NAME.fullmatch(codex_model):
         raise CodexConfigError("Codex model must be one normalized model ID")
-
     worker_paths: dict[str, tuple[Path, Path, Path]] = {}
     manifest_paths: dict[str, Path] = {}
     profile_configs: dict[Path, str] = {}
@@ -428,6 +503,8 @@ def build_config_bundle(
             work=work,
             artifact_root=artifacts,
             codex_model=codex_model,
+            worker_python=worker_executable,
+            qualification_mode=qualification_mode,
         )
 
     lines = _base_settings(SUPERVISOR_PERMISSION_PROFILE, codex_model)
@@ -442,6 +519,8 @@ def build_config_bundle(
             artifact_root=None,
             aggregation_input_root=aggregation_inputs,
             orchestration_receipt=receipt,
+            worker_python=None,
+            qualification_mode=None,
         )
     )
     lines.extend(_feature_lines())
@@ -569,6 +648,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--orchestration-receipt", type=Path, required=True)
     parser.add_argument("--codex-model", required=True)
     parser.add_argument("--allowed-host", required=True)
+    parser.add_argument("--worker-python", type=Path, required=True)
+    parser.add_argument(
+        "--qualification-mode",
+        choices=("release", "diagnostic"),
+        default="release",
+    )
     parser.add_argument(
         "--runtime-read-root",
         type=Path,
@@ -597,6 +682,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             orchestration_receipt=args.orchestration_receipt,
             codex_model=args.codex_model,
             allowed_host=args.allowed_host,
+            worker_python=args.worker_python,
+            qualification_mode=args.qualification_mode,
             runtime_read_roots=args.runtime_read_root,
         )
         write_bundle(args.output, bundle)

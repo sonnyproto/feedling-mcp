@@ -78,6 +78,7 @@ class FakeSmokeClient:
         self.registered: list[tuple[str, Session]] = []
         self.setup_calls: list[tuple[str, str, str, str, str, str | None]] = []
         self.trace_calls: list[str] = []
+        self.runtime_calls: list[str] = []
         self.reset_calls: list[tuple[str, dict]] = []
         self.accept_invalid = False
         self.echo_invalid_secret = False
@@ -88,6 +89,9 @@ class FakeSmokeClient:
         self.reject_valid_for: str | None = None
         self.fail_registration_at: int | None = None
         self.trace_deploy_enabled = True
+        self.runtime_mode = provisioner.DIAGNOSTIC_RUNTIME_MODE
+        self.runtime_version = provisioner.DIAGNOSTIC_RUNTIME_VERSION
+        self.runtime_configured = True
         self.reset_fail_for: set[str] = set()
         self.already_reset_for: set[str] = set()
 
@@ -169,6 +173,14 @@ class FakeSmokeClient:
             body["nested"] = {"detail": f"rejected secret={api_key}"}
         return self.invalid_http_status, body
 
+    def runtime_status(self, session):
+        status, body = self._req(
+            "GET", "/v1/model_api/runtime", api_key=session.api_key
+        )
+        if status != 200:
+            raise SmokeError("runtime", f"status={status}")
+        return body
+
     def _req(self, method, path, *, api_key=None, body=None, **_kwargs):
         if path == "/v1/users/whoami":
             session = next(s for _label, s in self.registered if s.api_key == api_key)
@@ -182,6 +194,13 @@ class FakeSmokeClient:
             assert method == "POST"
             assert body == {"enabled": True}
             return 200, {"enabled": True, "deploy_enabled": self.trace_deploy_enabled}
+        if path == "/v1/model_api/runtime":
+            self.runtime_calls.append(api_key)
+            return 200, {
+                "configured": self.runtime_configured,
+                "runtime_mode": self.runtime_mode,
+                "runtime_version": self.runtime_version,
+            }
         if path == "/v1/account/reset":
             self.reset_calls.append((api_key, body))
             if api_key in self.already_reset_for:
@@ -264,7 +283,9 @@ def test_provision_creates_all_profiles_without_persisting_provider_secrets(tmp_
     assert all(row["registration_verified"] for row in result["profiles"])
     assert all(row["fresh_state_verified"] for row in result["profiles"])
     assert all(row["trace_enabled"] for row in result["profiles"])
-    assert all(row["runtime_mode"] == "db_action_v2" for row in result["profiles"])
+    assert all(
+        row["runtime_mode"] == "hosted_resident" for row in result["profiles"]
+    )
     assert all(row["runtime_mode_set_verified"] for row in result["profiles"])
     assert all(row["runtime_mode_readback_verified"] for row in result["profiles"])
     assert [row["profile_id"] for row in result["profiles"]] == list(
@@ -305,6 +326,135 @@ def test_provision_creates_all_profiles_without_persisting_provider_secrets(tmp_
             "base_url": spec.expected_configured_base_url,
             "reasoning_effort": provisioner.EXPECTED_REASONING_EFFORT,
         }
+
+
+def test_adminless_diagnostic_subset_uses_user_runtime_readback(tmp_path):
+    env = _env()
+    env.pop("QA_TEST_ADMIN_TOKEN")
+    for profile_id, spec in provisioner.PROFILE_SPECS.items():
+        if profile_id == "official-gemini":
+            continue
+        env.pop(spec.credential_env, None)
+        env.pop(spec.model_env, None)
+    smoke = FakeSmokeClient()
+    admin = FakeAdminClient()
+    manifest_path = tmp_path / "diagnostic.json"
+
+    result = provisioner.provision(
+        _write_coverage(tmp_path),
+        manifest_path,
+        env=env,
+        client=smoke,
+        admin_client=admin,
+        diagnostic=True,
+        profile_ids=["official-gemini"],
+    )
+
+    assert admin.calls == []
+    assert result["qualification_mode"] == "diagnostic"
+    assert result["selected_profile_ids"] == ["official-gemini"]
+    assert result["runtime_mode"] == "hosted_resident"
+    assert result["runtime_version"] == 2
+    assert result["synthetic_account_reaper"] == {
+        "required": False,
+        "verified": False,
+        "reason": "adminless_diagnostic",
+    }
+    assert smoke.runtime_calls == ["feedling-account-key-0"]
+    assert len(result["profiles"]) == 1
+    profile = result["profiles"][0]
+    assert profile["profile_id"] == "official-gemini"
+    assert profile["runtime_mode"] == "hosted_resident"
+    assert profile["runtime_version"] == 2
+    assert profile["runtime_mode_set_required"] is False
+    assert profile["runtime_mode_set_verified"] is False
+    assert profile["runtime_mode_readback_verified"] is True
+    assert profile["runtime_readback_receipt"] == {
+        "configured": True,
+        "runtime_mode": "hosted_resident",
+        "runtime_version": 2,
+    }
+    assert profile["provision_status"] == provisioner.PROVISION_STATUS_READY
+    assert stat.S_IMODE(manifest_path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    "runtime_field,runtime_value",
+    [
+        ("runtime_configured", False),
+        ("runtime_mode", "db_action_v2"),
+        ("runtime_version", 1),
+        ("runtime_version", 2.0),
+    ],
+)
+def test_adminless_diagnostic_blocks_runtime_readback_mismatch(
+    tmp_path, runtime_field, runtime_value
+):
+    env = _env()
+    env.pop("QA_TEST_ADMIN_TOKEN")
+    smoke = FakeSmokeClient()
+    setattr(smoke, runtime_field, runtime_value)
+
+    result = provisioner.provision(
+        _write_coverage(tmp_path),
+        tmp_path / "diagnostic.json",
+        env=env,
+        client=smoke,
+        diagnostic=True,
+        profile_ids=["official-gemini"],
+    )
+
+    profile = result["profiles"][0]
+    assert profile["provision_status"] == provisioner.PROVISION_STATUS_BLOCKED
+    assert profile["provision_failure_code"] == "RUNTIME_MODE_VERIFICATION_FAILED"
+    assert profile["runtime_mode_readback_verified"] is False
+
+
+def test_profile_subset_is_rejected_outside_diagnostic_mode(tmp_path):
+    smoke = FakeSmokeClient()
+    admin = FakeAdminClient()
+
+    with pytest.raises(provisioner.ProvisionError, match="require diagnostic mode"):
+        provisioner.provision(
+            _write_coverage(tmp_path),
+            tmp_path / "manifest.json",
+            env=_env(),
+            client=smoke,
+            admin_client=admin,
+            profile_ids=["official-gemini"],
+        )
+
+    assert smoke.registered == []
+    assert admin.calls == []
+
+
+@pytest.mark.parametrize(
+    "profile_ids,error",
+    [
+        ([], "must not be empty"),
+        (["official-gemini", "official-gemini"], "duplicates"),
+        (["not-locked"], "outside the locked"),
+        ("official-gemini", "must be a sequence"),
+    ],
+)
+def test_invalid_diagnostic_profile_selection_fails_before_external_state(
+    tmp_path, profile_ids, error
+):
+    smoke = FakeSmokeClient()
+
+    with pytest.raises(provisioner.ProvisionError, match=error):
+        provisioner.provision(
+            _write_coverage(tmp_path),
+            tmp_path / "diagnostic.json",
+            env={
+                "QA_FEEDLING_BASE_URL": provisioner.ALLOWED_BASE_URL,
+            },
+            client=smoke,
+            diagnostic=True,
+            profile_ids=profile_ids,
+        )
+
+    assert smoke.registered == []
 
 
 def test_invalid_and_valid_setup_calls_use_profile_locked_base_urls(tmp_path):
@@ -976,6 +1126,34 @@ def test_cleanup_resets_every_account_and_removes_manifest(tmp_path):
     assert not manifest_path.exists()
 
 
+def test_adminless_diagnostic_cleanup_needs_no_admin_token(tmp_path):
+    manifest_path = tmp_path / "diagnostic.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "qualification_mode": "diagnostic",
+                "base_url": provisioner.ALLOWED_BASE_URL,
+                "profiles": [
+                    {
+                        "profile_id": "official-gemini",
+                        "user_id": "u1",
+                        "api_key": "account-1",
+                    }
+                ],
+            }
+        )
+    )
+    smoke = FakeSmokeClient()
+
+    result = provisioner.cleanup(manifest_path, env={}, client=smoke)
+
+    assert result["cleaned"] == 1
+    assert result["failed_profile_ids"] == []
+    assert result["manifest_deleted"] is True
+    assert not manifest_path.exists()
+
+
 def test_cleanup_failure_keeps_manifest_for_retry(tmp_path):
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(
@@ -1046,6 +1224,35 @@ def test_cleanup_401_without_admin_proof_keeps_manifest(tmp_path):
 
     assert result["cleaned"] == 0
     assert result["failed_profile_ids"] == ["p1"]
+    assert result["manifest_deleted"] is False
+    assert manifest_path.exists()
+
+
+def test_adminless_diagnostic_cleanup_retains_ambiguous_manifest(tmp_path):
+    manifest_path = tmp_path / "diagnostic.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "qualification_mode": "diagnostic",
+                "base_url": provisioner.ALLOWED_BASE_URL,
+                "profiles": [
+                    {
+                        "profile_id": "official-gemini",
+                        "user_id": "u1",
+                        "api_key": "account-1",
+                    }
+                ],
+            }
+        )
+    )
+    smoke = FakeSmokeClient()
+    smoke.already_reset_for.add("account-1")
+
+    result = provisioner.cleanup(manifest_path, env={}, client=smoke)
+
+    assert result["cleaned"] == 0
+    assert result["failed_profile_ids"] == ["official-gemini"]
     assert result["manifest_deleted"] is False
     assert manifest_path.exists()
 
@@ -1121,6 +1328,80 @@ def test_provision_cli_succeeds_for_complete_matrix_with_blocked_profile(
     assert env["QA_DEEPSEEK_API_KEY"] not in raw
     assert [row["profile_id"] for row in json.loads(raw)["profiles"]] == list(
         provisioner.PROFILE_SPECS
+    )
+
+
+def test_provision_cli_supports_adminless_diagnostic_canary(
+    tmp_path, monkeypatch, capsys
+):
+    coverage = _write_coverage(tmp_path)
+    manifest = tmp_path / "diagnostic.json"
+    env = _env()
+    env.pop("QA_TEST_ADMIN_TOKEN")
+    smoke = FakeSmokeClient()
+    original_provision = provisioner.provision
+
+    def injected_provision(coverage_path, manifest_path, **kwargs):
+        return original_provision(
+            coverage_path,
+            manifest_path,
+            env=env,
+            client=smoke,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(provisioner, "provision", injected_provision)
+    exit_code = provisioner.main(
+        [
+            "provision",
+            "--coverage",
+            str(coverage),
+            "--manifest",
+            str(manifest),
+            "--diagnostic",
+            "--profile",
+            "official-gemini",
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert captured.err == ""
+    assert json.loads(captured.out) == {
+        "ok": True,
+        "profile_count": 1,
+        "ready_profile_count": 1,
+        "blocked_profile_count": 0,
+        "blocked_profile_ids": [],
+        "manifest": str(manifest),
+        "qualification_mode": "diagnostic",
+    }
+
+
+def test_provision_cli_rejects_profile_without_diagnostic_mode(
+    tmp_path, monkeypatch, capsys
+):
+    def must_not_provision(*args, **kwargs):
+        raise AssertionError("provision should not be called")
+
+    monkeypatch.setattr(provisioner, "provision", must_not_provision)
+    exit_code = provisioner.main(
+        [
+            "provision",
+            "--coverage",
+            str(_write_coverage(tmp_path)),
+            "--manifest",
+            str(tmp_path / "manifest.json"),
+            "--profile",
+            "official-gemini",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert (
+        captured.err == "provisioning error: profile subsets require diagnostic mode\n"
     )
 
 

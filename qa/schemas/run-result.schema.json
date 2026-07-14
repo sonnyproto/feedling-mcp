@@ -194,7 +194,7 @@
           "$ref": "#/$defs/nullableSha"
         },
         "expected_runtime": {
-          "const": "db_action_v2"
+          "const": "hosted_resident"
         }
       }
     },
@@ -331,7 +331,7 @@
           "$ref": "#/$defs/nullableSafeLabel"
         },
         "expected_runtime": {
-          "const": "db_action_v2"
+          "const": "hosted_resident"
         },
         "observed_runtime": {
           "type": [
@@ -339,7 +339,7 @@
             "null"
           ],
           "enum": [
-            "db_action_v2",
+            "hosted_resident",
             "resident_cli",
             null
           ]

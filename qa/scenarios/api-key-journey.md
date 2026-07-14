@@ -17,6 +17,26 @@ names, evidence codes, identifier minima, and turn counts below. Copy those
 fields exactly, preserve `P0-01` through `P0-13` order, and include one numbered
 `attempt_results` row per attempt. A retry never replaces its first observation.
 
+For each agent-driven live scenario P0-02 through P0-11, at least one real probe
+command MUST begin with the exact environment assignment
+`QA_SCENARIO_ID=P0-XX ` for that scenario. The trusted launcher consumes these
+markers from completed Codex events without retaining command text. A comment,
+an uncompleted command, or one command containing several marker strings does
+not prove scenario execution. P0-01, P0-12, and P0-13 have separate
+parent-owned evidence and do not use these markers.
+
+P0-06 is the exception to the one-command minimum: it requires exactly three
+ordered, successful tool calls prefixed with `QA_SCENARIO_ID=P0-06` and distinct
+`QA_SCENARIO_PHASE=CAPTURE`, `REVIEW`, and `FINALIZE` assignments, using the
+exact commands embedded in the profile-agent prompt. CAPTURE and FINALIZE
+directly invoke the checked-in Genesis tool against the fixed private evidence
+path `$QA_WORK_ROOT/p0-06-private-evidence.json`; REVIEW directly reads that
+file in its own tool call and aborts if the fixed judgment path already exists.
+Only after observing REVIEW output may the agent write its own semantic judgment to the fixed
+`$QA_WORK_ROOT/p0-06-semantic-judgment.json` path and invoke FINALIZE. Never
+generate a script that derives an all-true judgment from `expected_fact_ids`
+without reviewing the decrypted evidence surfaces.
+
 ## P0-01 — Test-target and credential preflight
 
 **Act**
@@ -88,13 +108,13 @@ fields exactly, preserve `P0-01` through `P0-13` order, and include one numbered
 
 **Act**
 
-- Audit the provisioner's test-control-plane set and independent readback
-  receipts for `db_action_v2`.
+- Audit the provisioner's authenticated runtime readback receipt for
+  `hosted_resident` Runtime V2.
 - Capture candidate backend and worker identity when exposed.
 
 **Pass**
 
-- Expected and observed runtime both equal `db_action_v2`; deployment identity
+- Expected and observed runtime both equal `hosted_resident`; deployment identity
   matches the expected candidate; the V2 worker pool reports live/readiness
   evidence.
 
@@ -106,13 +126,14 @@ fields exactly, preserve `P0-01` through `P0-13` order, and include one numbered
   `qa/fixtures/persona-import-v1.json`: chat history, AI persona, personal profile,
   and memory summary.
 - Use `tools/genesis_e2e.py distill-existing-session` with this profile's
-  one-row `QA_PRIVATE_MANIFEST`, a `0600` evidence path beneath its isolated
-  `TMPDIR`, and `QA_ARTIFACT_DIR` only as the denied public-artifact boundary.
-  The agent cannot read or write that directory. Do not provision a second
-  user, consume a provider secret, or replace/delete the provisioned provider
-  configuration.
+  one-row `QA_PRIVATE_MANIFEST`, the fixed `0600` evidence path
+  `$QA_WORK_ROOT/p0-06-private-evidence.json`, and `QA_ARTIFACT_DIR` only as the
+  denied public-artifact boundary. The agent cannot read or write that
+  directory. Do not provision a second user, consume a provider secret, or
+  replace/delete the provisioned provider configuration.
 - After capture reaches `done`, read the decrypted private evidence and write a
-  separate owner-mode `0600` semantic judgment containing exactly
+  separate owner-mode `0600` semantic judgment at
+  `$QA_WORK_ROOT/p0-06-semantic-judgment.json` containing exactly
   `schema_version: 1`, `judge: qualification_agent`, the capture's exact
   `evidence_sha256`, all three reviewed surfaces, the exact locked fact IDs,
   and true/false consistency, support, and contradiction decisions.
@@ -214,15 +235,48 @@ fields exactly, preserve `P0-01` through `P0-13` order, and include one numbered
 
 **Act**
 
-- Send a small deterministic reasoning task that has an objectively checkable
-  final answer.
+- Request the deterministic parent-owned delivery probe exactly once for this
+  profile. The profile writes only a fixed marker, then waits for the sanitized
+  facts copy:
+
+  ```sh
+  umask 077
+  test ! -e "$QA_WORK_ROOT/.cot-probe-request"
+  test ! -e "$QA_WORK_ROOT/cot-delivery-facts.json"
+  printf '%s\n' "$QA_PROFILE_ID" > "$QA_WORK_ROOT/.cot-probe-request"
+  i=0
+  while test ! -f "$QA_WORK_ROOT/cot-delivery-facts.json" && test "$i" -lt 360; do
+    sleep 1
+    i=$((i + 1))
+  done
+  test -f "$QA_WORK_ROOT/cot-delivery-facts.json"
+  ```
+
+  Do not invoke `qa/cot_delivery_probe.py` yourself and do not create, replace,
+  edit, or delete the facts copy. The trusted parent derives the nonce, sends
+  the sole P0-12 turn, and writes the authoritative receipt under its private
+  worker-output root. That root is explicitly denied to this profile.
+
+  A facts copy containing a failed or unverified receipt is a completed
+  observation, not a reason to discard it or send a replacement P0-12 turn. An
+  unavailable/error facts copy is an evidence failure, not permission for the
+  profile to run its own probe.
+- The probe sends `17 × 19`, requires final answer `323`, exact-correlates the
+  resulting user turn and stored reply, and records only bounded metadata. Do
+  not send a second reasoning task or substitute a different turn.
 - Verify the correlated route and harness expose reasoning capability as enabled.
   Record requested, configured, and effective effort separately; all three must
   be `medium`. A configured route value alone is insufficient if the harness or
   selected model clamps effective effort to `off`.
-- Inspect the correlated chat record and trace for reasoning kind/source/model,
-  token metadata, at least one provider-visible reasoning/thinking event, and the
-  separately encrypted user-visible disclosure.
+- Bind the profile result to the receipt's exact request/turn/trace and reply
+  IDs. Inspect its bounded reasoning kind/source/model, token-metadata status,
+  provider-visible reasoning event count, and separately encrypted user-visible
+  disclosure result. The trusted launcher separately validates and hashes this
+  receipt; agent prose is not the authority for the delivery observation.
+- Copy failed/unverified receipts literally: empty request/turn/trace IDs require
+  empty reasoning ID strings and empty scenario ID arrays; empty delivered
+  kind/source/model strings require `null` result fields. Do not replace an empty
+  delivered-thinking model with the configured provider model.
 - Decrypt only to assert nonempty/sanitized client-visible content; do not persist
   its text.
 - Copy the sole P0-12 turn's exact `request_id`, `turn_id`, and `trace_id` into
@@ -246,6 +300,21 @@ record those observed values verbatim, classify P0-12 as `PRODUCT_FAIL` at stage
 `REASONING` with `REASONING_EFFORT_CLAMPED`, and preserve the sanitized failure
 artifact. Never replace a failed observation with success-shaped defaults.
 
+Map deterministic delivery failures without inventing evidence:
+
+- `DOWNSTREAM_PARSE_DROPPED_REASONING` or invalid reasoning metadata is
+  `PRODUCT_FAIL` / `REASONING_METADATA_MISSING`;
+- a missing or unreadable delivered thinking envelope is `PRODUCT_FAIL` /
+  `DISCLOSURE_MISSING`;
+- an incorrect final answer is `PRODUCT_FAIL` / `CONTENT_ASSERTION_FAILED`;
+- unavailable, ambiguous, or dropped trace—or an unobserved positive model
+  reasoning signal—is `BLOCKED_EVIDENCE` with `TRACE_INCOMPLETE` or
+  `TRACE_UNAVAILABLE` unless other exact correlated evidence resolves the
+  ambiguity; and
+- absent provider token accounting remains `BLOCKED_EVIDENCE` /
+  `REASONING_TOKENS_MISSING` for release qualification. It does not erase a
+  separately proven delivery PASS in the local diagnostic receipt.
+
 ## P0-13 — Trace completeness, latency attribution, and cleanup
 
 **Act**
@@ -257,6 +326,12 @@ artifact. Never replace a failed observation with success-shaped defaults.
 - Capture sanitized evidence, disable/delete provider hosting, reset this synthetic
   account using `{"confirm":"delete-all-data"}`, and verify the old Feedling
   credential is rejected.
+- Local adminless diagnostic exception: when
+  `QA_QUALIFICATION_MODE=diagnostic`, do not call account reset from the agent.
+  The deterministic parent performs the sole reset after collecting the worker
+  result and COT receipt; record the account-reset/old-credential assertions as
+  false and cleanup as deferred. This exception can never produce a release
+  PASS. Provider-config deletion may still be attempted before returning.
 
 **Pass**
 

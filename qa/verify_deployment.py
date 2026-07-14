@@ -23,7 +23,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from qa.provision_profiles import AdminClient, ProvisionError, validate_base_url
+from qa.provision_profiles import (  # noqa: E402
+    AdminClient,
+    ProvisionError,
+    validate_base_url,
+)
 
 
 _SHA_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")

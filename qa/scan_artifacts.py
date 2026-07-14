@@ -59,14 +59,20 @@ class ArtifactScanError(RuntimeError):
     """A fixed diagnostic safe to print without exposing artifact content."""
 
 
+def _byte_variants(value: bytes) -> set[bytes]:
+    """Return the fixed, bounded set of encodings checked for one secret."""
+
+    return {
+        value,
+        base64.b64encode(value),
+        base64.urlsafe_b64encode(value),
+        value.hex().encode("ascii"),
+    }
+
+
 def _encoded_variants(value: str, *, decode_base64: bool = False) -> set[bytes]:
     raw = value.encode("utf-8")
-    variants = {
-        raw,
-        base64.b64encode(raw),
-        base64.urlsafe_b64encode(raw),
-        raw.hex().encode("ascii"),
-    }
+    variants = _byte_variants(raw)
     if decode_base64:
         compact = b"".join(raw.split())
         variants.add(compact)
@@ -75,7 +81,7 @@ def _encoded_variants(value: str, *, decode_base64: bool = False) -> set[bytes]:
         except (ValueError, base64.binascii.Error):
             decoded = b""
         if decoded:
-            variants.add(decoded)
+            variants.update(_byte_variants(decoded))
     return variants
 
 

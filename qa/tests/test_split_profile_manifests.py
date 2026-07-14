@@ -21,7 +21,7 @@ def _manifest(tmp_path: Path) -> Path:
     payload = {
         "schema_version": 1,
         "base_url": "https://test-api.feedling.app",
-        "runtime_mode": "db_action_v2",
+        "runtime_mode": "hosted_resident",
         "profiles": [
             {
                 "profile_id": profile_id,

@@ -121,8 +121,8 @@ def _profile(profile_id: str, index: int) -> dict:
         "model": VALID_MODELS[profile_id],
         "reasoning_effort": "medium",
         "user_id": f"synthetic-user-{index}",
-        "expected_runtime": "db_action_v2",
-        "observed_runtime": "db_action_v2",
+        "expected_runtime": "hosted_resident",
+        "observed_runtime": "hosted_resident",
         "status": "PASS",
         "scenarios": [
             _scenario(item, index, turns) for item in gate.LOCKED_SCENARIO_IDS
@@ -189,7 +189,7 @@ def _valid_result() -> dict:
             "expected_deployment_sha": SHA,
             "observed_backend_sha": SHA,
             "observed_worker_sha": SHA,
-            "expected_runtime": "db_action_v2",
+            "expected_runtime": "hosted_resident",
         },
         "overall_status": "PASS",
         "profiles_expected": 8,
@@ -274,7 +274,7 @@ def _write_provisioning_manifest(tmp_path: Path) -> Path:
         "schema_version": 1,
         "generated_at": "2026-07-13T11:58:00Z",
         "base_url": "https://test-api.feedling.app",
-        "runtime_mode": "db_action_v2",
+        "runtime_mode": "hosted_resident",
         "synthetic_account_reaper": {
             "enabled": True,
             "label_prefix": "agent-e2e-",
@@ -300,7 +300,7 @@ def _write_provisioning_manifest(tmp_path: Path) -> Path:
                 "secret_key_b64": "cHJpdmF0ZS1zZWNyZXQta2V5",
                 "public_key_b64": "cHJpdmF0ZS1wdWJsaWMta2V5",
                 "trace_enabled": True,
-                "runtime_mode": "db_action_v2",
+                "runtime_mode": "hosted_resident",
                 "registration_verified": True,
                 "fresh_state_verified": True,
                 "invalid_key_rejected": True,
@@ -363,10 +363,13 @@ def _write_orchestration_receipt(
                 "stopped_at": f"2026-07-13T12:00:{stop_second:02d}.000001Z",
                 "profile_result_sha256": hashlib.sha256(canonical_profile).hexdigest(),
                 "exec_events_sha256": "c" * 64,
+                "cot_receipt_sha256": "d" * 64,
+                "cot_delivery_status": "PASS",
+                "cot_failure_code": "NONE",
             }
         )
     receipt = {
-        "schema_version": 2,
+        "schema_version": 3,
         "launcher_id": "run-10000000",
         "max_configured_profile_concurrency": 3,
         "max_observed_profile_concurrency": peak,
@@ -406,7 +409,7 @@ def _validate(
         post_deployment_receipt_path=_write_receipt(
             tmp_path, "post-deployment-receipt.json"
         ),
-        expected_runtime="db_action_v2",
+        expected_runtime="hosted_resident",
         expected_sha=SHA,
     )
 
@@ -484,7 +487,7 @@ def test_coverage_lock_cannot_weaken_evidence_contract(mutate):
     qa_dir = Path(__file__).resolve().parents[1]
     coverage = json.loads((qa_dir / "coverage-lock.json").read_text())
     mutate(coverage)
-    assert gate._validate_coverage(coverage, "db_action_v2")
+    assert gate._validate_coverage(coverage, "hosted_resident")
 
 
 @pytest.mark.parametrize(
@@ -1006,6 +1009,19 @@ def test_agent_peak_must_match_trusted_process_receipt(tmp_path):
             "content binding is invalid",
         ),
         (
+            lambda receipt: receipt["workers"][0].update(
+                cot_receipt_sha256="A" * 64
+            ),
+            "content binding is invalid",
+        ),
+        (
+            lambda receipt: receipt["workers"][0].update(
+                cot_delivery_status="FAIL",
+                cot_failure_code="THINKING_ENVELOPE_NOT_DELIVERED",
+            ),
+            "COT lifecycle is invalid",
+        ),
+        (
             lambda receipt: receipt.update(launch_attempts=7),
             "launch count is invalid",
         ),
@@ -1054,7 +1070,7 @@ def test_trusted_orchestration_receipt_must_be_owner_only(tmp_path):
             post_deployment_receipt_path=_write_receipt(
                 tmp_path, "post-deployment-receipt.json"
             ),
-            expected_runtime="db_action_v2",
+            expected_runtime="hosted_resident",
             expected_sha=SHA,
         )
 
@@ -1101,7 +1117,7 @@ def test_schema_error_does_not_echo_untrusted_value(tmp_path, capsys):
             "--post-deployment-receipt",
             str(_write_receipt(tmp_path, "post-deployment-receipt.json")),
             "--expected-runtime",
-            "db_action_v2",
+            "hosted_resident",
             "--expected-sha",
             SHA,
         ]
@@ -1151,7 +1167,7 @@ def test_artifact_symlink_escape_fails(tmp_path):
         post_deployment_receipt_path=_write_receipt(
             tmp_path, "post-deployment-receipt.json"
         ),
-        expected_runtime="db_action_v2",
+        expected_runtime="hosted_resident",
         expected_sha=SHA,
     )
     assert any("escapes the artifact root" in error for error in errors)
@@ -1176,7 +1192,7 @@ def test_artifact_root_symlink_fails(tmp_path):
         post_deployment_receipt_path=_write_receipt(
             tmp_path, "post-deployment-receipt.json"
         ),
-        expected_runtime="db_action_v2",
+        expected_runtime="hosted_resident",
         expected_sha=SHA,
     )
     assert errors == ["artifact root is missing or unreadable"]
@@ -1200,7 +1216,7 @@ def test_run_result_reference_must_identify_validated_result(tmp_path):
         post_deployment_receipt_path=_write_receipt(
             tmp_path, "post-deployment-receipt.json"
         ),
-        expected_runtime="db_action_v2",
+        expected_runtime="hosted_resident",
         expected_sha=SHA,
     )
     assert any(
@@ -1223,7 +1239,7 @@ def test_every_locked_profile_checkpoint_must_exist(tmp_path):
         post_deployment_receipt_path=_write_receipt(
             tmp_path, "post-deployment-receipt.json"
         ),
-        expected_runtime="db_action_v2",
+        expected_runtime="hosted_resident",
         expected_sha=SHA,
     )
     assert "profile artifact official-deepseek is missing or unsafe" in errors
@@ -1239,7 +1255,7 @@ def test_abbreviated_candidate_sha_is_rejected(tmp_path):
         orchestration_receipt_path=tmp_path / "unused-orchestration-receipt.json",
         deployment_receipt_path=tmp_path / "unused-receipt.json",
         post_deployment_receipt_path=tmp_path / "unused-post-receipt.json",
-        expected_runtime="db_action_v2",
+        expected_runtime="hosted_resident",
         expected_sha="abc1234",
     )
     assert errors == ["expected deployment SHA is malformed"]
@@ -1260,7 +1276,7 @@ def test_trusted_deployment_receipt_must_match_candidate_and_result(tmp_path):
         post_deployment_receipt_path=_write_receipt(
             tmp_path, "post-deployment-receipt.json"
         ),
-        expected_runtime="db_action_v2",
+        expected_runtime="hosted_resident",
         expected_sha=SHA,
     )
     assert "pre-run trusted deployment receipt does not match the candidate" in errors
@@ -1314,7 +1330,7 @@ def test_trusted_provisioning_manifest_rejects_swapped_openrouter_model_families
         result_by_id[profile_id]["model"] = model
         result_by_id[profile_id]["reasoning"]["model"] = model
 
-    errors = gate._validate_provisioning_manifest(manifest, result, "db_action_v2")
+    errors = gate._validate_provisioning_manifest(manifest, result, "hosted_resident")
 
     assert (
         "profile openrouter-claude trusted provisioning receipt is incomplete" in errors
@@ -1337,7 +1353,7 @@ def test_trusted_provisioning_manifest_binds_kongbeiqie_base_url(
     key = "base_url" if tamper_receipt else "configured_base_url"
     field[key] = "https://attacker.example/v1"
 
-    errors = gate._validate_provisioning_manifest(manifest, result, "db_action_v2")
+    errors = gate._validate_provisioning_manifest(manifest, result, "hosted_resident")
 
     assert (
         "profile relay-kongbeiqie trusted provisioning receipt is incomplete" in errors
@@ -1364,7 +1380,7 @@ def test_trusted_provisioning_manifest_must_be_owner_only_regular_file(tmp_path)
             post_deployment_receipt_path=_write_receipt(
                 tmp_path, "post-deployment-receipt.json"
             ),
-            expected_runtime="db_action_v2",
+            expected_runtime="hosted_resident",
             expected_sha=SHA,
         )
 
@@ -1387,7 +1403,7 @@ def test_post_run_receipt_must_match_pre_run_identity(tmp_path):
         orchestration_receipt_path=_write_orchestration_receipt(tmp_path),
         deployment_receipt_path=pre_receipt,
         post_deployment_receipt_path=post_receipt,
-        expected_runtime="db_action_v2",
+        expected_runtime="hosted_resident",
         expected_sha=SHA,
     )
     assert "post-run trusted deployment receipt does not match the candidate" in errors
@@ -1413,7 +1429,7 @@ def test_pre_and_post_receipts_must_strictly_bracket_the_run(tmp_path):
         orchestration_receipt_path=_write_orchestration_receipt(tmp_path),
         deployment_receipt_path=pre_receipt,
         post_deployment_receipt_path=post_receipt,
-        expected_runtime="db_action_v2",
+        expected_runtime="hosted_resident",
         expected_sha=SHA,
     )
 
@@ -1443,7 +1459,7 @@ def test_trusted_deployment_receipt_symlink_fails(tmp_path):
             post_deployment_receipt_path=_write_receipt(
                 tmp_path, "post-deployment-receipt.json"
             ),
-            expected_runtime="db_action_v2",
+            expected_runtime="hosted_resident",
             expected_sha=SHA,
         )
 

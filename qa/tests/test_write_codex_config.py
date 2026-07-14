@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -51,7 +53,13 @@ def _paths(tmp_path: Path) -> dict[str, Path | str | list[Path]]:
         _mkdir_private(agent_root / "tmp")
         _mkdir_private(agent_root / "work")
     python_runtime = tmp_path / "trusted-python"
-    python_runtime.mkdir()
+    python_bin = python_runtime / "bin"
+    python_bin.mkdir(parents=True)
+    worker_python = python_bin / "python3"
+    worker_python.write_text(
+        f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n"
+    )
+    worker_python.chmod(0o700)
     return {
         "output": codex_home / "config.toml",
         "source_root": source,
@@ -67,6 +75,8 @@ def _paths(tmp_path: Path) -> dict[str, Path | str | list[Path]]:
         "orchestration_receipt": private / "orchestration-receipt.json",
         "codex_model": "gpt-5.4",
         "allowed_host": "test-api.feedling.app",
+        "worker_python": worker_python,
+        "qualification_mode": "release",
         "runtime_read_roots": [python_runtime],
     }
 
@@ -125,6 +135,18 @@ def test_bundle_isolates_eight_top_level_profiles_and_aggregation(tmp_path):
         assert profile["shell_environment_policy"]["set"]["QA_AGENT_TYPE"] == agent_type
         assert profile["shell_environment_policy"]["set"]["QA_ARTIFACT_DIR"] == str(
             Path(values["artifact_root"]).resolve()
+        )
+        assert profile["shell_environment_policy"]["set"]["QA_PYTHON_BIN"] == str(
+            Path(values["worker_python"]).resolve()
+        )
+        assert (
+            profile["shell_environment_policy"]["set"]["QA_QUALIFICATION_MODE"]
+            == "release"
+        )
+        assert "QA_PYTHON_BIN" in profile["shell_environment_policy"]["include_only"]
+        assert (
+            "QA_QUALIFICATION_MODE"
+            in profile["shell_environment_policy"]["include_only"]
         )
         assert policy[own_manifest] == "read"
         for other_profile, other_agent in PROFILE_AGENT_TYPES:
@@ -298,6 +320,50 @@ def test_runtime_root_cannot_expose_private_run_data(tmp_path):
     values = _paths(tmp_path)
     values["runtime_read_roots"] = [Path(values["supervisor_home"])]
     with pytest.raises(writer.CodexConfigError, match="runtime read roots"):
+        writer.build_config_bundle(**values)
+
+
+def test_only_diagnostic_mode_allows_artifacts_outside_worker_source(tmp_path):
+    values = _paths(tmp_path)
+    external_artifacts = tmp_path / "operator-artifacts"
+    external_artifacts.mkdir(mode=0o700)
+    values["artifact_root"] = external_artifacts
+
+    with pytest.raises(writer.CodexConfigError, match="inside the source"):
+        writer.build_config_bundle(**values)
+
+    values["qualification_mode"] = "diagnostic"
+    bundle = writer.build_config_bundle(**values)
+
+    assert str(external_artifacts.resolve()) in bundle.main
+
+
+def test_rejects_broad_or_writable_worker_runtime(tmp_path):
+    values = _paths(tmp_path)
+    values["runtime_read_roots"] = [Path.home()]
+    with pytest.raises(writer.CodexConfigError, match="too broad or private"):
+        writer.build_config_bundle(**values)
+
+    values = _paths(tmp_path / "writable-root")
+    runtime = Path(values["runtime_read_roots"][0])
+    runtime.chmod(0o777)
+    with pytest.raises(writer.CodexConfigError, match="group/world writable"):
+        writer.build_config_bundle(**values)
+
+    values = _paths(tmp_path / "writable-bin")
+    Path(values["worker_python"]).parent.chmod(0o777)
+    with pytest.raises(writer.CodexConfigError, match="runtime bin"):
+        writer.build_config_bundle(**values)
+
+
+def test_worker_python_must_be_bound_to_declared_runtime(tmp_path):
+    values = _paths(tmp_path)
+    outside = tmp_path / "outside-python"
+    outside.write_text("#!/bin/sh\nexit 0\n")
+    outside.chmod(0o700)
+    values["worker_python"] = outside
+
+    with pytest.raises(writer.CodexConfigError, match="runtime bin"):
         writer.build_config_bundle(**values)
 
 

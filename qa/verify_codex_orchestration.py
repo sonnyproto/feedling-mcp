@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 import sys
 from datetime import datetime
@@ -16,13 +17,23 @@ from typing import Any, BinaryIO, Iterable, Mapping, Sequence
 
 try:
     from qa.orchestration_contract import PROFILE_AGENT_TYPES
+    from qa.validate_cot_receipt import CotReceiptError, validate_cot_receipt
 except ModuleNotFoundError:  # Direct ``python qa/...py`` execution.
     from orchestration_contract import PROFILE_AGENT_TYPES
+    from validate_cot_receipt import CotReceiptError, validate_cot_receipt
 
 
-RECEIPT_SCHEMA_VERSION = 2
+RECEIPT_SCHEMA_VERSION = 3
 MAX_CONFIGURED_CONCURRENCY = 3
-WORKER_FILES = frozenset(("events.jsonl", "result.json", "schema.json", "stderr.log"))
+WORKER_FILES = frozenset(
+    (
+        "events.jsonl",
+        "result.json",
+        "schema.json",
+        "stderr.log",
+        "cot-delivery-receipt.json",
+    )
+)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_RECEIPT_BYTES = 256 * 1024
@@ -31,6 +42,62 @@ _MAX_RESULT_BYTES = 32 * 1024 * 1024
 _MAX_SCHEMA_BYTES = 8 * 1024 * 1024
 _MAX_STDERR_BYTES = 64 * 1024 * 1024
 _MAX_JSON_LINE_BYTES = 16 * 1024 * 1024
+AGENT_LIVE_SCENARIO_IDS = tuple(f"P0-{index:02d}" for index in range(2, 12))
+MIN_SCENARIO_COMMAND_COUNTS = {
+    scenario_id: (3 if scenario_id == "P0-06" else 1)
+    for scenario_id in AGENT_LIVE_SCENARIO_IDS
+}
+MANDATORY_SOP_READ_COMMAND = 'sed -n \'1,999p\' "$QA_SOURCE_ROOT/qa/SOP.md"'
+_SCENARIO_COMMAND_RE = re.compile(
+    r"^QA_SCENARIO_ID=(P0-(?:0[2-9]|1[01]))(?:[ \t]|$)"
+)
+_RAW_P0_06_COMMAND_RE = re.compile(r"^QA_SCENARIO_ID=P0-06(?:[ \t]|$)")
+P0_06_COMMAND_PHASES = ("CAPTURE", "REVIEW", "FINALIZE")
+_CODEX_SHELLS = frozenset(("/bin/bash", "/bin/sh", "/bin/zsh"))
+_SHELL_CONTROL_PUNCTUATION = ";&|<>()"
+P0_06_REVIEW_PROGRAM = (
+    "import pathlib,sys;j=pathlib.Path(sys.argv[2]);"
+    "j.exists() and sys.exit(17);"
+    'print(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))'
+)
+_P0_06_EVIDENCE_PATH = "$QA_WORK_ROOT/p0-06-private-evidence.json"
+_P0_06_JUDGMENT_PATH = "$QA_WORK_ROOT/p0-06-semantic-judgment.json"
+_P0_06_CAPTURE_TOKENS = (
+    "$QA_SOURCE_ROOT/tools/genesis_e2e.py",
+    "distill-existing-session",
+    "--api-url",
+    "$QA_FEEDLING_BASE_URL",
+    "--session-manifest",
+    "$QA_PRIVATE_MANIFEST",
+    "--profile-id",
+    "$QA_PROFILE_ID",
+    "--fixture",
+    "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json",
+    "--private-evidence",
+    _P0_06_EVIDENCE_PATH,
+    "--artifact-dir",
+    "$QA_ARTIFACT_DIR",
+)
+_P0_06_REVIEW_TOKENS = (
+    "-I",
+    "-B",
+    "-c",
+    P0_06_REVIEW_PROGRAM,
+    _P0_06_EVIDENCE_PATH,
+    _P0_06_JUDGMENT_PATH,
+)
+_P0_06_FINALIZE_TOKENS = (
+    "$QA_SOURCE_ROOT/tools/genesis_e2e.py",
+    "distill-existing-session-finalize",
+    "--fixture",
+    "$QA_SOURCE_ROOT/qa/fixtures/persona-import-v1.json",
+    "--private-evidence",
+    _P0_06_EVIDENCE_PATH,
+    "--semantic-judgment",
+    _P0_06_JUDGMENT_PATH,
+    "--artifact-dir",
+    "$QA_ARTIFACT_DIR",
+)
 
 
 class OrchestrationError(RuntimeError):
@@ -195,6 +262,191 @@ def parse_exec_events(path: Path) -> tuple[str, str | None]:
     return threads[0], (sessions[0] if sessions else None)
 
 
+def _shell_tokens(payload: str) -> tuple[str, ...]:
+    """Tokenize one simple command while rejecting shell composition."""
+
+    if "\n" in payload or "\r" in payload:
+        return ()
+    try:
+        lexer = shlex.shlex(
+            payload,
+            posix=True,
+            punctuation_chars=_SHELL_CONTROL_PUNCTUATION,
+        )
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = tuple(lexer)
+    except ValueError:
+        return ()
+    if any(
+        token == "$"
+        or "`" in token
+        or (
+            bool(token)
+            and set(token).issubset(set(_SHELL_CONTROL_PUNCTUATION))
+        )
+        for token in tokens
+    ):
+        return ()
+    return tokens
+
+
+def _command_tokens(command: str) -> tuple[str, ...]:
+    """Safely unwrap Codex's fixed shell wrapper and tokenize its payload."""
+
+    outer = _shell_tokens(command.strip())
+    if len(outer) == 3 and outer[0] in _CODEX_SHELLS and outer[1] in {"-c", "-lc"}:
+        return _shell_tokens(outer[2])
+    return tuple(outer)
+
+
+def _raw_command_payload(command: str) -> str:
+    """Expose only an anchored wrapper payload for marker accounting.
+
+    This parser deliberately does not certify command safety. Its sole purpose
+    is to ensure an unsafe or failed P0-06 marker cannot disappear before the
+    exact-three check.
+    """
+
+    stripped = command.strip()
+    try:
+        outer = shlex.split(stripped)
+    except ValueError:
+        return stripped
+    if len(outer) >= 3 and outer[0] in _CODEX_SHELLS and outer[1] in {"-c", "-lc"}:
+        return outer[2].lstrip()
+    return stripped
+
+
+def _is_mandatory_sop_read(tokens: tuple[str, ...]) -> bool:
+    return tokens == (
+        "sed",
+        "-n",
+        "1,999p",
+        "$QA_SOURCE_ROOT/qa/SOP.md",
+    )
+
+
+def _p0_06_phase(tokens: tuple[str, ...]) -> str | None:
+    if len(tokens) < 4 or tokens[0] != "QA_SCENARIO_ID=P0-06":
+        return None
+    prefix = "QA_SCENARIO_PHASE="
+    if not tokens[1].startswith(prefix) or tokens[2] != "$QA_PYTHON_BIN":
+        return None
+    phase = tokens[1].removeprefix(prefix)
+    arguments = tokens[3:]
+    expected = {
+        "CAPTURE": _P0_06_CAPTURE_TOKENS,
+        "REVIEW": _P0_06_REVIEW_TOKENS,
+        "FINALIZE": _P0_06_FINALIZE_TOKENS,
+    }
+    return phase if arguments == expected.get(phase) else None
+
+
+def completed_command_evidence(
+    path: Path,
+) -> tuple[int, tuple[str, ...], bool, dict[str, int], tuple[str, ...]]:
+    """Return command count, scenario markers/counts, and first SOP read.
+
+    Command text is inspected only long enough to recognize a fixed assignment at
+    the start of the command. It is never copied into receipts or public artifacts.
+    One command can therefore prove at most one live scenario.
+    """
+
+    count = 0
+    scenario_counts = {scenario_id: 0 for scenario_id in AGENT_LIVE_SCENARIO_IDS}
+    first_terminal_command: tuple[str, ...] | None = None
+    first_terminal_command_succeeded = False
+    p0_06_phases: list[str] = []
+    for row in _json_lines(path, "Codex worker event stream"):
+        item = row.get("item")
+        if not (
+            row.get("type") == "item.completed"
+            and isinstance(item, dict)
+            and item.get("type") == "command_execution"
+        ):
+            continue
+        command = item.get("command")
+        tokens = _command_tokens(command) if isinstance(command, str) else ()
+        exit_code = item.get("exit_code")
+        command_succeeded = (
+            isinstance(command, str)
+            and
+            item.get("status") == "completed"
+            and isinstance(exit_code, int)
+            and not isinstance(exit_code, bool)
+            and exit_code == 0
+        )
+        if first_terminal_command is None:
+            first_terminal_command = tokens
+            first_terminal_command_succeeded = command_succeeded
+        if item.get("status") == "completed":
+            count += 1
+        if not isinstance(command, str):
+            continue
+        raw_p0_06_marker = bool(
+            _RAW_P0_06_COMMAND_RE.match(_raw_command_payload(command))
+        )
+        if raw_p0_06_marker:
+            scenario_counts["P0-06"] += 1
+        if item.get("status") != "completed":
+            continue
+        if not tokens:
+            continue
+        match = _SCENARIO_COMMAND_RE.match(tokens[0])
+        if not match:
+            continue
+        scenario_id = match.group(1)
+        if scenario_id == "P0-06" and not raw_p0_06_marker:
+            # Defensive fallback for a safely tokenized representation that the
+            # wrapper-only raw accounting did not recognize.
+            scenario_counts[scenario_id] += 1
+        if not command_succeeded:
+            continue
+        if scenario_id == "P0-06":
+            phase = _p0_06_phase(tokens)
+            if phase is None:
+                continue
+            p0_06_phases.append(phase)
+        elif len(tokens) < 3 or tokens[1] != "$QA_PYTHON_BIN":
+            continue
+        if scenario_id != "P0-06":
+            scenario_counts[scenario_id] += 1
+    return (
+        count,
+        tuple(
+            scenario_id
+            for scenario_id in AGENT_LIVE_SCENARIO_IDS
+            if scenario_counts[scenario_id] > 0
+        ),
+        first_terminal_command_succeeded
+        and _is_mandatory_sop_read(first_terminal_command or ()),
+        scenario_counts,
+        tuple(p0_06_phases),
+    )
+
+
+def scenario_command_contract_satisfied(
+    counts: Mapping[str, int], p0_06_phases: Sequence[str]
+) -> bool:
+    """Require every live marker and separate P0-06 capture/review/finalize calls."""
+
+    return (
+        tuple(p0_06_phases) == P0_06_COMMAND_PHASES
+        and set(counts) == set(AGENT_LIVE_SCENARIO_IDS)
+        and all(
+            isinstance(counts[scenario_id], int)
+            and not isinstance(counts[scenario_id], bool)
+            and (
+                counts[scenario_id] == minimum
+                if scenario_id == "P0-06"
+                else counts[scenario_id] >= minimum
+            )
+            for scenario_id, minimum in MIN_SCENARIO_COMMAND_COUNTS.items()
+        )
+    )
+
+
 def write_receipt(path: Path, receipt: Mapping[str, Any]) -> None:
     if not path.is_absolute() or path.is_symlink():
         raise OrchestrationError("orchestration receipt path is unsafe")
@@ -275,6 +527,9 @@ def _validate_receipt_shape(receipt: Any) -> list[dict[str, Any]]:
         "stopped_at",
         "profile_result_sha256",
         "exec_events_sha256",
+        "cot_receipt_sha256",
+        "cot_delivery_status",
+        "cot_failure_code",
     }
     identities: list[str] = []
     for index, row in enumerate(workers):
@@ -297,6 +552,10 @@ def _validate_receipt_shape(receipt: Any) -> list[dict[str, Any]]:
             or not _SHA256_RE.fullmatch(row["profile_result_sha256"])
             or not isinstance(row.get("exec_events_sha256"), str)
             or not _SHA256_RE.fullmatch(row["exec_events_sha256"])
+            or not isinstance(row.get("cot_receipt_sha256"), str)
+            or not _SHA256_RE.fullmatch(row["cot_receipt_sha256"])
+            or row.get("cot_delivery_status") not in {"PASS", "FAIL", "UNVERIFIED"}
+            or not _valid_identifier(row.get("cot_failure_code"))
         ):
             raise OrchestrationError("orchestration receipt worker contract is invalid")
         # Also validates ordering and timezone-awareness.
@@ -365,16 +624,45 @@ def verify(
             )
         events = directory / "events.jsonl"
         result = directory / "result.json"
+        cot_receipt_path = directory / "cot-delivery-receipt.json"
         thread_id, session_id = parse_exec_events(events)
+        (
+            _,
+            scenario_command_ids,
+            sop_read_first,
+            scenario_command_counts,
+            p0_06_phases,
+        ) = completed_command_evidence(events)
         if (
             thread_id != row["thread_id"]
             or session_id != row["session_id"]
+            or not sop_read_first
+            or scenario_command_ids != AGENT_LIVE_SCENARIO_IDS
+            or not scenario_command_contract_satisfied(
+                scenario_command_counts, p0_06_phases
+            )
             or file_sha256(
                 events, "Codex worker event stream", max_bytes=_MAX_EVENTS_BYTES
             )
             != row["exec_events_sha256"]
         ):
             raise OrchestrationError("worker output does not match trusted receipt")
+        try:
+            cot_receipt, cot_receipt_sha256 = validate_cot_receipt(
+                cot_receipt_path, profile_id
+            )
+        except (CotReceiptError, OSError):
+            raise OrchestrationError(
+                "worker COT evidence does not match trusted receipt"
+            ) from None
+        if (
+            cot_receipt_sha256 != row["cot_receipt_sha256"]
+            or cot_receipt.get("status") != row["cot_delivery_status"]
+            or cot_receipt.get("failure_code") != row["cot_failure_code"]
+        ):
+            raise OrchestrationError(
+                "worker COT evidence does not match trusted receipt"
+            )
         canonical = aggregation / f"{profile_id}.json"
         result_payload = load_private_json(
             result, "Codex worker result", max_bytes=_MAX_RESULT_BYTES

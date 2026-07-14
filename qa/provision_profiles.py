@@ -24,7 +24,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -36,7 +36,10 @@ from tools.provider_smoke.client import Session, SmokeClient  # noqa: E402
 
 ALLOWED_BASE_URL = "https://test-api.feedling.app"
 ALLOWED_KONGBEIQIE_BASE_URL = "https://xn--vduyey89e.com/v1"
-EXPECTED_RUNTIME_MODE = "db_action_v2"
+EXPECTED_RUNTIME_MODE = "hosted_resident"
+DIAGNOSTIC_RUNTIME_MODE = EXPECTED_RUNTIME_MODE
+DIAGNOSTIC_RUNTIME_VERSION = 2
+QUALIFICATION_MODE_DIAGNOSTIC = "diagnostic"
 EXPECTED_REASONING_EFFORT = "medium"
 INVALID_PROVIDER_KEY = "feedling-e2e-intentionally-invalid"
 MANIFEST_SCHEMA_VERSION = 1
@@ -312,6 +315,40 @@ def _load_coverage(path: Path) -> list[dict[str, Any]]:
     return ordered
 
 
+def _select_profiles(
+    profiles: Sequence[dict[str, Any]],
+    *,
+    diagnostic: bool,
+    profile_ids: Sequence[str] | None,
+) -> list[dict[str, Any]]:
+    """Select a locked diagnostic subset without weakening strict coverage."""
+    if not diagnostic:
+        if profile_ids is not None:
+            raise ProvisionError("profile subsets require diagnostic mode")
+        return list(profiles)
+    if profile_ids is None:
+        return list(profiles)
+    if isinstance(profile_ids, (str, bytes)):
+        raise ProvisionError("diagnostic profile selection must be a sequence")
+
+    requested = [str(profile_id or "").strip() for profile_id in profile_ids]
+    if not requested or any(not profile_id for profile_id in requested):
+        raise ProvisionError("diagnostic profile selection must not be empty")
+    if len(requested) != len(set(requested)):
+        raise ProvisionError("diagnostic profile selection contains duplicates")
+    unknown = sorted(set(requested) - set(PROFILE_SPECS))
+    if unknown:
+        raise ProvisionError(
+            "diagnostic profile selection is outside the locked API-key matrix"
+        )
+    requested_set = set(requested)
+    return [
+        profile
+        for profile in profiles
+        if str(profile.get("profile_id") or "") in requested_set
+    ]
+
+
 def _model_for(
     profile: Mapping[str, Any], spec: ProfileSpec, env: Mapping[str, str]
 ) -> str:
@@ -487,8 +524,10 @@ def _manifest_entry(
     reasoning_effort: str,
     session: Session,
     label: str,
+    *,
+    diagnostic: bool = False,
 ) -> dict[str, Any]:
-    return {
+    entry = {
         "profile_id": profile["profile_id"],
         "label": label,
         "provider": spec.provider,
@@ -513,6 +552,16 @@ def _manifest_entry(
         "provision_status": PROVISION_STATUS_BLOCKED,
         "provision_failure_code": PROVISION_FAILURE_INCOMPLETE,
     }
+    if diagnostic:
+        entry.update(
+            {
+                "qualification_mode": QUALIFICATION_MODE_DIAGNOSTIC,
+                "runtime_version": 0,
+                "runtime_mode_set_required": False,
+                "runtime_readback_receipt": None,
+            }
+        )
+    return entry
 
 
 def _verify_synthetic_reaper(admin_client: AdminClient) -> dict[str, Any]:
@@ -725,6 +774,31 @@ def _verify_runtime_mode(
     entry["runtime_mode_readback_verified"] = True
 
 
+def _verify_diagnostic_runtime(
+    client: SmokeClient, session: Session, entry: dict[str, Any]
+) -> None:
+    try:
+        body = client.runtime_status(session)
+    except Exception:
+        raise _ProfileProvisionFailure("RUNTIME_MODE_VERIFICATION_FAILED") from None
+    if (
+        not isinstance(body, Mapping)
+        or body.get("configured") is not True
+        or body.get("runtime_mode") != DIAGNOSTIC_RUNTIME_MODE
+        or type(body.get("runtime_version")) is not int
+        or body.get("runtime_version") != DIAGNOSTIC_RUNTIME_VERSION
+    ):
+        raise _ProfileProvisionFailure("RUNTIME_MODE_VERIFICATION_FAILED")
+    entry["runtime_mode"] = DIAGNOSTIC_RUNTIME_MODE
+    entry["runtime_version"] = DIAGNOSTIC_RUNTIME_VERSION
+    entry["runtime_mode_readback_verified"] = True
+    entry["runtime_readback_receipt"] = {
+        "configured": True,
+        "runtime_mode": DIAGNOSTIC_RUNTIME_MODE,
+        "runtime_version": DIAGNOSTIC_RUNTIME_VERSION,
+    }
+
+
 def _complete_diagnostic_manifest(manifest: Mapping[str, Any]) -> bool:
     profiles = manifest.get("profiles")
     if not isinstance(profiles, list):
@@ -732,7 +806,22 @@ def _complete_diagnostic_manifest(manifest: Mapping[str, Any]) -> bool:
     ids = [
         row.get("profile_id") if isinstance(row, Mapping) else None for row in profiles
     ]
-    if ids != list(PROFILE_SPECS):
+    if manifest.get("qualification_mode") == QUALIFICATION_MODE_DIAGNOSTIC:
+        selected = manifest.get("selected_profile_ids")
+        if (
+            not isinstance(selected, list)
+            or not selected
+            or any(not isinstance(profile_id, str) for profile_id in selected)
+            or selected
+            != [profile_id for profile_id in PROFILE_SPECS if profile_id in selected]
+            or manifest.get("runtime_mode") != DIAGNOSTIC_RUNTIME_MODE
+            or manifest.get("runtime_version") != DIAGNOSTIC_RUNTIME_VERSION
+        ):
+            return False
+        expected_ids = selected
+    else:
+        expected_ids = list(PROFILE_SPECS)
+    if ids != expected_ids:
         return False
     for row in profiles:
         profile_id = str(row.get("profile_id") or "")
@@ -875,12 +964,18 @@ def provision(
     env: Mapping[str, str] | None = None,
     client: SmokeClient | None = None,
     admin_client: AdminClient | None = None,
+    diagnostic: bool = False,
+    profile_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Create the locked matrix, isolating operational failures by profile."""
     active_env = os.environ if env is None else env
     base_url = validate_base_url(_required_env(active_env, "QA_FEEDLING_BASE_URL"))
-    admin_token = _required_env(active_env, "QA_TEST_ADMIN_TOKEN")
-    profiles = _load_coverage(coverage_path)
+    admin_token = "" if diagnostic else _required_env(active_env, "QA_TEST_ADMIN_TOKEN")
+    profiles = _select_profiles(
+        _load_coverage(coverage_path),
+        diagnostic=diagnostic,
+        profile_ids=profile_ids,
+    )
     # Validate every static input before the reaper preflight or registration.
     # A missing credential is a broken run contract; an expired credential is a
     # per-profile diagnostic discovered later by the valid-key probe.
@@ -891,8 +986,10 @@ def provision(
         for profile in profiles
     }
     provider_keys = {
-        profile_id: _required_env(active_env, spec.credential_env)
-        for profile_id, spec in PROFILE_SPECS.items()
+        str(profile["profile_id"]): _required_env(
+            active_env, PROFILE_SPECS[str(profile["profile_id"])].credential_env
+        )
+        for profile in profiles
     }
     provider_base_urls = {
         str(profile["profile_id"]): _provider_base_url_for(
@@ -905,10 +1002,19 @@ def provision(
         for profile in profiles
     }
     active_client = client or SmokeClient(base_url)
-    active_admin = admin_client or AdminClient(
-        base_url, admin_token, active_client._ssl
-    )
-    reaper_receipt = _verify_synthetic_reaper(active_admin)
+    active_admin: AdminClient | None
+    if diagnostic:
+        active_admin = None
+        reaper_receipt = {
+            "required": False,
+            "verified": False,
+            "reason": "adminless_diagnostic",
+        }
+    else:
+        active_admin = admin_client or AdminClient(
+            base_url, admin_token, active_client._ssl
+        )
+        reaper_receipt = _verify_synthetic_reaper(active_admin)
     run_id = re.sub(
         r"[^A-Za-z0-9_.-]+", "-", str(active_env.get("QA_RUN_ID") or "local")
     )[:48]
@@ -916,10 +1022,22 @@ def provision(
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "generated_at": _utc_now(),
         "base_url": base_url,
-        "runtime_mode": EXPECTED_RUNTIME_MODE,
+        "runtime_mode": (
+            DIAGNOSTIC_RUNTIME_MODE if diagnostic else EXPECTED_RUNTIME_MODE
+        ),
         "synthetic_account_reaper": reaper_receipt,
         "profiles": [],
     }
+    if diagnostic:
+        manifest.update(
+            {
+                "qualification_mode": QUALIFICATION_MODE_DIAGNOSTIC,
+                "runtime_version": DIAGNOSTIC_RUNTIME_VERSION,
+                "selected_profile_ids": [
+                    str(profile["profile_id"]) for profile in profiles
+                ],
+            }
+        )
 
     try:
         for profile in profiles:
@@ -947,6 +1065,7 @@ def provision(
                     reasoning_effort,
                     session,
                     label,
+                    diagnostic=diagnostic,
                 )
             except Exception:
                 _reset_one(
@@ -991,9 +1110,16 @@ def provision(
                 _atomic_write_manifest(manifest_path, manifest)
                 _enable_trace(active_client, session, entry)
                 _atomic_write_manifest(manifest_path, manifest)
-                _set_runtime_mode(active_admin, session, entry)
-                _atomic_write_manifest(manifest_path, manifest)
-                _verify_runtime_mode(active_admin, session, entry)
+                if diagnostic:
+                    _verify_diagnostic_runtime(active_client, session, entry)
+                else:
+                    if active_admin is None:  # pragma: no cover - defensive type guard
+                        raise ProvisionError(
+                            "strict provisioning requires admin client"
+                        )
+                    _set_runtime_mode(active_admin, session, entry)
+                    _atomic_write_manifest(manifest_path, manifest)
+                    _verify_runtime_mode(active_admin, session, entry)
                 entry["provision_status"] = PROVISION_STATUS_READY
                 entry["provision_failure_code"] = PROVISION_FAILURE_NONE
                 _atomic_write_manifest(manifest_path, manifest)
@@ -1036,6 +1162,17 @@ def _parser() -> argparse.ArgumentParser:
     create = commands.add_parser("provision", help="create the locked API-key profiles")
     create.add_argument("--coverage", type=Path, default=Path("qa/coverage-lock.json"))
     create.add_argument("--manifest", type=Path, required=True)
+    create.add_argument(
+        "--diagnostic",
+        action="store_true",
+        help="use user-scoped runtime readback without admin-only contracts",
+    )
+    create.add_argument(
+        "--profile",
+        action="append",
+        dest="profile_ids",
+        help="locked profile id to provision (repeatable; diagnostic mode only)",
+    )
     remove = commands.add_parser(
         "cleanup", help="reset all accounts in a private manifest"
     )
@@ -1047,7 +1184,17 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "provision":
-            result = provision(args.coverage, args.manifest)
+            if args.diagnostic:
+                result = provision(
+                    args.coverage,
+                    args.manifest,
+                    diagnostic=True,
+                    profile_ids=args.profile_ids,
+                )
+            else:
+                if args.profile_ids is not None:
+                    raise ProvisionError("profile subsets require diagnostic mode")
+                result = provision(args.coverage, args.manifest)
             if not _complete_diagnostic_manifest(result):
                 raise ProvisionError(
                     "provisioning did not produce a complete diagnostic manifest"
@@ -1062,18 +1209,17 @@ def main(argv: list[str] | None = None) -> int:
                 for row in result["profiles"]
                 if row["provision_status"] == PROVISION_STATUS_BLOCKED
             ]
-            print(
-                json.dumps(
-                    {
-                        "ok": True,
-                        "profile_count": len(result["profiles"]),
-                        "ready_profile_count": len(ready),
-                        "blocked_profile_count": len(blocked),
-                        "blocked_profile_ids": blocked,
-                        "manifest": str(args.manifest),
-                    }
-                )
-            )
+            summary = {
+                "ok": True,
+                "profile_count": len(result["profiles"]),
+                "ready_profile_count": len(ready),
+                "blocked_profile_count": len(blocked),
+                "blocked_profile_ids": blocked,
+                "manifest": str(args.manifest),
+            }
+            if args.diagnostic:
+                summary["qualification_mode"] = QUALIFICATION_MODE_DIAGNOSTIC
+            print(json.dumps(summary))
             return 0
         result = cleanup(args.manifest)
         print(

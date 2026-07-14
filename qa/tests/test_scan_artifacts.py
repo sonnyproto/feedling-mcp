@@ -129,6 +129,26 @@ def test_encoded_provider_secret_and_decoded_private_key_fail(tmp_path):
     ) == ["public artifact contains exact credential material"]
 
 
+@pytest.mark.parametrize("representation", ("urlsafe_base64", "hex"))
+def test_encoded_decoded_private_key_fails(tmp_path, representation):
+    artifacts, manifest, codex_auth, fixture, env = _write_inputs(tmp_path)
+    document = json.loads(manifest.read_text())
+    decoded_private = bytes((0xFB, 0xFF)) * 16
+    document["profiles"][0]["secret_key_b64"] = base64.b64encode(
+        decoded_private
+    ).decode("ascii")
+    manifest.write_text(json.dumps(document), encoding="utf-8")
+    encoded = {
+        "urlsafe_base64": base64.urlsafe_b64encode(decoded_private),
+        "hex": decoded_private.hex().encode("ascii"),
+    }[representation]
+    (artifacts / "latency.csv").write_bytes(encoded)
+
+    assert scanner.scan_artifacts(
+        artifacts, manifest, codex_auth, fixture, env=env
+    ) == ["public artifact contains exact credential material"]
+
+
 def test_provider_secret_split_across_ordered_json_string_fields_fails(tmp_path):
     artifacts, manifest, codex_auth, fixture, env = _write_inputs(tmp_path)
     secret = env["QA_OPENROUTER_API_KEY"]

@@ -693,6 +693,17 @@ class SmokeClient:
             raise SmokeError("trace", f"enable status={status} body={body}")
         return body
 
+    def runtime_status(self, sess: Session) -> dict:
+        """Read the authenticated account's effective hosted-runtime profile."""
+        status, body = self._req(
+            "GET",
+            "/v1/model_api/runtime",
+            api_key=sess.api_key,
+        )
+        if status != 200 or not isinstance(body, dict):
+            raise SmokeError("runtime", f"status={status} body={body}")
+        return body
+
     def read_trace(
         self, sess: Session, *, limit: int = 200, subsystem: str = ""
     ) -> dict:

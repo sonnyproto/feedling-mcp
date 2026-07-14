@@ -604,6 +604,48 @@ def test_trace_helpers_use_user_scoped_endpoints(monkeypatch):
     assert calls[2][:2] == ("DELETE", "/v1/debug/trace")
 
 
+def test_runtime_status_uses_user_scoped_endpoint(monkeypatch):
+    sess = _session()
+    smoke = client.SmokeClient("https://example.test")
+    calls = []
+
+    def fake_req(method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        return 200, {
+            "configured": True,
+            "runtime_mode": "hosted_resident",
+            "runtime_version": 2,
+        }
+
+    monkeypatch.setattr(smoke, "_req", fake_req)
+
+    assert smoke.runtime_status(sess)["runtime_version"] == 2
+    assert calls == [
+        (
+            "GET",
+            "/v1/model_api/runtime",
+            {"api_key": sess.api_key},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        (503, {"error": "unavailable"}),
+        (200, ["not", "an", "object"]),
+    ],
+)
+def test_runtime_status_rejects_unusable_response(monkeypatch, response):
+    smoke = client.SmokeClient("https://example.test")
+    monkeypatch.setattr(smoke, "_req", lambda *args, **kwargs: response)
+
+    with pytest.raises(client.SmokeError) as exc:
+        smoke.runtime_status(_session())
+
+    assert exc.value.stage == "runtime"
+
+
 def test_reset_account_requires_confirmed_success(monkeypatch):
     sess = _session()
     smoke = client.SmokeClient("https://example.test")
