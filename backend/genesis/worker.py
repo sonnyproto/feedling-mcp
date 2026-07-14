@@ -705,6 +705,7 @@ def _fact_write(
     memory_summary: str = "",
     known_memories: list[str] | None = None,
     keep_all: bool = False,
+    floor_note: str = "",
 ) -> dict:
     if not fact_candidates and not persona_material and not memory_summary:
         return {"memories": [], "identity": {"agent_name": "", "dimensions": []}}
@@ -718,7 +719,7 @@ def _fact_write(
             job_id=job_id,
             task_id=f"fact-write-{idx}",
             runtime=runtime,
-            messages=prompts.fact_write_messages(batch, persona_material, memory_summary, known_memories, keep_all=keep_all),
+            messages=prompts.fact_write_messages(batch, persona_material, memory_summary, known_memories, keep_all=keep_all, floor_note=floor_note),
             max_tokens=4000,
             idempotency_key=f"{idempotency_prefix}:fact_write:{idx}",
             is_empty=_fact_write_output_empty,
@@ -1018,6 +1019,7 @@ def build_memory_output_from_fact_candidates(
     known_memories: list[str] | None = None,
     llm: GenesisLLMClient | None = None,
     keep_all: bool = False,
+    floor_note: str = "",
 ) -> dict:
     """Run the Genesis fact_write step directly for already-mapped candidates.
 
@@ -1038,6 +1040,7 @@ def build_memory_output_from_fact_candidates(
         fact_candidates=[item for item in fact_candidates if isinstance(item, dict)],
         known_memories=known_memories,
         keep_all=keep_all,
+        floor_note=floor_note,
     )
 
 

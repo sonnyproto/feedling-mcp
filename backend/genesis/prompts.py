@@ -217,8 +217,33 @@ def combined_map_messages(chunk_text: str) -> list[dict[str, str]]:
     ]
 
 
-def fact_write_messages(fact_digest: list[dict], persona_material: str = "", memory_summary: str = "", known_memories: list[str] | None = None, *, keep_all: bool = False) -> list[dict[str, str]]:
-    system = FACT_WRITE_PROMPT + (FACT_WRITE_KEEP_ALL_SUFFIX if keep_all else "") + _STRICT_JSON_SUFFIX
+def fact_write_messages(fact_digest: list[dict], persona_material: str = "", memory_summary: str = "", known_memories: list[str] | None = None, *, keep_all: bool = False, floor_note: str = "") -> list[dict[str, str]]:
+    keep_all_suffix = FACT_WRITE_KEEP_ALL_SUFFIX if keep_all else ""
+    floor_note_text = (("\n\n★ " + str(floor_note).strip()) if str(floor_note or "").strip() else "")
+
+    if floor_note_text:
+        # Insert floor_note before the firewall section (which precedes JSON spec)
+        firewall_idx = FACT_WRITE_PROMPT.find("\n防火墙:")
+        if firewall_idx > 0:
+            system = (
+                FACT_WRITE_PROMPT[:firewall_idx]
+                + keep_all_suffix
+                + floor_note_text
+                + FACT_WRITE_PROMPT[firewall_idx:]
+                + _STRICT_JSON_SUFFIX
+            )
+        else:
+            # Fallback if marker not found
+            system = (
+                FACT_WRITE_PROMPT
+                + keep_all_suffix
+                + floor_note_text
+                + _STRICT_JSON_SUFFIX
+            )
+    else:
+        # Default behavior: no changes to output
+        system = FACT_WRITE_PROMPT + keep_all_suffix + _STRICT_JSON_SUFFIX
+
     return [
         {"role": "system", "content": system},
         {
