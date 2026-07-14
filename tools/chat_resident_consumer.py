@@ -3230,6 +3230,17 @@ def _raw_assistant_text(body: Any) -> str:
     return ""
 
 
+def _bare_cards_json(body: Any) -> str:
+    """Serialized {"cards": [...]} when an HTTP runtime answers a capture/dream
+    prompt with a bare cards object (no reply field). The shared turn parser
+    deliberately drops the cards shape (chat-protocol guard), so the raw_text
+    lanes must recover it here — kept as one helper so the simple and OpenAI
+    paths can't drift. Returns "" for anything else."""
+    if isinstance(body, dict) and isinstance(body.get("cards"), list):
+        return json.dumps({"cards": body.get("cards")}, ensure_ascii=False)
+    return ""
+
+
 def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = None, raw_text: bool = False) -> Any:
     headers = _agent_http_headers()
     payload = {"message": message}
@@ -3247,11 +3258,9 @@ def _call_agent_http_simple(message: str, images: list[dict[str, str]] | None = 
         text = _raw_assistant_text(body)
         if text.strip():
             return text
-        # Capture/dream lanes may get a bare {"cards": [...]} body with no reply
-        # field. Hand it back serialized — the shared turn parser deliberately
-        # drops the cards shape (chat-protocol guard), so it can't recover it.
-        if isinstance(body, dict) and isinstance(body.get("cards"), list):
-            return json.dumps({"cards": body.get("cards")}, ensure_ascii=False)
+        cards_text = _bare_cards_json(body)
+        if cards_text:
+            return cards_text
     if isinstance(body, dict):
         turn = _agent_turn_from_raw(body)
         if turn.actions or turn.thinking_summary or turn.tool_calls or len(turn.messages) > 1:
@@ -3301,6 +3310,9 @@ def _call_agent_http_openai(message: str, images: list[dict[str, str]] | None = 
         text = _raw_assistant_text(body)
         if text.strip():
             return text
+        cards_text = _bare_cards_json(body)
+        if cards_text:
+            return cards_text
     turn = _agent_turn_from_raw(body)
     if turn.actions or turn.thinking_summary or turn.tool_calls or len(turn.messages) > 1:
         return body
@@ -7182,12 +7194,19 @@ def _process_proactive_jobs(jobs: list) -> float:
             continue
         _clear_provider_payment_cooldown()
         if _consume_reply_parse_failed():
+            # Parse failure means call_agent already swapped agent_result for
+            # FALLBACK_REPLY — a foreground-only line ("你稍后再发一次…") that
+            # reads as an unsolicited error bubble on a turn the user never
+            # started. Background lanes never surface errors in chat (same
+            # policy as the agent_call_failed branch above): report + fail the
+            # job, post nothing.
             _notify_agent_turn_failure(
                 ValueError("agent produced no usable reply after sanitization"),
                 foreground=False,
             )
-        else:
-            _note_agent_turn_success()
+            update_proactive_job_status(job_id, "failed", "agent_reply_parse_failed")
+            continue
+        _note_agent_turn_success()
 
         turn = _split_agent_turn(agent_result, max_items=PROACTIVE_MAX_REPLY_MESSAGES)
         actions, replies = turn.actions, turn.messages

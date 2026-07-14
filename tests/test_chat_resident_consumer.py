@@ -3656,17 +3656,26 @@ def test_agent_turn_drops_truncated_cards_protocol_fragment():
     assert crc._split_agent_turn('{"cards": [{"action": "add"').messages == []
 
 
-def test_process_proactive_cards_json_reply_does_not_post(monkeypatch):
+def test_process_proactive_cards_json_reply_does_not_post_fallback(monkeypatch):
+    """Real call_agent path: a cards-format reply is dropped by the parser, so
+    call_agent (SEND_FALLBACK_ON_AGENT_ERROR=true) substitutes FALLBACK_REPLY
+    and sets the parse-failed marker. The proactive lane must NOT post that
+    foreground-only fallback as an unsolicited message — background lanes never
+    surface errors in chat (same policy as the agent_call_failed branch)."""
     crc._seen_ids.clear()
     crc._seen_ids_order.clear()
+    crc._turn_reply_parse_failed = False
 
     captured = {"statuses": [], "posted": []}
 
+    monkeypatch.setattr(crc, "AGENT_MODE", "http")
+    monkeypatch.setattr(crc, "SEND_FALLBACK_ON_AGENT_ERROR", True)
     monkeypatch.setattr(
         crc,
-        "call_agent",
-        lambda message, images=None, image_paths=None: '{"cards": []}',
+        "call_agent_http",
+        lambda message, images=None, raw_text=False: '{"cards": []}',
     )
+    monkeypatch.setattr(crc, "_notify_agent_turn_failure", lambda e, foreground=True: None)
     monkeypatch.setattr(crc, "post_reply", lambda reply, **kwargs: captured["posted"].append((reply, kwargs)) or {"id": "msg_leak"})
     monkeypatch.setattr(crc, "claim_proactive_job", lambda job_id: True)
     monkeypatch.setattr(
@@ -3689,7 +3698,31 @@ def test_process_proactive_cards_json_reply_does_not_post(monkeypatch):
     assert captured["posted"] == []
     failed = [s for s in captured["statuses"] if s[1] == "failed"]
     assert failed
-    assert failed[-1][2] == "empty_agent_reply"
+    assert failed[-1][2] == "agent_reply_parse_failed"
+
+
+def test_call_agent_http_openai_raw_text_returns_bare_cards_body(monkeypatch):
+    """Same bare-cards tolerance as the simple HTTP path: an OpenAI-protocol
+    runtime answering a capture prompt with a non-standard top-level
+    {"cards": [...]} body must still hand the raw_text lane the serialized JSON
+    (the shared parser now discards the cards shape and can't recover it)."""
+
+    class _Resp:
+        headers = {}
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"cards": []}
+
+    monkeypatch.setattr(crc, "AGENT_HTTP_URL", "http://127.0.0.1:8642/v1/chat/completions")
+    monkeypatch.setattr(crc, "AGENT_HTTP_MODEL", "hermes-agent")
+    monkeypatch.setattr(crc, "_whoami_cache", {"user_id": "usr_abc", "user_pk": None, "enclave_pk": None})
+    monkeypatch.setattr(crc, "_load_agent_session_id", lambda: "")
+    monkeypatch.setattr(crc, "_save_agent_session_id", lambda sid: None)
+    monkeypatch.setattr(crc._HTTP, "post", lambda url, json=None, headers=None, timeout=None: _Resp())
+
+    out = crc._call_agent_http_openai("capture prompt", raw_text=True)
+    assert json.loads(out) == {"cards": []}
 
 
 def test_agent_turn_extracts_native_thinking_from_content_block_and_messages_from_text_block():
