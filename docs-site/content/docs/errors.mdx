@@ -1,0 +1,29 @@
+---
+title: Errors
+description: Handle Feedling's stable JSON error envelope.
+---
+
+Feedling errors use a stable machine-readable slug:
+
+```json
+{
+  "error": "invalid_payload",
+  "detail": "The request body is invalid",
+  "request_id": "req_..."
+}
+```
+
+## Common errors
+
+| Status | Slug | Meaning |
+| --- | --- | --- |
+| `400` | `invalid_payload` | Request body or parameters are invalid. |
+| `401` | `unauthorized` | Authentication is missing or invalid. |
+| `403` | `forbidden` | The caller lacks permission. |
+| `404` | `not_found` | The requested resource does not exist. |
+| `409` | endpoint-specific | The request conflicts with current state. |
+| `500` | `internal_error` | Unexpected server failure; retain `request_id`. |
+| `503` | `service_busy` | Temporary capacity failure; retry with backoff. |
+
+Clients should branch on `error`, not human-readable `detail`. A new message may
+be added to `detail` without changing the stable slug contract.

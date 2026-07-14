@@ -1,0 +1,16 @@
+---
+title: API reference
+description: Public Feedling endpoints generated from the FastAPI application.
+---
+
+The endpoint pages in this section are generated from a filtered OpenAPI snapshot
+of the production FastAPI application.
+
+- Operator-only `/admin` and `/debug` routes are excluded.
+- Production `/docs`, `/redoc`, and `/openapi.json` remain disabled.
+- End-user requests normally use `X-API-Key`; hosted runtimes use scoped tokens in
+  `X-Feedling-Runtime-Token`.
+- The static site shows executable code samples, but the browser playground is
+  disabled until the API explicitly allows the documentation origin through CORS.
+
+Browse **Endpoints** in the sidebar to inspect routes grouped by domain.

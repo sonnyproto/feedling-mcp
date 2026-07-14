@@ -1,0 +1,40 @@
+---
+title: Getting started
+description: Verify the service and make an authenticated Feedling API request.
+---
+
+## Check service availability
+
+The health endpoint does not require authentication.
+
+```bash
+curl https://api.feedling.app/healthz
+```
+
+## Authenticate a request
+
+Most user endpoints accept a Feedling API key in the `X-API-Key` header.
+
+```bash
+curl https://api.feedling.app/v1/users/whoami \
+  -H 'X-API-Key: YOUR_FEEDLING_API_KEY'
+```
+
+Do not place API keys in query strings. Query-string authentication exists only
+for compatibility with older integrations and can leak through browser history,
+access logs, and analytics systems.
+
+## Send a hosted-agent message
+
+Hosted model-API users send messages through the authenticated chat endpoint.
+
+```bash
+curl https://api.feedling.app/v1/model_api/chat/send \
+  -H 'Content-Type: application/json' \
+  -H 'X-API-Key: YOUR_FEEDLING_API_KEY' \
+  --data '{"message":"Hello"}'
+```
+
+See the [API reference](/docs/api-reference) for the complete route inventory.
+Request and response schemas will become richer as the backend's legacy raw JSON
+handlers are migrated to typed FastAPI models.

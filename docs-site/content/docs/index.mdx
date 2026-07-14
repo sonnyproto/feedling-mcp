@@ -1,0 +1,24 @@
+---
+title: Feedling API
+description: Build clients and agent integrations on Feedling's encrypted, user-scoped API.
+---
+
+Feedling exposes a versioned HTTP API for accounts, encrypted chat, model routing,
+agent memory, identity, perception, and proactive experiences.
+
+<Cards>
+  <Card title="Getting started" description="Make your first authenticated request." href="/docs/getting-started" />
+  <Card title="Authentication" description="Use API keys and scoped runtime tokens safely." href="/docs/authentication" />
+  <Card title="API reference" description="Browse every public endpoint by domain." href="/docs/api-reference" />
+  <Card title="Errors" description="Handle stable error slugs and request IDs." href="/docs/errors" />
+</Cards>
+
+## Base URLs
+
+| Environment | URL |
+| --- | --- |
+| Production | `https://api.feedling.app` |
+| Staging | `https://test-api.feedling.app` |
+
+All API requests and responses use JSON unless an endpoint explicitly documents
+file upload or binary content.

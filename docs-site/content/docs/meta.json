@@ -1,0 +1,10 @@
+{
+  "title": "Feedling API",
+  "pages": [
+    "index",
+    "getting-started",
+    "authentication",
+    "errors",
+    "api-reference"
+  ]
+}

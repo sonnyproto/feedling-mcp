@@ -1,0 +1,37 @@
+---
+title: Authentication
+description: Authenticate as a user or a scoped hosted runtime.
+---
+
+## User API keys
+
+Client applications authenticate with the long-lived API key issued during
+account registration.
+
+```http
+X-API-Key: YOUR_FEEDLING_API_KEY
+```
+
+An API key represents one Feedling user. Keep it out of source control, logs,
+analytics payloads, and URLs.
+
+## Runtime tokens
+
+Hosted agent runtimes use short-lived, user-bound bearer tokens with explicit
+scopes. Runtime tokens are issued by Feedling infrastructure and are not a
+replacement for an end-user API key.
+
+```http
+X-Feedling-Runtime-Token: RUNTIME_TOKEN
+```
+
+Some control-plane endpoints require an API key and deliberately reject runtime
+tokens, even when the token belongs to the same user.
+
+## Authentication failures
+
+- `401 unauthorized` means the credential is missing, invalid, or expired.
+- `403 forbidden` means the credential is valid but cannot perform that action.
+
+Responses include a stable `error` slug. Server failures also include a
+`request_id` that should be retained when contacting support.

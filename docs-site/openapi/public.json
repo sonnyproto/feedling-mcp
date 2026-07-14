@@ -1,0 +1,3458 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Feedling API",
+    "version": "1.0.0",
+    "description": "HTTP API for Feedling accounts, encrypted chat, agent memory, model routing, perception, and proactive experiences."
+  },
+  "servers": [
+    {
+      "url": "https://api.feedling.app",
+      "description": "Production"
+    },
+    {
+      "url": "https://test-api.feedling.app",
+      "description": "Staging"
+    }
+  ],
+  "security": [
+    {
+      "ApiKeyAuth": []
+    },
+    {
+      "RuntimeTokenAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "System",
+      "description": "Service status endpoints."
+    },
+    {
+      "name": "Accounts",
+      "description": "Registration, authentication, recovery, preferences, and access modes."
+    },
+    {
+      "name": "Onboarding",
+      "description": "Bootstrap, imports, and onboarding state."
+    },
+    {
+      "name": "Chat",
+      "description": "Encrypted chat messages and hosted-agent conversations."
+    },
+    {
+      "name": "Model API",
+      "description": "Model provider credentials, routes, and runtime configuration."
+    },
+    {
+      "name": "MCP",
+      "description": "User-configured MCP servers and connection management."
+    },
+    {
+      "name": "Memory",
+      "description": "Memory records, buckets, threads, and migration state."
+    },
+    {
+      "name": "Identity",
+      "description": "Agent identity and relationship state."
+    },
+    {
+      "name": "Worldbook",
+      "description": "Worldbook entries and contextual matching."
+    },
+    {
+      "name": "Perception",
+      "description": "Device perception reports, snapshots, and photos."
+    },
+    {
+      "name": "Screen Context",
+      "description": "Screen frames, sources, summaries, and analysis."
+    },
+    {
+      "name": "Content",
+      "description": "Encrypted content, key rotation, exports, and account reset."
+    },
+    {
+      "name": "Proactive",
+      "description": "Proactive jobs, scheduling, capture, and device events."
+    },
+    {
+      "name": "Push",
+      "description": "Push notification and Live Activity integration."
+    },
+    {
+      "name": "Notices",
+      "description": "User-facing service notices."
+    },
+    {
+      "name": "Diagnostics",
+      "description": "Client diagnostic uploads."
+    },
+    {
+      "name": "Tracking",
+      "description": "Product telemetry events."
+    },
+    {
+      "name": "Copy Text",
+      "description": "Shared copy-text state."
+    },
+    {
+      "name": "Agent",
+      "description": "Agent-facing perception summaries."
+    },
+    {
+      "name": "Other",
+      "description": "Additional authenticated Feedling APIs."
+    }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "summary": "Healthz",
+        "description": "Liveness + readiness probe. Public, no auth — used by Docker/compose.",
+        "operationId": "healthz_healthz_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "System"
+        ],
+        "security": []
+      }
+    },
+    "/v1/access/claim-token": {
+      "post": {
+        "summary": "Access Link Token Claim",
+        "operationId": "access_link_token_claim_v1_access_claim_token_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Accounts"
+        ],
+        "security": []
+      }
+    },
+    "/v1/access/link-token": {
+      "post": {
+        "summary": "Access Link Token Create",
+        "operationId": "access_link_token_create_v1_access_link_token_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Accounts"
+        ]
+      }
+    },
+    "/v1/access/modes": {
+      "get": {
+        "summary": "Access Modes",
+        "operationId": "access_modes_v1_access_modes_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Accounts"
+        ]
+      }
+    },
+    "/v1/access/modes/switch": {
+      "post": {
+        "summary": "Access Modes Switch",
+        "operationId": "access_modes_switch_v1_access_modes_switch_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Accounts"
+        ]
+      }
+    },
+    "/v1/account/recover/challenge": {
+      "post": {
+        "summary": "Account Recover Challenge",
+        "operationId": "account_recover_challenge_v1_account_recover_challenge_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Accounts"
+        ],
+        "security": []
+      }
+    },
+    "/v1/account/recover/verify": {
+      "post": {
+        "summary": "Account Recover Verify",
+        "operationId": "account_recover_verify_v1_account_recover_verify_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Accounts"
+        ],
+        "security": []
+      }
+    },
+    "/v1/account/reset": {
+      "post": {
+        "summary": "Account Reset",
+        "operationId": "account_reset_v1_account_reset_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Accounts"
+        ]
+      }
+    },
+    "/v1/agent/perception": {
+      "get": {
+        "summary": "Agent Perception",
+        "operationId": "agent_perception_v1_agent_perception_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Agent"
+        ]
+      }
+    },
+    "/v1/agent/perception/digest": {
+      "get": {
+        "summary": "Agent Perception Digest",
+        "operationId": "agent_perception_digest_v1_agent_perception_digest_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Agent"
+        ]
+      }
+    },
+    "/v1/agent/perception/history": {
+      "get": {
+        "summary": "Agent Perception History",
+        "operationId": "agent_perception_history_v1_agent_perception_history_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Agent"
+        ]
+      }
+    },
+    "/v1/agent/perception/trend": {
+      "get": {
+        "summary": "Agent Perception Trend",
+        "operationId": "agent_perception_trend_v1_agent_perception_trend_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Agent"
+        ]
+      }
+    },
+    "/v1/bootstrap": {
+      "post": {
+        "summary": "Bootstrap",
+        "operationId": "bootstrap_v1_bootstrap_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/bootstrap/status": {
+      "get": {
+        "summary": "Bootstrap Status",
+        "operationId": "bootstrap_status_v1_bootstrap_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/capture/force": {
+      "post": {
+        "summary": "Capture Force",
+        "operationId": "capture_force_v1_capture_force_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/capture/tick": {
+      "post": {
+        "summary": "Capture Tick",
+        "operationId": "capture_tick_v1_capture_tick_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/chat/history": {
+      "get": {
+        "summary": "Chat History",
+        "operationId": "chat_history_v1_chat_history_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ]
+      },
+      "delete": {
+        "summary": "Chat History Clear",
+        "operationId": "chat_history_clear_v1_chat_history_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ]
+      }
+    },
+    "/v1/chat/message": {
+      "post": {
+        "summary": "Chat Message",
+        "operationId": "chat_message_v1_chat_message_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ]
+      }
+    },
+    "/v1/chat/messages/{message_id}/body": {
+      "get": {
+        "summary": "Chat Message Body",
+        "operationId": "chat_message_body_v1_chat_messages__message_id__body_get",
+        "parameters": [
+          {
+            "name": "message_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Message Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ]
+      }
+    },
+    "/v1/chat/poll": {
+      "get": {
+        "summary": "Chat Poll",
+        "operationId": "chat_poll_v1_chat_poll_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ]
+      }
+    },
+    "/v1/chat/response": {
+      "post": {
+        "summary": "Chat Response",
+        "operationId": "chat_response_v1_chat_response_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ]
+      }
+    },
+    "/v1/chat/verify_loop": {
+      "post": {
+        "summary": "Chat Verify Loop",
+        "operationId": "chat_verify_loop_v1_chat_verify_loop_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ]
+      }
+    },
+    "/v1/content/export": {
+      "get": {
+        "summary": "Content Export",
+        "operationId": "content_export_v1_content_export_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Content"
+        ]
+      }
+    },
+    "/v1/content/rewrap-to-current-key": {
+      "post": {
+        "summary": "Content Rewrap To Current Key",
+        "operationId": "content_rewrap_to_current_key_v1_content_rewrap_to_current_key_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Content"
+        ]
+      }
+    },
+    "/v1/content/swap": {
+      "post": {
+        "summary": "Content Swap",
+        "operationId": "content_swap_v1_content_swap_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Content"
+        ]
+      }
+    },
+    "/v1/copytext": {
+      "get": {
+        "summary": "Get Copytext",
+        "operationId": "get_copytext_v1_copytext_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Copy Text"
+        ]
+      },
+      "post": {
+        "summary": "Post Copytext",
+        "operationId": "post_copytext_v1_copytext_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Copy Text"
+        ]
+      }
+    },
+    "/v1/device/events": {
+      "get": {
+        "summary": "Device Events Get",
+        "operationId": "device_events_get_v1_device_events_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      },
+      "post": {
+        "summary": "Device Events Post",
+        "operationId": "device_events_post_v1_device_events_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/diagnostics/logs": {
+      "post": {
+        "summary": "Upload Logs",
+        "operationId": "upload_logs_v1_diagnostics_logs_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Diagnostics"
+        ]
+      }
+    },
+    "/v1/dream/tick": {
+      "post": {
+        "summary": "Dream Tick",
+        "operationId": "dream_tick_v1_dream_tick_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/genesis/imports": {
+      "get": {
+        "summary": "Genesis Import List",
+        "operationId": "genesis_import_list_v1_genesis_imports_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      },
+      "post": {
+        "summary": "Genesis Import Create",
+        "operationId": "genesis_import_create_v1_genesis_imports_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/genesis/imports/plaintext": {
+      "post": {
+        "summary": "Genesis Import Plaintext",
+        "operationId": "genesis_import_plaintext_v1_genesis_imports_plaintext_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/genesis/imports/{job_id}": {
+      "get": {
+        "summary": "Genesis Import Status",
+        "operationId": "genesis_import_status_v1_genesis_imports__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/genesis/imports/{job_id}/chunks/{seq}": {
+      "put": {
+        "summary": "Genesis Import Put Chunk",
+        "operationId": "genesis_import_put_chunk_v1_genesis_imports__job_id__chunks__seq__put",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          },
+          {
+            "name": "seq",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Seq"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/genesis/imports/{job_id}/finalize": {
+      "post": {
+        "summary": "Genesis Import Finalize",
+        "operationId": "genesis_import_finalize_v1_genesis_imports__job_id__finalize_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/genesis/imports/{job_id}/outputs": {
+      "post": {
+        "summary": "Genesis Import Apply Outputs",
+        "operationId": "genesis_import_apply_outputs_v1_genesis_imports__job_id__outputs_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/genesis/persona_backfill": {
+      "post": {
+        "summary": "Genesis Persona Backfill",
+        "operationId": "genesis_persona_backfill_v1_genesis_persona_backfill_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/genesis/resident/pending": {
+      "get": {
+        "summary": "Genesis Resident Pending",
+        "operationId": "genesis_resident_pending_v1_genesis_resident_pending_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/genesis/resident/{job_id}/complete": {
+      "post": {
+        "summary": "Genesis Resident Complete",
+        "operationId": "genesis_resident_complete_v1_genesis_resident__job_id__complete_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/genesis/resident/{job_id}/heartbeat": {
+      "post": {
+        "summary": "Genesis Resident Heartbeat",
+        "operationId": "genesis_resident_heartbeat_v1_genesis_resident__job_id__heartbeat_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/history_import/status/{job_id}": {
+      "get": {
+        "summary": "History Import Status",
+        "operationId": "history_import_status_v1_history_import_status__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/history_import/upload": {
+      "post": {
+        "summary": "History Import Upload",
+        "operationId": "history_import_upload_v1_history_import_upload_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/identity/actions": {
+      "post": {
+        "summary": "Identity Actions",
+        "operationId": "identity_actions_v1_identity_actions_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Identity"
+        ]
+      }
+    },
+    "/v1/identity/changes": {
+      "get": {
+        "summary": "Identity Changes",
+        "operationId": "identity_changes_v1_identity_changes_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Identity"
+        ]
+      }
+    },
+    "/v1/identity/get": {
+      "get": {
+        "summary": "Identity Get",
+        "operationId": "identity_get_v1_identity_get_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Identity"
+        ]
+      }
+    },
+    "/v1/identity/init": {
+      "post": {
+        "summary": "Identity Init",
+        "operationId": "identity_init_v1_identity_init_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Identity"
+        ]
+      }
+    },
+    "/v1/identity/relationship_anchor": {
+      "post": {
+        "summary": "Identity Relationship Anchor",
+        "operationId": "identity_relationship_anchor_v1_identity_relationship_anchor_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Identity"
+        ]
+      }
+    },
+    "/v1/identity/replace": {
+      "post": {
+        "summary": "Identity Replace",
+        "operationId": "identity_replace_v1_identity_replace_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Identity"
+        ]
+      }
+    },
+    "/v1/identity/verify": {
+      "get": {
+        "summary": "Identity Verify",
+        "operationId": "identity_verify_v1_identity_verify_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Identity"
+        ]
+      }
+    },
+    "/v1/mcp/envelopes": {
+      "get": {
+        "summary": "Mcp Envelopes",
+        "operationId": "mcp_envelopes_v1_mcp_envelopes_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "MCP"
+        ]
+      }
+    },
+    "/v1/mcp/servers": {
+      "get": {
+        "summary": "Mcp List",
+        "operationId": "mcp_list_v1_mcp_servers_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "MCP"
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      },
+      "post": {
+        "summary": "Mcp Upsert",
+        "operationId": "mcp_upsert_v1_mcp_servers_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "MCP"
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/v1/mcp/servers/{name}": {
+      "patch": {
+        "summary": "Mcp Patch",
+        "operationId": "mcp_patch_v1_mcp_servers__name__patch",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "MCP"
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      },
+      "delete": {
+        "summary": "Mcp Delete",
+        "operationId": "mcp_delete_v1_mcp_servers__name__delete",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "MCP"
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/v1/mcp/servers/{name}/test": {
+      "post": {
+        "summary": "Mcp Test",
+        "operationId": "mcp_test_v1_mcp_servers__name__test_post",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "MCP"
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ]
+      }
+    },
+    "/v1/memory/actions": {
+      "post": {
+        "summary": "Memory Actions",
+        "operationId": "memory_actions_v1_memory_actions_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/v1/memory/add": {
+      "post": {
+        "summary": "Memory Add",
+        "operationId": "memory_add_v1_memory_add_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/v1/memory/buckets": {
+      "get": {
+        "summary": "Memory Buckets",
+        "operationId": "memory_buckets_v1_memory_buckets_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/v1/memory/capture_jobs": {
+      "get": {
+        "summary": "Memory Capture Jobs",
+        "operationId": "memory_capture_jobs_v1_memory_capture_jobs_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/v1/memory/delete": {
+      "delete": {
+        "summary": "Memory Delete",
+        "operationId": "memory_delete_v1_memory_delete_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/v1/memory/fetch": {
+      "post": {
+        "summary": "Memory Fetch",
+        "operationId": "memory_fetch_v1_memory_fetch_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/v1/memory/get": {
+      "get": {
+        "summary": "Memory Get",
+        "operationId": "memory_get_v1_memory_get_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/v1/memory/index": {
+      "post": {
+        "summary": "Memory Index",
+        "operationId": "memory_index_v1_memory_index_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/v1/memory/legacy_batch": {
+      "post": {
+        "summary": "Memory Legacy Batch",
+        "operationId": "memory_legacy_batch_v1_memory_legacy_batch_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/v1/memory/list": {
+      "get": {
+        "summary": "Memory List",
+        "operationId": "memory_list_v1_memory_list_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/v1/memory/migration_state": {
+      "get": {
+        "summary": "Memory Migration State Get",
+        "operationId": "memory_migration_state_get_v1_memory_migration_state_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ]
+      },
+      "post": {
+        "summary": "Memory Migration State Post",
+        "operationId": "memory_migration_state_post_v1_memory_migration_state_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/v1/memory/retype": {
+      "post": {
+        "summary": "Memory Retype",
+        "operationId": "memory_retype_v1_memory_retype_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/v1/memory/threads": {
+      "get": {
+        "summary": "Memory Threads",
+        "operationId": "memory_threads_v1_memory_threads_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/v1/memory/verify": {
+      "get": {
+        "summary": "Memory Verify",
+        "operationId": "memory_verify_v1_memory_verify_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Memory"
+        ]
+      }
+    },
+    "/v1/model_api/chat/send": {
+      "post": {
+        "summary": "Model Api Chat Send",
+        "operationId": "model_api_chat_send_v1_model_api_chat_send_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Chat"
+        ]
+      }
+    },
+    "/v1/model_api/credentials": {
+      "get": {
+        "summary": "Model Api Credentials Get",
+        "operationId": "model_api_credentials_get_v1_model_api_credentials_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      }
+    },
+    "/v1/model_api/credentials/{credential_id}": {
+      "patch": {
+        "summary": "Model Api Credential Patch",
+        "operationId": "model_api_credential_patch_v1_model_api_credentials__credential_id__patch",
+        "parameters": [
+          {
+            "name": "credential_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Credential Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      },
+      "delete": {
+        "summary": "Model Api Credential Remove",
+        "operationId": "model_api_credential_remove_v1_model_api_credentials__credential_id__delete",
+        "parameters": [
+          {
+            "name": "credential_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Credential Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      }
+    },
+    "/v1/model_api/delete": {
+      "delete": {
+        "summary": "Model Api Delete",
+        "operationId": "model_api_delete_v1_model_api_delete_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      }
+    },
+    "/v1/model_api/driver": {
+      "post": {
+        "summary": "Model Api Set Hosting",
+        "operationId": "model_api_set_hosting_v1_model_api_driver_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      }
+    },
+    "/v1/model_api/get": {
+      "get": {
+        "summary": "Model Api Get",
+        "operationId": "model_api_get_v1_model_api_get_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      }
+    },
+    "/v1/model_api/key_envelope": {
+      "get": {
+        "summary": "Model Api Key Envelope",
+        "operationId": "model_api_key_envelope_v1_model_api_key_envelope_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      }
+    },
+    "/v1/model_api/memory/repair": {
+      "post": {
+        "summary": "Model Api Memory Repair",
+        "operationId": "model_api_memory_repair_v1_model_api_memory_repair_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      }
+    },
+    "/v1/model_api/routes": {
+      "get": {
+        "summary": "Model Api Routes Get",
+        "operationId": "model_api_routes_get_v1_model_api_routes_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      },
+      "post": {
+        "summary": "Model Api Route Create",
+        "operationId": "model_api_route_create_v1_model_api_routes_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      }
+    },
+    "/v1/model_api/routes/{route_id}": {
+      "delete": {
+        "summary": "Model Api Route Remove",
+        "operationId": "model_api_route_remove_v1_model_api_routes__route_id__delete",
+        "parameters": [
+          {
+            "name": "route_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Route Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      }
+    },
+    "/v1/model_api/routes/{route_id}/activate": {
+      "post": {
+        "summary": "Model Api Route Activate",
+        "operationId": "model_api_route_activate_v1_model_api_routes__route_id__activate_post",
+        "parameters": [
+          {
+            "name": "route_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Route Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      }
+    },
+    "/v1/model_api/routes/{route_id}/test": {
+      "post": {
+        "summary": "Model Api Route Test",
+        "operationId": "model_api_route_test_v1_model_api_routes__route_id__test_post",
+        "parameters": [
+          {
+            "name": "route_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Route Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      }
+    },
+    "/v1/model_api/runtime": {
+      "get": {
+        "summary": "Model Api Runtime Status",
+        "operationId": "model_api_runtime_status_v1_model_api_runtime_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      }
+    },
+    "/v1/model_api/runtime_error": {
+      "post": {
+        "summary": "Model Api Runtime Error",
+        "operationId": "model_api_runtime_error_v1_model_api_runtime_error_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      }
+    },
+    "/v1/model_api/setup": {
+      "post": {
+        "summary": "Model Api Setup",
+        "operationId": "model_api_setup_v1_model_api_setup_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      }
+    },
+    "/v1/model_api/test": {
+      "post": {
+        "summary": "Model Api Test",
+        "operationId": "model_api_test_v1_model_api_test_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Model API"
+        ]
+      }
+    },
+    "/v1/notices": {
+      "get": {
+        "summary": "List Notices",
+        "operationId": "list_notices_v1_notices_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Notices"
+        ]
+      }
+    },
+    "/v1/onboarding/archive": {
+      "post": {
+        "summary": "Archive Onboarding File",
+        "operationId": "archive_onboarding_file_v1_onboarding_archive_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/onboarding/route": {
+      "get": {
+        "summary": "Onboarding Route Get",
+        "operationId": "onboarding_route_get_v1_onboarding_route_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      },
+      "post": {
+        "summary": "Onboarding Route Post",
+        "operationId": "onboarding_route_post_v1_onboarding_route_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/onboarding/validate": {
+      "get": {
+        "summary": "Onboarding Validate",
+        "operationId": "onboarding_validate_v1_onboarding_validate_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Onboarding"
+        ]
+      }
+    },
+    "/v1/perception/app_open": {
+      "get": {
+        "summary": "App Open",
+        "operationId": "app_open_v1_perception_app_open_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Perception"
+        ]
+      }
+    },
+    "/v1/perception/items/{kind}": {
+      "get": {
+        "summary": "Items Recent",
+        "operationId": "items_recent_v1_perception_items__kind__get",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Kind"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Perception"
+        ]
+      }
+    },
+    "/v1/perception/photo/evaluate": {
+      "post": {
+        "summary": "Photo Evaluate",
+        "operationId": "photo_evaluate_v1_perception_photo_evaluate_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Perception"
+        ]
+      }
+    },
+    "/v1/perception/photo/{photo_id}/content": {
+      "get": {
+        "summary": "Photo Content",
+        "operationId": "photo_content_v1_perception_photo__photo_id__content_get",
+        "parameters": [
+          {
+            "name": "photo_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Photo Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Perception"
+        ]
+      }
+    },
+    "/v1/perception/photos": {
+      "get": {
+        "summary": "Photos Recent",
+        "operationId": "photos_recent_v1_perception_photos_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Perception"
+        ]
+      }
+    },
+    "/v1/perception/report": {
+      "post": {
+        "summary": "Report",
+        "operationId": "report_v1_perception_report_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Perception"
+        ]
+      }
+    },
+    "/v1/perception/snapshot": {
+      "get": {
+        "summary": "Snapshot",
+        "operationId": "snapshot_v1_perception_snapshot_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Perception"
+        ]
+      }
+    },
+    "/v1/proactive/debug": {
+      "get": {
+        "summary": "Proactive Debug Json",
+        "operationId": "proactive_debug_json_v1_proactive_debug_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/proactive/decisions": {
+      "get": {
+        "summary": "Proactive Decisions",
+        "operationId": "proactive_decisions_v1_proactive_decisions_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/proactive/decisions/{decision_id}/review": {
+      "post": {
+        "summary": "Proactive Decision Review",
+        "operationId": "proactive_decision_review_v1_proactive_decisions__decision_id__review_post",
+        "parameters": [
+          {
+            "name": "decision_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Decision Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/proactive/jobs/poll": {
+      "get": {
+        "summary": "Proactive Jobs Poll",
+        "operationId": "proactive_jobs_poll_v1_proactive_jobs_poll_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/proactive/jobs/{job_id}/claim": {
+      "post": {
+        "summary": "Proactive Job Claim",
+        "operationId": "proactive_job_claim_v1_proactive_jobs__job_id__claim_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/proactive/jobs/{job_id}/status": {
+      "post": {
+        "summary": "Proactive Job Status",
+        "operationId": "proactive_job_status_v1_proactive_jobs__job_id__status_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/proactive/reviews": {
+      "get": {
+        "summary": "Proactive Reviews",
+        "operationId": "proactive_reviews_v1_proactive_reviews_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/proactive/scheduled/actions": {
+      "post": {
+        "summary": "Proactive Scheduled Actions",
+        "operationId": "proactive_scheduled_actions_v1_proactive_scheduled_actions_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/proactive/scheduled/fire": {
+      "post": {
+        "summary": "Proactive Scheduled Fire",
+        "operationId": "proactive_scheduled_fire_v1_proactive_scheduled_fire_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/proactive/settings": {
+      "get": {
+        "summary": "Proactive Settings Get",
+        "operationId": "proactive_settings_get_v1_proactive_settings_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      },
+      "post": {
+        "summary": "Proactive Settings Post",
+        "operationId": "proactive_settings_post_v1_proactive_settings_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/proactive/state": {
+      "get": {
+        "summary": "Proactive State Get",
+        "operationId": "proactive_state_get_v1_proactive_state_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      },
+      "post": {
+        "summary": "Proactive State Post",
+        "operationId": "proactive_state_post_v1_proactive_state_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/proactive/tick": {
+      "post": {
+        "summary": "Proactive Tick",
+        "operationId": "proactive_tick_v1_proactive_tick_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Proactive"
+        ]
+      }
+    },
+    "/v1/push/dynamic-island": {
+      "post": {
+        "summary": "Dynamic Island",
+        "operationId": "dynamic_island_v1_push_dynamic_island_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Push"
+        ]
+      }
+    },
+    "/v1/push/live-activity": {
+      "post": {
+        "summary": "Live Activity",
+        "operationId": "live_activity_v1_push_live_activity_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Push"
+        ]
+      }
+    },
+    "/v1/push/live-start": {
+      "post": {
+        "summary": "Live Start",
+        "operationId": "live_start_v1_push_live_start_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Push"
+        ]
+      }
+    },
+    "/v1/push/notification": {
+      "post": {
+        "summary": "Notification",
+        "operationId": "notification_v1_push_notification_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Push"
+        ]
+      }
+    },
+    "/v1/push/register-token": {
+      "post": {
+        "summary": "Register Token",
+        "operationId": "register_token_v1_push_register_token_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Push"
+        ]
+      }
+    },
+    "/v1/push/tokens": {
+      "get": {
+        "summary": "List Tokens",
+        "operationId": "list_tokens_v1_push_tokens_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Push"
+        ]
+      }
+    },
+    "/v1/screen/analyze": {
+      "get": {
+        "summary": "Analyze Screen",
+        "operationId": "analyze_screen_v1_screen_analyze_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Screen Context"
+        ]
+      }
+    },
+    "/v1/screen/frames": {
+      "get": {
+        "summary": "List Frames",
+        "operationId": "list_frames_v1_screen_frames_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Screen Context"
+        ]
+      }
+    },
+    "/v1/screen/frames/latest": {
+      "get": {
+        "summary": "Latest Frame",
+        "operationId": "latest_frame_v1_screen_frames_latest_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Screen Context"
+        ]
+      }
+    },
+    "/v1/screen/frames/{filename}": {
+      "get": {
+        "summary": "Serve Frame",
+        "operationId": "serve_frame_v1_screen_frames__filename__get",
+        "parameters": [
+          {
+            "name": "filename",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Filename"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Screen Context"
+        ]
+      }
+    },
+    "/v1/screen/frames/{frame_id}/decrypt": {
+      "get": {
+        "summary": "Frame Decrypt",
+        "operationId": "frame_decrypt_v1_screen_frames__frame_id__decrypt_get",
+        "parameters": [
+          {
+            "name": "frame_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Frame Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Screen Context"
+        ]
+      }
+    },
+    "/v1/screen/frames/{frame_id}/envelope": {
+      "get": {
+        "summary": "Frame Envelope",
+        "operationId": "frame_envelope_v1_screen_frames__frame_id__envelope_get",
+        "parameters": [
+          {
+            "name": "frame_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Frame Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Screen Context"
+        ]
+      }
+    },
+    "/v1/screen/frames/{frame_id}/image": {
+      "get": {
+        "summary": "Frame Image",
+        "operationId": "frame_image_v1_screen_frames__frame_id__image_get",
+        "parameters": [
+          {
+            "name": "frame_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Frame Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Screen Context"
+        ]
+      }
+    },
+    "/v1/screen/ios": {
+      "get": {
+        "summary": "Get Ios",
+        "operationId": "get_ios_v1_screen_ios_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Screen Context"
+        ]
+      }
+    },
+    "/v1/screen/mac": {
+      "get": {
+        "summary": "Get Mac",
+        "operationId": "get_mac_v1_screen_mac_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Screen Context"
+        ]
+      }
+    },
+    "/v1/screen/summary": {
+      "get": {
+        "summary": "Get Summary",
+        "operationId": "get_summary_v1_screen_summary_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Screen Context"
+        ]
+      }
+    },
+    "/v1/sources": {
+      "get": {
+        "summary": "Get Sources",
+        "operationId": "get_sources_v1_sources_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Screen Context"
+        ]
+      }
+    },
+    "/v1/state/receipts": {
+      "get": {
+        "summary": "State Receipts",
+        "operationId": "state_receipts_v1_state_receipts_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Other"
+        ]
+      }
+    },
+    "/v1/track/event": {
+      "post": {
+        "summary": "Track Event",
+        "operationId": "track_event_v1_track_event_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Tracking"
+        ]
+      }
+    },
+    "/v1/users/preferences": {
+      "post": {
+        "summary": "Users Set Preferences",
+        "operationId": "users_set_preferences_v1_users_preferences_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Accounts"
+        ]
+      }
+    },
+    "/v1/users/public-key": {
+      "post": {
+        "summary": "Users Set Public Key",
+        "operationId": "users_set_public_key_v1_users_public_key_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Accounts"
+        ]
+      }
+    },
+    "/v1/users/register": {
+      "post": {
+        "summary": "Users Register",
+        "operationId": "users_register_v1_users_register_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Accounts"
+        ],
+        "security": []
+      }
+    },
+    "/v1/users/whoami": {
+      "get": {
+        "summary": "Whoami",
+        "operationId": "whoami_v1_users_whoami_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Accounts"
+        ]
+      }
+    },
+    "/v1/worldbook/delete": {
+      "delete": {
+        "summary": "Worldbook Delete",
+        "operationId": "worldbook_delete_v1_worldbook_delete_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Worldbook"
+        ]
+      }
+    },
+    "/v1/worldbook/list": {
+      "get": {
+        "summary": "Worldbook List",
+        "operationId": "worldbook_list_v1_worldbook_list_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Worldbook"
+        ]
+      }
+    },
+    "/v1/worldbook/match": {
+      "post": {
+        "summary": "Worldbook Match",
+        "operationId": "worldbook_match_v1_worldbook_match_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Worldbook"
+        ]
+      }
+    },
+    "/v1/worldbook/upsert": {
+      "post": {
+        "summary": "Worldbook Upsert",
+        "operationId": "worldbook_upsert_v1_worldbook_upsert_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "tags": [
+          "Worldbook"
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      }
+    },
+    "securitySchemes": {
+      "ApiKeyAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-API-Key",
+        "description": "Long-lived Feedling user API key."
+      },
+      "RuntimeTokenAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Feedling-Runtime-Token",
+        "description": "Short-lived scoped token used by hosted runtimes."
+      }
+    }
+  }
+}
