@@ -248,7 +248,7 @@ def test_runtime_success_statuses_and_non_json_media_are_explicit(
     expected_success_statuses = {
         ("post", "/v1/identity/init"): {"201"},
         ("post", "/v1/genesis/imports"): {"200", "201"},
-        ("post", "/v1/genesis/imports/plaintext"): {"202"},
+        ("post", "/v1/genesis/imports/plaintext"): {"200", "202"},
         ("post", "/v1/genesis/imports/{job_id}/finalize"): {"200", "202"},
         ("post", "/v1/genesis/persona_backfill"): {"200", "202"},
         ("post", "/v1/history_import/upload"): {"200", "202"},

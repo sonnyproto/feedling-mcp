@@ -498,8 +498,6 @@ def plaintext_import(
     input_hash = history_import._history_import_payload_hash(payload)
     client_job_id = history_import._history_import_client_job_id(payload)
     mode = plaintext_mode(payload, client_job_id=client_job_id)
-    if mode == "update_identity" and not identity_service._load_identity(store):
-        return _bad("identity_not_initialized", 409)
     existing = find_reusable(
         store,
         client_job_id=client_job_id,
