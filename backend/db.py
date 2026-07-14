@@ -519,6 +519,24 @@ def record_tee_sync_run(summary: dict) -> None:
         log.error("[db] record_tee_sync_run failed: %s", e)
 
 
+def last_tee_reconcile_age_sec() -> float | None:
+    """Seconds since the most recent SUCCESSFUL reconcile tick, or None if there
+    has never been one. Read by the tee-sync scheduler at loop start so a new
+    leader (gunicorn worker recycling hands leadership over) does not restart
+    from ``last_reconcile=None`` and redo reconcile-first — a full reconcile
+    takes tens of minutes, so with short worker lifetimes it would never finish
+    (2026-07-14 test: 2h of leader churn, zero completed ticks). Age is computed
+    server-side (``now() - max(ran_at)``) so client clock skew is irrelevant."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT EXTRACT(EPOCH FROM (now() - max(ran_at))) FROM tee_sync_runs "
+            "WHERE did_reconcile AND reconcile_ok IS TRUE"
+        ).fetchone()
+    if not row or row[0] is None:
+        return None
+    return max(0.0, float(row[0]))
+
+
 def recent_tee_sync_runs(limit: int = 50) -> list[dict]:
     """Most-recent TEE sync summaries, newest first (observability endpoint).
     ``ran_at`` is ISO-8601; ``report`` is the parsed JSONB detail dict."""

@@ -50,6 +50,11 @@ def test_worker_recycling_bounds_arena_growth():
     assert getattr(gconf, "max_requests", 0) >= 1000
     # 无 jitter = 4 个 worker 几乎同时到阈值同时回收 → 服务闪断。
     assert getattr(gconf, "max_requests_jitter", 0) > 0
+    # 下限同样重要：prod 每 worker ~15.5 req/s，max_requests=2000 意味着 ~2 分钟
+    # 就回收一次——长轮询高频被排空、leader 单例(tee-sync/:9998 WS)反复换手，
+    # 后台 reconcile 永远跑不完(2026-07-14 test 实测:部署后 2h 零 tee-sync tick)。
+    # 目标 worker 寿命 ≥ ~1h → ≥ 50k 请求。
+    assert getattr(gconf, "max_requests", 0) >= 50000
 
 
 def test_graceful_timeout_outlives_long_poll():

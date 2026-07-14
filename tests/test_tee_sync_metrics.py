@@ -147,3 +147,30 @@ def test_sync_tick_records_whole_table_replicate_failure(backend_env, monkeypatc
     assert row["replicate_copied"] == len(sched._CIPHERTEXT_TABLES) - 1  # 其余 4 张各 1
     assert row["report"]["replicate_failed"]["chat_messages"] == "the connection is lost"
     assert "chat_messages" not in (row["report"].get("replicate") or {})  # 挂的表不在成功明细里
+
+
+# --------------------------------------------------------------------------- #
+# db.last_tee_reconcile_age_sec — 调度器跨 worker 恢复 last_reconcile 的读侧。
+# --------------------------------------------------------------------------- #
+
+def test_last_reconcile_age_none_without_successful_reconcile(backend_env):
+    with db.get_pool().connection() as c:
+        c.execute("DELETE FROM tee_sync_runs")
+    assert db.last_tee_reconcile_age_sec() is None
+    # 有行但 reconcile 未成功 → 仍是 None
+    from admin import tee_sync_scheduler as sched
+    row = sched._blank_summary(True)
+    row["reconcile_ok"] = False
+    db.record_tee_sync_run(row)
+    assert db.last_tee_reconcile_age_sec() is None
+
+
+def test_last_reconcile_age_reflects_latest_success(backend_env):
+    with db.get_pool().connection() as c:
+        c.execute("DELETE FROM tee_sync_runs")
+    from admin import tee_sync_scheduler as sched
+    row = sched._blank_summary(True)
+    row["reconcile_ok"] = True
+    db.record_tee_sync_run(row)
+    age = db.last_tee_reconcile_age_sec()
+    assert age is not None and 0.0 <= age < 60.0

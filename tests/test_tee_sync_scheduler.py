@@ -232,3 +232,30 @@ def test_backoff_delay_doubles_and_caps(monkeypatch):
     assert sched._backoff_delay(2) == 600.0
     assert sched._backoff_delay(3) == 1200.0
     assert sched._backoff_delay(10) == sched._BACKOFF_CAP_SEC
+
+
+# --------------------------------------------------------------------------- #
+# last_reconcile 必须跨 worker 存活：gunicorn max_requests 回收 leader worker 后,
+# 新 leader 若从 None 起步就会重做 reconcile-first——test 实测 reconcile ~40min >
+# worker 寿命 → reconcile 永远完不成、tee_sync_runs 零新行(2026-07-14 部署后 2h)。
+# 从 tee_sync_runs 恢复上次成功 reconcile 的时点(换算到本进程 monotonic 轴)。
+# --------------------------------------------------------------------------- #
+
+def test_restore_last_reconcile_from_db_age(monkeypatch):
+    import time as _time
+    monkeypatch.setattr(sched.db, "last_tee_reconcile_age_sec", lambda: 100.0)
+    restored = sched._restore_last_reconcile()
+    assert restored is not None
+    assert abs((_time.monotonic() - 100.0) - restored) < 5.0
+
+
+def test_restore_last_reconcile_none_when_no_history(monkeypatch):
+    monkeypatch.setattr(sched.db, "last_tee_reconcile_age_sec", lambda: None)
+    assert sched._restore_last_reconcile() is None
+
+
+def test_restore_last_reconcile_swallows_db_errors(monkeypatch):
+    def boom():
+        raise RuntimeError("db down")
+    monkeypatch.setattr(sched.db, "last_tee_reconcile_age_sec", boom)
+    assert sched._restore_last_reconcile() is None
