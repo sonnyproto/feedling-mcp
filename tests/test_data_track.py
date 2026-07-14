@@ -608,3 +608,55 @@ def test_detail_payload_runtime_includes_reasoning_effort(client):
     row = data_track._build_data_track_user(user_entry, include_detail=True)
 
     assert row["runtime"]["reasoning_effort"] == "medium"
+
+
+def test_perception_permissions_block_renders_granted_denied_and_switches():
+    # The user-detail page shows a readable 感知授权 & 主动开关 block so "can't use
+    # album/screen" is answerable on sight (granted vs not vs unknown).
+    user = {
+        "perception_permissions": {
+            "permission_states": {"photos": "authorized", "screen": "denied", "location": "notDetermined"},
+            "switches": {"photo_wake_照片唤醒": True, "screen_watch_屏幕观察": False},
+            "wake_directive_configured": True,
+            "wake_interval_sec": 7200,
+        }
+    }
+    out = _dt._render_perception_permissions(user)
+    assert "photos" in out and "已授权" in out          # granted
+    assert "screen" in out and "未授权" in out           # denied
+    assert "location" in out and "notDetermined" in out  # unknown -> raw state shown
+    assert "photo_wake_照片唤醒" in out and "开" in out
+    assert "screen_watch_屏幕观察" in out and "关" in out
+    assert "自定义 wake 指令：已配置" in out
+    assert "间隔：7200 秒" in out
+    # empty permission_states -> explicit "no report" hint, not silence
+    empty = _dt._render_perception_permissions({"perception_permissions": {"permission_states": {}, "switches": {}}})
+    assert "permission_states 为空" in empty
+    # no block at all when the user has no perception_permissions key
+    assert _dt._render_perception_permissions({}) == ""
+
+
+def test_detail_payload_exposes_permission_metadata_without_private_directive(client):
+    user_id, _api_key = _register(client)
+    store = core_store.get_store(user_id)
+    store.save_proactive_settings({
+        "permission_states": {"photos": "authorized", "<script>": "<private>"},
+        "photo_wake_enabled": False,
+        "wake_directive": "private user-authored instruction",
+        "wake_interval_sec": 3600,
+    })
+    user_entry = next(u for u in registry._users if u["user_id"] == user_id)
+
+    row = _dt._build_data_track_user(user_entry, include_detail=True)
+    pp = row["perception_permissions"]
+    assert pp["permission_states"]["photos"] == "authorized"
+    assert pp["switches"]["photo_wake_照片唤醒"] is False
+    assert pp["wake_directive_configured"] is True
+    assert pp["wake_interval_sec"] == 3600
+    assert "private user-authored instruction" not in json.dumps(row)
+
+    rendered = _dt._render_perception_permissions(row)
+    assert "<script>" not in rendered
+    assert "<private>" not in rendered
+    assert "&lt;script&gt;" in rendered
+    assert "&lt;private&gt;" in rendered
