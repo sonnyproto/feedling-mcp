@@ -285,6 +285,14 @@ services:
       # on-chain re-auth. Default 4 here since the deployed image has the leader
       # patch; set to 1 if ever deploying a pre-leader-election image.
       FEEDLING_BACKEND_WORKERS: "${FEEDLING_BACKEND_WORKERS:-4}"
+      # glibc per-thread malloc arena 数量封顶。不设时 64 位默认 8×核数（8 核=64
+      # 个），与 anyio 线程池 40 线程相乘的结果是 2026-07-14 prod 实测形态：每个
+      # worker ~60 个 64MiB arena 近乎全驻留、占 RSS 80%+、12h 涨到 2-3GB/worker
+      # 不自趋稳（arena 高水位只涨不还）。封顶 4 让分配集中到少数 arena、可复用，
+      # 配合 gunicorn max_requests 回收（backend/gunicorn_conf.py）双保险。取 4
+      # 而非 2：保留一点并发分配空间，锁竞争代价可忽略（瓶颈在 DB/enclave I/O）。
+      # 明文配置、烘进 compose_hash（这是行为参数，不是密钥）。
+      MALLOC_ARENA_MAX: "4"
     ports:
       - "5001:5001"
       - "9998:9998"

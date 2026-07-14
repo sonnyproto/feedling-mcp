@@ -37,3 +37,40 @@ def test_on_starting_calls_assert_hosting_ready(monkeypatch):
         assert here in [os.path.abspath(p) for p in sys.path]
     finally:
         sys.path[:] = saved
+
+
+def test_worker_recycling_bounds_arena_growth():
+    """backend worker 的 glibc arena 会随请求 churn 无界膨胀（2026-07-14 prod
+    实测：每 worker ~60 个 64MiB arena 占 RSS 80%+，12h 涨到 2-3GB/worker，CVM
+    无 swap、available<1000M 即 OOM killer 红线）。worker 定期回收是结构性上限：
+    max_requests 到点回收 + jitter 防四个 worker 同时回收。"""
+    import importlib
+
+    gconf = importlib.import_module("gunicorn_conf")
+    assert getattr(gconf, "max_requests", 0) >= 1000
+    # 无 jitter = 4 个 worker 几乎同时到阈值同时回收 → 服务闪断。
+    assert getattr(gconf, "max_requests_jitter", 0) > 0
+
+
+def test_graceful_timeout_outlives_long_poll():
+    """回收 worker 时要排空在途请求；/v1/chat/poll 长轮询最长 30s，graceful_timeout
+    低于它就会掐断等待中的 consumer（默认 30s 是贴着悬崖）。"""
+    import importlib
+
+    gconf = importlib.import_module("gunicorn_conf")
+    assert getattr(gconf, "graceful_timeout", 30) >= 60
+
+
+def test_backend_compose_caps_malloc_arenas():
+    """MALLOC_ARENA_MAX 把 glibc per-thread arena 数量封顶（不设时 64 位默认
+    8×核数=64 个，正是 prod 实测膨胀形态）。prod 与 test 的 backend 服务都必须带。"""
+    import pathlib
+
+    import yaml
+
+    for name in ("docker-compose.phala.yaml", "docker-compose.phala.test.yaml"):
+        compose = yaml.safe_load(
+            (pathlib.Path(__file__).parent.parent / "deploy" / name).read_text())
+        env = compose["services"]["backend"]["environment"]
+        assert "MALLOC_ARENA_MAX" in env, f"{name} backend 缺 MALLOC_ARENA_MAX"
+        assert str(env["MALLOC_ARENA_MAX"]).strip('"') in {"2", "4"}

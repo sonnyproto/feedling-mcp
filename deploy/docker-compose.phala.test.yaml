@@ -170,6 +170,10 @@ services:
         soft: 65536
         hard: 65536
     environment:
+      # glibc per-thread malloc arena 数量封顶（与 prod compose 同源注释：不设时
+      # 8×核数个 arena × 线程池 40 线程 = worker RSS 无界膨胀，prod 2026-07-14
+      # 实测 2-3GB/worker；配合 gunicorn max_requests 回收双保险）。
+      MALLOC_ARENA_MAX: "4"
       FEEDLING_API_KEY: ""
       FEEDLING_ADMIN_TOKEN: "${FEEDLING_ADMIN_TOKEN:-}"
       # Password login for the admin data-track page. Inject only through the
